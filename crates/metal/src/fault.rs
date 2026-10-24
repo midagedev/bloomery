@@ -20,6 +20,7 @@ use bloomery_device::{DeviceError, Elems, Stream};
 
 use crate::buffer::MetalBuffer;
 use crate::encode::Binding;
+use crate::residency::Alloc;
 use crate::stream::{MetalStream, Settled};
 
 /// The fault word of a Metal device.
@@ -32,6 +33,16 @@ impl MetalFaultWord {
     pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, DeviceError> {
         let word = Self {
             buffer: MetalBuffer::new(device, Elems(FAULT_WORDS))?,
+        };
+        // No stream has seen the buffer yet, so nothing is in flight.
+        word.write_clean()?;
+        Ok(word)
+    }
+
+    /// A fault word registered into the residency set `alloc` names, clean.
+    pub(crate) fn registered(alloc: Alloc<'_>) -> Result<Self, DeviceError> {
+        let word = Self {
+            buffer: alloc.buffer(Elems(FAULT_WORDS))?,
         };
         // No stream has seen the buffer yet, so nothing is in flight.
         word.write_clean()?;

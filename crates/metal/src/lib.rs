@@ -39,6 +39,8 @@ pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod library;
 #[cfg(target_os = "macos")]
+pub mod residency;
+#[cfg(target_os = "macos")]
 pub mod stream;
 
 #[cfg(target_os = "macos")]
@@ -49,5 +51,7 @@ pub use census::MetalCensus;
 pub use device::MetalDevice;
 #[cfg(target_os = "macos")]
 pub use library::{Library, LibraryPath, Pipeline};
+#[cfg(target_os = "macos")]
+pub use residency::{Residency, ResidencyStats};
 #[cfg(target_os = "macos")]
 pub use stream::{GpuInterval, GpuStamps, GpuTimes, HostEvent, MetalEvent, MetalStream, Recording};

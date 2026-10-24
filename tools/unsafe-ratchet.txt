@@ -688,7 +688,10 @@ levers 0 0 0
 # PIN(2026-10-24): metal 22 -> 25 blocks, new code, not old code relaxed: stream.rs's host clock for the step-time
 # breakdown declares libSystem's mach_continuous_time and mach_timebase_info (one extern block) and calls each once,
 # each call with its SAFETY line.
-metal 25 7 11
+# PIN(2026-10-24): metal 11 -> 12 impls, new code, not old code relaxed: handle.rs's ResidencySetHandle is Send so the
+# stream's residency set moves with its stream; the set sits behind the residency's lock, one thread at a time, as
+# CommandBufferHandle's impl does.
+metal 25 7 12
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

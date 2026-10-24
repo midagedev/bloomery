@@ -26,8 +26,6 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
 use model::arch::names;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLDevice;
 
 use super::count::{GroupBytes, GroupKind, Layer, Projection};
 use super::session::SessionError;
@@ -39,6 +37,7 @@ use crate::kernels::{
     channels, f16_len, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys,
     state_elems,
 };
+use crate::residency::Alloc;
 
 const WHAT: &str = "qwen35moe arena";
 
@@ -241,7 +240,7 @@ struct SharedShapes {
 
 /// The file's tensors, copied into buffers on `device`.
 struct Loader<'a> {
-    device: &'a ProtocolObject<dyn MTLDevice>,
+    device: Alloc<'a>,
     split: &'a Split,
 }
 
@@ -277,7 +276,7 @@ impl Loader<'_> {
             .iter()
             .map(|b| f32::from_le_bytes(*b))
             .collect();
-        let mut buffer = MetalBuffer::new(self.device, Elems(len))?;
+        let mut buffer = self.device.buffer(Elems(len))?;
         buffer.write(&values)?;
         Ok(buffer)
     }
@@ -313,7 +312,7 @@ impl Loader<'_> {
                 )));
             }
         }
-        let mut buffer = MetalBuffer::new(self.device, Elems(len))?;
+        let mut buffer = self.device.buffer(Elems(len))?;
         buffer.write(&values)?;
         Ok(buffer)
     }
@@ -346,7 +345,7 @@ impl Loader<'_> {
         rows: usize,
     ) -> Result<(Quant, MetalBuffer<u8>), SessionError> {
         let (quant, bytes) = self.rows(name, cols, rows)?;
-        let mut buffer = MetalBuffer::new(self.device, Elems(bytes.len()))?;
+        let mut buffer = self.device.buffer(Elems(bytes.len()))?;
         buffer.write(bytes)?;
         Ok((quant, buffer))
     }
@@ -402,7 +401,7 @@ impl Loader<'_> {
                 host.extend_from_slice(b);
                 out_end = out_end.max(out_at + rows);
             }
-            let mut weights = MetalBuffer::new(self.device, Elems(host.len()))?;
+            let mut weights = self.device.buffer(Elems(host.len()))?;
             weights.write(&host)?;
             dispatches.push(P1Part {
                 quant,
@@ -498,10 +497,10 @@ impl Loader<'_> {
 
 /// A buffer of `n` elements, zeroed.
 fn zeroed<T: bloomery_device::Elem>(
-    device: &ProtocolObject<dyn MTLDevice>,
+    device: Alloc<'_>,
     n: usize,
 ) -> Result<MetalBuffer<T>, SessionError> {
-    let mut buffer = MetalBuffer::new(device, Elems(n))?;
+    let mut buffer = device.buffer(Elems(n))?;
     buffer.zero();
     Ok(buffer)
 }
@@ -562,7 +561,7 @@ impl Arena {
     /// the session's buffers does not fit, a shape no launch runs, or a type
     /// no launch reads is refused by name.
     pub(super) fn open(
-        device: &ProtocolObject<dyn MTLDevice>,
+        device: Alloc<'_>,
         split: &Split,
         spec: &ModelSpec,
         plans: &[LayerPlan],
@@ -637,7 +636,7 @@ impl Arena {
         let base = shared
             .rope_base
             .ok_or_else(|| refuse("no attention layer to read the rope from"))?;
-        let mut rope = MetalBuffer::new(device, Elems(rope_len))?;
+        let mut rope = device.buffer(Elems(rope_len))?;
         rope.write(&rope_rows(ctx, base)?)?;
         let proj = layers
             .iter()
@@ -648,7 +647,7 @@ impl Arena {
             .map(|p| p.out_end)
             .max()
             .ok_or_else(|| refuse("a file of no layer"))?;
-        let mut lane = MetalBuffer::new(device, Elems(LANES))?;
+        let mut lane = device.buffer(Elems(LANES))?;
         lane.write(&LANE_WORDS)?;
         Ok(Arena {
             hidden,
@@ -681,7 +680,10 @@ impl Arena {
             step_id: zeroed(device, RECORD_SLOTS)?,
             id_in: zeroed(device, 1)?,
             lane,
-            faults: [MetalFaultWord::new(device)?, MetalFaultWord::new(device)?],
+            faults: [
+                MetalFaultWord::registered(device)?,
+                MetalFaultWord::registered(device)?,
+            ],
         })
     }
 
@@ -1057,7 +1059,7 @@ fn attention(
 
 fn ffn(
     load: &Loader<'_>,
-    device: &ProtocolObject<dyn MTLDevice>,
+    device: Alloc<'_>,
     plan: &LayerPlan,
     hidden: usize,
     (n_experts, top_k): (usize, usize),

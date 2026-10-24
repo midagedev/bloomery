@@ -26,7 +26,9 @@
 //!     driver's live device bytes after the open> prompt_ids=<count>
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
 //!     decode_passes=<count> decode_s=<the loop's wall> decode_tok_s=<rate>
-//!     stop=<eog|length|ctx>
+//!     stop=<eog|length|ctx> decode_first_ms=<the loop's first pass>
+//!     decode_rest_ms=<the mean of the others> resident_bytes=<the
+//!     residency set's bytes> residency_requests=<its requests>
 //!
 //! The decode rate is the loop's passes over its wall: generated token 0
 //! comes from the prompt call and is in `decode_tokens`, not in the rate. A
@@ -75,7 +77,7 @@ mod cli {
     use std::io::Write as _;
     use std::path::PathBuf;
     use std::process::ExitCode;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use bloomery_device::Device;
     use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
@@ -709,6 +711,8 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         eprintln!("model={}", a.model.display());
         eprintln!("open_s={open_s:.3}");
         eprintln!("device_allocated_bytes={allocated}");
+        let resident = session.residency();
+        eprintln!("resident_bytes={}", resident.bytes);
         if let Some(bytes) = session.rows_arena_bytes() {
             eprintln!("rows_arena_bytes={bytes}");
         }
@@ -724,6 +728,14 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             eprintln!("decode_tok_s={:.1}", out.passes as f64 / decode_s);
         }
         eprintln!("stop={}", out.stop.name());
+        if let Some((first, rest)) = out.pass_walls.split_first() {
+            eprintln!("decode_first_ms={:.2}", first.as_secs_f64() * 1e3);
+            if !rest.is_empty() {
+                let mean = rest.iter().map(Duration::as_secs_f64).sum::<f64>() / rest.len() as f64;
+                eprintln!("decode_rest_ms={:.2}", mean * 1e3);
+            }
+        }
+        eprintln!("residency_requests={}", session.residency().requests);
         if let Some(p) = &a.profile {
             let id = *out
                 .ids

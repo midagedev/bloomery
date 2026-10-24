@@ -65,6 +65,9 @@ pub struct Generated {
     pub decode_wall: Duration,
     /// The completed passes counted by the runtime after the prompt.
     pub passes: usize,
+    /// The wall of each pass of the loop, in order: a first pass that stands
+    /// out from the rest is a cost the prompt left behind.
+    pub pass_walls: Vec<Duration>,
 }
 
 impl Generated {
@@ -104,7 +107,11 @@ where
     let first = plain.prompt(s, prompt)?;
     let prompt_wall = t0.elapsed();
     on_id(first);
-    let mut sink = Sink { on_id: &mut on_id };
+    let mut walls = Vec::new();
+    let mut sink = Sink {
+        on_id: &mut on_id,
+        walls: &mut walls,
+    };
     let t1 = Instant::now();
     let outcome = runtime::generate(s, &mut plain, prompt, first, &stop.with_eog(eog), &mut sink)?;
     Ok(Generated {
@@ -113,6 +120,7 @@ where
         prompt_wall,
         decode_wall: t1.elapsed(),
         passes: outcome.passes,
+        pass_walls: walls,
     })
 }
 
@@ -120,6 +128,7 @@ where
 /// in order.
 struct Sink<'a, F: FnMut(u32)> {
     on_id: &'a mut F,
+    walls: &'a mut Vec<Duration>,
 }
 
 impl<F: FnMut(u32)> PassSink<Session> for Sink<'_, F> {
@@ -134,8 +143,9 @@ impl<F: FnMut(u32)> PassSink<Session> for Sink<'_, F> {
         _t: &Session,
         _c: &Committed,
         tokens: &[u32],
-        _wall: Duration,
+        wall: Duration,
     ) -> Result<(), SessionError> {
+        self.walls.push(wall);
         // A pass keeps whole rows; the loop has already cut `tokens` at the
         // first end-of-generation id, so the sink hears no id past the end.
         for &id in tokens {

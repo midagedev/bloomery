@@ -13,8 +13,6 @@
 //! the down's output at their widths: they are most of the arena.
 
 use bloomery_device::{Buffer, Elems};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLDevice;
 
 use super::arena::{Arena, MixerBufs};
 use super::session::SessionError;
@@ -23,6 +21,7 @@ use crate::kernels::{
     EXPERT_K, EXPERT_SLOTS, LOGIT_STRIDE, PARTIALS_PER_HEAD, VALUE_HEADS, prepared_elems,
     route_table_words,
 };
+use crate::residency::Alloc;
 
 /// The widest a row of the delta numerator or the attention output is.
 pub(super) const MIX_STRIDE: usize = VALUE_HEADS * crate::kernels::HEAD_COLS;
@@ -41,14 +40,14 @@ fn refuse(detail: impl Into<String>) -> SessionError {
 
 /// A buffer of `n` elements, zeroed.
 fn zeroed<T: bloomery_device::Elem>(
-    device: &ProtocolObject<dyn MTLDevice>,
+    device: Alloc<'_>,
     n: usize,
     what: &str,
 ) -> Result<MetalBuffer<T>, SessionError> {
     if n == 0 {
         return Err(refuse(format!("{what} of no elements")));
     }
-    let mut buffer = MetalBuffer::new(device, Elems(n))?;
+    let mut buffer = device.buffer(Elems(n))?;
     buffer.zero();
     Ok(buffer)
 }
@@ -106,7 +105,7 @@ impl RowsArena {
     /// `device`: every length from the file's shapes and the launches'
     /// geometry, refused by name when one does not fit.
     pub(super) fn open(
-        device: &ProtocolObject<dyn MTLDevice>,
+        device: Alloc<'_>,
         arena: &Arena,
         cap: usize,
     ) -> Result<RowsArena, SessionError> {

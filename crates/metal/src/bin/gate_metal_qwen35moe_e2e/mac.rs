@@ -78,6 +78,10 @@
 //!   run's within a ratio; the greedy tokens teacher-forced through both; an
 //!   id past the vocabulary in a pass raises the token-id site and poisons.
 //!
+//! - `r_resident`: the session's kernel buffers are held in one residency set
+//!   (`resident.rs`): the set holds every byte the open and the first pass
+//!   allocated, and a submit after an idle gap renews its request once.
+//!
 //! `--nodes` is a tool, not a clause: its set's prompt host-fed, then its
 //! step token traced, every named node against ik's, the first past its
 //! band printed (`--set d1k` walks the d1k set at its depth; the step set is
@@ -130,6 +134,8 @@ mod nodes;
 mod pass;
 #[path = "profile.rs"]
 mod profile;
+#[path = "resident.rs"]
+mod resident;
 #[path = "serve.rs"]
 mod serve;
 #[path = "sets.rs"]
@@ -450,7 +456,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 19] = [
+    const NAMES: [&str; 20] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -470,6 +476,7 @@ pub fn main() -> ExitCode {
         "q_ref",
         "q_free",
         "q_fault",
+        "r_resident",
     ];
     if args.iter().any(|a| a == "--list") {
         for name in NAMES {
@@ -594,6 +601,7 @@ pub fn main() -> ExitCode {
             "q_ref" => pass::q_ref(&device, library, &path),
             "q_free" => pass::q_free(&device, library, &path),
             "q_fault" => pass::q_fault(&device, library, &path),
+            "r_resident" => resident::r_resident(&device, library, &path),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);

@@ -46,6 +46,12 @@
 //! pass, and none past the last op's. A prompt call cuts its ids into passes
 //! at its checkpoint marks ([`Session::prefill`]).
 //!
+//! Every buffer the kernels bind is registered into the stream's residency
+//! set when the session allocates it, and the open waits for the set to be
+//! requested resident ([`crate::residency`]): the first token finds the
+//! weights wired, and a token after a pass or an idle gap finds them still
+//! wired. [`Session::residency`] reports the set.
+//!
 //! [`Session::step_traced`] is the instrument the gates read nodes through:
 //! the same ops of a host-fed step, each on a command buffer of its own,
 //! waited, with a hook after each. It encodes what [`Session::step`]
@@ -84,6 +90,7 @@ use crate::encode::EncodeCount;
 use crate::handle::Handle;
 use crate::kernels::{EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, segments_for_keys, state_elems};
 use crate::library::Library;
+use crate::residency::{Alloc, ResidencyStats};
 use crate::stream::{GpuInterval, GpuStamps, MetalStream, Settled, Signalled, host_secs};
 use objc2_metal::MTLDevice;
 
@@ -645,8 +652,21 @@ impl Session {
             Read35::Whole,
         )?;
         let kernels = Kernels::from_library(library)?;
-        let stream = device.new_stream()?;
-        let arena = Arena::open(device.metal(), &split, &spec, &plans, ctx)?;
+        let mut stream = device.new_stream()?;
+        stream.enable_residency(device.metal())?;
+        let residency = stream
+            .residency()
+            .ok_or_else(|| refuse("the stream made no residency set"))?;
+        let arena = Arena::open(
+            Alloc::new(device.metal(), residency),
+            &split,
+            &spec,
+            &plans,
+            ctx,
+        )?;
+        // The open waits for the driver to wire the arena, so the first token
+        // finds it resident.
+        residency.commit();
         let ctx_positions = u32::try_from(arena.ctx).map_err(|_| {
             refuse(format!(
                 "a cache of {} rows: more than a u32 position names",
@@ -860,6 +880,16 @@ impl Session {
         pass_rows_max().min(self.arena.ctx)
     }
 
+    /// What the residency set of the session's kernel buffers holds and how
+    /// often it was requested.
+    #[must_use]
+    pub fn residency(&self) -> ResidencyStats {
+        self.stream
+            .residency()
+            .expect("a session opens its stream with a residency set")
+            .stats()
+    }
+
     /// The bytes the rows arena holds, once a pass has opened it.
     #[must_use]
     pub fn rows_arena_bytes(&self) -> Option<u64> {
@@ -939,7 +969,16 @@ impl Session {
             self.drop_ahead(a)?;
         }
         if self.rows.is_none() {
-            self.rows = Some(RowsArena::open(&self.device, &self.arena, cap)?);
+            let residency = self
+                .stream
+                .residency()
+                .ok_or_else(|| refuse("the stream has no residency set"))?;
+            self.rows = Some(RowsArena::open(
+                Alloc::new(&self.device, residency),
+                &self.arena,
+                cap,
+            )?);
+            residency.commit();
         }
         let rows = self
             .rows

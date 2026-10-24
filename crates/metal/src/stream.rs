@@ -40,6 +40,7 @@ use bloomery_device::{DeviceError, Event, Stream};
 use crate::device::MetalDevice;
 use crate::encode::ComputeEncoder;
 use crate::handle::{CommandBufferHandle, Handle};
+use crate::residency::Residency;
 
 /// How long `sync` and an event's `sync` wait before they give up by name.
 pub(crate) const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -74,6 +75,9 @@ pub struct MetalStream {
     committed: Mutex<Committed>,
     /// The host's waits: every settle and every sync.
     waits: AtomicU64,
+    /// The residency set of the buffers this stream's kernels bind, once
+    /// [`MetalStream::enable_residency`] made one.
+    residency: Option<Residency>,
 }
 
 /// What a stream has committed.
@@ -348,7 +352,31 @@ impl MetalStream {
                 pending: Vec::with_capacity(PENDING),
             }),
             waits: AtomicU64::new(0),
+            residency: None,
         })
+    }
+
+    /// Give the stream a residency set on `device`, empty: the buffers made
+    /// through [`Alloc`](crate::residency::Alloc) join it, and every submit
+    /// renews its request. Enabling twice is refused by name.
+    pub fn enable_residency(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<(), DeviceError> {
+        if self.residency.is_some() {
+            return Err(DeviceError::backend(
+                "residency set",
+                "the stream has one already".to_string(),
+            ));
+        }
+        self.residency = Some(Residency::new(device, &self.queue)?);
+        Ok(())
+    }
+
+    /// The stream's residency set, once enabled.
+    #[must_use]
+    pub fn residency(&self) -> Option<&Residency> {
+        self.residency.as_ref()
     }
 
     /// The host's waits on this stream so far: every settle and every sync.
@@ -396,8 +424,16 @@ impl MetalStream {
                 "the recording was made by another stream".to_string(),
             ));
         }
+        self.keep_resident();
         self.committed().commit(recording.buffer);
         Ok(())
+    }
+
+    /// The residency set renewed before work is committed.
+    fn keep_resident(&self) {
+        if let Some(residency) = &self.residency {
+            residency.keep();
+        }
     }
 
     /// Commit a recording's command buffer with a signal of its own and
@@ -411,6 +447,7 @@ impl MetalStream {
                 "the recording was made by another stream".to_string(),
             ));
         }
+        self.keep_resident();
         let mut c = self.committed();
         let value = c.next_value();
         recording

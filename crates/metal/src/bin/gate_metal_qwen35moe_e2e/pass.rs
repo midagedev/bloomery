@@ -93,7 +93,7 @@ const KV_ROW: usize = KV_HEADS * HEAD_DIM;
 const FREE_STEPS: usize = 4;
 
 /// The ids of a prompt of `n` ids: the d1k set's first.
-fn prompt_ids(n: usize) -> Result<Vec<u32>, String> {
+pub(super) fn prompt_ids(n: usize) -> Result<Vec<u32>, String> {
     let man = sets::open(Set::D1k)?;
     let (_, _, prompt) = man
         .step()

@@ -14,6 +14,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResidencySet,
 };
 
 /// A Metal protocol that Apple documents as safe to use from several threads
@@ -67,3 +68,11 @@ pub(crate) struct CommandBufferHandle(pub(crate) Retained<ProtocolObject<dyn MTL
 // handed to another thread when the first stops using it: the stream holds
 // it behind its lock, so one thread uses it at a time.
 unsafe impl Send for CommandBufferHandle {}
+
+/// A residency set, moved between threads with its stream.
+pub(crate) struct ResidencySetHandle(pub(crate) Retained<ProtocolObject<dyn MTLResidencySet>>);
+
+// SAFETY: a residency set is not documented thread-safe, but it may be
+// handed to another thread when the first stops using it: the residency
+// keeps it behind a lock, so one thread uses it at a time.
+unsafe impl Send for ResidencySetHandle {}
