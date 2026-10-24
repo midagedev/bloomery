@@ -78,6 +78,7 @@ impl Pipeline {
 }
 
 /// The library the kernels come from.
+#[derive(Clone)]
 pub struct Library {
     library: Handle<dyn MTLLibrary>,
     device: Handle<dyn MTLDevice>,

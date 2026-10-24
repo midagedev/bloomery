@@ -9,21 +9,24 @@ use bloomery_device::{Buffer, Device, Elems, Fault};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::kernels::router;
 use bloomery_metal::kernels::{
-    AttentionParams, AttentionRowsParams, AttnCache, CONV_TAPS, DeltaParams, DeltaRowStrides,
-    DeltaRowsParams, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, NormRowsParams, PARTIALS_PER_HEAD,
-    QUERY_HEADS, RING_ROWS, ROT, VALUE_HEADS, channels, out_len, partials_len, q8_code_len,
-    q8_scale_len, qg_len, ring_elems, state_elems,
+    AttentionParams, AttentionPrefillParams, AttentionRowsParams, AttnCache, CONV_TAPS,
+    DeltaParams, DeltaRowStrides, DeltaRowsParams, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS,
+    NormRowsParams, PARTIALS_PER_HEAD, QUERY_HEADS, RING_ROWS, ROT, VALUE_HEADS, channels, out_len,
+    partials_len, prepared_elems, q8_code_len, q8_scale_len, qg_len, ring_elems, state_elems,
 };
 
 use super::clauses_attention::{
-    CTX, CacheBack, KIND_K, KIND_Q, KIND_V, Scene, Tables, Uploaded, cache_of, gate_of, head_row,
-    load_tables, plant_f16, read_cache, u, upload_cache,
+    CTX, CacheBack, KIND_K, KIND_Q, KIND_V, Scene, Tables, Uploaded, cache_of, dequant_k,
+    dequant_v, gain_array, gate_of, head_row, load_tables, plant_f16, read_cache, take_qg, u,
+    upload_cache,
 };
 use super::clauses_delta::{Fixed, draw, fixed};
 use super::clauses_router;
 use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle;
+use super::oracle::sigmoid;
+use super::oracle_attention::{attend, band, norm_rope, prefill_band};
 use super::{ClauseCtx, ClauseRun, Harness};
 
 /// The delta layer's key heads.
@@ -91,6 +94,7 @@ struct Bufs {
     ring: MetalBuffer<f32>,
     partials: MetalBuffer<f32>,
     g: MetalBuffer<f32>,
+    prep: MetalBuffer<f32>,
 }
 
 /// What a delta launch left behind.
@@ -104,6 +108,11 @@ struct Out {
 
 const G_ROW: usize = VALUE_HEADS * HEAD_COLS;
 const P_ROW: usize = VALUE_HEADS * PARTIALS_PER_HEAD;
+
+/// f32s of one prepared row of the delta layer.
+fn prep_row() -> Result<usize, String> {
+    elems(prepared_elems(N_K), "the prepared row")
+}
 
 impl Bufs {
     fn new(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Self, String> {
@@ -125,6 +134,9 @@ impl Bufs {
                 .map_err(why)?,
             g: device
                 .upload(stream, &vec![0f32; c.rows * G_ROW])
+                .map_err(why)?,
+            prep: device
+                .upload(stream, &vec![0f32; c.rows * prep_row()?])
                 .map_err(why)?,
         })
     }
@@ -162,6 +174,7 @@ impl Bufs {
 fn run_rows(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
     let mut bufs = Bufs::new(h, fx, c)?;
     let strides = DeltaRowStrides::dense(N_K).ok_or("the strides do not fit")?;
+    let prep_len = c.rows * prep_row()?;
     h.clear_fault()?;
     h.encode(|encoder| {
         h.kernels.delta_rows(
@@ -180,6 +193,7 @@ fn run_rows(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
                 ring: bufs.ring.window_mut(Elems(0), Elems(c.ring.len()))?,
                 partials: bufs.partials.window_mut(Elems(0), Elems(c.rows * P_ROW))?,
                 g: bufs.g.window_mut(Elems(0), Elems(c.rows * G_ROW))?,
+                prep: bufs.prep.window_mut(Elems(0), Elems(prep_len))?,
                 faults: h.device.fault_word(),
                 n_v: VALUE_HEADS,
                 head: HEAD_COLS,
@@ -346,6 +360,12 @@ fn nan_x(c: &mut Chunk, ch: usize) {
     c.x[5 * ch + 100] = f32::NAN;
 }
 
+fn nan_value_x(c: &mut Chunk, ch: usize) {
+    // A value channel of value head 2, column 9, in row 6: rows 6 to 9 read it
+    // as a tap, and only the column block that holds it is unusable.
+    c.x[6 * ch + (2 * N_K + 2) * HEAD_COLS + 9] = f32::NAN;
+}
+
 fn inf_b(c: &mut Chunk, _ch: usize) {
     c.b[8 * VALUE_HEADS + 3] = f32::INFINITY;
 }
@@ -372,6 +392,12 @@ pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             apply: nan_x,
         },
         Poison {
+            what: "a NaN value conv input",
+            site: FaultSite::LinearConv,
+            everywhere: false,
+            apply: nan_value_x,
+        },
+        Poison {
             what: "an infinite β input",
             site: FaultSite::LinearConv,
             everywhere: false,
@@ -396,7 +422,7 @@ pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         // way the rows launch carries it in registers.
         let mut rng = oracle::Rng::new(0xD0A6 + i as u64);
         let mut c = chunk(&mut rng, 12, 7, (0, 0))?;
-        if i == 3 {
+        if case.what.starts_with("a write lane") {
             c.lane_at = 0;
             c.lane_to = 1;
         }
@@ -540,12 +566,13 @@ impl AttnBufs {
         tables: &Tables,
         case: &AttnCase,
         inp: &AttnIn,
+        ctx: usize,
     ) -> Result<Self, String> {
         let (device, stream) = (h.device, h.stream);
         let out_n = out_len().ok_or("the output length wraps")?;
         let scene = Scene {
             segments: case.segments,
-            ctx: CTX,
+            ctx,
             pos: u(case.from),
             n_keys: u(case.from),
             prefill: case.from,
@@ -560,7 +587,7 @@ impl AttnBufs {
             q_gain: device.upload(stream, &tables.q_gain).map_err(why)?,
             k_gain: device.upload(stream, &tables.k_gain).map_err(why)?,
             rope: device
-                .upload(stream, &tables.rope[..CTX * ROT])
+                .upload(stream, &tables.rope[..ctx * ROT])
                 .map_err(why)?,
             partials: device
                 .upload(stream, &vec![0f32; case.rows * partial_n])
@@ -599,8 +626,9 @@ fn attn_rows_run(
     tables: &Tables,
     case: &AttnCase,
     inp: &AttnIn,
+    ctx: usize,
 ) -> Result<AttnSeen, String> {
-    let mut b = AttnBufs::new(h, tables, case, inp)?;
+    let mut b = AttnBufs::new(h, tables, case, inp, ctx)?;
     let out_n = out_len().ok_or("the output length wraps")?;
     let q_n = qg_len().ok_or("the query length wraps")?;
     let partial_n = partials_len(case.segments).ok_or("the partial length wraps")?;
@@ -614,7 +642,7 @@ fn attn_rows_run(
                 query_heads: QUERY_HEADS,
                 kv_heads: KV_HEADS,
                 segments: case.segments,
-                ctx: CTX,
+                ctx,
                 eps: tables.eps,
                 layer: LAYER,
                 from: u(case.from),
@@ -627,8 +655,8 @@ fn attn_rows_run(
                 v_stride: kv_n,
                 q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
                 k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
-                rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
-                cache: cache_of(&mut b.cache, CTX)?,
+                rope: b.rope.window(Elems(0), Elems(ctx * ROT))?,
+                cache: cache_of(&mut b.cache, ctx)?,
                 partials: b
                     .partials
                     .window_mut(Elems(0), Elems(case.rows * partial_n))?,
@@ -650,7 +678,7 @@ fn attn_stepped_run(
     case: &AttnCase,
     inp: &AttnIn,
 ) -> Result<AttnSeen, String> {
-    let mut b = AttnBufs::new(h, tables, case, inp)?;
+    let mut b = AttnBufs::new(h, tables, case, inp, CTX)?;
     let out_n = out_len().ok_or("the output length wraps")?;
     let q_n = qg_len().ok_or("the query length wraps")?;
     let partial_n = partials_len(case.segments).ok_or("the partial length wraps")?;
@@ -725,7 +753,7 @@ pub fn norm_rope_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let mut parts = Vec::new();
     for case in &ATTN_CASES {
         let inp = attn_inputs(case.rows)?;
-        let a = attn_rows_run(h, &tables, case, &inp)?;
+        let a = attn_rows_run(h, &tables, case, &inp, CTX)?;
         let b = attn_stepped_run(h, &tables, case, &inp)?;
         same_cache(&a.cache, &b.cache)
             .map_err(|e| format!("{} rows from {}: {e}", case.rows, case.from))?;
@@ -744,7 +772,7 @@ pub fn attn_rows_v0(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let mut parts = Vec::new();
     for case in &ATTN_CASES {
         let inp = attn_inputs(case.rows)?;
-        let a = attn_rows_run(h, &tables, case, &inp)?;
+        let a = attn_rows_run(h, &tables, case, &inp, CTX)?;
         let b = attn_stepped_run(h, &tables, case, &inp)?;
         let at = format!("{} rows from {}", case.rows, case.from);
         if let Some(f) = a.fault {
@@ -770,6 +798,315 @@ pub fn attn_rows_v0(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         "rows@first position/segments {} are the decode launches' bits",
         parts.join(", ")
     )))
+}
+
+/// Cache rows of the prefill clauses: the longest chunk and its first
+/// position, rounded up to a tile.
+const PREFILL_CTX: usize = 352;
+
+/// The prefill cases: the first position and the rows. A first position of 0
+/// starts on an empty cache; 37 reads thirty-seven planted rows. One row is a
+/// block of one; 9 rows end a block after one position; 64 and 300 rows cover
+/// the diagonal tile at every offset of the block.
+const PREFILL_CASES: [(usize, usize); 8] = [
+    (0, 1),
+    (0, 9),
+    (0, 64),
+    (0, 300),
+    (37, 1),
+    (37, 9),
+    (37, 64),
+    (37, 300),
+];
+
+/// Split-K segments of the decode flash the prefill is compared with.
+const PREFILL_V0_SEGMENTS: usize = 5;
+
+/// The chunk as one prefill launch.
+fn attn_prefill_run(
+    h: &Harness<'_>,
+    tables: &Tables,
+    case: &AttnCase,
+    inp: &AttnIn,
+    ctx: usize,
+) -> Result<AttnSeen, String> {
+    let mut b = AttnBufs::new(h, tables, case, inp, ctx)?;
+    let out_n = out_len().ok_or("the output length wraps")?;
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        h.kernels.attention_prefill(
+            encoder,
+            AttentionPrefillParams {
+                head_dim: HEAD_DIM,
+                query_heads: QUERY_HEADS,
+                kv_heads: KV_HEADS,
+                ctx,
+                eps: tables.eps,
+                layer: LAYER,
+                from: u(case.from),
+                rows: case.rows,
+                q: b.q.window(Elems(0), Elems(inp.q.len()))?,
+                q_stride: q_n,
+                k: b.k.window(Elems(0), Elems(inp.k.len()))?,
+                k_stride: kv_n,
+                v: b.v.window(Elems(0), Elems(inp.v.len()))?,
+                v_stride: kv_n,
+                q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                rope: b.rope.window(Elems(0), Elems(ctx * ROT))?,
+                cache: cache_of(&mut b.cache, ctx)?,
+                out: b.out.window_mut(Elems(0), Elems(case.rows * out_n))?,
+                out_stride: out_n,
+                fault: h.device.fault_word(),
+            },
+        )
+    })?;
+    b.read(h, case)
+}
+
+/// The prefill launch and the decode flash's rows launch on one chunk.
+fn prefill_pair(
+    h: &Harness<'_>,
+    tables: &Tables,
+    case: &AttnCase,
+    inp: &AttnIn,
+) -> Result<(AttnSeen, AttnSeen), String> {
+    let pre = attn_prefill_run(h, tables, case, inp, PREFILL_CTX)?;
+    let v0 = attn_rows_run(h, tables, case, inp, PREFILL_CTX)?;
+    Ok((pre, v0))
+}
+
+/// The worst errors of a chunk's outputs over the (row, head) pairs a clause
+/// checks, each as a ratio to its band.
+#[derive(Default)]
+struct Worst {
+    /// The prefill against the f64 referee, over the prefill band.
+    prefill: f64,
+    /// The decode flash against the f64 referee, over the decode band.
+    decode: f64,
+    /// The prefill against the decode flash, over the two bands.
+    between: f64,
+}
+
+fn ratio(diff: f64, band: f64) -> f64 {
+    if band > 0.0 {
+        diff / band
+    } else if diff == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Each (row, head) pair `pick` names: the prefill output, the decode flash's
+/// and the f64 attention of the cache the launch left, with the prefill band
+/// and the decode band.
+fn prefill_bands(
+    tables: &Tables,
+    case: &AttnCase,
+    inp: &AttnIn,
+    (pre, v0): (&AttnSeen, &AttnSeen),
+    pick: impl Fn(usize, usize) -> bool,
+) -> Result<Worst, String> {
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let out_n = out_len().ok_or("the output length wraps")?;
+    let end = case.from + case.rows;
+    let mut keys = Vec::new();
+    let mut vals = Vec::new();
+    for kv in 0..KV_HEADS {
+        keys.push(
+            (0..end)
+                .map(|i| dequant_k(&pre.cache, PREFILL_CTX, kv, i))
+                .collect::<Vec<_>>(),
+        );
+        vals.push(
+            (0..end)
+                .map(|i| dequant_v(&pre.cache, PREFILL_CTX, kv, i))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let gain = gain_array(&tables.q_gain)?;
+    let mut worst = Worst::default();
+    for r in 0..case.rows {
+        let pos = case.from + r;
+        let rope = tables
+            .rope
+            .get(pos * ROT..pos * ROT + ROT)
+            .ok_or("the rope row is past the table")?;
+        for head in 0..QUERY_HEADS {
+            if !pick(r, head) {
+                continue;
+            }
+            let kv = head / (QUERY_HEADS / KV_HEADS);
+            let qrow = &inp.q[r * q_n..(r + 1) * q_n];
+            let qn = norm_rope(&take_qg(qrow, head, 0)?, &gain, tables.eps, rope)?;
+            let gate = take_qg(qrow, head, HEAD_DIM)?;
+            let (k, v) = (&keys[kv][..=pos], &vals[kv][..=pos]);
+            let refer = attend(&qn, k, v)?;
+            let bp = prefill_band(&qn, k, v, &gate)?;
+            let bd = band(&qn, k, v, &gate, case.segments)?;
+            for dim in 0..HEAD_DIM {
+                let at = r * out_n + head * HEAD_DIM + dim;
+                let (gp, g0) = (pre.out[at], v0.out[at]);
+                let want = refer[dim] * sigmoid(f64::from(gate[dim]));
+                let here = format!(
+                    "row {r} (position {pos}) head {head} dim {dim}: prefill {gp}, decode flash {g0}, f64 attention {want}"
+                );
+                if !gp.is_finite() || !g0.is_finite() {
+                    return Err(format!("{here}: not finite"));
+                }
+                let (dp, d0) = ((f64::from(gp) - want).abs(), (f64::from(g0) - want).abs());
+                let between = (f64::from(gp) - f64::from(g0)).abs();
+                if dp > bp[dim] || d0 > bd[dim] || between > bp[dim] + bd[dim] {
+                    return Err(format!(
+                        "{here}: |prefill - f64| {dp} over band {}, |decode - f64| {d0} over band {}, |prefill - decode| {between}",
+                        bp[dim], bd[dim]
+                    ));
+                }
+                worst.prefill = worst.prefill.max(ratio(dp, bp[dim]));
+                worst.decode = worst.decode.max(ratio(d0, bd[dim]));
+                worst.between = worst.between.max(ratio(between, bp[dim] + bd[dim]));
+            }
+        }
+    }
+    Ok(worst)
+}
+
+/// The prefill attention of a chunk is within its band of the f64 attention of
+/// the cache it read, and so within the two bands of the decode flash's rows:
+/// every row and head, with the query heads reading their key head.
+pub fn attn_prefill(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let tables = load_tables(fixture)?;
+    let mut parts = Vec::new();
+    let mut worst = Worst::default();
+    for (from, rows) in PREFILL_CASES {
+        let case = AttnCase {
+            from,
+            rows,
+            segments: PREFILL_V0_SEGMENTS,
+        };
+        let at = format!("{rows} rows from {from}");
+        let inp = attn_inputs(rows)?;
+        let (pre, v0) = prefill_pair(h, &tables, &case, &inp)?;
+        for (what, seen) in [("prefill", &pre), ("decode flash", &v0)] {
+            if let Some(f) = seen.fault {
+                return Err(format!("{at}: the {what} raised {f}"));
+            }
+        }
+        same_cache(&pre.cache, &v0.cache).map_err(|e| format!("{at}: {e}"))?;
+        let w = prefill_bands(&tables, &case, &inp, (&pre, &v0), |_, _| true)
+            .map_err(|e| format!("{at}: {e}"))?;
+        worst.prefill = worst.prefill.max(w.prefill);
+        worst.decode = worst.decode.max(w.decode);
+        worst.between = worst.between.max(w.between);
+        parts.push(format!("{rows}@{from}"));
+    }
+    Ok(Verdict::Noted(format!(
+        "rows@first position {} are within the prefill band of the f64 attention (worst ratio {:.3}) and within the two bands of the decode flash (worst ratio {:.3}; the decode flash itself {:.3} of its band)",
+        parts.join(", "),
+        worst.prefill,
+        worst.between,
+        worst.decode
+    )))
+}
+
+/// The fault word names the layer's `site` and no other.
+fn only_site(fault: Option<Fault>, site: FaultSite) -> bool {
+    matches!(fault, Some(f) if f.layer == LAYER && f.code == site as u32 && f.sites == 1u32 << (site as u32))
+}
+
+/// The prefill rows of a chunk with a key row that is not finite, a gate that
+/// is not finite and a query past f16's range: the decode flash's NaN and
+/// fault word, never a plausible value.
+pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let tables = load_tables(fixture)?;
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let out_n = out_len().ok_or("the output length wraps")?;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    let case = AttnCase {
+        from: 37,
+        rows: 40,
+        segments: PREFILL_V0_SEGMENTS,
+    };
+
+    // A key row that is not finite, in key head 1 at the chunk's row 20
+    // (position 57, in the tile of keys 48 to 63): the rows of that key head
+    // from there on are NaN; the rows whose own position is under 48 and
+    // those of key head 0 are in band.
+    let mut inp = attn_inputs(case.rows)?;
+    inp.k[20 * kv_n + HEAD_DIM + 5] = f32::NAN;
+    let (pre, v0) = prefill_pair(h, &tables, &case, &inp)?;
+    if pre.fault != v0.fault {
+        return Err(format!(
+            "a non-finite key: the prefill's fault word is {:?}, the decode flash's {:?}",
+            pre.fault, v0.fault
+        ));
+    }
+    for r in 20..case.rows {
+        for head in QUERY_HEADS / KV_HEADS..QUERY_HEADS {
+            let at = r * out_n + head * HEAD_DIM;
+            if v0.out[at..at + HEAD_DIM].iter().any(|v| !v.is_nan()) {
+                return Err(format!(
+                    "the decode flash left row {r} head {head} finite past a non-finite key"
+                ));
+            }
+            if pre.out[at..at + HEAD_DIM].iter().any(|v| !v.is_nan()) {
+                return Err(format!(
+                    "the prefill left row {r} head {head} finite past a non-finite key"
+                ));
+            }
+        }
+    }
+    prefill_bands(&tables, &case, &inp, (&pre, &v0), |r, head| {
+        head < QUERY_HEADS / KV_HEADS || r < 11
+    })
+    .map_err(|e| format!("a non-finite key: {e}"))?;
+
+    // A gate that is not finite: the product site, and that value NaN, in both.
+    let mut inp = attn_inputs(case.rows)?;
+    let (gr, gh, gd) = (3usize, 2usize, 7usize);
+    inp.q[gr * q_n + gh * 2 * HEAD_DIM + HEAD_DIM + gd] = f32::NAN;
+    let (pre, v0) = prefill_pair(h, &tables, &case, &inp)?;
+    if !only_site(pre.fault, FaultSite::F32Product) || !only_site(v0.fault, FaultSite::F32Product) {
+        return Err(format!(
+            "a non-finite gate: the prefill's fault word is {:?}, the decode flash's {:?}, the product site alone is expected",
+            pre.fault, v0.fault
+        ));
+    }
+    let at = gr * out_n + gh * HEAD_DIM + gd;
+    if !pre.out[at].is_nan() || !v0.out[at].is_nan() {
+        return Err("a non-finite gate left its value finite".to_string());
+    }
+    prefill_bands(&tables, &case, &inp, (&pre, &v0), |r, head| {
+        (r, head) != (gr, gh)
+    })
+    .map_err(|e| format!("a non-finite gate: {e}"))?;
+
+    // A query past f16's range (a gain of 1e5): the product site, every row NaN.
+    let big = Tables {
+        eps: tables.eps,
+        q_gain: vec![1e5; HEAD_DIM],
+        k_gain: tables.k_gain.clone(),
+        rope: tables.rope.clone(),
+        note: tables.note.clone(),
+    };
+    let inp = attn_inputs(case.rows)?;
+    let pre = attn_prefill_run(h, &big, &case, &inp, PREFILL_CTX)?;
+    if !only_site(pre.fault, FaultSite::F32Product) {
+        return Err(format!(
+            "a query past f16's range: the fault word is {:?}, the product site alone is expected",
+            pre.fault
+        ));
+    }
+    if pre.out.iter().any(|v| !v.is_nan()) {
+        return Err("a query past f16's range left a finite value".to_string());
+    }
+    Ok(Verdict::Noted(
+        "a key row that is not finite makes NaN the rows of its key head from its position on and leaves the rows before its tile in band; a gate that is not finite raises the product site and is NaN in both; a query past f16's range raises the product site and every row is NaN"
+            .to_string(),
+    ))
 }
 
 /// The width of the hidden state the norm and the router read.
@@ -986,6 +1323,7 @@ struct DeltaRef {
     ring: MetalBuffer<f32>,
     partials: MetalBuffer<f32>,
     g: MetalBuffer<f32>,
+    prep: MetalBuffer<f32>,
 }
 
 /// Rows of the well-formed refusal-table launches.
@@ -1006,10 +1344,12 @@ struct DeltaOver {
     lane_len: usize,
     lane_at: usize,
     lane_to: usize,
+    prep_len: usize,
+    prep_at: usize,
 }
 
 impl DeltaOver {
-    fn whole(ch: usize) -> Self {
+    fn whole(ch: usize, prep: usize) -> Self {
         Self {
             n_k: N_K,
             rows: REF_ROWS,
@@ -1022,6 +1362,8 @@ impl DeltaOver {
             lane_len: 2,
             lane_at: 0,
             lane_to: 1,
+            prep_len: REF_ROWS * prep,
+            prep_at: 0,
         }
     }
 }
@@ -1051,6 +1393,7 @@ fn delta_ref_launch(
             ring: b.ring.window_mut(Elems(0), Elems(RING_ROWS * ch))?,
             partials: b.partials.window_mut(Elems(0), Elems(o.partials_len))?,
             g: b.g.window_mut(Elems(0), Elems(o.g_len))?,
+            prep: b.prep.window_mut(Elems(o.prep_at), Elems(o.prep_len))?,
             faults: h.device.fault_word(),
             n_v: VALUE_HEADS,
             head: HEAD_COLS,
@@ -1116,8 +1459,10 @@ fn delta_refusals(h: &Harness<'_>) -> Result<usize, String> {
         ring: ones(RING_ROWS * ch)?,
         partials: ones(REF_ROWS * P_ROW)?,
         g: ones(REF_ROWS * G_ROW)?,
+        // One word more than the rows need, so a window can start a word in.
+        prep: ones(REF_ROWS * prep_row()? + 1)?,
     };
-    let whole = DeltaOver::whole(ch);
+    let whole = DeltaOver::whole(ch, prep_row()?);
     let case = |what, needle, edit| delta_case(h, whole, what, needle, edit);
     let cases = vec![
         case("rows of 0", "rows of 0", |o, _| o.rows = 0),
@@ -1146,6 +1491,20 @@ fn delta_refusals(h: &Harness<'_>) -> Result<usize, String> {
             "partials window",
             |o, _| {
                 o.partials_len = REF_ROWS * P_ROW - 1;
+            },
+        ),
+        case(
+            "a prepared rows window short of the last row",
+            "prepared rows window",
+            |o, _| {
+                o.prep_len -= 1;
+            },
+        ),
+        case(
+            "a prepared rows window off the 16-byte word",
+            "16-byte word",
+            |o, _| {
+                o.prep_at = 1;
             },
         ),
         case(
@@ -1207,6 +1566,7 @@ struct AttnOver {
     partials_len: usize,
     ticket_len: usize,
     q8: bool,
+    prefill: bool,
 }
 
 impl AttnOver {
@@ -1225,6 +1585,7 @@ impl AttnOver {
             partials_len: REF_ROWS * partial_n,
             ticket_len: REF_ROWS,
             q8: false,
+            prefill: false,
         })
     }
 }
@@ -1251,6 +1612,34 @@ fn attn_ref_launch(
     } else {
         cache_of(&mut b.cache, CTX)?
     };
+    if o.prefill {
+        return h.kernels.attention_prefill(
+            encoder,
+            AttentionPrefillParams {
+                head_dim: HEAD_DIM,
+                query_heads: QUERY_HEADS,
+                kv_heads: o.kv_heads,
+                ctx: CTX,
+                eps: 1e-6,
+                layer: LAYER,
+                from: o.from,
+                rows: o.rows,
+                q: b.q.window(Elems(0), Elems(o.q_len))?,
+                q_stride: o.q_stride,
+                k: b.k.window(Elems(0), Elems(REF_ROWS * kv_n))?,
+                k_stride: kv_n,
+                v: b.v.window(Elems(0), Elems(REF_ROWS * kv_n))?,
+                v_stride: kv_n,
+                q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
+                cache,
+                out: b.out.window_mut(Elems(0), Elems(o.out_len))?,
+                out_stride: out_n,
+                fault: h.device.fault_word(),
+            },
+        );
+    }
     h.kernels.attention_rows(
         encoder,
         AttentionRowsParams {
@@ -1393,7 +1782,40 @@ fn attn_refusals(h: &Harness<'_>, tables: &Tables) -> Result<usize, String> {
     common::accepted_writes(h, &mut bufs, good, |h, b| {
         common::moved(h, &b.out, |v| *v != 1.0)
     })?;
-    Ok(count)
+    // The prefill launch: the shape and window refusals it shares with the
+    // rows launch, on the same buffers with the output as it was.
+    bufs.out = device
+        .upload(stream, &vec![1f32; REF_ROWS * out_n])
+        .map_err(why)?;
+    let whole = AttnOver {
+        prefill: true,
+        ..whole
+    };
+    let case = |what, needle, edit| attn_case(h, whole, what, needle, edit);
+    let cases = vec![
+        case("rows of 0", "rows of 0", |o| o.rows = 0),
+        case("kv heads of 1", "kv heads", |o| o.kv_heads = 1),
+        case("positions past the cache", "pass the cache", |o| {
+            o.from = 77
+        }),
+        case("a q stride shorter than a row", "q stride", |o| {
+            o.q_stride -= 1;
+        }),
+        case("a q window short of the last row", "q window", |o| {
+            o.q_len -= 1
+        }),
+        case("an out window short of the last row", "out window", |o| {
+            o.out_len -= 1;
+        }),
+        case("the q8_0 planes", "q8_0", |o| o.q8 = true),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &AttnRef| common::still(h, &b.out, |v| *v == 1.0);
+    let more = common::refuse_launches(h, "attention prefill", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, AttnRef> = Box::new(|b, encoder| attn_ref_launch(h, b, &whole, encoder));
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.out, |v| *v != 1.0)
+    })?;
+    Ok(count + more)
 }
 
 /// The buffers of the norm rows refusal table.
@@ -1560,6 +1982,8 @@ pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
         ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
         ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
         ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
+        ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),
+        ("attn_prefill_nan", Box::new(|| ctx.with(attn_prefill_nan))),
         ("norm_rows", Box::new(|| ctx.with(norm_rows))),
         ("norm_rows_nan", Box::new(|| ctx.with(norm_rows_nan))),
         ("rows_refusals", Box::new(|| ctx.with(rows_refusals))),

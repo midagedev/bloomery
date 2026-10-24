@@ -46,6 +46,20 @@ pub const FLASH_THREADS: usize = SIMD_WIDTH * SIMD_GROUPS;
 /// `1/sqrt(256)`, exact.
 pub const SCALE: f32 = 0.0625;
 
+/// Positions one prefill threadgroup holds: a SIMD group each, whose rows
+/// are the [`GQA`] query heads of one key head at that position.
+pub const PREFILL_POSITIONS: usize = 4;
+
+/// Keys one prefill tile holds: two 8-key fragments.
+pub const PREFILL_KEYS: usize = 16;
+
+/// Halves of padding after each row of a prefill tile, so the eight rows of
+/// a fragment load fall in different banks.
+pub const PREFILL_PAD: usize = 8;
+
+/// Threads in the prefill threadgroup.
+pub const PREFILL_THREADS: usize = PREFILL_POSITIONS * SIMD_WIDTH;
+
 const _: () = {
     assert!(GQA == QUERY_HEADS / KV_HEADS);
     assert!(HEADS_PER_SG * SIMD_GROUPS == GQA);
@@ -54,6 +68,10 @@ const _: () = {
     assert!(QG_STRIDE == HEAD_DIM * 2);
     assert!(FLASH_THREADS == 256);
     assert!(SCALE == 1.0 / 16.0);
+    assert!(PREFILL_POSITIONS * SIMD_WIDTH == 128);
+    assert!(PREFILL_KEYS == 16);
+    assert!(GQA == 8);
+    assert!(HEAD_DIM & 7 == 0 && (HEAD_DIM + PREFILL_PAD) & 7 == 0);
 };
 
 /// Segments a live key count takes.

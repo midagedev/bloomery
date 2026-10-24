@@ -16,17 +16,13 @@ use bloomery_device::{Buffer, Elems};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 
-use super::arena::Arena;
+use super::arena::{Arena, MixerBufs};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::kernels::{
-    EXPERT_K, EXPERT_SLOTS, LOGIT_STRIDE, PARTIALS_PER_HEAD, VALUE_HEADS, partials_len,
-    route_table_words, segments_for_keys,
+    EXPERT_K, EXPERT_SLOTS, LOGIT_STRIDE, PARTIALS_PER_HEAD, VALUE_HEADS, prepared_elems,
+    route_table_words,
 };
-
-/// The most rows of one attention launch. The launch's partials are held for
-/// this many rows of the cache's most segments.
-pub(super) const ATTN_RUN_ROWS: usize = 32;
 
 /// The widest a row of the delta numerator or the attention output is.
 pub(super) const MIX_STRIDE: usize = VALUE_HEADS * crate::kernels::HEAD_COLS;
@@ -80,10 +76,11 @@ pub(super) struct RowsArena {
     pub(super) mix: MetalBuffer<f32>,
     /// The delta step's partial sums of squares, a row each.
     pub(super) delta_partials: MetalBuffer<f32>,
-    /// One attention launch's segment partials.
-    pub(super) attn_partials: MetalBuffer<f32>,
-    /// The attention folds' tickets, one word a row.
-    pub(super) attn_ticket: MetalBuffer<u32>,
+    /// The delta launch's prepared rows, [`RowsArena::delta_prep_stride`] a
+    /// row: the widest delta layer's prepared row.
+    pub(super) delta_prep: MetalBuffer<f32>,
+    /// The f32s of one prepared delta row.
+    pub(super) delta_prep_stride: usize,
     /// The router's logits, [`LOGIT_STRIDE`] a row.
     pub(super) logits: MetalBuffer<f32>,
     /// The picks of each row, the shared expert's id last.
@@ -121,16 +118,6 @@ impl RowsArena {
         // The widest P1 output a layer writes, rounded up to the four floats
         // the GEMM's output rows are aligned to.
         let proj_stride = arena.proj.len().get().next_multiple_of(4);
-        let segments = segments_for_keys(
-            u32::try_from(arena.ctx)
-                .map_err(|_| refuse(format!("a cache of {} rows does not fit u32", arena.ctx)))?,
-        ) as usize;
-        let run_partials = product(
-            partials_len(segments)
-                .ok_or_else(|| refuse(format!("the partials of {segments} segments")))?,
-            ATTN_RUN_ROWS,
-            "an attention run's partials",
-        )?;
         let words = route_table_words(slots, arena.n_experts);
         let ids = zeroed(device, cap, "the ids")?;
         let x = zeroed(
@@ -158,8 +145,23 @@ impl RowsArena {
             product(cap, DELTA_PARTIALS_STRIDE, "the delta partials")?,
             "the delta partials",
         )?;
-        let attn_partials = zeroed(device, run_partials, "the attention partials")?;
-        let attn_ticket = zeroed(device, cap, "the attention tickets")?;
+        let delta_prep_stride = arena
+            .layers
+            .iter()
+            .filter_map(|l| match &l.mixer {
+                MixerBufs::Delta(d) => Some(d.n_k),
+                MixerBufs::Attention(_) => None,
+            })
+            .map(|n_k| {
+                prepared_elems(n_k)
+                    .ok_or_else(|| refuse(format!("a delta layer of {n_k} key heads")))
+            })
+            .try_fold(0, |w, e| e.map(|e| w.max(e)))?;
+        let delta_prep = zeroed(
+            device,
+            product(cap, delta_prep_stride.max(1), "the delta's prepared rows")?,
+            "the delta's prepared rows",
+        )?;
         let logits = zeroed(
             device,
             product(cap, LOGIT_STRIDE, "the logit rows")?,
@@ -186,7 +188,7 @@ impl RowsArena {
             proj.len().get(),
             mix.len().get(),
             delta_partials.len().get(),
-            attn_partials.len().get(),
+            delta_prep.len().get(),
             logits.len().get(),
             pick_weights.len().get(),
             h.len().get(),
@@ -194,7 +196,6 @@ impl RowsArena {
         ];
         let u32s = [
             ids.len().get(),
-            attn_ticket.len().get(),
             pick_ids.len().get(),
             sorted.len().get(),
             inv.len().get(),
@@ -210,8 +211,8 @@ impl RowsArena {
             proj_stride,
             mix,
             delta_partials,
-            attn_partials,
-            attn_ticket,
+            delta_prep,
+            delta_prep_stride,
             logits,
             pick_ids,
             pick_weights,

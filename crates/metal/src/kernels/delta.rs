@@ -5,11 +5,14 @@
 //! not. The grid is fixed: one threadgroup per value-head column block, 128
 //! threads in the group.
 //!
-//! [`Kernels::delta_rows`] is the same step over a chunk of rows in one
-//! launch, rows in order: the rows are the bits of the stepped launches. It
-//! encodes two dispatches, the rows and then the ring commit, because a
-//! threadgroup's later rows write ring slots that another threadgroup's first
-//! rows still read.
+//! [`Kernels::delta_rows`] is the same step over a chunk of rows: the rows
+//! are the bits of the stepped launches. A row has a state-free half (the
+//! conv, the q/k norm, β, the decay, the gate's SiLU) and a recurrence half
+//! (the delta update of the state). The launch runs the state-free half of
+//! every row in parallel into a prepared row (the caller's scratch window), the
+//! recurrence over the rows in order, and then the numerators and partial sums
+//! in parallel. The ring commit follows the state-free half, which is the last
+//! reader of the pre-chunk slots.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -38,6 +41,65 @@ const _: () = assert!(RING_ROWS == 11 && GROUPS == 256 && GROUP_THREADS == 128);
 const _: () = assert!(HEAD_COLS / PARTIALS_PER_HEAD == 16);
 
 const WHAT: &str = "delta step";
+
+/// Where the parts of a prepared row sit, in floats from the row's start. The
+/// scaled queries, then the scaled keys (`n_k` key heads of [`HEAD_COLS`]
+/// values each), the value conv outputs and the gate's SiLU ([`VALUE_HEADS`]
+/// heads of [`HEAD_COLS`]), β and the decay ([`VALUE_HEADS`] each), and one
+/// status word for each recurrence threadgroup. Every part starts on a
+/// 16-byte boundary: the recurrence reads the keys four at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrepLayout {
+    stride: usize,
+    k: usize,
+    v: usize,
+    gate: usize,
+    decay: usize,
+    beta: usize,
+    bad: usize,
+}
+
+impl PrepLayout {
+    fn of(n_k: usize) -> Option<Self> {
+        let k = n_k.checked_mul(HEAD_COLS)?;
+        let v = k.checked_mul(2)?;
+        let gate = v.checked_add(VALUE_HEADS * HEAD_COLS)?;
+        let decay = gate.checked_add(VALUE_HEADS * HEAD_COLS)?;
+        let beta = decay.checked_add(VALUE_HEADS)?;
+        let bad = beta.checked_add(VALUE_HEADS)?;
+        let stride = bad.checked_add(GROUPS)?;
+        Some(Self {
+            stride,
+            k,
+            v,
+            gate,
+            decay,
+            beta,
+            bad,
+        })
+    }
+
+    /// The seven words the kernel's `GdnPrepLayout` holds, in its order.
+    fn words(self) -> Result<[u32; 7], DeviceError> {
+        let w = |name: &str, n: usize| word(WHAT, name, n);
+        Ok([
+            w("the prepared row stride", self.stride)?,
+            w("the prepared keys offset", self.k)?,
+            w("the prepared values offset", self.v)?,
+            w("the prepared gates offset", self.gate)?,
+            w("the prepared decays offset", self.decay)?,
+            w("the prepared betas offset", self.beta)?,
+            w("the prepared status offset", self.bad)?,
+        ])
+    }
+}
+
+/// f32s of one prepared row for `n_k` key heads: the scratch window of
+/// [`DeltaRowsParams::prep`] holds that many a row.
+#[must_use]
+pub fn prepared_elems(n_k: usize) -> Option<usize> {
+    PrepLayout::of(n_k).map(|l| l.stride)
+}
 
 /// Key index of lane `j`'s value `i`: `32·(i/4) + 4·j + (i%4)`.
 #[must_use]
@@ -363,8 +425,14 @@ pub struct DeltaRowsParams<'w> {
     pub ring: WindowMut<'w, f32, MetalDevice>,
     /// The partial sums of `o²`, [`GROUPS`] values a row.
     pub partials: WindowMut<'w, f32, MetalDevice>,
-    /// The gated numerator, one value per value-head column a row.
+    /// The gated numerator, one value per value-head column a row. The
+    /// recurrence leaves the column outputs here, and the launch's last
+    /// dispatch replaces them with the numerators.
     pub g: WindowMut<'w, f32, MetalDevice>,
+    /// The prepared rows' scratch, [`prepared_elems`] values a row, on a
+    /// 16-byte boundary. The launch writes and reads it; the caller reads
+    /// nothing from it.
+    pub prep: WindowMut<'w, f32, MetalDevice>,
     /// The fault word a raise lands in.
     pub faults: &'w MetalFaultWord,
     /// Value heads. This layer has [`VALUE_HEADS`].
@@ -395,16 +463,21 @@ pub struct DeltaRowsParams<'w> {
     pub eps: f32,
 }
 
-/// The pipelines of the rows launch: the rows, then the ring commit.
+/// The pipelines of the rows launch: the state-free half, the recurrence, the
+/// numerators and partials, and the ring commit.
 pub(crate) struct RowsPipelines {
+    prep: Pipeline,
     rows: Pipeline,
+    post: Pipeline,
     ring: Pipeline,
 }
 
 impl RowsPipelines {
     pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
         Ok(Self {
+            prep: library.pipeline("gdn_prep_rows")?,
             rows: library.pipeline("gdn_rows")?,
+            post: library.pipeline("gdn_post_rows")?,
             ring: library.pipeline("gdn_ring_rows")?,
         })
     }
@@ -457,15 +530,36 @@ fn check_rows(p: &DeltaRowsParams<'_>) -> Result<(), DeviceError> {
     word(WHAT, "the ring length", ring)?;
     check_window_len(WHAT, "state", p.state.len(), state)?;
     check_window_len(WHAT, "ring", p.ring.len(), ring)?;
+    let layout = PrepLayout::of(p.n_k)
+        .ok_or_else(|| refuse(format!("the prepared row of n_k {} does not fit", p.n_k)))?;
+    check_strided(
+        WHAT,
+        "prepared rows",
+        p.prep.len(),
+        p.rows,
+        layout.stride,
+        layout.stride,
+    )?;
+    let range = p
+        .prep
+        .byte_range()
+        .map_err(|e| refuse(format!("the prepared rows window: {e}")))?;
+    if range.start.get() % 16 != 0 {
+        return Err(refuse(format!(
+            "the prepared rows start {} bytes in, not on the 16-byte word the recurrence reads",
+            range.start.get()
+        )));
+    }
     Ok(())
 }
 
 impl Kernels {
-    /// Encode the step over `p.rows` rows: the rows dispatch, a memory
-    /// barrier, and the ring commit. The shape and every window are checked
-    /// before any dispatch, and a refused launch encodes nothing. The two
-    /// dispatches are one group each, and the barrier between them is the
-    /// ring commit's order after the rows' reads.
+    /// Encode the step over `p.rows` rows: the state-free half, a memory
+    /// barrier, the ring commit with the recurrence, a barrier, and the
+    /// numerators and partial sums. The shape and every window are checked
+    /// before any dispatch, and a refused launch encodes nothing. The ring
+    /// commit and the recurrence read and write disjoint windows, so they may
+    /// overlap.
     #[must_use = "a refused launch encoded nothing"]
     pub fn delta_rows(
         &self,
@@ -474,8 +568,9 @@ impl Kernels {
     ) -> Result<(), DeviceError> {
         check_rows(&p)?;
         let ch = channels(p.n_k).expect("check_rows fitted the channels");
+        let layout = PrepLayout::of(p.n_k).expect("check_rows fitted the prepared row");
         let st = p.strides;
-        let args = [
+        let step = [
             word(WHAT, "n_k", p.n_k)?,
             p.map.word(),
             word(WHAT, "the lane count", p.lanes)?,
@@ -484,6 +579,8 @@ impl Kernels {
             p.layer,
             p.pos,
             p.eps.to_bits(),
+        ];
+        let rows = [
             word(WHAT, "rows", p.rows)?,
             word(WHAT, "the x stride", st.x)?,
             word(WHAT, "the z stride", st.z)?,
@@ -491,9 +588,16 @@ impl Kernels {
             word(WHAT, "the a stride", st.a)?,
             word(WHAT, "the g stride", st.g)?,
             word(WHAT, "the partials stride", st.partials)?,
-        ]
-        .map(u32::to_ne_bytes);
-        encoder.set_pipeline(&self.delta_rows.rows);
+        ];
+        let args = step
+            .into_iter()
+            .chain(rows)
+            .chain(layout.words()?)
+            .map(u32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let args: [[u8; 4]; 22] = args.try_into().expect("twenty-two words");
+
+        encoder.set_pipeline(&self.delta_rows.prep);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of(&p.conv_w)?)?;
@@ -502,15 +606,10 @@ impl Kernels {
         slot.set(Binding::of(&p.dt_bias)?)?;
         slot.set(Binding::of(&p.ssm_a)?)?;
         slot.set(Binding::of(&p.z)?)?;
-        slot.set(Binding::of(&p.norm_w)?)?;
-        slot.set(Binding::of(&p.lane)?)?;
-        slot.set(Binding::of_mut(&p.state)?)?;
         slot.set(Binding::of_mut(&p.ring)?)?;
-        slot.set(Binding::of_mut(&p.partials)?)?;
-        slot.set(Binding::of_mut(&p.g)?)?;
+        slot.set(Binding::of_mut(&p.prep)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
-        slot.set(p.faults.binding())?;
-        slot.dispatch_groups(GROUPS, 1, GROUP_THREADS)?;
+        slot.dispatch_groups(p.n_k, p.rows, GROUP_THREADS)?;
 
         encoder.memory_barrier();
         let ring_args = [
@@ -529,6 +628,26 @@ impl Kernels {
             ch.div_ceil(RING_THREADS),
             p.rows.min(RING_ROWS),
             RING_THREADS,
-        )
+        )?;
+
+        encoder.set_pipeline(&self.delta_rows.rows);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of_mut(&p.prep)?)?;
+        slot.set(Binding::of(&p.lane)?)?;
+        slot.set(Binding::of_mut(&p.state)?)?;
+        slot.set(Binding::of_mut(&p.g)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(p.faults.binding())?;
+        slot.dispatch_groups(GROUPS, 1, GROUP_THREADS)?;
+
+        encoder.memory_barrier();
+        encoder.set_pipeline(&self.delta_rows.post);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of_mut(&p.prep)?)?;
+        slot.set(Binding::of(&p.norm_w)?)?;
+        slot.set(Binding::of_mut(&p.partials)?)?;
+        slot.set(Binding::of_mut(&p.g)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.dispatch_groups(VALUE_HEADS, p.rows, GROUP_THREADS)
     }
 }

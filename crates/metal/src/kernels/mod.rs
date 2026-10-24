@@ -39,6 +39,7 @@ mod router_geom;
 mod rows;
 mod seg;
 
+pub use attention::AttentionPrefillParams;
 pub use attention::AttentionRowsParams;
 pub use attention::{
     AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE,
@@ -52,6 +53,7 @@ pub use delta::HeadMap;
 pub use delta::Q_SCALE;
 pub use delta::channels;
 pub use delta::key_of;
+pub use delta::prepared_elems;
 pub use delta::ring_elems;
 pub use delta::state_elems;
 pub use delta::state_index;

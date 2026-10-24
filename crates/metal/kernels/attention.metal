@@ -42,6 +42,11 @@
 // it reads the rows the append dispatch wrote. A row is the bits of the decode
 // launch at its position with the same segment count.
 //
+// The prefill kernel (attn_prefill_f16, at the end of the file) is the same
+// attention over a chunk of rows for the prompt pass: simdgroup matrices over
+// tiles of keys, f16 operands. It reads the cache the append dispatch wrote
+// and is held to the decode flash by a band.
+//
 // The gate is the second half of each query head, the raw projection. The
 // output value is attn * (1 / (1 + exp(-g))), after the softmax. A non-finite
 // gate, or a non-finite product of a finite attention, raises the product
@@ -1054,4 +1059,252 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
                                 nullptr, rope, partials + row * partials_stride,
                                 out + row * args.out_stride, faults, ticket + row, tpg.x, group.x,
                                 tid, (threadgroup float *)shared, last_flag);
+}
+
+// The flash of a chunk of rows with simdgroup matrices. A threadgroup holds
+// four consecutive positions of one key head, a SIMD group each; a SIMD
+// group's rows are the 8 query heads of the key head at its position, so the
+// 8x8 fragments of its score matrix are (heads x keys) and every key of a
+// tile serves all 8 heads. The causal mask is therefore one position a SIMD
+// group, never a row. The K and V tiles of 16 keys sit in threadgroup memory
+// beside the other three SIMD groups' and are the loop's only shared state:
+// the queries, the running max and weight sum and the 256 values of each row
+// stay in the SIMD group's registers.
+//
+// The queries are normed and roped by the decode's own functions into a
+// threadgroup stage, rounded to f16, and held as fragments for the whole
+// loop. The score is the fragment product of f16 operands in f32 over the 256
+// dims, times the exact scale. The softmax is online in f32 over tiles of
+// 16 keys taken from absolute key 0, so a row's tiles do not depend on the
+// chunk it came in or on the rows around it; the weights of a tile are
+// rounded to f16 for the value product, and the weight sum is the f32
+// weights'. A tile beyond a row's own position is an exact no-op for the
+// row: its weights are 0 and its rescale factor 1. The sums are therefore not
+// the decode flash's: the rows are held to the decode flash by a band, not by
+// bits.
+//
+// A query value past f16's range raises the product site and the SIMD
+// group's rows are NaN. A key or value row that is not finite makes NaN the
+// rows of its tile and after, and raises nothing, as in the decode flash. The
+// tail of the chunk repeats its last row in the SIMD groups past it, and
+// stores nothing for them.
+#include <metal_simdgroup_matrix>
+
+#define PF_STRIDE (BLOOMERY_ATTN_HEAD + BLOOMERY_ATTN_PF_PAD)
+#define PF_TILE_HALVES (BLOOMERY_ATTN_PF_KEYS * PF_STRIDE)
+#define PF_STAGE_ROWS (BLOOMERY_ATTN_PF_POSITIONS * BLOOMERY_ATTN_GQA)
+// Every loop over the fragments of the query or the accumulator is unrolled
+// in full: a fragment array indexed by a run-time value lives in memory, and
+// the products then run at a fraction of the matrix unit's rate.
+#define PF_DCHUNKS (BLOOMERY_ATTN_HEAD / 8u)
+
+static_assert(PF_STAGE_ROWS * PF_STRIDE <= 2u * PF_TILE_HALVES,
+              "the query stage fits in the K and V tiles it shares memory with");
+static_assert(BLOOMERY_ATTN_PF_KEYS == 16u, "a tile is two 8-key fragments");
+static_assert(BLOOMERY_ATTN_GQA == 8u, "a fragment's rows are the 8 query heads of a key head");
+
+kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
+                             device float const *q_gain [[buffer(1)]],
+                             device float const *rope [[buffer(2)]],
+                             device ushort const *cache_k [[buffer(3)]],
+                             device ushort const *cache_v [[buffer(4)]],
+                             device float *out [[buffer(5)]],
+                             constant AttnRowsArgs &args [[buffer(6)]],
+                             device atomic_uint *faults [[buffer(7)]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint3 group [[threadgroup_position_in_grid]],
+                             uint3 tpg [[threadgroups_per_grid]]) {
+    threadgroup half shared[2u * PF_TILE_HALVES];
+    threadgroup float scratch[BLOOMERY_ATTN_PF_POSITIONS * BLOOMERY_ATTN_HEAD];
+    threadgroup half *tile_k = shared;
+    threadgroup half *tile_v = shared + PF_TILE_HALVES;
+
+    // The heaviest blocks (the last positions) are the first threadgroups.
+    uint kv = group.y;
+    uint row0 = (tpg.x - 1u - group.x) * BLOOMERY_ATTN_PF_POSITIONS;
+    uint last = min(row0 + BLOOMERY_ATTN_PF_POSITIONS, args.rows) - 1u;
+    bool writes = row0 + sg <= last;
+    uint row = min(row0 + sg, last);
+    AttnArgs a = attn_row_args(args, row);
+    uint max_live;
+    bool ok = attn_bounds(a, faults, writes, lane, max_live);
+    uint block_keys = args.from + last + 1u;
+    // A block past the cache has no key to read; its rows are the bounds' NaN.
+    if (block_keys > args.ctx) {
+        block_keys = 0u;
+    }
+
+    // The queries of this position, normed and roped, as f16 rows of the stage.
+    threadgroup float *sc = scratch + sg * BLOOMERY_ATTN_HEAD;
+    bool overflow = false;
+    bool unusable = !ok;
+    for (uint h = 0u; h < BLOOMERY_ATTN_GQA; ++h) {
+        uint head = kv * BLOOMERY_ATTN_GQA + h;
+        float y[8];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (ok) {
+            device float const *src =
+                q + (ulong)row * args.q_stride + head * BLOOMERY_ATTN_QG + lane * 8u;
+            for (uint d = 0u; d < 8u; ++d) {
+                sc[lane * 8u + d] = src[d];
+            }
+            attn_norm_rope(sc, q_gain, rope + a.pos * BLOOMERY_ATTN_ROT, lane, a.eps, y);
+        } else {
+            for (uint d = 0u; d < 8u; ++d) {
+                y[d] = 0.0f;
+            }
+        }
+        threadgroup half *dst = shared + (sg * BLOOMERY_ATTN_GQA + h) * PF_STRIDE + lane * 8u;
+        for (uint d = 0u; d < 8u; ++d) {
+            half hv = half(y[d]);
+            if (!isfinite(float(hv))) {
+                unusable = true;
+                overflow = overflow || isfinite(y[d]);
+            }
+            dst[d] = hv;
+        }
+    }
+    unusable = simd_any(unusable);
+    overflow = simd_any(overflow);
+    if (overflow && lane == 0u && writes) {
+        raise(faults, a.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qf[PF_DCHUNKS];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < PF_DCHUNKS; ++c) {
+        simdgroup_load(qf[c], shared + sg * BLOOMERY_ATTN_GQA * PF_STRIDE + c * 8u, PF_STRIDE);
+    }
+    // The K and V tiles are loaded over the stage.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Where this lane sits in a fragment: row `fm` (a query head), columns
+    // `fn` and `fn + 1`.
+    ushort qid = ushort(lane / 4u);
+    ushort fm = (qid & 4u) + ((lane / 2u) % 4u);
+    ushort fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+
+    simdgroup_float8x8 acc[PF_DCHUNKS];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < PF_DCHUNKS; ++c) {
+        acc[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float running_m = -INFINITY;
+    float running_l = 0.0f;
+
+    uint tiles = (block_keys + BLOOMERY_ATTN_PF_KEYS - 1u) / BLOOMERY_ATTN_PF_KEYS;
+    for (uint t = 0u; t < tiles; ++t) {
+        uint k0 = t * BLOOMERY_ATTN_PF_KEYS;
+        for (uint i = 0u; i < BLOOMERY_ATTN_PF_KEYS / BLOOMERY_ATTN_PF_POSITIONS; ++i) {
+            uint e = tid + i * (BLOOMERY_ATTN_PF_POSITIONS * 32u);
+            uint kr = e / 32u;
+            uint c = e % 32u;
+            uint key = k0 + kr;
+            uint4 wk = uint4(0u);
+            uint4 wv = uint4(0u);
+            if (key < block_keys) {
+                ulong at = ((ulong)kv * args.ctx + key) * (BLOOMERY_ATTN_HEAD / 8u) + c;
+                wk = ((device const uint4 *)cache_k)[at];
+                wv = ((device const uint4 *)cache_v)[at];
+            }
+            *((threadgroup uint4 *)(tile_k + kr * PF_STRIDE + c * 8u)) = wk;
+            *((threadgroup uint4 *)(tile_v + kr * PF_STRIDE + c * 8u)) = wv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 s1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        #pragma clang loop unroll(full)
+    for (uint c = 0u; c < PF_DCHUNKS; ++c) {
+            simdgroup_half8x8 k0f;
+            simdgroup_half8x8 k1f;
+            simdgroup_load(k0f, tile_k + c * 8u, PF_STRIDE, ulong2(0, 0), true);
+            simdgroup_load(k1f, tile_k + 8u * PF_STRIDE + c * 8u, PF_STRIDE, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(s0, qf[c], k0f, s0);
+            simdgroup_multiply_accumulate(s1, qf[c], k1f, s1);
+        }
+
+        // This lane's four scores of its row: keys fn, fn + 1 of each fragment.
+        float sv[4];
+        bool live[4];
+        float tile_max = -INFINITY;
+        for (uint j = 0u; j < 4u; ++j) {
+            float raw = j < 2u ? s0.thread_elements()[j] : s1.thread_elements()[j - 2u];
+            uint key = k0 + (j / 2u) * 8u + fn + (j % 2u);
+            live[j] = key <= a.pos;
+            sv[j] = raw * a.scale;
+            if (live[j]) {
+                tile_max = max(tile_max, sv[j]);
+            }
+        }
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, ushort(1)));
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, ushort(8)));
+        float new_m = max(running_m, tile_max);
+        float old_m = running_m;
+        float factor = old_m > -INFINITY ? exp(old_m - new_m) : 0.0f;
+        float p[4];
+        float weights = 0.0f;
+        for (uint j = 0u; j < 4u; ++j) {
+            p[j] = live[j] ? exp(sv[j] - new_m) : 0.0f;
+            weights += p[j];
+        }
+        running_l = running_l * factor + weights;
+        running_m = new_m;
+        // The rows' rescale as a diagonal fragment product, so the accumulators
+        // stay in matrix registers; a tile that raised no row's max skips it.
+        if (t > 0u && simd_any(factor != 1.0f)) {
+            simdgroup_float8x8 diag;
+            diag.thread_elements()[0] = fn == fm ? factor : 0.0f;
+            diag.thread_elements()[1] = fn + 1u == fm ? factor : 0.0f;
+            #pragma clang loop unroll(full)
+    for (uint c = 0u; c < PF_DCHUNKS; ++c) {
+                simdgroup_float8x8 scaled;
+                simdgroup_multiply(scaled, diag, acc[c]);
+                acc[c] = scaled;
+            }
+        }
+        simdgroup_half8x8 p0;
+        simdgroup_half8x8 p1;
+        p0.thread_elements()[0] = half(p[0]);
+        p0.thread_elements()[1] = half(p[1]);
+        p1.thread_elements()[0] = half(p[2]);
+        p1.thread_elements()[1] = half(p[3]);
+        #pragma clang loop unroll(full)
+    for (uint c = 0u; c < PF_DCHUNKS; ++c) {
+            simdgroup_half8x8 v0f;
+            simdgroup_half8x8 v1f;
+            simdgroup_load(v0f, tile_v + c * 8u, PF_STRIDE);
+            simdgroup_load(v1f, tile_v + 8u * PF_STRIDE + c * 8u, PF_STRIDE);
+            simdgroup_multiply_accumulate(acc[c], p0, v0f, acc[c]);
+            simdgroup_multiply_accumulate(acc[c], p1, v1f, acc[c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // The weight sum of a row is the sum of its four lanes' partial sums.
+    running_l += simd_shuffle_xor(running_l, ushort(1));
+    running_l += simd_shuffle_xor(running_l, ushort(8));
+    if (!writes) {
+        return;
+    }
+    uint head = kv * BLOOMERY_ATTN_GQA + fm;
+    bool whole = !unusable && running_l > 0.0f && isfinite(running_m);
+    float inv = 1.0f / running_l;
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < PF_DCHUNKS; ++c) {
+        for (uint e = 0u; e < 2u; ++e) {
+            uint dim = c * 8u + fn + e;
+            uint at = row * args.out_stride + head * BLOOMERY_ATTN_HEAD + dim;
+            if (!whole) {
+                out[at] = NAN;
+                continue;
+            }
+            float attn = acc[c].thread_elements()[e] * inv;
+            float g = q[(ulong)row * args.q_stride + head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim];
+            float product = attn * attn_sigmoid(g);
+            attn_commit(out, at, attn, g, product, faults, a.layer);
+        }
+    }
 }

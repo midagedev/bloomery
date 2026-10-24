@@ -126,7 +126,10 @@ fn geometry_header() -> String {
          #define BLOOMERY_ATTN_PARTIAL {apartial}\n\
          #define BLOOMERY_ATTN_QG {aqg}\n\
          #define BLOOMERY_ATTN_LANES {alanes}\n\
-         #define BLOOMERY_ATTN_THREADS {athreads}\n",
+         #define BLOOMERY_ATTN_THREADS {athreads}\n\
+         #define BLOOMERY_ATTN_PF_POSITIONS {apfpos}\n\
+         #define BLOOMERY_ATTN_PF_KEYS {apfkeys}\n\
+         #define BLOOMERY_ATTN_PF_PAD {apfpad}\n",
         rows = geometry::ROWS_PER_SIMD_GROUP,
         segs = geometry::MAX_SEGMENTS,
         heads = geometry::VALUE_HEADS,
@@ -158,6 +161,9 @@ fn geometry_header() -> String {
         aqg = attention_geom::QG_STRIDE,
         alanes = attention_geom::SIMD_WIDTH,
         athreads = attention_geom::FLASH_THREADS,
+        apfpos = attention_geom::PREFILL_POSITIONS,
+        apfkeys = attention_geom::PREFILL_KEYS,
+        apfpad = attention_geom::PREFILL_PAD,
     )
 }
 

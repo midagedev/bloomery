@@ -75,7 +75,7 @@ use runtime::seqstate::{self, Kept};
 
 use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
 use super::count::{GroupBytes, GroupKind, Layer};
-use super::ops::{AttnRun, Feed, MetalOps, RowsCtx, attn_runs};
+use super::ops::{Feed, MetalOps, RowsCtx};
 use super::rows::RowsArena;
 use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints};
@@ -948,14 +948,12 @@ impl Session {
         rows.ids.write_at(Elems(0), ids)?;
         let slot = slot_of(from + rows_n - 1);
         let head = out == PassOut::Last;
-        let runs = attn_runs(from, m);
         let cap_rows = rows.cap;
         let mut ops = PassOps {
             stream: &self.stream,
             kernels: &self.kernels,
             arena: &mut self.arena,
             rows,
-            runs: &runs,
             from,
             head,
             count: EncodeCount::default(),
@@ -1567,7 +1565,6 @@ struct PassOps<'s> {
     kernels: &'s Kernels,
     arena: &'s mut Arena,
     rows: &'s mut RowsArena,
-    runs: &'s [AttnRun],
     from: u32,
     head: bool,
     count: EncodeCount,
@@ -1594,10 +1591,7 @@ impl PassOps<'_> {
         f(&mut MetalOps::rows(
             &mut enc,
             self.arena,
-            RowsCtx {
-                arena: self.rows,
-                runs: self.runs,
-            },
+            RowsCtx { arena: self.rows },
             self.kernels,
             self.from,
             self.head,

@@ -47,6 +47,22 @@
 //! on that path (the 40, one per key, one per rescale, the division by the
 //! weight sum, and four for the sigmoid and the product). The reference
 //! softmax and the reference sigmoid are f64.
+//!
+//! # The prefill band
+//!
+//! The prefill kernel rounds the normed and roped query to f16 before the
+//! score, so each product `q_i k_i` carries `q_i`'s relative error
+//! `2^-11` (round to nearest, normal range) and an absolute `2^-25` for a
+//! value in f16's subnormal range. The keys are the cache's f16 words, exact.
+//! The 256 products are summed in f32 by the fragment product, in some order
+//! of at most `256 + 8` roundings with the scale's one: a score is off by at
+//! most `Δ = scale * ((2^-11 + G(265)) * sum_i |q_i k_i| + 2^-25 * sum_i |k_i|)`.
+//! The weights are then rounded to f16 before the value product, each by a
+//! relative `2^-11` and an absolute `2^-25` (the weight sum stays f32), so the
+//! attention is held to `B = (rel + 2^-11 + θ) * sum_j w_j |v_jd| + 2^-25 *
+//! sum_j |v_jd|` (the weight sum is at least 1 in the kernel's scale, the max
+//! weight being 1). The tile rescales are `ceil(n_keys / 16)`, and there are no
+//! segments. The gate adds the decode band's terms unchanged.
 
 use bloomery_metal::kernels::{HEAD_DIM, ROT, SCALE, TILE};
 use gguf::quant::{f32_to_f16_bits, half_to_f32, quantize_q8_0};
@@ -241,8 +257,70 @@ pub fn attend(
     Ok(acc)
 }
 
+/// What the band's derivation takes from the kernel it bounds.
+struct Terms {
+    /// Relative error of the query operand of a score product.
+    operand: f64,
+    /// Absolute error of the query operand, per unit of the key's magnitude.
+    operand_abs: f64,
+    /// Roundings on the longest path from a product to the score.
+    dot_ops: usize,
+    /// Relative error of a weight before the value product.
+    weight: f64,
+    /// Absolute error of a weight before the value product.
+    weight_abs: f64,
+}
+
+/// The decode flash's terms: exact operands and weights.
+const DECODE: Terms = Terms {
+    operand: 0.0,
+    operand_abs: 0.0,
+    dot_ops: DOT_OPS,
+    weight: 0.0,
+    weight_abs: 0.0,
+};
+
+/// f16 round to nearest, relative: `2^-11`.
+const F16_REL: f64 = 1.0 / 2048.0;
+
+/// f16's subnormal spacing over two: `2^-25`.
+const F16_ABS: f64 = 1.0 / 33_554_432.0;
+
+/// The prefill flash's terms: the query and the weights rounded to f16, a
+/// fragment product over the head's 256 values (plus the 8 of a fragment's
+/// own sum and the scale).
+const PREFILL: Terms = Terms {
+    operand: F16_REL,
+    operand_abs: F16_ABS,
+    dot_ops: HEAD_DIM + 8 + 1,
+    weight: F16_REL,
+    weight_abs: F16_ABS,
+};
+
 /// The absolute band per dimension of the gated output, from the derivation above.
 pub fn band(
+    q: &[f32; HEAD_DIM],
+    keys: &[[f32; HEAD_DIM]],
+    vals: &[[f32; HEAD_DIM]],
+    gate: &[f32; HEAD_DIM],
+    segments: usize,
+) -> Result<[f64; HEAD_DIM], String> {
+    band_of(&DECODE, q, keys, vals, gate, segments)
+}
+
+/// The band of the prefill flash, from the prefill derivation above. The
+/// prefill has no segments.
+pub fn prefill_band(
+    q: &[f32; HEAD_DIM],
+    keys: &[[f32; HEAD_DIM]],
+    vals: &[[f32; HEAD_DIM]],
+    gate: &[f32; HEAD_DIM],
+) -> Result<[f64; HEAD_DIM], String> {
+    band_of(&PREFILL, q, keys, vals, gate, 0)
+}
+
+fn band_of(
+    t: &Terms,
     q: &[f32; HEAD_DIM],
     keys: &[[f32; HEAD_DIM]],
     vals: &[[f32; HEAD_DIM]],
@@ -258,14 +336,16 @@ pub fn band(
     }
     let weights = softmax_weights(q, keys)?;
     let scale = f64::from(SCALE);
-    let g = gamma_bound(DOT_OPS);
+    let g = gamma_bound(t.dot_ops);
     let mut delta = 0.0f64;
     for k in keys {
         let mut mag = 0.0f64;
+        let mut key_mag = 0.0f64;
         for i in 0..HEAD_DIM {
             mag += (f64::from(q[i]) * f64::from(k[i])).abs();
+            key_mag += f64::from(k[i]).abs();
         }
-        let dj = g * scale * mag;
+        let dj = scale * ((t.operand + g) * mag + t.operand_abs * key_mag);
         if dj.total_cmp(&delta).is_gt() {
             delta = dj;
         }
@@ -274,21 +354,23 @@ pub fn band(
     let n_keys = keys.len();
     let n_rescale = n_keys.div_ceil(TILE) + segments;
     let theta = gamma_bound(n_keys + n_rescale) + f64_usize(n_rescale) * ETA;
-    let ops = DOT_OPS + n_keys + n_rescale + 1 + GATE_OPS;
+    let ops = t.dot_ops + n_keys + n_rescale + 1 + GATE_OPS;
     let floor = f64::from(f32::MIN_POSITIVE) * f64_usize(ops);
     let mut out = [0.0f64; HEAD_DIM];
     for (d, out) in out.iter_mut().enumerate() {
         let mut weighted = 0.0f64;
+        let mut value_mag = 0.0f64;
         let mut attn = 0.0f64;
         for (j, v) in vals.iter().enumerate() {
             let value = f64::from(v[d]);
             weighted += weights[j] * value.abs();
+            value_mag += value.abs();
             attn += weights[j] * value;
         }
         let sigma = sigmoid(f64::from(gate[d]));
         let y = attn * sigma;
         let d_sigma = ETA * sigma * (1.0 - sigma) + 2.0 * U * sigma;
-        let b_attn = (rel + theta) * weighted;
+        let b_attn = (rel + t.weight + theta) * weighted + t.weight_abs * value_mag;
         *out = sigma.abs() * b_attn + attn.abs() * d_sigma.abs() + U * y.abs() + floor;
     }
     Ok(out)

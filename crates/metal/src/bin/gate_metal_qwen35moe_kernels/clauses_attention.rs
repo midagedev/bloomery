@@ -115,7 +115,7 @@ pub(super) fn head_row(index: u32, kind: u32) -> [f32; HEAD_DIM] {
     row
 }
 
-fn gain_array(values: &[f32]) -> Result<[f32; HEAD_DIM], String> {
+pub(super) fn gain_array(values: &[f32]) -> Result<[f32; HEAD_DIM], String> {
     <[f32; HEAD_DIM]>::try_from(values).map_err(|_| "a gain holds 256 values".to_string())
 }
 
@@ -126,7 +126,7 @@ fn take_head(flat: &[f32], head: usize) -> Result<[f32; HEAD_DIM], String> {
         .ok_or_else(|| format!("head {head} is past the buffer"))
 }
 
-fn take_qg(flat: &[f32], head: usize, offset: usize) -> Result<[f32; HEAD_DIM], String> {
+pub(super) fn take_qg(flat: &[f32], head: usize, offset: usize) -> Result<[f32; HEAD_DIM], String> {
     let at = head * QG_STRIDE + offset;
     flat.get(at..at + HEAD_DIM)
         .and_then(|row| <[f32; HEAD_DIM]>::try_from(row).ok())
@@ -542,7 +542,7 @@ fn launch(
     })
 }
 
-fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HEAD_DIM] {
+pub(super) fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HEAD_DIM] {
     let row = kv * ctx + index;
     match cache {
         CacheBack::F16 { k, .. } => {
@@ -561,7 +561,7 @@ fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HE
     }
 }
 
-fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HEAD_DIM] {
+pub(super) fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HEAD_DIM] {
     let row = kv * ctx + index;
     match cache {
         CacheBack::F16 { v, .. } => {

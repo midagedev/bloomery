@@ -42,8 +42,6 @@ use crate::kernels::{
 
 mod rows;
 
-pub(super) use rows::{AttnRun, attn_runs};
-
 const WHAT: &str = "qwen35moe ops";
 
 /// The whole of `b`.
@@ -76,11 +74,9 @@ pub(super) enum Feed {
     Device,
 }
 
-/// What a pass adds to a step's ops: the rows arena, and the launches the
-/// attention takes over the pass's positions.
+/// What a pass adds to a step's ops: the rows arena.
 pub(super) struct RowsCtx<'a> {
     pub(super) arena: &'a mut RowsArena,
-    pub(super) runs: &'a [AttnRun],
 }
 
 /// The arm a unit of rows takes.

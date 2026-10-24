@@ -18,50 +18,19 @@ use bloomery_device::{Buffer, Elems};
 use chain::ChainError;
 
 use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
-use super::super::rows::{ATTN_RUN_ROWS, MIX_STRIDE};
+use super::super::rows::MIX_STRIDE;
 use super::super::session::SessionError;
 use super::{MetalOps, WHAT, all, all_mut};
 use crate::kernels::{
-    AttentionRowsParams, AttnCache, CONV_TAPS, CombineParams, DeltaRowStrides, DeltaRowsParams,
+    AttentionPrefillParams, AttnCache, CONV_TAPS, CombineParams, DeltaRowStrides, DeltaRowsParams,
     EXPERT_K, EXPERT_SLOTS, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams,
     HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormRowsParams, HeadParams, KV_HEADS, LOGIT_STRIDE,
     NormRowsParams, Operand, QUERY_HEADS, RouteSelectParams, RouteTableParams, RoutedKind,
-    RoutedParams, VALUE_HEADS, partials_len, route_table_words, route_tiles, segments_for_keys,
+    RoutedParams, VALUE_HEADS, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
 pub(in super::super) const PASS_OPERAND: Operand = Operand::F16;
-
-/// One attention launch of a pass: `len` rows from the pass's row `r0`, all
-/// of which take `segments` segments.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in super::super) struct AttnRun {
-    pub(in super::super) r0: usize,
-    pub(in super::super) len: usize,
-    pub(in super::super) segments: u32,
-}
-
-/// The attention launches of a pass of `m` rows from position `from`: runs of
-/// consecutive rows whose live key counts take the same segment count, cut at
-/// [`ATTN_RUN_ROWS`] rows. The flash splits a row's keys by the launch's
-/// segment count, so a launch whose rows share the count each decode step
-/// would give them holds each row to the bits of the step at its position.
-pub(in super::super) fn attn_runs(from: u32, m: usize) -> Vec<AttnRun> {
-    let mut runs: Vec<AttnRun> = Vec::new();
-    for r in 0..m {
-        let keys = from + u32::try_from(r).expect("a pass's rows fit u32") + 1;
-        let segments = segments_for_keys(keys);
-        match runs.last_mut() {
-            Some(run) if run.segments == segments && run.len < ATTN_RUN_ROWS => run.len += 1,
-            _ => runs.push(AttnRun {
-                r0: r,
-                len: 1,
-                segments,
-            }),
-        }
-    }
-    runs
-}
 
 impl MetalOps<'_, '_> {
     /// The pass's step record slot: its last row's.
@@ -166,15 +135,14 @@ impl MetalOps<'_, '_> {
         Ok(())
     }
 
-    /// Layer `l`'s attention over the pass: the append and the flash of each
-    /// run of rows.
+    /// Layer `l`'s attention over the pass: the prefill flash appends the
+    /// chunk's keys and values and runs every row against the cache.
     pub(super) fn rows_attn_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
         let from = self.pos;
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
-        let runs = ctx.runs;
         let rows = &mut *ctx.arena;
         let Arena {
             layers,
@@ -192,59 +160,40 @@ impl MetalOps<'_, '_> {
             .into());
         };
         let stride = rows.proj_stride;
-        for run in runs {
-            let parts = partials_len(run.segments as usize).ok_or_else(|| SessionError::Shape {
-                what: WHAT,
-                detail: format!("the partials of {} segments do not fit", run.segments),
-            })?;
-            let at = |range_start: usize| -> (usize, usize) {
-                (
-                    run.r0 * stride + range_start,
-                    run.len * stride - range_start,
-                )
-            };
-            let (q_at, q_len) = at(a.q.start);
-            let (k_at, k_len) = at(a.k.start);
-            let (v_at, v_len) = at(a.v.start);
-            self.kernels.attention_rows(
-                self.enc,
-                AttentionRowsParams {
-                    head_dim: HEAD_DIM,
-                    query_heads: QUERY_HEADS,
-                    kv_heads: KV_HEADS,
-                    segments: run.segments as usize,
-                    ctx: *cache_rows,
-                    eps: *eps,
-                    layer: layer_word(l),
-                    from: from + u32::try_from(run.r0).expect("a pass's rows fit u32"),
-                    rows: run.len,
-                    q: rows.proj.window(Elems(q_at), Elems(q_len))?,
-                    q_stride: stride,
-                    k: rows.proj.window(Elems(k_at), Elems(k_len))?,
-                    k_stride: stride,
-                    v: rows.proj.window(Elems(v_at), Elems(v_len))?,
-                    v_stride: stride,
-                    q_gain: all(&a.q_norm)?,
-                    k_gain: all(&a.k_norm)?,
-                    rope: all(rope)?,
-                    cache: AttnCache::F16 {
-                        k: all_mut(&mut a.k_cache)?,
-                        v: all_mut(&mut a.v_cache)?,
-                    },
-                    partials: rows
-                        .attn_partials
-                        .window_mut(Elems(0), Elems(run.len * parts))?,
-                    out: rows
-                        .mix
-                        .window_mut(Elems(run.r0 * MIX_STRIDE), Elems(run.len * MIX_STRIDE))?,
-                    out_stride: MIX_STRIDE,
-                    fault: &faults[slot],
-                    ticket: rows.attn_ticket.window_mut(Elems(0), Elems(run.len))?,
+        let at = |range_start: usize| -> (usize, usize) { (range_start, m * stride - range_start) };
+        let (q_at, q_len) = at(a.q.start);
+        let (k_at, k_len) = at(a.k.start);
+        let (v_at, v_len) = at(a.v.start);
+        self.kernels.attention_prefill(
+            self.enc,
+            AttentionPrefillParams {
+                head_dim: HEAD_DIM,
+                query_heads: QUERY_HEADS,
+                kv_heads: KV_HEADS,
+                ctx: *cache_rows,
+                eps: *eps,
+                layer: layer_word(l),
+                from,
+                rows: m,
+                q: rows.proj.window(Elems(q_at), Elems(q_len))?,
+                q_stride: stride,
+                k: rows.proj.window(Elems(k_at), Elems(k_len))?,
+                k_stride: stride,
+                v: rows.proj.window(Elems(v_at), Elems(v_len))?,
+                v_stride: stride,
+                q_gain: all(&a.q_norm)?,
+                k_gain: all(&a.k_norm)?,
+                rope: all(rope)?,
+                cache: AttnCache::F16 {
+                    k: all_mut(&mut a.k_cache)?,
+                    v: all_mut(&mut a.v_cache)?,
                 },
-            )?;
-            // The next run reuses the partials and the tickets.
-            self.enc.memory_barrier();
-        }
+                out: rows.mix.window_mut(Elems(0), Elems(m * MIX_STRIDE))?,
+                out_stride: MIX_STRIDE,
+                fault: &faults[slot],
+            },
+        )?;
+        self.enc.memory_barrier();
         Ok(())
     }
 
@@ -346,6 +295,9 @@ impl MetalOps<'_, '_> {
                     .delta_partials
                     .window_mut(Elems(0), Elems(m * strides.partials))?,
                 g: rows.mix.window_mut(Elems(0), Elems(m * strides.g))?,
+                prep: rows
+                    .delta_prep
+                    .window_mut(Elems(0), Elems(m * rows.delta_prep_stride))?,
                 faults: &faults[slot],
                 n_v: VALUE_HEADS,
                 head: HEAD_COLS,
@@ -680,27 +632,6 @@ impl MetalOps<'_, '_> {
 mod tests {
     use super::*;
     use crate::kernels::router;
-
-    /// The launches of a pass cut where the segment count changes and at the
-    /// run cap, cover every row once and in order, and give each row the
-    /// segment count a step at its position takes.
-    #[test]
-    fn attention_runs_cover_the_pass() {
-        for (from, m) in [(0u32, 9usize), (0, 600), (37, 300), (2000, 100), (4090, 33)] {
-            let runs = attn_runs(from, m);
-            let mut next = 0usize;
-            for run in &runs {
-                assert_eq!(run.r0, next, "runs follow one another");
-                assert!(run.len >= 1 && run.len <= ATTN_RUN_ROWS);
-                for r in run.r0..run.r0 + run.len {
-                    let keys = from + u32::try_from(r).unwrap() + 1;
-                    assert_eq!(segments_for_keys(keys), run.segments, "row {r} from {from}");
-                }
-                next += run.len;
-            }
-            assert_eq!(next, m, "the runs hold every row");
-        }
-    }
 
     /// The logit rows hold the routed experts and the shared gate, at a stride
     /// the GEMM's output rows are aligned to.
