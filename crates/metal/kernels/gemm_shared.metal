@@ -4,7 +4,7 @@
 // argument blocks the host packs are one program's ABI whichever library
 // runs it (kernels/gemm.rs and kernels/routed.rs launch both), and the
 // expert pair's SwiGLU is the decode pair's (experts.metal) and both
-// grouped GEMMs' epilogue.
+// grouped GEMMs' epilogue. The activations' checked cast is every GEMM's.
 
 #include <metal_stdlib>
 
@@ -101,4 +101,30 @@ static_assert(sizeof(RoutedArgs) == 32, "RoutedArgs is eight words");
 // silu(gate) * up. No route weight: the fold multiplies by it.
 inline float pair_swiglu(float gate, float up) {
     return gate / (1.0f + exp(-gate)) * up;
+}
+
+// One 16-value run of an activation row, staged for a GEMM's tile: loaded
+// as scalars (no window alignment is assumed) and checked as float4s. The
+// f16 arm's cast is the activation quantizer's: a value that is not finite
+// or past the half range (one test: not at most the half maximum in
+// magnitude, which a NaN fails too) raises the quantizer's site and stages
+// NaN, so the row's outputs are NaN — never a silent inf. Every GEMM of both
+// libraries stages its activations through this one cast.
+template <typename T>
+inline void gemm_stage_x(device const float * xr, threadgroup vec<T, 4> * dst,
+                         device atomic_uint * faults, uint layer) {
+    FOR_UNROLL(short g = 0; g < 4; ++g) {
+        const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
+        if (sizeof(T) == 2) {
+            const bool4 bad = !(fabs(v) <= 65504.f);
+            if (any(bad)) {
+                raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+                dst[g] = vec<T, 4>(select(v, float4(NAN), bad));
+            } else {
+                dst[g] = vec<T, 4>(v);
+            }
+        } else {
+            dst[g] = vec<T, 4>(v);
+        }
+    }
 }
