@@ -399,17 +399,17 @@ fn the_draft_layer_is_the_files() {
              update"
         )
     };
-    let open = |layer: Option<usize>| {
-        let row = layer.map(eh);
+    let open = |layers: &[usize]| {
+        let named: Vec<String> = layers.iter().map(|&n| eh(n)).collect();
         let mut rows: Vec<&str> = own_rows();
-        rows.extend(row.as_deref());
+        rows.extend(named.iter().map(String::as_str));
         open_own(&dir, &rows).unwrap_or_else(|e| panic!("{e}"))
     };
-    open(Some(48))
+    open(&[48])
         .check_draft_layer(48)
         .unwrap_or_else(|e| panic!("{e}"));
-    for (layer, named) in [(Some(47), "[47]"), (None, "[]")] {
-        let e = open(layer)
+    for (layers, named) in [(&[47][..], "[47]"), (&[], "[]"), (&[47, 48], "[47, 48]")] {
+        let e = open(layers)
             .check_draft_layer(48)
             .expect_err("another draft layer");
         let want = format!(
@@ -417,7 +417,7 @@ fn the_draft_layer_is_the_files() {
         );
         assert!(
             matches!(&e, RefError::Malformed { what, .. } if *what == want),
-            "{layer:?}: {e}"
+            "{layers:?}: {e}"
         );
     }
     remove(&dir);
