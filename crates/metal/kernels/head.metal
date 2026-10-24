@@ -50,8 +50,8 @@ kernel void head_argmax_kernel(device const typename Q::Block *weights [[buffer(
 
     const int first_row = simd_first_row(tg, sg);
     matvec_rows<Q, true, false, false, false>(weights, x, logits, (int)args.nblocks, args.eps,
-                                       args.layer, gain, nullptr, faults, first_row,
-                                       (int)args.rows, tiisg);
+                                              args.layer, gain, nullptr, faults, first_row,
+                                              (int)args.rows, tiisg);
 
     // Every logit this group stored is visible.
     threadgroup_barrier(mem_flags::mem_device);

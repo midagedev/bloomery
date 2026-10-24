@@ -53,7 +53,9 @@ impl PassSink<Session> for Quiet {
 fn mlx_fixture_path() -> Result<PathBuf, String> {
     let root = refset::fixture::root().map_err(|e| format!("the fixture root: {e}"))?;
     let at = format!("{root}/qwen35moe-mlxsplit");
-    let entries = std::fs::read_dir(&at).map_err(|e| format!("the MLX fixture {at}: {e}"))?;
+    let entries = std::fs::read_dir(&at).map_err(|e| {
+        format!("the MLX fixture {at}: {e} (`tools/mlx-fixture.py make` writes it from the qwen35moe fixture)")
+    })?;
     let mut found: Vec<String> = entries
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .filter(|n| n.ends_with(".gguf") && n.contains("-00001-of-"))

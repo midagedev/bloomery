@@ -3,10 +3,9 @@ pub const SIMD_WIDTH: usize = 32;
 
 /// The output rows one SIMD group of a mat-vec owns. The kernels' row loop
 /// and their tail are written for any of 2, 4 and 8, the counts the probe
-/// sweeps; four is the landed count, the measured choice of the M1 Pro sweep
-/// (the small-width families gain a third to a half: their input and gain
-/// loads halve per row). A count outside that set is a kernel edit, not a
-/// geometry.
+/// sweeps; four is the landed count, the probe sweep's choice (the input and
+/// gain loads are shared by more rows). A count outside that set is a kernel
+/// edit, not a geometry.
 pub const ROWS_PER_SIMD_GROUP: usize = 4;
 
 /// The SIMD groups in a mat-vec's threadgroup: the default. The count is the

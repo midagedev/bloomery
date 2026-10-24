@@ -25,7 +25,8 @@
 // shared-expert tensors; every other slot reads stack + ids[slot] * expert
 // bytes. The id is an int32, then that expert's rows, the way ggml mul_mv_id
 // reads an id. The select is uniform in the threadgroup. The route weight is
-// not applied here.//
+// not applied here.
+//
 // The pair norms its input as it loads it, the dense mat-vec's norm on load
 // (norm.metal) in its order: every SIMD group loads the whole input once, the
 // lane adds the squares of what it loaded before the gain multiplies them,

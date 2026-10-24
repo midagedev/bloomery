@@ -18,7 +18,7 @@
 // The argument block of a mat-vec, bound by value at slot 3.
 struct MatvecArgs {
     uint  rows;     // output rows
-    uint  nblocks;  // input columns / 256
+    uint  nblocks;  // input columns / the type's block values
     uint  layer;    // the layer a raise is recorded in (BLOOMERY_LAYER_NONE for a direct launch)
     float eps;      // the norm's epsilon (read by the norm variants only)
 };
@@ -36,7 +36,7 @@ struct MatvecSeg {
 
 // The argument block of a segmented mat-vec, bound by value at slot 3.
 struct SegArgs {
-    uint nblocks;   // input columns / 256
+    uint nblocks;   // input columns / the type's block values
     uint layer;     // the layer a raise is recorded in
     float eps;      // the norm's epsilon
     uint nseg;      // how many segments the dispatch runs
