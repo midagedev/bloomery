@@ -862,7 +862,9 @@ fn expected_sets() {
 /// host in its gathered rows, one on the NVMe tier refused by name, and the Qwen3.8
 /// file's row width as given, whatever its head tensors' order (its model
 /// tensors and first two layers, planned by its program's routed rule). A host
-/// reserve on node 0 raises its bytes by itself.
+/// reserve on node 0 raises its bytes by itself. A table read from NVMe adds
+/// its fill to the step once: twice the read rate takes half the fill off, on
+/// one Spark and on two, whose split and node windows stay.
 #[test]
 fn n1_is_today() {
     for case in cases() {
@@ -988,6 +990,26 @@ fn n1_is_today() {
     assert_eq!(nvme.serial_nvme, 4 * row);
     let (_, faster_step) = step_of(&plan, n, 2_000_000_000);
     assert_eq!(filled_step - faster_step, 2 * row);
+    let two_sparks = |nvme_read| {
+        let mut nodes = spark_nodes(2, shape.layers, fabric(2, LAMBDAS[0]));
+        let budgets = budgets_on(&model, &mut nodes, &[machine.clone(), machine.clone()]);
+        let w = Workload {
+            nvme_read,
+            ..workload(3_000)
+        };
+        let plan = plan_nodes(&nodes, &nvme, &budgets, w).expect("two Sparks");
+        let p = plan.predict().expect("a prediction");
+        let windows: Vec<u64> = p.per_node.iter().map(|l| l.window_ns).collect();
+        (plan.owned().to_vec(), windows, p.step_ns)
+    };
+    let (owned, windows, filled_pair) = two_sparks(1_000_000_000);
+    assert!(
+        owned.iter().all(|&o| o > 0),
+        "both Sparks hold ids: {owned:?}"
+    );
+    let (faster_owned, faster_windows, faster_pair) = two_sparks(2_000_000_000);
+    assert_eq!((faster_owned, faster_windows), (owned, windows));
+    assert_eq!(filled_pair - faster_pair, 2 * row);
     row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE, RowTableSource::Split)
         .expect("the table's tier");
     assert_eq!(plan.row_tier().expect("one tier"), Some(Device::Host));
