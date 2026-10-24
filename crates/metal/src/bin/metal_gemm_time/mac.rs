@@ -23,7 +23,14 @@
 //!
 //! The arms (`--arm NAME`, repeatable; `f16` and `f32` by default):
 //!
-//! - `f16`, `f32`: the crate's GEMM, launched through `Kernels::gemm`.
+//! - `f16`, `f32`: the crate's simdgroup GEMM, launched through
+//!   `Kernels::gemm`, on every device (the GEMM path the device's own rule
+//!   picks is printed in the header, not timed by these arms).
+//! - `tensor16`, `tensor32`: the tensor-op GEMM (`gemm_tensor.metal`, Metal
+//!   4's `matmul2d`), launched through `Kernels::gemm` on kernels whose GEMMs
+//!   come from that program, on any device that builds it.
+//! - `tensor16_relaxed`, `tensor32_relaxed`: the same with the op's relaxed
+//!   precision on (MLX's and llama.cpp's setting; the engine keeps it off).
 //! - `mlx16`, `mlx32`: MLX's `qmm_t` for 4-bit group-64 weights, A4 only
 //!   (`probe_mlx_qmm.metal`, its own library), reading MLX's layout; its
 //!   output is checked against a CPU product.
@@ -57,6 +64,10 @@
 //! `--routed` times the experts' grouped GEMM over a route table instead of
 //! the dense shapes (`routed.rs`, with its own `--rows`, `--skew` and
 //! `--hot`).
+//!
+//! The header's `gemm:` line names the device's GPU architecture, whether
+//! it reports Metal 4's family, the matrix-unit rule's verdict and the GEMM
+//! path the engine takes on it.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -67,7 +78,7 @@ use bloomery_metal::encode::{Binding, Bindings, ComputeEncoder};
 use bloomery_metal::kernels::{
     GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, Kernels, Operand, Quant,
 };
-use bloomery_metal::library::SOURCE;
+use bloomery_metal::library::{SOURCE, TENSOR_SOURCE};
 use bloomery_metal::{GpuInterval, Library, MetalBuffer, MetalStream};
 
 #[path = "../shared/oracle.rs"]
@@ -178,8 +189,11 @@ struct Method {
 /// What is timed at a configuration.
 #[derive(Clone, Copy)]
 enum Arm {
-    /// The crate's GEMM, through `Kernels::gemm`.
+    /// The crate's simdgroup GEMM, through `Kernels::gemm`.
     Engine(Operand),
+    /// The tensor-op GEMM, through `Kernels::gemm`; the op's relaxed
+    /// precision on when the flag is.
+    Tensor(Operand, bool),
     /// MLX's `qmm_t`, A4 only.
     Mlx(Operand),
     /// The shipped source with a variant's edits.
@@ -198,18 +212,28 @@ impl Arm {
     fn name(self) -> String {
         match self {
             Self::Engine(o) => operand_name(o).to_string(),
+            Self::Tensor(o, relaxed) => format!(
+                "tensor{}{}",
+                &operand_name(o)[1..],
+                if relaxed { "_relaxed" } else { "" }
+            ),
             Self::Mlx(Operand::F16) => "mlx16".to_string(),
             Self::Mlx(Operand::F32) => "mlx32".to_string(),
             Self::Variant(v, o) => format!("{}_{}", v.name, operand_name(o)),
         }
     }
 
-    /// The arm named `name`: `f16`, `f32`, `mlx16`, `mlx32` or
+    /// The arm named `name`: `f16`, `f32`, `tensor16`, `tensor32`,
+    /// `tensor16_relaxed`, `tensor32_relaxed`, `mlx16`, `mlx32` or
     /// `<variant>_f16` / `<variant>_f32`.
     fn parse(name: &str) -> Result<Self, String> {
         match name {
             "f16" => return Ok(Self::Engine(Operand::F16)),
             "f32" => return Ok(Self::Engine(Operand::F32)),
+            "tensor16" => return Ok(Self::Tensor(Operand::F16, false)),
+            "tensor32" => return Ok(Self::Tensor(Operand::F32, false)),
+            "tensor16_relaxed" => return Ok(Self::Tensor(Operand::F16, true)),
+            "tensor32_relaxed" => return Ok(Self::Tensor(Operand::F32, true)),
             "mlx16" => return Ok(Self::Mlx(Operand::F16)),
             "mlx32" => return Ok(Self::Mlx(Operand::F32)),
             _ => {}
@@ -226,7 +250,7 @@ impl Arm {
             .map(|v| v.name.to_string())
             .collect();
         Err(format!(
-            "no arm named {name}: f16, f32, mlx16, mlx32, or <variant>_f16 / _f32 of {}",
+            "no arm named {name}: f16, f32, tensor16, tensor32, tensor16_relaxed, tensor32_relaxed, mlx16, mlx32, or <variant>_f16 / _f32 of {}",
             known.join(", ")
         ))
     }
@@ -236,9 +260,46 @@ impl Arm {
 struct Libs {
     mlx: Option<Library>,
     variants: Vec<(&'static str, Library)>,
+    /// The tensor-op program and the kernels over it, strict then relaxed.
+    tensor: [Option<(Library, Kernels)>; 2],
+}
+
+/// The tensor-op GEMMs' program, with the op's relaxed precision on when
+/// `relaxed` is.
+pub(crate) fn tensor_library(device: &MetalDevice, relaxed: bool) -> Result<Library, String> {
+    const STRICT: &str = "#define TENSOR_RELAXED false";
+    let text = if relaxed {
+        if TENSOR_SOURCE.matches(STRICT).count() != 1 {
+            return Err(format!(
+                "the tensor-op source holds {STRICT:?} other than once"
+            ));
+        }
+        TENSOR_SOURCE.replace(STRICT, "#define TENSOR_RELAXED true")
+    } else {
+        TENSOR_SOURCE.to_string()
+    };
+    Library::tensor_from_source_text(device, &text)
+        .map_err(|e| format!("the tensor-op GEMMs do not build here: {e}"))
 }
 
 impl Libs {
+    /// The tensor-op program and the kernels whose GEMMs come from it.
+    fn tensor(
+        &mut self,
+        device: &MetalDevice,
+        relaxed: bool,
+    ) -> Result<&(Library, Kernels), String> {
+        let slot = &mut self.tensor[usize::from(relaxed)];
+        if slot.is_none() {
+            let library = tensor_library(device, relaxed)?;
+            let kernels =
+                Kernels::from_library(&device.library().with_tensor_gemms(library.clone()))
+                    .map_err(why)?;
+            *slot = Some((library, kernels));
+        }
+        Ok(slot.as_ref().expect("the kernels were just made"))
+    }
+
     fn mlx(&mut self, device: &MetalDevice) -> Result<&Library, String> {
         if self.mlx.is_none() {
             self.mlx = Some(Library::from_source_text(device, mlx::SOURCE).map_err(why)?);
@@ -361,9 +422,18 @@ fn run() -> Result<(), String> {
         info.name,
         device.library().path().name()
     );
+    let units = device.library().matrix_units();
+    println!(
+        "gemm: architecture={} metal4={} matrix-units={} engine-path={}",
+        units.architecture,
+        units.metal4,
+        units.present(),
+        device.library().gemm_path().name()
+    );
     let mut libs = Libs {
         mlx: None,
         variants: Vec::new(),
+        tensor: [None, None],
     };
     for arm in &arms {
         if let Arm::Variant(v, _) = arm {
@@ -385,7 +455,8 @@ fn run() -> Result<(), String> {
         method.gflop,
         method.copies
     );
-    let kernels = Kernels::new(&device).map_err(why)?;
+    // The `f16` and `f32` arms' GEMMs are the simdgroup ones on every device.
+    let kernels = Kernels::from_library(&device.library().with_simdgroup_gemms()).map_err(why)?;
     let ctx = Ctx {
         device: &device,
         stream,
@@ -474,6 +545,9 @@ fn pipelines(device: &MetalDevice, libs: &mut Libs, arms: &[Arm]) -> Result<(), 
         for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
             let (library, name): (&Library, String) = match arm {
                 Arm::Engine(o) => (device.library(), engine_kernel(quant, o)),
+                Arm::Tensor(o, relaxed) => {
+                    (&libs.tensor(device, relaxed)?.0, engine_kernel(quant, o))
+                }
                 Arm::Mlx(o) => {
                     if quant != Quant::A4 {
                         continue;
@@ -504,7 +578,7 @@ fn peaks(device: &MetalDevice, stream: &MetalStream, method: Method) -> Result<(
     let ctx = Ctx {
         device,
         stream,
-        kernels: &Kernels::new(device).map_err(why)?,
+        kernels: &Kernels::from_library(&device.library().with_simdgroup_gemms()).map_err(why)?,
         method,
     };
     let floats = vec![0.0625f32; 512];
@@ -672,28 +746,34 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     let fault = ctx.device.fault_word();
 
     let timed = match arm {
-        Arm::Engine(operand) => time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
-            ctx.kernels
-                .gemm(
-                    encoder,
-                    GemmParams {
-                        quant,
-                        rows: n,
-                        cols: k,
-                        acts: r,
-                        weights: pool.window(copy, 0)?,
-                        x: x_f32.window(Elems(0), Elems(r * k)).map_err(why)?,
-                        x_stride: k,
-                        y: y.window_mut(Elems(0), Elems(r * n)).map_err(why)?,
-                        y_stride: n,
-                        mode: GemmMode::Store,
-                        operand,
-                        fault,
-                        layer: LAYER_NONE,
-                    },
-                )
-                .map_err(|e| format!("the dispatch did not encode: {e}"))
-        })?,
+        Arm::Engine(operand) | Arm::Tensor(operand, _) => {
+            let kernels = match arm {
+                Arm::Tensor(_, relaxed) => &libs.tensor(ctx.device, relaxed)?.1,
+                _ => ctx.kernels,
+            };
+            time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
+                kernels
+                    .gemm(
+                        encoder,
+                        GemmParams {
+                            quant,
+                            rows: n,
+                            cols: k,
+                            acts: r,
+                            weights: pool.window(copy, 0)?,
+                            x: x_f32.window(Elems(0), Elems(r * k)).map_err(why)?,
+                            x_stride: k,
+                            y: y.window_mut(Elems(0), Elems(r * n)).map_err(why)?,
+                            y_stride: n,
+                            mode: GemmMode::Store,
+                            operand,
+                            fault,
+                            layer: LAYER_NONE,
+                        },
+                    )
+                    .map_err(|e| format!("the dispatch did not encode: {e}"))
+            })?
+        }
         Arm::Variant(v, operand) => {
             let library = libs.variant(ctx.device, v)?;
             let pipeline = library
