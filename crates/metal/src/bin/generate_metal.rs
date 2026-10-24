@@ -25,7 +25,12 @@
 //!     model=<path> open_s=<the open's wall> device_allocated_bytes=<the
 //!     driver's live device bytes after the open> prompt_ids=<count>
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
-//!     decode_s=<the loop's wall> decode_tok_s=<rate> stop=<eog|length|ctx>
+//!     decode_passes=<count> decode_s=<the loop's wall> decode_tok_s=<rate>
+//!     stop=<eog|length|ctx>
+//!
+//! The decode rate is the loop's passes over its wall: generated token 0
+//! comes from the prompt call and is in `decode_tokens`, not in the rate. A
+//! run of one token has no pass, and its rate prints `none`.
 //!
 //! `--profile [N]` (default N 32; `--profile-layers` implies it) steps N
 //! more tokens after the summary, each group of each token on a command
@@ -345,7 +350,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         s: &mut Session,
         p: &Profile,
         mut id: u32,
-        decode_ms: f64,
+        decode_ms: Option<f64>,
     ) -> Result<(), String> {
         let rows = s.ctx() - s.pos() as usize;
         if rows == 0 {
@@ -440,7 +445,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             }
         }
         eprintln!(
-            "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={:.3}",
+            "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={}",
             total.groups as f64 / steps as f64,
             total.gpu_s / steps as f64 * 1e3,
             total.bytes as f64 / steps as f64,
@@ -449,7 +454,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             } else {
                 0.0
             },
-            decode_ms,
+            decode_ms.map_or_else(|| "none".to_owned(), |ms| format!("{ms:.3}")),
         );
         Ok(())
     }
@@ -587,15 +592,20 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         eprintln!("prompt_s={prompt_s:.3}");
         eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
         eprintln!("decode_tokens={}", out.tokens());
+        eprintln!("decode_passes={}", out.passes());
         eprintln!("decode_s={decode_s:.3}");
-        eprintln!("decode_tok_s={:.1}", out.tokens() as f64 / decode_s);
+        if out.passes() == 0 {
+            eprintln!("decode_tok_s=none");
+        } else {
+            eprintln!("decode_tok_s={:.1}", out.passes() as f64 / decode_s);
+        }
         eprintln!("stop={}", out.stop.name());
         if let Some(p) = &a.profile {
             let id = *out
                 .ids
                 .last()
                 .ok_or("a profile of no token: the run picked none")?;
-            let decode_ms = decode_s / out.tokens() as f64 * 1e3;
+            let decode_ms = (out.passes() > 0).then(|| decode_s / out.passes() as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
         }
         if let Some(n) = a.step_times {

@@ -71,6 +71,13 @@ impl Generated {
     pub fn tokens(&self) -> usize {
         self.ids.len()
     }
+
+    /// The passes [`Generated::decode_wall`] holds: every token after
+    /// generated token 0, which the prompt call picks.
+    #[must_use]
+    pub fn passes(&self) -> usize {
+        self.ids.len().saturating_sub(1)
+    }
 }
 
 /// Greedy generation over the session: `prompt`'s ids through the target,
