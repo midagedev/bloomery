@@ -37,26 +37,18 @@ use bloomery_device::{Buffer, Device, Elems, LAYER_NONE, Stream};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, Bindings, ComputeEncoder};
 use bloomery_metal::fault::MetalFaultWord;
-use bloomery_metal::kernels::{EXPERT_SLOTS, GEMM_THREADS, Quant, ROUTE_TILE};
+use bloomery_metal::kernels::router::{EXPERTS, K as HIDDEN};
+use bloomery_metal::kernels::{
+    EXPERT_K, EXPERT_SLOTS, GEMM_THREADS, Quant, ROUTED_IDS as TOP_K, ROUTED_ROWS as TILE_ROWS,
+    TABLE_THREADS, route_tiles,
+};
 use bloomery_metal::library::SOURCE;
 use bloomery_metal::{Library, MetalBuffer, Pipeline};
 
 use super::oracle::Rng;
 use super::variants::{self, Variant};
-use super::{Ctx, Timed, oracle, synthetic, time_dispatches};
+use super::{Ctx, Timed, fnv, oracle, synthetic, time_dispatches};
 
-/// The routed experts and the shared group after them.
-const EXPERTS: usize = 256;
-/// Routed picks a row keeps.
-const TOP_K: usize = 8;
-/// The hidden width.
-const HIDDEN: usize = 2048;
-/// An expert's outputs of the gate (and of the up).
-const EXPERT_K: usize = 512;
-/// The weight rows of a routed tile (`ROUTED_ROWS`).
-const TILE_ROWS: usize = 64;
-/// The route table's threads (`ROUTE_THREADS`).
-const TABLE_THREADS: usize = 1024;
 /// Distinct synthetic experts the stack cycles through.
 const DISTINCT: usize = 4;
 
@@ -68,11 +60,10 @@ pub struct Opts {
     pub hot: bool,
 }
 
-/// An arm: its name, its library, the table's tile height.
+/// An arm: its name and its library.
 struct RArm<'l> {
     name: String,
     library: &'l Library,
-    tile: usize,
 }
 
 /// The weights of a layer: the stacks and the shared tensors, uploaded once.
@@ -108,39 +99,44 @@ fn weights(ctx: &Ctx<'_>) -> Result<Weights, String> {
     })
 }
 
-/// The ids of `rows` rows: eight distinct picks a row by the skewed weights,
-/// then the shared id.
+/// The ids of `rows` rows: eight distinct picks a row, drawn without
+/// replacement by the skewed weights of the experts not yet picked (each
+/// weight taken relative to the best remaining one, so a large skew stays
+/// finite), then the shared id.
 fn picks(rows: usize, skew: f64, seed: u64) -> Vec<u32> {
     let mut rng = Rng::new(seed);
     // A fixed random ranking of the experts, so the hot ones are not the
     // low ids.
     let mut rank: Vec<usize> = (0..EXPERTS).collect();
     for i in (1..EXPERTS).rev() {
-        let j = (rng.next() % (i as u64 + 1)) as usize;
+        let j = usize::try_from(rng.next() % (i as u64 + 1)).expect("shuffle index fits usize");
         rank.swap(i, j);
-    }
-    let weight: Vec<f64> = rank
-        .iter()
-        .map(|&r| 1.0 / (1.0 + r as f64).powf(skew))
-        .collect();
-    let mut cdf = Vec::with_capacity(EXPERTS);
-    let mut acc = 0.0;
-    for w in &weight {
-        acc += w;
-        cdf.push(acc);
     }
     let mut ids = Vec::with_capacity(rows * EXPERT_SLOTS);
     for _ in 0..rows {
-        let mut row: Vec<u32> = Vec::with_capacity(TOP_K);
-        while row.len() < TOP_K {
-            let u = (rng.next() >> 11) as f64 / (1u64 << 53) as f64 * acc;
-            let e = cdf.partition_point(|&c| c <= u).min(EXPERTS - 1) as u32;
-            if !row.contains(&e) {
-                row.push(e);
-            }
+        let mut available: Vec<usize> = (0..EXPERTS).collect();
+        for _ in 0..TOP_K {
+            let best = available
+                .iter()
+                .map(|&e| rank[e])
+                .min()
+                .expect("unpicked experts remain");
+            let mut total = 0.0;
+            let cdf: Vec<f64> = available
+                .iter()
+                .map(|&e| {
+                    total += ((best + 1) as f64 / (rank[e] + 1) as f64).powf(skew);
+                    total
+                })
+                .collect();
+            let u = (rng.next() >> 11) as f64 / (1u64 << 53) as f64 * total;
+            let at = cdf
+                .iter()
+                .position(|&c| c > u)
+                .expect("the remaining weights have positive mass");
+            ids.push(u32::try_from(available.swap_remove(at)).expect("expert id fits u32"));
         }
-        ids.extend(row);
-        ids.push(EXPERTS as u32);
+        ids.push(u32::try_from(EXPERTS).expect("shared id fits u32"));
     }
     ids
 }
@@ -217,7 +213,7 @@ fn read<T: bloomery_device::Elem + Default + Clone>(
 /// buffers.
 fn pass(ctx: &Ctx<'_>, arm: &RArm<'_>, rows: usize, ids: &[u32]) -> Result<Pass, String> {
     let slots = rows * EXPERT_SLOTS;
-    let max_tiles = slots.div_ceil(arm.tile) + EXPERTS + 1;
+    let max_tiles = route_tiles(slots, EXPERTS);
     let ids_b = ctx.device.upload(ctx.stream, ids).map_err(why)?;
     let zeroed_u32 = |n: usize| ctx.device.zeroed::<u32>(ctx.stream, Elems(n)).map_err(why);
     let mut tiles = zeroed_u32(4 * (1 + max_tiles))?;
@@ -370,13 +366,6 @@ fn launch(
         .map_err(why)
 }
 
-/// FNV-1a over the words of `v`.
-fn fnv(h: u64, v: &[f32]) -> u64 {
-    v.iter().fold(h, |h, w| {
-        (h ^ u64::from(w.to_bits())).wrapping_mul(0x0000_0100_0000_01B3)
-    })
-}
-
 /// The pair's and the down's outputs hashed in slot order: the place of a
 /// slot inside its group is the table's arrival order, so a place-order hash
 /// would differ between two runs of one arm.
@@ -418,17 +407,15 @@ pub fn run(ctx: &Ctx<'_>, opts: &Opts) -> Result<(), String> {
             arms.push(RArm {
                 name: name.clone(),
                 library: ctx.device.library(),
-                tile: ROUTE_TILE,
             });
         } else {
-            let (v, library) = built
+            let (_, library) = built
                 .iter()
                 .find(|(v, _)| v.name == name)
                 .expect("every named variant was built");
             arms.push(RArm {
                 name: name.clone(),
                 library,
-                tile: v.acts,
             });
         }
     }

@@ -40,7 +40,7 @@ pub const ROUTED_ROWS: usize = 64;
 pub const LOGIT_STRIDE: usize = router_geom::ROWS.div_ceil(4) * 4;
 
 /// The threads of the route table's one threadgroup (`ROUTE_THREADS`).
-const TABLE_THREADS: usize = 1024;
+pub const TABLE_THREADS: usize = 1024;
 
 /// The threads of the combine's threadgroup a row.
 const COMBINE_THREADS: usize = 256;

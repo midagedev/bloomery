@@ -786,9 +786,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
                 &mut words,
             )
             .map_err(why)?;
-        let hash = words.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, w| {
-            (h ^ u64::from(w.to_bits())).wrapping_mul(0x0000_0100_0000_01B3)
-        });
+        let hash = fnv(0xCBF2_9CE4_8422_2325, &words);
         println!(
             "hash quant={} op={op_name} n={n} k={k} r={r} y_hash={hash:016x}",
             quant.name()
@@ -919,3 +917,10 @@ fn median(values: &mut [f64]) -> f64 {
 /// launches them: the probe names the shapes, the geometry constants are the
 /// kernel's own, and this is the check that the two agree.
 const _: () = assert!(GEMM_ACTS == 64 && GEMM_ROWS == 64);
+
+/// FNV-1a over the words of `v`.
+fn fnv(h: u64, v: &[f32]) -> u64 {
+    v.iter().fold(h, |h, w| {
+        (h ^ u64::from(w.to_bits())).wrapping_mul(0x0000_0100_0000_01B3)
+    })
+}
