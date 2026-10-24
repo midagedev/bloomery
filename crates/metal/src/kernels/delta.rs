@@ -12,7 +12,9 @@
 //! every row in parallel into a prepared row (the caller's scratch window), the
 //! recurrence over the rows in order, and then the numerators and partial sums
 //! in parallel. The ring commit follows the state-free half, which is the last
-//! reader of the pre-chunk slots.
+//! reader of the pre-chunk slots. A launch may also leave copies after rows
+//! inside its chunk ([`DeltaSnaps`]): each the state lane and the ring a chunk
+//! ending at that row leaves, the chunk's own outputs unmoved.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -22,7 +24,7 @@ use crate::fault::MetalFaultWord;
 
 use crate::library::{Library, Pipeline};
 
-use super::delta_geom::{CONV_TAPS, RING_ROWS};
+use super::delta_geom::{CONV_TAPS, RING_ROWS, SNAPS};
 use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
 use super::rows::check_strided;
 use super::{Kernels, check_window_len, pack, word};
@@ -394,6 +396,21 @@ impl DeltaRowStrides {
     }
 }
 
+/// The copies a rows launch leaves after rows inside its chunk: copy `k` is
+/// the state lane and the ring a chunk ending after row `after[k]` leaves,
+/// bit for bit, written into the `k`-th lane and ring of these windows.
+pub struct DeltaSnaps<'w> {
+    /// The rows the copies follow, ascending, each below the chunk's rows;
+    /// one to [`SNAPS`] of them.
+    pub after: &'w [u32],
+    /// One lane of the state a copy, laid out as a lane of the state:
+    /// `after.len()` times [`state_elems`]`(1)` values.
+    pub lane: WindowMut<'w, f32, MetalDevice>,
+    /// One ring a copy, laid out as the ring: `after.len()` times
+    /// [`ring_elems`] values.
+    pub ring: WindowMut<'w, f32, MetalDevice>,
+}
+
 /// One gated delta step over a chunk of rows, rows in order in one launch.
 /// The state is read from the lane the word at `lane_at` names before the
 /// first row and written to the lane the word at `lane_to` names after the
@@ -461,15 +478,20 @@ pub struct DeltaRowsParams<'w> {
     pub strides: DeltaRowStrides,
     /// The L2 norm's epsilon.
     pub eps: f32,
+    /// The copies after rows inside the chunk; none takes none.
+    pub snaps: Option<DeltaSnaps<'w>>,
 }
 
 /// The pipelines of the rows launch: the state-free half, the recurrence, the
-/// numerators and partials, and the ring commit.
+/// numerators and partials, and the ring commit; and the recurrence and the
+/// ring's copy of a launch that leaves copies.
 pub(crate) struct RowsPipelines {
     prep: Pipeline,
     rows: Pipeline,
     post: Pipeline,
     ring: Pipeline,
+    rows_snap: Pipeline,
+    ring_snap: Pipeline,
 }
 
 impl RowsPipelines {
@@ -479,6 +501,8 @@ impl RowsPipelines {
             rows: library.pipeline("gdn_rows")?,
             post: library.pipeline("gdn_post_rows")?,
             ring: library.pipeline("gdn_ring_rows")?,
+            rows_snap: library.pipeline("gdn_rows_snap")?,
+            ring_snap: library.pipeline("gdn_ring_snap")?,
         })
     }
 }
@@ -550,7 +574,55 @@ fn check_rows(p: &DeltaRowsParams<'_>) -> Result<(), DeviceError> {
             range.start.get()
         )));
     }
+    if let Some(snaps) = &p.snaps {
+        check_snaps(snaps, p.rows, ring)?;
+    }
     Ok(())
+}
+
+/// The copies of a chunk of `rows` rows whose ring is `ring` values: one to
+/// [`SNAPS`] rows, ascending, inside the chunk, and a lane and a ring a copy.
+fn check_snaps(s: &DeltaSnaps<'_>, rows: usize, ring: usize) -> Result<(), DeviceError> {
+    let n = s.after.len();
+    if n == 0 || n > SNAPS {
+        return Err(refuse(format!(
+            "copies after {n} rows; a launch takes 1 to {SNAPS}"
+        )));
+    }
+    if !s.after.windows(2).all(|w| w[0] < w[1]) {
+        return Err(refuse(format!(
+            "copies after rows {:?}, not ascending",
+            s.after
+        )));
+    }
+    if let Some(&r) = s.after.iter().find(|&&r| r as usize >= rows) {
+        return Err(refuse(format!(
+            "a copy after row {r} of a chunk of {rows} rows"
+        )));
+    }
+    let lane = state_elems(1).ok_or_else(|| refuse("a lane of the state does not fit"))?;
+    let lanes = n
+        .checked_mul(lane)
+        .ok_or_else(|| refuse(format!("{n} copies of a lane do not fit")))?;
+    let rings = n
+        .checked_mul(ring)
+        .ok_or_else(|| refuse(format!("{n} copies of the ring do not fit")))?;
+    word(WHAT, "a copy's lane length", lane)?;
+    word(WHAT, "a copy's ring length", ring)?;
+    check_window_len(WHAT, "the copies' lanes", s.lane.len(), lanes)?;
+    check_window_len(WHAT, "the copies' rings", s.ring.len(), rings)
+}
+
+/// The copies' argument block: their count, the values of a copy's lane and
+/// of its ring, and the row each follows (the words past the count are 0).
+fn snap_args(s: &DeltaSnaps<'_>, ring: usize) -> Result<[[u8; 4]; 3 + SNAPS], DeviceError> {
+    let lane = state_elems(1).ok_or_else(|| refuse("a lane of the state does not fit"))?;
+    let mut words = [0u32; 3 + SNAPS];
+    words[0] = word(WHAT, "the copy count", s.after.len())?;
+    words[1] = word(WHAT, "a copy's lane length", lane)?;
+    words[2] = word(WHAT, "a copy's ring length", ring)?;
+    words[3..3 + s.after.len()].copy_from_slice(s.after);
+    Ok(words.map(u32::to_ne_bytes))
 }
 
 impl Kernels {
@@ -559,7 +631,9 @@ impl Kernels {
     /// numerators and partial sums. The shape and every window are checked
     /// before any dispatch, and a refused launch encodes nothing. The ring
     /// commit and the recurrence read and write disjoint windows, so they may
-    /// overlap.
+    /// overlap. With copies, the ring's copies are encoded beside the
+    /// state-free half (both only read the ring, before the commit's barrier)
+    /// and the recurrence writes the lanes' copies as it passes their rows.
     #[must_use = "a refused launch encoded nothing"]
     pub fn delta_rows(
         &self,
@@ -596,6 +670,18 @@ impl Kernels {
             .map(u32::to_ne_bytes)
             .collect::<Vec<_>>();
         let args: [[u8; 4]; 22] = args.try_into().expect("twenty-two words");
+        let ring_len = ring_elems(p.n_k).expect("check_rows fitted the ring");
+        let snap = match &p.snaps {
+            Some(s) => Some((s, snap_args(s, ring_len)?)),
+            None => None,
+        };
+        let ring_args = [
+            word(WHAT, "channels", ch)?,
+            word(WHAT, "rows", p.rows)?,
+            word(WHAT, "the x stride", st.x)?,
+            p.pos,
+        ]
+        .map(u32::to_ne_bytes);
 
         encoder.set_pipeline(&self.delta_rows.prep);
         let mut slot = Bindings::new(encoder);
@@ -611,14 +697,22 @@ impl Kernels {
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.dispatch_groups(p.n_k, p.rows, GROUP_THREADS)?;
 
+        if let Some((s, words)) = &snap {
+            encoder.set_pipeline(&self.delta_rows.ring_snap);
+            let mut slot = Bindings::new(encoder);
+            slot.set(Binding::of(&p.x)?)?;
+            slot.set(Binding::of_mut(&p.ring)?)?;
+            slot.set(Binding::of_mut(&s.ring)?)?;
+            slot.set(Binding::bytes(pack(&ring_args))?)?;
+            slot.set(Binding::bytes(pack(words))?)?;
+            slot.dispatch_groups(
+                ch.div_ceil(RING_THREADS),
+                s.after.len() * RING_ROWS,
+                RING_THREADS,
+            )?;
+        }
+
         encoder.memory_barrier();
-        let ring_args = [
-            word(WHAT, "channels", ch)?,
-            word(WHAT, "rows", p.rows)?,
-            word(WHAT, "the x stride", st.x)?,
-            p.pos,
-        ]
-        .map(u32::to_ne_bytes);
         encoder.set_pipeline(&self.delta_rows.ring);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.x)?)?;
@@ -630,7 +724,11 @@ impl Kernels {
             RING_THREADS,
         )?;
 
-        encoder.set_pipeline(&self.delta_rows.rows);
+        let rows = match &snap {
+            Some(_) => &self.delta_rows.rows_snap,
+            None => &self.delta_rows.rows,
+        };
+        encoder.set_pipeline(rows);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of_mut(&p.prep)?)?;
         slot.set(Binding::of(&p.lane)?)?;
@@ -638,6 +736,10 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.g)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.faults.binding())?;
+        if let Some((s, words)) = &snap {
+            slot.set(Binding::of_mut(&s.lane)?)?;
+            slot.set(Binding::bytes(pack(words))?)?;
+        }
         slot.dispatch_groups(GROUPS, 1, GROUP_THREADS)?;
 
         encoder.memory_barrier();

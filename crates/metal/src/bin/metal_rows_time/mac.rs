@@ -615,6 +615,7 @@ fn delta_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), 
                     pos: 100,
                     strides,
                     eps: 1e-6,
+                    snaps: None,
                 },
             )
         })?;

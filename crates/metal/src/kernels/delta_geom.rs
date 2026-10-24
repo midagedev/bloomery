@@ -9,3 +9,7 @@ pub const PASS_ROWS: usize = 8;
 
 /// Slots of the conv ring: the predecessors plus the positions of one pass.
 pub const RING_ROWS: usize = CONV_ROWS + PASS_ROWS;
+
+/// Copies of the state lane and the conv ring one rows launch may take after
+/// rows inside it: a prompt call's first and last message start.
+pub const SNAPS: usize = 2;

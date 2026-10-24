@@ -49,6 +49,7 @@ pub use attention::{
 pub use delta::DeltaParams;
 pub use delta::DeltaRowStrides;
 pub use delta::DeltaRowsParams;
+pub use delta::DeltaSnaps;
 pub use delta::HeadMap;
 pub use delta::Q_SCALE;
 pub use delta::channels;
@@ -60,6 +61,7 @@ pub use delta::state_index;
 pub use delta_geom::CONV_TAPS;
 pub use delta_geom::PASS_ROWS;
 pub use delta_geom::RING_ROWS;
+pub use delta_geom::SNAPS;
 pub use embed::EmbedParams;
 pub use experts::{FoldParams, PairParams, SharedPlan};
 pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};

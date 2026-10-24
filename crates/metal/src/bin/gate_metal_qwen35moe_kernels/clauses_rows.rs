@@ -10,9 +10,10 @@ use bloomery_metal::MetalBuffer;
 use bloomery_metal::kernels::router;
 use bloomery_metal::kernels::{
     AttentionParams, AttentionPrefillParams, AttentionRowsParams, AttnCache, CONV_TAPS,
-    DeltaParams, DeltaRowStrides, DeltaRowsParams, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS,
-    NormRowsParams, PARTIALS_PER_HEAD, QUERY_HEADS, RING_ROWS, ROT, VALUE_HEADS, channels, out_len,
-    partials_len, prepared_elems, q8_code_len, q8_scale_len, qg_len, ring_elems, state_elems,
+    DeltaParams, DeltaRowStrides, DeltaRowsParams, DeltaSnaps, HEAD_COLS, HEAD_DIM, HeadMap,
+    KV_HEADS, NormRowsParams, PARTIALS_PER_HEAD, QUERY_HEADS, RING_ROWS, ROT, VALUE_HEADS,
+    channels, out_len, partials_len, prepared_elems, q8_code_len, q8_scale_len, qg_len, ring_elems,
+    state_elems,
 };
 
 use super::clauses_attention::{
@@ -172,11 +173,47 @@ impl Bufs {
 
 /// The chunk as one rows launch.
 fn run_rows(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
+    run_rows_copied(h, fx, c, &[]).map(|(out, _)| out)
+}
+
+/// The lanes and rings a rows launch copied, copy after copy.
+struct Copies {
+    lane: Vec<f32>,
+    ring: Vec<f32>,
+}
+
+/// The chunk as one rows launch that copies its stores after the rows
+/// `after` (none: no copies). The copies' buffers start NaN, so a copy the
+/// launch did not write reads as no number.
+fn run_rows_copied(
+    h: &Harness<'_>,
+    fx: &Fixed,
+    c: &Chunk,
+    after: &[u32],
+) -> Result<(Out, Copies), String> {
     let mut bufs = Bufs::new(h, fx, c)?;
     let strides = DeltaRowStrides::dense(N_K).ok_or("the strides do not fit")?;
     let prep_len = c.rows * prep_row()?;
+    let lane_len = after.len() * elems(state_elems(1), "a lane")?;
+    let ring_len = after.len() * c.ring.len();
+    let poison = |n: usize| -> Result<MetalBuffer<f32>, String> {
+        h.device
+            .upload(h.stream, &vec![f32::NAN; n.max(1)])
+            .map_err(why)
+    };
+    let mut lane_copies = poison(lane_len)?;
+    let mut ring_copies = poison(ring_len)?;
     h.clear_fault()?;
     h.encode(|encoder| {
+        let snaps = if after.is_empty() {
+            None
+        } else {
+            Some(DeltaSnaps {
+                after,
+                lane: lane_copies.window_mut(Elems(0), Elems(lane_len))?,
+                ring: ring_copies.window_mut(Elems(0), Elems(ring_len))?,
+            })
+        };
         h.kernels.delta_rows(
             encoder,
             DeltaRowsParams {
@@ -208,10 +245,32 @@ fn run_rows(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
                 pos: c.pos,
                 strides,
                 eps: fx.eps,
+                snaps,
             },
         )
     })?;
-    bufs.read(h, c)
+    let out = bufs.read(h, c)?;
+    let mut copies = Copies {
+        lane: vec![0f32; lane_len],
+        ring: vec![0f32; ring_len],
+    };
+    if !after.is_empty() {
+        h.device
+            .read(
+                h.stream,
+                lane_copies.window(Elems(0), Elems(lane_len)).map_err(why)?,
+                &mut copies.lane,
+            )
+            .map_err(why)?;
+        h.device
+            .read(
+                h.stream,
+                ring_copies.window(Elems(0), Elems(ring_len)).map_err(why)?,
+                &mut copies.ring,
+            )
+            .map_err(why)?;
+    }
+    Ok((out, copies))
 }
 
 /// The chunk as `rows` stepped launches in one command buffer, row `r` at
@@ -341,6 +400,102 @@ pub fn delta_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     }
     Ok(Verdict::Noted(format!(
         "rows@first position {} are the stepped launches' bits",
+        parts.join(", ")
+    )))
+}
+
+/// The first `rows` rows of `c`: the same state, ring and lane words.
+fn head_of(c: &Chunk, rows: usize) -> Result<Chunk, String> {
+    let ch = elems(channels(N_K), "channels")?;
+    Ok(Chunk {
+        rows,
+        pos: c.pos,
+        lane_words: c.lane_words.clone(),
+        lane_at: c.lane_at,
+        lane_to: c.lane_to,
+        x: c.x[..rows * ch].to_vec(),
+        b: c.b[..rows * VALUE_HEADS].to_vec(),
+        a: c.a[..rows * VALUE_HEADS].to_vec(),
+        z: c.z[..rows * G_ROW].to_vec(),
+        state: c.state.clone(),
+        ring: c.ring.clone(),
+    })
+}
+
+/// The first word of a copy that is not the bits of the chunk that ends at
+/// its row, named.
+fn same_copy(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
+    match got
+        .iter()
+        .zip(want)
+        .position(|(g, w)| g.to_bits() != w.to_bits())
+    {
+        None if got.len() == want.len() => Ok(()),
+        None => Err(format!("{what}: {} words, not {}", got.len(), want.len())),
+        Some(i) => Err(format!(
+            "{what}[{i}] is {:?} ({:#010x}), the chunk ending at its row leaves {:?} ({:#010x})",
+            got[i],
+            got[i].to_bits(),
+            want[i],
+            want[i].to_bits()
+        )),
+    }
+}
+
+/// A copies case: rows, first position, lane words, the copies' rows.
+type SnapCase = (usize, u32, (usize, usize), &'static [u32]);
+
+/// The cases of the copies clause: rows, first position, the read and the
+/// write lane word, and the rows the copies follow. A copy after row 0 takes
+/// every ring slot but one from the ring the chunk found; one after a row
+/// past the ring's length takes none; a first position of 0 has slots no
+/// position wrote; a copy after the last row is the chunk's own end.
+const SNAP_CASES: [SnapCase; 4] = [
+    (12, 7, (0, 1), &[3, 9]),
+    (64, 5, (0, 0), &[0, 40]),
+    (9, 0, (0, 1), &[1, 8]),
+    (20, 3, (1, 0), &[12]),
+];
+
+/// A rows launch's copies are the bits a chunk ending at their rows leaves:
+/// copy `k`'s lane is the write lane, and its ring the ring, of the rows
+/// launch over rows `0..=after[k]` of the same inputs; and the copies move
+/// none of the launch's own outputs (numerators, partials, state, ring,
+/// fault word).
+pub fn delta_rows_snap(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let fx = fixed(fixture)?;
+    let lane_len = elems(state_elems(1), "a lane")?;
+    let mut rng = oracle::Rng::new(0xD0A7);
+    let mut parts = Vec::new();
+    for (rows, pos, lanes, after) in SNAP_CASES {
+        let c = chunk(&mut rng, rows, pos, lanes)?;
+        let at = format!("{rows} rows from {pos}, lanes {lanes:?}, copies after {after:?}");
+        let (got, copies) = run_rows_copied(h, &fx, &c, after)?;
+        if let Some(f) = got.fault {
+            return Err(format!("{at}: raised {f}"));
+        }
+        let plain = run_rows(h, &fx, &c)?;
+        same_out(&got, &plain).map_err(|e| format!("{at}, against no copies: {e}"))?;
+        let ring_len = c.ring.len();
+        for (k, &r) in after.iter().enumerate() {
+            let end = run_rows(h, &fx, &head_of(&c, r as usize + 1)?)?;
+            let lane = &end.state[c.lane_to * lane_len..(c.lane_to + 1) * lane_len];
+            same_copy(
+                &format!("{at}: copy {k}'s lane"),
+                &copies.lane[k * lane_len..(k + 1) * lane_len],
+                lane,
+            )?;
+            same_copy(
+                &format!("{at}: copy {k}'s ring"),
+                &copies.ring[k * ring_len..(k + 1) * ring_len],
+                &end.ring,
+            )?;
+        }
+        parts.push(format!("{rows}@{pos} after {after:?}"));
+    }
+    Ok(Verdict::Noted(format!(
+        "rows@first position {}: each copy is the chunk ending at its row, bit for bit, and \
+         the launch's own outputs are the launch's without copies",
         parts.join(", ")
     )))
 }
@@ -1415,6 +1570,7 @@ fn delta_ref_launch(
                 partials: P_ROW,
             },
             eps: 1e-6,
+            snaps: None,
         },
     )
 }
@@ -1980,6 +2136,7 @@ pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     vec![
         ("delta_rows", Box::new(|| ctx.with(delta_rows))),
         ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
+        ("delta_rows_snap", Box::new(|| ctx.with(delta_rows_snap))),
         ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
         ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
         ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),

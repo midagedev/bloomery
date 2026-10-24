@@ -43,6 +43,13 @@
 // ring is committed by gdn_ring_rows: the last min(m, ring) positions land in
 // their slots, after the prepared rows were read.
 //
+// A rows launch may also leave copies after rows inside the chunk (a prompt
+// pass's marks): gdn_rows_snap is gdn_rows that writes the lane's registers
+// after each named row into that copy's lane, and gdn_ring_snap writes the
+// ring a chunk ending after that row would leave into that copy's ring, read
+// before gdn_ring_rows overwrites the slots. A copy is the bits a chunk ending
+// at its row leaves; the chunk's own outputs do not move.
+//
 // The state is read from the lane the word at `lane_at` names and written to
 // the lane the word at `lane_to` names. The two words may name one lane: the
 // step then updates it in place. Two lanes apart, the step leaves the lane it
@@ -119,6 +126,18 @@ struct DeltaRingArgs {
 };
 
 static_assert(sizeof(DeltaRingArgs) == 16, "DeltaRingArgs is 16 bytes: the host packs four words");
+
+// The copies a rows launch leaves: how many, the floats of one copy's lane
+// and of one copy's ring, and the row each copy follows, ascending.
+struct DeltaSnapArgs {
+    uint n;
+    uint lane_len;
+    uint ring_len;
+    uint after[BLOOMERY_DELTA_SNAPS];
+};
+
+static_assert(sizeof(DeltaSnapArgs) == 4 * (3 + BLOOMERY_DELTA_SNAPS),
+              "DeltaSnapArgs is three words and a row word a copy: the host packs them");
 static_assert(BLOOMERY_DELTA_HEAD_COLS / BLOOMERY_DELTA_COLUMN_BLOCKS == BLOOMERY_DELTA_COLS_PER_BLOCK,
               "a column block is the head divided by the block count");
 
@@ -724,17 +743,15 @@ kernel void gdn_prep_rows(device const float *x [[buffer(0)]],
 // in the lane's registers between rows, so m rows leave the bits m stepped
 // launches leave. A row reads only its prepared row, and writes the column
 // outputs into the numerator window (gdn_post_rows finishes them). The
-// simdgroups of a threadgroup share nothing, so there is no barrier.
-kernel void gdn_rows(device const float *prep [[buffer(0)]],
-                     device const uint *lane_buf [[buffer(1)]],
-                     device float *state [[buffer(2)]],
-                     device float *g [[buffer(3)]],
-                     constant DeltaRowsArgs &args [[buffer(4)]],
-                     device atomic_uint *faults [[buffer(5)]],
-                     uint3 tgp [[threadgroup_position_in_grid]],
-                     uint3 tpt [[thread_position_in_threadgroup]],
-                     ushort tiisg [[thread_index_in_simdgroup]],
-                     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+// simdgroups of a threadgroup share nothing, so there is no barrier. With
+// `snaps`, the registers after each row it names land in that copy's lane of
+// `snap`, as the lane write after the last row would land them: a copy is the
+// state a chunk ending at its row leaves, and no output of the chunk moves.
+inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
+                         device float *state, device float *g, constant DeltaRowsArgs &args,
+                         device atomic_uint *faults, device float *snap,
+                         constant DeltaSnapArgs *snaps, uint3 tgp, uint3 tpt, ushort tiisg,
+                         ushort sgitg) {
     GdnSeat seat = gdn_seat(tgp, tpt, tiisg, sgitg, args.step.n_k, args.step.grouped);
     uint n_v = BLOOMERY_DELTA_VALUE_HEADS;
     uint head = BLOOMERY_DELTA_HEAD_COLS;
@@ -744,6 +761,9 @@ kernel void gdn_rows(device const float *prep [[buffer(0)]],
     bool lane_ok = word < args.step.lanes && word_to < args.step.lanes;
     uint base = ((word * n_v + seat.h) * head + seat.col) * head;
     uint base_to = ((word_to * n_v + seat.h) * head + seat.col) * head;
+    uint cell = (seat.h * head + seat.col) * head;
+    uint copies = snaps == nullptr ? 0u : snaps->n;
+    uint copy = 0u;
 
     float st[16];
     gdn_load(state, base, seat.j, lane_ok, st);
@@ -780,12 +800,52 @@ kernel void gdn_rows(device const float *prep [[buffer(0)]],
         }
         gdn_settle(seat, faults, args.step.layer, row_ok, conv_bad, column_bad, lane_state_bad,
                    oval, sp, st);
+        if (copy < copies && r == snaps->after[copy]) {
+            if (lane_ok) {
+                device float *lane = snap + (ulong)copy * snaps->lane_len + cell;
+                for (uint i = 0u; i < 16u; ++i) {
+                    lane[key_of(seat.j, i)] = st[i];
+                }
+            }
+            ++copy;
+        }
     }
     if (lane_ok) {
         for (uint i = 0u; i < 16u; ++i) {
             state[base_to + key_of(seat.j, i)] = st[i];
         }
     }
+}
+
+kernel void gdn_rows(device const float *prep [[buffer(0)]],
+                     device const uint *lane_buf [[buffer(1)]],
+                     device float *state [[buffer(2)]],
+                     device float *g [[buffer(3)]],
+                     constant DeltaRowsArgs &args [[buffer(4)]],
+                     device atomic_uint *faults [[buffer(5)]],
+                     uint3 tgp [[threadgroup_position_in_grid]],
+                     uint3 tpt [[thread_position_in_threadgroup]],
+                     ushort tiisg [[thread_index_in_simdgroup]],
+                     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    gdn_rows_run(prep, lane_buf, state, g, args, faults, nullptr, nullptr, tgp, tpt, tiisg,
+                 sgitg);
+}
+
+// gdn_rows with the copies `snaps` names: copy k's lane is `lane_len` floats
+// of `snap` from k·lane_len, laid out as one lane of the state.
+kernel void gdn_rows_snap(device const float *prep [[buffer(0)]],
+                          device const uint *lane_buf [[buffer(1)]],
+                          device float *state [[buffer(2)]],
+                          device float *g [[buffer(3)]],
+                          constant DeltaRowsArgs &args [[buffer(4)]],
+                          device atomic_uint *faults [[buffer(5)]],
+                          device float *snap [[buffer(6)]],
+                          constant DeltaSnapArgs &snaps [[buffer(7)]],
+                          uint3 tgp [[threadgroup_position_in_grid]],
+                          uint3 tpt [[thread_position_in_threadgroup]],
+                          ushort tiisg [[thread_index_in_simdgroup]],
+                          ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    gdn_rows_run(prep, lane_buf, state, g, args, faults, snap, &snaps, tgp, tpt, tiisg, sgitg);
 }
 
 // The numerators and the partial sums of a chunk of rows, from the column
@@ -832,4 +892,33 @@ kernel void gdn_ring_rows(device const float *x [[buffer(0)]],
     uint r = args.rows - kept + i;
     uint slot = (args.pos + r) % BLOOMERY_DELTA_RING_ROWS;
     ring[slot * args.ch + c] = x[r * args.x_stride + c];
+}
+
+// The ring a chunk ending after row `after[k]` leaves, for each copy k: slot s
+// holds the conv input of the latest position before the copy's own (the
+// chunk's first position plus the row plus one) whose slot is s — a row of the
+// chunk when that position is one, else the slot as the chunk found it. It
+// reads the ring before gdn_ring_rows writes it, so the launch encodes it
+// before that commit's barrier. Grid: the channels across, one row of the grid
+// for each slot of each copy. Copy k's ring is `ring_len` floats of `snap`
+// from k·ring_len, laid out as the ring.
+kernel void gdn_ring_snap(device const float *x [[buffer(0)]],
+                          device const float *ring [[buffer(1)]],
+                          device float *snap [[buffer(2)]],
+                          constant DeltaRingArgs &args [[buffer(3)]],
+                          constant DeltaSnapArgs &snaps [[buffer(4)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.x;
+    uint s = gid.y % (uint)BLOOMERY_DELTA_RING_ROWS;
+    uint k = gid.y / (uint)BLOOMERY_DELTA_RING_ROWS;
+    if (c >= args.ch || k >= snaps.n) {
+        return;
+    }
+    uint last = args.pos + snaps.after[k];
+    uint back = (last + (uint)BLOOMERY_DELTA_RING_ROWS - s) % (uint)BLOOMERY_DELTA_RING_ROWS;
+    float v = ring[s * args.ch + c];
+    if (back <= last && last - back >= args.pos) {
+        v = x[(last - back - args.pos) * args.x_stride + c];
+    }
+    snap[(ulong)k * snaps.ring_len + s * args.ch + c] = v;
 }

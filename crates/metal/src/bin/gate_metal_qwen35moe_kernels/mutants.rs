@@ -602,6 +602,26 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "snap_row_late",
+        clause: "delta_rows_snap",
+        why: "the rows launch copies the state lane one row after the row its copy names",
+        edits: &[(
+            "if (copy < copies && r == snaps->after[copy]) {",
+            "if (copy < copies && r == snaps->after[copy] + 1u) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "snap_ring_dropped",
+        clause: "delta_rows_snap",
+        why: "the rows launch leaves a copy's conv ring unwritten",
+        edits: &[(
+            "    snap[(ulong)k * snaps.ring_len + s * args.ch + c] = v;",
+            "    (void)v;",
+            1,
+        )],
+    },
+    Mutant {
         name: "rows_lane_parity",
         clause: "delta_rows",
         why: "the rows launch writes the state to the lane it read, not the lane the write word names",
