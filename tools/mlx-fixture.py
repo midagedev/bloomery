@@ -80,9 +80,6 @@ import numpy as np  # noqa: E402  (after the exit-code table, like the repo's to
 
 # --------------------------------------------------------------- the GGUF side
 
-def f16_bits_to_f32(bits):
-    """Little-endian f16 bits widened to f32 (exact), as half_to_f32 does."""
-    return np.ascontiguousarray(bits, dtype="<u2").astype(np.float32)
 
 
 def f16_pair(col2):
@@ -607,6 +604,15 @@ def check(out, fixture, quantizer, quiet=False):
     _meta, info, layers = read_gguf(fixture)
     head_v = value_head(info, layers)
     entries = {m: (g, kind, bits) for m, g, kind, bits in mlx_names(layers)}
+    expected = set(entries)
+    for name, (_, kind, _) in entries.items():
+        if kind == "quant":
+            stem = name.removesuffix(".weight")
+            expected.update((f"{stem}.scales", f"{stem}.biases"))
+    if set(weight_map) != expected:
+        missing, extra = sorted(expected - set(weight_map)), sorted(set(weight_map) - expected)
+        raise Refusal(EXIT_REFUSED, f"tensor index: {len(missing)} missing {missing[:3]}, "
+                                    f"{len(extra)} not in the map {extra[:3]}")
     gguf = GgufTensor(fixture, info)
     worst = {}
     checked = 0
@@ -899,6 +905,19 @@ def self_test():
         moved = grouped(np.arange(32, dtype=np.float32), [1, 32], "all", 0).reshape(-1)
         expect("grouped by hand", list(moved[:4]) == [0.0, 16.0, 1.0, 17.0], str(moved[:4]))
         check(out, fixture, StubQuantizer(), quiet=True)
+        # an index that drops a tensor (here every one) is refused before any tensor is read
+        index = os.path.join(out, "model.safetensors.index.json")
+        with open(index) as fh:
+            full = json.load(fh)
+        for drop in (list(full["weight_map"])[:1], list(full["weight_map"])):
+            with open(index, "w") as fh:
+                json.dump({**full, "weight_map": {k: v for k, v in full["weight_map"].items() if k not in drop}}, fh)
+            try:
+                check(out, fixture, StubQuantizer(), quiet=True)
+                expect(f"an index without {len(drop)} tensor(s) is refused", False, "check passed")
+            except Refusal as e:
+                expect(f"an index without {len(drop)} tensor(s) is refused",
+                       e.code == EXIT_REFUSED and f"{len(drop)} missing" in str(e), str(e))
         shutil.rmtree(out)
     print("mlx-fixture self-test: ok")
 
