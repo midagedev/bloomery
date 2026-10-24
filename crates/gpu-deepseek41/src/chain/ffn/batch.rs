@@ -2604,3 +2604,218 @@ fn count_of<T>(by_count: &mut [T], m: usize) -> Result<&mut T, GpuError> {
             detail: format!("a chunk of {m} tokens; the batch holds scratch for 1..={n}"),
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CardAccTier, FfnBatchKernels};
+    use bloomery_gpu::host::handoff::{Handoff, HandoffKernels};
+    use bloomery_gpu::host::page::HandoffLayout;
+    use bloomery_gpu::host::step::HandoffTarget;
+    use bloomery_gpu::host::tier::{TierImageLayout, TierTarget};
+    use bloomery_gpu::hybrid::HOST;
+    use bloomery_gpu::{FaultSite, Gpu, GpuError, Window};
+    use cuda_core::DeviceBuffer;
+
+    /// The handoff's places feed the production tier sum, not a readback
+    /// alone: every routed row belongs to exactly one of host, card and
+    /// tier, and all other copies are poisoned. Both slot entries must
+    /// conserve that union, including the final routed lane and partial
+    /// blocks, eagerly and on replay. Invalid ids must still raise.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
+    fn hw_f32_tier_handoffs_conserve_six_and_eight_consumed_routes() {
+        const EXPERTS: usize = 16;
+        const ROW_OFF: usize = 3;
+        const LAYER: usize = 7;
+        let gpu = Gpu::new().expect("a GPU");
+        let stream = gpu.stream();
+        let handoff = HandoffKernels::load(gpu.context()).expect("handoff kernels");
+        let sums = FfnBatchKernels::load(gpu.context()).expect("tier sum kernels");
+        let mut map = vec![HOST - 1; ROW_OFF + EXPERTS];
+        let mut tmap = map.clone();
+        for id in 0..EXPERTS {
+            map[ROW_OFF + id] = if id % 3 == 0 { (id / 3) as u32 } else { HOST };
+            tmap[ROW_OFF + id] = if id % 3 == 1 { (id / 3) as u32 } else { HOST };
+        }
+        let map = DeviceBuffer::from_host(stream, &map).expect("card map");
+        let tmap = DeviceBuffer::from_host(stream, &tmap).expect("tier map");
+        for n_used in [6, 8] {
+            for hidden in [n_used, 256, 257] {
+                for bad in [None, Some(EXPERTS as u32), Some(u32::MAX)] {
+                    let mut ids = vec![15, 0, 10, 5, 8, 1, 2, 7];
+                    ids.truncate(n_used);
+                    if let Some(id) = bad {
+                        ids[n_used - 1] = id;
+                    }
+                    // Neither handoff may read the router's trailing lane.
+                    ids.push(u32::MAX);
+                    let weights: Vec<f32> = (0..n_used)
+                        .map(|s| (s + 1) as f32 / 16.0)
+                        .chain([f32::NAN])
+                        .collect();
+                    let x: Vec<f32> = (0..hidden).map(|d| (d % 7 + 1) as f32 / 8.0).collect();
+                    let row = |s: usize, d: usize| (ids[s] + 1) as f32 * x[d];
+                    let mut down = vec![f32::NAN; n_used * hidden];
+                    let mut trows = down.clone();
+                    let mut host = vec![0.0f32; hidden];
+                    let mut want = host.clone();
+                    for d in 0..hidden {
+                        let mut card_tier = 0.0f32;
+                        for s in 0..n_used {
+                            if ids[s] >= EXPERTS as u32 {
+                                continue;
+                            }
+                            let value = row(s, d);
+                            match ids[s] % 3 {
+                                0 => down[s * hidden + d] = value,
+                                1 => trows[s * hidden + d] = value,
+                                _ => host[d] = value.mul_add(weights[s], host[d]),
+                            }
+                            if ids[s] % 3 != 2 {
+                                card_tier = value.mul_add(weights[s], card_tier);
+                            }
+                        }
+                        want[d] = card_tier + host[d];
+                    }
+                    let ids_d = DeviceBuffer::from_host(stream, &ids).expect("ids");
+                    let mut weights_d = DeviceBuffer::from_host(stream, &weights).expect("weights");
+                    let x_d = DeviceBuffer::from_host(stream, &x).expect("activation");
+                    let seq = DeviceBuffer::from_host(stream, &[19u32]).expect("sequence");
+                    let down = DeviceBuffer::from_host(stream, &down).expect("card rows");
+                    let trows = DeviceBuffer::from_host(stream, &trows).expect("tier rows");
+                    let doubled_host: Vec<f32> = host.iter().map(|h| 2.0 * h).collect();
+                    let mut host = DeviceBuffer::from_host(stream, &host).expect("host sum");
+                    let lay = HandoffLayout {
+                        seq: 0,
+                        ids: 1,
+                        weights: 1 + n_used,
+                        x: 1 + 2 * n_used,
+                        n_used,
+                        hidden,
+                    };
+                    let tl = TierImageLayout {
+                        sel: 0,
+                        q3: 0,
+                        d8: 0,
+                        x: n_used,
+                        n_used,
+                        q3_words: 0,
+                        d8_len: 0,
+                        x_len: hidden,
+                        hidden,
+                        cols: 1,
+                    };
+                    for captured in [false, true] {
+                        let mut image =
+                            DeviceBuffer::zeroed(stream, lay.x + hidden).expect("image");
+                        let mut timage =
+                            DeviceBuffer::zeroed(stream, tl.x + hidden).expect("tier image");
+                        let poison = vec![HOST - 1; n_used + 1];
+                        let mut sel = DeviceBuffer::from_host(stream, &poison).expect("places");
+                        let mut tsel =
+                            DeviceBuffer::from_host(stream, &poison).expect("tier places");
+                        let mut acc = DeviceBuffer::zeroed(stream, hidden).expect("sum");
+                        let mut result = DeviceBuffer::zeroed(stream, hidden).expect("result");
+                        let mut enqueue = || -> Result<(), GpuError> {
+                            handoff.enqueue_handoff_tier(
+                                stream,
+                                &Handoff {
+                                    ids: &ids_d,
+                                    weights: &weights_d,
+                                    map: &map,
+                                    row_off: ROW_OFF,
+                                    n_expert: EXPERTS,
+                                },
+                                &tmap,
+                                (
+                                    HandoffTarget {
+                                        x: &x_d,
+                                        seq: &seq,
+                                        image: &mut image,
+                                        layout: lay,
+                                    },
+                                    TierTarget {
+                                        image: &mut timage,
+                                        rows: &trows,
+                                        layout: tl,
+                                    },
+                                ),
+                                gpu.layer_sink(LAYER)?,
+                                (&mut sel, &mut tsel),
+                            )?;
+                            let routed_weights =
+                                Window::<f32>::of(&image, 4 * lay.weights, n_used)?;
+                            sums.enqueue_card_acc_tier(
+                                stream,
+                                &CardAccTier {
+                                    down: &down,
+                                    trows: &trows,
+                                    w: &routed_weights,
+                                    sel: &sel,
+                                    tsel: &tsel,
+                                    n: hidden,
+                                    m: 1,
+                                    n_card: EXPERTS.div_ceil(3),
+                                    n_tier: EXPERTS.div_ceil(3),
+                                    n_used,
+                                },
+                                &mut acc,
+                            )?;
+                            gpu.elem()
+                                .enqueue_add(stream, &acc, &host, hidden, &mut result)
+                        };
+                        if captured {
+                            let graph = gpu.capture(|_| enqueue()).expect("capture");
+                            graph.launch(stream).expect("replay");
+                            let doubled_weights: Vec<f32> =
+                                weights.iter().map(|w| 2.0 * w).collect();
+                            weights_d
+                                .copy_from_host(stream, &doubled_weights)
+                                .expect("new route weights");
+                            host.copy_from_host(stream, &doubled_host)
+                                .expect("new host sum");
+                            graph.launch(stream).expect("second replay");
+                            stream.synchronize().expect("replays settled");
+                        } else {
+                            enqueue().expect("eager handoff and consumption");
+                        }
+                        let scale = if captured { 2.0 } else { 1.0 };
+                        let got = result.to_host_vec(stream).expect("result");
+                        let places = sel.to_host_vec(stream).expect("places");
+                        let tier_places = tsel.to_host_vec(stream).expect("tier places");
+                        let image = image.to_host_vec(stream).expect("host image");
+                        let timage = timage.to_host_vec(stream).expect("tier image");
+                        stream.synchronize().expect("settled");
+                        let fault = gpu.take_fault().expect("fault word");
+                        if bad.is_some() {
+                            let fault = fault.expect("an invalid id must raise");
+                            assert_eq!(fault.layer, LAYER as u32);
+                            assert_eq!(fault.code, FaultSite::ExpertId as u32);
+                            assert_eq!(fault.sites, 1 << FaultSite::ExpertId as u32);
+                        } else {
+                            assert!(fault.is_none(), "{fault:?}");
+                        }
+                        assert_eq!(places[n_used], HOST - 1, "card places tail");
+                        assert_eq!(tier_places[n_used], HOST - 1, "tier places tail");
+                        assert_eq!(image[lay.seq], 19, "sequence");
+                        assert_eq!(&image[lay.ids..lay.ids + n_used], &ids[..n_used]);
+                        for s in 0..n_used {
+                            assert_eq!(image[lay.weights + s], (weights[s] * scale).to_bits());
+                            assert_eq!(timage[tl.sel + s], tier_places[s]);
+                        }
+                        for d in 0..hidden {
+                            assert_eq!(image[lay.x + d], x[d].to_bits());
+                            assert_eq!(timage[tl.x + d], x[d].to_bits());
+                        }
+                        assert!(
+                            got.iter()
+                                .zip(&want)
+                                .all(|(g, w)| g.to_bits() == (w * scale).to_bits()),
+                            "{n_used} slots, width {hidden}, bad {bad:?}, capture {captured}: result conservation"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
