@@ -19,7 +19,7 @@ const TOP_K: usize = TOP_K_MAX;
 
 const ROUTED_TENSOR: &str = "blk.0.ffn_gate_inp.weight";
 const SHARED_TENSOR: &str = "blk.0.ffn_gate_inp_shexp.weight";
-const GAIN_TENSOR: &str = "blk.0.post_attention_norm.weight";
+pub(super) const GAIN_TENSOR: &str = "blk.0.post_attention_norm.weight";
 
 struct Weights {
     routed: Vec<f32>,
@@ -28,8 +28,8 @@ struct Weights {
     eps: f32,
 }
 
-struct Out {
-    logits: Vec<f32>,
+pub(super) struct Out {
+    pub(super) logits: Vec<f32>,
     ids: Vec<u32>,
     weights: Vec<f32>,
 }
@@ -105,7 +105,7 @@ fn constructed_tie(eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (routed, shared, x, gain)
 }
 
-fn run(
+pub(super) fn run(
     h: &Harness<'_>,
     routed: &[f32],
     shared: &[f32],

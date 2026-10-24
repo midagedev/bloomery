@@ -25,7 +25,7 @@ use super::{Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
 /// Cache rows of the fault and refusal scenes. The append sits at 63, and
 /// rows past it stay unread.
-const CTX: usize = 80;
+pub(super) const CTX: usize = 80;
 /// The widest key-count scene's cache rows: the 4096-key scene plus rows
 /// past the live keys that stay unread.
 const DEEP_CTX: usize = 4112;
@@ -47,31 +47,31 @@ const Q8_NAN_SCALE: u16 = 0x7e00;
 /// `attn_half` the attention kernel reads its cache with.
 const EXPAND: &str = "\n// Every f16 bit pattern as f32, one value per thread. The host compares it\n// with `half_to_f32`.\nkernel void gqa256_f16_expand(device float *out [[buffer(0)]],\n                              uint gid [[thread_position_in_grid]]) {\n    if (gid >= 65536u) {\n        return;\n    }\n    out[gid] = attn_half(ushort(gid));\n}\n";
 
-const KIND_Q: u32 = 3;
-const KIND_K: u32 = 5;
-const KIND_V: u32 = 7;
+pub(super) const KIND_Q: u32 = 3;
+pub(super) const KIND_K: u32 = 5;
+pub(super) const KIND_V: u32 = 7;
 const KIND_PRE_K: u32 = 11;
 const KIND_PRE_V: u32 = 13;
 
-struct Tables {
-    eps: f32,
-    q_gain: Vec<f32>,
-    k_gain: Vec<f32>,
-    rope: Vec<f32>,
-    note: String,
+pub(super) struct Tables {
+    pub(super) eps: f32,
+    pub(super) q_gain: Vec<f32>,
+    pub(super) k_gain: Vec<f32>,
+    pub(super) rope: Vec<f32>,
+    pub(super) note: String,
 }
 
-struct Scene {
-    segments: usize,
-    ctx: usize,
-    pos: u32,
-    n_keys: u32,
+pub(super) struct Scene {
+    pub(super) segments: usize,
+    pub(super) ctx: usize,
+    pub(super) pos: u32,
+    pub(super) n_keys: u32,
     /// Rows `[0, prefill)` planted before the launch. The append sits past it.
-    prefill: usize,
-    q8: bool,
+    pub(super) prefill: usize,
+    pub(super) q8: bool,
 }
 
-enum CacheBack {
+pub(super) enum CacheBack {
     F16 {
         k: Vec<u16>,
         v: Vec<u16>,
@@ -94,7 +94,7 @@ struct Checked {
     worst: f64,
 }
 
-fn u(n: usize) -> u32 {
+pub(super) fn u(n: usize) -> u32 {
     u32::try_from(n).expect("a gate index fits u32")
 }
 
@@ -107,7 +107,7 @@ fn synth(index: u32, dim: u32, kind: u32) -> f32 {
     f32::from(u16::try_from(n).expect("under 1000")) / 999.0 - 0.5
 }
 
-fn head_row(index: u32, kind: u32) -> [f32; HEAD_DIM] {
+pub(super) fn head_row(index: u32, kind: u32) -> [f32; HEAD_DIM] {
     let mut row = [0f32; HEAD_DIM];
     for (dim, value) in row.iter_mut().enumerate() {
         *value = synth(index, u(dim), kind);
@@ -134,7 +134,7 @@ fn take_qg(flat: &[f32], head: usize, offset: usize) -> Result<[f32; HEAD_DIM], 
 }
 
 /// A finite gate in about `[-2, 2]`, so the sigmoid is not 1.
-fn gate_of(dim: u32) -> f32 {
+pub(super) fn gate_of(dim: u32) -> f32 {
     ((dim % 9) as f32 - 4.0) * 0.5
 }
 
@@ -204,7 +204,7 @@ fn load_rope(fixture: &Fixture, ctx: usize) -> Result<(Vec<f32>, String), String
     Ok((rope_from_base(base, ctx), format!("rope.freq_base {base}")))
 }
 
-fn load_tables(fixture: &Fixture) -> Result<Tables, String> {
+pub(super) fn load_tables(fixture: &Fixture) -> Result<Tables, String> {
     let eps = fixture.rms_eps()?;
     if !eps.is_finite() || eps < 0.0 {
         return Err(format!(
@@ -268,7 +268,7 @@ fn inputs(_scene: &Scene) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (q, k, v)
 }
 
-fn plant_f16(scene: &Scene) -> Result<CacheBack, String> {
+pub(super) fn plant_f16(scene: &Scene) -> Result<CacheBack, String> {
     let n = f16_len(scene.ctx).ok_or("the f16 cache length wraps")?;
     let mut k = vec![F16_HOLE; n];
     let mut v = vec![F16_HOLE; n];
@@ -329,7 +329,7 @@ fn upload_f32<'a>(
     Ok((buffer, host.len()))
 }
 
-enum Uploaded {
+pub(super) enum Uploaded {
     F16 {
         k: MetalBuffer<u16>,
         v: MetalBuffer<u16>,
@@ -342,7 +342,7 @@ enum Uploaded {
     },
 }
 
-fn upload_cache(
+pub(super) fn upload_cache(
     device: &MetalDevice,
     stream: &bloomery_metal::stream::MetalStream,
     planted: &CacheBack,
@@ -366,7 +366,7 @@ fn upload_cache(
     }
 }
 
-fn read_cache(
+pub(super) fn read_cache(
     device: &MetalDevice,
     stream: &bloomery_metal::stream::MetalStream,
     uploaded: &Uploaded,
@@ -415,7 +415,7 @@ fn read_cache(
     }
 }
 
-fn cache_of(uploaded: &mut Uploaded, ctx: usize) -> Result<AttnCache<'_>, DeviceError> {
+pub(super) fn cache_of(uploaded: &mut Uploaded, ctx: usize) -> Result<AttnCache<'_>, DeviceError> {
     match uploaded {
         Uploaded::F16 { k, v } => {
             let n = f16_len(ctx).ok_or_else(|| DeviceError::Range {

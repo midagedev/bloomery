@@ -15,12 +15,12 @@ use super::oracle::{self, Kind};
 use super::oracle_delta::{self, Fit, StepIn};
 use super::{Harness, HeadNormLaunch};
 
-struct Fixed {
-    conv_w: Vec<f32>,
-    ssm_a: Vec<f32>,
-    dt: Vec<f32>,
-    norm_w: Vec<f32>,
-    eps: f32,
+pub(super) struct Fixed {
+    pub(super) conv_w: Vec<f32>,
+    pub(super) ssm_a: Vec<f32>,
+    pub(super) dt: Vec<f32>,
+    pub(super) norm_w: Vec<f32>,
+    pub(super) eps: f32,
 }
 
 struct In<'a> {
@@ -51,7 +51,7 @@ struct Back {
     ring: Vec<f32>,
 }
 
-fn fixed(fixture: &Fixture) -> Result<Fixed, String> {
+pub(super) fn fixed(fixture: &Fixture) -> Result<Fixed, String> {
     let file = gguf::Gguf::open(&fixture.path).map_err(|e| format!("conv weight: {e}"))?;
     let t = file
         .find("blk.0.ssm_conv1d.weight")
@@ -81,7 +81,7 @@ fn fixed(fixture: &Fixture) -> Result<Fixed, String> {
     })
 }
 
-fn draw(rng: &mut oracle::Rng, n: usize, scale: f32) -> Vec<f32> {
+pub(super) fn draw(rng: &mut oracle::Rng, n: usize, scale: f32) -> Vec<f32> {
     (0..n).map(|_| scale * rng.signed()).collect()
 }
 

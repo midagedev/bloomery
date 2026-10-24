@@ -399,11 +399,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "delta_roll_keep",
         clause: "delta_roll",
         why: "the state store keeps the value it loaded",
-        edits: &[(
-            "state[base_to + key] = sp[i];",
-            "state[base_to + key] = s0[i];",
-            1,
-        )],
+        edits: &[("st[i] = sp[i];", "st[i] = st[i];", 1)],
     },
     Mutant {
         name: "delta_lane_in_place",
@@ -430,8 +426,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "delta_partial",
         why: "the partial sum is stored twice",
         edits: &[(
-            "partials[h * BLOOMERY_DELTA_COLUMN_BLOCKS + block] = p;",
-            "partials[h * BLOOMERY_DELTA_COLUMN_BLOCKS + block] = p + p;",
+            "partials_row[h * BLOOMERY_DELTA_COLUMN_BLOCKS + s.block] = p;",
+            "partials_row[h * BLOOMERY_DELTA_COLUMN_BLOCKS + s.block] = p + p;",
             1,
         )],
     },
@@ -439,11 +435,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "delta_nan_zero",
         clause: "delta_nan",
         why: "a non-finite lane stores zero",
-        edits: &[(
-            "state[base_to + key] = NAN;",
-            "state[base_to + key] = 0.0f;",
-            1,
-        )],
+        edits: &[("st[i] = NAN;", "st[i] = 0.0f;", 1)],
     },
     Mutant {
         name: "attn_score_scale",
@@ -600,6 +592,95 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "    ulong best = stage[0];\n    for (uint g = 1u; g < sg_count; ++g) {\n        best = max(best, stage[g]);\n    }",
             "    ulong best = stage[0];\n    for (uint g = 1u; g < sg_count - 1u; ++g) {\n        best = max(best, stage[g]);\n    }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_ring_slot",
+        clause: "delta_rows",
+        why: "the ring commit writes each position one slot late",
+        edits: &[(
+            "uint slot = (args.pos + r) % BLOOMERY_DELTA_RING_ROWS;",
+            "uint slot = (args.pos + r + 1u) % BLOOMERY_DELTA_RING_ROWS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_lane_parity",
+        clause: "delta_rows",
+        why: "the rows launch writes the state to the lane it read, not the lane the write word names",
+        edits: &[(
+            "    if (lane_ok) {\n        for (uint i = 0u; i < 16u; ++i) {\n            state[base_to + key_of(seat.j, i)] = st[i];",
+            "    if (lane_ok) {\n        for (uint i = 0u; i < 16u; ++i) {\n            state[base + key_of(seat.j, i)] = st[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_ring_inner",
+        clause: "delta_rows",
+        why: "a row from the fourth on reads its conv taps from the ring, not from the chunk",
+        edits: &[
+            (
+                "    if (d <= r) {\n        return x[(r - d) * x_stride + c];",
+                "    if (d == 0u || (d <= r && r < 3u)) {\n        return x[(r - d) * x_stride + c];",
+                1,
+            ),
+            (
+                "    uint back = d - r;",
+                "    uint back = d > r ? d - r : d;",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "rows_rope_relative",
+        clause: "norm_rope_rows",
+        why: "the chunk's keys are roped at their position in the chunk, not their absolute position",
+        edits: &[(
+            "v + row * args.v_stride, k_gain, rope, faults,",
+            "v + row * args.v_stride, k_gain, rope - (ulong)args.from * BLOOMERY_ATTN_ROT, faults,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_causal_plus1",
+        clause: "attn_rows_v0",
+        why: "every row of the chunk attends one key past its own position",
+        edits: &[("a.keys = a.pos + 1u;", "a.keys = a.pos + 2u;", 1)],
+    },
+    Mutant {
+        name: "rows_norm_shared",
+        clause: "norm_rows",
+        why: "every row of the chunk takes row 0's sum of squares, so row 0's scale",
+        edits: &[(
+            "        float4 xv = norm_rows_load4(xr, f4);",
+            "        float4 xv = norm_rows_load4(x, f4);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_lane_unchecked",
+        clause: "delta_rows_nan",
+        why: "the rows launch runs its rows as though the lane words were in range, so a word past the lanes raises nothing",
+        edits: &[(
+            "args.step.pos, r, lane_ok, b_raw + r",
+            "args.step.pos, r, true, b_raw + r",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_norm_no_raise",
+        clause: "norm_rows_nan",
+        why: "a row the norm cannot take raises nothing",
+        edits: &[("raise(word, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);", "", 1)],
+    },
+    Mutant {
+        name: "rows_norm_plausible",
+        clause: "norm_rows_nan",
+        why: "a row the norm cannot take is written as zeros, not NaN",
+        edits: &[(
+            "*((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
+            "*((device float4 *)(yr + f4 * 4u)) = float4(0.f);",
             1,
         )],
     },

@@ -1,0 +1,1567 @@
+//! The row kernels of the batched prefill pass: the gated delta step over a
+//! chunk, the attention's append and flash over a chunk's causal queries, and
+//! the norm over a chunk. Each row is held to the bits of the decode kernel
+//! that runs that row alone.
+
+use bloomery_device::conformance::{Clause, Verdict, why};
+use bloomery_device::fault::FaultSite;
+use bloomery_device::{Buffer, Device, Elems, Fault};
+use bloomery_metal::MetalBuffer;
+use bloomery_metal::kernels::router;
+use bloomery_metal::kernels::{
+    AttentionParams, AttentionRowsParams, AttnCache, CONV_TAPS, DeltaParams, DeltaRowStrides,
+    DeltaRowsParams, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, NormRowsParams, PARTIALS_PER_HEAD,
+    QUERY_HEADS, RING_ROWS, ROT, VALUE_HEADS, channels, out_len, partials_len, q8_code_len,
+    q8_scale_len, qg_len, ring_elems, state_elems,
+};
+
+use super::clauses_attention::{
+    CTX, CacheBack, KIND_K, KIND_Q, KIND_V, Scene, Tables, Uploaded, cache_of, gate_of, head_row,
+    load_tables, plant_f16, read_cache, u, upload_cache,
+};
+use super::clauses_delta::{Fixed, draw, fixed};
+use super::clauses_router;
+use super::common::{self, BadArg, Edit, LAYER};
+use super::fixture::Fixture;
+use super::oracle;
+use super::{ClauseCtx, ClauseRun, Harness};
+
+/// The delta layer's key heads.
+const N_K: usize = 16;
+
+/// Lanes of the state the delta clauses hold.
+const LANES: usize = 2;
+
+/// One chunk of the delta step: the inputs of `rows` rows from `pos`, and the
+/// lane words the state is read and written through.
+struct Chunk {
+    rows: usize,
+    pos: u32,
+    lane_words: Vec<u32>,
+    lane_at: usize,
+    lane_to: usize,
+    x: Vec<f32>,
+    b: Vec<f32>,
+    a: Vec<f32>,
+    z: Vec<f32>,
+    state: Vec<f32>,
+    ring: Vec<f32>,
+}
+
+fn elems(n: Option<usize>, what: &str) -> Result<usize, String> {
+    n.ok_or_else(|| format!("{what} does not fit"))
+}
+
+/// A chunk of `rows` rows from `pos`; the lane words are `[0, 1]` and the
+/// step reads word `at` and writes word `to`.
+fn chunk(
+    rng: &mut oracle::Rng,
+    rows: usize,
+    pos: u32,
+    (at, to): (usize, usize),
+) -> Result<Chunk, String> {
+    let ch = elems(channels(N_K), "channels")?;
+    Ok(Chunk {
+        rows,
+        pos,
+        lane_words: vec![0, 1],
+        lane_at: at,
+        lane_to: to,
+        x: draw(rng, rows * ch, 0.3),
+        b: draw(rng, rows * VALUE_HEADS, 1.0),
+        a: draw(rng, rows * VALUE_HEADS, 2.0),
+        z: draw(rng, rows * VALUE_HEADS * HEAD_COLS, 1.0),
+        state: draw(rng, elems(state_elems(LANES), "state")?, 0.04),
+        ring: draw(rng, elems(ring_elems(N_K), "ring")?, 0.05),
+    })
+}
+
+/// Every window a delta launch binds, uploaded from a chunk.
+struct Bufs {
+    x: MetalBuffer<f32>,
+    conv_w: MetalBuffer<f32>,
+    b: MetalBuffer<f32>,
+    a: MetalBuffer<f32>,
+    dt: MetalBuffer<f32>,
+    ssm_a: MetalBuffer<f32>,
+    z: MetalBuffer<f32>,
+    norm_w: MetalBuffer<f32>,
+    lane: MetalBuffer<u32>,
+    state: MetalBuffer<f32>,
+    ring: MetalBuffer<f32>,
+    partials: MetalBuffer<f32>,
+    g: MetalBuffer<f32>,
+}
+
+/// What a delta launch left behind.
+struct Out {
+    g: Vec<f32>,
+    partials: Vec<f32>,
+    state: Vec<f32>,
+    ring: Vec<f32>,
+    fault: Option<Fault>,
+}
+
+const G_ROW: usize = VALUE_HEADS * HEAD_COLS;
+const P_ROW: usize = VALUE_HEADS * PARTIALS_PER_HEAD;
+
+impl Bufs {
+    fn new(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Self, String> {
+        let (device, stream) = (h.device, h.stream);
+        Ok(Self {
+            x: device.upload(stream, &c.x).map_err(why)?,
+            conv_w: device.upload(stream, &fx.conv_w).map_err(why)?,
+            b: device.upload(stream, &c.b).map_err(why)?,
+            a: device.upload(stream, &c.a).map_err(why)?,
+            dt: device.upload(stream, &fx.dt).map_err(why)?,
+            ssm_a: device.upload(stream, &fx.ssm_a).map_err(why)?,
+            z: device.upload(stream, &c.z).map_err(why)?,
+            norm_w: device.upload(stream, &fx.norm_w).map_err(why)?,
+            lane: device.upload(stream, &c.lane_words).map_err(why)?,
+            state: device.upload(stream, &c.state).map_err(why)?,
+            ring: device.upload(stream, &c.ring).map_err(why)?,
+            partials: device
+                .upload(stream, &vec![0f32; c.rows * P_ROW])
+                .map_err(why)?,
+            g: device
+                .upload(stream, &vec![0f32; c.rows * G_ROW])
+                .map_err(why)?,
+        })
+    }
+
+    fn read(&self, h: &Harness<'_>, c: &Chunk) -> Result<Out, String> {
+        let (device, stream) = (h.device, h.stream);
+        let mut out = Out {
+            g: vec![0f32; c.rows * G_ROW],
+            partials: vec![0f32; c.rows * P_ROW],
+            state: vec![0f32; c.state.len()],
+            ring: vec![0f32; c.ring.len()],
+            fault: h.fault()?,
+        };
+        device
+            .read(stream, self.g.whole().map_err(why)?, &mut out.g)
+            .map_err(why)?;
+        device
+            .read(
+                stream,
+                self.partials.whole().map_err(why)?,
+                &mut out.partials,
+            )
+            .map_err(why)?;
+        device
+            .read(stream, self.state.whole().map_err(why)?, &mut out.state)
+            .map_err(why)?;
+        device
+            .read(stream, self.ring.whole().map_err(why)?, &mut out.ring)
+            .map_err(why)?;
+        Ok(out)
+    }
+}
+
+/// The chunk as one rows launch.
+fn run_rows(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
+    let mut bufs = Bufs::new(h, fx, c)?;
+    let strides = DeltaRowStrides::dense(N_K).ok_or("the strides do not fit")?;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        h.kernels.delta_rows(
+            encoder,
+            DeltaRowsParams {
+                x: bufs.x.window(Elems(0), Elems(c.x.len()))?,
+                conv_w: bufs.conv_w.window(Elems(0), Elems(fx.conv_w.len()))?,
+                b_raw: bufs.b.window(Elems(0), Elems(c.b.len()))?,
+                a_raw: bufs.a.window(Elems(0), Elems(c.a.len()))?,
+                dt_bias: bufs.dt.window(Elems(0), Elems(fx.dt.len()))?,
+                ssm_a: bufs.ssm_a.window(Elems(0), Elems(fx.ssm_a.len()))?,
+                z: bufs.z.window(Elems(0), Elems(c.z.len()))?,
+                norm_w: bufs.norm_w.window(Elems(0), Elems(fx.norm_w.len()))?,
+                lane: bufs.lane.window(Elems(0), Elems(c.lane_words.len()))?,
+                state: bufs.state.window_mut(Elems(0), Elems(c.state.len()))?,
+                ring: bufs.ring.window_mut(Elems(0), Elems(c.ring.len()))?,
+                partials: bufs.partials.window_mut(Elems(0), Elems(c.rows * P_ROW))?,
+                g: bufs.g.window_mut(Elems(0), Elems(c.rows * G_ROW))?,
+                faults: h.device.fault_word(),
+                n_v: VALUE_HEADS,
+                head: HEAD_COLS,
+                taps: CONV_TAPS,
+                n_k: N_K,
+                map: HeadMap::Tiled,
+                lanes: LANES,
+                lane_at: c.lane_at,
+                lane_to: c.lane_to,
+                layer: LAYER,
+                rows: c.rows,
+                pos: c.pos,
+                strides,
+                eps: fx.eps,
+            },
+        )
+    })?;
+    bufs.read(h, c)
+}
+
+/// The chunk as `rows` stepped launches in one command buffer, row `r` at
+/// position `pos + r`. The first step reads the chunk's read lane and writes
+/// its write lane; the later steps update the write lane in place, so the
+/// state the rows kernel carries in registers is the state the steps carry in
+/// memory.
+fn run_stepped(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
+    let mut bufs = Bufs::new(h, fx, c)?;
+    let ch = elems(channels(N_K), "channels")?;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        for r in 0..c.rows {
+            let pos = [c.pos + r as u32];
+            let lane_at = if r == 0 { c.lane_at } else { c.lane_to };
+            h.kernels.delta(
+                encoder,
+                DeltaParams {
+                    x: bufs.x.window(Elems(r * ch), Elems(ch))?,
+                    conv_w: bufs.conv_w.window(Elems(0), Elems(fx.conv_w.len()))?,
+                    b_raw: bufs.b.window(Elems(r * VALUE_HEADS), Elems(VALUE_HEADS))?,
+                    a_raw: bufs.a.window(Elems(r * VALUE_HEADS), Elems(VALUE_HEADS))?,
+                    dt_bias: bufs.dt.window(Elems(0), Elems(fx.dt.len()))?,
+                    ssm_a: bufs.ssm_a.window(Elems(0), Elems(fx.ssm_a.len()))?,
+                    z: bufs.z.window(Elems(r * G_ROW), Elems(G_ROW))?,
+                    norm_w: bufs.norm_w.window(Elems(0), Elems(fx.norm_w.len()))?,
+                    lane: bufs.lane.window(Elems(0), Elems(c.lane_words.len()))?,
+                    state: bufs.state.window_mut(Elems(0), Elems(c.state.len()))?,
+                    ring: bufs.ring.window_mut(Elems(0), Elems(c.ring.len()))?,
+                    partials: bufs.partials.window_mut(Elems(r * P_ROW), Elems(P_ROW))?,
+                    g: bufs.g.window_mut(Elems(r * G_ROW), Elems(G_ROW))?,
+                    faults: h.device.fault_word(),
+                    n_v: VALUE_HEADS,
+                    head: HEAD_COLS,
+                    taps: CONV_TAPS,
+                    n_k: N_K,
+                    map: HeadMap::Tiled,
+                    lanes: LANES,
+                    lane_at,
+                    lane_to: c.lane_to,
+                    layer: LAYER,
+                    pos: &pos,
+                    eps: fx.eps,
+                },
+            )?;
+        }
+        Ok(())
+    })?;
+    bufs.read(h, c)
+}
+
+/// The first word of `got` that is not the bits of `want`, named.
+fn same_bits(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("{what}: {} words, not {}", got.len(), want.len()));
+    }
+    match got
+        .iter()
+        .zip(want)
+        .position(|(g, w)| g.to_bits() != w.to_bits())
+    {
+        None => Ok(()),
+        Some(i) => Err(format!(
+            "{what}[{i}] is {:?} ({:#010x}), the stepped launch's {:?} ({:#010x})",
+            got[i],
+            got[i].to_bits(),
+            want[i],
+            want[i].to_bits()
+        )),
+    }
+}
+
+/// The rows launch left what the stepped launches left: the numerator and
+/// partials of every row, the whole state, the whole ring and the fault word.
+fn same_out(rows: &Out, stepped: &Out) -> Result<(), String> {
+    same_bits("g", &rows.g, &stepped.g)?;
+    same_bits("partials", &rows.partials, &stepped.partials)?;
+    same_bits("state", &rows.state, &stepped.state)?;
+    same_bits("ring", &rows.ring, &stepped.ring)?;
+    if rows.fault != stepped.fault {
+        let show = |f: &Option<Fault>| f.map_or("none".to_string(), |f| f.to_string());
+        return Err(format!(
+            "the fault word is {}, the stepped launches' {}",
+            show(&rows.fault),
+            show(&stepped.fault)
+        ));
+    }
+    Ok(())
+}
+
+/// The cases of the delta clause: rows, first position, and the read and the
+/// write lane word. A first position of 0 puts taps before the first
+/// position; 7 and 3 with 12 and 64 rows wrap the ring.
+const DELTA_CASES: [(usize, u32, (usize, usize)); 7] = [
+    (1, 4, (0, 1)),
+    (9, 0, (0, 1)),
+    (9, 20, (1, 0)),
+    (12, 7, (0, 1)),
+    (12, 3, (1, 1)),
+    (64, 5, (0, 0)),
+    (64, 9, (1, 0)),
+];
+
+/// `m` rows are the bits of `m` stepped launches: numerators, partials, state,
+/// ring and fault word.
+pub fn delta_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let fx = fixed(fixture)?;
+    let mut rng = oracle::Rng::new(0xD0A5);
+    let mut parts = Vec::new();
+    for (rows, pos, lanes) in DELTA_CASES {
+        let c = chunk(&mut rng, rows, pos, lanes)?;
+        let a = run_rows(h, &fx, &c)?;
+        let b = run_stepped(h, &fx, &c)?;
+        if let Some(f) = a.fault {
+            return Err(format!("{rows} rows from {pos} raised {f}"));
+        }
+        same_out(&a, &b).map_err(|e| format!("{rows} rows from {pos}, lanes {lanes:?}: {e}"))?;
+        // The state moved: a rows launch that wrote nothing is not the
+        // stepped launches' bits by luck of an unchanged lane.
+        if a.state == c.state {
+            return Err(format!("{rows} rows from {pos} left the state as it was"));
+        }
+        if rows >= RING_ROWS && a.ring == c.ring {
+            return Err(format!("{rows} rows from {pos} left the ring as it was"));
+        }
+        parts.push(format!("{rows}@{pos}"));
+    }
+    Ok(Verdict::Noted(format!(
+        "rows@first position {} are the stepped launches' bits",
+        parts.join(", ")
+    )))
+}
+
+/// What one poisoned chunk raises and where the NaN lands.
+struct Poison {
+    what: &'static str,
+    site: FaultSite,
+    /// Whether every numerator word is NaN (a lane that cannot be read leaves
+    /// no column a number), else only the columns the input reaches.
+    everywhere: bool,
+    apply: fn(&mut Chunk, usize),
+}
+
+fn nan_x(c: &mut Chunk, ch: usize) {
+    // A query channel of key head 0, in row 5: rows 5 to 8 read it as a tap.
+    c.x[5 * ch + 100] = f32::NAN;
+}
+
+fn inf_b(c: &mut Chunk, _ch: usize) {
+    c.b[8 * VALUE_HEADS + 3] = f32::INFINITY;
+}
+
+fn nan_state(c: &mut Chunk, _ch: usize) {
+    // One key of one column of value head 2, in the lane the chunk reads.
+    c.state[((2 * HEAD_COLS) + 9) * HEAD_COLS + 17] = f32::NAN;
+}
+
+fn lane_past(c: &mut Chunk, _ch: usize) {
+    c.lane_words = vec![0, 7];
+}
+
+/// A row with a non-finite input raises the decode's site and is NaN on the
+/// columns the stepped launches make NaN; the other rows are unaffected.
+pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let fx = fixed(fixture)?;
+    let ch = elems(channels(N_K), "channels")?;
+    let cases = [
+        Poison {
+            what: "a NaN conv input",
+            site: FaultSite::LinearConv,
+            everywhere: false,
+            apply: nan_x,
+        },
+        Poison {
+            what: "an infinite β input",
+            site: FaultSite::LinearConv,
+            everywhere: false,
+            apply: inf_b,
+        },
+        Poison {
+            what: "a NaN state key",
+            site: FaultSite::DeltaLane,
+            everywhere: false,
+            apply: nan_state,
+        },
+        Poison {
+            what: "a write lane word past the lanes",
+            site: FaultSite::DeltaLane,
+            everywhere: true,
+            apply: lane_past,
+        },
+    ];
+    let mut parts = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        // In place: the stepped launches then carry the state in memory the
+        // way the rows launch carries it in registers.
+        let mut rng = oracle::Rng::new(0xD0A6 + i as u64);
+        let mut c = chunk(&mut rng, 12, 7, (0, 0))?;
+        if i == 3 {
+            c.lane_at = 0;
+            c.lane_to = 1;
+        }
+        (case.apply)(&mut c, ch);
+        let a = run_rows(h, &fx, &c)?;
+        let b = run_stepped(h, &fx, &c)?;
+        same_out(&a, &b).map_err(|e| format!("{}: {e}", case.what))?;
+        match a.fault {
+            Some(f) if f.layer == LAYER && f.sites & (1 << case.site as u32) != 0 => {}
+            Some(f) => {
+                return Err(format!(
+                    "{} raised {f}, not {}",
+                    case.what,
+                    case.site.name()
+                ));
+            }
+            None => return Err(format!("{} raised nothing", case.what)),
+        }
+        let nans = a.g.iter().filter(|v| v.is_nan()).count();
+        if nans == 0 {
+            return Err(format!("{} left no NaN in the numerator", case.what));
+        }
+        if (nans == a.g.len()) != case.everywhere {
+            return Err(format!(
+                "{} made {nans} of {} numerator words NaN",
+                case.what,
+                a.g.len()
+            ));
+        }
+        parts.push(format!("{} ({nans} NaN words)", case.what));
+    }
+    Ok(Verdict::Noted(format!(
+        "each is the stepped launches' fault word, numerators and state: {}",
+        parts.join(", ")
+    )))
+}
+
+/// One chunk of the attention clauses: the first position, the rows and the
+/// split-K segments of every row's flash.
+struct AttnCase {
+    from: usize,
+    rows: usize,
+    segments: usize,
+}
+
+/// A first position of 0 starts on an empty cache; 37 reads thirty-seven
+/// planted rows. Three segments split 33 keys; five split 70.
+const ATTN_CASES: [AttnCase; 6] = [
+    AttnCase {
+        from: 0,
+        rows: 1,
+        segments: 1,
+    },
+    AttnCase {
+        from: 0,
+        rows: 9,
+        segments: 1,
+    },
+    AttnCase {
+        from: 0,
+        rows: 33,
+        segments: 3,
+    },
+    AttnCase {
+        from: 37,
+        rows: 1,
+        segments: 5,
+    },
+    AttnCase {
+        from: 37,
+        rows: 9,
+        segments: 5,
+    },
+    AttnCase {
+        from: 37,
+        rows: 33,
+        segments: 5,
+    },
+];
+
+/// The projections of a chunk, rows end to end: every row's query and gate,
+/// raw keys and raw values differ from every other row's.
+struct AttnIn {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+fn attn_inputs(rows: usize) -> Result<AttnIn, String> {
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    let mut inp = AttnIn {
+        q: vec![0f32; rows * q_n],
+        k: vec![0f32; rows * kv_n],
+        v: vec![0f32; rows * kv_n],
+    };
+    for r in 0..rows {
+        for head in 0..QUERY_HEADS {
+            let at = r * q_n + head * 2 * HEAD_DIM;
+            inp.q[at..at + HEAD_DIM].copy_from_slice(&head_row(u(r * QUERY_HEADS + head), KIND_Q));
+            for dim in 0..HEAD_DIM {
+                inp.q[at + HEAD_DIM + dim] = gate_of(u(dim + r));
+            }
+        }
+        for kv in 0..KV_HEADS {
+            let at = r * kv_n + kv * HEAD_DIM;
+            inp.k[at..at + HEAD_DIM].copy_from_slice(&head_row(u(r * KV_HEADS + kv), KIND_K));
+            inp.v[at..at + HEAD_DIM].copy_from_slice(&head_row(u(r * KV_HEADS + kv), KIND_V));
+        }
+    }
+    Ok(inp)
+}
+
+/// What a chunk's attention left: the outputs row after row, the cache, the
+/// fault word and the fold tickets.
+struct AttnSeen {
+    out: Vec<f32>,
+    cache: CacheBack,
+    fault: Option<Fault>,
+    ticket: Vec<u32>,
+}
+
+/// The buffers of one chunk: the cache planted with the rows before `from`,
+/// the projections, the tables, and the outputs, partials and tickets.
+struct AttnBufs {
+    q: MetalBuffer<f32>,
+    k: MetalBuffer<f32>,
+    v: MetalBuffer<f32>,
+    q_gain: MetalBuffer<f32>,
+    k_gain: MetalBuffer<f32>,
+    rope: MetalBuffer<f32>,
+    partials: MetalBuffer<f32>,
+    out: MetalBuffer<f32>,
+    ticket: MetalBuffer<u32>,
+    cache: Uploaded,
+}
+
+impl AttnBufs {
+    fn new(
+        h: &Harness<'_>,
+        tables: &Tables,
+        case: &AttnCase,
+        inp: &AttnIn,
+    ) -> Result<Self, String> {
+        let (device, stream) = (h.device, h.stream);
+        let out_n = out_len().ok_or("the output length wraps")?;
+        let scene = Scene {
+            segments: case.segments,
+            ctx: CTX,
+            pos: u(case.from),
+            n_keys: u(case.from),
+            prefill: case.from,
+            q8: false,
+        };
+        let planted = plant_f16(&scene)?;
+        let partial_n = partials_len(case.segments).ok_or("the partial length wraps")?;
+        Ok(Self {
+            q: device.upload(stream, &inp.q).map_err(why)?,
+            k: device.upload(stream, &inp.k).map_err(why)?,
+            v: device.upload(stream, &inp.v).map_err(why)?,
+            q_gain: device.upload(stream, &tables.q_gain).map_err(why)?,
+            k_gain: device.upload(stream, &tables.k_gain).map_err(why)?,
+            rope: device
+                .upload(stream, &tables.rope[..CTX * ROT])
+                .map_err(why)?,
+            partials: device
+                .upload(stream, &vec![0f32; case.rows * partial_n])
+                .map_err(why)?,
+            out: device
+                .upload(stream, &vec![0f32; case.rows * out_n])
+                .map_err(why)?,
+            ticket: device.upload(stream, &vec![0u32; case.rows]).map_err(why)?,
+            cache: upload_cache(device, stream, &planted)?,
+        })
+    }
+
+    fn read(&self, h: &Harness<'_>, case: &AttnCase) -> Result<AttnSeen, String> {
+        let (device, stream) = (h.device, h.stream);
+        let out_n = out_len().ok_or("the output length wraps")?;
+        let mut out = vec![0f32; case.rows * out_n];
+        device
+            .read(stream, self.out.whole().map_err(why)?, &mut out)
+            .map_err(why)?;
+        let mut ticket = vec![1u32; case.rows];
+        device
+            .read(stream, self.ticket.whole().map_err(why)?, &mut ticket)
+            .map_err(why)?;
+        Ok(AttnSeen {
+            out,
+            cache: read_cache(device, stream, &self.cache)?,
+            fault: h.fault()?,
+            ticket,
+        })
+    }
+}
+
+/// The chunk as one rows launch.
+fn attn_rows_run(
+    h: &Harness<'_>,
+    tables: &Tables,
+    case: &AttnCase,
+    inp: &AttnIn,
+) -> Result<AttnSeen, String> {
+    let mut b = AttnBufs::new(h, tables, case, inp)?;
+    let out_n = out_len().ok_or("the output length wraps")?;
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let partial_n = partials_len(case.segments).ok_or("the partial length wraps")?;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        h.kernels.attention_rows(
+            encoder,
+            AttentionRowsParams {
+                head_dim: HEAD_DIM,
+                query_heads: QUERY_HEADS,
+                kv_heads: KV_HEADS,
+                segments: case.segments,
+                ctx: CTX,
+                eps: tables.eps,
+                layer: LAYER,
+                from: u(case.from),
+                rows: case.rows,
+                q: b.q.window(Elems(0), Elems(inp.q.len()))?,
+                q_stride: q_n,
+                k: b.k.window(Elems(0), Elems(inp.k.len()))?,
+                k_stride: kv_n,
+                v: b.v.window(Elems(0), Elems(inp.v.len()))?,
+                v_stride: kv_n,
+                q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
+                cache: cache_of(&mut b.cache, CTX)?,
+                partials: b
+                    .partials
+                    .window_mut(Elems(0), Elems(case.rows * partial_n))?,
+                out: b.out.window_mut(Elems(0), Elems(case.rows * out_n))?,
+                out_stride: out_n,
+                fault: h.device.fault_word(),
+                ticket: b.ticket.window_mut(Elems(0), Elems(case.rows))?,
+            },
+        )
+    })?;
+    b.read(h, case)
+}
+
+/// The chunk as `rows` decode launches in one command buffer, row `r` at
+/// position `from + r` over `from + r + 1` keys, the same segment count.
+fn attn_stepped_run(
+    h: &Harness<'_>,
+    tables: &Tables,
+    case: &AttnCase,
+    inp: &AttnIn,
+) -> Result<AttnSeen, String> {
+    let mut b = AttnBufs::new(h, tables, case, inp)?;
+    let out_n = out_len().ok_or("the output length wraps")?;
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let partial_n = partials_len(case.segments).ok_or("the partial length wraps")?;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        for r in 0..case.rows {
+            h.kernels.attention_flash(
+                encoder,
+                AttentionParams {
+                    head_dim: HEAD_DIM,
+                    query_heads: QUERY_HEADS,
+                    kv_heads: KV_HEADS,
+                    segments: case.segments,
+                    ctx: CTX,
+                    eps: tables.eps,
+                    layer: LAYER,
+                    pos: u(case.from + r),
+                    n_keys: u(case.from + r + 1),
+                    q: b.q.window(Elems(r * q_n), Elems(q_n))?,
+                    k: b.k.window(Elems(r * kv_n), Elems(kv_n))?,
+                    v: b.v.window(Elems(r * kv_n), Elems(kv_n))?,
+                    q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                    k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+                    rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
+                    cache: cache_of(&mut b.cache, CTX)?,
+                    partials: b
+                        .partials
+                        .window_mut(Elems(r * partial_n), Elems(partial_n))?,
+                    out: b.out.window_mut(Elems(r * out_n), Elems(out_n))?,
+                    fault: h.device.fault_word(),
+                    ticket: b.ticket.window_mut(Elems(r), Elems(1))?,
+                },
+            )?;
+        }
+        Ok(())
+    })?;
+    b.read(h, case)
+}
+
+/// The first word of `got` that differs from `want`'s, named.
+fn same_words<T: PartialEq + Copy + core::fmt::Debug>(
+    what: &str,
+    got: &[T],
+    want: &[T],
+) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("{what}: {} words, not {}", got.len(), want.len()));
+    }
+    match common::first_diff(got, want) {
+        None => Ok(()),
+        Some((i, g, w)) => Err(format!("{what}[{i}] is {g:?}, the decode launch's {w:?}")),
+    }
+}
+
+/// Every cache word, holes included, is the decode launches'.
+fn same_cache(rows: &CacheBack, stepped: &CacheBack) -> Result<(), String> {
+    match (rows, stepped) {
+        (CacheBack::F16 { k: rk, v: rv }, CacheBack::F16 { k: sk, v: sv }) => {
+            same_words("k cache", rk, sk)?;
+            same_words("v cache", rv, sv)
+        }
+        _ => Err("the rows launch and the decode launches ran on different caches".to_string()),
+    }
+}
+
+/// The key and value rows the chunk appended are the decode launches' bits:
+/// the key normed and roped at its absolute position, the value raw, each
+/// stored as the f16 the decode stores, and the rows around them untouched.
+pub fn norm_rope_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let tables = load_tables(fixture)?;
+    let mut parts = Vec::new();
+    for case in &ATTN_CASES {
+        let inp = attn_inputs(case.rows)?;
+        let a = attn_rows_run(h, &tables, case, &inp)?;
+        let b = attn_stepped_run(h, &tables, case, &inp)?;
+        same_cache(&a.cache, &b.cache)
+            .map_err(|e| format!("{} rows from {}: {e}", case.rows, case.from))?;
+        parts.push(format!("{}@{}", case.rows, case.from));
+    }
+    Ok(Verdict::Noted(format!(
+        "rows@first position {} append the decode launches' cache rows",
+        parts.join(", ")
+    )))
+}
+
+/// Each row of the chunk's attention is the bits of the decode launch at its
+/// position: the gated output, the fault word, and the tickets the folds reset.
+pub fn attn_rows_v0(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let tables = load_tables(fixture)?;
+    let mut parts = Vec::new();
+    for case in &ATTN_CASES {
+        let inp = attn_inputs(case.rows)?;
+        let a = attn_rows_run(h, &tables, case, &inp)?;
+        let b = attn_stepped_run(h, &tables, case, &inp)?;
+        let at = format!("{} rows from {}", case.rows, case.from);
+        if let Some(f) = a.fault {
+            return Err(format!("{at} raised {f}"));
+        }
+        if a.out.iter().any(|v| v.is_nan()) {
+            return Err(format!("{at} wrote a NaN"));
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        same_words("out", &bits(&a.out), &bits(&b.out)).map_err(|e| format!("{at}: {e}"))?;
+        if a.fault != b.fault {
+            return Err(format!("{at}: the fault words differ"));
+        }
+        if a.ticket.iter().any(|&t| t != 0) {
+            return Err(format!(
+                "{at}: a fold's ticket reads {:?}, not zero",
+                a.ticket
+            ));
+        }
+        parts.push(format!("{}@{}/{}", case.rows, case.from, case.segments));
+    }
+    Ok(Verdict::Noted(format!(
+        "rows@first position/segments {} are the decode launches' bits",
+        parts.join(", ")
+    )))
+}
+
+/// The width of the hidden state the norm and the router read.
+const K: usize = router::K;
+
+/// The router's routed rows: the columns one launch of the oracle reads out.
+const ROUTED: usize = router::EXPERTS;
+
+/// A launch of the norm over `rows` rows, the words around each output row
+/// checked as they were, and the fault word as the launch left it.
+fn norm_rows_run(
+    h: &Harness<'_>,
+    x: &[f32],
+    gain: &[f32],
+    rows: usize,
+    (x_stride, y_stride): (usize, usize),
+    eps: f32,
+) -> Result<(Vec<f32>, Option<Fault>), String> {
+    let (device, stream) = (h.device, h.stream);
+    let sentinel = f32::from_bits(super::SENTINEL_BITS);
+    let x_b = device.upload(stream, x).map_err(why)?;
+    let gain_b = device.upload(stream, gain).map_err(why)?;
+    let mut y_b = device
+        .upload(stream, &vec![sentinel; rows * y_stride])
+        .map_err(why)?;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        h.kernels.norm_rows(
+            encoder,
+            NormRowsParams {
+                rows,
+                cols: K,
+                x: x_b.window(Elems(0), Elems(x.len()))?,
+                x_stride,
+                gain: gain_b.window(Elems(0), Elems(gain.len()))?,
+                y: y_b.window_mut(Elems(0), Elems(rows * y_stride))?,
+                y_stride,
+                eps,
+                fault: device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    })?;
+    let mut y = vec![0f32; rows * y_stride];
+    device
+        .read(stream, y_b.whole().map_err(why)?, &mut y)
+        .map_err(why)?;
+    for r in 0..rows {
+        let pad = &y[r * y_stride + K..(r + 1) * y_stride];
+        if pad.iter().any(|v| v.to_bits() != super::SENTINEL_BITS) {
+            return Err(format!(
+                "row {r}: a word past the row's {K} columns was written"
+            ));
+        }
+    }
+    Ok((y, h.fault()?))
+}
+
+/// The rows of `x` laid out `stride` apart, the words between them NaN, so a
+/// read past a row poisons the output.
+fn strided_rows(rows: &[Vec<f32>], stride: usize) -> Vec<f32> {
+    let mut x = vec![f32::NAN; rows.len() * stride];
+    for (r, row) in rows.iter().enumerate() {
+        x[r * stride..r * stride + row.len()].copy_from_slice(row);
+    }
+    x
+}
+
+/// Row `x` as the decode router carries it. The router run with one nonzero
+/// weight in each routed row returns, as that row's logit, the one product
+/// `(x · gain)[c] · scale` the router's dot adds to zeros, so the logits of
+/// the launches over each block of columns are the router's normed input.
+fn router_normed(h: &Harness<'_>, x: &[f32], gain: &[f32], eps: f32) -> Result<Vec<f32>, String> {
+    let shared = vec![0f32; K];
+    let mut out = vec![0f32; K];
+    for c0 in (0..K).step_by(ROUTED) {
+        let mut routed = vec![0f32; ROUTED * K];
+        for e in 0..ROUTED {
+            routed[e * K + c0 + e] = 1.0;
+        }
+        let run = clauses_router::run(h, &routed, &shared, x, gain, eps)?;
+        out[c0..c0 + ROUTED].copy_from_slice(&run.logits[..ROUTED]);
+    }
+    Ok(out)
+}
+
+/// Each row is the bits of the decode router's normed input of that row, for
+/// dense and for strided rows.
+pub fn norm_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let gain = fixture.f32s(clauses_router::GAIN_TENSOR, K)?;
+    let mut parts = Vec::new();
+    for (rows, strides) in [(1usize, (K, K)), (9, (K, K)), (33, (K + 4, K + 8))] {
+        let data: Vec<Vec<f32>> = (0..rows)
+            .map(|r| oracle::activations(K, 0x40A0 + r as u64, 3.7))
+            .collect();
+        let x = strided_rows(&data, strides.0);
+        let (y, fault) = norm_rows_run(h, &x, &gain, rows, strides, eps)?;
+        if let Some(f) = fault {
+            return Err(format!("{rows} rows raised {f}"));
+        }
+        for (r, row) in data.iter().enumerate() {
+            let want = router_normed(h, row, &gain, eps)?;
+            let got = &y[r * strides.1..r * strides.1 + K];
+            same_bits("norm", got, &want).map_err(|e| {
+                format!("{rows} rows, row {r}: {e}").replace("stepped launch", "router")
+            })?;
+        }
+        parts.push(rows.to_string());
+    }
+    Ok(Verdict::Noted(format!(
+        "{} rows are the decode router's normed input, bit for bit",
+        parts.join(", ")
+    )))
+}
+
+/// A row the norm cannot take is NaN alone and raises the norm site; a gain
+/// that is not finite raises it and moves only its column.
+pub fn norm_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = 0.0f32;
+    let gain = fixture.f32s(clauses_router::GAIN_TENSOR, K)?;
+    let rows = 9usize;
+    let clean: Vec<Vec<f32>> = (0..rows)
+        .map(|r| oracle::activations(K, 0x40B0 + r as u64, 3.7))
+        .collect();
+    let (want, fault) = norm_rows_run(h, &strided_rows(&clean, K), &gain, rows, (K, K), eps)?;
+    if let Some(f) = fault {
+        return Err(format!("the clean chunk raised {f}"));
+    }
+    let row_is = |y: &[f32], r: usize| y[r * K..(r + 1) * K].to_vec();
+    let nan_alone = |y: &[f32], bad: usize, what: &str| -> Result<(), String> {
+        for r in 0..rows {
+            if r == bad {
+                if !y[r * K..(r + 1) * K].iter().all(|v| v.is_nan()) {
+                    return Err(format!("{what}: row {r} is not all NaN"));
+                }
+            } else {
+                same_bits("norm", &row_is(y, r), &row_is(&want, r))
+                    .map_err(|e| format!("{what}: row {r} moved: {e}"))?;
+            }
+        }
+        Ok(())
+    };
+    let mut zero = clean.clone();
+    zero[3] = vec![0.0; K];
+    let (y, fault) = norm_rows_run(h, &strided_rows(&zero, K), &gain, rows, (K, K), eps)?;
+    nan_alone(&y, 3, "a zero row with eps 0")?;
+    expect_norm_fault(fault, "a zero row with eps 0")?;
+
+    let mut nan = clean.clone();
+    nan[5][700] = f32::NAN;
+    let (y, fault) = norm_rows_run(h, &strided_rows(&nan, K), &gain, rows, (K, K), eps)?;
+    nan_alone(&y, 5, "a NaN input")?;
+    expect_norm_fault(fault, "a NaN input")?;
+
+    let mut bad_gain = gain.clone();
+    bad_gain[11] = f32::INFINITY;
+    let (y, fault) = norm_rows_run(h, &strided_rows(&clean, K), &bad_gain, rows, (K, K), eps)?;
+    expect_norm_fault(fault, "an infinite gain")?;
+    for r in 0..rows {
+        for c in 0..K {
+            let got = y[r * K + c];
+            if c == 11 {
+                if got.is_finite() {
+                    return Err(format!("an infinite gain left row {r} column 11 finite"));
+                }
+            } else if got.to_bits() != want[r * K + c].to_bits() {
+                return Err(format!("an infinite gain moved row {r} column {c}"));
+            }
+        }
+    }
+
+    let (y, fault) = norm_rows_run(
+        h,
+        &strided_rows(&clean, K),
+        &gain,
+        rows,
+        (K, K),
+        f32::INFINITY,
+    )?;
+    expect_norm_fault(fault, "an infinite epsilon")?;
+    if !y.iter().all(|v| v.is_nan()) {
+        return Err("an infinite epsilon left a row that is not NaN".to_string());
+    }
+    Ok(Verdict::Noted(
+        "a zero row with eps 0 and a NaN row are NaN alone, an infinite gain moves one column, an infinite eps is every row NaN, each raising the norm site"
+            .to_string(),
+    ))
+}
+
+fn expect_norm_fault(fault: Option<Fault>, what: &str) -> Result<(), String> {
+    match fault {
+        Some(f) if f.layer == LAYER && f.sites == 1 << FaultSite::NormQuant as u32 => Ok(()),
+        Some(f) => Err(format!(
+            "{what} raised {f}, not norm_quant in layer {LAYER}"
+        )),
+        None => Err(format!("{what} raised nothing")),
+    }
+}
+
+/// The buffers of the delta rows refusal table, sized for [`REF_ROWS`] rows.
+struct DeltaRef {
+    ch: usize,
+    x: MetalBuffer<f32>,
+    conv_w: MetalBuffer<f32>,
+    b: MetalBuffer<f32>,
+    a: MetalBuffer<f32>,
+    dt: MetalBuffer<f32>,
+    ssm_a: MetalBuffer<f32>,
+    z: MetalBuffer<f32>,
+    norm_w: MetalBuffer<f32>,
+    lane: MetalBuffer<u32>,
+    state: MetalBuffer<f32>,
+    ring: MetalBuffer<f32>,
+    partials: MetalBuffer<f32>,
+    g: MetalBuffer<f32>,
+}
+
+/// Rows of the well-formed refusal-table launches.
+const REF_ROWS: usize = 4;
+
+/// The launch of one delta case: the well-formed words, with the ones a case
+/// edits.
+#[derive(Clone, Copy)]
+struct DeltaOver {
+    n_k: usize,
+    rows: usize,
+    pos: u32,
+    x_stride: usize,
+    z_stride: usize,
+    x_len: usize,
+    g_len: usize,
+    partials_len: usize,
+    lane_len: usize,
+    lane_at: usize,
+    lane_to: usize,
+}
+
+impl DeltaOver {
+    fn whole(ch: usize) -> Self {
+        Self {
+            n_k: N_K,
+            rows: REF_ROWS,
+            pos: 3,
+            x_stride: ch,
+            z_stride: G_ROW,
+            x_len: REF_ROWS * ch,
+            g_len: REF_ROWS * G_ROW,
+            partials_len: REF_ROWS * P_ROW,
+            lane_len: 2,
+            lane_at: 0,
+            lane_to: 1,
+        }
+    }
+}
+
+fn delta_ref_launch(
+    h: &Harness<'_>,
+    b: &mut DeltaRef,
+    o: &DeltaOver,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    let ch = b.ch;
+    h.kernels.delta_rows(
+        encoder,
+        DeltaRowsParams {
+            x: b.x.window(Elems(0), Elems(o.x_len))?,
+            conv_w: b.conv_w.window(Elems(0), Elems(CONV_TAPS * ch))?,
+            b_raw: b.b.window(Elems(0), Elems(REF_ROWS * VALUE_HEADS))?,
+            a_raw: b.a.window(Elems(0), Elems(REF_ROWS * VALUE_HEADS))?,
+            dt_bias: b.dt.window(Elems(0), Elems(VALUE_HEADS))?,
+            ssm_a: b.ssm_a.window(Elems(0), Elems(VALUE_HEADS))?,
+            z: b.z.window(Elems(0), Elems(REF_ROWS * G_ROW))?,
+            norm_w: b.norm_w.window(Elems(0), Elems(HEAD_COLS))?,
+            lane: b.lane.window(Elems(0), Elems(o.lane_len))?,
+            state: b
+                .state
+                .window_mut(Elems(0), Elems(LANES * G_ROW * HEAD_COLS))?,
+            ring: b.ring.window_mut(Elems(0), Elems(RING_ROWS * ch))?,
+            partials: b.partials.window_mut(Elems(0), Elems(o.partials_len))?,
+            g: b.g.window_mut(Elems(0), Elems(o.g_len))?,
+            faults: h.device.fault_word(),
+            n_v: VALUE_HEADS,
+            head: HEAD_COLS,
+            taps: CONV_TAPS,
+            n_k: o.n_k,
+            map: HeadMap::Tiled,
+            lanes: LANES,
+            lane_at: o.lane_at,
+            lane_to: o.lane_to,
+            layer: LAYER,
+            rows: o.rows,
+            pos: o.pos,
+            strides: DeltaRowStrides {
+                x: o.x_stride,
+                z: o.z_stride,
+                b: VALUE_HEADS,
+                a: VALUE_HEADS,
+                g: G_ROW,
+                partials: P_ROW,
+            },
+            eps: 1e-6,
+        },
+    )
+}
+
+fn delta_case<'a>(
+    h: &'a Harness<'_>,
+    whole: DeltaOver,
+    what: &'static str,
+    needle: &'static str,
+    edit: fn(&mut DeltaOver, usize),
+) -> BadArg<'a, DeltaRef> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut o = whole;
+            edit(&mut o, b.ch);
+            delta_ref_launch(h, b, &o, encoder)
+        }),
+    )
+}
+
+fn delta_refusals(h: &Harness<'_>) -> Result<usize, String> {
+    let (device, stream) = (h.device, h.stream);
+    let ch = elems(channels(N_K), "channels")?;
+    let ones = |n: usize| device.upload(stream, &vec![1f32; n]).map_err(why);
+    let mut bufs = DeltaRef {
+        ch,
+        // Not the 1.0 the ring holds, so a committed ring row is seen to move.
+        x: device
+            .upload(stream, &vec![2f32; REF_ROWS * ch])
+            .map_err(why)?,
+        conv_w: ones(CONV_TAPS * ch)?,
+        b: ones(REF_ROWS * VALUE_HEADS)?,
+        a: ones(REF_ROWS * VALUE_HEADS)?,
+        dt: ones(VALUE_HEADS)?,
+        ssm_a: ones(VALUE_HEADS)?,
+        z: ones(REF_ROWS * G_ROW)?,
+        norm_w: ones(HEAD_COLS)?,
+        lane: device.upload(stream, &[0u32, 1]).map_err(why)?,
+        state: ones(LANES * G_ROW * HEAD_COLS)?,
+        ring: ones(RING_ROWS * ch)?,
+        partials: ones(REF_ROWS * P_ROW)?,
+        g: ones(REF_ROWS * G_ROW)?,
+    };
+    let whole = DeltaOver::whole(ch);
+    let case = |what, needle, edit| delta_case(h, whole, what, needle, edit);
+    let cases = vec![
+        case("rows of 0", "rows of 0", |o, _| o.rows = 0),
+        case("an n_k of 3", "n_k", |o, _| o.n_k = 3),
+        case("positions past the 32-bit word", "position word", |o, _| {
+            o.pos = u32::MAX - 1;
+        }),
+        case("an x stride shorter than a row", "x stride", |o, ch| {
+            o.x_stride = ch - 1;
+        }),
+        case("a z stride shorter than a row", "z stride", |o, _| {
+            o.z_stride = G_ROW - 1;
+        }),
+        case("an x window short of the last row", "x window", |o, ch| {
+            o.x_len = REF_ROWS * ch - 1;
+        }),
+        case(
+            "a numerator window short of the last row",
+            "g window",
+            |o, _| {
+                o.g_len = REF_ROWS * G_ROW - 1;
+            },
+        ),
+        case(
+            "a partials window short of the last row",
+            "partials window",
+            |o, _| {
+                o.partials_len = REF_ROWS * P_ROW - 1;
+            },
+        ),
+        case(
+            "a read lane index past the lane window",
+            "read lane index",
+            |o, _| {
+                o.lane_at = 2;
+            },
+        ),
+        case(
+            "a write lane index past the lane window",
+            "write lane index",
+            |o, _| {
+                o.lane_to = 2;
+            },
+        ),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &DeltaRef| {
+        common::still(h, &b.g, |v| *v == 1.0)?;
+        common::still(h, &b.state, |v| *v == 1.0)?;
+        common::still(h, &b.partials, |v| *v == 1.0)?;
+        common::still(h, &b.ring, |v| *v == 1.0)
+    };
+    let count = common::refuse_launches(h, "delta step", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, DeltaRef> = Box::new(|b, encoder| delta_ref_launch(h, b, &whole, encoder));
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        Ok(common::moved(h, &b.g, |v| *v != 1.0)? && common::moved(h, &b.ring, |v| *v != 1.0)?)
+    })?;
+    Ok(count)
+}
+
+/// The buffers of the attention rows refusal table.
+struct AttnRef {
+    q: MetalBuffer<f32>,
+    k: MetalBuffer<f32>,
+    v: MetalBuffer<f32>,
+    q_gain: MetalBuffer<f32>,
+    k_gain: MetalBuffer<f32>,
+    rope: MetalBuffer<f32>,
+    partials: MetalBuffer<f32>,
+    out: MetalBuffer<f32>,
+    ticket: MetalBuffer<u32>,
+    cache: Uploaded,
+    q8_codes: [MetalBuffer<u32>; 2],
+    q8_scales: [MetalBuffer<u16>; 2],
+}
+
+const ATTN_SEGMENTS: usize = 2;
+
+#[derive(Clone, Copy)]
+struct AttnOver {
+    kv_heads: usize,
+    segments: usize,
+    rows: usize,
+    from: u32,
+    q_stride: usize,
+    q_len: usize,
+    out_len: usize,
+    partials_len: usize,
+    ticket_len: usize,
+    q8: bool,
+}
+
+impl AttnOver {
+    fn whole() -> Result<Self, String> {
+        let q_n = qg_len().ok_or("the query length wraps")?;
+        let out_n = out_len().ok_or("the output length wraps")?;
+        let partial_n = partials_len(ATTN_SEGMENTS).ok_or("the partial length wraps")?;
+        Ok(Self {
+            kv_heads: KV_HEADS,
+            segments: ATTN_SEGMENTS,
+            rows: REF_ROWS,
+            from: 10,
+            q_stride: q_n,
+            q_len: REF_ROWS * q_n,
+            out_len: REF_ROWS * out_n,
+            partials_len: REF_ROWS * partial_n,
+            ticket_len: REF_ROWS,
+            q8: false,
+        })
+    }
+}
+
+fn attn_ref_launch(
+    h: &Harness<'_>,
+    b: &mut AttnRef,
+    o: &AttnOver,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    let kv_n = KV_HEADS * HEAD_DIM;
+    let out_n = out_len().expect("the output length fits");
+    let cache = if o.q8 {
+        let codes = q8_code_len(CTX).expect("the code length fits");
+        let scales = q8_scale_len(CTX).expect("the scale length fits");
+        let [k_codes, v_codes] = &mut b.q8_codes;
+        let [k_scales, v_scales] = &mut b.q8_scales;
+        AttnCache::Q8 {
+            k_codes: k_codes.window_mut(Elems(0), Elems(codes))?,
+            k_scales: k_scales.window_mut(Elems(0), Elems(scales))?,
+            v_codes: v_codes.window_mut(Elems(0), Elems(codes))?,
+            v_scales: v_scales.window_mut(Elems(0), Elems(scales))?,
+        }
+    } else {
+        cache_of(&mut b.cache, CTX)?
+    };
+    h.kernels.attention_rows(
+        encoder,
+        AttentionRowsParams {
+            head_dim: HEAD_DIM,
+            query_heads: QUERY_HEADS,
+            kv_heads: o.kv_heads,
+            segments: o.segments,
+            ctx: CTX,
+            eps: 1e-6,
+            layer: LAYER,
+            from: o.from,
+            rows: o.rows,
+            q: b.q.window(Elems(0), Elems(o.q_len))?,
+            q_stride: o.q_stride,
+            k: b.k.window(Elems(0), Elems(REF_ROWS * kv_n))?,
+            k_stride: kv_n,
+            v: b.v.window(Elems(0), Elems(REF_ROWS * kv_n))?,
+            v_stride: kv_n,
+            q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+            k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+            rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
+            cache,
+            partials: b.partials.window_mut(Elems(0), Elems(o.partials_len))?,
+            out: b.out.window_mut(Elems(0), Elems(o.out_len))?,
+            out_stride: out_n,
+            fault: h.device.fault_word(),
+            ticket: b.ticket.window_mut(Elems(0), Elems(o.ticket_len))?,
+        },
+    )
+}
+
+fn attn_case<'a>(
+    h: &'a Harness<'_>,
+    whole: AttnOver,
+    what: &'static str,
+    needle: &'static str,
+    edit: fn(&mut AttnOver),
+) -> BadArg<'a, AttnRef> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut o = whole;
+            edit(&mut o);
+            attn_ref_launch(h, b, &o, encoder)
+        }),
+    )
+}
+
+fn attn_refusals(h: &Harness<'_>, tables: &Tables) -> Result<usize, String> {
+    let (device, stream) = (h.device, h.stream);
+    let q_n = qg_len().ok_or("the query length wraps")?;
+    let out_n = out_len().ok_or("the output length wraps")?;
+    let partial_n = partials_len(ATTN_SEGMENTS).ok_or("the partial length wraps")?;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    let scene = Scene {
+        segments: ATTN_SEGMENTS,
+        ctx: CTX,
+        pos: 10,
+        n_keys: 10,
+        prefill: 10,
+        q8: false,
+    };
+    let inp = attn_inputs(REF_ROWS)?;
+    let q8_codes = vec![0u32; q8_code_len(CTX).ok_or("the code length wraps")?];
+    let q8_scales = vec![0u16; q8_scale_len(CTX).ok_or("the scale length wraps")?];
+    let mut bufs = AttnRef {
+        q: device.upload(stream, &inp.q).map_err(why)?,
+        k: device.upload(stream, &inp.k).map_err(why)?,
+        v: device.upload(stream, &inp.v).map_err(why)?,
+        q_gain: device.upload(stream, &tables.q_gain).map_err(why)?,
+        k_gain: device.upload(stream, &tables.k_gain).map_err(why)?,
+        rope: device
+            .upload(stream, &tables.rope[..CTX * ROT])
+            .map_err(why)?,
+        partials: device
+            .upload(stream, &vec![1f32; REF_ROWS * partial_n])
+            .map_err(why)?,
+        out: device
+            .upload(stream, &vec![1f32; REF_ROWS * out_n])
+            .map_err(why)?,
+        ticket: device.upload(stream, &[0u32; REF_ROWS]).map_err(why)?,
+        cache: upload_cache(device, stream, &plant_f16(&scene)?)?,
+        q8_codes: [0, 1]
+            .map(|_| device.upload(stream, &q8_codes))
+            .map(|b| b.expect("upload")),
+        q8_scales: [0, 1]
+            .map(|_| device.upload(stream, &q8_scales))
+            .map(|b| b.expect("upload")),
+    };
+    let _ = (q_n, kv_n);
+    let whole = AttnOver::whole()?;
+    let case = |what, needle, edit| attn_case(h, whole, what, needle, edit);
+    let cases = vec![
+        case("rows of 0", "rows of 0", |o| o.rows = 0),
+        case("kv heads of 1", "kv heads", |o| o.kv_heads = 1),
+        case("segments of 0", "segments of 0", |o| o.segments = 0),
+        case("segments past the kernel's cap", "past the kernel", |o| {
+            o.segments = 65;
+        }),
+        case("positions past the cache", "pass the cache", |o| {
+            o.from = 77
+        }),
+        case("positions past the 32-bit word", "pass the cache", |o| {
+            o.from = u32::MAX;
+            o.rows = 2;
+        }),
+        case("a q stride shorter than a row", "q stride", |o| {
+            o.q_stride -= 1;
+        }),
+        case("a q window short of the last row", "q window", |o| {
+            o.q_len -= 1
+        }),
+        case("an out window short of the last row", "out window", |o| {
+            o.out_len -= 1;
+        }),
+        case(
+            "a partials window short of the last row",
+            "partials window",
+            |o| {
+                o.partials_len -= 1;
+            },
+        ),
+        case(
+            "a ticket window short of one word a row",
+            "ticket window",
+            |o| {
+                o.ticket_len -= 1;
+            },
+        ),
+        case("the q8_0 planes", "q8_0", |o| o.q8 = true),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &AttnRef| {
+        common::still(h, &b.out, |v| *v == 1.0)?;
+        common::still(h, &b.partials, |v| *v == 1.0)?;
+        common::still(h, &b.ticket, |v| *v == 0)
+    };
+    let count = common::refuse_launches(h, "attention rows", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, AttnRef> = Box::new(|b, encoder| attn_ref_launch(h, b, &whole, encoder));
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.out, |v| *v != 1.0)
+    })?;
+    Ok(count)
+}
+
+/// The buffers of the norm rows refusal table.
+struct NormRef {
+    x: MetalBuffer<f32>,
+    gain: MetalBuffer<f32>,
+    y: MetalBuffer<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct NormOver {
+    rows: usize,
+    cols: usize,
+    x_stride: usize,
+    y_stride: usize,
+    x_at: usize,
+    x_len: usize,
+    y_at: usize,
+    y_len: usize,
+    gain_at: usize,
+    gain_len: usize,
+}
+
+impl NormOver {
+    fn whole() -> Self {
+        Self {
+            rows: REF_ROWS,
+            cols: K,
+            x_stride: K,
+            y_stride: K,
+            x_at: 4,
+            x_len: REF_ROWS * K,
+            y_at: 4,
+            y_len: REF_ROWS * K,
+            gain_at: 4,
+            gain_len: K,
+        }
+    }
+}
+
+fn norm_ref_launch(
+    h: &Harness<'_>,
+    b: &mut NormRef,
+    o: &NormOver,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    h.kernels.norm_rows(
+        encoder,
+        NormRowsParams {
+            rows: o.rows,
+            cols: o.cols,
+            x: b.x.window(Elems(o.x_at), Elems(o.x_len))?,
+            x_stride: o.x_stride,
+            gain: b.gain.window(Elems(o.gain_at), Elems(o.gain_len))?,
+            y: b.y.window_mut(Elems(o.y_at), Elems(o.y_len))?,
+            y_stride: o.y_stride,
+            eps: 1e-6,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
+}
+
+fn norm_case<'a>(
+    h: &'a Harness<'_>,
+    whole: NormOver,
+    what: &'static str,
+    needle: &'static str,
+    edit: fn(&mut NormOver),
+) -> BadArg<'a, NormRef> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut o = whole;
+            edit(&mut o);
+            norm_ref_launch(h, b, &o, encoder)
+        }),
+    )
+}
+
+fn norm_refusals(h: &Harness<'_>) -> Result<usize, String> {
+    let (device, stream) = (h.device, h.stream);
+    // Windows start four floats into their buffers: 16-byte aligned.
+    let mut bufs = NormRef {
+        x: device
+            .upload(stream, &vec![1f32; 4 + REF_ROWS * K + 4])
+            .map_err(why)?,
+        gain: device.upload(stream, &vec![1f32; 4 + K + 4]).map_err(why)?,
+        y: device
+            .upload(stream, &vec![7f32; 4 + REF_ROWS * K + 4])
+            .map_err(why)?,
+    };
+    let whole = NormOver::whole();
+    let case = |what, needle, edit| norm_case(h, whole, what, needle, edit);
+    let cases = vec![
+        case("rows of 0", "rows of 0", |o| o.rows = 0),
+        case("a column count of 0", "cols 0", |o| o.cols = 0),
+        case("columns the threads do not cover", "multiple of", |o| {
+            o.cols = K + 4;
+        }),
+        case(
+            "an x stride that is not a float4 multiple",
+            "x stride",
+            |o| {
+                o.x_stride = K + 1;
+            },
+        ),
+        case(
+            "a y stride that is not a float4 multiple",
+            "y stride",
+            |o| {
+                o.y_stride = K + 2;
+            },
+        ),
+        case("an x stride shorter than a row", "x stride", |o| {
+            o.x_stride = K - 4;
+        }),
+        case("a y stride shorter than a row", "y stride", |o| {
+            o.y_stride = K - 4;
+        }),
+        case("an x window short of the last row", "x window", |o| {
+            o.x_len -= 1
+        }),
+        case("a y window short of the last row", "y window", |o| {
+            o.y_len -= 1
+        }),
+        case("a gain window short of the columns", "gain window", |o| {
+            o.gain_len -= 1;
+        }),
+        case("an x window off the 16-byte word", "16-byte", |o| {
+            o.x_at = 1
+        }),
+        case("a gain window off the 16-byte word", "16-byte", |o| {
+            o.gain_at = 1
+        }),
+        case("a y window off the 16-byte word", "16-byte", |o| o.y_at = 1),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &NormRef| common::still(h, &b.y, |v| *v == 7.0);
+    let count = common::refuse_launches(h, "norm rows", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, NormRef> = Box::new(|b, encoder| norm_ref_launch(h, b, &whole, encoder));
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.y, |v| *v != 7.0)
+    })?;
+    Ok(count)
+}
+
+/// Each launcher refusal is a named range error and writes nothing: the delta
+/// rows, the attention rows and the norm rows.
+pub fn rows_refusals(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let tables = load_tables(fixture)?;
+    let delta = delta_refusals(h).map_err(|e| format!("delta rows: {e}"))?;
+    let attention = attn_refusals(h, &tables).map_err(|e| format!("attention rows: {e}"))?;
+    let norm = norm_refusals(h).map_err(|e| format!("norm rows: {e}"))?;
+    Ok(Verdict::Noted(format!(
+        "{delta} delta, {attention} attention and {norm} norm refusals, each by name, nothing written"
+    )))
+}
+
+/// The clauses of the row kernels, in gate order.
+pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    vec![
+        ("delta_rows", Box::new(|| ctx.with(delta_rows))),
+        ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
+        ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
+        ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
+        ("norm_rows", Box::new(|| ctx.with(norm_rows))),
+        ("norm_rows_nan", Box::new(|| ctx.with(norm_rows_nan))),
+        ("rows_refusals", Box::new(|| ctx.with(rows_refusals))),
+    ]
+}

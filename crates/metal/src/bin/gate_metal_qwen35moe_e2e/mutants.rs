@@ -57,8 +57,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a_free",
         why: "the delta conv's oldest tap reads this token's input",
         edits: &[(
-            "tap_x(c, pos, 3u, ch, x, ring)",
-            "tap_x(c, pos, 0u, ch, x, ring)",
+            "tap_x(c, pos0, r, 3u, ch, x_stride, x, ring)",
+            "tap_x(c, pos0, r, 0u, ch, x_stride, x, ring)",
             1,
         )],
     },

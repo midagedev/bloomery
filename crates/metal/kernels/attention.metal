@@ -34,6 +34,14 @@
 // once a 16-key tile; the fold adds the segments' partials in ascending
 // segment order. The value sum is one fma a key in key order, per dim.
 //
+// The rows launches run a chunk of causal queries. attn_norm_rope_rows appends
+// row r's key and value at position from + r, by the same append the decode
+// flash runs, one SIMD group a (key head, row). gqa256_flash_f16_rows is the
+// decode flash with a row grid dimension: row r is the launch at position
+// from + r over from + r + 1 keys, with its own partials and ticket word, and
+// it reads the rows the append dispatch wrote. A row is the bits of the decode
+// launch at its position with the same segment count.
+//
 // The gate is the second half of each query head, the raw projection. The
 // output value is attn * (1 / (1 + exp(-g))), after the softmax. A non-finite
 // gate, or a non-finite product of a finite attention, raises the product
@@ -70,6 +78,39 @@ struct AttnArgs {
 };
 
 static_assert(sizeof(AttnArgs) == 28, "AttnArgs is 28 bytes: the host packs seven words");
+
+// The rows launches' argument block: a chunk of `rows` queries whose first
+// sits at position `from`, row r at position from + r with from + r + 1 live
+// keys. The strides are in floats between a row's query projection, raw key,
+// raw value and output.
+struct AttnRowsArgs {
+    uint segments;
+    uint ctx;
+    uint layer;
+    float eps;
+    float scale;
+    uint from;
+    uint rows;
+    uint q_stride;
+    uint k_stride;
+    uint v_stride;
+    uint out_stride;
+};
+
+static_assert(sizeof(AttnRowsArgs) == 44, "AttnRowsArgs is 44 bytes: the host packs eleven words");
+
+// The decode launch's words for row `row` of a rows launch.
+inline AttnArgs attn_row_args(constant AttnRowsArgs &args, uint row) {
+    AttnArgs a;
+    a.segments = args.segments;
+    a.ctx = args.ctx;
+    a.layer = args.layer;
+    a.eps = args.eps;
+    a.scale = args.scale;
+    a.pos = args.from + row;
+    a.keys = a.pos + 1u;
+    return a;
+}
 
 // The hardware half conversion. A finite pattern is the host `half_to_f32`.
 // The cast clears the sign of a negative NaN; the source sign is put back,
@@ -486,7 +527,7 @@ struct Q8Cache {
 // owning SIMD group builds each row and stores it a lane at a time.
 template <typename Cache>
 static void attn_append(Cache cache,
-                        constant AttnArgs &args,
+                        thread const AttnArgs &args,
                         device float const *k,
                         device float const *v,
                         device float const *k_gain,
@@ -522,7 +563,7 @@ static void attn_append(Cache cache,
 }
 
 // This group's query head, normed and partially roped, in `qv`.
-static void attn_prepare_q(constant AttnArgs &args,
+static void attn_prepare_q(thread const AttnArgs &args,
                            device float const *q,
                            device float const *q_gain,
                            device float const *rope,
@@ -552,7 +593,7 @@ static void attn_prepare_q(constant AttnArgs &args,
 // barrier: one SIMD group works one head over its own registers.
 template <typename Cache>
 static void attn_tile_loop(Cache cache,
-                           constant AttnArgs &args,
+                           thread const AttnArgs &args,
                            bool ok,
                            uint kv,
                            uint seg,
@@ -632,7 +673,7 @@ static void attn_tile_loop(Cache cache,
 }
 
 // One segment writes the gated output. More than one writes the partial.
-static void attn_epilogue(constant AttnArgs &args,
+static void attn_epilogue(thread const AttnArgs &args,
                           device float const *q,
                           device coherent(device) float *partials,
                           device float *out,
@@ -703,7 +744,7 @@ static void attn_epilogue(constant AttnArgs &args,
 // it served the zero page).
 static void attn_fold(device coherent(device) float *partials,
                       device atomic_uint *ticket,
-                      constant AttnArgs &args,
+                      thread const AttnArgs &args,
                       device float const *q,
                       device float *out,
                       device atomic_uint *faults,
@@ -792,9 +833,35 @@ static void attn_fold(device coherent(device) float *partials,
     }
 }
 
-template <typename Cache>
+// Whether the position and the key count are inside the cache, and the live
+// key count. A key count of 0 or past the cache raises the key-count site, a
+// position at or past it the cache-position site, once per dispatch's
+// threadgroup.
+static bool attn_bounds(thread const AttnArgs &args,
+                        device atomic_uint *faults,
+                        bool active,
+                        uint tid,
+                        thread uint &max_live) {
+    bool key_bad = args.keys == 0u || args.keys > args.ctx;
+    bool pos_bad = args.pos >= args.ctx;
+    max_live = key_bad ? 0u : args.keys;
+    if (tid == 0u && active) {
+        if (key_bad) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_KEY_COUNT);
+        }
+        if (pos_bad) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);
+        }
+    }
+    return active && !key_bad && !pos_bad;
+}
+
+// The flash of one position. APPEND is the decode's: the owning segment
+// appends this position's key and value first. The rows launch has appended
+// them already (attn_norm_rope_rows) and passes no key, value or key gain.
+template <typename Cache, bool APPEND>
 static void attn_flash(Cache cache,
-                       constant AttnArgs &args,
+                       thread const AttnArgs &args,
                        device float const *q,
                        device float const *k,
                        device float const *v,
@@ -816,25 +883,17 @@ static void attn_flash(Cache cache,
     uint seg = group - kv * args.segments;
     bool active = kv < BLOOMERY_ATTN_KV && seg < args.segments;
 
-    bool key_bad = args.keys == 0u || args.keys > args.ctx;
-    bool pos_bad = args.pos >= args.ctx;
-    bool ok = active && !key_bad && !pos_bad;
-    uint max_live = key_bad ? 0u : args.keys;
-    if (tid == 0u && active) {
-        if (key_bad) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_KEY_COUNT);
-        }
-        if (pos_bad) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);
-        }
-    }
+    uint max_live;
+    bool ok = attn_bounds(args, faults, active, tid, max_live);
 
     uint span = attn_span(max_live, args.segments);
-    if (active) {
-        attn_append(cache, args, k, v, k_gain, rope, faults, ok, kv, seg, span, sg, lane,
-                    scratch);
+    if constexpr (APPEND) {
+        if (active) {
+            attn_append(cache, args, k, v, k_gain, rope, faults, ok, kv, seg, span, sg, lane,
+                        scratch);
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     if (active) {
         float qv[8];
@@ -876,7 +935,7 @@ kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
                              device ushort *cache_v [[buffer(7)]],
                              device coherent(device) float *partials [[buffer(8)]],
                              device float *out [[buffer(9)]],
-                             constant AttnArgs &args [[buffer(10)]],
+                             constant AttnArgs &launch [[buffer(10)]],
                              device atomic_uint *faults [[buffer(11)]],
                              device atomic_uint *ticket [[buffer(12)]],
                              uint tid [[thread_index_in_threadgroup]],
@@ -884,13 +943,15 @@ kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
                              uint3 tpg [[threadgroups_per_grid]]) {
     threadgroup uint4 shared[BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 4];
     threadgroup uint last_flag = 0u;
+    AttnArgs args = launch;
     F16Cache cache;
     cache.k = cache_k;
     cache.v = cache_v;
     cache.tile_k = shared;
     cache.tile_v = shared + BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 8;
-    attn_flash(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults, ticket, tpg.x,
-               group.x, tid, (threadgroup float *)shared, last_flag);
+    attn_flash<F16Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults,
+                               ticket, tpg.x, group.x, tid, (threadgroup float *)shared,
+                               last_flag);
 }
 
 kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
@@ -905,7 +966,7 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
                             device ushort *v_scales [[buffer(9)]],
                             device coherent(device) float *partials [[buffer(10)]],
                             device float *out [[buffer(11)]],
-                            constant AttnArgs &args [[buffer(12)]],
+                            constant AttnArgs &launch [[buffer(12)]],
                             device atomic_uint *faults [[buffer(13)]],
                             device atomic_uint *ticket [[buffer(14)]],
                             uint tid [[thread_index_in_threadgroup]],
@@ -915,6 +976,7 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
     // f16 tiles' 16 KB, which the scratch also pairs through.
     threadgroup uint4 shared[BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 4];
     threadgroup uint last_flag = 0u;
+    AttnArgs args = launch;
     Q8Cache cache;
     cache.k_codes = k_codes;
     cache.k_scales = k_scales;
@@ -924,6 +986,72 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
     cache.tile_k_scales = (threadgroup ushort *)(shared + BLOOMERY_ATTN_TILE * 16);
     cache.tile_v_codes = (threadgroup uint *)(shared + BLOOMERY_ATTN_TILE * 20);
     cache.tile_v_scales = (threadgroup ushort *)(shared + BLOOMERY_ATTN_TILE * 36);
-    attn_flash(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults, ticket, tpg.x,
-               group.x, tid, (threadgroup float *)shared, last_flag);
+    attn_flash<Q8Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults,
+                              ticket, tpg.x, group.x, tid, (threadgroup float *)shared,
+                              last_flag);
+}
+
+// The append of a chunk of rows to the f16 cache: row r's key is normed and
+// roped at position from + r and stored with its value, by the decode's own
+// append, one SIMD group a (key head, row). The flash over the chunk
+// (gqa256_flash_f16_rows) reads these rows, so it runs in a later dispatch.
+kernel void attn_norm_rope_rows(device float const *k [[buffer(0)]],
+                                device float const *v [[buffer(1)]],
+                                device float const *k_gain [[buffer(2)]],
+                                device float const *rope [[buffer(3)]],
+                                device ushort *cache_k [[buffer(4)]],
+                                device ushort *cache_v [[buffer(5)]],
+                                constant AttnRowsArgs &args [[buffer(6)]],
+                                device atomic_uint *faults [[buffer(7)]],
+                                uint lane [[thread_index_in_threadgroup]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup float scratch[BLOOMERY_ATTN_HEAD];
+    F16Cache cache;
+    cache.k = cache_k;
+    cache.v = cache_v;
+    cache.tile_k = nullptr;
+    cache.tile_v = nullptr;
+    uint kv = group.x;
+    uint row = group.y;
+    AttnArgs a = attn_row_args(args, row);
+    uint max_live;
+    bool ok = attn_bounds(a, faults, true, lane, max_live);
+    // One segment owns every position: its span covers the live keys.
+    uint span = attn_span(max_live, 1u);
+    attn_append(cache, a, k + row * args.k_stride, v + row * args.v_stride, k_gain, rope, faults,
+                ok, kv, 0u, span, 0u, lane, scratch);
+}
+
+// The flash of a chunk of rows over the f16 cache: the decode flash with a
+// row grid dimension, row r at position from + r with from + r + 1 live keys,
+// each row the bits of the decode launch at its position. The grid is
+// (key heads x segments, rows); every row has its own partials and ticket
+// word.
+kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
+                                  device float const *q_gain [[buffer(1)]],
+                                  device float const *rope [[buffer(2)]],
+                                  device ushort *cache_k [[buffer(3)]],
+                                  device ushort *cache_v [[buffer(4)]],
+                                  device coherent(device) float *partials [[buffer(5)]],
+                                  device float *out [[buffer(6)]],
+                                  constant AttnRowsArgs &args [[buffer(7)]],
+                                  device atomic_uint *faults [[buffer(8)]],
+                                  device atomic_uint *ticket [[buffer(9)]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint3 group [[threadgroup_position_in_grid]],
+                                  uint3 tpg [[threadgroups_per_grid]]) {
+    threadgroup uint4 shared[BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 4];
+    threadgroup uint last_flag = 0u;
+    F16Cache cache;
+    cache.k = cache_k;
+    cache.v = cache_v;
+    cache.tile_k = shared;
+    cache.tile_v = shared + BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 8;
+    uint row = group.y;
+    AttnArgs a = attn_row_args(args, row);
+    uint partials_stride = BLOOMERY_ATTN_Q * args.segments * BLOOMERY_ATTN_PARTIAL;
+    attn_flash<F16Cache, false>(cache, a, q + row * args.q_stride, nullptr, nullptr, q_gain,
+                                nullptr, rope, partials + row * partials_stride,
+                                out + row * args.out_stride, faults, ticket + row, tpg.x, group.x,
+                                tid, (threadgroup float *)shared, last_flag);
 }

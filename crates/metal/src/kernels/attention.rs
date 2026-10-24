@@ -9,6 +9,11 @@
 //! output in the same launch. The ticket is one word the caller holds
 //! zeroed; the fold resets it, so the next launch finds it zero. There is
 //! no merge dispatch.
+//!
+//! [`Kernels::attention_rows`] is the same attention over a chunk of rows,
+//! each row a causal query at its own position: the append of the chunk's
+//! keys and values, then the flash with a row grid dimension. Each row is the
+//! bits of the decode launch at its position with the same segment count.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -17,9 +22,10 @@ use crate::encode::{Binding, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
+use super::rows::check_strided;
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
-use super::attention_geom::{FLASH_THREADS, PARTIAL_ELEMS};
+use super::attention_geom::{FLASH_THREADS, PARTIAL_ELEMS, SIMD_WIDTH};
 pub use super::attention_geom::{
     HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP, SEGMENT_KEYS, TILE,
     segments_for_keys,
@@ -136,6 +142,8 @@ pub fn q8_scale_len(ctx: usize) -> Option<usize> {
 pub(crate) struct AttentionPipelines {
     f16: Pipeline,
     q8: Pipeline,
+    append_rows: Pipeline,
+    flash_rows: Pipeline,
 }
 
 impl AttentionPipelines {
@@ -143,6 +151,8 @@ impl AttentionPipelines {
         Ok(Self {
             f16: library.pipeline("gqa256_flash_f16")?,
             q8: library.pipeline("gqa256_flash_q8")?,
+            append_rows: library.pipeline("attn_norm_rope_rows")?,
+            flash_rows: library.pipeline("gqa256_flash_f16_rows")?,
         })
     }
 }
@@ -330,5 +340,247 @@ impl Kernels {
         encoder.set_pipeline(pipeline);
         bind_flash(encoder, &p, &checked.args)?;
         encoder.dispatch_groups(groups, 1, FLASH_THREADS)
+    }
+}
+
+/// One attention launch over a chunk of `rows` causal queries, on the f16
+/// cache. Row `r` sits at position `from + r`, appends its key and value
+/// there and attends the `from + r + 1` keys up to and including it.
+///
+/// The windows with a stride hold `rows` rows that far apart; each may be
+/// longer than the last row's end.
+pub struct AttentionRowsParams<'w> {
+    /// Head dimension. The kernel takes [`HEAD_DIM`].
+    pub head_dim: usize,
+    /// Query heads. The kernel takes [`QUERY_HEADS`].
+    pub query_heads: usize,
+    /// Key and value heads. The kernel takes [`KV_HEADS`].
+    pub kv_heads: usize,
+    /// Split-K segments of every row's flash, the same count the decode
+    /// launch a row is held to uses.
+    pub segments: usize,
+    /// Cache rows per key head.
+    pub ctx: usize,
+    /// RMS epsilon.
+    pub eps: f32,
+    /// The layer a raise is recorded in.
+    pub layer: u32,
+    /// The position of row 0.
+    pub from: u32,
+    /// Rows in the chunk. Zero is refused, and so is a chunk that ends past
+    /// `ctx`.
+    pub rows: usize,
+    /// The query projections, [`qg_len`] elements a row, `q_stride` apart.
+    pub q: Window<'w, f32, MetalDevice>,
+    /// Elements between rows of `q`.
+    pub q_stride: usize,
+    /// Raw keys, [`KV_HEADS`] rows of [`HEAD_DIM`] a row, `k_stride` apart.
+    pub k: Window<'w, f32, MetalDevice>,
+    /// Elements between rows of `k`.
+    pub k_stride: usize,
+    /// Raw values, laid out as `k`.
+    pub v: Window<'w, f32, MetalDevice>,
+    /// Elements between rows of `v`.
+    pub v_stride: usize,
+    /// Query RMS gain, 256 values.
+    pub q_gain: Window<'w, f32, MetalDevice>,
+    /// Key RMS gain, 256 values.
+    pub k_gain: Window<'w, f32, MetalDevice>,
+    /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
+    pub rope: Window<'w, f32, MetalDevice>,
+    /// The cache the launch appends and reads. The rows launches take the
+    /// f16 cache; the q8_0 planes are refused by name.
+    pub cache: AttnCache<'w>,
+    /// Segment partials, [`partials_len`] elements a row.
+    pub partials: WindowMut<'w, f32, MetalDevice>,
+    /// The outputs after the gate, [`out_len`] elements a row, `out_stride`
+    /// apart.
+    pub out: WindowMut<'w, f32, MetalDevice>,
+    /// Elements between rows of `out`.
+    pub out_stride: usize,
+    /// The fault word.
+    pub fault: &'w MetalFaultWord,
+    /// The folds' tickets, one word a row. Held zeroed; each row's fold
+    /// resets its word, so the next launch finds them zero.
+    pub ticket: WindowMut<'w, u32, MetalDevice>,
+}
+
+const ROWS_WHAT: &str = "attention rows";
+
+fn refuse_rows(detail: String) -> DeviceError {
+    DeviceError::Range {
+        what: ROWS_WHAT,
+        detail,
+    }
+}
+
+fn checked_rows(p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceError> {
+    if p.head_dim != HEAD_DIM {
+        return Err(refuse_rows(format!(
+            "head dim {}, the kernel takes {HEAD_DIM}",
+            p.head_dim
+        )));
+    }
+    if p.query_heads != QUERY_HEADS {
+        return Err(refuse_rows(format!(
+            "query heads {}, the kernel takes {QUERY_HEADS}",
+            p.query_heads
+        )));
+    }
+    if p.kv_heads != KV_HEADS {
+        return Err(refuse_rows(format!(
+            "kv heads {}, the kernel takes {KV_HEADS}",
+            p.kv_heads
+        )));
+    }
+    if p.segments == 0 {
+        return Err(refuse_rows("segments of 0".to_string()));
+    }
+    if p.segments > SEGMENT_CAP {
+        return Err(refuse_rows(format!(
+            "segments of {} past the kernel's {SEGMENT_CAP}",
+            p.segments
+        )));
+    }
+    if p.ctx == 0 {
+        return Err(refuse_rows("ctx of 0".to_string()));
+    }
+    if p.rows == 0 {
+        return Err(refuse_rows("rows of 0".to_string()));
+    }
+    let rows = word(ROWS_WHAT, "rows", p.rows)?;
+    let ctx = word(ROWS_WHAT, "ctx", p.ctx)?;
+    match p.from.checked_add(rows) {
+        Some(end) if end <= ctx => {}
+        _ => {
+            return Err(refuse_rows(format!(
+                "positions {}..+{rows} pass the cache's ctx {ctx}",
+                p.from
+            )));
+        }
+    }
+    let q_len = qg_len().ok_or_else(|| refuse_rows("the query length wraps".to_string()))?;
+    let kv_len = KV_HEADS
+        .checked_mul(HEAD_DIM)
+        .ok_or_else(|| refuse_rows("the key length wraps".to_string()))?;
+    let out = out_len().ok_or_else(|| refuse_rows("the output length wraps".to_string()))?;
+    let rope_len = p
+        .ctx
+        .checked_mul(ROT)
+        .ok_or_else(|| refuse_rows("the rope length wraps".to_string()))?;
+    let partials_row = partials_len(p.segments)
+        .ok_or_else(|| refuse_rows("the partial length wraps".to_string()))?;
+    check_strided(ROWS_WHAT, "q", p.q.len(), p.rows, p.q_stride, q_len)?;
+    check_strided(ROWS_WHAT, "k", p.k.len(), p.rows, p.k_stride, kv_len)?;
+    check_strided(ROWS_WHAT, "v", p.v.len(), p.rows, p.v_stride, kv_len)?;
+    check_strided(ROWS_WHAT, "out", p.out.len(), p.rows, p.out_stride, out)?;
+    check_strided(
+        ROWS_WHAT,
+        "partials",
+        p.partials.len(),
+        p.rows,
+        partials_row,
+        partials_row,
+    )?;
+    check_strided(ROWS_WHAT, "ticket", p.ticket.len(), p.rows, 1, 1)?;
+    let ticket = p
+        .ticket
+        .byte_range()
+        .map_err(|e| refuse_rows(format!("the ticket window: {e}")))?;
+    if ticket.start.get() % 4 != 0 {
+        return Err(refuse_rows(
+            "the ticket word is not 4-byte aligned".to_string(),
+        ));
+    }
+    check_window_len(ROWS_WHAT, "q gain", p.q_gain.len(), HEAD_DIM)?;
+    check_window_len(ROWS_WHAT, "k gain", p.k_gain.len(), HEAD_DIM)?;
+    check_window_len(ROWS_WHAT, "rope", p.rope.len(), rope_len)?;
+    match &p.cache {
+        AttnCache::F16 { k, v } => {
+            let n =
+                f16_len(p.ctx).ok_or_else(|| refuse_rows("the cache length wraps".to_string()))?;
+            check_window_len(ROWS_WHAT, "k cache", k.len(), n)?;
+            check_window_len(ROWS_WHAT, "v cache", v.len(), n)?;
+            for (name, w) in [("k cache", k), ("v cache", v)] {
+                let range = w
+                    .byte_range()
+                    .map_err(|e| refuse_rows(format!("the {name} window: {e}")))?;
+                if range.start.get() % 16 != 0 {
+                    return Err(refuse_rows(format!(
+                        "the {name} starts {} bytes in, not on the 16-byte word the kernel reads",
+                        range.start.get()
+                    )));
+                }
+            }
+        }
+        AttnCache::Q8 { .. } => {
+            return Err(refuse_rows(
+                "the rows launches take the f16 cache, not the q8_0 planes".to_string(),
+            ));
+        }
+    }
+    Ok(args_bytes([
+        word(ROWS_WHAT, "segments", p.segments)?,
+        ctx,
+        p.layer,
+        p.eps.to_bits(),
+        SCALE.to_bits(),
+        p.from,
+        rows,
+        word(ROWS_WHAT, "the q stride", p.q_stride)?,
+        word(ROWS_WHAT, "the k stride", p.k_stride)?,
+        word(ROWS_WHAT, "the v stride", p.v_stride)?,
+        word(ROWS_WHAT, "the out stride", p.out_stride)?,
+    ]))
+}
+
+impl Kernels {
+    /// Encode the attention over a chunk of rows: the append of every row's
+    /// key and value, a memory barrier, and the flash with a row grid
+    /// dimension. A shape the kernels do not take, or a window that is not
+    /// that shape, is refused by name and nothing is encoded. The two
+    /// dispatches are one group each, the barrier the flash's order after the
+    /// appends.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn attention_rows(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: AttentionRowsParams<'_>,
+    ) -> Result<(), DeviceError> {
+        let args = checked_rows(&p)?;
+        let AttnCache::F16 {
+            k: cache_k,
+            v: cache_v,
+        } = &p.cache
+        else {
+            unreachable!("checked_rows refused the q8_0 planes");
+        };
+        encoder.set_pipeline(&self.attention.append_rows);
+        encoder.set_binding(0, Binding::of(&p.k)?)?;
+        encoder.set_binding(1, Binding::of(&p.v)?)?;
+        encoder.set_binding(2, Binding::of(&p.k_gain)?)?;
+        encoder.set_binding(3, Binding::of(&p.rope)?)?;
+        encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
+        encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
+        encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
+        encoder.set_binding(7, p.fault.binding())?;
+        encoder.dispatch_groups(KV_HEADS, p.rows, SIMD_WIDTH)?;
+
+        encoder.memory_barrier();
+        let groups = KV_HEADS
+            .checked_mul(p.segments)
+            .ok_or_else(|| refuse_rows("the flash grid wraps".to_string()))?;
+        encoder.set_pipeline(&self.attention.flash_rows);
+        encoder.set_binding(0, Binding::of(&p.q)?)?;
+        encoder.set_binding(1, Binding::of(&p.q_gain)?)?;
+        encoder.set_binding(2, Binding::of(&p.rope)?)?;
+        encoder.set_binding(3, Binding::of_mut(cache_k)?)?;
+        encoder.set_binding(4, Binding::of_mut(cache_v)?)?;
+        encoder.set_binding(5, Binding::of_mut(&p.partials)?)?;
+        encoder.set_binding(6, Binding::of_mut(&p.out)?)?;
+        encoder.set_binding(7, Binding::bytes(pack(&args))?)?;
+        encoder.set_binding(8, p.fault.binding())?;
+        encoder.set_binding(9, Binding::of_mut(&p.ticket)?)?;
+        encoder.dispatch_groups(groups, p.rows, FLASH_THREADS)
     }
 }

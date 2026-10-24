@@ -4,6 +4,12 @@
 //! head-normed mat-vec multiplies the norm scale on load; this launch does
 //! not. The grid is fixed: one threadgroup per value-head column block, 128
 //! threads in the group.
+//!
+//! [`Kernels::delta_rows`] is the same step over a chunk of rows in one
+//! launch, rows in order: the rows are the bits of the stepped launches. It
+//! encodes two dispatches, the rows and then the ring commit, because a
+//! threadgroup's later rows write ring slots that another threadgroup's first
+//! rows still read.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -11,8 +17,11 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
+use crate::library::{Library, Pipeline};
+
 use super::delta_geom::{CONV_TAPS, RING_ROWS};
 use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
+use super::rows::check_strided;
 use super::{Kernels, check_window_len, pack, word};
 
 /// `1 / sqrt(HEAD_COLS)` rounded to f32. The kernel multiplies the query by
@@ -152,41 +161,64 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
     super::range(WHAT, detail)
 }
 
+/// The shape the kernel takes, refused by name before any window is read.
+fn check_geometry(
+    n_v: usize,
+    head: usize,
+    taps: usize,
+    n_k: usize,
+    lanes: usize,
+) -> Result<(), DeviceError> {
+    if n_v != VALUE_HEADS {
+        return Err(refuse(format!(
+            "n_v {n_v} is not this layer's n_v {VALUE_HEADS}"
+        )));
+    }
+    if head != HEAD_COLS {
+        return Err(refuse(format!(
+            "head {head} is not this layer's head {HEAD_COLS}"
+        )));
+    }
+    if taps != CONV_TAPS {
+        return Err(refuse(format!(
+            "conv taps {taps} are not this layer's taps {CONV_TAPS}"
+        )));
+    }
+    if n_k == 0 || !VALUE_HEADS.is_multiple_of(n_k) {
+        return Err(refuse(format!(
+            "n_k {n_k} does not divide this layer's n_v {VALUE_HEADS}"
+        )));
+    }
+    if lanes == 0 {
+        return Err(refuse("lanes of 0"));
+    }
+    Ok(())
+}
+
 /// The shape, refused by name before any window is read. A position window
 /// that is not one position is refused here too.
 fn check_shape(p: &DeltaParams<'_>) -> Result<(), DeviceError> {
-    if p.n_v != VALUE_HEADS {
-        return Err(refuse(format!(
-            "n_v {} is not this layer's n_v {VALUE_HEADS}",
-            p.n_v
-        )));
-    }
-    if p.head != HEAD_COLS {
-        return Err(refuse(format!(
-            "head {} is not this layer's head {HEAD_COLS}",
-            p.head
-        )));
-    }
-    if p.taps != CONV_TAPS {
-        return Err(refuse(format!(
-            "conv taps {} are not this layer's taps {CONV_TAPS}",
-            p.taps
-        )));
-    }
-    if p.n_k == 0 || !VALUE_HEADS.is_multiple_of(p.n_k) {
-        return Err(refuse(format!(
-            "n_k {} does not divide this layer's n_v {VALUE_HEADS}",
-            p.n_k
-        )));
-    }
-    if p.lanes == 0 {
-        return Err(refuse("lanes of 0"));
-    }
+    check_geometry(p.n_v, p.head, p.taps, p.n_k, p.lanes)?;
     if p.pos.len() != 1 {
         return Err(refuse(format!(
             "the position window holds {}, the step takes one position",
             p.pos.len()
         )));
+    }
+    Ok(())
+}
+
+/// The lane window holds the words the read and the write index name.
+fn check_lane_words(held: usize, lane_at: usize, lane_to: usize) -> Result<(), DeviceError> {
+    for (what, at) in [("read", lane_at), ("write", lane_to)] {
+        let need = at
+            .checked_add(1)
+            .ok_or_else(|| refuse(format!("the {what} lane index {at} does not fit")))?;
+        if held < need {
+            return Err(refuse(format!(
+                "the lane window holds {held}, the {what} lane index needs {need}"
+            )));
+        }
     }
     Ok(())
 }
@@ -211,17 +243,7 @@ fn check_windows(p: &DeltaParams<'_>) -> Result<(), DeviceError> {
     check_window_len(WHAT, "ssm a", p.ssm_a.len(), VALUE_HEADS)?;
     check_window_len(WHAT, "z", p.z.len(), z_len)?;
     check_window_len(WHAT, "norm weight", p.norm_w.len(), HEAD_COLS)?;
-    for (what, at) in [("read", p.lane_at), ("write", p.lane_to)] {
-        let need = at
-            .checked_add(1)
-            .ok_or_else(|| refuse(format!("the {what} lane index {at} does not fit")))?;
-        if p.lane.len().get() < need {
-            return Err(refuse(format!(
-                "the lane window holds {}, the {what} lane index needs {need}",
-                p.lane.len().get()
-            )));
-        }
-    }
+    check_lane_words(p.lane.len().get(), p.lane_at, p.lane_to)?;
     word(WHAT, "the state length", state)?;
     word(WHAT, "the ring length", ring)?;
     check_window_len(WHAT, "state", p.state.len(), state)?;
@@ -274,5 +296,239 @@ impl Kernels {
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.faults.binding())?;
         slot.dispatch_groups(GROUPS, 1, GROUP_THREADS)
+    }
+}
+
+/// The strides, in elements, between the rows of a chunk's buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaRowStrides {
+    /// The conv input: at least [`channels`].
+    pub x: usize,
+    /// The gate input: at least `VALUE_HEADS · HEAD_COLS`.
+    pub z: usize,
+    /// β's input: at least [`VALUE_HEADS`].
+    pub b: usize,
+    /// The decay's input: at least [`VALUE_HEADS`].
+    pub a: usize,
+    /// The gated numerator: at least `VALUE_HEADS · HEAD_COLS`.
+    pub g: usize,
+    /// The partial sums of `o²`: at least [`GROUPS`] (`VALUE_HEADS` rows of
+    /// `PARTIALS_PER_HEAD`).
+    pub partials: usize,
+}
+
+impl DeltaRowStrides {
+    /// Rows laid end to end, each exactly as wide as the step's own window.
+    #[must_use]
+    pub fn dense(n_k: usize) -> Option<Self> {
+        Some(Self {
+            x: channels(n_k)?,
+            z: VALUE_HEADS * HEAD_COLS,
+            b: VALUE_HEADS,
+            a: VALUE_HEADS,
+            g: VALUE_HEADS * HEAD_COLS,
+            partials: GROUPS,
+        })
+    }
+}
+
+/// One gated delta step over a chunk of rows, rows in order in one launch.
+/// The state is read from the lane the word at `lane_at` names before the
+/// first row and written to the lane the word at `lane_to` names after the
+/// last; the words may name one lane. The ring keeps what `rows` stepped
+/// launches would leave.
+pub struct DeltaRowsParams<'w> {
+    /// The conv input: row `r` starts `strides.x` elements after row `r - 1`.
+    pub x: Window<'w, f32, MetalDevice>,
+    /// The conv weights, tap innermost: `4·channels`.
+    pub conv_w: Window<'w, f32, MetalDevice>,
+    /// `β`'s pre-sigmoid input, [`VALUE_HEADS`] values a row.
+    pub b_raw: Window<'w, f32, MetalDevice>,
+    /// The decay's pre-softplus input, [`VALUE_HEADS`] values a row.
+    pub a_raw: Window<'w, f32, MetalDevice>,
+    /// The decay bias, one value per value head.
+    pub dt_bias: Window<'w, f32, MetalDevice>,
+    /// The decay slope, one value per value head.
+    pub ssm_a: Window<'w, f32, MetalDevice>,
+    /// The gate activation's input, one value per value-head column a row.
+    pub z: Window<'w, f32, MetalDevice>,
+    /// The norm gain, one value per column. The norm scale is not applied.
+    pub norm_w: Window<'w, f32, MetalDevice>,
+    /// Lane words. The kernel reads the words at `lane_at` and `lane_to`.
+    pub lane: Window<'w, u32, MetalDevice>,
+    /// The recurrent state, every lane.
+    pub state: WindowMut<'w, f32, MetalDevice>,
+    /// The conv ring, every slot: the pre-chunk slots are read, then the last
+    /// `min(rows, RING_ROWS)` positions' slots are written.
+    pub ring: WindowMut<'w, f32, MetalDevice>,
+    /// The partial sums of `o²`, [`GROUPS`] values a row.
+    pub partials: WindowMut<'w, f32, MetalDevice>,
+    /// The gated numerator, one value per value-head column a row.
+    pub g: WindowMut<'w, f32, MetalDevice>,
+    /// The fault word a raise lands in.
+    pub faults: &'w MetalFaultWord,
+    /// Value heads. This layer has [`VALUE_HEADS`].
+    pub n_v: usize,
+    /// Columns of a head. This layer has [`HEAD_COLS`].
+    pub head: usize,
+    /// Conv taps. This layer has [`CONV_TAPS`].
+    pub taps: usize,
+    /// Key heads. `n_v` is a multiple of this, and it is not zero.
+    pub n_k: usize,
+    /// How a value head finds its key head.
+    pub map: HeadMap,
+    /// Lanes of the state. Zero is refused.
+    pub lanes: usize,
+    /// The word of the lane the chunk reads.
+    pub lane_at: usize,
+    /// The word of the lane the chunk writes.
+    pub lane_to: usize,
+    /// The layer a raise is recorded in.
+    pub layer: u32,
+    /// Rows in the chunk. Zero is refused.
+    pub rows: usize,
+    /// The position of row 0. Row `r` is position `pos + r`.
+    pub pos: u32,
+    /// The strides between rows of the windows above.
+    pub strides: DeltaRowStrides,
+    /// The L2 norm's epsilon.
+    pub eps: f32,
+}
+
+/// The pipelines of the rows launch: the rows, then the ring commit.
+pub(crate) struct RowsPipelines {
+    rows: Pipeline,
+    ring: Pipeline,
+}
+
+impl RowsPipelines {
+    pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
+        Ok(Self {
+            rows: library.pipeline("gdn_rows")?,
+            ring: library.pipeline("gdn_ring_rows")?,
+        })
+    }
+}
+
+/// Threads in the ring commit's threadgroup.
+const RING_THREADS: usize = 128;
+
+fn check_rows(p: &DeltaRowsParams<'_>) -> Result<(), DeviceError> {
+    check_geometry(p.n_v, p.head, p.taps, p.n_k, p.lanes)?;
+    if p.rows == 0 {
+        return Err(refuse("rows of 0"));
+    }
+    let rows = word(WHAT, "rows", p.rows)?;
+    if p.pos.checked_add(rows).is_none() {
+        return Err(refuse(format!(
+            "positions {}..+{rows} pass the 32-bit position word",
+            p.pos
+        )));
+    }
+    let ch = channels(p.n_k).ok_or_else(|| refuse(format!("n_k {} channels do not fit", p.n_k)))?;
+    let conv = ch
+        .checked_mul(CONV_TAPS)
+        .ok_or_else(|| refuse(format!("conv weights of {ch} channels do not fit")))?;
+    let z_len = VALUE_HEADS * HEAD_COLS;
+    let state = state_elems(p.lanes)
+        .ok_or_else(|| refuse(format!("the state of {} lanes does not fit", p.lanes)))?;
+    let ring = ring_elems(p.n_k)
+        .ok_or_else(|| refuse(format!("the ring of n_k {} does not fit", p.n_k)))?;
+    let st = p.strides;
+    check_strided(WHAT, "x", p.x.len(), p.rows, st.x, ch)?;
+    check_strided(WHAT, "z", p.z.len(), p.rows, st.z, z_len)?;
+    check_strided(WHAT, "b", p.b_raw.len(), p.rows, st.b, VALUE_HEADS)?;
+    check_strided(WHAT, "a", p.a_raw.len(), p.rows, st.a, VALUE_HEADS)?;
+    check_strided(WHAT, "g", p.g.len(), p.rows, st.g, z_len)?;
+    check_strided(
+        WHAT,
+        "partials",
+        p.partials.len(),
+        p.rows,
+        st.partials,
+        GROUPS,
+    )?;
+    check_window_len(WHAT, "conv weight", p.conv_w.len(), conv)?;
+    check_window_len(WHAT, "dt bias", p.dt_bias.len(), VALUE_HEADS)?;
+    check_window_len(WHAT, "ssm a", p.ssm_a.len(), VALUE_HEADS)?;
+    check_window_len(WHAT, "norm weight", p.norm_w.len(), HEAD_COLS)?;
+    check_lane_words(p.lane.len().get(), p.lane_at, p.lane_to)?;
+    word(WHAT, "the state length", state)?;
+    word(WHAT, "the ring length", ring)?;
+    check_window_len(WHAT, "state", p.state.len(), state)?;
+    check_window_len(WHAT, "ring", p.ring.len(), ring)?;
+    Ok(())
+}
+
+impl Kernels {
+    /// Encode the step over `p.rows` rows: the rows dispatch, a memory
+    /// barrier, and the ring commit. The shape and every window are checked
+    /// before any dispatch, and a refused launch encodes nothing. The two
+    /// dispatches are one group each, and the barrier between them is the
+    /// ring commit's order after the rows' reads.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn delta_rows(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: DeltaRowsParams<'_>,
+    ) -> Result<(), DeviceError> {
+        check_rows(&p)?;
+        let ch = channels(p.n_k).expect("check_rows fitted the channels");
+        let st = p.strides;
+        let args = [
+            word(WHAT, "n_k", p.n_k)?,
+            p.map.word(),
+            word(WHAT, "the lane count", p.lanes)?,
+            word(WHAT, "the read lane index", p.lane_at)?,
+            word(WHAT, "the write lane index", p.lane_to)?,
+            p.layer,
+            p.pos,
+            p.eps.to_bits(),
+            word(WHAT, "rows", p.rows)?,
+            word(WHAT, "the x stride", st.x)?,
+            word(WHAT, "the z stride", st.z)?,
+            word(WHAT, "the b stride", st.b)?,
+            word(WHAT, "the a stride", st.a)?,
+            word(WHAT, "the g stride", st.g)?,
+            word(WHAT, "the partials stride", st.partials)?,
+        ]
+        .map(u32::to_ne_bytes);
+        encoder.set_pipeline(&self.delta_rows.rows);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of(&p.conv_w)?)?;
+        slot.set(Binding::of(&p.b_raw)?)?;
+        slot.set(Binding::of(&p.a_raw)?)?;
+        slot.set(Binding::of(&p.dt_bias)?)?;
+        slot.set(Binding::of(&p.ssm_a)?)?;
+        slot.set(Binding::of(&p.z)?)?;
+        slot.set(Binding::of(&p.norm_w)?)?;
+        slot.set(Binding::of(&p.lane)?)?;
+        slot.set(Binding::of_mut(&p.state)?)?;
+        slot.set(Binding::of_mut(&p.ring)?)?;
+        slot.set(Binding::of_mut(&p.partials)?)?;
+        slot.set(Binding::of_mut(&p.g)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(p.faults.binding())?;
+        slot.dispatch_groups(GROUPS, 1, GROUP_THREADS)?;
+
+        encoder.memory_barrier();
+        let ring_args = [
+            word(WHAT, "channels", ch)?,
+            word(WHAT, "rows", p.rows)?,
+            word(WHAT, "the x stride", st.x)?,
+            p.pos,
+        ]
+        .map(u32::to_ne_bytes);
+        encoder.set_pipeline(&self.delta_rows.ring);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of_mut(&p.ring)?)?;
+        slot.set(Binding::bytes(pack(&ring_args))?)?;
+        slot.dispatch_groups(
+            ch.div_ceil(RING_THREADS),
+            p.rows.min(RING_ROWS),
+            RING_THREADS,
+        )
     }
 }

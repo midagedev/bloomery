@@ -29,16 +29,21 @@ mod geometry;
 mod head;
 mod headnorm;
 mod matvec;
+mod norm;
 pub mod router;
 mod router_geom;
+mod rows;
 mod seg;
 
+pub use attention::AttentionRowsParams;
 pub use attention::{
     AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE,
     SEGMENT_CAP, SEGMENT_KEYS, TILE, f16_len, out_len, partials_len, q8_code_len, q8_scale_len,
     qg_len, segments_for_keys,
 };
 pub use delta::DeltaParams;
+pub use delta::DeltaRowStrides;
+pub use delta::DeltaRowsParams;
 pub use delta::HeadMap;
 pub use delta::Q_SCALE;
 pub use delta::channels;
@@ -59,6 +64,7 @@ pub use geometry::{
 pub use head::{HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HEAD_VOCAB, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
+pub use norm::NormRowsParams;
 pub use seg::{SegParams, Segment};
 
 use bloomery_device::DeviceError;
@@ -104,9 +110,13 @@ pub struct Kernels {
     embed_q4k: Pipeline,
     embed_a4: Pipeline,
     router: Pipeline,
+    /// The RMS norm over rows.
+    norm_rows: Pipeline,
     experts: experts::Pipelines,
     /// The gated delta step.
     delta: Pipeline,
+    /// The gated delta step over rows, and the ring commit after it.
+    delta_rows: delta::RowsPipelines,
     attention: attention::AttentionPipelines,
     /// The output head: the Q6_K entry (A4's is `head_a4`; Q4_K has none).
     head_q6k: Pipeline,
@@ -255,8 +265,10 @@ impl Kernels {
             embed_q4k: library.pipeline("embed_q4k")?,
             embed_a4: library.pipeline("embed_a4")?,
             router: library.pipeline("router35")?,
+            norm_rows: library.pipeline("norm_rows")?,
             experts: experts::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,
+            delta_rows: delta::RowsPipelines::new(library)?,
             attention: attention::AttentionPipelines::new(library)?,
             // The head's SIMD-group count, not the mat-vec count this function
             // was given. The constant is the pipeline's function constant.
