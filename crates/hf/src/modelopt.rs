@@ -1209,6 +1209,8 @@ fn append<'a>(
         .try_reserve(bytes)
         .map_err(|e| shape(&wname, format!("cannot reserve {bytes} NVFP4 bytes: {e}")))?;
     os::advise_huge_within(out.blocks.spare_capacity_mut());
+    // Each scale byte's half value, worked out once; a byte that is no scale is refused below.
+    let halves: [Option<f32>; 256] = std::array::from_fn(|b| ue4m3_to_f32_half(b as u8).ok());
     for (row, (w, s)) in w
         .bytes
         .chunks_exact(half)
@@ -1223,12 +1225,14 @@ fn append<'a>(
             .enumerate()
         {
             for (sub, &byte) in d.iter().enumerate() {
-                let half_scale = ue4m3_to_f32_half(byte).map_err(|source| Error::Scale {
-                    name: sname.clone(),
-                    row,
-                    group: 4 * block + sub,
-                    source,
-                })?;
+                let half_scale = halves[usize::from(byte)]
+                    .map_or_else(|| ue4m3_to_f32_half(byte), Ok)
+                    .map_err(|source| Error::Scale {
+                        name: sname.clone(),
+                        row,
+                        group: 4 * block + sub,
+                        source,
+                    })?;
                 if !(half_scale * 12.0 * scale).is_finite()
                     && w[sub * 8..][..8]
                         .iter()
@@ -1244,19 +1248,35 @@ fn append<'a>(
                     ));
                 }
             }
-            out.blocks.extend_from_slice(d);
-            for g in w.as_chunks::<8>().0 {
-                // Value j is the (j % 2) nibble of byte j / 2; the block's byte j holds value j
-                // low and value j + 8 high.
-                out.blocks.extend((0..8).map(|j| {
-                    let nib = |b: u8| (b >> (4 * (j % 2))) & 0x0f;
-                    nib(g[j / 2]) | nib(g[4 + j / 2]) << 4
-                }));
+            let mut blocks = [0u8; 36];
+            blocks[..4].copy_from_slice(d);
+            for (g, o) in w
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(blocks[4..].as_chunks_mut::<8>().0)
+            {
+                *o = interleave(g);
             }
+            out.blocks.extend_from_slice(&blocks);
         }
     }
     out.scale.push(scale);
     Ok([rows, k])
+}
+
+/// A stored 16-value group (value j the (j % 2) nibble of byte j / 2) as GGUF's NVFP4 group:
+/// byte j holds value j low and value j + 8 high.
+fn interleave(g: &[u8; 8]) -> [u8; 8] {
+    // The 8 nibbles of a word, nibble j the low half of byte j.
+    let spread = |half: [u8; 4]| {
+        let x = u64::from(u32::from_le_bytes(half));
+        let x = (x | x << 16) & 0x0000_ffff_0000_ffff;
+        let x = (x | x << 8) & 0x00ff_00ff_00ff_00ff;
+        (x | x << 4) & 0x0f0f_0f0f_0f0f_0f0f
+    };
+    let [a, b, c, d, e, f, h, i] = *g;
+    (spread([a, b, c, d]) | spread([e, f, h, i]) << 4).to_le_bytes()
 }
 
 /// The stored tensor `name` of dtype `want` whose bytes fill its shape; bytes that do not are
