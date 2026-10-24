@@ -5,7 +5,8 @@
 //!
 //! What it maps:
 //!
-//! - `prefill` is the target's prompt call, its pick dropped; `next` is one
+//! - `prefill` is the target's prompt call, its pick dropped, and one line
+//!   on stderr naming its positions, its ids and its wall; `next` is one
 //!   step, [`Want::Argmax`] for a greedy request (the session chains the
 //!   pick into the token ahead) and [`Want::Logits`] for one that samples,
 //!   the row copied into the server's buffer;
@@ -23,6 +24,7 @@
 
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Instant;
 
 use runtime::{Out, Target, Want};
 use serve::{Engine, EngineError, EngineProps, Tokenizer};
@@ -82,10 +84,19 @@ impl<T: Target + Send> Engine for TargetEngine<T> {
         if ids.is_empty() {
             return Ok(());
         }
+        let from = self.target.pos();
+        let t0 = Instant::now();
         self.target
             .prompt(ids, Want::Argmax)
-            .map(|_| ())
-            .map_err(engine_error)
+            .map_err(engine_error)?;
+        eprintln!(
+            "{}: prompt call {from}..{}: {} ids in {:.1} ms",
+            self.what,
+            self.target.pos(),
+            ids.len(),
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
     }
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {

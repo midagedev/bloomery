@@ -34,8 +34,11 @@
 //! comes from the prompt call and is in `decode_tokens`, not in the rate. A
 //! run of one token has no pass, and its rate prints `none`.
 //!
-//! `--pass-times U` times the ops of one pass of U prompt ids, each on a
-//! command buffer of its own waited before the next, as per-class sums.
+//! `--pass-times U[,U…]` times, for each U, the ops of one pass of U prompt
+//! ids, each on a command buffer of its own waited before the next, as
+//! per-class sums, beside the wall of the same pass as the prompt runs it
+//! (`pass_wall`); then the wall of one checkpoint after a pass of the last U
+//! and of the whole prompt's call from position 0, both warm.
 //!
 //! `--prefill steps` feeds the prompt a decode step an id, the same-binary arm
 //! of the default (`batch`: the prompt in passes of up to
@@ -83,11 +86,12 @@ mod cli {
     use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
     use bloomery_metal::arch::qwen3moe::generate::greedy;
     use bloomery_metal::arch::qwen3moe::session::{
-        Op, PassOut, PassSample, ProfileGroup, Session, StepMode,
+        Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode,
     };
     use bloomery_metal::device::MetalDevice;
     use bloomery_metal::kernels::PASS_ROWS;
     use runtime::prompt::PrefillMode;
+    use runtime::{Target, Want};
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
@@ -96,15 +100,16 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U]
+generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
   the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
   and the file's context_length; --print-ids prints the ids, not the text;
   --profile [N] (default 32) steps N more tokens after the summary, each
   group's GPU time and bytes printed; --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
   clock's phases a mode printed; --prefill steps feeds the prompt a step an
-  id, batch (the default) in passes; --pass-times U times the ops of one pass
-  of the first U prompt ids, one command buffer at a time";
+  id, batch (the default) in passes; --pass-times U[,U…] times the ops of one
+  pass of the first U prompt ids, one command buffer at a time, beside the
+  pass's own wall";
 
     /// The flags that take a value.
     const VALUE_FLAGS: [&str; 6] = [
@@ -144,8 +149,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         /// `--step-times [N]`: the step clock's tokens a mode.
         step_times: Option<usize>,
         prefill: PrefillMode,
-        /// `--pass-times U`: the rows of the pass whose ops are timed alone.
-        pass_times: Option<usize>,
+        /// `--pass-times U[,U…]`: the rows of each pass whose ops are timed
+        /// alone.
+        pass_times: Option<Vec<usize>>,
         model: PathBuf,
     }
 
@@ -293,13 +299,20 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let pass_times = match flag("--pass-times")? {
             None => None,
             Some(s) => {
-                let u: usize = s.parse().map_err(|e| format!("--pass-times {s}: {e}"))?;
-                if u <= PASS_ROWS {
-                    return Err(format!(
-                        "--pass-times {u}: a pass holds more than {PASS_ROWS} rows"
-                    ));
+                let mut us = Vec::new();
+                for v in s.split(',') {
+                    let u: usize = v
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("--pass-times {s}: {e}"))?;
+                    if u <= PASS_ROWS {
+                        return Err(format!(
+                            "--pass-times {u}: a pass holds more than {PASS_ROWS} rows"
+                        ));
+                    }
+                    us.push(u);
                 }
-                Some(u)
+                Some(us)
             }
         };
         let prefill = match flag("--prefill")? {
@@ -512,14 +525,19 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             .unwrap_or_else(|| panic!("generate_metal: the kind {kind:?} sits in no kind table"))
     }
 
+    /// Timed runs of each `--pass-times` measurement, after one warm run.
+    const PASS_TIMES_RUNS: usize = 3;
+
     /// The pass over the first `u` ids of the prompt with every op on a
     /// command buffer of its own, waited before the next is committed: the
     /// op's GPU seconds are its own and never a queued buffer's overlap. One
     /// warm pass and `PASS_TIMES_RUNS` timed ones from position 0, each op's
-    /// median; the sums per class print as lines, in milliseconds. The
-    /// session is reset before and after.
+    /// median; the sums per class print as lines, in milliseconds. Then the
+    /// same pass as the prompt runs it, its host wall from the call to its
+    /// return, the median of `PASS_TIMES_RUNS` after a warm one, beside the
+    /// ops' sum: the gap is what the pass pays outside its ops' own GPU
+    /// time. The session is reset before each pass and after the last.
     fn pass_times_run(s: &mut Session, prompt: &[u32], u: usize) -> Result<(), String> {
-        const PASS_TIMES_RUNS: usize = 3;
         if prompt.len() < u {
             return Err(format!(
                 "--pass-times {u}: the prompt holds {} ids",
@@ -585,6 +603,65 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             "pass_times total_ms={:.2} rows_per_s={:.0}",
             total * 1e3,
             u as f64 / total
+        );
+        let mut walls = Vec::new();
+        for run in 0..=PASS_TIMES_RUNS {
+            s.reset().map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            s.pass(ids, PassOut::Last, StateOut::default())
+                .map_err(|e| e.to_string())?;
+            if run > 0 {
+                walls.push(t0.elapsed().as_secs_f64());
+            }
+        }
+        s.reset().map_err(|e| e.to_string())?;
+        let wall = median(&mut walls);
+        eprintln!(
+            "pass_wall rows={u} wall_ms={:.2} ops_gpu_ms={:.2} gap_ms={:.2} gap_per_op_us={:.1}",
+            wall * 1e3,
+            total * 1e3,
+            (wall - total) * 1e3,
+            (wall - total) / n as f64 * 1e6
+        );
+        Ok(())
+    }
+
+    /// The median of `v`, which holds at least one value.
+    fn median(v: &mut [f64]) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// The fixed work around a pass, warm: one checkpoint's wall after a
+    /// pass of the first `u` ids, and the whole prompt's call from position
+    /// 0 (`Target::prompt`: its passes and its checkpoints), each the median
+    /// of `PASS_TIMES_RUNS` after a warm one. The session is reset before
+    /// each and after the last.
+    fn call_times_run(s: &mut Session, prompt: &[u32], u: usize) -> Result<(), String> {
+        let (mut takes, mut calls) = (Vec::new(), Vec::new());
+        for run in 0..=PASS_TIMES_RUNS {
+            s.reset().map_err(|e| e.to_string())?;
+            s.pass(&prompt[..u], PassOut::Last, StateOut::default())
+                .map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            s.checkpoint().map_err(|e| e.to_string())?;
+            let take = t0.elapsed().as_secs_f64();
+            s.reset().map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            Target::prompt(s, prompt, Want::Argmax).map_err(|e| e.to_string())?;
+            let call = t0.elapsed().as_secs_f64();
+            if run > 0 {
+                takes.push(take);
+                calls.push(call);
+            }
+        }
+        s.reset().map_err(|e| e.to_string())?;
+        eprintln!(
+            "call_times rows={u} checkpoint_ms={:.2} checkpoint_bytes={} prompt_ids={} prompt_warm_ms={:.2}",
+            median(&mut takes) * 1e3,
+            s.checkpoint_bytes(),
+            prompt.len(),
+            median(&mut calls) * 1e3
         );
         Ok(())
     }
@@ -744,8 +821,13 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             let decode_ms = (out.passes > 0).then(|| decode_s / out.passes as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
         }
-        if let Some(u) = a.pass_times {
-            pass_times_run(&mut session, &prompt, u)?;
+        if let Some(us) = &a.pass_times {
+            for &u in us {
+                pass_times_run(&mut session, &prompt, u)?;
+            }
+            if let Some(&u) = us.last() {
+                call_times_run(&mut session, &prompt, u)?;
+            }
         }
         if let Some(n) = a.step_times {
             let id = *out
