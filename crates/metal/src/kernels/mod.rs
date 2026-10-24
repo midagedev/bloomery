@@ -84,7 +84,7 @@ pub use seg::{SegParams, Segment};
 use bloomery_device::DeviceError;
 
 use crate::device::MetalDevice;
-use crate::library::{Library, Pipeline};
+use crate::library::{GemmPath, Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
 /// input as it loads it, the one that adds into its output, and the segmented
@@ -118,10 +118,14 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     a4: MatvecPipelines,
     /// The dense GEMM of each weight type: every epilogue and operand,
-    /// plain and segmented (`gemm.metal`).
+    /// plain and segmented (`gemm.metal`, or `gemm_tensor.metal` on the
+    /// tensor-op path).
     q4k_gemm: gemm::GemmPipelines,
     q6k_gemm: gemm::GemmPipelines,
     a4_gemm: gemm::GemmPipelines,
+    /// The program the dense and the grouped GEMMs run: the library's
+    /// [`Library::gemm_path`].
+    gemm_path: GemmPath,
     /// The gated delta net's out projection: the Q4_K entry (A4's is
     /// `headnorm_a4`; Q6_K has none).
     headnorm: Pipeline,
@@ -282,9 +286,10 @@ impl Kernels {
                 ],
                 count,
             )?,
-            q4k_gemm: gemm::GemmPipelines::new(library, "gemm_q4k")?,
-            q6k_gemm: gemm::GemmPipelines::new(library, "gemm_q6k")?,
-            a4_gemm: gemm::GemmPipelines::new(library, "gemm_a4")?,
+            q4k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q4k")?,
+            q6k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q6k")?,
+            a4_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4")?,
+            gemm_path: library.gemm_path(),
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             headnorm_a4: library.pipeline_with_simdgroups("a4_matvec_headnorm_resid", count)?,
             embed_q4k: library.pipeline("embed_q4k")?,
@@ -315,6 +320,12 @@ impl Kernels {
             // over the SIMD groups the source names.
             router_groups: router_geom::ROWS.div_ceil(router_sg),
         })
+    }
+
+    /// The program the dense and the grouped GEMMs run.
+    #[must_use]
+    pub fn gemm_path(&self) -> GemmPath {
+        self.gemm_path
     }
 
     /// The SIMD groups in a mat-vec's threadgroup.

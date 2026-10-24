@@ -22,12 +22,13 @@
 //! `--tokens` spelling, so a run's output feeds back as an input), for
 //! gates. The summary lines go to stderr, `key=value` one a line:
 //!
-//!     model=<path> open_s=<the open's wall> open_load_s=<the plan read and
-//!     the weights copied> open_rows_ms=<the rows arena allocated>
-//!     open_residency_ms=<the residency set's commit> open_pipelines_ms=<the
-//!     pipelines built> device_allocated_bytes=<the driver's live device
-//!     bytes after the open> rows_arena_bytes=<the rows arena's bytes>
-//!     prompt_ids=<count>
+//!     model=<path> gemm_path=<simdgroup|tensor: the prompt pass's GEMMs,
+//!     the device's matrix-unit rule's pick> open_s=<the open's wall>
+//!     open_load_s=<the plan read and the weights copied> open_rows_ms=<the
+//!     rows arena allocated> open_residency_ms=<the residency set's commit>
+//!     open_pipelines_ms=<the pipelines built> device_allocated_bytes=<the
+//!     driver's live device bytes after the open> rows_arena_bytes=<the rows
+//!     arena's bytes> prompt_ids=<count>
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
 //!     decode_passes=<count> decode_s=<the loop's wall> decode_tok_s=<rate>
 //!     stop=<eog|length|ctx> decode_first_ms=<the loop's first pass>
@@ -789,6 +790,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let decode_s = out.decode_wall.as_secs_f64();
         eprintln!("# development-loop numbers: no lease, no witness");
         eprintln!("model={}", a.model.display());
+        eprintln!("gemm_path={}", device.library().gemm_path().name());
         eprintln!("open_s={open_s:.3}");
         let split = session.open_split();
         eprintln!("open_load_s={:.3}", split.load.as_secs_f64());
