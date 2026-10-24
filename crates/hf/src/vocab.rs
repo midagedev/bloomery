@@ -323,40 +323,24 @@ pub struct Keys {
     pub stop: Vec<u32>,
 }
 
-/// The `tokenizer.*` keys of the repo at `dir`.
-///
-/// # Errors
-///
-/// A file that cannot be read or parsed; in `tokenizer.json`, its `model`, an added token,
-/// `tokenizer_config.json` or `generation_config.json`, a key the tables of this module do not
-/// name or a value they do not allow; a `tokenizer.json` without its vocabulary or merges, or with
-/// a merge that is not two tokens without a space whose operands and joined token are all in its
-/// vocabulary; an added token whose id or content conflicts, or whose proper suffix
-/// starts another added token; a token spelled as an unused id's `[PAD<id>]`; a vocabulary size
-/// `config.json` does not give; a special token in `tokenizer_config.json` that is neither a
-/// string nor an added token's object, or that no added token spells; a special token id that is
-/// not an id or a list of them, lies outside the vocabulary, or is a BOS, pad, unknown or
-/// separator id other than the one exported; an `add_bos_token` or `add_eos_token` that is not
-/// boolean, and a `chat_template` that is not a string, each by name.
-pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
+/// A tokenizer's vocabulary as the GGUF keys spell it: every id's token and type, the merges in
+/// HF's rank order, and the added tokens by id (content, special).
+struct Vocabulary<'a> {
+    tokens: Vec<Value>,
+    types: Vec<Value>,
+    merges: Vec<Value>,
+    added: HashMap<u32, (&'a str, bool)>,
+}
+
+/// The vocabulary of `tokenizer.json` (`model` its `model`), its added tokens checked against
+/// `tokenizer_config.json` (`tc`), and its merges.
+fn vocabulary<'a>(
+    model: &'a Json,
+    tok: &'a Json,
+    tc: &Json,
+    config: &Config,
+) -> Result<Vocabulary<'a>, Error> {
     let bad = |what: String| Error::Vocab(what);
-    let read = |file: &str| crate::read_json(dir, file, Error::Io, Error::Json);
-    let tok = read("tokenizer.json")?.ok_or_else(|| bad("no tokenizer.json".into()))?;
-    let tc = read("tokenizer_config.json")?.unwrap_or_else(|| serde_json::json!({}));
-    let generation = read("generation_config.json")?.unwrap_or_else(|| serde_json::json!({}));
-    for (file, value, table) in [
-        ("tokenizer.json", &tok, TOKENIZER),
-        ("tokenizer_config.json", &tc, TOKENIZER_CONFIG),
-        ("generation_config.json", &generation, GENERATION),
-    ] {
-        schema::check(value, file, &[table]).map_err(bad)?;
-    }
-    let model = tok
-        .get("model")
-        .ok_or_else(|| bad("tokenizer.json has no model".into()))?;
-    schema::check(model, "model", &[MODEL]).map_err(bad)?;
-    let size = config.size;
-    let nfc = tok["normalizer"] == serde_json::json!({"type":"NFC"});
     let vocab = model["vocab"]
         .as_object()
         .ok_or_else(|| bad("tokenizer.json has no model.vocab".into()))?;
@@ -449,7 +433,7 @@ pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
         }
     }
     let (mut tokens, mut types) = (Vec::new(), Vec::new());
-    for id in 0..size {
+    for id in 0..config.size {
         let (t, ty) = match (by_id.get(&id), added.get(&id)) {
             (None, _) => {
                 let pad = format!("[PAD{id}]");
@@ -501,25 +485,28 @@ pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
         .filter(|(i, p)| last[p] == *i)
         .map(|(_, (a, b))| Value::String(format!("{a} {b}")))
         .collect();
-    let mut out = vec![
-        (
-            "tokenizer.ggml.model".to_string(),
-            Value::String("gpt2".into()),
-        ),
-        (
-            "tokenizer.ggml.pre".to_string(),
-            Value::String("qwen35".into()),
-        ),
-        ("tokenizer.ggml.tokens".to_string(), Value::Array(tokens)),
-        ("tokenizer.ggml.token_type".to_string(), Value::Array(types)),
-        ("tokenizer.ggml.merges".to_string(), Value::Array(merges)),
-    ];
-    if nfc {
-        out.push((
-            "tokenizer.ggml.normalizer".into(),
-            Value::String("NFC".into()),
-        ));
-    }
+    Ok(Vocabulary {
+        tokens,
+        types,
+        merges,
+        added,
+    })
+}
+
+/// [`special_ids`]: the `tokenizer.ggml.<kind>_token_id` keys and the generation stop ids.
+type SpecialIds = (Vec<(String, Value)>, Option<Vec<u32>>);
+
+/// The special ids the keys export, as `tokenizer.ggml.<kind>_token_id` keys, and the
+/// generation stop ids: each kind's token named in `tokenizer_config.json` (`tc`), else
+/// `config.json`'s id, else `generation_config.json`'s.
+fn special_ids(
+    tc: &Json,
+    generation: &Json,
+    config: &Config,
+    added: &HashMap<u32, (&str, bool)>,
+) -> Result<SpecialIds, Error> {
+    let bad = |what: String| Error::Vocab(what);
+    let mut ids = Vec::new();
     let mut stop = None;
     for (i, (kind, key)) in SPECIAL.iter().enumerate() {
         let named = match &tc[format!("{kind}_token")] {
@@ -567,9 +554,72 @@ pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
             )));
         }
         if let Some(id) = id {
-            out.push((format!("tokenizer.ggml.{key}"), Value::U32(id)));
+            ids.push((format!("tokenizer.ggml.{key}"), Value::U32(id)));
         }
     }
+    Ok((ids, stop))
+}
+
+/// The `tokenizer.*` keys of the repo at `dir`.
+///
+/// # Errors
+///
+/// A file that cannot be read or parsed; in `tokenizer.json`, its `model`, an added token,
+/// `tokenizer_config.json` or `generation_config.json`, a key the tables of this module do not
+/// name or a value they do not allow; a `tokenizer.json` without its vocabulary or merges, or with
+/// a merge that is not two tokens without a space whose operands and joined token are all in its
+/// vocabulary; an added token whose id or content conflicts, or whose proper suffix
+/// starts another added token; a token spelled as an unused id's `[PAD<id>]`; a vocabulary size
+/// `config.json` does not give; a special token in `tokenizer_config.json` that is neither a
+/// string nor an added token's object, or that no added token spells; a special token id that is
+/// not an id or a list of them, lies outside the vocabulary, or is a BOS, pad, unknown or
+/// separator id other than the one exported; an `add_bos_token` or `add_eos_token` that is not
+/// boolean, and a `chat_template` that is not a string, each by name.
+pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
+    let bad = |what: String| Error::Vocab(what);
+    let read = |file: &str| crate::read_json(dir, file, Error::Io, Error::Json);
+    let tok = read("tokenizer.json")?.ok_or_else(|| bad("no tokenizer.json".into()))?;
+    let tc = read("tokenizer_config.json")?.unwrap_or_else(|| serde_json::json!({}));
+    let generation = read("generation_config.json")?.unwrap_or_else(|| serde_json::json!({}));
+    for (file, value, table) in [
+        ("tokenizer.json", &tok, TOKENIZER),
+        ("tokenizer_config.json", &tc, TOKENIZER_CONFIG),
+        ("generation_config.json", &generation, GENERATION),
+    ] {
+        schema::check(value, file, &[table]).map_err(bad)?;
+    }
+    let model = tok
+        .get("model")
+        .ok_or_else(|| bad("tokenizer.json has no model".into()))?;
+    schema::check(model, "model", &[MODEL]).map_err(bad)?;
+    let nfc = tok["normalizer"] == serde_json::json!({"type":"NFC"});
+    let Vocabulary {
+        tokens,
+        types,
+        merges,
+        added,
+    } = vocabulary(model, &tok, &tc, config)?;
+    let mut out = vec![
+        (
+            "tokenizer.ggml.model".to_string(),
+            Value::String("gpt2".into()),
+        ),
+        (
+            "tokenizer.ggml.pre".to_string(),
+            Value::String("qwen35".into()),
+        ),
+        ("tokenizer.ggml.tokens".to_string(), Value::Array(tokens)),
+        ("tokenizer.ggml.token_type".to_string(), Value::Array(types)),
+        ("tokenizer.ggml.merges".to_string(), Value::Array(merges)),
+    ];
+    if nfc {
+        out.push((
+            "tokenizer.ggml.normalizer".into(),
+            Value::String("NFC".into()),
+        ));
+    }
+    let (ids, stop) = special_ids(&tc, &generation, config, &added)?;
+    out.extend(ids);
     for kind in ["bos", "eos"] {
         let key = format!("add_{kind}_token");
         let b = match tc.get(&key).filter(|v| !v.is_null()) {
