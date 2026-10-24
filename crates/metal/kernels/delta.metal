@@ -915,7 +915,9 @@ kernel void gdn_ring_snap(device const float *x [[buffer(0)]],
         return;
     }
     uint last = args.pos + snaps.after[k];
-    uint back = (last + (uint)BLOOMERY_DELTA_RING_ROWS - s) % (uint)BLOOMERY_DELTA_RING_ROWS;
+    // The slot's distance back from `last`, reduced first so no position wraps.
+    uint back = (last % (uint)BLOOMERY_DELTA_RING_ROWS + (uint)BLOOMERY_DELTA_RING_ROWS - s)
+                % (uint)BLOOMERY_DELTA_RING_ROWS;
     float v = ring[s * args.ch + c];
     if (back <= last && last - back >= args.pos) {
         v = x[(last - back - args.pos) * args.x_stride + c];
