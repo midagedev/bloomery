@@ -21,8 +21,10 @@
 //! the server marks inside it (`Target::prompt_marked`: a copy the pass
 //! leaves at that row, the call uncut) and at its end. Any other prefix runs
 //! from position 0. A prompt span of more than a step's window runs in passes
-//! of up to `Session::pass_rows` ids, a shorter one a host-fed step an id. No
-//! prompt cache, no slot files, no image input.
+//! of up to `Session::pass_rows` ids, a shorter one a host-fed step an id. The
+//! session opens the copies a marked pass leaves with its rows arena
+//! (`MarkCopies::AtOpen`), so the first request pays nothing the later ones
+//! do not. No prompt cache, no slot files, no image input.
 //!
 //! A bad flag or value is a named error and exit 64; a refusal of the file,
 //! the device or the session is a named error and exit 1; an engine failure
@@ -42,7 +44,7 @@ mod cli {
     use std::time::Instant;
 
     use bloomery_metal::MetalDevice;
-    use bloomery_metal::arch::qwen3moe::session::Session;
+    use bloomery_metal::arch::qwen3moe::session::{CHECKPOINT_EVERY, MarkCopies, Session};
     use bloomery_metal::server::TargetEngine;
     use serve::flag::{self, ApiKeys};
     use serve::sampling::sampler_factory;
@@ -163,8 +165,15 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
         let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
         let device = MetalDevice::open().map_err(|e| e.to_string())?;
         let t0 = Instant::now();
-        let session =
-            Session::open(&device, device.library(), path, ctx).map_err(|e| e.to_string())?;
+        let session = Session::open_as(
+            &device,
+            device.library(),
+            path,
+            ctx,
+            CHECKPOINT_EVERY,
+            MarkCopies::AtOpen,
+        )
+        .map_err(|e| e.to_string())?;
         eprintln!(
             "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}, checkpoints every {} ({} bytes a point, capacity {})",
             path.display(),

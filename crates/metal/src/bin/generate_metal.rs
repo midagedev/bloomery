@@ -22,8 +22,12 @@
 //! `--tokens` spelling, so a run's output feeds back as an input), for
 //! gates. The summary lines go to stderr, `key=value` one a line:
 //!
-//!     model=<path> open_s=<the open's wall> device_allocated_bytes=<the
-//!     driver's live device bytes after the open> prompt_ids=<count>
+//!     model=<path> open_s=<the open's wall> open_load_s=<the plan read and
+//!     the weights copied> open_rows_ms=<the rows arena allocated>
+//!     open_residency_ms=<the residency set's commit> open_pipelines_ms=<the
+//!     pipelines built> device_allocated_bytes=<the driver's live device
+//!     bytes after the open> rows_arena_bytes=<the rows arena's bytes>
+//!     prompt_ids=<count>
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
 //!     decode_passes=<count> decode_s=<the loop's wall> decode_tok_s=<rate>
 //!     stop=<eog|length|ctx> decode_first_ms=<the loop's first pass>
@@ -42,8 +46,8 @@
 //!
 //! `--prefill steps` feeds the prompt a decode step an id, the same-binary arm
 //! of the default (`batch`: the prompt in passes of up to
-//! [`Session::pass_rows`] ids, a short one by steps); the summary prints the
-//! rows arena's bytes (`rows_arena_bytes`) once a pass has opened it.
+//! [`Session::pass_rows`] ids, a short one by steps). The session opens its
+//! rows arena either way.
 //!
 //! `--profile [N]` (default N 32; `--profile-layers` implies it) steps N
 //! more tokens after the summary, each group of each token on a command
@@ -786,12 +790,21 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         eprintln!("# development-loop numbers: no lease, no witness");
         eprintln!("model={}", a.model.display());
         eprintln!("open_s={open_s:.3}");
+        let split = session.open_split();
+        eprintln!("open_load_s={:.3}", split.load.as_secs_f64());
+        eprintln!("open_rows_ms={:.2}", split.rows.as_secs_f64() * 1e3);
+        eprintln!(
+            "open_residency_ms={:.2}",
+            split.residency.as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "open_pipelines_ms={:.2}",
+            split.pipelines.as_secs_f64() * 1e3
+        );
         eprintln!("device_allocated_bytes={allocated}");
         let resident = session.residency();
         eprintln!("resident_bytes={}", resident.bytes);
-        if let Some(bytes) = session.rows_arena_bytes() {
-            eprintln!("rows_arena_bytes={bytes}");
-        }
+        eprintln!("rows_arena_bytes={}", session.rows_arena_bytes());
         eprintln!("prompt_ids={}", prompt.len());
         eprintln!("prompt_s={prompt_s:.3}");
         eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
