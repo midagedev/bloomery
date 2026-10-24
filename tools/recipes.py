@@ -6891,7 +6891,10 @@ def cmd_combos(args: argparse.Namespace) -> int:
 # The recipes whose cargo test calls count as running a test. A lab-* recipe is a lab crate's own test
 # runner (AGENTS.md: `just lab-engram`); it is left out of landing batches, not out of this count.
 TEST_RUNNERS = ("gate-", "lab-")
-# The box's target, x86_64-unknown-linux-gnu, where every gate-* recipe runs; any other key is unknown.
+# The box's target, x86_64-unknown-linux-gnu, where every gate-* recipe runs; any other key is unknown. A recipe
+# that runs tools/mac-gate.sh (MAC_GATE) runs on an Apple Silicon Mac instead, so its tests are read under the
+# Mac's keys (_MAC_CFG_KEYS).
+MAC_GATE = "tools/mac-gate.sh"
 _BOX_CFG_KEYS = {
     "target_arch": "x86_64",
     "target_os": "linux",
@@ -7274,12 +7277,13 @@ class TestRun:
     recipe: str
     features: set[str] | None  # None: a feature from a recipe parameter, known only at run time
     args: LibtestArgs
+    mac: bool = False  # the recipe runs MAC_GATE: its tests run on the Mac, under the Mac's cfg
 
 
 def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ...] = TEST_RUNNERS) -> tuple[list[str], list[str], int]:
     """(orphans, errors, tests checked): every `#[test]` of every workspace target that no cargo test call of
-    a recipe named with `prefixes` runs on the box, one `path:line name — why` line each; and every input
-    it cannot decide, by file and line."""
+    a recipe named with `prefixes` runs where the recipe runs (the box, or the Mac for a recipe that runs
+    MAC_GATE), one `path:line name — why` line each; and every input it cannot decide, by file and line."""
     runs: dict[tuple[str, str, str | None], list[TestRun]] = {}
     errors: list[str] = []
     for rname in sorted(recipes, key=lambda n: (recipes[n].line, n)):
@@ -7290,6 +7294,7 @@ def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ..
         except RecipeError as err:
             errors.append(f"justfile:{recipes[rname].line} {rname}: {err}")
             continue
+        mac = any(MAC_GATE in line for line in recipes[rname].lines)
         for inv in invocations:
             if inv.sub != "test":
                 continue
@@ -7309,7 +7314,7 @@ def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ..
                     # doctests are not #[test] fns; an example's or a bench's tests run only with `test = true`
                     continue
                 enabled = None if param else tree.feature_closure(tree.packages[pname], feats, not inv.no_default, inv.all_features)[0]
-                runs.setdefault(key, []).append(TestRun(rname, enabled, args))
+                runs.setdefault(key, []).append(TestRun(rname, enabled, args, mac))
     scan = TestScan(tree)
     orphans: list[str] = []
     checked = 0
@@ -7332,7 +7337,8 @@ def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ..
                 for run in cands:
                     bad = None
                     for f, ln, text, pred in item.cfgs:
-                        v = eval_cfg(pred, True, _BOX_CFG_KEYS, _BOX_CFG_NAMES, run.features)
+                        keys, names = (_MAC_CFG_KEYS, _MAC_CFG_NAMES) if run.mac else (_BOX_CFG_KEYS, _BOX_CFG_NAMES)
+                        v = eval_cfg(pred, True, keys, names, run.features)
                         if v is None:
                             unknown.append(f"cfg({text}) at {f}:{ln} under {run.recipe}")
                             bad = "?"
@@ -10386,6 +10392,11 @@ def orphan_self_test(expect, real: Side) -> None:
         expect(any("p/src/lib.rs:12 feat::t" in o and 'cfg(feature = "f") at p/src/lib.rs:9 is false' in o for o in orphans), f"orphan scan: feat::t's line {orphans}")
         expect(any(o.startswith("p/tests/it.rs:3 integ — p test it: no gate-* or lab-* recipe") for o in orphans), f"orphan scan: a check-* recipe counted as a runner {orphans}")
         expect(checked == 11, f"orphan scan: {checked} tests checked, not 11")
+        # a recipe that runs MAC_GATE runs its tests on the Mac: the macOS module's test is run there, and the
+        # feature-gated one stays an orphan
+        mac_rs = dict(rs, **{"lab-p": Recipe("lab-p", [f"cargo test -p p --lib && ./{MAC_GATE} gate_p"], [], "")})
+        mac_names = sorted(o.split(" ")[1] for o in orphan_tests(st, mac_rs)[0])
+        expect(mac_names == ["common::shared", "feat::t", "integ"], f"orphan scan: a {MAC_GATE} recipe's run, orphans {mac_names}")
         for where, why in [
             ("q/src/lib.rs:1:", "cfg_attr"),
             ("q/src/lib.rs:6:", "macro_rules! mk"),
