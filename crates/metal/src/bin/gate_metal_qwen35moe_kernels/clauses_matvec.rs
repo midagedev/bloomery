@@ -542,14 +542,6 @@ pub fn block_shape() -> Clause {
 /// group owns replaced by `rows`: the probe sweeps the same edit, and the
 /// clause holds the sweep's arithmetic still.
 /// The weight type's ggml name, for the fixture's readers.
-fn ty(quant: Quant) -> GgmlType {
-    match quant {
-        Quant::Q4K => GgmlType::Q4_K,
-        Quant::Q6K => GgmlType::Q6_K,
-        Quant::A4 => GgmlType::MLX_A4,
-    }
-}
-
 /// The kernels compiled from the shipped source with the row count a SIMD
 /// group owns replaced by `rows`: the probe sweeps the same edit, and the
 /// clause holds the sweep's arithmetic still.
@@ -593,7 +585,7 @@ pub fn nrows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         ("blk.2.attn_qkv.weight", Quant::Q6K, 2048, 8192),
         ("blk.2.ffn_down_shexp.weight", Quant::Q6K, 512, 2048),
     ] {
-        let bytes = fixture.rows(name, ty(quant), cols, rows)?;
+        let bytes = fixture.rows(name, quant.ggml(), cols, rows)?;
         let x = oracle::activations(cols, 0x5EB, 1.0);
         let many = h.matvec(&Launch {
             quant,

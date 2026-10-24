@@ -237,16 +237,6 @@ struct SharedShapes {
     moe: Option<(usize, usize)>,
 }
 
-/// The launch quant of file type `ty`, or `None` for a type no mat-vec runs.
-fn quant_of(ty: GgmlType) -> Option<Quant> {
-    match ty {
-        GgmlType::Q4_K => Some(Quant::Q4K),
-        GgmlType::Q6_K => Some(Quant::Q6K),
-        GgmlType::MLX_A4 => Some(Quant::A4),
-        _ => None,
-    }
-}
-
 /// The file's tensors, copied into buffers on `device`.
 struct Loader<'a> {
     device: &'a ProtocolObject<dyn MTLDevice>,
@@ -338,7 +328,7 @@ impl Loader<'_> {
                 "{name} is {dims:?}; the step reads {rows} rows of {cols}"
             )));
         }
-        let quant = quant_of(ty).ok_or_else(|| {
+        let quant = Quant::of_ggml(ty).ok_or_else(|| {
             refuse(format!(
                 "{name} is {ty:?}, which no mat-vec of this backend runs (Q4_K, Q6_K, MLX_A4)"
             ))
@@ -1150,10 +1140,10 @@ mod tests {
     use chain::arch::qwen3moe::plan::SiteTy;
     use chain::site::BACKEND_SITES;
 
-    use super::quant_of;
     use crate::arch::qwen3moe::session::LAUNCHED;
+    use crate::kernels::Quant;
 
-    /// The session's site list and the arena's quant set name the same
+    /// The session's site list and the mat-vecs' quant set name the same
     /// families, over the card's families and the backends' rows: a family
     /// the plan admits has a launch, and a launch the plan never admits is
     /// dead.
@@ -1166,8 +1156,8 @@ mod tests {
         for s in families {
             assert_eq!(
                 LAUNCHED.contains(&s),
-                quant_of(s.ggml()).is_some(),
-                "{s:?}: the session's LAUNCHED and the arena's quant_of disagree"
+                Quant::of_ggml(s.ggml()).is_some(),
+                "{s:?}: the session's LAUNCHED and Quant::of_ggml disagree"
             );
         }
     }

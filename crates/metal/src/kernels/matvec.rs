@@ -32,6 +32,16 @@ impl Quant {
         .expect("a block size fits usize")
     }
 
+    /// Every type a mat-vec reads.
+    pub const ALL: [Quant; 3] = [Self::Q4K, Self::Q6K, Self::A4];
+
+    /// The kernel type that reads file type `ty`, or `None` for a type no
+    /// mat-vec reads: [`Quant::ggml`] read backwards, the one map.
+    #[must_use]
+    pub fn of_ggml(ty: gguf::quant::GgmlType) -> Option<Quant> {
+        Self::ALL.into_iter().find(|q| q.ggml() == ty)
+    }
+
     /// The GGUF type this kernel reads.
     #[must_use]
     pub const fn ggml(self) -> gguf::quant::GgmlType {

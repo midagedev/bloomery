@@ -73,8 +73,9 @@ const WHAT: &str = "qwen35moe session";
 /// cut between points re-feeds at most 255 positions.
 pub const CHECKPOINT_EVERY: u32 = 256;
 
-/// The site types Metal's mat-vecs launch: the arena's quant set (`arena`'s
-/// `quant_of`, held equal to this list by its test) as families — Q4_K, Q6_K
+/// The site types Metal's mat-vecs launch: the kernels' quant set
+/// ([`Quant::of_ggml`](crate::kernels::Quant::of_ggml), held equal to this
+/// list by `arena`'s test) as families — Q4_K, Q6_K
 /// and MLX_A4, the A4 kernels' affine 4-bit groups. The F32 tensors a session
 /// reads as values (the norms, the conv, the dt bias, `ssm_a`) and the
 /// router's MLX_A8, which its loader dequantizes exactly at open, are no

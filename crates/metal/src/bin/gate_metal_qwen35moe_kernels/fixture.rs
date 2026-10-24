@@ -60,7 +60,8 @@ impl Fixture {
             ));
         }
         let all = self.data(shard, t, name)?;
-        let row_bytes = cols / values_per_block(ty)? * quant_block_bytes(ty)?;
+        let q = quant(ty)?;
+        let row_bytes = cols / q.values_per_block() * q.block_bytes();
         Ok(&all[..rows * row_bytes])
     }
 
@@ -74,7 +75,8 @@ impl Fixture {
         rows: usize,
     ) -> Result<&[u8], String> {
         let all = self.rows(name, ty, cols, at + rows)?;
-        let row_bytes = cols / values_per_block(ty)? * quant_block_bytes(ty)?;
+        let q = quant(ty)?;
+        let row_bytes = cols / q.values_per_block() * q.block_bytes();
         Ok(&all[at * row_bytes..])
     }
 
@@ -88,12 +90,13 @@ impl Fixture {
         expert: usize,
     ) -> Result<&[u8], String> {
         let (shard, t) = self.tensor(name)?;
+        let q = quant(ty)?;
         if t.ty != ty
             || t.dims.len() != 3
             || t.dims[0] != cols as u64
             || t.dims[1] != rows as u64
             || expert as u64 >= t.dims[2]
-            || !cols.is_multiple_of(values_per_block(ty)?)
+            || !cols.is_multiple_of(q.values_per_block())
         {
             return Err(format!(
                 "{name} is {:?} {:?}, the gate reads {ty:?} expert {expert} of {cols} columns by {rows} rows",
@@ -101,7 +104,7 @@ impl Fixture {
             ));
         }
         let all = self.data(shard, t, name)?;
-        let row_bytes = cols / values_per_block(ty)? * quant_block_bytes(ty)?;
+        let row_bytes = cols / q.values_per_block() * q.block_bytes();
         let one = rows * row_bytes;
         let start = expert * one;
         let end = start + one;
@@ -156,20 +159,8 @@ impl Fixture {
     }
 }
 
-/// The values one block of `ty` holds, in the mat-vec types the gate reads.
-fn values_per_block(ty: GgmlType) -> Result<usize, String> {
-    match ty {
-        GgmlType::Q4_K | GgmlType::Q6_K => Ok(256),
-        GgmlType::MLX_A4 => Ok(64),
-        other => Err(format!("{other:?} is not a mat-vec type")),
-    }
-}
-
-fn quant_block_bytes(ty: GgmlType) -> Result<usize, String> {
-    match ty {
-        GgmlType::Q4_K => Ok(Quant::Q4K.block_bytes()),
-        GgmlType::Q6_K => Ok(Quant::Q6K.block_bytes()),
-        GgmlType::MLX_A4 => Ok(Quant::A4.block_bytes()),
-        other => Err(format!("{other:?} is not a mat-vec type")),
-    }
+/// The mat-vec type that reads `ty`: its block's values and bytes are the
+/// kernels' own.
+fn quant(ty: GgmlType) -> Result<Quant, String> {
+    Quant::of_ggml(ty).ok_or_else(|| format!("{ty:?} is not a mat-vec type"))
 }
