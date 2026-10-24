@@ -115,7 +115,7 @@ pub const QROWS: &[QRow] = &[
            card: card!(-             -             Iq3s    (Iq3s, Q8Act)       Iq3s   -       -    -) },
     QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K,
-           card: card!(-             -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  -       -    -) },
+           card: card!(KQuant        -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  Iq4xs  -    -) },
     // The C scalars: ggml.c:621-649.
     QRow { ty: T::I8, name: "i8", blck: 1, bytes: 1, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::I16, name: "i16", blck: 1, bytes: 2, dequant: false, host_act: H::None, card: Card::NONE },

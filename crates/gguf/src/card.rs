@@ -255,6 +255,9 @@ pub enum SiteEntry {
     /// `Q8F32Kernels::enqueue_bf16_gemv` over BF16 words and f32 rows;
     /// wide, `Q8F32Kernels::enqueue_bf16_tile` over the same words and rows.
     Bf16,
+    /// `QuantSelKernels::enqueue_gemv_sel` over one matrix in the file's
+    /// IQ4_XS blocks and `Q8Act` columns; wide, the grouped IQ4_XS GEMM.
+    Iq4xs,
 }
 
 /// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
@@ -281,7 +284,11 @@ impl SiteEntry {
     #[must_use]
     pub const fn reads(self) -> SiteAct {
         match self {
-            SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k => SiteAct::Q8x128,
+            SiteEntry::Q3k
+            | SiteEntry::Q4k
+            | SiteEntry::Q5k
+            | SiteEntry::Q6k
+            | SiteEntry::Iq4xs => SiteAct::Q8x128,
             SiteEntry::Q8_0 => SiteAct::Q8x32,
             SiteEntry::F32 => SiteAct::F32,
             SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
@@ -300,7 +307,7 @@ impl SiteEntry {
 }
 
 /// One past the last [`SiteEntry`]: the span [`DENSE_TYPE`] covers.
-const DENSE_SPAN: usize = SiteEntry::Bf16 as usize + 1;
+const DENSE_SPAN: usize = SiteEntry::Iq4xs as usize + 1;
 
 /// Dense entry to the file type of the row that names it. The build refuses
 /// an entry two rows name, an entry no row names, and an entry past

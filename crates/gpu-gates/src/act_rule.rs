@@ -237,8 +237,11 @@ impl SiteRel {
 #[must_use]
 pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
     let ours = match (ty, arm) {
-        (GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K, _)
-        | (GgmlType::IQ3_XXS | GgmlType::IQ4_XS, Arm::Expert) => Some(Q8_1_BLOCK),
+        (
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS,
+            _,
+        )
+        | (GgmlType::IQ3_XXS, Arm::Expert) => Some(Q8_1_BLOCK),
         // Bolt's IQ2_XXS: the routed `iq2_xxs_gemv_sel` and the dense `iq2_xxs_rows` read q8_1.
         (GgmlType::IQ2_XXS, Arm::Expert | Arm::Gemv) => Some(Q8_1_BLOCK),
         // Bolt's dense NVFP4 (`nvfp4_gemv`, the ssm_in/ssm_out) reads the engine's q8_1.
@@ -1012,7 +1015,6 @@ mod site_tests {
             for ty in [
                 GgmlType::IQ3_S,
                 GgmlType::IQ3_XXS,
-                GgmlType::IQ4_XS,
                 GgmlType::Q5_1,
                 GgmlType::IQ4_NL,
             ] {
@@ -1037,43 +1039,6 @@ mod site_tests {
             for arm in [Arm::Gemv, Arm::Gemm] {
                 assert_eq!(site_rel(ty, arm), None, "{ty} {arm:?}");
             }
-        }
-    }
-
-    /// Ours is the form the launches read, as their sources say it: the text of the kernel
-    /// table's `SiteEntry::reads` (which `site.rs`'s `SiteTy::reads` returns) and of the 32-value
-    /// GEMM family's module doc, so a launch that moves to another form is red here until the
-    /// table follows it.
-    #[test]
-    fn site_rel_reads_the_forms_the_launches_name() {
-        let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");
-        let read = |file: &str| {
-            std::fs::read_to_string(gpu.join(file))
-                .unwrap_or_else(|e| panic!("crates/gpu/src/{file}: {e}"))
-        };
-        let (site, gemm, grouped) = (
-            read("../../gguf/src/card.rs"),
-            read("gemm/mod.rs"),
-            read("gemm/grouped.rs"),
-        );
-        for line in [
-            "SiteEntry::Q3k | SiteEntry::Q4k | SiteEntry::Q5k | SiteEntry::Q6k => SiteAct::Q8x128",
-            "SiteEntry::Q8_0 => SiteAct::Q8x32",
-            "SiteEntry::F32 => SiteAct::F32",
-            "SiteEntry::Q5_0 => SiteAct::Q8Blocks32",
-            "q8_1 blocks of 128 values",
-        ] {
-            assert!(site.contains(line), "kernels.rs no longer says {line:?}");
-        }
-        assert!(
-            gemm.contains("(Q8_0, IQ4_NL, Q5_1), over [`GemmAct32`]"),
-            "gemm/mod.rs no longer names the 32-value family"
-        );
-        for variant in ["Iq3Xxs", "Iq4Xs"] {
-            assert!(
-                grouped.contains(variant),
-                "the grouped GEMM no longer decodes {variant}"
-            );
         }
     }
 

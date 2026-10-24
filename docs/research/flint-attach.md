@@ -66,6 +66,31 @@ Each device slice needs its numerical/fault gates and the maintainer's offered h
 Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
 existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
+### Ordinary IQ4_XS shared-site implementation
+
+IQ4_XS now has an ordinary file-layout/dense entry in QROWS and a common site family.
+The loader keeps its original block words; `site::kgemv` uses the existing IQ4_XS
+entry over one matrix and `site::gemm` uses the existing grouped GEMM. The common
+gated block selects a split gate/up and sizes the down's q8_1 scratch from the
+actual activation form. Its column walk and the shared wide-prompt owner use
+those same sites. IQ4_XS is not relabeled as a routed expert or requantized.
+
+A compiled public `file_site` consumer on the pinned header refused all three
+layer42 shared matrices before this change and accepts their IQ4_XS/Q8x128
+bindings after it. This reads no payload and proves neither loading nor arithmetic.
+`hw_iq4_shared_loads_and_runs_narrow_columns_and_wide_replay`, owned by
+`gate-gpu-ds41-lib`, covers real packed-weight loading, unequal matrix widths,
+one/eight-column block execution and the wide-prompt transition/captured replay.
+Its nonnegative constant-weight case derives a scalar floating-operation bound;
+it is not a whole-model accuracy pin. The hardware case has not been run here.
+
+Existing program-specific admission remains unchanged: in particular the legacy
+Qwen projection/shared dispatch does not gain this site automatically. Flint
+still has no Program, attention/router binding, body or serve seat. Run the new
+consumer gate and the affected regressions on NVIDIA before claiming device
+support; reconcile full-model coverage only with the actual body integration.
+
+
 
 ## 1. Sources and observed artifact
 

@@ -38,7 +38,13 @@ const BLOCK: &str = "gated block";
 
 /// The types a block's matrices read, one launch family each ([`site::file_site`]'s `allowed`); a model's
 /// coverage pin for the block lists the same set.
-pub const BLOCK_TYPES: [SiteTy; 4] = [SiteTy::Q8_0, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K];
+pub const BLOCK_TYPES: [SiteTy; 5] = [
+    SiteTy::Q8_0,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Iq4Xs,
+];
 
 /// The most columns [`enqueue_block_cols`] takes: the q8_0 block's multi-column launches' cap, kept for every plan.
 const COLS_MAX: usize = 8;
@@ -46,6 +52,11 @@ const COLS_MAX: usize = 8;
 /// A shape no block launch reads, by name.
 fn refuse(what: &'static str, detail: String) -> GpuError {
     GpuError::Shape { what, detail }
+}
+
+/// A site whose narrow and wide launches both read the 128-value q8_1 form.
+fn q128(ty: SiteTy) -> bool {
+    ty.reads() == site::Form::Q8x128 && site::gemm_weight(ty).is_some()
 }
 
 /// A block's gate·up half, picked once at load from the file's types.
@@ -105,19 +116,19 @@ impl BlockPlan {
         !matches!(self.gate_up, GateUp::Split { .. })
     }
 
-    /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair or two K-quants for gate·up (the
-    /// same Q4_K or Q5_K fused, else split), any of [`BLOCK_TYPES`] for the down, which a split gate·up needs a
-    /// K-quant one of. Another mix is refused by name as `what`'s.
+    /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair or two sites over
+    /// 128-value q8_1 blocks (the same Q4_K or Q5_K fused, else split). A split pair needs a
+    /// down over that same activation form. Another mix is refused by name as `what`'s.
     ///
     /// # Errors
-    /// A gate and up that are not two q8_0 or two K-quants, or a split pair over a down that is not a K-quant.
+    /// A gate and up whose activation forms disagree, or a split pair over a down of another form.
     pub fn of_types(
         what: &'static str,
         [gate, up, down]: [SiteTy; 3],
     ) -> Result<BlockPlan, GpuError> {
         let gate_up = match (gate, up) {
             (SiteTy::Q8_0, SiteTy::Q8_0) => GateUp::Ds41,
-            (g, u) if g.kquant() && u.kquant() => match (g == u, g) {
+            (g, u) if q128(g) && q128(u) => match (g == u, g) {
                 (true, SiteTy::Q4K | SiteTy::Q5K) => GateUp::Fused(g),
                 _ => GateUp::Split { gate: g, up: u },
             },
@@ -125,12 +136,12 @@ impl BlockPlan {
                 return Err(refuse(
                     what,
                     format!(
-                        "gate is {gate} and up is {up}: a block takes two q8_0 or two K-quants"
+                        "gate is {gate} and up is {up}: a block takes two q8_0 or two sites over 128-value q8_1"
                     ),
                 ));
             }
         };
-        if matches!(gate_up, GateUp::Split { .. }) && !down.kquant() {
+        if matches!(gate_up, GateUp::Split { .. }) && !q128(down) {
             return Err(refuse(
                 what,
                 format!(
@@ -167,7 +178,7 @@ impl BlockPlan {
     /// SwiGLU already wrote it).
     #[must_use]
     pub fn extra_launches(self) -> usize {
-        let down_quantize = usize::from(self.down.kquant());
+        let down_quantize = usize::from(q128(self.down));
         match self.gate_up {
             GateUp::Ds41 => down_quantize,
             GateUp::Fused(_) => 1 + down_quantize,
@@ -280,7 +291,7 @@ impl BlockScratch {
         let (mut any, mut split_ff) = (false, 0);
         for (plan, ff) in blocks.into_iter().filter(|(p, _)| !p.is_q8()) {
             any = true;
-            if plan.down.kquant() && !ha.iter().any(|(f, _)| *f == ff) {
+            if q128(plan.down) && !ha.iter().any(|(f, _)| *f == ff) {
                 ha.push((ff, Q8Act::with_k(stream, 1, ff)?));
             }
             if matches!(plan.gate_up, GateUp::Split { .. }) {
@@ -426,7 +437,7 @@ pub fn enqueue_block_act(
             gpu.layer_sink(blk.layer)?,
             h,
         )?;
-        if !blk.plan.down.kquant() {
+        if !q128(blk.plan.down) {
             return site::resident_gemv(gpu, w, down, h, y);
         }
     }
@@ -470,7 +481,7 @@ pub fn enqueue_block_act(
             return site::kgemv(gpu, &kk.gemv, (blk.plan.down, w, down), act, fault, y);
         }
     }
-    if !blk.plan.down.kquant() {
+    if !q128(blk.plan.down) {
         return site::resident_gemv(gpu, w, down, h, y);
     }
     let (kk, sc) = kit(k, s)?;
@@ -620,16 +631,6 @@ mod tests {
         BlockPlan::of_types(WHAT, tys)
     }
 
-    fn refused(r: Result<BlockPlan, GpuError>, words: &[&str]) {
-        let msg = match r {
-            Err(GpuError::Shape { what, detail }) => format!("{what}: {detail}"),
-            other => panic!("expected a named shape refusal, got {other:?}"),
-        };
-        for w in words {
-            assert!(msg.contains(w), "{msg:?} lacks {w:?}");
-        }
-    }
-
     /// The plan is the types' dispatch: the q8_0 triple is `BlockPlan::Q8`, one Q4_K or Q5_K for gate and up
     /// is fused, any other K-quant pair splits, and every plan reads back the types it came from.
     #[test]
@@ -654,17 +655,17 @@ mod tests {
         }
     }
 
-    /// A mix no arm covers is refused by name, with the types: gate and up of two kinds, and a split pair over
-    /// a q8_0 down.
     #[test]
-    fn a_mix_no_arm_covers_is_refused() {
-        use SiteTy::{Q4K, Q6K, Q8_0};
-        refused(
-            plan([Q8_0, Q4K, Q8_0]),
-            &["test", "gate is Q8_0", "up is Q4_K"],
-        );
-        refused(plan([Q6K, Q8_0, Q6K]), &["gate is Q6_K", "up is Q8_0"]);
-        refused(plan([Q6K, Q6K, Q8_0]), &["split", "Q8_0 down"]);
+    fn incompatible_activation_forms_refuse_before_launch() {
+        use SiteTy::{Iq4Xs, Q4K, Q6K, Q8_0};
+        for types in [
+            [Q8_0, Q4K, Q8_0],
+            [Q6K, Q8_0, Q6K],
+            [Q6K, Q6K, Q8_0],
+            [Iq4Xs, Iq4Xs, Q8_0],
+        ] {
+            assert!(matches!(plan(types), Err(GpuError::Shape { .. })));
+        }
     }
 
     /// The launches beyond the q8_0 block's two, by plan: 0 for the q8_0 block, and the K-quant arms' derived

@@ -231,7 +231,8 @@ pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<LegSplit> {
 /// is `None`. An NVFP4 site has a gemv and no wide GEMM, which the body's
 /// prompt units run every dense site through, and is `None`. A BF16 site
 /// reads the words only a load under `ModelTensors::bf16_words` keeps, which
-/// the qwen3moe files do not set, and is `None`. The body's load and the
+/// the qwen3moe files do not set, and is `None`. Its legacy shared-expert
+/// dispatch does not feed IQ4_XS sites either. The body's load and the
 /// coverage census both read this, so a site the arena cannot feed is
 /// refused at load and listed together.
 #[must_use]
@@ -239,7 +240,7 @@ pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
     let Some(entry) = kernels::dense(ty) else {
         return None;
     };
-    if let SiteEntry::Nvfp4 | SiteEntry::Bf16 = entry {
+    if let SiteEntry::Nvfp4 | SiteEntry::Bf16 | SiteEntry::Iq4xs = entry {
         return None;
     }
     match entry.reads() {

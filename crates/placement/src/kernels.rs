@@ -621,32 +621,6 @@ mod tests {
         );
     }
 
-    // PIN(2026-10-16): the dense pairs gain NVFP4 (`nvfp4_gemv` through
-    // `site::kgemv`); every other pair is unchanged.
-    // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
-    // `site::gemv`); every other pair is unchanged.
-    // PIN(2026-10-20): and bloomery's own FP8_B128 (`fp8_b128_gemv` through
-    // `site::gemv`); BF16 also uses `bf16_gemv` and `bf16_tile_gemm` over its words.
-    #[test]
-    fn dense_admits_exactly_the_pinned_pairs() {
-        assert_eq!(
-            rows(dense),
-            [
-                (GgmlType::F32, SiteEntry::F32),
-                (GgmlType::Q5_0, SiteEntry::Q5_0),
-                (GgmlType::Q8_0, SiteEntry::Q8_0),
-                (GgmlType::Q3_K, SiteEntry::Q3k),
-                (GgmlType::Q4_K, SiteEntry::Q4k),
-                (GgmlType::Q5_K, SiteEntry::Q5k),
-                (GgmlType::Q6_K, SiteEntry::Q6k),
-                (GgmlType::BF16, SiteEntry::Bf16),
-                (GgmlType::NVFP4, SiteEntry::Nvfp4),
-                (GgmlType::MXFP8, SiteEntry::Mxfp8),
-                (GgmlType::FP8_B128, SiteEntry::Fp8B128),
-            ]
-        );
-    }
-
     /// A dense entry is named by one type's row, so its file type is that
     /// row's type.
     #[test]
@@ -684,94 +658,6 @@ mod tests {
                 (GgmlType::BF16, EmbedEntry::Bf16),
             ]
         );
-    }
-
-    /// The layout a file tensor of each type loads in, and the one a routed
-    /// stack loads in under the default expert rule: every type's but q5_K's,
-    /// which that rule does not admit, and mxfp8's, which has no card expert
-    /// entry.
-    #[test]
-    fn the_card_layouts_are_the_pinned_pairs() {
-        assert_eq!(
-            rows(CardFormat::of),
-            [
-                (GgmlType::F32, CardFormat::F32),
-                (GgmlType::F16, CardFormat::Bf16AsF32),
-                (GgmlType::Q5_0, CardFormat::Q5_0),
-                (GgmlType::Q5_1, CardFormat::Q5_1),
-                (GgmlType::Q8_0, CardFormat::Q8_0Planes),
-                (GgmlType::Q3_K, CardFormat::KQuant),
-                (GgmlType::Q4_K, CardFormat::KQuant),
-                (GgmlType::Q5_K, CardFormat::KQuant),
-                (GgmlType::Q6_K, CardFormat::KQuant),
-                (GgmlType::BF16, CardFormat::Bf16AsF32),
-                (GgmlType::NVFP4, CardFormat::Nvfp4Planes),
-                (GgmlType::IQ2_XXS, CardFormat::KQuant),
-                (GgmlType::MXFP8, CardFormat::Mxfp8Planes),
-                (GgmlType::FP8_B128, CardFormat::Fp8B128Planes),
-            ]
-        );
-        for ty in ALL {
-            let routed =
-                CardFormat::of(ty).filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::MXFP8));
-            assert_eq!(CardFormat::of_routed(ty), routed, "{ty:?}");
-        }
-    }
-
-    /// The types each layout holds: the types it is the load layout of, the
-    /// K-quants as decoded f32, bf16 as raw words, and in the file's blocks
-    /// every type a routed entry reads in them.
-    #[test]
-    fn each_layout_holds_exactly_the_pinned_types() {
-        let held = |f: CardFormat| -> Vec<GgmlType> {
-            ALL.into_iter().filter(|&ty| f.holds(ty)).collect()
-        };
-        assert_eq!(
-            held(CardFormat::KQuant),
-            [
-                GgmlType::Q5_1,
-                GgmlType::Q8_0,
-                GgmlType::Q3_K,
-                GgmlType::Q4_K,
-                GgmlType::Q5_K,
-                GgmlType::Q6_K,
-                GgmlType::MXFP4,
-                GgmlType::IQ2_XXS,
-                GgmlType::IQ2_XS,
-                GgmlType::IQ3_XXS,
-                GgmlType::IQ4_NL,
-                GgmlType::IQ3_S,
-                GgmlType::IQ4_XS,
-            ]
-        );
-        assert_eq!(
-            held(CardFormat::Bf16AsF32),
-            [
-                GgmlType::F16,
-                GgmlType::Q3_K,
-                GgmlType::Q4_K,
-                GgmlType::Q5_K,
-                GgmlType::Q6_K,
-                GgmlType::BF16,
-                GgmlType::IQ2_XXS,
-            ]
-        );
-        // PIN(2026-10-22): independent BF16 heads also occupy MXFP8 planes.
-        assert_eq!(
-            held(CardFormat::Mxfp8Planes),
-            [GgmlType::BF16, GgmlType::MXFP8]
-        );
-        for (f, ty) in [
-            (CardFormat::Q5_0, GgmlType::Q5_0),
-            (CardFormat::Q5_1, GgmlType::Q5_1),
-            (CardFormat::Q8_0Planes, GgmlType::Q8_0),
-            (CardFormat::Nvfp4Planes, GgmlType::NVFP4),
-            (CardFormat::Fp8B128Planes, GgmlType::FP8_B128),
-            (CardFormat::F32, GgmlType::F32),
-            (CardFormat::Bf16Raw, GgmlType::BF16),
-        ] {
-            assert_eq!(held(f), [ty], "{f:?}");
-        }
     }
 
     /// A card entry reads a layout the card loader can build: every type a

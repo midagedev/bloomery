@@ -1157,3 +1157,188 @@ fn no_batch() -> GpuError {
         missing: "the batch's buffers",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SharedWide;
+    use crate::block::{
+        Block, BlockIo, BlockKernels, BlockPlan, BlockScratch, KBlockKernels,
+        enqueue_block_cols_act,
+    };
+    use crate::experts::ExpertKernels;
+    use bloomery_gpu::Gpu;
+    use bloomery_gpu::gemm::Gemm32Kernels;
+    use bloomery_gpu::kquant::Act;
+    use bloomery_gpu::weights::Weights;
+    use cuda_core::DeviceBuffer;
+    use gguf::Split;
+    use gguf::quant::GgmlType;
+    use gguf::write::{Layout, TensorDecl, Writer};
+
+    const N: usize = 256;
+    const FF: usize = 512;
+    const NAMES: [&str; 3] = [
+        "blk.42.ffn_gate_shexp.weight",
+        "blk.42.ffn_up_shexp.weight",
+        "blk.42.ffn_down_shexp.weight",
+    ];
+
+    fn iq4_shared_file() -> (std::path::PathBuf, Split) {
+        let path =
+            std::env::temp_dir().join(format!("bloomery-iq4-shared-{}.gguf", std::process::id()));
+        let specs = [(N, FF, 0x1c00u16), (N, FF, 0x1800), (FF, N, 0x1800)];
+        let payloads: Vec<Vec<u8>> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(k, rows, scale))| {
+                let mut bytes = Vec::with_capacity(rows * (k / 256) * 136);
+                for row in 0..rows {
+                    let d = if i == 2 && row % 2 == 1 {
+                        scale - 0x400
+                    } else {
+                        scale
+                    };
+                    let mut block = [0x88u8; 136];
+                    block[..2].copy_from_slice(&d.to_le_bytes());
+                    block[2..4].copy_from_slice(&0xaaaau16.to_le_bytes());
+                    block[4..8].fill(0x11);
+                    for _ in 0..k / 256 {
+                        bytes.extend_from_slice(&block);
+                    }
+                }
+                bytes
+            })
+            .collect();
+        let decls = NAMES
+            .iter()
+            .zip(specs)
+            .zip(&payloads)
+            .map(|((&name, (k, rows, _)), bytes)| TensorDecl {
+                name: name.to_owned(),
+                dims: vec![u64::try_from(k).unwrap(), u64::try_from(rows).unwrap()],
+                type_id: GgmlType::IQ4_XS.as_u32(),
+                nbytes: u64::try_from(bytes.len()).unwrap(),
+            })
+            .collect();
+        let layout = Layout::new(&[], decls).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut writer = Writer::new(file, layout).unwrap();
+        for (name, bytes) in NAMES.iter().zip(payloads) {
+            writer.tensor(name, &bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let split = Split::open(&path).unwrap();
+        (path, split)
+    }
+
+    fn check_shared_rows(input: &[f32], rows: &[f32]) {
+        // Uniform positive rows quantize to code127 without integer rounding.
+        // The gate is at least128, so SiLU rounds to the gate itself. The
+        // scalar positive-dot upper bound has four input-width operations,
+        // two output-width operations and the scale/product roundings.
+        let operations = 4.0 * 256.0 + 2.0 * 512.0 + 16.0;
+        let eps = f64::from(f32::EPSILON);
+        let gamma = operations * eps / (1.0 - operations * eps);
+        for (c, row) in rows.as_chunks::<N>().0.iter().enumerate() {
+            let x = f64::from(input[c * N]);
+            for (r, &got) in row.iter().enumerate() {
+                let expected = x * x * if r % 2 == 0 { 0.5 } else { 0.25 };
+                assert!(got.is_finite());
+                assert!(
+                    (f64::from(got) - expected).abs() <= gamma * expected,
+                    "column {c} row {r}: {got} vs {expected}, relative bound {gamma}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_iq4_shared_loads_and_runs_narrow_columns_and_wide_replay() {
+        let (path, split) = iq4_shared_file();
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let weights = Weights::load_where(stream, &split, |name| NAMES.contains(&name)).unwrap();
+        let plan = BlockPlan::of_file(&split, "IQ4_XS shared", NAMES, (FF, N)).unwrap();
+        plan.check_resident(&weights, "IQ4_XS shared", NAMES, (FF, N))
+            .unwrap();
+        let block = Block {
+            plan,
+            names: NAMES,
+            ff: FF,
+            limit: 0.0,
+            layer: 42,
+        };
+        let experts = ExpertKernels::load(gpu.context()).unwrap();
+        let quant = KBlockKernels::load(&gpu).unwrap();
+        let kernels = BlockKernels {
+            experts: &experts,
+            kquant: Some(&quant),
+        };
+        let mut scratch = BlockScratch::new(stream, N, [(plan, FF)]).unwrap();
+        let mut h = DeviceBuffer::zeroed(stream, FF).unwrap();
+        let g32 = Gemm32Kernels::load(gpu.context()).unwrap();
+        for cols in [1, 8, super::GATED_FROM] {
+            let input: Vec<f32> = (0..cols)
+                .flat_map(|c| std::iter::repeat_n([128.0, 256.0, 384.0][c % 3], N))
+                .collect();
+            let x = DeviceBuffer::from_host(stream, &input).unwrap();
+            let mut y = DeviceBuffer::zeroed(stream, cols * N).unwrap();
+            if cols < super::GATED_FROM {
+                enqueue_block_cols_act(
+                    &gpu,
+                    &weights,
+                    &kernels,
+                    &mut scratch,
+                    (&block, Act::SiluMul),
+                    cols,
+                    BlockIo {
+                        x: &x,
+                        h: &mut h,
+                        y: &mut y,
+                    },
+                )
+                .unwrap();
+            } else {
+                let types = plan.types();
+                let mut wide =
+                    SharedWide::new(&gpu, (&types[..2], &types[2..]), (cols, N, FF)).unwrap();
+                wide.run(
+                    (&gpu, &weights, &g32),
+                    (&block, Act::SiluMul),
+                    (cols, N),
+                    (&x, &mut y),
+                )
+                .unwrap();
+                let eager = y.to_host_vec(stream).unwrap();
+                check_shared_rows(&input, &eager);
+                let graph = gpu
+                    .capture(|_| {
+                        wide.run(
+                            (&gpu, &weights, &g32),
+                            (&block, Act::SiluMul),
+                            (cols, N),
+                            (&x, &mut y),
+                        )
+                    })
+                    .unwrap();
+                graph.launch(stream).unwrap();
+                let replay = y.to_host_vec(stream).unwrap();
+                assert!(
+                    eager
+                        .iter()
+                        .zip(&replay)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+            check_shared_rows(&input, &y.to_host_vec(stream).unwrap());
+            assert_eq!(gpu.take_fault().unwrap(), None);
+        }
+        stream.synchronize().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+}

@@ -38,6 +38,8 @@ pub enum SiteTy {
     /// entry is none; a backend whose launch reads it names it in the list
     /// [`file_site`] takes.
     MlxA4,
+    /// IQ4_XS in its original blocks, over q8_1 columns, narrow and wide.
+    Iq4Xs,
 }
 
 impl SiteTy {
@@ -56,6 +58,7 @@ impl SiteTy {
         SiteTy::Mxfp8,
         SiteTy::Fp8B128,
         SiteTy::Bf16,
+        SiteTy::Iq4Xs,
     ];
 
     /// The family of a file tensor of type `ty`, the one that launches the
@@ -99,6 +102,7 @@ impl SiteTy {
             SiteTy::Mxfp8 => Some(SiteEntry::Mxfp8),
             SiteTy::Fp8B128 => Some(SiteEntry::Fp8B128),
             SiteTy::Bf16 => Some(SiteEntry::Bf16),
+            SiteTy::Iq4Xs => Some(SiteEntry::Iq4xs),
             SiteTy::MlxA4 => None,
         }
     }
