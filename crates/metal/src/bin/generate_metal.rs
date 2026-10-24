@@ -118,18 +118,19 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         model: PathBuf,
     }
 
-    /// Every value of flag `name`, in order; a trailing flag without its
-    /// value is refused by name.
+    /// Every value of flag `name`, in order. The walk takes each value flag's
+    /// next argument as its value, so a value is never read as a flag; a
+    /// value flag without its value is refused by name.
     fn flags(name: &str) -> Result<Vec<String>, String> {
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut args = std::env::args().skip(1);
         let mut out = Vec::new();
-        for (i, a) in args.iter().enumerate() {
+        while let Some(a) = args.next() {
+            if !VALUE_FLAGS.contains(&a.as_str()) {
+                continue;
+            }
+            let value = args.next().ok_or_else(|| format!("{a} needs a value"))?;
             if a == name {
-                out.push(
-                    args.get(i + 1)
-                        .ok_or_else(|| format!("{name} needs a value"))?
-                        .clone(),
-                );
+                out.push(value);
             }
         }
         Ok(out)
@@ -348,11 +349,10 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
     ) -> Result<(), String> {
         let rows = s.ctx() - s.pos() as usize;
         if rows == 0 {
-            eprintln!(
-                "prof: refused: the cache holds no row past position {}; give --ctx more rows",
+            return Err(format!(
+                "prof: the cache holds no row past position {}; give --ctx more rows",
                 s.pos()
-            );
-            return Ok(());
+            ));
         }
         let steps = p.n.min(rows);
         let layers = s.layer_count();
