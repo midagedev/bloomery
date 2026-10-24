@@ -38,6 +38,12 @@
 //!   to each mark and continued to the end, twice: the same pick, logits row
 //!   and stores both times, and the tokens after it within `q_free`'s band of
 //!   the stepped run's.
+//! - `q_tensor`: `q_free` with the pass's GEMMs on the tensor-op kernels
+//!   (`Library::with_tensor_gemms`), forced on any device that builds them,
+//!   held to the same band and cap: the tensor path's dot band is `q_free`'s
+//!   f16 operand roundings plus an f32 sum of at most K − 1 additions a term
+//!   (the kernels gate's `gemm_band`), under 2^-11 of a dot's magnitude at
+//!   K = 2,048, so the pass is another realization of the same rule.
 
 use std::path::Path;
 
@@ -49,7 +55,7 @@ use bloomery_metal::arch::qwen3moe::session::{
 };
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{CONV_TAPS, HEAD_COLS, HEAD_DIM, KV_HEADS, RING_ROWS, VALUE_HEADS};
-use bloomery_metal::library::Library;
+use bloomery_metal::library::{GemmPath, Library};
 use runtime::prompt::PrefillMode;
 use runtime::{Target, Want};
 
@@ -607,6 +613,31 @@ pub fn q_ref(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
 /// `q_free`: the greedy tokens of the stepped run teacher-forced through the
 /// pass run.
 pub fn q_free(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    free_run(device, library, path, "q_free")
+}
+
+/// `q_tensor`: `q_free` with the pass's GEMMs from the tensor-op program
+/// `tensor_text` (the shipped one, or a mutant's).
+pub fn q_tensor(device: &MetalDevice, library: &Library, tensor_text: &str, path: &Path) -> Clause {
+    let tensor = Library::tensor_from_source_text(device, tensor_text)
+        .map_err(|e| format!("the tensor-op GEMMs do not build here: {e}"))?;
+    let forced = library.with_tensor_gemms(tensor);
+    if forced.gemm_path() != GemmPath::TensorOps {
+        return Err(format!(
+            "the forced library's GEMMs are {}, not the tensor-op ones",
+            forced.gemm_path().name()
+        ));
+    }
+    let line = free_run(device, &forced, path, "q_tensor")?;
+    match line {
+        Verdict::Noted(line) => Ok(Verdict::Noted(format!("tensor-op GEMMs: {line}"))),
+        other => Ok(other),
+    }
+}
+
+/// The greedy tokens of the stepped run teacher-forced through the pass run,
+/// both sessions on `library`'s kernels.
+fn free_run(device: &MetalDevice, library: &Library, path: &Path, clause: &str) -> Clause {
     let ids = prompt_ids(1024)?;
     let ctx = ids.len() + FREE_STEPS + 1;
     let mut pass = open(device, library, path, ctx, 2048, PrefillMode::Batch)?;
@@ -626,7 +657,7 @@ pub fn q_free(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         if a.top == b.top {
             agree += 1;
         }
-        println!("q_free token {t}: picks pass={} steps={}", a.top, b.top);
+        println!("{clause} token {t}: picks pass={} steps={}", a.top, b.top);
         tok = b.top;
     }
     let line = format!(

@@ -22,7 +22,17 @@
 //! no kernel side. The host edits themselves are one-off edits recorded in the
 //! round that proves the clause.
 
-use bloomery_metal::library::SOURCE;
+use bloomery_metal::library::{SOURCE, TENSOR_SOURCE};
+
+/// The program a mutant's edits go into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Program {
+    /// The kernels' library ([`SOURCE`]).
+    Main,
+    /// The tensor-op GEMMs' library ([`TENSOR_SOURCE`]), which `q_tensor`
+    /// forces.
+    Tensor,
+}
 
 /// A defect and the clause that must be red on it.
 pub struct Mutant {
@@ -145,13 +155,34 @@ pub const MUTANTS: &[Mutant] = &[
     },
 ];
 
-pub fn find(name: &str) -> Option<&'static Mutant> {
-    MUTANTS.iter().find(|m| m.name == name)
+/// The tensor-op GEMMs' defects `q_tensor` must catch: the program it forces
+/// is the one its pass runs.
+pub const TENSOR_MUTANTS: &[Mutant] = &[Mutant {
+    name: "tensor_pass_pair_swapped",
+    clause: "q_tensor",
+    why: "the routed pair's gate and up accumulators swap places in the tensor-op SwiGLU",
+    edits: &[("pair_swiglu(cg[i], cu[i])", "pair_swiglu(cu[i], cg[i])", 1)],
+}];
+
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
 }
 
-/// The kernels' source with the mutant's edits applied.
-pub fn source_of(mutant: &Mutant) -> Result<String, String> {
-    let mut text = SOURCE.to_string();
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    MUTANTS
+        .iter()
+        .map(|m| (m, Program::Main))
+        .chain(TENSOR_MUTANTS.iter().map(|m| (m, Program::Tensor)))
+}
+
+/// The source of `program` with the mutant's edits applied.
+pub fn source_of(mutant: &Mutant, program: Program) -> Result<String, String> {
+    let mut text = match program {
+        Program::Main => SOURCE,
+        Program::Tensor => TENSOR_SOURCE,
+    }
+    .to_string();
     for (find, replace, count) in mutant.edits {
         let found = text.matches(find).count();
         if found != *count {
