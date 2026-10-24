@@ -63,20 +63,15 @@
 // no word past the output's last row or column is written; the residual
 // epilogue reads, adds and writes back per element.
 //
-// This file comes after quant.metal: it reads the quant owners and the
-// fault site's table.
+// This file comes after quant.metal and gemm_shared.metal: it reads the
+// quant owners, the fault site's table, the tile's geometry and the
+// argument blocks.
 
 #include <metal_stdlib>
 
 using namespace metal;
 
 #pragma METAL fp contract(off)
-
-// The tile's geometry: the kernel's own constants, the ones the host's
-// launch module (kernels/gemm.rs) mirrors.
-#define GEMM_ROWS 64     // weight rows a threadgroup owns
-#define GEMM_ACTS 64     // activation rows a threadgroup owns
-#define GEMM_THREADS 128  // four SIMD groups
 
 // The 8x8 fragments one SIMD group owns along each side: two SIMD groups
 // share a side, in 8-row blocks sixteen rows apart.
@@ -86,67 +81,6 @@ using namespace metal;
 static_assert(GEMM_THREADS == 4 * 32, "four SIMD groups of 32 threads");
 static_assert(GEMM_ROWS % 16 == 0 && GEMM_ACTS % 16 == 0,
               "the tile splits into 8x8 fragments, two SIMD groups to a side");
-
-// The K values one step covers: 32, a whole number of every owner's
-// 16-value staging chunks and half the smallest group (A4's 64).
-template <typename T>
-constexpr int gemm_bk() {
-    return 32;
-}
-
-// The staged rows' pitch in elements: the K step plus 16 bytes, steel's
-// padding.
-template <typename T>
-constexpr int gemm_lda() {
-    return gemm_bk<T>() + 16 / (int)sizeof(T);
-}
-
-// The threadgroup bytes one tile stages: the f32 arm's 18432, the f16
-// arm's 10240. The allocation itself lives in the entry kernel (a
-// threadgroup variable may be declared only there), and the tile body takes
-// it as a pointer.
-template <typename T>
-constexpr int gemm_shmem_bytes() {
-    return (GEMM_ROWS + GEMM_ACTS) * gemm_lda<T>() * (int)sizeof(T);
-}
-
-// The argument block of a plain GEMM, bound by value at slot 3.
-struct GemmArgs {
-    uint cols;     // the input columns K, a whole number of the type's blocks
-    uint rows;     // the weight rows N, the output's columns
-    uint acts;     // the activation rows R, the output's rows
-    uint x_stride; // the f32 elements between x's rows, at least cols
-    uint y_stride; // the f32 elements between y's rows, at least rows
-    uint layer;    // the layer a raise is recorded in
-};
-
-static_assert(sizeof(GemmArgs) == 24, "GemmArgs is 24 bytes: the host packs six words");
-
-// One segment of a segmented GEMM: the weight rows of one tensor, and where
-// they sit in the weights and in the output. The mat-vec's segment table's
-// own four fields (norm.metal's MatvecSeg), the GEMM's meaning: the output
-// offset is a column offset in the R-row output, and the first group is a
-// weight-tile threadgroup.
-struct GemmSeg {
-    uint rows;         // the segment's weight rows
-    uint wblocks;      // the segment's first row's block offset in the weights
-    uint out;          // the segment's first column in the output
-    uint first_group;  // the segment's first weight-tile threadgroup
-};
-
-// The argument block of a segmented GEMM, bound by value at slot 3.
-struct GemmSegArgs {
-    uint cols;
-    uint acts;
-    uint x_stride;
-    uint y_stride;
-    uint layer;
-    uint nseg;
-    GemmSeg segs[BLOOMERY_MATVEC_MAX_SEGMENTS];
-};
-
-static_assert(sizeof(GemmSegArgs) == 24 + 16 * BLOOMERY_MATVEC_MAX_SEGMENTS,
-              "GemmSegArgs is the header's six words and the segments' tables");
 
 // The float fragment multiply: a `vec<float, 2>` is the 8x8 simdgroup
 // matrix's per-lane storage, so the fragment aliases the matrix through

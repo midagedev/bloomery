@@ -48,7 +48,8 @@
 // in every row of the threadgroup, because every row reads every slot.
 //
 // This file comes after matvec_q6k.metal and quant.metal (the decode owners),
-// norm.metal (rms_scale, rms_usable) and fault.metal (raise).
+// norm.metal (rms_scale, rms_usable), gemm_shared.metal (pair_swiglu) and
+// fault.metal (raise).
 
 #include <metal_stdlib>
 
@@ -95,11 +96,6 @@ inline device const char * expert_base(bool shared_slot,
                                        device const char * shexp,
                                        device const char * stack) {
     return shared_slot ? shexp : stack;
-}
-
-// silu(gate) * up. No route weight: the fold multiplies by it.
-inline float pair_swiglu(float gate, float up) {
-    return gate / (1.0f + exp(-gate)) * up;
 }
 
 // True when the routed slot's id is past the stack. Slot 8 is the shared

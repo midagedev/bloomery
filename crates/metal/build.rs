@@ -1,7 +1,7 @@
 //! The build of the Metal backend: the kernels' one source, and the
 //! metallib when the Metal Toolchain is installed.
 //!
-//! Two outputs land in `OUT_DIR`:
+//! Three outputs land in `OUT_DIR`:
 //!
 //! - `bloomery.metal`: the kernels' source with the fault site's table
 //!   written in front of it, from `bloomery-device`'s table — the one owner
@@ -10,6 +10,9 @@
 //! - `bloomery.metallib`: the same source compiled by `xcrun metal`, when
 //!   the Metal Toolchain is installed. Its presence is the `metal_lib`
 //!   cfg, and the runtime loads it instead of the source.
+//! - `bloomery_tensor.metal`: the tensor-op GEMMs' source, the same table in
+//!   front of the files it reads, which the runtime compiles at Metal 4 on a
+//!   GPU that takes them (`library.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -262,6 +265,7 @@ fn main() {
         "probe",
         "norm",
         "quant",
+        "gemm_shared",
         "gemm",
         "matvec_q4k",
         "matvec_q6k",
@@ -288,6 +292,24 @@ fn main() {
     let combined = combined_source(&header, &kernels);
     let source_path = out_dir.join("bloomery.metal");
     std::fs::write(&source_path, &combined).expect("the source is written");
+
+    // The tensor-op GEMMs read the fault's raise, the quant owners and the
+    // shared GEMM ABI, the engine source's own files, in its order.
+    let tensor: Vec<(&str, String)> = kernels
+        .iter()
+        .filter(|(name, _)| ["fault", "quant", "gemm_shared"].contains(name))
+        .cloned()
+        .chain(std::iter::once((
+            "gemm_tensor",
+            std::fs::read_to_string(kernels_dir.join("gemm_tensor.metal"))
+                .expect("kernels/gemm_tensor.metal is read"),
+        )))
+        .collect();
+    std::fs::write(
+        out_dir.join("bloomery_tensor.metal"),
+        combined_source(&header, &tensor),
+    )
+    .expect("the tensor source is written");
 
     match build_metallib(&source_path, &out_dir) {
         Some(_) => println!("cargo:rustc-cfg=metal_lib=\"metallib\""),
