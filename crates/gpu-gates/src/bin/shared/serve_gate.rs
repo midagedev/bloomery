@@ -1,20 +1,25 @@
 //! The serve gate's clauses: the one owner of what a seat of a body that runs
 //! one sequence on one card is held to — it refuses a second slot, it loads
-//! the file at the context it was asked for, and it answers a chat turn with
-//! its reasoning split at the model's own tags and its turn ending at the
-//! model's own end token.
+//! the file at the context it was asked for, it answers a chat turn with its
+//! reasoning split at the model's own tags and its turn ending at the model's
+//! own end token, and a request keeps the prefix it shares with the slot the
+//! server holds ([`PREFIX`], `live_slot_keeps_the_prefix`: what holds and its
+//! FAIL-first are that clause's doc).
 //!
 //! A seat gives the clauses its own facts ([`Clauses`]): the model word, the
 //! records its server prints, the load and the listening record, the
 //! architecture word its load record names, the file's layers, the tags of its
-//! think span, the token that closes its turn and the context the server is
-//! asked for; and what its chat request asks beside the turn ([`Ask`]).
+//! think span, the token that closes its turn, the context the server is asked
+//! for and what its body's cut keeps of a shared prefix ([`Cut`]); and what
+//! its chat request asks beside the turn ([`Ask`]).
 
 use std::path::Path;
 use std::time::Duration;
 
 use bloomery_gpu_gates::record;
-use bloomery_gpu_gates::serve_client::{SeatGate, Served, check, curl, json_of, server_log};
+use bloomery_gpu_gates::serve_client::{
+    SeatGate, Served, check, curl, ids_of, json_of, server_log, tokenized,
+};
 use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
 use serde_json::json;
@@ -43,6 +48,23 @@ pub struct Clauses {
     pub turn_end: &'static str,
     /// The context the server is asked for.
     pub ctx: u64,
+    /// What the seat's cut (`app::Keep`) keeps of a prefix a request shares with the slot:
+    /// every held position, or the body's own smaller rule ([`Cut`]).
+    pub cut: Cut,
+}
+
+/// What a seat's cut does with a prefix a request shares with the slot, as
+/// the prefix clause reads it: the seat states its body's own rule
+/// (`app::Keep for Body`).
+pub enum Cut {
+    /// Every held position: any shared prefix, shorter than what the slot
+    /// holds or not, is kept whole.
+    EveryPosition,
+    /// The body's rule keeps a shared prefix shorter than what the slot holds
+    /// only where the sequence stands — at the nearest checkpoint at or below
+    /// it, and from an empty model where none is held — so a shorter shared
+    /// prefix is kept only as a whole continuation of what the slot holds.
+    WhereItStands,
 }
 
 /// The tokens the chat request asks for at most, and the reasoning tokens the
@@ -93,6 +115,31 @@ const ONE_SEQUENCE: &str = "holds one sequence";
 const CHAT: &str = "chat_splits_the_reasoning_at_the_models_tags";
 const ENDED: &str = "chat_ends_at_the_turn_end";
 const ANSWERED: &str = "chat_answers_a_turn";
+const PREFIX: &str = "live_slot_keeps_the_prefix";
+
+/// The tokens each request of the prefix clause asks for at most.
+const PREFIX_TOKENS: u64 = 8;
+
+/// The fixed text every prompt of the prefix clause opens with: long enough
+/// that the questions sit past a page of ids, short enough that the prompts
+/// stay well under half of every seat's context.
+const PREFIX_TEXT: &str = "The harbour office kept the keeper's ledger beside its maps: every \
+                           ship that passed the point, the wind, the tide and the names she read \
+                           through the glass, one page an evening for forty years. The clerks \
+                           still open the ledger first when a fishing boat asks about the weather \
+                           before dawn, and the newest page carries the same square hand as the \
+                           oldest.";
+
+/// The question the prefix clause's first prompt asks after [`PREFIX_TEXT`].
+const Q1: &str = "Which page did the clerk open first?";
+
+/// The question the second prompt asks after the first's answer.
+const Q2: &str = "And what did the oldest page record?";
+
+/// The question the third prompt asks after [`PREFIX_TEXT`]: it differs from
+/// [`Q1`] in its first word, so the two prompts' ids share the fixed text and
+/// part inside it.
+const Q3: &str = "What page did the clerk open first?";
 
 /// The seat of `c`, the one server the clauses drive.
 fn seat(c: &Clauses) -> SeatGate {
@@ -125,8 +172,9 @@ pub fn finish(c: &Clauses, ok: bool) -> Result<(), GateError> {
         return Err(checks_failed());
     }
     println!(
-        "PASSED: {} the seat refuses a second slot, loads at the context it was asked for, and \
-         answers a chat turn with its reasoning split at the model's tags",
+        "PASSED: {} the seat refuses a second slot, loads at the context it was asked for, \
+         answers a chat turn with its reasoning split at the model's tags, and keeps the prefix \
+         a request shares with the slot by its cut's rule (live_slot_keeps_the_prefix)",
         c.gate
     );
     Ok(())
@@ -229,6 +277,17 @@ pub fn served_with(c: &Clauses, dir: &Path, ask: Ask) -> Result<bool, GateError>
     if tier::run_clause(ENDED, Tag::FileBound)? {
         check(&mut ok, ENDED, ended);
     }
+    if tier::run_clause(PREFIX, Tag::SelfConsistency)? {
+        let lever = records
+            .one(&record::RESIDENCY_LEVER)?
+            .word("residency")?
+            .to_owned();
+        check(
+            &mut ok,
+            PREFIX,
+            live_slot_keeps_the_prefix(c, &url, &d, &lever)?,
+        );
+    }
     println!("server stopped: {}", s.stop()?);
     Ok(ok)
 }
@@ -289,4 +348,171 @@ fn chat(
             && !leaked,
         ended,
     ))
+}
+
+/// One greedy `/completion` of the prefix clause: the timings' `prompt_n` and
+/// `cache_n` and their sum, the answer's text and ids, its body in
+/// `<dir>/<name>.json`.
+struct Asked {
+    prompt_n: u64,
+    cache_n: u64,
+    whole: u64,
+    content: String,
+    tokens: Vec<u32>,
+}
+
+/// [`Asked`] of one request: `ids` at [`PREFIX_TOKENS`] tokens, temperature 0,
+/// the prompt cache `cache` asks the server to keep the prefix the prompt
+/// shares with the slot.
+fn asked(
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+    name: &str,
+    ids: &[u32],
+    cache: bool,
+) -> Result<Asked, GateError> {
+    let body = json!({
+        "prompt": ids, "n_predict": PREFIX_TOKENS, "temperature": 0,
+        "return_tokens": true, "cache_prompt": cache,
+    });
+    let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+    std::fs::write(dir.join(format!("{name}.json")), &text)?;
+    let v = json_of("/completion", st, &text)?;
+    let timings = &v["timings"];
+    let count = |k: &str| {
+        timings[k]
+            .as_u64()
+            .ok_or_else(|| format!("{name}: the answer's timings carry no {k}"))
+    };
+    let (prompt_n, cache_n) = (count("prompt_n")?, count("cache_n")?);
+    Ok(Asked {
+        prompt_n,
+        cache_n,
+        whole: prompt_n + cache_n,
+        content: v["content"].as_str().unwrap_or("").to_owned(),
+        tokens: ids_of(&v["tokens"]),
+    })
+}
+
+/// The length of the longest common prefix of `a` and `b`.
+fn common(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// [`PREFIX`], `live_slot_keeps_the_prefix`: the slot the chat clauses left
+/// standing reuses the prefix a later request shares with it. The prompts are
+/// posted as the ids `/tokenize` reads at `add_special` false, and a prompt of
+/// ids alone takes no special token (only a prompt's first text element gets
+/// the vocabulary's specials), so `timings.prompt_n + timings.cache_n` counts
+/// exactly the ids the request carried. The first prompt — [`PREFIX_TEXT`] and
+/// [`Q1`] — is answered with the cache on and its whole prompt count recorded
+/// as `n1`; the second — the first's text, its answer and [`Q2`] — keeps at
+/// least `n1` ids and its two timings count its whole prompt; the third —
+/// [`PREFIX_TEXT`] and [`Q3`], which differs from [`Q1`] in its first word —
+/// keeps exactly the ids the two prompts' tokenizations share, and the same
+/// prompt answered with the cache off writes the same text. The holds past the
+/// first prompt's counting are a seat whose cut keeps every held position's
+/// ([`Cut::EveryPosition`]): a body that keeps a shared prefix only where its
+/// state stands ([`Cut::WhereItStands`]) re-feeds a shorter shared prompt from
+/// an empty model by its own rule, so for it the second prompt's counting hold
+/// alone runs and the third and fourth are skipped by name. The same-answer
+/// hold runs only where the server's `residency lever` record says `off`
+/// (`lever`): on a server the machine serves, the placement follows the
+/// history of requests, and one line names the record and skips the hold.
+/// FAIL-first: a seat whose keep query grants nothing (`Seat::keep` answering
+/// 0) keeps none of the shared prefix, the second and third holds are red and
+/// the clause is red.
+fn live_slot_keeps_the_prefix(
+    c: &Clauses,
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+    lever: &str,
+) -> Result<bool, GateError> {
+    let p1 = format!("{PREFIX_TEXT} {Q1}");
+    let ids1 = tokenized(url, &p1)?;
+    if u64::try_from(ids1.len()).unwrap_or(u64::MAX) + PREFIX_TOKENS >= c.ctx / 2 {
+        return Err(format!(
+            "the prefix clause's first prompt holds {} ids and asks {PREFIX_TOKENS} more, past \
+             half of the {} positions the server serves",
+            ids1.len(),
+            c.ctx
+        )
+        .into());
+    }
+    let first = asked(url, dir, "prefix_first", &ids1, true)?;
+    let n1 = first.whole;
+    println!(
+        "prefix first: {} ids, kept {}, {} tokens; the answer {} chars",
+        ids1.len(),
+        first.cache_n,
+        first.tokens.len(),
+        first.content.trim().len()
+    );
+    let answer = first.content.trim().to_owned();
+    let p2 = if answer.is_empty() {
+        format!("{PREFIX_TEXT} {Q1} {Q2}")
+    } else {
+        format!("{PREFIX_TEXT} {Q1} {answer} {Q2}")
+    };
+    let ids2 = tokenized(url, &p2)?;
+    if matches!(c.cut, Cut::EveryPosition) && common(&ids1, &ids2) < n1 as usize {
+        return Err(format!(
+            "the first answer's text re-tokenizes into a seam inside the first prompt: the \
+             second prompt shares {} of the first's {n1} ids, and the clause needs a question \
+             whose ids the answer's text does not merge",
+            common(&ids1, &ids2)
+        )
+        .into());
+    }
+    let second = asked(url, dir, "prefix_extended", &ids2, true)?;
+    let counted = second.whole == ids2.len() as u64;
+    let kept = second.cache_n >= n1;
+    println!(
+        "prefix extended: {} ids; kept {} (at least the first prompt's {n1} {}), counted {}",
+        ids2.len(),
+        second.cache_n,
+        if kept { "holds" } else { "FAIL" },
+        counted
+    );
+    let mut holds = counted && (!matches!(c.cut, Cut::EveryPosition) || kept);
+    match c.cut {
+        Cut::EveryPosition => {
+            let p3 = format!("{PREFIX_TEXT} {Q3}");
+            let ids3 = tokenized(url, &p3)?;
+            let share = common(&ids1, &ids3);
+            let third = asked(url, dir, "prefix_shorter", &ids3, true)?;
+            let exact = third.cache_n == share as u64;
+            println!(
+                "prefix shorter: {} ids share {} with the first prompt and kept {} (want {}); \
+                 {} tokens",
+                ids3.len(),
+                share,
+                third.cache_n,
+                share,
+                third.tokens.len()
+            );
+            holds &= exact;
+            if lever == "off" {
+                let fresh = asked(url, dir, "prefix_shorter_fresh", &ids3, false)?;
+                let same = fresh.content == third.content;
+                println!(
+                    "prefix same answer: the cache-off run kept {} and wrote the same text {}",
+                    fresh.cache_n, same
+                );
+                holds &= same;
+            } else {
+                println!(
+                    "prefix same answer: skipped, the server's residency lever record is \
+                     {lever:?}, not off"
+                );
+            }
+        }
+        Cut::WhereItStands => {
+            println!(
+                "prefix shorter and same answer: skipped, the seat's cut keeps a shared prefix \
+                 only where the sequence stands, so a shorter one re-feeds from an empty model"
+            );
+        }
+    }
+    Ok(holds)
 }

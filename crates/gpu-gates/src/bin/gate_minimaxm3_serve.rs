@@ -17,8 +17,11 @@
 //! The plan and slot clauses are this file's. The load and the chat are the shared ones
 //! (`shared/serve_gate.rs`): the seat loads the file at the context it was asked for, answers a
 //! chat turn with its reasoning split at the model's tags and ends its turn at the model's own
-//! end token. The model's facts are this file's: the think tags and the turn end are written
-//! here as the model's vocabulary spells them; the seat reads the tags from the model's
+//! end token, and keeps the prefix a request shares with the slot the server holds
+//! (`live_slot_keeps_the_prefix`: its cut keeps every held position, so the shorter shared
+//! prefix is kept whole and its cached answer equals the uncached one on a server whose
+//! residency is off). The model's facts are this file's: the think tags and the turn end are
+//! written here as the model's vocabulary spells them; the seat reads the tags from the model's
 //! description (`models::ReasoningFormat::ThinkSpan`).
 //!
 //! - `slots_total_is_planned`: `--parallel 2 --ctx` [`CTX`] `--plan` exits 0 and its stderr
@@ -227,6 +230,9 @@ mod gate {
             think: THINK_TAGS,
             turn_end: TURN_END,
             ctx: CTX,
+            // Every store is a plane of positions, so the session's cut keeps every held
+            // position (`app::Keep`, crates/app/src/arch/minimaxm3/mod.rs:11).
+            cut: serve_gate::Cut::EveryPosition,
         })
     }
 
@@ -419,8 +425,9 @@ mod gate {
         println!(
             "PASSED: {} the seat plans two slots (pass=turns), two concurrent greedy requests \
              each equal their solo run, the second solo run a fresh server's own, loads at the \
-             context it was asked for, and answers a chat turn with its reasoning split at the \
-             model's tags",
+             context it was asked for, answers a chat turn with its reasoning split at the \
+             model's tags, and keeps the prefix a request shares with the slot \
+             (live_slot_keeps_the_prefix)",
             c.gate
         );
         Ok(())

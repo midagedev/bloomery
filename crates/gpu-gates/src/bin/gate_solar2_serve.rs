@@ -11,9 +11,14 @@
 //!
 //! The clauses are the shared ones (`shared/serve_gate.rs`): the seat refuses a second slot,
 //! loads the file at the context it was asked for, answers a chat turn with its reasoning split
-//! at the model's tags and ends its turn at the model's own end token. The model's facts are
-//! this file's: the think tags and the turn end are written here as the model's vocabulary
-//! spells them; the seat reads the tags from the model's description
+//! at the model's tags and ends its turn at the model's own end token, and runs the prefix
+//! clause `live_slot_keeps_the_prefix` at its own cut's fact: the body's `app::Keep` keeps a
+//! shared prefix only where the sequence stands — at the nearest checkpoint at or below it, and
+//! the serving prompt call takes no checkpoint (`Body::kept`,
+//! crates/app/src/arch/solar2/mod.rs:75), so a request that shares less than the slot holds
+//! re-feeds its prompt from an empty model and the clause holds it to the counting rule alone.
+//! The model's facts are this file's: the think tags and the turn end are written here as the
+//! model's vocabulary spells them; the seat reads the tags from the model's description
 //! (`models::ReasoningFormat::ThinkSpan`).
 //!
 //! - `parallel_above_one_is_refused`: `--parallel 2 --plan` exits non-zero, its stderr names the
@@ -202,6 +207,10 @@ mod gate {
             think: THINK_TAGS,
             turn_end: TURN_END,
             ctx: CTX,
+            // The KDA layers' recurrent state keeps a shared prefix only where the sequence
+            // stands or at a checkpoint (`Body::kept`, crates/app/src/arch/solar2/mod.rs:75),
+            // and the serving prompt call takes no checkpoint.
+            cut: serve_gate::Cut::WhereItStands,
         };
         let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;

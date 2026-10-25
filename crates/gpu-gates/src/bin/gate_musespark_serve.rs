@@ -103,6 +103,12 @@
 //!   the server stops there and leaves it out of the text. FAIL-first: a vocabulary that lists
 //!   only the file's `eos_token_id` (200001) lets the model run past its turn end, the token's
 //!   text is in the message and the clause is red.
+//! - `live_slot_keeps_the_prefix` (shared, `shared/serve_gate.rs`): a request keeps the prefix
+//!   it shares with the slot the server holds — the seat's cut keeps every held position
+//!   (`app::Keep`, crates/app/src/arch/musespark/mod.rs:81), so the shared prefix of another
+//!   question on the same text is kept whole and its cached answer equals the uncached one on
+//!   a server whose residency is off. FAIL-first: a seat whose keep query grants nothing keeps
+//!   none of the shared prefix and the clause is red.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -171,6 +177,9 @@ mod gate {
             think: MARKERS,
             turn_end: TURN_END,
             ctx: CTX,
+            // Every layer's store is a plane of positions, so the session's cut keeps every
+            // held position (`app::Keep for Body`, crates/app/src/arch/musespark/mod.rs:81).
+            cut: serve_gate::Cut::EveryPosition,
         })
     }
 
@@ -459,9 +468,10 @@ mod gate {
             "PASSED: gate_musespark_serve the seat plans one slot, plans the expert tier card where \
              two cards are in view and refuses it where one is, refuses a second slot, runs the \
              residency machine and plans the stream's ring by the common rule, loads at the \
-             context it was asked for, and answers a \
+             context it was asked for, answers a \
              chat turn with its reasoning split out of the recipient protocol and its turn ended \
-             at the model's own end token"
+             at the model's own end token, and keeps the prefix a request shares with the slot \
+             (live_slot_keeps_the_prefix)"
         );
         Ok(())
     }
