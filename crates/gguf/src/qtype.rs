@@ -105,15 +105,17 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::IQ2_XXS, name: "iq2_xxs", blck: 256, bytes: 66, dequant: true, host_act: H::Q8K,
            card: card!(KQuant        KQuant        Iq2xxs  (Iq2xxs, Q8Act)      Iq2xxs -       -    -) },
     QRow { ty: T::IQ2_XS, name: "iq2_xs", blck: 256, bytes: 74, dequant: true, host_act: H::Q8K,
-           card: card!(-             -             Iq2xs   (Iq2xs, Q8Act)      -      -       -    -) },
+           card: card!(KQuant        KQuant        Iq2xs   (Iq2xs, Q8Act)      Iq2xs  -       -    -) },
     QRow { ty: T::IQ3_XXS, name: "iq3_xxs", blck: 256, bytes: 98, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq3xxs  (Iq3xxs, Q8Act)     Iq3xxs -       -    -) },
-    QRow { ty: T::IQ1_S, name: "iq1_s", blck: 256, bytes: 50, dequant: false, host_act: H::None, card: Card::NONE },
+    QRow { ty: T::IQ1_S, name: "iq1_s", blck: 256, bytes: 50, dequant: false, host_act: H::None,
+           card: card!(KQuant        KQuant        Iq1s    (Iq1s, Q8Act)       Iq1s   -       -    -) },
     QRow { ty: T::IQ4_NL, name: "iq4_nl", blck: 32, bytes: 18, dequant: true, host_act: H::Q8_2X4,
            card: card!(-             -             -       (Iq4nl, Q8Blocks32) Iq4nl  -       -    -) },
     QRow { ty: T::IQ3_S, name: "iq3_s", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq3s    (Iq3s, Q8Act)       Iq3s   -       -    -) },
-    QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None, card: Card::NONE },
+    QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None,
+           card: card!(KQuant        KQuant        Iq2s    (Iq2s, Q8Act)       Iq2s   -       -    -) },
     QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  -       -    -) },
     // The C scalars: ggml.c:621-649.
@@ -124,7 +126,8 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::F64, name: "f64", blck: 1, bytes: 8, dequant: false, host_act: H::None, card: Card::NONE },
     // iq1_m: ggml-common.h:540. bf16 is one `uint16_t` (ggml.h:380, ggml.c:1485); ggml quantizes its
     // activations to bf16, a form this engine does not encode.
-    QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: false, host_act: H::None, card: Card::NONE },
+    QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: false, host_act: H::None,
+           card: card!(KQuant        KQuant        Iq1m    (Iq1m, Q8Act)       Iq1m   -       -    -) },
     QRow { ty: T::BF16, name: "bf16", blck: 1, bytes: 2, dequant: true, host_act: H::None,
            card: card!(Bf16AsF32     Bf16AsF32     -       -                   -      Bf16    Bf16 Bf16) },
     // Mainline's alone (llama.cpp 930e2fa59): block_tq1_0 ggml-common.h:281, block_tq2_0 :288, ggml.c:912/920.

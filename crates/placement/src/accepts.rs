@@ -136,6 +136,9 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GateUpEntry::Q6k
         | GateUpEntry::Iq2xxs
         | GateUpEntry::Iq2xs
+        | GateUpEntry::Iq2s
+        | GateUpEntry::Iq1s
+        | GateUpEntry::Iq1m
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
@@ -164,6 +167,9 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Q8_0
         | DownEntry::Iq2xxs
         | DownEntry::Iq2xs
+        | DownEntry::Iq2s
+        | DownEntry::Iq1s
+        | DownEntry::Iq1m
         | DownEntry::Iq3xxs
         | DownEntry::Iq3s
         | DownEntry::Iq4nl
@@ -179,9 +185,10 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
 /// gate·up arms ([`kernels::card_gate_up_runs`], and the Q8_0 and Q6_K arms the
 /// leg launches for the stacks no other family's plan reads) of the types whose
 /// prompt GEMM the table names ([`kernels::gemm`]). The wide arm reads that
-/// GEMM. IQ2_XXS, IQ3_S, IQ4_XS and Q6_K have one and the leg runs them.
-/// IQ2_XS and MXFP4, which have none, stay on the host by name; NVFP4 is not
-/// admitted (no qwen35 file or fixture proves it).
+/// GEMM. The i-quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M, IQ3_XXS, IQ3_S,
+/// IQ4_XS) and Q6_K have one and the leg runs them. MXFP4, which has none,
+/// stays on the host by name; NVFP4 is not admitted (no qwen35 file or fixture
+/// proves it).
 #[must_use]
 pub const fn prompt_leg_gate_up(ty: GgmlType) -> bool {
     (kernels::card_gate_up_runs(ty)
@@ -638,7 +645,7 @@ mod tests {
     /// layers whose graph the load's reference holds); a Q4_K, Q5_K, Q6_K,
     /// IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS or Q8_0 gate and up of one type with a
     /// Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0 or IQ4_NL
-    /// down are the rest of the common
+    /// down (IQ2_XS, IQ2_S, IQ1_S and IQ1_M also, on either side) are the rest of the common
     /// leg's ([`LegSplit::Common`]); every other triple, a gate and up of two
     /// types among them, is the host tier's. The sets are spelled out, so a
     /// type entering or leaving an arm goes red here. Mutant: the dispatch
@@ -646,10 +653,18 @@ mod tests {
     /// `Dispatch`.
     #[test]
     fn qwen35_leg_is_the_dispatch_for_its_types_and_the_common_leg_for_the_rest() {
-        use GgmlType::{IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
-        let gate_up = [Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS, Q8_0];
+        use GgmlType::{
+            IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q4_K, Q5_1, Q5_K,
+            Q6_K, Q8_0,
+        };
+        // PIN(2026-10-25): IQ2_XS, IQ2_S, IQ1_S and IQ1_M joined both arms with their prompt
+        // GEMMs (IQ2_XS had a gate·up and a down and no GEMM).
+        let gate_up = [
+            Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q8_0,
+        ];
         let down = [
-            Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0, IQ4_NL,
+            Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q5_1,
+            Q8_0, IQ4_NL,
         ];
         let dispatch_gate_up = [Q4_K, Q5_K];
         let dispatch_down = [Q4_K, Q5_K, Q6_K];
@@ -719,10 +734,12 @@ mod tests {
     }
 
     /// Qwen3.8's arms are the card leg's launches: a Q4_K, Q5_K, IQ2_XXS,
-    /// IQ3_XXS, IQ3_S, IQ4_XS or NVFP4 gate·up and a Q5_1, Q8_0, IQ4_NL or
-    /// NVFP4 down, no other type. Mutants: the prompt GEMM left out of the
-    /// gate·up (MXFP4 and IQ2_XS join it); the down's form left out (the
-    /// `Q8Act` downs join it).
+    /// IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M or NVFP4 gate·up and
+    /// a Q5_1, Q8_0, IQ4_NL or NVFP4 down, no other type. Mutants: the prompt
+    /// GEMM left out of the gate·up (MXFP4 joins it); the down's form left out
+    /// (the `Q8Act` downs join it).
+    // PIN(2026-10-25): the gate·up arm gains IQ2_XS, IQ2_S, IQ1_S and IQ1_M with
+    // their prompt GEMMs; the down arm is unchanged (their downs read `Q8Act`).
     #[test]
     fn qwen38_arms_are_its_legs_launches() {
         for ty in types() {
@@ -733,9 +750,13 @@ mod tests {
                     GgmlType::Q4_K
                         | GgmlType::Q5_K
                         | GgmlType::IQ2_XXS
+                        | GgmlType::IQ2_XS
                         | GgmlType::IQ3_XXS
+                        | GgmlType::IQ1_S
                         | GgmlType::IQ3_S
+                        | GgmlType::IQ2_S
                         | GgmlType::IQ4_XS
+                        | GgmlType::IQ1_M
                         | GgmlType::NVFP4
                 ),
                 "{ty} gate·up"
@@ -754,8 +775,8 @@ mod tests {
     /// The glm5next body's arms are the common leg's in the file's blocks and
     /// NVFP4's in its planes, its downs over either form, and its plan rule
     /// reads them part by part (NVFP4 in its planes, the rest in the file's
-    /// blocks): a Q4_K, Q5_K, MXFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS
-    /// or NVFP4 gate·up and those or a Q5_1, Q8_0 or IQ4_NL down; no Q6_K
+    /// blocks): a Q4_K, Q5_K, MXFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S,
+    /// IQ2_S, IQ4_XS, IQ1_M or NVFP4 gate·up and those or a Q5_1, Q8_0 or IQ4_NL down; no Q6_K
     /// down, which
     /// the host tier keeps. The common leg's plan, over 128-value buffers alone,
     /// keeps NVFP4 and the 32-value downs on the host. Mutants: glm5next's rule
@@ -764,18 +785,20 @@ mod tests {
     #[test]
     fn glm5next_arms_are_the_leg_with_planes_over_both_forms() {
         use GgmlType::{
-            IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, NVFP4, Q4_K, Q5_1, Q5_K, Q6_K,
-            Q8_0,
+            IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, NVFP4,
+            Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
         };
+        // PIN(2026-10-25): IQ2_S, IQ1_S and IQ1_M joined both arms with their gate·up and down
+        // entries.
         let gate_up = [
-            Q4_K, Q5_K, MXFP4, NVFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS,
+            Q4_K, Q5_K, MXFP4, NVFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M,
         ];
         // PIN(2026-10-22): Q6_K joined the down arm (`card_down_runs` runs it over the 128-value
         // form, which this body's buffers hold for the layers whose down reads it).
         // PIN(2026-10-23): IQ2_XXS joined both arms with its gate·up and down entries.
         let down = [
-            Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, MXFP4, NVFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S,
-            IQ4_XS,
+            Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, MXFP4, NVFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL,
+            IQ3_S, IQ2_S, IQ4_XS, IQ1_M,
         ];
         let arms = leg_arms(Program::Glm5nextBody).expect("a card leg");
         let RoutedRule::Leg {

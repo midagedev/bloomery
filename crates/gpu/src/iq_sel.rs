@@ -6,10 +6,13 @@
 //! UD-Q2_K_XL's, where gate·up and down are IQ2_XS, IQ3_XXS or IQ4_XS, of
 //! unsloth's GLM-5.3-Flash UD-IQ4_XS, whose gate·up stacks are IQ3_S, of
 //! Nemotron 3.5 Bolt's 24GB file, whose routed up and down stacks are IQ2_XXS
-//! (experts without a gate, so both run as one-stack entries), and of Muse
-//! Spark's, whose gated gate·up and down stacks are IQ2_XXS:
+//! (experts without a gate, so both run as one-stack entries), of Muse
+//! Spark's, whose gated gate·up and down stacks are IQ2_XXS, and of the
+//! low-bit sets that mix IQ1_S, IQ1_M and IQ2_S (ISTA's DeepSeek-V4.1-Flash
+//! 2.00 bpw set's IQ1_M experts, Unsloth's UD-IQ1_S and UD-IQ2_M):
 //!
-//! - `iq2_xxs_gate_up_sel`, `iq2_xs_gate_up_sel`, `iq3_xxs_gate_up_sel`,
+//! - `iq2_xxs_gate_up_sel`, `iq2_xs_gate_up_sel`, `iq2_s_gate_up_sel`,
+//!   `iq1_s_gate_up_sel`, `iq1_m_gate_up_sel`, `iq3_xxs_gate_up_sel`,
 //!   `iq3_s_gate_up_sel`, `iq4_xs_gate_up_sel`: the
 //!   [`crate::iq`] gate·up
 //!   with its rule as a launch argument ([`crate::kquant::act`]), one warp a
@@ -21,11 +24,13 @@
 //!   lane split, grid words, integer factors and fused multiply-adds as the
 //!   plane kernels — so a row's `g` equals `iq3_xxs_rows` /
 //!   `iq4_xs_rows` over `IqFormat::repack` of the same row, bit for bit;
-//!   only the reading differs (the raw-block windows below). IQ3_S has no
-//!   plane kernels: its row equals `iq.rs`'s host rule (`lane_partial_host`).
+//!   only the reading differs (the raw-block windows below). IQ3_S, IQ2_S,
+//!   IQ1_S and IQ1_M have no plane kernels: their rows equal `iq.rs`'s host
+//!   rule (`lane_partial_host`).
 //!   IQ2_XXS's entry fills the block's shared table ([`Iq2XxsTab`]) as its
 //!   `down_tab` entry does, ahead of any return.
-//! - `iq2_xs_gemv_sel`, `iq3_xxs_gemv_sel`, `iq3_s_gemv_sel`, `iq4_xs_gemv_sel`:
+//! - `iq2_xs_gemv_sel`, `iq2_s_gemv_sel`, `iq1_s_gemv_sel`, `iq1_m_gemv_sel`,
+//!   `iq3_xxs_gemv_sel`, `iq3_s_gemv_sel`, `iq4_xs_gemv_sel`:
 //!   the same
 //!   per-row dot as a down — slot `s` dots the rows of expert `sel[s]` with
 //!   column `s` of a [`Q8Act`] of at least `n_slots` columns (a
@@ -45,8 +50,8 @@
 //!
 //! Raw-block windows. A super-block of absolute row `ra` (the expert's row
 //! `sel[slot] · rows_per_expert + r`) starts at byte `ra · bb · n_sb + bb ·
-//! hb`, `bb` the format's block bytes (IQ2_XXS 66, IQ2_XS 74, IQ3_XXS 98, IQ3_S 110, IQ4_XS
-//! 136), and every field is read through whole words:
+//! hb`, `bb` the format's block bytes (IQ2_XXS 66, IQ2_XS 74, IQ2_S 82, IQ1_S 50, IQ1_M 56,
+//! IQ3_XXS 98, IQ3_S 110, IQ4_XS 136), and every field is read through whole words:
 //! - IQ2_XXS: `x` even; `d` as IQ3_XXS's, sub-block `ib`'s `idx` and `aux`
 //!   words (`x + 2 + 8·ib`) two windows over the words that hold its eight
 //!   bytes — the third word is the one holding the last byte, so no read
@@ -59,6 +64,24 @@
 //!   three words, its `aux` word (`x + 66 + 4·ib`) one window over two —
 //!   each `kquant::q8_0::q8_0_code(lo, hi, 8·(byte & 3))`, the parity-aware
 //!   extraction `q8_0_sel32` reads `block_q8_0`'s fields with.
+//! - IQ2_S: `x` even; `d` as IQ3_XXS's, sub-block `ib`'s four index bytes (`x +
+//!   2 + 4·ib`) and four sign bytes (`x + 34 + 4·ib`) one window over two words
+//!   each, its `qh` byte (`x + 66 + ib`) and scale byte (`x + 74 + ib`) one
+//!   shifted word each. Group `l` is its index byte plus bits `2l ..` of `qh`
+//!   as bits 8 and 9, signed by its raw sign byte; the factors `2(s & 15) + 1`
+//!   (groups 0, 1) and `2(s >> 4) + 1` (groups 2, 3) and the scale `d/8`.
+//! - IQ1_S: `x` even; `d` as IQ3_XXS's, sub-block `ib`'s four index bytes
+//!   (`x + 2 + 4·ib`) one window over two words and its `qh` halfword (`x +
+//!   34 + 2·ib`) half a word. The weights are int8 `8g ± 1` (the group's grid
+//!   values and the halfword's delta sign), the factor `2s + 1` (`s` bits
+//!   12..14) and the scale `d/8`: the integers ggml's `d·(2s + 1)·(g ± 1/8)`
+//!   is made of.
+//! - IQ1_M: 56-byte super-blocks are word-aligned; sub-block `ib`'s index
+//!   bytes are word `x/4 + ib`, its `qh` halfword half of word `x/4 + 8 + ib/2`
+//!   (a delta sign and three index bits a group, a nibble each), and the four
+//!   scale halfwords words `x/4 + 12` and `x/4 + 13`, from whose top nibbles
+//!   `d` is built; the two factors `2s + 1` are the 3-bit fields `6(ib & 1)`
+//!   and `6(ib & 1) + 3` of halfword `ib/2`.
 //! - IQ3_S: `x` even; `d` and the index bytes (`x + 2 + 8·ib`) as IQ3_XXS's;
 //!   sub-block `ib`'s `qh` byte (`x + 66 + ib`) and scale byte (`x + 106 + ib/2`,
 //!   nibble `ib & 1`) are one shifted word each, its four sign bytes (`x + 74 +
@@ -103,7 +126,8 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::hybrid::HOST;
 use crate::iq::{
-    ActCols, Iq2XxsTab, dp4_all, dp4_halves, iq2_group, iq2xxs_sub, iq3_group, iq3s_group, iq4_word,
+    ActCols, Iq2XxsTab, dp4_all, dp4_halves, iq1_group, iq1m_scale_bits, iq2_group, iq2s_group,
+    iq2xxs_sub, iq3_group, iq3s_group, iq4_word,
 };
 use crate::kquant::SelDown;
 use crate::kquant::act::{self, Act};
@@ -236,6 +260,169 @@ impl RawSb for Iq2Xxs {
     #[inline(always)]
     fn dot(wv: &[u32; 8], fac: i32, xw: &[u32; 8]) -> i32 {
         fac * dp4_all(wv, xw)
+    }
+}
+
+/// IQ2_S's raw super-block ([`RawSb`]).
+pub(crate) struct Iq2S;
+
+impl RawSb for Iq2S {
+    const BB: usize = 82;
+    type Fac = (i32, i32);
+    type Tab = ();
+
+    #[inline(always)]
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], (i32, i32), f32) {
+        let (at, sg, qa, sa) = (x + 2 + 4 * ib, x + 34 + 4 * ib, x + 66 + ib, x + 74 + ib);
+        // SAFETY: the whole super-block lies inside the stream by this fn's
+        // contract, and every word read below holds one of its bytes: x is
+        // even, so the f16 at x is one half of word x >> 2; the sub-block's
+        // four index bytes at .. at + 4 and four sign bytes sg .. sg + 4 lie
+        // inside it, so the two words of each window do; so do the qh byte qa
+        // and the scale byte sa.
+        let (dw, i0, i1, s0, s1, qw, sw) = unsafe {
+            (
+                *w.get_unchecked(x >> 2),
+                *w.get_unchecked(at >> 2),
+                *w.get_unchecked((at >> 2) + 1),
+                *w.get_unchecked(sg >> 2),
+                *w.get_unchecked((sg >> 2) + 1),
+                *w.get_unchecked(qa >> 2),
+                *w.get_unchecked(sa >> 2),
+            )
+        };
+        let d = half_bits_to_f32((dw >> (8 * (x & 2) as u32)) as u16) * 0.125;
+        let c = q8_0_code(i0, i1, 8 * (at & 3) as u32);
+        let sgn = q8_0_code(s0, s1, 8 * (sg & 3) as u32);
+        let qh = (qw >> (8 * (qa & 3) as u32)) & 0xff;
+        let s = (sw >> (8 * (sa & 3) as u32)) & 0xff;
+        let idx = |l: u32| ((c >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300);
+        let (w0, w1) = iq2s_group(idx(0), sgn);
+        let (w2, w3) = iq2s_group(idx(1), sgn >> 8);
+        let (w4, w5) = iq2s_group(idx(2), sgn >> 16);
+        let (w6, w7) = iq2s_group(idx(3), sgn >> 24);
+        (
+            [w0, w1, w2, w3, w4, w5, w6, w7],
+            ((2 * (s & 15) + 1) as i32, (2 * (s >> 4) + 1) as i32),
+            d,
+        )
+    }
+
+    #[inline(always)]
+    fn dot(wv: &[u32; 8], fac: (i32, i32), xw: &[u32; 8]) -> i32 {
+        let (s0, s1) = dp4_halves(wv, xw);
+        fac.0 * s0 + fac.1 * s1
+    }
+}
+
+/// IQ1_S's raw super-block ([`RawSb`]): int8 weights `8g ± 1` and the scale
+/// `2s + 1`, so `d/8` is its f32 scale.
+pub(crate) struct Iq1S;
+
+impl RawSb for Iq1S {
+    const BB: usize = 50;
+    type Fac = i32;
+    type Tab = ();
+
+    #[inline(always)]
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], i32, f32) {
+        let (at, qa) = (x + 2 + 4 * ib, x + 34 + 2 * ib);
+        // SAFETY: the whole super-block lies inside the stream by this fn's
+        // contract, and every word read below holds one of its bytes: x is
+        // even, so the f16 at x is one half of word x >> 2; the sub-block's
+        // four index bytes at .. at + 4 lie inside it, so the two words of
+        // their window do; qa is even, so the qh halfword at qa is one half
+        // of word qa >> 2.
+        let (dw, i0, i1, qw) = unsafe {
+            (
+                *w.get_unchecked(x >> 2),
+                *w.get_unchecked(at >> 2),
+                *w.get_unchecked((at >> 2) + 1),
+                *w.get_unchecked(qa >> 2),
+            )
+        };
+        let d = half_bits_to_f32((dw >> (8 * (x & 2) as u32)) as u16) * 0.125;
+        let c = q8_0_code(i0, i1, 8 * (at & 3) as u32);
+        let h = (qw >> (8 * (qa & 3) as u32)) & 0xffff;
+        let neg = h & 0x8000 != 0;
+        let idx = |l: u32| ((c >> (8 * l)) & 0xff) | (((h >> (3 * l)) & 7) << 8);
+        let (w0, w1) = iq1_group(idx(0), neg);
+        let (w2, w3) = iq1_group(idx(1), neg);
+        let (w4, w5) = iq1_group(idx(2), neg);
+        let (w6, w7) = iq1_group(idx(3), neg);
+        (
+            [w0, w1, w2, w3, w4, w5, w6, w7],
+            (2 * ((h >> 12) & 7) + 1) as i32,
+            d,
+        )
+    }
+
+    #[inline(always)]
+    fn dot(wv: &[u32; 8], fac: i32, xw: &[u32; 8]) -> i32 {
+        fac * dp4_all(wv, xw)
+    }
+}
+
+/// IQ1_M's raw super-block ([`RawSb`]): IQ1_S's weights with a delta sign per
+/// group and two scales a sub-block, one a 16-value half. Its 56 bytes keep
+/// every super-block word-aligned.
+pub(crate) struct Iq1M;
+
+impl RawSb for Iq1M {
+    const BB: usize = 56;
+    type Fac = (i32, i32);
+    type Tab = ();
+
+    #[inline(always)]
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], (i32, i32), f32) {
+        let wb = x >> 2;
+        // SAFETY: x is a multiple of 56, so wb is a word of the stream and the
+        // whole super-block (words wb .. wb + 14) lies inside it by this fn's
+        // contract: word wb + ib holds the sub-block's four index bytes, word
+        // wb + 8 + ib/2 its qh halfword, and words wb + 12 and wb + 13 the
+        // four scale halfwords.
+        let (c, qw, s01, s23) = unsafe {
+            (
+                *w.get_unchecked(wb + ib),
+                *w.get_unchecked(wb + 8 + (ib >> 1)),
+                *w.get_unchecked(wb + 12),
+                *w.get_unchecked(wb + 13),
+            )
+        };
+        let hq = (qw >> (16 * (ib & 1) as u32)) & 0xffff;
+        let sc: [u16; 4] = [
+            s01 as u16,
+            (s01 >> 16) as u16,
+            s23 as u16,
+            (s23 >> 16) as u16,
+        ];
+        let d = half_bits_to_f32(iq1m_scale_bits(sc)) * 0.125;
+        // Halfword ib/2 by select, not by index: a runtime index into `sc`
+        // would put it in local memory.
+        let sw = if ib >= 4 { s23 } else { s01 };
+        let three = ((sw >> (16 * ((ib >> 1) & 1) as u32)) & 0xffff) >> (6 * (ib & 1) as u32);
+        let group = |l: u32| {
+            let nib = (hq >> (4 * l)) & 15;
+            iq1_group(((c >> (8 * l)) & 0xff) | ((nib & 7) << 8), nib & 8 != 0)
+        };
+        let (w0, w1) = group(0);
+        let (w2, w3) = group(1);
+        let (w4, w5) = group(2);
+        let (w6, w7) = group(3);
+        (
+            [w0, w1, w2, w3, w4, w5, w6, w7],
+            (
+                (2 * (three & 7) + 1) as i32,
+                (2 * ((three >> 3) & 7) + 1) as i32,
+            ),
+            d,
+        )
+    }
+
+    #[inline(always)]
+    fn dot(wv: &[u32; 8], fac: (i32, i32), xw: &[u32; 8]) -> i32 {
+        let (s0, s1) = dp4_halves(wv, xw);
+        fac.0 * s0 + fac.1 * s1
     }
 }
 
@@ -782,7 +969,8 @@ pub fn iq4_nl_row_dot32_host(
 
 /// A gate·up launch ([`QuantSelKernels::enqueue_gate_up`]).
 pub struct IqGateUp<'a> {
-    /// The format of both stacks: IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS.
+    /// The format of both stacks: IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M, IQ3_XXS, IQ3_S or
+    /// IQ4_XS.
     pub ty: GgmlType,
     /// The gate stack: `n_experts · rows_per_expert` rows of the file's
     /// super-blocks as the KQuant word stream ([`stream_words`] words a
@@ -911,8 +1099,8 @@ fn stack_experts(
 }
 
 impl QuantSelKernels {
-    /// Enqueue the i-quant gate·up of `a.ty` (IQ2_XXS, IQ2_XS, IQ3_XXS,
-    /// IQ3_S or IQ4_XS):
+    /// Enqueue the i-quant gate·up of `a.ty` (IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S,
+    /// IQ1_M, IQ3_XXS, IQ3_S or IQ4_XS):
     /// slot `s` writes `h[s · rows_per_expert ..][..rows_per_expert]` as
     /// `a.rule` over the rows of expert `sel[s]` of both stacks dotted with
     /// column `s / slots_per_col` of `a.act` (module doc for [`HOST`] and ids
@@ -995,8 +1183,8 @@ impl QuantSelKernels {
         self.launch_raw_gate_up(stream, a.ty, grid, &launch, fault, h)
     }
 
-    /// Enqueue the i-quant down `_sel` of `ty` (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S or
-    /// IQ4_XS) over a [`Q8Act`]: slot `s` writes `y[s · rows_per_expert
+    /// Enqueue the i-quant down `_sel` of `ty` (IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M,
+    /// IQ3_XXS, IQ3_S or IQ4_XS) over a [`Q8Act`]: slot `s` writes `y[s · rows_per_expert
     /// ..][..rows_per_expert]` as the rows of expert `sel[s]` dotted with
     /// column `s` of `a.act` (module doc for [`HOST`] and ids past the stack,
     /// which raise on `fault`). `a.act` may hold more columns than the slots

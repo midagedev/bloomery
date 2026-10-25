@@ -151,6 +151,10 @@ generate_ds41   gdn_delta_lanes                          0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
+generate_ds41   gemm_iq1m                                0           0
+generate_ds41   gemm_iq1s                                0           0
+generate_ds41   gemm_iq2s                                0           0
+generate_ds41   gemm_iq2xs                               0           0
 generate_ds41   gemm_iq2xxs              0  0
 # PIN(2026-10-25): 0 -> 8 spill bytes and 0 -> 8 JIT local bytes (sm_86 ptxas 13.3.73 and the cc 8.6 JIT of the
 # release batch's A6000). 7d4d5f6d8 (juliankang4) walks a plain tile twice: in F32, then exactly for a tile that
@@ -267,6 +271,12 @@ generate_ds41   head_norm_neox_append_q8                 0           0
 generate_ds41   head_norm_neox_append_rows               0           0
 generate_ds41   index_key_ln_append                      0           0
 generate_ds41   index_pool                               0           0
+generate_ds41   iq1_m_gate_up_sel                        0           0
+generate_ds41   iq1_m_gemv_sel                           0           0
+generate_ds41   iq1_s_gate_up_sel                        0           0
+generate_ds41   iq1_s_gemv_sel                           0           0
+generate_ds41   iq2_s_gate_up_sel                        0           0
+generate_ds41   iq2_s_gemv_sel                           0           0
 generate_ds41   iq2_xs_gate_up_sel                       0           0
 generate_ds41   iq2_xs_gemv_sel                          0           0
 generate_ds41   iq2_xs_rows                              0           0

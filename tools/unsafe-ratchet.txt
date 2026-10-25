@@ -552,7 +552,11 @@ gguf 7 2 0
 # PIN(2026-10-24): gpu 2414 -> 2418 blocks, new code, not old code relaxed: the two branch pins the rebase onto main
 # folded away, the four-slot tier handoff (ds41_ffn_handoff_4_tier, +2) and Muse's attention branch (its fork and join,
 # +2); 2331 + 83 + 2 + 2, recounted by tools/check-unsafe.sh.
-gpu 2417 311 10
+# PIN(2026-10-25): gpu 2417 -> 2429 blocks, new code, not old code relaxed: the card kernels of IQ2_S, IQ1_S and IQ1_M and
+# the prompt GEMM of IQ2_XS, IQ2_S, IQ1_S and IQ1_M: five grid-table reads in iq.rs (`iq2xs_grid_half`, `iq2s_grid_half`,
+# `iq2s_group`, `iq1_group`, `iq1_group_half`), the three raw-block window reads of iq_sel.rs (`RawSb::sub` of the
+# three) and the four load macros of grouped.rs, each with its SAFETY line; recounted by tools/check-unsafe.sh.
+gpu 2429 311 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
