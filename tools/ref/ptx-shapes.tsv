@@ -109,6 +109,7 @@ generate_ds41   ds41_q3k_gemv_heads_groups               0           0
 generate_ds41   ds41_q3k_gemv_heads_mcol                 0           0
 generate_ds41   ds41_q5k_gemv_f32                        0           0
 generate_ds41   ds41_q5k_gemv_f32_mcol                   0           0
+generate_ds41   ds41_q5k_gemv_heads                      0           0
 generate_ds41   ds41_r8_q3k                              0           0
 generate_ds41   ds41_r8_q3k_groups                       0           0
 generate_ds41   ds41_ring_commit                         0           0
@@ -119,6 +120,7 @@ generate_ds41   ds41_rows_to_tokens                      0           0
 generate_ds41   ds41_shexp_gate_up                       0           0
 generate_ds41   ds41_shexp_gate_up_q3k                   0           0
 generate_ds41   ds41_shexp_gate_up_q3k_mcol              0           0
+generate_ds41   ds41_shexp_gate_up_q5k                   0           0
 generate_ds41   ds41_shexp_gate_up_q8_0_mcol             0           0
 generate_ds41   ds41_tap_means                           0           0
 generate_ds41   embed_rows                               0           0

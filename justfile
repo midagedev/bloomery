@@ -2454,9 +2454,13 @@ gate-gpu-ds41-chain-attn:
 # cache, compressor state and history equal the steps in turn, eager and replayed, and after a rollback (t+1 refused)
 # one step of another token equals the steps. --skew-api: the engine's entry (step_pair, rollback), graph and eager,
 # then the deep cuts. One load.
+# --feed, alone after --slots, on a load at the default levers: a file whose batch-read tensors are all Q3_K is fed by the
+# prompt batch with no refusal; any other file is fed as steps, `Body::batch_refusal` names a tensor that decided it, and its
+# prompt call is the same ids stepped one by one (the last token and the snapshot). Under BLOOMERY_FIXTURE_VARIANT=istadense
+# (ISTA's dense types) every clause above reads that file's own oracle sets, `fx_istadense_...`.
 [group('v41-load')]
 gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to

@@ -341,11 +341,12 @@ mod gate {
         ppl: Option<String>,
         skew: skew::Clauses,
         slots: bool,
+        feed: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--ppl TAG] \
-             [--skew-structure] [--skew-sets] [--skew-api] [--slots]";
+             [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed]";
         let mut a = Args {
             structure: false,
             sets: false,
@@ -357,6 +358,7 @@ mod gate {
                 api: false,
             },
             slots: false,
+            feed: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -368,6 +370,7 @@ mod gate {
                 "--skew-sets" => a.skew.sets = true,
                 "--skew-api" => a.skew.api = true,
                 "--slots" => a.slots = true,
+                "--feed" => a.feed = true,
                 "--ppl" => {
                     a.ppl = Some(
                         it.next()
@@ -378,8 +381,15 @@ mod gate {
             }
         }
         let others = a.structure || a.sets || a.select || a.ppl.is_some() || a.skew.any();
-        if !(others || a.slots) {
+        if !(others || a.slots || a.feed) {
             return Err(USAGE.into());
+        }
+        if a.feed && (others || a.slots) {
+            return Err(format!(
+                "--feed beside another clause: it loads at the default levers, where the others \
+                 pin the steps feed; run it alone: {USAGE}"
+            )
+            .into());
         }
         if others && a.slots {
             return Err(format!(
@@ -420,6 +430,22 @@ mod gate {
         cfg.place = tier::plan_levers(&split, &levers, 0)?;
         let hp = Hparams::read(&split)?;
         let inputs = PlanInputs::read(&split)?;
+        if args.feed {
+            crate::ds41_tier::sc(
+                "--feed: the file's prompt feed at the default levers, and a refused batch's steps",
+            )?;
+            let mut feed_cfg = body::OpenCfg::from_levers(&levers)?;
+            feed_cfg.place = tier::plan_levers(&split, &levers, 0)?;
+            let ok = feed_run(&path, &split, &hp, &feed_cfg)?;
+            tier::expect_fixture_oracle("gate_deepseek41_step", fixture_oracle_declared(&args))?;
+            println!("gate_deepseek41_step: {}", tier::tally_line());
+            return if ok {
+                println!("PASSED: gate_deepseek41_step --feed");
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
         if args.slots {
             crate::ds41_tier::sc(
                 "--slots: the slot harness's contracts on a load of two sequences",
@@ -566,6 +592,114 @@ mod gate {
     fn fixture_oracle_declared(args: &Args) -> usize {
         usize::from(args.sets) * FIXTURE_ORACLE_SETS
             + usize::from(args.select) * FIXTURE_ORACLE_SELECT
+    }
+
+    // ------------------------------------------------------------ the feed
+
+    /// The tensors of the file the prompt batch's launches read as Q3_K rows
+    /// (`AttnChain::batch_formats`), with their types, where the type is
+    /// another: a file with any is fed its prompts as steps.
+    fn batch_offenders(split: &Split, hp: &Hparams) -> Result<Vec<(String, GgmlType)>, GateError> {
+        let mut out = Vec::new();
+        for l in 0..hp.n_layer {
+            for name in [
+                names::attn_q_a(l),
+                names::attn_kv(l),
+                names::attn_q_b(l),
+                names::attn_output_a(l),
+                names::attn_output_b(l),
+                names::hc_attn_fn(l),
+                names::attn_compressor_kv(l),
+                names::attn_compressor_gate(l),
+                names::indexer_proj(l),
+                names::indexer_attn_q_b(l),
+                names::indexer_attn_k(l),
+            ] {
+                if let Some((_, t)) = split.find(&name)
+                    && t.ty != GgmlType::Q3_K
+                {
+                    out.push((name, t.ty));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `--feed`: a load at the default levers feeds prompts as the file allows.
+    /// A file whose batch-read tensors are all Q3_K is fed by the batch with no
+    /// refusal. Any other loads, feeds steps and names the tensor that decided
+    /// it (`Body::batch_refusal`), and its prompt call is the same ids stepped
+    /// one by one: the same last token and the same snapshot.
+    fn feed_run(
+        path: &str,
+        split: &Split,
+        hp: &Hparams,
+        cfg: &body::OpenCfg,
+    ) -> Result<bool, GateError> {
+        const WHAT: &str = "gate_deepseek41_step feed";
+        let offenders = batch_offenders(split, hp)?;
+        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let mut m = body::open(
+            file,
+            crate::gate_card::plan_gate,
+            usize::try_from(CTX_MAX)?,
+            cfg,
+        )?;
+        body::prepare_prefill(&mut m)?;
+        let (mode, why) = {
+            let b = m.body(WHAT)?;
+            (b.prefill_mode(), b.batch_refusal().map(str::to_owned))
+        };
+        let Some((first, ty)) = offenders.first() else {
+            let ok = mode == PrefillMode::Batch && why.is_none();
+            println!(
+                "feed: every batch-read tensor is Q3_K; feed {mode:?}, refusal {why:?}, want Batch \
+                 and none: {}",
+                verdict(ok)
+            );
+            return Ok(ok);
+        };
+        let named = why
+            .as_deref()
+            .is_some_and(|w| offenders.iter().any(|(n, _)| w.contains(n.as_str())));
+        let steps = mode == PrefillMode::Steps && named;
+        println!(
+            "feed: {} batch-read tensors are not Q3_K (first {first} {ty}); feed {mode:?}, \
+             refusal {why:?}, want Steps and a refusal that names one: {}",
+            offenders.len(),
+            verdict(steps)
+        );
+        let ids = &SLOT_PROMPTS[0];
+        let (call, last) = ids.split_at(ids.len() - 1);
+        m.reset()?;
+        <Body as Prompt>::prompt(&mut m, call)?;
+        let called = (m.step(last)?, snap_hash(&mut m)?);
+        m.reset()?;
+        let mut walked = 0;
+        for id in ids {
+            walked = m.step(std::slice::from_ref(id))?;
+        }
+        let walked = (walked, snap_hash(&mut m)?);
+        let same = called == walked;
+        println!(
+            "feed: the prompt call of {} ids and a step is the {} ids stepped (last token {} / {}, \
+             snapshot {:016x} / {:016x}): {}",
+            call.len(),
+            ids.len(),
+            called.0,
+            walked.0,
+            called.1,
+            walked.1,
+            verdict(same)
+        );
+        Ok(steps && same)
+    }
+
+    /// A digest of the model's snapshot, every part a save copies.
+    fn snap_hash(m: &mut Deepseek41Model) -> Result<u64, GateError> {
+        let mut h = DefaultHasher::new();
+        body::snapshot(m)?.hash(&mut h);
+        Ok(h.finish())
     }
 
     // ----------------------------------------------------------- the slots
@@ -2745,7 +2879,7 @@ mod gate {
         let (ok_topo, ok_shadow, ok_arrival) = {
             let (gpu, w, body) = m.body_parts("structure")?;
             let graph = step_graph(gpu, w, body, head)?;
-            let ok_topo = hc_branch(&graph, &body.layers());
+            let ok_topo = hc_branch(&graph, &body.layers(), split)?;
             let prefetch = gpu.row_prefetch();
             let ok_arrival = rows_arrival(&graph, body, split, hp, prefetch)?;
             (
@@ -2893,8 +3027,11 @@ mod gate {
     /// `ds41_hc_post` before the go with two dependencies. The step holds
     /// exactly one such fork and one such join per layer and no node has
     /// more than two edges on a side.
-    fn hc_branch(g: &Captured, layers: &std::ops::Range<usize>) -> bool {
-        const PRE: &str = "ds41_hc_pre";
+    fn hc_branch(
+        g: &Captured,
+        layers: &std::ops::Range<usize>,
+        split: &Split,
+    ) -> Result<bool, GateError> {
         const POST: &str = "ds41_hc_post";
         let mem: Vec<usize> = (0..g.nodes.len())
             .filter(|&i| host_batch(&g.nodes[i]))
@@ -2905,17 +3042,18 @@ mod gate {
                 mem.len(),
                 layers.len()
             );
-            return false;
+            return Ok(false);
         }
         let mut ok = true;
         for (k, l) in layers.clone().enumerate() {
             let start = if k == 0 { 0 } else { mem[2 * k - 1] + 1 };
+            let pre = shadow::hc_pre_kernel(split, &names::hc_attn_fn(l))?;
             let pres: Vec<usize> = (start..mem[2 * k])
-                .filter(|&i| g.kernel(i) == Some(PRE))
+                .filter(|&i| g.kernel(i) == Some(pre))
                 .collect();
             let &[a] = pres.as_slice() else {
                 println!(
-                    "topology layer={l}: {} {PRE} between the previous wait and the go, want 1 \
+                    "topology layer={l}: {} {pre} between the previous wait and the go, want 1 \
                      (the attention's): FAIL",
                     pres.len()
                 );
@@ -2937,7 +3075,7 @@ mod gate {
             let ok_post = post.is_some_and(|h| g.deps[h].len() == 2 && h < mem[2 * k]);
             let good = ok_body && ok_post;
             println!(
-                "topology layer={l} attention {PRE} (node {a}) depends on [{}], is depended on by \
+                "topology layer={l} attention {pre} (node {a}) depends on [{}], is depended on by \
                  [{}]; body's first kernel [{}] depends on [{}]; {POST} depends on [{}]: {}",
                 labels(g, deps),
                 labels(g, after),
@@ -2964,7 +3102,7 @@ mod gate {
             layers.len(),
             verdict(ok_count)
         );
-        ok && ok_count
+        Ok(ok && ok_count)
     }
 
     /// Each node's region: the host tier's batch `2i` is layer `layers[i]`'s
@@ -3438,6 +3576,36 @@ mod gate {
         if s > 0.0 { e / s } else { 0.0 }
     }
 
+    /// Relative variance of bf16 rounding (to nearest even) of `x`, exact: the
+    /// rounding ik applies to the activation of a BF16 weight, where ours
+    /// reads the f32 values.
+    fn v_bf16(x: &[f32]) -> f64 {
+        let (mut e, mut s) = (0.0f64, 0.0f64);
+        for &v in x {
+            let bits = v.to_bits();
+            let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000;
+            let r = f64::from(v) - f64::from(f32::from_bits(rounded));
+            e += r * r;
+            s += f64::from(v) * f64::from(v);
+        }
+        if s > 0.0 { e / s } else { 0.0 }
+    }
+
+    /// Relative variance of the activation rounding ik applies over `x` beyond
+    /// ours at a projection of type `ty`: a q3_K's q8_K against our q8_1 per 256
+    /// and 128 values, a BF16's bf16 against our f32. Another type is refused by
+    /// name: no term is derived for it.
+    fn v_proj_in(ty: GgmlType, x: &[f32]) -> Result<f64, GateError> {
+        match ty {
+            GgmlType::Q3_K => Ok(v_q8(x, 256) + v_q8(x, 128)),
+            GgmlType::BF16 => Ok(v_bf16(x)),
+            other => Err(format!(
+                "no envelope term is derived for a {other} projection over the normed input"
+            )
+            .into()),
+        }
+    }
+
     fn sumsq(x: &[f32]) -> f64 {
         x.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
     }
@@ -3495,7 +3663,7 @@ mod gate {
     /// through `comb` (the streams' spread `κ`) and `post` (`g`). `v_swap` is
     /// the relative variance a list swap adds at the attention's output.
     fn term(
-        set: &Set,
+        (set, split): (&Set, &Split),
         hp: &Hparams,
         stage: Stage,
         l: usize,
@@ -3507,7 +3675,19 @@ mod gate {
             let p: f64 = post.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
             p * sumsq(y) / sumsq(s)
         };
-        let mix = |hn: &[f32]| v_q8(hn, 256) + v_q8(hn, 128);
+        // The hyper-connection fn's mixes: a q3_K one reads ik's q8_K against our q8_1 of the
+        // normed streams, an f32 one both engines' f32 (no rounding differs).
+        let mix = |hn: &[f32], name: String| -> Result<f64, GateError> {
+            let ty = split
+                .find(&name)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| format!("{name} is not in the file"))?;
+            match ty {
+                GgmlType::Q3_K => Ok(v_q8(hn, 256) + v_q8(hn, 128)),
+                GgmlType::F32 => Ok(0.0),
+                other => Err(format!("no envelope term is derived for a {other} {name}").into()),
+            }
+        };
         match stage {
             Stage::Attn => {
                 let (hc, hn) = hc_pre(man, &names::hc_attn_scale(l))?;
@@ -3518,7 +3698,13 @@ mod gate {
                     + v_q8_2(&named(man, &n("attn_wo_a"))?);
                 let k = &hp.layers[l];
                 if k.compressor.is_some() && k.stream.is_some_and(|s| s.kv_source == l) {
-                    v += v_q8(&x, 256) + v_q8(&x, 128);
+                    let ty = split
+                        .find(&names::attn_compressor_kv(l))
+                        .map(|(_, t)| t.ty)
+                        .ok_or_else(|| {
+                            format!("layer {l}: the compressor's kv is not in the file")
+                        })?;
+                    v += v_proj_in(ty, &x)?;
                 }
                 let fattn = named(man, &n("fattn"))?;
                 let band = if man.tensor(&n("mask_to_idx"), 0).is_ok() {
@@ -3532,7 +3718,7 @@ mod gate {
                 let y = named(man, &n("attn_out"))?;
                 let s = named(man, &n("hc_attn_post"))?;
                 let g = g2(&hc[4..8], &y, &s);
-                Ok((v * g, mix(&hn) * (spread2(&hn) + g)))
+                Ok((v * g, mix(&hn, names::hc_attn_fn(l))? * (spread2(&hn) + g)))
             }
             Stage::Ffn => {
                 let (hc, hn) = hc_pre(man, &names::hc_ffn_scale(l))?;
@@ -3547,7 +3733,7 @@ mod gate {
                 let y = named(man, &n("ffn_out"))?;
                 let s = named(man, &n("l_out"))?;
                 let g = g2(&hc[4..8], &y, &s);
-                Ok((v * g, mix(&hn) * (spread2(&hn) + g)))
+                Ok((v * g, mix(&hn, names::hc_ffn_fn(l))? * (spread2(&hn) + g)))
             }
             Stage::Engram => {
                 let rows = named(man, &n("engram_embd"))?;
@@ -3631,7 +3817,7 @@ mod gate {
             if let (Some(a), Some(b)) = (&o.fold, &f_ref) {
                 fold_prev = rel(a, b);
             }
-            let (body_term, mix_term) = term(set, hp, o.stage, o.layer, v_swap)?;
+            let (body_term, mix_term) = term((set, split), hp, o.stage, o.layer, v_swap)?;
             let r = rel(&o.streams, &s_ref);
             let bound = (r_prev * r_prev + body_term + mix_term).sqrt();
             let ratio = if bound > 0.0 {
@@ -3986,8 +4172,19 @@ mod gate {
                     .find(|r| r.op == "SCALE" && r.src0.as_deref() == Some(w_name.as_str()))
                     .ok_or_else(|| format!("no SCALE of {w_name}"))?,
             )?;
-            let rho_q = Z * (r_fold * r_fold + v_q8_2(&x) + v_q8_2(&qr)).sqrt();
-            let rho_w = Z * (r_fold * r_fold + v_q8(&x, 256) + v_q8(&x, 128)).sqrt();
+            let ty_of = |name: String| {
+                split
+                    .find(&name)
+                    .map(|(_, t)| t.ty)
+                    .ok_or_else(|| format!("{name} is not in the file"))
+            };
+            let v_qr = match ty_of(names::indexer_attn_q_b(l))? {
+                GgmlType::BF16 => v_bf16(&qr),
+                _ => v_q8_2(&qr),
+            };
+            let v_w = v_proj_in(ty_of(names::indexer_proj(l))?, &x)?;
+            let rho_q = Z * (r_fold * r_fold + v_q8_2(&x) + v_qr).sqrt();
+            let rho_w = Z * (r_fold * r_fold + v_w).sqrt();
             let (q_rel, w_rel) = (rel(&ix.q, &ik_q), rel(&ix.w, &ik_w));
             let inputs = q_rel <= rho_q && w_rel <= rho_w;
             if st.index_key_source == l {

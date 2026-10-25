@@ -261,7 +261,7 @@ pub static NEED: Kind = Kind {
 pub static LOAD: Kind = Kind {
     name: "load",
     head: "load",
-    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds.",
+    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds; prefill_refusal, when the batch feed was asked for and the load fed prompts as steps, the refusal of the first layer tensor the batch's launches do not read.",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("shadow", Word, ""),
@@ -280,6 +280,7 @@ pub static LOAD: Kind = Kind {
         key("pinned", Bool, ""),
         key("prefill", Word, ""),
         key("ced", Text, ""),
+        opt("prefill_refusal", Text, ""),
         key("group", U64, "batches"),
         lit(" in "),
         pos("load_s", F64(1), "s"),

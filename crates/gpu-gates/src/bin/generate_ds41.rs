@@ -2056,7 +2056,8 @@ mod drive {
             if let Some((card, rate)) = &self.lane {
                 record::lane(card, rate).print();
             }
-            load.u("ctx", a.ctx)
+            let load = load
+                .u("ctx", a.ctx)
                 .u("layers", hp.n_layer)
                 .u("top_k", top_k)
                 .w("mode", mode_name(a.mode))
@@ -2071,8 +2072,12 @@ mod drive {
                         b.prefill_mode().name()
                     },
                 )
-                .w("ced", b.ced())
-                .u("group", b.prefill_group_lever())
+                .w("ced", b.ced());
+            let load = match b.batch_refusal() {
+                Some(why) => load.w("prefill_refusal", why),
+                None => load,
+            };
+            load.u("group", b.prefill_group_lever())
                 .f("load_s", total.as_secs_f64())
                 .print();
             if let Some(times) = m.load_times() {

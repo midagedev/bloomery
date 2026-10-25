@@ -1,0 +1,15 @@
+# Round qt-dense (card for the dump sitting): ik's CPU node dumps on the istadense fixture variant
+# (/models/fixture-variants/istadense/v41/, V4.1's fixture with ISTA-DASLab's dense types: attn_q_a and attn_kv Q8_0, attn_q_b,
+# attn_output_a, attn_output_b and the shared expert Q5_K, the compressor's and indexer's matrices BF16, hc_attn_fn and
+# hc_ffn_fn F32: tools/fixture-variants.tsv), so gate_deepseek41_step's FixtureOracle clauses on the variant have their sets.
+# The precedent is glmffnkq-dump.card. Four dumps, each `BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=istadense just
+# dump-ref-fixture deepseek41 <step4|d1n|d1|d2>-every-node` under this card, one lease each, the d2 set first as
+# fxoracle-dump.card orders them. Nothing is timed. The dumpers are main's shared bin/; the variant changes the file, not the dumper.
+# Minutes [derived from fxoracle-dump.card's measured terms]: fixed 3-15 s a lease take x 4 = 0.2-1.0 min; V4.1 step4, d1n, d1
+# and d2 every-node 0.05-0.3 min each = 0.2-1.2 min; so 0.4-2.2 min, rounded up to 1..6 for a cold read of the 15 GB variant.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads (CUDA hidden, no card); beside a timed run or a gate batch it would take their
+  cores and memory bandwidth, and the profile takes the lease for every dump; why now: the V4.1 dense types ISTA ships
+  (Q5_K matrices, BF16 compressor/indexer matrices, F32 hyper-connection fns) have no oracle sets on a variant, so their
+  FixtureOracle clauses and the site mutants cannot run
+minutes: 1..6

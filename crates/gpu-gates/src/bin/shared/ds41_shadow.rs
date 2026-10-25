@@ -32,18 +32,28 @@ fn projection(
     }
 }
 
+/// The HC_PRE kernel that reads hyper-connection fn `name`: the q3_K split-K
+/// walk's, or the f32 table's.
+pub fn hc_pre_kernel(split: &Split, name: &str) -> Result<&'static str, GateError> {
+    match type_of(split, name)? {
+        GgmlType::Q3_K => Ok("ds41_hc_pre"),
+        GgmlType::F32 => Ok("ds41_hc_pre_f32"),
+        other => Err(format!("{name}: {other} has no hyper-connection kernel").into()),
+    }
+}
+
 /// The MoE piece's own work in layer `l`'s host-leg shadow, in stream order:
-/// HC_PRE, with card experts the routed gate·up, the q8_1 of h's card-slot
-/// columns and the routed down, then the shared expert's gate·up
-/// (`ds41_shexp_gate_up`, or its q3_K twin when both weights are q3_K) and
-/// down ([`projection`]).
+/// HC_PRE ([`hc_pre_kernel`]), with card experts the routed gate·up, the q8_1
+/// of h's card-slot columns and the routed down, then the shared expert's
+/// gate·up (`ds41_shexp_gate_up`, or its q3_K or q5_K twin when both weights
+/// are of that type) and down ([`projection`]).
 pub fn shadow_kernels(
     split: &Split,
     l: usize,
     card_experts: bool,
     prefetch: bool,
 ) -> Result<Vec<&'static str>, GateError> {
-    let mut k = vec!["ds41_hc_pre"];
+    let mut k = vec![hc_pre_kernel(split, &names::hc_ffn_fn(l))?];
     if card_experts {
         // PIN(2026-09-26, fixup6): q3k_quantize_q8_1 → q8_1_quantize_sel, same launch count.
         // h's q8_1 covers the card slots' columns alone: a column the host serves
@@ -62,10 +72,10 @@ pub fn shadow_kernels(
     }
     let gate = type_of(split, &names::ffn_gate_shexp(l))?;
     let up = type_of(split, &names::ffn_up_shexp(l))?;
-    k.push(if (gate, up) == (GgmlType::Q3_K, GgmlType::Q3_K) {
-        "ds41_shexp_gate_up_q3k"
-    } else {
-        "ds41_shexp_gate_up"
+    k.push(match (gate, up) {
+        (GgmlType::Q3_K, GgmlType::Q3_K) => "ds41_shexp_gate_up_q3k",
+        (GgmlType::Q5_K, GgmlType::Q5_K) => "ds41_shexp_gate_up_q5k",
+        _ => "ds41_shexp_gate_up",
     });
     let down = names::ffn_down_shexp(l);
     k.extend(projection(type_of(split, &down)?, &down, prefetch)?);
