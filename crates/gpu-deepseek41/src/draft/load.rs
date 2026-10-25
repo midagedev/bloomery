@@ -11,7 +11,7 @@
 //! - from the target's file, the head's Q6_K projection (`output.weight`,
 //!   [`Borrow::Copied`]) and one embedding row, the mask token's
 //!   ([`Borrow::RowSource`]: the block's other rows are read per pass), as
-//!   the file stores it ([`EmbdRows`]: bf16, or Q3_K super-blocks).
+//!   the file stores it ([`EmbdRows`]: bf16, or Q3_K or Q5_K super-blocks).
 //!
 //! The file is checked against [`dspark::inventory`] before anything is
 //! uploaded: an absent, misshapen or unread tensor is refused by name.
@@ -30,71 +30,17 @@ use model::arch::models::shape::{MoeShape, rules, select_router};
 use model::embed::RowLayout;
 use model::placement::CardFormat;
 
+use crate::chain::glue::EmbdRows;
 use crate::experts_mxfp4::ROUTER_ROW;
 use crate::markov::MARKOV_ROW_WORDS;
 
 const WHAT: &str = "draft::load";
 
-/// Values of one Q3_K super-block.
-const Q3_K_BLOCK: usize = 256;
-
-/// How the target's `token_embd` rows sit in its file, and so in the draft's
-/// buffers and images: the file's bytes, a row's words from its first byte.
-/// The card decodes them with the target's own glue entries — bf16 widened
-/// exactly, Q3_K by `elem::q3k_embed_value` — so a draft row and the target's
-/// row of the same id are the same f32.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EmbdRows {
-    /// Two bf16 to a word, the low half first ([`CardFormat::Bf16Raw`]).
-    Bf16,
-    /// Q3_K super-blocks, 110 bytes each ([`CardFormat::KQuant`]); the last
-    /// word of a row with an odd super-block count is zero-padded.
-    Q3K,
-}
-
-impl EmbdRows {
-    /// The row format of a `token_embd` of type `ty` with rows of `n_embd`
-    /// values; `None` for any other type, and for a Q3_K row that is not
-    /// whole super-blocks.
-    #[must_use]
-    pub fn of(ty: GgmlType, n_embd: usize) -> Option<EmbdRows> {
-        match ty {
-            GgmlType::BF16 => Some(EmbdRows::Bf16),
-            GgmlType::Q3_K if n_embd.is_multiple_of(Q3_K_BLOCK) => Some(EmbdRows::Q3K),
-            _ => None,
-        }
-    }
-
-    /// The file bytes of one row of `n_embd` values.
-    #[must_use]
-    pub fn row_bytes(self, n_embd: usize) -> usize {
-        let ty = self.ty();
-        match (ty.blck_size(), ty.type_size()) {
-            (Some(blck), Some(size)) => size as usize * (n_embd / blck as usize),
-            _ => unreachable!("bf16 and Q3_K are sized types"),
-        }
-    }
-
-    /// The u32 words one row takes in a buffer or an image.
-    #[must_use]
-    pub fn row_words(self, n_embd: usize) -> usize {
-        self.row_bytes(n_embd).div_ceil(4)
-    }
-
-    /// The card format the mask row is held in.
-    fn card_format(self) -> CardFormat {
-        match self {
-            EmbdRows::Bf16 => CardFormat::Bf16Raw,
-            EmbdRows::Q3K => CardFormat::KQuant,
-        }
-    }
-
-    /// The file type these rows are.
-    fn ty(self) -> GgmlType {
-        match self {
-            EmbdRows::Bf16 => GgmlType::BF16,
-            EmbdRows::Q3K => GgmlType::Q3_K,
-        }
+/// The card format a mask row in `embd`'s format is held in.
+fn mask_card_format(embd: EmbdRows) -> CardFormat {
+    match embd {
+        EmbdRows::Bf16 => CardFormat::Bf16Raw,
+        EmbdRows::Q3K | EmbdRows::Q5K => CardFormat::KQuant,
     }
 }
 
@@ -187,8 +133,7 @@ fn upload_mask_row(
 ) -> Result<DeviceTensor<u32>, GpuError> {
     let shape = |detail: String| GpuError::Shape { what: WHAT, detail };
     let words = embd.row_words(n_embd);
-    let size = embd
-        .card_format()
+    let size = mask_card_format(embd)
         .resident_bytes(embd.ty(), n_embd as u64, 1)
         .ok_or_else(|| shape(format!("{name}: a row of {n_embd} has no {embd:?} layout")))?;
     if bytes.len() != embd.row_bytes(n_embd) || size != 4 * words as u64 {
@@ -393,7 +338,7 @@ impl Uploads {
                     detail: format!("{}: rows of {}", b.name, b.dims[0]),
                 })?;
                 let embd = EmbdRows::of(b.ty, n_embd)
-                    .filter(|e| e.card_format() == f)
+                    .filter(|e| mask_card_format(*e) == f)
                     .ok_or_else(|| missing(b.name.clone(), "a card format for its use"))?;
                 let (row, _) = embedding_row(target, &b.name, n_embd, mask_token)?;
                 let t = upload_mask_row(stream, &b.name, row, embd, n_embd)?;
@@ -402,6 +347,7 @@ impl Uploads {
                 let label = match embd {
                     EmbdRows::Bf16 => "bf16_raw (mask row)",
                     EmbdRows::Q3K => "q3k_row (mask row)",
+                    EmbdRows::Q5K => "q5k_row (mask row)",
                 };
                 (label, v)
             }
@@ -747,7 +693,7 @@ pub(super) fn embedding_row<'a>(
     let embd = EmbdRows::of(layout.ty(), k).ok_or_else(|| GpuError::Shape {
         what: WHAT,
         detail: format!(
-            "{name} is {}; the draft reads bf16 or Q3_K rows of {k}",
+            "{name} is {}; the draft reads bf16, Q3_K or Q5_K rows of {k}",
             layout.ty()
         ),
     })?;

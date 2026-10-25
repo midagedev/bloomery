@@ -219,10 +219,36 @@ unsafe fn stream_byte(w: &[u32], x: usize) -> u32 {
     (unsafe { *w.get_unchecked(x >> 2) } >> (8 * (x & 3))) & 0xff
 }
 
+/// The f32 value of IQ4_NL weight `v` (0..32) of the 18-byte block at byte
+/// `base` of the row stream `w`, bit-identical to `gguf::quant::dequant_row`:
+/// `d · kvalues_iq4nl[code]`, `d` the f16 in the block's first two bytes and
+/// `code` the low nibble of qs byte `v` for `v < 16`, the high nibble of qs
+/// byte `v − 16` above. The product of an f16 and an int8 is exact in f32. The
+/// code word is decoded by the shared nibble decode ([`crate::iq::iq4_word`]),
+/// and the value's lane picked from it. A block starts 0 or 2 mod 4 (18 bytes
+/// in a row of whole words), so `d` is one half of a word and the code byte is
+/// loaded alone from its covering word.
+///
+/// # Safety
+///
+/// `base` even, `base + 18 <= 4 * w.len()` and `v < 32`: the code byte is at
+/// most `base + 17` and `d` sits in the word of byte `base`.
+#[inline(always)]
+pub unsafe fn iq4nl_embed_value(w: &[u32], base: usize, v: usize) -> f32 {
+    let x = base + 2 + (v & 15);
+    // SAFETY: x <= base + 17 < 4 * w.len() and base < 4 * w.len() by this fn's
+    // `# Safety`, so both covering words are inside w.
+    let (cw, dw) = unsafe { (*w.get_unchecked(x >> 2), *w.get_unchecked(base >> 2)) };
+    let (lo, hi) = crate::iq::iq4_word(cw);
+    let kv = ((if v < 16 { lo } else { hi }) >> (8 * (x & 3))) as u8 as i8;
+    let d = half_to_f32((dw >> (16 * ((base >> 1) & 1))) as u16);
+    d * f32::from(kv)
+}
+
 /// A K-quant super-block as an embedding row reads it: its bytes in the
 /// file, and the f32 value of weight `v` (0..256) of the super-block at byte
 /// `base` of the row stream `w`, bit-identical to `gguf::quant::dequant_row`.
-pub(crate) trait EmbedSb {
+pub trait EmbedSb {
     /// Bytes of one super-block (ggml's `block_q*_K`).
     const BYTES: usize;
 
@@ -240,7 +266,7 @@ pub(crate) trait EmbedSb {
 /// 16 when bit `2j + h` of qh byte `v % 32` is set, and the value is
 /// `q · d1 − m1`. `q · d1` holds at most 22 significant bits, exact in f32,
 /// so a fused or unfused subtraction rounds alike.
-pub(crate) struct Q5kRows;
+pub struct Q5kRows;
 
 impl EmbedSb for Q5kRows {
     const BYTES: usize = 176;
@@ -283,7 +309,7 @@ impl EmbedSb for Q5kRows {
 /// 2) + l`, bits `2a..2a+1` of qh byte `32c + l` as its high two bits, and
 /// scale `8c + l / 16 + 2a`; the value is `(d · sc) · (q − 32)`, two
 /// roundings in the reference's order.
-pub(crate) struct Q6kRows;
+pub struct Q6kRows;
 
 impl EmbedSb for Q6kRows {
     const BYTES: usize = 210;
@@ -318,7 +344,7 @@ impl EmbedSb for Q6kRows {
 /// `hmask[16h + l]` bit `4c + a` (clear subtracts 4), and sub-block scale
 /// `8c + 2a + h` of the aux shuffle minus 32; the value is `(d · (sc − 32)) ·
 /// (q − hv)`, two roundings in the reference's order.
-pub(crate) struct Q3kRows;
+pub struct Q3kRows;
 
 impl EmbedSb for Q3kRows {
     const BYTES: usize = 110;

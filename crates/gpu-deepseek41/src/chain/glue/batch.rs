@@ -2,8 +2,8 @@
 //! broadcast and the engram step for up to [`HC_MAX_TOKENS`] consecutive
 //! tokens whose rows one image of the batch layout carries. Per token, the
 //! launches that read a token's rows out of the image are the step's own
-//! (`ds41_glue_embed`, `ds41_glue_engram_rows`, their Q3_K forms) at that
-//! token's offsets; `engram_wkv` runs over the chunk's columns in one launch
+//! ([`enqueue_embed_row`], `TableRows::enqueue`) at that token's offsets;
+//! `engram_wkv` runs over the chunk's columns in one launch
 //! ([`DenseKernels::enqueue_m`], column c the one-token launch on token c)
 //! and its row-major output is copied token-major ([`crate::transpose`]); the
 //! key norm, the gate and the fold take the chunk's tokens in one launch
@@ -60,8 +60,8 @@ impl Glue {
     pub fn batch(&self, gpu: &Gpu, layout: &ImageLayout) -> Result<GlueBatch, GpuError> {
         let dims = layout.dims();
         let m = dims.tokens;
-        let rows_values = self.rows as usize * self.key_len as usize;
-        let site_bytes = self.rows as usize * self.row_bytes as usize;
+        let rows_values = self.shape.rows as usize * self.shape.key_len as usize;
+        let site_bytes = self.shape.rows as usize * self.shape.row_bytes as usize;
         if !(1..=HC_MAX_TOKENS).contains(&m)
             || dims.n_embd != self.n_embd
             || layout.embd_words() != self.embd_words as usize
@@ -85,10 +85,13 @@ impl Glue {
             .map(|t| launch_u32(WHAT, "embedding word", layout.embd_at(t)))
             .collect::<Result<Vec<_>, _>>()?;
         let engram_byte: Vec<usize> = (0..m).map(|t| 4 * layout.engram_at(t)).collect();
-        if self.table == TableRows::Q3K && engram_byte.iter().any(|b| !b.is_multiple_of(2)) {
+        if self.table.on_half_words() && engram_byte.iter().any(|b| !b.is_multiple_of(2)) {
             return Err(GpuError::Shape {
                 what: WHAT,
-                detail: "a token's Q3_K engram rows start off a half word".to_string(),
+                detail: format!(
+                    "a token's {:?} engram rows start off a half word",
+                    self.table
+                ),
             });
         }
         let stream = gpu.stream();
@@ -137,7 +140,6 @@ impl Glue {
         check_tokens(WHAT, b, m)?;
         need(WHAT, "streams", streams.len(), m * HC_STREAMS * n)?;
         need(WHAT, "input", input.len(), m * n)?;
-        let half = launch_u32(WHAT, "media row words", n / 2)?;
         if let Some((of, rows)) = media {
             need(WHAT, "media flags", of.len(), m)?;
             need(WHAT, "media rows", rows.len(), m * n / 2)?;
@@ -151,62 +153,23 @@ impl Glue {
             )?;
             let mut s = span_mut(WHAT, streams, t * HC_STREAMS * n, HC_STREAMS * n)?;
             let mut x = span_mut(WHAT, input, t * n, n)?;
-            if let Some((_, rows)) = media.filter(|(of, _)| of[t]) {
-                let prep = self.module.prepare_ds41_glue_embed(LaunchConfig1D::new(
-                    half.div_ceil(THREADS),
-                    THREADS,
-                    0,
-                ))?;
-                let at = launch_u32(WHAT, "media row", t * n / 2)?;
-                self.module.ds41_glue_embed(
-                    gpu.stream(),
-                    &prep,
+            // A media position's row is bf16 whatever `token_embd`'s format.
+            let (rows, params, at) = match media.filter(|(of, _)| of[t]) {
+                Some((_, rows)) => (
+                    EmbdRows::Bf16,
                     rows,
-                    at,
-                    half,
-                    HC_STREAMS as u32,
-                    &mut s,
-                    &mut x,
-                )?;
-                continue;
-            }
-            match self.embd {
-                EmbdRows::Bf16 => {
-                    let half = self.embd_words;
-                    let prep = self.module.prepare_ds41_glue_embed(LaunchConfig1D::new(
-                        half.div_ceil(THREADS),
-                        THREADS,
-                        0,
-                    ))?;
-                    self.module.ds41_glue_embed(
-                        gpu.stream(),
-                        &prep,
-                        params,
-                        at,
-                        half,
-                        HC_STREAMS as u32,
-                        &mut s,
-                        &mut x,
-                    )?;
-                }
-                EmbdRows::Q3K => {
-                    let n_sb = launch_u32(WHAT, "super-blocks", n / Q3_K_BLOCK)?;
-                    let grid = launch_u32(WHAT, "grid", n.div_ceil(THREADS as usize))?;
-                    let prep = self
-                        .module
-                        .prepare_ds41_glue_embed_q3k(LaunchConfig1D::new(grid, THREADS, 0))?;
-                    self.module.ds41_glue_embed_q3k(
-                        gpu.stream(),
-                        &prep,
-                        params,
-                        at,
-                        n_sb,
-                        HC_STREAMS as u32,
-                        &mut s,
-                        &mut x,
-                    )?;
-                }
-            }
+                    launch_u32(WHAT, "media row", t * n / 2)?,
+                ),
+                None => (self.embd, params, at),
+            };
+            enqueue_embed_row(
+                &self.module,
+                gpu.stream(),
+                rows,
+                (params, at),
+                n,
+                (&mut s, &mut x),
+            )?;
         }
         Ok(())
     }
@@ -234,8 +197,8 @@ impl Glue {
         const WHAT: &str = "Glue::enqueue_batch_engram";
         check_tokens(WHAT, b, m)?;
         let stream = gpu.stream();
-        let rows_values = (self.rows * self.key_len) as usize;
-        let site_bytes = self.rows as usize * self.row_bytes as usize;
+        let rows_values = (self.shape.rows * self.shape.key_len) as usize;
+        let site_bytes = self.shape.rows as usize * self.shape.row_bytes as usize;
         let s = self
             .sites
             .iter()
@@ -245,43 +208,13 @@ impl Glue {
                 detail: format!("layer {layer} carries no engram site"),
             })?;
         let site = &self.sites[s];
-        let grid = (self.rows * self.key_len).div_ceil(THREADS);
         for (t, &token_byte) in b.engram_byte.iter().take(m).enumerate() {
             let at_byte = token_byte + s * site_bytes;
             need(WHAT, "params", 4 * params.len(), at_byte + site_bytes)?;
             let at_byte = launch_u32(WHAT, "site rows", at_byte)?;
             let mut x = span_mut(WHAT, &mut b.x, t * rows_values, rows_values)?;
-            match self.table {
-                TableRows::Q8_0 => {
-                    let prep = self
-                        .module
-                        .prepare_ds41_glue_engram_rows(LaunchConfig1D::new(grid, THREADS, 0))?;
-                    self.module.ds41_glue_engram_rows(
-                        stream,
-                        &prep,
-                        params,
-                        at_byte / 4,
-                        self.rows,
-                        self.row_bytes / 4,
-                        self.key_len,
-                        &mut x,
-                    )?;
-                }
-                TableRows::Q3K => {
-                    let prep = self
-                        .module
-                        .prepare_ds41_glue_engram_rows_q3k(LaunchConfig1D::new(grid, THREADS, 0))?;
-                    self.module.ds41_glue_engram_rows_q3k(
-                        stream,
-                        &prep,
-                        params,
-                        at_byte,
-                        self.rows,
-                        self.key_len / Q3_K_BLOCK as u32,
-                        &mut x,
-                    )?;
-                }
-            }
+            self.table
+                .enqueue(&self.module, stream, self.shape, (params, at_byte), &mut x)?;
         }
         let wide = (HC_STREAMS + 1) * ROW;
         let wkv = Dense::of(w, &site.wkv, rows_values, wide)?;

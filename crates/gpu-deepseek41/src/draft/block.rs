@@ -3,10 +3,10 @@
 //! rows. The head after the last layer is the common owner's.
 //!
 //! Input. Each row's embedding is the target's `token_embd` row as its file
-//! stores it ([`EmbdRows`]: bf16, or Q3_K super-blocks), decoded on the card
-//! by the target step's own broadcast entries (`ds41_glue_embed`, bf16
-//! widened exactly; `ds41_glue_embed_q3k`, `elem::q3k_embed_value`) — so a
-//! row is the target's f32 of that id — and copied into all four
+//! stores it ([`EmbdRows`]: bf16, or Q3_K or Q5_K super-blocks), decoded on
+//! the card by the target step's own broadcast ([`enqueue_embed_row`]: bf16
+//! widened exactly, a K-quant by `elem::EmbedSb::value`) — so a row is the
+//! target's f32 of that id — and copied into all four
 //! hyper-connection streams; layer 0's folded input is stream 0 (the one-hot
 //! initial `pre`). Rows `1..` are the mask token's, the same every block:
 //! decoded once at load by the same entry and written then. Row 0 is
@@ -51,15 +51,15 @@ use std::mem::size_of;
 use bloomery_gpu::mxfp4_sel::{DownArgs, GateUpArgs, MxAct, MxExpertKernels, concat_route};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Window, launch_u32};
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::deepseek41::names as target_names;
 use model::arch::dspark::{DraftHparams, names};
 
 use super::kv::DraftRings;
-use super::load::{DraftWeights, EmbdRows, pack_words};
+use super::load::{DraftWeights, pack_words};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
-use crate::chain::glue::glue_kernels;
+use crate::chain::glue::{EmbdRows, enqueue_embed_row, glue_kernels};
 use crate::experts::ExpertKernels;
 use crate::experts_mxfp4::{DraftRouterKernels, DraftRouterOut, N_EXPERT, N_USED, RouterArgs};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels, HcPostArgs};
@@ -106,7 +106,8 @@ pub struct BlockInput<'a> {
 }
 
 /// The target's `token_embd` row `id`: its file bytes, the stride from the
-/// tensor's type (bf16 or Q3_K, [`EmbdRows`]; any other type is refused).
+/// tensor's type (bf16, Q3_K or Q5_K, [`EmbdRows`]; any other type is
+/// refused).
 pub fn embedding_row(target: &Split, n_embd: usize, id: u32) -> Result<&[u8], GpuError> {
     Ok(super::load::embedding_row(target, &target_names::token_embd(), n_embd, id)?.0)
 }
@@ -718,44 +719,15 @@ fn enqueue_embed(
     }
     let mut streams = span_mut(WHAT, streams0, 0, HC_STREAMS * n)?;
     let mut input = span_mut(WHAT, fold0, 0, n)?;
-    let (at, hc) = (
-        launch_u32(WHAT, "the row's word", e.at)?,
-        launch_u32(WHAT, "streams", HC_STREAMS)?,
-    );
-    match e.rows {
-        EmbdRows::Bf16 => {
-            let half = launch_u32(WHAT, "half a row", n / 2)?;
-            let prep =
-                module.prepare_ds41_glue_embed(LaunchConfig1D::new(half.div_ceil(256), 256, 0))?;
-            module.ds41_glue_embed(
-                gpu.stream(),
-                &prep,
-                e.params,
-                at,
-                half,
-                hc,
-                &mut streams,
-                &mut input,
-            )?;
-        }
-        EmbdRows::Q3K => {
-            // `Glue::enqueue_embed`'s Q3_K launch: one thread a value.
-            let n_sb = launch_u32(WHAT, "super-blocks", n / 256)?;
-            let grid = launch_u32(WHAT, "grid", n.div_ceil(256))?;
-            let prep = module.prepare_ds41_glue_embed_q3k(LaunchConfig1D::new(grid, 256, 0))?;
-            module.ds41_glue_embed_q3k(
-                gpu.stream(),
-                &prep,
-                e.params,
-                at,
-                n_sb,
-                hc,
-                &mut streams,
-                &mut input,
-            )?;
-        }
-    }
-    Ok(())
+    let at = launch_u32(WHAT, "the row's word", e.at)?;
+    enqueue_embed_row(
+        module,
+        gpu.stream(),
+        e.rows,
+        (e.params, at),
+        n,
+        (&mut streams, &mut input),
+    )
 }
 
 /// The mask row `w` holds, decoded by [`enqueue_embed`] into scratch and read
