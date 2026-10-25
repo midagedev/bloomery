@@ -873,16 +873,7 @@ impl Body {
     /// What a state of this body's sequences belongs to: the model file's
     /// first shard, the stage card, a slot's positions.
     fn identity(&self, gpu: &Gpu) -> Result<Identity, GpuError> {
-        let file = self.file.shard_path(0).ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the model file's first shard",
-        })?;
-        Ok(Identity {
-            arch: ARCH,
-            file: file.to_path_buf(),
-            card: gpu.device_name()?,
-            ctx: self.positions(),
-        })
+        Identity::of_load(ARCH, &self.file, gpu, self.positions())
     }
 
     /// The shape of every part of a state of `n` positions, as this body

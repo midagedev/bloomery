@@ -1959,15 +1959,7 @@ impl Body38 {
             ctx,
             CHECKPOINT_EVERY,
         )?;
-        let who = Identity {
-            arch: "qwen4exp",
-            file: file
-                .shard_path(0)
-                .ok_or(GpuError::state(WHAT, "the file's first shard"))?
-                .to_path_buf(),
-            card: gpu.device_name()?,
-            ctx,
-        };
+        let who = Identity::of_load("qwen4exp", file, gpu, ctx)?;
         // The loaded `output`'s form, the step's head-count term: the one
         // owner of the list is `mtp::output_form` (the borrow check asks it
         // too); a type it does not take (a Q4_K head, no file today) counts

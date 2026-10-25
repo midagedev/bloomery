@@ -876,18 +876,7 @@ impl Body {
                 "the step's tier side, and the prompt batch's tier places and the join's copies",
             )?;
         }
-        let who = Identity {
-            arch: "mimo2",
-            file: file
-                .shard_path(0)
-                .ok_or(GpuError::State {
-                    what: WHAT,
-                    missing: "the file's first shard",
-                })?
-                .to_path_buf(),
-            card: gpu.device_name()?,
-            ctx,
-        };
+        let who = Identity::of_load("mimo2", &file, gpu, ctx)?;
         let embd = Embedding::new(file, dims.embd)?;
         if embd.table.n_vocab() != hp.n_vocab {
             return Err(shape(format!(
