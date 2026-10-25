@@ -22,6 +22,7 @@ gate-ds41-host	family	deepseek41	host	-
 gate-ds41-kld	family	deepseek41	host	-
 gate-ds41-load	family	deepseek41	host	-
 gate-ds41-meta	family	deepseek41	meta	arch_registry
+gate-ds41-open	family	deepseek41	meta	arch_registry
 gate-ds41-oracle	tooling		harness	-
 gate-ds41-place	family	glm5next	place	placement_sizing+tier_legs
 gate-ds41-plan	family	deepseek41	host	-

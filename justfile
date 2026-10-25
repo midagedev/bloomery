@@ -1341,6 +1341,13 @@ gate-placement:
 gate-ds41-meta:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-meta && bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41 arch::tests --nocapture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test ds41_meta -- --ignored --nocapture'
 
+# A published V4.1 set opens as it is: the header's facts under any publisher's spelling, the Engram hash constants as keys or
+# tensors, and the Engram tables in the file a header names for them. Headers only, seconds. The pins are the 1017 Q3_K_M set's,
+# so BLOOMERY_V41_MODEL=<first shard> opens another publisher's set of the model (ISTA-DASLab's 2.00 bpw shards state the
+# same facts), and BLOOMERY_V41_ENGRAM names the companion file when it is not beside the model.
+gate-ds41-open:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-open && bash tools/gate.sh --release -p bloomery-model --test ds41_open -- --ignored --nocapture'
+
 # GLM HF names/dims and converted F32/BF16 values against the map oracle $BLOOMERY_DATA/ref-glm5next-hf-map
 # (`just dump-ref-glm5next-hf-map`). The set opens through its refset family (crates/refset/src/arch/glm5next), which
 # refuses by name a set of another checkpoint, GGUF or writer, with a file that is not the one written, or never finished.

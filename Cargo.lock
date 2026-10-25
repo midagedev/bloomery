@@ -389,6 +389,7 @@ dependencies = [
 name = "bloomery-model"
 version = "0.1.0"
 dependencies = [
+ "bloomery-engram",
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-models",

@@ -34,6 +34,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The open gate builds the hash constants and opens the tables the way the card engine does.
+bloomery-engram = { path = "../engram" }
 # The gates read the oracle sets through the reference-set reader, which checks each set's
 # provenance. It depends on the GGUF reader only, so the edge makes no cycle.
 bloomery-refset = { path = "../refset" }
