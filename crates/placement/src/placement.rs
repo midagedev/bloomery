@@ -2099,19 +2099,28 @@ pub enum RoutedRule {
     /// A card leg of a fused gate·up kernel and a down kernel: a gate and an
     /// up of one type in `gate_up`'s format, a down in `down`'s. A layer whose
     /// gate and up differ in type has no card format; a routed stack whose
-    /// name names no part is refused by name.
+    /// name names no part is refused by name. With a `pair`, a layer also
+    /// runs only where `pair(gate and up type, down type, on a tier)` holds: a
+    /// leg whose launches read the down's type by the gate·up's, or whose
+    /// expert tier runs fewer layers than its stage card.
     Leg {
         gate_up: RoutedFormat,
         down: RoutedFormat,
+        pair: Option<LegPair>,
     },
 }
+
+/// A card leg's layer rule: whether a layer whose gate and up are of the
+/// first type and whose down is of the second runs on a stage card, or, for
+/// `true`, on an expert tier.
+pub type LegPair = fn(GgmlType, GgmlType, bool) -> bool;
 
 impl RoutedRule {
     /// The card format stack `t` loads in, `None` where the rule reads none.
     fn format(self, t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
         match self {
             Self::PerType(f) => Ok(f(t.ty)),
-            Self::Leg { gate_up, down } => match ExpertPart::of_name(&t.name) {
+            Self::Leg { gate_up, down, .. } => match ExpertPart::of_name(&t.name) {
                 Some(ExpertPart::Gate | ExpertPart::Up) => Ok(gate_up(t.ty)),
                 Some(ExpertPart::Down) => Ok(down(t.ty)),
                 None => Err(PlacementError::tensor(
@@ -2149,6 +2158,8 @@ impl RoutedRule {
     /// as the planner's layer eligibility.
     pub fn host_only(self, model: &ModelTensors) -> Result<Vec<HostOnly<'_>>, PlacementError> {
         let mut gate_up_types = vec![None; model.layers];
+        let mut by_layer: Vec<Vec<&ModelTensor>> = vec![Vec::new(); model.layers];
+        let mut held = vec![false; model.layers];
         let mut out = Vec::new();
         for tensor in model
             .tensors
@@ -2156,24 +2167,68 @@ impl RoutedRule {
             .filter(|t| t.role == Role::RoutedExperts)
         {
             let layer = layer_of(tensor, model.layers)?;
+            by_layer[layer].push(tensor);
             if let Some(why) = self.refusal(tensor, &mut gate_up_types[layer])? {
+                held[layer] = true;
                 out.push(HostOnly { layer, tensor, why });
+            }
+        }
+        // The pair rule reads whole layers: the down of a layer the parts
+        // above leave on the card, whose type does not pair with its gate
+        // and up's, keeps the layer on the host.
+        for (layer, stacks) in by_layer.iter().enumerate() {
+            if held[layer] {
+                continue;
+            }
+            if let Some(down) = self.unpaired_down(stacks, false) {
+                out.push(HostOnly {
+                    layer,
+                    tensor: down,
+                    why: "the routed down's type does not pair with the gate and up's on this \
+                          card leg",
+                });
             }
         }
         Ok(out)
     }
 
+    /// The down stack among the layer's `stacks` when the rule's pair refuses
+    /// the layer's (gate and up type, down type), `None` where there is no
+    /// pair rule, a part is missing or the pair holds.
+    fn unpaired_down<'m>(self, stacks: &[&'m ModelTensor], tier: bool) -> Option<&'m ModelTensor> {
+        let Self::Leg {
+            pair: Some(pair), ..
+        } = self
+        else {
+            return None;
+        };
+        let part = |p: ExpertPart| {
+            stacks
+                .iter()
+                .copied()
+                .find(|t| ExpertPart::of_name(&t.name) == Some(p))
+        };
+        let (gate, down) = (part(ExpertPart::Gate)?, part(ExpertPart::Down)?);
+        (!pair(gate.ty, down.ty, tier)).then_some(down)
+    }
+
     /// Whether the card runs a layer of the routed stacks `stacks`: each
-    /// loads in a card format, and on a leg its gate and up are one type.
+    /// loads in a card format, on a leg its gate and up are one type and the
+    /// leg's pair rule, where it has one, holds for the layer.
     pub(crate) fn layer_runs(
         self,
         stacks: &[usize],
         model: &ModelTensors,
+        tier: bool,
     ) -> Result<bool, PlacementError> {
         let mut runs = true;
         let mut gate_up_ty = None;
         for &i in stacks {
             runs &= self.refusal(&model.tensors[i], &mut gate_up_ty)?.is_none();
+        }
+        if runs {
+            let layer: Vec<&ModelTensor> = stacks.iter().map(|&i| &model.tensors[i]).collect();
+            runs = self.unpaired_down(&layer, tier).is_none();
         }
         Ok(runs)
     }
@@ -2187,10 +2242,11 @@ fn eligible(
     stacks: &[Vec<usize>],
     model: &ModelTensors,
     routed: RoutedRule,
+    tier: bool,
 ) -> Result<Vec<usize>, PlacementError> {
     let mut out = Vec::new();
     for l in layers {
-        if !stacks[l].is_empty() && routed.layer_runs(&stacks[l], model)? {
+        if !stacks[l].is_empty() && routed.layer_runs(&stacks[l], model, tier)? {
             out.push(l);
         }
     }
@@ -2691,7 +2747,7 @@ fn plan_rule<'a>(
     for (c, card) in machine.cards.iter().enumerate() {
         let (kv_card, shadow, stage_rows) = card_kv(card, kv, ctx_max);
         let eligible = match routed {
-            Some(r) => eligible(card.layers.clone(), &stacks, model, r)?,
+            Some(r) => eligible(card.layers.clone(), &stacks, model, r, false)?,
             None => Vec::new(),
         };
         let fill = Fill {
@@ -2721,7 +2777,7 @@ fn plan_rule<'a>(
         // so its fill plans no expert and still holds its reserves to the
         // card's budget and free floors.
         let eligible = match routed {
-            Some(r) if !tier.reserve_only => eligible(0..model.layers, &stacks, model, r)?,
+            Some(r) if !tier.reserve_only => eligible(0..model.layers, &stacks, model, r, true)?,
             _ => Vec::new(),
         };
         let fill = Fill {
@@ -2855,7 +2911,7 @@ fn resolve_shares(
         } else {
             card.layers.clone()
         };
-        let own = eligible(layers, stacks, model, routed)?;
+        let own = eligible(layers, stacks, model, routed, tier)?;
         let uploads = card_uploads(model, c, rows, &own, routed)?;
         let dense = Footprint::new(card.granule_bytes, &uploads).at(&zeros)?;
         let kv = kv_card.saturating_add(stage_rows);
@@ -2893,7 +2949,7 @@ fn resolve_shares(
             "none of the plan's cards it names has a share above 0".to_owned(),
         ));
     }
-    let routable = eligible(0..model.layers, stacks, model, routed)?;
+    let routable = eligible(0..model.layers, stacks, model, routed, false)?;
     let caps: Vec<u64> = (0..model.layers).map(|l| model.layer_experts(l)).collect();
     let experts = card_uploads(model, cards.len(), rows, &routable, routed)?;
     let total = Footprint::new(cards[0].granule_bytes, &experts).at(&caps)?;
@@ -6219,7 +6275,11 @@ mod tests {
         let gate_up: RoutedFormat = |ty| matches!(ty, Q4_K | Q5_K).then_some(CardFormat::KQuant);
         let down: RoutedFormat =
             |ty| matches!(ty, Q4_K | Q5_K | Q6_K).then_some(CardFormat::KQuant);
-        let leg = RoutedRule::Leg { gate_up, down };
+        let leg = RoutedRule::Leg {
+            gate_up,
+            down,
+            pair: None,
+        };
         let union = RoutedRule::PerType(down);
         let machine = |layers: usize| Machine {
             cards: vec![bytes_card("stage", 1 << 30, 0..layers)],

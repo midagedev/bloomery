@@ -1125,7 +1125,7 @@ mod tests {
     #[test]
     fn only_the_stacks_the_leg_runs_are_card_routed() {
         let rules = [Program::Mimo2Body, Program::Solar2Body].map(|p| {
-            let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+            let RoutedRule::Leg { gate_up, down, .. } = routed_rule(p) else {
                 panic!("{p:?}: a leg rule");
             };
             (p, gate_up, down)
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn the_minimax_body_routes_by_the_planes_arms() {
         let arms = |p| {
-            let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+            let RoutedRule::Leg { gate_up, down, .. } = routed_rule(p) else {
                 panic!("{p:?}: a leg rule");
             };
             (gate_up, down)

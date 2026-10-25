@@ -412,6 +412,7 @@ mod tests {
             swiglu_limit: 10.0,
             swiglu_limit_shared: 10.0,
             shared_down: GgmlType::Q8_0,
+            routed_types: None,
         }
     }
 

@@ -911,6 +911,14 @@ impl Weights {
         self.by_name.get(name)
     }
 
+    /// The resident set's own copy of the name `name` holds a weight under,
+    /// which a view of the weight (a [`crate::card_leg::LegStacks`]) keeps
+    /// for its refusals; `None` where [`Weights::get`] finds nothing by
+    /// exactly that name.
+    pub fn name_of(&self, name: &str) -> Option<&str> {
+        self.by_name.get_key_value(name).map(|(k, _)| k.as_str())
+    }
+
     /// Move the weight `name` out of the resident set: the caller owns its
     /// buffers and [`Weights::get`] no longer finds it. `None` when no entry
     /// has exactly that name (a tied head is the embedding's entry, not its

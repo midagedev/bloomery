@@ -539,6 +539,9 @@ pub struct LayerKind {
     /// `ffn_down_shexp`'s type: whether the shared expert's down projection
     /// reads its input as is or in q8_1 decides a launch of the step.
     pub shared_down: GgmlType,
+    /// The types of the layer's routed gate, up and down stacks in stack
+    /// order, `None` where the file holds none of them.
+    pub routed_types: Option<[GgmlType; 3]>,
 }
 
 impl LayerKind {
@@ -558,6 +561,19 @@ impl LayerKind {
 }
 
 impl Hparams {
+    /// Whether some layer's routed stacks run on the common card leg: a
+    /// layer of types the chain's card experts run
+    /// ([`crate::placement::accepts::leg_runs`]) that is not the fused layer
+    /// ([`crate::placement::accepts::DS41_LEG`]).
+    #[must_use]
+    pub fn on_leg(&self) -> bool {
+        use crate::placement::accepts::{DS41_LEG, Program, leg_runs};
+        self.layers
+            .iter()
+            .filter_map(|k| k.routed_types)
+            .any(|t| t != DS41_LEG && leg_runs(Program::Deepseek41Chain, t) == Some(true))
+    }
+
     /// Everything from `split`'s headers; a missing or malformed key, or a
     /// layer table ik's loader would refuse, is an error naming the key or the
     /// tensor.
@@ -1328,9 +1344,21 @@ fn layer_kinds(
                     name: names::ffn_down_shexp(l),
                     detail: "is not in the file".to_string(),
                 })?,
+            routed_types: routed_types(split, l),
         });
     }
     Ok(layers)
+}
+
+/// The types of layer `l`'s routed gate, up and down stacks, `None` unless
+/// the file holds all three.
+fn routed_types(split: &Split, l: usize) -> Option<[GgmlType; 3]> {
+    let ty = |name: String| split.find(&name).map(|(_, t)| t.ty);
+    Some([
+        ty(names::ffn_gate_exps(l))?,
+        ty(names::ffn_up_exps(l))?,
+        ty(names::ffn_down_exps(l))?,
+    ])
 }
 
 /// Whether layer `l` routes by the token table: it carries
