@@ -84,8 +84,11 @@ generate_ds41   ds41_ffn_replace                         0           0
 generate_ds41   ds41_ffn_sel_merge                       0           0
 generate_ds41   ds41_glue_embed                          0           0
 generate_ds41   ds41_glue_embed_q3k                      0           0
+# derived, not measured on this card: ds41_glue_embed_q5k and ds41_glue_engram_rows_iq4nl hold no local depot (ptx-scan on the cc 8.6 card: spill 0, jit_local 0, tools/ref/ptx-shapes.tsv); the first scan on this card confirms the rows or turns them red.
+generate_ds41   ds41_glue_embed_q5k                      0           0
 generate_ds41   ds41_glue_engram_rows                    0           0
 generate_ds41   ds41_glue_engram_rows_q3k                0           0
+generate_ds41   ds41_glue_engram_rows_iq4nl              0           0
 generate_ds41   ds41_groups_to_tokens                    0           0
 generate_ds41   ds41_hc_fold                             0           0
 generate_ds41   ds41_hc_mean                             0           0

@@ -74,8 +74,8 @@ import records  # noqa: E402 - the record reader, beside this tree's tools
 FULL_MARGIN = 16
 FULL_LONG_SHARE = 0.1
 
-PROLOGUE = {"gather_pairs", "ds41_glue_embed", "ds41_glue_embed_q3k"}
-ENGRAM_ROWS = {"ds41_glue_engram_rows", "ds41_glue_engram_rows_q3k"}
+PROLOGUE = {"gather_pairs", "ds41_glue_embed", "ds41_glue_embed_q3k", "ds41_glue_embed_q5k"}
+ENGRAM_ROWS = {"ds41_glue_engram_rows", "ds41_glue_engram_rows_q3k", "ds41_glue_engram_rows_iq4nl"}
 JOIN = {"ds41_ffn_post_batch", "ds41_ffn_post_batch_streams"}
 PLACES = "ds41_ffn_places"
 HC_PRE = "ds41_hc_pre"

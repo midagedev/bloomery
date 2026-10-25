@@ -90,8 +90,10 @@ generate_ds41   ds41_ffn_replace                         0           0
 generate_ds41   ds41_ffn_sel_merge                       0           0
 generate_ds41   ds41_glue_embed                          0           0
 generate_ds41   ds41_glue_embed_q3k                      0           0
+generate_ds41   ds41_glue_embed_q5k                      0           0
 generate_ds41   ds41_glue_engram_rows                    0           0
 generate_ds41   ds41_glue_engram_rows_q3k                0           0
+generate_ds41   ds41_glue_engram_rows_iq4nl              0           0
 generate_ds41   ds41_groups_to_tokens                    0           0
 generate_ds41   ds41_hc_fold                             0           0
 generate_ds41   ds41_hc_mean                             0           0

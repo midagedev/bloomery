@@ -1,0 +1,10 @@
+# Round qt-glue: ik's CPU node dumps of the istaglue fixture variant (/models/fixture-variants/istaglue/v41), the four V4.1
+# fixture sets (step4, d1n, d1, d2 every-node), each one `BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=istaglue just
+# dump-ref-fixture deepseek41 <set>-every-node` under this card, one lease each. Nothing is timed.
+# Minutes [derived]: the base fixture's V4.1 dumps were 0.05-0.3 min each (docs/cards/fxoracle-dump.card, fxprobe's measured
+# walls, V4.1 1.4 s) plus 3-15 s a lease take; four takes: 1-5 min.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and pages the variant file in, so it holds the lease; why now: gate-gpu-ds41-step
+  on the istaglue variant has no oracle sets until ik has dumped the variant, and the Q5_K embedding and IQ4_NL engram
+  decodes are otherwise held only to our own host decode
+minutes: 1..5

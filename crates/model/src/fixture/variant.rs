@@ -6,9 +6,10 @@
 //! differs from its source by the map alone.
 //!
 //! A table row is `tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why`. The map is `role=type`
-//! words: `role` is a tensor name between `blk.<L>.` and `.weight`, `type` a ggml type name. The scope
-//! `trunk` is every layer but the NextN one (the layer that holds `nextn.*` tensors), which keeps the
-//! source's types; `all` is every layer, the NextN one included.
+//! words: `role` is a tensor name between `blk.<L>.` and `.weight`, or the name of a tensor outside the
+//! layers without its `.weight` (`token_embd`, `output`), `type` a ggml type name. The scope `trunk` is
+//! every layer but the NextN one (the layer that holds `nextn.*` tensors), which keeps the source's
+//! types; `all` is every layer, the NextN one included; a tensor outside the layers is in either.
 //!
 //! The quantizer picks a type for every tensor it sees, so the argument names every tensor of the
 //! source by its exact name: the map's tensors at their new type, every other at its own, which the
@@ -263,10 +264,13 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
         let mut found = 0usize;
         let mut already = Vec::new();
         for (_, t) in source.iter_tensors() {
-            let Some((layer, rest)) = layer_of(&t.name) else {
-                continue;
+            // A tensor of a layer, or one outside the layers, whose role is its whole name.
+            let (layer, rest) = match layer_of(&t.name) {
+                Some((layer, rest)) => (Some(layer), rest),
+                None => (None, t.name.as_str()),
             };
-            if rest != want || (row.scope == Scope::Trunk && nextn.contains(&layer)) {
+            let nextn_layer = layer.is_some_and(|l| nextn.contains(&l));
+            if rest != want || (row.scope == Scope::Trunk && nextn_layer) {
                 continue;
             }
             found += 1;
@@ -304,8 +308,8 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
             return Err(err(
                 tag,
                 format!(
-                    "the map names {role}, and the source has no blk.<L>.{want} in scope {:?} \
-                     (the NextN layers are {nextn:?})",
+                    "the map names {role}, and the source has no blk.<L>.{want}, nor a tensor {want}, \
+                     in scope {:?} (the NextN layers are {nextn:?})",
                     row.scope
                 ),
             ));

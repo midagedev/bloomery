@@ -83,7 +83,8 @@ pub fn shadow_kernels(
 }
 
 /// Engram site `l`'s token-only work, in stream order: its rows decoded
-/// (`ds41_glue_engram_rows`, or `_q3k` for a q3_K table), `engram_wkv`
+/// (`ds41_glue_engram_rows`, or `_q3k` for a q3_K table, `_iq4nl` for an
+/// iq4_nl one), `engram_wkv`
 /// ([`projection`]) and the key norm. It reads the step image and weights
 /// alone.
 pub fn engram_kv_kernels(
@@ -95,6 +96,7 @@ pub fn engram_kv_kernels(
     let mut k = vec![match type_of(split, &table)? {
         GgmlType::Q8_0 => "ds41_glue_engram_rows",
         GgmlType::Q3_K => "ds41_glue_engram_rows_q3k",
+        GgmlType::IQ4_NL => "ds41_glue_engram_rows_iq4nl",
         other => return Err(format!("{table}: {other} has no row kernel").into()),
     }];
     let wkv = names::engram_wkv(l);

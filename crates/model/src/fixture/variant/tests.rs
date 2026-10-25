@@ -398,6 +398,56 @@ fn a_map_that_bites_nothing_is_refused() {
     );
 }
 
+/// A role that names a tensor outside the layers (`token_embd`) reaches that tensor in either scope,
+/// beside the layers' tensors of the map's other roles; one already at the type is refused as a layer's is.
+#[test]
+fn a_role_outside_the_layers_reaches_its_tensor() {
+    let d = Dir::new();
+    let mut tensors = source_tensors();
+    tensors.insert(
+        0,
+        t("token_embd.weight".into(), &[256, 4], GgmlType::Q3_K, 0, 13),
+    );
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 2));
+    let with = |scope: Scope, ty: GgmlType| Row {
+        scope,
+        map: vec![
+            ("token_embd".to_string(), ty),
+            ("ffn_gate_exps".to_string(), GgmlType::IQ3_S),
+        ],
+        ..the_row()
+    };
+    for scope in [Scope::Trunk, Scope::All] {
+        let got = expand(&with(scope, GgmlType::Q5_K), &src).expect("an expansion");
+        let first = got.first().expect("a retyped tensor");
+        assert_eq!(
+            (first.name.as_str(), first.from, first.to),
+            ("token_embd.weight", GgmlType::Q3_K, GgmlType::Q5_K),
+            "the tensor outside the layers leads the source's order"
+        );
+        assert!(
+            got.iter()
+                .skip(1)
+                .all(|r| r.name.ends_with("ffn_gate_exps.weight")),
+            "the layers' tensors of the other role follow"
+        );
+    }
+    red(
+        expand(&with(Scope::Trunk, GgmlType::Q3_K), &src),
+        &["token_embd.weight", "already at q3_K"],
+    );
+    let arg = custom_q(
+        "v1",
+        &src,
+        &expand(&with(Scope::Trunk, GgmlType::Q5_K), &src).expect("an expansion"),
+    )
+    .expect("an argument");
+    assert!(
+        arg.starts_with("^token_embd\\.weight$=q5_K,"),
+        "the quantizer's argument retypes it by its exact name: {arg}"
+    );
+}
+
 /// A tensor already at the map's type, beside another of its role that is not, is left out of the
 /// expansion; the quantizer's argument keeps it at its own type.
 #[test]
