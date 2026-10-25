@@ -531,3 +531,5 @@ generate_ds41   iq1_s_gate_up_sel                        0           0
 generate_ds41   iq1_s_gemv_sel                           0           0
 generate_ds41   iq2_s_gate_up_sel                        0           0
 generate_ds41   iq2_s_gemv_sel                           0           0
+generate_ds41   ds41_q5k_gemv_heads                      0           0
+generate_ds41   ds41_shexp_gate_up_q5k                   0           0
