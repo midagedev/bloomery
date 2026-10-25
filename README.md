@@ -33,7 +33,8 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 - **Checkpoint folders as downloaded.** MiniMax-M3.1-Flash loads from its vendor's NVFP4 safetensors folder, and
   Qwen3.8 from its NVFP4 or FP4-Local folder, with no conversion and no requant. Everything else loads from GGUF.
 - **Apple Silicon.** A Metal backend serves Qwen3.6-35B-A3B on a Mac GPU, from an MLX 4-bit checkpoint or a GGUF
-  file, with batched prompt passes; a follow-up turn reads only its new messages ([below](#apple-silicon)).
+  file, and runs Ornith-1.5-35B (Q4_K_M, text only); prompts run in batched passes, and a follow-up turn reads only its
+  new messages ([below](#apple-silicon)).
 - **llama-server compatible.** The same HTTP API (OpenAI and Anthropic), GGUF files and flag spellings, including the
   placement flags (`-dev`, `-ts`, `-ngl`, `--cpu-moe`, `-ot`, `--fit`) with llama's meaning. Your client works
   unchanged; Claude Code runs with `ANTHROPIC_BASE_URL=http://localhost:8080`.
@@ -90,8 +91,12 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 
 ### Apple Silicon
 
-macOS 26.2 or newer; the binaries are signed and notarized. One architecture runs so far: Qwen3.6-35B-A3B, from a
-Q4_K_M GGUF or from an MLX 4-bit folder that `bloomery-prepare` converts once.
+macOS 26.2 or newer; the binaries are signed and notarized. One architecture runs so far (`qwen35moe`). Qwen3.6-35B-A3B
+runs from a Q4_K_M GGUF or from an MLX 4-bit folder that `bloomery-prepare` converts once. Two more Q4_K_M files with its
+shapes run, text only: Ornith-1.5-35B, and MiniCPM-V 4.7 35B-A3B (its `mmproj` is not read) on a build after 0.3.9
+(0.3.9 refuses its vocabulary of 248,144). Sage-A1.5 has the same shapes and has not been run on a Mac yet. A file the
+Metal backend cannot run is refused by name when it opens; Qwen3.6's `UD-Q4_K_XL` (it holds Q8_0 and Q5_K tensors) and
+Qwen3-30B-A3B (architecture `qwen3moe`) are refused today.
 
 ```sh
 # Homebrew, or the same installer as on Linux (bloomery-0.3.9-macos-arm64-metal.tar.gz on the releases page)
@@ -150,7 +155,7 @@ adaptive residency: [`docs/serving.md`](docs/serving.md).
 | What runs | State |
 |---|---|
 | NVIDIA cards | Compute capability 8.6 or newer, driver R580 or newer (CUDA 13); an older driver is refused at the start. Run here: RTX 3090, RTX A6000, RTX 3060 (WSL2). Run by users: RTX 5090 ([#2](https://github.com/midagedev/bloomery/issues/2)), DGX Spark (GB10, from source: [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)), one model across several Sparks. Ada (sm_89): no report yet |
-| Apple Silicon | macOS 26.2 or newer, the release's signed binaries (Homebrew, the installer or the tarball); Qwen3.6-35B-A3B, one slot, text only ([`docs/mac.md`](docs/mac.md)). Run here: M1 Pro, M4 Pro 48 GB. Run by users: M3 Ultra, M5 Ultra ([#593](https://github.com/midagedev/bloomery/issues/593)). On an M5 the prompt's GEMMs run on the neural accelerators, picked by the device |
+| Apple Silicon | macOS 26.2 or newer, the release's signed binaries (Homebrew, the installer or the tarball); Qwen3.6-35B-A3B and Ornith-1.5-35B (MiniCPM-V 4.7 on a build after 0.3.9), one slot, text only ([`docs/mac.md`](docs/mac.md)). Run here: M1 Pro, M4 Pro 48 GB. Run by users: M3 Ultra, M5 Ultra ([#593](https://github.com/midagedev/bloomery/issues/593)). On an M5 the prompt's GEMMs run on the neural accelerators, picked by the device |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel, for the CUDA build; the Metal build runs on Apple Silicon |
 | OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2; macOS 26.2 or newer on Apple Silicon. AMD GPUs are not supported yet |
 

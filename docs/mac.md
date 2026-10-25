@@ -2,7 +2,8 @@
 
 bloomery runs on a Mac's GPU through its own Metal backend: `bloomery-serve-metal` serves the llama-server HTTP API,
 and `generate_metal` runs one prompt from the command line. The host side is Rust; the kernels are Metal Shading
-Language. One architecture runs so far, Qwen3.6-35B-A3B (`qwen35moe`). The release carries a signed and notarized Apple
+Language. One architecture runs so far (`qwen35moe`): Qwen3.6-35B-A3B and files with its shapes
+([which files](#which-files-run)). The release carries a signed and notarized Apple
 Silicon build; building from source works too. The port's map and design are in [`contrib/mac.md`](contrib/mac.md) and issue
 [#593](https://github.com/midagedev/bloomery/issues/593).
 
@@ -12,12 +13,17 @@ Silicon build; building from source works too. The port's map and design are in 
   (`crates/metal/src/device.rs`). Run on an M1 Pro and an M4 Pro 48 GB here, and on an M3 Ultra and an M5 Ultra by
   [@avlp12](https://github.com/avlp12) (#593).
 - Memory: after the open, the model holds 20.3 GB (MLX 4-bit) or 21.8 GB (Q4_K_M) of device memory at a 4,096-row
-  context, measured on the M4 Pro. A 48 GB Mac is tested; a 32 GB Mac is untested.
+  context, measured on the M4 Pro. A 48 GB Mac is tested. A 32 GB Mac (M1 Pro) opened and decoded two other Q4_K_M
+  files of this shape ([below](#which-files-run)). The GPU working set Metal reports was 0.78 × RAM on the three Macs
+  measured (24.96 GiB on an M1 Pro 32 GB, 37.44 GiB on an M4 Pro 48 GB); above 48 GB it is unverified.
 - To build from source: [rustup](https://rustup.rs), whose `cargo` comes first in `PATH` (Homebrew's `rust` builds
   with its stable compiler and fails on the pinned crates). `rust-toolchain.toml` pins the nightly, and rustup installs
   it on the first build. The Metal backend links no CUDA code, so plain `cargo` builds it. Xcode's Metal toolchain is
   optional: with `xcrun metal` the build writes a metallib, and without it the kernels compile from their embedded
-  source when the binary starts (the release's binaries do this).
+  source when the binary starts (the release's binaries do this). The maintainers' Macs have no Metal Toolchain
+  (`xcrun -sdk macosx metal --version` answers "missing Metal Toolchain"), so every number and gate here ran the source
+  path and the metallib path is not tested. If you have the toolchain (`xcodebuild -downloadComponent MetalToolchain`),
+  please run `just lab-metal` and report the output (why: [`contrib/mac.md`](contrib/mac.md), section 1.3).
 
 ## Install
 
@@ -40,9 +46,24 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
   -p bloomery-model-hf --bin prepare
 ```
 
+## Which files run
+
+| File | State |
+|---|---|
+| Qwen3.6-35B-A3B, Q4_K_M GGUF or an MLX 4-bit folder | runs; the numbers are below |
+| [Ornith-1.5-35B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), Q4_K_M | runs, text only: it has Qwen3.6's shapes, and its next-token layer is not read |
+| [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), Q4_K_M | runs on a build after 0.3.9, text only: its `mmproj` is not read. Release 0.3.9 refuses it: `qwen35moe arena: a vocabulary of 248144; the head reads 248320` |
+| [Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), Q4_K_M | not run on a Mac yet; it has Qwen3.6's shapes |
+| Qwen3.6 `UD-Q4_K_XL` | refused by name: it holds Q8_0 and Q5_K tensors, which the Metal kernels do not run. Planned next |
+| Qwen3-30B-A3B | refused by name: architecture `qwen3moe`. Planned next |
+
+The mat-vec kernels run Q4_K, Q6_K and MLX 4-bit weights. The router and the shared-expert gate may be F32 or MLX 8-bit,
+which the open dequantizes. Any other type is refused when the file opens, and the error names the tensor. The evidence
+for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
+
 ## Get a model
 
-Either file works:
+Either file works for Qwen3.6:
 
 - **A Q4_K_M GGUF opens directly**, for example `Qwen3.6-35B-A3B-Q4_K_M.gguf` from
   [`lmstudio-community/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF).
@@ -63,6 +84,11 @@ A quick check from the command line (the rates print on stderr, `decode_tok_s=`)
 BLOOMERY_REF_MODEL=OUT/qwen36-mlx4-00001-of-00001.gguf \
   target/release/generate_metal --prompt "The capital of France is" -n 32
 ```
+
+To learn whether a file opens before it loads (after #806): `generate_metal --plan [--ctx C]` reads only the file's
+header and tensor table. It prints every refusal, not only the first, the bytes the open would allocate, the device's
+working set and the host's free memory. It exits 0 when the file opens, 3 when it is refused and 64 when the header
+cannot be read. A 24 MB cut of a Hub file is enough.
 
 ## Serve
 
@@ -88,7 +114,8 @@ with exit 64.
   only its new messages. Any other prompt runs from position 0.
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
-- No saved prompt cache across slots, no slot files, no image input, no speculative decoding.
+- No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read), no speculative
+  decoding.
 - On an M5 (Metal 4, GPU family 17 or newer) the device picks the neural accelerators' tensor-op GEMMs for prompts
   (`gemm_path=tensor` in the stats); M1 to M4 run the SIMD-group GEMMs (`gemm_path=simdgroup`). On an M5 Ultra the
   tensor path took a 2,048-row prompt pass's GEMM class from 203.51 to 92.73 ms (@avlp12, #593). Its sums run in another
@@ -106,6 +133,10 @@ rounds, tok/s. The Mac has no timing runner (no lease, no witness blocks), so th
 
 mlx-lm and llama.cpp ran on the same files in the same sitting; their rows, every command and flag, and the per-round
 tables are in [rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-10-25.md#mac-m4pro-xeng).
+
+One more Mac, a development-loop number: an Apple M1 Pro 32 GB, macOS 27.0.1, `generate_metal --prompt "The capital of
+France is" -n 32`, greedy, with a download running on the same Mac. MiniCPM-V 4.7 and Ornith-1.5-35B (Q4_K_M) each
+decoded at 43.4 tok/s (PR #805). It is a different chip and different files from the table above.
 
 **Contributors' Macs**: measured by [@avlp12](https://github.com/avlp12) on an M3 Ultra and an M5 Ultra, 2026-10-25, at
 main bd0c61345 (its `crates/metal` is 0.3.9's), Qwen3.6-35B-A3B `Q4_K_M`, `generate_metal --tokens <seeded random ids>

@@ -14,26 +14,87 @@ Apple M1 Pro with 32 GiB (the machine facts are in section 2); every probe's log
 from a runner in `tools/ref/`, and none runs on a Mac. The only speed numbers are byte-over-bandwidth ceilings marked
 `[derived]`.
 
+**What changed since this map was written.** Parts A to F are the map and design of 2026-10-21 (main `8d74220bb`, with
+the M2.0 measurements of the same day) and keep that date. The Metal backend has landed since. Section 1 says what runs
+on Metal today, at main `d916e20ac`; where a later part says something does not exist yet, section 1 and the status line
+at the head of that part win. The user-facing steps (install, build, serve, flags, numbers) are in
+[`../mac.md`](../mac.md).
+
 Related documents: [`dgx-spark.md`](dgx-spark.md) (the port map this one is modelled on; its Appendix A is the P0 site
 map for aarch64 Linux), [`../research/tierengine.md`](../research/tierengine.md) (item (h) is unified memory on GB10),
 `AGENTS.md` ("Derive first", "Never").
 
 ## 1. Where the port stands
 
-| Phase (issue #593) | Done when | State (2026-10-21) | Left |
+| Phase (issue #593) | Done when | State (main `d916e20ac`) | Left |
 |---|---|---|---|
-| **M0** native host build | the host chain builds and tests on aarch64-apple-darwin; every Linux-only site is behind one platform module; on x86 Linux nothing moved (`just ptx-scan` equal) | 14 of 21 non-device crates already build and test natively (`tools/mac-check.sh test`: 1477 passed, 0 failed, 210 ignored in 52 test binaries); 7 do not, from 45 compile errors at 38 source lines in 10 files (Part A) | the platform module and its callers (Part E, M0) |
-| **M1** CPU path | NEON for `qdot`; the CPU engine behind `serve::Engine` | `qdot` has a scalar mirror for every kernel, so it builds off x86 once `threads` builds; a NEON form of the two generic kernels was prototyped and is bit-identical to the scalar mirror on 2400 rows (Part B); no CPU engine implements `serve::Engine` | off the critical path to a fast Metal decode (Part E) |
-| **M2** Metal backend | one model's decode set runs on Metal and a Mac gate holds it | nothing exists. The CUDA side has 376 `#[kernel]` fns and 90 `#[cuda_module]` blocks; a Qwen3-MoE decode step launches 15 distinct kernels (Part C) | the device seam, the kernels, the chain (Part E) |
-| **M3** a Mac gate tier | gates run on a Mac; `AGENTS.md` "Never" says so | the static tier and the pure crates' tests run (`just mac-static`, `just mac-test`); no runner for a gate or a timing exists on a Mac (Part D) | Part D |
+| **M0** native host build | the host chain builds and tests on aarch64-apple-darwin; every Linux-only site is behind one platform module; on x86 Linux nothing moved (`just ptx-scan` equal) | `crates/os` (`bloomery-os`) holds the Linux-only libc calls of the host chain beside their macOS bodies or a named `OsError::Unsupported`, and `threads`, `gguf`, `engram` and `model` call it (`cd40ceac9`, `000a5d52d`, 2026-10-21); `cd40ceac9`'s message records `tools/mac-check.sh test` at 16 crates, 1577 passed, 0 failed. The census in Part A (14 of 21 crates built; 1477 passed, 0 failed, 210 ignored in 52 test binaries; 45 compile errors at 38 source lines in 10 files) is of the tree before it | a fresh count; this page did not rerun it `[unverified]` |
+| **M1** CPU path | NEON for `qdot`; the CPU engine behind `serve::Engine` | 2026-10-21, not rechecked here: `qdot` has a scalar mirror for every kernel, so it builds off x86 once `threads` builds; a NEON form of the two generic kernels was prototyped and is bit-identical to the scalar mirror on 2400 rows (Part B); no CPU engine implements `serve::Engine` | off the critical path to a fast Metal decode (Part E) |
+| **M2** Metal backend | one model's decode set runs on Metal and a Mac gate holds it | `bloomery-device` (the device contract) and `bloomery-metal` (its Metal backend) landed on 2026-10-22 (`c16dd696c`). The `qwen35moe` family runs on it, in MSL kernels, with batched prompt passes and, on a GPU with matrix units, the tensor-op GEMMs for the prompt (`aaf14ad24`, `d91e4000e`, 2026-10-25). Files that run and files refused by name: section 1.1. Gates: `just lab-metal` and `just lab-metal-e2e`. For scale, as counted on 2026-10-21: the CUDA side has 376 `#[kernel]` fns and 90 `#[cuda_module]` blocks, and a Qwen3-MoE decode step launches 15 distinct kernels (Part C) | Qwen3.6 `UD-Q4_K_XL` and Qwen3-30B-A3B (section 1.1); image input, a second slot and speculative decoding ([`../mac.md`](../mac.md)) |
+| **M3** a Mac gate tier | gates run on a Mac; `AGENTS.md` "Never" says so | `tools/mac-gate.sh` (the Metal lock, the bound, the refusals; `ee4ee6cb2`, 2026-10-22) runs the Metal gates through `just lab-metal` and `just lab-metal-e2e`. Both are `lab-` recipes: the box has no Metal device, so no landing batch selects them. The static tier and the pure crates' tests run as before (`just mac-static`, `just mac-test`). No timing runner with a witness exists on a Mac, so a Mac speed number is a development-loop number | a Mac timing runner and its witness (Part D, F6) |
 
 The order that reaches a fast Metal decode soonest is M0, then M2, then M3; M1 moves out of the critical path (Part E
 gives the reasons).
 
+### 1.1 What runs on Metal today
+
+At main `d916e20ac` one architecture runs on Metal, `qwen35moe`. The open takes mat-vec weights of type Q4_K, Q6_K or
+MLX's affine 4-bit (`MLX_A4`), the embedding as Q4_K or `MLX_A4` and the head as Q6_K or `MLX_A4`
+(`crates/metal/src/arch/qwen3moe/arena.rs:333,617,624`). Any other type at those sites is refused by name, with the
+tensor's name.
+
+| File | State | Evidence |
+|---|---|---|
+| Qwen3.6-35B-A3B, Q4_K_M GGUF, or an MLX 4-bit folder converted by `prepare` | runs | [`../mac.md`](../mac.md) (numbers, conditions) |
+| MiniCPM-V 4.7 35B-A3B, Q4_K_M | runs, **text only**: its `mmproj` is not read on Metal. Its vocabulary is 248,144; the open refused it before PR #805 (`58d583fa6`) with `qwen35moe arena: a vocabulary of 248144; the head reads 248320`, and the v0.3.9 tag does not hold that commit | PR #805's comment: `generate_metal` on a real file, rc 1 at the base and rc 0 with the change |
+| Ornith-1.5-35B, Q4_K_M | runs, text only, on v0.3.9's `crates/metal` too. It has Qwen3.6's shapes and a next-token layer beyond the trunk; the open reads the trunk's layers only (`crates/model/src/arch/qwen35moe/spec.rs:9`) | PR #805's comment: rc 0 at the base and with the change |
+| Sage-A1.5, Q4_K_M | not run on Metal in the sources of this page `[unverified]`. Its file has Qwen3.6's shapes, plans the same weight bytes (`--plan` on the CUDA path) and carries a next-token layer too ([`../models.md`](../models.md)), so it is expected to open as Ornith does | none yet |
+| Qwen3.6 `UD-Q4_K_XL` | refused by name today: its tensors of type Q8_0 and Q5_K are not types of the list above | the refusal sites above; PR #806's body (a `--plan` of a header cut: 350 items, every Q8_0, Q5_K and F32 site) |
+| Qwen3-30B-A3B | refused by name today: architecture `qwen3moe` | PR #806's body (a `--plan` of a header cut: refused at the architecture) |
+
+The two refused files are the next two to open; the design is [`../research/metal-all-models.md`](../research/metal-all-models.md) (PR #802).
+
+The one rate in PR #805's comment: an Apple M1 Pro with 32 GB, macOS 27.0.1, `generate_metal --prompt "The capital of
+France is" -n 32`, greedy, with a download running on the same Mac. MiniCPM-V and Ornith each decoded at 43.4 tok/s.
+That is a development-loop number, not a measurement of the engine: the Mac has no timing runner. It also shows that a
+32 GB Mac opened and ran two Q4_K_M files of 35B-A3B shape.
+
+### 1.2 Before opening a file: `generate_metal --plan` (after #806)
+
+`generate_metal --plan [--ctx C]` reads only the file's header and tensor table and loads no weights. It prints every
+refusal the open would raise, not only the first, then the bytes the open would allocate, the device's working set and
+the host's free memory. It exits 0 when the file opens, 3 when it is refused and 64 when the header cannot be read.
+The data section may be truncated: a 24 MB cut of a Hub file is enough. In PR #806 the open's checks move into one pure
+function over the header and tensor table, and the open stops at the first refusal with the text it had before.
+
+PR #806's evidence, on the lead's M1 Pro (32 GB), with `--plan` on 24 MB header cuts of Hub files: the MiniCPM-V and
+Ornith Q4_K_M files print `plan: opens`; Qwen3.6 `UD-Q4_K_XL` prints `plan: refused, 350 items`; Qwen3-30B-A3B is
+refused at the architecture.
+
+### 1.3 The Metal toolchain, and which kernel path is tested
+
+`crates/metal/build.rs` runs `xcrun -sdk macosx metal --version` (`build.rs:184-191`). If it answers, the build compiles
+the kernels into a metallib and the runtime loads that. If it does not, the build embeds the kernels' source and the
+runtime compiles it when the device opens (`crates/metal/src/library.rs:199-215`). The tensor-op GEMMs that a GPU with
+matrix units takes (Metal 4; the M5 in [`../mac.md`](../mac.md)) are compiled from source at the open on both paths
+(`library.rs:207-214`).
+
+The maintainers' Macs have no Metal Toolchain. On the lead Mac in this round the command printed `error: cannot execute
+tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain`; the other Macs used for
+this port are reported to have none either. So every gate and every number on this page ran the source path. **The
+metallib path is not tested on any of the maintainers' Macs.** The kernels gate has a clause for it,
+`metallib_equals_source`, which runs every entry through both libraries and compares the words; a build without the
+toolchain reports it as a skip.
+
+A tester with the toolchain installed (`xcodebuild -downloadComponent MetalToolchain`) can help: run `just lab-metal`
+and report its output. The kernels gate prints a `metal-lib: path=metallib` or `path=source` line; its
+`metallib_equals_source` clause gives a verdict only on a build that made a metallib.
+
 ## 2. The machines
 
 The measured machine is the only Mac used in this round; the M5 rows are Apple's own statements, with the line copied.
-No M5 machine was available, so nothing about the Neural Accelerators is measured.
+No M5 machine was available in this round, so nothing about the Neural Accelerators is measured here; a contributor's
+M5 Ultra numbers are in [`../mac.md`](../mac.md).
 
 | Fact | Value | Source |
 |---|---|---|
@@ -41,7 +102,7 @@ No M5 machine was available, so nothing about the Neural Accelerators is measure
 | OS, Metal | macOS 27.0 (26A428); Metal 4 supported; GPU family `apple7`, not `apple8`/`apple9` | measured: `sw_vers`, the Swift `supportsFamily` probe (`probes/dev.swift`, `machine-probe.log`) |
 | Page size, cache line | 16384 B (`hw.pagesize`), 128 B (`hw.cachelinesize`); L2 12582912 B for the performance cores, 4194304 B for the efficiency cores | measured: `sysctl` |
 | CPU ISA | `hw.optional.arm.FEAT_DotProd` 1, `FEAT_I8MM` 0, `FEAT_BF16` 0, `FEAT_SME` 0 | measured: `sysctl` |
-| GPU memory limits | `hasUnifiedMemory` true; `recommendedMaxWorkingSetSize` 26800603136 B (0.78 of `hw.memsize` [derived]); `maxBufferLength` 20100448256 B; `maxThreadgroupMemoryLength` 32768 B; `iogpu.wired_limit_mb` 0 | measured: Swift `MTLDevice` probe, `sysctl iogpu.wired_limit_mb` |
+| GPU memory limits | `hasUnifiedMemory` true; `recommendedMaxWorkingSetSize` 26800603136 B (0.78 of `hw.memsize` [derived]); `maxBufferLength` 20100448256 B; `maxThreadgroupMemoryLength` 32768 B; `iogpu.wired_limit_mb` 0. The working set is 0.78 × `hw.memsize` on all three Macs measured: two M1 Pro 32 GB (24.96 GiB each) and an M4 Pro 48 GB (37.44 GiB); above 48 GB the fraction is `[unverified]` | measured: Swift `MTLDevice` probe, `sysctl iogpu.wired_limit_mb`; all three Macs: [`../research/metal-offload.md`](../research/metal-offload.md) §1.1 |
 | Missing tools | `flock`, `timeout`, `gtimeout`, `setsid` are not on this Mac | measured: `which` |
 | Toolchain | the pinned `nightly-2026-08-28` (`rustc 1.100.0-nightly (e457a7b0d 2026-08-27)`) builds natively; `aarch64-apple-darwin` is tier 1 | measured; https://doc.rust-lang.org/nightly/rustc/platform-support.html : "aarch64-apple-darwin ARM64 macOS (11.0+, Big Sur+)" under "Tier 1 with Host Tools" |
 
@@ -396,7 +457,7 @@ What of the Spark's placement applies (`crates/placement/src/placement.rs:280-28
 | Spark (GB10) | On a Mac |
 |---|---|
 | one pool, `PoolOver` holds Σ card + host ≤ available | the same rule. The census fills `UnifiedPool` from `MTLDevice.hasUnifiedMemory` (https://developer.apple.com/tutorials/data/documentation/metal/mtldevice/hasunifiedmemory.json : "A Boolean value that indicates whether the GPU shares all of its memory with the CPU.") |
-| the pool's room is `MemAvailable` | the GPU's share is capped lower: `recommendedMaxWorkingSetSize` ("An approximation of how much memory, in bytes, this GPU device can allocate without affecting its runtime performance.", https://developer.apple.com/tutorials/data/documentation/metal/mtldevice/recommendedmaxworkingsetsize.json) was 26800603136 B of 34359738368 on this machine (0.78 [derived]). `iogpu.wired_limit_mb` read 0 here (the default); a third party's reading of the default is two thirds of RAM up to 36 GB and three quarters above (`mistral.rs` `mistralrs-core/src/utils/memory_usage.rs:398-406`, `[unverified]` for Apple's behaviour). The pool is `min(working set, MemAvailable)` |
+| the pool's room is `MemAvailable` | the GPU's share is capped lower: `recommendedMaxWorkingSetSize` ("An approximation of how much memory, in bytes, this GPU device can allocate without affecting its runtime performance.", https://developer.apple.com/tutorials/data/documentation/metal/mtldevice/recommendedmaxworkingsetsize.json) was 26800603136 B of 34359738368 on this machine (0.78 [derived]; the same ratio on three Macs, section 2). `iogpu.wired_limit_mb` read 0 here (the default); a third party's reading of the default is two thirds of RAM up to 36 GB and three quarters above (`mistral.rs` `mistralrs-core/src/utils/memory_usage.rs:398-406`, `[unverified]` for Apple's behaviour). The pool is `min(working set, MemAvailable)` |
 | `cuMemHostAlloc(PORTABLE\|DEVICEMAP\|WRITECOMBINED)` pinned arena | `MTLResourceStorageModeShared`: https://developer.apple.com/tutorials/data/documentation/metal/mtlstoragemode/shared.json , "The CPU and GPU share access to the resource, allocated in system memory." and "This is the default storage mode for … instances on integrated GPUs and both … and … instances on Apple silicon GPUs." (the type names are links in the page data) No flags, no registration; write-combined does not exist |
 | `cudaHostRegister` of an anonymous arena | not needed: wrap page-aligned memory with `newBufferWithBytesNoCopy` |
 | the card leg reads the arena in place | the same: a Metal kernel reads the shared buffer. The CPU and GPU must not touch a buffer at once (Apple: "you’re responsible for synchronizing access to the texture from the other participant"): the `HostFlags` role is `MTLSharedEvent` waits and signals (https://developer.apple.com/tutorials/data/documentation/metal/mtlsharedevent.json : "A shared event can synchronize memory operations across multiple Metal devices and the CPU.") |
@@ -478,6 +539,11 @@ measured); two core classes (`hw.nperflevels` 2: 8 performance and 2 efficiency 
 
 ## Part D. Gates on a Mac (M3)
 
+**Status (main `d916e20ac`).** The Metal gates run on a Mac through `tools/mac-gate.sh`: `just lab-metal` runs the
+device gate, the `qwen35moe` kernels gate and that gate's mutants, and `just lab-metal-e2e` runs the `qwen35moe` session
+against ik's reference sets of the fixture family. They are `lab-` recipes, so no landing batch selects them. No Mac
+timing runner exists. The tables and bullets below are the plan of 2026-10-21.
+
 **What can run at each phase.**
 
 | Phase | Runs on a Mac | Evidence class |
@@ -517,10 +583,16 @@ And the first bullet ("Never build a device crate with plain cargo") gains one s
 
 ## Part E. The phased plan
 
+**Status (main `d916e20ac`).** M0a and M0b landed as `crates/os` (`cd40ceac9`, `000a5d52d`, 2026-10-21). M2.0 was
+measured (section C.5). The device contract and its Metal backend landed as `bloomery-device` and `bloomery-metal`
+(`c16dd696c`, 2026-10-22). The first Metal family is `qwen35moe` (question 2 of Part F); its tensor-op GEMMs
+(`aaf14ad24`, 2026-10-25) and the Apple Silicon release build (`e3ee4b796`, 2026-10-25) followed. The table below is the
+plan as written and its rows are not edited.
+
 Ordered for the shortest path to a fast Metal decode on one model. M1 leaves the critical path: the Metal engine runs the model whole on
 the GPU out of unified memory, where a CPU tier adds no capacity (C.4), so nothing in M2 waits on NEON or a CPU `serve::Engine`; the
 `Vocab` lift (B.2) is the only part of M1 the serve step needs. M0 stays: the Metal crate reuses `bloomery-model`'s placement and
-hparams, `gguf`, `refset` and `threads`, which do not build on a Mac today.
+hparams, `gguf`, `refset` and `threads`, which did not build on a Mac before `crates/os`.
 
 | Step | Work items | Files touched; size `[derived]` | What proves it (change class, `AGENTS.md` "Derive first") | Depends on |
 |---|---|---|---|---|
@@ -553,6 +625,13 @@ hparams, `gguf`, `refset` and `threads`, which do not build on a Mac today.
 - *Report.* The per-crate rc table again, the list of clauses skipped on macOS by name, the `canon-check` line.
 
 ## Part F. Open questions for the maintainer
+
+**Status (main `d916e20ac`).** The code answers three of these, not a maintainer's reply on this page. Question 2: the
+first Metal family is `qwen35moe` (`crates/metal/src/arch/qwen3moe/arena.rs:1` is its arena), and Qwen3-30B-A3B is
+refused by name. Question 7: macOS 26.2, refused by name below it (`crates/metal/src/device.rs:19`). Question 8:
+`objc2-metal`, pinned by `=` (`Cargo.toml:39`), with no Objective-C++ shim. Question 5 has a partial answer: a
+contributor ran the tensor path on an M5 Ultra ([`../mac.md`](../mac.md)); who owns an M5-class machine is not answered.
+The other questions are not answered on this page.
 
 1. **Numeric contract of the first Metal kernels.** q8_1 activations as on CUDA (integer-exact, bit-equal where the order is copied, two extra dispatches a layer for the quantizers) or f32/f16 activations as ggml-metal (fewer dispatches, no activation rounding, but a different family of bits and a band against ik that is not measured)? The kernel list depends on it.
 2. **The first Metal family.** `qwen3moe` (15 kernels, no fixture row: `registry.rs:103`), or `qwen35moe` (fixture exists, `registry.rs:124`, plus the delta rule and gated kernels), or both with `qwen3moe` first and the fixture family as the gate input?
