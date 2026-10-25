@@ -31,7 +31,11 @@
 //! ([`Checkpoints::enqueue_points`]): the slots it reads are not written
 //! ([`Checkpoints::take`], [`Checkpoints::open_take`], [`Checkpoints::adopt`])
 //! or freed before it lands, and a write that reaches one is refused by name.
+//!
+//! A body whose every store is a plane of positions takes no checkpoint: its
+//! state is the rows alone ([`planes`]).
 
+pub mod planes;
 pub mod saved;
 pub mod staging;
 

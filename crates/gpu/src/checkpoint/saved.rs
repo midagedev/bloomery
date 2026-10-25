@@ -43,18 +43,26 @@
 //! The host memory of a state taken by [`SeqState::save`] is pageable, every
 //! page written by the host before the copies ([`crate::tensor::host_filled`]):
 //! each copy runs on the engine stream, one synchronize at the end.
+//!
+//! A body whose every store is a plane of positions has no recurrent store and
+//! no point: its state is the positional rows alone ([`SeqState::save_rows`],
+//! [`SeqState::save_rows_async`]), made of stores that grow by a rule
+//! ([`Spans::by_position`], [`Spans::by_pool`]), and any prefix of it is a valid
+//! cut: [`SeqState::keep_point`] is every position up to the state's, and
+//! [`SeqState::load_rows`] moves the rows of the first `k` positions.
 
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
+use gguf::Split;
 use runtime::savemap::{Per, Run, Strip, plan_prefix, plan_whole};
 
 use super::Checkpoints;
 use super::staging::{NoRoom, Staged, Staging};
-use crate::GpuError;
 use crate::tensor::{Pitched, dtoh_2d, host_filled, htod_2d};
+use crate::{Gpu, GpuError};
 
 const WHAT: &str = "sequence state";
 
@@ -69,6 +77,27 @@ pub struct Identity {
     pub card: String,
     /// The positions every store was sized for.
     pub ctx: usize,
+}
+
+impl Identity {
+    /// The identity of a load of `arch` from `file` on `gpu`, its stores sized
+    /// for `ctx` positions. Refused by name for a file with no shard.
+    pub fn of_load(
+        arch: &'static str,
+        file: &Split,
+        gpu: &Gpu,
+        ctx: usize,
+    ) -> Result<Identity, GpuError> {
+        Ok(Identity {
+            arch,
+            file: file
+                .shard_path(0)
+                .ok_or(GpuError::state(WHAT, "the file's first shard"))?
+                .to_path_buf(),
+            card: gpu.device_name()?,
+            ctx,
+        })
+    }
 }
 
 impl fmt::Display for Identity {
@@ -310,10 +339,33 @@ pub struct SeqState<T> {
     current: T,
     /// Ascending, each below `positions`.
     points: Vec<(u32, T)>,
+    /// Where a prefix of the state can be cut to.
+    cuts: Cuts,
     /// What the copy cost, set once the host arrays hold the whole state: at
     /// once for a state taken on the engine stream, by [`Pending::land`] for
     /// one a copy stream fills. A resume reads the arrays only after.
     landed: OnceLock<SaveCost>,
+}
+
+/// Where a state can be cut to ([`SeqState::keep_point`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cuts {
+    /// At its own position and at the points it carries: a recurrent store
+    /// holds one position only.
+    AtPoints,
+    /// At any position: every store is a plane of positions that grows by a
+    /// rule, so the first `k` positions are the first `k` rows of each.
+    Anywhere,
+}
+
+/// What a save carries beside the rows: the host value of the current
+/// position, the points with theirs, the checkpoints those points are read
+/// from (none for a state of positional rows alone) and the state's cut rule.
+struct Carry<'c, T> {
+    current: T,
+    points: Vec<(u32, T)>,
+    ckpt: Option<&'c Checkpoints>,
+    cuts: Cuts,
 }
 
 /// The copy stream saves run on and the pinned staging their states are made
@@ -584,7 +636,29 @@ impl<T> SeqState<T> {
         points: Vec<(u32, T)>,
         ckpt: &Checkpoints,
     ) -> Result<SeqState<T>, GpuError> {
-        let lens = Self::checked(lent, positions, &points, ckpt)?;
+        let carry = Carry {
+            current,
+            points,
+            ckpt: Some(ckpt),
+            cuts: Cuts::AtPoints,
+        };
+        Self::save_in(stream, who, positions, lent, carry)
+    }
+
+    fn save_in(
+        stream: &CudaStream,
+        who: Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+        carry: Carry<'_, T>,
+    ) -> Result<SeqState<T>, GpuError> {
+        let Carry {
+            current,
+            points,
+            ckpt,
+            cuts,
+        } = carry;
+        let lens = Self::checked(lent, positions, &points, ckpt, cuts)?;
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
         let one: usize = lens.iter().sum();
@@ -608,9 +682,11 @@ impl<T> SeqState<T> {
         let synced = stream.synchronize();
         sent?;
         synced?;
-        for (i, &(at, _)) in points.iter().enumerate() {
-            let from = one * (1 + i);
-            ckpt.read_point(at, &mut recurrent[from..from + one])?;
+        if let Some(ckpt) = ckpt {
+            for (i, &(at, _)) in points.iter().enumerate() {
+                let from = one * (1 + i);
+                ckpt.read_point(at, &mut recurrent[from..from + one])?;
+            }
         }
         Ok(SeqState {
             who,
@@ -620,6 +696,7 @@ impl<T> SeqState<T> {
             lens,
             current,
             points,
+            cuts,
             landed: OnceLock::from(SaveCost::default()),
         })
     }
@@ -645,7 +722,29 @@ impl<T> SeqState<T> {
         points: Vec<(u32, T)>,
         ckpt: &Checkpoints,
     ) -> Result<Result<Pending<T>, NoRoom>, GpuError> {
-        let lens = Self::checked(lent, positions, &points, ckpt)?;
+        let carry = Carry {
+            current,
+            points,
+            ckpt: Some(ckpt),
+            cuts: Cuts::AtPoints,
+        };
+        Self::save_async_in(streams, who, positions, lent, carry)
+    }
+
+    fn save_async_in(
+        streams: Streams<'_>,
+        who: Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+        carry: Carry<'_, T>,
+    ) -> Result<Result<Pending<T>, NoRoom>, GpuError> {
+        let Carry {
+            current,
+            points,
+            ckpt,
+            cuts,
+        } = carry;
+        let lens = Self::checked(lent, positions, &points, ckpt, cuts)?;
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
         let one: usize = lens.iter().sum();
@@ -682,7 +781,7 @@ impl<T> SeqState<T> {
                 )
             };
             let calls = sent?;
-            if !points.is_empty() {
+            if let Some(ckpt) = ckpt.filter(|_| !points.is_empty()) {
                 let ats: Vec<u32> = points.iter().map(|&(at, _)| at).collect();
                 // SAFETY: the points' region is this state's alone. A failed
                 // enqueue or end event waits for the lane before it is returned.
@@ -700,7 +799,9 @@ impl<T> SeqState<T> {
         })?;
         let end = Arc::new(end);
         staged.hold(Arc::clone(&end));
-        ckpt.guard_points(Arc::clone(&end));
+        if let Some(ckpt) = ckpt {
+            ckpt.guard_points(Arc::clone(&end));
+        }
         Ok(Ok(Pending {
             state: Arc::new(SeqState {
                 who,
@@ -710,6 +811,7 @@ impl<T> SeqState<T> {
                 lens,
                 current,
                 points,
+                cuts,
                 landed: OnceLock::new(),
             }),
             start,
@@ -721,20 +823,39 @@ impl<T> SeqState<T> {
 
     /// The recurrent stores' lengths, after the checks both saves share:
     /// refused by name when the stores are not the checkpoints', or the points
-    /// do not ascend from above 0 and below `positions`.
+    /// do not ascend from above 0 and below `positions`; for a state of rows
+    /// alone (no checkpoints), when a recurrent store or a point is lent, or
+    /// a positional store has no growth rule.
     fn checked(
         lent: &Lent<'_, '_, '_>,
         positions: u32,
         points: &[(u32, T)],
-        ckpt: &Checkpoints,
+        ckpt: Option<&Checkpoints>,
+        cuts: Cuts,
     ) -> Result<Vec<usize>, GpuError> {
         lent.bytes(points.len())?;
         let lens = lent.lens();
-        if lens != ckpt.lens() {
-            return Err(shape(format!(
-                "recurrent stores of {lens:?} f32s; the checkpoints copy {:?}",
-                ckpt.lens()
-            )));
+        match ckpt {
+            Some(ckpt) if lens != ckpt.lens() => {
+                return Err(shape(format!(
+                    "recurrent stores of {lens:?} f32s; the checkpoints copy {:?}",
+                    ckpt.lens()
+                )));
+            }
+            None if !lens.is_empty() || !points.is_empty() => {
+                return Err(shape(format!(
+                    "recurrent stores of {lens:?} f32s and {} points lent to a state of positional \
+                     rows alone",
+                    points.len()
+                )));
+            }
+            _ => {}
+        }
+        if cuts == Cuts::Anywhere && lent.runs().iter().any(|r| matches!(r.per, Per::Whole)) {
+            return Err(shape(
+                "a positional store of no growth rule in a state that can be cut anywhere"
+                    .to_owned(),
+            ));
         }
         check_points(positions, points.iter().map(|&(p, _)| p))?;
         Ok(lens)
@@ -752,7 +873,7 @@ impl<T> SeqState<T> {
         lent: &mut Lent<'_, '_, '_>,
         ckpt: &mut Checkpoints,
     ) -> Result<Hosts<'_, T>, GpuError> {
-        let r = self.resume(stream, who, lent, ckpt, None)?;
+        let r = self.resume(stream, who, lent, Some(ckpt), None)?;
         Ok((r.current, r.points))
     }
 
@@ -774,7 +895,7 @@ impl<T> SeqState<T> {
         ckpt: &mut Checkpoints,
         n: u32,
     ) -> Result<Resumed<'_, T>, GpuError> {
-        self.resume(stream, who, lent, ckpt, Some(n))
+        self.resume(stream, who, lent, Some(ckpt), Some(n))
     }
 
     fn resume(
@@ -782,7 +903,7 @@ impl<T> SeqState<T> {
         stream: &CudaStream,
         who: &Identity,
         lent: &mut Lent<'_, '_, '_>,
-        ckpt: &mut Checkpoints,
+        ckpt: Option<&mut Checkpoints>,
         prefix: Option<u32>,
     ) -> Result<Resumed<'_, T>, GpuError> {
         if *who != self.who {
@@ -809,15 +930,17 @@ impl<T> SeqState<T> {
             )));
         }
         let lens = lent.lens();
-        if lens != self.lens || lens != ckpt.lens() {
+        let copied = ckpt.as_deref().map_or(&[][..], Checkpoints::lens);
+        if lens != self.lens || lens != copied {
             return Err(shape(format!(
                 "a state of recurrent stores of {:?} f32s put back into {lens:?} (the \
-                 checkpoints copy {:?})",
-                self.lens,
-                ckpt.lens()
+                 checkpoints copy {copied:?})",
+                self.lens
             )));
         }
-        if !ckpt.positions().is_empty() || ckpt.pending() {
+        if let Some(ckpt) = ckpt.as_deref()
+            && (!ckpt.positions().is_empty() || ckpt.pending())
+        {
             return Err(shape(format!(
                 "a state put back beside checkpoints at {:?}: resume onto an empty model",
                 ckpt.positions()
@@ -837,9 +960,10 @@ impl<T> SeqState<T> {
         }
         .map_err(|e| shape(e.to_string()))?;
         // The recurrent stores as they stood at `at`: the state's own, or the
-        // point's.
+        // point's. A state of rows alone has none, and its one host value
+        // stands for every cut.
         let one: usize = self.lens.iter().sum();
-        let (from, current) = if whole {
+        let (from, current) = if whole || self.cuts == Cuts::Anywhere {
             (0, &self.current)
         } else {
             let i = self
@@ -870,9 +994,11 @@ impl<T> SeqState<T> {
         let bytes = strips.iter().map(Strip::values).sum::<usize>() * size_of::<u16>()
             + one * size_of::<f32>();
         let adopted = self.points.partition_point(|&(p, _)| p <= at);
-        for (i, &(p, _)) in self.points[..adopted].iter().enumerate() {
-            let from = one * (1 + i);
-            ckpt.adopt(p, &self.host.recurrent()[from..from + one])?;
+        if let Some(ckpt) = ckpt {
+            for (i, &(p, _)) in self.points[..adopted].iter().enumerate() {
+                let from = one * (1 + i);
+                ckpt.adopt(p, &self.host.recurrent()[from..from + one])?;
+            }
         }
         Ok(Resumed {
             at,
@@ -903,11 +1029,15 @@ impl<T> SeqState<T> {
 
     /// The longest prefix of at most `n` positions a model holds right after
     /// the state is put back: every position when `n` reaches them, else the
-    /// nearest carried point at or below `n`, else none.
+    /// nearest carried point at or below `n`, else none; for a state of rows
+    /// alone, `n` itself.
     #[must_use]
     pub fn keep_point(&self, n: u32) -> u32 {
         if n >= self.positions {
             return self.positions;
+        }
+        if self.cuts == Cuts::Anywhere {
+            return n;
         }
         self.points
             .iter()
@@ -915,6 +1045,68 @@ impl<T> SeqState<T> {
             .map(|&(p, _)| p)
             .find(|&p| p <= n)
             .unwrap_or(0)
+    }
+}
+
+/// The state of a body whose every store is a plane of positions (the module
+/// doc): the positional rows alone, no recurrent store and no point, so a
+/// prefix of any length is a cut ([`SeqState::keep_point`]).
+impl SeqState<()> {
+    /// [`SeqState::save`] of `lent`'s positional rows alone, on the engine
+    /// stream. Refused by name when `lent` holds a recurrent store or a store
+    /// whose runs carry no growth rule ([`Spans::planes`]).
+    pub fn save_rows(
+        stream: &CudaStream,
+        who: Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+    ) -> Result<SeqState<()>, GpuError> {
+        Self::save_in(stream, who, positions, lent, Carry::rows())
+    }
+
+    /// [`SeqState::save_async`] of `lent`'s positional rows alone: the copy on
+    /// `streams`' lane into pinned staging, [`NoRoom`] when the staging holds
+    /// no free extent. Refused by name as [`SeqState::save_rows`] refuses.
+    pub fn save_rows_async(
+        streams: Streams<'_>,
+        who: Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+    ) -> Result<Result<Pending<()>, NoRoom>, GpuError> {
+        Self::save_async_in(streams, who, positions, lent, Carry::rows())
+    }
+
+    /// The first `n` positions of the state put back on `who`'s model: only
+    /// the rows of those positions move ([`SeqState::load_prefix`] of a state
+    /// that can be cut anywhere). Refused by name, nothing copied, for another
+    /// model's state or layout, an `n` of 0 or past the state's positions, and
+    /// a state whose copy is still running.
+    pub fn load_rows(
+        &self,
+        stream: &CudaStream,
+        who: &Identity,
+        lent: &mut Lent<'_, '_, '_>,
+        n: u32,
+    ) -> Result<Resumed<'_, ()>, GpuError> {
+        if n > self.positions {
+            return Err(shape(format!(
+                "a prefix of {n} positions of a state of {}",
+                self.positions
+            )));
+        }
+        self.resume(stream, who, lent, None, Some(n))
+    }
+}
+
+impl Carry<'_, ()> {
+    /// A save of positional rows alone.
+    fn rows() -> Self {
+        Carry {
+            current: (),
+            points: Vec::new(),
+            ckpt: None,
+            cuts: Cuts::Anywhere,
+        }
     }
 }
 
@@ -1144,6 +1336,7 @@ mod tests {
             lens: Vec::new(),
             current: (),
             points: [512, 1_024, 2_048].map(|p| (p, ())).to_vec(),
+            cuts: Cuts::AtPoints,
             landed: OnceLock::new(),
         };
         let kept = |asks: [u32; 8]| asks.map(|n| state.keep_point(n));
@@ -1151,6 +1344,97 @@ mod tests {
             kept([2_049, 1_500, 1_024, 511, 300, 0, 2_200, 9_000]),
             [2_048, 1_024, 1_024, 0, 0, 0, 2_200, 2_200]
         );
+    }
+
+    /// A state of positional rows alone is cut at any position up to its own: the
+    /// longest prefix a request asks for, where a state that carries points keeps
+    /// only its points.
+    #[test]
+    fn a_state_of_rows_alone_keeps_every_prefix() {
+        let state = SeqState::<()> {
+            who: who(),
+            positions: 40,
+            host: Host::Owned {
+                rows: Vec::new(),
+                recurrent: Vec::new(),
+            },
+            runs: Vec::new(),
+            lens: Vec::new(),
+            current: (),
+            points: Vec::new(),
+            cuts: Cuts::Anywhere,
+            landed: OnceLock::new(),
+        };
+        assert_eq!(
+            [0, 1, 17, 39, 40, 99].map(|n| state.keep_point(n)),
+            [0, 1, 17, 39, 40, 40]
+        );
+    }
+
+    /// A state of 5 positions of a two-plane store, rows alone: it saves
+    /// rows 0..5 of each plane, a recurrent store lent to it is refused by
+    /// name, and put back on an empty model it restores exactly the first 3
+    /// positions of each plane when asked for 3 (nothing past them moves), and
+    /// is refused by name for a prefix past its positions.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_state_of_rows_alone_comes_back_at_any_prefix() {
+        let gpu = crate::Gpu::new().expect("CUDA device 0");
+        let stream = gpu.stream_handle();
+        // Two planes of 8 positions, a row of 2 values.
+        let plane: Vec<u16> = (0..32).collect();
+        let mut kv = DeviceBuffer::from_host(&stream, &plane).expect("a store");
+        let mut rec = DeviceBuffer::from_host(&stream, &[3.0f32; 4]).expect("a store");
+        {
+            let mut spans = [Spans::by_position(&mut kv, 2, 16, 5, 2).expect("spans")];
+            let lent = Lent {
+                positional: &mut spans,
+                recurrent: &mut [&mut rec],
+            };
+            let err = SeqState::save_rows(&stream, who(), 5, &lent)
+                .err()
+                .expect("a recurrent store lent to rows alone is refused");
+            assert!(err.to_string().contains("positional rows alone"), "{err}");
+        }
+        let s = {
+            let mut spans = [Spans::by_position(&mut kv, 2, 16, 5, 2).expect("spans")];
+            let lent = Lent {
+                positional: &mut spans,
+                recurrent: &mut [],
+            };
+            SeqState::save_rows(&stream, who(), 5, &lent).expect("a save")
+        };
+        assert_eq!(s.bytes(), 2 * 10 * 2);
+        assert_eq!(
+            (s.keep_point(3), s.keep_point(9), s.keep_point(0)),
+            (3, 5, 0)
+        );
+        kv.copy_from_host(&stream, &[9u16; 32]).expect("kv");
+        let put = {
+            let mut spans = [Spans::by_position(&mut kv, 2, 16, 5, 2).expect("spans")];
+            let mut lent = Lent {
+                positional: &mut spans,
+                recurrent: &mut [],
+            };
+            let past = s
+                .load_rows(&stream, &who(), &mut lent, 6)
+                .err()
+                .expect("a prefix past the state's positions is refused");
+            assert!(
+                past.to_string()
+                    .contains("a prefix of 6 positions of a state of 5"),
+                "{past}"
+            );
+            s.load_rows(&stream, &who(), &mut lent, 3)
+                .expect("a prefix load")
+                .at
+        };
+        assert_eq!(put, 3);
+        let back = kv.to_host_vec(&stream).expect("kv");
+        assert_eq!(&back[..6], &plane[..6]);
+        assert!(back[6..16].iter().all(|&v| v == 9), "a row past the prefix");
+        assert_eq!(&back[16..22], &plane[16..22]);
+        assert!(back[22..].iter().all(|&v| v == 9), "a row past the prefix");
     }
 
     // ----------------------------------------------------- the synthetic model
