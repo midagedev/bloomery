@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::serve_client::{
-    SeatGate, Served, check, curl, ids_of, json_of, server_log, tokenized,
+    SeatGate, Served, check, completion_raw, curl, ids_of, json_of, server_log, tokenized,
 };
 use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -350,11 +350,10 @@ fn chat(
     ))
 }
 
-/// One greedy `/completion` of the prefix clause: the timings' `prompt_n` and
-/// `cache_n` and their sum, the answer's text and ids, its body in
+/// One greedy `/completion` of the prefix clause: the timings' `cache_n` and
+/// the sum of it and `prompt_n`, the answer's text and ids, its body in
 /// `<dir>/<name>.json`.
 struct Asked {
-    prompt_n: u64,
     cache_n: u64,
     whole: u64,
     content: String,
@@ -371,11 +370,7 @@ fn asked(
     ids: &[u32],
     cache: bool,
 ) -> Result<Asked, GateError> {
-    let body = json!({
-        "prompt": ids, "n_predict": PREFIX_TOKENS, "temperature": 0,
-        "return_tokens": true, "cache_prompt": cache,
-    });
-    let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+    let (st, text) = completion_raw(url, ids, usize::try_from(PREFIX_TOKENS)?, cache)?;
     std::fs::write(dir.join(format!("{name}.json")), &text)?;
     let v = json_of("/completion", st, &text)?;
     let timings = &v["timings"];
@@ -386,10 +381,12 @@ fn asked(
     };
     let (prompt_n, cache_n) = (count("prompt_n")?, count("cache_n")?);
     Ok(Asked {
-        prompt_n,
         cache_n,
         whole: prompt_n + cache_n,
-        content: v["content"].as_str().unwrap_or("").to_owned(),
+        content: v["content"]
+            .as_str()
+            .ok_or_else(|| format!("{name}: the answer carries no content text"))?
+            .to_owned(),
         tokens: ids_of(&v["tokens"]),
     })
 }
@@ -410,7 +407,8 @@ fn common(a: &[u32], b: &[u32]) -> usize {
 /// least `n1` ids and its two timings count its whole prompt; the third —
 /// [`PREFIX_TEXT`] and [`Q3`], which differs from [`Q1`] in its first word —
 /// keeps exactly the ids the two prompts' tokenizations share, and the same
-/// prompt answered with the cache off writes the same text. The holds past the
+/// prompt answered with the cache off keeps no position and writes the same
+/// text. The holds past the
 /// first prompt's counting are a seat whose cut keeps every held position's
 /// ([`Cut::EveryPosition`]): a body that keeps a shared prefix only where its
 /// state stands ([`Cut::WhereItStands`]) re-feeds a shorter shared prompt from
@@ -421,7 +419,9 @@ fn common(a: &[u32], b: &[u32]) -> usize {
 /// history of requests, and one line names the record and skips the hold.
 /// FAIL-first: a seat whose keep query grants nothing (`Seat::keep` answering
 /// 0) keeps none of the shared prefix, the second and third holds are red and
-/// the clause is red.
+/// the clause is red; a server that reuses the slot for the cache-off request
+/// too (`cache_prompt` ignored) keeps positions in the reference, and the
+/// same-answer hold is red.
 fn live_slot_keeps_the_prefix(
     c: &Clauses,
     url: &dyn Fn(&str) -> String,
@@ -494,10 +494,12 @@ fn live_slot_keeps_the_prefix(
             holds &= exact;
             if lever == "off" {
                 let fresh = asked(url, dir, "prefix_shorter_fresh", &ids3, false)?;
-                let same = fresh.content == third.content;
+                let same = fresh.cache_n == 0 && fresh.content == third.content;
                 println!(
-                    "prefix same answer: the cache-off run kept {} and wrote the same text {}",
-                    fresh.cache_n, same
+                    "prefix same answer: the cache-off run kept {} (want 0) and wrote the same \
+                     text {}",
+                    fresh.cache_n,
+                    fresh.content == third.content
                 );
                 holds &= same;
             } else {
