@@ -194,7 +194,7 @@ Mac's shape; section 4 (`:471-502`) the cost model; 3(j) (`:360-386`) the read u
 | arena memory: `ArenaMem` (`:139`), `ArenaKind::{Anon, Pinned}` (`:307`), `ArenaMem::pinned` (`:189`, `cuMemHostAlloc`) | `nvtier.rs:139-200,307-321,2126-2130` | the only CUDA-bound line group of the tier core (plus `issue_card_hold`) | a third kind `Shared`: an `AnonMap` wrapped by `makeBuffer(bytesNoCopy:)`, or the `MTLBuffer`'s own pages | no `MADV_DONTNEED` give-back (the refill overwrites in place; `tierengine.md:301`); one buffer is at most 0.585 x RAM, so one buffer per layer group |
 | fill reader: `NVTIER_FILL_THREADS` 16, rank queue, one `pread` a part | `nvtier.rs:127`, `nvtier/reader.rs:1-16,321` (792 lines) | yes (`GpuError` only) | carries over; thread count is the measured queue depth (QD 4 reaches the plateau on both Macs) | the unit stays a part (3 a fill, ~1 MB each: QD 3 of 1 MiB parts = 5.2-5.7 GB/s [derived between QD 1 and QD 4 above]) |
 | the O_DIRECT reader: `DirectFile`, `AnonMap`, `aligned_span`, `DIRECT_ALIGN` | `crates/engram/src/direct.rs:29,45,143,156` | yes | already runs: `crates/os/src/lib.rs:286` opens with `F_NOCACHE` on macOS | `DIRECT_ALIGN` is 4096 and Apple pages are 16 KiB; the probe above used 16 KiB alignment, 4 KiB-skewed `F_NOCACHE` reads are [unverified] |
-| the seam to the model: `TierSlots`, `Claim`, `Ticket`, `TierError` | `crates/model/src/moe.rs:2479,2290`; impl `nvtier.rs:3641` | device-free but in `crates/model`, which the Mac cannot build (`workstation.rs:74` reads `/sys/fs/cgroup`; `tools/recipes.py pure-crates` rejects it) | the seam types move with the tier core | none |
+| the seam to the model: `TierSlots`, `Claim`, `Ticket`, `TierError` | `crates/model/src/moe.rs:2479,2290`; impl `nvtier.rs:3641` | device-free; the Metal crate already depends on `crates/model` (`crates/metal/Cargo.toml:75`), although its complete native test suite is not in `pure-crates` | reuse the seam's existing owner when lifting the tier core | none |
 | the card leg: `ArenaLeg`, `issue_card_hold`, `CardTicket`, `CardHold::offsets`, the `_at` kernel entries | `crates/gpu/src/host/arena_leg.rs:1-31`, `nvtier.rs:1205,1258,2813` | CUDA-bound (streams, mapped tables, `kquant::sel`) | the template for the Metal leg: ids -> slot byte offsets -> expert kernels | on GB10 and here the card reads the arena in place: a hit costs the expert's bytes at the GPU rate, no copy |
 | handoff page and wait ops | `crates/gpu/src/host/page.rs:1-40`, `tier_cpu.rs:1-13` | page layout is arithmetic (no cuda); the protocol is a GPU spin-wait | **does not port** (section 1.5) | replaced by poll + commit |
 | card mover: `SwapMachine`, lanes, flips; `FileSwap`; rule | `swap.rs:1-30`, `swap_source.rs:1-50`; `crates/runtime/src/swaprule.rs:522` | the machine is CUDA-bound (streams, events); the rule is device-free | the mover collapses: with one pool there is no second level to flip between (`tierengine.md:283-284`: the card mover is `off`, why `Unified`); the rule's heat could rank arena eviction | `Hosting::Unified` already exists (`placement/workstation.rs:1164`) |
@@ -223,9 +223,14 @@ Weights are loaded today one tensor to one buffer by copy (`crates/metal/src/arc
     sum of listed tensors 111.324 GB (the README's 111.3 GB)
 
 A token reads the dense set D = 4.829 GB and 48 x 10 experts = 1.504 GB: **6.333 GB** [derived]. `py/active_bytes.py` run on the
-Qwen3.6 UD-Q4_K_XL header gives 2.753 GB a token against the 2,884 MB in `plan-triage.md`; Qwen3.6 Q4_K_M decodes at 85.6 tok/s
-on this M4 Pro (`mac-m4pro-xeng-2026-10-25.md`), so the Metal decode kernels run at 223-235 GB/s of the 245 GB/s stream rate
-(91-96 %) [derived: file ratio 0.945 x 2.753 = 2.6-2.75 GB]. That is Qwen3.6's figure. Qwen3.8 has no Metal kernels yet (15th
+Qwen3.6 UD-Q4_K_XL header gives 2.753 GB a token against the 2,884 MB in `plan-triage.md`. ~~Scaling that by the file ratio
+to calibrate Q4_K_M (223-235 GB/s, eta 0.91-0.96)~~ mixed two quants: Q4_K_M reads 1.976 GB a token (its header,
+`metal-all-models.md` §1.1), so its 85.6 tok/s on this M4 Pro (`mac-m4pro-xeng-2026-10-25.md`) is 169 GB/s, 69 % of the 245 GB/s
+stream rate, if the whole step were bandwidth [derived]. It is not: the design doc's two-term model (§3.2 there) fits the step as
+bytes / 262 GB/s + 40 layers x 0.104 ms of latency the bandwidth does not cover (11.68 ms = 7.54 + 4.14). On that model
+Qwen3.8's GPU term on the M4 Pro is 6.333 / 262 = 24.2 ms + 48 x 0.104 = 5.0 ms = **29.2 ms** [derived; the layer latency of
+its hyper-connection, QSA and PLE dispatches is unknown], against the 28.7 ms that eta 0.90 x 245 gave below: the tables keep
+their GPU rows within 2 %. The M1 Pro has no measured Qwen3.6 decode on Metal, so its 144 GB/s stays an assumption. That is Qwen3.6's figure. Qwen3.8 has no Metal kernels yet (15th
 in the design doc's cover order), and its hyper-connection, QSA attention and PLE paths add dispatches the figure does not
 carry. Below, the GPU term is a band: eta = 0.90 (Qwen3.6's measured end) and 0.75 [assumption: a guess for the unwritten kernels].
 
