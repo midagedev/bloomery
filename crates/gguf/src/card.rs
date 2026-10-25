@@ -59,9 +59,9 @@
 //!   IQ3_S and IQ4_XS reach a launch through `crates/gpu/src/iq_sel.rs`, their
 //!   entries (IQ2_S, IQ1_S, IQ1_M and IQ3_S have no plane row core). Q2_K has
 //!   no launcher of that shape.
-//! - V4.1's BF16 and Q3_K embedding rows (`chain/glue.rs` in
-//!   `crates/gpu-deepseek41`): the BF16 rows are that family's own; the
-//!   Q3_K rows have the common entry.
+//! - V4.1's BF16, Q3_K and Q5_K embedding rows and its IQ4_NL Engram rows
+//!   (`chain/glue.rs` in `crates/gpu-deepseek41`): the BF16 and IQ4_NL rows
+//!   are that family's own; the Q3_K and Q5_K rows have the common entry.
 //! - The grouped tile entries (`crates/gpu/src/kquant/tiles.rs`, and
 //!   `grouped_tiles` and `q4k_gemv_tiles` in `crates/gpu/src/q4k_sel.rs`) run
 //!   the Q4_K and Q5_K stacks the `_sel` entries already name and add no type.

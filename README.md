@@ -276,7 +276,8 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 - Muse Spark Open always thinks: a turn's first tokens are its reasoning, so a short `max_tokens` can end with empty
   `content`.
 - MiniMax-M3 (not M3.1) was not checked for 0.3.9.
-- IQ2_S and IQ1_M routed experts do not load.
+- DeepSeek V4.1 runs routed experts on a card only as Q3_K gate·up with a Q4_K down; other expert types (ISTA-DASLab's
+  IQ1_M, IQ2_XXS and IQ2_XS) run on the host tier.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 
 Every limit, by seat: [`docs/serving.md`](docs/serving.md#limits).

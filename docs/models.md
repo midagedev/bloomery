@@ -71,9 +71,9 @@ Qwen3.8's 28.8 GB PLE table is read from host RAM whatever the cards, so no numb
 file. Qwen3.8's `UD-Q3_K_XL` (90.0 GB) runs: its IQ3_XXS, IQ4_XS and IQ4_NL expert stacks are on the card, and the
 README's status rows name the types still not loaded.
 
-**Quant types.** A card runs a routed expert stack of Q4_K, Q5_K, Q6_K, Q8_0, MXFP4, NVFP4, IQ2_XS, IQ3_XXS,
-IQ3_S and IQ4_XS (a gate·up and a down), and the down of a Q5_0, Q5_1 or IQ4_NL stack. The types with no card kernel
-are Q2_K, Q2_0, Q4_0, Q4_1, Q8_1, Q8_K, IQ1_S, IQ1_M, IQ2_S, Q1_0, TQ1_0 and TQ2_0; of those only Q2_K and Q2_0
+**Quant types.** A card runs a routed expert stack of Q4_K, Q5_K, Q6_K, Q8_0, MXFP4, NVFP4, IQ1_S, IQ1_M, IQ2_XXS,
+IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS (a gate·up and a down), and the down of a Q5_0, Q5_1 or IQ4_NL stack. The
+types with no card kernel are Q2_K, Q2_0, Q4_0, Q4_1, Q8_1, Q8_K, Q1_0, TQ1_0 and TQ2_0; of those only Q2_K and Q2_0
 have a host matmul, so a `UD-Q2_K_XL` file loads. GLM-5.3's token embedding may be q4_K, q5_K or q6_K. On GLM-5.3 a
 layer whose down is Q6_K runs its experts on the card beside a card gate and up.
 
