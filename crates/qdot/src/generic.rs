@@ -27,12 +27,15 @@
 //! A type joins by an `impl HostDecode` and one [`Entry::of`] line in [`ENTRIES`]; its row
 //! (`gguf::QROWS`) already carries the block size, bytes and activation form, which the entry is
 //! checked against at build time. A type with a hand kernel is never listed: the hand arms of
-//! the dispatch are matched first.
+//! the dispatch are matched first. The listed types are IQ2_S, IQ1_S and IQ1_M, each with its
+//! vector decode; IQ1_S and IQ1_M put the group delta into the code (`8·grid ± 1`, float factor
+//! `d / 8`), so they have no min term and read no column sums. Q2_K, IQ4_XS and IQ4_NL are the
+//! decoders the tests hold to their hand kernels.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use gguf::iq_tables::KVALUES_IQ4NL;
+use gguf::iq_tables::{IQ1S_GRID, IQ2S_GRID, KVALUES_IQ4NL};
 use gguf::quant::half_to_f32;
 use gguf::{GgmlType, HostAct};
 
@@ -126,7 +129,11 @@ pub struct Entry {
 }
 
 /// The entries the dispatch falls to for a type with no hand kernel.
-pub static ENTRIES: &[Entry] = &[];
+pub static ENTRIES: &[Entry] = &[
+    Entry::of::<Iq2s>(),
+    Entry::of::<Iq1s>(),
+    Entry::of::<Iq1m>(),
+];
 
 const _: () = {
     let mut i = 0;
@@ -653,5 +660,253 @@ impl HostDecode for Iq4Nl {
     unsafe fn codes_avx2(blk: &[u8], _sub: usize) -> __m256i {
         // SAFETY: AVX2 per contract.
         unsafe { iq4nl_codes_avx2(&blk[2..18]) }
+    }
+}
+
+/// The 32 values of a sub-block as `q`'s grid magnitudes with the sign of bit `n` of `sign_bytes`
+/// on value `n`: ik's `SignHelper::sign_4_values`, the four sign bytes' bits to `±1` per value
+/// through `sign_epi8`.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn signed_by_bits(q: __m256i, sign_bytes: u32) -> __m256i {
+    // SAFETY: register-only; AVX2 per contract.
+    unsafe {
+        // Value n of the 32 selects sign byte n / 8, bit n % 8.
+        let pick = _mm256_set_epi64x(
+            0x0303_0303_0303_0303,
+            0x0202_0202_0202_0202,
+            0x0101_0101_0101_0101,
+            0,
+        );
+        let bit = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let bits = _mm256_and_si256(
+            _mm256_shuffle_epi8(_mm256_set1_epi32(sign_bytes as i32), pick),
+            bit,
+        );
+        let signs = _mm256_or_si256(_mm256_cmpeq_epi8(bits, bit), _mm256_set1_epi8(1));
+        _mm256_sign_epi8(q, signs)
+    }
+}
+
+/// An IQ1 sub-block's 32 codes `8·g + delta`: `g` in `-1..=1` is the byte of the four `grid`
+/// entries of [`IQ1S_GRID`] and `delta` is `±1` on each byte.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`); every `grid` entry
+/// must be below 2048.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq1_codes_avx2(grid: [usize; 4], delta: __m256i) -> __m256i {
+    // SAFETY: register-only; AVX2 and the index bound per contract.
+    unsafe {
+        let g = _mm256_set_epi64x(
+            IQ1S_GRID[grid[3]] as i64,
+            IQ1S_GRID[grid[2]] as i64,
+            IQ1S_GRID[grid[1]] as i64,
+            IQ1S_GRID[grid[0]] as i64,
+        );
+        // Bytes 0, 1 and 0xff times eight: the shift moves a byte's low bits up and the mask drops
+        // the bits that crossed from the byte below.
+        let eights = _mm256_and_si256(_mm256_slli_epi16::<3>(g), _mm256_set1_epi8(0xF8u8 as i8));
+        _mm256_add_epi8(eights, delta)
+    }
+}
+
+/// IQ2_S (`block_iq2_s`): f16 d @0, grid index bytes qs[32] @2, sign bytes @34, qh[8] @66,
+/// scales[8] @74. Group `l` (eight values) of sub-block `b` reads the grid entry
+/// `qs[4b + l] | (qh[b] << (8 - 2l)) & 0x300` and the sign byte `34 + 4b + l`; the 16 values of
+/// groups `2h` and `2h + 1` share the nibble `h` of `scales[b]`. A value is
+/// `d·(0.5 + s)·0.25·grid·sign`, so the code is the signed grid byte (at most 43), the scale
+/// `2s + 1` and the float factor `d / 8`.
+pub struct Iq2s;
+
+impl Iq2s {
+    /// The grid entry of group `l` of sub-block `sub`.
+    fn index(blk: &[u8], sub: usize, l: usize) -> usize {
+        usize::from(blk[2 + 4 * sub + l]) | ((usize::from(blk[66 + sub]) << (8 - 2 * l)) & 0x300)
+    }
+}
+
+impl HostDecode for Iq2s {
+    const TY: GgmlType = GgmlType::IQ2_S;
+    const ACT: HostAct = HostAct::Q8K;
+    const BYTES: usize = 82;
+    const VALUES: usize = 256;
+
+    fn head(blk: &[u8]) -> (f32, f32) {
+        (half_at(blk, 0) * 0.125, 0.0)
+    }
+    fn scale(blk: &[u8], group: usize) -> i32 {
+        2 * i32::from((blk[74 + group / 2] >> (4 * (group % 2))) & 0x0f) + 1
+    }
+    fn codes(blk: &[u8], sub: usize) -> [i8; 32] {
+        std::array::from_fn(|n| {
+            let (l, j) = (n / 8, n % 8);
+            let mag = IQ2S_GRID[Self::index(blk, sub, l)].to_le_bytes()[j] as i8;
+            if blk[34 + 4 * sub + l] >> j & 1 != 0 {
+                -mag
+            } else {
+                mag
+            }
+        })
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn codes_avx2(blk: &[u8], sub: usize) -> __m256i {
+        let at = 34 + 4 * sub;
+        let signs = u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]]);
+        // SAFETY: register-only; AVX2 per contract. Each index is ten bits, below the grid's 1024
+        // entries.
+        unsafe {
+            let q = _mm256_set_epi64x(
+                IQ2S_GRID[Self::index(blk, sub, 3)] as i64,
+                IQ2S_GRID[Self::index(blk, sub, 2)] as i64,
+                IQ2S_GRID[Self::index(blk, sub, 1)] as i64,
+                IQ2S_GRID[Self::index(blk, sub, 0)] as i64,
+            );
+            signed_by_bits(q, signs)
+        }
+    }
+}
+
+/// IQ1_S (`block_iq1_s`): f16 d @0, qs[32] @2, qh u16[8] @34. Group `l` of sub-block `b` reads
+/// the grid entry `qs[4b + l] | (qh[b] >> 3l & 7) << 8` (eight values in `-1..=1`); bits 12..15
+/// of `qh[b]` are the scale `s` and bit 15 the sign of the delta. A value is
+/// `d·(2s + 1)·(grid ± 1/8)`, so the code is `8·grid ± 1` (at most 9), the scale `2s + 1` and
+/// the float factor `d / 8`: the delta is inside the integer sum, which needs no min term.
+pub struct Iq1s;
+
+impl Iq1s {
+    fn qh(blk: &[u8], sub: usize) -> u16 {
+        u16::from_le_bytes([blk[34 + 2 * sub], blk[35 + 2 * sub]])
+    }
+    /// The grid entry of group `l` of sub-block `sub`.
+    fn index(blk: &[u8], sub: usize, l: usize) -> usize {
+        usize::from(blk[2 + 4 * sub + l]) | (usize::from((Self::qh(blk, sub) >> (3 * l)) & 7) << 8)
+    }
+    /// The delta of sub-block `sub`: 1, or -1 when bit 15 of its `qh` is set.
+    fn delta(blk: &[u8], sub: usize) -> i8 {
+        if Self::qh(blk, sub) & 0x8000 != 0 {
+            -1
+        } else {
+            1
+        }
+    }
+}
+
+impl HostDecode for Iq1s {
+    const TY: GgmlType = GgmlType::IQ1_S;
+    const ACT: HostAct = HostAct::Q8K;
+    const BYTES: usize = 50;
+    const VALUES: usize = 256;
+
+    fn head(blk: &[u8]) -> (f32, f32) {
+        (half_at(blk, 0) * 0.125, 0.0)
+    }
+    fn scale(blk: &[u8], group: usize) -> i32 {
+        2 * i32::from((Self::qh(blk, group / 2) >> 12) & 7) + 1
+    }
+    fn codes(blk: &[u8], sub: usize) -> [i8; 32] {
+        let delta = Self::delta(blk, sub);
+        std::array::from_fn(|n| {
+            let g = IQ1S_GRID[Self::index(blk, sub, n / 8)].to_le_bytes()[n % 8] as i8;
+            8 * g + delta
+        })
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn codes_avx2(blk: &[u8], sub: usize) -> __m256i {
+        // SAFETY: register-only; AVX2 per contract.
+        unsafe {
+            iq1_codes_avx2(
+                std::array::from_fn(|l| Self::index(blk, sub, l)),
+                _mm256_set1_epi8(Self::delta(blk, sub)),
+            )
+        }
+    }
+}
+
+/// IQ1_M (`block_iq1_m`): qs[32] @0, qh[16] @32, scales[8] @48 read as four u16 `sc`. The f16
+/// `d` has no field: its nibbles are the top nibbles of `sc[0..4]`, low nibble first. Group `l`
+/// of sub-block `b` reads the grid entry `qs[4b + l]` with three high bits from `qh[2b + l / 2]`
+/// (bits 0..3 for even `l`, 4..7 for odd) and a delta sign from bit 3 (even) or bit 7 (odd) of
+/// that byte; the 16 values of groups `2h` and `2h + 1` have the scale
+/// `2·(sc[b / 2] >> (6·(b % 2) + 3h) & 7) + 1`. Code, scale and float factor are IQ1_S's.
+pub struct Iq1m;
+
+impl Iq1m {
+    fn sc(blk: &[u8], i: usize) -> u16 {
+        u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]])
+    }
+    /// The block's f16 scale, from the top nibbles of the four `sc`.
+    fn d_bits(blk: &[u8]) -> u16 {
+        (Self::sc(blk, 0) >> 12)
+            | ((Self::sc(blk, 1) >> 8) & 0x00f0)
+            | ((Self::sc(blk, 2) >> 4) & 0x0f00)
+            | (Self::sc(blk, 3) & 0xf000)
+    }
+    /// The grid entry of group `l` of sub-block `sub`, and whether its delta is negative.
+    fn group(blk: &[u8], sub: usize, l: usize) -> (usize, bool) {
+        let h = blk[32 + 2 * sub + l / 2];
+        let (high, flag) = if l % 2 == 0 {
+            (h & 0x07, 0x08)
+        } else {
+            ((h >> 4) & 0x07, 0x80)
+        };
+        (
+            usize::from(blk[4 * sub + l]) | (usize::from(high) << 8),
+            h & flag != 0,
+        )
+    }
+}
+
+impl HostDecode for Iq1m {
+    const TY: GgmlType = GgmlType::IQ1_M;
+    const ACT: HostAct = HostAct::Q8K;
+    const BYTES: usize = 56;
+    const VALUES: usize = 256;
+
+    fn head(blk: &[u8]) -> (f32, f32) {
+        (half_to_f32(Self::d_bits(blk)) * 0.125, 0.0)
+    }
+    fn scale(blk: &[u8], group: usize) -> i32 {
+        let sub = group / 2;
+        let shift = 6 * (sub % 2) + 3 * (group % 2);
+        2 * i32::from((Self::sc(blk, sub / 2) >> shift) & 7) + 1
+    }
+    fn codes(blk: &[u8], sub: usize) -> [i8; 32] {
+        std::array::from_fn(|n| {
+            let (index, negative) = Self::group(blk, sub, n / 8);
+            let g = IQ1S_GRID[index].to_le_bytes()[n % 8] as i8;
+            8 * g + if negative { -1 } else { 1 }
+        })
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn codes_avx2(blk: &[u8], sub: usize) -> __m256i {
+        let groups: [(usize, bool); 4] = std::array::from_fn(|l| Self::group(blk, sub, l));
+        // A group's delta byte, eight times: 1, or -1 for a negative one.
+        let delta = |negative: bool| {
+            if negative {
+                -1i64
+            } else {
+                0x0101_0101_0101_0101
+            }
+        };
+        // SAFETY: register-only; AVX2 per contract.
+        unsafe {
+            iq1_codes_avx2(
+                groups.map(|(index, _)| index),
+                _mm256_set_epi64x(
+                    delta(groups[3].1),
+                    delta(groups[2].1),
+                    delta(groups[1].1),
+                    delta(groups[0].1),
+                ),
+            )
+        }
     }
 }

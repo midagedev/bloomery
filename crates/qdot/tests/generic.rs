@@ -21,6 +21,11 @@
 //!   that is not the column's bytes, on both encoder paths;
 //! - every row of `gguf::QROWS` that names a quantized activation form has a kernel of that
 //!   form, and a row that names none has no kernel.
+//!
+//! IQ2_S, IQ1_S and IQ1_M are the listed types (`qdot::generic::ENTRIES`), with no hand kernel to
+//! be equal to: the decode, vector, bound, refusal and entry clauses above hold them, a dispatch
+//! clause holds every entry point to the generic kernels, and `gate-quant` holds their dots to
+//! mainline's `vec_dot`.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -29,10 +34,10 @@ use std::marker::PhantomData;
 
 use gguf::quant::dequant_row;
 use gguf::{GgmlType, HostAct, QROWS};
-use qdot::generic::{Entry, HostDecode, Iq4Nl, Iq4Xs, Q2k, dot_avx2, dot_scalar};
+use qdot::generic::{Entry, HostDecode, Iq1m, Iq1s, Iq2s, Iq4Nl, Iq4Xs, Q2k, dot_avx2, dot_scalar};
 use qdot::{
-    col_bytes, dot_row_avx2, dot_row_scalar, k_granularity, quantize_col, quantize_col_scalar,
-    supports,
+    col_bytes, dot_row, dot_row_avx2, dot_row_cols, dot_row_scalar, has_tile, has_wide,
+    k_granularity, quantize_col, quantize_col_scalar, supports,
 };
 
 struct Lcg(u64);
@@ -76,11 +81,23 @@ impl<D: HostDecode> HostDecode for Plain<D> {
     }
 }
 
-/// Byte offsets of the f16 factors in a block of `ty`.
-fn f16_fields(ty: GgmlType) -> &'static [usize] {
+/// Writes the f16 factors of a block of `ty`, each from its own `next()`. IQ1_M has no field for
+/// its `d`: the four nibbles of the value are the top nibbles of its four `sc`.
+fn set_f16_fields(ty: GgmlType, blk: &mut [u8], mut next: impl FnMut() -> u16) {
+    let mut at = |off: usize| blk[off..off + 2].copy_from_slice(&next().to_le_bytes());
     match ty {
-        GgmlType::Q2_K => &[80, 82],
-        GgmlType::IQ4_XS | GgmlType::IQ4_NL => &[0],
+        GgmlType::Q2_K => {
+            at(80);
+            at(82);
+        }
+        GgmlType::IQ4_XS | GgmlType::IQ4_NL | GgmlType::IQ2_S | GgmlType::IQ1_S => at(0),
+        GgmlType::IQ1_M => {
+            let bits = next();
+            for i in 0..4 {
+                let high = 49 + 2 * i;
+                blk[high] = (blk[high] & 0x0f) | (((bits >> (4 * i)) & 0xf) as u8) << 4;
+            }
+        }
         other => panic!("no f16 fields listed for {other:?}"),
     }
 }
@@ -101,9 +118,7 @@ fn random_row(rng: &mut Lcg, ty: GgmlType, nb: usize) -> Vec<u8> {
         .map(|_| rng.next() as u8)
         .collect();
     for blk in row.chunks_mut(block_bytes(ty)) {
-        for &off in f16_fields(ty) {
-            blk[off..off + 2].copy_from_slice(&finite_f16(rng).to_le_bytes());
-        }
+        set_f16_fields(ty, blk, || finite_f16(rng));
     }
     row
 }
@@ -113,9 +128,7 @@ fn random_row(rng: &mut Lcg, ty: GgmlType, nb: usize) -> Vec<u8> {
 fn end_row(ty: GgmlType, nb: usize, fill: u8) -> Vec<u8> {
     let mut row = vec![fill; nb * block_bytes(ty)];
     for blk in row.chunks_mut(block_bytes(ty)) {
-        for &off in f16_fields(ty) {
-            blk[off..off + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
-        }
+        set_f16_fields(ty, blk, || 0x3c00);
     }
     row
 }
@@ -214,6 +227,9 @@ fn decoders_reproduce_ggmls_dequant() {
     check_decode::<Q2k>();
     check_decode::<Iq4Xs>();
     check_decode::<Iq4Nl>();
+    check_decode::<Iq2s>();
+    check_decode::<Iq1s>();
+    check_decode::<Iq1m>();
 }
 
 #[target_feature(enable = "avx2")]
@@ -260,6 +276,12 @@ fn vector_decodes_are_the_scalar_decode() {
     check_vector_decode::<Plain<Q2k>>();
     check_vector_decode::<Plain<Iq4Xs>>();
     check_vector_decode::<Plain<Iq4Nl>>();
+    check_vector_decode::<Iq2s>();
+    check_vector_decode::<Iq1s>();
+    check_vector_decode::<Iq1m>();
+    check_vector_decode::<Plain<Iq2s>>();
+    check_vector_decode::<Plain<Iq1s>>();
+    check_vector_decode::<Plain<Iq1m>>();
 }
 
 // --------------------------------------------------------------------- the dot
@@ -335,6 +357,79 @@ fn generic_dot_is_the_hand_dot_bit_for_bit() {
     check_dot::<Plain<Q2k>>(&Q8K_KS);
     check_dot::<Plain<Iq4Xs>>(&Q8K_KS);
     check_dot::<Plain<Iq4Nl>>(&Q82X4_KS);
+}
+
+/// A type with no hand kernel reaches its generic kernels through every entry point and nothing
+/// else: its entry is the one the dispatch finds, the quantized column is the entry's, and
+/// `dot_row`, `dot_row_avx2`, `dot_row_scalar` and the column tile (which has no kernel of its
+/// own for it) write the kernels' bits, the AVX2 and the scalar mirror alike.
+fn check_dispatch<D: HostDecode>(ks: &[usize]) {
+    assert!(has_avx2_fma(), "the box has AVX2 and FMA");
+    let ty = D::TY;
+    let entry = qdot::generic::entry(ty).expect("a listed type has an entry");
+    assert!(supports(ty), "{ty:?}: no kernel");
+    assert!(
+        !has_tile(ty) && !has_wide(ty),
+        "{ty:?}: a tile or wide kernel the generic form does not have"
+    );
+    let mut rng = Lcg(0xd15_9a7c4 ^ D::BYTES as u64);
+    for &k in ks {
+        let nb = k / D::VALUES;
+        assert_eq!(k_granularity(ty), D::VALUES);
+        let rows = weight_rows(&mut rng, ty, nb);
+        let cols: Vec<Vec<u8>> = activations(&mut rng, k)
+            .iter()
+            .map(|x| {
+                let mut acol = vec![0u8; col_bytes(ty, k)];
+                quantize_col(ty, x, &mut acol);
+                let mut want = vec![0u8; entry.col_bytes(k)];
+                entry.quantize(x, &mut want, true);
+                assert_eq!(acol, want, "{ty:?} k = {k}: the dispatch's column");
+                acol
+            })
+            .collect();
+        for (r, row) in rows.iter().enumerate() {
+            let mut tiled = vec![0f32; cols.len()];
+            let refs: Vec<&[u8]> = cols.iter().map(Vec::as_slice).collect();
+            dot_row_cols(ty, row, &refs, k, &mut tiled).expect("a tile of columns");
+            for (c, acol) in cols.iter().enumerate() {
+                // SAFETY: AVX2 and FMA asserted above; the row and the column hold `nb` blocks.
+                let avx2 = unsafe { dot_avx2::<D>(row, acol, nb) };
+                let scalar = dot_scalar::<D>(row, acol, nb);
+                assert_eq!(
+                    avx2.to_bits(),
+                    scalar.to_bits(),
+                    "{ty:?} k = {k} col {c} row {r}: avx2 {avx2:e}, scalar mirror {scalar:e}"
+                );
+                for (path, got) in [
+                    ("dot_row", dot_row(ty, row, acol, k).expect("dot_row")),
+                    (
+                        "dot_row_avx2",
+                        dot_row_avx2(ty, row, acol, k).expect("dot_row_avx2"),
+                    ),
+                    (
+                        "dot_row_scalar",
+                        dot_row_scalar(ty, row, acol, k).expect("dot_row_scalar"),
+                    ),
+                    ("tile", tiled[c]),
+                ] {
+                    // `dot_row_scalar` is the scalar mirror, the rest the AVX2 kernel; they are equal.
+                    assert_eq!(
+                        got.to_bits(),
+                        avx2.to_bits(),
+                        "{ty:?} k = {k} col {c} row {r}: {path} {got:e}, kernel {avx2:e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_type_with_no_hand_kernel_reaches_its_generic_kernels() {
+    check_dispatch::<Iq2s>(&Q8K_KS);
+    check_dispatch::<Iq1s>(&Q8K_KS);
+    check_dispatch::<Iq1m>(&Q8K_KS);
 }
 
 /// The quantized column's blocks as `(dy, codes)`: one Q8_K block of 256 values, or one Q8_2
@@ -430,6 +525,9 @@ fn generic_dot_is_within_its_f64_bound() {
     check_bound::<Q2k>(&Q8K_KS);
     check_bound::<Iq4Xs>(&Q8K_KS);
     check_bound::<Iq4Nl>(&Q82X4_KS);
+    check_bound::<Iq2s>(&Q8K_KS);
+    check_bound::<Iq1s>(&Q8K_KS);
+    check_bound::<Iq1m>(&Q8K_KS);
 }
 
 // ------------------------------------------------------------ the encoder's refusals
@@ -454,11 +552,14 @@ fn assert_refused(entry: &Entry, x: &[f32], out: &mut [u8], avx2: bool, refusal:
     );
 }
 
-fn proof_entries() -> [Entry; 3] {
+fn proof_entries() -> [Entry; 6] {
     [
         Entry::of::<Q2k>(),
         Entry::of::<Iq4Xs>(),
         Entry::of::<Iq4Nl>(),
+        Entry::of::<Iq2s>(),
+        Entry::of::<Iq1s>(),
+        Entry::of::<Iq1m>(),
     ]
 }
 

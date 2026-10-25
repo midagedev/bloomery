@@ -65,6 +65,7 @@
 //!
 //! - [`generic`]: a type with no hand kernel above runs its block decoder ([`generic::HostDecode`])
 //!   through one kernel per activation form (Q8_K, Q8_2_X4); the hand kernels are matched first.
+//!   IQ2_S x Q8_K, IQ1_S x Q8_K and IQ1_M x Q8_K are listed there.
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
