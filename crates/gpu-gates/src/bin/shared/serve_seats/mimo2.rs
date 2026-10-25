@@ -136,12 +136,9 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::bind::{
-    CacheRam, Cached, PutBack, Seat, SlotStep, eprint_noted, note_line, put_back,
-};
+use bloomery_gpu_gates::bind::{Cached, PutBack, Seat, SlotStep, note_line, put_back};
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::checkpoints_reserved;
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_mimo2::{
     Body, Mimo2Model, MimoSeq, PrefillMode, seq_bytes, seq_resume, seq_resume_prefix, seq_save,
@@ -150,13 +147,13 @@ use bloomery_levers::{Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
-use model::placement::workstation::{HostNeed, TierBatchBytes};
+use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use serve::{CacheNote, Saved, ServeError};
 
 use super::rounds;
-use super::tiered::{self, Tiered};
+use super::tiered::{self, CacheFlag, Tiered};
 
 const NAME: &str = "bloomery-serve-mimo2";
 
@@ -207,15 +204,15 @@ const WHOSE: &str = "a mimo2 body's";
 struct Flags {
     /// `--prefill`: how a prompt call is fed.
     prefill: PrefillMode,
-    /// `--cache-ram`, in bytes. `None` is the default ([`CacheRam`]).
-    cache_ram: Option<u64>,
+    /// `--cache-ram` and the budget over it.
+    cache_ram: CacheFlag,
 }
 
 impl Default for Flags {
     fn default() -> Self {
         Flags {
             prefill: PrefillMode::Batch,
-            cache_ram: None,
+            cache_ram: CacheFlag::default(),
         }
     }
 }
@@ -515,18 +512,12 @@ impl Tiered for Mimo {
                     .ok_or_else(|| format!("--prefill is batch or steps, not {value}"))?;
                 Ok(true)
             }
-            "--cache-ram" => {
-                out.cache_ram = Some(CacheRam::parse_mib(flag, value)?);
-                Ok(true)
-            }
-            _ => Ok(false),
+            _ => out.cache_ram.take(flag, value),
         }
     }
 
-    /// [`CacheRam`]: unset, the default; a default under one saved state (one
-    /// position, each window layer's ring whole, [`seq_bytes`]) is off. A
-    /// budget that holds no full session at the slot's context stays on for
-    /// the shorter ones and says so.
+    /// [`CacheFlag::budget`] over the plan's store bytes ([`seq_bytes`]: one position, each
+    /// window layer's ring whole): a default under one saved state is off.
     fn cache_budget(
         flags: &Self::Flags,
         plan: &Plan<'_>,
@@ -534,21 +525,9 @@ impl Tiered for Mimo {
         slot_ctx: usize,
         inputs: &model::arch::place_hybrid::PlanInputs<Self::H>,
     ) -> Result<u64, GateError> {
-        let cache = CacheRam::of(
-            flags.cache_ram,
-            HostNeed::of(plan, 0).bytes(),
-            pool,
-            checkpoints_reserved(plan.machine),
-        )?
-        .holding(seq_bytes(inputs, slot_ctx, 1));
-        let full = seq_bytes(inputs, slot_ctx, slot_ctx);
-        let cache = if cache.ram == 0 || full <= cache.ram {
-            cache
-        } else {
-            cache.short_of(slot_ctx, full)
-        };
-        eprint_noted(&cache.line());
-        Ok(cache.ram)
+        flags
+            .cache_ram
+            .budget(plan, pool, slot_ctx, |n| seq_bytes(inputs, slot_ctx, n))
     }
 
     /// `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving placement, which
