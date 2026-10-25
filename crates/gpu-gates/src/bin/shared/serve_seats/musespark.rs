@@ -8,7 +8,7 @@
 //!     bloomery-serve --model musespark [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
-//!                    [--queue-depth Q] [--slot-save-path DIR]
+//!                    [--cache-ram MIB] [--queue-depth Q] [--slot-save-path DIR]
 //!                    [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
@@ -19,7 +19,7 @@
 //! is the sampler crate's chain with no repetition penalty, `temperature <= 0`
 //! the engine's argmax. Any other flag is refused as an unknown argument.
 //!
-//! Four facts of the architecture set this seat's shape, and nothing else
+//! Five facts of the architecture set this seat's shape, and nothing else
 //! does:
 //!
 //! - The body holds one sequence: `--parallel` above 1 is refused by name
@@ -28,6 +28,22 @@
 //!   (the body's head-64 flash has no ring entry), so a cut keeps every held
 //!   position (`app::Keep for Body`) and the plan counts planes
 //!   (`model::arch::musespark::place::KV_ROWS`).
+//! - A saved prompt state is the planes' rows alone: no recurrent store and no
+//!   checkpoint, so a state of `n` positions restores at any position up to
+//!   `n`. `--cache-ram MIB` is the prompt cache's budget (`bind::CacheRam`:
+//!   unset, the default; `0` turns it off): the lesser of `bind::CACHE_RAM_CAP`
+//!   and half of what the host leaves past the plan's need and the residency's
+//!   churn pool, a `cache` line on stderr printing it with each term. A state
+//!   is every layer's K and V rows of the held positions
+//!   (`bloomery_gpu::checkpoint::planes`), copied off the request path on a
+//!   stream of its own into pinned staging that the budget pins whole at the
+//!   open, begun when a request ends and waited for only when the state is
+//!   read back; a pool with no room is the server's `NoRoom`, which makes room
+//!   or saves on the request path. A request of another conversation takes
+//!   the slot and the session's return puts its rows back (the first positions
+//!   the server keeps, when it shares only a prefix) instead of feeding the
+//!   prompt again. A state of another model, card or context is refused by
+//!   name.
 //! - The prompt runs as passes of the load's rows through every layer, the
 //!   hosted layers' experts through the host tier's batch port
 //!   (`app::Prompt for Body`, `GpuModel::prefill`): the `load` record's
@@ -117,6 +133,8 @@ use std::time::Instant;
 
 use app::{Prompt, Session};
 use bloomery_gpu::arch::musespark::Body;
+use bloomery_gpu::checkpoint::planes::{seq_bytes, seq_lane};
+use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_gates::GateError;
@@ -132,11 +150,12 @@ use model::arch::musespark::hparams::Hparams;
 use model::arch::musespark::place::{self, PlanInputs as MuseInputs};
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::workstation::TierBatchBytes;
-use model::placement::{Machine, PlacementError};
+use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
-use serve::{CacheNote, Saved, ServeError};
+use serve::{CacheNote, Pending, Saved, ServeError};
 
-use super::tiered::{self, Open, Tiered};
+use super::planes;
+use super::tiered::{self, CacheFlag, Open, Tiered};
 
 use super::xstream_rule::{Stage, plans_ring, xstream_rule};
 
@@ -145,8 +164,8 @@ const NAME: &str = "bloomery-serve-musespark";
 
 const USAGE: &str = "usage: bloomery-serve --model musespark [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--place W] [--plan] [--queue-depth Q] [--slot-save-path DIR] \
-                     [--api-key KEY] [--api-key-file FNAME]";
+                     [--place W] [--plan] [--cache-ram MIB] [--queue-depth Q] \
+                     [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
@@ -183,10 +202,16 @@ pub const TIER_RULE: TierRule = TierRule {
     basis: "docs/cards/musespark-2card.card",
 };
 
+/// What a refusal of another seat's state names ([`planes::resume`]).
+const WHOSE: &str = "a musespark body's";
+
 /// The seat: the session and the positions its stores were sized for.
 struct Muse {
     s: Session<Body>,
     ctx: usize,
+    /// The copy stream and pinned staging saved states are made on
+    /// ([`Seat::snapshots_async`]); none with the cache off.
+    lane: Option<SaveLane>,
 }
 
 impl Muse {
@@ -201,7 +226,7 @@ impl Muse {
     /// the plan's card segment of each layer's stacks resident, the rest on
     /// the host tier), and the expert stream is resolved last, after the
     /// capture, for a started ring takes the card's free bytes past its keep.
-    fn open(a: Open<()>) -> Result<Muse, GateError> {
+    fn open(a: Open<CacheFlag>) -> Result<Muse, GateError> {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let t = Instant::now();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
@@ -244,6 +269,12 @@ impl Muse {
         let ctx_u32 = u32::try_from(plan.ctx_max)
             .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
         let mut s = Session::from_model(model, ctx_u32);
+        // The lane before the expert stream: a started ring takes the card's free bytes past its
+        // keep, so every buffer the open makes comes first.
+        let lane = match a.cache_ram {
+            0 => None,
+            ram => Some(seq_lane(s.model_mut(), ram)?),
+        };
         let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
         let line = xstream_rule(gpu, body, a.xstream, Stage::of(a.place), a.residency)?;
         eprintln!("{line}");
@@ -266,7 +297,11 @@ impl Muse {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(s.model(), total, opened);
-        Ok(Muse { s, ctx: a.ctx })
+        Ok(Muse {
+            s,
+            ctx: a.ctx,
+            lane,
+        })
     }
 }
 
@@ -316,13 +351,41 @@ impl Seat for Muse {
         Vec::new()
     }
 
-    /// Never asked: the seat's prompt cache budget is 0.
-    fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-        Err(format!("a snapshot: {NO_CACHE}").into())
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        planes::snapshot_size(self.s.model_mut())
     }
 
-    fn resume(&mut self, _state: &dyn Saved) -> Result<(), GateError> {
-        Err(format!("a resume: {NO_CACHE}").into())
+    /// The sequence state ([`planes::snapshot`]), as the prompt cache holds it.
+    fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+        planes::snapshot(self.s.model_mut())
+    }
+
+    /// Whether the saves copy on the lane: the seat holds one.
+    fn snapshots_async(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// The state's copy begun on the lane ([`planes::snapshot_begin`]); a pool
+    /// with no room is the server's `NoRoom`. Without a lane, the snapshot on
+    /// the call.
+    fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+        match &self.lane {
+            Some(lane) => planes::snapshot_begin(self.s.model_mut(), lane),
+            None => Ok(Pending::landed(self.snapshot()?)),
+        }
+    }
+
+    /// The state put back ([`planes::resume`]) after the model's reset.
+    fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
+        planes::resume(self.s.model_mut(), state, WHOSE)
+    }
+
+    /// The first `n` positions the state can be cut to put back after the
+    /// model's reset ([`planes::resume_prefix`]): the sequence's next call
+    /// runs as it would have after the whole state's resume and a rollback to
+    /// the returned position.
+    fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
+        planes::resume_prefix(self.s.model_mut(), state, n, WHOSE)
     }
 
     fn note(note: &CacheNote) {
@@ -330,12 +393,9 @@ impl Seat for Muse {
     }
 }
 
-/// Why the seat takes no sequence state: it runs no prompt cache.
-const NO_CACHE: &str = "the musespark seat runs no prompt cache";
-
 impl Tiered for Muse {
     type H = Hparams;
-    type Flags = ();
+    type Flags = CacheFlag;
 
     const NAME: &'static str = NAME;
     const USAGE: &'static str = USAGE;
@@ -357,8 +417,22 @@ impl Tiered for Muse {
         MuseInputs::read(split)
     }
 
-    fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
-        Ok(false)
+    fn flags(flag: &str, value: &str, out: &mut CacheFlag) -> Result<bool, GateError> {
+        out.take(flag, value)
+    }
+
+    /// [`CacheFlag::budget`] over the plan's store bytes ([`seq_bytes`]): a default under one saved
+    /// state (one position) is off.
+    fn cache_budget(
+        flags: &CacheFlag,
+        plan: &Plan<'_>,
+        pool: u64,
+        slot_ctx: usize,
+        inputs: &PlanInputs<Self::H>,
+    ) -> Result<u64, GateError> {
+        flags.budget(plan, pool, slot_ctx, |n| {
+            seq_bytes(&inputs.kv, inputs.model.layers, n)
+        })
     }
 
     /// A placed load's machine: the body reads its token embedding from the

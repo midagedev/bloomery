@@ -8,8 +8,8 @@
 //!     bloomery-serve --model minimaxm3 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
-//!                    [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
-//!                    [--api-key KEY] [--api-key-file FNAME]
+//!                    [--parallel N] [--cache-ram MIB] [--queue-depth Q]
+//!                    [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` and `-c` are `--ctx` under llama-server's spellings. The
@@ -34,10 +34,26 @@
 //! walks one token, so a round of several slots is a select and a step each
 //! (`pass=turns`). One pass would be a host walk over the existing launches:
 //! the row-wise ones once over every busy row, and each slot's sequence-bound
-//! ones over that slot's rows and its own planes. A prompt cache is refused
-//! by name, and a request keeps the whole prefix it shares with what the slot
-//! holds: every store is a plane of positions, so a cut keeps every held
-//! position.
+//! ones over that slot's rows and its own planes.
+//!
+//! A request keeps the longest prefix it shares with what the slot holds (every
+//! held position: the planes are rows of positions that a later position never
+//! reads before it writes). The prompt cache (llama-server's `--cache-ram`, in
+//! MiB; 0 turns it off) holds the selected slot's sequence state when a request
+//! of another conversation takes the slot, and puts it back when the
+//! conversation returns, so a return feeds only what the state does not hold.
+//! A state is the planes' rows alone (`bloomery_gpu::checkpoint::planes`):
+//! every layer's K and V rows of the held positions and a sparse layer's index
+//! keys, with no recurrent store and no checkpoint, so it restores at any
+//! position up to the one it holds, and the first positions the server keeps
+//! are the only rows that move back. Its default is the lesser of
+//! `bind::CACHE_RAM_CAP` and half of what the host leaves past the plan's need
+//! and the residency's churn pool (`bind::CacheRam`); a `cache` line on stderr
+//! after the plan prints it with each term. The copy runs on a stream of its
+//! own into pinned staging that the budget pins whole at the open, begun when a
+//! request ends and waited for only when the state is read back; a pool with no
+//! room is the server's `NoRoom`, which makes room or saves on the request
+//! path. A state of another model, card or context is refused by name.
 //!
 //! The prompt call is fed in batches of up to a unit's columns
 //! (`app::Prompt for Body`), the same bits as one decode step an id; the
@@ -130,6 +146,8 @@ use std::time::Instant;
 
 use app::{Prompt, Session};
 use bloomery_gpu::GpuError;
+use bloomery_gpu::checkpoint::planes::{seq_bytes, seq_lane};
+use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
@@ -142,14 +160,15 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::PlanInputs;
-use model::placement::PlacementError;
 use model::placement::workstation::TierBatchBytes;
+use model::placement::{PlacementError, Plan};
 use runtime::Target;
 use serve::reasoning::ThinkTags;
-use serve::{CacheNote, Saved, ServeError};
+use serve::{CacheNote, Pending, Saved, ServeError};
 
 use super::minimaxm3_folder;
-use super::tiered::{self, Open, Read, Tiered};
+use super::planes;
+use super::tiered::{self, CacheFlag, Open, Read, Tiered};
 
 use super::xstream_rule::{Stage, plans_ring, xstream_rule};
 
@@ -161,8 +180,8 @@ const NAME: &str = "bloomery-serve-minimaxm3";
 
 const USAGE: &str = "usage: bloomery-serve --model minimaxm3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--place W] [--plan] [--parallel N] [--queue-depth Q] [--slot-save-path DIR] \
-                     [--api-key KEY] [--api-key-file FNAME]";
+                     [--place W] [--plan] [--parallel N] [--cache-ram MIB] [--queue-depth Q] \
+                     [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
@@ -194,10 +213,16 @@ pub const TIER_RULE: TierRule = TierRule {
     basis: "docs/cards/minimaxm31-2card.card",
 };
 
+/// What a refusal of another seat's state names ([`planes::resume`]).
+const WHOSE: &str = "a minimaxm3 body's";
+
 /// The seat: the session and the positions one slot's stores were sized for.
 struct MiniMax {
     s: Session<Body>,
     ctx: usize,
+    /// The copy stream and pinned staging saved states are made on
+    /// ([`Seat::snapshots_async`]); none with the cache off.
+    lane: Option<SaveLane>,
 }
 
 impl MiniMax {
@@ -210,7 +235,7 @@ impl MiniMax {
     /// the same call the run's probe made, and the body is opened for that
     /// many sequences. The shared session open plans one sequence, so this
     /// seat does not use it.
-    fn open(a: Open<()>) -> Result<MiniMax, GateError> {
+    fn open(a: Open<CacheFlag>) -> Result<MiniMax, GateError> {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let t = Instant::now();
         let file = match a.folder {
@@ -260,6 +285,10 @@ impl MiniMax {
         if a.slots.get() > 1 {
             s.add_slots(a.slots.get())?;
         }
+        let lane = match a.cache_ram {
+            0 => None,
+            ram => Some(seq_lane(s.model_mut(), ram)?),
+        };
         // The expert stream last: a started ring takes the card's free bytes past its keep, so
         // every card buffer the open makes comes before it.
         let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
@@ -284,7 +313,11 @@ impl MiniMax {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(s.model(), total, opened);
-        Ok(MiniMax { s, ctx: a.ctx })
+        Ok(MiniMax {
+            s,
+            ctx: a.ctx,
+            lane,
+        })
     }
 }
 
@@ -346,13 +379,43 @@ impl Seat for MiniMax {
         Vec::new()
     }
 
-    /// Never asked: the seat's prompt cache budget is 0.
-    fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-        Err(format!("a snapshot: {NO_CACHE}").into())
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        planes::snapshot_size(self.s.model_mut())
     }
 
-    fn resume(&mut self, _state: &dyn Saved) -> Result<(), GateError> {
-        Err(format!("a resume: {NO_CACHE}").into())
+    /// The selected slot's sequence state ([`planes::snapshot`]), as the
+    /// prompt cache holds it.
+    fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+        planes::snapshot(self.s.model_mut())
+    }
+
+    /// Whether the saves copy on the lane: the seat holds one.
+    fn snapshots_async(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// The selected slot's state copy begun on the lane
+    /// ([`planes::snapshot_begin`]); a pool with no room is the server's
+    /// `NoRoom`. Without a lane, the snapshot on the call.
+    fn snapshot_begin(&mut self) -> Result<Pending, GateError> {
+        match &self.lane {
+            Some(lane) => planes::snapshot_begin(self.s.model_mut(), lane),
+            None => Ok(Pending::landed(self.snapshot()?)),
+        }
+    }
+
+    /// The state put back ([`planes::resume`]) on the selected slot after its
+    /// reset.
+    fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
+        planes::resume(self.s.model_mut(), state, WHOSE)
+    }
+
+    /// The first `n` positions the state can be cut to put back on the
+    /// selected slot after its reset ([`planes::resume_prefix`]): the
+    /// sequence's next call runs as it would have after the whole state's
+    /// resume and a rollback to the returned position.
+    fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
+        planes::resume_prefix(self.s.model_mut(), state, n, WHOSE)
     }
 
     fn note(note: &CacheNote) {
@@ -360,12 +423,9 @@ impl Seat for MiniMax {
     }
 }
 
-/// Why the seat takes no sequence state: it runs no prompt cache.
-const NO_CACHE: &str = "the minimaxm3 seat runs no prompt cache";
-
 impl Tiered for MiniMax {
     type H = model::arch::minimaxm3::hparams::Hparams;
-    type Flags = ();
+    type Flags = CacheFlag;
 
     const NAME: &'static str = NAME;
     const USAGE: &'static str = USAGE;
@@ -420,8 +480,22 @@ impl Tiered for MiniMax {
         model::arch::minimaxm3::place::PlanInputs::describe(split)
     }
 
-    fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
-        Ok(false)
+    fn flags(flag: &str, value: &str, out: &mut CacheFlag) -> Result<bool, GateError> {
+        out.take(flag, value)
+    }
+
+    /// [`CacheFlag::budget`] over the plan's store bytes ([`seq_bytes`]): a default under one saved
+    /// state (one position) is off. A slot's context is the state's most.
+    fn cache_budget(
+        flags: &CacheFlag,
+        plan: &Plan<'_>,
+        pool: u64,
+        slot_ctx: usize,
+        inputs: &PlanInputs<Self::H>,
+    ) -> Result<u64, GateError> {
+        flags.budget(plan, pool, slot_ctx, |n| {
+            seq_bytes(&inputs.kv, inputs.model.layers, n)
+        })
     }
 
     /// The tier's prompt-batch bytes of the file's widths and down forms over the body's prompt

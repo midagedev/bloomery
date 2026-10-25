@@ -91,6 +91,10 @@ pub mod nemotron;
 // in the gpu crate.
 #[cfg(feature = "deepseek41")]
 pub mod raon1;
+// The seat side of a plane state (`minimaxm3`, `musespark`): the prompt-cache methods of a seat whose
+// body keeps rows of positions alone.
+#[cfg(feature = "deepseek41")]
+pub mod planes;
 // The seats' one owner of a round run as passes (`step_rows_one_pass`).
 #[cfg(feature = "deepseek41")]
 pub mod rounds;

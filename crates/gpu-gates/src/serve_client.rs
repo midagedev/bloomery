@@ -939,7 +939,7 @@ pub struct PrefixRestore<'a> {
 }
 
 /// `text` repeated until it holds `len` ids, cut to them.
-fn repeated_ids(
+pub fn repeated_ids(
     url: &dyn Fn(&str) -> String,
     text: &str,
     len: usize,

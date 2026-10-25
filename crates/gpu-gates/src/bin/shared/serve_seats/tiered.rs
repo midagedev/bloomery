@@ -8,7 +8,9 @@
 //! [`solar2`](super::solar2) keeps the hybrid seat's run. A seat
 //! whose body is opened whole on the card ([`nemotron`](super::nemotron)) plans a placed load of
 //! its own and keeps its run. A seat may name a prompt-cache budget
-//! ([`Tiered::cache_budget`]); the default is 0 and prints nothing.
+//! ([`Tiered::cache_budget`]; [`CacheFlag`] is the `--cache-ram` flag and the budget over the
+//! plan for a seat that saves states in host RAM, whose copy lane the open makes of
+//! [`Open::cache_ram`] bytes); the default is 0 and prints nothing.
 //!
 //! A model path is a GGUF split, or a checkpoint folder where the seat reads one
 //! ([`Tiered::read_model`]): the common run opens the folder once, plans by its located header,
@@ -23,14 +25,16 @@ use std::sync::Arc;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, parallel_line,
-    placement_of, slots_given, slots_of,
+    CacheRam, ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, eprint_noted,
+    model_props, parallel_line, placement_of, slots_given, slots_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule, choose_ctx, lane_at};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency;
-use bloomery_gpu_gates::residency38::{churn_bytes, residency_room, residency_set};
+use bloomery_gpu_gates::residency38::{
+    checkpoints_reserved, churn_bytes, residency_room, residency_set,
+};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
@@ -40,7 +44,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
-use model::placement::workstation::TierBatchBytes;
+use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use serve::reasoning::ThinkTags;
 use serve::{EngineProps, ServeError};
@@ -72,6 +76,9 @@ pub struct Open<F> {
     pub tier_batch: Option<TierBatchBytes>,
     /// The residency the plan chose, `Off` where the body keeps the experts the plan placed.
     pub residency: Residency,
+    /// The prompt cache's byte budget ([`Tiered::cache_budget`]): the pinned staging a seat's save
+    /// lane is made of at the open; 0, the cache off, makes none.
+    pub cache_ram: u64,
     /// `BLOOMERY_XSTREAM` as set ([`Levers::xstream`]), `None` unset: the seat whose prompt calls
     /// stream host experts resolves it by the common rule (`shared/xstream_rule.rs`).
     pub xstream: Option<&'static str>,
@@ -97,6 +104,48 @@ pub type FolderSource = ();
 pub struct Folder {
     pub header: Split,
     pub source: FolderSource,
+}
+
+/// `--cache-ram`, the flag of a seat that keeps saved sequence states in host RAM: the budget in MiB
+/// as given, unset the default ([`CacheRam`]).
+#[derive(Default)]
+pub struct CacheFlag {
+    ram: Option<u64>,
+}
+
+impl CacheFlag {
+    /// `flag` and `value` as the seat's own flag ([`Tiered::flags`]): `Ok(true)` took `--cache-ram`.
+    pub fn take(&mut self, flag: &str, value: &str) -> Result<bool, GateError> {
+        if flag != "--cache-ram" {
+            return Ok(false);
+        }
+        self.ram = Some(CacheRam::parse_mib(flag, value)?);
+        Ok(true)
+    }
+
+    /// The budget in bytes ([`Tiered::cache_budget`]), its `cache` line printed: the flag as given,
+    /// else the default over the plan's host need and the residency's `pool`; a default under one
+    /// saved state is off. `state` is the host bytes a saved state of that many positions holds. A
+    /// budget that holds no full session at the slot's context `slot_ctx` stays on for the shorter
+    /// ones and says so.
+    pub fn budget(
+        &self,
+        plan: &Plan<'_>,
+        pool: u64,
+        slot_ctx: usize,
+        state: impl Fn(usize) -> u64,
+    ) -> Result<u64, GateError> {
+        let cache = CacheRam::of(
+            self.ram,
+            HostNeed::of(plan, 0).bytes(),
+            pool,
+            checkpoints_reserved(plan.machine),
+        )?
+        .holding(state(1))
+        .short_of(slot_ctx, state(slot_ctx));
+        eprint_noted(&cache.line());
+        Ok(cache.ram)
+    }
 }
 
 /// The model at a path as the common run reads it ([`Tiered::read_model`]): the header it plans
@@ -575,6 +624,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         embedding,
         tier_batch,
         residency,
+        cache_ram,
         xstream: levers.xstream(),
         ring,
         folder,
