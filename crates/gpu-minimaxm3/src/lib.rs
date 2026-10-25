@@ -29,4 +29,3 @@ pub mod tier;
 
 pub use body::{Body, MiniMaxM3Model, StepInput, set_taps};
 pub use forced::{ForcedRoute, ForcedRow};
-pub use seq::MiniMaxSeq;

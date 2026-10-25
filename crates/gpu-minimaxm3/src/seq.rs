@@ -1,4 +1,5 @@
-//! A MiniMax-M3 sequence on the host ([`MiniMaxSeq`], over the shared
+//! A MiniMax-M3 sequence on the host (the body's
+//! [`PlaneSeq`](bloomery_gpu::checkpoint::planes::PlaneSeq), over the shared
 //! `bloomery_gpu::checkpoint::planes`): what a server's prompt cache holds of
 //! a sequence, and puts back on the slot that resumes it.
 //!
@@ -10,16 +11,12 @@
 //! resume are of the selected slot, whose planes the select made live.
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::checkpoint::planes::{PlaneBody, PlaneSeq, head_major};
+use bloomery_gpu::checkpoint::planes::{PlaneBody, head_major};
 use bloomery_gpu::checkpoint::saved::{Identity, Spans};
 use bloomery_gpu::flash_gqa::HEAD;
 
 use crate::attn::DIM;
 use crate::body::Body;
-
-/// A MiniMax-M3 sequence state on the host
-/// ([`bloomery_gpu::checkpoint::planes::seq_save`]).
-pub type MiniMaxSeq = PlaneSeq<Body>;
 
 impl PlaneBody for Body {
     const WHAT: &'static str = "minimaxm3 sequence";

@@ -94,7 +94,6 @@ mod tier;
 pub use placed::Placed;
 use placed::{PlacedOpen, StepWalk, plan_map};
 use prefill::{PASS_ROWS_MAX, PassSizes, Prompt, choose_pass_rows, placed_rows};
-pub use seq::MuseSeq;
 use stream::XSide;
 pub use stream::{STREAM_FLOOR, XSTREAM_COSTS};
 

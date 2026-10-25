@@ -10,4 +10,4 @@
 
 pub mod body;
 
-pub use body::{Body, LayerNodes, LayerRoute, MuseSeq, Placed};
+pub use body::{Body, LayerNodes, LayerRoute, Placed};

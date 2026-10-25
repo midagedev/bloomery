@@ -1,4 +1,5 @@
-//! A Muse Spark sequence on the host ([`MuseSeq`], over the shared
+//! A Muse Spark sequence on the host (the body's
+//! [`PlaneSeq`](crate::checkpoint::planes::PlaneSeq), over the shared
 //! `checkpoint::planes`): what a server's prompt cache holds of a sequence.
 //!
 //! Every store is a plane of positions: each layer's K and V, head-major, a
@@ -9,11 +10,8 @@
 
 use super::Body;
 use crate::GpuError;
-use crate::checkpoint::planes::{PlaneBody, PlaneSeq, head_major};
+use crate::checkpoint::planes::{PlaneBody, head_major};
 use crate::checkpoint::saved::{Identity, Spans};
-
-/// A Muse Spark sequence state on the host ([`crate::checkpoint::planes::seq_save`]).
-pub type MuseSeq = PlaneSeq<Body>;
 
 impl PlaneBody for Body {
     const WHAT: &'static str = "musespark sequence";
