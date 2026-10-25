@@ -4,16 +4,18 @@
 //! up and down and the r8 unpack of a staged gate or up — with the load's
 //! churn pool ([`churn`]) and the machine's live delay and deadline.
 //!
-//! **Parts.** An expert is three parts in stack order: gate and up (Q3_K,
-//! `ff` rows of `n_embd` values each) and down (Q4_K, `n_embd` rows of `ff`).
-//! On the card each part of slot `s` is the file's bytes of that expert at
-//! byte `s · part` of its layer's stack, which the placed load uploads as
-//! file bytes in slot order.
+//! **Parts.** An expert is three parts in stack order: gate and up (`ff` rows
+//! of `n_embd` values each) and down (`n_embd` rows of `ff`), of the types the
+//! layer's file tensors hold (`accepts::ds41_pair`: Q3_K and Q4_K for the
+//! fused layer, the common leg's types for the rest). On the card each part
+//! of slot `s` is the file's bytes of that expert at byte `s · part` of its
+//! layer's stack, which the placed load uploads as file bytes in slot order.
 //!
 //! **The unpack.** The host reads its routed gates and ups from the r8
 //! sidecar when the load reads one (`BLOOMERY_R8`), so those are the bytes
 //! the load's host set holds, and the down from the source file. A staged
-//! gate or up is then the r8 row-lane layout, not Q3_K: once its bytes are in
+//! gate or up is then the r8 row-lane layout, not Q3_K (a sidecar beside a
+//! file with any other gate and up type is refused by name): once its bytes are in
 //! the slot, [`R8Kernels`] turns them into the Q3_K bytes in place on the
 //! copy stream (`ds41_r8_q3k_groups`, the inverse of `qdot::repack_q3k_r8`,
 //! bit for bit `qdot::unpack_q3k_r8`). A group of eight rows is the same byte
@@ -29,16 +31,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::host::swap_source::{Convert, FileStacks};
+use bloomery_gpu::host::swap_source::{Convert, FileStacks, PlanStacks, StackFacts};
 use bloomery_gpu::{GpuError, WindowMut, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
 use cuda_device::vector::U32x4;
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
-use model::arch::deepseek41::names;
+use model::arch::names::routed_stacks;
 use model::placement::Plan;
-use model::placement::accepts;
 use model::placement::churn::ChurnPool;
 
 /// Passes from the boundary that makes a flip to the one it lands at. The
@@ -616,26 +617,52 @@ fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
     }
 }
 
-/// The K-quant types of V4.1's three stacks, in stack order: its card leg's
-/// ([`accepts::DS41_LEG`], the arms its plan's rule reads too).
-const TYPES: [GgmlType; 3] = accepts::DS41_LEG;
-
 /// V4.1's [`FileStacks`] for the common file source: each layer's gate, up
-/// and down by name, and under the r8 sidecar the unpack of a staged gate or
+/// and down by name and type as the plan's tensors hold them
+/// ([`PlanStacks`]), and under the r8 sidecar the unpack of a staged gate or
 /// up into its slot's Q3_K bytes ([`R8Unpack`]).
-pub struct Ds41Stacks;
+pub struct Ds41Stacks {
+    table: PlanStacks,
+    layers: usize,
+}
+
+impl Ds41Stacks {
+    /// The stacks of the file `plan` places, a layer holding either all three
+    /// or none. Load-time only.
+    pub fn of(plan: &Plan<'_>) -> Result<Ds41Stacks, GpuError> {
+        let table = PlanStacks::of(
+            plan.model,
+            StackFacts {
+                what: "deepseek41 stacks",
+                names: routed_stacks,
+                check: None,
+                empty: true,
+                map_layers: None,
+                unrouted: Vec::new(),
+            },
+        )?;
+        Ok(Ds41Stacks {
+            table,
+            layers: plan.model.layers,
+        })
+    }
+}
 
 impl FileStacks for Ds41Stacks {
     fn names(&self, layer: usize) -> Vec<String> {
-        vec![
-            names::ffn_gate_exps(layer),
-            names::ffn_up_exps(layer),
-            names::ffn_down_exps(layer),
-        ]
+        self.table.names(layer)
     }
 
-    fn types(&self, _layer: usize) -> &[GgmlType] {
-        &TYPES
+    fn types(&self, layer: usize) -> &[GgmlType] {
+        self.table.types(layer)
+    }
+
+    fn map_layers(&self) -> Option<usize> {
+        self.table.map_layers()
+    }
+
+    fn unrouted(&self) -> Vec<usize> {
+        self.table.unrouted()
     }
 
     fn open(
@@ -647,6 +674,25 @@ impl FileStacks for Ds41Stacks {
     ) -> Result<Option<Arc<dyn Convert>>, GpuError> {
         if !sidecar {
             return Ok(None);
+        }
+        // The convert step sees a part, not its layer: it unpacks every
+        // staged gate and up as Q3_K's r8 layout.
+        for l in 0..self.layers {
+            if let Some(&ty) = self
+                .table
+                .types(l)
+                .first()
+                .filter(|&&ty| ty != GgmlType::Q3_K)
+            {
+                return Err(shape(
+                    "Ds41Stacks::open",
+                    format!(
+                        "an r8 sidecar beside {ty} routed gate and up stacks (layer {l}): the \
+                         sidecar is Q3_K's (qdot::repack_q3k_r8) and the unpack converts every \
+                         staged gate and up as such (BLOOMERY_R8=off)"
+                    ),
+                ));
+            }
         }
         let (n_embd, ff) = (dims[0] as usize, dims[1] as usize);
         unpack_shape(n_embd, ff, parts)?;

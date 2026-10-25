@@ -51,6 +51,7 @@
 
 use std::mem::size_of;
 
+use bloomery_gpu::card_leg::LegRun;
 use bloomery_gpu::card_slots::CardSlotKernels;
 use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::hybrid::{BatchKey, ServeTimes};
@@ -948,6 +949,63 @@ pub fn enqueue_tiled_experts(
     )
 }
 
+/// Tokens one run of the common card leg covers in a block of a layer on it
+/// ([`enqueue_leg_block`]): the leg's buffers are sized for this many.
+pub const LEG_PIECE: usize = 64;
+
+/// What the leg path reads for one block ([`enqueue_leg_block`]): the layer's
+/// stacks as the common card leg reads them, the f32 normed rows of the
+/// block's `cols` tokens (`n_embd` values a token), each of its `N_USED ·
+/// cols` slots' place in the stacks (`sel`: a stack slot, or [`HOST`] for a
+/// slot another device computes), the layer, its SwiGLU clamp and the experts
+/// the stacks hold.
+pub struct LegBlock<'a> {
+    pub stacks: &'a LegStacks<'a>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub cols: usize,
+    pub layer: usize,
+    pub limit: f32,
+    pub n_card: usize,
+}
+
+/// A block's routed experts on one card through the common card leg, for a
+/// layer whose types the tile path does not read: the block cut in pieces of
+/// at most [`LEG_PIECE`] tokens, each piece the leg's four launches over its
+/// tokens' slots (`CardLeg::enqueue_rows`), the down rows into `down`
+/// (slot-major, `n_embd` a slot); a slot whose place is [`HOST`] is left as
+/// it was. The launches are slot-local, so a slot's rows are the step's for
+/// the same slot. Asynchronous, allocation-free.
+pub fn enqueue_leg_block(
+    gpu: &Gpu,
+    leg: &mut (CardLeg, LegBufs),
+    t: &LegBlock<'_>,
+    down: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (card, bufs) = leg;
+    let n = bufs.shape().n;
+    let rule = Act::SwigluClamp { limit: t.limit };
+    let mut t0 = 0;
+    while t0 < t.cols {
+        let m = (t.cols - t0).min(LEG_PIECE);
+        let x = span(WHAT, t.x, t0 * n, m * n)?;
+        let sel = span(WHAT, t.sel, t0 * N_USED, m * N_USED)?;
+        let mut rows = span_mut(WHAT, down, t0 * N_USED * n, m * N_USED * n)?;
+        let run = LegRun {
+            layer: t.layer,
+            stacks: t.stacks,
+            normed: &x,
+            m,
+            sel: &sel,
+            n_card: t.n_card,
+            rule,
+        };
+        card.enqueue_rows(gpu, bufs, &run, &mut rows)?;
+        t0 += m;
+    }
+    Ok(())
+}
+
 /// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
 /// that drives the launches with inputs a batch's route cannot produce.
 pub struct FfnBatchKernels {
@@ -1387,6 +1445,9 @@ pub struct FfnBatch {
     /// ([`FfnPiece::enqueue_batch_replace`]); made by
     /// [`FfnBatch::enable_stream`].
     ssel: Option<DeviceBuffer<u32>>,
+    /// The common card leg's launches and buffers, for a block of a layer on
+    /// it ([`FfnBatch::prepare_leg`]).
+    leg: Option<(CardLeg, LegBufs)>,
 }
 
 /// A tiered block's routing as the shadow left it for the post's card sum
@@ -1517,6 +1578,7 @@ impl FfnBatch {
                 Vec::new()
             },
             ssel: None,
+            leg: None,
         })
     }
 
@@ -1574,6 +1636,25 @@ impl FfnBatch {
         self.hc.iter().map(DeviceBuffer::num_bytes).sum()
     }
 
+    /// The common card leg for the blocks of layers whose types it runs
+    /// ([`CardStacks::fused`] false): its launches and buffers for pieces of
+    /// [`LEG_PIECE`] tokens. A batch over a file whose card layers are all
+    /// fused needs none, and a block of a layer that does refuses by name
+    /// until this has run. Load-time only.
+    pub fn prepare_leg(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if self.leg.is_some() {
+            return Ok(());
+        }
+        let shape = LegShape {
+            cap: LEG_PIECE,
+            slots_per_col: N_USED,
+            n: self.n_embd,
+            ff: self.ff,
+        };
+        self.leg = Some((CardLeg::load(gpu)?, LegBufs::new(gpu.stream(), shape)?));
+        Ok(())
+    }
+
     /// Device bytes of the buffers, the chunk scratch's included; the
     /// page-locked host copies are not counted.
     #[must_use]
@@ -1601,6 +1682,7 @@ impl FfnBatch {
             + self.tile.device_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.leg.as_ref().map_or(0, |(_, b)| b.bytes())
             + self
                 .held
                 .iter()
@@ -2349,6 +2431,24 @@ impl FfnPiece {
             };
             let sel = span(WHAT, places, at * N_USED, slots_n)?;
             let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
+            if let Some(legs) = s.legs() {
+                let leg = b.leg.as_mut().ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the common card leg of a block of a layer of types it runs \
+                              (FfnBatch::prepare_leg)",
+                })?;
+                let x = span(WHAT, &b.x, at * n, (u - at) * n)?;
+                let t = LegBlock {
+                    stacks: legs,
+                    x: &x,
+                    sel: &sel,
+                    cols: u - at,
+                    layer,
+                    limit: c.limit,
+                    n_card: c.n_card,
+                };
+                return enqueue_leg_block(gpu, leg, &t, &mut down);
+            }
             let t = TiledBlock {
                 stacks: s,
                 q3: &b.q3_all,

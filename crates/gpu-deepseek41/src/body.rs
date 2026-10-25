@@ -863,6 +863,10 @@ pub struct Body {
     /// for: the refusal of the first layer whose tensors the batch's launches
     /// do not read ([`prefill::prepare_prefill`]).
     batch_refusal: Option<String>,
+    /// Whether a layer with card experts runs on the common card leg
+    /// ([`CardStacks::fused`] false): the prompt batch makes the leg's
+    /// buffers.
+    card_leg: bool,
     /// Per layer of `layers`, one bit: whether the group a prompt call is
     /// enqueuing has run its pick there ([`Body::enqueue_group_chain`]).
     /// Zeroed at each group's start; the load refuses more layers than its
@@ -2405,7 +2409,7 @@ impl Body {
             deadline: swap::DEADLINE,
             top_k: meta.hp.experts.n_used,
             max_rows: PAIR_ROWS,
-            stacks: Arc::new(swap::Ds41Stacks),
+            stacks: Arc::new(swap::Ds41Stacks::of(plan)?),
         };
         let mut m = GpuModel::load_placed_with(
             file,
@@ -2519,7 +2523,11 @@ impl Body {
 
         let attn =
             AttnChain::with_rows(gpu, hp, layers.clone(), image.layout(), &planner, PAIR_ROWS)?;
-        let ffn = FfnPiece::with_rows(gpu, hp, &map, PAIR_ROWS)?;
+        let mut ffn = FfnPiece::with_rows(gpu, hp, &map, PAIR_ROWS)?;
+        let card_leg = hp.on_leg();
+        if card_leg {
+            ffn.prepare_leg(gpu)?;
+        }
         let glue = Glue::with_rows(gpu, hp, image.layout(), PAIR_ROWS)?;
         let steps = layer_steps(hp, &layers, &seq.kv, &ffn, &glue)?;
         let writers = steps
@@ -2609,6 +2617,7 @@ impl Body {
             levers: cfg,
             batch: None,
             batch_refusal: None,
+            card_leg,
             picked: 0,
             tier,
             residency_glue,

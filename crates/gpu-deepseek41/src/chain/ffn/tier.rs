@@ -754,6 +754,17 @@ impl Ds41Tier {
                 detail: format!("layer {l} of a model of {} layers", hp.n_layer),
             })?;
             let stacks = CardStacks::of(w, l)?;
+            // The tier's image carries the activation's Q3_K plane and scales
+            // alone, which the common card leg's gate·up entries do not read
+            // (`accepts::ds41_pair`): the plan puts only the fused layer on a
+            // tier, and a stack of the common leg's types is refused by name.
+            if stacks.is_some_and(|s| !s.fused()) {
+                return Err(GpuError::Tensor {
+                    what: WHAT,
+                    name: names::ffn_down_exps(l),
+                    need: "the fused layer's stacks (q3_K gate and up, q4_K down) on an expert tier",
+                });
+            }
             match (k, stacks) {
                 (0, None) => {}
                 (k, Some(s))

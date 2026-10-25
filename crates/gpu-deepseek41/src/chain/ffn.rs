@@ -77,12 +77,14 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegShape, LegStacks, QuantRun};
 use bloomery_gpu::fused::FusedKernels;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::tier::TierTarget;
 use bloomery_gpu::hybrid::{Boundary, HOST, HandoffTarget, HostExperts, Hybrid, SlotMap};
+use bloomery_gpu::kquant::act::Act;
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, Q8Act, launch_u32};
@@ -93,7 +95,7 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::UNION_MAX_COLS;
-use model::placement::accepts;
+use model::placement::accepts::{self, LegArms, Program};
 use runtime::combine::Slots;
 
 use crate::dense::{Dense, DenseKernels};
@@ -109,7 +111,7 @@ mod batch;
 mod tier;
 pub use batch::{
     BatchLayer, BlockIo, CardAccTier, CardGather, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo,
-    TiledGateUp,
+    LEG_PIECE, LegBlock, TiledGateUp, enqueue_leg_block,
 };
 // The card half of the combine, and the places and sum launches the common
 // card slots own (`bloomery_gpu::card_slots`).
@@ -617,20 +619,28 @@ unsafe fn combine_post_at_n<const N: usize>(
 }
 
 /// A layer's routed stacks on the card: the experts its slot-map row puts
-/// there, slot `s` at rows `s · rows .. (s + 1) · rows` of each — gate and up
-/// q3_K (`ff` rows of `n_embd` per expert), down q4_K (`n_embd` rows of `ff`).
+/// there, slot `s` at rows `s · rows .. (s + 1) · rows` of each. Either the
+/// fused layer ([`accepts::DS41_LEG`]: gate and up q3_K, `ff` rows of `n_embd`
+/// per expert, and a q4_K down of `n_embd` rows of `ff`), which the chain's
+/// own launches read, or a layer of types the common card leg runs
+/// ([`accepts::ds41_pair`]), which [`CardStacks::legs`] hands to it.
 #[derive(Clone, Copy)]
 pub struct CardStacks<'a> {
     pub gate: &'a DeviceTensor<u32>,
     pub up: &'a DeviceTensor<u32>,
     pub down: &'a DeviceTensor<u32>,
+    /// The stacks as the common card leg reads them, for a layer on it;
+    /// `None` for the fused layer.
+    legs: Option<LegStacks<'a>>,
 }
 
 impl<'a> CardStacks<'a> {
     /// The stacks a placed load holds for layer `layer`: its routed gate, up
     /// and down file tensors in `w`, which a plan uploads with the experts of
     /// its card segment in slot order. `None` when `w` holds none of the
-    /// three; an error when it holds some, or holds one in another format.
+    /// three; an error when it holds some, holds one in another format or of a
+    /// type the chain's card experts do not run, or holds a gate and up and a
+    /// down that do not pair ([`accepts::ds41_pair`]).
     pub fn of(w: &'a Weights, layer: usize) -> Result<Option<CardStacks<'a>>, GpuError> {
         const WHAT: &str = "CardStacks::of";
         let names = [
@@ -638,25 +648,83 @@ impl<'a> CardStacks<'a> {
             names::ffn_up_exps(layer),
             names::ffn_down_exps(layer),
         ];
-        let found = names.each_ref().map(|n| w.get(n));
-        if found.iter().all(Option::is_none) {
+        let held = names.each_ref().map(|n| w.name_of(n));
+        if held.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let [gate, up, down] = [0, 1, 2].map(|i| match found[i] {
-            Some(DevWeight::KQuant { ty, w: stack, .. }) if *ty == accepts::DS41_LEG[i] => {
-                Ok(stack)
-            }
-            _ => Err(GpuError::Tensor {
+        let [Some(gate), Some(up), Some(down)] = held else {
+            let missing = held.iter().position(Option::is_none).unwrap_or(0);
+            return Err(GpuError::Tensor {
                 what: WHAT,
-                name: names[i].clone(),
-                need: "a resident K-quant routed stack beside the layer's other two",
-            }),
-        });
+                name: names[missing].clone(),
+                need: "a resident routed stack beside the layer's other two",
+            });
+        };
+        let legs = LegStacks::of_arms(
+            w,
+            [gate, up, down],
+            LegArms {
+                gate_up: accepts::ds41_gate_up,
+                down: accepts::ds41_down,
+            },
+            (
+                "a resident routed gate or up stack of a type V4.1's card experts run \
+                 (`accepts::ds41_gate_up`)",
+                "a resident routed down stack of a type V4.1's card experts run \
+                 (`accepts::ds41_down`)",
+            ),
+        )?;
+        let types = [legs.gate_up_ty(), legs.gate_up_ty(), legs.down_ty()];
+        if accepts::leg_runs(Program::Deepseek41Chain, types) != Some(true) {
+            return Err(GpuError::Tensor {
+                what: WHAT,
+                name: names[2].clone(),
+                need: "a down stack of a type that pairs with the layer's gate and up \
+                       (`accepts::ds41_pair`)",
+            });
+        }
+        let [gate, up, down] = legs.words().map_err(|_| GpuError::Tensor {
+            what: WHAT,
+            name: names[0].clone(),
+            need: "routed stacks in the file's blocks",
+        })?;
+        let fused = types == accepts::DS41_LEG;
         Ok(Some(CardStacks {
-            gate: gate?,
-            up: up?,
-            down: down?,
+            gate,
+            up,
+            down,
+            legs: (!fused).then_some(legs),
         }))
+    }
+
+    /// The fused layer ([`accepts::DS41_LEG`]) over stacks a caller holds,
+    /// which the chain's own launches read.
+    #[must_use]
+    pub fn fused_over(
+        gate: &'a DeviceTensor<u32>,
+        up: &'a DeviceTensor<u32>,
+        down: &'a DeviceTensor<u32>,
+    ) -> CardStacks<'a> {
+        CardStacks {
+            gate,
+            up,
+            down,
+            legs: None,
+        }
+    }
+
+    /// Whether the layer is the fused one the chain's own launches read
+    /// ([`accepts::DS41_LEG`]); else its stacks run on the common card leg.
+    #[must_use]
+    pub fn fused(&self) -> bool {
+        self.legs.is_none()
+    }
+
+    /// The stacks as the common card leg reads them, for a layer that runs on
+    /// it.
+    #[must_use]
+    pub fn legs(&self) -> Option<&LegStacks<'a>> {
+        self.legs.as_ref()
     }
 }
 
@@ -964,6 +1032,9 @@ struct FfnRow {
     y: DeviceBuffer<f32>,
     mixes: DeviceBuffer<f32>,
     hc_out: DeviceBuffer<f32>,
+    /// The common card leg's buffers, for a layer of types it runs
+    /// ([`FfnPiece::prepare_leg`]); its rows go to `down`.
+    leg: Option<LegBufs>,
 }
 
 impl FfnRow {
@@ -982,6 +1053,7 @@ impl FfnRow {
             y: z(n_embd)?,
             mixes: z(HC_MIX)?,
             hc_out: z(HC_MIX)?,
+            leg: None,
         })
     }
 
@@ -1005,6 +1077,7 @@ impl FfnRow {
             + q8act_bytes(&self.act_x)
             + q8act_bytes(&self.act_h)
             + q8act_bytes(&self.act_sh)
+            + self.leg.as_ref().map_or(0, LegBufs::bytes)
     }
 }
 
@@ -1030,6 +1103,9 @@ pub struct FfnPiece {
     scale: f32,
     /// Per row, its buffers ([`FfnPiece::with_rows`]).
     rows: Vec<FfnRow>,
+    /// The common card leg's launches, for the layers of types it runs
+    /// ([`FfnPiece::prepare_leg`]).
+    leg: Option<CardLeg>,
     /// HC_PRE's reduction scratch, which its own launches consume.
     hc_scratch: HcPreScratch,
 }
@@ -1125,8 +1201,32 @@ impl FfnPiece {
                 .map_err(|_| refuse(format!("{} Sinkhorn rounds", hp.hc.sinkhorn_iters)))?,
             scale: ex.routed_scale,
             rows,
+            leg: None,
             hc_scratch: HcPreScratch::new(stream, HC_STREAMS * n_embd)?,
         })
+    }
+
+    /// The common card leg for the layers of types it runs
+    /// ([`CardStacks::fused`] false): its launches and, per row, its buffers.
+    /// A piece over a file whose card layers are all fused needs none, and an
+    /// enqueue of a layer that does refuses by name until this has run.
+    /// Load-time only.
+    pub fn prepare_leg(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if self.leg.is_some() {
+            return Ok(());
+        }
+        let shape = LegShape {
+            cap: 1,
+            slots_per_col: N_USED,
+            n: self.n_embd,
+            ff: self.ff,
+        };
+        let leg = CardLeg::load(gpu)?;
+        for r in &mut self.rows {
+            r.leg = Some(LegBufs::new(gpu.stream(), shape)?);
+        }
+        self.leg = Some(leg);
+        Ok(())
     }
 
     /// The layers the piece was built for.
@@ -1435,6 +1535,18 @@ impl FfnPiece {
         let (n, ff) = (self.n_embd, self.ff);
         match (card, self.cfg[i].n_card) {
             (None, 0) => Ok(None),
+            (Some(s), k) if k > 0 && s.legs().is_some() => {
+                let shape = LegShape {
+                    cap: 1,
+                    slots_per_col: N_USED,
+                    n,
+                    ff,
+                };
+                if let Some(legs) = s.legs() {
+                    legs.check(k, shape)?;
+                }
+                Ok(Some(s))
+            }
             (Some(s), k) if k > 0 => {
                 let (gu_words, d_words) = (110 * (n / 256) / 4, 36 * (ff / 256));
                 if s.gate.rows() != k * ff
@@ -1580,36 +1692,63 @@ impl FfnPiece {
             &mut r.mixes,
             &mut r.hc_out,
         )?;
-        if let Some(s) = card {
-            let args = ExpertGateUp {
-                wg: s.gate,
-                wu: s.up,
-                act: &r.act_x,
-                sel: &r.sel,
-                n_slots: N_USED,
-                rows_per_expert: ff,
-                limit: c.limit,
-                fault: gpu.layer_sink(layer)?,
-            };
-            self.experts
-                .enqueue_expert_gate_up(stream, &args, &mut r.h)?;
-            let q = QuantSel {
-                x: &r.h,
-                cols: 0..N_USED,
-                sel: &r.sel,
-                n_card: c.n_card,
-            };
-            gpu.q4k_sel()
-                .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, &mut r.act_h)?;
-            gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                stream,
-                s.down,
-                &r.act_h,
-                &r.sel,
-                N_USED,
-                n,
-                &mut r.down,
-            )?;
+        match card {
+            Some(s) if s.fused() => {
+                let args = ExpertGateUp {
+                    wg: s.gate,
+                    wu: s.up,
+                    act: &r.act_x,
+                    sel: &r.sel,
+                    n_slots: N_USED,
+                    rows_per_expert: ff,
+                    limit: c.limit,
+                    fault: gpu.layer_sink(layer)?,
+                };
+                self.experts
+                    .enqueue_expert_gate_up(stream, &args, &mut r.h)?;
+                let q = QuantSel {
+                    x: &r.h,
+                    cols: 0..N_USED,
+                    sel: &r.sel,
+                    n_card: c.n_card,
+                };
+                gpu.q4k_sel().enqueue_quantize_sel(
+                    stream,
+                    &q,
+                    gpu.layer_sink(layer)?,
+                    &mut r.act_h,
+                )?;
+                gpu.q4k_sel().enqueue_gemv_q4k_sel(
+                    stream,
+                    s.down,
+                    &r.act_h,
+                    &r.sel,
+                    N_USED,
+                    n,
+                    &mut r.down,
+                )?;
+            }
+            Some(s) => {
+                let unprepared = || GpuError::State {
+                    what: ENQUEUE,
+                    missing: "the common card leg of a layer of types it runs \
+                              (FfnPiece::prepare_leg)",
+                };
+                let leg = self.leg.as_ref().ok_or_else(unprepared)?;
+                let bufs = r.leg.as_mut().ok_or_else(unprepared)?;
+                let legs = s.legs().ok_or_else(unprepared)?;
+                let run = QuantRun {
+                    layer,
+                    stacks: legs,
+                    act: &r.act_x,
+                    m: 1,
+                    sel: &r.sel,
+                    n_card: c.n_card,
+                    rule: Act::SwigluClamp { limit: c.limit },
+                };
+                leg.enqueue_rows_quantized(gpu, bufs, &run, &mut r.down)?;
+            }
+            None => {}
         }
         match (lw.sh_gate, lw.sh_up) {
             (
