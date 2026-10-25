@@ -55,9 +55,10 @@
 //!   over two weight planes, with a fused weighted combine. The MXFP4 entries
 //!   are that file's per-slot pair over the file's own blocks.
 //! - `crates/gpu/src/iq.rs`'s `IqFormat` plane row cores (IQ2_XS, IQ3_XXS,
-//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS
-//!   reach a launch through `crates/gpu/src/iq_sel.rs`, their entries (IQ3_S
-//!   has no plane row core). Q2_K has no launcher of that shape.
+//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ2_S, IQ1_S, IQ1_M, IQ3_XXS,
+//!   IQ3_S and IQ4_XS reach a launch through `crates/gpu/src/iq_sel.rs`, their
+//!   entries (IQ2_S, IQ1_S, IQ1_M and IQ3_S have no plane row core). Q2_K has
+//!   no launcher of that shape.
 //! - V4.1's BF16 and Q3_K embedding rows (`chain/glue.rs` in
 //!   `crates/gpu-deepseek41`): the BF16 rows are that family's own; the
 //!   Q3_K rows have the common entry.
@@ -99,6 +100,15 @@ pub enum GateUpEntry {
     /// `QuantSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
     /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq2_s_gate_up_sel`, the file's
+    /// 82-byte `block_iq2_s` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq2s,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq1_s_gate_up_sel`, the file's
+    /// 50-byte `block_iq1_s` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq1s,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq1_m_gate_up_sel`, the file's
+    /// 56-byte `block_iq1_m` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq1m,
     /// `QuantSelKernels::enqueue_gate_up` (`iq3_xxs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
@@ -148,6 +158,15 @@ pub enum DownEntry {
     /// `QuantSelKernels::enqueue_gemv_sel` (`iq2_xs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq2_s_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq2s,
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq1_s_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq1s,
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq1_m_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq1m,
     /// `QuantSelKernels::enqueue_gemv_sel` (`iq3_xxs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
@@ -196,6 +215,14 @@ pub enum GemmEntry {
     Q6k,
     /// `GemmWeight::Iq2Xxs` (`gemm_iq2xxs`).
     Iq2xxs,
+    /// `GemmWeight::Iq2Xs` (`gemm_iq2xs`).
+    Iq2xs,
+    /// `GemmWeight::Iq2S` (`gemm_iq2s`).
+    Iq2s,
+    /// `GemmWeight::Iq1S` (`gemm_iq1s`).
+    Iq1s,
+    /// `GemmWeight::Iq1M` (`gemm_iq1m`).
+    Iq1m,
     /// `GemmWeight::Iq3Xxs` (`gemm_iq3xxs`).
     Iq3xxs,
     /// `GemmWeight::Iq3S` (`gemm_iq3s`).
@@ -395,6 +422,9 @@ impl DownEntry {
             | DownEntry::Q8_0
             | DownEntry::Iq2xxs
             | DownEntry::Iq2xs
+            | DownEntry::Iq2s
+            | DownEntry::Iq1s
+            | DownEntry::Iq1m
             | DownEntry::Iq3xxs
             | DownEntry::Iq3s
             | DownEntry::Iq4xs
@@ -557,10 +587,11 @@ impl CardFormat {
     /// [`Card::layout`]; `None` when the loader has none. `None` is not a
     /// refusal by itself: a routed stack of such a type stays on the host,
     /// and a tensor its role puts on a card is refused by the plan with
-    /// `placement::PlacementError::NoCardFormat`. IQ2_XXS loads in the file's
-    /// blocks ([`CardFormat::KQuant`]), which `iq2_xxs_gemv_sel` reads for a
-    /// routed stack and for a dense matrix as a stack of one expert (the
-    /// latent MoE body's shared expert).
+    /// `placement::PlacementError::NoCardFormat`. IQ2_XXS, IQ2_XS, IQ2_S,
+    /// IQ1_S and IQ1_M load in the file's blocks ([`CardFormat::KQuant`]),
+    /// which `iq2_xxs_gemv_sel` and its kin read for a routed stack and for a
+    /// dense matrix as a stack of one expert (the latent MoE body's shared
+    /// expert).
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<CardFormat> {
         ty.card().layout
@@ -659,7 +690,7 @@ impl CardFormat {
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
     /// uses, or the layout a routed card entry of `ty` reads a stack in
     /// (`DownEntry::layout`): the file's blocks
-    /// ([`CardFormat::KQuant`]) of q5_1, q8_0, iq2_xs, iq3_xxs, iq3_s,
+    /// ([`CardFormat::KQuant`]) of q5_1, q8_0, iq2_xs, iq2_s, iq1_s, iq1_m, iq3_xxs, iq3_s,
     /// iq4_xs, iq4_nl and mxfp4, which only a program's
     /// `placement::RoutedFormat` picks.
     #[must_use]

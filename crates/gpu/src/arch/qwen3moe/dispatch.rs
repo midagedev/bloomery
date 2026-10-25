@@ -1097,6 +1097,9 @@ fn slots_down(
             | GateUpEntry::Q6k
             | GateUpEntry::Iq2xxs
             | GateUpEntry::Iq2xs
+            | GateUpEntry::Iq2s
+            | GateUpEntry::Iq1s
+            | GateUpEntry::Iq1m
             | GateUpEntry::Iq3xxs
             | GateUpEntry::Iq3s
             | GateUpEntry::Iq4xs
@@ -1171,6 +1174,9 @@ fn slots_down(
             | DownEntry::Q8_0
             | DownEntry::Iq2xxs
             | DownEntry::Iq2xs
+            | DownEntry::Iq2s
+            | DownEntry::Iq1s
+            | DownEntry::Iq1m
             | DownEntry::Iq3xxs
             | DownEntry::Iq3s
             | DownEntry::Iq4nl
@@ -1325,6 +1331,9 @@ fn apart_down(
         | GateUpEntry::Q6k
         | GateUpEntry::Iq2xxs
         | GateUpEntry::Iq2xs
+        | GateUpEntry::Iq2s
+        | GateUpEntry::Iq1s
+        | GateUpEntry::Iq1m
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
@@ -1374,6 +1383,9 @@ fn apart_down(
         | DownEntry::Q8_0
         | DownEntry::Iq2xxs
         | DownEntry::Iq2xs
+        | DownEntry::Iq2s
+        | DownEntry::Iq1s
+        | DownEntry::Iq1m
         | DownEntry::Iq3xxs
         | DownEntry::Iq3s
         | DownEntry::Iq4nl

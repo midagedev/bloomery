@@ -158,8 +158,8 @@ pub struct LegBufs {
 
 impl LegBufs {
     /// The buffers for runs of `shape` whose down entries read [`DownAct::
-    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and
-    /// IQ4_XS downs).
+    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M,
+    /// IQ3_XXS, IQ3_S and IQ4_XS downs).
     /// Load-time or first-prompt only.
     pub fn new(stream: &CudaStream, shape: LegShape) -> Result<LegBufs, GpuError> {
         LegBufs::for_down(stream, shape, DownAct::Q8Act)
@@ -1093,6 +1093,9 @@ impl CardLeg {
             Some(
                 GateUpEntry::Iq2xxs
                 | GateUpEntry::Iq2xs
+                | GateUpEntry::Iq2s
+                | GateUpEntry::Iq1s
+                | GateUpEntry::Iq1m
                 | GateUpEntry::Iq3xxs
                 | GateUpEntry::Iq3s
                 | GateUpEntry::Iq4xs,
@@ -1202,7 +1205,13 @@ impl CardLeg {
             }
             (
                 Some((
-                    DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq3s | DownEntry::Iq4xs,
+                    DownEntry::Iq2xs
+                    | DownEntry::Iq2s
+                    | DownEntry::Iq1s
+                    | DownEntry::Iq1m
+                    | DownEntry::Iq3xxs
+                    | DownEntry::Iq3s
+                    | DownEntry::Iq4xs,
                     DownAct::Q8Act,
                 )),
                 ActH::Q8Act(act),
@@ -1628,11 +1637,26 @@ pub(crate) mod tests {
         *state
     }
 
+    /// Write the f16 `d` (`bits`) of one block of `ty`: IQ1_M has no `d` field, its f16 is spread
+    /// over the top nibbles of the four scale halfwords that close the block; every other type
+    /// opens its block with it.
+    fn put_d(ty: GgmlType, block: &mut [u8], bits: u16) {
+        if ty == GgmlType::IQ1_M {
+            for j in 0..4 {
+                let top = u8::try_from((bits >> (4 * j)) & 0xf).expect("a nibble");
+                block[49 + 2 * j] = (block[49 + 2 * j] & 0x0f) | (top << 4);
+            }
+        } else {
+            block[..2].copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+
     /// `rows` rows of `k` values of `ty` in the file's block bytes: every
     /// byte random but each block's scales, which are finite and small, so no
     /// dot is NaN or infinite — the f16 `d` (and `dmin` of Q4_K and Q5_K, `m`
-    /// of Q5_1; Q6_K's last in its block) or MXFP4's E8M0 byte. Every other byte of these types is a
-    /// valid code, so any draw is a valid block.
+    /// of Q5_1; Q6_K's last in its block), IQ1_M's, which [`put_d`] spreads over its scale
+    /// halfwords, or MXFP4's E8M0 byte. Every other byte of these types is a valid code, so any
+    /// draw is a valid block.
     pub(crate) fn stack_bytes(ty: GgmlType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
         let block = usize::try_from(ty.type_size().expect("a block size")).expect("a size");
         let width = usize::try_from(ty.blck_size().expect("a block width")).expect("a width");
@@ -1650,6 +1674,11 @@ pub(crate) mod tests {
             }
             if ty == GgmlType::MXFP4 {
                 b[0] = 118 + u8::try_from(next(&mut state) % 4).expect("a byte");
+                continue;
+            }
+            if ty == GgmlType::IQ1_M {
+                let (exp, mant) = (5 + next(&mut state) % 4, next(&mut state) & 0x3ff);
+                put_d(ty, b, u16::try_from(exp << 10 | mant).expect("an f16"));
                 continue;
             }
             // Q6_K's `d` closes its block; every other type's scales open it.
@@ -2263,6 +2292,9 @@ pub(crate) mod tests {
             GgmlType::Q5_K,
             GgmlType::Q8_0,
             GgmlType::IQ2_XS,
+            GgmlType::IQ2_S,
+            GgmlType::IQ1_S,
+            GgmlType::IQ1_M,
             GgmlType::IQ3_XXS,
             GgmlType::IQ3_S,
             GgmlType::IQ4_XS,
@@ -2270,7 +2302,7 @@ pub(crate) mod tests {
             let mut bytes = stack_bytes(ty, ROWS, K, 42);
             let bb = ty.type_size().expect("block bytes") as usize;
             for block in bytes.chunks_exact_mut(bb) {
-                block[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
+                put_d(ty, block, 0x7bff);
             }
             let up = words_of(&bytes, ROWS);
             let gate = vec![0u32; up.len()];
@@ -2522,7 +2554,7 @@ pub(crate) mod tests {
     /// The tokens of the wide test's runs: one, one past a group of eight
     /// columns, and the buffers' cap.
     const WIDE_RUNS: [usize; 3] = [1, 9, WIDE_CAP];
-    /// The wide test's cases, `(gate·up type, down type)`: the eight types of
+    /// The wide test's cases, `(gate·up type, down type)`: the eleven types of
     /// `kernels::card_gate_up_runs` each as a gate·up beside a down of its own
     /// type, then the three 32-value downs and the Q6_K down
     /// (`kernels::card_down_runs`) beside a gate·up that ran before.
@@ -2531,12 +2563,17 @@ pub(crate) mod tests {
     // PIN(2026-10-23): IQ2_XXS joins both sets with its gate·up (`iq2_xxs_gate_up_sel`)
     // and down (`iq2_xxs_gemv_sel`); the set was the eleven rows without its
     // own-type pair.
-    const WIDE_CASES: [(GgmlType, GgmlType); 12] = [
+    // PIN(2026-10-25): IQ2_S, IQ1_S and IQ1_M join both sets with their `_sel` gate·up and
+    // down; the set was the twelve rows without their own-type pairs.
+    const WIDE_CASES: [(GgmlType, GgmlType); 15] = [
         (GgmlType::Q4_K, GgmlType::Q4_K),
         (GgmlType::Q5_K, GgmlType::Q5_K),
         (GgmlType::MXFP4, GgmlType::MXFP4),
         (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS),
         (GgmlType::IQ2_XS, GgmlType::IQ2_XS),
+        (GgmlType::IQ2_S, GgmlType::IQ2_S),
+        (GgmlType::IQ1_S, GgmlType::IQ1_S),
+        (GgmlType::IQ1_M, GgmlType::IQ1_M),
         (GgmlType::IQ3_XXS, GgmlType::IQ3_XXS),
         (GgmlType::IQ3_S, GgmlType::IQ3_S),
         (GgmlType::IQ4_XS, GgmlType::IQ4_XS),
@@ -2679,7 +2716,7 @@ pub(crate) mod tests {
 
     /// A slot's rows are what a one-token run writes for it, whatever `m`
     /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
-    /// [`kernels::card_down_runs`] admit, in twelve cases (`WIDE_CASES`), and for
+    /// [`kernels::card_down_runs`] admit, in fifteen cases (`WIDE_CASES`), and for
     /// NVFP4's planes (`WIDE_PLANES`). Runs of
     /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
     /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a

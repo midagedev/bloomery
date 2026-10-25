@@ -1586,7 +1586,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m and q8_0)",
         row: prompt_leg_gate_up,
     },
     RowPin {
@@ -1594,7 +1594,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl)",
         row: prompt_leg_down,
     },
     RowPin {
@@ -1610,7 +1610,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m and q8_0)",
         row: prompt_leg_gate_up,
     },
     RowPin {
@@ -1618,7 +1618,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl)",
         row: prompt_leg_down,
     },
     RowPin {
@@ -2288,7 +2288,7 @@ mod tests {
             "routed gate q3_K".into(),
             matrix("ffn_gate_exps.weight", Role::RoutedExperts, GgmlType::Q3_K),
             &[
-                "q3_K routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)"
+                "q3_K routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m and q8_0)"
                     .to_string(),
             ],
         );
@@ -2382,22 +2382,31 @@ mod tests {
     // PIN(2026-10-22): both bodies' pins gain iq3_s on both parts (its prompt
     // GEMM `gemm_iq3s` gives the table's gemm row `prompt_leg_gate_up` and
     // `prompt_leg_down` read); red on the tree before the move by those.
+    // PIN(2026-10-25): and iq2_xs, iq2_s, iq1_s and iq1_m, whose prompt GEMMs
+    // (`gemm_iq2xs`, `gemm_iq2s`, `gemm_iq1s`, `gemm_iq1m`) give the table's
+    // gemm rows; an mxfp4 gate and up stand for the refused types.
     #[test]
     fn the_qwen3moe_bodies_read_routed_stacks_by_part() {
         use GgmlType::{
-            IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q3_K, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
+            IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q3_K, Q4_K, Q5_1,
+            Q5_K, Q6_K, Q8_0,
         };
         type Parts = (&'static str, &'static [GgmlType], &'static [GgmlType]);
         let rows: (Parts, Parts) = (
             (
-                "q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0",
-                &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q8_0],
-                &[Q3_K, IQ2_XS, MXFP4],
+                "q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m and q8_0",
+                &[
+                    Q4_K, Q5_K, Q6_K, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q8_0,
+                ],
+                &[Q3_K, MXFP4],
             ),
             (
-                "q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl",
-                &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0, IQ4_NL],
-                &[Q3_K, IQ2_XS, MXFP4],
+                "q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl",
+                &[
+                    Q4_K, Q5_K, Q6_K, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q5_1,
+                    Q8_0, IQ4_NL,
+                ],
+                &[Q3_K, MXFP4],
             ),
         );
         let bodies = [Program::Qwen3moeBody, Program::Qwen35Body].map(|p| (p, rows.0, rows.1));
@@ -2626,14 +2635,14 @@ mod tests {
             (
                 "ffn_gate_exps.weight",
                 Role::RoutedExperts,
-                GgmlType::IQ2_XS,
-                "iq2_xs routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+                GgmlType::MXFP4,
+                "mxfp4 routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m and q8_0)",
             ),
             (
                 "ffn_down_exps.weight",
                 Role::RoutedExperts,
                 GgmlType::MXFP4,
-                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl)",
             ),
             (
                 "ffn_gate_shexp.weight",
@@ -2879,9 +2888,9 @@ mod tests {
     /// leg does not read keeps its experts on the host; a type neither side runs is an item for
     /// each layer that holds it.
     // PIN(2026-10-25): the V4.1 routed rule widened from `CardFormat::of` to card-or-host so a
-    // file's iq1_m stacks (no card format, a fused kernel since qdot's generic host dot lists
-    // them) are no items; a q4_0 stack, which no card format or host kernel reads, is still an item.
-    // FAIL-first: under `CardFormat::of` alone the iq1_m layers are items.
+    // file's stacks of a type with a fused kernel and no card format (q2_K) are no items; a q4_0
+    // stack, which no card format or host kernel reads, is still an item.
+    // FAIL-first: under `CardFormat::of` alone the q2_K layers are items.
     #[test]
     fn a_deepseek41_routed_stack_runs_on_a_card_format_or_the_host() {
         let none = Vec::<(Option<usize>, String)>::new();
@@ -2919,9 +2928,10 @@ mod tests {
             (GgmlType::Q3_K, GgmlType::Q4_K, none.clone()),
             // A card format the chain's leg does not read: the layer stays on the host.
             (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS, none.clone()),
-            // The host's alone: no card format, a fused kernel.
-            (GgmlType::IQ1_M, GgmlType::IQ2_XXS, none.clone()),
             (GgmlType::IQ1_M, GgmlType::IQ1_M, none.clone()),
+            // The host's alone: no card format, a fused kernel.
+            (GgmlType::Q2_K, GgmlType::IQ2_XXS, none.clone()),
+            (GgmlType::Q2_K, GgmlType::Q2_K, none.clone()),
             // No side: q4_0 has no card format and no fused kernel.
             (GgmlType::Q4_0, GgmlType::Q4_K, item(GgmlType::Q4_0)),
         ];
@@ -3582,6 +3592,7 @@ mod tests {
             if t.name == "blk.4.ffn_down_exps.weight" {
                 t.dims[0] = 2000;
             }
+            // PIN(2026-10-25): iq2_s stood here until it had a card route; tq2_0 has none.
             if t.name == "blk.5.ffn_up_exps.weight" {
                 // PIN(2026-10-25): IQ2_S is served by qdot's generic host dot now; q4_0 has no kernel on either side.
                 t.ty = GgmlType::Q4_0;

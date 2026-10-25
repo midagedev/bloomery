@@ -2877,17 +2877,23 @@ mod tests {
                 GgmlType::Q5_K,
                 GgmlType::Q5_1,
                 GgmlType::Q8_0,
+                GgmlType::IQ2_XS,
+                GgmlType::IQ2_S,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ1_S,
                 GgmlType::IQ4_XS,
+                GgmlType::IQ1_M,
                 GgmlType::IQ4_NL,
             ] {
                 assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
             }
+            // PIN(2026-10-25): iq2_s stood in this list until it had card kernels (the gate·up
+            // and prompt GEMM `qwen38_gate_up` reads); tq2_0 has none.
             for ty in [
                 GgmlType::Q6_K,
                 GgmlType::Q5_0,
                 GgmlType::Q3_K,
-                GgmlType::IQ2_S,
+                GgmlType::TQ2_0,
             ] {
                 assert_eq!(card_routed(ty), None, "{ty}");
             }

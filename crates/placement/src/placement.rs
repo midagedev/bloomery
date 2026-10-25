@@ -6260,14 +6260,16 @@ mod tests {
     // types hold types it still has no GEMM for (an MXFP4 down, an IQ2_XS gate and
     // up); its rows are the ones the test held, and Qwen3.8's gain the MXFP4 down
     // its Q8_0 down did not have.
+    // PIN(2026-10-25): IQ2_XS has a GEMM now, so an MXFP4 gate and up stand for the
+    // types with none; the rows are unchanged.
     #[test]
     fn host_only_reasons_follow_the_program_and_part_in_file_order() {
         use crate::accepts::{Program, routed_rule};
-        use GgmlType::{IQ2_XS, MXFP4, Q4_K, Q5_K, Q6_K};
+        use GgmlType::{MXFP4, Q4_K, Q5_K, Q6_K};
         let model = legged(&[
             [Q4_K, Q4_K, Q6_K],
             [Q4_K, Q4_K, MXFP4],
-            [IQ2_XS, IQ2_XS, Q6_K],
+            [MXFP4, MXFP4, Q6_K],
             [Q4_K, Q5_K, Q4_K],
         ]);
         let rows = |program| {
@@ -7484,17 +7486,18 @@ mod tests {
             weights + KV + context + scratch + MARGIN,
             "the margin in the arena's place"
         );
-        // A routed stack of a type with no device format (iq1_s has none) is refused by name.
+        // A routed stack of a type with no device format (q2_K has none) is refused by name.
+        // PIN(2026-10-25): iq1_s stood here until it had a device format.
         let mut odd = layered(3);
-        odd.tensors[1].ty = GgmlType::IQ1_S;
+        odd.tensors[1].ty = GgmlType::Q2_K;
         match whole_need(&odd, &at(need), KV, load) {
             Err(e @ PlacementError::NoCardFormat { .. }) => assert_eq!(
                 e.to_string(),
-                "tensor experts 0: type iq1_s has no device format, but its role (routed) puts it \
+                "tensor experts 0: type q2_K has no device format, but its role (routed) puts it \
                  on a card"
             ),
             Err(e) => panic!("{e}, not NoCardFormat"),
-            Ok(n) => panic!("an iq1_s stack was sized as {n:?}"),
+            Ok(n) => panic!("a q2_K stack was sized as {n:?}"),
         }
     }
 

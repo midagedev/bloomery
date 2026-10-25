@@ -1,9 +1,9 @@
 //! IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K weights against q8_1 activations: the
 //! card layout of each format, one lane's share of a row's dot
 //! (device-callable, the [`crate::mxfp4`] shape), and the same rule on the
-//! host. IQ3_S has the host rule and the file format below only: its card
-//! layout is the file's own blocks ([`crate::iq_sel`]), so it has no planes,
-//! no repack and no row core.
+//! host. IQ3_S, IQ2_S, IQ1_S and IQ1_M have the host rule and the file format
+//! below only: their card layout is the file's own blocks ([`crate::iq_sel`]),
+//! so they have no planes, no repack and no row core.
 //!
 //! File formats (ggml's blocks, 256 values each; `gguf::quant` ports their
 //! dequant bit for bit):
@@ -19,6 +19,30 @@
 //!   7 the parity of the seven (ggml's `ksigns_iq2xs[i]`). Sub-block `ib`'s
 //!   scale byte `s` gives codes `4ib, 4ib+1` the factor `d·(0.5 + (s & 15))/4`
 //!   and codes `4ib+2, 4ib+3` `d·(0.5 + (s >> 4))/4`.
+//! - IQ2_S, 82 B: f16 `d` @0, 32 grid-index bytes @2 (four a sub-block), 32 raw
+//!   sign bytes @34 (four a sub-block), 8 high-bit bytes `qh` @66 and 8 scale
+//!   bytes @74 (one a sub-block). Group `l` (values `8l ..`) of sub-block
+//!   `ib` has the index byte `4ib + l` plus bits `2l ..` of `qh[ib]` as bits
+//!   8 and 9, into `iq2s_grid` (eight magnitudes, bytes of a u64), and the
+//!   sign byte `4ib + l`, whose bit `j` negates value `j`. The scale byte `s`
+//!   gives groups 0, 1 the factor `d·(0.5 + (s & 15))/4` and groups 2, 3
+//!   `d·(0.5 + (s >> 4))/4`, as IQ2_XS's.
+//! - IQ1_S, 50 B: f16 `d` @0, 32 grid-index bytes @2 (four a sub-block), 8 u16
+//!   `qh` @34 (one a sub-block). Sub-block `ib`'s `h = qh[ib]`: group `l`
+//!   (values `8l ..`) has the index byte `4ib + l` plus bits `3l ..` of `h` as
+//!   bits 8..10, into `iq1s_grid` (eight values −1, 0 or 1, bytes of a u64);
+//!   bits 12..14 of `h` are the scale `s` and bit 15 the sign of the delta
+//!   `±1/8` added to every grid value: a value is `d·(2s + 1)·(g ± 1/8)`,
+//!   which is `d/8·(2s + 1)·(8g ± 1)`.
+//! - IQ1_M, 56 B: 32 grid-index bytes @0 (four a sub-block), 16 `qh` bytes @32
+//!   (two a sub-block), four u16 scales @48. There is no `d` field: its f16
+//!   is the top nibbles of the four scale halfwords, the first halfword's the
+//!   lowest. Sub-block `ib` has two 3-bit scales, bits `6(ib & 1)` and
+//!   `6(ib & 1) + 3` of halfword `ib/2` (the factors `2s + 1` of groups 0, 1
+//!   and of groups 2, 3). Group `l` has the index byte `4ib + l` plus the low
+//!   three bits (even `l`) or bits 4..6 (odd `l`) of `qh[2ib + l/2]` as bits
+//!   8..10, and the delta sign in bit 3 (even `l`) or bit 7 (odd `l`) of that
+//!   byte; the group's values are `d/8·(2s + 1)·(8g ± 1)` as IQ1_S's.
 //! - IQ3_XXS, 98 B: f16 `d` @0, 64 grid-index bytes @2, eight u32 words @66.
 //!   Sub-block `ib` has index bytes `8ib .. 8ib + 8` (each four magnitudes of
 //!   `iq3xxs_grid`) and word `aux`: bits 28.. the scale `s`, bits `7l .. 7l+7`
@@ -70,7 +94,10 @@
 //! selectors of all 128 sign indices (computed by the same parity rule) into
 //! shared memory once ([`Iq2XxsTab`]), and a group's eight signed values are
 //! two table words or'd and two `prmt`s over the magnitudes and their
-//! negatives — the same value words, so the same bits.
+//! negatives — the same value words, so the same bits. IQ1_S and IQ1_M keep
+//! their grid in the global as selectors too ([`iq1_group`]): a group's eight
+//! int8 weights `8g ± 1` are two `prmt`s over the delta sign's three-byte
+//! table, no per-value work.
 //!
 //! Activations are the q8_1 quantizer's, as for MXFP4: per 128-value block a
 //! scale `d_x` and int8 codes in the Q4_K gemv's permutation, word `i` of
@@ -81,11 +108,13 @@
 //! - integer sums over the sub-block's 32 values, exact in i32, by `dp4a` on
 //!   the device: IQ2_XS `S0` over values 0..16 and `S1` over 16..32 of the
 //!   signed grid values times the codes,
-//!   `I = (2(s & 15) + 1)·S0 + (2(s >> 4) + 1)·S1`; IQ2_XXS and IQ3_XXS
-//!   `I = (2s + 1)·S` over all 32; IQ4_XS `I = (ls − 32)·S`;
+//!   `I = (2(s & 15) + 1)·S0 + (2(s >> 4) + 1)·S1`, IQ2_S and IQ1_M the same
+//!   with their own two factors (IQ1 over the int8 weights `8g ± 1`);
+//!   IQ2_XXS and IQ3_XXS `I = (2s + 1)·S` over all 32, IQ1_S too (over `8g ±
+//!   1`); IQ4_XS `I = (ls − 32)·S`;
 //!   Q2_K, per 16-value half `t`, `A_t = Σ q·x` and `B_t = Σ x`, `SA = Σ_t
 //!   (sc_t & 15)·A_t`, `SM = Σ_t (sc_t >> 4)·B_t`;
-//! - from `f = 0`: IQ2_XXS and IQ2_XS `f = fma((d/8)·d_x, I, f)`, IQ3_XXS `f = fma((d/4)·d_x,
+//! - from `f = 0`: IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S and IQ1_M `f = fma((d/8)·d_x, I, f)`, IQ3_XXS `f = fma((d/4)·d_x,
 //!   I, f)`, IQ3_S `f = fma(d·d_x, I, f)` with `I = (2s + 1)·S` over all 32,
 //!   IQ4_XS `f = fma(d·d_x, I, f)`, Q2_K `f = fma(d·d_x, SA, f)` then
 //!   `f = fma(−(dmin·d_x), SM, f)`, `d_x` the scale of the 128-value block
@@ -108,7 +137,8 @@ use cuda_device::{
 };
 use cuda_host::cuda_module;
 use gguf::iq_tables::{
-    IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use gguf::quant::{GgmlType, half_to_f32};
 use std::sync::Arc;
@@ -133,17 +163,27 @@ const GRID2XXS: &[u64; 256] = &IQ2XXS_GRID;
 pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
 /// The IQ3_S grid, likewise: 512 entries, a 9-bit index.
 pub(crate) const GRID3S: &[u32; 512] = &IQ3S_GRID;
+/// The IQ2_S grid, likewise: 1,024 entries, a 10-bit index (eight magnitudes,
+/// bytes of a u64, as IQ2_XS's).
+pub(crate) const GRID2S: &[u64; 1024] = &IQ2S_GRID;
+/// The IQ1 grid (IQ1_S's and IQ1_M's) as `prmt` selectors ([`grid1_sel`]),
+/// likewise: 2,048 entries, an 11-bit index.
+const GRID1_SEL: &[u32; 2048] = &grid1_sel(&IQ1S_GRID);
 
 /// `KVALUES_IQ4NL` as the shared nibble decode's table words
 /// ([`cores::table16`]).
 const IQ4NL: [u32; 4] = cores::table16(&KVALUES_IQ4NL);
 
-/// The six formats this module takes. [`IqFormat::Iq3S`] has the host rule
-/// only ([`IqFormat::plane_words`]).
+/// The nine formats this module takes. [`IqFormat::Iq3S`], [`IqFormat::Iq2S`],
+/// [`IqFormat::Iq1S`] and [`IqFormat::Iq1M`] have the host rule only
+/// ([`IqFormat::plane_words`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IqFormat {
     Iq2Xxs,
     Iq2Xs,
+    Iq2S,
+    Iq1S,
+    Iq1M,
     Iq3Xxs,
     Iq3S,
     Iq4Xs,
@@ -157,6 +197,9 @@ impl IqFormat {
         match self {
             IqFormat::Iq2Xxs => GgmlType::IQ2_XXS,
             IqFormat::Iq2Xs => GgmlType::IQ2_XS,
+            IqFormat::Iq2S => GgmlType::IQ2_S,
+            IqFormat::Iq1S => GgmlType::IQ1_S,
+            IqFormat::Iq1M => GgmlType::IQ1_M,
             IqFormat::Iq3Xxs => GgmlType::IQ3_XXS,
             IqFormat::Iq3S => GgmlType::IQ3_S,
             IqFormat::Iq4Xs => GgmlType::IQ4_XS,
@@ -176,7 +219,7 @@ impl IqFormat {
     }
 
     /// Whether the format has the plane layout and a row core (every format
-    /// but IQ3_S).
+    /// but IQ3_S, IQ2_S, IQ1_S and IQ1_M).
     #[must_use]
     pub fn has_planes(self) -> bool {
         self.plane_words(1).is_some()
@@ -184,14 +227,14 @@ impl IqFormat {
 
     /// Words of the three planes for `n` super-blocks, in plane order (the
     /// module doc's table; halves round up to whole words); `None` for a
-    /// format with no planes (IQ3_S).
+    /// format with no planes (IQ3_S, IQ2_S, IQ1_S, IQ1_M).
     #[must_use]
     pub fn plane_words(self, n: usize) -> Option<[usize; 3]> {
         match self {
             IqFormat::Iq2Xxs => Some([16 * n, 0, n.div_ceil(2)]),
             IqFormat::Iq2Xs => Some([16 * n, 2 * n, n.div_ceil(2)]),
             IqFormat::Iq3Xxs => Some([16 * n, 8 * n, n.div_ceil(2)]),
-            IqFormat::Iq3S => None,
+            IqFormat::Iq3S | IqFormat::Iq2S | IqFormat::Iq1S | IqFormat::Iq1M => None,
             IqFormat::Iq4Xs => Some([32 * n, 2 * n, 0]),
             IqFormat::Q2K => Some([16 * n, 4 * n, n]),
         }
@@ -269,7 +312,9 @@ impl IqFormat {
                     p1.extend((0..8).map(|i| word(blk, 66 + 4 * i)));
                     p2[h / 2] |= u32::from(half(blk, 0)) << (16 * (h % 2));
                 }
-                IqFormat::Iq3S => unreachable!("plane_words refused IQ3_S above"),
+                IqFormat::Iq3S | IqFormat::Iq2S | IqFormat::Iq1S | IqFormat::Iq1M => {
+                    unreachable!("plane_words refused a format with no planes above")
+                }
                 IqFormat::Iq4Xs => {
                     p0.extend((0..32).map(|i| word(blk, 8 + 4 * i)));
                     p1.push(word(blk, 0));
@@ -325,6 +370,95 @@ pub(crate) fn iq2_group(code: u32) -> (u32, u32) {
         signed4(g as u32, sign_mask4(s)),
         signed4((g >> 32) as u32, sign_mask4(s >> 4)),
     )
+}
+
+/// One IQ2_S group: grid index `i` (ten bits) under the raw sign byte in the
+/// low 8 bits of `sb` (its low nibble the first four values), as two
+/// value-order words. IQ3_S's shape over IQ2_S's eight-magnitude grid.
+#[inline(always)]
+pub(crate) fn iq2s_group(i: u32, sb: u32) -> (u32, u32) {
+    // SAFETY: i & 1023 < 1024, GRID2S's length.
+    let g = unsafe { *GRID2S.get_unchecked((i & 1023) as usize) };
+    (
+        signed4(g as u32, sign_mask4(sb)),
+        signed4((g >> 32) as u32, sign_mask4(sb >> 4)),
+    )
+}
+
+/// IQ2_XS grid entry `i` (nine bits)'s magnitudes at nibble `n` (bytes `4n ..
+/// 4n + 4` of its u64): one group's half, the four values an `mma` A-fragment
+/// lane holds (`grouped.rs`'s IQ2_XS decode).
+#[inline(always)]
+pub(crate) fn iq2xs_grid_half(i: u32, n: u32) -> u32 {
+    // SAFETY: i & 511 < 512, GRID2's length.
+    unsafe { (*GRID2.get_unchecked((i & 511) as usize) >> (32 * (n & 1))) as u32 }
+}
+
+/// IQ2_S grid entry `i` (ten bits)'s magnitudes at nibble `n`, as
+/// [`iq2xs_grid_half`].
+#[inline(always)]
+pub(crate) fn iq2s_grid_half(i: u32, n: u32) -> u32 {
+    // SAFETY: i & 1023 < 1024, GRID2S's length.
+    unsafe { (*GRID2S.get_unchecked((i & 1023) as usize) >> (32 * (n & 1))) as u32 }
+}
+
+/// An IQ1 weight is `8·g + 1` where its group's delta is positive and `8·g -
+/// 1` where it is negative, `g` in −1, 0, 1 (the grid): ggml's `d·(2s +
+/// 1)·(g ± 1/8)` with the eighth moved into the exact scale `d/8`, so the
+/// weights are int8 and every dot is an integer sum. [`IQ1_POS`] holds the
+/// three positive-delta weights (−7, 1, 9) as bytes 0..3 of a `prmt` word
+/// and [`IQ1_NEG`] the negative-delta ones (−9, −1, 7); selector nibble `c =
+/// g + 1` picks weight `c`.
+const IQ1_POS: u32 = 0x0009_01f9;
+const IQ1_NEG: u32 = 0x0007_fff7;
+
+/// Each IQ1 grid entry as a `prmt` selector over [`IQ1_POS`] or [`IQ1_NEG`]:
+/// nibble `j` is value `j`'s `g + 1`. A grid value that is none of −1, 0, 1
+/// stops the build.
+const fn grid1_sel(g: &[u64; 2048]) -> [u32; 2048] {
+    let mut t = [0u32; 2048];
+    let mut e = 0;
+    while e < 2048 {
+        let mut j = 0;
+        while j < 8 {
+            let c = match (g[e] >> (8 * j)) as u8 {
+                0xff => 0,
+                0x00 => 1,
+                0x01 => 2,
+                _ => panic!("an IQ1 grid value is not -1, 0 or 1"),
+            };
+            t[e] |= c << (4 * j);
+            j += 1;
+        }
+        e += 1;
+    }
+    t
+}
+
+/// The weight table [`IQ1_POS`] or [`IQ1_NEG`] a delta sign picks.
+#[inline(always)]
+fn iq1_table(neg: bool) -> u32 {
+    if neg { IQ1_NEG } else { IQ1_POS }
+}
+
+/// One IQ1 group: grid index `i` (eleven bits) under the delta sign `neg`, as
+/// two value-order words of int8 weights `8·g ± 1`.
+#[inline(always)]
+pub(crate) fn iq1_group(i: u32, neg: bool) -> (u32, u32) {
+    // SAFETY: i & 2047 < 2048, GRID1_SEL's length.
+    let sel = unsafe { *GRID1_SEL.get_unchecked((i & 2047) as usize) };
+    let tab = iq1_table(neg);
+    (prmt(tab, 0, sel), prmt(tab, 0, sel >> 16))
+}
+
+/// IQ1 grid entry `i`'s weights at nibble `n` (value bytes `4n .. 4n + 4`):
+/// one group's half, the four values an `mma` A-fragment lane holds, as
+/// [`iq2xs_grid_half`] holds its magnitudes.
+#[inline(always)]
+pub(crate) fn iq1_group_half(i: u32, neg: bool, n: u32) -> u32 {
+    // SAFETY: i & 2047 < 2048, GRID1_SEL's length.
+    let sel = unsafe { *GRID1_SEL.get_unchecked((i & 2047) as usize) };
+    prmt(iq1_table(neg), 0, sel >> (16 * (n & 1)))
 }
 
 /// The IQ2_XXS grid's three magnitudes as bytes 0..3 of a `prmt` word (byte
@@ -926,6 +1060,13 @@ pub unsafe fn q2_k_lane_partials<const M: usize>(
 
 // ------------------------------------------------------------------ host
 
+/// The f16 bits of an IQ1_M block's `d`: the top nibbles of its four scale
+/// halfwords `sc`, `sc[0]`'s the lowest.
+#[inline(always)]
+pub fn iq1m_scale_bits(sc: [u16; 4]) -> u16 {
+    (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000)
+}
+
 /// A file half as f32 (`gguf::quant::half_to_f32`).
 fn half_at(blk: &[u8], at: usize) -> f32 {
     half_to_f32(u16::from_le_bytes([blk[at], blk[at + 1]]))
@@ -972,6 +1113,57 @@ pub fn sub_sums_host(fmt: IqFormat, blk: &[u8], ib: usize, xq: &[i8; SUB_VALUES]
                 (2 * (s & 15) + 1) * half[0] + (2 * (s >> 4) + 1) * half[1],
                 0,
             )
+        }
+        IqFormat::Iq2S => {
+            let (qh, s) = (blk[66 + ib], i32::from(blk[74 + ib]));
+            let mut half = [0i32; 2];
+            for l in 0..4 {
+                let index =
+                    usize::from(blk[2 + 4 * ib + l]) | ((usize::from(qh) << (8 - 2 * l)) & 0x300);
+                let grid = IQ2S_GRID[index].to_le_bytes();
+                let signs = blk[34 + 4 * ib + l];
+                for (j, &g) in grid.iter().enumerate() {
+                    half[l / 2] += i32::from(g) * sign(signs, j) * x(8 * l + j);
+                }
+            }
+            (
+                (2 * (s & 15) + 1) * half[0] + (2 * (s >> 4) + 1) * half[1],
+                0,
+            )
+        }
+        IqFormat::Iq1S => {
+            let h = u16::from_le_bytes([blk[34 + 2 * ib], blk[35 + 2 * ib]]);
+            let fac = 2 * i32::from((h >> 12) & 7) + 1;
+            let delta = if h & 0x8000 != 0 { -1 } else { 1 };
+            let mut sum = 0i32;
+            for l in 0..4 {
+                let index =
+                    usize::from(blk[2 + 4 * ib + l]) | (usize::from((h >> (3 * l)) & 7) << 8);
+                for (j, &g) in IQ1S_GRID[index].to_le_bytes().iter().enumerate() {
+                    sum += (8 * i32::from(g as i8) + delta) * x(8 * l + j);
+                }
+            }
+            (fac * sum, 0)
+        }
+        IqFormat::Iq1M => {
+            let sc = |i: usize| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]);
+            let three = i32::from(sc(ib / 2) >> (6 * (ib % 2)));
+            let fac = [2 * (three & 7) + 1, 2 * ((three >> 3) & 7) + 1];
+            let mut half = [0i32; 2];
+            for l in 0..4 {
+                let h = blk[32 + 2 * ib + l / 2];
+                let (high, flag) = if l % 2 == 0 {
+                    (h & 7, 0x08)
+                } else {
+                    ((h >> 4) & 7, 0x80)
+                };
+                let index = usize::from(blk[4 * ib + l]) | (usize::from(high) << 8);
+                let delta = if h & flag != 0 { -1 } else { 1 };
+                for (j, &g) in IQ1S_GRID[index].to_le_bytes().iter().enumerate() {
+                    half[l / 2] += (8 * i32::from(g as i8) + delta) * x(8 * l + j);
+                }
+            }
+            (fac[0] * half[0] + fac[1] * half[1], 0)
         }
         IqFormat::Iq3Xxs => {
             let aux = u32::from_le_bytes(std::array::from_fn(|i| blk[66 + 4 * ib + i]));
@@ -1039,13 +1231,22 @@ pub fn sub_sums_host(fmt: IqFormat, blk: &[u8], ib: usize, xq: &[i8; SUB_VALUES]
 
 /// The f32 scales of one file block that the rule's integer sums of
 /// [`sub_sums_host`] are multiplied by (with the column's `d_x`): `(d/8, 0)`
-/// for IQ2_XXS and IQ2_XS, `(d/4, 0)` for IQ3_XXS, `(d, 0)` for IQ3_S and
-/// IQ4_XS, `(d, dmin)` for Q2_K (the second scales `SM` and is subtracted).
-/// `d/8` and `d/4` are exact.
+/// for IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S and IQ1_M, `(d/4, 0)` for IQ3_XXS, `(d,
+/// 0)` for IQ3_S and IQ4_XS, `(d, dmin)` for Q2_K (the second scales `SM` and
+/// is subtracted). `d/8` and `d/4` are exact. IQ1_M has no `d` field: its f16
+/// is spread over the top nibbles of its four scale halfwords, low nibble
+/// first ([`iq1m_scale_bits`]).
 #[must_use]
 pub fn sub_scales_host(fmt: IqFormat, blk: &[u8]) -> (f32, f32) {
     match fmt {
-        IqFormat::Iq2Xxs | IqFormat::Iq2Xs => (half_at(blk, 0) * 0.125, 0.0),
+        IqFormat::Iq2Xxs | IqFormat::Iq2Xs | IqFormat::Iq2S | IqFormat::Iq1S => {
+            (half_at(blk, 0) * 0.125, 0.0)
+        }
+        IqFormat::Iq1M => {
+            let sc: [u16; 4] =
+                std::array::from_fn(|i| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]));
+            (half_to_f32(iq1m_scale_bits(sc)) * 0.125, 0.0)
+        }
         IqFormat::Iq3Xxs => (half_at(blk, 0) * 0.25, 0.0),
         IqFormat::Iq3S | IqFormat::Iq4Xs => (half_at(blk, 0), 0.0),
         IqFormat::Q2K => (half_at(blk, 80), half_at(blk, 82)),
@@ -1504,7 +1705,7 @@ impl IqKernels {
             IqFormat::Q2K => {
                 crate::tensor::check_alignment::<U32x4, _>(what, "qs", &w.planes[0])?;
             }
-            IqFormat::Iq3S => {}
+            IqFormat::Iq3S | IqFormat::Iq2S | IqFormat::Iq1S | IqFormat::Iq1M => {}
         }
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(what, format!("1 <= m <= 8, got {m}")));
@@ -1560,10 +1761,13 @@ impl IqKernels {
                 let prep = md.prepare_q2_k_rows(cfg)?;
                 md.q2_k_rows(stream, &prep, p0, p1, p2, rows, n_sb, n_grp, m, q, d8, y)?;
             }
-            IqFormat::Iq3S => {
+            IqFormat::Iq3S | IqFormat::Iq2S | IqFormat::Iq1S | IqFormat::Iq1M => {
                 return Err(GpuError::shape(
                     what,
-                    "IQ3_S has no row core: its card layout is the file's blocks (iq_sel)",
+                    format!(
+                        "{:?} has no row core: its card layout is the file's blocks (iq_sel)",
+                        w.fmt
+                    ),
                 ));
             }
         }

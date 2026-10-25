@@ -138,21 +138,26 @@ mod tests {
 
     /// Qwen3.6's leg: the dispatch's types (a Q4_K or Q5_K gate and up of one
     /// type with a Q4_K, Q5_K or Q6_K down) and the common leg's (a Q6_K, Q8_0,
-    /// IQ3_XXS, IQ3_S or IQ4_XS gate and up of one type with a down any of the
-    /// common down arm's types) are card layers; a gate and up of two types,
-    /// and a carded layer with a stack of a type no card launch runs (an
-    /// IQ2_XS gate: no prompt GEMM, an MXFP4 down) are refused by name, the
+    /// IQ2_XS, IQ2_S, IQ1_S, IQ1_M, IQ3_XXS, IQ3_S or IQ4_XS gate and up of one
+    /// type with a down any of the common down arm's types) are card layers; a
+    /// gate and up of two types, and a carded layer with a stack of a type no
+    /// card launch runs (an MXFP4 gate: no prompt GEMM, an MXFP4 down) are
+    /// refused by name, the
     /// refusal listing both arms' types in file order. PIN(2026-10-22): the
     /// IQ4_XS and Q6_K gate and up and the Q5_1 down moved from refused to card
     /// layers when `placement::accepts` gave the body the common leg's arms;
     /// the IQ3_S gate and up and down joined both arms with its prompt GEMM.
+    /// PIN(2026-10-25): the IQ2_XS, IQ2_S, IQ1_S and IQ1_M gate and up and down
+    /// joined both arms with their prompt GEMMs; an MXFP4 gate and up stand for
+    /// the type with none.
     /// Mutant: the dispatch's arms (`accepts::qwen35_gate_up`/`qwen35_down`)
     /// for the common ones in `leg_arms` — the IQ4_XS, Q6_K, Q8_0 and IQ3_XXS
     /// layers are refused.
     #[test]
     fn qwen36s_leg_checks_a_card_layer_against_its_launches() {
         use GgmlType::{
-            IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
+            IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q4_K,
+            Q5_1, Q5_K, Q6_K, Q8_0,
         };
         for ok in [
             [Q4_K, Q4_K, Q4_K],
@@ -167,11 +172,15 @@ mod tests {
             [Q6_K, Q6_K, Q4_K],
             [Q6_K, Q6_K, Q8_0],
             [IQ2_XXS, IQ2_XXS, IQ2_XXS],
+            [IQ2_XS, IQ2_XS, IQ2_XS],
+            [IQ2_S, IQ2_S, IQ2_S],
+            [IQ1_S, IQ1_S, IQ1_S],
+            [IQ1_M, IQ1_M, IQ1_M],
         ] {
             assert_eq!(layer::<LegSplit>(ok), Ok(()), "{ok:?}");
         }
         for bad in [
-            [IQ2_XS, IQ2_XS, Q4_K],
+            [MXFP4, MXFP4, Q4_K],
             [Q4_K, Q4_K, MXFP4],
             [Q4_K, Q5_K, Q4_K],
             [Q4_K, Q6_K, Q4_K],
@@ -185,8 +194,9 @@ mod tests {
             assert!(
                 text.contains("layer 0's gate")
                     && text.ends_with(
-                        "a gate and an up of one type, [Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS], \
-                         and a down of [Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ4_NL, IQ3_S, IQ4_XS]"
+                        "a gate and an up of one type, [Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, \
+                         IQ3_S, IQ2_S, IQ4_XS, IQ1_M], and a down of [Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, \
+                         IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M]"
                     ),
                 "{text}"
             );
@@ -194,8 +204,8 @@ mod tests {
     }
 
     /// Qwen3.8's leg (`accepts::qwen38_gate_up`: the planes leg's gate·up
-    /// types that have a prompt GEMM): a Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_XS or
-    /// NVFP4 gate and up of one type with a Q5_1, Q8_0, IQ4_NL or NVFP4 down is
+    /// types that have a prompt GEMM): a Q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ3_XXS,
+    /// IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M or NVFP4 gate and up of one type with a Q5_1, Q8_0, IQ4_NL or NVFP4 down is
     /// a card layer, and the refusal's text lists those types; a Q4_K
     /// down (a down type its gate·up reads) and a Q6_K one (a type no part
     /// reads) are refused. Mutant: Qwen3.6's down arm for Qwen3.8's — the
@@ -231,8 +241,8 @@ mod tests {
                 text,
                 format!(
                     "layer 0's gate {}, up {} and down {}: the card leg runs a gate and an up \
-                     of one type, [Q4_K, Q5_K, IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS, NVFP4], and a down \
-                     of [Q5_1, Q8_0, IQ4_NL, NVFP4]",
+                     of one type, [Q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, \
+                     IQ1_M, NVFP4], and a down of [Q5_1, Q8_0, IQ4_NL, NVFP4]",
                     bad[0], bad[1], bad[2]
                 )
             );
@@ -245,17 +255,17 @@ mod tests {
     /// layer 2 arm catches it.
     #[test]
     fn the_table_checks_every_layer() {
-        use GgmlType::{IQ2_XS, Q4_K, Q6_K};
+        use GgmlType::{MXFP4, Q4_K, Q6_K};
         let three = |l: usize| {
             if l == 2 {
-                [IQ2_XS, IQ2_XS, Q4_K]
+                [MXFP4, MXFP4, Q4_K]
             } else {
                 [Q4_K, Q4_K, Q6_K]
             }
         };
         match stacks::<LegSplit>(&model(4, three), |_| Ok(true)) {
             Err(GpuError::Shape { detail, .. }) => {
-                assert!(detail.starts_with("layer 2's gate iq2_xs"), "{detail}");
+                assert!(detail.starts_with("layer 2's gate mxfp4"), "{detail}");
             }
             _ => panic!("layer 2 is refused by name"),
         }
@@ -272,13 +282,13 @@ mod tests {
 
     /// A layer the plan gives no card expert loads whatever its types: the
     /// leg never runs its stacks, so a gate and an up of two card types (or an
-    /// IQ2_XS gate and up on Qwen3.6's leg) is refused only on a carded layer.
+    /// MXFP4 gate and up on Qwen3.6's leg) is refused only on a carded layer.
     /// Mutant: the check run on every layer whatever `carded` says — the
     /// uncarded arms are refused.
     #[test]
     fn a_layer_with_no_card_expert_is_not_checked() {
-        use GgmlType::{IQ2_XS, Q4_K, Q5_K};
-        for bad in [[Q4_K, Q5_K, Q4_K], [IQ2_XS, IQ2_XS, Q4_K]] {
+        use GgmlType::{MXFP4, Q4_K, Q5_K};
+        for bad in [[Q4_K, Q5_K, Q4_K], [MXFP4, MXFP4, Q4_K]] {
             let two = model(2, |_| bad);
             assert!(
                 stacks::<LegSplit>(&two, |_| Ok(false)).is_ok(),

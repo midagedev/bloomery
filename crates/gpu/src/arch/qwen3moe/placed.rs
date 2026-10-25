@@ -2043,6 +2043,9 @@ fn gate_up_sel(
         | GateUpEntry::Q6k
         | GateUpEntry::Iq2xxs
         | GateUpEntry::Iq2xs
+        | GateUpEntry::Iq2s
+        | GateUpEntry::Iq1s
+        | GateUpEntry::Iq1m
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
@@ -2096,6 +2099,9 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         // and have no launch on the placed side.
         DownEntry::Iq2xxs
         | DownEntry::Iq2xs
+        | DownEntry::Iq2s
+        | DownEntry::Iq1s
+        | DownEntry::Iq1m
         | DownEntry::Iq3xxs
         | DownEntry::Iq3s
         | DownEntry::Iq4xs
@@ -3247,8 +3253,12 @@ mod tests {
         // PIN(2026-10-11): the i-quant downs have table entries now
         // (`iq_sel.rs`'s `Q8Act` downs), which the placed side has no launch
         // for; they were in the no-entry list below.
+        // PIN(2026-10-25): and IQ2_S, IQ1_S and IQ1_M, whose card entries are the same kind.
         for ty in [
             GgmlType::IQ2_XS,
+            GgmlType::IQ2_S,
+            GgmlType::IQ1_S,
+            GgmlType::IQ1_M,
             GgmlType::IQ3_XXS,
             GgmlType::IQ4_XS,
             GgmlType::MXFP4,

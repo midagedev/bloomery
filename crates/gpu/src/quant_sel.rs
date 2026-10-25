@@ -49,8 +49,8 @@ use crate::GpuError;
 use crate::fault::FaultSink;
 use crate::iq::{IQ2XXS_TAB_WORDS, Iq2XxsTab};
 use crate::iq_sel::{
-    Iq2Xs, Iq2Xxs, Iq3S, Iq3Xxs, Iq4Xs, RawDownLaunch, RawGateUpLaunch, RawSb, blk32_kernels,
-    down_sel_body, gate_up_sel_body,
+    Iq1M, Iq1S, Iq2S, Iq2Xs, Iq2Xxs, Iq3S, Iq3Xxs, Iq4Xs, RawDownLaunch, RawGateUpLaunch, RawSb,
+    blk32_kernels, down_sel_body, gate_up_sel_body,
 };
 use crate::kquant::sel::{
     ARENA_PARTS, Fmt, GateUpAct, GateUpAt, SelDown, SelDownAt, down_at_dims, down_dims,
@@ -1114,6 +1114,18 @@ quant_sel_module! {
         Iq2Xs IQ2_XS bb 74 {
             gate_up: iq2_xs_gate_up_sel, prepare_iq2_xs_gate_up_sel,
             down: iq2_xs_gemv_sel, prepare_iq2_xs_gemv_sel,
+        }
+        Iq2S IQ2_S bb 82 {
+            gate_up: iq2_s_gate_up_sel, prepare_iq2_s_gate_up_sel,
+            down: iq2_s_gemv_sel, prepare_iq2_s_gemv_sel,
+        }
+        Iq1S IQ1_S bb 50 {
+            gate_up: iq1_s_gate_up_sel, prepare_iq1_s_gate_up_sel,
+            down: iq1_s_gemv_sel, prepare_iq1_s_gemv_sel,
+        }
+        Iq1M IQ1_M bb 56 {
+            gate_up: iq1_m_gate_up_sel, prepare_iq1_m_gate_up_sel,
+            down: iq1_m_gemv_sel, prepare_iq1_m_gemv_sel,
         }
         Iq3Xxs IQ3_XXS bb 98 {
             gate_up: iq3_xxs_gate_up_sel, prepare_iq3_xxs_gate_up_sel,
