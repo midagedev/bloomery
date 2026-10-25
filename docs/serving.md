@@ -542,7 +542,7 @@ prefix restores at the largest of them inside it. On Qwen3.8 the card's own chec
 apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. On
 MiniMax-M3 and Muse Spark a saved state is the K and V rows of the held positions (and MiniMax's index keys), with no
 checkpoints: a request that shares any prefix with a saved state restores that prefix, and only those rows go back to
-the card. The MiMo and Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
+the card. The Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
 save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
 `<|im_start|>`, the seat cuts prompt calls at message starts, so a shared system prompt stays in the live slot
 for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
