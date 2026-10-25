@@ -327,9 +327,15 @@ fn gemv_pair(
                     k.q6k.enqueue_gemv_q6k_sel(stream, w, act, sel, 1, rpe, y)?
                 }
                 Some(DownEntry::Mxfp4) => k.mx.enqueue_down(stream, &a, sink, y)?,
-                Some(DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq3s | DownEntry::Iq4xs) => {
-                    k.quant.enqueue_gemv_sel(stream, ty, &a, sink, y)?
-                }
+                Some(
+                    DownEntry::Iq2xs
+                    | DownEntry::Iq2s
+                    | DownEntry::Iq1s
+                    | DownEntry::Iq1m
+                    | DownEntry::Iq3xxs
+                    | DownEntry::Iq3s
+                    | DownEntry::Iq4xs,
+                ) => k.quant.enqueue_gemv_sel(stream, ty, &a, sink, y)?,
                 _ => return Err(format!("{ty} has no `_sel` gemv here").into()),
             }
         }
@@ -376,7 +382,13 @@ fn gate_up_pair(
             Some(GateUpEntry::Q5k) => k.quant.enqueue_gate_up_q5k(stream, &a, sink, h)?,
             Some(GateUpEntry::Mxfp4) => k.mx.enqueue_gate_up(stream, &a, sink, h)?,
             Some(
-                GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
+                GateUpEntry::Iq2xs
+                | GateUpEntry::Iq2s
+                | GateUpEntry::Iq1s
+                | GateUpEntry::Iq1m
+                | GateUpEntry::Iq3xxs
+                | GateUpEntry::Iq3s
+                | GateUpEntry::Iq4xs,
             ) => {
                 let iq = IqGateUp {
                     ty,

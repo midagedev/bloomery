@@ -1,22 +1,29 @@
 //! GPU gate for the i-quant expert-select entries over raw blocks
-//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S
-//! and IQ4_XS
+//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S,
+//! IQ1_M, IQ3_XXS, IQ3_S and IQ4_XS
 //! gate·ups (IQ2_XXS's through its shared table, Muse Spark's gated
 //! experts), the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats),
-//! the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs over `Q8Act`
-//! (GLM-5.3-Flash UD-Q2_K_XL's and UD-IQ4_XS's), and IQ2_XXS's one-stack
+//! the IQ2_XS, IQ2_S, IQ1_S, IQ1_M, IQ3_XXS, IQ3_S and IQ4_XS downs over `Q8Act`
+//! (GLM-5.3-Flash UD-Q2_K_XL's and UD-IQ4_XS's, the V4.1 sets' IQ1_M and
+//! Unsloth's UD-IQ1_S / UD-IQ2_M), and IQ2_XXS's one-stack
 //! entry, Nemotron 3.5 Bolt's routed up and down (clauses 10, 12 and 13).
 //!
-//! IQ3_S has no plane kernels (`IqFormat::has_planes`), so clause 2 and the
-//! plane half of clause 10 do not apply to it. Its rule is held by clause 1
-//! (`iq.rs`'s host rule, written from `dequant_iq3_s`'s layout: index, high
-//! bit, raw sign byte and scale nibble), clause 3 (`gguf::dequant_row`, ggml's
-//! decode) and the rest, each at K = 4,096 and 2,304.
+//! IQ3_S, IQ2_S, IQ1_S and IQ1_M have no plane kernels
+//! (`IqFormat::has_planes`), so clause 2 and the plane half of clause 10 do not
+//! apply to them. Their rule is held by clause 1 (`iq.rs`'s host rule, written
+//! from the layout: for IQ3_S index, high bit, raw sign byte and scale nibble;
+//! for IQ2_S the same with a 10-bit index; for IQ1_S and IQ1_M the `qh`
+//! halfword's index bits, delta bit and scale bits, and IQ1_M's `d` spread over
+//! the scale halfwords), clause 3 (`bloomery_gpu_gates::iq_rows::ref_dequant`:
+//! `gguf::dequant_row` for IQ3_S, ggml's decode, and for IQ2_S, IQ1_S and IQ1_M
+//! the gate's own port of ggml's `dequantize_row_*`, which `dequant_row` does
+//! not have) and the rest, each at K = 4,096 and 2,304.
 //!
 //! Weights. The gate·up formats take the synthetic rows `dequant_ref
 //! --synthetic` writes (`$BLOOMERY_DATA/ref-synth/<type>.blocks`: 64 rows
 //! ggml-quantized then 16 rows of random codes, 4096 values each; IQ2_XXS,
-//! which the harness does not write, 80 rows of seeded blocks:
+//! which the harness does not write, and IQ2_S, IQ1_S and IQ1_M likewise, 80
+//! rows of seeded blocks:
 //! `bloomery_gpu_gates::iq_rows`) cut to ten
 //! super-blocks (K = 2,560, Qwen3.8's gate width) and to nine (K = 2,304, a
 //! partial last lane iteration), cycled into stacks of 4 experts × 80 rows
@@ -47,7 +54,8 @@
 //!    `act::apply` of `iq3_xxs_rows` / `iq4_xs_rows` over `IqFormat::repack`
 //!    of the same gate and up rows (the plane kernels, one launch an expert
 //!    over all columns), bit for bit.
-//! 3. **f64 band.** Against `gguf::dequant_row` × the f32 activations,
+//! 3. **f64 band.** Against `ref_dequant` (`gguf::dequant_row` for the formats it
+//!    decodes) × the f32 activations,
 //!    summed in f64, within `gate_iq.rs`'s bound derivation (below),
 //!    composed through the clamp rule for `h`: `1.1·Eg·|u| + |silu(g64)|·Eu
 //!    + 16u·max(|g64·u64|, |h|)` (silu' ≤ 1.1; the gate·ups over every row,
@@ -192,7 +200,7 @@ mod gate {
     use bloomery_gpu::quant_sel::QuantSelKernels;
     use bloomery_gpu::{DeviceTensor, Q8Act};
     use bloomery_gpu_gates::iq_rows::{
-        Col, SYNTH_K, dot_host, dot_ref, seeded_blocks, synth_rows as synth_all,
+        Col, SYNTH_K, dot_host, dot_ref, ref_dequant, seeded_blocks, set_d, synth_rows as synth_all,
     };
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
@@ -219,17 +227,23 @@ mod gate {
     /// iteration (nine super-blocks).
     const KS_DOWN: [usize; 2] = [2048, 2304];
     /// The formats of the gate·ups.
-    const GU_FMTS: [IqFormat; 5] = [
+    const GU_FMTS: [IqFormat; 8] = [
         IqFormat::Iq2Xxs,
         IqFormat::Iq2Xs,
+        IqFormat::Iq2S,
+        IqFormat::Iq1S,
+        IqFormat::Iq1M,
         IqFormat::Iq3Xxs,
         IqFormat::Iq3S,
         IqFormat::Iq4Xs,
     ];
     /// The formats of the `Q8Act` downs.
-    const Q8_FMTS: [IqFormat; 5] = [
+    const Q8_FMTS: [IqFormat; 8] = [
         IqFormat::Iq2Xxs,
         IqFormat::Iq2Xs,
+        IqFormat::Iq2S,
+        IqFormat::Iq1S,
+        IqFormat::Iq1M,
         IqFormat::Iq3Xxs,
         IqFormat::Iq3S,
         IqFormat::Iq4Xs,
@@ -255,7 +269,12 @@ mod gate {
     /// grid table, same eight-value sub-block count a row); the assertion is
     /// the composed bound either way. Re-pin from the first run's printed
     /// larger-of-sweep if it exceeds these.
-    const REL_PIN_GU: [(IqFormat, usize, f64); 11] = [
+    /// PIN(2026-10-25): the six IQ2_S, IQ1_S and IQ1_M rows (K = 4,096 and
+    /// 2,304), the first run's larger-of-sweep values 7.4762e-3 and 7.8782e-3
+    /// (IQ2_S), 1.1811e-2 and 8.7798e-3 (IQ1_S), 7.5881e-3 and 7.2450e-3
+    /// (IQ1_M) rounded up the way the rows above were; the assertion is the
+    /// composed bound.
+    const REL_PIN_GU: [(IqFormat, usize, f64); 17] = [
         (IqFormat::Iq3Xxs, 2560, 1.2e-2),
         (IqFormat::Iq3Xxs, 2304, 2.0e-2),
         (IqFormat::Iq3Xxs, 4096, 1.4e-2),
@@ -267,6 +286,12 @@ mod gate {
         (IqFormat::Iq3S, 2304, 9.0e-3),
         (IqFormat::Iq2Xxs, 4096, 1.7e-2),
         (IqFormat::Iq2Xxs, 2304, 1.4e-2),
+        (IqFormat::Iq2S, 4096, 8.0e-3),
+        (IqFormat::Iq2S, 2304, 8.5e-3),
+        (IqFormat::Iq1S, 4096, 1.3e-2),
+        (IqFormat::Iq1S, 2304, 9.5e-3),
+        (IqFormat::Iq1M, 4096, 8.0e-3),
+        (IqFormat::Iq1M, 2304, 8.0e-3),
     ];
     /// PIN(2026-10-06): the down's, both K, the dot-level 0.4 % class
     /// widened by the sampled rows' spread.
@@ -1197,10 +1222,10 @@ mod gate {
                     for r in 0..st.rpe {
                         let ra = id as usize * st.rpe + r;
                         let (gbytes, ubytes) = (st.row(false, ra), st.row(true, ra));
-                        dequant_row(st.fmt.ggml(), gbytes, &mut w_f32)?;
+                        ref_dequant(st.fmt, gbytes, &mut w_f32)?;
                         let (g64, eg) =
                             dot_ref(st.fmt, gbytes, &w_f32, &x[col * st.k..], &cols[col]);
-                        dequant_row(st.fmt.ggml(), ubytes, &mut w_f32)?;
+                        ref_dequant(st.fmt, ubytes, &mut w_f32)?;
                         let (u64v, eu) =
                             dot_ref(st.fmt, ubytes, &w_f32, &x[col * st.k..], &cols[col]);
                         let hv = f64::from(h[si * st.rpe + r]);
@@ -1495,13 +1520,13 @@ mod gate {
             let (mut gb, mut ub) = (st.g.clone(), st.u.clone());
             let (rb, bb) = (st.row_bytes(), fmt.block_bytes());
             // Expert 1, row 3, super-block 2 of the gate stack: a NaN d.
-            gb[(80 + 3) * rb + 2 * bb..][..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+            set_d(fmt, &mut gb[(80 + 3) * rb + 2 * bb..][..bb], 0x7e00);
             // Expert 2, row 5, super-blocks 1 and 4 of the up stack: the
             // same bytes with +inf and −inf d.
             let src = ub[(2 * 80 + 5) * rb + bb..][..bb].to_vec();
             ub[(2 * 80 + 5) * rb + 4 * bb..][..bb].copy_from_slice(&src);
-            ub[(2 * 80 + 5) * rb + bb..][..2].copy_from_slice(&0x7c00u16.to_le_bytes());
-            ub[(2 * 80 + 5) * rb + 4 * bb..][..2].copy_from_slice(&0xfc00u16.to_le_bytes());
+            set_d(fmt, &mut ub[(2 * 80 + 5) * rb + bb..][..bb], 0x7c00);
+            set_d(fmt, &mut ub[(2 * 80 + 5) * rb + 4 * bb..][..bb], 0xfc00);
             let bad = GuStack {
                 fmt,
                 g: gb,
@@ -2004,7 +2029,7 @@ mod gate {
             // Muse's gate width and the partial-lane tail; Bolt's gate-less
             // IQ2_XXS stacks stay clause 13's.
             IqFormat::Iq2Xxs => &[4096, 2304],
-            IqFormat::Iq2Xs => &[4096, 2304],
+            IqFormat::Iq2Xs | IqFormat::Iq2S | IqFormat::Iq1S | IqFormat::Iq1M => &[4096, 2304],
             IqFormat::Iq3Xxs => &[2560, 2304, 4096],
             IqFormat::Iq3S => &[4096, 2304],
             IqFormat::Iq4Xs | IqFormat::Q2K => &KS,
@@ -2235,11 +2260,11 @@ mod gate {
             // 5 super-blocks 1 and 4 (identical bytes, opposite d).
             let mut gb = st.g.clone();
             let (rb, bb) = (st.row_bytes(), fmt.block_bytes());
-            gb[(80 + 3) * rb + 2 * bb..][..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+            set_d(fmt, &mut gb[(80 + 3) * rb + 2 * bb..][..bb], 0x7e00);
             let src = gb[(2 * 80 + 5) * rb + bb..][..bb].to_vec();
             gb[(2 * 80 + 5) * rb + 4 * bb..][..bb].copy_from_slice(&src);
-            gb[(2 * 80 + 5) * rb + bb..][..2].copy_from_slice(&0x7c00u16.to_le_bytes());
-            gb[(2 * 80 + 5) * rb + 4 * bb..][..2].copy_from_slice(&0xfc00u16.to_le_bytes());
+            set_d(fmt, &mut gb[(2 * 80 + 5) * rb + bb..][..bb], 0x7c00);
+            set_d(fmt, &mut gb[(2 * 80 + 5) * rb + 4 * bb..][..bb], 0xfc00);
             let bad = GuStack {
                 fmt,
                 g: gb,
