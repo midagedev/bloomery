@@ -98,6 +98,19 @@
 //!   the printed line. PIN(2026-10-23): the fixture cut keeps four of the model's layers, whose
 //!   weights write no protocol, so this and the next clause are `Tag::FileBound` and the fixture
 //!   tier leaves them to the real tier by name.
+//! - `saved_state_returns` (shared, `serve_gate::saved_state_returns`, on the server of
+//!   `load_and_listen`): the seat prints a `cache` line with a budget above 0 (a seat with none
+//!   skips the clause by name). Raw-id conversation A of 1024 ids is opened by its head (its ids
+//!   less the last) and answered, so the live slot holds the head's rows and A continues it by one
+//!   id: that answer is the truth. An unrelated conversation B of 256 ids takes the slot and A
+//!   returns: `timings.cache_n` is at least 1023 (restored from the saved state, not fed again)
+//!   and, where the server's `residency lever` record is `off` (any other word skips this half by
+//!   name), the ids equal the truth's, the same arithmetic on the same rows. Then B takes the slot
+//!   again and A returns extended by its answer and a tail: `cache_n` is at least A's 1024 ids.
+//!   An uncached run is no oracle: another cut of the prompt or its answer's stepped rows in a
+//!   prompt pass differ by rounding. FAIL-first: a resume that puts back one position leaves
+//!   `cache_n` at 1 and the clause is red on it; one that stands at the positions asked over the
+//!   rows of one is red on the ids.
 //! - `chat_ends_at_the_turn_end`: the same answer finishes with `stop`, and no message holds
 //!   `<|eot|>`: the model closes its turn with that token, an end-of-generation id by name, so
 //!   the server stops there and leaves it out of the text. FAIL-first: a vocabulary that lists

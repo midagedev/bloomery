@@ -79,6 +79,20 @@
 //!   neither a span nor the turn end, so the last two clauses are `Tag::FileBound` and the
 //!   fixture tier leaves them to the real tier by name; the end id's place in the vocabulary is
 //!   pinned on any machine by `tokenizer`'s `a_familys_turn_end_token_ends_generation`.
+//! - `saved_state_returns` (shared, `serve_gate::saved_state_returns`, on the server of
+//!   `load_and_listen`): the seat prints a `cache` line with a budget above 0 (a seat with none
+//!   skips the clause by name). Raw-id conversation A of 1024 ids is opened by its head (its ids
+//!   less the last) and answered, so the live slot holds the head's rows and A continues it by one
+//!   id: that answer is the truth. An unrelated conversation B of 256 ids takes the slot and A
+//!   returns: `timings.cache_n` is at least 1023 (restored from the saved state, not fed again)
+//!   and, where the server's `residency lever` record is `off` (any other word skips this half by
+//!   name), the ids equal the truth's, the same arithmetic on the same rows. Then B takes the slot
+//!   again and A returns extended by its answer and a tail: `cache_n` is at least A's 1024 ids.
+//!   An uncached run is no oracle: another cut of the prompt or its answer's stepped rows in a
+//!   prompt pass differ by rounding. FAIL-first: a resume that puts back one position leaves
+//!   `cache_n` at 1 and the clause is red on it; one that stands at the positions asked over the
+//!   rows of one is red on the ids (the fixture cut answers one id whatever the rows: that half is
+//!   the real tier's).
 //! - `chat_answers_a_turn`: the same request, on either tier, is a 200 whose `usage` counts a
 //!   prompt and at most 512 completion tokens, whose message holds neither think tag, and whose
 //!   `finish_reason` is `stop` or `length`. FAIL-first: a seat whose engine ends the request

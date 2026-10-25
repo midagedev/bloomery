@@ -12,13 +12,18 @@
 //! think span, the token that closes its turn, the context the server is asked
 //! for and what its body's cut keeps of a shared prefix ([`Cut`]); and what
 //! its chat request asks beside the turn ([`Ask`]).
+//!
+//! A seat that keeps a saved prompt cache (its server prints a `cache` line with a budget) is also
+//! held to what the cache is for: a conversation another one interrupted returns from the cache
+//! ([`saved_state_returns`]); a seat with none skips that clause by name.
 
 use std::path::Path;
 use std::time::Duration;
 
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::serve_client::{
-    SeatGate, Served, check, completion_raw, curl, ids_of, json_of, server_log, tokenized,
+    SeatGate, Served, check, completion_raw, curl, greedy, ids_of, json_of, repeated_ids,
+    server_log, tokenized,
 };
 use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -112,6 +117,20 @@ const TURN: &str = "Name three primary colours.";
 /// The words of the refusal of a second slot.
 const ONE_SEQUENCE: &str = "holds one sequence";
 
+/// The saved-state clause's prompts: the texts the two conversations repeat to their lengths in
+/// ids (the first, the one that is saved and returns; the second, the one that takes the slot
+/// between), what A's second return appends, and the tokens each request makes.
+const SAVED_A: &str = "The quick brown fox jumps over the lazy dog near the river bank.";
+const SAVED_B: &str = "Colourless green ideas sleep furiously beside a silent grey sea.";
+const SAVED_TAIL: &str = " Now answer in one short sentence.";
+const SAVED_A_IDS: usize = 1024;
+const SAVED_B_IDS: usize = 256;
+const SAVED_N: usize = 16;
+/// The tokens of the request that opens A by its head (A less its last id): one, which is never
+/// fed back, so the slot holds the head's rows alone.
+const SAVED_HEAD_N: usize = 1;
+
+const SAVED: &str = "saved_state_returns";
 const CHAT: &str = "chat_splits_the_reasoning_at_the_models_tags";
 const ENDED: &str = "chat_ends_at_the_turn_end";
 const ANSWERED: &str = "chat_answers_a_turn";
@@ -288,7 +307,137 @@ pub fn served_with(c: &Clauses, dir: &Path, ask: Ask) -> Result<bool, GateError>
             live_slot_keeps_the_prefix(c, &url, &d, &lever)?,
         );
     }
+    ok &= saved_state_returns(c, &err_log, &url, &d)?;
     println!("server stopped: {}", s.stop()?);
+    Ok(ok)
+}
+
+/// The budget a server's `cache` line prints (`cache ram=<bytes> …`), `None` for a server that
+/// prints none: a seat with no saved prompt cache.
+fn cache_ram_of(err_log: &Path) -> Result<Option<u64>, GateError> {
+    let text =
+        std::fs::read_to_string(err_log).map_err(|e| format!("read {}: {e}", err_log.display()))?;
+    let Some(line) = text.lines().find(|l| l.starts_with("cache ram=")) else {
+        return Ok(None);
+    };
+    let ram = line["cache ram=".len()..]
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("the cache line {line:?} names no budget"))?;
+    Ok(Some(ram))
+}
+
+/// `saved_state_returns` on the server of `served_with` (its stderr `err_log`): conversation A of
+/// [`SAVED_A_IDS`] ids, an unrelated conversation B that takes the slot, and A's return from the
+/// saved state. A seat that prints no `cache` line, or a budget of 0, skips the clause by name.
+///
+/// The first half: A's head (its ids less the last) is answered, then A itself continues the live
+/// slot by that one id and is answered ([`SAVED_N`] tokens: the truth); B takes the slot; A
+/// returns. The return keeps every position but the one id every request feeds
+/// (`timings.cache_n` at least A's ids less one: restored from the saved state, not fed again)
+/// and, with the residency off (the server's `residency lever` record; any other word skips this
+/// half by name, the experts the two runs find on the card may differ), answers the truth's ids.
+/// The two runs are the same arithmetic on the same rows by construction: the head's rows (the
+/// rows saved) and then one pass of one id, so the ids are equal on every seat. They are not
+/// compared with an uncached run: the same prompt in other passes, or its answer's stepped rows
+/// in a prompt pass, differ by rounding that the Muse Spark batch does not hide.
+///
+/// The second half: B takes the slot again and A returns extended by its reply and a tail;
+/// `cache_n` at least A's ids, every position the saved state holds of A's answer.
+///
+/// FAIL-first: a resume that puts back one position leaves `cache_n` at 1, and the clause is red on
+/// it; one that stands at the positions asked over the rows of one is red on the ids (the
+/// MiniMax-M3 fixture cut answers one id whatever the rows: its ids half is the real tier's). A
+/// snapshot that returns the refusal it replaced is not this clause's: the engine fails and the
+/// server stops.
+fn saved_state_returns(
+    c: &Clauses,
+    err_log: &Path,
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+) -> Result<bool, GateError> {
+    let mut ok = true;
+    match cache_ram_of(err_log)? {
+        None => {
+            println!("skip {SAVED}: the {} seat prints no cache line", c.model);
+            return Ok(ok);
+        }
+        Some(0) => {
+            println!("skip {SAVED}: the {} seat's cache budget is 0", c.model);
+            return Ok(ok);
+        }
+        Some(_) => {}
+    }
+    let a = repeated_ids(url, SAVED_A, SAVED_A_IDS)?;
+    let b = repeated_ids(url, SAVED_B, SAVED_B_IDS)?;
+    let tail = tokenized(url, SAVED_TAIL)?;
+    if tail.is_empty() || a[0] == b[0] {
+        return Err(format!(
+            "the saved-state prompts: A starts {:?} and B {:?}, the tail holds {} ids; B must \
+             start where A does not",
+            a[0],
+            b[0],
+            tail.len()
+        )
+        .into());
+    }
+    let fed = a.len() as u64 - 1;
+    greedy(
+        url,
+        a[..a.len() - 1].to_vec(),
+        SAVED_HEAD_N,
+        dir,
+        "saved_head",
+        true,
+    )?;
+    let (truth, _) = greedy(url, a.clone(), SAVED_N, dir, "saved_a", true)?;
+    if truth.tokens.is_empty() || truth.cache_n != fed {
+        return Err(format!(
+            "the saved-state setup: A after its head kept {} ids of {fed} and answered {} \
+             tokens",
+            truth.cache_n,
+            truth.tokens.len()
+        )
+        .into());
+    }
+    greedy(url, b.clone(), SAVED_N, dir, "saved_b", true)?;
+    let (back, _) = greedy(url, a.clone(), SAVED_N, dir, "saved_a_back", true)?;
+    let word = server_log(err_log, c.kinds)?
+        .first(&record::RESIDENCY_LEVER)?
+        .map(|l| l.word("residency").map(str::to_owned))
+        .transpose()?;
+    let same = if word.as_deref() == Some("off") {
+        println!(
+            "saved: the return's ids {:?}, the truth's {:?}",
+            back.tokens, truth.tokens
+        );
+        back.tokens == truth.tokens
+    } else {
+        println!(
+            "skip {SAVED} answers the truth's ids: the residency lever is {word:?}, not \"off\""
+        );
+        true
+    };
+    greedy(url, b, SAVED_N, dir, "saved_b_again", true)?;
+    let mut extended = a;
+    extended.extend_from_slice(&truth.tokens);
+    extended.extend_from_slice(&tail);
+    let (longer, _) = greedy(url, extended, SAVED_N, dir, "saved_a_extended", true)?;
+    println!(
+        "saved: A {} ids, B {} ids took the slot; A returned kept {} (wants at least {fed}) and \
+         answers the truth's ids {same}; after B again, A extended kept {} (wants at least {})",
+        fed + 1,
+        SAVED_B_IDS,
+        back.cache_n,
+        longer.cache_n,
+        fed + 1
+    );
+    check(
+        &mut ok,
+        SAVED,
+        back.cache_n >= fed && same && longer.cache_n >= fed + 1,
+    );
     Ok(ok)
 }
 
