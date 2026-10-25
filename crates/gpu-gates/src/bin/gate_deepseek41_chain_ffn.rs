@@ -1264,11 +1264,9 @@ mod gate {
         io: &mut Io,
         lc: &LayerCx<'_>,
     ) -> Result<(), bloomery_gpu::GpuError> {
-        let card = lc.stacks.map(|s| CardStacks {
-            gate: &s.gate,
-            up: &s.up,
-            down: &s.down,
-        });
+        let card = lc
+            .stacks
+            .map(|s| CardStacks::fused_over(&s.gate, &s.up, &s.down));
         let fio = FfnIo {
             streams: &io.streams,
             fold_in: &io.fold_in,
