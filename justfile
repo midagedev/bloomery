@@ -32,7 +32,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -40,7 +40,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
@@ -95,7 +95,7 @@ mac-test:
 # which its clause must catch. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing batch
 # selects it.
 lab-metal:
-    cargo test -p bloomery-metal --lib && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
+    cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
 # The qwen35moe session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the fixture family's file
 # (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count, the
@@ -110,9 +110,25 @@ lab-metal:
 lab-metal-e2e:
     cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e --bin generate_metal --bin bloomery-serve-metal && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all && fx="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf" && ids="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" && want="134895,160927,412,163951,82046,43343,102520,19258" && [ "$ids" = "$want" ] || { echo "lab-metal-e2e: generate_metal smoke: ids $ids; $want is expected"; exit 1; } && out="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" && [ -n "$out" ] || { echo "lab-metal-e2e: generate_metal text smoke: empty stdout"; exit 1; } && one="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 1 --print-ids --profile 2 2>&1 >/dev/null)" && printf '%s\n' "$one" | grep -qx 'decode_passes=0' && printf '%s\n' "$one" | grep -qx 'decode_tok_s=none' && printf '%s\n' "$one" | grep -q '^prof total .* decode_ms=none$' || { echo "lab-metal-e2e: generate_metal rate smoke: a one-token run must print decode_passes=0, decode_tok_s=none and the profile's decode_ms=none"; exit 1; } && many="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids --profile 2 2>&1 >/dev/null)" && printf '%s\n' "$many" | tr ' ' '\n' | awk -F= '$1=="decode_passes"{p=$2} $1=="decode_s"{s=$2} $1=="decode_tok_s"{r=$2} $1=="decode_ms"{m=$2} END{ok = p==7 && s>0 && r/(p/s)>0.97 && r/(p/s)<1.03 && m/(s/p*1e3)>0.97 && m/(s/p*1e3)<1.03; exit !ok}' || { echo "lab-metal-e2e: generate_metal rate smoke: an 8-token run must count 7 passes, and decode_tok_s and the profile's decode_ms must be per pass"; exit 1; }
 
+# The Metal backend's move proof, on an Apple Silicon Mac (`just ptx-compare`'s analogue; AGENTS.md's change-class table, the move row): a
+# change that should leave a model's speed alone leaves the program alone. BASE (a commit, read through `git archive`) and this tree (or
+# `--head REV`, or `--here DIR`) each build `metal_scan` and `generate_metal` with the `pipeline-scan` and `encode-trace` features, then on
+# the qwen35moe fixture ($BLOOMERY_FIXTURE_ROOT): `metal_scan` builds every compute pipeline the engine builds from both GEMM programs,
+# serializes each into a binary archive and hashes it (what the device compiler makes of each kernel, one row per pipeline), and
+# `generate_metal --encode-trace` writes every dispatch, binding, `setBytes` value, barrier and commit/wait/event at depth ~0 and at depth 600.
+# Prints both tables (`metal_scan --compare`, `--compare-trace`: the first differing dispatch). Exit 0 only when every pipeline hash, both
+# traces and the generated ids are identical; 3 something existing moved or a trace differs, 4 a pipeline was removed, 5 both, 6 only
+# pipelines were added, 2 a side refused by name (no instrument and none applies), 1 a build or run failed. A side older than the commit
+# that added the instrument gets it laid over. Runs no gate and takes no lock; the owner is tools/metal-compare.sh.
+[arg("HEAD", long="head")]
+[arg("HERE", long="here")]
+[arg("OUT", long="out")]
+metal-compare BASE HEAD='' HERE='' OUT='':
+    ./tools/metal-compare.sh {{BASE}} {{ if HEAD != '' { '--head "' + HEAD + '"' } else { '' } }} {{ if HERE != '' { '--here "' + HERE + '"' } else { '' } }} {{ if OUT != '' { '--out "' + OUT + '"' } else { '' } }}
+
 # clippy on the Metal backend's macOS body, which the static tier's x86_64-linux cross check compiles as an empty crate.
 mac-metal-lint:
-    cargo clippy -p bloomery-device -p bloomery-metal --all-targets
+    cargo clippy -p bloomery-device -p bloomery-metal --all-targets --features bloomery-metal/pipeline-scan,bloomery-metal/encode-trace
 
 # 라운드 루프의 맥 정적 계층 한 줄(≤180 s 목표): fmt-check와 check 스크립트 여덟은 병렬 레인, cargo 레인은 lint(clippy가
 # type-check를 겸한다 — check를 따로 돌리면 멤버 크레이트를 두 번 짓는다) 다음 BASE 범위 combos. BASE를 주면 그 base

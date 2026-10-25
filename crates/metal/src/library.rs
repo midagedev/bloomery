@@ -154,6 +154,10 @@ impl MatrixUnits {
 pub struct Pipeline {
     state: Handle<dyn MTLComputePipelineState>,
     max_threads_per_group: usize,
+    /// The entry's name and, in angle brackets, its function-constant values:
+    /// how the move proof's scan and encode trace name this pipeline.
+    #[cfg(feature = "pipeline-label")]
+    label: String,
 }
 
 impl Pipeline {
@@ -167,6 +171,13 @@ impl Pipeline {
     pub fn max_threads_per_group(&self) -> usize {
         self.max_threads_per_group
     }
+
+    /// The entry's name and its function-constant values.
+    #[cfg(feature = "pipeline-label")]
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
 }
 
 /// The library the kernels come from.
@@ -179,6 +190,26 @@ pub struct Library {
     router_sg: Option<usize>,
     /// The tensor-op GEMMs' library, when the GEMMs run on them.
     tensor: Option<Box<Library>>,
+}
+
+#[cfg(feature = "pipeline-label")]
+thread_local! {
+    /// The function constants (index, `uint` value) of the pipeline the calling
+    /// thread is about to make: set by the caller that specialized the
+    /// function, taken by [`Library::pipeline_of`].
+    static CONSTANTS: core::cell::RefCell<Vec<(usize, u32)>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The label of an entry made with `constants`: the name, then the values in
+/// angle brackets.
+#[cfg(feature = "pipeline-label")]
+fn label_of(entry: &str, constants: &[(usize, u32)]) -> String {
+    if constants.is_empty() {
+        return entry.to_string();
+    }
+    let values: Vec<String> = constants.iter().map(|(_, v)| v.to_string()).collect();
+    format!("{entry}<{}>", values.join(","))
 }
 
 /// The value of `#define NAME <n>` in `text`, when one such line names a
@@ -322,6 +353,14 @@ impl Library {
         })
     }
 
+    /// The library object's address: what tells a pipeline's library from
+    /// another's in the scan.
+    #[cfg(feature = "pipeline-scan")]
+    #[must_use]
+    pub fn scan_id(&self) -> usize {
+        core::ptr::from_ref::<ProtocolObject<dyn MTLLibrary>>(&self.library).addr()
+    }
+
     /// The rows a SIMD group owns and the router's SIMD groups, as the
     /// source's `#define`s name them; none when the source does not name a
     /// count exactly once.
@@ -378,6 +417,8 @@ impl Library {
             .library
             .newFunctionWithName_constantValues_error(&wanted, &values)
             .map_err(|e| DeviceError::backend("library", e.localizedDescription().to_string()))?;
+        #[cfg(feature = "pipeline-label")]
+        CONSTANTS.with_borrow_mut(|constants| *constants = vec![(0, simdgroups)]);
         self.pipeline_of(function)
     }
 
@@ -391,10 +432,17 @@ impl Library {
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| DeviceError::backend("pipeline", e.localizedDescription().to_string()))?;
         let max_threads_per_group = state.maxTotalThreadsPerThreadgroup();
-        Ok(Pipeline {
+        #[cfg(feature = "pipeline-label")]
+        let constants = CONSTANTS.with_borrow_mut(core::mem::take);
+        let pipeline = Pipeline {
             state: Handle(state),
             max_threads_per_group,
-        })
+            #[cfg(feature = "pipeline-label")]
+            label: label_of(&function.name().to_string(), &constants),
+        };
+        #[cfg(feature = "pipeline-scan")]
+        crate::scan::record(self, &function, &constants, &pipeline);
+        Ok(pipeline)
     }
 }
 

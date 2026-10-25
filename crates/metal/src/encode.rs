@@ -136,6 +136,9 @@ pub struct ComputeEncoder<'r> {
     count: EncodeCount,
     /// A dispatch was encoded since the last barrier.
     group_open: bool,
+    /// What this encoder was asked, for the encode trace.
+    #[cfg(feature = "encode-trace")]
+    trace: crate::trace::EncoderTrace,
     _recording: PhantomData<&'r ()>,
 }
 
@@ -196,6 +199,8 @@ impl ComputeEncoder<'_> {
             )
         })?;
         Ok(ComputeEncoder {
+            #[cfg(feature = "encode-trace")]
+            trace: crate::trace::EncoderTrace::open(buffer, encoder.dispatchType()),
             encoder,
             max_threads_per_group: None,
             count: EncodeCount::default(),
@@ -208,6 +213,8 @@ impl ComputeEncoder<'_> {
     pub fn set_pipeline(&mut self, pipeline: &Pipeline) {
         self.encoder.setComputePipelineState(pipeline.metal());
         self.max_threads_per_group = Some(pipeline.max_threads_per_group());
+        #[cfg(feature = "encode-trace")]
+        self.trace.set_pipeline(pipeline);
     }
 
     /// The binding at `index`; an index past [`MAX_BINDINGS`] is refused by
@@ -235,6 +242,8 @@ impl ComputeEncoder<'_> {
                         slot,
                     );
                 }
+                #[cfg(feature = "encode-trace")]
+                self.trace.set_buffer(index, buffer, offset_bytes.get());
             }
             BindingKind::Bytes(data) => {
                 let ptr = NonNull::from(data).cast::<c_void>();
@@ -245,6 +254,8 @@ impl ComputeEncoder<'_> {
                     self.encoder
                         .setBytes_length_atIndex(ptr, to_ns(data.len()), slot);
                 }
+                #[cfg(feature = "encode-trace")]
+                self.trace.set_bytes(index, data);
             }
         }
         Ok(())
@@ -269,6 +280,8 @@ impl ComputeEncoder<'_> {
                 detail: format!("{groups_x} groups of {threads_per_group} threads wrap"),
             })?;
         self.submit(width, groups_y, threads_per_group);
+        #[cfg(feature = "encode-trace")]
+        self.trace.dispatch(groups_x, groups_y, threads_per_group);
         self.count.dispatches += 1;
         if !self.group_open {
             self.group_open = true;
@@ -340,6 +353,8 @@ impl ComputeEncoder<'_> {
     pub fn memory_barrier(&mut self) {
         self.encoder
             .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        #[cfg(feature = "encode-trace")]
+        self.trace.barrier();
         self.count.barriers += 1;
         self.group_open = false;
     }

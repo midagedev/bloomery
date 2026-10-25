@@ -115,6 +115,8 @@ impl<T: Elem> MetalBuffer<T> {
             .ok_or_else(|| {
                 DeviceError::backend("buffer", "the device made no buffer".to_string())
             })?;
+        #[cfg(feature = "encode-trace")]
+        crate::trace::buffer_made(core::ptr::from_ref(&*buffer).addr(), bytes.get());
         let ptr = buffer.contents().cast::<T>();
         if !ptr.as_ptr().addr().is_multiple_of(BUFFER_ALIGN) {
             return Err(DeviceError::backend(

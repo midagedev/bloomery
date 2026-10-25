@@ -40,8 +40,12 @@ pub mod kernels;
 pub mod library;
 #[cfg(target_os = "macos")]
 pub mod residency;
+#[cfg(all(target_os = "macos", feature = "pipeline-scan"))]
+pub mod scan;
 #[cfg(target_os = "macos")]
 pub mod stream;
+#[cfg(all(target_os = "macos", feature = "encode-trace"))]
+pub mod trace;
 
 #[cfg(target_os = "macos")]
 pub use buffer::{MetalBuffer, MetalRaw, MetalShared};

@@ -102,6 +102,8 @@ impl Committed {
     fn commit(&mut self, buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
         self.pending
             .retain(|b| b.0.status() != MTLCommandBufferStatus::Completed);
+        #[cfg(feature = "encode-trace")]
+        crate::trace::commit(&buffer);
         buffer.commit();
         self.submits += 1;
         self.pending.push(CommandBufferHandle(buffer));
@@ -189,6 +191,8 @@ impl<'s> Recording<'s> {
     fn wait_for_boundary(&self) {
         let last = self.stream.committed().boundary;
         if last > 0 {
+            #[cfg(feature = "encode-trace")]
+            crate::trace::wait_event(&self.buffer, "boundary", last);
             self.buffer
                 .encodeWaitForEvent_value(&self.stream.boundary, last);
         }
@@ -462,12 +466,17 @@ impl MetalStream {
     fn command_buffer(
         &self,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, DeviceError> {
-        self.queue.commandBuffer().ok_or_else(|| {
+        let made = self.queue.commandBuffer().ok_or_else(|| {
             DeviceError::backend(
                 "command buffer",
                 "the queue made no command buffer".to_string(),
             )
-        })
+        });
+        #[cfg(feature = "encode-trace")]
+        if let Ok(buffer) = &made {
+            crate::trace::command_buffer_made(buffer);
+        }
+        made
     }
 
     /// A recording for the next piece of work.
@@ -514,6 +523,11 @@ impl MetalStream {
         self.keep_resident();
         let mut c = self.committed();
         let value = c.next_value();
+        #[cfg(feature = "encode-trace")]
+        {
+            crate::trace::signal_event(&recording.buffer, "boundary", value);
+            crate::trace::signal_event(&recording.buffer, "timeline", value);
+        }
         recording
             .buffer
             .encodeSignalEvent_value(&self.boundary, value);
@@ -534,6 +548,8 @@ impl MetalStream {
     pub fn settle(&self, signalled: Signalled) -> Result<Settled, DeviceError> {
         self.waits.fetch_add(1, Ordering::Relaxed);
         let value = signalled.value;
+        #[cfg(feature = "encode-trace")]
+        crate::trace::host(|| format!("settle {value}"));
         let deadline = Instant::now() + SYNC_TIMEOUT;
         while !self
             .timeline
@@ -579,6 +595,8 @@ impl MetalStream {
     pub fn sync_for(&self, timeout: Duration) -> Result<(), DeviceError> {
         use std::sync::TryLockError::{Poisoned, WouldBlock};
         self.waits.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "encode-trace")]
+        crate::trace::host(|| "sync".to_string());
         let deadline = Instant::now() + timeout;
         let not_done = || {
             DeviceError::backend(
@@ -649,6 +667,8 @@ impl Stream for MetalStream {
         let buffer = self.command_buffer()?;
         let mut committed = self.committed();
         let value = committed.next_value();
+        #[cfg(feature = "encode-trace")]
+        crate::trace::signal_event(&buffer, "timeline", value);
         buffer.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.timeline), value);
         committed.commit(buffer);
         Ok(MetalEvent {
@@ -659,6 +679,8 @@ impl Stream for MetalStream {
 
     fn wait(&self, e: &Self::Event) -> Result<(), DeviceError> {
         let buffer = self.command_buffer()?;
+        #[cfg(feature = "encode-trace")]
+        crate::trace::wait_event(&buffer, "timeline", e.value);
         buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*e.event), e.value);
         self.committed().commit(buffer);
         Ok(())

@@ -84,6 +84,11 @@
 //! device, the session or the tokenizer, or a fault the device raised, is a
 //! named error and exit 1 — never a partial result presented as success.
 //! The body is macOS only; elsewhere it refuses and exits 78.
+//!
+//! A build with `--features encode-trace` also takes `--encode-trace FILE`:
+//! the run after the open (the prompt's passes and the decode steps) writes
+//! every dispatch, binding and commit/wait/event it asks of Metal to FILE
+//! (`bloomery_metal::trace`), which `metal_scan --compare-trace` compares.
 
 #[cfg(target_os = "macos")]
 fn main() -> std::process::ExitCode {
@@ -142,6 +147,7 @@ generate_metal --plan [--ctx C]
   pass's own wall";
 
     /// The flags that take a value.
+    #[cfg(not(feature = "encode-trace"))]
     const VALUE_FLAGS: [&str; 6] = [
         "--prompt",
         "--tokens",
@@ -149,6 +155,17 @@ generate_metal --plan [--ctx C]
         "--ctx",
         "--prefill",
         "--pass-times",
+    ];
+    /// The flags that take a value, and `--encode-trace` among them.
+    #[cfg(feature = "encode-trace")]
+    const VALUE_FLAGS: [&str; 7] = [
+        "--prompt",
+        "--tokens",
+        "-n",
+        "--ctx",
+        "--prefill",
+        "--pass-times",
+        "--encode-trace",
     ];
     /// The flags that stand alone.
     const BARE_FLAGS: [&str; 4] = ["--print-ids", "--help", "--profile-layers", "--plan"];
@@ -182,6 +199,9 @@ generate_metal --plan [--ctx C]
         /// `--pass-times U[,U…]`: the rows of each pass whose ops are timed
         /// alone.
         pass_times: Option<Vec<usize>>,
+        /// `--encode-trace FILE`: where the run's encode trace is written.
+        #[cfg(feature = "encode-trace")]
+        encode_trace: Option<PathBuf>,
         model: PathBuf,
     }
 
@@ -351,6 +371,8 @@ generate_metal --plan [--ctx C]
             step_times,
             prefill,
             pass_times,
+            #[cfg(feature = "encode-trace")]
+            encode_trace: flag("--encode-trace")?.map(PathBuf::from),
             model,
         })
     }
@@ -866,6 +888,10 @@ generate_metal --plan [--ctx C]
             Session::open(&device, device.library(), &a.model, ctx).map_err(|e| e.to_string())?;
         session.set_prefill(a.prefill);
         let open_s = t0.elapsed().as_secs_f64();
+        #[cfg(feature = "encode-trace")]
+        if a.encode_trace.is_some() {
+            bloomery_metal::trace::start();
+        }
         // The census's free bytes are the working set less the driver's own
         // `currentAllocatedSize`, the one count of the live device buffers
         // this process holds; the arena keeps no sum of its own.
@@ -878,6 +904,17 @@ generate_metal --plan [--ctx C]
         };
         let out = greedy(&mut session, &prompt, a.n, tok.eog(), |id| stream.id(id))
             .map_err(|e| e.to_string())?;
+        #[cfg(feature = "encode-trace")]
+        if let Some(path) = &a.encode_trace {
+            let mut text = bloomery_metal::trace::finish();
+            text.push_str(&format!(
+                "# run prompt_ids={} decode_tokens={} gemm_path={}\n",
+                prompt.len(),
+                out.tokens(),
+                device.library().gemm_path().name()
+            ));
+            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
         if a.print_ids {
             let ids: Vec<String> = out.ids.iter().map(u32::to_string).collect();
             println!("{}", ids.join(","));

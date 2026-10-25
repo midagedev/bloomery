@@ -343,6 +343,13 @@ fn bind_flash(
 }
 
 impl Kernels {
+    /// The pipelines this object builds on first launch, built now: the
+    /// move proof's scan lists every pipeline a run can need.
+    #[cfg(feature = "pipeline-scan")]
+    pub fn build_deferred(&self) -> Result<(), DeviceError> {
+        self.attention.prefill().map(|_| ())
+    }
+
     /// Encode the flash. One dispatch, which past one segment also folds
     /// the partials and writes the gated output. A shape the kernel does
     /// not take, or a window that is not that shape, is refused by name and

@@ -45,6 +45,29 @@ path = "src/bin/generate_metal.rs"
 name = "bloomery-serve-metal"
 path = "src/bin/bloomery_serve_metal.rs"
 
+[[bin]]
+name = "metal_scan"
+path = "src/bin/metal_scan.rs"
+required-features = ["pipeline-scan"]
+
+# The Metal move proof (tools/metal-compare.sh): what a change that should not move a kernel is
+# checked by, in place of a timing sitting. Both are off in every build the gates and the
+# serve binary use, so their host code is the shipped code.
+[features]
+default = []
+# Each compute pipeline the engine builds carries its entry and function-constant values.
+pipeline-label = []
+# The pipelines the engine builds are recorded as they are built: `metal_scan` serializes each
+# into a binary archive and hashes it.
+pipeline-scan = [
+    "pipeline-label",
+    "objc2-metal/MTLBinaryArchive",
+    "objc2-foundation/NSURL",
+]
+# Every dispatch, binding, `setBytes` value, barrier and commit/wait/event of a run is written
+# as text (`generate_metal --encode-trace FILE`).
+encode-trace = ["pipeline-label"]
+
 [lints]
 workspace = true
 
