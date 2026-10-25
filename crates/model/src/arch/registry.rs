@@ -22,8 +22,9 @@ use super::{
 use crate::placement::PlacementError;
 
 /// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
-pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 8] = [
+pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 9] = [
     deepseek41::fixture::spec,
+    qwen3moe::fixture::spec,
     qwen35moe::fixture::spec,
     qwen35moe::fixture::qwen35moe::spec,
     glm5next::fixture::spec,
@@ -150,7 +151,16 @@ pub static ROWS: &[ArchRow] = &[
         names: &["qwen3moe"],
         read: Some(qwen3moe::spec::read),
         draft: None,
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "qwen3moe",
+            repo: "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+            quant: "Q4_K_M",
+            // The repo's head commit when the row was written (the hub's API): its Q4_K_M file
+            // lists the box's file's size and sha256, so `fixture fetch qwen3moe` at it writes the
+            // same bytes as `fixture generate` from the box's copy.
+            rev: Some("eea7b2be5805a5f151f8847ede8e5f9a9284bf77"),
+            draft: DraftSource::None,
+        })),
     },
     ArchRow {
         arch: None,
@@ -464,6 +474,7 @@ mod tests {
             archs_of(true),
             [
                 "deepseek41",
+                "qwen3moe",
                 "qwen4exp",
                 "qwen35moe",
                 "glm5next",

@@ -2,7 +2,7 @@
 names	variant	read	draft	fixture
 deepseek2	Deepseek2	no	no	-
 deepseek41,deepseek4	Deepseek41	yes	no	v41
-qwen3moe	Qwen3moe	yes	no	-
+qwen3moe	Qwen3moe	yes	no	qwen3moe
 qwen4exp	-	yes	yes	qwen38
 qwen35moe	Qwen35moe	yes	yes	qwen35moe
 qwen35,clef	-	yes	no	-
