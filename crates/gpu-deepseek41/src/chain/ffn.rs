@@ -99,7 +99,7 @@ use runtime::combine::Slots;
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
 use crate::hc::{
-    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
+    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPreScratch,
     hc_fold_elem, hc_post_elem,
 };
 use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
@@ -727,7 +727,7 @@ struct LayerWeights<'w> {
     sh_gate: &'w DevWeight,
     sh_up: &'w DevWeight,
     sh_down: Dense<'w>,
-    hc: HcParams<'w>,
+    hc: HcFn<'w>,
 }
 
 impl<'w> LayerWeights<'w> {
@@ -749,14 +749,6 @@ impl<'w> LayerWeights<'w> {
             w.resident(ENQUEUE, &c.sh_up)?,
         );
         let sh_down = Dense::of(w, &c.sh_down, ff, n_embd)?;
-        let DevWeight::KQuant {
-            ty: GgmlType::Q3_K,
-            w: hc_w,
-            ..
-        } = w.resident(ENQUEUE, &c.hc_fn)?
-        else {
-            return Err(tensor_err(&c.hc_fn, "a q3_K file tensor"));
-        };
         Ok(LayerWeights {
             gain,
             router,
@@ -764,13 +756,12 @@ impl<'w> LayerWeights<'w> {
             sh_gate,
             sh_up,
             sh_down,
-            hc: HcParams {
-                w: hc_w,
-                scale: w.f32_buf(ENQUEUE, &c.hc_scale)?,
-                base: w.f32_buf(ENQUEUE, &c.hc_base)?,
-                eps: hc_eps,
-                iters: hc_iters,
-            },
+            hc: HcFn::of(
+                w,
+                ENQUEUE,
+                [&c.hc_fn, &c.hc_scale, &c.hc_base],
+                (hc_eps, hc_iters),
+            )?,
         })
     }
 }
@@ -1575,14 +1566,14 @@ impl FfnPiece {
         let layer = self.layers.start + i;
         let c = &self.cfg[i];
         let r = &mut self.rows[row];
-        let pre = HcPreArgs {
+        let pre = HcFnArgs {
             params: &lw.hc,
             x: io.streams,
             tokens: 1,
             rms_eps: self.rms_eps,
             fault: gpu.layer_sink(layer)?,
         };
-        self.hc.enqueue_pre(
+        self.hc.enqueue_pre_fn(
             stream,
             &pre,
             &mut self.hc_scratch,

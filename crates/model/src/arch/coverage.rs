@@ -1016,8 +1016,8 @@ const NEMOTRON_SITES: &[GgmlType] = &[
 /// `gpu/src/arch/qwen3moe/body35.rs`, each a launch of `gpu/src/site.rs`; the
 /// pins read from the card kernel table's rows are [`ROW_PINS`]; the V4.1
 /// chain's attention gemvs, whose head-split sites in `chain/attn.rs` take
-/// q3_K or q8_0, the same head, and the hyper-connection fn `hc.rs` reads as
-/// q3_K words, `hc_f32.rs` as f32; the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the common
+/// q3_K, q5_K or q8_0, the head q6_K or q5_K, and the hyper-connection fn `hc.rs` reads as
+/// q3_K words or f32; the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the common
 /// head's q8_0, q6_K and q4_K arms; the gemma-embedding2 encoder's GEMMs,
 /// each `site::gemm` on the 32-value path).
 const TYPE_PINS: &[TypePin] = &[
@@ -1079,17 +1079,30 @@ const TYPE_PINS: &[TypePin] = &[
         programs: &[Program::Deepseek41Chain],
         role: Role::Attention,
         matrices: true,
-        names: None,
-        what: "attention matrices (the chain reads q3_K and q8_0)",
-        reads: &[GgmlType::Q3_K, GgmlType::Q8_0],
+        names: Some(|n| !super::deepseek41::roles::is_side_matrix(n)),
+        what: "attention matrices (the chain reads q3_K, q5_K and q8_0)",
+        reads: &[GgmlType::Q3_K, GgmlType::Q5_K, GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::Deepseek41Chain],
+        role: Role::Attention,
+        matrices: true,
+        names: Some(super::deepseek41::roles::is_side_matrix),
+        what: "compressor and indexer matrices (the chain reads q3_K, q5_K, q8_0 and bf16)",
+        reads: &[
+            GgmlType::Q3_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::BF16,
+        ],
     },
     TypePin {
         programs: &[Program::Deepseek41Chain],
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the head reads q6_K)",
-        reads: &[GgmlType::Q6_K],
+        what: "output head (the head reads q6_K and q5_K)",
+        reads: &[GgmlType::Q6_K, GgmlType::Q5_K],
     },
     TypePin {
         programs: &[Program::Deepseek41Chain],
@@ -2243,14 +2256,22 @@ mod tests {
                 );
             }
         }
-        for ty in [GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0] {
+        // PIN(2026-10-25): the head gains Q5_K (`kernels::head`'s row: the `_sel` Q5_K
+        // gemv over the matrix as one expert), so this body's `output` of Q5_K is read
+        // by the common head instead of an item; every other type is unchanged.
+        for ty in [
+            GgmlType::Q6_K,
+            GgmlType::Q5_K,
+            GgmlType::Q4_K,
+            GgmlType::Q8_0,
+        ] {
             check(
                 format!("head {ty}"),
                 global("output.weight", Role::Head, ty),
                 &none,
             );
         }
-        for ty in [GgmlType::Q5_K, GgmlType::BF16] {
+        for ty in [GgmlType::BF16] {
             check(
                 format!("head {ty}"),
                 global("output.weight", Role::Head, ty),
@@ -3048,6 +3069,91 @@ mod tests {
                 "q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes)"
                     .to_string()
             )]
+        );
+    }
+
+    /// A V4.1 file's attention matrices are items unless their type is one
+    /// the chain's dense sites read (q3_K, q5_K, q8_0; the compressor's and
+    /// the indexer's also bf16), and its head unless q6_K or q5_K.
+    #[test]
+    fn the_ds41_dense_pins_read_the_chains_types() {
+        let items = |name: &str, role: Role, ty: GgmlType, needle: &str| {
+            let spec = ModelSpec {
+                arch: Arch::Deepseek41,
+                hidden: 4096,
+                vocab: 129_280,
+                ctx_train: 65_536,
+                rms_eps: 1e-6,
+                layers: Vec::new(),
+                mtp: Vec::new(),
+                hc: None,
+                engram: None,
+                encoder: None,
+                logit_epilogue: None,
+                chat: ChatSpec {
+                    pre: String::new(),
+                    template: None,
+                    tools: None,
+                    reasoning: None,
+                },
+            };
+            let model = ModelTensors {
+                tensors: vec![ModelTensor {
+                    name: name.to_string(),
+                    shard: 0,
+                    layer: None,
+                    role,
+                    ty,
+                    dims: vec![4096, 1024],
+                    file_bytes: 0,
+                    gathered_rows: None,
+                }],
+                layers: 9,
+                experts: 0,
+                experts_used: 0,
+                bf16_words: |_| false,
+            };
+            super::check(&spec, &model)
+                .into_iter()
+                .filter(|u| u.feature.contains(needle))
+                .map(|u| u.feature)
+                .collect::<Vec<String>>()
+        };
+        let attn = |name: &str, ty| items(name, Role::Attention, ty, "matrices");
+        for ty in [GgmlType::Q3_K, GgmlType::Q5_K, GgmlType::Q8_0] {
+            for name in [
+                "blk.0.attn_q_b.weight",
+                "blk.2.attn_compressor_kv.weight",
+                "blk.7.indexer.proj.weight",
+            ] {
+                assert_eq!(attn(name, ty), Vec::<String>::new(), "{name} {ty}");
+            }
+        }
+        for name in [
+            "blk.2.attn_compressor_gate.weight",
+            "blk.7.indexer.attn_q_b.weight",
+            "blk.4.indexer.attn_k.weight",
+        ] {
+            assert_eq!(attn(name, GgmlType::BF16), Vec::<String>::new(), "{name}");
+        }
+        assert_eq!(
+            attn("blk.0.attn_q_a.weight", GgmlType::BF16),
+            ["bf16 attention matrices (the chain reads q3_K, q5_K and q8_0)".to_string()]
+        );
+        assert_eq!(
+            attn("blk.2.attn_compressor_kv.weight", GgmlType::Q6_K),
+            [
+                "q6_K compressor and indexer matrices (the chain reads q3_K, q5_K, q8_0 and bf16)"
+                    .to_string()
+            ]
+        );
+        let head = |ty| items("output.weight", Role::Head, ty, "output head");
+        for ty in [GgmlType::Q6_K, GgmlType::Q5_K] {
+            assert_eq!(head(ty), Vec::<String>::new(), "{ty}");
+        }
+        assert_eq!(
+            head(GgmlType::Q4_K),
+            ["q4_K output head (the head reads q6_K and q5_K)".to_string()]
         );
     }
 

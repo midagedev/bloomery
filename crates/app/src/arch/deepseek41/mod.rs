@@ -96,6 +96,9 @@ impl Open for Body {
             return Ok(false);
         }
         body::prepare_prefill(m)?;
+        if m.body(WHAT)?.prefill_mode() != PrefillMode::Batch {
+            return Ok(false);
+        }
         if cfg.card_timing {
             let (gpu, _, b) = m.body_parts(WHAT)?;
             b.set_prefill_card_timing(gpu, true)?;

@@ -2424,7 +2424,7 @@ impl FfnPiece {
         let c = &self.cfg[i];
         let fault = gpu.layer_sink(layer)?;
         {
-            let pre = HcPreArgs {
+            let pre = HcFnArgs {
                 params: &lw.hc,
                 x: io.streams,
                 tokens: m,
@@ -2438,7 +2438,7 @@ impl FfnPiece {
                 m * HC_MIX,
             )?;
             self.hc
-                .enqueue_pre(stream, &pre, &mut self.hc_scratch, &mut b.mixes, &mut hc)?;
+                .enqueue_pre_fn(stream, &pre, &mut self.hc_scratch, &mut b.mixes, &mut hc)?;
             drop(hc);
             let act_x = count_of(&mut b.act_x, m)?;
             self.fused.enqueue_norm_quant(

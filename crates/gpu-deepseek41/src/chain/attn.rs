@@ -95,7 +95,7 @@ use crate::compress::{
 };
 use crate::dense::{Dense, DenseKernels};
 use crate::hc::{
-    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs,
+    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
     HcPreScratch,
 };
 use crate::index_key::{self, IndexKeyArgs, IndexKeyKernels};
@@ -1404,14 +1404,13 @@ impl AttnChain {
         let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
         let branch = &mut self.branch;
 
-        let params = HcParams {
-            w: q3_k(w, &n.hc_fn)?,
-            scale: vector(w, &n.hc_scale)?,
-            base: vector(w, &n.hc_base)?,
-            eps: d.hc_eps,
-            iters: d.hc_iters,
-        };
-        let pre = HcPreArgs {
+        let params = HcFn::of(
+            w,
+            WHAT,
+            [&n.hc_fn, &n.hc_scale, &n.hc_base],
+            (d.hc_eps, d.hc_iters),
+        )?;
+        let pre = HcFnArgs {
             params: &params,
             x: streams_in,
             tokens: m,
@@ -1420,7 +1419,7 @@ impl AttnChain {
         };
         // Only HC_POST reads what HC_PRE writes: it runs beside steps 2–8.
         let fork = branch.fork()?;
-        k.hc.enqueue_pre(fork.stream(), &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
+        k.hc.enqueue_pre_fn(fork.stream(), &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
 
         let qkv = Qkv::of(w, lp, d)?;
         let normed_act = enqueue_norm(&cx, lp, s, fold_in, &mut compressed, qkv.reads_q8_1())?;
@@ -1590,7 +1589,7 @@ fn enqueue_norm(
                 cx.fault,
             )?;
             let raw_key = s.raw.as_mut().and_then(|r| r.key.as_mut());
-            enqueue_source(cx, sp, src, raw_key, io)?;
+            enqueue_source(cx, sp, (src, &s.normed), raw_key, io)?;
             NormedAct::Source
         }
         (None, Compressed::Read(_), _) if lp.stream.is_some() && quantized => {
@@ -1828,11 +1827,18 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
             cx.k.dense
                 .enqueue_q3k_heads(stream, wa, &acts.heads, d.o_lora_rank, &mut s.wo_a)?;
         }
+        Dense::Q5K(wa) => cx.k.dense.enqueue_q5k_heads(
+            stream,
+            wa,
+            &s.y,
+            (d.o_lora_rank, d.group_k),
+            &mut s.wo_a,
+        )?,
         _ => {
             return Err(GpuError::Tensor {
                 what: WHAT,
                 name: n.out_a.clone(),
-                need: "Q3_K or Q8_0",
+                need: "Q3_K, Q5_K or Q8_0",
             });
         }
     }
@@ -1913,16 +1919,22 @@ fn enqueue_indexer(
             .enqueue_m(gpu, q_b, q_a_normed, q_act, m, q.part_mut(INDEX_Q))?;
     }
     if !joined.weights {
+        let proj = Dense::of(w, &ip.proj, d.n_embd, w_rows)?;
         let own = &mut sel.act;
-        let act = match (lp.source.is_some(), source.as_ref(), normed_act) {
-            (true, Some(src), _) => &src.act,
-            (_, _, NormedAct::Own) => &acts.normed,
-            _ => {
-                gpu.enqueue_quantize_q8_1_layer(normed, own, cx.layer)?;
-                &*own
-            }
+        let act = if proj.reads_q8_1() {
+            Some(match (lp.source.is_some(), source.as_ref(), normed_act) {
+                (true, Some(src), _) => &src.act,
+                (_, _, NormedAct::Own) => &acts.normed,
+                _ => {
+                    gpu.enqueue_quantize_q8_1_layer(normed, own, cx.layer)?;
+                    &*own
+                }
+            })
+        } else {
+            None
         };
-        gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, qkv.part_mut(INDEX_W))?;
+        cx.k.dense
+            .enqueue_m(gpu, proj, normed, act, m, qkv.part_mut(INDEX_W))?;
     }
     let q_in = Window::<f32>::of(q.part(INDEX_Q), 0, q_len * m)?;
     let w_in = Window::<f32>::of(qkv.part(INDEX_W), 0, w_rows * m)?;
@@ -2116,13 +2128,13 @@ fn enqueue_select(
 fn enqueue_source(
     cx: &Cx<'_>,
     sp: &SourcePlan,
-    src: &mut SourceScratch,
+    (src, normed): (&mut SourceScratch, &DeviceBuffer<f32>),
     raw_key: Option<&mut DeviceBuffer<f32>>,
     io: &mut SourceIo<'_>,
 ) -> Result<(), GpuError> {
     let ratio = cx.words.layout.streams[sp.stream].geom.ratio;
-    let st = SourceTensors::of(cx.w, sp, ratio, io.ring.is_some())?;
-    source_project(cx, &st, &src.act, &mut src.proj)?;
+    let st = SourceTensors::of(cx.w, sp, (cx.d.n_embd, ratio), io.ring.is_some())?;
+    source_project(cx, &st, (normed, &src.act), &mut src.proj)?;
     source_rows(
         cx,
         sp,
@@ -2144,30 +2156,39 @@ struct SourceTensors<'w> {
     proj: SourceProj<'w>,
     gain: &'w DeviceBuffer<f32>,
     /// The index key's projection and norm, on a layer that owns index keys.
-    keys: Option<(&'w DeviceTensor<u32>, &'w DeviceBuffer<f32>)>,
+    keys: Option<(Dense<'w>, &'w DeviceBuffer<f32>)>,
 }
 
 /// A compressor's projections of its normed input as resident.
 #[derive(Clone, Copy)]
 enum SourceProj<'w> {
     /// At ratio 1: kv alone.
-    Kv(&'w DeviceTensor<u32>),
-    /// Above it: kv and the gate as one joined row stream …
+    Kv(Dense<'w>),
+    /// Above it: kv and the gate as one joined Q3_K row stream …
     Joint(&'w DeviceTensor<u32>),
-    /// … or each its own.
-    Split {
-        kv: &'w DeviceTensor<u32>,
-        gate: &'w DeviceTensor<u32>,
-    },
+    /// … or each its own, in the format its file tensor has.
+    Split { kv: Dense<'w>, gate: Dense<'w> },
 }
 
 impl<'w> SourceTensors<'w> {
+    /// Whether every projection is Q3_K (joined or not), the only formats
+    /// the prompt batch's launches read.
+    fn q3k_only(&self) -> bool {
+        let q3k = |d: &Dense<'_>| matches!(d, Dense::Q3K(_));
+        let proj = match &self.proj {
+            SourceProj::Joint(_) => true,
+            SourceProj::Kv(kv) => q3k(kv),
+            SourceProj::Split { kv, gate } => q3k(kv) && q3k(gate),
+        };
+        proj && self.keys.as_ref().is_none_or(|(k, _)| q3k(k))
+    }
+
     /// `sp`'s, at `ratio`: a gate and a ring go together (above ratio 1), a
     /// join is refused unless it is kv's and the gate's rows.
     fn of(
         w: &'w Weights,
         sp: &SourcePlan,
-        ratio: usize,
+        (n_embd, ratio): (usize, usize),
         ring: bool,
     ) -> Result<SourceTensors<'w>, GpuError> {
         let width = compress::WIDTH;
@@ -2185,11 +2206,11 @@ impl<'w> SourceTensors<'w> {
                     });
                 }
                 None => SourceProj::Split {
-                    kv: q3_k(w, &sp.kv)?,
-                    gate: q3_k(w, gate)?,
+                    kv: Dense::of(w, &sp.kv, n_embd, width)?,
+                    gate: Dense::of(w, gate, n_embd, width)?,
                 },
             },
-            (None, false) => SourceProj::Kv(q3_k(w, &sp.kv)?),
+            (None, false) => SourceProj::Kv(Dense::of(w, &sp.kv, n_embd, width)?),
             (gate, ring) => {
                 return Err(GpuError::Shape {
                     what: WHAT,
@@ -2201,7 +2222,10 @@ impl<'w> SourceTensors<'w> {
             }
         };
         let keys = match &sp.keys {
-            Some((proj, norm)) => Some((q3_k(w, proj)?, vector(w, norm)?)),
+            Some((proj, norm)) => Some((
+                Dense::of(w, proj, compress::WIDTH, index_key::WIDTH)?,
+                vector(w, norm)?,
+            )),
             None => None,
         };
         Ok(SourceTensors {
@@ -2217,17 +2241,20 @@ impl<'w> SourceTensors<'w> {
 fn source_project(
     cx: &Cx<'_>,
     st: &SourceTensors<'_>,
-    act: &Q8Act,
+    (normed, act): (&DeviceBuffer<f32>, &Q8Act),
     proj: &mut PartedBuffer<f32, 2>,
 ) -> Result<(), GpuError> {
-    let gpu = cx.gpu;
+    let (gpu, dense, m) = (cx.gpu, &cx.k.dense, cx.m);
+    let project = |d: Dense<'_>, out: &mut DeviceBuffer<f32>| {
+        dense.enqueue_m(gpu, d, normed, d.reads_q8_1().then_some(act), m, out)
+    };
     match st.proj {
         SourceProj::Joint(t) => gpu.enqueue_gemv_q3k(t, act, proj.whole_mut())?,
         SourceProj::Split { kv, gate } => {
-            gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?;
-            gpu.enqueue_gemv_q3k(gate, act, proj.part_mut(COMP_SCORE))?;
+            project(kv, proj.part_mut(COMP_KV))?;
+            project(gate, proj.part_mut(COMP_SCORE))?;
         }
-        SourceProj::Kv(kv) => gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?,
+        SourceProj::Kv(kv) => project(kv, proj.part_mut(COMP_KV))?,
     }
     Ok(())
 }
@@ -2327,17 +2354,20 @@ fn source_rows(
     match (st.keys, io.keys.as_deref_mut()) {
         (Some((proj, norm)), Some(keys)) => {
             let groups = act_pre.m();
-            gpu.enqueue_quantize_q8_1_layer(pre, act_pre, cx.layer)?;
+            if proj.reads_q8_1() {
+                gpu.enqueue_quantize_q8_1_layer(pre, act_pre, cx.layer)?;
+            }
+            let act = proj.reads_q8_1().then_some(&*act_pre);
             match raw_key {
                 // The key's gemv runs the geometry's group slots, a column
                 // each: the pooling wrote the pre-rope rows of the groups the
                 // pass completes, and the index key reads only those.
                 Some(rk) if groups > 1 => {
-                    gpu.enqueue_gemv_q3k(proj, act_pre, rk)?;
+                    cx.k.dense.enqueue_m(gpu, proj, pre, act, groups, rk)?;
                     cx.k.transpose
                         .enqueue(stream, rk, index_key::WIDTH, groups, key)?;
                 }
-                _ => gpu.enqueue_gemv_q3k(proj, act_pre, key)?,
+                _ => cx.k.dense.enqueue_m(gpu, proj, pre, act, groups, key)?,
             }
             cx.k.key.enqueue_index_key(
                 stream,
@@ -2823,18 +2853,6 @@ fn joint_q3k<'w>(w: &'w Weights, name: &str) -> Result<Option<&'w DeviceTensor<u
             ..
         }) => Ok(Some(w)),
         Some(_) => Err(missing(name, "a Q3_K row join")),
-    }
-}
-
-/// Q3_K weight `name`'s row stream.
-fn q3_k<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
-    match w.get(name) {
-        Some(DevWeight::KQuant {
-            ty: GgmlType::Q3_K,
-            w,
-            ..
-        }) => Ok(w),
-        _ => Err(missing(name, "resident as Q3_K")),
     }
 }
 

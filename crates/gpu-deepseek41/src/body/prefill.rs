@@ -245,9 +245,18 @@ impl CallMedia<'_> {
 /// gives the held buffers the tap's rows, which a call that hands features
 /// over needs (refused by name without them). Once the buffers hold what the
 /// body's tap needs, a call does nothing.
+///
+/// A file whose attention tensors are in formats the batch's launches do not
+/// read (`AttnChain::batch_formats`) is fed as steps instead: the body's feed
+/// becomes [`PrefillMode::Steps`], no buffers are made, and the refusal that
+/// decided it is [`Body::batch_refusal`]. Under a residency the steps feed
+/// is refused, so the load is refused by name with both facts.
 pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
-    let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.make_batch_once(gpu)
+    let (gpu, w, body) = m.body_parts(WHAT)?;
+    match body.attn.batch_formats(w) {
+        Ok(()) => body.make_batch_once(gpu),
+        Err(why) => body.feed_steps_for(&why),
+    }
 }
 
 /// Make the prompt batch's media half ([`prepare_prefill`]'s buffers first,
@@ -1345,6 +1354,21 @@ impl Body {
             what: WHAT,
             missing: "the prompt batch's buffers, made at load (body::prepare_prefill)",
         })
+    }
+
+    /// Feed prompts as steps because the batch's launches do not read the
+    /// file's tensors, `why` the refusal; refused by name, with the reason,
+    /// where the levers do not take the steps feed.
+    fn feed_steps_for(&mut self, why: &GpuError) -> Result<(), GpuError> {
+        super::refuse_steps_under_residency(PrefillMode::Steps, self.levers.residency).map_err(
+            |e| GpuError::Shape {
+                what: "BLOOMERY_PREFILL",
+                detail: format!("the prompt batch cannot run this file ({why}); {e}"),
+            },
+        )?;
+        self.levers.prefill = PrefillMode::Steps;
+        self.batch_refusal = Some(why.to_string());
+        Ok(())
     }
 
     /// Make the batch's buffers when none are held: the attention piece over

@@ -70,6 +70,7 @@
 use bloomery_gpu::cores::{q3k_chain, q3k_sb_decode, q8_quad};
 use bloomery_gpu::elem::rms_scale_checked;
 use bloomery_gpu::fault::quad_finite;
+use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{
     COL_GROUP, ColGroups, DeviceTensor, FaultSink, FaultSite, GpuError, col_group, launch_u32,
 };
@@ -80,7 +81,10 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
+use gguf::quant::GgmlType;
 use std::sync::Arc;
+
+use crate::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
 
 /// Residual streams (the file's `hyper_connection.count`).
 pub const HC_STREAMS: usize = 4;
@@ -1691,6 +1695,59 @@ pub struct HcQ8PreArgs<'a> {
     pub fault: FaultSink,
 }
 
+/// One sub-layer's HC_PRE parameters by the format the file holds
+/// `hc_{attn,ffn}_fn` in: q3_K rows against the q8_1 walk
+/// ([`HcKernels::enqueue_pre`]), or f32 rows ([`crate::hc_f32`]).
+pub enum HcFn<'a> {
+    Q3K(HcParams<'a>),
+    F32(HcF32Params<'a>),
+}
+
+impl<'a> HcFn<'a> {
+    /// The parameters of the resident tensors `names` (`hc_{attn,ffn}_fn`,
+    /// `_scale`, `_base`), the fn in the format it is resident in; any other
+    /// format is refused by name as `what`'s.
+    pub fn of(
+        w: &'a Weights,
+        what: &'static str,
+        [fn_name, scale, base]: [&str; 3],
+        (eps, iters): (f32, u32),
+    ) -> Result<HcFn<'a>, GpuError> {
+        let (scale, base) = (w.f32_buf(what, scale)?, w.f32_buf(what, base)?);
+        match w.resident(what, fn_name)? {
+            DevWeight::KQuant {
+                ty: GgmlType::Q3_K,
+                w,
+                ..
+            } => Ok(HcFn::Q3K(HcParams {
+                w,
+                scale,
+                base,
+                eps,
+                iters,
+            })),
+            DevWeight::F32 { w, .. } => Ok(HcFn::F32(HcF32Params {
+                w,
+                scale,
+                base,
+                eps,
+                iters,
+            })),
+            _ => Err(GpuError::tensor(what, fn_name, "Q3_K or F32")),
+        }
+    }
+}
+
+/// The inputs of one [`HcKernels::enqueue_pre_fn`] launch: [`HcPreArgs`] over
+/// a [`HcFn`].
+pub struct HcFnArgs<'a> {
+    pub params: &'a HcFn<'a>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub tokens: usize,
+    pub rms_eps: f32,
+    pub fault: FaultSink,
+}
+
 /// The inputs of one `ds41_hc_post` launch.
 pub struct HcPostArgs<'a> {
     /// The sub-layer output, `n_embd` per token.
@@ -1710,6 +1767,7 @@ pub struct HcPostArgs<'a> {
 /// capturable.
 pub struct HcKernels {
     module: hc_kernels::LoadedModule,
+    f32: HcF32Kernels,
 }
 
 impl HcKernels {
@@ -1718,7 +1776,50 @@ impl HcKernels {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
         let module = unsafe { bloomery_gpu::shared_module!(hc_kernels, ctx)? };
-        Ok(HcKernels { module })
+        Ok(HcKernels {
+            module,
+            f32: HcF32Kernels::load(ctx)?,
+        })
+    }
+
+    /// [`HcKernels::enqueue_pre`] for the format the file holds the fn in:
+    /// q3_K the split-K walk over `scratch`, f32 `ds41_hc_pre_f32` (a block a
+    /// token, no scratch). Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pre_fn(
+        &self,
+        stream: &CudaStream,
+        a: &HcFnArgs<'_>,
+        scratch: &mut HcPreScratch,
+        mixes: &mut DeviceBuffer<f32>,
+        hc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        match a.params {
+            HcFn::Q3K(params) => self.enqueue_pre(
+                stream,
+                &HcPreArgs {
+                    params,
+                    x: a.x,
+                    tokens: a.tokens,
+                    rms_eps: a.rms_eps,
+                    fault: a.fault,
+                },
+                scratch,
+                mixes,
+                hc,
+            ),
+            HcFn::F32(params) => self.f32.enqueue_pre(
+                stream,
+                &HcF32Args {
+                    params,
+                    x: a.x,
+                    tokens: a.tokens,
+                    rms_eps: a.rms_eps,
+                    fault: a.fault,
+                },
+                mixes,
+                hc,
+            ),
+        }
     }
 
     /// Enqueue RMS + split-K gemv + HC_PRE (`ds41_hc_pre`): `mixes` takes

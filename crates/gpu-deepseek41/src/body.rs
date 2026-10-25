@@ -859,6 +859,10 @@ pub struct Body {
     /// The prompt batch's buffers ([`prefill`]), made at load by
     /// [`prefill::prepare_prefill`].
     batch: Option<Box<prefill::Batch>>,
+    /// Why the load fed prompts as steps although the batch feed was asked
+    /// for: the refusal of the first layer whose tensors the batch's launches
+    /// do not read ([`prefill::prepare_prefill`]).
+    batch_refusal: Option<String>,
     /// Per layer of `layers`, one bit: whether the group a prompt call is
     /// enqueuing has run its pick there ([`Body::enqueue_group_chain`]).
     /// Zeroed at each group's start; the load refuses more layers than its
@@ -1212,6 +1216,14 @@ impl Body {
     #[must_use]
     pub fn prefill_mode(&self) -> PrefillMode {
         self.levers.prefill
+    }
+
+    /// Why the load fed prompts as steps although the batch feed was asked
+    /// for, when it did ([`prepare_prefill`]): the refusal that named the
+    /// first layer tensor the batch's launches do not read.
+    #[must_use]
+    pub fn batch_refusal(&self) -> Option<&str> {
+        self.batch_refusal.as_deref()
     }
 
     /// Feed the next prompts as `mode` says, so one load runs both feeds (a
@@ -2596,6 +2608,7 @@ impl Body {
             hp: hp.clone(),
             levers: cfg,
             batch: None,
+            batch_refusal: None,
             picked: 0,
             tier,
             residency_glue,

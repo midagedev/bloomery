@@ -46,6 +46,7 @@ use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 
 use super::*;
 use crate::dense::{Q3kHeadsGroupsArgs, RowsPart};
+use crate::hc::{HcFn, HcParams, HcPreArgs};
 use crate::params::ImageLayout;
 use crate::span::{span, span_mut};
 
@@ -229,7 +230,18 @@ impl<'w> LayerTensors<'w> {
         };
         let qkv = match Qkv::of(w, lp, d)? {
             Qkv::Joint(t) => t,
-            Qkv::Parts { .. } => return Err(refuse(&n.qkv, "the joined Q3_K rows")),
+            Qkv::Parts { q_a, kv } => {
+                // The file's tensor that kept the join from forming, not the join's own name.
+                let other = [(&n.q_a, q_a), (&n.kv, kv)]
+                    .into_iter()
+                    .find(|(_, d)| !matches!(d, Dense::Q3K(_)));
+                return Err(match other {
+                    Some((name, _)) => {
+                        refuse(name, "Q3_K, joined with its input's other projections")
+                    }
+                    None => refuse(&n.qkv, "the joined Q3_K rows"),
+                });
+            }
         };
         let query = match (Query::of(w, lp, d)?, &lp.indexer) {
             (Query::Joint(t), _) => t,
@@ -254,18 +266,25 @@ impl<'w> LayerTensors<'w> {
         let source = match &lp.source {
             Some(sp) => {
                 let ratio = words.streams[sp.stream].geom.ratio;
-                Some(SourceTensors::of(w, sp, ratio, ratio > 1)?)
+                let st = SourceTensors::of(w, sp, (d.n_embd, ratio), ratio > 1)?;
+                if !st.q3k_only() {
+                    return Err(refuse(&sp.kv, "Q3_K, with its gate and index key"));
+                }
+                Some(st)
             }
             None => None,
         };
+        let hc = match HcFn::of(
+            w,
+            WHAT_BATCH,
+            [&n.hc_fn, &n.hc_scale, &n.hc_base],
+            (d.hc_eps, d.hc_iters),
+        )? {
+            HcFn::Q3K(hc) => hc,
+            HcFn::F32(_) => return Err(refuse(&n.hc_fn, "Q3_K")),
+        };
         Ok(LayerTensors {
-            hc: HcParams {
-                w: q3_k(w, &n.hc_fn)?,
-                scale: vector(w, &n.hc_scale)?,
-                base: vector(w, &n.hc_base)?,
-                eps: d.hc_eps,
-                iters: d.hc_iters,
-            },
+            hc,
             norm: vector(w, &n.norm)?,
             qkv,
             q_a_norm: vector(w, &n.q_a_norm)?,
@@ -612,6 +631,15 @@ impl BatchCx<'_> {
 }
 
 impl AttnChain {
+    /// Whether every layer's tensors are in the formats the prompt batch's
+    /// launches read ([`LayerTensors::of`]): `Ok`, or the first layer's
+    /// refusal by name. Load-time only.
+    pub fn batch_formats(&self, w: &Weights) -> Result<(), GpuError> {
+        self.plans
+            .iter()
+            .try_for_each(|lp| LayerTensors::of(w, lp, &self.dims, &self.words.layout).map(drop))
+    }
+
     /// The buffers of [`AttnChain::enqueue_batch_layer`] for groups of up to
     /// `sets` batches of up to `tokens` positions, refused by name when they
     /// do not fit the card's free memory ([`Gpu::alloc_room`]). Load-time
@@ -961,7 +989,10 @@ fn sub_pre(
                     (COMP_SCORE, 0, 2 * width, width),
                 ]
             }
-            SourceProj::Split { kv, gate } => {
+            SourceProj::Split {
+                kv: Dense::Q3K(kv),
+                gate: Dense::Q3K(gate),
+            } => {
                 let mut kv_rows = span_mut(WHAT_BATCH, raw, 0, n * width)?;
                 ent.one(gpu.enqueue_gemv_q3k_groups(kv, act, groups, &mut kv_rows))?;
                 drop(kv_rows);
@@ -969,9 +1000,16 @@ fn sub_pre(
                 ent.one(gpu.enqueue_gemv_q3k_groups(gate, act, groups, &mut gate_rows))?;
                 split_parts
             }
-            SourceProj::Kv(kv) => {
+            SourceProj::Kv(Dense::Q3K(kv)) => {
                 ent.one(gpu.enqueue_gemv_q3k_groups(kv, act, groups, raw))?;
                 &[(COMP_KV, 0, width, 0)]
+            }
+            SourceProj::Split { .. } | SourceProj::Kv(_) => {
+                return Err(GpuError::Shape {
+                    what: WHAT_BATCH,
+                    detail: "a compressor projection that is not Q3_K reached the batch path"
+                        .to_string(),
+                });
             }
         };
         for &(part, off, total_rows, r0) in parts {

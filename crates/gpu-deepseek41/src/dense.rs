@@ -11,15 +11,20 @@
 //!   `cores::q4k_row_dot`, ik's CUDA `mmvq` shape. The caller quantizes the
 //!   activation once for every projection that reads it; a Q3_K row may have
 //!   an odd super-block count.
-//! - Q5_K: [`DenseKernels`]'s f32-activation gemv, the one Q5_K dense site
-//!   (two layers' shared down projection): each weight dequantized as
+//! - Q5_K: [`DenseKernels`]'s f32-activation gemv, the Q5_K dense site
+//!   (the shared down projection, q_b, wo_b): each weight dequantized as
 //!   `gguf::quant::dequant_row` does it, then one fused multiply-add.
+//! - BF16: `q8f32`'s `bf16_gemv` over the file's words and the f32 input
+//!   (each value widened as it is read, so exact), the compressor's and the
+//!   indexer's projections.
 //!
 //! Two shapes of their own, where the file's format is a K-quant:
 //! - `attn_output_a`'s block diagonal ([`DenseKernels::enqueue_q3k_heads`]):
 //!   group `g`'s rows dot column `g` of a q8_1 activation of `groups`
 //!   columns — each row bit for bit what `q3k_gemv` computes for it on that
-//!   column alone;
+//!   column alone; a Q5_K file's ([`DenseKernels::enqueue_q5k_heads`]) dots
+//!   its group's window of the f32 heads, each row bit for bit what the Q5_K
+//!   gemv computes for it on that window alone;
 //! - the shared expert's gate·up·SwiGLU
 //!   ([`DenseKernels::enqueue_shexp_gate_up_q3k`]): both Q3_K dots against the
 //!   one q8_1 column, then `experts::swiglu_clamp` — the routed experts'
@@ -66,8 +71,8 @@ const BLOCK: u32 = 256;
 
 /// Bytes, and u32 words, of one Q5_K super-block of 256 values: `d` and
 /// `dmin` (f16), 12 scale bytes, 32 high-bit bytes, 128 low-nibble bytes.
-const Q5K_BYTES: usize = 176;
-const Q5K_WORDS: usize = Q5K_BYTES / 4;
+pub(crate) const Q5K_BYTES: usize = 176;
+pub(crate) const Q5K_WORDS: usize = Q5K_BYTES / 4;
 
 /// Byte `i` of the words from `base`.
 ///
@@ -150,7 +155,13 @@ unsafe fn q5k_values(
 ///
 /// `w.len() >= (row + 1) · 44 · n_sb`, `x.len() >= 256 · n_sb`, `lane < 32`.
 #[inline(always)]
-unsafe fn q5k_lane_partial(w: &[u32], x: &[f32], n_sb: usize, row: usize, lane: usize) -> f32 {
+pub(crate) unsafe fn q5k_lane_partial(
+    w: &[u32],
+    x: &[f32],
+    n_sb: usize,
+    row: usize,
+    lane: usize,
+) -> f32 {
     let mut acc = 0.0f32;
     let mut sb = 0usize;
     while sb < n_sb {
@@ -348,6 +359,59 @@ mod dense_kernels {
             // SAFETY: slots row·m + c for c < m are inside y (y.len() >=
             // n_rows·m) and belong to this row's warp alone.
             unsafe { store_cols(&mut y, row * m, 1, m, s) };
+        }
+    }
+
+    /// The block diagonal of a Q5_K weight at one f32 input: row `r` of
+    /// `n_rows` belongs to group `r / rows_per_head` and dots that group's
+    /// window of `x` (`n_sb` super-blocks from `group · x_head_stride`), the
+    /// module's contract order — each row bit for bit
+    /// `ds41_q5k_gemv_f32`'s on that window alone.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_rows * 44 * n_sb,
+            groups * rows_per_head >= n_rows,
+            groups >= 1,
+            x.len() + x_head_stride >= groups * x_head_stride + 256 * n_sb,
+            y.len() >= n_rows
+        )
+    )]
+    pub fn ds41_q5k_gemv_heads(
+        w: &[u32],
+        x: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        rows_per_head: u32,
+        groups: u32,
+        x_head_stride: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let group = row / rows_per_head as usize;
+        // The second test is the contract's, warp-uniform like the first.
+        if row >= n_rows as usize || group >= groups as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let at = group * x_head_stride as usize;
+        // SAFETY: the window from `at` holds 256·n_sb values (group < groups
+        // and the contract's x.len()); row < n_rows puts the row's words
+        // inside w; lane < 32.
+        let f = unsafe { q5k_lane_partial(w, x.get_unchecked(at..), n_sb as usize, row, lane) };
+        let s = warp::reduce_sum_f32(f);
+        if lane == 0 {
+            // SAFETY: row < n_rows <= y.len(); lane 0 of the row's warp is
+            // its only writer.
+            unsafe { *y.get_unchecked_mut(row) = s };
         }
     }
 
@@ -725,6 +789,8 @@ pub enum Dense<'w> {
     Q3K(&'w DeviceTensor<u32>),
     Q4K(&'w DeviceTensor<u32>),
     Q5K(&'w DeviceTensor<u32>),
+    /// BF16 as the file stores it, two values to a word.
+    Bf16(&'w DeviceTensor<u32>),
 }
 
 impl<'w> Dense<'w> {
@@ -732,13 +798,20 @@ impl<'w> Dense<'w> {
     /// values onto `rows` rows at a site type this module runs (the type of
     /// its resident form, `site::resident_site`).
     pub fn of(w: &'w Weights, name: &str, k: usize, rows: usize) -> Result<Dense<'w>, GpuError> {
-        const TYS: [SiteTy; 4] = [SiteTy::Q8_0, SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K];
+        const TYS: [SiteTy; 5] = [
+            SiteTy::Q8_0,
+            SiteTy::Q3K,
+            SiteTy::Q4K,
+            SiteTy::Q5K,
+            SiteTy::Bf16,
+        ];
         let ty = site::resident_site(w, WHAT, name, (rows, k), &TYS)?;
         match (ty, w.resident(WHAT, name)?) {
             (SiteTy::Q8_0, DevWeight::Q8_0 { qs, d, .. }) => Ok(Dense::Q8_0 { qs, d }),
             (SiteTy::Q3K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q3K(t)),
             (SiteTy::Q4K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q4K(t)),
             (SiteTy::Q5K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q5K(t)),
+            (SiteTy::Bf16, DevWeight::Bf16 { w: t, .. }) => Ok(Dense::Bf16(t)),
             _ => Err(GpuError::tensor(
                 WHAT,
                 name,
@@ -816,6 +889,7 @@ impl DenseKernels {
             Dense::Q3K(w) => gpu.enqueue_gemv_q3k(w, act()?, y),
             Dense::Q4K(w) => gpu.enqueue_gemv_q4k(w, act()?, y),
             Dense::Q5K(w) => self.enqueue_q5k(stream, w, x, m, y),
+            Dense::Bf16(w) => gpu.q8f32().enqueue_bf16_gemv(stream, w, x, m, y),
         }
     }
 
@@ -868,6 +942,75 @@ impl DenseKernels {
             self.module
                 .ds41_q5k_gemv_f32_mcol(stream, &prep, w.buf(), x, n_rows, n_sb, m, y)?;
         }
+        Ok(())
+    }
+
+    /// Enqueue the block diagonal of Q5_K weight `w` (rows of whole
+    /// super-blocks, word aligned) at one f32 input: row `r` against the
+    /// weight's `k` values of `x` from `(r / rows_per_head) · x_head_stride`,
+    /// the `w.rows() / rows_per_head` groups covering every row. `y` takes one
+    /// f32 per row; each is [`DenseKernels::enqueue`]'s of the Q5_K weight on
+    /// that window, bit for bit. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_q5k_heads(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        (rows_per_head, x_head_stride): (usize, usize),
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "DenseKernels::enqueue_q5k_heads";
+        let n_rows = w.rows();
+        if w.cols() == 0 || !w.cols().is_multiple_of(Q5K_WORDS) {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "Q5_K rows of {} words: not whole super-blocks of {Q5K_WORDS}",
+                    w.cols()
+                ),
+            });
+        }
+        let n_sb = w.cols() / Q5K_WORDS;
+        if rows_per_head == 0 || n_rows == 0 || !n_rows.is_multiple_of(rows_per_head) {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!("{n_rows} rows are not whole groups of {rows_per_head}"),
+            });
+        }
+        let groups = n_rows / rows_per_head;
+        let need_x = (groups - 1) * x_head_stride + 256 * n_sb;
+        if x.len() < need_x || y.len() < n_rows {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{groups} groups of {rows_per_head} rows at stride {x_head_stride}: x.len() {} \
+                     < {need_x} or y.len() {} < {n_rows}",
+                    x.len(),
+                    y.len()
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let rows_per_head = launch_u32(what, "rows_per_head", rows_per_head)?;
+        let groups = launch_u32(what, "groups", groups)?;
+        let x_head_stride = launch_u32(what, "x_head_stride", x_head_stride)?;
+        let prep = self
+            .module
+            .prepare_ds41_q5k_gemv_heads(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.ds41_q5k_gemv_heads(
+            stream,
+            &prep,
+            w.buf(),
+            x,
+            n_rows,
+            n_sb,
+            rows_per_head,
+            groups,
+            x_head_stride,
+            y,
+        )?;
         Ok(())
     }
 
@@ -1273,4 +1416,138 @@ fn kquant_rows(
         });
     }
     Ok(())
+}
+
+/// Deterministic test data for the hardware tests of this crate's Q5_K and
+/// BF16 sites.
+#[cfg(test)]
+pub(crate) mod testdata {
+    use super::Q5K_WORDS;
+
+    /// `n` values in [-1, 1) from a linear congruential stream seeded `seed`.
+    pub(crate) fn f32s(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// `rows` Q5_K rows of `n_sb` super-blocks as words: random scale, high
+    /// and low bits under finite f16 `d` and `dmin`.
+    pub(crate) fn q5k_words(rows: usize, n_sb: usize, seed: u64) -> Vec<u32> {
+        let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3);
+        let mut next = move || {
+            s = s.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            (s >> 33) as u32
+        };
+        let d_bits = [0x3000u16, 0x3400, 0x2c00, 0x3800];
+        let mut words = Vec::with_capacity(rows * n_sb * Q5K_WORDS);
+        for b in 0..rows * n_sb {
+            let dm = u32::from(d_bits[b % 4]) | (u32::from(d_bits[(b / 4) % 4] >> 1) << 16);
+            words.push(dm);
+            words.extend((1..Q5K_WORDS).map(|_| next()));
+        }
+        words
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testdata::{f32s, q5k_words};
+    use super::*;
+
+    /// Bits of the host copy of `y`.
+    fn bits(y: &DeviceBuffer<f32>, stream: &CudaStream) -> Vec<u32> {
+        y.to_host_vec(stream)
+            .expect("rows")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_q5k_heads_row_is_the_gemv_on_its_window() {
+        const GROUPS: usize = 3;
+        const ROWS_PER_HEAD: usize = 16;
+        const N_SB: usize = 2;
+        // A stride that is not the window: a group read at the wrong stride
+        // reads another group's values.
+        const STRIDE: usize = 600;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        let words = q5k_words(GROUPS * ROWS_PER_HEAD, N_SB, 1);
+        let cols = N_SB * Q5K_WORDS;
+        let w = DeviceTensor::upload(stream, &words, GROUPS * ROWS_PER_HEAD, cols).expect("w");
+        let x = f32s((GROUPS - 1) * STRIDE + 256 * N_SB, 2);
+        let xd = DeviceBuffer::from_host(stream, &x).expect("x");
+        let mut y = DeviceBuffer::zeroed(stream, GROUPS * ROWS_PER_HEAD).expect("y");
+        dense
+            .enqueue_q5k_heads(stream, &w, &xd, (ROWS_PER_HEAD, STRIDE), &mut y)
+            .expect("heads");
+        let got = bits(&y, stream);
+        for g in 0..GROUPS {
+            let rows = ROWS_PER_HEAD * cols;
+            let wg = DeviceTensor::upload(
+                stream,
+                &words[g * rows..(g + 1) * rows],
+                ROWS_PER_HEAD,
+                cols,
+            )
+            .expect("group rows");
+            let xg = DeviceBuffer::from_host(stream, &x[g * STRIDE..g * STRIDE + 256 * N_SB])
+                .expect("window");
+            let mut yg = DeviceBuffer::zeroed(stream, ROWS_PER_HEAD).expect("yg");
+            dense
+                .enqueue_q5k(stream, &wg, &xg, 1, &mut yg)
+                .expect("gemv");
+            assert_eq!(
+                got[g * ROWS_PER_HEAD..(g + 1) * ROWS_PER_HEAD],
+                bits(&yg, stream)[..],
+                "group {g}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_bf16_dense_is_the_f32_gemv_of_the_widened_rows() {
+        const ROWS: usize = 24;
+        const K: usize = 96;
+        // Tokens a call carries: the arm passes the column count through.
+        const M: usize = 3;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        let vals = f32s(ROWS * K, 3);
+        // BF16 words, two values a word, low half first; the widened rows are
+        // the BF16 values exactly.
+        let half = |v: f32| (v.to_bits() >> 16) as u16;
+        let words: Vec<u32> = vals
+            .chunks(2)
+            .map(|p| u32::from(half(p[0])) | (u32::from(half(p[1])) << 16))
+            .collect();
+        let widened: Vec<f32> = vals
+            .iter()
+            .map(|&v| f32::from_bits(u32::from(half(v)) << 16))
+            .collect();
+        let wb = DeviceTensor::upload(stream, &words, ROWS, K / 2).expect("bf16");
+        let wf = DeviceTensor::upload(stream, &widened, ROWS, K).expect("f32");
+        let xd = DeviceBuffer::from_host(stream, &f32s(M * K, 4)).expect("x");
+        let mut y = DeviceBuffer::zeroed(stream, M * ROWS).expect("y");
+        dense
+            .enqueue_m(&gpu, Dense::Bf16(&wb), &xd, None, M, &mut y)
+            .expect("bf16 dense");
+        let mut want = DeviceBuffer::zeroed(stream, M * ROWS).expect("want");
+        gpu.q8f32()
+            .enqueue_f32_gemv(stream, &wf, &xd, M, &mut want)
+            .expect("f32 gemv");
+        assert_eq!(bits(&y, stream), bits(&want, stream));
+    }
 }

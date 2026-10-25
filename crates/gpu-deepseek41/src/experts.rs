@@ -37,6 +37,7 @@
 //! q3_K stacks, f32 activations for q8_0, where ik quantizes to q8_K and
 //! q8_2 — the gate derives its band against ik's dump from that difference.
 
+use crate::dense::{Q5K_WORDS, q5k_lane_partial};
 use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::fault::FaultSink;
 use bloomery_gpu::kquant::Act;
@@ -48,6 +49,7 @@ use bloomery_gpu::{DeviceTensor, GpuError, Q8Act, col_sums, launch_u32, store_co
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
+use gguf::quant::GgmlType;
 use std::sync::Arc;
 
 /// Threads per block of every kernel here: eight warps.
@@ -211,6 +213,61 @@ mod experts_kernels {
         let g = warp::reduce_sum_f32(fg);
         // SAFETY: the same bounds for qs_u and d_u.
         let fu = unsafe { q8_0_lane_partial_1col(qs_u, d_u, x, k, row, 0, lane) };
+        let u = warp::reduce_sum_f32(fu);
+        if lane == 0 {
+            let v = act::apply_checked(act, limit, g, u, fault);
+            // SAFETY: row < n_rows <= h.len() by the launch contract; lane 0
+            // of the row's warp is its only writer.
+            unsafe { *h.get_unchecked_mut(row) = v };
+        }
+    }
+
+    /// [`ds41_shexp_gate_up`] for Q5_K weights: row `r` dots gate row `r` and
+    /// up row `r` — `n_sb` super-blocks each, `dense`'s Q5_K row walk
+    /// (`q5k_lane_partial`) — against the `256·n_sb` f32 activations `x`,
+    /// reduces each with the warp tree and stores `h[r] = swiglu_clamp(g, u,
+    /// limit)` from lane 0 after checking both sums. Each dot is bit for bit
+    /// `ds41_q5k_gemv_f32`'s on the row.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_g.len() >= n_rows * 44 * n_sb,
+            w_u.len() >= n_rows * 44 * n_sb,
+            x.len() >= 256 * n_sb,
+            h.len() >= n_rows,
+            act <= 2
+        )
+    )]
+    pub fn ds41_shexp_gate_up_q5k(
+        w_g: &[u32],
+        w_u: &[u32],
+        x: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows puts the row's words inside w_g and w_u and x
+        // holds 256·n_sb values, by the launch contract; lane < 32.
+        let fg = unsafe { q5k_lane_partial(w_g, x, n_sb as usize, row, lane) };
+        let g = warp::reduce_sum_f32(fg);
+        // SAFETY: the same bounds for w_u.
+        let fu = unsafe { q5k_lane_partial(w_u, x, n_sb as usize, row, lane) };
         let u = warp::reduce_sum_f32(fu);
         if lane == 0 {
             let v = act::apply_checked(act, limit, g, u, fault);
@@ -456,8 +513,8 @@ impl ExpertKernels {
     ) -> Result<(), GpuError> {
         let what = "enqueue_shexp_gate_up";
         let (act, limit) = rule.code(what)?;
-        let p = q8_pair(what, gate, up)?;
-        let (n_rows, k) = (p.n_rows, p.k);
+        let pair = shexp_pair(what, gate, up)?;
+        let (n_rows, k) = (pair.n_rows(), pair.k());
         if x.len() < k || h.len() < n_rows {
             return Err(GpuError::Shape {
                 what,
@@ -471,24 +528,47 @@ impl ExpertKernels {
         let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
         let k = launch_u32(what, "k", k)?;
-        let prep = self
-            .module
-            .prepare_ds41_shexp_gate_up(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module.ds41_shexp_gate_up(
-            stream,
-            &prep,
-            p.qs_g.buf(),
-            p.d_g.buf(),
-            p.qs_u.buf(),
-            p.d_u.buf(),
-            x,
-            n_rows,
-            k,
-            act,
-            limit,
-            fault,
-            h,
-        )?;
+        match pair {
+            ShexpPair::Q8(p) => {
+                let prep = self
+                    .module
+                    .prepare_ds41_shexp_gate_up(LaunchConfig1D::new(grid, BLOCK, 0))?;
+                self.module.ds41_shexp_gate_up(
+                    stream,
+                    &prep,
+                    p.qs_g.buf(),
+                    p.d_g.buf(),
+                    p.qs_u.buf(),
+                    p.d_u.buf(),
+                    x,
+                    n_rows,
+                    k,
+                    act,
+                    limit,
+                    fault,
+                    h,
+                )?;
+            }
+            ShexpPair::Q5K { gate, up, .. } => {
+                let n_sb = k / 256;
+                let prep = self
+                    .module
+                    .prepare_ds41_shexp_gate_up_q5k(LaunchConfig1D::new(grid, BLOCK, 0))?;
+                self.module.ds41_shexp_gate_up_q5k(
+                    stream,
+                    &prep,
+                    gate.buf(),
+                    up.buf(),
+                    x,
+                    n_rows,
+                    n_sb,
+                    act,
+                    limit,
+                    fault,
+                    h,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -576,6 +656,87 @@ impl ExpertKernels {
     }
 }
 
+/// A shared expert's gate and up weights as the f32-activation gate·up launch
+/// reads them: q8_0 planes, or Q5_K row streams of whole super-blocks.
+enum ShexpPair<'a> {
+    Q8(Q8Pair<'a>),
+    Q5K {
+        gate: &'a DeviceTensor<u32>,
+        up: &'a DeviceTensor<u32>,
+        n_rows: usize,
+        k: usize,
+    },
+}
+
+impl ShexpPair<'_> {
+    fn n_rows(&self) -> usize {
+        match self {
+            ShexpPair::Q8(p) => p.n_rows,
+            ShexpPair::Q5K { n_rows, .. } => *n_rows,
+        }
+    }
+
+    fn k(&self) -> usize {
+        match self {
+            ShexpPair::Q8(p) => p.k,
+            ShexpPair::Q5K { k, .. } => *k,
+        }
+    }
+}
+
+/// `gate` and `up` as a [`ShexpPair`]: both Q5_K file tensors of the same
+/// non-empty shape, or [`q8_pair`]'s q8_0 pair; any other is refused by
+/// name as `what`'s.
+fn shexp_pair<'a>(
+    what: &'static str,
+    gate: &'a DevWeight,
+    up: &'a DevWeight,
+) -> Result<ShexpPair<'a>, GpuError> {
+    let (
+        DevWeight::KQuant {
+            ty: GgmlType::Q5_K,
+            w: gate,
+            k,
+        },
+        DevWeight::KQuant {
+            ty: GgmlType::Q5_K,
+            w: up,
+            k: k_u,
+        },
+    ) = (gate, up)
+    else {
+        return q8_pair(what, gate, up).map(ShexpPair::Q8);
+    };
+    let (n_rows, k) = (gate.rows(), *k);
+    let n_sb = k / 256;
+    if *k_u != k
+        || up.rows() != n_rows
+        || n_rows == 0
+        || k == 0
+        || !k.is_multiple_of(256)
+        || gate.cols() != n_sb * Q5K_WORDS
+        || up.cols() != n_sb * Q5K_WORDS
+    {
+        return Err(GpuError::Shape {
+            what,
+            detail: format!(
+                "Q5_K gate {} rows x {k} ({} words) and up {} rows x {k_u} ({} words) must match, \
+                 whole super-blocks of {Q5K_WORDS} words, at least one row",
+                gate.rows(),
+                gate.cols(),
+                up.rows(),
+                up.cols()
+            ),
+        });
+    }
+    Ok(ShexpPair::Q5K {
+        gate,
+        up,
+        n_rows,
+        k,
+    })
+}
+
 /// A shared expert's gate and up q8_0 planes, checked to match: the same
 /// rows of the same `k`, a positive multiple of 32, with `k/4` code words and
 /// `k/32` scales a row.
@@ -649,6 +810,60 @@ mod tests {
     use crate::chain::ffn::{FfnBatchKernels, TiledGateUp};
     use crate::dense::DenseKernels;
     use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_shexp_q5k_pair_is_two_gemvs_then_swiglu() {
+        use crate::dense::testdata::{f32s, q5k_words};
+        use crate::dense::{Dense, DenseKernels};
+        const ROWS: usize = 24;
+        const N_SB: usize = 2;
+        const LIMIT: f32 = 7.0;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let experts = ExpertKernels::load(gpu.context()).expect("experts");
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        let cols = N_SB * Q5K_WORDS;
+        let (gw, uw) = (q5k_words(ROWS, N_SB, 5), q5k_words(ROWS, N_SB, 6));
+        let g = DeviceTensor::upload(stream, &gw, ROWS, cols).expect("gate");
+        let u = DeviceTensor::upload(stream, &uw, ROWS, cols).expect("up");
+        let xd = DeviceBuffer::from_host(stream, &f32s(256 * N_SB, 7)).expect("x");
+        let dev = |w: DeviceTensor<u32>| DevWeight::KQuant {
+            ty: GgmlType::Q5_K,
+            w,
+            k: 256 * N_SB,
+        };
+        let (gate, up) = (dev(g), dev(u));
+        let mut h = DeviceBuffer::zeroed(stream, ROWS).expect("h");
+        experts
+            .enqueue_shexp_gate_up(stream, &gate, &up, &xd, LIMIT, sink, &mut h)
+            .expect("pair");
+        let (DevWeight::KQuant { w: g, .. }, DevWeight::KQuant { w: u, .. }) = (&gate, &up) else {
+            unreachable!("both built as KQuant above");
+        };
+        let dot = |w: &DeviceTensor<u32>| {
+            let mut y = DeviceBuffer::zeroed(stream, ROWS).expect("y");
+            dense
+                .enqueue(&gpu, Dense::Q5K(w), &xd, None, &mut y)
+                .expect("gemv");
+            y.to_host_vec(stream).expect("rows")
+        };
+        let (gd, ud) = (dot(g), dot(u));
+        let want: Vec<u32> = gd
+            .iter()
+            .zip(&ud)
+            .map(|(&g, &u)| swiglu_clamp(g, u, LIMIT).to_bits())
+            .collect();
+        let got: Vec<u32> = h
+            .to_host_vec(stream)
+            .expect("rows")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(gpu.take_fault().expect("fault"), None);
+        assert_eq!(got, want);
+    }
 
     #[test]
     #[ignore = "needs a CUDA card"]
