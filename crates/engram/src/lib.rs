@@ -107,6 +107,8 @@ pub enum EngramError {
     NoHashMetadata(String),
     #[error("the metadata names an engram site at {name}, and no shard carries that tensor")]
     MissingSite { name: String },
+    #[error("{0}")]
+    Fact(#[from] gguf::v41_facts::FactError),
     #[error("gguf metadata has no key {key}")]
     MissingKey { key: String },
     #[error("{key}: the file's value is not {want}")]

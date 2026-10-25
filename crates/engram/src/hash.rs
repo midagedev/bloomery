@@ -44,6 +44,7 @@
 use std::ops::Range;
 use std::path::Path;
 
+use gguf::v41_facts::{self, FactError, HashFact};
 use gguf::{Inventory, Value};
 
 use crate::EngramError;
@@ -52,8 +53,8 @@ pub mod ngram;
 
 pub use ngram::{EosWindow, History, NgramError};
 
-/// Every key [`Hash::from_gguf`] reads is `deepseek41.engram.<suffix>`.
-const ENGRAM_PREFIX: &str = "deepseek41.engram.";
+/// The architecture the keys of [`Hash::from_gguf`] are under.
+const ARCH: &str = v41_facts::ARCH;
 
 /// What a window slot holds: the part of the hash the two key sets differ in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,60 +93,106 @@ pub struct Hash {
 impl Hash {
     /// Read the constants out of one shard's header.
     ///
-    /// Every key is mandatory, and so is its length: a file that carries eight
+    /// Every fact is mandatory, and so is its length: a file that carries eight
     /// of the nine, or a prime array of the wrong width, is an error naming the
-    /// key rather than a set of constants that is silently short.
+    /// key rather than a set of constants that is silently short. Each fact is
+    /// read through [`gguf::v41_facts`]: under its canonical key or any other
+    /// publisher's spelling, and the four hash constants from the key's array or
+    /// from the tensor a publisher stores them in; two spellings that disagree
+    /// are an error.
     pub fn from_gguf(meta: &Inventory) -> Result<Hash, EngramError> {
-        let k = |suffix: &str| format!("{ENGRAM_PREFIX}{suffix}");
-        let layer_ids: Vec<u32> = ints(&meta.meta, &k("layer_ids"))?
+        let fact = |e: FactError| EngramError::Fact(e);
+        let count = |f: &v41_facts::Fact| v41_facts::count(&meta.meta, ARCH, f).map_err(fact);
+        let layer_ids: Vec<u32> = v41_facts::counts(&meta.meta, ARCH, &v41_facts::ENGRAM_LAYER_IDS)
+            .map_err(fact)?
             .into_iter()
-            .map(|v| u32::try_from(v).map_err(|_| value_err(k("layer_ids"), "a block index")))
+            .map(|v| {
+                u32::try_from(v)
+                    .map_err(|_| value_err(key(v41_facts::ENGRAM_LAYER_IDS.name), "a block index"))
+            })
             .collect::<Result<_, _>>()?;
         let sites = layer_ids.len();
         if sites == 0 {
-            return Err(value_err(k("layer_ids"), "at least one engram site"));
+            return Err(value_err(
+                key(v41_facts::ENGRAM_LAYER_IDS.name),
+                "at least one engram site",
+            ));
         }
 
-        let n_heads = usize::try_from(scalar(&meta.meta, &k("head_count"))?)
-            .map_err(|_| value_err(k("head_count"), "a head count"))?;
-        let n_gram = usize::try_from(scalar(&meta.meta, &k("max_ngram_size"))?)
-            .map_err(|_| value_err(k("max_ngram_size"), "an n-gram size"))?;
+        let head_count = key(v41_facts::ENGRAM_HEAD_COUNT.name);
+        let n_heads = usize::try_from(count(&v41_facts::ENGRAM_HEAD_COUNT)?)
+            .map_err(|_| value_err(head_count.clone(), "a head count"))?;
+        let max_ngram = key(v41_facts::ENGRAM_MAX_NGRAM.name);
+        let n_gram = usize::try_from(count(&v41_facts::ENGRAM_MAX_NGRAM)?)
+            .map_err(|_| value_err(max_ngram.clone(), "an n-gram size"))?;
         // The port's own floor: one head and a 2-gram, because `n_cols` is
         // `(n_gram - 1) * n_heads` and a site with no buckets reads no rows.
         if n_heads == 0 {
-            return Err(value_err(k("head_count"), "at least one head"));
+            return Err(value_err(head_count, "at least one head"));
         }
         if n_gram < 2 {
-            return Err(value_err(k("max_ngram_size"), "at least a 2-gram"));
+            return Err(value_err(max_ngram, "at least a 2-gram"));
         }
         let n_cols = (n_gram - 1) * n_heads;
 
-        let key_length = u32::try_from(scalar(&meta.meta, &k("key_length"))?)
-            .map_err(|_| value_err(k("key_length"), "a key length"))?;
-        let pad = scalar(&meta.meta, &k("pad_id"))?;
+        let key_length_key = key(v41_facts::ENGRAM_KEY_LENGTH.name);
+        let key_length = u32::try_from(count(&v41_facts::ENGRAM_KEY_LENGTH)?)
+            .map_err(|_| value_err(key_length_key, "a key length"))?;
+        let pad = count(&v41_facts::ENGRAM_PAD_ID)?;
 
-        let mult = ints(&meta.meta, &k("multipliers"))?;
-        need_len(k("multipliers"), mult.len(), sites * n_gram)?;
-        let prime = ints(&meta.meta, &k("primes"))?;
-        need_len(k("primes"), prime.len(), sites * n_cols)?;
-        let offset = ints(&meta.meta, &k("offsets"))?;
-        need_len(k("offsets"), offset.len(), sites * n_cols)?;
+        let constant = |f: &HashFact, per_site: usize| -> Result<Vec<u64>, EngramError> {
+            let c = v41_facts::hash_constant(meta, ARCH, f, sites).map_err(fact)?;
+            let name = key(f.kv_name());
+            need_len(name.clone(), c.values.len(), sites * per_site)?;
+            if let Some(dims) = c.dims {
+                let want = [u64::try_from(per_site).unwrap_or(u64::MAX), sites as u64];
+                if dims != want {
+                    return Err(EngramError::Fact(FactError::Bad {
+                        key: f.tensor_name().to_string(),
+                        detail: format!("has dims {dims:?}, want {want:?} (a row a site)"),
+                    }));
+                }
+            }
+            Ok(c.values)
+        };
+        let mult = constant(&v41_facts::MULTIPLIERS, n_gram)?;
+        let prime = constant(&v41_facts::PRIMES, n_cols)?;
+        let offset = constant(&v41_facts::OFFSETS, n_cols)?;
         check_buckets(
             &prime,
             &offset,
-            [&k("primes"), &k("offsets")],
+            [
+                &key(v41_facts::PRIMES.kv_name()),
+                &key(v41_facts::OFFSETS.kv_name()),
+            ],
             u64::from(u32::MAX),
             "a bucket top inside u32",
         )?;
 
-        let token_map: Vec<u32> = ints(&meta.meta, &k("token_map"))?
+        let map =
+            v41_facts::hash_constant(meta, ARCH, &v41_facts::TOKEN_MAP, sites).map_err(fact)?;
+        if let Some(dims) = &map.dims
+            && dims.len() != 1
+        {
+            return Err(EngramError::Fact(FactError::Bad {
+                key: v41_facts::TOKEN_MAP.tensor_name().to_string(),
+                detail: format!("has dims {dims:?}, want one"),
+            }));
+        }
+        let token_map: Vec<u32> = map
+            .values
             .into_iter()
             .map(|v| {
-                u32::try_from(v).map_err(|_| value_err(k("token_map"), "a compressed vocab id"))
+                u32::try_from(v).map_err(|_| {
+                    value_err(key(v41_facts::TOKEN_MAP.kv_name()), "a compressed vocab id")
+                })
             })
             .collect::<Result<_, _>>()?;
         if token_map.is_empty() {
-            return Err(value_err(k("token_map"), "a non-empty map"));
+            return Err(value_err(
+                key(v41_facts::TOKEN_MAP.kv_name()),
+                "a non-empty map",
+            ));
         }
 
         Ok(Hash {
@@ -266,11 +313,10 @@ impl Hash {
     /// The first shard whose header carries the constants owns them. A split
     /// set writes the metadata once, into shard 1.
     pub(crate) fn from_shards(invs: &[Inventory]) -> Result<Hash, EngramError> {
-        let key = format!("{ENGRAM_PREFIX}layer_ids");
         let carrier = invs
             .iter()
-            .find(|inv| inv.value(&key).is_some())
-            .ok_or(EngramError::NoHashMetadata(key))?;
+            .find(|inv| v41_facts::carries(&inv.meta, ARCH, &v41_facts::ENGRAM_LAYER_IDS))
+            .ok_or_else(|| EngramError::NoHashMetadata(key(v41_facts::ENGRAM_LAYER_IDS.name)))?;
         Hash::from_gguf(carrier)
     }
 
@@ -593,6 +639,11 @@ const MAX_PLE_NGRAM: usize = 8;
 /// The most rows a PLE site reads a token (llama.cpp's `LLAMA_MAX_PLE_HEADS`).
 const MAX_PLE_ROWS: usize = 64;
 
+/// The canonical key of the V4.1 fact `name`, as errors name it.
+fn key(name: &str) -> String {
+    format!("{ARCH}.{name}")
+}
+
 fn value_err(key: String, what: &'static str) -> EngramError {
     EngramError::KeyValue { key, at: 0, what }
 }
@@ -756,10 +807,15 @@ mod tests {
 
     /// A V4.1-shaped constant set (two sites, 4-grams, eight heads, a
     /// 1,000-token map) as a header would carry it.
-    fn v41_fixture() -> Inventory {
-        let k = |s: &str| format!("deepseek41.engram.{s}");
-        let u64s = |v: Vec<u64>| Value::Array(v.into_iter().map(Value::U64).collect());
-        let i32s = |v: Vec<i32>| Value::Array(v.into_iter().map(Value::I32).collect());
+    /// A toy V4.1 Engram's constants: two sites of 24 buckets, 4 n-gram slots, 1000 tokens.
+    struct V41Constants {
+        mult: Vec<u64>,
+        primes: Vec<u64>,
+        offsets: Vec<u64>,
+        token_map: Vec<i32>,
+    }
+
+    fn v41_constants() -> V41Constants {
         let mult = (0..8u64)
             .map(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(2 * i + 1) | 1)
             .collect();
@@ -773,20 +829,95 @@ mod tests {
                 at += p;
             }
         }
+        V41Constants {
+            mult,
+            primes,
+            offsets,
+            token_map: (0..1000).map(|t| (t * 7919 + 13) % 600).collect(),
+        }
+    }
+
+    /// The `Q3_K_M` set's spelling: the constants as `deepseek41.engram.*` arrays.
+    fn v41_fixture() -> Inventory {
+        let k = |s: &str| format!("deepseek41.engram.{s}");
+        let u64s = |v: Vec<u64>| Value::Array(v.into_iter().map(Value::U64).collect());
+        let i32s = |v: Vec<i32>| Value::Array(v.into_iter().map(Value::I32).collect());
+        let c = v41_constants();
         inventory(vec![
             (k("layer_ids"), i32s(vec![1, 14])),
             (k("head_count"), Value::U32(8)),
             (k("max_ngram_size"), Value::U32(4)),
             (k("key_length"), Value::U32(256)),
             (k("pad_id"), Value::U32(600)),
-            (k("multipliers"), u64s(mult)),
-            (k("primes"), u64s(primes)),
-            (k("offsets"), u64s(offsets)),
-            (
-                k("token_map"),
-                i32s((0..1000).map(|t| (t * 7919 + 13) % 600).collect()),
-            ),
+            (k("multipliers"), u64s(c.mult)),
+            (k("primes"), u64s(c.primes)),
+            (k("offsets"), u64s(c.offsets)),
+            (k("token_map"), i32s(c.token_map)),
         ])
+    }
+
+    /// ISTA-DASLab's spelling of [`v41_fixture`]: the scalars under their own
+    /// keys, the four constants as tensors of a file (one row a site) that the
+    /// inventory reads back. `dims` overrides the primes tensor's.
+    fn ista_fixture(name: &str, primes_dims: Option<Vec<u64>>) -> (Inventory, Scratch) {
+        use gguf::write::{Layout, TensorDecl, Writer};
+        let c = v41_constants();
+        let le = |v: &[u64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let tensor = |name: &str, ty: u32, dims: Vec<u64>, bytes: Vec<u8>| {
+            let decl = TensorDecl {
+                name: name.to_string(),
+                dims,
+                type_id: ty,
+                nbytes: bytes.len() as u64,
+            };
+            (decl, bytes)
+        };
+        let k = |s: &str| format!("deepseek41.{s}");
+        let kvs = vec![
+            (
+                "general.architecture".to_string(),
+                Value::String("deepseek41".to_string()),
+            ),
+            (
+                k("engram.layer_ids"),
+                Value::Array(vec![Value::I32(1), Value::I32(14)]),
+            ),
+            (k("engram_n_heads"), Value::U32(8)),
+            (k("engram_max_ngram_size"), Value::U32(4)),
+            (k("engram_head_dim"), Value::U32(256)),
+            (k("engram_pad_token_id"), Value::U32(600)),
+        ];
+        let map: Vec<u8> = c.token_map.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let tensors = [
+            tensor("engram_token_map.weight", 26, vec![1000], map),
+            tensor(
+                "engram_primes.weight",
+                27,
+                primes_dims.unwrap_or(vec![24, 2]),
+                le(&c.primes),
+            ),
+            tensor("engram_offsets.weight", 27, vec![24, 2], le(&c.offsets)),
+            tensor("engram_multipliers.weight", 27, vec![4, 2], le(&c.mult)),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("engram-ista-{}-{name}.gguf", std::process::id()));
+        let layout = Layout::new(&kvs, tensors.iter().map(|(t, _)| t.clone()).collect()).unwrap();
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut w = Writer::new(file, layout).unwrap();
+        for (t, bytes) in &tensors {
+            w.tensor(&t.name, bytes).unwrap();
+        }
+        w.finish().unwrap();
+        (gguf::inventory_of(&path).unwrap(), Scratch(path))
+    }
+
+    /// A file the test removes when it ends; the inventory reads the tensors' bytes from it.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     fn inventory(meta: Vec<(String, Value)>) -> Inventory {
@@ -798,6 +929,7 @@ mod tests {
             data_base: 0,
             alignment: 32,
             file_len: 0,
+            path: None,
         }
     }
 
@@ -836,7 +968,50 @@ mod tests {
 
     #[test]
     fn v41_rows_are_the_pinned_rows() {
-        let hash = Hash::from_gguf(&v41_fixture()).unwrap();
+        pinned_rows(&Hash::from_gguf(&v41_fixture()).unwrap());
+    }
+
+    /// The tensors an ISTA-DASLab file stores the constants in give the same hash as the arrays.
+    #[test]
+    fn v41_rows_are_the_same_from_ista_tensors() {
+        let (inv, _file) = ista_fixture("rows", None);
+        pinned_rows(&Hash::from_gguf(&inv).unwrap());
+    }
+
+    /// A constants tensor with its axes swapped is another layout than a row a site: refused by name.
+    #[test]
+    fn ista_tensors_with_swapped_axes_are_refused() {
+        let (inv, _file) = ista_fixture("swapped", Some(vec![2, 24]));
+        match Hash::from_gguf(&inv) {
+            Err(EngramError::Fact(gguf::v41_facts::FactError::Bad { key, .. })) => {
+                assert_eq!(key, "engram_primes.weight");
+            }
+            other => panic!("want the primes tensor refused, got {:?}", other.err()),
+        }
+    }
+
+    /// A key and a tensor that state one constant two ways are refused, naming both.
+    #[test]
+    fn a_constant_stated_as_a_key_and_a_tensor_must_agree() {
+        let (mut inv, _file) = ista_fixture("both", None);
+        let mut primes = v41_constants().primes;
+        primes[3] += 2;
+        let arr = Value::Array(primes.into_iter().map(Value::U64).collect());
+        inv.meta.push(("deepseek41.engram.primes".to_string(), arr));
+        match Hash::from_gguf(&inv) {
+            Err(EngramError::Fact(gguf::v41_facts::FactError::Conflict {
+                first, second, ..
+            })) => {
+                assert_eq!(
+                    (first.as_str(), second.as_str()),
+                    ("deepseek41.engram.primes", "engram_primes.weight")
+                );
+            }
+            other => panic!("want a conflict, got {:?}", other.err()),
+        }
+    }
+
+    fn pinned_rows(hash: &Hash) {
         let tokens = [5u32, 999, 0, 17, 256, 42];
         let mut fold = 0xcbf2_9ce4_8422_2325u64;
         let mut pinned = V41_ROWS.iter();

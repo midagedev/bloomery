@@ -22,6 +22,7 @@
 
 use gguf::Split;
 use gguf::quant::GgmlType;
+use gguf::v41_facts::{self, Fact, FactError};
 
 use super::names;
 use crate::ModelError;
@@ -30,8 +31,39 @@ use crate::arch::{
 };
 use crate::placement::PlacementError;
 
-/// ik's `LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS` (llama-hparams.h:18).
-const IK_SQRT_SOFTPLUS: u64 = 4;
+use v41_facts::IK_SQRT_SOFTPLUS;
+
+/// A header fact the file states wrongly, twice, or not at all, as the error that names its key.
+fn fact_error(e: FactError) -> PlacementError {
+    PlacementError::Metadata {
+        key: e.key().to_string(),
+        detail: e.detail(),
+    }
+}
+
+/// The architecture string the facts are keyed under (`deepseek41` or `deepseek4`).
+fn arch(split: &Split) -> &str {
+    split.architecture().unwrap_or_default()
+}
+
+/// The count `fact` states, as the keyed metadata error.
+fn fact_count(split: &Split, fact: &Fact) -> Result<usize, PlacementError> {
+    let v = v41_facts::count(split.keys(), arch(split), fact).map_err(fact_error)?;
+    usize::try_from(v).map_err(|_| {
+        fact_error(FactError::Bad {
+            key: format!("{}.{}", arch(split), fact.name),
+            detail: format!("{v} does not fit usize"),
+        })
+    })
+}
+
+/// [`fact_count`], `None` when the file does not state the fact.
+fn fact_count_opt(split: &Split, fact: &Fact) -> Result<Option<usize>, PlacementError> {
+    match v41_facts::carries(split.keys(), arch(split), fact) {
+        true => fact_count(split, fact).map(Some),
+        false => Ok(None),
+    }
+}
 
 /// The V4.1 reference's two-level candidate mask (`select_candidate_blocks`,
 /// model.py:583-610), which the HF `config.json` carries (:125-127): every
@@ -47,11 +79,11 @@ pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
 pub const CANDIDATE_BLOCK_SIZE: usize = 8;
 
 /// `attention.candidate_source_layer_id`, ik's `LLM_KV_CANDIDATE_SOURCE_LAYER`.
-const CANDIDATE_SOURCE_KEY: &str = "attention.candidate_source_layer_id";
+const CANDIDATE_SOURCE_KEY: &str = v41_facts::CANDIDATE_SOURCE.name;
 /// `attention.candidate_block_size`, ik's `LLM_KV_CANDIDATE_BLOCK_SIZE`.
-const CANDIDATE_BLOCK_KEY: &str = "attention.candidate_block_size";
+const CANDIDATE_BLOCK_KEY: &str = v41_facts::CANDIDATE_BLOCK.name;
 /// `attention.candidate_topk_blocks`, ik's `LLM_KV_CANDIDATE_TOPK_BLOCKS`.
-const CANDIDATE_TOPK_KEY: &str = "attention.candidate_topk_blocks";
+const CANDIDATE_TOPK_KEY: &str = v41_facts::CANDIDATE_TOPK.name;
 
 /// Which model of this module a file holds, by its `general.architecture`
 /// ([`crate::arch::deepseek41_model`] reads it).
@@ -302,20 +334,16 @@ impl CandidateMask {
         layers: &[LayerKind],
         top_k: usize,
     ) -> Result<CandidateMask, PlacementError> {
-        let key_or = |suffix: &str, default: usize| -> Result<usize, PlacementError> {
-            if split.value(&split.arch_key(suffix)).is_some() {
-                meta_usize(split, suffix)
-            } else {
-                Ok(default)
-            }
+        let key_or = |fact: &Fact, default: usize| -> Result<usize, PlacementError> {
+            Ok(fact_count_opt(split, fact)?.unwrap_or(default))
         };
         let mask = CandidateMask {
-            source_layer: key_or(CANDIDATE_SOURCE_KEY, CANDIDATE_SOURCE_LAYER)?,
-            block_size: key_or(CANDIDATE_BLOCK_KEY, CANDIDATE_BLOCK_SIZE)?,
-            topk_blocks: key_or(CANDIDATE_TOPK_KEY, CANDIDATE_TOPK_BLOCKS)?,
+            source_layer: key_or(&v41_facts::CANDIDATE_SOURCE, CANDIDATE_SOURCE_LAYER)?,
+            block_size: key_or(&v41_facts::CANDIDATE_BLOCK, CANDIDATE_BLOCK_SIZE)?,
+            topk_blocks: key_or(&v41_facts::CANDIDATE_TOPK, CANDIDATE_TOPK_BLOCKS)?,
         };
         let indexes = |l: usize| layers.get(l).is_some_and(|k| k.indexer);
-        let named = split.value(&split.arch_key(CANDIDATE_SOURCE_KEY)).is_some();
+        let named = v41_facts::carries(split.keys(), arch(split), &v41_facts::CANDIDATE_SOURCE);
         let source = named.then_some((layers.len(), &indexes as &dyn Fn(usize) -> bool));
         CandidateMask::checked(mask, source, top_k)
             .map_err(|(suffix, detail)| metadata(split, suffix, detail))
@@ -792,7 +820,7 @@ impl Experts {
         dense_lead: usize,
         hash_layers: usize,
     ) -> Result<Experts, PlacementError> {
-        let gating = meta_u64(split, "expert_gating_func")?;
+        let gating = v41_facts::gating_func(split.keys(), arch(split)).map_err(fact_error)?;
         if gating != IK_SQRT_SOFTPLUS {
             return Err(metadata(
                 split,
@@ -818,12 +846,13 @@ impl Engram {
     /// The keys ik's loader requires of a V4.1 file (llama-hparams.cpp:2075-2096),
     /// without the hash constants.
     fn read(split: &Split, n_layer: usize) -> Result<Engram, PlacementError> {
-        let key = "engram.layer_ids";
+        let key = v41_facts::ENGRAM_LAYER_IDS.name;
         let mut layer_ids = Vec::new();
-        for (i, v) in meta_arr(split, key)?.iter().enumerate() {
-            let layer = v
-                .as_unsigned()
-                .and_then(|l| usize::try_from(l).ok())
+        let listed = v41_facts::counts(split.keys(), arch(split), &v41_facts::ENGRAM_LAYER_IDS)
+            .map_err(fact_error)?;
+        for (i, &v) in listed.iter().enumerate() {
+            let layer = usize::try_from(v)
+                .ok()
                 .filter(|&l| l < n_layer)
                 .ok_or_else(|| {
                     metadata(
@@ -840,15 +869,15 @@ impl Engram {
         if layer_ids.is_empty() {
             return Err(metadata(split, key, "is empty"));
         }
-        let n_head = meta_usize(split, "engram.head_count")?;
+        let n_head = fact_count(split, &v41_facts::ENGRAM_HEAD_COUNT)?;
         if n_head == 0 {
-            return Err(metadata(split, "engram.head_count", "is 0"));
+            return Err(metadata(split, v41_facts::ENGRAM_HEAD_COUNT.name, "is 0"));
         }
-        let max_ngram = meta_usize(split, "engram.max_ngram_size")?;
+        let max_ngram = fact_count(split, &v41_facts::ENGRAM_MAX_NGRAM)?;
         if max_ngram < 2 {
             return Err(metadata(
                 split,
-                "engram.max_ngram_size",
+                v41_facts::ENGRAM_MAX_NGRAM.name,
                 format!("is {max_ngram}; the hash needs a 2-gram"),
             ));
         }
@@ -856,7 +885,7 @@ impl Engram {
             layer_ids,
             n_head,
             max_ngram,
-            key_length: meta_usize(split, "engram.key_length")?,
+            key_length: fact_count(split, &v41_facts::ENGRAM_KEY_LENGTH)?,
         })
     }
 }

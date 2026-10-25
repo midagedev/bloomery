@@ -2,12 +2,15 @@
 //! names first, then the per-layer rules in order, the first match winning —
 //! the rule list of `docs/research/v41-placement/derive.py` `role()`, after
 //! the never-loaded names ([`Role::Unused`]: a multi-token-prediction head's
-//! `nextn.*` and `*.mtp.*`). A name no rule matches fails the file with every
+//! `nextn.*` and `*.mtp.*`) and the Engram hash constants a publisher stores
+//! as tensors ([`Role::EngramHash`]: read once at the header, never loaded).
+//! A name no rule matches fails the file with every
 //! such name listed; there is no catch-all role. V4.1 has no dense FFN, so
 //! no rule gives [`Role::DenseFfn`]: a dense `ffn_{gate,up,down}` here is a
 //! file this classifier refuses.
 
 use gguf::Split;
+use gguf::v41_facts;
 
 use super::hparams::Hparams;
 use super::names;
@@ -62,6 +65,9 @@ const LAYER_RULES: &[(Pattern, Role)] = &[
 fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
     if name.starts_with("mtp.") || (!name.starts_with("blk.") && name.contains(".mtp.")) {
         return Some((Role::Unused, None));
+    }
+    if v41_facts::is_hash_tensor(name) {
+        return Some((Role::EngramHash, None));
     }
     if name.starts_with("token_embd") {
         return Some((Role::TokenEmbedding, None));
@@ -141,6 +147,9 @@ mod tests {
             ("model.mtp.norm.weight", None),
         ] {
             assert_eq!(role(name, 43), Some((Role::Unused, layer)), "{name}");
+        }
+        for name in gguf::v41_facts::HASH_TENSORS {
+            assert_eq!(role(name, 43), Some((Role::EngramHash, None)), "{name}");
         }
         assert_eq!(
             role("blk.0.exp_probs_b.bias", 43),

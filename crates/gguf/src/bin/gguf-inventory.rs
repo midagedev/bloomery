@@ -743,6 +743,7 @@ mod tests {
                 data_base: 0,
                 alignment: 32,
                 file_len: 0,
+                path: None,
             },
         };
         assert_eq!(known_bytes(&[shard(1, "a")]), Ok(1 << 63));

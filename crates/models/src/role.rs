@@ -26,6 +26,10 @@ pub enum Role {
     EngramGain,
     /// An engram table: on NVMe, a few rows gathered per token.
     EngramTable,
+    /// The engram's hash constants a publisher stores as tensors
+    /// (`engram_{token_map,primes,offsets,multipliers}`): read once from the
+    /// header when the hash is built, never loaded.
+    EngramHash,
     /// A hash router's token table (`ffn_gate_tid2eid`): on the host, the one
     /// row of expert ids a token's id selects gathered per token.
     HashTable,
@@ -57,6 +61,7 @@ impl fmt::Display for Role {
             Role::EngramDense => "engram_dense",
             Role::EngramGain => "engram_gain",
             Role::EngramTable => "engram_table",
+            Role::EngramHash => "engram_hash",
             Role::HashTable => "hash_table",
             Role::RoutedExperts => "routed",
             Role::TokenEmbedding => "token_embd",

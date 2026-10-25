@@ -42,6 +42,7 @@ pub mod iq_tables;
 pub mod qtype;
 pub mod quant;
 pub mod v41;
+pub mod v41_facts;
 pub mod write;
 
 use qtype::OWN_ROWS;
@@ -209,6 +210,12 @@ pub enum LoadError {
     /// A [`Split::located`] argument that does not describe a split.
     #[error("located split: {detail}")]
     Located { detail: String },
+    /// The Engram companion file of a V4.1 set ([`v41_facts::attach_companion`]).
+    #[error("engram companion {path}: {detail}")]
+    Companion { path: String, detail: String },
+    /// A V4.1 header fact the file states wrongly or twice ([`v41_facts`]).
+    #[error("{0}")]
+    Fact(#[from] v41_facts::FactError),
 }
 
 /// A parsed, mmap-backed GGUF file.
@@ -719,9 +726,19 @@ impl Place {
 
 impl Split {
     /// Open the model whose first shard is `first`. A file without
-    /// `split.count` is a one-shard model.
+    /// `split.count` is a one-shard model. A V4.1 set whose Engram tables are
+    /// in a file of their own gets that companion as a further shard
+    /// ([`v41_facts::attach_companion`]): its tensors are the split's, and
+    /// `split.tensors.count` still counts the model shards' alone.
     pub fn open(first: impl AsRef<Path>) -> Result<Split, LoadError> {
-        let first = first.as_ref().to_path_buf();
+        let mut split = Split::open_model(first.as_ref())?;
+        v41_facts::attach_companion(&mut split)?;
+        Ok(split)
+    }
+
+    /// The model shards `split.count` names, checked against each other.
+    fn open_model(first: &Path) -> Result<Split, LoadError> {
+        let first = first.to_path_buf();
         let head = open_shard(&first)?;
         let Some(count) = head.value(SPLIT_COUNT) else {
             return Split::assemble(vec![head], vec![first], None);
@@ -916,32 +933,7 @@ impl Split {
         let mut places = placed.unwrap_or_default();
         let given = !places.is_empty();
         for (s, g) in shards.iter().enumerate() {
-            let in_file = !matches!(g.map, Backing::Header(_));
-            for (i, t) in g.iter_tensors().enumerate() {
-                if let Some(&(first, _)) = by_name.get(&t.name) {
-                    return Err(LoadError::DuplicateTensor {
-                        name: t.name.clone(),
-                        first: paths[first].display().to_string(),
-                        second: paths[s].display().to_string(),
-                    });
-                }
-                by_name.insert(t.name.clone(), (s, i));
-                if !given {
-                    // `open` checked the run inside its file.
-                    let start = g.data_base() + t.offset;
-                    places.insert(
-                        t.name.clone(),
-                        if in_file {
-                            Place::File {
-                                shard: s,
-                                range: start..start + t.nbytes,
-                            }
-                        } else {
-                            Place::Made
-                        },
-                    );
-                }
-            }
+            index_shard(&mut by_name, &mut places, &paths, s, g, !given)?;
         }
         Ok(Split {
             shards,
@@ -949,6 +941,24 @@ impl Split {
             by_name,
             places,
         })
+    }
+
+    /// Add `shard`, the file at `path`, after the shards the split has: its tensors are the
+    /// split's, and a name the split already holds is refused. The shard is no part of the
+    /// model's `split.count` set.
+    pub(crate) fn attach_shard(&mut self, shard: Gguf, path: PathBuf) -> Result<(), LoadError> {
+        let s = self.shards.len();
+        self.paths.push(path);
+        index_shard(
+            &mut self.by_name,
+            &mut self.places,
+            &self.paths,
+            s,
+            &shard,
+            true,
+        )?;
+        self.shards.push(shard);
+        Ok(())
     }
 
     /// Number of shards (1 for a single file).
@@ -1095,6 +1105,46 @@ impl Split {
     }
 }
 
+/// Index shard `s` (`g`, whose path is `paths[s]`) into `by_name`, refusing a tensor name the
+/// index already holds; with `keep_runs`, record each tensor's run of its file in `places`
+/// ([`Place::File`], or [`Place::Made`] for a header alone).
+fn index_shard(
+    by_name: &mut HashMap<String, (usize, usize)>,
+    places: &mut HashMap<String, Place>,
+    paths: &[PathBuf],
+    s: usize,
+    g: &Gguf,
+    keep_runs: bool,
+) -> Result<(), LoadError> {
+    let in_file = !matches!(g.map, Backing::Header(_));
+    for (i, t) in g.iter_tensors().enumerate() {
+        if let Some(&(first, _)) = by_name.get(&t.name) {
+            return Err(LoadError::DuplicateTensor {
+                name: t.name.clone(),
+                first: paths[first].display().to_string(),
+                second: paths[s].display().to_string(),
+            });
+        }
+        by_name.insert(t.name.clone(), (s, i));
+        if keep_runs {
+            // `open` checked the run inside its file.
+            let start = g.data_base() + t.offset;
+            places.insert(
+                t.name.clone(),
+                if in_file {
+                    Place::File {
+                        shard: s,
+                        range: start..start + t.nbytes,
+                    }
+                } else {
+                    Place::Made
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `-%05d-of-%05d.gguf` for shard `i` of `count`, the part `llama_split_path`
 /// appends to the prefix (numbered from 1).
 fn shard_suffix(i: u64, count: u64) -> String {
@@ -1167,6 +1217,9 @@ pub struct Inventory {
     pub data_base: u64,
     pub alignment: u64,
     pub file_len: u64,
+    /// The file the header was read from, where a tensor's bytes are read
+    /// ([`v41_facts::Header::int_tensor`]); `None` for a header built in memory.
+    pub path: Option<PathBuf>,
 }
 
 impl Inventory {
@@ -1181,7 +1234,8 @@ impl Inventory {
 /// touched only as far as the tensor-info section reaches, so a multi-
 /// hundred-GiB split shards in seconds without reading tensor bytes.
 pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
-    let file = File::open(path)?;
+    let path = path.as_ref().to_path_buf();
+    let file = File::open(&path)?;
     let len = file.metadata()?.len();
     // SAFETY: read-only mapping, nothing maps it writable — the same
     // contract `Gguf::open_backed` accepts.
@@ -1195,6 +1249,7 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
         data_base: h.data_base,
         alignment: h.alignment,
         file_len: len,
+        path: Some(path),
     })
 }
 

@@ -1884,6 +1884,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The V4.1 file's directory, exported beside `BLOOMERY_V41_MODEL`.",
     ),
     path(
+        "BLOOMERY_V41_ENGRAM",
+        None,
+        "The V4.1 Engram companion file: a set that stores its Engram tables in a GGUF of their own \
+         (`deepseek41.engram.file` names it) opens that file as a further shard of the model. Unset, \
+         the open looks for the named file beside the first shard, then in the sibling directory of \
+         the file's stem; set, this path is taken instead, and a model that needs no companion refuses it.",
+    ),
+    path(
         "BLOOMERY_V41_MODEL",
         Some("box.sh"),
         "The V4.1 first shard: `tools/box.sh` exports the deepseek41 profile's \

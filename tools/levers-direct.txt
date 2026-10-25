@@ -21,6 +21,7 @@ crates/qdot/src/lib.rs	BLOOMERY_QDOT_AVX512	isa-owner
 # Paths and profile facts (audit TL-6).
 crates/model-hf/src/bin/prepare.rs	BLOOMERY_QWEN38_HF	test harness checkpoint folder, not a serving lever
 crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL,BLOOMERY_REF_MODEL,BLOOMERY_REF_MODEL_PROFILE,BLOOMERY_FIXTURE_MODEL	gatestoml
+crates/gguf/src/v41_facts.rs	BLOOMERY_V41_ENGRAM	stays: the companion file's path, read where the model split opens (Split::open has no argument to carry it)
 crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
 crates/refset/src/fixture.rs	BLOOMERY_FIXTURE_ROOT,BLOOMERY_FIXTURE_VARIANT	gatestoml

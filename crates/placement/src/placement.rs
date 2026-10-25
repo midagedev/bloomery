@@ -1898,7 +1898,9 @@ fn place_whole(
                 gathered(t)?,
             )
         }
-        Role::Unread | Role::Unused => (in_place(Device::Unused, Format::Unused, None, 0), 0),
+        Role::Unread | Role::Unused | Role::EngramHash => {
+            (in_place(Device::Unused, Format::Unused, None, 0), 0)
+        }
         Role::RoutedExperts => {
             return Err(PlacementError::tensor(
                 t,

@@ -503,7 +503,7 @@ fn class_of(role: Role) -> &'static str {
         Role::Attention => "attention",
         Role::Router | Role::HashTable | Role::SharedExpert | Role::RoutedExperts => "experts",
         Role::FfnNorm | Role::DenseFfn => "ffn",
-        Role::EngramDense | Role::EngramGain | Role::EngramTable => "ngram",
+        Role::EngramDense | Role::EngramGain | Role::EngramTable | Role::EngramHash => "ngram",
         Role::TokenEmbedding => "embeddings",
         Role::Head => "output",
         Role::HyperConnection | Role::Unread | Role::Unused => "other",
@@ -529,7 +529,11 @@ pub fn model_props(split: &Split, model: &ModelTensors) -> ModelProps {
     for t in &model.tensors {
         let gathered_or_unread = matches!(
             t.role,
-            Role::TokenEmbedding | Role::EngramTable | Role::Unread | Role::Unused
+            Role::TokenEmbedding
+                | Role::EngramTable
+                | Role::EngramHash
+                | Role::Unread
+                | Role::Unused
         );
         if let (false, Some(name)) = (gathered_or_unread, t.ty.name()) {
             *by_type.entry(name).or_default() += t.file_bytes;
