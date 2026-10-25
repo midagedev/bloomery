@@ -204,7 +204,7 @@ BODY35_HEAD_TENSOR = "output.weight"
 # the anchor. A type there is printed and never judged.
 TYPE_PLACES = {
     "ds41": (("crates/gpu-deepseek41/src/dense.rs", "const TYS: [SiteTy;"),
-             ("crates/gpu-deepseek41/src/chain/glue.rs", "let embd_ok = matches!(embd.ty()"),
+             ("crates/gpu-deepseek41/src/chain/glue.rs", "pub fn of(ty: GgmlType, n_embd: usize) -> Option<EmbdRows>"),
              ("crates/gguf/src/card.rs", "pub fn of(ty: GgmlType) -> Option<CardFormat>"),
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "glm": (("crates/placement/src/accepts.rs", "pub const fn planes_leg_gate_up(ty: GgmlType)"),
