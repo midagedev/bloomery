@@ -1,0 +1,26 @@
+# Round mac-q30b (card for the dump sitting): ik's CPU node dumps on the Qwen3-30B-A3B-Instruct-2507 fixture
+# (/models/fixtures/qwen3moe, 1,946,263,808 B in one file: the Q4_K_M file at source layers [6, 8, 9, 47], the real 151,936-row
+# globals), so the refset family fx-ik-qwen3moe has its three sets: the 5-token batch, step4-every-node and d1k. Each is one
+# `BLOOMERY_TIER=fixture just dump-ref-fixture qwen3moe [step4-every-node | d1k]` under this card, one lease each, the file read from
+# the device once (it was written minutes before and sits in the page cache). Nothing is timed; the dumper is main's shared bin/.
+# Minutes [derived], from the measured walls of the same dumper on a four-layer fixture (fxoracle-dump.card: Qwen3.8 batch 4.4 s,
+# step4-every-node and d1k 0.1 min each, with 3-15 s a lease take) and this file's own terms:
+#   fixed     lease, witnesses, metadata, context: 3-15 s a lease take (glmref-dump.card), 3 takes: 0.15-0.75 min
+#   load      1.94 GB from the page cache (generate wrote it minutes before; cold from the NVMe it would be 1.94 GB / ~3 GB/s = 0.7 s):
+#             ik maps it and repacks nothing for Q4_K and Q6_K on this CPU: 1-3 s a dump
+#   batch     5 ids x 4 layers x ~57 M MACs (attn 18.9 M, top-8 of 128 experts at 2048x768 x3 = 37.7 M, router 0.26 M) + the head
+#             0.31 G MACs a row = ~7 GMAC = 14 GFLOP at 0.5-1.0 TFLOP/s: 0.03 s; its node writes dominate: 4.4 s measured on the
+#             Qwen3.8 four-layer fixture, the same graph shape
+#   step4     a 4-id quiet prefill and one decode step under the dumped schedule: the same terms, ~0.1 min
+#   d1k       a quiet prefill of 1,024 ids = 1,024 x 4 x 57 M = 0.23 TMAC = 0.47 TFLOP at 0.5-1.0 TFLOP/s: 0.5-1 s, then one decode
+#             step at position 1,024 whose attention reads 1,025 positions of 4 layers: ~0.1-0.3 min with the node writes
+#   writes    three sets of node files, 60-135 MB each by the layer ratio of the Qwen3.6 fixture's sets (106-135 MB for four layers
+#             and a delta tap per layer; this model has none): <= 0.4 GB at the NVMe's write rate, under 1 s
+#   total     fixed 0.15-0.75 + three dumps 0.1-0.3 min = 0.5-1.7 min; the lease wait is not in it
+# What the run guarantees: CUDA hidden, the CPU lease held through each dump, the staging set installed only when its manifest
+# carries its `# complete` trailer, the fixture's `# fixture` line in each set's header.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads (CUDA hidden, no card); beside a timed run or a gate batch it would take their cores and
+  memory bandwidth, and the profile takes the lease for every dump; why now: the Qwen3-30B fixture family (round mac-q30b) is the
+  Metal port's proof path for the second model, whose e2e gate needs these sets
+minutes: 1..3
