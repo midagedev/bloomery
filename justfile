@@ -1358,7 +1358,7 @@ gate-glm5next-hf-map:
 # qwen3moe 메타 게이트: 하이퍼파라미터 거부 단위 시험(합성 헤더) 뒤, arch/qwen3moe가 파일에서 읽은 값을 ik 그래프
 # (ref_qwen3moe 매니페스트의 노드 형상·op)와 헤더에 대조하고, 텐서 전부가 역할과 허용 타입을 갖는지 본다. 헤더만, 초 단위.
 gate-qwen3moe-meta:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen3moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen3moe_meta -- --ignored --nocapture'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-qwen3moe-meta && bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen3moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen3moe_meta -- --ignored --nocapture'
 
 # Muse Spark Open's header gate: the family's unit tests, then the reader on the first shard of the UD-IQ2_XXS file
 # (headers only, seconds; the muse-spark profile names it, BLOOMERY_REF_MODEL moves it). No fixture-tier conversion: the
@@ -1380,10 +1380,10 @@ gate-gpu-rope-writers:
 # `down`은 다운 `_sel`(Q6_K, Q4_K)을, `head`는 argmax를 접은 Q6_K 헤드를, `flash`는 GQA 플래시 디코드 두 패스(스칼라·텐서
 # 코어)를 잰다. 레시피마다 바이너리 하나.
 gate-gpu-qwen3moe-rope:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-rope && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope'
 
 gate-gpu-qwen3moe-router:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-router && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router'
 
 # Qwen3.6-35B-A3B MoE 블록: 257행 게이트 라우터(전문가 256 + 공유 전문가 게이트 행), 조인된 257-전문가 스택, K=512 down `_sel`,
 # 아홉 슬롯 FFN과 ubatch 경로를 호스트 규칙과 ik 밴드에 맞춘다. ARGS는 `--case <이름>[,…]`.
@@ -1595,20 +1595,20 @@ gate-gpu-qwen4exp-mtp:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
 
 gate-gpu-qwen3moe-down:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-down && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
 
 # qwen3moe 헤드: argmax를 접은 Q6_K 투영을 `q6k_gemv` + `argmax_fault`에 대고 — logits 비트 동일, 토큰과 폴트 워드 동일,
 # 동점, NaN 행, NaN 활성, 그래프.
 gate-gpu-qwen3moe-head:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_head && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_head'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-head && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_head && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_head'
 
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
 # (리드 전용, `bench-gpu-kernels`). relu² 접힌 32값 블록 양자화기(`g32_relu_sqr`)는 relu_sqr 다음 quantize_gemm32와 비트 동일.
 gate-gpu-gemm *ARGS:
-    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete kquant_contract_keeps_a_subnormal_step_exact nan_bits_equal_takes_the_length_and_any_nan'
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemm && bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete kquant_contract_keeps_a_subnormal_step_exact nan_bits_equal_takes_the_length_and_any_nan'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
 # 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.
 # 모델 없이 Qwen3.6-35B-A3B 형상의 합성 입력으로 돌고, fault 사이트, 한 토큰의 그래프, 깊이 4,096의 f64 drift 보고를 함께 찍는다.
@@ -1713,7 +1713,7 @@ gate-gpu-gemma-embedding-head256:
 # greedy tokens with embedding calls in flight, and named refusals; the runner holds one card.
 [group('pool')]
 gate-gpu-gemma-embedding2-serve *ARGS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh -p bloomery-gpu-gates --features hf --test sentence_prompts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding2-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D" {{ARGS}} && if [ -z "{{ARGS}}" ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D/audio" --audio; fi'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemma-embedding2-serve && bash tools/gate.sh -p bloomery-gpu-gates --features hf --test sentence_prompts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding2-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D" {{ARGS}} && if [ -z "{{ARGS}}" ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D/audio" --audio; fi'
 
 # EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file the sets are dumped from
 # (refset's gemma_embedding2::MODEL, held to its sha256; the sets' `# model` line names the same path): every
@@ -1725,7 +1725,7 @@ gate-gpu-gemma-embedding-e2e:
     BLOOMERY_MODEL=gemma-embedding ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e --v1'
 
 gate-gpu-gemma-embedding-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemma-embedding-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
 
 gate-gpu-gemma-embedding2-e2e *ARGS:
     ./tools/box.sh 'bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
@@ -1781,18 +1781,18 @@ gate-gpu-muse-router:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_muse_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_muse_router'
 
 gate-gpu-qwen3moe-flash:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-flash && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
 
 # qwen3moe 체인 커널 셋(3090): Q4_K 임베딩 행(dequant_row·ik inp_embd와 비트 동일), expert gate·up·SwiGLU `_sel`
 # (ffn_moe_gate_par 대조), combine(routed_out 대조).
 gate-gpu-qwen3moe-experts:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-experts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
 
 # qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
 # 파일), graph = eager. 텐서 코어 플래시(엔진 경로)로 한 번 돈다. 스칼라 패스는 (u)의 자로 eager 안에서만 돈다.
 [group('pool')]
 gate-gpu-qwen3moe-e2e:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
 # qwen3moe routed types under the --place-unset defaults: for every type the host's routed kernels run, a crafted
 # two-layer header planned by the CLI's and the serve seat's defaults. A refusal, or card experts of a type the card
@@ -1884,9 +1884,13 @@ gate-r8:
 # by name; the Solar-Open2-250B spec (model::arch::solar2::fixture) against the Solar file's header: the four-layer plan read
 # back by the engine's hparams (kinds, KV heads, every stem and type pair of the source), the planned budget (half the
 # experts on each card-eligible layer, none on the Q6_K-down layers), and on a small synthetic source the written fixture's
-# constants and the maps that lose a mixer or a pair refused by name; and a toy family's r8 sidecar written, checked and
+# constants and the maps that lose a mixer or a pair refused by name; the Qwen3-30B-A3B spec (model::arch::qwen3moe::fixture)
+# against the Instruct-2507 Q4_K_M file's header: the four-layer plan read back by the engine's hparams (every stem and type
+# pair of the source, the Q6_K layers kept), the written fixture (about 1.95 GB) verified against it with a flipped byte
+# refused by name, and the maps that lose a pair refused by name; and a toy family's r8 sidecar written, checked and
 # refused when absent, other or flipped.
-# Reads headers only; writes only under this tree's target/tmp (the Nemotron clause writes its one 0.93 GB file there).
+# Reads headers only; writes only under this tree's target/tmp (the Nemotron clause writes its one 0.93 GB file there, the
+# Qwen3-30B-A3B clause its one 1.95 GB file).
 gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model-hf --test fixture --bin fixture -- --include-ignored --nocapture --test-threads=1'
 
@@ -1902,7 +1906,7 @@ gate-fixture-budget:
 # The architecture registry (crates/model/src/arch/registry.rs): every architecture string is in one row and every `Arch`
 # in one row, a fixture row declares its row's architecture, the draft rules are the three rows that have one,
 # tools/arch-registry.tsv (which tools/hf-arch-check.py reads) is the registry's print, and each family's written fixture
-# (the eight GGUF ones under /models/fixtures, BLOOMERY_FIXTURE_ROOT; a cut folder is read by its own reader) reads through the registry exactly as its family's own reader
+# (the nine GGUF ones under /models/fixtures, BLOOMERY_FIXTURE_ROOT; a cut folder is read by its own reader) reads through the registry exactly as its family's own reader
 # does. Headers only, no card. Either tier: it reads the fixtures as they are.
 gate-arch-registry:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::registry --include-ignored --nocapture'
@@ -2810,7 +2814,7 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen3moe-twocard:
-    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=both ./tools/box.sh "q3=\$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen3moe bash -c '. tools/ref/ref-paths.sh && printf %s \"\$MODEL\"') && q35=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_qwen3moe_twocard \"\$q3\" \"\$q35\""
+    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=both ./tools/box.sh "bash tools/ref/real-only.sh gate-gpu-qwen3moe-twocard && q3=\$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen3moe bash -c '. tools/ref/ref-paths.sh && printf %s \"\$MODEL\"') && q35=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_qwen3moe_twocard \"\$q3\" \"\$q35\""
 
 # Qwen3.8's plan (b′) with its expert tier on a tier node (docs/contrib/dgx-spark.md 9.5 items 5 and 6): node 0, a child
 # of the gate with BLOOMERY_TIER_NODES set, and node 1, tier_server, over loopback on this machine's card, the tier's page
@@ -2880,7 +2884,7 @@ gate-gpu-qwen38-serve:
 # _decode_*): the qwen3moe file's --mmproj refusal and, on the Qwen3.6 file, the seat with its encoder.
 [group('pool')]
 gate-gpu-qwen3-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --images'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --images'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless
