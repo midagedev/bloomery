@@ -512,7 +512,8 @@ blk_fixturevariants() {
       awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
         { echo "check-recipes: $file: family $family has no fixture directory row in $dirs" >&2; return 1; }
       for r in $recipes; do
-        grep -qE "^$r:" "$jf" || { echo "check-recipes: $file: $r is no recipe of the justfile" >&2; return 1; }
+        # A recipe with parameters (`gate-gpu-ds41-step *ARGS=…:`) is a recipe too.
+        grep -qE "^$r([ :]|\$)" "$jf" || { echo "check-recipes: $file: $r is no recipe of the justfile" >&2; return 1; }
       done
     done < "$file"
     [ "$n" -gt 0 ] || { echo "check-recipes: $file holds no variant" >&2; return 1; }
@@ -619,6 +620,33 @@ blk_fixturevariants() {
   case $err in *"$two"*) ;; *) echo "check-recipes: dspark_model, two drafts: wanted $two in: $err" >&2; return 1 ;; esac
   ds '. "$1" && dspark_model' BLOOMERY_DSPARK_MODEL=/x.gguf
   [ "$ds_rc" = 0 ] && [ "$ds_out" = /x.gguf ] || { echo "check-recipes: dspark_model, caller draft: rc=$ds_rc out='$ds_out', want /x.gguf" >&2; return 1; }
+  # A deepseek41 variant: its map never retypes the draft, so a variant directory with no draft answers the fixture's one, one with
+  # an identical draft of its own answers that, and one whose draft differs from the fixture's, or a variant over a fixture with no
+  # draft, is refused by name (dspark_model, exit 66).
+  local vtag vdir
+  vtag=$(awk -F'\t' '$0 !~ /^#/ && $2 == "deepseek41" { print $1; exit }' "$tsv")
+  [ -n "$vtag" ] || { echo "check-recipes: $tsv names no deepseek41 variant: the draft rules of a variant have no case to run on" >&2; return 1; }
+  vdir=$d/fixture-variants/$vtag/v41
+  rm -f "$two"
+  mkdir -p "$vdir"
+  touch "$vdir/t-00001-of-00001.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$one" ] || { echo "check-recipes: dspark_model, a variant with no draft: rc=$ds_rc out='$ds_out', want the fixture's $one" >&2; return 1; }
+  mkdir -p "$vdir/draft"
+  cp "$one" "$vdir/draft/one.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$vdir/draft/one.gguf" ] || { echo "check-recipes: dspark_model, a variant with the fixture's draft: rc=$ds_rc out='$ds_out', want $vdir/draft/one.gguf" >&2; return 1; }
+  printf x > "$vdir/draft/one.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] && [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, a variant with another draft: rc=$ds_rc out='$ds_out', want 66 and nothing: $err" >&2; return 1; }
+  case $err in *"the variant $vtag holds the draft $vdir/draft/one.gguf, which differs from the fixture's $one"*) ;; *) echo "check-recipes: dspark_model, a variant with another draft: wanted the variant and both drafts in: $err" >&2; return 1 ;; esac
+  rm -rf "$vdir/draft" "$one"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] && [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, a variant over a fixture with no draft: rc=$ds_rc out='$ds_out', want 66 and nothing: $err" >&2; return 1; }
+  case $err in *"$vdir/draft"*"the fixture's own draft directory holds"*) ;; *) echo "check-recipes: dspark_model, a variant over a fixture with no draft: wanted both draft directories in: $err" >&2; return 1 ;; esac
+  echo "check-recipes: deepseek41 variant draft: the fixture's, an identical own, a differing own refused, none refused"
   local prof line real f_rc f_out
   prof=$(dirname "$0")/ref/models/deepseek41.sh
   line=$(sed -n '215p' "$prof")

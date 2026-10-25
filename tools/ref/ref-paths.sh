@@ -168,15 +168,32 @@ case "${BLOOMERY_TIER:-real}" in
           DSPARK_MODEL=
           DSPARK_MODEL_WHY=
           __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
-          if [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ]; then
+          # A variant's map retypes the target's tensors and never the draft, so a variant directory with no draft of its own answers
+          # the fixture's one; a draft of its own that differs from the fixture's is refused (`cmp`), by name.
+          __fixture_base=()
+          if [ -n "$FIXTURE_VARIANT" ]; then
+            __fixture_base=("${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$__fixture_dir"/draft/*.gguf)
+            if [ ! -e "${__fixture_drafts[0]}" ] && [ -e "${__fixture_base[0]}" ] && [ "${#__fixture_base[@]}" = 1 ]; then
+              __fixture_drafts=("${__fixture_base[@]}")
+            elif [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ] && [ -e "${__fixture_base[0]}" ] &&
+              [ "${#__fixture_base[@]}" = 1 ] && ! cmp -s "${__fixture_drafts[0]}" "${__fixture_base[0]}"; then
+              DSPARK_MODEL_WHY="ref-paths.sh: BLOOMERY_TIER=fixture: the variant $FIXTURE_VARIANT holds the draft ${__fixture_drafts[0]}, which differs from the fixture's ${__fixture_base[0]}; a variant's map never retypes the draft (exit 66)"
+            fi
+          fi
+          if [ -n "$DSPARK_MODEL_WHY" ]; then
+            :
+          elif [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ]; then
             DSPARK_MODEL=${__fixture_drafts[0]}
           else
             DSPARK_MODEL_WHY="ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)"
+            if [ -n "$FIXTURE_VARIANT" ]; then
+              DSPARK_MODEL_WHY="${DSPARK_MODEL_WHY%(exit 66)}and the fixture's own draft directory holds ${#__fixture_base[@]} files (${__fixture_base[*]}) (exit 66)"
+            fi
           fi
         fi
         ;;
     esac
-    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts __fixture_ext __fixture_verb __variant_family
+    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts __fixture_base __fixture_ext __fixture_verb __variant_family
     ;;
   *)
     echo "ref-paths.sh: BLOOMERY_TIER is real (unset: the same) or fixture, got '${BLOOMERY_TIER}'" >&2
