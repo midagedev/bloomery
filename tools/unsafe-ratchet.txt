@@ -603,7 +603,9 @@ gguf 7 2 0
 # the prompt GEMM of IQ2_XS, IQ2_S, IQ1_S and IQ1_M: five grid-table reads in iq.rs (`iq2xs_grid_half`, `iq2s_grid_half`,
 # `iq2s_group`, `iq1_group`, `iq1_group_half`), the three raw-block window reads of iq_sel.rs (`RawSb::sub` of the
 # three) and the four load macros of grouped.rs, each with its SAFETY line; recounted by tools/check-unsafe.sh.
-gpu 2652 334 10
+# PIN(2026-10-25): gpu 2652 -> 2653 blocks, 334 -> 335 fns, new code, not old code relaxed: the IQ4_NL Engram row
+# decode (elem.rs `iq4nl_embed_value`, an unsafe fn, and its one window read), with its SAFETY line.
+gpu 2653 335 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -626,7 +628,11 @@ gpu 2652 334 10
 # PIN(2026-10-24): gpu-deepseek41 382 -> 384 blocks, new code, not old code relaxed: the four-slot tier card sum
 # (chain/ffn/batch.rs: ds41_ffn_card_acc_4_tier's card_acc_tier_at call and its store, 2 blocks), each block with its
 # SAFETY line.
-gpu-deepseek41 384 44 0
+# PIN(2026-10-25): gpu-deepseek41 384 -> 395 blocks, new code, not old code relaxed: ISTA's dense types (the Q5_K
+# selector partials of dense.rs and experts.rs, `q5k_lane_partial`'s calls and their row stores) and the glue's Q5_K
+# token rows and IQ4_NL Engram rows (glue.rs: the value reads, the stream and input stores, the shared module), each
+# with its SAFETY line; counted by tools/check-unsafe.sh.
+gpu-deepseek41 395 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
@@ -892,7 +898,10 @@ placement 0 0 0
 # entry's tile on offset codes, its column prep (nvfp4_prep_avx2), the x4 lane sums both share (nvfp4_group_sums, an
 # `#[inline(always)]` fn) and the run walk (nvfp4_planes_tiled; nvfp4_tile_run replaces nvfp4_planes_tile), each with
 # its SAFETY line.
-qdot 255 115 0
+# PIN(2026-10-25): qdot 255 -> 261 blocks, 115 -> 120 fns, new code, not old code relaxed: the generic AVX2 dots of
+# IQ1_S, IQ1_M and IQ2_S (generic.rs: `signed_by_bits`, `iq1_codes_avx2` and the three types' `codes_avx2`, each an
+# unsafe fn with its body block), each with its SAFETY line.
+qdot 261 120 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0
