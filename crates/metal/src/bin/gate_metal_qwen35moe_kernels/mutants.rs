@@ -554,6 +554,16 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "head_last_group",
+        clause: "head_partial",
+        why: "the final reduction stops one candidate short, so the last threadgroup's winner is lost",
+        edits: &[(
+            "for (uint g = tid; g < groups; g += HEAD_THREADS) {",
+            "for (uint g = tid; g < groups - 1u; g += HEAD_THREADS) {",
+            1,
+        )],
+    },
+    Mutant {
         name: "head_ticket",
         clause: "head_ticket",
         why: "the step id is one past the selected row",

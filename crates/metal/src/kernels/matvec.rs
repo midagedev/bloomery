@@ -88,8 +88,7 @@ pub struct NormOnLoad<'w> {
     /// a kernel is backend code, and the contract's `FaultWord` does not say.
     pub fault: &'w MetalFaultWord,
     /// The layer a raise is recorded in: [`LAYER_NONE`] for a direct launch.
-    /// The caller's: when Metal implements `ChainOps`, the walk's
-    /// `LayerCtx.layer` feeds it.
+    /// The caller's: the chain walk's `LayerCtx.layer` feeds it.
     pub layer: u32,
 }
 

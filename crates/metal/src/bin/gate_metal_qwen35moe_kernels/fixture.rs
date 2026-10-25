@@ -6,6 +6,11 @@ use bloomery_metal::kernels::Quant;
 use gguf::Split;
 use gguf::quant::{GgmlType, dequant_row};
 
+/// The rows of the fixture's `output.weight`: Qwen3.6's vocabulary. The
+/// head's launch takes its row count from the file; this is the fixture's, for
+/// the clauses that read the tensor's tail.
+pub const OUTPUT_ROWS: usize = 248_320;
+
 /// The fixture file: the qwen35moe trunk the gate reads its tensors from,
 /// opened as a split — the one reader that accepts bloomery's own value
 /// types, which an MLX-format fixture's tensors are.

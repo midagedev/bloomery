@@ -32,10 +32,9 @@ use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
-    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_GROUPS, HEAD_K, HEAD_VOCAB, HeadMap,
-    KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment, VALUE_HEADS,
-    channels, f16_len, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys,
-    state_elems,
+    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_K, HeadMap, KV_HEADS, MAX_SEGMENTS,
+    PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment, VALUE_HEADS, channels, f16_len,
+    head_groups, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys, state_elems,
 };
 use crate::residency::Alloc;
 
@@ -599,10 +598,10 @@ impl Arena {
                 "a hidden width of {hidden}; the head and the router read {HEAD_K}"
             )));
         }
-        if vocab != HEAD_VOCAB {
-            return Err(refuse(format!(
-                "a vocabulary of {vocab}; the head reads {HEAD_VOCAB}"
-            )));
+        if vocab == 0 {
+            return Err(refuse(
+                "a vocabulary of 0; the head reads at least one row".to_string(),
+            ));
         }
         if plans.len() != spec.layers.len() {
             return Err(refuse(format!(
@@ -675,7 +674,7 @@ impl Arena {
             rope,
             h: zeroed(device, EXPERT_SLOTS * EXPERT_K)?,
             logits: zeroed(device, vocab)?,
-            candidates: zeroed(device, HEAD_GROUPS)?,
+            candidates: zeroed(device, head_groups(vocab))?,
             head_ticket: zeroed(device, 1)?,
             step_id: zeroed(device, RECORD_SLOTS)?,
             id_in: zeroed(device, 1)?,

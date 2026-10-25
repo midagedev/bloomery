@@ -6,8 +6,7 @@
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
 use bloomery_metal::kernels::{
-    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_K, HEAD_VOCAB, PARTIALS_PER_HEAD, Quant, ROUTED_IDS,
-    VALUE_HEADS,
+    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_K, PARTIALS_PER_HEAD, Quant, ROUTED_IDS, VALUE_HEADS,
 };
 
 use super::clauses_embed;
@@ -18,7 +17,7 @@ use super::clauses_experts::{
 use super::clauses_head;
 use super::clauses_norm::head_partials;
 use super::common::{self, LAYER};
-use super::fixture::Fixture;
+use super::fixture::{Fixture, OUTPUT_ROWS};
 use super::oracle::{self, Kind};
 use super::{Harness, HeadNormLaunch, Launch, ModeSpec, SENTINEL_BITS};
 
@@ -55,7 +54,7 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
         "output.weight",
         gguf::quant::GgmlType::MLX_A4,
         HEAD_K,
-        HEAD_VOCAB - tail_rows,
+        OUTPUT_ROWS - tail_rows,
         tail_rows,
     )?;
     let x = oracle::activations(HEAD_K, 0x1A3A, 1.0);
@@ -73,8 +72,8 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )
     .map_err(|e| {
         format!(
-            "output.weight rows {}..{HEAD_VOCAB}: {e}",
-            HEAD_VOCAB - tail_rows
+            "output.weight rows {}..{OUTPUT_ROWS}: {e}",
+            OUTPUT_ROWS - tail_rows
         )
     })?;
     parts.push(format!(
@@ -533,7 +532,7 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let gain = fix.f32s("output_norm.weight", HEAD_K)?;
     let samples = [
         ("output.weight head", 0usize, 32usize, 0x1EAD_u64),
-        ("output.weight tail", HEAD_VOCAB - 17, 17, 0x1EAE),
+        ("output.weight tail", OUTPUT_ROWS - 17, 17, 0x1EAE),
     ];
     let mut worst = 0.0f64;
     let mut notes = Vec::new();

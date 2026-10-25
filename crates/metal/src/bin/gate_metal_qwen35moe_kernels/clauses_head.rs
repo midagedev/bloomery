@@ -10,27 +10,26 @@ use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::kernels::{
-    HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HEAD_VOCAB, HeadParams, Quant,
-    ROWS_PER_SIMD_GROUP,
+    HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, Quant, ROWS_PER_SIMD_GROUP, head_groups,
 };
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
 use super::common::{self, BadArg, Edit, LAYER};
-use super::fixture::Fixture;
+use super::fixture::{Fixture, OUTPUT_ROWS};
 use super::oracle::{self, Kind};
 use super::{Harness, SENTINEL_BITS};
 
 /// The rows one threadgroup owns.
 const ROWS_PER_GROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
 
-const _: () = assert!(HEAD_VOCAB == 248_320);
 const _: () = assert!(HEAD_K == 2_048);
 const _: () = assert!(HEAD_SIMD_GROUPS == 8);
 const _: () = assert!(HEAD_THREADS == 256);
-const _: () = assert!(HEAD_GROUPS == HEAD_VOCAB / ROWS_PER_GROUP);
 const _: () = assert!(ROWS_PER_GROUP == HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP);
-const _: () = assert!(HEAD_GROUPS * ROWS_PER_GROUP == HEAD_VOCAB);
+// The fixture's head is the full grid the shipped dispatch runs.
+const _: () = assert!(head_groups(OUTPUT_ROWS) == 7_760);
+const _: () = assert!(head_groups(OUTPUT_ROWS) * ROWS_PER_GROUP == OUTPUT_ROWS);
 
 const OUTPUT: &str = "output.weight";
 const GAIN: &str = "output_norm.weight";
@@ -58,9 +57,9 @@ fn expect_head(fixture: &Fixture) -> Result<(), String> {
     let weights = file
         .find(OUTPUT)
         .ok_or_else(|| format!("the fixture has no tensor {OUTPUT}"))?;
-    if weights.ty != GgmlType::Q6_K || weights.dims != [HEAD_K as u64, HEAD_VOCAB as u64] {
+    if weights.ty != GgmlType::Q6_K || weights.dims != [HEAD_K as u64, OUTPUT_ROWS as u64] {
         return Err(format!(
-            "{OUTPUT} is {:?} {:?}, the head reads Q6_K [{HEAD_K}, {HEAD_VOCAB}]",
+            "{OUTPUT} is {:?} {:?}, the gate reads Q6_K [{HEAD_K}, {OUTPUT_ROWS}]",
             weights.ty, weights.dims
         ));
     }
@@ -149,7 +148,7 @@ pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
         eps,
     } = case;
     let (device, stream) = (h.device, h.stream);
-    let groups = rows.div_ceil(ROWS_PER_GROUP);
+    let groups = head_groups(rows);
     let weights_b = device.upload(stream, weights).map_err(why)?;
     let x_b = device.upload(stream, x).map_err(why)?;
     let gain_b = device.upload(stream, gain).map_err(why)?;
@@ -241,7 +240,7 @@ pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let gain = fixture.f32s(GAIN, HEAD_K)?;
     let samples = [
         ("output.weight head", 0usize, 32usize, 0x6EAD_u64),
-        ("output.weight tail", HEAD_VOCAB - 17, 17, 0x6EAE),
+        ("output.weight tail", OUTPUT_ROWS - 17, 17, 0x6EAE),
     ];
     let mut worst = 0.0f64;
     let mut notes = Vec::new();
@@ -310,25 +309,25 @@ pub fn head_id(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     Ok(Verdict::Noted(format!("{wide}; {tie}")))
 }
 
+/// A real output row whose logit, normed by itself at gain 1, is a wide positive
+/// margin over a zero row: the row, that logit and the margin's width.
+fn wide_row(fixture: &Fixture, eps: f32) -> Result<(&[u8], f64, f64), String> {
+    let bytes = row_bytes(HEAD_K);
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 32)?;
+    for row in pool.chunks_exact(bytes) {
+        let (y, width) = margin(row, HEAD_K, eps)?;
+        if y.is_finite() && y > 0.0 && y > width {
+            return Ok((row, y, width));
+        }
+    }
+    Err("construction: no output row is a wide positive margin over a zero row".to_string())
+}
+
 fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
     const WINNER: usize = 100;
     let bytes = row_bytes(HEAD_K);
-    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 32)?;
-    let mut chosen: Option<(usize, f64, f64)> = None;
-    for (i, row) in pool.chunks_exact(bytes).enumerate() {
-        let (y, width) = margin(row, HEAD_K, eps)?;
-        if y.is_finite() && y > 0.0 && y > width {
-            chosen = Some((i, y, width));
-            break;
-        }
-    }
-    let Some((src, y, width)) = chosen else {
-        return Err(
-            "construction: no output row is a wide positive margin over a zero row".to_string(),
-        );
-    };
-    let mut weights = vec![0u8; HEAD_VOCAB * bytes];
-    let row = &pool[src * bytes..(src + 1) * bytes];
+    let (row, y, width) = wide_row(fixture, eps)?;
+    let mut weights = vec![0u8; OUTPUT_ROWS * bytes];
     weights[WINNER * bytes..(WINNER + 1) * bytes].copy_from_slice(row);
     let x = dequant(row, HEAD_K)?;
     let gain = vec![1f32; HEAD_K];
@@ -339,7 +338,7 @@ fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, S
             weights: &weights,
             x: &x,
             gain: &gain,
-            rows: HEAD_VOCAB,
+            rows: OUTPUT_ROWS,
             k: HEAD_K,
             eps,
         },
@@ -441,6 +440,76 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
         ));
     }
     Ok(format!("tie id {low}"))
+}
+
+/// The head over a row count no threadgroup divides, as a vocabulary of 248,144
+/// is: the grid has full groups and a partial last one, and the true argmax is
+/// planted in the partial group's last row. A grid that leaves that group out,
+/// or a reduction that does not read its candidate, loses the winner; the
+/// logits of the last two groups are held to the f64 oracle.
+pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    /// The rows of the launch: 7,754 full groups and a last group of 16.
+    const ROWS: usize = 248_144;
+    /// The first row of the last group.
+    const LAST_BASE: usize = ROWS / ROWS_PER_GROUP * ROWS_PER_GROUP;
+    /// The rows the last group owns.
+    const LAST_ROWS: usize = ROWS - LAST_BASE;
+    /// The rows the oracle reads back: the last full group and the last one.
+    const CHECKED: usize = ROWS_PER_GROUP + LAST_ROWS;
+    /// The planted winner: the last row the head owns.
+    const WINNER: usize = ROWS - 1;
+    const _: () = assert!(LAST_ROWS > 0 && LAST_ROWS < ROWS_PER_GROUP);
+    h.clear_fault()?;
+    expect_head(fixture)?;
+    let eps = fixture.rms_eps()?;
+    let bytes = row_bytes(HEAD_K);
+    let (row, _, _) = wide_row(fixture, eps)?;
+    let mut weights = vec![0u8; ROWS * bytes];
+    weights[WINNER * bytes..(WINNER + 1) * bytes].copy_from_slice(row);
+    let x = dequant(row, HEAD_K)?;
+    let gain = vec![1f32; HEAD_K];
+    let out = run(
+        h,
+        HeadRun {
+            quant: Quant::Q6K,
+            weights: &weights,
+            x: &x,
+            gain: &gain,
+            rows: ROWS,
+            k: HEAD_K,
+            eps,
+        },
+    )?;
+    if let Some(f) = h.fault()? {
+        return Err(format!("head-partial raised {f}"));
+    }
+    if out.ticket != 0 {
+        return Err(format!(
+            "head-partial: the ticket counter is {}, not 0",
+            out.ticket
+        ));
+    }
+    let from = ROWS - CHECKED;
+    let ratio = check_logits(
+        "head-partial last groups",
+        &out.logits[from..],
+        &weights[from * bytes..],
+        &x,
+        &gain,
+        HEAD_K,
+        eps,
+    )?;
+    let want = u32::try_from(WINNER).map_err(|_| "the winner index does not fit the step id")?;
+    if out.id != want {
+        return Err(format!(
+            "head-partial: step id is {}, the f64 argmax is {want}",
+            out.id
+        ));
+    }
+    Ok(Verdict::Noted(format!(
+        "{ROWS} rows in {} groups, the last of {LAST_ROWS}: id {want}, last {CHECKED} rows {ratio:.3}",
+        head_groups(ROWS)
+    )))
 }
 
 pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
@@ -964,6 +1033,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cla
     vec![
         ("head_logit", Box::new(|| ctx.with(head_logit))),
         ("head_id", Box::new(|| ctx.with(head_id))),
+        ("head_partial", Box::new(|| ctx.with(head_partial))),
         ("head_ticket", Box::new(|| ctx.with(head_ticket))),
         ("head_nan", Box::new(|| ctx.with(head_nan))),
         ("head_all_nan", Box::new(|| ctx.with(head_all_nan))),

@@ -86,10 +86,9 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::ComputeEncoder;
 use bloomery_metal::kernels::router::{self, RouterParams};
 use bloomery_metal::kernels::{
-    EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_VOCAB,
-    HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD,
-    PairParams, Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP, SegParams, Segment,
-    SharedPlan, VALUE_HEADS,
+    EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_K, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams,
+    Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD, PairParams, Quant, ROUTED_IDS,
+    ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP, SegParams, Segment, SharedPlan, VALUE_HEADS,
 };
 use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::{GpuInterval, MetalStream};
@@ -119,10 +118,14 @@ const CHAIN_MAX: usize = 256;
 /// matrix, and the kernel's own shape.
 const ROUTER_BYTES: usize = router::ROWS * router::K * core::mem::size_of::<f32>();
 
+/// The timed head's rows: Qwen3.6's output matrix. The launch takes any row
+/// count; this is the shape the design's head is timed at.
+const HEAD_ROWS: usize = 248_320;
+
 /// The head's weight bytes: 248320 rows of K 2048 Q6_K. The design's head
 /// matrix, and the kernel's own shape; the block bytes are gguf's row.
 fn head_bytes() -> usize {
-    HEAD_VOCAB * (HEAD_K / Quant::Q6K.values_per_block()) * Quant::Q6K.block_bytes()
+    HEAD_ROWS * (HEAD_K / Quant::Q6K.values_per_block()) * Quant::Q6K.block_bytes()
 }
 
 /// The review's predicted tail span for one router dispatch, in the row's
@@ -135,9 +138,9 @@ const HEAD_TAIL_US: (f64, f64) = (62.0, 683.0);
 
 const _: () = assert!(router::ROWS == 257 && router::K == 2048);
 const _: () = assert!(router::TOP_K_MAX == 8);
-const _: () = assert!(HEAD_VOCAB == 248_320 && HEAD_K == 2048);
+const _: () = assert!(HEAD_K == 2048);
 const _: () = assert!(ROUTER_BYTES == 2_105_344 && ROUTER_BYTES.is_multiple_of(256));
-const _: () = assert!(HEAD_GROUPS * HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP == HEAD_VOCAB);
+const _: () = assert!(HEAD_ROWS.is_multiple_of(HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP));
 
 /// How one kernel is launched into a timed command buffer.
 struct Arm {
@@ -1206,8 +1209,8 @@ fn time_head(
     device.fault_word().clear(stream).map_err(why)?;
     // The variant's rows a SIMD group move the threadgroup count: the
     // candidates buffer follows the geometry the launch encodes against.
-    let head_groups = HEAD_VOCAB.div_ceil(HEAD_SIMD_GROUPS * kernels.rows_per_simd_group());
-    let one = matrix(Quant::Q6K, HEAD_VOCAB, HEAD_K, 0x6EAD);
+    let head_groups = HEAD_ROWS.div_ceil(HEAD_SIMD_GROUPS * kernels.rows_per_simd_group());
+    let one = matrix(Quant::Q6K, HEAD_ROWS, HEAD_K, 0x6EAD);
     let bytes = one.len();
     if bytes != head_bytes() {
         return Err(format!(
@@ -1234,7 +1237,7 @@ fn time_head(
         .map_err(why)?;
     let mut ticket = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
     let mut step_id = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
-    let rows = HEAD_VOCAB;
+    let rows = HEAD_ROWS;
     let mut y = device
         .zeroed::<f32>(stream, Elems((WARMUPS + trials) * dispatches * rows))
         .map_err(why)?;
@@ -1255,7 +1258,7 @@ fn time_head(
                     encoder,
                     HeadParams {
                         quant: Quant::Q6K,
-                        rows: HEAD_VOCAB,
+                        rows: HEAD_ROWS,
                         k: HEAD_K,
                         simdgroups: HEAD_SIMD_GROUPS,
                         weights: weights
@@ -1939,7 +1942,7 @@ pub fn main() -> ExitCode {
             }
         }
     }
-    let head_label = format!("q6k_head_argmax {HEAD_VOCAB}x{HEAD_K} q6k{geom}");
+    let head_label = format!("q6k_head_argmax {HEAD_ROWS}x{HEAD_K} q6k{geom}");
     if want_head {
         let outcome = time_arms(
             &run,
