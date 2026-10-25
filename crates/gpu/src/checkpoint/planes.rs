@@ -183,6 +183,9 @@ pub fn seq_save_bytes<B: PlaneBody>(m: &mut GpuModel<B>) -> Result<u64, GpuError
     .bytes(0)
 }
 
+/// A state [`seq_save_async`] saved with the copy still in flight, or [`NoRoom`].
+pub type SavedAsync<B> = Result<(PlaneSeq<B>, Pending<()>), NoRoom>;
+
 /// [`seq_save`] whose copy runs on `lane`'s stream into its pinned staging and
 /// whose call returns once it is enqueued ([`SeqState::save_rows_async`]): the
 /// state and its copy in flight, which the model's rows are not cut, reset or
@@ -191,7 +194,7 @@ pub fn seq_save_bytes<B: PlaneBody>(m: &mut GpuModel<B>) -> Result<u64, GpuError
 pub fn seq_save_async<B: PlaneBody>(
     m: &mut GpuModel<B>,
     lane: &SaveLane,
-) -> Result<Result<(PlaneSeq<B>, Pending<()>), NoRoom>, GpuError> {
+) -> Result<SavedAsync<B>, GpuError> {
     let pending = take(m, |engine, who, pos, lent| {
         SeqState::save_rows_async(Streams { lane, engine }, who, pos, lent)
     })?;

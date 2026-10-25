@@ -436,7 +436,7 @@ fn saved_state_returns(
     check(
         &mut ok,
         SAVED,
-        back.cache_n >= fed && same && longer.cache_n >= fed + 1,
+        back.cache_n >= fed && same && longer.cache_n > fed,
     );
     Ok(ok)
 }
