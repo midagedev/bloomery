@@ -26,6 +26,7 @@ pub mod prompt_tables;
 pub mod quant;
 pub mod qwen35;
 pub mod qwen35moe;
+pub mod qwen3moe;
 pub mod qwen4exp;
 pub mod raon1;
 pub mod solar2;
@@ -40,6 +41,7 @@ static MINIMAX_M3: &[&Family] = &[&minimaxm3::LCPP, &minimaxm31::TF, &minimaxm31
 static BY_ARCH: &[(&str, &[&Family])] = &[
     (deepseek41::ARCH, deepseek41::FAMILIES),
     (deepseek41v::ARCH, deepseek41v::FAMILIES),
+    (qwen3moe::ARCH, qwen3moe::FAMILIES),
     (qwen35moe::ARCH, qwen35moe::FAMILIES),
     (qwen35::ARCH, qwen35::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
@@ -101,6 +103,10 @@ mod qwen_vis_tests;
 mod tests {
     use super::{BY_ARCH, all, families, minimaxm3, minimaxm31, named, node_dumps};
     use crate::family::Identity;
+
+    /// The fixture families whose real file's sets have no refset family: the card gates open
+    /// those by name. Each is checked in its own module.
+    const STANDALONE: [&str; 1] = ["fx-ik-qwen3moe"];
 
     /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
     #[test]
@@ -184,7 +190,8 @@ mod tests {
     /// identity, a draft file when the real family has one and no per-file set
     /// name; each set is the real family's set under the `fx_` prefix
     /// (`ref-mtp/fx_` for an MTP set). The real family's node dumps stay the
-    /// architecture's.
+    /// architecture's. [`STANDALONE`] are the fixture families whose real sets
+    /// have no family, held by their own module's test.
     #[test]
     fn each_fixture_family_mirrors_a_real_one() {
         let sets_of = [
@@ -198,7 +205,7 @@ mod tests {
             ("fx-ref-nemotron-moe-logits", 1),
         ];
         let mut found: Vec<&str> = all()
-            .filter(|f| f.name.starts_with("fx-"))
+            .filter(|f| f.name.starts_with("fx-") && !STANDALONE.contains(&f.name))
             .map(|f| f.name)
             .collect();
         found.sort_unstable();
