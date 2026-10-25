@@ -1140,7 +1140,8 @@ pub fn card(
     }
 }
 
-/// The fixture tier's card: `a` resolved against this process's devices once.
+/// The fixture tier's card: `a` resolved against this process's devices once, the tier nodes
+/// `BLOOMERY_TIER_NODES` names (a node 0 child's) left out.
 #[cfg(feature = "gpu")]
 fn fixture_card() -> Result<model::placement::workstation::CardSpec, GateError> {
     use model::placement::workstation::CardSpec;
@@ -1150,7 +1151,7 @@ fn fixture_card() -> Result<model::placement::workstation::CardSpec, GateError> 
     if let Some(c) = A.get() {
         return Ok(*c);
     }
-    let specs = crate::generate::Place::A.on_host()?.card_specs()?;
+    let specs = crate::generate::Place::A.on_host_alone()?.card_specs()?;
     let card = *specs.first().ok_or("--place a resolved to no card")?;
     Ok(*A.get_or_init(|| card))
 }

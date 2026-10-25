@@ -473,6 +473,18 @@ impl Place {
         )
     }
 
+    /// [`Place::on_host`] with no tier nodes: the cards this process holds, whatever
+    /// `BLOOMERY_TIER_NODES` names. A lookup of this process's own card (the fixture tier's) is
+    /// not a placement on the nodes a node 0 child has set.
+    pub fn on_host_alone(self) -> Result<Place, GateError> {
+        self.on_with(
+            &crate::gpu_census::census()?,
+            &bloomery_levers::card_budget()?,
+            &bloomery_levers::card_margin()?,
+            &[],
+        )
+    }
+
     /// [`Place::on`] with the levers it reads given parsed: `budget`
     /// (`BLOOMERY_CARD_BUDGET`) and `margin` (`BLOOMERY_CARD_MARGIN`) refused
     /// against the census and the tier nodes before any card resolves, the
