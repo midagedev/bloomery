@@ -162,7 +162,7 @@ crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
-crates/placement/src/accepts.rs	deepseek	10	PIN(2026-10-21) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	deepseek	14	PIN(2026-10-26) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet; +4 are V4.1's leg arms (ds41_gate_up, ds41_down, ds41_pair and its routed_rule arm), held in the Program-keyed arm table beside qwen35's and qwen38's until a Program owns its arms
 crates/placement/src/accepts.rs	flint	1	PIN(2026-10-23) flint: program_of matches every models::Arch; the header-only reader must explicitly return no program until a body is registered
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
