@@ -1862,12 +1862,13 @@ pub fn check_with(
     for t in &model.tensors {
         if t.role == Role::RoutedExperts {
             match program {
-                // The V4.1 chain's rule: a stack of a type no card format
-                // loads. A layer whose stacks the chain's card experts do not
-                // read keeps them on the host, whose load refuses a type with
-                // no host kernel.
+                // The V4.1 chain's rule: a stack passes when some card format
+                // loads its type or a qdot fused kernel serves it on the host at
+                // its row width ([`routed_unrun`], the one owner). A layer whose
+                // stacks the chain's card experts do not read keeps them on the
+                // host.
                 Some(Program::Deepseek41Chain) => {
-                    if CardFormat::of(t.ty).is_none() {
+                    if routed_unrun(t, |ty| CardFormat::of(ty).is_some()) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -2724,7 +2725,8 @@ mod tests {
         }
         // No side: a type no card expert kernel reads and no fused qdot
         // kernel serves.
-        for ty in [GgmlType::IQ2_S, GgmlType::F32] {
+        // PIN(2026-10-25): IQ2_S left this list when qdot's generic host dot began to serve it; q4_0 has neither side.
+        for ty in [GgmlType::Q4_0, GgmlType::F32] {
             assert!(
                 super::routed_unrun(&routed(ty, 2560), super::qwen38_card_routed),
                 "{ty}"
@@ -2860,6 +2862,68 @@ mod tests {
             (GgmlType::NVFP4_ROWS, GgmlType::NVFP4_ROWS, none.clone()),
             (GgmlType::Q4_K, GgmlType::Q6_K, none.clone()),
             (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .map(|(gate_up, down, want)| (gate_up, down, want, routed(*gate_up, *down)))
+            .filter(|(_, _, want, got)| want != &got)
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "(gate and up, down, want, got) of the cases off the rule: {wrong:#?}"
+        );
+    }
+
+    /// A routed stack of a V4.1 file passes when some card format loads its type or a fused qdot
+    /// kernel serves it on the host at its row width, so a layer whose stacks the chain's card
+    /// leg does not read keeps its experts on the host; a type neither side runs is an item for
+    /// each layer that holds it.
+    // PIN(2026-10-25): the V4.1 routed rule widened from `CardFormat::of` to card-or-host so a
+    // file's iq1_m stacks (no card format, a fused kernel since qdot's generic host dot lists
+    // them) are no items; a q4_0 stack, which no card format or host kernel reads, is still an item.
+    // FAIL-first: under `CardFormat::of` alone the iq1_m layers are items.
+    #[test]
+    fn a_deepseek41_routed_stack_runs_on_a_card_format_or_the_host() {
+        let none = Vec::<(Option<usize>, String)>::new();
+        let routed = |gate_up: GgmlType, down: GgmlType| {
+            let stack = |layer: usize, stem: &str, ty: GgmlType| ModelTensor {
+                name: format!("blk.{layer}.{stem}.weight"),
+                shard: 0,
+                layer: Some(layer),
+                role: Role::RoutedExperts,
+                ty,
+                dims: vec![5120, 2304, 384],
+                file_bytes: 0,
+                gathered_rows: None,
+            };
+            let tensors = [3, 4]
+                .into_iter()
+                .flat_map(|l| {
+                    [
+                        stack(l, "ffn_gate_exps", gate_up),
+                        stack(l, "ffn_up_exps", gate_up),
+                        stack(l, "ffn_down_exps", down),
+                    ]
+                })
+                .collect();
+            arch_items(Arch::Deepseek41, tensors, "routed experts on a card")
+        };
+        let item = |ty: GgmlType| -> Vec<(Option<usize>, String)> {
+            [3, 4]
+                .into_iter()
+                .map(|l| (Some(l), Need::RoutedFormat(ty).to_string()))
+                .collect()
+        };
+        let cases = [
+            // The chain's card leg: q3_K gate and up with a q4_K down.
+            (GgmlType::Q3_K, GgmlType::Q4_K, none.clone()),
+            // A card format the chain's leg does not read: the layer stays on the host.
+            (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS, none.clone()),
+            // The host's alone: no card format, a fused kernel.
+            (GgmlType::IQ1_M, GgmlType::IQ2_XXS, none.clone()),
+            (GgmlType::IQ1_M, GgmlType::IQ1_M, none.clone()),
+            // No side: q4_0 has no card format and no fused kernel.
+            (GgmlType::Q4_0, GgmlType::Q4_K, item(GgmlType::Q4_0)),
         ];
         let wrong: Vec<_> = cases
             .iter()
@@ -3164,11 +3228,16 @@ mod tests {
                 GgmlType::F16,
                 GgmlType::IQ4_XS,
                 GgmlType::IQ2_XXS,
+                GgmlType::IQ2_S,
+                GgmlType::IQ1_S,
+                GgmlType::IQ1_M,
             ] {
                 assert_eq!(embed(program, ty), Vec::<String>::new(), "{program:?} {ty}");
             }
             // PIN(2026-10-16): IQ2_XXS joined the embedding's set when `dequant_row` began to decode it.
-            for ty in [GgmlType::IQ1_S, GgmlType::I8] {
+            // PIN(2026-10-25): IQ1_S left the refused list and IQ2_S, IQ1_S and IQ1_M joined the embedding's set for the
+            // same reason; q4_0 is a type `dequant_row` still refuses.
+            for ty in [GgmlType::Q4_0, GgmlType::I8] {
                 assert_eq!(
                     embed(program, ty),
                     [format!(
@@ -3514,7 +3583,8 @@ mod tests {
                 t.dims[0] = 2000;
             }
             if t.name == "blk.5.ffn_up_exps.weight" {
-                t.ty = GgmlType::IQ2_S;
+                // PIN(2026-10-25): IQ2_S is served by qdot's generic host dot now; q4_0 has no kernel on either side.
+                t.ty = GgmlType::Q4_0;
             }
             if t.name == "blk.6.ffn_down_exps.weight" {
                 t.ty = GgmlType::Q6_K;
@@ -3529,7 +3599,7 @@ mod tests {
             items,
             [
                 "q4_K attention matrices (the body reads q8_0)",
-                "iq2_s routed experts on a card",
+                "q4_0 routed experts on a card",
                 "q6_K routed experts on a card",
             ],
             "{items:?}"

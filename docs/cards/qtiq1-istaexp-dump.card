@@ -1,0 +1,13 @@
+# Round qt-iq1 (card for the dump sitting): ik's CPU node dumps on the fixture variant istaexp (/models/fixture-variants/istaexp/v41,
+# the V4.1 fixture with its routed gate and up at IQ1_M and its routed down at IQ2_XXS), so the V4.1 host expert tier on those types
+# has the four fixture sets of the base (step4, d1n, d1, d2 every-node) under fx_istaexp_ref_deepseek41_*. One
+# `BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=istaexp just dump-ref-fixture deepseek41 <set>` each under this card, one lease each.
+# Nothing is timed. The dumper is this tree's, built into the private dir /root/bloomery-data/bin-qtiq1 (REF_BIN_NAME=bin-qtiq1) and
+# the shared bin/ stays as main's real-tier dumps need it.
+# Minutes [derived]: the fxoracle card's V4.1 rows (step4, d1n, d1, d2 every-node 0.05-0.3 min each on the 14.8 GB fixture, a lease
+# take 3-15 s) with the variant at 7.9 GB, so the cold read is no longer: 4 takes 0.2-1.0 min plus 4 dumps 0.2-1.2 min, 0.4-2.2 min.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads (CUDA hidden, no card) and the V4.1 profile takes the lease for every dump; beside a timed run
+  or a gate batch it would take their cores and memory bandwidth; why now: the V4.1 host expert tier on IQ1_M and IQ2_XXS needs ik's
+  node sets on the same file to be held to (round qt-iq1)
+minutes: 1..5

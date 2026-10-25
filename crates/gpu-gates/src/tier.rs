@@ -1026,7 +1026,12 @@ fn planned(
     variant: Option<&str>,
     family: &str,
 ) -> Result<u64, GateError> {
-    model::fixture::check_budget(planner, split, recorded)
+    let check = if variant.is_some() {
+        model::fixture::check_budget_variant
+    } else {
+        model::fixture::check_budget
+    };
+    check(planner, split, recorded)
         .map_err(|e| fixture_budget_error(path, recorded, e, variant, family))?;
     Ok(on_fixture_card(planner, split).map_err(|e| format!("{}: {e}", path.display()))?)
 }
@@ -1863,6 +1868,81 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("regenerate"), "{error}");
+        drop(split);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A host-only variant's recorded budget holds through `planned`: the plan of a file whose
+    /// experts all stay off the card has no half to fall short of, so any cap that plans it holds.
+    /// A base fixture of that plan is refused by name.
+    /// Mutant: `planned` checking a variant by the base fixture's rule, which refuses the
+    /// host-only variant.
+    #[test]
+    fn a_host_only_variants_budget_holds_and_a_base_fixtures_does_not() {
+        use model::fixture::{Budget, CardExperts, FixtureError};
+
+        const MIB: u64 = 1024 * 1024;
+        let dir = temp("host-only-budget");
+        let path = dir.join("host-only.gguf");
+        write_fixture(&path, 1, &[]);
+        let split = Split::open(&path).unwrap();
+        let planner = Budget {
+            ctx: 1,
+            card_experts: |_, cap| match cap {
+                Some(c) if c < 3 * MIB => {
+                    Err(FixtureError::Budget("no room for dense weights".into()))
+                }
+                _ => Ok(CardExperts {
+                    per_layer: vec![0, 0, 0],
+                    experts: 8,
+                }),
+            },
+            card_set_aside: None,
+        };
+        assert_eq!(
+            planned(
+                &planner,
+                &split,
+                &path,
+                3 * MIB,
+                Some("hostonly"),
+                "deepseek41"
+            )
+            .unwrap(),
+            0
+        );
+        let error = planned(&planner, &split, &path, 3 * MIB, None, "deepseek41")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no layer of the file holds a card expert"),
+            "{error}"
+        );
+        // A larger cap holds too: no cap puts an expert on a card. One the dense tensors do not
+        // fit is the planner's refusal, naming the variant.
+        assert!(
+            planned(
+                &planner,
+                &split,
+                &path,
+                9 * MIB,
+                Some("hostonly"),
+                "deepseek41"
+            )
+            .is_ok()
+        );
+        let error = planned(
+            &planner,
+            &split,
+            &path,
+            2 * MIB,
+            Some("hostonly"),
+            "deepseek41",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("variant hostonly:"), "{error}");
+        assert!(error.contains("no room for dense weights"), "{error}");
         drop(split);
         std::fs::remove_dir_all(dir).unwrap();
     }

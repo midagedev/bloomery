@@ -63,6 +63,13 @@ impl Predicted {
 /// the head's four) and the gather — less one launch for each projection
 /// a Q3_K row join folds into another's (`join_projections`). The types
 /// come from `split`. Printed as the table G2 pins.
+/// Whether a layer whose MoE piece enqueues `ffn_launches` kernels (`FfnPiece::launches`) runs card
+/// experts: the piece enqueues 7 without them and 10 with them, one more in either case when the
+/// shared expert's down reads q8_1 rows.
+pub fn has_card_experts(ffn_launches: usize) -> bool {
+    ffn_launches >= 10
+}
+
 pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, GateError> {
     let ty = |name: String| {
         split
@@ -131,7 +138,11 @@ pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, 
                 None => "",
             },
             if k.engram.is_some() { "+engram" } else { "" },
-            if ffn > 7 { "+card" } else { "+host-only" }
+            if has_card_experts(ffn) {
+                "+card"
+            } else {
+                "+host-only"
+            }
         );
         match kinds.iter_mut().find(|e| e.0 == name) {
             Some(e) => e.3 += 1,

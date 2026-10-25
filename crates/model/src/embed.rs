@@ -360,11 +360,16 @@ mod tests {
             GgmlType::F16,
             GgmlType::IQ4_XS,
             GgmlType::IQ2_XXS,
+            GgmlType::IQ2_S,
+            GgmlType::IQ1_S,
+            GgmlType::IQ1_M,
         ] {
             assert!(ty.has_dequant(), "{ty}");
         }
         // PIN(2026-10-16): IQ2_XXS (type 16) left the refused set when `dequant_row` began to decode it.
-        for type_id in [19u32, 22] {
+        // PIN(2026-10-25): IQ1_S (type 19) and IQ2_S (type 22) left it for the same reason; Q4_0 and Q4_1 are
+        // types `dequant_row` still refuses.
+        for type_id in [2u32, 3] {
             let ty = GgmlType::from_u32(type_id);
             assert!(!ty.has_dequant(), "{ty}");
             let Err(e) = opened_as(type_id, NAME, &[256, 2], 256) else {

@@ -971,7 +971,8 @@ fn structure(
         let launches = body
             .ffn_launches(l)
             .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-        let mut want = shadow::shadow_kernels(split, l, launches > 7, prefetch)?;
+        let mut want =
+            shadow::shadow_kernels(split, l, crate::nodes::has_card_experts(launches), prefetch)?;
         if sites.contains(&(l + 1)) {
             want.extend(shadow::engram_kv_kernels(split, l + 1, prefetch)?);
         }

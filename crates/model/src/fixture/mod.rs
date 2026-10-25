@@ -72,7 +72,9 @@ mod verify;
 mod write;
 
 pub use budget::check as check_budget;
+pub use budget::check_variant as check_budget_variant;
 pub use budget::choose_written as choose_budget_written;
+pub use budget::host_only as budget_host_only;
 pub use fill::{Band, CHUNK_TARGET, FloatTy, NVFP4_TENSOR_SCALE, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
 pub(crate) use plan::{int_like, items, split_layer, unsigned};

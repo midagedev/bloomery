@@ -865,10 +865,12 @@ fn variant_budget(variant: &str) -> Res<()> {
             let planned = fixture::choose_budget_written(&planner, &var)?;
             let was = fixture::variant_record_budget(&tag, &var, planned)?;
             let key = model::fixture::KEY_CARD_BUDGET;
-            println!(
-                "fixture: variant-budget {tag}: {key} {was} -> {planned} (planned on the \
-                 variant's own file)"
-            );
+            let own = if fixture::budget_host_only(&planner, &var)? {
+                "host-only: no layer holds a card expert, the trunk's budget is kept"
+            } else {
+                "planned on the variant's own file"
+            };
+            println!("fixture: variant-budget {tag}: {key} {was} -> {planned} ({own})");
         }
     }
     Ok(())
