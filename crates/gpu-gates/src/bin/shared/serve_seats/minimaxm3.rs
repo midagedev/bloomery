@@ -35,9 +35,9 @@
 //! (`pass=turns`). One pass would be a host walk over the existing launches:
 //! the row-wise ones once over every busy row, and each slot's sequence-bound
 //! ones over that slot's rows and its own planes. A prompt cache is refused
-//! by name, and a request keeps the prefix it shares with what the slot holds
-//! only where the sequence stands; any shorter prefix re-feeds the prompt
-//! from an empty model.
+//! by name, and a request keeps the whole prefix it shares with what the slot
+//! holds: every store is a plane of positions, so a cut keeps every held
+//! position.
 //!
 //! The prompt call is fed in batches of up to a unit's columns
 //! (`app::Prompt for Body`), the same bits as one decode step an id; the
