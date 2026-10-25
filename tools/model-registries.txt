@@ -3,6 +3,7 @@
 # not ratcheted. One path a line, relative to the repository root.
 crates/app/src/arch/mod.rs
 crates/chain/src/arch/mod.rs
+crates/gguf/src/arch/mod.rs
 crates/gpu-gates/src/bin/shared/serve_seats/mod.rs
 crates/gpu-gates/src/lib.rs
 crates/gpu-vision/src/lib.rs

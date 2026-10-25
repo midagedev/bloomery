@@ -28,7 +28,8 @@ use std::collections::BTreeMap;
 use std::fmt::{Debug, Write as _};
 
 use engram::{Engram, hash::Hash};
-use gguf::v41_facts::{self, ARCH, ENGRAM_FILE, ENGRAM_ROWS, HASH_TENSORS};
+use gguf::arch::deepseek41::{ARCH, ENGRAM, HASH_TENSORS};
+use gguf::facts;
 use gguf::{Split, Value};
 use model::arch::deepseek41::hparams::{
     CANDIDATE_BLOCK_SIZE, CANDIDATE_SOURCE_LAYER, CANDIDATE_TOPK_BLOCKS, Hparams, Score,
@@ -175,7 +176,7 @@ fn hw_ds41_open_gives_every_tensor_a_role() {
         LAYER_IDS.to_vec(),
     );
     let in_companion = tables.iter().filter(|t| t.shard >= shards).count();
-    let named = v41_facts::text_opt(o.split.keys(), ARCH, &ENGRAM_FILE).expect("engram.file");
+    let named = facts::text_opt(o.split.keys(), ARCH, &ENGRAM.file).expect("engram.file");
     row(
         &mut out,
         &mut bad,
@@ -331,7 +332,7 @@ fn hw_ds41_open_engram_matches_the_header() {
     let paths = (0..o.split.shard_count()).filter_map(|i| o.split.shard_path(i));
     let engram = Engram::open(paths).unwrap_or_else(|e| panic!("engram tables of {}: {e}", o.path));
     let counted =
-        v41_facts::counts_opt(o.split.keys(), ARCH, &ENGRAM_ROWS).expect("engram.num_embeddings");
+        facts::counts_opt(o.split.keys(), ARCH, &ENGRAM.rows).expect("engram.num_embeddings");
     for (e, site) in engram.sites().iter().enumerate() {
         let want = hash.partition_rows(e).expect("site");
         row(

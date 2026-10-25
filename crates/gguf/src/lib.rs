@@ -36,13 +36,15 @@
 //! Errors, not panics: every file-derived value is bounds-checked — a
 //! truncated or hostile file yields [`LoadError`].
 
+pub mod arch;
 pub mod card;
 pub mod digest;
+pub mod engram;
+pub mod facts;
 pub mod iq_tables;
 pub mod qtype;
 pub mod quant;
 pub mod v41;
-pub mod v41_facts;
 pub mod write;
 
 use qtype::OWN_ROWS;
@@ -210,12 +212,12 @@ pub enum LoadError {
     /// A [`Split::located`] argument that does not describe a split.
     #[error("located split: {detail}")]
     Located { detail: String },
-    /// The Engram companion file of a V4.1 set ([`v41_facts::attach_companion`]).
+    /// The Engram companion file of a set ([`engram::attach_companion`]).
     #[error("engram companion {path}: {detail}")]
     Companion { path: String, detail: String },
-    /// A V4.1 header fact the file states wrongly or twice ([`v41_facts`]).
+    /// A header fact the file states wrongly or twice ([`facts`]).
     #[error("{0}")]
-    Fact(#[from] v41_facts::FactError),
+    Fact(#[from] facts::FactError),
 }
 
 /// A parsed, mmap-backed GGUF file.
@@ -726,13 +728,13 @@ impl Place {
 
 impl Split {
     /// Open the model whose first shard is `first`. A file without
-    /// `split.count` is a one-shard model. A V4.1 set whose Engram tables are
+    /// `split.count` is a one-shard model. A set whose Engram tables are
     /// in a file of their own gets that companion as a further shard
-    /// ([`v41_facts::attach_companion`]): its tensors are the split's, and
+    /// ([`engram::attach_companion`]): its tensors are the split's, and
     /// `split.tensors.count` still counts the model shards' alone.
     pub fn open(first: impl AsRef<Path>) -> Result<Split, LoadError> {
         let mut split = Split::open_model(first.as_ref())?;
-        v41_facts::attach_companion(&mut split)?;
+        engram::attach_companion(&mut split)?;
         Ok(split)
     }
 
@@ -1218,7 +1220,7 @@ pub struct Inventory {
     pub alignment: u64,
     pub file_len: u64,
     /// The file the header was read from, where a tensor's bytes are read
-    /// ([`v41_facts::Header::int_tensor`]); `None` for a header built in memory.
+    /// ([`facts::hash_constant`]); `None` for a header built in memory.
     pub path: Option<PathBuf>,
 }
 

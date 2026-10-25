@@ -21,8 +21,11 @@
 //! (`tools/ref/models/deepseek41.sh`'s `IK`).
 
 use gguf::Split;
+use gguf::arch::deepseek41::{
+    CANDIDATE_BLOCK, CANDIDATE_SOURCE, CANDIDATE_TOPK, ENGRAM, IK_SQRT_SOFTPLUS, gating_func,
+};
+use gguf::facts::{self, Fact, FactError};
 use gguf::quant::GgmlType;
-use gguf::v41_facts::{self, Fact, FactError};
 
 use super::names;
 use crate::ModelError;
@@ -30,8 +33,6 @@ use crate::arch::{
     meta_arr, meta_bool, meta_f32, meta_str, meta_u64, meta_usize, metadata, n_vocab,
 };
 use crate::placement::PlacementError;
-
-use v41_facts::IK_SQRT_SOFTPLUS;
 
 /// A header fact the file states wrongly, twice, or not at all, as the error that names its key.
 fn fact_error(e: FactError) -> PlacementError {
@@ -48,7 +49,7 @@ fn arch(split: &Split) -> &str {
 
 /// The count `fact` states, as the keyed metadata error.
 fn fact_count(split: &Split, fact: &Fact) -> Result<usize, PlacementError> {
-    let v = v41_facts::count(split.keys(), arch(split), fact).map_err(fact_error)?;
+    let v = facts::count(split.keys(), arch(split), fact).map_err(fact_error)?;
     usize::try_from(v).map_err(|_| {
         fact_error(FactError::Bad {
             key: format!("{}.{}", arch(split), fact.name),
@@ -59,7 +60,7 @@ fn fact_count(split: &Split, fact: &Fact) -> Result<usize, PlacementError> {
 
 /// [`fact_count`], `None` when the file does not state the fact.
 fn fact_count_opt(split: &Split, fact: &Fact) -> Result<Option<usize>, PlacementError> {
-    match v41_facts::carries(split.keys(), arch(split), fact) {
+    match facts::carries(split.keys(), arch(split), fact) {
         true => fact_count(split, fact).map(Some),
         false => Ok(None),
     }
@@ -79,11 +80,11 @@ pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
 pub const CANDIDATE_BLOCK_SIZE: usize = 8;
 
 /// `attention.candidate_source_layer_id`, ik's `LLM_KV_CANDIDATE_SOURCE_LAYER`.
-const CANDIDATE_SOURCE_KEY: &str = v41_facts::CANDIDATE_SOURCE.name;
+const CANDIDATE_SOURCE_KEY: &str = CANDIDATE_SOURCE.name;
 /// `attention.candidate_block_size`, ik's `LLM_KV_CANDIDATE_BLOCK_SIZE`.
-const CANDIDATE_BLOCK_KEY: &str = v41_facts::CANDIDATE_BLOCK.name;
+const CANDIDATE_BLOCK_KEY: &str = CANDIDATE_BLOCK.name;
 /// `attention.candidate_topk_blocks`, ik's `LLM_KV_CANDIDATE_TOPK_BLOCKS`.
-const CANDIDATE_TOPK_KEY: &str = v41_facts::CANDIDATE_TOPK.name;
+const CANDIDATE_TOPK_KEY: &str = CANDIDATE_TOPK.name;
 
 /// Which model of this module a file holds, by its `general.architecture`
 /// ([`crate::arch::deepseek41_model`] reads it).
@@ -338,12 +339,12 @@ impl CandidateMask {
             Ok(fact_count_opt(split, fact)?.unwrap_or(default))
         };
         let mask = CandidateMask {
-            source_layer: key_or(&v41_facts::CANDIDATE_SOURCE, CANDIDATE_SOURCE_LAYER)?,
-            block_size: key_or(&v41_facts::CANDIDATE_BLOCK, CANDIDATE_BLOCK_SIZE)?,
-            topk_blocks: key_or(&v41_facts::CANDIDATE_TOPK, CANDIDATE_TOPK_BLOCKS)?,
+            source_layer: key_or(&CANDIDATE_SOURCE, CANDIDATE_SOURCE_LAYER)?,
+            block_size: key_or(&CANDIDATE_BLOCK, CANDIDATE_BLOCK_SIZE)?,
+            topk_blocks: key_or(&CANDIDATE_TOPK, CANDIDATE_TOPK_BLOCKS)?,
         };
         let indexes = |l: usize| layers.get(l).is_some_and(|k| k.indexer);
-        let named = v41_facts::carries(split.keys(), arch(split), &v41_facts::CANDIDATE_SOURCE);
+        let named = facts::carries(split.keys(), arch(split), &CANDIDATE_SOURCE);
         let source = named.then_some((layers.len(), &indexes as &dyn Fn(usize) -> bool));
         CandidateMask::checked(mask, source, top_k)
             .map_err(|(suffix, detail)| metadata(split, suffix, detail))
@@ -820,7 +821,7 @@ impl Experts {
         dense_lead: usize,
         hash_layers: usize,
     ) -> Result<Experts, PlacementError> {
-        let gating = v41_facts::gating_func(split.keys(), arch(split)).map_err(fact_error)?;
+        let gating = gating_func(split.keys(), arch(split)).map_err(fact_error)?;
         if gating != IK_SQRT_SOFTPLUS {
             return Err(metadata(
                 split,
@@ -846,10 +847,10 @@ impl Engram {
     /// The keys ik's loader requires of a V4.1 file (llama-hparams.cpp:2075-2096),
     /// without the hash constants.
     fn read(split: &Split, n_layer: usize) -> Result<Engram, PlacementError> {
-        let key = v41_facts::ENGRAM_LAYER_IDS.name;
+        let key = ENGRAM.layer_ids.name;
         let mut layer_ids = Vec::new();
-        let listed = v41_facts::counts(split.keys(), arch(split), &v41_facts::ENGRAM_LAYER_IDS)
-            .map_err(fact_error)?;
+        let listed =
+            facts::counts(split.keys(), arch(split), &ENGRAM.layer_ids).map_err(fact_error)?;
         for (i, &v) in listed.iter().enumerate() {
             let layer = usize::try_from(v)
                 .ok()
@@ -869,15 +870,15 @@ impl Engram {
         if layer_ids.is_empty() {
             return Err(metadata(split, key, "is empty"));
         }
-        let n_head = fact_count(split, &v41_facts::ENGRAM_HEAD_COUNT)?;
+        let n_head = fact_count(split, &ENGRAM.head_count)?;
         if n_head == 0 {
-            return Err(metadata(split, v41_facts::ENGRAM_HEAD_COUNT.name, "is 0"));
+            return Err(metadata(split, ENGRAM.head_count.name, "is 0"));
         }
-        let max_ngram = fact_count(split, &v41_facts::ENGRAM_MAX_NGRAM)?;
+        let max_ngram = fact_count(split, &ENGRAM.max_ngram)?;
         if max_ngram < 2 {
             return Err(metadata(
                 split,
-                v41_facts::ENGRAM_MAX_NGRAM.name,
+                ENGRAM.max_ngram.name,
                 format!("is {max_ngram}; the hash needs a 2-gram"),
             ));
         }
@@ -885,7 +886,7 @@ impl Engram {
             layer_ids,
             n_head,
             max_ngram,
-            key_length: fact_count(split, &v41_facts::ENGRAM_KEY_LENGTH)?,
+            key_length: fact_count(split, &ENGRAM.key_length)?,
         })
     }
 }

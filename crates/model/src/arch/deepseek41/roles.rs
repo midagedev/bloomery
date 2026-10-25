@@ -10,7 +10,7 @@
 //! file this classifier refuses.
 
 use gguf::Split;
-use gguf::v41_facts;
+use gguf::arch::deepseek41::is_hash_tensor;
 
 use super::hparams::Hparams;
 use super::names;
@@ -66,7 +66,7 @@ fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
     if name.starts_with("mtp.") || (!name.starts_with("blk.") && name.contains(".mtp.")) {
         return Some((Role::Unused, None));
     }
-    if v41_facts::is_hash_tensor(name) {
+    if is_hash_tensor(name) {
         return Some((Role::EngramHash, None));
     }
     if name.starts_with("token_embd") {
@@ -146,6 +146,7 @@ mod tests {
     use super::{bf16_words, role};
     use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role};
     use gguf::GgmlType;
+    use gguf::arch::deepseek41::HASH_TENSORS;
 
     /// A BF16 compressor or indexer matrix loads in its words, where another
     /// BF16 attention matrix, a router and a gain load widened to f32.
@@ -209,7 +210,7 @@ mod tests {
         ] {
             assert_eq!(role(name, 43), Some((Role::Unused, layer)), "{name}");
         }
-        for name in gguf::v41_facts::HASH_TENSORS {
+        for name in HASH_TENSORS {
             assert_eq!(role(name, 43), Some((Role::EngramHash, None)), "{name}");
         }
         assert_eq!(
