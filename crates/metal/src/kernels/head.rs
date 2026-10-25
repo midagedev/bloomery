@@ -36,13 +36,7 @@ const _: () = assert!(HEAD_THREADS == 32 * HEAD_SIMD_GROUPS);
 /// when the count is not a multiple.
 #[must_use]
 pub const fn head_groups(rows: usize) -> usize {
-    groups(rows, ROWS_PER_THREADGROUP)
-}
-
-/// The threadgroups of `rows` rows at `rows_per_threadgroup` each: the rule a
-/// launch checks its candidates against, at the geometry of its pipelines.
-const fn groups(rows: usize, rows_per_threadgroup: usize) -> usize {
-    rows.div_ceil(rows_per_threadgroup)
+    rows.div_ceil(ROWS_PER_THREADGROUP)
 }
 
 /// One head launch.
@@ -108,7 +102,7 @@ fn check(p: &HeadParams<'_>, rows_per_threadgroup: usize) -> Result<(usize, usiz
     let nblocks = p.k / p.quant.values_per_block();
     let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.k)))?;
-    let candidates = groups(p.rows, rows_per_threadgroup);
+    let candidates = p.rows.div_ceil(rows_per_threadgroup);
     check_window_len(WHAT, "x", p.x.len(), p.k)?;
     check_window_len(WHAT, "gain", p.gain.len(), p.k)?;
     check_window_len(WHAT, "logits", p.logits.len(), p.rows)?;
