@@ -426,7 +426,7 @@ bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qw
 file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
 head instead of the file's own.
 
-**Concurrent requests.** Every generative seat but nemotron, raon1, solar2 and minimaxm3 (one slot each, above) takes `--parallel N` (unset, one slot; a set
+**Concurrent requests.** Every generative seat but nemotron, raon1 and solar2 (one slot each, above) takes `--parallel N` (unset, one slot; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
 llama-server reads it, and the startup line says so). A count you set is never lowered. The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
@@ -437,7 +437,7 @@ Qwen3.8 also batches sampled steps on a drafting load, with every slot's draft b
 before the round's pass. A round that leaves slot 0 out runs as one pass too and keeps slot 0's waiting hidden rows
 intact. A
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
-lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
+lookup draft, Qwen3.8 under `--place bp` and MiniMax-M3 step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
 llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
@@ -540,8 +540,8 @@ the slot. A request that shares only part of an earlier prompt, such as the same
 restores too: a saved state keeps checkpoints at 512·2^i positions below its end and the last one, and a shared
 prefix restores at the largest of them inside it. On Qwen3.8 the card's own checkpoints are 4,096 positions
 apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. The
-MiMo and Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
-save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
+MiMo, Qwen3, MiniMax-M3 and Muse Spark seats keep only the longest prefix the live slot holds; they run no saved
+prompt cache, and a save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
 `<|im_start|>`, the seat cuts prompt calls at message starts, so a shared system prompt stays in the live slot
 for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
@@ -632,7 +632,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
-  streams wait. The decide seat serves one request at a time, and the nemotron, raon1, solar2 and minimaxm3 seats one
+  streams wait. The decide seat serves one request at a time, and the nemotron, raon1 and solar2 seats one
   slot each; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
