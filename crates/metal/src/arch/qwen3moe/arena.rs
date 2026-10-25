@@ -5,9 +5,11 @@
 //! P1 projection is one buffer per weight type, each the segments of one
 //! dispatch. The activations, the caches, the recurrent stores, the router's
 //! and the head's tickets, the host's id slot, the step record slots and the
-//! fault words are the session's. Every length comes from the plan, the
-//! file's shapes or a launch's geometry. A shape no launch runs is refused by
-//! name before the buffers past it are allocated.
+//! fault words are the session's. Every name, type and length comes from the
+//! layout [`super::check`] resolved from the file's header (the plan, the
+//! file's shapes and a launch's geometry): a shape or a type no launch runs was
+//! refused there, by name, before any buffer was allocated, so the loader
+//! checks nothing but that the split gives a tensor's bytes.
 //!
 //! Two tokens may be committed at once, the second reading what the first
 //! writes. What the second would overwrite before the first is done is held
@@ -18,23 +20,20 @@
 use core::ops::Range;
 
 use bloomery_device::{Elem, Elems};
-use chain::arch::qwen3moe::plan::{FfnRoute, LayerPlan, MixerPlan, SharedPlan};
-use chain::arch::qwen3moe::read::file_names;
-use chain::linear::{KHeadMap, LinearShape};
-use chain::rope::{Direction, RopeSpec, RopeTable};
+use chain::rope::{Direction, RopeTable};
 use gguf::Split;
 use gguf::quant::GgmlType;
-use model::arch::models::{Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
-use model::arch::names;
 
+use super::check::{
+    AttnLayout, DeltaLayout, FfnLayout, LayerLayout, Layout, MixerLayout, P1Layout, Site, Values,
+};
 use super::count::{GroupBytes, GroupKind, Layer, Projection};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
-    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_K, HeadMap, KV_HEADS, MAX_SEGMENTS,
-    PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment, VALUE_HEADS, channels, f16_len,
-    head_groups, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys, state_elems,
+    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, PARTIALS_PER_HEAD, Quant, ROT,
+    Segment, VALUE_HEADS, head_groups, partials_len, router, segments_for_keys, state_elems,
 };
 use crate::residency::Alloc;
 
@@ -228,24 +227,28 @@ fn refuse(detail: impl Into<String>) -> SessionError {
     }
 }
 
-/// The shape facts every layer must share, each set by the first layer that
-/// has one and held by every later layer: the rope table's base (one table
-/// serves one) and the MoE's experts-and-picks shape.
-#[derive(Default)]
-struct SharedShapes {
-    rope_base: Option<f32>,
-    moe: Option<(usize, usize)>,
+/// Refusal `e` of layer `l`, naming the layer.
+fn at_layer(l: usize, e: SessionError) -> SessionError {
+    match e {
+        SessionError::Shape { what, detail } => SessionError::Shape {
+            what,
+            detail: format!("layer {l}: {detail}"),
+        },
+        other => other,
+    }
 }
 
-/// The file's tensors, copied into buffers on `device`.
+/// The file's tensors, copied into buffers on `device`. Every tensor named
+/// here was judged against the header by [`super::check`]; what the loader
+/// still refuses is a tensor whose bytes the split cannot give.
 struct Loader<'a> {
     device: Alloc<'a>,
     split: &'a Split,
 }
 
 impl Loader<'_> {
-    /// The type, shape and bytes of tensor `name`.
-    fn tensor(&self, name: &str) -> Result<(GgmlType, Vec<u64>, &[u8]), SessionError> {
+    /// The bytes of tensor `name`.
+    fn bytes(&self, name: &str) -> Result<&[u8], SessionError> {
         let (shard, info) = self
             .split
             .find(name)
@@ -254,243 +257,95 @@ impl Loader<'_> {
             .split
             .shard(shard)
             .ok_or_else(|| refuse(format!("{name}: shard {shard} is not open")))?;
-        let bytes = file
-            .data(info)
-            .map_err(|e| refuse(format!("{name}: {e}")))?;
-        Ok((info.ty, info.dims.clone(), bytes))
+        file.data(info).map_err(|e| refuse(format!("{name}: {e}")))
     }
 
-    /// F32 tensor `name` of `len` values.
-    fn f32s(&self, name: &str, len: usize) -> Result<MetalBuffer<f32>, SessionError> {
-        let (ty, dims, bytes) = self.tensor(name)?;
-        let n: u64 = dims.iter().product();
-        if ty != GgmlType::F32 || usize::try_from(n).ok() != Some(len) {
-            return Err(refuse(format!(
-                "{name} is {ty:?} {dims:?}; the step reads {len} F32 values"
-            )));
-        }
-        let values: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect();
-        let mut buffer = self.device.buffer(Elems(len))?;
-        buffer.write(&values)?;
-        Ok(buffer)
-    }
-
-    /// F32 tensor `name` of `len` values, or MLX's affine 8-bit tensor of the
-    /// same values, dequantized exactly at open through the host reader
-    /// (`s·q + b` in f32, the pair's product exact): the router and the
-    /// shared-expert gate never run a kernel, so no 8-bit path exists on the
-    /// card. The reader's own refusals (a non-finite scale or bias) name the
-    /// tensor and its block.
-    fn f32s_or_a8(&self, name: &str, len: usize) -> Result<MetalBuffer<f32>, SessionError> {
-        let (ty, dims, bytes) = self.tensor(name)?;
-        let n: u64 = dims.iter().product();
-        if usize::try_from(n).ok() != Some(len) {
-            return Err(refuse(format!(
-                "{name} is {ty:?} {dims:?}; the step reads {len} F32 values"
-            )));
-        }
-        let mut values = vec![0f32; len];
-        match ty {
+    /// The f32 values of `v`: an F32 tensor as it is, or MLX's affine 8-bit
+    /// tensor of the same values, dequantized exactly at open through the host
+    /// reader (`s·q + b` in f32, the pair's product exact). The reader's own
+    /// refusals (a non-finite scale or bias) name the tensor and its block.
+    fn values(&self, v: &Values) -> Result<MetalBuffer<f32>, SessionError> {
+        let bytes = self.bytes(&v.name)?;
+        let mut values = vec![0f32; v.len];
+        match v.ty {
             GgmlType::F32 => {
-                for (v, b) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
-                    *v = f32::from_le_bytes(*b);
+                for (x, b) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *x = f32::from_le_bytes(*b);
                 }
             }
             GgmlType::MLX_A8 => {
                 gguf::quant::dequant_row(GgmlType::MLX_A8, bytes, &mut values)
-                    .map_err(|e| refuse(format!("{name}: {e}")))?;
+                    .map_err(|e| refuse(format!("{}: {e}", v.name)))?;
             }
             other => {
                 return Err(refuse(format!(
-                    "{name} is {other:?}; the step reads F32 or MLX_A8"
+                    "{} is {other:?}; the step reads F32 or MLX_A8",
+                    v.name
                 )));
             }
         }
-        let mut buffer = self.device.buffer(Elems(len))?;
+        let mut buffer = self.device.buffer(Elems(v.len))?;
         buffer.write(&values)?;
         Ok(buffer)
     }
 
-    /// The quant and bytes of tensor `name`: `rows` rows of `cols`, every
-    /// axis past the first counted as rows, in a type a mat-vec runs.
-    fn rows(&self, name: &str, cols: usize, rows: usize) -> Result<(Quant, &[u8]), SessionError> {
-        let (ty, dims, bytes) = self.tensor(name)?;
-        let got_rows: u64 = dims.iter().skip(1).product();
-        let shape_ok = dims.first().and_then(|&c| usize::try_from(c).ok()) == Some(cols)
-            && usize::try_from(got_rows).ok() == Some(rows);
-        if !shape_ok {
-            return Err(refuse(format!(
-                "{name} is {dims:?}; the step reads {rows} rows of {cols}"
-            )));
-        }
-        let quant = Quant::of_ggml(ty).ok_or_else(|| {
-            refuse(format!(
-                "{name} is {ty:?}, which no mat-vec of this backend runs (Q4_K, Q6_K, MLX_A4)"
-            ))
-        })?;
-        Ok((quant, bytes))
-    }
-
-    /// Tensor `name` as its own buffer, with its quant.
-    fn quant(
-        &self,
-        name: &str,
-        cols: usize,
-        rows: usize,
-    ) -> Result<(Quant, MetalBuffer<u8>), SessionError> {
-        let (quant, bytes) = self.rows(name, cols, rows)?;
+    /// Site `s` as its own buffer.
+    fn site(&self, s: &Site) -> Result<MetalBuffer<u8>, SessionError> {
+        let bytes = self.bytes(&s.name)?;
         let mut buffer = self.device.buffer(Elems(bytes.len()))?;
         buffer.write(bytes)?;
-        Ok((quant, buffer))
+        Ok(buffer)
     }
 
-    /// The P1 of `parts` (each a tensor and its rows, all of `cols`), normed
-    /// on load by `norm`: one dispatch per weight type, its segments in the
-    /// order given, each part's output at the offset its place in `parts`
-    /// gives. Returns the P1 and every part's output range.
-    fn p1(
-        &self,
-        norm: &str,
-        parts: &[(&str, usize)],
-        cols: usize,
-    ) -> Result<(P1, Vec<Range<usize>>), SessionError> {
-        let mut ranges = Vec::with_capacity(parts.len());
-        let mut tensors = Vec::with_capacity(parts.len());
-        let mut at = 0usize;
-        for &(name, rows) in parts {
-            let (quant, bytes) = self.rows(name, cols, rows)?;
-            if !cols.is_multiple_of(quant.values_per_block()) {
-                return Err(refuse(format!(
-                    "{norm}'s P1 reads {cols} columns, not whole blocks of {}",
-                    quant.values_per_block()
-                )));
-            }
-            ranges.push(at..at + rows);
-            tensors.push((quant, rows, bytes, at));
-            at += rows;
-        }
-        let mut dispatches: Vec<P1Part> = Vec::new();
-        for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
-            let mine: Vec<_> = tensors.iter().filter(|t| t.0 == quant).collect();
-            if mine.is_empty() {
-                continue;
-            }
-            if mine.len() > MAX_SEGMENTS {
-                return Err(refuse(format!(
-                    "{norm}'s P1 has {} {quant:?} tensors; a dispatch takes {MAX_SEGMENTS}",
-                    mine.len()
-                )));
-            }
-            let bytes: usize = mine.iter().map(|t| t.2.len()).sum();
-            let mut host = Vec::with_capacity(bytes);
-            let mut segments = Vec::with_capacity(mine.len());
-            let mut out_end = 0;
-            for &&(_, rows, b, out_at) in &mine {
+    /// The P1 of `p`: one dispatch per weight type, its segments in the order
+    /// the layout gives, each site's output at the offset its place gives.
+    /// Returns the P1 and every site's output range.
+    fn p1(&self, p: &P1Layout) -> Result<(P1, Vec<Range<usize>>), SessionError> {
+        let mut parts: Vec<P1Part> = Vec::with_capacity(p.dispatches.len());
+        for d in &p.dispatches {
+            let bytes: Vec<&[u8]> = d
+                .members
+                .iter()
+                .map(|&i| self.bytes(&p.sites[i].name))
+                .collect::<Result<_, _>>()?;
+            let mut host = Vec::with_capacity(bytes.iter().map(|b| b.len()).sum());
+            let mut segments = Vec::with_capacity(d.members.len());
+            for (&i, b) in d.members.iter().zip(&bytes) {
+                let site = &p.sites[i];
                 segments.push(Segment {
-                    cols,
-                    rows,
-                    weight_blocks: host.len() / quant.block_bytes(),
-                    out_offset: out_at,
+                    cols: site.cols,
+                    rows: site.rows,
+                    weight_blocks: host.len() / d.quant.block_bytes(),
+                    out_offset: p.range(i).start,
                 });
                 host.extend_from_slice(b);
-                out_end = out_end.max(out_at + rows);
             }
             let mut weights = self.device.buffer(Elems(host.len()))?;
             weights.write(&host)?;
-            dispatches.push(P1Part {
-                quant,
+            parts.push(P1Part {
+                quant: d.quant,
                 weights,
                 segments,
-                out_end,
+                out_end: d.out_end,
             });
         }
-        let norm = self.f32s(norm, cols)?;
+        let norm = self.values(&p.norm)?;
         Ok((
-            P1 {
-                norm,
-                parts: dispatches,
-            },
-            ranges,
+            P1 { norm, parts },
+            (0..p.sites.len()).map(|i| p.range(i)).collect(),
         ))
     }
 
-    /// Layer `l`'s buffers: the mixer its plan and description agree on, the
-    /// FFN of the expert shape every layer shares, the facts the layers must
-    /// share read from and set on `shared` (the first layer that has one sets
-    /// each). A refusal of layer `l` names it.
-    fn layer(
-        &self,
-        plan: &LayerPlan,
-        layer: &LayerSpec,
-        l: usize,
-        hidden: usize,
-        ctx: usize,
-        shared: &mut SharedShapes,
-    ) -> Result<LayerBufs, SessionError> {
-        let at = |e: SessionError| match e {
-            SessionError::Shape { what, detail } => SessionError::Shape {
-                what,
-                detail: format!("layer {l}: {detail}"),
-            },
-            other => other,
+    /// One layer's buffers, from its layout.
+    fn layer(&self, layer: &LayerLayout, top_k: usize) -> Result<LayerBufs, SessionError> {
+        let mixer = match &layer.mixer {
+            MixerLayout::Delta(d) => MixerBufs::Delta(delta(self, d)?),
+            MixerLayout::Attention(a) => MixerBufs::Attention(attention(self, a)?),
         };
-        let mixer = match (&plan.mixer, &layer.mixer) {
-            (MixerPlan::Delta(d), SpecMixer::DeltaRule(_)) => {
-                MixerBufs::Delta(delta(self, d, hidden).map_err(at)?)
-            }
-            (MixerPlan::Gqa(g), SpecMixer::Gqa(spec_g)) => {
-                if spec_g.rope.dims as usize != ROT {
-                    return Err(at(refuse(format!(
-                        "a rope over {} values; the attention turns {ROT}",
-                        spec_g.rope.dims
-                    ))));
-                }
-                match shared.rope_base {
-                    None => shared.rope_base = Some(spec_g.rope.base),
-                    Some(b) if b == spec_g.rope.base => {}
-                    Some(b) => {
-                        return Err(at(refuse(format!(
-                            "a rope base of {}, another layer's is {b}; one table serves one",
-                            spec_g.rope.base
-                        ))));
-                    }
-                }
-                MixerBufs::Attention(attention(self, g, hidden, ctx).map_err(at)?)
-            }
-            _ => {
-                return Err(at(refuse(
-                    "the plan's mixer and the description's differ".to_string(),
-                )));
-            }
-        };
-        let Ffn::Moe(m) = &layer.ffn else {
-            return Err(at(refuse(
-                "a dense FFN, which this backend's experts do not run".to_string(),
-            )));
-        };
-        let shape = (m.experts as usize, m.top_k as usize);
-        match shared.moe {
-            None => shared.moe = Some(shape),
-            Some(s) if s == shape => {}
-            Some(s) => {
-                return Err(at(refuse(format!(
-                    "{shape:?} experts and picks, another layer's are {s:?}"
-                ))));
-            }
-        }
-        if m.expert_ff as usize != EXPERT_K {
-            return Err(at(refuse(format!(
-                "an expert of {}; the experts run {EXPERT_K}",
-                m.expert_ff
-            ))));
-        }
-        let ffn = ffn(self, self.device, plan, hidden, shape, l).map_err(at)?;
-        Ok(LayerBufs { mixer, ffn })
+        Ok(LayerBufs {
+            mixer,
+            ffn: ffn(self, self.device, &layer.ffn, top_k)?,
+        })
     }
 }
 
@@ -542,134 +397,57 @@ fn delta_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&DeltaBufs, 
 /// multiplication in f32 as ggml's `rope_yarn` does with no YaRN — chain's
 /// [`RopeTable`] over a window spec, the one owner of the recipe both
 /// backends' tables come from.
-fn rope_rows(ctx: usize, base: f32) -> Result<Vec<f32>, SessionError> {
-    let table = RopeTable::new(&RopeSpec::window(base, ROT))
-        .map_err(|e| refuse(format!("the rope table: {e}")))?;
-    let positions = u32::try_from(ctx).expect("the arena checked the cache's rows fit u32");
+fn rope_rows(table: &RopeTable, ctx: usize) -> Vec<f32> {
+    let positions = u32::try_from(ctx).expect("the check made the cache's rows fit u32");
     let mut out = Vec::with_capacity(ctx * ROT);
     for pos in 0..positions {
         table.push(pos, Direction::Forward, &mut out);
     }
-    Ok(out)
+    out
 }
 
 impl Arena {
-    /// The arena of `plans` (read from `split`, whose description is
-    /// `spec`) at `ctx` positions, past one segment of keys or within it. A
-    /// `ctx` of no rows or past the file's trained context, a length one of
-    /// the session's buffers does not fit, a shape no launch runs, or a type
-    /// no launch reads is refused by name.
+    /// The arena of `g` (the layout [`super::check`] resolved from `split`'s
+    /// header): each weight copied from `split` into a buffer of its own, and
+    /// every buffer a token touches made, all zeroed but the weights, the
+    /// rope table and the lane words.
     pub(super) fn open(
         device: Alloc<'_>,
         split: &Split,
-        spec: &ModelSpec,
-        plans: &[LayerPlan],
-        ctx: usize,
+        g: &Layout,
     ) -> Result<Arena, SessionError> {
-        if ctx == 0 {
-            return Err(refuse(format!(
-                "a cache of {ctx} rows; a session holds at least one"
-            )));
-        }
-        let trained = spec.ctx_train as usize;
-        if ctx > trained {
-            return Err(refuse(format!(
-                "a cache of {ctx} rows; the file was trained to {trained}"
-            )));
-        }
-        // Every length the session holds of `ctx` rows, before any of them
-        // is allocated.
-        let word = ctx_word(ctx)?;
-        let _ = f16_len(ctx)
-            .ok_or_else(|| refuse(format!("the f16 cache of {ctx} rows does not fit")))?;
-        let rope_len = ctx
-            .checked_mul(ROT)
-            .ok_or_else(|| refuse(format!("the rope table of {ctx} rows does not fit")))?;
-        let segments = segments_for_keys(word) as usize;
-        let attn_partials = partials_len(segments).ok_or_else(|| {
-            refuse(format!(
-                "the attention partials of {segments} segments do not fit"
-            ))
-        })?;
-        let hidden = spec.hidden as usize;
-        let vocab = spec.vocab as usize;
-        if hidden != HEAD_K || hidden != router::K {
-            return Err(refuse(format!(
-                "a hidden width of {hidden}; the head and the router read {HEAD_K}"
-            )));
-        }
-        if vocab == 0 {
-            return Err(refuse(
-                "a vocabulary of 0; the head reads at least one row".to_string(),
-            ));
-        }
-        if plans.len() != spec.layers.len() {
-            return Err(refuse(format!(
-                "{} plans for {} layers",
-                plans.len(),
-                spec.layers.len()
-            )));
-        }
+        let (hidden, vocab, ctx) = (g.hidden, g.vocab, g.ctx);
         let load = Loader { device, split };
-        let (embed_quant, embed) = load.quant(&names::token_embd(), hidden, vocab)?;
-        if !matches!(embed_quant, Quant::Q4K | Quant::A4) {
-            return Err(refuse(format!(
-                "{} is {embed_quant:?}; the embedding reads Q4_K or MLX_A4",
-                names::token_embd()
-            )));
+        let embed = load.site(&g.embed)?;
+        let head_w = load.site(&g.head)?;
+        let head_norm = load.values(&g.head_norm)?;
+        let mut layers = Vec::with_capacity(g.layers.len());
+        for (l, layer) in g.layers.iter().enumerate() {
+            layers.push(load.layer(layer, g.top_k).map_err(|e| at_layer(l, e))?);
         }
-        let (head_quant, head_w) = load.quant(&names::output(), hidden, vocab)?;
-        if !matches!(head_quant, Quant::Q6K | Quant::A4) {
-            return Err(refuse(format!(
-                "{} is {head_quant:?}; the head reads Q6_K or MLX_A4",
-                names::output()
-            )));
-        }
-        let head_norm = load.f32s(&names::output_norm(), hidden)?;
-        let mut shared = SharedShapes::default();
-        let mut layers = Vec::with_capacity(plans.len());
-        for (l, (plan, layer)) in plans.iter().zip(&spec.layers).enumerate() {
-            layers.push(load.layer(plan, layer, l, hidden, ctx, &mut shared)?);
-        }
-        let (n_experts, top_k) = shared.moe.ok_or_else(|| refuse("a file of no layer"))?;
-        let base = shared
-            .rope_base
-            .ok_or_else(|| refuse("no attention layer to read the rope from"))?;
-        let mut rope = device.buffer(Elems(rope_len))?;
-        rope.write(&rope_rows(ctx, base)?)?;
-        let proj = layers
-            .iter()
-            .flat_map(|l| match &l.mixer {
-                MixerBufs::Delta(d) => &d.p1.parts,
-                MixerBufs::Attention(a) => &a.p1.parts,
-            })
-            .map(|p| p.out_end)
-            .max()
-            .ok_or_else(|| refuse("a file of no layer"))?;
+        let mut rope = device.buffer(Elems(g.rope_len))?;
+        rope.write(&rope_rows(&g.rope, ctx))?;
         let mut lane = device.buffer(Elems(LANES))?;
         lane.write(&LANE_WORDS)?;
         Ok(Arena {
             hidden,
             vocab,
             ctx,
-            eps: spec.rms_eps,
-            top_k,
-            n_experts,
+            eps: g.eps,
+            top_k: g.top_k,
+            n_experts: g.n_experts,
             layers,
-            embed_quant,
+            embed_quant: g.embed.quant,
             embed,
-            head_quant,
+            head_quant: g.head.quant,
             head_w,
             head_norm,
             x: zeroed(device, hidden)?,
-            proj: zeroed(device, proj)?,
+            proj: zeroed(device, g.proj)?,
             g: zeroed(device, VALUE_HEADS * HEAD_COLS)?,
             delta_partials: zeroed(device, VALUE_HEADS * PARTIALS_PER_HEAD)?,
-            attn: zeroed(
-                device,
-                out_len().ok_or_else(|| refuse("the attention output does not fit"))?,
-            )?,
-            attn_partials: zeroed(device, attn_partials)?,
+            attn: zeroed(device, g.attn_out)?,
+            attn_partials: zeroed(device, g.attn_partials)?,
             attn_ticket: zeroed(device, 1)?,
             rope,
             h: zeroed(device, EXPERT_SLOTS * EXPERT_K)?,
@@ -950,186 +728,69 @@ impl Arena {
     }
 }
 
-/// `ctx` as the launches' word.
-fn ctx_word(ctx: usize) -> Result<u32, SessionError> {
-    u32::try_from(ctx).map_err(|_| refuse(format!("a cache of {ctx} rows does not fit u32")))
-}
-
-/// The value-head map the delta launch reads.
-fn head_map(map: KHeadMap) -> HeadMap {
-    match map {
-        KHeadMap::Tiled => HeadMap::Tiled,
-        KHeadMap::Grouped => HeadMap::Grouped,
-    }
-}
-
-fn delta(
-    load: &Loader<'_>,
-    d: &chain::arch::qwen3moe::plan::DeltaPlan,
-    hidden: usize,
-) -> Result<DeltaBufs, SessionError> {
-    let LinearShape { n_k, n_v, map } = d.shape;
-    if n_v != VALUE_HEADS {
-        return Err(refuse(format!(
-            "{n_v} value heads; the delta step runs {VALUE_HEADS}"
-        )));
-    }
-    let ch = channels(n_k).ok_or_else(|| refuse(format!("{n_k} key heads do not fit")))?;
-    let z_len = VALUE_HEADS * HEAD_COLS;
-    let (p1, ranges) = load.p1(
-        &d.attn_norm,
-        &[
-            (&d.qkv, ch),
-            (&d.gate, z_len),
-            (&d.beta, VALUE_HEADS),
-            (&d.alpha, VALUE_HEADS),
-        ],
-        hidden,
-    )?;
-    let (out_quant, out) = load.quant(&d.ssm_out, z_len, hidden)?;
-    if !matches!(out_quant, Quant::Q4K | Quant::A4) {
-        return Err(refuse(format!(
-            "{} is {out_quant:?}; the head-norm projection reads Q4_K or MLX_A4",
-            d.ssm_out
-        )));
-    }
+fn delta(load: &Loader<'_>, d: &DeltaLayout) -> Result<DeltaBufs, SessionError> {
+    let (p1, ranges) = load.p1(&d.p1)?;
+    let out = load.site(&d.out)?;
     let device = load.device;
-    let state = zeroed(
-        device,
-        state_elems(LANES).ok_or_else(|| refuse("the delta state does not fit"))?,
-    )?;
-    let ring = zeroed(
-        device,
-        ring_elems(n_k).ok_or_else(|| refuse("the conv ring does not fit"))?,
-    )?;
+    let state = zeroed(device, d.state)?;
+    let ring = zeroed(device, d.ring)?;
     Ok(DeltaBufs {
         qkv: ranges[0].clone(),
         z: ranges[1].clone(),
         beta: ranges[2].clone(),
         alpha: ranges[3].clone(),
         p1,
-        conv: load.f32s(&d.conv, crate::kernels::CONV_TAPS * ch)?,
-        dt_bias: load.f32s(&d.dt_bias, VALUE_HEADS)?,
-        ssm_a: load.f32s(&d.ssm_a, VALUE_HEADS)?,
-        ssm_norm: load.f32s(&d.ssm_norm, HEAD_COLS)?,
+        conv: load.values(&d.conv)?,
+        dt_bias: load.values(&d.dt_bias)?,
+        ssm_a: load.values(&d.ssm_a)?,
+        ssm_norm: load.values(&d.ssm_norm)?,
         out,
-        out_quant,
+        out_quant: d.out.quant,
         state,
         ring,
-        n_k,
-        map: head_map(map),
+        n_k: d.n_k,
+        map: d.map,
     })
 }
 
-fn attention(
-    load: &Loader<'_>,
-    g: &chain::arch::qwen3moe::plan::GqaPlan,
-    hidden: usize,
-    ctx: usize,
-) -> Result<AttnBufs, SessionError> {
-    let q_rows = qg_len().ok_or_else(|| refuse("the query rows do not fit"))?;
-    let kv_rows = KV_HEADS * HEAD_DIM;
-    let (p1, ranges) = load.p1(
-        &g.attn_norm,
-        &[
-            (&g.attn_q, q_rows),
-            (&g.attn_k, kv_rows),
-            (&g.attn_v, kv_rows),
-        ],
-        hidden,
-    )?;
-    let att = out_len().ok_or_else(|| refuse("the attention rows do not fit"))?;
-    let (out_quant, out) = load.quant(&g.attn_output, att, hidden)?;
-    let cache = f16_len(ctx).ok_or_else(|| refuse("the cache does not fit"))?;
+fn attention(load: &Loader<'_>, a: &AttnLayout) -> Result<AttnBufs, SessionError> {
+    let (p1, ranges) = load.p1(&a.p1)?;
+    let out = load.site(&a.out)?;
     let device = load.device;
     Ok(AttnBufs {
         q: ranges[0].clone(),
         k: ranges[1].clone(),
         v: ranges[2].clone(),
         p1,
-        q_norm: load.f32s(&g.attn_q_norm, HEAD_DIM)?,
-        k_norm: load.f32s(&g.attn_k_norm, HEAD_DIM)?,
+        q_norm: load.values(&a.q_norm)?,
+        k_norm: load.values(&a.k_norm)?,
         out,
-        out_quant,
-        k_cache: zeroed(device, cache)?,
-        v_cache: zeroed(device, cache)?,
+        out_quant: a.out.quant,
+        k_cache: zeroed(device, a.cache)?,
+        v_cache: zeroed(device, a.cache)?,
     })
 }
 
 fn ffn(
     load: &Loader<'_>,
     device: Alloc<'_>,
-    plan: &LayerPlan,
-    hidden: usize,
-    (n_experts, top_k): (usize, usize),
-    l: usize,
+    f: &FfnLayout,
+    top_k: usize,
 ) -> Result<FfnBufs, SessionError> {
-    match &plan.ffn.route {
-        FfnRoute::Router {
-            shared: Some(SharedPlan::Joined),
-            ..
-        } => {}
-        FfnRoute::Router {
-            shared: Some(SharedPlan::Apart(_)),
-            ..
-        } => {
-            return Err(refuse(
-                "a shared expert of another type than its stacks, which the fold does not run",
-            ));
-        }
-        FfnRoute::Router { shared: None, .. } => {
-            return Err(refuse(
-                "a router with no shared expert, which the router does not run",
-            ));
-        }
-        FfnRoute::Dense => {
-            return Err(refuse(
-                "a dense FFN, which this backend's experts do not run",
-            ));
-        }
-    }
-    if n_experts != router::EXPERTS || top_k != ROUTED_IDS {
-        return Err(refuse(format!(
-            "{n_experts} experts picking {top_k}; the router and the experts run \
-             {} picking {ROUTED_IDS}",
-            router::EXPERTS
-        )));
-    }
-    // The file's tensors, under the plan's file-side names (chain's one
-    // owner of the naming): the plan names the joined stacks, which this
-    // backend reads as the routed stack and the shared expert apart.
-    let file = file_names(l);
-    let (gq, gate) = load.quant(&file.gate, hidden, EXPERT_K * n_experts)?;
-    let (uq, up) = load.quant(&file.up, hidden, EXPERT_K * n_experts)?;
-    let (sgq, shexp_gate) = load.quant(&file.sh_gate, hidden, EXPERT_K)?;
-    let (suq, shexp_up) = load.quant(&file.sh_up, hidden, EXPERT_K)?;
-    if [uq, sgq, suq].iter().any(|&q| q != gq) {
-        return Err(refuse(format!(
-            "gate {gq:?}, up {uq:?}, shared gate {sgq:?}, shared up {suq:?}; the pair runs \
-             one type"
-        )));
-    }
-    let (dq, down) = load.quant(&file.down, EXPERT_K, hidden * n_experts)?;
-    let (sdq, shexp_down) = load.quant(&file.sh_down, EXPERT_K, hidden)?;
-    if sdq != dq {
-        return Err(refuse(format!(
-            "down {dq:?}, shared down {sdq:?}; the fold runs one type"
-        )));
-    }
     Ok(FfnBufs {
-        norm: load.f32s(&plan.ffn.ffn_norm, hidden)?,
+        norm: load.values(&f.norm)?,
         // The router and the shared-expert gate: F32 in a GGUF file, MLX's
         // affine 8-bit in an MLX file, dequantized exactly at open.
-        gate_inp: load.f32s_or_a8(&file.router, n_experts * hidden)?,
-        gate_inp_shexp: load.f32s_or_a8(&file.router_gate, hidden)?,
-        gate_up_quant: gq,
-        gate,
-        up,
-        shexp_gate,
-        shexp_up,
-        down_quant: dq,
-        down,
-        shexp_down,
+        gate_inp: load.values(&f.gate_inp)?,
+        gate_inp_shexp: load.values(&f.gate_inp_shexp)?,
+        gate_up_quant: f.gate_up_quant,
+        gate: load.site(&f.gate)?,
+        up: load.site(&f.up)?,
+        shexp_gate: load.site(&f.shexp_gate)?,
+        shexp_up: load.site(&f.shexp_up)?,
+        down_quant: f.down_quant,
+        down: load.site(&f.down)?,
+        shexp_down: load.site(&f.shexp_down)?,
         logits: zeroed(device, router::ROWS)?,
         ids: zeroed(device, top_k + 1)?,
         weights: zeroed(device, top_k + 1)?,

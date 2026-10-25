@@ -80,14 +80,15 @@ use bloomery_device::fault::Fault;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy, kinds35};
-use chain::arch::qwen3moe::read::{PlanDims, Read35, Sites35, layer_plans};
+use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy};
+use chain::arch::qwen3moe::read::Sites35;
 use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
 use runtime::prompt::PrefillMode;
 use runtime::seqstate::{self, Kept};
 
 use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
+use super::check;
 use super::count::{GroupBytes, GroupKind, Layer};
 use super::ops::{Feed, MetalOps, RowsCtx};
 use super::rows::{RowsArena, SnapBufs};
@@ -106,7 +107,7 @@ use crate::stream::{
 };
 use objc2_metal::MTLDevice;
 
-const WHAT: &str = "qwen35moe session";
+pub(super) const WHAT: &str = "qwen35moe session";
 
 /// The most rows of one pass, and the spacing of a prompt call's inner
 /// checkpoints ([`runtime::seqstate::marks`]): a mark falls between two
@@ -207,7 +208,7 @@ impl From<ChainError> for SessionError {
     }
 }
 
-fn refuse(detail: impl Into<String>) -> SessionError {
+pub(super) fn refuse(detail: impl Into<String>) -> SessionError {
     SessionError::Shape {
         what: WHAT,
         detail: detail.into(),
@@ -711,20 +712,10 @@ impl Session {
         let started = Instant::now();
         let split = Split::open(path)
             .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
-        let read = model::arch::qwen35moe::spec::read(&split)
-            .map_err(|e| refuse(format!("{}: {e}", path.display())))?;
-        let spec = read.spec;
-        let kinds = kinds35(&spec.layers)?;
-        let pd = PlanDims::q35(&spec, WHAT)?;
-        let plans = layer_plans(
-            &split,
-            WHAT,
-            &pd,
-            &kinds,
-            &spec.layers,
-            &SITES,
-            Read35::Whole,
-        )?;
+        // Every refusal the header and tensor table hold, in the order the
+        // checks meet them; the open stops at the first.
+        let checked = check::check(&split, ctx).checked_or_first()?;
+        let plans = checked.plans;
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
         let residency = stream
@@ -732,7 +723,7 @@ impl Session {
             .ok_or_else(|| refuse("the stream made no residency set"))?;
         let staged = residency.stage();
         let alloc = Alloc::new(device.metal(), &staged);
-        let arena = Arena::open(alloc, &split, &spec, &plans, ctx)?;
+        let arena = Arena::open(alloc, &split, &checked.layout)?;
         let load = started.elapsed();
         let started = Instant::now();
         let mut rows = RowsArena::open(alloc, &arena, pass_rows_max().min(arena.ctx))?;

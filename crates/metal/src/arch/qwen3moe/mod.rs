@@ -5,11 +5,15 @@
 
 #[cfg(target_os = "macos")]
 mod arena;
+#[cfg(target_os = "macos")]
+pub mod check;
 pub mod count;
 #[cfg(target_os = "macos")]
 pub mod generate;
 #[cfg(target_os = "macos")]
 mod ops;
+#[cfg(target_os = "macos")]
+pub mod plan;
 #[cfg(target_os = "macos")]
 mod rows;
 #[cfg(target_os = "macos")]

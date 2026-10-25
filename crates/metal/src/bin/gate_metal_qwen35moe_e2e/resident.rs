@@ -11,6 +11,10 @@
 //!   across `Session::open` by the set's bytes, to within one page a buffer
 //!   (the two counts round a buffer differently), so a kernel buffer made
 //!   outside the set shows as bytes the set lacks;
+//! - the plan of the same header (`generate_metal --plan`, read from the
+//!   header alone) counts the buffers the set holds, and its bytes bound the
+//!   set's: the bytes it asks of the driver at least, each buffer rounded up
+//!   to a page at most;
 //! - the open makes the rows arena too, so the first pass allocates nothing
 //!   on the device and adds nothing to the set;
 //! - a submit after a gap of [`KEEP`] renews the request once, and a submit
@@ -22,6 +26,8 @@ use std::time::Duration;
 
 use bloomery_device::Device;
 use bloomery_device::conformance::{Clause, Verdict, why};
+use bloomery_metal::arch::qwen3moe::check::{self, Tally};
+use bloomery_metal::arch::qwen3moe::plan;
 use bloomery_metal::arch::qwen3moe::session::{PassOut, Session, StateOut, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
@@ -56,7 +62,22 @@ fn held(device: &MetalDevice) -> Result<u64, String> {
     Ok(info.total_bytes.saturating_sub(info.free_bytes))
 }
 
+/// What the plan of `path`'s header says the open makes buffers of at [`CTX`]
+/// rows: the same read `generate_metal --plan` makes, no weight byte touched.
+fn planned(path: &Path) -> Result<Tally, String> {
+    let header = plan::open_header(path)?;
+    let outcome = check::check(&header.split, CTX);
+    let items: Vec<String> = outcome.items.iter().map(|i| i.error.to_string()).collect();
+    let checked = outcome
+        .checked
+        .ok_or_else(|| format!("the plan refuses the file the open opened: {items:?}"))?;
+    Ok(checked.bytes().map_err(says)?.total())
+}
+
 pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    // Read before the open: the keep rule below counts the time from the
+    // open's request, so nothing but the clause's own steps may fill it.
+    let plan = planned(path)?;
     let before = held(device)?;
     let mut s = Session::open_with(device, library, path, CTX, 2048).map_err(says)?;
     let opened = held(device)? - before;
@@ -66,6 +87,15 @@ pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Claus
             "the open allocated {opened} bytes on the device; the residency set holds {} bytes in \
              {} buffers",
             at_open.bytes, at_open.buffers
+        ));
+    }
+    if plan.buffers != at_open.buffers as u64
+        || !(plan.requested..=plan.paged).contains(&at_open.bytes)
+    {
+        return Err(format!(
+            "the plan counts {} buffers of {}..={} bytes; the residency set holds {} buffers of \
+             {} bytes",
+            plan.buffers, plan.requested, plan.paged, at_open.buffers, at_open.bytes
         ));
     }
     if at_open.requests != 1 {
@@ -113,11 +143,14 @@ pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Claus
     }
     Ok(Verdict::Noted(format!(
         "the open allocated {opened} bytes, the rows arena's {} among them; the residency set \
-         holds {} buffers of them to within a page each; the first pass allocated nothing and \
-         added nothing to the set; a step after {:?} idle renewed the request once, two steps \
+         holds {} buffers of them to within a page each, as many as the plan of the header counts \
+         ({}..={} bytes asked, rounded to pages); the first pass allocated nothing and added \
+         nothing to the set; a step after {:?} idle renewed the request once, two steps \
          straight after the pass renewed none",
         s.rows_arena_bytes(),
         at_open.buffers,
+        plan.requested,
+        plan.paged,
         KEEP + GAP_MARGIN
     )))
 }

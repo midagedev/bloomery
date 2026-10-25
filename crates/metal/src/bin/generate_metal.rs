@@ -7,6 +7,7 @@
 //!     generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--profile [N]] [--profile-layers]
 //!                    [--step-times [N]] [--prefill batch|steps] [--pass-times U]
+//!     generate_metal --plan [--ctx C]
 //!
 //! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
 //! flag given twice takes its last value. `--prompt` tokenizes the text with
@@ -70,6 +71,15 @@
 //! profiled token runs one command buffer a group, waited, which the real
 //! step's single buffer does not.
 //!
+//! `--plan` reads the file's header and tensor table alone (no weight byte, no
+//! device buffer) and prints, on stdout, what the open would find: the
+//! description, the room the device and the host report beside the bytes the
+//! open would make buffers of, every refusal the open's checks meet (not the
+//! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
+//! items` (exit 3). A file whose data section is cut short is read as a header
+//! alone; a header the plan cannot read is a named error and exit 64. It takes
+//! no generation flag.
+//!
 //! A bad flag or a bad value is a named error and exit 2; a refusal of the
 //! device, the session or the tokenizer, or a fault the device raised, is a
 //! named error and exit 1 — never a partial result presented as success.
@@ -88,8 +98,10 @@ mod cli {
     use std::time::{Duration, Instant};
 
     use bloomery_device::Device;
+    use bloomery_metal::arch::qwen3moe::check;
     use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
     use bloomery_metal::arch::qwen3moe::generate::greedy;
+    use bloomery_metal::arch::qwen3moe::plan;
     use bloomery_metal::arch::qwen3moe::session::{
         Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode,
     };
@@ -106,8 +118,11 @@ mod cli {
 
     const USAGE: &str = "\
 generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
+generate_metal --plan [--ctx C]
   the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
-  and the file's context_length; --print-ids prints the ids, not the text;
+  and the file's context_length; --plan reads the header alone and prints
+  every refusal the open would make, the bytes it would allocate and the
+  room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
   --profile [N] (default 32) steps N more tokens after the summary, each
   group's GPU time and bytes printed; --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
@@ -126,7 +141,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         "--pass-times",
     ];
     /// The flags that stand alone.
-    const BARE_FLAGS: [&str; 3] = ["--print-ids", "--help", "--profile-layers"];
+    const BARE_FLAGS: [&str; 4] = ["--print-ids", "--help", "--profile-layers", "--plan"];
     /// The profile tokens' default count, and the step-times' per mode.
     const PROFILE_DEFAULT: usize = 32;
 
@@ -355,19 +370,24 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             None => {
                 let split = gguf::Split::open(&a.model)
                     .map_err(|e| format!("{}: {e}", a.model.display()))?;
-                let train = split
-                    .arch_get_u64("context_length")
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or_else(|| {
-                        format!(
-                            "{}: {} is absent or not a count",
-                            a.model.display(),
-                            split.arch_key("context_length")
-                        )
-                    })?;
-                Ok(CTX_DEFAULT.min(train))
+                default_ctx(&split, &a.model)
             }
         }
+    }
+
+    /// The smaller of the default cap and `split`'s `context_length`.
+    fn default_ctx(split: &gguf::Split, model: &std::path::Path) -> Result<usize, String> {
+        let train = split
+            .arch_get_u64("context_length")
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{}: {} is absent or not a count",
+                    model.display(),
+                    split.arch_key("context_length")
+                )
+            })?;
+        Ok(CTX_DEFAULT.min(train))
     }
 
     /// The generated text as it completes: the tokenizer's streaming
@@ -733,6 +753,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             eprintln!("generate_metal: {e}");
             return ExitCode::from(1);
         }
+        if has_flag("--plan") {
+            return plan_run();
+        }
         let a = match parse() {
             Ok(a) => a,
             Err(e) => {
@@ -747,6 +770,86 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 ExitCode::from(1)
             }
         }
+    }
+
+    /// `--plan`: the header's plan on stdout, the code it ends with. It takes
+    /// `--ctx` and no other flag but `--help`, which `parse` answers first
+    /// in a generation run: a flag that would do nothing here is refused by
+    /// name.
+    fn plan_run() -> ExitCode {
+        if let Some(name) = unknown_flag() {
+            eprintln!("generate_metal: {name} is not a flag of this CLI");
+            return ExitCode::from(2);
+        }
+        if has_flag("--help") {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        let other = std::env::args().skip(1).find(|a| {
+            (VALUE_FLAGS.contains(&a.as_str()) && a != "--ctx")
+                || (BARE_FLAGS.contains(&a.as_str()) && a != "--plan")
+                || COUNT_FLAGS.contains(&a.as_str())
+        });
+        if let Some(name) = other {
+            eprintln!("generate_metal: --plan reads the header alone; {name} is a generation flag");
+            return ExitCode::from(2);
+        }
+        let ctx = match flag("--ctx") {
+            Ok(None) => None,
+            Ok(Some(s)) => match s.parse::<usize>() {
+                Ok(c) if c > 0 => Some(c),
+                Ok(_) => {
+                    eprintln!("generate_metal: --ctx {s}: a cache of no rows");
+                    return ExitCode::from(2);
+                }
+                Err(e) => {
+                    eprintln!("generate_metal: --ctx {s}: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+            Err(e) => {
+                eprintln!("generate_metal: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let model = match std::env::var_os(MODEL_ENV) {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => {
+                eprintln!(
+                    "generate_metal: no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
+                );
+                return ExitCode::from(2);
+            }
+        };
+        match plan_of(&model, ctx) {
+            Ok(printed) => {
+                for line in &printed.lines {
+                    println!("{line}");
+                }
+                ExitCode::from(printed.code)
+            }
+            Err(e) => {
+                eprintln!("generate_metal: --plan: {e}");
+                ExitCode::from(plan::EXIT_UNREADABLE)
+            }
+        }
+    }
+
+    fn plan_of(model: &std::path::Path, ctx: Option<usize>) -> Result<plan::Printed, String> {
+        let header = plan::open_header(model)?;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => default_ctx(&header.split, model)?,
+        };
+        let outcome = check::check(&header.split, ctx);
+        Ok(plan::render(
+            model,
+            header.data,
+            ctx,
+            &outcome,
+            &plan::device_room(),
+            &plan::HostMemory::probe(),
+        ))
     }
 
     fn generate(a: &Args) -> Result<(), String> {
