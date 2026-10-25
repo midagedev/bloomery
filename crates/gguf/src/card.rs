@@ -383,6 +383,11 @@ pub enum HeadEntry {
     /// `Q8F32Kernels::enqueue_bf16_gemv` over BF16 words and normed f32 rows,
     /// then `argmax_finite_fault`.
     Bf16,
+    /// The q8_1 quantizer, the `_sel` Q5_K gemv over the matrix as one expert
+    /// (`QuantSelKernels::enqueue_gemv_q5k_sel`), then `argmax_fault`; one
+    /// row (`m = 1`), whose logits the sel gemv writes in the layout the
+    /// argmax reads.
+    Q5k,
 }
 
 /// A card embedding row lookup: the rows of the ids dequantized token-major,

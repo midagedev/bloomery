@@ -710,6 +710,8 @@ mod tests {
 
     // PIN(2026-10-20): the head and embedding pairs gain BF16 (`bf16_gemv`
     // over the head's words, `embed_rows_bf16`); every other pair is unchanged.
+    // PIN(2026-10-25): the head gains Q5_K (the `_sel` Q5_K gemv over the matrix
+    // as one expert, one row); every other pair is unchanged.
     #[test]
     fn head_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -717,6 +719,7 @@ mod tests {
             [
                 (GgmlType::Q8_0, HeadEntry::Q8_0),
                 (GgmlType::Q4_K, HeadEntry::Q4k),
+                (GgmlType::Q5_K, HeadEntry::Q5k),
                 (GgmlType::Q6_K, HeadEntry::Q6k),
                 (GgmlType::BF16, HeadEntry::Bf16),
             ]

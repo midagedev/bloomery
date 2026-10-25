@@ -94,7 +94,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q4_K, name: "q4_K", blck: 256, bytes: 144, dequant: true, host_act: H::Q8_2X4,
            card: card!(KQuant        KQuant        Q4k     (Q4k, Q8Act)        Q4k    Q4k     Q4k  Q4k) },
     QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4,
-           card: card!(KQuant        -             Q5k     (Q5k, Q8Act)        Q5k    Q5k     -    Q5k) },
+           card: card!(KQuant        -             Q5k     (Q5k, Q8Act)        Q5k    Q5k     Q5k  Q5k) },
     QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4,
            card: card!(KQuant        KQuant        Q6k     (Q6k, Q8Act)        Q6k    Q6k     Q6k  Q6k) },
     // q8_K: ggml's activation form, mainline's block (llama.cpp 36a73916 ggml-common.h:371-376, ggml.c:880): float d, 256 int8

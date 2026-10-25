@@ -33,7 +33,9 @@
 use crate::Gpu;
 use crate::GpuError;
 use crate::fault::{Fault, FaultSink, LAYER_HEAD};
+use crate::kquant::SelDown;
 use crate::q8f32::{E4m3GemvArgs, E4m3Weight, GemvOut};
+use crate::quant_sel::QuantSelKernels;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
@@ -45,6 +47,7 @@ use model::placement::kernels::{self, HeadEntry};
 /// words over the f32 rows.
 enum OutW<'a> {
     Q6K(&'a DeviceTensor<u32>),
+    Q5K(&'a DeviceTensor<u32>),
     Q4K(&'a DeviceTensor<u32>),
     Q8_0 {
         qs: &'a DeviceTensor<u32>,
@@ -58,7 +61,7 @@ impl OutW<'_> {
     /// Its rows: the vocabulary.
     fn rows(&self) -> usize {
         match self {
-            OutW::Q6K(w) | OutW::Q4K(w) | OutW::Bf16(w) => w.rows(),
+            OutW::Q6K(w) | OutW::Q5K(w) | OutW::Q4K(w) | OutW::Bf16(w) => w.rows(),
             OutW::Q8_0 { d, .. } => d.rows(),
             OutW::E4m3(w) => w.qs.rows(),
         }
@@ -87,6 +90,7 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
     match w.get(HEAD_TENSOR) {
         Some(DevWeight::KQuant { ty, w, k }) => match kernels::head(*ty) {
             Some(HeadEntry::Q6k) => Ok((OutW::Q6K(w), *k)),
+            Some(HeadEntry::Q5k) => Ok((OutW::Q5K(w), *k)),
             Some(HeadEntry::Q4k) => Ok((OutW::Q4K(w), *k)),
             Some(HeadEntry::Q8_0 | HeadEntry::Bf16) | None => Err(GpuError::shape(
                 "head_out_w",
@@ -117,11 +121,13 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
 fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
     match head_out_w(w)?.0 {
         OutW::Q6K(w) => Ok(w),
-        OutW::Q4K(_) | OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_) => Err(GpuError::tensor(
-            "head_q6k_w",
-            HEAD_TENSOR,
-            "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
-        )),
+        OutW::Q5K(_) | OutW::Q4K(_) | OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_) => {
+            Err(GpuError::tensor(
+                "head_q6k_w",
+                HEAD_TENSOR,
+                "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
+            ))
+        }
     }
 }
 
@@ -209,6 +215,15 @@ pub struct Head {
     /// The ticket count of an f32-activation head of `m > 1` rows (its argmax's blocks
     /// each draw one), zero between launches; `None` for every other head.
     rows_done: Option<DeviceBuffer<u32>>,
+    /// A Q5_K head's gemv: the `_sel` kernels and the one expert's id.
+    q5k: Option<Q5kHead>,
+}
+
+/// The kernels a Q5_K head's projection launches: the `_sel` Q5_K gemv, which
+/// reads the matrix as a stack of one expert.
+struct Q5kHead {
+    kernels: QuantSelKernels,
+    one: DeviceBuffer<u32>,
 }
 
 impl Head {
@@ -286,6 +301,19 @@ impl Head {
         } else {
             None
         };
+        let q5k = match out_w {
+            OutW::Q5K(_) if m != 1 => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("{HEAD_TENSOR} is Q5_K: its gemv runs one row, got m={m}"),
+                ));
+            }
+            OutW::Q5K(_) => Some(Q5kHead {
+                kernels: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
+                one: DeviceBuffer::zeroed(stream, 1)?,
+            }),
+            _ => None,
+        };
         let x = DeviceBuffer::zeroed(stream, m * hidden)?;
         let fin = match norm {
             HeadNorm::Rms => Final::Rms {
@@ -309,6 +337,7 @@ impl Head {
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
             rows_done,
+            q5k,
         })
     }
 
@@ -346,6 +375,7 @@ impl Head {
             + self.logits.num_bytes()
             + self.token_out.num_bytes()
             + self.rows_done.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.q5k.as_ref().map_or(0, |q| q.one.num_bytes())
             + self.act.as_ref().map_or(0, Q8Act::device_bytes)
     }
 
@@ -380,6 +410,28 @@ impl Head {
                 let act = held(&mut self.act)?;
                 gpu.enqueue_quantize_q8_1_head(rows, act)?;
                 gpu.enqueue_gemv_q6k(out_w, &*act, &mut self.logits)?;
+            }
+            OutW::Q5K(out_w) => {
+                let act = held(&mut self.act)?;
+                gpu.enqueue_quantize_q8_1_head(rows, act)?;
+                let q = self.q5k.as_ref().ok_or_else(|| {
+                    GpuError::state(
+                        "Head::enqueue",
+                        "a Q5_K head's kernels (made with the head)",
+                    )
+                })?;
+                q.kernels.enqueue_gemv_q5k_sel(
+                    stream,
+                    &SelDown {
+                        w: out_w,
+                        act: &*act,
+                        sel: &q.one,
+                        n_slots: 1,
+                        rows_per_expert: out_w.rows(),
+                    },
+                    fault,
+                    &mut self.logits,
+                )?;
             }
             OutW::Q4K(out_w) => {
                 let act = held(&mut self.act)?;
@@ -583,6 +635,115 @@ impl Head {
 mod tests {
     use super::*;
     use crate::fault::{FAULT_NONE, FaultSite};
+    use gguf::Split;
+    use gguf::quant::{GgmlType, dequant_row};
+    use gguf::write::{Layout, TensorDecl, Writer};
+
+    /// Bytes of one Q5_K super-block.
+    const Q5K_BLOCK: usize = 176;
+
+    /// Next value of a xorshift64 stream.
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// `rows` rows of `k` values of Q5_K as the file's block bytes: random
+    /// codes, and each block's `d` and `dmin` a small finite f16, so no dot is
+    /// NaN or infinite.
+    fn q5k_rows(rows: usize, k: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut out = vec![0u8; rows * (k / 256) * Q5K_BLOCK];
+        for block in out.chunks_exact_mut(Q5K_BLOCK) {
+            for chunk in block.chunks_mut(8) {
+                let v = next(&mut state).to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
+            for scale in block[..4].chunks_mut(2) {
+                let (exp, mant) = (5 + next(&mut state) % 4, next(&mut state) & 0x3ff);
+                let bits = u16::try_from(exp << 10 | mant).expect("an f16");
+                scale.copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// A Q5_K `output.weight` is read by the head as the file's rows: each
+    /// logit is the host's dot of the dequantized row with the normed input,
+    /// within the q8_1 rounding of that input, and the argmax is the card's
+    /// own logits' maximum.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_q5k_head_projects_the_rows_it_reads() {
+        const K: usize = 512;
+        const N_VOCAB: usize = 600;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let rows = q5k_rows(N_VOCAB, K);
+        let gain: Vec<u8> = (0..K).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let decls = vec![
+            TensorDecl {
+                name: HEAD_TENSOR.to_string(),
+                dims: vec![K as u64, N_VOCAB as u64],
+                type_id: GgmlType::Q5_K.as_u32(),
+                nbytes: rows.len() as u64,
+            },
+            TensorDecl {
+                name: output_norm().to_string(),
+                dims: vec![K as u64],
+                type_id: GgmlType::F32.as_u32(),
+                nbytes: gain.len() as u64,
+            },
+        ];
+        let dir = std::env::temp_dir().join(format!("bloomery-q5k-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("head.gguf");
+        let layout = Layout::new(&[], decls.clone()).expect("a layout");
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the file"));
+        let mut writer = Writer::new(file, layout).expect("a writer");
+        writer.tensor(&decls[0].name, &rows).expect("the rows");
+        writer.tensor(&decls[1].name, &gain).expect("the gain");
+        writer.finish().expect("a finished file");
+        let split = Split::open(&path).expect("the file opens");
+        let w = Weights::load_where(gpu.stream(), &split, |_| true).expect("resident");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut head = Head::new(&gpu, &w, 1e-6).expect("a Q5_K head");
+        assert_eq!((head.hidden(), head.n_vocab()), (K, N_VOCAB));
+        let x: Vec<f32> = (0..K)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+            .collect();
+        head.set_input(&gpu, &x).expect("the input");
+        head.enqueue(&gpu, &w).expect("the head");
+        let normed = head.normed_to_host(&gpu).expect("the normed row");
+        let logits = head.logits_to_host(&gpu).expect("the logits");
+        assert_eq!(logits.len(), N_VOCAB);
+        let row_bytes = K / 256 * Q5K_BLOCK;
+        let mut wv = vec![0.0f32; K];
+        for (r, &got) in logits.iter().enumerate() {
+            dequant_row(
+                GgmlType::Q5_K,
+                &rows[r * row_bytes..(r + 1) * row_bytes],
+                &mut wv,
+            )
+            .expect("a Q5_K row");
+            let terms = wv
+                .iter()
+                .zip(&normed)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b));
+            let want: f64 = terms.clone().sum();
+            let scale = terms.map(|t| t * t).sum::<f64>().sqrt();
+            assert!(
+                (f64::from(got) - want).abs() <= 0.03 * scale + 1e-6,
+                "row {r}: the card's {got}, the host's {want} (the row's own scale {scale})"
+            );
+        }
+        let best = (0..N_VOCAB)
+            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+            .expect("a vocabulary");
+        assert_eq!(head.token(&gpu).expect("the token") as usize, best);
+    }
 
     /// The readback's seeded (0, 0) pair is an unwritten readback, not a
     /// fault: the error names the state, with no device fault in it.
