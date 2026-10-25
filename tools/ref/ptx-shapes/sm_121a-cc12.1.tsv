@@ -499,3 +499,13 @@ gate_qwen3vl_tower vis_row_op 0 0
 gate_qwen3vl_tower vis_silu_mul 0 0
 gate_qwen3vl_tower vis_silu_mul_clamp 0 0
 gate_qwen3vl_tower vis_unfold 0 0
+generate_ds41   gemm_iq1m                                0           0
+generate_ds41   gemm_iq1s                                0           0
+generate_ds41   gemm_iq2s                                0           0
+generate_ds41   gemm_iq2xs                               0           0
+generate_ds41   iq1_m_gate_up_sel                        0           0
+generate_ds41   iq1_m_gemv_sel                           0           0
+generate_ds41   iq1_s_gate_up_sel                        0           0
+generate_ds41   iq1_s_gemv_sel                           0           0
+generate_ds41   iq2_s_gate_up_sel                        0           0
+generate_ds41   iq2_s_gemv_sel                           0           0

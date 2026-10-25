@@ -507,3 +507,13 @@ generate_ds41   sigmoid_256_8_router                     0           0
 generate_ds41   sigmoid_256_8_router_pick                0           0
 generate_ds41   softcap_rows                             0           0
 generate_ds41   swiglu_rule_rows                         0           0
+generate_ds41   gemm_iq1m                                0           0
+generate_ds41   gemm_iq1s                                0           0
+generate_ds41   gemm_iq2s                                0           0
+generate_ds41   gemm_iq2xs                               0           0
+generate_ds41   iq1_m_gate_up_sel                        0           0
+generate_ds41   iq1_m_gemv_sel                           0           0
+generate_ds41   iq1_s_gate_up_sel                        0           0
+generate_ds41   iq1_s_gemv_sel                           0           0
+generate_ds41   iq2_s_gate_up_sel                        0           0
+generate_ds41   iq2_s_gemv_sel                           0           0
