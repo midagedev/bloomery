@@ -268,10 +268,8 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 ## Known limits (0.3.9)
 
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
-- The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and keep no saved prompt states; `--parallel`
-  above 1 is refused by name.
-- MiniMax-M3.1 keeps no saved prompt states either: a turn that continues the slot's conversation reuses it; another
-  conversation in between replaces it.
+- The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot; `--parallel` above 1 is refused by name.
+  The `nemotron`, `raon1` and `solar2` seats keep no saved prompt states.
 - `--place bp` is refused by name on the `nemotron` seat, Qwen3.6 and Qwen3-30B; they run one card plus the host tier.
 - Nemotron-3.5-Lightning `UD-Q4_K_XL` is a placed load: its whole-card expert body is IQ2_XXS, and the other expert
   types stay on the host.

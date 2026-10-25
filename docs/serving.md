@@ -532,16 +532,18 @@ decode starts warm (on by default, with `--place` unset, `a` or `bp`). On Qwen3.
 decode has routed experts of its own puts the pool back where it found it at its end, so a long prompt does not
 reset the placement its reply decodes from; a fresh server's calls keep it.
 
-**Prompt cache (V4.1, Qwen3.8, GLM-5.3).** `--cache-ram` (MiB; 0 turns it off) keeps saved sequence states in host RAM.
+**Prompt cache (V4.1, Qwen3.8, GLM-5.3, MiMo, MiniMax-M3, Muse Spark).** `--cache-ram` (MiB; 0 turns it off) keeps saved sequence states in host RAM.
 By default the budget is the lesser of 8 GiB and half the host RAM the plan leaves, with every slot's checkpoints and
 the residency's churn pool counted in; the checkpoint budget follows the slot context. A request that continues an
 earlier conversation (its prompt holds the whole earlier prompt) restores that state even after another request used
 the slot. A request that shares only part of an earlier prompt, such as the same system prompt with another question,
 restores too: a saved state keeps checkpoints at 512·2^i positions below its end and the last one, and a shared
 prefix restores at the largest of them inside it. On Qwen3.8 the card's own checkpoints are 4,096 positions
-apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. The
-MiMo, Qwen3, MiniMax-M3 and Muse Spark seats keep only the longest prefix the live slot holds; they run no saved
-prompt cache, and a save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
+apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. On
+MiniMax-M3 and Muse Spark a saved state is the K and V rows of the held positions (and MiniMax's index keys), with no
+checkpoints: a request that shares any prefix with a saved state restores that prefix, and only those rows go back to
+the card. The MiMo and Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
+save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
 `<|im_start|>`, the seat cuts prompt calls at message starts, so a shared system prompt stays in the live slot
 for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
