@@ -2,7 +2,7 @@
 """Generate crates/gguf/src/iq_tables.rs from ggml's sources, or check it.
 
 The i-quant codebooks (iq2xxs_grid, iq2xs_grid, iq3xxs_grid, iq3s_grid, ksigns_iq2xs, kmask_iq2xs,
-kvalues_iq4nl) are data, not code: this script is their one transcription.
+kvalues_iq4nl, iq2s_grid, iq1s_grid) are data, not code: this script is their one transcription.
 It reads them from the ggml tree the reference harnesses link ($IK), writes
 them as Rust `const` arrays, and prints each table's md5 over its
 little-endian bytes. The generated file carries those md5 values; `--check`
@@ -39,6 +39,9 @@ TABLES = [
     ("iq3xxs_grid", "IQ3XXS_GRID", "uint32_t", 256),
     ("iq3s_grid", "IQ3S_GRID", "uint32_t", 512),
     ("kvalues_iq4nl", "KVALUES_IQ4NL", "int8_t", 16),
+    ("iq2s_grid", "IQ2S_GRID", "uint64_t", 1024),
+    # The header spells the count NGRID_IQ1S (2048); the length check below holds it.
+    ("iq1s_grid", "IQ1S_GRID", "uint64_t", 2048),
 ]
 
 RUST_TY = {"uint8_t": "u8", "uint32_t": "u32", "uint64_t": "u64", "int8_t": "i8"}
@@ -66,7 +69,7 @@ def extract(tree, cname, ctype, n):
         with open(path, encoding="utf-8") as f:
             text = f.read()
         pats = [
-            r"GGML_TABLE_BEGIN\(\s*%s\s*,\s*%s\s*,\s*%d\s*\)(.*?)GGML_TABLE_END\(\)"
+            r"GGML_TABLE_BEGIN\(\s*%s\s*,\s*%s\s*,\s*(?:%d|NGRID_IQ1S)\s*\)(.*?)GGML_TABLE_END\(\)"
             % (re.escape(ctype), cname, n),
             r"static\s+const\s+%s\s+%s\s*\[\s*%d\s*\]\s*=\s*\{(.*?)\};"
             % (re.escape(ctype), cname, n),
