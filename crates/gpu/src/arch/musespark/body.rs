@@ -49,6 +49,7 @@
 
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Names, Site, norm_rows};
 use crate::card_slots::CardAcc;
+use crate::checkpoint::saved::Identity;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{FlashGqaKernels, GROUP, Gqa64Args, HEAD_64, SEGMENTS, window_segments};
@@ -86,12 +87,14 @@ use std::sync::Arc;
 
 mod placed;
 mod prefill;
+mod seq;
 mod stream;
 mod tier;
 
 pub use placed::Placed;
 use placed::{PlacedOpen, StepWalk, plan_map};
 use prefill::{PASS_ROWS_MAX, PassSizes, Prompt, choose_pass_rows, placed_rows};
+pub use seq::MuseSeq;
 use stream::XSide;
 pub use stream::{STREAM_FLOOR, XSTREAM_COSTS};
 
@@ -572,6 +575,8 @@ pub struct Body {
     prompt: Prompt,
     /// The prompt calls' host streaming ([`stream`]).
     xs: XSide,
+    /// What a saved sequence belongs to ([`seq`]).
+    who: Identity,
 }
 
 /// How a load holds the routed experts.
@@ -966,6 +971,7 @@ impl Body {
             placed,
             prompt,
             xs: XSide::default(),
+            who: Identity::of_load("musespark", file, gpu, ctx)?,
         })
     }
 
@@ -1010,6 +1016,7 @@ impl Body {
             placed,
             prompt: _prompt,
             xs: _xs,
+            who: _who,
         } = self;
         let sh = *sh;
         let cx = GqaCx {

@@ -27,6 +27,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::arch::hybrid::{Acts, GqaGate, GqaLayer, Site};
+use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::flash_gqa::{GROUP_16, HEAD, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
@@ -258,6 +259,8 @@ pub struct Body {
     /// The positions the live sequence's stores hold: a step at `pos` needs `pos <= at`, and it leaves
     /// `pos + 1`. A select exchanges it with the parked sequence's.
     pub(crate) at: u32,
+    /// What a saved sequence belongs to ([`crate::seq`]).
+    pub(crate) who: Identity,
     /// Sequences the load's plan counts, the live one included.
     slots_planned: usize,
     /// Sequences allocated, the live one included. Grows in [`Slots::new_seq`].
@@ -604,6 +607,7 @@ impl Body {
             units,
             slots,
             at: 0,
+            who: Identity::of_load("minimaxm3", file, gpu, dims.ctx)?,
             k: Kernels::load(gpu)?,
             rope,
             shape: msa,

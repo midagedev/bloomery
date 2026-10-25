@@ -13,6 +13,7 @@
 //! - [`body`]: the load, the stores, the buffers, [`body::Body`];
 //! - [`step`]: the one-token step's walk;
 //! - [`ffn`]: the routed block with its shared expert around the host leg, and the dense block;
+//! - [`seq`]: the sequence's rows on the host, for a server's prompt cache;
 //! - [`stream`]: the family's facts for the common walk's host streaming (`BLOOMERY_XSTREAM`);
 //! - [`tier`]: the expert tier card's node family over the common card leg.
 
@@ -21,9 +22,11 @@ pub mod body;
 pub mod ffn;
 pub mod forced;
 pub mod prefill;
+pub mod seq;
 pub mod step;
 pub mod stream;
 pub mod tier;
 
 pub use body::{Body, MiniMaxM3Model, StepInput, set_taps};
 pub use forced::{ForcedRoute, ForcedRow};
+pub use seq::MiniMaxSeq;
