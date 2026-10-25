@@ -34,7 +34,10 @@
 //!   synthetic depth is no method of this model: the body is not
 //!   `Instrumented`, so a seed is a compile error, not a refusal to check.
 //! - (v) reload: a probe context holds the card across two loads, both device
-//!   bundles JIT'd on it before the first reading and by neither load; the
+//!   bundles JIT'd on it before the first reading and by neither load, every
+//!   kernel's code mapped with its bundle (`CUDA_MODULE_LOADING=EAGER`, which
+//!   the gate requires: lazy loading maps a kernel's code at its first launch,
+//!   inside load 1, and the context keeps that granule past the drop); the
 //!   first model's drop gives back everything but what its chain capture took
 //!   from the context (iv) and, when the body held page-locked shadows, the
 //!   one 2 MiB mapping granule that capture keeps; the second load takes what
@@ -130,7 +133,20 @@ mod gate {
     /// position a step through the host tier.
     const R8_PROMPT: usize = 16;
 
+    /// The module loading check (v)'s readings need: every kernel's code
+    /// mapped when its bundle loads, before the first reading.
+    const MODULE_LOADING: &str = "EAGER";
+
     pub fn run() -> Result<(), GateError> {
+        let loading = std::env::var("CUDA_MODULE_LOADING").unwrap_or_default();
+        if loading != MODULE_LOADING {
+            return Err(format!(
+                "refusing before any context: CUDA_MODULE_LOADING is {loading:?}, check (v) needs \
+                 {MODULE_LOADING:?} (a lazily loaded kernel maps its code inside load 1 and the \
+                 context keeps it past the drop)"
+            )
+            .into());
+        }
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
         crate::gate_card::init()?;

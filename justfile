@@ -3079,7 +3079,7 @@ kld-diff A B *ARGS:
 # reads the routed gates and ups from the file, and the r8 load, last, leaves the sidecar's pages cached.
 [group('v41-load')]
 gate-ds41-load:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_load && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_load'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_load && CUDA_MODULE_LOADING=EAGER BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_load'
 
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
