@@ -43,13 +43,10 @@ const CTX: usize = 64;
 /// The ids of the pass: more than a step's window.
 const PASS_IDS: usize = 12;
 
-/// The page both counts round a buffer to.
-const PAGE: u64 = 16 * 1024;
-
 /// Whether the device's `held` growth and the set's `bytes` agree to within a
 /// page a buffer of `buffers`.
 fn agree(held: u64, bytes: u64, buffers: usize) -> bool {
-    held.abs_diff(bytes) <= buffers as u64 * PAGE
+    held.abs_diff(bytes) <= buffers as u64 * check::PAGE
 }
 
 /// How far past [`KEEP`] the idle gap sleeps, so a clock that wakes late

@@ -281,16 +281,7 @@ generate_metal --plan [--ctx C]
                 "-n 0: a generation of 0 tokens: token 0 comes out of the prompt call".into(),
             );
         }
-        let ctx = match flag("--ctx")? {
-            None => None,
-            Some(s) => {
-                let c: usize = s.parse().map_err(|e| format!("--ctx {s}: {e}"))?;
-                if c == 0 {
-                    return Err(format!("--ctx {s}: a cache of no rows"));
-                }
-                Some(c)
-            }
-        };
+        let ctx = ctx_flag()?;
         let print_ids = has_flag("--print-ids");
         // `--profile-layers` alone implies the profile.
         let profile_n = count_flag("--profile");
@@ -371,6 +362,20 @@ generate_metal --plan [--ctx C]
                 let split = gguf::Split::open(&a.model)
                     .map_err(|e| format!("{}: {e}", a.model.display()))?;
                 default_ctx(&split, &a.model)
+            }
+        }
+    }
+
+    /// The `--ctx` value: absent, or a count of at least one row.
+    fn ctx_flag() -> Result<Option<usize>, String> {
+        match flag("--ctx")? {
+            None => Ok(None),
+            Some(s) => {
+                let c: usize = s.parse().map_err(|e| format!("--ctx {s}: {e}"))?;
+                if c == 0 {
+                    return Err(format!("--ctx {s}: a cache of no rows"));
+                }
+                Ok(Some(c))
             }
         }
     }
@@ -794,19 +799,8 @@ generate_metal --plan [--ctx C]
             eprintln!("generate_metal: --plan reads the header alone; {name} is a generation flag");
             return ExitCode::from(2);
         }
-        let ctx = match flag("--ctx") {
-            Ok(None) => None,
-            Ok(Some(s)) => match s.parse::<usize>() {
-                Ok(c) if c > 0 => Some(c),
-                Ok(_) => {
-                    eprintln!("generate_metal: --ctx {s}: a cache of no rows");
-                    return ExitCode::from(2);
-                }
-                Err(e) => {
-                    eprintln!("generate_metal: --ctx {s}: {e}");
-                    return ExitCode::from(2);
-                }
-            },
+        let ctx = match ctx_flag() {
+            Ok(c) => c,
             Err(e) => {
                 eprintln!("generate_metal: {e}");
                 return ExitCode::from(2);

@@ -383,7 +383,7 @@ impl Outcome {
         match self.checked {
             Some(checked) => Ok(checked),
             None => Err(self.items.into_iter().next().map_or_else(
-                || session_shape("the file was refused with no item named".to_owned()),
+                || super::session::refuse("the file was refused with no item named".to_owned()),
                 |item| item.error,
             )),
         }
@@ -402,11 +402,6 @@ pub fn check(split: &Split, ctx: usize) -> Outcome {
         checked: if items.is_empty() { checked } else { None },
         items,
     }
-}
-
-/// A refusal of the description, worded as the session words its own.
-fn session_shape(detail: String) -> SessionError {
-    super::session::refuse(detail)
 }
 
 /// The plan of layer `l`'s mixer of kind `kind`, at the lists `sites`: the
@@ -509,6 +504,34 @@ fn refused_sites(split: &Split, names: impl IntoIterator<Item = String>) -> Vec<
         .collect()
 }
 
+/// The facts of `spec` a plan prints first, before any check.
+fn summarize(split: &Split, spec: &ModelSpec) -> Summary {
+    let delta = spec
+        .layers
+        .iter()
+        .filter(|l| matches!(l.mixer, SpecMixer::DeltaRule(_)))
+        .count();
+    let (experts, picks) = spec
+        .layers
+        .iter()
+        .find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => Some((m.experts as usize, m.top_k as usize)),
+            Ffn::Dense { .. } => None,
+        })
+        .unwrap_or((0, 0));
+    Summary {
+        arch: split.architecture().unwrap_or("").to_owned(),
+        layers: spec.layers.len(),
+        delta,
+        attention: spec.layers.len() - delta,
+        hidden: spec.hidden as usize,
+        vocab: spec.vocab as usize,
+        experts,
+        picks,
+        ctx_train: spec.ctx_train as usize,
+    }
+}
+
 fn read(
     split: &Split,
     ctx: usize,
@@ -527,34 +550,11 @@ fn read(
                 items: &mut *items,
                 layer: None,
             }
-            .push(session_shape(format!("{path}: {e}")));
+            .push(super::session::refuse(format!("{path}: {e}")));
             return None;
         }
     };
-    let delta = spec
-        .layers
-        .iter()
-        .filter(|l| matches!(l.mixer, SpecMixer::DeltaRule(_)))
-        .count();
-    let (experts, picks) = spec
-        .layers
-        .iter()
-        .find_map(|l| match &l.ffn {
-            Ffn::Moe(m) => Some((m.experts as usize, m.top_k as usize)),
-            Ffn::Dense { .. } => None,
-        })
-        .unwrap_or((0, 0));
-    *summary = Some(Summary {
-        arch: split.architecture().unwrap_or("").to_owned(),
-        layers: spec.layers.len(),
-        delta,
-        attention: spec.layers.len() - delta,
-        hidden: spec.hidden as usize,
-        vocab: spec.vocab as usize,
-        experts,
-        picks,
-        ctx_train: spec.ctx_train as usize,
-    });
+    *summary = Some(summarize(split, &spec));
     let (kinds, pd) = match kinds35(&spec.layers)
         .and_then(|kinds| PlanDims::q35(&spec, WHAT).map(|pd| (kinds, pd)))
     {
@@ -1147,19 +1147,6 @@ impl Bytes {
 }
 
 impl Checked {
-    /// The layers: how many of each mixer.
-    #[must_use]
-    pub fn mixers(&self) -> (usize, usize) {
-        let delta = delta_heads(&self.layout.layers).count();
-        (delta, self.layout.layers.len() - delta)
-    }
-
-    /// The cache rows the check was made at.
-    #[must_use]
-    pub fn ctx(&self) -> usize {
-        self.layout.ctx
-    }
-
     /// The bytes the open makes buffers of: every buffer the arena makes, and
     /// the rows arena of the pass the session holds, from the lengths the
     /// open sizes them by.
@@ -1474,11 +1461,107 @@ mod tests {
         let out = check(&t.split(), CTX);
         assert!(out.items.is_empty(), "{:?}", out.items);
         let checked = out.checked.expect("a checked file");
-        assert_eq!(checked.mixers(), (1, 1));
         // The weights the plan counts are the file's tensors, byte for byte.
         let bytes = checked.bytes().expect("the bytes");
         assert_eq!(bytes.weights.requested, t.tensor_bytes());
         assert!(bytes.total().paged >= bytes.total().requested);
+    }
+
+    /// One class of buffers from the byte size of each: how many, the bytes
+    /// asked of the driver and the bytes its pages count.
+    fn class(sizes: &[u64]) -> Tally {
+        Tally {
+            buffers: count(sizes.len()),
+            requested: sizes.iter().sum(),
+            paged: sizes.iter().map(|s| s.div_ceil(PAGE) * PAGE).sum(),
+        }
+    }
+
+    /// `Checked::bytes` over the synthetic table, class by class: the buffers
+    /// `Arena::open` and `RowsArena::open` make, listed here by field from the
+    /// table's shape (layer 0 delta with 16 key heads, layer 1 attention, 8
+    /// picks, a cache of `CTX` rows), so a buffer dropped from or added to one
+    /// list moves one class.
+    #[test]
+    fn the_bytes_pin_each_class_of_buffers() {
+        use super::super::arena::RECORD_SLOTS;
+        use crate::kernels::{LOGIT_STRIDE, RING_ROWS, prepared_elems, route_table_words};
+
+        const N_K: usize = 16;
+        const TOP_K: usize = 8;
+        let hidden = HIDDEN as usize;
+        let vocab = VOCAB as usize;
+        let t = Synthetic::new();
+        let checked = check(&t.split(), CTX).checked.expect("a checked file");
+        let bytes = checked.bytes().expect("the bytes");
+        let f32s = |n: usize| count(n) * 4;
+
+        // The K and the V cache of the attention layer, f16.
+        let cache = count(KV_HEADS * CTX * HEAD_DIM) * 2;
+        assert_eq!(bytes.kv, class(&[cache, cache]));
+
+        // The delta layer's state lanes and its conv ring.
+        let channels = (2 * N_K + VALUE_HEADS) * HEAD_COLS;
+        assert_eq!(
+            bytes.state,
+            class(&[
+                f32s(LANES * VALUE_HEADS * HEAD_COLS * HEAD_COLS),
+                f32s(RING_ROWS * channels),
+            ])
+        );
+
+        // Each layer's router (logits, picks, weights, partials, ticket), then
+        // the token arena's buffers in field order.
+        let router = [router::ROWS, TOP_K + 1, TOP_K + 1, router::PARTIALS, 1];
+        let proj = channels + VALUE_HEADS * HEAD_COLS + 2 * VALUE_HEADS;
+        let attn_partials =
+            partials_len(segments_for_keys(CTX as u32) as usize).expect("the partials fit");
+        let mut scratch: Vec<u64> = [router, router].concat().into_iter().map(f32s).collect();
+        scratch.extend(
+            [
+                hidden,                          // x
+                proj,                            // proj
+                VALUE_HEADS * HEAD_COLS,         // g
+                VALUE_HEADS * PARTIALS_PER_HEAD, // delta_partials
+                VALUE_HEADS * HEAD_COLS,         // attn
+                attn_partials,                   // attn_partials
+                1,                               // attn_ticket
+                CTX * ROT,                       // rope
+                EXPERT_SLOTS * EXPERT_K,         // h
+                vocab,                           // logits
+            ]
+            .map(f32s),
+        );
+        scratch.push(count(head_groups(vocab)) * 8); // candidates
+        scratch.extend([1, RECORD_SLOTS, 1, LANES].map(f32s)); // head_ticket, step_id, id_in, lane
+        scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
+        assert_eq!(bytes.scratch, class(&scratch));
+
+        // The rows arena of a pass of `cap` rows: ids, residual, normed input,
+        // P1 output, mixer rows, delta partials and prepared rows, logits, four
+        // slot lists, the route table, the pair's and the down's outputs.
+        let cap = pass_rows_max().min(CTX);
+        let slots = cap * EXPERT_SLOTS;
+        let prepared = prepared_elems(N_K).expect("the prepared row fits");
+        let rows = [
+            cap,
+            cap * hidden,
+            cap * hidden,
+            cap * proj.next_multiple_of(4),
+            cap * VALUE_HEADS * HEAD_COLS,
+            cap * VALUE_HEADS * PARTIALS_PER_HEAD,
+            cap * prepared,
+            cap * LOGIT_STRIDE,
+            slots,
+            slots,
+            slots,
+            slots,
+            route_table_words(slots, router::EXPERTS),
+            slots * EXPERT_K,
+            slots * hidden,
+        ]
+        .map(f32s);
+        assert_eq!(bytes.rows, class(&rows));
     }
 
     #[test]
