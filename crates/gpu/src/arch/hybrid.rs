@@ -38,6 +38,7 @@ use crate::site::{self, Form, KGemvKernels, SiteTy, SiteWeight, WideActs, WideKe
 use crate::tensor::{Pitched, dtod_2d};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window};
+use chain::arch::hybrid::plan::{MambaPlan, NopeGqaPlan};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::hybrid::{
@@ -563,22 +564,28 @@ pub(crate) fn residual(
     residual_rows(cx.gpu, cx.sh.hidden, src, delta, dst)
 }
 
-/// One Mamba-2 layer: the `ssm_in` output is `[z | xBC | dt]`, three views of
-/// the one buffer at `0`, `d_inner` and `d_inner + conv_dim` values (llama.cpp
-/// `build_mamba2_layer`'s views at `0`, `d_inner`, `2·d_inner + 2·n_group·d_state`).
+/// One Mamba-2 layer: [`mamba_in`], [`mamba_core`], [`mamba_out`] in order.
 pub(crate) fn mamba_layer(
     cx: &Cx<'_>,
     (l, m): (usize, &mut MambaLayer),
     (s, acts): (&mut Scratch, &mut Acts),
     (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
 ) -> Result<(), GpuError> {
-    let sh = cx.sh;
+    mamba_in(cx, (l, &*m), (&mut *s, &mut *acts), src)?;
+    mamba_core(cx, (l, &mut *m), &mut *s)?;
+    mamba_out(cx, (l, &*m), (s, acts), (src, dst))
+}
+
+/// A Mamba-2 layer's input side: the norm of `src` and the `ssm_in` projection, whose output is
+/// `[z | xBC | dt]`, three views of the one buffer at `0`, `d_inner` and `d_inner + conv_dim`
+/// values (llama.cpp `build_mamba2_layer`'s views at `0`, `d_inner`, `2·d_inner + 2·n_group·d_state`).
+pub(crate) fn mamba_in(
+    cx: &Cx<'_>,
+    (l, m): (usize, &MambaLayer),
+    (s, acts): (&mut Scratch, &mut Acts),
+    src: &DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
     let site_cx = cx.gqa();
-    let (inner, conv_dim, heads) = (
-        sh.mamba.geom().d_inner,
-        sh.mamba.conv_dim(),
-        sh.mamba.geom().n_heads,
-    );
     if m.ssm_in.ty.reads() == Form::Q8x128 {
         // The fused launch writes the normed row into `xn` and the q8_1 form
         // `ssm_in`'s gemv reads — the norm + quantize pair it folds, bit for
@@ -588,17 +595,32 @@ pub(crate) fn mamba_layer(
             cx.gpu.stream(),
             src,
             cx.f32(&m.norm)?,
-            sh.eps,
+            cx.sh.eps,
             act,
             &mut s.buf.xn,
             cx.gpu.layer_sink(l)?,
         )?;
-        m.ssm_in.kgemv(&site_cx, act, l, &mut s.buf.zxbcdt)?;
+        m.ssm_in.kgemv(&site_cx, act, l, &mut s.buf.zxbcdt)
     } else {
         norm(cx, &m.norm, src, &mut s.buf.xn)?;
         m.ssm_in
-            .project(&site_cx, acts, l, &s.buf.xn, &mut s.buf.zxbcdt)?;
+            .project(&site_cx, acts, l, &s.buf.xn, &mut s.buf.zxbcdt)
     }
+}
+
+/// A Mamba-2 layer's middle: the conv, the scan and the grouped norm over the views of
+/// `ssm_in`'s output, into `y`.
+pub(crate) fn mamba_core(
+    cx: &Cx<'_>,
+    (l, m): (usize, &mut MambaLayer),
+    s: &mut Scratch,
+) -> Result<(), GpuError> {
+    let sh = cx.sh;
+    let (inner, conv_dim, heads) = (
+        sh.mamba.geom().d_inner,
+        sh.mamba.conv_dim(),
+        sh.mamba.geom().n_heads,
+    );
     let f32s = size_of::<f32>();
     let z = Window::<f32>::of(&s.buf.zxbcdt, 0, inner)?;
     let xbc = Window::<f32>::of(&s.buf.zxbcdt, inner * f32s, conv_dim)?;
@@ -625,9 +647,19 @@ pub(crate) fn mamba_layer(
             state: &mut m.store.state,
             scratch: &mut s.mamba,
         },
-    )?;
+    )
+}
+
+/// A Mamba-2 layer's output side: the `ssm_out` projection of `y` and the residual add of `src`
+/// into `dst`.
+pub(crate) fn mamba_out(
+    cx: &Cx<'_>,
+    (l, m): (usize, &MambaLayer),
+    (s, acts): (&mut Scratch, &mut Acts),
+    (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+) -> Result<(), GpuError> {
     m.ssm_out
-        .project(&site_cx, acts, l, &s.buf.y, &mut s.buf.delta)?;
+        .project(&cx.gqa(), acts, l, &s.buf.y, &mut s.buf.delta)?;
     residual(cx, src, &s.buf.delta, dst)
 }
 
@@ -802,6 +834,74 @@ impl Names<'_> {
             norm,
         })
     }
+
+    /// Site `name` of `rows` rows of `k` values at the type `ty` a plan read from the file's header,
+    /// checked against the resident weight.
+    pub(crate) fn planned(
+        &self,
+        name: &str,
+        ty: SiteTy,
+        (rows, k): (usize, usize),
+    ) -> Result<Site, GpuError> {
+        site::site(self.w, self.what, name, (rows, k), ty)?;
+        Ok(Site::new(name.to_string(), ty, k))
+    }
+
+    /// The f32 vector `name` of `len` values, resident.
+    pub(crate) fn planned_vector(&self, name: &str, len: usize) -> Result<String, GpuError> {
+        site::vector(self.w, self.what, name.to_owned(), len)
+    }
+
+    /// Mamba-2 layer `p` on a `hidden`-value row and its scan store: [`Names::mamba`] from a plan
+    /// (the names and site types the chain read from the file's header), whose conv bias is the
+    /// zero vector [`derive_zero_conv_bias`] made where the plan holds none.
+    pub(crate) fn mamba_of(
+        &self,
+        p: &MambaPlan,
+        hidden: usize,
+        stream: &CudaStream,
+    ) -> Result<MambaLayer, GpuError> {
+        let (d_inner, d_state) = (p.shape.d_inner as usize, p.shape.d_state as usize);
+        let (n_heads, d_conv) = (p.shape.n_heads as usize, p.shape.d_conv as usize);
+        let lens = stores::mamba2_lens(d_inner, d_state, CONV_TAPS, p.conv_dim);
+        let conv_b = match &p.conv_b {
+            Some(name) => self.planned_vector(name, p.conv_dim)?,
+            None => site::vector(self.w, self.what, ZERO_CONV_BIAS.to_owned(), p.conv_dim)?,
+        };
+        Ok(MambaLayer {
+            ssm_in: self.planned(&p.ssm_in, p.in_ty, (p.shape.d_in_proj as usize, hidden))?,
+            ssm_out: self.planned(&p.ssm_out, p.out_ty, (hidden, d_inner))?,
+            a: self.planned_vector(&p.a, n_heads)?,
+            d: self.planned_vector(&p.d, n_heads)?,
+            dt_bias: self.planned_vector(&p.dt_bias, n_heads)?,
+            conv_w: self.planned_vector(&p.conv_w, d_conv * p.conv_dim)?,
+            conv_b,
+            ssm_norm: self.planned_vector(&p.ssm_norm, d_inner)?,
+            store: RecStore::new(stream, lens, 1)?,
+            norm: self.planned_vector(&p.norm, hidden)?,
+        })
+    }
+
+    /// Attention layer `p` on a `hidden`-value row, its K/V planes of `ctx` rows a key head, no out
+    /// gate: [`Names::attn`] from a plan.
+    pub(crate) fn attn_of(
+        &self,
+        p: &NopeGqaPlan,
+        (hidden, ctx): (usize, usize),
+        stream: &CudaStream,
+    ) -> Result<GqaLayer, GpuError> {
+        let width = p.n_kv * HEAD;
+        Ok(GqaLayer {
+            q: self.planned(&p.q, p.q_ty, (p.n_head * HEAD, hidden))?,
+            k: self.planned(&p.k, p.k_ty, (width, hidden))?,
+            v: self.planned(&p.v, p.v_ty, (width, hidden))?,
+            o: self.planned(&p.o, p.o_ty, (hidden, p.n_head * HEAD))?,
+            gate: GqaGate::None,
+            kc: DeviceTensor::zeroed(stream, p.n_kv * ctx, HEAD)?,
+            vc: DeviceTensor::zeroed(stream, p.n_kv * ctx, HEAD)?,
+            norm: self.planned_vector(&p.norm, hidden)?,
+        })
+    }
 }
 
 /// What a NoPE GQA layer's launches read, apart from a family's other
@@ -956,77 +1056,102 @@ fn out_gate(
     )
 }
 
-/// One NoPE GQA layer of `PACK` query heads a key head at one row: the
-/// norm, q·k·v (and the gate's projection), the plane appends, the flash
-/// pass, the out gate when the layer has one, `o`, the residual add of
-/// `src` into `dst`. The gate multiplies into `q`'s rows, which nothing reads
-/// after the flash pass; `o` reads them in place of `attn`.
+/// One NoPE GQA layer of `PACK` query heads a key head at one row: [`gqa_in`], [`gqa_core`],
+/// [`gqa_out`] in order.
 pub fn gqa_layer<const PACK: usize>(
     cx: &GqaCx<'_>,
     (l, a): (usize, &mut GqaLayer),
-    (b, acts): (GqaBufs<'_>, &mut Acts),
+    (mut b, acts): (GqaBufs<'_>, &mut Acts),
     (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
 ) -> Result<(), GpuError> {
-    let GqaBufs {
-        words,
-        row_word,
-        n_keys,
-        xn,
-        q,
-        k,
-        v,
-        g,
-        attn,
-        part_v,
-        part_ms,
-        delta,
-    } = b;
-    let fault = cx.gpu.layer_sink(l)?;
-    let mut gate = gate_rows(cx.what, &a.gate, g)?;
-    norm_rows((cx.gpu, cx.w), (cx.eps, cx.hidden, 1), &a.norm, src, xn)?;
-    a.q.project(cx, acts, l, xn, q)?;
-    a.k.project(cx, acts, l, xn, k)?;
-    a.v.project(cx, acts, l, xn, v)?;
+    gqa_in(cx, (l, &*a), (&mut b, &mut *acts), src)?;
+    gqa_core::<PACK>(cx, (l, &mut *a), &mut b)?;
+    gqa_out(cx, (l, &*a), (&mut b, acts), (src, dst))
+}
+
+/// A NoPE GQA layer's input side at one row: the norm of `src`, q·k·v, and the gate's projection
+/// when the layer has one.
+pub fn gqa_in(
+    cx: &GqaCx<'_>,
+    (l, a): (usize, &GqaLayer),
+    (b, acts): (&mut GqaBufs<'_>, &mut Acts),
+    src: &DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let mut gate = gate_rows(cx.what, &a.gate, b.g.as_deref_mut())?;
+    norm_rows(
+        (cx.gpu, cx.w),
+        (cx.eps, cx.hidden, 1),
+        &a.norm,
+        src,
+        &mut *b.xn,
+    )?;
+    a.q.project(cx, acts, l, &*b.xn, &mut *b.q)?;
+    a.k.project(cx, acts, l, &*b.xn, &mut *b.k)?;
+    a.v.project(cx, acts, l, &*b.xn, &mut *b.v)?;
     if let Some((site, g)) = gate.as_mut() {
-        site.project(cx, acts, l, xn, g)?;
+        site.project(cx, acts, l, &*b.xn, g)?;
     }
+    Ok(())
+}
+
+/// A NoPE GQA layer's middle at one row: the plane appends of `k` and `v`, the flash pass over
+/// `PACK` query heads a key head into `attn`, and the out gate multiplied into `q`'s rows when the
+/// layer has one.
+pub fn gqa_core<const PACK: usize>(
+    cx: &GqaCx<'_>,
+    (l, a): (usize, &mut GqaLayer),
+    b: &mut GqaBufs<'_>,
+) -> Result<(), GpuError> {
+    let fault = cx.gpu.layer_sink(l)?;
+    let gate = gate_rows(cx.what, &a.gate, b.g.as_deref_mut())?;
     let at = PlaneAppend {
-        words,
-        first_word: row_word,
+        words: b.words,
+        first_word: b.row_word,
         heads: cx.n_kv,
         m: 1,
         fault,
     };
     let flash = cx.gpu.flash();
-    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(k), &mut a.kc)?;
-    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(v), &mut a.vc)?;
+    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&*b.k), &mut a.kc)?;
+    flash.enqueue_kv_append_planes(cx.gpu.stream(), &at, head_rows(&*b.v), &mut a.vc)?;
     cx.flash.enqueue_pass::<PACK>(
         cx.gpu.stream(),
         GqaArgs {
-            q: &*q,
+            q: &*b.q,
             kc: a.kc.buf(),
             vc: a.vc.buf(),
-            n_keys,
+            n_keys: b.n_keys,
             scale: 1.0 / (HEAD as f32).sqrt(),
             n_kv: cx.n_kv,
             ctx: cx.ctx,
             m: 1,
-            part_v,
-            part_ms,
+            part_v: &mut *b.part_v,
+            part_ms: &mut *b.part_ms,
             fault,
-            y: &mut *attn,
+            y: &mut *b.attn,
         },
         cx.mma,
     )?;
-    let o_in: &DeviceBuffer<f32> = match &gate {
-        Some((_, g)) => {
-            out_gate(cx, (&*attn, &**g), (1, PACK * cx.n_kv), fault, &mut *q)?;
-            &*q
-        }
-        None => &*attn,
+    if let Some((_, g)) = gate {
+        out_gate(cx, (&*b.attn, &*g), (1, PACK * cx.n_kv), fault, &mut *b.q)?;
+    }
+    Ok(())
+}
+
+/// A NoPE GQA layer's output side at one row: `o` over the flash's rows (the gated rows in `q`
+/// where the layer has a gate) and the residual add of `src` into `dst`.
+pub fn gqa_out(
+    cx: &GqaCx<'_>,
+    (l, a): (usize, &GqaLayer),
+    (b, acts): (&mut GqaBufs<'_>, &mut Acts),
+    (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+) -> Result<(), GpuError> {
+    let o_in: &DeviceBuffer<f32> = match &a.gate {
+        GqaGate::Proj(_) => &*b.q,
+        GqaGate::None => &*b.attn,
     };
-    a.o.project(cx, acts, l, o_in, delta)?;
-    residual_rows(cx.gpu, cx.hidden, src, delta, dst)
+    a.o.project(cx, acts, l, o_in, &mut *b.delta)?;
+    residual_rows(cx.gpu, cx.hidden, src, &*b.delta, dst)
 }
 
 /// [`gqa_layer`] over a prompt batch's `m` rows in position order: the
