@@ -231,8 +231,9 @@ lock stubs, checking both the exit status and whether the command ran.
    which prints the `llc` path and version line and stops (exit 70) on an unset name, a file that does not run, a banner
    with no version or a major other than 21. One DGX Spark run exported these four, with LLVM 21.1.8's `llc`
    ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082), "Reproduce"). T1 (section 2) needs
-   `PATH` and `CUDA_TOOLKIT_PATH` as well. Local mode unsets `CUDA_OXIDE_BACKEND` after the file, so `cargo oxide`
-   builds its own backend from the pinned rev.
+   `PATH` and `CUDA_TOOLKIT_PATH` as well. Local mode unsets `CUDA_OXIDE_BACKEND`; first run
+   `tools/oxide-backend.sh` to install the patched backend. Before each oxide build, `tools/oxide-host.sh`
+   selects it in `.cargo/cuda-oxide.toml` and refuses a missing or unpatched backend.
 2. **The pinned `cargo-oxide`.** Before a command that builds with `cargo oxide`, `tools/box.sh` checks with
    `cargo install --list` that the `cargo-oxide` on `PATH` was installed from the pinned rev, and stops with exit 70
    when it was not. The install command is in `docs/BUILD.md` ("Toolchain").

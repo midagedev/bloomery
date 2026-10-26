@@ -69,7 +69,8 @@
 #                             BLOOMERY_CARD but `both` runs on it, `both` is refused (64), and CUDA_VISIBLE_DEVICES is the
 #                             caller's, or the environment file's when it sets one (a timing runner then pins its timing
 #                             card: tools/ref/timing-card.sh). CUDA_OXIDE_BACKEND is unset after the
-#                             environment file, so cargo oxide builds and keeps its own backend. BLOOMERY_REMOTE names no
+#                             environment file; tools/oxide-host.sh selects the patched backend tools/oxide-backend.sh
+#                             installed, and refuses one that is missing. BLOOMERY_REMOTE names no
 #                             directory here and adds no CARGO_BUILD_JOBS. What box.sh reads on this side, its own outputs
 #                             (BLOOMERY_REF_MODEL_PROFILE, the fixture tier's BLOOMERY_CARD_BUDGET and
 #                             BLOOMERY_FIXTURE_MODEL) and the lease's file names reach the command only as box.sh exports
@@ -1192,10 +1193,6 @@ OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librus
 # cargo-oxide of another rev reads other settings and selects other tools without a word.
 OXCLI='{ __h="${CARGO_HOME:-$HOME/.cargo}/bin"; __p="$__h/cargo-oxide"; case ":$PATH:" in *":$__h:"*) __p= ;; esac; { [ -f "$__p" ] && [ -x "$__p" ] || __p=$(type -P cargo-oxide); } && __p=$(readlink -f -- "$__p") || { echo "box.sh: cannot resolve cargo-oxide executable" >&2; exit 70; }; __r=$(dirname "$(dirname "$__p")"); __c=$(cargo install --list --root "$__r" 2>/dev/null) || { echo "box.sh: cannot read cargo-oxide install record at $__r" >&2; exit 70; }; __c=$(printf "%s\n" "$__c" | sed -n "s/^cargo-oxide v[^ ]* (.*#\([0-9a-f]\{7,\}\)).*/\1/p" | head -1); case OXREV in "$__c"*) [ -n "$__c" ] ;; *) false ;; esac || { echo "box.sh: the installed cargo-oxide at $__r is from rev ${__c:-none}, not the pin OXREV: install the pin into its own root, cargo install --locked --git https://github.com/NVIDIA/cuda-rust.git --rev OXREV --root ~/.cargo/cuda-oxide-bloomery/OXREV cargo-oxide (docs/BUILD.md)" >&2; exit 70; }; unset __h __p __r __c; } && '
 OXCLI=${OXCLI//OXREV/$OXREV}
-case "$*" in
-  *"cargo oxide"*) OXIDE="${OXIDE}{ [ -f \"\$CUDA_OXIDE_BACKEND\" ] || { echo \"box.sh: no cuda-oxide backend for rev $OXREV at \$CUDA_OXIDE_BACKEND (tools/oxide-backend.sh builds it)\" >&2; exit 70; }; } && { __r=\$(cat \"\${CUDA_OXIDE_BACKEND%/*}/source-rev.txt\" 2>/dev/null); [ \"\$__r\" = $OXREV ] || { echo \"box.sh: the backend at \$CUDA_OXIDE_BACKEND records source rev '\$__r', not $OXREV\" >&2; exit 70; }; unset __r; } && " ;;
-esac
-# Local mode unsets the environment file's backend: cargo oxide builds and keeps its own (the header).
 [ "$LOCAL" = 0 ] || OXIDE="unset CUDA_OXIDE_BACKEND && "
 # The guard probed LOCK_DIR and the recipe expanded its arch before the environment file and BLOOMERY_BOX_ENV ran; one of
 # them moving either would put the command's locks where the guard did not look, or build for another arch.

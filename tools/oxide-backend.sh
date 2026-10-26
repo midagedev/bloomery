@@ -46,7 +46,14 @@ pin_rev() { # the first cuda-device rev of Cargo.toml's [workspace.dependencies]
   printf '%s\n' "$rev"
 }
 
-backends_root() { printf '%s\n' "${BLOOMERY_OXIDE_BACKENDS:-${CARGO_HOME:-$HOME/.cargo}/cuda-oxide-bloomery}"; }
+# A relative root is the tree's: the build changes directory into its copy, and a later --path or --check runs from anywhere.
+backends_root() {
+  local root=${BLOOMERY_OXIDE_BACKENDS:-${CARGO_HOME:-$HOME/.cargo}/cuda-oxide-bloomery}
+  case $root in
+    /*) printf '%s\n' "$root" ;;
+    *) printf '%s/%s\n' "$ROOT" "$root" ;;
+  esac
+}
 
 backend_path() { printf '%s/%s/librustc_codegen_cuda.so\n' "$(backends_root)" "$(pin_rev)"; }
 
@@ -205,6 +212,9 @@ EOF
   run 'a backend of another rev is refused' 70 "records source rev 'f+', not the pin $rev" bash "$ob" --check
   printf '%s\n' "$rev" > "$d/source-rev.txt"
   run 'the restored backend passes' 0 'rev 01234567' bash "$ob" --check
+  # a relative root: the build installs under the tree, and a separate --check from elsewhere finds it there
+  run 'a relative root builds under the tree' 0 "oxide-backend: $t/tree/rel/$rev/librustc_codegen_cuda\\.so rev" env BLOOMERY_OXIDE_BACKENDS=rel bash "$ob"
+  run 'a relative root names the same backend from another directory' 0 'rev 01234567' sh -c "cd / && BLOOMERY_OXIDE_BACKENDS=rel bash '$ob' --check"
   # a patch the pin no longer takes
   printf 'one\nchanged\nthree\n' > "$t/ck/${rev:0:7}/cuda-oxide/stub.txt"
   rm -rf "$t/backends"
