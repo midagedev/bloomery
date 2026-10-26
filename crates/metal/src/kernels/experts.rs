@@ -14,11 +14,7 @@ use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
-use super::experts_geom::{EXPERT_K, EXPERT_SLOTS, FOLDED_BLOCKS, ROUTED_IDS};
-
-/// Whether the host instance's experts run a shared expert's slot after the
-/// routed ones.
-const HAS_SHARED: bool = EXPERT_SLOTS > ROUTED_IDS;
+use super::experts_geom::{EXPERT_K, EXPERT_SLOTS, FOLDED_BLOCKS, HAS_SHARED, ROUTED_IDS};
 use super::{Quant, args_bytes, check_window_len, pack, word};
 
 const PAIR: &str = "pair";

@@ -64,7 +64,7 @@ pub use delta_geom::RING_ROWS;
 pub use delta_geom::SNAPS;
 pub use embed::EmbedParams;
 pub use experts::{FoldParams, PairParams, SharedPlan};
-pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
+pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, HAS_SHARED, ROUTED_IDS, SHARED_SLOT};
 pub use gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, GemmSegParams, Operand};
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,

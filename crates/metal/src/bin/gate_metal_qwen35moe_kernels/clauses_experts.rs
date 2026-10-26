@@ -8,8 +8,8 @@ use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::kernels::{
-    EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP,
-    SHARED_SLOT, SharedPlan,
+    EXPERT_K, EXPERT_SLOTS, FoldParams, HAS_SHARED, PairParams, Quant, ROUTED_IDS,
+    ROWS_PER_SIMD_GROUP, SHARED_SLOT, SharedPlan,
 };
 use gguf::quant::GgmlType;
 
@@ -25,8 +25,6 @@ const N_EXPERTS: usize = 4;
 const PAIR_COLS: usize = 2048;
 pub const FOLD_ROWS: usize = 2048;
 const IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 1, 2, 3, 0];
-/// The host instance's experts run a shared expert's slot after the picks.
-const HAS_SHARED: bool = SHARED_SLOT < EXPERT_SLOTS;
 const ROUTE_ALL: [f32; 9] = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8];
 const ROUTE: [f32; EXPERT_SLOTS] = {
     let mut route = [0f32; EXPERT_SLOTS];

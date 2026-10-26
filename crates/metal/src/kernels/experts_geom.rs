@@ -23,6 +23,10 @@ pub const fn shared_slot(inst: &Instance) -> usize {
 /// The slot of the host instance's experts that reads the shared expert.
 pub const SHARED_SLOT: usize = shared_slot(&HOST);
 
+/// Whether the host instance's experts run a shared expert's slot after the
+/// routed ones.
+pub const HAS_SHARED: bool = SHARED_SLOT < EXPERT_SLOTS;
+
 /// The expert intermediate width: the host instance's. The pair's rows and
 /// the fold's K are this.
 pub const EXPERT_K: usize = HOST.key.moe.expert_ff as usize;
