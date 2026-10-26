@@ -28,21 +28,15 @@ use bloomery_device::{Buffer, Elems};
 use super::arena::{Arena, MixerBufs};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
-use crate::kernels::{
-    EXPERT_K, EXPERT_SLOTS, LOGIT_STRIDE, PARTIALS_PER_HEAD, SNAPS, VALUE_HEADS, prepared_elems,
-    route_table_words, state_elems,
-};
+use crate::geom::Geometry;
+use crate::kernels::{SNAPS, route_table_words};
 use crate::residency::Alloc;
 
-/// The widest a row of the delta numerator or the attention output is.
-pub(super) const MIX_STRIDE: usize = {
-    let delta = VALUE_HEADS * crate::kernels::HEAD_COLS;
-    let attn = crate::kernels::QUERY_HEADS * crate::kernels::HEAD_DIM;
-    if delta > attn { delta } else { attn }
-};
-
-/// The partial sums of squares a row of the delta step leaves.
-pub(super) const DELTA_PARTIALS_STRIDE: usize = VALUE_HEADS * PARTIALS_PER_HEAD;
+/// The widest a row of the delta numerator or the attention output is, at
+/// `g`: the value heads' columns or the query heads' values.
+fn mix_stride(g: &Geometry) -> usize {
+    (g.delta.value_heads * g.delta.head_cols).max(g.attn.query_heads * g.attn.head)
+}
 
 const WHAT: &str = "qwen35moe rows arena";
 
@@ -72,8 +66,9 @@ pub(super) struct RowsArena {
     /// The P1 output, `proj_stride` values a row.
     pub(super) proj: MetalBuffer<f32>,
     pub(super) proj_stride: usize,
-    /// The delta numerator, or the attention output: [`MIX_STRIDE`] a row.
+    /// The delta numerator, or the attention output: `mix_stride` a row.
     pub(super) mix: MetalBuffer<f32>,
+    pub(super) mix_stride: usize,
     /// The delta step's partial sums of squares, a row each.
     pub(super) delta_partials: MetalBuffer<f32>,
     /// The delta launch's prepared rows, [`RowsArena::delta_prep_stride`] a
@@ -81,7 +76,7 @@ pub(super) struct RowsArena {
     pub(super) delta_prep: MetalBuffer<f32>,
     /// The f32s of one prepared delta row.
     pub(super) delta_prep_stride: usize,
-    /// The router's logits, [`LOGIT_STRIDE`] a row.
+    /// The router's logits, `RouterGeom::logit_stride` a row.
     pub(super) logits: MetalBuffer<f32>,
     /// The picks of each row, the shared expert's id last.
     pub(super) pick_ids: MetalBuffer<u32>,
@@ -93,7 +88,7 @@ pub(super) struct RowsArena {
     pub(super) inv: MetalBuffer<u32>,
     /// The route table's tiles.
     pub(super) tiles: MetalBuffer<u32>,
-    /// The pair's outputs, a row of [`EXPERT_K`] a place.
+    /// The pair's outputs, a row of `ExpertsGeom::k` a place.
     pub(super) h: MetalBuffer<f32>,
     /// The down's outputs, a row of the hidden width a place.
     pub(super) y: MetalBuffer<f32>,
@@ -131,7 +126,11 @@ pub(super) struct SnapBufs {
 impl SnapBufs {
     /// The copies of the delta layers of `arena`, opened on `device`.
     pub(super) fn open(device: Alloc<'_>, arena: &Arena) -> Result<SnapBufs, SessionError> {
-        let lane_len = state_elems(1).ok_or_else(|| refuse("a lane of the state does not fit"))?;
+        let lane_len = arena
+            .geom
+            .delta
+            .state_elems(1)
+            .ok_or_else(|| refuse("a lane of the state does not fit"))?;
         let (mut lanes, mut rings) = (0usize, 0usize);
         let mut at = Vec::with_capacity(arena.layers.len());
         for layer in &arena.layers {
@@ -176,6 +175,7 @@ pub(super) struct RowsLens {
     pub(super) proj: usize,
     pub(super) proj_stride: usize,
     pub(super) mix: usize,
+    pub(super) mix_stride: usize,
     pub(super) delta_partials: usize,
     pub(super) delta_prep: usize,
     pub(super) delta_prep_stride: usize,
@@ -187,11 +187,12 @@ pub(super) struct RowsLens {
 }
 
 impl RowsLens {
-    /// The lens of a pass of `cap` rows over a token arena of residual width
-    /// `hidden`, a P1 output of `proj` values at its widest, `n_experts`
-    /// routed experts and delta layers of the key heads `delta_heads` names,
-    /// each refused by name when it does not fit.
+    /// The lens of a pass of `cap` rows at the launch geometry `g` over a token
+    /// arena of residual width `hidden`, a P1 output of `proj` values at its
+    /// widest, `n_experts` routed experts and delta layers of the key heads
+    /// `delta_heads` names, each refused by name when it does not fit.
     pub(super) fn of(
+        g: &Geometry,
         cap: usize,
         hidden: usize,
         proj: usize,
@@ -201,14 +202,15 @@ impl RowsLens {
         if cap == 0 {
             return Err(refuse("a pass of no rows"));
         }
-        let slots = product(cap, EXPERT_SLOTS, "the pass's slots")?;
+        let slots = product(cap, g.experts.slots, "the pass's slots")?;
         // The widest P1 output a layer writes, rounded up to the four floats
         // the GEMM's output rows are aligned to.
         let proj_stride = proj.next_multiple_of(4);
         let words = route_table_words(slots, n_experts);
         let delta_prep_stride = delta_heads
             .map(|n_k| {
-                prepared_elems(n_k)
+                g.delta
+                    .prepared_elems(n_k)
                     .ok_or_else(|| refuse(format!("a delta layer of {n_k} key heads")))
             })
             .try_fold(0, |w, e| e.map(|e| w.max(e)))?;
@@ -219,6 +221,7 @@ impl RowsLens {
                 Ok(n)
             }
         };
+        let mix_stride = mix_stride(g);
         Ok(RowsLens {
             ids: nonzero(cap, "the ids")?,
             x: nonzero(product(cap, hidden, "the residual rows")?, "the residual")?,
@@ -226,11 +229,12 @@ impl RowsLens {
             proj: nonzero(product(cap, proj_stride, "the P1 rows")?, "the P1 output")?,
             proj_stride,
             mix: nonzero(
-                product(cap, MIX_STRIDE, "the mixer rows")?,
+                product(cap, mix_stride, "the mixer rows")?,
                 "the mixer rows",
             )?,
+            mix_stride,
             delta_partials: nonzero(
-                product(cap, DELTA_PARTIALS_STRIDE, "the delta partials")?,
+                product(cap, g.delta.partials_stride, "the delta partials")?,
                 "the delta partials",
             )?,
             delta_prep: nonzero(
@@ -238,11 +242,14 @@ impl RowsLens {
                 "the delta's prepared rows",
             )?,
             delta_prep_stride,
-            logits: nonzero(product(cap, LOGIT_STRIDE, "the logit rows")?, "the logits")?,
+            logits: nonzero(
+                product(cap, g.router.logit_stride, "the logit rows")?,
+                "the logits",
+            )?,
             slots: nonzero(slots, "the picks")?,
             tiles: nonzero(words, "the route table")?,
             h: nonzero(
-                product(slots, EXPERT_K, "the pair rows")?,
+                product(slots, g.experts.k, "the pair rows")?,
                 "the pair outputs",
             )?,
             y: nonzero(product(slots, hidden, "the down rows")?, "the down outputs")?,
@@ -295,6 +302,7 @@ impl RowsArena {
             MixerBufs::Attention(_) => None,
         });
         let lens = RowsLens::of(
+            &arena.geom,
             cap,
             hidden,
             arena.proj.len().get(),
@@ -316,8 +324,12 @@ impl RowsArena {
         let tiles = device.buffer(Elems(lens.tiles))?;
         let h = device.buffer(Elems(lens.h))?;
         let y = device.buffer(Elems(lens.y))?;
-        let (proj_stride, delta_prep_stride, bytes) =
-            (lens.proj_stride, lens.delta_prep_stride, lens.bytes());
+        let (proj_stride, mix_stride, delta_prep_stride, bytes) = (
+            lens.proj_stride,
+            lens.mix_stride,
+            lens.delta_prep_stride,
+            lens.bytes(),
+        );
         Ok(RowsArena {
             cap,
             ids,
@@ -326,6 +338,7 @@ impl RowsArena {
             proj,
             proj_stride,
             mix,
+            mix_stride,
             delta_partials,
             delta_prep,
             delta_prep_stride,

@@ -96,11 +96,10 @@ use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints, Restore};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
+use crate::geom::Geometry;
 use crate::handle::Handle;
 use crate::instance::Instance;
-use crate::kernels::{
-    EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, SNAPS, segments_for_keys, state_elems,
-};
+use crate::kernels::{Kernels, PASS_ROWS, SNAPS, segments_for_keys};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
 use crate::stream::{
@@ -113,7 +112,7 @@ pub(super) const WHAT: &str = "qwen35moe session";
 /// The most rows of one pass, and the spacing of a prompt call's inner
 /// checkpoints ([`runtime::seqstate::marks`]): a mark falls between two
 /// passes, so a pass never holds a position a checkpoint needs. The family's
-/// ubatch rule at nine slots a row over [`MAX_PASS_SLOTS`] slots
+/// ubatch rule at an instance's slots a row over [`max_pass_slots`] slots
 /// ([`pass_rows_max`]).
 ///
 /// A point copies each delta layer's state lane and its conv ring.
@@ -125,14 +124,16 @@ pub(super) const WHAT: &str = "qwen35moe session";
 /// between points re-feeds at most 2047 positions.
 pub const CHECKPOINT_EVERY: u32 = 2048;
 
-/// The slots of one pass the rows arena holds: its experts' buffers are a row
-/// a slot.
-const MAX_PASS_SLOTS: usize = EXPERT_SLOTS * CHECKPOINT_EVERY as usize;
+/// The slots of one pass of `g`'s instance the rows arena holds: its experts'
+/// buffers are a row a slot.
+fn max_pass_slots(g: &Geometry) -> usize {
+    g.experts.slots * CHECKPOINT_EVERY as usize
+}
 
-/// The most rows of one pass, by the family's ubatch rule.
+/// The most rows of one pass of `g`'s instance, by the family's ubatch rule.
 #[must_use]
-pub fn pass_rows_max() -> usize {
-    chain::arch::qwen3moe::router::ubatch_at(EXPERT_SLOTS, MAX_PASS_SLOTS)
+pub fn pass_rows_max(g: &Geometry) -> usize {
+    chain::arch::qwen3moe::router::ubatch_at(g.experts.slots, max_pass_slots(g))
 }
 
 /// The site types Metal's mat-vecs launch: the kernels' quant set
@@ -523,7 +524,11 @@ impl Probe<'_> {
             Node::DeltaG => whole(&a.g),
             Node::DeltaPartials => whole(&a.delta_partials),
             Node::DeltaState(l) => {
-                let lane = state_elems(1).ok_or_else(|| refuse("a state lane does not fit"))?;
+                let lane = a
+                    .geom
+                    .delta
+                    .state_elems(1)
+                    .ok_or_else(|| refuse("a state lane does not fit"))?;
                 let at = self.lane * lane;
                 read(&delta(l)?.state, at..at + lane)
             }
@@ -540,11 +545,12 @@ impl Probe<'_> {
                 if pos >= a.ctx {
                     return Err(refuse(format!("{node:?}: the cache holds {} rows", a.ctx)));
                 }
-                let heads = cache.pages().len().get() / (a.ctx * HEAD_DIM);
-                let mut out = Vec::with_capacity(heads * HEAD_DIM);
+                let head = a.geom.attn.head;
+                let heads = cache.pages().len().get() / (a.ctx * head);
+                let mut out = Vec::with_capacity(heads * head);
                 for h in 0..heads {
-                    let at = (h * a.ctx + pos) * HEAD_DIM;
-                    let bits = read(cache, at..at + HEAD_DIM)?;
+                    let at = (h * a.ctx + pos) * head;
+                    let bits = read(cache, at..at + head)?;
                     out.extend(bits.into_iter().map(gguf::quant::half_to_f32));
                 }
                 Ok(out)
@@ -729,7 +735,9 @@ impl Session {
         // Every refusal the header and tensor table hold, in the order the
         // checks meet them; the open stops at the first.
         let checked = check::check(&split, ctx).checked_or_first()?;
-        if checked.instance != library.instance() {
+        // The arena is sized at the geometry the file was judged at and the
+        // launches at the library's: one instance, or the open is refused.
+        if checked.geom != *kernels.geom() {
             return Err(refuse(format!(
                 "{}: the file is instance {}, the library is built for {}",
                 path.display(),
@@ -745,10 +753,10 @@ impl Session {
             .ok_or_else(|| refuse("the stream made no residency set"))?;
         let staged = residency.stage();
         let alloc = Alloc::new(device.metal(), &staged);
-        let arena = Arena::open(alloc, &split, &checked.layout)?;
+        let arena = Arena::open(alloc, &split, &checked.geom, &checked.layout)?;
         let load = started.elapsed();
         let started = Instant::now();
-        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max().min(arena.ctx))?;
+        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max(&checked.geom).min(arena.ctx))?;
         // A file of no recurrent store has nothing a mark copies.
         let stores = arena
             .layers
@@ -817,6 +825,12 @@ impl Session {
     #[must_use]
     pub fn open_split(&self) -> OpenSplit {
         self.open_split
+    }
+
+    /// The launch geometry the session runs at: its instance's.
+    #[must_use]
+    pub fn geom(&self) -> &Geometry {
+        &self.arena.geom
     }
 
     /// The token as the count models it.
@@ -1574,7 +1588,7 @@ impl Session {
             return Err(SessionError::Poisoned(fault));
         }
         self.quiesce()?;
-        let lane_len = lane_len()?;
+        let lane_len = lane_len(&self.arena.geom)?;
         let live = lane_of(at)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
@@ -1650,7 +1664,7 @@ impl Session {
             return Ok(());
         }
         self.quiesce()?;
-        let lane_len = lane_len()?;
+        let lane_len = lane_len(&self.arena.geom)?;
         let start = lane_of(n)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
@@ -1718,15 +1732,17 @@ fn checkpoint_error(e: checkpoint::Error) -> SessionError {
     }
 }
 
-/// f32s of one delta state lane.
-fn lane_len() -> Result<usize, SessionError> {
-    state_elems(1).ok_or_else(|| refuse("a delta state lane's length overflowed"))
+/// f32s of one delta state lane at `g`.
+fn lane_len(g: &Geometry) -> Result<usize, SessionError> {
+    g.delta
+        .state_elems(1)
+        .ok_or_else(|| refuse("a delta state lane's length overflowed"))
 }
 
 /// Each delta layer's state lane, then its conv ring: none for a file of no
 /// delta layer. The state buffer is both lanes; a checkpoint copies one.
 fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
-    let lane_len = lane_len()?;
+    let lane_len = lane_len(&arena.geom)?;
     let both = lane_len
         .checked_mul(LANES)
         .ok_or_else(|| refuse("the delta state's length overflowed"))?;
@@ -2214,11 +2230,19 @@ impl ChainOps for Profiler<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance::REGISTERED;
 
     /// A prompt call's inner checkpoints fall between passes: their spacing
     /// is the most rows of one pass.
     #[test]
     fn checkpoint_spacing_is_the_pass_rows() {
-        assert_eq!(pass_rows_max(), CHECKPOINT_EVERY as usize);
+        for inst in REGISTERED {
+            assert_eq!(
+                pass_rows_max(&Geometry::of(inst)),
+                CHECKPOINT_EVERY as usize,
+                "{}",
+                inst.name
+            );
+        }
     }
 }
