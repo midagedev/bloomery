@@ -764,12 +764,6 @@ fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> 
                 names::output(),
                 s.quant
             )));
-        } else if !hidden.is_multiple_of(s.quant.values_per_block()) {
-            at.push(refuse(format!(
-                "a hidden width of {hidden}; the head reads whole blocks of {}",
-                s.quant.values_per_block()
-            )));
-            return false;
         }
         fits
     });
