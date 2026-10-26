@@ -308,7 +308,7 @@ impl Library {
 
     #[cfg(metal_lib = "metallib")]
     fn metallib_of(device: &Handle<dyn MTLDevice>) -> Result<Self, DeviceError> {
-        let data = dispatch2::DispatchData::from_bytes(METALLIB);
+        let data = dispatch2::DispatchData::from_static_bytes(METALLIB);
         let library = device
             .newLibraryWithData_error(&data)
             .map_err(|e| DeviceError::backend("library", e.localizedDescription().to_string()))?;

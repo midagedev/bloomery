@@ -38,7 +38,7 @@ objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSError", "NSArray", "NSProcessInfo"] }
 objc2-metal = { version = "=0.3.2", default-features = false, features = ["std", "MTLTypes", "MTLDevice", "MTLResource", "MTLAllocation", "MTLBuffer", "MTLLibrary", "MTLComputePipeline", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLEvent", "dispatch2"] }
 # The dispatch data a metallib is loaded from.
-dispatch2 = { version = "=0.3.0", default-features = false, features = ["alloc"] }
+dispatch2 = { version = "=0.3.0", default-features = false, features = ["alloc", "block2"] }
 
 # The declarations above name the NVIDIA/cuda-rust rev (cuda-oxide lives under cuda-oxide/ there, cuda-core at the
 # root); the source comes from our fork (midagedev/cuda-oxide), branch `bloomery` = that rev + the patches meant for

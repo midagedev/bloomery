@@ -329,8 +329,16 @@ fn suite_outputs(h: &Harness<'_>, fixture: &Fixture) -> Result<Vec<Vec<f32>>, St
             })?);
         }
     }
-    let (table, vocab) = fixture.table("token_embd.weight", 2048)?;
-    out.push(run_embed(h, table, vocab, &[3, 99, 4096])?);
+    let (table, vocab, ty) = fixture.table("token_embd.weight", 2048)?;
+    let quant = Quant::of_ggml(ty)
+        .ok_or_else(|| format!("token_embd.weight is {ty:?}, not a table type"))?;
+    out.push(super::clauses_embed::run_embed(
+        h,
+        quant,
+        table,
+        vocab,
+        &[3, 99, 4096],
+    )?);
     Ok(out)
 }
 
