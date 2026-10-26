@@ -147,24 +147,14 @@ generate_metal --plan [--ctx C]
   pass's own wall";
 
     /// The flags that take a value.
-    #[cfg(not(feature = "encode-trace"))]
-    const VALUE_FLAGS: [&str; 6] = [
+    const VALUE_FLAGS: &[&str] = &[
         "--prompt",
         "--tokens",
         "-n",
         "--ctx",
         "--prefill",
         "--pass-times",
-    ];
-    /// The flags that take a value, and `--encode-trace` among them.
-    #[cfg(feature = "encode-trace")]
-    const VALUE_FLAGS: [&str; 7] = [
-        "--prompt",
-        "--tokens",
-        "-n",
-        "--ctx",
-        "--prefill",
-        "--pass-times",
+        #[cfg(feature = "encode-trace")]
         "--encode-trace",
     ];
     /// The flags that stand alone.

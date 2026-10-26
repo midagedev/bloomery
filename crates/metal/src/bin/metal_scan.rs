@@ -610,6 +610,16 @@ mod compare {
         if !columns {
             return Err(format!("{path}: no column line"));
         }
+        for key in ENVIRONMENT {
+            if header.get(key).is_none_or(String::is_empty) {
+                return Err(format!("{path}: missing environment header {key}"));
+            }
+        }
+        for (key, row) in &rows {
+            if !row[6].parse::<i64>().is_ok_and(|n| n >= 0) {
+                return Err(format!("{path}: {key}: invalid archive_bytes {}", row[6]));
+            }
+        }
         Ok(Scan { header, rows })
     }
 
@@ -654,7 +664,9 @@ mod compare {
                         same += 1;
                     } else {
                         let air_only = row[4] != other[4] && row[5] == other[5];
-                        let size = |r: &[String]| r[6].parse::<i64>().unwrap_or(i64::MAX / 2);
+                        let size = |r: &[String]| {
+                            r[6].parse::<i64>().expect("read validated archive_bytes")
+                        };
                         let hash_only = row[3] == other[3]
                             && row[7..] == other[7..]
                             && (size(row) - size(other)).abs() <= DRIFT_ALIGN;
@@ -802,10 +814,11 @@ mod compare {
     mod tests {
         use super::*;
 
-        fn scan_text(rows: &[&str]) -> String {
+        /// A scan whose header holds `headers` as (key, value).
+        fn scan_text_of(headers: &[(&str, &str)], rows: &[&str]) -> String {
             let mut text = format!("{SCAN_VERSION}\n");
-            for k in super::super::ENVIRONMENT {
-                text.push_str(&format!("# {k}\tv\n"));
+            for (k, v) in headers {
+                text.push_str(&format!("# {k}\t{v}\n"));
             }
             text.push_str(&COLUMNS.join("\t"));
             text.push('\n');
@@ -814,6 +827,11 @@ mod compare {
                 text.push('\n');
             }
             text
+        }
+
+        fn scan_text(rows: &[&str]) -> String {
+            let headers: Vec<(&str, &str)> = ENVIRONMENT.iter().map(|k| (*k, "v")).collect();
+            scan_text_of(&headers, rows)
         }
 
         fn write(name: &str, text: &str) -> String {
@@ -826,12 +844,17 @@ mod compare {
             path.to_string_lossy().into_owned()
         }
 
-        fn rc(a: &[&str], b: &[&str]) -> u8 {
-            let (x, y) = (write("a", &scan_text(a)), write("b", &scan_text(b)));
+        /// The exit code of comparing two scan texts.
+        fn rc_of(a: &str, b: &str) -> u8 {
+            let (x, y) = (write("a", a), write("b", b));
             let code = pipelines(&x, &y);
             let _ = std::fs::remove_file(&x);
             let _ = std::fs::remove_file(&y);
             code
+        }
+
+        fn rc(a: &[&str], b: &[&str]) -> u8 {
+            rc_of(&scan_text(a), &scan_text(b))
         }
 
         const P: &str = "main\tp\t-\ty\taa\tdd\t10\t0\t1024\t32\t0";
@@ -862,9 +885,53 @@ mod compare {
                 0,
                 "a row only added moves nothing existing"
             );
-            assert_eq!(rc(&[P, Q], &[P_MOVED, Q]), 3);
             assert_eq!(rc(&[P, Q], &[P]), 4);
             assert_eq!(rc(&[P, Q], &[P_MOVED]), 5);
+        }
+
+        #[test]
+        fn a_scan_missing_an_environment_value_is_refused() {
+            // Two scans with the same key absent compare equal on it, so each is refused alone.
+            for key in ENVIRONMENT {
+                let without: Vec<(&str, &str)> = ENVIRONMENT
+                    .iter()
+                    .filter(|k| **k != key)
+                    .map(|k| (*k, "v"))
+                    .collect();
+                let empty: Vec<(&str, &str)> = ENVIRONMENT
+                    .iter()
+                    .map(|k| (*k, if *k == key { "" } else { "v" }))
+                    .collect();
+                for headers in [&without, &empty] {
+                    let text = scan_text_of(headers, &[P]);
+                    assert_eq!(rc_of(&text, &text), 2, "{key}");
+                    let path = write("read", &text);
+                    let err = read(&path)
+                        .err()
+                        .expect("a scan without the value is refused");
+                    let _ = std::fs::remove_file(&path);
+                    assert!(
+                        err.contains(&format!("missing environment header {key}")),
+                        "{err}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_row_with_a_bad_archive_size_is_refused() {
+            // One row, the hashes moved, every other column equal: bad sizes must not compare as one default.
+            let row = |sha: &str, code: &str, size: &str| {
+                format!("main\tp\t-\ty\t{sha}\t{code}\t{size}\t0\t1024\t32\t0")
+            };
+            for (x, y) in [("x", "y"), ("-1", "-1"), ("", "1.5")] {
+                let (a, b) = (row("aa", "dd", x), row("bb", "ee", y));
+                assert_eq!(rc(&[&a], &[&b]), 2, "{x:?} against {y:?}");
+                let path = write("read", &scan_text(&[&a]));
+                let err = read(&path).err().expect("a bad archive_bytes is refused");
+                let _ = std::fs::remove_file(&path);
+                assert!(err.contains("invalid archive_bytes"), "{err}");
+            }
         }
     }
 }

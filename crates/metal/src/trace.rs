@@ -158,15 +158,6 @@ pub(crate) fn host(what: impl FnOnce() -> String) {
     state().emit(|| format!("host {what}", what = what()));
 }
 
-/// The bytes of a `setBytes` value, as lowercase hex.
-fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
-}
-
 /// What one compute encoder has been asked: the trace's side of
 /// [`crate::encode::ComputeEncoder`].
 pub(crate) struct EncoderTrace {
@@ -235,7 +226,7 @@ impl EncoderTrace {
 
     /// Slot `index` holds the value `data`.
     pub(crate) fn set_bytes(&mut self, index: usize, data: &[u8]) {
-        self.bound[index] = Some(format!("bytes:{}", hex(data)));
+        self.bound[index] = Some(format!("bytes:{}", gguf::digest::hex(data)));
     }
 
     /// A dispatch of `groups_x` by `groups_y` groups of `threads` threads.
