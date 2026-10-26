@@ -138,6 +138,8 @@ mod gate {
     const MODULE_LOADING: &str = "EAGER";
 
     pub fn run() -> Result<(), GateError> {
+        let levers =
+            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
         let loading = std::env::var("CUDA_MODULE_LOADING").unwrap_or_default();
         if loading != MODULE_LOADING {
             return Err(format!(
@@ -147,8 +149,6 @@ mod gate {
             )
             .into());
         }
-        let levers =
-            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
         crate::gate_card::init()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         let path = crate::ds41_tier::model_path()?;
