@@ -296,14 +296,16 @@ fn main() {
     let mut kernels = Vec::new();
     // The order is the dependency order: norm defines the argument block the
     // mat-vecs read, quant the block layouts and the decode owners every
-    // quantized kernel reads (embed's too), matvec_q4k the row loop and the
-    // entry templates the Q6_K, A4, Q8_0, Q5_K, experts and head files instantiate.
+    // quantized kernel reads (embed's too), quant_b32 the 32-value block owners
+    // (Q5_0, Q5_1) beside it, matvec_q4k the row loop and the entry templates
+    // the Q6_K, A4, Q8_0, Q5_K, Q5_0, experts and head files instantiate.
     for name in [
         "fault",
         "copy",
         "probe",
         "norm",
         "quant",
+        "quant_b32",
         "gemm_shared",
         "gemm",
         "matvec_q4k",
@@ -311,15 +313,23 @@ fn main() {
         "matvec_a4",
         "matvec_q8_0",
         "matvec_q5k",
+        "matvec_q5_0",
         "embed",
+        // The squared ReLU is a helper the squared-ReLU experts call, so it
+        // comes before them.
+        "relu2",
         // Ticket's helpers are what the router and the head call, so ticket
         // comes before either kernel.
         "ticket",
         "router",
         "experts",
+        "experts_relu2",
         "route",
+        "route_sigmoid",
         "gemm_routed",
         "delta",
+        // The Mamba-2 step follows the delta step's ring and state-lane scheme.
+        "mamba2",
         "attention",
         "head",
     ] {
@@ -333,7 +343,7 @@ fn main() {
     // shared GEMM ABI, the engine source's own files, in its order.
     let tensor: Vec<(&str, String)> = kernels
         .iter()
-        .filter(|(name, _)| ["fault", "quant", "gemm_shared"].contains(name))
+        .filter(|(name, _)| ["fault", "quant", "quant_b32", "gemm_shared"].contains(name))
         .cloned()
         .chain(std::iter::once((
             "gemm_tensor",

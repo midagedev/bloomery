@@ -1,7 +1,9 @@
 //! The Nemotron 3 Nano family. The logits set is dumped from the tokenizer
 //! family's model ([`super::tokenizer::nemotron_model`]) by mainline llama.cpp
 //! ([`BUILD`]), the libraries `nemotron_ref` is linked against, built from the
-//! tree the tokenizer family pins by commit. ik has no `nemotron_h`.
+//! tree the tokenizer family pins by commit. ik has no `nemotron_h`. The fixture tier's mirror is in [`fixture`].
+
+pub mod fixture;
 
 use crate::family::{Build, Family, Identity};
 
@@ -33,7 +35,7 @@ pub static LOGITS: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&LOGITS];
+pub static FAMILIES: &[&Family] = &[&LOGITS, &fixture::LOGITS];
 
 #[cfg(test)]
 mod tests {

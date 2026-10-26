@@ -903,13 +903,25 @@ fn write_logits_set(dir: &Path, arch: &str, model: &str, fixture: Option<&str>, 
 
 /// A logits set of the fixture the tree runs passes, with its `# fixture` line read; one of another seed, or
 /// with no line, is stale and names both lines; a set of the real file is stale on `# model` first; two
-/// `# fixture` lines are malformed. The real family takes the same set without a fixture line.
+/// `# fixture` lines are malformed. The real family takes the same set without a fixture line. Each fixture
+/// family of the last-position logits kind (the Nano's and the Bolt's) holds it.
 #[test]
 fn a_logits_set_of_another_generation_is_stale() -> Result<(), RefError> {
+    for (fixture, real) in [
+        ("fx-ref-nemotron-logits", "ref-nemotron-logits"),
+        ("fx-ref-nemotron-moe-logits", "ref-nemotron-moe-logits"),
+    ] {
+        a_logits_family_holds_the_staleness_rules(fixture, real)?;
+    }
+    Ok(())
+}
+
+/// The rules of [`a_logits_set_of_another_generation_is_stale`] on the fixture family `fixture` and its real twin `real`.
+fn a_logits_family_holds_the_staleness_rules(fixture: &str, real: &str) -> Result<(), RefError> {
     let root = temp("logits-root")?;
     let other = temp("logits-other")?;
     let set = temp("logits-set")?;
-    let u = under("fx-ref-nemotron-moe-logits", "ref-nemotron-moe-logits")?;
+    let u = under(fixture, real)?;
     let (arch, build) = (u.arch, u.build);
     let first = root_with(&root, arch, &fixture_kvs(1))?;
     let ours = line(Path::new(&first))?;
@@ -947,8 +959,7 @@ fn a_logits_set_of_another_generation_is_stale() -> Result<(), RefError> {
         e.contains(&format!("dumped from {}", u.real_file)) && !e.contains("fixture line"),
         "{e}"
     );
-    let real = family("ref-nemotron-moe-logits");
-    let p = real.check_set(&set)?;
+    let p = family(real).check_set(&set)?;
     assert_eq!(p.dumped_from, u.real_file);
 
     write_logits_set(&set, arch, &first, Some(body(&ours)), build);
