@@ -180,10 +180,13 @@ libtest option it does not know. Two gaps it does not see: tests a macro defined
 Build shapes (`combos`). Every cargo build a recipe runs on the box compiles one package under one feature set,
 in one of two modes: a plain build, or a test build (cfg(test): a lib's or a bin's unit tests under
 `cargo test`, a `--test` or `--bench` target under any subcommand). A shape is (package, mode, the package's
-enabled features — the closure, defaults included — and any `dep/feature` words for other packages); the
+enabled features — the closure, defaults included — and any `dep/feature` words for its dependencies); the
 recipes that share a shape share one command, `cargo check -p <package> [--profile test] [--features …]` over
 the union of their targets, so each shape is type-checked the way the box compiles it. One package a command:
 two in one invocation would unify a shared dependency's features and hide a feature one of them lacks. A
+`dep/feature` word for a package of the same call that this package does not depend on (`-p a -p b --features
+b/x`) is b's own feature, left out of a's shape: cargo refuses it for `-p a` alone, and a call where neither
+holds is a named error of `check`. A
 shape that another covers (the same package with more features) is still its own command — a
 `cfg(not(feature))` or an optional dependency makes them different code. Named, never silent, and left out:
 the `check` and `lint` recipes (`tools/mac-check.sh check` and `lint` run their commands); an invocation
@@ -1590,6 +1593,12 @@ class Tree:
 
     # ---------------- invocation -> targets ----------------
 
+    @staticmethod
+    def depends_on(pkg: Package, name: str) -> bool:
+        """Whether `pkg` names package `name` in a dependency table (any kind): the only other package whose
+        `name/feature` word cargo takes for `-p pkg` alone."""
+        return any(name in (d.key, d.pkg) for d in pkg.deps)
+
     def resolve(self, inv: Invocation) -> tuple[list[tuple[str, str, str | None, list[str]]], list[str]]:
         """[(package, kind, name, features)], [errors]. Test kinds: libtest for `--lib`, doctest for `--doc`."""
         errors: list[str] = []
@@ -1613,6 +1622,8 @@ class Tree:
                         feats.append(ff)
                     elif ff not in self.packages[fp].features:
                         errors.append(f"--features {f}: {fp} has no feature {ff}")
+                    elif fp not in pkgs and not self.depends_on(pkg, fp):
+                        errors.append(f"--features {f}: cargo takes `dep/feature` for a dependency of -p {pname} or a package of the same call, and {pname} depends on no {fp}")
                 else:
                     feats.append(f)
             enabled, _, unknown = self.feature_closure(pkg, feats, not inv.no_default, inv.all_features)
@@ -6920,7 +6931,9 @@ def resolve_call(tree: Tree, inv: Invocation) -> tuple[list[tuple[str, str, str 
     targets, errs = tree.resolve(inv)
     for pname, kind, name, feats in targets:
         enabled, _, _ = tree.feature_closure(tree.packages[pname], feats, not inv.no_default, inv.all_features)
-        others = tuple(sorted({f for f in inv.features if "/" in f and f.split("/", 1)[0] != pname}))
+        # a `dep/feature` word names a dependency of this package; one for another package of the same call
+        # (`-p a -p b --features b/x`) is that package's own word, which a shape of `a` alone would be refused for
+        others = tuple(sorted({f for f in inv.features if "/" in f and f.split("/", 1)[0] != pname and tree.depends_on(tree.packages[pname], f.split("/", 1)[0])}))
         out.append((pname, kind, name, feats, tuple(sorted(enabled)), others))
     return out, errs
 
@@ -12622,6 +12635,32 @@ def _st_basics(fails: list[str], side: Side) -> None:
             fails.append("combos: a call naming no target accepted")
         except RecipeError as err:
             expect("g: --bin no_such_bin" in str(err), f"combos: an unresolvable call refused without its name: {err}")
+        # one call over two packages (`-p a -p b --features b/x`): b/x is b's own feature, and a's shape carries no
+        # word for a package it does not depend on (cargo refuses one for `-p a` alone); a dependency's word stays
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(
+                "h:\n    ./tools/box.sh 'cargo clippy -p bloomery-device -p bloomery-metal --features bloomery-metal/pipeline-scan,bloomery-metal/encode-trace --lib'\n"
+                "i:\n    ./tools/box.sh 'cargo check -p bloomery-gpu-gates --features glm5next,bloomery-gpu-glm5next/hf --lib'\n"
+            )
+        try:
+            got = {c.command() for c in build_shapes(side.tree, load_justfile(p))[0]}
+        except RecipeError as err:
+            got = set()
+            fails.append(f"combos: a call over two packages raised {err}")
+        want = {
+            "cargo check -p bloomery-device --lib",
+            "cargo check -p bloomery-metal --features encode-trace,pipeline-scan --lib",
+            "cargo check -p bloomery-gpu-gates --features glm5next,bloomery-gpu-glm5next/hf --lib",
+        }
+        expect(got == want, f"combos: a call over two packages derives {sorted(got)}, not {sorted(want)}")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("j:\n    ./tools/box.sh 'cargo check -p bloomery-device --features bloomery-metal/pipeline-scan --lib'\n")
+        try:
+            build_shapes(side.tree, load_justfile(p))
+            fails.append("combos: a `dep/feature` word for a package the call's package does not depend on accepted")
+        except RecipeError as err:
+            expect("j: --features bloomery-metal/pipeline-scan" in str(err) and "bloomery-device depends on no bloomery-metal" in str(err),
+                   f"combos: a `dep/feature` word for a package the call's package does not depend on refused without naming it: {err}")
 
     # one binary, one feature set
     bin_feature_self_test(expect)
