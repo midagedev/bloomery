@@ -4,13 +4,14 @@
 //! reads: every KDA layer's state and conv ring, every latent layer's latent
 //! and index rows and pool plane, the checkpoints, and the last position's
 //! logits. A batch of at most [`CHUNK`] positions writes the steps' bits; one
-//! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections and its dense
+//! of [`GEMM_FROM`] or more runs its mixers' projections and its dense
 //! blocks on the GEMM ([`GemmFront`]: a KDA mixer's input projections but the
-//! decay's pair and its output projection, a latent mixer's joined
-//! projection, query heads and output projection, a dense block of any
-//! types), whose activations are quantized to int8 blocks (of 32 values for a
-//! Q8_0 projection, q8_1 blocks of 128 for a K-quant dense block), so it
-//! writes the GEMM's bits there. Either way a token's bits are a function of the ids
+//! decay's pair and its output projection, a latent mixer's projections of the
+//! normed input, query heads and output projection, a dense block of any
+//! types; each by its weight's type, Q8_0, K-quant or BF16), whose
+//! activations are quantized to int8 blocks (of 32 values for a Q8_0
+//! projection, q8_1 blocks of 128 for a K-quant one), so it writes the GEMM's
+//! bits there. Either way a token's bits are a function of the ids
 //! before it and of which side of [`GEMM_FROM`] each batch they ran in fell,
 //! not of the batches' cut otherwise: the GEMM's output for a column is that
 //! of any other column count, and every other launch writes a column what
@@ -130,7 +131,7 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use model::arch::glm5next::names::Sub;
-use model::arch::glm5next::place::{self, DenseForms, FrontWidths};
+use model::arch::glm5next::place::{self, DenseForms, FrontWidths, MixerForms};
 use model::moe::UNION_MAX_COLS;
 use model::placement::kernels::DownForms;
 use runtime::layer::{FfnKind, MixerKind};
@@ -148,7 +149,7 @@ use super::{
     prompt, q8, shape,
 };
 use crate::ffn::{self, CardRows, CardTiles};
-use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
+use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows, Launches};
 use crate::kda;
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, KdaNames, MixerNames, other_kind};
@@ -167,8 +168,8 @@ const _: () = assert!(CHUNK == HC_MAX_TOKENS);
 
 /// The fewest tokens a batch runs its GEMM projections over
 /// ([`GemmFront`]: a KDA mixer's input and output projections but its decay
-/// pair, a latent mixer's joined projection, query heads and output
-/// projection, a dense block): a batch of at most a chunk
+/// pair, a latent mixer's projections of the normed input, query heads and
+/// output projection, a dense block): a batch of at most a chunk
 /// runs them as the step's gemv does, so it writes the step's bits.
 pub const GEMM_FROM: usize = CHUNK + 1;
 
@@ -883,7 +884,8 @@ struct Bufs {
 impl Bufs {
     /// The shared buffers for batches of up to `cap` tokens of `d`'s widths,
     /// `ff` the widest dense or shared-expert width, `dense_ff` the widest
-    /// dense block's (0 for none) with the `forms` its sites read,
+    /// dense block's (0 for none) with the `forms` its sites read and the
+    /// `mixer` inputs a K-quant site reads,
     /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
     /// positions, which are a list's width, so they cover a list too. The
@@ -894,7 +896,7 @@ impl Bufs {
         gpu: &Gpu,
         d: &Dims,
         [ff, dense_ff, expert_ff]: [usize; 3],
-        forms: DenseForms,
+        (forms, mixer): (DenseForms, MixerForms),
         ctx: usize,
         cap: usize,
         card_leg: DownForms,
@@ -964,6 +966,7 @@ impl Bufs {
                         heads_v: d.heads * d.head_v,
                         ff: dense_ff,
                         forms,
+                        mixer,
                     },
                 },
             )?,
@@ -1857,7 +1860,7 @@ impl Body {
             gpu,
             &self.dims,
             [ff, dense_ff, expert_ff],
-            forms,
+            (forms, self.mixer),
             self.ctx,
             cap,
             self.card.prompt_leg(),
@@ -2259,11 +2262,19 @@ impl KdaProj for KdaBatch<'_> {
             z,
             ..
         } = y;
-        // The front's GEMM reads q8_0 planes: from GEMM_FROM tokens when the
-        // projections it runs are such, else by chunk by name.
+        // The front's GEMM runs the types it has one for (`GemmFront::covers`):
+        // from GEMM_FROM tokens when the projections it runs are such, else
+        // by chunk by name.
+        let (launches, rows) = nm.qkv.launches(W, w)?;
         let gemm = t >= GEMM_FROM
-            && nm.qkv.is_joined(w)
-            && reads_q8_0(w, [&nm.qkv.whole, &nm.g_a, &nm.beta, &nm.g_b]);
+            && GemmFront::covers(
+                w,
+                nm.qkv.resident(w).into_iter().chain([
+                    nm.g_a.as_str(),
+                    nm.beta.as_str(),
+                    nm.g_b.as_str(),
+                ]),
+            );
         if gemm {
             self.front.kda_in(
                 gpu,
@@ -2272,7 +2283,10 @@ impl KdaProj for KdaBatch<'_> {
                 t,
                 xn,
                 KdaInNames {
-                    qkv: &nm.qkv.whole,
+                    qkv: Launches {
+                        parts: &launches,
+                        rows,
+                    },
                     g_a: &nm.g_a,
                     beta: &nm.beta,
                     g_b: &nm.g_b,
@@ -2364,7 +2378,7 @@ impl KdaProj for KdaBatch<'_> {
     ) -> Result<(), GpuError> {
         const W: &str = "glm5next prefill kda";
         let (w, nm) = (self.w, self.nm);
-        if t >= GEMM_FROM && reads_q8_0(w, [&nm.out]) {
+        if t >= GEMM_FROM && GemmFront::covers(w, [nm.out.as_str()]) {
             return self.front.kda_out(gpu, w, l, t, gated, &nm.out, out);
         }
         let (n, v) = (self.d.embd, self.d.kda.n_v * HEAD);
@@ -2382,14 +2396,6 @@ impl KdaProj for KdaBatch<'_> {
         }
         Ok(())
     }
-}
-
-/// Whether every weight `names` is resident as q8_0 planes: the form the
-/// front's GEMM reads.
-fn reads_q8_0<'n>(w: &Weights, names: impl IntoIterator<Item = &'n String>) -> bool {
-    names
-        .into_iter()
-        .all(|n| matches!(w.get(n), Some(DevWeight::Q8_0 { .. })))
 }
 
 impl PromptProgram<'_> {
@@ -2568,14 +2574,22 @@ impl PromptProgram<'_> {
             t,
             &mut b.xn,
         )?;
-        if t >= GEMM_FROM && nm.stack.is_joined(w) {
+        if t >= GEMM_FROM && GemmFront::covers(w, nm.stack.resident(w)) {
+            let (launches, rows) = nm.stack.launches(W, w)?;
             b.front.latent_in(
                 gpu,
                 w,
                 l,
                 t,
                 &b.xn,
-                (&nm.stack.whole, ql, kvw),
+                (
+                    Launches {
+                        parts: &launches,
+                        rows,
+                    },
+                    ql,
+                    kvw,
+                ),
                 LatentInRows {
                     qa: &mut b.qa,
                     kv: &mut b.kv,
@@ -2673,8 +2687,8 @@ impl PromptProgram<'_> {
         let rows = index.rows();
         let kept = d.kept;
         let (gemm_q, gemm_out) = (
-            t >= GEMM_FROM && reads_q8_0(w, [&nm.q_b]),
-            t >= GEMM_FROM && reads_q8_0(w, [&nm.out]),
+            t >= GEMM_FROM && GemmFront::covers(w, [nm.q_b.as_str()]),
+            t >= GEMM_FROM && GemmFront::covers(w, [nm.out.as_str()]),
         );
         let (hq, hv) = (d.heads * d.head_k, d.heads * d.head_v);
         if gemm_q {
