@@ -77,6 +77,11 @@ pub use geometry::{
 };
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, head_groups};
 pub use headnorm::HeadNormParams;
+pub use mamba2::{Mamba2NormParams, Mamba2Params, Mamba2Shape};
+pub use mamba2_geom::{
+    CH_PER_BLOCK as MAMBA2_CH_PER_BLOCK, STATE as MAMBA2_STATE, TAPS as MAMBA2_TAPS,
+    THREADS as MAMBA2_THREADS,
+};
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
 pub use routed::{
@@ -162,6 +167,8 @@ pub struct Kernels {
     delta: Pipeline,
     /// The gated delta step over rows, and the ring commit after it.
     delta_rows: delta::RowsPipelines,
+    /// The Mamba-2 decode step and the grouped norm over its output.
+    mamba2: mamba2::Pipelines,
     attention: attention::AttentionPipelines,
     /// The output head: the Q6_K entry (A4's, Q8_0's and Q5_K's are
     /// `head_a4`, `head_q8_0` and `head_q5k`; Q4_K has none).
@@ -384,6 +391,7 @@ impl Kernels {
             experts: experts::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,
             delta_rows: delta::RowsPipelines::new(library)?,
+            mamba2: mamba2::Pipelines::new(library)?,
             attention: attention::AttentionPipelines::new(library)?,
             // The head's SIMD-group count, not the mat-vec count this function
             // was given. The constant is the pipeline's function constant.
