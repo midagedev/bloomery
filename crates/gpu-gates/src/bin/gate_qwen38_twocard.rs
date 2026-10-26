@@ -1535,7 +1535,7 @@ mod gate {
     /// the wide structure line on that load, then the harness's one-slot
     /// clause on a load of one.
     fn slots_clauses(
-        (path, inputs, bp): (&Path, &PlanInputs, &Machine),
+        (path, file, inputs, bp): (&Path, &Split, &PlanInputs, &Machine),
         (gib, host, ub): (u64, HostCfg, usize),
     ) -> Result<bool, GateError> {
         let [w0, w1] = [0, 1].map(|s| SLOT_PROMPTS[s] + SLOT_FILL);
@@ -1548,7 +1548,7 @@ mod gate {
             gib,
             host,
             ub,
-            shape: crate::q38_arch::shape_of(&inputs.spec)?,
+            shape: crate::q38_arch::shape_of(&inputs.spec, file)?,
             windows: [a0.to_vec(), a1.to_vec()],
         };
         let plan = a.plan(slots_gate::STREAMS)?;
@@ -1724,7 +1724,7 @@ mod gate {
                 "--slots: a tier load planned for two slots through the slot harness, wide passes of 5 to 8 columns",
             )?;
             drop(last.take());
-            pass &= slots_clauses((path, &inputs, &bp), (gib, host, ub))?;
+            pass &= slots_clauses((path, &split, &inputs, &bp), (gib, host, ub))?;
         }
         let (ran, deferred) = tier::tally();
         println!(

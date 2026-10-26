@@ -2913,6 +2913,19 @@ impl Gpu {
         self.quantize_q8_1_at(x, 0, act, sink)
     }
 
+    /// [`Gpu::enqueue_quantize_q8_1_layer`] on `stream`, which the caller orders
+    /// before the activation's readers, raising into `fault`.
+    pub fn enqueue_quantize_q8_1_on(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let m = act.m();
+        self.quantize_q8_1_cols_at_(stream, x, 0, act, m, false, fault)
+    }
+
     /// The head's quantization: [`Gpu::enqueue_quantize_q8_1`] raising with
     /// [`LAYER_HEAD`].
     pub(crate) fn enqueue_quantize_q8_1_head(
@@ -2989,7 +3002,7 @@ impl Gpu {
         m: usize,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
-        self.quantize_q8_1_cols_at_(x, x0, act, m, true, fault)
+        self.quantize_q8_1_cols_at_(&self.stream, x, x0, act, m, true, fault)
     }
 
     /// [`Gpu::quantize_q8_1_at`] over `act`'s first `m` columns, refused
@@ -3002,14 +3015,19 @@ impl Gpu {
         m: usize,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
-        self.quantize_q8_1_cols_at_(x, x0, act, m, false, fault)
+        self.quantize_q8_1_cols_at_(&self.stream, x, x0, act, m, false, fault)
     }
 
     /// The launcher both quantize entries share; `relu_sqr` only picks the
     /// kernel (`q3k_quantize_q8_1_relu_sqr` applies the squared ReLU inside
     /// its load).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the stream, the rows, their offset, the activation, the columns, the kernel pick and the sink (rust-quality R8)"
+    )]
     fn quantize_q8_1_cols_at_(
         &self,
+        stream: &CudaStream,
         x: &DeviceBuffer<f32>,
         x0: usize,
         act: &mut Q8Act,
@@ -3051,7 +3069,7 @@ impl Gpu {
                 .module
                 .prepare_q3k_quantize_q8_1_relu_sqr(LaunchConfig1D::new(grid, 32, 0))?;
             self.module.q3k_quantize_q8_1_relu_sqr(
-                &self.stream,
+                stream,
                 &prep,
                 x,
                 x0,
@@ -3071,7 +3089,7 @@ impl Gpu {
                 .module
                 .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(grid, 32, 0))?;
             self.module.q3k_quantize_q8_1(
-                &self.stream,
+                stream,
                 &prep,
                 x,
                 x0,
@@ -3097,6 +3115,17 @@ impl Gpu {
     /// capturable.
     pub fn enqueue_gemv_q4k(
         &self,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_gemv_q4k_on(&self.stream, w, act, y)
+    }
+
+    /// [`Gpu::enqueue_gemv_q4k`] on `stream`, which the caller orders before the output's readers.
+    pub fn enqueue_gemv_q4k_on(
+        &self,
+        stream: &CudaStream,
         w: &DeviceTensor<u32>,
         act: &Q8Act,
         y: &mut DeviceBuffer<f32>,
@@ -3131,7 +3160,7 @@ impl Gpu {
             if self.row_prefetch {
                 let prep = self.module.prepare_q4k_gemv_prefetch(cfg)?;
                 self.module.q4k_gemv_prefetch(
-                    &self.stream,
+                    stream,
                     &prep,
                     w.buf(),
                     &act.q4,
@@ -3145,7 +3174,7 @@ impl Gpu {
             } else {
                 let prep = self.module.prepare_q4k_gemv(cfg)?;
                 self.module.q4k_gemv(
-                    &self.stream,
+                    stream,
                     &prep,
                     w.buf(),
                     &act.q4,
@@ -3161,7 +3190,7 @@ impl Gpu {
             let m = launch_u32(what, "m", m)?;
             let prep = self.module.prepare_q4k_gemv_mcol(cfg)?;
             self.module.q4k_gemv_mcol(
-                &self.stream,
+                stream,
                 &prep,
                 w.buf(),
                 &act.q4,
@@ -3187,6 +3216,17 @@ impl Gpu {
     /// is `q3k_gemv`. Asynchronous, allocation-free, capturable.
     pub fn enqueue_gemv_q3k(
         &self,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_gemv_q3k_on(&self.stream, w, act, y)
+    }
+
+    /// [`Gpu::enqueue_gemv_q3k`] on `stream`, which the caller orders before the output's readers.
+    pub fn enqueue_gemv_q3k_on(
+        &self,
+        stream: &CudaStream,
         w: &DeviceTensor<u32>,
         act: &Q8Act,
         y: &mut DeviceBuffer<f32>,
@@ -3220,7 +3260,7 @@ impl Gpu {
             .module
             .prepare_q3k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q3k_gemv(
-            &self.stream,
+            stream,
             &prep,
             w.buf(),
             &act.q3,
@@ -3423,6 +3463,17 @@ impl Gpu {
         act: &Q8Act,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        self.enqueue_gemv_q6k_on(&self.stream, w, act, y)
+    }
+
+    /// [`Gpu::enqueue_gemv_q6k`] on `stream`, which the caller orders before the output's readers.
+    pub fn enqueue_gemv_q6k_on(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
         if !n_sb.is_multiple_of(2) {
@@ -3463,7 +3514,7 @@ impl Gpu {
                 0,
             ))?;
             self.module.q6k_gemv_prefetch(
-                &self.stream,
+                stream,
                 &prep,
                 w.buf(),
                 &act.q6,
@@ -3479,7 +3530,7 @@ impl Gpu {
                 self.module
                     .prepare_q6k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
             self.module.q6k_gemv(
-                &self.stream,
+                stream,
                 &prep,
                 w.buf(),
                 &act.q6,

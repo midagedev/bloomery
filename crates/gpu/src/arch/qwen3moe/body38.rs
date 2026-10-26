@@ -143,7 +143,7 @@ use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
 use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkMode};
 use crate::folder::{Folder, Model};
-use crate::head::{Head, HeadNorm};
+use crate::head::{Head, HeadLaunches, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
@@ -163,6 +163,7 @@ use crate::model::{
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
+use crate::site::{BY_NAME_COLS, ByName};
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, launch_u32, ple};
@@ -1307,9 +1308,9 @@ pub struct Body38 {
     pending: Option<Pending38>,
     /// Each layer's streams after it and its route, when a gate armed them.
     taps: Option<Taps38>,
-    /// The loaded `output`'s form (`mtp::output_form`): the step's launch
-    /// count's head term ([`step_launches`]).
-    head_form: model::arch::qwen35moe::mtp::BorrowedHead,
+    /// The launches the loaded `output`'s head records past its norm: the
+    /// captured walks' launch count's head term ([`step_launches`]).
+    head: HeadLaunches,
     eps: f32,
     vocab: usize,
     ctx: usize,
@@ -1830,12 +1831,34 @@ impl Body38 {
         let ple_ring = DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?;
         let rope = RopeTable::new(&RopeSpec::window(base, geo::ROPE))?;
         let rope = RopeRows::new(stream, &rope, geo::ROPE, ctx)?;
-        let s = Arena38::new(stream, router_dims, 1, ctx)?;
+        // The sites that read q8_1 rows (the file's K-quants) project by name
+        // through forms of their own: one pair of by-name states a walk's
+        // arena, the branch's beside the main stream's.
+        let by_sites = plan38::q8_1_sites(w, &plans)?;
+        let by_any = !by_sites.is_empty();
+        let by_state = |cols: usize| ByName::for_sites(gpu, w, by_sites.iter().copied(), cols);
+        let by_none = || ByName::for_sites(gpu, w, std::iter::empty::<&str>(), 1);
+        let s = Arena38::new(stream, router_dims, 1, ctx, (by_state(1)?, by_state(1)?))?;
         let sp = StepParams::new(stream, true)?;
-        let a = Arena38::new(stream, router_dims, PASS_ROWS, ctx)?;
+        let a = Arena38::new(
+            stream,
+            router_dims,
+            PASS_ROWS,
+            ctx,
+            (by_state(PASS_ROWS)?, by_state(PASS_ROWS)?),
+        )?;
         let rp = PassRecord::new(stream)?;
         let pass_hsum = DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?;
-        let wa = Arena38::wide(stream, router_dims, ub, UBATCH_MOST, ctx)?;
+        // The ubatch walk projects a K-quant site by chunks of the by-name
+        // unit's columns on the main stream alone.
+        let wa = Arena38::wide(
+            stream,
+            router_dims,
+            ub,
+            UBATCH_MOST,
+            ctx,
+            (by_state(BY_NAME_COLS.min(ub))?, by_none()?),
+        )?;
         let wr = WideRecord::new(stream, ub)?;
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
         let host_cols = ub.max(PASS_ROWS);
@@ -2013,20 +2036,10 @@ impl Body38 {
                 Ok::<_, GpuError>((s, section_order(order)))
             })
             .transpose()?;
-        // The loaded `output`'s form, the step's head-count term: the one
-        // owner of the list is `mtp::output_form` (the borrow check asks it
-        // too); a type it does not take (a Q4_K head, no file today) counts
-        // as the Q8_0 form's, which reads the f32 rows with no quantize.
-        let head_form = match w.get(&model::arch::qwen35moe::names::output()) {
-            Some(crate::weights::DevWeight::KQuant { ty, .. }) => {
-                model::arch::qwen35moe::mtp::output_form(*ty)
-                    .unwrap_or(model::arch::qwen35moe::mtp::BorrowedHead::Q8_0)
-            }
-            Some(crate::weights::DevWeight::Bf16 { .. }) => {
-                model::arch::qwen35moe::mtp::BorrowedHead::Bf16
-            }
-            _ => model::arch::qwen35moe::mtp::BorrowedHead::Q8_0,
-        };
+        // The head's launches in a captured walk, from the head's own rule
+        // for the `output` it reads; a type no head entry reads is refused by
+        // name.
+        let head = HeadLaunches::of(w)?;
         let mut body = Body38 {
             hybrid,
             plans,
@@ -2043,7 +2056,7 @@ impl Body38 {
             a,
             rp,
             pass_hsum,
-            k: Kernels38::load(gpu)?,
+            k: Kernels38::load(gpu, by_any)?,
             branch: Branch::new(gpu.stream_handle())?,
             slots,
             card,
@@ -2060,7 +2073,7 @@ impl Body38 {
             taps: None,
             eps: spec.rms_eps,
             vocab: spec.vocab as usize,
-            head_form,
+            head,
             ctx,
             held: 0,
             staged: None,
@@ -2110,7 +2123,7 @@ impl Body38 {
             .filter(|&l| !self.card.hostless(l))
             .count();
         (
-            step_launches(&self.plans, &self.card, self.tier.as_ref(), self.head_form),
+            step_launches(&self.plans, &self.card, self.tier.as_ref(), self.head),
             STEP_MEMOPS * served,
         )
     }
@@ -2653,13 +2666,7 @@ impl Body38 {
     /// count).
     #[must_use]
     pub fn verify_launches(&self, m: usize) -> usize {
-        verify_launches(
-            &self.plans,
-            &self.card,
-            self.tier.as_ref(),
-            m,
-            self.head_form,
-        )
+        verify_launches(&self.plans, &self.card, self.tier.as_ref(), m, self.head)
     }
 
     /// Refused by name unless the stores hold `pos` positions: a call from
@@ -5097,11 +5104,14 @@ impl ChainBody for Body38 {
             + self.rope.table.num_bytes()
             + self.rope_bytes()
             + self.s.bytes()
+            + self.s.by_bytes()
             + self.sp.bytes()
             + self.a.bytes()
+            + self.a.by_bytes()
             + self.rp.bytes()
             + self.pass_hsum.num_bytes()
             + self.wa.bytes()
+            + self.wa.by_bytes()
             + self.wr.bytes()
             + self.wide_hsum.num_bytes()
             + self.wide.bytes()

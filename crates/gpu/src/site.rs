@@ -233,6 +233,23 @@ pub(crate) const BY_NAME: [SiteTy; 5] = [
     SiteTy::Bf16,
 ];
 
+/// The types a dense site launches by name through [`ByName`] over up to
+/// [`BY_NAME_COLS`] columns: [`BY_NAME`] and the families that read the q8_1
+/// blocks of 128 (the K-quants, NVFP4), every dense family but Q5_0. A unit
+/// test holds the list to `placement::accepts::dense_projected`.
+pub(crate) const PROJECTED: [SiteTy; 10] = [
+    SiteTy::Q3K,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+    SiteTy::F32,
+    SiteTy::Nvfp4,
+    SiteTy::Mxfp8,
+    SiteTy::Fp8B128,
+    SiteTy::Bf16,
+];
+
 /// The resident K-quant words of `name`, or a named refusal.
 fn kq<'w>(
     w: &'w Weights,
@@ -632,9 +649,26 @@ pub fn kgemv(
     fault: FaultSink,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    kgemv_on(gpu, gpu.stream(), kk, (ty, w, name), act, fault, y)
+}
+
+/// [`kgemv`] on `stream`, which the caller orders before the output's readers.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, the stream, the kernels, the site, the activation, the sink and the output (rust-quality R8)"
+)]
+pub fn kgemv_on(
+    gpu: &Gpu,
+    stream: &cuda_core::CudaStream,
+    kk: &KGemvKernels,
+    (ty, w, name): (SiteTy, &Weights, &str),
+    act: &Q8Act,
+    fault: FaultSink,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
     const WHAT: &str = "site::kgemv";
     match ty {
-        SiteTy::Q4K => gpu.enqueue_gemv_q4k(kq(w, WHAT, name)?, act, y),
+        SiteTy::Q4K => gpu.enqueue_gemv_q4k_on(stream, kq(w, WHAT, name)?, act, y),
         // An odd super-block count leaves the rows unaligned to the words the
         // plain gemv reads: the `_sel` entry addresses rows by byte, so the
         // site runs as a stack of one expert, one column (where its layout
@@ -652,14 +686,14 @@ pub fn kgemv(
             }
             let wt = kq(w, WHAT, name)?;
             kk.q6
-                .enqueue_gemv_q6k_sel(gpu.stream(), wt, act, &kk.one, 1, wt.rows(), y)
+                .enqueue_gemv_q6k_sel(stream, wt, act, &kk.one, 1, wt.rows(), y)
         }
-        SiteTy::Q6K => gpu.enqueue_gemv_q6k(kq(w, WHAT, name)?, act, y),
-        SiteTy::Q3K => gpu.enqueue_gemv_q3k(kq(w, WHAT, name)?, act, y),
+        SiteTy::Q6K => gpu.enqueue_gemv_q6k_on(stream, kq(w, WHAT, name)?, act, y),
+        SiteTy::Q3K => gpu.enqueue_gemv_q3k_on(stream, kq(w, WHAT, name)?, act, y),
         SiteTy::Q5K => {
             let wt = kq(w, WHAT, name)?;
             kk.kq.enqueue_gemv_q5k_sel(
-                gpu.stream(),
+                stream,
                 &SelDown {
                     w: wt,
                     act,
@@ -671,9 +705,7 @@ pub fn kgemv(
                 y,
             )
         }
-        SiteTy::Nvfp4 => kk
-            .nv
-            .enqueue_gemv(gpu.stream(), w.nvfp4(WHAT, name)?, act, y),
+        SiteTy::Nvfp4 => kk.nv.enqueue_gemv(stream, w.nvfp4(WHAT, name)?, act, y),
         SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 | SiteTy::Fp8B128 | SiteTy::Bf16 => {
             Err(GpuError::shape(
                 WHAT,
@@ -722,6 +754,20 @@ pub fn blocks32_gemv(
 
 /// The most columns a [`ByName`] projection runs: the K-quant gemv's.
 pub const BY_NAME_COLS: usize = KGEMV_COLS;
+
+/// The launches a [`ByName::gemv`] of a whole weight of type `ty` over `m`
+/// columns makes beyond the one an f32-row site makes: a K-quant or NVFP4
+/// site quantizes its columns into q8_1 rows first, and a type whose gemv is
+/// row-major ([`kgemv_order`]) copies its result token-major past one column.
+/// A body counts its captured walk's launches by this and the weights'
+/// resident types.
+#[must_use]
+pub fn by_name_extra(ty: SiteTy, m: usize) -> usize {
+    if ty.reads() != Form::Q8x128 {
+        return 0;
+    }
+    1 + usize::from(m > 1 && kgemv_order(ty) == Some(Order::RowMajor))
+}
 
 /// The launches a [`ByName`] projection makes beyond the f32-row gemv: the
 /// K-quant `_sel` family and the row-major copy into token-major rows.
@@ -851,9 +897,33 @@ impl ByName {
     pub fn gemv(
         &mut self,
         gpu: &Gpu,
+        kernels: (Option<&ByNameKernels>, Option<&Gemm32Kernels>),
+        site: (&Weights, &str),
+        layer: usize,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        out: Out<'_>,
+    ) -> Result<(), GpuError> {
+        let fault = gpu.layer_sink(layer)?;
+        self.gemv_on(gpu, gpu.stream(), kernels, site, fault, x, m, out)
+    }
+
+    /// [`ByName::gemv`] on `stream`, which the caller orders before the
+    /// output's readers, a fault of the quantization raising into `fault`.
+    /// Two projections on two streams at once hold a `ByName` each: a form
+    /// and the staging are one projection's.
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the stream, the kernels, the site, the sink, the rows, their count and the output (rust-quality R8)"
+    )]
+    pub fn gemv_on(
+        &mut self,
+        gpu: &Gpu,
+        stream: &cuda_core::CudaStream,
         (k, g32): (Option<&ByNameKernels>, Option<&Gemm32Kernels>),
         (w, name): (&Weights, &str),
-        layer: usize,
+        fault: FaultSink,
         x: &DeviceBuffer<f32>,
         m: usize,
         out: Out<'_>,
@@ -874,7 +944,6 @@ impl ByName {
             ));
         }
         let whole = at == 0 && stride == rows;
-        let stream = gpu.stream();
         match ty.reads() {
             Form::F32 | Form::Q8x32 => {
                 if whole {
@@ -924,26 +993,25 @@ impl ByName {
                             format!("{name}: no q8_1 form of {m} columns of {wk} values was made"),
                         )
                     })?;
-                gpu.enqueue_quantize_q8_1_layer(x, act, layer)?;
-                let fault = gpu.layer_sink(layer)?;
+                gpu.enqueue_quantize_q8_1_on(stream, x, act, fault)?;
                 let key = (ty, w, name);
                 let row_major = kgemv_order(ty) == Some(Order::RowMajor) && m > 1;
                 if m == 1 && !whole {
                     let mut win = WindowMut::<f32>::of_mut(y, at * size_of::<f32>(), rows)?;
-                    return kgemv(gpu, &k.kgemv, key, act, fault, &mut win);
+                    return kgemv_on(gpu, stream, &k.kgemv, key, act, fault, &mut win);
                 }
                 if !row_major && whole {
-                    return kgemv(gpu, &k.kgemv, key, act, fault, y);
+                    return kgemv_on(gpu, stream, &k.kgemv, key, act, fault, y);
                 }
                 if row_major {
-                    kgemv(gpu, &k.kgemv, key, act, fault, &mut self.stage)?;
+                    kgemv_on(gpu, stream, &k.kgemv, key, act, fault, &mut self.stage)?;
                     if whole {
                         return k.tm.enqueue(stream, &self.stage, rows, m, y);
                     }
                     k.tm.enqueue(stream, &self.stage, rows, m, &mut self.rows)?;
                     return scatter(stream, &self.rows, (rows, m), y, (at, stride));
                 }
-                kgemv(gpu, &k.kgemv, key, act, fault, &mut self.stage)?;
+                kgemv_on(gpu, stream, &k.kgemv, key, act, fault, &mut self.stage)?;
                 scatter(stream, &self.stage, (rows, m), y, (at, stride))
             }
             Form::Q8Blocks32 => Err(GpuError::shape(
@@ -1928,8 +1996,8 @@ fn swiglu(
 #[cfg(test)]
 mod tests {
     use super::{
-        Form, Order, SiteTy, SwigluLaunch, WideActs, WideForms, file_site, gemm_weight,
-        kgemv_order, swiglu_launch,
+        Form, Order, SiteTy, SwigluLaunch, WideActs, WideForms, by_name_extra, file_site,
+        gemm_weight, kgemv_order, swiglu_launch,
     };
     use crate::gemm::GemmWeight;
     use crate::kquant::Act;
@@ -1939,6 +2007,29 @@ mod tests {
     use model::placement::kernels;
     use std::fs::File;
     use std::io::BufWriter;
+
+    /// A by-name projection's extra launches follow the type: none for a site
+    /// that reads the f32 rows or the q8 blocks of 32, the quantization for a
+    /// K-quant or NVFP4 site, and the token-major copy past one column for
+    /// the row-major types alone (Q3_K, Q4_K, Q6_K).
+    #[test]
+    fn a_by_name_projection_counts_its_quantization_and_its_row_major_copy() {
+        for (ty, one, rows) in [
+            (SiteTy::Q8_0, 0, 0),
+            (SiteTy::F32, 0, 0),
+            (SiteTy::Bf16, 0, 0),
+            (SiteTy::Mxfp8, 0, 0),
+            (SiteTy::Fp8B128, 0, 0),
+            (SiteTy::Q3K, 1, 2),
+            (SiteTy::Q4K, 1, 2),
+            (SiteTy::Q6K, 1, 2),
+            (SiteTy::Q5K, 1, 1),
+            (SiteTy::Nvfp4, 1, 1),
+        ] {
+            assert_eq!(by_name_extra(ty, 1), one, "{ty} at one column");
+            assert_eq!(by_name_extra(ty, 4), rows, "{ty} at four columns");
+        }
+    }
 
     /// A site's type is read from the file's header alone: a Q8_0 matrix of
     /// two rows of 64 is read as Q8_0 where Q8_0 is launched, and refused by
@@ -2133,6 +2224,11 @@ mod tests {
             let by_name = model::placement::accepts::dense_by_name(ty);
             assert_eq!(super::BY_NAME.contains(&s), by_name.is_some(), "{s}");
             if let Some(entry) = by_name {
+                assert_eq!(SiteTy::of_entry(entry), Some(s), "{s}");
+            }
+            let projected = model::placement::accepts::dense_projected(ty);
+            assert_eq!(super::PROJECTED.contains(&s), projected.is_some(), "{s}");
+            if let Some(entry) = projected {
                 assert_eq!(SiteTy::of_entry(entry), Some(s), "{s}");
             }
         }

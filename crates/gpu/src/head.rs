@@ -37,6 +37,7 @@ use crate::kquant::SelDown;
 use crate::q8f32::{E4m3GemvArgs, E4m3Weight, GemvOut};
 use crate::quant_sel::QuantSelKernels;
 use crate::tensor::{DeviceTensor, Q8Act};
+use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
 use model::arch::names::output_norm;
@@ -71,6 +72,12 @@ impl OutW<'_> {
     /// no q8_1 form and its argmax refuses a non-finite logit.
     fn reads_f32(&self) -> bool {
         matches!(self, OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_))
+    }
+
+    /// Whether its gemv writes token-major columns that a copy interleaves
+    /// into the argmax's layout past one row: the `_sel` Q5_K gemv.
+    fn copies_rows(&self) -> bool {
+        matches!(self, OutW::Q5K(_))
     }
 }
 
@@ -187,6 +194,38 @@ fn norm_rows<'a>(
     }
 }
 
+/// The launches [`Head::enqueue`] records past the final norm, by the type of
+/// the `output.weight` it projects: the q8_1 quantization of a K-quant
+/// projection's input rows, the projection, a Q5_K projection's token-major
+/// copy past one row, and the argmax. A body whose captured walk holds a head
+/// counts it through [`HeadLaunches::at`], so the count follows the kernels
+/// the head launches and not a copy of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadLaunches {
+    quantizes: bool,
+    copies_rows: bool,
+}
+
+impl HeadLaunches {
+    /// The launches of the head over `out`'s `output.weight`.
+    ///
+    /// # Errors
+    /// A weight no head entry reads, or none resident (as [`Head::with_gain`]).
+    pub fn of(out: &Weights) -> Result<HeadLaunches, GpuError> {
+        let (w, _) = head_out_w(out)?;
+        Ok(HeadLaunches {
+            quantizes: !w.reads_f32(),
+            copies_rows: w.copies_rows(),
+        })
+    }
+
+    /// The launches of a head of `m` rows past its final norm.
+    #[must_use]
+    pub fn at(self, m: usize) -> usize {
+        usize::from(self.quantizes) + 1 + usize::from(self.copies_rows && m > 1) + 1
+    }
+}
+
 /// The resident output head for `m` rows: input `m * hidden` f32 (row-major,
 /// one row per token), the normed rows, their q8_1 quantization, `n_vocab * m`
 /// logits (`logits[v*m + c]`, the gemv's layout) and `m` argmax tokens. Every
@@ -220,10 +259,21 @@ pub struct Head {
 }
 
 /// The kernels a Q5_K head's projection launches: the `_sel` Q5_K gemv, which
-/// reads the matrix as a stack of one expert.
+/// reads the matrix as a stack of one expert (`one`: the expert's id, a slot
+/// each of the `m` rows). Past one row it writes token-major (`cols[c ·
+/// n_vocab + v]`), which `token_major` copies into the interleaved layout the
+/// argmax reads (`logits[v · m + c]`).
 struct Q5kHead {
     kernels: QuantSelKernels,
     one: DeviceBuffer<u32>,
+    rows: Option<Q5kRows>,
+}
+
+/// A Q5_K head of more than one row: the gemv's token-major logits and the
+/// copy into the interleaved layout.
+struct Q5kRows {
+    cols: DeviceBuffer<f32>,
+    token_major: TokenMajor,
 }
 
 impl Head {
@@ -302,15 +352,17 @@ impl Head {
             None
         };
         let q5k = match out_w {
-            OutW::Q5K(_) if m != 1 => {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!("{HEAD_TENSOR} is Q5_K: its gemv runs one row, got m={m}"),
-                ));
-            }
             OutW::Q5K(_) => Some(Q5kHead {
                 kernels: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
-                one: DeviceBuffer::zeroed(stream, 1)?,
+                one: DeviceBuffer::zeroed(stream, m)?,
+                rows: if m > 1 {
+                    Some(Q5kRows {
+                        cols: DeviceBuffer::zeroed(stream, m * n_vocab)?,
+                        token_major: TokenMajor::load(gpu.context())?,
+                    })
+                } else {
+                    None
+                },
             }),
             _ => None,
         };
@@ -375,7 +427,9 @@ impl Head {
             + self.logits.num_bytes()
             + self.token_out.num_bytes()
             + self.rows_done.as_ref().map_or(0, DeviceBuffer::num_bytes)
-            + self.q5k.as_ref().map_or(0, |q| q.one.num_bytes())
+            + self.q5k.as_ref().map_or(0, |q| {
+                q.one.num_bytes() + q.rows.as_ref().map_or(0, |r| r.cols.num_bytes())
+            })
             + self.act.as_ref().map_or(0, Q8Act::device_bytes)
     }
 
@@ -414,24 +468,39 @@ impl Head {
             OutW::Q5K(out_w) => {
                 let act = held(&mut self.act)?;
                 gpu.enqueue_quantize_q8_1_head(rows, act)?;
-                let q = self.q5k.as_ref().ok_or_else(|| {
+                let q = self.q5k.as_mut().ok_or_else(|| {
                     GpuError::state(
                         "Head::enqueue",
                         "a Q5_K head's kernels (made with the head)",
                     )
                 })?;
-                q.kernels.enqueue_gemv_q5k_sel(
-                    stream,
-                    &SelDown {
-                        w: out_w,
-                        act: &*act,
-                        sel: &q.one,
-                        n_slots: 1,
-                        rows_per_expert: out_w.rows(),
-                    },
-                    fault,
-                    &mut self.logits,
-                )?;
+                let down = SelDown {
+                    w: out_w,
+                    act: &*act,
+                    sel: &q.one,
+                    n_slots: self.m,
+                    rows_per_expert: out_w.rows(),
+                };
+                match q.rows.as_mut() {
+                    None => {
+                        q.kernels
+                            .enqueue_gemv_q5k_sel(stream, &down, fault, &mut self.logits)?
+                    }
+                    Some(r) => {
+                        q.kernels
+                            .enqueue_gemv_q5k_sel(stream, &down, fault, &mut r.cols)?;
+                        // `logits[v · m + c] = cols[c · n_vocab + v]`: the
+                        // copy of an `m`-row, `n_vocab`-column matrix with
+                        // the two counts as `token_major`'s `rows` and `m`.
+                        r.token_major.enqueue(
+                            stream,
+                            &r.cols,
+                            self.m,
+                            self.n_vocab,
+                            &mut self.logits,
+                        )?;
+                    }
+                }
             }
             OutW::Q4K(out_w) => {
                 let act = held(&mut self.act)?;
@@ -743,6 +812,39 @@ mod tests {
             .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
             .expect("a vocabulary");
         assert_eq!(head.token(&gpu).expect("the token") as usize, best);
+
+        // A head of three rows: row `c`'s logits and token are the one-row
+        // head's on that row, bit for bit (the `_sel` gemv is token-major and
+        // the copy puts it in the argmax's layout).
+        const M: usize = 3;
+        let inputs: Vec<Vec<f32>> = (0..M)
+            .map(|c| {
+                (0..K)
+                    .map(|i| (((i + 7 * c) * 37 % 101) as f32 - 50.0 + c as f32) / 25.0)
+                    .collect()
+            })
+            .collect();
+        let mut multi = Head::with_m(&gpu, &w, 1e-6, M).expect("a Q5_K head of three rows");
+        multi
+            .set_input(&gpu, &inputs.concat())
+            .expect("the three rows");
+        multi.enqueue(&gpu, &w).expect("the head of three rows");
+        let got = multi.logits_to_host(&gpu).expect("the logits");
+        let tokens = multi.tokens(&gpu).expect("the tokens");
+        assert_eq!((got.len(), tokens.len()), (M * N_VOCAB, M));
+        for (c, input) in inputs.iter().enumerate() {
+            head.set_input(&gpu, input).expect("the input");
+            head.enqueue(&gpu, &w).expect("the head");
+            let want = head.logits_to_host(&gpu).expect("the logits");
+            for (v, &w1) in want.iter().enumerate() {
+                assert_eq!(
+                    got[v * M + c].to_bits(),
+                    w1.to_bits(),
+                    "row {c}, logit {v}: the head of three rows, the one-row head's"
+                );
+            }
+            assert_eq!(tokens[c], head.token(&gpu).expect("the token"), "row {c}");
+        }
     }
 
     /// The readback's seeded (0, 0) pair is an unwritten readback, not a

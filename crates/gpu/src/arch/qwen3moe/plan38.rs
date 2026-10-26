@@ -159,6 +159,15 @@ pub(super) struct PlePlan {
     pub(super) conv: String,
 }
 
+/// The launches a layer's by-name projections ([`dense::ByName`]) add to the
+/// one launch an f32-row site makes, from the resident types of its sites
+/// ([`dense::by_name_extra`]): at one column and at more than one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ByLaunches {
+    pub(super) one: usize,
+    pub(super) rows: usize,
+}
+
 /// One layer's plan.
 pub(super) struct Layer38 {
     pub(super) attn_hc: HcSite,
@@ -166,6 +175,8 @@ pub(super) struct Layer38 {
     pub(super) ffn_hc: HcSite,
     pub(super) ffn: FfnPlan,
     pub(super) ple: Option<PlePlan>,
+    /// The by-name projections' extra launches.
+    pub(super) by: ByLaunches,
 }
 
 impl GdnPlan {
@@ -216,6 +227,26 @@ impl Layer38 {
             Mixer38::Gdn(p) => &p.ssm_out,
             Mixer38::Qsa(p) => &p.out,
         }
+    }
+
+    /// The layer's dense sites a walk projects by name ([`dense::ByName`]):
+    /// the mixer's, the shared expert's three and the PLE site's. The joined
+    /// β·α stack is not among them: it reads the f32 rows, whole at one row
+    /// and by its two parts past it.
+    pub(super) fn projected(&self) -> Vec<&str> {
+        let mut sites: Vec<&str> = match &self.mixer {
+            Mixer38::Gdn(p) => vec![&p.qkv, &p.z, &p.ssm_out],
+            Mixer38::Qsa(p) => vec![&p.q, &p.k, &p.v, &p.out, &p.idx_k, &p.idx_q],
+        };
+        sites.extend([&*self.ffn.gate_sh, &*self.ffn.up_sh, &*self.ffn.down_sh]);
+        sites.extend(self.ple.iter().flat_map(PlePlan::input_sites));
+        sites
+    }
+
+    /// The launches the layer's by-name projections add to a walk over `m`
+    /// columns ([`ByLaunches`]).
+    pub(super) fn by_extra(&self, m: usize) -> usize {
+        if m > 1 { self.by.rows } else { self.by.one }
     }
 }
 
@@ -452,9 +483,10 @@ fn gqa_fits(g: &Gqa) -> bool {
 
 /// Every layer's plan from its kind, `ple` the PLE site's layer, each weight
 /// checked against the geometry: type and shape. A dense projection, the
-/// indexer's two and the joined β·α stack among them, is of a type the
-/// common site launches by name (`site::BY_NAME`), each tensor's own: the
-/// walks pick its launch by the resident form. An HC matrix is one
+/// indexer's two among them, is of a type the common site projects by name
+/// (`site::PROJECTED`: the f32 rows' families and the K-quants), each
+/// tensor's own: the walks pick its launch by the resident form. The joined
+/// β·α stack is of an f32 rows' family (`site::BY_NAME`). An HC matrix is one
 /// `HcMatrix::of` reads. The gains, the conv and the injects are F32 (the
 /// load widens a BF16 one, `ModelTensors::bf16_words`); the router is F32 or
 /// a BF16 one's words, which its kernels read either way.
@@ -488,14 +520,14 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                         ssm_out: model::arch::qwen35moe::names::ssm_out(l),
                     };
                     let (c, nv) = (GDN.channels(), GDN.n_v);
-                    dense_shape(w, &p.qkv, c, HIDDEN)?;
-                    dense_shape(w, &p.z, nv * linear::HEAD, HIDDEN)?;
+                    projected_shape(w, &p.qkv, c, HIDDEN)?;
+                    projected_shape(w, &p.z, nv * linear::HEAD, HIDDEN)?;
                     dense_shape(w, &p.beta_alpha, 2 * nv, HIDDEN)?;
                     f32_len(w, &p.conv, c * linear::CONV_TAPS)?;
                     f32_len(w, &p.dt_bias, nv)?;
                     f32_len(w, &p.ssm_a, nv)?;
                     f32_len(w, &p.ssm_norm, linear::HEAD)?;
-                    dense_shape(w, &p.ssm_out, HIDDEN, nv * linear::HEAD)?;
+                    projected_shape(w, &p.ssm_out, HIDDEN, nv * linear::HEAD)?;
                     Mixer38::Gdn(p)
                 }
                 Kind38::Qsa => {
@@ -511,14 +543,14 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                         idx_k_norm: model::arch::qwen35moe::names::indexer_k_norm(l),
                         idx_q_norm: model::arch::qwen35moe::names::indexer_q_norm(l),
                     };
-                    dense_shape(w, &p.q, Q_ROWS, HIDDEN)?;
-                    dense_shape(w, &p.k, KV, HIDDEN)?;
-                    dense_shape(w, &p.v, KV, HIDDEN)?;
+                    projected_shape(w, &p.q, Q_ROWS, HIDDEN)?;
+                    projected_shape(w, &p.k, KV, HIDDEN)?;
+                    projected_shape(w, &p.v, KV, HIDDEN)?;
                     f32_len(w, &p.q_norm, HEAD)?;
                     f32_len(w, &p.k_norm, HEAD)?;
-                    dense_shape(w, &p.out, HIDDEN, ATTN)?;
-                    dense_shape(w, &p.idx_k, IDX_DIM, HIDDEN)?;
-                    dense_shape(w, &p.idx_q, IDX_HEADS * IDX_DIM, HIDDEN)?;
+                    projected_shape(w, &p.out, HIDDEN, ATTN)?;
+                    projected_shape(w, &p.idx_k, IDX_DIM, HIDDEN)?;
+                    projected_shape(w, &p.idx_q, IDX_HEADS * IDX_DIM, HIDDEN)?;
                     f32_len(w, &p.idx_k_norm, IDX_DIM)?;
                     f32_len(w, &p.idx_q_norm, IDX_DIM)?;
                     Mixer38::Qsa(p)
@@ -537,9 +569,9 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                 (EXPERTS + 1, HIDDEN),
                 &[SiteTy::F32, SiteTy::Bf16],
             )?;
-            dense_shape(w, &ffn.gate_sh, FF, HIDDEN)?;
-            dense_shape(w, &ffn.up_sh, FF, HIDDEN)?;
-            dense_shape(w, &ffn.down_sh, HIDDEN, FF)?;
+            projected_shape(w, &ffn.gate_sh, FF, HIDDEN)?;
+            projected_shape(w, &ffn.up_sh, FF, HIDDEN)?;
+            projected_shape(w, &ffn.down_sh, HIDDEN, FF)?;
             let ple = if l == ple {
                 let p = PlePlan {
                     key: model::arch::qwen35moe::names::ple_key(l),
@@ -549,8 +581,8 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                     norm_conv: model::arch::qwen35moe::names::ple_norm_conv(l),
                     conv: model::arch::qwen35moe::names::ple_conv1d(l),
                 };
-                dense_shape(w, &p.key, wide, HIDDEN)?;
-                dense_shape(w, &p.value, HIDDEN, HIDDEN)?;
+                projected_shape(w, &p.key, wide, HIDDEN)?;
+                projected_shape(w, &p.value, HIDDEN, HIDDEN)?;
                 for g in [&p.norm_key, &p.norm_query, &p.norm_conv] {
                     f32_len(w, g, wide)?;
                 }
@@ -565,21 +597,70 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
             );
             check_site(&attn_hc)?;
             check_site(&ffn_hc)?;
-            Ok(Layer38 {
+            let mut layer = Layer38 {
                 attn_hc,
                 mixer,
                 ffn_hc,
                 ffn,
                 ple,
-            })
+                by: ByLaunches::default(),
+            };
+            layer.by = by_launches(w, &layer)?;
+            Ok(layer)
         })
         .collect()
 }
 
+/// The dense sites of `plans` whose resident type reads q8_1 rows (the
+/// K-quants, NVFP4): the sites a [`dense::ByName`] holds forms for. None on a
+/// file whose sites all read the f32 rows or q8 blocks of 32.
+pub(super) fn q8_1_sites<'p>(w: &Weights, plans: &'p [Layer38]) -> Result<Vec<&'p str>, GpuError> {
+    let mut sites = Vec::new();
+    for name in plans.iter().flat_map(Layer38::projected) {
+        if dense::resident_type(w, WHAT, name)?.reads() == dense::Form::Q8x128 {
+            sites.push(name);
+        }
+    }
+    Ok(sites)
+}
+
+/// The extra launches of `layer`'s by-name projections from its sites'
+/// resident types.
+fn by_launches(w: &Weights, layer: &Layer38) -> Result<ByLaunches, GpuError> {
+    let mut by = ByLaunches::default();
+    for name in layer.projected() {
+        let ty = dense::resident_type(w, WHAT, name)?;
+        by.one += dense::by_name_extra(ty, 1);
+        by.rows += dense::by_name_extra(ty, 2);
+    }
+    Ok(by)
+}
+
 /// The resident weight `name`, `rows` rows of `k` values, of a type the
-/// common dense site launches by name on both walks (`site::BY_NAME`).
+/// common dense site launches by name on both walks (`site::BY_NAME`): the f32
+/// rows' families, which the joined β·α stack reads whole and by its parts.
 fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
     dense::resident_site(w, WHAT, name, (rows, k), &dense::BY_NAME).map(drop)
+}
+
+/// Values of a K-quant super-block, which a q8_1 row holds whole.
+const SUPER_BLOCK: usize = 256;
+
+/// The resident weight `name`, `rows` rows of `k` values, of a type a
+/// by-name projection launches (`site::PROJECTED`: every dense family but
+/// Q5_0, the K-quants and NVFP4 over the q8_1 rows of their input); another
+/// type or shape is refused by name.
+fn projected_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+    let ty = dense::resident_site(w, WHAT, name, (rows, k), &dense::PROJECTED)?;
+    if ty.reads() == dense::Form::Q8x128 && !k.is_multiple_of(SUPER_BLOCK) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "{name} is {ty} over rows of {k} values: a q8_1 row is whole super-blocks of {SUPER_BLOCK}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The resident HC matrix `name` in a form `HcMatrix::of` reads, `rows`

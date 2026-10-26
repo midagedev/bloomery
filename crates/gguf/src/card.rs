@@ -384,9 +384,10 @@ pub enum HeadEntry {
     /// then `argmax_finite_fault`.
     Bf16,
     /// The q8_1 quantizer, the `_sel` Q5_K gemv over the matrix as one expert
-    /// (`QuantSelKernels::enqueue_gemv_q5k_sel`), then `argmax_fault`; one
-    /// row (`m = 1`), whose logits the sel gemv writes in the layout the
-    /// argmax reads.
+    /// (`QuantSelKernels::enqueue_gemv_q5k_sel`, a slot each of the `m`
+    /// rows), then `argmax_fault`; past one row the sel gemv's token-major
+    /// logits are copied into the layout the rows' argmax reads
+    /// (`token_major::TokenMajor`).
     Q5k,
 }
 
