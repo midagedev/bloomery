@@ -61,7 +61,7 @@ use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
 use bloomery_gpu::media::widen_bf16;
-use bloomery_gpu::site;
+use bloomery_gpu::site::{ByName, Out};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel, host_filled};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
@@ -78,6 +78,7 @@ use runtime::sched::{At, Overlap, Port, PortKind};
 use super::WHAT as BODY;
 use super::prefill::PromptState;
 use super::{Body, Dims, Kernels, LANES, RowScratch, Scratch, f32t, f32v, weight};
+use crate::body::{project, project_joined};
 use crate::ffn::block_names;
 use crate::mla::{self, LatentStore};
 use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
@@ -246,6 +247,8 @@ pub struct Nextn {
     /// The full row's buffers: a trunk step's one-row buffers.
     s: RowScratch,
     a: Arena,
+    /// The walk's by-name projections' forms, up to the walk's rows.
+    by_name: ByName,
     /// The verify's row 0 streams, copied at the verify's end.
     pair0: DeviceBuffer<f32>,
     /// The head over the target's `output`, its input the layer's own norm.
@@ -482,7 +485,9 @@ impl Nextn {
             names::indexer_compressor_gate(index),
         ];
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-        w.join_rows(stream, &parts, names::attn_a_stack(index))?;
+        if crate::body::joins_stack(&w, &parts) {
+            w.join_rows(stream, &parts, names::attn_a_stack(index))?;
+        }
         let held_bytes = w.resident_bytes() as u64;
         if held_bytes != plan.nextn_resident_bytes() {
             return Err(shape(format!(
@@ -516,6 +521,15 @@ impl Nextn {
             )));
         }
         let n = d.embd;
+        let sites: Vec<String> = {
+            let l = &names.latent;
+            let mut v: Vec<&str> = l.stack.resident(&w);
+            v.extend([&l.q_b, &l.sel.q_b, &l.sel.proj, &l.out, &names.eh].map(String::as_str));
+            v.into_iter().map(str::to_owned).collect()
+        };
+        let site_names = || sites.iter().map(String::as_str);
+        let row_by_name = ByName::for_sites(gpu, &w, site_names(), 1)?;
+        let walk_by_name = ByName::for_sites(gpu, &w, site_names(), WALK_ROWS)?;
         let body = Nextn {
             index,
             w,
@@ -523,8 +537,15 @@ impl Nextn {
             latent: DeviceTensor::zeroed(stream, ctx, LATENT)?,
             index_rows: DeviceTensor::zeroed(stream, ctx, INDEX_ROW)?,
             pooled: DeviceTensor::zeroed(stream, pools_for(ctx), INDEX_HEAD)?,
-            s: RowScratch::new(stream, d, (shared.ff as usize, ctx), [(block, block_ff)])?,
+            s: RowScratch::new(
+                stream,
+                d,
+                (shared.ff as usize, ctx),
+                [(block, block_ff)],
+                row_by_name,
+            )?,
             a: Arena::new(stream, n, d.stack())?,
+            by_name: walk_by_name,
             pair0: DeviceBuffer::zeroed(stream, HC_STREAMS * n)?,
             head,
             limit: shared.act.swiglu_limit(),
@@ -1012,6 +1033,7 @@ impl Body {
             pooled,
             s: row,
             a,
+            by_name,
             head,
             limit,
             block,
@@ -1060,13 +1082,14 @@ impl Body {
                 &mut *span_mut(WHAT, &mut a.pack, t * 2 * n + n, n)?,
             )?;
         }
-        site::resident_gemv_cols(
+        project(
             gpu,
-            None,
-            (w, &nm.eh),
+            k,
+            by_name,
+            (w, &nm.eh, *index),
             &*span(WHAT, &a.pack, 0, m * 2 * n)?,
             m,
-            &mut a.x,
+            Out::whole(&mut a.x),
         )?;
         // The store: the joined projection's rows, the latent and index rows
         // at the rows' positions, the pools they complete.
@@ -1081,10 +1104,11 @@ impl Body {
             m,
             &mut a.xn,
         )?;
-        site::resident_gemv_cols(
+        project_joined(
             gpu,
-            None,
-            (w, &ln.stack),
+            k,
+            by_name,
+            (w, &ln.stack, *index),
             &*span(WHAT, &a.xn, 0, m * n)?,
             m,
             &mut a.stack,
@@ -1151,7 +1175,7 @@ impl Body {
             k,
             branch,
             &d,
-            ln,
+            (*index, ln),
             LatentStore {
                 latent,
                 index: index_rows,

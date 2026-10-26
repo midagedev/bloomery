@@ -33,15 +33,15 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
-use bloomery_gpu::weights::Weights;
+use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::BlockPlan;
-use bloomery_gpu_deepseek41::hc::{HcPostArgs, HcQ8Params, HcQ8PreArgs};
+use bloomery_gpu_deepseek41::hc::{HcFn, HcFnArgs, HcPostArgs, HcQ8Params, HcQ8PreArgs};
 use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind};
 
-use crate::body::{LANES, LOAD_ROWS, Parts, f32v, q8};
+use crate::body::{LANES, LOAD_ROWS, Parts, f32v};
 use crate::tensors::LayerNames;
 use crate::{ffn, kda, mla};
 
@@ -57,23 +57,29 @@ pub fn step_launches(
     mixers: &[MixerKind],
     ffns: &[FfnKind],
     cards: &[bool],
-    blocks: &[BlockPlan],
+    blocks: &[(BlockPlan, usize)],
 ) -> usize {
     mixers
         .iter()
         .zip(ffns)
         .zip(cards)
         .zip(blocks)
-        .map(|(((&m, &f), &c), &b)| layer_launches(m, f, c, b))
+        .map(|(((&m, &f), &c), &(b, x))| layer_launches(m, f, c, (b, x)))
         .sum::<usize>()
         + 4
 }
 
 /// One host-served layer's launches: two sub-layers' three for the streams, its mixer's
-/// and its block's, with its card experts' when `card` and the K-quant
-/// block's own ([`BlockPlan::extra_launches`]).
+/// and its block's, with its card experts' when `card`, the K-quant
+/// block's own ([`BlockPlan::extra_launches`]) and the mixer's by-name
+/// projections' (`mixer_extra`).
 #[must_use]
-pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool, plan: BlockPlan) -> usize {
+pub fn layer_launches(
+    mixer: MixerKind,
+    ffn: FfnKind,
+    card: bool,
+    (plan, mixer_extra): (BlockPlan, usize),
+) -> usize {
     let mix = match mixer {
         MixerKind::DeltaRule => kda::LAUNCHES,
         MixerKind::Latent => mla::LAUNCHES,
@@ -84,7 +90,7 @@ pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool, plan: BlockPla
         FfnKind::Moe if card => ffn::MOE_LAUNCHES + ffn::CARD_LAUNCHES,
         FfnKind::Moe => ffn::MOE_LAUNCHES,
     };
-    2 * 3 + mix + block + plan.extra_launches()
+    2 * 3 + mix + mixer_extra + block + plan.extra_launches()
 }
 
 /// The stream buffer a row's streams end in after a walk of `layers`
@@ -369,32 +375,49 @@ pub(crate) fn hc_in(
             detail: format!("layer {l} past the {} named", names.len()),
         })?
         .hc(sub);
-    let (qs, dd) = q8(w, &n.fn_)?;
-    let params = HcQ8Params {
-        qs,
-        d: dd,
-        scale: f32v(w, &n.scale)?,
-        base: f32v(w, &n.base)?,
-        eps: d.hc_eps,
-        iters: d.hc_iters,
-    };
     let hc = &p.k.hc;
     let s = &mut *p.s;
     let streams = &s.streams[cur];
-    hc.enqueue_pre_q8_0(
-        stream,
-        &HcQ8PreArgs {
-            params: &params,
-            x: streams,
-            tokens: 1,
-            rms_eps: d.rms_eps,
-            fault: gpu.layer_sink(l)?,
-        },
-        1,
-        &mut s.hc_scratch,
-        &mut s.mixes,
-        &mut s.hc,
-    )?;
+    if let Some(DevWeight::Q8_0 { qs, d: dd, .. }) = w.get(&n.fn_) {
+        let params = HcQ8Params {
+            qs,
+            d: dd,
+            scale: f32v(w, &n.scale)?,
+            base: f32v(w, &n.base)?,
+            eps: d.hc_eps,
+            iters: d.hc_iters,
+        };
+        hc.enqueue_pre_q8_0(
+            stream,
+            &HcQ8PreArgs {
+                params: &params,
+                x: streams,
+                tokens: 1,
+                rms_eps: d.rms_eps,
+                fault: gpu.layer_sink(l)?,
+            },
+            1,
+            &mut s.hc_scratch,
+            &mut s.mixes,
+            &mut s.hc,
+        )?;
+    } else {
+        // An f32 fn (a BF16 one is widened at load): one block a token.
+        let params = HcFn::of(w, WHAT, [&n.fn_, &n.scale, &n.base], (d.hc_eps, d.hc_iters))?;
+        hc.enqueue_pre_fn(
+            stream,
+            &HcFnArgs {
+                params: &params,
+                x: streams,
+                tokens: 1,
+                rms_eps: d.rms_eps,
+                fault: gpu.layer_sink(l)?,
+            },
+            &mut s.hc_scratch,
+            &mut s.mixes,
+            &mut s.hc,
+        )?;
+    }
     hc.enqueue_fold(stream, streams, &s.hc, d.embd, 1, &mut s.x)
 }
 

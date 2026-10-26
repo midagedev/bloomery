@@ -21,11 +21,12 @@
 use bloomery_gpu::linear::mixer_kda::{
     self, CORE_LAUNCHES, KdaBufs, KdaDecay, KdaDims, KdaIn, KdaProj, KdaRule, KdaState, KdaVecs,
 };
+use bloomery_gpu::site::{ByName, Out};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 
-use crate::body::{Dims, Parts, Store, f32v, gemv};
+use crate::body::{Dims, Kernels, Parts, Store, f32v, project, project_joined};
 use crate::tensors::{KdaNames, LayerNames, MixerNames, other_kind};
 
 /// The projections the step makes: the joined q·k·v, `f_a`, `g_a`, β, `f_b`,
@@ -99,10 +100,13 @@ pub(crate) fn state<'s>(
     })
 }
 
-/// The step's q8_0 projections of layer `l`, one column.
+/// The step's projections of layer `l`, one column, each by the site type its
+/// weight is resident in.
 struct Step<'a> {
     w: &'a Weights,
     n: &'a KdaNames,
+    k: &'a Kernels,
+    bn: &'a mut ByName,
 }
 
 /// The step runs one row; the mixer asked for `m`.
@@ -120,31 +124,40 @@ impl KdaProj for Step<'_> {
     fn input(
         &mut self,
         gpu: &Gpu,
-        _l: usize,
+        l: usize,
         m: usize,
         xn: &DeviceBuffer<f32>,
         y: KdaIn<'_>,
     ) -> Result<(), GpuError> {
         one_row(m)?;
-        let (w, n) = (self.w, self.n);
-        gemv(gpu, w, &n.qkv, xn, y.qkv)?;
-        gemv(gpu, w, &n.f_a, xn, y.fa)?;
-        gemv(gpu, w, &n.g_a, xn, y.ga)?;
-        gemv(gpu, w, &n.beta, xn, y.beta_raw)?;
-        gemv(gpu, w, &n.f_b, y.fa, y.f)?;
-        gemv(gpu, w, &n.g_b, y.ga, y.z)
+        let (w, n, k) = (self.w, self.n, self.k);
+        let bn = &mut *self.bn;
+        project_joined(gpu, k, bn, (w, &n.qkv, l), xn, 1, y.qkv)?;
+        project(gpu, k, bn, (w, &n.f_a, l), xn, 1, Out::whole(y.fa))?;
+        project(gpu, k, bn, (w, &n.g_a, l), xn, 1, Out::whole(y.ga))?;
+        project(gpu, k, bn, (w, &n.beta, l), xn, 1, Out::whole(y.beta_raw))?;
+        project(gpu, k, bn, (w, &n.f_b, l), y.fa, 1, Out::whole(y.f))?;
+        project(gpu, k, bn, (w, &n.g_b, l), y.ga, 1, Out::whole(y.z))
     }
 
     fn output(
         &mut self,
         gpu: &Gpu,
-        _l: usize,
+        l: usize,
         m: usize,
         gated: &DeviceBuffer<f32>,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         one_row(m)?;
-        gemv(gpu, self.w, &self.n.out, gated, out)
+        project(
+            gpu,
+            self.k,
+            self.bn,
+            (self.w, &self.n.out, l),
+            gated,
+            1,
+            Out::whole(out),
+        )
     }
 }
 
@@ -160,7 +173,12 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         gpu,
         gpu.stream(),
         &p.k.linear,
-        &mut Step { w, n },
+        &mut Step {
+            w,
+            n,
+            k: p.k,
+            bn: &mut s.by_name,
+        },
         (l, 1, &dims(&d)),
         &vecs(w, n)?,
         st,

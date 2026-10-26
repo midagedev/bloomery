@@ -160,7 +160,11 @@ impl Rank {
         let k_blocks = cfg.iter().any(|c| !c.block.is_q8());
         let widest = cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let blocks: Vec<_> = cfg.iter().map(|c| (c.block, c.ff)).collect();
-        let s = Scratch::new(stream, &dims, (widest, ctx), &blocks)?;
+        let sites = crate::body::mixer_sites(&w, &names);
+        let q8_1_sites = crate::body::reads_q8_1(&file, &names, None);
+        let s = Scratch::new(stream, &dims, (widest, ctx), &blocks, &|cols| {
+            bloomery_gpu::site::ByName::for_sites(gpu, &w, sites.iter().copied(), cols)
+        })?;
         let stores = cfg
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx, KdaLanes::One))
@@ -205,7 +209,7 @@ impl Rank {
             at,
             stream: gpu.stream_handle(),
             w,
-            k: Kernels::load(gpu, k_blocks)?,
+            k: Kernels::load(gpu, k_blocks, q8_1_sites)?,
             branch: Branch::new(gpu.stream_handle())?,
             dims,
             cfg,

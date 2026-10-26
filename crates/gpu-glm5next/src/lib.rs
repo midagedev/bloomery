@@ -64,6 +64,7 @@ pub use body::seq::{
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, LOAD_ROWS, NEXTN_ON_TIER, Plant,
     TIER_BEFORE_UPLOAD, checkpoint_budget, checkpoint_price, prompt, set_taps, trunk_blocks,
+    trunk_mixer_extras,
 };
 pub use model::arch::glm5next::place::KdaLanes;
 pub use program::{layer_launches, step_launches};

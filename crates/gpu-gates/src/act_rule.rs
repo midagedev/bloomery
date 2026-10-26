@@ -249,13 +249,18 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
         // No card launch of these bodies reads IQ2_XS, IQ3_S or Q2_K experts; the host tier reads
         // their q8_K blocks as ik does (the same dot).
         (GgmlType::IQ2_XS | GgmlType::IQ3_S | GgmlType::Q2_K, Arm::Expert) => Some(QK_K),
-        (GgmlType::Q8_0, Arm::Gemv) | (GgmlType::F32, Arm::Gemv | Arm::Gemm) => None,
+        // BF16 words are read on the f32 rows, narrow (`bf16_gemv`) and wide (`bf16_tile_gemm`).
+        (GgmlType::Q8_0, Arm::Gemv) | (GgmlType::F32 | GgmlType::BF16, Arm::Gemv | Arm::Gemm) => {
+            None
+        }
         _ => return None,
     };
     let ik = match ty {
         // NVFP4, mainline's alone (`vec_dot_nvfp4_q8_1`): no ik dot reads it, so ik has no side
         // to count, as Q2_0's q8_0 column.
         GgmlType::NVFP4 => None,
+        // BF16's activation is counted as its own rounding below, not as a q8 block.
+        GgmlType::BF16 => None,
         _ => match activation_format(ty).ok()? {
             Some(ActivationFormat::Q8K) => Some(QK_K),
             Some(ActivationFormat::Q8_2X4) => Some(crate::ik_q8_2::QK),
@@ -266,10 +271,19 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
     };
     let rel = |block: Option<usize>| block.map_or(0.0, q8_rel);
     Some(SiteRel {
-        ik: rel(ik),
+        ik: if ty == GgmlType::BF16 {
+            BF16_REL
+        } else {
+            rel(ik)
+        },
         ours: rel(ours),
     })
 }
+
+/// The worst-case relative rounding of an activation to bfloat16, which ggml's BF16 dot reads
+/// (`vec_dot_type` BF16, `ggml.c:1494`): 8 significant bits, so each value moves by at most 2^-8
+/// of itself, and a row's RMS error over its RMS by at most as much.
+pub const BF16_REL: f64 = 1.0 / 256.0;
 
 /// The variance of a q8 quantizer's rounding of each value of `x`, blocks
 /// of `block` values with `d = amax / 127`: `d² / 12`.
@@ -1027,7 +1041,11 @@ mod site_tests {
         let s = site_rel(GgmlType::Q8_0, Arm::Gemm).expect("a Q8_0 site");
         assert!((s.ik - crate::rounding::q8_32_rel()).abs() < 1e-15);
         assert!((s.joint() - std::f64::consts::SQRT_2 * s.ik).abs() < 1e-15);
-        for ty in [GgmlType::F16, GgmlType::BF16, GgmlType::MXFP4] {
+        // PIN(2026-10-26): BF16 left this list when the glm5next mixers read BF16 words by name
+        // (`site::ByName`, `bf16_gemv` and `bf16_tile_gemm` over the f32 rows); derivation: ours
+        // reads no activation form, ik's BF16 dot rounds the activation to bfloat16
+        // ([`BF16_REL`]); `a_bf16_site_counts_ik_s_bfloat16_activation` holds its row.
+        for ty in [GgmlType::F16, GgmlType::MXFP4] {
             for arm in [Arm::Gemv, Arm::Gemm, Arm::Expert] {
                 assert_eq!(site_rel(ty, arm), None, "{ty} {arm:?}");
             }
@@ -1044,6 +1062,23 @@ mod site_tests {
     /// table's `SiteEntry::reads` (which `site.rs`'s `SiteTy::reads` returns) and of the 32-value
     /// GEMM family's module doc, so a launch that moves to another form is red here until the
     /// table follows it.
+    /// A BF16 site is read on the f32 rows by ours on both arms and by ik's BF16 dot on
+    /// bfloat16 activations; no expert stack of it is read.
+    #[test]
+    fn a_bf16_site_counts_ik_s_bfloat16_activation() {
+        for arm in [Arm::Gemv, Arm::Gemm] {
+            assert_eq!(
+                site_rel(GgmlType::BF16, arm),
+                Some(SiteRel {
+                    ik: super::BF16_REL,
+                    ours: 0.0
+                }),
+                "{arm:?}"
+            );
+        }
+        assert_eq!(site_rel(GgmlType::BF16, Arm::Expert), None);
+    }
+
     #[test]
     fn site_rel_reads_the_forms_the_launches_name() {
         let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");

@@ -46,12 +46,13 @@ use bloomery_gpu::kpool::{self, ScoreArgs};
 use bloomery_gpu::latent::{IndexKeyArgs, IndexPoolArgs, LATENT, LatentAppendArgs, Rows};
 use bloomery_gpu::model::Q8_0GemvHeadsArgs;
 use bloomery_gpu::qsa::{TopkHighArgs, list_width};
-use bloomery_gpu::weights::Weights;
+use bloomery_gpu::site::Out;
+use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Branch, DeviceTensor, FaultSink, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, SelectedRows};
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use crate::body::{Dims, Kernels, Parts, RowScratch, Store, f32t, f32v, gemv, q8};
+use crate::body::{Dims, Kernels, Parts, RowScratch, Store, f32v, project, project_joined, q8};
 use crate::tensors::{LatentNames, MixerNames, SelNames, other_kind};
 
 /// The launches [`mla`] makes.
@@ -92,6 +93,33 @@ pub(crate) fn pool(
     )
 }
 
+/// `y = W · x` for the resident weight `name` over the first `m` columns of
+/// `x` on `stream`, `y[r · m + c]` (the layout of `enqueue_q8_0_gemv` and
+/// `enqueue_f32_gemv` past one column, which the score pass reads): q8_0
+/// planes, f32 rows or BF16 words; any other form is refused by name, for the
+/// by-name family past the f32 rows launches on the engine's own stream.
+fn gemv_row_major(
+    gpu: &Gpu,
+    stream: &CudaStream,
+    w: &Weights,
+    name: &str,
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let q = gpu.q8f32();
+    match w.resident("glm5next selector", name)? {
+        DevWeight::Q8_0 { qs, d, .. } => q.enqueue_q8_0_gemv(stream, qs, d, x, m, y),
+        DevWeight::F32 { w: t, .. } => q.enqueue_f32_gemv(stream, t, x, m, y),
+        DevWeight::Bf16 { w: t, .. } => q.enqueue_bf16_gemv(stream, t, x, m, y),
+        _ => Err(GpuError::tensor(
+            "glm5next selector",
+            name,
+            "q8_0 planes, f32 rows or bf16 words",
+        )),
+    }
+}
+
 /// What [`select`] reads and writes for `m` tokens of one latent layer: the
 /// stream it launches on, the tokens' normed input (`[m][embd]`) and q_a
 /// norm (`[m][q_lora]`), their live counts, the layer's index cache and pool
@@ -130,11 +158,10 @@ pub(crate) fn select(
     a: Select<'_>,
 ) -> Result<(), GpuError> {
     let ctx = a.index.rows();
-    gpu.q8f32()
-        .enqueue_f32_gemv(a.stream, f32t(w, &n.proj)?, a.xn, a.m, a.wi)?;
-    let (qs, dd) = q8(w, &n.q_b)?;
-    gpu.q8f32()
-        .enqueue_q8_0_gemv(a.stream, qs, dd, a.qr, a.m, a.qi)?;
+    // The selector's two projections run on its branch stream, their rows
+    // `[rows][m]` as the score pass reads them.
+    gemv_row_major(gpu, a.stream, w, &n.proj, a.xn, a.m, a.wi)?;
+    gemv_row_major(gpu, a.stream, w, &n.q_b, a.qr, a.m, a.qi)?;
     k.kpool.enqueue_score(
         a.stream,
         ScoreArgs {
@@ -187,7 +214,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         index,
         pooled,
     };
-    latent_row(gpu, w, p.k, p.branch, p.d, n, store, p.s, fault)
+    latent_row(gpu, w, p.k, p.branch, p.d, (l, n), store, p.s, fault)
 }
 
 /// A latent layer's store, lent apart from its layer's slot.
@@ -210,7 +237,7 @@ pub(crate) fn latent_row(
     k: &Kernels,
     branch: &mut Branch,
     d: &Dims,
-    n: &LatentNames,
+    (l, n): (usize, &LatentNames),
     st: LatentStore<'_>,
     s: &mut RowScratch,
     fault: FaultSink,
@@ -232,7 +259,15 @@ pub(crate) fn latent_row(
         1,
         &mut s.xn,
     )?;
-    gemv(gpu, w, &n.stack, &s.xn, &mut s.stack)?;
+    project_joined(
+        gpu,
+        k,
+        &mut s.by_name,
+        (w, &n.stack, l),
+        &s.xn,
+        1,
+        &mut s.stack,
+    )?;
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.stack,
@@ -301,7 +336,15 @@ pub(crate) fn latent_row(
             fault,
         },
     )?;
-    gemv(gpu, w, &n.q_b, &s.qr, &mut s.q)?;
+    project(
+        gpu,
+        k,
+        &mut s.by_name,
+        (w, &n.q_b, l),
+        &s.qr,
+        1,
+        Out::whole(&mut s.q),
+    )?;
     let (qs, dd) = q8(w, &n.k_b)?;
     k.step.enqueue_q8_0_gemv_heads(
         stream,
@@ -361,5 +404,13 @@ pub(crate) fn latent_row(
             y: &mut s.av,
         },
     )?;
-    gemv(gpu, w, &n.out, &s.av, &mut s.out)
+    project(
+        gpu,
+        k,
+        &mut s.by_name,
+        (w, &n.out, l),
+        &s.av,
+        1,
+        Out::whole(&mut s.out),
+    )
 }

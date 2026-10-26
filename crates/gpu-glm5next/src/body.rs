@@ -97,7 +97,7 @@ use bloomery_gpu::model::{
     ChainBody, HostServed, Rollback, SlotRange, Slots, StepKernels, StepMode, refuse_scratch_past,
 };
 use bloomery_gpu::qsa::{QsaKernels, list_width};
-pub(crate) use bloomery_gpu::site::resident_gemv as gemv;
+use bloomery_gpu::site::{ByName, ByNameKernels, Form, Out, SiteTy};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer};
 use bloomery_gpu_deepseek41::attn::{self, AttnKernels};
@@ -122,7 +122,7 @@ use crate::ffn::{CardExperts, block_names};
 use crate::host::routed_layers;
 use crate::program;
 use crate::swap;
-use crate::tensors::LayerNames;
+use crate::tensors::{Joined, LayerNames};
 use crate::tier;
 
 #[path = "media.rs"]
@@ -215,10 +215,13 @@ pub(crate) struct Kernels {
     /// The k-pool selector's score and top-k passes ([`crate::mla`]).
     pub kpool: KpoolKernels,
     pub qsa: QsaKernels,
+    /// The by-name projections' K-quant family: `None` on a file whose
+    /// mixers read the f32 rows alone.
+    pub by_name: Option<ByNameKernels>,
 }
 
 impl Kernels {
-    pub(crate) fn load(gpu: &Gpu, k_blocks: bool) -> Result<Kernels, GpuError> {
+    pub(crate) fn load(gpu: &Gpu, k_blocks: bool, by_name: bool) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             step: StepKernels::load(ctx)?,
@@ -232,6 +235,7 @@ impl Kernels {
             block: k_blocks.then(|| KBlockKernels::load(gpu)).transpose()?,
             kpool: KpoolKernels::load(ctx)?,
             qsa: QsaKernels::load(ctx)?,
+            by_name: by_name.then(|| ByNameKernels::load(gpu)).transpose()?,
             g32: bloomery_gpu::gemm::Gemm32Kernels::load(gpu.context())?,
         })
     }
@@ -292,6 +296,10 @@ pub(crate) struct LayerCfg {
     pub ff: usize,
     /// The block's launches by its file's types ([`BlockPlan`]).
     pub block: BlockPlan,
+    /// The launches the mixer's by-name projections add: the parts of a
+    /// projection the load left apart, and the quantization a site of a
+    /// q8_1 type makes ([`LayerNames::mixer_extra_launches`]).
+    pub mixer_extra: usize,
     /// The router's selection bias is in the file.
     pub bias: bool,
     /// The layer's row in the slot map's card copy, as a word offset
@@ -477,12 +485,17 @@ impl Scratch {
         d: &Dims,
         (ff, ctx): (usize, usize),
         blocks: &[(BlockPlan, usize)],
+        by_name: &dyn Fn(usize) -> Result<ByName, GpuError>,
     ) -> Result<Scratch, GpuError> {
-        let row = || RowScratch::new(stream, d, (ff, ctx), blocks.iter().copied());
+        // Row 0 is the prompt batch's, whose chunks run up to CHUNK columns
+        // by name; every other row is one token's.
+        let row = |cols: usize| {
+            RowScratch::new(stream, d, (ff, ctx), blocks.iter().copied(), by_name(cols)?)
+        };
         Ok(Scratch {
             // One buffer set a row of the load's LOAD_ROWS; another count
             // fails to compile here.
-            rows: [row()?, row()?, row()?, row()?],
+            rows: [row(prefill::CHUNK)?, row(1)?, row(1)?, row(1)?],
             lane: DeviceBuffer::zeroed(stream, 1)?,
             lanes: pair::Lanes::default(),
         })
@@ -578,6 +591,8 @@ pub(crate) struct RowScratch {
     pub sh_y: DeviceBuffer<f32>,
     /// The K-quant blocks' buffers, for the blocks this row runs.
     pub block: Option<BlockScratch>,
+    /// The mixers' by-name projections' q8_1 forms and staging.
+    pub by_name: ByName,
     pub rout: RouterOut,
     pub sel: DeviceBuffer<u32>,
     /// A layer without a selection bias in the file selects with none.
@@ -596,6 +611,7 @@ impl RowScratch {
         d: &Dims,
         (ff, ctx): (usize, usize),
         blocks: impl IntoIterator<Item = (BlockPlan, usize)>,
+        by_name: ByName,
     ) -> Result<RowScratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let (n, c, v) = (d.embd, d.kda.channels(), d.kda.n_v * HEAD);
@@ -638,6 +654,7 @@ impl RowScratch {
             h: z(ff)?,
             sh_y: z(n)?,
             block: BlockScratch::new(stream, n, blocks)?,
+            by_name,
             rout: RouterOut::new(stream)?,
             sel: DeviceBuffer::zeroed(stream, N_USED)?,
             no_bias: z(N_EXPERT)?,
@@ -695,6 +712,7 @@ impl RowScratch {
             + self.cnt.num_bytes()
             + self.list.num_bytes()
             + self.block.as_ref().map_or(0, BlockScratch::bytes)
+            + self.by_name.bytes()
     }
 }
 
@@ -1093,6 +1111,100 @@ pub(crate) fn q8<'w>(
             need: "a q8_0 weight",
         }),
     }
+}
+
+/// Whether the latent layer's four projections of the normed input join into
+/// one weight: every part q8_0 planes at one width, which is the form the
+/// prompt batch's GEMM and its row windows read. Any other mix stays four
+/// by-name launches ([`crate::tensors::Joined`]).
+pub(crate) fn joins_stack(w: &Weights, parts: &[&str]) -> bool {
+    w.joinable(parts) && matches!(w.get(parts[0]), Some(DevWeight::Q8_0 { .. }))
+}
+
+/// The mixers' resident dense weights, by name, every layer's: what a
+/// [`ByName`] holds forms for.
+pub(crate) fn mixer_sites<'a>(w: &Weights, names: &'a [LayerNames]) -> Vec<&'a str> {
+    names.iter().flat_map(|n| n.mixer_sites(w)).collect()
+}
+
+/// Whether any mixer site of the trunk's `names` (or the next-token layer's
+/// `nextn`) is a file type that reads q8_1 rows (a K-quant, NVFP4), from the
+/// file's header, before any upload.
+pub(crate) fn reads_q8_1(file: &Split, names: &[LayerNames], nextn: Option<usize>) -> bool {
+    let nextn = nextn.map(|i| {
+        [
+            names::attn_q_a(i),
+            names::attn_kv_a_mqa(i),
+            names::indexer_attn_k(i),
+            names::indexer_compressor_gate(i),
+            names::attn_q_b(i),
+            names::indexer_attn_q_b(i),
+            names::indexer_proj(i),
+            names::attn_output(i),
+            names::nextn_eh_proj(i),
+        ]
+    });
+    names
+        .iter()
+        .flat_map(|n| n.file_sites())
+        .chain(nextn.iter().flatten().map(String::as_str))
+        .any(|s| {
+            file.find(s).is_some_and(|(_, t)| {
+                SiteTy::of_ggml(t.ty).is_some_and(|ty| ty.reads() == Form::Q8x128)
+            })
+        })
+}
+
+/// `y = W · x` for the resident weight `name` over the first `m` columns of
+/// `x` at the site type of its resident form, token-major ([`ByName::gemv`]);
+/// `layer` is the layer a fault raises into.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, kernels, weights and forms, the site, the layer, the columns and the output (rust-quality R8)"
+)]
+pub(crate) fn project(
+    gpu: &Gpu,
+    k: &Kernels,
+    bn: &mut ByName,
+    (w, name, layer): (&Weights, &str, usize),
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    out: Out<'_>,
+) -> Result<(), GpuError> {
+    bn.gemv(
+        gpu,
+        (k.by_name.as_ref(), Some(&k.g32)),
+        (w, name),
+        layer,
+        x,
+        m,
+        out,
+    )
+}
+
+/// [`project`] of a joined projection ([`Joined`]): its one weight, or each
+/// part into its rows of the joined layout `y`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, kernels, weights and forms, the projection, the layer, the columns and the output (rust-quality R8)"
+)]
+pub(crate) fn project_joined(
+    gpu: &Gpu,
+    k: &Kernels,
+    bn: &mut ByName,
+    (w, joined, layer): (&Weights, &Joined, usize),
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (launches, total) = joined.launches(WHAT, w)?;
+    if let [(name, _)] = launches[..] {
+        return project(gpu, k, bn, (w, name, layer), x, m, Out::whole(y));
+    }
+    for (name, at) in launches {
+        project(gpu, k, bn, (w, name, layer), x, m, Out::part(y, at, total))?;
+    }
+    Ok(())
 }
 
 /// The resident f32 tensor `name`.
@@ -1504,7 +1616,8 @@ impl Body {
     /// The joins: a KDA layer's q, k and v projections into one row stream
     /// and its three conv tap sets into one, in the conv's channel order; a
     /// latent layer's four projections of the normed input. Each row keeps
-    /// its file bits.
+    /// its file bits. A projection whose parts are not resident in one format
+    /// stays its parts (`tensors::Joined`).
     pub(crate) fn derive(
         stream: &CudaStream,
         kinds: &[Layer],
@@ -1518,7 +1631,11 @@ impl Body {
             match kind.mixer {
                 MixerKind::DeltaRule => {
                     let (q, k, v) = (names::attn_q(l), names::attn_k(l), names::attn_v(l));
-                    w.join_rows(stream, &[&q, &k, &v], names::attn_qkv(l))?;
+                    // Three projections of one input in one launch when they
+                    // share a format; otherwise three by-name launches.
+                    if w.joinable(&[&q, &k, &v]) {
+                        w.join_rows(stream, &[&q, &k, &v], names::attn_qkv(l))?;
+                    }
                     let parts = ['q', 'k', 'v'].map(|p| names::ssm_conv1d(l, p));
                     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
                     w.join_rows(stream, &parts, names::ssm_conv1d_qkv(l))?;
@@ -1531,7 +1648,9 @@ impl Body {
                         names::indexer_compressor_gate(l),
                     ];
                     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-                    w.join_rows(stream, &parts, names::attn_a_stack(l))?;
+                    if joins_stack(w, &parts) {
+                        w.join_rows(stream, &parts, names::attn_a_stack(l))?;
+                    }
                 }
                 MixerKind::Gqa => {
                     return Err(shape(format!(
@@ -1624,6 +1743,10 @@ impl Body {
             c.block
                 .check_resident(w, WHAT, block_names(n), (c.ff, dims.embd))?;
         }
+        let mut cfg = cfg;
+        for (c, n) in cfg.iter_mut().zip(&names) {
+            c.mixer_extra = n.mixer_extra_launches(file);
+        }
         let forms = prefill::dense_forms(&cfg);
         if forms != inputs.dense_forms() {
             return Err(shape(format!(
@@ -1638,11 +1761,15 @@ impl Body {
             .transpose()?;
         let k_blocks = cfg.iter().any(|c| !c.block.is_q8())
             || nextn.is_some_and(|(_, _, (plan, _))| !plan.is_q8());
+        let q8_1_sites = reads_q8_1(file, &names, nextn.map(|(_, ni, _)| ni.index));
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let ff = cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let blocks: Vec<(BlockPlan, usize)> = cfg.iter().map(|c| (c.block, c.ff)).collect();
-        let s = Scratch::new(stream, &dims, (ff, ctx), &blocks)?;
+        let sites = mixer_sites(w, &names);
+        let s = Scratch::new(stream, &dims, (ff, ctx), &blocks, &|cols| {
+            ByName::for_sites(gpu, w, sites.iter().copied(), cols)
+        })?;
         let stores = cfg
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx, lanes))
@@ -1748,7 +1875,7 @@ impl Body {
             cfg,
             names,
             dims,
-            k: Kernels::load(gpu, k_blocks)?,
+            k: Kernels::load(gpu, k_blocks, q8_1_sites)?,
             branch: Branch::new(gpu.stream_handle())?,
             s,
             stores,
@@ -1834,6 +1961,13 @@ impl Body {
     #[must_use]
     pub fn blocks(&self) -> Vec<BlockPlan> {
         self.cfg.iter().map(|c| c.block).collect()
+    }
+
+    /// Each layer's mixer extra launches ([`LayerCfg::mixer_extra`]), in layer
+    /// order.
+    #[must_use]
+    pub fn mixer_extras(&self) -> Vec<usize> {
+        self.cfg.iter().map(|c| c.mixer_extra).collect()
     }
 
     /// The layers the host tier serves.
@@ -2088,6 +2222,22 @@ pub fn trunk_blocks(file: &Split) -> Result<Vec<BlockPlan>, GpuError> {
     trunk_plans(file, &inputs)
 }
 
+/// Each trunk layer's mixer extra launches ([`LayerNames::mixer_extra_launches`]),
+/// read from `file`'s header before any upload.
+///
+/// # Errors
+/// A header the plan reader refuses.
+pub fn trunk_mixer_extras(file: &Split) -> Result<Vec<usize>, GpuError> {
+    let inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+    inputs
+        .spec
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(l, s)| Ok(LayerNames::of(l, Layer::of(s))?.mixer_extra_launches(file)))
+        .collect()
+}
+
 /// Each trunk layer's block plan from `inputs`' layer descriptions and `file`'s
 /// tensor types.
 pub(crate) fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuError> {
@@ -2237,6 +2387,7 @@ pub(crate) fn layer_cfg(
         limit,
         ff,
         block,
+        mixer_extra: 0,
         bias,
         row_off,
     })

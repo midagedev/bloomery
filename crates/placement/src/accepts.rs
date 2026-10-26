@@ -275,6 +275,19 @@ pub const fn dense_by_name(ty: GgmlType) -> Option<SiteEntry> {
     }
 }
 
+/// The dense sites launched by name over up to eight columns on every family
+/// the table's dense row names but Q5_0 (`site::ByName`): the f32-row entries
+/// beside those that read q8_1 blocks of 128 (the K-quants, NVFP4), whose
+/// activation the unit quantizes itself. Q5_0 reads 32-value blocks no
+/// by-name unit holds.
+#[must_use]
+pub const fn dense_projected(ty: GgmlType) -> Option<SiteEntry> {
+    match kernels::dense(ty) {
+        Some(SiteEntry::Q5_0) => None,
+        other => other,
+    }
+}
+
 /// The head a body whose load widens BF16 to f32 (`ModelTensors::bf16_words`
 /// naming none, as the qwen3moe body's files) runs an `output` of `ty` with: the
 /// table's [`kernels::head`] row but BF16, whose words that load does not keep.

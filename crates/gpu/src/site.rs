@@ -64,7 +64,10 @@
 //! what the typed call launches for the site type of the weight's resident
 //! form, which the kernel table's dense entry decides
 //! ([`of_resident`]); [`resident_site`] checks that type and shape
-//! at load.
+//! at load. A body whose sites include the K-quants and NVFP4, which read the
+//! q8_1 rows of their input, projects by name through [`ByName`]: the same
+//! decision, the quantization and the token-major copy the type needs, and
+//! an output that is a part of a joined layout.
 
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
@@ -79,7 +82,8 @@ use crate::q8f32::{
     Bf16GemvMcolArgs, E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, SelArgs,
 };
 use crate::quant_sel::QuantSelKernels;
-use crate::tensor::{Q8Act, TensorWindow};
+use crate::tensor::{Pitched, Q8Act, TensorWindow, WindowMut, dtod_2d};
+use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use chain::site::list;
@@ -276,7 +280,7 @@ pub fn resident_gemv_cols(
 }
 
 /// [`resident_gemv_cols`] on `stream`, ordered by the caller before its consumers.
-pub(crate) fn resident_gemv_cols_on(
+pub fn resident_gemv_cols_on(
     gpu: &Gpu,
     stream: &cuda_core::CudaStream,
     g32: Option<&Gemm32Kernels>,
@@ -714,6 +718,265 @@ pub fn blocks32_gemv(
     };
     gpu.q5()
         .enqueue_gemv_q5_0(gpu.stream(), wt, act, 0, wt.rows(), 0, act.m(), y, 0)
+}
+
+/// The most columns a [`ByName`] projection runs: the K-quant gemv's.
+pub const BY_NAME_COLS: usize = KGEMV_COLS;
+
+/// The launches a [`ByName`] projection makes beyond the f32-row gemv: the
+/// K-quant `_sel` family and the row-major copy into token-major rows.
+pub struct ByNameKernels {
+    kgemv: KGemvKernels,
+    tm: TokenMajor,
+}
+
+impl ByNameKernels {
+    /// Load the K-quant family and the token-major copy into `gpu`'s
+    /// context. Load-time only.
+    pub fn load(gpu: &Gpu) -> Result<ByNameKernels, GpuError> {
+        Ok(ByNameKernels {
+            kgemv: KGemvKernels::load(gpu)?,
+            tm: TokenMajor::load(gpu.context())?,
+        })
+    }
+}
+
+/// Where a [`ByName`] projection's output goes: column `c`, row `r` to
+/// `y[c · stride + at + r]`. A whole weight into its own buffer is
+/// `stride = rows, at = 0` ([`Out::whole`]); a part of a stack the consumer
+/// reads joined is its row offset `at` in the joined stride.
+pub struct Out<'y> {
+    pub y: &'y mut DeviceBuffer<f32>,
+    pub at: usize,
+    pub stride: usize,
+}
+
+impl<'y> Out<'y> {
+    /// The weight's own rows, token-major, from the start of `y`.
+    pub fn whole(y: &'y mut DeviceBuffer<f32>) -> Out<'y> {
+        Out {
+            y,
+            at: 0,
+            stride: 0,
+        }
+    }
+
+    /// Rows `at ..` of each `stride`-value column of `y`.
+    pub fn part(y: &'y mut DeviceBuffer<f32>, at: usize, stride: usize) -> Out<'y> {
+        Out { y, at, stride }
+    }
+}
+
+/// The one by-name dense projection for a body that names a weight and
+/// leaves its type to the file: any dense family of the kernel table but
+/// Q5_0 over `1 ..= `[`BY_NAME_COLS`] columns, token-major, into a whole
+/// buffer or a part of a joined layout. The f32-row families are
+/// [`resident_gemv_cols`]'s launches; a K-quant or NVFP4 site quantizes the
+/// columns into the q8_1 form of its width ([`ByName::for_sites`] made one a
+/// width and column count), runs [`kgemv`] and copies a row-major result
+/// token-major ([`kgemv_order`]). Each column is the site's one-column launch
+/// on that row bit for bit.
+pub struct ByName {
+    acts: Vec<Q8Act>,
+    /// A row-major gemv's output, or a part before its strided copy:
+    /// `rows · columns` values at the widest site.
+    stage: DeviceBuffer<f32>,
+    /// A row-major gemv's token-major rows before a strided copy.
+    rows: DeviceBuffer<f32>,
+}
+
+impl ByName {
+    /// The forms and staging for the K-quant and NVFP4 sites among `names`
+    /// (resident in `w`) at each column count `1 ..= cols` (`cols` at most
+    /// [`BY_NAME_COLS`]); a body of only f32-row sites holds none. Load-time
+    /// only.
+    pub fn for_sites<'n>(
+        gpu: &Gpu,
+        w: &Weights,
+        names: impl IntoIterator<Item = &'n str>,
+        cols: usize,
+    ) -> Result<ByName, GpuError> {
+        const WHAT: &str = "site::ByName::for_sites";
+        if !(1..=BY_NAME_COLS).contains(&cols) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{cols} columns; a by-name unit runs 1..={BY_NAME_COLS}"),
+            ));
+        }
+        let stream = gpu.stream();
+        let mut acts: Vec<Q8Act> = Vec::new();
+        let mut widest = 0usize;
+        for name in names {
+            let weight = w.resident(WHAT, name)?;
+            let Some(ty) = of_resident(weight) else {
+                continue;
+            };
+            widest = widest.max(weight.rows());
+            if ty.reads() != Form::Q8x128 {
+                continue;
+            }
+            let k = weight.k();
+            for m in 1..=cols {
+                if !acts.iter().any(|a| a.k() == k && a.m() == m) {
+                    acts.push(if m == 1 {
+                        Q8Act::with_k(stream, 1, k)?
+                    } else {
+                        Q8Act::with_slots(stream, m, k)?
+                    });
+                }
+            }
+        }
+        Ok(ByName {
+            acts,
+            stage: DeviceBuffer::zeroed(stream, (widest * cols).max(1))?,
+            rows: DeviceBuffer::zeroed(stream, (widest * cols).max(1))?,
+        })
+    }
+
+    /// Device bytes of the forms and the staging.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.acts.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + self.stage.num_bytes()
+            + self.rows.num_bytes()
+    }
+
+    /// `out = W · x` for the resident weight `name`, by the site type of its
+    /// resident form, over the first `m` (1..=[`BY_NAME_COLS`]) columns of
+    /// the f32 rows `x`; a fault of the quantization raises into layer
+    /// `layer`'s sink. `k` is read only by a K-quant or NVFP4 site, `g32` by
+    /// an F32 site past one column ([`resident_gemv_cols`]). A Q5_0 site, a
+    /// form the load made no q8_1 rows for, or a part past the output's
+    /// stride is refused by name.
+    pub fn gemv(
+        &mut self,
+        gpu: &Gpu,
+        (k, g32): (Option<&ByNameKernels>, Option<&Gemm32Kernels>),
+        (w, name): (&Weights, &str),
+        layer: usize,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        out: Out<'_>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "site::ByName::gemv";
+        let weight = w.resident(WHAT, name)?;
+        let ty = resident_ty(WHAT, (None, weight, name))?;
+        let rows = weight.rows();
+        let Out { y, at, stride } = out;
+        let stride = if stride == 0 { rows } else { stride };
+        if !(1..=BY_NAME_COLS).contains(&m) || at + rows > stride {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{name}: {m} columns of {rows} rows at {at} of a {stride}-value column; \
+                     a by-name unit runs 1..={BY_NAME_COLS} columns inside the stride"
+                ),
+            ));
+        }
+        let whole = at == 0 && stride == rows;
+        let stream = gpu.stream();
+        match ty.reads() {
+            Form::F32 | Form::Q8x32 => {
+                if whole {
+                    return launch(
+                        gpu,
+                        stream,
+                        g32,
+                        (None, w, SiteWeight::Resident(name)),
+                        x,
+                        m,
+                        y,
+                    );
+                }
+                if m == 1 {
+                    let mut win = WindowMut::<f32>::of_mut(y, at * size_of::<f32>(), rows)?;
+                    return launch(
+                        gpu,
+                        stream,
+                        g32,
+                        (None, w, SiteWeight::Resident(name)),
+                        x,
+                        1,
+                        &mut win,
+                    );
+                }
+                launch(
+                    gpu,
+                    stream,
+                    g32,
+                    (None, w, SiteWeight::Resident(name)),
+                    x,
+                    m,
+                    &mut self.stage,
+                )?;
+                scatter(stream, &self.stage, (rows, m), y, (at, stride))
+            }
+            Form::Q8x128 => {
+                let k = k.ok_or(GpuError::state(WHAT, "the by-name kernels"))?;
+                let wk = weight.k();
+                let act = self
+                    .acts
+                    .iter_mut()
+                    .find(|a| a.k() == wk && a.m() == m)
+                    .ok_or_else(|| {
+                        GpuError::shape(
+                            WHAT,
+                            format!("{name}: no q8_1 form of {m} columns of {wk} values was made"),
+                        )
+                    })?;
+                gpu.enqueue_quantize_q8_1_layer(x, act, layer)?;
+                let fault = gpu.layer_sink(layer)?;
+                let key = (ty, w, name);
+                let row_major = kgemv_order(ty) == Some(Order::RowMajor) && m > 1;
+                if m == 1 && !whole {
+                    let mut win = WindowMut::<f32>::of_mut(y, at * size_of::<f32>(), rows)?;
+                    return kgemv(gpu, &k.kgemv, key, act, fault, &mut win);
+                }
+                if !row_major && whole {
+                    return kgemv(gpu, &k.kgemv, key, act, fault, y);
+                }
+                if row_major {
+                    kgemv(gpu, &k.kgemv, key, act, fault, &mut self.stage)?;
+                    if whole {
+                        return k.tm.enqueue(stream, &self.stage, rows, m, y);
+                    }
+                    k.tm.enqueue(stream, &self.stage, rows, m, &mut self.rows)?;
+                    return scatter(stream, &self.rows, (rows, m), y, (at, stride));
+                }
+                kgemv(gpu, &k.kgemv, key, act, fault, &mut self.stage)?;
+                scatter(stream, &self.stage, (rows, m), y, (at, stride))
+            }
+            Form::Q8Blocks32 => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{name} is {ty}: its activation is the Q8Blocks32 form, which no by-name unit holds"
+                ),
+            )),
+        }
+    }
+}
+
+/// `m` columns of `rows` values, token-major in `src`, into `dst` at `at` of
+/// each `stride`-value column: one strided copy.
+fn scatter(
+    stream: &cuda_core::CudaStream,
+    src: &DeviceBuffer<f32>,
+    (rows, m): (usize, usize),
+    dst: &mut DeviceBuffer<f32>,
+    (at, stride): (usize, usize),
+) -> Result<(), GpuError> {
+    let f = size_of::<f32>();
+    dtod_2d(
+        stream,
+        (src, 0),
+        (dst, at * f),
+        Pitched {
+            width: rows * f,
+            rows: m,
+            dev_pitch: rows * f,
+            host_pitch: stride * f,
+        },
+    )
 }
 
 /// Where a site reads its weight: the resident tensor of a name
