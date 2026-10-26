@@ -1,6 +1,6 @@
 //! The residency of a stream's buffers: one Metal residency set holding every
 //! buffer a session's kernels bind, requested resident at open and again
-//! whenever a submit finds the last request older than [`KEEP`].
+//! whenever a submit finds the last request [`KEEP`] old or more.
 //!
 //! Without a set the driver wires a buffer's pages at the first command
 //! buffer that binds it and lets the wiring lapse once no submitted command
@@ -43,7 +43,11 @@ use crate::handle::{Handle, ResidencySetHandle};
 /// well under the gap after which the driver lets wiring lapse.
 pub const KEEP: Duration = Duration::from_millis(250);
 
-/// What a stream's residency set holds and how often it was requested.
+/// `renewed_gap_min_ns` before any submit has renewed.
+const NEVER: u64 = u64::MAX;
+
+/// What a stream's residency set holds, how often it was requested, and the
+/// gaps its submits decided at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidencyStats {
     /// The buffers registered.
@@ -53,6 +57,15 @@ pub struct ResidencyStats {
     /// The requests made: the commits that asked for residency, and the
     /// renewals a submit made after [`KEEP`].
     pub requests: u64,
+    /// The submits that found the last request younger than [`KEEP`] and
+    /// left it.
+    pub held: u64,
+    /// The longest gap since the last request a submit left it at: the rule
+    /// keeps it under [`KEEP`]. Zero before the first held submit.
+    pub held_gap_max: Duration,
+    /// The shortest gap since the last request a submit renewed it at: the
+    /// rule keeps it at [`KEEP`] or more. `None` before the first renewal.
+    pub renewed_gap_min: Option<Duration>,
 }
 
 /// A stream's residency set.
@@ -63,6 +76,11 @@ pub struct Residency {
     /// Nanoseconds from `born` to the last request.
     requested_ns: AtomicU64,
     requests: AtomicU64,
+    held: AtomicU64,
+    /// Nanoseconds: the largest gap a submit held at.
+    held_gap_max_ns: AtomicU64,
+    /// Nanoseconds: the smallest gap a submit renewed at, [`NEVER`] before one.
+    renewed_gap_min_ns: AtomicU64,
 }
 
 impl Residency {
@@ -84,6 +102,9 @@ impl Residency {
             born: Instant::now(),
             requested_ns: AtomicU64::new(0),
             requests: AtomicU64::new(0),
+            held: AtomicU64::new(0),
+            held_gap_max_ns: AtomicU64::new(0),
+            renewed_gap_min_ns: AtomicU64::new(NEVER),
         })
     }
 
@@ -119,14 +140,20 @@ impl Residency {
         self.note_request();
     }
 
-    /// The set requested again when the last request is older than [`KEEP`];
-    /// a submit calls it before it commits.
+    /// The set requested again when the last request is at least [`KEEP`]
+    /// old; a submit calls it before it commits. Each decision is recorded
+    /// against the gap it measured, on the clock the rule reads
+    /// ([`ResidencyStats::held_gap_max`], [`ResidencyStats::renewed_gap_min`]).
     pub(crate) fn keep(&self) {
         let now = self.nanos();
         let last = self.requested_ns.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < u64::try_from(KEEP.as_nanos()).unwrap_or(u64::MAX) {
+        let gap = now.saturating_sub(last);
+        if gap < u64::try_from(KEEP.as_nanos()).unwrap_or(u64::MAX) {
+            self.held.fetch_add(1, Ordering::Relaxed);
+            self.held_gap_max_ns.fetch_max(gap, Ordering::Relaxed);
             return;
         }
+        self.renewed_gap_min_ns.fetch_min(gap, Ordering::Relaxed);
         self.set().0.requestResidency();
         self.note_request();
     }
@@ -140,7 +167,8 @@ impl Residency {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// What the set holds and how often it was requested.
+    /// What the set holds, how often it was requested, and the gaps its
+    /// submits decided at.
     #[must_use]
     pub fn stats(&self) -> ResidencyStats {
         let set = self.set();
@@ -148,6 +176,12 @@ impl Residency {
             buffers: set.0.allocationCount(),
             bytes: set.0.allocatedSize(),
             requests: self.requests.load(Ordering::Relaxed),
+            held: self.held.load(Ordering::Relaxed),
+            held_gap_max: Duration::from_nanos(self.held_gap_max_ns.load(Ordering::Relaxed)),
+            renewed_gap_min: match self.renewed_gap_min_ns.load(Ordering::Relaxed) {
+                NEVER => None,
+                ns => Some(Duration::from_nanos(ns)),
+            },
         }
     }
 }

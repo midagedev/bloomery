@@ -108,7 +108,24 @@ lab-metal:
 # loop's passes (none for a one-token run, 7 for eight tokens). A lab-* recipe: the box has no Metal device, so no
 # landing batch selects it.
 lab-metal-e2e:
-    cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e --bin generate_metal --bin bloomery-serve-metal && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all && fx="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf" && ids="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" && want="134895,160927,412,163951,82046,43343,102520,19258" && [ "$ids" = "$want" ] || { echo "lab-metal-e2e: generate_metal smoke: ids $ids; $want is expected"; exit 1; } && out="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" && [ -n "$out" ] || { echo "lab-metal-e2e: generate_metal text smoke: empty stdout"; exit 1; } && one="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 1 --print-ids --profile 2 2>&1 >/dev/null)" && printf '%s\n' "$one" | grep -qx 'decode_passes=0' && printf '%s\n' "$one" | grep -qx 'decode_tok_s=none' && printf '%s\n' "$one" | grep -q '^prof total .* decode_ms=none$' || { echo "lab-metal-e2e: generate_metal rate smoke: a one-token run must print decode_passes=0, decode_tok_s=none and the profile's decode_ms=none"; exit 1; } && many="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids --profile 2 2>&1 >/dev/null)" && printf '%s\n' "$many" | tr ' ' '\n' | awk -F= '$1=="decode_passes"{p=$2} $1=="decode_s"{s=$2} $1=="decode_tok_s"{r=$2} $1=="decode_ms"{m=$2} END{ok = p==7 && s>0 && r/(p/s)>0.97 && r/(p/s)<1.03 && m/(s/p*1e3)>0.97 && m/(s/p*1e3)<1.03; exit !ok}' || { echo "lab-metal-e2e: generate_metal rate smoke: an 8-token run must count 7 passes, and decode_tok_s and the profile's decode_ms must be per pass"; exit 1; }
+    #!/usr/bin/env bash
+    set -euo pipefail
+    die() { echo "lab-metal-e2e: $*" >&2; exit 1; }
+    # A step that fails ends the recipe with its own exit code, named by its command line.
+    run() { "$@" || { rc=$?; echo "lab-metal-e2e: '$*' failed (rc $rc)" >&2; exit "$rc"; }; }
+    run cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e --bin generate_metal --bin bloomery-serve-metal
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
+    fx="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf"
+    want="134895,160927,412,163951,82046,43343,102520,19258"
+    ids="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" || die "generate_metal smoke: the run failed (rc $?)"
+    [ "$ids" = "$want" ] || die "generate_metal smoke: ids $ids; $want is expected"
+    out="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" || die "generate_metal text smoke: the run failed (rc $?)"
+    [ -n "$out" ] || die "generate_metal text smoke: empty stdout"
+    one="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 1 --print-ids --profile 2 2>&1 >/dev/null)" || die "generate_metal rate smoke: the one-token run failed (rc $?)"
+    { grep -qx 'decode_passes=0' <<<"$one" && grep -qx 'decode_tok_s=none' <<<"$one" && grep -q '^prof total .* decode_ms=none$' <<<"$one"; } || die "generate_metal rate smoke: a one-token run must print decode_passes=0, decode_tok_s=none and the profile's decode_ms=none"
+    many="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids --profile 2 2>&1 >/dev/null)" || die "generate_metal rate smoke: the eight-token run failed (rc $?)"
+    tr ' ' '\n' <<<"$many" | awk -F= '$1=="decode_passes"{p=$2} $1=="decode_s"{s=$2} $1=="decode_tok_s"{r=$2} $1=="decode_ms"{m=$2} END{ok = p==7 && s>0 && r/(p/s)>0.97 && r/(p/s)<1.03 && m/(s/p*1e3)>0.97 && m/(s/p*1e3)<1.03; exit !ok}' || die "generate_metal rate smoke: an 8-token run must count 7 passes, and decode_tok_s and the profile's decode_ms must be per pass"
 
 # The Metal backend's move proof, on an Apple Silicon Mac (`just ptx-compare`'s analogue; AGENTS.md's change-class table, the move row): a
 # change that should leave a model's speed alone leaves the program alone. BASE (a commit, read through `git archive`) and this tree (or

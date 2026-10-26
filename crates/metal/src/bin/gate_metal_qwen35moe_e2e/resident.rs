@@ -17,8 +17,12 @@
 //!   to a page at most;
 //! - the open makes the rows arena too, so the first pass allocates nothing
 //!   on the device and adds nothing to the set;
-//! - a submit after a gap of [`KEEP`] renews the request once, and a submit
-//!   straight after another does not.
+//! - every submit's decision agrees with the gap it measured: the residency
+//!   keeps the longest gap a submit left the request at and the shortest it
+//!   renewed it at, so the rule (renew when the last request is [`KEEP`] old,
+//!   else leave it) is read on the clock the rule itself reads, not on the
+//!   wall time the steps take; the step after a sleep of [`KEEP`] renews, and
+//!   some submit comes within [`KEEP`] of the last request and leaves it.
 
 use std::path::Path;
 use std::thread::sleep;
@@ -30,7 +34,7 @@ use bloomery_metal::arch::qwen3moe::plan;
 use bloomery_metal::arch::qwen3moe::session::{PassOut, Session, StateOut, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
-use bloomery_metal::residency::KEEP;
+use bloomery_metal::residency::{KEEP, ResidencyStats};
 
 use super::pass::prompt_ids;
 use super::says;
@@ -67,6 +71,31 @@ fn planned(path: &Path) -> Result<Tally, String> {
         .checked
         .ok_or_else(|| format!("the plan refuses the file the open opened: {items:?}"))?;
     Ok(checked.bytes().map_err(says)?.total())
+}
+
+/// The most steps run to find a submit within [`KEEP`] of the last request:
+/// a step is that slow only on a machine too loaded to observe the rule.
+const HOLD_STEPS: usize = 16;
+
+/// The first decision of `stats` that disagrees with the gap it measured:
+/// a renewal at a gap under [`KEEP`], or a submit that left the request at a
+/// gap of [`KEEP`] or more.
+fn decisions(stats: &ResidencyStats) -> Result<(), String> {
+    if let Some(gap) = stats.renewed_gap_min
+        && gap < KEEP
+    {
+        return Err(format!(
+            "a submit renewed the request {gap:?} after the last, under the {KEEP:?} the rule waits"
+        ));
+    }
+    if stats.held_gap_max >= KEEP {
+        return Err(format!(
+            "a submit left the request {:?} after the last, at or past the {KEEP:?} the rule \
+             renews at",
+            stats.held_gap_max
+        ));
+    }
+    Ok(())
 }
 
 pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
@@ -114,38 +143,52 @@ pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Claus
         ));
     }
 
+    // Steps straight after the pass, until a submit has left the request
+    // (the pass itself may have): how many submits fall within KEEP of the
+    // last request is the machine's, what each did about it is the rule's.
     let id = ids[PASS_IDS - 1];
-    let renewed = s.residency().requests;
-    s.step(id, StepMode::HostFed).map_err(says)?;
-    s.step(id, StepMode::HostFed).map_err(says)?;
-    let back_to_back = s.residency().requests;
+    let mut steps = 0;
+    while steps < 2 || (s.residency().held == 0 && steps < HOLD_STEPS) {
+        s.step(id, StepMode::HostFed).map_err(says)?;
+        steps += 1;
+    }
+    let straight = s.residency();
+    decisions(&straight)?;
+    if straight.held == 0 {
+        return Err(format!(
+            "no submit of the pass and {steps} steps came within {KEEP:?} of the last request; the \
+             rule's leave-it half was not observed"
+        ));
+    }
     sleep(KEEP + GAP_MARGIN);
     s.step(id, StepMode::HostFed).map_err(says)?;
-    let after_gap = s.residency().requests;
-    if after_gap != back_to_back + 1 {
+    let after_gap = s.residency();
+    if after_gap.requests <= straight.requests {
         return Err(format!(
-            "a step after a gap of {:?} left {after_gap} requests; the {back_to_back} before it \
-             and one renewal are expected",
-            KEEP + GAP_MARGIN
-        ));
-    }
-    if back_to_back != renewed {
-        return Err(format!(
-            "two steps straight after the pass renewed the request {} times; the gap rule is \
+            "a step after a gap of {:?} left {} requests, the {} before it; the rule renews at \
              {KEEP:?}",
-            back_to_back - renewed
+            KEEP + GAP_MARGIN,
+            after_gap.requests,
+            straight.requests
         ));
     }
+    decisions(&after_gap)?;
+    let renewed_at = after_gap.renewed_gap_min.ok_or_else(|| {
+        "the requests grew across the gap step and no renewal recorded its gap".to_string()
+    })?;
     Ok(Verdict::Noted(format!(
         "the open allocated {opened} bytes, the rows arena's {} among them; the residency set \
          holds {} buffers of them to within a page each, as many as the plan of the header counts \
          ({}..={} bytes asked, rounded to pages); the first pass allocated nothing and added \
-         nothing to the set; a step after {:?} idle renewed the request once, two steps \
-         straight after the pass renewed none",
+         nothing to the set; a step after {:?} idle renewed the request; the {} submits that left \
+         it did so at {:?} at most and the renewals came at {renewed_at:?} or more, against \
+         the rule's {KEEP:?}",
         s.rows_arena_bytes(),
         at_open.buffers,
         plan.requested,
         plan.paged,
-        KEEP + GAP_MARGIN
+        KEEP + GAP_MARGIN,
+        after_gap.held,
+        after_gap.held_gap_max
     )))
 }
