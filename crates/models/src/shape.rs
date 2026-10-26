@@ -857,16 +857,22 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
 /// The first row, in [`GQA`]'s order, built for `head` key values and `value`
 /// value values that takes `group` query heads a key head.
 #[must_use]
-pub fn gqa_row_v(head: u32, value: u32, group: u32) -> Option<GqaInst> {
-    GQA.iter()
-        .find(|r| r.head == head && r.value == value && r.takes(group))
-        .copied()
+pub const fn gqa_row_v(head: u32, value: u32, group: u32) -> Option<GqaInst> {
+    let mut i = 0;
+    while i < GQA.len() {
+        let r = GQA[i];
+        if r.head == head && r.value == value && r.takes(group) {
+            return Some(r);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// [`gqa_row_v`] at a value width equal to the head's: the rows the
 /// Qwen bodies launch.
 #[must_use]
-pub fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
+pub const fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
     gqa_row_v(head, head, group)
 }
 

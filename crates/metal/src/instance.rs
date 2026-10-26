@@ -62,22 +62,6 @@ pub struct DeltaAxes {
     pub conv_taps: u32,
 }
 
-/// The first row of [`shape::GQA`] built for `head` key and value values
-/// that takes `group` query heads a key head: [`shape::gqa_row`] in the const
-/// form an instance row is written in. Fails the build when the table has no
-/// such row.
-const fn gqa_row(head: u32, group: u32) -> GqaInst {
-    let mut i = 0;
-    while i < shape::GQA.len() {
-        let r = shape::GQA[i];
-        if r.head == head && r.value == head && r.takes(group) {
-            return r;
-        }
-        i += 1;
-    }
-    panic!("the shape table has no GQA row for this head at this group")
-}
-
 /// Qwen3.6-35B-A3B's shape (`qwen35moe`): the gated softmax router over 256
 /// experts and the shared expert, the gated query, the gated delta net.
 pub const QWEN35MOE_A3B: Instance = Instance {
@@ -90,7 +74,10 @@ pub const QWEN35MOE_A3B: Instance = Instance {
             expert_ff: 512,
         },
         attn: AttnAxes {
-            row: gqa_row(256, 16 / 2),
+            row: match shape::gqa_row(256, 16 / 2) {
+                Some(r) => r,
+                None => panic!("the shape table has no GQA row for this head at this group"),
+            },
             n_head: 16,
             n_kv: 2,
             rot: 64,
@@ -402,14 +389,7 @@ mod tests {
     #[test]
     fn the_registered_rows_are_the_shape_tables() {
         for inst in REGISTERED {
-            let (m, a) = (&inst.key.moe, &inst.key.attn);
-            let group = a.n_head / a.n_kv;
-            assert_eq!(
-                shape::gqa_row(a.row.head, group),
-                Some(a.row),
-                "{}: the flash row is the one the table's lookup gives",
-                inst.name
-            );
+            let m = &inst.key.moe;
             let s = MoeShape {
                 rule: m.router.rule,
                 experts: m.router.experts,
