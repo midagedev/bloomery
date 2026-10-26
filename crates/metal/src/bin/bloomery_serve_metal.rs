@@ -163,7 +163,8 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
         drop(split);
         let tok = tokenizer::Tokenizer::from_gguf(path).map_err(|e| e.to_string())?;
         let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
-        let device = MetalDevice::open().map_err(|e| e.to_string())?;
+        let instance = Session::instance_of(path, ctx).map_err(|e| e.to_string())?;
+        let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
         let t0 = Instant::now();
         let session = Session::open_as(
             &device,

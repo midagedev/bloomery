@@ -160,6 +160,7 @@ mod mac {
     use std::path::Path;
 
     use bloomery_metal::device::MetalDevice;
+    use bloomery_metal::instance::HOST;
     use bloomery_metal::kernels::Kernels;
     use bloomery_metal::library::{GemmPath, Library, LibraryPath, SOURCE, TENSOR_SOURCE};
     use bloomery_metal::scan::{self, Built};
@@ -450,7 +451,7 @@ kernel void bloomery_scan_calibration(device float * x [[buffer(0)]], uint i [[t
     }
 
     pub(super) fn run(out: Option<&Path>, keep: Option<&Path>) -> Result<(), String> {
-        let device = MetalDevice::open().map_err(|e| e.to_string())?;
+        let device = MetalDevice::open(&HOST).map_err(|e| e.to_string())?;
         if device.library().path() != LibraryPath::Source {
             return Err(
                 "the library is the build's metallib (the Metal Toolchain is installed): the calibration compiles the run-time source, so the scan would not be of what runs"

@@ -97,6 +97,7 @@ use crate::checkpoint::{self, Checkpoints, Restore};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
 use crate::handle::Handle;
+use crate::instance::Instance;
 use crate::kernels::{
     EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, SNAPS, segments_for_keys, state_elems,
 };
@@ -665,6 +666,17 @@ pub struct Passed {
 }
 
 impl Session {
+    /// The instance the file at `path` selects by its shape: the library a
+    /// session of it with a cache of `ctx` rows opens on. The open's own
+    /// check decides it, so a shape no instance is built for, and every
+    /// other refusal the open would meet first, is refused by name before
+    /// a device opens.
+    pub fn instance_of(path: &Path, ctx: usize) -> Result<&'static Instance, SessionError> {
+        let split = Split::open(path)
+            .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
+        Ok(check::check(&split, ctx).checked_or_first()?.instance)
+    }
+
     /// The session of the file at `path` on `device`, its pipelines from
     /// `library`, with a cache of `ctx` rows: the plan read from the file's
     /// header, every weight copied into the arena, every store at rest, and
@@ -695,7 +707,8 @@ impl Session {
     /// Every buffer is made and the residency set committed here, once: a
     /// refusal is a named error and leaves the set as it was, and no pass
     /// allocates or builds a pipeline but the first marked pass of a session
-    /// opened [`MarkCopies::OnFirstMark`].
+    /// opened [`MarkCopies::OnFirstMark`]. A file whose shape selects no
+    /// instance, or another than `library`'s, is refused by name.
     pub fn open_as(
         device: &MetalDevice,
         library: &Library,
@@ -715,6 +728,14 @@ impl Session {
         // Every refusal the header and tensor table hold, in the order the
         // checks meet them; the open stops at the first.
         let checked = check::check(&split, ctx).checked_or_first()?;
+        if checked.instance != library.instance() {
+            return Err(refuse(format!(
+                "{}: the file is instance {}, the library is built for {}",
+                path.display(),
+                checked.instance.name,
+                library.instance().name
+            )));
+        }
         let plans = checked.plans;
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
