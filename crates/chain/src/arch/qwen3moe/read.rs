@@ -7,20 +7,19 @@
 
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
-    SharedPlan, SharedSites, SiteTy, q35,
+    SharedPlan, SharedSites, SiteTy, layer_class, q35,
 };
 use crate::ChainError;
 use crate::linear::{self, LinearShape};
 use crate::site::{file_site, shaped};
 use gguf::Split;
 use gguf::quant::GgmlType;
-use model::arch::models::Mixer;
-use model::arch::models::{Ffn, LayerSpec, ModelSpec};
+use model::arch::models::{Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate};
 use model::arch::names::blk;
 use model::placement::accepts::{self, LegSplit};
 
 /// The row counts a plan reads its sites at, from the file's shapes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanDims {
     /// Values of the residual stream.
     pub hidden: usize,
@@ -36,23 +35,44 @@ pub struct PlanDims {
 }
 
 impl PlanDims {
-    /// The row counts a qwen35moe plan reads its sites at, from `spec`'s
-    /// description: its first attention layer's head counts (a layer with
-    /// another count is refused by name when its own `plan_gqa` reads its
-    /// sites at these rows) and the geometry the kernels are built for —
-    /// [`q35::HEAD_DIM`] values an attention head, a routed expert's
-    /// [`q35::EXPERT_FF`].
+    /// The row counts a plan reads its sites at, from `spec`'s description alone: its first
+    /// attention layer's head counts and width, the gate rows beside each query its
+    /// [`OutGate`] writes, and its first layer's FFN width (a layer with another count is
+    /// refused by name when its own sites are read at these rows).
+    pub fn of(spec: &ModelSpec, what: &'static str) -> Result<PlanDims, ChainError> {
+        let g = first_gqa(spec, what)?;
+        let gate = match g.out_gate {
+            OutGate::None => 1,
+            OutGate::Packed => 2,
+            OutGate::Proj => {
+                return Err(ChainError::shape(
+                    what,
+                    "an output gate projected on its own (`attn_gate`), which no attention site \
+                     here reads",
+                ));
+            }
+        };
+        let ff = match spec.layers.first().map(|l| &l.ffn) {
+            Some(Ffn::Moe(m)) => m.expert_ff,
+            Some(Ffn::Dense { ff, .. }) => *ff,
+            None => return Err(ChainError::shape(what, "no layer to size the FFN for")),
+        };
+        let (heads, kv_heads, head) = (g.heads as usize, g.kv_heads as usize, g.head_dim as usize);
+        Ok(PlanDims {
+            hidden: spec.hidden as usize,
+            ff: ff as usize,
+            q_rows: gate * heads * head,
+            kv_len: kv_heads * head,
+            attn_len: heads * head,
+        })
+    }
+
+    /// The row counts the card's qwen35moe plan reads its sites at, from `spec`'s description:
+    /// its first attention layer's head counts and the geometry the card's kernels are built
+    /// for — [`q35::HEAD_DIM`] values an attention head, a routed expert's [`q35::EXPERT_FF`].
     pub fn q35(spec: &ModelSpec, what: &'static str) -> Result<PlanDims, ChainError> {
-        let (n_head, n_kv) = spec
-            .layers
-            .iter()
-            .find_map(|l| match &l.mixer {
-                Mixer::Gqa(g) => Some((g.heads as usize, g.kv_heads as usize)),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                ChainError::shape(what, "no attention layer to size the attention rows for")
-            })?;
+        let g = first_gqa(spec, what)?;
+        let (n_head, n_kv) = (g.heads as usize, g.kv_heads as usize);
         let head = q35::HEAD_DIM as usize;
         Ok(PlanDims {
             hidden: spec.hidden as usize,
@@ -62,6 +82,17 @@ impl PlanDims {
             attn_len: n_head * head,
         })
     }
+}
+
+/// `spec`'s first attention layer's mixer, or the named refusal of a description with none.
+fn first_gqa<'a>(spec: &'a ModelSpec, what: &'static str) -> Result<&'a Gqa, ChainError> {
+    spec.layers
+        .iter()
+        .find_map(|l| match &l.mixer {
+            Mixer::Gqa(g) => Some(g),
+            _ => None,
+        })
+        .ok_or_else(|| ChainError::shape(what, "no attention layer to size the attention rows for"))
 }
 
 /// The joined name of layer `l`'s stack `part` (`gate`, `up`, `down`).
@@ -293,39 +324,37 @@ pub fn card_leg(
     Ok(accepts::qwen35_leg(tys).map(|leg| (leg, tys)))
 }
 
-/// The types of routed part `part` of layer `l` from `file`'s header: its
-/// experts' stack (`experts` experts of `rows` rows of `k` values; [`HOSTED`]
-/// for a layer the host tier runs) and its shared expert's matrix (`rows` of
-/// `k`), each at a type of the backend's `sites`.
-fn part_tys(
-    file: &Split,
-    what: &'static str,
-    l: usize,
-    part: &str,
-    (rows, k, experts): (usize, usize, usize),
-    hosted: bool,
-    sites: &Sites35,
-) -> Result<(SiteTy, SiteTy), ChainError> {
-    let (routed_name, sh_name) = (exps(l, part), shexp(l, part));
-    let routed = if hosted {
-        HOSTED
-    } else {
-        ty_of(file, what, &routed_name, experts * rows, k, sites.stacks)?
-    };
-    Ok((routed, ty_of(file, what, &sh_name, rows, k, sites.stacks)?))
+/// Layer `l`'s pre-FFN norm: the one of the two spellings the file holds, `ffn_norm.weight`
+/// or `post_attention_norm.weight`. A file with both or neither is refused by name.
+fn ffn_norm_name(file: &Split, what: &'static str, l: usize) -> Result<String, ChainError> {
+    let [plain, post] = ["ffn_norm.weight", "post_attention_norm.weight"].map(|s| blk(l, s));
+    match (file.find(&plain).is_some(), file.find(&post).is_some()) {
+        (true, false) => Ok(plain),
+        (false, true) => Ok(post),
+        (true, true) => Err(ChainError::shape(
+            what,
+            format!("layer {l}: the file holds both {plain} and {post}; the pre-FFN norm is one"),
+        )),
+        (false, false) => Err(ChainError::shape(
+            what,
+            format!("layer {l}: the file holds neither {plain} nor {post}"),
+        )),
+    }
 }
 
 /// Layer `l`'s FFN by its description `spec`, every site's type from
-/// `file`'s header at a type of the backend's `sites`. A routed one: its
+/// `file`'s header at a type of the backend's `sites`, its pre-FFN norm the
+/// file's own spelling ([`ffn_norm_name`]). A routed one: its
 /// stacks' types admitted by the backend's dispatch lists (`gate_up`, `down`
-/// — one gate·up launch reading the gate and the up of one type) and its
-/// shared expert's by its own (`shared`), each refused by name with the
-/// layer; the router joined with the shared gate
-/// as row `n` (the routed count, which a backend's load joins); and the shared expert folded
-/// into the stacks as expert `n` when its gate, up and down are each its
-/// stack's type ([`SharedPlan::Joined`]), else kept apart at its own types
-/// ([`SharedPlan::Apart`]). Under a placed read ([`Read35::Placed`]) a layer
-/// whose stacks the dispatch's launches do not run ([`card_leg`]) is typed as
+/// — one gate·up launch reading the gate and the up of one type) and, where
+/// the description has a shared expert, its own (`shared`), each refused by
+/// name with the layer. A shared expert comes with the router joined with
+/// its gate as row `n` (the routed count, which a backend's load joins) and is
+/// folded into the stacks as expert `n` when its gate, up and down are each
+/// its stack's type ([`SharedPlan::Joined`]), else kept apart at its own
+/// types ([`SharedPlan::Apart`]); with none, the router is the file's own
+/// weight and the stacks the file's own. Under a placed read
+/// ([`Read35::Placed`]) a layer whose stacks the dispatch's launches do not run ([`card_leg`]) is typed as
 /// the host tier's: its stacks are read as `HOSTED` and no dispatch list is
 /// asked of them, its shared expert kept apart at its own types, which the
 /// card runs whatever the stacks are; the common leg's layers
@@ -342,7 +371,7 @@ pub fn plan_ffn(
     read: Read35,
 ) -> Result<FfnPlan, ChainError> {
     let (h, ff) = (d.hidden, d.ff);
-    let ffn_norm = blk(l, "post_attention_norm.weight");
+    let ffn_norm = ffn_norm_name(file, what, l)?;
     match &spec.ffn {
         Ffn::Moe(m) => {
             let n = m.experts as usize;
@@ -351,9 +380,29 @@ pub fn plan_ffn(
                     card_leg(file, what, l, (ff, h, n))?,
                     Some((LegSplit::Dispatch, _))
                 );
-            let (gate_ty, sh_gate) = part_tys(file, what, l, "gate", (ff, h, n), hosted, sites)?;
-            let (up_ty, sh_up) = part_tys(file, what, l, "up", (ff, h, n), hosted, sites)?;
-            let (down_ty, sh_down) = part_tys(file, what, l, "down", (h, ff, n), hosted, sites)?;
+            let stack = |part: &str, (rows, k): (usize, usize)| {
+                if hosted {
+                    Ok(HOSTED)
+                } else {
+                    ty_of(file, what, &exps(l, part), n * rows, k, sites.stacks)
+                }
+            };
+            let (gate_ty, up_ty, down_ty) = (
+                stack("gate", (ff, h))?,
+                stack("up", (ff, h))?,
+                stack("down", (h, ff))?,
+            );
+            let part = |part: &str, (rows, k): (usize, usize)| {
+                ty_of(file, what, &shexp(l, part), rows, k, sites.stacks)
+            };
+            let shared_tys = match m.shared {
+                Some(_) => Some([
+                    part("gate", (ff, h))?,
+                    part("up", (ff, h))?,
+                    part("down", (h, ff))?,
+                ]),
+                None => None,
+            };
             let at = |e: ChainError| ChainError::shape(what, format!("layer {l}: {e}"));
             if !hosted {
                 if gate_ty != up_ty {
@@ -368,15 +417,16 @@ pub fn plan_ffn(
                 launches(gate_ty, sites.gate_up, "gate·up", what).map_err(at)?;
                 launches(down_ty, sites.down, "down `_sel`", what).map_err(at)?;
             }
-            for ty in [sh_gate, sh_up, sh_down] {
-                launches(ty, sites.shared, "shared expert part", what).map_err(at)?;
+            for ty in shared_tys.iter().flatten() {
+                launches(*ty, sites.shared, "shared expert part", what).map_err(at)?;
             }
             let routed = |part: &str| exps(l, part);
-            let (shared, [gate, up, down]) =
-                if !hosted && (gate_ty, up_ty, down_ty) == (sh_gate, sh_up, sh_down) {
-                    let stacks = ["gate", "up", "down"].map(|part| joint(l, part));
-                    (SharedPlan::Joined, stacks)
-                } else {
+            let (shared, [gate, up, down]) = match shared_tys {
+                Some(tys) if !hosted && tys == [gate_ty, up_ty, down_ty] => (
+                    Some(SharedPlan::Joined),
+                    ["gate", "up", "down"].map(|part| joint(l, part)),
+                ),
+                Some([sh_gate, sh_up, sh_down]) => {
                     let sites = SharedSites {
                         gate: shexp(l, "gate"),
                         up: shexp(l, "up"),
@@ -385,15 +435,20 @@ pub fn plan_ffn(
                         up_ty: sh_up,
                         down_ty: sh_down,
                     };
-                    let stacks = ["gate", "up", "down"].map(routed);
-                    (SharedPlan::Apart(sites), stacks)
-                };
+                    (
+                        Some(SharedPlan::Apart(sites)),
+                        ["gate", "up", "down"].map(routed),
+                    )
+                }
+                None => (None, ["gate", "up", "down"].map(routed)),
+            };
+            let gate_inp = match shared {
+                Some(_) => joint_gate_inp(l),
+                None => blk(l, "ffn_gate_inp.weight"),
+            };
             Ok(FfnPlan {
                 ffn_norm,
-                route: FfnRoute::Router {
-                    gate_inp: joint_gate_inp(l),
-                    shared: Some(shared),
-                },
+                route: FfnRoute::Router { gate_inp, shared },
                 gate,
                 up,
                 down,
@@ -422,13 +477,29 @@ pub fn plan_ffn(
     }
 }
 
-/// Layer `l`'s gated attention over the flash `flash` its group selects,
-/// every site's type from `file`'s header at a type of the backend's `sites`.
+/// Layer `l`'s gated attention ([`GqaKind::Gated256`]) over the flash `flash`
+/// its group selects: what the card's body reads ([`plan_gqa_class`]).
 pub fn plan_gqa(
     file: &Split,
     what: &'static str,
     d: &PlanDims,
     l: usize,
+    flash: Flash,
+    sites: &Sites35,
+) -> Result<GqaPlan, ChainError> {
+    plan_gqa_class(file, what, d, l, GqaKind::Gated256, flash, sites)
+}
+
+/// Layer `l`'s attention of class `kind` over the flash `flash` its group
+/// selects, every site's type from `file`'s header at a type of the backend's
+/// `sites`. The query projection is read at the rows `d` names, which hold the
+/// class's gate rows.
+pub fn plan_gqa_class(
+    file: &Split,
+    what: &'static str,
+    d: &PlanDims,
+    l: usize,
+    kind: GqaKind,
     flash: Flash,
     sites: &Sites35,
 ) -> Result<GqaPlan, ChainError> {
@@ -440,7 +511,7 @@ pub fn plan_gqa(
         blk(l, "attn_output.weight"),
     );
     Ok(GqaPlan {
-        kind: GqaKind::Gated256,
+        kind,
         flash,
         attn_norm: blk(l, "attn_norm.weight"),
         attn_q_norm: blk(l, "attn_q_norm.weight"),
@@ -494,12 +565,14 @@ pub fn plan_delta(
     })
 }
 
-/// Every layer's plan of a qwen35moe chain, `kinds` its layers' kinds
-/// ([`kinds35`], one a layer), each layer's mixer and FFN read from `file`'s
-/// header at the rows `pd` names and at a type of the backend's `sites`, the
-/// routed stacks held as `read` says ([`Read35`]): the loop a whole load
-/// runs, both backends' — a backend that transforms the plans after the read
-/// (a placed load's `apart_plans`) transforms the `Vec` this returns.
+/// Every layer's plan of a qwen3moe-family chain, `kinds` its layers' kinds
+/// ([`super::plan::kinds_of`] or the card's [`super::plan::kinds35`], one a
+/// layer; an attention layer's class is its description's geometry), each
+/// layer's mixer and FFN read from `file`'s header at the rows `pd` names and
+/// at a type of the backend's `sites`, the routed stacks held as `read` says
+/// ([`Read35`]): the loop a whole load runs, both backends' — a backend that
+/// transforms the plans after the read (a placed load's `apart_plans`)
+/// transforms the `Vec` this returns.
 pub fn layer_plans(
     file: &Split,
     what: &'static str,
@@ -525,7 +598,11 @@ pub fn layer_plans(
         .enumerate()
         .map(|(l, (kind, layer))| {
             let mixer = match *kind {
-                Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, what, pd, l, flash, sites)?),
+                Kind35::Gqa(flash) => {
+                    let class = layer_class(layer)
+                        .map_err(|e| ChainError::shape(what, format!("layer {l}: {e}")))?;
+                    MixerPlan::Gqa(plan_gqa_class(file, what, pd, l, class, flash, sites)?)
+                }
                 Kind35::Delta(shape) => {
                     MixerPlan::Delta(plan_delta(file, what, pd, shape, l, sites)?)
                 }
@@ -540,9 +617,368 @@ pub fn layer_plans(
 
 #[cfg(test)]
 mod tests {
-    use super::{SiteTy, Sites35};
-    use gguf::quant::GgmlType;
+    use super::{
+        FfnRoute, Flash, GqaKind, LayerPlan, MixerPlan, PlanDims, Read35, SharedPlan, SiteTy,
+        Sites35, layer_plans, plan_ffn, plan_gqa,
+    };
+    use crate::arch::qwen3moe::plan::fixtures::{delta, gqa, layer, q30_layer, spec};
+    use crate::arch::qwen3moe::plan::{Kind35, kinds_of, kinds35};
+    use gguf::Split;
+    use gguf::quant::GgmlType::{self, F32, Q4_K, Q6_K, Q8_0};
+    use gguf::write::{Layout, TensorDecl};
     use model::arch::coverage::{qwen35_down, qwen35_gate_up, qwen35_shared};
+    use model::arch::models::ModelSpec;
+    use std::path::PathBuf;
+
+    /// `name`, `dims` (`dims[0]` the contiguous axis) at `ty`, as a file header declares it.
+    fn decl(name: String, dims: &[u64], ty: GgmlType) -> TensorDecl {
+        let id = ty.as_u32();
+        let (_, blck, size) = gguf::ggml_type_info(id).expect("a type the table sizes");
+        TensorDecl {
+            name,
+            dims: dims.to_vec(),
+            type_id: id,
+            nbytes: gguf::tensor_bytes(blck, size, dims).expect("a size that fits"),
+        }
+    }
+
+    /// A file's header of `decls` and no weight bytes: all a plan reads.
+    fn header(decls: Vec<TensorDecl>) -> Split {
+        let layout = Layout::new(&[], decls).unwrap_or_else(|e| panic!("{e}"));
+        Split::header_only(PathBuf::from("synthetic.gguf"), &layout)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn blk(l: usize, stem: &str) -> String {
+        format!("blk.{l}.{stem}")
+    }
+
+    /// Layer `l`'s routed FFN as the file holds it: the pre-FFN norm under `norm`, the stacks of
+    /// `n` experts of `ff` values over `h`, the down at `down`, and the shared expert's three
+    /// parts at `shared` when given.
+    fn ffn_header(
+        l: usize,
+        norm: &str,
+        (h, ff, n): (u64, u64, u64),
+        down: GgmlType,
+        shared: Option<GgmlType>,
+    ) -> Vec<TensorDecl> {
+        let mut t = vec![
+            decl(blk(l, norm), &[h], F32),
+            decl(blk(l, "ffn_gate_exps.weight"), &[h, ff, n], Q4_K),
+            decl(blk(l, "ffn_up_exps.weight"), &[h, ff, n], Q4_K),
+            decl(blk(l, "ffn_down_exps.weight"), &[ff, h, n], down),
+        ];
+        if let Some(ty) = shared {
+            t.extend([
+                decl(blk(l, "ffn_gate_shexp.weight"), &[h, ff], ty),
+                decl(blk(l, "ffn_up_shexp.weight"), &[h, ff], ty),
+                decl(blk(l, "ffn_down_shexp.weight"), &[ff, h], ty),
+            ]);
+        }
+        t
+    }
+
+    /// Layer `l`'s attention sites over `h` values: `q` rows of query (gate rows included), `kv`
+    /// rows of key and of value (at `v`), and `att` values of attention output.
+    fn gqa_header(l: usize, h: u64, (q, kv, att): (u64, u64, u64), v: GgmlType) -> Vec<TensorDecl> {
+        vec![
+            decl(blk(l, "attn_q.weight"), &[h, q], Q4_K),
+            decl(blk(l, "attn_k.weight"), &[h, kv], Q4_K),
+            decl(blk(l, "attn_v.weight"), &[h, kv], v),
+            decl(blk(l, "attn_output.weight"), &[att, h], Q4_K),
+        ]
+    }
+
+    fn site(name: &str, ty: SiteTy) -> String {
+        format!("{name} {ty}")
+    }
+
+    /// Everything a layer's plan holds, one entry a name or a name with its type, in field order.
+    fn describe(p: &LayerPlan) -> Vec<String> {
+        let mut out = Vec::new();
+        match &p.mixer {
+            MixerPlan::Gqa(g) => out.extend([
+                format!("gqa {:?} {:?}", g.kind, g.flash),
+                g.attn_norm.clone(),
+                g.attn_q_norm.clone(),
+                g.attn_k_norm.clone(),
+                site(&g.attn_q, g.q_ty),
+                site(&g.attn_k, g.k_ty),
+                site(&g.attn_v, g.v_ty),
+                site(&g.attn_output, g.o_ty),
+            ]),
+            MixerPlan::Delta(d) => out.extend([
+                format!("delta {}/{}", d.shape.n_k, d.shape.n_v),
+                d.attn_norm.clone(),
+                d.conv.clone(),
+                d.dt_bias.clone(),
+                d.ssm_a.clone(),
+                d.ssm_norm.clone(),
+                site(&d.qkv, d.qkv_ty),
+                site(&d.gate, d.gate_ty),
+                site(&d.beta, d.beta_ty),
+                site(&d.alpha, d.alpha_ty),
+                site(&d.ssm_out, d.out_ty),
+            ]),
+        }
+        out.push(p.ffn.ffn_norm.clone());
+        match &p.ffn.route {
+            FfnRoute::Router { gate_inp, shared } => {
+                out.push(format!("router {gate_inp}"));
+                out.push(match shared {
+                    None => "no shared".to_string(),
+                    Some(SharedPlan::Joined) => "joined".to_string(),
+                    Some(SharedPlan::Apart(s)) => format!(
+                        "apart {} / {} / {}",
+                        site(&s.gate, s.gate_ty),
+                        site(&s.up, s.up_ty),
+                        site(&s.down, s.down_ty)
+                    ),
+                });
+            }
+            FfnRoute::Dense => out.push("dense".to_string()),
+        }
+        out.extend([
+            site(&p.ffn.gate, p.ffn.gate_ty),
+            site(&p.ffn.up, p.ffn.up_ty),
+            site(&p.ffn.down, p.ffn.down_ty),
+        ]);
+        out
+    }
+
+    /// The plans of `spec` over `file` at the card's lists, by the card's entry points
+    /// (`kinds35`, `PlanDims::q35`) or by the chain's (`kinds_of`, `PlanDims::of`).
+    fn plans(file: &Split, spec: &ModelSpec, card: bool) -> Vec<Vec<String>> {
+        let (kinds, pd) = if card {
+            (kinds35(&spec.layers), PlanDims::q35(spec, "t"))
+        } else {
+            (kinds_of(&spec.layers), PlanDims::of(spec, "t"))
+        };
+        let (kinds, pd) = (
+            kinds.unwrap_or_else(|e| panic!("{e}")),
+            pd.unwrap_or_else(|e| panic!("{e}")),
+        );
+        layer_plans(
+            file,
+            "t",
+            &pd,
+            &kinds,
+            &spec.layers,
+            &Sites35::CARD,
+            Read35::Whole,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+        .iter()
+        .map(describe)
+        .collect()
+    }
+
+    /// Qwen3.6's description reads to the plans it always read, through the card's entry points and
+    /// through the chain's alike: a delta layer and two attention layers (one with a Q6_K v), the
+    /// shared expert folded into the stacks where its parts are their types and kept apart where
+    /// they are not, the router joined with its gate, and the pre-FFN norm under the file's
+    /// `post_attention_norm.weight`.
+    #[test]
+    fn qwen36_reads_to_the_plans_it_read_before() {
+        let (h, ff, n) = (2048, 512, 256);
+        let mut t = vec![
+            decl(blk(0, "attn_qkv.weight"), &[h, 8192], Q4_K),
+            decl(blk(0, "attn_gate.weight"), &[h, 4096], Q4_K),
+            decl(blk(0, "ssm_beta.weight"), &[h, 32], F32),
+            decl(blk(0, "ssm_alpha.weight"), &[h, 32], F32),
+            decl(blk(0, "ssm_out.weight"), &[4096, h], Q4_K),
+        ];
+        t.extend(gqa_header(1, h, (8192, 512, 4096), Q6_K));
+        t.extend(gqa_header(2, h, (8192, 512, 4096), Q4_K));
+        let norm = "post_attention_norm.weight";
+        t.extend(ffn_header(0, norm, (h, ff, n), Q4_K, Some(Q4_K)));
+        t.extend(ffn_header(1, norm, (h, ff, n), Q4_K, Some(Q4_K)));
+        t.extend(ffn_header(2, norm, (h, ff, n), Q6_K, Some(Q8_0)));
+        let file = header(t);
+        let spec = spec(vec![layer(delta()), layer(gqa()), layer(gqa())], h as u32);
+        let want = [
+            vec![
+                "delta 16/32",
+                "blk.0.attn_norm.weight",
+                "blk.0.ssm_conv1d.weight",
+                "blk.0.ssm_dt.bias",
+                "blk.0.ssm_a",
+                "blk.0.ssm_norm.weight",
+                "blk.0.attn_qkv.weight Q4_K",
+                "blk.0.attn_gate.weight Q4_K",
+                "blk.0.ssm_beta.weight F32",
+                "blk.0.ssm_alpha.weight F32",
+                "blk.0.ssm_out.weight Q4_K",
+                "blk.0.post_attention_norm.weight",
+                "router derived.blk.0.ffn_gate_inp_sh",
+                "joined",
+                "derived.blk.0.ffn_gate_exps_sh Q4_K",
+                "derived.blk.0.ffn_up_exps_sh Q4_K",
+                "derived.blk.0.ffn_down_exps_sh Q4_K",
+            ],
+            vec![
+                "gqa Gated256 Group",
+                "blk.1.attn_norm.weight",
+                "blk.1.attn_q_norm.weight",
+                "blk.1.attn_k_norm.weight",
+                "blk.1.attn_q.weight Q4_K",
+                "blk.1.attn_k.weight Q4_K",
+                "blk.1.attn_v.weight Q6_K",
+                "blk.1.attn_output.weight Q4_K",
+                "blk.1.post_attention_norm.weight",
+                "router derived.blk.1.ffn_gate_inp_sh",
+                "joined",
+                "derived.blk.1.ffn_gate_exps_sh Q4_K",
+                "derived.blk.1.ffn_up_exps_sh Q4_K",
+                "derived.blk.1.ffn_down_exps_sh Q4_K",
+            ],
+            vec![
+                "gqa Gated256 Group",
+                "blk.2.attn_norm.weight",
+                "blk.2.attn_q_norm.weight",
+                "blk.2.attn_k_norm.weight",
+                "blk.2.attn_q.weight Q4_K",
+                "blk.2.attn_k.weight Q4_K",
+                "blk.2.attn_v.weight Q4_K",
+                "blk.2.attn_output.weight Q4_K",
+                "blk.2.post_attention_norm.weight",
+                "router derived.blk.2.ffn_gate_inp_sh",
+                "apart blk.2.ffn_gate_shexp.weight Q8_0 / blk.2.ffn_up_shexp.weight Q8_0 / \
+                 blk.2.ffn_down_shexp.weight Q8_0",
+                "blk.2.ffn_gate_exps.weight Q4_K",
+                "blk.2.ffn_up_exps.weight Q4_K",
+                "blk.2.ffn_down_exps.weight Q6_K",
+            ],
+        ];
+        for card in [true, false] {
+            assert_eq!(plans(&file, &spec, card), want, "card entry points: {card}");
+        }
+        let pd = PlanDims::q35(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(PlanDims::of(&spec, "t").ok(), Some(pd));
+        let card = plan_gqa(&file, "t", &pd, 1, Flash::Group, &Sites35::CARD);
+        assert_eq!(card.map(|g| g.kind).ok(), Some(GqaKind::Gated256));
+    }
+
+    /// Qwen3-30B-A3B's description reads to whole-head NEOX attention over the group flash with
+    /// 4096 query rows (no gate rows), 128 routed experts of 768 with no shared expert, the
+    /// router and the stacks under the file's own names, and the pre-FFN norm under the file's
+    /// `ffn_norm.weight`.
+    #[test]
+    fn qwen3_30b_reads_to_neox_attention_and_no_shared_expert() {
+        let (h, ff, n) = (2048, 768, 128);
+        let mut t = Vec::new();
+        t.extend(gqa_header(0, h, (4096, 512, 4096), Q4_K));
+        t.extend(gqa_header(1, h, (4096, 512, 4096), Q6_K));
+        t.extend(ffn_header(0, "ffn_norm.weight", (h, ff, n), Q4_K, None));
+        t.extend(ffn_header(1, "ffn_norm.weight", (h, ff, n), Q6_K, None));
+        let file = header(t);
+        let spec = spec(vec![q30_layer(), q30_layer()], h as u32);
+        let pd = PlanDims::of(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (pd.hidden, pd.ff, pd.q_rows, pd.kv_len, pd.attn_len),
+            (2048, 768, 4096, 512, 4096)
+        );
+        let want = [
+            vec![
+                "gqa Neox128 Group",
+                "blk.0.attn_norm.weight",
+                "blk.0.attn_q_norm.weight",
+                "blk.0.attn_k_norm.weight",
+                "blk.0.attn_q.weight Q4_K",
+                "blk.0.attn_k.weight Q4_K",
+                "blk.0.attn_v.weight Q4_K",
+                "blk.0.attn_output.weight Q4_K",
+                "blk.0.ffn_norm.weight",
+                "router blk.0.ffn_gate_inp.weight",
+                "no shared",
+                "blk.0.ffn_gate_exps.weight Q4_K",
+                "blk.0.ffn_up_exps.weight Q4_K",
+                "blk.0.ffn_down_exps.weight Q4_K",
+            ],
+            vec![
+                "gqa Neox128 Group",
+                "blk.1.attn_norm.weight",
+                "blk.1.attn_q_norm.weight",
+                "blk.1.attn_k_norm.weight",
+                "blk.1.attn_q.weight Q4_K",
+                "blk.1.attn_k.weight Q4_K",
+                "blk.1.attn_v.weight Q6_K",
+                "blk.1.attn_output.weight Q4_K",
+                "blk.1.ffn_norm.weight",
+                "router blk.1.ffn_gate_inp.weight",
+                "no shared",
+                "blk.1.ffn_gate_exps.weight Q4_K",
+                "blk.1.ffn_up_exps.weight Q4_K",
+                "blk.1.ffn_down_exps.weight Q6_K",
+            ],
+        ];
+        assert_eq!(plans(&file, &spec, false), want);
+    }
+
+    /// A kind that is not the description's is refused by name with the layer, never read as an
+    /// attention class: an attention kind over a delta-rule layer.
+    #[test]
+    fn a_kind_the_description_does_not_hold_is_refused_by_name() {
+        let spec = spec(vec![layer(delta())], 2048);
+        let pd = PlanDims {
+            hidden: 2048,
+            ff: 512,
+            q_rows: 8192,
+            kv_len: 512,
+            attn_len: 4096,
+        };
+        let kinds = [Kind35::Gqa(Flash::Group)];
+        let file = header(Vec::new());
+        match layer_plans(
+            &file,
+            "t",
+            &pd,
+            &kinds,
+            &spec.layers,
+            &Sites35::CARD,
+            Read35::Whole,
+        ) {
+            Err(e) => assert!(e.to_string().contains("layer 0:"), "{e}"),
+            Ok(p) => panic!("read as {:?}", p.iter().map(describe).collect::<Vec<_>>()),
+        }
+    }
+
+    /// The pre-FFN norm is the file's: a file that holds both spellings or neither is refused by
+    /// name with the layer, never read as one of them.
+    #[test]
+    fn the_pre_ffn_norm_is_the_files_one_spelling() {
+        let (h, ff, n) = (2048, 768, 128);
+        let spec = spec(vec![q30_layer()], h as u32);
+        let pd = PlanDims::of(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
+        let both = vec![
+            decl(blk(0, "ffn_norm.weight"), &[h], F32),
+            decl(blk(0, "post_attention_norm.weight"), &[h], F32),
+        ];
+        let neither = ffn_header(0, "ffn_norm.weight", (h, ff, n), Q4_K, None)[1..].to_vec();
+        for (what, tensors, text) in [
+            ("both", both, "holds both"),
+            ("neither", neither, "neither"),
+        ] {
+            let file = header(tensors);
+            let got = plan_ffn(
+                &file,
+                "t",
+                &pd,
+                &spec.layers[0],
+                0,
+                &Sites35::CARD,
+                Read35::Whole,
+            );
+            match got {
+                Err(e) => assert!(
+                    e.to_string().contains("layer 0:") && e.to_string().contains(text),
+                    "{what}: {e}"
+                ),
+                Ok(p) => panic!("{what}: read as {}", p.ffn_norm),
+            }
+        }
+    }
 
     /// The card's dispatch lists are the kernel tables' families, each list
     /// exactly the families whose file type its table names an entry for: a
