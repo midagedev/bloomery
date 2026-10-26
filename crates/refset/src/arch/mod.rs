@@ -90,6 +90,22 @@ pub fn named(name: &str) -> Option<&'static Family> {
     all().find(|f| f.name == name)
 }
 
+/// The families whose sets exist only where a machine fact holds, each with the variable that states it: every consumer gate of
+/// the family opens with `bash tools/ref/needs-env.sh <recipe> <VAR>`, so a machine without VAR defers the gate by name and has
+/// no sets for it. `needs_env_rows_are_the_families_whose_consumers_open_with_needs_env` holds this table to the justfile.
+static NEEDS_ENV: &[(&Family, &str)] = &[(&qwen4exp::nvfp4::HF, "BLOOMERY_CARD_ALL_EXPERTS")];
+
+/// The variable family `f`'s sets wait on, when it is unset or empty here: the sets are not in place on this machine by design, and
+/// a check of every family's sets in place names the family as deferred instead of failing on sets nothing here reads.
+#[must_use]
+pub fn deferred(f: &Family) -> Option<&'static str> {
+    NEEDS_ENV
+        .iter()
+        .find(|(g, _)| std::ptr::eq(*g, f))
+        .map(|&(_, var)| var)
+        .filter(|var| std::env::var_os(var).is_none_or(|v| v.is_empty()))
+}
+
 #[cfg(test)]
 mod node_dump_contract;
 #[cfg(test)]
@@ -99,7 +115,9 @@ mod qwen_vis_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{BY_ARCH, all, families, minimaxm3, minimaxm31, named, node_dumps};
+    use super::{
+        BY_ARCH, NEEDS_ENV, all, deferred, families, minimaxm3, minimaxm31, named, node_dumps,
+    };
     use crate::family::Identity;
 
     /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
@@ -147,13 +165,25 @@ mod tests {
 
     /// Every family's sets in place pass their family's check: each states
     /// the file the tree runs, names its family's ik build where the family
-    /// pins one, and is complete. One line per set, then the verdict.
+    /// pins one, and is complete. One line per set, then the verdict. A family
+    /// whose consumer needs a machine fact this machine lacks ([`deferred`]) is
+    /// named and left out: its sets are written where that fact holds.
     #[test]
     #[ignore = "hw: needs the reference sets in $BLOOMERY_DATA and BLOOMERY_DSPARK_MODEL on the box"]
     fn hw_every_set_in_place_is_its_familys() {
         let mut failed = 0usize;
         let mut sets = 0usize;
+        let mut left = 0usize;
         for f in all() {
+            if let Some(var) = deferred(f) {
+                left += 1;
+                println!(
+                    "hw_refset: {}: deferred — its {} set(s) wait on {var}, unset here",
+                    f.name,
+                    f.sets.len()
+                );
+                continue;
+            }
             for path in f.in_place() {
                 sets += 1;
                 match f.check_set(&path) {
@@ -171,10 +201,62 @@ mod tests {
                 }
             }
         }
-        println!("hw_refset: {sets} set(s) in place, {failed} failed");
+        println!("hw_refset: {sets} set(s) in place, {failed} failed, {left} deferred");
         assert_eq!(
             failed, 0,
             "hw_refset: {failed} set(s) in place fail their family's check"
+        );
+    }
+
+    /// The variable `recipe` of `justfile` opens its box command with: the word after `needs-env.sh <recipe>` in the recipe's
+    /// indented lines, as `tools/gate-batch.sh` reads the same call. None for a recipe that is not there or opens with no guard.
+    fn needs_env_of(justfile: &str, recipe: &str) -> Option<String> {
+        let mut lines = justfile.lines();
+        lines.find(|l| {
+            l.strip_prefix(recipe)
+                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' '))
+        })?;
+        let guard = format!("needs-env.sh {recipe} ");
+        lines
+            .take_while(|l| l.is_empty() || l.starts_with(char::is_whitespace))
+            .find_map(|l| {
+                let rest = &l[l.find(&guard)? + guard.len()..];
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || c == '\'')
+                    .unwrap_or(rest.len());
+                Some(rest[..end].to_string())
+            })
+    }
+
+    /// A family whose every consumer gate opens with `bash tools/ref/needs-env.sh <recipe> <VAR>`, one VAR for all, is in
+    /// `NEEDS_ENV` with that VAR, and every row is such a family: a gate a machine defers by name leaves its sets out of the
+    /// in-place check by name too, a new such family is not left to turn the check red on a machine that cannot hold its sets,
+    /// and a row for a family whose consumer needs nothing would excuse missing sets.
+    #[test]
+    fn needs_env_rows_are_the_families_whose_consumers_open_with_needs_env() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../justfile");
+        let justfile =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut derived: Vec<(&str, String)> = Vec::new();
+        for f in all() {
+            let vars: Vec<Option<String>> = f
+                .consumers
+                .iter()
+                .map(|c| needs_env_of(&justfile, c))
+                .collect();
+            if let Some(Some(var)) = vars.first()
+                && vars.iter().all(|v| v.as_deref() == Some(var.as_str()))
+            {
+                derived.push((f.name, var.clone()));
+            }
+        }
+        let table: Vec<(&str, String)> = NEEDS_ENV
+            .iter()
+            .map(|&(f, var)| (f.name, var.to_string()))
+            .collect();
+        assert_eq!(
+            derived, table,
+            "the families whose consumers open with needs-env.sh (left) are not NEEDS_ENV's rows (right)"
         );
     }
 

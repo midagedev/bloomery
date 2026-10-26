@@ -21,7 +21,10 @@
 //! `just refset-check` exports as the dspark recipes do. The tree runs the
 //! fixture families' files too (`BLOOMERY_FIXTURE_ROOT`, default
 //! `/models/fixtures`); a family whose file cannot be found is listed as
-//! `<family>: <the error>`.
+//! `<family>: <the error>`. A family whose sets exist only where a machine fact
+//! holds (`arch::deferred`: its consumer gate is deferred by name where the
+//! variable is unset) is one `<family>: deferred` line with the variable, and
+//! none of its sets are read; the summary line counts those families.
 //!
 //! The census sets are checked the same way in place: one
 //! `census <org>/<repo>[/<dir>]/<set>: PASS` or `: FAIL <the error>` line per
@@ -128,8 +131,21 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("--census") {
         return census_only(&args[1..]);
     }
+    let mut deferred = 0usize;
     let sets: Vec<(&Family, PathBuf)> = match args.split_first() {
         None => arch::all()
+            .filter(|f| {
+                let Some(var) = arch::deferred(f) else {
+                    return true;
+                };
+                deferred += 1;
+                println!(
+                    "{}: deferred — its {} set(s) wait on {var}, unset here",
+                    f.name,
+                    f.sets.len()
+                );
+                false
+            })
             .flat_map(|f| f.in_place().into_iter().map(move |p| (f, p)))
             .collect(),
         Some((name, paths)) => {
@@ -154,7 +170,7 @@ fn main() -> ExitCode {
         total += sets;
         failed += failures;
     }
-    println!("refset-check: {total} set(s), {failed} failed");
+    println!("refset-check: {total} set(s), {failed} failed, {deferred} deferred");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
