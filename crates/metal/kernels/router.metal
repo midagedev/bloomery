@@ -1,8 +1,10 @@
 // The router, one dispatch. Geometry: one row per SIMD group, no split, so
-// 257 SIMD groups of one row of K 2048 f32, sixteen float4s per lane. Eight
-// SIMD groups a threadgroup make 256 threads and 33 threadgroups; the last
-// threadgroup has seven SIMD groups with no row. Row 256 reads the second
-// segment base; the two bases are not joined.
+// one SIMD group a row of K f32 (sixteen float4s per lane at K 2048). The
+// rows are the routed experts', then, when the instance has a gated shared
+// expert (BLOOMERY_ROUTER_SHARED), the shared expert's gate row, read from
+// the second segment base; the two bases are not joined. Eight SIMD groups a
+// threadgroup make 256 threads (33 threadgroups over Qwen3.6's 257 rows, the
+// last with seven SIMD groups of no row; 16 over Qwen3-30B's 128).
 //
 // The norm is the threadgroup's, not the row's: every lane loads its share of
 // the input and the gain (two float4s at 256 lanes), stores the gained value
@@ -31,7 +33,10 @@
 #define ROUTER_KEYS (ROUTER_EXPERTS / ROUTER_LANES)
 #define ROUTER_WORK (ROUTER_ROWS * ROUTER_SPLIT)
 
-static_assert(ROUTER_ROWS == ROUTER_EXPERTS + 1, "the shared expert is the last row");
+static_assert(BLOOMERY_ROUTER_SHARED == 0u || BLOOMERY_ROUTER_SHARED == 1u,
+              "a router has a gated shared expert or none");
+static_assert(ROUTER_ROWS == ROUTER_EXPERTS + BLOOMERY_ROUTER_SHARED,
+              "a gated shared expert is the last row");
 static_assert(ROUTER_WORK == ROUTER_ROWS, "the work is the rows: no split");
 static_assert(ROUTER_LANES * ROUTER_FLOAT4S * 4 == ROUTER_K / ROUTER_SPLIT,
               "the float4s cover one split");
@@ -61,7 +66,7 @@ inline float4 router_load4(device const float *p, uint f4)
 // in threadgroup memory: the first SIMD group alone, after the barrier that
 // published them. The group reduces the "bad" flags (a logit that is not
 // finite raises the router site and leaves NaN weights over the ids 0.. in
-// order); else its lanes take the keys their rows left, eight each at 32
+// order, and the shared slot's NaN weight when there is one); else its lanes take the keys their rows left, eight each at 32
 // lanes over the routed experts, and the selection runs in rounds of the
 // group's largest packed key reduced by two SIMD maximums, with no further
 // barrier. The weights stay on lane 0, serial, so their bits stay put. The
@@ -90,8 +95,10 @@ static void route_pick(device uint *ids,
                 ids[s] = s;
                 weights[s] = NAN;
             }
+#if BLOOMERY_ROUTER_SHARED
             ids[top_k] = ROUTER_EXPERTS;
             weights[top_k] = NAN;
+#endif
             if (ticket != nullptr) {
                 ticket_reset(ticket);
             }
@@ -145,8 +152,10 @@ static void route_pick(device uint *ids,
         for (uint s = 0u; s < top_k; ++s) {
             weights[s] = term[s] / sum_exp;
         }
+#if BLOOMERY_ROUTER_SHARED
         ids[top_k] = ROUTER_EXPERTS;
         weights[top_k] = 1.f / (1.f + exp(-tg_logits[ROUTER_EXPERTS]));
+#endif
         if (ticket != nullptr) {
             ticket_reset(ticket);
         }
@@ -265,9 +274,13 @@ kernel void router35(device const float *routed [[buffer(0)]],
             ticket_write(partials, sg, NAN);
         }
     } else if (sg < ROUTER_ROWS) {
+#if BLOOMERY_ROUTER_SHARED
         device const float *row_base = sg < ROUTER_EXPERTS
             ? routed + (ulong)sg * (ulong)ROUTER_K
             : shared;
+#else
+        device const float *row_base = routed + (ulong)sg * (ulong)ROUTER_K;
+#endif
         float acc = 0.f;
 #pragma unroll(8)
         for (uint i = 0u; i < ROUTER_FLOAT4S; ++i) {

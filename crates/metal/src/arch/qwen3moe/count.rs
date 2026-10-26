@@ -315,6 +315,33 @@ mod tests {
         );
     }
 
+    /// Qwen3-30B-A3B's 48 attention layers, `attn_v` at Q6 on the layers
+    /// the Q4_K_M rule (`use_more_bits`) raises: the first and the last
+    /// eighth, and every third layer between from the eighth on.
+    fn q30_target() -> Vec<Layer> {
+        (0..48)
+            .map(|i| Layer::Attention {
+                v: if !(6..42).contains(&i) || (i - 6) % 3 == 2 {
+                    Projection::Q6
+                } else {
+                    Projection::Q4
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q30_target_folded_within_64() {
+        // 2 + 6·48 groups, and the 24 raised layers' second P1 dispatch.
+        assert_eq!(
+            token_count(&q30_target(), LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 290,
+                dispatches: 314
+            }
+        );
+    }
+
     #[test]
     fn past_the_waterline_the_count_does_not_grow() {
         for layers in [fixture().as_slice(), target().as_slice()] {

@@ -139,21 +139,27 @@ pub(super) enum MixerBufs {
     Attention(AttnBufs),
 }
 
+/// A shared expert's router row and weights.
+pub(super) struct SharedBufs {
+    pub(super) gate_inp: MetalBuffer<f32>,
+    pub(super) gate: MetalBuffer<u8>,
+    pub(super) up: MetalBuffer<u8>,
+    pub(super) down: MetalBuffer<u8>,
+}
+
 /// A layer's FFN half: the router's weights and outputs, and the experts.
 /// Each layer keeps its own router outputs, so every layer's picks are
 /// readable after a step.
 pub(super) struct FfnBufs {
     pub(super) norm: MetalBuffer<f32>,
     pub(super) gate_inp: MetalBuffer<f32>,
-    pub(super) gate_inp_shexp: MetalBuffer<f32>,
     pub(super) gate_up_quant: Quant,
     pub(super) gate: MetalBuffer<u8>,
     pub(super) up: MetalBuffer<u8>,
-    pub(super) shexp_gate: MetalBuffer<u8>,
-    pub(super) shexp_up: MetalBuffer<u8>,
     pub(super) down_quant: Quant,
     pub(super) down: MetalBuffer<u8>,
-    pub(super) shexp_down: MetalBuffer<u8>,
+    /// The shared expert, on a router that runs one.
+    pub(super) shared: Option<SharedBufs>,
     pub(super) logits: MetalBuffer<f32>,
     pub(super) ids: MetalBuffer<u32>,
     pub(super) weights: MetalBuffer<f32>,
@@ -623,7 +629,7 @@ impl Arena {
                 let f = &bufs()?.ffn;
                 Ok(GroupBytes {
                     weights: bytes_of(&f.gate_inp)
-                        + bytes_of(&f.gate_inp_shexp)
+                        + f.shared.as_ref().map_or(0, |s| bytes_of(&s.gate_inp))
                         + bytes_of(&f.norm),
                     // The residual read; the logits, the ids, the weights,
                     // the partials and the ticket written.
@@ -639,11 +645,11 @@ impl Arena {
             GroupKind::GateUp | GroupKind::Down => {
                 let f = &bufs()?.ffn;
                 let picks = self.top_k;
-                if ids.len() != picks + 1 {
+                if ids.len() != picks + router::SHARED {
                     return Err(refuse(format!(
-                        "{kind:?}: {} router ids; the picks, then the shared expert's, are {}",
+                        "{kind:?}: {} router ids; the picks, then any shared expert's, are {}",
                         ids.len(),
-                        picks + 1
+                        picks + router::SHARED
                     )));
                 }
                 let n = count_u64(self.n_experts, "the experts");
@@ -663,8 +669,9 @@ impl Arena {
                 let (weights, acts) = match kind {
                     GroupKind::GateUp => (
                         picks * (expert(&f.gate)? + expert(&f.up)?)
-                            + bytes_of(&f.shexp_gate)
-                            + bytes_of(&f.shexp_up),
+                            + f.shared
+                                .as_ref()
+                                .map_or(0, |s| bytes_of(&s.gate) + bytes_of(&s.up)),
                         // The residual normed as it is loaded, the ids read,
                         // the experts' rows written.
                         f32s(self.hidden)
@@ -673,7 +680,8 @@ impl Arena {
                             + bytes_of(&self.h),
                     ),
                     _ => (
-                        picks * expert(&f.down)? + bytes_of(&f.shexp_down),
+                        picks * expert(&f.down)?
+                            + f.shared.as_ref().map_or(0, |s| bytes_of(&s.down)),
                         // The experts' rows and their weights read, the
                         // residual read and written.
                         bytes_of(&self.h) + bytes_of(&f.weights) + 2 * f32s(self.hidden),
@@ -782,18 +790,26 @@ fn ffn(
         // The router and the shared-expert gate: F32 in a GGUF file, MLX's
         // affine 8-bit in an MLX file, dequantized exactly at open.
         gate_inp: load.values(&f.gate_inp)?,
-        gate_inp_shexp: load.values(&f.gate_inp_shexp)?,
         gate_up_quant: f.gate_up_quant,
         gate: load.site(&f.gate)?,
         up: load.site(&f.up)?,
-        shexp_gate: load.site(&f.shexp_gate)?,
-        shexp_up: load.site(&f.shexp_up)?,
         down_quant: f.down_quant,
         down: load.site(&f.down)?,
-        shexp_down: load.site(&f.shexp_down)?,
+        shared: f
+            .shared
+            .as_ref()
+            .map(|s| {
+                Ok::<_, SessionError>(SharedBufs {
+                    gate_inp: load.values(&s.gate_inp)?,
+                    gate: load.site(&s.gate)?,
+                    up: load.site(&s.up)?,
+                    down: load.site(&s.down)?,
+                })
+            })
+            .transpose()?,
         logits: zeroed(device, router::ROWS)?,
-        ids: zeroed(device, top_k + 1)?,
-        weights: zeroed(device, top_k + 1)?,
+        ids: zeroed(device, top_k + router::SHARED)?,
+        weights: zeroed(device, top_k + router::SHARED)?,
         partials: zeroed(device, router::PARTIALS)?,
         ticket: zeroed(device, 1)?,
     })

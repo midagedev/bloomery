@@ -1,9 +1,11 @@
-//! The launch of decode GQA attention: 16 query heads, 2 key heads, head
-//! dim 256. One threadgroup is one key head and one segment of eight SIMD
-//! groups, one query head a group, the keys streamed from the cache into
-//! registers.
+//! The launch of decode GQA attention at the host instance's geometry
+//! ([`QUERY_HEADS`] query heads over [`KV_HEADS`] key heads, [`HEAD_DIM`]
+//! values a head). One threadgroup is one key head and one segment of eight
+//! SIMD groups, one query head a group, the keys streamed from the cache
+//! into registers.
 //!
-//! One segment is the flash: it normalizes, applies the gate and writes the
+//! One segment is the flash: it normalizes, applies the gate when the
+//! layer's query carries one ([`QG_STRIDE`] is twice the head) and writes the
 //! output. More than one writes partials, and the dispatch's last
 //! threadgroup — the ticket's — folds them, applies the gate and writes the
 //! output in the same launch. The ticket is one word the caller holds
@@ -41,14 +43,14 @@ pub use super::attention_geom::{
 
 /// The f16 cache or the q8_0 planes a launch reads and appends.
 pub enum AttnCache<'w> {
-    /// `[kv][ctx][256]` f16 bits.
+    /// `[kv][ctx][head]` f16 bits.
     F16 {
         /// Key rows.
         k: WindowMut<'w, u16, MetalDevice>,
         /// Value rows.
         v: WindowMut<'w, u16, MetalDevice>,
     },
-    /// q8_0 planes: 64 code words and 8 scales per row.
+    /// q8_0 planes: `head / 4` code words and `head / 32` scales per row.
     Q8 {
         /// Key codes, little-endian bytes within each word.
         k_codes: WindowMut<'w, u32, MetalDevice>,
@@ -64,7 +66,8 @@ pub enum AttnCache<'w> {
 /// One attention launch. A key count of 0 or past `ctx`, and an append
 /// position at or past `ctx`, are the kernel's faults, not refusals.
 ///
-/// `q` is `[query heads, 512]`: the query, then the gate, per head.
+/// `q` is `[query heads, QG_STRIDE]`: the query, then the gate when the
+/// layer has one, per head.
 pub struct AttentionParams<'w> {
     /// Head dimension. The kernel takes [`HEAD_DIM`].
     pub head_dim: usize,
@@ -84,15 +87,16 @@ pub struct AttentionParams<'w> {
     pub pos: u32,
     /// Live key count, including the appended row when it is live.
     pub n_keys: u32,
-    /// The query projection, [`qg_len`] elements: query, then gate, per head.
+    /// The query projection, [`qg_len`] elements: query, then any gate, per
+    /// head.
     pub q: Window<'w, f32, MetalDevice>,
     /// Keys, one raw row per key head.
     pub k: Window<'w, f32, MetalDevice>,
     /// Values, one raw row per key head.
     pub v: Window<'w, f32, MetalDevice>,
-    /// Query RMS gain, 256 values.
+    /// Query RMS gain, [`HEAD_DIM`] values.
     pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, 256 values.
+    /// Key RMS gain, [`HEAD_DIM`] values.
     pub k_gain: Window<'w, f32, MetalDevice>,
     /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
     pub rope: Window<'w, f32, MetalDevice>,
@@ -100,7 +104,7 @@ pub struct AttentionParams<'w> {
     pub cache: AttnCache<'w>,
     /// Segment partials, [`partials_len`] elements.
     pub partials: WindowMut<'w, f32, MetalDevice>,
-    /// The layer output, [`out_len`] elements, after the gate.
+    /// The layer output, [`out_len`] elements, after any gate.
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// The fault word.
     pub fault: &'w MetalFaultWord,
@@ -123,25 +127,25 @@ pub fn out_len() -> Option<usize> {
     QUERY_HEADS.checked_mul(HEAD_DIM)
 }
 
-/// The query projection's length: the query and the gate, per head.
+/// The query projection's length: the query and any gate, per head.
 #[must_use]
 pub fn qg_len() -> Option<usize> {
     QUERY_HEADS.checked_mul(QG_STRIDE)
 }
 
-/// f16 cache rows, `kv * ctx * 256` bits.
+/// f16 cache rows, `kv * ctx * head` bits.
 #[must_use]
 pub fn f16_len(ctx: usize) -> Option<usize> {
     KV_HEADS.checked_mul(ctx)?.checked_mul(HEAD_DIM)
 }
 
-/// q8_0 code words per cache, `kv * ctx * 64`.
+/// q8_0 code words per cache, `kv * ctx * head / 4`.
 #[must_use]
 pub fn q8_code_len(ctx: usize) -> Option<usize> {
     KV_HEADS.checked_mul(ctx)?.checked_mul(HEAD_DIM / 4)
 }
 
-/// q8_0 scales per cache, `kv * ctx * 8`.
+/// q8_0 scales per cache, `kv * ctx * head / 32`.
 #[must_use]
 pub fn q8_scale_len(ctx: usize) -> Option<usize> {
     KV_HEADS.checked_mul(ctx)?.checked_mul(HEAD_DIM / 32)
@@ -255,8 +259,9 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
             let n = f16_len(p.ctx).ok_or_else(|| refuse("the cache length wraps".to_string()))?;
             check_window_len("attention", "k cache", k.len(), n)?;
             check_window_len("attention", "v cache", v.len(), n)?;
-            // The kernel reads each cache row as 16-byte words, one a lane:
-            // the windows must start where those words align.
+            // The kernels read each cache row as lane words of up to 16 bytes
+            // (the prefill's are 16): the windows must start where those
+            // words align.
             for (name, w) in [("k cache", k), ("v cache", v)] {
                 let range = w
                     .byte_range()
@@ -413,9 +418,9 @@ pub struct AttentionRowsParams<'w> {
     pub v: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `v`.
     pub v_stride: usize,
-    /// Query RMS gain, 256 values.
+    /// Query RMS gain, [`HEAD_DIM`] values.
     pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, 256 values.
+    /// Key RMS gain, [`HEAD_DIM`] values.
     pub k_gain: Window<'w, f32, MetalDevice>,
     /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
     pub rope: Window<'w, f32, MetalDevice>,
@@ -424,7 +429,7 @@ pub struct AttentionRowsParams<'w> {
     pub cache: AttnCache<'w>,
     /// Segment partials, [`partials_len`] elements a row.
     pub partials: WindowMut<'w, f32, MetalDevice>,
-    /// The outputs after the gate, [`out_len`] elements a row, `out_stride`
+    /// The outputs after any gate, [`out_len`] elements a row, `out_stride`
     /// apart.
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// Elements between rows of `out`.
@@ -664,16 +669,16 @@ pub struct AttentionPrefillParams<'w> {
     pub v: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `v`.
     pub v_stride: usize,
-    /// Query RMS gain, 256 values.
+    /// Query RMS gain, [`HEAD_DIM`] values.
     pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, 256 values.
+    /// Key RMS gain, [`HEAD_DIM`] values.
     pub k_gain: Window<'w, f32, MetalDevice>,
     /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
     pub rope: Window<'w, f32, MetalDevice>,
     /// The cache the launch appends and reads: the f16 cache; the q8_0
     /// planes are refused by name.
     pub cache: AttnCache<'w>,
-    /// The outputs after the gate, [`out_len`] elements a row, `out_stride`
+    /// The outputs after any gate, [`out_len`] elements a row, `out_stride`
     /// apart.
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// Elements between rows of `out`.

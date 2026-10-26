@@ -67,6 +67,9 @@ pipeline-scan = [
 # Every dispatch, binding, `setBytes` value, barrier and commit/wait/event of a run is written
 # as text (`generate_metal --encode-trace FILE`).
 encode-trace = ["pipeline-label"]
+# The host launch geometry is Qwen3-30B-A3B's (`instance::QWEN3MOE_A3B`) instead of Qwen3.6's: a
+# build opens that model's files and refuses the other's by name.
+host-qwen3moe-a3b = []
 
 [lints]
 workspace = true

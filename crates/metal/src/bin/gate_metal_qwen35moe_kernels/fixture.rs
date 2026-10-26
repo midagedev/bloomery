@@ -146,6 +146,18 @@ impl Fixture {
             .ok_or_else(|| "the fixture names no attention.layer_norm_rms_epsilon".to_string())
     }
 
+    /// The first layer whose tensor `blk.L.{stem}` is of type `ty`.
+    pub fn first_layer_of(&self, stem: &str, ty: GgmlType) -> Result<usize, String> {
+        (0usize..)
+            .map_while(|l| {
+                self.split
+                    .find(&format!("blk.{l}.{stem}"))
+                    .map(|(_, t)| (l, t.ty))
+            })
+            .find_map(|(l, t)| (t == ty).then_some(l))
+            .ok_or_else(|| format!("the fixture has no layer whose {stem} is {ty:?}"))
+    }
+
     /// The bytes of an embedding table: `rows` rows of `cols`, its type's.
     pub fn table(&self, name: &str, cols: usize) -> Result<(&[u8], usize, GgmlType), String> {
         let (shard, t) = self.tensor(name)?;

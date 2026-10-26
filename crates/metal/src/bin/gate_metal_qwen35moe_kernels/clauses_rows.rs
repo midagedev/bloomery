@@ -1083,8 +1083,8 @@ fn prefill_bands(
             let gate = take_qg(qrow, head, HEAD_DIM)?;
             let (k, v) = (&keys[kv][..=pos], &vals[kv][..=pos]);
             let refer = attend(&qn, k, v)?;
-            let bp = prefill_band(&qn, k, v, &gate)?;
-            let bd = band(&qn, k, v, &gate, case.segments)?;
+            let bp = prefill_band(&qn, k, v, Some(&gate))?;
+            let bd = band(&qn, k, v, Some(&gate), case.segments)?;
             for dim in 0..HEAD_DIM {
                 let at = r * out_n + head * HEAD_DIM + dim;
                 let (gp, g0) = (pre.out[at], v0.out[at]);
@@ -1335,7 +1335,7 @@ fn router_normed(h: &Harness<'_>, x: &[f32], gain: &[f32], eps: f32) -> Result<V
 /// dense and for strided rows.
 pub fn norm_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = fixture.rms_eps()?;
-    let gain = fixture.f32s(clauses_router::GAIN_TENSOR, K)?;
+    let gain = clauses_router::gain(fixture)?;
     let mut parts = Vec::new();
     for (rows, strides) in [(1usize, (K, K)), (9, (K, K)), (33, (K + 4, K + 8))] {
         let data: Vec<Vec<f32>> = (0..rows)
@@ -1365,7 +1365,7 @@ pub fn norm_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// that is not finite raises it and moves only its column.
 pub fn norm_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = 0.0f32;
-    let gain = fixture.f32s(clauses_router::GAIN_TENSOR, K)?;
+    let gain = clauses_router::gain(fixture)?;
     let rows = 9usize;
     let clean: Vec<Vec<f32>> = (0..rows)
         .map(|r| oracle::activations(K, 0x40B0 + r as u64, 3.7))

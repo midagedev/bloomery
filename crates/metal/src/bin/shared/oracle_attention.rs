@@ -1,30 +1,36 @@
-//! The attention oracle: the kernel's f32 norm and partial rope, the host
-//! quantizers, an f64 softmax over the dequantized cache, and the band.
+//! The attention oracle: the kernel's f32 norm and rope, the host
+//! quantizers, an f64 softmax over the dequantized cache, and the band, at
+//! the host instance's head ([`HEAD_DIM`] values, the first [`ROT`] turning).
 //!
-//! The norm follows the CUDA partial append's pairing and warp order. Pairs
-//! are `(i, i + 32)` for `i < 32` and `(tid + 32, tid + 128)` otherwise, the
-//! xor butterfly is 16, 8, 4, 2, 1 with every lane reading the values from
-//! before the step, and the four warp sums are added in order `0 + 1 + 2 + 3`.
+//! The norm follows the CUDA append's pairing and warp order: thread `t` of
+//! `HEAD/2` owns `owned_pair(HEAD, ROT, t)`, `(t, t + ROT/2)` for
+//! `t < ROT/2` and `(t + ROT/2, t + HEAD/2)` otherwise; the xor butterfly is
+//! 16, 8, 4, 2, 1 with every lane reading the values from before the step,
+//! and the `HEAD/64` warp sums are added in warp order.
 //! The CUDA sum is f64. This GPU has no f64, so the kernel and this oracle
-//! evaluate that tree in f32. The mean is `sum / 256`, the scale is
+//! evaluate that tree in f32. The mean is `sum / HEAD`, the scale is
 //! `1 / sqrt(mean + eps)` (two roundings), and a scale that is not finite
 //! and positive is NaN. The turn is `fma(n0, c, -(n1 * s))` and
 //! `fma(n0, s, n1 * c)` on table pair `i` of the position's row. Values at
-//! dim 64 and above pass through as `(scale * gain) * x`.
+//! dim `ROT` and above pass through as `(scale * gain) * x`.
 //!
 //! A q8_0 row is `gguf::quant::quantize_q8_0` per 32-value block, packed into
-//! the kernel's planes (64 code words, low byte first, and 8 f16 scales).
+//! the kernel's planes (`HEAD/4` code words, low byte first, and `HEAD/32`
+//! f16 scales).
 //! An f16 row is `gguf::quant::f32_to_f16_bits`.
 //!
 //! # The band
 //!
 //! PIN(2026-10-22): the model below, and no measured error, sets the band.
 //!
-//! A lane owns 8 dims and sums them with 8 fmas. The SIMD group's sum is at
-//! most 31 adds, whichever tree the language picks. The score multiplies by
-//! the exact scale `1/16`. The longest path from a product `q_i k_i` to the
-//! score is 40 roundings, so a score is off by at most
-//! `Δ = G(40) * scale * sum_i |q_i k_i|`, `G(n) = nU / (1 - nU)`, `U = 2^-24`.
+//! A lane owns `HEAD/32` dims and sums them with as many fmas. The SIMD
+//! group's sum is at most 31 adds, whichever tree the language picks. The
+//! score multiplies by the scale (`1/16` at head 256, exact; the f32
+//! `1/sqrt(128)` at head 128, one rounding, and the reference reads the same
+//! f32 scale). The longest path from a product `q_i k_i` to the score is
+//! `HEAD/32 + 32` roundings (40 at head 256), so a score is off by at most
+//! `Δ = G(HEAD/32 + 32) * scale * sum_i |q_i k_i|`, `G(n) = nU / (1 - nU)`,
+//! `U = 2^-24`.
 //!
 //! Metal Shading Language Specification version 4.1, section 8.4, Table 8.1,
 //! row `exp`: at most 4 ulp. The build selects that table
@@ -39,7 +45,8 @@
 //! `θ = G(n_keys + n_rescale) + n_rescale * η`. Dimension `d` of the attention
 //! is held to `B = (rel + θ) * sum_j w_j |v_jd|`, `w` the f64 softmax weight.
 //!
-//! The stored value is `y = attn * σ(g)`, `σ(g) = 1 / (1 + exp(-g))`.
+//! A layer with no gate stores `y = attn`, held to `B` plus the floor. A
+//! gated layer stores `y = attn * σ(g)`, `σ(g) = 1 / (1 + exp(-g))`.
 //! `|Δσ| ≤ η σ (1-σ) + 2 U σ`: the exp's relative slip through `dσ/de * e`
 //! (`e / (1+e) = 1-σ`), then one correctly rounded add and one correctly
 //! rounded division. The product adds `U |y|`. The band is
@@ -54,9 +61,10 @@
 //! score, so each product `q_i k_i` carries `q_i`'s relative error
 //! `2^-11` (round to nearest, normal range) and an absolute `2^-25` for a
 //! value in f16's subnormal range. The keys are the cache's f16 words, exact.
-//! The 256 products are summed in f32 by the fragment product, in some order
-//! of at most `256 + 8` roundings with the scale's one: a score is off by at
-//! most `Δ = scale * ((2^-11 + G(265)) * sum_i |q_i k_i| + 2^-25 * sum_i |k_i|)`.
+//! The `HEAD` products are summed in f32 by the fragment product, in some
+//! order of at most `HEAD + 8` roundings with the scale's one: a score is off
+//! by at most
+//! `Δ = scale * ((2^-11 + G(HEAD + 9)) * sum_i |q_i k_i| + 2^-25 * sum_i |k_i|)`.
 //! The weights are then rounded to f16 before the value product, each by a
 //! relative `2^-11` and an absolute `2^-25` (the weight sum stays f32), so the
 //! attention is held to `B = (rel + 2^-11 + θ) * sum_j w_j |v_jd| + 2^-25 *
@@ -69,7 +77,7 @@ use gguf::quant::{f32_to_f16_bits, half_to_f32, quantize_q8_0};
 
 use super::oracle::{U, gamma_bound, sigmoid};
 /// Lane fmas, the SIMD-group sum, and the scale multiply.
-const DOT_OPS: usize = 8 + 31 + 1;
+const DOT_OPS: usize = HEAD_DIM / 32 + 31 + 1;
 /// 4 ulp of a normal, as a relative error: `4 * 2^-23`.
 const ETA: f64 = 1.0 / 2_097_152.0;
 /// The sigmoid and the product: exp, add, divide, multiply.
@@ -79,15 +87,18 @@ fn f64_usize(n: usize) -> f64 {
     f64::from(u32::try_from(n).expect("a band count fits u32"))
 }
 
-fn warp_sums(x: &[f32; HEAD_DIM]) -> [f32; 4] {
-    let mut acc = [[0f32; 32]; 4];
+/// The norm's pair tree's warps: `HEAD/2` threads, 32 a warp.
+const PAIR_WARPS: usize = HEAD_DIM / 64;
+
+fn warp_sums(x: &[f32; HEAD_DIM]) -> [f32; PAIR_WARPS] {
+    let mut acc = [[0f32; 32]; PAIR_WARPS];
     for (w, row) in acc.iter_mut().enumerate() {
         for (lane, slot) in row.iter_mut().enumerate() {
             let tid = w * 32 + lane;
-            let (i0, i1) = if tid < 32 {
-                (tid, tid + 32)
+            let (i0, i1) = if tid < ROT / 2 {
+                (tid, tid + ROT / 2)
             } else {
-                (tid + 32, tid + 128)
+                (tid + ROT / 2, tid + HEAD_DIM / 2)
             };
             *slot = x[i0] * x[i0] + x[i1] * x[i1];
         }
@@ -100,11 +111,11 @@ fn warp_sums(x: &[f32; HEAD_DIM]) -> [f32; 4] {
             }
         }
     }
-    [acc[0][0], acc[1][0], acc[2][0], acc[3][0]]
+    acc.map(|row| row[0])
 }
 
 fn rms_scale(sum: f32, eps: f32) -> f32 {
-    let mean = sum / f32::from(u16::try_from(HEAD_DIM).expect("256 fits"));
+    let mean = sum / f32::from(u16::try_from(HEAD_DIM).expect("a head's width fits u16"));
     let scale = 1.0 / (mean + eps).sqrt();
     if !scale.is_finite() || scale <= 0.0 {
         f32::NAN
@@ -113,7 +124,7 @@ fn rms_scale(sum: f32, eps: f32) -> f32 {
     }
 }
 
-/// Norm then partial rope of one head, in the kernel's f32 order.
+/// Norm then rope of one head, in the kernel's f32 order.
 pub fn norm_rope(
     x: &[f32; HEAD_DIM],
     gain: &[f32; HEAD_DIM],
@@ -128,9 +139,9 @@ pub fn norm_rope(
     }
     let warps = warp_sums(x);
     let mut sum = warps[0];
-    sum += warps[1];
-    sum += warps[2];
-    sum += warps[3];
+    for w in &warps[1..] {
+        sum += w;
+    }
     let scale = rms_scale(sum, eps);
     let mut n = [0f32; HEAD_DIM];
     for i in 0..HEAD_DIM {
@@ -233,8 +244,9 @@ fn softmax_weights(q: &[f32; HEAD_DIM], keys: &[[f32; HEAD_DIM]]) -> Result<Vec<
     Ok(weights)
 }
 
-/// f64 attention of `q` over `keys` and `vals`: scale `1/16`, softmax, then
-/// the weighted values. The result is the attention context, before the gate.
+/// f64 attention of `q` over `keys` and `vals`: the kernel's scale,
+/// softmax, then the weighted values. The result is the attention context,
+/// before any gate.
 pub fn attend(
     q: &[f32; HEAD_DIM],
     keys: &[[f32; HEAD_DIM]],
@@ -287,8 +299,8 @@ const F16_REL: f64 = 1.0 / 2048.0;
 const F16_ABS: f64 = 1.0 / 33_554_432.0;
 
 /// The prefill flash's terms: the query and the weights rounded to f16, a
-/// fragment product over the head's 256 values (plus the 8 of a fragment's
-/// own sum and the scale).
+/// fragment product over the head's values (plus the 8 of a fragment's own
+/// sum and the scale).
 const PREFILL: Terms = Terms {
     operand: F16_REL,
     operand_abs: F16_ABS,
@@ -297,12 +309,13 @@ const PREFILL: Terms = Terms {
     weight_abs: F16_ABS,
 };
 
-/// The absolute band per dimension of the gated output, from the derivation above.
+/// The absolute band per dimension of the output, gated by `gate` when the
+/// layer has one, from the derivation above.
 pub fn band(
     q: &[f32; HEAD_DIM],
     keys: &[[f32; HEAD_DIM]],
     vals: &[[f32; HEAD_DIM]],
-    gate: &[f32; HEAD_DIM],
+    gate: Option<&[f32; HEAD_DIM]>,
     segments: usize,
 ) -> Result<[f64; HEAD_DIM], String> {
     band_of(&DECODE, q, keys, vals, gate, segments)
@@ -314,7 +327,7 @@ pub fn prefill_band(
     q: &[f32; HEAD_DIM],
     keys: &[[f32; HEAD_DIM]],
     vals: &[[f32; HEAD_DIM]],
-    gate: &[f32; HEAD_DIM],
+    gate: Option<&[f32; HEAD_DIM]>,
 ) -> Result<[f64; HEAD_DIM], String> {
     band_of(&PREFILL, q, keys, vals, gate, 0)
 }
@@ -324,7 +337,7 @@ fn band_of(
     q: &[f32; HEAD_DIM],
     keys: &[[f32; HEAD_DIM]],
     vals: &[[f32; HEAD_DIM]],
-    gate: &[f32; HEAD_DIM],
+    gate: Option<&[f32; HEAD_DIM]>,
     segments: usize,
 ) -> Result<[f64; HEAD_DIM], String> {
     if keys.len() != vals.len() {
@@ -354,7 +367,8 @@ fn band_of(
     let n_keys = keys.len();
     let n_rescale = n_keys.div_ceil(TILE) + segments;
     let theta = gamma_bound(n_keys + n_rescale) + f64_usize(n_rescale) * ETA;
-    let ops = t.dot_ops + n_keys + n_rescale + 1 + GATE_OPS;
+    let gate_ops = if gate.is_some() { GATE_OPS } else { 0 };
+    let ops = t.dot_ops + n_keys + n_rescale + 1 + gate_ops;
     let floor = f64::from(f32::MIN_POSITIVE) * f64_usize(ops);
     let mut out = [0.0f64; HEAD_DIM];
     for (d, out) in out.iter_mut().enumerate() {
@@ -367,11 +381,16 @@ fn band_of(
             value_mag += value.abs();
             attn += weights[j] * value;
         }
-        let sigma = sigmoid(f64::from(gate[d]));
-        let y = attn * sigma;
-        let d_sigma = ETA * sigma * (1.0 - sigma) + 2.0 * U * sigma;
         let b_attn = (rel + t.weight + theta) * weighted + t.weight_abs * value_mag;
-        *out = sigma.abs() * b_attn + attn.abs() * d_sigma.abs() + U * y.abs() + floor;
+        *out = match gate {
+            Some(gate) => {
+                let sigma = sigmoid(f64::from(gate[d]));
+                let y = attn * sigma;
+                let d_sigma = ETA * sigma * (1.0 - sigma) + 2.0 * U * sigma;
+                sigma.abs() * b_attn + attn.abs() * d_sigma.abs() + U * y.abs() + floor
+            }
+            None => b_attn + floor,
+        };
     }
     Ok(out)
 }
