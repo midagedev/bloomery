@@ -10,53 +10,10 @@
 use super::ops::{HybridOps, Step};
 use super::plan::LayerPlan;
 use crate::ChainError;
-use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
-use std::marker::PhantomData;
+use crate::noleg::NoLeg;
+use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 const WHAT: &str = "hybrid::Walk";
-
-/// The port of a chain with no host leg: it exchanges nothing, and opens one unit of `1..=rows`
-/// columns, `rows` the backend's arena's. The same port as the qwen3moe walk's, a second copy until
-/// one common owner takes both.
-struct NoLeg<E> {
-    rows: usize,
-    _error: PhantomData<fn() -> E>,
-}
-
-impl<E> NoLeg<E> {
-    fn new(rows: usize) -> NoLeg<E> {
-        NoLeg {
-            rows,
-            _error: PhantomData,
-        }
-    }
-}
-
-impl<E: From<ChainError>> Port for NoLeg<E> {
-    type Error = E;
-    const KIND: PortKind = PortKind::Step;
-
-    /// Refuses by name more than one unit (no leg to overlap across units) and more columns than
-    /// the arena holds rows.
-    fn open(&mut self, o: Overlap) -> Result<(), E> {
-        if o.units != 1 || !(1..=self.rows).contains(&o.cols) {
-            return Err(ChainError::shape(
-                "hybrid::NoLeg::open",
-                format!(
-                    "{} units of {} columns; a chain with no host leg walks one unit of \
-                     1..={} columns (the arena's rows)",
-                    o.units, o.cols, self.rows
-                ),
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    fn refused(why: Refused) -> E {
-        ChainError::shape(WHAT, why.to_string()).into()
-    }
-}
 
 /// Layer `layer` of the chain `plans` at `m` rows: what an op is told of it and the plan it runs, or
 /// a named refusal for a layer the chain does not hold.
@@ -160,8 +117,9 @@ pub fn layer<O: HybridOps>(
 #[cfg(test)]
 mod tests {
     use super::super::plan::{LayerPlan, MambaPlan, NopeGqaPlan};
-    use super::{HybridOps, NoLeg, Step, Steps, Walk, at, layer};
+    use super::{HybridOps, Step, Steps, Walk, at, layer};
     use crate::ChainError;
+    use crate::noleg::NoLeg;
     use crate::site::SiteTy;
     use model::arch::models::Mamba2;
     use runtime::sched::{self, Overlap, PortKind};
@@ -383,11 +341,11 @@ mod tests {
         assert_eq!(
             run(&mut ops, &plans, ARENA_ROWS + 1).as_deref(),
             Some(
-                "hybrid::NoLeg::open: 1 units of 17 columns; a chain with no host leg walks \
+                "chain::NoLeg::open: 1 units of 17 columns; a chain with no host leg walks \
                  one unit of 1..=16 columns (the arena's rows)"
             )
         );
-        assert!(run(&mut ops, &plans, 0).is_some_and(|e| e.starts_with("hybrid::Walk: ")));
+        assert!(run(&mut ops, &plans, 0).is_some_and(|e| e.starts_with("chain::NoLeg: ")));
         let two = Overlap {
             units: 2,
             cols: 1,
@@ -400,7 +358,7 @@ mod tests {
         assert_eq!(
             err.map(|e| e.to_string()).as_deref(),
             Some(
-                "hybrid::NoLeg::open: 2 units of 1 columns; a chain with no host leg walks \
+                "chain::NoLeg::open: 2 units of 1 columns; a chain with no host leg walks \
                  one unit of 1..=16 columns (the arena's rows)"
             )
         );

@@ -150,9 +150,9 @@ pub fn nope_gqa_plan(
 #[cfg(test)]
 mod tests {
     use super::super::plan::{MambaPlan, NopeGqaPlan};
-    use super::super::test_file::{decl, header};
     use super::{mamba_plan, no_block, nope_gqa_plan};
     use crate::site::SiteTy;
+    use crate::test_file::{decl, header};
     use gguf::Split;
     use gguf::quant::GgmlType::{F32, Q4_K, Q5_0, Q8_0};
     use model::arch::hybrid::{

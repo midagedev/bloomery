@@ -10,6 +10,4 @@
 pub mod ops;
 pub mod plan;
 pub mod read;
-#[cfg(test)]
-pub(crate) mod test_file;
 pub mod walk;

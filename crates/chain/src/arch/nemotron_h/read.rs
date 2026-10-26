@@ -80,8 +80,8 @@ mod tests {
     use super::super::plan::{MlpPlan, Plan};
     use super::layer_plans;
     use crate::hybrid::plan::{Counts, LayerPlan};
-    use crate::hybrid::test_file::{decl, header};
     use crate::site::SiteTy;
+    use crate::test_file::{decl, header};
     use gguf::Split;
     use gguf::quant::GgmlType::{self, Q4_K, Q5_0, Q8_0};
     use model::arch::hybrid::{ATTN_K, ATTN_OUTPUT, ATTN_Q, ATTN_V, SSM_IN, SSM_OUT};
