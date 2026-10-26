@@ -1,4 +1,4 @@
-//! The launch of the Q4_K, Q6_K, A4, Q8_0 and Q5_K mat-vecs.
+//! The launch of the Q4_K, Q6_K, A4, Q8_0, Q5_K, Q5_0 and Q5_1 mat-vecs.
 
 use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
@@ -21,6 +21,10 @@ pub enum Quant {
     Q8_0,
     /// GGUF `Q5_K`: 176-byte blocks of 256 values.
     Q5K,
+    /// GGUF `Q5_0`: 22-byte blocks of 32 values.
+    Q5_0,
+    /// GGUF `Q5_1`: 24-byte blocks of 32 values.
+    Q5_1,
 }
 
 impl Quant {
@@ -36,8 +40,8 @@ impl Quant {
         .expect("a block size fits usize")
     }
 
-    /// Every type a session's arena opens. Q8_0 and Q5_K have kernels but no
-    /// arena site yet, so they are not here.
+    /// Every type a session's arena opens. Q8_0, Q5_K, Q5_0 and Q5_1 have
+    /// kernels but no arena site yet, so they are not here.
     pub const ALL: [Quant; 3] = [Self::Q4K, Self::Q6K, Self::A4];
 
     /// The kernel type that reads file type `ty`, or `None` for a type a
@@ -57,6 +61,8 @@ impl Quant {
             Self::A4 => gguf::quant::GgmlType::MLX_A4,
             Self::Q8_0 => gguf::quant::GgmlType::Q8_0,
             Self::Q5K => gguf::quant::GgmlType::Q5_K,
+            Self::Q5_0 => gguf::quant::GgmlType::Q5_0,
+            Self::Q5_1 => gguf::quant::GgmlType::Q5_1,
         }
     }
 
@@ -81,6 +87,8 @@ impl Quant {
             Self::A4 => "a4",
             Self::Q8_0 => "q8_0",
             Self::Q5K => "q5k",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
         }
     }
 }
@@ -224,6 +232,8 @@ impl Kernels {
             Quant::A4 => &self.a4,
             Quant::Q8_0 => &self.q8_0,
             Quant::Q5K => &self.q5k,
+            Quant::Q5_0 => &self.q5_0,
+            Quant::Q5_1 => &self.q5_1,
         };
         encoder.set_pipeline(family.of(&p.mode));
         let mut slot = Bindings::new(encoder);

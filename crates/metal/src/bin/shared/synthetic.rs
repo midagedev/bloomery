@@ -12,7 +12,10 @@ use super::oracle::Rng;
 /// Q4_K, Q6_K and Q8_0, a BF16 pair for A4's groups, and an f16 pair in
 /// [0.0001, 0.0008] for Q5_K: under its 6-bit sub-scales and 5-bit codes the
 /// wider range's weights reach 0.004 · 63 · 31, and their pair outputs pass
-/// the half range a GEMM's f16 operand takes.
+/// the half range a GEMM's f16 operand takes. Q5_0's and Q5_1's scale is an
+/// f16 in [0.0005, 0.004] of either sign, as a file's is, and Q5_1's min an
+/// f16 in [-0.05, 0.05]: the order of the codes' own `d·q`, so a dropped min
+/// shows.
 pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     let block = quant.block_bytes();
     let blocks = rows * cols / quant.values_per_block();
@@ -36,6 +39,14 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
         gguf::quant::fp32_to_bf16_bits(0.0005 + 0.0035 * unit).to_le_bytes()
     };
     let zero_bias = gguf::quant::fp32_to_bf16_bits(0.0).to_le_bytes();
+    let signed_f16 = |rng: &mut Rng| {
+        let mut bits = small_f16(rng);
+        if rng.next() & 1 == 1 {
+            bits[1] |= 0x80;
+        }
+        bits
+    };
+    let wide_f16 = |rng: &mut Rng| gguf::quant::f32_to_f16_bits(0.05 * rng.signed()).to_le_bytes();
     for b in bytes.chunks_exact_mut(block) {
         match quant {
             Quant::Q4K => {
@@ -48,6 +59,11 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
             }
             Quant::Q6K => b[208..210].copy_from_slice(&small_f16(&mut rng)),
             Quant::Q8_0 => b[0..2].copy_from_slice(&small_f16(&mut rng)),
+            Quant::Q5_0 => b[0..2].copy_from_slice(&signed_f16(&mut rng)),
+            Quant::Q5_1 => {
+                b[0..2].copy_from_slice(&signed_f16(&mut rng));
+                b[2..4].copy_from_slice(&wide_f16(&mut rng));
+            }
             // A group: the scale and the bias at its end, both BF16, so the
             // reader's finiteness check takes the matrix.
             Quant::A4 => {

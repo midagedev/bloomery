@@ -122,6 +122,12 @@ impl Kernels {
             Quant::Q6K => {
                 return Err(refuse("Q6_K has no head-normed mat-vec".to_string()));
             }
+            Quant::Q5_0 | Quant::Q5_1 => {
+                return Err(refuse(format!(
+                    "{} has no head-normed mat-vec",
+                    p.quant.name()
+                )));
+            }
         };
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);

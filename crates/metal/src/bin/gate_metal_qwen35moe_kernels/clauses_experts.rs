@@ -60,6 +60,8 @@ fn tag(quant: Quant) -> u64 {
         Quant::A4 => 2,
         Quant::Q8_0 => 3,
         Quant::Q5K => 4,
+        Quant::Q5_0 => 5,
+        Quant::Q5_1 => 6,
     }
 }
 
@@ -104,7 +106,7 @@ fn plane(
 pub fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
     let ty = quant.ggml();
     let weights = match quant {
-        Quant::Q8_0 | Quant::Q5K => {
+        Quant::Q8_0 | Quant::Q5K | Quant::Q5_0 | Quant::Q5_1 => {
             return Err(format!("the fixture has no {} experts", quant.name()));
         }
         Quant::Q4K => PairWeights {
@@ -233,7 +235,7 @@ fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
 pub fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
     let ty = quant.ggml();
     let (name, shared) = match quant {
-        Quant::Q8_0 | Quant::Q5K => {
+        Quant::Q8_0 | Quant::Q5K | Quant::Q5_0 | Quant::Q5_1 => {
             return Err(format!("the fixture has no {} experts", quant.name()));
         }
         Quant::Q4K => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),

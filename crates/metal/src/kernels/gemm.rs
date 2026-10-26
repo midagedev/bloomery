@@ -505,6 +505,11 @@ impl Kernels {
             Quant::A4 => &self.a4_gemm,
             Quant::Q8_0 => &self.q8_0_gemm,
             Quant::Q5K => &self.q5k_gemm,
+            // A quant with no GEMM entry is refused by name: the entry is
+            // absent, not defaulted.
+            Quant::Q5_0 | Quant::Q5_1 => {
+                return Err(refuse(format!("{} has no GEMM entry", d.quant.name())));
+            }
         };
         encoder.set_pipeline(family.of(d.seg, d.mode, d.operand));
         let mut slot = Bindings::new(encoder);
