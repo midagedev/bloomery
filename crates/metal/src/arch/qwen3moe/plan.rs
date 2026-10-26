@@ -130,7 +130,7 @@ pub fn device_room() -> Result<DeviceRoom, String> {
     Ok(DeviceRoom {
         name: info.name,
         recommended: info.total_bytes,
-        allocated: info.total_bytes - info.free_bytes,
+        allocated: MetalCensus::allocated_of(&default).map_err(|e| e.to_string())?,
     })
 }
 

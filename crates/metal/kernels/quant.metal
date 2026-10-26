@@ -109,6 +109,20 @@ enum LoadMode {
     LOAD_ROUTE,
 };
 
+// The four 16-bit words of a Q4_K-packed scale table's half `iq`: the eight
+// 6-bit scales and mins of that half's four 32-value groups, as bytes
+// [scale 2iq, scale 2iq+1, min 2iq, min 2iq+1, scale 2iq+4, scale 2iq+5,
+// min 2iq+4, min 2iq+5]. `sc` is the table read as words, offset by `iq`.
+inline void k4_scale_words(device const uint16_t * sc, thread uint16_t * sc16) {
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+    sc16[0] = sc[0] & kmask1;
+    sc16[1] = sc[2] & kmask1;
+    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+}
+
 struct Q4K {
     typedef block_q4_K Block;
 
@@ -200,20 +214,13 @@ struct Q4K {
     // sum.
     static inline float partial(device const Block & blk,
                                 const thread Lane & lane) {
-        constexpr uint16_t kmask1 = 0x3f3f;
-        constexpr uint16_t kmask2 = 0x0f0f;
-        constexpr uint16_t kmask3 = 0xc0c0;
-
         uint16_t sc16[4];
         thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
         device const uint16_t * sc = (device const uint16_t *)blk.scales + lane.iq;
         device const uint16_t * q1 = (device const uint16_t *)blk.qs + 16 * lane.iq + 4 * lane.ir;
         device const half * dh = &blk.d;
 
-        sc16[0] = sc[0] & kmask1;
-        sc16[1] = sc[2] & kmask1;
-        sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-        sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+        k4_scale_words(sc, sc16);
 
         device const uint16_t * q2 = q1 + 32;
         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
@@ -246,20 +253,13 @@ struct Q4K {
                                      const thread Lane & lane,
                                      float lo,
                                      float hi) {
-        constexpr uint16_t kmask1 = 0x3f3f;
-        constexpr uint16_t kmask2 = 0x0f0f;
-        constexpr uint16_t kmask3 = 0xc0c0;
-
         uint16_t sc16[4];
         thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
         device const uint16_t * sc = (device const uint16_t *)blk.scales + lane.iq;
         device const uint16_t * q1 = (device const uint16_t *)blk.qs + 16 * lane.iq + 4 * lane.ir;
         device const half * dh = &blk.d;
 
-        sc16[0] = sc[0] & kmask1;
-        sc16[1] = sc[2] & kmask1;
-        sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-        sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+        k4_scale_words(sc, sc16);
 
         device const uint16_t * q2 = q1 + 32;
         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
@@ -317,18 +317,11 @@ struct Q4K {
     static inline void dequant16(device const Block & blk,
                                  short il,
                                  thread matrix<T, 4, 4> & reg) {
-        constexpr uint16_t kmask1 = 0x3f3f;
-        constexpr uint16_t kmask2 = 0x0f0f;
-        constexpr uint16_t kmask3 = 0xc0c0;
-
         const short iq = (il >> 2) & 1;
         uint16_t sc16[4];
         thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
         device const uint16_t * sc = (device const uint16_t *)blk.scales + iq;
-        sc16[0] = sc[0] & kmask1;
-        sc16[1] = sc[2] & kmask1;
-        sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-        sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+        k4_scale_words(sc, sc16);
         // sc8 holds the half's four scale/min pairs: [scale 2iq, scale 2iq+1,
         // min 2iq, min 2iq+1, scale 2iq+4, scale 2iq+5, min 2iq+4, min 2iq+5].
         const short at = (il >> 1 & 1) + 4 * (il >> 3);
@@ -806,20 +799,6 @@ struct Q8_0 {
         }
     }
 };
-
-// The four 16-bit words of a Q4_K-packed scale table's half `iq`: the eight
-// 6-bit scales and mins of that half's four 32-value groups, as bytes
-// [scale 2iq, scale 2iq+1, min 2iq, min 2iq+1, scale 2iq+4, scale 2iq+5,
-// min 2iq+4, min 2iq+5]. `sc` is the table read as words, offset by `iq`.
-inline void k4_scale_words(device const uint16_t * sc, thread uint16_t * sc16) {
-    constexpr uint16_t kmask1 = 0x3f3f;
-    constexpr uint16_t kmask2 = 0x0f0f;
-    constexpr uint16_t kmask3 = 0xc0c0;
-    sc16[0] = sc[0] & kmask1;
-    sc16[1] = sc[2] & kmask1;
-    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-}
 
 // GGUF's Q5_K decode owner (block_q5_K, above): Q4_K's block with a fifth
 // bit a value. A lane loads the same 32 values of a block Q4_K's lane loads
