@@ -1,9 +1,10 @@
 // Forced-prefix logits from mainline llama.cpp, one f32 row per requested continuation id.
 // Row 0 follows the whole prompt; row i > 0 follows forced[i-1]. The final forced id is not fed.
 // tools/ref/dense-logits.py verifies the identities and installs the complete set: with its manifest this is the
-// CUDA writer of the refset family logits-qwen38d (crates/refset/src/arch/qwen35/dense.rs); HIP captures are lab
-// diagnostics, not that family's sets. The raw rows and sidecar are not a set until the runner writes the manifest.
-// --validate-inputs opens no model or device.
+// CUDA writer of the refset families logits-qwen38d and logits-nanbeige43 (crates/refset/src/arch/qwen35/dense.rs,
+// crates/refset/src/arch/llama/dense.rs); HIP captures are lab diagnostics, not those families' sets. The raw rows and
+// sidecar are not a set until the runner writes the manifest. --arch names the general.architecture the model file must
+// state (the writer passes its target's). --validate-inputs opens no model or device.
 
 #include "llama.h"
 #include "gguf.h"
@@ -48,7 +49,7 @@ static std::vector<llama_token> ids(const std::string & path) {
 }
 
 struct Options {
-    std::string model, prompt, forced, out, prefill = "batch";
+    std::string model, prompt, forced, out, prefill = "batch", arch;
     int ctx = 4352, ubatch = 512, gpu_layers = 99, threads = 16;
     std::string backend;
     int reset_repeats = 1;
@@ -73,6 +74,7 @@ static Options options(int argc, char ** argv) {
         else if (key == "--forced-file") o.forced = value;
         else if (key == "--out") o.out = value;
         else if (key == "--prefill") o.prefill = value;
+        else if (key == "--arch") o.arch = value;
         else if (key == "--backend") o.backend = value;
         else if (key == "--reset-repeats") o.reset_repeats = integer(value, key, 1);
         else if (key == "--hip-max-model-bytes") o.hip_max_model_bytes = size_t(integer(value, key, 1));
@@ -216,12 +218,13 @@ static int run(int argc, char ** argv) {
         const gguf_init_params gp = {true, nullptr};
         std::unique_ptr<gguf_context, decltype(&gguf_free)> header(gguf_init_from_file(o.model.c_str(), gp), gguf_free);
         if (!header) throw std::runtime_error("cannot read GGUF header");
-        const int64_t arch = gguf_find_key(header.get(), "general.architecture");
-        if (arch < 0 || gguf_get_kv_type(header.get(), arch) != GGUF_TYPE_STRING ||
-            std::strcmp(gguf_get_val_str(header.get(), arch), "qwen35") != 0) {
-            throw std::runtime_error("expected dense qwen35 before model load");
+        if (o.arch.empty()) throw std::runtime_error("requires --arch, the general.architecture of the model file");
+        const int64_t key_arch = gguf_find_key(header.get(), "general.architecture");
+        if (key_arch < 0 || gguf_get_kv_type(header.get(), key_arch) != GGUF_TYPE_STRING ||
+            o.arch != gguf_get_val_str(header.get(), key_arch)) {
+            throw std::runtime_error("expected dense " + o.arch + " before model load");
         }
-        if (gguf_find_key(header.get(), "qwen35.decision.type") >= 0) throw std::runtime_error("decision model is not a dense generation diagnostic");
+        if (gguf_find_key(header.get(), (o.arch + ".decision.type").c_str()) >= 0) throw std::runtime_error("decision model is not a dense generation diagnostic");
         if (o.backend == "hip") {
             for (int64_t i = 0; i < gguf_get_n_tensors(header.get()); ++i)
                 tensor_bytes = add_bytes(tensor_bytes, gguf_get_tensor_size(header.get(), i));
@@ -236,9 +239,9 @@ static int run(int argc, char ** argv) {
             };
             // Conservative planning allowance, not an allocator cap or measured peak:
             // baseline scratch + expanded weights + context activations/state + FFN scratch.
-            const size_t layers = dimension("qwen35.block_count");
-            const size_t embedding = dimension("qwen35.embedding_length");
-            const size_t ffn = dimension("qwen35.feed_forward_length");
+            const size_t layers = dimension((o.arch + ".block_count").c_str());
+            const size_t embedding = dimension((o.arch + ".embedding_length").c_str());
+            const size_t ffn = dimension((o.arch + ".feed_forward_length").c_str());
             context_allowance = add_bytes(32 * 1024 * 1024, multiply_bytes(tensor_bytes, 4));
             context_allowance = add_bytes(context_allowance, multiply_bytes(multiply_bytes(multiply_bytes(size_t(o.ctx), embedding), layers), 32));
             context_allowance = add_bytes(context_allowance, multiply_bytes(multiply_bytes(size_t(o.ubatch), ffn), 32));

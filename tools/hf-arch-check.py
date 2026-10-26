@@ -37,7 +37,8 @@ expires (`BOX_EXCEPTIONS`): while its expiry file on the box (`box-facts --grep`
 the two named sizes is `excepted: <reason>` and not a FAIL, counted on its own in `excepted=`, and the day the file holds the
 string it is a FAIL naming the exception.
 
---self-test greps the Rust sources the mirror copies (`Model::serves`, the decide rows' constants,
+--self-test greps the Rust sources the mirror copies (`Model::serves`, the qwen3 seat's program rule
+(`Family::pick`, `program_of`, the models crate's `Arch::name`), the decide rows' constants,
 `GgmlType::from_u32`) and fails, naming every name that is in one and not the other, or a source it cannot parse. The
 architecture strings of `Arch::from_name` and of the model reader are not mirrored: they are read from
 tools/arch-registry.tsv, the print of the model crate's registry (`fixture registry`, crates/model/src/arch/registry.rs),
@@ -103,15 +104,23 @@ ROW_BUDGET = 64 * MIB
 # fails on any name in one and not the other.
 
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::serves — the architecture strings each generative seat
-# serves. The glm and nemotron seats read their names through Arch::from_name (SERVES_VIA_FROM_NAME).
+# serves. The glm and nemotron seats read their names through Arch::from_name (SERVES_VIA_FROM_NAME); the qwen3 seat
+# serves a file by the program that runs its description (SERVES_BY_PROGRAM).
 SERVES = {
     "ds41": ("deepseek41", "deepseek4"),
     "qwen38": ("qwen4exp",),
-    "qwen3": ("qwen3moe", "qwen35moe", "qwen35"),
     "mimo2": ("mimo2",),
 }
 SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "minimaxm3": ("MiniMaxM3",), "nemotron": ("NemotronH", "NemotronHMoe"),
                         "raon1": ("Raon1",), "musespark": ("MuseSpark",)}
+# crates/gpu-gates/src/qwen_seat.rs:Family::pick — the programs a program-served seat serves (Model::serves asks
+# Family::of). crates/placement/src/accepts.rs:program_of — the program that runs each crates/models Arch variant, here
+# the variants of those programs; crates/models/src/lib.rs:Arch::name — the architecture string of each variant.
+# PIN(2026-10-26): the mirror of qwen_seat.rs DECISION_LAYOUTS and its doctoring case are gone with the const: the seat
+# refuses a file by its header's `<arch>.decision.type` (model_file::refuse_decision_model), not by an architecture name.
+SERVES_BY_PROGRAM = {"qwen3": ("Qwen3moeBody", "Qwen35Body")}
+PROGRAM_OF = {"Qwen3Moe": "Qwen3moeBody", "Qwen35Moe": "Qwen35Body", "Qwen35": "Qwen35Body", "Llama": "Qwen35Body"}
+MODELS_ARCH_NAME = {"Qwen3Moe": "qwen3moe", "Qwen35Moe": "qwen35moe", "Qwen35": "qwen35", "Llama": "llama"}
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
 SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "solar2", "minimaxm3", "nemotron", "raon1", "musespark")
@@ -236,6 +245,8 @@ def seat_names(seat):
     """The architecture strings of the generative `seat`."""
     if seat in SERVES_VIA_FROM_NAME:
         return [n for v in SERVES_VIA_FROM_NAME[seat] for n in FROM_NAME[v]]
+    if seat in SERVES_BY_PROGRAM:
+        return [MODELS_ARCH_NAME[v] for v, p in PROGRAM_OF.items() if p in SERVES_BY_PROGRAM[seat]]
     return SERVES[seat]
 
 
@@ -1125,6 +1136,9 @@ def live(readme_path=None, text=None, box=False, box_hash=False, hub_factory=Non
 # a SourceError naming the file and line, never a pass.
 
 SERVE_RS = "crates/gpu-gates/src/bin/bloomery_serve.rs"
+QWEN_SEAT_RS = "crates/gpu-gates/src/qwen_seat.rs"
+ACCEPTS_RS = "crates/placement/src/accepts.rs"
+MODELS_RS = "crates/models/src/lib.rs"
 ARCH_RS = "crates/model/src/arch/mod.rs"
 DECIDE_SERVE_RS = "crates/serve/src/decide.rs"
 DECIDE_SEAT_RS = "crates/gpu-gates/src/bin/shared/serve_seats/decide.rs"
@@ -1392,9 +1406,10 @@ def src_seat_words(serve, consts_decide):
 
 
 def src_serves(serve, arch_consts, words):
-    """Model::serves: ({seat word: [names]}, {seat word: [Arch variants]} it reads through Arch::from_name)."""
+    """Model::serves: ({seat word: [names]}, {seat word: [Arch variants]} it reads through Arch::from_name,
+    {seat word: True} for the seats that ask `qwen_seat::Family::of`, the program of the file's description)."""
     lo, hi = serve.one_body("serves")
-    direct, via = {}, {}
+    direct, via, programmed = {}, {}, {}
     for pat, (a, b) in serve.match_arms(lo, hi, r"\bmatch\s+self\b"):
         m = re.fullmatch(r"\s*Model::(\w+)\s*", serve.m[pat[0]:pat[1]])
         if not m or m.group(1) not in words:
@@ -1417,6 +1432,8 @@ def src_serves(serve, arch_consts, words):
                 via[word] = tuple(alts)
             else:
                 raise serve.err(first[0], f"a matches! head this tool cannot read: {head!r}")
+        elif expr == "bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok()":
+            programmed[word] = True
         else:
             alts = []
             for x, y in serve.split_top(a, b, "||"):
@@ -1425,7 +1442,54 @@ def src_serves(serve, arch_consts, words):
                     raise serve.err(x, f"a serves arm this tool cannot read: {serve.m[x:y].strip()!r}")
                 alts += names_of(serve, x + serve.m[x:y].index("==") + 2, y, arch_consts)
             direct[word] = alts
-    return direct, via
+    return direct, via, programmed
+
+
+def src_family_pick(seat):
+    """qwen_seat.rs:Family::pick: the programs whose arm gives a family."""
+    lo, hi = seat.one_body("pick")
+    out = []
+    for pat, expr in seat.match_arms(lo, hi, r"\bmatch\s+program\b"):
+        if not seat.m[expr[0]:expr[1]].strip().startswith("Some("):
+            continue
+        p = re.match(r"\s*Program::(\w+)", seat.m[pat[0]:pat[1]])
+        if not p:
+            raise seat.err(pat[0], f"a pick arm this tool cannot read: {seat.m[pat[0]:pat[1]].strip()!r}")
+        if p.group(1) not in out:
+            out.append(p.group(1))
+    return out
+
+
+def src_program_of(accepts):
+    """accepts.rs:program_of: {models Arch variant: Program variant} of the arms that name a program."""
+    lo, hi = accepts.one_body("program_of")
+    out = {}
+    for pat, expr in accepts.match_arms(lo, hi, r"\bmatch\s+arch\b"):
+        e = accepts.m[expr[0]:expr[1]].strip()
+        if e == "None":
+            continue
+        p = re.fullmatch(r"Some\(Program::(\w+)\)", e)
+        if not p:
+            raise accepts.err(expr[0], f"a program_of arm this tool cannot read: {e!r}")
+        for x, y in accepts.split_top(pat[0], pat[1], "|"):
+            v = re.fullmatch(r"\s*Arch::(\w+)\s*", accepts.m[x:y])
+            if not v:
+                raise accepts.err(x, f"a program_of pattern this tool cannot read: {accepts.m[x:y].strip()!r}")
+            out[v.group(1)] = p.group(1)
+    return out
+
+
+def src_arch_names(models):
+    """crates/models Arch::name: {variant: architecture string}."""
+    lo, hi = models.one_body("name")
+    out = {}
+    for pat, expr in models.match_arms(lo, hi, r"\bmatch\s+self\b"):
+        v = re.fullmatch(r"\s*Arch::(\w+)\s*", models.m[pat[0]:pat[1]])
+        lit = models.literal(*expr)
+        if not v or lit is None:
+            raise models.err(pat[0], "an Arch::name arm this tool cannot read")
+        out[v.group(1)] = lit
+    return out
 
 
 def src_decide_rows(seat, releases):
@@ -1662,9 +1726,21 @@ def mirror_vs_source(read):
         out.append(f"seat order: the mirror has {list(SEAT_ORDER)} and {SERVE_RS} has {[word_of(v) for v in order]}")
     if decide_word != DECIDE_WORD:
         out.append(f"decide word: the mirror has {DECIDE_WORD!r} and {DECIDE_SERVE_RS} has {decide_word!r}")
-    direct, via = src_serves(serve, arch.consts(), words)
+    direct, via, programmed = src_serves(serve, arch.consts(), words)
     out += diff_maps(f"{SERVE_RS}:Model::serves", SERVES, direct, SERVE_RS)
     out += diff_maps(f"{SERVE_RS}:Model::serves via Arch::from_name", SERVES_VIA_FROM_NAME, via, SERVE_RS)
+    out += diff_sets(f"{SERVE_RS}:Model::serves by program", SERVES_BY_PROGRAM, programmed, SERVE_RS)
+    # The program rule: the seat's programs, which variants those programs run, their strings, and the layouts left out.
+    qwen = Src(QWEN_SEAT_RS, read(QWEN_SEAT_RS))
+    picked = src_family_pick(qwen)
+    for word, programs in SERVES_BY_PROGRAM.items():
+        out += diff_sets(f"{QWEN_SEAT_RS}:Family::pick programs of the {word} seat", programs, picked, QWEN_SEAT_RS)
+    program_of = src_program_of(Src(ACCEPTS_RS, read(ACCEPTS_RS)))
+    seat_programs = {p for ps in SERVES_BY_PROGRAM.values() for p in ps}
+    out += diff_maps(f"{ACCEPTS_RS}:program_of (the seat programs' variants)", PROGRAM_OF,
+                     {v: p for v, p in program_of.items() if p in seat_programs}, ACCEPTS_RS)
+    arch_names = src_arch_names(Src(MODELS_RS, read(MODELS_RS)))
+    out += diff_maps(f"{MODELS_RS}:Arch::name", MODELS_ARCH_NAME, {v: arch_names.get(v) for v in PROGRAM_OF}, MODELS_RS)
     from_name, spec = registry_tables(read(REGISTRY_TSV))
     out += diff_maps(f"{REGISTRY_TSV}:Arch::from_name", FROM_NAME, from_name, REGISTRY_TSV)
     # The registry's print and the enum's own match name the same strings: a name added to only one side is named.
@@ -1677,6 +1753,9 @@ def mirror_vs_source(read):
     for word, names in direct.items():
         out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r}, which {REGISTRY_TSV} has no reader for"
                 for n in names if n not in spec]
+    for word in SERVES_BY_PROGRAM:
+        out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r} by program, which {REGISTRY_TSV} has no "
+                f"reader for" for n in seat_names(word) if n not in spec]
     for word, variants in via.items():
         out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r}, which {REGISTRY_TSV} has no reader for"
                 for v in variants for n in from_name.get(v, ()) if n not in spec]
@@ -1864,6 +1943,13 @@ def self_test():
          "is_other_body"),
         ("a name added to QWEN35_BODY is named", ARCH_RS, 'pub const QWEN35_BODY: &[&str] = &["qwen35", "clef"];',
          'pub const QWEN35_BODY: &[&str] = &["qwen35", "clef", "qwen36"];', "qwen36"),
+        ("a program added to Family::pick is named", QWEN_SEAT_RS, "Program::Qwen3moeBody => Some(Self::Qwen3moe),",
+         "Program::Qwen3moeBody => Some(Self::Qwen3moe),\n            Program::Qwen38Body => Some(Self::Qwen3moe),",
+         "Qwen38Body"),
+        ("a variant moved into a seat program by program_of is named", ACCEPTS_RS,
+         "Arch::Qwen4Exp => Some(Program::Qwen38Body),", "Arch::Qwen4Exp => Some(Program::Qwen35Body),", "Qwen4Exp"),
+        ("a renamed variant in Arch::name is named", MODELS_RS, 'Arch::Llama => "llama",', 'Arch::Llama => "llama2",',
+         "llama2"),
     ):
         try:
             got = mirror_vs_source(doctored(path, old, new))
@@ -1899,7 +1985,7 @@ def self_test():
 
     check("a site call reading a field Sites35::CARD does not name is refused by name", unnamed_field)
     try:
-        mirror_vs_source(doctored(SERVE_RS, 'Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe" | "qwen35"),',
+        mirror_vs_source(doctored(SERVE_RS, "Model::Qwen3 => bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok(),",
                                   'Model::Qwen3 => arch.starts_with("qwen3"),'))
         check("a serves arm in a form this tool cannot read fails by file and line", False, "no failure")
     except SourceError as e:
@@ -1950,6 +2036,9 @@ def self_test():
               not green and "a deepseek2 file, which no seat serves" in line, line)
         line, green, _ = row_line("mimo2", "mimo2", small)
         check("a mimo2 file routes to the mimo2 seat", green and "arch=mimo2 route=ok" in line, line)
+        line, green, _ = row_line("qwen3", "llama", small)
+        check("a llama file routes to the qwen3 seat, by the program of its description",
+              green and "arch=llama route=ok" in line, line)
         # a split set: the experts are in shard 2
         p1, p2 = os.path.join(tmp, "s1.gguf"), os.path.join(tmp, "s2.gguf")
         b1 = synth(p1, "glm5-next", [small[0]])

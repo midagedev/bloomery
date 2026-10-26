@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the dense logits oracle on the box: dense_logits_ref (tools/ref/dense_logits_ref.cpp) linked against llama.cpp
-# mainline's libllama and libggml in the qwen38d profile's LCPP build (tools/ref/models/qwen38d.sh), the tree the qwen35
-# hidden-state oracle runs. Under the qwen38d profile only.
+# mainline's libllama and libggml in the profile's LCPP build (tools/ref/models/qwen38d.sh, nanbeige43.sh: one tree, the one the
+# qwen35 hidden-state oracle runs), under a profile that names logits sets (LOGITS_SETS). Either profile builds the one binary.
 #
 # The tree is proven, not trusted, and nothing is built in it (it is the build the depth runners time):
 # tools/ref/dense-logits.py build --pin runs tools/ref/emb2/oracle-tree.sh on it (HEAD is LCPP_PIN, no tracked change,
@@ -13,8 +13,8 @@
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
-[ "$MODEL_NAME" = qwen38d ] ||
-  { echo "build-dense-logits: dense_logits_ref is built under the qwen38d profile; this command picked $MODEL_NAME" >&2; exit 2; }
+declare -p LOGITS_SETS > /dev/null 2>&1 ||
+  { echo "build-dense-logits: dense_logits_ref is built under a profile that names logits sets; the $MODEL_NAME profile names none" >&2; exit 2; }
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 OUT=${DENSE_LOGITS_OUT:-$HERE/target/release/dense_logits_ref}
 rm -f "$OUT" "$OUT.build.json" "$OUT.partial"

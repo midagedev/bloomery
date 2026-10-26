@@ -1299,9 +1299,9 @@ esac
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 case $MODEL_NAME in
-  qwen3moe | qwen35moe | qwen4exp | nemotron_h | nemotron_h_moe) ;;
+  qwen3moe | qwen35moe | qwen4exp | nanbeige43 | nemotron_h | nemotron_h_moe) ;;
   *)
-    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe, qwen35moe, qwen4exp, nemotron_h or nemotron_h_moe on the Mac side (BLOOMERY_MODEL=…)" >&2
+    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe, qwen35moe, qwen4exp, nanbeige43, nemotron_h or nemotron_h_moe on the Mac side (BLOOMERY_MODEL=…)" >&2
     exit 64
     ;;
 esac
@@ -1354,10 +1354,10 @@ case $AB_WARMUP in
 esac
 ARMS=("$@")
 if [ ${#ARMS[@]} -eq 0 ]; then
-  # The nemotron profiles have no ik arm (the refusal below): nemotron_h's default is ours and mainline;
+  # The nemotron profiles and nanbeige43 have no ik arm (the refusal below): nemotron_h's and nanbeige43's default is ours and mainline;
   # nemotron_h_moe's is mainline alone, since generate_qwen3moe has no Bolt arm yet.
   ARMS=(6 lcpp:6)
-  case $MODEL_NAME in nemotron_h) ;; nemotron_h_moe) ARMS=(lcpp:6) ;; *) ARMS=(6 ik:6 lcpp:6) ;; esac
+  case $MODEL_NAME in nanbeige43 | nemotron_h) ;; nemotron_h_moe) ARMS=(lcpp:6) ;; *) ARMS=(6 ik:6 lcpp:6) ;; esac
 fi
 ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
@@ -1668,9 +1668,9 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
   kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM='' AMODEL='' APREFILL='' blist=''
-  # The nemotron profiles: ik has neither, and no mistral.rs build here is shown to load one.
+  # The nemotron profiles and nanbeige43: ik has no oracle for them, and no mistral.rs build here is shown to load one.
   case $MODEL_NAME in
-    nemotron_h | nemotron_h_moe)
+    nanbeige43 | nemotron_h | nemotron_h_moe)
       case $eng in
         ik* | mrs*) arm_refuse "$a" "the $MODEL_NAME profile runs ours, bin: and mainline llama.cpp arms: ik has no $MODEL_NAME, and no mistral.rs build here is shown to load one" ;;
       esac

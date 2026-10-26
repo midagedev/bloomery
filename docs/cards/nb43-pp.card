@@ -1,0 +1,20 @@
+# Nanbeige4.3-33B's first prompt rows on the A6000. A prompt token costs 2 x ~32.5e9 multiply-adds over the trunk's
+# weights [derived from the tensor census: 20.78 GB at Q4_K_M ~4.9 bits a weight ~ 33.9e9 weights]: 67.8 GFLOP. The
+# dense FFN and projections run the K-quant tensor-core GEMM; at 40..55 % of the A6000's 154.8 TFLOPS f16 roof
+# (62..85 TFLOPS) that is 0.80..1.09 ms a token; the group-of-7 prompt flash at P = 4096 adds ~10 % [derived:
+# 2 x 56 heads x 128 x P/2 per token per layer]. pp512 ~920..1250 tok/s, pp4096 ~840..1140.
+kind: baseline
+question: what does bloomery's prompt pass reach on Nanbeige4.3-33B Q4_K_M on the RTX A6000, and llama.cpp beside it?
+term: pp tok/s @ P = 512 and 4096, generate_qwen3moe (BLOOMERY_MODEL=nanbeige43 just depth-gpu-qwen3moe 512 4096),
+  A6000
+unit: tok/s
+predict: 800..1300
+condition: depth-gpu-qwen3moe in its own lease on the A6000, ours and the reference arms interleaved, the ubatch
+  the load's rule picks printed in each row's log; the witness shows no other model load and no [cpu-busy] or
+  [other-busy] row
+reason: prefill is a headline beside decode (AGENTS.md); why now: the landing's gates are green and the rows go into
+  the PR and the model's table
+decide-in: write the rows into the model's A6000 table with the lease and witness
+decide-below: profile one pass (BLOOMERY_PROFILE) and read the GEMM share against the 0.80 ms a token floor; the
+  ubatch pick and the flash's share are the first suspects
+decide-above: re-derive the FLOP count per token (the head and the attention terms)

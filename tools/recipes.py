@@ -12710,9 +12710,10 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-22): gate-gpu-qwen3-dspark joins them; its recipe builds bloomery-serve for the qwen3 seat's draft arms.
     # PIN(2026-10-23): gate-gpu-musespark-serve joins them; its recipe builds bloomery-serve beside its own bin, whose Muse seat names the module.
     # PIN(2026-10-23): gate-gpu-minimaxm3-twocard and gate-gpu-musespark-twocard join them; each runs its serve gate, which builds bloomery-serve.
+    # PIN(2026-10-26): gate-gpu-llama-serve joins them; its recipe builds bloomery-serve beside its own bin.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
-                      "gate-gpu-lev-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
+                      "gate-gpu-lev-serve", "gate-gpu-llama-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
                       "gate-gpu-qwen3-dspark", "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
@@ -12741,7 +12742,8 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
     # PIN(2026-10-20): gate-q38-serve-rules also runs the lib's serve_client tests and record schema includes.
     # PIN(2026-10-23): gate-gpu-rope-writers compiles the lib tests and their record schema includes.
-    expect(schema == {"gate-gpu-gates-lib", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    # PIN(2026-10-26): gate-gpu-llama-dense compiles the lib tests (its kv_planes:: clause) and their record schema includes.
+    expect(schema == {"gate-gpu-gates-lib", "gate-gpu-llama-dense", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     flow = graph.inputs("weekly-gpu-ds41-flowcounts")
     expect(flow.match("tools/bloomery/hf.py") is None, "flowcounts must not key the unrelated hub reader through self-test prose")
     for path in ("tools/bloomery/records.py", "tools/flow/routes.py", "tools/gpu-ab.py", "tools/ref/tdist.py"):

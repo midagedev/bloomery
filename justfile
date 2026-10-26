@@ -949,6 +949,21 @@ build-dense-logits-ref:
 dump-logits-qwen38d *SETS:
     case " {{SETS}} " in *" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=qwen38d ./tools/box.sh 'bash tools/ref/dense-logits.sh {{SETS}}'
 
+# Nanbeige4.3-33B (nanbeige43: general.architecture llama, bartowski's Q4_K_M) logits oracle's binary: the same dense_logits_ref as
+# build-dense-logits-ref (one source, one mainline tree and pin; the device arch comes from the writer's target), built under this profile
+# (tools/ref/models/nanbeige43.sh) into target/release of the box's directory (tools/ref/build-dense-logits.sh).
+build-dense-logits-ref-nanbeige43:
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/ref/build-dense-logits.sh'
+
+# The nanbeige43 logits oracle sets (tools/ref/dense-logits.sh): mainline's logits after the first 64 and 4,096 prose ids of this
+# vocabulary ($BLOOMERY_DATA/nanbeige43/corpus-prose.ids) and after each of the 32 ids that follow them (teacher forced), into
+# $BLOOMERY_DATA/ref_nanbeige43_logits_p{64,4096}/ (refset family logits-nanbeige43). Each dump puts the whole file on the card (the
+# A6000 unless BLOOMERY_CARD says otherwise; its gate lock); no lease (a functional oracle). `--cpu-twin` writes each set's CPU twin
+# into <set>.cpu/ instead (no card, 16 threads): the oracle's own floor a gate's band is derived from
+# (`python3 tools/ref/dense-logits.py floor <set>`).
+dump-logits-nanbeige43 *SETS:
+    case " {{SETS}} " in *" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/ref/dense-logits.sh {{SETS}}'
+
 # Clef-Flash image input, the oracle's binary: dump_mtmd (tools/ref/clefvis/dump_mtmd.cpp) linked against llama.cpp mainline's libmtmd in the qwen35 profile's tree (tools/ref/clefvis/build-clefvis.sh).
 build-clefvis-ref:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
@@ -1388,6 +1403,11 @@ gate-musespark-meta:
 gate-qwen35moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test qwen35moe_meta -- --ignored --nocapture'
 
+# llama(Nanbeige4.3-33B) header gate: the unit tests of the synthetic headers, then what the reader resolves from the real file
+# (the description line by line), what the model needs of a program, and what the coverage check lists for it. Headers only: seconds.
+gate-llama-meta:
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::llama --nocapture && bash tools/gate.sh --release -p bloomery-model --test llama_meta -- --ignored --nocapture'
+
 # Cache append safety contracts and model-less plane/ring writer refusals.
 gate-gpu-rope-writers:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'
@@ -1485,6 +1505,26 @@ gate-gpu-clef-hidden:
 # resident slots in one pass against each alone. The gate lock; no lease.
 gate-gpu-qwen38d:
     BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
+
+# The dense Nanbeige4.3-33B generation gate (llama, bartowski's Q4_K_M, either card, both tiers): the same clauses as
+# gate-gpu-qwen38d over the Body35 chain on a trunk of attention layers alone (52 layers of 56/8 heads of 128, NORM rope, no head
+# norm): the load against the header derivation, the prompt call and forced decode steps' logits rows against mainline's
+# (`just dump-logits-nanbeige43`) within the bands the oracle's own CPU twin gives, graph = eager = pass, reset, the cut to any
+# position with its re-fed tail (no layer holds a store to copy, so no checkpoint), and two resident slots in one pass against
+# each alone. The group of 7 query heads a KV head runs the tensor-core flash only. The gate lock; no lease. The whole-fit verdict's
+# cache term is the description layout's sum (`KvLayout::trunk_bytes`); the `kv_planes::` unit tests run first (host only, no card).
+gate-gpu-llama-dense:
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --lib -- kv_planes:: && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_llama_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_dense'
+
+# The qwen3 seat of bloomery-serve on Nanbeige4.3-33B's Q4_K_M, a `llama` file, with no seat word: `--plan` picks the seat by the
+# program that runs the file's description (and `--model ds41` is refused naming `--model qwen3`); one server at ctx 4096 prints the
+# qwen3 seat's load and listening records naming `llama`, renders the file's ChatML with one leading <|im_start|> and no added BOS
+# (the raw /tokenize door adds it), splits the reply at the <think> span the generation prompt opens (thinking off: no span), renders
+# a tool request's block with the file's template (the chat door counts the ids of that rendering) and parses a scripted XML call
+# through a scripted engine behind the same template, and answers /completion at temperature 0 with the ids generate_qwen3moe --last-step prints for the
+# same ids (run once the server has stopped, the file does not fit a card twice). One card; the gate lock.
+gate-gpu-llama-serve:
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_llama_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/llama-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_serve --dir $D'
 
 # Body35's image rows on Clef-Flash at bartowski's Q8_0 (9.5 GB, either card), against the clefvis sets (set B's tower rows
 # as the spans' rows; set C's three prompts, their CPU twins and the C'' runs): the unit rows and the text rows a media call

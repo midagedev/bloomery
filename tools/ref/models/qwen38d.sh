@@ -18,6 +18,7 @@
 #   PROSE_IDS       the prose corpus, the qwen35 profile's file: the 27B's llama-tokenize --ids --no-parse-special over the
 #                   same prose text ($BLOOMERY_DATA/tokenizer-qwen3moe/prose.txt, md5 c6bb074439479420faffa33257424c00) gives
 #                   76,175 ids with the sha256 the qwen35 profile pins, so the ids are one file and PROSE_SHA256 is the check
+#   LOGITS_TARGET   tools/ref/dense-logits.py TARGETS' name for MODEL: its size, sha256, vocabulary and architecture
 #   LOGITS_SETS     the oracle sets, `<set>:<P>`: the first P ids of PROSE_IDS are the prompt and the LOGITS_FORCED ids after
 #                   them the forced continuation (teacher forced on the corpus), each row mainline's logits after the prompt
 #                   or after a forced id (tools/ref/dense-logits.sh)
@@ -33,6 +34,7 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf}
 LCPP_PIN=53ed051ce5e8193652e449f43216ca3859454f49
 PROSE_IDS=${BLOOMERY_DATA:-/root/bloomery-data}/qwen35/corpus-prose.ids
 PROSE_SHA256=4bdf4171c7e1d0fd37d61b4fd13fdfb66c0dea1806d03b0398f851da5a350223
+LOGITS_TARGET=qwen38-27b
 LOGITS_FORCED=32
 LOGITS_CTX=4352
 LOGITS_UBATCH=512

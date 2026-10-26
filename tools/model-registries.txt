@@ -27,3 +27,4 @@ crates/refset/src/lib.rs
 crates/tokenizer/src/pretok.rs
 crates/tokenizer/src/vocab.rs
 crates/vision/src/arch/mod.rs
+crates/models/src/formats.rs

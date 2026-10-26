@@ -31,7 +31,7 @@ quant_mxfp4	quant	crates/gpu/src/mxfp4.rs crates/gpu/src/mxfp4_sel.rs
 quant_gated	quant	crates/gpu/src/gated_quant.rs crates/gpu/src/quant_sel.rs crates/gpu/src/fused.rs
 quant_gemm	quant	crates/gpu/src/gemm/mod.rs crates/gpu/src/gemm/act.rs crates/gpu/src/gemm/act32.rs crates/gpu/src/gemm/gemm32.rs crates/gpu/src/gemm/grouped.rs crates/gpu/src/gemm/kernels.rs crates/gpu/src/gemm/kernels32.rs crates/gpu/src/gemm/f32tile.rs crates/gpu/src/gemm/remap.rs crates/gpu/src/gemm/swiglu.rs
 quant_host_qdot	quant	crates/qdot/src/lib.rs crates/gguf/src/quant.rs
-attn_gqa	attn	crates/gpu/src/flash_gqa.rs crates/gpu/src/flash_gqa_prefill.rs crates/gpu/src/flash_gqa_prefill_512.rs crates/gpu/src/flash.rs crates/gpu/src/rope_neox.rs crates/gpu/src/rope_table.rs
+attn_gqa	attn	crates/gpu/src/flash_gqa.rs crates/gpu/src/flash_gqa_prefill.rs crates/gpu/src/flash_gqa_prefill_512.rs crates/gpu/src/flash.rs crates/gpu/src/rope_neox.rs crates/gpu/src/rope_norm.rs crates/gpu/src/rope_table.rs
 attn_latent_mla	attn	crates/gpu/src/latent.rs crates/gpu-glm5next/src/mla.rs
 attn_linear_gdn_kda	recur	crates/gpu/src/linear/conv.rs crates/gpu/src/linear/delta.rs crates/gpu/src/linear/mixer_kda.rs crates/gpu/src/linear/norm_gate.rs crates/gpu/src/linear/out_gate.rs crates/gpu-glm5next/src/kda.rs crates/model/src/arch/kda.rs
 recur_mamba2	recur	crates/gpu/src/mamba2.rs crates/gpu/src/mamba2_ssd.rs crates/model/src/mamba2.rs crates/gpu/src/recur.rs

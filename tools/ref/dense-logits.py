@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Build/run immutable dense-Qwen forced-logit sets; compare them without an invented accuracy band.
+"""Build/run immutable dense forced-logit sets (Qwen3.5-architecture and Llama-architecture files); compare them without an
+invented accuracy band.
 
 A set is a node-dump `MANIFEST.tsv` (tools/bloomery/manifest.py here, crates/refset there) with the
 rows in `logits.0.f32` and the ids it was fed. A CUDA `--kind reference` run is the one writer of the
-refset family `logits-qwen38d` (crates/refset/src/arch/qwen35/dense.rs; `just dump-logits-qwen38d`
-drives it through tools/ref/dense-logits.sh): its `# model`, `# build` and `# arch` lines are what the
-family checks. HIP reference runs are lab diagnostics with full build hashes, not that family's sets.
+refset families `logits-qwen38d` (crates/refset/src/arch/qwen35/dense.rs; `just dump-logits-qwen38d`) and
+`logits-nanbeige43` (crates/refset/src/arch/llama/dense.rs; `just dump-logits-nanbeige43`), each driven
+through tools/ref/dense-logits.sh: its `# model`, `# build` and `# arch` lines are what the family checks,
+and the `# arch` line is the target's own `arch`. HIP reference runs are lab diagnostics with full build
+hashes, not those families' sets.
 A `--kind native` run is a comparison capture and is no family's set. `compare --bitwise` checks native
 eager/graph equality only; `floor` prints the oracle's own spread (mainline CUDA against its CPU twin)
 and the top-2 margins the gates' bands are derived from. `--self-test` checks the
@@ -44,6 +47,16 @@ TARGETS = {
         "repository": "lmstudio-community/Qwen3.8-27B-GGUF",
         "revision": "5a7da681f60570ab5b439a587e912d2e5eddb582",
         "file": "Qwen3.8-27B-Q4_K_M.gguf",
+        "arch": "qwen35",
+    },
+    "nanbeige43-33b": {
+        "vocab": 166912,
+        "size": 20788825216,
+        "sha256": "2cef79855ca47ee6571e166db32a07089e34f3cf78e0397b262d124ddb814c37",
+        "repository": "bartowski/Nanbeige_Nanbeige4.3-33B-GGUF",
+        "revision": "9beb68421fdf7be095093a6888325fa2c83ddd38",
+        "file": "Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf",
+        "arch": "llama",
     },
     "qwen35-0.8b-candidate": {
         "vocab": 248320,
@@ -52,6 +65,7 @@ TARGETS = {
         "repository": "notschmee/Qwen3.5-0.8B-GGUF",
         "revision": "1870603ac8ab59c7ddb9d94cccf3b297e379538f",
         "file": "Qwen3.5-0.8B-Q4_K_M.gguf",
+        "arch": "qwen35",
     },
     "hip-lab-hybrid": {
         "vocab": 258,
@@ -60,6 +74,7 @@ TARGETS = {
         "repository": "midagedev/bloomery",
         "revision": "03372d339f99996ec5103484f6e917412191d661",
         "file": "smoke.gguf",
+        "arch": "qwen35",
     },
 }
 
@@ -538,7 +553,7 @@ def run(args):
                 "BLOOMERY_QWEN3_UBATCH": str(args.ubatch), "BLOOMERY_QWEN3_KV": "f16",
                 "BLOOMERY_GATE_BOUND": "900"})
     if not native:
-        argv = [str(binary), "--model", str(model), "--prompt-file", str(stage / "prompt.ids"),
+        argv = [str(binary), "--model", str(model), "--arch", target["arch"], "--prompt-file", str(stage / "prompt.ids"),
                 "--forced-file", str(stage / "forced.ids"), "--out", str(raw),
                 "--ctx", str(args.ctx), "--ubatch", str(args.ubatch), "--prefill", args.prefill,
                 "--backend", args.backend, "--reset-repeats", str(args.reset_repeats),
@@ -604,7 +619,7 @@ def run(args):
                 # HIP lab diagnostics keep the full hash and cannot impersonate that family.
                 "build": (source_head if native else build_info["llama_commit"] if args.backend == "hip"
                           else build_info["llama_commit"][:9]),
-                "arch": "qwen35", "model_sha256": target["sha256"], "model_revision": target["revision"],
+                "arch": target["arch"], "model_sha256": target["sha256"], "model_revision": target["revision"],
                 "target": args.target, "engine": args.kind, "backend": args.backend,
                 "binary_sha256": binary_sha, "driver_sha256": driver_sha,
                 "prompt_sha256": digest(stage / "prompt.ids"), "forced_sha256": digest(stage / "forced.ids"),
@@ -642,7 +657,7 @@ def bundle(path):
     if len(rows) != 1 or rows[0]["name"] != "logits" or rows[0]["type"] != "f32" or rows[0]["op"] != LOGITS_OP:
         raise ValueError(f"{path}: requires one f32 logits tensor")
     n, vocab = rows[0].int("ne1"), rows[0].int("ne0")
-    if vocab != target["vocab"] or m.header.get("arch") != "qwen35":
+    if vocab != target["vocab"] or m.header.get("arch") != target["arch"]:
         raise ValueError(f"{path}: architecture or vocabulary differs from the immutable target")
     if rows[0].int("occurrence") != 0 or rows[0].int("ne2") != 1 or rows[0].int("ne3") != 1 or rows[0].int("bytes") != n * vocab * 4:
         raise ValueError(f"{path}: inconsistent tensor dimensions or declared bytes")
@@ -795,7 +810,8 @@ def print_floor(report, stream=sys.stdout):
 
 
 def self_test():
-    TARGETS["_selftest"] = {"sha256": "selftest-identity", "vocab": 2}
+    TARGETS["_selftest"] = {"sha256": "selftest-identity", "vocab": 2, "arch": "qwen35"}
+    TARGETS["_selftest_llama"] = {"sha256": "selftest-llama-identity", "vocab": 2, "arch": "llama"}
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         model = root / "model"
@@ -896,7 +912,8 @@ def self_test():
             if sys.byteorder != "little":
                 values.byteswap()
             (folder / "logits.0.f32").write_bytes(values.tobytes())
-            identity = {"format": MANIFEST_FORMAT, "model": "/models/selftest.gguf", "build": "same", "arch": "qwen35",
+            identity = {"format": MANIFEST_FORMAT, "model": "/models/selftest.gguf", "build": "same",
+                        "arch": TARGETS["_selftest"]["arch"],
                         "target": "_selftest", "model_sha256": TARGETS["_selftest"]["sha256"], "engine": "native",
                         "binary_sha256": "same", "backend": "cuda", "ctx": "8", "kv": "f16", "ubatch": "8",
                         "prompt_sha256": digest(folder / "prompt.ids"), "forced_sha256": digest(folder / "forced.ids")}
@@ -922,6 +939,7 @@ def self_test():
         mp.write_text(complete)
         for bad, want in ((complete.replace("# complete\t1\t0\n", ""), "incomplete"),
                           (complete.replace(TARGETS["_selftest"]["sha256"], "wrong"), "identity"),
+                          (complete.replace("# arch\tqwen35", "# arch\tllama"), "architecture"),
                           (complete.replace("tensor\tlogits\t0\tf32\t2", "tensor\tlogits\t0\tf32\t3"), "vocabulary"),
                           (complete.replace("\t1\t1\t8\t-1.0\t" + LOGITS_OP, "\t2\t1\t8\t-1.0\t" + LOGITS_OP), "dimensions"),
                           (complete.replace("\t-1.0\t" + LOGITS_OP, "\t-1.5\t" + LOGITS_OP), "sum"),
@@ -933,6 +951,27 @@ def self_test():
             except ValueError as error:
                 assert want in str(error), error
         mp.write_text(complete)
+        # Each target states its own architecture: a Llama-architecture target's set reads, and the Qwen3.5 one's
+        # `# arch` on it (or its own on a Qwen3.5 target) is refused by name.
+        folder = root / "l"
+        folder.mkdir()
+        for name in ("prompt.ids", "forced.ids", "logits.0.f32"):
+            shutil.copyfile(root / "a" / name, folder / name)
+        finish_bundle(folder, {"format": MANIFEST_FORMAT, "model": "/models/selftest.gguf", "build": "same",
+                               "arch": TARGETS["_selftest_llama"]["arch"], "target": "_selftest_llama",
+                               "model_sha256": TARGETS["_selftest_llama"]["sha256"], "engine": "native",
+                               "binary_sha256": "same", "backend": "cuda", "ctx": "8", "kv": "f16", "ubatch": "8",
+                               "prompt_sha256": digest(folder / "prompt.ids"), "forced_sha256": digest(folder / "forced.ids")},
+                      {"rows": "1", "vocab": "2", "mode": "eager", "prefill": "pass"})
+        header, _ = bundle(folder)
+        assert header["arch"] == "llama" and header["target"] == "_selftest_llama"
+        llama_set = (folder / "MANIFEST.tsv").read_text()
+        (folder / "MANIFEST.tsv").write_text(llama_set.replace("# arch\tllama", "# arch\tqwen35"))
+        try:
+            bundle(folder)
+            raise AssertionError("accepted a Llama target's set that states the Qwen3.5 architecture")
+        except ValueError as error:
+            assert "architecture" in str(error), error
         (root / "b/logits.0.f32").write_bytes(b"\0\0\0")
         try:
             raw_rows(root / "b/logits.0.f32", 1, 2)
@@ -980,7 +1019,8 @@ def self_test():
         # the trailer is the last line.
         m = manifest.read(str(root / "a"))
         assert m.complete == "1\t0" and (root / "a/MANIFEST.tsv").read_text().splitlines()[-1] == "# complete\t1\t0"
-        assert m.header["model"] == "/models/selftest.gguf" and m.header["build"] == "same" and m.header["arch"] == "qwen35"
+        assert m.header["model"] == "/models/selftest.gguf" and m.header["build"] == "same" \
+            and m.header["arch"] == TARGETS["_selftest"]["arch"]
         assert not {"prefill", "kind", "input", "int", "flags", "tokens"} & set(m.header), sorted(m.header)
         assert m.columns["tensor"] == ["kind", "name", "occurrence", "type", "ne0", "ne1", "ne2", "ne3", "bytes", "sum", "op",
                                        "contig", "logical", "src0", "src1"]
@@ -1045,7 +1085,8 @@ def self_test():
                 rows.byteswap()
             (folder / "logits.0.f32").write_bytes(rows.tobytes())
             finish_bundle(folder, {"format": MANIFEST_FORMAT, "model": "/models/selftest.gguf", "build": "53ed051ce",
-                                   "arch": "qwen35", "target": "_selftest", "model_sha256": TARGETS["_selftest"]["sha256"],
+                                   "arch": TARGETS["_selftest"]["arch"], "target": "_selftest",
+                                   "model_sha256": TARGETS["_selftest"]["sha256"],
                                    "engine": "reference", "backend": backend, "binary_sha256": "same", "ctx": "8", "kv": "f16",
                                    "ubatch": "8", "prompt_sha256": digest(folder / "prompt.ids"),
                                    "forced_sha256": digest(folder / "forced.ids")},
@@ -1081,7 +1122,7 @@ def self_test():
             raise AssertionError("floor took a twin that ran on the card")
         except ValueError as error:
             assert "floor takes a reference CUDA set" in str(error), error
-    del TARGETS["_selftest"]
+    del TARGETS["_selftest"], TARGETS["_selftest_llama"]
     print("dense-logits self-test: malformed ids, provenance, the set's family-shaped manifest, corpus slices, run and build refusals, "
           "incomplete/truncated/NaN rows, HIP placement and reserve, reset repeats, eager/graph, the oracle floor and owned-session cleanup contracts passed")
     return 0

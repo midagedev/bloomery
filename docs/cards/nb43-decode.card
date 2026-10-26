@@ -1,0 +1,19 @@
+# Nanbeige4.3-33B's first decode rows on the A6000 (a dense Llama run as a Body35 configuration). Decode is
+# bandwidth-bound [derived]: a token reads every weight once, 20,784,820,224 B of buffers (gate-gpu-llama-dense's
+# whole line), at ~700 GB/s for kernels near the card's roof (AGENTS.md) = 29.7 ms; the graph's 52 layers' launches
+# ~1.5 ms beside it: ~31 ms, 32 tok/s. At depth 4096 the cache adds 52 x 2 x 8 x 128 x 2 B x 4096 = 872 MB a token,
+# +1.2 ms: ~31 tok/s. The band widens the roof to 600..720 GB/s.
+kind: baseline
+question: what does bloomery decode Nanbeige4.3-33B Q4_K_M at on the RTX A6000, and llama.cpp beside it?
+term: decode tok/s @ depth 6 and 4096, generate_qwen3moe (BLOOMERY_MODEL=nanbeige43 just depth-gpu-qwen3moe), A6000
+unit: tok/s
+predict: 27..34
+condition: depth-gpu-qwen3moe in its own lease on the A6000 (TIMING_GPU), ours and the reference arms interleaved
+  (BLOOMERY_DEPTHS="6 4096"), the reference preheated; the witness shows no other model load, no [cpu-busy] or
+  [other-busy] row, and each ours row's whole-fit line the dense whole load
+reason: the first public decode rows of a new model (AGENTS.md: a decode headline names its depth); why now: the
+  landing's gates are green and the rows go into the PR and the model's table
+decide-in: write the rows into the model's A6000 table with the lease and witness
+decide-below: read the step's per-node profile (BLOOMERY_PROFILE) against the 29.7 ms weight read: a node far over
+  its bytes' time is the next round
+decide-above: re-derive the weight bytes a step reads (a layer read twice would show below, a skipped one above)

@@ -77,6 +77,7 @@ crates/gpu-gates/src/bin/generate.rs	deepseek	4	baseline T 4: case-table rows, t
 crates/gpu-gates/src/bin/generate.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/h2d_probe.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/probe_nvread.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/shared/dense_e2e.rs	qwen	16	PIN(2026-10-26) qwen: the dense e2e gate both Body35 dense families share opens the body through qwen35_open and names its model type Qwen35moeModel; a program-named body type and open path would remove them
 crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
@@ -88,7 +89,7 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program 
 crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	4	baseline P 6: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	21	baseline P 24: MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
-crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	13	baseline S 13: MK9 seat by program
+crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	12	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
 crates/gpu-gates/src/bin/shared/state_back.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/vision_taps.rs	clef	1	baseline D 1: media design: VideoRule data per tower (vidcore)
@@ -139,7 +140,7 @@ crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
 crates/model/src/arch/coverage.rs	glm	18	baseline P 21: MK2 program by body
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
 crates/model/src/arch/coverage.rs	nemotron	35	baseline P 36: MK2 program by body
-crates/model/src/arch/coverage.rs	qwen	58	baseline P 63: MK2 program by body
+crates/model/src/arch/coverage.rs	qwen	60	PIN(2026-10-26) qwen: main's row (baseline P 63, 58 lines) + 2, the group-7 flash and NORM-rope rows name Program::Qwen35Body, the one program that launches them; the program would own its rows instead of the list naming programs (MK2)
 crates/model/src/arch/draft.rs	mimo	3	baseline D 4: MK1a draft usability as an ArchRow row
 crates/model/src/arch/draft.rs	qwen	13	baseline D 15: MK1a draft usability as an ArchRow row
 crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
@@ -216,3 +217,7 @@ crates/gpu-gates/src/record.rs	muse	4	PIN(2026-10-23) muse: MK12 per-bin Kind st
 crates/model/src/arch/coverage.rs	muse	25	PIN(2026-10-23) muse: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the musespark body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/hf/src/vocab.rs	minimax	3	PIN(2026-10-23) minimax: the minimax-m2 pre-tokenizer's name, regex and pipeline row; tokenizer programs are not yet described by ModelSpec
 crates/gpu-gates/src/prompts.rs	deepseek	1	PIN(2026-10-23) deepseek: the measured logit σ is named for the one family it was measured on (SIGMA_LOGIT_V41); other families carry it in their gate description until their own is measured
+crates/gpu-gates/src/bin/shared/routed_legs.rs	llama	2	PIN(2026-10-26) llama: family_of and skip_of match every models::Arch exhaustively; the dense trunk has no routed-legs adapter
+crates/model/src/arch/mod.rs	llama	2	PIN(2026-10-26) llama: the family's module declaration (`pub mod llama;`) and the SentencePiece rule's tokenizer-model word; the module list is not a registry
+crates/models/src/lib.rs	llama	2	PIN(2026-10-26) llama: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
+crates/placement/src/accepts.rs	llama	1	PIN(2026-10-26) llama: program_of matches every models::Arch exhaustively, so the variant needs its arm to the Qwen35Body program
