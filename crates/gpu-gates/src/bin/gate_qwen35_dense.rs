@@ -5,24 +5,8 @@
 //! file fits either card, so the gate holds the same clauses in both tiers. `gate_clef_hidden` holds the trunk's
 //! hidden-state band on the same geometry; this gate does not repeat it.
 //!
-//! What is asserted:
-//! - (a) load: the whole-fit verdict's weights term, the buffers the load uploaded and the header derivation
-//!   (`weights::part_format` of every tensor but `blk.64.*`) are the same bytes; no `blk.64` tensor is resident;
-//!   the verdict's cache term and the body's store bytes are their derivation from the header's geometry.
-//! - (b) oracle: for each set (the 64- and 4,096-id prompts, 32 teacher-forced rows each) the prompt call and the
-//!   forced decode steps' logits rows against mainline's CUDA rows: each row's relative L2 within [`REL_BAND`],
-//!   the median within [`MEDIAN_BAND`], the 90th percentile within [`P90_BAND`]; and the argmax equal on every row
-//!   whose reference top-2 margin exceeds its stability bound ([`STABLE_K`] times the oracle's own spread on that row,
-//!   mainline's CPU twin against its CUDA rows); the rows at or under it are counted and pinned ([`OTHER_ROWS`]).
-//! - (c) graph = eager = pass: five tokens as graph decode steps, one pass of five rows, eager steps and graph steps
-//!   after a `reset`, each leaving the same logits, tokens and every layer's store bit for bit.
-//! - (d) reset: a 600-id sequence with 8 greedy steps, a `reset`, a shorter sequence, a `reset`, the first again: the
-//!   two runs equal bit for bit (logits, tokens, every store).
-//! - (e) checkpoints: a prompt of [`KP`] ids takes its points at the ubatch's multiples and its end; one checkpoint's
-//!   bytes and slots are their derivation; a cut to a non-checkpoint is refused by name; a cut to the last inner mark
-//!   and the re-fed tail equal the uncut call bit for bit; a `reset` drops every point.
-//! - (f) slots: the slots harness (`slots_gate`, H1-H7) over two streams on one load, a pass of one row a slot equal to
-//!   each alone, the pass refusals and each slot's checkpoints its own.
+//! The clauses (a) to (f) are the shared dense-gate module's (`shared/dense_e2e.rs`, the same code for every dense
+//! Body35 file); this bin is the Qwen3.8-27B's row of it: the file, its sets, its header's geometry and the bands below.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -42,27 +26,15 @@ mod qwen35_open;
 mod q35_clauses;
 
 #[cfg(feature = "gpu")]
-mod gate {
-    use super::q35_clauses::{
-        self as q35, Geometry35, PathRun, Slots35, fresh, lcg_ids, same_run, stores, uncut_call,
-    };
-    use super::qwen35_open;
-    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
-    use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::weights::part_format;
-    use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::{
-        GateError, checks_failed, data_dir, gpu_census, kld, quantile, ref_model_path, verdict,
-    };
-    use gguf::{GgmlType, Split};
-    use refset::arch::qwen35::dense::{ForcedLogits, MODEL, P64, P4096};
-    use std::path::Path;
+#[path = "shared/dense_e2e.rs"]
+mod dense_e2e;
 
-    /// The cache every clause loads: the oracle sets' context (a 4,096-id prompt and 31 forced steps fit), with the room
-    /// the checkpoint clause's marks need.
-    const CTX: usize = 4352;
-    /// The load's ubatch: four units of the 4,096-id prompt, marks at its multiples.
-    const U_GATE: usize = 1024;
+#[cfg(feature = "gpu")]
+mod gate {
+    use super::dense_e2e::{self, Bands, Row};
+    use super::q35_clauses::Geometry35;
+    use bloomery_gpu_gates::GateError;
+    use refset::arch::qwen35::dense::{MODEL, P64, P4096, Qwen38d};
 
     /// The real file's literals, beside the geometry its header gives (the move proof, `Geometry35::of`).
     const REAL: Geometry35 = Geometry35 {
@@ -101,404 +73,25 @@ mod gate {
     /// sets or the twin moved, not the engine.
     const OTHER_ROWS: [usize; 2] = [20, 17];
 
-    /// Greedy steps after each prompt of (d).
-    const D_STEPS: usize = 8;
-    /// (d)'s two prompts: the longer first, the shorter after a `reset`, so no row of the first lies past the second's.
-    const D_LONG: usize = 600;
-    const D_SHORT: usize = 64;
-
-    /// (e)'s prompt: past two marks (1,024 and 2,048) with a run of 200 ids left after them, short of the third.
-    const KP: usize = 2 * U_GATE + 200;
-
-    /// (f)'s streams, A and B: each past the load's first mark by a run the mark keeps.
-    const SLOT_A: usize = U_GATE + 16;
-    const SLOT_B: usize = U_GATE + 32;
-
-    /// The oracle's two sets, with the row counts they hold.
-    const SETS: [(&str, usize); 2] = [(P64, 64), (P4096, 4096)];
-
-    fn load(path: &Path) -> Result<(Qwen35moeModel, Split), GateError> {
-        qwen35_open::open(path, CTX, U_GATE)
-    }
-
-    /// `(‖a − b‖₂, max |a − b|, ‖b‖₂)` in f64; a NaN reads infinite.
-    fn norms(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
-        let (mut num, mut den, mut max) = (0.0f64, 0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            let e = f64::from(x) - f64::from(y);
-            num += e * e;
-            den += f64::from(y).powi(2);
-            max = if e.is_nan() {
-                f64::INFINITY
-            } else {
-                max.max(e.abs())
-            };
-        }
-        let l2 = if num.is_nan() {
-            f64::INFINITY
-        } else {
-            num.sqrt()
-        };
-        (l2, max, den.sqrt())
-    }
+    /// The Qwen3.8-27B's row: the scalar flash (the file's group of 6 runs the pairs' pass, which has no tensor-core
+    /// form).
+    const ROW: Row = Row {
+        gate: "gate_qwen35_dense",
+        model: MODEL,
+        sets: [P64, P4096],
+        real: REAL,
+        unused_block: Some(UNUSED_BLOCK),
+        mma: false,
+        bands: Bands {
+            rel: REL_BAND,
+            median: MEDIAN_BAND,
+            p90: P90_BAND,
+            stable_k: STABLE_K,
+            other_rows: OTHER_ROWS,
+        },
+    };
 
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
-        let path = ref_model_path()?;
-        println!("gate_qwen35_dense: {}", path.display());
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let geom = Geometry35::of(&split)?;
-        let witness = geom == REAL;
-        println!(
-            "geometry from the header {geom:?} (the real file's {REAL:?}{}) {}",
-            if path == Path::new(MODEL) {
-                ""
-            } else {
-                ", another file"
-            },
-            verdict(witness || path != Path::new(MODEL))
-        );
-        let mut ok = witness || path != Path::new(MODEL);
-        drop(split);
-
-        // `--only <a-f>` runs one clause (the FAIL-first mutants' loop); no flag runs them all.
-        let only = std::env::args().skip_while(|a| a != "--only").nth(1);
-        let want = |c: &str| only.as_deref().is_none_or(|o| o == c);
-        if let Some(o) = &only
-            && !["a", "b", "c", "d", "e", "f"].contains(&o.as_str())
-        {
-            return Err(format!("--only {o}: a clause is one of a, b, c, d, e, f").into());
-        }
-        let vocab = if ["a", "b", "c", "d", "e"].iter().any(|c| want(c)) {
-            let o = Open35 {
-                ctx: CTX,
-                mma: false,
-                ubatch: U_GATE,
-                kv: KvQ8::F16,
-                media: false,
-            };
-            if want("a") {
-                ok &= load_clause(&path, o, geom)?;
-            }
-            let (mut m, split) = load(&path)?;
-            if want("a") {
-                ok &= resident_clause(&m, &split, geom)?;
-            }
-            drop(split);
-            m.set_mode(StepMode::Graph);
-            let mut sets = Vec::new();
-            for (name, _) in SETS {
-                sets.push(ForcedLogits::open(&data_dir().join(name))?);
-            }
-            if want("b") {
-                println!("(b) forced logits rows against mainline's CUDA rows");
-                for (i, (name, prompt)) in SETS.iter().enumerate() {
-                    ok &= oracle(&mut m, name, *prompt, &sets[i], OTHER_ROWS[i])?;
-                }
-            }
-            if want("c") {
-                println!("(c) graph = eager = pass");
-                let toks: Vec<u32> = sets[0].prompt.iter().take(5).copied().collect();
-                ok &= q35::paths(&mut m, &toks)?.0;
-            }
-            if want("d") {
-                ok &= reset_clause(&mut m)?;
-            }
-            if want("e") {
-                ok &= checkpoint_clause(&mut m, geom)?;
-            }
-            m.body("gate_qwen35_dense")?.vocab()
-        } else {
-            let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-            split
-                .find("token_embd.weight")
-                .map(|(_, t)| t.dims[1] as usize)
-                .ok_or("the file holds no token_embd.weight")?
-        };
-
-        if want("f") {
-            println!("(f) resident slots: the harness's contracts over two lcg streams");
-            expect_q6k_head(&path)?;
-            let slots = Slots35::new(
-                lcg_ids(SLOT_A + SLOT_B, vocab),
-                SLOT_A,
-                (U_GATE, CTX),
-                (geom, 1 + 2 * geom.n_delta + 3 * geom.n_attn),
-                Box::new(move || load(&path).map(|(m, _)| m)),
-            )?;
-            ok &= q35::slots_two(&slots)?;
-        }
-        if ok { Ok(()) } else { Err(checks_failed()) }
-    }
-
-    /// The head is Q6_K, else refused by name: the slots adapter's pass-node count is the Q6_K head's.
-    fn expect_q6k_head(path: &Path) -> Result<(), GateError> {
-        let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let ty = split.find("output.weight").map(|(_, t)| t.ty);
-        match ty {
-            Some(GgmlType::Q6_K) => Ok(()),
-            other => Err(format!(
-                "output.weight is {other:?}; the slots derivation is written for Q6_K"
-            )
-            .into()),
-        }
-    }
-
-    /// Tensors of the header but `blk.64.*`: `(name, resident bytes)` by `weights::part_format`.
-    fn derived_weights(split: &Split) -> Result<Vec<(String, usize)>, GateError> {
-        split
-            .iter_tensors()
-            .map(|(_, t)| t)
-            .filter(|t| !t.name.starts_with(UNUSED_BLOCK))
-            .map(|t| {
-                part_format(t)
-                    .map(|(_, bytes)| (t.name.clone(), bytes))
-                    .map_err(Into::into)
-            })
-            .collect()
-    }
-
-    /// (a), the verdict half, before the load: the whole-fit line, its weights and cache terms against the derivation.
-    fn load_clause(path: &Path, o: Open35, geom: Geometry35) -> Result<bool, GateError> {
-        println!(
-            "(a) load: the whole-fit verdict and the header derivation without {UNUSED_BLOCK}*"
-        );
-        let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let census = gpu_census::census()?;
-        let card = Place::A.on(&census)?.card_specs()?[0];
-        let need = qwen35_open::whole_verdict(&split, o, card, &|_| {})?;
-        println!("  whole fit at ctx {CTX}: {need}");
-        let derived: usize = derived_weights(&split)?.iter().map(|d| d.1).sum();
-        let all: usize = split
-            .iter_tensors()
-            .map(|(_, t)| part_format(t).unwrap_or_else(|e| panic!("{e}")).1)
-            .sum();
-        let kv = geom.store_bytes(CTX) as u64;
-        let ok = need.weights_unrounded == derived as u64 && need.kv == kv && all > derived;
-        println!(
-            "  verdict weights {} B of buffers, derived {derived} B (with {UNUSED_BLOCK}* {all} B, {} B more); cache {} \
-             B, derived {kv} B ({} attention layers' K/V planes of 2 x {} heads x {CTX} x {} f16 + {} layers' state \
-             and conv ring) {}",
-            need.weights_unrounded,
-            all - derived,
-            need.kv,
-            geom.n_attn,
-            geom.n_kv,
-            geom.head,
-            geom.n_delta,
-            verdict(ok)
-        );
-        Ok(ok)
-    }
-
-    /// (a), the load half: the weights the load holds against the derivation, name for name; none is `blk.64.*`; the
-    /// body's stores are the geometry's.
-    fn resident_clause(
-        m: &Qwen35moeModel,
-        split: &Split,
-        geom: Geometry35,
-    ) -> Result<bool, GateError> {
-        let want = derived_weights(split)?;
-        let w = m.weights();
-        let names: Vec<&str> = w.names().filter(|n| !n.starts_with("derived.")).collect();
-        let held: usize = names
-            .iter()
-            .filter_map(|n| w.get(n))
-            .map(|d| d.resident_bytes())
-            .sum();
-        let want_names: Vec<&str> = want.iter().map(|d| d.0.as_str()).collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        let mut want_sorted = want_names.clone();
-        want_sorted.sort_unstable();
-        let unused = names.iter().filter(|n| n.starts_with(UNUSED_BLOCK)).count();
-        let derived: usize = want.iter().map(|d| d.1).sum();
-        let stores = m.body("gate_qwen35_dense")?.store_bytes();
-        let ok = sorted == want_sorted
-            && held == derived
-            && unused == 0
-            && stores == geom.store_bytes(CTX);
-        println!(
-            "  resident: {} file tensors {held} B (derived {derived} B over {} tensors), {unused} of {UNUSED_BLOCK}* \
-             resident; stores {stores} B (derived {} B); resident_bytes {} B {}",
-            names.len(),
-            want.len(),
-            geom.store_bytes(CTX),
-            m.resident_bytes(),
-            verdict(ok)
-        );
-        Ok(ok)
-    }
-
-    /// The prompt call and the forced steps of `set` on `m` from a `reset`: the logits row after the prompt, then after
-    /// each forced id fed.
-    fn rows_of(m: &mut Qwen35moeModel, set: &ForcedLogits) -> Result<Vec<Vec<f32>>, GateError> {
-        m.reset()?;
-        <Body35 as app::Prompt>::prompt(m, &set.prompt)?;
-        let mut rows = vec![m.logits()?];
-        for &id in &set.forced[..set.rows() - 1] {
-            m.step(&[id])?;
-            rows.push(m.logits()?);
-        }
-        Ok(rows)
-    }
-
-    /// (b) on one set: the clause's bands, the stability rule and the pinned count of rows under it.
-    fn oracle(
-        m: &mut Qwen35moeModel,
-        name: &str,
-        prompt: usize,
-        set: &ForcedLogits,
-        other: usize,
-    ) -> Result<bool, GateError> {
-        let twin_dir = data_dir().join(format!("{name}.cpu"));
-        let twin = ForcedLogits::open_cpu(&twin_dir)?;
-        if twin.prompt != set.prompt || twin.forced != set.forced || set.prompt.len() != prompt {
-            return Err(format!(
-                "{name}: its twin is not the CPU run of the same prompt and forced ids"
-            )
-            .into());
-        }
-        let ours = rows_of(m, set)?;
-        let (mut rel, mut flips_stable, mut stable, mut under, mut flips_under) =
-            (Vec::new(), 0usize, 0usize, 0usize, 0usize);
-        let mut worst = (0.0f64, 0usize);
-        for (i, row) in ours.iter().enumerate() {
-            let reference = set.row(i);
-            if row.len() != reference.len() {
-                return Err(format!(
-                    "{name} row {i}: {} logits, the set's {}",
-                    row.len(),
-                    reference.len()
-                )
-                .into());
-            }
-            let (l2, _, norm) = norms(row, reference);
-            rel.push(l2 / norm);
-            if l2 / norm > worst.0 || l2.is_infinite() {
-                worst = (l2 / norm, i);
-            }
-            let (twin_l2, twin_max, _) = norms(twin.row(i), reference);
-            let bound = STABLE_K * f64::min(2.0 * twin_max, std::f64::consts::SQRT_2 * twin_l2);
-            let (ours_top, _, _, _) = kld::top2(row);
-            let (ref_top, first, _, second) = kld::top2(reference);
-            let margin = f64::from(first) - f64::from(second);
-            if margin > bound {
-                stable += 1;
-                flips_stable += usize::from(ours_top != ref_top);
-            } else {
-                under += 1;
-                flips_under += usize::from(ours_top != ref_top);
-            }
-        }
-        let (median, p90) = (quantile(&rel, 0.5), quantile(&rel, 0.9));
-        let ok = rel.iter().all(|&r| r <= REL_BAND)
-            && median <= MEDIAN_BAND
-            && p90 <= P90_BAND
-            && flips_stable == 0
-            && under == other;
-        println!(
-            "  {name}: {} rows after {prompt} ids; rel L2 median {median:.4} (band {MEDIAN_BAND}), p90 {p90:.4} (band \
-             {P90_BAND}), worst {:.4} at row {} (band {REL_BAND}); argmax equal on {}/{stable} stable rows; {under} \
-             rows at or under their stability bound (pinned {other}), {flips_under} of them flipped {}",
-            ours.len(),
-            worst.0,
-            worst.1,
-            stable - flips_stable,
-            verdict(ok)
-        );
-        Ok(ok)
-    }
-
-    /// `ids` as one prompt call and `steps` greedy steps from the model's state, every position's logits and token and
-    /// every store read back.
-    fn sequence(m: &mut Qwen35moeModel, ids: &[u32], steps: usize) -> Result<PathRun, GateError> {
-        let mut tok = <Body35 as app::Prompt>::prompt(m, ids)?;
-        let (mut logits, mut tokens) = (vec![m.logits()?], vec![tok]);
-        for _ in 0..steps {
-            tok = m.step(&[tok])?;
-            logits.push(m.logits()?);
-            tokens.push(tok);
-        }
-        Ok(PathRun {
-            logits,
-            tokens,
-            stores: stores(m)?,
-        })
-    }
-
-    /// (d): the first sequence again after a `reset`, a shorter sequence between, equal bit for bit.
-    fn reset_clause(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
-        println!("(d) reset: the same sequence after a reset and another sequence");
-        let vocab = m.body("gate_qwen35_dense")?.vocab();
-        let (long, short) = (lcg_ids(D_LONG, vocab), lcg_ids(D_SHORT, vocab));
-        fresh(m)?;
-        let first = sequence(m, &long, D_STEPS)?;
-        m.reset()?;
-        sequence(m, &short, D_STEPS)?;
-        m.reset()?;
-        let again = sequence(m, &long, D_STEPS)?;
-        Ok(same_run(
-            "the first sequence after a reset and a shorter one",
-            &again,
-            &first,
-        ))
-    }
-
-    /// (e): the checkpoints of a marked prompt call and a cut with its re-fed tail (module doc).
-    fn checkpoint_clause(m: &mut Qwen35moeModel, geom: Geometry35) -> Result<bool, GateError> {
-        println!("(e) checkpoints: the points, the cut, the re-feed and the reset");
-        m.body_parts("gate_qwen35_dense")?.2.set_checkpoints(true);
-        let ids = lcg_ids(KP, m.body("gate_qwen35_dense")?.vocab());
-        let ub = u32::try_from(m.ubatch()?)?;
-        let c = m.body("gate_qwen35_dense")?.checkpoints();
-        let want_bytes = geom.checkpoint_bytes() as u64;
-        let fit = runtime::seqstate::capacity(runtime::seqstate::HOST_BUDGET, want_bytes)
-            .map_err(|e| e.to_string())?;
-        let want_slots = (CTX.div_ceil(ub as usize) + 1).min(fit);
-        let bytes_ok = c.bytes() == want_bytes && c.capacity() == want_slots;
-        println!(
-            "  one copy {} B (derived {want_bytes} B), {} slots (want {want_slots}) {}",
-            c.bytes(),
-            c.capacity(),
-            verdict(bytes_ok)
-        );
-        let uncut = uncut_call(m, &ids)?;
-        let want_pts: Vec<u32> = (1..)
-            .map(|k| ub * k)
-            .take_while(|&p| p < KP as u32)
-            .chain([KP as u32])
-            .collect();
-        let body = m.body("gate_qwen35_dense")?;
-        let (pts, walks) = (body.checkpoints().positions(), body.prompt_walks());
-        let walks_want = (KP as u32).div_ceil(ub) as usize;
-        let points_ok = pts == want_pts && walks == walks_want;
-        println!(
-            "  a prompt of {KP} ids took its points at {pts:?} (want {want_pts:?}), {walks} walks (want {walks_want}) {}",
-            verdict(points_ok)
-        );
-        let ask = (KP - 50) as u32;
-        let refused = m
-            .rollback(ask)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        let refused_ok = refused.contains("no checkpoint restores it")
-            && m.body("gate_qwen35_dense")?.checkpoints().positions() == want_pts;
-        println!(
-            "  a cut to {ask}: {refused}; the points stand {}",
-            verdict(refused_ok)
-        );
-        let cut_at = ub * (ask / ub);
-        let refed_ok = q35::refed_after_cut(m, &ids, cut_at, &uncut, &want_pts, ub)?;
-        fresh(m)?;
-        let dropped = m
-            .body("gate_qwen35_dense")?
-            .checkpoints()
-            .positions()
-            .is_empty();
-        println!("  a reset drops every point {}", verdict(dropped));
-        m.set_mode(StepMode::Graph);
-        Ok(bytes_ok && points_ok && refused_ok && refed_ok && dropped)
+        dense_e2e::run::<Qwen38d>(&ROW)
     }
 }

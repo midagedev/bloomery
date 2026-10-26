@@ -27,7 +27,9 @@
 //! call. A call that does not follow the markup (no name, text where a tag
 //! belongs, a value without its key, a key given twice, a value its schema
 //! types as JSON that is not JSON) and a call still open when the stream ends
-//! are a [`KvError`], never content and never dropped. The call a scan has
+//! are a [`KvError`], never content and never dropped; the chat parser reads a
+//! generation the token limit cut inside a call as an answer, not as this error
+//! ([`crate::dsml::ChatParser::try_finish_at`]). The call a scan has
 //! opened and not closed is reported as it is read ([`Scanned::open`]): its
 //! name once a tag follows it, and the arguments so far, a prefix of the
 //! arguments the call closes with, the text of a `"string"` argument as it
@@ -199,6 +201,17 @@ pub enum KvError {
         ty: String,
         value: String,
     },
+}
+
+impl KvError {
+    /// The text of the call the generation ended inside, when that is the whole fault: markup that
+    /// read as the template's so far and was not closed.
+    pub(crate) fn unclosed(&self) -> Option<String> {
+        match self {
+            KvError::Unterminated { text, .. } => Some(text.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// What a tool schema says of one argument.

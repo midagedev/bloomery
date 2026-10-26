@@ -688,6 +688,11 @@ pub struct ChatParser {
     /// `Some` for a stream that sends a call as it is read
     /// ([`ChatParser::streaming_calls`]).
     streamer: Option<Streamer>,
+    /// The call the last push left open once its name was read.
+    open: Option<Progress>,
+    /// Whether a call the token limit cuts after its name stays a call
+    /// ([`ChatParser::keeping_cut_call`]).
+    keep_cut: bool,
     total: Message,
 }
 
@@ -744,6 +749,8 @@ impl ChatParser {
                 Tools::MuseSpark => Scan::Muse(crate::museatem::MuseScan::default()),
             }),
             streamer: None,
+            open: None,
+            keep_cut: false,
             total: Message::default(),
         }
     }
@@ -758,6 +765,16 @@ impl ChatParser {
     #[must_use]
     pub fn streaming_calls(mut self) -> Self {
         self.streamer = Some(Streamer::default());
+        self.keeping_cut_call()
+    }
+
+    /// The same parser, answering a generation the token limit cuts inside a call after its name
+    /// is read ([`ChatParser::try_finish_at`]) with that call and the arguments read so far,
+    /// as llama-server's chat route does. The default gives the call's text back as content,
+    /// for an answer whose call shape holds only closed calls.
+    #[must_use]
+    pub fn keeping_cut_call(mut self) -> Self {
+        self.keep_cut = true;
         self
     }
 
@@ -840,6 +857,7 @@ impl ChatParser {
             Some(Scan::Qwen(q)) => Some(q.push(&split.content)?),
             Some(Scan::Muse(m)) => Some(m.push(&split.content)),
         };
+        self.open = scanned.as_ref().and_then(|s| s.open.clone());
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
     }
@@ -847,18 +865,38 @@ impl ChatParser {
     /// Releases everything held at the end of the generation, or names the
     /// tool call still open.
     pub fn try_finish(&mut self) -> Result<Message, MarkupError> {
+        self.try_finish_at(false)
+    }
+
+    /// [`ChatParser::try_finish`] for a generation that the token limit cut (`cut`) or that
+    /// ended on its own. llama-server parses the end of the text as the end of the input, so a
+    /// cut inside a call is no fault there: its answer holds what was read, and its
+    /// `finish_reason` `length` says the generation was cut. The same here, for every scan that
+    /// refuses an open call: a call the markup has begun well and the limit cut is content (the
+    /// text it consumed, as the DSML scan gives an open block back), or, once its name was read
+    /// and the parser keeps it ([`ChatParser::keeping_cut_call`]), a call with the arguments read.
+    /// A call that ended without the limit, and markup that already read wrong, stay errors.
+    pub fn try_finish_at(&mut self, cut: bool) -> Result<Message, MarkupError> {
         // An open span's tail is reasoning; the scanner has seen none of it.
         let split = self
             .think
             .as_mut()
             .map(ThinkSplit::finish)
             .unwrap_or_default();
+        let kept = self.open.as_ref().filter(|_| self.keep_cut);
         let scanned = match &mut self.scan {
             None => None,
-            Some(Scan::Dsml(d)) => Some(d.finish()),
-            Some(Scan::Kv(k)) => Some(k.finish()?),
-            Some(Scan::Hermes(h)) => Some(h.finish()?),
-            Some(Scan::Qwen(q)) => Some(q.finish()?),
+            Some(Scan::Dsml(d)) => {
+                let released = d.finish();
+                Some(match kept.filter(|_| cut) {
+                    Some(p) => cut_call(p),
+                    None => released,
+                })
+            }
+            Some(Scan::Kv(k)) => Some(ended(k.finish(), KvError::unclosed, cut, kept)?),
+            Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, kept)?),
+            Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, kept)?),
+            // The scan closes a message the stream ends inside as its call on its own.
             Some(Scan::Muse(m)) => Some(m.finish()),
         };
         self.stream(scanned.as_ref())?;
@@ -906,6 +944,44 @@ impl ChatParser {
         }
         self.total.append(&d);
         d
+    }
+}
+
+/// A scan's end of text. `released` is its release; when the limit cut (`cut`) the generation
+/// inside a call it reads as the template's so far (`unclosed`: the text of that call, from the
+/// scan's own error), the answer holds what was read of that call instead of its error: the `kept`
+/// call (its name read) with the arguments so far, else the text it consumed as content.
+fn ended<E: Into<MarkupError>>(
+    released: Result<Scanned, E>,
+    unclosed: fn(&E) -> Option<String>,
+    cut: bool,
+    kept: Option<&Progress>,
+) -> Result<Scanned, MarkupError> {
+    let e = match released {
+        Err(e) if cut => e,
+        released => return released.map_err(Into::into),
+    };
+    let Some(text) = unclosed(&e) else {
+        return Err(e.into());
+    };
+    Ok(match kept {
+        Some(p) => cut_call(p),
+        None => Scanned {
+            content: text,
+            ..Scanned::default()
+        },
+    })
+}
+
+/// The call a cut left open, as the arguments read so far spell it.
+fn cut_call(p: &Progress) -> Scanned {
+    Scanned {
+        calls: vec![ToolCall {
+            index: p.index,
+            name: p.name.clone(),
+            arguments: p.args.clone(),
+        }],
+        ..Scanned::default()
     }
 }
 

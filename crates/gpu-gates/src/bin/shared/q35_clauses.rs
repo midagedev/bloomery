@@ -29,13 +29,14 @@ pub struct Geometry35 {
 
 impl Geometry35 {
     /// The geometry `split`'s header gives: every attention layer's heads and every delta layer's state shape must
-    /// agree, else the file is refused by name here, before a derivation is written against a mixed one.
+    /// agree, else the file is refused by name here, before a derivation is written against a mixed one. A trunk of
+    /// attention layers alone is legal: its description holds no delta layer, and the delta fields are zero.
     #[allow(
         dead_code,
         reason = "the dense gate reads its geometry off the header; the MoE gate states its constants"
     )]
     pub fn of(split: &Split) -> Result<Geometry35, GateError> {
-        let spec = model::arch::qwen35moe::spec::read(split)
+        let spec = model::arch::spec(split)
             .map_err(|e| format!("the header: {e}"))?
             .spec;
         let (mut attn, mut delta): (Option<[usize; 3]>, Option<[usize; 3]>) = (None, None);
@@ -59,7 +60,7 @@ impl Geometry35 {
                     ],
                     &mut n_delta,
                 ),
-                _ => return Err(format!("layer {l}: neither a gated GQA nor a delta rule").into()),
+                _ => return Err(format!("layer {l}: neither a GQA nor a delta rule").into()),
             };
             if slot.is_some_and(|seen| seen != got) {
                 return Err(
@@ -69,9 +70,10 @@ impl Geometry35 {
             *slot = Some(got);
             *n += 1;
         }
-        let (Some([n_kv, head, _]), Some([n_v, head_v, conv_c])) = (attn, delta) else {
-            return Err("the file holds no gated GQA layer or no delta layer".into());
+        let Some([n_kv, head, _]) = attn else {
+            return Err("the file holds no attention layer".into());
         };
+        let [n_v, head_v, conv_c] = delta.unwrap_or([0; 3]);
         Ok(Geometry35 {
             n_attn,
             n_delta,
@@ -607,13 +609,25 @@ pub fn slots_two(a: &Slots35) -> Result<bool, GateError> {
     let a_held = (a.state_hash(m)?, points(m)?);
     m.select_slot(1)?;
     let b_held = (a.state_hash(m)?, points(m)?, m.pos());
-    let taken = a_held.1 == [mark, ends[0]] && b_held.1 == [mark, ends[1]];
+    // A trunk with a delta layer takes the mark and each prompt's end; one without holds no store to copy, so no point.
+    let (want_a, want_b, why) = if a.geom.n_delta > 0 {
+        (
+            vec![mark, ends[0]],
+            vec![mark, ends[1]],
+            "the mark and each prompt's end",
+        )
+    } else {
+        (
+            Vec::new(),
+            Vec::new(),
+            "none: no layer holds a store to copy",
+        )
+    };
+    let taken = a_held.1 == want_a && b_held.1 == want_b;
     println!(
-        "slots points: slot 0 {:?}, slot 1 {:?} (want [{mark}, {}] and [{mark}, {}]: the mark and each prompt's end) {}",
+        "slots points: slot 0 {:?}, slot 1 {:?} (want {want_a:?} and {want_b:?}: {why}) {}",
         a_held.1,
         b_held.1,
-        ends[0],
-        ends[1],
         verdict(taken)
     );
     // Slot 1 cut back to the mark; slot 0 runs before slot 1 does again.

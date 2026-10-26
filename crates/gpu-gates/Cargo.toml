@@ -732,6 +732,14 @@ name = "gate_qwen35_dense"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_llama_dense"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_llama_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "clef_hidden"
 required-features = ["gpu"]
 

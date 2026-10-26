@@ -185,7 +185,7 @@ fn machine(
         .as_slice()
     {
         &[stage] => machine_for_experts(stage, layers, ub, Experts::Card),
-        &[_, _] => q38place::machine_bp38(place, layers, ub, None, tier_batch(&inputs.hp, ub))
+        &[_, _] => q38place::machine_bp38(place, layers, ub, None, tier_batch(&inputs.spec, ub))
             .map_err(|e| outcome_of(e.as_ref()))?,
         cards => {
             return Err(Outcome::Red(format!(

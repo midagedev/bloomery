@@ -16,7 +16,7 @@ fn run() -> Result<(), GateError> {
     };
     let file = Split::open(path)?;
     let arch = file.architecture().unwrap_or("<missing>");
-    if qwen_seat::Family::from_name(arch) != Some(qwen_seat::Family::Qwen35) {
+    if qwen_seat::Family::of(&file).ok() != Some(qwen_seat::Family::Qwen35) {
         return Err(format!("{path}: expected dense qwen35, got {arch}").into());
     }
     let hp = Hparams::read(&file)?;

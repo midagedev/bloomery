@@ -291,16 +291,19 @@ models (the --model word is optional with a model file: the file's architecture 
             }
         }
 
-        /// Whether a file of architecture `arch` (its `general.architecture`
-        /// string) is this seat's. `qwen4exp` is not an `Arch` name, which
-        /// is why the seat of a file is read from the string; the glm seat
-        /// takes both spellings of its architecture through [`Arch::from_name`].
-        fn serves(self, arch: &str) -> bool {
+        /// Whether the file whose first shard is `file` is this seat's. The qwen3 seat
+        /// serves a file by the program that runs its description's layers
+        /// ([`bloomery_gpu_gates::qwen_seat::Family::of`]); the other seats read the file's
+        /// `general.architecture` string: `qwen4exp` is not an `Arch` name, which is why
+        /// the seat of such a file is read from the string, and the glm seat takes both
+        /// spellings of its architecture through [`Arch::from_name`].
+        fn serves(self, file: &Split) -> bool {
+            let arch = file.architecture().unwrap_or("<missing>");
             match self {
                 Model::Ds41 => matches!(arch, "deepseek41" | DEEPSEEK4),
                 Model::Qwen38 => arch == "qwen4exp",
                 Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
-                Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe" | "qwen35"),
+                Model::Qwen3 => bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok(),
                 Model::Mimo2 => arch == "mimo2",
                 Model::Solar2 => matches!(Arch::from_name(arch), Ok(Arch::SolarOpen2)),
                 Model::MinimaxM3 => matches!(Arch::from_name(arch), Ok(Arch::MiniMaxM3)),
@@ -347,19 +350,20 @@ models (the --model word is optional with a model file: the file's architecture 
             .join(", ")
     }
 
-    /// The seat the model file's ([`ref_model_path`]) first shard holds, with
-    /// its `general.architecture` string: the one generative seat that serves
-    /// the architecture ([`Model::serves`]; the string itself, not an `Arch`
-    /// variant, because `qwen4exp` is no `Arch` name). A file of a decision
+    /// The seat the model file's ([`ref_model_path`]) first shard holds: the one
+    /// generative seat that serves the file ([`Model::serves`]). A file of a decision
     /// row's backbone (`qwen35`, Clef's) here has no head: its refusal
     /// ([`serve::decide::no_head`]) says what would seat it. An explicit
     /// generative word admits a dense qwen35 file through the existing Qwen
-    /// seat. Any other architecture, and a shard that names none, is refused by name listing
-    /// the seat words. A qwen35moe file (Qwen3.6) is the qwen3 seat's.
-    fn seat_of_file(generative: bool) -> Result<(Model, String), GateError> {
+    /// seat. Any other file, and a shard that names no architecture, is refused by name
+    /// listing the seat words; an explicit seat word that is not the file's seat is
+    /// refused naming the file's. A file the Qwen3.5 body runs (Qwen3.6, a dense
+    /// `llama` trunk) is the qwen3 seat's.
+    fn seat_of_file(word: Option<Word>) -> Result<Model, GateError> {
+        let generative = matches!(word, Some(Word::Seat(Model::Qwen3)));
         let path = ref_model_path()?;
         model_file::with_header(&path, |split| {
-            let (seat, arch) = match split.architecture() {
+            let seat = match split.architecture() {
                 Some(a) if side_seat::row(a).is_some() => {
                     return Err(format!(
                         "{} is a {a} file, an embedding model: serve it beside a chat model with \
@@ -376,14 +380,24 @@ models (the --model word is optional with a model file: the file's architecture 
                     )
                     .into());
                 }
-                Some(a) => (
-                    Model::ALL
+                Some(a) => {
+                    let seat = Model::ALL
                         .iter()
                         .copied()
-                        .find(|m| m.serves(a))
-                        .ok_or_else(|| no_seat(&path, split, a))?,
-                    a.to_owned(),
-                ),
+                        .find(|m| m.serves(split))
+                        .ok_or_else(|| no_seat(&path, split, a))?;
+                    if let Some(Word::Seat(word)) = word
+                        && !word.serves(split)
+                    {
+                        return Err(format!(
+                            "--model {} on a {a} file, which serves --model {}",
+                            word.word(),
+                            seat.word()
+                        )
+                        .into());
+                    }
+                    seat
+                }
                 None => {
                     return Err(format!(
                         "{}: the first shard names no architecture; the seats are --model {}",
@@ -393,7 +407,7 @@ models (the --model word is optional with a model file: the file's architecture 
                     .into());
                 }
             };
-            Ok((seat, arch))
+            Ok(seat)
         })?
     }
 
@@ -423,14 +437,16 @@ models (the --model word is optional with a model file: the file's architecture 
     }
 
     /// The `general.architecture` of the model file's first shard
-    /// ([`ref_model_path`]) and its `<arch>.decision.type`, when it has one.
-    fn file_facts() -> Result<(String, Option<String>), GateError> {
+    /// ([`ref_model_path`]), its `<arch>.decision.type` when it has one, and whether a
+    /// generative seat serves the file ([`Model::serves`]).
+    fn file_facts() -> Result<(String, Option<String>, bool), GateError> {
         let path = ref_model_path()?;
         model_file::with_header(&path, |split| {
             let decision = model_file::decision_type(split)?.map(str::to_owned);
             Ok((
                 split.architecture().unwrap_or("<missing>").to_owned(),
                 decision,
+                Model::ALL.iter().any(|m| m.serves(split)),
             ))
         })?
     }
@@ -444,7 +460,7 @@ models (the --model word is optional with a model file: the file's architecture 
         rest: &[String],
     ) -> Result<(Option<decide::Pick>, Vec<String>), GateError> {
         let (given, rest) = serve::decide::take_head(rest)?;
-        let (arch, decision) = file_facts()?;
+        let (arch, decision, served) = file_facts()?;
         let ask = Ask {
             head: given.head.as_deref(),
             head_config: given.config.as_deref(),
@@ -454,7 +470,7 @@ models (the --model word is optional with a model file: the file's architecture 
             decision: decision.as_deref(),
             // A qwen35 repo can name a decision head in its card. Keep that
             // inference with no --model; an explicit qwen3 word opts into generation.
-            generative: arch != "qwen35" && Model::ALL.iter().any(|m| m.serves(&arch)),
+            generative: arch != "qwen35" && served,
         };
         let from = serve::decide::pick(&ask, decide::ROWS, &mut |r| {
             model_file::quantized_from(r).map_err(|e| e.to_string())
@@ -557,23 +573,10 @@ models (the --model word is optional with a model file: the file's architecture 
             };
             return ended(decide::run(&rest, from, repo.as_deref()));
         }
-        let (seat, arch) = match seat_of_file(matches!(word, Some(Word::Seat(Model::Qwen3)))) {
+        let seat = match seat_of_file(word) {
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };
-        if let Some(Word::Seat(word)) = word
-            && !word.serves(&arch)
-        {
-            return exit_with(
-                NAME,
-                Err(format!(
-                    "--model {} on a {arch} file, which serves --model {}",
-                    word.word(),
-                    seat.word()
-                )
-                .into()),
-            );
-        }
         // llama-server's placement flags and variables, read once the seat is known: the levers some
         // are, and the `--place` word the others come to.
         let seat_word = || -> Result<&'static str, GateError> { Ok(seat.word()) };

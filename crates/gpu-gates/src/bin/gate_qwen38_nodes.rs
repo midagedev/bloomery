@@ -277,7 +277,7 @@ mod gate {
                 layers,
                 ub,
                 None,
-                tier_batch(&self.inputs.hp, ub),
+                tier_batch(&self.inputs.spec, ub),
             ))
         }
 
@@ -292,7 +292,7 @@ mod gate {
                 self.inputs.spec.layers.len(),
                 ub,
                 None,
-                tier_batch(&self.inputs.hp, ub),
+                tier_batch(&self.inputs.spec, ub),
             )
         }
 
@@ -680,7 +680,7 @@ mod gate {
             c.inputs.model.layers,
             stage,
             &[spec],
-            tier_batch(&c.inputs.hp, c.ub as u64),
+            tier_batch(&c.inputs.spec, c.ub as u64),
         )?;
         if machines.len() != 2 {
             return Err("the census plan omitted a node".into());
@@ -691,7 +691,7 @@ mod gate {
             &PlanLevers::default(),
             Experts::Card,
         )?;
-        let terms = Terms::of(&stage_plan, c.inputs.hp.n_embd as u64);
+        let terms = Terms::of(&stage_plan, u64::from(c.inputs.spec.hidden));
         let mut budgets = vec![NodeBudget::of(&stage_plan)];
         for remote in &machines[1..] {
             budgets.push(NodeBudget::routed(
@@ -1675,7 +1675,7 @@ mod gate {
         let mut read_terms = None;
         let mut wire = Vec::new();
         if decode.is_some() {
-            read_terms = Some(Terms::of(&plan, u64::try_from(c.inputs.hp.n_embd)?)?);
+            read_terms = Some(Terms::of(&plan, u64::from(c.inputs.spec.hidden))?);
             let tiers = s.model().body(NAME)?.hybrid().tiers();
             for tier in tiers {
                 let layout = tier.page_layout(tiers.len())?;

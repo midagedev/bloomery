@@ -1,8 +1,10 @@
-//! The NeoX gates' host inputs, expected outputs, device launch and readback.
+//! The rope gates' host inputs, expected outputs, device launch and readback: the NeoX
+//! launch with its per-head norm and the NORM launch without one.
 
 use crate::{GateError, activations, bits_equal, verdict};
 use bloomery_gpu::fault::{Fault, FaultSink, FaultSite};
 use bloomery_gpu::rope_neox::PartialNeoxArgs;
+use bloomery_gpu::rope_norm::NormArgs;
 use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
 use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -145,6 +147,24 @@ pub fn check<const H: usize, const R: usize, const Q: usize>(
         verdict(pass)
     );
 
+    let fault_ok = cache_pos_fault(gpu, &a, pos, s, layer, &run_at)?;
+    Ok(pass && fault_ok)
+}
+
+/// A rope launch whose last token sits at the cache's height raises
+/// `cache_pos` with the launch's layer, leaves that token's heads NaN and
+/// appends nothing; every other token and plane row is the clean run `a`'s,
+/// and a rerun after it leaves the word clean.
+fn cache_pos_fault(
+    gpu: &Gpu,
+    a: &RopeOut,
+    pos: &[u32],
+    s: RopeShape,
+    layer: usize,
+    run_at: &impl Fn(&[u32], FaultSink) -> Result<RopeOut, GateError>,
+) -> Result<bool, GateError> {
+    let (m, ctx, head) = (pos.len(), s.ctx, s.head);
+    let unl = gpu.unlabelled_sink();
     // The last token's position at the cache's height.
     let bad_t = m - 1;
     let mut bad = pos.to_vec();
@@ -154,7 +174,7 @@ pub fn check<const H: usize, const R: usize, const Q: usize>(
     let r = run_at(&bad, sink)?;
     let raised = gpu.take_fault()?;
     let want_fault = Some(Fault::at(u32::try_from(layer)?, FaultSite::CachePos));
-    let (qw, kw) = (s.n_head * H, s.n_kv * H);
+    let (qw, kw) = (s.n_head * head, s.n_kv * head);
     let others = bits_equal(&r.q[..bad_t * qw], &a.q[..bad_t * qw])
         && bits_equal(&r.k[..bad_t * kw], &a.k[..bad_t * kw]);
     let nan = r.q[bad_t * qw..].iter().all(|v| v.is_nan())
@@ -163,9 +183,9 @@ pub fn check<const H: usize, const R: usize, const Q: usize>(
     let mut ck_want = a.ck.clone();
     let mut cv_want = a.cv.clone();
     for j in 0..s.n_kv {
-        let row = (j * ctx + pos[bad_t] as usize) * H;
-        ck_want[row..row + H].fill(SENTINEL);
-        cv_want[row..row + H].fill(SENTINEL);
+        let row = (j * ctx + pos[bad_t] as usize) * head;
+        ck_want[row..row + head].fill(SENTINEL);
+        cv_want[row..row + head].fill(SENTINEL);
     }
     let not_appended = r.ck == ck_want && r.cv == cv_want;
     let again = run_at(pos, unl)?;
@@ -179,7 +199,7 @@ pub fn check<const H: usize, const R: usize, const Q: usize>(
          {clean_after} {}",
         verdict(fault_ok)
     );
-    Ok(pass && fault_ok)
+    Ok(fault_ok)
 }
 
 /// A head of values whose squares overflow the f32 products — query head 0
@@ -296,6 +316,132 @@ pub fn run(
             table: &table,
             pos: &posd,
             eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+            cache_k: &mut ck,
+            cache_v: &mut cv,
+        },
+    )?;
+    stream.synchronize()?;
+    Ok(RopeOut {
+        q: q.to_host_vec(stream)?,
+        k: k.to_host_vec(stream)?,
+        ck: ck.to_host_vec(stream)?,
+        cv: cv.to_host_vec(stream)?,
+    })
+}
+
+/// Host rows and position table of a no-norm NORM rope launch: the query rows
+/// (turned in place), the key rows (turned in place) and the value rows, token-major, head
+/// after head, `head` values each, and the table of `ctx` rows of `head` f32.
+#[derive(Clone)]
+pub struct NormIn {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub table: Vec<f32>,
+}
+
+/// Expected heads and cache planes under the host NORM rule
+/// ([`crate::rounding::norm_head`]): the query and key heads turned, the planes'
+/// rows the f16 (nearest even) of the turned key and of the value, every other
+/// plane word the sentinel.
+#[must_use]
+pub fn expected_norm<const H: usize>(inp: &NormIn, pos: &[u32], s: RopeShape) -> RopeOut {
+    assert_eq!(s.head, H);
+    let (nh, nk, ctx) = (s.n_head, s.n_kv, s.ctx);
+    let mut out = RopeOut {
+        q: vec![0.0; pos.len() * nh * H],
+        k: vec![0.0; pos.len() * nk * H],
+        ck: vec![SENTINEL; nk * ctx * H],
+        cv: vec![SENTINEL; nk * ctx * H],
+    };
+    for (t, &p) in pos.iter().enumerate() {
+        let cs = &inp.table[p as usize * H..(p as usize + 1) * H];
+        for h in 0..nh {
+            let at = (t * nh + h) * H;
+            out.q[at..at + H]
+                .copy_from_slice(&crate::rounding::norm_head::<H>(&inp.q[at..at + H], cs));
+        }
+        for h in 0..nk {
+            let at = (t * nk + h) * H;
+            let y = crate::rounding::norm_head::<H>(&inp.k[at..at + H], cs);
+            out.k[at..at + H].copy_from_slice(&y);
+            let row = (h * ctx + p as usize) * H;
+            for d in 0..H {
+                out.ck[row + d] = gguf::quant::f32_to_f16_bits(y[d]);
+                out.cv[row + d] = gguf::quant::f32_to_f16_bits(inp.v[at + d]);
+            }
+        }
+    }
+    out
+}
+
+/// Check exact NORM output, reruns and isolated cache-position faults.
+pub fn check_norm<const H: usize>(
+    gpu: &Gpu,
+    inp: &NormIn,
+    pos: &[u32],
+    s: RopeShape,
+    layer: usize,
+    run_at: impl Fn(&[u32], FaultSink) -> Result<RopeOut, GateError>,
+) -> Result<bool, GateError> {
+    let (m, p0, ctx) = (pos.len(), pos[0], s.ctx);
+    let unl = gpu.unlabelled_sink();
+    let a = run_at(pos, unl)?;
+    let b = run_at(pos, unl)?;
+    let want = expected_norm::<H>(inp, pos, s);
+    let q_ok = bits_equal(&a.q, &want.q);
+    let k_ok = bits_equal(&a.k, &want.k);
+    let planes_ok = a.ck == want.ck && a.cv == want.cv;
+    let rerun = bits_equal(&a.q, &b.q) && bits_equal(&a.k, &b.k) && a.ck == b.ck && a.cv == b.cv;
+    let pass = q_ok && k_ok && planes_ok && rerun;
+    println!(
+        "rope norm m={m} positions {p0}.. ctx={ctx} head {H}: q in place bit_exact_host={q_ok} \
+         k in place bit_exact_host={k_ok} planes_exact={planes_ok} rerun={rerun} {}",
+        verdict(pass)
+    );
+    let fault_ok = cache_pos_fault(gpu, &a, pos, s, layer, &run_at)?;
+    Ok(pass && fault_ok)
+}
+
+/// Check distinct positions, enqueue the NORM rope and read its outputs.
+pub fn run_norm(
+    stream: &CudaStream,
+    inp: &NormIn,
+    pos: &[u32],
+    shape: RopeShape,
+    fault: FaultSink,
+    enqueue: impl FnOnce(&CudaStream, NormArgs<'_>) -> Result<(), GpuError>,
+) -> Result<RopeOut, GateError> {
+    check_cache_positions(pos, shape.ctx, shape.ctx)?;
+    let RopeShape {
+        head,
+        n_head,
+        n_kv,
+        ctx,
+        ..
+    } = shape;
+    let m = pos.len();
+    let mut q = DeviceBuffer::from_host(stream, &inp.q)?;
+    let mut k = DeviceBuffer::from_host(stream, &inp.k)?;
+    let v = DeviceBuffer::from_host(stream, &inp.v)?;
+    let table = DeviceBuffer::from_host(stream, &inp.table)?;
+    let posd = DeviceBuffer::from_host(stream, pos)?;
+    let plane = vec![SENTINEL; n_kv * ctx * head];
+    let mut ck = DeviceBuffer::from_host(stream, &plane)?;
+    let mut cv = DeviceBuffer::from_host(stream, &plane)?;
+    enqueue(
+        stream,
+        NormArgs {
+            q: &mut q,
+            k: &mut k,
+            v: &v,
+            table: &table,
+            pos: &posd,
             n_head,
             n_kv,
             ctx,

@@ -351,8 +351,16 @@ mod gate {
             Experts::Card,
             1,
         )?;
-        let hp = &inputs.hp;
-        Ok((plan.n_l.clone(), hp.n_embd, hp.expert_ff, hp.n_used))
+        let routed = inputs
+            .spec
+            .routed()
+            .ok_or("the description holds no routed layer")?;
+        Ok((
+            plan.n_l.clone(),
+            inputs.spec.hidden as usize,
+            routed.expert_ff as usize,
+            routed.top_k as usize,
+        ))
     }
 
     // ----------------------------------------------------------------- clause 3

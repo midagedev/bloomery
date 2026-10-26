@@ -97,7 +97,7 @@ pub fn tier_experts(
         inputs.spec.layers.len(),
         ub,
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
-        tier_batch(&inputs.hp, ub),
+        tier_batch(&inputs.spec, ub),
     )?;
     beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;
@@ -120,7 +120,7 @@ pub fn ctx_choice(
     mut holds: impl FnMut(u64) -> Result<(), GateError>,
 ) -> Result<Chosen<()>, GateError> {
     choose_ctx_of(
-        u64::try_from(inputs.hp.n_ctx_train)?,
+        u64::from(inputs.spec.ctx_train),
         asked,
         (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
         |c| match holds(c) {

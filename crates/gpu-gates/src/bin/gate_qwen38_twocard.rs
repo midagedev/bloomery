@@ -964,7 +964,7 @@ mod gate {
             .into());
         }
         let layers = inputs.spec.layers.len();
-        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
+        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.spec, ub as u64));
         let Chosen { plan, tight, .. } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
         let ids = prose_ids("qwen4exp", PROMPT_4K)?;
@@ -1548,7 +1548,7 @@ mod gate {
             gib,
             host,
             ub,
-            shape: crate::q38_arch::shape_of(&inputs.hp)?,
+            shape: crate::q38_arch::shape_of(&inputs.spec)?,
             windows: [a0.to_vec(), a1.to_vec()],
         };
         let plan = a.plan(slots_gate::STREAMS)?;
@@ -1599,7 +1599,7 @@ mod gate {
         tier::plan_levers(&split, &levers, 0)?;
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
-        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
+        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.spec, ub as u64));
         let Chosen {
             plan,
             tight: tight_3k,

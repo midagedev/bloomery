@@ -416,9 +416,9 @@ mod gate {
         let draft = draft_path(&levers, &path)?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
-        let shape = crate::q38_arch::shape_of(&inputs.hp)?;
+        let shape = crate::q38_arch::shape_of(&inputs.spec)?;
         let header_budget = tier::header_budget(&file)?;
-        let n_expert = inputs.hp.n_expert;
+        let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {
             path,
             draft,
@@ -6361,7 +6361,7 @@ mod gate {
         );
 
         let head_file = open_target()?;
-        let host = Host::open(&head_file, &draft, inputs.hp.rms_eps)?;
+        let host = Host::open(&head_file, &draft, inputs.spec.rms_eps)?;
         m.set_mtp_taps(true)?;
         let mut r = Replay::new();
         let mut last = None;

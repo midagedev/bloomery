@@ -16,8 +16,9 @@ use bloomery_gpu::arch::qwen3moe::KvQ8;
 use bloomery_gpu::model::Engine;
 use bloomery_gpu::{Deepseek2Model, Gpu, GpuError, Qwen3moeModel};
 use gguf::Split;
-use model::arch::{self, Arch, coverage, models};
+use model::arch::{self, Arch, coverage};
 use model::placement::PlacementError;
+use model::placement::accepts::{Program, program_of};
 
 /// The architectures whose program is a placed load of its own, or that no program runs: refused
 /// by name before any load. An architecture not listed here goes by its description.
@@ -46,13 +47,15 @@ impl AnyEngine {
     /// chain and output head with a `ctx`-row cache: deepseek2 through its
     /// `open` (every weight on the card, or the hybrid load its levers ask
     /// for); any other architecture by its description
-    /// ([`model::arch::spec`]) — qwen3moe through its `open` (the whole model
-    /// on one card, with the ubatch size and the flash pass its levers name,
-    /// read here) once the coverage check finds nothing it cannot run.
-    /// A file of an architecture whose program is a placed load of its own
-    /// is [`GpuError::UnsupportedArch`] here, before any load; a file whose
-    /// description has parts no program runs is refused with every such
-    /// part listed. deepseek2 has no description reader and
+    /// ([`model::arch::spec`]) — a file whose program is the qwen3moe body's
+    /// ([`program_of`]) through its `open` (the whole model on one card, with
+    /// the ubatch size and the flash pass its levers name, read here) once the
+    /// coverage check finds nothing it cannot run; a file of any other program
+    /// is [`GpuError::UnsupportedArch`] (the Qwen3.5 body has no arm here: its
+    /// bins open it themselves). A file of an architecture whose program is a
+    /// placed load of its own is [`GpuError::UnsupportedArch`] too, before any
+    /// load; a file whose description has parts no program runs is refused
+    /// with every such part listed. deepseek2 has no description reader and
     /// dispatches on the architecture string. The engine takes the file.
     pub fn open(file: Split, ctx: usize) -> Result<AnyEngine, GpuError> {
         const WHAT: &str = "AnyEngine::open";
@@ -74,15 +77,15 @@ impl AnyEngine {
         if !missing.is_empty() {
             return Err(GpuError::plan(WHAT, PlacementError::Unimplemented(missing)));
         }
-        match read.spec.arch {
-            models::Arch::Qwen3Moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::open(
+        match program_of(read.spec.arch) {
+            Some(Program::Qwen3moeBody) => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::open(
                 Gpu::new()?,
                 file,
                 // The f16 cache: this harness runs no cache lever (the
                 // binaries through it refuse the name set).
                 Qwen3moeModel::lever_opts(ctx, KvQ8::F16)?,
             )?)),
-            a => Err(GpuError::UnsupportedArch(a.name().to_string())),
+            _ => Err(GpuError::UnsupportedArch(read.spec.arch.name().to_string())),
         }
     }
 }

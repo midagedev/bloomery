@@ -78,7 +78,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   its own) and MiMo-V2.6 (the same tags, a value bare between them: `<parameter=KEY>VALUE</parameter>`) parse into
   `tool_calls` and `tool_use` blocks, so agent clients work against each of them. Which of the two framings a
   template uses is read from the call it renders, not from its name, and a `tool_choice` that forces a call writes
-  it in that framing.
+  it in that framing. A generation the token limit cuts inside a call is an answer, as llama-server answers it:
+  200 with `finish_reason` `length` (`stop_reason` `max_tokens`), the call's text as `content` while its name is not
+  whole and, on the chat route, the call with the arguments read so far once it is; a generation that ends on its own
+  inside a call is a 500 naming the call.
   DeepSeek-V4.1 writes its DSML tags with a space after the token (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`,
   `<｜DSML｜ parameter>`), V4 without (`<｜DSML｜tool_calls>`). The V4.1 GGUFs carry V4's template, so a
   `general.architecture` `deepseek41` file is served with that template respelled as V4.1's (the template llama.cpp
@@ -143,6 +146,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
   auto context nearly doubles on the same card; `--cache-type-v` does not exist, both planes quantize together),
+  `-ub/--ubatch-size N` (the qwen3 seat and the decide seat, on a file with no routed expert, whose only load is the
+  whole one: that many tokens a prompt ubatch, or a refusal by name with the bytes it needs and a smaller size as
+  the remedy; unset, the load takes the largest of 4096, 2048, 1024 and 512 the card holds at the asked context and
+  slots, and one `ubatch` line names the sizes it tried; a routed file takes `BLOOMERY_QWEN3_UBATCH` and refuses
+  the flag),
   `--host/--port`, `--alias`, `--mmproj <file>` and `--no-mmproj` (image input, below).
 - **The model's name** (`/v1/models` `id`, the `model` of every answer, `/props` `model_alias`) is `--alias`, else the
   GGUF's `general.name`, else the seat's own default. llama-server's default is the model file's name; this server

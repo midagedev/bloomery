@@ -53,6 +53,7 @@ use std::sync::Arc;
 use bloomery_gpu::media::{ImageShape, ImageSpan, MediaBody, MediaSpan};
 use cuda_core::CudaContext;
 use gguf::Gguf;
+use model::arch::models::{Mixer, ModelSpec, NgramRule, RopeMode};
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::minicpmv::{self, Group};
@@ -303,6 +304,39 @@ pub struct TextFacts {
     pub ple: PleImage,
 }
 
+impl TextFacts {
+    /// The facts of a description whose every attention layer rotates by IMROPE over one set of
+    /// sections: its width, those sections, and no per-layer embedding.
+    ///
+    /// # Errors
+    /// A description with no attention layer, an attention layer that rotates otherwise, or two
+    /// attention layers with different sections.
+    pub fn of_imrope(spec: &ModelSpec) -> Result<TextFacts, GateError> {
+        let mut sections = None;
+        for (layer, l) in spec.layers.iter().enumerate() {
+            let Mixer::Gqa(g) = &l.mixer else { continue };
+            let RopeMode::Imrope { sections: s } = g.rope.mode else {
+                return Err(
+                    format!("layer {layer}: the attention does not rotate by IMROPE").into(),
+                );
+            };
+            if *sections.get_or_insert(s) != s {
+                return Err(format!(
+                    "layer {layer}: the attention rotates over sections {s:?}, not the first layer's {sections:?}"
+                )
+                .into());
+            }
+        }
+        let sections =
+            sections.ok_or("the description holds no attention layer to rotate by IMROPE")?;
+        Ok(TextFacts {
+            n_embd: spec.hidden as usize,
+            imrope: Some(sections),
+            ple: PleImage::Absent,
+        })
+    }
+}
+
 /// A text model's `ple.image_token_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PleImage {
@@ -322,6 +356,16 @@ impl PleImage {
             None => PleImage::Absent,
             Some(image) => image.map_or(PleImage::NoKey, PleImage::Id),
         }
+    }
+
+    /// The PLE site of `spec` as [`PleImage::of`] reads it: the description's n-gram site of the
+    /// PLE rule, none for a description with no site or one of another rule.
+    #[must_use]
+    pub fn of_spec(spec: &ModelSpec) -> PleImage {
+        PleImage::of(spec.engram.as_ref().and_then(|e| match e.rule {
+            NgramRule::Ple { image, .. } => Some(image),
+            NgramRule::Engram => None,
+        }))
     }
 }
 

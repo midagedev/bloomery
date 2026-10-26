@@ -4092,9 +4092,11 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         prompt,
         mut parser,
     } = plan;
-    if p.stream {
-        parser = parser.streaming_calls();
-    }
+    parser = if p.stream {
+        parser.streaming_calls()
+    } else {
+        parser.keeping_cut_call()
+    };
     let ids_meta = ChatIds {
         id: format!("chatcmpl-{}", state.random_id()),
         created: unix_now(),
@@ -4109,7 +4111,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             Err(e) => send_error(w, req, &e),
             Ok((o, _)) => match parser
                 .try_push(&o.content)
-                .and_then(|_| parser.try_finish())
+                .and_then(|_| parser.try_finish_at(o.cut()))
             {
                 Ok(_) => {
                     let lp = p
@@ -4215,7 +4217,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }])),
             )?;
         }
-        let d = match parser.try_finish() {
+        let d = match parser.try_finish_at(o.cut()) {
             Ok(d) => d,
             Err(e) => {
                 let e = tool_markup_error(&e);

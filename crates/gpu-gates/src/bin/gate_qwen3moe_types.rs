@@ -201,6 +201,16 @@ mod gate {
             u32v("expert_used_count", 8),
             u32v("expert_feed_forward_length", 256),
             u32v("vocab_size", 16),
+            // The serve seat reads the file's description, chat surface included, before it picks the
+            // load: a served file names its pre-tokenizer, as every qwen3moe file does.
+            (
+                "tokenizer.ggml.model".to_owned(),
+                gguf::Value::String("gpt2".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.pre".to_owned(),
+                gguf::Value::String("qwen2".to_owned()),
+            ),
         ];
         let tensor =
             |name: &str, dims: &[u64], ty: u32| -> Result<gguf::write::TensorDecl, GateError> {

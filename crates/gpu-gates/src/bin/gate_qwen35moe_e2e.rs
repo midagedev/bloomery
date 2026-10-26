@@ -439,7 +439,7 @@ mod gate {
     use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::models::Mixer;
     use model::arch::models::shape::{AttnShape, MoeShape};
-    use model::arch::qwen35moe::hparams::Hparams;
+    use model::arch::qwen35moe::hparams::Kind;
     use model::arch::qwen35moe::names;
     use model::placement::PlanLevers;
     use model::placement::accepts::{self, LegSplit};
@@ -763,13 +763,25 @@ mod gate {
         ik_set(&fixture, set)
     }
 
-    /// The shape of `split` from its header: the layer kinds the model
-    /// crate's header reader gives (cross-checked there with the tensors and
-    /// the interval) and the type of each site the launch rules read, from the
-    /// split's tensor table. Returns the file's hyperparameters with it.
-    fn header_shape(split: &Split) -> Result<(Hparams, Shape), GateError> {
-        let hp = Hparams::read(split)?;
-        let kinds = hp.kinds.clone();
+    /// The shape of `split` from its header: the layer kinds the file's
+    /// description gives (cross-checked by its reader with the tensors and the
+    /// interval) and the type of each site the launch rules read, from the
+    /// split's tensor table. Returns the embedding width with it.
+    fn header_shape(split: &Split) -> Result<(usize, Shape), GateError> {
+        let spec = model::arch::spec(split)?.spec;
+        let kinds = spec
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(l, layer)| match &layer.mixer {
+                Mixer::DeltaRule(_) => Ok(Kind::DeltaRule),
+                Mixer::Gqa(_) => Ok(Kind::Attention),
+                other => Err(GateError::from(format!(
+                    "layer {l} mixes with {}, which has no launch rules here",
+                    other.what()
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let shape = Shape::from_header(&kinds, |l, site| {
             let name = match site {
                 Site::AttnQkv => names::attn_qkv(l),
@@ -793,7 +805,7 @@ mod gate {
                 .map(|(_, t)| t.ty)
                 .ok_or_else(|| GateError::from(format!("the file holds no {name}")))
         })?;
-        Ok((hp, shape))
+        Ok((spec.hidden as usize, shape))
     }
 
     /// Read the file's header once: the path the tier names, the levers, the
@@ -805,12 +817,11 @@ mod gate {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let (hp, shape) = header_shape(&file)?;
-        if hp.n_embd != HIDDEN {
+        let (n_embd, shape) = header_shape(&file)?;
+        if n_embd != HIDDEN {
             return Err(format!(
-                "{} has an embedding width of {}, the derivations here are written for {HIDDEN}",
+                "{} has an embedding width of {n_embd}, the derivations here are written for {HIDDEN}",
                 path.display(),
-                hp.n_embd
             )
             .into());
         }
@@ -821,7 +832,7 @@ mod gate {
             host: levers.host(),
             plan_levers,
             shape,
-            n_embd: hp.n_embd,
+            n_embd,
         };
         if CFG.set(cfg).is_err() {
             return Err("the gate's configuration was read twice".into());

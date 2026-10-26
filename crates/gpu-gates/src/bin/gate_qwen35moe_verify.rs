@@ -357,10 +357,10 @@ mod gate {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let inputs = PlanInputs::describe(&file)?;
         let inputs = match lanes {
-            Some(l) => inputs.with_lanes(l),
+            Some(l) => inputs.with_lanes(l)?,
             None => inputs,
         };
-        let sum: u64 = (0..inputs.hp.n_trunk)
+        let sum: u64 = (0..inputs.spec.layers.len())
             .map(|l| inputs.kv.layer_bytes(l, CTX as u64))
             .sum();
         Ok(usize::try_from(sum)?)

@@ -50,13 +50,14 @@ pub fn serve_default(split: &Split) -> Result<String, String> {
         kv: KvQ8::F16,
         media: false,
         beside: Default::default(),
+        ubatch: None,
     };
     let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
         .map_err(|e| format!("the --ctx choice refused: {e}"))?;
     let total = usize::try_from(chosen.total).map_err(|e| e.to_string())?;
     let line = chosen.line();
     let u = match chosen.plan {
-        q3place::ServeLoad::Whole(card) => q3place::Unplaced::Whole(card),
+        q3place::ServeLoad::Whole(on) => q3place::Unplaced::Whole(on.card),
         q3place::ServeLoad::Placed { q, .. } => q3place::Unplaced::Placed(q),
     };
     let how = held(split, &u, total, whole_refuses)?;

@@ -33,7 +33,9 @@
 //! function or a parameter the request's tools do not name, one parameter
 //! twice, a value its schema types JSON that is not JSON — and a call still
 //! open when the stream ends are a [`QwenXmlError`], never content and never
-//! dropped. The call a scan has opened and not closed is reported as it is read
+//! dropped; the chat parser reads a generation the token limit cut inside a
+//! call as an answer, not as this error ([`crate::dsml::ChatParser::try_finish_at`]).
+//! The call a scan has opened and not closed is reported as it is read
 //! ([`Scanned::open`]): its name once `<function=NAME>` is whole, and the
 //! arguments so far, a prefix of the arguments the call closes with, the text
 //! of a string parameter as it arrives. Every decision depends on the text
@@ -48,21 +50,12 @@ use crate::constrain::{Fun, Part, Refusal, Style, call, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
-/// Opens a call.
-pub const CALL_OPEN: &str = "<tool_call>";
-/// Closes a call.
-pub const CALL_CLOSE: &str = "</tool_call>";
-/// Opens the call's function, its name to the `>` (`<function=NAME>`).
-pub const FUNCTION_OPEN: &str = "<function=";
-/// Closes the function.
-pub const FUNCTION_CLOSE: &str = "</function>";
-/// Opens a parameter, its name to the `>` (`<parameter=KEY>`).
-pub const PARAM_OPEN: &str = "<parameter=";
-/// Closes a parameter.
-pub const PARAM_CLOSE: &str = "</parameter>";
-/// Ends a [`Framing::Lines`] value: the newline before the tag and the one
-/// after it are the markup's own.
-const PARAM_VALUE_CLOSE: &str = "\n</parameter>\n";
+// The format's markup is its description's (the models crate's `function_xml`, not this crate's `models` module),
+// the strings the template table names a file's format by.
+use ::models::function_xml::PARAM_VALUE_CLOSE;
+pub use ::models::function_xml::{
+    CALL_CLOSE, CALL_OPEN, FUNCTION_CLOSE, FUNCTION_OPEN, PARAM_CLOSE, PARAM_OPEN,
+};
 
 /// How a template frames a parameter's value, a fact of the template that its
 /// rendered call shows ([`Framing::of_rendered`]): one parser reads both.
@@ -167,6 +160,17 @@ pub enum QwenXmlError {
         ty: String,
         value: String,
     },
+}
+
+impl QwenXmlError {
+    /// The text of the call the generation ended inside, when that is the whole fault: markup that
+    /// read as the template's so far and was not closed.
+    pub(crate) fn unclosed(&self) -> Option<String> {
+        match self {
+            QwenXmlError::Unterminated { text, .. } => Some(text.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// What a parameter's schema says of its value.

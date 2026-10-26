@@ -290,6 +290,13 @@ pub(crate) struct Outcome {
     pub timings: Timings,
 }
 
+impl Outcome {
+    /// Whether the token limit ended the generation (`finish_reason` `length`).
+    pub(crate) fn cut(&self) -> bool {
+        self.stop == StopKind::Limit
+    }
+}
+
 /// What the loop hands its sink.
 pub(crate) enum Event<'a> {
     /// The prompt is evaluated (llama-server's `prompt_progress`, sent once, complete).

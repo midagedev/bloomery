@@ -37,6 +37,8 @@ pub mod image_plan;
 #[cfg(feature = "gpu")]
 pub mod iq_rows;
 pub mod kld;
+#[cfg(feature = "gpu")]
+pub mod kv_planes;
 pub mod llama_launch;
 pub mod llama_place;
 pub mod logit_rows;
@@ -71,6 +73,7 @@ pub mod slots_gate;
 pub mod swiglu_host;
 pub mod tap_dump;
 pub mod tier;
+pub mod ubatch_pick;
 // The image encoder's pieces the serve seats share; the tower itself is `bloomery-gpu-vision`'s, behind `vision`.
 #[cfg(any(feature = "vision", feature = "deepseek41"))]
 pub mod vision_seat;

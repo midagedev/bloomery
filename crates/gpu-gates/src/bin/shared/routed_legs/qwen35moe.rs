@@ -49,6 +49,7 @@ fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
         kv: KvQ8::F16,
         media: false,
         beside: Default::default(),
+        ubatch: None,
     };
     let total = floor_or(
         q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts).map(|(chosen, _)| chosen.total),

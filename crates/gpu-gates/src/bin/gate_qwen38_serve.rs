@@ -3756,7 +3756,7 @@ mod gate {
                 "--ctx asks {over} positions a slot, past this model's limit of {limit} \
                  ({source}; the file was trained at {}): the load stops; ask {limit} or fewer a \
                  slot",
-                inputs.hp.n_ctx_train
+                inputs.spec.ctx_train
             ))
         };
         let listened = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
@@ -4819,7 +4819,7 @@ mod gate {
     /// within `place::KERNEL_POSITIONS`.
     fn limit38(inputs: &PlanInputs) -> Result<(u64, &'static str), GateError> {
         Ok(CtxLimit {
-            trained: u64::try_from(inputs.hp.n_ctx_train)?,
+            trained: u64::from(inputs.spec.ctx_train),
             kernel: Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")),
             verified: None,
         }

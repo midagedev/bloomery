@@ -18,6 +18,11 @@
 //!   `answers` hold every question of the request and whose last key is
 //!   `timings`, with `prompt_n` above 0; `/v1/chat/completions` is a 404
 //!   (the seat serves its row's routes only);
+//! - `decide_ubatch_is_the_cards_pick`: the backbone is a dense whole load, so its prompt ubatch is the card's
+//!   verdict: the server's stderr holds `ubatch` lines (`ubatch_pick`) none of which is the user's, each
+//!   judged by its own terms (the largest of 4096, 2048, 1024 and 512 within what the card had) with a pick;
+//!   `-ub 0` is refused by name before any load (`decide_ubatch_flag_is_checked`). FAIL-first: a seat that
+//!   opens at its own size prints no line and the clause is red;
 //! - `speaks_llama_cpps_wire` (llama.cpp's `/v1/systemone`, its server at
 //!   `a4cb4c61`): the answer's `model` is the server's name for the model
 //!   (the file's name under `-m`), not the request's; `/v1/models` lists
@@ -102,6 +107,7 @@ mod gate {
     use std::path::{Path, PathBuf};
 
     use bloomery_gpu_gates::serve_client::{self, Served, curl};
+    use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::{GateError, checks_failed};
     use decision::encode::NO_IMAGE_INPUT;
     use decision::head::HeadConfig;
@@ -901,6 +907,14 @@ mod gate {
             &["the head reads hidden states of width 16"],
         )?;
         check(&mut ok, "narrow_head", pass);
+        let pass = refused(
+            &a.dir,
+            "decide_ubatch_flag_is_checked",
+            &["-m", model, "--head", head, "-ub", "0"],
+            // The server names the flag in its long spelling, whichever spelling was given.
+            &["--ubatch-size takes a whole number of at least 1, not \"0\""],
+        )?;
+        check(&mut ok, "decide_ubatch_flag_is_checked", pass);
         // PIN(2026-10-07): the clause that held llama.cpp's Clef layout refused ("does not serve
         // yet", with bartowski's `--hf` line) is this one. The layout is served now (bartowski's
         // current Q5_K_M is in it, and `--hf bartowski/Cloudflare_clef-flash-GGUF` fetches it), so
@@ -958,6 +972,16 @@ mod gate {
         println!("/v1/chat/completions {st}");
         serves &= st == 404;
         check(&mut ok, "serves_its_row", serves);
+        let err = std::fs::read_to_string(d.join("server.err"))?;
+        let picks = ubatch_pick::choices(&err);
+        let picked = !picks.is_empty()
+            && picks
+                .iter()
+                .all(|c| c.asked.is_none() && c.pick.is_some() && ubatch_pick::judge(c).is_ok());
+        println!(
+            "decide ubatch lines {picks:?}: each the card's pick, judged by its terms {picked}"
+        );
+        check(&mut ok, "decide_ubatch_is_the_cards_pick", picked);
         let file = a.model.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let mut wire = v["model"] == file && props["engine"]["name"] == "bloomery";
         println!(

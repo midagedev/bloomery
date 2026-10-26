@@ -6,7 +6,7 @@
 //!                    [--head <weights> [--head-config <file>]]
 //!                    [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                    [--image-max-tokens N]
-//!                    [--host 127.0.0.1] [--port 8080] [--ctx C]
+//!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [-ub N | --ubatch-size N]
 //!
 //! A decision model is named by its head (`serve::decide::pick`): `--head`,
 //! or, under `--hf` with no `--head`, the head repo of the row whose model
@@ -28,6 +28,12 @@
 //! trained context, halved while the whole load is short of the card, one
 //! `ctx` line naming the rule. A set value is that one context; a share past
 //! the limit is refused by name before the load.
+//!
+//! The backbone is a dense whole load, so its prompt ubatch is part of the card's verdict
+//! (`ubatch_pick`, as the qwen3 seat's dense file): `-ub`/`--ubatch-size` (else
+//! `BLOOMERY_QWEN3_UBATCH`) is the size, taken exactly and refused by name when the whole load does not fit
+//! it; unset, it is the largest of 4096, 2048, 1024 and 512 whose whole need fits at the context, one
+//! `ubatch` line on stderr naming the rule, beside the `whole fit` line.
 //!
 //! Before any load the seat refuses by name a file whose architecture is
 //! not one of the row's backbones; then, on a worker thread that owns the
@@ -70,20 +76,20 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use bloomery_gpu::GpuError;
+use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH, UBATCH_ENV, ubatch_asked};
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::arm_screen;
 use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
+use bloomery_gpu_gates::ubatch_pick::Rule;
+use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
 use cuda_core::CudaContext;
 use decision::release::{clef, lev};
 use gguf::Split;
 use model::arch::is_qwen35_body;
-use model::arch::qwen35moe::hparams::Hparams;
-use model::placement::ctx_ask::{Probe, Short, Side};
 use serde_json::{Value, json};
 use serve::ServeError;
 use serve::decide::{
@@ -100,7 +106,7 @@ const WHAT: &str = "bloomery-serve-decide";
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
                      [--head <weights> [--head-config <file>]] [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] [--image-max-tokens N] [--host H] [--port P] \
-                     [--ctx C] [--api-key KEY] [--api-key-file FNAME]";
+                     [--ctx C] [-ub N | --ubatch-size N] [--api-key KEY] [--api-key-file FNAME]";
 
 /// A row's own part, opened from its head's source: its weights and config files, or the model
 /// file that carries the head.
@@ -196,7 +202,7 @@ impl Hidden for Qwen35moeModel {
 /// the file; `Some` seat is the image encoder's, whose reserve the whole-fit verdict counts and
 /// whose presence makes the sequences take a media call.
 type OpenBody =
-    fn(&Path, usize, Option<&EncoderSeat>) -> Result<(Box<dyn Hidden>, Split), GateError>;
+    fn(&Path, (usize, usize), Option<&EncoderSeat>) -> Result<(Box<dyn Hidden>, Split), GateError>;
 
 /// The file architectures a body opens.
 type Opens = fn(&str) -> bool;
@@ -206,20 +212,20 @@ type Opens = fn(&str) -> bool;
 const BODIES: &[(Opens, OpenBody)] = &[(is_qwen35_body, open_qwen35)];
 
 /// A Qwen3.5 dense file (`qwen35`, or `clef` with its head beside the trunk)
-/// whole on one card, the open [`crate::qwen35_open::open_shape`] names.
+/// whole on one card, the open [`crate::qwen35_open::open_shape`] names at
+/// the prompt ubatch the seat settled for `(ctx, ubatch)`.
 fn open_qwen35(
     path: &Path,
-    ctx: usize,
+    (ctx, ubatch): (usize, usize),
     image: Option<&EncoderSeat>,
 ) -> Result<(Box<dyn Hidden>, Split), GateError> {
     let reserve = Beside {
         image: image.and_then(|s| s.reserve),
         embedding: None,
     };
-    let o = crate::qwen35_open::open_shape(ctx, image.is_some());
     let (model, split) =
-        crate::qwen35_open::open_seated(path, o.ctx, o.ubatch, o.media, &|machine| {
-            beside::reserve_on(machine, reserve)
+        crate::qwen35_open::open_seated(path, ctx, ubatch, image.is_some(), &|machine| {
+            beside::reserve_on(machine, reserve);
         })?;
     Ok((Box::new(model), split))
 }
@@ -347,6 +353,8 @@ struct Args {
     host: String,
     port: u16,
     ctx: Option<usize>,
+    /// `-ub`/`--ubatch-size`: the prompt ubatch the user names.
+    ubatch: Option<usize>,
     /// The image-input flags: `--mmproj` is the encoder file whose images the seat serves, else
     /// the `--hf` repo's projector unless `--no-mmproj`.
     vision: vision_seat::Flags,
@@ -360,6 +368,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         host: "127.0.0.1".to_owned(),
         port: 8080,
         ctx: None,
+        ubatch: None,
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
     };
@@ -379,6 +388,14 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--port" => a.port = v.parse().map_err(|e| format!("--port {v:?}: {e}"))?,
             f if serve::flag::CTX.contains(&f) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => a.ctx = Some(n),
+                _ => {
+                    return Err(
+                        format!("{flag} takes a whole number of at least 1, not {v:?}").into(),
+                    );
+                }
+            },
+            f if serve::flag::UBATCH.contains(&f) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => a.ubatch = Some(n),
                 _ => {
                     return Err(
                         format!("{flag} takes a whole number of at least 1, not {v:?}").into(),
@@ -457,6 +474,8 @@ struct Load {
     open: Open,
     /// Set `--ctx`, the one context. `None` walks the seats' ladder.
     ctx: Option<usize>,
+    /// `-ub`, the prompt ubatch the user names. `None` is `BLOOMERY_QWEN3_UBATCH`, else the card's room.
+    ubatch: Option<usize>,
     /// The row's name, which a refusal names.
     row: &'static str,
     vision: vision_seat::Flags,
@@ -521,13 +540,8 @@ fn open_image(
     }
     let file = l.vision.encoder(true)?;
     let split = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
-    let hp = Hparams::read(&split)?;
     // Every Qwen3.5 attention layer rotates by IMROPE over the file's sections.
-    let text = TextFacts {
-        n_embd: hp.n_embd,
-        imrope: Some(hp.rope_sections),
-        ple: PleImage::Absent,
-    };
+    let text = TextFacts::of_imrope(&model::arch::spec(&split)?.spec)?;
     #[cfg(not(feature = "vision"))]
     if file.is_some() || l.vision.sets_limits() {
         return Err(image::NO_IMAGES.into());
@@ -582,6 +596,9 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
             embedding: None,
         };
         let media = image.is_some();
+        // The Qwen body's ubatch lever, as the planner's `ubatch_rule` passes it.
+        let env = ubatch_asked()?.map(|size| (size, UBATCH_ENV));
+        let rule = Rule::of(l.ubatch, env, UBATCH)?;
         let chosen = choose_ctx(
             &file,
             (l.ctx, 1),
@@ -590,28 +607,20 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
                 let ctx =
                     usize::try_from(c).map_err(|e| format!("a context of {c} positions: {e}"))?;
                 let shape = crate::qwen35_open::open_shape(ctx, media);
-                let need = crate::qwen35_open::whole_verdict(&file, shape, card, &|machine| {
+                crate::qwen35_open::probe_whole(&file, shape, card, rule, &|machine| {
                     beside::reserve_on(machine, reserve);
-                })?;
-                Ok(if need.fits() {
-                    Probe::Holds(())
-                } else {
-                    Probe::Short(Short {
-                        on: Side::Card,
-                        need: need.need,
-                        room: need.budget,
-                    })
                 })
             },
         )?;
         eprintln!("{}", chosen.line());
         let ctx = usize::try_from(chosen.slot_ctx)?;
+        let ubatch = chosen.plan;
         drop(file);
         let (_, open_body) = BODIES
             .iter()
             .find(|(opens, _)| opens(&l.arch))
             .ok_or_else(|| format!("no backbone body opens a {} file", l.arch))?;
-        let (body, file) = open_body(&l.model, ctx, image.as_ref().map(|o| &o.seat))?;
+        let (body, file) = open_body(&l.model, (ctx, ubatch), image.as_ref().map(|o| &o.seat))?;
         let vision = image
             .as_ref()
             .map(|at| open_encoder(body.context(), at))
@@ -736,6 +745,7 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         head,
         open: row.open,
         ctx: a.ctx,
+        ubatch: a.ubatch,
         row: row.name,
         vision: a.vision,
     };

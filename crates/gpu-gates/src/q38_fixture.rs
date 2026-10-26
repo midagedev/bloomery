@@ -1,9 +1,9 @@
 //! What the three Qwen3.8 whole-model gates (`gate_qwen4exp_e2e`, `gate_qwen4exp_mtp`,
 //! `gate_qwen38_twocard`) read from the file they open instead of carrying the real file's
-//! numbers: its layer kinds from the header (`block_count` and `full_attention_interval`) and the
-//! captured graphs' node counts from those kinds. The tier the gates run in, the card a plan is
-//! made on and the plan's card budget belong to `crate::tier`; a gate prints each derived value
-//! beside the literal it replaced there (`tier::witness`).
+//! numbers: its layer kinds from the file's description and the captured graphs' node counts from
+//! those kinds. The tier the gates run in, the card a plan is made on and the plan's card budget
+//! belong to `crate::tier`; a gate prints each derived value beside the literal it replaced there
+//! (`tier::witness`).
 
 use crate::GateError;
 
@@ -32,15 +32,13 @@ const SLOT_GDN_LAUNCHES: usize = 2;
 /// slots' q8_1, the down and the card sum.
 const CARD_LEG_LAUNCHES: usize = 5;
 
-/// The layer kinds a file's header names: what a gate's structure clause is written against, and
-/// the only source it reads them from (never the loaded body).
+/// The layer kinds a file's description names: what a gate's structure clause is written against,
+/// and the only source it reads them from (never the loaded body).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shape {
-    /// `block_count`.
+    /// The trunk's layers.
     pub n_layer: usize,
-    /// `full_attention_interval`.
-    pub interval: usize,
-    /// The selecting layers: llama.cpp's `(il + 1) % interval == 0`.
+    /// The selecting layers (the description's attention layers), in order.
     pub qsa: Vec<usize>,
     /// `ple.layers`: the layer the PLE site sits on; `None` when the file lists no site.
     pub ple_layer: Option<usize>,
@@ -48,28 +46,27 @@ pub struct Shape {
     pub image_token: Option<u32>,
 }
 
-/// The selecting layers of `n_layer` layers at `interval`.
-#[must_use]
-fn qsa_layers(n_layer: usize, interval: usize) -> Vec<usize> {
-    (0..n_layer)
-        .filter(|l| (l + 1).is_multiple_of(interval))
-        .collect()
-}
-
 impl Shape {
-    /// The shape of the header values themselves.
+    /// The shape of a description's layers: `n_layer` of them, `qsa` of which select.
     ///
     /// # Errors
-    /// A file with no layer or an interval of 0, or a PLE site past the layers.
-    pub fn from_header(
+    /// A file with no layer, a selecting layer past the layers or listed out of order, or a PLE
+    /// site past the layers.
+    pub fn from_layers(
         n_layer: usize,
-        interval: usize,
+        qsa: Vec<usize>,
         ple_layer: Option<usize>,
         image_token: Option<u32>,
     ) -> Result<Shape, GateError> {
-        if n_layer == 0 || interval == 0 {
+        if n_layer == 0 {
+            return Err("the description holds no layer".into());
+        }
+        if qsa.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(format!("the selecting layers {qsa:?} are not in order").into());
+        }
+        if qsa.last().is_some_and(|&l| l >= n_layer) {
             return Err(
-                format!("block_count {n_layer} and full_attention_interval {interval}").into(),
+                format!("the selecting layers {qsa:?} are past the {n_layer} layers").into(),
             );
         }
         if ple_layer.is_some_and(|l| l >= n_layer) {
@@ -77,8 +74,7 @@ impl Shape {
         }
         Ok(Shape {
             n_layer,
-            interval,
-            qsa: qsa_layers(n_layer, interval),
+            qsa,
             ple_layer,
             image_token,
         })
@@ -163,14 +159,14 @@ impl Shape {
 mod tests {
     use super::*;
 
-    /// The real file's header (48 layers, interval 4, the PLE site on layer 1) gives the literals
-    /// the gates carried; the fixture's (4 layers, interval 2, the site on layer 2) gives the
-    /// counts its derivation names. Mutant: any launch constant, the interval rule or a count off
-    /// by one.
+    /// The real file's description (48 layers, every fourth one selecting, the PLE site on layer 1)
+    /// gives the literals the gates carried; the fixture's (4 layers, every second one selecting,
+    /// the site on layer 2) gives the counts its derivation names. Mutant: any launch constant or
+    /// a count off by one.
     #[test]
-    fn the_header_gives_the_real_files_literals_and_the_fixtures_counts() {
-        let real = Shape::from_header(48, 4, Some(1), Some(248_056)).expect("real");
-        assert_eq!(real.qsa, (0..12).map(|i| 4 * i + 3).collect::<Vec<_>>());
+    fn the_description_gives_the_real_files_literals_and_the_fixtures_counts() {
+        let every_fourth = (0..12).map(|i| 4 * i + 3).collect();
+        let real = Shape::from_layers(48, every_fourth, Some(1), Some(248_056)).expect("real");
         assert_eq!((real.n_qsa(), real.n_gdn()), (12, 36));
         assert_eq!(real.nodes_decode(), 1151);
         assert_eq!(real.memops(), 96);
@@ -179,8 +175,7 @@ mod tests {
         assert_eq!(real.nodes_decode_card(48), 1391);
         assert_eq!(real.nodes_verify_card(48), 1427);
         assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
-        let fix = Shape::from_header(4, 2, Some(2), Some(248_056)).expect("fixture");
-        assert_eq!(fix.qsa, [1, 3]);
+        let fix = Shape::from_layers(4, vec![1, 3], Some(2), Some(248_056)).expect("fixture");
         assert_eq!((fix.n_qsa(), fix.n_gdn()), (2, 2));
         assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 29 + 5 + 5);
         assert_eq!(fix.nodes_decode(), 113);
@@ -190,14 +185,15 @@ mod tests {
         assert_eq!(fix.nodes_verify_card(4), 135);
     }
 
-    /// A header no gate can read a shape from is a named error, and a file with no PLE site has
-    /// no site's launches.
+    /// A description no gate can read a shape from is a named error, and a file with no PLE site
+    /// has no site's launches.
     #[test]
-    fn a_header_without_layers_or_interval_is_refused_and_no_site_adds_no_launches() {
-        assert!(Shape::from_header(0, 4, None, None).is_err());
-        assert!(Shape::from_header(48, 0, None, None).is_err());
-        assert!(Shape::from_header(4, 2, Some(4), None).is_err());
-        let bare = Shape::from_header(4, 2, None, None).expect("no site");
+    fn a_description_without_a_shape_is_refused_and_no_site_adds_no_launches() {
+        assert!(Shape::from_layers(0, Vec::new(), None, None).is_err());
+        assert!(Shape::from_layers(4, vec![1, 4], None, None).is_err());
+        assert!(Shape::from_layers(4, vec![3, 1], None, None).is_err());
+        assert!(Shape::from_layers(4, vec![1, 3], Some(4), None).is_err());
+        let bare = Shape::from_layers(4, vec![1, 3], None, None).expect("no site");
         assert_eq!(bare.nodes_decode(), 108);
         assert_eq!(bare.nodes_slot(), 22);
     }

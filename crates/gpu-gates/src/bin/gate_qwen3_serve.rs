@@ -442,13 +442,14 @@
 //! - `records_name_the_files_architecture`, every file: the `load` and the `listening` record
 //!   name the header's architecture word. FAIL-first: a seat that prints `qwen35moe` for the
 //!   dense file leaves both records red.
-//! - `tool_call_is_parsed`, a `Body35` file: `/v1/chat/completions` of [`TOOL_ASK`] with one
-//!   function listed, at temperature 0 and thinking off, answers 200 with `finish_reason`
-//!   `tool_calls` and one call of the listed function whose `arguments` is a JSON object with a
-//!   non-empty string `city`: the markup the file's template teaches (`<tool_call><function=…>`)
-//!   is the format the reader binds (`qwen35moe::spec`) and the server parses. FAIL-first: a
-//!   server that parses no tool markup for the template refuses the request or answers the markup
-//!   as text.
+//! - `tool_call_is_parsed`, a `Body35` file: a server over a scripted engine (no model behind it)
+//!   whose every reply is the file's template's XML call (`<tool_call><function=…>`), asked one tool
+//!   turn with the file's own chat template, answers 200 with `finish_reason` `tool_calls` and one
+//!   call of the listed function with the arguments the script gave
+//!   (`serve_client::scripted_call`, which `gate_llama_serve` runs too): the markup the template
+//!   teaches is the format the reader binds (`qwen35moe::spec`) and the server parses, and the
+//!   clause reads nothing the model chose to reply. FAIL-first: a scanner that drops a call's
+//!   parameters answers `{}` and the clause is red.
 //! - `dense_below_its_floor_is_refused_by_name`, the dense file: `--plan` on `--place a` under
 //!   [`PLACED_BUDGET`] exits non-zero with the context ladder's refusal (the least the default
 //!   tries takes more bytes than the budget's, `ask fewer slots or a smaller model file`) and
@@ -530,7 +531,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Qwen35moeModel, checkpoint_budget35};
+    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
@@ -540,14 +541,15 @@ mod gate {
     use bloomery_gpu_gates::qwen_seat::{self, decode_mma};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
-        self, Answer, PrefixTurns, Served, agree, answered, chat_is_those_ids, check, curl,
-        edit_and_extension, greedy_chat, ids_of, json_of, metric, parse_ids, rendered, serve_cmd,
-        server_log, tokenized,
+        self, Answer, PrefixTurns, Served, WholeTerms, agree, answered, chat_is_those_ids, check,
+        curl, edit_and_extension, greedy_chat, ids_of, json_of, metric, rendered, scripted_call,
+        serve_cmd, server_log, tokenized, whole_terms,
     };
+    use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
     use bloomery_gpu_gates::{GateError, checks_failed};
     use gguf::{Gguf, Split};
-    use model::arch::qwen35moe::hparams::{Hparams, Kind};
+    use model::arch::models::Mixer;
     use model::arch::qwen35moe::mtp::{InFile, in_file};
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
@@ -642,14 +644,11 @@ mod gate {
     /// behind are a whole fresh run's.
     const GEMM_FROM: usize = app::arch::qwen3moe::GEMM_FROM;
 
-    /// The seat's family of `model`, from the architecture its header names;
+    /// The seat's family of `model`, from the program its header's description names;
     /// a file the Qwen seat takes none of is a named error.
     fn seat_of(model: &Path) -> Result<qwen_seat::Family, GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let arch = split.architecture().unwrap_or("<missing>");
-        qwen_seat::Family::from_name(arch).ok_or_else(|| {
-            format!("{}: the Qwen seat takes no {arch:?} file", model.display()).into()
-        })
+        qwen_seat::Family::of(&split).map_err(|e| format!("{}: {e}", model.display()).into())
     }
 
     /// Whether the family's body is `Body35`: GDN layers beside gated
@@ -1363,8 +1362,14 @@ mod gate {
     /// tensor-core pass, the eight-head layout's (`decode_mma`), is the one that
     /// reads a q8_0 K cache; the scalar pair pass of a group of six has none.
     fn flash_has_q8(split: &Split) -> Result<bool, GateError> {
-        let hp = Hparams::read(split).map_err(|e| format!("{e}"))?;
-        decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)
+        let spec = model::arch::spec(split)?.spec;
+        let head = spec
+            .gqa()
+            .ok_or("the description holds no attention layer to choose the decode flash by")?;
+        decode_mma(
+            head.head_dim as usize,
+            (head.heads / head.kv_heads) as usize,
+        )
     }
 
     /// `q8_cache_is_refused_on_the_scalar_pair_flash` (module header), on a
@@ -1421,52 +1426,6 @@ mod gate {
             !listened && named,
         );
         Ok(())
-    }
-
-    /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
-    /// on …`): its `need`, its `cache` term (the planes' bytes), that need
-    /// less the cache (the terms no context moves at or past the floor),
-    /// what the card had, the census reading inside its parentheses, and
-    /// whether it says the load fits. A line without its terms is a named
-    /// error.
-    struct WholeTerms<'a> {
-        need: u64,
-        cache: u64,
-        rest: u64,
-        budget: u64,
-        census: &'a str,
-        fits: bool,
-    }
-
-    /// The terms of `line`, the whole-fit verdict's own words.
-    fn whole_terms(line: &str) -> Result<WholeTerms<'_>, GateError> {
-        let term = |after: &str| -> Result<u64, GateError> {
-            line.split(after)
-                .nth(1)
-                .and_then(|t| t.split(" B").next())
-                .and_then(|t| t.parse().ok())
-                .ok_or_else(|| format!("the whole-fit line names no `{after}… B`: {line}").into())
-        };
-        let (need, cache) = (term(": need ")?, term(" + cache ")?);
-        let (had, census) = line
-            .split_once(" B the card had (")
-            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
-        let budget: u64 = had
-            .rsplit(", of ")
-            .next()
-            .and_then(|t| t.parse().ok())
-            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
-        let rest = need
-            .checked_sub(cache)
-            .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
-        Ok(WholeTerms {
-            need,
-            cache,
-            rest,
-            budget,
-            census: census.trim_end_matches(')'),
-            fits: line.contains(": fits: "),
-        })
     }
 
     /// `ctx_default_is_the_highest_rung_held`, on the default arm's server
@@ -1560,10 +1519,21 @@ mod gate {
             .lines()
             .find(|l| l.starts_with(&head))
             .ok_or_else(|| format!("the default arm's seat printed no whole-fit line at {n}"))?;
-        let held = match qwen_seat::Family::from_name(arch) {
+        let held = match qwen_seat::Family::of(split).ok() {
             Some(seat) if body35(seat) => {
-                // The open the serve seat makes, from its one owner.
-                let o = q3place::serve_open35(split, usize::try_from(n)?, KvQ8::F16, false)?;
+                // The open the serve seat makes, from its one owner; a file with no routed expert
+                // settles its ubatch in the verdict, which the seat's `ubatch` line at `n` names.
+                let at = usize::try_from(n)?;
+                let o = q3place::serve_open35(split, at, KvQ8::F16, false)?;
+                let o = match ubatch_pick::choices(log)
+                    .iter()
+                    .rev()
+                    .find(|c| c.ctx == at)
+                    .and_then(|c| c.pick)
+                {
+                    Some(ubatch) => Open35 { ubatch, ..o },
+                    None => o,
+                };
                 let WholeLoad::Checked { arena, reserve } = Qwen35moeModel::whole_load(split, o)?
                 else {
                     return Err(format!("a {arch} whole load carries no arena term").into());
@@ -1686,8 +1656,8 @@ mod gate {
     /// and `ring` (`LinearShape`'s lengths), which no context moves: the
     /// state `lanes` times, and a load of more than one lane a word a lane
     /// past the ring (`RecStore`'s stamps), as `Body35` allocates them. A
-    /// qwen35moe file's layers are the reader's trunk (`Hparams::kinds`): a
-    /// next-token layer past the trunk holds no sequence plane.
+    /// qwen35moe file's layers are the description's trunk: a next-token
+    /// layer past the trunk holds no sequence plane.
     fn cache_planes(
         model: &Path,
         split: &Split,
@@ -1723,20 +1693,29 @@ mod gate {
                     // file's delta layers are the tiled ones.
                     map: KHeadMap::Tiled,
                 };
-                let trunk =
-                    Hparams::read(split).map_err(|e| format!("{}: {e}", model.display()))?;
-                for kind in &trunk.kinds {
-                    match kind {
-                        Kind::DeltaRule => {
+                let trunk = model::arch::spec(split)
+                    .map_err(|e| format!("{}: {e}", model.display()))?
+                    .spec;
+                for (l, layer) in trunk.layers.iter().enumerate() {
+                    match &layer.mixer {
+                        Mixer::DeltaRule(_) => {
                             planes.push(4 * lanes as u64 * shape.state_len() as u64);
                             planes.push(4 * shape.ring_len() as u64);
                             if lanes > 1 {
                                 planes.push(4 * lanes as u64);
                             }
                         }
-                        Kind::Attention => {
+                        Mixer::Gqa(_) => {
                             planes.push(plane);
                             planes.push(plane);
+                        }
+                        other => {
+                            return Err(format!(
+                                "{}: layer {l} mixes with {}, which holds no planes listed here",
+                                model.display(),
+                                other.what()
+                            )
+                            .into());
                         }
                     }
                 }
@@ -1934,72 +1913,21 @@ mod gate {
         Ok(())
     }
 
-    /// The turn the tool-call clause asks.
-    const TOOL_ASK: &str = "What is the weather in Seoul right now? Use the tool.";
-
-    /// The tokens the tool-call clause allows: a call is a few dozen.
-    const TOOL_TOKENS: usize = 256;
-
-    /// `tool_call_is_parsed` (module header), on the default server of a
-    /// `Body35` file: `/v1/chat/completions` of [`TOOL_ASK`] with one function
-    /// listed, at temperature 0 and thinking off, answers 200 with
-    /// `finish_reason` `tool_calls` and one call of the listed function whose
-    /// `arguments` is a JSON object with a non-empty string `city`. The markup
-    /// is the file's template's (`<tool_call><function=…>`), the format the
-    /// reader binds and the server parses. FAIL-first: a server that parses
-    /// no tool markup for this template refuses the request or answers the
-    /// markup as text, and the clause is red.
-    fn tool_call_is_parsed(
-        url: &dyn Fn(&str) -> String,
-        dir: &Path,
-        ok: &mut bool,
-    ) -> Result<(), GateError> {
-        let body = json!({
-            "messages": [{ "role": "user", "content": TOOL_ASK }],
-            "tools": [{ "type": "function", "function": {
-                "name": "get_weather",
-                "description": "The current weather of a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "city": { "type": "string", "description": "the city's name" } },
-                    "required": ["city"],
-                },
-            } }],
-            "max_tokens": TOOL_TOKENS,
-            "temperature": 0,
-            "stream": false,
-            "chat_template_kwargs": { "enable_thinking": false },
-        });
-        let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
-        std::fs::write(dir.join("tools.json"), &text)?;
-        let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let choice = &answer["choices"][0];
-        let calls = choice["message"]["tool_calls"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let function = calls.first().map(|c| &c["function"]);
-        let name = function.and_then(|f| f["name"].as_str());
-        let arguments: Option<Value> = function
-            .and_then(|f| f["arguments"].as_str())
-            .and_then(|a| serde_json::from_str(a).ok());
-        let city = arguments.as_ref().and_then(|a| a["city"].as_str());
-        println!(
-            "tool call: HTTP {st}, finish {:?}, {} call(s), function {name:?}, city {city:?}; \
-             content {:?}",
-            choice["finish_reason"],
-            calls.len(),
-            choice["message"]["content"]
-        );
-        check(
-            ok,
-            "tool_call_is_parsed",
-            st == 200
-                && choice["finish_reason"] == "tool_calls"
-                && calls.len() == 1
-                && name == Some("get_weather")
-                && city.is_some_and(|c| !c.trim().is_empty()),
-        );
+    /// `tool_call_is_parsed` (module header), on a `Body35` file's chat template: a server over a
+    /// scripted engine whose every reply is the template's XML call, asked one tool turn at
+    /// temperature 0 and thinking off, answers 200 with `finish_reason` `tool_calls` and one call of
+    /// the listed function with the arguments the script gave (`serve_client::scripted_call`). The
+    /// markup is the file's template's (`<tool_call><function=…>`), the format the reader binds and the
+    /// server parses; the clause reads nothing the model chose to reply. FAIL-first: a scanner that
+    /// drops a call's parameters answers `{}` and the clause is red.
+    fn tool_call_is_parsed(split: &Split, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let template = model::arch::spec(split)
+            .map_err(|e| format!("the header: {e}"))?
+            .spec
+            .chat
+            .template
+            .ok_or("the file carries no chat template")?;
+        check(ok, "tool_call_is_parsed", scripted_call(&template, dir)?);
         Ok(())
     }
 
@@ -2884,12 +2812,18 @@ mod gate {
             println!("{arm}: checkpoints lines {lines:?}");
             held &= match &spec {
                 Some(spec) => {
+                    // The size the load opened at: a file with no routed expert settles it in its
+                    // verdict (the seat's last `ubatch` line), any other takes the levers'.
+                    let ubatch = match ubatch_pick::choices(&log).last().and_then(|c| c.pick) {
+                        Some(u) => u,
+                        None => ubatch_size()?,
+                    };
                     let slot_ctx = log
                         .lines()
                         .filter(|l| l.starts_with("parallel "))
                         .find_map(|l| parallel_word(l, "slot_ctx")?.parse::<u64>().ok());
                     let each = slot_ctx
-                        .map(|c| checkpoint_budget35(spec, ubatch_size()?, c))
+                        .map(|c| checkpoint_budget35(spec, ubatch, c))
                         .transpose()?;
                     let want = each.zip(slot_ctx).map(|(each, c)| {
                         format!(
@@ -3317,7 +3251,7 @@ mod gate {
         }
         if body35(seat) {
             prefix35(&url, dir, ok)?;
-            tool_call_is_parsed(&url, dir, ok)?;
+            tool_call_is_parsed(&split, dir, ok)?;
         }
         *ok &= serve_client::shared_system_prompt(&url, dir, SYSTEM_MSG, [EDIT_A, EDIT_B], N)?;
         *ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
@@ -3495,63 +3429,6 @@ mod gate {
             ))),
             _ => Err(format!("{} plan records, the clause wants one split", plans.len()).into()),
         }
-    }
-
-    /// `generate_qwen3moe --arm <prompt>/N --ctx <ctx> … --last-step` on
-    /// `model`, an arm a prompt; its `tokens` lines in order. `ctx` is the
-    /// server's loaded context: the CLI's own default plans a different
-    /// split of the routed experts, and the two legs do not sum in one order.
-    fn cli(
-        model: &Path,
-        prompts: &[&[u32]],
-        ctx: u64,
-        dir: &Path,
-    ) -> Result<Vec<Vec<u32>>, GateError> {
-        let exe = beside("generate_qwen3moe")?;
-        let mut args = Vec::new();
-        for p in prompts {
-            let ids: Vec<String> = p.iter().map(u32::to_string).collect();
-            args.push("--arm".to_owned());
-            args.push(format!("{}/{N}", ids.join(",")));
-        }
-        // The server's context, so the CLI's plan is the server's split.
-        args.push("--ctx".to_owned());
-        args.push(ctx.to_string());
-        args.push("--last-step".to_owned());
-        let out = Command::new(&exe)
-            .args(&args)
-            .env("BLOOMERY_REF_MODEL", model)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-        let log = dir.join("gen.log");
-        std::fs::write(&log, &out.stdout)?;
-        std::fs::write(dir.join("gen.err"), &out.stderr)?;
-        if !out.status.success() {
-            return Err(format!(
-                "{} {}: {}",
-                exe.display(),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )
-            .into());
-        }
-        let text = String::from_utf8(out.stdout)?;
-        let lines: Vec<Vec<u32>> = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("tokens "))
-            .map(parse_ids)
-            .collect::<Result<_, _>>()?;
-        if lines.len() != prompts.len() {
-            return Err(format!(
-                "{}: {} `tokens` lines for {} arms",
-                log.display(),
-                lines.len(),
-                prompts.len()
-            )
-            .into());
-        }
-        Ok(lines)
     }
 
     /// The cache flag's own surface (`--cache-type-k`): a word outside the
@@ -4644,7 +4521,14 @@ mod gate {
                 continue;
             };
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
-            let references = cli(model, &prompts, default_n, &dir)?;
+            let references = serve_client::generate_arms(
+                "generate_qwen3moe",
+                model,
+                &prompts,
+                N,
+                default_n,
+                &dir,
+            )?;
             let mut agree_all = true;
             for (ans, reference) in answers.iter().zip(&references) {
                 println!("cli tokens {reference:?}");

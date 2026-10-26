@@ -158,8 +158,8 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+    use model::arch::models::Mixer;
     use model::arch::models::shape::{MoeShape, rules};
-    use model::arch::qwen35moe::hparams::{Hparams, Kind};
     use refset::arch::qwen35moe as oracle;
     use refset::arch::qwen35moe::fixture as fx;
 
@@ -415,12 +415,13 @@ mod gate {
     /// The layers the real-weight cases run and the file's delta layers, by kind: the first delta layer
     /// whose down stack is Q6_K, then the first whose down stack is Q4_K (a delta layer, because the cases
     /// read `ssm_output`, the delta-net's tap).
-    fn pick_layers(split: &Split, hp: &Hparams) -> Result<([usize; 2], Vec<usize>), GateError> {
-        let delta: Vec<usize> = hp
-            .kinds
+    fn pick_layers(split: &Split) -> Result<([usize; 2], Vec<usize>), GateError> {
+        let spec = model::arch::spec(split)?.spec;
+        let delta: Vec<usize> = spec
+            .layers
             .iter()
             .enumerate()
-            .filter(|(_, kind)| **kind == Kind::DeltaRule)
+            .filter(|(_, layer)| matches!(layer.mixer, Mixer::DeltaRule(_)))
             .map(|(l, _)| l)
             .collect();
         let first = |ty: GgmlType| -> Result<usize, GateError> {
@@ -1422,7 +1423,10 @@ mod gate {
     /// Mixed router and shared-gate file types use one F32 resident format
     /// on every layer, with the widened bytes counted before loading.
     fn wide_load(c: &Ctx) -> Result<bool, GateError> {
-        use model::arch::qwen35moe::{hparams::Variant, names, roles};
+        use model::arch::qwen35moe::{
+            hparams::{Hparams, Variant},
+            names, roles,
+        };
         use model::placement::{self, CardFormat, Format};
 
         let mut hp = Hparams::read(&c.split)?;
@@ -3198,7 +3202,7 @@ mod gate {
         let eps = split
             .arch_get_f32("attention.layer_norm_rms_epsilon")
             .ok_or("no attention.layer_norm_rms_epsilon")?;
-        let (layers, delta) = pick_layers(&split, &Hparams::read(&split)?)?;
+        let (layers, delta) = pick_layers(&split)?;
         let gpu = Gpu::new()?;
         let ctx = gpu.context().clone();
         let reads_sets = ORACLE_CASES

@@ -109,6 +109,21 @@ pub fn decision_type(file: &Split) -> Result<Option<&str>, GateError> {
         .transpose()
 }
 
+/// The refusal a generative seat gives a file that declares a decision type: a decision model is
+/// the decide seat's, whatever trunk it shares with a generative family. A marker that is not a
+/// string is `decision_type`'s error.
+pub fn refuse_decision_model(file: &Split) -> Result<(), GateError> {
+    match decision_type(file)? {
+        None => Ok(()),
+        Some(kind) => Err(format!(
+            "a {} file declares {} = {kind}: a decision model is the decide seat's, not generation",
+            file.architecture().unwrap_or("<missing>"),
+            file.arch_key("decision.type")
+        )
+        .into()),
+    }
+}
+
 /// The model file a server named on its command line, set once.
 static MODEL_FILE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -146,10 +161,39 @@ pub fn hf_projector() -> Result<Option<PathBuf>, GateError> {
     Ok(None)
 }
 
+/// A header of architecture `arch` with `keys` beside it, written to `path` and opened: the files
+/// the decision-marker tests read.
+#[cfg(test)]
+pub(crate) fn test_header(
+    path: &std::path::Path,
+    arch: &str,
+    keys: Vec<(String, gguf::Value)>,
+) -> Split {
+    let mut all = vec![(
+        gguf::GENERAL_ARCHITECTURE.to_owned(),
+        gguf::Value::String(arch.into()),
+    )];
+    all.extend(keys);
+    let file = std::fs::File::create_new(path).unwrap();
+    let layout = gguf::write::Layout::new(&all, Vec::new()).unwrap();
+    gguf::write::Writer::new(file, layout)
+        .and_then(gguf::write::Writer::finish)
+        .unwrap();
+    Split::open(path).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Split, decision_type, header};
+    use super::{Split, decision_type, header, refuse_decision_model, test_header};
     use gguf::Value;
+
+    /// A header of architecture `fixture` with the optional `fixture.decision.type` marker.
+    fn marked_header(path: &std::path::Path, marker: Option<Value>) -> Split {
+        let keys = marker
+            .map(|m| vec![("fixture.decision.type".to_owned(), m)])
+            .unwrap_or_default();
+        test_header(path, "fixture", keys)
+    }
 
     /// A path that is no model file is refused naming it, and a directory is a checkpoint folder:
     /// a build without the `checkpoint` feature refuses it by that name instead of failing to
@@ -191,27 +235,43 @@ mod tests {
             ),
         ];
         for (index, (marker, expected)) in cases.into_iter().enumerate() {
-            let mut keys = vec![(
-                gguf::GENERAL_ARCHITECTURE.to_owned(),
-                Value::String("fixture".into()),
-            )];
-            if let Some(marker) = marker {
-                keys.push(("fixture.decision.type".into(), marker));
-            }
             let path = std::env::temp_dir().join(format!(
                 "bloomery-decision-header-{}-{index}.gguf",
                 std::process::id()
             ));
-            let file = std::fs::File::create_new(&path).unwrap();
-            let layout = gguf::write::Layout::new(&keys, Vec::new()).unwrap();
-            gguf::write::Writer::new(file, layout)
-                .and_then(gguf::write::Writer::finish)
-                .unwrap();
-            let split = Split::open(&path).unwrap();
+            let split = marked_header(&path, marker);
             match expected {
                 Ok(value) => assert_eq!(decision_type(&split).unwrap(), value),
                 Err(error) => assert_eq!(decision_type(&split).unwrap_err().to_string(), error),
             }
+            drop(split);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_declared_decision_type_is_refused_by_name_and_no_marker_passes() {
+        let cases = [
+            (None, Ok(())),
+            (
+                Some(Value::String("lev".into())),
+                Err(
+                    "a fixture file declares fixture.decision.type = lev: a decision model is the decide seat's, not generation",
+                ),
+            ),
+            (
+                Some(Value::U32(1)),
+                Err("fixture.decision.type: expected a string"),
+            ),
+        ];
+        for (index, (marker, expected)) in cases.into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!(
+                "bloomery-decision-refuse-{}-{index}.gguf",
+                std::process::id()
+            ));
+            let split = marked_header(&path, marker);
+            let got = refuse_decision_model(&split).map_err(|e| e.to_string());
+            assert_eq!(got, expected.map_err(str::to_owned));
             drop(split);
             std::fs::remove_file(path).unwrap();
         }

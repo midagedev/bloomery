@@ -39,6 +39,7 @@ impl Adapter for Row {
             kv: KvQ8::F16,
             media: false,
             beside: Default::default(),
+            ubatch: None,
         };
         let serve = floor_or(
             q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)

@@ -1011,7 +1011,7 @@ fn whole(
     };
     if let Err(e) = parser
         .try_push(&o.content)
-        .and_then(|_| parser.try_finish())
+        .and_then(|_| parser.try_finish_at(o.cut()))
     {
         return send_error(w, req, &tool_markup_error(&e));
     }
@@ -1127,7 +1127,7 @@ fn stream(
     };
     finish_stream(req, stream, w_opt, r, |s, o| {
         let mut events = frames.opening(ids);
-        match parser.try_finish() {
+        match parser.try_finish_at(o.cut()) {
             Ok(d) => items.push(&d, &mut events),
             Err(e) => {
                 frames.send(s, events)?;

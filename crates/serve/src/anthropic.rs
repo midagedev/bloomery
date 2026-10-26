@@ -582,7 +582,7 @@ fn whole(
     };
     if let Err(e) = parser
         .try_push(&o.content)
-        .and_then(|_| parser.try_finish())
+        .and_then(|_| parser.try_finish_at(o.cut()))
     {
         return send_error(w, req, &tool_markup_error(&e));
     }
@@ -856,7 +856,7 @@ fn stream(
             if !started {
                 event(&mut s, &message_start(ids, &o.timings))?;
             }
-            match parser.try_finish() {
+            match parser.try_finish_at(o.cut()) {
                 Ok(d) => {
                     let mut ev = blocks.push(ids, &d);
                     blocks.stop(&mut ev);

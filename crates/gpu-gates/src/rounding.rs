@@ -102,6 +102,25 @@ pub fn neox_head<const H: usize, const R: usize>(
     y
 }
 
+/// One head's NORM turn in the device rule, with no norm: pair `(x[2i],
+/// x[2i + 1])` turned by `(cs[2i], cs[2i + 1])` as `y0 = x0·c − x1·s`, `y1 = x0·s
+/// + x1·c`, each product and each sum rounded on its own (host f32 `*`, `+` and
+/// `-` are exactly `mul_rn` and `add_rn`, which rustc never contracts).
+#[must_use]
+pub fn norm_head<const H: usize>(x: &[f32], cs: &[f32]) -> Vec<f32> {
+    const { assert!(H >= 2 && H.is_multiple_of(2)) };
+    assert_eq!(x.len(), H, "norm_head: input width");
+    assert_eq!(cs.len(), H, "norm_head: rope width");
+    let mut y = vec![0.0f32; H];
+    for i in 0..H / 2 {
+        let (x0, x1) = (x[2 * i], x[2 * i + 1]);
+        let (c, s) = (cs[2 * i], cs[2 * i + 1]);
+        y[2 * i] = x0 * c - x1 * s;
+        y[2 * i + 1] = x0 * s + x1 * c;
+    }
+    y
+}
+
 /// A 32-value block's largest magnitude over its RMS, at most: a block of
 /// one nonzero value, √32 — the crest [`q8_32_rel`] takes.
 pub const CREST_MAX_32: f64 = 5.656_854_249_492_381;

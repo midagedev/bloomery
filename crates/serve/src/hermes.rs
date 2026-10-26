@@ -18,7 +18,9 @@
 //! calls, where this parser keeps that text. A call that does not follow the
 //! markup — a body that is not one JSON object holding a `name` string and
 //! an `arguments` object, or a `<tool_call>` still open when the generation
-//! ends — is a [`HermesError`], never content and never dropped. The call a
+//! ends — is a [`HermesError`], never content and never dropped; the chat
+//! parser reads a generation the token limit cut inside a call as an answer,
+//! not as this error ([`crate::dsml::ChatParser::try_finish_at`]). The call a
 //! scan has opened and not closed is reported as it is read
 //! ([`Scanned::open`]): its name and `arguments` object once their start is
 //! read, and the compact JSON of the object so far, a prefix of the arguments
@@ -67,6 +69,17 @@ pub enum HermesError {
         name: String,
         key: String,
     },
+}
+
+impl HermesError {
+    /// The text of the call the generation ended inside, when that is the whole fault: markup that
+    /// read as the template's so far and was not closed.
+    pub(crate) fn unclosed(&self) -> Option<String> {
+        match self {
+            HermesError::Unterminated { text, .. } => Some(text.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Streaming scanner over the text after the think span.

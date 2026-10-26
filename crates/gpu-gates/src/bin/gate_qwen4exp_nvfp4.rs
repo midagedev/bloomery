@@ -482,7 +482,7 @@ mod gate {
         let model = model_of(path)?;
         let file = model.header();
         let inputs = PlanInputs::describe(file)?;
-        let hp = &inputs.hp;
+        let spec = &inputs.spec;
         let gate = file
             .find(&names::ffn_gate_exps(0))
             .map(|(_, t)| t.ty)
@@ -495,12 +495,15 @@ mod gate {
             .into());
         }
         let dense = dense_of(&inputs.model).map_err(|e| format!("{}: {e}", path.display()))?;
-        let streams = hp.exp.as_ref().map_or(1, |e| e.hc_streams);
+        let streams = spec.hc.map_or(1, |hc| hc.streams as usize);
+        let routed = spec
+            .routed()
+            .ok_or("the description holds no routed layer")?;
         Ok(Dims {
-            n_layer: hp.n_trunk,
-            row: streams * hp.n_embd,
-            n_expert: hp.n_expert,
-            n_used: hp.n_used,
+            n_layer: spec.layers.len(),
+            row: streams * spec.hidden as usize,
+            n_expert: routed.experts as usize,
+            n_used: routed.top_k as usize,
             dense,
         })
     }

@@ -1,7 +1,9 @@
 //! `generate_qwen3moe` — the decode CLI of the qwen3moe family's engines: a
-//! qwen3moe (Qwen3-30B-A3B), a qwen35moe (Qwen3.6-35B-A3B) or a qwen4exp
-//! (Qwen3.8-Flash-Next) file, the architecture read from the file's header
-//! (any other is refused by name), the whole model on one card or placed by
+//! qwen3moe (Qwen3-30B-A3B), a qwen35moe (Qwen3.6-35B-A3B), a dense Qwen3.5
+//! trunk (`qwen35`, or a dense `llama` trunk such as Nanbeige4.3-33B) or a
+//! qwen4exp (Qwen3.8-Flash-Next) file, the engine picked by the program that
+//! runs the description the file's header gives (any other file is refused
+//! by name), the whole model on one card or placed by
 //! a plan over a card and the host tier (`--place`), greedy, one token per
 //! step, and the timing runner's ruler.
 //!
@@ -29,8 +31,8 @@
 //! Defaults: N 32, C 4096, mode graph, prefill auto, W 0. An ordinary flag given
 //! twice takes its last value; repeated `--arm` and `--tokens-file` keep their
 //! order. Each value is data even when it spells an option. `--prompt` tokenizes
-//! the text with the file's own vocabulary (`tokenizer`, no BOS: the file sets
-//! `add_bos_token` false; no chat template) and prints the generated text after the ids.
+//! the text with the file's own vocabulary (`tokenizer`, a BOS where the file's
+//! `add_bos_token` asks for one; no chat template) and prints the generated text after the ids.
 //!
 //! `--last-step` (a qwen3moe or qwen35moe file, refused by name on any
 //! other and beside `--time` and `--seed-depth`) feeds the prompt
@@ -49,7 +51,9 @@
 //! its last token is generated token 0, and `N − 1` feedback steps follow.
 //! The ubatch size is `BLOOMERY_QWEN3_UBATCH` (1..=4096, default 4096),
 //! clipped to the cache, read once: the plan counts that ubatch's arena and
-//! the load runs it.
+//! the load runs it. A file with no routed expert, whose only load is the
+//! whole one, takes the largest of 4096, 2048, 1024 and 512 the card holds
+//! when the variable is unset (`q3place::dense_open35`).
 //!
 //! A qwen4exp file's plan puts each layer's id prefix on the card as its
 //! budget holds (`place::Experts::Card`, `BLOOMERY_QWEN38_EXPERTS` unset or
@@ -468,11 +472,11 @@ mod cli {
     };
     use cuda_core::sys;
     use gguf::Split;
-    use model::arch::Arch;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
     };
+    use model::placement::accepts::{Program, program_of};
     use model::placement::workstation::HostRead;
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -613,13 +617,14 @@ mod cli {
             .collect::<Result<_, _>>()?)
     }
 
-    /// The engines this CLI drives, one a file architecture.
+    /// The engines this CLI drives, one a program of [`PROGRAMS`]; `Qwen35` is
+    /// the Qwen3.5 body, whether its trunk is routed, a dense Qwen3.5 one or a
+    /// dense `llama` one.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Family {
         Qwen3,
         Qwen35,
-        /// `qwen4exp`, which the qwen35moe reader reads and `Arch` does not
-        /// name.
+        /// The Qwen3.8 body's files (`qwen4exp`).
         Qwen38,
         /// `nemotron_h`, the whole model on one card, one sequence, its
         /// prompt run as steps.
@@ -642,37 +647,43 @@ mod cli {
         }
     }
 
+    /// The programs this CLI runs, one a family.
+    const PROGRAMS: [Program; 5] = [
+        Program::Qwen3moeBody,
+        Program::Qwen35Body,
+        Program::Qwen38Body,
+        Program::NemotronHBody,
+        Program::NemotronHMoeBody,
+    ];
+
     /// The model file ([`ref_model_path`]) and its engine, read from its
-    /// first shard's header: `qwen4exp` by its name, else `Arch::detect`'s
-    /// qwen3moe, qwen35moe, nemotron_h or nemotron_h_moe; dense qwen35 also uses Body35.
-    /// Other files are refused by name.
+    /// first shard's description: the program that runs its layers
+    /// ([`program_of`]) picks the family, so a dense `llama` trunk is the
+    /// Qwen3.5 body's as a dense `qwen35` file is. A file the Qwen3.5 body
+    /// runs that carries a decision head is the decide seat's, not
+    /// generation. Other files are refused by name, with the programs this
+    /// runs.
     fn open_file() -> Result<(Split, Family), GateError> {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        if file.architecture() == Some("qwen35") {
-            if bloomery_gpu_gates::model_file::decision_type(&file)?.is_some() {
-                return Err(
-                    "a qwen35 decision model belongs to the decide seat, not generation".into(),
-                );
+        let arch = file.architecture().unwrap_or("<missing>").to_owned();
+        let spec = model::arch::spec(&file)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .spec;
+        match program_of(spec.arch) {
+            Some(Program::Qwen3moeBody) => Ok((file, Family::Qwen3)),
+            Some(Program::Qwen35Body) => {
+                bloomery_gpu_gates::model_file::refuse_decision_model(&file)?;
+                Ok((file, Family::Qwen35))
             }
-            return Ok((file, Family::Qwen35));
-        }
-        if file.architecture() == Some("qwen4exp") {
-            return Ok((file, Family::Qwen38));
-        }
-        let first = file
-            .shard(0)
-            .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
-        match Arch::detect(first)? {
-            Arch::Qwen3moe => Ok((file, Family::Qwen3)),
-            Arch::Qwen35moe => Ok((file, Family::Qwen35)),
-            Arch::NemotronH => Ok((file, Family::NemotronH)),
-            Arch::NemotronHMoe => Ok((file, Family::NemotronHMoe)),
+            Some(Program::Qwen38Body) => Ok((file, Family::Qwen38)),
+            Some(Program::NemotronHBody) => Ok((file, Family::NemotronH)),
+            Some(Program::NemotronHMoeBody) => Ok((file, Family::NemotronHMoe)),
             other => Err(format!(
-                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen35, qwen4exp, \
-                 nemotron_h and nemotron_h_moe files",
+                "{} is a {arch} file, run by {}; generate_qwen3moe runs the programs {}",
                 path.display(),
-                file.architecture().unwrap_or(other.name())
+                other.map_or("no program", Program::name),
+                PROGRAMS.map(Program::name).join(", ")
             )
             .into()),
         }
@@ -1432,7 +1443,7 @@ mod cli {
         let layers = inputs.spec.layers.len();
         Ok(match place.card_specs()?.as_slice() {
             &[_, _] => {
-                q38place::machine_bp38(place, layers, ub, draft, tier_batch(&inputs.hp, ub))?
+                q38place::machine_bp38(place, layers, ub, draft, tier_batch(&inputs.spec, ub))?
             }
             &[stage] => machine_for_experts(stage, layers, ub, experts),
             cards => {
@@ -1832,10 +1843,12 @@ mod cli {
                 (Chosen::Qwen3(Body::path(prefill)?, place), None, lane)
             }
             Family::Qwen35 => {
-                if file.architecture() == Some("qwen35") {
+                if bloomery_gpu_gates::qwen_seat::Family::of(&file)?
+                    == bloomery_gpu_gates::qwen_seat::Family::Qwen35
+                {
                     if levers.draft().is_some_and(|w| w != "off") {
                         return Err(
-                            "BLOOMERY_DRAFT: dense qwen35 generation serves no draft".into()
+                            "BLOOMERY_DRAFT: dense Qwen3.5 body generation serves no draft".into(),
                         );
                     }
                 } else {
@@ -2684,6 +2697,7 @@ mod cli {
     ) -> Result<Qwen35moeModel, GateError> {
         let arch = file.architecture().unwrap_or("<missing>").to_owned();
         let o = q3place::serve_open35(&file, ctx, kv, false)?;
+        let o = q3place::dense_open35(&file, o, place.map(|(p, _)| p))?;
         let dspark = levers.draft() == Some("dspark");
         let mut m = match place {
             None => {
@@ -2704,30 +2718,40 @@ mod cli {
                 q3place::open_unplaced_qwen35(file, o, levers, Record::print)?
             }
             Some((p, levers)) => {
-                let q = PlaceQ3::qwen35(&file, p, o)?;
-                let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-                for line in q.records(&plan, None)? {
-                    line.print();
-                }
-                match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
-                    Some(card) => {
-                        if dspark {
-                            return Err(dspark_refusal(None));
-                        }
-                        Qwen35moeModel::open(
-                            Gpu::open_card_after_hook(card.name, card.device)?,
-                            file,
-                            o,
-                        )?
+                // A trunk of attention layers alone has no plan: it loads whole on the card or is
+                // refused with the bytes.
+                let attention = q3place::whole_card_attention(&file, p, &o)?;
+                if let Some(card) = attention {
+                    if dspark {
+                        return Err(dspark_refusal(None));
                     }
-                    None => {
-                        if dspark {
-                            return Err(dspark_refusal(Some((
-                                format!("--place {}", p.name()),
-                                "its plan puts routed experts on the host tier".to_owned(),
-                            ))));
+                    Qwen35moeModel::open(q3place::open_unplanned_card(card)?, file, o)?
+                } else {
+                    let q = PlaceQ3::qwen35(&file, p, o)?;
+                    let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
+                    for line in q.records(&plan, None)? {
+                        line.print();
+                    }
+                    match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
+                        Some(card) => {
+                            if dspark {
+                                return Err(dspark_refusal(None));
+                            }
+                            Qwen35moeModel::open(
+                                Gpu::open_card_after_hook(card.name, card.device)?,
+                                file,
+                                o,
+                            )?
                         }
-                        q3place::open_qwen35(file, &plan, o, levers.host())?
+                        None => {
+                            if dspark {
+                                return Err(dspark_refusal(Some((
+                                    format!("--place {}", p.name()),
+                                    "its plan puts routed experts on the host tier".to_owned(),
+                                ))));
+                            }
+                            q3place::open_qwen35(file, &plan, o, levers.host())?
+                        }
                     }
                 }
             }
@@ -2867,7 +2891,7 @@ mod cli {
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
         inputs.room = room;
-        let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
+        let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
         let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, None)?;
         // One slot is `plan_with` itself.
@@ -2922,7 +2946,7 @@ mod cli {
              verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
              place={} cards={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
             m.resident_bytes(),
-            inputs.hp.n_ctx_train,
+            inputs.spec.ctx_train,
             m.layers().len(),
             mode_name(mode),
             body.store_bytes(),
@@ -2961,7 +2985,7 @@ mod cli {
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
         inputs.room = room;
-        let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
+        let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
         let head = head_rows_of(levers.mtp_head_rows(), &file, inputs.spec.vocab)?;
         let rows = head.rows.clone();
@@ -3046,7 +3070,7 @@ mod cli {
              verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
              place={} cards={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
             m.resident_bytes(),
-            inputs.hp.n_ctx_train,
+            inputs.spec.ctx_train,
             m.layers().len(),
             mode_name(mode),
             body.store_bytes(),

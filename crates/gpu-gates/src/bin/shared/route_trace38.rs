@@ -46,7 +46,10 @@ pub fn create(
     inputs: &PlanInputs,
     run: &TraceRun<'_>,
 ) -> Result<RouteTrace, GateError> {
-    let hp = &inputs.hp;
+    let routed = inputs
+        .spec
+        .routed()
+        .ok_or("the description holds no routed layer")?;
     let mut extra = vec![
         ("place".to_owned(), run.place.to_owned()),
         ("experts".to_owned(), experts_name(run.experts).to_owned()),
@@ -59,8 +62,8 @@ pub fn create(
         model: run.model.to_path_buf(),
         arch: "qwen4exp".to_owned(),
         build: run.build.to_owned(),
-        n_expert: hp.n_expert,
-        n_used: hp.n_used,
+        n_expert: routed.experts as usize,
+        n_used: routed.top_k as usize,
         first_layer: 0,
         n_layer: inputs.spec.layers.len(),
         extra,

@@ -401,8 +401,8 @@ use bloomery_levers::{
 };
 use cuda_core::sys;
 use gguf::Split;
-use model::arch::models::Mixer;
 use model::arch::models::headpick::HeadSet;
+use model::arch::models::{Mixer, ModelSpec};
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tensor_places,
@@ -641,7 +641,7 @@ impl Place38 {
             Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
             Kind38::Bp => {
                 let draft = mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?;
-                q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.hp, ub))?
+                q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.spec, ub))?
             }
         };
         beside::reserve_on(
@@ -653,9 +653,13 @@ impl Place38 {
         );
         if self.media {
             let rows = u64::try_from(slots)?.saturating_mul(ctx);
+            let head = inputs.spec.gqa().ok_or(
+                "the description holds no attention layer to rotate an image's positions by",
+            )?;
+            let width = head.rope.dims as usize;
             machine.cards[0].reserves.push((
                 vision_seat::TABLES_RESERVE.to_owned(),
-                rows.saturating_mul(vision_seat::table_bytes_per_position(inputs.hp.rope_dims)),
+                rows.saturating_mul(vision_seat::table_bytes_per_position(width)),
             ));
         }
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
@@ -1276,7 +1280,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 }
 
 /// What `--mmproj` opened for the plans: the encoder file held against the text model's embedding
-/// width, its vocabulary's image ids, the file's IMROPE sections and its PLE image token
+/// width, its vocabulary's image ids, the description's IMROPE sections and its PLE image token
 /// (`token` the vocabulary's id to text), and seated for
 /// a plan on `place` ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else, where the seat
 /// `takes` the `--hf` repo's projector, that one ([`vision_seat::Flags::encoder`]), and `None`
@@ -1285,7 +1289,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 fn vision_of(
     flags: &vision_seat::Flags,
     (place, takes): (Place, bool),
-    hp: &model::arch::qwen35moe::hparams::Hparams,
+    spec: &ModelSpec,
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<Option<vision_seat::Opened>, GateError> {
     #[cfg(not(feature = "vision"))]
@@ -1299,11 +1303,8 @@ fn vision_of(
         place,
         &[vision::arch::qwen3vl::PROJECTOR_TYPE],
         &vision_seat::TextFacts {
-            n_embd: hp.n_embd,
-            imrope: Some(hp.rope_sections),
-            ple: vision_seat::PleImage::of(
-                hp.exp.as_ref().and_then(|exp| exp.ple).map(|ple| ple.image),
-            ),
+            ple: vision_seat::PleImage::of_spec(spec),
+            ..vision_seat::TextFacts::of_imrope(spec)?
         },
         token,
     )
@@ -1464,7 +1465,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let vision = vision_of(
         &a.vision,
         (draft_at.cards, !mtp && !feed.stepped()),
-        &inputs.hp,
+        &inputs.spec,
         &token,
     )?;
     let (mtp, draft_off) = if vision.is_some() {
@@ -2199,7 +2200,7 @@ impl Q38 {
         // difference.
         let mut inputs = PlanInputs::describe(model.header())?;
         inputs.room = a.room.clone();
-        let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
+        let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.spec)?;
         let ub = ubatch_for(a.ctx)?;
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
         // The sequences the load makes pin the body's budget at this context;
@@ -2291,7 +2292,7 @@ impl Q38 {
             a.ctx,
             a.slots,
             a.ctx,
-            inputs.hp.n_ctx_train,
+            inputs.spec.ctx_train,
             m.layers().len(),
             m.body(WHAT)?.store_bytes(),
             a.feed.name(),

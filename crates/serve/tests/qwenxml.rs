@@ -1242,6 +1242,120 @@ fn hw_qwen_malformed_call_is_an_api_error() {
     }
 }
 
+/// A generation the token limit cuts inside a call is an answer, as llama-server answers it (its chat parser reads
+/// the end of the text as the end of the input): 200 with `finish_reason` `length`. Cut before the function's name
+/// is whole, the text read is `content` and no call is made; cut after it, the call stands with the arguments read
+/// (`{`, then `{"location":"Seo` with a string value open), the text before it stays content, and a stream folds to
+/// the same message. `/v1/messages` holds only closed calls: the cut call is text and `stop_reason` is
+/// `max_tokens`. A generation that ends on its own inside a call stays the error
+/// (`hw_qwen_malformed_call_is_an_api_error`).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_qwen_call_cut_by_the_limit_is_an_answer() {
+    use serve::Tokenizer;
+    const SCRIPT: &str = "</think>Calling.<tool_call>\n<function=get_weather>\n<parameter=location>\nSeoul\n</parameter>\n</function>\n</tool_call>";
+    /// The cut: the script's start, the content a chat answer holds, the call it holds.
+    type Cut = (
+        &'static str,
+        &'static str,
+        Option<(&'static str, &'static str)>,
+    );
+    let cuts: [Cut; 3] = [
+        (
+            "</think>Calling.<tool_call>\n<func",
+            "Calling.<tool_call>\n<func",
+            None,
+        ),
+        (
+            "</think>Calling.<tool_call>\n<function=get_weather>\n<para",
+            "Calling.",
+            Some(("get_weather", "{")),
+        ),
+        (
+            "</think>Calling.<tool_call>\n<function=get_weather>\n<parameter=location>\nSeo",
+            "Calling.",
+            Some(("get_weather", r#"{"location":"Seo"#)),
+        ),
+    ];
+    let addr = start(SCRIPT);
+    for (read, content, call) in cuts {
+        assert!(SCRIPT.starts_with(read), "{read:?} is the script's start");
+        let tokens = serve::MockTokenizer.encode(read).len();
+        let want: Vec<Value> = call
+            .iter()
+            .map(|(name, arguments)| json!({"name": name, "arguments": arguments}))
+            .collect();
+        let mut body = tool_body(false);
+        body["max_tokens"] = json!(tokens);
+        let r = post(addr, "/v1/chat/completions", &body);
+        assert_eq!(r.status, 200, "{read:?}: {}", r.body);
+        let v = r.json();
+        let c = &v["choices"][0];
+        assert_eq!(c["finish_reason"], "length", "{read:?}: {v}");
+        assert_eq!(c["message"]["content"], content, "{read:?}: {v}");
+        let calls: Vec<Value> = c["message"]["tool_calls"]
+            .as_array()
+            .map(|a| a.iter().map(|tc| tc["function"].clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(calls, want, "{read:?}: {v}");
+
+        body["stream"] = json!(true);
+        let r = post(addr, "/v1/chat/completions", &body);
+        assert_eq!(r.status, 200, "{read:?}: {}", r.body);
+        let events: Vec<Value> = r
+            .body
+            .split("\n\n")
+            .filter_map(|e| e.strip_prefix("data: "))
+            .filter(|e| *e != "[DONE]")
+            .map(|e| serde_json::from_str(e).expect("chunk JSON"))
+            .collect();
+        assert!(
+            events.iter().all(|e| e.get("error").is_none()),
+            "{read:?}: {}",
+            r.body
+        );
+        let finish = events
+            .iter()
+            .find_map(|e| e["choices"][0]["finish_reason"].as_str());
+        assert_eq!(finish, Some("length"), "{read:?}: {}", r.body);
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(streamed, content, "{read:?}: streamed == non-streamed");
+        if call.is_some() {
+            let (_, folded) = fold_stream(&r.body).unwrap_or_else(|e| panic!("{read:?}: {e}"));
+            assert_eq!(
+                folded["calls"],
+                json!(want),
+                "{read:?}: streamed == non-streamed"
+            );
+        }
+
+        let b = json!({
+            "model": "m",
+            "max_tokens": tokens,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "temperature": 0,
+            "tools": [{"name": "get_weather", "description": "",
+                "input_schema": {"type": "object", "properties": {
+                    "location": {"type": "string"}, "days": {"type": "integer"}}}}],
+        });
+        let r = post(addr, "/v1/messages", &b);
+        assert_eq!(r.status, 200, "{read:?}: {}", r.body);
+        let v = r.json();
+        assert_eq!(v["stop_reason"], "max_tokens", "{read:?}: {v}");
+        let blocks = v["content"].as_array().expect("content blocks");
+        assert!(blocks.iter().all(|b| b["type"] == "text"), "{read:?}: {v}");
+        let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        assert_eq!(
+            Some(text.as_str()),
+            read.strip_prefix("</think>"),
+            "{read:?}: the text read, whole"
+        );
+    }
+}
+
 /// The content after the think span, on every fixture template
 /// ([`FIXTURE_TEMPLATES`]), as llama.cpp mainline's chat layer parses the same
 /// generation (`tools/ref/chat_parse_ref` over each template, one user turn,
