@@ -1151,7 +1151,14 @@ fn fixture_card() -> Result<model::placement::workstation::CardSpec, GateError> 
     if let Some(c) = A.get() {
         return Ok(*c);
     }
-    let specs = crate::generate::Place::A.on_host_alone()?.card_specs()?;
+    let specs = crate::generate::Place::A
+        .on_with(
+            &crate::gpu_census::census()?,
+            &bloomery_levers::card_budget()?,
+            &bloomery_levers::card_margin()?,
+            &[],
+        )?
+        .card_specs()?;
     let card = *specs.first().ok_or("--place a resolved to no card")?;
     Ok(*A.get_or_init(|| card))
 }
