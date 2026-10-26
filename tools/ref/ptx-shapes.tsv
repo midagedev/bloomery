@@ -271,7 +271,6 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # through the 484 step. The spill pin stands (484 read again). The entry launches only where dense_mma holds, cc 12.1
 # (q8f32.rs Q8F32Kernels::load), so these cc 8.6 bytes are never run.
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
-# The cc 8.6 JIT was not measured; its historical 104 B pin is retained.
 # PIN(2026-10-26): hc_gated_up_mma_mix_4 jit_local 104 -> 216 on cc 8.6 (gate-ptx-spill on the box's RTX card, the
 # type train's union batch): a534227ca raised its sm_86 spill 484 -> 608 with the BF16 head-norm finish and kept the
 # older jit_local, which a GB10 cannot measure; the entry's PTX is main's (ptx-compare 43073091b: changed none).
