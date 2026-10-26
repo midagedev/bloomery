@@ -1,14 +1,31 @@
-/// Slots in one launch: eight routed experts and the shared expert.
-pub const EXPERT_SLOTS: usize = 9;
+use crate::instance::{HOST, Instance};
 
-/// Ids a launch reads. The shared slot has none.
-pub const ROUTED_IDS: usize = 8;
+/// Slots in one launch of `inst`'s experts: its routed picks, and a gated
+/// shared expert's slot after them.
+#[must_use]
+pub const fn slots(inst: &Instance) -> usize {
+    inst.key.moe.top_k as usize + inst.key.moe.router.rule.gated as usize
+}
 
-/// The slot that reads the shared expert.
-pub const SHARED_SLOT: usize = 8;
+/// Slots in one launch of the host instance's experts.
+pub const EXPERT_SLOTS: usize = slots(&HOST);
 
-/// The expert intermediate width. The pair's rows and the fold's K are this.
-pub const EXPERT_K: usize = 512;
+/// Ids a launch reads: the host instance's picks. The shared slot has none.
+pub const ROUTED_IDS: usize = HOST.key.moe.top_k as usize;
+
+/// The slot of `inst`'s experts that reads the shared expert: the one after
+/// the routed ids.
+#[must_use]
+pub const fn shared_slot(inst: &Instance) -> usize {
+    inst.key.moe.top_k as usize
+}
+
+/// The slot of the host instance's experts that reads the shared expert.
+pub const SHARED_SLOT: usize = shared_slot(&HOST);
+
+/// The expert intermediate width: the host instance's. The pair's rows and
+/// the fold's K are this.
+pub const EXPERT_K: usize = HOST.key.moe.expert_ff as usize;
 
 /// Blocks of K': the slots, two blocks of [`EXPERT_K`] each. A block holds 256
 /// values, the mat-vec geometry's block.

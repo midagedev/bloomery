@@ -1,23 +1,39 @@
-/// Values in one head.
-pub const HEAD_DIM: usize = 256;
+use crate::instance::{HOST, Instance};
 
-/// The partial rope: the first 64 values turn, in 32 pairs.
-pub const ROT: usize = 64;
+/// Values in one head: the host instance's.
+pub const HEAD_DIM: usize = HOST.key.attn.row.head as usize;
 
-/// Query heads.
-pub const QUERY_HEADS: usize = 16;
+/// The partial rope: the values of a head that turn, in pairs from the
+/// first. The host instance's.
+pub const ROT: usize = HOST.key.attn.rot as usize;
 
-/// Key and value heads.
-pub const KV_HEADS: usize = 2;
+/// Query heads: the host instance's.
+pub const QUERY_HEADS: usize = HOST.key.attn.n_head as usize;
+
+/// Key and value heads: the host instance's.
+pub const KV_HEADS: usize = HOST.key.attn.n_kv as usize;
+
+/// Query heads per key head of `inst`.
+#[must_use]
+pub const fn gqa(inst: &Instance) -> usize {
+    (inst.key.attn.n_head / inst.key.attn.n_kv) as usize
+}
 
 /// Query heads per key head.
-pub const GQA: usize = QUERY_HEADS / KV_HEADS;
+pub const GQA: usize = gqa(&HOST);
 
 /// Keys in one K/V tile.
 pub const TILE: usize = 16;
 
+/// SIMD groups in the flash threadgroup of `inst`: its group of query
+/// heads, [`HEADS_PER_SG`] a SIMD group.
+#[must_use]
+pub const fn simd_groups(inst: &Instance) -> usize {
+    gqa(inst) / HEADS_PER_SG
+}
+
 /// SIMD groups in the flash threadgroup.
-pub const SIMD_GROUPS: usize = 8;
+pub const SIMD_GROUPS: usize = simd_groups(&HOST);
 
 /// The width of a SIMD group.
 pub const SIMD_WIDTH: usize = 32;
@@ -28,11 +44,25 @@ pub const HEADS_PER_SG: usize = 1;
 /// Values one lane holds. The SIMD group covers the head.
 pub const LANE_DIMS: usize = HEAD_DIM / SIMD_WIDTH;
 
-/// One segment partial: the max, the weight sum, then the head.
-pub const PARTIAL_ELEMS: usize = HEAD_DIM + 2;
+/// One segment partial of a head of `head` values: the max, the weight sum,
+/// then the head.
+#[must_use]
+pub const fn partial_elems(head: usize) -> usize {
+    head + 2
+}
+
+/// One segment partial.
+pub const PARTIAL_ELEMS: usize = partial_elems(HEAD_DIM);
+
+/// One head of `inst`'s query projection: the query, then the gate when it
+/// writes one.
+#[must_use]
+pub const fn qg_stride(inst: &Instance) -> usize {
+    inst.key.attn.row.head as usize * (1 + inst.key.attn.q_gate as usize)
+}
 
 /// One head of the query projection: the query, then the gate.
-pub const QG_STRIDE: usize = HEAD_DIM * 2;
+pub const QG_STRIDE: usize = qg_stride(&HOST);
 
 /// The live-key ceiling one segment holds. At or under it the flash is one
 /// dispatch that finishes in its epilogue; past it the segment rule splits
@@ -40,8 +70,14 @@ pub const QG_STRIDE: usize = HEAD_DIM * 2;
 /// model reads this as the waterline its two scenes sit either side of).
 pub const SEGMENT_KEYS: usize = 64;
 
+/// Threads in the flash threadgroup of `inst`.
+#[must_use]
+pub const fn flash_threads(inst: &Instance) -> usize {
+    SIMD_WIDTH * simd_groups(inst)
+}
+
 /// Threads in the flash threadgroup.
-pub const FLASH_THREADS: usize = SIMD_WIDTH * SIMD_GROUPS;
+pub const FLASH_THREADS: usize = flash_threads(&HOST);
 
 /// `1/sqrt(256)`, exact.
 pub const SCALE: f32 = 0.0625;
@@ -68,6 +104,7 @@ const _: () = {
     assert!(QG_STRIDE == HEAD_DIM * 2);
     assert!(FLASH_THREADS == 256);
     assert!(SCALE == 1.0 / 16.0);
+    assert!(SCALE * SCALE * HEAD_DIM as f32 == 1.0);
     assert!(PREFILL_POSITIONS * SIMD_WIDTH == 128);
     assert!(PREFILL_KEYS == 16);
     assert!(GQA == 8);

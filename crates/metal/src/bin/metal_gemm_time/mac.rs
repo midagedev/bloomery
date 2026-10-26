@@ -103,6 +103,7 @@ mod variants;
 const PEAK_SOURCE: &str = include_str!("probe_peak.metal");
 
 use bloomery_metal::device::MetalDevice;
+use bloomery_metal::instance::HOST;
 
 /// The working set the weights rotate through: large enough that a timed
 /// dispatch's weights were not just read by another.
@@ -414,7 +415,7 @@ fn run() -> Result<(), String> {
         arms = vec![Arm::Engine(Operand::F16), Arm::Engine(Operand::F32)];
     }
 
-    let device = MetalDevice::open().map_err(|e| format!("the Metal device: {e}"))?;
+    let device = MetalDevice::open(&HOST).map_err(|e| format!("the Metal device: {e}"))?;
     let info = device.info().map_err(why)?;
     let stream = device.stream();
     println!(

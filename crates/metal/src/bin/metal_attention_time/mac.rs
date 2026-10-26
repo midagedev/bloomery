@@ -30,6 +30,7 @@ use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, Stream};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
+use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::{
     AttentionParams, AttnCache, KV_HEADS, Kernels, QUERY_HEADS, SCALE, f16_len, out_len,
     partials_len, qg_len, segments_for_keys,
@@ -681,7 +682,7 @@ pub fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let device = match MetalDevice::open() {
+    let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
             println!("metal_attention_time: REFUSED ({e})");

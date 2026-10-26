@@ -16,8 +16,9 @@ use crate::fault::MetalFaultWord;
 use super::geometry::ROWS_PER_SIMD_GROUP;
 use super::{Kernels, Quant, args_bytes, check_window_len, pack, word};
 
-/// The columns of every row.
-pub const HEAD_K: usize = 2048;
+/// The columns of every row of the host instance's head: its hidden width.
+/// A launch takes any positive multiple of the type's block values.
+pub const HEAD_K: usize = crate::instance::HOST.key.hidden as usize;
 
 /// The SIMD groups in the head's threadgroup.
 pub const HEAD_SIMD_GROUPS: usize = 8;
@@ -47,8 +48,8 @@ pub struct HeadParams<'w> {
     /// The output rows: the file's vocabulary for the engine's head. A launch
     /// accepts any positive count.
     pub rows: usize,
-    /// The columns, a positive multiple of the type's block values. The
-    /// engine's head reads [`HEAD_K`].
+    /// The columns, a positive multiple of the type's block values: the
+    /// file's hidden width for the engine's head.
     pub k: usize,
     /// The SIMD groups in the threadgroup. The kernel runs
     /// [`HEAD_SIMD_GROUPS`] and no other count.

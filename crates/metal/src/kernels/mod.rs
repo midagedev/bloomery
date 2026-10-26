@@ -84,6 +84,7 @@ pub use seg::{SegParams, Segment};
 use bloomery_device::DeviceError;
 
 use crate::device::MetalDevice;
+use crate::instance::HOST;
 use crate::library::{GemmPath, Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
@@ -204,7 +205,8 @@ impl Kernels {
     /// `router_sg` the router's own SIMD-group count, another source
     /// constant. The probe compiles variant sources and names their counts
     /// here; the launches' geometry follows what they name. A `rows` or
-    /// `router_sg` the library's source does not define is refused by name.
+    /// `router_sg` the library's source does not define, and a library of
+    /// another instance than the host's ([`HOST`]), are refused by name.
     pub fn with_geometry(
         library: &Library,
         rows: usize,
@@ -231,6 +233,19 @@ impl Kernels {
                     geometry::MAX_SIMD_GROUPS_PER_GROUP
                 ),
             });
+        }
+        // The launches' grids and the buffers' lengths are the host
+        // instance's: a library of another instance's geometry would be
+        // launched over rows and heads its kernels do not hold.
+        if *library.instance() != HOST {
+            return Err(DeviceError::unsupported(
+                "kernels",
+                format!(
+                    "the library is instance {}; the host's launches are sized for {}",
+                    library.instance().name,
+                    HOST.name
+                ),
+            ));
         }
         // The counts are the source's `#define`s: a count the library was not
         // compiled with would launch threadgroups over rows no kernel writes.
