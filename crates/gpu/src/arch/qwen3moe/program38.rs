@@ -55,7 +55,8 @@
 //! them the go and the wait, stream memory-operation batches
 //! ([`STEP_MEMOPS`] a layer) — and the card leg's [`CARD_LAUNCHES`] on a
 //! layer with card experts ([`TIER_CARD_LAUNCHES`] on a tier layer); then
-//! the head's mix, projection and argmax. A layer without a host leg
+//! the head's mix ([`HEAD_MIX_LAUNCHES`]) and the head's own launches
+//! ([`HeadLaunches`]). A layer without a host leg
 //! ([`Card38::hostless`]) has no go and no wait.
 
 use super::body::ATTN_SCALE_256;
@@ -74,7 +75,7 @@ use crate::graph::Forked;
 use crate::hc_gated::{
     Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, MixArgs, SiteWeights,
 };
-use crate::head::Head;
+use crate::head::{Head, HeadLaunches};
 use crate::host::handoff::{Handoff, HandoffKernels, Places};
 use crate::host::run::HostRun;
 use crate::host::{BatchLeg, StepLeg};
@@ -86,11 +87,11 @@ use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::MtpKernels;
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
 use crate::q38::{
-    CardSharedAddArgs, EmbedArgs, EmbedRows, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
+    CardSharedAddArgs, EmbedIo, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
 };
 use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
-use crate::site;
+use crate::site::{self, ByName, ByNameKernels, Out};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Branch, Gpu, GpuError};
@@ -125,26 +126,18 @@ pub(super) const FFN_LAUNCHES: usize = 1 + 1 + 1 + 4 + 1 + 1;
 /// the wait, which a layer without a host leg ([`Card38::hostless`]) goes
 /// without.
 pub(super) const STEP_MEMOPS: usize = 2;
-/// The head: its mix, the projection and the argmax.
-pub(super) const HEAD_LAUNCHES: usize = 3 + 2;
-
-/// The head's launches in a captured walk for its borrowed form — the one
-/// owner of the form is `model::arch::qwen35moe::mtp` (`head_kind`, its
-/// `output_form` the borrow check asks): [`HEAD_LAUNCHES`] for the Q8_0
-/// planes and the BF16 words, whose projections read the normed f32 rows; a Q6_K word plane's
-/// walk quantizes its input rows to q8_1 first, one launch more
-/// (`Head::enqueue`'s `enqueue_quantize_q8_1_head`).
-fn head_launches(head: model::arch::qwen35moe::mtp::BorrowedHead) -> usize {
-    HEAD_LAUNCHES
-        + usize::from(matches!(
-            head,
-            model::arch::qwen35moe::mtp::BorrowedHead::Q6K
-        ))
-}
+/// The head's mix: the last layer's combine and the final norm, into the
+/// head's input. The head's own launches are [`HeadLaunches::at`]'s.
+pub(super) const HEAD_MIX_LAUNCHES: usize = 3;
 
 /// A delta layer's launches past [`GDN_LAUNCHES`] at more than one row: the
 /// joined β·α projection runs as β's rows and α's rows, one launch each.
 pub(super) const GDN_ROWS_LAUNCHES: usize = 1;
+
+// A layer's launches past those the constants count are its by-name
+// projections' ([`Layer38::by_extra`]): the quantization of each K-quant
+// site's input rows, and past one row the token-major copy of a row-major
+// type's result ([`site::by_name_extra`], from the resident types).
 
 /// The captured decode step's launches for `plans` with `card`'s card
 /// experts and `tier`'s tier layers (module doc).
@@ -152,21 +145,21 @@ pub(super) fn step_launches(
     plans: &[Layer38],
     card: &Card38,
     tier: Option<&TierSide38>,
-    head: model::arch::qwen35moe::mtp::BorrowedHead,
+    head: HeadLaunches,
 ) -> usize {
     walk_launches(plans, card, tier, 1, head)
 }
 
 /// The captured verify's launches for `plans` with `card`'s card experts and
 /// `tier`'s tier layers at `m >= 2` rows: the step's, plus each delta
-/// layer's [`GDN_ROWS_LAUNCHES`]; the handoff, the go, the wait, the card
-/// leg and the head are one each whatever `m`.
+/// layer's [`GDN_ROWS_LAUNCHES`]; the handoff, the go, the wait and the card
+/// leg are one each whatever `m`, and the head's are [`HeadLaunches::at`]'s.
 pub(super) fn verify_launches(
     plans: &[Layer38],
     card: &Card38,
     tier: Option<&TierSide38>,
     m: usize,
-    head: model::arch::qwen35moe::mtp::BorrowedHead,
+    head: HeadLaunches,
 ) -> usize {
     walk_launches(plans, card, tier, m, head)
 }
@@ -176,7 +169,7 @@ fn walk_launches(
     card: &Card38,
     tier: Option<&TierSide38>,
     m: usize,
-    head: model::arch::qwen35moe::mtp::BorrowedHead,
+    head: HeadLaunches,
 ) -> usize {
     let rows = m > 1;
     1 + plans
@@ -194,6 +187,7 @@ fn walk_launches(
             };
             MIX_LAUNCHES
                 + mixer
+                + p.by_extra(m)
                 + ffn
                 + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
                 + match (card.has(l), tier.is_some_and(|t| t.k(l) > 0)) {
@@ -203,7 +197,8 @@ fn walk_launches(
                 }
         })
         .sum::<usize>()
-        + head_launches(head)
+        + HEAD_MIX_LAUNCHES
+        + head.at(m)
 }
 
 /// Every module a Qwen3.8 walk launches besides the `Gpu`'s own.
@@ -227,11 +222,16 @@ pub(super) struct Kernels38 {
     pub(super) hcw: HcWideKernels,
     /// The MTP draft layer's input pack and head argmax (`mtp38`).
     pub(super) mtp: MtpKernels,
+    /// The K-quant gemvs and the token-major copy a by-name projection of a
+    /// site that reads q8_1 rows launches; `None` on a load whose sites all
+    /// read the f32 rows or q8 blocks of 32.
+    pub(super) by: Option<ByNameKernels>,
 }
 
 impl Kernels38 {
-    /// Load every module into `gpu`'s context. Load-time only.
-    pub(super) fn load(gpu: &Gpu) -> Result<Kernels38, GpuError> {
+    /// Load every module into `gpu`'s context, the by-name projections' when
+    /// `by_name` (a site reads q8_1 rows). Load-time only.
+    pub(super) fn load(gpu: &Gpu, by_name: bool) -> Result<Kernels38, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels38 {
             q38: Q38Kernels::load(ctx)?,
@@ -249,6 +249,7 @@ impl Kernels38 {
             prefill: FlashGqaPrefill::load(ctx)?,
             hcw: HcWideKernels::load(ctx)?,
             mtp: MtpKernels::load(ctx)?,
+            by: by_name.then(|| ByNameKernels::load(gpu)).transpose()?,
         })
     }
 }
@@ -266,9 +267,11 @@ pub(super) struct Ctx38<'a> {
 }
 
 impl Ctx38<'_> {
-    /// `y = W · x` for the dense weight `name` over `m` columns, token-major:
-    /// the common dense site at the type of its resident form
-    /// (`site::resident_gemv_cols`; `plan38::plans` checks it is one).
+    /// `y = W · x` for the dense weight `name` over `m` columns of the f32
+    /// rows `x`, token-major, at the site type of its resident form
+    /// ([`site::resident_gemv_cols`]): the draft layer's sites, which
+    /// `Mtp38::arm` checks read the f32 rows or q8 planes (`site::BY_NAME`);
+    /// a K-quant site is [`Ctx38::project`]'s.
     pub(super) fn dense_gemv(
         &self,
         name: &str,
@@ -276,20 +279,63 @@ impl Ctx38<'_> {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        self.dense_gemv_on(self.gpu.stream(), name, x, m, y)
+        site::resident_gemv_cols_on(
+            self.gpu,
+            self.gpu.stream(),
+            Some(&self.k.g32),
+            (self.w, name),
+            x,
+            m,
+            y,
+        )
     }
 
-    /// [`Ctx38::dense_gemv`] on `stream`, which the caller orders before
-    /// the output's readers.
-    fn dense_gemv_on(
+    /// `out = W · x` for the dense weight `name` over `m` columns, token-major:
+    /// the common dense site at the type of its resident form, by name
+    /// ([`ByName::gemv_on`]; `plan38::plans` checks it is one). `bn` holds the
+    /// forms of the stream the projection runs on, `sink` the layer's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the forms, the site, the rows, their count, the sink and the output (rust-quality R8)"
+    )]
+    pub(super) fn project(
         &self,
-        stream: &CudaStream,
+        bn: &mut ByName,
         name: &str,
         x: &DeviceBuffer<f32>,
         m: usize,
-        y: &mut DeviceBuffer<f32>,
+        sink: FaultSink,
+        out: Out<'_>,
     ) -> Result<(), GpuError> {
-        site::resident_gemv_cols_on(self.gpu, stream, Some(&self.k.g32), (self.w, name), x, m, y)
+        self.project_on(self.gpu.stream(), bn, name, x, m, sink, out)
+    }
+
+    /// [`Ctx38::project`] on `stream`, which the caller orders before the
+    /// output's readers; `bn` is the one that stream's projections share.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the stream, the forms, the site, the rows, their count, the sink and the output (rust-quality R8)"
+    )]
+    pub(super) fn project_on(
+        &self,
+        stream: &CudaStream,
+        bn: &mut ByName,
+        name: &str,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        sink: FaultSink,
+        out: Out<'_>,
+    ) -> Result<(), GpuError> {
+        bn.gemv_on(
+            self.gpu,
+            stream,
+            (self.k.by.as_ref(), Some(&self.k.g32)),
+            (self.w, name),
+            sink,
+            x,
+            m,
+            out,
+        )
     }
 
     /// The mix of `site` over `m` columns of `res`, after `before`, into
@@ -528,8 +574,15 @@ impl Parts38<'_> {
             tap(&mut self.taps, &s.res[self.cur], l - 1, gpu)?;
             let w = c.w;
             let pl = &mut s.ple;
-            c.dense_gemv(&pp.key, &pl.e, m, &mut pl.key)?;
-            c.dense_gemv(&pp.value, &pl.e, m, &mut pl.value)?;
+            c.project(&mut s.by, &pp.key, &pl.e, m, sink, Out::whole(&mut pl.key))?;
+            c.project(
+                &mut s.by,
+                &pp.value,
+                &pl.e,
+                m,
+                sink,
+                Out::whole(&mut pl.value),
+            )?;
             let x = &s.res[self.cur];
             c.k.ple.enqueue_gate(
                 stream,
@@ -634,20 +687,31 @@ impl Parts38<'_> {
     /// `sh_y`: gate and up, SwiGLU, down.
     fn shared(
         &mut self,
-        stream: &CudaStream,
+        (stream, forked): (&CudaStream, bool),
         l: usize,
         x: Option<&DeviceBuffer<f32>>,
     ) -> Result<(), GpuError> {
         let p = plan_of(self.plans, l)?;
+        let sink = self.c.gpu.layer_sink(l)?;
         let (c, m) = (&self.c, self.m);
         let s = &mut *self.s;
         let x = x.unwrap_or(&s.ffn_x);
-        c.dense_gemv_on(stream, &p.ffn.gate_sh, x, m, &mut s.sh_g)?;
-        c.dense_gemv_on(stream, &p.ffn.up_sh, x, m, &mut s.sh_u)?;
+        let bn = if forked { &mut s.by_fork } else { &mut s.by };
+        let f = &p.ffn;
+        c.project_on(stream, bn, &f.gate_sh, x, m, sink, Out::whole(&mut s.sh_g))?;
+        c.project_on(stream, bn, &f.up_sh, x, m, sink, Out::whole(&mut s.sh_u))?;
         c.gpu
             .elem()
             .enqueue_swiglu(stream, &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
-        c.dense_gemv_on(stream, &p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
+        c.project_on(
+            stream,
+            bn,
+            &f.down_sh,
+            &s.sh_h,
+            m,
+            sink,
+            Out::whole(&mut s.sh_y),
+        )
     }
 
     /// Layer `l`'s shadow over `x` (`None`: the arena's `ffn_x`): the shared
@@ -664,10 +728,10 @@ impl Parts38<'_> {
     ) -> Result<(), GpuError> {
         if !self.card.has(l) {
             let gpu = self.c.gpu;
-            return self.shared(gpu.stream(), l, x);
+            return self.shared((gpu.stream(), false), l, x);
         }
         let fork = branch.fork()?;
-        self.shared(fork.stream(), l, x)?;
+        self.shared((fork.stream(), true), l, x)?;
         self.card(l, x)?;
         fork.join()
     }
@@ -854,24 +918,21 @@ impl Parts38<'_> {
 /// Each sequence's embedding of its ids into its rows of `s` — `emb`, and
 /// each row's position and live key count — from its own input record.
 fn embed(c: &Ctx38<'_>, seqs: &Seqs38<'_>, s: &mut Arena38) -> Result<(), GpuError> {
-    let table = EmbedRows::of(
-        c.w,
-        "qwen3moe::program38::embed",
-        &model::arch::qwen35moe::names::token_embd(),
-    )?;
-    let (gpu, stream) = (c.gpu, c.gpu.stream());
+    const WHAT: &str = "qwen3moe::program38::embed";
+    let name = model::arch::qwen35moe::names::token_embd();
     let Arena38 {
         emb, pos, n_keys, ..
     } = s;
     match seqs {
-        Seqs38::One { io, .. } => c.k.q38.enqueue_embed_rows(
-            stream,
-            EmbedArgs {
-                table,
+        Seqs38::One { io, .. } => c.k.q38.enqueue_embed_lookup(
+            c.gpu,
+            WHAT,
+            (c.w, &name),
+            EmbedIo {
                 ids: io.ids,
                 pos0: io.pos0,
                 first: io.first,
-                fault: gpu.unlabelled_sink(),
+                width: geo::HIDDEN,
                 y: emb,
                 pos,
                 n_keys,
@@ -880,14 +941,15 @@ fn embed(c: &Ctx38<'_>, seqs: &Seqs38<'_>, s: &mut Arena38) -> Result<(), GpuErr
         Seqs38::Slots(seqs) => {
             for q in seqs {
                 let r = &q.rows;
-                c.k.q38.enqueue_embed_rows(
-                    stream,
-                    EmbedArgs {
-                        table,
+                c.k.q38.enqueue_embed_lookup(
+                    c.gpu,
+                    WHAT,
+                    (c.w, &name),
+                    EmbedIo {
                         ids: q.io.ids,
                         pos0: q.io.pos0,
                         first: q.io.first,
-                        fault: gpu.unlabelled_sink(),
+                        width: geo::HIDDEN,
                         y: &mut *rows_mut(emb, r, geo::HIDDEN)?,
                         pos: &mut *rows_mut(pos, r, 1)?,
                         n_keys: &mut *rows_mut(n_keys, r, 1)?,
@@ -992,7 +1054,7 @@ fn gdn(
     (l, m, each): (usize, usize, bool),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    let fork = gdn_in(c, gp, branch, s, m)?;
+    let fork = gdn_in(c, gp, branch, s, (m, sink))?;
     let nv = GDN.n_v;
     {
         let Arena38 { gdn: g, pos, .. } = &mut *s;
@@ -1061,14 +1123,20 @@ fn gdn_in<'b>(
     gp: &GdnPlan,
     branch: &'b mut Branch,
     s: &mut Arena38,
-    m: usize,
+    (m, sink): (usize, FaultSink),
 ) -> Result<Forked<'b>, GpuError> {
     let nv = GDN.n_v;
-    let Arena38 { mixed, gdn: g, .. } = s;
-    c.dense_gemv(&gp.qkv, mixed, m, &mut g.x)?;
+    let Arena38 {
+        mixed,
+        gdn: g,
+        by,
+        by_fork,
+        ..
+    } = s;
+    c.project(by, &gp.qkv, mixed, m, sink, Out::whole(&mut g.x))?;
     let fork = branch.fork()?;
     if m == 1 {
-        c.dense_gemv(&gp.beta_alpha, mixed, 1, &mut g.ba)?;
+        c.project(by, &gp.beta_alpha, mixed, 1, sink, Out::whole(&mut g.ba))?;
     } else {
         let g32 = Some(&c.k.g32);
         for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
@@ -1076,7 +1144,15 @@ fn gdn_in<'b>(
             site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, part), mixed, m, &mut y)?;
         }
     }
-    c.dense_gemv_on(fork.stream(), &gp.z, mixed, m, &mut g.z)?;
+    c.project_on(
+        fork.stream(),
+        by_fork,
+        &gp.z,
+        mixed,
+        m,
+        sink,
+        Out::whole(&mut g.z),
+    )?;
     Ok(fork)
 }
 
@@ -1195,7 +1271,11 @@ fn gdn_out(
     let (w, stream) = (c.w, c.gpu.stream());
     let nv = GDN.n_v;
     let Arena38 {
-        gdn: g, attn, y, ..
+        gdn: g,
+        attn,
+        y,
+        by,
+        ..
     } = s;
     c.k.linear.norm_gate.enqueue_norm_gate_sigmoid(
         stream,
@@ -1211,7 +1291,7 @@ fn gdn_out(
         },
     )?;
     debug_assert_eq!(nv * linear::HEAD, geo::ATTN);
-    c.dense_gemv(&gp.ssm_out, &*attn, m, y)
+    c.project(by, &gp.ssm_out, &*attn, m, sink, Out::whole(y))
 }
 
 /// The rows a selecting layer's indexer keys of one sequence read and
@@ -1256,7 +1336,7 @@ fn qsa(
     (l, m): (usize, usize),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    let fork = qsa_qkv(c, qp, branch, s, m)?;
+    let fork = qsa_qkv(c, qp, branch, s, (m, sink))?;
     match seqs {
         Seqs38::One { stores, .. } => {
             let (kv, raw, pooled) = qsa_of(stores, l)?;
@@ -1266,6 +1346,7 @@ fn qsa(
                     qsa: qa,
                     pos,
                     n_keys,
+                    by,
                     ..
                 } = &mut *s;
                 let keys = KeysIo {
@@ -1274,9 +1355,9 @@ fn qsa(
                     pos,
                     n_keys,
                 };
-                qsa_keys(c, qp, (raw, pooled), keys, m, sink)?;
+                qsa_keys(c, qp, by, (raw, pooled), keys, (m, sink))?;
             }
-            qsa_query(c, qp, s, m)?;
+            qsa_query(c, qp, s, (m, sink))?;
             fork.join()?;
             let Arena38 {
                 qsa: qa,
@@ -1301,7 +1382,7 @@ fn qsa(
             unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink) }?;
         }
         Seqs38::Slots(seqs) => {
-            qsa_query(c, qp, s, m)?;
+            qsa_query(c, qp, s, (m, sink))?;
             fork.join()?;
             let (h, d) = (geo::HIDDEN, geo::IDX_DIM);
             let Arena38 {
@@ -1310,6 +1391,7 @@ fn qsa(
                 pos,
                 n_keys,
                 flash,
+                by,
                 ..
             } = &mut *s;
             for q in seqs {
@@ -1328,7 +1410,7 @@ fn qsa(
                     pos: &pos,
                     n_keys: &n_keys,
                 };
-                qsa_keys(c, qp, (raw, pooled), keys, r.len(), sink)?;
+                qsa_keys(c, qp, by, (raw, pooled), keys, (r.len(), sink))?;
                 let io = AttendIo {
                     qsel: &*rows_of(&qa.qi, r, geo::IDX_HEADS * d)?,
                     n_keys: &n_keys,
@@ -1358,13 +1440,27 @@ fn qsa_qkv<'b>(
     qp: &QsaPlan,
     branch: &'b mut Branch,
     s: &mut Arena38,
-    m: usize,
+    (m, sink): (usize, FaultSink),
 ) -> Result<Forked<'b>, GpuError> {
-    let Arena38 { mixed, qsa: qa, .. } = s;
+    let Arena38 {
+        mixed,
+        qsa: qa,
+        by,
+        by_fork,
+        ..
+    } = s;
     let fork = branch.fork()?;
-    c.dense_gemv(&qp.k, mixed, m, &mut qa.k)?;
-    c.dense_gemv(&qp.v, mixed, m, &mut qa.v)?;
-    c.dense_gemv_on(fork.stream(), &qp.q, mixed, m, &mut qa.qg)?;
+    c.project(by, &qp.k, mixed, m, sink, Out::whole(&mut qa.k))?;
+    c.project(by, &qp.v, mixed, m, sink, Out::whole(&mut qa.v))?;
+    c.project_on(
+        fork.stream(),
+        by_fork,
+        &qp.q,
+        mixed,
+        m,
+        sink,
+        Out::whole(&mut qa.qg),
+    )?;
     Ok(fork)
 }
 
@@ -1374,14 +1470,14 @@ fn qsa_qkv<'b>(
 fn qsa_keys(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
+    bn: &mut ByName,
     (raw, pooled): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>),
     io: KeysIo<'_>,
-    m: usize,
-    sink: FaultSink,
+    (m, sink): (usize, FaultSink),
 ) -> Result<(), GpuError> {
     let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
     let KeysIo { x, kr, pos, n_keys } = io;
-    c.dense_gemv(&qp.idx_k, x, m, kr)?;
+    c.project(bn, &qp.idx_k, x, m, sink, Out::whole(&mut *kr))?;
     c.k.q38.enqueue_key_append(
         stream,
         KeyAppendArgs {
@@ -1411,9 +1507,16 @@ fn qsa_keys(
 
 /// A selecting layer's indexer queries over every row of `s.mixed` into
 /// `qi`, token-major.
-fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
-    let Arena38 { mixed, qsa: qa, .. } = s;
-    c.dense_gemv(&qp.idx_q, mixed, m, &mut qa.qi)
+fn qsa_query(
+    c: &Ctx38<'_>,
+    qp: &QsaPlan,
+    s: &mut Arena38,
+    (m, sink): (usize, FaultSink),
+) -> Result<(), GpuError> {
+    let Arena38 {
+        mixed, qsa: qa, by, ..
+    } = s;
+    c.project(by, &qp.idx_q, mixed, m, sink, Out::whole(&mut qa.qi))
 }
 
 /// A selecting layer's attention over one sequence's `m` rows and its
@@ -1533,6 +1636,7 @@ fn qsa_out(
         flash,
         attn,
         y,
+        by,
         ..
     } = s;
     c.k.q38.enqueue_out_gate(
@@ -1546,7 +1650,7 @@ fn qsa_out(
             y: &mut *attn,
         },
     )?;
-    c.dense_gemv(&qp.out, &*attn, m, y)
+    c.project(by, &qp.out, &*attn, m, sink, Out::whole(y))
 }
 
 /// The captured decode step's walk `(1, 1, Step)`, into `head`.

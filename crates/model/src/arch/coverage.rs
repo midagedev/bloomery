@@ -1222,30 +1222,6 @@ const TYPE_PINS: &[TypePin] = &[
         what: "hyper-connection down and up (the body reads q8_0 and bf16)",
         reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
-    // The qwen4exp load keeps a bf16 head and embedding in their words
-    // (`ModelTensors::bf16_words`), which the head and the embedding rows
-    // read; a body without it would load them as f32, which neither reads.
-    TypePin {
-        programs: &[Program::Qwen38Body],
-        role: Role::Head,
-        matrices: true,
-        names: None,
-        what: "output head (the head reads q8_0 planes, q6_K or q4_K word planes, bf16 words)",
-        reads: &[
-            GgmlType::Q8_0,
-            GgmlType::Q6_K,
-            GgmlType::Q4_K,
-            GgmlType::BF16,
-        ],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
-        role: Role::TokenEmbedding,
-        matrices: true,
-        names: None,
-        what: "token embedding (the card reads q8_0 or bf16 rows)",
-        reads: &[GgmlType::Q8_0, GgmlType::BF16],
-    },
     TypePin {
         programs: &[Program::Mimo2Body],
         role: Role::Attention,
@@ -1565,8 +1541,10 @@ struct RowPin {
 /// body's attention sites ([`qwen3moe_dense`]: the table's dense row kept to
 /// the forms that body's arena carries, the fused Q4_K ones among them), head
 /// ([`head_of_widened`]: `head.rs`) and token embedding ([`embed_of_widened`]:
-/// `elem.rs`), each the table's row but BF16, and routed stacks (the qwen3moe
-/// body's and `Body35`'s [`prompt_leg_gate_up`], [`prompt_leg_down`]: the
+/// `elem.rs`), each the table's row but BF16, the qwen4exp body's head and
+/// token embedding (`kernels::head`, `kernels::embed`: the table's rows,
+/// BF16's among them, which that load keeps in its words), and routed stacks
+/// (the qwen3moe body's and `Body35`'s [`prompt_leg_gate_up`], [`prompt_leg_down`]: the
 /// FFN dispatch and the common card leg), and `Body35`'s shared expert
 /// ([`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
@@ -1575,20 +1553,33 @@ struct RowPin {
 /// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
     // PIN(2026-10-22): Qwen38 dense pins admit MXFP8/FP8_B128 and Q8_0 indexers via BY_NAME; the old MXFP8 refusal fails the new coverage test (PR FAIL-first).
+    // PIN(2026-10-26): the qwen38 body's dense sites (the delta rule's and the selecting attention's, the shared
+    // expert's, the PLE site's) read the common dense entries by name (`site::ByName`) in every type but Q5_0, so the
+    // K-quants and NVFP4 joined the f32-row types; each type is a launch of `site.rs`, which
+    // `gate_qwen4exp_e2e` runs on the fixture variant `q38dense`. The shared expert's down has K = 640, not whole
+    // super-blocks of 256, so no q8_1 family reads it: its own pin keeps the f32-row types.
     RowPin {
         program: Program::Qwen38Body,
         role: Role::Attention,
         matrices: true,
         names: None,
-        what: "attention matrices (the types dense_by_name names)",
-        row: |ty| dense_by_name(ty).is_some(),
+        what: "attention matrices (the types dense_projected names)",
+        row: |ty| dense_projected(ty).is_some(),
     },
     RowPin {
         program: Program::Qwen38Body,
         role: Role::SharedExpert,
         matrices: true,
         names: None,
-        what: "shared expert (the types dense_by_name names)",
+        what: "shared expert (the types dense_projected names)",
+        row: |ty| dense_projected(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::SharedExpert,
+        matrices: true,
+        names: Some(|n| n.ends_with(".ffn_down_shexp.weight")),
+        what: "shared expert down (K = 640 is not whole q8_1 super-blocks: the types dense_by_name names)",
         row: |ty| dense_by_name(ty).is_some(),
     },
     // PIN(2026-10-26): the latent body's mixer dense sites read the common dense
@@ -1606,6 +1597,26 @@ const ROW_PINS: &[RowPin] = &[
         }),
         what: "mixer matrices (the types dense_projected names)",
         row: |ty| dense_projected(ty).is_some(),
+    },
+    // The qwen4exp load keeps a bf16 head and embedding in their words
+    // (`ModelTensors::bf16_words`), which the head and the embedding rows
+    // read, so these two rows keep BF16 where the qwen3moe body's
+    // (`head_of_widened`, `embed_of_widened`) do not.
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output head (the types the card kernel table's head rows name)",
+        row: |ty| crate::placement::kernels::head(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the types the card kernel table's embedding rows name)",
+        row: |ty| crate::placement::kernels::embed(ty).is_some(),
     },
     RowPin {
         program: Program::Qwen3moeBody,
@@ -2482,11 +2493,13 @@ mod tests {
         ];
         for pin in ROW_PINS {
             // A name the pin takes: the pins scoped by name are the routed
-            // stacks' parts and gemma-embedding2's per-layer input projection.
+            // stacks' parts, the qwen38 shared expert's down and
+            // gemma-embedding2's per-layer input projection.
             let name = [
                 "blk.0.attn_q.weight",
                 "blk.0.ffn_gate_exps.weight",
                 "blk.0.ffn_down_exps.weight",
+                "blk.0.ffn_down_shexp.weight",
                 "per_layer_model_proj.weight",
             ]
             .into_iter()
@@ -3586,10 +3599,35 @@ mod tests {
     }
 
     // PIN(2026-10-22): MXFP8/FP8_B128 dense and Q8_0 indexer refusals were wrong: both walks launch them.
+    // PIN(2026-10-26): the K-quants (Q3_K to Q6_K) joined the dense sites' set: both walks project a site by name
+    // (`site::ByName`), the q8_1 quantization and the K-quant gemv by chunks on the ubatch walk. The shared expert's
+    // down keeps the f32-row types: K = 640 is not whole super-blocks.
     #[test]
-    fn the_qwen38_dense_pins_read_the_by_name_sites() {
+    fn the_qwen38_dense_pins_read_the_projected_sites() {
+        let q8_1 = [
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+        ];
+        let f32_rows = [
+            GgmlType::Q8_0,
+            GgmlType::BF16,
+            GgmlType::MXFP8,
+            GgmlType::FP8_B128,
+            GgmlType::F32,
+        ];
+        let refused = [
+            GgmlType::Q5_0,
+            GgmlType::Q2_K,
+            GgmlType::IQ3_S,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ4_XS,
+            GgmlType::Q4_0,
+        ];
         for (name, role, what) in [
             ("attn_q.weight", Role::Attention, "attention matrices"),
+            ("ssm_out.weight", Role::Attention, "attention matrices"),
             (
                 "indexer.q_proj.weight",
                 Role::Attention,
@@ -3601,92 +3639,116 @@ mod tests {
                 "attention matrices",
             ),
             ("ffn_gate_shexp.weight", Role::SharedExpert, "shared expert"),
+            ("ffn_up_shexp.weight", Role::SharedExpert, "shared expert"),
         ] {
-            for ty in gguf::QROWS
-                .iter()
-                .map(|row| row.ty)
-                .chain([GgmlType::MXFP8, GgmlType::FP8_B128])
-            {
+            for ty in q8_1.into_iter().chain(f32_rows) {
                 let got = items(Program::Qwen38Body, &matrix(name, role, ty));
-                if matches!(
-                    ty,
-                    GgmlType::Q8_0
-                        | GgmlType::BF16
-                        | GgmlType::MXFP8
-                        | GgmlType::FP8_B128
-                        | GgmlType::F32
-                ) {
-                    assert!(got.is_empty(), "{name} {ty}: {got:?}");
-                } else {
-                    assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
-                    assert!(got[0].starts_with(&format!("{ty} {what}")), "{got:?}");
-                }
+                assert!(got.is_empty(), "{name} {ty}: {got:?}");
             }
+            for ty in refused {
+                let got = items(Program::Qwen38Body, &matrix(name, role, ty));
+                assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
+                assert!(got[0].starts_with(&format!("{ty} {what}")), "{got:?}");
+            }
+        }
+        // The shared expert's down is K = 640: a K-quant's rows are whole
+        // super-blocks of 256, so only the f32-row types read it, and a type
+        // no dense entry reads is refused by both pins.
+        let down = "ffn_down_shexp.weight";
+        for ty in f32_rows {
+            let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));
+            assert!(got.is_empty(), "{down} {ty}: {got:?}");
+        }
+        for ty in q8_1 {
+            let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));
+            assert_eq!(got.len(), 1, "{down} {ty}: {got:?}");
+            assert!(
+                got[0].starts_with(&format!("{ty} shared expert down (K = 640")),
+                "{got:?}"
+            );
+        }
+        for ty in refused {
+            let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));
+            assert_eq!(got.len(), 2, "{down} {ty}: {got:?}");
         }
     }
 
-    /// The qwen4exp head's pin reads the set the head kernel reads
-    /// (`gpu::head`'s `head_out_w`): q8_0 planes, a q6_K or q4_K word plane,
-    /// bf16 words; another type of `output` is an item, and the embedding's
-    /// pin reads q8_0 and bf16.
+    /// The qwen4exp head and embedding read the card kernel table's rows
+    /// ([`super::ROW_PINS`], `kernels::head` and `kernels::embed`, BF16's
+    /// among them: that load keeps BF16 in its words): `output` of Q8_0, Q6_K,
+    /// Q5_K, Q4_K or BF16 and a `token_embd` of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0
+    /// or BF16 are no item; another type is one that names the row.
     // PIN(2026-10-06): q6_K (and q4_K, which the same gemv reads) joined the
-    /// head's set so the UD-Q3_K_XL file's q6_K output loads.
+    // head's set so the UD-Q3_K_XL file's q6_K output loads.
     // PIN(2026-10-20): bf16 joined the head's and the embedding's sets with
-    /// the bf16 head gemv and embedding rows (`prepare --keep-bf16`).
+    // the bf16 head gemv and embedding rows (`prepare --keep-bf16`).
+    // PIN(2026-10-26): the head's set is the table's head rows (q5_K joined:
+    // the `_sel` Q5_K gemv over the matrix as one expert, `Head::with_gain`)
+    // and the embedding's the table's embedding rows (q3_K, q4_K, q5_K and
+    // q6_K joined: `Q38Kernels::enqueue_embed_lookup` runs
+    // `ElemKernels::enqueue_embed_rows_kquant`), so the unsloth UD-IQ1_S to
+    // UD-IQ3_XXS files' K-quant embedding and the ISTA files' Q5_K head are no
+    // items. Derivation: each type admitted has a launch the qwen4exp walks
+    // run on every path that embeds (the step, the pass and the ubatch front)
+    // or projects (the step's head); the old test asserted the two refusals
+    // this one inverts.
     #[test]
-    fn the_qwen38_head_pin_reads_the_head_kernels_set() {
+    fn the_qwen38_head_and_embedding_read_the_kernel_tables_rows() {
+        let mut bad = Vec::<String>::new();
+        let mut check = |what: String, t: ModelTensor, want: &[String]| {
+            let got = items(Program::Qwen38Body, &t);
+            if got != want {
+                bad.push(format!("{what}: items {got:?}, want {want:?}"));
+            }
+        };
+        let none = Vec::<String>::new();
         for ty in [
             GgmlType::Q8_0,
             GgmlType::Q6_K,
+            GgmlType::Q5_K,
             GgmlType::Q4_K,
             GgmlType::BF16,
         ] {
-            assert_eq!(
-                items(
-                    Program::Qwen38Body,
-                    &ModelTensor {
-                        name: "output.weight".into(),
-                        layer: None,
-                        ..matrix("", Role::Head, ty)
-                    }
-                ),
-                Vec::<String>::new(),
-                "{ty}"
+            check(
+                format!("head {ty}"),
+                global("output.weight", Role::Head, ty),
+                &none,
             );
         }
-        assert_eq!(
-            items(
-                Program::Qwen38Body,
-                &ModelTensor {
-                    name: "output.weight".into(),
-                    layer: None,
-                    ..matrix("", Role::Head, GgmlType::Q5_K)
-                }
-            ),
-            ["q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes, bf16 words)"]
-        );
-        assert_eq!(
-            items(
-                Program::Qwen38Body,
-                &ModelTensor {
-                    name: "token_embd.weight".into(),
-                    layer: None,
-                    ..matrix("", Role::TokenEmbedding, GgmlType::Q6_K)
-                }
-            ),
-            ["q6_K token embedding (the card reads q8_0 or bf16 rows)"]
-        );
-        assert_eq!(
-            items(
-                Program::Qwen38Body,
-                &ModelTensor {
-                    name: "token_embd.weight".into(),
-                    layer: None,
-                    ..matrix("", Role::TokenEmbedding, GgmlType::BF16)
-                }
-            ),
-            Vec::<String>::new()
-        );
+        for ty in [GgmlType::Q3_K, GgmlType::IQ4_XS, GgmlType::Q5_0] {
+            check(
+                format!("head {ty}"),
+                global("output.weight", Role::Head, ty),
+                &[format!(
+                    "{ty} output head (the types the card kernel table's head rows name)"
+                )],
+            );
+        }
+        for ty in [
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+            GgmlType::BF16,
+        ] {
+            check(
+                format!("embedding {ty}"),
+                global("token_embd.weight", Role::TokenEmbedding, ty),
+                &none,
+            );
+        }
+        for ty in [GgmlType::Q2_K, GgmlType::IQ4_XS, GgmlType::Q5_0] {
+            check(
+                format!("embedding {ty}"),
+                global("token_embd.weight", Role::TokenEmbedding, ty),
+                &[format!(
+                    "{ty} token embedding (the types the card kernel table's embedding rows \
+                     name)"
+                )],
+            );
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     /// MiMo-V2.6-Flash at the shapes `mimo2_meta` pins (48 layers, the nine

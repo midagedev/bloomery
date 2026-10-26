@@ -1,0 +1,15 @@
+# Round qtq38b: ik's CPU node dumps of the q38dense fixture variant (/models/fixture-variants/q38dense/qwen38: the Qwen3.8
+# fixture with Q4_K, Q5_K and Q6_K delta-rule, attention, shared-expert gate/up and PLE sites: tools/fixture-variants.tsv),
+# the five Qwen3.8 fixture sets (batch, step4, step4-every-node, d1k, d3k), each one `BLOOMERY_TIER=fixture
+# BLOOMERY_FIXTURE_VARIANT=q38dense just dump-ref-fixture qwen4exp [<set>]` under this card, one lease each. Nothing is
+# timed. The dumpers are main's shared bin/ (the ik build the real and fixture sets were dumped with); a variant changes
+# the file, not the dumper.
+# Minutes [derived from q38glue-dump.card, which read the same five sets of a same-size file]: the base fixture's Qwen3.8
+# dumps were 0.1 min for batch, step4 and step4-every-node, ~0.1 for d1k and 0.2-0.5 for d3k, plus 3-15 s a lease take
+# (0.25 min at the high end): 5 takes 0.3-1.3 min lease plus 0.6-1.0 min of dumps, 1..5 with the variant file paged in cold.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and pages the variant file in, so it holds the lease; why now: gate-gpu-qwen4exp-e2e
+  on the q38dense variant has no oracle sets until ik has dumped the variant, and the K-quant dense sites (the q8_1
+  quantization, the row-major and token-major gemvs, the ubatch walk's chunks) are otherwise held only to our own graph =
+  eager = pass clauses
+minutes: 1..5

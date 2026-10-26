@@ -10,6 +10,8 @@
 //!   `t`'s position `pos0[0] + first + t` and live key count one more.
 //! - [`q38_kernels::embed_rows_bf16`] — the same over a BF16 table in its
 //!   words (`DevWeight::Bf16`), each value widened to f32 (exact).
+//!   [`Q38Kernels::enqueue_embed_lookup`] picks between these two and the
+//!   K-quant rows' lookups (`crate::elem`) by the resident table's form.
 //! - [`q38_kernels::gqa_out_gate_f32`] — one thread per value: `attn ·
 //!   σ(gate)`, the gate at `[q | gate]`'s head stride, `σ` the Qwen3.6 gated
 //!   quantizer's (`route_core::sigmoid`); the output projection reads the f32
@@ -77,18 +79,21 @@
 //! written as computed.
 
 use crate::card_slots::card_acc_at;
+use crate::elem::EmbedRowsArgs;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::hybrid::HOST;
 use crate::q8f32::{Bf16Words, RowValues};
 use crate::route_core::sigmoid;
-use crate::{GpuError, launch_u32, short};
+use crate::weights::{DevWeight, Weights};
+use crate::{Gpu, GpuError, launch_u32, short};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
+use model::placement::kernels;
 use std::sync::Arc;
 
 /// Values of an attention head: the gate kernel's head, whose `[q | gate]`
@@ -960,6 +965,19 @@ pub struct EmbedArgs<'a> {
     pub n_keys: &'a mut DeviceBuffer<u32>,
 }
 
+/// [`Q38Kernels::enqueue_embed_lookup`]'s arguments: [`EmbedArgs`]' but the
+/// table, which the resident weight's own form picks, and the fault sink, the
+/// engine's unlabelled one; `width` is the values a row of the outputs holds.
+pub struct EmbedIo<'a> {
+    pub ids: &'a DeviceBuffer<u32>,
+    pub pos0: &'a DeviceBuffer<u32>,
+    pub first: usize,
+    pub width: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+    pub pos: &'a mut DeviceBuffer<u32>,
+    pub n_keys: &'a mut DeviceBuffer<u32>,
+}
+
 /// [`Q38Kernels::enqueue_shared_add`]'s arguments: the host tier's routed
 /// sums and the shared expert's outputs (`[m][n]` each), the router's
 /// weights (`slots` a token) and the shared expert's slot among them, and
@@ -1185,6 +1203,80 @@ impl Q38Kernels {
             }
         }
         Ok(())
+    }
+
+    /// [`Q38Kernels::enqueue_embed_rows`] for the resident table `name` of
+    /// `w`, by its form: Q8_0 planes and BF16 words run this module's
+    /// lookups, a K-quant word plane of the table's rows
+    /// ([`kernels::embed`]: Q3_K, Q4_K, Q5_K and Q6_K)
+    /// [`ElemKernels::enqueue_embed_rows_kquant`](crate::elem::ElemKernels::enqueue_embed_rows_kquant),
+    /// each an id past the table a [`FaultSite::TokenId`] and a NaN row. A
+    /// table of another form, or whose rows are not `io.width` values wide, is
+    /// refused by name as `what`'s. One launch. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_embed_lookup(
+        &self,
+        gpu: &Gpu,
+        what: &'static str,
+        (w, name): (&Weights, &str),
+        io: EmbedIo<'_>,
+    ) -> Result<(), GpuError> {
+        let EmbedIo {
+            ids,
+            pos0,
+            first,
+            width,
+            y,
+            pos,
+            n_keys,
+        } = io;
+        let wide = |got: usize| {
+            GpuError::shape(
+                what,
+                format!("{name} rows are {got} values wide; the unit's rows hold {width}"),
+            )
+        };
+        let stream = gpu.stream();
+        let table = match w.resident(what, name)? {
+            DevWeight::KQuant { ty, w: words, k } if kernels::embed(*ty).is_some() => {
+                if *k != width {
+                    return Err(wide(*k));
+                }
+                return gpu.elem().enqueue_embed_rows_kquant(
+                    stream,
+                    *ty,
+                    EmbedRowsArgs {
+                        w: words,
+                        ids,
+                        pos0,
+                        first,
+                        y,
+                        pos,
+                        n_keys,
+                    },
+                );
+            }
+            dw => EmbedRows::of_weight(dw).ok_or_else(|| {
+                GpuError::tensor(what, name, "Q3_K..Q6_K rows, Q8_0 planes or BF16 words")
+            })?,
+        };
+        let got = table.shape().map_err(|e| GpuError::shape(what, e))?.1;
+        if got != width {
+            return Err(wide(got));
+        }
+        self.enqueue_embed_rows(
+            stream,
+            EmbedArgs {
+                table,
+                ids,
+                pos0,
+                first,
+                fault: gpu.unlabelled_sink(),
+                y,
+                pos,
+                n_keys,
+            },
+        )
     }
 
     /// Enqueue `y = attn · σ(gate)` over `m` tokens of `n_head` heads of

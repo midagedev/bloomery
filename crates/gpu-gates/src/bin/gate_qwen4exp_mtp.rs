@@ -416,7 +416,7 @@ mod gate {
         let draft = draft_path(&levers, &path)?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
-        let shape = crate::q38_arch::shape_of(&inputs.spec)?;
+        let shape = crate::q38_arch::shape_of(&inputs.spec, &file)?;
         let header_budget = tier::header_budget(&file)?;
         let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {

@@ -16,7 +16,9 @@
 #      matrix, written by tools/ref/flat-imatrix.py (every weight 1.0, one entry per such tensor): the quantizer bails out on
 #      those types without one, and the variant needs the type, not the quality. The matrix is part of the variant's identity: the
 #      row's why column names it (`imatrix=sha256:<16 hex>`, flat-imatrix.py --check-row), and a row of a map that needs none names none.
-#   2. llama-quantize --allow-requantize --keep-split --leave-output-tensor writes into <dir>.tmp.<pid>.
+#   2. llama-quantize --allow-requantize --keep-split --leave-output-tensor writes into <dir>.tmp.<pid> (without --leave-output-tensor
+#      when the map names `output`: the flag keeps that tensor out of the quantizer's rules; every tensor has a rule, so the rule of an
+#      unnamed output is its own type).
 #   3. `fixture variant-budget` plans the card budget on the written temporary file by the family's own planner and records it
 #      in place (bloomery.fixture.card_budget, eight bytes: the quantizer copied the trunk's, whose experts are another size);
 #      a family with a fixed budget keeps the trunk's value and writes nothing.
@@ -104,11 +106,15 @@ fi
 # The matrix is part of the variant's identity: the row names it (its id), so a changed matrix is an edited row and a new fixture.
 python3 "$HERE/flat-imatrix.py" --check-row "$LOG.imatrix" "$TABLE" "$TAG" || die "the row of $TAG does not name the importance matrix the quantizer is given" 65
 
+MAP=$(awk -F'\t' -v t="$TAG" '$0 !~ /^#/ && $1 == t { print $4 }' "$TABLE")
+LEAVE_OUTPUT=(--leave-output-tensor)
+case " $MAP " in *" output="*) LEAVE_OUTPUT=() ;; esac
+
 mkdir "$TMP"
 START=$(date +%s)
 echo "fixture-requant.sh: quantizing (log $LOG, ${REQUANT_THREADS:-24} threads, bound ${REQUANT_BOUND:-1500} s)"
 # The type argument is the quantizer's own and moves no tensor: every tensor has a rule. The output is the shards' prefix (--keep-split).
-LEASE_BOUNDED_OUT=$LOG lease_bounded "${REQUANT_BOUND:-1500}" "$QUANT" --allow-requantize --keep-split --leave-output-tensor \
+LEASE_BOUNDED_OUT=$LOG lease_bounded "${REQUANT_BOUND:-1500}" "$QUANT" --allow-requantize --keep-split "${LEAVE_OUTPUT[@]}" \
   "${IMATRIX_ARGS[@]}" --custom-q "$CUSTOM_Q" --override-kv "$OVERRIDE_KV" "$SRC" "$TMP/$STEM-$TAG" Q4_K_M "${REQUANT_THREADS:-24}" ||
   { tail -20 "$LOG" >&2; die "llama-quantize failed (log $LOG)" 70; }
 echo "fixture-requant.sh: llama-quantize done in $(($(date +%s) - START)) s; log $LOG"

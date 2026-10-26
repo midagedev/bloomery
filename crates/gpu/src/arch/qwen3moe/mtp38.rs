@@ -1394,6 +1394,24 @@ impl Mtp38 {
                 ),
             ));
         }
+        // The walk's dense sites read the f32 rows or q8 planes: a K-quant
+        // draft layer is not projected by name (the target's sites are,
+        // `site::ByName`), and is refused here rather than at a walk.
+        let n = Names::of(self.index, &self.w);
+        for name in [
+            &n.eh, &n.q, &n.k, &n.v, &n.out, &n.gate_sh, &n.up_sh, &n.down_sh,
+        ] {
+            let ty = site::resident_type(&self.w, WHAT, name)?;
+            if !site::BY_NAME.contains(&ty) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "{name} is {ty}: the draft layer's walks read the f32 rows and the q8 \
+                         planes of their sites, and none projects a K-quant site by name"
+                    ),
+                ));
+            }
+        }
         let q6k = matches!(self.head_w, BorrowedHead::Q6K { .. });
         let a = MtpArena::new(stream, dims, vocab, q6k)?;
         let got = a.bytes() as u64;

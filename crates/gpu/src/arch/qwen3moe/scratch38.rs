@@ -23,6 +23,7 @@ use crate::hc_gated::HcScratch;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
+use crate::site::ByName;
 use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
@@ -250,6 +251,11 @@ pub(super) struct Arena38 {
     pub(super) sh_u: DeviceBuffer<f32>,
     pub(super) sh_h: DeviceBuffer<f32>,
     pub(super) sh_y: DeviceBuffer<f32>,
+    /// The by-name projections' forms and staging: the main stream's, and the
+    /// branch's, whose projections run beside the main stream's
+    /// ([`Branch`](crate::Branch)) and so share none of its.
+    pub(super) by: ByName,
+    pub(super) by_fork: ByName,
 }
 
 impl Arena38 {
@@ -260,6 +266,7 @@ impl Arena38 {
         router: RouterDims,
         rows: usize,
         ctx: usize,
+        by: (ByName, ByName),
     ) -> Result<Arena38, GpuError> {
         if !(1..=PASS_ROWS).contains(&rows) {
             return Err(GpuError::shape(
@@ -268,7 +275,7 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::with_tokens(stream, router, rows)?;
-        Arena38::alloc(stream, rows, (rows, rows), route, ctx)
+        Arena38::alloc(stream, rows, (rows, rows), route, ctx, by)
     }
 
     /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
@@ -283,6 +290,7 @@ impl Arena38 {
         rows: usize,
         most: usize,
         ctx: usize,
+        by: (ByName, ByName),
     ) -> Result<Arena38, GpuError> {
         if !(1..=most).contains(&rows) {
             return Err(GpuError::shape(
@@ -291,7 +299,7 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
-        let mut a = Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)?;
+        let mut a = Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx, by)?;
         // The prompt form's records take the q·k·v rows' room once the conv
         // has read them (`wide38::gdn`); a short walk needs a little more
         // than the rows.
@@ -311,6 +319,7 @@ impl Arena38 {
         (sel, parts): (usize, usize),
         route: RouterOut,
         ctx: usize,
+        (by, by_fork): (ByName, ByName),
     ) -> Result<Arena38, GpuError> {
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, rows * n);
@@ -371,7 +380,15 @@ impl Arena38 {
             sh_u: f(geo::FF)?,
             sh_h: f(geo::FF)?,
             sh_y: f(h)?,
+            by,
+            by_fork,
         })
+    }
+
+    /// Device bytes of the by-name projections' forms and staging, which the
+    /// plan's arena counts leave out ([`Arena38::bytes`]).
+    pub(super) fn by_bytes(&self) -> usize {
+        self.by.bytes() + self.by_fork.bytes()
     }
 
     /// Device bytes.

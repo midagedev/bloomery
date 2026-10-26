@@ -141,10 +141,11 @@
 //!   waiting, by name; the lane word planted on a lane no call wrote makes
 //!   the next step's first delta layer raise `delta_stamp` there, alone.
 //! - (h) the head of m rows: from the prefix, a head of two rows over the
-//!   loaded q8_0 lm_head, its input written from the host, reads back two
+//!   loaded lm_head, its input written from the host, reads back two
 //!   equal tokens for two equal finite rows, and with a NaN in row 0's
-//!   input, then in row 1's, reads back the head's `logit` fault each time,
-//!   never a token (built here because the model's own head mix raises
+//!   input, then in row 1's, reads back the head's fault each time (`logit`
+//!   for a head over the f32 rows, `quant_column` for a K-quant head, whose
+//!   quantizer refuses the NaN first), never a token (built here because the model's own head mix raises
 //!   `hc_mix` on a row that is not finite first, so no call of the model
 //!   plants one row alone); the word left raised, a verify of two
 //!   rows is that fault and poisons the model.
@@ -589,7 +590,7 @@ mod gate {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
-        let shape = crate::q38_arch::shape_of(&inputs.spec)?;
+        let shape = crate::q38_arch::shape_of(&inputs.spec, &file)?;
         let plan_levers = tier::plan_levers(&file, &levers, 0)?;
         let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {
@@ -2153,11 +2154,14 @@ mod gate {
 
     // ------------------------------------------------- (h) the head of m rows
 
-    /// (h): from the prefix, a head of two rows over the loaded q8_0 lm_head,
+    /// (h): from the prefix, a head of two rows over the loaded lm_head,
     /// its input written from the host: two equal finite rows read back two
     /// equal tokens; then a NaN in row 0's input, then (the word cleared) in
-    /// row 1's, makes that row's every logit NaN, and each readback is the
-    /// head's [`FaultSite::Logit`], never a token — each launch after one
+    /// row 1's, and each readback is the head's fault, never a token: the
+    /// [`FaultSite::Logit`] of a head that reads the f32 rows (the NaN makes
+    /// that row's every logit NaN), the [`FaultSite::QuantColumn`] of a head
+    /// that quantizes them to q8_1 first (a K-quant lm_head, whose quantizer
+    /// refuses the NaN before any logit exists) — each launch after one
     /// that must have put its argmax's ticket count back. The head is built
     /// here, not reached through a verify, because the model path cannot
     /// plant one row alone: the head's mix checks every value it writes into
@@ -2166,7 +2170,13 @@ mod gate {
     /// raised, a verify of two rows: its head's readback carries the raised
     /// word, so the call is that fault and the model poisoned.
     fn head_rows(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
-        let want = Fault::at(LAYER_HEAD, FaultSite::Logit);
+        // The site the header's `output` type raises ([`Shape::head`]), never read off the loaded head.
+        let site = if shape().head.quantizes {
+            FaultSite::QuantColumn
+        } else {
+            FaultSite::Logit
+        };
+        let want = Fault::at(LAYER_HEAD, site);
         let (rows, _) = verify_rows(toks)?;
         fresh(m)?;
         m.step(&toks[..PREFIX])?;
@@ -2185,7 +2195,7 @@ mod gate {
             let equal = matches!(&clean, Ok(t) if t.len() == 2 && t[0] == t[1]);
             ok &= equal;
             println!(
-                "head rows: a head of 2 rows over the q8_0 lm_head, two equal finite rows -> {} \
+                "head rows: a head of 2 rows over the loaded lm_head, two equal finite rows -> {} \
                  (want two equal tokens) {}",
                 match &clean {
                     Ok(t) => format!("tokens {t:?}"),
@@ -2203,13 +2213,13 @@ mod gate {
                 let named = matches!(&got, Err(GpuError::Fault { fault, .. }) if *fault == want);
                 ok &= named;
                 println!(
-                    "head rows: a head of 2 rows over the q8_0 lm_head, a NaN in row {r}'s input \
+                    "head rows: a head of 2 rows over the loaded lm_head, a NaN in row {r}'s input \
                      -> {} (want the output head's fault at site {}) {}",
                     match &got {
                         Ok(t) => format!("tokens {t:?}"),
                         Err(e) => format!("error \"{e}\""),
                     },
-                    FaultSite::Logit.name(),
+                    site.name(),
                     verdict(named)
                 );
             }
