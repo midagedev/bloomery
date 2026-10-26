@@ -111,7 +111,9 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::glm5next::names;
-use model::arch::glm5next::place::{self, KdaLanes, NextnInputs, NextnPlan, PlanInputs};
+use model::arch::glm5next::place::{
+    self, KdaLanes, MixerForms, NextnInputs, NextnPlan, PlanInputs,
+};
 use model::embed::EmbedTable;
 use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
@@ -122,7 +124,7 @@ use crate::ffn::{CardExperts, block_names};
 use crate::host::routed_layers;
 use crate::program;
 use crate::swap;
-use crate::tensors::{Joined, LayerNames};
+use crate::tensors::{Joined, LayerNames, MixerNames};
 use crate::tier;
 
 #[path = "media.rs"]
@@ -796,6 +798,9 @@ pub struct Body {
     cfg: Vec<LayerCfg>,
     /// Each layer's tensor names, made at load.
     names: Vec<LayerNames>,
+    /// The mixer inputs a K-quant site reads, from the file's header
+    /// ([`mixer_forms`]): what the prompt batch's GEMM front is sized for.
+    mixer: MixerForms,
     dims: Dims,
     k: Kernels,
     /// The stream the k-pool selector's launches run on beside the latent
@@ -1153,6 +1158,33 @@ pub(crate) fn reads_q8_1(file: &Split, names: &[LayerNames], nextn: Option<usize
                 SiteTy::of_ggml(t.ty).is_some_and(|ty| ty.reads() == Form::Q8x128)
             })
         })
+}
+
+/// The inputs of the prompt batch's GEMM front that a K-quant mixer site of
+/// the trunk's `names` reads ([`MixerForms`]), from the file's header, before
+/// any upload: the plan's reserve counts the same way
+/// ([`place::PlanInputs::mixer_forms`]).
+pub(crate) fn mixer_forms(file: &Split, names: &[LayerNames]) -> MixerForms {
+    let kquant = |name: &String| {
+        file.find(name)
+            .is_some_and(|(_, t)| SiteTy::of_ggml(t.ty).is_some_and(SiteTy::kquant))
+    };
+    let mut f = MixerForms::NONE;
+    for n in names {
+        match &n.mixer {
+            MixerNames::Kda(k) => {
+                f.embd |= k.qkv.parts.iter().chain([&k.g_a, &k.beta]).any(kquant);
+                f.low |= kquant(&k.g_b);
+                f.gated |= kquant(&k.out);
+            }
+            MixerNames::Latent(l) => {
+                f.embd |= l.stack.parts.iter().any(kquant);
+                f.q_low |= kquant(&l.q_b);
+                f.heads |= kquant(&l.out);
+            }
+        }
+    }
+    f
 }
 
 /// `y = W · x` for the resident weight `name` over the first `m` columns of
@@ -1754,6 +1786,13 @@ impl Body {
                 inputs.dense_forms()
             )));
         }
+        let mixer = mixer_forms(file, &names);
+        if mixer != inputs.mixer_forms() {
+            return Err(shape(format!(
+                "the mixers read the forms {mixer:?}; the plan's prompt front was sized for {:?}",
+                inputs.mixer_forms()
+            )));
+        }
         let nextn = nextn
             .map(|(np, ni)| {
                 nextn::block_plan(file, inputs, ni, dims.embd).map(|block| (np, ni, block))
@@ -1874,6 +1913,7 @@ impl Body {
             layers,
             cfg,
             names,
+            mixer,
             dims,
             k: Kernels::load(gpu, k_blocks, q8_1_sites)?,
             branch: Branch::new(gpu.stream_handle())?,

@@ -38,6 +38,14 @@
 //!   dense block on a front sized for none each give their named error,
 //!   with no launch made.
 //!
+//! - (g4) `by type`: on a file whose front sites are not all Q8_0 (a variant: K-quant or BF16 mixers), the
+//!   front's every projection against the by-name path the chunks run (`site::ByName`, columns of up to eight
+//!   on the same f32 rows), each output within [`NEAR`] of the reference's RMS: a K-quant's GEMM and gemv read
+//!   the same q8_1 codes and differ in the order of the sums, BF16's tile and gemv read the same f32 rows;
+//!   the joined q·k·v or its parts apart, the latent stack joined or four, a part's strided copy into its
+//!   rows of the joined layout, the query heads and the output projection. g1 to g3 hold the Q8_0 file
+//!   (their contract is over its blocks).
+//!
 //! Tiers (`BLOOMERY_TIER`): every clause is a self-consistency clause (`tier::sc`) on the layers of the opened file
 //! (layer 0 dense, layer 4 KDA, layer 3 latent), so the fixture tier runs them all on the fixture.
 
@@ -52,6 +60,10 @@ mod glm5next_tier;
 
 #[cfg(feature = "glm5next")]
 mod gate {
+    use std::ops::Range;
+
+    use bloomery_gpu::gemm::Gemm32Kernels;
+    use bloomery_gpu::site::{BY_NAME_COLS, ByName, ByNameKernels, Out};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_deepseek41::block::{Block, BlockPlan};
@@ -60,14 +72,14 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::T_MAX;
     use bloomery_gpu_glm5next::gemm::{
-        FrontShape, FrontStats, GemmFront, KdaInNames, KdaInRows, LatentInRows,
+        FrontShape, FrontStats, GemmFront, KdaInNames, KdaInRows, LatentInRows, Launches,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::{DenseForms, FrontWidths};
+    use model::arch::glm5next::place::{DenseForms, FrontWidths, MixerForms};
 
     use crate::glm5next_tier;
 
@@ -227,6 +239,7 @@ mod gate {
             quantize: after.quantize - before.quantize,
             gemm: after.gemm - before.gemm,
             route: after.route - before.route,
+            copy: after.copy - before.copy,
         }
     }
 
@@ -250,9 +263,10 @@ mod gate {
             }
         }
 
-        fn input(&self) -> KdaInNames<'_> {
+        /// The names, the joined q·k·v as the one launch `qkv` of `rows` rows.
+        fn input<'a>(&'a self, qkv: Launches<'a>) -> KdaInNames<'a> {
             KdaInNames {
-                qkv: &self.qkv,
+                qkv,
                 g_a: &self.g_a,
                 beta: &self.beta,
                 g_b: &self.g_b,
@@ -303,11 +317,15 @@ mod gate {
         let mut w = Weights::load_where(stream, file, |n| keep.iter().any(|k| k == n))?;
         for l in [LEAD, KDA] {
             let (q, k, v) = (names::attn_q(l), names::attn_k(l), names::attn_v(l));
-            w.join_rows(stream, &[&q, &k, &v], names::attn_qkv(l))?;
+            if w.joinable(&[&q, &k, &v]) {
+                w.join_rows(stream, &[&q, &k, &v], names::attn_qkv(l))?;
+            }
         }
         let parts = stack_parts(LATENT);
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-        w.join_rows(stream, &parts, names::attn_a_stack(LATENT))?;
+        if w.joinable(&parts) && matches!(w.get(parts[0]), Some(DevWeight::Q8_0 { .. })) {
+            w.join_rows(stream, &parts, names::attn_a_stack(LATENT))?;
+        }
         Ok(w)
     }
 
@@ -349,7 +367,10 @@ mod gate {
                 l,
                 m,
                 &xn_d,
-                nm.input(),
+                nm.input(Launches {
+                    parts: &[(nm.qkv.as_str(), 0)],
+                    rows: qkv.rows,
+                }),
                 KdaInRows {
                     qkv: y_qkv,
                     ga: y_ga,
@@ -418,6 +439,7 @@ mod gate {
         let xn_d = DeviceBuffer::from_host(stream, &xn)?;
         let mut qa = nan_buf(stream, m * q_lora)?;
         let mut kv_d = nan_buf(stream, m * kv)?;
+        let stack_name = names::attn_a_stack(l);
         let before = front.stats();
         front.latent_in(
             gpu,
@@ -425,7 +447,14 @@ mod gate {
             l,
             m,
             &xn_d,
-            (&names::attn_a_stack(l), q_lora, kv),
+            (
+                Launches {
+                    parts: &[(stack_name.as_str(), 0)],
+                    rows: q_lora + kv,
+                },
+                q_lora,
+                kv,
+            ),
             LatentInRows {
                 qa: &mut qa,
                 kv: &mut kv_d,
@@ -611,7 +640,9 @@ mod gate {
         };
         let before = front.stats();
         let r = front.kda_out(gpu, w, KDA, s.cols, &gated, &norm, &mut y);
-        pass &= case("f32 weight", "is not a q8_0 weight", r);
+        // PIN(2026-10-26): the front runs the types it has a GEMM for (Q8_0, the K-quants, BF16), so an F32
+        // weight is refused for having none; it was refused for not being Q8_0 planes.
+        pass &= case("f32 weight", "no wide GEMM the front runs", r);
         let r = front.kda_out(gpu, w, KDA, s.cols + 1, &gated, &nm.out, &mut y);
         pass &= case("oversize m", "the scratch holds", r);
         let r = front.kda_out(gpu, w, KDA, s.cols, &gated, &nm.qkv, &mut y);
@@ -663,38 +694,446 @@ mod gate {
         Ok(pass)
     }
 
+    /// Clause g4's columns: two 64-column tiles and a tail, nine chunks of the by-name path.
+    const BY_TYPE_COLS: usize = 70;
+
+    /// Clause g4's band: the largest difference over the reference's RMS. A K-quant's GEMM and gemv sum the
+    /// same integer block products in another order and scale them by the same f32 factors, and BF16's tile
+    /// and gemv sum the same f32 products in another order: two f32 sums of K <= 16384 terms differ by at most
+    /// about sqrt(K) * 2^-24 = 7.6e-6 of their terms' scale.
+    const NEAR: f64 = 1e-5;
+
+    /// Whether every site the front runs in the layers `LEAD`, `KDA` and `LATENT` is Q8_0 in the file: what
+    /// clauses g1 to g3 read.
+    fn front_sites_q8_0(file: &Split) -> bool {
+        let sites = [LEAD, KDA].into_iter().flat_map(|l| {
+            [
+                names::attn_q(l),
+                names::attn_k(l),
+                names::attn_v(l),
+                names::ssm_g_a(l),
+                names::ssm_beta(l),
+                names::ssm_g_b(l),
+                names::attn_output(l),
+            ]
+        });
+        let latent = stack_parts(LATENT)
+            .into_iter()
+            .chain([names::attn_q_b(LATENT), names::attn_output(LATENT)]);
+        sites
+            .chain(latent)
+            .all(|n| file.find(&n).is_some_and(|(_, t)| t.ty == GgmlType::Q8_0))
+    }
+
+    /// The by-name reference ([`ByName::gemv`] by chunks of up to [`BY_NAME_COLS`] columns, the path the
+    /// prompt's chunks run).
+    struct Reference<'a> {
+        gpu: &'a Gpu,
+        k: ByNameKernels,
+        g32: Gemm32Kernels,
+        bn: ByName,
+    }
+
+    impl<'a> Reference<'a> {
+        fn open(gpu: &'a Gpu, w: &Weights, sites: &[String]) -> Result<Reference<'a>, GateError> {
+            Ok(Reference {
+                gpu,
+                k: ByNameKernels::load(gpu)?,
+                g32: Gemm32Kernels::load(gpu.context())?,
+                bn: ByName::for_sites(gpu, w, sites.iter().map(String::as_str), BY_NAME_COLS)?,
+            })
+        }
+
+        /// The weight `name`'s outputs over the `m` columns of `x` into rows `at ..` of each `stride`-value
+        /// column of `y` (`stride` 0: the weight's own rows, `at` 0).
+        fn project(
+            &mut self,
+            w: &Weights,
+            (name, layer): (&str, usize),
+            x: &[f32],
+            m: usize,
+            (at, stride): (usize, usize),
+            y: &mut [f32],
+        ) -> Result<(), GateError> {
+            let stream = self.gpu.stream();
+            let rows = w.resident("gate_glm5next_gemm", name)?.rows();
+            let k = x.len() / m;
+            let width = if stride == 0 { rows } else { stride };
+            for c0 in (0..m).step_by(BY_NAME_COLS) {
+                let c = BY_NAME_COLS.min(m - c0);
+                let xs = DeviceBuffer::from_host(stream, &x[c0 * k..(c0 + c) * k])?;
+                let mut out = nan_buf(stream, c * width)?;
+                let dst = if stride == 0 {
+                    Out::whole(&mut out)
+                } else {
+                    Out::part(&mut out, at, stride)
+                };
+                let kernels = (Some(&self.k), Some(&self.g32));
+                self.bn
+                    .gemv(self.gpu, kernels, (w, name), layer, &xs, c, dst)?;
+                let got = out.to_host_vec(stream)?;
+                for col in 0..c {
+                    let (from, to) = (col * width + at, (c0 + col) * width + at);
+                    y[to..to + rows].copy_from_slice(&got[from..from + rows]);
+                }
+            }
+            Ok(())
+        }
+
+        /// A projection the load may have left apart ([`launches_of`]): every part into its rows of `y`.
+        fn joined(
+            &mut self,
+            w: &Weights,
+            (launches, total): (&[(&str, usize)], usize),
+            layer: usize,
+            (x, m): (&[f32], usize),
+            y: &mut [f32],
+        ) -> Result<(), GateError> {
+            let stride = if let [(_, 0)] = launches { 0 } else { total };
+            for &(name, at) in launches {
+                self.project(w, (name, layer), x, m, (at, stride), y)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A projection's weights as the load left them: the joined weight `whole` when it is resident, else the
+    /// `parts` with their first rows ([`bloomery_gpu_glm5next::gemm::Launches`]).
+    fn launches_of<'a>(
+        w: &Weights,
+        whole: &'a str,
+        parts: &'a [String],
+    ) -> Result<(Vec<(&'a str, usize)>, usize), GateError> {
+        if let Some(j) = w.get(whole) {
+            return Ok((vec![(whole, 0)], j.rows()));
+        }
+        let mut at = 0;
+        let mut v = Vec::new();
+        for p in parts {
+            v.push((p.as_str(), at));
+            at += w.resident("gate_glm5next_gemm", p)?.rows();
+        }
+        Ok((v, at))
+    }
+
+    /// Whether the resident weight `name` is not Q8_0 planes: the sites g4 holds (g1 holds the Q8_0 ones
+    /// against the contract, whose int8 activations the by-name path's f32 rows are not).
+    fn typed(w: &Weights, name: &str) -> bool {
+        !matches!(w.get(name), Some(DevWeight::Q8_0 { .. }))
+    }
+
+    /// The rows `at .. at + rows` of each launch of [`launches_of`] that [`typed`] holds.
+    fn typed_rows(w: &Weights, launches: &[(&str, usize)]) -> Result<Vec<Range<usize>>, GateError> {
+        let mut v = Vec::new();
+        for &(name, at) in launches {
+            if typed(w, name) {
+                v.push(at..at + w.resident("gate_glm5next_gemm", name)?.rows());
+            }
+        }
+        Ok(v)
+    }
+
+    /// The card's outputs against the by-name reference's over the rows `ranges` of each `width`-value
+    /// column: the largest difference over the reference's RMS. No row, a Q8_0 site, is no verdict.
+    fn near(
+        what: &str,
+        (got, want): (&[f32], &[f32]),
+        width: usize,
+        ranges: &[Range<usize>],
+    ) -> bool {
+        let rows = |v: &[f32]| -> Vec<f32> {
+            v.iter()
+                .enumerate()
+                .filter(|(i, _)| ranges.iter().any(|r| r.contains(&(i % width))))
+                .map(|(_, &x)| x)
+                .collect()
+        };
+        let (got, want) = (rows(got), rows(want));
+        if want.is_empty() {
+            println!("g4 near {what}: Q8_0, held by g1");
+            return true;
+        }
+        let rms = (want.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+            / want.len().max(1) as f64)
+            .sqrt();
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(&g, &w)| {
+                if g.is_finite() && w.is_finite() {
+                    f64::from(g - w).abs()
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .fold(0.0, f64::max);
+        let rel = worst / rms.max(f64::MIN_POSITIVE);
+        line(
+            &format!("g4 near {what}"),
+            got.len() == want.len() && rel <= NEAR,
+            &format!(
+                "{} outputs, worst {rel:.3e} of the reference's RMS {rms:.3e} (band {NEAR:e})",
+                want.len()
+            ),
+        )
+    }
+
+    /// Clause g4 on KDA layer `l` over `m` columns: the input projections (the second from the front's own
+    /// first-input rows) and the output projection.
+    fn by_type_kda(
+        gpu: &Gpu,
+        w: &Weights,
+        front: &mut GemmFront,
+        rf: &mut Reference<'_>,
+        (l, m): (usize, usize),
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let fw = front.shape().widths;
+        let nm = KdaNames::of(l);
+        let parts = [names::attn_q(l), names::attn_k(l), names::attn_v(l)];
+        let (launches, rows) = launches_of(w, &nm.qkv, &parts)?;
+        let xn = columns(m, fw.embd, 0x4b00_0000 + l as u64);
+        let gated = columns(m, fw.gated, 0x4c00_0000 + l as u64);
+        let (xn_d, gated_d) = (
+            DeviceBuffer::from_host(stream, &xn)?,
+            DeviceBuffer::from_host(stream, &gated)?,
+        );
+        let n_of = |n: &str| w.resident("gate_glm5next_gemm", n).map(|r| r.rows());
+        let (ga_n, beta_n, z_n, out_n) = (
+            n_of(&nm.g_a)?,
+            n_of(&nm.beta)?,
+            n_of(&nm.g_b)?,
+            n_of(&nm.out)?,
+        );
+        let mut ys = [rows, ga_n, beta_n, z_n, out_n]
+            .map(|n| nan_buf(stream, m * n))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let [y_qkv, y_ga, y_beta, y_z, _] = &mut ys[..] else {
+                return Err("five outputs".into());
+            };
+            front.kda_in(
+                gpu,
+                w,
+                l,
+                m,
+                &xn_d,
+                nm.input(Launches {
+                    parts: &launches,
+                    rows,
+                }),
+                KdaInRows {
+                    qkv: y_qkv,
+                    ga: y_ga,
+                    beta_raw: y_beta,
+                    z: y_z,
+                },
+            )?;
+        }
+        front.kda_out(gpu, w, l, m, &gated_d, &nm.out, &mut ys[4])?;
+        stream.synchronize()?;
+        if let Some(f) = gpu.fault()? {
+            return Err(format!("layer {l}: the front raised {f:?}").into());
+        }
+        let got = ys
+            .iter()
+            .map(|y| y.to_host_vec(stream))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut want = [rows, ga_n, beta_n, z_n, out_n].map(|n| vec![f32::NAN; m * n]);
+        rf.joined(w, (&launches, rows), l, (&xn, m), &mut want[0])?;
+        rf.project(w, (&nm.g_a, l), &xn, m, (0, 0), &mut want[1])?;
+        rf.project(w, (&nm.beta, l), &xn, m, (0, 0), &mut want[2])?;
+        rf.project(w, (&nm.g_b, l), &got[1], m, (0, 0), &mut want[3])?;
+        rf.project(w, (&nm.out, l), &gated, m, (0, 0), &mut want[4])?;
+        let mut pass = true;
+        let own = |name: &str, n: usize| {
+            if typed(w, name) {
+                vec![0..n]
+            } else {
+                Vec::new()
+            }
+        };
+        let ranges = [
+            typed_rows(w, &launches)?,
+            own(&nm.g_a, ga_n),
+            own(&nm.beta, beta_n),
+            own(&nm.g_b, z_n),
+            own(&nm.out, out_n),
+        ];
+        let widths = [rows, ga_n, beta_n, z_n, out_n];
+        for (i, what) in ["qkv", "g_a", "beta", "g_b", "out"].into_iter().enumerate() {
+            let at = format!("layer {l} {what}");
+            pass &= near(&at, (&got[i], &want[i]), widths[i], &ranges[i]);
+        }
+        Ok(pass)
+    }
+
+    /// Clause g4 on latent layer `l` over `m` columns: the stack, then the query heads and the output.
+    fn by_type_latent(
+        gpu: &Gpu,
+        w: &Weights,
+        front: &mut GemmFront,
+        rf: &mut Reference<'_>,
+        (l, m): (usize, usize),
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let fw = front.shape().widths;
+        let parts = stack_parts(l);
+        let whole = names::attn_a_stack(l);
+        let (launches, total) = launches_of(w, &whole, &parts)?;
+        let q_lora = w.resident("gate_glm5next_gemm", &parts[0])?.rows();
+        let kv = total - q_lora;
+        let xn = columns(m, fw.embd, 0x4d00_0000 + l as u64);
+        let qr = columns(m, fw.q_low, 0x4e00_0000 + l as u64);
+        let av = columns(m, fw.heads_v, 0x4f00_0000 + l as u64);
+        let xn_d = DeviceBuffer::from_host(stream, &xn)?;
+        let qr_d = DeviceBuffer::from_host(stream, &qr)?;
+        let (q_b, out) = (names::attn_q_b(l), names::attn_output(l));
+        let out_n = w.resident("gate_glm5next_gemm", &out)?.rows();
+        let mut qa = nan_buf(stream, m * q_lora)?;
+        let mut kv_d = nan_buf(stream, m * kv)?;
+        let mut y = nan_buf(stream, m * out_n)?;
+        front.latent_in(
+            gpu,
+            w,
+            l,
+            m,
+            &xn_d,
+            (
+                Launches {
+                    parts: &launches,
+                    rows: total,
+                },
+                q_lora,
+                kv,
+            ),
+            LatentInRows {
+                qa: &mut qa,
+                kv: &mut kv_d,
+            },
+        )?;
+        {
+            let (q, av_d) = front.heads_rows();
+            q.copy_from_host(stream, &vec![f32::NAN; q.len()])?;
+            let mut rows = vec![f32::NAN; av_d.len()];
+            rows[..av.len()].copy_from_slice(&av);
+            av_d.copy_from_host(stream, &rows)?;
+        }
+        front.latent_q(gpu, w, (l, m), &qr_d, &q_b)?;
+        front.latent_out(gpu, w, (l, m), &out, &mut y)?;
+        stream.synchronize()?;
+        if let Some(f) = gpu.fault()? {
+            return Err(format!("layer {l}: the front raised {f:?}").into());
+        }
+        let q_n = w.resident("gate_glm5next_gemm", &q_b)?.rows();
+        let got_q = front.heads_rows().0.to_host_vec(stream)?;
+        let mut full = vec![f32::NAN; m * total];
+        rf.joined(w, (&launches, total), l, (&xn, m), &mut full)?;
+        let (mut want_qa, mut want_kv) = (Vec::new(), Vec::new());
+        for col in full.chunks(total) {
+            want_qa.extend_from_slice(&col[..q_lora]);
+            want_kv.extend_from_slice(&col[q_lora..]);
+        }
+        let mut want_q = vec![f32::NAN; m * q_n];
+        rf.project(w, (&q_b, l), &qr, m, (0, 0), &mut want_q)?;
+        let mut want_y = vec![f32::NAN; m * out_n];
+        rf.project(w, (&out, l), &av, m, (0, 0), &mut want_y)?;
+        let (head, tail): (Vec<_>, Vec<_>) =
+            launches.iter().copied().partition(|&(_, at)| at < q_lora);
+        let tail: Vec<(&str, usize)> = tail.into_iter().map(|(n, at)| (n, at - q_lora)).collect();
+        let own = |name: &str, n: usize| {
+            if typed(w, name) {
+                vec![0..n]
+            } else {
+                Vec::new()
+            }
+        };
+        let mut pass = near(
+            &format!("layer {l} q_a"),
+            (&qa.to_host_vec(stream)?, &want_qa),
+            q_lora,
+            &typed_rows(w, &head)?,
+        );
+        pass &= near(
+            &format!("layer {l} kv_a·index_k·gate"),
+            (&kv_d.to_host_vec(stream)?, &want_kv),
+            kv,
+            &typed_rows(w, &tail)?,
+        );
+        pass &= near(
+            &format!("layer {l} q_b"),
+            (&got_q[..m * q_n], &want_q),
+            q_n,
+            &own(&q_b, q_n),
+        );
+        pass &= near(
+            &format!("layer {l} out"),
+            (&y.to_host_vec(stream)?, &want_y),
+            out_n,
+            &own(&out, out_n),
+        );
+        Ok(pass)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
         let file = glm5next_tier::open()?;
         let w = load(stream, &file)?;
         let hp = Hparams::read(&file)?;
-        let low = HostW::of(&file, &[names::ssm_g_a(KDA)])?.rows;
-        let qkv = names::attn_qkv(KDA);
-        let out = names::attn_output(KDA);
+        let q8 = front_sites_q8_0(&file);
+        // The q·k·v the load joined is one weight, else its parts: the first's K is the normed input's.
+        let qkv_site = if w.get(&names::attn_qkv(KDA)).is_some() {
+            names::attn_qkv(KDA)
+        } else {
+            names::attn_q(KDA)
+        };
         let k_of = |name: &str| -> Result<usize, GateError> {
             match w.get(name) {
-                Some(DevWeight::Q8_0 { k, .. }) => Ok(*k),
-                _ => Err(format!("{name} is not resident as Q8_0").into()),
+                Some(
+                    DevWeight::Q8_0 { k, .. }
+                    | DevWeight::KQuant { k, .. }
+                    | DevWeight::Bf16 { k, .. },
+                ) => Ok(*k),
+                _ => Err(format!("{name} is not resident as Q8_0, a K-quant or BF16").into()),
             }
         };
         let rows_of = |name: &str| -> Result<usize, GateError> {
-            match w.get(name) {
-                Some(q @ DevWeight::Q8_0 { .. }) => Ok(q.rows()),
-                _ => Err(format!("{name} is not resident as Q8_0").into()),
-            }
+            Ok(w.resident("gate_glm5next_gemm", name)?.rows())
+        };
+        // The inputs a K-quant site reads: the q8_1 blocks the front holds beside its q8 blocks of 32.
+        let kquant = |n: String| {
+            file.find(&n).is_some_and(|(_, t)| {
+                matches!(
+                    t.ty,
+                    GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+                )
+            })
+        };
+        let mixer = MixerForms {
+            embd: [names::attn_q(KDA), names::attn_k(KDA), names::attn_v(KDA)]
+                .into_iter()
+                .chain([names::ssm_g_a(KDA), names::ssm_beta(KDA)])
+                .chain(stack_parts(LATENT))
+                .any(kquant),
+            low: kquant(names::ssm_g_b(KDA)),
+            gated: kquant(names::attn_output(KDA)),
+            q_low: kquant(names::attn_q_b(LATENT)),
+            heads: kquant(names::attn_output(LATENT)),
         };
         let shape = FrontShape {
             cols: T_MAX,
             widths: FrontWidths {
-                embd: k_of(&qkv)?,
-                low,
-                gated: k_of(&out)?,
+                embd: k_of(&qkv_site)?,
+                low: rows_of(&names::ssm_g_a(KDA))?,
+                gated: k_of(&names::attn_output(KDA))?,
                 q_low: k_of(&names::attn_q_b(LATENT))?,
                 q: rows_of(&names::attn_q_b(LATENT))?,
                 heads_v: k_of(&names::attn_output(LATENT))?,
                 ff: k_of(&names::ffn_down(LEAD))?,
                 forms: DenseForms::Q8_0,
+                mixer,
             },
         };
         let mut front = GemmFront::open(&gpu, shape)?;
@@ -705,6 +1144,39 @@ mod gate {
         let mut pass = true;
         // A short count first, then the batch's: the table refilled for each
         // new count, every column of both written.
+        if !q8 {
+            tier::sc("(g4) by type: every projection the front runs against the by-name path")?;
+            let mut sites: Vec<String> = Vec::new();
+            for l in [KDA, LEAD] {
+                sites.extend([
+                    names::attn_q(l),
+                    names::attn_k(l),
+                    names::attn_v(l),
+                    names::attn_qkv(l),
+                    names::ssm_g_a(l),
+                    names::ssm_beta(l),
+                    names::ssm_g_b(l),
+                    names::attn_output(l),
+                ]);
+            }
+            sites.extend(stack_parts(LATENT));
+            sites.extend([names::attn_a_stack(LATENT), names::attn_q_b(LATENT)]);
+            sites.push(names::attn_output(LATENT));
+            sites.retain(|n| w.get(n).is_some());
+            let mut rf = Reference::open(&gpu, &w, &sites)?;
+            for at in [(KDA, BY_TYPE_COLS), (KDA, BY_TYPE_COLS + 6)] {
+                pass &= by_type_kda(&gpu, &w, &mut front, &mut rf, at)?;
+            }
+            pass &= by_type_latent(&gpu, &w, &mut front, &mut rf, (LATENT, BY_TYPE_COLS))?;
+            println!("gate_glm5next_gemm: {}", tier::tally_line());
+            if !pass {
+                return Err(checks_failed());
+            }
+            println!(
+                "PASSED: gate_glm5next_gemm — every projection the front runs by its type within the band of the by-name path"
+            );
+            return Ok(());
+        }
         tier::sc("(g1) bits: every projection bit for bit the host transcription of the contract")?;
         tier::sc("(g2) quantize: one launch per distinct input, one GEMM per projection")?;
         tier::sc("(g3) refuse: the named errors, with no launch made")?;

@@ -16,7 +16,7 @@ use runtime::prompt::group_sets;
 use runtime::stores;
 
 use super::hparams::{Hparams, Kind};
-use super::{roles, spec};
+use super::{names, roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::arch::names::routed_stacks;
@@ -245,6 +245,34 @@ impl DenseForms {
     }
 }
 
+/// The inputs of the GEMM front a mixer's K-quant site reads as q8_1 blocks of 128 values, over the file's
+/// mixers: each input holds the q8 blocks of 32 values beside them for its Q8_0 and BF16 sites. A file whose
+/// mixer sites are all Q8_0 or BF16 holds none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MixerForms {
+    /// The normed input: a KDA qkv, gate and β, a latent stack.
+    pub embd: bool,
+    /// A KDA mixer's low-rank gate rows.
+    pub low: bool,
+    /// A KDA mixer's gated rows.
+    pub gated: bool,
+    /// A latent mixer's normed query low rank.
+    pub q_low: bool,
+    /// A latent mixer's heads' outputs.
+    pub heads: bool,
+}
+
+impl MixerForms {
+    /// No K-quant mixer site.
+    pub const NONE: MixerForms = MixerForms {
+        embd: false,
+        low: false,
+        gated: false,
+        q_low: false,
+        heads: false,
+    };
+}
+
 /// The widths, in values a column, a prompt batch's GEMM front is sized for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontWidths {
@@ -267,6 +295,8 @@ pub struct FrontWidths {
     pub ff: usize,
     /// The forms the dense block's sites read: what is held besides the normed input's q8 blocks of 32 values.
     pub forms: DenseForms,
+    /// The mixer inputs a K-quant site reads: their q8_1 blocks of 128 values beside the q8 blocks of 32.
+    pub mixer: MixerForms,
 }
 
 /// Card bytes of a GEMM front of `cols` token columns of widths `w`, four
@@ -277,10 +307,11 @@ pub struct FrontWidths {
 /// (sixteen of codes, two scales, two code sums), over the normed input, the
 /// KDA gate's low-rank and gated rows, the latent query's low rank, the
 /// latent heads' outputs and, for a Q8_0 down, the dense block's SwiGLU rows;
-/// the dense block's K-quant forms ([`DenseForms`]) in q8_1 blocks of 128
-/// values, the q8_1 planes' own bytes ([`q8_act_bytes`], over the width's
-/// whole super-blocks) over the normed input and a K-quant down's SwiGLU
-/// rows; and the f32 rows the front holds whole, a word a value: the latent
+/// the dense block's K-quant forms ([`DenseForms`]) and the mixers' ([`MixerForms`])
+/// in q8_1 blocks of 128 values, the q8_1 planes' own bytes ([`q8_act_bytes`],
+/// over the width's whole super-blocks) over the normed input (one buffer for
+/// either), a K-quant down's SwiGLU rows and each other input a K-quant mixer
+/// site reads; and the f32 rows the front holds whole, a word a value: the latent
 /// query heads, the heads' outputs, and the dense block's gate and up rows. A width of 0 makes nothing (the dense block's forms none at an `ff` of 0). The one formula of those
 /// bytes: the card body's front checks its made bytes against it.
 #[must_use]
@@ -299,9 +330,23 @@ pub fn front_bytes(cols: usize, w: FrontWidths) -> usize {
         .into_iter()
         .map(act)
         .sum();
-    let in128 = if forms.in128 { w.embd } else { 0 };
+    // The normed input's q8_1 blocks are one buffer for a K-quant dense gate and up and a K-quant mixer site.
+    let m = w.mixer;
+    let in128 = if forms.in128 || m.embd { w.embd } else { 0 };
     let rows128 = if forms.rows128 { w.ff } else { 0 };
-    let acts128: u64 = [in128, rows128].into_iter().map(act128).sum();
+    let mixer128 = [
+        (m.low, w.low),
+        (m.gated, w.gated),
+        (m.q_low, w.q_low),
+        (m.heads, w.heads_v),
+    ]
+    .into_iter()
+    .filter_map(|(held, k)| held.then_some(k));
+    let acts128: u64 = [in128, rows128]
+        .into_iter()
+        .chain(mixer128)
+        .map(act128)
+        .sum();
     let rows = cols * (w.q + w.heads_v + 2 * w.ff);
     usize::try_from(4 * (table + acts + rows) as u64 + acts128)
         .expect("the front's bytes fit a usize")
@@ -591,7 +636,50 @@ impl PlanInputs {
             heads_v: hp.n_head * hp.head_v,
             ff: hp.dense_ff,
             forms: self.dense_forms(),
+            mixer: self.mixer_forms(),
         }
+    }
+
+    /// The inputs of the front a K-quant mixer site reads ([`MixerForms`]), from the types of the trunk's
+    /// sites in the header: the sites the prompt batch's GEMM front runs, each by the input it reads and
+    /// the kind of its layer.
+    #[must_use]
+    pub fn mixer_forms(&self) -> MixerForms {
+        let hp = &self.hp;
+        let kquant: std::collections::HashSet<&str> = self
+            .model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::Attention && is_kquant(t.ty))
+            .map(|t| t.name.as_str())
+            .collect();
+        let held = |name: String| kquant.contains(name.as_str());
+        let mut f = MixerForms::NONE;
+        for (l, kind) in hp.kinds[..hp.n_trunk].iter().enumerate() {
+            match kind {
+                Kind::Kda => {
+                    f.embd |= [names::attn_q(l), names::attn_k(l), names::attn_v(l)]
+                        .into_iter()
+                        .chain([names::ssm_g_a(l), names::ssm_beta(l)])
+                        .any(held);
+                    f.low |= held(names::ssm_g_b(l));
+                    f.gated |= held(names::attn_output(l));
+                }
+                Kind::Latent => {
+                    f.embd |= [
+                        names::attn_q_a(l),
+                        names::attn_kv_a_mqa(l),
+                        names::indexer_attn_k(l),
+                        names::indexer_compressor_gate(l),
+                    ]
+                    .into_iter()
+                    .any(held);
+                    f.q_low |= held(names::attn_q_b(l));
+                    f.heads |= held(names::attn_output(l));
+                }
+            }
+        }
+        f
     }
 
     /// Every feature of the file the engine does not run, as
@@ -1361,9 +1449,9 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseForms, FRONT_STEP, FrontWidths, KdaLanes, Kind, KvBytes, KvLayout, NextnKv,
-        PROMPT_GROUP, card_tile_bytes, front_bytes, group_sets, recurrent_bytes, row_bytes,
-        seq_terms, stage_term, unit_bytes,
+        DenseForms, FRONT_STEP, FrontWidths, KdaLanes, Kind, KvBytes, KvLayout, MixerForms,
+        NextnKv, PROMPT_GROUP, card_tile_bytes, front_bytes, group_sets, recurrent_bytes,
+        row_bytes, seq_terms, stage_term, unit_bytes,
     };
 
     /// A prompt group unit at GLM-5.3-Flash's sizes (4,096 values, four
@@ -1394,6 +1482,7 @@ mod tests {
             heads_v: 16_384,
             ff: 6144,
             forms,
+            mixer: MixerForms::NONE,
         };
         let q8 = front_bytes(cols, w(DenseForms::Q8_0));
         // 2048: sb 8 -> 256·4 + 256·2 + 80 = 1,616 words a column; 6144: sb 24 -> 256·12 + 256·6 + 240 = 4,848.
@@ -1419,6 +1508,24 @@ mod tests {
         let none = |forms| front_bytes(cols, FrontWidths { ff: 0, ..w(forms) });
         assert_eq!(none(mixed), none(DenseForms::NONE));
         assert_eq!(none(DenseForms::Q8_0), none(DenseForms::NONE));
+        // A K-quant mixer site adds the q8_1 blocks of its input: 2048 as above, 8192 (sb 32): 256·16 + 256·8 +
+        // 320 = 6,464 words, 1536 (sb 6): 256·3 + 256·2 + 60 = 1,340, 16,384 (sb 64): 256·32 + 256·16 + 640 =
+        // 12,928; the normed input's blocks are one buffer for the dense block and the mixers.
+        let with = |mixer, forms| front_bytes(cols, FrontWidths { mixer, ..w(forms) });
+        let embd = MixerForms {
+            embd: true,
+            ..MixerForms::NONE
+        };
+        assert_eq!(with(embd, DenseForms::Q8_0), q8 + in128);
+        assert_eq!(with(embd, all_k), front_bytes(cols, w(all_k)));
+        let (gated, q_low, heads) = (4 * cols * 6_464, 4 * cols * 1_340, 4 * cols * 12_928);
+        let rest = MixerForms {
+            gated: true,
+            q_low: true,
+            heads: true,
+            ..MixerForms::NONE
+        };
+        assert_eq!(with(rest, DenseForms::Q8_0), q8 + gated + q_low + heads);
     }
 
     /// The card experts' grouped scratch at GLM-5.3-Flash's sizes (4,096
@@ -1533,9 +1640,9 @@ mod tests {
 
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
-            DenseForms, KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
-            TIER_CHUNK, card_leg_bytes, card_leg_forms, prompt_reserve_bytes, row_bytes,
-            tier_batch,
+            DenseForms, KdaLanes, Kind, KvLayout, MixerForms, NextnInputs, NextnKv, PlaceError,
+            PlanInputs, TIER_CHUNK, card_leg_bytes, card_leg_forms, prompt_reserve_bytes,
+            row_bytes, tier_batch,
         };
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
@@ -1796,6 +1903,74 @@ mod tests {
             let (forms, widths) = with(&[[Q6_K, Q6_K, Q5_K], [Q8_0, Q8_0, Q8_0]]);
             assert_eq!(forms, DenseForms { rows32: true, ..k });
             assert_eq!(widths.forms, forms);
+        }
+
+        /// The mixer forms follow the header's types: a K-quant attention output reads the gated rows on a KDA
+        /// layer and the heads' outputs on a latent one, a K-quant `attn_q`, `ssm_g_a` or `attn_kv_a_mqa` the
+        /// normed input, `ssm_g_b` the low-rank rows, `attn_q_b` the query's low rank; Q8_0 sites and a K-quant
+        /// absorbed pair (which the front does not run) hold none. Layer 0 is a KDA layer, layer 3 a latent one.
+        #[test]
+        fn the_mixer_forms_follow_the_headers_types() {
+            use GgmlType::{Q5_K, Q6_K, Q8_0};
+            let with = |sites: &[(usize, &str, GgmlType)]| {
+                let mut inputs = inputs();
+                for &(l, stem, ty) in sites {
+                    inputs.model.tensors.push(ModelTensor {
+                        name: format!("blk.{l}.{stem}.weight"),
+                        shard: 0,
+                        layer: Some(l),
+                        role: Role::Attention,
+                        ty,
+                        dims: vec![4096, 4096],
+                        file_bytes: 0,
+                        gathered_rows: None,
+                    });
+                }
+                (inputs.mixer_forms(), inputs.front_widths())
+            };
+            let none = MixerForms::NONE;
+            assert_eq!(with(&[(0, "attn_q", Q8_0), (3, "attn_q_b", Q8_0)]).0, none);
+            assert_eq!(
+                with(&[(3, "attn_k_b", Q6_K), (3, "attn_v_b", Q6_K)]).0,
+                none
+            );
+            let one = |l, stem, ty| with(&[(l, stem, ty)]).0;
+            let embd = MixerForms { embd: true, ..none };
+            assert_eq!(one(0, "attn_k", Q6_K), embd);
+            assert_eq!(one(0, "ssm_g_a", Q5_K), embd);
+            assert_eq!(one(3, "attn_kv_a_mqa", Q6_K), embd);
+            assert_eq!(one(0, "ssm_g_b", Q5_K), MixerForms { low: true, ..none });
+            assert_eq!(
+                one(0, "attn_output", Q5_K),
+                MixerForms {
+                    gated: true,
+                    ..none
+                }
+            );
+            assert_eq!(
+                one(3, "attn_output", Q5_K),
+                MixerForms {
+                    heads: true,
+                    ..none
+                }
+            );
+            assert_eq!(
+                one(3, "attn_q_b", Q5_K),
+                MixerForms {
+                    q_low: true,
+                    ..none
+                }
+            );
+            let (forms, widths) = with(&[(0, "attn_output", Q5_K), (3, "attn_q_b", Q6_K)]);
+            assert_eq!(
+                forms,
+                MixerForms {
+                    gated: true,
+                    q_low: true,
+                    ..none
+                }
+            );
+            assert_eq!(widths.mixer, forms);
         }
 
         /// An attention projection in bloomery's MXFP8 (`GgmlType::MXFP8`, as an
