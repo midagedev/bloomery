@@ -24,7 +24,6 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
-use bloomery_device::Device;
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_metal::arch::qwen3moe::check::{self, Tally};
 use bloomery_metal::arch::qwen3moe::plan;
@@ -53,10 +52,9 @@ fn agree(held: u64, bytes: u64, buffers: usize) -> bool {
 /// cannot land the gap inside it.
 const GAP_MARGIN: Duration = Duration::from_millis(50);
 
-/// The bytes the device holds, as its census counts them.
+/// The bytes this process holds on the device, as the driver counts them.
 fn held(device: &MetalDevice) -> Result<u64, String> {
-    let info = device.info().map_err(why)?;
-    Ok(info.total_bytes.saturating_sub(info.free_bytes))
+    device.allocated_bytes().map_err(why)
 }
 
 /// What the plan of `path`'s header says the open makes buffers of at [`CTX`]

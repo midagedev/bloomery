@@ -102,7 +102,6 @@ mod cli {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
-    use bloomery_device::Device;
     use bloomery_metal::arch::qwen3moe::{
         check,
         count::{GroupKind, KINDS},
