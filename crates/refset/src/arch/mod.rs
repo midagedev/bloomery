@@ -99,7 +99,8 @@ static NEEDS_ENV: &[(&Family, &str, fn() -> bool)] = &[(
     card_all_experts,
 )];
 
-/// Whether `BLOOMERY_CARD_ALL_EXPERTS` is set and not empty here.
+/// Whether `BLOOMERY_CARD_ALL_EXPERTS` is set and not empty here. A row carries its own reader because
+/// `tools/check-levers.sh` accepts a direct read only by a literal name, which a lookup by the row's string is not.
 fn card_all_experts() -> bool {
     std::env::var_os("BLOOMERY_CARD_ALL_EXPERTS").is_some_and(|v| !v.is_empty())
 }
