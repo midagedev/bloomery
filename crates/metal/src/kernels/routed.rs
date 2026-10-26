@@ -113,14 +113,22 @@ impl RoutedPipelines {
         })
     }
 
-    fn family(&self, quant: Quant) -> &RoutedFamily {
-        match quant {
+    /// The grouped GEMM family of `quant`; a type with none is refused by
+    /// name, the entry absent and not defaulted.
+    fn family(&self, quant: Quant) -> Result<&RoutedFamily, DeviceError> {
+        Ok(match quant {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
             Quant::A4 => &self.a4,
             Quant::Q8_0 => &self.q8_0,
             Quant::Q5K => &self.q5k,
-        }
+            Quant::Q5_0 | Quant::Q5_1 => {
+                return Err(range(
+                    ROUTED_WHAT,
+                    format!("{} has no grouped GEMM entry", quant.name()),
+                ));
+            }
+        })
     }
 }
 
@@ -568,7 +576,7 @@ impl Kernels {
             u32::from(p.gather),
             word(ROUTED_WHAT, "the outputs an expert", p.rows)?,
         ]);
-        let family = self.routed.family(p.quant);
+        let family = self.routed.family(p.quant)?;
         let table = if pair { &family.pair } else { &family.plain };
         encoder.set_pipeline(&table[operand_at(p.operand)]);
         let mut slot = Bindings::new(encoder);

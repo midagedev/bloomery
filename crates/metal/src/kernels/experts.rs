@@ -367,24 +367,39 @@ impl Pipelines {
         })
     }
 
-    fn pair(&self, quant: Quant) -> &Pipeline {
-        match quant {
+    /// The gate-up pair's entry of `quant`; a type with none is refused by
+    /// name, the entry absent and not defaulted.
+    fn pair(&self, quant: Quant) -> Result<&Pipeline, DeviceError> {
+        Ok(match quant {
             Quant::Q4K => &self.pair_q4,
             Quant::Q6K => &self.pair_q6,
             Quant::A4 => &self.pair_a4,
             Quant::Q8_0 => &self.pair_q8_0,
             Quant::Q5K => &self.pair_q5k,
-        }
+            Quant::Q5_0 | Quant::Q5_1 => {
+                return Err(refuse_pair(format!(
+                    "{} has no gate-up pair entry",
+                    quant.name()
+                )));
+            }
+        })
     }
 
-    fn fold(&self, quant: Quant) -> &Pipeline {
-        match quant {
+    /// The folded down's entry of `quant`, refused by name the same way.
+    fn fold(&self, quant: Quant) -> Result<&Pipeline, DeviceError> {
+        Ok(match quant {
             Quant::Q4K => &self.fold_q4,
             Quant::Q6K => &self.fold_q6,
             Quant::A4 => &self.fold_a4,
             Quant::Q8_0 => &self.fold_q8_0,
             Quant::Q5K => &self.fold_q5k,
-        }
+            Quant::Q5_0 | Quant::Q5_1 => {
+                return Err(refuse_fold(format!(
+                    "{} has no folded down entry",
+                    quant.name()
+                )));
+            }
+        })
     }
 }
 
@@ -411,7 +426,7 @@ impl super::Kernels {
             shape.stride,
             p.eps.to_bits(),
         ]);
-        encoder.set_pipeline(self.experts.pair(p.quant));
+        encoder.set_pipeline(self.experts.pair(p.quant)?);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.gate)?)?;
         slot.set(Binding::of(&p.up)?)?;
@@ -448,7 +463,7 @@ impl super::Kernels {
             self.rows_per_simd_group,
         )?;
         let args = args_bytes([shape.rows, shape.n_experts, p.layer, 0]);
-        encoder.set_pipeline(self.experts.fold(p.quant));
+        encoder.set_pipeline(self.experts.fold(p.quant)?);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.down)?)?;
         slot.set(Binding::of(&shared)?)?;

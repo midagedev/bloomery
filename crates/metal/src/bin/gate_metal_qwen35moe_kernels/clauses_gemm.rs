@@ -278,6 +278,9 @@ pub(super) fn gemm_band(
         Quant::Q4K | Quant::Q5K => 4,
         Quant::Q6K | Quant::A4 => 2,
         Quant::Q8_0 => 1,
+        Quant::Q5_0 | Quant::Q5_1 => {
+            panic!("{} has no GEMM entry, so no GEMM band", quant.name())
+        }
     };
     let acc = match path {
         GemmPath::Simdgroup => cols / 8 + 8,

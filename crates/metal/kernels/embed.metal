@@ -2,7 +2,8 @@
 // row t of an f32 output, one thread per value — `embed_q4k` over a Q4_K
 // table, and one body over the owners' value decode (quant.metal, not a
 // second copy of the rule) for the others: `embed_a4` over MLX's affine
-// 4-bit groups, `embed_q8_0` over Q8_0, `embed_q5k` over Q5_K.
+// 4-bit groups, `embed_q8_0` over Q8_0, `embed_q5k` over Q5_K, `embed_q5_0`
+// over Q5_0 and `embed_q5_1` over Q5_1.
 //
 // An id at or past the table's rows is undefined input: the kernel raises the
 // token-id site in `layer`, reads no table word, and writes NaN to every value
@@ -13,8 +14,9 @@
 // or an unfused subtraction gives the same bits. The others' value is the
 // owner's: A4's the host reader's `s·q + b` with the product and the sum
 // each rounded once (the fp-contract pragma holds the order), Q8_0's `q·d`
-// exact, Q5_K's `d1·q − m1` with the subtraction the one rounding — so the
-// embed's bits are the reader's.
+// exact, Q5_K's `d1·q − m1` with the subtraction the one rounding, Q5_0's
+// `(q − 16)·d` exact and Q5_1's `q·d + m` with the sum the one rounding — so
+// the embed's bits are the reader's.
 //
 // This file comes after quant.metal (QK_K, the block structs, the owners)
 // and fault.metal (raise).
@@ -123,3 +125,5 @@ kernel void embed_kernel(device const typename Q::Block * table [[buffer(0)]],
 EMBED_ENTRY(embed_a4, A4)
 EMBED_ENTRY(embed_q8_0, Q8_0)
 EMBED_ENTRY(embed_q5k, Q5K)
+EMBED_ENTRY(embed_q5_0, Q5_0)
+EMBED_ENTRY(embed_q5_1, Q5_1)

@@ -55,6 +55,12 @@ maps, the block strides, Q5_K's fifth-bit masks and the sum associations. The bo
 instantiate are the ones named above. The licence is the one above, the ggml authors' MIT licence,
 whose text applies to those two owners.
 
+The `Q5_0` and `Q5_1` owners in `crates/metal/kernels/quant_b32.metal` are adapted from llama.cpp's
+`kernel_mul_mv_q5_0_f32` and `kernel_mul_mv_q5_1_f32` (the same file, the same commit): the lane map,
+the block stride, the scaled activation load, the fifth-bit masks and the sum associations. The bodies
+the owners instantiate are the ones named above. The licence is the one above, the ggml authors' MIT
+licence, whose text applies to those two owners.
+
 ## MLX
 
 `crates/metal/src/bin/metal_gemm_time/probe_mlx_qmm.metal` is MLX's affine `qmm_t` kernel for 4-bit, group-64

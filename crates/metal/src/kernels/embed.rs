@@ -1,4 +1,4 @@
-//! The launch of the Q4_K and A4 embeddings.
+//! The launch of the embeddings.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -14,8 +14,8 @@ const GROUP_THREADS: usize = 256;
 
 /// One embedding: `ids.len()` rows of a quantized table, dequantized to f32.
 pub struct EmbedParams<'w> {
-    /// The table's type. Q4_K and A4 have an embedding entry; Q6_K has none
-    /// and is refused by name.
+    /// The table's type. Every type but Q6_K has an embedding entry; Q6_K is
+    /// refused by name.
     pub quant: Quant,
     /// The table's bytes: `vocab * cols / values_per_block()` blocks.
     pub table: Window<'w, u8, MetalDevice>,
@@ -81,14 +81,19 @@ impl Kernels {
             p.layer,
             word(WHAT, "the id count", count)?,
         ]);
-        // One thread per value, and a thread's index is a 32-bit word.
-        // The columns are a multiple of the group, so the value count is too.
+        // One thread per value, and a thread's index is a 32-bit word: the
+        // grid is the value count rounded up to whole groups (the kernel
+        // returns for a thread past the last value).
         word(WHAT, "the value count", values)?;
+        let threads = values.next_multiple_of(GROUP_THREADS);
+        word(WHAT, "the value count rounded up to a group", threads)?;
         let pipeline = match p.quant {
             Quant::Q4K => &self.embed_q4k,
             Quant::A4 => &self.embed_a4,
             Quant::Q8_0 => &self.embed_q8_0,
             Quant::Q5K => &self.embed_q5k,
+            Quant::Q5_0 => &self.embed_q5_0,
+            Quant::Q5_1 => &self.embed_q5_1,
             // A quant with no embedding entry is refused by name: the entry
             // is absent, not defaulted.
             Quant::Q6K => {
@@ -102,6 +107,6 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.out)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.fault.binding())?;
-        slot.dispatch_groups(values / GROUP_THREADS, 1, GROUP_THREADS)
+        slot.dispatch_groups(threads / GROUP_THREADS, 1, GROUP_THREADS)
     }
 }

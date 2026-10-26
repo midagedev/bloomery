@@ -64,12 +64,38 @@
 //! add (1) in place of the four-scale sum (3), so its path is the store's
 //! plus the head scale's product, within `n + 1` as Q4_K's.
 //!
+//! **Q5_0** (quant_b32.metal's `Q5_0`) evaluates `d (acc0 + acc1 - 16 sumy)`
+//! over the five-bit codes `q`, not `q - 16`, so the terms of the evaluation
+//! tree are `d q y` and `-16 d y`, and the bound is on their magnitudes:
+//! `M_c = |d| (q + 16)`, which is the reader's dequantization of the same
+//! blocks with `d`'s sign cleared (`|d| (q - 16)`) plus `32 |d|`. The
+//! activations are loaded divided by a power of two and met by a code word
+//! scaled by the same one, so those products are exact apart from their
+//! one rounding. The longest path is the code side's and the sum side's,
+//! equal: the product (1), the pair's add (1), the accumulator's chain over
+//! four pairs (3: the first add is to zero, exact), the two adds that join
+//! `sumy * -16 + acc0 + acc1` (2 for `acc0`'s terms), and the product by `d`
+//! (1); the sum side is the pair add (1), its chain (3), `sumy0 + sumy1`
+//! (1), the two joins (2; the product by -16 is exact) and `d` (1):
+//! `n = 8 + ceil(nb / 16) + 31`, the lane's sum over its blocks and the 31
+//! adds of the SIMD group.
+//!
+//! **Q5_1** (`Q5_1`) evaluates `d (acc0 + acc1) + sumy m`, so the terms are
+//! `d q y` and `m y` and the bound is on `M_c = |d| q + |m|`, the reader's
+//! dequantization of the same blocks with both sign bits cleared. The code
+//! side's path is the product (1), the pair add (1), the chain (3), the sum
+//! `acc0 + acc1` (1), the product by `d` (1) and the final add (1); the min
+//! side's is the pair add (1), the chain (3), `sumy0 + sumy1` (1), the
+//! product by `m` (1) and the final add (1), shorter by one:
+//! `n = 8 + ceil(nb / 16) + 31`.
+//!
 //! **Norm on load** adds the gain product on the load (1) and the scale
 //! product at the end (1), and the scale itself: `s = rsqrt(S / K + eps)`, `S`
 //! the sum of squares in the kernel's own order (a square, two adds, the lane's
 //! chain of `8 ceil(nb / 4)` adds for Q4_K and Q5_K (one load), `4 ceil(nb /
-//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4 or `2 ceil(nb / 8)` for Q8_0, the 31
-//! adds of the SIMD group), then the division and the addition. `s` is off
+//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4, `2 ceil(nb / 8)` for Q8_0 or `4
+//! ceil(nb / 16)` for Q5_0 and Q5_1 (four groups of four values a block), the
+//! 31 adds of the SIMD group), then the division and the addition. `s` is off
 //! by at most `(1 - t)^(-1/2) - 1` for `t = G(nS + 2)` (the worse direction),
 //! and by the library `rsqrt`'s own error, taken as `RSQRT_ULP` units in the
 //! last place (2 ulp = 4U). The `RSQRT_ULP` premise is `[unverified]`: no source
@@ -153,6 +179,14 @@ const A4_STORE_BASE: usize = 9;
 /// sets the band.
 const Q8_0_STORE_BASE: usize = 9;
 
+/// The operations of a Q5_0 or Q5_1 store path before the lane's blocks and
+/// the SIMD group's sum: the code side's and the sum side's equal count of
+/// the model in this module's doc.
+///
+/// PIN(2026-10-27): the model in this module's doc, and no measured error,
+/// sets the band.
+const B32_STORE_BASE: usize = 8;
+
 /// The operations of a Q5_K store path before the lane's blocks and the SIMD
 /// group's sum: the `d` side's fixed count of the model in this module's doc.
 ///
@@ -230,6 +264,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
         Quant::A4 => (nblocks.div_ceil(8), A4_STORE_BASE),
         Quant::Q8_0 => (nblocks.div_ceil(8), Q8_0_STORE_BASE),
         Quant::Q5K => (nblocks.div_ceil(4), Q5K_STORE_BASE),
+        Quant::Q5_0 | Quant::Q5_1 => (nblocks.div_ceil(16), B32_STORE_BASE),
     };
     let n_store = base + lane_blocks + SIMD_SUM_DEPTH;
     match kind {
@@ -243,6 +278,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
                 Quant::Q6K => 4 * lane_blocks,
                 Quant::A4 => 4 * lane_blocks,
                 Quant::Q8_0 => 2 * lane_blocks,
+                Quant::Q5_0 | Quant::Q5_1 => 4 * lane_blocks,
             };
             let n_s = 1 + 2 + chain + SIMD_SUM_DEPTH;
             // The scale's argument is off by at most `t` relative, so the
@@ -336,6 +372,40 @@ fn a4_magnitude_blocks(row: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The magnitude of every value of a Q5_0 or Q5_1 row, the terms of the
+/// evaluation tree this module's doc derives: Q5_0's `|d| (q + 16)`, the
+/// reader's values of the row with `d` made non-negative plus `32 |d|`;
+/// Q5_1's `|d| q + |m|`, the reader's values of the row with `d` and `m` made
+/// non-negative (each opens its block as a little-endian f16; Q5_0 holds `d`
+/// and Q5_1 `d` then `m`).
+fn b32_magnitudes(quant: Quant, row: &[u8], out: &mut [f64]) -> Result<(), String> {
+    let bytes = quant.block_bytes();
+    let mut cleared = row.to_vec();
+    for block in cleared.chunks_exact_mut(bytes) {
+        block[1] &= 0x7F;
+        if quant == Quant::Q5_1 {
+            block[3] &= 0x7F;
+        }
+    }
+    let mut values = vec![0f32; out.len()];
+    dequant_row(quant.ggml(), &cleared, &mut values)
+        .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
+    for (o, v) in out.iter_mut().zip(&values) {
+        *o = f64::from(*v);
+    }
+    if quant == Quant::Q5_0 {
+        for (block, chunk) in cleared.chunks_exact(bytes).zip(out.as_chunks_mut::<32>().0) {
+            let d = f64::from(gguf::quant::half_to_f32(u16::from_le_bytes([
+                block[0], block[1],
+            ])));
+            for v in chunk {
+                *v += 32.0 * d;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The oracle for `rows` rows of `weights` against the input `x` (what the
 /// kernel dots with: already normed when the kernel norms).
 pub fn reference(
@@ -356,6 +426,7 @@ pub fn reference(
     let ty = quant.ggml();
     let mut w = vec![0f32; cols];
     let mut m = vec![0f32; cols];
+    let mut big = vec![0f64; cols];
     let mut out = Reference {
         y: Vec::with_capacity(rows),
         magnitude: Vec::with_capacity(rows),
@@ -378,6 +449,10 @@ pub fn reference(
                 dequant_row(ty, &a4_magnitude_blocks(row), &mut m)
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
+            }
+            Quant::Q5_0 | Quant::Q5_1 => {
+                b32_magnitudes(quant, row, &mut big)?;
+                big.iter().zip(x).map(|(&m, &x)| m * x.abs()).sum()
             }
         };
         out.y.push(dot);

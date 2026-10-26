@@ -127,10 +127,9 @@ lab-metal-e2e:
     many="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids --profile 2 2>&1 >/dev/null)" || die "generate_metal rate smoke: the eight-token run failed (rc $?)"
     tr ' ' '\n' <<<"$many" | awk -F= '$1=="decode_passes"{p=$2} $1=="decode_s"{s=$2} $1=="decode_tok_s"{r=$2} $1=="decode_ms"{m=$2} END{ok = p==7 && s>0 && r/(p/s)>0.97 && r/(p/s)<1.03 && m/(s/p*1e3)>0.97 && m/(s/p*1e3)<1.03; exit !ok}' || die "generate_metal rate smoke: an 8-token run must count 7 passes, and decode_tok_s and the profile's decode_ms must be per pass"
 
-# The Nemotron kernels' gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the Mamba-2 step, the Q5_0 and Q5_1 owners,
-# the squared ReLU and the sigmoid router against the f64 oracle, then the gate's kernel mutants, each of which its clause must
-# catch. The gate bin refuses (66) while it has no clause. A lab-* recipe: the box has no Metal device, so no landing batch
-# selects it.
+# The Nemotron kernels' gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the Q5_0 and Q5_1 owners against the f64 oracle
+# (synthetic rows at the models' real shapes, and the Nano fixture's tensors where the machine has the file), then the gate's
+# kernel mutants, each of which its clause must catch. A lab-* recipe: the box has no Metal device, so no landing batch selects it.
 lab-metal-nemotron:
     cargo build --release -p bloomery-metal --bin gate_metal_nemotron_kernels && ./tools/mac-gate.sh gate_metal_nemotron_kernels && ./tools/mac-gate.sh gate_metal_nemotron_kernels --mutants-all
 

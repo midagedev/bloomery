@@ -1,5 +1,5 @@
-//! The quantized kernels' host side: the pipelines of the Q4_K, Q6_K and A4
-//! mat-vecs, the Q4_K and A4 embeddings, and the launch of each.
+//! The quantized kernels' host side: the pipelines of the quantized mat-vecs
+//! and embeddings, and the launch of each.
 //!
 //! A launch takes a parameter struct of windows and the shape they are for,
 //! checks every window's length against the shape before it encodes anything
@@ -125,6 +125,8 @@ pub struct Kernels {
     a4: MatvecPipelines,
     q8_0: MatvecPipelines,
     q5k: MatvecPipelines,
+    q5_0: MatvecPipelines,
+    q5_1: MatvecPipelines,
     /// The dense GEMM of each weight type: every epilogue and operand,
     /// plain and segmented (`gemm.metal`, or `gemm_tensor.metal` on the
     /// tensor-op path).
@@ -147,6 +149,8 @@ pub struct Kernels {
     embed_a4: Pipeline,
     embed_q8_0: Pipeline,
     embed_q5k: Pipeline,
+    embed_q5_0: Pipeline,
+    embed_q5_1: Pipeline,
     router: Pipeline,
     /// The RMS norm over rows.
     norm_rows: Pipeline,
@@ -332,6 +336,26 @@ impl Kernels {
                 ],
                 count,
             )?,
+            q5_0: MatvecPipelines::new(
+                library,
+                [
+                    "q5_0_matvec",
+                    "q5_0_matvec_norm",
+                    "q5_0_matvec_resid",
+                    "q5_0_matvec_seg",
+                ],
+                count,
+            )?,
+            q5_1: MatvecPipelines::new(
+                library,
+                [
+                    "q5_1_matvec",
+                    "q5_1_matvec_norm",
+                    "q5_1_matvec_resid",
+                    "q5_1_matvec_seg",
+                ],
+                count,
+            )?,
             q4k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q4k")?,
             q6k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q6k")?,
             a4_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4")?,
@@ -346,6 +370,8 @@ impl Kernels {
             embed_a4: library.pipeline("embed_a4")?,
             embed_q8_0: library.pipeline("embed_q8_0")?,
             embed_q5k: library.pipeline("embed_q5k")?,
+            embed_q5_0: library.pipeline("embed_q5_0")?,
+            embed_q5_1: library.pipeline("embed_q5_1")?,
             router: library.pipeline("router35")?,
             norm_rows: library.pipeline("norm_rows")?,
             routed: routed::RoutedPipelines::new(library)?,
