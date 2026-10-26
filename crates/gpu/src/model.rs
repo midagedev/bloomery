@@ -40,9 +40,10 @@ pub use slots::{SlotRange, SlotRowOrder, SlotRows, Slots, SlotsOut, slots_a_pass
 use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
+use crate::graph::MappedHost;
 use crate::head::{Head, HeadNorm};
 use crate::host::leg_tier;
-use crate::host::nvtier::{ArenaKind, NvTier};
+use crate::host::nvtier::{ArenaKind, ArenaPages, NvTier, PageSource};
 use crate::host::refuse_expert_tiers;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
@@ -51,8 +52,9 @@ use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refus
 use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
-use bloomery_levers::{ChurnHosting, HostCfg};
+use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream};
+use engram::direct::DIRECT_ALIGN;
 use gguf::Split;
 use model::arch::Arch;
 use model::moe::HostLayer;
@@ -1893,6 +1895,66 @@ fn launch_served<B: ChainBody>(
     }
 }
 
+/// The pinned host memory `ctx`'s card maps ([`MappedHost::read_in_place`]:
+/// write-combined on an integrated device alone) as the NVMe tier's arena
+/// pages, which a pin gives the card's address of.
+pub(crate) struct PinnedSource<'a>(pub(crate) &'a Arc<CudaContext>);
+
+impl PageSource for PinnedSource<'_> {
+    /// `len` bytes from the allocation's first [`DIRECT_ALIGN`]-aligned
+    /// byte, which a direct fill's window starts on. `cuMemHostAlloc`
+    /// promises no alignment, and a driver can hand a small allocation out of
+    /// a chunk it shares with others, off a page boundary, so the allocation
+    /// takes [`DIRECT_ALIGN`] bytes more.
+    fn alloc(&self, len: usize) -> Result<Box<dyn ArenaPages>, GpuError> {
+        let page = MappedHost::read_in_place(
+            self.0,
+            len + DIRECT_ALIGN,
+            "cuMemHostAlloc (the NVMe tier's arena; `BLOOMERY_NVTIER_MEM=anon` takes it \
+             from anonymous memory instead)",
+        )?;
+        let first = page.host_at(0) as usize;
+        let skip = first.next_multiple_of(DIRECT_ALIGN) - first;
+        Ok(Box::new(PinnedPages { page, skip, len }))
+    }
+}
+
+/// One allocation of mapped host memory, its arena starting `skip` bytes in.
+struct PinnedPages {
+    page: MappedHost,
+    skip: usize,
+    len: usize,
+}
+
+impl ArenaPages for PinnedPages {
+    fn base(&self) -> *mut u8 {
+        self.page.host_at(self.skip)
+    }
+
+    fn bytes(&self) -> usize {
+        self.len
+    }
+
+    fn device_base(&self) -> Option<u64> {
+        Some(self.page.dev_at(self.skip))
+    }
+}
+
+/// The arena `lever` asks for on `source`'s device: pinned pages when the
+/// lever pins on a device of that integrated bit ([`NvTierMem::pinned`]), the
+/// bit write-combining reads too, else anonymous.
+pub(crate) fn arena_kind_of<'a>(
+    source: &'a PinnedSource<'_>,
+    lever: NvTierMem,
+) -> Result<ArenaKind<'a>, GpuError> {
+    let integrated = crate::raw_device_integrated(source.0.cu_device())?;
+    Ok(if lever.pinned(integrated) {
+        ArenaKind::Provided(source)
+    } else {
+        ArenaKind::Anon
+    })
+}
+
 /// The NVMe expert tier of a paged load, the common chain's one build
 /// every family's host run attaches
 /// ([`HostRun::attach_tier`](crate::host::run::HostRun::attach_tier)):
@@ -1930,7 +1992,8 @@ pub fn nvme_tier(
              reads the source: same bits)",
         ));
     }
-    let mem = ArenaKind::of(ctx, levers.mem)?;
+    let source = PinnedSource(ctx);
+    let mem = arena_kind_of(&source, levers.mem)?;
     NvTier::of_paged(plan, file, levers.direct, arena, mem, levers.evict).map(|t| t.map(Arc::new))
 }
 

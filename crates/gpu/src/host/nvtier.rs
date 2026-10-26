@@ -1,13 +1,15 @@
 //! The NVMe expert tier's RAM arena: one anonymous mapping
-//! ([`engram::direct::AnonMap`]), or one allocation of pinned host memory the
-//! card maps ([`ArenaKind::Pinned`]), carved into slots — one expert a slot,
+//! ([`engram::direct::AnonMap`]), or the pages a [`PageSource`] provides
+//! ([`ArenaKind::Provided`]; on the card, pinned host memory it maps),
+//! carved into slots — one expert a slot,
 //! each of its parts in its own [`DIRECT_ALIGN`]-aligned window, the bytes
 //! landing at the skew an aligned read of the part's file range needs —
 //! filled on a miss by [`DirectFile::read_span_uninit`] — over the resident pool for
 //! a decode step's misses, on the tier's own reader for a prompt batch's and
 //! a residency flip's victim — and lent to the host leg through the model
-//! side's [`TierSlots`] seam or, on a pinned arena, held for the step port's
-//! card leg, which computes a step's ids from their slots on the card
+//! side's [`TierSlots`] seam or, on an arena whose pages have a device
+//! address, held for the step port's card leg, which computes a step's ids
+//! from their slots on the card
 //! ([`NvTier::issue_card_hold`], then [`CardTicket::finish`]).
 //! The file mapping serves the plan's host segment; every other id the leg
 //! reads — the NVMe segment's, and the card's victims once they flip — is
@@ -18,7 +20,7 @@
 //! arena's one give-back (`ArenaMem::give_back`, the only door to the
 //! mapping's advice), which frees an anonymous range's pages — that is why
 //! the arena is anonymous and not the page cache, whose warm set nothing
-//! else can flush. A pinned arena returns none: its allocation is the
+//! else can flush. A provided arena returns none: its allocation is the
 //! plan's for the load. On write-combined pages (an integrated device's) a
 //! `MADV_DONTNEED` leaves the range unbacked for the host and for a
 //! `cuMemcpyDtoH` from its device address: the next fill's read fails with
@@ -102,8 +104,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bloomery_levers::{NvTierEvict, NvTierMem};
-use cuda_core::CudaContext;
+use bloomery_levers::NvTierEvict;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
 use model::moe::{Claim, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin, TierSlots};
@@ -134,21 +135,17 @@ const READER_STOP_BOUND: Duration = Duration::from_secs(30);
 /// through. The mapping is a private field of [`ArenaMem`]: a slot's pages go
 /// back through [`ArenaMem::give_back`] and no other call; and a fill writes
 /// straight into a slot's windows ([`ArenaMem::read_into`]), never through a
-/// bounce buffer. The mapping is anonymous memory, or pinned host memory the
-/// card maps ([`ArenaKind`]), whose pages stay for the arena's life.
+/// bounce buffer. The mapping is anonymous memory, or pages a source
+/// provides ([`ArenaKind`]), which stay for the arena's life.
 mod arena_mem {
-    use std::sync::Arc;
-
-    use cuda_core::CudaContext;
     use engram::EngramError;
     use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile};
 
-    use crate::GpuError;
-    use crate::graph::MappedHost;
+    use super::ArenaPages;
 
     enum Pages {
         Anon(AnonMap),
-        Pinned(MappedHost),
+        Provided(Box<dyn ArenaPages>),
     }
 
     pub(super) struct ArenaMem {
@@ -179,31 +176,26 @@ mod arena_mem {
             }
         }
 
-        /// `len` bytes of pinned host memory on `ctx` the card maps
-        /// ([`MappedHost::read_in_place`]), from the allocation's first
-        /// [`DIRECT_ALIGN`]-aligned byte, which a direct fill's window
-        /// starts on. `cuMemHostAlloc` promises no alignment, and a driver
-        /// can hand a small allocation out of a chunk it shares with others,
-        /// off a page boundary, so the allocation takes [`DIRECT_ALIGN`]
-        /// bytes more.
-        pub(super) fn pinned(ctx: &Arc<CudaContext>, len: usize) -> Result<ArenaMem, GpuError> {
-            let page = MappedHost::read_in_place(
-                ctx,
-                len + DIRECT_ALIGN,
-                "cuMemHostAlloc (the NVMe tier's arena; `BLOOMERY_NVTIER_MEM=anon` takes it \
-                 from anonymous memory instead)",
-            )?;
-            let first = page.host_at(0) as usize;
-            let base = page.host_at(first.next_multiple_of(DIRECT_ALIGN) - first);
+        /// The `len` bytes `pages` hold, from the first byte they name,
+        /// which a direct fill's window starts on. A source that gives
+        /// another length, or a first byte off a [`DIRECT_ALIGN`] boundary,
+        /// breaks its contract ([`ArenaPages`]): refused by name.
+        pub(super) fn provided(pages: Box<dyn ArenaPages>, len: usize) -> ArenaMem {
+            let base = pages.base();
+            assert!(
+                pages.bytes() == len,
+                "the page source gave {} B for the arena's {len} B",
+                pages.bytes()
+            );
             assert!(
                 (base as usize).is_multiple_of(DIRECT_ALIGN),
-                "the pinned arena's first byte {base:p} is not {DIRECT_ALIGN}-aligned"
+                "the provided arena's first byte {base:p} is not {DIRECT_ALIGN}-aligned"
             );
-            Ok(ArenaMem {
+            ArenaMem {
                 base,
                 len,
-                pages: Pages::Pinned(page),
-            })
+                pages: Pages::Provided(pages),
+            }
         }
 
         /// The mapping's first byte's address.
@@ -212,13 +204,11 @@ mod arena_mem {
         }
 
         /// The mapping's first byte as the card addresses it; `None` on an
-        /// anonymous mapping.
+        /// anonymous mapping and on pages with no device address.
         pub(super) fn device_start(&self) -> Option<u64> {
             match &self.pages {
                 Pages::Anon(_) => None,
-                Pages::Pinned(page) => {
-                    Some(page.dev_at(self.base as usize - page.host_at(0) as usize))
-                }
+                Pages::Provided(pages) => pages.device_base(),
             }
         }
 
@@ -283,44 +273,48 @@ mod arena_mem {
 
         /// Return the pages of `at .. at + len` — whole pages of a slot the
         /// books gave up — to the kernel: the next touch reads zeroes. The
-        /// one place the arena's pages are advised. Nothing on pinned pages:
-        /// the allocation is the plan's for the load, and on write-combined
-        /// pages advice leaves the range unbacked for the next fill and for a
-        /// copy from its device address (the module's head).
+        /// one place the arena's pages are advised. Nothing on provided
+        /// pages: the allocation is the plan's for the load, and on
+        /// write-combined pages advice leaves the range unbacked for the next
+        /// fill and for a copy from its device address (the module's head).
         pub(super) fn give_back(&self, at: usize, len: usize) -> Result<(), EngramError> {
             match &self.pages {
                 Pages::Anon(map) => map.dontneed(at, len),
-                Pages::Pinned(_) => Ok(()),
+                Pages::Provided(_) => Ok(()),
             }
         }
     }
 }
 use arena_mem::ArenaMem;
 
+/// The memory behind a provided arena: [`ArenaPages::bytes`] bytes from a
+/// first byte aligned to [`DIRECT_ALIGN`] (the direct fills' windows start
+/// on it), alive as long as the value.
+pub trait ArenaPages: Send + Sync {
+    /// The first byte the fills write, the same on every call.
+    fn base(&self) -> *mut u8;
+    /// The mapping's length in bytes.
+    fn bytes(&self) -> usize;
+    /// The first byte as the card addresses it; `None` when the pages have
+    /// no device address.
+    fn device_base(&self) -> Option<u64>;
+}
+
+/// What makes the pages of a provided arena, once the carve knows how many
+/// it needs.
+pub trait PageSource {
+    /// `len` bytes of pages ([`ArenaPages::bytes`] is `len`); refused by name
+    /// when the source has none to give.
+    fn alloc(&self, len: usize) -> Result<Box<dyn ArenaPages>, GpuError>;
+}
+
 /// The memory an arena is ([`NvTier::of_paged`]): an anonymous mapping, or
-/// one `cuMemHostAlloc` on `ctx` the card maps (write-combined on an
-/// integrated device alone,
-/// [`MappedHost::read_in_place`](crate::graph::MappedHost::read_in_place)),
-/// whose filled slots a pin gives the card's address of
-/// ([`TierPin::device_slot`]).
+/// the pages a [`PageSource`] provides, whose filled slots a pin gives the
+/// card's address of ([`TierPin::device_slot`]) when the pages have one.
 #[derive(Clone, Copy)]
 pub enum ArenaKind<'a> {
     Anon,
-    Pinned(&'a Arc<CudaContext>),
-}
-
-impl<'a> ArenaKind<'a> {
-    /// The arena `lever` asks for on `ctx`'s device: pinned when the lever
-    /// pins on a device of that integrated bit ([`NvTierMem::pinned`]), the
-    /// bit write-combining reads too, else anonymous.
-    pub(crate) fn of(ctx: &'a Arc<CudaContext>, lever: NvTierMem) -> Result<Self, GpuError> {
-        let integrated = crate::raw_device_integrated(ctx.cu_device())?;
-        Ok(if lever.pinned(integrated) {
-            ArenaKind::Pinned(ctx)
-        } else {
-            ArenaKind::Anon
-        })
-    }
+    Provided(&'a dyn PageSource),
 }
 
 /// A slot's state, as a pick reads it without the lock.
@@ -2127,7 +2121,7 @@ impl NvTier {
                 AnonMap::new(bytes)
                     .map_err(|e| GpuError::shape(WHAT, format!("the arena's {bytes} B: {e}")))?,
             ),
-            ArenaKind::Pinned(ctx) => ArenaMem::pinned(ctx, bytes)?,
+            ArenaKind::Provided(source) => ArenaMem::provided(source.alloc(bytes)?, bytes),
         };
         let bases = layer_bases(count, slot_sizes);
         for (arena, base) in arenas.iter_mut().flatten().zip(bases) {
@@ -3783,10 +3777,10 @@ mod tests {
         layer_bases, pick_slot, slots_of, window_bytes, window_span,
     };
     use bloomery_levers::NvTierEvict;
-    use engram::direct::{DIRECT_ALIGN, aligned_span};
+    use engram::direct::{AnonMap, DIRECT_ALIGN, aligned_span};
     use model::moe::Claim;
     use model::placement::{ARENA_LANE_SLOTS, UNION_BATCH_IDS};
-    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     fn book(state: u32, tick: u64) -> SlotBook {
         SlotBook {
@@ -5338,7 +5332,7 @@ mod tests {
     /// or not, the same.
     #[test]
     fn a_refill_of_an_evicted_slot_gives_no_pages_back() {
-        use engram::direct::{AnonMap, DirectFile};
+        use engram::direct::DirectFile;
         use std::sync::Arc;
         const PAGE: usize = DIRECT_ALIGN;
         let dir = std::env::temp_dir();
@@ -5424,7 +5418,7 @@ mod tests {
     /// layers, so the second's base is past 0, each stack row its own file
     /// and range, the leg's parts resolved to other rows (`[2, 0, 1]`), and
     /// an expert in the slot before. The arena is what the lever's `pinned`
-    /// asks of this device ([`ArenaKind::of`]), allocated after a small
+    /// asks of this device ([`arena_kind_of`]), allocated after a small
     /// allocation of the same kind, and write-combined on an integrated
     /// device alone. Each round fills expert 7's slot from files whose bytes
     /// differ from every other round's and row's at every offset, read
@@ -5437,6 +5431,7 @@ mod tests {
     fn devmap_rounds(direct: bool) {
         use super::{ArenaKind, NvTier};
         use crate::graph::{MappedHost, cu};
+        use crate::model::{PinnedSource, arena_kind_of};
         use bloomery_levers::NvTierMem;
         use engram::direct::DirectFile;
         use model::moe::TierSlots;
@@ -5513,8 +5508,12 @@ mod tests {
         let _before =
             MappedHost::read_in_place(&ctx, 1, "cuMemHostAlloc (before the test's arena)")
                 .expect("a pinned byte");
-        let pinned = ArenaKind::of(&ctx, NvTierMem::Pinned).unwrap();
-        assert!(matches!(pinned, ArenaKind::Pinned(_)), "the lever's pinned");
+        let source = PinnedSource(&ctx);
+        let pinned = arena_kind_of(&source, NvTierMem::Pinned).unwrap();
+        assert!(
+            matches!(pinned, ArenaKind::Provided(_)),
+            "the lever's pinned"
+        );
         let mut tier = tier_of(pinned);
         let mut flags = 0u32;
         // SAFETY: the host address is the arena's first byte, inside the
@@ -5567,7 +5566,7 @@ mod tests {
                 "an id the pin does not hold has no address"
             );
         }
-        let anon = ArenaKind::of(&ctx, NvTierMem::Anon).unwrap();
+        let anon = arena_kind_of(&source, NvTierMem::Anon).unwrap();
         assert!(matches!(anon, ArenaKind::Anon), "the lever's anon");
         let mut tier = tier_of(anon);
         fill(&mut tier, 1, 7, 0);
@@ -5586,8 +5585,8 @@ mod tests {
         }
         assert_eq!(
             matches!(
-                ArenaKind::of(&ctx, NvTierMem::Auto).unwrap(),
-                ArenaKind::Pinned(_)
+                arena_kind_of(&source, NvTierMem::Auto).unwrap(),
+                ArenaKind::Provided(_)
             ),
             integrated,
             "auto pins on an integrated device alone"
@@ -5643,7 +5642,17 @@ mod tests {
         count: usize,
         evict: NvTierEvict,
     ) -> std::sync::Arc<super::NvTier> {
-        use super::{ArenaKind, NvTier};
+        eight_tier_over(scratch, count, evict, super::ArenaKind::Anon)
+    }
+
+    /// [`eight_tier`] over the arena memory `mem` says.
+    fn eight_tier_over(
+        scratch: &Scratch,
+        count: usize,
+        evict: NvTierEvict,
+        mem: super::ArenaKind<'_>,
+    ) -> std::sync::Arc<super::NvTier> {
+        use super::NvTier;
         use engram::direct::DirectFile;
         use model::placement::workstation::ArenaGrant;
         use std::sync::Arc;
@@ -5672,16 +5681,8 @@ mod tests {
         };
         let slots = [3 * CARD_PAGE];
         let grant = ArenaGrant::whole((count * slots[0]) as u64);
-        let mut tier = NvTier::carve(
-            vec![None, layer()],
-            &slots,
-            count,
-            grant,
-            0,
-            &split,
-            ArenaKind::Anon,
-        )
-        .expect("the tier's carve");
+        let mut tier = NvTier::carve(vec![None, layer()], &slots, count, grant, 0, &split, mem)
+            .expect("the tier's carve");
         if evict == NvTierEvict::Heat {
             tier.count_routes();
         }
@@ -5780,6 +5781,164 @@ mod tests {
             None,
             "an anonymous arena has no card address"
         );
+    }
+
+    /// Pages over an anonymous map, `skew` bytes in, of `len` bytes, whose
+    /// first byte the card would address as `dev`: a page source with no card
+    /// behind it.
+    struct HostPages {
+        map: AnonMap,
+        skew: usize,
+        len: usize,
+        dev: Option<u64>,
+    }
+
+    impl HostPages {
+        fn new(skew: usize, len: usize, dev: Option<u64>) -> HostPages {
+            let map = AnonMap::new(len + skew + DIRECT_ALIGN).expect("an anonymous map");
+            HostPages {
+                map,
+                skew,
+                len,
+                dev,
+            }
+        }
+    }
+
+    impl super::ArenaPages for HostPages {
+        fn base(&self) -> *mut u8 {
+            self.map.as_ptr().cast_mut().wrapping_add(self.skew)
+        }
+
+        fn bytes(&self) -> usize {
+            self.len
+        }
+
+        fn device_base(&self) -> Option<u64> {
+            self.dev
+        }
+    }
+
+    /// A [`HostPages`] source that records the first byte it gave.
+    struct HostSource {
+        skew: usize,
+        dev: Option<u64>,
+        gave: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::PageSource for HostSource {
+        fn alloc(&self, len: usize) -> Result<Box<dyn super::ArenaPages>, crate::GpuError> {
+            let pages = HostPages::new(self.skew, len, self.dev);
+            let base = super::ArenaPages::base(&pages) as usize;
+            self.gave.store(base, Ordering::Relaxed);
+            Ok(Box::new(pages))
+        }
+    }
+
+    /// A provided arena is its source's pages and nothing else: the fills
+    /// land from the first byte the source names (a page in, so not the
+    /// mapping's own), the card's address of a slot is the source's device
+    /// base plus the slot's offset, and no give-back advises the pages (an
+    /// anonymous arena's would read zeroes after one).
+    #[test]
+    fn a_provided_arena_is_its_sources_pages() {
+        use super::ArenaKind;
+        use model::moe::TierSlots;
+        const LAYER: usize = 1;
+        const DEV: u64 = 0xD000_0000;
+        let scratch = Scratch::new("provided");
+        let source = HostSource {
+            skew: CARD_PAGE,
+            dev: Some(DEV),
+            gave: Default::default(),
+        };
+        let tier = eight_tier_over(&scratch, 2, NvTierEvict::Tick, ArenaKind::Provided(&source));
+        assert_eq!(
+            tier.mem.start(),
+            source.gave.load(Ordering::Relaxed),
+            "the arena starts at the first byte the source named"
+        );
+        assert_eq!(tier.mem.len(), 2 * 3 * CARD_PAGE);
+        assert_eq!(
+            tier.card_arena(),
+            Some((DEV, 2 * 3 * CARD_PAGE / 4)),
+            "the card's address of the arena is the source's device base"
+        );
+        let hold = tier.hold_for_card(LAYER, &[1, 2]).unwrap();
+        let pin = tier.pin(LAYER, &[1, 2]).unwrap();
+        let check = |what: &str| {
+            for id in [1u32, 2] {
+                for p in 0..PARTS {
+                    let part = tier.slot(LAYER, id, p).expect("a held id's slot");
+                    let a = card_at(p, id as usize);
+                    assert_eq!(
+                        part,
+                        &card_bytes(p)[a..a + CARD_LEN],
+                        "{what}: expert {id} part {p}: the file's bytes"
+                    );
+                    let at = (part.as_ptr() as usize - tier.mem.start()) as u64;
+                    assert_eq!(
+                        pin.device_slot(id, p),
+                        Some(DEV + at),
+                        "{what}: expert {id} part {p}: the card's address"
+                    );
+                }
+            }
+        };
+        check("filled");
+        tier.mem
+            .give_back(0, tier.mem.len())
+            .expect("the give-back of provided pages");
+        check("after a give-back");
+        drop((pin, hold));
+    }
+
+    /// A source with no device address gives the card none, and the host
+    /// reads its slots the same.
+    #[test]
+    fn a_provided_arena_without_a_device_base_has_no_card_address() {
+        use super::ArenaKind;
+        use model::moe::TierSlots;
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("provided-host");
+        let source = HostSource {
+            skew: 0,
+            dev: None,
+            gave: Default::default(),
+        };
+        let tier = eight_tier_over(&scratch, 2, NvTierEvict::Tick, ArenaKind::Provided(&source));
+        assert_eq!(tier.card_arena(), None);
+        let hold = tier.hold_for_card(LAYER, &[1]).unwrap();
+        let pin = tier.pin(LAYER, &[1]).unwrap();
+        for p in 0..PARTS {
+            assert_eq!(pin.device_slot(1, p), None, "part {p}: no card address");
+            let a = card_at(p, 1);
+            assert_eq!(
+                tier.slot(LAYER, 1, p),
+                Some(&card_bytes(p)[a..a + CARD_LEN]),
+                "part {p}: the host's view"
+            );
+        }
+        drop((pin, hold));
+    }
+
+    /// A source that gives other than the bytes the carve asked for breaks
+    /// its contract: refused by name, never an arena of another size.
+    #[test]
+    #[should_panic(expected = "the page source gave")]
+    fn a_provided_arena_refuses_pages_of_another_length() {
+        let pages = HostPages::new(0, 4 * DIRECT_ALIGN - 1, None);
+        super::ArenaMem::provided(Box::new(pages), 4 * DIRECT_ALIGN);
+    }
+
+    /// A source whose first byte is off a [`DIRECT_ALIGN`] boundary breaks
+    /// its contract: the direct fills' windows start on it, so it is refused
+    /// by name.
+    #[test]
+    #[should_panic(expected = "is not 4096-aligned")]
+    fn a_provided_arena_refuses_a_first_byte_off_the_direct_alignment() {
+        let pages = HostPages::new(1, 4 * DIRECT_ALIGN, None);
+        super::ArenaMem::provided(Box::new(pages), 4 * DIRECT_ALIGN);
     }
 
     /// A heat arena's victim order beside the gate's (`gate_nvtier`'s
@@ -6125,7 +6284,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_refilled_pinned_slot_reads_as_its_new_expert_in_the_arena_entries() {
-        use super::{ArenaKind, NvTier};
+        use super::NvTier;
         use crate::Gpu;
         use crate::card_leg::tests::{stack_bytes, words_of};
         use crate::graph::Graph;
@@ -6268,7 +6427,9 @@ mod tests {
                 arena.part_of.set([0, 1, 2]).unwrap();
                 Some(arena)
             };
-            let pinned = ArenaKind::of(ctx, bloomery_levers::NvTierMem::Pinned).unwrap();
+            let source = crate::model::PinnedSource(ctx);
+            let pinned =
+                crate::model::arena_kind_of(&source, bloomery_levers::NvTierMem::Pinned).unwrap();
             let slots = [slot_bytes; 2];
             let grant = ArenaGrant::whole((2 * slots.iter().sum::<usize>()) as u64);
             let mut tier =
@@ -6420,7 +6581,7 @@ mod tests {
         use super::super::page::Word;
         use super::super::slots::HOST;
         use super::super::step::{Boundary, BoundaryShape};
-        use super::{ArenaKind, NvTier};
+        use super::NvTier;
         use crate::Gpu;
         use crate::card_leg::tests::{stack_bytes, words_of};
         use crate::card_slots::{CardAcc, CardSlotKernels};
@@ -6603,7 +6764,9 @@ mod tests {
             .collect();
         arena.files = files;
         arena.part_of.set([0, 1, 2]).unwrap();
-        let pinned = ArenaKind::of(ctx, bloomery_levers::NvTierMem::Pinned).unwrap();
+        let source = crate::model::PinnedSource(ctx);
+        let pinned =
+            crate::model::arena_kind_of(&source, bloomery_levers::NvTierMem::Pinned).unwrap();
         let grant = ArenaGrant::whole((2 * slot_bytes) as u64);
         let tier = Arc::new(
             NvTier::carve(
