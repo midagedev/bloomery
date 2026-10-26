@@ -17,6 +17,23 @@ pub mod arch;
 /// launch (macOS) and by the token count (every OS).
 #[path = "kernels/attention_geom.rs"]
 pub mod attention_geom;
+/// The gated delta step's geometry, one file read by the launch (macOS) and
+/// by `build.rs`.
+#[path = "kernels/delta_geom.rs"]
+pub mod delta_geom;
+/// The expert pair and fold geometry, one file read by the launch (macOS) and
+/// by `build.rs`.
+#[path = "kernels/experts_geom.rs"]
+pub mod experts_geom;
+/// The launch geometry of one instance, resolved once: the owner of every
+/// number the host sizes a launch by, which `build.rs` writes the kernels'
+/// header from too. Host arithmetic: every OS.
+#[path = "kernels/geom.rs"]
+pub mod geom;
+/// The mat-vec launch geometry, one file read by the launches (macOS) and by
+/// `build.rs`.
+#[path = "kernels/geometry.rs"]
+pub mod geometry;
 /// The kernels' instances: one per registered shape row, each the axes one
 /// translation unit of the kernels is compiled at (a router's experts, picks
 /// and hidden width, decode attention's head, rope and heads, the delta
@@ -26,6 +43,10 @@ pub mod attention_geom;
 /// file selects its instance by its shape and a shape no instance has is
 /// refused by name. Host arithmetic: every OS.
 pub mod instance;
+/// The router's geometry, one file read by the launch (macOS) and by
+/// `build.rs`.
+#[path = "kernels/router_geom.rs"]
+pub mod router_geom;
 /// The server's engine over any `runtime::Target`, host code: every OS.
 pub mod server;
 

@@ -23,19 +23,19 @@
 mod attention;
 use crate::attention_geom;
 mod delta;
-mod delta_geom;
+use crate::delta_geom;
 mod embed;
 mod experts;
-mod experts_geom;
+use crate::experts_geom;
 mod gemm;
-mod geometry;
+use crate::geometry;
 mod head;
 mod headnorm;
 mod matvec;
 mod norm;
 mod routed;
 pub mod router;
-mod router_geom;
+use crate::router_geom;
 mod rows;
 mod seg;
 
@@ -76,7 +76,7 @@ pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
-    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SLOTS_PER_ROW, TABLE_THREADS,
+    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, TABLE_THREADS,
     route_table_words, route_tiles,
 };
 pub use seg::{SegParams, Segment};
@@ -84,7 +84,7 @@ pub use seg::{SegParams, Segment};
 use bloomery_device::DeviceError;
 
 use crate::device::MetalDevice;
-use crate::instance::HOST;
+pub use crate::geom::Geometry;
 use crate::library::{GemmPath, Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
@@ -160,6 +160,9 @@ pub struct Kernels {
     head_a4: Pipeline,
     head_q8_0: Pipeline,
     head_q5k: Pipeline,
+    /// The launch geometry of the library's instance: the numbers every
+    /// launch sizes its grid and checks its windows by.
+    geom: Geometry,
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -205,8 +208,9 @@ impl Kernels {
     /// `router_sg` the router's own SIMD-group count, another source
     /// constant. The probe compiles variant sources and names their counts
     /// here; the launches' geometry follows what they name. A `rows` or
-    /// `router_sg` the library's source does not define, and a library of
-    /// another instance than the host's ([`HOST`]), are refused by name.
+    /// `router_sg` the library's source does not define is refused by name.
+    /// The numbers of every other launch are the library's instance's
+    /// ([`Geometry::of`]).
     pub fn with_geometry(
         library: &Library,
         rows: usize,
@@ -234,19 +238,9 @@ impl Kernels {
                 ),
             });
         }
-        // The launches' grids and the buffers' lengths are the host
-        // instance's: a library of another instance's geometry would be
-        // launched over rows and heads its kernels do not hold.
-        if *library.instance() != HOST {
-            return Err(DeviceError::unsupported(
-                "kernels",
-                format!(
-                    "the library is instance {}; the host's launches are sized for {}",
-                    library.instance().name,
-                    HOST.name
-                ),
-            ));
-        }
+        // The launches' grids and the buffers' lengths are the library's
+        // instance's, read from the same row its kernels were compiled at.
+        let geom = Geometry::of(library.instance());
         // The counts are the source's `#define`s: a count the library was not
         // compiled with would launch threadgroups over rows no kernel writes.
         let (built_rows, built_router_sg) = library.geometry();
@@ -376,13 +370,20 @@ impl Kernels {
                 u32::try_from(head::HEAD_SIMD_GROUPS)
                     .expect("the head's SIMD-group count fits u32"),
             )?,
+            geom,
             simdgroups,
             rows_per_simd_group: rows,
             router_threads,
             // The router's split is one, so a threadgroup count is the rows
             // over the SIMD groups the source names.
-            router_groups: router_geom::ROWS.div_ceil(router_sg),
+            router_groups: geom.router.rows.div_ceil(router_sg),
         })
+    }
+
+    /// The launch geometry of the library's instance.
+    #[must_use]
+    pub fn geom(&self) -> &Geometry {
+        &self.geom
     }
 
     /// The program the dense and the grouped GEMMs run.

@@ -1,16 +1,20 @@
 use crate::instance::{HOST, Instance, REGISTERED};
 
-/// Values in one head: the host instance's.
+/// Values in one head. A shim: the build's host instance's. Callers left:
+/// the arch, the e2e and kernel gates, their oracles and the probes.
 pub const HEAD_DIM: usize = HOST.key.attn.row.head as usize;
 
 /// The partial rope: the values of a head that turn, in pairs from the
-/// first. The host instance's.
+/// first. A shim: the build's host instance's. Callers left: the arch, the
+/// kernel gate, its oracles and the probes.
 pub const ROT: usize = HOST.key.attn.rot as usize;
 
-/// Query heads: the host instance's.
+/// Query heads. A shim: the build's host instance's. Callers left: the arch,
+/// the kernel gate and the probes.
 pub const QUERY_HEADS: usize = HOST.key.attn.n_head as usize;
 
-/// Key and value heads: the host instance's.
+/// Key and value heads. A shim: the build's host instance's. Callers left:
+/// the arch, the e2e and kernel gates and the probes.
 pub const KV_HEADS: usize = HOST.key.attn.n_kv as usize;
 
 /// Query heads per key head of `inst`.
@@ -18,9 +22,6 @@ pub const KV_HEADS: usize = HOST.key.attn.n_kv as usize;
 pub const fn gqa(inst: &Instance) -> usize {
     (inst.key.attn.n_head / inst.key.attn.n_kv) as usize
 }
-
-/// Query heads per key head.
-pub const GQA: usize = gqa(&HOST);
 
 /// Keys in one K/V tile.
 pub const TILE: usize = 16;
@@ -31,9 +32,6 @@ pub const TILE: usize = 16;
 pub const fn simd_groups(inst: &Instance) -> usize {
     gqa(inst) / HEADS_PER_SG
 }
-
-/// SIMD groups in the flash threadgroup.
-pub const SIMD_GROUPS: usize = simd_groups(&HOST);
 
 /// The width of a SIMD group.
 pub const SIMD_WIDTH: usize = 32;
@@ -48,18 +46,12 @@ pub const fn lane_dims(inst: &Instance) -> usize {
     inst.key.attn.row.head as usize / SIMD_WIDTH
 }
 
-/// Values one lane holds.
-pub const LANE_DIMS: usize = lane_dims(&HOST);
-
 /// One segment partial of a head of `head` values: the max, the weight sum,
 /// then the head.
 #[must_use]
 pub const fn partial_elems(head: usize) -> usize {
     head + 2
 }
-
-/// One segment partial.
-pub const PARTIAL_ELEMS: usize = partial_elems(HEAD_DIM);
 
 /// One head of `inst`'s query projection: the query, then the gate when it
 /// writes one.
@@ -68,7 +60,8 @@ pub const fn qg_stride(inst: &Instance) -> usize {
     inst.key.attn.row.head as usize * (1 + inst.key.attn.q_gate as usize)
 }
 
-/// One head of the query projection: the query, then the gate.
+/// One head of the query projection: the query, then the gate. A shim: the
+/// build's host instance's. Callers left: the kernel gate.
 pub const QG_STRIDE: usize = qg_stride(&HOST);
 
 /// The live-key ceiling one segment holds. At or under it the flash is one
@@ -83,7 +76,8 @@ pub const fn flash_threads(inst: &Instance) -> usize {
     SIMD_WIDTH * simd_groups(inst)
 }
 
-/// Threads in the flash threadgroup.
+/// Threads in the flash threadgroup. A shim: the build's host instance's.
+/// Callers left: the probes.
 pub const FLASH_THREADS: usize = flash_threads(&HOST);
 
 /// The score's scale for a head of `head` values: ik's
@@ -99,11 +93,12 @@ pub const fn scale_of(head: usize) -> f32 {
     }
 }
 
-/// The host instance's score scale.
+/// The score's scale. A shim: the build's host instance's. Callers left: the
+/// kernel gate's oracles and the probes.
 pub const SCALE: f32 = scale_of(HEAD_DIM);
 
 /// Positions one prefill threadgroup holds: a SIMD group each, whose rows
-/// are the [`GQA`] query heads of one key head at that position.
+/// are the group's query heads of one key head at that position.
 pub const PREFILL_POSITIONS: usize = 4;
 
 /// Keys one prefill tile holds: two 8-key fragments.
@@ -147,7 +142,6 @@ const _: () = {
         holds(&REGISTERED[i]);
         i += 1;
     }
-    assert!(PARTIAL_ELEMS == HEAD_DIM + 2);
     assert!(PREFILL_POSITIONS * SIMD_WIDTH == 128);
     assert!(PREFILL_KEYS == 16);
 };
@@ -177,7 +171,7 @@ pub fn segments_for_keys(n_keys: u32) -> u32 {
 }
 
 /// The most segments a key count takes. The partials are
-/// `QUERY_HEADS * SEGMENT_CAP * PARTIAL_ELEMS` values, written by the flash
+/// `query_heads * SEGMENT_CAP * partial_elems` values, written by the flash
 /// and read by its fold; at the cap they are an eighth of the K/V bytes of
 /// the keys that reach it.
 pub const SEGMENT_CAP: usize = 64;
