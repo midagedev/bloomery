@@ -3,7 +3,8 @@
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
-use bloomery_metal::kernels::{BLOCK_VALUES, HEAD_COLS, PARTIALS_PER_HEAD, Quant, VALUE_HEADS};
+use bloomery_metal::geom::DeltaGeom;
+use bloomery_metal::kernels::{BLOCK_VALUES, PARTIALS_PER_HEAD, Quant};
 
 use super::common::{self, LAYER};
 use super::fixture::Fixture;
@@ -215,24 +216,26 @@ pub fn residual_epilogue(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// numerator and the heads' partial sums are the inputs.
 pub fn headnorm(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = fixture.rms_eps()?;
-    let t = common::Tensor::q4k("blk.0.ssm_out.weight", HEAD_COLS * VALUE_HEADS, 2048);
+    let delta = &h.geom().delta;
+    let cols = delta.head_cols * delta.value_heads;
+    let t = common::Tensor::q4k("blk.0.ssm_out.weight", cols, 2048);
     let weights = t.bytes(fixture)?;
-    let g = oracle::activations(HEAD_COLS * VALUE_HEADS, 0x5E8, 1.0);
-    let partials = head_partials();
+    let g = oracle::activations(cols, 0x5E8, 1.0);
+    let partials = head_partials(delta);
     let x = common::head_scaled(
         &g,
         &partials,
-        VALUE_HEADS,
-        HEAD_COLS,
+        delta.value_heads,
+        delta.head_cols,
         PARTIALS_PER_HEAD,
         eps,
     );
-    let reference = oracle::reference(Quant::Q4K, weights, 2048, HEAD_COLS * VALUE_HEADS, &x)?;
+    let reference = oracle::reference(Quant::Q4K, weights, 2048, cols, &x)?;
     let resid = oracle::activations(2048, 0x5E9, 2.0);
     let got = h.headnorm(&HeadNormLaunch {
         quant: Quant::Q4K,
         rows: 2048,
-        cols: HEAD_COLS * VALUE_HEADS,
+        cols,
         weights,
         g: &g,
         partials: &partials,
@@ -244,11 +247,11 @@ pub fn headnorm(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err(format!("the launch raised {fault}"));
     }
     let kind = Kind::HeadNorm(oracle::HeadGeometry {
-        heads: VALUE_HEADS,
-        cols_per_head: HEAD_COLS,
+        heads: delta.value_heads,
+        cols_per_head: delta.head_cols,
         partials_per_head: PARTIALS_PER_HEAD,
     });
-    let band = oracle::band(Quant::Q4K, (HEAD_COLS * VALUE_HEADS) / BLOCK_VALUES, kind);
+    let band = oracle::band(Quant::Q4K, cols / BLOCK_VALUES, kind);
     let worst = oracle::check(&got, &reference, band, kind, Some(&resid))?;
     Ok(Verdict::Noted(format!(
         "the out projection's worst error over its band: {worst:.3}"
@@ -259,10 +262,12 @@ pub fn headnorm(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// NaN, not a zero head.
 pub fn headnorm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = fixture.rms_eps()?;
-    let t = common::Tensor::q4k("blk.0.ssm_out.weight", HEAD_COLS * VALUE_HEADS, 2048);
+    let delta = &h.geom().delta;
+    let cols = delta.head_cols * delta.value_heads;
+    let t = common::Tensor::q4k("blk.0.ssm_out.weight", cols, 2048);
     let weights = t.bytes(fixture)?;
-    let g = oracle::activations(HEAD_COLS * VALUE_HEADS, 0x5E8, 1.0);
-    let partials = head_partials();
+    let g = oracle::activations(cols, 0x5E8, 1.0);
+    let partials = head_partials(delta);
     let resid = oracle::activations(2048, 0x5E9, 2.0);
     let mut bad_partials = partials.clone();
     bad_partials[5 * PARTIALS_PER_HEAD + 3] = f32::INFINITY;
@@ -276,7 +281,7 @@ pub fn headnorm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         let got = h.headnorm(&HeadNormLaunch {
             quant: Quant::Q4K,
             rows: 2048,
-            cols: HEAD_COLS * VALUE_HEADS,
+            cols,
             weights,
             g,
             partials,
@@ -298,8 +303,8 @@ pub fn headnorm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 /// The heads' partial sums of the squares of their values: positive, and of
 /// the size the values of a head have.
-pub(super) fn head_partials() -> Vec<f32> {
-    (0..VALUE_HEADS * PARTIALS_PER_HEAD)
+pub(super) fn head_partials(delta: &DeltaGeom) -> Vec<f32> {
+    (0..delta.value_heads * PARTIALS_PER_HEAD)
         .map(|i| 0.5 + (i % 7) as f32 * 0.25)
         .collect()
 }

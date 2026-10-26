@@ -17,15 +17,32 @@
 //! subnormal floor is `8·f32::MIN_POSITIVE` and is not a widening of the factor.
 //!
 //! A predecessor at distance `d` is 0 while `pos < d`, and ring slot
-//! `(pos − d) mod 11` otherwise. Distance 0 is the launch's `x`. At position
-//! 0 every predecessor is 0. At position 1 the distance-1 tap reads the ring.
+//! `(pos − d) mod ring_rows` otherwise. Distance 0 is the launch's `x`. At
+//! position 0 every predecessor is 0. At position 1 the distance-1 tap reads
+//! the ring.
+//!
+//! The numbers of the step (value heads, columns of a head, taps, ring rows,
+//! the query's scale) are the geometry the input carries ([`StepIn::delta`]),
+//! so the oracle judges a launch at the instance it ran on.
 
-use bloomery_metal::kernels::{
-    CONV_TAPS, HEAD_COLS, HeadMap, PARTIALS_PER_HEAD, Q_SCALE, RING_ROWS, VALUE_HEADS, channels,
-    key_of, ring_elems, state_elems, state_index,
-};
+use bloomery_metal::geom::{DeltaGeom, Geometry};
+use bloomery_metal::instance::REGISTERED;
+use bloomery_metal::kernels::{HeadMap, PARTIALS_PER_HEAD, key_of};
 
 use super::oracle::U;
+
+/// What the kernel's lane map and the oracle's association are written for,
+/// held for every registered row: a head of 128 columns (32 lanes of four,
+/// sixteen keys by eight lanes a column) and a conv of four taps.
+const _: () = {
+    let mut i = 0;
+    while i < REGISTERED.len() {
+        let d = Geometry::of(&REGISTERED[i]).delta;
+        assert!(d.head_cols == 128);
+        assert!(d.conv_taps == 4);
+        i += 1;
+    }
+};
 
 /// The subnormal floor: one minimum-positive f32 per operation of the path
 /// the model in this module's doc counts, which the relative bound does not
@@ -243,6 +260,8 @@ fn lane_dot(a: &[Ev; 16], b: &[Ev; 16]) -> Ev {
 
 /// One step's inputs. The slices are the kernel's windows.
 pub struct StepIn<'a> {
+    /// The step's numbers: the instance the launch ran on.
+    pub delta: &'a DeltaGeom,
     /// Key heads.
     pub n_k: usize,
     /// How a value head finds its key head.
@@ -312,6 +331,7 @@ pub struct Fit {
 }
 
 struct Conv<'a> {
+    delta: &'a DeltaGeom,
     pos: u32,
     ch: usize,
     x: &'a [f32],
@@ -326,7 +346,8 @@ fn tap(c: &Conv<'_>, channel: usize, d: u32) -> Ev {
     if c.pos < d {
         return Ev::zero();
     }
-    let slot = (c.pos + RING_ROWS as u32 - d) % RING_ROWS as u32;
+    let ring_rows = c.delta.ring_rows as u32;
+    let slot = (c.pos + ring_rows - d) % ring_rows;
     Ev::exact(c.ring[slot as usize * c.ch + channel])
 }
 
@@ -337,17 +358,19 @@ fn conv_silu(c: &Conv<'_>, channel: usize) -> Result<Ev, String> {
         tap(c, channel, 1),
         tap(c, channel, 0),
     ];
-    let mut acc = mul(xs[0], Ev::exact(c.w[CONV_TAPS * channel]));
-    for (j, &x) in xs.iter().enumerate().take(CONV_TAPS).skip(1) {
-        acc = fma(x, Ev::exact(c.w[CONV_TAPS * channel + j]), acc);
+    let taps = c.delta.conv_taps;
+    let mut acc = mul(xs[0], Ev::exact(c.w[taps * channel]));
+    for (j, &x) in xs.iter().enumerate().take(taps).skip(1) {
+        acc = fma(x, Ev::exact(c.w[taps * channel + j]), acc);
     }
     silu(acc)
 }
 
-fn conv_head(c: &Conv<'_>, head: usize) -> Result<[Ev; HEAD_COLS], String> {
-    let mut out = [Ev::zero(); HEAD_COLS];
+fn conv_head(c: &Conv<'_>, head: usize) -> Result<Vec<Ev>, String> {
+    let cols = c.delta.head_cols;
+    let mut out = vec![Ev::zero(); cols];
     for (col, slot) in out.iter_mut().enumerate() {
-        *slot = conv_silu(c, head * HEAD_COLS + col)?;
+        *slot = conv_silu(c, head * cols + col)?;
     }
     Ok(out)
 }
@@ -360,10 +383,11 @@ fn l2_scale(sum: Ev, eps: f64) -> Result<Ev, String> {
 }
 
 fn normalize(
-    q: &[Ev; HEAD_COLS],
-    k: &[Ev; HEAD_COLS],
+    delta: &DeltaGeom,
+    q: &[Ev],
+    k: &[Ev],
     eps: f64,
-) -> Result<([Ev; HEAD_COLS], [Ev; HEAD_COLS]), String> {
+) -> Result<(Vec<Ev>, Vec<Ev>), String> {
     let mut sq = [Ev::zero(); 32];
     let mut sk = [Ev::zero(); 32];
     for lane in 0..32 {
@@ -386,9 +410,9 @@ fn normalize(
     }
     let sq = butterfly(sq, &[16, 8, 4, 2, 1]);
     let sk = butterfly(sk, &[16, 8, 4, 2, 1]);
-    let q_scale = Ev::exact(Q_SCALE);
-    let mut qo = [Ev::zero(); HEAD_COLS];
-    let mut ko = [Ev::zero(); HEAD_COLS];
+    let q_scale = Ev::exact(delta.q_scale);
+    let mut qo = vec![Ev::zero(); delta.head_cols];
+    let mut ko = vec![Ev::zero(); delta.head_cols];
     for lane in 0..32 {
         let qs = l2_scale(sq[lane], eps)?;
         let ks = l2_scale(sk[lane], eps)?;
@@ -409,20 +433,27 @@ fn need(len: usize, want: usize, what: &str) -> Result<(), String> {
 }
 
 fn check_lens(inp: &StepIn<'_>) -> Result<usize, String> {
-    let ch = channels(inp.n_k).ok_or_else(|| format!("n_k {} channels do not fit", inp.n_k))?;
-    let state = state_elems(inp.lanes).ok_or_else(|| "the state does not fit".to_string())?;
-    let ring = ring_elems(inp.n_k).ok_or_else(|| "the ring does not fit".to_string())?;
+    let d = inp.delta;
+    let ch = d
+        .channels(inp.n_k)
+        .ok_or_else(|| format!("n_k {} channels do not fit", inp.n_k))?;
+    let state = d
+        .state_elems(inp.lanes)
+        .ok_or_else(|| "the state does not fit".to_string())?;
+    let ring = d
+        .ring_elems(inp.n_k)
+        .ok_or_else(|| "the ring does not fit".to_string())?;
     need(inp.x.len(), ch, "x")?;
-    need(inp.conv_w.len(), CONV_TAPS * ch, "conv weight")?;
-    need(inp.b.len(), VALUE_HEADS, "b")?;
-    need(inp.a.len(), VALUE_HEADS, "a")?;
-    need(inp.dt.len(), VALUE_HEADS, "dt bias")?;
-    need(inp.ssm_a.len(), VALUE_HEADS, "ssm a")?;
-    need(inp.z.len(), VALUE_HEADS * HEAD_COLS, "z")?;
-    need(inp.norm_w.len(), HEAD_COLS, "norm weight")?;
+    need(inp.conv_w.len(), d.conv_taps * ch, "conv weight")?;
+    need(inp.b.len(), d.value_heads, "b")?;
+    need(inp.a.len(), d.value_heads, "a")?;
+    need(inp.dt.len(), d.value_heads, "dt bias")?;
+    need(inp.ssm_a.len(), d.value_heads, "ssm a")?;
+    need(inp.z.len(), d.value_heads * d.head_cols, "z")?;
+    need(inp.norm_w.len(), d.head_cols, "norm weight")?;
     need(inp.state.len(), state, "state")?;
     need(inp.ring.len(), ring, "ring")?;
-    if inp.n_k == 0 || !VALUE_HEADS.is_multiple_of(inp.n_k) {
+    if inp.n_k == 0 || !d.value_heads.is_multiple_of(inp.n_k) {
         return Err(format!("n_k {} does not divide the value heads", inp.n_k));
     }
     for (what, lane) in [("read", inp.lane), ("write", inp.lane_out)] {
@@ -437,13 +468,14 @@ fn check_lens(inp: &StepIn<'_>) -> Result<usize, String> {
 }
 
 struct Head<'a> {
+    delta: &'a DeltaGeom,
     h: usize,
     lane: usize,
     lane_out: usize,
     decay: Ev,
     beta: Ev,
-    q: &'a [Ev; HEAD_COLS],
-    k: &'a [Ev; HEAD_COLS],
+    q: &'a [Ev],
+    k: &'a [Ev],
     state_in: &'a [f32],
     z: &'a [f32],
     norm_w: &'a [f32],
@@ -471,7 +503,8 @@ fn column(
     for j in 0..8 {
         for i in 0..16 {
             let key = key_of(j, i);
-            let s0 = Ev::exact(head.state_in[state_index(head.lane, head.h, col, key)]);
+            let at = head.delta.state_index(head.lane, head.h, col, key);
+            let s0 = Ev::exact(head.state_in[at]);
             sp[j][i] = mul(s0, head.decay);
             kk[j][i] = head.k[key];
             qq[j][i] = head.q[key];
@@ -491,7 +524,7 @@ fn column(
             *out.flip = (*out.flip).max(2.0 * (kk[j][i].v * u[j].v).abs());
             sp[j][i] = fma(kk[j][i], u[j], sp[j][i]);
             let key = key_of(j, i);
-            let at = state_index(head.lane_out, head.h, col, key);
+            let at = head.delta.state_index(head.lane_out, head.h, col, key);
             out.state[at] = sp[j][i].v;
             out.state_err[at] = sp[j][i].e;
         }
@@ -501,7 +534,7 @@ fn column(
         odots[j] = lane_dot(&sp[j], &qq[j]);
     }
     let o = butterfly(odots, &[4, 2, 1])[0];
-    let at = head.h * HEAD_COLS + col;
+    let at = head.h * head.delta.head_cols + col;
     let gval = mul(
         mul(o, Ev::exact(head.norm_w[col])),
         silu(Ev::exact(head.z[at]))?,
@@ -515,7 +548,9 @@ fn column(
 /// The step: the kernel's association, in f64, with the absolute error.
 pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
     let ch = check_lens(inp)?;
+    let d = inp.delta;
     let conv = Conv {
+        delta: d,
         pos: inp.pos,
         ch,
         x: inp.x,
@@ -528,28 +563,29 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
     for kh in 0..inp.n_k {
         let q = conv_head(&conv, kh)?;
         let k = conv_head(&conv, inp.n_k + kh)?;
-        let (q, k) = normalize(&q, &k, eps)?;
+        let (q, k) = normalize(d, &q, &k, eps)?;
         qs.push(q);
         ks.push(k);
     }
     let lane = inp.lane as usize;
     let lane_out = inp.lane_out as usize;
-    let g_len = VALUE_HEADS * HEAD_COLS;
+    let g_len = d.value_heads * d.head_cols;
     let mut g = vec![0.0; g_len];
     let mut g_err = vec![0.0; g_len];
-    let mut partials = vec![0.0; VALUE_HEADS * PARTIALS_PER_HEAD];
-    let mut partials_err = vec![0.0; VALUE_HEADS * PARTIALS_PER_HEAD];
+    let mut partials = vec![0.0; d.value_heads * PARTIALS_PER_HEAD];
+    let mut partials_err = vec![0.0; d.value_heads * PARTIALS_PER_HEAD];
     let mut out_state: Vec<f64> = inp.state.iter().map(|&v| f64::from(v)).collect();
     let mut out_err = vec![0.0; inp.state.len()];
     let mut flip = 0.0f64;
-    for h in 0..VALUE_HEADS {
+    for h in 0..d.value_heads {
         let decay = exp_ev(mul(
             Ev::exact(inp.ssm_a[h]),
             softplus(add(Ev::exact(inp.a[h]), Ev::exact(inp.dt[h])))?,
         ))?;
         let beta = sigmoid(Ev::exact(inp.b[h]))?;
-        let kh = inp.map.k_head(h, inp.n_k);
+        let kh = inp.map.k_head_of(h, d.value_heads, inp.n_k);
         let head = Head {
+            delta: d,
             h,
             lane,
             lane_out,
@@ -569,11 +605,11 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
             flip: &mut flip,
         };
         let mut o2 = [Ev::zero(); 16];
-        for col in 0..HEAD_COLS {
+        for col in 0..d.head_cols {
             if col % 16 == 0 {
                 o2 = [Ev::zero(); 16];
             }
-            let v = conv_silu(&conv, (2 * inp.n_k + h) * HEAD_COLS + col)?;
+            let v = conv_silu(&conv, (2 * inp.n_k + h) * d.head_cols + col)?;
             column(&head, &mut out, col, v, &mut o2)?;
             if col % 16 == 15 {
                 let mut p = o2[0];
@@ -587,7 +623,7 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
         }
     }
     let mut ring = inp.ring.to_vec();
-    let slot = (inp.pos as usize) % RING_ROWS;
+    let slot = (inp.pos as usize) % d.ring_rows;
     ring[slot * ch..(slot + 1) * ch].copy_from_slice(inp.x);
     Ok(StepOut {
         g,

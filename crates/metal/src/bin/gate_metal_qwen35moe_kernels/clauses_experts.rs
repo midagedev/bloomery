@@ -7,7 +7,7 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::MetalBuffer;
-use bloomery_metal::geom::{ExpertsGeom, Geometry, HOST_GEOMETRY};
+use bloomery_metal::geom::{ExpertsGeom, Geometry};
 use bloomery_metal::instance::REGISTERED;
 use bloomery_metal::kernels::{FoldParams, PairParams, Quant, ROWS_PER_SIMD_GROUP, SharedPlan};
 use gguf::quant::GgmlType;
@@ -153,12 +153,6 @@ fn plane(
     Ok(fix.rows(name, ty, cols, rows)?.to_vec())
 }
 
-/// [`pair_weights_for`] at the build's host instance. A shim. Callers left:
-/// the A4 clauses.
-pub fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
-    pair_weights_for(&HOST_GEOMETRY.experts, fix, quant)
-}
-
 /// Q4 reads the gate and up experts. Q6 has no gate or up experts in the
 /// fixture, so each expert is one Q6_K down expert's blocks, read as 512 by
 /// 2048: the byte length is the same. A4 reads its own gate and up stacks,
@@ -299,26 +293,8 @@ pub fn synthetic_fold_for(e: &ExpertsGeom, quant: Quant, rows: usize, seed: u64)
     }
 }
 
-/// [`synthetic_pair_for`] at the build's host instance. A shim. Callers left:
-/// the synthetic clauses.
-pub fn synthetic_pair(quant: Quant, seed: u64) -> PairWeights {
-    synthetic_pair_for(&HOST_GEOMETRY.experts, quant, seed)
-}
-
-/// [`synthetic_fold_for`] at the build's host instance. A shim. Callers left:
-/// the synthetic clauses.
-pub fn synthetic_fold(quant: Quant, rows: usize, seed: u64) -> FoldWeights {
-    synthetic_fold_for(&HOST_GEOMETRY.experts, quant, rows, seed)
-}
-
 fn fold_weights(e: &ExpertsGeom, fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
     fold_weights_for(e, fix, quant, FOLD_ROWS)
-}
-
-/// [`fold_weights_for`] at the build's host instance. A shim. Callers left: the
-/// A4 clauses.
-pub fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
-    fold_weights_for(&HOST_GEOMETRY.experts, fix, quant, rows)
 }
 
 /// The fold's weights at `rows` rows an expert: the engine's whole rows, or a

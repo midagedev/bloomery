@@ -11,11 +11,11 @@
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
-use bloomery_metal::kernels::{GemmMode, HEAD_COLS, HEAD_K, PARTIALS_PER_HEAD, Quant, VALUE_HEADS};
+use bloomery_metal::kernels::{GemmMode, PARTIALS_PER_HEAD, Quant};
 
 use super::clauses_experts::{
     FOLD_ROWS, FOLD_TAIL_ROWS, check_fold_weights, check_pair_weights, fold_bad_id, pair_faults,
-    synthetic_fold, synthetic_norm, synthetic_pair,
+    synthetic_fold_for, synthetic_norm, synthetic_pair_for,
 };
 use super::clauses_gemm::{Case, SEG_COLS, SegGroup, dense_arms, seg_groups};
 use super::clauses_norm::head_partials;
@@ -62,7 +62,11 @@ pub fn matvec(h: &Harness<'_>, quant: Quant) -> Clause {
         .iter()
         .map(|&(name, cols, rows)| (name.to_string(), cols, rows))
         .collect();
-    shapes.push((format!("output tail {HEAD_TAIL}"), HEAD_K, HEAD_TAIL));
+    shapes.push((
+        format!("output tail {HEAD_TAIL}"),
+        h.geom().hidden,
+        HEAD_TAIL,
+    ));
     let mut parts = Vec::new();
     for (i, (name, cols, rows)) in shapes.into_iter().enumerate() {
         let weights = synthetic::matrix(quant, rows, cols, salt(quant) + i as u64);
@@ -123,7 +127,7 @@ pub fn norm(h: &Harness<'_>, quant: Quant) -> Clause {
         .iter()
         .map(|&(name, cols, rows)| (name.to_string(), cols, rows))
         .collect();
-    cases.push(("output".to_string(), HEAD_K, 4096));
+    cases.push(("output".to_string(), h.geom().hidden, 4096));
     let mut parts = Vec::new();
     for (i, (name, cols, rows)) in cases.iter().enumerate() {
         let weights = synthetic::matrix(quant, *rows, *cols, salt(quant) + 0x20 + i as u64);
@@ -294,16 +298,17 @@ pub fn seg(h: &Harness<'_>, quant: Quant) -> Clause {
 /// the head each value sits in, against the f64 oracle, and a partial and a
 /// numerator that are not finite (the gate site, every row NaN).
 pub fn headnorm(h: &Harness<'_>, quant: Quant) -> Clause {
-    let cols = HEAD_COLS * VALUE_HEADS;
+    let delta = &h.geom().delta;
+    let cols = delta.head_cols * delta.value_heads;
     let rows = 2048;
     let weights = synthetic::matrix(quant, rows, cols, salt(quant) + 0x40);
     let g = oracle::activations(cols, 0x5E88, 1.0);
-    let partials = head_partials();
+    let partials = head_partials(delta);
     let x = common::head_scaled(
         &g,
         &partials,
-        VALUE_HEADS,
-        HEAD_COLS,
+        delta.value_heads,
+        delta.head_cols,
         PARTIALS_PER_HEAD,
         EPS,
     );
@@ -328,8 +333,8 @@ pub fn headnorm(h: &Harness<'_>, quant: Quant) -> Clause {
         return Err(format!("the launch raised {fault}"));
     }
     let kind = Kind::HeadNorm(oracle::HeadGeometry {
-        heads: VALUE_HEADS,
-        cols_per_head: HEAD_COLS,
+        heads: delta.value_heads,
+        cols_per_head: delta.head_cols,
         partials_per_head: PARTIALS_PER_HEAD,
     });
     let band = oracle::band(quant, cols / quant.values_per_block(), kind);
@@ -360,7 +365,7 @@ pub fn headnorm(h: &Harness<'_>, quant: Quant) -> Clause {
 /// The gate-up pair over four experts' stacks and the shared pair: the
 /// oracle band, an id past the stack, and the norm's fault inputs.
 pub fn pair(h: &Harness<'_>, quant: Quant) -> Clause {
-    let weights = synthetic_pair(quant, salt(quant) + 0x50);
+    let weights = synthetic_pair_for(&h.geom().experts, quant, salt(quant) + 0x50);
     let norm = synthetic_norm(EPS);
     let worst = check_pair_weights(h, quant, &weights, &norm)?;
     pair_faults(h, quant, &weights, &norm)?;
@@ -374,9 +379,10 @@ pub fn pair(h: &Harness<'_>, quant: Quant) -> Clause {
 /// The folded down over four experts' stacks and the shared down: the oracle
 /// band at the engine's rows and at a row tail, and a bad id's NaN rows.
 pub fn fold(h: &Harness<'_>, quant: Quant) -> Clause {
-    let whole = synthetic_fold(quant, FOLD_ROWS, salt(quant) + 0x58);
+    let experts = &h.geom().experts;
+    let whole = synthetic_fold_for(experts, quant, FOLD_ROWS, salt(quant) + 0x58);
     let worst = check_fold_weights(h, quant, &whole, FOLD_ROWS)?;
-    let tail = synthetic_fold(quant, FOLD_TAIL_ROWS, salt(quant) + 0x5A);
+    let tail = synthetic_fold_for(experts, quant, FOLD_TAIL_ROWS, salt(quant) + 0x5A);
     let tail = check_fold_weights(h, quant, &tail, FOLD_TAIL_ROWS)?;
     fold_bad_id(h, &whole, quant)?;
     h.clear_fault()?;
@@ -390,9 +396,10 @@ pub fn fold(h: &Harness<'_>, quant: Quant) -> Clause {
 /// oracle band, the step id the host argmax of the read-back logits, the
 /// ticket counter back at 0.
 pub fn head(h: &Harness<'_>, quant: Quant) -> Clause {
-    let weights = synthetic::matrix(quant, OUTPUT_ROWS, HEAD_K, salt(quant) + 0x60);
-    let x = oracle::activations(HEAD_K, 0x5EAD, 0.5);
-    let gain = gain(HEAD_K, 0x5EAE);
+    let hidden = h.geom().hidden;
+    let weights = synthetic::matrix(quant, OUTPUT_ROWS, hidden, salt(quant) + 0x60);
+    let x = oracle::activations(hidden, 0x5EAD, 0.5);
+    let gain = gain(hidden, 0x5EAE);
     h.clear_fault()?;
     let out = clauses_head::run(
         h,
@@ -402,7 +409,7 @@ pub fn head(h: &Harness<'_>, quant: Quant) -> Clause {
             x: &x,
             gain: &gain,
             rows: OUTPUT_ROWS,
-            k: HEAD_K,
+            k: hidden,
             eps: EPS,
         },
     )?;
@@ -413,8 +420,8 @@ pub fn head(h: &Harness<'_>, quant: Quant) -> Clause {
         return Err(format!("the ticket counter is {}, not 0", out.ticket));
     }
     let xhat = oracle::rms_norm(&x, &gain, EPS);
-    let reference = oracle::reference(quant, &weights, OUTPUT_ROWS, HEAD_K, &xhat)?;
-    let band = oracle::band(quant, HEAD_K / quant.values_per_block(), Kind::Norm);
+    let reference = oracle::reference(quant, &weights, OUTPUT_ROWS, hidden, &xhat)?;
+    let band = oracle::band(quant, hidden / quant.values_per_block(), Kind::Norm);
     let worst = oracle::check(&out.logits, &reference, band, Kind::Norm, None)?;
     let (_, want) = clauses_head::host_argmax(&out.logits)?;
     if out.id != want {
@@ -424,14 +431,14 @@ pub fn head(h: &Harness<'_>, quant: Quant) -> Clause {
         ));
     }
     Ok(Verdict::Noted(format!(
-        "{OUTPUT_ROWS}x{HEAD_K} worst {worst:.3}; step id {want}, the logits' argmax"
+        "{OUTPUT_ROWS}x{hidden} worst {worst:.3}; step id {want}, the logits' argmax"
     )))
 }
 
 /// The embedding over a whole-vocabulary table: the owner's value decode
 /// bit-equal to the host reader, and the ids past the vocabulary.
 pub fn embed(h: &Harness<'_>, quant: Quant) -> Clause {
-    let table = synthetic::matrix(quant, OUTPUT_ROWS, HEAD_K, salt(quant) + 0x68);
+    let table = synthetic::matrix(quant, OUTPUT_ROWS, h.geom().hidden, salt(quant) + 0x68);
     Ok(Verdict::Noted(clauses_embed::embed_table(
         h,
         quant,

@@ -11,7 +11,7 @@ use bloomery_metal::kernels::router;
 use bloomery_metal::kernels::{
     Kernels, MatvecParams, Mode, NormOnLoad, Quant, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP,
 };
-use bloomery_metal::library::{Library, SOURCE};
+use bloomery_metal::library::{Library, sources_of};
 use bloomery_metal::stream::MetalStream;
 use gguf::quant::GgmlType;
 
@@ -546,23 +546,20 @@ pub fn block_shape() -> Clause {
     ))
 }
 
-/// The kernels compiled from the shipped source with the row count a SIMD
-/// group owns replaced by `rows`: the probe sweeps the same edit, and the
-/// clause holds the sweep's arithmetic still.
-/// The weight type's ggml name, for the fixture's readers.
-/// The kernels compiled from the shipped source with the row count a SIMD
-/// group owns replaced by `rows`: the probe sweeps the same edit, and the
-/// clause holds the sweep's arithmetic still.
+/// The kernels compiled from the shipped source of the harness's instance
+/// with the row count a SIMD group owns replaced by `rows`: the probe sweeps
+/// the same edit, and the clause holds the sweep's arithmetic still.
 fn kernels_of_rows(h: &Harness<'_>, rows: usize) -> Result<Kernels, String> {
+    let (source, _) = sources_of(h.library.instance()).map_err(why)?;
     let find = format!("#define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {ROWS_PER_SIMD_GROUP}");
-    let found = SOURCE.matches(find.as_str()).count();
+    let found = source.matches(find.as_str()).count();
     if found != 1 {
         return Err(format!(
             "the geometry define occurs {found} times, not 1; the header moved"
         ));
     }
     let with = format!("#define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {rows}");
-    let text = SOURCE.replacen(find.as_str(), with.as_str(), 1);
+    let text = source.replacen(find.as_str(), with.as_str(), 1);
     let library = Library::from_source_text(h.device, &text).map_err(why)?;
     Kernels::with_geometry(&library, rows, SIMD_GROUPS_PER_GROUP, router::SG).map_err(why)
 }
