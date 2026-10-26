@@ -20,8 +20,10 @@ use gguf::Split;
 /// half the value projections and expert down stacks, Q5_0 low-rank KDA up projections.
 const Q4KM: &str = "/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
 
-/// The IQ4_XS file (four shards): the same 1,083 tensors at other types.
-const IQ4XS: &str = "/models/Solar-Open2-250B-IQ4_XS/Solar-Open2-250B-IQ4_XS-00001-of-00004.gguf";
+/// The IQ4_XS file (four shards): the same 1,083 tensors at other types. Read as the type census's
+/// header stub (`tools/type-census.py build` writes `<root>/<org>/<repo>/<file>`: a sparse file of
+/// the real header, every tensor byte zero); the gate reads headers only.
+const IQ4XS: &str = "/models/census-stubs-a134239f/prometheusAIR/Solar-Open2-250B-GGUF/IQ4_XS/Solar-Open2-250B-IQ4_XS-00001-of-00004.gguf";
 
 // PIN(2026-10-20): the file's description as `arch::solar2::spec` reads it, line by line (the
 // key values checked against the Q4_K_M header dump, 48 layers; `attention.head_count_kv` is 8 at

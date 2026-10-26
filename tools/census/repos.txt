@@ -11,3 +11,4 @@ ggml-org/MiMo-V2.6-Flash-MOPD-GGUF
 ggml-org/MiMo-V2.6-Flash-RL-GGUF
 bartowski/Cloudflare_clef-flash-GGUF
 ggml-org/lev-GGUF
+prometheusAIR/Solar-Open2-250B-GGUF
