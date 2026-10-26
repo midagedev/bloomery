@@ -38,7 +38,7 @@ use crate::site::{self, Form, KGemvKernels, SiteTy, SiteWeight, WideActs, WideKe
 use crate::tensor::{Pitched, dtod_2d};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window};
-use chain::arch::hybrid::plan::{MambaPlan, NopeGqaPlan};
+use chain::hybrid::plan::{MambaPlan, NopeGqaPlan};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::hybrid::{
