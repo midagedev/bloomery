@@ -51,6 +51,7 @@ use bloomery_metal::buffer::{MetalBuffer, MetalShared};
 use bloomery_metal::census::MetalCensus;
 use bloomery_metal::device::{MetalDevice, require_macos};
 use bloomery_metal::encode::{Binding, MAX_BINDINGS, MAX_BYTES_BINDING};
+use bloomery_metal::instance::HOST;
 use bloomery_metal::library::{Library, Pipeline};
 use bloomery_metal::stream::{HostEvent, MetalStream};
 
@@ -678,7 +679,7 @@ pub fn main() -> ExitCode {
         }
     }
 
-    let device = match MetalDevice::open() {
+    let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
             println!("clause open: REFUSED ({e})");

@@ -28,6 +28,7 @@ use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::Binding;
+use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::{
     AttentionPrefillParams, AttentionRowsParams, AttnCache, CONV_TAPS, DeltaParams,
     DeltaRowStrides, DeltaRowsParams, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, Kernels, QUERY_HEADS,
@@ -197,7 +198,7 @@ pub fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let device = match MetalDevice::open() {
+    let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
             println!("metal_rows_time: REFUSED ({e})");

@@ -84,6 +84,7 @@ use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, LAYER_NONE, Stream};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::ComputeEncoder;
+use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::router::{self, RouterParams};
 use bloomery_metal::kernels::{
     EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_K, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams,
@@ -1658,7 +1659,7 @@ pub fn main() -> ExitCode {
         }
     };
 
-    let device = match MetalDevice::open() {
+    let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
             println!("metal_matvec_time: REFUSED ({e})");
