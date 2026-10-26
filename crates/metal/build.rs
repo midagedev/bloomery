@@ -15,8 +15,9 @@
 //!   front of the files it reads, which the runtime compiles at Metal 4 on a
 //!   GPU that takes them (`library.rs`).
 //!
-//! And `instances.rs`, the table `library.rs` includes: every instance's
-//! name and its embedded sources (and metallib).
+//! And the two tables `library.rs` includes as expressions: `built.rs`, every
+//! instance's name and embedded sources, and `metallibs.rs`, each instance's
+//! metallib when the toolchain is there.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -325,9 +326,9 @@ fn main() {
     let mut built = String::from(
         "// Written by build.rs: every registered instance's embedded sources,\n\
          // in instance::REGISTERED's order.\n\
-         const BUILT: &[Built] = &[\n",
+         &[\n",
     );
-    let mut metallibs = String::from("const METALLIBS: &[(&str, &[u8])] = &[\n");
+    let mut metallibs = String::from("&[\n");
     for inst in instance::REGISTERED {
         let stem = inst.name;
         assert!(
@@ -358,12 +359,13 @@ fn main() {
             ));
         }
     }
-    built.push_str("];\n");
+    built.push_str("]\n");
+    std::fs::write(out_dir.join("built.rs"), built).expect("the instance table is written");
     if toolchain {
-        metallibs.push_str("];\n");
-        built.push_str(&metallibs);
+        metallibs.push_str("]\n");
+        std::fs::write(out_dir.join("metallibs.rs"), metallibs)
+            .expect("the metallib table is written");
     }
-    std::fs::write(out_dir.join("instances.rs"), built).expect("the instance table is written");
 
     if toolchain {
         println!("cargo:rustc-cfg=metal_lib=\"metallib\"");
