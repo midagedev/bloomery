@@ -68,7 +68,7 @@ use bloomery_gpu::site::{
     self, Gated, GatedIo, SiteTy, SiteWeight, WideActs, WideForms, WideIn, WideKernels,
 };
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{Gpu, GpuError, Pitched, dtod_2d};
+use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::Block;
 use cuda_core::DeviceBuffer;
 use model::arch::glm5next::place::{self, FrontWidths};
@@ -854,7 +854,7 @@ impl GemmFront {
                 (Dst::Query, _) => gemm(gpu, &k, dense, (w, p), &x_in, m, q)?,
                 (Dst::Caller(y), stride) => {
                     gemm(gpu, &k, dense, (w, p), &x_in, m, q)?;
-                    scatter(gpu, &*q, (n, m), y, (p.at, stride))?;
+                    site::scatter(gpu.stream(), &*q, (n, m), y, (p.at, stride))?;
                     stats.copy += 1;
                 }
             }
@@ -939,29 +939,6 @@ fn gemm(
             site::resident_gemm_rows(gpu, k, (w, p.name, (r.start, r.len())), x, route, m, y)
         }
     }
-}
-
-/// `m` columns of `rows` values, token-major in `stage`, into `y` at `at` of
-/// each `stride`-value column: one strided copy.
-fn scatter(
-    gpu: &Gpu,
-    stage: &DeviceBuffer<f32>,
-    (rows, m): (usize, usize),
-    y: &mut DeviceBuffer<f32>,
-    (at, stride): (usize, usize),
-) -> Result<(), GpuError> {
-    let f = size_of::<f32>();
-    dtod_2d(
-        gpu.stream(),
-        (stage, 0),
-        (y, at * f),
-        Pitched {
-            width: rows * f,
-            rows: m,
-            dev_pitch: rows * f,
-            host_pitch: stride * f,
-        },
-    )
 }
 
 /// Card bytes of a front of `shape` ([`GemmFront::bytes`]): the plan's

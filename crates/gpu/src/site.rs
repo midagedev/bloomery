@@ -1026,7 +1026,10 @@ impl ByName {
 
 /// `m` columns of `rows` values, token-major in `src`, into `dst` at `at` of
 /// each `stride`-value column: one strided copy.
-fn scatter(
+///
+/// # Errors
+/// The copy's launch error.
+pub fn scatter(
     stream: &cuda_core::CudaStream,
     src: &DeviceBuffer<f32>,
     (rows, m): (usize, usize),
