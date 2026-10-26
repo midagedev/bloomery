@@ -133,7 +133,7 @@ mac-locks *ARGS:
     ./tools/mac-remote.sh --locks {{ARGS}}
 
 # An off-box check for a contributor: fmt, the pure crates' tests, the Python tool self-tests and every tools/check-*.sh
-# (T0, any OS with the pinned nightly), plus the host-nightly units on x86_64 or aarch64 Linux with no card (T1, the
+# (T0, any OS with the pinned toolchain), plus the host-nightly units on x86_64 or aarch64 Linux with no card (T1, the
 # default on x86_64).
 # `just contrib-check --tier t0|t1`. One line per unit, then a DONE line; docs/contrib/local-check.md. The owner is tools/contrib-check.sh.
 contrib-check *ARGS:
@@ -201,7 +201,8 @@ ptx-compare BASE BIN FEATURES='gpu' BASEONLY='' NOCACHE='':
     @bash tools/scan-args.sh ptx {{BIN}}
     ./tools/ptx-compare.sh {{BASE}} {{BIN}} --features {{FEATURES}} {{BASEONLY}} {{NOCACHE}}
 
-# 호스트 rustflags의 두 소유자(.cargo/config.toml, .cargo/cuda-oxide.toml)가 같은지 — 맥에서, 빌드 없음.
+# The host CPU flags of an oxide build: .cargo/config.toml's list per triple, what tools/oxide-host.sh makes of it, and the generated
+# .cargo/cuda-oxide.toml — on the Mac, no build.
 check-rustflags:
     ./tools/check-rustflags.sh
 
@@ -2092,7 +2093,7 @@ lab-engram:
 # The parser fuzz crate (fuzz/, excluded from the workspace): its own tests, then each target for 60 s on its
 # seeds, as fuzz/README.md runs them (tools/fuzz-lab.sh). The name is lab-, not gate-, so `just affected` never
 # selects it, and a finding is a bug to fix, not a landing's red. Needs `cargo install cargo-fuzz --locked` on
-# the box (the pinned nightly and a C++ compiler it has); derived wall ~6 min of fuzzing (six 60 s targets) plus
+# the box (the pinned toolchain and a C++ compiler it has); derived wall ~6 min of fuzzing (six 60 s targets) plus
 # the test build and one sanitizer build, cold. `just deny` does not scan fuzz/, so fuzz/Cargo.lock is outside
 # its advisory and license check; libfuzzer-sys is NCSA, which deny.toml does not allow, and nothing ships from
 # fuzz/.

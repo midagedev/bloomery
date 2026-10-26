@@ -40,11 +40,10 @@ Installed: just 1.58.0. The runner refuses (69) a remote `just --version` that d
 
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
     sh rustup-init.sh -y --default-toolchain none --no-modify-path
-    ~/.cargo/bin/rustup toolchain install nightly-2026-08-28 --profile minimal \
+    ~/.cargo/bin/rustup toolchain install 1.99.1 --profile minimal \
       -c rust-src,rustc-dev,rust-analyzer,clippy,rustfmt,llvm-tools -t x86_64-unknown-linux-gnu
 
-Installed: rustup 1.29.1, `rustc 1.100.0-nightly (e457a7b0d 2026-08-27)`. A new `rust-toolchain.toml` channel needs
-the same `toolchain install` line with the new date. The pinned components are all taken up front so a plain `cargo`
+A new `rust-toolchain.toml` channel needs the same `toolchain install` line with the new channel. The pinned components are all taken up front so a plain `cargo`
 through the rustup proxy has nothing to add during a run.
 
 ## 4. The cross check's environment, copied byte for byte from the lead's Mac (the shape keys do not hash these headers)

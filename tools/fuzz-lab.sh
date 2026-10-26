@@ -3,7 +3,7 @@
 # its own tests, then each fuzz target for 60 s on its seeds, as fuzz/README.md runs them. `just lab-fuzz`.
 #   ./tools/box.sh 'bash tools/fuzz-lab.sh'
 #
-# Needs cargo-fuzz on the box (`cargo install cargo-fuzz --locked`), the pinned nightly and a C++ compiler.
+# Needs cargo-fuzz on the box (`cargo install cargo-fuzz --locked`), the pinned toolchain and a C++ compiler.
 # The tests go through tools/gate.sh, which owns their bound and exit code. The call is spelled here, not in
 # the justfile: tools/recipes.py reads a recipe's `cargo test` call with no `-p` as the whole workspace's, and
 # `--manifest-path fuzz/Cargo.toml` names another one.

@@ -310,6 +310,12 @@ blk_macremote() { tool_selftest mac-remote.sh; }
 # read's pass, the `--hold up|down` rules and a looping caller stopping at its next call, on a scratch copy under a fake HOME with
 # ssh and rsync stubs, no box.
 blk_boxsh() { tool_selftest box.sh; }
+# oxide-host.sh writes the generated .cargo/cuda-oxide.toml for a triple and refuses an llc that is unset, missing, of another
+# major or without a version banner, each by name: its cases run on scratch trees and stub llc scripts, no build and no card.
+blk_oxidehost() { tool_selftest oxide-host.sh; }
+# oxide-backend.sh builds the patched backend and refuses, by name, one without this tree's patch, with another rev or missing: its cases
+# run on a scratch tree with stub cargo and rustc, no build and no card.
+blk_oxidebackend() { tool_selftest oxide-backend.sh; }
 # seed-target.sh clones a warm tree's target/ into a new worktree and restores the seed's mtime on the files that are equal:
 # its refusals (a DST with a target, a SRC without one, two volumes, a host that cannot clone) and the mtime pass (only
 # equal files) are tested on two scratch trees, no cargo.
@@ -1169,7 +1175,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

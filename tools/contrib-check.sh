@@ -6,7 +6,7 @@
 #   tools/contrib-check.sh [--tier t0|t1] [--only REGEX]   (`just contrib-check`; default t1 on x86_64 Linux, else t0)
 #       --only REGEX  runs just the units whose name matches the extended regex (a red unit again, say `--only '^fmt$'`)
 #
-#   T0  any OS with the pinned nightly:
+#   T0  any OS with the pinned toolchain:
 #         fmt                    cargo fmt --all -- --check
 #         lab-<name>-lock        cargo metadata --locked on each labs/<name>/Cargo.toml: a lab is a workspace of its own, so a
 #                                root crate's new dependency leaves its lock stale until the change that added it refreshes it

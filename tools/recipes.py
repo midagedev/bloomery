@@ -77,7 +77,7 @@ A recipe's inputs are:
     fixture directory table it reads, tools/fixture-dirs.tsv, tools/ref/models/deepseek41.sh and the recipe's profile (`BLOOMERY_MODEL=x` on the line, else
     deepseek2);
   - for a cargo recipe, Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml, and
-    .cargo/cuda-oxide.toml when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
+    tools/oxide-host.sh (the host's CPU flags and llc), tools/oxide-backend.sh and its patch when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
     table too (`root_moves`): of [workspace], `members`/`exclude` select the recipes that read a package that
     entered or left the workspace (an exclude of a path that held no member selects nothing) and
     `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`; every other table, and
@@ -262,7 +262,7 @@ CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/conf
 # The workspace's root manifest: a cargo global every cargo recipe reads, narrowed by table (`root_moves`) where it is a
 # virtual manifest; as a package's own manifest it stays whole.
 ROOT_MANIFEST = "Cargo.toml"
-OXIDE_GLOBALS = [".cargo/cuda-oxide.toml"]
+OXIDE_GLOBALS = ["tools/oxide-host.sh", "tools/oxide-backend.sh", "tools/oxide-backend/cuda-rust-1648.patch"]
 BOX_GLOBALS = ["tools/box.sh", "tools/ref/ref-paths.sh", "tools/fixture-dirs.tsv", "tools/ref/models/deepseek41.sh"]
 DEFAULT_PROFILE = "deepseek2"
 # Runners that execute target/release/<first argument>.
@@ -6316,7 +6316,7 @@ _MAC_CFG_KEYS = {
     "target_endian": "little",
 }
 _MAC_CFG_NAMES = {"unix": True, "windows": False}
-# The cuda-oxide repository under its upstream name and our fork's ([patch] in Cargo.toml).
+# The cuda-oxide repository under its name (NVIDIA/cuda-rust) and the retired fork's, which the lock of a tree before the fork was dropped still names.
 DEVICE_GIT_SOURCES = ("/cuda-rust.git", "/cuda-oxide.git")
 DEVICE_NAMED_ROOTS = ("cuda-core", "cuda-bindings")
 _NOT_ON_MAC = [
@@ -7038,14 +7038,13 @@ def bin_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
 # ----------------------------------------------------------------------------------------------
 
 # Files every shape's check reads whatever its package: the workspace's dependency resolution, the
-# toolchain pin and the two rustflags owners (a moved pin or flag re-checks every shape), and this
+# toolchain pin and the rustflags owner (a moved pin or flag re-checks every shape), and this
 # tool and its runner — their sha moves every key when they change, the gate ledger's rule.
 SHAPE_KEY_META = (
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
     ".cargo/config.toml",
-    ".cargo/cuda-oxide.toml",
     "tools/recipes.py",
     "tools/mac-check.sh",
 )
@@ -7934,7 +7933,7 @@ def own_fixture_row(path: str, dirs: set[str]) -> bool:
     return any((path + "/").startswith(f"{FIXTURE_ROOT}/{d}/") for d in dirs)
 
 
-KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".cargo/cuda-oxide.toml"]
+KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
 # tools/box.sh's rsync excludes (target/ and .git/ at any depth; *.ptx, *.ll, .oxide-artifacts/ at the
 # root), plus per-checkout noise no gate reads that would split the key by checkout: a worktree's .git
 # file, .DS_Store, __pycache__/.
@@ -11270,8 +11269,8 @@ def expand_self_test(expect) -> None:
 
 def oxide_rev_self_test(expect) -> None:
     """The cuda-oxide rev the key (oxide_rev) and tools/box.sh (the backend directory it exports) read from this tree's
-    Cargo.toml is the [patch] section's cuda-device rev as TOML reads it — the fork's, not the upstream declaration's,
-    which both fall back to when their section header names another repository."""
+    Cargo.toml is the [patch] section's cuda-device rev as TOML reads it when a tree has that section (a tree from before the
+    fork was dropped), else the workspace declaration's."""
     import tomllib
 
     with open(os.path.join(ROOT, "Cargo.toml"), "rb") as fh:

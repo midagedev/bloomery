@@ -739,6 +739,12 @@ sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=1 /' -e '
 chmod +x "$B/tools/box.sh"
 grep -q '^DROP_WAIT=0 ' "$B/tools/box.sh" && grep -q '^SYNC_WAIT=1 ' "$B/tools/box.sh" || { echo "card-tests: the box.sh copy's waits did not shrink (the constants' lines moved?)" >&2; exit 70; }
 cp "$ROOT/Cargo.toml" "$B/"
+# A cargo oxide command runs tools/oxide-host.sh in the tree, which reads .cargo/config.toml's list for the triple.
+mkdir -p "$B/.cargo"
+cp "$ROOT/tools/oxide-host.sh" "$ROOT/tools/oxide-backend.sh" "$B/tools/"
+mkdir -p "$B/tools/oxide-backend"
+cp "$ROOT/tools/oxide-backend/cuda-rust-1648.patch" "$B/tools/oxide-backend/"
+cp "$ROOT/.cargo/config.toml" "$B/.cargo/"
 # The ssh stub answers the queue's one probe after a failed rsync (flock -n -x on the dir lock, then the remote tree's id) with
 # `lock=$STUB_PROBE_RC` (0 where unset) and $STUB_SYNC_ID on the next line, or with an ssh that ends 255 when STUB_PROBE_RC is 255;
 # a queued call's look at the remote tree's id answers $STUB_SYNC_ID (nothing where unset); the rsync stub records its arguments and
@@ -778,11 +784,22 @@ sshlog 'box.sh: the guard comes first, before the environment' '^stub \( cd ~/re
 sshlog 'box.sh: the command comes last' '^\} && cd ~/repo/x && .*cargo check$'
 # A cargo oxide command checks Cargo's selected executable against the pin; any other command does not.
 # The root-aware cargo install stub distinguishes the executable's metadata from other installs.
-PIN=$(sed -n '/^\[patch\."https:\/\/github.com\/NVIDIA\/cuda-rust.git"\]/,/^\[workspace/s/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$B/Cargo.toml")
+PIN=$(sed -n 's/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$B/Cargo.toml" | head -1)
 rc_is 'box.sh: a cargo oxide command reaches the stub ssh' 0 box "$B/tools/box.sh" 'cargo oxide build'
 sshlog 'box.sh: a cargo oxide command checks the installed cargo-oxide against the pin' "cargo install --list .*not the pin $PIN"
+sshlog 'box.sh: a cargo oxide command prepares the host after the pin check' "not the pin $PIN.*bash tools/oxide-host\\.sh && "
+sshlog "box.sh: the pin's own cargo-oxide directory is first on PATH, beside its backend" \
+  "export CUDA_OXIDE_BACKEND=.*cuda-oxide-bloomery/$PIN/librustc_codegen_cuda\\.so PATH=.*cuda-oxide-bloomery/$PIN/bin:.*PATH && "
+seen=$(wc -l < "$tmp/ssh.log")
+rc_is 'box.sh: a command that runs no cargo oxide reaches the stub ssh' 0 box "$B/tools/box.sh" 'cargo check'
+tail -n +$((seen + 1)) "$tmp/ssh.log" > "$tmp/ssh.new"
+if grep -q 'oxide-host\.sh' "$tmp/ssh.new" || grep -q 'not the pin' "$tmp/ssh.new"; then
+  fail 'box.sh: a command that runs no cargo oxide takes no host preparation and no pin check' 'the ssh line names one' "$tmp/ssh.new"
+else
+  pass 'box.sh: a command that runs no cargo oxide takes no host preparation and no pin check'
+fi
 rc_is 'box.sh: a cargo oxide command with BLOOMERY_BOX_ENV runs' 0 box env BLOOMERY_BOX_ENV=CARGO_HOME=/opt/c "$B/tools/box.sh" 'cargo oxide build'
-sshlog 'box.sh: the cargo-oxide check runs after BLOOMERY_BOX_ENV' 'export CARGO_HOME=/opt/c && .*\{ __p='
+sshlog 'box.sh: the cargo-oxide check runs after BLOOMERY_BOX_ENV' 'export CARGO_HOME=/opt/c && .*\{ __h='
 OXCLI=$(sed -n "s/^OXCLI='\(.*\)'\$/\1/p" "$B/tools/box.sh")
 OXCLI=${OXCLI//OXREV/$PIN}
 # PIN(2026-10-20): the rev cases use per-root metadata so dropping --root cannot pass.
@@ -818,7 +835,13 @@ for got in "${PIN:0:8}" 4da6c138 path; do
     run 'box.sh: a PATH symlink uses its executable install root' 0 '^ran$' \
       env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxempty" CARGO_INSTALL_ROOT="$tmp/oxhome" \
       PATH="$tmp/oxstub:$tmp/oxlink/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
-    run 'box.sh: Cargo home precedes a pinned PATH install' 70 "installed cargo-oxide.*$tmp/oxhome.*not the pin $PIN" \
+    run 'box.sh: a pinned PATH install ahead of a stale Cargo home that is on PATH passes' 0 '^ran$' \
+      env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxhome" CARGO_INSTALL_ROOT="$tmp/oxhome" \
+      PATH="$tmp/oxstub:$tmp/oxpath/bin:$tmp/oxhome/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
+    run 'box.sh: a stale Cargo home on PATH ahead of a pinned install is refused by name and root' 70 "installed cargo-oxide.*$tmp/oxhome.*not the pin $PIN" \
+      env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxhome" CARGO_INSTALL_ROOT="$tmp/oxpath" \
+      PATH="$tmp/oxstub:$tmp/oxhome/bin:$tmp/oxpath/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
+    run 'box.sh: Cargo home precedes a pinned PATH install when it is not on PATH' 70 "installed cargo-oxide.*$tmp/oxhome.*not the pin $PIN" \
       env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxhome" CARGO_INSTALL_ROOT="$tmp/oxpath" \
       PATH="$tmp/oxstub:$tmp/oxpath/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
   else
@@ -1141,28 +1164,33 @@ qrc() {
 mkdir -p "$QH/repo/x/tools/release"
 printf 'touch "$OX_STARTED"\n' > "$QH/repo/x/tools/gate.sh"
 cp "$QH/repo/x/tools/gate.sh" "$QH/repo/x/tools/release/build.sh"
+# The host preparation (tools/oxide-host.sh) runs after the pin check and before the build; a stub marks that it ran.
+printf 'touch "$OX_HOSTED"\n' > "$QH/repo/x/tools/oxide-host.sh"
 chmod +x "$tmp/oxhome/bin/cargo-oxide"
 OX_ENV=(CARGO_HOME="$tmp/oxhome" CARGO_INSTALL_ROOT="$tmp/oxhome"
-  PATH="$tmp/oxstub:$tmp/oxpath/bin:$Q/bin:$PATH" OX_STARTED="$Q/oxide-started")
+  PATH="$tmp/oxstub:$tmp/oxpath/bin:$Q/bin:$PATH" OX_STARTED="$Q/oxide-started" OX_HOSTED="$Q/oxide-hosted")
 for cmd in 'bash tools/gate.sh --oxide -p x --release --lib' \
   'bash tools/gate.sh --gpu --oxide -p x --release --lib' \
   'bash tools/release/build.sh 0.1.0 abcdef0' \
   'bash tools/release/build.sh --check /tmp/out && bash tools/release/build.sh 0.1.0 abcdef0'; do
   qjob BLOOMERY_BOX_ENV="CARGO_HOME=$tmp/oxempty" -- "$cmd"
-  rm -f "$Q/oxide-started"
+  rm -f "$Q/oxide-started" "$Q/oxide-hosted"
   printf 'cargo-oxide v0.2.1 (https://example.org/oxide#4da6c138):\n' > "$tmp/oxpath/install-list"
   qrun "box.sh job: '$cmd' refuses a stale compiler" 70 "not the pin $PIN" "${OX_ENV[@]}"
   nofile "box.sh job: '$cmd' did not start with a stale compiler" "$Q/oxide-started"
+  nofile "box.sh job: '$cmd' did not prepare the host with a stale compiler" "$Q/oxide-hosted"
   printf 'cargo-oxide v0.2.1 (https://example.org/oxide#%s):\n' "${PIN:0:8}" > "$tmp/oxpath/install-list"
   qrc "box.sh job: '$cmd' accepts the selected pinned compiler" 0 "${OX_ENV[@]}"
   if [ -e "$Q/oxide-started" ]; then pass "box.sh job: '$cmd' started with the pin"; else fail "box.sh job: '$cmd' started with the pin" 'no marker'; fi
+  if [ -e "$Q/oxide-hosted" ]; then pass "box.sh job: '$cmd' prepared the host before the build"; else fail "box.sh job: '$cmd' prepared the host before the build" 'no marker'; fi
 done
 printf 'cargo-oxide v0.2.1 (https://example.org/oxide#4da6c138):\n' > "$tmp/oxpath/install-list"
 for cmd in 'cargo check' 'bash tools/release/build.sh --check /tmp/out'; do
   qjob BLOOMERY_BOX_ENV="CARGO_HOME=$tmp/oxempty" -- "$cmd"
-  rm -f "$Q/oxide-started"
+  rm -f "$Q/oxide-started" "$Q/oxide-hosted"
   qrc "box.sh job: '$cmd' needs no pinned compiler" 0 "${OX_ENV[@]}"
   if [ -e "$Q/oxide-started" ]; then pass "box.sh job: '$cmd' started without the pin"; else fail "box.sh job: '$cmd' started without the pin" 'no marker'; fi
+  nofile "box.sh job: '$cmd' prepared no host" "$Q/oxide-hosted"
 done
 
 # A card lane is the job's gate lock: BLOOMERY_GATE_CARD is that card (any: the daemon's), so a recipe's ${BLOOMERY_GATE_CARD:-any} never
@@ -1245,15 +1273,31 @@ else
   run 'lock-back.sh: local mode brings nothing back and succeeds' 0 '^lock-back-done$' boxl bash -c "\"$ROOT/tools/lock-back.sh\" && echo lock-back-done"
   unreached 'lock-back.sh: local mode reached no ssh'
   if [ -d "$L" ]; then pass 'box.sh: local mode made its lock directory'; else fail 'box.sh: local mode made its lock directory' "no $L"; fi
-  printf 'export CUDA_OXIDE_BACKEND=/x/backend.so\n' > "$tmp/oxide-env.sh"
+  # A cargo oxide command also prepares the host (tools/oxide-host.sh): the triple's flags file and an llc of LLVM 21, here a stub
+  # that prints its banner, for the triple the config carries a list for whatever machine this runs on.
+  printf '#!/bin/sh\necho "LLVM version 21.1.8"\n' > "$tmp/llc21"
+  chmod +x "$tmp/llc21"
+  # ... and the pin's backend with the patch's record (tools/oxide-backend.sh --check), under a backend root of this directory.
+  mkdir -p "$tmp/oxbackends/$PIN"
+  printf 'so\n' > "$tmp/oxbackends/$PIN/librustc_codegen_cuda.so"
+  printf '%s\n' "$PIN" > "$tmp/oxbackends/$PIN/source-rev.txt"
+  printf 'patch-sha256: %s tools/oxide-backend/cuda-rust-1648.patch\n' "$( (sha256sum "$ROOT/tools/oxide-backend/cuda-rust-1648.patch" 2> /dev/null || shasum -a 256 "$ROOT/tools/oxide-backend/cuda-rust-1648.patch") | cut -d' ' -f1)" > "$tmp/oxbackends/$PIN/PROVENANCE"
+  printf 'export CUDA_OXIDE_BACKEND=/x/backend.so CUDA_OXIDE_LLC=%s CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu BLOOMERY_OXIDE_BACKENDS=%s\n' "$tmp/llc21" "$tmp/oxbackends" > "$tmp/oxide-env.sh"
   # A cargo oxide command still takes the installed cargo-oxide check in local mode: a stub cargo-oxide and a stub cargo
   # at the pin pass it.
   mkdir -p "$tmp/oxpin"
-  printf '#!/bin/sh\necho "cargo-oxide v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=x#%s):"\n' "${PIN:0:8}" > "$tmp/oxpin/cargo"
+  printf '#!/bin/sh\necho "cargo-oxide v0.2.1 (https://github.com/NVIDIA/cuda-rust.git?rev=x#%s):"\n' "${PIN:0:8}" > "$tmp/oxpin/cargo"
   printf '#!/bin/sh\nexit 0\n' > "$tmp/oxpin/cargo-oxide"
   chmod +x "$tmp/oxpin/cargo" "$tmp/oxpin/cargo-oxide"
   run 'box.sh: local mode unsets the environment file'"'"'s CUDA_OXIDE_BACKEND and adds no backend check to cargo oxide' 0 'oxide=unset data=' \
     boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
+  # ... and one built without the patch ends the command by name before it runs: the PROVENANCE record is what tells the two apart.
+  cp "$tmp/oxbackends/$PIN/PROVENANCE" "$tmp/oxbackends/PROVENANCE.good"
+  printf 'built by cargo-oxide itself\n' > "$tmp/oxbackends/$PIN/PROVENANCE"
+  run 'box.sh: local mode refuses an unpatched backend by name' 70 'built without tools/oxide-backend/cuda-rust-1648\.patch' \
+    boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the unpatched-backend refusal ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the unpatched-backend refusal ran no command'; fi
+  cp "$tmp/oxbackends/PROVENANCE.good" "$tmp/oxbackends/$PIN/PROVENANCE"
   printf 'export BLOOMERY_LOCK_DIR=%s/elsewhere\n' "$tmp" > "$tmp/lockdir-env.sh"
   run "box.sh: local mode refuses an environment file that moves the lock directory after the guard" 64 \
     'the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode.s guard probed the lock directory' \

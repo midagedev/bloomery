@@ -1,0 +1,1091 @@
+cuda-oxide backend patch carried by bloomery: NVIDIA/cuda-rust pull request #1648, "perf(cute): speed up the CuTe
+verifier's provenance analysis" (fixes #1647), by juliankang4. Base 9df9e7cef561 (this tree's pin), head 4bb62e04db45;
+the diff below is the pull request's, unchanged, 7 files under cuda-oxide/cute-rs-preview/dialect-cute/src/verify/.
+
+Why it is carried. dialect-cute's verify_cute_semantics runs on every module the backend lowers, and each story builds
+provenance facts for every scope, even one with no CuTe operation. OrdinaryFacts::entries scans the whole fact map for
+every store and block argument inside the fixed-point loops, so the time is cubic in the block count of a kernel and
+bloomery-gpu does not finish. The pull request indexes the facts by carrier, skips a story whose family has no operation
+in the scope, keeps at most two opaque origins per path and checks each local cell's aliases once.
+
+tools/oxide-backend.sh applies this file to the pin's checkout (patch -p1) and builds the backend from the copy. Drop
+this file when the pin holds #1648 (the dry run in tools/oxide-backend.sh then fails by name).
+
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/cfg.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/cfg.rs
+index 6a4da1be5..5094602dd 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/cfg.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/cfg.rs
+@@ -12,7 +12,7 @@ use pliron::{
+     basic_block::BasicBlock,
+     context::{Context, Ptr},
+     linked_list::ContainsLinkedList,
+-    op::Op,
++    op::{Op, OpId},
+     operation::Operation,
+ };
+ 
+@@ -53,6 +53,13 @@ pub(super) fn operations_by_scope(
+     scopes.into_values().collect()
+ }
+ 
++/// Test whether a scope holds any operation of one semantic family.
++pub(super) fn scope_has_any(ctx: &Context, scope: &[Ptr<Operation>], ids: &[OpId]) -> bool {
++    scope
++        .iter()
++        .any(|operation| ids.contains(&Operation::get_opid(*operation, ctx)))
++}
++
+ /// Test whether any successor path in the same region reaches the destination block.
+ pub(super) fn block_reaches(
+     ctx: &Context,
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/epilogue.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/epilogue.rs
+index 66aae6d02..fe2794e17 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/epilogue.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/epilogue.rs
+@@ -29,7 +29,7 @@ use super::{
+     ghosts::epilogue_semantic_ids,
+     invalid,
+     mma::{MmaFact, build_mma_facts, one_mma_fact},
+-    provenance::{is_semantic_pointer_carrier_cast, local_cell, local_cell_is_closed},
++    provenance::{LocalCells, is_semantic_pointer_carrier_cast},
+     tma::direct_tma_view_producer,
+ };
+ use crate::{
+@@ -49,21 +49,25 @@ fn is_epilogue_pointer_identity_cast(ctx: &Context, operation: Ptr<Operation>) -
+ }
+ 
+ /// Recognize carrier-only operations allowed between writer synchronization anchors.
+-fn is_epilogue_writer_plumbing(ctx: &Context, operation: Ptr<Operation>) -> bool {
++fn is_epilogue_writer_plumbing(
++    ctx: &Context,
++    cells: &LocalCells,
++    operation: Ptr<Operation>,
++) -> bool {
+     let opid = Operation::get_opid(operation, ctx);
+     opid == MirGotoOp::get_opid_static()
+         || opid == MirStorageLiveOp::get_opid_static()
+         || opid == MirStorageDeadOp::get_opid_static()
+         || opid == MirExtractFieldOp::get_opid_static()
+         || is_epilogue_pointer_identity_cast(ctx, operation)
+-        || is_closed_local_cell_load(ctx, operation)
++        || is_closed_local_cell_load(ctx, cells, operation)
+ }
+ 
+ /// A non-volatile `mir.load` from a closed compiler-created local cell only
+ /// re-materializes carrier state (e.g. the epilogue handle struct spilled to
+ /// an alloca slot); it cannot touch tile memory, so it is admissible plumbing
+ /// between the writer-protocol anchor operations.
+-fn is_closed_local_cell_load(ctx: &Context, operation: Ptr<Operation>) -> bool {
++fn is_closed_local_cell_load(ctx: &Context, cells: &LocalCells, operation: Ptr<Operation>) -> bool {
+     if Operation::get_opid(operation, ctx) != MirLoadOp::get_opid_static() {
+         return false;
+     }
+@@ -77,10 +81,7 @@ fn is_closed_local_cell_load(ctx: &Context, operation: Ptr<Operation>) -> bool {
+     if load.is_volatile(ctx) {
+         return false;
+     }
+-    let Some((root, _path)) = local_cell(ctx, load.address_opd(ctx)) else {
+-        return false;
+-    };
+-    local_cell_is_closed(ctx, root)
++    cells.closed_cell(ctx, load.address_opd(ctx)).is_some()
+ }
+ 
+ /// Accept only the dead immutable reference Rust leaves around a no-inline
+@@ -149,9 +150,13 @@ fn is_dead_epilogue_store_pipeline_ref(ctx: &Context, operation: Ptr<Operation>)
+ }
+ 
+ /// Recognize harmless carrier assembly and indexing between TMA issuer anchors.
+-fn is_epilogue_issuer_plumbing(ctx: &Context, operation: Ptr<Operation>) -> bool {
++fn is_epilogue_issuer_plumbing(
++    ctx: &Context,
++    cells: &LocalCells,
++    operation: Ptr<Operation>,
++) -> bool {
+     let opid = Operation::get_opid(operation, ctx);
+-    is_epilogue_writer_plumbing(ctx, operation)
++    is_epilogue_writer_plumbing(ctx, cells, operation)
+         || opid == MirUndefOp::get_opid_static()
+         || opid == MirInsertFieldOp::get_opid_static()
+         || opid == MirConstructStructOp::get_opid_static()
+@@ -528,6 +533,7 @@ pub(super) fn verify_epilogue_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -
+         )?;
+     }
+ 
++    let cells = LocalCells::new(ctx, all_ops);
+     let writer_range = require_linear_protocol_order(
+         ctx,
+         "epilogue writer protocol",
+@@ -535,7 +541,7 @@ pub(super) fn verify_epilogue_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -
+     )?;
+     for operation in &writer_range {
+         let expected = [reusable_sync, store_fragment, ready_sync].contains(operation);
+-        if !expected && !is_epilogue_writer_plumbing(ctx, *operation) {
++        if !expected && !is_epilogue_writer_plumbing(ctx, &cells, *operation) {
+             return Err(invalid(format!(
+                 "epilogue writer protocol has interposed non-carrier operation `{}`",
+                 Operation::get_opid(*operation, ctx)
+@@ -663,7 +669,7 @@ pub(super) fn verify_epilogue_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -
+             commit,
+         ]
+         .contains(&operation);
+-        if !allowed_tma_view && !expected && !is_epilogue_issuer_plumbing(ctx, operation) {
++        if !allowed_tma_view && !expected && !is_epilogue_issuer_plumbing(ctx, &cells, operation) {
+             return Err(invalid(format!(
+                 "epilogue TMA issuer protocol has interposed operation `{opid}`"
+             )));
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/mma.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/mma.rs
+index ef3389c4c..f15431213 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/mma.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/mma.rs
+@@ -20,11 +20,12 @@ use pliron::{
+ 
+ use super::{
+     Result,
++    cfg::scope_has_any,
+     ghosts::smem_mma_semantic_ids,
+     invalid,
+     provenance::{
+-        CarrierKey, OrdinaryFacts, branch_successor_operands, is_semantic_pointer_carrier_cast,
+-        local_cell, local_cell_is_closed, poison_missing_forwarding_sources,
++        CarrierFact, LocalCells, OrdinaryFacts, branch_successor_operands,
++        is_semantic_pointer_carrier_cast, poison_missing_forwarding_sources,
+         propagate_ordinary_plumbing, seed_unknown_integer_carriers,
+     },
+ };
+@@ -101,6 +102,12 @@ pub(super) enum MmaFact {
+     Unknown(#[doc = "Original SSA value lacking semantic provenance."] Value),
+ }
+ 
++impl CarrierFact for MmaFact {
++    fn is_opaque(&self) -> bool {
++        matches!(self, Self::Scalar(_) | Self::Unknown(_))
++    }
++}
++
+ /// Return the sole carrier fact, rejecting absent or conflicting facts; callers validate its kind.
+ pub(super) fn one_mma_fact(
+     facts: &OrdinaryFacts<MmaFact>,
+@@ -191,6 +198,7 @@ pub(super) fn build_mma_facts(
+     ctx: &Context,
+     operations: &[Ptr<Operation>],
+ ) -> OrdinaryFacts<MmaFact> {
++    let cells = LocalCells::new(ctx, operations);
+     let mut facts = OrdinaryFacts::default();
+     for operation in operations {
+         let opid = Operation::get_opid(*operation, ctx);
+@@ -233,7 +241,7 @@ pub(super) fn build_mma_facts(
+     }
+ 
+     loop {
+-        let mut changed = propagate_ordinary_plumbing(ctx, operations, &mut facts);
++        let mut changed = propagate_ordinary_plumbing(ctx, operations, &cells, &mut facts);
+         for operation in operations {
+             if Operation::get_opid(*operation, ctx) != CuteTiledGemmOp::get_opid_static() {
+                 continue;
+@@ -259,9 +267,14 @@ pub(super) fn build_mma_facts(
+     seed_unknown_integer_carriers(ctx, operations, &mut facts, 32, MmaFact::Scalar);
+     seed_unknown_integer_carriers(ctx, operations, &mut facts, 64, MmaFact::Scalar);
+     loop {
+-        let poisoned =
+-            poison_missing_forwarding_sources(ctx, operations, &mut facts, MmaFact::Unknown);
+-        let propagated = propagate_ordinary_plumbing(ctx, operations, &mut facts);
++        let poisoned = poison_missing_forwarding_sources(
++            ctx,
++            operations,
++            &cells,
++            &mut facts,
++            MmaFact::Unknown,
++        );
++        let propagated = propagate_ordinary_plumbing(ctx, operations, &cells, &mut facts);
+         if !poisoned && !propagated {
+             break;
+         }
+@@ -357,10 +370,13 @@ fn mma_branch_forwards_fact(
+ }
+ 
+ /// Check that ordinary casts, aggregates, or closed local cells forward the tracked fact without escape.
++#[allow(clippy::too_many_arguments)]
+ fn mma_ordinary_use_forwards_fact(
+     ctx: &Context,
++    cells: &LocalCells,
+     facts: &OrdinaryFacts<MmaFact>,
+-    key: &CarrierKey,
++    value: Value,
++    path: &[u32],
+     fact: MmaFact,
+     user: Ptr<Operation>,
+     operand_index: usize,
+@@ -372,14 +388,14 @@ fn mma_ordinary_use_forwards_fact(
+         && is_semantic_pointer_carrier_cast(ctx, user)
+         && operation.get_num_results() == 1
+     {
+-        return mma_fact_at_path(facts, operation.get_result(0), &key.path, fact);
++        return mma_fact_at_path(facts, operation.get_result(0), path, fact);
+     }
+     if (opid == MirConstructStructOp::get_opid_static()
+         || opid == MirConstructTupleOp::get_opid_static())
+         && operation.get_num_results() == 1
+     {
+         let mut destination_path = vec![operand_index as u32];
+-        destination_path.extend_from_slice(&key.path);
++        destination_path.extend_from_slice(path);
+         return mma_fact_at_path(facts, operation.get_result(0), &destination_path, fact);
+     }
+     if opid == MirInsertFieldOp::get_opid_static()
+@@ -390,14 +406,14 @@ fn mma_ordinary_use_forwards_fact(
+             return false;
+         };
+         if operand_index == 0 {
+-            if key.path.first().copied() == Some(index.0) {
++            if path.first().copied() == Some(index.0) {
+                 return true;
+             }
+-            return mma_fact_at_path(facts, operation.get_result(0), &key.path, fact);
++            return mma_fact_at_path(facts, operation.get_result(0), path, fact);
+         }
+         if operand_index == 1 {
+             let mut destination_path = vec![index.0];
+-            destination_path.extend_from_slice(&key.path);
++            destination_path.extend_from_slice(path);
+             return mma_fact_at_path(facts, operation.get_result(0), &destination_path, fact);
+         }
+         return false;
+@@ -409,22 +425,21 @@ fn mma_ordinary_use_forwards_fact(
+         let Some(index) = MirExtractFieldOp::new(user).get_attr_index(ctx) else {
+             return false;
+         };
+-        if key.path.first().copied() != Some(index.0) {
++        if path.first().copied() != Some(index.0) {
+             return true;
+         }
+-        return mma_fact_at_path(facts, operation.get_result(0), &key.path[1..], fact);
++        return mma_fact_at_path(facts, operation.get_result(0), &path[1..], fact);
+     }
+     if opid == MirStoreOp::get_opid_static() && operation.get_num_operands() == 2 {
+         let store = MirStoreOp::new(user);
+         if operand_index == 0 {
+-            return local_cell(ctx, store.address_opd(ctx))
+-                .is_some_and(|(root, _)| local_cell_is_closed(ctx, root));
++            return cells.closed_cell(ctx, store.address_opd(ctx)).is_some();
+         }
+         if operand_index == 1
+-            && let Some((root, mut destination_path)) = local_cell(ctx, store.address_opd(ctx))
+-            && local_cell_is_closed(ctx, root)
++            && let Some((root, mut destination_path)) =
++                cells.closed_cell(ctx, store.address_opd(ctx))
+         {
+-            destination_path.extend_from_slice(&key.path);
++            destination_path.extend_from_slice(path);
+             return mma_fact_at_path(facts, root, &destination_path, fact);
+         }
+         return false;
+@@ -434,13 +449,10 @@ fn mma_ordinary_use_forwards_fact(
+         && operation.get_num_results() == 1
+     {
+         let load = MirLoadOp::new(user);
+-        let Some((root, cell_path)) = local_cell(ctx, load.address_opd(ctx)) else {
++        let Some((_, cell_path)) = cells.closed_cell(ctx, load.address_opd(ctx)) else {
+             return false;
+         };
+-        if !local_cell_is_closed(ctx, root) {
+-            return false;
+-        }
+-        let Some(result_path) = key.path.strip_prefix(cell_path.as_slice()) else {
++        let Some(result_path) = path.strip_prefix(cell_path.as_slice()) else {
+             return true;
+         };
+         return mma_fact_at_path(facts, operation.get_result(0), result_path, fact);
+@@ -452,13 +464,12 @@ fn mma_ordinary_use_forwards_fact(
+             .get_attr_field_index(ctx)
+             .is_some()
+     {
+-        return local_cell(ctx, operation.get_result(0))
+-            .is_some_and(|(root, _)| local_cell_is_closed(ctx, root));
++        return cells.closed_cell(ctx, operation.get_result(0)).is_some();
+     }
+     if opid == MirCondBranchOp::get_opid_static() && operand_index == 0 {
+         return false;
+     }
+-    mma_branch_forwards_fact(ctx, facts, user, key.value, &key.path, fact)
++    mma_branch_forwards_fact(ctx, facts, user, value, path, fact)
+ }
+ 
+ /// Reject ordinary uses that discard or expose semantic MMA carriers outside recognized forwarding.
+@@ -467,31 +478,37 @@ pub(super) fn verify_mma_use_closure(
+     operations: &[Ptr<Operation>],
+     facts: &OrdinaryFacts<MmaFact>,
+ ) -> Result {
+-    for (key, found) in &facts.facts {
+-        for fact in found.iter().copied() {
+-            if matches!(fact, MmaFact::Scalar(_) | MmaFact::Unknown(_)) {
+-                continue;
+-            }
+-            for r#use in key.value.uses(ctx) {
+-                let user = r#use.user_op();
+-                let operand_index = r#use.find_index(ctx);
+-                if operations.contains(&user)
+-                    && (mma_semantic_consumer(ctx, user, operand_index, fact)
+-                        || mma_ordinary_use_forwards_fact(
+-                            ctx,
+-                            facts,
+-                            key,
+-                            fact,
+-                            user,
+-                            operand_index,
+-                        ))
+-                {
++    let scope: HashSet<Ptr<Operation>> = operations.iter().copied().collect();
++    let cells = LocalCells::new(ctx, operations);
++    for (value, paths) in &facts.facts {
++        for (path, found) in paths {
++            for fact in found.iter().copied() {
++                if fact.is_opaque() {
+                     continue;
+                 }
+-                return Err(invalid(format!(
+-                    "shared-MMA carrier has an unsupported outgoing use by `{}` operand {operand_index}",
+-                    Operation::get_opid(user, ctx)
+-                )));
++                for r#use in value.uses(ctx) {
++                    let user = r#use.user_op();
++                    let operand_index = r#use.find_index(ctx);
++                    if scope.contains(&user)
++                        && (mma_semantic_consumer(ctx, user, operand_index, fact)
++                            || mma_ordinary_use_forwards_fact(
++                                ctx,
++                                &cells,
++                                facts,
++                                *value,
++                                path,
++                                fact,
++                                user,
++                                operand_index,
++                            ))
++                    {
++                        continue;
++                    }
++                    return Err(invalid(format!(
++                        "shared-MMA carrier has an unsupported outgoing use by `{}` operand {operand_index}",
++                        Operation::get_opid(user, ctx)
++                    )));
++                }
+             }
+         }
+     }
+@@ -518,6 +535,10 @@ fn require_same_mma_plan(
+ /// Validate shared overlays, lazy B partitions, scale/A fragments, and accumulator provenance together.
+ pub(super) fn verify_smem_mma_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -> Result {
+     let ids = smem_mma_semantic_ids();
++    // Facts start only at this family's operations; a scope without one has nothing to check.
++    if !scope_has_any(ctx, all_ops, &ids) {
++        return Ok(());
++    }
+     let facts = build_mma_facts(ctx, all_ops);
+     let mut overlays = HashSet::new();
+     let mut used_overlays = HashSet::new();
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/pipeline.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/pipeline.rs
+index 355f94342..3787024c3 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/pipeline.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/pipeline.rs
+@@ -17,12 +17,12 @@ use pliron::{
+ 
+ use super::{
+     Result,
+-    cfg::{operation_dominates, operation_reaches},
++    cfg::{operation_dominates, operation_reaches, scope_has_any},
+     ghosts::pipeline_semantic_ids,
+     invalid,
+     provenance::{
+-        OrdinaryFacts, poison_missing_forwarding_sources, propagate_ordinary_plumbing,
+-        seed_unknown_integer_carriers,
++        CarrierFact, LocalCells, OrdinaryFacts, poison_missing_forwarding_sources,
++        propagate_ordinary_plumbing, seed_unknown_integer_carriers,
+     },
+ };
+ use crate::{
+@@ -175,6 +175,12 @@ enum PipelineFact {
+     Unknown(#[doc = "Original SSA value lacking semantic provenance."] Value),
+ }
+ 
++impl CarrierFact for PipelineFact {
++    fn is_opaque(&self) -> bool {
++        matches!(self, Self::Unknown(_))
++    }
++}
++
+ /// Require an unambiguous slot or phase fact rooted at cursor creation.
+ fn pipeline_state_root(
+     facts: &OrdinaryFacts<PipelineFact>,
+@@ -206,6 +212,7 @@ fn build_pipeline_facts(
+     ctx: &Context,
+     operations: &[Ptr<Operation>],
+ ) -> OrdinaryFacts<PipelineFact> {
++    let cells = LocalCells::new(ctx, operations);
+     let mut facts = OrdinaryFacts::default();
+     for operation in operations {
+         if Operation::get_opid(*operation, ctx) == CutePipelineStateNewOp::get_opid_static() {
+@@ -216,7 +223,7 @@ fn build_pipeline_facts(
+     }
+ 
+     loop {
+-        let mut changed = propagate_ordinary_plumbing(ctx, operations, &mut facts);
++        let mut changed = propagate_ordinary_plumbing(ctx, operations, &cells, &mut facts);
+         for operation in operations {
+             if Operation::get_opid(*operation, ctx) != CutePipelineStateAdvanceOp::get_opid_static()
+             {
+@@ -248,9 +255,14 @@ fn build_pipeline_facts(
+ 
+     seed_unknown_integer_carriers(ctx, operations, &mut facts, 32, PipelineFact::Unknown);
+     loop {
+-        let poisoned =
+-            poison_missing_forwarding_sources(ctx, operations, &mut facts, PipelineFact::Unknown);
+-        let propagated = propagate_ordinary_plumbing(ctx, operations, &mut facts);
++        let poisoned = poison_missing_forwarding_sources(
++            ctx,
++            operations,
++            &cells,
++            &mut facts,
++            PipelineFact::Unknown,
++        );
++        let propagated = propagate_ordinary_plumbing(ctx, operations, &cells, &mut facts);
+         if !poisoned && !propagated {
+             break;
+         }
+@@ -302,6 +314,10 @@ pub(super) fn require_producer_pipeline_order(
+ /// Validate handle ownership, complete cursor lifecycles, CFG order, and expected TMA byte totals.
+ pub(super) fn verify_pipeline_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -> Result {
+     let ids = pipeline_semantic_ids();
++    // Facts start only at this family's operations; a scope without one has nothing to check.
++    if !scope_has_any(ctx, all_ops, &ids) {
++        return Ok(());
++    }
+     let facts = build_pipeline_facts(ctx, all_ops);
+     let makes: Vec<_> = all_ops
+         .iter()
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/provenance.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/provenance.rs
+index 7bd4ae9a8..3732e626c 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/provenance.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/provenance.rs
+@@ -27,6 +27,7 @@ use dialect_mir::{
+     types::{MirArrayType, MirPtrType, MirStructType, MirTupleType, address_space},
+ };
+ use pliron::{
++    basic_block::BasicBlock,
+     builtin::{op_interfaces::BranchOpInterface, types::IntegerType},
+     context::{Context, Ptr},
+     op::{Op, op_cast},
+@@ -35,21 +36,28 @@ use pliron::{
+     value::Value,
+ };
+ 
+-/// Identity of a whole SSA carrier or one nested aggregate field.
+-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+-pub(super) struct CarrierKey {
+-    /// The whole SSA carrier before following any aggregate field path.
+-    pub(super) value: Value,
+-    /// Empty means the value itself.  Non-empty paths describe a field inside
+-    /// an ordinary aggregate before a matching `mir.extract_field` exposes it.
+-    pub(super) path: Vec<u32>,
++/// One possible origin of an ordinary carrier.
++pub(super) trait CarrierFact: Clone + Eq + std::hash::Hash {
++    /// True for a fact that names an ordinary SSA value instead of a semantic
++    /// origin: an input without provenance, or an ordinary scalar.
++    fn is_opaque(&self) -> bool;
+ }
+ 
++/// Consumers read an origin set only through its size, its sole origin, and
++/// whether it holds a given semantic origin. Two opaque origins therefore show
++/// a merge exactly as any larger number does, and keeping more would let the
++/// sets grow with every merge they flow through.
++const OPAQUE_FACTS_KEPT: usize = 2;
++
+ /// Monotone sets of possible semantic origins, indexed by carrier and field path.
+ #[derive(Clone)]
+ pub(super) struct OrdinaryFacts<F> {
+-    /// Accumulated origins; multiple entries at one key represent a merge that consumers must resolve.
+-    pub(super) facts: HashMap<CarrierKey, HashSet<F>>,
++    /// Accumulated origins by SSA carrier, then by field path inside it. An
++    /// empty path means the value itself; a non-empty path describes a field
++    /// inside an ordinary aggregate before a matching `mir.extract_field`
++    /// exposes it. Multiple origins at one path represent a merge that
++    /// consumers must resolve.
++    pub(super) facts: HashMap<Value, HashMap<Vec<u32>, HashSet<F>>>,
+ }
+ 
+ impl<F> Default for OrdinaryFacts<F> {
+@@ -60,16 +68,21 @@ impl<F> Default for OrdinaryFacts<F> {
+     }
+ }
+ 
+-impl<F> OrdinaryFacts<F>
+-where
+-    F: Clone + Eq + std::hash::Hash,
+-{
++impl<F: CarrierFact> OrdinaryFacts<F> {
+     /// Add one origin to a field path and report whether the fixed-point state changed.
+     pub(super) fn insert_path(&mut self, value: Value, path: Vec<u32>, fact: F) -> bool {
+-        self.facts
+-            .entry(CarrierKey { value, path })
++        let found = self
++            .facts
++            .entry(value)
+             .or_default()
+-            .insert(fact)
++            .entry(path)
++            .or_default();
++        if fact.is_opaque()
++            && found.iter().filter(|kept| kept.is_opaque()).count() >= OPAQUE_FACTS_KEPT
++        {
++            return false;
++        }
++        found.insert(fact)
+     }
+ 
+     /// Add an origin for the whole SSA carrier, with an empty field path.
+@@ -79,10 +92,7 @@ where
+ 
+     /// Borrow the possible origins at an exact carrier field path.
+     pub(super) fn at_path(&self, value: Value, path: &[u32]) -> Option<&HashSet<F>> {
+-        self.facts.get(&CarrierKey {
+-            value,
+-            path: path.to_vec(),
+-        })
++        self.facts.get(&value)?.get(path)
+     }
+ 
+     /// Borrow origins attached directly to a whole SSA carrier.
+@@ -93,9 +103,10 @@ where
+     /// Collect all nested field origins carried by one SSA value.
+     pub(super) fn entries(&self, value: Value) -> Vec<(Vec<u32>, F)> {
+         self.facts
+-            .iter()
+-            .filter(|(key, _)| key.value == value)
+-            .flat_map(|(key, facts)| facts.iter().cloned().map(|fact| (key.path.clone(), fact)))
++            .get(&value)
++            .into_iter()
++            .flatten()
++            .flat_map(|(path, facts)| facts.iter().cloned().map(|fact| (path.clone(), fact)))
+             .collect()
+     }
+ 
+@@ -268,6 +279,51 @@ pub(super) fn local_cell_is_closed(ctx: &Context, root: Value) -> bool {
+     true
+ }
+ 
++/// Closedness of every local cell allocated in one scope. The verifier never
++/// mutates the IR it reads, so each cell's alias graph is walked once and
++/// shared by all accesses and fixed-point iterations.
++pub(super) struct LocalCells {
++    closed: HashMap<Value, bool>,
++}
++
++impl LocalCells {
++    /// Check the alias graph of each `mir.alloca` result in the scope.
++    pub(super) fn new(ctx: &Context, operations: &[Ptr<Operation>]) -> Self {
++        let closed = operations
++            .iter()
++            .filter(|operation| {
++                Operation::get_opid(**operation, ctx) == MirAllocaOp::get_opid_static()
++                    && operation.deref(ctx).get_num_results() == 1
++            })
++            .map(|operation| {
++                let root = operation.deref(ctx).get_result(0);
++                (root, local_cell_is_closed(ctx, root))
++            })
++            .collect();
++        Self { closed }
++    }
++
++    /// Resolve a pointer to a closed local cell and the field path inside it.
++    pub(super) fn closed_cell(&self, ctx: &Context, pointer: Value) -> Option<(Value, Vec<u32>)> {
++        let (root, path) = local_cell(ctx, pointer)?;
++        let closed = self
++            .closed
++            .get(&root)
++            .copied()
++            .unwrap_or_else(|| local_cell_is_closed(ctx, root));
++        closed.then_some((root, path))
++    }
++}
++
++/// Read the operands each incoming edge passes to a block, once per edge.
++fn incoming_edge_operands(ctx: &Context, block: Ptr<BasicBlock>) -> Vec<Vec<Value>> {
++    block
++        .uses(ctx)
++        .into_iter()
++        .filter_map(|edge| branch_successor_operands(ctx, edge.user_op(), edge.find_index(ctx)))
++        .collect()
++}
++
+ /// Propagate semantic facts through the exact ordinary SSA adapters that can
+ /// remain after common CuTe preparation.  This is deliberately a monotone
+ /// fixed-point transfer: loop block arguments become known once their entry
+@@ -276,10 +332,11 @@ pub(super) fn local_cell_is_closed(ctx: &Context, root: Value) -> bool {
+ pub(super) fn propagate_ordinary_plumbing<F>(
+     ctx: &Context,
+     operations: &[Ptr<Operation>],
++    cells: &LocalCells,
+     facts: &mut OrdinaryFacts<F>,
+ ) -> bool
+ where
+-    F: Clone + Eq + std::hash::Hash,
++    F: CarrierFact,
+ {
+     let mut changed = false;
+     let mut blocks = HashSet::new();
+@@ -340,8 +397,7 @@ where
+         } else if opid == MirStoreOp::get_opid_static() && operation_ref.get_num_operands() == 2 {
+             let store = MirStoreOp::new(*operation);
+             if !store.is_volatile(ctx)
+-                && let Some((root, path)) = local_cell(ctx, store.address_opd(ctx))
+-                && local_cell_is_closed(ctx, root)
++                && let Some((root, path)) = cells.closed_cell(ctx, store.address_opd(ctx))
+             {
+                 changed |= facts.copy_entries(store.value_opd(ctx), root, &[], &path);
+             }
+@@ -351,8 +407,7 @@ where
+         {
+             let load = MirLoadOp::new(*operation);
+             if !load.is_volatile(ctx)
+-                && let Some((root, path)) = local_cell(ctx, load.address_opd(ctx))
+-                && local_cell_is_closed(ctx, root)
++                && let Some((root, path)) = cells.closed_cell(ctx, load.address_opd(ctx))
+             {
+                 changed |= facts.copy_entries(root, operation_ref.get_result(0), &path, &[]);
+             }
+@@ -360,16 +415,11 @@ where
+     }
+ 
+     for block in blocks {
++        let edges = incoming_edge_operands(ctx, block);
+         let block_ref = block.deref(ctx);
+         for argument_index in 0..block_ref.get_num_arguments() {
+             let argument = block_ref.get_argument(argument_index);
+-            for edge in block.uses(ctx) {
+-                let terminator = edge.user_op();
+-                let Some(operands) =
+-                    branch_successor_operands(ctx, terminator, edge.find_index(ctx))
+-                else {
+-                    continue;
+-                };
++            for operands in &edges {
+                 if let Some(incoming) = operands.get(argument_index).copied() {
+                     changed |= facts.copy_entries(incoming, argument, &[], &[]);
+                 }
+@@ -433,7 +483,7 @@ pub(super) fn seed_unknown_integer_carriers<F>(
+     width: u32,
+     unknown: impl Fn(Value) -> F,
+ ) where
+-    F: Clone + Eq + std::hash::Hash,
++    F: CarrierFact,
+ {
+     let mut values = Vec::new();
+     let mut blocks = HashSet::new();
+@@ -467,11 +517,12 @@ pub(super) fn seed_unknown_integer_carriers<F>(
+ pub(super) fn poison_missing_forwarding_sources<F>(
+     ctx: &Context,
+     operations: &[Ptr<Operation>],
++    cells: &LocalCells,
+     facts: &mut OrdinaryFacts<F>,
+     unknown: impl Fn(Value) -> F + Copy,
+ ) -> bool
+ where
+-    F: Clone + Eq + std::hash::Hash,
++    F: CarrierFact,
+ {
+     let mut changed = false;
+     let mut blocks = HashSet::new();
+@@ -483,12 +534,9 @@ where
+             continue;
+         }
+         let store = MirStoreOp::new(*operation);
+-        let Some((root, cell_path)) = local_cell(ctx, store.address_opd(ctx)) else {
++        let Some((root, cell_path)) = cells.closed_cell(ctx, store.address_opd(ctx)) else {
+             continue;
+         };
+-        if !local_cell_is_closed(ctx, root) {
+-            continue;
+-        }
+         for (path, _) in facts.entries(root) {
+             let Some(source_path) = path.strip_prefix(cell_path.as_slice()) else {
+                 continue;
+@@ -504,6 +552,7 @@ where
+     }
+ 
+     for block in blocks {
++        let edges = incoming_edge_operands(ctx, block);
+         let block_ref = block.deref(ctx);
+         for argument_index in 0..block_ref.get_num_arguments() {
+             let argument = block_ref.get_argument(argument_index);
+@@ -511,13 +560,7 @@ where
+             if argument_entries.is_empty() {
+                 continue;
+             }
+-            for edge in block.uses(ctx) {
+-                let terminator = edge.user_op();
+-                let Some(operands) =
+-                    branch_successor_operands(ctx, terminator, edge.find_index(ctx))
+-                else {
+-                    continue;
+-                };
++            for operands in &edges {
+                 let Some(incoming) = operands.get(argument_index).copied() else {
+                     continue;
+                 };
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/scheduler.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/scheduler.rs
+index 0d4e05295..205e60a15 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/scheduler.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/scheduler.rs
+@@ -19,12 +19,12 @@ use pliron::{
+ 
+ use super::{
+     Result,
+-    cfg::{block_reaches, operation_reaches},
++    cfg::{block_reaches, operation_reaches, scope_has_any},
+     ghosts::scheduler_semantic_ids,
+     invalid,
+     provenance::{
+-        OrdinaryFacts, poison_missing_forwarding_sources, propagate_ordinary_plumbing,
+-        seed_unknown_integer_carriers,
++        CarrierFact, LocalCells, OrdinaryFacts, poison_missing_forwarding_sources,
++        propagate_ordinary_plumbing, seed_unknown_integer_carriers,
+     },
+ };
+ use crate::{
+@@ -74,6 +74,12 @@ pub(super) enum SchedulerFact {
+     Unknown(#[doc = "Original SSA value lacking semantic provenance."] Value),
+ }
+ 
++impl CarrierFact for SchedulerFact {
++    fn is_opaque(&self) -> bool {
++        matches!(self, Self::Unknown(_))
++    }
++}
++
+ /// Require exactly one current-index or stride origin of the requested kind.
+ pub(super) fn scheduler_root(
+     facts: &OrdinaryFacts<SchedulerFact>,
+@@ -105,6 +111,7 @@ pub(super) fn build_scheduler_facts(
+     ctx: &Context,
+     operations: &[Ptr<Operation>],
+ ) -> OrdinaryFacts<SchedulerFact> {
++    let cells = LocalCells::new(ctx, operations);
+     let mut facts = OrdinaryFacts::default();
+     for operation in operations {
+         if Operation::get_opid(*operation, ctx) == CuteSchedulerNew1dOp::get_opid_static() {
+@@ -115,7 +122,7 @@ pub(super) fn build_scheduler_facts(
+     }
+ 
+     loop {
+-        let mut changed = propagate_ordinary_plumbing(ctx, operations, &mut facts);
++        let mut changed = propagate_ordinary_plumbing(ctx, operations, &cells, &mut facts);
+         for operation in operations {
+             if Operation::get_opid(*operation, ctx) != CuteSchedulerAdvanceOp::get_opid_static() {
+                 continue;
+@@ -146,9 +153,14 @@ pub(super) fn build_scheduler_facts(
+     // itself first, while still poisoning a merge with an arbitrary edge.
+     seed_unknown_integer_carriers(ctx, operations, &mut facts, 64, SchedulerFact::Unknown);
+     loop {
+-        let poisoned =
+-            poison_missing_forwarding_sources(ctx, operations, &mut facts, SchedulerFact::Unknown);
+-        let propagated = propagate_ordinary_plumbing(ctx, operations, &mut facts);
++        let poisoned = poison_missing_forwarding_sources(
++            ctx,
++            operations,
++            &cells,
++            &mut facts,
++            SchedulerFact::Unknown,
++        );
++        let propagated = propagate_ordinary_plumbing(ctx, operations, &cells, &mut facts);
+         if !poisoned && !propagated {
+             break;
+         }
+@@ -198,6 +210,10 @@ fn scheduler_guard(
+ /// Check one scheduler's state origins, loop advance, work guard, and coordinate consumers.
+ pub(super) fn verify_scheduler_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -> Result {
+     let ids = scheduler_semantic_ids();
++    // Facts start only at this family's operations; a scope without one has nothing to check.
++    if !scope_has_any(ctx, all_ops, &ids) {
++        return Ok(());
++    }
+     let facts = build_scheduler_facts(ctx, all_ops);
+     let mut roots = HashSet::new();
+     let mut has_work_roots = HashSet::new();
+diff --git a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/tests.rs b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/tests.rs
+index 30d90d276..4df2c3f17 100644
+--- a/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/tests.rs
++++ b/cuda-oxide/cute-rs-preview/dialect-cute/src/verify/tests.rs
+@@ -34,7 +34,8 @@ use super::{
+     mma::{build_mma_facts, require_smem_overlay_pair, verify_mma_use_closure},
+     pipeline::require_producer_pipeline_order,
+     provenance::{
+-        is_local_cell_pointer_alias_cast, is_semantic_pointer_carrier_cast, local_cell_is_closed,
++        CarrierFact, LocalCells, OrdinaryFacts, is_local_cell_pointer_alias_cast,
++        is_semantic_pointer_carrier_cast, local_cell_is_closed,
+     },
+     scheduler::{build_scheduler_facts, scheduler_root},
+     *,
+@@ -189,12 +190,15 @@ fn cond_branch(
+ }
+ 
+ /// Construct one valid persistent-scheduler function with configurable body/exit placement.
++/// The scheduler state reaches the loop header through `pad` ordinary blocks, each passing it
++/// as block arguments and through a closed local cell.
+ fn append_complete_scheduler_function(
+     ctx: &mut Context,
+     module_block: Ptr<BasicBlock>,
+     name: &str,
+     grid: CuteTileGridAttr,
+     misroute_work_edge: bool,
++    pad: usize,
+ ) {
+     let function_type = FunctionType::get(ctx, vec![], vec![]);
+     let function = Operation::new(
+@@ -222,12 +226,20 @@ fn append_complete_scheduler_function(
+     let start = CuteSchedulerNew1dOp::new(ctx, grid).get_operation();
+     start.insert_at_back(entry, ctx);
+     let start = CuteSchedulerNew1dOp::wrap(start);
+-    goto(
+-        ctx,
+-        entry,
+-        header,
+-        vec![start.current(ctx), start.stride(ctx)],
+-    );
++    let mut carried = vec![start.current(ctx), start.stride(ctx)];
++    let mut previous = entry;
++    for _ in 0..pad {
++        let block = BasicBlock::new(ctx, None, vec![u64_ty, u64_ty]);
++        block.insert_at_back(region, ctx);
++        goto(ctx, previous, block, carried);
++        let current = block.deref(ctx).get_argument(0);
++        let stride = block.deref(ctx).get_argument(1);
++        let cell = local_cell(ctx, block, u64_ty);
++        store(ctx, block, cell, current);
++        carried = vec![load(ctx, block, cell, u64_ty), stride];
++        previous = block;
++    }
++    goto(ctx, previous, header, carried);
+ 
+     let current = header.deref(ctx).get_argument(0);
+     let stride = header.deref(ctx).get_argument(1);
+@@ -305,6 +317,7 @@ fn accepts_independent_scheduler_stories_in_two_functions_without_mutation() {
+         "first",
+         CuteTileGridAttr::new(4, 4, 1),
+         false,
++        0,
+     );
+     append_complete_scheduler_function(
+         &mut ctx,
+@@ -312,6 +325,7 @@ fn accepts_independent_scheduler_stories_in_two_functions_without_mutation() {
+         "second",
+         CuteTileGridAttr::new(5, 4, 1),
+         false,
++        0,
+     );
+     let mut before = Vec::new();
+     collect_ops(&ctx, module, &mut before);
+@@ -334,6 +348,7 @@ fn rejects_a_scheduler_body_on_the_exit_edge_even_when_preorder_looks_ordered()
+         "misrouted",
+         CuteTileGridAttr::new(4, 4, 1),
+         true,
++        0,
+     );
+ 
+     let error = verify_cute_semantics(&ctx, module).unwrap_err().to_string();
+@@ -388,6 +403,195 @@ fn factless_block_argument_store_poisons_a_valid_scheduler_cell() {
+     assert!(error.contains("merges values"), "{error}");
+ }
+ 
++/// A scope's cell table answers every pointer as walking that pointer's cell aliases does,
++/// including cells allocated outside the scope.
++#[test]
++fn local_cells_agree_with_the_alias_walk() {
++    let mut ctx = Context::new();
++    module_top(&mut ctx);
++    let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
++    let block = BasicBlock::new(&mut ctx, None, vec![]);
++    let closed = local_cell(&mut ctx, block, u64_ty);
++    let read_only_type: TypeHandle = MirPtrType::get_generic(&mut ctx, u64_ty, false).into();
++    let alias_cast = pointer_cast(&mut ctx, block, closed, read_only_type);
++    let alias = alias_cast.deref(&ctx).get_result(0);
++    let value = undef(&mut ctx, block, u64_ty);
++    store(&mut ctx, block, closed, value);
++    load(&mut ctx, block, alias, u64_ty);
++    let escaped = local_cell(&mut ctx, block, u64_ty);
++    let pointer_type = escaped.get_type(&ctx);
++    let holder = local_cell(&mut ctx, block, pointer_type);
++    store(&mut ctx, block, holder, escaped);
++    let operations: Vec<_> = block.deref(&ctx).iter(&ctx).collect();
++    let without_allocas: Vec<_> = operations
++        .iter()
++        .copied()
++        .filter(|operation| Operation::get_opid(*operation, &ctx) != MirAllocaOp::get_opid_static())
++        .collect();
++
++    for scope in [&operations, &without_allocas] {
++        let cells = LocalCells::new(&ctx, scope);
++        for pointer in [closed, alias, escaped, holder] {
++            let walked = super::provenance::local_cell(&ctx, pointer)
++                .filter(|(root, _)| local_cell_is_closed(&ctx, *root));
++            assert_eq!(cells.closed_cell(&ctx, pointer), walked);
++        }
++        assert!(cells.closed_cell(&ctx, alias).is_some());
++        assert!(cells.closed_cell(&ctx, escaped).is_none());
++    }
++}
++
++/// Fact lookups see only the named carrier, and a copy forwards the source as it was when the copy began.
++#[test]
++fn ordinary_facts_forward_a_snapshot_of_one_carrier() {
++    let mut ctx = Context::new();
++    let (_, block) = module_top(&mut ctx);
++    let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
++    let source = undef(&mut ctx, block, u64_ty);
++    let other = undef(&mut ctx, block, u64_ty);
++    let destination = undef(&mut ctx, block, u64_ty);
++    let sorted = |facts: &OrdinaryFacts<u32>, value| {
++        let mut entries = facts.entries(value);
++        entries.sort();
++        entries
++    };
++
++    let mut facts = OrdinaryFacts::default();
++    assert!(facts.insert_path(source, vec![0], 1));
++    assert!(facts.insert_path(source, vec![1, 2], 2));
++    assert!(!facts.insert_path(source, vec![1, 2], 2));
++    assert!(facts.insert(other, 3));
++    assert_eq!(sorted(&facts, source), vec![(vec![0], 1), (vec![1, 2], 2)]);
++    assert_eq!(sorted(&facts, other), vec![(vec![], 3)]);
++    assert!(sorted(&facts, destination).is_empty());
++    assert_eq!(
++        facts.at_path(source, &[1, 2]).map(|found| found.len()),
++        Some(1)
++    );
++    assert!(facts.at_path(source, &[1]).is_none());
++    assert!(facts.at(other).is_some_and(|found| found.contains(&3)));
++
++    assert!(facts.copy_entries(source, source, &[], &[5]));
++    assert_eq!(
++        sorted(&facts, source),
++        vec![
++            (vec![0], 1),
++            (vec![1, 2], 2),
++            (vec![5, 0], 1),
++            (vec![5, 1, 2], 2)
++        ]
++    );
++    assert!(facts.copy_entries(source, destination, &[1], &[]));
++    assert!(!facts.copy_entries(source, destination, &[1], &[]));
++    assert_eq!(sorted(&facts, destination), vec![(vec![2], 2)]);
++    assert_eq!(sorted(&facts, other), vec![(vec![], 3)]);
++
++    // Opaque origins stop at two per path; semantic origins are always kept.
++    assert!(facts.insert(other, 100));
++    assert!(facts.insert(other, 101));
++    assert!(!facts.insert(other, 102));
++    assert!(!facts.insert(other, 100));
++    assert!(facts.insert(other, 4));
++    assert_eq!(
++        sorted(&facts, other),
++        vec![(vec![], 3), (vec![], 4), (vec![], 100), (vec![], 101)]
++    );
++    assert!(facts.insert(destination, 102));
++    assert!(facts.copy_entries(destination, other, &[], &[]));
++    assert_eq!(
++        sorted(&facts, other),
++        vec![
++            (vec![], 3),
++            (vec![], 4),
++            (vec![], 100),
++            (vec![], 101),
++            (vec![2], 2)
++        ]
++    );
++}
++
++/// Origins at or above 100 stand for opaque facts in the fact-set tests.
++impl CarrierFact for u32 {
++    fn is_opaque(&self) -> bool {
++        *self >= 100
++    }
++}
++
++/// A scheduler cursor that passes through many blocks and cells keeps its one origin.
++#[test]
++fn accepts_scheduler_state_carried_through_many_blocks_and_cells() {
++    let mut ctx = Context::new();
++    let (module, block) = module_top(&mut ctx);
++    append_complete_scheduler_function(
++        &mut ctx,
++        block,
++        "padded",
++        CuteTileGridAttr::new(4, 4, 1),
++        false,
++        48,
++    );
++    verify_cute_semantics(&ctx, module).unwrap();
++}
++
++/// Build a function whose `cute.scheduler_has_work` reads a cursor with no scheduler origin:
++/// a plain value, or a block argument merging `incoming` unrelated values.
++fn scheduler_has_work_without_origin(incoming: usize) -> String {
++    let mut ctx = Context::new();
++    let (module, module_block) = module_top(&mut ctx);
++    let function_type = FunctionType::get(&ctx, vec![], vec![]);
++    let function = Operation::new(
++        &mut ctx,
++        MirFuncOp::get_concrete_op_info(),
++        vec![],
++        vec![],
++        vec![],
++        1,
++    );
++    let function_op = MirFuncOp::new(&mut ctx, function, TypeAttr::new(function_type.into()));
++    function_op.set_symbol_name(&mut ctx, "unrooted".try_into().unwrap());
++    function.insert_at_back(module_block, &ctx);
++    let region = function.deref(&ctx).get_region(0);
++    let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
++    let entry = BasicBlock::new(&mut ctx, None, vec![]);
++    entry.insert_at_back(region, &ctx);
++    let mut cursor = undef(&mut ctx, entry, u64_ty);
++    let mut current = entry;
++    if incoming > 0 {
++        let join = BasicBlock::new(&mut ctx, None, vec![u64_ty]);
++        join.insert_at_back(region, &ctx);
++        goto(&mut ctx, entry, join, vec![cursor]);
++        for _ in 1..incoming {
++            let side = BasicBlock::new(&mut ctx, None, vec![]);
++            side.insert_at_back(region, &ctx);
++            let value = undef(&mut ctx, side, u64_ty);
++            goto(&mut ctx, side, join, vec![value]);
++        }
++        cursor = join.deref(&ctx).get_argument(0);
++        current = join;
++    }
++    let grid = CuteTileGridAttr::new(4, 4, 1);
++    CuteSchedulerHasWorkOp::new(&mut ctx, cursor, grid)
++        .get_operation()
++        .insert_at_back(current, &ctx);
++    verify_cute_semantics(&ctx, module).unwrap_err().to_string()
++}
++
++/// Rejections keep their wording however many unrelated values a cursor merges.
++#[test]
++fn scheduler_cursor_without_origin_is_rejected_with_the_same_wording() {
++    let prefix = "invalid CuTe semantic module: cute.scheduler_has_work current";
++    assert_eq!(
++        scheduler_has_work_without_origin(0),
++        format!("{prefix} is not derived from the required scheduler_new_1d result")
++    );
++    for incoming in [1, 3, 8] {
++        assert_eq!(
++            scheduler_has_work_without_origin(incoming),
++            format!("{prefix} merges values from different scheduler stories")
++        );
++    }
++}
++
+ /// Casts that change pointee, address space, or write capability cannot establish closed-cell aliases.
+ #[test]
+ fn non_identity_pointer_casts_cannot_alias_a_local_semantic_cell() {
