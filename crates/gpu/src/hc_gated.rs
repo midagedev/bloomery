@@ -23,7 +23,8 @@
 //!   memory (block 0 also writes them out, and at an inject site the
 //!   combine's weights `2·σ(·/4)`), then a warp per hidden value runs the
 //!   four up rows of that value against the bottleneck in the q8f32 lane
-//!   order, and lane 0 writes `(xn_0·σ(g_0), fma for the rest)·(1/4)`.
+//!   order, and lane c writes column c's `(xn_0·σ(g_0), fma for the
+//!   rest)·(1/4)`.
 //!
 //! A BF16 down or up (in its words, [`HcMatrix::Bf16`]) runs its own entry
 //! of the same blocks, `hc_gated_down_bf16_4x320` and
@@ -122,6 +123,8 @@ const _: () = assert!(
         && INSTANCES[0].rank as usize == RANK
 );
 const _: () = assert!(MAX_COLS == 8 && NORM_THREADS == 256 && NORM_WARPS == 8);
+// Lane c of an up warp mixes column c.
+const _: () = assert!(MAX_COLS <= 32);
 const _: () = assert!(DOWN_WARPS == 8);
 
 /// The fault site every entry here raises.
@@ -176,6 +179,8 @@ const _: () = assert!(UP_WORDS == 80 && UP_LANE_WORDS * 32 >= UP_WORDS && UP_WOR
 /// Values of a BF16 up row one lane takes.
 const UP_LANE_VALUES: usize = RANK / 32;
 const _: () = assert!(UP_LANE_VALUES * 32 == RANK);
+/// Columns one walk of a BF16 up row takes.
+const UP_GROUP: usize = 4;
 const _: () = assert!((runtime::hc_gated::HIDDEN_ALIGN as usize).is_multiple_of(UP_WARPS));
 
 /// Threads of a combine block, a value each.
@@ -300,8 +305,8 @@ unsafe fn down_row_end<const M: usize>(
 }
 
 /// Hidden value `h`'s four up rows against the `M` columns of the
-/// bottleneck in shared memory `lo_s` (`[M][RANK]`), then lane 0's mixed
-/// value of each column (module doc).
+/// bottleneck in shared memory `lo_s` (`[M][RANK]`), then lane c's mixed
+/// value of column c (module doc).
 ///
 /// # Safety
 /// `qs`, `d` hold the up's `STREAMS·hidden` rows of `RANK` values in the
@@ -350,8 +355,9 @@ unsafe fn up_mix_value<const M: usize>(
             }
         }
     }
-    // Columns outer, streams inner: a column's bottleneck words live for that column only.
-    let mut g = [[0.0f32; MAX_COLS]; STREAMS];
+    // Columns outer, streams inner: a column's bottleneck words and its four
+    // sums live for that column only, and lane c keeps column c's.
+    let mut mine = [0.0f32; STREAMS];
     for c in 0..M {
         thread::__unroll_config::<0>();
         let mut f = [0.0f32; STREAMS];
@@ -370,48 +376,59 @@ unsafe fn up_mix_value<const M: usize>(
                 }
             }
         }
-        for s in 0..STREAMS {
-            thread::__unroll_config::<0>();
-            g[s][c] = warp::reduce_sum_f32(f[s]);
-        }
+        keep_sums(&f, lane == c, &mut mine);
     }
-    if lane == 0 {
-        // SAFETY: this fn's contract is mix_out's.
-        unsafe { mix_out::<M>(&g, xn, hidden, h, fault, mixed) };
+    if lane < M {
+        // SAFETY: lane < M, so this fn's contract is mix_col's for column lane.
+        unsafe { mix_col(&mine, xn, (hidden, h, lane), fault, mixed) };
     }
 }
 
-/// Lane 0's mixed value of each of `M` columns for hidden value `h` from its
-/// four up rows' sums `g[s][c]` (module doc).
-///
-/// # Safety
-/// `xn` holds `M` columns of `STREAMS·hidden`, `mixed` `M·hidden` slots, `h <
-/// hidden`; the calling warp owns `h`.
+/// The butterfly of each of a column's four lane partials `f`, kept in
+/// `mine` on the lane that owns the column (`own`). Every lane of the warp
+/// calls it.
 #[inline(always)]
 #[allow(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn mix_out<const M: usize>(
-    g: &[[f32; MAX_COLS]; STREAMS],
+fn keep_sums(f: &[f32; STREAMS], own: bool, mine: &mut [f32; STREAMS]) {
+    for s in 0..STREAMS {
+        thread::__unroll_config::<0>();
+        let g = warp::reduce_sum_f32(f[s]);
+        if own {
+            mine[s] = g;
+        }
+    }
+}
+
+/// The mixed value of column `c` for hidden value `h` from its four up rows'
+/// sums `g[s]` (module doc), on the lane that keeps them.
+///
+/// # Safety
+/// `xn` holds `c + 1` columns of `STREAMS·hidden`, `mixed` `(c + 1)·hidden`
+/// slots, `h < hidden`; the calling warp owns `h`.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn mix_col(
+    g: &[f32; STREAMS],
     xn: &[f32],
-    hidden: usize,
-    h: usize,
+    (hidden, h, c): (usize, usize, usize),
     fault: FaultSink,
     mixed: &mut DisjointSlice<f32>,
 ) {
-    for c in 0..M {
+    let mut acc = 0.0f32;
+    for s in 0..STREAMS {
         thread::__unroll_config::<0>();
-        let mut acc = 0.0f32;
-        for s in 0..STREAMS {
-            thread::__unroll_config::<0>();
-            // SAFETY: (c·STREAMS + s)·hidden + h < M·STREAMS·hidden <= xn.len().
-            let x = unsafe { *xn.get_unchecked((c * STREAMS + s) * hidden + h) };
-            acc = mix_step(acc, x, gate_value(g[s][c]), s);
-        }
-        // SAFETY: c·hidden + h < M·hidden <= mixed.len(); this warp owns h.
-        unsafe { store_mix(acc, c * hidden + h, fault, mixed) };
+        // SAFETY: (c·STREAMS + s)·hidden + h < (c + 1)·STREAMS·hidden <= xn.len().
+        let x = unsafe { *xn.get_unchecked((c * STREAMS + s) * hidden + h) };
+        acc = mix_step(acc, x, gate_value(g[s]), s);
     }
+    // SAFETY: c·hidden + h < (c + 1)·hidden <= mixed.len(); this warp owns h.
+    unsafe { store_mix(acc, c * hidden + h, fault, mixed) };
 }
 
 /// Inject block `ib` (row `ib / 4`, stream `ib % 4`) of the down kernels:
@@ -575,7 +592,10 @@ unsafe fn down_row_bf16<const M: usize>(
 /// [`up_mix_value`] for a BF16 up in its words: each of the four up rows
 /// against each column of the bottleneck by the F32 core's lane walk over
 /// the widened values (lane `L` values `32t + L`, `t` up to `RANK/32`), then
-/// the butterfly and [`mix_out`].
+/// the butterfly and [`mix_col`]. The walk takes up to [`UP_GROUP`] columns
+/// at once, the lane's four values of step `t` against each of them, so a
+/// value is loaded once for the group and only the group's sums stay live;
+/// a column's multiply-adds keep their order in `t`.
 ///
 /// # Safety
 /// `w` holds the up's `STREAMS·hidden` rows of `RANK` values two a word,
@@ -593,38 +613,43 @@ unsafe fn up_mix_value_bf16<const M: usize>(
     fault: FaultSink,
     mixed: &mut DisjointSlice<f32>,
 ) {
-    let mut v = [[0.0f32; UP_LANE_VALUES]; STREAMS];
-    for s in 0..STREAMS {
+    let mut mine = [0.0f32; STREAMS];
+    for g in 0..M.div_ceil(UP_GROUP) {
         thread::__unroll_config::<0>();
-        let row = s * hidden + h;
+        let mut f = [[0.0f32; STREAMS]; UP_GROUP];
         for t in 0..UP_LANE_VALUES {
             thread::__unroll_config::<0>();
-            // SAFETY: row < STREAMS·hidden and 32t + lane < RANK: inside the
-            // words.
-            v[s][t] = unsafe { Bf16Words(w).at(row * RANK + 32 * t + lane) };
-        }
-    }
-    let mut g = [[0.0f32; MAX_COLS]; STREAMS];
-    for c in 0..M {
-        thread::__unroll_config::<0>();
-        let mut f = [0.0f32; STREAMS];
-        for t in 0..UP_LANE_VALUES {
-            thread::__unroll_config::<0>();
-            // SAFETY: c < M and 32t + lane < RANK: inside lo_s.
-            let x = unsafe { *lo_s.add(c * RANK + 32 * t + lane) };
+            let mut v = [0.0f32; STREAMS];
             for s in 0..STREAMS {
                 thread::__unroll_config::<0>();
-                f[s] = f32::mul_add(v[s][t], x, f[s]);
+                // SAFETY: row s·hidden + h < STREAMS·hidden and 32t + lane <
+                // RANK: inside the words.
+                v[s] = unsafe { Bf16Words(w).at((s * hidden + h) * RANK + 32 * t + lane) };
+            }
+            for j in 0..UP_GROUP {
+                thread::__unroll_config::<0>();
+                let c = g * UP_GROUP + j;
+                if c < M {
+                    // SAFETY: c < M and 32t + lane < RANK: inside lo_s.
+                    let x = unsafe { *lo_s.add(c * RANK + 32 * t + lane) };
+                    for s in 0..STREAMS {
+                        thread::__unroll_config::<0>();
+                        f[j][s] = f32::mul_add(v[s], x, f[j][s]);
+                    }
+                }
             }
         }
-        for s in 0..STREAMS {
+        for j in 0..UP_GROUP {
             thread::__unroll_config::<0>();
-            g[s][c] = warp::reduce_sum_f32(f[s]);
+            let c = g * UP_GROUP + j;
+            if c < M {
+                keep_sums(&f[j], lane == c, &mut mine);
+            }
         }
     }
-    if lane == 0 {
-        // SAFETY: this fn's contract is mix_out's.
-        unsafe { mix_out::<M>(&g, xn, hidden, h, fault, mixed) };
+    if lane < M {
+        // SAFETY: lane < M, so this fn's contract is mix_col's for column lane.
+        unsafe { mix_col(&mine, xn, (hidden, h, lane), fault, mixed) };
     }
 }
 
