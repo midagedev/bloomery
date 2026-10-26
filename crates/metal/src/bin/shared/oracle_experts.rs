@@ -1,14 +1,16 @@
 //! The pair's band and the fold's band.
 
-use bloomery_metal::kernels::{EXPERT_K, EXPERT_SLOTS, Quant};
+use bloomery_metal::geom::ExpertsGeom;
+use bloomery_metal::kernels::Quant;
 
 use super::oracle::{self, Kind, U, silu};
 
 /// The blocks of one fold in `quant`'s own blocks: the hidden states of
-/// every slot, `slots * k` columns (eighteen 256-value blocks, seventy-two
-/// A4 groups, a hundred and forty-four Q8_0 blocks).
-fn fold_blocks(quant: Quant) -> usize {
-    EXPERT_SLOTS * EXPERT_K / quant.values_per_block()
+/// every slot, `slots * k` columns (nine slots of 512 columns are eighteen
+/// 256-value blocks, seventy-two A4 groups, a hundred and forty-four Q8_0
+/// blocks).
+fn fold_blocks(e: &ExpertsGeom, quant: Quant) -> usize {
+    e.slots * e.k / quant.values_per_block()
 }
 
 /// The operations the fold adds to a store path of [`fold_blocks`] blocks:
@@ -62,8 +64,8 @@ pub fn pair_width(
 /// and `magnitude` is the sum of the slots' term magnitudes. The residual
 /// contributes `U |y|` on top of gamma of the fold's operation count.
 #[must_use]
-pub fn fold_width(quant: Quant, magnitude: f64, y: f64) -> f64 {
-    let n = oracle::band(quant, fold_blocks(quant), Kind::Store).ops() + FOLD_EXTRA_OPS;
+pub fn fold_width(e: &ExpertsGeom, quant: Quant, magnitude: f64, y: f64) -> f64 {
+    let n = oracle::band(quant, fold_blocks(e, quant), Kind::Store).ops() + FOLD_EXTRA_OPS;
     let factor = oracle::gamma_bound(n);
     let floor = n as f64 * f64::from(f32::MIN_POSITIVE);
     factor * magnitude * (1.0 + U) + U * y.abs() + floor

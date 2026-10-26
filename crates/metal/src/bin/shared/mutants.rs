@@ -1,15 +1,15 @@
 // The mutant support both Metal gates share: a module of each gate's
 // `mutants.rs`, whose own tables `MUTANTS` and `TENSOR_MUTANTS` it walks.
 
-use bloomery_metal::library::{SOURCE, TENSOR_SOURCE};
+use bloomery_metal::instance::{HOST, Instance};
+use bloomery_metal::library::sources_of;
 
 /// The program a mutant's edits go into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Program {
-    /// The kernels' library ([`SOURCE`]).
+    /// The kernels' library.
     Main,
-    /// The tensor-op GEMMs' library ([`TENSOR_SOURCE`]), which the tensor
-    /// clauses force.
+    /// The tensor-op GEMMs' library, which the tensor clauses force.
     Tensor,
 }
 
@@ -33,14 +33,28 @@ pub fn all(
         .chain(tensor.iter().map(|m| (m, Program::Tensor)))
 }
 
-/// The source of `program` with the mutant's edits applied; an edit whose
-/// find text occurs another number of times than it names is refused.
+/// The source of `program` of `inst`'s kernels with the mutant's edits
+/// applied; an edit whose find text occurs another number of times than it
+/// names is refused.
+pub fn source_at(inst: &Instance, mutant: &Mutant, program: Program) -> Result<String, String> {
+    let (main, tensor) = sources_of(inst).map_err(|e| e.to_string())?;
+    let base = match program {
+        Program::Main => main,
+        Program::Tensor => tensor,
+    };
+    edited(base, mutant)
+}
+
+/// The source of `program` of the build's host instance ([`HOST`]) with the
+/// mutant's edits applied. A shim of [`source_at`]. Callers left: the e2e
+/// gate.
 pub fn source_of(mutant: &Mutant, program: Program) -> Result<String, String> {
-    let mut text = match program {
-        Program::Main => SOURCE,
-        Program::Tensor => TENSOR_SOURCE,
-    }
-    .to_string();
+    source_at(&HOST, mutant, program)
+}
+
+/// `base` with the mutant's edits applied, in order.
+fn edited(base: &str, mutant: &Mutant) -> Result<String, String> {
+    let mut text = base.to_string();
     for (find, replace, count) in mutant.edits {
         let found = text.matches(find).count();
         if found != *count {
