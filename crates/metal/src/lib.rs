@@ -17,6 +17,15 @@ pub mod arch;
 /// launch (macOS) and by the token count (every OS).
 #[path = "kernels/attention_geom.rs"]
 pub mod attention_geom;
+/// The kernels' instances: one per registered shape row, each the axes one
+/// translation unit of the kernels is compiled at (a router's experts, picks
+/// and hidden width, decode attention's head, rope and heads, the delta
+/// step's heads and columns, the experts' width). The router and flash rows
+/// are the shape table's (`models::shape`), the rows the CUDA bodies are
+/// built at. `build.rs` writes and compiles every registered instance; a
+/// file selects its instance by its shape and a shape no instance has is
+/// refused by name. Host arithmetic: every OS.
+pub mod instance;
 /// The server's engine over any `runtime::Target`, host code: every OS.
 pub mod server;
 

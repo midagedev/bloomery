@@ -38,10 +38,11 @@ use model::arch::names;
 use super::arena::LANES;
 use super::rows::RowsLens;
 use super::session::{LAUNCHED, SITES, SessionError, WHAT, pass_rows_max};
+use crate::instance::{self, Instance};
 use crate::kernels::{
-    CONV_TAPS, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_K, HeadMap, KV_HEADS,
-    MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, VALUE_HEADS, channels, f16_len,
-    head_groups, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys, state_elems,
+    CONV_TAPS, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, MAX_SEGMENTS,
+    PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, VALUE_HEADS, channels, f16_len, head_groups,
+    out_len, partials_len, qg_len, ring_elems, router, segments_for_keys, state_elems,
 };
 
 /// The arena's name in a refusal.
@@ -327,8 +328,10 @@ pub(super) struct Layout {
     pub(super) proj: usize,
 }
 
-/// A file the open runs: the plans of its layers and the arena's layout.
+/// A file the open runs: the instance its shape selects, the plans of its
+/// layers and the arena's layout.
 pub struct Checked {
+    pub(super) instance: &'static Instance,
     pub(super) plans: Vec<LayerPlan>,
     pub(super) layout: Layout,
 }
@@ -555,6 +558,13 @@ fn read(
         }
     };
     *summary = Some(summarize(split, &spec));
+    // The library a session of the file runs on: the instance its shape
+    // selects, a shape no instance is built for refused by name.
+    let inst = At {
+        items: &mut *items,
+        layer: None,
+    }
+    .ok(instance::select(&spec).map_err(|e| super::session::refuse(format!("{path}: {e}"))));
     let (kinds, pd) = match kinds35(&spec.layers)
         .and_then(|kinds| PlanDims::q35(&spec, WHAT).map(|pd| (kinds, pd)))
     {
@@ -647,9 +657,10 @@ fn read(
     });
     let attn_out = file.ok(out_len().ok_or_else(|| refuse("the attention output does not fit")));
     let plans: Option<Vec<LayerPlan>> = plans.into_iter().collect();
-    let (head, (n_experts, top_k), rope, layers, proj, attn_out, plans) =
-        (head?, moe?, rope?, layers?, proj?, attn_out?, plans?);
+    let (inst, head, (n_experts, top_k), rope, layers, proj, attn_out, plans) =
+        (inst?, head?, moe?, rope?, layers?, proj?, attn_out?, plans?);
     Some(Checked {
+        instance: inst,
         plans,
         layout: Layout {
             hidden,
@@ -717,9 +728,10 @@ fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> 
     let hidden = spec.hidden as usize;
     let vocab = spec.vocab as usize;
     let mut ok = true;
-    if hidden != HEAD_K || hidden != router::K {
+    if hidden != router::K {
         at.push(refuse(format!(
-            "a hidden width of {hidden}; the head and the router read {HEAD_K}"
+            "a hidden width of {hidden}; the router reads {}",
+            router::K
         )));
         ok = false;
     }
@@ -750,6 +762,12 @@ fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> 
                 names::output(),
                 s.quant
             )));
+        } else if !hidden.is_multiple_of(s.quant.values_per_block()) {
+            at.push(refuse(format!(
+                "a hidden width of {hidden}; the head reads whole blocks of {}",
+                s.quant.values_per_block()
+            )));
+            return false;
         }
         fits
     });
@@ -1578,6 +1596,20 @@ mod tests {
                 && got[0].contains("\"qwen3moe\""),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn a_shape_no_instance_is_built_for_is_the_opens_first_item() {
+        let t = Synthetic::new().kv("qwen35moe.expert_used_count", Value::U32(6));
+        let split = t.split();
+        let got = texts(&split, CTX);
+        assert!(
+            got.first().is_some_and(|e| e
+                .starts_with("qwen35moe session: synthetic.gguf: no instance is built for ")
+                && e.contains("top 6")),
+            "{got:?}"
+        );
+        assert!(check(&split, CTX).checked.is_none());
     }
 
     #[test]

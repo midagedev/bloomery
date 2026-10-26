@@ -871,7 +871,9 @@ generate_metal --plan [--ctx C]
             return Err("the prompt has no ids".into());
         }
         let ctx = ctx_of(a)?;
-        let device = MetalDevice::open().map_err(|e| e.to_string())?;
+        // The library is the instance the file's shape selects, by the check `--plan` prints.
+        let instance = Session::instance_of(&a.model, ctx).map_err(|e| e.to_string())?;
+        let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
         let t0 = Instant::now();
         let mut session =
             Session::open(&device, device.library(), &a.model, ctx).map_err(|e| e.to_string())?;
