@@ -619,7 +619,7 @@ pub fn layer_plans(
 mod tests {
     use super::{
         FfnRoute, Flash, GqaKind, LayerPlan, MixerPlan, PlanDims, Read35, SharedPlan, SiteTy,
-        Sites35, layer_plans, plan_ffn, plan_gqa,
+        Sites35, blk, layer_plans, plan_ffn, plan_gqa,
     };
     use crate::arch::qwen3moe::plan::fixtures::{delta, gqa, layer, q30_layer, spec};
     use crate::arch::qwen3moe::plan::{Kind35, kinds_of, kinds35};
@@ -647,10 +647,6 @@ mod tests {
         let layout = Layout::new(&[], decls).unwrap_or_else(|e| panic!("{e}"));
         Split::header_only(PathBuf::from("synthetic.gguf"), &layout)
             .unwrap_or_else(|e| panic!("{e}"))
-    }
-
-    fn blk(l: usize, stem: &str) -> String {
-        format!("blk.{l}.{stem}")
     }
 
     /// Layer `l`'s routed FFN as the file holds it: the pre-FFN norm under `norm`, the stacks of
