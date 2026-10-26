@@ -1058,10 +1058,6 @@ mod site_tests {
         }
     }
 
-    /// Ours is the form the launches read, as their sources say it: the text of the kernel
-    /// table's `SiteEntry::reads` (which `site.rs`'s `SiteTy::reads` returns) and of the 32-value
-    /// GEMM family's module doc, so a launch that moves to another form is red here until the
-    /// table follows it.
     /// A BF16 site is read on the f32 rows by ours on both arms and by ik's BF16 dot on
     /// bfloat16 activations; no expert stack of it is read.
     #[test]
@@ -1079,6 +1075,10 @@ mod site_tests {
         assert_eq!(site_rel(GgmlType::BF16, Arm::Expert), None);
     }
 
+    /// Ours is the form the launches read, as their sources say it: the text of the kernel
+    /// table's `SiteEntry::reads` (which `site.rs`'s `SiteTy::reads` returns) and of the 32-value
+    /// GEMM family's module doc, so a launch that moves to another form is red here until the
+    /// table follows it.
     #[test]
     fn site_rel_reads_the_forms_the_launches_name() {
         let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");

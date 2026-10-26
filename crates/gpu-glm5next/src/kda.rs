@@ -9,7 +9,7 @@
 //!
 //! The launches are `mixer_kda::enqueue`'s (ik `src/llama-kda.cpp`; the
 //! module's doc lists them): this file is the model's part of them. [`Step`]
-//! is the q8_0 projections at one token, one gemv a weight; the prompt batch's
+//! is the projections at one token, each by the site type of its weight (`project`); the prompt batch's
 //! (the chunked gemvs or the GEMM front) is `prefill`'s. [`dims`], [`vecs`],
 //! [`names`] and [`state`] are what both hand the mixer.
 //!
