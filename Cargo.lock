@@ -617,7 +617,7 @@ dependencies = [
 [[package]]
 name = "cuda-artifact-finalizer"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
@@ -628,8 +628,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-bindings"
-version = "0.4.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "bindgen",
  "libloading",
@@ -641,8 +641,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-core"
-version = "0.4.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "anyhow",
  "cuda-bindings",
@@ -653,8 +653,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-core-derive"
-version = "0.4.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -664,7 +664,7 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "cuda-macros",
 ]
@@ -672,10 +672,11 @@ dependencies = [
 [[package]]
 name = "cuda-host"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-core",
+ "cuda-device",
  "cuda-macros",
  "half",
  "libc",
@@ -688,8 +689,9 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
+ "oxide-tile-export",
  "proc-macro2",
  "quote",
  "reserved-oxide-symbols",
@@ -699,7 +701,7 @@ dependencies = [
 [[package]]
 name = "cuda-target-spec"
 version = "0.1.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 
 [[package]]
 name = "digest"
@@ -876,7 +878,7 @@ dependencies = [
 [[package]]
 name = "libnvvm-sys"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "cuda-target-spec",
  "libloading",
@@ -959,7 +961,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 dependencies = [
  "libloading",
  "thiserror",
@@ -1030,6 +1032,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-tile-export"
+version = "0.2.1"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1064,7 +1076,7 @@ dependencies = [
 [[package]]
 name = "ptx-parse"
 version = "0.1.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 
 [[package]]
 name = "quote"
@@ -1113,7 +1125,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc951864b79f723b4da9c11fa229f5600aefcb"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=9df9e7cef561e03a066230b3bb433b3d8285da81#9df9e7cef561e03a066230b3bb433b3d8285da81"
 
 [[package]]
 name = "rustc-hash"

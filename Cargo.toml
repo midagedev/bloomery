@@ -5,12 +5,15 @@ members = ["crates/qdot", "crates/gguf", "crates/models", "crates/model", "crate
 exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_smoke", "fuzz", "labs/hip-native"]
 
 [workspace.dependencies]
-# cuda-oxide는 rev로 고정한다. 떠 있으면 어제의 수치와 오늘의 수치가 다른 컴파일러에서 나온다.
-cuda-device = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "1691162ab9204ef21b0329c2e8059815420dfd5a" }
-cuda-host = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "1691162ab9204ef21b0329c2e8059815420dfd5a" }
-# cuda-host takes cuda-core by path inside the same repository, so cuda-core comes from that repository and rev
-# too (and through the same [patch] below): a crates.io copy would be a second crate whose types are not cuda-host's.
-cuda-core = { version = "0.4.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "1691162ab9204ef21b0329c2e8059815420dfd5a" }
+# cuda-oxide is NVIDIA/cuda-rust (cuda-oxide lives under cuda-oxide/ there, cuda-core at the root), taken straight from
+# that repository by rev. A floating rev puts yesterday's numbers and today's on different compilers. A rev move here
+# needs the box's backend and cargo-oxide for that rev (tools/box.sh, docs/BUILD.md) and rust-toolchain.toml on the
+# channel of that rev's cuda-oxide/rust-toolchain.toml.
+cuda-device = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "9df9e7cef561e03a066230b3bb433b3d8285da81" }
+cuda-host = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "9df9e7cef561e03a066230b3bb433b3d8285da81" }
+# cuda-host takes cuda-core by path inside the same repository, so cuda-core comes from that repository and rev too: a
+# crates.io copy would be a second crate whose types are not cuda-host's.
+cuda-core = { version = "0.5.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "9df9e7cef561e03a066230b3bb433b3d8285da81" }
 # The .oxart container parser is the copy cuda-core's module loader links: cuda-core and cuda-host both take
 # oxide-artifacts from crates.io (the repository's own copy is its publish source, not a dependency). Requirements on
 # one semver line unify into one version, so the gates cut the text handed to the driver with the loader's own code.
@@ -39,15 +42,6 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 objc2-metal = { version = "=0.3.2", default-features = false, features = ["std", "MTLTypes", "MTLDevice", "MTLResource", "MTLAllocation", "MTLBuffer", "MTLLibrary", "MTLComputePipeline", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLEvent", "dispatch2"] }
 # The dispatch data a metallib is loaded from.
 dispatch2 = { version = "=0.3.0", default-features = false, features = ["alloc"] }
-
-# The declarations above name the NVIDIA/cuda-rust rev (cuda-oxide lives under cuda-oxide/ there, cuda-core at the
-# root); the source comes from our fork (midagedev/cuda-oxide), branch `bloomery` = that rev + the patches meant for
-# upstream (listed in THIRD_PARTY_NOTICES.md). With no patch left this section goes. A rev move here needs the box's
-# backend rebuilt for that rev (tools/box.sh, CUDA_OXIDE_BACKEND).
-[patch."https://github.com/NVIDIA/cuda-rust.git"]
-cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
-cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
-cuda-core = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
 
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]

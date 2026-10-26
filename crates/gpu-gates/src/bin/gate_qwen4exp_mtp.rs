@@ -1445,7 +1445,7 @@ mod gate {
             )?;
             let taps = m.mtp_taps()?;
             let mut flipped = vec![false; rows];
-            for t in 0..rows {
+            for (t, flipped_t) in flipped.iter_mut().enumerate().take(rows) {
                 let at = c0 + t;
                 let span = at * WIDE..(at + 1) * WIDE;
                 let e = if vs_ik {
@@ -1474,7 +1474,7 @@ mod gate {
                     })
                     .flatten()
                 {
-                    flipped[t] = true;
+                    *flipped_t = true;
                     r.flips += 1;
                     let cap = flip::flip_cap(router_b, ik_v);
                     let gap_cap = flip::margin_cap(router_b, ik_v);
@@ -1491,7 +1491,7 @@ mod gate {
                 }
                 let l_out = &w.l_out[t * WIDE..(t + 1) * WIDE];
                 pin_row(host, g, at, &taps, t, l_out, &mut r.pins);
-                if vs_ik && !flipped[t] {
+                if vs_ik && !*flipped_t {
                     r.l_out_held += 1;
                     let d = rel(l_out, &g.l_out[span]);
                     r.l_out_worst = r.l_out_worst.max(d);
@@ -6103,28 +6103,35 @@ mod gate {
         let (file, draft_file) = (open_target()?, open_draft()?);
         let mut paged_inputs = PlanInputs::describe(&file)?;
         let mut room = paged_inputs.room.0;
-        let mut paged = None;
         let mut refused = None;
-        for _ in 0..24 {
-            paged_inputs.room = (room, HostRead::Given);
-            match paged_inputs.plan_mtp_with(
-                &machine,
-                CTX,
-                &plan_levers(extra)?,
-                mtp,
-                Experts::Card,
-            ) {
-                Ok(p) if p.plan.host.nvme_expert_bytes > 0 && p.plan.host.nvme_arena_bytes > 0 => {
-                    paged = Some(p);
-                    break;
-                }
-                Ok(_) => room /= 2,
-                Err(e) => {
-                    refused = Some(e);
-                    break;
+        // The plan leaves the search by the labelled break, not through a variable the next
+        // round's write to `room` could see borrowed (the borrow checker of the stable
+        // toolchain reads such a variable as live across the loop).
+        let paged = 'search: {
+            for _ in 0..24 {
+                paged_inputs.room = (room, HostRead::Given);
+                match paged_inputs.plan_mtp_with(
+                    &machine,
+                    CTX,
+                    &plan_levers(extra)?,
+                    mtp,
+                    Experts::Card,
+                ) {
+                    Ok(p)
+                        if p.plan.host.nvme_expert_bytes > 0
+                            && p.plan.host.nvme_arena_bytes > 0 =>
+                    {
+                        break 'search Some(p);
+                    }
+                    Ok(_) => room /= 2,
+                    Err(e) => {
+                        refused = Some(e);
+                        break 'search None;
+                    }
                 }
             }
-        }
+            None
+        };
         let Some(plan) = paged else {
             // The split dial gives an arena only where half the host leg lies above the floor
             // and the arena's least (`ArenaDial::peak`); the fixture's four layers, half of

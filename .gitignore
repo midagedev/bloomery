@@ -6,3 +6,6 @@ specs/handoff/
 
 tools/metal-probe/build/
 tools/metal-probe/out/
+
+# Made by tools/oxide-host.sh before a `cargo oxide` build, from the host triple's rustflags in .cargo/config.toml.
+/.cargo/cuda-oxide.toml

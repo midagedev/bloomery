@@ -115,6 +115,9 @@ const R8_PAIR_WORDS: usize = R8_PAIR / 4;
 const R8_TASKS: usize = R8_ROWS * 8;
 /// The shared group's words at [`R8_NB_MAX`].
 const R8_GROUP_WORDS_MAX: usize = R8_BLOCK_WORDS * R8_NB_MAX;
+// `ds41_r8_q3k_groups`' launch contract spells these two out: a `requires` takes integer literals, not constants.
+const _: () = assert!(R8_NB_MAX == 20);
+const _: () = assert!(R8_BLOCK_WORDS == 220);
 
 /// Byte `o` of `src`, little-endian words.
 ///
@@ -420,7 +423,7 @@ mod r8_kernels {
     #[launch_contract(
         domain = 1,
         block = (256, 1, 1),
-        requires = (nb >= 1, nb <= R8_NB_MAX, part.len() >= groups * nb * R8_BLOCK_WORDS)
+        requires = (nb >= 1, nb <= 20, part.len() >= groups * nb * 220)
     )]
     pub fn ds41_r8_q3k_groups(groups: u32, nb: u32, mut part: DisjointSlice<u32>) {
         static mut GROUP: SharedArray<u32, R8_GROUP_WORDS_MAX, 16> = SharedArray::UNINIT;

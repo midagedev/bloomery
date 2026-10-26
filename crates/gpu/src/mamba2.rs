@@ -155,8 +155,11 @@ const STAGE_T2: usize = 2 * STAGE_T * TOKEN_STAGED;
 const STAGE_ROUNDS: usize = (STAGE_T * TOKEN_STAGED).div_ceil(BLOCK);
 
 // The entries' launch attributes spell the block out as a literal, and the
-// scan and the conv are written for these widths.
+// scan and the conv are written for these widths. Their `requires` take
+// integer literals, not constants, and spell `STATE`, `CONV_TAPS`,
+// `CH_PER_BLOCK` and `RING_ROWS` as 128, 4, 16 and 11.
 const _: () = assert!(BLOCK == 128 && STATE == 128 && CONV_TAPS == 4 && CH_PER_BLOCK == 16);
+const _: () = assert!(RING_ROWS == 11);
 
 /// Whether channel `k` of the chunk exists (`chunk·16 + k < head_dim`), the
 /// compare in 32 bits: the contract holds `chunk·16 < head_dim + 16` and the
@@ -191,21 +194,21 @@ mod mamba2_kernels {
             head_dim >= 1,
             has_norm <= 1,
             n_head == per * n_group,
-            chunks * CH_PER_BLOCK >= head_dim,
-            chunks * CH_PER_BLOCK < head_dim + CH_PER_BLOCK,
-            xbc.len() >= n_head * head_dim + 2 * n_group * STATE,
+            chunks * 16 >= head_dim,
+            chunks * 16 < head_dim + 16,
+            xbc.len() >= n_head * head_dim + 2 * n_group * 128,
             dt.len() >= n_head,
             dt_bias.len() >= n_head,
             a.len() >= n_head,
             d.len() >= n_head,
             z.len() >= n_head * head_dim,
-            conv_w.len() >= CONV_TAPS * (n_head * head_dim + 2 * n_group * STATE),
-            conv_b.len() >= n_head * head_dim + 2 * n_group * STATE,
+            conv_w.len() >= 4 * (n_head * head_dim + 2 * n_group * 128),
+            conv_b.len() >= n_head * head_dim + 2 * n_group * 128,
             gain.len() >= has_norm * n_head * head_dim,
             pos.len() >= pos_at + 1,
             y.len() >= n_head * head_dim,
-            ring.len() >= RING_ROWS * (n_head * head_dim + 2 * n_group * STATE),
-            state.len() >= n_head * head_dim * STATE,
+            ring.len() >= 11 * (n_head * head_dim + 2 * n_group * 128),
+            state.len() >= n_head * head_dim * 128,
             part.len() >= n_head * chunks,
             done.len() >= has_norm * n_group
         )
@@ -530,17 +533,17 @@ mod mamba2_kernels {
             n_group >= 1,
             head_dim >= 1,
             u >= 1,
-            ld >= x0 + n_head * head_dim + 2 * n_group * STATE,
+            ld >= x0 + n_head * head_dim + 2 * n_group * 128,
             ld >= dt0 + n_head,
             rows.len() >= u * ld,
             dt_bias.len() >= n_head,
             a.len() >= n_head,
             d.len() >= n_head,
-            conv_w.len() >= CONV_TAPS * (n_head * head_dim + 2 * n_group * STATE),
-            conv_b.len() >= n_head * head_dim + 2 * n_group * STATE,
+            conv_w.len() >= 4 * (n_head * head_dim + 2 * n_group * 128),
+            conv_b.len() >= n_head * head_dim + 2 * n_group * 128,
             pos.len() >= pos_at + 1,
-            ring.len() >= RING_ROWS * (n_head * head_dim + 2 * n_group * STATE),
-            conv.len() >= u * (n_head * head_dim + 2 * n_group * STATE),
+            ring.len() >= 11 * (n_head * head_dim + 2 * n_group * 128),
+            conv.len() >= u * (n_head * head_dim + 2 * n_group * 128),
             sd.len() >= 2 * u * n_head
         )
     )]
@@ -647,15 +650,15 @@ mod mamba2_kernels {
             head_dim >= 1,
             u >= 1,
             n_head == per * n_group,
-            chunks * CH_PER_BLOCK >= head_dim,
-            chunks * CH_PER_BLOCK < head_dim + CH_PER_BLOCK,
+            chunks * 16 >= head_dim,
+            chunks * 16 < head_dim + 16,
             ld >= z0 + n_head * head_dim,
-            conv.len() >= u * (n_head * head_dim + 2 * n_group * STATE),
+            conv.len() >= u * (n_head * head_dim + 2 * n_group * 128),
             sd.len() >= 2 * u * n_head,
             d.len() >= n_head,
             rows.len() >= u * ld,
             y.len() >= u * n_head * head_dim,
-            state.len() >= n_head * head_dim * STATE
+            state.len() >= n_head * head_dim * 128
         )
     )]
     pub fn mamba2_steps(
@@ -908,7 +911,7 @@ mod mamba2_kernels {
             ld >= x0 + conv_dim,
             rows.len() >= u * ld,
             pos.len() >= pos_at + 1,
-            ring.len() >= RING_ROWS * conv_dim
+            ring.len() >= 11 * conv_dim
         )
     )]
     pub fn mamba2_ring_tail(
@@ -959,8 +962,8 @@ mod mamba2_kernels {
             head_dim >= 1,
             u >= 1,
             n_head == per * n_group,
-            chunks * CH_PER_BLOCK >= head_dim,
-            chunks * CH_PER_BLOCK < head_dim + CH_PER_BLOCK,
+            chunks * 16 >= head_dim,
+            chunks * 16 < head_dim + 16,
             gain.len() >= n_head * head_dim,
             y.len() >= u * n_head * head_dim
         )

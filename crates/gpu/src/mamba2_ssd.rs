@@ -112,7 +112,9 @@ const SH_AT: usize = XW_AT + CHUNK * XROW_W;
 const WORDS: usize = SH_AT + HEAD_DIM * ROW_W;
 
 // The kernel's fragment walk is written for these widths: four warps of two
-// 16-row slabs and two 32-channel halves, four 16-channel state slabs.
+// 16-row slabs and two 32-channel halves, four 16-channel state slabs. The
+// launch contract's `requires` take integer literals, not constants, and spell
+// `HEAD_DIM` and `STATE` as 64 and 128.
 const _: () = assert!(STATE == 128 && HEAD_DIM == 64 && CHUNK == 32 && BLOCK == 128);
 const _: () = assert!(2 * (4 * WORDS + 1024) <= 102_400 && 4 * WORDS <= 48 * 1024);
 // Every tile and padded row starts 16-byte aligned, as `ldmatrix` rows must.
@@ -172,14 +174,14 @@ mod mamba2_ssd_kernels {
             n_group >= 1,
             u >= 1,
             n_head == per * n_group,
-            ld >= z0 + n_head * HEAD_DIM,
-            conv.len() >= u * (n_head * HEAD_DIM + 2 * n_group * STATE),
+            ld >= z0 + n_head * 64,
+            conv.len() >= u * (n_head * 64 + 2 * n_group * 128),
             sd.len() >= 2 * u * n_head,
             a.len() >= n_head,
             d.len() >= n_head,
             rows.len() >= u * ld,
-            y.len() >= u * n_head * HEAD_DIM,
-            state.len() >= n_head * HEAD_DIM * STATE
+            y.len() >= u * n_head * 64,
+            state.len() >= n_head * 64 * 128
         )
     )]
     pub fn mamba2_ssd(

@@ -2452,6 +2452,11 @@ pub mod gated {
     const ROWS: usize = EXPERTS + 1;
     const EXPERTS_WIDE: usize = 32 * PER_LANE_WIDE;
     const ROWS_WIDE: usize = EXPERTS_WIDE + 1;
+    // The entries' launch contracts spell these four out: a `requires` takes integer literals, not constants.
+    const _: () = assert!(EXPERTS == 256);
+    const _: () = assert!(ROWS == 257);
+    const _: () = assert!(EXPERTS_WIDE == 512);
+    const _: () = assert!(ROWS_WIDE == 513);
 
     /// The narrow instance's row: 256 experts, `k` one to 32.
     pub const ROW: RouterInst = shape::router_row(RouterBody::Qwen35moe, 32 * PER_LANE as u32);
@@ -2526,10 +2531,10 @@ pub mod gated {
                 m_cols <= 8,
                 used >= 1,
                 used <= 32,
-                w.len() >= ROWS * k,
+                w.len() >= 257 * k,
                 x.len() >= m_cols * k,
-                logits.len() >= ROWS * m_cols,
-                probs.len() >= EXPERTS * m_cols,
+                logits.len() >= 257 * m_cols,
+                probs.len() >= 256 * m_cols,
                 ids.len() >= (used + 1) * m_cols,
                 weights.len() >= (used + 1) * m_cols,
                 done.len() >= 1
@@ -2591,10 +2596,10 @@ pub mod gated {
             domain = 1,
             block = (256, 1, 1),
             requires = (
-                k <= NORM_K,
+                k <= 2048,
                 used >= 1,
                 used <= 32,
-                w.len() >= ROWS * k,
+                w.len() >= 257 * k,
                 x.len() >= k,
                 gain.len() >= k,
                 q3.len() >= 64 * half_it,
@@ -2602,8 +2607,8 @@ pub mod gated {
                 q6.len() >= 128 * half_it,
                 s8.len() >= 8 * n_sb,
                 d8.len() >= 2 * n_sb,
-                logits.len() >= ROWS,
-                probs.len() >= EXPERTS,
+                logits.len() >= 257,
+                probs.len() >= 256,
                 ids.len() >= used + 1,
                 weights.len() >= used + 1,
                 done.len() >= 1
@@ -2698,10 +2703,10 @@ pub mod gated {
             domain = 1,
             block = (256, 1, 1),
             requires = (
-                k <= NORM_K,
+                k <= 2048,
                 used >= 1,
                 used <= 32,
-                w.len() >= ROWS * k,
+                w.len() >= 257 * k,
                 x.len() >= k,
                 gain.len() >= k,
                 q3.len() >= 64 * half_it,
@@ -2709,8 +2714,8 @@ pub mod gated {
                 q6.len() >= 128 * half_it,
                 s8.len() >= 8 * n_sb,
                 d8.len() >= 2 * n_sb,
-                logits.len() >= ROWS,
-                probs.len() >= EXPERTS,
+                logits.len() >= 257,
+                probs.len() >= 256,
                 ids.len() >= used + 1,
                 weights.len() >= used + 1,
                 done.len() >= 1
@@ -2817,10 +2822,10 @@ pub mod gated {
             requires = (
                 m_cols >= 1,
                 m_cols <= 8,
-                k <= NORM_K,
+                k <= 2048,
                 used >= 1,
                 used <= 32,
-                w.len() >= ROWS * k,
+                w.len() >= 257 * k,
                 x.len() >= m_cols * k,
                 gain.len() >= k,
                 q3.len() >= m_cols * 64 * half_it,
@@ -2828,8 +2833,8 @@ pub mod gated {
                 q6.len() >= m_cols * 128 * half_it,
                 s8.len() >= m_cols * 8 * n_sb,
                 d8.len() >= m_cols * 2 * n_sb,
-                logits.len() >= ROWS * m_cols,
-                probs.len() >= EXPERTS * m_cols,
+                logits.len() >= 257 * m_cols,
+                probs.len() >= 256 * m_cols,
                 ids.len() >= (used + 1) * m_cols,
                 weights.len() >= (used + 1) * m_cols,
                 done.len() >= 1
@@ -2936,10 +2941,10 @@ pub mod gated {
             requires = (
                 m_cols >= 1,
                 m_cols <= 8,
-                k <= NORM_K,
+                k <= 2048,
                 used >= 1,
                 used <= 32,
-                w.len() >= ROWS * k,
+                w.len() >= 257 * k,
                 x.len() >= m_cols * k,
                 gain.len() >= k,
                 q3.len() >= m_cols * 64 * half_it,
@@ -2947,8 +2952,8 @@ pub mod gated {
                 q6.len() >= m_cols * 128 * half_it,
                 s8.len() >= m_cols * 8 * n_sb,
                 d8.len() >= m_cols * 2 * n_sb,
-                logits.len() >= ROWS * m_cols,
-                probs.len() >= EXPERTS * m_cols,
+                logits.len() >= 257 * m_cols,
+                probs.len() >= 256 * m_cols,
                 ids.len() >= (used + 1) * m_cols,
                 weights.len() >= (used + 1) * m_cols,
                 done.len() >= 1
@@ -3053,9 +3058,9 @@ pub mod gated {
             block = (256, 1, 1),
             requires = (
                 n_tok >= 1,
-                w.len() >= ROWS * k,
+                w.len() >= 257 * k,
                 x.len() >= n_tok * k,
-                logits.len() >= ROWS * n_tok
+                logits.len() >= 257 * n_tok
             )
         )]
         pub fn qwen35moe_router_logits(
@@ -3098,8 +3103,8 @@ pub mod gated {
             requires = (
                 used >= 1,
                 used <= 32,
-                logits.len() >= ROWS * n_tok,
-                probs.len() >= EXPERTS * n_tok,
+                logits.len() >= 257 * n_tok,
+                probs.len() >= 256 * n_tok,
                 ids.len() >= (used + 1) * n_tok,
                 weights.len() >= (used + 1) * n_tok
             )
@@ -3156,10 +3161,10 @@ pub mod gated {
                 m_cols <= 8,
                 used >= 1,
                 used <= 32,
-                w.len() >= ROWS_WIDE * k,
+                w.len() >= 513 * k,
                 x.len() >= m_cols * k,
-                logits.len() >= ROWS_WIDE * m_cols,
-                probs.len() >= EXPERTS_WIDE * m_cols,
+                logits.len() >= 513 * m_cols,
+                probs.len() >= 512 * m_cols,
                 ids.len() >= (used + 1) * m_cols,
                 weights.len() >= (used + 1) * m_cols,
                 done.len() >= 1
@@ -3225,10 +3230,10 @@ pub mod gated {
                 m_cols <= 8,
                 used >= 1,
                 used <= 32,
-                2 * w.len() >= ROWS_WIDE * k,
+                2 * w.len() >= 513 * k,
                 x.len() >= m_cols * k,
-                logits.len() >= ROWS_WIDE * m_cols,
-                probs.len() >= EXPERTS_WIDE * m_cols,
+                logits.len() >= 513 * m_cols,
+                probs.len() >= 512 * m_cols,
                 ids.len() >= (used + 1) * m_cols,
                 weights.len() >= (used + 1) * m_cols,
                 done.len() >= 1
@@ -3291,10 +3296,10 @@ pub mod gated {
                 m_cols <= 8,
                 used >= 1,
                 used <= 32,
-                2 * w.len() >= ROWS_WIDE * k,
+                2 * w.len() >= 513 * k,
                 x.len() >= m_cols * k,
-                logits.len() >= ROWS_WIDE * m_cols,
-                probs.len() >= EXPERTS_WIDE * m_cols,
+                logits.len() >= 513 * m_cols,
+                probs.len() >= 512 * m_cols,
                 ids.len() >= (used + 1) * m_cols,
                 weights.len() >= (used + 1) * m_cols,
                 done.len() >= 1
@@ -3354,9 +3359,9 @@ pub mod gated {
             block = (256, 1, 1),
             requires = (
                 n_tok >= 1,
-                w.len() >= ROWS_WIDE * k,
+                w.len() >= 513 * k,
                 x.len() >= n_tok * k,
-                logits.len() >= ROWS_WIDE * n_tok
+                logits.len() >= 513 * n_tok
             )
         )]
         pub fn qwen35moe_router_logits_512(
@@ -3398,9 +3403,9 @@ pub mod gated {
             block = (256, 1, 1),
             requires = (
                 n_tok >= 1,
-                2 * w.len() >= ROWS_WIDE * k,
+                2 * w.len() >= 513 * k,
                 x.len() >= n_tok * k,
-                logits.len() >= ROWS_WIDE * n_tok
+                logits.len() >= 513 * n_tok
             )
         )]
         pub fn qwen35moe_router_logits_512_bf16(
@@ -3442,9 +3447,9 @@ pub mod gated {
             block = (256, 1, 1),
             requires = (
                 n_tok >= 1,
-                2 * w.len() >= ROWS_WIDE * k,
+                2 * w.len() >= 513 * k,
                 x.len() >= n_tok * k,
-                logits.len() >= ROWS_WIDE * n_tok
+                logits.len() >= 513 * n_tok
             )
         )]
         pub fn qwen35moe_router_logits_512_bf16_mma(
@@ -3488,8 +3493,8 @@ pub mod gated {
             requires = (
                 used >= 1,
                 used <= 32,
-                logits.len() >= ROWS_WIDE * n_tok,
-                probs.len() >= EXPERTS_WIDE * n_tok,
+                logits.len() >= 513 * n_tok,
+                probs.len() >= 512 * n_tok,
                 ids.len() >= (used + 1) * n_tok,
                 weights.len() >= (used + 1) * n_tok
             )
