@@ -22,6 +22,14 @@ name = "gate_metal_qwen35moe_e2e"
 path = "src/bin/gate_metal_qwen35moe_e2e.rs"
 
 [[bin]]
+name = "gate_metal_nemotron_kernels"
+path = "src/bin/gate_metal_nemotron_kernels.rs"
+
+[[bin]]
+name = "gate_metal_nemotron_e2e"
+path = "src/bin/gate_metal_nemotron_e2e.rs"
+
+[[bin]]
 name = "metal_matvec_time"
 path = "src/bin/metal_matvec_time.rs"
 
