@@ -654,10 +654,11 @@ fn fixture_clause(h: &Harness<'_>, fx: &fixture::Fixture) -> Clause {
         parts.push(format!("ssm_in {what} {worst:.3}"));
     }
 
-    let g12 = fx.f32s("blk.12.attn_norm.weight", cols)?;
-    let q = fx.rows("blk.12.attn_q.weight", quant, cols, 5_120)?;
-    let k = fx.rows("blk.12.attn_k.weight", quant, cols, 1_024)?;
-    let v = fx.rows("blk.12.attn_v.weight", quant, cols, 1_024)?;
+    // Fixture layer 2 holds the source file's attention layer 12.
+    let g12 = fx.f32s("blk.2.attn_norm.weight", cols)?;
+    let q = fx.rows("blk.2.attn_q.weight", quant, cols, 5_120)?;
+    let k = fx.rows("blk.2.attn_k.weight", quant, cols, 1_024)?;
+    let v = fx.rows("blk.2.attn_v.weight", quant, cols, 1_024)?;
     seg_against_alone(
         h,
         quant,
