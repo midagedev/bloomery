@@ -1,8 +1,7 @@
 //! The synthetic quantized weights a probe or a clause builds when the
 //! fixture's own tensors are not what it wants: random blocks with the
 //! scales (and the mins, the biases) small and finite, so a kernel's
-//! finiteness checks take them. `metal_matvec_time` holds its own copy of
-//! this builder; this module is the one later bins share.
+//! finiteness checks take them.
 
 use bloomery_metal::kernels::Quant;
 
