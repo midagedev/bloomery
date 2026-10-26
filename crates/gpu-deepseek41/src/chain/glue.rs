@@ -1874,7 +1874,7 @@ mod tests {
                 .expect("embed launch");
             }
             let got = streams.to_host_vec(stream).expect("streams");
-            for (s, got) in got.chunks_exact(N).enumerate() {
+            for (s, got) in got.as_chunks::<N>().0.iter().enumerate() {
                 failures.extend(differs(got, &want).map(|d| format!("{embd:?} stream {s}: {d}")));
             }
             let got = input.to_host_vec(stream).expect("input");
@@ -1887,7 +1887,7 @@ mod tests {
             let mut want = vec![0f32; ROWS * KEY_LEN];
             for (b, w) in bytes
                 .chunks_exact(row_bytes)
-                .zip(want.chunks_exact_mut(KEY_LEN))
+                .zip(want.as_chunks_mut::<KEY_LEN>().0)
             {
                 dequant_row(ty, b, w).expect("the file decode");
             }

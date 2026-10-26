@@ -2271,7 +2271,8 @@ mod tests {
                 &none,
             );
         }
-        for ty in [GgmlType::BF16] {
+        {
+            let ty = GgmlType::BF16;
             check(
                 format!("head {ty}"),
                 global("output.weight", Role::Head, ty),

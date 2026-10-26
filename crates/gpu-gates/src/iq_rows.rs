@@ -147,7 +147,7 @@ pub fn ref_dequant(fmt: IqFormat, bytes: &[u8], out: &mut [f32]) -> Result<(), Q
     let half = |b: &[u8], at: usize| half_to_f32(u16::from_le_bytes([b[at], b[at + 1]]));
     match fmt {
         IqFormat::Iq2S => {
-            for (blk, y) in bytes.chunks_exact(bb).zip(out.chunks_exact_mut(256)) {
+            for (blk, y) in bytes.chunks_exact(bb).zip(out.as_chunks_mut::<256>().0) {
                 let d = half(blk, 0);
                 for ib32 in 0..8 {
                     let sc = blk[74 + ib32];
@@ -174,7 +174,7 @@ pub fn ref_dequant(fmt: IqFormat, bytes: &[u8], out: &mut [f32]) -> Result<(), Q
             Ok(())
         }
         IqFormat::Iq1S => {
-            for (blk, y) in bytes.chunks_exact(bb).zip(out.chunks_exact_mut(256)) {
+            for (blk, y) in bytes.chunks_exact(bb).zip(out.as_chunks_mut::<256>().0) {
                 let d = half(blk, 0);
                 for ib in 0..8 {
                     let qh = u16::from_le_bytes([blk[34 + 2 * ib], blk[35 + 2 * ib]]);
@@ -193,7 +193,7 @@ pub fn ref_dequant(fmt: IqFormat, bytes: &[u8], out: &mut [f32]) -> Result<(), Q
             Ok(())
         }
         IqFormat::Iq1M => {
-            for (blk, y) in bytes.chunks_exact(bb).zip(out.chunks_exact_mut(256)) {
+            for (blk, y) in bytes.chunks_exact(bb).zip(out.as_chunks_mut::<256>().0) {
                 let sc: [u16; 4] =
                     std::array::from_fn(|i| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]));
                 // The C's expression, not the card rule's `iq1m_scale_bits`.

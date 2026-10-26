@@ -851,7 +851,7 @@ impl Iq1m {
     /// The grid entry of group `l` of sub-block `sub`, and whether its delta is negative.
     fn group(blk: &[u8], sub: usize, l: usize) -> (usize, bool) {
         let h = blk[32 + 2 * sub + l / 2];
-        let (high, flag) = if l % 2 == 0 {
+        let (high, flag) = if l.is_multiple_of(2) {
             (h & 0x07, 0x08)
         } else {
             ((h >> 4) & 0x07, 0x80)

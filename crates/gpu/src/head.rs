@@ -656,7 +656,7 @@ mod tests {
     fn q5k_rows(rows: usize, k: usize) -> Vec<u8> {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut out = vec![0u8; rows * (k / 256) * Q5K_BLOCK];
-        for block in out.chunks_exact_mut(Q5K_BLOCK) {
+        for block in out.as_chunks_mut::<Q5K_BLOCK>().0 {
             for chunk in block.chunks_mut(8) {
                 let v = next(&mut state).to_le_bytes();
                 chunk.copy_from_slice(&v[..chunk.len()]);
