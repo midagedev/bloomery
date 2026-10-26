@@ -15,7 +15,7 @@
 # Mainline is not rebuilt.
 # BLOOMERY_TIER=fixture dumps the profile's set on its fixture file (ref-paths.sh: the model is its first shard): the set
 # is its real twin's name behind `fx_` (fixture_dump_tier) and carries the file's `# fixture` line (fixture_line), which
-# nemotron_ref writes beside `# model`. The Bolt's fixture is fx_ref-nemotron-moe-logits; the Nano has no fixture tier.
+# nemotron_ref writes beside `# model`. The Nano's fixture set is fx_ref-nemotron-logits, the Bolt's fx_ref-nemotron-moe-logits.
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
@@ -32,10 +32,6 @@ esac
 CTX=4096
 PROMPTS=(code5 code29 code4096 prose1 prose64 prose255 prose256 prose257 prose512 prose1024)
 fixture_dump_tier dump-nemotron.sh
-if [ -n "$SET_PREFIX" ] && [ "$MODEL_NAME" != nemotron_h_moe ]; then
-  echo "dump-nemotron: BLOOMERY_TIER=fixture: $SET_NAME has no fixture twin (crates/refset names only the Bolt's, fx_ref-nemotron-moe-logits) (exit 66)" >&2
-  exit 66
-fi
 SET_NAME=$SET_PREFIX$SET_NAME
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SRC=$HERE/tools/ref/nemotron_ref.cpp
