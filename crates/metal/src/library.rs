@@ -98,14 +98,26 @@ const HOST_BUILT: &Built = match built_of(&HOST) {
 
 /// The kernels' source of the host's instance ([`HOST`]), with the fault
 /// site's table and its geometry in front of them: the text the kernel gate
-/// edits its mutants into.
+/// edits its mutants into. A shim: the build's host instance's
+/// ([`sources_of`]). Callers left: the kernel gate, the probes and the
+/// gates' shared mutants.
 pub const SOURCE: &str = HOST_BUILT.source;
 
 /// The tensor-op GEMMs' source of the host's instance
 /// (`kernels/gemm_tensor.metal` after the files it reads), with the same
 /// header in front: the text the runtime compiles at Metal 4, and the text
-/// the kernel gate edits its tensor mutants into.
+/// the kernel gate edits its tensor mutants into. A shim: the build's host
+/// instance's ([`sources_of`]). Callers left: the e2e and kernel gates, the
+/// probes and the gates' shared mutants.
 pub const TENSOR_SOURCE: &str = HOST_BUILT.tensor;
+
+/// The kernels' source and the tensor-op GEMMs' source of `inst`, in that
+/// order, each with the fault site's table and the instance's geometry in
+/// front of it; the named refusal of an instance `build.rs` did not write.
+pub fn sources_of(inst: &Instance) -> Result<(&'static str, &'static str), DeviceError> {
+    let built = sources(inst)?;
+    Ok((built.source, built.tensor))
+}
 
 /// The sources of `inst`, or the named refusal of an instance `build.rs` did
 /// not write.
@@ -582,6 +594,8 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geom::Geometry;
+    use crate::instance::REGISTERED;
 
     fn units(architecture: &str, metal4: bool) -> MatrixUnits {
         MatrixUnits {
@@ -604,5 +618,59 @@ mod tests {
         assert_eq!(units("applegpu", true).generation(), None);
         assert_eq!(units("applegpu", true).path(), GemmPath::Simdgroup);
         assert_eq!(units("applegpu_g17s", true).generation(), Some((17, 's')));
+    }
+
+    #[test]
+    fn the_header_is_the_geometry() {
+        for inst in REGISTERED {
+            let g = Geometry::of(inst);
+            let (source, tensor) = sources_of(inst).expect("a registered instance has sources");
+            let defines: [(&str, usize); 24] = [
+                ("BLOOMERY_DELTA_VALUE_HEADS", g.delta.value_heads),
+                ("BLOOMERY_DELTA_HEAD_COLS", g.delta.head_cols),
+                ("BLOOMERY_DELTA_RING_ROWS", g.delta.ring_rows),
+                ("BLOOMERY_ROUTER_ROWS", g.router.rows),
+                ("BLOOMERY_ROUTER_EXPERTS", g.router.experts),
+                ("BLOOMERY_ROUTER_K", g.router.k),
+                ("BLOOMERY_ROUTER_FLOAT4S", g.router.float4s),
+                ("BLOOMERY_ROUTER_TOPK_MAX", g.router.top_k_max),
+                ("BLOOMERY_ROUTER_SHARED", g.router.shared),
+                ("BLOOMERY_EXPERT_SLOTS", g.experts.slots),
+                ("BLOOMERY_EXPERT_ROUTED", g.experts.routed_ids),
+                ("BLOOMERY_EXPERT_SHARED", g.experts.shared_slot),
+                ("BLOOMERY_EXPERT_K", g.experts.k),
+                ("BLOOMERY_ATTN_HEAD", g.attn.head),
+                ("BLOOMERY_ATTN_ROT", g.attn.rot),
+                ("BLOOMERY_ATTN_Q", g.attn.query_heads),
+                ("BLOOMERY_ATTN_KV", g.attn.kv_heads),
+                ("BLOOMERY_ATTN_SG", g.attn.simd_groups),
+                ("BLOOMERY_ATTN_GQA", g.attn.gqa),
+                ("BLOOMERY_ATTN_PARTIAL", g.attn.partial_elems),
+                ("BLOOMERY_ATTN_QG", g.attn.qg_stride),
+                ("BLOOMERY_ATTN_THREADS", g.attn.flash_threads),
+                ("BLOOMERY_ATTN_LANE_DIMS", g.attn.lane_dims),
+                ("BLOOMERY_ATTN_GATED", usize::from(g.attn.gated)),
+            ];
+            for (name, want) in defines {
+                assert_eq!(
+                    define_of(source, name),
+                    Some(want),
+                    "{}: {name} in the kernels' source",
+                    inst.name
+                );
+                assert_eq!(
+                    define_of(tensor, name),
+                    Some(want),
+                    "{}: {name} in the tensor-op source",
+                    inst.name
+                );
+            }
+            assert_eq!(
+                define_of(source, "BLOOMERY_DELTA_COLS_PER_BLOCK"),
+                Some(g.delta.head_cols / crate::geometry::PARTIALS_PER_HEAD),
+                "{}: BLOOMERY_DELTA_COLS_PER_BLOCK",
+                inst.name
+            );
+        }
     }
 }

@@ -76,6 +76,16 @@ mod attention_geom {
     include!("src/kernels/attention_geom.rs");
 }
 
+/// The launch geometry of one instance, from the file the host module reads:
+/// the header is written from the same struct the launches read.
+#[allow(
+    dead_code,
+    reason = "the host module reads every field; the header emits the ones the kernels read"
+)]
+mod geom {
+    include!("src/kernels/geom.rs");
+}
+
 /// The fault site's table, written as the Metal compiler sees it.
 fn fault_sites_header() -> String {
     let mut out = String::from(
@@ -103,11 +113,11 @@ fn fault_sites_header() -> String {
 }
 
 /// The launch geometry of `inst`, written as the Metal compiler sees it.
-/// Each number has one owner: the instance's row, or the geometry file's
-/// constant or rule that the host module reads at its own instance.
-fn geometry_header(inst: &instance::Instance) -> String {
-    let key = &inst.key;
-    let delta = inst.delta_built();
+/// Every instance-derived number is a field of `inst`'s [`geom::Geometry`],
+/// the struct the host's launches read; the instance-free ones are the
+/// geometry files' constants.
+fn geometry_header(inst: &'static instance::Instance) -> String {
+    let g = geom::Geometry::of(inst);
     format!(
         "// The mat-vec launch geometry, from src/kernels/geometry.rs.\n\
          #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {rows}\n\
@@ -157,39 +167,39 @@ fn geometry_header(inst: &instance::Instance) -> String {
          #define BLOOMERY_ATTN_PF_PAD {apfpad}\n",
         rows = geometry::ROWS_PER_SIMD_GROUP,
         segs = geometry::MAX_SEGMENTS,
-        heads = delta.value_heads,
-        cols = delta.head_cols,
+        heads = g.delta.value_heads,
+        cols = g.delta.head_cols,
         blocks = geometry::PARTIALS_PER_HEAD,
-        per = delta.head_cols as usize / geometry::PARTIALS_PER_HEAD,
-        ring = delta_geom::ring_rows(delta.conv_taps as usize),
+        per = g.delta.head_cols / geometry::PARTIALS_PER_HEAD,
+        ring = g.delta.ring_rows,
         snaps = delta_geom::SNAPS,
-        rrows = router_geom::rows(inst),
-        rexperts = key.moe.router.experts,
-        rk = key.hidden,
+        rrows = g.router.rows,
+        rexperts = g.router.experts,
+        rk = g.router.k,
         rsplit = router_geom::SPLIT,
         rsg = router_geom::SIMD_GROUPS,
-        rfloat4 = router_geom::float4s(key.hidden as usize),
-        rtop = key.moe.top_k,
+        rfloat4 = g.router.float4s,
+        rtop = g.router.top_k_max,
         rlanes = router_geom::SIMD_WIDTH,
-        rshared = u32::from(key.moe.router.rule.gated),
-        eslots = experts_geom::slots(inst),
-        erouted = key.moe.top_k,
-        eshared = experts_geom::shared_slot(inst),
-        ek = key.moe.expert_ff,
-        ahead = key.attn.row.head,
-        arot = key.attn.rot,
-        aq = key.attn.n_head,
-        akv = key.attn.n_kv,
+        rshared = g.router.shared,
+        eslots = g.experts.slots,
+        erouted = g.experts.routed_ids,
+        eshared = g.experts.shared_slot,
+        ek = g.experts.k,
+        ahead = g.attn.head,
+        arot = g.attn.rot,
+        aq = g.attn.query_heads,
+        akv = g.attn.kv_heads,
         atile = attention_geom::TILE,
-        asg = attention_geom::simd_groups(inst),
+        asg = g.attn.simd_groups,
         ahpt = attention_geom::HEADS_PER_SG,
-        agqa = attention_geom::gqa(inst),
-        apartial = attention_geom::partial_elems(key.attn.row.head as usize),
-        aqg = attention_geom::qg_stride(inst),
+        agqa = g.attn.gqa,
+        apartial = g.attn.partial_elems,
+        aqg = g.attn.qg_stride,
         alanes = attention_geom::SIMD_WIDTH,
-        athreads = attention_geom::flash_threads(inst),
-        alanedims = attention_geom::lane_dims(inst),
-        agated = u32::from(key.attn.q_gate),
+        athreads = g.attn.flash_threads,
+        alanedims = g.attn.lane_dims,
+        agated = u32::from(g.attn.gated),
         asegcap = attention_geom::SEGMENT_CAP,
         apfpos = attention_geom::PREFILL_POSITIONS,
         apfkeys = attention_geom::PREFILL_KEYS,
@@ -271,6 +281,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/kernels/router_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/experts_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/attention_geom.rs");
+    println!("cargo:rerun-if-changed=src/kernels/geom.rs");
     println!("cargo:rerun-if-changed=src/instance.rs");
     println!("cargo:rerun-if-changed=build.rs");
     // Installing the Metal Toolchain (or pointing at another one) changes

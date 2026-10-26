@@ -16,8 +16,9 @@ use crate::fault::MetalFaultWord;
 use super::geometry::ROWS_PER_SIMD_GROUP;
 use super::{Kernels, Quant, args_bytes, check_window_len, pack, word};
 
-/// The columns of every row of the host instance's head: its hidden width.
-/// A launch takes any positive multiple of the type's block values.
+/// The columns of every row of the head: the hidden width (`Geometry::hidden`).
+/// A launch takes any positive multiple of the type's block values. A shim:
+/// the build's host instance's. Callers left: the kernel gate and the probes.
 pub const HEAD_K: usize = crate::instance::HOST.key.hidden as usize;
 
 /// The SIMD groups in the head's threadgroup.

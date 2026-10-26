@@ -1,7 +1,7 @@
 //! `metal_scan` — the Metal move proof's pipeline hash and the two compares
 //! (`just metal-compare`, owner `tools/metal-compare.sh`).
 //!
-//!     metal_scan [--out FILE] [--keep DIR]
+//!     metal_scan [--instance NAME] [--out FILE] [--keep DIR]
 //!     metal_scan --compare BASE.tsv HEAD.tsv
 //!     metal_scan --compare-trace BASE.txt HEAD.txt
 //!
@@ -44,6 +44,10 @@
 //! exit 1, and so is a library that is the build's metallib: the calibration
 //! compiles the run-time source, so it must be what runs.
 //!
+//! `--instance NAME` scans one registered instance's kernels (default: the
+//! build's host instance); a name that is not registered is exit 64, naming
+//! the registered ones.
+//!
 //! `--keep DIR` keeps each serialized archive as `DIR/<lib>-<entry>-<constants>.bin`, for
 //! reading what differs between two runs.
 //!
@@ -63,7 +67,7 @@
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-metal_scan [--out FILE] [--keep DIR]
+metal_scan [--instance NAME] [--out FILE] [--keep DIR]
 metal_scan --compare BASE.tsv HEAD.tsv
 metal_scan --compare-trace BASE.txt HEAD.txt";
 
@@ -121,25 +125,39 @@ fn main() -> ExitCode {
 fn scan(args: &[String]) -> ExitCode {
     let mut out = None;
     let mut keep = None;
+    let mut instance = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let slot = match a.as_str() {
             "--out" => &mut out,
             "--keep" => &mut keep,
+            "--instance" => &mut instance,
             other => {
                 eprintln!("metal_scan: {other} is not a flag of this tool\n{USAGE}");
                 return ExitCode::from(64);
             }
         };
         match it.next() {
-            Some(v) => *slot = Some(std::path::PathBuf::from(v)),
+            Some(v) => *slot = Some(v.clone()),
             None => {
                 eprintln!("metal_scan: {a} needs a value\n{USAGE}");
                 return ExitCode::from(64);
             }
         }
     }
-    match mac::run(out.as_deref(), keep.as_deref()) {
+    let inst = match instance.as_deref().map(mac::instance_named) {
+        None => &bloomery_metal::instance::HOST,
+        Some(Ok(inst)) => inst,
+        Some(Err(e)) => {
+            eprintln!("metal_scan: {e}\n{USAGE}");
+            return ExitCode::from(64);
+        }
+    };
+    let (out, keep) = (
+        out.map(std::path::PathBuf::from),
+        keep.map(std::path::PathBuf::from),
+    );
+    match mac::run(inst, out.as_deref(), keep.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("metal_scan: {e}");
@@ -160,9 +178,9 @@ mod mac {
     use std::path::Path;
 
     use bloomery_metal::device::MetalDevice;
-    use bloomery_metal::instance::HOST;
+    use bloomery_metal::instance::{Instance, REGISTERED};
     use bloomery_metal::kernels::Kernels;
-    use bloomery_metal::library::{GemmPath, Library, LibraryPath, SOURCE, TENSOR_SOURCE};
+    use bloomery_metal::library::{GemmPath, Library, LibraryPath, sources_of};
     use bloomery_metal::scan::{self, Built};
     use gguf::digest::sha256_hex;
     use objc2::runtime::ProtocolObject;
@@ -450,8 +468,28 @@ kernel void bloomery_scan_calibration(device float * x [[buffer(0)]], uint i [[t
         ))
     }
 
-    pub(super) fn run(out: Option<&Path>, keep: Option<&Path>) -> Result<(), String> {
-        let device = MetalDevice::open(&HOST).map_err(|e| e.to_string())?;
+    /// The registered instance named `name`, or the refusal naming every
+    /// registered one.
+    pub(super) fn instance_named(name: &str) -> Result<&'static Instance, String> {
+        REGISTERED
+            .iter()
+            .find(|inst| inst.name == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = REGISTERED.iter().map(|inst| inst.name).collect();
+                format!(
+                    "{name} is not a registered instance (registered: {})",
+                    names.join(", ")
+                )
+            })
+    }
+
+    pub(super) fn run(
+        inst: &'static Instance,
+        out: Option<&Path>,
+        keep: Option<&Path>,
+    ) -> Result<(), String> {
+        let device = MetalDevice::open(inst).map_err(|e| e.to_string())?;
+        let (source, tensor_source) = sources_of(inst).map_err(|e| e.to_string())?;
         if device.library().path() != LibraryPath::Source {
             return Err(
                 "the library is the build's metallib (the Metal Toolchain is installed): the calibration compiles the run-time source, so the scan would not be of what runs"
@@ -464,13 +502,13 @@ kernel void bloomery_scan_calibration(device float * x [[buffer(0)]], uint i [[t
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         let main = device.library().with_simdgroup_gemms();
-        let tensor = Library::tensor_from_source_text(&device, TENSOR_SOURCE)
+        let tensor = Library::tensor_from_source_text(&device, tensor_source)
             .map_err(|e| format!("the tensor-op library: {e}"))?;
         let real = archives(&device, &main, &tensor, &scratch)?;
-        let main_c = Library::from_source_text(&device, &format!("{SOURCE}{CALIBRATION}"))
+        let main_c = Library::from_source_text(&device, &format!("{source}{CALIBRATION}"))
             .map_err(|e| format!("the calibration library: {e}"))?;
         let tensor_c =
-            Library::tensor_from_source_text(&device, &format!("{TENSOR_SOURCE}{CALIBRATION}"))
+            Library::tensor_from_source_text(&device, &format!("{tensor_source}{CALIBRATION}"))
                 .map_err(|e| format!("the calibration tensor-op library: {e}"))?;
         let twin = archives(&device, &main_c, &tensor_c, &scratch)?;
         std::fs::remove_dir(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
@@ -540,8 +578,9 @@ kernel void bloomery_scan_calibration(device float * x [[buffer(0)]], uint i [[t
             "MTLBinaryArchive of one function (descriptor defaults), serializeToURL; the library's identity is zeroed (the 64-hex module signature, the module UUID, the GPU slice's LC_UUID: stripped_bytes) and checked against a build of the library with one unused kernel appended; sha256 of the rest, code_sha256 of its GPU-code slice"
                 .to_string(),
         );
-        head("source_sha256_main", sha256_hex(SOURCE.as_bytes()));
-        head("source_sha256_tensor", sha256_hex(TENSOR_SOURCE.as_bytes()));
+        head("instance", inst.name.to_string());
+        head("source_sha256_main", sha256_hex(source.as_bytes()));
+        head("source_sha256_tensor", sha256_hex(tensor_source.as_bytes()));
         text.push_str(&format!("{}\n", super::COLUMNS.join("\t")));
         text.push_str(&rows);
         match out {
@@ -551,6 +590,22 @@ kernel void bloomery_scan_calibration(device float * x [[buffer(0)]], uint i [[t
             None => print!("{text}"),
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod instance_tests {
+        use super::*;
+
+        #[test]
+        fn an_instance_is_named_by_the_registry() {
+            for inst in REGISTERED {
+                assert_eq!(instance_named(inst.name), Ok(inst));
+            }
+            let refused = instance_named("no_such_instance").expect_err("no such instance");
+            for inst in REGISTERED {
+                assert!(refused.contains(inst.name), "{refused}");
+            }
+        }
     }
 }
 

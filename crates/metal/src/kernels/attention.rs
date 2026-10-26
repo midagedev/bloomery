@@ -1,12 +1,11 @@
-//! The launch of decode GQA attention at the host instance's geometry
-//! ([`QUERY_HEADS`] query heads over [`KV_HEADS`] key heads, [`HEAD_DIM`]
-//! values a head). One threadgroup is one key head and one segment of eight
-//! SIMD groups, one query head a group, the keys streamed from the cache
-//! into registers.
+//! The launch of decode GQA attention at the library's instance geometry
+//! (`AttnGeom`: its query heads over its key heads, its values a head). One
+//! threadgroup is one key head and one segment of eight SIMD groups, one
+//! query head a group, the keys streamed from the cache into registers.
 //!
 //! One segment is the flash: it normalizes, applies the gate when the
-//! layer's query carries one ([`QG_STRIDE`] is twice the head) and writes the
-//! output. More than one writes partials, and the dispatch's last
+//! layer's query carries one (`AttnGeom::qg_stride` is twice the head) and
+//! writes the output. More than one writes partials, and the dispatch's last
 //! threadgroup — the ticket's — folds them, applies the gate and writes the
 //! output in the same launch. The ticket is one word the caller holds
 //! zeroed; the fold resets it, so the next launch finds it zero. There is
@@ -32,14 +31,13 @@ use crate::library::{Library, Pipeline};
 
 use super::rows::check_strided;
 use super::{Kernels, args_bytes, check_window_len, pack, word};
+use crate::geom::{AttnGeom, HOST_GEOMETRY};
 
-use super::attention_geom::{
-    FLASH_THREADS, PARTIAL_ELEMS, PREFILL_POSITIONS, PREFILL_THREADS, SIMD_WIDTH,
-};
 pub use super::attention_geom::{
     HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP, SEGMENT_KEYS, TILE,
     segments_for_keys,
 };
+use super::attention_geom::{PREFILL_POSITIONS, PREFILL_THREADS, SIMD_WIDTH};
 
 /// The f16 cache or the q8_0 planes a launch reads and appends.
 pub enum AttnCache<'w> {
@@ -66,14 +64,15 @@ pub enum AttnCache<'w> {
 /// One attention launch. A key count of 0 or past `ctx`, and an append
 /// position at or past `ctx`, are the kernel's faults, not refusals.
 ///
-/// `q` is `[query heads, QG_STRIDE]`: the query, then the gate when the
+/// `q` is `[query heads, qg_stride]`: the query, then the gate when the
 /// layer has one, per head.
 pub struct AttentionParams<'w> {
-    /// Head dimension. The kernel takes [`HEAD_DIM`].
+    /// Head dimension. The kernel takes the instance's (`AttnGeom::head`).
     pub head_dim: usize,
-    /// Query heads. The kernel takes [`QUERY_HEADS`].
+    /// Query heads. The kernel takes the instance's (`AttnGeom::query_heads`).
     pub query_heads: usize,
-    /// Key and value heads. The kernel takes [`KV_HEADS`].
+    /// Key and value heads. The kernel takes the instance's
+    /// (`AttnGeom::kv_heads`).
     pub kv_heads: usize,
     /// Split-K segments. One finishes in the flash.
     pub segments: usize,
@@ -87,24 +86,25 @@ pub struct AttentionParams<'w> {
     pub pos: u32,
     /// Live key count, including the appended row when it is live.
     pub n_keys: u32,
-    /// The query projection, [`qg_len`] elements: query, then any gate, per
-    /// head.
+    /// The query projection, `AttnGeom::qg_len` elements: query, then any
+    /// gate, per head.
     pub q: Window<'w, f32, MetalDevice>,
     /// Keys, one raw row per key head.
     pub k: Window<'w, f32, MetalDevice>,
     /// Values, one raw row per key head.
     pub v: Window<'w, f32, MetalDevice>,
-    /// Query RMS gain, [`HEAD_DIM`] values.
+    /// Query RMS gain, one value per head value.
     pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, [`HEAD_DIM`] values.
+    /// Key RMS gain, one value per head value.
     pub k_gain: Window<'w, f32, MetalDevice>,
-    /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
+    /// Rope table, `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`
+    /// pairs.
     pub rope: Window<'w, f32, MetalDevice>,
     /// The cache the launch reads and appends.
     pub cache: AttnCache<'w>,
-    /// Segment partials, [`partials_len`] elements.
+    /// Segment partials, `AttnGeom::partials_len` elements.
     pub partials: WindowMut<'w, f32, MetalDevice>,
-    /// The layer output, [`out_len`] elements, after any gate.
+    /// The layer output, `AttnGeom::out_len` elements, after any gate.
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// The fault word.
     pub fault: &'w MetalFaultWord,
@@ -113,42 +113,90 @@ pub struct AttentionParams<'w> {
     pub ticket: WindowMut<'w, u32, MetalDevice>,
 }
 
-/// The partial buffer's length: one partial per head and segment.
+impl AttnGeom {
+    /// The partial buffer's length: one partial per head and segment.
+    #[must_use]
+    pub fn partials_len(&self, segments: usize) -> Option<usize> {
+        self.query_heads
+            .checked_mul(segments)?
+            .checked_mul(self.partial_elems)
+    }
+
+    /// The attention output's length.
+    #[must_use]
+    pub fn out_len(&self) -> Option<usize> {
+        self.query_heads.checked_mul(self.head)
+    }
+
+    /// The query projection's length: the query and any gate, per head.
+    #[must_use]
+    pub fn qg_len(&self) -> Option<usize> {
+        self.query_heads.checked_mul(self.qg_stride)
+    }
+
+    /// f16 cache rows, `kv * ctx * head` bits.
+    #[must_use]
+    pub fn f16_len(&self, ctx: usize) -> Option<usize> {
+        self.kv_heads.checked_mul(ctx)?.checked_mul(self.head)
+    }
+
+    /// q8_0 code words per cache, `kv * ctx * head / 4`.
+    #[must_use]
+    pub fn q8_code_len(&self, ctx: usize) -> Option<usize> {
+        self.kv_heads.checked_mul(ctx)?.checked_mul(self.head / 4)
+    }
+
+    /// q8_0 scales per cache, `kv * ctx * head / 32`.
+    #[must_use]
+    pub fn q8_scale_len(&self, ctx: usize) -> Option<usize> {
+        self.kv_heads.checked_mul(ctx)?.checked_mul(self.head / 32)
+    }
+}
+
+/// The partial buffer's length: one partial per head and segment. A shim: the
+/// build's host instance's (`AttnGeom::partials_len`). Callers left: the arch,
+/// the kernel gate and the probes.
 #[must_use]
 pub fn partials_len(segments: usize) -> Option<usize> {
-    QUERY_HEADS
-        .checked_mul(segments)?
-        .checked_mul(PARTIAL_ELEMS)
+    HOST_GEOMETRY.attn.partials_len(segments)
 }
 
-/// The attention output's length.
+/// The attention output's length. A shim: the build's host instance's
+/// (`AttnGeom::out_len`). Callers left: the arch, the kernel gate and the
+/// probes.
 #[must_use]
 pub fn out_len() -> Option<usize> {
-    QUERY_HEADS.checked_mul(HEAD_DIM)
+    HOST_GEOMETRY.attn.out_len()
 }
 
-/// The query projection's length: the query and any gate, per head.
+/// The query projection's length: the query and any gate, per head. A shim:
+/// the build's host instance's (`AttnGeom::qg_len`). Callers left: the arch,
+/// the kernel gate and the probes.
 #[must_use]
 pub fn qg_len() -> Option<usize> {
-    QUERY_HEADS.checked_mul(QG_STRIDE)
+    HOST_GEOMETRY.attn.qg_len()
 }
 
-/// f16 cache rows, `kv * ctx * head` bits.
+/// f16 cache rows, `kv * ctx * head` bits. A shim: the build's host
+/// instance's (`AttnGeom::f16_len`). Callers left: the arch, the kernel gate
+/// and the probes.
 #[must_use]
 pub fn f16_len(ctx: usize) -> Option<usize> {
-    KV_HEADS.checked_mul(ctx)?.checked_mul(HEAD_DIM)
+    HOST_GEOMETRY.attn.f16_len(ctx)
 }
 
-/// q8_0 code words per cache, `kv * ctx * head / 4`.
+/// q8_0 code words per cache, `kv * ctx * head / 4`. A shim: the build's host
+/// instance's (`AttnGeom::q8_code_len`). Callers left: the kernel gate.
 #[must_use]
 pub fn q8_code_len(ctx: usize) -> Option<usize> {
-    KV_HEADS.checked_mul(ctx)?.checked_mul(HEAD_DIM / 4)
+    HOST_GEOMETRY.attn.q8_code_len(ctx)
 }
 
-/// q8_0 scales per cache, `kv * ctx * head / 32`.
+/// q8_0 scales per cache, `kv * ctx * head / 32`. A shim: the build's host
+/// instance's (`AttnGeom::q8_scale_len`). Callers left: the kernel gate.
 #[must_use]
 pub fn q8_scale_len(ctx: usize) -> Option<usize> {
-    KV_HEADS.checked_mul(ctx)?.checked_mul(HEAD_DIM / 32)
+    HOST_GEOMETRY.attn.q8_scale_len(ctx)
 }
 
 pub(crate) struct AttentionPipelines {
@@ -196,23 +244,23 @@ struct Checked {
     args: [[u8; 4]; 7],
 }
 
-fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
-    if p.head_dim != HEAD_DIM {
+fn checked(g: &AttnGeom, p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
+    if p.head_dim != g.head {
         return Err(refuse(format!(
-            "head dim {}, the kernel takes {HEAD_DIM}",
-            p.head_dim
+            "head dim {}, the kernel takes {}",
+            p.head_dim, g.head
         )));
     }
-    if p.query_heads != QUERY_HEADS {
+    if p.query_heads != g.query_heads {
         return Err(refuse(format!(
-            "query heads {}, the kernel takes {QUERY_HEADS}",
-            p.query_heads
+            "query heads {}, the kernel takes {}",
+            p.query_heads, g.query_heads
         )));
     }
-    if p.kv_heads != KV_HEADS {
+    if p.kv_heads != g.kv_heads {
         return Err(refuse(format!(
-            "kv heads {}, the kernel takes {KV_HEADS}",
-            p.kv_heads
+            "kv heads {}, the kernel takes {}",
+            p.kv_heads, g.kv_heads
         )));
     }
     if p.segments == 0 {
@@ -221,16 +269,20 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
     if p.ctx == 0 {
         return Err(refuse("ctx of 0".to_string()));
     }
-    let q_len = qg_len().ok_or_else(|| refuse("the query length wraps".to_string()))?;
-    let kv_len = KV_HEADS
-        .checked_mul(HEAD_DIM)
+    let q_len = g
+        .qg_len()
+        .ok_or_else(|| refuse("the query length wraps".to_string()))?;
+    let kv_len = g
+        .kv_heads
+        .checked_mul(g.head)
         .ok_or_else(|| refuse("the key length wraps".to_string()))?;
     let rope_len = p
         .ctx
-        .checked_mul(ROT)
+        .checked_mul(g.rot)
         .ok_or_else(|| refuse("the rope length wraps".to_string()))?;
-    let partials =
-        partials_len(p.segments).ok_or_else(|| refuse("the partial length wraps".to_string()))?;
+    let partials = g
+        .partials_len(p.segments)
+        .ok_or_else(|| refuse("the partial length wraps".to_string()))?;
     if p.segments > SEGMENT_CAP {
         return Err(refuse(format!(
             "segments of {} past the kernel's {SEGMENT_CAP}",
@@ -245,18 +297,22 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
     if ticket.start.get() % 4 != 0 {
         return Err(refuse("the ticket word is not 4-byte aligned".to_string()));
     }
-    let out = out_len().ok_or_else(|| refuse("the output length wraps".to_string()))?;
+    let out = g
+        .out_len()
+        .ok_or_else(|| refuse("the output length wraps".to_string()))?;
     check_window_len("attention", "q", p.q.len(), q_len)?;
     check_window_len("attention", "k", p.k.len(), kv_len)?;
     check_window_len("attention", "v", p.v.len(), kv_len)?;
-    check_window_len("attention", "q gain", p.q_gain.len(), HEAD_DIM)?;
-    check_window_len("attention", "k gain", p.k_gain.len(), HEAD_DIM)?;
+    check_window_len("attention", "q gain", p.q_gain.len(), g.head)?;
+    check_window_len("attention", "k gain", p.k_gain.len(), g.head)?;
     check_window_len("attention", "rope", p.rope.len(), rope_len)?;
     check_window_len("attention", "partials", p.partials.len(), partials)?;
     check_window_len("attention", "out", p.out.len(), out)?;
     match &p.cache {
         AttnCache::F16 { k, v } => {
-            let n = f16_len(p.ctx).ok_or_else(|| refuse("the cache length wraps".to_string()))?;
+            let n = g
+                .f16_len(p.ctx)
+                .ok_or_else(|| refuse("the cache length wraps".to_string()))?;
             check_window_len("attention", "k cache", k.len(), n)?;
             check_window_len("attention", "v cache", v.len(), n)?;
             // The kernels read each cache row as lane words of up to 16 bytes
@@ -280,10 +336,12 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
             v_codes,
             v_scales,
         } => {
-            let codes =
-                q8_code_len(p.ctx).ok_or_else(|| refuse("the code length wraps".to_string()))?;
-            let scales =
-                q8_scale_len(p.ctx).ok_or_else(|| refuse("the scale length wraps".to_string()))?;
+            let codes = g
+                .q8_code_len(p.ctx)
+                .ok_or_else(|| refuse("the code length wraps".to_string()))?;
+            let scales = g
+                .q8_scale_len(p.ctx)
+                .ok_or_else(|| refuse("the scale length wraps".to_string()))?;
             check_window_len("attention", "k codes", k_codes.len(), codes)?;
             check_window_len("attention", "k scales", k_scales.len(), scales)?;
             check_window_len("attention", "v codes", v_codes.len(), codes)?;
@@ -299,7 +357,7 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
         ctx,
         p.layer,
         p.eps.to_bits(),
-        SCALE.to_bits(),
+        g.scale.to_bits(),
         p.pos,
         p.n_keys,
     ]);
@@ -365,17 +423,19 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: AttentionParams<'_>,
     ) -> Result<(), DeviceError> {
-        let checked = checked(&p)?;
+        let g = &self.geom.attn;
+        let checked = checked(g, &p)?;
         let pipeline = match &p.cache {
             AttnCache::F16 { .. } => &self.attention.f16,
             AttnCache::Q8 { .. } => &self.attention.q8,
         };
-        let groups = KV_HEADS
+        let groups = g
+            .kv_heads
             .checked_mul(p.segments)
             .ok_or_else(|| refuse("the flash grid wraps".to_string()))?;
         encoder.set_pipeline(pipeline);
         bind_flash(encoder, &p, &checked.args)?;
-        encoder.dispatch_groups(groups, 1, FLASH_THREADS)
+        encoder.dispatch_groups(groups, 1, g.flash_threads)
     }
 }
 
@@ -386,11 +446,12 @@ impl Kernels {
 /// The windows with a stride hold `rows` rows that far apart; each may be
 /// longer than the last row's end.
 pub struct AttentionRowsParams<'w> {
-    /// Head dimension. The kernel takes [`HEAD_DIM`].
+    /// Head dimension. The kernel takes the instance's (`AttnGeom::head`).
     pub head_dim: usize,
-    /// Query heads. The kernel takes [`QUERY_HEADS`].
+    /// Query heads. The kernel takes the instance's (`AttnGeom::query_heads`).
     pub query_heads: usize,
-    /// Key and value heads. The kernel takes [`KV_HEADS`].
+    /// Key and value heads. The kernel takes the instance's
+    /// (`AttnGeom::kv_heads`).
     pub kv_heads: usize,
     /// Split-K segments of every row's flash, the same count the decode
     /// launch a row is held to uses.
@@ -406,11 +467,13 @@ pub struct AttentionRowsParams<'w> {
     /// Rows in the chunk. Zero is refused, and so is a chunk that ends past
     /// `ctx`.
     pub rows: usize,
-    /// The query projections, [`qg_len`] elements a row, `q_stride` apart.
+    /// The query projections, `AttnGeom::qg_len` elements a row, `q_stride`
+    /// apart.
     pub q: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `q`.
     pub q_stride: usize,
-    /// Raw keys, [`KV_HEADS`] rows of [`HEAD_DIM`] a row, `k_stride` apart.
+    /// Raw keys, `AttnGeom::kv_heads` rows of the head's values a row,
+    /// `k_stride` apart.
     pub k: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `k`.
     pub k_stride: usize,
@@ -418,19 +481,20 @@ pub struct AttentionRowsParams<'w> {
     pub v: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `v`.
     pub v_stride: usize,
-    /// Query RMS gain, [`HEAD_DIM`] values.
+    /// Query RMS gain, one value per head value.
     pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, [`HEAD_DIM`] values.
+    /// Key RMS gain, one value per head value.
     pub k_gain: Window<'w, f32, MetalDevice>,
-    /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
+    /// Rope table, `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`
+    /// pairs.
     pub rope: Window<'w, f32, MetalDevice>,
     /// The cache the launch appends and reads. The rows launches take the
     /// f16 cache; the q8_0 planes are refused by name.
     pub cache: AttnCache<'w>,
-    /// Segment partials, [`partials_len`] elements a row.
+    /// Segment partials, `AttnGeom::partials_len` elements a row.
     pub partials: WindowMut<'w, f32, MetalDevice>,
-    /// The outputs after any gate, [`out_len`] elements a row, `out_stride`
-    /// apart.
+    /// The outputs after any gate, `AttnGeom::out_len` elements a row,
+    /// `out_stride` apart.
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// Elements between rows of `out`.
     pub out_stride: usize,
@@ -474,14 +538,20 @@ struct ChunkView<'a, 'w> {
 
 impl ChunkView<'_, '_> {
     /// The rows launches' argument words, in `AttnRowsArgs`' order.
-    fn words(&self, segments: usize, layer: u32, eps: f32) -> Result<[[u8; 4]; 11], DeviceError> {
+    fn words(
+        &self,
+        g: &AttnGeom,
+        segments: usize,
+        layer: u32,
+        eps: f32,
+    ) -> Result<[[u8; 4]; 11], DeviceError> {
         let what = self.what;
         Ok(args_bytes([
             word(what, "segments", segments)?,
             word(what, "ctx", self.ctx)?,
             layer,
             eps.to_bits(),
-            SCALE.to_bits(),
+            g.scale.to_bits(),
             self.from,
             word(what, "rows", self.rows)?,
             word(what, "the q stride", self.q_stride)?,
@@ -493,25 +563,25 @@ impl ChunkView<'_, '_> {
 }
 
 /// The shape, the windows and the cache of a chunk, refused by name.
-fn check_chunk(c: &ChunkView<'_, '_>) -> Result<(), DeviceError> {
+fn check_chunk(g: &AttnGeom, c: &ChunkView<'_, '_>) -> Result<(), DeviceError> {
     let what = c.what;
     let refuse = |detail: String| refuse_in(what, detail);
-    if c.head_dim != HEAD_DIM {
+    if c.head_dim != g.head {
         return Err(refuse(format!(
-            "head dim {}, the kernel takes {HEAD_DIM}",
-            c.head_dim
+            "head dim {}, the kernel takes {}",
+            c.head_dim, g.head
         )));
     }
-    if c.query_heads != QUERY_HEADS {
+    if c.query_heads != g.query_heads {
         return Err(refuse(format!(
-            "query heads {}, the kernel takes {QUERY_HEADS}",
-            c.query_heads
+            "query heads {}, the kernel takes {}",
+            c.query_heads, g.query_heads
         )));
     }
-    if c.kv_heads != KV_HEADS {
+    if c.kv_heads != g.kv_heads {
         return Err(refuse(format!(
-            "kv heads {}, the kernel takes {KV_HEADS}",
-            c.kv_heads
+            "kv heads {}, the kernel takes {}",
+            c.kv_heads, g.kv_heads
         )));
     }
     if c.ctx == 0 {
@@ -531,25 +601,32 @@ fn check_chunk(c: &ChunkView<'_, '_>) -> Result<(), DeviceError> {
             )));
         }
     }
-    let q_len = qg_len().ok_or_else(|| refuse("the query length wraps".to_string()))?;
-    let kv_len = KV_HEADS
-        .checked_mul(HEAD_DIM)
+    let q_len = g
+        .qg_len()
+        .ok_or_else(|| refuse("the query length wraps".to_string()))?;
+    let kv_len = g
+        .kv_heads
+        .checked_mul(g.head)
         .ok_or_else(|| refuse("the key length wraps".to_string()))?;
-    let out = out_len().ok_or_else(|| refuse("the output length wraps".to_string()))?;
+    let out = g
+        .out_len()
+        .ok_or_else(|| refuse("the output length wraps".to_string()))?;
     let rope_len = c
         .ctx
-        .checked_mul(ROT)
+        .checked_mul(g.rot)
         .ok_or_else(|| refuse("the rope length wraps".to_string()))?;
     check_strided(what, "q", c.q.len(), c.rows, c.q_stride, q_len)?;
     check_strided(what, "k", c.k.len(), c.rows, c.k_stride, kv_len)?;
     check_strided(what, "v", c.v.len(), c.rows, c.v_stride, kv_len)?;
     check_strided(what, "out", c.out.len(), c.rows, c.out_stride, out)?;
-    check_window_len(what, "q gain", c.q_gain.len(), HEAD_DIM)?;
-    check_window_len(what, "k gain", c.k_gain.len(), HEAD_DIM)?;
+    check_window_len(what, "q gain", c.q_gain.len(), g.head)?;
+    check_window_len(what, "k gain", c.k_gain.len(), g.head)?;
     check_window_len(what, "rope", c.rope.len(), rope_len)?;
     match c.cache {
         AttnCache::F16 { k, v } => {
-            let n = f16_len(c.ctx).ok_or_else(|| refuse("the cache length wraps".to_string()))?;
+            let n = g
+                .f16_len(c.ctx)
+                .ok_or_else(|| refuse("the cache length wraps".to_string()))?;
             check_window_len(what, "k cache", k.len(), n)?;
             check_window_len(what, "v cache", v.len(), n)?;
             for (name, w) in [("k cache", k), ("v cache", v)] {
@@ -597,7 +674,7 @@ fn rows_view<'a, 'w>(p: &'a AttentionRowsParams<'w>) -> ChunkView<'a, 'w> {
     }
 }
 
-fn checked_rows(p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceError> {
+fn checked_rows(g: &AttnGeom, p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceError> {
     if p.segments == 0 {
         return Err(refuse_in(ROWS_WHAT, "segments of 0".to_string()));
     }
@@ -608,8 +685,9 @@ fn checked_rows(p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceErro
         ));
     }
     let view = rows_view(p);
-    check_chunk(&view)?;
-    let partials_row = partials_len(p.segments)
+    check_chunk(g, &view)?;
+    let partials_row = g
+        .partials_len(p.segments)
         .ok_or_else(|| refuse_in(ROWS_WHAT, "the partial length wraps".to_string()))?;
     check_strided(
         ROWS_WHAT,
@@ -630,7 +708,7 @@ fn checked_rows(p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceErro
             "the ticket word is not 4-byte aligned".to_string(),
         ));
     }
-    view.words(p.segments, p.layer, p.eps)
+    view.words(g, p.segments, p.layer, p.eps)
 }
 
 /// One prefill attention launch over a chunk of `rows` causal queries on the
@@ -640,11 +718,12 @@ fn checked_rows(p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceErro
 /// and including it. The windows are the rows launch's, less the split-K
 /// partials and tickets the kernel does not use.
 pub struct AttentionPrefillParams<'w> {
-    /// Head dimension. The kernel takes [`HEAD_DIM`].
+    /// Head dimension. The kernel takes the instance's (`AttnGeom::head`).
     pub head_dim: usize,
-    /// Query heads. The kernel takes [`QUERY_HEADS`].
+    /// Query heads. The kernel takes the instance's (`AttnGeom::query_heads`).
     pub query_heads: usize,
-    /// Key and value heads. The kernel takes [`KV_HEADS`].
+    /// Key and value heads. The kernel takes the instance's
+    /// (`AttnGeom::kv_heads`).
     pub kv_heads: usize,
     /// Cache rows per key head.
     pub ctx: usize,
@@ -657,11 +736,13 @@ pub struct AttentionPrefillParams<'w> {
     /// Rows in the chunk. Zero is refused, and so is a chunk that ends past
     /// `ctx`.
     pub rows: usize,
-    /// The query projections, [`qg_len`] elements a row, `q_stride` apart.
+    /// The query projections, `AttnGeom::qg_len` elements a row, `q_stride`
+    /// apart.
     pub q: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `q`.
     pub q_stride: usize,
-    /// Raw keys, [`KV_HEADS`] rows of [`HEAD_DIM`] a row, `k_stride` apart.
+    /// Raw keys, `AttnGeom::kv_heads` rows of the head's values a row,
+    /// `k_stride` apart.
     pub k: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `k`.
     pub k_stride: usize,
@@ -669,17 +750,18 @@ pub struct AttentionPrefillParams<'w> {
     pub v: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `v`.
     pub v_stride: usize,
-    /// Query RMS gain, [`HEAD_DIM`] values.
+    /// Query RMS gain, one value per head value.
     pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, [`HEAD_DIM`] values.
+    /// Key RMS gain, one value per head value.
     pub k_gain: Window<'w, f32, MetalDevice>,
-    /// Rope table, `ctx` rows of [`ROT`] interleaved `(cos, sin)` pairs.
+    /// Rope table, `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`
+    /// pairs.
     pub rope: Window<'w, f32, MetalDevice>,
     /// The cache the launch appends and reads: the f16 cache; the q8_0
     /// planes are refused by name.
     pub cache: AttnCache<'w>,
-    /// The outputs after any gate, [`out_len`] elements a row, `out_stride`
-    /// apart.
+    /// The outputs after any gate, `AttnGeom::out_len` elements a row,
+    /// `out_stride` apart.
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// Elements between rows of `out`.
     pub out_stride: usize,
@@ -687,7 +769,10 @@ pub struct AttentionPrefillParams<'w> {
     pub fault: &'w MetalFaultWord,
 }
 
-fn checked_prefill(p: &AttentionPrefillParams<'_>) -> Result<[[u8; 4]; 11], DeviceError> {
+fn checked_prefill(
+    g: &AttnGeom,
+    p: &AttentionPrefillParams<'_>,
+) -> Result<[[u8; 4]; 11], DeviceError> {
     let view = ChunkView {
         what: PREFILL_WHAT,
         head_dim: p.head_dim,
@@ -709,9 +794,9 @@ fn checked_prefill(p: &AttentionPrefillParams<'_>) -> Result<[[u8; 4]; 11], Devi
         out: &p.out,
         out_stride: p.out_stride,
     };
-    check_chunk(&view)?;
+    check_chunk(g, &view)?;
     // The append dispatch's span rule takes one segment: the prefill has no split.
-    view.words(1, p.layer, p.eps)
+    view.words(g, 1, p.layer, p.eps)
 }
 
 impl Kernels {
@@ -727,7 +812,8 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: AttentionRowsParams<'_>,
     ) -> Result<(), DeviceError> {
-        let args = checked_rows(&p)?;
+        let g = &self.geom.attn;
+        let args = checked_rows(g, &p)?;
         let AttnCache::F16 {
             k: cache_k,
             v: cache_v,
@@ -744,10 +830,11 @@ impl Kernels {
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
         encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
         encoder.set_binding(7, p.fault.binding())?;
-        encoder.dispatch_groups(KV_HEADS, p.rows, SIMD_WIDTH)?;
+        encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
         encoder.memory_barrier();
-        let groups = KV_HEADS
+        let groups = g
+            .kv_heads
             .checked_mul(p.segments)
             .ok_or_else(|| refuse_in(ROWS_WHAT, "the flash grid wraps".to_string()))?;
         encoder.set_pipeline(&self.attention.flash_rows);
@@ -761,7 +848,7 @@ impl Kernels {
         encoder.set_binding(7, Binding::bytes(pack(&args))?)?;
         encoder.set_binding(8, p.fault.binding())?;
         encoder.set_binding(9, Binding::of_mut(&p.ticket)?)?;
-        encoder.dispatch_groups(groups, p.rows, FLASH_THREADS)
+        encoder.dispatch_groups(groups, p.rows, g.flash_threads)
     }
 
     /// Build the prefill attention's pipeline if no launch has built it yet. A
@@ -784,7 +871,8 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: AttentionPrefillParams<'_>,
     ) -> Result<(), DeviceError> {
-        let args = checked_prefill(&p)?;
+        let g = &self.geom.attn;
+        let args = checked_prefill(g, &p)?;
         let flash = self.attention.prefill()?;
         let AttnCache::F16 {
             k: cache_k,
@@ -802,7 +890,7 @@ impl Kernels {
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
         encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
         encoder.set_binding(7, p.fault.binding())?;
-        encoder.dispatch_groups(KV_HEADS, p.rows, SIMD_WIDTH)?;
+        encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
         encoder.memory_barrier();
         encoder.set_pipeline(flash);
@@ -815,6 +903,6 @@ impl Kernels {
         encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
         encoder.set_binding(7, p.fault.binding())?;
         let blocks = p.rows.div_ceil(PREFILL_POSITIONS);
-        encoder.dispatch_groups(blocks, KV_HEADS, PREFILL_THREADS)
+        encoder.dispatch_groups(blocks, g.kv_heads, PREFILL_THREADS)
     }
 }
