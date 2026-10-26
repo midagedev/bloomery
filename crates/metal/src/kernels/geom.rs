@@ -99,8 +99,6 @@ pub struct ExpertsGeom {
     pub has_shared: bool,
     /// The expert intermediate width: the pair's rows and the fold's K.
     pub k: usize,
-    /// Blocks of K' of the fold.
-    pub folded_blocks: usize,
 }
 
 /// The launch geometry of one instance: every number the host sizes a launch,
@@ -194,7 +192,6 @@ impl Geometry {
                 shared_slot: experts_geom::shared_slot(inst),
                 has_shared: slots > routed_ids,
                 k: key.moe.expert_ff as usize,
-                folded_blocks: experts_geom::folded_blocks(inst),
             },
         }
     }
@@ -295,11 +292,6 @@ mod tests {
             );
             assert_eq!(e.shared_slot, e.routed_ids, "{name}: shared slot");
             assert_eq!(e.k, moe.expert_ff as usize, "{name}: expert k");
-            assert_eq!(
-                e.folded_blocks,
-                e.slots * (e.k / 256),
-                "{name}: folded blocks"
-            );
 
             if *inst == HOST {
                 assert_eq!(g, HOST_GEOMETRY, "{name}: the host's geometry");

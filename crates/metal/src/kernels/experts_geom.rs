@@ -33,20 +33,12 @@ pub const SHARED_SLOT: usize = shared_slot(&HOST);
 /// kernel gates, their oracles and the probes.
 pub const EXPERT_K: usize = HOST.key.moe.expert_ff as usize;
 
-/// Blocks of K' of `inst`'s fold: the slots, each as wide as the expert
-/// width in blocks of [`geometry::BLOCK_VALUES`] values.
-#[must_use]
-pub const fn folded_blocks(inst: &Instance) -> usize {
-    slots(inst) * (inst.key.moe.expert_ff as usize / geometry::BLOCK_VALUES)
-}
-
 /// The geometry the experts' kernels are written for, held for `inst`: the
 /// fold maps every slot's blocks as one K', in the 256-value quants' blocks
 /// (A4's and Q8_0's folds walk their own counts).
 const fn holds(inst: &Instance) {
     let k = inst.key.moe.expert_ff as usize;
     assert!(k.is_multiple_of(geometry::BLOCK_VALUES));
-    assert!(folded_blocks(inst) == slots(inst) * (k / geometry::BLOCK_VALUES));
     assert!(shared_slot(inst) + inst.key.moe.router.rule.gated as usize == slots(inst));
 }
 
