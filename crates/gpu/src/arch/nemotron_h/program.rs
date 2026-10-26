@@ -16,9 +16,9 @@ use crate::flash_gqa::GROUP_5;
 use crate::head::Head;
 use crate::weights::DevWeight;
 use crate::{GpuError, Window};
+use chain::arch::nemotron_h::plan::MlpPlan;
 use chain::hybrid::ops::{HybridOps, Step};
 use chain::hybrid::plan::{MambaPlan, NopeGqaPlan};
-use chain::arch::nemotron_h::plan::MlpPlan;
 use cuda_core::DeviceBuffer;
 
 const WHAT: &str = "nemotron_h::Program";
