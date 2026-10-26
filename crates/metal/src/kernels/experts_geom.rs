@@ -28,10 +28,6 @@ pub const fn shared_slot(inst: &Instance) -> usize {
 /// host instance's. Callers left: the e2e and kernel gates.
 pub const SHARED_SLOT: usize = shared_slot(&HOST);
 
-/// Whether the host instance's experts run a shared expert's slot after the
-/// routed ones. A shim: the open's geometry holds it as `ExpertsGeom::has_shared`.
-pub const HAS_SHARED: bool = SHARED_SLOT < EXPERT_SLOTS;
-
 /// The expert intermediate width. The pair's rows and the fold's K are this.
 /// A shim: the build's host instance's. Callers left: the arch, the e2e and
 /// kernel gates, their oracles and the probes.
