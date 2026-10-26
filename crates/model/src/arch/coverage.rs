@@ -1571,10 +1571,10 @@ const ROW_PINS: &[RowPin] = &[
         what: "shared expert (the types dense_by_name names)",
         row: |ty| dense_by_name(ty).is_some(),
     },
-    // PIN(2026-10-26): the glm5next mixers' dense sites read the common dense
+    // PIN(2026-10-26): the latent body's mixer dense sites read the common dense
     // entries by name (`site::ByName`) in every type but Q5_0, where they read
-    // q8_0 alone; each type is a launch of `site.rs`, which `gate_glm5next_e2e`
-    // runs on the fixture variants `glmattnk`, `glmattn6` and `glmbf16`.
+    // q8_0 alone; each type is a launch of `site.rs`, which the family's e2e
+    // gate runs on its mixer fixture variants.
     RowPin {
         program: Program::Glm5nextBody,
         role: Role::Attention,
@@ -1758,7 +1758,7 @@ pub const fn qwen35_shared(ty: GgmlType) -> Option<SiteEntry> {
     qwen3moe_dense(ty)
 }
 
-/// The glm5next latent mixer's absorbed key and value heads (`attn_k_b`,
+/// The latent mixer's absorbed key and value heads (`attn_k_b`,
 /// `attn_v_b`): the weights its per-head gemv reads.
 fn is_absorbed_pair(name: &str) -> bool {
     name.ends_with(".attn_k_b.weight") || name.ends_with(".attn_v_b.weight")
