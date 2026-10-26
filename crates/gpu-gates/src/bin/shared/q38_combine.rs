@@ -13,6 +13,9 @@ use crate::gate::{Ctx, E38, Leg38, M38, N38, SEL38, SEL38_STRAY, SENT, mismatch,
 /// Token 0's value of clause 10's `-0.0` case.
 const NEG0: usize = 3;
 
+/// One row of the combine refusals: `(launcher, case, result)`.
+type CombineRefusal = (&'static str, &'static str, Result<(), GpuError>);
+
 impl Leg38 {
     /// A layer without a host leg's one launch on the leg's down rows,
     /// weights and shared rows, `m` tokens placed by `sel`, into `y`.
@@ -105,10 +108,7 @@ impl Leg38 {
     /// The combine launchers' rows of clause 10's refusals, each `(launcher,
     /// case, result)`: a combine slot past the weights, and a layer without
     /// a host leg of no token or an output a value short.
-    pub(crate) fn combine_refusals(
-        &mut self,
-        c: &Ctx,
-    ) -> Result<[(&'static str, &'static str, Result<(), GpuError>); 3], GateError> {
+    pub(crate) fn combine_refusals(&mut self, c: &Ctx) -> Result<[CombineRefusal; 3], GateError> {
         let stream = c.gpu.stream();
         let r_slot = self.q38.enqueue_card_shared_add(
             stream,

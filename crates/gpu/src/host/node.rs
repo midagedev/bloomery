@@ -1579,7 +1579,7 @@ impl Session<'_> {
         match tag {
             Tag::Open => self.handle_open(&mut i, bad)?,
             Tag::Bind => {
-                let mode = i.u8("bind mode").map_err(&bad)?;
+                let mode = i.u8("bind mode").map_err(bad)?;
                 match mode {
                     0 => {
                         if !self.local_ip.is_loopback() {
@@ -1588,22 +1588,22 @@ impl Session<'_> {
                             )
                             .into());
                         }
-                        let path = i.str("path").map_err(&bad)?;
+                        let path = i.str("path").map_err(bad)?;
                         let (bytes, tiers, index) = (
-                            i.len("bytes").map_err(&bad)?,
-                            i.len("tiers").map_err(&bad)?,
-                            i.len("index").map_err(&bad)?,
+                            i.len("bytes").map_err(bad)?,
+                            i.len("tiers").map_err(bad)?,
+                            i.len("index").map_err(bad)?,
                         );
-                        i.end().map_err(&bad)?;
+                        i.end().map_err(bad)?;
                         self.opened()?
                             .work
                             .bind_opened(Path::new(&path), bytes, tiers, index)?;
                     }
                     1 => {
-                        let tiers = i.len("tiers").map_err(&bad)?;
-                        let index = i.len("index").map_err(&bad)?;
-                        let remote = read_endpoint(&mut i).map_err(&bad)?;
-                        i.end().map_err(&bad)?;
+                        let tiers = i.len("tiers").map_err(bad)?;
+                        let index = i.len("index").map_err(bad)?;
+                        let remote = read_endpoint(&mut i).map_err(bad)?;
+                        i.end().map_err(bad)?;
                         let ip = self.local_ip;
                         let endpoint =
                             self.opened()?.work.bind_remote(tiers, index, &remote, ip)?;
@@ -1616,8 +1616,8 @@ impl Session<'_> {
                 self.asked = p;
             }
             Tag::Reset => {
-                let phase = i.u8("reset phase").map_err(&bad)?;
-                i.end().map_err(&bad)?;
+                let phase = i.u8("reset phase").map_err(bad)?;
+                i.end().map_err(bad)?;
                 if phase != self.reset_phase || phase > 2 {
                     return Err(bad(format!(
                         "remote reset phase {phase}, expected {}",

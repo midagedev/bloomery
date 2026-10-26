@@ -171,8 +171,7 @@ fn hw_matmul_q_q3k_fused_dispatch() {
     for r in 0..n {
         let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
         gguf::dequant_row(GgmlType::Q3_K, src, &mut row).unwrap();
-        for t in 0..x.ne1 {
-            let xc = &cols[t];
+        for (t, xc) in cols.iter().enumerate().take(x.ne1) {
             let mut acc = 0.0f32;
             for i in 0..k {
                 acc += row[i] * xc[i];

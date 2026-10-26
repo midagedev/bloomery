@@ -1251,8 +1251,8 @@ mod gate {
         let rule_b = &rules[1];
         if let Some((score, mask_ok)) = &unfused {
             let (mut over, mut worst) = (0usize, 0.0f64);
-            for t in 0..n_vis {
-                let d = (f64::from(b.scores[t]) - f64::from(score[t])).abs();
+            for (t, &st) in score.iter().enumerate().take(n_vis) {
+                let d = (f64::from(b.scores[t]) - f64::from(st)).abs();
                 let bd = rule_b.kernel[t] + rule_b.rep[t] + rule_b.ik[t];
                 over += usize::from(outside(d, bd));
                 worst = worst.max(d / bd);

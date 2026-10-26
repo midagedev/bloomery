@@ -1655,9 +1655,9 @@ mod tests {
         let (c, r) = v4();
         let w = own_streams(V4_RATIOS_KEY, &c, &r).expect("the V4 table walks");
         assert_eq!((w.csa_ratio, w.hca_ratio), (4, 128));
-        for l in 0..43 {
+        for (l, &ratio) in r.iter().enumerate().take(43) {
             let (s, d) = (w.streams[l], w.dense[l]);
-            match r[l] {
+            match ratio {
                 0 => assert!(s.is_none() && d.is_none(), "layer {l}"),
                 4 => assert_eq!(
                     s,

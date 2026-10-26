@@ -733,8 +733,8 @@ mod gate {
                 continue;
             }
             let ru = rule(&q, &w, tokens, t, &plane, n, scale, 0);
-            for j in 0..n {
-                let d = (f64::from(row[j]) - ru.score[j]).abs();
+            for (j, &rj) in row.iter().enumerate().take(n) {
+                let d = (f64::from(rj) - ru.score[j]).abs();
                 worst = worst.max(if d.is_nan() {
                     f64::INFINITY
                 } else {

@@ -3160,10 +3160,10 @@ mod gate {
                 &mut scratch,
             )?;
             grouped &= bits_equal(&one.q_out, &s.q_out[g0 * qw..g1 * qw]);
-            for t in g0..g1 {
+            for (t, &count) in counts.iter().enumerate().take(g1).skip(g0) {
                 let r = t - g0;
-                let nb = if qsa_shape().scored(counts[t], SEL_CTX) {
-                    counts[t] / POOL
+                let nb = if qsa_shape().scored(count, SEL_CTX) {
+                    count / POOL
                 } else {
                     0
                 };

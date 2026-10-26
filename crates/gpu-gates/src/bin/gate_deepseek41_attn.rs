@@ -1093,14 +1093,17 @@ mod gate {
                 }
             }
         }
-        for lane in 0..8 {
-            sum[0][lane] += sum[2][lane];
-            sum[1][lane] += sum[3][lane];
+        let [s0, s1, s2, s3] = &mut sum;
+        for (a, c) in s0.iter_mut().zip(s2.iter()) {
+            *a += *c;
         }
-        for lane in 0..8 {
-            sum[0][lane] += sum[1][lane];
+        for (b, d) in s1.iter_mut().zip(s3.iter()) {
+            *b += *d;
         }
-        let t: [f32; 4] = std::array::from_fn(|i| sum[0][i] + sum[0][i + 4]);
+        for (a, b) in s0.iter_mut().zip(s1.iter()) {
+            *a += *b;
+        }
+        let t: [f32; 4] = std::array::from_fn(|i| s0[i] + s0[i + 4]);
         (t[0] + t[1]) + (t[2] + t[3])
     }
 

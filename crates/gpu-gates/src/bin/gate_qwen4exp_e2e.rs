@@ -5470,13 +5470,13 @@ mod gate {
         );
         let mut ok = ids_ok;
         let mut past = Vec::new();
-        for l in 0..n_layer() {
+        for (l, ik_route) in ik_routes.iter().enumerate().take(n_layer()) {
             let worst = (0..n)
                 .map(|t| {
                     routes
                         .get(t)
                         .and_then(|r| r.get(l))
-                        .map_or(f64::INFINITY, |o| rel(&o.logits, ik_routes[l].at(t).0))
+                        .map_or(f64::INFINITY, |o| rel(&o.logits, ik_route.at(t).0))
                 })
                 .fold(0.0f64, f64::max);
             let band = bands.router[l];

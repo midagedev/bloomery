@@ -4758,13 +4758,13 @@ mod gate {
                 let mut card = 0usize;
                 let mut host_ok = true;
                 let mut card_ok = true;
-                for c in 0..n {
+                for (c, &sel_c) in sel.iter().enumerate().take(n) {
                     let same = eq(&got.0, &want.0, c)
                         && got.1[c * 2 * steps..][..2 * steps]
                             == want.1[c * 2 * steps..][..2 * steps]
                         && got.2[c * 2 * steps..][..2 * steps]
                             == want.2[c * 2 * steps..][..2 * steps];
-                    if sel[c] == HOST {
+                    if sel_c == HOST {
                         let kept = eq(&got.0, &before.0, c)
                             && got.1[c * 2 * steps..][..2 * steps]
                                 == before.1[c * 2 * steps..][..2 * steps]

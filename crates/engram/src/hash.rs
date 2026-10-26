@@ -1357,8 +1357,8 @@ mod tests {
             }
             for n in 2..=n_gram {
                 let mut mixed = ctx[0].wrapping_mul(hash.mult[0]);
-                for j in 1..n {
-                    mixed ^= ctx[j].wrapping_mul(hash.mult[j]);
+                for (c, m) in ctx.iter().zip(&hash.mult).take(n).skip(1) {
+                    mixed ^= c.wrapping_mul(*m);
                 }
                 let base = (n - 2) * per_gram;
                 for g in 0..per_gram {

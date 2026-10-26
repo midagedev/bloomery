@@ -385,9 +385,9 @@ mod gate {
             let gv: Vec<f64> = vr.iter().map(|&v| f64::from(v) * gate).collect();
             let ms = gv.iter().map(|v| v * v).sum::<f64>() / n;
             let sc = 1.0 / (ms + eps).sqrt();
-            for d in 0..ROW {
-                e.gv[b * ROW + d] = gv[d];
-                e.ngv[b * ROW + d] = gv[d] * sc * g(&i.gc, d);
+            for (d, &gvd) in gv.iter().enumerate().take(ROW) {
+                e.gv[b * ROW + d] = gvd;
+                e.ngv[b * ROW + d] = gvd * sc * g(&i.gc, d);
             }
             (e.gate[b], e.s[b], e.dot[b], e.abs_sum[b], e.gv_ms[b]) = (gate, s, dot, abs, ms);
         }

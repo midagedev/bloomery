@@ -2768,9 +2768,9 @@ impl<H: HostExperts> HostTier<H> {
                 listed |= mask;
                 i += 1;
             }
-            for t in 0..k {
+            for (t, slot) in pass.iter_mut().enumerate().take(k) {
                 match self.tiers[t].replay(chain, &self.tier_lists[t]) {
-                    Ok(p) => pass[t] = p,
+                    Ok(p) => *slot = p,
                     Err(e) => {
                         let at = self.tier_lists[t].first().map_or(0, |p| p.0);
                         return Err(self.fail_tier(SERVE, at, t, e));

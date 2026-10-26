@@ -775,12 +775,12 @@ impl ChatReply {
         if self.ids.len() < agree {
             return (self.ids.len(), None, false);
         }
-        for k in 0..agree {
-            if self.ids[k] == want[k] {
+        for (k, &wanted) in want.iter().enumerate().take(agree) {
+            if self.ids[k] == wanted {
                 continue;
             }
             let gap = self.second[k]
-                .filter(|&(id, _)| id == want[k])
+                .filter(|&(id, _)| id == wanted)
                 .map(|(_, g)| g);
             return (k, gap, gap.is_some_and(|g| g < near_tie));
         }

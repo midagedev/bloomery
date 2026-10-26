@@ -1429,20 +1429,18 @@ mod gate {
                 .collect::<Vec<_>>(),
             &q8_var(&c.hc_normed, 256),
         );
-        let mut sig = [[0.0f64; 24]; 24];
-        for r in 0..24 {
-            for t in r..24 {
+        // The matrix is symmetric: entry (r, t) is the sum over the pair taken with the smaller index first.
+        let sig: [[f64; 24]; 24] = std::array::from_fn(|r| {
+            std::array::from_fn(|t| {
+                let (r, t) = (r.min(t), r.max(t));
                 let (a, b) = (&hw.hc_fn[r * k..(r + 1) * k], &hw.hc_fn[t * k..(t + 1) * k]);
-                let v: f64 = a
-                    .iter()
+                a.iter()
                     .zip(b)
                     .zip(&var)
                     .map(|((&x, &y), v)| f64::from(x) * f64::from(y) * v)
-                    .sum();
-                sig[r][t] = v;
-                sig[t][r] = v;
-            }
-        }
+                    .sum::<f64>()
+            })
+        });
         let mix: Vec<f64> = c.mixes.iter().map(|&v| f64::from(v)).collect();
         let (eps, iters) = (f64::from(hp.hc.eps), hp.hc.sinkhorn_iters);
         let mut jac = [[0.0f64; 24]; 24];

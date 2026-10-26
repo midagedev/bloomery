@@ -801,15 +801,15 @@ fn check_gdn_lanes(
         .checked_mul(2)
         .and_then(|n| n.checked_add(nv))
         .and_then(|n| n.checked_mul(HEAD))
-        .ok_or_else(&overflow)?;
-    let qkv = m.checked_mul(channels).ok_or_else(&overflow)?;
-    let heads = m.checked_mul(nv).ok_or_else(&overflow)?;
-    let output = heads.checked_mul(HEAD).ok_or_else(&overflow)?;
+        .ok_or_else(overflow)?;
+    let qkv = m.checked_mul(channels).ok_or_else(overflow)?;
+    let heads = m.checked_mul(nv).ok_or_else(overflow)?;
+    let output = heads.checked_mul(HEAD).ok_or_else(overflow)?;
     let state = lanes
         .checked_mul(nv)
         .and_then(|n| n.checked_mul(HEAD * HEAD))
-        .ok_or_else(&overflow)?;
-    let lane = d.lane_at.checked_add(1).ok_or_else(&overflow)?;
+        .ok_or_else(overflow)?;
+    let lane = d.lane_at.checked_add(1).ok_or_else(overflow)?;
     let lens = [
         ("qkv", d.qkv.len(), qkv),
         ("beta", d.beta.len(), heads),

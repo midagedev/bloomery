@@ -1680,13 +1680,13 @@ mod tests {
                 rows_below(&pre, &stream, n),
                 rows_below(&source(&ctx, &stream), &stream, n)
             );
-            for i in 0..2 {
+            for (i, &len) in LENS.iter().enumerate() {
                 let (a, b) = (
                     pre.rec[i].to_host_vec(&stream).expect("rec"),
                     cut.rec[i].to_host_vec(&stream).expect("rec"),
                 );
                 assert_eq!(a, b, "store {i} at {k}");
-                assert_eq!(a, vec![rec; LENS[i]]);
+                assert_eq!(a, vec![rec; len]);
             }
             assert_eq!(pre.ckpt.positions(), cut.ckpt.positions(), "points at {k}");
             // Nothing past the point moved: the K plane's row k is the poison.

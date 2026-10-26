@@ -870,8 +870,8 @@ mod gate {
         let mut ok = referee;
         let mut y_bad = 0;
         let mut y_worst = 0.0f64;
-        for t in 0..TOKENS {
-            let (bad, worst) = within(&got.y[t], &want.y[t], &y_bands[t]);
+        for (t, band) in y_bands.iter().enumerate().take(TOKENS) {
+            let (bad, worst) = within(&got.y[t], &want.y[t], band);
             y_bad += bad;
             y_worst = y_worst.max(worst);
         }
