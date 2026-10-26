@@ -3,8 +3,8 @@
 // entry points, under the host names of the simdgroup kernels they stand in
 // for (one library or the other is the GEMMs' library; `Library` picks):
 //
-//   gemm_{q4k,q6k,a4}_{store,resid}[_seg]_{f16,f32}     gemm.metal's
-//   gemm_routed_{q4k,q6k,a4}_{pair,plain}_{f16,f32}     gemm_routed.metal's
+//   gemm_{q4k,q6k,a4,q8_0,q5k}_{store,resid}[_seg]_{f16,f32}     gemm.metal's
+//   gemm_routed_{q4k,q6k,a4,q8_0,q5k}_{pair,plain}_{f16,f32}     gemm_routed.metal's
 //
 // Same arguments, buffers, grid and meanings as those (their headers hold
 // them): the epilogues, the segment table, the route table's tiles, the f16
@@ -484,6 +484,8 @@ kernel void tensor_routed_kernel(device const typename Q::Block * W [[buffer(0)]
 TENSOR_GEMM_FAMILY(q4k, Q4K)
 TENSOR_GEMM_FAMILY(q6k, Q6K)
 TENSOR_GEMM_FAMILY(a4, A4)
+TENSOR_GEMM_FAMILY(q8_0, Q8_0)
+TENSOR_GEMM_FAMILY(q5k, Q5K)
 
 #define TENSOR_ROUTED_ENTRY(NAME, Q, T, PAIR)                                       \
     template [[host_name("gemm_routed_" #NAME)]]                                    \
@@ -515,3 +517,11 @@ TENSOR_ROUTED_ENTRY(a4_pair_f16, A4, half, true)
 TENSOR_ROUTED_ENTRY(a4_pair_f32, A4, float, true)
 TENSOR_ROUTED_ENTRY(a4_plain_f16, A4, half, false)
 TENSOR_ROUTED_ENTRY(a4_plain_f32, A4, float, false)
+TENSOR_ROUTED_ENTRY(q8_0_pair_f16, Q8_0, half, true)
+TENSOR_ROUTED_ENTRY(q8_0_pair_f32, Q8_0, float, true)
+TENSOR_ROUTED_ENTRY(q8_0_plain_f16, Q8_0, half, false)
+TENSOR_ROUTED_ENTRY(q8_0_plain_f32, Q8_0, float, false)
+TENSOR_ROUTED_ENTRY(q5k_pair_f16, Q5K, half, true)
+TENSOR_ROUTED_ENTRY(q5k_pair_f32, Q5K, float, true)
+TENSOR_ROUTED_ENTRY(q5k_plain_f16, Q5K, half, false)
+TENSOR_ROUTED_ENTRY(q5k_plain_f32, Q5K, float, false)

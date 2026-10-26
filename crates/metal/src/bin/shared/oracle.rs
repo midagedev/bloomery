@@ -42,11 +42,34 @@
 //! lane's sum over its `ceil(nb / 8)` blocks, and the 31 adds of the SIMD
 //! group: `n = 9 + ceil(nb / 8) + 31`.
 //!
+//! **Q8_0** (quant.metal's `Q8_0`), one term `d * q * x`, `q` an integer: the
+//! product `q * x` (1), the eight-term chain of the block's code dot (7: its
+//! first add is to zero, exact), the product by `d` (1), the lane's sum over
+//! its `ceil(nb / 8)` blocks, and the 31 adds of the SIMD group:
+//! `n = 9 + ceil(nb / 8) + 31`. The terms' magnitudes are `|w_c x_c|`.
+//!
+//! **Q5_K** (quant.metal's `Q5K`) factors a weight as Q4_K's `d sc q - dmin m`
+//! with a five-bit `q`, so the bound is on Q4_K's magnitudes, the same sign
+//! flip at the same offsets: `M_c = d sc q + dmin m`, `sum_c M_c |x_c|`. A
+//! code's fifth bit enters as a sum of the activations whose bit is set,
+//! times 16 (exact), so the terms of `d sc q x` are `q_lo x` and `16 x` and
+//! their magnitudes sum to `q |x|`. The longest path is the `d` side's: the
+//! product (1), the eight-term chain of the nibble sum (7), the combine with
+//! the fifth bits' sum (1; the divide and multiply by 16 are exact), the
+//! product by the scale (1), the four-scale sum (3), the product by `d` (1)
+//! and the subtraction (1) — the `dmin` side is Q4_K's 13 — the lane's sum
+//! over its `ceil(nb / 4)` blocks, and the 31 adds of the SIMD group:
+//! `n = 15 + ceil(nb / 4) + 31`. The head-normed form scales each half once
+//! and adds the halves: the two-scale sum (1), the head scale (1) and that
+//! add (1) in place of the four-scale sum (3), so its path is the store's
+//! plus the head scale's product, within `n + 1` as Q4_K's.
+//!
 //! **Norm on load** adds the gain product on the load (1) and the scale
 //! product at the end (1), and the scale itself: `s = rsqrt(S / K + eps)`, `S`
 //! the sum of squares in the kernel's own order (a square, two adds, the lane's
-//! chain of `8 ceil(nb / 4)` adds for Q4_K or `4 ceil(nb / 2)` for Q6_K, the
-//! 31 adds of the SIMD group), then the division and the addition. `s` is off
+//! chain of `8 ceil(nb / 4)` adds for Q4_K and Q5_K (one load), `4 ceil(nb /
+//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4 or `2 ceil(nb / 8)` for Q8_0, the 31
+//! adds of the SIMD group), then the division and the addition. `s` is off
 //! by at most `(1 - t)^(-1/2) - 1` for `t = G(nS + 2)` (the worse direction),
 //! and by the library `rsqrt`'s own error, taken as `RSQRT_ULP` units in the
 //! last place (2 ulp = 4U). The `RSQRT_ULP` premise is `[unverified]`: no source
@@ -122,6 +145,21 @@ const Q6K_STORE_BASE: usize = 9;
 /// product and the bias add, as this module's doc derives.
 const A4_STORE_BASE: usize = 9;
 
+/// The operations of a Q8_0 store path before the lane's blocks and the SIMD
+/// group's sum: the product, the eight-term chain and the scale product, as
+/// this module's doc derives.
+///
+/// PIN(2026-10-25): the model in this module's doc, and no measured error,
+/// sets the band.
+const Q8_0_STORE_BASE: usize = 9;
+
+/// The operations of a Q5_K store path before the lane's blocks and the SIMD
+/// group's sum: the `d` side's fixed count of the model in this module's doc.
+///
+/// PIN(2026-10-25): the model in this module's doc, and no measured error,
+/// sets the band.
+const Q5K_STORE_BASE: usize = 15;
+
 /// The longest path through the SIMD group's sum: a binary tree over 32 lanes
 /// is at most 31 adds deep, whatever its shape.
 const SIMD_SUM_DEPTH: usize = 31;
@@ -190,6 +228,8 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
         Quant::Q4K => (nblocks.div_ceil(4), Q4K_STORE_BASE),
         Quant::Q6K => (nblocks.div_ceil(2), Q6K_STORE_BASE),
         Quant::A4 => (nblocks.div_ceil(8), A4_STORE_BASE),
+        Quant::Q8_0 => (nblocks.div_ceil(8), Q8_0_STORE_BASE),
+        Quant::Q5K => (nblocks.div_ceil(4), Q5K_STORE_BASE),
     };
     let n_store = base + lane_blocks + SIMD_SUM_DEPTH;
     match kind {
@@ -199,9 +239,10 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
         },
         Kind::Norm => {
             let chain = match quant {
-                Quant::Q4K => 8 * lane_blocks,
+                Quant::Q4K | Quant::Q5K => 8 * lane_blocks,
                 Quant::Q6K => 4 * lane_blocks,
                 Quant::A4 => 4 * lane_blocks,
+                Quant::Q8_0 => 2 * lane_blocks,
             };
             let n_s = 1 + 2 + chain + SIMD_SUM_DEPTH;
             // The scale's argument is off by at most `t` relative, so the
@@ -265,10 +306,11 @@ pub struct Reference {
 
 /// `block`'s bytes with `d` made non-negative and `dmin` non-positive: the
 /// reader's dequantization of them is `d sc q + |dmin| m`, the magnitude of
-/// the two terms of a Q4_K weight.
-fn q4k_magnitude_blocks(row: &[u8]) -> Vec<u8> {
+/// the two terms of a Q4_K or Q5_K weight (both blocks open with `d` and
+/// `dmin`, little-endian f16s).
+fn k_magnitude_blocks(quant: Quant, row: &[u8]) -> Vec<u8> {
     let mut out = row.to_vec();
-    for block in out.chunks_exact_mut(Quant::Q4K.block_bytes()) {
+    for block in out.chunks_exact_mut(quant.block_bytes()) {
         block[1] &= 0x7F;
         block[3] |= 0x80;
     }
@@ -322,13 +364,13 @@ pub fn reference(
         dequant_row(ty, row, &mut w).map_err(|e| format!("dequantizing a row: {e}"))?;
         let dot: f64 = w.iter().zip(x).map(|(&w, &x)| f64::from(w) * x).sum();
         let magnitude: f64 = match quant {
-            Quant::Q6K => w
+            Quant::Q6K | Quant::Q8_0 => w
                 .iter()
                 .zip(x)
                 .map(|(&w, &x)| f64::from(w).abs() * x.abs())
                 .sum(),
-            Quant::Q4K => {
-                dequant_row(ty, &q4k_magnitude_blocks(row), &mut m)
+            Quant::Q4K | Quant::Q5K => {
+                dequant_row(ty, &k_magnitude_blocks(quant, row), &mut m)
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
             }

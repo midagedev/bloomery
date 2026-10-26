@@ -1,10 +1,11 @@
 // The output head: one quantized mat-vec with the norm on the load, and the
 // argmax in the same dispatch. The body is a template over the quant
-// (quant.metal), its row loop matvec_q4k.metal's; the entries are the Q6_K
-// and A4 instantiations, under their host names. A threadgroup owns the rows of
-// its BLOOMERY_MATVEC_SIMD_GROUPS SIMD groups, BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP
-// each. It writes one packed candidate. The last threadgroup's threads
-// together reduce every candidate and thread 0 stores the winning row index.
+// (quant.metal), its row loop matvec_q4k.metal's; the entries are the Q6_K,
+// A4, Q8_0 and Q5_K instantiations, under their host names. A threadgroup
+// owns the rows of its BLOOMERY_MATVEC_SIMD_GROUPS SIMD groups,
+// BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP each. It writes one packed candidate.
+// The last threadgroup's threads together reduce every candidate and thread
+// 0 stores the winning row index.
 //
 // The packed key is ticket.metal's argmax_key. An empty group, and a group
 // whose live logits are all NaN, packs (-inf, 0). When that key wins, the
@@ -154,3 +155,35 @@ kernel void head_argmax_kernel<A4>(device const block_mlx_a4 *weights [[buffer(0
                                    ushort tiisg [[thread_index_in_simdgroup]],
                                    ushort sg [[simdgroup_index_in_threadgroup]],
                                    uint groups [[threadgroups_per_grid]]);
+
+template [[host_name("q8_0_head_argmax")]]
+kernel void head_argmax_kernel<Q8_0>(device const block_q8_0 *weights [[buffer(0)]],
+                                     device const float *x [[buffer(1)]],
+                                     device const float *gain [[buffer(2)]],
+                                     device float *logits [[buffer(3)]],
+                                     device coherent(device) ulong *candidates [[buffer(4)]],
+                                     device atomic_uint *ticket [[buffer(5)]],
+                                     device uint *step_id [[buffer(6)]],
+                                     device atomic_uint *faults [[buffer(7)]],
+                                     constant MatvecArgs &args [[buffer(8)]],
+                                     uint tg [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_position_in_threadgroup]],
+                                     ushort tiisg [[thread_index_in_simdgroup]],
+                                     ushort sg [[simdgroup_index_in_threadgroup]],
+                                     uint groups [[threadgroups_per_grid]]);
+
+template [[host_name("q5k_head_argmax")]]
+kernel void head_argmax_kernel<Q5K>(device const block_q5_K *weights [[buffer(0)]],
+                                    device const float *x [[buffer(1)]],
+                                    device const float *gain [[buffer(2)]],
+                                    device float *logits [[buffer(3)]],
+                                    device coherent(device) ulong *candidates [[buffer(4)]],
+                                    device atomic_uint *ticket [[buffer(5)]],
+                                    device uint *step_id [[buffer(6)]],
+                                    device atomic_uint *faults [[buffer(7)]],
+                                    constant MatvecArgs &args [[buffer(8)]],
+                                    uint tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sg [[simdgroup_index_in_threadgroup]],
+                                    uint groups [[threadgroups_per_grid]]);

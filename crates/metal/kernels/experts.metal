@@ -6,12 +6,17 @@
 //                     x̂ = x * gain / sqrt(mean(x^2) + eps)
 //   q6k_pair_swiglu   the same over block_q6_K
 //   a4_pair_swiglu    the same over block_mlx_a4
+//   q8_0_pair_swiglu  the same over block_q8_0
+//   q5k_pair_swiglu   the same over block_q5_K
 //   q4k_down_fold     y[r] += sum over slots of w_s * (down_s[r] · h_s)
 //   q6k_down_fold     the same over block_q6_K
 //   a4_down_fold      the same over block_mlx_a4
+//   q8_0_down_fold    the same over block_q8_0
+//   q5k_down_fold     the same over block_q5_K
 //
-// The bodies' dot loops are llama.cpp's (kernel_mul_mv_q4_K_f32 and
-// kernel_mul_mv_q6_K_f32, MIT licence; see THIRD_PARTY_NOTICES.md):
+// The bodies' dot loops are llama.cpp's (kernel_mul_mv_q4_K_f32,
+// kernel_mul_mv_q6_K_f32, kernel_mul_mv_q8_0_f32 and kernel_mul_mv_q5_K_f32,
+// MIT licence; see THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The lane map, the block loop and the simd_sum reduction are the ones the
 // dense mat-vec uses, owned by the quant.
@@ -35,13 +40,14 @@
 // norm that cannot take its input raises NormQuant and writes NaN in the
 // row, as the mat-vec's does.
 //
-// The fold's K' is nine slots of K 512: eighteen 256-value blocks, or
-// seventy-two of MLX's 64-value groups — the quant's own count. A lane owns
-// blocks by the dense stride across that whole K', not slot by slot: Q4_K
-// steps four blocks (a lane owns four or five), Q6_K steps two (a lane owns
-// nine), A4 steps eight. The route weight of the block's slot scales the
-// activation as it is loaded, and the residual add is the store. There is no
-// second dispatch.
+// The fold's K' is nine slots of K 512: eighteen 256-value blocks,
+// seventy-two of MLX's 64-value groups, or a hundred and forty-four Q8_0
+// blocks — the quant's own count. A lane owns blocks by the dense stride
+// across that whole K', not slot by slot: Q4_K and Q5_K step four blocks (a
+// lane owns four or five), Q6_K steps two (a lane owns nine), A4 and Q8_0
+// step eight (nine and eighteen). The route weight of the block's slot
+// scales the activation as it is loaded, and the residual add is the store.
+// There is no second dispatch.
 //
 // An id past the stack raises ExpertId and writes NaN before any weight is
 // loaded. The pair writes NaN only in the bad slot's row; the fold writes NaN
@@ -356,6 +362,36 @@ kernel void pair_swiglu_kernel<A4>(device const block_mlx_a4 * gate [[buffer(0)]
                                    ushort tiisg [[thread_index_in_simdgroup]],
                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
+template [[host_name("q8_0_pair_swiglu")]]
+kernel void pair_swiglu_kernel<Q8_0>(device const block_q8_0 * gate [[buffer(0)]],
+                                     device const block_q8_0 * up [[buffer(1)]],
+                                     device const block_q8_0 * shexp_gate [[buffer(2)]],
+                                     device const block_q8_0 * shexp_up [[buffer(3)]],
+                                     device const float * x [[buffer(4)]],
+                                     device const float * gain [[buffer(5)]],
+                                     device const int * ids [[buffer(6)]],
+                                     device float * y [[buffer(7)]],
+                                     device atomic_uint * faults [[buffer(8)]],
+                                     constant PairArgs & args [[buffer(9)]],
+                                     uint3 tgpig [[threadgroup_position_in_grid]],
+                                     ushort tiisg [[thread_index_in_simdgroup]],
+                                     ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q5k_pair_swiglu")]]
+kernel void pair_swiglu_kernel<Q5K>(device const block_q5_K * gate [[buffer(0)]],
+                                    device const block_q5_K * up [[buffer(1)]],
+                                    device const block_q5_K * shexp_gate [[buffer(2)]],
+                                    device const block_q5_K * shexp_up [[buffer(3)]],
+                                    device const float * x [[buffer(4)]],
+                                    device const float * gain [[buffer(5)]],
+                                    device const int * ids [[buffer(6)]],
+                                    device float * y [[buffer(7)]],
+                                    device atomic_uint * faults [[buffer(8)]],
+                                    constant PairArgs & args [[buffer(9)]],
+                                    uint3 tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
 template [[host_name("q4k_down_fold")]]
 kernel void down_fold_kernel<Q4K>(device const block_q4_K * down [[buffer(0)]],
                                   device const block_q4_K * shared [[buffer(1)]],
@@ -394,3 +430,29 @@ kernel void down_fold_kernel<A4>(device const block_mlx_a4 * down [[buffer(0)]],
                                  uint3 tgpig [[threadgroup_position_in_grid]],
                                  ushort tiisg [[thread_index_in_simdgroup]],
                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q8_0_down_fold")]]
+kernel void down_fold_kernel<Q8_0>(device const block_q8_0 * down [[buffer(0)]],
+                                   device const block_q8_0 * shared [[buffer(1)]],
+                                   device const float * h [[buffer(2)]],
+                                   device const float * w [[buffer(3)]],
+                                   device const int * ids [[buffer(4)]],
+                                   device float * y [[buffer(5)]],
+                                   device atomic_uint * faults [[buffer(6)]],
+                                   constant FoldArgs & args [[buffer(7)]],
+                                   uint3 tgpig [[threadgroup_position_in_grid]],
+                                   ushort tiisg [[thread_index_in_simdgroup]],
+                                   ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q5k_down_fold")]]
+kernel void down_fold_kernel<Q5K>(device const block_q5_K * down [[buffer(0)]],
+                                  device const block_q5_K * shared [[buffer(1)]],
+                                  device const float * h [[buffer(2)]],
+                                  device const float * w [[buffer(3)]],
+                                  device const int * ids [[buffer(4)]],
+                                  device float * y [[buffer(5)]],
+                                  device atomic_uint * faults [[buffer(6)]],
+                                  constant FoldArgs & args [[buffer(7)]],
+                                  uint3 tgpig [[threadgroup_position_in_grid]],
+                                  ushort tiisg [[thread_index_in_simdgroup]],
+                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);

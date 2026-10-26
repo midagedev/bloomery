@@ -15,12 +15,13 @@ use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle;
 use super::oracle_experts;
+use super::synthetic;
 use super::{
     Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_PAD, WEIGHT_TAIL, check_guards, padded,
 };
 const N_EXPERTS: usize = 4;
 const PAIR_COLS: usize = 2048;
-const FOLD_ROWS: usize = 2048;
+pub const FOLD_ROWS: usize = 2048;
 const IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 1, 2, 3, 0];
 const ROUTE: [f32; EXPERT_SLOTS] = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8];
 
@@ -34,13 +35,18 @@ pub struct PairNorm {
 /// ones, under which a dropped gain is invisible. The epsilon is the
 /// fixture's.
 pub fn ffn_norm(fix: &Fixture) -> Result<PairNorm, String> {
-    Ok(PairNorm {
+    Ok(synthetic_norm(fix.rms_eps()?))
+}
+
+/// The synthetic gain [`ffn_norm`] reads, at epsilon `eps`.
+pub fn synthetic_norm(eps: f32) -> PairNorm {
+    PairNorm {
         gain: oracle::activations(PAIR_COLS, 0x6C0, 0.5)
             .iter()
             .map(|g| 1.0 + g.abs())
             .collect(),
-        eps: fix.rms_eps()?,
-    })
+        eps,
+    }
 }
 
 pub fn row_bytes(quant: Quant, cols: usize) -> usize {
@@ -52,6 +58,8 @@ fn tag(quant: Quant) -> u64 {
         Quant::Q4K => 0,
         Quant::Q6K => 1,
         Quant::A4 => 2,
+        Quant::Q8_0 => 3,
+        Quant::Q5K => 4,
     }
 }
 
@@ -91,10 +99,14 @@ fn plane(
 /// Q4 reads the gate and up experts. Q6 has no gate or up experts in the
 /// fixture, so each expert is one Q6_K down expert's blocks, read as 512 by
 /// 2048: the byte length is the same. A4 reads its own gate and up stacks,
-/// which an MLX-format fixture holds.
+/// which an MLX-format fixture holds. The fixtures hold no Q8_0 or Q5_K
+/// experts: those are refused by name (their clauses build synthetic rows).
 pub fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
     let ty = quant.ggml();
     let weights = match quant {
+        Quant::Q8_0 | Quant::Q5K => {
+            return Err(format!("the fixture has no {} experts", quant.name()));
+        }
         Quant::Q4K => PairWeights {
             gate: stack(
                 fix,
@@ -188,6 +200,28 @@ pub struct FoldWeights {
     pub shared: Vec<u8>,
 }
 
+/// A pair's weights of synthetic rows ([`synthetic::matrix`]), for a quant
+/// no fixture holds: the four experts' gate and up stacks and the shared
+/// pair, each from its own seed.
+pub fn synthetic_pair(quant: Quant, seed: u64) -> PairWeights {
+    let stack = N_EXPERTS * EXPERT_K;
+    PairWeights {
+        gate: synthetic::matrix(quant, stack, PAIR_COLS, seed),
+        up: synthetic::matrix(quant, stack, PAIR_COLS, seed + 1),
+        shared_gate: synthetic::matrix(quant, EXPERT_K, PAIR_COLS, seed + 2),
+        shared_up: synthetic::matrix(quant, EXPERT_K, PAIR_COLS, seed + 3),
+    }
+}
+
+/// A fold's weights of synthetic rows at `rows` rows an expert: the four
+/// experts' down stack and the shared down.
+pub fn synthetic_fold(quant: Quant, rows: usize, seed: u64) -> FoldWeights {
+    FoldWeights {
+        down: synthetic::matrix(quant, N_EXPERTS * rows, EXPERT_K, seed),
+        shared: synthetic::matrix(quant, rows, EXPERT_K, seed + 1),
+    }
+}
+
 fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
     fold_weights_of(fix, quant, FOLD_ROWS)
 }
@@ -199,6 +233,9 @@ fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
 pub fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
     let ty = quant.ggml();
     let (name, shared) = match quant {
+        Quant::Q8_0 | Quant::Q5K => {
+            return Err(format!("the fixture has no {} experts", quant.name()));
+        }
         Quant::Q4K => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
         Quant::Q6K => ("blk.2.ffn_down_exps.weight", "blk.2.ffn_down_shexp.weight"),
         Quant::A4 => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
@@ -385,8 +422,17 @@ pub fn expect_bits(got: &[f32], want: &[f32], what: &str) -> Result<(), String> 
 }
 
 pub fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<String, String> {
-    let weights = pair_weights(fix, quant)?;
-    let norm = ffn_norm(fix)?;
+    check_pair_weights(h, quant, &pair_weights(fix, quant)?, &ffn_norm(fix)?)
+}
+
+/// The pair over `weights` against the oracle band, every slot's rows, the
+/// shared slot's too: the worst error over the band.
+pub fn check_pair_weights(
+    h: &Harness<'_>,
+    quant: Quant,
+    weights: &PairWeights,
+    norm: &PairNorm,
+) -> Result<String, String> {
     let x = oracle::activations(PAIR_COLS, 0xA11 + tag(quant), 1.0);
     let y0 = vec![f32::from_bits(SENTINEL_BITS); EXPERT_SLOTS * EXPERT_K];
     h.clear_fault()?;
@@ -401,7 +447,7 @@ pub fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<
             shared_gate: &weights.shared_gate,
             shared_up: &weights.shared_up,
             x: &x,
-            norm: &norm,
+            norm,
             y0: &y0,
         },
     )?;
@@ -609,6 +655,136 @@ pub fn pair_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     ))
 }
 
+/// An id past the stack writes NaN in that slot only and raises
+/// [`FaultSite::ExpertId`], the other slots the clean launch's bits; the
+/// norm's fault inputs (a NaN input, an infinite one, a zero input with a
+/// zero epsilon) raise [`FaultSite::NormQuant`] with NaN in all nine slots'
+/// rows. One quant's pair over `weights`.
+pub fn pair_faults(
+    h: &Harness<'_>,
+    quant: Quant,
+    weights: &PairWeights,
+    norm: &PairNorm,
+) -> Result<(), String> {
+    let x = oracle::activations(PAIR_COLS, 0x1B1D, 1.0);
+    let y_len = EXPERT_SLOTS * EXPERT_K;
+
+    // An id past the stack: that slot's rows NaN, the others the clean bits.
+    h.clear_fault()?;
+    let clean = launch_pair(
+        h,
+        PairIn {
+            quant,
+            n_experts: N_EXPERTS,
+            ids: &IDS,
+            gate: &weights.gate,
+            up: &weights.up,
+            shared_gate: &weights.shared_gate,
+            shared_up: &weights.shared_up,
+            x: &x,
+            norm,
+            y0: &vec![f32::from_bits(SENTINEL_BITS); y_len],
+        },
+    )?;
+    if let Some(f) = h.fault()? {
+        return Err(format!("the clean pair raised {f}"));
+    }
+    for bad in [-1, N_EXPERTS as i32] {
+        let mut bad_ids = IDS;
+        bad_ids[3] = bad;
+        h.clear_fault()?;
+        let got = launch_pair(
+            h,
+            PairIn {
+                quant,
+                n_experts: N_EXPERTS,
+                ids: &bad_ids,
+                gate: &weights.gate,
+                up: &weights.up,
+                shared_gate: &weights.shared_gate,
+                shared_up: &weights.shared_up,
+                x: &x,
+                norm,
+                y0: &vec![1.0; y_len],
+            },
+        )?;
+        common::expect_fault(h, &format!("id {bad}"), FaultSite::ExpertId)?;
+        for slot in 0..EXPERT_SLOTS {
+            let row = &got[slot * EXPERT_K..(slot + 1) * EXPERT_K];
+            let clean_row = &clean[slot * EXPERT_K..(slot + 1) * EXPERT_K];
+            if slot == 3 {
+                if let Some(k) = row.iter().position(|v| !v.is_nan()) {
+                    return Err(format!("id {bad} slot 3 row {k} is {:?}, not NaN", row[k]));
+                }
+            } else if let Some(k) = row
+                .iter()
+                .zip(clean_row)
+                .position(|(g, c)| g.to_bits() != c.to_bits())
+            {
+                return Err(format!(
+                    "id {bad} slot {slot} row {k} changed to {:?} (clean {:?})",
+                    row[k], clean_row[k]
+                ));
+            }
+        }
+    }
+
+    // The norm's fault inputs: NaN rows in all nine slots' rows.
+    for (what, mut x, eps) in [
+        (
+            "a NaN input",
+            oracle::activations(PAIR_COLS, 0x1A0, 1.0),
+            norm.eps,
+        ),
+        (
+            "an infinite input",
+            oracle::activations(PAIR_COLS, 0x1A1, 1.0),
+            norm.eps,
+        ),
+        (
+            "a zero input and a zero epsilon",
+            vec![0f32; PAIR_COLS],
+            0.0,
+        ),
+    ] {
+        match what {
+            "a NaN input" => x[17] = f32::NAN,
+            "an infinite input" => x[PAIR_COLS - 1] = f32::INFINITY,
+            _ => {}
+        }
+        h.clear_fault()?;
+        let got = launch_pair(
+            h,
+            PairIn {
+                quant,
+                n_experts: N_EXPERTS,
+                ids: &IDS,
+                gate: &weights.gate,
+                up: &weights.up,
+                shared_gate: &weights.shared_gate,
+                shared_up: &weights.shared_up,
+                x: &x,
+                norm: &PairNorm {
+                    gain: norm.gain.clone(),
+                    eps,
+                },
+                y0: &vec![1.0; y_len],
+            },
+        )?;
+        common::expect_fault(h, what, FaultSite::NormQuant)?;
+        if let Some(k) = got.iter().position(|v| !v.is_nan()) {
+            return Err(format!(
+                "{what}: slot {} row {} is {:?}, not NaN",
+                k / EXPERT_K,
+                k % EXPERT_K,
+                got[k]
+            ));
+        }
+    }
+    h.clear_fault()?;
+    Ok(())
+}
+
 /// Slot 0 of a pair over a one-expert stack, `rows` being `[gate, up, shared
 /// gate, shared up]`.
 fn solo_slot(
@@ -718,7 +894,17 @@ pub fn check_fold_quant(
     quant: Quant,
     rows: usize,
 ) -> Result<String, String> {
-    let weights = fold_weights_of(fix, quant, rows)?;
+    check_fold_weights(h, quant, &fold_weights_of(fix, quant, rows)?, rows)
+}
+
+/// The fold over `weights` (`rows` rows an expert) against the oracle band:
+/// the worst error over the band.
+pub fn check_fold_weights(
+    h: &Harness<'_>,
+    quant: Quant,
+    weights: &FoldWeights,
+    rows: usize,
+) -> Result<String, String> {
     let hidden = hidden_states(quant);
     let resid = oracle::activations(rows, 0xF01D + tag(quant), 2.0);
     h.clear_fault()?;
@@ -817,7 +1003,7 @@ pub fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Resu
 
 /// A row count a threadgroup's four rows do not divide: the last SIMD
 /// group's live rows are one, and its dead rows are never stored.
-const FOLD_TAIL_ROWS: usize = 2045;
+pub const FOLD_TAIL_ROWS: usize = 2045;
 
 const _: () = assert!(!FOLD_TAIL_ROWS.is_multiple_of(ROWS_PER_SIMD_GROUP));
 

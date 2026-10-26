@@ -9,13 +9,15 @@
 //   block_stride
 //   values_per_block  the values one block holds: the width every body's
 //                block-count arithmetic reads (the pointer walks, the norm's
-//                count) — QK_K for Q4_K and Q6_K, 64 for MLX's groups
+//                count) — QK_K for Q4_K, Q5_K and Q6_K, 64 for MLX's groups,
+//                32 for Q8_0
 //   load<LOAD>   its input load — plain, the norm on load (the gain and the
 //                sum of squares), or the route-weight form
 //   partial      the dot of one block against the loaded input
 //   fold_blocks, the folded down's K' in the quant's blocks, and the slot
-//   fold_slot    a block of K' belongs to; `head_scales` and `sums_finite`
-//                serve the head-normed row loop, and `value` the embedding
+//   fold_slot    a block of K' belongs to; `head_scales`, `sums_finite` and
+//                `partial_head` serve the head-normed row loop, `value` the
+//                embedding, and `dequant16` the prompt GEMMs' staging
 //
 // Every kernel body over quantized weights — the mat-vec's row loop with its
 // modes, the expert pair's SwiGLU, the folded down, the head's argmax, the
@@ -23,10 +25,12 @@
 // instantiations, under their host names. A new weight format adds one owner
 // here and instantiates the bodies; no body is copied per quant.
 //
-// The lane maps (Q4_K's ix/iq/ir, Q6_K's tid/ix/ip/il), the block strides,
-// the uint16 nibble trick, the 6-bit unpacking and the sum associations are
-// llama.cpp's, from its kernel_mul_mv_q4_K_f32 and kernel_mul_mv_q6_K_f32
-// (MIT licence; see THIRD_PARTY_NOTICES.md):
+// The lane maps (Q4_K's ix/iq/ir, Q6_K's tid/ix/ip/il, Q8_0's ix/il, Q5_K's
+// tid/ix/iq/ir), the block strides, the uint16 nibble trick, the 6-bit
+// unpacking, Q5_K's fifth-bit masks and the sum associations are
+// llama.cpp's, from its kernel_mul_mv_q4_K_f32, kernel_mul_mv_q6_K_f32,
+// kernel_mul_mv_q8_0_f32 and kernel_mul_mv_q5_K_f32 (MIT licence; see
+// THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The same map was the dense mat-vec's, the pair's and the fold's since each
 // landed; this file is those copies folded into one. A4's map is ours, on
@@ -73,6 +77,26 @@ struct block_mlx_a4 {
 };
 
 static_assert(sizeof(block_mlx_a4) == 36, "block_mlx_a4 is 36 bytes");
+
+struct block_q8_0 {
+    half   d;
+    int8_t qs[32];
+};
+
+static_assert(sizeof(block_q8_0) == 34, "block_q8_0 is 34 bytes");
+
+// Q4_K's d, dmin and 6-bit scale/min pairs, then the fifth bit of every
+// value (value 64j + l takes bit 2j of qh[l], value 64j + 32 + l bit
+// 2j + 1) and Q4_K's nibbles.
+struct block_q5_K {
+    half    d;
+    half    dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t qs[128];
+};
+
+static_assert(sizeof(block_q5_K) == 176, "block_q5_K is 176 bytes");
 
 // What a load does to each value it loads.
 enum LoadMode {
@@ -632,6 +656,349 @@ struct A4 {
                                  thread matrix<T, 4, 4> & reg) {
         for (short j = 0; j < 16; ++j) {
             reg[j / 4][j % 4] = value(blk, (uint)(16 * il + j));
+        }
+    }
+};
+
+// GGUF's Q8_0 decode owner (block_q8_0, above): a 32-value block of signed
+// bytes under one f16 scale, `y = q·d`. The lane map is llama.cpp's
+// kernel_mul_mv_q8_0_f32's inside one SIMD group: four lanes split a block
+// into quarters of eight values, so the 32 lanes cover eight blocks, 256
+// values, a pass (the stride). llama.cpp splits the blocks across the
+// threadgroup's SIMD groups too and reduces through threadgroup memory;
+// here every SIMD group owns its rows over the whole row, the row loop's
+// rule. A 32-value block sits inside one 128-column value head, so the head
+// form is one scale a block, as A4's.
+struct Q8_0 {
+    typedef block_q8_0 Block;
+
+    // The lane's map and registers: ix picks the lane's blocks (eight
+    // apart), il the quarter of one. yl holds the loaded activations, eight
+    // consecutive values.
+    struct Lane {
+        short   ix;
+        short   il;
+        float   yl[8];
+    };
+
+    static inline Lane lane_of(ushort tiisg) {
+        Lane lane;
+        lane.ix = (short)(tiisg / 4);  // 0...7
+        lane.il = (short)(tiisg % 4);  // 0...3
+        return lane;
+    }
+
+    static inline int first_block(const thread Lane &lane) {
+        return lane.ix;
+    }
+
+    static inline int block_stride() {
+        return 8;
+    }
+
+    static inline int values_per_block() {
+        return 32;
+    }
+
+    // The lane's values' offset in a block: its quarter.
+    static inline int input_offset(const thread Lane &lane) {
+        return 8 * lane.il;
+    }
+
+    // The activations of one block, in the lane's registers. `gain` and
+    // `sum_sq` are read by the norm load only, `scale` by the route load.
+    template <LoadMode LOAD>
+    static inline void load(thread Lane &lane,
+                            device const float * block,
+                            device const float * gain,
+                            float scale,
+                            thread float * sum_sq) {
+        const int base = input_offset(lane);
+        for (short l = 0; l < 8; l += 4) {
+            float a0 = block[base + l + 0];
+            float a1 = block[base + l + 1];
+            float a2 = block[base + l + 2];
+            float a3 = block[base + l + 3];
+            if (LOAD == LOAD_ROUTE) {
+                a0 *= scale;
+                a1 *= scale;
+                a2 *= scale;
+                a3 *= scale;
+            } else if (LOAD == LOAD_NORM) {
+                *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+                a0 *= gain[base + l + 0];
+                a1 *= gain[base + l + 1];
+                a2 *= gain[base + l + 2];
+                a3 *= gain[base + l + 3];
+            }
+            lane.yl[l + 0] = a0;
+            lane.yl[l + 1] = a1;
+            lane.yl[l + 2] = a2;
+            lane.yl[l + 3] = a3;
+        }
+    }
+
+    // One block's contribution: the code dot, then the scale once, in
+    // llama.cpp's association.
+    static inline float partial(device const Block & blk,
+                                const thread Lane & lane) {
+        device const int8_t * qs = blk.qs + 8 * lane.il;
+        float sumq = 0.f;
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            sumq += qs[i] * lane.yl[i];
+        }
+        return sumq * (float)blk.d;
+    }
+
+    // A block sits whole inside one value head, so the head's one scale
+    // multiplies the whole contribution; `hi` is that same head's.
+    static inline float partial_head(device const Block & blk,
+                                     const thread Lane & lane,
+                                     float lo,
+                                     float hi) {
+        return lo * partial(blk, lane);
+    }
+
+    static_assert(BLOOMERY_DELTA_HEAD_COLS % 32 == 0,
+                  "a Q8_0 block sits inside one value head");
+
+    static inline float2 head_scales(threadgroup const float * scales, int ib) {
+        const int head = ib / (BLOOMERY_DELTA_HEAD_COLS / 32);
+        return float2(scales[head], scales[head]);
+    }
+
+    // The lane's loaded values sum to a finite number: no sum is kept for
+    // the dot, so the head-normed row loop's ask adds them here.
+    static inline bool sums_finite(const thread Lane &lane) {
+        float sum = 0.f;
+        for (short i = 0; i < 8; ++i) {
+            sum += lane.yl[i];
+        }
+        return isfinite(sum);
+    }
+
+    static inline int fold_blocks() {
+        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());
+    }
+
+    static inline int fold_slot(int ib) {
+        return ib / (BLOOMERY_EXPERT_K / values_per_block());
+    }
+
+    // Value `j` of a block, the host reader's decode: the code times the
+    // scale, exact in f32 (eight bits times eleven), so the embed's bits are
+    // the reader's.
+    static inline float value(device const Block & blk, uint j) {
+        return (float)blk.qs[j] * (float)blk.d;
+    }
+
+    // Sixteen consecutive values of a block, [16*il, 16*il + 16) in natural
+    // order (value 16*il + j at reg[j/4][j%4]), the GEMM's A staging: the
+    // owner's own `value`, rounded once into the operand type.
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        const float d = (float)blk.d;
+        device const int8_t * q = blk.qs + 16 * il;
+        FOR_UNROLL(short j = 0; j < 16; ++j) {
+            reg[j / 4][j % 4] = (float)q[j] * d;
+        }
+    }
+};
+
+// The four 16-bit words of a Q4_K-packed scale table's half `iq`: the eight
+// 6-bit scales and mins of that half's four 32-value groups, as bytes
+// [scale 2iq, scale 2iq+1, min 2iq, min 2iq+1, scale 2iq+4, scale 2iq+5,
+// min 2iq+4, min 2iq+5]. `sc` is the table read as words, offset by `iq`.
+inline void k4_scale_words(device const uint16_t * sc, thread uint16_t * sc16) {
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+    sc16[0] = sc[0] & kmask1;
+    sc16[1] = sc[2] & kmask1;
+    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+}
+
+// GGUF's Q5_K decode owner (block_q5_K, above): Q4_K's block with a fifth
+// bit a value. A lane loads the same 32 values of a block Q4_K's lane loads
+// (its quarter of a 64-value group pair), so the registers, the load and the
+// group sums are Q4_K's own; the lane map is llama.cpp's
+// kernel_mul_mv_q5_K_f32's, which walks four blocks apart as Q4_K's does
+// but puts neighbouring lanes on neighbouring blocks. The dot is that
+// kernel's: the nibbles under d and the fifth bits' sums times 16, less the
+// dmin term.
+struct Q5K {
+    typedef block_q5_K Block;
+    typedef Q4K::Lane Lane;
+
+    static inline Lane lane_of(ushort tiisg) {
+        Lane lane;
+        lane.ix = (short)(tiisg % 4);  // 0...3
+        const short tid = (short)(tiisg / 4);
+        lane.iq = (short)(tid / 4);    // 0 or 1
+        lane.ir = (short)(tid % 4);    // 0...3
+        return lane;
+    }
+
+    static inline int first_block(const thread Lane &lane) {
+        return lane.ix;
+    }
+
+    static inline int block_stride() {
+        return 4;
+    }
+
+    static inline int values_per_block() {
+        return QK_K;
+    }
+
+    static inline int input_offset(const thread Lane &lane) {
+        return Q4K::input_offset(lane);
+    }
+
+    template <LoadMode LOAD>
+    static inline void load(thread Lane &lane,
+                            device const float * block,
+                            device const float * gain,
+                            float scale,
+                            thread float * sum_sq) {
+        Q4K::load<LOAD>(lane, block, gain, scale, sum_sq);
+    }
+
+    // The lane's four group dots of one block: acc1 the nibble sums (the
+    // high nibbles 16 times over, as the byte masks leave them), acc2 the
+    // sums of the activations whose fifth bit is set, and the half's scale
+    // words.
+    static inline void dots(device const Block & blk,
+                            const thread Lane & lane,
+                            thread float4 & acc1,
+                            thread float4 & acc2,
+                            thread uint16_t * sc16) {
+        const short l0 = 8 * lane.ir;
+        device const uint8_t * q1 = blk.qs + 32 * lane.iq + l0;
+        device const uint8_t * q2 = q1 + 64;
+        device const uint8_t * qh = blk.qh + l0;
+        const uint8_t hm1 = 1u << (2 * lane.iq);
+        const uint8_t hm2 = hm1 << 1;
+        const uint8_t hm3 = hm1 << 4;
+        const uint8_t hm4 = hm2 << 4;
+        k4_scale_words((device const uint16_t *)blk.scales + lane.iq, sc16);
+        acc1 = float4(0.f, 0.f, 0.f, 0.f);
+        acc2 = float4(0.f, 0.f, 0.f, 0.f);
+        FOR_UNROLL (short l = 0; l < 8; ++l) {
+            const uint8_t h = qh[l];
+            acc1[0] += lane.yl[l + 0] * (q1[l] & 0x0F);
+            acc1[1] += lane.yl[l + 8] * (q1[l] & 0xF0);
+            acc1[2] += lane.yh[l + 0] * (q2[l] & 0x0F);
+            acc1[3] += lane.yh[l + 8] * (q2[l] & 0xF0);
+            acc2[0] += h & hm1 ? lane.yl[l + 0] : 0.f;
+            acc2[1] += h & hm2 ? lane.yl[l + 8] : 0.f;
+            acc2[2] += h & hm3 ? lane.yh[l + 0] : 0.f;
+            acc2[3] += h & hm4 ? lane.yh[l + 8] : 0.f;
+        }
+    }
+
+    // One block's contribution, in llama.cpp's association: d times the
+    // scaled code sums, less dmin times the scaled activation sums.
+    static inline float partial(device const Block & blk,
+                                const thread Lane & lane) {
+        float4 acc1;
+        float4 acc2;
+        uint16_t sc16[4];
+        dots(blk, lane, acc1, acc2, sc16);
+        thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+        const float d = (float)blk.d;
+        const float dmin = (float)blk.dmin;
+        return d * (sc8[0] * (acc1[0]        + 16.f * acc2[0]) +
+                    sc8[1] * (acc1[1] / 16.f + 16.f * acc2[1]) +
+                    sc8[4] * (acc1[2]        + 16.f * acc2[2]) +
+                    sc8[5] * (acc1[3] / 16.f + 16.f * acc2[3]))
+             - dmin * (lane.sumy[0] * sc8[2] + lane.sumy[1] * sc8[3] +
+                       lane.sumy[2] * sc8[6] + lane.sumy[3] * sc8[7]);
+    }
+
+    // The same block dotted against a head-scaled input, Q4_K's two-halves
+    // form: the block's two 128-value head groups, each scale on its whole
+    // term once, the dmin subtraction per half.
+    static inline float partial_head(device const Block & blk,
+                                     const thread Lane & lane,
+                                     float lo,
+                                     float hi) {
+        float4 acc1;
+        float4 acc2;
+        uint16_t sc16[4];
+        dots(blk, lane, acc1, acc2, sc16);
+        thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+        const float d = (float)blk.d;
+        const float dmin = (float)blk.dmin;
+        return lo * (d * (sc8[0] * (acc1[0]        + 16.f * acc2[0]) +
+                          sc8[1] * (acc1[1] / 16.f + 16.f * acc2[1])) -
+                     dmin * (lane.sumy[0] * sc8[2] + lane.sumy[1] * sc8[3])) +
+               hi * (d * (sc8[4] * (acc1[2]        + 16.f * acc2[2]) +
+                          sc8[5] * (acc1[3] / 16.f + 16.f * acc2[3])) -
+                     dmin * (lane.sumy[2] * sc8[6] + lane.sumy[3] * sc8[7]));
+    }
+
+    static inline float2 head_scales(threadgroup const float * scales, int ib) {
+        return Q4K::head_scales(scales, ib);
+    }
+
+    static inline bool sums_finite(const thread Lane &lane) {
+        return Q4K::sums_finite(lane);
+    }
+
+    static inline int fold_blocks() {
+        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());
+    }
+
+    static inline int fold_slot(int ib) {
+        return ib / (BLOOMERY_EXPERT_K / values_per_block());
+    }
+
+    // The scale and the min of 32-value group `s` (0...7) times d and dmin:
+    // the reader's d1 and m1, both exact in f32.
+    static inline float2 group_scale(device const Block & blk, short s) {
+        uint16_t sc16[4];
+        thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+        k4_scale_words((device const uint16_t *)blk.scales + ((s >> 1) & 1), sc16);
+        const short at = (s & 1) + 4 * (s >> 2);
+        return float2((float)blk.d * (float)sc8[at], (float)blk.dmin * (float)sc8[2 + at]);
+    }
+
+    // The five-bit code of value `j`: its nibble (the low one in the first
+    // 32 values of a 64-value group, the high one in the second) and its
+    // fifth bit.
+    static inline uint code(device const Block & blk, uint j) {
+        const uint group = j / 64;
+        const uint high = (j / 32) & 1;
+        const uint l = j % 32;
+        const uint nibble = (blk.qs[32 * group + l] >> (4 * high)) & 0x0F;
+        const uint fifth = (blk.qh[l] >> (2 * group + high)) & 1;
+        return nibble | (fifth << 4);
+    }
+
+    // Value `j` of a block, the host reader's decode: d1 * q - m1, where
+    // d1 * q (at most 22 significant bits) and m1 are exact in f32, so the
+    // subtraction is the one rounding and the embed's bits are the reader's.
+    static inline float value(device const Block & blk, uint j) {
+        const float2 sm = group_scale(blk, (short)(j / 32));
+        return sm.x * (float)code(blk, j) - sm.y;
+    }
+
+    // Sixteen consecutive values of a block, [16*il, 16*il + 16) in natural
+    // order (value 16*il + j at reg[j/4][j%4]), the GEMM's A staging: the
+    // owner's own value with the group's scale and min taken once (a chunk
+    // sits inside one 32-value group), computed in f32 and rounded once
+    // into the operand type.
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        const float2 sm = group_scale(blk, il >> 1);
+        FOR_UNROLL(short j = 0; j < 16; ++j) {
+            reg[j / 4][j % 4] = sm.x * (float)code(blk, (uint)(16 * il + j)) - sm.y;
         }
     }
 };

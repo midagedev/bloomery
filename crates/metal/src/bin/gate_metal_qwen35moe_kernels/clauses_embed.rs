@@ -113,6 +113,23 @@ pub fn embed(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         gguf::quant::GgmlType::MLX_A4 => Quant::A4,
         other => return Err(format!("token_embd.weight is {other:?}, not a table type")),
     };
+    let checked = embed_table(h, quant, table, vocab)?;
+    refuses_an_odd_table(h)?;
+    Ok(Verdict::Noted(format!(
+        "{checked}, a table at an odd byte refused"
+    )))
+}
+
+/// `table` (`vocab` rows of 2048 columns, of `quant`) embedded: ids in range
+/// bit-equal to the reader's rows with a clean fault word, and ids at and past
+/// the vocabulary raising the token-id site with NaN rows, the ids beside them
+/// still the reader's. The note says what was held.
+pub fn embed_table(
+    h: &Harness<'_>,
+    quant: Quant,
+    table: &[u8],
+    vocab: usize,
+) -> Result<String, String> {
     let cols = 2048;
 
     // Ids in range: the dequantizer's bits, row by row, and a clean word.
@@ -157,11 +174,10 @@ pub fn embed(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             ));
         }
     }
-    refuses_an_odd_table(h)?;
-    Ok(Verdict::Noted(format!(
-        "{} ids bit-equal to the reader, ids {} and {} raised token_id with NaN rows, a table at an odd byte refused",
+    Ok(format!(
+        "{} ids bit-equal to the reader, ids {} and {} raised token_id with NaN rows",
         good.len(),
         vocab,
         u32::MAX
-    )))
+    ))
 }

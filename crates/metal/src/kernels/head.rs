@@ -135,6 +135,8 @@ impl Kernels {
         let pipeline = match p.quant {
             Quant::Q6K => &self.head_q6k,
             Quant::A4 => &self.head_a4,
+            Quant::Q8_0 => &self.head_q8_0,
+            Quant::Q5K => &self.head_q5k,
             // A quant with no head entry is refused by name: the entry is
             // absent, not defaulted.
             Quant::Q4K => {

@@ -1104,6 +1104,218 @@ pub const MUTANTS: &[Mutant] = &[
             1,
         )],
     },
+    Mutant {
+        name: "q8_0_lane_quarter",
+        clause: "q8_0_matvec",
+        why: "a Q8_0 lane dots its activations with the other quarter of the block's codes",
+        edits: &[(
+            "device const int8_t * qs = blk.qs + 8 * lane.il;",
+            "device const int8_t * qs = blk.qs + 8 * (lane.il ^ 1);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_tail_store",
+        clause: "q8_0_row_tail",
+        why: "the store of a pair no longer stops at the last row",
+        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 1)],
+    },
+    Mutant {
+        name: "q8_0_norm_gain",
+        clause: "q8_0_norm",
+        why: "the Q8_0 norm load drops the gain of a value",
+        edits: &[("a0 *= gain[base + l + 0];", "a0 *= 1.f;", 1)],
+    },
+    Mutant {
+        name: "q8_0_seg_weights",
+        clause: "q8_0_seg",
+        why: "a segment reads the weights of the first segment",
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+    },
+    Mutant {
+        name: "q8_0_head_scale",
+        clause: "q8_0_headnorm",
+        why: "a Q8_0 block takes the neighbouring head's scale",
+        edits: &[(
+            "const int head = ib / (BLOOMERY_DELTA_HEAD_COLS / 32);",
+            "const int head = (ib / (BLOOMERY_DELTA_HEAD_COLS / 32)) ^ 1;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_sum_sq",
+        clause: "q8_0_pair",
+        why: "the Q8_0 norm load's sum of squares drops a value",
+        edits: &[(
+            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= gain[base + l + 0];",
+            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= gain[base + l + 0];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_fold_slot",
+        clause: "q8_0_fold",
+        why: "the Q8_0 fold maps every eight blocks, not every sixteen, to a slot",
+        edits: &[(
+            "        return isfinite(sum);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / (BLOOMERY_EXPERT_K / values_per_block());",
+            "        return isfinite(sum);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / 8;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_dot_short",
+        clause: "q8_0_head",
+        why: "the Q8_0 code dot stops one value short of the lane's eight",
+        edits: &[(
+            "FOR_UNROLL (short i = 0; i < 8; ++i) {\n            sumq += qs[i] * lane.yl[i];",
+            "FOR_UNROLL (short i = 0; i < 7; ++i) {\n            sumq += qs[i] * lane.yl[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_value_unsigned",
+        clause: "q8_0_embed",
+        why: "the Q8_0 value reads its code as unsigned",
+        edits: &[(
+            "return (float)blk.qs[j] * (float)blk.d;",
+            "return (float)(uint8_t)blk.qs[j] * (float)blk.d;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_chunk_half",
+        clause: "q8_0_gemm",
+        why: "a GEMM chunk stages the other half of its Q8_0 block",
+        edits: &[(
+            "device const int8_t * q = blk.qs + 16 * il;",
+            "device const int8_t * q = blk.qs + 16 * (il ^ 1);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_gemm_seg_out",
+        clause: "q8_0_gemm_seg",
+        why: "every GEMM segment stores at the first segment's output offset",
+        edits: &[(
+            "                           x,\n                           y + args.segs[s].out,",
+            "                           x,\n                           y,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_stage_unsigned",
+        clause: "q8_0_grouped",
+        why: "the GEMM staging reads the Q8_0 codes as unsigned",
+        edits: &[(
+            "reg[j / 4][j % 4] = (float)q[j] * d;",
+            "reg[j / 4][j % 4] = (float)(uint8_t)q[j] * d;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_high_bit",
+        clause: "q5k_matvec",
+        why: "the second group's fifth bit is read two bits up, not one",
+        edits: &[(
+            "const uint8_t hm2 = hm1 << 1;",
+            "const uint8_t hm2 = hm1 << 2;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_tail_store",
+        clause: "q5k_row_tail",
+        why: "the store of a pair no longer stops at the last row",
+        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 1)],
+    },
+    Mutant {
+        name: "q5k_plain_load",
+        clause: "q5k_norm",
+        why: "the Q5_K load takes the plain form: no gain, no sum of squares",
+        edits: &[(
+            "Q4K::load<LOAD>(lane, block, gain, scale, sum_sq);",
+            "Q4K::load<LOAD_PLAIN>(lane, block, gain, scale, sum_sq);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_seg_weights",
+        clause: "q5k_seg",
+        why: "a segment reads the weights of the first segment",
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+    },
+    Mutant {
+        name: "q5k_head_halves",
+        clause: "q5k_headnorm",
+        why: "the first half of a Q5_K block takes the second head's scale",
+        edits: &[("return lo * (d * (sc8[0]", "return hi * (d * (sc8[0]", 1)],
+    },
+    Mutant {
+        name: "q5k_dmin_sign",
+        clause: "q5k_pair",
+        why: "the Q5_K dmin correction is added, not subtracted",
+        edits: &[("- dmin * (lane.sumy[0]", "+ dmin * (lane.sumy[0]", 1)],
+    },
+    Mutant {
+        name: "q5k_fold_slot",
+        clause: "q5k_fold",
+        why: "the Q5_K fold maps every four blocks, not every two, to a slot",
+        edits: &[(
+            "        return Q4K::sums_finite(lane);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / (BLOOMERY_EXPERT_K / values_per_block());",
+            "        return Q4K::sums_finite(lane);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / 4;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_nibble_group",
+        clause: "q5k_head",
+        why: "the third group's nibbles are read from the first group's bytes",
+        edits: &[(
+            "acc1[2] += lane.yh[l + 0] * (q2[l] & 0x0F);",
+            "acc1[2] += lane.yh[l + 0] * (q1[l] & 0x0F);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_fifth_bit",
+        clause: "q5k_embed",
+        why: "a value in a group's second half takes the first half's fifth bit",
+        edits: &[(
+            "const uint fifth = (blk.qh[l] >> (2 * group + high)) & 1;",
+            "const uint fifth = (blk.qh[l] >> (2 * group)) & 1;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_chunk_group",
+        clause: "q5k_gemm",
+        why: "a GEMM chunk takes the scale and min of the group two chunks on",
+        edits: &[(
+            "const float2 sm = group_scale(blk, il >> 1);",
+            "const float2 sm = group_scale(blk, il >> 2);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_gemm_seg_out",
+        clause: "q5k_gemm_seg",
+        why: "every GEMM segment stores at the first segment's output offset",
+        edits: &[(
+            "                           x,\n                           y + args.segs[s].out,",
+            "                           x,\n                           y,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_scale_byte",
+        clause: "q5k_grouped",
+        why: "the second half's groups take the mins' bytes as their scales",
+        edits: &[(
+            "const short at = (s & 1) + 4 * (s >> 2);",
+            "const short at = (s & 1) + 2 * (s >> 2);",
+            1,
+        )],
+    },
 ];
 
 /// The tensor-op GEMMs' defects, at least one for each `tensor_*` clause.
@@ -1193,6 +1405,58 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
         edits: &[(
             "            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);",
             "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q8_0_rotate",
+        clause: "tensor_q8_0_gemm",
+        why: "a Q8_0 chunk's values rotate inside each four as they are staged",
+        edits: &[(
+            "reg[j / 4][j % 4] = (float)q[j] * d;",
+            "reg[j / 4][(j + 1) % 4] = (float)q[j] * d;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q8_0_seg_out",
+        clause: "tensor_q8_0_gemm_seg",
+        why: "every segment stores at the first segment's output offset",
+        edits: &[("y + args.segs[s].out", "y", 1)],
+    },
+    Mutant {
+        name: "tensor_q8_0_chunk_half",
+        clause: "tensor_q8_0_grouped",
+        why: "a routed chunk stages the other half of its Q8_0 block",
+        edits: &[(
+            "device const int8_t * q = blk.qs + 16 * il;",
+            "device const int8_t * q = blk.qs + 16 * (il ^ 1);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q5k_min_sign",
+        clause: "tensor_q5k_gemm",
+        why: "the staged Q5_K value adds the group's min",
+        edits: &[(
+            "reg[j / 4][j % 4] = sm.x * (float)code(blk, (uint)(16 * il + j)) - sm.y;",
+            "reg[j / 4][j % 4] = sm.x * (float)code(blk, (uint)(16 * il + j)) + sm.y;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q5k_seg_out",
+        clause: "tensor_q5k_gemm_seg",
+        why: "every segment stores at the first segment's output offset",
+        edits: &[("y + args.segs[s].out", "y", 1)],
+    },
+    Mutant {
+        name: "tensor_q5k_scale_words",
+        clause: "tensor_q5k_grouped",
+        why: "a group's scale words come from the other half of the table",
+        edits: &[(
+            "blk.scales + ((s >> 1) & 1), sc16);",
+            "blk.scales + ((s >> 2) & 1), sc16);",
             1,
         )],
     },

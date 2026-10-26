@@ -87,6 +87,8 @@ impl Kernels {
         let pipeline = match p.quant {
             Quant::Q4K => &self.embed_q4k,
             Quant::A4 => &self.embed_a4,
+            Quant::Q8_0 => &self.embed_q8_0,
+            Quant::Q5K => &self.embed_q5k,
             // A quant with no embedding entry is refused by name: the entry
             // is absent, not defaulted.
             Quant::Q6K => {

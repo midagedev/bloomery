@@ -20,7 +20,7 @@ use super::{Quant, args_bytes, check_window_len, pack, word};
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";
 /// Blocks of K': nine slots, two blocks of [`EXPERT_K`] each, in the
-/// 256-value quants' blocks (A4's fold walks its own count).
+/// 256-value quants' blocks (A4's and Q8_0's folds walk their own counts).
 const _: () = assert!(super::geometry::BLOCK_VALUES == 256);
 const _: () = assert!(FOLDED_BLOCKS == EXPERT_SLOTS * (EXPERT_K / super::geometry::BLOCK_VALUES));
 
@@ -299,9 +299,13 @@ pub(crate) struct Pipelines {
     pair_q4: Pipeline,
     pair_q6: Pipeline,
     pair_a4: Pipeline,
+    pair_q8_0: Pipeline,
+    pair_q5k: Pipeline,
     fold_q4: Pipeline,
     fold_q6: Pipeline,
     fold_a4: Pipeline,
+    fold_q8_0: Pipeline,
+    fold_q5k: Pipeline,
 }
 
 impl Pipelines {
@@ -312,9 +316,13 @@ impl Pipelines {
             pair_q4: library.pipeline_with_simdgroups("q4k_pair_swiglu", simdgroups)?,
             pair_q6: library.pipeline_with_simdgroups("q6k_pair_swiglu", simdgroups)?,
             pair_a4: library.pipeline_with_simdgroups("a4_pair_swiglu", simdgroups)?,
+            pair_q8_0: library.pipeline_with_simdgroups("q8_0_pair_swiglu", simdgroups)?,
+            pair_q5k: library.pipeline_with_simdgroups("q5k_pair_swiglu", simdgroups)?,
             fold_q4: library.pipeline_with_simdgroups("q4k_down_fold", simdgroups)?,
             fold_q6: library.pipeline_with_simdgroups("q6k_down_fold", simdgroups)?,
             fold_a4: library.pipeline_with_simdgroups("a4_down_fold", simdgroups)?,
+            fold_q8_0: library.pipeline_with_simdgroups("q8_0_down_fold", simdgroups)?,
+            fold_q5k: library.pipeline_with_simdgroups("q5k_down_fold", simdgroups)?,
         })
     }
 
@@ -323,6 +331,8 @@ impl Pipelines {
             Quant::Q4K => &self.pair_q4,
             Quant::Q6K => &self.pair_q6,
             Quant::A4 => &self.pair_a4,
+            Quant::Q8_0 => &self.pair_q8_0,
+            Quant::Q5K => &self.pair_q5k,
         }
     }
 
@@ -331,6 +341,8 @@ impl Pipelines {
             Quant::Q4K => &self.fold_q4,
             Quant::Q6K => &self.fold_q6,
             Quant::A4 => &self.fold_a4,
+            Quant::Q8_0 => &self.fold_q8_0,
+            Quant::Q5K => &self.fold_q5k,
         }
     }
 }

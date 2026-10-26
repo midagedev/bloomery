@@ -57,6 +57,10 @@ mod clauses_head;
 mod clauses_matvec;
 #[path = "clauses_norm.rs"]
 mod clauses_norm;
+#[path = "clauses_q5k.rs"]
+mod clauses_q5k;
+#[path = "clauses_q8_0.rs"]
+mod clauses_q8_0;
 #[path = "clauses_route.rs"]
 mod clauses_route;
 #[path = "clauses_router.rs"]
@@ -65,6 +69,8 @@ mod clauses_router;
 mod clauses_rows;
 #[path = "clauses_seg.rs"]
 mod clauses_seg;
+#[path = "clauses_synth.rs"]
+mod clauses_synth;
 #[path = "clauses_tensor.rs"]
 mod clauses_tensor;
 #[path = "common.rs"]
@@ -85,6 +91,8 @@ mod oracle_delta;
 mod oracle_experts;
 #[path = "../shared/oracle_router.rs"]
 mod oracle_router;
+#[path = "../shared/synthetic.rs"]
+mod synthetic;
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -702,6 +710,8 @@ pub fn main() -> ExitCode {
     let clauses: Vec<_> = front
         .into_iter()
         .chain(clauses_a4::table(ctx.harness, &mlx))
+        .chain(clauses_q8_0::table(ctx.harness))
+        .chain(clauses_q5k::table(ctx.harness))
         .chain(clauses_gemm::table(ctx.harness, ctx.fixture, &mlx))
         .chain(clauses_delta::table(&ctx))
         .chain(clauses_router::table(&ctx))

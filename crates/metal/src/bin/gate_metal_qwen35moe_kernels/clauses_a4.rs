@@ -5,21 +5,18 @@
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
-use bloomery_metal::kernels::{
-    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_K, PARTIALS_PER_HEAD, Quant, ROUTED_IDS, VALUE_HEADS,
-};
+use bloomery_metal::kernels::{HEAD_COLS, HEAD_K, PARTIALS_PER_HEAD, Quant, VALUE_HEADS};
 
 use super::clauses_embed;
 use super::clauses_experts::{
-    self, PairIn, check_fold_quant, check_pair_quant, ffn_norm, fold_bad_id, fold_weights_of,
-    launch_pair,
+    self, check_fold_quant, check_pair_quant, ffn_norm, fold_bad_id, fold_weights_of,
 };
 use super::clauses_head;
 use super::clauses_norm::head_partials;
 use super::common::{self, LAYER};
 use super::fixture::{Fixture, OUTPUT_ROWS};
 use super::oracle::{self, Kind};
-use super::{Harness, HeadNormLaunch, Launch, ModeSpec, SENTINEL_BITS};
+use super::{Harness, HeadNormLaunch, Launch, ModeSpec};
 
 /// The store dot at the Q4_K clause's shapes and the head's tail rows.
 pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
@@ -390,120 +387,7 @@ pub fn a4_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
 pub fn a4_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let worst = check_pair_quant(h, fix, Quant::A4)?;
     let weights = clauses_experts::pair_weights(fix, Quant::A4)?;
-    let norm = ffn_norm(fix)?;
-    let x = oracle::activations(2048, 0x1B1D, 1.0);
-    let y_len = EXPERT_SLOTS * EXPERT_K;
-    let ids: [i32; ROUTED_IDS] = [0, 1, 2, 3, 1, 2, 3, 0];
-
-    // An id past the stack: that slot's rows NaN, the others the clean bits.
-    h.clear_fault()?;
-    let clean = launch_pair(
-        h,
-        PairIn {
-            quant: Quant::A4,
-            n_experts: 4,
-            ids: &ids,
-            gate: &weights.gate,
-            up: &weights.up,
-            shared_gate: &weights.shared_gate,
-            shared_up: &weights.shared_up,
-            x: &x,
-            norm: &norm,
-            y0: &vec![f32::from_bits(SENTINEL_BITS); y_len],
-        },
-    )?;
-    if let Some(f) = h.fault()? {
-        return Err(format!("the clean pair raised {f}"));
-    }
-    for bad in [-1, 4] {
-        let mut bad_ids = ids;
-        bad_ids[3] = bad;
-        h.clear_fault()?;
-        let got = launch_pair(
-            h,
-            PairIn {
-                quant: Quant::A4,
-                n_experts: 4,
-                ids: &bad_ids,
-                gate: &weights.gate,
-                up: &weights.up,
-                shared_gate: &weights.shared_gate,
-                shared_up: &weights.shared_up,
-                x: &x,
-                norm: &norm,
-                y0: &vec![1.0; y_len],
-            },
-        )?;
-        common::expect_fault(h, &format!("id {bad}"), FaultSite::ExpertId)?;
-        for slot in 0..EXPERT_SLOTS {
-            let row = &got[slot * EXPERT_K..(slot + 1) * EXPERT_K];
-            let clean_row = &clean[slot * EXPERT_K..(slot + 1) * EXPERT_K];
-            if slot == 3 {
-                if let Some(k) = row.iter().position(|v| !v.is_nan()) {
-                    return Err(format!("id {bad} slot 3 row {k} is {:?}, not NaN", row[k]));
-                }
-            } else if let Some(k) = row
-                .iter()
-                .zip(clean_row)
-                .position(|(g, c)| g.to_bits() != c.to_bits())
-            {
-                return Err(format!(
-                    "id {bad} slot {slot} row {k} changed to {:?} (clean {:?})",
-                    row[k], clean_row[k]
-                ));
-            }
-        }
-    }
-
-    // The norm's fault inputs: NaN rows in all nine slots' rows.
-    for (what, mut x, eps) in [
-        (
-            "a NaN input",
-            oracle::activations(2048, 0x1A0, 1.0),
-            norm.eps,
-        ),
-        (
-            "an infinite input",
-            oracle::activations(2048, 0x1A1, 1.0),
-            norm.eps,
-        ),
-        ("a zero input and a zero epsilon", vec![0f32; 2048], 0.0),
-    ] {
-        match what {
-            "a NaN input" => x[17] = f32::NAN,
-            "an infinite input" => x[2047] = f32::INFINITY,
-            _ => {}
-        }
-        h.clear_fault()?;
-        let got = launch_pair(
-            h,
-            PairIn {
-                quant: Quant::A4,
-                n_experts: 4,
-                ids: &ids,
-                gate: &weights.gate,
-                up: &weights.up,
-                shared_gate: &weights.shared_gate,
-                shared_up: &weights.shared_up,
-                x: &x,
-                norm: &clauses_experts::PairNorm {
-                    gain: norm.gain.clone(),
-                    eps,
-                },
-                y0: &vec![1.0; y_len],
-            },
-        )?;
-        common::expect_fault(h, what, FaultSite::NormQuant)?;
-        if let Some(k) = got.iter().position(|v| !v.is_nan()) {
-            return Err(format!(
-                "{what}: slot {} row {} is {:?}, not NaN",
-                k / EXPERT_K,
-                k % EXPERT_K,
-                got[k]
-            ));
-        }
-    }
-    h.clear_fault()?;
+    clauses_experts::pair_faults(h, Quant::A4, &weights, &ffn_norm(fix)?)?;
     Ok(Verdict::Noted(format!(
         "worst error over its band: {worst}; ids -1 and the stack length raised expert_id, \
          NaN in that slot only; the norm's fault inputs raised norm_quant, NaN in all nine \

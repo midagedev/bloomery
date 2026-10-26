@@ -1,4 +1,4 @@
-//! The launch of the Q4_K, Q6_K and A4 mat-vecs.
+//! The launch of the Q4_K, Q6_K, A4, Q8_0 and Q5_K mat-vecs.
 
 use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
@@ -17,6 +17,10 @@ pub enum Quant {
     Q6K,
     /// MLX's affine 4-bit: 36-byte groups of 64 values (`MLX_A4`).
     A4,
+    /// GGUF `Q8_0`: 34-byte blocks of 32 values.
+    Q8_0,
+    /// GGUF `Q5_K`: 176-byte blocks of 256 values.
+    Q5K,
 }
 
 impl Quant {
@@ -32,11 +36,13 @@ impl Quant {
         .expect("a block size fits usize")
     }
 
-    /// Every type a mat-vec reads.
+    /// Every type a session's arena opens. Q8_0 and Q5_K have kernels but no
+    /// arena site yet, so they are not here.
     pub const ALL: [Quant; 3] = [Self::Q4K, Self::Q6K, Self::A4];
 
-    /// The kernel type that reads file type `ty`, or `None` for a type no
-    /// mat-vec reads: [`Quant::ggml`] read backwards, the one map.
+    /// The kernel type that reads file type `ty`, or `None` for a type a
+    /// session does not open: [`Quant::ggml`] read backwards over
+    /// [`Quant::ALL`], the one map.
     #[must_use]
     pub fn of_ggml(ty: gguf::quant::GgmlType) -> Option<Quant> {
         Self::ALL.into_iter().find(|q| q.ggml() == ty)
@@ -49,6 +55,8 @@ impl Quant {
             Self::Q4K => gguf::quant::GgmlType::Q4_K,
             Self::Q6K => gguf::quant::GgmlType::Q6_K,
             Self::A4 => gguf::quant::GgmlType::MLX_A4,
+            Self::Q8_0 => gguf::quant::GgmlType::Q8_0,
+            Self::Q5K => gguf::quant::GgmlType::Q5_K,
         }
     }
 
@@ -71,6 +79,8 @@ impl Quant {
             Self::Q4K => "q4k",
             Self::Q6K => "q6k",
             Self::A4 => "a4",
+            Self::Q8_0 => "q8_0",
+            Self::Q5K => "q5k",
         }
     }
 }
@@ -212,6 +222,8 @@ impl Kernels {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
             Quant::A4 => &self.a4,
+            Quant::Q8_0 => &self.q8_0,
+            Quant::Q5K => &self.q5k,
         };
         encoder.set_pipeline(family.of(&p.mode));
         let mut slot = Bindings::new(encoder);

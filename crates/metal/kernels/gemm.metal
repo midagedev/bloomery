@@ -1,7 +1,7 @@
 // The dense quantized GEMM: y[r][n] = sum_k W[n][k] * x[r][k] over R
 // activation rows, one dispatch. The entry points, under their host names:
 //
-//   gemm_{q4k,q6k,a4}_{store,resid}[_seg]_{f16,f32}
+//   gemm_{q4k,q6k,a4,q8_0,q5k}_{store,resid}[_seg]_{f16,f32}
 //
 //   store    y = W . x
 //   resid    y = y + W . x, in place: the residual epilogue, the decode
@@ -432,3 +432,19 @@ GEMM_SEG_ENTRY(a4_seg_store_f16, A4, half, false, gemm_seg_kernel)
 GEMM_SEG_ENTRY(a4_seg_store_f32, A4, float, false, gemm_seg_kernel)
 GEMM_SEG_ENTRY(a4_seg_resid_f16, A4, half, true, gemm_seg_kernel)
 GEMM_SEG_ENTRY(a4_seg_resid_f32, A4, float, true, gemm_seg_kernel)
+GEMM_ENTRY(q8_0_store_f16, Q8_0, half, false, gemm_kernel)
+GEMM_ENTRY(q8_0_store_f32, Q8_0, float, false, gemm_kernel)
+GEMM_ENTRY(q8_0_resid_f16, Q8_0, half, true, gemm_kernel)
+GEMM_ENTRY(q8_0_resid_f32, Q8_0, float, true, gemm_kernel)
+GEMM_SEG_ENTRY(q8_0_seg_store_f16, Q8_0, half, false, gemm_seg_kernel)
+GEMM_SEG_ENTRY(q8_0_seg_store_f32, Q8_0, float, false, gemm_seg_kernel)
+GEMM_SEG_ENTRY(q8_0_seg_resid_f16, Q8_0, half, true, gemm_seg_kernel)
+GEMM_SEG_ENTRY(q8_0_seg_resid_f32, Q8_0, float, true, gemm_seg_kernel)
+GEMM_ENTRY(q5k_store_f16, Q5K, half, false, gemm_kernel)
+GEMM_ENTRY(q5k_store_f32, Q5K, float, false, gemm_kernel)
+GEMM_ENTRY(q5k_resid_f16, Q5K, half, true, gemm_kernel)
+GEMM_ENTRY(q5k_resid_f32, Q5K, float, true, gemm_kernel)
+GEMM_SEG_ENTRY(q5k_seg_store_f16, Q5K, half, false, gemm_seg_kernel)
+GEMM_SEG_ENTRY(q5k_seg_store_f32, Q5K, float, false, gemm_seg_kernel)
+GEMM_SEG_ENTRY(q5k_seg_resid_f16, Q5K, half, true, gemm_seg_kernel)
+GEMM_SEG_ENTRY(q5k_seg_resid_f32, Q5K, float, true, gemm_seg_kernel)

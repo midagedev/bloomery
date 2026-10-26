@@ -1,7 +1,8 @@
 // The embedding kernels: row `ids[t]` of a quantized table, dequantized into
 // row t of an f32 output, one thread per value — `embed_q4k` over a Q4_K
-// table, `embed_a4` over MLX's affine 4-bit groups (the owner's value decode,
-// quant.metal, not a second copy of the rule).
+// table, and one body over the owners' value decode (quant.metal, not a
+// second copy of the rule) for the others: `embed_a4` over MLX's affine
+// 4-bit groups, `embed_q8_0` over Q8_0, `embed_q5k` over Q5_K.
 //
 // An id at or past the table's rows is undefined input: the kernel raises the
 // token-id site in `layer`, reads no table word, and writes NaN to every value
@@ -9,12 +10,13 @@
 //
 // The Q4_K value is the dequantizer's (ggml's dequantize_row_q4_K): d1 * q -
 // m1, where `d * sc`, `d * sc * q` and `dmin * m` are exact in f32, so a fused
-// or an unfused subtraction gives the same bits. The A4 value is the owner's,
-// the host reader's `s·q + b` with the product and the sum each rounded once
-// (the fp-contract pragma holds the order), so the embed's bits are the
-// reader's.
+// or an unfused subtraction gives the same bits. The others' value is the
+// owner's: A4's the host reader's `s·q + b` with the product and the sum
+// each rounded once (the fp-contract pragma holds the order), Q8_0's `q·d`
+// exact, Q5_K's `d1·q − m1` with the subtraction the one rounding — so the
+// embed's bits are the reader's.
 //
-// This file comes after quant.metal (QK_K, the block structs, the A4 owner)
+// This file comes after quant.metal (QK_K, the block structs, the owners)
 // and fault.metal (raise).
 
 #include <metal_stdlib>
@@ -78,15 +80,18 @@ kernel void embed_q4k(device const block_q4_K * table [[buffer(0)]],
     out[gid] = value;
 }
 
-kernel void embed_a4(device const block_mlx_a4 * table [[buffer(0)]],
-                     device const uint       * ids [[buffer(1)]],
-                     device float            * out [[buffer(2)]],
-                     constant EmbedArgs      & args [[buffer(3)]],
-                     device atomic_uint      * faults [[buffer(4)]],
-                     uint gid [[thread_position_in_grid]])
+// A table over a decode owner: the owner's value of each place.
+template <typename Q>
+kernel void embed_kernel(device const typename Q::Block * table [[buffer(0)]],
+                         device const uint       * ids [[buffer(1)]],
+                         device float            * out [[buffer(2)]],
+                         constant EmbedArgs      & args [[buffer(3)]],
+                         device atomic_uint      * faults [[buffer(4)]],
+                         uint gid [[thread_position_in_grid]])
 {
-    // A group holds 64 values; the args' block count counts groups.
-    const uint width = args.nblocks * 64;
+    // The args' block count counts the owner's blocks.
+    const uint per = (uint)Q::values_per_block();
+    const uint width = args.nblocks * per;
     if ((ulong)gid >= (ulong)args.count * (ulong)width) {
         return;
     }
@@ -95,8 +100,8 @@ kernel void embed_a4(device const block_mlx_a4 * table [[buffer(0)]],
     const uint id = ids[t];
     float v;
     if (id < args.vocab) {
-        device const block_mlx_a4 & b = table[(ulong)id * args.nblocks + k / 64];
-        v = A4::value(b, k % 64);
+        device const typename Q::Block & b = table[(ulong)id * args.nblocks + k / per];
+        v = Q::value(b, k % per);
     } else {
         if (k == 0) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_TOKEN_ID);
@@ -105,3 +110,16 @@ kernel void embed_a4(device const block_mlx_a4 * table [[buffer(0)]],
     }
     out[gid] = v;
 }
+
+#define EMBED_ENTRY(NAME, Q)                                                      \
+    template [[host_name(#NAME)]] kernel void embed_kernel<Q>(                    \
+        device const Q::Block * table [[buffer(0)]],                              \
+        device const uint     * ids [[buffer(1)]],                                \
+        device float          * out [[buffer(2)]],                                \
+        constant EmbedArgs    & args [[buffer(3)]],                               \
+        device atomic_uint    * faults [[buffer(4)]],                             \
+        uint gid [[thread_position_in_grid]]);
+
+EMBED_ENTRY(embed_a4, A4)
+EMBED_ENTRY(embed_q8_0, Q8_0)
+EMBED_ENTRY(embed_q5k, Q5K)

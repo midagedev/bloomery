@@ -297,7 +297,8 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
 
 /// One matrix of random blocks the probe's way: random bytes, with the
 /// scales (and the mins, the biases) small and finite — an f16 pair in
-/// [0.0005, 0.004] for Q4_K and Q6_K, a BF16 pair for A4's groups.
+/// [0.0005, 0.004] for Q4_K, Q5_K, Q6_K and Q8_0, a BF16 pair for A4's
+/// groups.
 fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     let block = quant.block_bytes();
     let blocks = rows * cols / quant.values_per_block();
@@ -319,11 +320,12 @@ fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     let zero_bias = gguf::quant::fp32_to_bf16_bits(0.0).to_le_bytes();
     for b in bytes.chunks_exact_mut(block) {
         match quant {
-            Quant::Q4K => {
+            Quant::Q4K | Quant::Q5K => {
                 b[0..2].copy_from_slice(&small_f16(&mut rng));
                 b[2..4].copy_from_slice(&small_f16(&mut rng));
             }
             Quant::Q6K => b[208..210].copy_from_slice(&small_f16(&mut rng)),
+            Quant::Q8_0 => b[0..2].copy_from_slice(&small_f16(&mut rng)),
             // A group: the scale and the bias at its end, both BF16, so the
             // reader's finiteness check takes the matrix.
             Quant::A4 => {

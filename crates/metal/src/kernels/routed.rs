@@ -84,6 +84,8 @@ pub(crate) struct RoutedPipelines {
     q4k: RoutedFamily,
     q6k: RoutedFamily,
     a4: RoutedFamily,
+    q8_0: RoutedFamily,
+    q5k: RoutedFamily,
     f32w: Pipeline,
     select: Pipeline,
     table: Pipeline,
@@ -100,6 +102,8 @@ impl RoutedPipelines {
             q4k: RoutedFamily::new(gemm, "q4k")?,
             q6k: RoutedFamily::new(gemm, "q6k")?,
             a4: RoutedFamily::new(gemm, "a4")?,
+            q8_0: RoutedFamily::new(gemm, "q8_0")?,
+            q5k: RoutedFamily::new(gemm, "q5k")?,
             f32w: library.pipeline("gemm_f32w_store_f32")?,
             select: library.pipeline("route_rows_select")?,
             table: library.pipeline("route_table")?,
@@ -113,6 +117,8 @@ impl RoutedPipelines {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
             Quant::A4 => &self.a4,
+            Quant::Q8_0 => &self.q8_0,
+            Quant::Q5K => &self.q5k,
         }
     }
 }

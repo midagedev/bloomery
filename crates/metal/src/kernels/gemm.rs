@@ -503,6 +503,8 @@ impl Kernels {
             Quant::Q4K => &self.q4k_gemm,
             Quant::Q6K => &self.q6k_gemm,
             Quant::A4 => &self.a4_gemm,
+            Quant::Q8_0 => &self.q8_0_gemm,
+            Quant::Q5K => &self.q5k_gemm,
         };
         encoder.set_pipeline(family.of(d.seg, d.mode, d.operand));
         let mut slot = Bindings::new(encoder);

@@ -1,7 +1,7 @@
 // The grouped GEMM of the routed experts, and the dense GEMM over f32 weight
 // rows. The entry points, under their host names:
 //
-//   gemm_routed_{q4k,q6k,a4}_{pair,plain}_{f16,f32}
+//   gemm_routed_{q4k,q6k,a4,q8_0,q5k}_{pair,plain}_{f16,f32}
 //   gemm_f32w_store_f32
 //
 //   pair     y[p][o] = silu(gate_e[o] . x) * (up_e[o] . x) * w[p], the
@@ -353,3 +353,11 @@ ROUTED_ENTRY(a4_pair_f16, A4, half, true)
 ROUTED_ENTRY(a4_pair_f32, A4, float, true)
 ROUTED_ENTRY(a4_plain_f16, A4, half, false)
 ROUTED_ENTRY(a4_plain_f32, A4, float, false)
+ROUTED_ENTRY(q8_0_pair_f16, Q8_0, half, true)
+ROUTED_ENTRY(q8_0_pair_f32, Q8_0, float, true)
+ROUTED_ENTRY(q8_0_plain_f16, Q8_0, half, false)
+ROUTED_ENTRY(q8_0_plain_f32, Q8_0, float, false)
+ROUTED_ENTRY(q5k_pair_f16, Q5K, half, true)
+ROUTED_ENTRY(q5k_pair_f32, Q5K, float, true)
+ROUTED_ENTRY(q5k_plain_f16, Q5K, half, false)
+ROUTED_ENTRY(q5k_plain_f32, Q5K, float, false)

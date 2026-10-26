@@ -17,6 +17,10 @@
 //   a4_matvec / _norm / _resid / _seg /
 //   a4_matvec_headnorm_resid  the same over MLX's affine 4-bit groups,
 //                             instantiated in matvec_a4.metal
+//   q8_0_matvec / ..., q5k_matvec / ...
+//                             the same five over Q8_0 and Q5_K,
+//                             instantiated in matvec_q8_0.metal and
+//                             matvec_q5k.metal
 //
 // The row loop is llama.cpp's (kernel_mul_mv_q4_K_f32 and
 // kernel_mul_mv_q6_K_f32, MIT licence; see THIRD_PARTY_NOTICES.md):

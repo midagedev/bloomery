@@ -1,21 +1,25 @@
 //! The pair's band and the fold's band.
 
-use bloomery_metal::kernels::{BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, Quant};
+use bloomery_metal::kernels::{EXPERT_K, EXPERT_SLOTS, Quant};
 
 use super::oracle::{self, Kind, U, silu};
 
-/// The blocks of one fold: the hidden states of every slot, `slots * k`
-/// columns.
-const FOLD_BLOCKS: usize = EXPERT_SLOTS * EXPERT_K / BLOCK_VALUES;
+/// The blocks of one fold in `quant`'s own blocks: the hidden states of
+/// every slot, `slots * k` columns (eighteen 256-value blocks, seventy-two
+/// A4 groups, a hundred and forty-four Q8_0 blocks).
+fn fold_blocks(quant: Quant) -> usize {
+    EXPERT_SLOTS * EXPERT_K / quant.values_per_block()
+}
 
-/// The operations the fold adds to a store path of `FOLD_BLOCKS` blocks: the
-/// route-weight product on the load and the residual add (2), over the store
-/// path's own base (13 for Q4_K, 9 for Q6_K) and SIMD-group sum (31).
+/// The operations the fold adds to a store path of [`fold_blocks`] blocks:
+/// the route-weight product on the load and the residual add (2), over the
+/// store path's own base and SIMD-group sum (31).
 ///
 /// PIN(2026-10-23): pair = the norm-on-load mat-vec band, silu's slope under
-/// 1.1, exp's 4 ulp; fold = the store path of 18 blocks (base 13, SIMD sum 31) plus the
-/// route weight and the residual (2). The model in this module's doc, and no
-/// measured error, sets the counts.
+/// 1.1, exp's 4 ulp; fold = the store path of the quant's own block count
+/// plus the route weight and the residual (2). The model in this module's
+/// doc, and no measured error, sets the counts.
+/// PIN(2026-10-25): each quant's own block count widens A4's fold band from `G(45)` to `G(51)`.
 const FOLD_EXTRA_OPS: usize = 2;
 
 /// `(want, width)` for one output `silu(g) * u`.
@@ -59,7 +63,7 @@ pub fn pair_width(
 /// contributes `U |y|` on top of gamma of the fold's operation count.
 #[must_use]
 pub fn fold_width(quant: Quant, magnitude: f64, y: f64) -> f64 {
-    let n = oracle::band(quant, FOLD_BLOCKS, Kind::Store).ops() + FOLD_EXTRA_OPS;
+    let n = oracle::band(quant, fold_blocks(quant), Kind::Store).ops() + FOLD_EXTRA_OPS;
     let factor = oracle::gamma_bound(n);
     let floor = n as f64 * f64::from(f32::MIN_POSITIVE);
     factor * magnitude * (1.0 + U) + U * y.abs() + floor

@@ -10,7 +10,10 @@ use super::oracle::Rng;
 
 /// One matrix of random blocks: random bytes, with the scales (and the
 /// mins, the biases) small and finite — an f16 pair in [0.0005, 0.004] for
-/// Q4_K and Q6_K, a BF16 pair for A4's groups.
+/// Q4_K, Q6_K and Q8_0, a BF16 pair for A4's groups, and an f16 pair in
+/// [0.0001, 0.0008] for Q5_K: under its 6-bit sub-scales and 5-bit codes the
+/// wider range's weights reach 0.004 · 63 · 31, and their pair outputs pass
+/// the half range a GEMM's f16 operand takes.
 pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     let block = quant.block_bytes();
     let blocks = rows * cols / quant.values_per_block();
@@ -25,6 +28,10 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
         let unit = (rng.signed() + 1.0) / 2.0;
         gguf::quant::f32_to_f16_bits(0.0005 + 0.0035 * unit).to_le_bytes()
     };
+    let k5_f16 = |rng: &mut Rng| {
+        let unit = (rng.signed() + 1.0) / 2.0;
+        gguf::quant::f32_to_f16_bits(0.0001 + 0.0007 * unit).to_le_bytes()
+    };
     let small_bf16 = |rng: &mut Rng| {
         let unit = (rng.signed() + 1.0) / 2.0;
         gguf::quant::fp32_to_bf16_bits(0.0005 + 0.0035 * unit).to_le_bytes()
@@ -36,7 +43,12 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
                 b[0..2].copy_from_slice(&small_f16(&mut rng));
                 b[2..4].copy_from_slice(&small_f16(&mut rng));
             }
+            Quant::Q5K => {
+                b[0..2].copy_from_slice(&k5_f16(&mut rng));
+                b[2..4].copy_from_slice(&k5_f16(&mut rng));
+            }
             Quant::Q6K => b[208..210].copy_from_slice(&small_f16(&mut rng)),
+            Quant::Q8_0 => b[0..2].copy_from_slice(&small_f16(&mut rng)),
             // A group: the scale and the bias at its end, both BF16, so the
             // reader's finiteness check takes the matrix.
             Quant::A4 => {

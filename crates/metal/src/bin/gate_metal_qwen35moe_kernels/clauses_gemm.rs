@@ -11,8 +11,9 @@
 //! model over the GEMM's own evaluation tree:
 //!
 //! - every weight value carries its owner's dequant arithmetic in f32: four
-//!   roundings for Q4_K (`d·sc`, `·q`, `dmin·min`, the subtraction), two for
-//!   Q6_K (`d·sc`, `·(q−32)`) and two for A4 (`s·q`, `+b`);
+//!   roundings for Q4_K and Q5_K (`d·sc`, `·q`, `dmin·min`, the
+//!   subtraction), two for Q6_K (`d·sc`, `·(q−32)`), two for A4 (`s·q`,
+//!   `+b`) and one for Q8_0 (`q·d`);
 //! - the f32 operand's product rounds once; the f16 operand's two casts
 //!   round once each into half (2^-11 relative) and their products are exact
 //!   in the f32 accumulator (two eleven-bit mantissas);
@@ -274,8 +275,9 @@ pub(super) fn gemm_band(
     path: GemmPath,
 ) -> (f64, usize) {
     let base = match quant {
-        Quant::Q4K => 4,
+        Quant::Q4K | Quant::Q5K => 4,
         Quant::Q6K | Quant::A4 => 2,
+        Quant::Q8_0 => 1,
     };
     let acc = match path {
         GemmPath::Simdgroup => cols / 8 + 8,
@@ -362,16 +364,16 @@ fn check_rows(
 
 /// One case of a store or resid clause: the tensor's bytes, its shape and
 /// the strides (the tight ones unless named).
-struct Case<'a> {
-    label: String,
-    weights: &'a [u8],
-    quant: Quant,
-    rows: usize,
-    cols: usize,
-    acts: usize,
-    x_stride: usize,
-    y_stride: usize,
-    seed: u64,
+pub(super) struct Case<'a> {
+    pub(super) label: String,
+    pub(super) weights: &'a [u8],
+    pub(super) quant: Quant,
+    pub(super) rows: usize,
+    pub(super) cols: usize,
+    pub(super) acts: usize,
+    pub(super) x_stride: usize,
+    pub(super) y_stride: usize,
+    pub(super) seed: u64,
 }
 
 /// The cases one store or resid clause runs, both operand arms: the
@@ -659,7 +661,7 @@ pub fn gemm_a4_resid(h: &Harness<'_>, mlx: &Fixture) -> Clause {
 /// Every dense arm of one weight type on `h`'s kernels (the tensor-op
 /// kernels, for the `tensor_gemm_*` clauses): both epilogues in both
 /// operands, every case within the band of `h`'s GEMM path.
-fn tensor_arms(h: &Harness<'_>, cases: &[Case<'_>]) -> Clause {
+pub(super) fn dense_arms(h: &Harness<'_>, cases: &[Case<'_>]) -> Clause {
     let mut notes = Vec::new();
     for mode in [GemmMode::Store, GemmMode::Residual] {
         let Verdict::Noted(note) = run_cases(h, mode, cases)? else {
@@ -675,15 +677,15 @@ fn tensor_arms(h: &Harness<'_>, cases: &[Case<'_>]) -> Clause {
 }
 
 pub fn tensor_gemm_q4k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    tensor_arms(h, &q4k_cases(fixture)?)
+    dense_arms(h, &q4k_cases(fixture)?)
 }
 
 pub fn tensor_gemm_q6k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    tensor_arms(h, &q6k_cases(fixture)?)
+    dense_arms(h, &q6k_cases(fixture)?)
 }
 
 pub fn tensor_gemm_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    tensor_arms(h, &a4_cases(mlx)?)
+    dense_arms(h, &a4_cases(mlx)?)
 }
 
 /// Every segment of a segmented dispatch is the same bits as the same tensor
@@ -692,13 +694,7 @@ pub fn tensor_gemm_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
 /// per weight type, a tail segment in two of them, both operand arms and
 /// both epilogues.
 pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
-    let acts = 33;
-    let cols = 2048;
-    struct Group<'a> {
-        quant: Quant,
-        segments: Vec<(usize, &'a [u8])>,
-        mode: GemmMode,
-    }
+    let cols = SEG_COLS;
     let q4k_tail = fixture.rows_at(
         "blk.0.attn_qkv.weight",
         gguf::quant::GgmlType::Q4_K,
@@ -707,7 +703,7 @@ pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
         511,
     )?;
     let groups = [
-        Group {
+        SegGroup {
             quant: Quant::Q4K,
             segments: vec![
                 (
@@ -732,7 +728,7 @@ pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
             ],
             mode: GemmMode::Store,
         },
-        Group {
+        SegGroup {
             quant: Quant::Q6K,
             segments: vec![(
                 8192,
@@ -745,7 +741,7 @@ pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
             )],
             mode: GemmMode::Residual,
         },
-        Group {
+        SegGroup {
             quant: Quant::A4,
             segments: vec![
                 (
@@ -780,6 +776,29 @@ pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
             mode: GemmMode::Store,
         },
     ];
+    Ok(Verdict::Noted(format!(
+        "every segment the same bits as its tensor alone: {}",
+        seg_groups(h, &groups)?.join(", ")
+    )))
+}
+
+/// The columns of every segment [`seg_groups`] runs.
+pub(super) const SEG_COLS: usize = 2048;
+
+/// One group of a segmented dispatch: one weight type's segments, each
+/// `SEG_COLS` columns, and the epilogue.
+pub(super) struct SegGroup<'a> {
+    pub(super) quant: Quant,
+    pub(super) segments: Vec<(usize, &'a [u8])>,
+    pub(super) mode: GemmMode,
+}
+
+/// Each group's segmented dispatch, both operand arms, every segment
+/// against its own single launch, bit for bit; every column of the output
+/// written. One note per group and arm.
+pub(super) fn seg_groups(h: &Harness<'_>, groups: &[SegGroup<'_>]) -> Result<Vec<String>, String> {
+    let acts = 33;
+    let cols = SEG_COLS;
     let mut parts = Vec::new();
     for (g, group) in groups.iter().enumerate() {
         let rows: usize = group.segments.iter().map(|(r, _)| r).sum();
@@ -865,10 +884,7 @@ pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
             ));
         }
     }
-    Ok(Verdict::Noted(format!(
-        "every segment the same bits as its tensor alone: {}",
-        parts.join(", ")
-    )))
+    Ok(parts)
 }
 
 /// The f16 operand's range check: an activation that is not finite or past

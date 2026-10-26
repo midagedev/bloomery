@@ -18,11 +18,14 @@
 //!   within the tensor path's band; an activation past the half range the
 //!   fault and NaN; a tile past the tile's slots the expert-id site with
 //!   nothing stored.
+//! - `tensor_q8_0_*`, `tensor_q5k_*`: the dense, segmented and grouped GEMMs
+//!   of the owners no fixture holds yet, on synthetic rows
+//!   (`clauses_synth`).
 
 use bloomery_device::conformance::Clause;
 
 use super::fixture::Fixture;
-use super::{ClauseRun, Harness, clauses_gemm, clauses_route};
+use super::{ClauseRun, Harness, clauses_gemm, clauses_q5k, clauses_q8_0, clauses_route};
 
 /// The tensor-op clauses over `tensor`, the harness of the tensor-op GEMMs
 /// (or why this device has none).
@@ -41,7 +44,7 @@ pub fn table<'a>(
             }
         }) as ClauseRun<'a>
     };
-    vec![
+    let mut clauses = vec![
         (
             "tensor_gemm_q4k",
             on(clauses_gemm::tensor_gemm_q4k, fixture),
@@ -75,5 +78,8 @@ pub fn table<'a>(
             "tensor_grouped_a4",
             on(clauses_route::tensor_grouped_a4, mlx),
         ),
-    ]
+    ];
+    clauses.extend(clauses_q8_0::tensor_table(tensor));
+    clauses.extend(clauses_q5k::tensor_table(tensor));
+    clauses
 }

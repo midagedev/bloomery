@@ -49,6 +49,12 @@ reduction. The pair's gate and up rows, the slot select, the folded K' and the r
 load are this engine's. The licence is the one above, the ggml authors' MIT licence, whose text
 applies to that file.
 
+The `Q8_0` and `Q5K` owners in `crates/metal/kernels/quant.metal` are adapted from llama.cpp's
+`kernel_mul_mv_q8_0_f32` and `kernel_mul_mv_q5_K_f32` (the same file, commit `36a73916e`): the lane
+maps, the block strides, Q5_K's fifth-bit masks and the sum associations. The bodies the owners
+instantiate are the ones named above. The licence is the one above, the ggml authors' MIT licence,
+whose text applies to those two owners.
+
 ## MLX
 
 `crates/metal/src/bin/metal_gemm_time/probe_mlx_qmm.metal` is MLX's affine `qmm_t` kernel for 4-bit, group-64
