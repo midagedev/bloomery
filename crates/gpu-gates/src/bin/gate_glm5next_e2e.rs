@@ -506,7 +506,7 @@ mod gate {
         plant_prompt_routes, prefill, prefill_mode, prompt_ffn_taps, prompt_route_taps, seq_resume,
         seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prefill_media,
         set_prompt_ffn_taps, set_prompt_route_taps, set_taps, step_launches, store_digests,
-        store_rows, trunk_blocks,
+        store_rows, trunk_blocks, trunk_mixer_extras,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -850,11 +850,17 @@ mod gate {
         );
         // The blocks' plans from the header, and the loaded body's: the launches a K-quant block
         // adds are the plan's, and both sides count them.
-        let header_blocks = trunk_blocks(&glm5next_tier::open()?)?;
+        let header = glm5next_tier::open()?;
+        let header_blocks = trunk_blocks(&header)?;
         let block_extra: usize = header_blocks.iter().map(|b| b.extra_launches()).sum();
-        let want = decode + block_extra + CARD_NODES * card_layers.len();
-        let blocks_ok = header_blocks == body.blocks();
-        let counted = step_launches(&mixers, &ffns, &cards, &body.blocks()) - 2 * hostless;
+        // The mixers' by-name projections' launches beyond the Q8_0 file's: each part of a projection
+        // the load left apart, and the quantization of a K-quant site's input.
+        let header_mixer = trunk_mixer_extras(&header)?;
+        let mixer_extra: usize = header_mixer.iter().sum();
+        let want = decode + block_extra + mixer_extra + CARD_NODES * card_layers.len();
+        let blocks_ok = header_blocks == body.blocks() && header_mixer == body.mixer_extras();
+        let plans: Vec<_> = body.blocks().into_iter().zip(body.mixer_extras()).collect();
+        let counted = step_launches(&mixers, &ffns, &cards, &plans) - 2 * hostless;
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let copy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
@@ -868,8 +874,9 @@ mod gate {
             && other == 0;
         println!(
             "structure decode graph_nodes={nodes} (want {want} = {decode} + {block_extra} block \
-             launches + {CARD_NODES} x {} card layers; the program counts {counted}; the header's \
-             block plans are the body's {blocks_ok}) kernel={k} batch_mem_op={b} (want {memops}) \
+             launches + {mixer_extra} mixer launches + {CARD_NODES} x {} card layers; the program \
+             counts {counted}; the header's block plans and mixer launches are the body's \
+             {blocks_ok}) kernel={k} batch_mem_op={b} (want {memops}) \
              memcpy={c} (want {hostless}) other={other} {}",
             card_layers.len(),
             verdict(pass)

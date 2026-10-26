@@ -1,0 +1,18 @@
+# Round qtglm (card for the dump sitting): ik's CPU node dumps on the glmattnk, glmattn4 and glmbf16 fixture variants
+# (/models/fixture-variants/<tag>/, GLM's fixture with the mixers retyped: glmattnk q5_K/q6_K/q6_K q, k, v with q5_K
+# attn_output and attn_q_a; glmattn4 q4_K q, k, v with q6_K attn_output, attn_q_a and attn_kv_a_mqa and q4_K attn_q_b; glmbf16 the
+# ssm projections, the indexer's key, query and pool gate and both hyper-connection fns bf16: tools/fixture-variants.tsv), so
+# gate_glm5next_e2e's FixtureOracle clauses on each variant have their sets.
+# The precedent is glmffnkq-dump.card. Nine dumps, each `BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=<tag> just
+# dump-ref-fixture glm5next [step4 | step4-every-node]` (the bare form is the batch set) under this card, one lease each. Nothing is
+# timed. The dumpers are main's shared bin/ (the ik build the real and fixture sets were dumped with); a variant changes the
+# file, not the dumper.
+# Minutes [derived from glmffnkq-dump.card's measured terms]: fixed 3-15 s a lease take x 9 = 0.45-2.3 min; GLM batch, step4 and
+# step4-every-node ~0.1 min each (fxprobe's GLM batch 4.3 s, CPU, -t 32) x 3 variants = 0.9 min; so 1.4-3.2 min, rounded up to
+# 3..10 for a cold read of three 8.6 GB variants.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads (CUDA hidden, no card); beside a timed run or a gate batch it would take their
+  cores and memory bandwidth, and the profile takes the lease for every dump; why now: the GLM mixer types the most-downloaded
+  files ship (K-quant q, k, v, output and q_a; BF16 ssm projections, indexer sites and hyper-connection fns) have no oracle
+  sets on a variant, so their FixtureOracle clauses and the site mutants cannot run
+minutes: 3..10

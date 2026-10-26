@@ -572,6 +572,23 @@ impl Weights {
         Ok(())
     }
 
+    /// Whether every part is resident in one format at one width `k` — the
+    /// parts [`Weights::join_rows`] joins; a missing part is not joinable.
+    #[must_use]
+    pub fn joinable(&self, parts: &[&str]) -> bool {
+        let key = |name: &str| {
+            self.by_name.get(name).map(|w| {
+                let ty = match w {
+                    DevWeight::KQuant { ty, .. } => Some(*ty),
+                    _ => None,
+                };
+                (std::mem::discriminant(w), ty, w.k())
+            })
+        };
+        let first = parts.first().and_then(|n| key(n));
+        first.is_some() && parts.iter().all(|n| key(n) == first)
+    }
+
     /// Move the K-quant weights `parts` — one type, one row width — into one
     /// row stream filed as the derived weight `joint`: part `i`'s rows follow
     /// part `i − 1`'s, so one gemv over `joint` computes every part's rows,

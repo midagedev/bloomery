@@ -17,8 +17,8 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use bloomery_placement::accepts::{
-    BOLT_LEG, MUSESPARK_LEG, dense_by_name, embed_of_widened, head_of_widened, latent_leg_runs,
-    leg_arms, qwen3moe_dense, resident_down_runs,
+    BOLT_LEG, MUSESPARK_LEG, dense_by_name, dense_projected, embed_of_widened, head_of_widened,
+    latent_leg_runs, leg_arms, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
@@ -1052,7 +1052,8 @@ const NEMOTRON_SITES: &[GgmlType] = &[
 /// pins read from the card kernel table's rows are [`ROW_PINS`]; the V4.1
 /// chain's attention gemvs, whose head-split sites in `chain/attn.rs` take
 /// q3_K, q5_K or q8_0, the head q6_K or q5_K, and the hyper-connection fn `hc.rs` reads as
-/// q3_K words or f32; the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the common
+/// q3_K words or f32; the glm5next body's mixer sites by name (`site::ByName`), its absorbed pair q8_0
+/// and its hyper-connection fn `hc_pre_q8_0` or f32, the common
 /// head's q8_0, q6_K and q4_K arms; the gemma-embedding2 encoder's GEMMs,
 /// each `site::gemm` on the 32-value path).
 const TYPE_PINS: &[TypePin] = &[
@@ -1147,21 +1148,26 @@ const TYPE_PINS: &[TypePin] = &[
         what: "hyper-connection fn (the chain reads q3_K and f32)",
         reads: &[GgmlType::Q3_K],
     },
+    // The absorbed pair is the one mixer site with no common dense entry: a
+    // per-head gemv over the weight's heads, which only q8_0 planes have.
     TypePin {
         programs: &[Program::Glm5nextBody],
         role: Role::Attention,
         matrices: true,
-        names: None,
-        what: "attention matrices (the body reads q8_0)",
+        names: Some(is_absorbed_pair),
+        what: "absorbed key and value heads (the per-head gemv reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
+    // PIN(2026-10-26): widened from `[Q8_0]` with the f32 hyper-connection fn
+    // (`HcFn::F32`, `ds41_hc_pre_f32`): a BF16 fn loads widened to f32 values,
+    // which that launch reads beside the q8_0 planes `hc_pre_q8_0` reads.
     TypePin {
         programs: &[Program::Glm5nextBody],
         role: Role::HyperConnection,
         matrices: true,
         names: None,
-        what: "hyper-connection fn (hc_pre_q8_0 reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "hyper-connection fn (hc_pre_q8_0 reads q8_0, ds41_hc_pre_f32 f32 values: bf16 widened)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
     TypePin {
         programs: &[Program::Glm5nextBody],
@@ -1565,6 +1571,18 @@ const ROW_PINS: &[RowPin] = &[
         what: "shared expert (the types dense_by_name names)",
         row: |ty| dense_by_name(ty).is_some(),
     },
+    // PIN(2026-10-26): the glm5next mixers' dense sites read the common dense
+    // entries by name (`site::ByName`) in every type but Q5_0, where they read
+    // q8_0 alone; each type is a launch of `site.rs`, which `gate_glm5next_e2e`
+    // runs on the fixture variants `glmattnk`, `glmattn6` and `glmbf16`.
+    RowPin {
+        program: Program::Glm5nextBody,
+        role: Role::Attention,
+        matrices: true,
+        names: Some(|n| !is_absorbed_pair(n)),
+        what: "mixer matrices (the types dense_projected names)",
+        row: |ty| dense_projected(ty).is_some(),
+    },
     RowPin {
         program: Program::Qwen3moeBody,
         role: Role::Attention,
@@ -1738,6 +1756,12 @@ const Q35_PROJ: &[GgmlType] = &[
 #[must_use]
 pub const fn qwen35_shared(ty: GgmlType) -> Option<SiteEntry> {
     qwen3moe_dense(ty)
+}
+
+/// The glm5next latent mixer's absorbed key and value heads (`attn_k_b`,
+/// `attn_v_b`): the weights its per-head gemv reads.
+fn is_absorbed_pair(name: &str) -> bool {
+    name.ends_with(".attn_k_b.weight") || name.ends_with(".attn_v_b.weight")
 }
 
 /// A routed expert stack's gate or up rows (`ffn_gate_exps`/`ffn_up_exps`):
@@ -3337,6 +3361,72 @@ mod tests {
             }
             assert_eq!(vector(name, role, GgmlType::Q8_0).len(), 1, "{name} q8_0");
         }
+    }
+
+    /// glm5next's mixer matrices read the common dense entries by name
+    /// ([`dense_projected`]: every dense row but Q5_0), the absorbed pair reads
+    /// q8_0 alone (its per-head gemv has no other plane), and the
+    /// hyper-connection fn reads q8_0 planes or BF16 widened to f32.
+    // PIN(2026-10-26): the mixer pin widened from `[Q8_0]`; derivation: each
+    // type is a launch of `site::ByName::gemv`, whose arms `gate_glm5next_e2e`
+    // runs on the fixture variants that retype the mixers.
+    #[test]
+    fn the_glm5next_mixer_pins_read_the_dense_entries_by_name() {
+        let of = |name: &str, role: Role, ty: GgmlType| {
+            items(Program::Glm5nextBody, &matrix(name, role, ty))
+        };
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::BF16,
+        ] {
+            for name in ["attn_q.weight", "attn_output.weight", "ssm_f_a.weight"] {
+                assert_eq!(
+                    of(name, Role::Attention, ty),
+                    Vec::<String>::new(),
+                    "{name} {ty}"
+                );
+            }
+        }
+        for ty in [
+            GgmlType::Q5_0,
+            GgmlType::Q2_K,
+            GgmlType::IQ3_S,
+            GgmlType::IQ4_NL,
+            GgmlType::Q4_0,
+        ] {
+            assert_eq!(
+                of("attn_q.weight", Role::Attention, ty),
+                [format!(
+                    "{ty} mixer matrices (the types dense_projected names)"
+                )],
+                "{ty}"
+            );
+        }
+        let pair = "absorbed key and value heads (the per-head gemv reads q8_0)";
+        for name in ["attn_k_b.weight", "attn_v_b.weight"] {
+            assert_eq!(
+                of(name, Role::Attention, GgmlType::Q8_0),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                of(name, Role::Attention, GgmlType::Q6_K),
+                [format!("{} {pair}", GgmlType::Q6_K)]
+            );
+        }
+        for ty in [GgmlType::Q8_0, GgmlType::BF16] {
+            assert_eq!(
+                of("hc_attn_fn.weight", Role::HyperConnection, ty),
+                Vec::<String>::new()
+            );
+        }
+        assert_eq!(
+            of("hc_attn_fn.weight", Role::HyperConnection, GgmlType::Q6_K).len(),
+            1
+        );
     }
 
     /// The dense block's pin (mimo2, glm5next) and glm5next's shared-expert pin

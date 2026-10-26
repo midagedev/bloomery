@@ -92,11 +92,21 @@ pub fn tensor_role(name: &str) -> Option<Role> {
 
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    classify_with(
+    let mut model = classify_with(
         split,
         |name| role_with_nextn(name, hp.n_layer, hp.n_trunk, &TRUNK, NEXTN),
         Counts::new(hp.n_trunk, hp.n_expert, hp.n_used),
-    )
+    )?;
+    model.bf16_words = bf16_words;
+    Ok(model)
+}
+
+/// Whether the body reads BF16 tensor `t` in its words
+/// ([`ModelTensors::bf16_words`]): a mixer's matrix, whose dense site
+/// (`site::ByName`) takes BF16; every other BF16 tensor (a hyper-connection
+/// fn, whose launch reads f32 values, a conv, a vector) loads widened to f32.
+fn bf16_words(t: &crate::placement::ModelTensor) -> bool {
+    t.role == Role::Attention && t.ty == gguf::GgmlType::BF16 && t.dims.len() == 2
 }
 
 #[cfg(test)]
