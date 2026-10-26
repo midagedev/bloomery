@@ -8,7 +8,7 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::encode::{Binding, ComputeEncoder};
-use bloomery_metal::geom::{AttnGeom, HOST_GEOMETRY};
+use bloomery_metal::geom::AttnGeom;
 use bloomery_metal::kernels::{AttentionParams, AttnCache, segments_for_keys};
 use bloomery_metal::library::Library;
 use bloomery_metal::{MetalBuffer, MetalDevice};
@@ -122,19 +122,6 @@ pub(super) fn head_row_for(attn: &AttnGeom, index: u32, kind: u32) -> Vec<f32> {
         .collect()
 }
 
-/// [`head_row_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn head_row(index: u32, kind: u32) -> Vec<f32> {
-    head_row_for(&HOST_GEOMETRY.attn, index, kind)
-}
-
-/// A head's gain as the oracle takes it. A shim: the tables' gains are the
-/// head's width already, and the oracle refuses another. Callers left: the
-/// rows clauses.
-pub(super) fn gain_array(values: &[f32]) -> Result<Vec<f32>, String> {
-    Ok(values.to_vec())
-}
-
 fn take_head<'f>(attn: &AttnGeom, flat: &'f [f32], head: usize) -> Result<&'f [f32], String> {
     let at = head * attn.head;
     flat.get(at..at + attn.head)
@@ -152,12 +139,6 @@ pub(super) fn take_qg_for<'f>(
     let at = head * attn.qg_stride + offset;
     flat.get(at..at + attn.head)
         .ok_or_else(|| format!("head {head} offset {offset} is past the query"))
-}
-
-/// [`take_qg_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn take_qg(flat: &[f32], head: usize, offset: usize) -> Result<Vec<f32>, String> {
-    take_qg_for(&HOST_GEOMETRY.attn, flat, head, offset).map(<[f32]>::to_vec)
 }
 
 /// A finite gate in about `[-2, 2]`, so the sigmoid is not 1.
@@ -234,12 +215,6 @@ fn load_rope(attn: &AttnGeom, fixture: &Fixture, ctx: usize) -> Result<(Vec<f32>
     ))
 }
 
-/// [`load_tables_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn load_tables(fixture: &Fixture) -> Result<Tables, String> {
-    load_tables_for(&HOST_GEOMETRY.attn, fixture)
-}
-
 /// The fixture's norm epsilon, the query and key gains (or synthetic ones of
 /// the head's width) and a rope table of the deepest scene's rows.
 pub(super) fn load_tables_for(attn: &AttnGeom, fixture: &Fixture) -> Result<Tables, String> {
@@ -306,12 +281,6 @@ fn inputs(attn: &AttnGeom, _scene: &Scene) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         v[at..at + attn.head].copy_from_slice(&head_row_for(attn, u(kv), KIND_V));
     }
     (q, k, v)
-}
-
-/// [`plant_f16_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn plant_f16(scene: &Scene) -> Result<CacheBack, String> {
-    plant_f16_for(&HOST_GEOMETRY.attn, scene)
 }
 
 pub(super) fn plant_f16_for(attn: &AttnGeom, scene: &Scene) -> Result<CacheBack, String> {
@@ -466,12 +435,6 @@ pub(super) fn read_cache(
             })
         }
     }
-}
-
-/// [`cache_of_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn cache_of(uploaded: &mut Uploaded, ctx: usize) -> Result<AttnCache<'_>, DeviceError> {
-    cache_of_for(&HOST_GEOMETRY.attn, uploaded, ctx)
 }
 
 pub(super) fn cache_of_for<'u>(
@@ -634,12 +597,6 @@ pub(super) fn dequant_k_for(
     }
 }
 
-/// [`dequant_k_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> Vec<f32> {
-    dequant_k_for(&HOST_GEOMETRY.attn, cache, ctx, kv, index)
-}
-
 /// One value row of the read-back cache, dequantized.
 pub(super) fn dequant_v_for(
     attn: &AttnGeom,
@@ -664,12 +621,6 @@ pub(super) fn dequant_v_for(
             )
         }
     }
-}
-
-/// [`dequant_v_for`] at the build's host instance. A shim. Callers left: the
-/// rows clauses.
-pub(super) fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> Vec<f32> {
-    dequant_v_for(&HOST_GEOMETRY.attn, cache, ctx, kv, index)
 }
 
 fn quant_label(scene: &Scene) -> &'static str {

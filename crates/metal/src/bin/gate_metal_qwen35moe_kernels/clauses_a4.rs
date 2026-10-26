@@ -5,11 +5,11 @@
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
-use bloomery_metal::kernels::{HEAD_COLS, HEAD_K, PARTIALS_PER_HEAD, Quant, VALUE_HEADS};
+use bloomery_metal::kernels::{PARTIALS_PER_HEAD, Quant};
 
 use super::clauses_embed;
 use super::clauses_experts::{
-    self, check_fold_quant, check_pair_quant, ffn_norm, fold_bad_id, fold_weights_of,
+    self, check_fold_quant, check_pair_quant, ffn_norm, fold_bad_id, fold_weights_for,
 };
 use super::clauses_head;
 use super::clauses_norm::head_partials;
@@ -47,20 +47,21 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
     // The head's last rows: a count no threadgroup divides, deep in the
     // 248320-row tensor, in the Q6_K clause's shape.
     let tail_rows = 1153;
+    let hidden = h.geom().hidden;
     let head = fix.rows_at(
         "output.weight",
         gguf::quant::GgmlType::MLX_A4,
-        HEAD_K,
+        hidden,
         OUTPUT_ROWS - tail_rows,
         tail_rows,
     )?;
-    let x = oracle::activations(HEAD_K, 0x1A3A, 1.0);
+    let x = oracle::activations(hidden, 0x1A3A, 1.0);
     let worst = common::run_checked(
         h,
         &Launch {
             quant: Quant::A4,
             rows: tail_rows,
-            cols: HEAD_K,
+            cols: hidden,
             weights: head,
             x: &x,
             y0: &common::sentinel_rows(tail_rows),
@@ -74,7 +75,7 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
         )
     })?;
     parts.push(format!(
-        "output.weight tail {tail_rows}x{HEAD_K} {worst:.3}"
+        "output.weight tail {tail_rows}x{hidden} {worst:.3}"
     ));
     common::noted(parts)
 }
@@ -310,16 +311,17 @@ pub fn a4_seg(h: &Harness<'_>, fix: &Fixture, layer_norm: &str) -> Clause {
 /// and numerator the Q4_K clause runs.
 pub fn a4_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let eps = fix.rms_eps()?;
-    let cols = HEAD_COLS * VALUE_HEADS;
+    let delta = &h.geom().delta;
+    let cols = delta.head_cols * delta.value_heads;
     let t = common::Tensor::a4("blk.0.ssm_out.weight", cols, 2048);
     let weights = t.bytes(fix)?;
     let g = oracle::activations(cols, 0x1E88, 1.0);
-    let partials = head_partials();
+    let partials = head_partials(delta);
     let x = common::head_scaled(
         &g,
         &partials,
-        VALUE_HEADS,
-        HEAD_COLS,
+        delta.value_heads,
+        delta.head_cols,
         PARTIALS_PER_HEAD,
         eps,
     );
@@ -340,8 +342,8 @@ pub fn a4_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
         return Err(format!("the launch raised {fault}"));
     }
     let kind = Kind::HeadNorm(oracle::HeadGeometry {
-        heads: VALUE_HEADS,
-        cols_per_head: HEAD_COLS,
+        heads: delta.value_heads,
+        cols_per_head: delta.head_cols,
         partials_per_head: PARTIALS_PER_HEAD,
     });
     let band = oracle::band(Quant::A4, cols / Quant::A4.values_per_block(), kind);
@@ -386,7 +388,7 @@ pub fn a4_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
 /// stack, and the norm's fault inputs.
 pub fn a4_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let worst = check_pair_quant(h, fix, Quant::A4)?;
-    let weights = clauses_experts::pair_weights(fix, Quant::A4)?;
+    let weights = clauses_experts::pair_weights_for(&h.geom().experts, fix, Quant::A4)?;
     clauses_experts::pair_faults(h, Quant::A4, &weights, &ffn_norm(fix)?)?;
     Ok(Verdict::Noted(format!(
         "worst error over its band: {worst}; ids -1 and the stack length raised expert_id, \
@@ -400,7 +402,8 @@ pub fn a4_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
 pub fn a4_fold(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let worst = check_fold_quant(h, fix, Quant::A4, 2048)?;
     let tail = check_fold_quant(h, fix, Quant::A4, 2045)?;
-    fold_bad_id(h, &fold_weights_of(fix, Quant::A4, 2048)?, Quant::A4)?;
+    let folded = fold_weights_for(&h.geom().experts, fix, Quant::A4, 2048)?;
+    fold_bad_id(h, &folded, Quant::A4)?;
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
         "worst error over its band: {worst}; tail 2045 rows: {tail}; a bad id writes NaN and \
@@ -413,7 +416,8 @@ pub fn a4_fold(h: &Harness<'_>, fix: &Fixture) -> Clause {
 /// tail rows.
 pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let eps = fix.rms_eps()?;
-    let gain = fix.f32s("output_norm.weight", HEAD_K)?;
+    let hidden = h.geom().hidden;
+    let gain = fix.f32s("output_norm.weight", hidden)?;
     let samples = [
         ("output.weight head", 0usize, 32usize, 0x1EAD_u64),
         ("output.weight tail", OUTPUT_ROWS - 17, 17, 0x1EAE),
@@ -424,11 +428,11 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
         let weights = fix.rows_at(
             "output.weight",
             gguf::quant::GgmlType::MLX_A4,
-            HEAD_K,
+            hidden,
             at,
             rows,
         )?;
-        let x = oracle::activations(HEAD_K, seed, 0.5);
+        let x = oracle::activations(hidden, seed, 0.5);
         let out = clauses_head::run(
             h,
             clauses_head::HeadRun {
@@ -437,7 +441,7 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
                 x: &x,
                 gain: &gain,
                 rows,
-                k: HEAD_K,
+                k: hidden,
                 eps,
             },
         )?;
@@ -451,8 +455,8 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
             ));
         }
         let xhat = oracle::rms_norm(&x, &gain, eps);
-        let reference = oracle::reference(Quant::A4, weights, rows, HEAD_K, &xhat)?;
-        let band = oracle::band(Quant::A4, HEAD_K / Quant::A4.values_per_block(), Kind::Norm);
+        let reference = oracle::reference(Quant::A4, weights, rows, hidden, &xhat)?;
+        let band = oracle::band(Quant::A4, hidden / Quant::A4.values_per_block(), Kind::Norm);
         let ratio = oracle::check(&out.logits, &reference, band, Kind::Norm, None)
             .map_err(|e| format!("{name}: {e}"))?;
         let (_, want) = clauses_head::host_argmax(&out.logits)?;
@@ -463,7 +467,7 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
             ));
         }
         worst = worst.max(ratio);
-        notes.push(format!("{name} {rows}x{HEAD_K} {ratio:.3}"));
+        notes.push(format!("{name} {rows}x{hidden} {ratio:.3}"));
     }
     Ok(Verdict::Noted(format!(
         "worst {worst:.3}; {}",
@@ -475,7 +479,7 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
 /// so `embed` holds the owner's value decode bit-equal to the host reader,
 /// row by row, and the ids past the vocabulary.
 pub fn a4_embed(h: &Harness<'_>, fix: &Fixture) -> Clause {
-    let (_, _, ty) = fix.table("token_embd.weight", HEAD_K)?;
+    let (_, _, ty) = fix.table("token_embd.weight", h.geom().hidden)?;
     if ty != gguf::quant::GgmlType::MLX_A4 {
         return Err(format!("token_embd.weight is {ty:?}, not MLX_A4"));
     }

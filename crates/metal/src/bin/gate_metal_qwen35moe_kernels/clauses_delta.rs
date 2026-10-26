@@ -3,10 +3,9 @@
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
-use bloomery_metal::kernels::{
-    BLOCK_VALUES, CONV_TAPS, HEAD_COLS, HeadMap, PARTIALS_PER_HEAD, PASS_ROWS, Quant, RING_ROWS,
-    VALUE_HEADS, channels, key_of, ring_elems, state_elems, state_index,
-};
+use bloomery_metal::geom::{DeltaGeom, Geometry};
+use bloomery_metal::instance::REGISTERED;
+use bloomery_metal::kernels::{BLOCK_VALUES, HeadMap, PARTIALS_PER_HEAD, PASS_ROWS, Quant, key_of};
 use gguf::quant::GgmlType;
 
 use super::common::{self, BadArg, Edit, LAYER};
@@ -14,6 +13,25 @@ use super::fixture::Fixture;
 use super::oracle::{self, Kind};
 use super::oracle_delta::{self, Fit, StepIn};
 use super::{Harness, HeadNormLaunch};
+
+/// The key heads of the first layer's conv: the fixture's, and the count the
+/// clauses launch at.
+pub(super) const KEY_HEADS: usize = 16;
+
+/// A second key-head count, which divides the value heads too.
+const KEY_HEADS_NARROW: usize = 8;
+
+/// What the clauses' key-head counts are written for, held for every
+/// registered row: the value heads are a multiple of both.
+const _: () = {
+    let mut i = 0;
+    while i < REGISTERED.len() {
+        let d = Geometry::of(&REGISTERED[i]).delta;
+        assert!(d.value_heads.is_multiple_of(KEY_HEADS));
+        assert!(d.value_heads.is_multiple_of(KEY_HEADS_NARROW));
+        i += 1;
+    }
+};
 
 pub(super) struct Fixed {
     pub(super) conv_w: Vec<f32>,
@@ -51,32 +69,34 @@ struct Back {
     ring: Vec<f32>,
 }
 
-pub(super) fn fixed(fixture: &Fixture) -> Result<Fixed, String> {
+pub(super) fn fixed(delta: &DeltaGeom, fixture: &Fixture) -> Result<Fixed, String> {
+    let ch = elems(delta.channels(KEY_HEADS), "channels")?;
     let file = gguf::Gguf::open(&fixture.path).map_err(|e| format!("conv weight: {e}"))?;
     let t = file
         .find("blk.0.ssm_conv1d.weight")
         .ok_or("the fixture has no blk.0.ssm_conv1d.weight")?;
-    if t.ty != GgmlType::F32 || t.dims != [4, 8192] {
+    if t.ty != GgmlType::F32 || t.dims != [delta.conv_taps as u64, ch as u64] {
         return Err(format!(
-            "blk.0.ssm_conv1d.weight is {:?} {:?}, the gate reads f32 [4, 8192]",
-            t.ty, t.dims
+            "blk.0.ssm_conv1d.weight is {:?} {:?}, the gate reads f32 [{}, {ch}]",
+            t.ty, t.dims, delta.conv_taps
         ));
     }
     let bytes = file
         .data(t)
         .map_err(|e| format!("blk.0.ssm_conv1d.weight: {e}"))?;
-    if bytes.len() != 4 * 8192 * 4 {
+    let words = delta.conv_taps * ch;
+    if bytes.len() != words * 4 {
         return Err(format!("blk.0.ssm_conv1d.weight is {} bytes", bytes.len()));
     }
-    let mut conv_w = vec![0f32; 4 * 8192];
+    let mut conv_w = vec![0f32; words];
     for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         conv_w[i] = f32::from_le_bytes(*chunk);
     }
     Ok(Fixed {
         conv_w,
-        ssm_a: fixture.f32s("blk.0.ssm_a", VALUE_HEADS)?,
-        dt: fixture.f32s("blk.0.ssm_dt.bias", VALUE_HEADS)?,
-        norm_w: fixture.f32s("blk.0.ssm_norm.weight", HEAD_COLS)?,
+        ssm_a: fixture.f32s("blk.0.ssm_a", delta.value_heads)?,
+        dt: fixture.f32s("blk.0.ssm_dt.bias", delta.value_heads)?,
+        norm_w: fixture.f32s("blk.0.ssm_norm.weight", delta.head_cols)?,
         eps: fixture.rms_eps()?,
     })
 }
@@ -91,8 +111,9 @@ fn elems(n: Option<usize>, what: &str) -> Result<usize, String> {
 
 fn run(h: &Harness<'_>, inp: &In<'_>) -> Result<Back, String> {
     let (device, stream) = (h.device, h.stream);
-    let g_len = VALUE_HEADS * HEAD_COLS;
-    let p_len = VALUE_HEADS * PARTIALS_PER_HEAD;
+    let delta = &h.geom().delta;
+    let g_len = delta.value_heads * delta.head_cols;
+    let p_len = delta.value_heads * PARTIALS_PER_HEAD;
     let x = device.upload(stream, inp.x).map_err(why)?;
     let conv_w = device.upload(stream, inp.conv_w).map_err(why)?;
     let b = device.upload(stream, inp.b).map_err(why)?;
@@ -125,9 +146,9 @@ fn run(h: &Harness<'_>, inp: &In<'_>) -> Result<Back, String> {
                 partials: partials.window_mut(Elems(0), Elems(p_len))?,
                 g: g.window_mut(Elems(0), Elems(g_len))?,
                 faults: device.fault_word(),
-                n_v: VALUE_HEADS,
-                head: HEAD_COLS,
-                taps: CONV_TAPS,
+                n_v: delta.value_heads,
+                head: delta.head_cols,
+                taps: delta.conv_taps,
                 n_k: inp.n_k,
                 map: inp.map,
                 lanes: inp.lanes,
@@ -160,8 +181,9 @@ fn run(h: &Harness<'_>, inp: &In<'_>) -> Result<Back, String> {
     Ok(back)
 }
 
-fn step_in<'a>(inp: &'a In<'a>) -> StepIn<'a> {
+fn step_in<'a>(delta: &'a DeltaGeom, inp: &'a In<'a>) -> StepIn<'a> {
     StepIn {
+        delta,
         n_k: inp.n_k,
         map: inp.map,
         lane: inp.lane[inp.lane_at],
@@ -185,7 +207,7 @@ fn step_in<'a>(inp: &'a In<'a>) -> StepIn<'a> {
 fn launch_fit(h: &Harness<'_>, inp: &In<'_>, tripwire: bool) -> Result<(Back, Fit), String> {
     let back = run(h, inp)?;
     common::expect_clean(h, "the step")?;
-    let out = oracle_delta::step(&step_in(inp))?;
+    let out = oracle_delta::step(&step_in(&h.geom().delta, inp))?;
     let fit = oracle_delta::fit(
         &back.g,
         &back.partials,
@@ -198,19 +220,20 @@ fn launch_fit(h: &Harness<'_>, inp: &In<'_>, tripwire: bool) -> Result<(Back, Fi
 }
 
 fn inputs(
+    delta: &DeltaGeom,
     rng: &mut oracle::Rng,
     n_k: usize,
     fixed: &Fixed,
     conv_w: &[f32],
 ) -> Result<Owned, String> {
-    let ch = elems(channels(n_k), "channels")?;
+    let ch = elems(delta.channels(n_k), "channels")?;
     Ok(Owned {
         x: draw(rng, ch, 0.3),
-        b: draw(rng, VALUE_HEADS, 1.0),
-        a: draw(rng, VALUE_HEADS, 2.0),
-        z: draw(rng, VALUE_HEADS * HEAD_COLS, 1.0),
-        state: draw(rng, elems(state_elems(1), "state")?, 0.04),
-        ring: draw(rng, elems(ring_elems(n_k), "ring")?, 0.05),
+        b: draw(rng, delta.value_heads, 1.0),
+        a: draw(rng, delta.value_heads, 2.0),
+        z: draw(rng, delta.value_heads * delta.head_cols, 1.0),
+        state: draw(rng, elems(delta.state_elems(1), "state")?, 0.04),
+        ring: draw(rng, elems(delta.ring_elems(n_k), "ring")?, 0.05),
         conv_w: conv_w.to_vec(),
         ssm_a: fixed.ssm_a.clone(),
         dt: fixed.dt.clone(),
@@ -300,9 +323,10 @@ fn keep_max(worst: &mut f64, widest: &mut f64, fit: &Fit) {
 
 /// One step from a host state, tiled and grouped, and a second key-head count.
 pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let fixed = fixed(fixture)?;
+    let delta = &h.geom().delta;
+    let fixed = fixed(delta, fixture)?;
     let mut rng = oracle::Rng::new(0xD417);
-    let owned = inputs(&mut rng, 16, &fixed, &fixed.conv_w)?;
+    let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
     let lane = [0u32];
     let (tiled, tiled_fit) = launch_fit(
@@ -319,9 +343,13 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err("tiled and grouped wrote the same bits".to_string());
     }
     let mut rng = oracle::Rng::new(0xD418);
-    let conv8 = draw(&mut rng, CONV_TAPS * elems(channels(8), "channels")?, 0.5);
-    let mut narrow = inputs(&mut rng, 8, &fixed, &conv8)?;
-    let lanes = elems(state_elems(2), "state")?;
+    let conv8 = draw(
+        &mut rng,
+        delta.conv_taps * elems(delta.channels(KEY_HEADS_NARROW), "channels")?,
+        0.5,
+    );
+    let mut narrow = inputs(delta, &mut rng, KEY_HEADS_NARROW, &fixed, &conv8)?;
+    let lanes = elems(delta.state_elems(2), "state")?;
     narrow.state = draw(&mut rng, lanes, 0.04);
     // Word 1 names lane 1, read; word 2 names lane 0, written. Word 0 names
     // no lane, so a step that reads a word by another index raises.
@@ -338,7 +366,7 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         )),
         true,
     )?;
-    let lane1 = elems(state_elems(1), "state")?;
+    let lane1 = elems(delta.state_elems(1), "state")?;
     if !common::bits_eq(&back.state[lane1..], &narrow.state[lane1..]) {
         return Err("the lane the step read was written".to_string());
     }
@@ -354,9 +382,10 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 /// Five steps, each oracled from the state and the ring the kernel wrote.
 pub fn delta_roll(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let fixed = fixed(fixture)?;
+    let delta = &h.geom().delta;
+    let fixed = fixed(delta, fixture)?;
     let mut rng = oracle::Rng::new(0xD419);
-    let owned = inputs(&mut rng, 16, &fixed, &fixed.conv_w)?;
+    let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let mut state = owned.state.clone();
     let mut ring = owned.ring.clone();
     let lane = [0u32];
@@ -365,13 +394,13 @@ pub fn delta_roll(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     for step_i in 0u32..5 {
         let pos = [4 + step_i];
         let x = draw(&mut rng, owned.x.len(), 0.3);
-        let b = draw(&mut rng, VALUE_HEADS, 1.0);
-        let a = draw(&mut rng, VALUE_HEADS, 2.0);
-        let z = draw(&mut rng, VALUE_HEADS * HEAD_COLS, 1.0);
+        let b = draw(&mut rng, delta.value_heads, 1.0);
+        let a = draw(&mut rng, delta.value_heads, 2.0);
+        let z = draw(&mut rng, delta.value_heads * delta.head_cols, 1.0);
         let snap_state = state.clone();
         let snap_ring = ring.clone();
         let inp = In {
-            n_k: 16,
+            n_k: KEY_HEADS,
             map: HeadMap::Tiled,
             lanes: 1,
             lane_at: 0,
@@ -400,15 +429,21 @@ pub fn delta_roll(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )))
 }
 
-fn written_once(out: &[f32], before: &[f32], x: &[f32], pos: u32) -> Result<(), String> {
+fn written_once(
+    ring_rows: usize,
+    out: &[f32],
+    before: &[f32],
+    x: &[f32],
+    pos: u32,
+) -> Result<(), String> {
     let ch = x.len();
-    let slot = (pos as usize) % RING_ROWS;
+    let slot = (pos as usize) % ring_rows;
     for c in 0..ch {
         if out[slot * ch + c].to_bits() != x[c].to_bits() {
             return Err(format!("slot {slot} channel {c} was not the conv input"));
         }
     }
-    for s in 0..RING_ROWS {
+    for s in 0..ring_rows {
         if s == slot {
             continue;
         }
@@ -443,15 +478,17 @@ fn ring_launch(
         }),
         tripwire,
     )?;
-    written_once(&back.ring, ring, &owned.x, pos[0])?;
+    written_once(h.geom().delta.ring_rows, &back.ring, ring, &owned.x, pos[0])?;
     Ok(back)
 }
 
-/// The conv reads a predecessor only while `pos >= d`, and writes `pos mod 11` once.
+/// The conv reads a predecessor only while `pos >= d`, and writes
+/// `pos mod ring_rows` once.
 pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let fixed = fixed(fixture)?;
+    let delta = &h.geom().delta;
+    let fixed = fixed(delta, fixture)?;
     let mut rng = oracle::Rng::new(0xD41A);
-    let owned = inputs(&mut rng, 16, &fixed, &fixed.conv_w)?;
+    let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let ch = owned.x.len();
     let zeros = vec![0f32; owned.ring.len()];
     let mut sentinel = vec![1e6f32; owned.ring.len()];
@@ -471,7 +508,7 @@ pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     }
     let mut unread_a = zeros.clone();
     let unread_b = zeros.clone();
-    let unread = (1usize + RING_ROWS - 2) % RING_ROWS;
+    let unread = (1usize + delta.ring_rows - 2) % delta.ring_rows;
     unread_a[unread * ch..(unread + 1) * ch].fill(1e6);
     let a = ring_launch(h, &owned, &unread_a, 1, false)?;
     let b = ring_launch(h, &owned, &unread_b, 1, true)?;
@@ -493,9 +530,10 @@ pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 /// The partials and the numerator match the oracle, and the head-norm launch accepts them.
 pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let fixed = fixed(fixture)?;
+    let delta = &h.geom().delta;
+    let fixed = fixed(delta, fixture)?;
     let mut rng = oracle::Rng::new(0xD41B);
-    let owned = inputs(&mut rng, 16, &fixed, &fixed.conv_w)?;
+    let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
     let lane = [0u32];
     let (back, fit) = launch_fit(
@@ -504,7 +542,7 @@ pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         true,
     )?;
     let rows = 32;
-    let cols = HEAD_COLS * VALUE_HEADS;
+    let cols = delta.head_cols * delta.value_heads;
     let weights = fixture.rows("blk.0.ssm_out.weight", GgmlType::Q4_K, cols, rows)?;
     let y0 = draw(&mut rng, rows, 0.1);
     h.clear_fault()?;
@@ -523,15 +561,15 @@ pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let x = common::head_scaled(
         &back.g,
         &back.partials,
-        VALUE_HEADS,
-        HEAD_COLS,
+        delta.value_heads,
+        delta.head_cols,
         PARTIALS_PER_HEAD,
         owned.eps,
     );
     let reference = oracle::reference(Quant::Q4K, weights, rows, cols, &x)?;
     let kind = Kind::HeadNorm(oracle::HeadGeometry {
-        heads: VALUE_HEADS,
-        cols_per_head: HEAD_COLS,
+        heads: delta.value_heads,
+        cols_per_head: delta.head_cols,
         partials_per_head: PARTIALS_PER_HEAD,
     });
     let band = oracle::band(Quant::Q4K, cols / BLOCK_VALUES, kind);
@@ -549,8 +587,9 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
             key_of(3, 0)
         ));
     }
+    let delta = &h.geom().delta;
     let mut state = owned.state.clone();
-    let at = state_index(0, 0, 0, 12);
+    let at = delta.state_index(0, 0, 0, 12);
     state[at] = f32::NAN;
     let pos = [4u32];
     let lane = [0u32];
@@ -571,7 +610,7 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
     for j in 0..8 {
         for i in 0..16 {
             let key = key_of(j, i);
-            let idx = state_index(0, 0, 0, key);
+            let idx = delta.state_index(0, 0, 0, key);
             if j == 3 {
                 if !back.state[idx].is_nan() {
                     return Err(format!(
@@ -594,6 +633,7 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
         ));
     }
     let clean = oracle_delta::step(&StepIn {
+        delta,
         n_k: owned.n_k,
         map: HeadMap::Tiled,
         lane: 0,
@@ -619,7 +659,7 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
     partials[0] = clean.partials[0] as f32;
     for j in 0..8 {
         for i in 0..16 {
-            let idx = state_index(0, 0, 0, key_of(j, i));
+            let idx = delta.state_index(0, 0, 0, key_of(j, i));
             got_state[idx] = clean.state[idx] as f32;
         }
     }
@@ -630,9 +670,10 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
 /// A read or a write lane word past the lanes, and one non-finite key, each
 /// raise the lane site.
 pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let fixed = fixed(fixture)?;
+    let delta = &h.geom().delta;
+    let fixed = fixed(delta, fixture)?;
     let mut rng = oracle::Rng::new(0xD41C);
-    let owned = inputs(&mut rng, 16, &fixed, &fixed.conv_w)?;
+    let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
     // Word 0 names lane 0, word 1 a lane past the one there is.
     let lane = [0u32, 4];
@@ -654,7 +695,7 @@ pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                 "{what} lane word past the lanes left a finite numerator or partial"
             ));
         }
-        written_once(&back.ring, &owned.ring, &owned.x, 4)?;
+        written_once(delta.ring_rows, &back.ring, &owned.ring, &owned.x, 4)?;
     }
     poison_column(h, &owned)?;
     Ok(Verdict::Noted(
@@ -702,17 +743,22 @@ struct Args {
 }
 
 impl Args {
-    const fn whole(n_k: usize, g_len: usize) -> Self {
+    const fn whole(delta: &DeltaGeom, n_k: usize, g_len: usize) -> Self {
         Self {
-            n_v: VALUE_HEADS,
-            head: HEAD_COLS,
-            taps: CONV_TAPS,
+            n_v: delta.value_heads,
+            head: delta.head_cols,
+            taps: delta.conv_taps,
             n_k,
             pos_len: 1,
             g: g_len,
             lane_to: 0,
         }
     }
+}
+
+/// A text a refusal names, for a needle that carries a count of the row.
+fn named(text: String) -> &'static str {
+    text.leak()
 }
 
 /// The position windows a case can ask for by length.
@@ -726,6 +772,7 @@ fn refuse(
     a: &Args,
     encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
 ) -> Result<(), bloomery_device::DeviceError> {
+    let delta = &h.geom().delta;
     let pos: &[u32] = if a.pos_len == PASS_ROWS + 1 {
         &POS_LONG
     } else if a.pos_len == 2 {
@@ -737,13 +784,13 @@ fn refuse(
         encoder,
         bloomery_metal::kernels::DeltaParams {
             x: b.x.window(Elems(0), Elems(b.ch))?,
-            conv_w: b.conv_w.window(Elems(0), Elems(CONV_TAPS * b.ch))?,
-            b_raw: b.b.window(Elems(0), Elems(VALUE_HEADS))?,
-            a_raw: b.a.window(Elems(0), Elems(VALUE_HEADS))?,
-            dt_bias: b.dt.window(Elems(0), Elems(VALUE_HEADS))?,
-            ssm_a: b.ssm_a.window(Elems(0), Elems(VALUE_HEADS))?,
+            conv_w: b.conv_w.window(Elems(0), Elems(delta.conv_taps * b.ch))?,
+            b_raw: b.b.window(Elems(0), Elems(delta.value_heads))?,
+            a_raw: b.a.window(Elems(0), Elems(delta.value_heads))?,
+            dt_bias: b.dt.window(Elems(0), Elems(delta.value_heads))?,
+            ssm_a: b.ssm_a.window(Elems(0), Elems(delta.value_heads))?,
             z: b.z.window(Elems(0), Elems(b.g_len))?,
-            norm_w: b.norm_w.window(Elems(0), Elems(HEAD_COLS))?,
+            norm_w: b.norm_w.window(Elems(0), Elems(delta.head_cols))?,
             lane: b.lane.window(Elems(0), Elems(1))?,
             state: b.state.window_mut(Elems(0), Elems(b.state_len))?,
             ring: b.ring.window_mut(Elems(0), Elems(b.ring_len))?,
@@ -787,12 +834,14 @@ fn bad<'a>(
 pub fn delta_bounds(h: &Harness<'_>) -> Clause {
     let device = h.device;
     let stream = h.stream;
-    let n_k = 16usize;
-    let ch = elems(channels(n_k), "channels")?;
-    let state_len = elems(state_elems(1), "state")?;
-    let ring_len = elems(ring_elems(n_k), "ring")?;
-    let g_len = VALUE_HEADS * HEAD_COLS;
-    let p_len = VALUE_HEADS * PARTIALS_PER_HEAD;
+    let delta = &h.geom().delta;
+    let n_k = KEY_HEADS;
+    let ch = elems(delta.channels(n_k), "channels")?;
+    let state_len = elems(delta.state_elems(1), "state")?;
+    let ring_len = elems(delta.ring_elems(n_k), "ring")?;
+    let g_len = delta.value_heads * delta.head_cols;
+    let p_len = delta.value_heads * PARTIALS_PER_HEAD;
+    let heads = vec![1f32; delta.value_heads];
     let mut bufs = Refusals {
         ch,
         state_len,
@@ -801,26 +850,57 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
         p_len,
         x: device.upload(stream, &vec![1f32; ch]).map_err(why)?,
         conv_w: device
-            .upload(stream, &vec![1f32; CONV_TAPS * ch])
+            .upload(stream, &vec![1f32; delta.conv_taps * ch])
             .map_err(why)?,
-        b: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
-        a: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
-        dt: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
-        ssm_a: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
+        b: device.upload(stream, &heads).map_err(why)?,
+        a: device.upload(stream, &heads).map_err(why)?,
+        dt: device.upload(stream, &heads).map_err(why)?,
+        ssm_a: device.upload(stream, &heads).map_err(why)?,
         z: device.upload(stream, &vec![1f32; g_len]).map_err(why)?,
-        norm_w: device.upload(stream, &vec![1f32; HEAD_COLS]).map_err(why)?,
+        norm_w: device
+            .upload(stream, &vec![1f32; delta.head_cols])
+            .map_err(why)?,
         lane: device.upload(stream, &[0u32]).map_err(why)?,
         state: device.upload(stream, &vec![1f32; state_len]).map_err(why)?,
         ring: device.upload(stream, &vec![1f32; ring_len]).map_err(why)?,
         partials: device.upload(stream, &vec![1f32; p_len]).map_err(why)?,
         g: device.upload(stream, &vec![1f32; g_len + 1]).map_err(why)?,
     };
-    let whole = Args::whole(n_k, g_len);
+    let whole = Args::whole(delta, n_k, g_len);
+    let (value_heads, head_cols, conv_taps) = (delta.value_heads, delta.head_cols, delta.conv_taps);
+    // The smallest count of key heads that does not divide the value heads.
+    let non_divisor = (2..)
+        .find(|n| !value_heads.is_multiple_of(*n))
+        .ok_or("every count divides the value heads")?;
     let cases = vec![
-        bad("n_v of 16", "n_v 32", |a| a.n_v = 16, h, whole),
-        bad("head of 64", "head 128", |a| a.head = 64, h, whole),
-        bad("taps of 3", "taps", |a| a.taps = 3, h, whole),
-        bad("n_k of 3", "n_k", |a| a.n_k = 3, h, whole),
+        bad(
+            "half the value heads",
+            named(format!("n_v {value_heads}")),
+            move |a| a.n_v = value_heads / 2,
+            h,
+            whole,
+        ),
+        bad(
+            "half the head",
+            named(format!("head {head_cols}")),
+            move |a| a.head = head_cols / 2,
+            h,
+            whole,
+        ),
+        bad(
+            "one tap fewer",
+            "taps",
+            move |a| a.taps = conv_taps - 1,
+            h,
+            whole,
+        ),
+        bad(
+            "a count of key heads that does not divide the value heads",
+            "n_k",
+            move |a| a.n_k = non_divisor,
+            h,
+            whole,
+        ),
         bad(
             "a position window of 33 words",
             "position window",

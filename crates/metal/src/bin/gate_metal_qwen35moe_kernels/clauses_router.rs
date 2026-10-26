@@ -4,7 +4,7 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
-use bloomery_metal::geom::{HOST_GEOMETRY, RouterGeom};
+use bloomery_metal::geom::RouterGeom;
 use bloomery_metal::kernels::router::RouterParams;
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
@@ -27,12 +27,6 @@ const ROUTED_TENSOR: &str = "blk.0.ffn_gate_inp.weight";
 const SHARED_TENSOR: &str = "blk.0.ffn_gate_inp_shexp.weight";
 /// The pre-FFN norm's gain under the names the families give it.
 const GAIN_TENSORS: [&str; 2] = ["blk.0.post_attention_norm.weight", "blk.0.ffn_norm.weight"];
-
-/// Layer 0's pre-FFN norm gain at the build's host instance. A shim of
-/// [`gain_for`]. Callers left: the rows clauses.
-pub(super) fn gain(fixture: &Fixture) -> Result<Vec<f32>, String> {
-    gain_for(&HOST_GEOMETRY.router, fixture)
-}
 
 /// Layer 0's pre-FFN norm gain, whichever of its names the fixture holds.
 pub(super) fn gain_for(r: &RouterGeom, fixture: &Fixture) -> Result<Vec<f32>, String> {

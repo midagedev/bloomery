@@ -9,8 +9,10 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
+use bloomery_metal::geom::Geometry;
+use bloomery_metal::instance::REGISTERED;
 use bloomery_metal::kernels::{
-    HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, Quant, ROWS_PER_SIMD_GROUP, head_groups,
+    HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, Quant, ROWS_PER_SIMD_GROUP, head_groups,
 };
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
@@ -23,7 +25,15 @@ use super::{Harness, SENTINEL_BITS};
 /// The rows one threadgroup owns.
 const ROWS_PER_GROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
 
-const _: () = assert!(HEAD_K == 2_048);
+/// What the fixture's head is written for, held for every registered row: the
+/// 2048-wide tensors the clauses read.
+const _: () = {
+    let mut i = 0;
+    while i < REGISTERED.len() {
+        assert!(Geometry::of(&REGISTERED[i]).hidden == 2_048);
+        i += 1;
+    }
+};
 const _: () = assert!(HEAD_SIMD_GROUPS == 8);
 const _: () = assert!(HEAD_THREADS == 256);
 const _: () = assert!(ROWS_PER_GROUP == HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP);
@@ -51,24 +61,26 @@ fn row_bytes(k: usize) -> usize {
     k / 256 * block_bytes()
 }
 
-/// The fixture's head tensors are the shipped shape.
-fn expect_head(fixture: &Fixture) -> Result<(), String> {
+/// The fixture's head tensors are the shipped shape: the row's hidden width
+/// by the vocabulary.
+fn expect_head(h: &Harness<'_>, fixture: &Fixture) -> Result<(), String> {
+    let hidden = h.geom().hidden;
     let file = Gguf::open(&fixture.path).map_err(|e| format!("{OUTPUT}: {e}"))?;
     let weights = file
         .find(OUTPUT)
         .ok_or_else(|| format!("the fixture has no tensor {OUTPUT}"))?;
-    if weights.ty != GgmlType::Q6_K || weights.dims != [HEAD_K as u64, OUTPUT_ROWS as u64] {
+    if weights.ty != GgmlType::Q6_K || weights.dims != [hidden as u64, OUTPUT_ROWS as u64] {
         return Err(format!(
-            "{OUTPUT} is {:?} {:?}, the gate reads Q6_K [{HEAD_K}, {OUTPUT_ROWS}]",
+            "{OUTPUT} is {:?} {:?}, the gate reads Q6_K [{hidden}, {OUTPUT_ROWS}]",
             weights.ty, weights.dims
         ));
     }
     let gain = file
         .find(GAIN)
         .ok_or_else(|| format!("the fixture has no tensor {GAIN}"))?;
-    if gain.ty != GgmlType::F32 || gain.dims != [HEAD_K as u64] {
+    if gain.ty != GgmlType::F32 || gain.dims != [hidden as u64] {
         return Err(format!(
-            "{GAIN} is {:?} {:?}, the head reads {HEAD_K} f32s",
+            "{GAIN} is {:?} {:?}, the head reads {hidden} f32s",
             gain.ty, gain.dims
         ));
     }
@@ -234,10 +246,11 @@ fn check_logits(
 }
 
 pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let hidden = h.geom().hidden;
     h.clear_fault()?;
-    expect_head(fixture)?;
+    expect_head(h, fixture)?;
     let eps = fixture.rms_eps()?;
-    let gain = fixture.f32s(GAIN, HEAD_K)?;
+    let gain = fixture.f32s(GAIN, hidden)?;
     let samples = [
         ("output.weight head", 0usize, 32usize, 0x6EAD_u64),
         ("output.weight tail", OUTPUT_ROWS - 17, 17, 0x6EAE),
@@ -245,8 +258,8 @@ pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let mut worst = 0.0f64;
     let mut notes = Vec::new();
     for (name, at, rows, seed) in samples {
-        let weights = fixture.rows_at(OUTPUT, GgmlType::Q6_K, HEAD_K, at, rows)?;
-        let x = oracle::activations(HEAD_K, seed, 0.5);
+        let weights = fixture.rows_at(OUTPUT, GgmlType::Q6_K, hidden, at, rows)?;
+        let x = oracle::activations(hidden, seed, 0.5);
         let out = run(
             h,
             HeadRun {
@@ -255,7 +268,7 @@ pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                 x: &x,
                 gain: &gain,
                 rows,
-                k: HEAD_K,
+                k: hidden,
                 eps,
             },
         )?;
@@ -268,9 +281,9 @@ pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                 out.ticket
             ));
         }
-        let ratio = check_logits(name, &out.logits, weights, &x, &gain, HEAD_K, eps)?;
+        let ratio = check_logits(name, &out.logits, weights, &x, &gain, hidden, eps)?;
         worst = worst.max(ratio);
-        notes.push(format!("{name} {rows}x{HEAD_K} {ratio:.3}"));
+        notes.push(format!("{name} {rows}x{hidden} {ratio:.3}"));
     }
     Ok(Verdict::Noted(format!(
         "worst {worst:.3}; {}",
@@ -298,7 +311,7 @@ fn key_order() -> Result<(), String> {
 
 pub fn head_id(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     h.clear_fault()?;
-    expect_head(fixture)?;
+    expect_head(h, fixture)?;
     key_order()?;
     let eps = fixture.rms_eps()?;
     let wide = wide_margin(h, fixture, eps)?;
@@ -311,11 +324,11 @@ pub fn head_id(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 /// A real output row whose logit, normed by itself at gain 1, is a wide positive
 /// margin over a zero row: the row, that logit and the margin's width.
-fn wide_row(fixture: &Fixture, eps: f32) -> Result<(&[u8], f64, f64), String> {
-    let bytes = row_bytes(HEAD_K);
-    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 32)?;
+fn wide_row(hidden: usize, fixture: &Fixture, eps: f32) -> Result<(&[u8], f64, f64), String> {
+    let bytes = row_bytes(hidden);
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, 32)?;
     for row in pool.chunks_exact(bytes) {
-        let (y, width) = margin(row, HEAD_K, eps)?;
+        let (y, width) = margin(row, hidden, eps)?;
         if y.is_finite() && y > 0.0 && y > width {
             return Ok((row, y, width));
         }
@@ -325,12 +338,13 @@ fn wide_row(fixture: &Fixture, eps: f32) -> Result<(&[u8], f64, f64), String> {
 
 fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
     const WINNER: usize = 100;
-    let bytes = row_bytes(HEAD_K);
-    let (row, y, width) = wide_row(fixture, eps)?;
+    let hidden = h.geom().hidden;
+    let bytes = row_bytes(hidden);
+    let (row, y, width) = wide_row(hidden, fixture, eps)?;
     let mut weights = vec![0u8; OUTPUT_ROWS * bytes];
     weights[WINNER * bytes..(WINNER + 1) * bytes].copy_from_slice(row);
-    let x = dequant(row, HEAD_K)?;
-    let gain = vec![1f32; HEAD_K];
+    let x = dequant(row, hidden)?;
+    let gain = vec![1f32; hidden];
     let out = run(
         h,
         HeadRun {
@@ -339,7 +353,7 @@ fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, S
             x: &x,
             gain: &gain,
             rows: OUTPUT_ROWS,
-            k: HEAD_K,
+            k: hidden,
             eps,
         },
     )?;
@@ -369,9 +383,10 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
     const K: usize = 256;
     const LOW: usize = 5;
     const HIGH: usize = 9;
-    let bytes = row_bytes(HEAD_K);
+    let hidden = h.geom().hidden;
+    let bytes = row_bytes(hidden);
     let block = block_bytes();
-    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 64)?;
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, 64)?;
     let mut chosen: Option<Vec<u8>> = None;
     for row in pool.chunks_exact(bytes) {
         let one = &row[..block];
@@ -459,15 +474,16 @@ pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     /// The planted winner: the last row the head owns.
     const WINNER: usize = ROWS - 1;
     const _: () = assert!(LAST_ROWS > 0 && LAST_ROWS < ROWS_PER_GROUP);
+    let hidden = h.geom().hidden;
     h.clear_fault()?;
-    expect_head(fixture)?;
+    expect_head(h, fixture)?;
     let eps = fixture.rms_eps()?;
-    let bytes = row_bytes(HEAD_K);
-    let (row, _, _) = wide_row(fixture, eps)?;
+    let bytes = row_bytes(hidden);
+    let (row, _, _) = wide_row(hidden, fixture, eps)?;
     let mut weights = vec![0u8; ROWS * bytes];
     weights[WINNER * bytes..(WINNER + 1) * bytes].copy_from_slice(row);
-    let x = dequant(row, HEAD_K)?;
-    let gain = vec![1f32; HEAD_K];
+    let x = dequant(row, hidden)?;
+    let gain = vec![1f32; hidden];
     let out = run(
         h,
         HeadRun {
@@ -476,7 +492,7 @@ pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             x: &x,
             gain: &gain,
             rows: ROWS,
-            k: HEAD_K,
+            k: hidden,
             eps,
         },
     )?;
@@ -496,7 +512,7 @@ pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         &weights[from * bytes..],
         &x,
         &gain,
-        HEAD_K,
+        hidden,
         eps,
     )?;
     let want = u32::try_from(WINNER).map_err(|_| "the winner index does not fit the step id")?;
@@ -519,8 +535,9 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     const GROUPS: usize = 2_304;
     const ROWS: usize = ROWS_PER_GROUP * GROUPS;
     const K: usize = 256;
+    let hidden = h.geom().hidden;
     h.clear_fault()?;
-    expect_head(fixture)?;
+    expect_head(h, fixture)?;
     let groups = ROWS.div_ceil(ROWS_PER_GROUP);
     if groups != GROUPS {
         return Err(format!(
@@ -528,9 +545,9 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         ));
     }
     let eps = fixture.rms_eps()?;
-    let full = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, ROWS)?;
+    let full = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, ROWS)?;
     let block = block_bytes();
-    let wide = row_bytes(HEAD_K);
+    let wide = row_bytes(hidden);
     let mut weights = vec![0u8; ROWS * block];
     for (row, dst) in full.chunks_exact(wide).zip(weights.chunks_exact_mut(block)) {
         dst.copy_from_slice(&row[..block]);
@@ -648,15 +665,16 @@ pub fn head_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     const K: usize = 256;
     const NAN_ROW: usize = 0;
     const WINNER: usize = 7;
+    let hidden = h.geom().hidden;
     h.clear_fault()?;
-    expect_head(fixture)?;
+    expect_head(h, fixture)?;
     let eps = fixture.rms_eps()?;
     if !eps.is_finite() || eps <= 0.0 {
         return Err(format!("construction: eps {eps} is not usable"));
     }
-    let bytes = row_bytes(HEAD_K);
+    let bytes = row_bytes(hidden);
     let block = block_bytes();
-    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 64)?;
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, 64)?;
     let mut chosen: Option<Vec<u8>> = None;
     for row in pool.chunks_exact(bytes) {
         let one = &row[..block];
@@ -726,15 +744,16 @@ pub fn head_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 pub fn head_all_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     const ROWS: usize = 32;
     const K: usize = 256;
+    let hidden = h.geom().hidden;
     h.clear_fault()?;
-    expect_head(fixture)?;
+    expect_head(h, fixture)?;
     let eps = fixture.rms_eps()?;
     if !eps.is_finite() || eps <= 0.0 {
         return Err(format!("construction: eps {eps} is not usable"));
     }
-    let bytes = row_bytes(HEAD_K);
+    let bytes = row_bytes(hidden);
     let block = block_bytes();
-    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 64)?;
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, 64)?;
     let mut chosen: Option<Vec<u8>> = None;
     for row in pool.chunks_exact(bytes) {
         let one = &row[..block];
