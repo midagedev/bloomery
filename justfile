@@ -1797,9 +1797,9 @@ gate-gpu-qwen3moe-e2e:
 # qwen3moe routed types under the --place-unset defaults: for every type the host's routed kernels run, a crafted
 # two-layer header planned by the CLI's and the serve seat's defaults. A refusal, or card experts of a type the card
 # table does not run, fails by name. The synthetic layout with MXFP8 attention also loads whole and placed;
-# no external model file is needed, so the fixture tier runs it.
+# no external model file is needed, so the fixture tier runs it, under the default profile: no family fixture's card budget applies.
 gate-gpu-qwen3moe-types:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_types && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_types'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_types && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_types'
 
 # routed card layers vs the card leg, over the census stubs: every family's (qwen3moe, qwen35moe, qwen4exp, glm5-next,
 # mimo2, deepseek41) --place-unset production defaults (the CLI's and the serve seat's, per family) plan each set's
