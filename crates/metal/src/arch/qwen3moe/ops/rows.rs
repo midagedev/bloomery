@@ -18,15 +18,13 @@ use bloomery_device::{Buffer, Elems};
 use chain::ChainError;
 
 use super::super::arena::{Arena, FfnBufs, MixerBufs, SharedBufs, lane_of, layer_word, slot_of};
-use super::super::rows::MIX_STRIDE;
 use super::super::session::SessionError;
 use super::{MetalOps, WHAT, all, all_mut};
 use crate::kernels::{
-    AttentionPrefillParams, AttnCache, CONV_TAPS, CombineParams, DeltaRowStrides, DeltaRowsParams,
-    DeltaSnaps, EXPERT_K, EXPERT_SLOTS, EmbedParams, F32GemmParams, GemmMode, GemmParams,
-    GemmSegParams, HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormRowsParams, HeadParams, KV_HEADS,
-    LOGIT_STRIDE, NormRowsParams, Operand, QUERY_HEADS, RouteSelectParams, RouteTableParams,
-    RoutedKind, RoutedParams, VALUE_HEADS, route_table_words, route_tiles, state_elems,
+    AttentionPrefillParams, AttnCache, CombineParams, DeltaRowStrides, DeltaRowsParams, DeltaSnaps,
+    EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
+    HeadNormRowsParams, HeadParams, NormRowsParams, Operand, RouteSelectParams, RouteTableParams,
+    RoutedKind, RoutedParams, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -150,6 +148,7 @@ impl MetalOps<'_, '_> {
             faults,
             eps,
             ctx: cache_rows,
+            geom,
             ..
         } = &mut *self.arena;
         let MixerBufs::Attention(a) = &mut layers[l].mixer else {
@@ -167,9 +166,9 @@ impl MetalOps<'_, '_> {
         self.kernels.attention_prefill(
             self.enc,
             AttentionPrefillParams {
-                head_dim: HEAD_DIM,
-                query_heads: QUERY_HEADS,
-                kv_heads: KV_HEADS,
+                head_dim: geom.attn.head,
+                query_heads: geom.attn.query_heads,
+                kv_heads: geom.attn.kv_heads,
                 ctx: *cache_rows,
                 eps: *eps,
                 layer: layer_word(l),
@@ -188,8 +187,8 @@ impl MetalOps<'_, '_> {
                     k: all_mut(&mut a.k_cache)?,
                     v: all_mut(&mut a.v_cache)?,
                 },
-                out: rows.mix.window_mut(Elems(0), Elems(m * MIX_STRIDE))?,
-                out_stride: MIX_STRIDE,
+                out: rows.mix.window_mut(Elems(0), Elems(m * rows.mix_stride))?,
+                out_stride: rows.mix_stride,
                 fault: &faults[slot],
             },
         )?;
@@ -222,11 +221,11 @@ impl MetalOps<'_, '_> {
             GemmParams {
                 quant: a.out_quant,
                 rows: *hidden,
-                cols: MIX_STRIDE,
+                cols: rows.mix_stride,
                 acts: m,
                 weights: all(&a.out)?,
-                x: rows.mix.window(Elems(0), Elems(m * MIX_STRIDE))?,
-                x_stride: MIX_STRIDE,
+                x: rows.mix.window(Elems(0), Elems(m * rows.mix_stride))?,
+                x_stride: rows.mix_stride,
                 y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
                 y_stride: *hidden,
                 mode: GemmMode::Residual,
@@ -256,6 +255,7 @@ impl MetalOps<'_, '_> {
             lane,
             faults,
             eps,
+            geom,
             ..
         } = &mut *self.arena;
         let MixerBufs::Delta(d) = &mut layers[l].mixer else {
@@ -265,7 +265,7 @@ impl MetalOps<'_, '_> {
             )
             .into());
         };
-        let dense = DeltaRowStrides::dense(d.n_k).ok_or_else(|| SessionError::Shape {
+        let dense = DeltaRowStrides::of(&geom.delta, d.n_k).ok_or_else(|| SessionError::Shape {
             what: WHAT,
             detail: format!("{} key heads do not fit", d.n_k),
         })?;
@@ -283,7 +283,8 @@ impl MetalOps<'_, '_> {
         } else {
             let copies = rows.snaps.as_mut();
             let at = copies.as_ref().and_then(|c| c.at.get(l).copied().flatten());
-            let (Some(c), Some(at), Some(lane_len)) = (copies, at, state_elems(1)) else {
+            let (Some(c), Some(at), Some(lane_len)) = (copies, at, geom.delta.state_elems(1))
+            else {
                 return Err(ChainError::shape(
                     WHAT,
                     format!("layer {l}: a pass's copies with none open for the layer"),
@@ -321,9 +322,9 @@ impl MetalOps<'_, '_> {
                     .delta_prep
                     .window_mut(Elems(0), Elems(m * rows.delta_prep_stride))?,
                 faults: &faults[slot],
-                n_v: VALUE_HEADS,
-                head: HEAD_COLS,
-                taps: CONV_TAPS,
+                n_v: geom.delta.value_heads,
+                head: geom.delta.head_cols,
+                taps: geom.delta.conv_taps,
                 n_k: d.n_k,
                 map: d.map,
                 lanes: super::super::arena::LANES,
@@ -421,10 +422,12 @@ impl MetalOps<'_, '_> {
             hidden,
             top_k,
             n_experts,
+            geom,
             ..
         } = &mut *self.arena;
         let f = &layers[l].ffn;
-        let slots = m * EXPERT_SLOTS;
+        let slots = m * geom.experts.slots;
+        let logit_stride = geom.router.logit_stride;
         self.kernels.norm_rows(
             self.enc,
             NormRowsParams {
@@ -441,7 +444,7 @@ impl MetalOps<'_, '_> {
             },
         )?;
         self.enc.memory_barrier();
-        let routed_cols = (m - 1) * LOGIT_STRIDE;
+        let routed_cols = (m - 1) * logit_stride;
         self.kernels.gemm_f32(
             self.enc,
             F32GemmParams {
@@ -454,7 +457,7 @@ impl MetalOps<'_, '_> {
                 y: rows
                     .logits
                     .window_mut(Elems(0), Elems(routed_cols + *n_experts))?,
-                y_stride: LOGIT_STRIDE,
+                y_stride: logit_stride,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -471,7 +474,7 @@ impl MetalOps<'_, '_> {
                 y: rows
                     .logits
                     .window_mut(Elems(*n_experts), Elems(routed_cols + 1))?,
-                y_stride: LOGIT_STRIDE,
+                y_stride: logit_stride,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -482,8 +485,8 @@ impl MetalOps<'_, '_> {
             RouteSelectParams {
                 rows: m,
                 top_k: *top_k,
-                logits: rows.logits.window(Elems(0), Elems(m * LOGIT_STRIDE))?,
-                logit_stride: LOGIT_STRIDE,
+                logits: rows.logits.window(Elems(0), Elems(m * logit_stride))?,
+                logit_stride,
                 ids: rows.pick_ids.window_mut(Elems(0), Elems(slots))?,
                 weights: rows.pick_weights.window_mut(Elems(0), Elems(slots))?,
                 fault: &faults[slot],
@@ -495,7 +498,7 @@ impl MetalOps<'_, '_> {
             self.enc,
             RouteTableParams {
                 slots,
-                per_row: EXPERT_SLOTS,
+                per_row: geom.experts.slots,
                 experts: *n_experts,
                 ids: rows.pick_ids.window(Elems(0), Elems(slots))?,
                 sorted: rows.sorted.window_mut(Elems(0), Elems(slots))?,
@@ -524,10 +527,11 @@ impl MetalOps<'_, '_> {
             faults,
             hidden,
             n_experts,
+            geom,
             ..
         } = &mut *self.arena;
         let f = &layers[l].ffn;
-        let slots = m * EXPERT_SLOTS;
+        let (slots, expert_k) = (m * geom.experts.slots, geom.experts.k);
         let max_tiles = route_tiles(slots, *n_experts);
         let table_words = route_table_words(slots, *n_experts);
         self.kernels.gemm_routed(
@@ -537,7 +541,7 @@ impl MetalOps<'_, '_> {
                 kind: RoutedKind::Pair,
                 operand: PASS_OPERAND,
                 cols: *hidden,
-                rows: EXPERT_K,
+                rows: expert_k,
                 experts: *n_experts,
                 stack: all(&f.gate)?,
                 stack_up: Some(all(&f.up)?),
@@ -547,8 +551,8 @@ impl MetalOps<'_, '_> {
                 x_rows: m,
                 x_stride: *hidden,
                 gather: true,
-                y: rows.h.window_mut(Elems(0), Elems(slots * EXPERT_K))?,
-                y_stride: EXPERT_K,
+                y: rows.h.window_mut(Elems(0), Elems(slots * expert_k))?,
+                y_stride: expert_k,
                 slots,
                 max_tiles,
                 sorted: rows.sorted.window(Elems(0), Elems(slots))?,
@@ -565,16 +569,16 @@ impl MetalOps<'_, '_> {
                 quant: f.down_quant,
                 kind: RoutedKind::Plain,
                 operand: PASS_OPERAND,
-                cols: EXPERT_K,
+                cols: expert_k,
                 rows: *hidden,
                 experts: *n_experts,
                 stack: all(&f.down)?,
                 stack_up: None,
                 shared: all(&shared_of(f, l)?.down)?,
                 shared_up: None,
-                x: rows.h.window(Elems(0), Elems(slots * EXPERT_K))?,
+                x: rows.h.window(Elems(0), Elems(slots * expert_k))?,
                 x_rows: slots,
-                x_stride: EXPERT_K,
+                x_stride: expert_k,
                 gather: false,
                 y: rows.y.window_mut(Elems(0), Elems(slots * *hidden))?,
                 y_stride: *hidden,
@@ -592,7 +596,7 @@ impl MetalOps<'_, '_> {
             self.enc,
             CombineParams {
                 rows: m,
-                per_row: EXPERT_SLOTS,
+                per_row: geom.experts.slots,
                 cols: *hidden,
                 y: rows.y.window(Elems(0), Elems(slots * *hidden))?,
                 y_rows: slots,
@@ -668,14 +672,21 @@ fn shared_of(f: &FfnBufs, l: usize) -> Result<&SharedBufs, SessionError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kernels::router;
+    use crate::geom::Geometry;
+    use crate::instance::REGISTERED;
 
-    /// The logit rows hold the routed experts and any shared gate, at a
-    /// stride the GEMM's output rows are aligned to.
-    const _: () = assert!(
-        router::EXPERTS + router::SHARED == router::ROWS
-            && LOGIT_STRIDE >= router::ROWS
-            && LOGIT_STRIDE.is_multiple_of(4)
-    );
+    /// The logit rows of every registered instance hold the routed experts and
+    /// any shared gate, at a stride the GEMM's output rows are aligned to.
+    const _: () = {
+        let mut i = 0;
+        while i < REGISTERED.len() {
+            let r = Geometry::of(&REGISTERED[i]).router;
+            assert!(
+                r.experts + r.shared == r.rows
+                    && r.logit_stride >= r.rows
+                    && r.logit_stride.is_multiple_of(4)
+            );
+            i += 1;
+        }
+    };
 }

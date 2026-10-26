@@ -31,10 +31,8 @@ use super::count::{GroupBytes, GroupKind, Layer, Projection};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
-use crate::kernels::{
-    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, PARTIALS_PER_HEAD, Quant, ROT,
-    Segment, VALUE_HEADS, head_groups, partials_len, router, segments_for_keys, state_elems,
-};
+use crate::geom::Geometry;
+use crate::kernels::{HeadMap, Quant, Segment, head_groups, segments_for_keys};
 use crate::residency::Alloc;
 
 const WHAT: &str = "qwen35moe arena";
@@ -175,6 +173,9 @@ pub(super) struct LayerBufs {
 
 /// Every buffer of the session.
 pub(super) struct Arena {
+    /// The launch geometry of the instance the file selects: every length
+    /// below that is not the file's own is derived from it.
+    pub(super) geom: Geometry,
     pub(super) hidden: usize,
     pub(super) vocab: usize,
     pub(super) ctx: usize,
@@ -202,9 +203,9 @@ pub(super) struct Arena {
     /// The attention fold's ticket, one word: the flash's last threadgroup
     /// resets it, so every launch finds it zero.
     pub(super) attn_ticket: MetalBuffer<u32>,
-    /// `ctx` rows of [`ROT`] interleaved `(cos, sin)`.
+    /// `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`.
     pub(super) rope: MetalBuffer<f32>,
-    /// The experts' activations, one row of [`EXPERT_K`] per slot.
+    /// The experts' activations, one row of `ExpertsGeom::k` per slot.
     pub(super) h: MetalBuffer<f32>,
     pub(super) logits: MetalBuffer<f32>,
     pub(super) candidates: MetalBuffer<u64>,
@@ -250,6 +251,7 @@ fn at_layer(l: usize, e: SessionError) -> SessionError {
 struct Loader<'a> {
     device: Alloc<'a>,
     split: &'a Split,
+    geom: &'a Geometry,
 }
 
 impl Loader<'_> {
@@ -398,14 +400,14 @@ fn delta_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&DeltaBufs, 
     }
 }
 
-/// The rope table of `ctx` positions: per position, [`ROT`] / 2 pairs
-/// `(cos θ, sin θ)` with θ = `pos · base^(−2i/ROT)`, θ advanced by repeated
+/// The rope table of `ctx` positions: per position, `rot` / 2 pairs
+/// `(cos θ, sin θ)` with θ = `pos · base^(−2i/rot)`, θ advanced by repeated
 /// multiplication in f32 as ggml's `rope_yarn` does with no YaRN — chain's
 /// [`RopeTable`] over a window spec, the one owner of the recipe both
 /// backends' tables come from.
-fn rope_rows(table: &RopeTable, ctx: usize) -> Vec<f32> {
+fn rope_rows(table: &RopeTable, ctx: usize, rot: usize) -> Vec<f32> {
     let positions = u32::try_from(ctx).expect("the check made the cache's rows fit u32");
-    let mut out = Vec::with_capacity(ctx * ROT);
+    let mut out = Vec::with_capacity(ctx * rot);
     for pos in 0..positions {
         table.push(pos, Direction::Forward, &mut out);
     }
@@ -414,16 +416,22 @@ fn rope_rows(table: &RopeTable, ctx: usize) -> Vec<f32> {
 
 impl Arena {
     /// The arena of `g` (the layout [`super::check`] resolved from `split`'s
-    /// header): each weight copied from `split` into a buffer of its own, and
-    /// every buffer a token touches made, all zeroed but the weights, the
-    /// rope table and the lane words.
+    /// header, at the launch geometry `geom` of the file's instance): each
+    /// weight copied from `split` into a buffer of its own, and every buffer a
+    /// token touches made, all zeroed but the weights, the rope table and the
+    /// lane words.
     pub(super) fn open(
         device: Alloc<'_>,
         split: &Split,
+        geom: &Geometry,
         g: &Layout,
     ) -> Result<Arena, SessionError> {
         let (hidden, vocab, ctx) = (g.hidden, g.vocab, g.ctx);
-        let load = Loader { device, split };
+        let load = Loader {
+            device,
+            split,
+            geom,
+        };
         let embed = load.site(&g.embed)?;
         let head_w = load.site(&g.head)?;
         let head_norm = load.values(&g.head_norm)?;
@@ -432,10 +440,11 @@ impl Arena {
             layers.push(load.layer(layer, g.top_k).map_err(|e| at_layer(l, e))?);
         }
         let mut rope = device.buffer(Elems(g.rope_len))?;
-        rope.write(&rope_rows(&g.rope, ctx))?;
+        rope.write(&rope_rows(&g.rope, ctx, geom.attn.rot))?;
         let mut lane = device.buffer(Elems(LANES))?;
         lane.write(&LANE_WORDS)?;
         Ok(Arena {
+            geom: *geom,
             hidden,
             vocab,
             ctx,
@@ -450,13 +459,13 @@ impl Arena {
             head_norm,
             x: zeroed(device, hidden)?,
             proj: zeroed(device, g.proj)?,
-            g: zeroed(device, VALUE_HEADS * HEAD_COLS)?,
-            delta_partials: zeroed(device, VALUE_HEADS * PARTIALS_PER_HEAD)?,
+            g: zeroed(device, geom.delta.value_heads * geom.delta.head_cols)?,
+            delta_partials: zeroed(device, geom.delta.partials_stride)?,
             attn: zeroed(device, g.attn_out)?,
             attn_partials: zeroed(device, g.attn_partials)?,
             attn_ticket: zeroed(device, 1)?,
             rope,
-            h: zeroed(device, EXPERT_SLOTS * EXPERT_K)?,
+            h: zeroed(device, geom.experts.slots * geom.experts.k)?,
             logits: zeroed(device, vocab)?,
             candidates: zeroed(device, head_groups(vocab))?,
             head_ticket: zeroed(device, 1)?,
@@ -556,9 +565,11 @@ impl Arena {
                 no_ids()?;
                 let a = attn_of(bufs()?, layer, kind)?;
                 let n_keys = u64::from(pos) + 1;
-                let kv_row = count_u64(KV_HEADS * HEAD_DIM, "a cache row") * 2;
+                let attn = &self.geom.attn;
+                let kv_row = count_u64(attn.kv_heads * attn.head, "a cache row") * 2;
                 let segments = segments_for_keys(pos + 1);
-                let parts = partials_len(segments as usize)
+                let parts = attn
+                    .partials_len(segments as usize)
                     .ok_or_else(|| refuse("the attention partials do not fit"))?;
                 // The flash writes the gated output within one segment;
                 // past it, the partials its own fold then reads back.
@@ -569,10 +580,10 @@ impl Arena {
                 };
                 Ok(GroupBytes {
                     // The query's and the key's head norms.
-                    weights: 2 * f32s(HEAD_DIM),
+                    weights: 2 * f32s(attn.head),
                     // The query with its gate, the rope row, and the flash's
                     // output.
-                    acts: f32s(a.q.len()) + f32s(ROT) + wrote,
+                    acts: f32s(a.q.len()) + f32s(attn.rot) + wrote,
                     // The live keys and values read, this token's row written.
                     state: 2 * (n_keys * kv_row + kv_row),
                 })
@@ -590,7 +601,11 @@ impl Arena {
             GroupKind::DeltaCore => {
                 no_ids()?;
                 let d = delta_of(bufs()?, layer, kind)?;
-                let lane = state_elems(1).ok_or_else(|| refuse("a state lane does not fit"))?;
+                let lane = self
+                    .geom
+                    .delta
+                    .state_elems(1)
+                    .ok_or_else(|| refuse("a state lane does not fit"))?;
                 Ok(GroupBytes {
                     weights: bytes_of(&d.conv)
                         + bytes_of(&d.dt_bias)
@@ -645,11 +660,12 @@ impl Arena {
             GroupKind::GateUp | GroupKind::Down => {
                 let f = &bufs()?.ffn;
                 let picks = self.top_k;
-                if ids.len() != picks + router::SHARED {
+                let shared = self.geom.router.shared;
+                if ids.len() != picks + shared {
                     return Err(refuse(format!(
                         "{kind:?}: {} router ids; the picks, then any shared expert's, are {}",
                         ids.len(),
-                        picks + router::SHARED
+                        picks + shared
                     )));
                 }
                 let n = count_u64(self.n_experts, "the experts");
@@ -807,10 +823,10 @@ fn ffn(
                 })
             })
             .transpose()?,
-        logits: zeroed(device, router::ROWS)?,
-        ids: zeroed(device, top_k + router::SHARED)?,
-        weights: zeroed(device, top_k + router::SHARED)?,
-        partials: zeroed(device, router::PARTIALS)?,
+        logits: zeroed(device, load.geom.router.rows)?,
+        ids: zeroed(device, top_k + load.geom.router.shared)?,
+        weights: zeroed(device, top_k + load.geom.router.shared)?,
+        partials: zeroed(device, load.geom.router.partials)?,
         ticket: zeroed(device, 1)?,
     })
 }

@@ -34,10 +34,9 @@ use crate::device::MetalDevice;
 use crate::encode::ComputeEncoder;
 use crate::kernels::router::RouterParams;
 use crate::kernels::{
-    AttentionParams, AttnCache, CONV_TAPS, DeltaParams, EXPERT_K, EXPERT_SLOTS, EmbedParams,
-    FoldParams, HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams, KV_HEADS,
-    Kernels, MatvecParams, Mode, NormOnLoad, PASS_ROWS, PairParams, QUERY_HEADS, ROUTED_IDS,
-    SegParams, SharedPlan, VALUE_HEADS, partials_len, router, segments_for_keys,
+    AttentionParams, AttnCache, DeltaParams, EmbedParams, FoldParams, HEAD_SIMD_GROUPS,
+    HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormOnLoad, PASS_ROWS, PairParams,
+    SegParams, SharedPlan, segments_for_keys,
 };
 
 mod rows;
@@ -262,19 +261,23 @@ impl MetalOps<'_, '_> {
             faults,
             eps,
             ctx,
+            geom,
             ..
         } = &mut *arena;
         let a = attention_of!(layers, l);
         // The arena holds the partials of the cache's whole segment count;
         // the launch reads and writes the prefix this token's keys take.
-        let parts = partials_len(segments as usize).ok_or_else(|| SessionError::Shape {
-            what: WHAT,
-            detail: format!("the partials of {segments} segments do not fit"),
-        })?;
+        let parts =
+            geom.attn
+                .partials_len(segments as usize)
+                .ok_or_else(|| SessionError::Shape {
+                    what: WHAT,
+                    detail: format!("the partials of {segments} segments do not fit"),
+                })?;
         Ok(AttentionParams {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
+            head_dim: geom.attn.head,
+            query_heads: geom.attn.query_heads,
+            kv_heads: geom.attn.kv_heads,
             segments: segments as usize,
             ctx: *ctx,
             eps: *eps,
@@ -327,16 +330,20 @@ impl MetalOps<'_, '_> {
             hidden,
             eps,
             n_experts,
+            geom,
             ..
         } = &mut *self.arena;
         let f = &layers[l].ffn;
-        let ids = f.ids.window(Elems(0), Elems(ROUTED_IDS))?.cast::<i32>()?;
+        let ids = f
+            .ids
+            .window(Elems(0), Elems(geom.experts.routed_ids))?
+            .cast::<i32>()?;
         self.kernels.pair(
             self.enc,
             PairParams {
                 quant: f.gate_up_quant,
-                slots: EXPERT_SLOTS,
-                k: EXPERT_K,
+                slots: geom.experts.slots,
+                k: geom.experts.k,
                 cols: *hidden,
                 n_experts: *n_experts,
                 ids,
@@ -348,7 +355,7 @@ impl MetalOps<'_, '_> {
                 gain: all(&f.norm)?,
                 eps: *eps,
                 y: all_mut(h)?,
-                out_stride: EXPERT_K,
+                out_stride: geom.experts.k,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -368,10 +375,14 @@ impl MetalOps<'_, '_> {
             faults,
             hidden,
             n_experts,
+            geom,
             ..
         } = &mut *self.arena;
         let f = &layers[l].ffn;
-        let ids = f.ids.window(Elems(0), Elems(ROUTED_IDS))?.cast::<i32>()?;
+        let ids = f
+            .ids
+            .window(Elems(0), Elems(geom.experts.routed_ids))?
+            .cast::<i32>()?;
         let y = x.window_mut(Elems(0), Elems(*hidden))?;
         self.kernels.fold(
             self.enc,
@@ -382,8 +393,8 @@ impl MetalOps<'_, '_> {
                     None => SharedPlan::None,
                 },
                 rows: *hidden,
-                slots: EXPERT_SLOTS,
-                k: EXPERT_K,
+                slots: geom.experts.slots,
+                k: geom.experts.k,
                 n_experts: *n_experts,
                 ids,
                 down: all(&f.down)?,
@@ -506,6 +517,7 @@ impl ChainOps for MetalOps<'_, '_> {
             lane,
             faults,
             eps,
+            geom,
             ..
         } = &mut *self.arena;
         let d = delta_of!(layers, l.layer);
@@ -526,9 +538,9 @@ impl ChainOps for MetalOps<'_, '_> {
                 partials: all_mut(delta_partials)?,
                 g: all_mut(g)?,
                 faults: &faults[slot],
-                n_v: VALUE_HEADS,
-                head: HEAD_COLS,
-                taps: CONV_TAPS,
+                n_v: geom.delta.value_heads,
+                head: geom.delta.head_cols,
+                taps: geom.delta.conv_taps,
                 n_k: d.n_k,
                 map: d.map,
                 lanes: LANES,
@@ -590,13 +602,14 @@ impl ChainOps for MetalOps<'_, '_> {
             eps,
             hidden,
             top_k,
+            geom,
             ..
         } = &mut *self.arena;
         let f = &mut layers[l.layer].ffn;
         self.kernels.router(
             self.enc,
             RouterParams {
-                rows: router::ROWS,
+                rows: geom.router.rows,
                 k: *hidden,
                 top_k: *top_k,
                 routed: all(&f.gate_inp)?,
