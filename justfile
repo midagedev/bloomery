@@ -2806,7 +2806,7 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 # Qwen3-30B and Qwen3.6 on plan (b′) (gate_qwen3moe_twocard's doc): the stage on the A6000 and one expert tier on the
 # 3090 against the same plan with every tier segment joined onto the stage card. The real tier's card budget is the
 # gate's, and it is what puts experts on the tier. Step tokens and logits rows, bit for bit the joined reference. The
-# Qwen3-30B arm is real-file only (fixture-dirs row self); the fixture tier runs the Qwen3.6 arm. Both cards
+# Qwen3-30B arm is real-file only: the fixture tier checks that file's header and runs the Qwen3.6 arm. Both cards
 # (BLOOMERY_CARD=both: both gate locks), two loads of one file then two of the other, under the big-load lock the V4.1
 # loads take. The bound is the solar2 two-card recipe's, copied with that recipe's shape. Both
 # profiles' model paths are resolved inside the box command: the qwen35moe one through the box's
@@ -2814,7 +2814,7 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen3moe-twocard:
-    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=both ./tools/box.sh "bash tools/ref/real-only.sh gate-gpu-qwen3moe-twocard && q3=\$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen3moe bash -c '. tools/ref/ref-paths.sh && printf %s \"\$MODEL\"') && q35=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_qwen3moe_twocard \"\$q3\" \"\$q35\""
+    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=both ./tools/box.sh "q3=\$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen3moe bash -c '. tools/ref/ref-paths.sh && printf %s \"\$MODEL\"') && q35=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_qwen3moe_twocard \"\$q3\" \"\$q35\""
 
 # Qwen3.8's plan (b′) with its expert tier on a tier node (docs/contrib/dgx-spark.md 9.5 items 5 and 6): node 0, a child
 # of the gate with BLOOMERY_TIER_NODES set, and node 1, tier_server, over loopback on this machine's card, the tier's page

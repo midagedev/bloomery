@@ -34,9 +34,9 @@
 //! named and unread here, are `ref_qwen35moe`, `ref_qwen35moe_step4_every_node`
 //! and `ref_qwen35moe_d1k` (fixture `fx_ref_qwen35moe`,
 //! `fx_ref_qwen35moe_step4_every_node`, `fx_ref_qwen35moe_d1k`, family
-//! `fx-ik-qwen35moe`). Qwen3-30B has no fixture set (`tools/fixture-dirs.tsv`
-//! row `self`): the fixture tier checks that arm's header is `qwen3moe` and
-//! skips it, and does not open the real file.
+//! `fx-ik-qwen35moe`). This gate reads no Qwen3-30B set: the fixture tier checks
+//! that arm's header is `qwen3moe` and skips it, and opens neither the real file
+//! nor the fixture's.
 //!
 //! Arguments: the Qwen3-30B file, then the Qwen3.6 file. The second file's
 //! architecture is `qwen35` or `qwen35moe`.
@@ -342,8 +342,8 @@ mod gate {
                 return Err(format!("the first file is {arch:?}, want qwen3moe").into());
             }
             println!(
-                "{NAME}: the fixture tier skips the Qwen3-30B arm: qwen3moe is tools/fixture-dirs.tsv \
-                 row self, so this gate does not open the real file there"
+                "{NAME}: the fixture tier skips the Qwen3-30B arm: this gate has no fixture \
+                 conversion of it, so it opens neither the real file nor the fixture there"
             );
             return Ok(true);
         }

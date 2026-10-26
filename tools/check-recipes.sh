@@ -560,7 +560,7 @@ blk_fixturevariants() {
   want "a tag the table does not name, exit" "rc=64" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=nosuchtag || return 1
   want "a variant of another family" "is a variant of $family" BLOOMERY_MODEL=qwen4exp BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   want "a string that is no tag" "lower-case letters and digits" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT='../x' || return 1
-  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=qwen3moe BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=deepseek2 BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   rm -f "$d/fixture-variants/$tag/glm5next/"*.gguf
   want "a variant file that is not there" "fixture-requant $family $tag" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   want "a variant file that is not there, exit" "rc=66" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
