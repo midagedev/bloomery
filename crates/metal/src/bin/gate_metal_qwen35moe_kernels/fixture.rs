@@ -1,4 +1,4 @@
-//! The kernels' gate's fixture file: the qwen35moe trunk whose real tensors the clauses read.
+//! The kernels' gate's fixture file: the row's family's trunk (qwen35moe's or qwen3moe's) whose real tensors the clauses read.
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +11,8 @@ use gguf::quant::{GgmlType, dequant_row};
 /// the clauses that read the tensor's tail.
 pub const OUTPUT_ROWS: usize = 248_320;
 
-/// The fixture file: the qwen35moe trunk the gate reads its tensors from,
-/// opened as a split — the one reader that accepts bloomery's own value
+/// The fixture file: the trunk of the row's family the gate reads its tensors
+/// from, opened as a split — the one reader that accepts bloomery's own value
 /// types, which an MLX-format fixture's tensors are.
 pub struct Fixture {
     split: Split,
@@ -23,7 +23,7 @@ impl Fixture {
     pub fn open(path: &Path) -> Result<Self, String> {
         let split = Split::open(path).map_err(|e| {
             format!(
-                "the fixture {} did not open: {e} (copy the qwen35moe fixture's trunk file there, or name it with --fixture)",
+                "the fixture {} did not open: {e} (copy the row's fixture's trunk file there, or name it with --fixture)",
                 path.display()
             )
         })?;

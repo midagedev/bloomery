@@ -16,20 +16,24 @@
 //! check; a table that stayed green on one would be wrong.
 //!
 //! The tensor-op GEMMs' mutants ([`TENSOR_MUTANTS`]) edit their own program's
-//! text ([`TENSOR_SOURCE`]) and are caught by the `tensor_*` clauses, which
-//! run those kernels on any device that compiles them.
+//! text and are caught by the `tensor_*` clauses, which run those kernels on
+//! any device that compiles them.
 
 #[path = "../shared/mutants.rs"]
+#[allow(
+    dead_code,
+    reason = "the e2e gate reads the host shim `source_of`; this gate reads `source_at`"
+)]
 mod program;
 
-pub use program::{Mutant, Program, source_of};
+pub use program::{Mutant, Program, source_at};
 
 use super::Table;
 
-/// Every mutant of a host's run (`table`, its row of the gate), with the
-/// program it edits: at a host that runs the whole gate both tables; at one
-/// that runs its shaped kernels' clauses, the main table's mutants of those
-/// clauses and the instance's own.
+/// Every mutant of an instance's run (`table`, its row of the gate), with the
+/// program it edits: at an instance that runs the whole gate both tables; at
+/// one that runs its shaped kernels' clauses, the main table's mutants of
+/// those clauses and the instance's own.
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
@@ -40,7 +44,7 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     }
 }
 
-/// The main table's mutants of the clauses a Qwen3-30B-A3B host runs, less
+/// The main table's mutants of the clauses the Qwen3-30B-A3B row runs, less
 /// the three whose text its preprocessor removes: the gated epilogues
 /// (`attn_gate_s1`, `attn_gate_merge`) and the shared slot (`pair_shared_stack`).
 pub const Q30_KEPT: &[&str] = &[

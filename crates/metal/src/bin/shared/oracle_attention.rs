@@ -1,6 +1,8 @@
 //! The attention oracle: the kernel's f32 norm and rope, the host
 //! quantizers, an f64 softmax over the dequantized cache, and the band, at
-//! the host instance's head ([`HEAD_DIM`] values, the first [`ROT`] turning).
+//! the head its inputs carry: the head's width is the query's length, and the
+//! values that turn are the rope row's. An input of another length than the
+//! one it pairs with is refused by name.
 //!
 //! The norm follows the CUDA append's pairing and warp order: thread `t` of
 //! `HEAD/2` owns `owned_pair(HEAD, ROT, t)`, `(t, t + ROT/2)` for
@@ -72,12 +74,11 @@
 //! weight being 1). The tile rescales are `ceil(n_keys / 16)`, and there are no
 //! segments. The gate adds the decode band's terms unchanged.
 
-use bloomery_metal::kernels::{HEAD_DIM, ROT, SCALE, TILE};
+use bloomery_metal::kernels::TILE;
 use gguf::quant::{f32_to_f16_bits, half_to_f32, quantize_q8_0};
 
 use super::oracle::{U, gamma_bound, sigmoid};
-/// Lane fmas, the SIMD-group sum, and the scale multiply.
-const DOT_OPS: usize = HEAD_DIM / 32 + 31 + 1;
+
 /// 4 ulp of a normal, as a relative error: `4 * 2^-23`.
 const ETA: f64 = 1.0 / 2_097_152.0;
 /// The sigmoid and the product: exp, add, divide, multiply.
@@ -87,18 +88,46 @@ fn f64_usize(n: usize) -> f64 {
     f64::from(u32::try_from(n).expect("a band count fits u32"))
 }
 
-/// The norm's pair tree's warps: `HEAD/2` threads, 32 a warp.
-const PAIR_WARPS: usize = HEAD_DIM / 64;
+/// The score's scale for a head of `head` values: ik's `1.0f/sqrtf(float(head))`
+/// in f32.
+fn scale_of(head: usize) -> f32 {
+    1.0 / (head as f32).sqrt()
+}
 
-fn warp_sums(x: &[f32; HEAD_DIM]) -> [f32; PAIR_WARPS] {
-    let mut acc = [[0f32; 32]; PAIR_WARPS];
+/// The head's values fill the norm's pair tree: `head / 2` threads, 32 a
+/// warp.
+fn check_head(head: usize) -> Result<(), String> {
+    if head == 0 || !head.is_multiple_of(64) {
+        return Err(format!(
+            "a head of {head} values does not fill the pair tree's 32-lane warps"
+        ));
+    }
+    Ok(())
+}
+
+/// `x` and `other`, two inputs of the same head, are of one width.
+fn same_head(what: &str, head: usize, other: usize) -> Result<(), String> {
+    if other != head {
+        return Err(format!(
+            "{what} holds {other} values, the head holds {head}"
+        ));
+    }
+    Ok(())
+}
+
+/// The norm's pair tree's warps, one sum each: `head / 2` threads, 32 a
+/// warp, a thread owning the pair `(t, t + rot/2)` while the rope turns it and
+/// `(t + rot/2, t + head/2)` after.
+fn warp_sums(x: &[f32], rot: usize) -> Vec<f32> {
+    let head = x.len();
+    let mut acc = vec![[0f32; 32]; head / 64];
     for (w, row) in acc.iter_mut().enumerate() {
         for (lane, slot) in row.iter_mut().enumerate() {
             let tid = w * 32 + lane;
-            let (i0, i1) = if tid < ROT / 2 {
-                (tid, tid + ROT / 2)
+            let (i0, i1) = if tid < rot / 2 {
+                (tid, tid + rot / 2)
             } else {
-                (tid + ROT / 2, tid + HEAD_DIM / 2)
+                (tid + rot / 2, tid + head / 2)
             };
             *slot = x[i0] * x[i0] + x[i1] * x[i1];
         }
@@ -111,11 +140,11 @@ fn warp_sums(x: &[f32; HEAD_DIM]) -> [f32; PAIR_WARPS] {
             }
         }
     }
-    acc.map(|row| row[0])
+    acc.iter().map(|row| row[0]).collect()
 }
 
-fn rms_scale(sum: f32, eps: f32) -> f32 {
-    let mean = sum / f32::from(u16::try_from(HEAD_DIM).expect("a head's width fits u16"));
+fn rms_scale(sum: f32, eps: f32, head: usize) -> f32 {
+    let mean = sum / f32::from(u16::try_from(head).expect("a head's width fits u16"));
     let scale = 1.0 / (mean + eps).sqrt();
     if !scale.is_finite() || scale <= 0.0 {
         f32::NAN
@@ -124,60 +153,67 @@ fn rms_scale(sum: f32, eps: f32) -> f32 {
     }
 }
 
-/// Norm then rope of one head, in the kernel's f32 order.
-pub fn norm_rope(
-    x: &[f32; HEAD_DIM],
-    gain: &[f32; HEAD_DIM],
-    eps: f32,
-    table_row: &[f32],
-) -> Result<[f32; HEAD_DIM], String> {
-    if table_row.len() != ROT {
+/// Norm then rope of one head, in the kernel's f32 order. The head is `x`'s
+/// width; the rope turns the first `table_row.len()` values.
+pub fn norm_rope(x: &[f32], gain: &[f32], eps: f32, table_row: &[f32]) -> Result<Vec<f32>, String> {
+    let head = x.len();
+    let rot = table_row.len();
+    check_head(head)?;
+    same_head("a gain", head, gain.len())?;
+    if rot == 0 || !rot.is_multiple_of(2) || rot > head {
         return Err(format!(
-            "a rope row holds {} values, the partial holds {ROT}",
-            table_row.len()
+            "a rope row holds {rot} values, which do not turn pairs of a head of {head}"
         ));
     }
-    let warps = warp_sums(x);
+    let warps = warp_sums(x, rot);
     let mut sum = warps[0];
     for w in &warps[1..] {
         sum += w;
     }
-    let scale = rms_scale(sum, eps);
-    let mut n = [0f32; HEAD_DIM];
-    for i in 0..HEAD_DIM {
-        let scaled_gain = scale * gain[i];
-        n[i] = scaled_gain * x[i];
-    }
-    let mut y = n;
-    for i in 0..ROT / 2 {
+    let scale = rms_scale(sum, eps, head);
+    let n: Vec<f32> = (0..head)
+        .map(|i| {
+            let scaled_gain = scale * gain[i];
+            scaled_gain * x[i]
+        })
+        .collect();
+    let mut y = n.clone();
+    for i in 0..rot / 2 {
         let n0 = n[i];
-        let n1 = n[i + ROT / 2];
+        let n1 = n[i + rot / 2];
         let c = table_row[2 * i];
         let s = table_row[2 * i + 1];
         y[i] = n0.mul_add(c, -(n1 * s));
-        y[i + ROT / 2] = n0.mul_add(s, n1 * c);
+        y[i + rot / 2] = n0.mul_add(s, n1 * c);
     }
     Ok(y)
 }
 
 /// One head as f16 bits, `gguf::quant::f32_to_f16_bits` per value.
 #[must_use]
-pub fn pack_f16(row: &[f32; HEAD_DIM]) -> [u16; HEAD_DIM] {
-    let mut out = [0u16; HEAD_DIM];
-    for (out, &v) in out.iter_mut().zip(row.iter()) {
-        *out = f32_to_f16_bits(v);
-    }
-    out
+pub fn pack_f16(row: &[f32]) -> Vec<u16> {
+    row.iter().map(|&v| f32_to_f16_bits(v)).collect()
 }
 
 /// One head as q8_0 planes, `gguf::quant::quantize_q8_0` per block of 32.
 ///
 /// The code word `b * 8 + j / 4` holds code `j` in byte `j % 4`, low byte
 /// first. The scale word `b` is the block's `d`.
-pub fn pack_q8(row: &[f32; HEAD_DIM]) -> ([u32; HEAD_DIM / 4], [u16; HEAD_DIM / 32]) {
-    let mut codes = [0u32; HEAD_DIM / 4];
-    let mut scales = [0u16; HEAD_DIM / 32];
-    for b in 0..HEAD_DIM / 32 {
+///
+/// # Panics
+///
+/// When the head is not whole 32-value blocks: no cache row is.
+#[must_use]
+pub fn pack_q8(row: &[f32]) -> (Vec<u32>, Vec<u16>) {
+    assert!(
+        !row.is_empty() && row.len().is_multiple_of(32),
+        "a q8_0 row is whole 32-value blocks, not {} values",
+        row.len()
+    );
+    let blocks = row.len() / 32;
+    let mut codes = vec![0u32; blocks * 8];
+    let mut scales = vec![0u16; blocks];
+    for b in 0..blocks {
         let block = quantize_q8_0(&row[b * 32..b * 32 + 32]);
         scales[b] = block.d;
         for (j, code) in block.q.iter().enumerate() {
@@ -196,31 +232,43 @@ pub fn dequant_f16(bits: u16) -> f32 {
 }
 
 /// One q8_0 head dequantized: sign-extended code times `half_to_f32` of its scale.
+///
+/// # Panics
+///
+/// When the scales are not one a block of the codes' 32 values.
 #[must_use]
-pub fn dequant_q8(codes: &[u32], scales: &[u16]) -> [f32; HEAD_DIM] {
-    let mut out = [0f32; HEAD_DIM];
-    for (dim, out) in out.iter_mut().enumerate() {
-        let word = codes[dim / 4];
-        let shift = (dim % 4) * 8;
-        let byte = u8::try_from((word >> shift) & 0xff).expect("a masked byte fits u8");
-        let code = i8::from_le_bytes([byte]);
-        *out = f32::from(code) * half_to_f32(scales[dim / 32]);
-    }
-    out
+pub fn dequant_q8(codes: &[u32], scales: &[u16]) -> Vec<f32> {
+    let head = codes.len() * 4;
+    assert_eq!(
+        scales.len() * 32,
+        head,
+        "a q8_0 row holds a scale for each block of 32 values"
+    );
+    (0..head)
+        .map(|dim| {
+            let word = codes[dim / 4];
+            let shift = (dim % 4) * 8;
+            let byte = u8::try_from((word >> shift) & 0xff).expect("a masked byte fits u8");
+            let code = i8::from_le_bytes([byte]);
+            f32::from(code) * half_to_f32(scales[dim / 32])
+        })
+        .collect()
 }
 
 /// The f64 softmax weights of `q` over `keys`, summing to 1.
-fn softmax_weights(q: &[f32; HEAD_DIM], keys: &[[f32; HEAD_DIM]]) -> Result<Vec<f64>, String> {
+fn softmax_weights<R: AsRef<[f32]>>(q: &[f32], keys: &[R]) -> Result<Vec<f64>, String> {
     if keys.is_empty() {
         return Err("attention over no keys".to_string());
     }
-    let scale = f64::from(SCALE);
+    let scale = f64::from(scale_of(q.len()));
     let mut scores = Vec::with_capacity(keys.len());
     let mut m = f64::NEG_INFINITY;
     for k in keys {
+        let k = k.as_ref();
+        same_head("a key", q.len(), k.len())?;
         let mut dot = 0.0f64;
-        for i in 0..HEAD_DIM {
-            dot += f64::from(q[i]) * f64::from(k[i]);
+        for (&a, &b) in q.iter().zip(k) {
+            dot += f64::from(a) * f64::from(b);
         }
         let s = dot * scale;
         if s.total_cmp(&m).is_gt() {
@@ -247,11 +295,7 @@ fn softmax_weights(q: &[f32; HEAD_DIM], keys: &[[f32; HEAD_DIM]]) -> Result<Vec<
 /// f64 attention of `q` over `keys` and `vals`: the kernel's scale,
 /// softmax, then the weighted values. The result is the attention context,
 /// before any gate.
-pub fn attend(
-    q: &[f32; HEAD_DIM],
-    keys: &[[f32; HEAD_DIM]],
-    vals: &[[f32; HEAD_DIM]],
-) -> Result<[f64; HEAD_DIM], String> {
+pub fn attend<R: AsRef<[f32]>>(q: &[f32], keys: &[R], vals: &[R]) -> Result<Vec<f64>, String> {
     if keys.len() != vals.len() {
         return Err(format!(
             "attention over {} keys and {} values",
@@ -260,10 +304,12 @@ pub fn attend(
         ));
     }
     let weights = softmax_weights(q, keys)?;
-    let mut acc = [0.0f64; HEAD_DIM];
-    for (j, w) in weights.iter().enumerate() {
-        for d in 0..HEAD_DIM {
-            acc[d] += w * f64::from(vals[j][d]);
+    let mut acc = vec![0.0f64; q.len()];
+    for (w, v) in weights.iter().zip(vals) {
+        let v = v.as_ref();
+        same_head("a value", q.len(), v.len())?;
+        for (acc, &value) in acc.iter_mut().zip(v) {
+            *acc += w * f64::from(value);
         }
     }
     Ok(acc)
@@ -283,63 +329,69 @@ struct Terms {
     weight_abs: f64,
 }
 
-/// The decode flash's terms: exact operands and weights.
-const DECODE: Terms = Terms {
-    operand: 0.0,
-    operand_abs: 0.0,
-    dot_ops: DOT_OPS,
-    weight: 0.0,
-    weight_abs: 0.0,
-};
-
 /// f16 round to nearest, relative: `2^-11`.
 const F16_REL: f64 = 1.0 / 2048.0;
 
 /// f16's subnormal spacing over two: `2^-25`.
 const F16_ABS: f64 = 1.0 / 33_554_432.0;
 
-/// The prefill flash's terms: the query and the weights rounded to f16, a
-/// fragment product over the head's values (plus the 8 of a fragment's own
-/// sum and the scale).
-const PREFILL: Terms = Terms {
-    operand: F16_REL,
-    operand_abs: F16_ABS,
-    dot_ops: HEAD_DIM + 8 + 1,
-    weight: F16_REL,
-    weight_abs: F16_ABS,
-};
+/// The decode flash's terms for a head of `head` values: exact operands and
+/// weights, a lane's `head / 32` fmas, the SIMD group's sum, and the scale
+/// multiply.
+fn decode_terms(head: usize) -> Terms {
+    Terms {
+        operand: 0.0,
+        operand_abs: 0.0,
+        dot_ops: head / 32 + 31 + 1,
+        weight: 0.0,
+        weight_abs: 0.0,
+    }
+}
+
+/// The prefill flash's terms for a head of `head` values: the query and the
+/// weights rounded to f16, a fragment product over the head's values (plus
+/// the 8 of a fragment's own sum and the scale).
+fn prefill_terms(head: usize) -> Terms {
+    Terms {
+        operand: F16_REL,
+        operand_abs: F16_ABS,
+        dot_ops: head + 8 + 1,
+        weight: F16_REL,
+        weight_abs: F16_ABS,
+    }
+}
 
 /// The absolute band per dimension of the output, gated by `gate` when the
 /// layer has one, from the derivation above.
-pub fn band(
-    q: &[f32; HEAD_DIM],
-    keys: &[[f32; HEAD_DIM]],
-    vals: &[[f32; HEAD_DIM]],
-    gate: Option<&[f32; HEAD_DIM]>,
+pub fn band<R: AsRef<[f32]>, G: AsRef<[f32]> + ?Sized>(
+    q: &[f32],
+    keys: &[R],
+    vals: &[R],
+    gate: Option<&G>,
     segments: usize,
-) -> Result<[f64; HEAD_DIM], String> {
-    band_of(&DECODE, q, keys, vals, gate, segments)
+) -> Result<Vec<f64>, String> {
+    band_of(&decode_terms(q.len()), q, keys, vals, gate, segments)
 }
 
 /// The band of the prefill flash, from the prefill derivation above. The
 /// prefill has no segments.
-pub fn prefill_band(
-    q: &[f32; HEAD_DIM],
-    keys: &[[f32; HEAD_DIM]],
-    vals: &[[f32; HEAD_DIM]],
-    gate: Option<&[f32; HEAD_DIM]>,
-) -> Result<[f64; HEAD_DIM], String> {
-    band_of(&PREFILL, q, keys, vals, gate, 0)
+pub fn prefill_band<R: AsRef<[f32]>, G: AsRef<[f32]> + ?Sized>(
+    q: &[f32],
+    keys: &[R],
+    vals: &[R],
+    gate: Option<&G>,
+) -> Result<Vec<f64>, String> {
+    band_of(&prefill_terms(q.len()), q, keys, vals, gate, 0)
 }
 
-fn band_of(
+fn band_of<R: AsRef<[f32]>, G: AsRef<[f32]> + ?Sized>(
     t: &Terms,
-    q: &[f32; HEAD_DIM],
-    keys: &[[f32; HEAD_DIM]],
-    vals: &[[f32; HEAD_DIM]],
-    gate: Option<&[f32; HEAD_DIM]>,
+    q: &[f32],
+    keys: &[R],
+    vals: &[R],
+    gate: Option<&G>,
     segments: usize,
-) -> Result<[f64; HEAD_DIM], String> {
+) -> Result<Vec<f64>, String> {
     if keys.len() != vals.len() {
         return Err(format!(
             "the band over {} keys and {} values",
@@ -347,16 +399,22 @@ fn band_of(
             vals.len()
         ));
     }
+    let head = q.len();
+    let gate: Option<&[f32]> = gate.map(|g| g.as_ref());
+    if let Some(gate) = gate {
+        same_head("a gate", head, gate.len())?;
+    }
     let weights = softmax_weights(q, keys)?;
-    let scale = f64::from(SCALE);
+    let scale = f64::from(scale_of(head));
     let g = gamma_bound(t.dot_ops);
     let mut delta = 0.0f64;
     for k in keys {
+        let k = k.as_ref();
         let mut mag = 0.0f64;
         let mut key_mag = 0.0f64;
-        for i in 0..HEAD_DIM {
-            mag += (f64::from(q[i]) * f64::from(k[i])).abs();
-            key_mag += f64::from(k[i]).abs();
+        for (&a, &b) in q.iter().zip(k) {
+            mag += (f64::from(a) * f64::from(b)).abs();
+            key_mag += f64::from(b).abs();
         }
         let dj = scale * ((t.operand + g) * mag + t.operand_abs * key_mag);
         if dj.total_cmp(&delta).is_gt() {
@@ -370,12 +428,14 @@ fn band_of(
     let gate_ops = if gate.is_some() { GATE_OPS } else { 0 };
     let ops = t.dot_ops + n_keys + n_rescale + 1 + gate_ops;
     let floor = f64::from(f32::MIN_POSITIVE) * f64_usize(ops);
-    let mut out = [0.0f64; HEAD_DIM];
+    let mut out = vec![0.0f64; head];
     for (d, out) in out.iter_mut().enumerate() {
         let mut weighted = 0.0f64;
         let mut value_mag = 0.0f64;
         let mut attn = 0.0f64;
         for (j, v) in vals.iter().enumerate() {
+            let v = v.as_ref();
+            same_head("a value", head, v.len())?;
             let value = f64::from(v[d]);
             weighted += weights[j] * value.abs();
             value_mag += value.abs();

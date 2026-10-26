@@ -1,4 +1,4 @@
-//! Decode attention clauses at the host instance's geometry. The output is
+//! Decode attention clauses at the row's instance's geometry. The output is
 //! the attention, gated when the instance's query carries a gate. The appended
 //! cache row is the host quantizer's bits: `f32_to_f16_bits` or
 //! `gguf::quant::quantize_q8_0`. The norm and the partial rope are the f32
@@ -8,10 +8,8 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::encode::{Binding, ComputeEncoder};
-use bloomery_metal::kernels::{
-    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, f16_len, out_len,
-    partials_len, q8_code_len, q8_scale_len, qg_len, segments_for_keys,
-};
+use bloomery_metal::geom::{AttnGeom, HOST_GEOMETRY};
+use bloomery_metal::kernels::{AttentionParams, AttnCache, segments_for_keys};
 use bloomery_metal::library::Library;
 use bloomery_metal::{MetalBuffer, MetalDevice};
 use gguf::quant::{GgmlType, dequant_row, half_to_f32};
@@ -41,11 +39,15 @@ const CODE_HOLE: u32 = 0x0BAD_0BAD;
 const SCALE_HOLE: u16 = 0x0BAD;
 /// The q8_0 scale a non-finite block stores.
 const Q8_NAN_SCALE: u16 = 0x7e00;
-/// A q8_0 cache row's code words and scales.
-const Q8_WORDS: usize = HEAD_DIM / 4;
-const Q8_SCALES: usize = HEAD_DIM / 32;
-/// The host instance's query carries a gate after each head.
-pub(super) const GATED: bool = QG_STRIDE == 2 * HEAD_DIM;
+/// A q8_0 cache row's code words.
+fn q8_words(attn: &AttnGeom) -> usize {
+    attn.head / 4
+}
+
+/// A q8_0 cache row's scales.
+fn q8_scales(attn: &AttnGeom) -> usize {
+    attn.head / 32
+}
 
 /// The pattern-expansion kernel, the `attn_half` clause's own: the shipped
 /// library does not carry it, and the clause compiles it once beside the
@@ -113,30 +115,49 @@ fn synth(index: u32, dim: u32, kind: u32) -> f32 {
     f32::from(u16::try_from(n).expect("under 1000")) / 999.0 - 0.5
 }
 
-pub(super) fn head_row(index: u32, kind: u32) -> [f32; HEAD_DIM] {
-    let mut row = [0f32; HEAD_DIM];
-    for (dim, value) in row.iter_mut().enumerate() {
-        *value = synth(index, u(dim), kind);
-    }
-    row
+/// One head of the synthetic rows `index` and `kind` name.
+pub(super) fn head_row_for(attn: &AttnGeom, index: u32, kind: u32) -> Vec<f32> {
+    (0..attn.head)
+        .map(|dim| synth(index, u(dim), kind))
+        .collect()
 }
 
-pub(super) fn gain_array(values: &[f32]) -> Result<[f32; HEAD_DIM], String> {
-    <[f32; HEAD_DIM]>::try_from(values).map_err(|_| format!("a gain holds {HEAD_DIM} values"))
+/// [`head_row_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
+pub(super) fn head_row(index: u32, kind: u32) -> Vec<f32> {
+    head_row_for(&HOST_GEOMETRY.attn, index, kind)
 }
 
-fn take_head(flat: &[f32], head: usize) -> Result<[f32; HEAD_DIM], String> {
-    let at = head * HEAD_DIM;
-    flat.get(at..at + HEAD_DIM)
-        .and_then(|row| <[f32; HEAD_DIM]>::try_from(row).ok())
+/// A head's gain as the oracle takes it. A shim: the tables' gains are the
+/// head's width already, and the oracle refuses another. Callers left: the
+/// rows clauses.
+pub(super) fn gain_array(values: &[f32]) -> Result<Vec<f32>, String> {
+    Ok(values.to_vec())
+}
+
+fn take_head<'f>(attn: &AttnGeom, flat: &'f [f32], head: usize) -> Result<&'f [f32], String> {
+    let at = head * attn.head;
+    flat.get(at..at + attn.head)
         .ok_or_else(|| format!("head {head} is past the buffer"))
 }
 
-pub(super) fn take_qg(flat: &[f32], head: usize, offset: usize) -> Result<[f32; HEAD_DIM], String> {
-    let at = head * QG_STRIDE + offset;
-    flat.get(at..at + HEAD_DIM)
-        .and_then(|row| <[f32; HEAD_DIM]>::try_from(row).ok())
+/// The `offset`th value of query head `head`'s `qg_stride` values, one head's
+/// width of them.
+pub(super) fn take_qg_for<'f>(
+    attn: &AttnGeom,
+    flat: &'f [f32],
+    head: usize,
+    offset: usize,
+) -> Result<&'f [f32], String> {
+    let at = head * attn.qg_stride + offset;
+    flat.get(at..at + attn.head)
         .ok_or_else(|| format!("head {head} offset {offset} is past the query"))
+}
+
+/// [`take_qg_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
+pub(super) fn take_qg(flat: &[f32], head: usize, offset: usize) -> Result<Vec<f32>, String> {
+    take_qg_for(&HOST_GEOMETRY.attn, flat, head, offset).map(<[f32]>::to_vec)
 }
 
 /// A finite gate in about `[-2, 2]`, so the sigmoid is not 1.
@@ -148,26 +169,26 @@ fn wider(a: f64, b: f64) -> f64 {
     if a.total_cmp(&b).is_gt() { a } else { b }
 }
 
-fn load_gain(fixture: &Fixture, name: &str, kind: u32) -> (Vec<f32>, String) {
-    if let Ok(values) = fixture.f32s(name, HEAD_DIM)
+fn load_gain(attn: &AttnGeom, fixture: &Fixture, name: &str, kind: u32) -> (Vec<f32>, String) {
+    if let Ok(values) = fixture.f32s(name, attn.head)
         && values.iter().all(|v| v.is_finite())
     {
         return (values, name.to_string());
     }
-    let values = (0..HEAD_DIM)
+    let values = (0..attn.head)
         .map(|dim| 0.75 + 0.25 * synth(0, u(dim), kind))
         .collect();
     (values, format!("synthetic {name}"))
 }
 
-fn rope_from_base(base: f32, ctx: usize) -> Vec<f32> {
-    let mut table = vec![0f32; ctx * ROT];
+fn rope_from_base(attn: &AttnGeom, base: f32, ctx: usize) -> Vec<f32> {
+    let mut table = vec![0f32; ctx * attn.rot];
     let b = f64::from(base);
     for pos in 0..ctx {
-        for i in 0..ROT / 2 {
-            let exp = -f64::from(u(2 * i)) / f64::from(u(ROT));
+        for i in 0..attn.rot / 2 {
+            let exp = -f64::from(u(2 * i)) / f64::from(u(attn.rot));
             let theta = f64::from(u(pos)) * b.powf(exp);
-            let at = pos * ROT + 2 * i;
+            let at = pos * attn.rot + 2 * i;
             table[at] = theta.cos() as f32;
             table[at + 1] = theta.sin() as f32;
         }
@@ -181,10 +202,10 @@ fn tensor_len(dims: &[u64]) -> Option<usize> {
     })
 }
 
-fn load_rope(fixture: &Fixture, ctx: usize) -> Result<(Vec<f32>, String), String> {
+fn load_rope(attn: &AttnGeom, fixture: &Fixture, ctx: usize) -> Result<(Vec<f32>, String), String> {
     let file =
         gguf::Gguf::open(&fixture.path).map_err(|e| format!("the fixture did not reopen: {e}"))?;
-    let need = ctx * ROT;
+    let need = ctx * attn.rot;
     for tensor in file.iter_tensors() {
         if !tensor.name.to_ascii_lowercase().contains("rope") || tensor.ty != GgmlType::F32 {
             continue;
@@ -207,19 +228,30 @@ fn load_rope(fixture: &Fixture, ctx: usize) -> Result<(Vec<f32>, String), String
             "rope.freq_base {base} is not a positive finite base"
         ));
     }
-    Ok((rope_from_base(base, ctx), format!("rope.freq_base {base}")))
+    Ok((
+        rope_from_base(attn, base, ctx),
+        format!("rope.freq_base {base}"),
+    ))
 }
 
+/// [`load_tables_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
 pub(super) fn load_tables(fixture: &Fixture) -> Result<Tables, String> {
+    load_tables_for(&HOST_GEOMETRY.attn, fixture)
+}
+
+/// The fixture's norm epsilon, the query and key gains (or synthetic ones of
+/// the head's width) and a rope table of the deepest scene's rows.
+pub(super) fn load_tables_for(attn: &AttnGeom, fixture: &Fixture) -> Result<Tables, String> {
     let eps = fixture.rms_eps()?;
     if !eps.is_finite() || eps < 0.0 {
         return Err(format!(
             "the norm epsilon {eps} is not finite and non-negative"
         ));
     }
-    let (q_gain, q_note) = load_gain(fixture, "blk.0.attn_q_norm.weight", KIND_Q);
-    let (k_gain, k_note) = load_gain(fixture, "blk.0.attn_k_norm.weight", KIND_K);
-    let (rope, rope_note) = load_rope(fixture, DEEP_CTX)?;
+    let (q_gain, q_note) = load_gain(attn, fixture, "blk.0.attn_q_norm.weight", KIND_Q);
+    let (k_gain, k_note) = load_gain(attn, fixture, "blk.0.attn_k_norm.weight", KIND_K);
+    let (rope, rope_note) = load_rope(attn, fixture, DEEP_CTX)?;
     Ok(Tables {
         eps,
         q_gain,
@@ -254,58 +286,71 @@ fn scene_keys(n_keys: u32, q8: bool) -> Scene {
     }
 }
 
-fn inputs(_scene: &Scene) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let q_n = qg_len().expect("the query length wraps");
+fn inputs(attn: &AttnGeom, _scene: &Scene) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q_n = attn.qg_len().expect("the query length wraps");
     let mut q = vec![0f32; q_n];
-    let mut k = vec![0f32; KV_HEADS * HEAD_DIM];
-    let mut v = vec![0f32; KV_HEADS * HEAD_DIM];
-    for head in 0..QUERY_HEADS {
-        let at = head * QG_STRIDE;
-        q[at..at + HEAD_DIM].copy_from_slice(&head_row(u(head), KIND_Q));
-        if GATED {
-            for dim in 0..HEAD_DIM {
-                q[at + HEAD_DIM + dim] = gate_of(u(dim));
+    let mut k = vec![0f32; attn.kv_heads * attn.head];
+    let mut v = vec![0f32; attn.kv_heads * attn.head];
+    for head in 0..attn.query_heads {
+        let at = head * attn.qg_stride;
+        q[at..at + attn.head].copy_from_slice(&head_row_for(attn, u(head), KIND_Q));
+        if attn.gated {
+            for dim in 0..attn.head {
+                q[at + attn.head + dim] = gate_of(u(dim));
             }
         }
     }
-    for kv in 0..KV_HEADS {
-        let at = kv * HEAD_DIM;
-        k[at..at + HEAD_DIM].copy_from_slice(&head_row(u(kv), KIND_K));
-        v[at..at + HEAD_DIM].copy_from_slice(&head_row(u(kv), KIND_V));
+    for kv in 0..attn.kv_heads {
+        let at = kv * attn.head;
+        k[at..at + attn.head].copy_from_slice(&head_row_for(attn, u(kv), KIND_K));
+        v[at..at + attn.head].copy_from_slice(&head_row_for(attn, u(kv), KIND_V));
     }
     (q, k, v)
 }
 
+/// [`plant_f16_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
 pub(super) fn plant_f16(scene: &Scene) -> Result<CacheBack, String> {
-    let n = f16_len(scene.ctx).ok_or("the f16 cache length wraps")?;
+    plant_f16_for(&HOST_GEOMETRY.attn, scene)
+}
+
+pub(super) fn plant_f16_for(attn: &AttnGeom, scene: &Scene) -> Result<CacheBack, String> {
+    let n = attn
+        .f16_len(scene.ctx)
+        .ok_or("the f16 cache length wraps")?;
     let mut k = vec![F16_HOLE; n];
     let mut v = vec![F16_HOLE; n];
-    for kv in 0..KV_HEADS {
+    for kv in 0..attn.kv_heads {
         for row in 0..scene.prefill {
-            let at = (kv * scene.ctx + row) * HEAD_DIM;
-            k[at..at + HEAD_DIM].copy_from_slice(&pack_f16(&head_row(u(row), KIND_PRE_K + u(kv))));
-            v[at..at + HEAD_DIM].copy_from_slice(&pack_f16(&head_row(u(row), KIND_PRE_V + u(kv))));
+            let at = (kv * scene.ctx + row) * attn.head;
+            let pre_k = head_row_for(attn, u(row), KIND_PRE_K + u(kv));
+            let pre_v = head_row_for(attn, u(row), KIND_PRE_V + u(kv));
+            k[at..at + attn.head].copy_from_slice(&pack_f16(&pre_k));
+            v[at..at + attn.head].copy_from_slice(&pack_f16(&pre_v));
         }
     }
     Ok(CacheBack::F16 { k, v })
 }
 
-fn plant_q8(scene: &Scene) -> Result<CacheBack, String> {
-    let codes_n = q8_code_len(scene.ctx).ok_or("the code length wraps")?;
-    let scales_n = q8_scale_len(scene.ctx).ok_or("the scale length wraps")?;
+fn plant_q8(attn: &AttnGeom, scene: &Scene) -> Result<CacheBack, String> {
+    let codes_n = attn.q8_code_len(scene.ctx).ok_or("the code length wraps")?;
+    let scales_n = attn
+        .q8_scale_len(scene.ctx)
+        .ok_or("the scale length wraps")?;
+    let (words, scales) = (q8_words(attn), q8_scales(attn));
     let mut k_codes = vec![CODE_HOLE; codes_n];
     let mut v_codes = vec![CODE_HOLE; codes_n];
     let mut k_scales = vec![SCALE_HOLE; scales_n];
     let mut v_scales = vec![SCALE_HOLE; scales_n];
-    for kv in 0..KV_HEADS {
+    for kv in 0..attn.kv_heads {
         for row in 0..scene.prefill {
             let index = kv * scene.ctx + row;
-            let (kc, ks) = pack_q8(&head_row(u(row), KIND_PRE_K + u(kv)));
-            let (vc, vs) = pack_q8(&head_row(u(row), KIND_PRE_V + u(kv)));
-            k_codes[index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS].copy_from_slice(&kc);
-            v_codes[index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS].copy_from_slice(&vc);
-            k_scales[index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES].copy_from_slice(&ks);
-            v_scales[index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES].copy_from_slice(&vs);
+            let (kc, ks) = pack_q8(&head_row_for(attn, u(row), KIND_PRE_K + u(kv)));
+            let (vc, vs) = pack_q8(&head_row_for(attn, u(row), KIND_PRE_V + u(kv)));
+            k_codes[index * words..(index + 1) * words].copy_from_slice(&kc);
+            v_codes[index * words..(index + 1) * words].copy_from_slice(&vc);
+            k_scales[index * scales..(index + 1) * scales].copy_from_slice(&ks);
+            v_scales[index * scales..(index + 1) * scales].copy_from_slice(&vs);
         }
     }
     Ok(CacheBack::Q8 {
@@ -316,14 +361,14 @@ fn plant_q8(scene: &Scene) -> Result<CacheBack, String> {
     })
 }
 
-fn plant(scene: &Scene) -> Result<CacheBack, String> {
+fn plant(attn: &AttnGeom, scene: &Scene) -> Result<CacheBack, String> {
     if scene.prefill > scene.ctx {
         return Err("the prefill is past the cache".to_string());
     }
     if scene.q8 {
-        plant_q8(scene)
+        plant_q8(attn, scene)
     } else {
-        plant_f16(scene)
+        plant_f16_for(attn, scene)
     }
 }
 
@@ -423,10 +468,20 @@ pub(super) fn read_cache(
     }
 }
 
+/// [`cache_of_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
 pub(super) fn cache_of(uploaded: &mut Uploaded, ctx: usize) -> Result<AttnCache<'_>, DeviceError> {
+    cache_of_for(&HOST_GEOMETRY.attn, uploaded, ctx)
+}
+
+pub(super) fn cache_of_for<'u>(
+    attn: &AttnGeom,
+    uploaded: &'u mut Uploaded,
+    ctx: usize,
+) -> Result<AttnCache<'u>, DeviceError> {
     match uploaded {
         Uploaded::F16 { k, v } => {
-            let n = f16_len(ctx).ok_or_else(|| DeviceError::Range {
+            let n = attn.f16_len(ctx).ok_or_else(|| DeviceError::Range {
                 what: "attention",
                 detail: "the f16 cache length wraps".to_string(),
             })?;
@@ -441,11 +496,11 @@ pub(super) fn cache_of(uploaded: &mut Uploaded, ctx: usize) -> Result<AttnCache<
             v_codes,
             v_scales,
         } => {
-            let codes = q8_code_len(ctx).ok_or_else(|| DeviceError::Range {
+            let codes = attn.q8_code_len(ctx).ok_or_else(|| DeviceError::Range {
                 what: "attention",
                 detail: "the code length wraps".to_string(),
             })?;
-            let scales = q8_scale_len(ctx).ok_or_else(|| DeviceError::Range {
+            let scales = attn.q8_scale_len(ctx).ok_or_else(|| DeviceError::Range {
                 what: "attention",
                 detail: "the scale length wraps".to_string(),
             })?;
@@ -468,15 +523,18 @@ fn launch(
     v: &[f32],
     planted: &CacheBack,
 ) -> Result<Seen, String> {
+    let attn = &h.geom().attn;
     let (device, stream) = (h.device, h.stream);
     h.clear_fault()?;
-    if tables.rope.len() < scene.ctx * ROT {
+    if tables.rope.len() < scene.ctx * attn.rot {
         return Err("the rope table is shorter than the scene's cache".to_string());
     }
-    let out_n = out_len().ok_or("the output length wraps")?;
-    let q_n = qg_len().ok_or("the query length wraps")?;
-    let partial_n = partials_len(scene.segments).ok_or("the partial length wraps")?;
-    let kv_n = KV_HEADS * HEAD_DIM;
+    let out_n = attn.out_len().ok_or("the output length wraps")?;
+    let q_n = attn.qg_len().ok_or("the query length wraps")?;
+    let partial_n = attn
+        .partials_len(scene.segments)
+        .ok_or("the partial length wraps")?;
+    let kv_n = attn.kv_heads * attn.head;
     if q.len() != q_n || k.len() != kv_n || k.len() != v.len() {
         return Err("the query or the key buffer is not the scene's shape".to_string());
     }
@@ -485,7 +543,7 @@ fn launch(
     let (v_buf, _) = upload_f32(device, stream, v)?;
     let (q_gain, _) = upload_f32(device, stream, &tables.q_gain)?;
     let (k_gain, _) = upload_f32(device, stream, &tables.k_gain)?;
-    let (rope, _) = upload_f32(device, stream, &tables.rope[..scene.ctx * ROT])?;
+    let (rope, _) = upload_f32(device, stream, &tables.rope[..scene.ctx * attn.rot])?;
     let mut partials = device.upload(stream, &vec![0f32; partial_n]).map_err(why)?;
     let mut ticket = device.upload(stream, &[0u32]).map_err(why)?;
     let sentinel = f32::from_bits(SENTINEL_BITS);
@@ -501,9 +559,9 @@ fn launch(
     let k_len = k.len();
     h.encode(|encoder| {
         let flash = AttentionParams {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
+            head_dim: attn.head,
+            query_heads: attn.query_heads,
+            kv_heads: attn.kv_heads,
             segments,
             ctx,
             eps,
@@ -513,10 +571,10 @@ fn launch(
             q: q_buf.window(Elems(VALUE_PAD), Elems(q_len))?,
             k: k_buf.window(Elems(VALUE_PAD), Elems(k_len))?,
             v: v_buf.window(Elems(VALUE_PAD), Elems(k_len))?,
-            q_gain: q_gain.window(Elems(VALUE_PAD), Elems(HEAD_DIM))?,
-            k_gain: k_gain.window(Elems(VALUE_PAD), Elems(HEAD_DIM))?,
-            rope: rope.window(Elems(VALUE_PAD), Elems(ctx * ROT))?,
-            cache: cache_of(&mut uploaded, ctx)?,
+            q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+            k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+            rope: rope.window(Elems(VALUE_PAD), Elems(ctx * attn.rot))?,
+            cache: cache_of_for(attn, &mut uploaded, ctx)?,
             partials: partials.window_mut(Elems(0), Elems(partial_n))?,
             out: out_buf.window_mut(Elems(OUT_GUARD), Elems(out_n))?,
             fault: device.fault_word(),
@@ -550,42 +608,68 @@ fn launch(
     })
 }
 
-pub(super) fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HEAD_DIM] {
+/// One key row of the read-back cache, dequantized.
+pub(super) fn dequant_k_for(
+    attn: &AttnGeom,
+    cache: &CacheBack,
+    ctx: usize,
+    kv: usize,
+    index: usize,
+) -> Vec<f32> {
     let row = kv * ctx + index;
     match cache {
-        CacheBack::F16 { k, .. } => {
-            let mut out = [0f32; HEAD_DIM];
-            for (dim, out) in out.iter_mut().enumerate() {
-                *out = dequant_f16(k[row * HEAD_DIM + dim]);
-            }
-            out
-        }
+        CacheBack::F16 { k, .. } => k[row * attn.head..(row + 1) * attn.head]
+            .iter()
+            .map(|&bits| dequant_f16(bits))
+            .collect(),
         CacheBack::Q8 {
             k_codes, k_scales, ..
-        } => dequant_q8(
-            &k_codes[row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS],
-            &k_scales[row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES],
-        ),
+        } => {
+            let (words, scales) = (q8_words(attn), q8_scales(attn));
+            dequant_q8(
+                &k_codes[row * words..(row + 1) * words],
+                &k_scales[row * scales..(row + 1) * scales],
+            )
+        }
     }
 }
 
-pub(super) fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HEAD_DIM] {
+/// [`dequant_k_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
+pub(super) fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> Vec<f32> {
+    dequant_k_for(&HOST_GEOMETRY.attn, cache, ctx, kv, index)
+}
+
+/// One value row of the read-back cache, dequantized.
+pub(super) fn dequant_v_for(
+    attn: &AttnGeom,
+    cache: &CacheBack,
+    ctx: usize,
+    kv: usize,
+    index: usize,
+) -> Vec<f32> {
     let row = kv * ctx + index;
     match cache {
-        CacheBack::F16 { v, .. } => {
-            let mut out = [0f32; HEAD_DIM];
-            for (dim, out) in out.iter_mut().enumerate() {
-                *out = dequant_f16(v[row * HEAD_DIM + dim]);
-            }
-            out
-        }
+        CacheBack::F16 { v, .. } => v[row * attn.head..(row + 1) * attn.head]
+            .iter()
+            .map(|&bits| dequant_f16(bits))
+            .collect(),
         CacheBack::Q8 {
             v_codes, v_scales, ..
-        } => dequant_q8(
-            &v_codes[row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS],
-            &v_scales[row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES],
-        ),
+        } => {
+            let (words, scales) = (q8_words(attn), q8_scales(attn));
+            dequant_q8(
+                &v_codes[row * words..(row + 1) * words],
+                &v_scales[row * scales..(row + 1) * scales],
+            )
+        }
     }
+}
+
+/// [`dequant_v_for`] at the build's host instance. A shim. Callers left: the
+/// rows clauses.
+pub(super) fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> Vec<f32> {
+    dequant_v_for(&HOST_GEOMETRY.attn, cache, ctx, kv, index)
 }
 
 fn quant_label(scene: &Scene) -> &'static str {
@@ -596,15 +680,10 @@ fn quant_label(scene: &Scene) -> &'static str {
     }
 }
 
-fn expect_f16_row(
-    got: &[u16],
-    row: usize,
-    want: &[u16; HEAD_DIM],
-    what: &str,
-) -> Result<(), String> {
-    let at = row * HEAD_DIM;
+fn expect_f16_row(got: &[u16], row: usize, want: &[u16], what: &str) -> Result<(), String> {
+    let at = row * want.len();
     let have = got
-        .get(at..at + HEAD_DIM)
+        .get(at..at + want.len())
         .ok_or_else(|| format!("{what} row {row} is past the cache"))?;
     if let Some((dim, g, w)) = first_diff(have, want) {
         return Err(format!(
@@ -618,15 +697,16 @@ fn expect_q8_row(
     codes: &[u32],
     scales: &[u16],
     row: usize,
-    want_codes: &[u32; Q8_WORDS],
-    want_scales: &[u16; Q8_SCALES],
+    want_codes: &[u32],
+    want_scales: &[u16],
     what: &str,
 ) -> Result<(), String> {
+    let (words, blocks) = (want_codes.len(), want_scales.len());
     let code = codes
-        .get(row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS)
+        .get(row * words..(row + 1) * words)
         .ok_or_else(|| format!("{what} row {row} codes are past the cache"))?;
     let scale = scales
-        .get(row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES)
+        .get(row * blocks..(row + 1) * blocks)
         .ok_or_else(|| format!("{what} row {row} scales are past the cache"))?;
     if let Some((i, g, w)) = first_diff(code, want_codes) {
         return Err(format!(
@@ -646,6 +726,7 @@ fn is_append(scene: &Scene, row: usize) -> Result<bool, String> {
 }
 
 fn expect_append_row(
+    attn: &AttnGeom,
     tables: &Tables,
     scene: &Scene,
     k: &[f32],
@@ -657,19 +738,14 @@ fn expect_append_row(
     let row = kv * scene.ctx + pos;
     let rope = tables
         .rope
-        .get(pos * ROT..pos * ROT + ROT)
+        .get(pos * attn.rot..(pos + 1) * attn.rot)
         .ok_or("the rope row is past the table")?;
-    let key = norm_rope(
-        &take_head(k, kv)?,
-        &gain_array(&tables.k_gain)?,
-        tables.eps,
-        rope,
-    )?;
-    let value = take_head(v, kv)?;
+    let key = norm_rope(take_head(attn, k, kv)?, &tables.k_gain, tables.eps, rope)?;
+    let value = take_head(attn, v, kv)?;
     match cache {
         CacheBack::F16 { k, v } => {
             expect_f16_row(k, row, &pack_f16(&key), "k")?;
-            expect_f16_row(v, row, &pack_f16(&value), "v")
+            expect_f16_row(v, row, &pack_f16(value), "v")
         }
         CacheBack::Q8 {
             k_codes,
@@ -678,7 +754,7 @@ fn expect_append_row(
             v_scales,
         } => {
             let (kc, ks) = pack_q8(&key);
-            let (vc, vs) = pack_q8(&value);
+            let (vc, vs) = pack_q8(value);
             expect_q8_row(k_codes, k_scales, row, &kc, &ks, "k")?;
             expect_q8_row(v_codes, v_scales, row, &vc, &vs, "v")
         }
@@ -686,6 +762,7 @@ fn expect_append_row(
 }
 
 fn expect_planted_row(
+    attn: &AttnGeom,
     scene: &Scene,
     planted: &CacheBack,
     got: &CacheBack,
@@ -693,18 +770,17 @@ fn expect_planted_row(
     row: usize,
 ) -> Result<(), String> {
     let index = kv * scene.ctx + row;
+    let (head, words, blocks) = (attn.head, q8_words(attn), q8_scales(attn));
     match (planted, got) {
         (CacheBack::F16 { k: pk, v: pv }, CacheBack::F16 { k, v }) => {
             let planted_k = pk
-                .get(index * HEAD_DIM..index * HEAD_DIM + HEAD_DIM)
-                .and_then(|r| <[u16; HEAD_DIM]>::try_from(r).ok())
+                .get(index * head..(index + 1) * head)
                 .ok_or("the planted k row is short")?;
             let planted_v = pv
-                .get(index * HEAD_DIM..index * HEAD_DIM + HEAD_DIM)
-                .and_then(|r| <[u16; HEAD_DIM]>::try_from(r).ok())
+                .get(index * head..(index + 1) * head)
                 .ok_or("the planted v row is short")?;
-            expect_f16_row(k, index, &planted_k, "k")?;
-            expect_f16_row(v, index, &planted_v, "v")
+            expect_f16_row(k, index, planted_k, "k")?;
+            expect_f16_row(v, index, planted_v, "v")
         }
         (
             CacheBack::Q8 {
@@ -721,29 +797,26 @@ fn expect_planted_row(
             },
         ) => {
             let kc = pkc
-                .get(index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS)
-                .and_then(|r| <[u32; Q8_WORDS]>::try_from(r).ok())
+                .get(index * words..(index + 1) * words)
                 .ok_or("the planted k codes are short")?;
             let ks = pks
-                .get(index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES)
-                .and_then(|r| <[u16; Q8_SCALES]>::try_from(r).ok())
+                .get(index * blocks..(index + 1) * blocks)
                 .ok_or("the planted k scales are short")?;
             let vc = pvc
-                .get(index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS)
-                .and_then(|r| <[u32; Q8_WORDS]>::try_from(r).ok())
+                .get(index * words..(index + 1) * words)
                 .ok_or("the planted v codes are short")?;
             let vs = pvs
-                .get(index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES)
-                .and_then(|r| <[u16; Q8_SCALES]>::try_from(r).ok())
+                .get(index * blocks..(index + 1) * blocks)
                 .ok_or("the planted v scales are short")?;
-            expect_q8_row(k_codes, k_scales, index, &kc, &ks, "k")?;
-            expect_q8_row(v_codes, v_scales, index, &vc, &vs, "v")
+            expect_q8_row(k_codes, k_scales, index, kc, ks, "k")?;
+            expect_q8_row(v_codes, v_scales, index, vc, vs, "v")
         }
         _ => Err("the read-back cache is a different format".to_string()),
     }
 }
 
 fn expect_cache(
+    attn: &AttnGeom,
     tables: &Tables,
     scene: &Scene,
     k: &[f32],
@@ -751,12 +824,12 @@ fn expect_cache(
     planted: &CacheBack,
     got: &CacheBack,
 ) -> Result<(), String> {
-    for kv in 0..KV_HEADS {
+    for kv in 0..attn.kv_heads {
         for row in 0..scene.ctx {
             if is_append(scene, row)? {
-                expect_append_row(tables, scene, k, v, got, kv)?;
+                expect_append_row(attn, tables, scene, k, v, got, kv)?;
             } else {
-                expect_planted_row(scene, planted, got, kv, row)?;
+                expect_planted_row(attn, scene, planted, got, kv, row)?;
             }
         }
     }
@@ -765,6 +838,7 @@ fn expect_cache(
 
 #[derive(Clone, Copy)]
 struct QueryIn<'a> {
+    attn: &'a AttnGeom,
     tables: &'a Tables,
     scene: &'a Scene,
     q: &'a [f32],
@@ -777,42 +851,43 @@ struct QueryIn<'a> {
 /// One head against the oracle: its worst ratio of the error to the band.
 fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
     let QueryIn {
+        attn,
         tables,
         scene,
         q,
         seen,
         ..
     } = *inp;
-    let kv = head / (QUERY_HEADS / KV_HEADS);
+    let kv = head / attn.gqa;
     let pos = usize::try_from(scene.pos).map_err(|_| "a position does not fit".to_string())?;
     let keys_n =
         usize::try_from(scene.n_keys).map_err(|_| "a key count does not fit".to_string())?;
     let rope = tables
         .rope
-        .get(pos * ROT..pos * ROT + ROT)
+        .get(pos * attn.rot..(pos + 1) * attn.rot)
         .ok_or("the rope row is past the table")?;
     let qn = norm_rope(
-        &take_qg(q, head, 0)?,
-        &gain_array(&tables.q_gain)?,
+        take_qg_for(attn, q, head, 0)?,
+        &tables.q_gain,
         tables.eps,
         rope,
     )?;
-    let gate = if GATED {
-        Some(take_qg(q, head, HEAD_DIM)?)
+    let gate = if attn.gated {
+        Some(take_qg_for(attn, q, head, attn.head)?)
     } else {
         None
     };
     let mut keys = Vec::with_capacity(keys_n);
     let mut vals = Vec::with_capacity(keys_n);
     for index in 0..keys_n {
-        keys.push(dequant_k(&seen.cache, scene.ctx, kv, index));
-        vals.push(dequant_v(&seen.cache, scene.ctx, kv, index));
+        keys.push(dequant_k_for(attn, &seen.cache, scene.ctx, kv, index));
+        vals.push(dequant_v_for(attn, &seen.cache, scene.ctx, kv, index));
     }
     let refer = attend(&qn, &keys, &vals)?;
-    let bound = band(&qn, &keys, &vals, gate.as_ref(), scene.segments)?;
+    let bound = band(&qn, &keys, &vals, gate, scene.segments)?;
     let mut worst = 0.0f64;
-    for dim in 0..HEAD_DIM {
-        let at = head * HEAD_DIM + dim;
+    for dim in 0..attn.head {
+        let at = head * attn.head + dim;
         let got = seen.out.get(at).copied().ok_or("the output is short")?;
         let want = gate.map_or(refer[dim], |g| refer[dim] * sigmoid(f64::from(g[dim])));
         let b = bound[dim];
@@ -840,6 +915,7 @@ fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
 
 fn check_queries(inp: &QueryIn<'_>, heads: std::ops::Range<usize>) -> Result<Checked, String> {
     let QueryIn {
+        attn,
         tables,
         scene,
         k,
@@ -851,7 +927,7 @@ fn check_queries(inp: &QueryIn<'_>, heads: std::ops::Range<usize>) -> Result<Che
     if let Some(fault) = seen.fault {
         return Err(format!("a finite attention raised {fault}"));
     }
-    expect_cache(tables, scene, k, v, planted, &seen.cache)?;
+    expect_cache(attn, tables, scene, k, v, planted, &seen.cache)?;
     let mut worst = 0.0f64;
     for head in heads {
         worst = wider(worst, check_head(inp, head)?);
@@ -876,11 +952,13 @@ fn require_live_append(scene: &Scene) -> Result<(), String> {
 
 fn run(h: &Harness<'_>, tables: &Tables, scene: &Scene) -> Result<Checked, String> {
     require_live_append(scene)?;
-    let (q, k, v) = inputs(scene);
-    let planted = plant(scene)?;
+    let attn = &h.geom().attn;
+    let (q, k, v) = inputs(attn, scene);
+    let planted = plant(attn, scene)?;
     let seen = launch(h, tables, scene, &q, &k, &v, &planted)?;
     check_queries(
         &QueryIn {
+            attn,
             tables,
             scene,
             q: &q,
@@ -889,7 +967,7 @@ fn run(h: &Harness<'_>, tables: &Tables, scene: &Scene) -> Result<Checked, Strin
             planted: &planted,
             seen: &seen,
         },
-        0..QUERY_HEADS,
+        0..attn.query_heads,
     )
 }
 
@@ -904,7 +982,7 @@ fn noted_band(tables: &Tables, worst: f64, what: &str) -> Verdict {
 /// counts: the one-segment waterline, its counted splits, the ticket's fold
 /// past the first segment, and the four-segment scene the split rule leaves.
 pub fn attn_f16(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let tables = load_tables(fixture)?;
+    let tables = load_tables_for(&h.geom().attn, fixture)?;
     let mut worst = 0.0f64;
     let mut note = String::new();
     for &n_keys in &SCENE_KEYS {
@@ -926,7 +1004,7 @@ pub fn attn_f16(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// The appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention
 /// over it is inside the band, at the same key counts.
 pub fn attn_q8(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let tables = load_tables(fixture)?;
+    let tables = load_tables_for(&h.geom().attn, fixture)?;
     let mut worst = 0.0f64;
     let mut note = String::new();
     for &n_keys in &SCENE_KEYS {
@@ -1030,12 +1108,18 @@ fn cache_same(planted: &CacheBack, got: &CacheBack) -> Result<(), String> {
     }
 }
 
-fn expect_nan_q8_row(codes: &[u32], scales: &[u16], row: usize) -> Result<(), String> {
+fn expect_nan_q8_row(
+    attn: &AttnGeom,
+    codes: &[u32],
+    scales: &[u16],
+    row: usize,
+) -> Result<(), String> {
+    let (words, blocks) = (q8_words(attn), q8_scales(attn));
     let scale = scales
-        .get(row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES)
+        .get(row * blocks..(row + 1) * blocks)
         .ok_or("the bad q8_0 row's scales are past the cache")?;
     let code = codes
-        .get(row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS)
+        .get(row * words..(row + 1) * words)
         .ok_or("the bad q8_0 row's codes are past the cache")?;
     for (i, &bits) in scale.iter().enumerate() {
         if bits != Q8_NAN_SCALE {
@@ -1056,7 +1140,8 @@ fn expect_nan_q8_row(codes: &[u32], scales: &[u16], row: usize) -> Result<(), St
 
 /// KeyCount and CachePos write NaN and leave the cache untouched. KvQuant stores a NaN scale and zero codes.
 pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let tables = load_tables(fixture)?;
+    let attn = &h.geom().attn;
+    let tables = load_tables_for(attn, fixture)?;
     for (pos, keys, site, what) in [
         (63u32, 0u32, FaultSite::KeyCount, "a key count of 0"),
         (
@@ -1080,8 +1165,8 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             prefill: 0,
             q8: false,
         };
-        let (q, k, v) = inputs(&scene);
-        let planted = plant(&scene)?;
+        let (q, k, v) = inputs(attn, &scene);
+        let planted = plant(attn, &scene)?;
         let seen = launch(h, &tables, &scene, &q, &k, &v, &planted)?;
         expect_fault(h, what, site)?;
         expect_written_nan(&seen.out)?;
@@ -1096,9 +1181,9 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         prefill: 0,
         q8: true,
     };
-    let (q, mut k, v) = inputs(&scene);
+    let (q, mut k, v) = inputs(attn, &scene);
     k[0] = f32::NAN;
-    let planted = plant(&scene)?;
+    let planted = plant(attn, &scene)?;
     let seen = launch(h, &tables, &scene, &q, &k, &v, &planted)?;
     expect_fault(h, "a non-finite key", FaultSite::KvQuant)?;
     let CacheBack::Q8 {
@@ -1111,21 +1196,21 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err("the q8_0 fault read back another format".to_string());
     };
     let row = 63;
-    expect_nan_q8_row(k_codes, k_scales, row)?;
-    let (vc, vs) = pack_q8(&take_head(&v, 0)?);
+    expect_nan_q8_row(attn, k_codes, k_scales, row)?;
+    let (vc, vs) = pack_q8(take_head(attn, &v, 0)?);
     expect_q8_row(v_codes, v_scales, row, &vc, &vs, "v")?;
-    for kv in 1..KV_HEADS {
-        expect_append_row(&tables, &scene, &k, &v, &seen.cache, kv)?;
+    for kv in 1..attn.kv_heads {
+        expect_append_row(attn, &tables, &scene, &k, &v, &seen.cache, kv)?;
     }
-    for kv in 0..KV_HEADS {
+    for kv in 0..attn.kv_heads {
         for index in 0..scene.ctx {
             if index == row {
                 continue;
             }
-            expect_planted_row(&scene, &planted, &seen.cache, kv, index)?;
+            expect_planted_row(attn, &scene, &planted, &seen.cache, kv, index)?;
         }
     }
-    for (i, value) in seen.out[..8 * HEAD_DIM].iter().enumerate() {
+    for (i, value) in seen.out[..attn.gqa * attn.head].iter().enumerate() {
         if value.to_bits() == SENTINEL_BITS || !value.is_nan() {
             return Err(format!(
                 "kv 0 value {i} is {value:?}, the NaN key's heads are NaN"
@@ -1136,6 +1221,7 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     // head's outputs still match the oracle over the cache that was written.
     let mut worst = 0.0f64;
     let inp = QueryIn {
+        attn,
         tables: &tables,
         scene: &scene,
         q: &q,
@@ -1144,7 +1230,7 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         planted: &planted,
         seen: &seen,
     };
-    for head in 8..QUERY_HEADS {
+    for head in attn.gqa..attn.query_heads {
         worst = wider(worst, check_head(&inp, head)?);
     }
     Ok(Verdict::Noted(format!(
@@ -1180,11 +1266,11 @@ struct Args {
 }
 
 impl Args {
-    const fn whole(q_window: usize) -> Self {
+    fn whole(attn: &AttnGeom, q_window: usize) -> Self {
         Self {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
+            head_dim: attn.head,
+            query_heads: attn.query_heads,
+            kv_heads: attn.kv_heads,
             segments: 1,
             ctx: CTX,
             q_window,
@@ -1199,13 +1285,14 @@ fn refuse(
     a: &Args,
     encoder: &mut ComputeEncoder<'_>,
 ) -> Result<(), DeviceError> {
+    let attn = &h.geom().attn;
     let wrap = |what: &str| DeviceError::Range {
         what: "attention",
         detail: format!("the {what} length wraps"),
     };
-    let cache_n = f16_len(CTX).ok_or_else(|| wrap("cache"))?;
-    let partial_n = partials_len(1).ok_or_else(|| wrap("partials"))?;
-    let out_n = out_len().ok_or_else(|| wrap("out"))?;
+    let cache_n = attn.f16_len(CTX).ok_or_else(|| wrap("cache"))?;
+    let partial_n = attn.partials_len(1).ok_or_else(|| wrap("partials"))?;
+    let out_n = attn.out_len().ok_or_else(|| wrap("out"))?;
     h.kernels.attention_flash(
         encoder,
         AttentionParams {
@@ -1219,11 +1306,11 @@ fn refuse(
             pos: 63,
             n_keys: 64,
             q: b.q.window(Elems(0), Elems(a.q_window))?,
-            k: b.k.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
-            v: b.v.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
-            q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
-            k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
-            rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
+            k: b.k.window(Elems(0), Elems(attn.kv_heads * attn.head))?,
+            v: b.v.window(Elems(0), Elems(attn.kv_heads * attn.head))?,
+            q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
+            k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+            rope: b.rope.window(Elems(0), Elems(CTX * attn.rot))?,
             cache: AttnCache::F16 {
                 k: b.k_cache.window_mut(Elems(0), Elems(cache_n))?,
                 v: b.v_cache.window_mut(Elems(0), Elems(cache_n))?,
@@ -1259,36 +1346,37 @@ fn bad_arg<'a>(
 /// A head dim, head count or window the kernel does not take is refused by name.
 /// The same clause then runs one segment, so a span that drops keys is red.
 pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let tables = load_tables(fixture)?;
+    let attn = h.geom().attn;
+    let tables = load_tables_for(&attn, fixture)?;
     let (device, stream) = (h.device, h.stream);
-    let out_n = out_len().ok_or("the output length wraps")?;
-    let q_n = qg_len().ok_or("the query length wraps")?;
+    let out_n = attn.out_len().ok_or("the output length wraps")?;
+    let q_n = attn.qg_len().ok_or("the query length wraps")?;
     let mut bufs = Bounds {
         q: device.upload(stream, &vec![0f32; q_n]).map_err(why)?,
         k: device
-            .upload(stream, &vec![0f32; KV_HEADS * HEAD_DIM])
+            .upload(stream, &vec![0f32; attn.kv_heads * attn.head])
             .map_err(why)?,
         v: device
-            .upload(stream, &vec![0f32; KV_HEADS * HEAD_DIM])
+            .upload(stream, &vec![0f32; attn.kv_heads * attn.head])
             .map_err(why)?,
         q_gain: device.upload(stream, &tables.q_gain).map_err(why)?,
         k_gain: device.upload(stream, &tables.k_gain).map_err(why)?,
         rope: device.upload(stream, &tables.rope).map_err(why)?,
         partials: device
-            .upload(stream, &vec![0f32; partials_len(1).ok_or("partials")?])
+            .upload(stream, &vec![0f32; attn.partials_len(1).ok_or("partials")?])
             .map_err(why)?,
         out: device
             .upload(stream, &vec![f32::from_bits(SENTINEL_BITS); out_n])
             .map_err(why)?,
         k_cache: device
-            .upload(stream, &vec![F16_HOLE; f16_len(CTX).ok_or("cache")?])
+            .upload(stream, &vec![F16_HOLE; attn.f16_len(CTX).ok_or("cache")?])
             .map_err(why)?,
         v_cache: device
-            .upload(stream, &vec![F16_HOLE; f16_len(CTX).ok_or("cache")?])
+            .upload(stream, &vec![F16_HOLE; attn.f16_len(CTX).ok_or("cache")?])
             .map_err(why)?,
         ticket: device.upload(stream, &[0u32]).map_err(why)?,
     };
-    let whole = Args::whole(q_n);
+    let whole = Args::whole(&attn, q_n);
     let case = |what: &'static str, needle: &'static str, edit: Box<dyn FnOnce(&mut Args)>| {
         bad_arg(what, needle, edit, h, &tables, whole)
     };
@@ -1296,12 +1384,12 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         case(
             "half the head dim",
             "head dim",
-            Box::new(|a| a.head_dim = HEAD_DIM / 2),
+            Box::new(move |a| a.head_dim = attn.head / 2),
         ),
         case(
             "half the query heads",
             "query heads",
-            Box::new(|a| a.query_heads = QUERY_HEADS / 2),
+            Box::new(move |a| a.query_heads = attn.query_heads / 2),
         ),
         case("one kv head", "kv heads", Box::new(|a| a.kv_heads = 1)),
         case(
