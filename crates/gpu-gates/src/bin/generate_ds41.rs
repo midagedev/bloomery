@@ -1034,7 +1034,18 @@ mod drive {
         } else {
             None
         };
-        let call = log.call.take();
+        // The load may feed a prompt the batch cannot read as steps: the
+        // feed, and whether its call is planned, follow the body's mode.
+        let feed_mode = if check_finite {
+            body::PrefillMode::Steps
+        } else {
+            s.model().body("generate_ds41")?.prefill_mode()
+        };
+        let batched = feed_mode == body::PrefillMode::Batch;
+        let call = log.call.take().filter(|_| batched);
+        if let Some(c) = &call {
+            c.print(false, &hp, &[]);
+        }
         let pre = Prelude {
             cfg: &cfg,
             hp: &hp,
@@ -2018,8 +2029,10 @@ mod drive {
             let called = depth - usize::from(a.diag.serve_feed);
             let call = (self.batched && self.draft != Draft::Dspark && a.arms.is_empty())
                 .then(|| CallView::of(self.cfg, &inputs.hp, ctx_max, called));
-            if let Some(c) = &call {
-                c.print(a.plan, &inputs.hp, &plan.n_l);
+            if a.plan
+                && let Some(c) = &call
+            {
+                c.print(true, &inputs.hp, &plan.n_l);
             }
             self.hp = Some(inputs.hp.clone());
             self.ctx_max = ctx_max;
