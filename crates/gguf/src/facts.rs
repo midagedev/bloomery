@@ -282,7 +282,7 @@ fn norm(key: &str, value: &Value, kind: Kind) -> Result<Norm, FactError> {
 /// A [`Conv::PerSite`] fact made per-site: each of `sites` equal chunks
 /// counted from its own first row.
 fn per_site(key: &str, v: Vec<u64>, sites: usize) -> Result<Vec<u64>, FactError> {
-    if sites == 0 || !v.len().is_multiple_of(sites) {
+    if v.is_empty() || sites == 0 || !v.len().is_multiple_of(sites) {
         return Err(bad(
             key,
             format!(

@@ -384,6 +384,10 @@ mod tests {
         assert_eq!(got, Norm::Counts(vec![0, 10, 20, 0, 10, 20]));
         let e = resolve(&k, ARCH, &ENGRAM.offsets.kv, 4).unwrap_err();
         assert!(matches!(e, FactError::Bad { .. }), "{e}");
+        // The test writer refuses an empty array (no element type); a file's reader yields one.
+        let k = pairs(&[("ple.head_offsets", Value::Array(Vec::new()))]);
+        let e = resolve(&k, ARCH, &ENGRAM.offsets.kv, 2).unwrap_err();
+        assert!(matches!(e, FactError::Bad { .. }), "{e}");
     }
 
     /// A file with the four hash tensors of a one-site toy Engram (2 columns,
