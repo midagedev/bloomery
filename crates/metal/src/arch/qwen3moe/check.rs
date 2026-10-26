@@ -22,7 +22,7 @@
 use bloomery_device::fault::FAULT_WORDS;
 use chain::ChainError;
 use chain::arch::qwen3moe::plan::{
-    DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, kinds35,
+    DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, kinds_of,
 };
 use chain::arch::qwen3moe::read::{
     PlanDims, Read35, Sites35, file_names, plan_delta, plan_ffn, plan_gqa,
@@ -290,15 +290,22 @@ pub(super) enum MixerLayout {
 pub(super) struct FfnLayout {
     pub(super) norm: Values,
     pub(super) gate_inp: Values,
-    pub(super) gate_inp_shexp: Values,
     pub(super) gate_up_quant: Quant,
     pub(super) gate: Site,
     pub(super) up: Site,
-    pub(super) shexp_gate: Site,
-    pub(super) shexp_up: Site,
     pub(super) down_quant: Quant,
     pub(super) down: Site,
-    pub(super) shexp_down: Site,
+    /// The shared expert, on a router that runs one ([`router::SHARED`]).
+    pub(super) shared: Option<SharedLayout>,
+}
+
+/// A shared expert: its router row and its three sites, each of its routed
+/// stack's type.
+pub(super) struct SharedLayout {
+    pub(super) gate_inp: Values,
+    pub(super) gate: Site,
+    pub(super) up: Site,
+    pub(super) down: Site,
 }
 
 pub(super) struct LayerLayout {
@@ -546,7 +553,7 @@ fn read(
         .expect("a split holds a first shard")
         .display()
         .to_string();
-    let spec = match model::arch::qwen35moe::spec::read(split) {
+    let spec = match model::arch::spec(split) {
         Ok(read) => read.spec,
         Err(e) => {
             At {
@@ -565,8 +572,31 @@ fn read(
         layer: None,
     }
     .ok(instance::select(&spec).map_err(|e| super::session::refuse(format!("{path}: {e}"))));
-    let (kinds, pd) = match kinds35(&spec.layers)
-        .and_then(|kinds| PlanDims::q35(&spec, WHAT).map(|pd| (kinds, pd)))
+    // The host's launches are one instance's geometry: a file another
+    // instance's shape selects opens in the build whose host it is.
+    let inst = match inst {
+        Some(inst) if *inst != instance::HOST => {
+            At {
+                items: &mut *items,
+                layer: None,
+            }
+            .push(super::session::refuse(format!(
+                "{path}: the file selects instance {}, and this build's host is {}{}",
+                inst.name,
+                instance::HOST.name,
+                inst.host_feature.map_or_else(
+                    || " (the default build opens it)".to_owned(),
+                    |f| format!(" (build with --features {f})")
+                )
+            )));
+            // The host's arena and launches would judge the file at another
+            // geometry: nothing past this refusal is the file's.
+            return None;
+        }
+        inst => inst,
+    };
+    let (kinds, pd) = match kinds_of(&spec.layers)
+        .and_then(|kinds| PlanDims::of(&spec, WHAT).map(|pd| (kinds, pd)))
     {
         Ok(read) => read,
         Err(e) => {
@@ -958,11 +988,11 @@ fn ffn_checks(
     (n_experts, top_k): (usize, usize),
     l: usize,
 ) -> Option<FfnLayout> {
-    match &plan.ffn.route {
+    let joined = match &plan.ffn.route {
         FfnRoute::Router {
             shared: Some(SharedPlan::Joined),
             ..
-        } => {}
+        } => true,
         FfnRoute::Router {
             shared: Some(SharedPlan::Apart(_)),
             ..
@@ -972,18 +1002,21 @@ fn ffn_checks(
             ));
             return None;
         }
-        FfnRoute::Router { shared: None, .. } => {
-            at.push(refuse(
-                "a router with no shared expert, which the router does not run",
-            ));
-            return None;
-        }
+        FfnRoute::Router { shared: None, .. } => false,
         FfnRoute::Dense => {
             at.push(refuse(
                 "a dense FFN, which this backend's experts do not run",
             ));
             return None;
         }
+    };
+    if joined != (router::SHARED == 1) {
+        at.push(refuse(if joined {
+            "a shared expert, which the host's router and experts run none of"
+        } else {
+            "a router with no shared expert, and the host's router runs one"
+        }));
+        return None;
     }
     if n_experts != router::EXPERTS || top_k != ROUTED_IDS {
         at.push(refuse(format!(
@@ -999,21 +1032,31 @@ fn ffn_checks(
     let file = file_names(l);
     let gate = at.ok(t.site(&file.gate, hidden, EXPERT_K * n_experts));
     let up = at.ok(t.site(&file.up, hidden, EXPERT_K * n_experts));
-    let shexp_gate = at.ok(t.site(&file.sh_gate, hidden, EXPERT_K));
-    let shexp_up = at.ok(t.site(&file.sh_up, hidden, EXPERT_K));
+    let shexp_gate = joined.then(|| at.ok(t.site(&file.sh_gate, hidden, EXPERT_K)));
+    let shexp_up = joined.then(|| at.ok(t.site(&file.sh_up, hidden, EXPERT_K)));
     let mut ok = true;
-    if let (Some(g), Some(u), Some(sg), Some(su)) = (&gate, &up, &shexp_gate, &shexp_up)
-        && [u.quant, sg.quant, su.quant].iter().any(|&q| q != g.quant)
-    {
-        at.push(refuse(format!(
-            "gate {:?}, up {:?}, shared gate {:?}, shared up {:?}; the pair runs one type",
-            g.quant, u.quant, sg.quant, su.quant
-        )));
-        ok = false;
+    match (&gate, &up, &shexp_gate, &shexp_up) {
+        (Some(g), Some(u), Some(Some(sg)), Some(Some(su)))
+            if [u.quant, sg.quant, su.quant].iter().any(|&q| q != g.quant) =>
+        {
+            at.push(refuse(format!(
+                "gate {:?}, up {:?}, shared gate {:?}, shared up {:?}; the pair runs one type",
+                g.quant, u.quant, sg.quant, su.quant
+            )));
+            ok = false;
+        }
+        (Some(g), Some(u), None, None) if u.quant != g.quant => {
+            at.push(refuse(format!(
+                "gate {:?}, up {:?}; the pair runs one type",
+                g.quant, u.quant
+            )));
+            ok = false;
+        }
+        _ => {}
     }
     let down = at.ok(t.site(&file.down, EXPERT_K, hidden * n_experts));
-    let shexp_down = at.ok(t.site(&file.sh_down, EXPERT_K, hidden));
-    if let (Some(d), Some(sd)) = (&down, &shexp_down)
+    let shexp_down = joined.then(|| at.ok(t.site(&file.sh_down, EXPERT_K, hidden)));
+    if let (Some(d), Some(Some(sd))) = (&down, &shexp_down)
         && sd.quant != d.quant
     {
         at.push(refuse(format!(
@@ -1026,21 +1069,26 @@ fn ffn_checks(
     // The router and the shared-expert gate: F32 in a GGUF file, MLX's
     // affine 8-bit in an MLX file, dequantized exactly at open.
     let gate_inp = at.ok(t.f32s_or_a8(&file.router, n_experts * hidden));
-    let gate_inp_shexp = at.ok(t.f32s_or_a8(&file.router_gate, hidden));
-    let (gate, up, shexp_gate, shexp_up, down, shexp_down) =
-        (gate?, up?, shexp_gate?, shexp_up?, down?, shexp_down?);
+    let gate_inp_shexp = joined.then(|| at.ok(t.f32s_or_a8(&file.router_gate, hidden)));
+    let shared = match (gate_inp_shexp, shexp_gate, shexp_up, shexp_down) {
+        (Some(gate_inp), Some(gate), Some(up), Some(down)) => Some(SharedLayout {
+            gate_inp: gate_inp?,
+            gate: gate?,
+            up: up?,
+            down: down?,
+        }),
+        _ => None,
+    };
+    let (gate, up, down) = (gate?, up?, down?);
     ok.then_some(FfnLayout {
         norm: norm?,
         gate_inp: gate_inp?,
-        gate_inp_shexp: gate_inp_shexp?,
         gate_up_quant: gate.quant,
         down_quant: down.quant,
         gate,
         up,
-        shexp_gate,
-        shexp_up,
         down,
-        shexp_down,
+        shared,
     })
 }
 
@@ -1205,21 +1253,29 @@ impl Checked {
                 }
             }
             let f = &layer.ffn;
+            let sh = f.shared.as_ref();
             for s in [
-                &f.gate,
-                &f.up,
-                &f.shexp_gate,
-                &f.shexp_up,
-                &f.down,
-                &f.shexp_down,
-            ] {
+                Some(&f.gate),
+                Some(&f.up),
+                sh.map(|s| &s.gate),
+                sh.map(|s| &s.up),
+                Some(&f.down),
+                sh.map(|s| &s.down),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 b.weights.add(s.bytes());
             }
-            for v in [&f.norm, &f.gate_inp, &f.gate_inp_shexp] {
+            for v in [Some(&f.norm), Some(&f.gate_inp), sh.map(|s| &s.gate_inp)]
+                .into_iter()
+                .flatten()
+            {
                 b.weights.add(f32s(v.len));
             }
             // The router's logits, picks, weights, partials and ticket.
-            for words in [router::ROWS, g.top_k + 1, g.top_k + 1, router::PARTIALS, 1] {
+            let ids = g.top_k + router::SHARED;
+            for words in [router::ROWS, ids, ids, router::PARTIALS, 1] {
                 b.scratch.add(f32s(words));
             }
         }
@@ -1454,11 +1510,11 @@ mod tests {
     /// The error the open met before the collector: `layer_plans` over the
     /// same header, the call the open made.
     fn old_plan_error(split: &Split) -> String {
-        let spec = model::arch::qwen35moe::spec::read(split)
+        let spec = model::arch::spec(split)
             .expect("the description reads")
             .spec;
-        let kinds = kinds35(&spec.layers).expect("the kinds read");
-        let pd = PlanDims::q35(&spec, WHAT).expect("the dims read");
+        let kinds = kinds_of(&spec.layers).expect("the kinds read");
+        let pd = PlanDims::of(&spec, WHAT).expect("the dims read");
         let err = layer_plans(
             split,
             WHAT,
@@ -1475,6 +1531,9 @@ mod tests {
 
     #[test]
     fn a_clean_table_opens() {
+        if !judged_here() {
+            return;
+        }
         let t = Synthetic::new();
         let out = check(&t.split(), CTX);
         assert!(out.items.is_empty(), "{:?}", out.items);
@@ -1502,6 +1561,9 @@ mod tests {
     /// list moves one class.
     #[test]
     fn the_bytes_pin_each_class_of_buffers() {
+        if !judged_here() {
+            return;
+        }
         use super::super::arena::RECORD_SLOTS;
         use crate::kernels::{LOGIT_STRIDE, RING_ROWS, prepared_elems, route_table_words};
 
@@ -1582,18 +1644,40 @@ mod tests {
         assert_eq!(bytes.rows, class(&rows));
     }
 
+    /// Whether this build's host judges the synthetic table, a Qwen3.6
+    /// header. Another host refuses the table at the instance pick, before
+    /// any judgement the table's tests pin
+    /// (`a_file_of_another_instance_than_the_host_is_refused_by_name`), so
+    /// those tests end at once there.
+    fn judged_here() -> bool {
+        instance::HOST == instance::QWEN35MOE_A3B
+    }
+
+    #[test]
+    fn a_file_of_another_instance_than_the_host_is_refused_by_name() {
+        // A Qwen3.6 header opens at a Qwen3.6 host; another host refuses it
+        // by its host line.
+        let out = check(&Synthetic::new().split(), CTX);
+        let host_line = out.items.iter().any(|i| {
+            i.error
+                .to_string()
+                .contains(&format!("this build's host is {}", instance::HOST.name))
+        });
+        assert_eq!(host_line, !judged_here(), "{:?}", out.items);
+    }
+
     #[test]
     fn the_architecture_verdict_is_the_one_item() {
+        // An architecture no description reader reads.
         let t = Synthetic::new().kv(
             gguf::GENERAL_ARCHITECTURE,
-            Value::String("qwen3moe".to_owned()),
+            Value::String("deepseek2".to_owned()),
         );
         let got = texts(&t.split(), CTX);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(
             got[0].starts_with("qwen35moe session: synthetic.gguf: ")
-                && got[0].contains(gguf::GENERAL_ARCHITECTURE)
-                && got[0].contains("\"qwen3moe\""),
+                && got[0].contains("unsupported architecture \"deepseek2\""),
             "{got:?}"
         );
     }
@@ -1614,6 +1698,9 @@ mod tests {
 
     #[test]
     fn a_site_type_no_mat_vec_runs_is_the_chain_words_and_the_opens_first() {
+        if !judged_here() {
+            return;
+        }
         let t = Synthetic::new().ty("blk.0.attn_qkv.weight", GgmlType::Q8_0);
         let split = t.split();
         let got = texts(&split, CTX);
@@ -1628,6 +1715,9 @@ mod tests {
 
     #[test]
     fn every_site_of_a_half_the_lists_refuse_is_an_item_in_the_readers_order() {
+        if !judged_here() {
+            return;
+        }
         let t = Synthetic::new()
             .ty("blk.0.attn_qkv.weight", GgmlType::Q8_0)
             .ty("blk.0.ssm_beta.weight", GgmlType::F32)
@@ -1660,6 +1750,9 @@ mod tests {
 
     #[test]
     fn the_shared_parts_and_the_stacks_of_an_ffn_are_listed_in_the_readers_order() {
+        if !judged_here() {
+            return;
+        }
         let t = Synthetic::new()
             .ty("blk.1.ffn_down_shexp.weight", GgmlType::Q8_0)
             .ty("blk.1.ffn_down_exps.weight", GgmlType::Q5_K)
@@ -1690,6 +1783,9 @@ mod tests {
 
     #[test]
     fn a_missing_tensor_and_a_shape_the_plan_does_not_take_are_one_item_each() {
+        if !judged_here() {
+            return;
+        }
         let split = Synthetic::new().drop("blk.0.attn_gate.weight").split();
         let got = texts(&split, CTX);
         assert_eq!(
@@ -1713,6 +1809,9 @@ mod tests {
 
     #[test]
     fn a_gate_beside_another_types_up_is_one_item() {
+        if !judged_here() {
+            return;
+        }
         let split = Synthetic::new()
             .ty("blk.0.ffn_up_exps.weight", GgmlType::Q6_K)
             .split();
@@ -1729,6 +1828,9 @@ mod tests {
 
     #[test]
     fn the_cache_is_judged_at_the_asked_rows() {
+        if !judged_here() {
+            return;
+        }
         let split = Synthetic::new().split();
         assert_eq!(
             texts(&split, 0),
@@ -1742,6 +1844,9 @@ mod tests {
 
     #[test]
     fn the_head_and_the_embedding_are_judged_by_their_kernels() {
+        if !judged_here() {
+            return;
+        }
         let got = texts(
             &Synthetic::new()
                 .ty("token_embd.weight", GgmlType::Q6_K)
@@ -1764,6 +1869,9 @@ mod tests {
 
     #[test]
     fn a_vocabulary_of_the_file_opens_and_zero_is_one_item() {
+        if !judged_here() {
+            return;
+        }
         // MiniCPM-V's 248,144 rows: the head's last group is partial.
         let t = Synthetic::new()
             .kv("qwen35moe.vocab_size", Value::U32(248_144))
@@ -1785,6 +1893,9 @@ mod tests {
 
     #[test]
     fn the_arena_rules_of_a_layer_name_the_layer() {
+        if !judged_here() {
+            return;
+        }
         // A shared expert of another type than its stacks: the plan reads it
         // apart, the arena's fold does not run it.
         let got = texts(
@@ -1830,6 +1941,9 @@ mod tests {
 
     #[test]
     fn two_faults_give_both_the_plans_before_the_arenas() {
+        if !judged_here() {
+            return;
+        }
         let t = Synthetic::new()
             .ty("output.weight", GgmlType::Q4_K)
             .ty("blk.0.attn_qkv.weight", GgmlType::Q8_0);
@@ -1845,6 +1959,9 @@ mod tests {
 
     #[test]
     fn a_refused_layer_does_not_hide_the_next_and_the_first_is_the_opens() {
+        if !judged_here() {
+            return;
+        }
         // Layer 0's FFN, then layer 1's mixer: the order `layer_plans` reads.
         let t = Synthetic::new()
             .ty("blk.1.attn_q.weight", GgmlType::Q8_0)
@@ -1894,6 +2011,9 @@ mod tests {
 
     #[test]
     fn a_file_cut_after_its_tensor_table_is_read_as_its_header() {
+        if !judged_here() {
+            return;
+        }
         let t = Synthetic::new();
         let layout = t.layout();
         let file = TempFile::new("cut", layout.header_bytes());

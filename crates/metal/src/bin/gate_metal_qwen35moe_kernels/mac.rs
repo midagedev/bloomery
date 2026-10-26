@@ -30,12 +30,13 @@
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-use bloomery_device::conformance::{Clause, Report, why};
+use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::instance::HOST;
+use bloomery_metal::instance::{HOST, Instance, QWEN3MOE_A3B, QWEN35MOE_A3B, REGISTERED};
 use bloomery_metal::kernels::{
-    HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant, SegParams, Segment,
+    HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant, SIMD_GROUPS_PER_GROUP,
+    SegParams, Segment,
 };
 use bloomery_metal::library::{Library, SOURCE, TENSOR_SOURCE};
 use bloomery_metal::stream::MetalStream;
@@ -430,13 +431,120 @@ fn tensor_kernels_of_text(
     Ok((library, kernels))
 }
 
-/// The fixture path: `--fixture PATH`, else the qwen35moe fixture under the
-/// fixture root (`BLOOMERY_FIXTURE_ROOT`), as the reference sets resolve it.
+/// What the gate runs at a host instance.
+#[derive(Clone, Copy)]
+enum Table {
+    /// Every clause and both mutant tables: the gate is written at this
+    /// instance's fixture.
+    Whole,
+    /// The clauses of the kernels the instance's geometry shapes (router,
+    /// experts, attention), the main table's mutants of those clauses
+    /// (`kept`) and the instance's own (`own`).
+    Shaped {
+        kept: &'static [&'static str],
+        own: &'static [mutants::Mutant],
+    },
+}
+
+/// A registered instance's row of the gate: the architecture whose fixture
+/// its clauses read, and what it runs.
+struct HostRow {
+    instance: Instance,
+    fixture: &'static str,
+    table: Table,
+}
+
+/// The gate's row of each registered instance.
+const HOST_ROWS: &[HostRow] = &[
+    HostRow {
+        instance: QWEN35MOE_A3B,
+        fixture: "qwen35moe",
+        table: Table::Whole,
+    },
+    HostRow {
+        instance: QWEN3MOE_A3B,
+        fixture: "qwen3moe",
+        table: Table::Shaped {
+            kept: mutants::Q30_KEPT,
+            own: mutants::Q30_MUTANTS,
+        },
+    },
+];
+
+/// The host instance's row of [`HOST_ROWS`].
+fn host_row() -> &'static HostRow {
+    HOST_ROWS
+        .iter()
+        .find(|r| r.instance == HOST)
+        .unwrap_or_else(|| panic!("the host instance {} has no row in the gate", HOST.name))
+}
+
+/// The entries whose bodies an instance's geometry shapes.
+const INSTANCE_ENTRIES: [&str; 9] = [
+    "gqa256_flash_f16",
+    "gqa256_flash_q8",
+    "gqa256_flash_f16_rows",
+    "attn_norm_rope_rows",
+    "attn_prefill_f16",
+    "router35",
+    "route_rows_select",
+    "route_table",
+    "combine_rows",
+];
+/// The instance-shaped entries that take the mat-vec's SIMD group count.
+const INSTANCE_MATVEC_ENTRIES: [&str; 3] = ["q4k_pair_swiglu", "q4k_down_fold", "q6k_down_fold"];
+
+/// Every registered instance's library compiles, and its instance-shaped
+/// entries make pipelines: the source is compiled at run time, so a body
+/// that only another instance's `#define`s break is caught here, in either
+/// host's build.
+fn instances(h: &Harness<'_>) -> Clause {
+    let mut names = Vec::with_capacity(REGISTERED.len());
+    for inst in REGISTERED {
+        let other = if *inst == HOST {
+            None
+        } else {
+            Some(MetalDevice::open(inst).map_err(|e| format!("{}: {e}", inst.name))?)
+        };
+        let library = other
+            .as_ref()
+            .map_or(h.device.library(), MetalDevice::library);
+        if *library.instance() != *inst {
+            return Err(format!(
+                "the library opened for {} is instance {}",
+                inst.name,
+                library.instance().name
+            ));
+        }
+        for name in INSTANCE_ENTRIES {
+            library
+                .pipeline(name)
+                .map_err(|e| format!("{}: {name}: {e}", inst.name))?;
+        }
+        let count = u32::try_from(SIMD_GROUPS_PER_GROUP).map_err(|e| e.to_string())?;
+        for name in INSTANCE_MATVEC_ENTRIES {
+            library
+                .pipeline_with_simdgroups(name, count)
+                .map_err(|e| format!("{}: {name}: {e}", inst.name))?;
+        }
+        names.push(inst.name);
+    }
+    Ok(Verdict::Noted(format!(
+        "{} compile, {} entries each make pipelines; host {}",
+        names.join(", "),
+        INSTANCE_ENTRIES.len() + INSTANCE_MATVEC_ENTRIES.len(),
+        HOST.name
+    )))
+}
+
+/// The fixture path: `--fixture PATH`, else the host instance's fixture
+/// under the fixture root (`BLOOMERY_FIXTURE_ROOT`), as the reference sets
+/// resolve it.
 fn fixture_path(args: &[String]) -> Result<PathBuf, String> {
     if let Some(path) = flag(args, "--fixture") {
         return Ok(PathBuf::from(path));
     }
-    refset::fixture::first_shard("qwen35moe")
+    refset::fixture::first_shard(host_row().fixture)
         .map(PathBuf::from)
         .map_err(|e| format!("{e} (name the fixture's trunk file with --fixture PATH)"))
 }
@@ -463,7 +571,7 @@ fn mutants_all(args: &[String]) -> ExitCode {
     };
     let mut green = Vec::new();
     let mut count = 0usize;
-    for (mutant, _) in mutants::all() {
+    for (mutant, _) in mutants::all(host_row().table) {
         count += 1;
         let mut child = Command::new(&exe);
         child.args(["--mutant", mutant.name]);
@@ -568,7 +676,7 @@ pub fn main() -> ExitCode {
         device.library().gemm_path().name()
     );
     let mutant = match flag(&args, "--mutant") {
-        Some(name) => match mutants::find(name) {
+        Some(name) => match mutants::find(name, host_row().table) {
             Some(mutant) => Some(mutant),
             None => {
                 println!("gate_metal_qwen35moe_kernels: no mutant named {name}");
@@ -708,21 +816,36 @@ pub fn main() -> ExitCode {
         ("nsg", Box::new(|| ctx.with(clauses_matvec::nsg))),
         ("nrows", Box::new(|| ctx.with(clauses_matvec::nrows))),
     ];
-    let clauses: Vec<_> = front
-        .into_iter()
-        .chain(clauses_a4::table(ctx.harness, &mlx))
-        .chain(clauses_q8_0::table(ctx.harness))
-        .chain(clauses_q5k::table(ctx.harness))
-        .chain(clauses_gemm::table(ctx.harness, ctx.fixture, &mlx))
-        .chain(clauses_delta::table(&ctx))
-        .chain(clauses_router::table(&ctx))
-        .chain(clauses_experts::table(&ctx))
-        .chain(clauses_attention::table(&ctx))
-        .chain(clauses_head::table(&ctx))
-        .chain(clauses_rows::table(&ctx))
-        .chain(clauses_route::table(&ctx, &mlx))
-        .chain(clauses_tensor::table(&tensor, &fixture, &mlx))
-        .collect();
+    let instances_run = || {
+        vec![(
+            "instances",
+            Box::new(|| instances(ctx.harness)) as ClauseRun,
+        )]
+    };
+    let clauses: Vec<_> = match host_row().table {
+        Table::Shaped { .. } => instances_run()
+            .into_iter()
+            .chain(clauses_router::table(&ctx))
+            .chain(clauses_experts::table(&ctx))
+            .chain(clauses_attention::table(&ctx))
+            .collect(),
+        Table::Whole => front
+            .into_iter()
+            .chain(instances_run())
+            .chain(clauses_a4::table(ctx.harness, &mlx))
+            .chain(clauses_q8_0::table(ctx.harness))
+            .chain(clauses_q5k::table(ctx.harness))
+            .chain(clauses_gemm::table(ctx.harness, ctx.fixture, &mlx))
+            .chain(clauses_delta::table(&ctx))
+            .chain(clauses_router::table(&ctx))
+            .chain(clauses_experts::table(&ctx))
+            .chain(clauses_attention::table(&ctx))
+            .chain(clauses_head::table(&ctx))
+            .chain(clauses_rows::table(&ctx))
+            .chain(clauses_route::table(&ctx, &mlx))
+            .chain(clauses_tensor::table(&tensor, &fixture, &mlx))
+            .collect(),
+    };
     if args.iter().any(|a| a == "--list") {
         for (name, _) in &clauses {
             println!("{name}");

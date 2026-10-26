@@ -14,8 +14,9 @@
 //                      scale, in place: the head-norm mat-vec's input
 //
 // The route table. A pass of R rows has 9 R slots: a row's eight picks and
-// the shared expert, whose id is the router's 256. One threadgroup counts the
-// slots per group (the 256 routed experts, then the shared expert as the
+// the shared expert, whose id is the router's 256 (an instance with no gated
+// shared expert has 8 R slots and no shared group). One threadgroup counts
+// the slots per group (the 256 routed experts, then the shared expert as the
 // 257th group), scans the counts, and places each slot at its group's start
 // plus the slot's arrival at the group (a threadgroup atomic). The order
 // inside a group is therefore not fixed; nothing reads it: a slot's output is
@@ -43,8 +44,8 @@ using namespace metal;
 #define ROUTE_TILE 64
 // Threads of the table's one threadgroup.
 #define ROUTE_THREADS 1024
-// Groups: the routed experts and the shared expert.
-#define ROUTE_GROUPS (ROUTER_EXPERTS + 1)
+// Groups: the routed experts and a gated shared expert.
+#define ROUTE_GROUPS (ROUTER_EXPERTS + BLOOMERY_ROUTER_SHARED)
 
 struct RowsPickArgs {
     uint top_k;
@@ -89,7 +90,7 @@ kernel void route_rows_select(device const float *logits [[buffer(0)]],
     if (sg_in_tg != 0u) {
         return;
     }
-    const uint per_row = args.top_k + 1u;
+    const uint per_row = args.top_k + BLOOMERY_ROUTER_SHARED;
     route_pick(ids + (ulong)row * per_row, weights + (ulong)row * per_row, nullptr, faults,
                args.top_k, args.layer, lane, tg_logits, tg_keys, tg_bad);
 }
@@ -128,7 +129,7 @@ kernel void route_table(device const uint *ids [[buffer(0)]],
     // range, raised.
     for (uint s = tid; s < args.slots; s += ROUTE_THREADS) {
         const uint id = ids[s];
-        const bool shared = (s % args.per_row) == args.per_row - 1u;
+        const bool shared = BLOOMERY_ROUTER_SHARED && (s % args.per_row) == args.per_row - 1u;
         const bool ok = shared ? id == args.n_experts : id < args.n_experts;
         if (!ok) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
@@ -170,7 +171,7 @@ kernel void route_table(device const uint *ids [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = tid; s < args.slots; s += ROUTE_THREADS) {
         const uint id = ids[s];
-        const bool shared = (s % args.per_row) == args.per_row - 1u;
+        const bool shared = BLOOMERY_ROUTER_SHARED && (s % args.per_row) == args.per_row - 1u;
         const bool ok = shared ? id == args.n_experts : id < args.n_experts;
         const uint g = ok ? id : 0u;
         const uint place =

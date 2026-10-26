@@ -1,5 +1,6 @@
-//! The launch of the router: 257 rows of K 2048, one row a SIMD group, one
-//! dispatch.
+//! The launch of the router: [`ROWS`] rows of [`K`] (the routed experts, then
+//! a gated shared expert's row when the host instance has one), one row a
+//! SIMD group, one dispatch.
 //!
 //! The kernel is `kernels/router.metal`. A launch checks the shape, every
 //! window's length and the alignment of the windows the kernel loads as
@@ -12,14 +13,15 @@ use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 pub use super::router_geom::SIMD_GROUPS as SG;
-pub use super::router_geom::{EXPERTS, K, PARTIALS, ROWS, TOP_K_MAX};
+pub use super::router_geom::{EXPERTS, K, PARTIALS, ROWS, SHARED, TOP_K_MAX};
 use super::router_geom::{FLOAT4S, GROUPS, SIMD_WIDTH, SPLIT, THREADS};
 use super::{Kernels, check_window_len, pack, word};
 
 const WHAT: &str = "router";
 
 const _: () = assert!(PARTIALS == ROWS * SPLIT);
-const _: () = assert!(GROUPS == 33);
+const _: () = assert!(GROUPS * SG >= ROWS && (GROUPS - 1) * SG < ROWS);
+const _: () = assert!(ROWS == EXPERTS + SHARED && (SHARED == 0 || SHARED == 1));
 const _: () = assert!(THREADS == 256);
 const _: () = assert!(SIMD_WIDTH * FLOAT4S * 4 == K / SPLIT);
 const _: () = assert!(SIMD_WIDTH * FLOAT4S * SPLIT * 4 == K);
@@ -32,12 +34,13 @@ pub struct RouterParams<'w> {
     /// The columns. The kernel reads [`K`].
     pub k: usize,
     /// The routed experts to select, `1..=`[`TOP_K_MAX`]. The output holds
-    /// that many ids and weights plus the shared expert.
+    /// that many ids and weights plus the shared expert's when there is one.
     pub top_k: usize,
     /// The routed weights, [`EXPERTS`] rows of [`K`], one segment.
     pub routed: Window<'w, f32, MetalDevice>,
-    /// The shared expert's weights, [`K`] values, the second segment.
-    pub shared: Window<'w, f32, MetalDevice>,
+    /// The shared expert's gate row, [`K`] values, the second segment: given
+    /// exactly when the host instance's router has the row ([`SHARED`]).
+    pub shared: Option<Window<'w, f32, MetalDevice>>,
     /// The input, [`K`] values.
     pub x: Window<'w, f32, MetalDevice>,
     /// The norm's gain, [`K`] values.
@@ -50,10 +53,11 @@ pub struct RouterParams<'w> {
     pub ticket: WindowMut<'w, u32, MetalDevice>,
     /// The logits, [`ROWS`] values.
     pub logits: WindowMut<'w, f32, MetalDevice>,
-    /// The selected ids and then the shared expert's id, `top_k + 1` values.
-    pub ids: WindowMut<'w, u32, MetalDevice>,
-    /// The selected weights and then the shared expert's weight, `top_k + 1`
+    /// The selected ids and then any shared expert's id, `top_k + SHARED`
     /// values.
+    pub ids: WindowMut<'w, u32, MetalDevice>,
+    /// The selected weights and then any shared expert's weight,
+    /// `top_k + SHARED` values.
     pub weights: WindowMut<'w, f32, MetalDevice>,
     /// The epsilon added to the mean of the squares.
     pub eps: f32,
@@ -93,16 +97,27 @@ fn check(p: &RouterParams<'_>) -> Result<(), DeviceError> {
         return Err(refuse(format!("eps {} is not finite", p.eps)));
     }
     check_window_len(WHAT, "routed", p.routed.len(), EXPERTS * K)?;
-    check_window_len(WHAT, "shared", p.shared.len(), K)?;
+    match (&p.shared, SHARED) {
+        (Some(shared), 1) => {
+            check_window_len(WHAT, "shared", shared.len(), K)?;
+            align16("shared", shared.byte_range()?.start.get())?;
+        }
+        (None, 0) => {}
+        (Some(_), _) => {
+            return Err(refuse(
+                "a shared expert's row, which this router has none of".to_string(),
+            ));
+        }
+        (None, _) => return Err(refuse("no shared expert's row".to_string())),
+    }
     check_window_len(WHAT, "x", p.x.len(), K)?;
     check_window_len(WHAT, "gain", p.gain.len(), K)?;
     check_window_len(WHAT, "partials", p.partials.len(), PARTIALS)?;
     check_window_len(WHAT, "ticket", p.ticket.len(), 1)?;
     check_window_len(WHAT, "logits", p.logits.len(), ROWS)?;
-    check_window_len(WHAT, "ids", p.ids.len(), p.top_k + 1)?;
-    check_window_len(WHAT, "weights", p.weights.len(), p.top_k + 1)?;
+    check_window_len(WHAT, "ids", p.ids.len(), p.top_k + SHARED)?;
+    check_window_len(WHAT, "weights", p.weights.len(), p.top_k + SHARED)?;
     align16("routed", p.routed.byte_range()?.start.get())?;
-    align16("shared", p.shared.byte_range()?.start.get())?;
     align16("x", p.x.byte_range()?.start.get())?;
     align16("gain", p.gain.byte_range()?.start.get())?;
     Ok(())
@@ -129,7 +144,9 @@ impl Kernels {
         encoder.set_pipeline(&self.router);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.routed)?)?;
-        slot.set(Binding::of(&p.shared)?)?;
+        // A router with no shared row binds the routed rows in its slot,
+        // which the kernel does not read.
+        slot.set(Binding::of(p.shared.as_ref().unwrap_or(&p.routed))?)?;
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of(&p.gain)?)?;
         slot.set(Binding::of_mut(&p.partials)?)?;

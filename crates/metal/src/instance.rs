@@ -10,6 +10,9 @@ pub struct Instance {
     /// it, and how a refusal names it.
     pub name: &'static str,
     pub key: Key,
+    /// The cargo feature a build whose host is this instance ([`HOST`]) is
+    /// made with; none for the default build's.
+    pub host_feature: Option<&'static str>,
 }
 
 /// The axes an instance's kernels are compiled at: what a file's shape is
@@ -20,7 +23,8 @@ pub struct Key {
     pub hidden: u32,
     pub moe: MoeAxes,
     pub attn: AttnAxes,
-    pub delta: DeltaAxes,
+    /// The gated delta net's axes; none for a file of no delta layer.
+    pub delta: Option<DeltaAxes>,
 }
 
 /// A routed layer's axes.
@@ -78,6 +82,18 @@ const fn gqa_row(head: u32, group: u32) -> GqaInst {
     panic!("the shape table has no GQA row for this head at this group")
 }
 
+/// Qwen3.6-35B-A3B's gated delta net.
+const QWEN35_GDN: DeltaAxes = DeltaAxes {
+    value_heads: 32,
+    head_cols: 128,
+    conv_taps: 4,
+};
+
+/// The delta axes an instance of no delta layer compiles its delta kernels
+/// at: every instance's translation unit holds them, and no layer of its
+/// files launches them.
+const DELTA_UNLAUNCHED: DeltaAxes = QWEN35_GDN;
+
 /// Qwen3.6-35B-A3B's shape (`qwen35moe`): the gated softmax router over 256
 /// experts and the shared expert, the gated query, the gated delta net.
 pub const QWEN35MOE_A3B: Instance = Instance {
@@ -96,24 +112,64 @@ pub const QWEN35MOE_A3B: Instance = Instance {
             rot: 64,
             q_gate: true,
         },
-        delta: DeltaAxes {
-            value_heads: 32,
-            head_cols: 128,
-            conv_taps: 4,
-        },
+        delta: Some(QWEN35_GDN),
     },
+    host_feature: None,
+};
+
+/// Qwen3-30B-A3B's shape (`qwen3moe`): the softmax router over 128 experts
+/// and no shared expert, the plain query of head 128 turned whole, no delta
+/// layer.
+pub const QWEN3MOE_A3B: Instance = Instance {
+    name: "qwen3moe_a3b",
+    key: Key {
+        hidden: 2048,
+        moe: MoeAxes {
+            router: shape::router_row(RouterBody::Qwen3moe, 128),
+            top_k: 8,
+            expert_ff: 768,
+        },
+        attn: AttnAxes {
+            row: gqa_row(128, 32 / 4),
+            n_head: 32,
+            n_kv: 4,
+            rot: 128,
+            q_gate: false,
+        },
+        delta: None,
+    },
+    host_feature: Some("host-qwen3moe-a3b"),
 };
 
 /// Every instance `build.rs` writes and compiles. A shape with no row here
 /// has no kernels: a file of it is refused by name ([`select`]), and the
 /// route to running it is a row here (its router and flash rows in the
 /// shape table first).
-pub const REGISTERED: &[Instance] = &[QWEN35MOE_A3B];
+pub const REGISTERED: &[Instance] = &[QWEN35MOE_A3B, QWEN3MOE_A3B];
 
 /// The instance the host is written at: the launches' grids and the
 /// buffers' lengths read its axes as constants (`kernels::*_geom`), so the
-/// kernels refuse a library of any other (`Kernels::with_geometry`).
+/// kernels refuse a library of any other (`Kernels::with_geometry`). A
+/// build picks it by feature: Qwen3.6's by default, Qwen3-30B-A3B's under
+/// `host-qwen3moe-a3b`.
+#[cfg(not(feature = "host-qwen3moe-a3b"))]
 pub const HOST: Instance = QWEN35MOE_A3B;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-qwen3moe-a3b")]
+pub const HOST: Instance = QWEN3MOE_A3B;
+
+impl Instance {
+    /// The delta axes this instance's delta kernels are compiled at: its
+    /// own, or [`DELTA_UNLAUNCHED`] when its files have no delta layer.
+    #[must_use]
+    pub const fn delta_built(&self) -> DeltaAxes {
+        match self.key.delta {
+            Some(d) => d,
+            None => DELTA_UNLAUNCHED,
+        }
+    }
+}
 
 /// Why a file has no instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +181,7 @@ pub enum Refused {
     /// A layer whose axes are not those of the earlier layers of its kind:
     /// an instance compiles each kind at one shape.
     Layers { layer: usize, what: &'static str },
-    /// No layer of a kind every instance compiles.
+    /// No layer of a kind every instance compiles: routed or attention.
     Missing { what: &'static str },
     /// The file's axes are no registered instance's.
     NoInstance { key: Key },
@@ -133,11 +189,11 @@ pub enum Refused {
 
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (m, a, d) = (&self.moe, &self.attn, &self.delta);
+        let (m, a) = (&self.moe, &self.attn);
         write!(
             f,
             "hidden {}; router {:?} of {} experts{}, top {}, expert ff {}; attention {}/{} heads \
-             of {} (value {}), rope {}{}; delta {} value heads of {}, conv {}",
+             of {} (value {}), rope {}{}; ",
             self.hidden,
             m.router.body,
             m.router.experts,
@@ -154,10 +210,15 @@ impl fmt::Display for Key {
             a.row.value,
             a.rot,
             if a.q_gate { ", a gated query" } else { "" },
-            d.value_heads,
-            d.head_cols,
-            d.conv_taps
-        )
+        )?;
+        match &self.delta {
+            Some(d) => write!(
+                f,
+                "delta {} value heads of {}, conv {}",
+                d.value_heads, d.head_cols, d.conv_taps
+            ),
+            None => f.write_str("no delta layer"),
+        }
     }
 }
 
@@ -217,8 +278,8 @@ impl Key {
     ///
     /// [`Refused`] naming the layer when the shape table has no row for it,
     /// it is of a kind no instance compiles, or its axes are not the earlier
-    /// layers' of its kind; and naming the kind when the file has none of
-    /// one.
+    /// layers' of its kind; and naming the kind when the file has no routed
+    /// or no attention layer. A file of no delta layer has no delta axes.
     pub fn of<'a>(
         hidden: u32,
         layers: impl IntoIterator<Item = (&'a Mixer, &'a Ffn)>,
@@ -278,9 +339,7 @@ impl Key {
             hidden,
             moe: moe.ok_or(Refused::Missing { what: "routed" })?,
             attn: attn.ok_or(Refused::Missing { what: "attention" })?,
-            delta: delta.ok_or(Refused::Missing {
-                what: "gated delta net",
-            })?,
+            delta,
         })
     }
 }
@@ -323,6 +382,11 @@ mod tests {
 
     /// A Qwen3.6-35B-A3B attention layer, as its reader describes it.
     fn gqa(heads: u32, kv_heads: u32, head_dim: u32, rot: u32) -> Mixer {
+        gqa_gated(heads, kv_heads, head_dim, rot, OutGate::Packed)
+    }
+
+    /// An attention layer of `out_gate`.
+    fn gqa_gated(heads: u32, kv_heads: u32, head_dim: u32, rot: u32, out_gate: OutGate) -> Mixer {
         Mixer::Gqa(Gqa {
             heads,
             kv_heads,
@@ -336,7 +400,7 @@ mod tests {
             },
             qk_norm: true,
             o_norm: false,
-            out_gate: OutGate::Packed,
+            out_gate,
             select: None,
             window: None,
             sinks: false,
@@ -395,6 +459,19 @@ mod tests {
         ]
     }
 
+    /// Qwen3-30B-A3B's layers as its fixture keeps them: four of plain
+    /// head-128 attention over 128 routed experts and no shared one.
+    fn qwen3_30b() -> Vec<(Mixer, Ffn)> {
+        (0..4)
+            .map(|_| {
+                (
+                    gqa_gated(32, 4, 128, 128, OutGate::None),
+                    moe(128, 8, 768, false),
+                )
+            })
+            .collect()
+    }
+
     fn key(hidden: u32, layers: &[(Mixer, Ffn)]) -> Result<Key, Refused> {
         Key::of(hidden, layers.iter().map(|(m, f)| (m, f)))
     }
@@ -433,6 +510,66 @@ mod tests {
         assert!(
             REGISTERED.contains(&HOST),
             "the host's instance is registered"
+        );
+        let features: Vec<_> = REGISTERED.iter().map(|i| i.host_feature).collect();
+        for (i, f) in features.iter().enumerate() {
+            assert!(
+                !features[..i].contains(f),
+                "{}: one build a host instance",
+                REGISTERED[i].name
+            );
+        }
+        let manifest = include_str!("../Cargo.toml");
+        for f in features.iter().flatten() {
+            assert!(
+                manifest.lines().any(|l| l.starts_with(&format!("{f} = "))),
+                "{f}: a feature of this crate"
+            );
+        }
+    }
+
+    #[test]
+    fn each_shape_selects_its_instance() {
+        assert_eq!(
+            key(2048, &qwen36()).and_then(of_key),
+            Ok(&QWEN35MOE_A3B),
+            "Qwen3.6's layers"
+        );
+        assert_eq!(
+            key(2048, &qwen3_30b()).and_then(of_key),
+            Ok(&QWEN3MOE_A3B),
+            "Qwen3-30B-A3B's layers"
+        );
+        assert_eq!(QWEN3MOE_A3B.key.delta, None, "no delta layer");
+        assert_eq!(
+            QWEN3MOE_A3B.delta_built(),
+            QWEN35MOE_A3B.delta_built(),
+            "an instance of no delta layer compiles the delta kernels at Qwen3.6's axes"
+        );
+        // A gated query on Qwen3-30B's attention, or its 30B layers with a
+        // gated shared expert: no instance.
+        let mut gated = qwen3_30b();
+        gated[2].0 = gqa_gated(32, 4, 128, 128, OutGate::Packed);
+        let got = key(2048, &gated);
+        assert_eq!(
+            got,
+            Err(Refused::Layers {
+                layer: 2,
+                what: "attention"
+            }),
+            "one gated layer among plain ones"
+        );
+        let all_gated: Vec<_> = qwen3_30b()
+            .into_iter()
+            .map(|(_, f)| (gqa_gated(32, 4, 128, 128, OutGate::Packed), f))
+            .collect();
+        let got = key(2048, &all_gated).and_then(of_key);
+        let Err(e @ Refused::NoInstance { .. }) = &got else {
+            panic!("a gated head-128 query: {got:?}");
+        };
+        assert!(
+            e.to_string().contains("a gated query; no delta layer"),
+            "{e}"
         );
     }
 
@@ -527,12 +664,25 @@ mod tests {
             .filter(|(m, _)| matches!(m, Mixer::Gqa(_)))
             .cloned()
             .collect();
+        let got = key(2048, &no_delta).and_then(of_key);
+        let Err(e @ Refused::NoInstance { key: refused }) = &got else {
+            panic!("Qwen3.6's attention with no delta layer: {got:?}");
+        };
+        assert!(
+            refused.delta.is_none()
+                && e.to_string()
+                    .contains("of 256 (value 256), rope 64, a gated query; no delta layer"),
+            "a file of no delta layer: {e}"
+        );
+        let delta_only: Vec<_> = layers
+            .iter()
+            .filter(|(m, _)| matches!(m, Mixer::DeltaRule(_)))
+            .cloned()
+            .collect();
         assert_eq!(
-            key(2048, &no_delta),
-            Err(Refused::Missing {
-                what: "gated delta net"
-            }),
-            "a file of no delta layer"
+            key(2048, &delta_only),
+            Err(Refused::Missing { what: "attention" }),
+            "a file of no attention layer"
         );
         let mut dense = layers.clone();
         dense[2].1 = Ffn::Dense {

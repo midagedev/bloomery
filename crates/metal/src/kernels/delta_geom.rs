@@ -1,7 +1,7 @@
 use crate::instance::HOST;
 
 /// Taps of the causal conv: the host instance's.
-pub const CONV_TAPS: usize = HOST.key.delta.conv_taps as usize;
+pub const CONV_TAPS: usize = HOST.delta_built().conv_taps as usize;
 
 /// Positions one step's position window may name.
 pub const PASS_ROWS: usize = 8;

@@ -26,7 +26,7 @@
 //! reads; that read adds no operation. The magnitude is multiplied by
 //! `1 + U`, as the mat-vec oracle multiplies its own.
 //!
-//! **Ids.** The f64 ranking sorts the 256 expert logits descending and breaks
+//! **Ids.** The f64 ranking sorts the [`EXPERTS`] expert logits descending and breaks
 //! a tie toward the smaller id. The 8th-vs-9th margin is wider than the band
 //! when it exceeds the sum of those two rows' logit widths: no value inside
 //! its band can cross the cut. An internal adjacent margin inside its two
@@ -34,8 +34,8 @@
 //! every adjacent margin of the top nine is wider than its band.
 //!
 //! **Weights.** `w_i = exp(l_i - l_max) / sum_j exp(l_j - l_max)` over the
-//! selected logits, and the shared expert is
-//! `sigmoid(l_256) = 1 / (1 + exp(-l_256))`. A logit movement of at most
+//! selected logits, and a gated router's shared expert is
+//! `sigmoid(l_s) = 1 / (1 + exp(-l_s))`, `l_s` its row's logit. A logit movement of at most
 //! `delta` (the widest selected width) moves a weight by at most
 //! `0.5 * delta`, because `2 w (1 - w) <= 1/2`. The evaluation of that
 //! formula, given the logits: the subtraction is a relative `U`, `exp` is at
@@ -50,7 +50,7 @@
 //! derived in [`shared_band`], and is 1 when that expression is not a finite
 //! bound.
 
-use bloomery_metal::kernels::router::{EXPERTS, K, ROWS, TOP_K_MAX};
+use bloomery_metal::kernels::router::{EXPERTS, K, ROWS, SHARED, TOP_K_MAX};
 
 use super::oracle::{self, RSQRT_ULP, U};
 
@@ -79,7 +79,7 @@ const _: () = assert!(N_DOT == 97);
 const _: () = assert!(N_S == 46);
 const _: () = assert!(N_ARG == 48);
 const _: () = assert!(K == 2048);
-const _: () = assert!(ROWS == EXPERTS + 1);
+const _: () = assert!(ROWS == EXPERTS + SHARED);
 const _: () = assert!(TOP_K_MAX == 8);
 
 /// The relative factor of a logit and the operations that set its floor.
@@ -111,13 +111,14 @@ pub fn logit_width(band: Band, magnitude: f64) -> f64 {
 
 /// One router input, evaluated in f64: the logits and each row's width.
 pub struct Step {
-    /// The f64 logits, the shared expert last.
+    /// The f64 logits, the shared expert's last when the router has its row.
     pub logits: Vec<f64>,
     /// The absolute width of each logit.
     pub width: Vec<f64>,
 }
 
-/// `routed` is [`EXPERTS`] rows of [`K`], `shared` is [`K`], both f32.
+/// `routed` is [`EXPERTS`] rows of [`K`], `shared` is [`K`] when the router
+/// has the shared row and empty otherwise, both f32.
 pub fn step(
     name: &str,
     routed: &[f32],
@@ -126,7 +127,8 @@ pub fn step(
     gain: &[f32],
     eps: f32,
 ) -> Result<Step, String> {
-    if routed.len() != EXPERTS * K || shared.len() != K || x.len() != K || gain.len() != K {
+    if routed.len() != EXPERTS * K || shared.len() != SHARED * K || x.len() != K || gain.len() != K
+    {
         return Err(format!(
             "{name}: the oracle was given {} routed values, {} shared, x {}, gain {}",
             routed.len(),
@@ -144,9 +146,11 @@ pub fn step(
         logits.push(dot);
         width.push(logit_width(band, magnitude));
     }
-    let (dot, magnitude) = dot_row(shared, &xhat);
-    logits.push(dot);
-    width.push(logit_width(band, magnitude));
+    if SHARED == 1 {
+        let (dot, magnitude) = dot_row(shared, &xhat);
+        logits.push(dot);
+        width.push(logit_width(band, magnitude));
+    }
     Ok(Step { logits, width })
 }
 
@@ -231,9 +235,10 @@ pub fn rank(step: &Step) -> Ranking {
     }
 }
 
-/// The f64 weights of `ids` and the absolute band of each, shared expert last.
+/// The f64 weights of `ids` and the absolute band of each, the shared
+/// expert's last when the router has its row.
 pub struct WeightOracle {
-    /// The routed weights and then the shared expert's sigmoid.
+    /// The routed weights and then any shared expert's sigmoid.
     pub want: Vec<f64>,
     /// The absolute band of each.
     pub band: Vec<f64>,
@@ -269,8 +274,10 @@ pub fn weights(step: &Step, ids: &[usize]) -> Result<WeightOracle, String> {
     }
     let mut want: Vec<f64> = term.into_iter().map(|e| e / sum).collect();
     let mut band = vec![abs; k];
-    want.push(oracle::sigmoid(step.logits[EXPERTS]));
-    band.push(shared_band(step.logits[EXPERTS], step.width[EXPERTS]));
+    if SHARED == 1 {
+        want.push(oracle::sigmoid(step.logits[EXPERTS]));
+        band.push(shared_band(step.logits[EXPERTS], step.width[EXPERTS]));
+    }
     Ok(WeightOracle { want, band })
 }
 
@@ -311,12 +318,12 @@ fn shared_band(l: f64, delta: f64) -> f64 {
 }
 
 /// The host's selection from the kernel's own f32 logits: ascending scan,
-/// strict `>`, so a tie keeps the smaller id. The shared id is [`EXPERTS`]
-/// and is not ranked.
+/// strict `>`, so a tie keeps the smaller id. A gated router's shared id is
+/// [`EXPERTS`], last, and is not ranked.
 #[must_use]
 pub fn select_f32(logits: &[f32], top_k: usize) -> Vec<u32> {
     let mut taken = [false; EXPERTS];
-    let mut ids = Vec::with_capacity(top_k + 1);
+    let mut ids = Vec::with_capacity(top_k + SHARED);
     for _ in 0..top_k {
         let mut any = false;
         let mut best_v = 0.0f32;
@@ -336,6 +343,8 @@ pub fn select_f32(logits: &[f32], top_k: usize) -> Vec<u32> {
         taken[best_i as usize] = true;
         ids.push(best_i);
     }
-    ids.push(u32::try_from(EXPERTS).unwrap_or(0));
+    if SHARED == 1 {
+        ids.push(u32::try_from(EXPERTS).unwrap_or(0));
+    }
     ids
 }

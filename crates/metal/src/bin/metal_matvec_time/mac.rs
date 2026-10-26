@@ -141,10 +141,13 @@ const ROUTER_TAIL_US: (f64, f64) = (11.0, 123.0);
 /// microsecond fields.
 const HEAD_TAIL_US: (f64, f64) = (62.0, 683.0);
 
-const _: () = assert!(router::ROWS == 257 && router::K == 2048);
-const _: () = assert!(router::TOP_K_MAX == 8);
-const _: () = assert!(HEAD_K == 2048);
-const _: () = assert!(ROUTER_BYTES == 2_105_344 && ROUTER_BYTES.is_multiple_of(256));
+/// Whether this build's geometry is the one the predictions above were derived at: Qwen3.6's
+/// router (257 rows of K 2048, top-8) and head K 2048. A build of another host refuses at `main`.
+const PREDICTED_GEOMETRY: bool =
+    router::ROWS == 257 && router::K == 2048 && router::TOP_K_MAX == 8 && HEAD_K == 2048;
+
+const _: () =
+    assert!(!PREDICTED_GEOMETRY || (ROUTER_BYTES == 2_105_344 && ROUTER_BYTES.is_multiple_of(256)));
 const _: () = assert!(HEAD_ROWS.is_multiple_of(HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP));
 
 /// How one kernel is launched into a timed command buffer.
@@ -879,8 +882,8 @@ fn time_pair(
                         up: up_w
                             .window(Elems((n % stack_copies) * stack_stride), Elems(stack))
                             .map_err(why)?,
-                        shared_gate: shg_w.window(Elems(sg), Elems(one_expert)).map_err(why)?,
-                        shared_up: shu_w.window(Elems(sg), Elems(one_expert)).map_err(why)?,
+                        shared_gate: Some(shg_w.window(Elems(sg), Elems(one_expert)).map_err(why)?),
+                        shared_up: Some(shu_w.window(Elems(sg), Elems(one_expert)).map_err(why)?),
                         x: x.window(Elems(0), Elems(cols)).map_err(why)?,
                         gain: gain.window(Elems(0), Elems(cols)).map_err(why)?,
                         eps: 1e-6,
@@ -1134,8 +1137,14 @@ fn time_router(
                         routed: weights
                             .window(Elems(base), Elems(router::EXPERTS * router::K))
                             .map_err(why)?,
-                        shared: weights
-                            .window(Elems(base + router::EXPERTS * router::K), Elems(router::K))
+                        shared: (router::SHARED == 1)
+                            .then(|| {
+                                weights.window(
+                                    Elems(base + router::EXPERTS * router::K),
+                                    Elems(router::K),
+                                )
+                            })
+                            .transpose()
                             .map_err(why)?,
                         x: x.window(Elems(0), Elems(router::K)).map_err(why)?,
                         gain: gain.window(Elems(0), Elems(router::K)).map_err(why)?,
@@ -1608,6 +1617,14 @@ fn time_arms(
 }
 
 pub fn main() -> ExitCode {
+    if !PREDICTED_GEOMETRY {
+        eprintln!(
+            "metal_matvec_time: refused: its byte predictions are Qwen3.6's, and this build's host \
+             instance is {}",
+            HOST.name
+        );
+        return ExitCode::from(78);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         help();

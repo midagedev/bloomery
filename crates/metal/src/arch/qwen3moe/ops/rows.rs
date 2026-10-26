@@ -17,7 +17,7 @@ use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, Elems};
 use chain::ChainError;
 
-use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
+use super::super::arena::{Arena, FfnBufs, MixerBufs, SharedBufs, lane_of, layer_word, slot_of};
 use super::super::rows::MIX_STRIDE;
 use super::super::session::SessionError;
 use super::{MetalOps, WHAT, all, all_mut};
@@ -465,7 +465,7 @@ impl MetalOps<'_, '_> {
                 rows: 1,
                 cols: *hidden,
                 acts: m,
-                weights: all(&f.gate_inp_shexp)?,
+                weights: all(&shared_of(f, l)?.gate_inp)?,
                 x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
                 x_stride: *hidden,
                 y: rows
@@ -541,8 +541,8 @@ impl MetalOps<'_, '_> {
                 experts: *n_experts,
                 stack: all(&f.gate)?,
                 stack_up: Some(all(&f.up)?),
-                shared: all(&f.shexp_gate)?,
-                shared_up: Some(all(&f.shexp_up)?),
+                shared: all(&shared_of(f, l)?.gate)?,
+                shared_up: Some(all(&shared_of(f, l)?.up)?),
                 x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
                 x_rows: m,
                 x_stride: *hidden,
@@ -570,7 +570,7 @@ impl MetalOps<'_, '_> {
                 experts: *n_experts,
                 stack: all(&f.down)?,
                 stack_up: None,
-                shared: all(&f.shexp_down)?,
+                shared: all(&shared_of(f, l)?.down)?,
                 shared_up: None,
                 x: rows.h.window(Elems(0), Elems(slots * EXPERT_K))?,
                 x_rows: slots,
@@ -651,15 +651,30 @@ impl MetalOps<'_, '_> {
     }
 }
 
+/// Layer `l`'s shared expert, whose rows the rows arm runs with the picks':
+/// a layer whose router runs none takes its prompt a step each
+/// (`PrefillMode::Steps`).
+fn shared_of(f: &FfnBufs, l: usize) -> Result<&SharedBufs, SessionError> {
+    f.shared.as_ref().ok_or_else(|| {
+        ChainError::shape(
+            WHAT,
+            format!(
+                "layer {l}: the rows arm runs a shared expert's rows, and this router has none"
+            ),
+        )
+        .into()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernels::router;
 
-    /// The logit rows hold the routed experts and the shared gate, at a stride
-    /// the GEMM's output rows are aligned to.
+    /// The logit rows hold the routed experts and any shared gate, at a
+    /// stride the GEMM's output rows are aligned to.
     const _: () = assert!(
-        router::EXPERTS + 1 == router::ROWS
+        router::EXPERTS + router::SHARED == router::ROWS
             && LOGIT_STRIDE >= router::ROWS
             && LOGIT_STRIDE.is_multiple_of(4)
     );

@@ -1,5 +1,7 @@
 //! The routed pair and the folded down. The pair norms its input as it loads
-//! it, with a synthetic gain and the fixture's epsilon.
+//! it, with a synthetic gain and the fixture's epsilon. The slots are the
+//! host instance's: its routed picks, then the shared expert's when it has
+//! one.
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
@@ -23,7 +25,50 @@ const N_EXPERTS: usize = 4;
 const PAIR_COLS: usize = 2048;
 pub const FOLD_ROWS: usize = 2048;
 const IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 1, 2, 3, 0];
-const ROUTE: [f32; EXPERT_SLOTS] = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8];
+/// The host instance's experts run a shared expert's slot after the picks.
+const HAS_SHARED: bool = SHARED_SLOT < EXPERT_SLOTS;
+const ROUTE_ALL: [f32; 9] = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8];
+const ROUTE: [f32; EXPERT_SLOTS] = {
+    let mut route = [0f32; EXPERT_SLOTS];
+    let mut s = 0;
+    while s < EXPERT_SLOTS {
+        route[s] = ROUTE_ALL[s];
+        s += 1;
+    }
+    route
+};
+/// The fixture's Q6_K down stack and its shared expert's: the first layer
+/// the fixture keeps at Q6_K.
+fn q6_down(fix: &Fixture) -> Result<[String; 2], String> {
+    let l = fix.first_layer_of("ffn_down_exps.weight", GgmlType::Q6_K)?;
+    Ok([
+        format!("blk.{l}.ffn_down_exps.weight"),
+        format!("blk.{l}.ffn_down_shexp.weight"),
+    ])
+}
+
+/// The shared expert's bytes when the host instance's experts have its slot,
+/// and none otherwise.
+fn if_shared(read: impl FnOnce() -> Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+    if HAS_SHARED { read() } else { Ok(Vec::new()) }
+}
+
+/// The fold's shared plan: the window when the host instance's experts have
+/// a shared slot, [`SharedPlan::None`] otherwise.
+fn shared_plan(
+    window: bloomery_device::Window<'_, u8, bloomery_metal::MetalDevice>,
+) -> SharedPlan<'_> {
+    if HAS_SHARED {
+        SharedPlan::Same(window)
+    } else {
+        SharedPlan::None
+    }
+}
+
+/// A count a refusal names, as the text it is named by.
+fn named(count: usize) -> &'static str {
+    count.to_string().leak()
+}
 
 /// The norm a pair launch applies to its input.
 pub struct PairNorm {
@@ -126,33 +171,24 @@ pub fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> 
                 0,
                 N_EXPERTS,
             )?,
-            shared_gate: plane(fix, "blk.0.ffn_gate_shexp.weight", ty, PAIR_COLS, EXPERT_K)?,
-            shared_up: plane(fix, "blk.0.ffn_up_shexp.weight", ty, PAIR_COLS, EXPERT_K)?,
+            shared_gate: if_shared(|| {
+                plane(fix, "blk.0.ffn_gate_shexp.weight", ty, PAIR_COLS, EXPERT_K)
+            })?,
+            shared_up: if_shared(|| {
+                plane(fix, "blk.0.ffn_up_shexp.weight", ty, PAIR_COLS, EXPERT_K)
+            })?,
         },
-        Quant::Q6K => PairWeights {
-            gate: stack(
-                fix,
-                "blk.2.ffn_down_exps.weight",
-                ty,
-                EXPERT_K,
-                PAIR_COLS,
-                0,
-                N_EXPERTS,
-            )?,
-            up: stack(
-                fix,
-                "blk.2.ffn_down_exps.weight",
-                ty,
-                EXPERT_K,
-                PAIR_COLS,
-                8,
-                N_EXPERTS,
-            )?,
-            shared_gate: plane(fix, "blk.2.ffn_down_shexp.weight", ty, EXPERT_K, PAIR_COLS)?,
-            shared_up: fix
-                .expert("blk.2.ffn_down_exps.weight", ty, EXPERT_K, PAIR_COLS, 16)?
-                .to_vec(),
-        },
+        Quant::Q6K => {
+            let [down, shared] = q6_down(fix)?;
+            PairWeights {
+                gate: stack(fix, &down, ty, EXPERT_K, PAIR_COLS, 0, N_EXPERTS)?,
+                up: stack(fix, &down, ty, EXPERT_K, PAIR_COLS, 8, N_EXPERTS)?,
+                shared_gate: if_shared(|| plane(fix, &shared, ty, EXPERT_K, PAIR_COLS))?,
+                shared_up: if_shared(|| {
+                    Ok(fix.expert(&down, ty, EXPERT_K, PAIR_COLS, 16)?.to_vec())
+                })?,
+            }
+        }
         Quant::A4 => PairWeights {
             gate: stack(
                 fix,
@@ -172,21 +208,28 @@ pub fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> 
                 0,
                 N_EXPERTS,
             )?,
-            shared_gate: plane(fix, "blk.0.ffn_gate_shexp.weight", ty, PAIR_COLS, EXPERT_K)?,
-            shared_up: plane(fix, "blk.0.ffn_up_shexp.weight", ty, PAIR_COLS, EXPERT_K)?,
+            shared_gate: if_shared(|| {
+                plane(fix, "blk.0.ffn_gate_shexp.weight", ty, PAIR_COLS, EXPERT_K)
+            })?,
+            shared_up: if_shared(|| {
+                plane(fix, "blk.0.ffn_up_shexp.weight", ty, PAIR_COLS, EXPERT_K)
+            })?,
         },
     };
     let one = weights.gate.len() / N_EXPERTS;
+    let shared_len = if HAS_SHARED { one } else { 0 };
     if weights.up.len() != weights.gate.len()
-        || weights.shared_gate.len() != one
-        || weights.shared_up.len() != one
+        || weights.shared_gate.len() != shared_len
+        || weights.shared_up.len() != shared_len
     {
         return Err(format!(
             "{} pair weights are not expert-sized",
             quant.name()
         ));
     }
-    if weights.shared_gate == weights.gate[..one] || weights.shared_up == weights.up[..one] {
+    if HAS_SHARED
+        && (weights.shared_gate == weights.gate[..one] || weights.shared_up == weights.up[..one])
+    {
         return Err(format!(
             "{} shared expert matches expert 0, so the slot select cannot be seen",
             quant.name()
@@ -208,8 +251,16 @@ pub fn synthetic_pair(quant: Quant, seed: u64) -> PairWeights {
     PairWeights {
         gate: synthetic::matrix(quant, stack, PAIR_COLS, seed),
         up: synthetic::matrix(quant, stack, PAIR_COLS, seed + 1),
-        shared_gate: synthetic::matrix(quant, EXPERT_K, PAIR_COLS, seed + 2),
-        shared_up: synthetic::matrix(quant, EXPERT_K, PAIR_COLS, seed + 3),
+        shared_gate: if HAS_SHARED {
+            synthetic::matrix(quant, EXPERT_K, PAIR_COLS, seed + 2)
+        } else {
+            Vec::new()
+        },
+        shared_up: if HAS_SHARED {
+            synthetic::matrix(quant, EXPERT_K, PAIR_COLS, seed + 3)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -218,7 +269,11 @@ pub fn synthetic_pair(quant: Quant, seed: u64) -> PairWeights {
 pub fn synthetic_fold(quant: Quant, rows: usize, seed: u64) -> FoldWeights {
     FoldWeights {
         down: synthetic::matrix(quant, N_EXPERTS * rows, EXPERT_K, seed),
-        shared: synthetic::matrix(quant, rows, EXPERT_K, seed + 1),
+        shared: if HAS_SHARED {
+            synthetic::matrix(quant, rows, EXPERT_K, seed + 1)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -232,29 +287,31 @@ fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
 /// the count's own stride, the stride the kernel's row offsets read.
 pub fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
     let ty = quant.ggml();
-    let (name, shared) = match quant {
+    let [name, shared] = match quant {
         Quant::Q8_0 | Quant::Q5K => {
             return Err(format!("the fixture has no {} experts", quant.name()));
         }
-        Quant::Q4K => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
-        Quant::Q6K => ("blk.2.ffn_down_exps.weight", "blk.2.ffn_down_shexp.weight"),
-        Quant::A4 => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
+        Quant::Q4K | Quant::A4 => [
+            "blk.0.ffn_down_exps.weight".to_owned(),
+            "blk.0.ffn_down_shexp.weight".to_owned(),
+        ],
+        Quant::Q6K => q6_down(fix)?,
     };
     let rb = row_bytes(quant, EXPERT_K);
     let mut down = Vec::with_capacity(N_EXPERTS * rows * rb);
     for expert in 0..N_EXPERTS {
-        let whole = fix.expert(name, ty, EXPERT_K, FOLD_ROWS, expert)?;
+        let whole = fix.expert(&name, ty, EXPERT_K, FOLD_ROWS, expert)?;
         down.extend_from_slice(&whole[..rows * rb]);
     }
     let weights = FoldWeights {
         down,
-        shared: fix.rows(shared, ty, EXPERT_K, rows)?.to_vec(),
+        shared: if_shared(|| Ok(fix.rows(&shared, ty, EXPERT_K, rows)?.to_vec()))?,
     };
     let one = weights.down.len() / N_EXPERTS;
-    if weights.shared.len() != one {
+    if weights.shared.len() != if HAS_SHARED { one } else { 0 } {
         return Err(format!("{} shared down is not one expert", quant.name()));
     }
-    if weights.shared == weights.down[..one] {
+    if HAS_SHARED && weights.shared == weights.down[..one] {
         return Err(format!(
             "{} shared down matches expert 0, so the slot select cannot be seen",
             quant.name()
@@ -332,9 +389,12 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
                 ids: ids.window(Elems(VALUE_PAD), Elems(launch.ids.len()))?,
                 gate: gate.window(Elems(WEIGHT_PAD), Elems(launch.gate.len()))?,
                 up: up.window(Elems(WEIGHT_PAD), Elems(launch.up.len()))?,
-                shared_gate: shared_gate
-                    .window(Elems(WEIGHT_PAD), Elems(launch.shared_gate.len()))?,
-                shared_up: shared_up.window(Elems(WEIGHT_PAD), Elems(launch.shared_up.len()))?,
+                shared_gate: HAS_SHARED
+                    .then(|| shared_gate.window(Elems(WEIGHT_PAD), Elems(launch.shared_gate.len())))
+                    .transpose()?,
+                shared_up: HAS_SHARED
+                    .then(|| shared_up.window(Elems(WEIGHT_PAD), Elems(launch.shared_up.len())))
+                    .transpose()?,
                 x: x.window(Elems(VALUE_PAD), Elems(launch.x.len()))?,
                 gain: gain.window(Elems(VALUE_PAD), Elems(launch.norm.gain.len()))?,
                 eps: launch.norm.eps,
@@ -388,7 +448,7 @@ pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, Stri
             encoder,
             FoldParams {
                 quant,
-                shared: SharedPlan::Same(shared),
+                shared: shared_plan(shared),
                 rows,
                 slots: EXPERT_SLOTS,
                 k: EXPERT_K,
@@ -651,14 +711,14 @@ pub fn pair_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     }
     h.clear_fault()?;
     Ok(Verdict::Noted(
-        "a NaN input, an infinite input and a zero input with a zero epsilon raised norm_quant only, NaN in all nine slots' rows, both quants".to_string(),
+        "a NaN input, an infinite input and a zero input with a zero epsilon raised norm_quant only, NaN in every slot's rows, both quants".to_string(),
     ))
 }
 
 /// An id past the stack writes NaN in that slot only and raises
 /// [`FaultSite::ExpertId`], the other slots the clean launch's bits; the
 /// norm's fault inputs (a NaN input, an infinite one, a zero input with a
-/// zero epsilon) raise [`FaultSite::NormQuant`] with NaN in all nine slots'
+/// zero epsilon) raise [`FaultSite::NormQuant`] with NaN in every slot's
 /// rows. One quant's pair over `weights`.
 pub fn pair_faults(
     h: &Harness<'_>,
@@ -729,7 +789,7 @@ pub fn pair_faults(
         }
     }
 
-    // The norm's fault inputs: NaN rows in all nine slots' rows.
+    // The norm's fault inputs: NaN rows in every slot's rows.
     for (what, mut x, eps) in [
         (
             "a NaN input",
@@ -843,7 +903,10 @@ pub fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result
         return Err(format!("{} pair raised {f}", quant.name()));
     }
     let one = weights.gate.len() / N_EXPERTS;
-    for slot in [0usize, 1, SHARED_SLOT] {
+    for slot in [0usize, 1, SHARED_SLOT]
+        .into_iter()
+        .filter(|&s| s < EXPERT_SLOTS)
+    {
         let (gate, up, shared_gate, shared_up) = if slot == SHARED_SLOT {
             (
                 weights.shared_gate.as_slice(),
@@ -871,9 +934,13 @@ pub fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result
 pub fn pair_shared(h: &Harness<'_>, fix: &Fixture) -> Clause {
     check_pair_shared(h, fix, Quant::Q4K)?;
     check_pair_shared(h, fix, Quant::Q6K)?;
-    Ok(Verdict::Noted(
-        "slots 0, 1 and 8 bit-equal to a solo launch of the same rows, both quants".to_string(),
-    ))
+    Ok(Verdict::Noted(if HAS_SHARED {
+        "slots 0, 1 and the shared 8 bit-equal to a solo launch of the same rows, both quants"
+            .to_string()
+    } else {
+        "slots 0 and 1 bit-equal to a solo launch of the same rows, both quants; no shared slot"
+            .to_string()
+    }))
 }
 
 pub fn hidden_states(quant: Quant) -> Vec<f32> {
@@ -1087,8 +1154,12 @@ fn refuse_pair(
             ids: b.ids.window(Elems(0), Elems(a.id_len))?,
             gate: b.bytes.window(Elems(0), Elems(a.gate_len))?,
             up: b.bytes.window(Elems(0), Elems(a.gate_len))?,
-            shared_gate: b.bytes.window(Elems(0), Elems(a.gate_len))?,
-            shared_up: b.bytes.window(Elems(0), Elems(a.gate_len))?,
+            shared_gate: HAS_SHARED
+                .then(|| b.bytes.window(Elems(0), Elems(a.gate_len)))
+                .transpose()?,
+            shared_up: HAS_SHARED
+                .then(|| b.bytes.window(Elems(0), Elems(a.gate_len)))
+                .transpose()?,
             x: b.values.window(Elems(0), Elems(a.x))?,
             gain: b.values.window(Elems(0), Elems(a.x))?,
             eps: 1e-6,
@@ -1141,7 +1212,7 @@ fn refuse_fold(
         encoder,
         FoldParams {
             quant: Quant::Q4K,
-            shared: SharedPlan::Same(b.bytes.window(Elems(0), Elems(a.down_len))?),
+            shared: shared_plan(b.bytes.window(Elems(0), Elems(a.down_len))?),
             rows: a.rows,
             slots: a.slots,
             k: a.k,
@@ -1195,14 +1266,14 @@ pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
     let pair_cases = vec![
         bad_pair(
             "a pair of 3 slots",
-            "9",
+            named(EXPERT_SLOTS),
             "",
             "window",
             Box::new(|a| a.slots = 3),
         ),
         bad_pair(
             "a pair of width 256",
-            "512",
+            named(EXPERT_K),
             "",
             "window",
             Box::new(|a| a.k = 256),
@@ -1250,14 +1321,14 @@ pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
     let fold_cases = vec![
         bad_fold(
             "a fold of 3 slots",
-            "9",
+            named(EXPERT_SLOTS),
             "",
             "window",
             Box::new(|a| a.slots = 3),
         ),
         bad_fold(
             "a fold of width 256",
-            "512",
+            named(EXPERT_K),
             "",
             "window",
             Box::new(|a| a.k = 256),
@@ -1290,7 +1361,7 @@ pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
                             encoder,
                             FoldParams {
                                 quant: Quant::Q4K,
-                                shared: SharedPlan::Same(b.bytes.window(Elems(0), Elems(16))?),
+                                shared: shared_plan(b.bytes.window(Elems(0), Elems(16))?),
                                 rows: FOLD_ROWS,
                                 slots: EXPERT_SLOTS,
                                 k: EXPERT_K,
@@ -1409,7 +1480,7 @@ pub fn fold_type(h: &Harness<'_>, fix: &Fixture) -> Clause {
             encoder,
             FoldParams {
                 quant: Quant::Q4K,
-                shared: SharedPlan::Same(b.down.window(Elems(0), Elems(down_len))?),
+                shared: shared_plan(b.down.window(Elems(0), Elems(down_len))?),
                 rows: 4,
                 slots: EXPERT_SLOTS,
                 k: EXPERT_K,

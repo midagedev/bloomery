@@ -585,8 +585,9 @@ pub struct Session {
     /// nothing.
     clock: Option<StepClock>,
     /// Each delta layer's state lane and conv ring, at the positions a
-    /// prompt call takes.
-    checkpoints: Checkpoints,
+    /// prompt call takes; none for a file of no recurrent store, whose
+    /// caches hold every position below the one it stands at.
+    checkpoints: Option<Checkpoints>,
     /// The device the mark copies are opened on, by the first pass that
     /// takes one when the open did not make them.
     device: Handle<dyn MTLDevice>,
@@ -748,7 +749,12 @@ impl Session {
         let load = started.elapsed();
         let started = Instant::now();
         let mut rows = RowsArena::open(alloc, &arena, pass_rows_max().min(arena.ctx))?;
-        if copies == MarkCopies::AtOpen {
+        // A file of no recurrent store has nothing a mark copies.
+        let stores = arena
+            .layers
+            .iter()
+            .any(|l| matches!(l.mixer, MixerBufs::Delta(_)));
+        if copies == MarkCopies::AtOpen && stores {
             rows.snaps = Some(SnapBufs::open(alloc, &arena)?);
         }
         let rows_t = started.elapsed();
@@ -764,13 +770,24 @@ impl Session {
             ))
         })?;
         let lens = store_lens(&arena)?;
-        let checkpoints = Checkpoints::open(
-            device.handle().clone(),
-            lens,
-            u64::from(ctx_positions),
-            every,
-        )
-        .map_err(checkpoint_error)?;
+        let checkpoints = (!lens.is_empty())
+            .then(|| {
+                Checkpoints::open(
+                    device.handle().clone(),
+                    lens,
+                    u64::from(ctx_positions),
+                    every,
+                )
+            })
+            .transpose()
+            .map_err(checkpoint_error)?;
+        // The rows arm runs each layer's shared expert with the picks; a file
+        // whose routers run none takes its prompt a step each.
+        let prefill = if arena.layers.iter().all(|l| l.ffn.shared.is_some()) {
+            PrefillMode::Batch
+        } else {
+            PrefillMode::Steps
+        };
         let layers = arena.token_layers();
         Ok(Session {
             stream,
@@ -786,7 +803,7 @@ impl Session {
             checkpoints,
             device: device.handle().clone(),
             rows,
-            prefill: PrefillMode::Batch,
+            prefill,
             open_split: OpenSplit {
                 load,
                 rows: rows_t,
@@ -1447,7 +1464,9 @@ impl Session {
         }
         self.pos = 0;
         self.poisoned = None;
-        self.checkpoints.clear();
+        if let Some(c) = self.checkpoints.as_mut() {
+            c.clear();
+        }
         self.drop_copies();
         Ok(())
     }
@@ -1462,50 +1481,65 @@ impl Session {
     /// The ledger's counts.
     #[must_use]
     pub fn checkpoint_stats(&self) -> seqstate::Stats {
-        self.checkpoints.stats()
+        self.checkpoints
+            .as_ref()
+            .map_or_else(seqstate::Stats::default, Checkpoints::stats)
     }
 
     /// The checkpoints' positions, ascending.
     #[must_use]
     pub fn checkpoint_positions(&self) -> Vec<u32> {
-        self.checkpoints.positions()
+        self.checkpoints
+            .as_ref()
+            .map_or_else(Vec::new, Checkpoints::positions)
     }
 
-    /// The bytes one checkpoint copies.
+    /// The bytes one checkpoint copies: none with no recurrent store.
     #[must_use]
     pub fn checkpoint_bytes(&self) -> u64 {
-        self.checkpoints.point_bytes()
+        self.checkpoints
+            .as_ref()
+            .map_or(0, Checkpoints::point_bytes)
     }
 
     /// The checkpoints the budget holds.
     #[must_use]
     pub fn checkpoint_capacity(&self) -> usize {
-        self.checkpoints.capacity()
+        self.checkpoints.as_ref().map_or(0, Checkpoints::capacity)
     }
 
-    /// The spacing of a prompt call's inner checkpoints.
+    /// The spacing of a prompt call's inner checkpoints; none with no
+    /// recurrent store.
     #[must_use]
-    pub fn checkpoint_every(&self) -> u32 {
-        self.checkpoints.every()
+    pub fn checkpoint_every(&self) -> Option<u32> {
+        self.checkpoints.as_ref().map(Checkpoints::every)
     }
 
-    /// The positions a prompt call from `from` to `to` takes a checkpoint at.
+    /// The positions a prompt call from `from` to `to` takes a checkpoint at:
+    /// none with no recurrent store.
     #[must_use]
     pub fn checkpoint_marks(&self, from: u32, to: u32) -> Vec<u32> {
-        self.checkpoints.marks(from, to)
+        self.checkpoints
+            .as_ref()
+            .map_or_else(Vec::new, |c| c.marks(from, to))
     }
 
     /// What a cut to at most `n` keeps of the position the session stands at.
+    /// With no recurrent store a cut keeps any position up to it.
     #[must_use]
     pub fn kept(&self, n: u32) -> Kept {
-        self.checkpoints.kept(n, self.pos)
+        match &self.checkpoints {
+            Some(c) => c.kept(n, self.pos),
+            None => Kept::rule(n, self.pos, n.min(self.pos)),
+        }
     }
 
     /// A checkpoint at the position, the stream idle: the token ahead is
     /// waited out and dropped first, then each delta layer's state lane at
     /// the position's parity and its ring are copied once, from the shared
-    /// pages straight into the point's slot. Refused while the session is
-    /// poisoned.
+    /// pages straight into the point's slot. A file of no recurrent store
+    /// has nothing to copy: its caches hold the position. Refused while the
+    /// session is poisoned.
     pub fn checkpoint(&mut self) -> Result<(), SessionError> {
         self.take_point(self.pos, None)
     }
@@ -1590,7 +1624,11 @@ impl Session {
                     .ok_or_else(|| refuse("a delta conv ring lies past its buffer"))?,
             );
         }
-        self.checkpoints.take(at, &views).map_err(checkpoint_error)
+        match self.checkpoints.as_mut() {
+            Some(c) => c.take(at, &views).map_err(checkpoint_error),
+            // No recurrent store: the caches hold the position as they are.
+            None => Ok(()),
+        }
     }
 
     /// Cut to position `n`. A cut to 0 resets, which drops the checkpoints. A
@@ -1632,7 +1670,19 @@ impl Session {
                 at: Elems(0),
             });
         }
-        match self.checkpoints.cut(n, self.pos, &mut dst) {
+        let cut = match self.checkpoints.as_mut() {
+            Some(c) => c.cut(n, self.pos, &mut dst),
+            // No recurrent store: the caches hold every position below `n`,
+            // and the next step's append overwrites the rows past it.
+            None if n < self.pos => Ok(()),
+            None => {
+                return Err(refuse(format!(
+                    "a cut to {n}, past the position {}",
+                    self.pos
+                )));
+            }
+        };
+        match cut {
             Ok(()) => {}
             // A copy that stopped midway leaves some layers at `n` and the
             // rest where they were: reset, so no step runs on mixed state.
@@ -1673,8 +1723,8 @@ fn lane_len() -> Result<usize, SessionError> {
     state_elems(1).ok_or_else(|| refuse("a delta state lane's length overflowed"))
 }
 
-/// Each delta layer's state lane, then its conv ring. The state buffer is
-/// both lanes; a checkpoint copies one.
+/// Each delta layer's state lane, then its conv ring: none for a file of no
+/// delta layer. The state buffer is both lanes; a checkpoint copies one.
 fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
     let lane_len = lane_len()?;
     let both = lane_len
@@ -1697,9 +1747,6 @@ fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
         }
         lens.push(lane_len);
         lens.push(ring_len);
-    }
-    if lens.is_empty() {
-        return Err(refuse("a checkpoint copies no delta layer"));
     }
     Ok(lens)
 }

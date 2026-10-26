@@ -328,7 +328,7 @@ struct Rule {
 }
 
 fn rule(ids: &[u32]) -> Rule {
-    let groups = EXPERTS + 1;
+    let groups = EXPERTS + router::SHARED;
     let mut count = vec![0usize; groups];
     for &id in ids {
         count[id as usize] += 1;

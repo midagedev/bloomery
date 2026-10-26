@@ -4,7 +4,9 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
-use bloomery_metal::kernels::router::{EXPERTS, K, PARTIALS, ROWS, RouterParams, TOP_K_MAX};
+use bloomery_metal::kernels::router::{
+    EXPERTS, K, PARTIALS, ROWS, RouterParams, SHARED, TOP_K_MAX,
+};
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
@@ -16,10 +18,28 @@ use super::{Harness, SENTINEL_BITS};
 
 /// The routed count the numeric clauses select.
 const TOP_K: usize = TOP_K_MAX;
+/// The ids and weights a launch writes: the routed picks, then the shared
+/// expert's when the router has its row.
+const IDS: usize = TOP_K + SHARED;
+/// Words past the ids and the weights a launch must leave as they were.
+const ID_GUARD: usize = 4;
 
 const ROUTED_TENSOR: &str = "blk.0.ffn_gate_inp.weight";
 const SHARED_TENSOR: &str = "blk.0.ffn_gate_inp_shexp.weight";
-pub(super) const GAIN_TENSOR: &str = "blk.0.post_attention_norm.weight";
+/// The pre-FFN norm's gain under the names the families give it.
+const GAIN_TENSORS: [&str; 2] = ["blk.0.post_attention_norm.weight", "blk.0.ffn_norm.weight"];
+
+/// Layer 0's pre-FFN norm gain, whichever of its names the fixture holds.
+pub(super) fn gain(fixture: &Fixture) -> Result<Vec<f32>, String> {
+    let file = Gguf::open(&fixture.path).map_err(|e| format!("the fixture did not reopen: {e}"))?;
+    match GAIN_TENSORS.map(|name| file.find(name).is_some()) {
+        [true, false] => fixture.f32s(GAIN_TENSORS[0], K),
+        [false, true] => fixture.f32s(GAIN_TENSORS[1], K),
+        held => Err(format!(
+            "the fixture holds {held:?} of {GAIN_TENSORS:?}; the router reads exactly one"
+        )),
+    }
+}
 
 struct Weights {
     routed: Vec<f32>,
@@ -50,8 +70,12 @@ fn load_weights(fixture: &Fixture) -> Result<Weights, String> {
     dequant_row(GgmlType::F32, bytes, &mut routed).map_err(|e| format!("{ROUTED_TENSOR}: {e}"))?;
     Ok(Weights {
         routed,
-        shared: fixture.f32s(SHARED_TENSOR, K)?,
-        gain: fixture.f32s(GAIN_TENSOR, K)?,
+        shared: if SHARED == 1 {
+            fixture.f32s(SHARED_TENSOR, K)?
+        } else {
+            Vec::new()
+        },
+        gain: gain(fixture)?,
         eps: fixture.rms_eps()?,
     })
 }
@@ -73,8 +97,10 @@ fn constructed(eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         };
         routed[i * K] = (target / x0) as f32;
     }
-    let mut shared = vec![0f32; K];
-    shared[0] = (0.5 / x0) as f32;
+    let mut shared = vec![0f32; SHARED * K];
+    if let Some(first) = shared.first_mut() {
+        *first = (0.5 / x0) as f32;
+    }
     (routed, shared, x, gain)
 }
 
@@ -100,8 +126,10 @@ fn constructed_tie(eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         };
         routed[i * K] = (target / x0) as f32;
     }
-    let mut shared = vec![0f32; K];
-    shared[0] = (0.5 / x0) as f32;
+    let mut shared = vec![0f32; SHARED * K];
+    if let Some(first) = shared.first_mut() {
+        *first = (0.5 / x0) as f32;
+    }
     (routed, shared, x, gain)
 }
 
@@ -115,17 +143,20 @@ pub(super) fn run(
 ) -> Result<Out, String> {
     let (device, stream) = (h.device, h.stream);
     let routed_b = device.upload(stream, routed).map_err(why)?;
-    let shared_b = device.upload(stream, shared).map_err(why)?;
+    let shared_b = (SHARED == 1)
+        .then(|| device.upload(stream, shared))
+        .transpose()
+        .map_err(why)?;
     let x_b = device.upload(stream, x).map_err(why)?;
     let gain_b = device.upload(stream, gain).map_err(why)?;
     let mut partials = device.upload(stream, &vec![0f32; PARTIALS]).map_err(why)?;
     let mut ticket = device.upload(stream, &[0u32]).map_err(why)?;
     let mut logits = device.upload(stream, &vec![0f32; ROWS]).map_err(why)?;
     let mut ids = device
-        .upload(stream, &[0xFFFFu32; TOP_K + 1])
+        .upload(stream, &[0xFFFFu32; IDS + ID_GUARD])
         .map_err(why)?;
     let mut weights = device
-        .upload(stream, &[f32::from_bits(SENTINEL_BITS); TOP_K + 1])
+        .upload(stream, &[f32::from_bits(SENTINEL_BITS); IDS + ID_GUARD])
         .map_err(why)?;
     h.encode(|encoder| {
         h.kernels.router(
@@ -135,14 +166,17 @@ pub(super) fn run(
                 k: K,
                 top_k: TOP_K,
                 routed: routed_b.window(Elems(0), Elems(routed.len()))?,
-                shared: shared_b.window(Elems(0), Elems(shared.len()))?,
+                shared: shared_b
+                    .as_ref()
+                    .map(|b| b.window(Elems(0), Elems(shared.len())))
+                    .transpose()?,
                 x: x_b.window(Elems(0), Elems(x.len()))?,
                 gain: gain_b.window(Elems(0), Elems(gain.len()))?,
                 partials: partials.window_mut(Elems(0), Elems(PARTIALS))?,
                 ticket: ticket.window_mut(Elems(0), Elems(1))?,
                 logits: logits.window_mut(Elems(0), Elems(ROWS))?,
-                ids: ids.window_mut(Elems(0), Elems(TOP_K + 1))?,
-                weights: weights.window_mut(Elems(0), Elems(TOP_K + 1))?,
+                ids: ids.window_mut(Elems(0), Elems(IDS))?,
+                weights: weights.window_mut(Elems(0), Elems(IDS))?,
                 eps,
                 fault: device.fault_word(),
                 layer: LAYER,
@@ -150,8 +184,8 @@ pub(super) fn run(
         )
     })?;
     let mut logits_h = vec![0f32; ROWS];
-    let mut ids_h = vec![0u32; TOP_K + 1];
-    let mut weights_h = vec![0f32; TOP_K + 1];
+    let mut ids_h = vec![0u32; IDS + ID_GUARD];
+    let mut weights_h = vec![0f32; IDS + ID_GUARD];
     device
         .read(stream, logits.whole().map_err(why)?, &mut logits_h)
         .map_err(why)?;
@@ -161,6 +195,19 @@ pub(super) fn run(
     device
         .read(stream, weights.whole().map_err(why)?, &mut weights_h)
         .map_err(why)?;
+    if ids_h[IDS..].iter().any(|&id| id != 0xFFFF)
+        || weights_h[IDS..]
+            .iter()
+            .any(|w| w.to_bits() != SENTINEL_BITS)
+    {
+        return Err(format!(
+            "the router wrote past its {IDS} ids or weights: ids {:?}, weights {:?}",
+            &ids_h[IDS..],
+            &weights_h[IDS..]
+        ));
+    }
+    ids_h.truncate(IDS);
+    weights_h.truncate(IDS);
     Ok(Out {
         logits: logits_h,
         ids: ids_h,
@@ -176,6 +223,14 @@ fn match_ids(name: &str, out: &Out, ranking: &Ranking) -> Result<(), String> {
                 "router-ids: step {name} slot {s} is {got}, the f64 ranking has {want}"
             ));
         }
+    }
+    shared_id(name, out)
+}
+
+/// A gated router writes the shared expert's id after the picks.
+fn shared_id(name: &str, out: &Out) -> Result<(), String> {
+    if SHARED == 0 {
+        return Ok(());
     }
     let shared = out.ids[TOP_K];
     if shared != EXPERTS as u32 {
@@ -208,12 +263,7 @@ fn check_ids(name: &str, out: &Out, step: &Step) -> Result<&'static str, String>
                 "router-ids: step {name} id set {got:?}, the f64 ranking has {want:?}"
             ));
         }
-        let shared = out.ids[TOP_K];
-        if shared != EXPERTS as u32 {
-            return Err(format!(
-                "router-ids: step {name} shared id is {shared}, the shared expert is {EXPERTS}"
-            ));
-        }
+        shared_id(name, out)?;
         return Ok("set");
     }
     match_ids(name, out, &ranking)?;
@@ -370,12 +420,7 @@ pub fn router_tie(h: &Harness<'_>) -> Clause {
             ));
         }
     }
-    let shared_id = out.ids[TOP_K];
-    if shared_id != EXPERTS as u32 {
-        return Err(format!(
-            "shared id is {shared_id}, the shared expert is {EXPERTS}"
-        ));
-    }
+    shared_id("tie", &out)?;
     for (s, &got) in out.ids[..TOP_K].iter().enumerate() {
         let want = u32::try_from(s).map_err(|_| "a slot id does not fit u32")?;
         if got != want {
@@ -452,9 +497,15 @@ pub fn router_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     for v in &mut xs {
         *v = 0.25 * rng.signed();
     }
-    let id_len = TOP_K + 1;
+    let id_len = IDS;
     let routed = device.upload(stream, &weights.routed).map_err(why)?;
-    let shared = device.upload(stream, &weights.shared).map_err(why)?;
+    // A router with no shared row binds none: the buffer only stands in.
+    let shared = device
+        .upload(
+            stream,
+            &[weights.shared.clone(), vec![0f32; (1 - SHARED) * K]].concat(),
+        )
+        .map_err(why)?;
     let x = device.upload(stream, &xs).map_err(why)?;
     let gain = device.upload(stream, &weights.gain).map_err(why)?;
     let mut partials = device.upload(stream, &vec![0f32; PARTIALS]).map_err(why)?;
@@ -546,7 +597,7 @@ fn dispatch_ticket(
     bufs: &mut Buffers<'_>,
     eps: f32,
 ) -> Result<(), String> {
-    let id_len = TOP_K + 1;
+    let id_len = IDS;
     let fault = h.device.fault_word();
     h.encode(|encoder| {
         for launch in batch..end {
@@ -557,7 +608,9 @@ fn dispatch_ticket(
                     k: K,
                     top_k: TOP_K,
                     routed: bufs.routed.window(Elems(0), Elems(EXPERTS * K))?,
-                    shared: bufs.shared.window(Elems(0), Elems(K))?,
+                    shared: (SHARED == 1)
+                        .then(|| bufs.shared.window(Elems(0), Elems(K)))
+                        .transpose()?,
                     x: bufs.x.window(Elems(launch * K), Elems(K))?,
                     gain: bufs.gain.window(Elems(0), Elems(K))?,
                     partials: bufs.partials.window_mut(Elems(0), Elems(PARTIALS))?,
@@ -684,15 +737,15 @@ impl Args {
             top_k: TOP_K,
             eps: 1e-5,
             routed: EXPERTS * K,
-            shared: K,
+            shared: SHARED * K,
             x_len: K,
             x_at: 0,
             gain: K,
             partials: PARTIALS,
             ticket: 1,
             logits: ROWS,
-            ids: TOP_K + 1,
-            weights: TOP_K + 1,
+            ids: IDS,
+            weights: IDS,
         }
     }
 }
@@ -710,7 +763,9 @@ fn refuse(
             k: a.k,
             top_k: a.top_k,
             routed: bufs.routed.window(Elems(0), Elems(a.routed))?,
-            shared: bufs.shared.window(Elems(0), Elems(a.shared))?,
+            shared: (a.shared > 0)
+                .then(|| bufs.shared.window(Elems(0), Elems(a.shared)))
+                .transpose()?,
             x: bufs.x.window(Elems(a.x_at), Elems(a.x_len))?,
             gain: bufs.gain.window(Elems(0), Elems(a.gain))?,
             partials: bufs.partials.window_mut(Elems(0), Elems(a.partials))?,
@@ -756,11 +811,9 @@ pub fn router_bounds(h: &Harness<'_>) -> Clause {
     let mut logits = device
         .upload(stream, &vec![f32::from_bits(SENTINEL_BITS); ROWS])
         .map_err(why)?;
-    let mut ids = device
-        .upload(stream, &[SENTINEL_BITS; TOP_K + 1])
-        .map_err(why)?;
+    let mut ids = device.upload(stream, &[SENTINEL_BITS; IDS]).map_err(why)?;
     let mut weights = device
-        .upload(stream, &[f32::from_bits(SENTINEL_BITS); TOP_K + 1])
+        .upload(stream, &[f32::from_bits(SENTINEL_BITS); IDS])
         .map_err(why)?;
     let mut bufs = Buffers {
         routed: &routed,
@@ -776,8 +829,8 @@ pub fn router_bounds(h: &Harness<'_>) -> Clause {
     let cases = vec![
         bad("K of 2047", "2048", |a| a.k = 2047, h),
         bad("K of 4096", "2048", |a| a.k = 4096, h),
-        bad("256 rows", "257", |a| a.rows = 256, h),
-        bad("258 rows", "257", |a| a.rows = 258, h),
+        bad("one row short", "row count", |a| a.rows = ROWS - 1, h),
+        bad("one row over", "row count", |a| a.rows = ROWS + 1, h),
         bad("top-k of 0", "top-k", |a| a.top_k = 0, h),
         bad("top-k of 9", "top-k", |a| a.top_k = 9, h),
         bad("top-k of 32", "top-k", |a| a.top_k = 32, h),
@@ -789,7 +842,16 @@ pub fn router_bounds(h: &Harness<'_>) -> Clause {
             |a| a.routed = EXPERTS * K - 1,
             h,
         ),
-        bad("a short shared window", "shared", |a| a.shared = K - 1, h),
+        if SHARED == 1 {
+            bad("a short shared window", "shared", |a| a.shared = K - 1, h)
+        } else {
+            bad(
+                "a shared row the router has none of",
+                "shared expert's row",
+                |a| a.shared = K,
+                h,
+            )
+        },
         bad("a short x window", "x window", |a| a.x_len = K - 1, h),
         bad("a short gain window", "gain", |a| a.gain = K - 1, h),
         bad(
@@ -805,11 +867,11 @@ pub fn router_bounds(h: &Harness<'_>) -> Clause {
             |a| a.logits = ROWS - 1,
             h,
         ),
-        bad("a short ids window", "ids", |a| a.ids = TOP_K, h),
+        bad("a short ids window", "ids", |a| a.ids = IDS - 1, h),
         bad(
             "a short weights window",
             "weights",
-            |a| a.weights = TOP_K,
+            |a| a.weights = IDS - 1,
             h,
         ),
         bad(
