@@ -1,4 +1,4 @@
-use crate::instance::{HOST, Instance};
+use crate::instance::{HOST, Instance, REGISTERED};
 
 /// Values in one head: the host instance's.
 pub const HEAD_DIM: usize = HOST.key.attn.row.head as usize;
@@ -41,8 +41,15 @@ pub const SIMD_WIDTH: usize = 32;
 /// Query heads one SIMD group holds.
 pub const HEADS_PER_SG: usize = 1;
 
-/// Values one lane holds. The SIMD group covers the head.
-pub const LANE_DIMS: usize = HEAD_DIM / SIMD_WIDTH;
+/// Values one lane of `inst`'s flash holds: a SIMD group is one query head,
+/// its lanes cover the head.
+#[must_use]
+pub const fn lane_dims(inst: &Instance) -> usize {
+    inst.key.attn.row.head as usize / SIMD_WIDTH
+}
+
+/// Values one lane holds.
+pub const LANE_DIMS: usize = lane_dims(&HOST);
 
 /// One segment partial of a head of `head` values: the max, the weight sum,
 /// then the head.
@@ -79,8 +86,21 @@ pub const fn flash_threads(inst: &Instance) -> usize {
 /// Threads in the flash threadgroup.
 pub const FLASH_THREADS: usize = flash_threads(&HOST);
 
-/// `1/sqrt(256)`, exact.
-pub const SCALE: f32 = 0.0625;
+/// The score's scale for a head of `head` values: ik's
+/// `1.0f/sqrtf(float(head))` in f32 (exact at 256; at 128 the f32 nearest,
+/// the delta net's own query scale). A head with no written scale fails the
+/// build.
+#[must_use]
+pub const fn scale_of(head: usize) -> f32 {
+    match head {
+        256 => 0.0625,
+        128 => f32::from_bits(0x3db5_04f3),
+        _ => panic!("no score scale is written for this head"),
+    }
+}
+
+/// The host instance's score scale.
+pub const SCALE: f32 = scale_of(HEAD_DIM);
 
 /// Positions one prefill threadgroup holds: a SIMD group each, whose rows
 /// are the [`GQA`] query heads of one key head at that position.
@@ -96,19 +116,40 @@ pub const PREFILL_PAD: usize = 8;
 /// Threads in the prefill threadgroup.
 pub const PREFILL_THREADS: usize = PREFILL_POSITIONS * SIMD_WIDTH;
 
+/// The geometry every flash kernel is written for, held for `inst`: the
+/// kernels' own `static_assert`s, stated where the host sizes its launches.
+const fn holds(inst: &Instance) {
+    let a = &inst.key.attn;
+    let head = a.row.head as usize;
+    let rot = a.rot as usize;
+    assert!(a.row.value == a.row.head);
+    assert!(gqa(inst) * a.n_kv as usize == a.n_head as usize);
+    assert!(HEADS_PER_SG * simd_groups(inst) == gqa(inst));
+    // A lane holds 8 values (a 16-byte word) or 4 (an 8-byte word).
+    assert!(lane_dims(inst) * SIMD_WIDTH == head);
+    assert!(lane_dims(inst) == 8 || lane_dims(inst) == 4);
+    assert!(qg_stride(inst) == head * (1 + a.q_gate as usize));
+    assert!(flash_threads(inst) == 256);
+    // The fold: one thread a 16 values of a head, every head at once.
+    assert!(a.n_head as usize * head == flash_threads(inst) * 16);
+    // The norm's pair tree (rope_neox's `owned_pair`): head/64 warps, the
+    // turning pairs inside warp 0 or every value turning.
+    assert!(head.is_multiple_of(64) && rot.is_multiple_of(2) && rot <= head);
+    assert!(rot / 2 <= SIMD_WIDTH || rot == head);
+    assert!(gqa(inst) == 8);
+    assert!(head & 7 == 0 && (head + PREFILL_PAD) & 7 == 0);
+    let _ = scale_of(head);
+}
+
 const _: () = {
-    assert!(GQA == QUERY_HEADS / KV_HEADS);
-    assert!(HEADS_PER_SG * SIMD_GROUPS == GQA);
-    assert!(LANE_DIMS == 8);
+    let mut i = 0;
+    while i < REGISTERED.len() {
+        holds(&REGISTERED[i]);
+        i += 1;
+    }
     assert!(PARTIAL_ELEMS == HEAD_DIM + 2);
-    assert!(QG_STRIDE == HEAD_DIM * 2);
-    assert!(FLASH_THREADS == 256);
-    assert!(SCALE == 1.0 / 16.0);
-    assert!(SCALE * SCALE * HEAD_DIM as f32 == 1.0);
     assert!(PREFILL_POSITIONS * SIMD_WIDTH == 128);
     assert!(PREFILL_KEYS == 16);
-    assert!(GQA == 8);
-    assert!(HEAD_DIM & 7 == 0 && (HEAD_DIM + PREFILL_PAD) & 7 == 0);
 };
 
 /// Segments a live key count takes.
@@ -157,6 +198,20 @@ fn span_mirror(live: u32, segments: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scale_is_iks_for_every_registered_head() {
+        for inst in REGISTERED {
+            let head = inst.key.attn.row.head;
+            let ik = 1.0f32 / (head as f32).sqrt();
+            assert_eq!(
+                scale_of(head as usize).to_bits(),
+                ik.to_bits(),
+                "{}: head {head}",
+                inst.name
+            );
+        }
+    }
 
     #[test]
     fn one_segment_holds_the_waterline() {

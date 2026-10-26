@@ -35,7 +35,11 @@ use crate::kernels::{
 use crate::residency::Alloc;
 
 /// The widest a row of the delta numerator or the attention output is.
-pub(super) const MIX_STRIDE: usize = VALUE_HEADS * crate::kernels::HEAD_COLS;
+pub(super) const MIX_STRIDE: usize = {
+    let delta = VALUE_HEADS * crate::kernels::HEAD_COLS;
+    let attn = crate::kernels::QUERY_HEADS * crate::kernels::HEAD_DIM;
+    if delta > attn { delta } else { attn }
+};
 
 /// The partial sums of squares a row of the delta step leaves.
 pub(super) const DELTA_PARTIALS_STRIDE: usize = VALUE_HEADS * PARTIALS_PER_HEAD;

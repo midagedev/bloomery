@@ -24,14 +24,109 @@ mod program;
 
 pub use program::{Mutant, Program, source_of};
 
-/// Every mutant of both tables, with the program it edits.
-pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
-    program::all(MUTANTS, TENSOR_MUTANTS)
+use super::Table;
+
+/// Every mutant of a host's run (`table`, its row of the gate), with the
+/// program it edits: at a host that runs the whole gate both tables; at one
+/// that runs its shaped kernels' clauses, the main table's mutants of those
+/// clauses and the instance's own.
+pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
+    match table {
+        Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
+        Table::Shaped { kept, own } => program::all(MUTANTS, &[])
+            .filter(|(m, _)| kept.contains(&m.name))
+            .chain(program::all(own, &[]))
+            .collect(),
+    }
 }
 
+/// The main table's mutants of the clauses a Qwen3-30B-A3B host runs, less
+/// the three whose text its preprocessor removes: the gated epilogues
+/// (`attn_gate_s1`, `attn_gate_merge`) and the shared slot (`pair_shared_stack`).
+pub const Q30_KEPT: &[&str] = &[
+    "router_logit",
+    "router_ids",
+    "router_tie",
+    "router_weights",
+    "router_ticket",
+    "router_nan",
+    "router_bounds",
+    "router_rounds",
+    "router_bad",
+    "router_norm_no_raise",
+    "pair_no_silu",
+    "pair_id_zero",
+    "pair_norm_gain",
+    "pair_norm_no_raise",
+    "fold_tail",
+    "fold_drop_weight",
+    "fold_no_resid",
+    "attn_score_scale",
+    "attn_q8_id",
+    "attn_key_count",
+    "attn_no_fold",
+    "attn_f16_round",
+    "attn_s1_partials",
+    "attn_half",
+    "attn_bounds",
+];
+
+/// The defects only a head-128, ungated, unshared instance shows: each edit
+/// is the same program at Qwen3.6's geometry, or text its preprocessor
+/// removes there.
+pub const Q30_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "attn_factors_tile_sized",
+        clause: "attn_f16",
+        why: "the shared block is the K and V tiles' size, so 32 heads' factors at 64 segments run past it",
+        edits: &[
+            (
+                "    (ATTN_TILE_WORDS > ATTN_FACTOR_WORDS ? ATTN_TILE_WORDS : ATTN_FACTOR_WORDS)",
+                "    (ATTN_TILE_WORDS)",
+                1,
+            ),
+            (
+                "static_assert(ATTN_SHARED_WORDS * 4u >= BLOOMERY_ATTN_Q * BLOOMERY_ATTN_SEGMENT_CAP * 2u,",
+                "static_assert(true,",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "attn_norm_pair_32",
+        clause: "attn_f16",
+        why: "the norm's pair tree pairs dim t with t + 32, not with t + rot/2",
+        edits: &[(
+            "            i1 = tid + BLOOMERY_ATTN_ROT / 2u;",
+            "            i1 = tid + 32u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_shared_write_ungated",
+        clause: "router_ids",
+        why: "a router with no shared row still writes the shared slot's id and weight after the picks",
+        edits: &[(
+            "#if BLOOMERY_ROUTER_SHARED\n        ids[top_k] = ROUTER_EXPERTS;",
+            "#if 1\n        ids[top_k] = ROUTER_EXPERTS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_gate_ungated",
+        clause: "attn_f16",
+        why: "a query with no gate still multiplies the attention by the sigmoid of the value past its head",
+        edits: &[(
+            "#if BLOOMERY_ATTN_GATED\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+            "#if 1\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+            1,
+        )],
+    },
+];
+
 /// The mutant of this name, and the program it edits.
-pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
-    all().find(|(m, _)| m.name == name)
+pub fn find(name: &str, table: Table) -> Option<(&'static Mutant, Program)> {
+    all(table).into_iter().find(|(m, _)| m.name == name)
 }
 
 const TAIL_STORE_FIND: &str =
@@ -769,8 +864,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_prefill",
         why: "the prefill reads the other key head's rows for its query heads",
         edits: &[(
-            "ulong at = ((ulong)kv * args.ctx + key) * (BLOOMERY_ATTN_HEAD / 8u) + c;",
-            "ulong at = ((ulong)(1u - kv) * args.ctx + key) * (BLOOMERY_ATTN_HEAD / 8u) + c;",
+            "ulong at = ((ulong)kv * args.ctx + key) * PF_ROW_WORDS + c;",
+            "ulong at = ((ulong)(1u - kv) * args.ctx + key) * PF_ROW_WORDS + c;",
             1,
         )],
     },
@@ -947,7 +1042,7 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "route_rows_select",
         why: "a row's ids and weights are written at the picks' stride, not the picks and the shared slot's",
         edits: &[(
-            "const uint per_row = args.top_k + 1u;",
+            "const uint per_row = args.top_k + BLOOMERY_ROUTER_SHARED;",
             "const uint per_row = args.top_k;",
             1,
         )],

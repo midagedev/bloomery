@@ -34,10 +34,10 @@ pub const MAX_SEGMENTS: usize = 4;
 
 /// The value heads a gated delta net's out projection reads: its head scale
 /// and its partial sums are per head. The host instance's.
-pub const VALUE_HEADS: usize = HOST.key.delta.value_heads as usize;
+pub const VALUE_HEADS: usize = HOST.delta_built().value_heads as usize;
 
 /// The columns one value head's gated output holds: the host instance's.
-pub const HEAD_COLS: usize = HOST.key.delta.head_cols as usize;
+pub const HEAD_COLS: usize = HOST.delta_built().head_cols as usize;
 
 /// The column blocks one head's partial sums are split into.
 pub const PARTIALS_PER_HEAD: usize = 8;

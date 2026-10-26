@@ -175,13 +175,18 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
             MarkCopies::AtOpen,
         )
         .map_err(|e| e.to_string())?;
+        let checkpoints = match session.checkpoint_every() {
+            Some(every) => format!(
+                "checkpoints every {every} ({} bytes a point, capacity {})",
+                session.checkpoint_bytes(),
+                session.checkpoint_capacity()
+            ),
+            None => "no checkpoints (no recurrent store)".to_owned(),
+        };
         eprintln!(
-            "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}, checkpoints every {} ({} bytes a point, capacity {})",
+            "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}, {checkpoints}",
             path.display(),
             t0.elapsed().as_secs_f64(),
-            session.checkpoint_every(),
-            session.checkpoint_bytes(),
-            session.checkpoint_capacity()
         );
         let head_rows = session.vocab();
         let engine = TargetEngine::new(

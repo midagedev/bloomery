@@ -1,4 +1,5 @@
-//! Decode attention clauses. The output is the gated attention. The appended
+//! Decode attention clauses at the host instance's geometry. The output is
+//! the attention, gated when the instance's query carries a gate. The appended
 //! cache row is the host quantizer's bits: `f32_to_f16_bits` or
 //! `gguf::quant::quantize_q8_0`. The norm and the partial rope are the f32
 //! tree in `oracle_attention`.
@@ -40,6 +41,11 @@ const CODE_HOLE: u32 = 0x0BAD_0BAD;
 const SCALE_HOLE: u16 = 0x0BAD;
 /// The q8_0 scale a non-finite block stores.
 const Q8_NAN_SCALE: u16 = 0x7e00;
+/// A q8_0 cache row's code words and scales.
+const Q8_WORDS: usize = HEAD_DIM / 4;
+const Q8_SCALES: usize = HEAD_DIM / 32;
+/// The host instance's query carries a gate after each head.
+pub(super) const GATED: bool = QG_STRIDE == 2 * HEAD_DIM;
 
 /// The pattern-expansion kernel, the `attn_half` clause's own: the shipped
 /// library does not carry it, and the clause compiles it once beside the
@@ -116,7 +122,7 @@ pub(super) fn head_row(index: u32, kind: u32) -> [f32; HEAD_DIM] {
 }
 
 pub(super) fn gain_array(values: &[f32]) -> Result<[f32; HEAD_DIM], String> {
-    <[f32; HEAD_DIM]>::try_from(values).map_err(|_| "a gain holds 256 values".to_string())
+    <[f32; HEAD_DIM]>::try_from(values).map_err(|_| format!("a gain holds {HEAD_DIM} values"))
 }
 
 fn take_head(flat: &[f32], head: usize) -> Result<[f32; HEAD_DIM], String> {
@@ -256,8 +262,10 @@ fn inputs(_scene: &Scene) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     for head in 0..QUERY_HEADS {
         let at = head * QG_STRIDE;
         q[at..at + HEAD_DIM].copy_from_slice(&head_row(u(head), KIND_Q));
-        for dim in 0..HEAD_DIM {
-            q[at + HEAD_DIM + dim] = gate_of(u(dim));
+        if GATED {
+            for dim in 0..HEAD_DIM {
+                q[at + HEAD_DIM + dim] = gate_of(u(dim));
+            }
         }
     }
     for kv in 0..KV_HEADS {
@@ -294,10 +302,10 @@ fn plant_q8(scene: &Scene) -> Result<CacheBack, String> {
             let index = kv * scene.ctx + row;
             let (kc, ks) = pack_q8(&head_row(u(row), KIND_PRE_K + u(kv)));
             let (vc, vs) = pack_q8(&head_row(u(row), KIND_PRE_V + u(kv)));
-            k_codes[index * 64..index * 64 + 64].copy_from_slice(&kc);
-            v_codes[index * 64..index * 64 + 64].copy_from_slice(&vc);
-            k_scales[index * 8..index * 8 + 8].copy_from_slice(&ks);
-            v_scales[index * 8..index * 8 + 8].copy_from_slice(&vs);
+            k_codes[index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS].copy_from_slice(&kc);
+            v_codes[index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS].copy_from_slice(&vc);
+            k_scales[index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES].copy_from_slice(&ks);
+            v_scales[index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES].copy_from_slice(&vs);
         }
     }
     Ok(CacheBack::Q8 {
@@ -555,8 +563,8 @@ pub(super) fn dequant_k(cache: &CacheBack, ctx: usize, kv: usize, index: usize) 
         CacheBack::Q8 {
             k_codes, k_scales, ..
         } => dequant_q8(
-            &k_codes[row * 64..row * 64 + 64],
-            &k_scales[row * 8..row * 8 + 8],
+            &k_codes[row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS],
+            &k_scales[row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES],
         ),
     }
 }
@@ -574,8 +582,8 @@ pub(super) fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) 
         CacheBack::Q8 {
             v_codes, v_scales, ..
         } => dequant_q8(
-            &v_codes[row * 64..row * 64 + 64],
-            &v_scales[row * 8..row * 8 + 8],
+            &v_codes[row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS],
+            &v_scales[row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES],
         ),
     }
 }
@@ -610,15 +618,15 @@ fn expect_q8_row(
     codes: &[u32],
     scales: &[u16],
     row: usize,
-    want_codes: &[u32; 64],
-    want_scales: &[u16; 8],
+    want_codes: &[u32; Q8_WORDS],
+    want_scales: &[u16; Q8_SCALES],
     what: &str,
 ) -> Result<(), String> {
     let code = codes
-        .get(row * 64..row * 64 + 64)
+        .get(row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS)
         .ok_or_else(|| format!("{what} row {row} codes are past the cache"))?;
     let scale = scales
-        .get(row * 8..row * 8 + 8)
+        .get(row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES)
         .ok_or_else(|| format!("{what} row {row} scales are past the cache"))?;
     if let Some((i, g, w)) = first_diff(code, want_codes) {
         return Err(format!(
@@ -713,20 +721,20 @@ fn expect_planted_row(
             },
         ) => {
             let kc = pkc
-                .get(index * 64..index * 64 + 64)
-                .and_then(|r| <[u32; 64]>::try_from(r).ok())
+                .get(index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS)
+                .and_then(|r| <[u32; Q8_WORDS]>::try_from(r).ok())
                 .ok_or("the planted k codes are short")?;
             let ks = pks
-                .get(index * 8..index * 8 + 8)
-                .and_then(|r| <[u16; 8]>::try_from(r).ok())
+                .get(index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES)
+                .and_then(|r| <[u16; Q8_SCALES]>::try_from(r).ok())
                 .ok_or("the planted k scales are short")?;
             let vc = pvc
-                .get(index * 64..index * 64 + 64)
-                .and_then(|r| <[u32; 64]>::try_from(r).ok())
+                .get(index * Q8_WORDS..index * Q8_WORDS + Q8_WORDS)
+                .and_then(|r| <[u32; Q8_WORDS]>::try_from(r).ok())
                 .ok_or("the planted v codes are short")?;
             let vs = pvs
-                .get(index * 8..index * 8 + 8)
-                .and_then(|r| <[u16; 8]>::try_from(r).ok())
+                .get(index * Q8_SCALES..index * Q8_SCALES + Q8_SCALES)
+                .and_then(|r| <[u16; Q8_SCALES]>::try_from(r).ok())
                 .ok_or("the planted v scales are short")?;
             expect_q8_row(k_codes, k_scales, index, &kc, &ks, "k")?;
             expect_q8_row(v_codes, v_scales, index, &vc, &vs, "v")
@@ -775,7 +783,7 @@ fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
         seen,
         ..
     } = *inp;
-    let kv = head / 8;
+    let kv = head / (QUERY_HEADS / KV_HEADS);
     let pos = usize::try_from(scene.pos).map_err(|_| "a position does not fit".to_string())?;
     let keys_n =
         usize::try_from(scene.n_keys).map_err(|_| "a key count does not fit".to_string())?;
@@ -789,7 +797,11 @@ fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
         tables.eps,
         rope,
     )?;
-    let gate = take_qg(q, head, HEAD_DIM)?;
+    let gate = if GATED {
+        Some(take_qg(q, head, HEAD_DIM)?)
+    } else {
+        None
+    };
     let mut keys = Vec::with_capacity(keys_n);
     let mut vals = Vec::with_capacity(keys_n);
     for index in 0..keys_n {
@@ -797,12 +809,12 @@ fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
         vals.push(dequant_v(&seen.cache, scene.ctx, kv, index));
     }
     let refer = attend(&qn, &keys, &vals)?;
-    let bound = band(&qn, &keys, &vals, &gate, scene.segments)?;
+    let bound = band(&qn, &keys, &vals, gate.as_ref(), scene.segments)?;
     let mut worst = 0.0f64;
     for dim in 0..HEAD_DIM {
         let at = head * HEAD_DIM + dim;
         let got = seen.out.get(at).copied().ok_or("the output is short")?;
-        let want = refer[dim] * sigmoid(f64::from(gate[dim]));
+        let want = gate.map_or(refer[dim], |g| refer[dim] * sigmoid(f64::from(g[dim])));
         let b = bound[dim];
         let diff = (f64::from(got) - want).abs();
         if !b.is_finite() {
@@ -818,7 +830,7 @@ fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
         worst = wider(worst, ratio);
         if !got.is_finite() || !want.is_finite() || diff.total_cmp(&b).is_gt() {
             return Err(format!(
-                "head {head} dim {dim}: got {got}, gated f64 attention {want}, |diff| {diff} over band {b} (ratio {ratio}) via {}",
+                "head {head} dim {dim}: got {got}, f64 attention {want}, |diff| {diff} over band {b} (ratio {ratio}) via {}",
                 quant_label(scene)
             ));
         }
@@ -1020,10 +1032,10 @@ fn cache_same(planted: &CacheBack, got: &CacheBack) -> Result<(), String> {
 
 fn expect_nan_q8_row(codes: &[u32], scales: &[u16], row: usize) -> Result<(), String> {
     let scale = scales
-        .get(row * 8..row * 8 + 8)
+        .get(row * Q8_SCALES..row * Q8_SCALES + Q8_SCALES)
         .ok_or("the bad q8_0 row's scales are past the cache")?;
     let code = codes
-        .get(row * 64..row * 64 + 64)
+        .get(row * Q8_WORDS..row * Q8_WORDS + Q8_WORDS)
         .ok_or("the bad q8_0 row's codes are past the cache")?;
     for (i, &bits) in scale.iter().enumerate() {
         if bits != Q8_NAN_SCALE {
@@ -1282,14 +1294,14 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     };
     let cases = vec![
         case(
-            "a head dim of 128",
+            "half the head dim",
             "head dim",
-            Box::new(|a| a.head_dim = 128),
+            Box::new(|a| a.head_dim = HEAD_DIM / 2),
         ),
         case(
-            "eight query heads",
+            "half the query heads",
             "query heads",
-            Box::new(|a| a.query_heads = 8),
+            Box::new(|a| a.query_heads = QUERY_HEADS / 2),
         ),
         case("one kv head", "kv heads", Box::new(|a| a.kv_heads = 1)),
         case(

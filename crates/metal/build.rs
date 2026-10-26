@@ -107,6 +107,7 @@ fn fault_sites_header() -> String {
 /// constant or rule that the host module reads at its own instance.
 fn geometry_header(inst: &instance::Instance) -> String {
     let key = &inst.key;
+    let delta = inst.delta_built();
     format!(
         "// The mat-vec launch geometry, from src/kernels/geometry.rs.\n\
          #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {rows}\n\
@@ -129,6 +130,7 @@ fn geometry_header(inst: &instance::Instance) -> String {
          #define BLOOMERY_ROUTER_FLOAT4S {rfloat4}\n\
          #define BLOOMERY_ROUTER_TOPK_MAX {rtop}\n\
          #define BLOOMERY_ROUTER_LANES {rlanes}\n\
+         #define BLOOMERY_ROUTER_SHARED {rshared}\n\
          // The expert pair and the folded down, from src/kernels/experts_geom.rs.\n\
          #define BLOOMERY_EXPERT_SLOTS {eslots}\n\
          #define BLOOMERY_EXPERT_ROUTED {erouted}\n\
@@ -147,16 +149,19 @@ fn geometry_header(inst: &instance::Instance) -> String {
          #define BLOOMERY_ATTN_QG {aqg}\n\
          #define BLOOMERY_ATTN_LANES {alanes}\n\
          #define BLOOMERY_ATTN_THREADS {athreads}\n\
+         #define BLOOMERY_ATTN_LANE_DIMS {alanedims}\n\
+         #define BLOOMERY_ATTN_GATED {agated}\n\
+         #define BLOOMERY_ATTN_SEGMENT_CAP {asegcap}\n\
          #define BLOOMERY_ATTN_PF_POSITIONS {apfpos}\n\
          #define BLOOMERY_ATTN_PF_KEYS {apfkeys}\n\
          #define BLOOMERY_ATTN_PF_PAD {apfpad}\n",
         rows = geometry::ROWS_PER_SIMD_GROUP,
         segs = geometry::MAX_SEGMENTS,
-        heads = key.delta.value_heads,
-        cols = key.delta.head_cols,
+        heads = delta.value_heads,
+        cols = delta.head_cols,
         blocks = geometry::PARTIALS_PER_HEAD,
-        per = key.delta.head_cols as usize / geometry::PARTIALS_PER_HEAD,
-        ring = delta_geom::ring_rows(key.delta.conv_taps as usize),
+        per = delta.head_cols as usize / geometry::PARTIALS_PER_HEAD,
+        ring = delta_geom::ring_rows(delta.conv_taps as usize),
         snaps = delta_geom::SNAPS,
         rrows = router_geom::rows(inst),
         rexperts = key.moe.router.experts,
@@ -166,6 +171,7 @@ fn geometry_header(inst: &instance::Instance) -> String {
         rfloat4 = router_geom::float4s(key.hidden as usize),
         rtop = key.moe.top_k,
         rlanes = router_geom::SIMD_WIDTH,
+        rshared = u32::from(key.moe.router.rule.gated),
         eslots = experts_geom::slots(inst),
         erouted = key.moe.top_k,
         eshared = experts_geom::shared_slot(inst),
@@ -182,6 +188,9 @@ fn geometry_header(inst: &instance::Instance) -> String {
         aqg = attention_geom::qg_stride(inst),
         alanes = attention_geom::SIMD_WIDTH,
         athreads = attention_geom::flash_threads(inst),
+        alanedims = attention_geom::lane_dims(inst),
+        agated = u32::from(key.attn.q_gate),
+        asegcap = attention_geom::SEGMENT_CAP,
         apfpos = attention_geom::PREFILL_POSITIONS,
         apfkeys = attention_geom::PREFILL_KEYS,
         apfpad = attention_geom::PREFILL_PAD,
