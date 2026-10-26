@@ -1643,12 +1643,13 @@ mod tests {
                     .expect("a tensor")
             })
             .collect();
-        // gate, shared gate, up, shared up, down, shared down.
+        // The routed stacks (gate, up, down), then the shared parts (gate,
+        // up, down): `plan_ffn`'s order.
         assert_eq!(
             tensors,
             [
-                "blk.1.ffn_gate_shexp.weight",
                 "blk.1.ffn_down_exps.weight",
+                "blk.1.ffn_gate_shexp.weight",
                 "blk.1.ffn_down_shexp.weight"
             ],
             "{got:?}"

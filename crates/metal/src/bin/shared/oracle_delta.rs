@@ -338,8 +338,8 @@ fn conv_silu(c: &Conv<'_>, channel: usize) -> Result<Ev, String> {
         tap(c, channel, 0),
     ];
     let mut acc = mul(xs[0], Ev::exact(c.w[CONV_TAPS * channel]));
-    for j in 1..CONV_TAPS {
-        acc = fma(xs[j], Ev::exact(c.w[CONV_TAPS * channel + j]), acc);
+    for (j, &x) in xs.iter().enumerate().take(CONV_TAPS).skip(1) {
+        acc = fma(x, Ev::exact(c.w[CONV_TAPS * channel + j]), acc);
     }
     silu(acc)
 }

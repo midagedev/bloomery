@@ -567,10 +567,10 @@ pub fn q_ref(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let b = traced_step(&mut steps, *tok)?;
     let mut worst_ratio = 0f64;
     let (mut worst_a, mut worst_b) = (0f64, 0f64);
-    for l in 0..n {
+    for (l, want) in ik_out.iter().enumerate().take(n) {
         let (ea, eb) = (
-            flip::rel_to(&a.outs[l], &ik_out[l]),
-            flip::rel_to(&b.outs[l], &ik_out[l]),
+            flip::rel_to(&a.outs[l], want),
+            flip::rel_to(&b.outs[l], want),
         );
         worst_a = flip::worse(worst_a, ea);
         worst_b = flip::worse(worst_b, eb);

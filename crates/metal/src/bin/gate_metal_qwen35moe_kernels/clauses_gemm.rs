@@ -334,7 +334,7 @@ fn check_rows(
             launch.cols,
             &x_f64,
         )?;
-        for n in 0..launch.rows {
+        for (n, &w_abs_n) in w_abs.iter().enumerate().take(launch.rows) {
             let at = r * launch.y_stride + n;
             let carried = match launch.mode {
                 GemmMode::Store => 0.0,
@@ -346,7 +346,7 @@ fn check_rows(
                 GemmMode::Residual => U * want.abs(),
             };
             let width = factor * reference.magnitude[n] * (1.0 + U)
-                + HALF_SUBNORMAL * (x_abs + w_abs[n])
+                + HALF_SUBNORMAL * (x_abs + w_abs_n)
                 + resid
                 + floor;
             let err = (f64::from(got[at]) - want).abs();

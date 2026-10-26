@@ -814,8 +814,8 @@ fn check_grouped(
         let down = Experts::of(&ex.down, &ex.shared_down, e);
         let rd = oracle::reference(ex.quant, down, HIDDEN, EXPERT_K, &hx)?;
         let wd = abs.of(2, e, down, HIDDEN, EXPERT_K)?.to_vec();
-        for n in 0..HIDDEN {
-            let width = dot_width(f_down, ops_down, sub, rd.magnitude[n], h_abs, wd[n]);
+        for (n, &wd_n) in wd.iter().enumerate().take(HIDDEN) {
+            let width = dot_width(f_down, ops_down, sub, rd.magnitude[n], h_abs, wd_n);
             let got = f64::from(run.y[p * HIDDEN + n]);
             let err = (got - rd.y[n]).abs();
             if !got.is_finite() || err > width {
