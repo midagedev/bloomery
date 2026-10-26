@@ -989,16 +989,24 @@ const PREFILL_CTX: usize = 352;
 
 /// The prefill cases: the first position and the rows. A first position of 0
 /// starts on an empty cache; 37 reads thirty-seven planted rows. One row is a
-/// block of one; 9 rows end a block after one position; 64 and 300 rows cover
-/// the diagonal tile at every offset of the block.
-const PREFILL_CASES: [(usize, usize); 8] = [
+/// block of one; 7 rows are a block short of its eight positions; 8 rows fill
+/// one; 9 rows end a block after one position; 64, 257 and 300 rows cover the
+/// diagonal tile at every offset of the block, 257 the first position past a
+/// 256-row cut.
+const PREFILL_CASES: [(usize, usize); 14] = [
     (0, 1),
+    (0, 7),
+    (0, 8),
     (0, 9),
     (0, 64),
+    (0, 257),
     (0, 300),
     (37, 1),
+    (37, 7),
+    (37, 8),
     (37, 9),
     (37, 64),
+    (37, 257),
     (37, 300),
 ];
 
@@ -1127,15 +1135,19 @@ fn prefill_bands(
             let kv = head / (attn.query_heads / attn.kv_heads);
             let qrow = &inp.q[r * q_n..(r + 1) * q_n];
             let qn = norm_rope(take_qg_for(attn, qrow, head, 0)?, gain, tables.eps, rope)?;
-            let gate = take_qg_for(attn, qrow, head, attn.head)?;
+            let gate = if attn.gated {
+                Some(take_qg_for(attn, qrow, head, attn.head)?)
+            } else {
+                None
+            };
             let (k, v) = (&keys[kv][..=pos], &vals[kv][..=pos]);
             let refer = attend(&qn, k, v)?;
-            let bp = prefill_band(&qn, k, v, Some(gate))?;
-            let bd = band(&qn, k, v, Some(gate), case.segments)?;
+            let bp = prefill_band(&qn, k, v, gate)?;
+            let bd = band(&qn, k, v, gate, case.segments)?;
             for dim in 0..attn.head {
                 let at = r * out_n + head * attn.head + dim;
                 let (gp, g0) = (pre.out[at], v0.out[at]);
-                let want = refer[dim] * sigmoid(f64::from(gate[dim]));
+                let want = gate.map_or(refer[dim], |g| refer[dim] * sigmoid(f64::from(g[dim])));
                 let here = format!(
                     "row {r} (position {pos}) head {head} dim {dim}: prefill {gp}, decode flash {g0}, f64 attention {want}"
                 );
@@ -1231,8 +1243,10 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             pre.fault, v0.fault
         ));
     }
+    // Key head 1 is read by the query heads `gqa..2 * gqa`.
+    let gqa = attn.query_heads / attn.kv_heads;
     for r in 20..case.rows {
-        for head in attn.query_heads / attn.kv_heads..attn.query_heads {
+        for head in gqa..2 * gqa {
             let at = r * out_n + head * attn.head;
             if v0.out[at..at + attn.head].iter().any(|v| !v.is_nan()) {
                 return Err(format!(
@@ -1247,29 +1261,34 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         }
     }
     prefill_bands(attn, &tables, &case, &inp, (&pre, &v0), |r, head| {
-        head < attn.query_heads / attn.kv_heads || r < 11
+        !(gqa..2 * gqa).contains(&head) || r < 11
     })
     .map_err(|e| format!("a non-finite key: {e}"))?;
 
-    // A gate that is not finite: the product site, and that value NaN, in both.
-    let mut inp = attn_inputs(attn, case.rows)?;
-    let (gr, gh, gd) = (3usize, 2usize, 7usize);
-    inp.q[gr * q_n + gh * attn.qg_stride + attn.head + gd] = f32::NAN;
-    let (pre, v0) = prefill_pair(h, &tables, &case, &inp)?;
-    if !only_site(pre.fault, FaultSite::F32Product) || !only_site(v0.fault, FaultSite::F32Product) {
-        return Err(format!(
-            "a non-finite gate: the prefill's fault word is {:?}, the decode flash's {:?}, the product site alone is expected",
-            pre.fault, v0.fault
-        ));
+    // A gate that is not finite: the product site, and that value NaN, in
+    // both. A query with no gate has none.
+    if attn.gated {
+        let mut inp = attn_inputs(attn, case.rows)?;
+        let (gr, gh, gd) = (3usize, 2usize, 7usize);
+        inp.q[gr * q_n + gh * attn.qg_stride + attn.head + gd] = f32::NAN;
+        let (pre, v0) = prefill_pair(h, &tables, &case, &inp)?;
+        if !only_site(pre.fault, FaultSite::F32Product)
+            || !only_site(v0.fault, FaultSite::F32Product)
+        {
+            return Err(format!(
+                "a non-finite gate: the prefill's fault word is {:?}, the decode flash's {:?}, the product site alone is expected",
+                pre.fault, v0.fault
+            ));
+        }
+        let at = gr * out_n + gh * attn.head + gd;
+        if !pre.out[at].is_nan() || !v0.out[at].is_nan() {
+            return Err("a non-finite gate left its value finite".to_string());
+        }
+        prefill_bands(attn, &tables, &case, &inp, (&pre, &v0), |r, head| {
+            (r, head) != (gr, gh)
+        })
+        .map_err(|e| format!("a non-finite gate: {e}"))?;
     }
-    let at = gr * out_n + gh * attn.head + gd;
-    if !pre.out[at].is_nan() || !v0.out[at].is_nan() {
-        return Err("a non-finite gate left its value finite".to_string());
-    }
-    prefill_bands(attn, &tables, &case, &inp, (&pre, &v0), |r, head| {
-        (r, head) != (gr, gh)
-    })
-    .map_err(|e| format!("a non-finite gate: {e}"))?;
 
     // A query past f16's range (a gain of 1e5): the product site, every row NaN.
     let big = Tables {
@@ -1291,7 +1310,7 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err("a query past f16's range left a finite value".to_string());
     }
     Ok(Verdict::Noted(
-        "a key row that is not finite makes NaN the rows of its key head from its position on and leaves the rows before its tile in band; a gate that is not finite raises the product site and is NaN in both; a query past f16's range raises the product site and every row is NaN"
+        "a key row that is not finite makes NaN the rows of its key head from its position on and leaves the rows before its tile in band; a gate that is not finite (of a query that has one) raises the product site and is NaN in both; a query past f16's range raises the product site and every row is NaN"
             .to_string(),
     ))
 }
@@ -2165,7 +2184,12 @@ fn norm_refusals(h: &Harness<'_>) -> Result<usize, String> {
 /// rows, the attention rows and the norm rows.
 pub fn rows_refusals(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables_for(&h.geom().attn, fixture)?;
-    let delta = delta_refusals(h).map_err(|e| format!("delta rows: {e}"))?;
+    // A file with no delta layer launches no delta rows.
+    let delta = if h.library.instance().key.delta.is_some() {
+        delta_refusals(h).map_err(|e| format!("delta rows: {e}"))?
+    } else {
+        0
+    };
     let attention = attn_refusals(h, &tables).map_err(|e| format!("attention rows: {e}"))?;
     let norm = norm_refusals(h).map_err(|e| format!("norm rows: {e}"))?;
     Ok(Verdict::Noted(format!(
@@ -2173,12 +2197,27 @@ pub fn rows_refusals(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )))
 }
 
-/// The clauses of the row kernels, in gate order.
+/// The clauses of the row kernels, in gate order: the whole table, with the
+/// delta net's.
 pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     vec![
         ("delta_rows", Box::new(|| ctx.with(delta_rows))),
         ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
         ("delta_rows_snap", Box::new(|| ctx.with(delta_rows_snap))),
+        ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
+        ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
+        ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),
+        ("attn_prefill_nan", Box::new(|| ctx.with(attn_prefill_nan))),
+        ("norm_rows", Box::new(|| ctx.with(norm_rows))),
+        ("norm_rows_nan", Box::new(|| ctx.with(norm_rows_nan))),
+        ("rows_refusals", Box::new(|| ctx.with(rows_refusals))),
+    ]
+}
+
+/// The clauses of the row kernels an instance whose layers are all attention
+/// runs: the delta net's are left out.
+pub fn shaped<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    vec![
         ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
         ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
         ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),
