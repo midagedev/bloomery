@@ -1220,7 +1220,8 @@ mod gate {
         let file = open_split(Arch::NemotronHMoe, "gate-gpu-nemotron-h-moe-e2e")?;
         let inputs = moe_place::read(&file)?;
         let spec = gate_card::card()?;
-        let machine = workstation::placed_on(spec, case.hp.n_layer, workstation::SCRATCH);
+        let layers = inputs.model.layers;
+        let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
         let ctx = u64::try_from(whole.ctx)?;
         // No lever is read: the clause plans and loads by its arms alone, so a
         // lever left in the runner's environment cannot move it.
@@ -1281,7 +1282,7 @@ mod gate {
             let plan = inputs.plan_with(&machine, ctx, &arm.levers, arm.experts)?;
             // A layer is hosted when the card holds fewer than the model's
             // experts of it; a layer with no routed stacks is neither.
-            let split: Vec<(usize, u64, u64)> = (0..case.hp.n_layer)
+            let split: Vec<(usize, u64, u64)> = (0..layers)
                 .filter_map(|l| {
                     let x = case.hp.experts[l]?;
                     Some((l, plan.n_l[l], x.n_expert as u64))

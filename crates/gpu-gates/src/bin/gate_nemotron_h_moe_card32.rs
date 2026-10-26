@@ -149,9 +149,12 @@ mod gate {
         } else {
             Experts::Placed
         };
-        let machine = workstation::placed_on(spec, hp.n_layer, workstation::SCRATCH);
+        // The planner's layer count: the trunk, not `block_count`, which holds the file's next-token
+        // block too.
+        let layers = inputs.model.layers;
+        let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
         let plan = inputs.plan_with(&machine, ctx, &PlanLevers::default(), experts)?;
-        let card: Vec<(usize, u64, u64)> = (0..hp.n_layer)
+        let card: Vec<(usize, u64, u64)> = (0..layers)
             .filter_map(|l| Some((l, plan.n_l[l], hp.experts[l]?.n_expert as u64)))
             .collect();
         println!(
