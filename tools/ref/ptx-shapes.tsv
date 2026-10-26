@@ -280,7 +280,9 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 generate_ds41   hc_gated_up_mma_mix_4                  536         184
 # PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
 # GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
-generate_ds41   hc_gated_up_mma_mix_4_bf16             676         192
+# PIN(2026-10-26): spill 676 -> 628 B and cc 8.6 JIT local 192 -> 200 B, both measured by gate-ptx-spill (sm_86 ptxas
+# 13.3.73, the RTX A6000's JIT): cuda-oxide moved to NVIDIA/cuda-rust 9df9e7cef561 with #1648, and the PTX moved with it.
+generate_ds41   hc_gated_up_mma_mix_4_bf16             628         200
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
