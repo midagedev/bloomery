@@ -9,8 +9,9 @@
 //! arena's: a pass reads and writes the same ones, so a pass and a step
 //! continue each other.
 //!
-//! The expert buffers hold a row per slot (`m * 9`), the pair's output and
-//! the down's output at their widths: they are most of the arena.
+//! The expert buffers hold a row per slot (`m` times the instance's slots),
+//! the pair's output and the down's output at their widths: they are most of
+//! the arena.
 //!
 //! The copies a pass leaves after rows inside it ([`SnapBufs`]) are opened
 //! apart from the arena, by the open of a session that marks or else by the
@@ -78,9 +79,11 @@ pub(super) struct RowsArena {
     pub(super) delta_prep_stride: usize,
     /// The router's logits, `RouterGeom::logit_stride` a row.
     pub(super) logits: MetalBuffer<f32>,
-    /// The picks of each row, the shared expert's id last.
+    /// The picks of each row, the shared expert's id last when the instance
+    /// has one.
     pub(super) pick_ids: MetalBuffer<u32>,
-    /// The picks' weights, the shared expert's gate last.
+    /// The picks' weights, the shared expert's gate last when the instance
+    /// has one.
     pub(super) pick_weights: MetalBuffer<f32>,
     /// The slot at each place of the expert-sorted list.
     pub(super) sorted: MetalBuffer<u32>,

@@ -454,8 +454,9 @@ enum Table {
     /// instance's fixture.
     Whole,
     /// The clauses of the kernels the instance's geometry shapes (router,
-    /// experts, attention), the main table's mutants of those clauses
-    /// (`kept`) and the instance's own (`own`).
+    /// experts, attention, and the prompt pass's rows and routing), the main
+    /// table's mutants of those clauses (`kept`) and the instance's own
+    /// (`own`).
     Shaped {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
@@ -900,6 +901,8 @@ fn clause_table<'a>(
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))
             .chain(clauses_attention::table(ctx))
+            .chain(clauses_rows::shaped(ctx))
+            .chain(clauses_route::shaped(ctx))
             .collect(),
         Table::Whole => front(ctx)
             .into_iter()
