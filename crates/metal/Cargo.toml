@@ -82,6 +82,9 @@ bloomery-placement = { path = "../placement" }
 # vocabulary and the sampler chain, every seat's owners.
 bloomery-runtime = { path = "../runtime" }
 bloomery-serve = { path = "../serve" }
+# The shape table the kernels' instances are rows of (`src/instance.rs`), and
+# the description a file's shape is matched on: host code, every OS.
+bloomery-models = { path = "../models" }
 
 # The Objective-C bindings, macOS only: on another operating system the
 # library is empty and the gate bin only refuses, so these are never built.
@@ -111,3 +114,6 @@ bloomery-levers = { path = "../levers" }
 # The fault site's table, the one owner the generated header is written
 # from.
 bloomery-device = { path = "../device" }
+# The shape table the registered instances are rows of: one header and one
+# compile per instance.
+bloomery-models = { path = "../models" }

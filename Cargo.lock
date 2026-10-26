@@ -383,6 +383,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-models",
  "bloomery-os",
  "bloomery-placement",
  "bloomery-refset",

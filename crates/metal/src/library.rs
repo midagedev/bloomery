@@ -1,11 +1,15 @@
-//! The library the kernels come from.
+//! The library the kernels come from: one instance's (`crate::instance`).
+//! `build.rs` writes the kernels' source of every registered instance and
+//! the library is the one of the instance it is opened at, which a file
+//! selects by its shape.
 //!
 //! Two paths, and the gate prints which one ran:
 //!
 //! - the **metallib**: `build.rs` compiled the kernels with `xcrun metal`
 //!   when the Metal Toolchain is installed, and the bytes are embedded.
-//! - the **source**: the same source, with the fault site's table written
-//!   in front of it, is compiled by the Metal runtime when it loads.
+//! - the **source**: the same source, with the fault site's table and the
+//!   instance's geometry written in front of it, is compiled by the Metal
+//!   runtime when it loads: the instance's alone.
 //!
 //! Both paths are given the same math options (safe math, precise
 //! single-precision functions, language version 3.2) and the source turns
@@ -35,20 +39,83 @@ use bloomery_device::DeviceError;
 
 use crate::device::MetalDevice;
 use crate::handle::Handle;
+use crate::instance::{HOST, Instance};
 
-/// The kernels' source, with the fault site's table in front of them: the
-/// text the runtime compiles, and the text the kernel gate edits its mutants
-/// into.
-pub const SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/bloomery.metal"));
+/// One registered instance's embedded sources, as `build.rs` wrote them.
+struct Built {
+    /// The instance's name.
+    name: &'static str,
+    /// The kernels' source, the fault site's table and the instance's
+    /// geometry in front of them.
+    source: &'static str,
+    /// The tensor-op GEMMs' source, with the same header in front.
+    tensor: &'static str,
+}
 
-/// The tensor-op GEMMs' source (`kernels/gemm_tensor.metal` after the files it
-/// reads), with the same table in front: the text the runtime compiles at
-/// Metal 4, and the text the kernel gate edits its tensor mutants into.
-pub const TENSOR_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/bloomery_tensor.metal"));
+// `BUILT`, and `METALLIBS` when the Metal Toolchain was there.
+include!(concat!(env!("OUT_DIR"), "/instances.rs"));
 
-/// The metallib `build.rs` compiled, when the Metal Toolchain was there.
-#[cfg(metal_lib = "metallib")]
-const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bloomery.metallib"));
+/// Whether two names are the same bytes.
+const fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The sources `build.rs` wrote for `inst`; none for an instance that is not
+/// registered.
+const fn built_of(inst: &Instance) -> Option<&'static Built> {
+    let mut i = 0;
+    while i < BUILT.len() {
+        if same_name(BUILT[i].name, inst.name) {
+            return Some(&BUILT[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The sources of the host's instance ([`HOST`]): `build.rs` writes every
+/// registered instance's, and the host's is registered.
+const HOST_BUILT: &Built = match built_of(&HOST) {
+    Some(built) => built,
+    None => panic!("build.rs wrote no sources for the host's instance"),
+};
+
+/// The kernels' source of the host's instance ([`HOST`]), with the fault
+/// site's table and its geometry in front of them: the text the kernel gate
+/// edits its mutants into.
+pub const SOURCE: &str = HOST_BUILT.source;
+
+/// The tensor-op GEMMs' source of the host's instance
+/// (`kernels/gemm_tensor.metal` after the files it reads), with the same
+/// header in front: the text the runtime compiles at Metal 4, and the text
+/// the kernel gate edits its tensor mutants into.
+pub const TENSOR_SOURCE: &str = HOST_BUILT.tensor;
+
+/// The sources of `inst`, or the named refusal of an instance `build.rs` did
+/// not write.
+fn sources(inst: &Instance) -> Result<&'static Built, DeviceError> {
+    built_of(inst).ok_or_else(|| {
+        DeviceError::unsupported(
+            "library",
+            format!(
+                "no kernels are built for instance {}: build.rs writes the rows of \
+                 instance::REGISTERED",
+                inst.name
+            ),
+        )
+    })
+}
 
 /// Which path the library came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +253,8 @@ pub struct Library {
     library: Handle<dyn MTLLibrary>,
     device: Handle<dyn MTLDevice>,
     path: LibraryPath,
+    /// The instance whose sources the library is compiled from.
+    instance: &'static Instance,
     rows_per_simd_group: Option<usize>,
     router_sg: Option<usize>,
     /// The tensor-op GEMMs' library, when the GEMMs run on them.
@@ -227,44 +296,83 @@ fn define_of(text: &str, name: &str) -> Option<usize> {
 }
 
 impl Library {
-    /// The library this machine's Metal device takes: the metallib when the
-    /// build made one, the source otherwise, and the tensor-op GEMMs beside
-    /// it on a GPU whose cores carry matrix units.
-    pub(crate) fn compile(device: &Handle<dyn MTLDevice>) -> Result<Self, DeviceError> {
+    /// The library of `instance` this machine's Metal device takes: the
+    /// metallib when the build made one, the source otherwise, and the
+    /// tensor-op GEMMs beside it on a GPU whose cores carry matrix units.
+    /// An instance `build.rs` did not write is refused by name.
+    pub(crate) fn compile(
+        device: &Handle<dyn MTLDevice>,
+        instance: &'static Instance,
+    ) -> Result<Self, DeviceError> {
+        let built = sources(instance)?;
         #[cfg(metal_lib = "metallib")]
-        let library = Self::metallib_of(device)?;
+        let library = Self::metallib_of(device, instance)?;
         #[cfg(not(metal_lib = "metallib"))]
-        let library = Self::source_of(device, SOURCE, MTLLanguageVersion::Version3_2)?;
+        let library = Self::source_of(
+            device,
+            instance,
+            built.source,
+            MTLLanguageVersion::Version3_2,
+        )?;
         match MatrixUnits::of(device).path() {
             GemmPath::Simdgroup => Ok(library),
             GemmPath::TensorOps => {
-                let tensor =
-                    Self::source_of(device, TENSOR_SOURCE, MTLLanguageVersion::Version4_0)?;
+                let tensor = Self::source_of(
+                    device,
+                    instance,
+                    built.tensor,
+                    MTLLanguageVersion::Version4_0,
+                )?;
                 Ok(library.with_tensor_gemms(tensor))
             }
         }
     }
 
-    /// The library the runtime compiles from the source.
+    /// The library the runtime compiles from the source of the device's
+    /// instance.
     pub fn from_source(device: &MetalDevice) -> Result<Self, DeviceError> {
-        Self::source_of(device.handle(), SOURCE, MTLLanguageVersion::Version3_2)
+        let instance = device.library().instance;
+        let built = sources(instance)?;
+        Self::source_of(
+            device.handle(),
+            instance,
+            built.source,
+            MTLLanguageVersion::Version3_2,
+        )
     }
 
-    /// The library the runtime compiles from the given source text. For the
-    /// kernels gate alone, which is why it is public: its mutants (a defect
-    /// edited into the shipped source's text) and its gate-only kernels
-    /// appended to that text. The engine takes [`Library::from_source`].
+    /// The library the runtime compiles from the given source text, at the
+    /// device's instance. For the kernels gate alone, which is why it is
+    /// public: its mutants (a defect edited into the shipped source's text)
+    /// and its gate-only kernels appended to that text. The engine takes
+    /// [`Library::from_source`].
     pub fn from_source_text(device: &MetalDevice, text: &str) -> Result<Self, DeviceError> {
-        Self::source_of(device.handle(), text, MTLLanguageVersion::Version3_2)
+        Self::source_of(
+            device.handle(),
+            device.library().instance,
+            text,
+            MTLLanguageVersion::Version3_2,
+        )
     }
 
     /// The tensor-op GEMMs' library the runtime compiles at Metal 4 from
-    /// `text` ([`TENSOR_SOURCE`], or the gate's mutant of it), on any device
-    /// that compiles it: the gate and the probe run it whatever
-    /// [`MatrixUnits`] says. A device whose runtime refuses it is a named
-    /// error.
+    /// `text` ([`TENSOR_SOURCE`], or the gate's mutant of it), at the
+    /// device's instance, on any device that compiles it: the gate and the
+    /// probe run it whatever [`MatrixUnits`] says. A device whose runtime
+    /// refuses it is a named error.
     pub fn tensor_from_source_text(device: &MetalDevice, text: &str) -> Result<Self, DeviceError> {
-        Self::source_of(device.handle(), text, MTLLanguageVersion::Version4_0)
+        Self::source_of(
+            device.handle(),
+            device.library().instance,
+            text,
+            MTLLanguageVersion::Version4_0,
+        )
+    }
+
+    /// The instance the library is compiled at.
+    #[must_use]
+    pub fn instance(&self) -> &'static Instance {
+        self.instance
     }
 
     /// This library with its GEMMs taken from `tensor`, a library of
@@ -310,6 +418,7 @@ impl Library {
 
     fn source_of(
         device: &Handle<dyn MTLDevice>,
+        instance: &'static Instance,
         text: &str,
         version: MTLLanguageVersion,
     ) -> Result<Self, DeviceError> {
@@ -325,21 +434,39 @@ impl Library {
             library: Handle(library),
             device: device.clone(),
             path: LibraryPath::Source,
+            instance,
             rows_per_simd_group: define_of(text, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
             router_sg: define_of(text, "BLOOMERY_ROUTER_SG"),
             tensor: None,
         })
     }
 
-    /// The library of the embedded metallib, when the build made one.
+    /// The library of the device's instance's embedded metallib, when the
+    /// build made one.
     #[cfg(metal_lib = "metallib")]
     pub fn from_metallib(device: &MetalDevice) -> Result<Self, DeviceError> {
-        Self::metallib_of(device.handle())
+        Self::metallib_of(device.handle(), device.library().instance)
     }
 
     #[cfg(metal_lib = "metallib")]
-    fn metallib_of(device: &Handle<dyn MTLDevice>) -> Result<Self, DeviceError> {
-        let data = dispatch2::DispatchData::from_static_bytes(METALLIB);
+    fn metallib_of(
+        device: &Handle<dyn MTLDevice>,
+        instance: &'static Instance,
+    ) -> Result<Self, DeviceError> {
+        let built = sources(instance)?;
+        let &(_, bytes) = METALLIBS
+            .iter()
+            .find(|(name, _)| *name == instance.name)
+            .ok_or_else(|| {
+                DeviceError::unsupported(
+                    "library",
+                    format!(
+                        "build.rs compiled no metallib for instance {}",
+                        instance.name
+                    ),
+                )
+            })?;
+        let data = dispatch2::DispatchData::from_static_bytes(bytes);
         let library = device
             .newLibraryWithData_error(&data)
             .map_err(|e| DeviceError::backend("library", e.localizedDescription().to_string()))?;
@@ -347,8 +474,9 @@ impl Library {
             library: Handle(library),
             device: device.clone(),
             path: LibraryPath::Metallib,
-            rows_per_simd_group: define_of(SOURCE, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
-            router_sg: define_of(SOURCE, "BLOOMERY_ROUTER_SG"),
+            instance,
+            rows_per_simd_group: define_of(built.source, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
+            router_sg: define_of(built.source, "BLOOMERY_ROUTER_SG"),
             tensor: None,
         })
     }

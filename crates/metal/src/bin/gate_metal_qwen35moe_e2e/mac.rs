@@ -112,6 +112,7 @@ use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
+use bloomery_metal::instance::HOST;
 use bloomery_metal::library::{Library, TENSOR_SOURCE};
 
 #[path = "ahead.rs"]
@@ -507,7 +508,7 @@ pub fn main() -> ExitCode {
     if args.iter().any(|a| a == "--mutants-all") {
         return mutants_all();
     }
-    let device = match MetalDevice::open() {
+    let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
             println!("clause open: REFUSED ({e})");

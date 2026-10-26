@@ -13,6 +13,7 @@ use crate::buffer::{MetalBuffer, MetalRaw, MetalShared};
 use crate::census::MetalCensus;
 use crate::fault::MetalFaultWord;
 use crate::handle::Handle;
+use crate::instance::Instance;
 use crate::library::{Library, Pipeline};
 use crate::stream::{MetalEvent, MetalStream};
 
@@ -61,8 +62,10 @@ pub struct MetalDevice {
 }
 
 impl MetalDevice {
-    /// Open the machine's default Metal device.
-    pub fn open() -> Result<Self, DeviceError> {
+    /// Open the machine's default Metal device, its library compiled at
+    /// `instance`: the one a file selects by its shape
+    /// (`crate::instance::select`), or the host's for a run with no file.
+    pub fn open(instance: &'static Instance) -> Result<Self, DeviceError> {
         let (major, minor, patch) = os_version();
         require_macos(major, minor, patch)?;
 
@@ -81,7 +84,7 @@ impl MetalDevice {
         })?;
         let queue = Handle(queue);
         let stream = MetalStream::new(device.clone(), queue.clone())?;
-        let library = Library::compile(&device)?;
+        let library = Library::compile(&device, instance)?;
         let fault = MetalFaultWord::new(&device)?;
         let ordinal = MetalCensus::ordinal_of(&device)?;
         Ok(Self {

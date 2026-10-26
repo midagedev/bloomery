@@ -33,6 +33,7 @@ use std::process::{Command, ExitCode};
 use bloomery_device::conformance::{Clause, Report, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
+use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::{
     HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant, SegParams, Segment,
 };
@@ -523,7 +524,7 @@ pub fn main() -> ExitCode {
     if args.iter().any(|a| a == "--mutants-all") {
         return mutants_all(&args);
     }
-    let device = match MetalDevice::open() {
+    let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
             println!("clause open: REFUSED ({e})");
