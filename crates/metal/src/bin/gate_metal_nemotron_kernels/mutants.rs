@@ -18,7 +18,7 @@ mod program;
 pub use program::Mutant;
 
 /// Every family's mutant table.
-const TABLES: &[&[Mutant]] = &[B32_MUTANTS];
+const TABLES: &[&[Mutant]] = &[B32_MUTANTS, super::clauses_mamba2::MUTANTS];
 
 /// Every mutant of every table.
 pub fn all() -> impl Iterator<Item = &'static Mutant> {

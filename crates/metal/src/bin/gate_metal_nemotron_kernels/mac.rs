@@ -31,6 +31,8 @@ use bloomery_metal::kernels::{Kernels, MatvecParams, Mode, NormOnLoad, Quant, Se
 use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::stream::MetalStream;
 
+#[path = "clauses_mamba2.rs"]
+mod clauses_mamba2;
 #[path = "clauses_q5_0.rs"]
 mod clauses_q5_0;
 #[path = "fixture.rs"]
@@ -43,6 +45,8 @@ mod mutants;
     reason = "the clauses read the oracle's mat-vec reference and band; the other families read the rest"
 )]
 mod oracle;
+#[path = "oracle_mamba2.rs"]
+mod oracle_mamba2;
 #[path = "../shared/synthetic.rs"]
 mod synthetic;
 
@@ -461,6 +465,7 @@ pub fn main() -> ExitCode {
     // line.
     let clauses: Vec<(&'static str, ClauseRun)> = std::iter::empty()
         .chain(clauses_q5_0::table(&ctx))
+        .chain(clauses_mamba2::table(ctx.harness))
         .collect();
     if args.iter().any(|a| a == "--list") {
         for (name, _) in &clauses {
