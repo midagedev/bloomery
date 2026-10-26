@@ -25,6 +25,7 @@ crates/gguf/src/arch/deepseek41.rs	BLOOMERY_V41_ENGRAM	stays: the companion file
 crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
 crates/refset/src/fixture.rs	BLOOMERY_FIXTURE_ROOT,BLOOMERY_FIXTURE_VARIANT	gatestoml
+crates/refset/src/arch/mod.rs	BLOOMERY_CARD_ALL_EXPERTS	gatestoml
 crates/model/src/bin/bloomery-decode.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/metal/src/bin/generate_metal.rs	BLOOMERY_REF_MODEL	gatestoml

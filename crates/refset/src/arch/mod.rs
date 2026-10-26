@@ -93,7 +93,16 @@ pub fn named(name: &str) -> Option<&'static Family> {
 /// The families whose sets exist only where a machine fact holds, each with the variable that states it: every consumer gate of
 /// the family opens with `bash tools/ref/needs-env.sh <recipe> <VAR>`, so a machine without VAR defers the gate by name and has
 /// no sets for it. `needs_env_rows_are_the_families_whose_consumers_open_with_needs_env` holds this table to the justfile.
-static NEEDS_ENV: &[(&Family, &str)] = &[(&qwen4exp::nvfp4::HF, "BLOOMERY_CARD_ALL_EXPERTS")];
+static NEEDS_ENV: &[(&Family, &str, fn() -> bool)] = &[(
+    &qwen4exp::nvfp4::HF,
+    "BLOOMERY_CARD_ALL_EXPERTS",
+    card_all_experts,
+)];
+
+/// Whether `BLOOMERY_CARD_ALL_EXPERTS` is set and not empty here.
+fn card_all_experts() -> bool {
+    std::env::var_os("BLOOMERY_CARD_ALL_EXPERTS").is_some_and(|v| !v.is_empty())
+}
 
 /// The variable family `f`'s sets wait on, when it is unset or empty here: the sets are not in place on this machine by design, and
 /// a check of every family's sets in place names the family as deferred instead of failing on sets nothing here reads.
@@ -101,9 +110,9 @@ static NEEDS_ENV: &[(&Family, &str)] = &[(&qwen4exp::nvfp4::HF, "BLOOMERY_CARD_A
 pub fn deferred(f: &Family) -> Option<&'static str> {
     NEEDS_ENV
         .iter()
-        .find(|(g, _)| std::ptr::eq(*g, f))
-        .map(|&(_, var)| var)
-        .filter(|var| std::env::var_os(var).is_none_or(|v| v.is_empty()))
+        .find(|(g, _, _)| std::ptr::eq(*g, f))
+        .filter(|(_, _, set)| !set())
+        .map(|&(_, var, _)| var)
 }
 
 #[cfg(test)]
@@ -252,7 +261,7 @@ mod tests {
         }
         let table: Vec<(&str, String)> = NEEDS_ENV
             .iter()
-            .map(|&(f, var)| (f.name, var.to_string()))
+            .map(|&(f, var, _)| (f.name, var.to_string()))
             .collect();
         assert_eq!(
             derived, table,
