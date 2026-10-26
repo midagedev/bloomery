@@ -91,6 +91,7 @@ pub mod quant_sel;
 pub(crate) mod recur;
 pub(crate) mod ring_gemm;
 pub mod rope_neox;
+pub mod rope_norm;
 pub mod rope_table;
 pub mod route_body;
 pub mod route_core;

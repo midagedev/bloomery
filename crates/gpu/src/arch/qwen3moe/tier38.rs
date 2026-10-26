@@ -117,7 +117,7 @@ fn node_host(
             ff: geo::FF,
             n_used: geo::N_USED,
         },
-        |src| model::arch::qwen35moe::host::layers(src, &inputs.hp, 0..open.layers),
+        |src| model::arch::qwen35moe::host::layers_of_spec(src, &inputs.spec, 0..open.layers),
     )
 }
 

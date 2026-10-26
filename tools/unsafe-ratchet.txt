@@ -605,7 +605,12 @@ gguf 7 2 0
 # three) and the four load macros of grouped.rs, each with its SAFETY line; recounted by tools/check-unsafe.sh.
 # PIN(2026-10-25): gpu 2652 -> 2653 blocks, 334 -> 335 fns, new code, not old code relaxed: the IQ4_NL Engram row
 # decode (elem.rs `iq4nl_embed_value`, an unsafe fn, and its one window read), with its SAFETY line.
-gpu 2653 335 10
+# PIN(2026-10-26): gpu 2653 -> 2655 blocks, 335 -> 336 fns, new kernel entries, not old code relaxed: the Nanbeige
+# landing's net, as on its own base (1994/223 -> 1996/224). The group-of-7 tensor-core flash shares seg_mma at a pack
+# and the head-128 prompt walk is one macro body (prefill_128) each entry expands, the two static entries one block
+# each for their tiles (+2); the NORM rope append and its q8 twin hold one unsafe fn (rope_norm.rs, +1). Each block
+# has its SAFETY line.
+gpu 2655 336 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

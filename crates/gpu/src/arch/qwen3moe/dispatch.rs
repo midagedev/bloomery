@@ -24,13 +24,13 @@ use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{
-    DownEntry, FfnPlan, FfnRoute, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan, SharedPlan,
-    SharedSites, SiteTy, down_entry, down_sel, gate_up_entry, gate_up_fused, o_fused, qkv_fused,
-    reads_f32,
+    DownEntry, FfnPlan, FfnRoute, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan, Pairs,
+    SharedPlan, SharedSites, SiteTy, down_entry, down_sel, gate_up_entry, gate_up_fused, o_fused,
+    qkv_fused, reads_f32,
 };
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
-use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes};
+use super::scratch::{Append128, Append256, AppendNorm, Arena, FlashPass, Io, KvPlanes};
 use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
 use crate::gated_quant::GateLayout;
@@ -629,6 +629,19 @@ pub(super) fn attn_core(
             }
         }
         GqaKind::Gated256 => gated_256(c, n, kv, s, m)?,
+        GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        } => norm_128(c, n, kv, s, m)?,
+        GqaKind::Head128 { pairs, head_norm } => {
+            return Err(GpuError::shape(
+                "qwen3moe::attention",
+                format!(
+                    "a head-128 attention of {pairs:?} pairs with head norm {head_norm}, which no \
+                     launch here serves"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -650,7 +663,10 @@ pub(super) fn attn_core(
 /// out of those rows and turns the first 64 values, and the output
 /// projection's input is the flash output multiplied by `σ(gate)`: in its
 /// quantizer for a K-quant, as f32 rows for any other type
-/// ([`GqaKind::Gated256`]).
+/// ([`GqaKind::Gated256`]). A head-128 layer with a NORM rope and no head
+/// norm ([`GqaKind::Head128`]) turns all 128 values by neighbouring pairs
+/// with the cache append, and its flash output is the output projection's
+/// input as it is.
 pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     if m > GEMV_COLS {
         return wide::attn_in(c, n, s, m);
@@ -752,7 +768,7 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
     // flash's own, at head 256 the products `gated_256` wrote into the gated
     // rows. A K-quant one reads `act_attn`, so its f32 operand is unused.
     let rows = match n.kind {
-        GqaKind::Neox128 => &*attn,
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => &*attn,
         GqaKind::Gated256 if n.o_ty.kquant() => &*attn,
         GqaKind::Gated256 => gated_rows.as_ref().ok_or(GpuError::state(
             "qwen3moe::attention",
@@ -796,6 +812,63 @@ pub(super) fn out_resid(
     c.gpu
         .elem()
         .enqueue_add(c.gpu.stream(), x, normed, m * hidden, y)
+}
+
+/// The attention's head-128 middle with a NORM rope and no head norm
+/// ([`GqaKind::Head128`]): the turn of all 128 values of each query and key
+/// head by neighbouring pairs, with the cache append; the flash over the
+/// rows' live key counts at the layer's layout (`n.flash`); and, for a
+/// K-quant `attn_output`, the flash rows' q8_1.
+fn norm_128(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::norm_128";
+    let (gpu, k) = (c.gpu, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let i = s.col(m)?;
+    kv.append_norm(
+        &k.q35(WHAT)?.norm,
+        stream,
+        AppendNorm {
+            q: &mut s.q,
+            k: &mut s.k,
+            v: &s.v,
+            table: c.table,
+            pos: &s.pos,
+            n_head: d.n_head,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            m,
+            fault: c.sink,
+        },
+    )?;
+    kv.flash_head128(
+        &k.flash,
+        stream,
+        FlashPass {
+            q: &s.q,
+            n_keys: &s.n_keys,
+            scale: ATTN_SCALE,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            m,
+            part_v: &mut s.part_v,
+            part_ms: &mut s.part_ms,
+            fault: c.sink,
+            y: &mut s.attn,
+        },
+        n.flash,
+        c.mma,
+    )?;
+    if n.o_ty.kquant() {
+        gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
+    }
+    Ok(())
 }
 
 /// The attention's head-256 middle ([`GqaKind::Gated256`]): the q/k norm
@@ -1440,7 +1513,7 @@ fn apart_down(
 mod tests {
     use super::pass_launches;
     use crate::arch::qwen3moe::plan::fixtures::layer;
-    use crate::arch::qwen3moe::plan::{GqaKind, SiteTy};
+    use crate::arch::qwen3moe::plan::{GqaKind, Pairs, SiteTy};
 
     /// The launches of a one-layer pass at `m` rows, less the embedding.
     fn one(kind: GqaKind, tys: [SiteTy; 4], m: usize) -> usize {
@@ -1475,5 +1548,13 @@ mod tests {
         assert_eq!(one(h, [Q4K, Q4K, Q4K, F32], 1), 7 + ffn);
         // Head 256 keeps its out gate in front of the projection.
         assert_eq!(one(GqaKind::Gated256, [Q4K, Q4K, Q4K, Q8_0], 1), 8 + ffn);
+        // A NORM head of 128 with no head norm launches as the NEOX one does:
+        // the append one launch, the flash two, no gate.
+        let norm = GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        };
+        assert_eq!(one(norm, [Q4K; 4], 1), 7 + ffn);
+        assert_eq!(one(norm, [Q4K, Q4K, Q4K, Q8_0], 1), 7 + ffn);
     }
 }

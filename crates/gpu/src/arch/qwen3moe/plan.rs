@@ -20,9 +20,13 @@
 use crate::site::Form;
 pub(super) use chain::arch::qwen3moe::plan::{
     DeltaPlan, DownEntry, FfnPlan, FfnRoute, Flash, GateUpEntry, GqaKind, GqaPlan, Kind35,
-    LayerPlan, MixerPlan, SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kind35,
-    kinds35, moe_fits, q35, shared_entry,
+    LayerPlan, MixerPlan, Pairs, SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry,
+    kind35, kinds35, moe_fits, q35, shared_entry,
 };
+
+// The head the chain plans a `GqaKind::Head128` layer at is the one this crate's head-128 kernels
+// are built for.
+const _: () = assert!(chain::arch::qwen3moe::plan::HEAD_128 as usize == crate::flash_gqa::HEAD);
 
 /// Whether every one of `tys` is Q4_K: a fused group of Q4_K launches (one launch over several
 /// matrices, or a projection with its neighbour folded in) runs only then.

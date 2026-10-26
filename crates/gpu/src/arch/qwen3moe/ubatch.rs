@@ -87,23 +87,30 @@ fn ubatch_of(u: usize) -> Result<NonZeroUsize, GpuError> {
         .ok_or_else(|| GpuError::shape(WHAT, format!("a ubatch of {u} tokens (1..={UBATCH})")))
 }
 
-/// The ubatch size a load takes: [`UBATCH_ENV`] if set, else [`UBATCH`].
-/// Read once per process; a value that is set but not a size in
-/// `1..=UBATCH` is an error that names it, at every load.
+/// The ubatch size [`UBATCH_ENV`] asks, `None` when it is unset. Read once
+/// per process; a value that is set but not a size in `1..=UBATCH` is an
+/// error that names it, at every load.
+pub fn ubatch_asked() -> Result<Option<usize>, GpuError> {
+    static ASKED: std::sync::OnceLock<Result<Option<usize>, String>> = std::sync::OnceLock::new();
+    ASKED
+        .get_or_init(|| match std::env::var(UBATCH_ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(format!("{UBATCH_ENV}: {e}")),
+            Ok(v) => match v.parse::<usize>() {
+                Ok(u) if (1..=UBATCH).contains(&u) => Ok(Some(u)),
+                _ => Err(format!(
+                    "{UBATCH_ENV}={v} is not a ubatch size in 1..={UBATCH}"
+                )),
+            },
+        })
+        .clone()
+        .map_err(|e| GpuError::shape(WHAT, e))
+}
+
+/// The ubatch size a load takes: [`UBATCH_ENV`] if set ([`ubatch_asked`]),
+/// else [`UBATCH`].
 pub fn ubatch_size() -> Result<usize, GpuError> {
-    static SIZE: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
-    SIZE.get_or_init(|| match std::env::var(UBATCH_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(UBATCH),
-        Err(e) => Err(format!("{UBATCH_ENV}: {e}")),
-        Ok(v) => match v.parse::<usize>() {
-            Ok(u) if (1..=UBATCH).contains(&u) => Ok(u),
-            _ => Err(format!(
-                "{UBATCH_ENV}={v} is not a ubatch size in 1..={UBATCH}"
-            )),
-        },
-    })
-    .clone()
-    .map_err(|e| GpuError::shape(WHAT, e))
+    Ok(ubatch_asked()?.unwrap_or(UBATCH))
 }
 
 /// The ubatch size a load of a cache of `ctx` positions runs: [`ubatch_size`]

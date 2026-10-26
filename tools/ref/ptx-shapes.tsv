@@ -215,6 +215,12 @@ generate_ds41   gqa_flash_seg_h128_swa                   0           0
 generate_ds41   gqa_flash_seg_k192                       0           0
 generate_ds41   gqa_flash_seg_k192_ring                  0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
+generate_ds41   gqa_flash_seg_mma_g7                     0           0
+generate_ds41   gqa_flash_seg_mma_g7_q8                  0           0
+generate_ds41   gqa_prefill_flash_g7                     0           0
+generate_ds41   gqa_prefill_flash_g7_q8                  0           0
+generate_ds41   rope_norm_append                         0           0
+generate_ds41   rope_norm_append_q8                      0           0
 generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p12_sel            0           0
 generate_ds41   gqa_flash_seg_mma_256_p4                 0           0

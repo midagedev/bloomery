@@ -714,9 +714,9 @@ impl<T> Drop for TensorWindow<'_, T> {
 }
 
 /// The largest K a [`Q8Act`] takes: the widest K-quant input of the models
-/// this engine runs — DeepSeek-V4.1's `hc_{attn,ffn}_fn` read all four
-/// residual streams, 4 × 5120 values.
-pub(crate) const Q8ACT_MAX_K: usize = 20_480;
+/// this engine runs — a dense FFN down of 22,016 values; DeepSeek-V4.1's
+/// `hc_{attn,ffn}_fn`, which read all four residual streams, take 4 × 5120.
+pub(crate) const Q8ACT_MAX_K: usize = 22_016;
 
 /// The most columns a per-slot [`Q8Act`] takes ([`Q8Act::with_slots`]):
 /// every routed slot of a prompt batch — the host union's `UNION_MAX_COLS`

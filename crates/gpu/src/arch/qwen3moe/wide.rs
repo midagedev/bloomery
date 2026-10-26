@@ -24,10 +24,10 @@
 //!
 //! The attention half splits by the plan's kind, as the gemv arm does: head
 //! 256 with its gate ([`GqaKind::Gated256`]) and head 128
-//! ([`GqaKind::Neox128`]), whose three parts run over buffer views
-//! ([`Neox128Rows`]), so the arena of this arm and the whole-card GEMM
-//! prefill's (`ubatch.rs`, through [`neox_128_rows`]) both lend them their
-//! rows.
+//! ([`GqaKind::Neox128`], [`GqaKind::Head128`]), whose three parts run over
+//! buffer views ([`Neox128Rows`]), so the arena of this arm and the
+//! whole-card GEMM prefill's (`ubatch.rs`, through [`neox_128_rows`]) both
+//! lend them their rows.
 //!
 //! Numeric class. A wide op computes a token's values from that token's
 //! inputs alone — the GEMM accumulates each (slot, row) on its own, the
@@ -43,11 +43,12 @@ use super::body35::Body35;
 use super::dispatch::{Ctx, PassCtx};
 use super::experts::CombineArgs;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
-use super::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaKind, GqaPlan, SharedPlan, SiteTy};
+use super::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaKind, GqaPlan, Pairs, SharedPlan, SiteTy};
 use super::program::{Program, Tail};
 use super::router::MAX_TOKENS;
 use super::scratch::{
-    ApartForms, Append128, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route,
+    ApartForms, Append128, Append256, AppendNorm, Arena, Dims, Forms, GdnArena, KvPlanes,
+    PrefillFlash, Route,
 };
 use super::taps35::Ffn35Run;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
@@ -375,7 +376,7 @@ pub(super) fn route_dense(c: &Ctx<'_>, s: &mut Arena, m: usize) -> Result<(), Gp
 pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     match n.kind {
         GqaKind::Gated256 => gated_256_in(c, n, s, m),
-        GqaKind::Neox128 => {
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => {
             let d = s.dims;
             let env = (c.gpu, c.w, c.k);
             neox_128_in(env, (c.eps, c.sink), n, (&d, m), &mut neox_rows(s)?)
@@ -397,7 +398,7 @@ pub(super) fn attn_core(
 ) -> Result<(), GpuError> {
     match n.kind {
         GqaKind::Gated256 => gated_256_core(c, n, kv, s, m),
-        GqaKind::Neox128 => {
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => {
             let d = s.dims;
             let env = (c.gpu, c.w, c.k);
             let at = (c.table, c.eps, c.sink);
@@ -412,7 +413,7 @@ pub(super) fn attn_core(
 pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     match n.kind {
         GqaKind::Gated256 => gated_256_out(c, n, s, m),
-        GqaKind::Neox128 => {
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => {
             let d = s.dims;
             neox_128_out((c.gpu, c.w, c.k), n, (&d, m), &mut neox_rows(s)?)
         }
@@ -613,7 +614,7 @@ fn gated_256_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<()
 }
 
 /// The arena's buffers as a head-128 attention half's views
-/// ([`GqaKind::Neox128`], [`Neox128Rows`]).
+/// ([`GqaKind::Neox128`], [`GqaKind::Head128`], [`Neox128Rows`]).
 fn neox_rows(s: &mut Arena) -> Result<Neox128Rows<'_>, GpuError> {
     let Arena {
         x,
@@ -739,9 +740,12 @@ fn neox_128_in(
     Ok(())
 }
 
-/// The head-128 half's middle at `t` rows over `b`'s views: the q/k norm and
-/// rope with the K/V rows appended to the layer's planes, the prefill flash,
-/// and the flash rows quantized into the forms the output projection reads.
+/// The head-128 half's middle at `t` rows over `b`'s views: the turn with the
+/// K/V rows appended to the layer's planes, the prefill flash at the layer's
+/// layout (`n.flash`), and the flash rows quantized into the forms the output
+/// projection reads. The turn follows the plan's kind: the head norm with the
+/// NEOX turn ([`GqaKind::Neox128`]) or the NORM turn with no head norm
+/// ([`GqaKind::Head128`]); any other kind is refused by name.
 fn neox_128_core(
     (gpu, w, k): (&Gpu, &Weights, &Kernels),
     (table, eps, sink): (&DeviceBuffer<f32>, f32, FaultSink),
@@ -749,30 +753,60 @@ fn neox_128_core(
     (d, t): (&Dims, usize),
     b: &mut Neox128Rows<'_>,
 ) -> Result<(), GpuError> {
+    const WHAT_N: &str = "qwen3moe::wide::neox_128_core";
     let stream = gpu.stream();
-    // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
-    unsafe {
-        kv.append_128(
-            &k.neox,
+    match n.kind {
+        GqaKind::Neox128 => {
+            // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+            unsafe {
+                kv.append_128(
+                    &k.neox,
+                    stream,
+                    Append128 {
+                        q: &mut *b.q,
+                        k: &mut *b.k,
+                        v: &*b.v,
+                        gq: f32_gain(w, &n.attn_q_norm)?,
+                        gk: f32_gain(w, &n.attn_k_norm)?,
+                        table,
+                        pos: b.pos,
+                        eps,
+                        n_head: d.n_head,
+                        n_kv: d.n_kv,
+                        ctx: d.ctx,
+                        m: t,
+                        fault: sink,
+                    },
+                )
+            }?
+        }
+        GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        } => kv.append_norm(
+            &k.q35(WHAT_N)?.norm,
             stream,
-            Append128 {
+            AppendNorm {
                 q: &mut *b.q,
                 k: &mut *b.k,
                 v: &*b.v,
-                gq: f32_gain(w, &n.attn_q_norm)?,
-                gk: f32_gain(w, &n.attn_k_norm)?,
                 table,
                 pos: b.pos,
-                eps,
                 n_head: d.n_head,
                 n_kv: d.n_kv,
                 ctx: d.ctx,
                 m: t,
                 fault: sink,
             },
-        )
-    }?;
-    kv.prefill_128(
+        )?,
+        other => {
+            return Err(GpuError::shape(
+                WHAT_N,
+                format!("the {other:?} kind in a head-128 attention half"),
+            ));
+        }
+    }
+    kv.prefill_head128(
         &k.prefill,
         stream,
         PrefillFlash {
@@ -786,6 +820,7 @@ fn neox_128_core(
             fault: sink,
             y: &mut *b.attn,
         },
+        n.flash,
     )?;
     b.out
         .quantize(gpu, &wide_kernels(k), sink, b.attn, t, &[n.o_ty])

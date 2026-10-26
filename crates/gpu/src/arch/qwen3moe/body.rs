@@ -40,6 +40,7 @@ use crate::model::{
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
+use crate::rope_norm::RopeNormKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, KGemvKernels};
 use crate::tensor::{Window, WindowMut};
@@ -72,7 +73,8 @@ pub(super) const ATTN_SCALE_256: f32 = 0.0625;
 const _: () = assert!(crate::flash_gqa::HEAD_256 == 256);
 
 /// The kernels only Qwen3.6's layers launch: the delta rule's three, the
-/// gated router and the gated output projection's quantizer; and what a
+/// gated router and the gated output projection's quantizer, the NORM rope
+/// append of a head-128 layer with no head norm; and what a
 /// site that is not one of the fused Q4_K groups launches — the 32-value
 /// GEMM family with its quantizers and the F32 tile, the K-quant gemv beyond
 /// the `Gpu`'s own (Q5_K), the Q8_0 embedding and the f32 out gate (a Q8_0
@@ -85,6 +87,8 @@ pub(super) struct Q35Kernels {
     pub(super) gated: GatedQuantKernels,
     pub(super) g32: Gemm32Kernels,
     pub(super) q38: Q38Kernels,
+    /// The NORM turn and cache append of a head-128 layer with no head norm.
+    pub(super) norm: RopeNormKernels,
     /// A K-quant site's gemv beyond the `Gpu`'s own (the Q5_K one).
     pub(super) kgemv: KGemvKernels,
     /// The FFN's K-quant `_sel` family and its combine with a host sum.
@@ -132,6 +136,7 @@ impl Kernels {
                     gated: GatedQuantKernels::load(ctx)?,
                     g32: Gemm32Kernels::load(ctx)?,
                     q38: Q38Kernels::load(ctx)?,
+                    norm: RopeNormKernels::load(ctx)?,
                     kgemv: KGemvKernels::load(gpu)?,
                     ffn: dispatch::FfnKernels::load(gpu)?,
                 })

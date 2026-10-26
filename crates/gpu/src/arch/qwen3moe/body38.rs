@@ -1778,7 +1778,7 @@ impl Body38 {
         residency_glue: ResidencyGlue,
         (ub, route_run, counted, planned): (usize, usize, u64, usize),
     ) -> Result<Body38, GpuError> {
-        let (spec, hp) = (&inputs.spec, &inputs.hp);
+        let spec = &inputs.spec;
         let n = spec.layers.len();
         let ctx = usize::try_from(plan.ctx_max)
             .ok()
@@ -1920,7 +1920,7 @@ impl Body38 {
             host.r8,
             set.arena(),
             widths,
-            |src| model::arch::qwen35moe::host::layers(src, hp, hosted.iter().copied()),
+            |src| model::arch::qwen35moe::host::layers_of_spec(src, spec, hosted.iter().copied()),
         )?;
         residency_glue.attach_tier(experts.tier())?;
         let nvme_tier = experts.tier().cloned();
@@ -2003,6 +2003,16 @@ impl Body38 {
             CHECKPOINT_EVERY,
         )?;
         let who = Identity::of_load("qwen4exp", file, gpu, ctx)?;
+        // An IMROPE file's image rows read their sections in the file's
+        // `rope.section_order`, a key the description does not carry.
+        let imrope = imrope_sections(spec)
+            .map(|s| {
+                let order = model::arch::qwen35moe::hparams::Hparams::read(file)
+                    .map_err(|e| GpuError::plan(WHAT, e))?
+                    .rope_order;
+                Ok::<_, GpuError>((s, section_order(order)))
+            })
+            .transpose()?;
         // The loaded `output`'s form, the step's head-count term: the one
         // owner of the list is `mtp::output_form` (the borrow check asks it
         // too); a type it does not take (a Q4_K head, no file today) counts
@@ -2027,7 +2037,7 @@ impl Body38 {
             seq_rope: None,
             rope_base: None,
             media: None,
-            imrope: imrope_sections(spec).map(|s| (s, section_order(hp.rope_order))),
+            imrope,
             s,
             sp,
             a,

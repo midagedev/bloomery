@@ -36,6 +36,7 @@ use crate::rope_neox::{
     NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
     q8_plane_lens,
 };
+use crate::rope_norm::{NormArgs, NormQ8Args, RopeNormKernels};
 use crate::tensor::{Q8Act, WindowMut};
 use crate::weights::q8_0_planes;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
@@ -280,6 +281,21 @@ pub(super) struct Append256<'a> {
     pub(super) fault: FaultSink,
 }
 
+/// The fields [`NormArgs`] and [`NormQ8Args`] share, the NORM turn and append
+/// every cache-format arm of [`KvPlanes::append_norm`] launches.
+pub(super) struct AppendNorm<'a> {
+    pub(super) q: &'a mut DeviceBuffer<f32>,
+    pub(super) k: &'a mut DeviceBuffer<f32>,
+    pub(super) v: &'a DeviceBuffer<f32>,
+    pub(super) table: &'a DeviceBuffer<f32>,
+    pub(super) pos: &'a DeviceBuffer<u32>,
+    pub(super) n_head: usize,
+    pub(super) n_kv: usize,
+    pub(super) ctx: usize,
+    pub(super) m: usize,
+    pub(super) fault: FaultSink,
+}
+
 /// The fields [`GqaArgs`](crate::flash_gqa::GqaArgs) and
 /// [`GqaQ8Args`](crate::flash_gqa::GqaQ8Args) share, the decode flash every
 /// cache-format arm of [`KvPlanes::flash_128`] and [`KvPlanes::flash_256`]
@@ -331,14 +347,19 @@ fn q8_unserved(what: &'static str, flash: Flash, pass: &str) -> GpuError {
 
 impl KvPlanes {
     /// Whether these planes serve the scalar flash pass at the layout
-    /// `flash`: an f16 cache does, and a q8_0 cache's flash is the eight-head
+    /// `flash`: an f16 cache does, except at the group of seven, whose flash
+    /// is a tensor-core pass only; a q8_0 cache's flash is the eight-head
     /// layout's tensor-core pass only — asking for the scalar pass on it is
     /// [`q8_unserved`]'s named refusal, raised by the call that asks
     /// (`set_flash_mma`) before any step dispatches it.
     pub(super) fn serves_scalar(&self, what: &'static str, flash: Flash) -> Result<(), GpuError> {
-        match self {
-            KvPlanes::F16 { .. } => Ok(()),
-            KvPlanes::Q8 { .. } => Err(q8_unserved(what, flash, "scalar")),
+        match (self, flash) {
+            (KvPlanes::F16 { .. }, Flash::Seven) => Err(GpuError::shape(
+                what,
+                "the scalar pass at the group-of-seven layout: it has a tensor-core pass only",
+            )),
+            (KvPlanes::F16 { .. }, _) => Ok(()),
+            (KvPlanes::Q8 { .. }, _) => Err(q8_unserved(what, flash, "scalar")),
         }
     }
 
@@ -602,6 +623,214 @@ impl KvPlanes {
         }
     }
 
+    /// The head-128 NORM turn and append of `s`'s rows over these planes, no
+    /// head norm: [`RopeNormKernels::enqueue_rope_norm_append`]'s f16 launch,
+    /// or its q8_0 twin's on a q8_0 cache. Asynchronous, allocation-free,
+    /// capturable.
+    pub(super) fn append_norm(
+        &mut self,
+        norm: &RopeNormKernels,
+        stream: &CudaStream,
+        s: AppendNorm<'_>,
+    ) -> Result<(), GpuError> {
+        let AppendNorm {
+            q,
+            k,
+            v,
+            table,
+            pos,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => norm.enqueue_rope_norm_append(
+                stream,
+                NormArgs {
+                    q,
+                    k,
+                    v,
+                    table,
+                    pos,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                    cache_k: kc,
+                    cache_v: vc,
+                },
+            ),
+            KvPlanes::Q8 { kq, kd, vq, vd } => norm.enqueue_rope_norm_append_q8(
+                stream,
+                NormQ8Args {
+                    q,
+                    k,
+                    v,
+                    table,
+                    pos,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                },
+            ),
+        }
+    }
+
+    /// The head-128 decode flash of `s`'s rows over these planes at the
+    /// layout `flash` names: the eight-head pass ([`KvPlanes::flash_128`]), or
+    /// the group-of-seven pass ([`FlashGqaKernels::enqueue_pass_g7`], its q8_0
+    /// twin on a q8_0 cache), which is tensor-core only: `mma` false is
+    /// refused by name. Any other layout has no head-128 entry.
+    pub(super) fn flash_head128(
+        &mut self,
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        s: FlashPass<'_>,
+        flash: Flash,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "qwen3moe::KvPlanes::flash_head128";
+        match flash {
+            Flash::Group => self.flash_128(k, stream, s, mma),
+            Flash::Seven => {
+                let FlashPass {
+                    q,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                } = s;
+                match self {
+                    KvPlanes::F16 { k: kc, v: vc } => k.enqueue_pass_g7(
+                        stream,
+                        GqaArgs {
+                            q,
+                            kc,
+                            vc,
+                            n_keys,
+                            scale,
+                            n_kv,
+                            ctx,
+                            m,
+                            part_v,
+                            part_ms,
+                            fault,
+                            y,
+                        },
+                        mma,
+                    ),
+                    KvPlanes::Q8 { kq, kd, vq, vd } if mma => k.enqueue_pass_g7_q8(
+                        stream,
+                        GqaQ8Args {
+                            q,
+                            kq,
+                            kd,
+                            vq,
+                            vd,
+                            n_keys,
+                            scale,
+                            n_kv,
+                            ctx,
+                            m,
+                            part_v,
+                            part_ms,
+                            fault,
+                            y,
+                        },
+                    ),
+                    KvPlanes::Q8 { .. } => Err(q8_unserved(WHAT, flash, "scalar")),
+                }
+            }
+            Flash::Quads | Flash::Pairs => Err(GpuError::shape(
+                WHAT,
+                format!("the {flash:?} layout, which only the head-256 flash entries have"),
+            )),
+        }
+    }
+
+    /// The head-128 prefill flash of `s`'s rows over these planes at the
+    /// layout `flash` names: the eight-head pass ([`KvPlanes::prefill_128`]) or
+    /// the group-of-seven pass ([`FlashGqaPrefill::enqueue_g7`], its q8_0 twin
+    /// on a q8_0 cache). Any other layout has no head-128 entry.
+    pub(super) fn prefill_head128(
+        &mut self,
+        prefill: &FlashGqaPrefill,
+        stream: &CudaStream,
+        s: PrefillFlash<'_>,
+        flash: Flash,
+    ) -> Result<(), GpuError> {
+        match flash {
+            Flash::Group => self.prefill_128(prefill, stream, s),
+            Flash::Seven => {
+                let PrefillFlash {
+                    q,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                } = s;
+                match self {
+                    KvPlanes::F16 { k: kc, v: vc } => prefill.enqueue_g7(
+                        stream,
+                        GqaPrefillArgs {
+                            q,
+                            kc,
+                            vc,
+                            n_keys,
+                            scale,
+                            n_head,
+                            n_kv,
+                            ctx,
+                            t,
+                            fault,
+                            y,
+                        },
+                    ),
+                    KvPlanes::Q8 { kq, kd, vq, vd } => prefill.enqueue_g7_q8(
+                        stream,
+                        GqaPrefillQ8Args {
+                            q,
+                            kq,
+                            kd,
+                            vq,
+                            vd,
+                            n_keys,
+                            scale,
+                            n_head,
+                            n_kv,
+                            ctx,
+                            t,
+                            fault,
+                            y,
+                        },
+                    ),
+                }
+            }
+            Flash::Quads | Flash::Pairs => Err(GpuError::shape(
+                "qwen3moe::KvPlanes::prefill_head128",
+                format!("the {flash:?} layout, which only the head-256 flash entries have"),
+            )),
+        }
+    }
+
     /// The head-128 decode flash of `s`'s rows over these planes
     /// ([`FlashGqaKernels::enqueue_pass`]'s f16 launch, the tensor-core pass
     /// when `mma`, or its q8_0 twin's, which is that pass only: the scalar
@@ -777,6 +1006,10 @@ impl KvPlanes {
                 flash,
                 if mma { "tensor-core" } else { "scalar" },
             )),
+            (KvPlanes::F16 { .. }, Flash::Seven) => Err(GpuError::shape(
+                "qwen3moe::KvPlanes::flash_256",
+                "the group-of-seven layout, which only the head-128 flash entries have",
+            )),
         }
     }
 
@@ -925,10 +1158,12 @@ impl KvPlanes {
                     y,
                 },
             ),
-            (KvPlanes::Q8 { .. }, flash @ (Flash::Quads | Flash::Pairs)) => Err(q8_unserved(
+            (KvPlanes::Q8 { .. }, flash @ (Flash::Quads | Flash::Pairs | Flash::Seven)) => Err(
+                q8_unserved("qwen3moe::KvPlanes::prefill_256", flash, "prefill"),
+            ),
+            (KvPlanes::F16 { .. }, Flash::Seven) => Err(GpuError::shape(
                 "qwen3moe::KvPlanes::prefill_256",
-                flash,
-                "prefill",
+                "the group-of-seven layout, which only the head-128 flash entries have",
             )),
         }
     }

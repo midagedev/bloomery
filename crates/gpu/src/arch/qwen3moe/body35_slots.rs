@@ -6,7 +6,7 @@
 //! launches bound to one sequence run once per busy slot, over that slot's
 //! row window, its input record and its own stores: the embedding (its
 //! first position and its ids), a delta layer's conv over its conv ring and
-//! delta step over its state, and an attention layer's head-256 rope with
+//! delta step over its state, and an attention layer's rope with
 //! the cache append and the flash's segment pass and merge over its K/V
 //! planes, the rope reading the slot's own rotation table (a media load's
 //! images shift one sequence's rows and no other's). Every slot's rows read
@@ -32,7 +32,7 @@
 //! ([`SlotRows::SETTLES_PARTIAL_KEEP`] stays false): keeping a part of them
 //! would need the state after a kept row, which no lane holds.
 
-use super::body::ATTN_SCALE_256;
+use super::body::{ATTN_SCALE, ATTN_SCALE_256};
 use super::body35::{Body35, Slot35};
 use super::delta;
 use super::dispatch::{self, PassCtx};
@@ -40,10 +40,10 @@ use super::head_argmax::HeadArgmaxState;
 use super::image::MediaCarrier;
 use super::placed::{ColsMix, ColsWalk, Placed, slot_chain};
 use super::plan::LayerPlan;
-use super::plan::{DeltaPlan, FfnPlan, GqaKind, GqaPlan, MixerPlan};
+use super::plan::{DeltaPlan, FfnPlan, GqaKind, GqaPlan, MixerPlan, Pairs};
 use super::program::{self, Tail, layer_ctx};
-use super::scratch::{Append256, Arena, FlashPass, Io, KvPlanes, LayerStore, RecStore};
-use crate::flash_gqa::{partials_ms_len, partials_v_len_256};
+use super::scratch::{Append256, AppendNorm, Arena, FlashPass, Io, KvPlanes, LayerStore, RecStore};
+use crate::flash_gqa::{partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::host::StepLeg;
@@ -365,6 +365,87 @@ impl ColsMix for Mix35<'_, '_> {
     }
 }
 
+/// The head-128 attention with a NORM rope and no head norm, the one head-128 kind a pass of slots
+/// binds per slot.
+const NORM_128: GqaKind = GqaKind::Head128 {
+    pairs: Pairs::Norm,
+    head_norm: false,
+};
+
+/// A [`NORM_128`] layer's middle at the pass's `m` rows (the step's launches in its order): each
+/// slot's rope turn and cache append and its flash over its rows and its K/V planes, then a K-quant
+/// output projection's q8_1 rows of the flash output.
+fn norm_core(
+    c: &dispatch::Ctx<'_>,
+    n: &GqaPlan,
+    seqs: &mut [SlotSeq35<'_>],
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    let (gpu, k) = (c.gpu, c.k);
+    let norm = &k.q35(WHAT)?.norm;
+    let stream = gpu.stream();
+    let d = s.dims;
+    {
+        let Arena {
+            q,
+            k: kr,
+            v,
+            pos,
+            n_keys,
+            part_v,
+            part_ms,
+            attn,
+            ..
+        } = &mut *s;
+        for qs in seqs.iter_mut() {
+            let r = &qs.rows;
+            let kv = kv_of(&mut *qs.stores, c.layer)?;
+            let pos = rows(pos, r, 1)?;
+            let mut qr = rows_mut(q, r, d.attn_len())?;
+            kv.append_norm(
+                norm,
+                stream,
+                AppendNorm {
+                    q: &mut qr,
+                    k: &mut *rows_mut(kr, r, d.kv_len())?,
+                    v: &*rows(v, r, d.kv_len())?,
+                    table: qs.table,
+                    pos: &pos,
+                    n_head: d.n_head,
+                    n_kv: d.n_kv,
+                    ctx: d.ctx,
+                    m: r.len(),
+                    fault: c.sink,
+                },
+            )?;
+            kv.flash_head128(
+                &k.flash,
+                stream,
+                FlashPass {
+                    q: &qr,
+                    n_keys: &*rows(n_keys, r, 1)?,
+                    scale: ATTN_SCALE,
+                    n_kv: d.n_kv,
+                    ctx: d.ctx,
+                    m: r.len(),
+                    part_v: &mut *rows_mut(part_v, r, partials_v_len(1, d.n_head))?,
+                    part_ms: &mut *rows_mut(part_ms, r, partials_ms_len(1, d.n_head))?,
+                    fault: c.sink,
+                    y: &mut *rows_mut(attn, r, d.attn_len())?,
+                },
+                n.flash,
+                c.mma,
+            )?;
+        }
+    }
+    if n.o_ty.kquant() {
+        let i = s.col(m)?;
+        gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
+    }
+    Ok(())
+}
+
 impl ChainOps for Slots35<'_, '_> {
     type Error = GpuError;
 
@@ -383,16 +464,16 @@ impl ChainOps for Slots35<'_, '_> {
     }
 
     /// q, k and v over every row; any attention other than gated head 256
-    /// is refused by name.
+    /// or head 128 turned by NORM pairs with no head norm is refused by name.
     fn attn_in(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
         let c = &layer_ctx(self.c, l)?;
-        if n.kind != GqaKind::Gated256 {
+        if n.kind != GqaKind::Gated256 && n.kind != NORM_128 {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "layer {} is not gated attention at head 256, the one attention a pass of slots \
-                 binds per slot",
-                    c.layer
+                    "layer {} is {:?} attention, and a pass of slots binds only gated attention at \
+                     head 256 or head 128 turned by NORM pairs with no head norm per slot",
+                    c.layer, n.kind
                 ),
             ));
         }
@@ -402,9 +483,12 @@ impl ChainOps for Slots35<'_, '_> {
     /// Each slot's q/k norm, rope and cache append and its flash over its
     /// rows and its K/V planes, then the output gate over every row — in
     /// the output projection's quantizer for a K-quant, as f32 rows
-    /// otherwise.
+    /// otherwise. A head-128 layer turned by NORM pairs runs [`norm_core`].
     fn attn_core(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
         let (c, seqs, s, m) = (&layer_ctx(self.c, l)?, &mut *self.seqs, &mut *self.s, l.m);
+        if n.kind == NORM_128 {
+            return norm_core(c, n, seqs, s, m);
+        }
         let (gpu, w, k) = (c.gpu, c.w, c.k);
         let q35 = k.q35(WHAT)?;
         let stream = gpu.stream();

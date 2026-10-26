@@ -43,7 +43,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
-use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Stats, Take};
+use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Stats, Take, Why};
 
 use crate::GpuError;
 use crate::graph::cu;
@@ -77,9 +77,12 @@ impl Pending {
     }
 }
 
-/// One model's checkpoints: the ledger, the stores' lengths, the slots.
+/// One model's checkpoints: the ledger, the stores' lengths, the slots. A
+/// body with no recurrent store to copy has none of the three
+/// ([`Checkpoints::stateless`]).
 pub struct Checkpoints {
-    ledger: Ledger,
+    /// `None` for a body with no store to copy.
+    ledger: Option<Ledger>,
     /// f32s of each copied store, in the body's order.
     lens: Vec<usize>,
     slots: Vec<Slot>,
@@ -174,7 +177,7 @@ impl Checkpoints {
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
         Ok(Checkpoints {
-            ledger,
+            ledger: Some(ledger),
             lens,
             slots,
             points: Vec::new(),
@@ -183,6 +186,27 @@ impl Checkpoints {
             reading: Mutex::new(Vec::new()),
             ctx: Arc::clone(ctx),
         })
+    }
+
+    /// The checkpoints of a body whose trunk holds no recurrent store: nothing
+    /// to copy, so no ledger, no slot and no point. Its K/V rows are cut by
+    /// position, so a cut keeps every position it asks for up to the held one
+    /// ([`Checkpoints::kept`]), a call's only mark is its end
+    /// ([`Checkpoints::marks`]), and a take, a restore and a waiting cut move
+    /// nothing. [`Checkpoints::sequence`] still refuses a body whose stores
+    /// came out empty: the body states the difference.
+    #[must_use]
+    pub fn stateless(ctx: &Arc<CudaContext>, every: u32) -> Checkpoints {
+        Checkpoints {
+            ledger: None,
+            lens: Vec::new(),
+            slots: Vec::new(),
+            points: Vec::new(),
+            open: 0,
+            every,
+            reading: Mutex::new(Vec::new()),
+            ctx: Arc::clone(ctx),
+        }
     }
 
     /// f32s of each copied store, in the body's order.
@@ -200,7 +224,7 @@ impl Checkpoints {
     /// Checkpoints the budget holds.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.ledger.capacity()
+        self.ledger.as_ref().map_or(0, Ledger::capacity)
     }
 
     /// Slots made so far.
@@ -211,13 +235,17 @@ impl Checkpoints {
 
     #[must_use]
     pub fn stats(&self) -> Stats {
-        self.ledger.stats()
+        self.ledger
+            .as_ref()
+            .map_or_else(Stats::default, Ledger::stats)
     }
 
     /// The checkpoints' positions, ascending.
     #[must_use]
     pub fn positions(&self) -> Vec<u32> {
-        self.ledger.positions()
+        self.ledger
+            .as_ref()
+            .map_or_else(Vec::new, Ledger::positions)
     }
 
     /// The points a save at `pos` carries, ascending: every anchor of the
@@ -225,31 +253,68 @@ impl Checkpoints {
     /// ([`seqstate::save_points`]). The one pick, whatever the family.
     #[must_use]
     pub fn save_points(&self, pos: u32) -> Vec<u32> {
-        seqstate::save_points(&self.ledger.positions(), pos, self.every)
+        seqstate::save_points(&self.positions(), pos, self.every)
     }
 
-    /// What a cut to at most `n` keeps of the `held` positions, and why.
+    /// What a cut to at most `n` keeps of the `held` positions, and why. With
+    /// no store to copy ([`Checkpoints::stateless`]) every position up to
+    /// `held` is kept, the body's own rule.
     #[must_use]
     pub fn kept(&self, n: u32, held: u32) -> Kept {
-        self.ledger.keep(n, held)
+        match &self.ledger {
+            Some(ledger) => ledger.keep(n, held),
+            None => {
+                let at = n.min(held);
+                let why = if at == held {
+                    Why::Current
+                } else if at == 0 {
+                    Why::Empty
+                } else {
+                    Why::Rule
+                };
+                Kept {
+                    asked: n,
+                    held,
+                    at,
+                    why,
+                }
+            }
+        }
     }
 
-    /// The positions a prompt call from `from` to `to` takes a checkpoint at.
+    /// The positions a prompt call from `from` to `to` takes a checkpoint at;
+    /// with no store to copy, the call's end alone.
     #[must_use]
     pub fn marks(&self, from: u32, to: u32) -> Vec<u32> {
-        seqstate::marks(from, to, self.every)
+        if self.ledger.is_some() {
+            seqstate::marks(from, to, self.every)
+        } else if to > from {
+            vec![to]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Whether a cut waits for [`Checkpoints::apply`].
     #[must_use]
     pub fn pending(&self) -> bool {
-        self.ledger.pending().is_some()
+        self.ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.pending().is_some())
     }
 
     /// Plan a cut to `n` of the `held` positions; refused by name unless a
-    /// checkpoint, the held position or 0 is at `n`.
+    /// checkpoint, the held position or 0 is at `n`. With no store to copy,
+    /// refused by name only past `held`: nothing is planned.
     pub fn cut(&mut self, n: u32, held: u32) -> Result<(), GpuError> {
-        let cut = self.ledger.cut(n, held).map_err(refused)?;
+        let Some(ledger) = self.ledger.as_mut() else {
+            return if n > held {
+                Err(refused(seqstate::CheckpointError::Past { n, held }))
+            } else {
+                Ok(())
+            };
+        };
+        let cut = ledger.cut(n, held).map_err(refused)?;
         if cut != Cut::Stay {
             self.points.retain(|&(p, _)| p <= n);
         }
@@ -263,7 +328,7 @@ impl Checkpoints {
         stream: &CudaStream,
         stores: &mut [&mut DeviceBuffer<f32>],
     ) -> Result<(), GpuError> {
-        let Some(cut) = self.ledger.pending() else {
+        let Some(cut) = self.ledger.as_ref().and_then(Ledger::pending) else {
             return Ok(());
         };
         self.check(stores)?;
@@ -297,7 +362,9 @@ impl Checkpoints {
             }
         }
         stream.synchronize()?;
-        self.ledger.applied();
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.applied();
+        }
         Ok(())
     }
 
@@ -313,7 +380,11 @@ impl Checkpoints {
         self.unread("a take")?;
         self.apply(stream, stores)?;
         self.check(stores)?;
-        let take = self.ledger.take(at).map_err(refused)?;
+        let Some(ledger) = self.ledger.as_mut() else {
+            // No store to copy: the K/V rows below `at` are the state.
+            return Ok(Take::Held);
+        };
+        let take = ledger.take(at).map_err(refused)?;
         if let Take::Copy { slot, evicted, .. } = take {
             self.took(at, slot, evicted);
             if let Err(e) = self.copy_into(stream, slot, at, stores) {
@@ -339,7 +410,10 @@ impl Checkpoints {
         self.unread("an open take")?;
         self.apply(stream, stores)?;
         self.check(stores)?;
-        let Take::Copy { slot, evicted, .. } = self.ledger.take(at).map_err(refused)? else {
+        let Some(ledger) = self.ledger.as_mut() else {
+            return Ok(None);
+        };
+        let Take::Copy { slot, evicted, .. } = ledger.take(at).map_err(refused)? else {
             return Ok(None);
         };
         self.took(at, slot, evicted);
@@ -440,7 +514,7 @@ impl Checkpoints {
     /// The point at `at` given back to the ledger ([`Ledger::forget`]) and
     /// out of the points beside it; every other point stands.
     fn forget(&mut self, at: u32) -> Result<(), GpuError> {
-        self.ledger.forget(at).map_err(refused)?;
+        self.ledger_mut()?.forget(at).map_err(refused)?;
         self.points.retain(|&(p, _)| p != at);
         Ok(())
     }
@@ -595,7 +669,7 @@ impl Checkpoints {
     pub fn adopt(&mut self, at: u32, src: &[f32]) -> Result<(), GpuError> {
         self.unread("an adopt")?;
         self.fits(src.len())?;
-        let take = self.ledger.take(at).map_err(refused)?;
+        let take = self.ledger_mut()?.take(at).map_err(refused)?;
         let Take::Copy { slot, evicted, .. } = take else {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -669,8 +743,19 @@ impl Checkpoints {
     /// Every checkpoint dropped and no cut waiting: the model is empty. The
     /// slots stay made.
     pub fn clear(&mut self) {
-        self.ledger.clear();
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.clear();
+        }
         self.points.clear();
+    }
+
+    /// The ledger, refused by name for checkpoints with no store to copy
+    /// ([`Checkpoints::stateless`]).
+    fn ledger_mut(&mut self) -> Result<&mut Ledger, GpuError> {
+        self.ledger.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a ledger (these checkpoints copy no store)",
+        })
     }
 
     /// Refused by name unless `stores` are the stores of the lengths this
@@ -844,6 +929,39 @@ mod tests {
         assert!(e.to_string().contains("passes the u32 positions"), "{e}");
     }
 
+    /// Checkpoints with no store to copy keep every position a cut asks for
+    /// up to the held one (the body's rule, no reason of a checkpoint's), mark
+    /// only a call's end, hold no point and plan nothing for a cut; a cut past
+    /// the held position and an adopted point are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_checkpoints_without_a_store_keep_every_position() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut c = Checkpoints::stateless(&ctx, 512);
+        assert_eq!((c.capacity(), c.bytes(), c.slots()), (0, 0, 0));
+        assert_eq!(c.marks(0, 1300), vec![1300]);
+        assert_eq!(c.marks(200, 1300), vec![1300]);
+        assert!(c.marks(300, 300).is_empty());
+        let k = c.kept(700, 1000);
+        assert_eq!((k.at, k.why), (700, Why::Rule));
+        let k = c.kept(2000, 1000);
+        assert_eq!((k.at, k.why), (1000, Why::Current));
+        let k = c.kept(0, 1000);
+        assert_eq!((k.at, k.why), (0, Why::Empty));
+        c.cut(700, 1000).expect("a cut within the held positions");
+        assert!(!c.pending() && c.positions().is_empty());
+        let Err(e) = c.cut(1001, 1000) else {
+            panic!("a cut past the held position is refused");
+        };
+        assert!(e.to_string().contains("1001"), "{e}");
+        let taken = c.take(&stream, 700, &mut []).expect("a take of no store");
+        assert_eq!(taken, Take::Held);
+        let Err(e) = c.adopt(700, &[]) else {
+            panic!("a point adopted into checkpoints with no ledger is refused");
+        };
+        assert!(e.to_string().contains("copy no store"), "{e}");
+    }
+
     /// A restore reads a slot only as the position its last finished copy
     /// holds: a ledger point planted on a slot made and never copied is
     /// refused by name, and the stores keep what they held; a slot a take
@@ -860,7 +978,11 @@ mod tests {
             .expect("a take at 5");
         assert!(matches!(take, Take::Copy { slot: 0, .. }), "{take:?}");
         // The ledger names a new slot at 9, but no copy runs.
-        let planted = c.ledger.take(9).expect("the ledger's point at 9");
+        let planted = c
+            .ledger_mut()
+            .expect("a ledger")
+            .take(9)
+            .expect("the ledger's point at 9");
         assert!(
             matches!(
                 planted,

@@ -205,12 +205,16 @@ impl LegFamily for Qwen35 {
     }
 
     fn widths(inputs: &Self::Inputs) -> LegWidths {
-        let hp = &inputs.hp;
+        // A tier leg places routed experts; `describe` of a file it opens has a routed layer.
+        let moe = inputs
+            .spec
+            .routed()
+            .expect("a qwen35moe tier leg's description holds a routed layer");
         LegWidths {
-            n_expert: hp.n_expert,
-            n_used: hp.n_used,
-            n_embd: hp.n_embd,
-            ff: hp.expert_ff,
+            n_expert: moe.experts as usize,
+            n_used: moe.top_k as usize,
+            n_embd: inputs.spec.hidden as usize,
+            ff: moe.expert_ff as usize,
         }
     }
 
