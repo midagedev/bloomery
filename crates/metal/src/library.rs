@@ -52,8 +52,13 @@ struct Built {
     tensor: &'static str,
 }
 
-// `BUILT`, and `METALLIBS` when the Metal Toolchain was there.
-include!(concat!(env!("OUT_DIR"), "/instances.rs"));
+/// Every registered instance's embedded sources, in `instance::REGISTERED`'s
+/// order (build.rs writes the table).
+const BUILT: &[Built] = include!(concat!(env!("OUT_DIR"), "/built.rs"));
+
+/// Each instance's metallib, when the Metal Toolchain was there.
+#[cfg(metal_lib = "metallib")]
+const METALLIBS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/metallibs.rs"));
 
 /// Whether two names are the same bytes.
 const fn same_name(a: &str, b: &str) -> bool {
