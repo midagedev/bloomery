@@ -7,9 +7,9 @@
 //   route_table        the counting sort of every slot of the pass by expert:
 //                      the slot list in expert order, each slot's place in
 //                      it, and the table of tiles the grouped GEMM walks
-//   combine_rows       x[row] += y[slot 0] + ... + y[slot 8], the slots'
-//                      outputs read through each slot's place in the sorted
-//                      list, summed in slot order
+//   combine_rows       x[row] += y[slot 0] + ... + y[slot per_row - 1], the
+//                      slots' outputs read through each slot's place in the
+//                      sorted list, summed in slot order
 //   headnorm_rows      the gated delta numerator times each head's norm
 //                      scale, in place: the head-norm mat-vec's input
 //

@@ -136,6 +136,26 @@ pub fn pass_rows_max(g: &Geometry) -> usize {
     chain::arch::qwen3moe::router::ubatch_at(g.experts.slots, max_pass_slots(g))
 }
 
+/// How a session of `g`'s instance feeds a prompt call when nothing sets it:
+/// in passes when the rows arm's launches take the instance's slots, a step
+/// each otherwise. The arm's slots are the router's picks and the shared
+/// expert's slot exactly when the router has a shared row, and its route
+/// table has a group for each routed expert and one for the shared expert
+/// when there is one; the instances the arm runs are those that agree on
+/// both, a layer with a shared expert and one without alike.
+fn prefill_at_open(g: &Geometry) -> PrefillMode {
+    let (router, experts) = (&g.router, &g.experts);
+    let shared = router.shared == 1;
+    if experts.has_shared == shared
+        && experts.slots == experts.routed_ids + router.shared
+        && router.rows == router.experts + router.shared
+    {
+        PrefillMode::Batch
+    } else {
+        PrefillMode::Steps
+    }
+}
+
 /// The site types Metal's mat-vecs launch: the kernels' quant set
 /// ([`Quant::of_ggml`](crate::kernels::Quant::of_ggml), held equal to this
 /// list by `arena`'s test) as families — Q4_K, Q6_K
@@ -789,13 +809,7 @@ impl Session {
             })
             .transpose()
             .map_err(checkpoint_error)?;
-        // The rows arm runs each layer's shared expert with the picks; a file
-        // whose routers run none takes its prompt a step each.
-        let prefill = if arena.layers.iter().all(|l| l.ffn.shared.is_some()) {
-            PrefillMode::Batch
-        } else {
-            PrefillMode::Steps
-        };
+        let prefill = prefill_at_open(&checked.geom);
         let layers = arena.token_layers();
         Ok(Session {
             stream,
@@ -2231,6 +2245,32 @@ impl ChainOps for Profiler<'_> {
 mod tests {
     use super::*;
     use crate::instance::REGISTERED;
+
+    /// A session feeds its prompt calls in passes at every registered
+    /// instance: the rows arm runs a layer that has a shared expert and one
+    /// that has none.
+    #[test]
+    fn every_registered_instance_opens_in_passes() {
+        for inst in REGISTERED {
+            assert_eq!(
+                prefill_at_open(&Geometry::of(inst)),
+                PrefillMode::Batch,
+                "{}",
+                inst.name
+            );
+        }
+    }
+
+    /// A geometry whose slots are not the picks and the shared slot the
+    /// router's row says feeds a step each.
+    #[test]
+    fn a_geometry_the_rows_arm_does_not_take_opens_in_steps() {
+        for inst in REGISTERED {
+            let mut g = Geometry::of(inst);
+            g.experts.slots += 1;
+            assert_eq!(prefill_at_open(&g), PrefillMode::Steps, "{}", inst.name);
+        }
+    }
 
     /// A prompt call's inner checkpoints fall between passes: their spacing
     /// is the most rows of one pass.
