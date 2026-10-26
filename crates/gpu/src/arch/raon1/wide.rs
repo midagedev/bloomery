@@ -46,7 +46,7 @@ use crate::site::{
     self, Form, Gated, GatedIo, SiteTy, SiteWeight, SwigluRows, WideActs, WideForms, WideIn,
 };
 use crate::tensor::DeviceTensor;
-use crate::weights::{DevWeight, Weights};
+use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
@@ -982,19 +982,6 @@ pub(super) fn rda_rows(
     )
 }
 
-/// The stack `name` as the route GEMM reads it: its file type and form.
-fn stack<'w>(w: &'w Weights, name: &str) -> Result<(GgmlType, StackW<'w>), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::KQuant { ty, w, .. }) => Ok((*ty, StackW::Words(w))),
-        Some(DevWeight::Q5_0 { w, .. }) => Ok((GgmlType::Q5_0, StackW::Q5_0(w))),
-        _ => Err(GpuError::tensor(
-            WHAT,
-            name,
-            "a resident routed stack (the file's blocks as words, or Q5_0 packed)",
-        )),
-    }
-}
-
 /// The form a dense block's or a shared expert's SwiGLU rows take into its
 /// down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1038,9 +1025,9 @@ fn routed_stacks<'w>(
     l: usize,
     names: &[String; 3],
 ) -> Result<RoutedStacks<'w>, GpuError> {
-    let (gty, gate) = stack(w, &names[0])?;
-    let (uty, up) = stack(w, &names[1])?;
-    let (dty, down) = stack(w, &names[2])?;
+    let (gty, gate) = StackW::resident(WHAT, w, &names[0])?;
+    let (uty, up) = StackW::resident(WHAT, w, &names[1])?;
+    let (dty, down) = StackW::resident(WHAT, w, &names[2])?;
     if gty != uty {
         return Err(GpuError::shape(
             WHAT,

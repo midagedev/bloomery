@@ -374,12 +374,15 @@ pub const fn resident_down_runs(ty: GgmlType) -> bool {
 
 /// The card format every card leg reads a routed stack of `ty` in: NVFP4 in
 /// its planes ([`kernels::card_planes_runs`]: codes, block scales and a tensor
-/// scale an expert), every other type in the file's blocks. A leg's arms say
-/// which types it runs; this says how each loads, for every leg alike.
+/// scale an expert), Q5_0 in the packed layout its `q5_0_gemv_sel` reads
+/// ([`CardFormat::Q5_0`]), every other type in the file's blocks. A leg's arms
+/// say which types it runs; this says how each loads, for every leg alike.
 #[must_use]
 pub const fn leg_card_format(ty: GgmlType) -> CardFormat {
     if kernels::card_planes_runs(ty) {
         CardFormat::Nvfp4Planes
+    } else if matches!(kernels::down(ty), Some((DownEntry::Q5_0, _))) {
+        CardFormat::Q5_0
     } else {
         CardFormat::KQuant
     }
@@ -432,6 +435,18 @@ pub fn leg_pair(p: Program) -> Option<LegPair> {
     }
 }
 
+/// The format a whole-card load of the latent MoE body uploads a routed stack
+/// of `ty` in again, for the card leg's relu² form: the leg's card format
+/// ([`leg_card_format`]) where the file's own layout ([`CardFormat::of`]) is
+/// another (Q8_0's planes and Q5_1's packed codes, as the file's blocks);
+/// `None` where the stack already is in it (Q5_0's packed words) or the form
+/// does not run the type.
+#[must_use]
+pub fn relu2_relayout(ty: GgmlType) -> Option<CardFormat> {
+    let read = leg_card_format(ty);
+    (kernels::card_sel32_runs(ty) && CardFormat::of(ty) != Some(read)).then_some(read)
+}
+
 /// The latent MoE body's routed stacks: an up and a down (no gate) of the
 /// one type its `iq2_xxs_gemv_sel` launches read, in the file's blocks.
 pub const BOLT_LEG: GgmlType = GgmlType::IQ2_XXS;
@@ -439,8 +454,8 @@ pub const BOLT_LEG: GgmlType = GgmlType::IQ2_XXS;
 /// Whether the latent MoE body runs a routed up or down stack of type `ty` on
 /// the card: [`BOLT_LEG`] by its `iq2_xxs_gemv_sel` launches, or a
 /// 32-value-block type by the card leg's relu² form
-/// ([`kernels::card_sel32_runs`]: Q5_1, Q8_0, IQ4_NL). A layer runs one form
-/// for both stacks, so the load refuses by name a layer whose up and down
+/// ([`kernels::card_sel32_runs`]: Q5_0, Q5_1, Q8_0, IQ4_NL). A layer runs one
+/// form for both stacks, so the load refuses by name a layer whose up and down
 /// take different forms.
 #[must_use]
 pub const fn latent_leg_runs(ty: GgmlType) -> bool {
@@ -584,16 +599,11 @@ fn musespark_leg_card(ty: GgmlType) -> Option<CardFormat> {
     (ty == MUSESPARK_LEG).then(|| leg_card_format(ty))
 }
 
-/// The raon1 body's down arm ([`resident_down_runs`]): a Q5_0 stack in the packed
-/// layout its `q5_0_gemv_sel` reads, every other type in the leg's card format.
+/// The raon1 body's down arm ([`resident_down_runs`]), in the leg's card format
+/// ([`leg_card_format`]: a Q5_0 stack in the packed layout its `q5_0_gemv_sel`
+/// reads).
 fn resident_down_card(ty: GgmlType) -> Option<CardFormat> {
-    if !resident_down_runs(ty) {
-        None
-    } else if kernels::card_down_runs(ty) {
-        Some(leg_card_format(ty))
-    } else {
-        Some(CardFormat::Q5_0)
-    }
+    resident_down_runs(ty).then(|| leg_card_format(ty))
 }
 
 /// The common leg's gate·up arm in the mimo2 and solar2 bodies' plans
@@ -1066,16 +1076,18 @@ mod tests {
     }
 
     /// Every program's card leg loads a stack it runs by the one format rule
-    /// ([`leg_card_format`]): NVFP4 in its planes, every other type in the
-    /// file's blocks. Mutant, the defect Qwen3.8's rule had: a leg that loads
-    /// an NVFP4 stack it runs as the file's blocks.
+    /// ([`leg_card_format`]): NVFP4 in its planes, Q5_0 in the packed layout
+    /// its `q5_0_gemv_sel` reads, every other type in the file's blocks.
+    /// Mutants: the defect Qwen3.8's rule had (a leg that loads an NVFP4 stack
+    /// it runs as the file's blocks) and a rule without its Q5_0 arm, which
+    /// the raon1 and latent MoE bodies' Q5_0 stacks read.
     #[test]
     fn every_leg_loads_a_stack_by_the_shared_format() {
         for ty in types() {
-            let want = if ty == GgmlType::NVFP4 {
-                CardFormat::Nvfp4Planes
-            } else {
-                CardFormat::KQuant
+            let want = match ty {
+                GgmlType::NVFP4 => CardFormat::Nvfp4Planes,
+                GgmlType::Q5_0 => CardFormat::Q5_0,
+                _ => CardFormat::KQuant,
             };
             assert_eq!(leg_card_format(ty), want, "{ty}");
             for p in PROGRAMS {
@@ -1083,14 +1095,24 @@ mod tests {
                     continue;
                 };
                 for f in [gate_up(ty), down(ty)].into_iter().flatten() {
-                    // A whole-file body holds its Q5_0 down in the packed layout.
-                    let want = if p == Program::Raon1Body && ty == GgmlType::Q5_0 {
-                        CardFormat::Q5_0
-                    } else {
-                        want
-                    };
                     assert_eq!(f, want, "{p:?} {ty}");
                 }
+            }
+        }
+    }
+
+    /// A whole-card load of the latent MoE body re-uploads a stack for the relu² form only where
+    /// the file's own layout is not the one its `_sel` reads: Q5_1 and Q8_0 as the file's blocks,
+    /// not Q5_0, whose packed words are the leg's format already, and no type the form does not
+    /// run. Mutant: the re-upload as the file's blocks for every type the form runs.
+    #[test]
+    fn a_relu2_stack_is_uploaded_again_only_off_the_legs_layout() {
+        assert_eq!(relu2_relayout(GgmlType::Q5_0), None);
+        assert_eq!(relu2_relayout(GgmlType::Q5_1), Some(CardFormat::KQuant));
+        assert_eq!(relu2_relayout(GgmlType::Q8_0), Some(CardFormat::KQuant));
+        for ty in types() {
+            if !kernels::card_sel32_runs(ty) {
+                assert_eq!(relu2_relayout(ty), None, "{ty}");
             }
         }
     }

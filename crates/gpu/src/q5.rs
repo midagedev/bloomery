@@ -1961,6 +1961,21 @@ impl Q5Kernels {
         rows_per_expert: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
+        self.enqueue_gemv_q5_0_sel_at(stream, (w, act), (sel, n_slots), rows_per_expert, fault, y)
+    }
+
+    /// [`Q5Kernels::enqueue_gemv_q5_0_sel`] raising into `fault`, the sink of
+    /// the caller's layer, so an id past the stack names its layer.
+    pub fn enqueue_gemv_q5_0_sel_at(
+        &self,
+        stream: &CudaStream,
+        (w, act): (&crate::DeviceTensor<u32>, &Q8Blocks32),
+        (sel, n_slots): (&DeviceBuffer<u32>, usize),
+        rows_per_expert: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
         if w.cols() != q5_0_row_words(k_blocks) {
             return Err(GpuError::shape(
@@ -2028,7 +2043,7 @@ impl Q5Kernels {
             n_experts,
             rows_per_expert,
             n_slots,
-            crate::sink_over(&self.fault, LAYER_NONE),
+            fault,
             y,
         )?;
         Ok(())

@@ -79,7 +79,7 @@ use crate::iq_sel::{IqDown, IqGateUp};
 use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
 use crate::q4k_sel::QuantSel;
-use crate::q5::Q8Blocks32;
+use crate::q5::{Q5Kernels, Q8Blocks32};
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
@@ -260,7 +260,7 @@ pub fn leg_bytes_for(shape: LegShape, act: DownAct) -> usize {
 
 /// A resident routed stack's device form: the file's blocks as words
 /// (`DevWeight::KQuant`), NVFP4's planes and its experts' scales
-/// (`DevWeight::Nvfp4Stack`), or a Q5_0 down in the `pack_q5_0` layout
+/// (`DevWeight::Nvfp4Stack`), or a Q5_0 stack in the `pack_q5_0` layout
 /// (`DevWeight::Q5_0`), which `q5_0_gemv_sel` reads.
 #[derive(Clone, Copy)]
 pub(crate) enum StackW<'a> {
@@ -270,6 +270,25 @@ pub(crate) enum StackW<'a> {
 }
 
 impl<'a> StackW<'a> {
+    /// The resident routed stack `name` of `w` and its file type, for a walk
+    /// whose route GEMM reads it ([`StackW::route`]): the file's blocks as
+    /// words or Q5_0 packed. Any other weight is refused by name as `what`'s.
+    pub(crate) fn resident(
+        what: &'static str,
+        w: &'a Weights,
+        name: &str,
+    ) -> Result<(GgmlType, StackW<'a>), GpuError> {
+        match w.get(name) {
+            Some(DevWeight::KQuant { ty, w, .. }) => Ok((*ty, StackW::Words(w))),
+            Some(DevWeight::Q5_0 { w, .. }) => Ok((GgmlType::Q5_0, StackW::Q5_0(w))),
+            _ => Err(GpuError::tensor(
+                what,
+                name,
+                "a resident routed stack (the file's blocks as words, or Q5_0 packed)",
+            )),
+        }
+    }
+
     /// Rows the stack holds, every expert's.
     pub(crate) fn rows(&self) -> usize {
         match self {
@@ -515,8 +534,9 @@ struct LegStack<'a> {
 
 impl<'a> LegStack<'a> {
     /// The resident stack `name`: a `KQuant` stack of a type `runs` admits in
-    /// the stack's role, or an NVFP4 stack in its planes where `planes`
-    /// admits NVFP4; `role` is the refusal's words.
+    /// the stack's role, a Q5_0 stack in the packed layout where `runs` admits
+    /// Q5_0, or an NVFP4 stack in its planes where `planes` admits NVFP4;
+    /// `role` is the refusal's words.
     fn of(
         w: &'a Weights,
         name: &'a str,
@@ -578,7 +598,7 @@ impl<'a> LegStack<'a> {
         }
     }
 
-    /// The stack's `pack_q5_0` words, for the Q5_0 down entry.
+    /// The stack's `pack_q5_0` words, for the Q5_0 entry.
     fn q5_0(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
         match self.w {
             StackW::Q5_0(w) => Ok(w),
@@ -953,9 +973,10 @@ impl CardLeg {
         })
     }
 
-    /// The modules the 32-value-block `_sel`s run on.
-    fn sel32(&self) -> Sel32<'_> {
+    /// The modules the 32-value-block `_sel`s run on, the q5 module `gpu`'s.
+    fn sel32<'a>(&'a self, gpu: &'a Gpu) -> Sel32<'a> {
         Sel32 {
+            q5: gpu.q5(),
             q51: &self.q51,
             q80: &self.q80,
             iq: &self.quant,
@@ -1296,17 +1317,6 @@ impl CardLeg {
                 };
                 self.nvfp4.enqueue_down(stream, &d, fault, down)?;
             }
-            (Some((DownEntry::Q5_0, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
-                gpu.q5().enqueue_gemv_q5_0_sel(
-                    stream,
-                    st.down.q5_0()?,
-                    act,
-                    sel,
-                    slots,
-                    rows_per_expert,
-                    down,
-                )?;
-            }
             (Some((entry, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let run = Sel32Run {
                     entry,
@@ -1316,7 +1326,7 @@ impl CardLeg {
                     n_slots: slots,
                     rows_per_expert,
                 };
-                self.sel32().enqueue(stream, &run, fault, down)?;
+                self.sel32(gpu).enqueue(stream, &run, fault, down)?;
             }
             (
                 Some((
@@ -1401,6 +1411,7 @@ fn enqueue_sum(
 
 /// The modules a 32-value-block `_sel` runs on, borrowed from a leg.
 struct Sel32<'a> {
+    q5: &'a Q5Kernels,
     q51: &'a Q51SelKernels,
     q80: &'a Q80SelKernels,
     iq: &'a QuantSelKernels,
@@ -1440,6 +1451,14 @@ impl Sel32<'_> {
             rows_per_expert,
         } = *run;
         match entry {
+            DownEntry::Q5_0 => self.q5.enqueue_gemv_q5_0_sel_at(
+                stream,
+                (stack.q5_0()?, act),
+                (sel, n_slots),
+                rows_per_expert,
+                fault,
+                y,
+            ),
             DownEntry::Q5_1 => {
                 let d = Q51SelDown {
                     w: stack.words()?,
@@ -1485,7 +1504,8 @@ pub struct Relu2Stacks<'a> {
 
 impl<'a> Relu2Stacks<'a> {
     /// The stacks named `[up, down]` in `w`, each a resident
-    /// `DevWeight::KQuant` of a 32-value-block type the relu² form runs.
+    /// `DevWeight::KQuant` of a 32-value-block type the relu² form runs, or
+    /// for Q5_0 a `DevWeight::Q5_0` in the packed layout its entry reads.
     /// Allocation-free on success.
     pub fn of(w: &'a Weights, names: [&'a str; 2]) -> Result<Relu2Stacks<'a>, GpuError> {
         const UP: &str = "a resident routed up stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
@@ -1608,9 +1628,10 @@ impl Relu2Leg {
         })
     }
 
-    /// The modules the 32-value-block `_sel`s run on.
-    fn sel32(&self) -> Sel32<'_> {
+    /// The modules the 32-value-block `_sel`s run on, the q5 module `gpu`'s.
+    fn sel32<'a>(&'a self, gpu: &'a Gpu) -> Sel32<'a> {
         Sel32 {
+            q5: gpu.q5(),
             q51: &self.q51,
             q80: &self.q80,
             iq: &self.iq,
@@ -1657,7 +1678,7 @@ impl Relu2Leg {
         let stream = gpu.stream();
         let fault = gpu.layer_sink(run.layer)?;
         let slots = run.m * slots_per_col;
-        let sel32 = self.sel32();
+        let sel32 = self.sel32(gpu);
         let q = QuantSel {
             x: run.normed,
             cols: 0..slots,
@@ -1711,6 +1732,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::hybrid::HOST;
     use crate::q4k_sel::QuantSel;
+    use crate::q5::pack_q5_0;
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
     use model::placement::CardFormat;
@@ -1843,7 +1865,8 @@ pub(crate) mod tests {
     /// `DevWeight::KQuant`, named by [`stack_name`]. The types the loader
     /// keeps as the file's rows (Q4_K, Q5_K) come through a file written for
     /// them, so `tys` holds one; the other types' rows are the same word
-    /// stream, filed as derived weights.
+    /// stream, filed as derived weights (Q5_0's in the loader's packed
+    /// layout, `DevWeight::Q5_0`).
     fn weights(gpu: &Gpu, shape: LegShape, tys: &[GgmlType]) -> Weights {
         weights_for(gpu, shape, tys, |role, ty| match role {
             "down" => kernels::card_down_runs(ty),
@@ -1907,21 +1930,31 @@ pub(crate) mod tests {
         let mut weights = Weights::load_where(gpu.stream(), &split, |_| true).expect("resident");
         let _ = std::fs::remove_dir_all(&dir);
         for (name, ty, rows, k, bytes) in derived {
-            let words = words_of(&bytes, rows);
-            let w = DeviceTensor::upload(gpu.stream(), &words, rows, words.len() / rows)
-                .expect("the stack's words");
+            // The loader's layout for the type: Q5_0 packed, else the file's words.
+            let dev = if CardFormat::of(ty) == Some(CardFormat::Q5_0) {
+                let packed = pack_q5_0(&bytes, k, rows).expect("a packed stack");
+                let w = DeviceTensor::upload(gpu.stream(), &packed, rows, packed.len() / rows)
+                    .expect("the stack's packed words");
+                DevWeight::Q5_0 { w, k }
+            } else {
+                let words = words_of(&bytes, rows);
+                let w = DeviceTensor::upload(gpu.stream(), &words, rows, words.len() / rows)
+                    .expect("the stack's words");
+                DevWeight::KQuant { ty, w, k }
+            };
             weights
-                .insert_derived(name, DevWeight::KQuant { ty, w, k })
+                .insert_derived(name, dev)
                 .expect("a free derived name");
         }
         weights
     }
 
-    /// The resident words of the stack `name`.
+    /// The resident words of the stack `name`: the file's blocks, or Q5_0's
+    /// packed words.
     fn words<'a>(w: &'a Weights, name: &str) -> &'a DeviceTensor<u32> {
         match w.get(name) {
-            Some(DevWeight::KQuant { w, .. }) => w,
-            _ => panic!("{name} is not a resident K-quant"),
+            Some(DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. }) => w,
+            _ => panic!("{name} is not a resident K-quant or packed Q5_0"),
         }
     }
 
@@ -3182,15 +3215,19 @@ pub(crate) mod tests {
     };
     /// The tokens of the relu² runs: one, a few, and the buffers' cap.
     const R2_RUNS: [usize; 3] = [1, 4, R2_CAP];
-    /// The relu² cases, `(up type, down type)`: the three 32-value types
+    /// The relu² cases, `(up type, down type)`: the four 32-value types
     /// `kernels::card_sel32_runs` admits, each in both roles, with the mixes a
-    /// real file holds (an IQ4_NL up under an IQ4_NL, a Q8_0 and a Q5_1 down).
-    const R2_CASES: [(GgmlType, GgmlType); 5] = [
+    /// real file holds (an IQ4_NL up under an IQ4_NL, a Q8_0 and a Q5_1 down;
+    /// a Q5_0 up under a Q5_1 and a Q8_0 down).
+    const R2_CASES: [(GgmlType, GgmlType); 8] = [
         (GgmlType::IQ4_NL, GgmlType::IQ4_NL),
         (GgmlType::IQ4_NL, GgmlType::Q8_0),
         (GgmlType::IQ4_NL, GgmlType::Q5_1),
         (GgmlType::Q8_0, GgmlType::Q8_0),
         (GgmlType::Q5_1, GgmlType::Q5_1),
+        (GgmlType::Q5_0, GgmlType::Q5_0),
+        (GgmlType::Q5_0, GgmlType::Q5_1),
+        (GgmlType::Q5_0, GgmlType::Q8_0),
     ];
 
     /// The launches the relu² form is made of, run by hand on buffers of
@@ -3224,6 +3261,10 @@ pub(crate) mod tests {
         ) {
             let (stream, sink) = (gpu.stream(), gpu.layer_sink(0).expect("a sink"));
             match ty {
+                GgmlType::Q5_0 => {
+                    gpu.q5()
+                        .enqueue_gemv_q5_0_sel(stream, w, act, sel, n_slots, rows_per_expert, y)
+                }
                 GgmlType::Q5_1 => {
                     let d = Q51SelDown {
                         w,

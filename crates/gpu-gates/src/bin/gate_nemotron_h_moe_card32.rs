@@ -1,6 +1,6 @@
 //! The nemotron_h_moe gate of the card's 32-value routed experts: a file whose
 //! routed up and down stacks are of a 32-value-block type (Nemotron 3.5
-//! Lightning's IQ4_NL ups beside IQ4_NL, Q8_0 and Q5_1 downs) runs its card
+//! Lightning's Q5_0 ups beside Q5_1 and Q8_0 downs) runs its card
 //! experts through the card leg's relu² form in the step and the 32-value
 //! GEMMs in the prompt pass (`bloomery_gpu::arch::nemotron_h_moe`), where the
 //! host tier runs them in relu² through its own kernels. The real tier only:

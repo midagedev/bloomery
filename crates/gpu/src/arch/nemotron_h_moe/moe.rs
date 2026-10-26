@@ -14,8 +14,8 @@
 //! 4. each kept expert on the latent: the up rows of its id (`latent → w`,
 //!    the slots' one column), the squared ReLU, the down rows (`w → latent`)
 //!    (llama-graph.cpp :2321, :2422-2430, :2435): IQ2_XXS stacks (Bolt) by
-//!    `iq2_xxs_gemv_sel`, 32-value-block stacks (Lightning's IQ4_NL, Q8_0 and
-//!    Q5_1) by the card leg's relu² form ([`Relu2Leg`]), both stacks of a
+//!    `iq2_xxs_gemv_sel`, 32-value-block stacks (Lightning's Q5_0, Q5_1 and
+//!    Q8_0) by the card leg's relu² form ([`Relu2Leg`]), both stacks of a
 //!    layer one form ([`Form`]);
 //! 5. the slots' downs times their weights, summed in slot order
 //!    (:2451-2480);
@@ -45,7 +45,7 @@ use model::arch::nemotron_h_moe::names::{
     EXP_PROBS_B, FFN_DOWN_EXPS, FFN_DOWN_SHEXP, FFN_GATE_INP, FFN_LATENT_DOWN, FFN_LATENT_UP,
     FFN_UP_EXPS, FFN_UP_SHEXP,
 };
-use model::placement::{CardFormat, kernels};
+use model::placement::{accepts, kernels};
 
 /// The latent pair's site types: Q8_0 through the f32 gemv.
 const LATENT_TYPES: &[SiteTy] = &[SiteTy::Q8_0];
@@ -68,9 +68,9 @@ pub(super) enum Shared {
 pub(super) enum Form {
     /// IQ2_XXS stacks, which `iq2_xxs_gemv_sel` reads.
     Iq2,
-    /// Stacks of a 32-value-block type ([`kernels::card_sel32_runs`]: Q5_1,
-    /// Q8_0, IQ4_NL), which the card leg's relu² form ([`Relu2Leg`]) and the
-    /// 32-value GEMM read.
+    /// Stacks of a 32-value-block type ([`kernels::card_sel32_runs`]: Q5_0,
+    /// Q5_1, Q8_0, IQ4_NL), which the card leg's relu² form ([`Relu2Leg`]) and
+    /// the 32-value GEMM read.
     Sel32,
 }
 
@@ -92,18 +92,20 @@ fn form_of(file: &Split, l: usize, what: &'static str) -> Result<Form, GpuError>
             what,
             format!(
                 "layer {l}: the routed up is {u:?} and the down {d:?}; the card runs a layer's \
-                 two stacks as IQ2_XXS or as 32-value-block types (Q5_1, Q8_0, IQ4_NL), one form"
+                 two stacks as IQ2_XXS or as 32-value-block types (Q5_0, Q5_1, Q8_0, IQ4_NL), \
+                 one form"
             ),
         )),
     }
 }
 
 /// The routed stacks of `hp`'s MoE layers in `file` that a whole-card load
-/// lays out other than in the file's blocks (Q8_0's planes, Q5_1's packed
-/// words), uploaded again as words: what the relu² form's `_sel`s and the
-/// 32-value GEMM read. An IQ4_NL stack has no whole-card layout, so a
-/// whole-card load of it is refused by name before this runs; a placed load
-/// takes the plan's format, the file's blocks. Load-time only.
+/// lays out other than in the layout the relu² form's `_sel`s and the
+/// 32-value GEMM read, uploaded again in it ([`accepts::relu2_relayout`]:
+/// Q8_0's planes and Q5_1's packed codes as the file's blocks; Q5_0's packed
+/// words stay). An IQ4_NL stack has no whole-card layout, so a whole-card
+/// load of it is refused by name before this runs; a placed load takes the
+/// plan's format. Load-time only.
 pub(super) fn sel32_words(
     stream: &CudaStream,
     file: &Split,
@@ -116,8 +118,8 @@ pub(super) fn sel32_words(
             let Some((_, t)) = file.find(&name) else {
                 continue;
             };
-            if kernels::card_sel32_runs(t.ty) && CardFormat::of(t.ty) != Some(CardFormat::KQuant) {
-                w.relayout(stream, file, &name, CardFormat::KQuant)?;
+            if let Some(format) = accepts::relu2_relayout(t.ty) {
+                w.relayout(stream, file, &name, format)?;
             }
         }
     }

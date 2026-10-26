@@ -258,14 +258,15 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
 
 /// Whether the common card leg's relu² form launches the 32-value-block `_sel`
 /// of a routed stack of type `ty`, in either role: the [`up`] entry of an
-/// ungated up stack, or the [`down`] entry of the same form (Q5_1, Q8_0 and
-/// IQ4_NL, the 32-value downs of [`card_down_runs`]). The Q5_0 row reads the
-/// packed layout, not the file's blocks.
+/// ungated up stack, or the [`down`] entry of the same form: Q5_1, Q8_0 and
+/// IQ4_NL (the 32-value downs of [`card_down_runs`], stacks in the file's
+/// blocks) and Q5_0, whose stack is in the packed layout its entry reads
+/// ([`crate::placement::CardFormat::Q5_0`], `accepts::leg_card_format`).
 #[must_use]
 pub const fn card_sel32_runs(ty: GgmlType) -> bool {
     matches!(
         up(ty),
-        Some(DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl)
+        Some(DownEntry::Q5_0 | DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl)
     )
 }
 
@@ -590,11 +591,20 @@ mod tests {
             );
         }
         let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_sel32_runs(ty)).collect();
-        assert_eq!(runs, [GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL]);
+        assert_eq!(
+            runs,
+            [
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::IQ4_NL
+            ]
+        );
+        // Every type but Q5_0 is a down in the file's blocks; Q5_0's stack is the packed layout, a
+        // down the whole-file bodies' leg also runs (`accepts::resident_down_runs`).
         for ty in runs {
-            assert!(card_down_runs(ty), "{ty:?}");
+            assert_eq!(card_down_runs(ty), ty != GgmlType::Q5_0, "{ty:?}");
         }
-        assert!(up(GgmlType::Q5_0).is_some() && !card_sel32_runs(GgmlType::Q5_0));
     }
 
     /// The leg runs NVFP4 and NVFP4_ROWS from their planes and no other type;
