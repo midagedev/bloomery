@@ -16,7 +16,6 @@ use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
-use bloomery_device::Device;
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
 use bloomery_metal::arch::qwen3moe::session::{Node, Op, Session, StepMode};
@@ -112,16 +111,16 @@ pub fn f_deep(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
 
     // The prompt, host-fed: every step's count by its live keys, one wait a
     // step, nothing allocated on either side of a steady step.
-    let before = device.info().map_err(why)?.free_bytes;
+    let before = device.allocated_bytes().map_err(why)?;
     let mut walls = Vec::with_capacity(prompt.len());
     for (call, &id) in prompt.iter().enumerate() {
         walls.push(step_counted(&mut s, id, call > 0)?);
     }
-    let after = device.info().map_err(why)?.free_bytes;
+    let after = device.allocated_bytes().map_err(why)?;
     if after != before {
         return Err(format!(
-            "the device's free bytes moved from {before} to {after} across {} prompt steps: a \
-             step allocated",
+            "the device's allocated bytes moved from {before} to {after} across {} prompt steps: \
+             a step allocated",
             prompt.len()
         ));
     }

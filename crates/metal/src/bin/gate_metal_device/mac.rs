@@ -156,6 +156,10 @@ impl Harness for MetalHarness {
         &self.device
     }
 
+    fn held_bytes(&self) -> Result<u64, DeviceError> {
+        self.device.allocated_bytes()
+    }
+
     fn copy_f32(
         &self,
         s: &MetalStream,

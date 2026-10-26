@@ -882,13 +882,10 @@ generate_metal --plan [--ctx C]
         if a.encode_trace.is_some() {
             bloomery_metal::trace::start();
         }
-        // The census's free bytes are the working set less the driver's own
-        // `currentAllocatedSize`, the one count of the live device buffers
-        // this process holds; the arena keeps no sum of its own.
-        let allocated = device
-            .info()
-            .map(|i| i.total_bytes - i.free_bytes)
-            .map_err(|e| e.to_string())?;
+        // The driver's own `currentAllocatedSize` is the one count of the
+        // live device buffers this process holds; the arena keeps no sum of
+        // its own.
+        let allocated = device.allocated_bytes().map_err(|e| e.to_string())?;
         let mut stream = Stream {
             decoder: (!a.print_ids).then(|| tokenizer::Decoder::new(&tok, true)),
         };

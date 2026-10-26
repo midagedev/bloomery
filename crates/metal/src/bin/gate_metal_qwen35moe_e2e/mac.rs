@@ -106,9 +106,9 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
+use bloomery_device::DeviceError;
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
-use bloomery_device::{Device, DeviceError};
 use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
@@ -304,16 +304,16 @@ fn spread(mut walls: Vec<Duration>) -> (f64, f64) {
 /// step.
 fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
     let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
-    let before = device.info().map_err(why)?.free_bytes;
+    let before = device.allocated_bytes().map_err(why)?;
     let host = d_run(s, StepMode::HostFed)?;
     let stats0 = s.stats();
     let chain = d_run(s, StepMode::Chain)?;
     let stats = chain::moved(s, stats0);
-    let after = device.info().map_err(why)?.free_bytes;
+    let after = device.allocated_bytes().map_err(why)?;
     if after != before {
         return Err(format!(
-            "the device's free bytes moved from {before} to {after} across {} steps: a step \
-             allocated",
+            "the device's allocated bytes moved from {before} to {after} across {} steps: a \
+             step allocated",
             2 * s.ctx()
         ));
     }

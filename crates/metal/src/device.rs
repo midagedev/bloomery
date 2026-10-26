@@ -105,6 +105,13 @@ impl MetalDevice {
         &self.device
     }
 
+    /// The bytes of live device buffers this process holds, as the driver
+    /// counts them. The census's free bytes are the host's room, so a clause
+    /// that asks what this process allocated reads this.
+    pub fn allocated_bytes(&self) -> Result<u64, DeviceError> {
+        MetalCensus::allocated_of(&self.device)
+    }
+
     /// The library the kernels come from.
     #[must_use]
     pub fn library(&self) -> &Library {

@@ -35,9 +35,10 @@
 //!     the read that follows it.
 //! 11. **census**: the devices' ordinals and ids are distinct, this device is
 //!     the census's device at its ordinal, the free bytes are below the total,
-//!     and an allocation lowers the free bytes the device reports. It reads the
-//!     free bytes twice, so it holds only on a device no other process frees
-//!     memory on meanwhile.
+//!     and an allocation raises the bytes the device reports held
+//!     ([`Harness::held_bytes`]). It reads the held bytes twice, so on a
+//!     device whose held bytes count every process it holds only where no
+//!     other process frees memory meanwhile.
 
 use core::sync::atomic::Ordering;
 use std::process::ExitCode;
@@ -178,6 +179,26 @@ pub trait Harness {
 
     /// A stream of the device other than its own.
     fn other_stream(&self) -> Result<DeviceStream<Self::Device>, DeviceError>;
+
+    /// The bytes held on the device, which an allocation raises: the
+    /// census's total less its free bytes, where the free bytes count what
+    /// every process holds. A device whose free bytes are the host's room
+    /// (an integrated one) answers with its driver's own count of this
+    /// process's allocation instead, which no other process moves.
+    fn held_bytes(&self) -> Result<u64, DeviceError> {
+        let info = self.device().info()?;
+        info.total_bytes
+            .checked_sub(info.free_bytes)
+            .ok_or_else(|| {
+                DeviceError::backend(
+                    "census",
+                    format!(
+                        "{}: {} free bytes pass its {} total",
+                        info.name, info.free_bytes, info.total_bytes
+                    ),
+                )
+            })
+    }
 }
 
 /// A gate the host holds on a stream. Dropping it opens it too, so a clause
@@ -779,9 +800,9 @@ fn fault_read_waits<H: Harness>(h: &H) -> Clause {
     Ok(Verdict::Pass)
 }
 
-/// The bytes the census clause allocates to see the free bytes fall: the fall
-/// is read from the device's own free count, so another process freeing more
-/// than this meanwhile turns the clause red.
+/// The bytes the census clause allocates to see the held bytes rise: where the
+/// held bytes are the census's total less its free bytes, another process
+/// freeing more than this meanwhile turns the clause red.
 const CENSUS_PROBE: usize = 64 << 20;
 
 fn census<H: Harness, C: Census>(h: &H) -> Clause {
@@ -822,14 +843,14 @@ fn census<H: Harness, C: Census>(h: &H) -> Clause {
         ));
     }
 
-    let before = own.free_bytes;
+    let before = h.held_bytes().map_err(why)?;
     let big = d.zeroed::<u8>(s, Elems(CENSUS_PROBE)).map_err(why)?;
     s.sync().map_err(why)?;
-    let after = d.info().map_err(why)?.free_bytes;
+    let after = h.held_bytes().map_err(why)?;
     drop(big);
-    if after >= before {
+    if after <= before {
         return Err(format!(
-            "a {} MiB buffer left the free bytes at {after}, from {before}",
+            "a {} MiB buffer left the held bytes at {after}, from {before}",
             CENSUS_PROBE >> 20
         ));
     }
