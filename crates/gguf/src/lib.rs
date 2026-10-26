@@ -217,7 +217,15 @@ pub enum LoadError {
     Companion { path: String, detail: String },
     /// A header fact the file states wrongly or twice ([`facts`]).
     #[error("{0}")]
-    Fact(#[from] facts::FactError),
+    Fact(Box<facts::FactError>),
+}
+
+/// Boxed: a fact's error names its keys and values, and a large error variant
+/// would widen every `Result` that carries a `LoadError`.
+impl From<facts::FactError> for LoadError {
+    fn from(e: facts::FactError) -> Self {
+        LoadError::Fact(Box::new(e))
+    }
 }
 
 /// A parsed, mmap-backed GGUF file.

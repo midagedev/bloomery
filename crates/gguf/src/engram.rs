@@ -151,14 +151,14 @@ impl Sites {
         arch: &str,
         facts: &EngramFacts,
     ) -> Result<Option<Sites>, LoadError> {
-        let Some(layers) = counts_opt(meta, arch, &facts.layer_ids).map_err(LoadError::Fact)?
+        let Some(layers) = counts_opt(meta, arch, &facts.layer_ids).map_err(LoadError::from)?
         else {
             return Ok(None);
         };
         Ok(Some(Sites {
-            key_length: count(meta, arch, &facts.key_length).map_err(LoadError::Fact)?,
-            rows: counts_opt(meta, arch, &facts.rows).map_err(LoadError::Fact)?,
-            source: text_opt(meta, arch, &facts.source).map_err(LoadError::Fact)?,
+            key_length: count(meta, arch, &facts.key_length).map_err(LoadError::from)?,
+            rows: counts_opt(meta, arch, &facts.rows).map_err(LoadError::from)?,
+            source: text_opt(meta, arch, &facts.source).map_err(LoadError::from)?,
             layers,
         }))
     }
@@ -193,7 +193,7 @@ fn check_companion(
             "is one shard of a split set; the companion is one file".to_string(),
         ));
     }
-    let theirs = text_opt(g.keys(), arch, &facts.source).map_err(LoadError::Fact)?;
+    let theirs = text_opt(g.keys(), arch, &facts.source).map_err(LoadError::from)?;
     if let (Some(ours), Some(theirs)) = (&sites.source, &theirs)
         && ours != theirs
     {
@@ -289,7 +289,7 @@ pub(crate) fn attach_companion_with(
             None => Ok(()),
         };
     };
-    let name = text_opt(split.keys(), arch, &facts.file).map_err(LoadError::Fact)?;
+    let name = text_opt(split.keys(), arch, &facts.file).map_err(LoadError::from)?;
     if name.is_none() && explicit.is_none() {
         return Ok(());
     }
