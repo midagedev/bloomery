@@ -94,7 +94,9 @@ if os.path.exists(path):
               "(a default arch), and the CPU flags now come from .cargo/config.toml and the backend from "
               "tools/oxide-backend.sh. Remove it, or merge what it sets into the environment", file=sys.stderr)
         sys.exit(1)
-tmp = path + ".tmp"
+# Its own temp name: lanes of a batch prepare the same tree at once, and a shared name lets one rename the
+# other's file away.
+tmp = f"{path}.{os.getpid()}.tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     fh.write(text)
 os.replace(tmp, path)
@@ -193,6 +195,12 @@ EOF
   [ "$before" = "$after" ] && echo "oxide-host self-test: ok  an equal file keeps its mtime" || { echo "oxide-host self-test: BAD an equal file was rewritten"; fails=$((fails + 1)); }
   run 'aarch64 replaces the generated file with its own list' 0 'host rustflags: -C target-cpu=native' env CARGO_BUILD_TARGET=$A CUDA_OXIDE_LLC="$t/bin/llc21" bash "$oh"
   grep -q '^extra-rustflags = \["-C", "target-cpu=native"\]$' "$t/tree/.cargo/cuda-oxide.toml" && echo "oxide-host self-test: ok  the file now holds the aarch64 list" || { echo "oxide-host self-test: BAD the aarch64 list is not in the file"; fails=$((fails + 1)); }
+  # Two writers of an absent file: each writes its own temp file, so neither renames the other's away. A
+  # directory at the old shared name `<file>.tmp` stands for another writer's file there.
+  rm -f "$t/tree/.cargo/cuda-oxide.toml"
+  mkdir "$t/tree/.cargo/cuda-oxide.toml.tmp"
+  run 'another writer at the shared temp name does not stop this one' 0 'host rustflags: -C target-cpu=znver3' env CARGO_BUILD_TARGET=$X CUDA_OXIDE_LLC="$t/bin/llc21" bash "$oh"
+  rmdir "$t/tree/.cargo/cuda-oxide.toml.tmp"
   run 'the triple comes from rustc when CARGO_BUILD_TARGET is unset' 0 'aarch64-unknown-linux-gnu host rustflags' env PATH="$t/bin:$PATH" CUDA_OXIDE_LLC="$t/bin/llc21" bash "$oh"
   run 'a triple with no list ends 70 before the llc is read' 70 'no \[target\.mips-unknown-linux-gnu\] rustflags list' env CARGO_BUILD_TARGET=mips-unknown-linux-gnu bash "$oh"
   printf 'backend = "/x/librustc_codegen_cuda.so"\n' > "$t/tree/.cargo/cuda-oxide.toml"
