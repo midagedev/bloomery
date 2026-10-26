@@ -4,7 +4,7 @@ use gguf::{Split, Value};
 use models::{Arch, ChatSpec, EncoderSpec, ModelSpec};
 
 use super::{hparams::Hparams, roles};
-use crate::arch::{Read, spec_u32, template_of};
+use crate::arch::{Read, chat_of, spec_u32, spm_pre_default};
 use crate::placement::PlacementError;
 
 /// Read the description, tensor roles and architecture-derived defaults.
@@ -18,30 +18,10 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
             detail: "must be llama (SentencePiece)".into(),
         });
     }
-    let pre = "tokenizer.ggml.pre";
-    if let Some(value) = split.value(pre)
-        && value.as_str().is_none()
-    {
-        return Err(PlacementError::Metadata {
-            key: pre.into(),
-            detail: "is not a string".into(),
-        });
-    }
-    // SentencePiece selects its own tokenization rule, regardless of the BPE pre name.
-    let chat = ChatSpec {
-        pre: "llama".into(),
-        template: template_of(split)?,
-        tools: None,
-        reasoning: None,
-    };
+    let chat = chat_of(split, None, None)?;
     let spec = spec_of(&hp, chat)?;
     let mut defaults = hp.defaults;
-    let file_pre = split.value(pre).and_then(Value::as_str);
-    if file_pre != Some("llama") {
-        defaults.push(format!(
-            "{pre} = llama (tokenizer.ggml.model llama; the file says {file_pre:?})"
-        ));
-    }
+    defaults.extend(spm_pre_default(split));
     Ok(Read {
         spec,
         tensors,

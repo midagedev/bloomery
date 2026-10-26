@@ -11,11 +11,16 @@
 
 use std::fmt;
 
+use models::ModelSpec;
+
 use super::hparams::Hparams;
 use super::names;
 use crate::ModelError;
 use crate::moe::{HostLayer, HostLayerSpec};
 use crate::r8file::R8Source;
+
+/// The run the refusal of [`layers`] and [`layers_of_spec`] names.
+const RUN: &str = "qwen4exp";
 
 /// Layer `layer`'s routed experts as the host tier serves them, built from
 /// `src` ([`HostLayer::build`]); an error for a layer past the model, and
@@ -48,6 +53,20 @@ impl RoutedDims {
             n_expert: hp.n_expert,
             embd: hp.n_embd,
             ff: hp.expert_ff,
+        }
+    }
+
+    /// The dims `spec` describes: the trunk's layers, its routed mixture's
+    /// experts and width. A description with no routed layer has no experts
+    /// (`n_expert` and `ff` 0), which [`HostLayer::build`] refuses by name.
+    #[must_use]
+    pub fn of_spec(spec: &ModelSpec) -> RoutedDims {
+        let routed = spec.routed();
+        RoutedDims {
+            n_layer: spec.layers.len(),
+            n_expert: routed.map_or(0, |m| m.experts as usize),
+            embd: spec.hidden as usize,
+            ff: routed.map_or(0, |m| m.expert_ff as usize),
         }
     }
 }
@@ -130,7 +149,17 @@ pub fn layers(
     hp: &Hparams,
     set: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<HostLayer>, RefusedLayers> {
-    routed_layers(src, RoutedDims::of(hp), set, "qwen4exp")
+    routed_layers(src, RoutedDims::of(hp), set, RUN)
+}
+
+/// [`layers`] for a file read as a description: the dims are
+/// [`RoutedDims::of_spec`]'s.
+pub fn layers_of_spec(
+    src: R8Source<'_>,
+    spec: &ModelSpec,
+    set: impl IntoIterator<Item = usize>,
+) -> Result<Vec<HostLayer>, RefusedLayers> {
+    routed_layers(src, RoutedDims::of_spec(spec), set, RUN)
 }
 
 /// The host views of the layers of `set` of a file of the family whose

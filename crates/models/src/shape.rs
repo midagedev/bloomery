@@ -711,6 +711,17 @@ pub const GQA: &[GqaInst] = &[
     GqaInst {
         head: 128,
         value: 128,
+        pack: 7,
+        group: GroupRule::One,
+        window: false,
+        sinks: false,
+        value_scale: false,
+        at: "gpu/src/flash_gqa.rs GROUP_7 (gqa_flash_seg_mma_g7 and its q8 twin, tensor-core pass \
+             only; gpu/src/flash_gqa_prefill.rs gqa_prefill_flash_g7)",
+    },
+    GqaInst {
+        head: 128,
+        value: 128,
         pack: 16,
         group: GroupRule::One,
         window: false,
@@ -1319,6 +1330,7 @@ mod tests {
                 served: vec![
                     "exactly 8".to_string(),
                     "exactly 5".to_string(),
+                    "exactly 7".to_string(),
                     "exactly 16".to_string()
                 ]
             }
@@ -1357,6 +1369,19 @@ mod tests {
         assert_eq!(row.group, GroupRule::One);
         assert!(!row.window && !row.sinks && !row.value_scale);
         assert_eq!(row.packs(5), 1);
+    }
+
+    /// Head 128 at seven query heads a key head (Nanbeige4.3's 56/8) selects
+    /// the group-7 row: one block a group, no window, sinks or value scale.
+    #[test]
+    fn a_head_128_group_of_7_selects_the_g7_row() {
+        let s = attn(56, 8, 128);
+        let row = select_gqa(s).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(row.pack, 7);
+        assert_eq!(row.group, GroupRule::One);
+        assert!(!row.window && !row.sinks && !row.value_scale);
+        assert_eq!(row.packs(7), 1);
+        assert!(row.at.contains("GROUP_7"), "{}", row.at);
     }
 
     fn mimo(n_head: u32, n_kv: u32, window: Option<u32>, sinks: bool) -> AttnShape {

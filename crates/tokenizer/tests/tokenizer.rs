@@ -2,7 +2,8 @@
 //! id, and the reference's ids decode back to the source bytes — for each
 //! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer),
 //! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`), Qwen3.8-Flash-Next's
-//! (`qwen35`), Nemotron 3 Nano 4B's (`pixtral`) and MiniMax-M3's (`minimax-m2`).
+//! (`qwen35`), Nemotron 3 Nano 4B's (`pixtral`), MiniMax-M3's (`minimax-m2`)
+//! and Nanbeige4.3-33B's (`llama`, SentencePiece with byte fallback).
 //!
 //! The reference's sets are written once by `just dump-ref-tokenizer`
 //! (`crates/tokenizer/tools/oracle.sh`) and opened here through their refset
@@ -19,13 +20,15 @@
 //! special tokens rendered, which returns their text, so it is exact for
 //! every input that is valid UTF-8, up to a vocabulary's `unspelled` texts
 //! in the mode that does not parse special tokens. Invalid input is not: the
-//! reference decodes it to U+FFFD first.
+//! reference decodes it to U+FFFD first. Nanbeige's file adds a BOS and no
+//! EOS, and its set keeps the BOS: its ids at `add_special` are the set's, and
+//! at `add_special` false the set's after the BOS.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
-use refset::arch::tokenizer::{GLM5NEXT, MUSESPARK, NEMOTRON, QWEN3MOE, QWEN38, V41};
+use refset::arch::tokenizer::{GLM5NEXT, MUSESPARK, NANBEIGE43, NEMOTRON, QWEN3MOE, QWEN38, V41};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
@@ -118,6 +121,19 @@ fn musespark() -> Vocabulary {
         family: &MUSESPARK,
         ambiguous: &[],
         eog: &["<|eot|>"],
+        unspelled: &[],
+    }
+}
+
+/// Nanbeige4.3-33B on the box (`llama` SentencePiece, byte fallback). No
+/// `eot_token_id` key, and both `<|im_end|>` (the eos) and `<|endoftext|>` are
+/// control tokens on the reference's EOT list, as Qwen3-MoE's: generation ends
+/// on either.
+fn nanbeige43() -> Vocabulary {
+    Vocabulary {
+        family: &NANBEIGE43,
+        ambiguous: &["eot"],
+        eog: &["<|im_end|>", "<|endoftext|>"],
         unspelled: &[],
     }
 }
@@ -288,12 +304,11 @@ fn hw_glm5next_corpus_ids_equal_reference() {
     corpus_ids_equal_reference(&glm5next());
 }
 
-/// The hand-picked strings of `tests/cases.txt`, and the conditions under
-/// which "equal to the reference" is well defined: the partition order among
-/// equal-length special tokens cannot matter, and the roles picked from
-/// several candidate texts are the vocabulary's pinned list.
-fn cases_equal_reference(v: &Vocabulary) {
-    let tok = load(v.family);
+/// The conditions under which "equal to the reference" is well defined for
+/// `v`'s vocabulary as `tok` loads it: no two equal-length special tokens
+/// overlap in text, the roles picked by hash order are `v`'s pinned list, and
+/// every text in `v.eog` ends generation.
+fn equality_is_well_defined(tok: &Tokenizer, v: &Vocabulary) {
     assert_eq!(
         tok.special_overlap(),
         None,
@@ -312,6 +327,15 @@ fn cases_equal_reference(v: &Vocabulary) {
             tok.eog()
         );
     }
+}
+
+/// The hand-picked strings of `tests/cases.txt`, and the conditions under
+/// which "equal to the reference" is well defined: the partition order among
+/// equal-length special tokens cannot matter, and the roles picked from
+/// several candidate texts are the vocabulary's pinned list.
+fn cases_equal_reference(v: &Vocabulary) {
+    let tok = load(v.family);
+    equality_is_well_defined(&tok, v);
 
     let set = open(v.family);
     let cases: Vec<&Text> = set.cases().collect();
@@ -381,6 +405,61 @@ fn hw_llama_cases_equal_reference() {
     assert!(longest > 4096, "no long tokenizer input");
     assert!(count > 40, "missing fixed tokenizer cases");
     println!("llama: {count} cases, both parse and add_special modes equal mainline ids");
+}
+
+/// SentencePiece with a BOS and no EOS: the set keeps the BOS `llama-tokenize`
+/// adds, so `encode` at `add_special` equals the set's ids and without it the
+/// set's after the BOS, in both parse modes, on the shared cases and
+/// Nanbeige's own (the control and user-defined tokens, ChatML turns, byte
+/// fallback, U+2581).
+#[test]
+#[ignore = "needs the Nanbeige4.3-33B file and its oracle set (just dump-ref-tokenizer nanbeige43)"]
+fn hw_nanbeige43_cases_equal_reference() {
+    let v = nanbeige43();
+    let tok = load(v.family);
+    let set = TokenizerSet::open(&v.family.path(v.family.sets[0]), v.family)
+        .unwrap_or_else(|e| refuse(v.family, &e));
+    set.check_cases(
+        include_bytes!("cases.txt"),
+        Some(include_bytes!("cases-nanbeige43.txt")),
+    )
+    .unwrap_or_else(|e| refuse(v.family, &e));
+    assert!(tok.add_bos() && !tok.add_eos(), "a BOS and no EOS");
+    equality_is_well_defined(&tok, &v);
+    let bos = tok.specials().bos.expect("the file names a BOS");
+    let corpora: Vec<&str> = set.corpora().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        corpora,
+        ["code", "prose", "prose-all", "threads", "korean"],
+        "the corpus texts of {}",
+        set.dir.display()
+    );
+    // The set holds the ids llama-tokenize gives with its BOS, corpora too (the oracle's
+    // nanbeige43 profile): the text's own ids are the ones after it.
+    let mut count = 0;
+    for text in set.cases().chain(set.corpora()) {
+        let bytes = text.read().unwrap_or_else(|e| panic!("{e}"));
+        count += usize::from(text.is_case());
+        for parse in [false, true] {
+            let oracle = text.ids(parse).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(oracle.first(), Some(&bos), "{} BOS", text.name);
+            for add_special in [false, true] {
+                let expected = if add_special {
+                    &oracle[..]
+                } else {
+                    &oracle[1..]
+                };
+                let ours = tok.encode(&bytes, add_special, parse);
+                compare(&tok, &ours, expected).unwrap_or_else(|e| {
+                    panic!("{} parse={parse} add_special={add_special}: {e}", text.name)
+                });
+            }
+        }
+    }
+    assert!(count > 40, "missing fixed tokenizer cases");
+    println!(
+        "nanbeige43: {count} cases and the five corpora, both parse and add_special modes equal mainline ids"
+    );
 }
 
 #[test]

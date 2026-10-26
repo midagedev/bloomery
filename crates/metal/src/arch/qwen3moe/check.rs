@@ -414,7 +414,9 @@ fn plan_mixer(
     sites: &Sites35,
 ) -> Result<MixerPlan, ChainError> {
     Ok(match kind {
-        Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(split, WHAT, pd, l, flash, sites)?),
+        Kind35::Gqa(kind, flash) => {
+            MixerPlan::Gqa(plan_gqa(split, WHAT, pd, l, (kind, flash), sites)?)
+        }
         Kind35::Delta(shape) => MixerPlan::Delta(plan_delta(split, WHAT, pd, shape, l, sites)?),
     })
 }

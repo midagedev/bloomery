@@ -8,7 +8,7 @@
 //! constant for either.
 
 use gguf::GgmlType;
-use model::arch::models::{Arch, ChatSpec, ModelSpec};
+use model::arch::models::ChatSpec;
 use model::arch::qwen3moe::hparams::{Experts, Hparams as Hparams3, Rope, RopeMode, Score};
 use model::arch::qwen3moe::place::{self as q3, KvLayout as Kv3, PlanInputs as Plan3};
 use model::arch::qwen35moe::hparams::{FfnKind, Hparams as Hparams35, Kind, SectionOrder, Variant};
@@ -302,7 +302,6 @@ fn qwen36_inputs() -> q35::PlanInputs {
         defaults: Vec::new(),
         kinds,
     };
-    let kv = Kv35::of(&hp);
     let mut tensors = Vec::new();
     q8(
         &mut tensors,
@@ -491,34 +490,29 @@ fn qwen36_inputs() -> q35::PlanInputs {
         vec![HIDDEN, Q36_VOCAB],
         None,
     );
+    let roles = ModelTensors {
+        tensors,
+        layers: Q36_LAYERS,
+        experts: Q36_EXPERTS,
+        experts_used: 8,
+        bf16_words: |_| false,
+    };
+    // The description the plan reads, made from the header facts above as a file's open makes it.
+    let spec = model::arch::qwen35moe::spec::spec_of(
+        &hp,
+        &roles,
+        ChatSpec {
+            pre: String::new(),
+            template: None,
+            tools: None,
+            reasoning: None,
+        },
+    )
+    .expect("the synthetic Qwen3.6 header describes its layers");
+    let kv = Kv35::of_spec(&spec).expect("every layer has a store the layout sizes");
     q35::PlanInputs {
-        hp,
-        model: ModelTensors {
-            tensors,
-            layers: Q36_LAYERS,
-            experts: Q36_EXPERTS,
-            experts_used: 8,
-            bf16_words: |_| false,
-        },
-        spec: ModelSpec {
-            arch: Arch::Qwen35Moe,
-            hidden: HIDDEN as u32,
-            vocab: Q36_VOCAB as u32,
-            ctx_train: CTX as u32,
-            rms_eps: 1e-6,
-            layers: Vec::new(),
-            mtp: Vec::new(),
-            hc: None,
-            engram: None,
-            encoder: None,
-            logit_epilogue: None,
-            chat: ChatSpec {
-                pre: String::new(),
-                template: None,
-                tools: None,
-                reasoning: None,
-            },
-        },
+        model: roles,
+        spec,
         kv,
         room: (u64::MAX, HostRead::Given),
         row_source: model::placement::RowTableSource::Split,
@@ -528,7 +522,7 @@ fn qwen36_inputs() -> q35::PlanInputs {
 
 fn qwen36_tier(stage: CardSpec, tier: CardSpec) -> Result<(u64, u64, u64), Place35Error> {
     let inputs = qwen36_inputs();
-    let machine = tiered(Q36_LAYERS, stage, tier, q35::leg_tier_batch(&inputs.hp));
+    let machine = tiered(Q36_LAYERS, stage, tier, q35::leg_tier_batch(&inputs.spec));
     let plan = inputs.plan_rule(
         &machine,
         CTX,

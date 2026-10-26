@@ -15,6 +15,7 @@
 //! list names what it means in its own comment.
 
 mod encoder;
+mod formats;
 pub mod headpick;
 mod need;
 mod role;
@@ -101,6 +102,9 @@ pub enum Arch {
     /// Muse Spark: GQA layers whose sliding half ropes and full half does not, all of them routed
     /// in a latent, no dense layer.
     MuseSpark,
+    /// A dense Llama: GQA layers with the pairwise (NORM) rope and a SwiGLU
+    /// feed-forward block of `feed_forward_length`, on an untied head.
+    Llama,
 }
 
 impl Arch {
@@ -127,6 +131,7 @@ impl Arch {
             Arch::GemmaEmbedding2 => "gemma-embedding2",
             Arch::Flint => "flint",
             Arch::MuseSpark => "muse-spark",
+            Arch::Llama => "llama",
         }
     }
 }
@@ -531,7 +536,8 @@ pub struct Rope {
 /// How a rope pairs a head's values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeMode {
-    /// GPT-J pairs over the last `dims` values.
+    /// GPT-J pairs over the last `dims` values; with `dims == head_dim` it is
+    /// llama's NORM rope, pairs `(2i, 2i + 1)` over the whole head.
     NormTail,
     /// NeoX halves over the first `dims` values.
     Neox,
@@ -842,6 +848,38 @@ pub enum ToolFormat {
     MuseSpark,
 }
 
+impl ToolFormat {
+    /// The format a chat template's call markup spells, for the formats a
+    /// description names from the template alone (`formats`' table). `None`:
+    /// no such markup, so no parser is named for the file.
+    #[must_use]
+    pub fn of_template(template: &str) -> Option<ToolFormat> {
+        formats::tool_of(template)
+    }
+}
+
+/// The markup of [`ToolFormat::QwenXml`], spelled once: the template table
+/// names a file's format by the markers its template teaches, and the
+/// server's scanner reads a reply by the same strings.
+pub mod function_xml {
+    /// Opens a call.
+    pub const CALL_OPEN: &str = "<tool_call>";
+    /// Closes a call.
+    pub const CALL_CLOSE: &str = "</tool_call>";
+    /// Opens the call's function, its name to the `>` (`<function=NAME>`).
+    pub const FUNCTION_OPEN: &str = "<function=";
+    /// Closes the function.
+    pub const FUNCTION_CLOSE: &str = "</function>";
+    /// Opens a parameter, its name to the `>` (`<parameter=KEY>`).
+    pub const PARAM_OPEN: &str = "<parameter=";
+    /// Closes a parameter.
+    pub const PARAM_CLOSE: &str = "</parameter>";
+    /// Ends a value a template frames on lines of its own
+    /// (`<parameter=KEY>\nVALUE\n</parameter>`): the newline before the tag
+    /// and the one after it are the markup's own.
+    pub const PARAM_VALUE_CLOSE: &str = "\n</parameter>\n";
+}
+
 /// A reasoning span syntax.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningFormat {
@@ -860,6 +898,13 @@ impl ReasoningFormat {
         open: "<think>",
         close: "</think>",
     };
+
+    /// The span a chat template opens (`formats`' table). `None`: the
+    /// template opens no span, so the output is not split.
+    #[must_use]
+    pub fn of_template(template: &str) -> Option<ReasoningFormat> {
+        formats::span_of(template)
+    }
 }
 
 /// A draft, read to be paired with a target.
@@ -1011,6 +1056,24 @@ pub struct BlockDraft {
 }
 
 impl ModelSpec {
+    /// The first routed mixture: the one every routed layer of a file shares
+    /// (the readers hold them to one count and width). `None`: no layer
+    /// routes, the whole feed-forward side is dense.
+    #[must_use]
+    pub fn routed(&self) -> Option<&Moe> {
+        self.layers.iter().find_map(LayerSpec::moe)
+    }
+
+    /// The first GQA layer's mixer: the head shape and rope the trunk's
+    /// attention layers share. `None`: no layer attends.
+    #[must_use]
+    pub fn gqa(&self) -> Option<&Gqa> {
+        self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Gqa(g) => Some(g),
+            _ => None,
+        })
+    }
+
     /// The layers before the first routed one.
     #[must_use]
     pub fn dense_lead(&self) -> u32 {

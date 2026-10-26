@@ -16,7 +16,7 @@ use gguf::Split;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3,
+    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, llama, mimo2, minimaxm3,
     musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
@@ -194,6 +194,14 @@ pub static ROWS: &[ArchRow] = &[
         arch: None,
         names: QWEN35_BODY,
         read: Some(qwen35moe::spec::read),
+        draft: None,
+        fixture: None,
+    },
+    ArchRow {
+        // No `Arch` variant: the Qwen3.5 body runs the file, as it runs `qwen35`.
+        arch: None,
+        names: &["llama"],
+        read: Some(llama::spec::read),
         draft: None,
         fixture: None,
     },
@@ -387,6 +395,7 @@ mod tests {
             "qwen35moe" | "qwen4exp" => qwen35moe::spec::read,
             a if QWEN35_BODY.contains(&a) => qwen35moe::spec::read,
             "glm5next" | GLM5_NEXT_LLAMA_CPP => glm5next::spec::read,
+            "llama" => llama::spec::read,
             "mimo2" => mimo2::spec::read,
             "minimax-m3" => minimaxm3::spec::read,
             "raon1" => raon1::spec::read,
@@ -521,8 +530,8 @@ mod tests {
         );
     }
 
-    /// The draft rules are the old table's three keys, and an architecture the rows do not name
-    /// has no reader row.
+    /// The draft rules are the old table's three keys, `llama` has a reader row and no draft rule,
+    /// and an architecture the rows do not name has no reader row.
     #[test]
     fn the_draft_rules_are_the_old_tables_keys() {
         let with: Vec<&str> = ROWS
@@ -531,7 +540,8 @@ mod tests {
             .map(|r| r.canonical())
             .collect();
         assert_eq!(with, ["qwen4exp", "qwen35moe", "mimo2"]);
-        assert!(row_of("llama").is_none());
+        assert!(row_of("llama").is_some_and(|r| r.read.is_some() && r.draft.is_none()));
+        assert!(row_of("llama4").is_none());
         assert!(row_of("deepseek2").is_some_and(|r| r.read.is_none()));
     }
 

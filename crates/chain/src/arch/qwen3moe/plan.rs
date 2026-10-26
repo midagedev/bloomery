@@ -14,9 +14,11 @@
 //! else its own dense FFN of its types. Qwen3.5-9B has the same mixers and a dense SwiGLU FFN,
 //! which runs as a stack of one expert, every token's one slot on it at
 //! weight 1 ([`FfnRoute::Dense`]): the routed FFN's launches without the
-//! router. A layer's kind comes from its [`LayerSpec`] — the file's tensors,
-//! cross-checked with its interval key by the reader — never from the
-//! layer's number.
+//! router. A dense Llama's layers are [`MixerPlan::Gqa`] at head 128 turned
+//! by NORM pairs with no head norm ([`GqaKind::Head128`]), each followed by
+//! the same dense FFN. A layer's kind comes from its [`LayerSpec`] — the
+//! file's tensors, cross-checked with its interval key by the reader — never
+//! from the layer's number.
 
 use super::router::RouterDims;
 use crate::ChainError;
@@ -26,6 +28,7 @@ use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_share
 use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
 use model::arch::models::{
     Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, OutGate,
+    RopeMode,
 };
 
 pub use crate::site::SiteTy;
@@ -53,20 +56,81 @@ pub enum GqaKind {
     /// writing `[q | gate]` per head, the flash output multiplied by
     /// `σ(gate)` in the output projection's quantizer.
     Gated256,
+    /// A head of 128 values with no output gate and no key selection, the
+    /// whole head turned by `pairs`: the q/k norm before the rope when
+    /// `head_norm`, none otherwise. [`GqaKind::Neox128`] is `{ Neox, true }`.
+    Head128 { pairs: Pairs, head_norm: bool },
+}
+
+impl GqaKind {
+    /// Whether the kind norms each query and key head before its rope: the
+    /// layer's q and k norm tensors are then part of its plan.
+    #[must_use]
+    pub fn head_norm(self) -> bool {
+        match self {
+            GqaKind::Neox128 | GqaKind::Gated256 => true,
+            GqaKind::Head128 { head_norm, .. } => head_norm,
+        }
+    }
+}
+
+/// Which values of a head a rope turns together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pairs {
+    /// NEOX: value `i` with value `i + dims/2`.
+    Neox,
+    /// NORM: the neighbours `2i` and `2i + 1`.
+    Norm,
 }
 
 impl GqaKind {
     /// Every class with the geometry that selects it: a head's width, the
-    /// values of it the rope turns, and where the output gate comes from.
-    const CLASSES: [(GqaKind, u32, u32, OutGate); 2] = [
-        (GqaKind::Neox128, 128, 128, OutGate::None),
-        (
-            GqaKind::Gated256,
-            q35::HEAD_DIM,
-            q35::ROPE_DIMS,
-            OutGate::Packed,
-        ),
+    /// values of it the rope turns and how it pairs them, the head norm, and
+    /// where the output gate comes from.
+    const CLASSES: [Class; 3] = [
+        Class {
+            kind: GqaKind::Neox128,
+            head: HEAD_128,
+            rope: HEAD_128,
+            pairs: Pairs::Neox,
+            head_norm: true,
+            gate: OutGate::None,
+        },
+        Class {
+            kind: GqaKind::Head128 {
+                pairs: Pairs::Norm,
+                head_norm: false,
+            },
+            head: HEAD_128,
+            rope: HEAD_128,
+            pairs: Pairs::Norm,
+            head_norm: false,
+            gate: OutGate::None,
+        },
+        Class {
+            kind: GqaKind::Gated256,
+            head: q35::HEAD_DIM,
+            rope: q35::ROPE_DIMS,
+            pairs: Pairs::Neox,
+            head_norm: true,
+            gate: OutGate::Packed,
+        },
     ];
+}
+
+/// One attention class and the geometry that selects it ([`GqaKind::CLASSES`]).
+struct Class {
+    kind: GqaKind,
+    /// Values of a head.
+    head: u32,
+    /// Values of a head the rope turns.
+    rope: u32,
+    /// How the rope pairs them.
+    pairs: Pairs,
+    /// Whether each query and key head is normed before its rope.
+    head_norm: bool,
+    /// Where the output gate comes from.
+    gate: OutGate,
 }
 
 /// How the head-256 flash entries cover a key head's group of query heads:
@@ -82,6 +146,9 @@ pub enum Flash {
     /// Blocks of two query heads, `group / 2` a key head (the `_256_p2`
     /// entries): the scalar segment pass only.
     Pairs,
+    /// One block of seven query heads a key head (the head-128 `_g7`
+    /// entries): the tensor-core passes only.
+    Seven,
 }
 
 /// A GQA layer's names, types and geometry.
@@ -275,7 +342,7 @@ pub fn shared_entry(ty: SiteTy, what: &'static str) -> Result<SiteEntry, ChainEr
 /// A layer's mixer kind, from its description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind35 {
-    Gqa(Flash),
+    Gqa(GqaKind, Flash),
     Delta(LinearShape),
 }
 
@@ -305,7 +372,10 @@ const WHAT: &str = "qwen3moe plan";
 pub fn kind_of(s: &LayerSpec, l: usize) -> Result<Kind35, ChainError> {
     let refuse = |d: String| ChainError::shape(WHAT, format!("layer {l}: {d}"));
     let kind = match &s.mixer {
-        Mixer::Gqa(g) => Kind35::Gqa(gqa_fits(g).map_err(refuse)?.1),
+        Mixer::Gqa(g) => {
+            let (kind, flash) = gqa_fits(g).map_err(refuse)?;
+            Kind35::Gqa(kind, flash)
+        }
         Mixer::DeltaRule(d) => Kind35::Delta(delta_shape(d).map_err(refuse)?),
         other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
             return Err(refuse(format!(
@@ -351,13 +421,24 @@ pub fn kinds35(layers: &[LayerSpec]) -> Result<Vec<Kind35>, ChainError> {
         .collect()
 }
 
+/// The attention kinds the card's instances run: [`GqaKind::Gated256`], and the head-128
+/// attention turned by NORM pairs with no head norm (the `_g7` and group-of-8 head-128 entries).
+const CARD_KINDS: [GqaKind; 2] = [
+    GqaKind::Gated256,
+    GqaKind::Head128 {
+        pairs: Pairs::Norm,
+        head_norm: false,
+    },
+];
+
 /// Why the card's instances do not run `s`, which [`kind_of`] reads.
 fn card_fits(s: &LayerSpec) -> Result<(), String> {
     if let Mixer::Gqa(g) = &s.mixer
-        && gqa_class(g)? != GqaKind::Gated256
+        && !CARD_KINDS.contains(&gqa_class(g)?)
     {
         return Err(format!(
-            "attention {g:?}; the card's kernels take the gated attention of heads of {}",
+            "attention {g:?}; the card's kernels take the gated attention of heads of {} or \
+             heads of {HEAD_128} turned by NORM pairs with no head norm",
             q35::HEAD_DIM
         ));
     }
@@ -367,38 +448,54 @@ fn card_fits(s: &LayerSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// The attention class `g`'s geometry selects, or why none does.
+/// Values of the head the head-128 kernels are built for; the rope turns all
+/// of them.
+pub const HEAD_128: u32 = 128;
+
+/// The attention class `g`'s geometry selects, or why none does: the class
+/// table's row ([`GqaKind::CLASSES`]) of its head width, the values the rope
+/// turns, how it pairs them, its head norm and its output gate, with no yarn,
+/// output norm, key selection, window, sinks or value scale.
 pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
-    let rope_ok = turns_as_neox(g.rope.mode, g.rope.dims);
     let plain = g.rope.yarn.is_none()
-        && rope_ok
-        && g.qk_norm
         && !g.o_norm
         && g.select.is_none()
         && g.window.is_none()
         && !g.sinks
         && g.value_scale.is_none();
+    let pairs = if turns_as_neox(g.rope.mode, g.rope.dims) {
+        Some(Pairs::Neox)
+    } else if g.rope.mode == RopeMode::NormTail {
+        Some(Pairs::Norm)
+    } else {
+        None
+    };
     let class = GqaKind::CLASSES
         .iter()
-        .find(|&&(_, head, rope, gate)| {
-            g.head_dim == head && g.rope.dims == rope && g.out_gate == gate
+        .find(|c| {
+            g.head_dim == c.head
+                && g.rope.dims == c.rope
+                && pairs == Some(c.pairs)
+                && g.qk_norm == c.head_norm
+                && g.out_gate == c.gate
         })
-        .map(|&(kind, ..)| kind);
+        .map(|c| c.kind);
     match class {
         Some(kind) if plain => Ok(kind),
         _ => {
             let classes: Vec<String> = GqaKind::CLASSES
                 .iter()
-                .map(|&(_, head, rope, gate)| {
+                .map(|c| {
                     format!(
-                        "heads of {head} with the first {rope} values turned (output gate {gate:?})"
+                        "heads of {} with the first {} values turned by {:?} pairs (q/k norms {}, \
+                         output gate {:?})",
+                        c.head, c.rope, c.pairs, c.head_norm, c.gate
                     )
                 })
                 .collect();
             Err(format!(
-                "attention {g:?}; the kernels take {}, turned by NEOX (IMROPE sections covering \
-                 them), with q/k norms and no output norm, key selection, window, sinks or value \
-                 scale",
+                "attention {g:?}; the kernels take {} (NEOX by IMROPE sections covering them), \
+                 with no output norm, key selection, window, sinks or value scale",
                 classes.join(" or ")
             ))
         }
@@ -418,19 +515,20 @@ pub(crate) fn layer_class(s: &LayerSpec) -> Result<GqaKind, String> {
 }
 
 /// The class and the flash of `g` when it is an attention the kernels run:
-/// the shape table's row for its group ([`select_gqa`]), one of eight or of
-/// pairs.
+/// the shape table's row for its group ([`select_gqa`]), one of eight, of
+/// quads or pairs, or the head-128 group of seven.
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
     let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
-    let flash = match (row.pack, row.group) {
-        (8, GroupRule::One) => Flash::Group,
-        (4, GroupRule::Packs) => Flash::Quads,
-        (2, GroupRule::Packs) => Flash::Pairs,
+    let flash = match (kind, row.pack, row.group) {
+        (_, 8, GroupRule::One) => Flash::Group,
+        (_, 4, GroupRule::Packs) => Flash::Quads,
+        (_, 2, GroupRule::Packs) => Flash::Pairs,
+        (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
         _ => {
             return Err(format!(
-                "attention {}/{} heads selects {}, which this body does not launch",
-                g.heads, g.kv_heads, row.at
+                "attention {}/{} heads of {} selects {}, which this body does not launch",
+                g.heads, g.kv_heads, g.head_dim, row.at
             ));
         }
     };
@@ -681,10 +779,13 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{delta, gqa, gqa_of, layer, q30_gqa, q30_layer};
-    use super::{Flash, GqaKind, Kind35, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits};
+    use super::{
+        Flash, GqaKind, Kind35, Pairs, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits,
+    };
     use crate::linear::{KHeadMap as LinearMap, LinearShape};
     use model::arch::models::{
-        Act, DeltaKind, DeltaRule, Ffn, GdnGate, KHeadMap, LayerSpec, Mixer, OutGate, Shared,
+        Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, OutGate, Rope,
+        RopeMode, Shared,
     };
 
     /// The plan's kinds follow the description layer by layer, wherever its
@@ -706,7 +807,7 @@ mod tests {
         let want: Vec<Kind35> = (0..8)
             .map(|l| {
                 if attn.contains(&l) {
-                    Kind35::Gqa(Flash::Group)
+                    Kind35::Gqa(GqaKind::Gated256, Flash::Group)
                 } else {
                     Kind35::Delta(shape)
                 }
@@ -793,7 +894,13 @@ mod tests {
             n_v: 48,
             map: LinearMap::Tiled,
         };
-        assert_eq!(got, [Kind35::Delta(shape), Kind35::Gqa(Flash::Pairs)]);
+        assert_eq!(
+            got,
+            [
+                Kind35::Delta(shape),
+                Kind35::Gqa(GqaKind::Gated256, Flash::Pairs)
+            ]
+        );
         for (at, bad) in [
             (0usize, dense(gqa_of(24, 8), 17408)),
             (1, dense(wide, 17400)),
@@ -803,6 +910,78 @@ mod tests {
             match kinds35(&layers) {
                 Err(e) => assert!(e.to_string().contains(&format!("layer {at}:")), "{e}"),
                 Ok(k) => panic!("layer {at} accepted: {k:?}"),
+            }
+        }
+    }
+
+    /// A head-128 attention with no gate: Nanbeige's 56/8 heads (group 7) and a
+    /// group of 8 pick the NORM append and their flash by the shape table's
+    /// row; a NEOX turn, a head norm, an output norm, a gate, a rope over part
+    /// of the head, a group no head-128 flash covers and a head no kernel is
+    /// built for are each refused by name with the layer.
+    #[test]
+    fn a_head_128_norm_attention_picks_its_kind_and_flash() {
+        let norm = GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        };
+        let dense = |mixer: Mixer| LayerSpec {
+            ffn: Ffn::Dense {
+                ff: 22016,
+                act: Act::SwiGlu { limit: None },
+            },
+            ..layer(mixer)
+        };
+        let head_128 = |heads: u32, kv_heads: u32, edit: &dyn Fn(&mut Gqa)| {
+            let mut g = Gqa {
+                heads,
+                kv_heads,
+                head_dim: 128,
+                value_dim: 128,
+                rope: Rope {
+                    mode: RopeMode::NormTail,
+                    dims: 128,
+                    base: 1.2e8,
+                    yarn: None,
+                },
+                qk_norm: false,
+                o_norm: false,
+                out_gate: OutGate::None,
+                select: None,
+                window: None,
+                sinks: false,
+                value_scale: None,
+            };
+            edit(&mut g);
+            dense(Mixer::Gqa(g))
+        };
+        for (heads, kv_heads, flash) in [(56, 8, Flash::Seven), (64, 8, Flash::Group)] {
+            let got = kinds35(&[head_128(heads, kv_heads, &|_: &mut Gqa| {})])
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(got, [Kind35::Gqa(norm, flash)], "{heads}/{kv_heads}");
+        }
+        type Misfit<'a> = (&'a str, u32, &'a dyn Fn(&mut Gqa));
+        let misfits: [Misfit; 8] = [
+            ("a NEOX turn", 8, &|g: &mut Gqa| {
+                g.rope.mode = RopeMode::Neox
+            }),
+            ("a head norm", 8, &|g: &mut Gqa| g.qk_norm = true),
+            ("an output norm", 8, &|g: &mut Gqa| g.o_norm = true),
+            ("a packed gate", 8, &|g: &mut Gqa| {
+                g.out_gate = OutGate::Packed
+            }),
+            ("a rope over 64 values", 8, &|g: &mut Gqa| g.rope.dims = 64),
+            ("no rope", 8, &|g: &mut Gqa| g.rope.mode = RopeMode::None),
+            ("a group of 5", 5, &|_: &mut Gqa| {}),
+            ("a head of 64", 8, &|g: &mut Gqa| {
+                g.head_dim = 64;
+                g.value_dim = 64;
+            }),
+        ];
+        for (what, group, edit) in misfits {
+            match kinds35(&[dense(delta()), head_128(8 * group, 8, edit)]) {
+                Err(e) => assert!(e.to_string().contains("layer 1:"), "{what}: {e}"),
+                Ok(k) => panic!("{what} accepted: {k:?}"),
             }
         }
     }
@@ -867,7 +1046,7 @@ mod tests {
     #[test]
     fn an_attention_no_class_describes_is_refused_by_name() {
         let got = kinds_of(&[q30_layer(), q30_layer()]).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(got, [Kind35::Gqa(Flash::Group); 2]);
+        assert_eq!(got, [Kind35::Gqa(GqaKind::Neox128, Flash::Group); 2]);
         assert_eq!(gqa_class(&q30_gqa()), Ok(GqaKind::Neox128));
         let class_of = |m: Mixer| match m {
             Mixer::Gqa(g) => gqa_class(&g),

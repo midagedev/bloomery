@@ -44,6 +44,8 @@
 #   gemma4    EmbeddingGemma 2's Q8_0 file        mainline 6868a52cb (the gemma-embedding2 profile's  ref-tokenizer-gemma4
 #                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
 #   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
+#   nanbeige43  Nanbeige4.3-33B's Q4_K_M file     llama.cpp-mainline at the nanbeige43 profile's LCPP  ref-tokenizer-nanbeige43
+#                                                 and LCPP_PIN (tools/ref/models/nanbeige43.sh)
 #
 # Every vocabulary's reference is a tree's build, not one machine's md5s: before anything is read, the tree is checked against
 # the pin the profile names (tools/ref/emb2/oracle-tree.sh owns the check), and the manifest then states `# build <commit>` or
@@ -60,7 +62,9 @@
 # llama's corpora are cut into rows of at most CHUNK bytes, named <corpus>.<nnn> (a cut at a line end: `split -C`). That vocabulary's
 # SPM tokenizer partitions a text at its user-defined special tokens, the newline runs among them, and walks the fragment list once
 # per match, so the time of one text grows with the square of its size; the corpora whole outran the recipe's bound. The other
-# vocabularies keep one row per corpus, which the tokenizer gate's corpus test names.
+# vocabularies keep one row per corpus, which the tokenizer gate's corpus test names. nanbeige43 is SentencePiece too, but its
+# user-defined tokens are four (<think> </think> <tool_call> </tool_call>) and a newline is a byte-fallback piece, so a text has
+# few matches to walk and its time is linear in the text: one row per corpus (set CHUNK in its profile to cut it).
 #
 # A vocabulary can have cases of its own after the shared ones (EXTRA, `# extra cases` in the manifest, rows numbered on
 # from the shared cases): gemma4's crates/tokenizer/tests/cases-gemma4.txt, the boundaries of its own vocabulary and the
@@ -76,7 +80,7 @@
 # takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
 # mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|gemma4|llama|all [--cases-only]
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|nanbeige43|gemma4|llama|all [--cases-only]
 # --cases-only writes the fixed cases without reading the corpus trees.
 set -euo pipefail
 
@@ -159,15 +163,15 @@ case $#:${2:-} in
 esac
 
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | gemma4 | llama) ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | nanbeige43 | gemma4 | llama) ;;
   all)
-    for v in v41 qwen3moe glm5next qwen38 nemotron musespark; do
+    for v in v41 qwen3moe glm5next qwen38 nemotron musespark nanbeige43; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v" "${@:2}"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|gemma4|llama|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|nanbeige43|gemma4|llama|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -199,6 +203,13 @@ tree_tokref() {
   ORACLE_TREE=/home/user/ik-tokref
   BUILD_PIN=db517b690a8c0865fd8cf51565ae6b4a7295eb01 BUILD_PATCH=29cabc43ed4d
   TREE_FLAGS=(--unversioned)
+}
+
+# llama.cpp-mainline: mainline at 53ed051ce, no patch; the commit the qwen35 families (crates/refset/src/arch/qwen35) name.
+tree_mainline() {
+  ORACLE_TREE=/home/user/llama.cpp-mainline
+  BUILD_PIN=53ed051ce5e8193652e449f43216ca3859454f49 BUILD_PATCH=
+  TREE_FLAGS=()
 }
 
 profile() {
@@ -234,10 +245,7 @@ profile() {
       # ik-tokref knows the pre name and refuses the file: its loader has no
       # nemotron_h architecture. This tree's binary loads it. The pre is the
       # same LLAMA3 regex with ignore_merges.
-      # llama.cpp-mainline: mainline at 53ed051ce, no patch; the commit the qwen35 families (crates/refset/src/arch/qwen35) name.
-      ORACLE_TREE=/home/user/llama.cpp-mainline
-      BUILD_PIN=53ed051ce5e8193652e449f43216ca3859454f49 BUILD_PATCH=
-      TREE_FLAGS=()
+      tree_mainline
       SHARD=/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
       SET=ref-tokenizer-nemotron
       # The file sets add_bos_token, so llama-tokenize prepends BOS. The gate's
@@ -275,6 +283,19 @@ profile() {
       SET=ref-tokenizer-musespark
       # Nemotron's flags, a mainline llama-tokenize too: the file sets add_bos_token, and the gate compares the text's own ids.
       REF_FLAGS=(--no-bos --no-escape)
+      ;;
+    nanbeige43)
+      # Mainline's tree, as nemotron's. The file is the nanbeige43 profile's own MODEL, not the one tools/box.sh resolved for the
+      # default profile.
+      tree_mainline
+      # shellcheck disable=SC2016 # the child shell expands it
+      SHARD=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s" "$MODEL"' _ "$ROOT/tools/ref/models/nanbeige43.sh")
+      SET=ref-tokenizer-nanbeige43
+      EXTRA=$ROOT/crates/tokenizer/tests/cases-nanbeige43.txt
+      # The file sets add_bos_token (BOS is <|im_start|>), and llama-tokenize's ids keep it: the set holds the ids a
+      # /tokenize with add_special gives, and the text's own ids are the ones after that first id (no EOS: add_eos_token is
+      # false). The EmbeddingGemma sets are read the same way. --no-escape keeps the text's bytes, as for nemotron.
+      REF_FLAGS=(--no-escape)
       ;;
     gemma4 | llama)
       # The profile's own MODEL, not the file tools/box.sh resolved for the default profile.

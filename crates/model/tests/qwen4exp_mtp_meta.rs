@@ -254,7 +254,7 @@ fn hw_qwen4exp_mtp_plan() {
         )
     };
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
         for ctx in [4096u64, 32_768] {
             let plain = inputs
                 .plan(&machine, ctx, &levers)
@@ -320,7 +320,7 @@ fn hw_qwen4exp_mtp_plan() {
             for ctx in [4096u64, 4352, 32_768] {
                 let machine = place::machine_for_experts(
                     card,
-                    inputs.hp.n_layer,
+                    inputs.spec.layers.len(),
                     place::UBATCH_PLANNED.min(ctx),
                     experts,
                 );
@@ -392,7 +392,7 @@ fn hw_qwen4exp_mtp_plan() {
             - at.draft.cards[0].kv_bytes;
         let limit = at.plan.usable_bytes(spec) - spec.margin_bytes;
         let kv = |ctx: u64| -> u64 {
-            (0..inputs.hp.n_layer)
+            (0..inputs.spec.layers.len())
                 .map(|l| model::placement::KvBytes::layer_bytes(&inputs.kv, l, ctx))
                 .sum::<u64>()
                 + ctx * DRAFT_KV_ROW
@@ -547,9 +547,9 @@ fn hw_qwen4exp_bp_mtp_plan() {
     let mtp = MtpInputs::read(&draft, &target, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let (ctx, u) = (4096u64, 4096u64);
-    let n = inputs.hp.n_layer;
+    let n = inputs.spec.layers.len();
     let levers = PlanLevers::default();
-    let batch = tier_batch(&inputs.hp, u);
+    let batch = tier_batch(&inputs.spec, u);
     let bytes = mtp
         .card_bytes(ctx)
         .unwrap_or_else(|e| panic!("card_bytes: {e}"));

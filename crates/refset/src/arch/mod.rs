@@ -12,9 +12,11 @@ pub mod deepseek41;
 pub mod deepseek41v;
 pub mod dequant;
 pub mod draft;
+pub mod forced_logits;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;
 pub mod glm5next;
+pub mod llama;
 pub mod mimo2;
 pub mod minicpmv4_7;
 pub mod minimaxm3;
@@ -44,6 +46,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (qwen3moe::ARCH, qwen3moe::FAMILIES),
     (qwen35moe::ARCH, qwen35moe::FAMILIES),
     (qwen35::ARCH, qwen35::FAMILIES),
+    (llama::ARCH, llama::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
     (minimaxm3::ARCH, MINIMAX_M3),

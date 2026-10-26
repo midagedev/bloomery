@@ -1,0 +1,68 @@
+# Nanbeige4.3-33B's own cases for the tokenizer oracle's nanbeige43 row (tools/oracle.sh EXTRA), after tests/cases.txt; printf %b
+# escapes, one a line. The vocabulary is SentencePiece (`llama`): BOS is <|im_start|> (166100) and EOS <|im_end|> (166101), the set
+# keeps the BOS llama-tokenize adds, newline has no piece of its own (byte fallback <0x0A>), and the specials are three control
+# tokens after <s> </s> <unk> (<|im_start|> <|im_end|> <|endoftext|>) and four user-defined ones (<think> </think> <tool_call>
+# </tool_call>). First the control and user-defined tokens next to text and to each other, with and without a space around them (a
+# text fragment after a special is prefixed with a space), then ChatML turns, the tool-call surface, byte fallback, whitespace and
+# U+2581, then English, Chinese and mixed text.
+<s>Hello</s>
+<unk> <s> </s> <|endoftext|>
+<|im_start|>
+<|im_end|>
+<|im_start|><|im_start|>
+<|im_start|><|im_end|><|endoftext|>
+<|im_start|>user
+<|im_start|> user
+<|im_start|>\nuser
+<think>x</think>
+a<think>b</think>c
+<think> x </think> y
+<think><think></think></think>
+</think>x
+</think>\n\nx
+<|im_end|>\n<|im_start|>
+<|im_end|> <|im_start|>
+<|im_end|>  <|im_end|>
+<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>
+<tool_call>{"name": "get_weather", "arguments": {"city": "Seoul"}}</tool_call>
+<tool_response>{"temp": 21}</tool_response>
+<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n
+<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n4<|im_end|>\n
+<|im_start|>system\n你是一位工具函数调用专家，你会得到一个问题和一组可能的工具函数。<|im_end|>\n<|im_start|>user\n今天北京的天气怎么样？<|im_end|>\n<|im_start|>assistant\n<think>\n
+<|im_start|>assistant\n<think>\nLet me check.\n</think>\n\n<tool_call>\n<function=search>\n<parameter=q>\n中文 query\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n
+\n
+\n\n
+\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n
+a\nb\r\nc\rd\te\x0bf\x0cg
+\t\t\tindented\n\t\tcode
+\x00
+a\x00b\x01\x02\x7f
+\x1b[31mred\x1b[0m
+\xff\xfe abc \xc3
+\xc0\x80 \xed\xa0\x80 \xf0\x9f\x98 \xe2\x96
+\xe2\x96\x81 and \xe2\x96\x81\xe2\x96\x81
+▁hello ▁▁world▁
+a▁b ▁ ▁▁
+🙂 👨‍👩‍👧‍👦 🇰🇷 🚀🎉 ❤️ 👍🏽
+ꙮ 𠮷 𝔘𝔫𝔦 ‮rtl‬ ﷽
+x                                        y
+                                                                z
+  leading and trailing\x20\x20
+\x20
+\x20\x20\x20
+a\xc2\xa0b c d
+The quick brown fox jumps over the lazy dog. It's we're they've I'm you'll he'd, isn't it? 'Tis the season.
+https://example.com/a/b?q=1&r=%E4%B8%AD#frag user@example.com 192.168.0.1 v1.2.3-rc.4 1e-10 0xDEADBEEF
+Pneumonoultramicroscopicsilicovolcanoconiosis and supercalifragilisticexpialidocious are long words.
+def fib(n: int) -> int:\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nprint([fib(i) for i in range(10)])
+{"id": 42, "tags": ["a", "b"], "nested": {"ok": true, "ratio": 0.125, "note": null}}
+| a | b |\n|---|---|\n| 1 | 2 |\n\n$$\\frac{a}{b} = \\sum_{i=0}^{n} x_i$$
+你好，世界！这是一个中英文 mixed 的 tokenizer 测试。
+我们可以使用 llama.cpp 运行 Nanbeige4.3-33B 模型，上下文长度为 524288。
+《红楼梦》「曹雪芹」……——（节选）：满纸荒唐言，一把辛酸泪。都云作者痴，谁解其中味？
+這是一個繁體中文的測試句子，包含「引號」與標點。
+２０２６年１０月２４日，ＡＢＣ１２３ ｈａｌｆ-ｗｉｄｔｈ
+中文123English456中文 3.14159 1,000,000 第1章
+日本語のテキスト カタカナ ひらがな 漢字。한국어 문장도 포함합니다.
+Привет мир مرحبا بالعالم שלום עולם नमस्ते दुनिया สวัสดีชาวโลก
+Section 1. The committee reviewed the proposal for the new transit line, noting that ridership forecasts depended on housing density near each station. 委员会审议了新地铁线路的提案，指出客流预测在很大程度上取决于每个车站附近的住房密度。 Several members argued that the cost estimates were too low; others disagreed. 一些成员认为成本估算过低，另一些成员则不同意。 Section 1. The committee reviewed the proposal for the new transit line, noting that ridership forecasts depended on housing density near each station. 委员会审议了新地铁线路的提案，指出客流预测在很大程度上取决于每个车站附近的住房密度。 Several members argued that the cost estimates were too low; others disagreed. 一些成员认为成本估算过低，另一些成员则不同意。 Section 1. The committee reviewed the proposal for the new transit line, noting that ridership forecasts depended on housing density near each station. 委员会审议了新地铁线路的提案，指出客流预测在很大程度上取决于每个车站附近的住房密度。 Several members argued that the cost estimates were too low; others disagreed. 一些成员认为成本估算过低，另一些成员则不同意。 Section 1. The committee reviewed the proposal for the new transit line, noting that ridership forecasts depended on housing density near each station. 委员会审议了新地铁线路的提案，指出客流预测在很大程度上取决于每个车站附近的住房密度。 Several members argued that the cost estimates were too low; others disagreed. 一些成员认为成本估算过低，另一些成员则不同意。 Section 1. The committee reviewed the proposal for the new transit line, noting that ridership forecasts depended on housing density near each station. 委员会审议了新地铁线路的提案，指出客流预测在很大程度上取决于每个车站附近的住房密度。 Several members argued that the cost estimates were too low; others disagreed. 一些成员认为成本估算过低，另一些成员则不同意。

@@ -277,7 +277,7 @@ fn card_scratch_at(u: u64) -> u64 {
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_plan() {
-    use model::arch::qwen35moe::hparams::Kind;
+    use model::arch::models::{Extra, Mixer};
     use model::arch::qwen35moe::names::{self, Sub};
     use model::arch::qwen35moe::place::{self, KERNEL_POSITIONS, PlaceError, PlanInputs};
     use model::placement::host_lock::{HostFile, HostSet, page_bytes};
@@ -315,7 +315,7 @@ fn hw_qwen4exp_plan() {
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
     inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
-    let hp = &inputs.hp;
+    let n_layer = inputs.spec.layers.len();
     let file: std::collections::HashSet<&str> = inputs
         .model
         .tensors
@@ -338,8 +338,12 @@ fn hw_qwen4exp_plan() {
     ] {
         want(n);
     }
-    let ple = hp.exp.as_ref().and_then(|e| e.ple).map(|p| p.layer);
-    for (l, kind) in hp.kinds.iter().enumerate() {
+    let ple = inputs
+        .spec
+        .layers
+        .iter()
+        .position(|l| l.extras.contains(&Extra::Ple));
+    for (l, layer) in inputs.spec.layers.iter().enumerate() {
         for sub in [Sub::Attn, Sub::Ffn] {
             want(names::hc_norm(l, sub));
             want(names::hc_down(l, sub));
@@ -358,8 +362,8 @@ fn hw_qwen4exp_plan() {
         ] {
             want(f(l));
         }
-        let mixer: &[fn(usize) -> String] = match kind {
-            Kind::DeltaRule => &[
+        let mixer: &[fn(usize) -> String] = match &layer.mixer {
+            Mixer::DeltaRule(_) => &[
                 names::attn_qkv,
                 names::attn_gate,
                 names::ssm_conv1d,
@@ -370,7 +374,7 @@ fn hw_qwen4exp_plan() {
                 names::ssm_norm,
                 names::ssm_out,
             ],
-            Kind::Attention => &[
+            Mixer::Gqa(_) => &[
                 names::attn_q,
                 names::attn_k,
                 names::attn_v,
@@ -382,6 +386,7 @@ fn hw_qwen4exp_plan() {
                 names::indexer_q_norm,
                 names::indexer_k_norm,
             ],
+            other => panic!("layer {l} mixes with {}", other.what()),
         };
         for f in mixer {
             want(f(l));
@@ -406,7 +411,7 @@ fn hw_qwen4exp_plan() {
     );
     let levers = PlanLevers::default();
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, hp.n_layer, place::UBATCH_PLANNED);
+        let machine = place::machine(card, n_layer, place::UBATCH_PLANNED);
         for (ctx, kv) in KV_AT {
             let plan = match inputs.plan(&machine, ctx, &levers) {
                 Ok(p) => p,
@@ -512,7 +517,7 @@ fn hw_qwen4exp_plan() {
             c.dense_bytes + c.expert_bytes + c.rounding_bytes + c.scratch_bytes + c.context_bytes;
         let limit = at.usable_bytes(spec) - spec.margin_bytes;
         let kv = |ctx: u64| -> u64 {
-            (0..hp.n_layer)
+            (0..n_layer)
                 .map(|l| inputs.kv.layer_bytes(l, ctx))
                 .sum::<u64>()
                 + inputs.kv.stage_position_bytes(ctx)
@@ -543,7 +548,7 @@ fn hw_qwen4exp_plan() {
             at_max && past,
         );
     }
-    let machine = place::machine(A6000, hp.n_layer, place::UBATCH_PLANNED);
+    let machine = place::machine(A6000, n_layer, place::UBATCH_PLANNED);
     // The plan's host set, from the headers: the PLE table's pages once, beside the routed
     // stacks', each run grown to whole pages and merged per shard.
     match inputs.plan(&machine, KV_AT[0].0, &levers) {
@@ -981,7 +986,7 @@ fn hw_qwen4exp_card_plan() {
     let levers = PlanLevers::default();
     for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS {
         let card = if name == A6000.name { A6000 } else { RTX_3090 };
-        let machine = place::machine_for_experts(card, inputs.hp.n_layer, u, Experts::Card);
+        let machine = place::machine_for_experts(card, inputs.spec.layers.len(), u, Experts::Card);
         let got = if with_draft {
             inputs
                 .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
@@ -1080,7 +1085,7 @@ fn hw_qwen4exp_card_plan() {
         );
     }
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
         // PIN(2026-10-15): the floor holds the stage rope table, 64 f32 a position, 256 B at
         // 4,096 positions (1,048,576 B), beside the cache.
         let stage = inputs.kv.stage_position_bytes(KV_AT[0].0);
@@ -1434,7 +1439,7 @@ fn hw_qwen4exp_q3_card_plan() {
     let levers = PlanLevers::default();
     for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS_Q3 {
         let card = if name == A6000.name { A6000 } else { RTX_3090 };
-        let machine = place::machine_for_experts(card, inputs.hp.n_layer, u, Experts::Card);
+        let machine = place::machine_for_experts(card, inputs.spec.layers.len(), u, Experts::Card);
         let got = if with_draft {
             inputs
                 .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
@@ -1525,7 +1530,7 @@ fn hw_qwen4exp_q3_card_plan() {
         );
     }
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
         // PIN(2026-10-15): the floor holds the stage rope table, 64 f32 a position, 256 B at
         // 4,096 positions (1,048,576 B), beside the cache.
         let stage = inputs.kv.stage_position_bytes(KV_AT[0].0);
@@ -1649,9 +1654,9 @@ fn hw_qwen4exp_bp_plan() {
     // memory reads: a room no host need passes, given, not read.
     inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
     let (ctx, u) = (4096u64, 4096u64);
-    let n = inputs.hp.n_layer;
+    let n = inputs.spec.layers.len();
     let levers = PlanLevers::default();
-    let batch = tier_batch(&inputs.hp, u);
+    let batch = tier_batch(&inputs.spec, u);
     let machine = machine_bp(n, u, None, batch);
     // Plan (a)'s rule at the A6000's budget less the tier join's scratch
     // (`place::card_tier_join_bytes`), which plan (b′) adds to its scratch.

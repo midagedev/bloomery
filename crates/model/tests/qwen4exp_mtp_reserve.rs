@@ -23,11 +23,11 @@
 use gguf::GgmlType;
 use model::arch::models::headpick::HeadSet;
 use model::arch::models::{
-    Act, Arch, Borrows, ChatSpec, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, ModelSpec, Moe,
-    MtpDraft, MtpHeadNorm, MtpInput, MtpSource, OutGate, Residual, Rope, RopeMode, Router, Score,
+    Act, Arch, Borrows, ChatSpec, DeltaKind, DeltaRule, EngramSpec, Extra, Ffn, GdnGate, Gqa,
+    HcKind, HcSpec, KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, MtpDraft, MtpHeadNorm, MtpInput,
+    MtpSource, NgramRule, OutGate, PoolRule, Residual, Rope, RopeMode, Router, Score, Selector,
     Shared,
 };
-use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, SectionOrder, Variant};
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
     Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, mtp_head_act_bytes, mtp_tensors,
@@ -47,65 +47,115 @@ const WIDE: u64 = 8 << 30;
 
 /// The slot tests' file: three delta layers, the PLE site on the second, a
 /// selecting attention layer; Qwen3.8's widths.
-fn hparams() -> Hparams {
-    Hparams {
-        variant: Variant::Qwen4Exp,
-        n_layer: LAYERS,
-        n_trunk: LAYERS,
-        n_embd: 2560,
-        n_head: 16,
-        n_head_kv: 2,
-        head_dim: 256,
-        rope_dims: 64,
-        rope_sections: [11, 11, 10, 0],
-        rope_order: SectionOrder::Tyxz,
-        rope_base: 1e7,
-        rms_eps: 1e-6,
-        n_vocab: 248_320,
-        n_ctx_train: 262_144,
-        n_expert: 512,
-        n_used: 10,
-        expert_ff: 640,
-        shared_ff: Some(640),
-        ff: None,
-        conv: 4,
-        state: 128,
-        v_heads: 48,
+fn description() -> ModelSpec {
+    let rope = Rope {
+        mode: RopeMode::Imrope {
+            sections: [11, 11, 10, 0],
+        },
+        dims: 64,
+        base: 1e7,
+        yarn: None,
+    };
+    let gdn = Mixer::DeltaRule(DeltaRule {
+        kind: DeltaKind::Gdn {
+            khead_map: KHeadMap::Tiled,
+            gate: GdnGate::Sigmoid,
+        },
         k_heads: 16,
-        interval: LAYERS,
-        kinds: vec![
-            Kind::DeltaRule,
-            Kind::DeltaRule,
-            Kind::DeltaRule,
-            Kind::Attention,
-        ],
-        ffns: vec![FfnKind::Routed; LAYERS],
-        exp: Some(Exp {
-            hc_streams: 4,
-            hc_rank: 320,
-            idx_heads: 4,
-            idx_dim: 128,
-            idx_top_k: 2048,
-            ratios: vec![0, 0, 0, 4],
-            ple: Some(Ple {
-                layer: 1,
-                ngram: 3,
-                heads_per_ngram: 4,
-                conv: 4,
-                eos: 0,
-                image: None,
-                row: 256,
+        v_heads: 48,
+        d: 128,
+        conv: 4,
+    });
+    let attention = Mixer::Gqa(Gqa {
+        heads: 16,
+        kv_heads: 2,
+        head_dim: 256,
+        value_dim: 256,
+        rope,
+        qk_norm: true,
+        o_norm: false,
+        out_gate: OutGate::Packed,
+        select: Some(Selector::TokenPool {
+            heads: 4,
+            d: 128,
+            top_k: 2048,
+            pool: 4,
+            rule: PoolRule::Mean { rope },
+        }),
+        window: None,
+        sinks: false,
+        value_scale: None,
+    });
+    let layer = |l: usize, mixer: Mixer| LayerSpec {
+        mixer,
+        ffn: Ffn::Moe(Moe {
+            experts: 512,
+            top_k: 10,
+            expert_ff: 640,
+            latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
+            act: Act::SwiGlu { limit: None },
+            router: Router {
+                score: Score::Softmax,
+                bias: false,
+                norm: models::RouterNorm::SelectedSum,
+                scale: 1.0,
+                hash: false,
+            },
+            shared: Some(Shared {
+                ff: 640,
+                act: Act::SwiGlu { limit: None },
+                sigmoid_gate: true,
             }),
         }),
-        defaults: Vec::new(),
+        residual: Residual::Hc,
+        extras: if l == 1 { vec![Extra::Ple] } else { Vec::new() },
+    };
+    ModelSpec {
+        arch: Arch::Qwen4Exp,
+        hidden: 2560,
+        vocab: 248_320,
+        ctx_train: 262_144,
+        rms_eps: 1e-6,
+        layers: vec![
+            layer(0, gdn.clone()),
+            layer(1, gdn.clone()),
+            layer(2, gdn),
+            layer(3, attention),
+        ],
+        mtp: Vec::new(),
+        hc: Some(HcSpec {
+            streams: 4,
+            kind: HcKind::Gated { rank: 320 },
+        }),
+        engram: Some(EngramSpec {
+            heads: 4,
+            max_ngram: 3,
+            key_length: 256,
+            rule: NgramRule::Ple {
+                eos: 0,
+                image: None,
+                conv: 4,
+                dilation: 3,
+            },
+        }),
+        encoder: None,
+        logit_epilogue: None,
+        chat: ChatSpec {
+            pre: String::new(),
+            template: None,
+            tools: None,
+            reasoning: None,
+        },
     }
 }
 
 /// A layer's norm, and its routed stacks in types the card experts read: a
 /// Q4_K gate and up of 640 rows of 2,560, a Q8_0 down of 2,560 rows of 640.
 fn inputs() -> PlanInputs {
-    let hp = hparams();
-    let kv = KvLayout::of(&hp);
+    let spec = description();
+    let kv = KvLayout::of_spec(&spec).expect("the description's layout");
     let tensor = |l: usize, stem: &str, role: Role, ty: GgmlType, dims: Vec<u64>| {
         let values: u64 = dims.iter().product();
         ModelTensor {
@@ -145,27 +195,7 @@ fn inputs() -> PlanInputs {
             vec![640, 2560, EXPERTS],
         ));
     }
-    let spec = ModelSpec {
-        arch: Arch::Qwen4Exp,
-        hidden: 2560,
-        vocab: 248_320,
-        ctx_train: 262_144,
-        rms_eps: 1e-6,
-        layers: Vec::new(),
-        mtp: Vec::new(),
-        hc: None,
-        engram: None,
-        encoder: None,
-        logit_epilogue: None,
-        chat: ChatSpec {
-            pre: String::new(),
-            template: None,
-            tools: None,
-            reasoning: None,
-        },
-    };
     PlanInputs {
-        hp,
         model: ModelTensors {
             tensors,
             layers: LAYERS,

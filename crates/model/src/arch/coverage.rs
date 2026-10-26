@@ -133,10 +133,12 @@ pub const AVAILABLE: &[Available] = &[
                     sinks: false,
                     scaled: false,
                 // The pack-5 and pack-16 rows (head 128, groups 5 and 16) are
-                // launched by no Qwen body; the programs that launch them name
-                // their own entries.
+                // launched by neither whole-card body, and the pack-7 row (group 7) by
+                // Body35 alone; the programs that launch them name their own
+                // entries.
                 } if value == head
-                    && gqa_row(*head, *group).is_some_and(|r| r.pack != 5 && r.pack != 16)
+                    && gqa_row(*head, *group)
+                        .is_some_and(|r| r.pack != 5 && r.pack != 7 && r.pack != 16)
             )
         },
     },
@@ -154,6 +156,24 @@ pub const AVAILABLE: &[Available] = &[
                     sinks: false,
                     scaled: false,
                 } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 5)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Qwen35Body],
+        at: "gpu/src/flash_gqa.rs GROUP_7 (gqa_flash_seg_mma_g7, gpu/src/flash_gqa_prefill.rs \
+             gqa_prefill_flash_g7, and their q8 twins)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head,
+                    value,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 7)
             )
         },
     },
@@ -287,6 +307,21 @@ pub const AVAILABLE: &[Available] = &[
                     mode: mode @ RopeMode::Imrope { .. },
                     dims: 64
                 } if turns_as_neox(*mode, 64)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Qwen35Body],
+        at: "gpu/src/rope_norm.rs rope_norm_append (NORM pairs over all 128 dims, no head norm)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: false,
+                    head: 128,
+                    mode: RopeMode::NormTail,
+                    dims: 128
+                }
             )
         },
     },
@@ -2095,6 +2130,44 @@ mod tests {
             ),
         ] {
             assert!(!runs(&need), "{what} read as covered: {need}");
+        }
+    }
+
+    /// The head-128 group-of-7 flash and the head-128 NORM rope without a
+    /// head norm are launched by `Body35` alone: the other whole-card body reads
+    /// neither as covered.
+    #[test]
+    fn a_group_of_7_flash_and_a_norm_rope_are_body35s_alone() {
+        use super::AVAILABLE;
+        use models::RopeMode;
+        let g7 = Need::Gqa {
+            head: 128,
+            value: 128,
+            group: 7,
+            window: None,
+            sinks: false,
+            scaled: false,
+        };
+        let norm = Need::QkRope {
+            qk_norm: false,
+            head: 128,
+            mode: RopeMode::NormTail,
+            dims: 128,
+        };
+        let runs = |program: Program, need: &Need| {
+            AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&program) && (a.runs)(need))
+        };
+        for (what, need) in [("the group-7 flash", &g7), ("the NORM rope", &norm)] {
+            assert!(
+                runs(Program::Qwen35Body, need),
+                "{what}: Body35 launches it"
+            );
+            assert!(
+                !runs(Program::Qwen3moeBody, need),
+                "{what} read as the other whole-card body's"
+            );
         }
     }
 

@@ -19,9 +19,9 @@ pub enum Program {
     Deepseek41Chain,
     /// The whole-card qwen3moe body (`crates/gpu/src/arch/qwen3moe` `Body`).
     Qwen3moeBody,
-    /// The whole-card qwen35moe and qwen35 body (`crates/gpu/src/arch/qwen3moe`
-    /// `Body35`): gated-delta-rule and gated GQA layers, its sites' types by
-    /// `crate::site`.
+    /// The whole-card qwen35moe, qwen35 and llama body
+    /// (`crates/gpu/src/arch/qwen3moe` `Body35`): gated-delta-rule and GQA
+    /// layers, its sites' types by `crate::site`.
     Qwen35Body,
     /// The glm5next body (`crates/gpu-glm5next`): the routed experts the plan
     /// puts on a card (the common pair) and the rest on the host tier.
@@ -75,7 +75,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
     match arch {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(Program::Deepseek41Chain),
         Arch::Qwen3Moe => Some(Program::Qwen3moeBody),
-        Arch::Qwen35Moe | Arch::Qwen35 => Some(Program::Qwen35Body),
+        Arch::Qwen35Moe | Arch::Qwen35 | Arch::Llama => Some(Program::Qwen35Body),
         Arch::Glm5Next => Some(Program::Glm5nextBody),
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),

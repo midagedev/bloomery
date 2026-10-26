@@ -24,6 +24,7 @@ mod gemma_encoder;
 pub mod glm5next;
 pub mod hybrid;
 pub mod kda;
+pub mod llama;
 pub mod mimo2;
 pub mod minimaxm3;
 pub mod musespark;
@@ -48,13 +49,34 @@ pub use models;
 /// architecture no reader here reads is [`ModelError::UnknownArchitecture`]
 /// with the string the file held. `deepseek2` has no reader.
 pub fn spec(split: &Split) -> Result<Read, ModelError> {
-    let arch = split.architecture();
-    match arch.and_then(registry::row_of).and_then(|row| row.read) {
+    match reader_of(split) {
         Some(read) => read(split).map_err(ModelError::from),
         None => Err(ModelError::UnknownArchitecture(
-            arch.unwrap_or("<missing>").to_string(),
+            split.architecture().unwrap_or("<missing>").to_string(),
         )),
     }
+}
+
+/// [`spec`] for a caller whose refusals are the placement layer's
+/// ([`PlacementError`]): the reader's own error as it stands, and an
+/// architecture no reader here reads a metadata refusal naming
+/// `general.architecture`.
+pub fn spec_placed(split: &Split) -> Result<Read, PlacementError> {
+    match reader_of(split) {
+        Some(read) => read(split),
+        None => Err(architecture_is(&format!(
+            "{:?}; no reader here reads it",
+            split.architecture().unwrap_or("<missing>")
+        ))),
+    }
+}
+
+/// The reader of `split`'s family ([`registry::ROWS`]); `None`: no reader.
+fn reader_of(split: &Split) -> Option<registry::Reader> {
+    split
+        .architecture()
+        .and_then(registry::row_of)
+        .and_then(|row| row.read)
 }
 
 /// A reader's output: the description, the roles, and the keys it took a
@@ -815,29 +837,80 @@ fn nextn_layers(
 
 /// `tokenizer.ggml.pre`.
 const PRE: &str = "tokenizer.ggml.pre";
+/// `tokenizer.ggml.model`.
+const TOKENIZER_MODEL: &str = "tokenizer.ggml.model";
 /// `tokenizer.chat_template`.
 const TEMPLATE: &str = "tokenizer.chat_template";
+/// `tokenizer.ggml.model` of a SentencePiece file, and the pre-tokenizer rule
+/// that tokenizer selects, whatever `tokenizer.ggml.pre` says (llama.cpp's
+/// SentencePiece branch takes no BPE pre-tokenizer from it).
+const SPM: &str = "llama";
 
-/// The file's chat surface: its pre-tokenizer (required) and template, with
-/// the family's parsers.
+/// Whether `split`'s tokenizer is SentencePiece.
+fn is_spm(split: &Split) -> bool {
+    split.value(TOKENIZER_MODEL).and_then(Value::as_str) == Some(SPM)
+}
+
+/// The file's chat surface: its pre-tokenizer and template, with the family's
+/// parsers. A SentencePiece file's pre-tokenizer is [`SPM`] whatever
+/// `tokenizer.ggml.pre` says ([`spm_pre_default`] names the rewrite); any other
+/// file names its own, and is refused without one.
 fn chat_of(
     split: &Split,
     tools: Option<ToolFormat>,
     reasoning: Option<ReasoningFormat>,
 ) -> Result<ChatSpec, PlacementError> {
-    let pre = split
-        .value(PRE)
-        .and_then(Value::as_str)
-        .ok_or_else(|| PlacementError::Metadata {
-            key: PRE.to_string(),
-            detail: "is absent or not a string".to_string(),
-        })?;
+    let pre = if is_spm(split) {
+        if let Some(v) = split.value(PRE)
+            && v.as_str().is_none()
+        {
+            return Err(PlacementError::Metadata {
+                key: PRE.to_string(),
+                detail: "is not a string".to_string(),
+            });
+        }
+        SPM
+    } else {
+        split
+            .value(PRE)
+            .and_then(Value::as_str)
+            .ok_or_else(|| PlacementError::Metadata {
+                key: PRE.to_string(),
+                detail: "is absent or not a string".to_string(),
+            })?
+    };
     Ok(ChatSpec {
         pre: pre.to_string(),
         template: template_of(split)?,
         tools,
         reasoning,
     })
+}
+
+/// [`chat_of`] for an architecture string several model families share: the
+/// tool-call and reasoning parsers are the ones the file's own template
+/// teaches ([`ToolFormat::of_template`], [`ReasoningFormat::of_template`]), and
+/// `None` for a file with no template or one whose markup no parser here reads.
+fn chat_from_template(split: &Split) -> Result<ChatSpec, PlacementError> {
+    let mut chat = chat_of(split, None, None)?;
+    if let Some(template) = &chat.template {
+        chat.tools = ToolFormat::of_template(template);
+        chat.reasoning = ReasoningFormat::of_template(template);
+    }
+    Ok(chat)
+}
+
+/// The line a reader records in its defaults when [`chat_of`] took a
+/// SentencePiece file's pre-tokenizer from the tokenizer model: the file's own
+/// `tokenizer.ggml.pre` is absent or another name. `None` for any other file,
+/// and for one that already says [`SPM`].
+fn spm_pre_default(split: &Split) -> Option<String> {
+    if !is_spm(split) {
+        return None;
+    }
+    let file = split.value(PRE).and_then(Value::as_str);
+    (file != Some(SPM))
+        .then(|| format!("{PRE} = {SPM} ({TOKENIZER_MODEL} {SPM}; the file says {file:?})"))
 }
 
 /// `tokenizer.chat_template`; `None` when the file has none.

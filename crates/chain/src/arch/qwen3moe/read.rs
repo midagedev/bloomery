@@ -477,30 +477,18 @@ pub fn plan_ffn(
     }
 }
 
-/// Layer `l`'s gated attention ([`GqaKind::Gated256`]) over the flash `flash`
-/// its group selects: what the card's body reads ([`plan_gqa_class`]).
+/// Layer `l`'s attention of kind `kind` over the flash `flash` its group
+/// selects, every site's type from `file`'s header at a type of the backend's
+/// `sites`. The q and k norm names are planned for every kind; only a kind
+/// with a head norm ([`GqaKind::head_norm`]) reads them, and a backend's
+/// residency check asks the file for them only then. The query projection is
+/// read at the rows `d` names, which hold the kind's gate rows.
 pub fn plan_gqa(
     file: &Split,
     what: &'static str,
     d: &PlanDims,
     l: usize,
-    flash: Flash,
-    sites: &Sites35,
-) -> Result<GqaPlan, ChainError> {
-    plan_gqa_class(file, what, d, l, GqaKind::Gated256, flash, sites)
-}
-
-/// Layer `l`'s attention of class `kind` over the flash `flash` its group
-/// selects, every site's type from `file`'s header at a type of the backend's
-/// `sites`. The query projection is read at the rows `d` names, which hold the
-/// class's gate rows.
-pub fn plan_gqa_class(
-    file: &Split,
-    what: &'static str,
-    d: &PlanDims,
-    l: usize,
-    kind: GqaKind,
-    flash: Flash,
+    (kind, flash): (GqaKind, Flash),
     sites: &Sites35,
 ) -> Result<GqaPlan, ChainError> {
     let (h, kv, att) = (d.hidden, d.kv_len, d.attn_len);
@@ -567,7 +555,7 @@ pub fn plan_delta(
 
 /// Every layer's plan of a qwen3moe-family chain, `kinds` its layers' kinds
 /// ([`super::plan::kinds_of`] or the card's [`super::plan::kinds35`], one a
-/// layer; an attention layer's class is its description's geometry), each
+/// layer; an attention layer's kind carries the class its geometry selects), each
 /// layer's mixer and FFN read from `file`'s header at the rows `pd` names and
 /// at a type of the backend's `sites`, the routed stacks held as `read` says
 /// ([`Read35`]): the loop a whole load runs, both backends' — a backend that
@@ -598,10 +586,19 @@ pub fn layer_plans(
         .enumerate()
         .map(|(l, (kind, layer))| {
             let mixer = match *kind {
-                Kind35::Gqa(flash) => {
+                Kind35::Gqa(kind, flash) => {
                     let class = layer_class(layer)
                         .map_err(|e| ChainError::shape(what, format!("layer {l}: {e}")))?;
-                    MixerPlan::Gqa(plan_gqa_class(file, what, pd, l, class, flash, sites)?)
+                    if class != kind {
+                        return Err(ChainError::shape(
+                            what,
+                            format!(
+                                "layer {l}: the kind reads attention {kind:?}; the description's \
+                                 geometry selects {class:?}"
+                            ),
+                        ));
+                    }
+                    MixerPlan::Gqa(plan_gqa(file, what, pd, l, (kind, flash), sites)?)
                 }
                 Kind35::Delta(shape) => {
                     MixerPlan::Delta(plan_delta(file, what, pd, shape, l, sites)?)
@@ -852,7 +849,14 @@ mod tests {
         }
         let pd = PlanDims::q35(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(PlanDims::of(&spec, "t").ok(), Some(pd));
-        let card = plan_gqa(&file, "t", &pd, 1, Flash::Group, &Sites35::CARD);
+        let card = plan_gqa(
+            &file,
+            "t",
+            &pd,
+            1,
+            (GqaKind::Gated256, Flash::Group),
+            &Sites35::CARD,
+        );
         assert_eq!(card.map(|g| g.kind).ok(), Some(GqaKind::Gated256));
     }
 
@@ -924,7 +928,7 @@ mod tests {
             kv_len: 512,
             attn_len: 4096,
         };
-        let kinds = [Kind35::Gqa(Flash::Group)];
+        let kinds = [Kind35::Gqa(GqaKind::Gated256, Flash::Group)];
         let file = header(Vec::new());
         match layer_plans(
             &file,
