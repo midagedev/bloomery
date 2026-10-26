@@ -1158,6 +1158,26 @@ const TYPE_PINS: &[TypePin] = &[
         what: "absorbed key and value heads (the per-head gemv reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
+    // The selector's query and head weights run on its branch stream through
+    // its own row-major gemv (`mla::select`), not `site::ByName`.
+    TypePin {
+        programs: &[Program::Glm5nextBody],
+        role: Role::Attention,
+        matrices: true,
+        names: Some(is_selector_site),
+        what: "selector query and head weights (its gemv reads q8_0, f32 or bf16)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
+    },
+    // The selector's pool position table is read as f32 values: a BF16 one
+    // loads widened.
+    TypePin {
+        programs: &[Program::Glm5nextBody],
+        role: Role::Attention,
+        matrices: true,
+        names: Some(|n| n.ends_with(".indexer_compressor_ape.weight")),
+        what: "selector pool positions (read as f32 values)",
+        reads: &[GgmlType::BF16],
+    },
     // PIN(2026-10-26): widened from `[Q8_0]` with the f32 hyper-connection fn
     // (`HcFn::F32`, `ds41_hc_pre_f32`): a BF16 fn loads widened to f32 values,
     // which that launch reads beside the q8_0 planes `hc_pre_q8_0` reads.
@@ -1579,7 +1599,11 @@ const ROW_PINS: &[RowPin] = &[
         program: Program::Glm5nextBody,
         role: Role::Attention,
         matrices: true,
-        names: Some(|n| !is_absorbed_pair(n)),
+        names: Some(|n| {
+            !is_absorbed_pair(n)
+                && !is_selector_site(n)
+                && !n.ends_with(".indexer_compressor_ape.weight")
+        }),
         what: "mixer matrices (the types dense_projected names)",
         row: |ty| dense_projected(ty).is_some(),
     },
@@ -1762,6 +1786,12 @@ pub const fn qwen35_shared(ty: GgmlType) -> Option<SiteEntry> {
 /// `attn_v_b`): the weights its per-head gemv reads.
 fn is_absorbed_pair(name: &str) -> bool {
     name.ends_with(".attn_k_b.weight") || name.ends_with(".attn_v_b.weight")
+}
+
+/// The latent mixer's selector query and head weights: `mla::select` reads
+/// them on its branch stream through its own row-major gemv.
+fn is_selector_site(name: &str) -> bool {
+    name.ends_with(".indexer.attn_q_b.weight") || name.ends_with(".indexer.proj.weight")
 }
 
 /// A routed expert stack's gate or up rows (`ffn_gate_exps`/`ffn_up_exps`):
@@ -3417,6 +3447,32 @@ mod tests {
                 [format!("{} {pair}", GgmlType::Q6_K)]
             );
         }
+        let sel = "selector query and head weights (its gemv reads q8_0, f32 or bf16)";
+        for name in ["indexer.attn_q_b.weight", "indexer.proj.weight"] {
+            for ty in [GgmlType::Q8_0, GgmlType::BF16] {
+                assert_eq!(
+                    of(name, Role::Attention, ty),
+                    Vec::<String>::new(),
+                    "{name} {ty}"
+                );
+            }
+            assert_eq!(
+                of(name, Role::Attention, GgmlType::Q4_K),
+                [format!("{} {sel}", GgmlType::Q4_K)]
+            );
+        }
+        let ape = "indexer_compressor_ape.weight";
+        assert_eq!(
+            of(ape, Role::Attention, GgmlType::BF16),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            of(ape, Role::Attention, GgmlType::Q4_K),
+            [format!(
+                "{} selector pool positions (read as f32 values)",
+                GgmlType::Q4_K
+            )]
+        );
         for ty in [GgmlType::Q8_0, GgmlType::BF16] {
             assert_eq!(
                 of("hc_attn_fn.weight", Role::HyperConnection, ty),

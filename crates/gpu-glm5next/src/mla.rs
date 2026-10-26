@@ -15,8 +15,8 @@
 //! 6. the key of the pool the token completes ([`pool`], `index_pool`);
 //!
 //! and [`select`]:
-//! 7. `indexer.proj`: the head weights, an f32 gemv of the normed input;
-//! 8. `indexer.attn_q_b`: the indexer query, a q8_0 gemv of the q_a norm;
+//! 7. `indexer.proj`: the head weights, a q8_0, f32 or bf16 gemv of the normed input;
+//! 8. `indexer.attn_q_b`: the indexer query, a q8_0, f32 or bf16 gemv of the q_a norm;
 //! 9. the scores of the pools the token sees (`kpool_score`);
 //! 10. the list and its length as the attention's visible count
 //!     (`qsa_topk_high`) —

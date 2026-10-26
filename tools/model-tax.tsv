@@ -138,7 +138,7 @@ crates/metal/src/bin/generate_metal.rs	qwen	2	PIN(2026-10-23) qwen: Metal arch d
 crates/metal/src/instance.rs	qwen	4	PIN(2026-10-27) qwen: Metal instance rows by program: the registry names each instance row in common code until each architecture module registers its own rows
 crates/model/src/arch/coverage.rs	deepseek	16	PIN(2026-10-26) deepseek: baseline P 13: MK2 program by body; +3 are the V4.1 chain's compressor and indexer type pin (its programs key and the two name selectors of roles::is_side_matrix); the program would own its type pins instead of this list naming Program::Deepseek41Chain
 crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
-crates/model/src/arch/coverage.rs	glm	19	PIN(2026-10-27) glm: the absorbed key/value pair is a second pin row of its program until a common head-split entry reads K-quants (was 18; baseline P 21: MK2 program by body)
+crates/model/src/arch/coverage.rs	glm	21	PIN(2026-10-27) glm: the absorbed key/value pair and the selector (its own row-major gemv, and its pool positions read as f32) are pin rows of their program beside the by-name row, until common entries read them (was 18; baseline P 21: MK2 program by body)
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
 crates/model/src/arch/coverage.rs	nemotron	35	baseline P 36: MK2 program by body
 crates/model/src/arch/coverage.rs	qwen	60	PIN(2026-10-26) qwen: main's row (baseline P 63, 58 lines) + 2, the group-7 flash and NORM-rope rows name Program::Qwen35Body, the one program that launches them; the program would own its rows instead of the list naming programs (MK2)
