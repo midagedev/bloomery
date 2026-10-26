@@ -14,7 +14,7 @@ use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::site::SiteTy;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
-use chain::arch::hybrid::plan::LayerPlan;
+use chain::hybrid::plan::LayerPlan;
 use chain::arch::nemotron_h::plan::Plan;
 use chain::arch::nemotron_h::read::layer_plans;
 use cuda_core::{CudaStream, DeviceBuffer};

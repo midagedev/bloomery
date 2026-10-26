@@ -17,6 +17,7 @@
 //! the text, so what a gate pins reads the same on every backend.
 
 pub mod arch;
+pub mod hybrid;
 pub mod linear;
 pub mod rope;
 pub mod site;

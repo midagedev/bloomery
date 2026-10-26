@@ -3,8 +3,8 @@
 
 use super::plan::{MlpPlan, Plan};
 use crate::ChainError;
-use crate::arch::hybrid::plan::LayerPlan;
-use crate::arch::hybrid::read::{mamba_plan, no_block, nope_gqa_plan};
+use crate::hybrid::plan::LayerPlan;
+use crate::hybrid::read::{mamba_plan, no_block, nope_gqa_plan};
 use crate::site::{SiteTy, file_site};
 use gguf::Split;
 use model::arch::models::{Act, Ffn, LayerSpec, Mixer};
@@ -79,8 +79,8 @@ pub fn layer_plans(
 mod tests {
     use super::super::plan::{MlpPlan, Plan};
     use super::layer_plans;
-    use crate::arch::hybrid::plan::{Counts, LayerPlan};
-    use crate::arch::hybrid::test_file::{decl, header};
+    use crate::hybrid::plan::{Counts, LayerPlan};
+    use crate::hybrid::test_file::{decl, header};
     use crate::site::SiteTy;
     use gguf::Split;
     use gguf::quant::GgmlType::{self, Q4_K, Q5_0, Q8_0};

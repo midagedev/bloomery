@@ -1,5 +1,5 @@
 //! One decode step: the layer kinds and the enqueue of the whole chain, the chain crate's walk
-//! ([`chain::arch::hybrid::walk`]) over [`Program`]'s ops (async throughout: nothing here
+//! ([`chain::hybrid::walk`]) over [`Program`]'s ops (async throughout: nothing here
 //! allocates, frees or synchronizes, so it is both the eager body and what a capture records).
 
 use super::body::Body;
@@ -9,7 +9,7 @@ use crate::head::Head;
 use crate::site::SiteTy;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
-use chain::arch::hybrid::walk::Walk;
+use chain::hybrid::walk::Walk;
 
 const WHAT: &str = "nemotron_h::Body::enqueue_chain";
 

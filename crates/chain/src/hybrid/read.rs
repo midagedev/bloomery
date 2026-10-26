@@ -201,24 +201,24 @@ mod tests {
     #[test]
     fn a_mamba_plan_reads_its_names_types_and_optional_bias() {
         let want = |conv_b: Option<&str>| MambaPlan {
-            norm: "blk.3.attn_norm.weight".into(),
-            ssm_in: "blk.3.ssm_in.weight".into(),
-            ssm_out: "blk.3.ssm_out.weight".into(),
-            a: "blk.3.ssm_a".into(),
-            d: "blk.3.ssm_d".into(),
-            dt_bias: "blk.3.ssm_dt.bias".into(),
-            conv_w: "blk.3.ssm_conv1d.weight".into(),
+            norm: blk(3, "attn_norm.weight"),
+            ssm_in: blk(3, "ssm_in.weight"),
+            ssm_out: blk(3, "ssm_out.weight"),
+            a: blk(3, "ssm_a"),
+            d: blk(3, "ssm_d"),
+            dt_bias: blk(3, "ssm_dt.bias"),
+            conv_w: blk(3, "ssm_conv1d.weight"),
             conv_b: conv_b.map(Into::into),
-            ssm_norm: "blk.3.ssm_norm.weight".into(),
+            ssm_norm: blk(3, "ssm_norm.weight"),
             shape: mamba(),
             conv_dim: 1024,
             in_ty: SiteTy::Q5_0,
             out_ty: SiteTy::Q8_0,
         };
-        for (bias, conv_b) in [(true, Some("blk.3.ssm_conv1d.bias")), (false, None)] {
+        for (bias, conv_b) in [(true, Some(blk(3, "ssm_conv1d.bias"))), (false, None)] {
             let got = mamba_plan(&mamba_file(3, bias), WHAT, 3, &mamba(), HIDDEN, ALLOWED)
                 .unwrap_or_else(|e| panic!("{e}"));
-            assert_eq!(got, want(conv_b));
+            assert_eq!(got, want(conv_b.as_deref()));
         }
     }
 
@@ -260,7 +260,7 @@ mod tests {
         ]);
         let ty = mamba_err(&other_ty, &mamba());
         assert!(
-            ty.contains("blk.3.ssm_in.weight") && ty.contains("this site launches Q5_0, Q8_0"),
+            ty.contains(&blk(3, "ssm_in.weight")) && ty.contains("this site launches Q5_0, Q8_0"),
             "{ty}"
         );
         let other_shape = header(vec![
@@ -269,7 +269,7 @@ mod tests {
         ]);
         let shape = mamba_err(&other_shape, &mamba());
         assert!(
-            shape.contains("blk.3.ssm_in.weight") && shape.contains("takes 1544 rows of 256"),
+            shape.contains(&blk(3, "ssm_in.weight")) && shape.contains("takes 1544 rows of 256"),
             "{shape}"
         );
         let missing = mamba_err(&header(vec![]), &mamba());
@@ -323,11 +323,11 @@ mod tests {
         assert_eq!(
             got,
             NopeGqaPlan {
-                norm: "blk.2.attn_norm.weight".into(),
-                q: "blk.2.attn_q.weight".into(),
-                k: "blk.2.attn_k.weight".into(),
-                v: "blk.2.attn_v.weight".into(),
-                o: "blk.2.attn_output.weight".into(),
+                norm: blk(2, "attn_norm.weight"),
+                q: blk(2, "attn_q.weight"),
+                k: blk(2, "attn_k.weight"),
+                v: blk(2, "attn_v.weight"),
+                o: blk(2, "attn_output.weight"),
                 n_head: 10,
                 n_kv: 2,
                 q_ty: SiteTy::Q5_0,
@@ -406,7 +406,7 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(
-            err.contains("blk.2.attn_q.weight") && err.contains("this site launches Q5_0, Q8_0"),
+            err.contains(&blk(2, "attn_q.weight")) && err.contains("this site launches Q5_0, Q8_0"),
             "{err}"
         );
         t[0] = decl(blk(2, ATTN_Q), &[h, 1279], Q5_0);
@@ -415,7 +415,7 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(
-            err.contains("blk.2.attn_q.weight") && err.contains("takes 1280 rows of 256"),
+            err.contains(&blk(2, "attn_q.weight")) && err.contains("takes 1280 rows of 256"),
             "{err}"
         );
     }

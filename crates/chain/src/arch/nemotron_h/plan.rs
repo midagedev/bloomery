@@ -1,6 +1,6 @@
 //! The family's own layer: a dense MLP with no gate, `down(relu²(up(x)))`.
 
-use crate::arch::hybrid::plan::LayerPlan;
+use crate::hybrid::plan::LayerPlan;
 use crate::site::SiteTy;
 
 /// A dense MLP layer: the pre-norm, the up projection to `ff` values and the down projection back.

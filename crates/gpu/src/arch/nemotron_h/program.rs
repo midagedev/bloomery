@@ -1,5 +1,5 @@
 //! The family's layer program ([`Program`]): the ops ([`HybridOps`]) the chain crate's walk
-//! ([`Walk`](chain::arch::hybrid::walk::Walk)) orders over one decode step. Each op is one of the
+//! ([`Walk`](chain::hybrid::walk::Walk)) orders over one decode step. Each op is one of the
 //! launch groups of the hybrid trunk ([`crate::arch::hybrid`]) or of the MLP layer, the layer it
 //! runs the one the walk's [`Step`] names.
 //!
@@ -16,8 +16,8 @@ use crate::flash_gqa::GROUP_5;
 use crate::head::Head;
 use crate::weights::DevWeight;
 use crate::{GpuError, Window};
-use chain::arch::hybrid::ops::{HybridOps, Step};
-use chain::arch::hybrid::plan::{MambaPlan, NopeGqaPlan};
+use chain::hybrid::ops::{HybridOps, Step};
+use chain::hybrid::plan::{MambaPlan, NopeGqaPlan};
 use chain::arch::nemotron_h::plan::MlpPlan;
 use cuda_core::DeviceBuffer;
 
