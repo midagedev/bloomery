@@ -59,7 +59,7 @@ France is" -n 32`, greedy, with a download running on the same Mac. MiniCPM-V an
 That is a development-loop number, not a measurement of the engine: the Mac has no timing runner. It also shows that a
 32 GB Mac opened and ran two Q4_K_M files of 35B-A3B shape.
 
-### 1.2 Before opening a file: `generate_metal --plan` (after #806)
+### 1.2 Before opening a file: `generate_metal --plan`
 
 `generate_metal --plan [--ctx C]` reads only the file's header and tensor table and loads no weights. It prints every
 refusal the open would raise, not only the first, then the bytes the open would allocate, the device's working set and
@@ -79,12 +79,11 @@ runtime compiles it when the device opens (`crates/metal/src/library.rs:199-215`
 matrix units takes (Metal 4; the M5 in [`../mac.md`](../mac.md)) are compiled from source at the open on both paths
 (`library.rs:207-214`).
 
-The maintainers' Macs have no Metal Toolchain. On the lead Mac in this round the command printed `error: cannot execute
-tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain`; the other Macs used for
-this port are reported to have none either. So every gate and every number on this page ran the source path. **The
-metallib path is not tested on any of the maintainers' Macs.** The kernels gate has a clause for it,
-`metallib_equals_source`, which runs every entry through both libraries and compares the words; a build without the
-toolchain reports it as a skip.
+One maintainer Mac has the Metal Toolchain; the others have none (`xcrun -sdk macosx metal --version` prints
+`error: cannot execute tool 'metal' due to missing Metal Toolchain`). The metallib path builds on the Mac that has it.
+Every gate and every number on this page ran the source path. **The metallib path's gates have not run on any of the
+maintainers' Macs.** The kernels gate has a clause for it, `metallib_equals_source`, which runs every entry through
+both libraries and compares the words; a build without the toolchain reports it as a skip.
 
 A tester with the toolchain installed (`xcodebuild -downloadComponent MetalToolchain`) can help: run `just lab-metal`
 and report its output. The kernels gate prints a `metal-lib: path=metallib` or `path=source` line; its

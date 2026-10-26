@@ -20,9 +20,8 @@ Silicon build; building from source works too. The port's map and design are in 
   with its stable compiler and fails on the pinned crates). `rust-toolchain.toml` pins the nightly, and rustup installs
   it on the first build. The Metal backend links no CUDA code, so plain `cargo` builds it. Xcode's Metal toolchain is
   optional: with `xcrun metal` the build writes a metallib, and without it the kernels compile from their embedded
-  source when the binary starts (the release's binaries do this). The maintainers' Macs have no Metal Toolchain
-  (`xcrun -sdk macosx metal --version` answers "missing Metal Toolchain"), so every number and gate here ran the source
-  path and the metallib path is not tested. If you have the toolchain (`xcodebuild -downloadComponent MetalToolchain`),
+  source when the binary starts (the release's binaries do this). Every number and gate here ran the source path;
+  the metallib path builds, and its gates have not run on the maintainers' Macs. If you have the toolchain (`xcodebuild -downloadComponent MetalToolchain`),
   please run `just lab-metal` and report the output (why: [`contrib/mac.md`](contrib/mac.md), section 1.3).
 
 ## Install
@@ -85,7 +84,7 @@ BLOOMERY_REF_MODEL=OUT/qwen36-mlx4-00001-of-00001.gguf \
   target/release/generate_metal --prompt "The capital of France is" -n 32
 ```
 
-To learn whether a file opens before it loads (after #806): `generate_metal --plan [--ctx C]` reads only the file's
+To learn whether a file opens before it loads: `generate_metal --plan [--ctx C]` reads only the file's
 header and tensor table. It prints every refusal, not only the first, the bytes the open would allocate, the device's
 working set and the host's free memory. It exits 0 when the file opens, 3 when it is refused and 64 when the header
 cannot be read. A 24 MB cut of a Hub file is enough.
