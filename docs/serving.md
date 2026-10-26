@@ -684,7 +684,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   written as `\u003c` in both, which reads back as the same string. A string written raw in a tool call's XML markup is
   one line (Qwen) or holds no `<` (GLM, DSML), since the value ends at the text after it, and a raw constant or enum
   option with a `<` is a 400.
-- A pinned nightly with a pinned cuda-oxide revision from our fork ([`BUILD.md`](BUILD.md)).
+- A pinned toolchain with a pinned cuda-oxide revision ([`BUILD.md`](BUILD.md)).
 
 In progress: serving on N cards for every model; Clef from the IQ and Q2_K files; DeepSeek-V4-Flash-0731.
 

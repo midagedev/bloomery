@@ -10,7 +10,7 @@ box (`crates/gpu-gates`: the maintainers run the box gates and `just ptx-scan --
 first. Take a row by opening an issue that names it. The rules in [`CONTRIBUTING.md`](../../CONTRIBUTING.md) apply: a
 test that fails first, no relaxed gate, say what you ran.
 
-Setup for the serve rows: the pinned nightly from `rust-toolchain.toml`; `cargo test --release -p bloomery-serve` needs
+Setup for the serve rows: the pinned toolchain from `rust-toolchain.toml`; `cargo test --release -p bloomery-serve` needs
 no card and no model (the pure crates, `python3 tools/recipes.py pure-crates`; `bloomery-serve` has a mock engine,
 `crates/serve/src/mock.rs`).
 

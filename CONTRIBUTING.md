@@ -7,7 +7,7 @@ own card counts. What you can check on your own machine, and what you cannot, is
 
 ## Build
 
-[`docs/BUILD.md`](docs/BUILD.md) has the toolchain (a pinned nightly, a cuda-oxide fork pinned by rev, CUDA 13.3) and one
+[`docs/BUILD.md`](docs/BUILD.md) has the toolchain (a pinned stable toolchain, cuda-oxide pinned by rev, CUDA 13.3) and one
 command block per model. Never build a device crate with plain `cargo`; use `cargo oxide` (`AGENTS.md`, "Never").
 The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:32`).
 
@@ -27,7 +27,7 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
   it needs the environment the header of `tools/mac-check.sh` describes (`docs/BUILD.md:299`).
 - Starter rows that need none of our hardware: [`docs/contrib/good-first-issues.md`](docs/contrib/good-first-issues.md).
 - **One command for all of this:** `just contrib-check` (`tools/contrib-check.sh`). `--tier t0` runs on any OS with the
-  pinned nightly: `cargo fmt --check`, `cargo test -p` for each pure crate, the Python tool self-tests and every
+  pinned toolchain: `cargo fmt --check`, `cargo test -p` for each pure crate, the Python tool self-tests and every
   `tools/check-*.sh`. `--tier t1` (the default on x86_64 Linux) adds the host-nightly units. It prints one line per unit
   and a `DONE` line; paste them in your pull request. The card tier (T2) is designed, not built:
   [`docs/contrib/local-check.md`](docs/contrib/local-check.md). CI runs `just contrib-check --tier t0` and the clippy

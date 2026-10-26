@@ -40,7 +40,7 @@ The recipes' own lines and the tool headers (`tools/recipes.py`, `tools/gate.sh`
 reference; what follows is the contract.
 
     just check / lint / fmt   # check --all-targets (also refreshes Cargo.lock: commit the lock with the edit, or the
-                              # timing runners refuse stale binaries, rc 3); clippy, 0 errors; cargo fmt, pinned nightly
+                              # timing runners refuse stale binaries, rc 3); clippy, 0 errors; cargo fmt, pinned toolchain
     just contrib-check        # what a machine with no card can run: --tier t0 any OS, t1 adds the host tier (CI runs t0)
     just build-ref            # the C++ reference harnesses that link ggml (rerun when ik moves; gate-qdot reads them)
     just deny                 # cargo deny; fails if the cuda-oxide pin floats; reaches the network
@@ -165,9 +165,12 @@ forced_exact count pin, the reference gates).
   `reset`. The kernel keeps its memory accesses defined and never writes a plausible value.
 - Correctness is defined against ggml: kernels match its output within the band in each crate's RESULTS file.
 - **Toolchain defects** (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go into `docs/upstream/nvlabs-ledger.md` the
-  moment they are met, before any workaround. A cuda-oxide defect that shapes our code is fixed in our fork as it is
-  met: one commit on the `bloomery` branch with its reproducer and FAIL-first, the pin moved (below), the workaround
-  removed by the change that moves the pin.
+  moment they are met, before any workaround. bloomery takes cuda-oxide from NVIDIA/cuda-rust as it is and carries no
+  fork: a defect that shapes our code is worked around in bloomery (the ledger row names the workaround and the
+  upstream issue or PR that would remove it), proposed upstream as a short single-purpose issue or PR, and the
+  workaround goes in the change that moves the pin to a rev that fixes it, proved by the gate that owns it. A patch of
+  the backend source is such a workaround: `tools/oxide-backend/cuda-rust-1648.patch` (upstream #1648, unchanged),
+  applied by `tools/oxide-backend.sh`. The fork's last pinned rev is the tag `pin/87bc9518` of midagedev/cuda-oxide.
 - **Common code first, so the next model attaches cheaply.** A concept two models share (tier legs, prompt walks,
   seats, placement sizing, drafts, residency glue) has one common owner. A model's own code holds only what an
   architecture fact forces (tensor shapes, the recurrent state, the attention kind, the quant), and its description
@@ -201,10 +204,11 @@ forced_exact count pin, the reference gates).
 - **A feature-gated bin declares `required-features`** in `crates/gpu-gates/Cargo.toml`, so cargo refuses to build it
   without them instead of linking the stub `main`.
 - **Do not split a `#[target_feature]` kernel body into helpers** (10–13 % loss). A helper touching `_mm*` intrinsics
-  is `#[inline(always)]` or carries the attribute itself. `.cargo/config.toml` sets `-C target-cpu=znver3` for plain
-  cargo builds, and `.cargo/cuda-oxide.toml` carries it for oxide builds (`CARGO_ENCODED_RUSTFLAGS` masks the former),
-  both per target triple (aarch64 takes `native`); `just check-rustflags` holds each triple's two lists equal. The
-  attributes stay.
+  is `#[inline(always)]` or carries the attribute itself. `.cargo/config.toml` sets `-C target-cpu=znver3` per target
+  triple (aarch64 takes `native`), and that table is the only list: `tools/oxide-host.sh` writes the untracked
+  `.cargo/cuda-oxide.toml` for the triple a `cargo oxide` build is for from it (`CARGO_ENCODED_RUSTFLAGS` masks the
+  table there), and refuses a triple that has none; `just check-rustflags` holds the tables, the generator and the file
+  together. The attributes stay.
 - **An unprofiled chunk takes no lock and reports nothing.** Per-chunk collectors are for `BLOOMERY_PROFILE` and
   errors; an unconditional lock per chunk is a futex convoy (symptom: a flat thread-scaling curve; first question
   `SWEEP="8 16 24 32" just measure-decode`).
@@ -216,11 +220,16 @@ forced_exact count pin, the reference gates).
   typed values down; `<bin> --levers` prints them. An `in place` row is a line of `tools/levers-direct.txt` with the
   change that converts it (`just check-levers`). A retired name that is set is refused by name. `just gate-levers`
   prints the table.
-- **Toolchain pins.** `rust-toolchain.toml` pins the nightly and moves only with the cuda-oxide pin. `cuda-oxide` is
-  pinned by `rev` in `[workspace.dependencies]` and taken from our fork's `bloomery` branch through `[patch]` (patches
-  listed in `THIRD_PARTY_NOTICES.md`); `just deny` fails if either floats. Before the fork's branch moves, the old pin
-  gets the tag `pin/<short rev>`; pin tags are never deleted. A fork patch that changes codegen is a pin move (every
-  gate); one that must not proves it with identical `just ptx-scan` tables of `generate_ds41` and `gate_e2e`.
+- **Toolchain pins.** `rust-toolchain.toml` pins the stable channel of the pinned cuda-oxide rev's own
+  `cuda-oxide/rust-toolchain.toml` and moves only with the cuda-oxide pin (`.cargo/config.toml` sets `RUSTC_BOOTSTRAP=1`,
+  which that channel needs for the feature gates of `cuda-device`, `cuda-host` and `cuda-macros`). `cuda-oxide` is pinned
+  by `rev` in `[workspace.dependencies]`, straight from NVIDIA/cuda-rust with no `[patch]`; `just deny` fails if it
+  floats. A rev move is a codegen change (every gate) unless `just canon-check BASE` proves every entry the same program
+  (`reordered-only` or identical, equal resource columns). Each rev has its directory on the box,
+  `~/.cargo/cuda-oxide-bloomery/<rev>/`: its backend and its own `cargo-oxide` (`tools/box.sh`). The backend is built by
+  `tools/oxide-backend.sh` from the rev's checkout plus `tools/oxide-backend/cuda-rust-1648.patch`, with the patch's sha256 in
+  its `PROVENANCE`; the llc, the host CPU flags and that record are checked by `tools/oxide-host.sh` before every
+  `cargo oxide` build (LLVM 21 `llc` named by `CUDA_OXIDE_LLC`; an unpatched backend is refused by name).
 
 ## Measuring
 

@@ -2,7 +2,7 @@
 
 This standalone crate is excluded from the engine workspace. It exercises public
 CPU APIs without a model, a GPU, an HTTP listener or tool execution. Use the
-repository's pinned nightly, `cargo-fuzz`, and a working C++ compiler/linker.
+repository's pinned toolchain, `cargo-fuzz`, and a working C++ compiler/linker.
 `just lab-fuzz` runs the crate's tests and every target below for 60 s on the box.
 
 ```sh

@@ -27,7 +27,7 @@ runs of the same binary scatter on one machine. *DSpark* is V4.1's draft model f
 
 | Machine | Command | A green result shows | Needs |
 |---|---|---|---|
-| Any OS, a Mac included | `just contrib-check --tier t0` | formatting, the pure crates' tests, the Python tool self-tests and every `tools/check-*.sh` pass | the pinned nightly through rustup, `python3` 3.11 or later with numpy and PIL, `just` (section 2) |
+| Any OS, a Mac included | `just contrib-check --tier t0` | formatting, the pure crates' tests, the Python tool self-tests and every `tools/check-*.sh` pass | the pinned toolchain through rustup, `python3` 3.11 or later with numpy and PIL, `just` (section 2) |
 | Mac | `just mac-static [BASE]` | formatting, clippy and the build shapes `BASE`'s change touches check as x86_64 Linux, and every check script passes; no test or gate runs | the environment file the header of `tools/mac-check.sh` describes (section 2) |
 | x86_64 or aarch64 Linux, with or without a card | `just contrib-check --tier t1` | T0, then the tests of every crate that reaches no card | the CUDA headers, libclang, numpy and PIL (section 2) |
 | Linux with an NVIDIA card | `BLOOMERY_BOX_LOCAL=1 BLOOMERY_TIER=fixture just gate-<x>`, for each gate of your list | that gate passes on your card at the fixture tier | an environment file, the fixtures and the reference sets (sections 3 and 4) |
@@ -88,7 +88,7 @@ must contain `bloomery-safetensors`. A zero `recipes.py gaps` result alone does 
 
 | Tier | Where | Runs |
 |---|---|---|
-| T0 | any OS with the pinned nightly (rustup, rustfmt) and `python3` 3.11 or later (`tools/recipes.py` reads `Cargo.lock` with `tomllib`) with numpy and PIL | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists (some import numpy and PIL, which CI installs before T0); every `tools/check-*.sh`. Each check script reads the tree and runs no cargo and no box command, so none is left out |
+| T0 | any OS with the pinned toolchain (rustup, rustfmt) and `python3` 3.11 or later (`tools/recipes.py` reads `Cargo.lock` with `tomllib`) with numpy and PIL | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists (some import numpy and PIL, which CI installs before T0); every `tools/check-*.sh`. Each check script reads the tree and runs no cargo and no box command, so none is left out |
 | T1 | x86_64 or aarch64 Linux, no card needed | T0, then every unit of `recipes.py host-nightly` that T0 did not already run under the same name, each `bash tools/gate.sh --release --locked -p <crate>`. Needs what `tools/nightly/install.sh` lists: the CUDA 13.3 headers under `CUDA_TOOLKIT_PATH`, libclang for bindgen, python3-numpy and python3-pil |
 
 T1 leaves out the six device crates (`python3 tools/recipes.py host-nightly --excluded` names them). A device crate is
@@ -227,10 +227,12 @@ lock stubs, checking both the exit status and whether the command ran.
    missing file exits 69. It exports the toolchain of `docs/BUILD.md` ("Toolchain") in four variables: `PATH` (cargo,
    `cargo-oxide`, LLVM 21 and CUDA 13.3's `bin`), `CUDA_TOOLKIT_PATH`, `LIBCLANG_PATH` and `CUDA_OXIDE_LLC`, the path of
    LLVM 21's `llc`. Without `CUDA_OXIDE_LLC`, cuda-oxide takes the Rust toolchain's `llc` first (`docs/BUILD.md`), and
-   the pinned nightly's LLVM is 23. One DGX Spark run exported these four, with LLVM 21.1.8's `llc`
+   the pinned toolchain's LLVM is 23, so before every `cargo oxide` command `tools/box.sh` runs `tools/oxide-host.sh`,
+   which prints the `llc` path and version line and stops (exit 70) on an unset name, a file that does not run, a banner
+   with no version or a major other than 21. One DGX Spark run exported these four, with LLVM 21.1.8's `llc`
    ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082), "Reproduce"). T1 (section 2) needs
    `PATH` and `CUDA_TOOLKIT_PATH` as well. Local mode unsets `CUDA_OXIDE_BACKEND` after the file, so `cargo oxide`
-   builds its own backend from the pinned fork rev.
+   builds its own backend from the pinned rev.
 2. **The pinned `cargo-oxide`.** Before a command that builds with `cargo oxide`, `tools/box.sh` checks with
    `cargo install --list` that the `cargo-oxide` on `PATH` was installed from the pinned rev, and stops with exit 70
    when it was not. The install command is in `docs/BUILD.md` ("Toolchain").
@@ -245,15 +247,15 @@ lock stubs, checking both the exit status and whether the command ran.
 5. **The CPU flag, on x86_64.** The cargo files build for Zen 3 (`znver3`) on x86_64, and local mode does not change
    that, so on another x86_64 CPU a gate binary may stop with an illegal instruction. Set
    `RUSTFLAGS='-C target-cpu=native'` in your shell or the environment file. Plain `cargo` then takes it in place of
-   `.cargo/config.toml`'s flags, and `cargo oxide` adds it after `.cargo/cuda-oxide.toml`'s `extra-rustflags`, so the
-   later `target-cpu` wins. On an RTX 5090 host (x86_64) at `b289130a`, with cargo-oxide 0.2.1 at the pinned rev, this
+   `.cargo/config.toml`'s flags, and `cargo oxide` adds it after `.cargo/cuda-oxide.toml`'s `extra-rustflags` (the
+   file `tools/oxide-host.sh` writes from the same table), so the later `target-cpu` wins. On an RTX 5090 host (x86_64) at `b289130a`, with cargo-oxide 0.2.1 at the pinned rev, this
    build passed `-C target-cpu=x86-64-v2` after `-C target-cpu=znver3 -C target-feature=-sse4a` in every `rustc`
    call:
 
        RUSTFLAGS='-C target-cpu=x86-64-v2' cargo oxide build --arch sm_86 -- \
          -p bloomery-gpu-gates --features gpu --release --bin gate_kquant -v
 
-   The other way is to edit both files (`docs/BUILD.md`, "The CPU flag"). On aarch64 the files already build for the
+   The other way is to edit the triple's list in `.cargo/config.toml` (`docs/BUILD.md`, "The CPU flag"). On aarch64 the files already build for the
    native CPU.
 6. **The inputs.** `BLOOMERY_DATA` names your copy of the reference sets and reaches the command as you set it; unset,
    it is the maintainers' `/root/bloomery-data`. The fixtures sit under `/models/fixtures`. Section 4 says how to make
@@ -487,7 +489,7 @@ The design listed what a run off the box must bypass. This table keeps that list
 | 5 | Cards are found by exact name, `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000` | `tools/ref/cards.sh:33-34`; the card pick in `tools/box.sh` | **Built** (#38): the `BLOOMERY_CARD` values that run and the ones refused, and the gates the name still closes, are in section 3 |
 | 6 | The device arch was `sm_86` in 139 `justfile` lines and `tools/gate.sh` | the justfile's `arch` variable, `tools/arch.sh` | **Done:** `BLOOMERY_ARCH`, default `sm_86`, read by the justfile and by the tools on the box, forwarded by `box.sh`; `check-recipes` fails on a literal. `gate-ptx-spill` reads a table per PTX arch and card capability (`tools/ref/ptx-shapes.tsv` is sm_86 on cc 8.6; sm_86 and sm_121 on cc 12.1 sit in `tools/ref/ptx-shapes/`), `ptx-scan` takes sm_86, sm_120 and sm_121, and `just narrow` and `release-build` refuse another arch by name |
 | 7 | The cuda-oxide backend is a prebuilt `.so` per rev, and `cargo oxide` refuses (rc 70) without it | `tools/box.sh` | **Built** (#38): local mode lets `cargo-oxide` build its own backend (section 3) |
-| 8 | The CPU flag `znver3` in both cargo files | `.cargo/config.toml`, `.cargo/cuda-oxide.toml` | **aarch64 done** (`f0139df3`): each file has a table per target triple, `target-cpu=native` for aarch64. **x86_64:** the files stay `znver3`, and a caller's `RUSTFLAGS` reaches both plain `cargo` and `cargo oxide` builds (measured, section 3) |
+| 8 | The CPU flag `znver3` in both cargo files | `.cargo/config.toml`, `tools/oxide-host.sh` | **aarch64 done** (`f0139df3`): `.cargo/config.toml` has a table per target triple, `target-cpu=native` for aarch64, and `tools/oxide-host.sh` writes the `cargo oxide` file for the triple a build is for from it. **x86_64:** the table stays `znver3`, and a caller's `RUSTFLAGS` reaches both plain `cargo` and `cargo oxide` builds (measured, section 3) |
 | 9 | Real model files at `/models/...`: ~~133~~ 151 lines with a path literal in `crates/**/*.rs`, comments included (`git grep -n '"/models/\|"/root/\|/home/user' -- 'crates/**/*.rs' \| wc -l` at `3bc2a172`), e.g. `crates/model/tests/mimo2_meta.rs:20` | tests, `tools/ref/models/*.sh` | **Not built:** one resolver (`crates/model/tests/common/model_path.rs` reads `$BLOOMERY_MODEL` already) and `BLOOMERY_DATA` (`tools/ref/ref-paths.sh:75`, overridable) |
 | 10 | Fixtures at `/models/fixtures/<dir>` and the sets under `$BLOOMERY_DATA` | `tools/ref/ref-paths.sh`, `crates/refset/src/fixture.rs:31,33` | **Published:** the sets are a public dataset and `fixture fetch` makes the fixtures (section 4). The root-relative identity is not built (section 6) |
 

@@ -5,7 +5,7 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
 1. **Check the machine.** `nvidia-smi` (card, driver, free memory), `ldd --version` (glibc 2.34+), `free -g` (host
    RAM). Find the model's row under [Models and hardware](models.md#what-each-model-needs): the card it needs, the
    host RAM, the file size.
-2. **Use a release binary** ([Install](../README.md#install)). Building from source needs a pinned nightly and our
+2. **Use a release binary** ([Install](../README.md#install)). Building from source needs a pinned toolchain and our
    cuda-oxide fork ([`BUILD.md`](BUILD.md)); a release binary is the same code.
 3. **Start it with `--hf`**, for example
    `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --port 8080`. The first start downloads the files

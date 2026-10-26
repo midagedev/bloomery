@@ -8,28 +8,34 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 
 | Piece | Version | Where it is pinned |
 |---|---|---|
-| Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
-| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `1691162ab9204ef21b0329c2e8059815420dfd5a` (upstream: NVIDIA/cuda-rust), source rev `87bc951864b79f723b4da9c11fa229f5600aefcb` | `[workspace.dependencies]` in `Cargo.toml` (NVIDIA/cuda-rust), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
-| `cargo-oxide` | 0.2.1, from the same fork and rev | the install command below; `cargo oxide doctor` must pass |
-| LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | select explicitly with `CUDA_OXIDE_LLC`; a higher-priority Rust sysroot tool can override `PATH` |
+| Rust | `1.99.1` (stable), with `rust-src`, `rustc-dev`, `rust-analyzer`, `llvm-tools`, `clippy`, `rustfmt`; `RUSTC_BOOTSTRAP=1` (set by `.cargo/config.toml`) for the feature gates of `cuda-device`, `cuda-host`, `cuda-macros` | `rust-toolchain.toml`, `.cargo/config.toml` |
+| cuda-oxide (`cuda-device`, `cuda-host`) | rev `9df9e7cef561e03a066230b3bb433b3d8285da81` of NVIDIA/cuda-rust, as published (no fork, no patch) | `[workspace.dependencies]` in `Cargo.toml`; `just deny` fails if it floats |
+| `cargo-oxide` | 0.2.1, from the same repository and rev | the install command below; `cargo oxide doctor` must pass |
+| LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | name the `llc` with `CUDA_OXIDE_LLC`; `tools/oxide-host.sh` refuses any other major |
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
 | CUDA toolkit | 13.3, with the cuRAND headers (`libcurand-dev` on Ubuntu) | `CUDA_TOOLKIT_PATH` |
 | NVIDIA driver | 615.71.09 on the development machine | — |
 | GPU | sm_86: RTX A6000, RTX 3090 | `--arch sm_86` |
-| CPU | x86-64; the build targets Zen 3 (see [The CPU flag](#the-cpu-flag)) | `.cargo/config.toml`, `.cargo/cuda-oxide.toml` |
+| CPU | x86-64; the build targets Zen 3 (see [The CPU flag](#the-cpu-flag)) | `.cargo/config.toml` |
 | `just`, `python3` (3.11 or later) | any | only for the Mac checks and the scripts under `tools/`; the commands on this page need neither |
 | `hf` (from `huggingface_hub`) | any | for the downloads below; older releases call it `huggingface-cli download` |
 
-The nightly moves only when the cuda-oxide pin moves. Other CUDA versions, drivers and GPU architectures are not tested.
+The toolchain channel moves only when the cuda-oxide pin moves (it is the channel of that rev's `cuda-oxide/rust-toolchain.toml`). Other CUDA versions, drivers and GPU architectures are not tested.
 
-Install `cargo-oxide` from the fork at the pinned rev, not from upstream's main branch (NVIDIA/cuda-rust, formerly NVlabs/cuda-oxide):
+Install `cargo-oxide` at the pinned rev, not from upstream's main branch (NVIDIA/cuda-rust, formerly NVlabs/cuda-oxide):
 
 ```sh
-cargo +nightly-2026-08-28 install --git https://github.com/midagedev/cuda-oxide.git \
-  --rev 87bc951864b79f723b4da9c11fa229f5600aefcb cargo-oxide
+cargo +1.99.1 install --locked --git https://github.com/NVIDIA/cuda-rust.git \
+  --rev 9df9e7cef561e03a066230b3bb433b3d8285da81 cargo-oxide
 ```
 
-That `cargo-oxide` builds its codegen backend from the checkout cargo resolved for `cuda-device`, which is the `[patch]` fork at the pinned rev (the fork's `crates/cargo-oxide/src/backend_source.rs`). The maintainers' machine instead keeps one prebuilt backend per rev and points `CUDA_OXIDE_BACKEND` at it; you do not need that. The install above has not been run on a clean host yet.
+That `cargo-oxide` would build its codegen backend from the checkout cargo resolved for `cuda-device`, at the pinned rev (`crates/cargo-oxide/src/backend_source.rs` in the repository). This tree builds the backend itself instead, with one patch (`tools/oxide-backend/cuda-rust-1648.patch`, NVIDIA/cuda-rust pull request #1648: without it the cute verifier's time is cubic in the block count of a large kernel, and `bloomery-gpu` does not finish):
+
+```sh
+tools/oxide-backend.sh        # about a minute; installs under ${CARGO_HOME:-~/.cargo}/cuda-oxide-bloomery/<rev>/
+```
+
+`tools/oxide-host.sh` (run before every `cargo oxide` build by `tools/box.sh`, and by hand in a shell) writes the `backend = ...` line of the generated `.cargo/cuda-oxide.toml` and refuses, by name, a backend that was not built from this tree's patch. The maintainers' machine keeps one `cargo-oxide` per rev in that directory too and points `CUDA_OXIDE_BACKEND` at the backend; you do not need that. The install above has not been run on a clean host yet.
 
 An environment like this one works on the development machine. Adjust the paths to your install:
 
@@ -41,32 +47,29 @@ cargo oxide doctor
 ```
 
 The pipeline selects an explicit `CUDA_OXIDE_LLC` first, then the Rust toolchain's `llc`, then `llc-23`,
-`llc-22` and `llc-21` on `PATH`. The pinned Rust nightly includes LLVM 23, so putting LLVM 21 on `PATH`
-alone does not select the supported compiler. Pin the actual LLVM 21 executable as above and read the
-`llc (LLVM)` path/version from `cargo oxide doctor`.
+`llc-22` and `llc-21` on `PATH`, and cuda-oxide itself does not check the major. The Rust toolchain carries a newer
+LLVM, so putting LLVM 21 on `PATH` alone does not select the supported compiler: name the actual LLVM 21 executable as
+above. Before a build, run
 
-The current backend pin does not enforce this major during a build. The actual-owner enforcement change is
-[cuda-oxide #2](https://github.com/midagedev/cuda-oxide/pull/2): an optional
-`CUDA_OXIDE_REQUIRED_LLC_MAJOR=21` policy reports the selected path/version without verbose mode and refuses
-another major or an invalid explicit override before LLVM optimization and PTX emission, not before Cargo
-host compilation. It was verified by actual LLVM 21/23 device builds and a host-only build; no GPU was run.
-Do not enable that setting against the current pin, which ignores it. Tag the old pin before landing the fork change,
-then install the matching backend and update the dependency pins, lockfile, notices and project configuration together.
-Until that cutover, the explicit selection and doctor check remain required; see the [toolchain ledger](upstream/nvlabs-ledger.md), row 50.
+```sh
+tools/oxide-host.sh
+```
+
+(`tools/box.sh` runs it before every `cargo oxide` command). It prints the `llc` path and its version line, and stops by
+name (exit 70, before any PTX is made) on an unset `CUDA_OXIDE_LLC`, a file that is not an executable, a banner with no
+version and a major other than 21. It also writes the CPU flags of your triple (next section). Read the `llc (LLVM)`
+path and version from `cargo oxide doctor` as well; see the [toolchain ledger](upstream/nvlabs-ledger.md), row 50.
 
 ## The CPU flag
 
-Both cargo configuration files set the CPU per target triple:
-
-- `.cargo/config.toml` sets it in plain `cargo` builds (`[target.<triple>] rustflags`).
-- `.cargo/cuda-oxide.toml` sets it for `cargo oxide` builds (`[target.<triple>] extra-rustflags`). cargo-oxide passes its own rustflags, which hide the first file's setting, so the flag needs this second owner. cargo-oxide takes the table of the triple it builds for (`--target`, else `CARGO_BUILD_TARGET`, else the host rustc's); a triple with neither table gets no CPU flag. The `cargo-oxide` you have installed must be the pinned rev: an older one ignores the tables without a word.
+`.cargo/config.toml` sets the CPU per target triple (`[target.<triple>] rustflags`), and plain `cargo` builds read it there. `cargo oxide` passes its own rustflags, which hide that table, and reads one flat `extra-rustflags` list from `.cargo/cuda-oxide.toml`, the same for every triple. So `tools/oxide-host.sh` writes that file (untracked) for the triple the build is for (`CARGO_BUILD_TARGET`, else the host rustc's), from the same table; a triple with no table is refused by name, never built with no CPU flag. `tools/box.sh` runs it before each `cargo oxide` command; on your own host, run it once before the `cargo oxide` commands below. A `RUSTFLAGS` you export still lands after these flags in an oxide build, as before.
 
 | Triple | Flags | Machine |
 |---|---|---|
 | `x86_64-unknown-linux-gnu` | `-C target-cpu=znver3 -C target-feature=-sse4a` | the development machine (Zen 3) |
 | `aarch64-unknown-linux-gnu` | `-C target-cpu=native` | a DGX Spark, building for itself |
 
-Every bit gate runs under the x86_64 flags. An x86_64 host that is not Zen 3 has not been tested; on an older AMD or an Intel CPU a binary built for `znver3` may stop with an illegal instruction. To build for your own x86_64 CPU, change that triple's flags in **both** files, for example to `target-cpu=native`, and keep the two lists equal. `tools/check-rustflags.sh` (`just check-rustflags`) checks that each triple's two lists are equal, that the x86_64 lists still name `znver3` and `-sse4a`, and that the aarch64 lists name no x86 CPU or feature, so it fails after that change; that check is the maintainers'. The kernels carry their own `#[target_feature]` attributes and need AVX2 and FMA in any case.
+Every bit gate runs under the x86_64 flags. An x86_64 host that is not Zen 3 has not been tested; on an older AMD or an Intel CPU a binary built for `znver3` may stop with an illegal instruction. To build for your own x86_64 CPU, change that triple's list in `.cargo/config.toml`, for example to `target-cpu=native`; the oxide file follows from it. `tools/check-rustflags.sh` (`just check-rustflags`) checks that the x86_64 list still names `znver3` and `-sse4a`, that the aarch64 list names no x86 CPU or feature, and that the generator returns the config's list, so it fails after that change; that check is the maintainers'. The kernels carry their own `#[target_feature]` attributes and need AVX2 and FMA in any case.
 
 ## Building
 
@@ -348,4 +351,4 @@ None of these is needed for a plain run with `--tokens`. Without `--tokens` or `
 
 Beyond the pure crates, a Linux machine with an x86_64 or aarch64 CPU, no card and no model files runs the whole host tier: `python3 tools/recipes.py host-nightly` prints its units (one `cargo test --release` per crate that reaches no device root, `bloomery-app` admitted by name, then every `tools/check-*.sh`) and `--excluded` prints what it leaves out and why. `tools/nightly/run.sh` runs that list every night off the GPU box, keeps the last 14 runs and mails on red; `tools/nightly/install.sh` sets a machine up for it.
 
-On a Mac, `just mac-check` and `just mac-lint` run `check` and `lint` as an x86_64-linux cross check that links nothing (`cargo --target x86_64-unknown-linux-gnu`); `just mac-check` then also cross-checks every build shape a gate or build recipe compiles (`just mac-combos`: one `cargo check` per package, mode and feature set, the list from `tools/recipes.py combos`). They need the pinned nightly with the x86_64-linux std, the CUDA headers, a Linux sysroot's headers and libclang, set up in one environment file. `just fmt` and `just mac-fmt-check` format and check with the pinned nightly's rustfmt. The header of `tools/mac-check.sh` lists each piece and how it is made.
+On a Mac, `just mac-check` and `just mac-lint` run `check` and `lint` as an x86_64-linux cross check that links nothing (`cargo --target x86_64-unknown-linux-gnu`); `just mac-check` then also cross-checks every build shape a gate or build recipe compiles (`just mac-combos`: one `cargo check` per package, mode and feature set, the list from `tools/recipes.py combos`). They need the pinned toolchain with the x86_64-linux std, the CUDA headers, a Linux sysroot's headers and libclang, set up in one environment file. `just fmt` and `just mac-fmt-check` format and check with the pinned toolchain's rustfmt. The header of `tools/mac-check.sh` lists each piece and how it is made.
