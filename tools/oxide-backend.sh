@@ -213,7 +213,10 @@ EOF
   printf '%s\n' "$rev" > "$d/source-rev.txt"
   run 'the restored backend passes' 0 'rev 01234567' bash "$ob" --check
   # a relative root: the build installs under the tree, and a separate --check from elsewhere finds it there
-  run 'a relative root builds under the tree' 0 "oxide-backend: $t/tree/rel/$rev/librustc_codegen_cuda\\.so rev" env BLOOMERY_OXIDE_BACKENDS=rel bash "$ob"
+  # the tree as the script sees it ($ROOT is a cd-and-pwd path; a TMPDIR ending in / doubles the slash in $t)
+  local tr
+  tr=$(cd "$t/tree" && pwd)
+  run 'a relative root builds under the tree' 0 "oxide-backend: $tr/rel/$rev/librustc_codegen_cuda\\.so rev" env BLOOMERY_OXIDE_BACKENDS=rel bash "$ob"
   run 'a relative root names the same backend from another directory' 0 'rev 01234567' sh -c "cd / && BLOOMERY_OXIDE_BACKENDS=rel bash '$ob' --check"
   # a patch the pin no longer takes
   printf 'one\nchanged\nthree\n' > "$t/ck/${rev:0:7}/cuda-oxide/stub.txt"
