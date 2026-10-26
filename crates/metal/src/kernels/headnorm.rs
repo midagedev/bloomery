@@ -5,19 +5,19 @@
 //! norm scale of the head each column belongs to. The scale comes from the
 //! head's partial sums of the squares of its values, which the delta kernel
 //! leaves in `partials[head][block]`: the head's sum is the sum of its eight
-//! partials, and the scale is `1 / sqrt(sum / HEAD_COLS + eps)`.
+//! partials, and the scale is `1 / sqrt(sum / head_cols + eps)`.
 //!
 //! The layout of `g` and `partials` is the contract with the delta kernel: the
-//! value heads' count and width are the geometry's constants
-//! ([`VALUE_HEADS`], [`HEAD_COLS`], [`PARTIALS_PER_HEAD`]).
+//! value heads' count and width are the instance's (`DeltaGeom`), and each
+//! head's partials are one per column block (`geometry::PARTIALS_PER_HEAD`).
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
+use crate::geom::DeltaGeom;
 
-use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
 use super::matvec::Quant;
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
@@ -37,7 +37,7 @@ pub struct HeadNormParams<'w> {
     /// The gated numerator, one value per input column.
     pub g: Window<'w, f32, MetalDevice>,
     /// The partial sums of the squares of the values: every head's row of
-    /// [`PARTIALS_PER_HEAD`] partials.
+    /// one partial per column block.
     pub partials: Window<'w, f32, MetalDevice>,
     /// The output, the residual added into it.
     pub y: WindowMut<'w, f32, MetalDevice>,
@@ -66,6 +66,7 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 /// a window is not the shape's, or when a count passes the kernel's 32-bit
 /// words.
 fn check(
+    d: &DeltaGeom,
     p: &HeadNormParams<'_>,
     simdgroups: usize,
     rows_per_simd_group: usize,
@@ -73,10 +74,10 @@ fn check(
     if p.rows == 0 {
         return Err(refuse("no rows".to_string()));
     }
-    if p.cols != VALUE_HEADS * HEAD_COLS {
+    if p.cols != d.value_heads * d.head_cols {
         return Err(refuse(format!(
-            "{} columns, the kernel's heads hold {} of {HEAD_COLS}",
-            p.cols, VALUE_HEADS
+            "{} columns, the kernel's heads hold {} of {}",
+            p.cols, d.value_heads, d.head_cols
         )));
     }
     let nblocks = p.cols / p.quant.values_per_block();
@@ -84,12 +85,7 @@ fn check(
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
     check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
     check_window_len(WHAT, "g", p.g.len(), p.cols)?;
-    check_window_len(
-        WHAT,
-        "partials",
-        p.partials.len(),
-        VALUE_HEADS * PARTIALS_PER_HEAD,
-    )?;
+    check_window_len(WHAT, "partials", p.partials.len(), d.partials_stride)?;
     check_window_len(WHAT, "y", p.y.len(), p.rows)?;
     let start = p.weights.byte_range()?.start.get();
     super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
@@ -110,7 +106,12 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: HeadNormParams<'_>,
     ) -> Result<(), DeviceError> {
-        let shape = check(&p, self.simdgroups, self.rows_per_simd_group)?;
+        let shape = check(
+            &self.geom.delta,
+            &p,
+            self.simdgroups,
+            self.rows_per_simd_group,
+        )?;
         let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.eps.to_bits()]);
         let pipeline = match p.quant {
             Quant::Q4K => &self.headnorm,

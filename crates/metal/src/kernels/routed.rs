@@ -18,13 +18,12 @@ use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
 use super::gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, Operand};
-use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
 use super::matvec::Quant;
 use super::router_geom;
 use super::rows::check_strided;
 use super::{
-    EXPERT_SLOTS, Kernels, WeightAlign, args_bytes, check_weights_align, check_window_len, pack,
-    range, weight_bytes, word,
+    Kernels, WeightAlign, args_bytes, check_weights_align, check_window_len, pack, range,
+    weight_bytes, word,
 };
 
 /// The slots a tile of the grouped GEMM holds at most: the route table's cut
@@ -36,8 +35,10 @@ pub const ROUTE_TILE: usize = 64;
 pub const ROUTED_ROWS: usize = 64;
 
 /// The logits row stride a pass keeps: the router's rows rounded up to a
-/// multiple of four floats (the GEMM's output rows are four-aligned).
-pub const LOGIT_STRIDE: usize = router_geom::ROWS.div_ceil(4) * 4;
+/// multiple of four floats (the GEMM's output rows are four-aligned). A shim:
+/// the build's host instance's (`RouterGeom::logit_stride`). Callers left:
+/// the arch and the kernel gate.
+pub const LOGIT_STRIDE: usize = router_geom::logit_stride(router_geom::ROWS);
 
 /// The threads of the route table's one threadgroup (`ROUTE_THREADS`).
 pub const TABLE_THREADS: usize = 1024;
@@ -166,7 +167,8 @@ pub struct RouteSelectParams<'w> {
     pub rows: usize,
     /// Routed experts a row keeps: 1 to the router's most.
     pub top_k: usize,
-    /// The logits, [`router_geom::ROWS`] values a row, `logit_stride` apart.
+    /// The logits, the router's rows (`RouterGeom::rows`) values a row,
+    /// `logit_stride` apart.
     pub logits: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `logits`.
     pub logit_stride: usize,
@@ -310,12 +312,13 @@ const HEADNORM_WHAT: &str = "headnorm rows";
 pub struct HeadNormRowsParams<'w> {
     /// Rows in the pass.
     pub rows: usize,
-    /// The numerator, [`VALUE_HEADS`] heads of [`HEAD_COLS`] a row.
+    /// The numerator, the delta net's value heads of its head columns a row
+    /// (`DeltaGeom::value_heads`, `DeltaGeom::head_cols`).
     pub g: WindowMut<'w, f32, MetalDevice>,
     /// Elements between rows of `g`.
     pub g_stride: usize,
-    /// The heads' partial sums of squares, [`VALUE_HEADS`] rows of
-    /// [`PARTIALS_PER_HEAD`] a row.
+    /// The heads' partial sums of squares, the value heads' rows of the
+    /// column blocks a row (`DeltaGeom::partials_stride`).
     pub partials: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `partials`.
     pub partials_stride: usize,
@@ -400,11 +403,11 @@ impl Kernels {
         if p.rows == 0 {
             return Err(refuse("rows of 0".to_string()));
         }
-        if p.top_k == 0 || p.top_k > router_geom::TOP_K_MAX {
+        let router = &self.geom.router;
+        if p.top_k == 0 || p.top_k > router.top_k_max {
             return Err(refuse(format!(
                 "top_k {}; the selection takes 1 to {}",
-                p.top_k,
-                router_geom::TOP_K_MAX
+                p.top_k, router.top_k_max
             )));
         }
         check_strided(
@@ -413,7 +416,7 @@ impl Kernels {
             p.logits.len(),
             p.rows,
             p.logit_stride,
-            router_geom::ROWS,
+            router.rows,
         )?;
         let per_row = p.top_k + 1;
         let slots = p
@@ -453,11 +456,10 @@ impl Kernels {
                 p.slots, p.per_row
             )));
         }
-        if p.experts + 1 != router_geom::ROWS {
+        if p.experts + 1 != self.geom.router.rows {
             return Err(refuse(format!(
                 "{} routed experts; the table's groups are the router's {} rows",
-                p.experts,
-                router_geom::ROWS
+                p.experts, self.geom.router.rows
             )));
         }
         check_window_len(TABLE_WHAT, "ids", p.ids.len(), p.slots)?;
@@ -650,13 +652,14 @@ impl Kernels {
         if p.rows == 0 {
             return Err(range(HEADNORM_WHAT, "rows of 0"));
         }
+        let delta = &self.geom.delta;
         check_strided(
             HEADNORM_WHAT,
             "g",
             p.g.len(),
             p.rows,
             p.g_stride,
-            VALUE_HEADS * HEAD_COLS,
+            delta.value_heads * delta.head_cols,
         )?;
         check_strided(
             HEADNORM_WHAT,
@@ -664,7 +667,7 @@ impl Kernels {
             p.partials.len(),
             p.rows,
             p.partials_stride,
-            VALUE_HEADS * PARTIALS_PER_HEAD,
+            delta.partials_stride,
         )?;
         let args = [
             word(HEADNORM_WHAT, "the g stride", p.g_stride)?,
@@ -679,9 +682,6 @@ impl Kernels {
         slot.set(Binding::of(&p.partials)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.fault.binding())?;
-        slot.dispatch_groups(p.rows, VALUE_HEADS, HEAD_COLS)
+        slot.dispatch_groups(p.rows, delta.value_heads, delta.head_cols)
     }
 }
-
-/// The slots a row of the pass holds: the picks and the shared expert.
-pub const SLOTS_PER_ROW: usize = EXPERT_SLOTS;

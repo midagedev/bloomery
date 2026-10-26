@@ -33,10 +33,14 @@ pub const BLOCK_VALUES: usize = 256;
 pub const MAX_SEGMENTS: usize = 4;
 
 /// The value heads a gated delta net's out projection reads: its head scale
-/// and its partial sums are per head. The host instance's.
+/// and its partial sums are per head. A shim: the build's host instance's
+/// delta axes. Callers left: the arch, the e2e and kernel gates, their
+/// oracles and the probes.
 pub const VALUE_HEADS: usize = HOST.delta_built().value_heads as usize;
 
-/// The columns one value head's gated output holds: the host instance's.
+/// The columns one value head's gated output holds. A shim: the build's host
+/// instance's delta axes. Callers left: the arch, the e2e and kernel gates,
+/// their oracles and the probes.
 pub const HEAD_COLS: usize = HOST.delta_built().head_cols as usize;
 
 /// The column blocks one head's partial sums are split into.
