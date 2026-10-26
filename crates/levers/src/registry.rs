@@ -2472,6 +2472,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          only mark its row.",
     ),
     runner(
+        "BLOOMERY_OXIDE_BACKENDS",
+        Some("oxide-backend.sh"),
+        "The directory the patched cuda-oxide backends are built into and read from, one \
+         `<rev>/` each; unset, `${CARGO_HOME:-~/.cargo}/cuda-oxide-bloomery`.",
+    ),
+    runner(
         "BLOOMERY_PACK_BUDGET",
         Some("gate-batch.sh"),
         "Mac side: the host byte budget `tools/gate-batch.sh` gives the pack of lane X (bytes, a \
