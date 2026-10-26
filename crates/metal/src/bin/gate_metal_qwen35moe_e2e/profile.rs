@@ -215,7 +215,7 @@ fn whole_of(whole: u64, parts: u64, what: &str) -> Result<u64, String> {
 fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64>, String> {
     let split = gguf::Split::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let read = model::arch::qwen35moe::spec::read(&split).map_err(|e| e.to_string())?;
-    let (spec, tensors) = (read.spec, read.tensors);
+    let spec = read.spec;
     let kinds = chain::arch::qwen3moe::plan::kinds35(&spec.layers).map_err(|e| e.to_string())?;
     let pd = chain::arch::qwen3moe::read::PlanDims::q35(&spec, WHAT).map_err(|e| e.to_string())?;
     let plans = chain::arch::qwen3moe::read::layer_plans(
@@ -224,7 +224,6 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
         &pd,
         &kinds,
         &spec.layers,
-        &tensors,
         &bloomery_metal::arch::qwen3moe::session::SITES,
         chain::arch::qwen3moe::read::Read35::Whole,
     )
