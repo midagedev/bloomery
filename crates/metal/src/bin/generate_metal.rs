@@ -98,12 +98,12 @@ mod cli {
     use std::time::{Duration, Instant};
 
     use bloomery_device::Device;
-    use bloomery_metal::arch::qwen3moe::check;
-    use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
-    use bloomery_metal::arch::qwen3moe::generate::greedy;
-    use bloomery_metal::arch::qwen3moe::plan;
-    use bloomery_metal::arch::qwen3moe::session::{
-        Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode,
+    use bloomery_metal::arch::qwen3moe::{
+        check,
+        count::{GroupKind, KINDS},
+        generate::greedy,
+        plan,
+        session::{Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode},
     };
     use bloomery_metal::device::MetalDevice;
     use bloomery_metal::kernels::PASS_ROWS;
@@ -112,6 +112,16 @@ mod cli {
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
+
+    /// The model file `MODEL_ENV` names, or why there is none.
+    fn model_path() -> Result<PathBuf, String> {
+        match std::env::var_os(MODEL_ENV) {
+            Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+            _ => Err(format!(
+                "no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
+            )),
+        }
+    }
 
     /// The cache rows' default cap.
     const CTX_DEFAULT: usize = 4096;
@@ -331,14 +341,7 @@ generate_metal --plan [--ctx C]
             Some(s) => PrefillMode::from_name(&s)
                 .ok_or_else(|| format!("--prefill {s}: batch or steps"))?,
         };
-        let model = match std::env::var_os(MODEL_ENV) {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => {
-                return Err(format!(
-                    "no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
-                ));
-            }
-        };
+        let model = model_path()?;
         Ok(Args {
             prompt,
             n: n_gen,
@@ -806,12 +809,10 @@ generate_metal --plan [--ctx C]
                 return ExitCode::from(2);
             }
         };
-        let model = match std::env::var_os(MODEL_ENV) {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => {
-                eprintln!(
-                    "generate_metal: no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
-                );
+        let model = match model_path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("generate_metal: {e}");
                 return ExitCode::from(2);
             }
         };
