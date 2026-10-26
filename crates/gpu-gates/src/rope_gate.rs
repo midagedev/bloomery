@@ -371,8 +371,8 @@ pub fn expected_norm<const H: usize>(inp: &NormIn, pos: &[u32], s: RopeShape) ->
             let y = crate::rounding::norm_head::<H>(&inp.k[at..at + H], cs);
             out.k[at..at + H].copy_from_slice(&y);
             let row = (h * ctx + p as usize) * H;
-            for d in 0..H {
-                out.ck[row + d] = gguf::quant::f32_to_f16_bits(y[d]);
+            for (d, &yd) in y.iter().enumerate() {
+                out.ck[row + d] = gguf::quant::f32_to_f16_bits(yd);
                 out.cv[row + d] = gguf::quant::f32_to_f16_bits(inp.v[at + d]);
             }
         }

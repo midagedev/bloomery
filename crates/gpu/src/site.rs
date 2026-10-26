@@ -894,6 +894,10 @@ impl ByName {
     /// an F32 site past one column ([`resident_gemv_cols`]). A Q5_0 site, a
     /// form the load made no q8_1 rows for, or a part past the output's
     /// stride is refused by name.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the projection, the card, the kernels, the site, the layer, the input, its columns and the output (rust-quality R8)"
+    )]
     pub fn gemv(
         &mut self,
         gpu: &Gpu,
@@ -912,7 +916,6 @@ impl ByName {
     /// output's readers, a fault of the quantization raising into `fault`.
     /// Two projections on two streams at once hold a `ByName` each: a form
     /// and the staging are one projection's.
-
     #[allow(
         clippy::too_many_arguments,
         reason = "the card, the stream, the kernels, the site, the sink, the rows, their count and the output (rust-quality R8)"

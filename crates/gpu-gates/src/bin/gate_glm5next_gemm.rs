@@ -797,13 +797,16 @@ mod gate {
         }
     }
 
+    /// The weights a projection launches, each with its first row, and the joined rows.
+    type PartRows<'a> = (Vec<(&'a str, usize)>, usize);
+
     /// A projection's weights as the load left them: the joined weight `whole` when it is resident, else the
     /// `parts` with their first rows ([`bloomery_gpu_glm5next::gemm::Launches`]).
     fn launches_of<'a>(
         w: &Weights,
         whole: &'a str,
         parts: &'a [String],
-    ) -> Result<(Vec<(&'a str, usize)>, usize), GateError> {
+    ) -> Result<PartRows<'a>, GateError> {
         if let Some(j) = w.get(whole) {
             return Ok((vec![(whole, 0)], j.rows()));
         }
@@ -949,7 +952,7 @@ mod gate {
         let mut pass = true;
         let own = |name: &str, n: usize| {
             if typed(w, name) {
-                vec![0..n]
+                std::iter::once(0..n).collect()
             } else {
                 Vec::new()
             }
@@ -1044,7 +1047,7 @@ mod gate {
         let tail: Vec<(&str, usize)> = tail.into_iter().map(|(n, at)| (n, at - q_lora)).collect();
         let own = |name: &str, n: usize| {
             if typed(w, name) {
-                vec![0..n]
+                std::iter::once(0..n).collect()
             } else {
                 Vec::new()
             }

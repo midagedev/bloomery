@@ -95,10 +95,13 @@ pub fn named(name: &str) -> Option<&'static Family> {
     all().find(|f| f.name == name)
 }
 
+/// A [`NEEDS_ENV`] row: the family, its variable, and the variable's reader.
+type NeedsEnvRow = (&'static Family, &'static str, fn() -> bool);
+
 /// The families whose sets exist only where a machine fact holds, each with the variable that states it: every consumer gate of
 /// the family opens with `bash tools/ref/needs-env.sh <recipe> <VAR>`, so a machine without VAR defers the gate by name and has
 /// no sets for it. `needs_env_rows_are_the_families_whose_consumers_open_with_needs_env` holds this table to the justfile.
-static NEEDS_ENV: &[(&Family, &str, fn() -> bool)] = &[(
+static NEEDS_ENV: &[NeedsEnvRow] = &[(
     &qwen4exp::nvfp4::HF,
     "BLOOMERY_CARD_ALL_EXPERTS",
     card_all_experts,

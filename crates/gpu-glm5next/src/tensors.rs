@@ -35,6 +35,9 @@ pub(crate) struct Joined {
     pub parts: Vec<String>,
 }
 
+/// The weights a joined projection launches, each with its first row, and the joined rows ([`Joined::launches`]).
+pub(crate) type PartRows<'a> = (Vec<(&'a str, usize)>, usize);
+
 impl Joined {
     /// The weights the projection launches, in row order, each with its
     /// first row in the joined layout, and the joined row count: the joined
@@ -43,7 +46,7 @@ impl Joined {
         &'a self,
         what: &'static str,
         w: &Weights,
-    ) -> Result<(Vec<(&'a str, usize)>, usize), GpuError> {
+    ) -> Result<PartRows<'a>, GpuError> {
         if w.get(&self.whole).is_some() {
             let rows = w.resident(what, &self.whole)?.rows();
             return Ok((vec![(self.whole.as_str(), 0)], rows));

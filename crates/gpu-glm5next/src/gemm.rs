@@ -809,7 +809,7 @@ impl GemmFront {
         let fault = self.fill(gpu, l, m)?;
         let tys = projs
             .iter()
-            .map(|p| Ok(site::of_resident(w.resident(WHAT, p.name)?).ok_or(shape_ty(p.name))?))
+            .map(|p| site::of_resident(w.resident(WHAT, p.name)?).ok_or_else(|| shape_ty(p.name)))
             .collect::<Result<Vec<SiteTy>, GpuError>>()?;
         let GemmFront {
             route_k,
