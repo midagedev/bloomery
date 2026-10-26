@@ -86,8 +86,8 @@ BLOOMERY_REF_MODEL=OUT/qwen36-mlx4-00001-of-00001.gguf \
 
 To learn whether a file opens before it loads: `generate_metal --plan [--ctx C]` reads only the file's
 header and tensor table. It prints every refusal, not only the first, the bytes the open would allocate, the device's
-working set and the host's free memory. It exits 0 when the file opens, 3 when it is refused and 64 when the header
-cannot be read. A 24 MB cut of a Hub file is enough.
+working set and the host's free memory. It exits 0 when the header's checks pass, 3 when it is refused and 64 when the
+header cannot be read; exit 0 does not prove the load fits at run time. A 24 MB cut of a Hub file is enough.
 
 ## Serve
 
@@ -135,7 +135,7 @@ tables are in [rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-
 
 One more Mac, a development-loop number: an Apple M1 Pro 32 GB, macOS 27.0.1, `generate_metal --prompt "The capital of
 France is" -n 32`, greedy, with a download running on the same Mac. MiniCPM-V 4.7 and Ornith-1.5-35B (Q4_K_M) each
-decoded at 43.4 tok/s (PR #805). It is a different chip and different files from the table above.
+decoded at 43.4 tok/s ([PR #805's comment](https://github.com/midagedev/bloomery/pull/805) has the commands and output). It is a different chip and different files from the table above.
 
 **Contributors' Macs**: measured by [@avlp12](https://github.com/avlp12) on an M3 Ultra and an M5 Ultra, 2026-10-25, at
 main bd0c61345 (its `crates/metal` is 0.3.9's), Qwen3.6-35B-A3B `Q4_K_M`, `generate_metal --tokens <seeded random ids>
