@@ -12,7 +12,8 @@ use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
 use super::oracle_delta::{self, Fit, StepIn};
-use super::{Harness, HeadNormLaunch};
+use super::synthetic;
+use super::{ClauseRun, Harness, HeadNormLaunch};
 
 /// The key heads of the first layer's conv: the fixture's, and the count the
 /// clauses launch at.
@@ -69,7 +70,49 @@ struct Back {
     ring: Vec<f32>,
 }
 
-pub(super) fn fixed(delta: &DeltaGeom, fixture: &Fixture) -> Result<Fixed, String> {
+/// Where a delta clause's fixed parameters and weights come from: the
+/// fixture's first delta layer, or seeded draws for an instance whose delta
+/// axes no fixture carries.
+#[derive(Clone, Copy)]
+pub(super) enum Params<'a> {
+    Fixture(&'a Fixture),
+    Drawn,
+}
+
+/// The fixed parameters of a delta layer at `delta`'s axes.
+pub(super) fn fixed(delta: &DeltaGeom, params: Params<'_>) -> Result<Fixed, String> {
+    match params {
+        Params::Fixture(fixture) => from_fixture(delta, fixture),
+        Params::Drawn => drawn(delta),
+    }
+}
+
+/// Seeded draws over the ranges a layer's own tensors hold: the conv taps
+/// and the decay slope `-exp(A_log)` (negative, so a decay stays below one),
+/// the decay bias, a positive norm gain and the norm's epsilon.
+fn drawn(delta: &DeltaGeom) -> Result<Fixed, String> {
+    let ch = elems(delta.channels(KEY_HEADS), "channels")?;
+    let mut rng = oracle::Rng::new(0xD4A9);
+    let conv_w = draw(&mut rng, delta.conv_taps * ch, 0.5);
+    let ssm_a = draw(&mut rng, delta.value_heads, 0.5)
+        .iter()
+        .map(|v| -0.55 - v)
+        .collect();
+    let dt = draw(&mut rng, delta.value_heads, 0.2);
+    let norm_w = draw(&mut rng, delta.head_cols, 0.5)
+        .iter()
+        .map(|v| 1.0 + v)
+        .collect();
+    Ok(Fixed {
+        conv_w,
+        ssm_a,
+        dt,
+        norm_w,
+        eps: 1e-6,
+    })
+}
+
+fn from_fixture(delta: &DeltaGeom, fixture: &Fixture) -> Result<Fixed, String> {
     let ch = elems(delta.channels(KEY_HEADS), "channels")?;
     let file = gguf::Gguf::open(&fixture.path).map_err(|e| format!("conv weight: {e}"))?;
     let t = file
@@ -322,9 +365,9 @@ fn keep_max(worst: &mut f64, widest: &mut f64, fit: &Fit) {
 }
 
 /// One step from a host state, tiled and grouped, and a second key-head count.
-pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_step(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fixed = fixed(delta, fixture)?;
+    let fixed = fixed(delta, params)?;
     let mut rng = oracle::Rng::new(0xD417);
     let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
@@ -381,9 +424,9 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 }
 
 /// Five steps, each oracled from the state and the ring the kernel wrote.
-pub fn delta_roll(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_roll(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fixed = fixed(delta, fixture)?;
+    let fixed = fixed(delta, params)?;
     let mut rng = oracle::Rng::new(0xD419);
     let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let mut state = owned.state.clone();
@@ -484,9 +527,9 @@ fn ring_launch(
 
 /// The conv reads a predecessor only while `pos >= d`, and writes
 /// `pos mod ring_rows` once.
-pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_ring(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fixed = fixed(delta, fixture)?;
+    let fixed = fixed(delta, params)?;
     let mut rng = oracle::Rng::new(0xD41A);
     let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let ch = owned.x.len();
@@ -529,9 +572,9 @@ pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 }
 
 /// The partials and the numerator match the oracle, and the head-norm launch accepts them.
-pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_partial(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fixed = fixed(delta, fixture)?;
+    let fixed = fixed(delta, params)?;
     let mut rng = oracle::Rng::new(0xD41B);
     let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
@@ -543,7 +586,16 @@ pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )?;
     let rows = 32;
     let cols = delta.head_cols * delta.value_heads;
-    let weights = fixture.rows("blk.0.ssm_out.weight", GgmlType::Q4_K, cols, rows)?;
+    let drawn_weights;
+    let weights: &[u8] = match params {
+        Params::Fixture(fixture) => {
+            fixture.rows("blk.0.ssm_out.weight", GgmlType::Q4_K, cols, rows)?
+        }
+        Params::Drawn => {
+            drawn_weights = synthetic::matrix(Quant::Q4K, rows, cols, 0x41B);
+            &drawn_weights
+        }
+    };
     let y0 = draw(&mut rng, rows, 0.1);
     h.clear_fault()?;
     let got = h.headnorm(&HeadNormLaunch {
@@ -669,9 +721,9 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
 
 /// A read or a write lane word past the lanes, and one non-finite key, each
 /// raise the lane site.
-pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_nan(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fixed = fixed(delta, fixture)?;
+    let fixed = fixed(delta, params)?;
     let mut rng = oracle::Rng::new(0xD41C);
     let owned = inputs(delta, &mut rng, KEY_HEADS, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
@@ -959,11 +1011,48 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
 /// The gated-delta clauses, in gate order.
 pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
     vec![
-        ("delta_step", Box::new(|| ctx.with(delta_step))),
-        ("delta_roll", Box::new(|| ctx.with(delta_roll))),
-        ("delta_ring", Box::new(|| ctx.with(delta_ring))),
-        ("delta_partial", Box::new(|| ctx.with(delta_partial))),
-        ("delta_nan", Box::new(|| ctx.with(delta_nan))),
+        ("delta_step", Box::new(|| ctx.with_params(delta_step))),
+        ("delta_roll", Box::new(|| ctx.with_params(delta_roll))),
+        ("delta_ring", Box::new(|| ctx.with_params(delta_ring))),
+        ("delta_partial", Box::new(|| ctx.with_params(delta_partial))),
+        ("delta_nan", Box::new(|| ctx.with_params(delta_nan))),
         ("delta_bounds", Box::new(|| delta_bounds(ctx.harness))),
+    ]
+}
+
+/// The head-normed mat-vec's clause on synthetic weights at the layer's
+/// value heads: a clean fault word before and after, as the synthetic
+/// tables run theirs.
+fn headnorm_on<'a>(h: &'a super::Harness<'a>, quant: Quant) -> ClauseRun<'a> {
+    Box::new(move || {
+        h.clear_fault()?;
+        let verdict = super::clauses_synth::headnorm(h, quant);
+        h.clear_fault()?;
+        verdict
+    })
+}
+
+/// The clauses of the kernels the delta axes shape, on drawn parameters: for
+/// an instance whose delta layer is not the fixture's. The step's (the
+/// fixture-free `delta_bounds` too), the head-normed mat-vecs over Q4_K and
+/// the MLX 4-bit groups, and the head norm over a chunk of rows.
+pub fn wide<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    let h = ctx.harness;
+    vec![
+        ("delta_step", Box::new(|| delta_step(h, Params::Drawn))),
+        ("delta_roll", Box::new(|| delta_roll(h, Params::Drawn))),
+        ("delta_ring", Box::new(|| delta_ring(h, Params::Drawn))),
+        (
+            "delta_partial",
+            Box::new(|| delta_partial(h, Params::Drawn)),
+        ),
+        ("delta_nan", Box::new(|| delta_nan(h, Params::Drawn))),
+        ("delta_bounds", Box::new(|| delta_bounds(h))),
+        ("headnorm_q4k", headnorm_on(h, Quant::Q4K)),
+        ("headnorm_a4", headnorm_on(h, Quant::A4)),
+        (
+            "headnorm_rows",
+            Box::new(|| super::clauses_route::headnorm_rows(h)),
+        ),
     ]
 }

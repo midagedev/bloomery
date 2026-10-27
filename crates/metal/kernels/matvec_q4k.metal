@@ -274,6 +274,26 @@ kernel void matvec_headnorm_kernel(device const typename Q::Block * W [[buffer(0
             scales[head] = s;
         }
     }
+#if BLOOMERY_DELTA_VALUE_HEADS > 32
+    // The value heads past the first SIMD width: the same sums, a lane a head
+    // again, a further round for each SIMD width.
+    if (sgitg == 0) {
+        for (uint head = 32u + tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {
+            float sum = 0.f;
+            for (short j = 0; j < BLOOMERY_DELTA_COLUMN_BLOCKS; ++j) {
+                sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];
+            }
+            const float mean = sum / float(BLOOMERY_DELTA_HEAD_COLS);
+            const float s = rsqrt(mean + args.eps);
+            if (!isfinite(sum) || !isfinite(s)) {
+                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+                scales[head] = NAN;
+            } else {
+                scales[head] = s;
+            }
+        }
+    }
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int first_row = simd_first_row(tgpig.x, sgitg);

@@ -43,12 +43,12 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
             "4 (the conv ring holds 11 slots)",
         ));
     }
-    if d.groups != 256 {
+    if d.value_heads == 0 || !d.value_heads.is_multiple_of(2) {
         return Err(KernelRefused::new(
             "delta",
             "value heads",
             d.value_heads,
-            "32 (256 partial groups)",
+            "an even count above 0 (a prepared row is whole 16-byte words)",
         ));
     }
     if d.head_cols != 128 || d.head_cols / geometry::PARTIALS_PER_HEAD != 16 {

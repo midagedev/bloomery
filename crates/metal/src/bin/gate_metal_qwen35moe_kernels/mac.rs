@@ -43,7 +43,9 @@ use std::process::{Command, ExitCode};
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::instance::{self, Instance, QWEN3MOE_A3B, QWEN35MOE_A3B, REGISTERED};
+use bloomery_metal::instance::{
+    self, Instance, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, REGISTERED,
+};
 use bloomery_metal::kernels::{
     Geometry, HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant,
     SIMD_GROUPS_PER_GROUP, SegParams, Segment,
@@ -217,6 +219,15 @@ impl<'a> ClauseCtx<'a> {
     fn with(&self, f: fn(&Harness<'_>, &fixture::Fixture) -> Clause) -> Clause {
         match self.fixture {
             Ok(fixture) => f(self.harness, fixture),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// Run a delta clause on the fixture's parameters, or the fixture's open
+    /// error when there is none.
+    fn with_params(&self, f: fn(&Harness<'_>, clauses_delta::Params<'_>) -> Clause) -> Clause {
+        match self.fixture {
+            Ok(fixture) => f(self.harness, clauses_delta::Params::Fixture(fixture)),
             Err(e) => Err(e.clone()),
         }
     }
@@ -477,6 +488,16 @@ enum Table {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
     },
+    /// The clauses of the kernels an instance's delta axes shape, on drawn
+    /// parameters (the delta step and rows, the head-normed mat-vecs and
+    /// the head norm over rows): an instance that is another registered
+    /// instance's but for its delta layer, which no fixture carries. The
+    /// mutants of those clauses in both tables (`kept`) and the instance's
+    /// own (`own`).
+    Delta {
+        kept: &'static [&'static str],
+        own: &'static [mutants::Mutant],
+    },
 }
 
 /// A registered instance's row of the gate: the architecture whose fixture
@@ -500,6 +521,14 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         table: Table::Shaped {
             kept: mutants::Q30_KEPT,
             own: mutants::Q30_MUTANTS,
+        },
+    },
+    InstanceRow {
+        instance: &QWEN35MOE_GDN48,
+        fixture: "qwen35moe",
+        table: Table::Delta {
+            kept: mutants::GDN48_KEPT,
+            own: mutants::GDN48_MUTANTS,
         },
     },
 ];
@@ -914,6 +943,10 @@ fn clause_table<'a>(
         ))
     };
     match row.table {
+        Table::Delta { .. } => instances()
+            .chain(clauses_delta::wide(ctx))
+            .chain(clauses_rows::wide(ctx))
+            .collect(),
         Table::Shaped { .. } => instances()
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))

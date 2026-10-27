@@ -1710,7 +1710,7 @@ pub fn combine(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
 
 /// The numerator times each head's scale against f64; a head the norm cannot
 /// take is NaN alone and raises the linear-gate site.
-pub fn headnorm_rows(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
+pub fn headnorm_rows(h: &Harness<'_>) -> Clause {
     let delta = &h.geom().delta;
     let rows = 9usize;
     let width = delta.value_heads * delta.head_cols;
@@ -2145,7 +2145,7 @@ pub fn table<'a>(
             }),
         ),
         ("combine", Box::new(|| ctx.with(combine))),
-        ("headnorm_rows", Box::new(|| ctx.with(headnorm_rows))),
+        ("headnorm_rows", Box::new(|| headnorm_rows(ctx.harness))),
         ("route_refusals", Box::new(|| ctx.with(route_refusals))),
     ]
 }

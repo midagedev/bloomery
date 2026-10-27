@@ -81,6 +81,14 @@ const QWEN35_GDN: DeltaAxes = DeltaAxes {
 /// files launches them.
 const DELTA_UNLAUNCHED: DeltaAxes = QWEN35_GDN;
 
+/// A gated delta net of 48 value heads: three to each of 16 key heads, the
+/// value heads as an axis beside Qwen3.6's 32.
+const GDN_48: DeltaAxes = DeltaAxes {
+    value_heads: 48,
+    head_cols: 128,
+    conv_taps: 4,
+};
+
 /// Qwen3.6-35B-A3B's shape (`qwen35moe`): the gated softmax router over 256
 /// experts and the shared expert, the gated query, the gated delta net.
 pub const QWEN35MOE_A3B: Instance = Instance {
@@ -134,11 +142,23 @@ pub const QWEN3MOE_A3B: Instance = Instance {
     host_feature: Some("host-qwen3moe-a3b"),
 };
 
+/// Qwen3.6's shape with the delta net of [`GDN_48`]: the kernel gate's row of
+/// the value-head axis, where every other axis is the one its clauses have a
+/// fixture for.
+pub const QWEN35MOE_GDN48: Instance = Instance {
+    name: "qwen35moe_gdn48",
+    key: Key {
+        delta: Some(GDN_48),
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-qwen35moe-gdn48"),
+};
+
 /// Every instance `build.rs` writes and compiles. A shape with no row here
 /// is compiled at open when every kernel family takes its geometry
 /// ([`select`]), from the source; a row here is the route to its metallib
 /// (its router and flash rows in the shape table first).
-pub const REGISTERED: &[Instance] = &[QWEN35MOE_A3B, QWEN3MOE_A3B];
+pub const REGISTERED: &[Instance] = &[QWEN35MOE_A3B, QWEN3MOE_A3B, QWEN35MOE_GDN48];
 
 /// The name of an instance made at open for a shape no row registers. No
 /// registered instance has it.
@@ -148,13 +168,18 @@ pub const UNREGISTERED: &str = "unregistered";
 /// buffers' lengths read its axes as constants (`kernels::*_geom`), so the
 /// kernels refuse a library of any other (`Kernels::with_geometry`). A
 /// build picks it by feature: Qwen3.6's by default, Qwen3-30B-A3B's under
-/// `host-qwen3moe-a3b`.
-#[cfg(not(feature = "host-qwen3moe-a3b"))]
+/// `host-qwen3moe-a3b`, the 48-value-head delta net's under
+/// `host-qwen35moe-gdn48`.
+#[cfg(not(any(feature = "host-qwen3moe-a3b", feature = "host-qwen35moe-gdn48")))]
 pub const HOST: Instance = QWEN35MOE_A3B;
 
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-qwen3moe-a3b")]
 pub const HOST: Instance = QWEN3MOE_A3B;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-qwen35moe-gdn48")]
+pub const HOST: Instance = QWEN35MOE_GDN48;
 
 impl Instance {
     /// The delta axes this instance's delta kernels are compiled at: its
@@ -609,6 +634,18 @@ mod tests {
             Ok(&QWEN3MOE_A3B),
             "Qwen3-30B-A3B's layers"
         );
+        let gdn48: Vec<_> = qwen36()
+            .into_iter()
+            .map(|(m, f)| match m {
+                Mixer::DeltaRule(_) => (gdn(48), f),
+                _ => (m, f),
+            })
+            .collect();
+        assert_eq!(
+            key(2048, &gdn48).and_then(of_key),
+            Ok(&QWEN35MOE_GDN48),
+            "Qwen3.6's layers with 48 delta value heads"
+        );
         assert_eq!(QWEN3MOE_A3B.key.delta, None, "no delta layer");
         assert_eq!(
             QWEN3MOE_A3B.delta_built(),
@@ -667,7 +704,7 @@ mod tests {
         let delta = layers
             .iter()
             .map(|(m, f)| match m {
-                Mixer::DeltaRule(_) => (gdn(48), f.clone()),
+                Mixer::DeltaRule(_) => (gdn(64), f.clone()),
                 _ => (m.clone(), f.clone()),
             })
             .collect::<Vec<_>>();
@@ -684,7 +721,7 @@ mod tests {
             ("hidden", 4096, &layers, "hidden 4096;"),
             ("expert ff", 2048, &wide, "expert ff 768;"),
             ("rope", 2048, &narrow, "rope 128,"),
-            ("delta heads", 2048, &delta, "delta 48 value heads"),
+            ("delta heads", 2048, &delta, "delta 64 value heads"),
             ("head 128", 2048, &head128, "attention 32/4 heads of 128"),
         ] {
             let got = key(hidden, layers).and_then(of_key);

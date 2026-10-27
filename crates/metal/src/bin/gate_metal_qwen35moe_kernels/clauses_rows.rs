@@ -18,7 +18,7 @@ use super::clauses_attention::{
     dequant_v_for, gate_of, head_row_for, load_tables_for, plant_f16_for, read_cache, take_qg_for,
     u, upload_cache,
 };
-use super::clauses_delta::{Fixed, KEY_HEADS, draw, fixed};
+use super::clauses_delta::{Fixed, KEY_HEADS, Params, draw, fixed};
 use super::clauses_router;
 use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
@@ -202,7 +202,7 @@ fn run_rows_copied(
     let delta = &h.geom().delta;
     let (g_row, p_row) = (g_row(delta), p_row(delta));
     let mut bufs = Bufs::new(h, fx, c)?;
-    let strides = DeltaRowStrides::dense(N_K).ok_or("the strides do not fit")?;
+    let strides = DeltaRowStrides::of(delta, N_K).ok_or("the strides do not fit")?;
     let prep_len = c.rows * prep_row(delta)?;
     let lane_len = after.len() * elems(delta.state_elems(1), "a lane")?;
     let ring_len = after.len() * c.ring.len();
@@ -392,9 +392,9 @@ const DELTA_CASES: [(usize, u32, (usize, usize)); 7] = [
 
 /// `m` rows are the bits of `m` stepped launches: numerators, partials, state,
 /// ring and fault word.
-pub fn delta_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_rows(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fx = fixed(delta, fixture)?;
+    let fx = fixed(delta, params)?;
     let mut rng = oracle::Rng::new(0xD0A5);
     let mut parts = Vec::new();
     for (rows, pos, lanes) in DELTA_CASES {
@@ -462,9 +462,9 @@ const SNAP_CASES: [SnapCase; 5] = [
 /// launch over rows `0..=after[k]` of the same inputs; and the copies move
 /// none of the launch's own outputs (numerators, partials, state, ring,
 /// fault word).
-pub fn delta_rows_snap(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_rows_snap(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fx = fixed(delta, fixture)?;
+    let fx = fixed(delta, params)?;
     let lane_len = elems(delta.state_elems(1), "a lane")?;
     let mut rng = oracle::Rng::new(0xD0A7);
     let mut parts = Vec::new();
@@ -537,9 +537,9 @@ fn lane_past(_delta: &DeltaGeom, c: &mut Chunk, _ch: usize) {
 
 /// A row with a non-finite input raises the decode's site and is NaN on the
 /// columns the stepped launches make NaN; the other rows are unaffected.
-pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+pub fn delta_rows_nan(h: &Harness<'_>, params: Params<'_>) -> Clause {
     let delta = &h.geom().delta;
-    let fx = fixed(delta, fixture)?;
+    let fx = fixed(delta, params)?;
     let ch = elems(delta.channels(N_K), "channels")?;
     let cases = [
         Poison {
@@ -2201,12 +2201,35 @@ pub fn rows_refusals(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// delta net's.
 pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     let mut clauses: Vec<(&'static str, ClauseRun<'a>)> = vec![
-        ("delta_rows", Box::new(|| ctx.with(delta_rows))),
-        ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
-        ("delta_rows_snap", Box::new(|| ctx.with(delta_rows_snap))),
+        ("delta_rows", Box::new(|| ctx.with_params(delta_rows))),
+        (
+            "delta_rows_nan",
+            Box::new(|| ctx.with_params(delta_rows_nan)),
+        ),
+        (
+            "delta_rows_snap",
+            Box::new(|| ctx.with_params(delta_rows_snap)),
+        ),
     ];
     clauses.extend(shaped(ctx));
     clauses
+}
+
+/// The delta net's clauses of the row kernels on drawn parameters: for an
+/// instance whose delta layer is not the fixture's.
+pub fn wide<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    let h = ctx.harness;
+    vec![
+        ("delta_rows", Box::new(|| delta_rows(h, Params::Drawn))),
+        (
+            "delta_rows_nan",
+            Box::new(|| delta_rows_nan(h, Params::Drawn)),
+        ),
+        (
+            "delta_rows_snap",
+            Box::new(|| delta_rows_snap(h, Params::Drawn)),
+        ),
+    ]
 }
 
 /// The clauses of the row kernels an instance whose layers are all attention

@@ -70,6 +70,9 @@ encode-trace = ["pipeline-label"]
 # The host launch geometry is Qwen3-30B-A3B's (`instance::QWEN3MOE_A3B`) instead of Qwen3.6's: a
 # build opens that model's files and refuses the other's by name.
 host-qwen3moe-a3b = []
+# The host launch geometry is Qwen3.6's with a delta net of 48 value heads
+# (`instance::QWEN35MOE_GDN48`): the kernel gate's row of the value-head axis.
+host-qwen35moe-gdn48 = []
 
 [lints]
 workspace = true

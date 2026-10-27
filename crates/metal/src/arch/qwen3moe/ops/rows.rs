@@ -392,6 +392,7 @@ impl MetalOps<'_, '_> {
             faults,
             eps,
             hidden,
+            geom,
             ..
         } = &mut *self.arena;
         let MixerBufs::Delta(d) = &layers[l].mixer else {
@@ -401,7 +402,7 @@ impl MetalOps<'_, '_> {
             )
             .into());
         };
-        let dense = DeltaRowStrides::dense(d.n_k).ok_or_else(|| SessionError::Shape {
+        let dense = DeltaRowStrides::of(&geom.delta, d.n_k).ok_or_else(|| SessionError::Shape {
             what: WHAT,
             detail: format!("{} key heads do not fit", d.n_k),
         })?;

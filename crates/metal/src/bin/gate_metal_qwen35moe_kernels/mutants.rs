@@ -37,14 +37,14 @@ use super::Table;
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
-        Table::Shaped { kept, own } => {
+        Table::Shaped { kept, own } | Table::Delta { kept, own } => {
             if let Some(name) = kept.iter().find(|name| {
                 !MUTANTS
                     .iter()
                     .chain(TENSOR_MUTANTS)
                     .any(|m| m.name == **name)
             }) {
-                panic!("the shaped row keeps the mutant {name}, which neither table holds");
+                panic!("the row keeps the mutant {name}, which neither table holds");
             }
             program::all(MUTANTS, TENSOR_MUTANTS)
                 .filter(|(m, _)| kept.contains(&m.name))
@@ -271,6 +271,78 @@ pub fn find(name: &str, table: Table) -> Option<(&'static Mutant, Program)> {
     all(table).into_iter().find(|(m, _)| m.name == name)
 }
 
+/// The mutants of the clauses the 48-value-head row runs: the delta step's
+/// and rows', and the head norm over rows. Each is a defect the 32-head row
+/// shows too, so the table's clause is red on it at both.
+pub const GDN48_KEPT: &[&str] = &[
+    "delta_fma_sign",
+    "delta_roll_keep",
+    "delta_lane_in_place",
+    "delta_ring_slot",
+    "delta_partial_scale",
+    "delta_nan_zero",
+    "rows_ring_slot",
+    "snap_row_late",
+    "snap_ring_dropped",
+    "rows_lane_parity",
+    "rows_ring_inner",
+    "rows_lane_unchecked",
+    "rows_prep_prev_row",
+    "rows_prep_value_head",
+    "rows_prep_value_flag",
+    "rows_recur_decay_row",
+    "rows_post_partial_block",
+    "rows_post_gate_row",
+    "headnorm_rows_head",
+    "headnorm_rows_no_raise",
+];
+
+/// The defects only a value-head count past the SIMD width or a key head
+/// serving three value heads shows: each edit is the same program at
+/// Qwen3.6's 32 value heads over 16 key heads (two to a key head).
+pub const GDN48_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "delta_per_two_step",
+        clause: "delta_step",
+        why: "the step's seat takes two value heads for each key head, whatever the layer's counts",
+        edits: &[(
+            "    uint per = n_v / n_k;\n    s.kh = ",
+            "    uint per = 2u;\n    s.kh = ",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_per_two_prep",
+        clause: "delta_rows",
+        why: "the state-free half of a chunk prepares two value heads for each key head, whatever the layer's counts",
+        edits: &[(
+            "    uint per = n_v / n_k;\n    device float *row",
+            "    uint per = 2u;\n    device float *row",
+            1,
+        )],
+    },
+    Mutant {
+        name: "headnorm_scales_one_round",
+        clause: "headnorm_q4k",
+        why: "the head norm's scales stop at the SIMD width, so the value heads past it keep unset scales",
+        edits: &[(
+            "for (uint head = 32u + tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {",
+            "for (uint head = 32u + tiisg; head < 32u; head += 32u) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_head_wrap_32",
+        clause: "headnorm_a4",
+        why: "an MLX 4-bit group reads its head's scale modulo 32, so the value heads past 32 read the first heads'",
+        edits: &[(
+            "const int head = ib >> 1;",
+            "const int head = (ib >> 1) & 31;",
+            1,
+        )],
+    },
+];
+
 const TAIL_STORE_FIND: &str =
     "    for (short row = 0; row < NR0 && first_row + row < rows; ++row) {\n        float sum_all";
 const TAIL_STORE_REPLACE: &str =
@@ -386,7 +458,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "sum / float(BLOOMERY_DELTA_HEAD_COLS)",
             "sum / float(BLOOMERY_DELTA_HEAD_COLS * 2)",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -397,7 +469,7 @@ pub const MUTANTS: &[Mutant] = &[
             (
                 "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
                 "",
-                1,
+                2,
             ),
             (
                 "raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",

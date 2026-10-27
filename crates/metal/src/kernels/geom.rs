@@ -369,7 +369,8 @@ mod tests {
                 ),
             ),
             (|i| delta(i, 32, 128, 5), ("delta", "conv taps", "5")),
-            (|i| delta(i, 48, 128, 4), ("delta", "value heads", "48")),
+            // PIN(2026-10-28): the 48-value-head case is now an axis; the odd count is its refusal.
+            (|i| delta(i, 33, 128, 4), ("delta", "value heads", "33")),
             (|i| delta(i, 32, 64, 4), ("delta", "head columns", "64")),
         ];
         let mut wrong = Vec::new();
@@ -394,6 +395,39 @@ mod tests {
             Geometry::of(&inst).check().unwrap_err().to_string(),
             "router: hidden is 3136; it must be a multiple of 1024 (a float4 a lane over 256 threads)"
         );
+    }
+
+    #[test]
+    fn delta_value_heads_are_an_axis() {
+        // 48 value heads over 16 key heads (three to a key head) and 64 over
+        // 16 hold beside Qwen3.6's 32: the step's grid, its partials and its
+        // prepared row follow the value heads.
+        for value_heads in [32u32, 48, 64] {
+            let mut inst = QWEN35MOE_A3B;
+            delta(&mut inst, value_heads, 128, 4);
+            let g = Geometry::of(&inst);
+            assert_eq!(g.check(), Ok(()), "{value_heads} value heads");
+            let (d, n_v, n_k) = (g.delta, value_heads as usize, 16);
+            assert_eq!(
+                n_v % n_k,
+                0,
+                "{value_heads}: key heads divide the value heads"
+            );
+            assert_eq!(d.groups, n_v * geometry::PARTIALS_PER_HEAD, "{n_v}: groups");
+            assert_eq!(d.partials_stride, d.groups, "{n_v}: partials");
+            assert_eq!(d.group_threads, 128, "{n_v}: threads a group");
+            assert_eq!(
+                d.channels(n_k),
+                Some((2 * n_k + n_v) * 128),
+                "{n_v}: channels"
+            );
+            let prepared = d.prepared_elems(n_k).expect("the prepared row fits");
+            assert_eq!(
+                prepared % 4,
+                0,
+                "{n_v}: a prepared row is whole 16-byte words"
+            );
+        }
     }
 
     #[test]

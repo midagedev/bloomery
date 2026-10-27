@@ -14,10 +14,12 @@
 // function of a half is one inline function that both launches call, so a row
 // is the bits of the stepped launch at its position.
 //
-// The step's grid is 256 threadgroups of 128 threads: 32 value heads, 8
-// column blocks, 4 simdgroups. A simdgroup holds 4 columns of 8 lanes. Lane j
-// of a column holds keys 32·r + 4·j + c. The q/k conv is redone in every
-// threadgroup (256 channels, 4 taps).
+// The step's grid is one threadgroup of 128 threads for each value head and
+// column block: BLOOMERY_DELTA_VALUE_HEADS × 8 of them, 4 simdgroups each. A
+// simdgroup holds 4 columns of 8 lanes. Lane j of a column holds keys
+// 32·r + 4·j + c. The q/k conv is redone in every threadgroup (256 channels,
+// 4 taps). A key head serves n_v / n_k value heads, the count the argument
+// block's n_k sets at run time.
 //
 // The ring stores the conv input. A predecessor at distance d is 0 while
 // pos < d, otherwise the slot (pos − d) mod the ring length. The current token is the
@@ -34,7 +36,7 @@
 // the normed and scaled q and k, the value conv outputs, the gate's SiLU, β
 // and the decay, and a status word for each recurrence threadgroup that is
 // non-zero when a conv, a norm, β or a decay of that group's row is not
-// finite. gdn_rows is the step's 256 threadgroups with the state in
+// finite. gdn_rows is the step's threadgroups with the state in
 // registers across the rows: it reads the lane the word at `lane_at` names
 // before the first row and writes the lane the word at `lane_to` names after
 // the last, and a row reads only its prepared row. It writes the column
@@ -140,6 +142,9 @@ static_assert(sizeof(DeltaSnapArgs) == 4 * (3 + BLOOMERY_DELTA_SNAPS),
               "DeltaSnapArgs is three words and a row word a copy: the host packs them");
 static_assert(BLOOMERY_DELTA_HEAD_COLS / BLOOMERY_DELTA_COLUMN_BLOCKS == BLOOMERY_DELTA_COLS_PER_BLOCK,
               "a column block is the head divided by the block count");
+static_assert(BLOOMERY_DELTA_VALUE_HEADS % 2 == 0,
+              "a prepared row's floats are a multiple of four only for an even value head count: "
+              "the recurrence reads the keys four at a time");
 
 constant float Q_SCALE = as_type<float>(0x3db504f3u);
 
