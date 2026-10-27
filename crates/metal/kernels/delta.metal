@@ -376,75 +376,102 @@ GDN_INLINE bool gdn_norm_qk(threadgroup float *qv, threadgroup float *kv, ushort
     return !isfinite(sq) || !isfinite(sk);
 }
 
-// The delta update of one lane's sixteen state values `st`, into `sp`, and the
-// column's output: NaN when the lane word, the conv or the column is unusable.
-// `lane_state_bad` is whether this lane's state is not finite, `column_bad`
-// whether any lane of the column's is while the rest of the row is usable.
-GDN_INLINE float gdn_delta(thread const GdnSeat &s, bool lane_ok, bool conv_bad,
-                       thread const float *kk, thread const float *qq, float v, float decay,
-                       float beta, thread const float *st, thread float *sp,
-                       thread bool *lane_state_bad, thread bool *column_bad) {
-    bool state_bad = false;
-    if (lane_ok) {
+// What the step does with a lane it cannot update (the lane word out of range
+// or the conv unusable), with a column whose state is not finite, and with an
+// output that is not finite. `sp` holds the update `gdn_delta` computed, `o`
+// the column's output. The result is the column's output, NaN when the lane,
+// the conv or the column is unusable, and `*wrote` whether the step writes the
+// lane: false when the lane word was out of range or the conv was not usable.
+// `sp` is the state the step leaves: `st` unless the step writes the lane, NaN
+// on a lane whose own state is not finite when a lane of the column is not,
+// and the update otherwise.
+GDN_INLINE float gdn_refused(thread const GdnSeat &s, device atomic_uint *faults, uint layer,
+                             bool lane_ok, bool conv_bad, float o, thread const float *st,
+                             thread float *sp, thread bool *wrote) {
+    if (!lane_ok || conv_bad) {
+        if (s.tid == 0u) {
+            raise(faults, layer,
+                  lane_ok ? BLOOMERY_FAULT_SITE_LINEAR_CONV : BLOOMERY_FAULT_SITE_DELTA_LANE);
+        }
         for (uint i = 0u; i < 16u; ++i) {
-            if (!isfinite(st[i])) {
-                state_bad = true;
-            }
+            sp[i] = st[i];
         }
+        *wrote = false;
+        return NAN;
     }
+    *wrote = true;
+    bool lane_state_bad = false;
     for (uint i = 0u; i < 16u; ++i) {
-        sp[i] = (lane_ok && !state_bad) ? st[i] * decay : 0.0f;
-    }
-
-    float kvdot = column_sum(lane_dot(sp, kk));
-    float u = (v - kvdot) * beta;
-    for (uint i = 0u; i < 16u; ++i) {
-        sp[i] = fma(kk[i], u, sp[i]);
-    }
-    float o = column_sum(lane_dot(sp, qq));
-
-    uint lb = state_bad ? 1u : 0u;
-    lb = column_or(lb);
-    bool bad = lane_ok && !conv_bad && lb != 0u;
-    *lane_state_bad = state_bad;
-    *column_bad = bad;
-    return (lane_ok && !conv_bad && !bad) ? o : NAN;
-}
-
-// What a row leaves after its output: the raises, and the state `st` the step
-// leaves in the lane. The result is whether the step writes the lane: false
-// when the lane word was out of range or the conv was not usable.
-GDN_INLINE bool gdn_settle(thread const GdnSeat &s, device atomic_uint *faults, uint layer,
-                       bool lane_ok, bool conv_bad, bool column_bad, bool lane_state_bad,
-                       float oval, thread const float *sp, thread float *st) {
-    if (!lane_ok) {
-        if (s.tid == 0u) {
-            raise(faults, layer, BLOOMERY_FAULT_SITE_DELTA_LANE);
+        if (!isfinite(st[i])) {
+            lane_state_bad = true;
         }
-        return false;
     }
-    if (conv_bad) {
-        if (s.tid == 0u) {
-            raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);
+    uint column_state_bad = column_or(lane_state_bad ? 1u : 0u);
+    if (column_state_bad != 0u) {
+        for (uint i = 0u; i < 16u; ++i) {
+            sp[i] = lane_state_bad ? NAN : st[i];
         }
-        return false;
-    }
-    if (column_bad) {
         if (lane_state_bad) {
-            for (uint i = 0u; i < 16u; ++i) {
-                st[i] = NAN;
-            }
             raise(faults, layer, BLOOMERY_FAULT_SITE_DELTA_LANE);
         }
-        return true;
+        return NAN;
     }
-    for (uint i = 0u; i < 16u; ++i) {
-        st[i] = sp[i];
-    }
-    if (s.j == 0u && !isfinite(oval)) {
+    if (s.j == 0u && !isfinite(o)) {
         raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_DELTA);
     }
-    return true;
+    return o;
+}
+
+// The delta update of one lane's sixteen state values in place, in the order
+// the contract names, and the column's output. It does no check: every caller
+// owns what a value that is not finite does. It comes in two parts so a caller
+// can load the next row's keys once `gdn_advance` has used these, and its
+// queries once the lane's dot has.
+//
+// The state takes the decay, then the correction the column's sum of key
+// products and the value make; the keys are not read past this.
+GDN_INLINE void gdn_advance(thread float *st, thread const float *kk, float v, float decay,
+                            float beta) {
+    for (uint i = 0u; i < 16u; ++i) {
+        st[i] = st[i] * decay;
+    }
+
+    float kvdot = column_sum(lane_dot(st, kk));
+    float u = (v - kvdot) * beta;
+    for (uint i = 0u; i < 16u; ++i) {
+        st[i] = fma(kk[i], u, st[i]);
+    }
+}
+
+// The column's output: the sum over its lanes of the lane's dot of the updated
+// state with the queries.
+GDN_INLINE float gdn_update(thread float *st, thread const float *kk, thread const float *qq,
+                            float v, float decay, float beta) {
+    gdn_advance(st, kk, v, decay, beta);
+    return column_sum(lane_dot(st, qq));
+}
+
+// The delta update of one lane's sixteen state values `st`, into `sp`, with the
+// checks. A state value that is not finite makes every sum of its column not
+// finite, whatever the decay, keys, β and value are (NaN and infinity absorb
+// every add and multiply), so a lane word in range, a usable conv and a finite
+// output mean a finite state, and then the state, `sp` and the output are what
+// an update that checked the state first computes. Any other case goes to
+// `gdn_refused`, which settles it by the rules the header names. The result is
+// the column's output, `*wrote` whether the step writes the lane.
+GDN_INLINE float gdn_delta(thread const GdnSeat &s, device atomic_uint *faults, uint layer,
+                           bool lane_ok, bool conv_bad, thread const float *kk,
+                           thread const float *qq, float v, float decay, float beta,
+                           thread const float *st, thread float *sp, thread bool *wrote) {
+    for (uint i = 0u; i < 16u; ++i) {
+        sp[i] = st[i];
+    }
+    float o = gdn_update(sp, kk, qq, v, decay, beta);
+    if (lane_ok && !conv_bad && isfinite(o)) {
+        *wrote = true;
+        return o;
+    }
+    return gdn_refused(s, faults, layer, lane_ok, conv_bad, o, st, sp, wrote);
 }
 
 // The numerator of a column from its output, the norm gain and the gate's
@@ -473,17 +500,16 @@ GDN_INLINE uint block_or(uint x) {
 
 // One row of the decode step: the conv and SiLU, the q/k norm, β and the
 // decay, the delta update and the gated numerator. `st` is the lane's sixteen
-// state values: the state the row reads, and after the call the state the
-// step leaves in the lane (a row that writes no state leaves them as they
-// were). The result is whether the step writes the lane. Row r sits at
-// position pos0 + r; its conv input is row r of `b.x`, its predecessors before
-// r come from the chunk and the earlier ones from the ring. The row ends past
-// the barrier that closes its reduction, so the next row may reuse the shared
-// memory.
+// state values the row reads, and `sp` the state the step leaves in the lane
+// (`st`'s values when the step writes none). The result is whether the step
+// writes the lane. Row r sits at position pos0 + r; its conv input is row r of
+// `b.x`, its predecessors before r come from the chunk and the earlier ones
+// from the ring. The row ends past the barrier that closes its reduction, so
+// the next row may reuse the shared memory.
 inline bool gdn_row(thread const GdnSeat &s, thread const GdnBound &b, uint pos0, uint r,
                     bool lane_ok, device const float *b_row, device const float *a_row,
                     device const float *z_row, device float *g_row, device float *partials_row,
-                    thread float *st, thread const GdnShared &sh) {
+                    thread const float *st, thread float *sp, thread const GdnShared &sh) {
     uint tid = s.tid;
     uint head = BLOOMERY_DELTA_HEAD_COLS;
     uint ch = s.ch;
@@ -544,7 +570,6 @@ inline bool gdn_row(thread const GdnSeat &s, thread const GdnBound &b, uint pos0
 
     bool conv_bad = (sh.sg_bad[0] | sh.sg_bad[1] | sh.sg_bad[2] | sh.sg_bad[3] | *sh.scale_bad) != 0u;
 
-    float sp[16];
     float kk[16];
     float qq[16];
     for (uint i = 0u; i < 16u; ++i) {
@@ -552,10 +577,9 @@ inline bool gdn_row(thread const GdnSeat &s, thread const GdnBound &b, uint pos0
         kk[i] = sh.kv[key];
         qq[i] = sh.qv[key];
     }
-    bool lane_state_bad;
-    bool column_bad;
-    float oval = gdn_delta(s, lane_ok, conv_bad, kk, qq, v, decay, beta, st, sp, &lane_state_bad,
-                           &column_bad);
+    bool wrote;
+    float oval = gdn_delta(s, b.faults, b.layer, lane_ok, conv_bad, kk, qq, v, decay, beta, st, sp,
+                           &wrote);
 
     if (j == 0u) {
         sh.o2[s.col_in_block] = oval * oval;
@@ -571,8 +595,7 @@ inline bool gdn_row(thread const GdnSeat &s, thread const GdnBound &b, uint pos0
         partials_row[h * BLOOMERY_DELTA_COLUMN_BLOCKS + s.block] = p;
     }
 
-    return gdn_settle(s, b.faults, b.layer, lane_ok, conv_bad, column_bad, lane_state_bad, oval, sp,
-                      st);
+    return wrote;
 }
 
 // The lane's sixteen state values at `base`, and whether the lane word was in
@@ -629,11 +652,12 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
     uint base_to = ((word_to * n_v + seat.h) * head + seat.col) * head;
 
     float st[16];
+    float sp[16];
     gdn_load(state, base, seat.j, lane_ok, st);
-    bool wrote = gdn_row(seat, bound, pos, 0u, lane_ok, b_raw, a_raw, z, g, partials, st, sh);
+    bool wrote = gdn_row(seat, bound, pos, 0u, lane_ok, b_raw, a_raw, z, g, partials, st, sp, sh);
     if (wrote) {
         for (uint i = 0u; i < 16u; ++i) {
-            state[base_to + key_of(seat.j, i)] = st[i];
+            state[base_to + key_of(seat.j, i)] = sp[i];
         }
     }
 
@@ -737,6 +761,113 @@ kernel void gdn_prep_rows(device const float *x [[buffer(0)]],
     }
 }
 
+// What the rows of one launch share: where the thread sits, its threadgroup's
+// index, the prepared rows, the numerator window, the fault word, and the
+// copies it leaves (`copy` of `copies` are written so far).
+struct GdnRowsRun {
+    GdnSeat seat;
+    uint tg;
+    device const float *prep;
+    device float *g;
+    device atomic_uint *faults;
+    device float *snap;
+    constant DeltaSnapArgs *snaps;
+    uint cell;
+    uint copies;
+    uint copy;
+    bool lane_ok;
+};
+
+// The prepared row r of a rows launch, in two loads: the thread's keys, its
+// column's value, its head's decay and β, and whether the row's status word
+// marks a conv, a norm, β or a decay that is not finite; and the thread's
+// queries.
+GDN_INLINE void gdn_rows_load_keys(thread const GdnRowsRun &run, constant DeltaRowsArgs &args,
+                                   uint r, thread float *kk, thread float *v, thread float *decay,
+                                   thread float *beta, thread bool *conv_bad) {
+    thread const GdnSeat &seat = run.seat;
+    uint head = BLOOMERY_DELTA_HEAD_COLS;
+    device const float *row = run.prep + (ulong)r * args.prep.stride;
+    device const float *kp = row + args.prep.k + seat.kh * head;
+    for (uint c = 0u; c < 4u; ++c) {
+        float4 kf = *((device const float4 *)(kp + 32u * c + 4u * seat.j));
+        kk[4u * c] = kf.x;
+        kk[4u * c + 1u] = kf.y;
+        kk[4u * c + 2u] = kf.z;
+        kk[4u * c + 3u] = kf.w;
+    }
+    *v = row[args.prep.v + seat.h * head + seat.col];
+    *decay = row[args.prep.decay + seat.h];
+    *beta = row[args.prep.beta + seat.h];
+    *conv_bad = ((device const uint *)(row + args.prep.bad))[run.tg] != 0u;
+}
+
+GDN_INLINE void gdn_rows_load_queries(thread const GdnRowsRun &run, constant DeltaRowsArgs &args,
+                                      uint r, thread float *qq) {
+    thread const GdnSeat &seat = run.seat;
+    uint head = BLOOMERY_DELTA_HEAD_COLS;
+    device const float *row = run.prep + (ulong)r * args.prep.stride;
+    device const float *qp = row + seat.kh * head;
+    for (uint c = 0u; c < 4u; ++c) {
+        float4 qf = *((device const float4 *)(qp + 32u * c + 4u * seat.j));
+        qq[4u * c] = qf.x;
+        qq[4u * c + 1u] = qf.y;
+        qq[4u * c + 2u] = qf.z;
+        qq[4u * c + 3u] = qf.w;
+    }
+}
+
+// What row r leaves: its column output in the numerator window, and the state
+// `st` it left in the copy it ends, when it ends one.
+GDN_INLINE void gdn_rows_emit(thread GdnRowsRun &run, constant DeltaRowsArgs &args, uint r,
+                              float oval, thread const float *st) {
+    thread const GdnSeat &seat = run.seat;
+    uint head = BLOOMERY_DELTA_HEAD_COLS;
+    if (seat.j == 0u) {
+        run.g[(ulong)r * args.g_stride + seat.h * head + seat.col] = oval;
+    }
+    uint copy = run.copy;
+    uint copies = run.copies;
+    constant DeltaSnapArgs *snaps = run.snaps;
+    if (copy < copies && r == snaps->after[copy]) {
+        if (run.lane_ok) {
+            device float *lane = run.snap + (ulong)copy * snaps->lane_len + run.cell;
+            for (uint i = 0u; i < 16u; ++i) {
+                lane[key_of(seat.j, i)] = st[i];
+            }
+        }
+        run.copy = copy + 1u;
+    }
+}
+
+// The first pass's row r: the state `st` updated with no check, the numerator
+// and the copy the row leaves, and `unusable` raised when the row's status
+// word is set or its column output is not finite. The next row's keys, from
+// row `next`, load into `kk_next` as the row begins, and its queries into `qq`
+// once the lane's dot has used them, so the loads of one row go out while
+// the arithmetic of the one before runs.
+GDN_INLINE void gdn_rows_first(thread GdnRowsRun &run, constant DeltaRowsArgs &args, uint r,
+                               uint next, thread float *st, thread const float *kk,
+                               thread float *kk_next, thread float *qq, float v, float decay,
+                               float beta, bool conv_bad, thread float *v_next,
+                               thread float *decay_next, thread float *beta_next,
+                               thread bool *conv_bad_next, thread uint *unusable) {
+    gdn_rows_load_keys(run, args, next, kk_next, v_next, decay_next, beta_next, conv_bad_next);
+    gdn_advance(st, kk, v, decay, beta);
+    float part = lane_dot(st, qq);
+    gdn_rows_load_queries(run, args, next, qq);
+    float oval = column_sum(part);
+    *unusable |= (conv_bad || !isfinite(oval)) ? 1u : 0u;
+    gdn_rows_emit(run, args, r, oval, st);
+}
+
+// The lane's sixteen state values written at `base`.
+inline void gdn_store(device float *state, uint base, uint j, thread const float *st) {
+    for (uint i = 0u; i < 16u; ++i) {
+        state[base + key_of(j, i)] = st[i];
+    }
+}
+
 // The recurrence over a chunk of rows in one launch: the rows in order, the
 // state read once from the lane the word at `lane_at` names and written once,
 // after the last row, to the lane the word at `lane_to` names. The state stays
@@ -747,6 +878,16 @@ kernel void gdn_prep_rows(device const float *x [[buffer(0)]],
 // `snaps`, the registers after each row it names land in that copy's lane of
 // `snap`, as the lane write after the last row would land them: a copy is the
 // state a chunk ending at its row leaves, and no output of the chunk moves.
+//
+// The first pass runs the rows' arithmetic with no check, in place, and notes
+// whether any row's conv was unusable or any column output was not finite. A
+// pass that notes none is the chunk the checked update computes (`gdn_delta`):
+// every state the rows saw was finite, by the argument there. If any lane of
+// the simdgroup noted one, the simdgroup runs the chunk again from the state
+// it read, with the checked update, which raises the faults and writes the NaN
+// the contract names, and overwrites everything the first pass wrote but the
+// state, which only a clean pass writes. Rows go in pairs through two banks of
+// keys, so the keys of a row are in registers when its arithmetic begins.
 inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
                          device float *state, device float *g, constant DeltaRowsArgs &args,
                          device atomic_uint *faults, device float *snap,
@@ -761,59 +902,71 @@ inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
     bool lane_ok = word < args.step.lanes && word_to < args.step.lanes;
     uint base = ((word * n_v + seat.h) * head + seat.col) * head;
     uint base_to = ((word_to * n_v + seat.h) * head + seat.col) * head;
-    uint cell = (seat.h * head + seat.col) * head;
-    uint copies = snaps == nullptr ? 0u : snaps->n;
-    uint copy = 0u;
+    GdnRowsRun run = {seat,
+                      tgp.x,
+                      prep,
+                      g,
+                      faults,
+                      snap,
+                      snaps,
+                      (seat.h * head + seat.col) * head,
+                      snaps == nullptr ? 0u : snaps->n,
+                      0u,
+                      lane_ok};
 
     float st[16];
     gdn_load(state, base, seat.j, lane_ok, st);
+    uint unusable = lane_ok ? 0u : 1u;
+    float kk_a[16];
+    float kk_b[16];
+    float qq[16];
+    float v_a = 0.0f;
+    float v_b = 0.0f;
+    float decay_a = 0.0f;
+    float decay_b = 0.0f;
+    float beta_a = 0.0f;
+    float beta_b = 0.0f;
+    bool conv_bad_a = false;
+    bool conv_bad_b = false;
+    if (args.rows > 0u) {
+        gdn_rows_load_keys(run, args, 0u, kk_a, &v_a, &decay_a, &beta_a, &conv_bad_a);
+        gdn_rows_load_queries(run, args, 0u, qq);
+    }
     bool row_ok = lane_ok;
     for (uint r = 0u; r < args.rows; ++r) {
-        device const float *row = prep + (ulong)r * args.prep.stride;
-        device const float *qp = row + seat.kh * head;
-        device const float *kp = row + args.prep.k + seat.kh * head;
-        float kk[16];
-        float qq[16];
-        for (uint c = 0u; c < 4u; ++c) {
-            float4 kf = *((device const float4 *)(kp + 32u * c + 4u * seat.j));
-            float4 qf = *((device const float4 *)(qp + 32u * c + 4u * seat.j));
-            kk[4u * c] = kf.x;
-            kk[4u * c + 1u] = kf.y;
-            kk[4u * c + 2u] = kf.z;
-            kk[4u * c + 3u] = kf.w;
-            qq[4u * c] = qf.x;
-            qq[4u * c + 1u] = qf.y;
-            qq[4u * c + 2u] = qf.z;
-            qq[4u * c + 3u] = qf.w;
+        uint next = r + 1u < args.rows ? r + 1u : r;
+        gdn_rows_first(run, args, r, next, st, kk_a, kk_b, qq, v_a, decay_a, beta_a, conv_bad_a,
+                       &v_b, &decay_b, &beta_b, &conv_bad_b, &unusable);
+        if (++r == args.rows) {
+            break;
         }
-        float v = row[args.prep.v + seat.h * head + seat.col];
-        float decay = row[args.prep.decay + seat.h];
-        float beta = row[args.prep.beta + seat.h];
-        bool conv_bad = ((device const uint *)(row + args.prep.bad))[tgp.x] != 0u;
-        float sp[16];
-        bool lane_state_bad;
-        bool column_bad;
-        float oval = gdn_delta(seat, row_ok, conv_bad, kk, qq, v, decay, beta, st, sp,
-                               &lane_state_bad, &column_bad);
-        if (seat.j == 0u) {
-            g[(ulong)r * args.g_stride + seat.h * head + seat.col] = oval;
-        }
-        gdn_settle(seat, faults, args.step.layer, row_ok, conv_bad, column_bad, lane_state_bad,
-                   oval, sp, st);
-        if (copy < copies && r == snaps->after[copy]) {
-            if (lane_ok) {
-                device float *lane = snap + (ulong)copy * snaps->lane_len + cell;
-                for (uint i = 0u; i < 16u; ++i) {
-                    lane[key_of(seat.j, i)] = st[i];
-                }
+        next = r + 1u < args.rows ? r + 1u : r;
+        gdn_rows_first(run, args, r, next, st, kk_b, kk_a, qq, v_b, decay_b, beta_b, conv_bad_b,
+                       &v_a, &decay_a, &beta_a, &conv_bad_a, &unusable);
+    }
+    if (simd_any(unusable != 0u)) {
+        gdn_load(state, base, seat.j, lane_ok, st);
+        run.copy = 0u;
+        for (uint r = 0u; r < args.rows; ++r) {
+            float kk[16];
+            float v;
+            float decay;
+            float beta;
+            bool conv_bad;
+            gdn_rows_load_keys(run, args, r, kk, &v, &decay, &beta, &conv_bad);
+            gdn_rows_load_queries(run, args, r, qq);
+            float sp[16];
+            bool wrote;
+            float oval = gdn_delta(seat, faults, args.step.layer, row_ok, conv_bad, kk, qq, v,
+                                   decay, beta, st, sp, &wrote);
+            gdn_rows_emit(run, args, r, oval, sp);
+            for (uint i = 0u; i < 16u; ++i) {
+                st[i] = sp[i];
             }
-            ++copy;
         }
     }
     if (lane_ok) {
-        for (uint i = 0u; i < 16u; ++i) {
-            state[base_to + key_of(seat.j, i)] = st[i];
-        }
+        gdn_store(state, base_to, seat.j, st);
     }
 }
 

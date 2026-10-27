@@ -243,6 +243,7 @@ fn inputs(
     })
 }
 
+#[derive(Clone)]
 struct Owned {
     x: Vec<f32>,
     b: Vec<f32>,
@@ -667,8 +668,70 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
     Ok(())
 }
 
-/// A read or a write lane word past the lanes, and one non-finite key, each
-/// raise the lane site.
+/// A state value that is finite but whose update is not: value head 0 decays
+/// by e^80 a step, so the 1e30 in key 12 of its column 0 leaves the range of
+/// f32 in `state * decay`. The state the step read was finite, so the step
+/// raises the delta site and not the lane site, and writes the update as it
+/// computed it: every key of the column is not finite, where a non-finite
+/// state value leaves the other lanes' keys as they were. The next column is
+/// finite.
+fn overflow_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
+    let delta = &h.geom().delta;
+    let mut grown = owned.clone();
+    grown.ssm_a[0] = 2.0;
+    grown.a[0] = 40.0 - grown.dt[0];
+    let mut state = owned.state.clone();
+    state[delta.state_index(0, 0, 0, 12)] = 1.0e30;
+    let pos = [4u32];
+    let lane = [0u32];
+    let back = run(
+        h,
+        &grown.as_in(View {
+            map: HeadMap::Tiled,
+            lanes: 1,
+            lane_at: 0,
+            lane_to: 0,
+            lane: &lane,
+            pos: &pos,
+            state: &state,
+            ring: &owned.ring,
+        }),
+    )?;
+    common::expect_fault(
+        h,
+        "a finite state whose update overflows",
+        FaultSite::LinearDelta,
+    )?;
+    for key in 0..delta.head_cols {
+        let idx = delta.state_index(0, 0, 0, key);
+        if back.state[idx].is_finite() {
+            return Err(format!(
+                "key {key} of the overflowing column is {:?}, the update as computed is not finite",
+                back.state[idx]
+            ));
+        }
+        let next = delta.state_index(0, 0, 1, key);
+        if !back.state[next].is_finite() {
+            return Err(format!(
+                "key {key} of the next column is {:?}",
+                back.state[next]
+            ));
+        }
+    }
+    if back.g[0].is_finite() {
+        return Err(format!(
+            "the overflowing column's numerator is {:?}",
+            back.g[0]
+        ));
+    }
+    if !back.g[1].is_finite() {
+        return Err(format!("the next column's numerator is {:?}", back.g[1]));
+    }
+    Ok(())
+}
+
+/// A read or a write lane word past the lanes, one non-finite key and one
+/// finite key whose update overflows, each raise their own site.
 pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let delta = &h.geom().delta;
     let fixed = fixed(delta, fixture)?;
@@ -698,8 +761,9 @@ pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         written_once(delta.ring_rows, &back.ring, &owned.ring, &owned.x, 4)?;
     }
     poison_column(h, &owned)?;
+    overflow_column(h, &owned)?;
     Ok(Verdict::Noted(
-        "a read or a write lane word past the lanes left the state untouched, and one non-finite key wrote NaN on that lane only"
+        "a read or a write lane word past the lanes left the state untouched, one non-finite key wrote NaN on that lane only, and an update that overflows raised the delta site with the update as computed"
             .to_string(),
     ))
 }

@@ -683,8 +683,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "delta_step",
         why: "the state update subtracts k*u",
         edits: &[(
-            "sp[i] = fma(kk[i], u, sp[i]);",
-            "sp[i] = fma(-kk[i], u, sp[i]);",
+            "st[i] = fma(kk[i], u, st[i]);",
+            "st[i] = fma(-kk[i], u, st[i]);",
             1,
         )],
     },
@@ -692,7 +692,11 @@ pub const MUTANTS: &[Mutant] = &[
         name: "delta_roll_keep",
         clause: "delta_roll",
         why: "the state store keeps the value it loaded",
-        edits: &[("st[i] = sp[i];", "st[i] = st[i];", 1)],
+        edits: &[(
+            "state[base_to + key_of(seat.j, i)] = sp[i];",
+            "state[base_to + key_of(seat.j, i)] = st[i];",
+            1,
+        )],
     },
     Mutant {
         name: "delta_lane_in_place",
@@ -728,7 +732,47 @@ pub const MUTANTS: &[Mutant] = &[
         name: "delta_nan_zero",
         clause: "delta_nan",
         why: "a non-finite lane stores zero",
-        edits: &[("st[i] = NAN;", "st[i] = 0.0f;", 1)],
+        edits: &[(
+            "sp[i] = lane_state_bad ? NAN : st[i];",
+            "sp[i] = lane_state_bad ? 0.0f : st[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_bad_column_all_nan",
+        clause: "delta_nan",
+        why: "every lane of a column with one non-finite state value stores NaN, not only that lane",
+        edits: &[("sp[i] = lane_state_bad ? NAN : st[i];", "sp[i] = NAN;", 1)],
+    },
+    Mutant {
+        name: "delta_guard_state_unchecked",
+        clause: "delta_nan",
+        why: "the update takes a finite output as the whole check, so a state value that is not finite never reaches the state check",
+        edits: &[(
+            "if (lane_ok && !conv_bad && isfinite(o)) {",
+            "if (lane_ok && !conv_bad) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_overflow_silent",
+        clause: "delta_nan",
+        why: "a finite state whose update overflows raises nothing",
+        edits: &[(
+            "raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_DELTA);",
+            "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_refused_site_swap",
+        clause: "delta_rows_nan",
+        why: "a conv that is not usable raises the lane site, and a lane word out of range the conv site",
+        edits: &[(
+            "lane_ok ? BLOOMERY_FAULT_SITE_LINEAR_CONV : BLOOMERY_FAULT_SITE_DELTA_LANE",
+            "lane_ok ? BLOOMERY_FAULT_SITE_DELTA_LANE : BLOOMERY_FAULT_SITE_LINEAR_CONV",
+            1,
+        )],
     },
     Mutant {
         name: "attn_score_scale",
@@ -933,8 +977,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "delta_rows",
         why: "the rows launch writes the state to the lane it read, not the lane the write word names",
         edits: &[(
-            "    if (lane_ok) {\n        for (uint i = 0u; i < 16u; ++i) {\n            state[base_to + key_of(seat.j, i)] = st[i];",
-            "    if (lane_ok) {\n        for (uint i = 0u; i < 16u; ++i) {\n            state[base + key_of(seat.j, i)] = st[i];",
+            "gdn_store(state, base_to, seat.j, st);",
+            "gdn_store(state, base, seat.j, st);",
             1,
         )],
     },
@@ -982,6 +1026,36 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "rows_first_pass_finite",
+        clause: "delta_rows_nan",
+        why: "the first pass over a chunk does not note a column output that is not finite, so a state value that is not finite raises nothing",
+        edits: &[(
+            "*unusable |= (conv_bad || !isfinite(oval)) ? 1u : 0u;",
+            "*unusable |= conv_bad ? 1u : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_first_pass_conv",
+        clause: "delta_rows_nan",
+        why: "the first pass over a chunk does not note a row whose status word marks a conv, β or decay that is not finite, though the row's own numbers are finite",
+        edits: &[(
+            "*unusable |= (conv_bad || !isfinite(oval)) ? 1u : 0u;",
+            "*unusable |= !isfinite(oval) ? 1u : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_prefetch_stale",
+        clause: "delta_rows",
+        why: "a row's successor takes the keys and queries of the row itself, so every second row of a chunk reads the row before it",
+        edits: &[(
+            "        next = r + 1u < args.rows ? r + 1u : r;",
+            "        next = r;",
+            1,
+        )],
+    },
+    Mutant {
         name: "rows_lane_unchecked",
         clause: "delta_rows_nan",
         why: "the rows launch runs its rows as though the lane words were in range, so a word past the lanes raises nothing",
@@ -1022,8 +1096,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "delta_rows",
         why: "the recurrence takes the decay of the previous row",
         edits: &[(
-            "float decay = row[args.prep.decay + seat.h];",
-            "float decay = (r > 0u ? row - args.prep.stride : row)[args.prep.decay + seat.h];",
+            "*decay = row[args.prep.decay + seat.h];",
+            "*decay = (r > 0u ? row - args.prep.stride : row)[args.prep.decay + seat.h];",
             1,
         )],
     },

@@ -1,0 +1,48 @@
+# Paper decomposition of the sequential delta recurrence (gdn_rows_run, crates/metal/kernels/delta.metal) per
+# layer-pass of 2048 rows; 30 delta layers x 2 passes = 60 layer-passes; pass wall 3789 ms = 1081 tok/s (a4p
+# report, M4 Pro).
+# First derivation, struck through: the step is issue-bound, ~200 simdgroup instructions a row, and cutting
+# the state checks, the register copies and one reduction (to ~110) saves 1.6 ms a layer-pass, -98 ms a pass,
+# +2.7 %.
+# It was wrong. Measured on the M4 Pro (metal_rows_time --delta 2048, recurrence arm, binaries interleaved,
+# 3-5 rounds, thermal nominal, testbed load 10-50): base 4.77 ms;
+# the instruction cut alone (first pass in place with no check, a chunk-level redo on any unusable row) 4.71
+# ms, -1.3 %; loads of the prepared row alone 2.2 ms; arithmetic alone 2.6 ms (2.8 with the
+# numerator store); both 4.71, so the two phases add, 0.28 ms overlapped; the arithmetic twice 5.18 ms
+# (+0.47); every row reading row 0 (L1-hot) 4.4 ms (-7 %); no shuffles 4.68 ms (-0.7 %).
+# Corrected model: each simdgroup alternates a load phase (12 load instructions a row, 8 of them float4; ~1.0
+# us a row step for all of them) and an arithmetic phase (~1.3 us), and the resident
+# simdgroups do not hide one under the other. The instruction count is not the term; a lever on it predicts ~0
+# (rig-log 09-26 q3gemma). The lever is the overlap: the first pass loads row r+1 while row r computes.
+# Timeline of one row step on one core (derived from the phase table, 1.5 GHz [derived from the 7.55 TFLOPS
+# MMA peak]): load phase ~1.6k cycles, arithmetic ~1.9k cycles, store 0.1k; DRAM 0.53 ms of the 4.5 ms; host,
+# PCIe, NVMe 0. The kernels are barrier-serial, so the pass wall is the sum of them and the recurrence is 76 %
+# of the delta class. The change keeps every bit: keys, queries and scalars load in the order
+# the arithmetic uses them, one row ahead, through two key banks (+16 registers; the compiled register count is not read [unverified]).
+# Measured with the change (same harness): recurrence 4.03 ms, -0.74 ms a layer-pass = -44 ms a pass = +1.2 %
+# on 3789 ms. Band: the isolated figure +-0.15 ms a layer-pass (+-9 ms, +-0.3 %) and the unmeasured
+# difference between the isolated launch and the launch inside the pass (cache state, neighbouring kernels).
+kind: ab
+question: Does the bit-exact first pass of the sequential gated-delta recurrence (no per-row state checks,
+  in-place state, next row loaded while the row computes) cut the 4K prompt pass, and by how much against the
+  isolated recurrence measurement?
+term: prompt tok/s @ P = 4096 (the first 4096 ids of the a4p prompt file), warm call (median of 3 inside the
+  process), Qwen3.6-35B-A3B MLX 4-bit split file, Apple M4 Pro 20-core GPU, head vs base 89e3dec90
+unit: %
+predict: 0.8..1.6
+rounds: 5
+sd: 0.2 % mac-dmma sitting, head 1096.1 +- 2.0 and base 1081.1 +- 1.4 tok/s over 5 rounds
+condition: Base, head and mlx-lm 0.32.0 in one sitting, arm order rotated each round, one fresh process per
+  arm and round; uptime and the stream probe (bw, chain) at the start and end; thermal nominal; the first
+  generated ids equal across the three arms; --pass-times 2048 gives the delta class ms of base and head in
+  the same runs.
+decide-in: Land it: the recurrence is 15 % shorter with every output bit equal. The next lever is the load
+  phase (12 load instructions a row): pack decay, beta and the status word into one load in the prepared row,
+  or give a lane two columns so a key load serves both; derive each from the phase table before a run.
+decide-below: Below +0.8 % the isolated gain did not carry into the pass: read the pass delta class ms
+  (--pass-times) against 5.94 - 0.74 ms a layer-pass first, then the prep and post kernels beside it; if the
+  class moved less, the launch inside the pass has a different cache state and the next measurement is the
+  class, not the recurrence.
+decide-above: Above +1.6 % the pass gains more than the isolated launch: the delta class shares cache with its
+  neighbours and the load phase weighs more than measured; re-fit the phase table from --pass-times and move
+  the load-phase lever up.
