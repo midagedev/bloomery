@@ -26,10 +26,11 @@
 //! The pre-tokenizers the table allows are the rows of [`PRE`]: each is the pipeline
 //! `tokenizer.json` spells for one name of `tokenizer.ggml.pre` (the name llama.cpp gives the
 //! vocabulary by the hash of its output), and the row `tokenizer.json` carries is the one
-//! written. A pipeline no row spells is refused by name, and a [`VocabSpec`] may name the row its
-//! model has. For every row the stop id array also makes serving encode as
-//! `tokenizer.json` does: the regex folds a contraction's case by Unicode, and BPE skips a byte
-//! the vocabulary lacks.
+//! written, whatever `pretokenize_regex` of `tokenizer_config.json` says (a regex no row spells is
+//! refused) and whatever `ByteLevel` trims of an encoding's offsets. A pipeline no row spells is
+//! refused by name, and a [`VocabSpec`] may name the row its model has. For every row the stop
+//! id array also makes serving encode as `tokenizer.json` does: the regex folds a contraction's
+//! case by Unicode, and BPE skips a byte the vocabulary lacks.
 
 use std::collections::HashMap;
 use std::fs;
@@ -121,23 +122,57 @@ fn pre_names() -> String {
     PRE.map(|(name, _)| name).join(", ")
 }
 
+/// `pre_tokenizer` with its `ByteLevel` parts' `trim_offsets` cleared. The flag trims the offsets an
+/// encoding reports and moves no id; the keys written carry no offsets, so nothing downstream reads
+/// it, and a pipeline that differs from a row only by it is that row.
+fn ids_only(pre: &Json) -> Json {
+    fn clear(part: &mut Json) {
+        if part["type"] == "ByteLevel" && part.get("trim_offsets").is_some() {
+            part["trim_offsets"] = Json::Bool(false);
+        }
+    }
+    let mut pre = pre.clone();
+    if pre["pretokenizers"].is_array() {
+        pre["pretokenizers"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .for_each(clear);
+    } else {
+        clear(&mut pre);
+    }
+    pre
+}
+
+/// Each row of [`PRE`] with its name, its pipeline as [`ids_only`] reads it and the regex it
+/// splits by.
+fn rows() -> impl Iterator<Item = (&'static str, Json, String)> {
+    PRE.into_iter().map(|(name, spelled)| {
+        let row: Json = serde_json::from_str(spelled).expect("a pre-tokenizer row is JSON");
+        let regex = row["pretokenizers"][0]["pattern"]["Regex"]
+            .as_str()
+            .expect("a pre-tokenizer row splits by a regex")
+            .to_string();
+        (name, ids_only(&row), regex)
+    })
+}
+
 /// The row of [`PRE`] a `tokenizer.json` pre-tokenizer is: its name and the regex it splits by.
+/// A pipeline is a row when it spells the row's pretokenizers and options but for `ByteLevel`'s
+/// `trim_offsets` ([`ids_only`]).
 fn pre_row(pre: Option<&Json>) -> Result<(&'static str, String), Error> {
     let bad = |what: String| Error::Vocab(what);
     let pre = pre.ok_or_else(|| bad("tokenizer.json.pre_tokenizer is missing".into()))?;
-    for (name, spelled) in PRE {
-        let row: Json = serde_json::from_str(spelled).expect("a pre-tokenizer row is JSON");
-        if &row == pre {
-            let regex = row["pretokenizers"][0]["pattern"]["Regex"]
-                .as_str()
-                .expect("a pre-tokenizer row splits by a regex");
-            return Ok((name, regex.to_string()));
-        }
-    }
-    Err(bad(format!(
-        "tokenizer.json.pre_tokenizer {pre} is unsupported; supported rows: {}",
-        pre_names()
-    )))
+    let own = ids_only(pre);
+    rows()
+        .find(|(_, row, _)| *row == own)
+        .map(|(name, _, regex)| (name, regex))
+        .ok_or_else(|| {
+            bad(format!(
+                "tokenizer.json.pre_tokenizer {pre} is unsupported; supported rows: {}",
+                pre_names()
+            ))
+        })
 }
 
 /// `tokenizer.json`.
@@ -241,6 +276,13 @@ const TOKENIZER_CONFIG: &Fields = &[
         Ignore(
             Type::Bool,
             "where HF loaded the folder from; no id depends on it",
+        ),
+    ),
+    (
+        "local_files_only",
+        Ignore(
+            Type::Bool,
+            "whether HF may reach the hub for the folder; no id depends on it",
         ),
     ),
     (
@@ -649,7 +691,7 @@ fn special_ids(
 /// A file that cannot be read or parsed; in `tokenizer.json`, its `model`, an added token,
 /// `tokenizer_config.json` or `generation_config.json`, a key the tables of this module do not
 /// name or a value they do not allow; a pre-tokenizer no row of [`PRE`] spells or other than the
-/// row `spec` names, and a `pretokenize_regex` other than the row's; a `tokenizer.json` without
+/// row `spec` names, and a `pretokenize_regex` no row splits by; a `tokenizer.json` without
 /// its vocabulary or merges, or with a merge that is not two tokens without a space whose
 /// operands and joined token are all in its vocabulary; an added token whose id or content
 /// conflicts; a token spelled as an unused id's `[PAD<id>]`; a vocabulary size
@@ -677,9 +719,19 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
             "tokenizer.json.pre_tokenizer is the {pre:?} row, where this model's is {expected:?}"
         )));
     }
-    if let Some(v) = tc.get("pretokenize_regex").filter(|&v| *v != regex) {
+    // A construction argument of transformers' Qwen2Tokenizer: the pipeline a loaded folder runs is
+    // `tokenizer.json`'s, so a regex of another row is not the folder's pipeline, and one no row
+    // spells is a pipeline this converter cannot name.
+    if let Some(v) = tc
+        .get("pretokenize_regex")
+        .filter(|&v| *v != regex && !rows().any(|(_, _, r)| *v == r))
+    {
         return Err(bad(format!(
-            "tokenizer_config.json.pretokenize_regex {v} is unsupported; the {pre:?} row splits by {regex:?}"
+            "tokenizer_config.json.pretokenize_regex {v} is unsupported; the rows split by: {}",
+            rows()
+                .map(|(name, _, r)| format!("{name} {r:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
         )));
     }
     let model = tok
@@ -1067,6 +1119,7 @@ mod tests {
             ["tokenizer_config.json", "", "model_max_length", 262144, "long"],
             ["tokenizer_config.json", "", "backend", "tokenizers", "sentencepiece"],
             ["tokenizer_config.json", "", "is_local", true, "yes"],
+            ["tokenizer_config.json", "", "local_files_only", false, "yes"],
             ["tokenizer_config.json", "", "processor_class", "Qwen3VLProcessor", 1],
             ["tokenizer_config.json", "", "audio_bos_token", "<|audio_start|>", 1],
             ["tokenizer_config.json", "", "audio_eos_token", "<|audio_end|>", 1],
@@ -1334,7 +1387,7 @@ mod tests {
 
     /// A pre-tokenizer no row spells is refused by name, one character of the regex off, a
     /// `Split` that keeps the gaps beside MiniMax's regex, and a lone `ByteLevel`; so is a
-    /// `pretokenize_regex` that is another row's.
+    /// `pretokenize_regex` no row splits by.
     #[test]
     fn a_pre_tokenizer_no_row_spells_is_refused() {
         let regex = |tokenizer: &mut Json| {
@@ -1362,10 +1415,13 @@ mod tests {
                 }),
             ),
             (
-                "another row's pretokenize_regex",
+                "a pretokenize_regex no row spells",
                 Box::new(|_: &mut Json, c: &mut Json| {
                     let qwen: Json = serde_json::from_str(PRE[0].1).unwrap();
-                    c["pretokenize_regex"] = qwen["pretokenizers"][0]["pattern"]["Regex"].clone();
+                    let r = qwen["pretokenizers"][0]["pattern"]["Regex"]
+                        .as_str()
+                        .unwrap();
+                    c["pretokenize_regex"] = r.replace("\\p{N}|", "\\p{N}+|").into();
                 }),
             ),
         ] {
@@ -1384,6 +1440,83 @@ mod tests {
         });
         super::keys(&dir, &spec_of(&dir)).unwrap();
         remove(&dir);
+    }
+
+    /// A `pretokenize_regex` of another row leaves the row `tokenizer.json` spells: the pipeline a
+    /// loaded folder runs is the file's, and transformers' loader and mlx-lm tokenize
+    /// mlx-community's Qwen3.8-27B-4bit with the file's pipeline beside a `pretokenize_regex` of
+    /// another row.
+    #[test]
+    fn a_pretokenize_regex_of_another_row_leaves_the_files_row() {
+        // PIN(2026-10-28): was refused; the loaders' pipeline is `tokenizer.json`'s, not this key's.
+        let qwen: Json = serde_json::from_str(PRE[0].1).unwrap();
+        let dir = minimax_repo(|_, c| {
+            c["pretokenize_regex"] = qwen["pretokenizers"][0]["pattern"]["Regex"].clone();
+        });
+        let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+        assert_eq!(
+            get(&keys.keys, "tokenizer.ggml.pre"),
+            Some(&Value::String("minimax-m2".into()))
+        );
+        remove(&dir);
+    }
+
+    /// `ByteLevel`'s `trim_offsets` moves no id, so a pipeline that differs from a row by it is
+    /// that row; its other options do move ids, and a pipeline that differs by one is refused.
+    #[test]
+    fn trim_offsets_moves_no_row_and_the_other_byte_level_options_do() {
+        for (name, spelled) in PRE {
+            let mut row: Json = serde_json::from_str(spelled).unwrap();
+            let trim = row["pretokenizers"][1]["trim_offsets"].as_bool().unwrap();
+            row["pretokenizers"][1]["trim_offsets"] = (!trim).into();
+            assert_eq!(pre_row(Some(&row)).unwrap().0, name);
+            for option in ["add_prefix_space", "use_regex"] {
+                let mut moved: Json = serde_json::from_str(spelled).unwrap();
+                moved["pretokenizers"][1][option] = true.into();
+                assert!(pre_row(Some(&moved)).is_err(), "{name} {option}");
+            }
+        }
+    }
+
+    /// The pipelines of Qwen3.8-27B's `tokenizer.json` as two repos ship it, each with the
+    /// `pretokenize_regex` of its `tokenizer_config.json` (the files' normalizer, pre-tokenizer,
+    /// post-processor and decoder, committed alone), open as the row each file spells: mlx-community's
+    /// re-save at `10c35caafbb80f7dc6a7a432cdd11af10a6d4818` is the `qwen2` row (letters alone,
+    /// no mark; `trim_offsets` set) beside the `qwen35` regex, the official repo's at
+    /// `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` the `qwen35` row.
+    #[test]
+    fn the_real_qwen3_8_27b_folders_open_as_the_row_their_tokenizer_json_spells() {
+        let path = format!(
+            "{}/tests/fixtures/qwen3.8-27b-tokenizer-pipelines.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let pipelines: Json = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for (folder, row) in [
+            (
+                "mlx-community/Qwen3.8-27B-4bit@10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+                "qwen2",
+            ),
+            (
+                "Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+                "qwen35",
+            ),
+        ] {
+            let p = &pipelines[folder];
+            let dir = minimax_repo(|t, c| {
+                for part in ["normalizer", "pre_tokenizer", "post_processor", "decoder"] {
+                    t[part] = p[part].clone();
+                }
+                c["pretokenize_regex"] = p["pretokenize_regex"].clone();
+            });
+            let keys =
+                super::keys(&dir, &spec_of(&dir)).unwrap_or_else(|e| panic!("{folder}: {e}"));
+            assert_eq!(
+                get(&keys.keys, "tokenizer.ggml.pre"),
+                Some(&Value::String(row.into())),
+                "{folder}"
+            );
+            remove(&dir);
+        }
     }
 
     /// A spec that names a row accepts that row and refuses another by both names; a name no row
@@ -1418,7 +1551,11 @@ mod tests {
             .collect();
         assert_eq!(names.len(), PRE.len());
         for (i, a) in rows.iter().enumerate() {
-            assert!(rows[..i].iter().all(|b| a != b), "{}", PRE[i].0);
+            assert!(
+                rows[..i].iter().all(|b| ids_only(a) != ids_only(b)),
+                "{}",
+                PRE[i].0
+            );
             assert_eq!(pre_row(Some(a)).unwrap().0, PRE[i].0);
         }
     }
