@@ -87,4 +87,5 @@ crates/decision/tests/lev.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
 crates/gpu-gates/src/tier.rs	BLOOMERY_TIER	stays: the tier a gate runs in, read once here and checked against the file it opens
 crates/gpu-gates/src/model_file/fetch.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
+crates/metal/src/model_arg.rs	BLOOMERY_CACHE,HOME	stays: the Metal server's --hf cache, read where gpu-gates' fetch reads it
 crates/hf/src/fetch.rs	HF_TOKEN,HOME,HF_HUB_OFFLINE	stays: the hub token for a gated repo, and its file; the hub's own switch to stay offline
