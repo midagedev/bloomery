@@ -37,10 +37,20 @@ use super::Table;
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
-        Table::Shaped { kept, own } => program::all(MUTANTS, TENSOR_MUTANTS)
-            .filter(|(m, _)| kept.contains(&m.name))
-            .chain(program::all(own, &[]))
-            .collect(),
+        Table::Shaped { kept, own } => {
+            if let Some(name) = kept.iter().find(|name| {
+                !MUTANTS
+                    .iter()
+                    .chain(TENSOR_MUTANTS)
+                    .any(|m| m.name == **name)
+            }) {
+                panic!("the shaped row keeps the mutant {name}, which neither table holds");
+            }
+            program::all(MUTANTS, TENSOR_MUTANTS)
+                .filter(|(m, _)| kept.contains(&m.name))
+                .chain(program::all(own, &[]))
+                .collect()
+        }
     }
 }
 
