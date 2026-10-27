@@ -32,19 +32,19 @@ use super::Table;
 
 /// Every mutant of an instance's run (`table`, its row of the gate), with the
 /// program it edits: at an instance that runs the whole gate both tables; at
-/// one that runs its shaped kernels' clauses, the main table's mutants of
-/// those clauses and the instance's own.
+/// one that runs its shaped kernels' clauses, the mutants of either table
+/// that name those clauses (`kept`) and the instance's own.
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
-        Table::Shaped { kept, own } => program::all(MUTANTS, &[])
+        Table::Shaped { kept, own } => program::all(MUTANTS, TENSOR_MUTANTS)
             .filter(|(m, _)| kept.contains(&m.name))
             .chain(program::all(own, &[]))
             .collect(),
     }
 }
 
-/// The main table's mutants of the clauses the Qwen3-30B-A3B row runs, less
+/// The mutants of the clauses the Qwen3-30B-A3B row runs, less
 /// those whose text its preprocessor removes or whose edit is the same
 /// program there: the gated epilogues (`attn_gate_s1`, `attn_gate_merge`),
 /// the shared slot (`pair_shared_stack`), the shared group of the grouped GEMM
@@ -52,7 +52,8 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
 /// logits' stride (`route_rows_stride`: the row's logits are dense, the stride
 /// its row count) and the key head swap (`prefill_kv_head`: four key heads
 /// make `1 - kv` wrap). The A4 mutants are kept but the head-normed scale's
-/// (`a4_headnorm_scale`), a delta net's.
+/// (`a4_headnorm_scale`), a delta net's; so are those of the A4 GEMM clauses
+/// (dense, segmented and tensor-op), which run at both rows.
 pub const Q30_KEPT: &[&str] = &[
     "router_logit",
     "router_ids",
@@ -114,6 +115,14 @@ pub const Q30_KEPT: &[&str] = &[
     "a4_head_logit",
     "a4_embed_code",
     "a4_routed_bias_sign",
+    "gemm_row_edge",
+    "gemm_resid_overwrite",
+    "gemm_seg_weights",
+    "gemm_a4_chunk_order",
+    "tensor_resid_stores",
+    "tensor_seg_out",
+    "tensor_routed_block_rows",
+    "tensor_tile_no_raise",
 ];
 
 /// The defects only a head-128, ungated, unshared instance shows, and those of
@@ -1161,6 +1170,32 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "gemm_a4_store",
         why: "the bounded store ignores the weight-column bound, so a tail tile's dead columns are written",
         edits: &[("if (n < nr0) {", "if (n < GEMM_ROWS) {", 1)],
+    },
+    Mutant {
+        name: "gemm_resid_overwrite",
+        clause: "gemm_a4_resid",
+        why: "the residual epilogue stores the product over the output's even words instead of adding to them",
+        edits: &[(
+            "p[n] = RESID ? p[n] + c[i][j].x : c[i][j].x;",
+            "p[n] = c[i][j].x;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_seg_weights",
+        clause: "gemm_seg",
+        why: "a segment of the segmented GEMM reads the weights of the first segment",
+        edits: &[("W + wblocks,", "W,", 1)],
+    },
+    Mutant {
+        name: "gemm_a4_chunk_order",
+        clause: "gemm_a4_store",
+        why: "an A4 chunk stages its values with each neighbouring pair swapped",
+        edits: &[(
+            "reg[j / 4][j % 4] = value(blk, (uint)(16 * il + j));",
+            "reg[j / 4][j % 4] = value(blk, (uint)(16 * il + (j ^ 1)));",
+            1,
+        )],
     },
     Mutant {
         name: "gemm_act_edge",

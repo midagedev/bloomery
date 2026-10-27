@@ -2,7 +2,8 @@
 //! against the f64 oracle, over the MLX-format fixture split. The Q4_K
 //! clauses' own shapes and fault inputs, every new entry: the five mat-vec
 //! modes, the pair, the fold, the head and the embedding. The mat-vec shapes
-//! are a row's [`Sites`]: the tensors of its family's trunk, at its geometry.
+//! and the prompt pass's GEMM shapes (`clauses_gemm`) are a row's [`Sites`]:
+//! the tensors of its family's trunk, at its geometry.
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
@@ -19,8 +20,26 @@ use super::fixture::Fixture;
 use super::oracle::{self, Kind};
 use super::{Harness, HeadNormLaunch, Launch, ModeSpec};
 
-/// The tensors the mat-vec A4 clauses read at one row: the shapes of its
-/// family's sites. The head and the embedding are the fixture's own.
+/// One dense GEMM case at a row's site: a whole tensor against `acts`
+/// activation rows, the activations' seed beside it.
+pub struct GemmCase {
+    pub(super) tensor: common::Tensor,
+    pub(super) acts: usize,
+    pub(super) seed: u64,
+}
+
+/// The segmented GEMM's A4 group at a row's site: whole tensors in segment
+/// order, then one tail segment cut from a tensor, so the dispatch has a
+/// segment no weight tile divides.
+pub struct GemmSeg {
+    /// The tensors taken whole, with their rows.
+    pub(super) whole: &'static [(&'static str, usize)],
+    /// The tail segment: the tensor, its first row and its rows.
+    pub(super) tail: (&'static str, usize, usize),
+}
+
+/// The tensors the A4 clauses read at one row: the shapes of its family's
+/// sites. The head and the embedding are the fixture's own.
 pub struct Sites {
     /// The store dot's tensors.
     matvec: &'static [common::Tensor],
@@ -35,6 +54,10 @@ pub struct Sites {
     seg: &'static [&'static [(&'static str, usize)]],
     /// The gain the segments load under.
     seg_gain: &'static str,
+    /// The dense prompt-pass GEMM's cases, before the head's tail.
+    pub(super) gemm: &'static [GemmCase],
+    /// The segmented prompt-pass GEMM's group.
+    pub(super) gemm_seg: GemmSeg,
 }
 
 /// The Qwen3.6 row: the delta net's projections beside the gated attention
@@ -74,6 +97,30 @@ pub const QWEN35_SITES: Sites = Sites {
         ],
     ],
     seg_gain: "blk.1.attn_norm.weight",
+    gemm: &[
+        GemmCase {
+            tensor: common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192),
+            acts: 9,
+            seed: 0x6E51,
+        },
+        GemmCase {
+            tensor: common::Tensor::a4("blk.0.ssm_out.weight", 4096, 2048),
+            acts: 33,
+            seed: 0x6E52,
+        },
+        GemmCase {
+            tensor: common::Tensor::a4("blk.0.ffn_down_shexp.weight", 512, 2048),
+            acts: 512,
+            seed: 0x6E53,
+        },
+    ],
+    gemm_seg: GemmSeg {
+        whole: &[
+            ("blk.0.attn_qkv.weight", 8192),
+            ("blk.1.attn_k.weight", 512),
+        ],
+        tail: ("blk.1.attn_q.weight", 100, 511),
+    },
 };
 
 /// The Qwen3-30B row: the plain attention query of 32 heads of 128, the key
@@ -108,6 +155,31 @@ pub const QWEN3_SITES: Sites = Sites {
         ("blk.1.attn_v.weight", 512),
     ]],
     seg_gain: "blk.1.attn_norm.weight",
+    gemm: &[
+        GemmCase {
+            tensor: common::Tensor::a4("blk.0.attn_q.weight", 2048, 4096),
+            acts: 9,
+            seed: 0x6E55,
+        },
+        GemmCase {
+            tensor: common::Tensor::a4("blk.0.attn_output.weight", 4096, 2048),
+            acts: 33,
+            seed: 0x6E56,
+        },
+        GemmCase {
+            tensor: common::Tensor::a4("blk.0.attn_k.weight", 2048, 512),
+            acts: 512,
+            seed: 0x6E57,
+        },
+    ],
+    gemm_seg: GemmSeg {
+        whole: &[
+            ("blk.1.attn_q.weight", 4096),
+            ("blk.1.attn_k.weight", 512),
+            ("blk.1.attn_v.weight", 512),
+        ],
+        tail: ("blk.1.attn_q.weight", 100, 511),
+    },
 };
 
 /// The store dot at the row's sites and the head's tail rows.
@@ -546,7 +618,7 @@ pub fn a4_embed(h: &Harness<'_>, fix: &Fixture) -> Clause {
 
 /// `clause` over the MLX split, or the reason it could not be opened: a clause
 /// run without the split is red, not skipped.
-fn with<'a>(
+pub(super) fn with<'a>(
     h: &'a Harness<'a>,
     mlx: &'a Result<Fixture, String>,
     clause: impl Fn(&Harness<'_>, &Fixture) -> Clause + 'a,
