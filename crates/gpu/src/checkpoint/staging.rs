@@ -250,12 +250,6 @@ impl Staged {
         self.rows
     }
 
-    /// The `f32` recurrent values' count.
-    #[must_use]
-    pub fn recurrent_len(&self) -> usize {
-        self.recurrent
-    }
-
     /// The rows. Read only after the copy that fills them has landed.
     #[must_use]
     pub fn rows(&self) -> &[u16] {

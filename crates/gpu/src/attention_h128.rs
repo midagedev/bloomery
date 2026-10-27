@@ -225,10 +225,6 @@ impl Binding {
             self.capacity - self.window + 1
         }
     }
-    #[must_use]
-    pub fn projection_types(&self) -> [SiteTy; 4] {
-        [self.q.ty, self.k.ty, self.v.ty, self.o.ty]
-    }
 
     /// Full attention sub-layer: RMS, Q/K/V, head RMS and optional NeoX, append,
     /// sink-folded attention, O projection, residual. Every scratch cell read is written.

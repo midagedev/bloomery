@@ -497,14 +497,6 @@ impl CardExperts {
         })
     }
 
-    /// The raw routed sum of the last pass.
-    pub fn pass_acc(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
-        self.pass.as_ref().map(|p| &p.acc).ok_or(GpuError::State {
-            what: self.family.what,
-            missing: "the buffers of a pass of several rows",
-        })
-    }
-
     /// Device bytes of the step's buffers and a pass's.
     #[must_use]
     pub fn bytes(&self) -> usize {

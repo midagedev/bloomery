@@ -471,10 +471,6 @@ impl Gguf {
         self.arch_get_u64("embedding_length")
     }
 
-    pub fn attention_head_count(&self) -> Option<u64> {
-        self.arch_get_u64("attention.head_count")
-    }
-
     /// Number of tensors.
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()

@@ -1577,13 +1577,6 @@ impl Body35 {
         self.lane.as_ref().map(LaneWord::lane)
     }
 
-    /// The verify waiting for its commit: the position of its first row and
-    /// its row count. `None` on a plain load, and when none waits.
-    #[must_use]
-    pub fn verify_waiting(&self) -> Option<(u32, usize)> {
-        self.pending.map(|p| (p.pos0, p.rows))
-    }
-
     /// What a cut to at most `n` positions of a model standing at `pos`
     /// keeps, and why: with a verify waiting, `n` when it lies past the
     /// verify's first position (`Rule`: its commit moves the lane word and

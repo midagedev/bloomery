@@ -2577,12 +2577,6 @@ impl<H: HostExperts> HostTier<H> {
         (&mut self.step.boundary, &self.slots)
     }
 
-    /// The step port.
-    #[must_use]
-    pub fn step_port(&self) -> &StepPort {
-        &self.step
-    }
-
     /// The go waits of step services `from..to` (counts of
     /// [`HybridStats::gaps`]): the card's time between the host's signal and
     /// the next go, per service. No allocation.

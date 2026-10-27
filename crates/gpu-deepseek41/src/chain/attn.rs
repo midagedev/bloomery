@@ -1064,16 +1064,6 @@ impl AttnChain {
         self.top_k
     }
 
-    /// Row `row`'s kept candidate lists (`[tokens × blocks]`, token `t`'s at
-    /// `t · blocks`) and `blocks`, as the source layer's last pass of that
-    /// row left them; `None` on a piece whose layers the candidate mask gives
-    /// no role.
-    #[must_use]
-    pub fn cand_kept(&self, row: usize) -> Option<(&DeviceBuffer<u32>, usize)> {
-        let c = self.scratch.select.as_ref()?.cand.as_ref()?;
-        Some((c.kept.get(row)?, c.shape.blocks()))
-    }
-
     /// Of [`AttnChain::device_bytes`], the kept candidate lists: one set a
     /// row of words, laid out like them.
     #[must_use]

@@ -692,18 +692,6 @@ pub enum FlashKind {
     Scalar,
 }
 
-impl FlashKind {
-    /// `true` is the tensor-core pass.
-    #[must_use]
-    pub fn from_mma(mma: bool) -> FlashKind {
-        if mma {
-            FlashKind::Mma
-        } else {
-            FlashKind::Scalar
-        }
-    }
-}
-
 impl GpuModel<Body> {
     /// The whole model of `file` resident on `gpu`, plus the output head:
     /// every tensor in its kernels' device format, the caches of `opts.ctx`

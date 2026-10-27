@@ -1028,54 +1028,6 @@ pub fn latent_append_host(
     sites
 }
 
-/// The host rule of [`LatentKernels::enqueue_latent_extra_append`]: the
-/// latent normed as [`latent_append_host`] norms it, after the token's
-/// `extra` raw values at column `e_off`, each rounded to f16, into `cache`
-/// (`[rows][extra + LATENT]` f16 bits). Returns the mask of the sites the
-/// launch raises.
-///
-/// # Panics
-///
-/// When `x` holds fewer than `pos.len()` rows or a part passes a row, or
-/// `gain` is shorter than [`LATENT`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the launch's own arguments, as the host rule of one kernel entry"
-)]
-#[must_use]
-pub fn latent_extra_append_host(
-    x: &[f32],
-    stride: usize,
-    off: usize,
-    e_off: usize,
-    extra: usize,
-    gain: &[f32],
-    pos: &[u32],
-    eps: f32,
-    cache: &mut [u16],
-) -> u32 {
-    let width = extra + LATENT;
-    let rows = cache.len() / width;
-    let mut latent = vec![0u16; rows * LATENT];
-    let mut sites = latent_append_host(x, stride, off, gain, pos, eps, &mut latent);
-    for (t, &p) in pos.iter().enumerate() {
-        let p = p as usize;
-        if p >= rows {
-            continue;
-        }
-        for j in 0..extra {
-            let h = f32_to_f16_bits(x[t * stride + e_off + j]);
-            if !f16_finite(h) {
-                sites |= bit(FaultSite::CacheValue);
-            }
-            cache[p * width + j] = h;
-        }
-        cache[p * width + extra..(p + 1) * width]
-            .copy_from_slice(&latent[p * LATENT..(p + 1) * LATENT]);
-    }
-    sites
-}
-
 /// The host rule of [`LatentKernels::enqueue_index_key_append`]: the module
 /// doc's index-key contract, op for op, for the `pos.len()` tokens of `x`
 /// (`[m][stride]`, the key at column `k_off`, the gate at `g_off`) into

@@ -1086,29 +1086,6 @@ impl ModelSpec {
         self.indices(|l| l.moe().is_some_and(|m| m.router.hash))
     }
 
-    /// The distinct compression ratios in layer order: the first and the next
-    /// one, at most two in a file the readers accept.
-    #[must_use]
-    pub fn ratio_segments(&self) -> Vec<u32> {
-        let mut seen = Vec::new();
-        for c in self
-            .layers
-            .iter()
-            .filter_map(|l| l.latent()?.compress.as_ref())
-        {
-            if !seen.contains(&c.ratio) {
-                seen.push(c.ratio);
-            }
-        }
-        seen
-    }
-
-    /// The layers carrying an engram site, in order.
-    #[must_use]
-    pub fn engram_sites(&self) -> Vec<LayerIdx> {
-        self.indices(|l| l.extras.contains(&Extra::Engram))
-    }
-
     fn indices(&self, pick: impl Fn(&LayerSpec) -> bool) -> Vec<LayerIdx> {
         (0..)
             .zip(&self.layers)

@@ -85,7 +85,7 @@ use chain::arch::qwen3moe::read::Sites35;
 use chain::arch::qwen3moe::walk::Walk;
 use model_hf::ModelFile;
 use runtime::prompt::PrefillMode;
-use runtime::seqstate::{self, Kept};
+use runtime::seqstate::Kept;
 
 use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
 use super::check;
@@ -1573,14 +1573,6 @@ impl Session {
         if let Some(copies) = self.rows.snaps.as_mut() {
             copies.holds = [None; SNAPS];
         }
-    }
-
-    /// The ledger's counts.
-    #[must_use]
-    pub fn checkpoint_stats(&self) -> seqstate::Stats {
-        self.checkpoints
-            .as_ref()
-            .map_or_else(seqstate::Stats::default, Checkpoints::stats)
     }
 
     /// The checkpoints' positions, ascending.

@@ -46,16 +46,6 @@ pub fn layer_output_norm(l: usize) -> String {
     blk(l, "layer_output_norm.weight")
 }
 
-/// The block's own embedding table, when the conversion writes one.
-pub fn nextn_embed_tokens(l: usize) -> String {
-    blk(l, "nextn.embed_tokens.weight")
-}
-
-/// The block's own head, when the conversion writes one.
-pub fn nextn_shared_head_head(l: usize) -> String {
-    blk(l, "nextn.shared_head_head.weight")
-}
-
 /// The block's own head norm, when the conversion writes one.
 pub fn nextn_shared_head_norm(l: usize) -> String {
     blk(l, "nextn.shared_head_norm.weight")
