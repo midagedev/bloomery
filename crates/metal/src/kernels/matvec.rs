@@ -36,9 +36,9 @@ impl Quant {
         .expect("a block size fits usize")
     }
 
-    /// Every type a session's arena opens. Q8_0 and Q5_K have kernels but no
-    /// arena site yet, so they are not here.
-    pub const ALL: [Quant; 3] = [Self::Q4K, Self::Q6K, Self::A4];
+    /// Every type a session's arena opens: all the mat-vec families, in the
+    /// order a layer's P1 dispatches them.
+    pub const ALL: [Quant; 5] = [Self::Q4K, Self::Q6K, Self::A4, Self::Q8_0, Self::Q5K];
 
     /// The kernel type that reads file type `ty`, or `None` for a type a
     /// session does not open: [`Quant::ggml`] read backwards over
@@ -70,6 +70,37 @@ impl Quant {
                 .expect("every kernel type has a GGUF row"),
         )
         .expect("a block's value count fits usize")
+    }
+
+    /// Whether the embedding launch has an entry for the type: the
+    /// `Kernels::embed` pipeline match, which refuses the others by name.
+    #[must_use]
+    pub const fn embeds(self) -> bool {
+        match self {
+            Self::Q4K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q6K => false,
+        }
+    }
+
+    /// Whether the head launch has an entry for the type: the
+    /// `Kernels::head` pipeline match, which refuses the others by name.
+    #[must_use]
+    pub const fn heads(self) -> bool {
+        match self {
+            Self::Q6K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q4K => false,
+        }
+    }
+
+    /// Whether the head-normed residual mat-vec has an entry for the type:
+    /// the `Kernels::headnorm_resid` pipeline match, which refuses the
+    /// others by name.
+    #[must_use]
+    pub const fn headnorms(self) -> bool {
+        match self {
+            Self::Q4K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q6K => false,
+        }
     }
 
     /// The type's name as an error prints it.

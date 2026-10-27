@@ -17,7 +17,8 @@
 //! embedding, then each layer whose two plans read). A half whose plan the
 //! launch lists refuse names its first refusal as the chain reader words it,
 //! then every other site of that half the same lists refuse, so one file's
-//! `Q8_0` sites are all listed and the first item is the one the open names.
+//! sites of a type no mat-vec runs are all listed and the first item is the
+//! one the open names.
 
 use bloomery_device::fault::FAULT_WORDS;
 use chain::ChainError;
@@ -182,7 +183,8 @@ impl Table<'_> {
         }
         let quant = Quant::of_ggml(ty).ok_or_else(|| {
             refuse(format!(
-                "{name} is {ty:?}, which no mat-vec of this backend runs (Q4_K, Q6_K, MLX_A4)"
+                "{name} is {ty:?}, which no mat-vec of this backend runs ({})",
+                runs(|_| true).join(", ")
             ))
         })?;
         Ok(Site {
@@ -386,6 +388,26 @@ struct SharedShapes {
 
 fn count(n: usize) -> u64 {
     u64::try_from(n).expect("a count fits u64")
+}
+
+/// The file types of the mat-vec families `has` admits, in [`Quant::ALL`]'s
+/// order, named as a refusal prints them.
+fn runs(has: fn(Quant) -> bool) -> Vec<String> {
+    Quant::ALL
+        .into_iter()
+        .filter(|&q| has(q))
+        .map(|q| q.ggml().to_string().to_ascii_uppercase())
+        .collect()
+}
+
+/// [`runs`] as "A, B or C": the words a site's refusal names its types in.
+fn reading(has: fn(Quant) -> bool) -> String {
+    let names = runs(has);
+    match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    }
 }
 
 impl Outcome {
@@ -769,23 +791,25 @@ fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> 
     let embed = at
         .ok(t.site(&names::token_embd(), hidden, vocab))
         .filter(|s| {
-            let fits = matches!(s.quant, Quant::Q4K | Quant::A4);
+            let fits = s.quant.embeds();
             if !fits {
                 at.push(refuse(format!(
-                    "{} is {:?}; the embedding reads Q4_K or MLX_A4",
+                    "{} is {:?}; the embedding reads {}",
                     names::token_embd(),
-                    s.quant
+                    s.quant,
+                    reading(Quant::embeds)
                 )));
             }
             fits
         });
     let head = at.ok(t.site(&names::output(), hidden, vocab)).filter(|s| {
-        let fits = matches!(s.quant, Quant::Q6K | Quant::A4);
+        let fits = s.quant.heads();
         if !fits {
             at.push(refuse(format!(
-                "{} is {:?}; the head reads Q6_K or MLX_A4",
+                "{} is {:?}; the head reads {}",
                 names::output(),
-                s.quant
+                s.quant,
+                reading(Quant::heads)
             )));
         }
         fits
@@ -835,7 +859,7 @@ fn p1_checks(
             at_row.push(next);
             next += s.rows;
         }
-        for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
+        for quant in Quant::ALL {
             let members: Vec<usize> = (0..sites.len())
                 .filter(|&i| sites[i].quant == quant)
                 .collect();
@@ -903,11 +927,13 @@ fn delta_checks(
         hidden,
     );
     let out = at.ok(t.site(&d.ssm_out, z_len, hidden)).filter(|s| {
-        let fits = matches!(s.quant, Quant::Q4K | Quant::A4);
+        let fits = s.quant.headnorms();
         if !fits {
             at.push(refuse(format!(
-                "{} is {:?}; the head-norm projection reads Q4_K or MLX_A4",
-                d.ssm_out, s.quant
+                "{} is {:?}; the head-norm projection reads {}",
+                d.ssm_out,
+                s.quant,
+                reading(Quant::headnorms)
             )));
         }
         fits
@@ -1749,24 +1775,162 @@ mod tests {
 
     #[test]
     fn a_site_type_no_mat_vec_runs_is_the_chain_words_and_the_opens_first() {
-        let t = Synthetic::new().ty("blk.0.attn_qkv.weight", GgmlType::Q8_0);
+        let t = Synthetic::new().ty("blk.0.attn_qkv.weight", GgmlType::Q3_K);
         let split = t.split();
         let got = texts(&split, CTX);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0], old_plan_error(&split));
         assert_eq!(
             got[0],
-            "qwen35moe session: the plan: qwen35moe session: blk.0.attn_qkv.weight is q8_0 in the \
-             file; this site launches Q4_K, Q6_K, MLX_A4"
+            "qwen35moe session: the plan: qwen35moe session: blk.0.attn_qkv.weight is q3_K in the \
+             file; this site launches Q4_K, Q6_K, MLX_A4, Q8_0, Q5_K"
+        );
+    }
+
+    /// `t` with each of `names` retyped to `ty`.
+    fn retyped(mut t: Synthetic, names: &[&str], ty: GgmlType) -> Synthetic {
+        for name in names {
+            t = t.ty(name, ty);
+        }
+        t
+    }
+
+    /// The tensors of the two-layer table that a mat-vec, the embedding, the
+    /// head or the head-norm projection reads, and no routed stack or shared
+    /// expert: the sites a UD file holds in Q8_0 beside its stacks.
+    const DENSE: [&str; 11] = [
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.ssm_beta.weight",
+        "blk.0.ssm_alpha.weight",
+        "blk.0.ssm_out.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+    ];
+
+    /// Q8_0 at the embedding, the head, both layers' P1 (one dispatch each),
+    /// the delta layer's head-norm projection and the attention layer's out.
+    #[test]
+    fn q8_0_sites_open_at_every_dense_site() {
+        let t = retyped(Synthetic::new(), &DENSE, GgmlType::Q8_0);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let layout = out.checked.expect("a checked file").layout;
+        assert_eq!(layout.embed.quant, Quant::Q8_0);
+        assert_eq!(layout.head.quant, Quant::Q8_0);
+        let [delta, attention] = &layout.layers[..] else {
+            panic!("two layers");
+        };
+        let MixerLayout::Delta(d) = &delta.mixer else {
+            panic!("layer 0 is a delta layer");
+        };
+        assert_eq!(d.out.quant, Quant::Q8_0);
+        let quants: Vec<Quant> = d.p1.dispatches.iter().map(|x| x.quant).collect();
+        assert_eq!(quants, [Quant::Q8_0]);
+        assert_eq!(d.p1.dispatches[0].members, [0, 1, 2, 3]);
+        let MixerLayout::Attention(a) = &attention.mixer else {
+            panic!("layer 1 is an attention layer");
+        };
+        assert_eq!(a.out.quant, Quant::Q8_0);
+        let quants: Vec<Quant> = a.p1.dispatches.iter().map(|x| x.quant).collect();
+        assert_eq!(quants, [Quant::Q8_0]);
+    }
+
+    /// The same sites in Q5_K.
+    #[test]
+    fn q5_k_sites_open_at_every_dense_site() {
+        let t = retyped(Synthetic::new(), &DENSE, GgmlType::Q5_K);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let layout = out.checked.expect("a checked file").layout;
+        assert_eq!(layout.embed.quant, Quant::Q5K);
+        assert_eq!(layout.head.quant, Quant::Q5K);
+    }
+
+    /// The routed stacks and the shared expert in Q8_0 and Q5_K: the pair
+    /// reads one type and the fold one, the shared expert in each its
+    /// stack's.
+    #[test]
+    fn q8_0_and_q5_k_stacks_open_with_a_shared_expert_of_their_type() {
+        for (gate_up, down) in [
+            (GgmlType::Q8_0, GgmlType::Q8_0),
+            (GgmlType::Q5_K, GgmlType::Q5_K),
+            (GgmlType::Q4_K, GgmlType::Q5_K),
+        ] {
+            let mut t = Synthetic::new();
+            for l in 0..2 {
+                t = retyped(
+                    t,
+                    &[
+                        &format!("blk.{l}.ffn_gate_exps.weight"),
+                        &format!("blk.{l}.ffn_up_exps.weight"),
+                        &format!("blk.{l}.ffn_gate_shexp.weight"),
+                        &format!("blk.{l}.ffn_up_shexp.weight"),
+                    ],
+                    gate_up,
+                );
+                t = retyped(
+                    t,
+                    &[
+                        &format!("blk.{l}.ffn_down_exps.weight"),
+                        &format!("blk.{l}.ffn_down_shexp.weight"),
+                    ],
+                    down,
+                );
+            }
+            let out = check(&t.split(), CTX);
+            assert!(
+                out.items.is_empty(),
+                "{gate_up:?} {down:?}: {:?}",
+                out.items
+            );
+            let layout = out.checked.expect("a checked file").layout;
+            for layer in &layout.layers {
+                assert_eq!(layer.ffn.gate_up_quant.ggml(), gate_up);
+                assert_eq!(layer.ffn.down_quant.ggml(), down);
+            }
+        }
+    }
+
+    /// A P1 of tensors of several types is one dispatch a type, in the
+    /// order of [`Quant::ALL`] whatever order the tensors are in.
+    #[test]
+    fn a_p1_of_several_types_is_one_dispatch_a_type_in_the_kernels_order() {
+        let t = Synthetic::new()
+            .ty("blk.1.attn_q.weight", GgmlType::Q8_0)
+            .ty("blk.1.attn_k.weight", GgmlType::Q5_K)
+            .ty("blk.1.attn_v.weight", GgmlType::Q6_K);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let layout = out.checked.expect("a checked file").layout;
+        let MixerLayout::Attention(a) = &layout.layers[1].mixer else {
+            panic!("layer 1 is an attention layer");
+        };
+        let got: Vec<(Quant, &[usize])> =
+            a.p1.dispatches
+                .iter()
+                .map(|d| (d.quant, d.members.as_slice()))
+                .collect();
+        assert_eq!(
+            got,
+            [
+                (Quant::Q6K, &[2usize][..]),
+                (Quant::Q8_0, &[0][..]),
+                (Quant::Q5K, &[1][..]),
+            ]
         );
     }
 
     #[test]
     fn every_site_of_a_half_the_lists_refuse_is_an_item_in_the_readers_order() {
         let t = Synthetic::new()
-            .ty("blk.0.attn_qkv.weight", GgmlType::Q8_0)
-            .ty("blk.0.ssm_beta.weight", GgmlType::F32)
-            .ty("blk.0.attn_gate.weight", GgmlType::Q5_K);
+            .ty("blk.0.attn_qkv.weight", GgmlType::Q3_K)
+            .ty("blk.0.ssm_beta.weight", GgmlType::BF16)
+            .ty("blk.0.attn_gate.weight", GgmlType::Q5_0);
         let split = t.split();
         let got = texts(&split, CTX);
         assert_eq!(got[0], old_plan_error(&split));
@@ -1796,9 +1960,9 @@ mod tests {
     #[test]
     fn the_shared_parts_and_the_stacks_of_an_ffn_are_listed_in_the_readers_order() {
         let t = Synthetic::new()
-            .ty("blk.1.ffn_down_shexp.weight", GgmlType::Q8_0)
-            .ty("blk.1.ffn_down_exps.weight", GgmlType::Q5_K)
-            .ty("blk.1.ffn_gate_shexp.weight", GgmlType::Q8_0);
+            .ty("blk.1.ffn_down_shexp.weight", GgmlType::Q3_K)
+            .ty("blk.1.ffn_down_exps.weight", GgmlType::Q5_0)
+            .ty("blk.1.ffn_gate_shexp.weight", GgmlType::Q3_K);
         let split = t.split();
         let got = texts(&split, CTX);
         assert_eq!(got[0], old_plan_error(&split));
@@ -1885,7 +2049,10 @@ mod tests {
         );
         assert_eq!(
             got,
-            ["qwen35moe arena: token_embd.weight is Q6K; the embedding reads Q4_K or MLX_A4"]
+            [
+                "qwen35moe arena: token_embd.weight is Q6K; the embedding reads Q4_K, MLX_A4, \
+                 Q8_0 or Q5_K"
+            ]
         );
         let got = texts(
             &Synthetic::new().ty("output.weight", GgmlType::Q4_K).split(),
@@ -1893,7 +2060,10 @@ mod tests {
         );
         assert_eq!(
             got,
-            ["qwen35moe arena: output.weight is Q4K; the head reads Q6_K or MLX_A4"]
+            [
+                "qwen35moe arena: output.weight is Q4K; the head reads Q6_K, MLX_A4, Q8_0 or \
+                 Q5_K"
+            ]
         );
     }
 
@@ -1967,7 +2137,7 @@ mod tests {
     fn two_faults_give_both_the_plans_before_the_arenas() {
         let t = Synthetic::new()
             .ty("output.weight", GgmlType::Q4_K)
-            .ty("blk.0.attn_qkv.weight", GgmlType::Q8_0);
+            .ty("blk.0.attn_qkv.weight", GgmlType::Q3_K);
         let split = t.split();
         let got = texts(&split, CTX);
         assert_eq!(got.len(), 2, "{got:?}");
@@ -1982,8 +2152,8 @@ mod tests {
     fn a_refused_layer_does_not_hide_the_next_and_the_first_is_the_opens() {
         // Layer 0's FFN, then layer 1's mixer: the order `layer_plans` reads.
         let t = Synthetic::new()
-            .ty("blk.1.attn_q.weight", GgmlType::Q8_0)
-            .ty("blk.0.ffn_down_exps.weight", GgmlType::Q5_K);
+            .ty("blk.1.attn_q.weight", GgmlType::Q3_K)
+            .ty("blk.0.ffn_down_exps.weight", GgmlType::Q3_K);
         let split = t.split();
         let out = check(&split, CTX);
         let layers: Vec<Option<usize>> = out.items.iter().map(|i| i.layer).collect();
@@ -1997,8 +2167,8 @@ mod tests {
         // Every layer refused sets none of the facts the layers share; the
         // plan does not add a refusal of its own for that.
         let t = Synthetic::new()
-            .ty("blk.0.attn_qkv.weight", GgmlType::Q8_0)
-            .ty("blk.1.attn_q.weight", GgmlType::Q8_0);
+            .ty("blk.0.attn_qkv.weight", GgmlType::Q3_K)
+            .ty("blk.1.attn_q.weight", GgmlType::Q3_K);
         let got = texts(&t.split(), CTX);
         assert!(
             got.iter()

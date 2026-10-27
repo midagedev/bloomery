@@ -6,12 +6,13 @@
 //! The token encoder is the caller: the e2e gate holds what one token
 //! encodes to this count.
 
+use core::num::NonZeroU32;
+
 /// One layer of the token.
 ///
-/// `qkv` and `v` are the projection that is P1. [`Projection::Q6`] is that
-/// projection splitting into two dispatches in one group (`qkv` on a delta
-/// layer, `v` on an attention layer). It is not a quant of the layer's
-/// other tensors.
+/// `qkv` and `v` are the projection that is P1: one dispatch for each weight
+/// type its tensors hold, all in one group (`qkv` on a delta layer, `v` on
+/// an attention layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
@@ -20,13 +21,32 @@ pub enum Layer {
     Attention { v: Projection },
 }
 
-/// Whether P1 is one dispatch or two in one group.
+/// How many dispatches P1 is, in one group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Projection {
+pub struct Projection(NonZeroU32);
+
+impl Projection {
     /// P1 is one dispatch.
-    Q4,
+    pub const ONE: Projection = Projection(NonZeroU32::MIN);
+
     /// P1 is two dispatches in one group.
-    Q6,
+    pub const TWO: Projection = Projection(NonZeroU32::new(2).expect("2 is not zero"));
+
+    /// P1 as `dispatches` dispatches in one group; `None` for none or a
+    /// count that does not fit `u32`.
+    #[must_use]
+    pub fn of(dispatches: usize) -> Option<Projection> {
+        u32::try_from(dispatches)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .map(Projection)
+    }
+
+    /// The dispatches of P1.
+    #[must_use]
+    pub const fn dispatches(self) -> u32 {
+        self.0.get()
+    }
 }
 
 /// Whether the live keys are past 64.
@@ -67,25 +87,23 @@ pub struct TokenCount {
 /// mixer, its out, the router, the gate-up and the down. Those six already
 /// include the flash — the attention's fold runs inside it, so past the
 /// segment rule's waterline the count is the same — and the FFN norm, which
-/// the router and the gate-up each apply as they load the residual. A Q6
-/// projection adds one dispatch. An unfolded ticket adds one group for each
-/// layer's router and one for the head. A count that does not fit `u32`
-/// panics by name.
+/// the router and the gate-up each apply as they load the residual. A
+/// projection of more than one dispatch adds the rest. An unfolded ticket
+/// adds one group for each layer's router and one for the head. A count that
+/// does not fit `u32` panics by name.
 pub fn token_count(layers: &[Layer], _live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut n = 0u32;
-    let mut n_q6 = 0u32;
+    let mut n_split = 0u32;
     for layer in layers {
         n = fit("layer", n.checked_add(1));
-        let q6 = match layer {
-            Layer::Delta { qkv } => matches!(qkv, Projection::Q6),
-            Layer::Attention { v } => matches!(v, Projection::Q6),
+        let p1 = match layer {
+            Layer::Delta { qkv } => qkv,
+            Layer::Attention { v } => v,
         };
-        if q6 {
-            n_q6 = fit("Q6", n_q6.checked_add(1));
-        }
+        n_split = fit("P1", n_split.checked_add(p1.dispatches() - 1));
     }
     let mut groups = fit("group", 2u32.checked_add(fit("group", 6u32.checked_mul(n))));
-    let mut dispatches = fit("dispatch", groups.checked_add(n_q6));
+    let mut dispatches = fit("dispatch", groups.checked_add(n_split));
     if matches!(ticket, Ticket::Unfolded) {
         let extra = fit("group", n.checked_add(1));
         groups = fit("group", groups.checked_add(extra));
@@ -200,31 +218,32 @@ mod tests {
     fn fixture() -> [Layer; 4] {
         [
             Layer::Delta {
-                qkv: Projection::Q4,
+                qkv: Projection::ONE,
             },
-            Layer::Attention { v: Projection::Q4 },
+            Layer::Attention { v: Projection::ONE },
             Layer::Delta {
-                qkv: Projection::Q6,
+                qkv: Projection::TWO,
             },
-            Layer::Attention { v: Projection::Q6 },
+            Layer::Attention { v: Projection::TWO },
         ]
     }
 
-    /// 16 delta Q4, 14 delta Q6, 4 attention Q4, 6 attention Q6.
+    /// 16 delta layers of one P1 dispatch, 14 of two, 4 attention layers of one,
+    /// 6 of two.
     fn target() -> [Layer; 40] {
         let mut layers = [Layer::Delta {
-            qkv: Projection::Q4,
+            qkv: Projection::ONE,
         }; 40];
         for layer in &mut layers[16..30] {
             *layer = Layer::Delta {
-                qkv: Projection::Q6,
+                qkv: Projection::TWO,
             };
         }
         for layer in &mut layers[30..34] {
-            *layer = Layer::Attention { v: Projection::Q4 };
+            *layer = Layer::Attention { v: Projection::ONE };
         }
         for layer in &mut layers[34..40] {
-            *layer = Layer::Attention { v: Projection::Q6 };
+            *layer = Layer::Attention { v: Projection::TWO };
         }
         layers
     }
@@ -315,16 +334,17 @@ mod tests {
         );
     }
 
-    /// Qwen3-30B-A3B's 48 attention layers, `attn_v` at Q6 on the layers
-    /// the Q4_K_M rule (`use_more_bits`) raises: the first and the last
-    /// eighth, and every third layer between from the eighth on.
+    /// Qwen3-30B-A3B's 48 attention layers, `attn_v` at Q6_K (a second P1
+    /// dispatch) on the layers the Q4_K_M rule (`use_more_bits`) raises: the
+    /// first and the last eighth, and every third layer between from the
+    /// eighth on.
     fn q30_target() -> Vec<Layer> {
         (0..48)
             .map(|i| Layer::Attention {
                 v: if !(6..42).contains(&i) || (i - 6) % 3 == 2 {
-                    Projection::Q6
+                    Projection::TWO
                 } else {
-                    Projection::Q4
+                    Projection::ONE
                 },
             })
             .collect()

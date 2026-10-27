@@ -83,13 +83,9 @@ pub(super) struct P1 {
 }
 
 impl P1 {
-    /// The count's projection: one dispatch, or two in the group.
+    /// The count's projection: the dispatches of the group.
     fn projection(&self) -> Projection {
-        if self.parts.len() == 2 {
-            Projection::Q6
-        } else {
-            Projection::Q4
-        }
+        Projection::of(self.parts.len()).expect("a P1 holds at least one dispatch")
     }
 }
 
@@ -105,7 +101,7 @@ pub(super) struct DeltaBufs {
     pub(super) dt_bias: MetalBuffer<f32>,
     pub(super) ssm_a: MetalBuffer<f32>,
     pub(super) ssm_norm: MetalBuffer<f32>,
-    /// `ssm_out`: Q4_K or MLX_A4, the head-norm projection's two types.
+    /// `ssm_out`, in a type the head-norm projection reads.
     pub(super) out: MetalBuffer<u8>,
     /// The out projection's type: the head-norm launch reads it.
     pub(super) out_quant: Quant,
