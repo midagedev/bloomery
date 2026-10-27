@@ -132,7 +132,7 @@ crates/gpu/src/arch/hybrid.rs	nemotron	1	baseline O 1: own path: an alias row in
 crates/gpu/src/card_slots.rs	deepseek	24	PIN(2026-10-21) deepseek: baseline K 20 + 4, the four-slot entry `ds41_ffn_card_acc_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
 crates/gpu/src/dspark/head.rs	deepseek	3	baseline K 3: rename the kernel entries by what they compute (deferred)
 crates/gpu/src/host/handoff.rs	deepseek	37	PIN(2026-10-26) deepseek: the tier launcher uses a common F32 error context instead of selecting a family-named label per slot count; existing kernel entry symbols remain ABI-stable
-crates/hf/src/vocab.rs	qwen	4	PIN(2026-10-20) qwen: the qwen35 tokenizer pipeline name and regex; tokenizer programs are not yet described by ModelSpec
+crates/hf/src/vocab.rs	qwen	7	PIN(2026-10-28) qwen: the qwen35 tokenizer pipeline name and regex (4), and the qwen2 pre-tokenizer's regex macro, name and row (+3, Qwen3-30B-A3B's HF reading; the shape of minimax-m2's row); tokenizer programs are not yet described by ModelSpec
 crates/metal/src/bin/bloomery_serve_metal.rs	qwen	3	PIN(2026-10-23) qwen: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session by name until crates/metal/src/arch picks a session by the file's architecture string
 crates/metal/src/bin/generate_metal.rs	qwen	2	PIN(2026-10-23) qwen: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session by name until crates/metal/src/arch picks a session by the file's architecture string
 crates/metal/src/instance.rs	qwen	13	PIN(2026-10-27) qwen: Metal instance rows by program: the registry names each instance row (Qwen3.6-35B-A3B, Qwen3-30B-A3B) and its selection tests in common code until each architecture module registers its own rows
@@ -155,7 +155,6 @@ crates/model/src/arch/mod.rs	mimo	4	baseline A 5: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	nemotron	8	baseline A 10: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	qwen	16	baseline A 19: MK1a/MK1b ArchRow registry
 crates/model/src/bin/bloomery-decode.rs	deepseek	3	baseline R 4: MK1a one registry row per crate
-crates/model-hf/src/bin/prepare.rs	qwen	1	PIN(2026-10-20) qwen: the checkpoint architecture selected by the converter
 crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
 crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	flint	2	PIN(2026-10-23) flint: ModelSpec.arch names the reader by an enum variant and name arm until ModelSpec carries the registry's name

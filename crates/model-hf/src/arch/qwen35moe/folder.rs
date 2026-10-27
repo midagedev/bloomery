@@ -20,14 +20,6 @@ pub type Planned = crate::folder::Planned<Step>;
 /// How a planned tensor's bytes are made.
 pub type Make = crate::folder::Make<Step>;
 
-/// The folder as both readers take it.
-pub type Read = crate::folder::Read<Checkpoint>;
-
-/// [`crate::folder::read`] of the folder `dir` as qwen4exp's map reads it.
-pub fn read(dir: &Path, q8: bool) -> Result<Read, Error> {
-    crate::folder::read::<Checkpoint>(dir, q8)
-}
-
 /// [`crate::folder::plan_tensors`] of `entries` as qwen4exp's map reads them: the plan and the
 /// planned tensors.
 pub fn plan_tensors(

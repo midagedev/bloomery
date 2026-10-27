@@ -78,7 +78,7 @@
 //! own). A mark therefore reaches the pre-tokenizer as its own collapsed byte,
 //! and the letter run's optional prefix `[^\r\n\p{L}\p{N}]?` — which the
 //! regex leaves as qwen2's — takes one as readily as a space or an apostrophe.
-//! [`match_qwen35`] is that regex under ECMAScript semantics, written out by
+//! [`match_qwen`] is that regex under ECMAScript semantics, written out by
 //! hand, and [`split_qwen35`] its one pass over the fragment.
 //!
 //! A Hugging Face `tokenizer.json` runs the same regex with Oniguruma, where
@@ -316,61 +316,42 @@ fn match_tail(
     match_space(c, i, hi)
 }
 
-/// The `qwen35` regex at `i`: the first of its alternatives that matches,
-/// under ECMAScript semantics (alternatives in order, greedy quantifiers that
-/// back off). None of them can match the empty string, and a mark is a plain
-/// codepoint of its own class here: the regex runs on the collapsed bytes.
-/// `fold(k)` is the lowercase ASCII letter the codepoint at `k` matches in a
-/// contraction.
-fn match_qwen35(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> usize {
+/// The `qwen35` regex at `i` (`word` letters or marks, `other` [`is_other_qwen35`]) or the
+/// `qwen2` regex (`word` letters alone, `other` [`is_other`], the marks among its codepoints):
+/// the first of the alternatives that matches, under ECMAScript semantics (alternatives in order,
+/// greedy quantifiers that back off). None of them can match the empty string, and a mark is a
+/// plain codepoint of its own class here: the regex runs on the collapsed bytes. `fold(k)` is the
+/// lowercase ASCII letter the codepoint at `k` matches in a contraction.
+fn match_qwen(
+    c: &[u8],
+    i: usize,
+    hi: usize,
+    fold: impl Fn(usize) -> u8,
+    word: impl Fn(u8) -> bool + Copy,
+    other: impl Fn(u8) -> bool,
+) -> usize {
     // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
     let n = contraction(c, i, hi, fold);
     if n > 0 {
         return n;
     }
 
-    // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`: the prefix class takes a mark, a space or an
-    // apostrophe as readily as qwen2's does.
+    // `[^\r\n\p{L}\p{N}]?W+`, `W` the word class: the prefix class takes a mark, a space or an
+    // apostrophe as readily under either regex.
     let n = match_prefixed_word(
         c,
         i,
         hi,
         |x| !is_newline(x) && !is_letter(x) && !is_number(x),
-        is_letter_or_mark,
+        word,
     );
     if n > 0 {
         return n;
     }
 
-    // `\p{N}` (one number, however long the run), ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` and
+    // `\p{N}` (one number, however long the run), ` ?[^\s<word>\p{N}]+[\r\n]*` and
     // `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_tail(c, i, hi, 1, is_other_qwen35, is_newline)
-}
-
-/// The `qwen2` regex at `i`, as a regex engine runs it (the reference runs a hand-written
-/// splitter for it): [`match_qwen35`] with letters alone in the word run and the marks among the
-/// "other" run's codepoints. `fold(k)` is as there.
-fn match_qwen2(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> usize {
-    // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
-    let n = contraction(c, i, hi, fold);
-    if n > 0 {
-        return n;
-    }
-
-    // `[^\r\n\p{L}\p{N}]?\p{L}+`
-    let n = match_prefixed_word(
-        c,
-        i,
-        hi,
-        |x| !is_newline(x) && !is_letter(x) && !is_number(x),
-        is_letter,
-    );
-    if n > 0 {
-        return n;
-    }
-
-    // `\p{N}`, ` ?[^\s\p{L}\p{N}]+[\r\n]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_tail(c, i, hi, 1, is_other, is_newline)
+    match_tail(c, i, hi, 1, other, is_newline)
 }
 
 /// Regex 3 at `i`: the first of its six alternatives that matches.
@@ -878,7 +859,14 @@ fn fold_at(cpts: &[u32], c: &[u8], k: usize, hf: bool) -> u8 {
 /// regex over the collapsed bytes.
 fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
-        match_qwen35(c, i, hi, |k| fold_at(cpts, c, k, hf))
+        match_qwen(
+            c,
+            i,
+            hi,
+            |k| fold_at(cpts, c, k, hf),
+            is_letter_or_mark,
+            is_other_qwen35,
+        )
     });
     &s.b
 }
@@ -887,7 +875,7 @@ fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
 /// as Hugging Face's.
 fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
-        match_qwen2(c, i, hi, |k| fold_at(cpts, c, k, true))
+        match_qwen(c, i, hi, |k| fold_at(cpts, c, k, true), is_letter, is_other)
     });
     &s.b
 }
