@@ -2151,7 +2151,7 @@ gate-decision-clef:
 # answer math by hand-computed cases (temperatures, buckets, the variants' softmax average, the rating scale), and the
 # policy (option order, prompt shape, refusals).
 gate-decision-lev:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --test lev -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --features safetensors --test lev -- --include-ignored --nocapture'
 # lev's oracle: the patched mainline server answering tools/ref/lev/{suite,edge}.jsonl on the lev file, its prompts' ids
 # and bodies into $BLOOMERY_DATA/lev/4b/ref (tools/ref/lev_ref.py; the server is built by tools/ref/build-lcpp-lev.sh,
 # the file fetched into /root/models/lev-4b/). A functional dump, no lease: the server runs through tools/gpu-gate.sh
