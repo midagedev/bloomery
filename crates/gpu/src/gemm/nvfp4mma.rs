@@ -937,7 +937,31 @@ unsafe fn mxfp8_cols_body(
 mod native {
     use super::*;
     use cuda_device::shared::cvta_generic_to_shared_u32;
-    use cuda_device::wmma::{ldmatrix_x2_shared_u32, ldmatrix_x4_shared_u32};
+    use cuda_device::wmma::ldmatrix_x4_shared_u32;
+
+    /// Fragments `n` and `n + 1` of half `h` of an activation stage `bp`, one
+    /// `ldmatrix` of four eight-row sets: lanes `8i .. 8i + 8` address
+    /// fragment `n + i / 2`'s chunk `2h + i % 2`, the sets the MMA's two
+    /// registers take.
+    ///
+    /// # Safety
+    /// Every lane of the warp calls it; `bp` is an activation stage after the
+    /// barrier that publishes it, `n + 1 < 8` and `h < HALVES`.
+    #[inline(always)]
+    unsafe fn b_pair(bp: *mut u32, n: usize, h: usize, lane: usize) -> [[u32; 2]; 2] {
+        let at = chunk(
+            (n + (lane >> 4)) * 8 + (lane & 7),
+            2 * h + ((lane >> 3) & 1),
+        );
+        // SAFETY: rows (n + lane / 16) * 8 + lane % 8 < 64 of the stage, at an aligned chunk of
+        // half h, each set eight aligned rows (this fn's contract).
+        let r = unsafe {
+            ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                bp.add(at).cast_const().cast::<u8>(),
+            ))
+        };
+        [[r[0], r[1]], [r[2], r[3]]]
+    }
 
     #[allow(
         clippy::too_many_arguments,
@@ -1203,20 +1227,15 @@ mod native {
                                 // The quad's fragments load before its MMAs, so their shared
                                 // waits overlap.
                                 let mut b = [[0u32; 2]; 4];
-                                for i in 0..4 {
+                                for p in 0..2 {
                                     ::cuda_device::thread::__unroll_config::<0>();
-                                    let n = 4 * q + i;
+                                    let n = 4 * q + 2 * p;
                                     if !$full && n >= nt {
                                         continue;
                                     }
-                                    let b_off = chunk(n * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
-                                    // SAFETY: the whole warp loads two sets of eight aligned rows within
-                                    // this activation stage.
-                                    b[i] = unsafe {
-                                        ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
-                                            bp.add(b_off).cast_const().cast::<u8>(),
-                                        ))
-                                    };
+                                    // SAFETY: the whole warp loads; n + 1 < 8 and h < HALVES in this
+                                    // published activation stage.
+                                    [b[2 * p], b[2 * p + 1]] = unsafe { b_pair(bp, n, h, lane) };
                                 }
                                 for i in 0..4 {
                                     ::cuda_device::thread::__unroll_config::<0>();
@@ -1420,19 +1439,15 @@ mod native {
                         let sb = unsafe { scale_quad(sp, g, wc) };
                         // The warp's fragments load before its MMAs, so their shared waits overlap.
                         let mut bs = [[0u32; 2]; 4];
-                        for n in 0..4 {
+                        for p in 0..2 {
                             ::cuda_device::thread::__unroll_config::<0>();
-                            let nn = 4 * wc + n;
+                            let nn = 4 * wc + 2 * p;
                             if !$full && nn >= nt {
                                 continue;
                             }
-                            let b_off = chunk(nn * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
-                            // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
-                            bs[n] = unsafe {
-                                ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
-                                    bp.add(b_off).cast_const().cast::<u8>(),
-                                ))
-                            };
+                            // SAFETY: the whole warp loads; nn + 1 < 8 and h < HALVES in this published
+                            // activation stage.
+                            [bs[2 * p], bs[2 * p + 1]] = unsafe { b_pair(bp, nn, h, lane) };
                         }
                         for n in 0..4 {
                             ::cuda_device::thread::__unroll_config::<0>();
