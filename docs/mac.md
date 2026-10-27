@@ -54,7 +54,7 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 | [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), Q4_K_M | runs on a build after 0.3.9, text only: its `mmproj` is not read. Release 0.3.9 refuses it: `qwen35moe arena: a vocabulary of 248144; the head reads 248320` |
 | [Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), Q4_K_M | not run on a Mac yet; it has Qwen3.6's shapes |
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M or an MLX 4-bit folder | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
-| [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct), an MLX 4-bit folder | runs on a build after 0.3.10, text only: it has Qwen3-30B-A3B's shapes (`qwen3moe`). A request with `tools` is refused, see the limits below |
+| [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct), an MLX 4-bit folder | runs on a build after 0.3.10, text only: it has Qwen3-30B-A3B's shapes (`qwen3moe`). Its XML tool calls parse into OpenAI `tool_calls` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `UD-Q4_K_XL` | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: its Q8_0, Q5_K and f32 tensors |
 
 The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights, and f32 at the delta layers' `ssm_alpha` and
@@ -132,9 +132,6 @@ flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused
   only its new messages. Any other prompt runs from position 0.
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
-- Qwen3-Coder's tool calls do not work yet: a chat request with `tools` is refused with HTTP 500, `chat template: |reject
-  takes no arguments`, because the template engine has no `reject` filter. A request without `tools` renders the
-  template and answers.
 - No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read), no speculative
   decoding.
 - On an M5 (Metal 4, GPU family 17 or newer) the device picks the neural accelerators' tensor-op GEMMs for prompts

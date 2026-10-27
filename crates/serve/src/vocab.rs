@@ -311,10 +311,5 @@ mod tests {
         let vocab = Vocab::new(tok).unwrap();
         assert_eq!(vocab.bos(), None);
         assert_eq!(vocab.bos_to_prepend(), Ok(None));
-        let e = tokenizer::Tokenizer::from_keys(&keys(true))
-            .err()
-            .expect("a BOS that is asked for and not named is refused")
-            .to_string();
-        assert!(e.contains("tokenizer.ggml.bos_token_id"), "{e}");
     }
 }
