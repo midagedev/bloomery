@@ -2200,18 +2200,13 @@ pub fn rows_refusals(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// The clauses of the row kernels, in gate order: the whole table, with the
 /// delta net's.
 pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
-    vec![
+    let mut clauses: Vec<(&'static str, ClauseRun<'a>)> = vec![
         ("delta_rows", Box::new(|| ctx.with(delta_rows))),
         ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
         ("delta_rows_snap", Box::new(|| ctx.with(delta_rows_snap))),
-        ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
-        ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
-        ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),
-        ("attn_prefill_nan", Box::new(|| ctx.with(attn_prefill_nan))),
-        ("norm_rows", Box::new(|| ctx.with(norm_rows))),
-        ("norm_rows_nan", Box::new(|| ctx.with(norm_rows_nan))),
-        ("rows_refusals", Box::new(|| ctx.with(rows_refusals))),
-    ]
+    ];
+    clauses.extend(shaped(ctx));
+    clauses
 }
 
 /// The clauses of the row kernels an instance whose layers are all attention
