@@ -1,5 +1,8 @@
+use models::{RouterNorm, Score};
+
+use crate::geom::{Geometry, KernelRefused, yes_no};
 use crate::geometry;
-use crate::instance::{HOST, Instance, REGISTERED};
+use crate::instance::{HOST, Instance};
 
 /// The routed rows, and the id of the shared expert. A shim: the build's host
 /// instance's router row (`Geometry::router`'s `experts`). Callers left: the
@@ -85,18 +88,44 @@ pub const fn logit_stride(rows: usize) -> usize {
     rows.div_ceil(4) * 4
 }
 
-/// The geometry the router kernel is written for, held for `inst`: the
+/// The geometry the router kernel is written for, held for `g`: the
 /// kernel's own `static_assert`s, stated where the host sizes its launch.
-const fn holds(inst: &Instance) {
-    let n_rows = rows(inst);
-    let k = inst.key.hidden as usize;
-    let shared = inst.key.moe.router.rule.gated as usize;
-    assert!(partials(inst) == n_rows * SPLIT);
-    assert!(groups(inst) * SIMD_GROUPS >= n_rows && (groups(inst) - 1) * SIMD_GROUPS < n_rows);
-    assert!(n_rows == inst.key.moe.router.experts as usize + shared && shared <= 1);
-    assert!(SIMD_WIDTH * float4s(k) * 4 == k / SPLIT);
-    assert!(SIMD_WIDTH * float4s(k) * SPLIT * 4 == k);
-    assert!(k.is_multiple_of(4 * THREADS));
+///
+/// # Errors
+///
+/// [`KernelRefused`] naming the axis the router cannot take.
+pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
+    // The rule the kernel computes: a softmax over the logits, no selection
+    // bias, the kept scores divided by their sum.
+    let rule = g.instance.key.moe.router.rule;
+    if !matches!(rule.score, Score::Softmax)
+        || rule.bias
+        || !matches!(rule.norm, RouterNorm::SelectedSum)
+    {
+        return Err(KernelRefused::new(
+            "router",
+            "router rule",
+            format_args!(
+                "{:?} scores, bias {}, norm {:?}",
+                rule.score,
+                yes_no(rule.bias),
+                rule.norm
+            ),
+            "Softmax scores, no bias, norm SelectedSum",
+        ));
+    }
+    let k = g.router.k;
+    // A lane loads float4s from one split of a row, and the norm's
+    // cooperative load covers the input with the threadgroup's lanes.
+    if !k.is_multiple_of(4 * SIMD_WIDTH * SPLIT) || !k.is_multiple_of(4 * THREADS) {
+        return Err(KernelRefused::new(
+            "router",
+            "hidden",
+            k,
+            "a multiple of 1024 (a float4 a lane over 256 threads)",
+        ));
+    }
+    Ok(())
 }
 
 const _: () = {
@@ -104,9 +133,4 @@ const _: () = {
     // load wants, and the width the mat-vec geometry owns too.
     assert!(THREADS == 256);
     assert!(SIMD_WIDTH == geometry::SIMD_WIDTH);
-    let mut i = 0;
-    while i < REGISTERED.len() {
-        holds(&REGISTERED[i]);
-        i += 1;
-    }
 };

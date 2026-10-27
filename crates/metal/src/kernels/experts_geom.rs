@@ -1,5 +1,6 @@
+use crate::geom::{Geometry, KernelRefused};
 use crate::geometry;
-use crate::instance::{HOST, Instance, REGISTERED};
+use crate::instance::{HOST, Instance};
 
 /// Slots in one launch of `inst`'s experts: its routed picks, and a gated
 /// shared expert's slot after them.
@@ -33,20 +34,23 @@ pub const SHARED_SLOT: usize = shared_slot(&HOST);
 /// kernel gates, their oracles and the probes.
 pub const EXPERT_K: usize = HOST.key.moe.expert_ff as usize;
 
-/// The geometry the experts' kernels are written for, held for `inst`: the
+/// The geometry the experts' kernels are written for, held for `g`: the
 /// fold maps every slot's blocks as one K', in the 256-value quants' blocks
 /// (A4's and Q8_0's folds walk their own counts).
-const fn holds(inst: &Instance) {
-    let k = inst.key.moe.expert_ff as usize;
-    assert!(k.is_multiple_of(geometry::BLOCK_VALUES));
-    assert!(shared_slot(inst) + inst.key.moe.router.rule.gated as usize == slots(inst));
+///
+/// # Errors
+///
+/// [`KernelRefused`] naming the axis the experts cannot take.
+pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
+    if !g.experts.k.is_multiple_of(geometry::BLOCK_VALUES) {
+        return Err(KernelRefused::new(
+            "experts",
+            "expert ff",
+            g.experts.k,
+            "a multiple of 256 (the fold maps whole blocks)",
+        ));
+    }
+    Ok(())
 }
 
-const _: () = {
-    assert!(geometry::BLOCK_VALUES == 256);
-    let mut i = 0;
-    while i < REGISTERED.len() {
-        holds(&REGISTERED[i]);
-        i += 1;
-    }
-};
+const _: () = assert!(geometry::BLOCK_VALUES == 256);

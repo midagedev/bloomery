@@ -717,9 +717,9 @@ pub struct Passed {
 impl Session {
     /// The instance the file at `path` selects by its shape: the library a
     /// session of it with a cache of `ctx` rows opens on. The open's own
-    /// check decides it, so a shape no instance is built for, and every
-    /// other refusal the open would meet first, is refused by name before
-    /// a device opens.
+    /// check decides it, so a geometry no kernel takes, and every other
+    /// refusal the open would meet first, is refused by name before a device
+    /// opens.
     pub fn instance_of(path: &Path, ctx: usize) -> Result<&'static Instance, SessionError> {
         let split = Split::open(path)
             .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
@@ -756,8 +756,9 @@ impl Session {
     /// Every buffer is made and the residency set committed here, once: a
     /// refusal is a named error and leaves the set as it was, and no pass
     /// allocates or builds a pipeline but the first marked pass of a session
-    /// opened [`MarkCopies::OnFirstMark`]. A file whose shape selects no
-    /// instance, or another than `library`'s, is refused by name.
+    /// opened [`MarkCopies::OnFirstMark`]. A file whose geometry some kernel
+    /// cannot take, or whose instance is another than `library`'s, is refused
+    /// by name.
     pub fn open_as(
         device: &MetalDevice,
         library: &Library,
@@ -781,10 +782,10 @@ impl Session {
         // launches at the library's: one instance, or the open is refused.
         if checked.geom != *kernels.geom() {
             return Err(refuse(format!(
-                "{}: the file is instance {}, the library is built for {}",
+                "{}: the file is {}, the library is built for {}",
                 path.display(),
-                checked.instance.name,
-                library.instance().name
+                checked.instance,
+                library.instance()
             )));
         }
         let plans = checked.plans;

@@ -628,9 +628,10 @@ fn read(
     };
     *summary = Some(summarize(split, &spec));
     // The library a session of the file runs on: the instance its shape
-    // selects, a shape no instance is built for refused by name. The arena's
-    // rules below are judged at the instance's launch geometry, so a shape
-    // with no instance has none of them: its plans are read, and no more.
+    // selects (a registered one, or one made at open), a geometry no kernel
+    // takes refused by name. The arena's rules below are judged at the
+    // instance's launch geometry, so a shape with no instance has none of
+    // them: its plans are read, and no more.
     let inst = At {
         items: &mut *items,
         layer: None,
@@ -1813,17 +1814,43 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_no_instance_is_built_for_is_the_opens_first_item() {
-        let t = Synthetic::new().kv("qwen35moe.expert_used_count", Value::U32(6));
+    fn a_geometry_no_kernel_takes_is_the_opens_first_item() {
+        // An expert width the fold's blocks do not divide.
+        let t = Synthetic::new().kv("qwen35moe.expert_feed_forward_length", Value::U32(700));
         let split = t.split();
         let got = texts(&split, CTX);
         assert!(
             got.first().is_some_and(|e| e
                 .starts_with("qwen35moe session: synthetic.gguf: no instance is built for ")
-                && e.contains("top 6")),
+                && e.contains("expert ff 700")
+                && e.ends_with(
+                    "experts: expert ff is 700; it must be a multiple of 256 \
+                     (the fold maps whole blocks)"
+                )),
             "{got:?}"
         );
         assert!(check(&split, CTX).checked.is_none());
+    }
+
+    /// A shape no row registers, whose geometry every kernel takes, is judged
+    /// at an instance made for it: its arena and launches are sized by that
+    /// geometry, and the file's weights are its tensors byte for byte.
+    #[test]
+    fn a_geometry_no_row_registers_is_judged_at_its_own_instance() {
+        let mut inst = instance::QWEN35MOE_A3B;
+        inst.key.hidden = 3072;
+        inst.key.moe.expert_ff = 1024;
+        let t = Synthetic::of(&inst);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let checked = out.checked.expect("a checked file");
+        assert_eq!(checked.instance.name, instance::UNREGISTERED);
+        assert_eq!(checked.instance.key, inst.key, "the instance");
+        assert_eq!(checked.geom, Geometry::of(checked.instance), "the geometry");
+        assert_eq!(checked.geom.hidden, 3072);
+        assert_eq!(checked.geom.experts.k, 1024);
+        let bytes = checked.bytes().expect("the bytes");
+        assert_eq!(bytes.weights.requested, t.tensor_bytes(), "the weights");
     }
 
     #[test]

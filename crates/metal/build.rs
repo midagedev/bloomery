@@ -2,22 +2,28 @@
 //! instance, and its metallib when the Metal Toolchain is installed.
 //!
 //! An instance (`src/instance.rs`, a row of `REGISTERED`) is the axes one
-//! translation unit is compiled at. For each, these land in `OUT_DIR`:
+//! translation unit is compiled at. The header in front of the kernels'
+//! files (the fault site's table and the instance's geometry) is written by
+//! `src/kernels/header.rs`, the file the runtime writes the same header with
+//! at open. In `OUT_DIR` land the two bodies, the part no instance changes:
 //!
-//! - `<name>.metal`: the kernels' source with the fault site's table, from
-//!   `bloomery-device`'s table (the one owner of the codes), and the
-//!   instance's geometry written in front of it. It is embedded and compiled
-//!   by the runtime when no metallib exists.
+//! - `main_body.metal`: the kernels' files joined.
+//! - `tensor_body.metal`: the tensor-op GEMMs' files joined.
+//!
+//! And for each instance:
+//!
+//! - `<name>.metal`: the header, then `main_body.metal`. It is embedded and
+//!   compiled by the runtime when no metallib exists.
 //! - `<name>.metallib`: the same source compiled by `xcrun metal`, when the
 //!   Metal Toolchain is installed. Its presence is the `metal_lib` cfg, and
 //!   the runtime loads it instead of the source.
-//! - `<name>_tensor.metal`: the tensor-op GEMMs' source, the same header in
-//!   front of the files it reads, which the runtime compiles at Metal 4 on a
-//!   GPU that takes them (`library.rs`).
+//! - `<name>_tensor.metal`: the header, then `tensor_body.metal`, which the
+//!   runtime compiles at Metal 4 on a GPU that takes them (`library.rs`).
 //!
 //! And the two tables `library.rs` includes as expressions: `built.rs`, every
 //! instance's name and embedded sources, and `metallibs.rs`, each instance's
-//! metallib when the toolchain is there.
+//! metallib when the toolchain is there. A registered instance whose geometry
+//! some kernel cannot take ends the build by name.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -86,134 +92,14 @@ mod geom {
     include!("src/kernels/geom.rs");
 }
 
-/// The fault site's table, written as the Metal compiler sees it.
-fn fault_sites_header() -> String {
-    let mut out = String::from(
-        "// The fault site's codes, from the device contract's table\n\
-         // (bloomery-device). The contract owns the codes; this is their copy.\n",
-    );
-    for site in bloomery_device::fault::FaultSite::ALL {
-        out.push_str(&format!(
-            "#define BLOOMERY_FAULT_SITE_{} {}\n",
-            site.name().to_uppercase(),
-            *site as u32
-        ));
-    }
-    out.push_str(&format!(
-        "// The fault word's shape, from the same table.\n\
-         #define BLOOMERY_LAYER_NONE {}u\n\
-         #define BLOOMERY_FAULT_WORDS {}u\n\
-         // The word a raise stores: the layer above the site.\n\
-         #define BLOOMERY_FAULT_WORD(layer, site) (((layer) << {}) | (site))\n",
-        bloomery_device::fault::LAYER_NONE,
-        bloomery_device::fault::FAULT_WORDS,
-        bloomery_device::fault::LAYER_SHIFT
-    ));
-    out
-}
-
-/// The launch geometry of `inst`, written as the Metal compiler sees it.
-/// Every instance-derived number is a field of `inst`'s [`geom::Geometry`],
-/// the struct the host's launches read; the instance-free ones are the
-/// geometry files' constants.
-fn geometry_header(inst: &'static instance::Instance) -> String {
-    let g = geom::Geometry::of(inst);
-    format!(
-        "// The mat-vec launch geometry, from src/kernels/geometry.rs.\n\
-         #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {rows}\n\
-         #define BLOOMERY_MATVEC_MAX_SEGMENTS {segs}\n\
-         // The gated delta net's head geometry. The numbers live with the\n\
-         // mat-vec geometry; the delta step and the head-normed mat-vec read them.\n\
-         #define BLOOMERY_DELTA_VALUE_HEADS {heads}\n\
-         #define BLOOMERY_DELTA_HEAD_COLS {cols}\n\
-         #define BLOOMERY_DELTA_COLUMN_BLOCKS {blocks}\n\
-         #define BLOOMERY_DELTA_COLS_PER_BLOCK {per}\n\
-         // The conv ring, from src/kernels/delta_geom.rs.\n\
-         #define BLOOMERY_DELTA_RING_ROWS {ring}\n\
-         #define BLOOMERY_DELTA_SNAPS {snaps}\n\
-         // The router, from src/kernels/router_geom.rs.\n\
-         #define BLOOMERY_ROUTER_ROWS {rrows}\n\
-         #define BLOOMERY_ROUTER_EXPERTS {rexperts}\n\
-         #define BLOOMERY_ROUTER_K {rk}\n\
-         #define BLOOMERY_ROUTER_SPLIT {rsplit}\n\
-         #define BLOOMERY_ROUTER_SG {rsg}\n\
-         #define BLOOMERY_ROUTER_FLOAT4S {rfloat4}\n\
-         #define BLOOMERY_ROUTER_TOPK_MAX {rtop}\n\
-         #define BLOOMERY_ROUTER_LANES {rlanes}\n\
-         #define BLOOMERY_ROUTER_SHARED {rshared}\n\
-         // The expert pair and the folded down, from src/kernels/experts_geom.rs.\n\
-         #define BLOOMERY_EXPERT_SLOTS {eslots}\n\
-         #define BLOOMERY_EXPERT_ROUTED {erouted}\n\
-         #define BLOOMERY_EXPERT_SHARED {eshared}\n\
-         #define BLOOMERY_EXPERT_K {ek}\n\
-         // Decode attention, from src/kernels/attention_geom.rs.\n\
-         #define BLOOMERY_ATTN_HEAD {ahead}\n\
-         #define BLOOMERY_ATTN_ROT {arot}\n\
-         #define BLOOMERY_ATTN_Q {aq}\n\
-         #define BLOOMERY_ATTN_KV {akv}\n\
-         #define BLOOMERY_ATTN_TILE {atile}\n\
-         #define BLOOMERY_ATTN_SG {asg}\n\
-         #define BLOOMERY_ATTN_HPT {ahpt}\n\
-         #define BLOOMERY_ATTN_GQA {agqa}\n\
-         #define BLOOMERY_ATTN_PARTIAL {apartial}\n\
-         #define BLOOMERY_ATTN_QG {aqg}\n\
-         #define BLOOMERY_ATTN_LANES {alanes}\n\
-         #define BLOOMERY_ATTN_THREADS {athreads}\n\
-         #define BLOOMERY_ATTN_LANE_DIMS {alanedims}\n\
-         #define BLOOMERY_ATTN_GATED {agated}\n\
-         #define BLOOMERY_ATTN_SEGMENT_CAP {asegcap}\n\
-         #define BLOOMERY_ATTN_PF_POSITIONS {apfpos}\n\
-         #define BLOOMERY_ATTN_PF_KEYS {apfkeys}\n\
-         #define BLOOMERY_ATTN_PF_PAD {apfpad}\n",
-        rows = geometry::ROWS_PER_SIMD_GROUP,
-        segs = geometry::MAX_SEGMENTS,
-        heads = g.delta.value_heads,
-        cols = g.delta.head_cols,
-        blocks = geometry::PARTIALS_PER_HEAD,
-        per = g.delta.head_cols / geometry::PARTIALS_PER_HEAD,
-        ring = g.delta.ring_rows,
-        snaps = delta_geom::SNAPS,
-        rrows = g.router.rows,
-        rexperts = g.router.experts,
-        rk = g.router.k,
-        rsplit = router_geom::SPLIT,
-        rsg = router_geom::SIMD_GROUPS,
-        rfloat4 = g.router.float4s,
-        rtop = g.router.top_k_max,
-        rlanes = router_geom::SIMD_WIDTH,
-        rshared = g.router.shared,
-        eslots = g.experts.slots,
-        erouted = g.experts.routed_ids,
-        eshared = g.experts.shared_slot,
-        ek = g.experts.k,
-        ahead = g.attn.head,
-        arot = g.attn.rot,
-        aq = g.attn.query_heads,
-        akv = g.attn.kv_heads,
-        atile = attention_geom::TILE,
-        asg = g.attn.simd_groups,
-        ahpt = attention_geom::HEADS_PER_SG,
-        agqa = g.attn.gqa,
-        apartial = g.attn.partial_elems,
-        aqg = g.attn.qg_stride,
-        alanes = attention_geom::SIMD_WIDTH,
-        athreads = g.attn.flash_threads,
-        alanedims = g.attn.lane_dims,
-        agated = u32::from(g.attn.gated),
-        asegcap = attention_geom::SEGMENT_CAP,
-        apfpos = attention_geom::PREFILL_POSITIONS,
-        apfkeys = attention_geom::PREFILL_KEYS,
-        apfpad = attention_geom::PREFILL_PAD,
-    )
-}
-
-/// The kernels' source: the table, then every kernel file in order.
-fn combined_source(header: &str, kernels: &[(&str, String)]) -> String {
-    let mut out = String::from(header);
-    for (name, source) in kernels {
-        out.push_str(&format!("\n// {name}\n{source}"));
-    }
-    out
+/// The program text of one geometry, from the file the runtime writes it
+/// with at open: the header in front of the kernels' files.
+#[allow(
+    dead_code,
+    reason = "the host module reads the header's parts; the build writes the whole program"
+)]
+mod header {
+    include!("src/kernels/header.rs");
 }
 
 /// Whether the Metal Toolchain is installed: `xcrun metal` answers.
@@ -282,6 +168,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/kernels/experts_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/attention_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/geom.rs");
+    println!("cargo:rerun-if-changed=src/kernels/header.rs");
     println!("cargo:rerun-if-changed=src/instance.rs");
     println!("cargo:rerun-if-changed=build.rs");
     // Installing the Metal Toolchain (or pointing at another one) changes
@@ -343,6 +230,13 @@ fn main() {
         )))
         .collect();
 
+    let main_body = header::files(&kernels);
+    let tensor_body = header::files(&tensor);
+    std::fs::write(out_dir.join("main_body.metal"), &main_body)
+        .expect("the kernels' body is written");
+    std::fs::write(out_dir.join("tensor_body.metal"), &tensor_body)
+        .expect("the tensor body is written");
+
     let toolchain = metal_toolchain();
     let mut built = String::from(
         "// Written by build.rs: every registered instance's embedded sources,\n\
@@ -359,12 +253,19 @@ fn main() {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
             "instance {stem:?}: a name is a file stem of lowercase letters, digits and _"
         );
-        let header = fault_sites_header() + &geometry_header(inst);
+        assert!(
+            stem != instance::UNREGISTERED,
+            "instance {stem:?}: the name is the one an instance made at open has"
+        );
+        let g = geom::Geometry::of(inst);
+        if let Err(why) = g.check() {
+            panic!("instance {stem:?}: {why}");
+        }
         let source_path = out_dir.join(format!("{stem}.metal"));
-        std::fs::write(&source_path, combined_source(&header, &kernels))
+        std::fs::write(&source_path, header::program(&g, &main_body))
             .expect("the source is written");
         let tensor_path = out_dir.join(format!("{stem}_tensor.metal"));
-        std::fs::write(&tensor_path, combined_source(&header, &tensor))
+        std::fs::write(&tensor_path, header::program(&g, &tensor_body))
             .expect("the tensor source is written");
         built.push_str(&format!(
             "    Built {{\n        name: {stem:?},\n        source: include_str!({:?}),\n        \

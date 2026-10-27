@@ -34,14 +34,20 @@ pub mod geom;
 /// `build.rs`.
 #[path = "kernels/geometry.rs"]
 pub mod geometry;
+/// The kernels' program text: the header of one geometry in front of the
+/// kernels' files, written by `build.rs` for every registered instance and by
+/// the runtime at open. Host text: every OS.
+#[path = "kernels/header.rs"]
+pub mod header;
 /// The kernels' instances: one per registered shape row, each the axes one
 /// translation unit of the kernels is compiled at (a router's experts, picks
 /// and hidden width, decode attention's head, rope and heads, the delta
 /// step's heads and columns, the experts' width). The router and flash rows
 /// are the shape table's (`models::shape`), the rows the CUDA bodies are
 /// built at. `build.rs` writes and compiles every registered instance; a
-/// file selects its instance by its shape and a shape no instance has is
-/// refused by name. Host arithmetic: every OS.
+/// file selects its instance by its shape, and a shape no row registers is
+/// compiled at open when every kernel takes its geometry, else refused by
+/// name. Host arithmetic: every OS.
 pub mod instance;
 /// The router's geometry, one file read by the launch (macOS) and by
 /// `build.rs`.
