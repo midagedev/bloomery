@@ -33,6 +33,16 @@ impl Fixture {
         })
     }
 
+    /// The vocabulary the fixture's head has: the rows of its `output.weight`.
+    pub fn output_rows(&self) -> Result<usize, String> {
+        let (_, t) = self.tensor("output.weight")?;
+        match t.dims[..] {
+            [_, rows] => usize::try_from(rows)
+                .map_err(|_| format!("output.weight has {rows} rows, past usize")),
+            _ => Err(format!("output.weight is {:?}, not a matrix", t.dims)),
+        }
+    }
+
     /// The tensor `name`: its shard and its info.
     fn tensor(&self, name: &str) -> Result<(usize, &gguf::TensorInfo), String> {
         self.split

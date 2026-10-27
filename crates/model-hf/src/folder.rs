@@ -400,6 +400,14 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
     (row.open)(dir, &config)
 }
 
+/// The model type of the folder `dir`'s `config.json`, which [`open`] picks its map by.
+pub fn model_type(dir: &Path) -> Result<String, Error> {
+    let config = read_config(dir)?;
+    model_type_of(&config)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: config.json names no model_type", dir.display()).into())
+}
+
 /// `config.json`'s model type: the top level's, else `text_config`'s.
 fn model_type_of(config: &Json) -> Option<&str> {
     config

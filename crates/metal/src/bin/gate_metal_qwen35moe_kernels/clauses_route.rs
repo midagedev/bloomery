@@ -2152,9 +2152,12 @@ pub fn table<'a>(
 
 /// The clauses of the instance whose gate runs the kernels its geometry
 /// shapes: the routing and the grouped experts of a router with no shared row
-/// and layers of one weight family (Q4_K, with a Q6_K down in some), without
-/// the head-norm scale of the delta net and the MLX family.
-pub fn shaped<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+/// and layers of one weight family (Q4_K, with a Q6_K down in some) beside the
+/// A4 family of its MLX fixture, without the head-norm scale of the delta net.
+pub fn shaped<'a>(
+    ctx: &'a super::ClauseCtx<'a>,
+    mlx: &'a Result<Fixture, String>,
+) -> Vec<(&'static str, super::ClauseRun<'a>)> {
     vec![
         ("gemm_f32w", Box::new(|| ctx.with(gemm_f32w))),
         (
@@ -2164,17 +2167,19 @@ pub fn shaped<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cl
         ("route_table", Box::new(|| ctx.with(route_table))),
         (
             "grouped_gemm",
-            Box::new(|| match ctx.fixture {
-                Ok(fixture) => grouped_gemm(ctx.harness, fixture, None),
-                Err(e) => Err(e.clone()),
+            Box::new(move || match (ctx.fixture, mlx) {
+                (Ok(fixture), Ok(a4)) => grouped_gemm(ctx.harness, fixture, Some(a4)),
+                (Err(e), _) => Err(e.clone()),
+                (_, Err(e)) => Err(format!("the A4 fixture: {e}")),
             }),
         ),
         ("grouped_q6_down", Box::new(|| ctx.with(grouped_q6_down))),
         (
             "grouped_oracle",
-            Box::new(|| match ctx.fixture {
-                Ok(fixture) => grouped_oracle(ctx.harness, fixture, None),
-                Err(e) => Err(e.clone()),
+            Box::new(move || match (ctx.fixture, mlx) {
+                (Ok(fixture), Ok(a4)) => grouped_oracle(ctx.harness, fixture, Some(a4)),
+                (Err(e), _) => Err(e.clone()),
+                (_, Err(e)) => Err(format!("the A4 fixture: {e}")),
             }),
         ),
         ("combine", Box::new(|| ctx.with(combine))),

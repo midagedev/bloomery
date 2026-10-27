@@ -1,8 +1,10 @@
 //! prepare — a Hugging Face checkpoint folder as a GGUF split the server opens as it opens any
 //! (`gguf::Split`). The folder's quantization config places each tensor in a format
 //! (`hf::quant_config`), the model's map names it, says how its role reads it and moves it into
-//! the program's layout (`model_hf::arch::qwen35moe::Checkpoint`, qwen4exp's reader), and one table writes each
-//! format as its GGUF type (`hf::modelopt::normalize`).
+//! the program's layout (`model_hf::arch::qwen35moe::Checkpoint`, qwen4exp's and Qwen3.6's reader,
+//! or `model_hf::arch::qwen3moe::Checkpoint`, Qwen3-MoE's), and one table writes each format as
+//! its GGUF type (`hf::modelopt::normalize`). The map is the one the config's `model_type` names,
+//! among the maps `model_hf::arch::with_split_map` reads.
 //!
 //!     prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]
 //!
@@ -44,7 +46,8 @@ use bloomery_levers::PREPARE_Q8;
 use gguf::Value;
 use gguf::write::{Layout, Writer};
 use hf::modelopt::{self, Normal, Use};
-use model_hf::arch::qwen35moe::folder::{self, Make, Planned};
+use model_hf::arch::{self, MapUse};
+use model_hf::folder::{self, FolderMap, Make, Planned};
 
 const USAGE: &str = concat!(
     "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]\n",
@@ -111,6 +114,45 @@ fn run(args: &[String], q8: bool) -> Res<()> {
             format!("--shard-gib {shard_gib}: not a shard size of 1 GiB or more in u64 bytes")
         })?;
     let dir = Path::new(dir);
+    let model_type = folder::model_type(dir)?;
+    arch::with_split_map(
+        &model_type,
+        WriteSplit {
+            dir,
+            prefix,
+            limit,
+            q8,
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "{}: model_type {model_type:?} has no split writer; prepare writes {:?}",
+            dir.display(),
+            arch::split_model_types()
+        )
+    })?
+}
+
+/// The split of a folder, written by whichever map reads it.
+struct WriteSplit<'a> {
+    dir: &'a Path,
+    prefix: &'a str,
+    /// The shard size limit in bytes.
+    limit: u64,
+    /// Whether a BF16 or F32 matrix is rewritten as Q8_0.
+    q8: bool,
+}
+
+impl MapUse for WriteSplit<'_> {
+    type Out = Res<()>;
+
+    fn with<M: FolderMap>(self) -> Res<()> {
+        write_as::<M>(self.dir, self.prefix, self.limit, self.q8)
+    }
+}
+
+/// The split of the folder `dir`, read by the map `M`, written at `prefix`.
+fn write_as<M: FolderMap>(dir: &Path, prefix: &str, limit: u64, q8: bool) -> Res<()> {
     let folder::Read {
         checkpoint,
         folder,
@@ -118,7 +160,7 @@ fn run(args: &[String], q8: bool) -> Res<()> {
         planned,
         kvs,
         ..
-    } = folder::read(dir, q8)?;
+    } = folder::read::<M>(dir, q8)?;
 
     let tensors = planned.len();
     let shards = plan_shards(planned, &kvs, limit)?;
@@ -192,8 +234,8 @@ fn run(args: &[String], q8: bool) -> Res<()> {
                     }
                     Make::Tensor(m) => {
                         let mut n: Normal = modelopt::normalize(get, &m.placed(&plan)?, m.role)?;
-                        for step in &m.steps {
-                            step.apply(&checkpoint.geometry, name, &mut n)?;
+                        if let Some(moves) = checkpoint.mover(name, &m.steps) {
+                            moves(&mut n)?;
                         }
                         if n.type_id != p.decl.type_id {
                             return Err(format!(
@@ -331,11 +373,11 @@ fn print_plan(dir: &Path) -> Res<()> {
     Ok(())
 }
 
-fn plan_shards(
-    planned: Vec<Planned>,
+fn plan_shards<S>(
+    planned: Vec<Planned<S>>,
     kvs: &[(String, Value)],
     limit: u64,
-) -> Res<Vec<(Vec<Planned>, Layout)>> {
+) -> Res<Vec<(Vec<Planned<S>>, Layout)>> {
     let tensors32 =
         i32::try_from(planned.len()).map_err(|_| "too many tensors for a GGUF split")?;
     let shard_keys = |no: u16, count: u16| {
@@ -347,7 +389,7 @@ fn plan_shards(
         ]);
         keys
     };
-    let mut shards: Vec<Vec<Planned>> = vec![vec![]];
+    let mut shards: Vec<Vec<Planned<S>>> = vec![vec![]];
     let mut pending = planned.into_iter().peekable();
     while let Some(p) = pending.next() {
         let mut group = vec![p];
@@ -878,6 +920,27 @@ mod tests {
         assert!(e.contains("/nonexistent-folder/config.json"), "{e}");
         let e = refused(&["a", "b", "--keep-bf16"], true);
         assert!(e.contains("--keep-bf16 keeps the BF16 matrices"), "{e}");
+    }
+
+    /// A folder whose `model_type` no writer reads is refused by name, with the types the writers
+    /// read.
+    #[test]
+    fn a_model_type_no_writer_reads_is_refused() {
+        use super::*;
+
+        let dir = split_dir("no-writer");
+        std::fs::write(dir.join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        let args = [
+            dir.display().to_string(),
+            dir.join("out").display().to_string(),
+        ];
+        let e = run(&args, false).unwrap_err().to_string();
+        assert!(
+            e.contains("model_type \"llama\" has no split writer"),
+            "{e}"
+        );
+        assert!(e.contains("qwen3_moe") && e.contains("qwen3_5_moe"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Serving's tokenizer, built from a Qwen3.8 folder's files as `prepare` builds it, encodes

@@ -25,6 +25,8 @@ use model::arch::names as common;
 use model::arch::qwen35moe::hparams::{MAX_PLE_HEADS, MAX_PLE_NGRAM};
 use model::arch::qwen35moe::names::{self, Sub};
 
+use super::section::Section;
+use super::trunk;
 use crate::folder::{FolderMap, Mapping, Origin, PlusOne, VocabSpec};
 
 pub mod folder;
@@ -36,6 +38,12 @@ pub enum Error {
     Config(String),
     #[error("qwen35moe hf: {name}: {what}")]
     Tensor { name: String, what: String },
+}
+
+impl From<String> for Error {
+    fn from(why: String) -> Error {
+        Error::Config(why)
+    }
 }
 
 fn refuse(name: &str, what: impl Into<String>) -> Error {
@@ -190,90 +198,28 @@ const ROOT_36: &Fields = &[
     ("image_token_id", Ignore(Type::Number, VISION)),
 ];
 
-/// `config.json`'s `text_config`, every family's keys. A setting the program computes with one
-/// value and GGUF has no key for is `Only` that value: another would be served as this one, and
-/// an absent one is it.
+/// `config.json`'s `text_config`, every family's keys beside [`trunk::KEYS`]. A setting the
+/// program computes with one value and GGUF has no key for is `Only` that value: another would
+/// be served as this one, and an absent one is it.
 const TEXT_SHARED: &Fields = &[
-    ("num_hidden_layers", Read),
-    ("max_position_embeddings", Read),
-    ("hidden_size", Read),
-    ("num_attention_heads", Read),
-    ("num_key_value_heads", Read),
-    ("num_experts", Read),
-    ("num_experts_per_tok", Read),
-    ("head_dim", Read),
-    ("moe_intermediate_size", Read),
     ("shared_expert_intermediate_size", Read),
     ("linear_conv_kernel_dim", Read),
     ("linear_key_head_dim", Read),
     ("linear_num_key_heads", Read),
     ("linear_num_value_heads", Read),
     ("linear_value_head_dim", Read),
-    ("rms_norm_eps", Read),
     ("layer_types", Read),
     ("rope_parameters", Read),
     ("partial_rotary_factor", Read),
-    // hf::vocab::Config's.
-    ("vocab_size", Read),
-    ("bos_token_id", Read),
-    ("eos_token_id", Read),
-    ("pad_token_id", Read),
-    ("unk_token_id", Read),
-    ("sep_token_id", Read),
-    // The routed and shared experts' SwiGLU.
-    ("hidden_act", Only(r#"["silu"]"#)),
-    ("attention_bias", Only("[false]")),
-    ("tie_word_embeddings", Only("[false]")),
     // Serving keeps the gated delta-rule state in F32.
     ("mamba_ssm_dtype", Only(r#"["float32"]"#)),
-    (
-        "dtype",
-        Ignore(
-            Type::String,
-            "the dtype HF loads in; each tensor keeps its stored dtype and format",
-        ),
-    ),
-    (
-        "attention_dropout",
-        Ignore(Type::Number, "dropout acts in training only"),
-    ),
-    (
-        "initializer_range",
-        Ignore(Type::Number, "initializes weights the checkpoint holds"),
-    ),
-    (
-        "router_aux_loss_coef",
-        Ignore(Type::Number, "weighs a training loss"),
-    ),
-    (
-        "output_router_logits",
-        Ignore(
-            Type::Bool,
-            "returns the router logits beside an unchanged output",
-        ),
-    ),
-    (
-        "use_cache",
-        Ignore(
-            Type::Bool,
-            "whether HF keeps its cache; outputs are the same",
-        ),
-    ),
     ("mtp_num_hidden_layers", Ignore(Type::Number, MTP)),
     ("mtp_use_dedicated_embeddings", Ignore(Type::Bool, MTP)),
 ];
 
-/// The counts of [`TEXT_SHARED`] every family reads: each a positive u32.
+/// The counts of [`TEXT_SHARED`] every family reads beside [`trunk::COUNTS`]: each a positive
+/// u32.
 const COUNTS: &[&str] = &[
-    "num_hidden_layers",
-    "max_position_embeddings",
-    "hidden_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "num_experts",
-    "num_experts_per_tok",
-    "head_dim",
-    "moe_intermediate_size",
     "shared_expert_intermediate_size",
     "linear_conv_kernel_dim",
     "linear_key_head_dim",
@@ -282,7 +228,7 @@ const COUNTS: &[&str] = &[
     "linear_value_head_dim",
 ];
 
-/// Qwen3.8's counts beside [`COUNTS`].
+/// Qwen3.8's counts beside [`COUNTS`] and [`trunk::COUNTS`].
 const COUNTS_38: &[&str] = &[
     "full_attention_interval",
     "hc_count",
@@ -434,52 +380,8 @@ fn attention_interval(full: &[bool]) -> Option<u32> {
         .and_then(|n| u32::try_from(n).ok())
 }
 
-struct Reader<'a> {
-    value: &'a Json,
-    path: &'a str,
-}
-
-impl<'a> Reader<'a> {
-    fn new(value: &'a Json, path: &'a str) -> Result<Self, Error> {
-        if !value.is_object() {
-            return Err(Error::Config(format!("{path} is not an object")));
-        }
-        Ok(Self { value, path })
-    }
-
-    fn field(&self, key: &str) -> Result<&'a Json, Error> {
-        self.value
-            .get(key)
-            .ok_or_else(|| self.bad(key, "is missing"))
-    }
-
-    fn bad(&self, key: &str, why: &str) -> Error {
-        Error::Config(format!("{}.{key} {why}", self.path))
-    }
-
-    fn count(&self, key: &str) -> Result<u32, Error> {
-        self.field(key)?
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n > 0)
-            .ok_or_else(|| self.bad(key, "must be a positive u32"))
-    }
-
-    fn number(&self, key: &str) -> Result<f32, Error> {
-        self.field(key)?
-            .as_f64()
-            .map(|n| n as f32)
-            .filter(|n| n.is_finite() && *n > 0.0)
-            .ok_or_else(|| self.bad(key, "must be a finite positive f32"))
-    }
-
-    fn array(&self, key: &str) -> Result<&'a [Json], Error> {
-        self.field(key)?
-            .as_array()
-            .map(Vec::as_slice)
-            .ok_or_else(|| self.bad(key, "is not an array"))
-    }
-}
+/// The reads of an object of `config.json`, refusals in this map's error.
+type Reader<'a> = Section<'a, Error>;
 
 impl Checkpoint {
     /// Read the fields this converter uses, and refuse by name a key the family's tables
@@ -501,11 +403,15 @@ impl Checkpoint {
         })?;
         schema::check(config, "config", &[ROOT_SHARED, family.root()]).map_err(Error::Config)?;
         let c = Reader::new(root.field("text_config")?, "text_config")?;
-        schema::check(c.value, "text_config", &[TEXT_SHARED, family.text_config()])
-            .map_err(Error::Config)?;
+        schema::check(
+            c.value,
+            "text_config",
+            &[TEXT_SHARED, trunk::KEYS, family.text_config()],
+        )
+        .map_err(Error::Config)?;
         let vocab = hf::vocab::Config::parse(config).map_err(|e| Error::Config(e.to_string()))?;
         let mut counts = BTreeMap::new();
-        for &field in COUNTS.iter().chain(family.counts()) {
+        for &field in trunk::COUNTS.iter().chain(COUNTS).chain(family.counts()) {
             counts.insert(field, c.count(field)?);
         }
         let n = |key: &str| counts[key];
@@ -529,12 +435,7 @@ impl Checkpoint {
                 "must group by linear_num_key_heads",
             ));
         }
-        if !n("num_attention_heads").is_multiple_of(n("num_key_value_heads")) {
-            return Err(c.bad("num_attention_heads", "must group by num_key_value_heads"));
-        }
-        if n("num_experts_per_tok") > n("num_experts") {
-            return Err(c.bad("num_experts_per_tok", "exceeds num_experts"));
-        }
+        trunk::check_counts(&c, n)?;
         let exp = match family {
             Family::Qwen38 => Some(Exp::of(&c, &counts)?),
             Family::Qwen36 => None,
@@ -626,41 +527,15 @@ impl Checkpoint {
             return Err(rope.bad("mrope_section", "must sum to half the rotary head width"));
         }
         sections.resize(4, Value::I32(0));
-        let mut metadata: Vec<(String, Value)> = vec![
-            ("block_count".into(), Value::U32(n("num_hidden_layers"))),
-            (
-                "context_length".into(),
-                Value::U32(n("max_position_embeddings")),
-            ),
-            ("embedding_length".into(), Value::U32(n("hidden_size"))),
-            (
-                "attention.head_count".into(),
-                Value::U32(n("num_attention_heads")),
-            ),
-            (
-                "attention.head_count_kv".into(),
-                Value::U32(n("num_key_value_heads")),
-            ),
+        let mut metadata =
+            trunk::metadata(n, rope.number("rope_theta")?, c.number("rms_norm_eps")?);
+        // The sections follow the head counts, before the rope's base: the order the split's keys
+        // have always been written in.
+        metadata.insert(
+            5,
             ("rope.dimension_sections".into(), Value::Array(sections)),
-            (
-                "rope.freq_base".into(),
-                Value::F32(rope.number("rope_theta")?),
-            ),
-            (
-                "attention.layer_norm_rms_epsilon".into(),
-                Value::F32(c.number("rms_norm_eps")?),
-            ),
-            ("expert_count".into(), Value::U32(n("num_experts"))),
-            (
-                "expert_used_count".into(),
-                Value::U32(n("num_experts_per_tok")),
-            ),
-            ("attention.key_length".into(), Value::U32(n("head_dim"))),
-            ("attention.value_length".into(), Value::U32(n("head_dim"))),
-            (
-                "expert_feed_forward_length".into(),
-                Value::U32(n("moe_intermediate_size")),
-            ),
+        );
+        metadata.extend([
             (
                 "expert_shared_feed_forward_length".into(),
                 Value::U32(n("shared_expert_intermediate_size")),
@@ -684,7 +559,7 @@ impl Checkpoint {
             ("ssm.inner_size".into(), Value::U32(inner)),
             ("full_attention_interval".into(), Value::U32(interval)),
             ("rope.dimension_count".into(), Value::U32(rotary as u32)),
-        ];
+        ]);
         if let Some(exp) = &exp {
             let ratios = full
                 .iter()
@@ -1126,14 +1001,7 @@ fn map<'a>(
     let mut join = Parts::new();
     for (name, shape) in tensors {
         let left_out = g.family.leaves_out(name, draft);
-        if !left_out
-            && (shape.is_empty()
-                || shape.contains(&0)
-                || shape
-                    .iter()
-                    .try_fold(1usize, |n, &d| n.checked_mul(d))
-                    .is_none())
-        {
+        if !left_out && !trunk::sized(shape) {
             return Err(refuse(
                 name,
                 format!("shape {shape:?} is empty, zero, or overflows usize"),
@@ -1207,18 +1075,11 @@ fn map<'a>(
             }
             _ => None,
         };
-        if short == "embed_tokens.weight" {
-            put(
-                names::token_embd(),
-                one(Use::Matrix(Plain::Q8_0), vec![], dims()),
-            )?;
-            continue;
-        }
-        if short == "norm.weight" && g.family == Family::Qwen36 {
-            put(
-                common::output_norm(),
-                one(Use::Matrix(Plain::F32), vec![], dims()),
-            )?;
+        // Qwen3.8's output norm is its hyper-connection mix, below.
+        if let Some((to, plain)) = trunk::global(short)
+            .filter(|_| g.family == Family::Qwen36 || short == "embed_tokens.weight")
+        {
+            put(to, one(Use::Matrix(plain), vec![], dims()))?;
             continue;
         }
         if let Some(rest) = short
@@ -1375,6 +1236,11 @@ fn map<'a>(
     Ok(out)
 }
 
+/// The name of Qwen3.6's feed-forward block norm, which the file calls the post-attention one.
+fn post_attention_norm(l: usize) -> String {
+    common::blk(l, "post_attention_norm.weight")
+}
+
 /// The tensors of `g`'s file made of `rest`, a tensor of layer `l` other than a Qwen3.8 routed
 /// expert or the PLE table.
 fn layer(
@@ -1435,24 +1301,12 @@ fn layer(
         }
         _ => {}
     }
-    if let Some(proj) = rest
-        .strip_prefix("mlp.switch_mlp.")
-        .filter(|_| g.family == Family::Qwen36)
+    // Qwen3.6's experts arrive stacked: one `[experts, rows, columns]` tensor a projection.
+    if g.family == Family::Qwen36
+        && let Some(stack) = trunk::stacked_experts(l, rest, shape, g.experts)
     {
-        // The experts arrive stacked: one `[experts, rows, columns]` tensor a projection.
-        let to = match proj {
-            "gate_proj.weight" => names::ffn_gate_exps(l),
-            "up_proj.weight" => names::ffn_up_exps(l),
-            "down_proj.weight" => names::ffn_down_exps(l),
-            _ => return Err(refuse(name, "not a routed expert projection")),
-        };
-        return match *shape {
-            [e, _, _] if e == g.experts => one(to, Plain::Q8_0, vec![]),
-            _ => Err(refuse(
-                name,
-                format!("{shape:?} is not [{} experts, rows, columns]", g.experts),
-            )),
-        };
+        let (to, plain) = stack.map_err(|why| refuse(name, why))?;
+        return one(to, plain, vec![]);
     }
     let (sub, hc) = if let Some(r) = rest.strip_prefix("attn_hyper_connection.").filter(|_| exp) {
         (Some(Sub::Attn), r)
@@ -1477,6 +1331,21 @@ fn layer(
     // `x + 1` already (mlx-lm's `sanitize` adds it only to a file whose conv taps are still HF's
     // `[channels, 1, kernel]`).
     let plus_one = || if exp { vec![Step::PlusOne] } else { vec![] };
+    if let Some((to, plain)) = trunk::attention(l, rest) {
+        // Only the per-head norms are F32 here, and they carry the `+ 1` an HF file lacks.
+        let steps = if plain == Plain::F32 {
+            plus_one()
+        } else {
+            vec![]
+        };
+        return one(to, plain, steps);
+    }
+    if let Some((to, plain)) = trunk::router(l, rest) {
+        return one(to, plain, vec![]);
+    }
+    if q36 && let Some((to, plain)) = trunk::block_norms(l, rest, post_attention_norm) {
+        return one(to, plain, vec![]);
+    }
     match rest {
         "linear_attn.in_proj_qkv.weight" => one(names::attn_qkv(l), Plain::Q8_0, v(qk, g.head_v)),
         "linear_attn.in_proj_z.weight" => one(names::attn_gate(l), Plain::Q8_0, v(0, g.head_v)),
@@ -1507,18 +1376,6 @@ fn layer(
             Plain::Q8_0,
             vec![Step::VCols { head: g.head_v }],
         ),
-        "input_layernorm.weight" if q36 => one(common::attn_norm(l), Plain::F32, vec![]),
-        "post_attention_layernorm.weight" if q36 => one(
-            common::blk(l, "post_attention_norm.weight"),
-            Plain::F32,
-            vec![],
-        ),
-        "self_attn.q_proj.weight" => one(names::attn_q(l), Plain::Q8_0, vec![]),
-        "self_attn.k_proj.weight" => one(names::attn_k(l), Plain::Q8_0, vec![]),
-        "self_attn.v_proj.weight" => one(names::attn_v(l), Plain::Q8_0, vec![]),
-        "self_attn.o_proj.weight" => one(names::attn_output(l), Plain::Q8_0, vec![]),
-        "self_attn.q_norm.weight" => one(names::attn_q_norm(l), Plain::F32, plus_one()),
-        "self_attn.k_norm.weight" => one(names::attn_k_norm(l), Plain::F32, plus_one()),
         "self_attn.indexer.q_layernorm.weight" if exp => {
             one(names::indexer_q_norm(l), Plain::F32, vec![Step::PlusOne])
         }
@@ -1547,7 +1404,6 @@ fn layer(
                 (names::indexer_k_proj(l), part(g.indexer_q..rows)),
             ])
         }
-        "mlp.gate.weight" => one(names::ffn_gate_inp(l), Plain::Bf16, vec![]),
         "mlp.shared_expert_gate.weight" => match *shape {
             [1, n] => Ok(vec![(
                 names::ffn_gate_inp_shexp(l),
@@ -1721,7 +1577,6 @@ impl Step {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
 
     use gguf::GgmlType;
     use hf::modelopt;
@@ -1729,6 +1584,10 @@ mod tests {
     use safetensors::Dtype;
 
     use super::*;
+    use crate::test_support::{
+        Entries, Stored, bf16_tensor, entries, fixture, gguf_tensors, json, key_json, mlx_linear,
+        write_folder,
+    };
 
     /// The next-token layers, the vision tower and the PLE hash constants are skipped with their
     /// reason; the PLE table's parts and every other tensor are the map's to read.
@@ -1790,23 +1649,6 @@ mod tests {
         }
     }
 
-    fn fixture(name: &str) -> Vec<u8> {
-        let path = format!("{}/../hf/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        let raw = std::fs::read(&path).unwrap();
-        if !name.ends_with(".gz") {
-            return raw;
-        }
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(raw.as_slice())
-            .read_to_end(&mut out)
-            .unwrap();
-        out
-    }
-
-    fn json(name: &str) -> Json {
-        serde_json::from_slice(&fixture(name)).unwrap()
-    }
-
     pub(super) fn config() -> Json {
         json("quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__config.json.gz")
     }
@@ -1824,13 +1666,7 @@ mod tests {
 
     /// The byte-level BPE tokenizer [`small_config`] reads, its one special token `</s>` id 2.
     pub(super) fn tokenizer() -> Json {
-        serde_json::json!({"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"Sequence","pretokenizers":[
-            {"type":"Split","pattern":{"Regex":r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"},"behavior":"Isolated","invert":false},
-            {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
-            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
-            "post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
-            "model":{"type":"BPE","vocab":{"A":0,"a":1,"Aa":7},"merges":[["A","a"]]},
-            "added_tokens":[{"id":2,"content":"</s>","special":true}]})
+        crate::test_support::tokenizer("qwen35")
     }
 
     #[test]
@@ -2512,39 +2348,6 @@ mod tests {
         assert!(missed.is_empty(), "{}", missed.join("\n"));
     }
 
-    /// A header key's value as the committed key files write it: `[type, value]`, an array
-    /// `["ARR", [element type, values]]`.
-    fn key_json(v: &Value) -> Json {
-        match v {
-            Value::U32(x) => serde_json::json!(["U32", x]),
-            Value::F32(x) => serde_json::json!(["F32", f64::from(*x)]),
-            Value::Array(a) => {
-                let (tag, items): (&str, Vec<Json>) = match a.first() {
-                    Some(Value::I32(_)) => (
-                        "I32",
-                        a.iter()
-                            .map(|x| match x {
-                                Value::I32(i) => serde_json::json!(i),
-                                _ => unreachable!(),
-                            })
-                            .collect(),
-                    ),
-                    _ => (
-                        "U64",
-                        a.iter()
-                            .map(|x| match x {
-                                Value::U64(i) => serde_json::json!(i),
-                                _ => unreachable!(),
-                            })
-                            .collect(),
-                    ),
-                };
-                serde_json::json!(["ARR", [tag, items]])
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
     /// The keys from the checkpoint's `config.json` equal unsloth's `qwen4exp.*` keys, the PLE
     /// constants as stored.
     #[test]
@@ -2771,50 +2574,6 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "accepted: {missed:?}");
-    }
-
-    /// A folder's tensors: name, dtype and shape.
-    type Entries = Vec<(String, Dtype, Vec<usize>)>;
-
-    /// The entries of a committed tensor-header file.
-    fn entries(header: &Json) -> Entries {
-        header
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(n, e)| {
-                let shape = e["shape"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|d| d.as_u64().unwrap() as usize)
-                    .collect();
-                (
-                    n.clone(),
-                    Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
-                    shape,
-                )
-            })
-            .collect()
-    }
-
-    /// The GGUF fixture's tensors, `[name, ggml dims, type id]`, by name.
-    fn gguf_tensors(gguf: &Json) -> BTreeMap<String, (Vec<u64>, GgmlType)> {
-        gguf["tensors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| {
-                let dims = t[1].as_array().unwrap().iter().map(|d| d.as_u64().unwrap());
-                (
-                    t[0].as_str().unwrap().to_string(),
-                    (
-                        dims.collect(),
-                        GgmlType::from_u32(t[2].as_u64().unwrap() as u32),
-                    ),
-                )
-            })
-            .collect()
     }
 
     /// The MLX type and role a GGUF fixture tensor of type `ty` becomes: the 4-bit linears are
@@ -3252,46 +3011,6 @@ mod tests {
         }
     }
 
-    /// One stored tensor: name, dtype, shape, bytes.
-    type Stored = (String, &'static str, Vec<usize>, Vec<u8>);
-
-    /// An MLX linear `stem` of `bits`-bit codes over the leading dims `lead` and `k` values a row:
-    /// its weight (a counting pattern of words), its scales (0.5) and its biases (−0.25).
-    fn mlx_linear(stem: &str, bits: usize, lead: &[usize], k: usize) -> Vec<Stored> {
-        let shape = |last: usize| [lead, &[last]].concat();
-        let n = shape(k * bits / 32).iter().product::<usize>();
-        let words = (0..n as u32).flat_map(|i| i.wrapping_mul(0x9e37_79b9).to_le_bytes());
-        let groups = shape(k / 64).iter().product::<usize>();
-        let pair = |bf16: u16| (0..groups).flat_map(|_| bf16.to_le_bytes()).collect();
-        vec![
-            (
-                format!("{stem}.weight"),
-                "U32",
-                shape(k * bits / 32),
-                words.collect(),
-            ),
-            (
-                format!("{stem}.scales"),
-                "BF16",
-                shape(k / 64),
-                pair(0x3f00),
-            ),
-            (
-                format!("{stem}.biases"),
-                "BF16",
-                shape(k / 64),
-                pair(0xbe80),
-            ),
-        ]
-    }
-
-    /// A BF16 tensor of `shape` whose element `i` is `value(i)`.
-    fn bf16_tensor(name: &str, shape: &[usize], value: impl Fn(usize) -> u16) -> Stored {
-        let n = shape.iter().product::<usize>();
-        let bytes = (0..n).flat_map(|i| value(i).to_le_bytes()).collect();
-        (name.to_string(), "BF16", shape.to_vec(), bytes)
-    }
-
     /// A folder of two layers (gated delta rule, then attention) of a Qwen3.6 as small as the
     /// groups allow, written in MLX's names, opens: its planned tensors and header keys read as
     /// a qwen35moe file through the engine's own header reader (kinds, interval), every tensor of
@@ -3426,31 +3145,7 @@ mod tests {
             &[2, 3],
             |_| 0x3f80,
         ));
-        let write_shard = |file: &str, part: &[Stored]| {
-            let list: Vec<(&str, &str, &[usize], &[u8])> = part
-                .iter()
-                .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
-                .collect();
-            std::fs::write(dir.join(file), safetensors::write(&list)).unwrap();
-        };
-        let (first, second) = t.split_at(t.len() / 2);
-        write_shard("a.safetensors", first);
-        write_shard("b.safetensors", second);
-        let weight_map: BTreeMap<&str, &str> = first
-            .iter()
-            .map(|t| (t.0.as_str(), "a.safetensors"))
-            .chain(second.iter().map(|t| (t.0.as_str(), "b.safetensors")))
-            .collect();
-        std::fs::write(
-            dir.join(safetensors::Folder::INDEX),
-            json!({ "weight_map": weight_map }).to_string(),
-        )
-        .unwrap();
-        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-        std::fs::write(dir.join("tokenizer.json"), tokenizer().to_string()).unwrap();
-        for file in ["tokenizer_config.json", "generation_config.json"] {
-            std::fs::write(dir.join(file), "{}").unwrap();
-        }
+        write_folder(&dir, &t, &config, &tokenizer());
         let opened = crate::folder::open(&dir).unwrap();
         let hp = Hparams::read(&opened.header).unwrap();
         assert_eq!(hp.kinds, [Kind::DeltaRule, Kind::Attention]);

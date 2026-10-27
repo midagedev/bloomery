@@ -27,7 +27,7 @@ const GREEDY: usize = 24;
 /// every MLX_A4 site through Metal's lists, the picks the session's first
 /// greedy steps.
 pub fn m_mlx(device: &MetalDevice, library: &Library) -> Clause {
-    let path = mlx_split::path()?;
+    let path = mlx_split::path("qwen35moe")?;
     let mut s = Session::open(device, library, &path, CTX).map_err(says)?;
 
     // The reference: the first id and each pick host-fed, one step each.

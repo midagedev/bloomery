@@ -22,6 +22,9 @@ Bolt's two files list 27,921 modules (15 MB); they are cut to the first module o
 `../checkpoint-headers/glm-5.3-flash-nvfp4-layers-0-3.tensors.json.gz` is the dtype and shape of every tensor of `nvidia/GLM-5.3-Flash-NVFP4` layers 0 and 3 and every unlayered `model.language_model.` tensor and `lm_head.weight`, gathered from all 33 shard headers.
 
 | `mlx-community/Qwen3.6-35B-A3B-4bit` | (the folder on the M4 Pro; no revision recorded) | MLX affine 4-bit g64, 8-bit router and shared-expert gates |
+| `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` | `e9675aa3ca5f900ccef55267914466d55ab325fa` | MLX affine 4-bit g64, the `quantization` block names no `mode`, 8-bit routers |
+
+`bloomery__qwen3moe-mlx-fixture__config.json.gz` is the `config.json` of the MLX-format fixture folder `tools/mlx-fixture.py make` writes from the qwen3moe GGUF fixture (the Qwen3-30B-A3B config above cut to four layers and their quantization entries, no `mode` key), unchanged.
 
 `bloomery__qwen35moe-mlx-fixture__config.json.gz` is the `config.json` of the MLX-format fixture folder (`tools/mlx-fixture.py make`: the config above cut to four layers, `layer_types` of the fixture's layers and the quantization entries of those layers), unchanged.
 
