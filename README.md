@@ -98,7 +98,7 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 
 macOS 26.2 or newer; the binaries are signed and notarized. Two architectures run: `qwen35moe` and `qwen3moe`. On a
 build after 0.3.10, an mlx-community 4-bit folder opens as downloaded (`--hf mlx-community/<repo>` or `-m <folder>`):
-Qwen3.6-35B-A3B and Qwen3-30B-A3B-Instruct-2507. 0.3.10 converts the Qwen3.6 folder once with `bloomery-prepare`, which
+Qwen3.6-35B-A3B, Qwen3-30B-A3B-Instruct-2507 and Qwen3-Coder-30B-A3B-Instruct (text only; its tool calls do not work yet). 0.3.10 converts the Qwen3.6 folder once with `bloomery-prepare`, which
 still writes one GGUF split for those who want one file. Both models also run from their Q4_K_M GGUF, and Qwen3.6 from
 `UD-Q4_K_XL`. Two more Q4_K_M files with Qwen3.6's shapes run, text only: Ornith-1.5-35B, and MiniCPM-V 4.7 35B-A3B (its
 `mmproj` is not read). Sage-A1.5 has the same shapes and has not been run on a Mac yet. A file the Metal backend cannot

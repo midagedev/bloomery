@@ -54,6 +54,7 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 | [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), Q4_K_M | runs on a build after 0.3.9, text only: its `mmproj` is not read. Release 0.3.9 refuses it: `qwen35moe arena: a vocabulary of 248144; the head reads 248320` |
 | [Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), Q4_K_M | not run on a Mac yet; it has Qwen3.6's shapes |
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M or an MLX 4-bit folder | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
+| [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct), an MLX 4-bit folder | runs on a build after 0.3.10, text only: it has Qwen3-30B-A3B's shapes (`qwen3moe`). A request with `tools` is refused, see the limits below |
 | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `UD-Q4_K_XL` | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: its Q8_0, Q5_K and f32 tensors |
 
 The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights, and f32 at the delta layers' `ssm_alpha` and
@@ -65,11 +66,13 @@ The evidence for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
 
 - **An MLX 4-bit folder opens as downloaded**, with no conversion step first. `--hf mlx-community/<repo>` fetches the
   repo into the cache (`$BLOOMERY_CACHE`, else `~/.cache/bloomery/hf`) and opens it; `-m <folder>` opens a folder you
-  already have. Two folders run:
+  already have. Three folders run:
   - [`mlx-community/Qwen3.6-35B-A3B-4bit`](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit): 19.5 GB of
     weights, text only (the vision tower is skipped).
   - [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit):
     17.2 GB of weights.
+  - [`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit):
+    17.2 GB of weights, text only. The folder's chat template is the server's; a plain chat works.
 
   The open picks the map by the folder's `model_type`, keeps MLX's 4-bit and 8-bit weights as they are stored, and
   checks the tokenizer against the folder's. It writes nothing to disk.
@@ -129,6 +132,9 @@ flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused
   only its new messages. Any other prompt runs from position 0.
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
+- Qwen3-Coder's tool calls do not work yet: a chat request with `tools` is refused with HTTP 500, `chat template: |reject
+  takes no arguments`, because the template engine has no `reject` filter. A request without `tools` renders the
+  template and answers.
 - No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read), no speculative
   decoding.
 - On an M5 (Metal 4, GPU family 17 or newer) the device picks the neural accelerators' tensor-op GEMMs for prompts
