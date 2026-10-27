@@ -9,8 +9,9 @@
 //!   f32 `h` out), then the q8_0 gemv over `h`;
 //! - one K-quant type for gate and up, Q4_K or Q5_K: the row's q8_1 blocks, then the fused clamped `_sel` over a
 //!   stack of one expert (f32 `h` out);
-//! - any other K-quant pair: the row's q8_1 blocks, a gemv each, and the clamped SwiGLU written into the
-//!   down's q8_1 blocks (no f32 `h`);
+//! - any other K-quant pair: the row's q8_1 blocks, a gemv each, and the rule's SwiGLU written into the
+//!   down's q8_1 blocks (no f32 `h`) when the down is a K-quant, else into the f32 `h` the down's q8_0 or
+//!   f32-form gemv reads;
 //! - a pair of types that read the f32 row (MXFP8): a gemv each over the row, then the rule's f32 rows
 //!   (`ElemKernels::enqueue_swiglu_rule`, f32 `h` out);
 //! - the down by its type: the q8_0 or f32-form gemv over `h`, or a K-quant gemv over `h`'s q8_1 blocks.
@@ -108,20 +109,20 @@ impl BlockPlan {
     }
 
     /// Whether a row's run leaves its SwiGLU row in `h` as f32 (the q8_0 pair, a fused K-quant gate·up, an
-    /// f32-form pair); a split gate·up writes it only into the down's q8_1 blocks, from the f32 gate and up rows
+    /// f32-form pair, a split gate·up over a down that is not a K-quant); a split gate·up over a K-quant down
+    /// writes it only into the down's q8_1 blocks, from the f32 gate and up rows
     /// ([`BlockScratch::gate_up_rows`]).
     #[must_use]
     pub fn writes_h(self) -> bool {
-        !matches!(self.gate_up, GateUp::Split { .. })
+        !matches!(self.gate_up, GateUp::Split { .. }) || !self.down.kquant()
     }
 
     /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair, two K-quants (the same Q4_K or Q5_K
-    /// fused, else split) or two types that read the f32 row for gate·up, any of [`BLOCK_TYPES`] for the down,
-    /// which a split gate·up needs a K-quant one of. Another mix is refused by name as `what`'s.
+    /// fused, else split) or two types that read the f32 row for gate·up, and any of [`BLOCK_TYPES`] for the
+    /// down. Another mix is refused by name as `what`'s.
     ///
     /// # Errors
-    /// A gate and up that are not two q8_0, two K-quants or two f32-form types, or a split pair over a down that
-    /// is not a K-quant.
+    /// A gate and up that are not two q8_0, two K-quants or two f32-form types.
     pub fn of_types(
         what: &'static str,
         [gate, up, down]: [SiteTy; 3],
@@ -145,14 +146,6 @@ impl BlockPlan {
                 ));
             }
         };
-        if matches!(gate_up, GateUp::Split { .. }) && !down.kquant() {
-            return Err(refuse(
-                what,
-                format!(
-                    "gate {gate} and up {up} split, and the split writes q8_1 blocks a {down} down cannot read"
-                ),
-            ));
-        }
         Ok(BlockPlan { gate_up, down })
     }
 
@@ -177,9 +170,10 @@ impl BlockPlan {
     }
 
     /// The launches [`enqueue_block`] enqueues beyond the q8_0 block's two (the pair, the down): a fused gate·up
-    /// quantizes the row and launches the `_sel` (+1), a split one quantizes it, runs both gemvs and the clamped
-    /// SwiGLU's quantizer (+3), an f32-form one runs both gemvs and the rule's rows (+2), and a K-quant down over
-    /// an f32 `h` quantizes it first (+1; a split block's SwiGLU already wrote it).
+    /// quantizes the row and launches the `_sel` (+1), a split one quantizes it, runs both gemvs and the SwiGLU,
+    /// which the down's q8_1 quantizer fuses or the rule's f32 rows are (+3), an f32-form one runs both gemvs and
+    /// the rule's rows (+2), and a K-quant down over an f32 `h` quantizes it first (+1; a split block's SwiGLU
+    /// already wrote it).
     #[must_use]
     pub fn extra_launches(self) -> usize {
         let down_quantize = usize::from(self.down.kquant());
@@ -490,13 +484,29 @@ pub fn enqueue_block_act(
                     missing: "the split block's f32 gate and up",
                 });
             };
-            let act = h_blocks(ha, blk.ff)?;
+            // A K-quant down reads the SwiGLU as q8_1 blocks; any other down reads the f32 `h`.
+            let act = if blk.plan.down.kquant() {
+                Some(h_blocks(ha, blk.ff)?)
+            } else {
+                None
+            };
             gpu.enqueue_quantize_q8_1_layer(x, xa, blk.layer)?;
             site::kgemv(gpu, &kk.gemv, (gt, w, gate), xa, fault, g)?;
             site::kgemv(gpu, &kk.gemv, (ut, w, up), xa, fault, u)?;
-            kk.swiglu
-                .enqueue_swiglu_act_quant_q8(stream, g, u, rule, 1, act, fault)?;
-            return site::kgemv(gpu, &kk.gemv, (blk.plan.down, w, down), act, fault, y);
+            match act {
+                Some(act) => {
+                    kk.swiglu
+                        .enqueue_swiglu_act_quant_q8(stream, g, u, rule, 1, act, fault)?;
+                    return site::kgemv(gpu, &kk.gemv, (blk.plan.down, w, down), act, fault, y);
+                }
+                None => gpu.elem().enqueue_swiglu_rule(
+                    stream,
+                    rule,
+                    (&*g, &*u),
+                    blk.ff,
+                    (fault, &mut *h),
+                )?,
+            }
         }
         GateUp::Site { .. } => {
             let [g, u] = gate_up_rows(s)?;
@@ -667,8 +677,12 @@ mod tests {
     }
 
     /// The plan is the types' dispatch: the q8_0 triple is `BlockPlan::Q8`, one Q4_K or Q5_K for gate and up
-    /// is fused, any other K-quant pair splits, an MXFP8 pair runs the f32-form arm, and every plan reads back
-    /// the types it came from. Mutant: the f32-form arm dropped — the MXFP8 triple is refused.
+    /// is fused, any other K-quant pair splits whatever its down (a K-quant down reads the SwiGLU as q8_1
+    /// blocks, a q8_0 or MXFP8 down as the f32 `h`), an MXFP8 pair runs the f32-form arm, and every plan reads
+    /// back the types it came from. Mutant: the f32-form arm dropped — the MXFP8 triple is refused.
+    ///
+    /// PIN(2026-10-27): the split pair over a q8_0 down was refused; Unsloth's MiniMax-M3.1-Flash files carry
+    /// it in the last layer's shared expert (gate and up Q6_K, down Q8_0), and its launches take it.
     #[test]
     fn the_plan_is_the_types_dispatch() {
         use SiteTy::{Mxfp8, Q3K, Q4K, Q5K, Q6K, Q8_0};
@@ -680,6 +694,8 @@ mod tests {
         assert_eq!(plan([Q6K, Q6K, Q5K]).unwrap().gate_up, split(Q6K, Q6K));
         assert_eq!(plan([Q4K, Q5K, Q4K]).unwrap().gate_up, split(Q4K, Q5K));
         assert_eq!(plan([Q3K, Q3K, Q6K]).unwrap().gate_up, split(Q3K, Q3K));
+        assert_eq!(plan([Q6K, Q6K, Q8_0]).unwrap().gate_up, split(Q6K, Q6K));
+        assert_eq!(plan([Q4K, Q5K, Mxfp8]).unwrap().gate_up, split(Q4K, Q5K));
         assert_eq!(
             plan([Mxfp8, Mxfp8, Mxfp8]).unwrap().gate_up,
             GateUp::Site {
@@ -692,6 +708,7 @@ mod tests {
             [Q8_0, Q8_0, Q5K],
             [Q4K, Q4K, Q8_0],
             [Q6K, Q6K, Q5K],
+            [Q6K, Q6K, Q8_0],
             [Q4K, Q5K, Q6K],
             [Mxfp8, Mxfp8, Mxfp8],
             [Mxfp8, Mxfp8, Q6K],
@@ -700,8 +717,21 @@ mod tests {
         }
     }
 
-    /// A mix no arm covers is refused by name, with the types: gate and up of two kinds, and a split pair over
-    /// a q8_0 down.
+    /// A row's SwiGLU is f32 in `h` unless a split gate·up feeds a K-quant down, which takes the q8_1 blocks the
+    /// SwiGLU's quantizer writes. Mutant: `writes_h` false for every split plan.
+    #[test]
+    fn a_row_leaves_f32_h_unless_a_split_pair_feeds_a_kquant_down() {
+        use SiteTy::{Mxfp8, Q4K, Q5K, Q6K, Q8_0};
+        let writes = |tys| plan(tys).unwrap().writes_h();
+        assert!(writes([Q8_0, Q8_0, Q6K]));
+        assert!(writes([Q4K, Q4K, Q8_0]));
+        assert!(writes([Mxfp8, Mxfp8, Mxfp8]));
+        assert!(!writes([Q6K, Q6K, Q5K]));
+        assert!(writes([Q6K, Q6K, Q8_0]));
+        assert!(writes([Q4K, Q5K, Mxfp8]));
+    }
+
+    /// A mix no arm covers is refused by name, with the types: gate and up of two kinds.
     #[test]
     fn a_mix_no_arm_covers_is_refused() {
         use SiteTy::{Mxfp8, Q4K, Q6K, Q8_0};
@@ -710,13 +740,13 @@ mod tests {
             &["test", "gate is Q8_0", "up is Q4_K"],
         );
         refused(plan([Q6K, Q8_0, Q6K]), &["gate is Q6_K", "up is Q8_0"]);
-        refused(plan([Q6K, Q6K, Q8_0]), &["split", "Q8_0 down"]);
         refused(plan([Mxfp8, Q8_0, Mxfp8]), &["gate is MXFP8", "up is Q8_0"]);
         refused(plan([Q4K, Mxfp8, Q4K]), &["gate is Q4_K", "up is MXFP8"]);
     }
 
     /// The launches beyond the q8_0 block's two, by plan: 0 for the q8_0 block, and the other arms' derived
-    /// counts (module doc) — one more for a K-quant down over an f32 `h`, three for a split pair, two for an
+    /// counts (module doc) — one more for a K-quant down over an f32 `h`, three for a split pair (the same over a
+    /// q8_0 down: the quantizer of the row, two gemvs and the SwiGLU's f32 rows, then the down), two for an
     /// f32-form pair.
     #[test]
     fn the_extra_launches_are_the_arms_counts() {
@@ -727,6 +757,7 @@ mod tests {
         assert_eq!(extra([Q4K, Q4K, Q8_0]), 1);
         assert_eq!(extra([Q5K, Q5K, Q6K]), 2);
         assert_eq!(extra([Q6K, Q6K, Q5K]), 3);
+        assert_eq!(extra([Q6K, Q6K, Q8_0]), 3);
         assert_eq!(extra([Q4K, Q5K, Q4K]), 3);
         assert_eq!(extra([Mxfp8, Mxfp8, Mxfp8]), 2);
         assert_eq!(extra([Mxfp8, Mxfp8, Q6K]), 3);
@@ -745,6 +776,7 @@ mod tests {
             ([Q4K, Q4K, Q4K], 4),
             ([Q5K, Q5K, Q8_0], 3),
             ([Q6K, Q6K, Q5K], 5),
+            ([Q6K, Q6K, Q8_0], 5),
             ([Mxfp8, Mxfp8, Mxfp8], 4),
         ] {
             let p = plan(tys).unwrap();
