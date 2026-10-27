@@ -9,7 +9,7 @@
 //! layout [`super::check`] resolved from the file's header (the plan, the
 //! file's shapes and a launch's geometry): a shape or a type no launch runs was
 //! refused there, by name, before any buffer was allocated, so the loader
-//! checks nothing but that the split gives a tensor's bytes.
+//! checks nothing but that the model file gives a tensor's bytes.
 //!
 //! Two tokens may be committed at once, the second reading what the first
 //! writes. What the second would overwrite before the first is done is held
@@ -18,11 +18,14 @@
 //! its position's parity and writes by the next position's.
 
 use core::ops::Range;
+use std::borrow::Cow;
 
 use bloomery_device::{Elem, Elems};
 use chain::rope::{Direction, RopeTable};
-use gguf::Split;
 use gguf::quant::GgmlType;
+use model::part::Part;
+use model_hf::Weights;
+use model_hf::model_file::Error as WeightError;
 
 use super::check::{
     AttnLayout, DeltaLayout, FfnLayout, LayerLayout, Layout, MixerLayout, P1Layout, Site, Values,
@@ -248,25 +251,41 @@ fn at_layer(l: usize, e: SessionError) -> SessionError {
 
 /// The file's tensors, copied into buffers on `device`. Every tensor named
 /// here was judged against the header by [`super::check`]; what the loader
-/// still refuses is a tensor whose bytes the split cannot give.
+/// still refuses is a tensor whose bytes the model file cannot give.
 struct Loader<'a> {
     device: Alloc<'a>,
-    split: &'a Split,
+    weights: &'a Weights<'a>,
     geom: &'a Geometry,
 }
 
-impl Loader<'_> {
-    /// The bytes of tensor `name`.
-    fn bytes(&self, name: &str) -> Result<&[u8], SessionError> {
-        let (shard, info) = self
-            .split
-            .find(name)
-            .ok_or_else(|| refuse(format!("the file has no tensor {name}")))?;
-        let file = self
-            .split
-            .shard(shard)
-            .ok_or_else(|| refuse(format!("{name}: shard {shard} is not open")))?;
-        file.data(info).map_err(|e| refuse(format!("{name}: {e}")))
+/// `spans` joined into one run: one span as it is, several copied together.
+fn joined<'s>(spans: &[&'s [u8]]) -> Cow<'s, [u8]> {
+    match spans {
+        [one] => Cow::Borrowed(*one),
+        many => Cow::Owned(many.concat()),
+    }
+}
+
+/// `spans` written one after another into `buffer` from byte `at`; returns the
+/// byte after the last.
+fn put(buffer: &mut MetalBuffer<u8>, at: usize, spans: &[&[u8]]) -> Result<usize, SessionError> {
+    let mut at = at;
+    for span in spans {
+        buffer.write_at(Elems(at), span)?;
+        at += span.len();
+    }
+    Ok(at)
+}
+
+impl<'a> Loader<'a> {
+    /// The part of tensor `name`: its bytes in the type its header declares,
+    /// whether the file is a GGUF split (the mapped bytes, lent) or a
+    /// checkpoint folder (the bytes its source makes of the stored planes).
+    fn part(&self, name: &str) -> Result<Part<'a>, SessionError> {
+        self.weights.bytes(name).map_err(|e| match e {
+            WeightError::Unknown { .. } => refuse(format!("the file has no tensor {name}")),
+            e => refuse(format!("{name}: {e}")),
+        })
     }
 
     /// The f32 values of `v`: an F32 tensor as it is, or MLX's affine 8-bit
@@ -274,7 +293,8 @@ impl Loader<'_> {
     /// reader (`s·q + b` in f32, the pair's product exact). The reader's own
     /// refusals (a non-finite scale or bias) name the tensor and its block.
     fn values(&self, v: &Values) -> Result<MetalBuffer<f32>, SessionError> {
-        let bytes = self.bytes(&v.name)?;
+        let part = self.part(&v.name)?;
+        let bytes = joined(&part.spans());
         let mut values = vec![0f32; v.len];
         match v.ty {
             GgmlType::F32 => {
@@ -283,7 +303,7 @@ impl Loader<'_> {
                 }
             }
             GgmlType::MLX_A8 => {
-                gguf::quant::dequant_row(GgmlType::MLX_A8, bytes, &mut values)
+                gguf::quant::dequant_row(GgmlType::MLX_A8, &bytes, &mut values)
                     .map_err(|e| refuse(format!("{}: {e}", v.name)))?;
             }
             other => {
@@ -298,39 +318,44 @@ impl Loader<'_> {
         Ok(buffer)
     }
 
-    /// Site `s` as its own buffer.
+    /// Site `s` as its own buffer, written from its part.
     fn site(&self, s: &Site) -> Result<MetalBuffer<u8>, SessionError> {
-        let bytes = self.bytes(&s.name)?;
-        let mut buffer = self.device.buffer(Elems(bytes.len()))?;
-        buffer.write(bytes)?;
+        let part = self.part(&s.name)?;
+        let spans = part.spans();
+        let mut buffer = self
+            .device
+            .buffer(Elems(spans.iter().map(|b| b.len()).sum()))?;
+        put(&mut buffer, 0, &spans)?;
         Ok(buffer)
     }
 
     /// The P1 of `p`: one dispatch per weight type, its segments in the order
-    /// the layout gives, each site's output at the offset its place gives.
-    /// Returns the P1 and every site's output range.
+    /// the layout gives, each site's output at the offset its place gives and
+    /// each site's bytes written straight into the dispatch's buffer. Returns
+    /// the P1 and every site's output range.
     fn p1(&self, p: &P1Layout) -> Result<(P1, Vec<Range<usize>>), SessionError> {
         let mut parts: Vec<P1Part> = Vec::with_capacity(p.dispatches.len());
         for d in &p.dispatches {
-            let bytes: Vec<&[u8]> = d
+            let held: Vec<Part<'a>> = d
                 .members
                 .iter()
-                .map(|&i| self.bytes(&p.sites[i].name))
+                .map(|&i| self.part(&p.sites[i].name))
                 .collect::<Result<_, _>>()?;
-            let mut host = Vec::with_capacity(bytes.iter().map(|b| b.len()).sum());
+            let spans: Vec<Vec<&[u8]>> = held.iter().map(Part::spans).collect();
+            let total: usize = spans.iter().flatten().map(|b| b.len()).sum();
+            let mut weights = self.device.buffer(Elems(total))?;
             let mut segments = Vec::with_capacity(d.members.len());
-            for (&i, b) in d.members.iter().zip(&bytes) {
+            let mut at = 0;
+            for (&i, s) in d.members.iter().zip(&spans) {
                 let site = &p.sites[i];
                 segments.push(Segment {
                     cols: site.cols,
                     rows: site.rows,
-                    weight_blocks: host.len() / d.quant.block_bytes(),
+                    weight_blocks: at / d.quant.block_bytes(),
                     out_offset: p.range(i).start,
                 });
-                host.extend_from_slice(b);
+                at = put(&mut weights, at, s)?;
             }
-            let mut weights = self.device.buffer(Elems(host.len()))?;
-            weights.write(&host)?;
             parts.push(P1Part {
                 quant: d.quant,
                 weights,
@@ -416,21 +441,21 @@ fn rope_rows(table: &RopeTable, ctx: usize, rot: usize) -> Vec<f32> {
 }
 
 impl Arena {
-    /// The arena of `g` (the layout [`super::check`] resolved from `split`'s
-    /// header, at the launch geometry `geom` of the file's instance): each
-    /// weight copied from `split` into a buffer of its own, and every buffer a
-    /// token touches made, all zeroed but the weights, the rope table and the
-    /// lane words.
+    /// The arena of `g` (the layout [`super::check`] resolved from the model
+    /// file's header, at the launch geometry `geom` of the file's instance):
+    /// each weight copied from `weights` into a buffer of its own, and every
+    /// buffer a token touches made, all zeroed but the weights, the rope table
+    /// and the lane words.
     pub(super) fn open(
         device: Alloc<'_>,
-        split: &Split,
+        weights: &Weights<'_>,
         geom: &Geometry,
         g: &Layout,
     ) -> Result<Arena, SessionError> {
         let (hidden, vocab, ctx) = (g.hidden, g.vocab, g.ctx);
         let load = Loader {
             device,
-            split,
+            weights,
             geom,
         };
         let embed = load.site(&g.embed)?;

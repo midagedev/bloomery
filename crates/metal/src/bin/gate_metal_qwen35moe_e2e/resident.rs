@@ -65,7 +65,7 @@ fn held(device: &MetalDevice) -> Result<u64, String> {
 /// rows: the same read `generate_metal --plan` makes, no weight byte touched.
 fn planned(path: &Path) -> Result<Tally, String> {
     let header = plan::open_header(path)?;
-    let outcome = check::check(&header.split, CTX);
+    let outcome = check::check(header.split(), CTX);
     let items: Vec<String> = outcome.items.iter().map(|i| i.error.to_string()).collect();
     let checked = outcome
         .checked

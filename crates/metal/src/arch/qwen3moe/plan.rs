@@ -10,15 +10,18 @@
 //! side and judge nothing: the census's rule is the open's, and this plan
 //! states what each says.
 //!
-//! A file whose data section is cut short (a header fetched by a range read)
-//! is read from its header and tensor table alone ([`open_header`]); the open
-//! of such a file stays a named error.
+//! A GGUF file whose data section is cut short (a header fetched by a range
+//! read) is read from its header and tensor table alone ([`open_header`]); the
+//! open of such a file stays a named error. A checkpoint folder is read through
+//! the model file's own header.
 
 use std::path::Path;
 
 use bloomery_device::Census;
 use gguf::Split;
 use gguf::write::{Layout as FileLayout, TensorDecl};
+use model_hf::ModelFile;
+use model_hf::model_file::Error as FileError;
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 
 use super::check::{Bytes, Item, Outcome, Tally};
@@ -41,25 +44,34 @@ pub enum Data {
     Cut { file_len: u64, need: u64 },
 }
 
-/// The split a plan reads.
+/// The model file a plan reads.
 pub struct Header {
-    pub split: Split,
+    pub file: ModelFile,
     pub data: Data,
 }
 
-/// The file at `path` as the plan reads it: the open's own split when the file
-/// is whole, else its header and tensor table alone. A header the reader
-/// cannot take, or a file that is whole and still refused by the reader, is a
-/// named error.
+impl Header {
+    /// The header and tensor table the plan is read from.
+    #[must_use]
+    pub fn split(&self) -> &Split {
+        self.file.header()
+    }
+}
+
+/// The file at `path` as the plan reads it: the open's own model file when the
+/// file is whole, else a GGUF's header and tensor table alone. A header the
+/// reader cannot take, a folder the open refuses, or a GGUF that is whole and
+/// still refused by the reader, is a named error.
 pub fn open_header(path: &Path) -> Result<Header, String> {
-    let refused = match Split::open(path) {
-        Ok(split) => {
+    let refused = match ModelFile::open(path) {
+        Ok(file) => {
             return Ok(Header {
-                split,
+                file,
                 data: Data::Complete,
             });
         }
-        Err(e) => e,
+        Err(FileError::Gguf { source, .. }) => source,
+        Err(e) => return Err(e.to_string()),
     };
     let inv = gguf::inventory_of(path)
         .map_err(|e| format!("{}: {refused}; the header alone: {e}", path.display()))?;
@@ -99,7 +111,7 @@ pub fn open_header(path: &Path) -> Result<Header, String> {
     let split = Split::header_only(path.to_path_buf(), &layout)
         .map_err(|e| format!("{}: the header-only split: {e}", path.display()))?;
     Ok(Header {
-        split,
+        file: ModelFile::Gguf(split),
         data: Data::Cut {
             file_len: inv.file_len,
             need,
@@ -386,6 +398,22 @@ Pages purgeable:                                3987.
             Err("vm_stat: no `Pages purgeable` count".to_owned())
         );
         assert!(HostMemory::parse("not vm_stat").is_err());
+    }
+
+    /// A directory is read as the checkpoint folder it is: one the folder open refuses is that open's
+    /// refusal by name, not a GGUF header that failed.
+    #[test]
+    fn a_directory_that_is_no_checkpoint_folder_is_the_folder_opens_refusal() {
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-metal-plan-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the directory is made");
+        let refused = open_header(&dir).err();
+        std::fs::remove_dir_all(&dir).expect("the directory is removed");
+        let e = refused.expect("an empty directory is no checkpoint folder");
+        assert!(
+            e.starts_with(&format!("checkpoint folder {}: ", dir.display())),
+            "{e}"
+        );
     }
 
     #[test]

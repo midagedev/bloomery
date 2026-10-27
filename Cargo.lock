@@ -399,6 +399,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-model-hf",
  "bloomery-models",
  "bloomery-os",
  "bloomery-placement",

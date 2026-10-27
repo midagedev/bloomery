@@ -83,7 +83,7 @@ use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy};
 use chain::arch::qwen3moe::read::Sites35;
 use chain::arch::qwen3moe::walk::Walk;
-use gguf::Split;
+use model_hf::ModelFile;
 use runtime::prompt::PrefillMode;
 use runtime::seqstate::{self, Kept};
 
@@ -249,6 +249,12 @@ impl From<DeviceError> for SessionError {
 impl From<ChainError> for SessionError {
     fn from(e: ChainError) -> Self {
         SessionError::Plan(e)
+    }
+}
+
+impl From<model_hf::model_file::Error> for SessionError {
+    fn from(e: model_hf::model_file::Error) -> Self {
+        refuse(e.to_string())
     }
 }
 
@@ -721,9 +727,17 @@ impl Session {
     /// refusal the open would meet first, is refused by name before a device
     /// opens.
     pub fn instance_of(path: &Path, ctx: usize) -> Result<&'static Instance, SessionError> {
-        let split = Split::open(path)
-            .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
-        Ok(check::check(&split, ctx).checked_or_first()?.instance)
+        Self::instance_of_model(&ModelFile::open(path)?, ctx)
+    }
+
+    /// [`Session::instance_of`] for a model file already open.
+    pub fn instance_of_model(
+        file: &ModelFile,
+        ctx: usize,
+    ) -> Result<&'static Instance, SessionError> {
+        Ok(check::check(file.header(), ctx)
+            .checked_or_first()?
+            .instance)
     }
 
     /// The session of the file at `path` on `device`, its pipelines from
@@ -752,17 +766,48 @@ impl Session {
         Self::open_as(device, library, path, ctx, every, MarkCopies::OnFirstMark)
     }
 
-    /// [`Session::open_with`] with the mark copies opened as `copies` says.
-    /// Every buffer is made and the residency set committed here, once: a
-    /// refusal is a named error and leaves the set as it was, and no pass
-    /// allocates or builds a pipeline but the first marked pass of a session
-    /// opened [`MarkCopies::OnFirstMark`]. A file whose geometry some kernel
-    /// cannot take, or whose instance is another than `library`'s, is refused
-    /// by name.
+    /// [`Session::open_with`] with the mark copies opened as `copies` says,
+    /// over the file at `path` as [`ModelFile::open`] takes it.
     pub fn open_as(
         device: &MetalDevice,
         library: &Library,
         path: &Path,
+        ctx: usize,
+        every: u32,
+        copies: MarkCopies,
+    ) -> Result<Session, SessionError> {
+        Self::open_model_as(device, library, &ModelFile::open(path)?, ctx, every, copies)
+    }
+
+    /// [`Session::open`] over a model file already open: a GGUF split or a
+    /// checkpoint folder.
+    pub fn open_model(
+        device: &MetalDevice,
+        library: &Library,
+        file: &ModelFile,
+        ctx: usize,
+    ) -> Result<Session, SessionError> {
+        Self::open_model_as(
+            device,
+            library,
+            file,
+            ctx,
+            CHECKPOINT_EVERY,
+            MarkCopies::OnFirstMark,
+        )
+    }
+
+    /// [`Session::open_as`] over a model file already open. Every buffer is
+    /// made and the residency set committed here, once: a refusal is a named
+    /// error and leaves the set as it was, and no pass allocates or builds a
+    /// pipeline but the first marked pass of a session opened
+    /// [`MarkCopies::OnFirstMark`]. A file whose geometry some kernel cannot
+    /// take, or whose instance is another than `library`'s, is refused by
+    /// name.
+    pub fn open_model_as(
+        device: &MetalDevice,
+        library: &Library,
+        file: &ModelFile,
         ctx: usize,
         every: u32,
         copies: MarkCopies,
@@ -773,17 +818,17 @@ impl Session {
         kernels.prepare_prefill()?;
         let pipelines = started.elapsed();
         let started = Instant::now();
-        let split = Split::open(path)
-            .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
         // Every refusal the header and tensor table hold, in the order the
         // checks meet them; the open stops at the first.
-        let checked = check::check(&split, ctx).checked_or_first()?;
+        let checked = check::check(file.header(), ctx).checked_or_first()?;
         // The arena is sized at the geometry the file was judged at and the
         // launches at the library's: one instance, or the open is refused.
         if checked.geom != *kernels.geom() {
             return Err(refuse(format!(
                 "{}: the file is {}, the library is built for {}",
-                path.display(),
+                file.header()
+                    .shard_path(0)
+                    .map_or_else(|| "the model file".into(), |p| p.display().to_string()),
                 checked.instance,
                 library.instance()
             )));
@@ -796,7 +841,8 @@ impl Session {
             .ok_or_else(|| refuse("the stream made no residency set"))?;
         let staged = residency.stage();
         let alloc = Alloc::new(device.metal(), &staged);
-        let arena = Arena::open(alloc, &split, &checked.geom, &checked.layout)?;
+        let weights = file.weights()?;
+        let arena = Arena::open(alloc, &weights, &checked.geom, &checked.layout)?;
         let load = started.elapsed();
         let started = Instant::now();
         let mut rows = RowsArena::open(alloc, &arena, pass_rows_max(&checked.geom).min(arena.ctx))?;

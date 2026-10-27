@@ -2,7 +2,8 @@
 //! written as an MLX folder and converted back to a GGUF split
 //! (`tools/mlx-fixture.py`), every typed site MLX_A4 and the routers MLX_A8,
 //! in the family's `<family>-mlxsplit` directory under the fixture root
-//! (`BLOOMERY_FIXTURE_ROOT`).
+//! (`BLOOMERY_FIXTURE_ROOT`), and the folder it was converted from, in
+//! `<family>-mlx`.
 
 use std::path::PathBuf;
 
@@ -18,4 +19,22 @@ pub fn path(family: &str) -> Result<PathBuf, String> {
     )
     .map(PathBuf::from)
     .map_err(|e| e.to_string())
+}
+
+/// The MLX folder `prepare` converts into [`path`]'s split: `<family>-mlx`
+/// under the fixture root, as `tools/mlx-fixture.py make` writes it.
+#[allow(
+    dead_code,
+    reason = "the e2e gate opens the folder; the kernel gate reads the split alone"
+)]
+pub fn folder(family: &str) -> Result<PathBuf, String> {
+    let root = refset::fixture::root().map_err(|e| format!("the fixture root: {e}"))?;
+    let dir = PathBuf::from(format!("{root}/{family}-mlx"));
+    if !dir.is_dir() {
+        return Err(format!(
+            "{}: not a folder (`tools/mlx-fixture.py make` writes it from the {family} fixture)",
+            dir.display()
+        ));
+    }
+    Ok(dir)
 }
