@@ -1,5 +1,6 @@
+use crate::geom::{Geometry, KernelRefused};
 use crate::geometry;
-use crate::instance::{HOST, Instance, REGISTERED};
+use crate::instance::HOST;
 
 /// Taps of the causal conv. A shim: the build's host instance's delta axes.
 /// Callers left: the arch, the e2e and kernel gates, their oracles and the
@@ -10,10 +11,11 @@ pub const CONV_TAPS: usize = HOST.delta_built().conv_taps as usize;
 pub const PASS_ROWS: usize = 8;
 
 /// Slots of the conv ring of a conv of `taps` taps: the predecessors it
-/// reads (the taps except the current token) plus the positions of one pass.
+/// reads (the taps except the current token, none for a conv of no taps)
+/// plus the positions of one pass.
 #[must_use]
 pub const fn ring_rows(taps: usize) -> usize {
-    taps - 1 + PASS_ROWS
+    taps.saturating_sub(1) + PASS_ROWS
 }
 
 /// Slots of the conv ring. A shim: the build's host instance's. Callers left:
@@ -24,23 +26,38 @@ pub const RING_ROWS: usize = ring_rows(CONV_TAPS);
 /// rows inside it: a prompt call's first and last message start.
 pub const SNAPS: usize = 2;
 
-/// The geometry the delta kernels are written for, held for `inst`'s delta
-/// axes (the axes its kernels are compiled at, [`Instance::delta_built`]):
-/// the kernels' own `static_assert`s, stated where the host sizes its
-/// launches.
-const fn holds(inst: &Instance) {
-    let d = inst.delta_built();
-    let head_cols = d.head_cols as usize;
-    assert!(ring_rows(d.conv_taps as usize) == 11);
-    assert!(d.value_heads as usize * geometry::PARTIALS_PER_HEAD == 256);
-    assert!(head_cols == 128);
-    assert!(head_cols / geometry::PARTIALS_PER_HEAD == 16);
-}
-
-const _: () = {
-    let mut i = 0;
-    while i < REGISTERED.len() {
-        holds(&REGISTERED[i]);
-        i += 1;
+/// The geometry the delta kernels are written for, held for `g`'s delta axes
+/// (the axes its kernels are compiled at, [`crate::instance::Instance::delta_built`]):
+/// the kernels' own `static_assert`s, stated where the host sizes its launches.
+///
+/// # Errors
+///
+/// [`KernelRefused`] naming the axis the delta step cannot take.
+pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
+    let d = &g.delta;
+    if d.ring_rows != 11 {
+        return Err(KernelRefused::new(
+            "delta",
+            "conv taps",
+            d.conv_taps,
+            "4 (the conv ring holds 11 slots)",
+        ));
     }
-};
+    if d.groups != 256 {
+        return Err(KernelRefused::new(
+            "delta",
+            "value heads",
+            d.value_heads,
+            "32 (256 partial groups)",
+        ));
+    }
+    if d.head_cols != 128 || d.head_cols / geometry::PARTIALS_PER_HEAD != 16 {
+        return Err(KernelRefused::new(
+            "delta",
+            "head columns",
+            d.head_cols,
+            "128 (16 columns a block)",
+        ));
+    }
+    Ok(())
+}

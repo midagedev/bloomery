@@ -1,4 +1,7 @@
-use crate::instance::{HOST, Instance, REGISTERED};
+use core::fmt;
+
+use crate::geom::{Geometry, KernelRefused, yes_no};
+use crate::instance::{HOST, Instance};
 
 /// Values in one head. A shim: the build's host instance's. Callers left:
 /// the arch, the e2e and kernel gates, their oracles and the probes.
@@ -82,20 +85,25 @@ pub const FLASH_THREADS: usize = flash_threads(&HOST);
 
 /// The score's scale for a head of `head` values: ik's
 /// `1.0f/sqrtf(float(head))` in f32 (exact at 256; at 128 the f32 nearest,
-/// the delta net's own query scale). A head with no written scale fails the
-/// build.
+/// the delta net's own query scale). A head with no written scale has NaN,
+/// which [`holds`] refuses.
 #[must_use]
 pub const fn scale_of(head: usize) -> f32 {
     match head {
         256 => 0.0625,
         128 => f32::from_bits(0x3db5_04f3),
-        _ => panic!("no score scale is written for this head"),
+        _ => f32::NAN,
     }
 }
 
 /// The score's scale. A shim: the build's host instance's. Callers left: the
 /// kernel gate's oracles and the probes.
 pub const SCALE: f32 = scale_of(HEAD_DIM);
+
+const _: () = assert!(
+    !SCALE.is_nan(),
+    "no score scale is written for the host's head"
+);
 
 /// Positions one prefill threadgroup holds: a SIMD group each, whose rows
 /// are the group's query heads of one key head at that position.
@@ -111,39 +119,82 @@ pub const PREFILL_PAD: usize = 8;
 /// Threads in the prefill threadgroup.
 pub const PREFILL_THREADS: usize = PREFILL_POSITIONS * SIMD_WIDTH;
 
-/// The geometry every flash kernel is written for, held for `inst`: the
+/// The geometry every flash kernel is written for, held for `g`: the
 /// kernels' own `static_assert`s, stated where the host sizes its launches.
-const fn holds(inst: &Instance) {
-    let a = &inst.key.attn;
-    let head = a.row.head as usize;
-    let rot = a.rot as usize;
-    assert!(a.row.value == a.row.head);
-    assert!(gqa(inst) * a.n_kv as usize == a.n_head as usize);
-    assert!(HEADS_PER_SG * simd_groups(inst) == gqa(inst));
-    // A lane holds 8 values (a 16-byte word) or 4 (an 8-byte word).
-    assert!(lane_dims(inst) * SIMD_WIDTH == head);
-    assert!(lane_dims(inst) == 8 || lane_dims(inst) == 4);
-    assert!(qg_stride(inst) == head * (1 + a.q_gate as usize));
-    assert!(flash_threads(inst) == 256);
+///
+/// # Errors
+///
+/// [`KernelRefused`] naming the first axis the flash cannot take.
+pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
+    let a = &g.attn;
+    let refuse = |axis, value: &dyn fmt::Display, needs| {
+        Err(KernelRefused::new("attention", axis, value, needs))
+    };
+    // A lane holds 8 values (a 16-byte word) or 4 (an 8-byte word), the
+    // norm's pair tree is head/64 warps, and the score's scale is written
+    // for those heads.
+    if a.lane_dims * SIMD_WIDTH != a.head
+        || !matches!(a.lane_dims, 4 | 8)
+        || !a.head.is_multiple_of(64)
+        || scale_of(a.head).is_nan()
+    {
+        return refuse("head", &a.head, "128 or 256 values");
+    }
+    let row = &g.instance.key.attn.row;
+    if row.value as usize != a.head {
+        return refuse("value width", &row.value, "the head's width");
+    }
+    if a.gqa * a.kv_heads != a.query_heads {
+        return refuse("query heads", &a.query_heads, "a multiple of the key heads");
+    }
+    // One SIMD group a query head, and 256 threads in the flash threadgroup.
+    if HEADS_PER_SG * a.simd_groups != a.gqa || a.flash_threads != 256 || a.gqa != 8 {
+        return refuse(
+            "query heads a key head",
+            &a.gqa,
+            "8 (one SIMD group each in a 256-thread flash)",
+        );
+    }
     // The fold: one thread a 16 values of a head, every head at once.
-    assert!(a.n_head as usize * head == flash_threads(inst) * 16);
-    // The norm's pair tree (rope_neox's `owned_pair`): head/64 warps, the
-    // turning pairs inside warp 0 or every value turning.
-    assert!(head.is_multiple_of(64) && rot.is_multiple_of(2) && rot <= head);
-    assert!(rot / 2 <= SIMD_WIDTH || rot == head);
-    assert!(gqa(inst) == 8);
-    assert!(head & 7 == 0 && (head + PREFILL_PAD) & 7 == 0);
-    let _ = scale_of(head);
+    if a.query_heads * a.head != a.flash_threads * 16 {
+        return refuse(
+            "query heads x head",
+            &(a.query_heads * a.head),
+            "4096 (the fold's 256 threads of 16 values)",
+        );
+    }
+    // The norm's pair tree (rope_neox's `owned_pair`): the turning pairs
+    // inside warp 0 or every value turning.
+    if !a.rot.is_multiple_of(2) || a.rot > a.head || (a.rot / 2 > SIMD_WIDTH && a.rot != a.head) {
+        return refuse(
+            "rope dims",
+            &a.rot,
+            "an even count of at most 64, or the whole head",
+        );
+    }
+    // The shape table's row that cuts a window, folds sinks or multiplies the
+    // value rows is a layer that asks for one: the flash attends every
+    // position and appends the values as they are.
+    if row.window || row.sinks || row.value_scale {
+        return refuse(
+            "flash row",
+            &format_args!(
+                "window {}, sinks {}, value scale {}",
+                yes_no(row.window),
+                yes_no(row.sinks),
+                yes_no(row.value_scale)
+            ),
+            "a row with no window, no sinks and no value multiplier",
+        );
+    }
+    Ok(())
 }
 
 const _: () = {
-    let mut i = 0;
-    while i < REGISTERED.len() {
-        holds(&REGISTERED[i]);
-        i += 1;
-    }
     assert!(PREFILL_POSITIONS * SIMD_WIDTH == 128);
     assert!(PREFILL_KEYS == 16);
+    // A prefill tile's row stride keeps the head's 8-value alignment.
+    assert!(PREFILL_PAD.is_multiple_of(8));
 };
 
 /// Segments a live key count takes.
@@ -192,6 +243,7 @@ fn span_mirror(live: u32, segments: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance::REGISTERED;
 
     #[test]
     fn the_scale_is_iks_for_every_registered_head() {

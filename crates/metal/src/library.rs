@@ -1,15 +1,18 @@
-//! The library the kernels come from: one instance's (`crate::instance`).
-//! `build.rs` writes the kernels' source of every registered instance and
-//! the library is the one of the instance it is opened at, which a file
-//! selects by its shape.
+//! The library the kernels come from: one instance's (`crate::instance`),
+//! the one a file selects by its shape.
 //!
 //! Two paths, and the gate prints which one ran:
 //!
-//! - the **metallib**: `build.rs` compiled the kernels with `xcrun metal`
-//!   when the Metal Toolchain is installed, and the bytes are embedded.
-//! - the **source**: the same source, with the fault site's table and the
-//!   instance's geometry written in front of it, is compiled by the Metal
-//!   runtime when it loads: the instance's alone.
+//! - the **metallib**: `build.rs` compiled the kernels of every registered
+//!   instance with `xcrun metal` when the Metal Toolchain is installed, and
+//!   the bytes are embedded.
+//! - the **source**: the kernels' files with the fault site's table and the
+//!   instance's geometry written in front of them (`crate::header`, rendered
+//!   at open from the instance's [`Geometry`]), compiled by the Metal runtime
+//!   when it loads: the instance's alone. It is the path of a build with no
+//!   Metal Toolchain and of an instance no row registers, so a file whose
+//!   geometry every kernel takes opens on a build that has its metallib for
+//!   other shapes only.
 //!
 //! Both paths are given the same math options (safe math, precise
 //! single-precision functions, language version 3.2) and the source turns
@@ -38,7 +41,9 @@ use objc2_metal::{
 use bloomery_device::DeviceError;
 
 use crate::device::MetalDevice;
+use crate::geom::Geometry;
 use crate::handle::Handle;
+use crate::header;
 use crate::instance::{HOST, Instance};
 
 /// One registered instance's embedded sources, as `build.rs` wrote them.
@@ -55,6 +60,14 @@ struct Built {
 /// Every registered instance's embedded sources, in `instance::REGISTERED`'s
 /// order (build.rs writes the table).
 const BUILT: &[Built] = include!(concat!(env!("OUT_DIR"), "/built.rs"));
+
+/// The kernels' files joined as `build.rs` joins them (`header::files`): the
+/// part of the program text no instance changes. The open writes an
+/// instance's header in front of it.
+const MAIN_BODY: &str = include_str!(concat!(env!("OUT_DIR"), "/main_body.metal"));
+
+/// The tensor-op GEMMs' files joined, the same way.
+const TENSOR_BODY: &str = include_str!(concat!(env!("OUT_DIR"), "/tensor_body.metal"));
 
 /// Each instance's metallib, when the Metal Toolchain was there.
 #[cfg(metal_lib = "metallib")]
@@ -113,25 +126,35 @@ pub const TENSOR_SOURCE: &str = HOST_BUILT.tensor;
 
 /// The kernels' source and the tensor-op GEMMs' source of `inst`, in that
 /// order, each with the fault site's table and the instance's geometry in
-/// front of it; the named refusal of an instance `build.rs` did not write.
+/// front of it, as `build.rs` embedded them; the named refusal of an instance
+/// `build.rs` did not write. [`rendered`] writes the same text at open, for
+/// any instance.
 pub fn sources_of(inst: &Instance) -> Result<(&'static str, &'static str), DeviceError> {
-    let built = sources(inst)?;
-    Ok((built.source, built.tensor))
-}
-
-/// The sources of `inst`, or the named refusal of an instance `build.rs` did
-/// not write.
-fn sources(inst: &Instance) -> Result<&'static Built, DeviceError> {
-    built_of(inst).ok_or_else(|| {
+    let built = built_of(inst).ok_or_else(|| {
         DeviceError::unsupported(
             "library",
             format!(
-                "no kernels are built for instance {}: build.rs writes the rows of \
-                 instance::REGISTERED",
-                inst.name
+                "no kernels are embedded for {inst}: build.rs writes the rows of \
+                 instance::REGISTERED"
             ),
         )
-    })
+    })?;
+    Ok((built.source, built.tensor))
+}
+
+/// The kernels' source and the tensor-op GEMMs' source of `inst`, in that
+/// order, written at open from its geometry: the header of [`Geometry::of`]
+/// in front of the kernels' files. For a registered instance it is the text
+/// `build.rs` embedded, byte for byte. A geometry some kernel cannot take is
+/// refused by name, before any compile.
+fn rendered(inst: &Instance) -> Result<(String, String), DeviceError> {
+    let g = Geometry::of(inst);
+    g.check()
+        .map_err(|why| DeviceError::unsupported("library", format!("{inst}: {why}")))?;
+    Ok((
+        header::program(&g, MAIN_BODY),
+        header::program(&g, TENSOR_BODY),
+    ))
 }
 
 /// Which path the library came from.
@@ -298,46 +321,31 @@ fn label_of(entry: &str, constants: &[(usize, u32)]) -> String {
     format!("{entry}<{}>", values.join(","))
 }
 
-/// The value of `#define NAME <n>` in `text`, when one such line names a
-/// whole number: the geometry the source's kernels were compiled with.
-fn define_of(text: &str, name: &str) -> Option<usize> {
-    let mut found = text.lines().filter_map(|line| {
-        line.trim()
-            .strip_prefix("#define ")?
-            .strip_prefix(name)?
-            .strip_prefix(' ')
-            .and_then(|n| n.trim().parse().ok())
-    });
-    let n = found.next()?;
-    found.next().is_none().then_some(n)
-}
-
 impl Library {
     /// The library of `instance` this machine's Metal device takes: the
-    /// metallib when the build made one, the source otherwise, and the
-    /// tensor-op GEMMs beside it on a GPU whose cores carry matrix units.
-    /// An instance `build.rs` did not write is refused by name.
+    /// metallib when the build made one for it, the source otherwise (a
+    /// build with no Metal Toolchain, or an instance no row registers), and
+    /// the tensor-op GEMMs beside it on a GPU whose cores carry matrix units.
+    /// A geometry some kernel cannot take is refused by name.
     pub(crate) fn compile(
         device: &Handle<dyn MTLDevice>,
         instance: &'static Instance,
     ) -> Result<Self, DeviceError> {
-        let built = sources(instance)?;
+        let (source, tensor_source) = rendered(instance)?;
         #[cfg(metal_lib = "metallib")]
-        let library = Self::metallib_of(device, instance)?;
+        let library = match METALLIBS.iter().find(|(name, _)| *name == instance.name) {
+            Some(&(_, bytes)) => Self::metallib_of(device, instance, bytes, &source)?,
+            None => Self::source_of(device, instance, &source, MTLLanguageVersion::Version3_2)?,
+        };
         #[cfg(not(metal_lib = "metallib"))]
-        let library = Self::source_of(
-            device,
-            instance,
-            built.source,
-            MTLLanguageVersion::Version3_2,
-        )?;
+        let library = Self::source_of(device, instance, &source, MTLLanguageVersion::Version3_2)?;
         match MatrixUnits::of(device).path() {
             GemmPath::Simdgroup => Ok(library),
             GemmPath::TensorOps => {
                 let tensor = Self::source_of(
                     device,
                     instance,
-                    built.tensor,
+                    &tensor_source,
                     MTLLanguageVersion::Version4_0,
                 )?;
                 Ok(library.with_tensor_gemms(tensor))
@@ -349,11 +357,11 @@ impl Library {
     /// instance.
     pub fn from_source(device: &MetalDevice) -> Result<Self, DeviceError> {
         let instance = device.library().instance;
-        let built = sources(instance)?;
+        let (source, _) = rendered(instance)?;
         Self::source_of(
             device.handle(),
             instance,
-            built.source,
+            &source,
             MTLLanguageVersion::Version3_2,
         )
     }
@@ -452,37 +460,40 @@ impl Library {
             device: device.clone(),
             path: LibraryPath::Source,
             instance,
-            rows_per_simd_group: define_of(text, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
-            router_sg: define_of(text, "BLOOMERY_ROUTER_SG"),
+            rows_per_simd_group: header::define_of(text, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
+            router_sg: header::define_of(text, "BLOOMERY_ROUTER_SG"),
             tensor: None,
         })
     }
 
     /// The library of the device's instance's embedded metallib, when the
-    /// build made one.
+    /// build made one for it.
     #[cfg(metal_lib = "metallib")]
     pub fn from_metallib(device: &MetalDevice) -> Result<Self, DeviceError> {
-        Self::metallib_of(device.handle(), device.library().instance)
-    }
-
-    #[cfg(metal_lib = "metallib")]
-    fn metallib_of(
-        device: &Handle<dyn MTLDevice>,
-        instance: &'static Instance,
-    ) -> Result<Self, DeviceError> {
-        let built = sources(instance)?;
+        let instance = device.library().instance;
         let &(_, bytes) = METALLIBS
             .iter()
             .find(|(name, _)| *name == instance.name)
             .ok_or_else(|| {
                 DeviceError::unsupported(
                     "library",
-                    format!(
-                        "build.rs compiled no metallib for instance {}",
-                        instance.name
-                    ),
+                    format!("build.rs compiled no metallib for {instance}"),
                 )
             })?;
+        let (source, _) = rendered(instance)?;
+        Self::metallib_of(device.handle(), instance, bytes, &source)
+    }
+
+    /// The library of an instance's metallib `bytes`; `source` is the text
+    /// the metallib was compiled from, which names the geometry the library
+    /// holds.
+    #[cfg(metal_lib = "metallib")]
+    fn metallib_of(
+        device: &Handle<dyn MTLDevice>,
+        instance: &'static Instance,
+        bytes: &'static [u8],
+        source: &str,
+    ) -> Result<Self, DeviceError> {
         let data = dispatch2::DispatchData::from_static_bytes(bytes);
         let library = device
             .newLibraryWithData_error(&data)
@@ -492,8 +503,8 @@ impl Library {
             device: device.clone(),
             path: LibraryPath::Metallib,
             instance,
-            rows_per_simd_group: define_of(built.source, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
-            router_sg: define_of(built.source, "BLOOMERY_ROUTER_SG"),
+            rows_per_simd_group: header::define_of(source, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
+            router_sg: header::define_of(source, "BLOOMERY_ROUTER_SG"),
             tensor: None,
         })
     }
@@ -594,8 +605,7 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::Geometry;
-    use crate::instance::REGISTERED;
+    use crate::instance::{REGISTERED, UNREGISTERED, open_key};
 
     fn units(architecture: &str, metal4: bool) -> MatrixUnits {
         MatrixUnits {
@@ -620,57 +630,69 @@ mod tests {
         assert_eq!(units("applegpu_g17s", true).generation(), Some((17, 's')));
     }
 
+    /// The first byte at which two texts differ, for a failure to name.
+    fn differs_at(a: &str, b: &str) -> usize {
+        a.bytes()
+            .zip(b.bytes())
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()))
+    }
+
     #[test]
-    fn the_header_is_the_geometry() {
+    fn the_rendered_sources_are_the_built_ones() {
         for inst in REGISTERED {
-            let g = Geometry::of(inst);
-            let (source, tensor) = sources_of(inst).expect("a registered instance has sources");
-            let defines: [(&str, usize); 24] = [
-                ("BLOOMERY_DELTA_VALUE_HEADS", g.delta.value_heads),
-                ("BLOOMERY_DELTA_HEAD_COLS", g.delta.head_cols),
-                ("BLOOMERY_DELTA_RING_ROWS", g.delta.ring_rows),
-                ("BLOOMERY_ROUTER_ROWS", g.router.rows),
-                ("BLOOMERY_ROUTER_EXPERTS", g.router.experts),
-                ("BLOOMERY_ROUTER_K", g.router.k),
-                ("BLOOMERY_ROUTER_FLOAT4S", g.router.float4s),
-                ("BLOOMERY_ROUTER_TOPK_MAX", g.router.top_k_max),
-                ("BLOOMERY_ROUTER_SHARED", g.router.shared),
-                ("BLOOMERY_EXPERT_SLOTS", g.experts.slots),
-                ("BLOOMERY_EXPERT_ROUTED", g.experts.routed_ids),
-                ("BLOOMERY_EXPERT_SHARED", g.experts.shared_slot),
-                ("BLOOMERY_EXPERT_K", g.experts.k),
-                ("BLOOMERY_ATTN_HEAD", g.attn.head),
-                ("BLOOMERY_ATTN_ROT", g.attn.rot),
-                ("BLOOMERY_ATTN_Q", g.attn.query_heads),
-                ("BLOOMERY_ATTN_KV", g.attn.kv_heads),
-                ("BLOOMERY_ATTN_SG", g.attn.simd_groups),
-                ("BLOOMERY_ATTN_GQA", g.attn.gqa),
-                ("BLOOMERY_ATTN_PARTIAL", g.attn.partial_elems),
-                ("BLOOMERY_ATTN_QG", g.attn.qg_stride),
-                ("BLOOMERY_ATTN_THREADS", g.attn.flash_threads),
-                ("BLOOMERY_ATTN_LANE_DIMS", g.attn.lane_dims),
-                ("BLOOMERY_ATTN_GATED", usize::from(g.attn.gated)),
-            ];
-            for (name, want) in defines {
-                assert_eq!(
-                    define_of(source, name),
-                    Some(want),
-                    "{}: {name} in the kernels' source",
-                    inst.name
-                );
-                assert_eq!(
-                    define_of(tensor, name),
-                    Some(want),
-                    "{}: {name} in the tensor-op source",
-                    inst.name
-                );
-            }
-            assert_eq!(
-                define_of(source, "BLOOMERY_DELTA_COLS_PER_BLOCK"),
-                Some(g.delta.head_cols / crate::geometry::PARTIALS_PER_HEAD),
-                "{}: BLOOMERY_DELTA_COLS_PER_BLOCK",
-                inst.name
+            let (built, built_tensor) =
+                sources_of(inst).expect("a registered instance has sources");
+            let (source, tensor) = rendered(inst).expect("a registered geometry is taken");
+            assert!(
+                source == built,
+                "{inst}: the kernels' source differs from build.rs's at byte {}",
+                differs_at(&source, built)
+            );
+            assert!(
+                tensor == built_tensor,
+                "{inst}: the tensor-op source differs from build.rs's at byte {}",
+                differs_at(&tensor, built_tensor)
             );
         }
+    }
+
+    #[test]
+    fn an_unregistered_geometry_renders_its_own_header() {
+        let mut key = REGISTERED[0].key;
+        key.hidden = 3072;
+        let inst = open_key(key).expect("a geometry every kernel takes opens");
+        assert_eq!(inst.name, UNREGISTERED);
+        assert!(
+            sources_of(inst).is_err(),
+            "build.rs embedded no source for it"
+        );
+        let (source, tensor) = rendered(inst).expect("its geometry is taken");
+        assert_eq!(
+            header::define_of(&source, "BLOOMERY_ROUTER_K"),
+            Some(3072),
+            "the router's K in the header"
+        );
+        assert_eq!(
+            header::define_of(&tensor, "BLOOMERY_ROUTER_K"),
+            Some(3072),
+            "the router's K in the tensor-op header"
+        );
+        assert!(source.ends_with(MAIN_BODY) && tensor.ends_with(TENSOR_BODY));
+    }
+
+    #[test]
+    fn a_geometry_no_kernel_takes_is_refused_before_a_compile() {
+        let mut inst = REGISTERED[0];
+        inst.name = UNREGISTERED;
+        inst.key.hidden = 3136;
+        let Err(e) = rendered(&inst) else {
+            panic!("hidden 3136 is not a multiple of the router's 1024");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains("router: hidden is 3136; it must be a multiple of 1024"),
+            "{text}"
+        );
     }
 }

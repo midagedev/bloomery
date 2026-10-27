@@ -1,9 +1,62 @@
+use core::fmt;
+
 use crate::attention_geom;
 use crate::delta_geom;
 use crate::experts_geom;
 use crate::geometry;
 use crate::instance::{HOST, Instance};
 use crate::router_geom;
+
+/// A geometry one kernel family cannot take: which kernel, which axis, the
+/// value the geometry has and what the kernel needs there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRefused {
+    /// The kernel family: `attention`, `router`, `experts` or `delta`.
+    pub kernel: &'static str,
+    /// The axis the kernel cannot take.
+    pub axis: &'static str,
+    /// The axis's value in the geometry, as text.
+    pub value: String,
+    /// What the kernel needs of the axis.
+    pub needs: &'static str,
+}
+
+impl KernelRefused {
+    /// The refusal of `kernel` at `axis`, which is `value` where `needs` is
+    /// asked.
+    #[must_use]
+    pub fn new(
+        kernel: &'static str,
+        axis: &'static str,
+        value: impl fmt::Display,
+        needs: &'static str,
+    ) -> Self {
+        Self {
+            kernel,
+            axis,
+            value: value.to_string(),
+            needs,
+        }
+    }
+}
+
+/// A flag as a refusal prints it.
+#[must_use]
+pub const fn yes_no(flag: bool) -> &'static str {
+    if flag { "yes" } else { "no" }
+}
+
+impl fmt::Display for KernelRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {} is {}; it must be {}",
+            self.kernel, self.axis, self.value, self.needs
+        )
+    }
+}
+
+impl std::error::Error for KernelRefused {}
 
 /// The numbers of decode attention for one instance.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,11 +158,13 @@ pub struct ExpertsGeom {
 /// a window or a buffer by, derived once from its row.
 ///
 /// [`Geometry::of`] is a `const fn` over the same functions the kernels'
-/// source header is written from: `build.rs` prints each instance-derived
-/// `#define` from this struct, so a launch and the kernel it dispatches
-/// cannot disagree about a number. `Kernels` holds the geometry of its
-/// library's instance (`Kernels::geom`), resolved when the pipelines are
-/// made.
+/// source header is written from: [`crate::header::render`] prints each
+/// instance-derived `#define` from this struct, at build for a registered
+/// instance and at open for the file's, so a launch and the kernel it
+/// dispatches cannot disagree about a number. `Kernels` holds the geometry of
+/// its library's instance (`Kernels::geom`), resolved when the pipelines are
+/// made. A geometry the kernels cannot take is refused by
+/// [`Geometry::check`], which every open runs before the header is written.
 ///
 /// The names the host read before a geometry existed (`HEAD_DIM`,
 /// `EXPERT_K`, `LOGIT_STRIDE`, `partials_len`, and the rest of the geometry
@@ -120,7 +175,7 @@ pub struct ExpertsGeom {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geometry {
     /// The instance the numbers are derived from.
-    pub instance: &'static Instance,
+    pub instance: Instance,
     /// The residual width: the router's K and the head's.
     pub hidden: usize,
     /// Decode attention.
@@ -136,8 +191,12 @@ pub struct Geometry {
 impl Geometry {
     /// The geometry of `inst`, from the functions the kernels' source header
     /// is written from, so the values equal the header's by construction.
+    ///
+    /// The numbers are derived, not judged: a geometry no kernel takes still
+    /// has them (a score scale none is written for is NaN), and
+    /// [`Geometry::check`] refuses it.
     #[must_use]
-    pub const fn of(inst: &'static Instance) -> Geometry {
+    pub const fn of(inst: &Instance) -> Geometry {
         let key = &inst.key;
         let hidden = key.hidden as usize;
         let head = key.attn.row.head as usize;
@@ -149,7 +208,7 @@ impl Geometry {
         let slots = experts_geom::slots(inst);
         let routed_ids = key.moe.top_k as usize;
         Geometry {
-            instance: inst,
+            instance: *inst,
             hidden,
             attn: AttnGeom {
                 head,
@@ -195,6 +254,20 @@ impl Geometry {
             },
         }
     }
+
+    /// Whether every kernel family takes this geometry: the kernels' own
+    /// `static_assert`s, stated where the host sizes its launches.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelRefused`] naming the first kernel family, axis and value a
+    /// kernel cannot take.
+    pub fn check(&self) -> Result<(), KernelRefused> {
+        attention_geom::holds(self)?;
+        router_geom::holds(self)?;
+        experts_geom::holds(self)?;
+        delta_geom::holds(self)
+    }
 }
 
 /// The geometry of the build's host instance ([`HOST`]): what the shims of
@@ -203,8 +276,125 @@ pub const HOST_GEOMETRY: Geometry = Geometry::of(&HOST);
 
 #[cfg(test)]
 mod tests {
+    use models::shape::{self, RouterBody};
+
     use super::*;
-    use crate::instance::REGISTERED;
+    use crate::instance::{DeltaAxes, QWEN35MOE_A3B, REGISTERED};
+
+    /// A case of the refusal table: how Qwen3.6's row is moved, and the kernel,
+    /// axis and value (a prefix of it) the geometry is then refused at.
+    type Case = (
+        fn(&mut Instance),
+        (&'static str, &'static str, &'static str),
+    );
+
+    /// Attention of `n_head` heads of `head` values over the shape table's
+    /// row of a group of eight.
+    fn attention(inst: &mut Instance, head: u32, n_head: u32) {
+        inst.key.attn.row = shape::gqa_row(head, 8).expect("the shape table has the row");
+        inst.key.attn.n_head = n_head;
+    }
+
+    /// Qwen3-30B's attention over the shape table's row that cuts a window and
+    /// folds sinks.
+    fn window_row(inst: &mut Instance) {
+        inst.key.attn.row = shape::GQA[1];
+        inst.key.attn.n_head = 32;
+        inst.key.attn.n_kv = 4;
+        inst.key.attn.rot = 64;
+    }
+
+    /// A delta layer of the given axes.
+    fn delta(inst: &mut Instance, value_heads: u32, head_cols: u32, conv_taps: u32) {
+        inst.key.delta = Some(DeltaAxes {
+            value_heads,
+            head_cols,
+            conv_taps,
+        });
+    }
+
+    #[test]
+    fn every_registered_geometry_passes_the_check() {
+        for inst in REGISTERED {
+            assert_eq!(Geometry::of(inst).check(), Ok(()), "{}", inst.name);
+        }
+        // A shape no row registers, with the axes the kernels take free.
+        let mut inst = QWEN35MOE_A3B;
+        inst.key.hidden = 3072;
+        inst.key.moe.expert_ff = 1024;
+        inst.key.attn.rot = 32;
+        assert_eq!(Geometry::of(&inst).check(), Ok(()));
+    }
+
+    #[test]
+    fn a_geometry_a_kernel_cannot_take_is_refused_by_name() {
+        // One case a clause of each kernel family's `holds`, each moving the
+        // axes of Qwen3.6's row (hidden 2048, expert ff 512, 16 heads of 256
+        // over 2, rope 64, 32 delta heads of 128 and 4 taps) to the named one.
+        let cases: [Case; 14] = [
+            (|i| i.key.hidden = 3136, ("router", "hidden", "3136")),
+            (
+                |i| i.key.moe.router = shape::router_row(RouterBody::BiasedSigmoid, 256),
+                ("router", "router rule", "Sigmoid scores, bias yes"),
+            ),
+            (
+                |i| i.key.moe.expert_ff = 700,
+                ("experts", "expert ff", "700"),
+            ),
+            (|i| attention(i, 64, 16), ("attention", "head", "64")),
+            (
+                |i| i.key.attn.row.value = 192,
+                ("attention", "value width", "192"),
+            ),
+            (
+                |i| i.key.attn.n_head = 15,
+                ("attention", "query heads", "15"),
+            ),
+            (
+                |i| i.key.attn.n_head = 32,
+                ("attention", "query heads a key head", "16"),
+            ),
+            (
+                |i| attention(i, 128, 16),
+                ("attention", "query heads x head", "2048"),
+            ),
+            (|i| i.key.attn.rot = 128, ("attention", "rope dims", "128")),
+            (|i| i.key.attn.rot = 33, ("attention", "rope dims", "33")),
+            (
+                window_row,
+                (
+                    "attention",
+                    "flash row",
+                    "window yes, sinks yes, value scale no",
+                ),
+            ),
+            (|i| delta(i, 32, 128, 5), ("delta", "conv taps", "5")),
+            (|i| delta(i, 48, 128, 4), ("delta", "value heads", "48")),
+            (|i| delta(i, 32, 64, 4), ("delta", "head columns", "64")),
+        ];
+        let mut wrong = Vec::new();
+        for (moved, (kernel, axis, value)) in cases {
+            let mut inst = QWEN35MOE_A3B;
+            moved(&mut inst);
+            match Geometry::of(&inst).check() {
+                Err(got)
+                    if got.kernel == kernel && got.axis == axis && got.value.starts_with(value) => {
+                }
+                got => wrong.push(format!("{kernel}/{axis} {value}: {got:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "not refused as named:\n{}",
+            wrong.join("\n")
+        );
+        let mut inst = QWEN35MOE_A3B;
+        inst.key.hidden = 3136;
+        assert_eq!(
+            Geometry::of(&inst).check().unwrap_err().to_string(),
+            "router: hidden is 3136; it must be a multiple of 1024 (a float4 a lane over 256 threads)"
+        );
+    }
 
     #[test]
     fn each_geometry_is_its_row() {
@@ -212,7 +402,7 @@ mod tests {
             let g = Geometry::of(inst);
             let key = &inst.key;
             let name = inst.name;
-            assert_eq!(g.instance, inst, "{name}: the instance");
+            assert_eq!(g.instance, *inst, "{name}: the instance");
             assert_eq!(g.hidden, key.hidden as usize, "{name}: hidden");
 
             let a = g.attn;

@@ -1,13 +1,16 @@
 use core::fmt;
+use std::sync::{Mutex, PoisonError};
 
+use crate::geom::{Geometry, KernelRefused};
 use models::shape::{self, AttnShape, GqaInst, MoeShape, RouterBody, RouterInst, ShapeRefused};
-use models::{DeltaKind, Ffn, Mixer, ModelSpec, OutGate};
+use models::{DeltaKind, Ffn, GdnGate, Mixer, ModelSpec, OutGate};
 
 /// One instance: the axes its kernels are compiled at, under a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Instance {
     /// The instance's name: the stem of the sources `build.rs` writes for
-    /// it, and how a refusal names it.
+    /// it, and how a refusal names it. [`UNREGISTERED`] for an instance made
+    /// at open for a shape no row registers.
     pub name: &'static str,
     pub key: Key,
     /// The cargo feature a build whose host is this instance ([`HOST`]) is
@@ -132,10 +135,14 @@ pub const QWEN3MOE_A3B: Instance = Instance {
 };
 
 /// Every instance `build.rs` writes and compiles. A shape with no row here
-/// has no kernels: a file of it is refused by name ([`select`]), and the
-/// route to running it is a row here (its router and flash rows in the
-/// shape table first).
+/// is compiled at open when every kernel family takes its geometry
+/// ([`select`]), from the source; a row here is the route to its metallib
+/// (its router and flash rows in the shape table first).
 pub const REGISTERED: &[Instance] = &[QWEN35MOE_A3B, QWEN3MOE_A3B];
+
+/// The name of an instance made at open for a shape no row registers. No
+/// registered instance has it.
+pub const UNREGISTERED: &str = "unregistered";
 
 /// The instance the host is written at: the launches' grids and the
 /// buffers' lengths read its axes as constants (`kernels::*_geom`), so the
@@ -161,6 +168,17 @@ impl Instance {
     }
 }
 
+impl fmt::Display for Instance {
+    /// A registered instance by its name, an unregistered one by its shape.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.name == UNREGISTERED {
+            write!(f, "an unregistered shape ({})", self.key)
+        } else {
+            f.write_str(self.name)
+        }
+    }
+}
+
 /// Why a file has no instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -175,6 +193,10 @@ pub enum Refused {
     Missing { what: &'static str },
     /// The file's axes are no registered instance's.
     NoInstance { key: Key },
+    /// The file's axes are no registered instance's, and a kernel cannot take
+    /// them, so there is nothing to compile. The key is boxed: it would make
+    /// every `Refused` as large as the key.
+    Geometry { key: Box<Key>, why: KernelRefused },
 }
 
 impl fmt::Display for Key {
@@ -234,6 +256,12 @@ impl fmt::Display for Refused {
                 }
                 Ok(())
             }
+            Refused::Geometry { key, why } => {
+                write!(
+                    f,
+                    "no instance is built for {key}, and no kernel takes it: {why}"
+                )
+            }
         }
     }
 }
@@ -278,6 +306,12 @@ impl Key {
         for (layer, (mixer, ffn)) in layers.into_iter().enumerate() {
             match mixer {
                 Mixer::Gqa(g) => {
+                    if g.out_gate == OutGate::Proj {
+                        return Err(Refused::Kind {
+                            layer,
+                            what: "an attention output gate on its own projection",
+                        });
+                    }
                     let row = shape::select_gqa(AttnShape::of(g))
                         .map_err(|why| Refused::Row { layer, why })?;
                     let axes = AttnAxes {
@@ -289,7 +323,15 @@ impl Key {
                     };
                     agree(&mut attn, axes, layer, "attention")?;
                 }
-                Mixer::DeltaRule(d) if matches!(d.kind, DeltaKind::Gdn { .. }) => {
+                Mixer::DeltaRule(d)
+                    if matches!(
+                        d.kind,
+                        DeltaKind::Gdn {
+                            gate: GdnGate::Silu,
+                            ..
+                        }
+                    ) =>
+                {
                     let axes = DeltaAxes {
                         value_heads: d.v_heads,
                         head_cols: d.d,
@@ -300,7 +342,7 @@ impl Key {
                 Mixer::DeltaRule(_) => {
                     return Err(Refused::Kind {
                         layer,
-                        what: "a delta rule other than the gated delta net",
+                        what: "a delta rule other than the gated delta net with a SiLU gate",
                     });
                 }
                 other => {
@@ -341,20 +383,60 @@ impl Key {
 /// [`Refused::NoInstance`] naming `key` and every registered instance when
 /// none has it: never the nearest row.
 pub fn of_key(key: Key) -> Result<&'static Instance, Refused> {
-    REGISTERED
-        .iter()
-        .find(|inst| inst.key == key)
-        .ok_or(Refused::NoInstance { key })
+    registered(&key).ok_or(Refused::NoInstance { key })
 }
 
-/// The registered instance a file described by `spec` runs.
+/// The registered instance of `key`, if any.
+fn registered(key: &Key) -> Option<&'static Instance> {
+    REGISTERED.iter().find(|inst| inst.key == *key)
+}
+
+/// The instances made at open, one per key: a cache, so a key selected twice
+/// in a process (the plan's check, then the open's) is one instance for the
+/// life of the process.
+static OPENED: Mutex<Vec<&'static Instance>> = Mutex::new(Vec::new());
+
+/// The instance a file of `key` runs: the registered instance of its key,
+/// else an instance made at open when every kernel family takes the key's
+/// geometry ([`Geometry::check`]). The library of an instance made at open
+/// is compiled from the source.
 ///
 /// # Errors
 ///
-/// [`Refused`] when the file's shape has no instance ([`Key::of`],
-/// [`of_key`]).
+/// [`Refused::Geometry`] naming the kernel family, the axis and its value
+/// when a kernel cannot take the geometry: never the nearest row.
+pub fn open_key(key: Key) -> Result<&'static Instance, Refused> {
+    if let Some(inst) = registered(&key) {
+        return Ok(inst);
+    }
+    let made = Instance {
+        name: UNREGISTERED,
+        key,
+        host_feature: None,
+    };
+    Geometry::of(&made)
+        .check()
+        .map_err(|why| Refused::Geometry {
+            key: Box::new(key),
+            why,
+        })?;
+    let mut opened = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(inst) = opened.iter().find(|inst| inst.key == key) {
+        return Ok(inst);
+    }
+    let inst: &'static Instance = Box::leak(Box::new(made));
+    opened.push(inst);
+    Ok(inst)
+}
+
+/// The instance a file described by `spec` runs ([`Key::of`], [`open_key`]).
+///
+/// # Errors
+///
+/// [`Refused`] when the file's shape has no row in the shape table, is of a
+/// kind no kernel runs, or has a geometry no kernel takes.
 pub fn select(spec: &ModelSpec) -> Result<&'static Instance, Refused> {
-    of_key(Key::of(
+    open_key(Key::of(
         spec.hidden,
         spec.layers.iter().map(|l| (&l.mixer, &l.ffn)),
     )?)
@@ -480,6 +562,10 @@ mod tests {
                 Ok(m.router),
                 "{}: the router row is the one the table selects at its picks",
                 inst.name
+            );
+            assert_ne!(
+                inst.name, UNREGISTERED,
+                "the name is an instance made at open's"
             );
             let named = REGISTERED.iter().filter(|i| i.name == inst.name).count();
             let keyed = REGISTERED.iter().filter(|i| i.key == inst.key).count();
@@ -679,6 +765,97 @@ mod tests {
                 what: "a dense FFN"
             }),
             "a dense layer"
+        );
+    }
+
+    #[test]
+    fn a_layer_the_kernels_read_otherwise_is_refused_by_name() {
+        // The key records a query gate as present or absent; a gate on a
+        // projection of its own is neither.
+        let own: Vec<_> = qwen3_30b()
+            .into_iter()
+            .map(|(_, f)| (gqa_gated(32, 4, 128, 128, OutGate::Proj), f))
+            .collect();
+        assert_eq!(
+            key(2048, &own),
+            Err(Refused::Kind {
+                layer: 0,
+                what: "an attention output gate on its own projection"
+            })
+        );
+        // The delta kernel gates its output with SiLU.
+        let mut sigmoid = qwen36();
+        sigmoid[0].0 = Mixer::DeltaRule(DeltaRule {
+            kind: DeltaKind::Gdn {
+                khead_map: KHeadMap::Tiled,
+                gate: GdnGate::Sigmoid,
+            },
+            k_heads: 16,
+            v_heads: 32,
+            d: 128,
+            conv: 4,
+        });
+        assert_eq!(
+            key(2048, &sigmoid),
+            Err(Refused::Kind {
+                layer: 0,
+                what: "a delta rule other than the gated delta net with a SiLU gate"
+            })
+        );
+    }
+
+    #[test]
+    fn a_shape_no_row_registers_opens_when_every_kernel_takes_it() {
+        for inst in REGISTERED {
+            assert_eq!(
+                *open_key(inst.key).expect("a registered key opens"),
+                *inst,
+                "{}: a registered key opens its row",
+                inst.name
+            );
+        }
+        // Qwen3.6's layers at another hidden width: no row, and the kernels
+        // take it.
+        let wide = key(4096, &qwen36()).expect("the shape table has its rows");
+        assert!(of_key(wide).is_err(), "no row has hidden 4096");
+        let opened = open_key(wide).expect("every kernel takes hidden 4096");
+        assert_eq!(opened.name, UNREGISTERED);
+        assert_eq!(opened.key, wide);
+        assert_eq!(opened.host_feature, None);
+        assert!(
+            core::ptr::eq(opened, open_key(wide).expect("opens again")),
+            "one instance a key"
+        );
+        assert!(
+            opened
+                .to_string()
+                .starts_with("an unregistered shape (hidden 4096;"),
+            "{opened}"
+        );
+        assert_eq!(Geometry::of(opened).check(), Ok(()));
+    }
+
+    #[test]
+    fn a_shape_no_kernel_takes_is_refused_by_name() {
+        // Hidden 3136 is no multiple of the router's 1024.
+        let odd = key(3136, &qwen36()).expect("the shape table has its rows");
+        let got = open_key(odd);
+        let Err(Refused::Geometry { key, why }) = &got else {
+            panic!("hidden 3136: {got:?}");
+        };
+        assert_eq!(**key, odd);
+        assert_eq!(
+            (why.kernel, why.axis, why.value.as_str()),
+            ("router", "hidden", "3136")
+        );
+        let text = got.unwrap_err().to_string();
+        assert!(
+            text.starts_with("no instance is built for hidden 3136;")
+                && text.ends_with(
+                    "router: hidden is 3136; it must be a multiple of 1024 \
+                     (a float4 a lane over 256 threads)"
+                ),
+            "{text}"
         );
     }
 }
