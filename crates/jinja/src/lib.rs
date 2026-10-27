@@ -2525,6 +2525,9 @@ fn filter(
     if name == "join" {
         return join_filter(v, args, kwargs);
     }
+    if matches!(name, "select" | "reject" | "selectattr" | "rejectattr") {
+        return select_filter(v, name, args, kwargs);
+    }
     if !args.is_empty() || !kwargs.is_empty() {
         return err(format!("|{name} takes no arguments"));
     }
@@ -2595,22 +2598,32 @@ fn bind_args<'a, const N: usize>(
     Ok(slots)
 }
 
-/// `join(d='')` without autoescape: Python's `str()` of each item of a list (a mapping's keys, a
-/// string's characters; nothing for undefined), the separator's `str()` between them.
+/// The items a `for` walks in `v`: a list's, a mapping's keys, a string's characters, a range's
+/// integers. Any other value comes back as the error, for the caller to name.
+fn elements(v: V) -> Result<Vec<Value>, V> {
+    match v {
+        V::J(Value::Array(a)) => Ok(a),
+        V::J(Value::Object(m)) => Ok(m.into_iter().map(|(k, _)| Value::String(k)).collect()),
+        V::J(Value::String(s)) => Ok(s.chars().map(|c| Value::String(c.to_string())).collect()),
+        V::Range(r) => Ok(r.items()),
+        other => Err(other),
+    }
+}
+
+/// `join(d='')` without autoescape: Python's `str()` of each item of a sequence (a mapping's keys,
+/// a string's characters; nothing for undefined), the separator's `str()` between them.
 fn join_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
     let slots = bind_args("|join", ["d", "attribute"], args, kwargs)?;
     if slots[1].is_some_and(|a| !matches!(a, V::J(Value::Null))) {
         return err("|join: attribute is not supported");
     }
     let sep = slots[0].map(to_str).transpose()?.unwrap_or_default();
-    let items: Vec<Value> = match v {
-        V::J(Value::Array(a)) => a,
-        V::J(Value::Object(m)) => m.into_iter().map(|(k, _)| Value::String(k)).collect(),
-        V::J(Value::String(s)) => s.chars().map(|c| Value::String(c.to_string())).collect(),
-        V::Undef => Vec::new(),
-        other => {
+    let items = match elements(v) {
+        Ok(items) => items,
+        Err(V::Undef) => Vec::new(),
+        Err(other) => {
             return err(format!(
-                "|join needs a list, a mapping or a string, not {other:?}"
+                "|join needs a list, a mapping, a string or a range, not {other:?}"
             ));
         }
     };
@@ -2622,6 +2635,116 @@ fn join_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateErro
         V::J(item).render(&mut out)?;
     }
     Ok(V::J(Value::String(out)))
+}
+
+/// One step of an attribute path.
+enum Step {
+    Key(String),
+    Pos(i64),
+}
+
+impl Step {
+    fn label(&self) -> String {
+        match self {
+            Step::Key(k) => k.clone(),
+            Step::Pos(p) => p.to_string(),
+        }
+    }
+}
+
+/// jinja2's `make_attrgetter` parts: a string splits at its dots, each part a position when it is
+/// all digits; an integer is one position.
+fn attribute_path(filter: &str, attr: &V) -> Result<Vec<Step>, TemplateError> {
+    match attr {
+        V::J(Value::String(s)) => s
+            .split('.')
+            .map(|part| {
+                if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                    part.parse().map(Step::Pos).map_err(|_| {
+                        TemplateError(format!("|{filter}: attribute position {part} is too large"))
+                    })
+                } else {
+                    Ok(Step::Key(part.to_owned()))
+                }
+            })
+            .collect(),
+        V::J(Value::Number(n)) if n.is_i64() => Ok(vec![Step::Pos(n.as_i64().expect("integer"))]),
+        other => err(format!(
+            "|{filter}: the attribute must be a string or an integer, not {other:?}"
+        )),
+    }
+}
+
+/// `item` read along `path` as jinja2's `environment.getitem` does: a missing key or position is
+/// an undefined value, and reading a further step of an undefined value is an error.
+fn attribute_of(filter: &str, path: &[Step], item: V) -> Result<V, TemplateError> {
+    let mut at = item;
+    for (i, step) in path.iter().enumerate() {
+        if matches!(at, V::Undef) {
+            let spelled: Vec<String> = path.iter().map(Step::label).collect();
+            return err(format!(
+                "|{filter}: attribute `{}` reads `{}` of an undefined `{}`",
+                spelled.join("."),
+                step.label(),
+                spelled[i - 1]
+            ));
+        }
+        at = match step {
+            Step::Key(k) => index(&at, &V::J(Value::String(k.clone()))),
+            Step::Pos(p) => index(&at, &V::J(Value::from(*p))),
+        };
+    }
+    Ok(at)
+}
+
+/// `select`, `reject`, `selectattr` and `rejectattr`: the items of a sequence that a test passes
+/// (`select`) or fails (`reject`) or, with no test name, the truthy (falsy) ones; the `attr` forms
+/// put an item's attribute through the test instead. The test is [`test`], so its names, its
+/// arguments and its refusals are the `is` operator's. The result is a list where jinja2's is a
+/// generator. Where jinja2 gives an empty result for a value that is no sequence (an undefined
+/// value, `none`, `0`, `false`) this refuses it by name.
+fn select_filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    if !kwargs.is_empty() {
+        return err(format!("|{name} takes no keyword arguments"));
+    }
+    let keep = name.starts_with("select");
+    let (path, rest) = if name.ends_with("attr") {
+        let [attr, rest @ ..] = args else {
+            return err(format!("|{name} needs an attribute name"));
+        };
+        (Some(attribute_path(name, attr)?), rest)
+    } else {
+        (None, args)
+    };
+    let (test_name, test_args) = match rest {
+        [] => (None, rest),
+        [V::J(Value::String(t)), more @ ..] => (Some(t.as_str()), more),
+        [other, ..] => {
+            return err(format!(
+                "|{name}: the test name must be a string, not {other:?}"
+            ));
+        }
+    };
+    let items = elements(v).map_err(|other| {
+        TemplateError(format!(
+            "|{name} needs a list, a mapping, a string or a range, not {other:?}"
+        ))
+    })?;
+    let mut kept = Vec::new();
+    for item in items {
+        let probe = match &path {
+            Some(path) => attribute_of(name, path, V::J(item.clone()))?,
+            None => V::J(item.clone()),
+        };
+        let passes = match test_name {
+            Some(t) => test(&probe, t, test_args)?,
+            None => probe.truthy(),
+        };
+        if passes == keep {
+            kept.push(item);
+        }
+    }
+    Ok(V::J(Value::Array(kept)))
 }
 
 /// `replace(old, new, count=None)` without autoescape: Python's `str()` on
@@ -2697,7 +2820,40 @@ fn to_str(v: &V) -> Result<String, TemplateError> {
     Ok(s)
 }
 
+/// The binary operator a comparison test is named for, by every name jinja2 gives it.
+fn test_operator(name: &str) -> Option<BinOp> {
+    Some(match name {
+        "eq" | "equalto" | "==" => BinOp::Eq,
+        "ne" | "!=" => BinOp::Ne,
+        "lt" | "lessthan" | "<" => BinOp::Lt,
+        "le" | "<=" => BinOp::Le,
+        "gt" | "greaterthan" | ">" => BinOp::Gt,
+        "ge" | ">=" => BinOp::Ge,
+        "in" => BinOp::In,
+        _ => return None,
+    })
+}
+
 fn test(v: &V, name: &str, args: &[V]) -> Result<bool, TemplateError> {
+    if let Some(op) = test_operator(name) {
+        let [other] = args else {
+            return err(format!(
+                "`is {name}` takes one argument, got {}",
+                args.len()
+            ));
+        };
+        // The operator's own evaluation (`is in` is `v in other`), so one place defines it.
+        return Ok(binop(v, op, other)?.truthy());
+    }
+    if name == "divisibleby" {
+        let [num] = args else {
+            return err(format!(
+                "`is divisibleby` takes one argument, got {}",
+                args.len()
+            ));
+        };
+        return Ok(eq(&binop(v, BinOp::Mod, num)?, &V::J(Value::from(0))));
+    }
     if name == "sameas" {
         let [other] = args else {
             return err(format!(
@@ -2726,6 +2882,10 @@ fn test(v: &V, name: &str, args: &[V]) -> Result<bool, TemplateError> {
         // Python's `bool` is a `Number`.
         "number" => matches!(v, V::J(Value::Number(_) | Value::Bool(_))),
         "boolean" => matches!(v, V::J(Value::Bool(_))),
+        "odd" | "even" => {
+            let rem = binop(v, BinOp::Mod, &V::J(Value::from(2)))?;
+            eq(&rem, &V::J(Value::from(i32::from(name == "odd"))))
+        }
         "mapping" => matches!(v, V::J(Value::Object(_))),
         // jinja2's Undefined has a length and items; a namespace has neither.
         "sequence" | "iterable" => matches!(
@@ -3461,6 +3621,241 @@ mod tests {
         }
         let e = render_err("{{ 3 | join(',') }}", vars);
         assert!(e.contains("|join needs"), "{e}");
+        // A range joins as the list of its integers.
+        assert_eq!(render("{{ range(3) | join(',') }}", json!({})), "0,1,2");
+    }
+
+    /// `select` and `reject` as jinja2 renders them: the items a test passes (fails) or, with no
+    /// test, the truthy (falsy) ones; a mapping walks as its keys, a string as its characters, a
+    /// range as its integers. The first five are the examples of jinja2's documentation, the last
+    /// is Qwen3-Coder's tool header. Each expected string is jinja2 3.1.6's render in the HF
+    /// environment.
+    #[test]
+    fn select_and_reject_follow_jinja2() {
+        let vars = json!({
+            "numbers": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "strings": ["mystring", "other", "mystring"],
+            "d": {"type": 1, "description": 2, "pattern": 3, "x": 4},
+        });
+        for (src, want) in [
+            ("{{ numbers|select('odd')|join(',') }}", "1,3,5,7,9,11"),
+            (
+                "{{ numbers|select('divisibleby', 3)|join(',') }}",
+                "3,6,9,12",
+            ),
+            ("{{ numbers|select('lessthan', 5)|join(',') }}", "1,2,3,4"),
+            (
+                "{{ strings|select('equalto', 'mystring')|join(',') }}",
+                "mystring,mystring",
+            ),
+            ("{{ numbers|reject('odd')|join(',') }}", "2,4,6,8,10,12"),
+            (
+                "{{ [0, 1, '', 'a', none, [], [0], {}, 0.0, 2.5]|select|join('|') }}",
+                "1|a|[0]|2.5",
+            ),
+            (
+                "{{ [0, 1, '', 'a', none, [], [0], {}, 0.0, 2.5]|reject|join('|') }}",
+                "0||None|[]|{}|0.0",
+            ),
+            ("{{ ['a','b','c']|reject('in', ['b'])|join(',') }}", "a,c"),
+            // The walks of a mapping, a string and a range, and the arguments a test takes.
+            ("{{ d|select('in', ['type'])|join(',') }}", "type"),
+            ("{{ 'abc'|select('in', 'abcd')|join('') }}", "abc"),
+            ("{{ ['a','b']|select('in', 'abc')|join(',') }}", "a,b"),
+            ("{{ range(5)|select('odd')|join(',') }}", "1,3"),
+            (
+                "{{ [1, 2.0, true, 'x']|select('number')|join(',') }}",
+                "1,2.0,True",
+            ),
+            ("{{ [1,2,3]|select('divisibleby', 2.0)|join(',') }}", "2"),
+            // A comparison named as a string.
+            ("{{ ['x','y']|select('==', 'x')|join(',') }}", "x"),
+            ("{{ ['x','y']|select('!=', 'x')|join(',') }}", "y"),
+            ("{{ [1,2,3]|select('>=', 2)|join(',') }}", "2,3"),
+            ("{{ [1,2,3]|select('eq', 2.0)|join(',') }}", "2"),
+            // Qwen3-Coder's header: a schema's keys the template does not render itself.
+            (
+                "{{ d.keys()|reject('in', ['type','description'])|join(',') }}",
+                "pattern,x",
+            ),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+    }
+
+    /// `selectattr` and `rejectattr` as jinja2 renders them: the attribute (a dotted path, or an
+    /// integer or digit-string position) of each item goes through the test; an item without it
+    /// hands the test an undefined value, which `defined` and `none` tell apart. The first four
+    /// are the examples of jinja2's documentation. Each expected string is jinja2 3.1.6's render
+    /// in the HF environment.
+    #[test]
+    fn selectattr_and_rejectattr_follow_jinja2() {
+        let vars = json!({
+            "users": [
+                {"n": "a", "is_active": true, "email": null, "p": {"q": 2}},
+                {"n": "b", "is_active": false, "email": "b@x", "p": {"q": 3}},
+                {"n": "c", "p": {"r": 2}},
+            ],
+            "pairs": [[1, 2], [3]],
+        });
+        for (src, want) in [
+            (
+                "{% for u in users|selectattr('is_active') %}{{ u.n }},{% endfor %}",
+                "a,",
+            ),
+            (
+                "{% for u in users|selectattr('email', 'none') %}{{ u.n }},{% endfor %}",
+                "a,",
+            ),
+            (
+                "{% for u in users|rejectattr('is_active') %}{{ u.n }},{% endfor %}",
+                "b,c,",
+            ),
+            (
+                "{% for u in users|rejectattr('email', 'none') %}{{ u.n }},{% endfor %}",
+                "b,c,",
+            ),
+            (
+                "{% for u in users|selectattr('email', 'defined') %}{{ u.n }},{% endfor %}",
+                "a,b,",
+            ),
+            (
+                "{% for u in users|selectattr('p.q', 'equalto', 2) %}{{ u.n }},{% endfor %}",
+                "a,",
+            ),
+            (
+                "{% for u in users|rejectattr('p.q', 'equalto', 2) %}{{ u.n }},{% endfor %}",
+                "b,c,",
+            ),
+            ("{{ pairs|selectattr(0, 'ge', 3)|join(',') }}", "[3]"),
+            ("{{ pairs|selectattr('0', 'ge', 3)|join(',') }}", "[3]"),
+            (
+                "{{ ['Seoul', 'Busan']|rejectattr('x')|join(',') }}",
+                "Seoul,Busan",
+            ),
+            (
+                "{{ [{'x': 1}, {'y': 2}]|selectattr('x', 'none')|join(',') }}",
+                "",
+            ),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+    }
+
+    /// What the four filters refuse, by name: where jinja2 raises (an unknown test, a test given
+    /// the wrong arguments, values the test cannot compare, an attribute read of an undefined
+    /// value) and the inputs it lets through silently, which would be an empty result here: an
+    /// undefined value, and a falsy value that is no sequence.
+    #[test]
+    fn select_and_reject_name_their_refusals() {
+        let vars = json!({"users": [{"n": "a"}, {"p": {"q": 2}}]});
+        for (src, named) in [
+            (
+                "{{ [1]|select('nosuch')|join }}",
+                "unsupported test `is nosuch`",
+            ),
+            (
+                "{{ [1]|select(none)|join }}",
+                "|select: the test name must be a string",
+            ),
+            (
+                "{{ [1]|selectattr('n', 3)|join }}",
+                "|selectattr: the test name must be a string",
+            ),
+            (
+                "{{ [1]|select('divisibleby')|join }}",
+                "`is divisibleby` takes one argument",
+            ),
+            (
+                "{{ [1]|select('divisibleby', 0)|join }}",
+                "division by zero",
+            ),
+            (
+                "{{ [1]|select('odd', 1)|join }}",
+                "`is odd` takes no argument",
+            ),
+            (
+                "{{ [1]|select('equalto')|join }}",
+                "`is equalto` takes one argument",
+            ),
+            (
+                "{{ [1]|select('equalto', 1, 2)|join }}",
+                "`is equalto` takes one argument",
+            ),
+            (
+                "{{ [1]|select('equalto', other=1)|join }}",
+                "|select takes no keyword arguments",
+            ),
+            ("{{ [1,2]|select('lessthan', 'a')|join }}", "cannot compare"),
+            ("{{ ['a']|select('odd')|join }}", "arithmetic on"),
+            (
+                "{{ ['a', 1]|select('in', 'abc')|join }}",
+                "`in` a string needs a string",
+            ),
+            ("{{ [1]|select('in', 5)|join }}", "`in` on"),
+            (
+                "{{ [1]|selectattr|join }}",
+                "|selectattr needs an attribute name",
+            ),
+            (
+                "{{ [1]|selectattr(none)|join }}",
+                "|selectattr: the attribute must be a string or an integer",
+            ),
+            (
+                "{{ users|selectattr('p.q', 'equalto', 2)|join }}",
+                "|selectattr: attribute `p.q` reads `q` of an undefined `p`",
+            ),
+            (
+                "{{ 5|select('odd')|join }}",
+                "|select needs a list, a mapping, a string or a range, not",
+            ),
+            ("{{ none|reject('odd')|join }}", "|reject needs a list"),
+            (
+                "{{ false|selectattr('x')|join }}",
+                "|selectattr needs a list",
+            ),
+            (
+                "{{ missing|rejectattr('x')|join }}",
+                "|rejectattr needs a list",
+            ),
+        ] {
+            let e = render_err(src, vars.clone());
+            assert!(e.contains(named), "{src}: {e}");
+        }
+    }
+
+    /// The tests jinja2 builds on the comparison operators, by every name it gives them (`is in`
+    /// is the operator `in`), and `odd`, `even` and `divisibleby`. The operators' own evaluation
+    /// is the one owner, so values the operator refuses are refused here. Each expected string is
+    /// jinja2 3.1.6's render in the HF environment.
+    #[test]
+    fn comparison_and_arithmetic_tests_follow_jinja2() {
+        assert_eq!(
+            render(
+                "{{ 'a' is in(['a']) }}{{ 3 is not in([1, 2]) }}{{ 3 is lessthan 5 }}{{ 3 is lt(2) }}\
+                 {{ 4 is even }}{{ 3 is odd }}{{ 6 is divisibleby 3 }}{{ 'a' is eq 'a' }}{{ 2 is ne 3 }}\
+                 {{ 2 is ge 2 }}{{ 2 is gt 2 }}{{ 2 is le 2 }}{{ 2 is greaterthan 1 }}{{ 2 is equalto 2 }}",
+                json!({})
+            ),
+            "TrueTrueTrueFalseTrueTrueTrueTrueTrueTrueFalseTrueTrueTrue"
+        );
+        assert_eq!(
+            render(
+                "{{ [1.0, 2.0, 3.5]|select('odd')|join(',') }}|{{ [true, false]|select('odd')|join(',') }}",
+                json!({})
+            ),
+            "1.0|True"
+        );
+        for (src, named) in [
+            ("{{ 3 is in 5 }}", "`in` on"),
+            ("{{ 3 is odd(1) }}", "`is odd` takes no argument"),
+            ("{{ 3 is eq }}", "`is eq` takes one argument"),
+            ("{{ 3 is lt('a') }}", "cannot compare"),
+            ("{{ 3 is divisibleby 0 }}", "division by zero"),
+        ] {
+            let e = render_err(src, json!({}));
+            assert!(e.contains(named), "{src}: {e}");
+        }
     }
 
     /// Macros as jinja2 runs them: the body sees its arguments and the top
