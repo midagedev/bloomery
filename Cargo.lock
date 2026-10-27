@@ -397,6 +397,7 @@ dependencies = [
  "bloomery-chain",
  "bloomery-device",
  "bloomery-gguf",
+ "bloomery-hf",
  "bloomery-levers",
  "bloomery-model",
  "bloomery-model-hf",

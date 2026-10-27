@@ -1,16 +1,21 @@
 //! `bloomery-serve-metal` — the llama-server-compatible HTTP API on this
-//! Mac's Metal device: a qwen35moe file opened as `generate_metal` opens it,
-//! served by `bloomery_metal::server::TargetEngine`.
+//! Mac's Metal device: a model opened as `generate_metal` opens it, served
+//! by `bloomery_metal::server::TargetEngine`.
 //!
-//!     bloomery-serve-metal -m PATH [--host 127.0.0.1] [--port 8080] [--ctx C]
+//!     bloomery-serve-metal (-m PATH | --hf REPO) [--host 127.0.0.1]
+//!                          [--port 8080] [--ctx C]
 //!                          [--chat-template-file PATH] [--alias NAME]
 //!                          [--queue-depth Q] [--api-key KEY] [--api-key-file F]
 //!
-//! `--ctx-size` and `-c` are `--ctx` under llama-server's spellings; unset,
-//! the cache holds the smaller of 32768 rows and the file's
-//! `context_length`. The file's first shard gives the vocabulary,
-//! `tokenizer.chat_template` the chat template (`--chat-template-file`
-//! replaces it) and `general.name` the alias (`--alias` replaces it).
+//! The model is a GGUF file's first shard or a checkpoint folder (an MLX
+//! folder as downloaded, no `prepare`); `--hf REPO` fetches a repo into the
+//! cache and opens it (`bloomery_metal::model_arg`). `--ctx-size` and `-c`
+//! are `--ctx` under llama-server's spellings; unset, the cache holds the
+//! smaller of 32768 rows and the file's `context_length`. The file gives the
+//! vocabulary, `tokenizer.chat_template` the chat template
+//! (`--chat-template-file` replaces it) and the alias (`--alias` replaces
+//! it): `general.name`, else the folder's name, else the repo's, else the
+//! architecture's.
 //! Sampling is the sampler crate's chain; `temperature <= 0` is the
 //! session's argmax, the ids `generate_metal --tokens` picks for the same
 //! prompt ids.
@@ -38,14 +43,16 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(target_os = "macos")]
 mod cli {
-    use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::time::Instant;
 
     use bloomery_metal::MetalDevice;
     use bloomery_metal::arch::qwen3moe::session::{CHECKPOINT_EVERY, MarkCopies, Session};
+    use bloomery_metal::model_arg;
     use bloomery_metal::server::TargetEngine;
+    use hf::source::Source;
+    use model_hf::ModelFile;
     use serve::flag::{self, ApiKeys};
     use serve::sampling::sampler_factory;
     use serve::vocab::{ChatSurface, TemplateFile, Vocab};
@@ -55,12 +62,16 @@ mod cli {
     const CTX_DEFAULT: usize = 32768;
 
     const USAGE: &str = "\
-bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-file PATH]
+bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--chat-template-file PATH]
                      [--alias NAME] [--queue-depth Q] [--api-key KEY] [--api-key-file F]
+  PATH is a GGUF file (its first shard) or a checkpoint folder; REPO is fetched into the cache
   --ctx (--ctx-size, -c) defaults to the smaller of 32768 and the file's context_length";
 
+    /// The model's path flags; `--hf` is the repo's.
+    const PATH_FLAGS: &[&str] = &["-m", "--model"];
+
     struct Args {
-        model: PathBuf,
+        model: Source,
         host: String,
         port: u16,
         ctx: Option<usize>,
@@ -71,9 +82,9 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
     }
 
     fn parse() -> Result<Args, String> {
-        let mut model = None;
+        let mut model = Vec::new();
         let mut a = Args {
-            model: PathBuf::new(),
+            model: Source::File(String::new()),
             host: "127.0.0.1".to_owned(),
             port: 8080,
             ctx: None,
@@ -86,7 +97,7 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
         while let Some(f) = it.next() {
             let mut val = || it.next().ok_or_else(|| format!("{f} needs a value"));
             match f.as_str() {
-                "-m" | "--model" => model = Some(PathBuf::from(val()?)),
+                "-m" | "--model" | "--hf" => model.push((f.clone(), val()?)),
                 "--host" => a.host = val()?,
                 "--port" => a.port = flag::number(&f, &val()?)?,
                 c if flag::CTX.contains(&c) => a.ctx = Some(flag::number(&f, &val()?)?),
@@ -98,7 +109,8 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
                 other => return Err(format!("unknown flag {other}\n{USAGE}")),
             }
         }
-        a.model = model.ok_or_else(|| format!("-m PATH is required\n{USAGE}"))?;
+        a.model = model_arg::named(&model, PATH_FLAGS, None, "-m PATH or --hf REPO")
+            .map_err(|e| format!("{e}\n{USAGE}"))?;
         Ok(a)
     }
 
@@ -135,8 +147,10 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
     }
 
     fn open(a: Args) -> Result<Server, String> {
-        let path = &a.model;
-        let split = gguf::Split::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let model = model_arg::resolve(&a.model)?;
+        let path = &model.path;
+        let file = ModelFile::open(path).map_err(|e| e.to_string())?;
+        let split = file.header();
         let ctx = match a.ctx {
             Some(c) => c,
             None => {
@@ -153,17 +167,20 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
                 CTX_DEFAULT.min(train)
             }
         };
+        let arch = split
+            .architecture()
+            .ok_or_else(|| format!("{}: the header names no architecture", path.display()))?
+            .to_owned();
         let ChatSurface { template, name } = ChatSurface::read(
             path,
             split.value("tokenizer.chat_template"),
             split.value("general.name"),
             a.template_file.path(),
-            "qwen35moe",
+            &model_arg::default_alias(file.name(), model.repo.as_deref(), &arch),
         )?;
-        drop(split);
-        let tok = tokenizer::Tokenizer::from_gguf(path).map_err(|e| e.to_string())?;
+        let tok = file.tokenizer().map_err(|e| e.to_string())?;
         let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
-        let instance = Session::instance_of(path, ctx).map_err(|e| e.to_string())?;
+        let instance = Session::instance_of_model(&file, ctx).map_err(|e| e.to_string())?;
         if instance.name == bloomery_metal::instance::UNREGISTERED {
             eprintln!(
                 "metal: {instance}: no registered instance holds this shape, so no gate checked its output"
@@ -171,15 +188,17 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
         }
         let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
         let t0 = Instant::now();
-        let session = Session::open_as(
+        let session = Session::open_model_as(
             &device,
             device.library(),
-            path,
+            &file,
             ctx,
             CHECKPOINT_EVERY,
             MarkCopies::AtOpen,
         )
         .map_err(|e| e.to_string())?;
+        // The session holds its own buffers: the file's mapping is not kept for the run.
+        drop(file);
         let checkpoints = match session.checkpoint_every() {
             Some(every) => format!(
                 "checkpoints every {every} ({} bytes a point, capacity {})",
@@ -198,7 +217,7 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
             session,
             head_rows,
             vocab,
-            "metal qwen35moe session".to_owned(),
+            format!("metal {arch} session"),
             EngineProps::default(),
         )?;
         let config = ServerConfig {

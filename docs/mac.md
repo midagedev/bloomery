@@ -53,7 +53,7 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 | [Ornith-1.5-35B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), Q4_K_M | runs, text only: it has Qwen3.6's shapes, and its next-token layer is not read |
 | [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), Q4_K_M | runs on a build after 0.3.9, text only: its `mmproj` is not read. Release 0.3.9 refuses it: `qwen35moe arena: a vocabulary of 248144; the head reads 248320` |
 | [Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), Q4_K_M | not run on a Mac yet; it has Qwen3.6's shapes |
-| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
+| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M or an MLX 4-bit folder | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `UD-Q4_K_XL` | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: its Q8_0, Q5_K and f32 tensors |
 
 The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights, and f32 at the delta layers' `ssm_alpha` and
@@ -63,42 +63,52 @@ The evidence for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
 
 ## Get a model
 
-Either file works for Qwen3.6:
+- **An MLX 4-bit folder opens as downloaded**, with no conversion step first. `--hf mlx-community/<repo>` fetches the
+  repo into the cache (`$BLOOMERY_CACHE`, else `~/.cache/bloomery/hf`) and opens it; `-m <folder>` opens a folder you
+  already have. Two folders run:
+  - [`mlx-community/Qwen3.6-35B-A3B-4bit`](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit): 19.5 GB of
+    weights, text only (the vision tower is skipped).
+  - [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit):
+    17.2 GB of weights.
 
+  The open picks the map by the folder's `model_type`, keeps MLX's 4-bit and 8-bit weights as they are stored, and
+  checks the tokenizer against the folder's. It writes nothing to disk.
 - **A Q4_K_M GGUF opens directly**, for example `Qwen3.6-35B-A3B-Q4_K_M.gguf` from
-  [`lmstudio-community/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF).
-- **An MLX 4-bit folder converts once**, for example
-  [`mlx-community/Qwen3.6-35B-A3B-4bit`](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit). `prepare` writes
-  a GGUF split that keeps MLX's 4-bit and 8-bit weights as they are stored. It skips the vision tower (text only) and
-  checks the tokenizer against the folder's. The split is 19.5 GB; the conversion needs that much free disk plus about
-  10 %.
+  [`lmstudio-community/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF), by `-m`
+  or by `--hf owner/name:Q4_K_M`.
 
-  ```sh
-  target/release/prepare PATH/Qwen3.6-35B-A3B-4bit --plan            # prints the plan, writes nothing
-  target/release/prepare PATH/Qwen3.6-35B-A3B-4bit OUT/qwen36-mlx4    # writes OUT/qwen36-mlx4-00001-of-00001.gguf
-  ```
+`prepare` is optional. It writes a folder as one GGUF split, for those who want a single file. A split and its folder
+open with the same weights. The split is the folder's size (19.5 GB or 17.2 GB), and the conversion needs that much
+free disk plus about 10 %.
 
-The Qwen3-30B-A3B MLX 4-bit folder,
-[`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit),
-converts the same way (`prepare` picks the map by the folder's `model_type`, `qwen3_moe`; the weights stay as stored).
-The split is 17.2 GB, and on a build after 0.3.9 `generate_metal` opens and runs it.
+```sh
+target/release/prepare PATH/Qwen3.6-35B-A3B-4bit --plan            # prints the plan, writes nothing
+target/release/prepare PATH/Qwen3.6-35B-A3B-4bit OUT/qwen36-mlx4    # writes OUT/qwen36-mlx4-00001-of-00001.gguf
+```
 
 A quick check from the command line (the rates print on stderr, `decode_tok_s=`):
 
 ```sh
-BLOOMERY_REF_MODEL=OUT/qwen36-mlx4-00001-of-00001.gguf \
-  target/release/generate_metal --prompt "The capital of France is" -n 32
+target/release/generate_metal --hf mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit \
+  --prompt "The capital of France is" -n 32
+target/release/generate_metal -m PATH/Qwen3-30B-A3B-Instruct-2507-4bit --prompt "The capital of France is" -n 32
 ```
 
-To learn whether a file opens before it loads: `generate_metal --plan [--ctx C]` reads only the file's
-header and tensor table. It prints every refusal, not only the first, the bytes the open would allocate, the device's
-working set and the host's free memory. It exits 0 when the header's checks pass, 3 when it is refused and 64 when the
-header cannot be read; exit 0 does not prove the load fits at run time. A 24 MB cut of a Hub file is enough.
+`BLOOMERY_REF_MODEL` names the model too, as the CUDA binaries read it. The model is named once: `-m` beside `--hf`,
+either flag twice, or a flag that differs from the variable is refused by name.
+
+To learn whether a model opens before it loads: `generate_metal [-m PATH | --hf REPO] --plan [--ctx C]` reads only the
+header and tensor table, a folder's or a GGUF file's. It prints every refusal, not only the first, the bytes the open
+would allocate, the device's working set and the host's free memory. It exits 0 when the header's checks pass, 3 when it
+is refused and 64 when the header cannot be read; exit 0 does not prove the load fits at run time. With `--hf` the
+fetch comes first, and it downloads what the cache lacks. A 24 MB cut of a Hub GGUF file is enough.
 
 ## Serve
 
 ```sh
-target/release/bloomery-serve-metal -m OUT/qwen36-mlx4-00001-of-00001.gguf --port 8080
+target/release/bloomery-serve-metal --hf mlx-community/Qwen3.6-35B-A3B-4bit --port 8080
+# or a folder or a GGUF file you have
+target/release/bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-4bit --port 8080
 
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages": [{"role": "user", "content": "What is the capital of France?"}], "max_tokens": 256}'
@@ -107,10 +117,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 The model thinks first: its reasoning comes back in `reasoning_content`, so leave `max_tokens` room for the answer.
 `/health`, `/v1/models`, `/v1/chat/completions` and `/completion` answer as llama-server's do.
 
-The flags it takes: `-m`/`--model`, `--host`, `--port`, `--ctx` (also `--ctx-size` and `-c`; unset, the smaller of
-32,768 and the file's `context_length`), `--chat-template-file`, `--alias`, `--queue-depth`, `--api-key` and
-`--api-key-file`. Any other flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused by name
-with exit 64.
+The flags it takes: `-m`/`--model` or `--hf` (one of the two), `--host`, `--port`, `--ctx` (also `--ctx-size` and `-c`;
+unset, the smaller of 32,768 and the file's `context_length`), `--chat-template-file`, `--alias` (unset, the file's
+`general.name`, else the folder's name, else the repo's), `--queue-depth`, `--api-key` and `--api-key-file`. Any other
+flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused by name with exit 64.
 
 ## What it does and does not do yet
 

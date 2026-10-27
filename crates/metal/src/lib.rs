@@ -74,6 +74,9 @@ mod handle;
 pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod library;
+/// How a binary is told its model (`-m`, `--hf`, `$BLOOMERY_REF_MODEL`) and how a repo is fetched.
+#[cfg(target_os = "macos")]
+pub mod model_arg;
 #[cfg(target_os = "macos")]
 pub mod residency;
 #[cfg(all(target_os = "macos", feature = "pipeline-scan"))]

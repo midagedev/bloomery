@@ -107,6 +107,8 @@ bloomery-model = { path = "../model" }
 # The model file a session opens, a GGUF split or a checkpoint folder behind one
 # owner (`ModelFile`, `Weights`): this crate parses no checkpoint of its own.
 bloomery-model-hf = { path = "../model-hf" }
+# `--hf REPO`: the hub's fetch into the cache, and the rule that a model is named once (`model_arg`).
+bloomery-hf = { path = "../hf" }
 # Where the fixture file sits (the one owner of the fixture root and layout),
 # and the e2e gate's oracle: ik's reference sets, opened through their family.
 bloomery-refset = { path = "../refset" }
