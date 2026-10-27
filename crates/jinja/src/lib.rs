@@ -1823,16 +1823,10 @@ impl Renderer {
                 filter,
                 body,
             } => {
-                let mut items: Vec<Value> = match self.eval(iter)? {
-                    V::Undef => Vec::new(),
-                    V::J(Value::Array(a)) => a,
-                    V::J(Value::Object(o)) => o.keys().map(|k| Value::String(k.clone())).collect(),
-                    V::J(Value::String(s)) => {
-                        s.chars().map(|c| Value::String(c.to_string())).collect()
-                    }
-                    V::J(Value::Null) => Vec::new(),
-                    V::Range(r) => r.items(),
-                    other => return err(format!("cannot iterate {other:?}")),
+                let mut items: Vec<Value> = match elements(self.eval(iter)?) {
+                    Ok(items) => items,
+                    Err(V::Undef | V::J(Value::Null)) => Vec::new(),
+                    Err(other) => return err(format!("cannot iterate {other:?}")),
                 };
                 if let Some(cond) = filter {
                     let mut kept = Vec::with_capacity(items.len());
