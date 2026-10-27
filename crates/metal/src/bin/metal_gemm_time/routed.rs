@@ -40,7 +40,7 @@ use bloomery_device::{Buffer, Device, Elems, LAYER_NONE, Stream};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, Bindings, ComputeEncoder};
 use bloomery_metal::fault::MetalFaultWord;
-use bloomery_metal::kernels::router::{EXPERTS, K as HIDDEN};
+use bloomery_metal::kernels::router::{EXPERTS, K as HIDDEN, ROWS as GROUPS};
 use bloomery_metal::kernels::{
     EXPERT_K, EXPERT_SLOTS, GEMM_THREADS, Quant, ROUTED_IDS as TOP_K, ROUTED_ROWS as TILE_ROWS,
     TABLE_THREADS, route_tiles,
@@ -217,7 +217,7 @@ fn read<T: bloomery_device::Elem + Default + Clone>(
 /// buffers.
 fn pass(ctx: &Ctx<'_>, arm: &RArm<'_>, rows: usize, ids: &[u32]) -> Result<Pass, String> {
     let slots = rows * EXPERT_SLOTS;
-    let max_tiles = route_tiles(slots, EXPERTS);
+    let max_tiles = route_tiles(slots, GROUPS);
     let ids_b = ctx.device.upload(ctx.stream, ids).map_err(why)?;
     let zeroed_u32 = |n: usize| ctx.device.zeroed::<u32>(ctx.stream, Elems(n)).map_err(why);
     let mut tiles = zeroed_u32(4 * (1 + max_tiles))?;

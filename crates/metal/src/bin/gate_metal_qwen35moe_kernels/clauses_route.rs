@@ -32,6 +32,7 @@
 //! band (`oracle_experts::pair_width`); the route weight multiplies once.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
@@ -327,7 +328,7 @@ fn table_run(h: &Harness<'_>, ids: &[u32]) -> Result<Table, String> {
     let ids_b = upload(h, ids)?;
     let mut sorted = upload(h, &vec![0xFFFF_FFFFu32; slots])?;
     let mut inv = upload(h, &vec![0xFFFF_FFFFu32; slots])?;
-    let words = route_table_words(slots, d.experts);
+    let words = route_table_words(slots, d.rows);
     let mut tiles = upload(h, &vec![0xFFFF_FFFFu32; words])?;
     h.clear_fault()?;
     h.encode(|encoder| {
@@ -464,7 +465,7 @@ fn check_table(d: Dims, ids: &[u32], t: &Table, what: &str) -> Result<usize, Str
             ));
         }
     }
-    let cap = route_table_words(slots, d.experts);
+    let cap = route_table_words(slots, d.rows);
     if t.tiles[4 * (1 + n)..cap].iter().any(|&w| w != 0xFFFF_FFFF) {
         return Err(format!("{what}: a word past the last tile was written"));
     }
@@ -733,7 +734,7 @@ fn grouped_run(
         kernels: h.kernels,
         sorted: &table.sorted,
         tiles: &table.tiles,
-        max_tiles: route_tiles(sc.rows * d.per_row, d.experts),
+        max_tiles: route_tiles(sc.rows * d.per_row, d.rows),
     };
     let out = grouped_launch(h, ex, sc, operand, &over)?;
     Ok(Grouped {
@@ -1127,6 +1128,45 @@ fn q6k_experts(d: Dims, fix: &Fixture) -> Result<Experts, String> {
     })
 }
 
+/// What a launch over a table with one tile the grouped GEMM refuses leaves:
+/// the pair and the down raise the expert-id site, the tile's `places` hold
+/// no store of either, and the place after them (the next tile's first) is
+/// stored.
+fn expect_refused(out: &Outs, d: Dims, places: Range<usize>, what: &str) -> Result<(), String> {
+    expect_site(
+        out.pair_fault,
+        &format!("the pair on {what}"),
+        FaultSite::ExpertId,
+    )?;
+    expect_site(
+        out.down_fault,
+        &format!("the down on {what}"),
+        FaultSite::ExpertId,
+    )?;
+    for p in places.clone() {
+        for (side, row) in [
+            ("pair", &out.h[p * d.expert_k..(p + 1) * d.expert_k]),
+            ("down", &out.y[p * d.k..(p + 1) * d.k]),
+        ] {
+            if let Some(v) = row.iter().find(|v| v.to_bits() != SENTINEL_BITS) {
+                return Err(format!(
+                    "the {side} stored {v:?} at place {p} of the refused tile"
+                ));
+            }
+        }
+    }
+    let after = places.end;
+    if out.h[after * d.expert_k..(after + 1) * d.expert_k]
+        .iter()
+        .any(|v| v.to_bits() == SENTINEL_BITS)
+    {
+        return Err(format!(
+            "place {after}, the next tile's first, was not stored"
+        ));
+    }
+    Ok(())
+}
+
 /// A tile the table cannot write — its run one slot longer than a tile —
 /// raises the expert-id site in the pair and in the down, and neither
 /// stores a word of its places; the table's other tiles are stored.
@@ -1146,41 +1186,89 @@ fn bad_tile(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
         kernels: h.kernels,
         sorted: &table.sorted,
         tiles: &tiles,
-        max_tiles: route_tiles(sc.rows * d.per_row, d.experts),
+        max_tiles: route_tiles(sc.rows * d.per_row, d.rows),
     };
     let out = grouped_launch(h, ex, &sc, Operand::F16, &over)?;
-    expect_site(
-        out.pair_fault,
-        "the pair on a tile past the tile's slots",
-        FaultSite::ExpertId,
-    )?;
-    expect_site(
-        out.down_fault,
-        "the down on a tile past the tile's slots",
-        FaultSite::ExpertId,
-    )?;
-    for p in first..first + count {
-        for (what, row) in [
-            ("pair", &out.h[p * d.expert_k..(p + 1) * d.expert_k]),
-            ("down", &out.y[p * d.k..(p + 1) * d.k]),
-        ] {
-            if let Some(v) = row.iter().find(|v| v.to_bits() != SENTINEL_BITS) {
-                return Err(format!(
-                    "the {what} stored {v:?} at place {p} of the bad tile"
-                ));
-            }
+    expect_refused(
+        &out,
+        d,
+        first..first + count,
+        "a tile past the tile's slots",
+    )
+}
+
+/// The table's group one past the routed experts: the shared expert's when
+/// the instance has one, a group the table cannot write when it has none. A
+/// hand-built table of two tiles, that group over the first two rows' places
+/// and the last routed expert over the rest. With a shared group both tiles
+/// are the oracle's within the band, the first against the shared tensors;
+/// with none the first raises the expert-id site in the pair and in the down
+/// and stores nothing, and the second is stored. Returns what it showed.
+fn past_routed(h: &Harness<'_>, ex: &Experts) -> Result<&'static str, String> {
+    let d = ex.dims;
+    let mut sc = scene(d, 4, None, 0x6A3);
+    let slots = sc.rows * d.per_row;
+    let cut = 2 * d.per_row;
+    let (past, last) = (d.experts as u32, d.experts as u32 - 1);
+    // The oracle reads a slot's group from the scene's ids.
+    sc.ids = (0..slots)
+        .map(|s| if s < cut { past } else { last })
+        .collect();
+    let max_tiles = route_tiles(slots, d.rows);
+    let mut tiles = vec![0xFFFF_FFFFu32; 4 * (1 + max_tiles)];
+    tiles[..12].copy_from_slice(&[
+        2,
+        0,
+        0,
+        0,
+        past,
+        0,
+        cut as u32,
+        0,
+        last,
+        cut as u32,
+        (slots - cut) as u32,
+        0,
+    ]);
+    let sorted: Vec<u32> = (0..slots as u32).collect();
+    let over = OverTable {
+        kernels: h.kernels,
+        sorted: &sorted,
+        tiles: &tiles,
+        max_tiles,
+    };
+    let out = grouped_launch(h, ex, &sc, Operand::F16, &over)?;
+    if d.shared == 0 {
+        expect_refused(
+            &out,
+            d,
+            0..cut,
+            "a tile of the group past the routed experts",
+        )?;
+        return Ok(
+            "the group past the routed experts raises the expert-id site and stores nothing",
+        );
+    }
+    for (side, fault) in [("pair", out.pair_fault), ("down", out.down_fault)] {
+        if let Some(f) = fault {
+            return Err(format!("the {side} on the shared group's tile raised {f}"));
         }
     }
-    let after = first + count;
-    if out.h[after * d.expert_k..(after + 1) * d.expert_k]
-        .iter()
-        .any(|v| v.to_bits() == SENTINEL_BITS)
-    {
-        return Err(format!(
-            "place {after}, the next tile's first, was not stored"
-        ));
-    }
-    Ok(())
+    let run = Grouped {
+        h: out.h,
+        y: out.y,
+        table: Table {
+            inv: sorted.clone(),
+            sorted,
+            tiles,
+            fault: None,
+        },
+        pair_fault: None,
+        down_fault: None,
+    };
+    check_grouped(ex, &sc, &run, Operand::F16, 1, None, h.kernels.gemm_path())
+        .map_err(|e| format!("the shared group's tile: {e}"))?;
+    Ok("the group past the routed experts is the shared expert's, within the band")
 }
 
 /// The grouped GEMM's every arm of one weight type on `h`'s kernels (the
@@ -1190,7 +1278,8 @@ fn bad_tile(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
 /// group's), which end inside a SIMD group's second block of places and
 /// inside the second group's first; an activation past the half range the
 /// fault and NaN; a tile past the tile's slots the expert-id site with
-/// nothing stored.
+/// nothing stored; the group past the routed experts the shared expert's or
+/// that site, by whether the instance has one.
 fn grouped_arms(h: &Harness<'_>, ex: &Experts) -> Clause {
     let note = grouped_quant(h, ex, &[Operand::F16, Operand::F32])?;
     let mut runs = Vec::new();
@@ -1217,8 +1306,9 @@ fn grouped_arms(h: &Harness<'_>, ex: &Experts) -> Clause {
         runs.push(format!("runs of {rows} pair {pair:.3} down {down:.3}"));
     }
     bad_tile(h, ex)?;
+    let past = past_routed(h, ex)?;
     Ok(Verdict::Noted(format!(
-        "{} kernels, worst error over its band: {note}, {}; a tile past the tile's slots raises the expert-id site and stores nothing",
+        "{} kernels, worst error over its band: {note}, {}; a tile past the tile's slots raises the expert-id site and stores nothing; {past}",
         h.kernels.gemm_path().name(),
         runs.join(", ")
     )))
@@ -1703,7 +1793,7 @@ pub fn route_refusals(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
     let ids_b = upload(h, &vec![0u32; slots])?;
     let mut sorted = upload(h, &vec![0u32; slots])?;
     let mut inv = upload(h, &vec![0u32; slots])?;
-    let words = route_table_words(slots, d.experts);
+    let words = route_table_words(slots, d.rows);
     let mut tiles = upload(h, &vec![0u32; words])?;
     let logits_b = upload(h, &vec![0f32; 2 * d.logit_stride])?;
     let mut sel_ids = upload(h, &vec![0u32; 2 * d.row_ids()])?;

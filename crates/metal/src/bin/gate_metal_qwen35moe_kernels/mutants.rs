@@ -48,7 +48,7 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
 /// those whose text its preprocessor removes or whose edit is the same
 /// program there: the gated epilogues (`attn_gate_s1`, `attn_gate_merge`),
 /// the shared slot (`pair_shared_stack`), the shared group of the grouped GEMM
-/// (`routed_shared_base`), the picks' stride (`route_rows_per_row`), the
+/// (`routed_shared_base`, `routed_shared_group_refused`), the picks' stride (`route_rows_per_row`), the
 /// logits' stride (`route_rows_stride`: the row's logits are dense, the stride
 /// its row count) and the key head swap (`prefill_kv_head`: four key heads
 /// make `1 - kv` wrap).
@@ -204,6 +204,33 @@ pub const Q30_MUTANTS: &[Mutant] = &[
             "#if 1\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
             1,
         )],
+    },
+    Mutant {
+        name: "routed_group_past_routed_open",
+        clause: "grouped_q6_down",
+        why: "a tile of the group one past the routed experts passes the expert-id check on an instance with no shared expert and reads one expert past the stack",
+        edits: &[(
+            "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+            "expert > args.n_experts",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_group_past_routed_shared",
+        clause: "grouped_q6_down",
+        why: "a tile of the group one past the routed experts is taken for the shared expert's on an instance with none: it raises no expert-id site and reads the stack's first expert",
+        edits: &[
+            (
+                "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+                "expert > args.n_experts",
+                1,
+            ),
+            (
+                "const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;",
+                "const bool shared = expert == args.n_experts;",
+                1,
+            ),
+        ],
     },
 ];
 
@@ -1167,6 +1194,16 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[("shared ? W_sh : W +", "shared ? W : W +", 1)],
     },
     Mutant {
+        name: "routed_shared_group_refused",
+        clause: "q8_0_grouped",
+        why: "the group past the routed experts is refused as a tile the table cannot write, though the instance has a shared expert",
+        edits: &[(
+            "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+            "expert >= args.n_experts",
+            1,
+        )],
+    },
+    Mutant {
         name: "routed_no_weight",
         clause: "grouped_gemm",
         why: "the pair's output is not scaled by the slot's route weight",
@@ -1635,6 +1672,16 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
         edits: &[(
             "blk.scales + ((s >> 1) & 1), sc16);",
             "blk.scales + ((s >> 2) & 1), sc16);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_routed_shared_group_refused",
+        clause: "tensor_q8_0_grouped",
+        why: "the group past the routed experts is refused as a tile the table cannot write, though the instance has a shared expert",
+        edits: &[(
+            "expert >= args.n_experts + BLOOMERY_ROUTER_SHARED",
+            "expert >= args.n_experts",
             1,
         )],
     },
