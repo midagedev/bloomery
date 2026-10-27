@@ -38,6 +38,11 @@
 //!   to each mark and continued to the end, twice: the same pick, logits row
 //!   and stores both times, and the tokens after it within `q_free`'s band of
 //!   the stepped run's.
+//! - `q_marked`: a prompt call with a mark inside it, longer than a step's
+//!   window, runs as a pass and leaves the unmarked call's bits; the stepped
+//!   run's pick and the teacher-forced tokens after it hold to `q_free`'s
+//!   band. A file with no recurrent store drops the mark (it has nothing to
+//!   copy).
 //! - `q_tensor`: `q_free` with the pass's GEMMs on the tensor-op kernels
 //!   (`Library::with_tensor_gemms`), forced on any device that builds them,
 //!   held to the same band and cap: the tensor path's dot band is `q_free`'s
@@ -54,7 +59,7 @@ use bloomery_metal::arch::qwen3moe::session::{
     Node, Op, PassOut, Session, SessionError, StateOut, StepMode,
 };
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{CONV_TAPS, HEAD_COLS, HEAD_DIM, KV_HEADS, RING_ROWS, VALUE_HEADS};
+use bloomery_metal::geom::Geometry;
 use bloomery_metal::library::{GemmPath, Library};
 use runtime::prompt::PrefillMode;
 use runtime::{Target, Want};
@@ -104,10 +109,14 @@ const LAYER_RATIO: f64 = 2.5;
 const LOGITS_RATIO: f64 = 1.5;
 
 /// The conv rows ik's state holds: the taps less the current token's.
-const CONV_ROWS: usize = CONV_TAPS - 1;
+fn conv_rows(g: &Geometry) -> usize {
+    g.delta.conv_taps - 1
+}
 
 /// A row of the cache: one cell's key (or value) heads.
-const KV_ROW: usize = KV_HEADS * HEAD_DIM;
+fn kv_row(g: &Geometry) -> usize {
+    g.attn.kv_heads * g.attn.head
+}
 
 /// The ids of `q_layers`'s pass: more than a step's window, so the pass runs
 /// every rows arm.
@@ -121,6 +130,11 @@ const FREE_STEPS: usize = 4;
 /// before the ring's length, one past it, and the last.
 const MARK_IDS: usize = 40;
 const MARK_ROWS: [u32; 3] = [6, 25, 39];
+
+/// The ids `q_marked` prompts, more than a step's window so the call is a
+/// pass, and the mark inside it.
+const MARKED_IDS: usize = 40;
+const MARKED_AT: u32 = 20;
 
 /// The marks `q_mark_cut` puts inside its prompt's second pass (a point every
 /// [`MARK_EVERY`]): one where the ring is all that pass's rows, one whose ring
@@ -253,11 +267,12 @@ fn differs(what: &str, a: &Stores, b: &Stores) -> Option<String> {
 
 /// The rows of the three positions before `p` in a conv ring, a position's
 /// row first: the rows ik's conv state holds.
-fn kept_ring(ring: &[f32], p: usize) -> Vec<f32> {
-    let ch = ring.len() / RING_ROWS;
-    let mut out = Vec::with_capacity(CONV_ROWS * ch);
-    for j in 0..CONV_ROWS {
-        let slot = (p + j - CONV_ROWS) % RING_ROWS;
+fn kept_ring(ring: &[f32], p: usize, g: &Geometry) -> Vec<f32> {
+    let (taps, ring_rows) = (conv_rows(g), g.delta.ring_rows);
+    let ch = ring.len() / ring_rows;
+    let mut out = Vec::with_capacity(taps * ch);
+    for j in 0..taps {
+        let slot = (p + j - taps) % ring_rows;
         out.extend_from_slice(&ring[slot * ch..(slot + 1) * ch]);
     }
     out
@@ -270,34 +285,37 @@ fn kept_ring(ring: &[f32], p: usize) -> Vec<f32> {
 /// layout the fixture's set has; any other shape is refused by name).
 fn ik_stores(
     man: &refset::ik::RefManifest,
+    g: &Geometry,
     kinds: &[Layer],
     p: usize,
 ) -> Result<Vec<Store>, String> {
+    let (conv_rows, kv_row) = (conv_rows(g), kv_row(g));
+    let (value_heads, head_cols) = (g.delta.value_heads, g.delta.head_cols);
     let mut out = Vec::new();
     for (l, kind) in kinds.iter().enumerate() {
         out.push(match kind {
             Layer::Delta { .. } => {
                 let s = sets::input(man, &format!("cache_s_l{l}"))?;
-                let ssm_len = VALUE_HEADS * HEAD_COLS * HEAD_COLS;
+                let ssm_len = value_heads * head_cols * head_cols;
                 let conv_len = s.len().checked_sub(ssm_len).unwrap_or(1);
-                if conv_len == 0 || conv_len % CONV_ROWS != 0 {
+                if conv_len == 0 || conv_len % conv_rows != 0 {
                     return Err(format!("cache_s_l{l} holds {} values", s.len()));
                 }
-                let channels = conv_len / CONV_ROWS;
+                let channels = conv_len / conv_rows;
                 let (conv, ssm) = s.split_at(conv_len);
                 let mut state = vec![0.0f32; ssm.len()];
-                for h in 0..VALUE_HEADS {
-                    for k in 0..HEAD_COLS {
-                        for v in 0..HEAD_COLS {
-                            state[(h * HEAD_COLS + v) * HEAD_COLS + k] =
-                                ssm[(h * HEAD_COLS + k) * HEAD_COLS + v];
+                for h in 0..value_heads {
+                    for k in 0..head_cols {
+                        for v in 0..head_cols {
+                            state[(h * head_cols + v) * head_cols + k] =
+                                ssm[(h * head_cols + k) * head_cols + v];
                         }
                     }
                 }
                 let mut ring = vec![0.0f32; conv_len];
-                for j in 0..CONV_ROWS {
+                for j in 0..conv_rows {
                     for ch in 0..channels {
-                        ring[j * channels + ch] = conv[ch * CONV_ROWS + j];
+                        ring[j * channels + ch] = conv[ch * conv_rows + j];
                     }
                 }
                 Store::Rec { state, ring }
@@ -306,14 +324,14 @@ fn ik_stores(
                 let plane = |name: String| -> Result<Vec<f32>, String> {
                     let (vals, ne) = sets::input_f16_rows(man, &name)?;
                     let rows_of_cell_heads =
-                        ne[0] as usize == HEAD_DIM && (ne[1] as usize / KV_HEADS) >= p;
-                    let flat = ne[1] == 1 && (ne[0] as usize / KV_ROW) >= p;
-                    if !(rows_of_cell_heads || flat) || vals.len() < p * KV_ROW {
+                        ne[0] as usize == g.attn.head && (ne[1] as usize / g.attn.kv_heads) >= p;
+                    let flat = ne[1] == 1 && (ne[0] as usize / kv_row) >= p;
+                    if !(rows_of_cell_heads || flat) || vals.len() < p * kv_row {
                         return Err(format!(
-                            "{name} is {ne:?}, not rows of {KV_ROW} holding {p} positions"
+                            "{name} is {ne:?}, not rows of {kv_row} holding {p} positions"
                         ));
                     }
-                    Ok(vals[..p * KV_ROW].to_vec())
+                    Ok(vals[..p * kv_row].to_vec())
                 };
                 Store::Kv {
                     k: plane(format!("cache_k_l{l}"))?,
@@ -327,11 +345,12 @@ fn ik_stores(
 
 /// A layer's distance from `base` (ik's): the larger of its two stores'
 /// `‖ours − base‖ / ‖base‖`, a ring read at the three rows ik keeps.
-fn store_dist(ours: &Store, base: &Store, p: usize) -> f64 {
+fn store_dist(ours: &Store, base: &Store, p: usize, g: &Geometry) -> f64 {
     match (ours, base) {
-        (Store::Rec { state, ring }, Store::Rec { state: s, ring: r }) => {
-            flip::worse(flip::rel_to(state, s), flip::rel_to(&kept_ring(ring, p), r))
-        }
+        (Store::Rec { state, ring }, Store::Rec { state: s, ring: r }) => flip::worse(
+            flip::rel_to(state, s),
+            flip::rel_to(&kept_ring(ring, p, g), r),
+        ),
         (Store::Kv { k, v }, Store::Kv { k: kb, v: vb }) => {
             flip::worse(flip::rel_to(k, kb), flip::rel_to(v, vb))
         }
@@ -542,12 +561,13 @@ pub fn q_ref(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let stores_pass = run_prompt(&mut pass, &ids)?;
     let stores_steps = run_prompt(&mut steps, &ids)?;
     let p = ids.len();
-    let ik_layers = ik_stores(&man, pass.token_layers(), p)?;
+    let geom = *pass.geom();
+    let ik_layers = ik_stores(&man, &geom, pass.token_layers(), p)?;
     let mut worst_store = (0f64, 0usize);
     for (l, ik) in ik_layers.iter().enumerate() {
         let (dp, ds) = (
-            store_dist(&stores_pass.layers[l], ik, p),
-            store_dist(&stores_steps.layers[l], ik, p),
+            store_dist(&stores_pass.layers[l], ik, p, &geom),
+            store_dist(&stores_steps.layers[l], ik, p, &geom),
         );
         let ratio = flip::worse(0.0, dp / ds.max(f64::MIN_POSITIVE));
         println!(
@@ -644,15 +664,44 @@ fn free_run(device: &MetalDevice, library: &Library, path: &Path, clause: &str) 
     let mut steps = open(device, library, path, ctx, 2048, PrefillMode::Steps)?;
     let (_, pick) = keep::prompt_bits(&mut steps, &ids)?;
     let (_, pass_pick) = keep::prompt_bits(&mut pass, &ids)?;
+    teacher_forced(
+        clause,
+        &mut pass,
+        &mut steps,
+        (pick, pass_pick),
+        "1,024 ids",
+    )
+}
+
+/// The greedy tokens of `steps` teacher-forced through both sessions, which
+/// hold the same prompt (`after` names it), `picks` the two runs' prompt
+/// picks: every layer's output of every token within [`FREE_BAND`] of the
+/// stepped run's and the routers' picks differing in no more than
+/// [`FREE_FLIPS_MAX`] sites.
+fn teacher_forced(
+    clause: &str,
+    pass: &mut Session,
+    steps: &mut Session,
+    picks: (u32, u32),
+    after: &str,
+) -> Clause {
+    let (pick, pass_pick) = picks;
     let mut tok = pick;
     let (mut worst, mut flips, mut agree) = (0f64, 0usize, usize::from(pick == pass_pick));
     let layers = pass.layer_count();
+    let routed = pass.geom().experts.routed_ids;
     for t in 0..FREE_STEPS {
-        let b = traced_step(&mut steps, tok)?;
-        let a = traced_step(&mut pass, tok)?;
+        let b = traced_step(steps, tok)?;
+        let a = traced_step(pass, tok)?;
         for l in 0..layers {
-            worst = flip::worse(worst, flip::rel_to(&a.outs[l], &b.outs[l]));
-            flips += usize::from(a.ids[l][..a.ids[l].len() - 1] != b.ids[l][..b.ids[l].len() - 1]);
+            let rel = flip::rel_to(&a.outs[l], &b.outs[l]);
+            let flipped = a.ids[l][..routed] != b.ids[l][..routed];
+            println!(
+                "{clause} token {t} layer {l}: output {rel:.3e} of the stepped run's, router picks {}",
+                if flipped { "differ" } else { "equal" }
+            );
+            worst = flip::worse(worst, rel);
+            flips += usize::from(flipped);
         }
         if a.top == b.top {
             agree += 1;
@@ -661,7 +710,7 @@ fn free_run(device: &MetalDevice, library: &Library, path: &Path, clause: &str) 
         tok = b.top;
     }
     let line = format!(
-        "{FREE_STEPS} teacher-forced tokens after 1,024 ids: worst layer output {worst:.3e} of the stepped run's (band {FREE_BAND}), {flips} router sites with other picks (cap {FREE_FLIPS_MAX}), {agree} of {} picks equal",
+        "{FREE_STEPS} teacher-forced tokens after {after}: worst layer output {worst:.3e} of the stepped run's (band {FREE_BAND}), {flips} router sites with other picks (cap {FREE_FLIPS_MAX}), {agree} of {} picks equal",
         FREE_STEPS + 1
     );
     if worst <= FREE_BAND && flips <= FREE_FLIPS_MAX {
@@ -669,6 +718,61 @@ fn free_run(device: &MetalDevice, library: &Library, path: &Path, clause: &str) 
     } else {
         Err(line)
     }
+}
+
+/// `q_marked`: a prompt call with a mark inside it, longer than a step's
+/// window, is a pass that moves none of the unmarked call's bits, and the
+/// stepped run's pick and teacher-forced tokens hold to `q_free`'s band after
+/// it. The mark is a checkpoint where the file has a recurrent store to copy
+/// and nothing where it has none.
+pub fn q_marked(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let ids = prompt_ids(MARKED_IDS)?;
+    let ctx = ids.len() + FREE_STEPS + 1;
+    let mut pass = open(device, library, path, ctx, 2048, PrefillMode::Batch)?;
+    let plain = run_prompt(&mut pass, &ids)?;
+    if pass.stats().passes == 0 {
+        return Err(format!(
+            "a prompt of {MARKED_IDS} ids did not take the pass"
+        ));
+    }
+    pass.reset().map_err(says)?;
+    let before = pass.stats();
+    let (logits, pick) = keep::prompt_bits_marked(&mut pass, &ids, &[MARKED_AT])?;
+    let moved = chain::moved(&pass, before);
+    if moved.passes == 0 {
+        return Err(format!(
+            "the prompt of {MARKED_IDS} ids marked at {MARKED_AT} ran no pass"
+        ));
+    }
+    let recurrent = super::row::current().recurrent;
+    if pass.checkpoint_positions().contains(&MARKED_AT) != recurrent {
+        return Err(format!(
+            "the mark at {MARKED_AT} left the points {:?}; the file {} a recurrent store to copy",
+            pass.checkpoint_positions(),
+            if recurrent { "has" } else { "has no" }
+        ));
+    }
+    let marked = read_stores(&mut pass, pick, logits)?;
+    if let Some(why) = differs(&format!("a prompt marked at {MARKED_AT}"), &marked, &plain) {
+        return Err(format!("{why}, against the unmarked call"));
+    }
+    let mut steps = open(device, library, path, ctx, 2048, PrefillMode::Steps)?;
+    let (_, steps_pick) = keep::prompt_bits(&mut steps, &ids)?;
+    let line = teacher_forced(
+        "q_marked",
+        &mut pass,
+        &mut steps,
+        (steps_pick, pick),
+        &format!("{MARKED_IDS} ids marked at {MARKED_AT}"),
+    )?;
+    Ok(match line {
+        Verdict::Noted(line) => Verdict::Noted(format!(
+            "the prompt of {MARKED_IDS} ids marked at {MARKED_AT} ran a pass and left the unmarked \
+             call's pick, logits row, states, rings and cache rows bit for bit, {} point; {line}",
+            if recurrent { "the mark a" } else { "no" }
+        )),
+        other => other,
+    })
 }
 
 /// `q_fault`: the pass reads its fault word once, at its end, and poisons.
@@ -831,13 +935,13 @@ fn stores_at_point(s: &mut Session, at: u32, end: &Stores) -> Result<Stores, Str
 /// from 0, differs from `found` (the ring that pass found) in a slot of a
 /// position before the pass: slots `r + 1..`, which the copy takes from the
 /// ring as it was.
-fn found_slots(at: &Stores, found: &Stores, r: usize) -> Option<usize> {
+fn found_slots(at: &Stores, found: &Stores, r: usize, ring_rows: usize) -> Option<usize> {
     at.layers
         .iter()
         .zip(&found.layers)
         .position(|(a, f)| match (a, f) {
             (Store::Rec { ring: a, .. }, Store::Rec { ring: f, .. }) => {
-                let from = (r + 1) * (f.len() / RING_ROWS);
+                let from = (r + 1) * (f.len() / ring_rows);
                 bits(&a[from..]) != bits(&f[from..])
             }
             _ => false,
@@ -856,6 +960,7 @@ pub fn q_mark(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         2048,
         PrefillMode::Batch,
     )?;
+    let ring_rows = s.geom().delta.ring_rows;
     s.reset().map_err(says)?;
     let found = read_stores(&mut s, 0, Vec::new())?;
     let plain = copied_pass(&mut s, &ids, &[])?;
@@ -879,8 +984,8 @@ pub fn q_mark(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
             {
                 return Err(format!("{why}, against the pass's own end"));
             }
-            if (r as usize) + 1 < RING_ROWS
-                && let Some(l) = found_slots(&at, &found, r as usize)
+            if (r as usize) + 1 < ring_rows
+                && let Some(l) = found_slots(&at, &found, r as usize, ring_rows)
             {
                 return Err(format!(
                     "{held}: delta layer {l}'s ring slots before the pass are not the ring the \
@@ -926,6 +1031,7 @@ pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Claus
         return Err("a prompt of 1,024 ids did not take the pass".to_string());
     }
     let layers = s.layer_count();
+    let routed = s.geom().experts.routed_ids;
     let mut notes = Vec::new();
     // Descending: a cut drops the points past it.
     for &u in MARK_CUTS.iter().rev() {
@@ -951,8 +1057,7 @@ pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Claus
             let a = traced_step(&mut s, tok)?;
             for l in 0..layers {
                 worst = flip::worse(worst, flip::rel_to(&a.outs[l], &b.outs[l]));
-                flips +=
-                    usize::from(a.ids[l][..a.ids[l].len() - 1] != b.ids[l][..b.ids[l].len() - 1]);
+                flips += usize::from(a.ids[l][..routed] != b.ids[l][..routed]);
             }
             tok = b.top;
         }

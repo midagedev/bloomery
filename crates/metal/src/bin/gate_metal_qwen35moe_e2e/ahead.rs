@@ -11,7 +11,8 @@
 //!   checkpoints the prompt crosses (every second position) and one it does
 //!   not, which steps its span (`PrefillMode::Steps`; a longer span is a pass
 //!   by default); `StepStats` shows the ids ahead all kept, their count the loop's
-//!   own rule (mirrored below for the expectation).
+//!   own rule (mirrored below for the expectation). A file with no recurrent
+//!   store takes no checkpoint, so it has no session that crosses one.
 //! - the checkpoint: the token ahead a mark's take waits out is dropped —
 //!   the rule the cut, fault and reset paths share — and the prompt on from
 //!   the mark, and a cut back to it, match the host-fed run: the point the
@@ -332,6 +333,9 @@ pub fn h_prompt(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
     // not cut at a mark steps. The pass has its own clauses (`pass.rs`).
     wide.set_prefill(PrefillMode::Steps);
     let mut near = Session::open_with(device, library, path, CTX, EVERY).map_err(says)?;
+    // Its spans are the marks' two ids on a file with a recurrent store, and
+    // the call's whole run on one without; either steps.
+    near.set_prefill(PrefillMode::Steps);
 
     let reference = host_fed(&mut wide, &ids)?;
     let counted = counts(&mut wide, &ids)?;
@@ -346,23 +350,31 @@ pub fn h_prompt(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
         "the ahead prompt",
     )?;
 
-    let (got, moved) = ahead(&mut near, &ids)?;
-    if let Some(d) = differs("the ahead prompt across marks", &got, &reference) {
-        return Err(d);
+    // A file with no recurrent store takes no checkpoint inside a call.
+    let recurrent = super::row::current().recurrent;
+    if recurrent {
+        let (got, moved) = ahead(&mut near, &ids)?;
+        if let Some(d) = differs("the ahead prompt across marks", &got, &reference) {
+            return Err(d);
+        }
+        stats_are(
+            &moved,
+            ahead_calls(&ids, &seqstate::marks(0, P as u32, EVERY), 0),
+            "the ahead prompt across marks",
+        )?;
     }
-    stats_are(
-        &moved,
-        ahead_calls(&ids, &seqstate::marks(0, P as u32, EVERY), 0),
-        "the ahead prompt across marks",
-    )?;
 
     let checked = checkpoint_ahead(&mut near, &ids, &reference)?;
     Ok(Verdict::Noted(format!(
         "{counted}; the ahead prompt left the host-fed run's position, pick, logits row, {} \
-         delta lanes and {} cache rows bit for bit and its {} greedy picks, with a mark crossed \
-         and without; {checked}",
+         delta lanes and {} cache rows bit for bit and its {} greedy picks, {}; {checked}",
         reference.lanes.len(),
         reference.kv.len(),
-        GREEDY
+        GREEDY,
+        if recurrent {
+            "with a mark crossed and without"
+        } else {
+            "the file taking no mark to cross"
+        }
     )))
 }

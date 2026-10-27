@@ -97,12 +97,15 @@ mac-test:
 lab-metal:
     cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
-# The qwen35moe session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the fixture family's file
+# The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over two rows (`--row`): the qwen35moe
+# fixture, then the qwen3moe fixture (attention layers only, no shared expert, no recurrent store; the clauses that
+# hold a delta contract print SKIP with their reason). Each row: the fixture family's file
 # (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count, the
 # fault path of a bad token id, the session as the generation loop's target (its greedy loop, logits read-back,
 # prompt and cut rules), the generation core the CLI runs (ids, stops, sink) and the profile step (its picks and logits
 # equal the plain step's, its group tags covering the count's groups, its weight bytes equal the file's own tensors);
-# then the gate's kernel mutants, each of which its clause must catch; then the generate_metal CLI's smoke on the same fixture: the batch set's first ids
+# then the gate's kernel mutants, each of which its clause must catch; then the generate_metal CLI's smoke on the qwen35moe fixture (and, for the ids
+# and the text prompt, on the qwen3moe fixture): the batch set's first ids
 # through --tokens must print g_generate's reference ids (the fixture family is pinned by sha, so the ids are baked
 # here), a text prompt must decode to non-empty stdout, and the decode rate and the profile's decode_ms must count the
 # loop's passes (none for a one-token run, 7 for eight tokens). A lab-* recipe: the box has no Metal device, so no
@@ -115,11 +118,20 @@ lab-metal-e2e:
     run() { "$@" || { rc=$?; echo "lab-metal-e2e: '$*' failed (rc $rc)" >&2; exit "$rc"; }; }
     run cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e --bin generate_metal --bin bloomery-serve-metal
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3moe
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
     fx="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf"
     want="134895,160927,412,163951,82046,43343,102520,19258"
     ids="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" || die "generate_metal smoke: the run failed (rc $?)"
     [ "$ids" = "$want" ] || die "generate_metal smoke: ids $ids; $want is expected"
+    # The qwen3moe fixture's batch set opens with 785,6722,315: the CLI picks the library of the file's instance. The first
+    # id is ik's g_generate reference after those three ids; the eight pin this engine's greedy output on the fixture.
+    fx3="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen3moe/qwen3moe-fixture-00001-of-00001.gguf"
+    want3="86066,124430,50136,141037,109958,50136,109958,48396"
+    ids3="$(BLOOMERY_REF_MODEL="$fx3" ./target/release/generate_metal --tokens 785,6722,315 -n 8 --print-ids)" || die "generate_metal qwen3moe smoke: the run failed (rc $?)"
+    [ "$ids3" = "$want3" ] || die "generate_metal qwen3moe smoke: ids $ids3; $want3 is expected"
+    out3="$(BLOOMERY_REF_MODEL="$fx3" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" || die "generate_metal qwen3moe text smoke: the run failed (rc $?)"
+    [ -n "$out3" ] || die "generate_metal qwen3moe text smoke: empty stdout"
     out="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" || die "generate_metal text smoke: the run failed (rc $?)"
     [ -n "$out" ] || die "generate_metal text smoke: empty stdout"
     one="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 1 --print-ids --profile 2 2>&1 >/dev/null)" || die "generate_metal rate smoke: the one-token run failed (rc $?)"

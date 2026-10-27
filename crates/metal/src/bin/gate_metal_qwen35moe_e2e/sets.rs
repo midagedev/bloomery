@@ -1,8 +1,7 @@
-//! The fixture family's reference sets, opened through the family's check
-//! (`refset::arch::qwen35moe::fixture::IK`): a set dumped from another file,
+//! The row's reference sets, opened through its family's check
+//! (`refset::arch::<arch>::fixture::IK`): a set dumped from another file,
 //! another generation of the fixture or another ik build is refused by name.
 
-use refset::arch::qwen35moe::fixture as fx;
 use refset::ik::{
     RefManifest, ref_tensor_logical_in, topk_ids_logical_within, widened_f16_rows_in,
 };
@@ -17,14 +16,15 @@ pub enum Set {
     D1k,
 }
 
-/// Set `set`, checked against its family.
+/// Set `set` of the row this process runs, checked against its family.
 pub fn open(set: Set) -> Result<RefManifest, String> {
+    let row = super::row::current();
     let name = match set {
-        Set::Batch => fx::BATCH,
-        Set::Step => fx::STEP4,
-        Set::D1k => fx::D1K,
+        Set::Batch => row.batch,
+        Set::Step => row.step4,
+        Set::D1k => row.d1k,
     };
-    RefManifest::open(&fx::IK.path(name), &fx::IK).map_err(|e| format!("{name}: {e}"))
+    RefManifest::open(&row.ik.path(name), row.ik).map_err(|e| format!("{name}: {e}"))
 }
 
 /// The logical values of node `name` (its first occurrence).

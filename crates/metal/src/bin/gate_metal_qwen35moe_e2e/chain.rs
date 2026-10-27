@@ -204,8 +204,13 @@ pub fn c_resume(s: &mut Session) -> Clause {
             "the broken promise's id {x} picked {first_a} host-fed, {first_b} after the drop"
         ));
     }
-    if after_a.lanes.is_empty() {
-        return Err("the token has no delta layer to hold the lanes of".to_string());
+    if after_a.lanes.is_empty() == super::row::current().recurrent {
+        return Err(format!(
+            "row {} says recurrent = {}; the token holds {} delta lanes",
+            super::row::current().name,
+            super::row::current().recurrent,
+            after_a.lanes.len()
+        ));
     }
     if let Some(d) = differs("after the broken promise", &after_a, &after_b) {
         return Err(d);

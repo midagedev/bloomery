@@ -19,9 +19,13 @@
 //!   unmoved (a partial prompt would move it), and the session still steps
 //!   the pick a fresh replay of the same prefix steps. The rule's granted
 //!   arms beside them: a cut to the position does nothing, a cut to 0
-//!   resets.
+//!   resets. A file with no recurrent store keeps any position, so its cut
+//!   between 0 and the position is granted instead: the position moves to it
+//!   and the session steps the pick a fresh replay of the prefix up to it
+//!   steps.
 //! - the cut rule: `kept` (and `keepable` as its `at`) for 0, a position
-//!   between, the position, and past it.
+//!   between, the position, and past it. A file with no recurrent store
+//!   answers each with its own rule: the smaller of the ask and the position.
 //! - no host allocation call in a steady target step, for either read-back
 //!   (`d_count`'s counter and its first-call exception).
 
@@ -302,17 +306,29 @@ fn the_refusals(s: &mut Session, toks: &[u32]) -> Result<String, String> {
     // so no checkpoint stands below it.
     fed(s, prefix)?;
     let held = s.pos();
-    let err = match Target::cut(s, 1) {
-        Err(e) => says(e),
-        Ok(()) => return Err("a cut to position 1 ran".into()),
-    };
-    if !err.contains("no checkpoint") {
-        return Err(format!("a cut to a middle position refused as: {err}"));
+    if super::row::current().recurrent {
+        let err = match Target::cut(s, 1) {
+            Err(e) => says(e),
+            Ok(()) => return Err("a cut to position 1 ran".into()),
+        };
+        if !err.contains("no checkpoint") {
+            return Err(format!("a cut to a middle position refused as: {err}"));
+        }
+        if s.pos() != held {
+            return Err(format!("a refused cut moved the position to {}", s.pos()));
+        }
+        usable_after(s, prefix, next)?;
+    } else {
+        // No recurrent store: the caches hold every position below the cut.
+        Target::cut(s, 1).map_err(|e| format!("a cut to position 1: {}", says(e)))?;
+        if s.pos() != 1 {
+            return Err(format!(
+                "a cut to position 1 left the position at {}",
+                s.pos()
+            ));
+        }
+        usable_after(s, &prefix[..1], prefix[1])?;
     }
-    if s.pos() != held {
-        return Err(format!("a refused cut moved the position to {}", s.pos()));
-    }
-    usable_after(s, prefix, next)?;
 
     // The granted arms: the position itself does nothing, 0 resets.
     fed(s, prefix)?;
@@ -339,55 +355,37 @@ fn the_refusals(s: &mut Session, toks: &[u32]) -> Result<String, String> {
             "after a cut to 0 the session stepped {pick}; a fresh session steps {fresh}"
         ));
     }
-    Ok(
-        "a prompt of no ids, a prompt past the cache's last row and a cut to a middle position \
-        refused by name, the position unmoved, the session stepping on; a cut to the position \
-        did nothing and a cut to 0 reset to step a fresh session's pick"
-            .to_string(),
-    )
+    let middle = if super::row::current().recurrent {
+        "refused by name, the position unmoved, the session stepping on"
+    } else {
+        "granted (the file keeps any position), the session stepping a fresh replay's pick"
+    };
+    Ok(format!(
+        "a prompt of no ids and a prompt past the cache's last row refused by name, the position \
+        unmoved, the session stepping on; a cut to a middle position {middle}; a cut to the \
+        position did nothing and a cut to 0 reset to step a fresh session's pick"
+    ))
 }
 
 /// `kept` and `keepable` for the rule's four asks.
 fn the_rule(s: &mut Session, toks: &[u32]) -> Result<String, String> {
     fed(s, &toks[..PREFIX])?;
     let held = s.pos();
+    // With a recurrent store the ledger answers: nothing for 0, nothing below
+    // the first checkpoint, the held positions from the position up. With
+    // none, the file's own rule keeps the smaller of the ask and the position.
+    let recurrent = super::row::current().recurrent;
+    let kept = |asked: u32, at: u32, why: Why| Kept {
+        asked,
+        held,
+        at: if recurrent { at } else { asked.min(held) },
+        why: if recurrent { why } else { Why::Rule },
+    };
     let cases = [
-        (
-            0,
-            Kept {
-                asked: 0,
-                held,
-                at: 0,
-                why: Why::Empty,
-            },
-        ),
-        (
-            1,
-            Kept {
-                asked: 1,
-                held,
-                at: 0,
-                why: Why::Missed { lost: None },
-            },
-        ),
-        (
-            held,
-            Kept {
-                asked: held,
-                held,
-                at: held,
-                why: Why::Current,
-            },
-        ),
-        (
-            held + 3,
-            Kept {
-                asked: held + 3,
-                held,
-                at: held,
-                why: Why::Current,
-            },
-        ),
+        (0, kept(0, 0, Why::Empty)),
+        (1, kept(1, 0, Why::Missed { lost: None })),
+        (held, kept(held, held, Why::Current)),
+        (held + 3, kept(held + 3, held, Why::Current)),
     ];
     for (n, want) in cases {
         let got = Target::kept(s, n);
@@ -402,10 +400,17 @@ fn the_rule(s: &mut Session, toks: &[u32]) -> Result<String, String> {
             ));
         }
     }
-    Ok(format!(
-        "kept for 0 (empty), a middle position (no checkpoint), {held} and past it (current), \
-         keepable each one's at"
-    ))
+    Ok(if recurrent {
+        format!(
+            "kept for 0 (empty), a middle position (no checkpoint), {held} and past it (current), \
+             keepable each one's at"
+        )
+    } else {
+        format!(
+            "kept for 0, a middle position, {held} and past it is the smaller of the ask and \
+             {held} (the file's rule), keepable each one's at"
+        )
+    })
 }
 
 /// No host allocation call in a steady target step, either read-back.

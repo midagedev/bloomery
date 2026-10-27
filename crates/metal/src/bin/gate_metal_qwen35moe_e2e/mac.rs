@@ -1,8 +1,15 @@
-//! The qwen35moe e2e gate's clauses (macOS only).
+//! The e2e gate's clauses (macOS only).
 //!
 //! The session (`bloomery_metal::arch::qwen3moe::session`) opens the file
 //! the fixture family runs (`refset::fixture::first_shard`), the file its
-//! reference sets were dumped from, and every clause starts from its reset:
+//! reference sets were dumped from, and every clause starts from its reset.
+//! The gate runs over a row (`--row`, `row.rs`): the qwen35moe fixture by
+//! default, or the qwen3moe fixture. A clause reads the file's numbers from
+//! the session's geometry and layers; a row names the clauses whose contract
+//! its file's architecture lacks (a delta layer's recurrent state), and the
+//! gate prints each as that clause's SKIP line with its reason. The kernel
+//! mutants (`--mutant`, `--mutants-all`) and the `--nodes` walk run on the
+//! default row.
 //!
 //! - `d_count`: host-fed, then in chain steps, every step of a depth within
 //!   one segment of keys encodes the groups and dispatches
@@ -71,7 +78,7 @@
 //!   host-fed picks (`t_target`'s greedy pattern on that session).
 //!
 //! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`, `q_layers`,
-//!   `q_mark`, `q_mark_cut`: the batched prompt pass (`pass.rs`): a prompt of at
+//!   `q_mark`, `q_mark_cut`, `q_marked`: the batched prompt pass (`pass.rs`): a prompt of at
 //!   most a step's window is the step path; one pass against the stepped ids
 //!   leaves layer 0's state and ring within a derived band; the pass size moves
 //!   no bit; the step at the prompt's depth against ik's `l_out` and logits, the
@@ -80,7 +87,9 @@
 //!   token-id site and poisons; a pass is one command buffer a layer and leaves
 //!   the profiled pass's bits; a pass's copies at rows inside it move none of its
 //!   bits and are its state there, and a prompt cut back to a mark inside its
-//!   pass continues the same every time, within the teacher-forced band.
+//!   pass continues the same every time, within the teacher-forced band; a
+//!   prompt call with a mark inside it is a pass that leaves the unmarked
+//!   call's bits, on a file with a recurrent store or without one.
 //! - `q_tensor`: `q_free` with the pass's GEMMs forced onto the tensor-op
 //!   kernels, on any device that builds them (`pass.rs`).
 //!
@@ -109,11 +118,11 @@ use std::time::{Duration, Instant};
 use bloomery_device::DeviceError;
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
-use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
+use bloomery_metal::arch::qwen3moe::count::{Layer, LiveKeys, Ticket, token_count};
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::instance::HOST;
-use bloomery_metal::library::{Library, TENSOR_SOURCE};
+use bloomery_metal::instance::Instance;
+use bloomery_metal::library::{Library, sources_of};
 
 #[path = "ahead.rs"]
 mod ahead;
@@ -143,6 +152,8 @@ mod pass;
 mod profile;
 #[path = "resident.rs"]
 mod resident;
+#[path = "row.rs"]
+mod row;
 #[path = "serve.rs"]
 mod serve;
 #[path = "sets.rs"]
@@ -177,9 +188,9 @@ pub fn says(e: SessionError) -> String {
     e.to_string()
 }
 
-/// The file the fixture family runs: the one its sets were dumped from.
+/// The file the row's fixture family runs: the one its sets were dumped from.
 fn model_path() -> Result<PathBuf, String> {
-    refset::fixture::first_shard(refset::arch::qwen35moe::ARCH)
+    refset::fixture::first_shard(row::current().arch)
         .map(PathBuf::from)
         .map_err(|e| format!("the fixture file: {e}"))
 }
@@ -455,25 +466,30 @@ fn library_of(
     }
 }
 
-/// The tensor-op program `q_tensor` forces: the shipped one, or a tensor-op
-/// mutant's.
-fn tensor_text_of(mutant: Option<(&mutants::Mutant, mutants::Program)>) -> Result<String, String> {
+/// The tensor-op program `q_tensor` forces: the shipped one of the file's
+/// instance, or a tensor-op mutant's.
+fn tensor_text_of(
+    instance: &'static Instance,
+    mutant: Option<(&mutants::Mutant, mutants::Program)>,
+) -> Result<String, String> {
     match mutant {
         Some((m, mutants::Program::Tensor)) => mutants::source_of(m, mutants::Program::Tensor),
-        _ => Ok(TENSOR_SOURCE.to_string()),
+        _ => sources_of(instance)
+            .map(|(_, tensor)| tensor.to_string())
+            .map_err(why),
     }
 }
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(name) = ["--only", "--mutant"]
+    if let Some(name) = ["--only", "--mutant", "--row"]
         .into_iter()
         .find(|name| args.last().is_some_and(|last| last == name))
     {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 24] = [
+    const NAMES: [&str; 25] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -497,6 +513,7 @@ pub fn main() -> ExitCode {
         "q_layers",
         "q_mark",
         "q_mark_cut",
+        "q_marked",
         "r_resident",
     ];
     if args.iter().any(|a| a == "--list") {
@@ -505,23 +522,39 @@ pub fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    let row = match flag(&args, "--row") {
+        None => &row::QWEN35MOE,
+        Some(name) => match row::find(name) {
+            Some(r) => r,
+            None => {
+                let rows: Vec<&str> = row::ROWS.iter().map(|r| r.name).collect();
+                println!("{GATE}: no row named {name}; the rows are {rows:?}");
+                return ExitCode::from(64);
+            }
+        },
+    };
+    row::select(row);
+    let default_row = std::ptr::eq(row, &row::QWEN35MOE);
     if args.iter().any(|a| a == "--mutants-all") {
+        if !default_row {
+            println!(
+                "{GATE}: --mutants-all: the kernel mutants edit the {} row's program",
+                row::QWEN35MOE.name
+            );
+            return ExitCode::from(64);
+        }
         return mutants_all();
     }
-    let device = match MetalDevice::open(&HOST) {
-        Ok(device) => device,
-        Err(e @ DeviceError::Unsupported { .. }) => {
-            println!("clause open: REFUSED ({e})");
-            return ExitCode::from(78);
-        }
-        Err(e) => {
-            println!("clause open: FAIL ({e})");
-            return ExitCode::FAILURE;
-        }
-    };
     let mutant = match flag(&args, "--mutant") {
         Some(name) => match mutants::find(name) {
-            Some(m) => Some(m),
+            Some(m) if default_row => Some(m),
+            Some(_) => {
+                println!(
+                    "{GATE}: --mutant {name}: the kernel mutants edit the {} row's program",
+                    row::QWEN35MOE.name
+                );
+                return ExitCode::from(64);
+            }
             None => {
                 println!("{GATE}: no mutant named {name}");
                 return ExitCode::from(64);
@@ -529,24 +562,6 @@ pub fn main() -> ExitCode {
         },
         None => None,
     };
-    let mutated = match library_of(&device, mutant) {
-        Ok(lib) => lib,
-        Err(e) => {
-            println!("{GATE}: the mutant does not build: {e}");
-            return ExitCode::from(64);
-        }
-    };
-    let library = mutated.as_ref().unwrap_or_else(|| device.library());
-    let tensor_text = match tensor_text_of(mutant) {
-        Ok(text) => text,
-        Err(e) => {
-            println!("{GATE}: the mutant does not build: {e}");
-            return ExitCode::from(64);
-        }
-    };
-    if let Some((m, _)) = mutant {
-        println!("mutant: {} ({})", m.name, m.why);
-    }
     let only = mutant.map(|(m, _)| m.clause).or(flag(&args, "--only"));
     if let Some(name) = only
         && !NAMES.contains(&name)
@@ -562,6 +577,13 @@ pub fn main() -> ExitCode {
         }
     };
     let nodes = args.iter().any(|a| a == "--nodes");
+    if nodes && !default_row {
+        println!(
+            "{GATE}: --nodes walks the {} row's nodes",
+            row::QWEN35MOE.name
+        );
+        return ExitCode::from(64);
+    }
     let nodes_set = match flag(&args, "--set") {
         None => sets::Set::Step,
         Some(name) => match name {
@@ -584,6 +606,43 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The library is the instance the file's shape selects.
+    let instance = match Session::instance_of(&path, ctx) {
+        Ok(instance) => instance,
+        Err(e) => {
+            println!("clause open: FAIL ({})", says(e));
+            return ExitCode::FAILURE;
+        }
+    };
+    let device = match MetalDevice::open(instance) {
+        Ok(device) => device,
+        Err(e @ DeviceError::Unsupported { .. }) => {
+            println!("clause open: REFUSED ({e})");
+            return ExitCode::from(78);
+        }
+        Err(e) => {
+            println!("clause open: FAIL ({e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mutated = match library_of(&device, mutant) {
+        Ok(lib) => lib,
+        Err(e) => {
+            println!("{GATE}: the mutant does not build: {e}");
+            return ExitCode::from(64);
+        }
+    };
+    let library = mutated.as_ref().unwrap_or_else(|| device.library());
+    let tensor_text = match tensor_text_of(instance, mutant) {
+        Ok(text) => text,
+        Err(e) => {
+            println!("{GATE}: the mutant does not build: {e}");
+            return ExitCode::from(64);
+        }
+    };
+    if let Some((m, _)) = mutant {
+        println!("mutant: {} ({})", m.name, m.why);
+    }
     let t = Instant::now();
     let mut session = match Session::open(&device, library, &path, ctx) {
         Ok(s) => s,
@@ -593,12 +652,27 @@ pub fn main() -> ExitCode {
         }
     };
     println!(
-        "session: {} ({} layers, ctx {ctx}) open in {:.1} s; token {:?}",
+        "session: {} ({} layers, ctx {ctx}) open in {:.1} s; row {}, instance {}; token {:?}",
         path.display(),
         session.layer_count(),
         t.elapsed().as_secs_f64(),
+        row.name,
+        instance.name,
         session.token_layers()
     );
+    let delta_layers = session
+        .token_layers()
+        .iter()
+        .filter(|l| matches!(l, Layer::Delta { .. }))
+        .count();
+    if (delta_layers > 0) != row.recurrent {
+        println!(
+            "clause open: FAIL (row {} says recurrent = {}; the file has {delta_layers} delta \
+             layers)",
+            row.name, row.recurrent
+        );
+        return ExitCode::FAILURE;
+    }
     if nodes {
         return nodes::run(&mut session, nodes_set);
     }
@@ -610,31 +684,35 @@ pub fn main() -> ExitCode {
         if only.is_some_and(|o| o != name) {
             continue;
         }
-        let result = match name {
-            "d_count" => d_count(&mut session, &device),
-            "e_token_id" => e_token_id(&mut session),
-            "b_chain" => chain::b_chain(&mut session),
-            "c_resume" => chain::c_resume(&mut session),
-            "h_prompt" => ahead::h_prompt(&device, library, &path),
-            "t_target" => target::t_target(&mut session),
-            "s_serve" => serve::s_serve(&mut session, &device, library, &path),
-            "k_keep" => keep::k_keep(&device, library, &path),
-            "g_generate" => generate::g_generate(&mut session),
-            "f_deep" => deep::f_deep(&device, library, &path),
-            "p_profile" => profile::p_profile(&device, library, &path),
-            "m_mlx" => mlx::m_mlx(&device, library),
-            "q_short" => pass::q_short(&device, library, &path),
-            "q_state" => pass::q_state(&device, library, &path),
-            "q_chunk" => pass::q_chunk(&device, library, &path),
-            "q_ref" => pass::q_ref(&device, library, &path),
-            "q_free" => pass::q_free(&device, library, &path),
-            "q_tensor" => pass::q_tensor(&device, library, &tensor_text, &path),
-            "q_fault" => pass::q_fault(&device, library, &path),
-            "q_layers" => pass::q_layers(&device, library, &path),
-            "q_mark" => pass::q_mark(&device, library, &path),
-            "q_mark_cut" => pass::q_mark_cut(&device, library, &path),
-            "r_resident" => resident::r_resident(&device, library, &path),
-            _ => free::a_free(&mut session),
+        let result = match row.skip_of(name) {
+            Some(why) => Ok(Verdict::Skip(format!("row {}: {why}", row.name))),
+            None => match name {
+                "d_count" => d_count(&mut session, &device),
+                "e_token_id" => e_token_id(&mut session),
+                "b_chain" => chain::b_chain(&mut session),
+                "c_resume" => chain::c_resume(&mut session),
+                "h_prompt" => ahead::h_prompt(&device, library, &path),
+                "t_target" => target::t_target(&mut session),
+                "s_serve" => serve::s_serve(&mut session, &device, library, &path),
+                "k_keep" => keep::k_keep(&device, library, &path),
+                "g_generate" => generate::g_generate(&mut session),
+                "f_deep" => deep::f_deep(&device, library, &path),
+                "p_profile" => profile::p_profile(&device, library, &path),
+                "m_mlx" => mlx::m_mlx(&device, library),
+                "q_short" => pass::q_short(&device, library, &path),
+                "q_state" => pass::q_state(&device, library, &path),
+                "q_chunk" => pass::q_chunk(&device, library, &path),
+                "q_ref" => pass::q_ref(&device, library, &path),
+                "q_free" => pass::q_free(&device, library, &path),
+                "q_tensor" => pass::q_tensor(&device, library, &tensor_text, &path),
+                "q_fault" => pass::q_fault(&device, library, &path),
+                "q_layers" => pass::q_layers(&device, library, &path),
+                "q_mark" => pass::q_mark(&device, library, &path),
+                "q_mark_cut" => pass::q_mark_cut(&device, library, &path),
+                "q_marked" => pass::q_marked(&device, library, &path),
+                "r_resident" => resident::r_resident(&device, library, &path),
+                _ => free::a_free(&mut session),
+            },
         };
         report.clause(name, result);
     }

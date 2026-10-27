@@ -17,7 +17,6 @@
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::session::{Node, Op, Session, StepMode};
-use bloomery_metal::kernels::{ROUTED_IDS, router};
 
 use super::flip::{self, RouteFlip, held_rows, picks_its_top, rel_to, router_tie, worse};
 use super::says;
@@ -54,7 +53,8 @@ pub fn a_free(s: &mut Session) -> Clause {
     let toks = toks.to_vec();
     let n = s.layer_count();
     let vocab = s.vocab();
-    let experts = router::EXPERTS;
+    let geom = s.geom();
+    let (experts, routed) = (geom.router.experts, geom.experts.routed_ids);
     let ik_out: Vec<Vec<f32>> = (0..n)
         .map(|l| sets::tap(&man, &format!("l_out-{l}")))
         .collect::<Result<_, _>>()?;
@@ -158,7 +158,7 @@ pub fn a_free(s: &mut Session) -> Clause {
         let lg = sets::tap(&man, &format!("ffn_moe_logits-{l}"))?;
         let kept = lg.len() / experts;
         let ids = sets::topk(&man, l, experts as u32)?;
-        if kept == 0 || kept > t_n || kept * experts != lg.len() || ids.len() != kept * ROUTED_IDS {
+        if kept == 0 || kept > t_n || kept * experts != lg.len() || ids.len() != kept * routed {
             return Err(format!(
                 "layer {l}: {} router logits and {} ids for {t_n} rows",
                 lg.len(),
@@ -168,12 +168,12 @@ pub fn a_free(s: &mut Session) -> Clause {
         for k in 0..kept {
             let t = t_n - kept + k;
             let row = &by_token[t];
-            let ours = &row.ids[..ROUTED_IDS];
+            let ours = &row.ids[..routed];
             let ours_lg = &row.logits[..experts];
-            let theirs = &ids[k * ROUTED_IDS..(k + 1) * ROUTED_IDS];
+            let theirs = &ids[k * routed..(k + 1) * routed];
             let ik_lg = &lg[k * experts..(k + 1) * experts];
             sites += 1;
-            if !picks_its_top(ours, ours_lg, ROUTED_IDS) {
+            if !picks_its_top(ours, ours_lg, routed) {
                 inconsistent.push((l, t));
             }
             if ours.iter().all(|&e| theirs.contains(&(e as i32))) {

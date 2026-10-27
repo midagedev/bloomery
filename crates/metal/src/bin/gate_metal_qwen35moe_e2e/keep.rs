@@ -58,7 +58,17 @@ fn engine_says(e: serve::EngineError) -> String {
 }
 
 pub(super) fn prompt_bits(s: &mut Session, ids: &[u32]) -> Result<(Vec<u32>, u32), String> {
-    match Target::prompt(s, ids, Want::Logits).map_err(says)? {
+    prompt_bits_marked(s, ids, &[])
+}
+
+/// [`prompt_bits`] with a mark at each of `marks`, the way a server's chat
+/// turn passes them.
+pub(super) fn prompt_bits_marked(
+    s: &mut Session,
+    ids: &[u32],
+    marks: &[u32],
+) -> Result<(Vec<u32>, u32), String> {
+    match Target::prompt_marked(s, ids, marks, Want::Logits).map_err(says)? {
         Out::Logits { argmax, row } => Ok((row.iter().map(|v| v.to_bits()).collect(), argmax)),
         Out::Argmax(_) => Err("a Want::Logits prompt returned the argmax alone".into()),
     }

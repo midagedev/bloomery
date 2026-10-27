@@ -31,6 +31,7 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::EncodeCount;
 use bloomery_metal::kernels::SEGMENT_KEYS;
 use bloomery_metal::library::Library;
+use chain::arch::qwen3moe::plan::FfnRoute;
 
 use super::says;
 use super::{HOST_ALLOC_CALLS, SEED};
@@ -214,10 +215,10 @@ fn whole_of(whole: u64, parts: u64, what: &str) -> Result<u64, String> {
 /// layer's router ids as the step left them.
 fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64>, String> {
     let split = gguf::Split::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let read = model::arch::qwen35moe::spec::read(&split).map_err(|e| e.to_string())?;
+    let read = model::arch::spec(&split).map_err(|e| e.to_string())?;
     let spec = read.spec;
-    let kinds = chain::arch::qwen3moe::plan::kinds35(&spec.layers).map_err(|e| e.to_string())?;
-    let pd = chain::arch::qwen3moe::read::PlanDims::q35(&spec, WHAT).map_err(|e| e.to_string())?;
+    let kinds = chain::arch::qwen3moe::plan::kinds_of(&spec.layers).map_err(|e| e.to_string())?;
+    let pd = chain::arch::qwen3moe::read::PlanDims::of(&spec, WHAT).map_err(|e| e.to_string())?;
     let plans = chain::arch::qwen3moe::read::layer_plans(
         &split,
         WHAT,
@@ -285,24 +286,30 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
         }
         let f = chain::arch::qwen3moe::read::file_names(l);
         let router = bytes(&f.router)?;
-        let router_gate = bytes(&f.router_gate)?;
         // The experts' count from the router's own rows, as the arena holds it.
         let experts = router / 4 / hidden as u64;
-        if experts == 0 || pick.len() < 2 {
+        // The layer's last slot reads the shared expert when the plan has one.
+        let shared = match &plan.ffn.route {
+            FfnRoute::Router { shared, .. } => shared.is_some(),
+            FfnRoute::Dense => return Err(format!("layer {l}: a dense FFN, not a routed one")),
+        };
+        if experts == 0 || pick.len() <= usize::from(shared) {
             return Err(format!(
                 "layer {l}: the router holds {} rows and the token picked {} ids",
                 experts,
                 pick.len()
             ));
         }
-        let picks = (pick.len() - 1) as u64;
-        *total += bytes(&plan.ffn.ffn_norm)? + router + router_gate;
+        let picks = (pick.len() - usize::from(shared)) as u64;
+        *total += bytes(&plan.ffn.ffn_norm)? + router;
         *total += picks
             * (whole_of(bytes(&f.gate)?, experts, "a gate stack")?
                 + whole_of(bytes(&f.up)?, experts, "an up stack")?);
-        *total += bytes(&f.sh_gate)? + bytes(&f.sh_up)?;
         *total += picks * whole_of(bytes(&f.down)?, experts, "a down stack")?;
-        *total += bytes(&f.sh_down)?;
+        if shared {
+            *total +=
+                bytes(&f.router_gate)? + bytes(&f.sh_gate)? + bytes(&f.sh_up)? + bytes(&f.sh_down)?;
+        }
     }
     Ok(per)
 }
