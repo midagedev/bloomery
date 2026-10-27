@@ -873,6 +873,11 @@ generate_metal --plan [--ctx C]
         let ctx = ctx_of(a)?;
         // The library is the instance the file's shape selects, by the check `--plan` prints.
         let instance = Session::instance_of(&a.model, ctx).map_err(|e| e.to_string())?;
+        if instance.name == bloomery_metal::instance::UNREGISTERED {
+            eprintln!(
+                "metal: {instance}: no registered instance holds this shape, so no gate checked its output"
+            );
+        }
         let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
         let t0 = Instant::now();
         let mut session =
