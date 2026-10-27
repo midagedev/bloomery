@@ -2,8 +2,8 @@
 
 bloomery runs on a Mac's GPU through its own Metal backend: `bloomery-serve-metal` serves the llama-server HTTP API,
 and `generate_metal` runs one prompt from the command line. The host side is Rust; the kernels are Metal Shading
-Language. One architecture runs so far (`qwen35moe`): Qwen3.6-35B-A3B and files with its shapes
-([which files](#which-files-run)). The release carries a signed and notarized Apple
+Language. Two architectures run on a build after 0.3.9: `qwen35moe` (Qwen3.6-35B-A3B and files with its shapes) and
+`qwen3moe` (Qwen3-30B-A3B) ([which files](#which-files-run)). The release carries a signed and notarized Apple
 Silicon build; building from source works too. The port's map and design are in [`contrib/mac.md`](contrib/mac.md) and issue
 [#593](https://github.com/midagedev/bloomery/issues/593).
 
