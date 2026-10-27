@@ -59,6 +59,7 @@ use bloomery_metal::kernels::{
 use bloomery_metal::library::GemmPath;
 use gguf::quant::dequant_row;
 
+use super::clauses_a4::{self, Sites};
 use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, U};
@@ -559,77 +560,48 @@ fn q6k_cases(fixture: &Fixture) -> Result<Vec<Case<'_>>, String> {
     ])
 }
 
-/// The A4 cases, the MLX-format fixture split's tensors.
-fn a4_cases(mlx: &Fixture) -> Result<Vec<Case<'_>>, String> {
+/// The seed of the A4 head-tail case's activations.
+const HEAD_TAIL_SEED: u64 = 0x6E54;
+
+/// The A4 cases at a row's sites, the MLX-format fixture split's tensors: its
+/// whole tensors, then the head's last rows, a count no weight tile divides.
+fn a4_cases<'a>(h: &Harness<'_>, mlx: &'a Fixture, sites: &Sites) -> Result<Vec<Case<'a>>, String> {
     let tail_rows = 1153;
-    let tail = mlx.rows_at(
-        "output.weight",
-        gguf::quant::GgmlType::MLX_A4,
-        2048,
-        248_320 - tail_rows,
-        tail_rows,
-    )?;
-    Ok(vec![
-        Case {
-            label: "blk.0.attn_qkv.weight 8192x2048 r9".to_string(),
-            weights: mlx.rows(
-                "blk.0.attn_qkv.weight",
-                gguf::quant::GgmlType::MLX_A4,
-                2048,
-                8192,
-            )?,
-            quant: Quant::A4,
-            rows: 8192,
-            cols: 2048,
-            acts: 9,
-            x_stride: 2048,
-            y_stride: 8192,
-            seed: 0x6E51,
-        },
-        Case {
-            label: "blk.0.ssm_out.weight 2048x4096 r33".to_string(),
-            weights: mlx.rows(
-                "blk.0.ssm_out.weight",
-                gguf::quant::GgmlType::MLX_A4,
-                4096,
-                2048,
-            )?,
-            quant: Quant::A4,
-            rows: 2048,
-            cols: 4096,
-            acts: 33,
-            x_stride: 4096,
-            y_stride: 2048,
-            seed: 0x6E52,
-        },
-        Case {
-            label: "blk.0.ffn_down_shexp.weight 2048x512 r512".to_string(),
-            weights: mlx.rows(
-                "blk.0.ffn_down_shexp.weight",
-                gguf::quant::GgmlType::MLX_A4,
-                512,
-                2048,
-            )?,
-            quant: Quant::A4,
-            rows: 2048,
-            cols: 512,
-            acts: 512,
-            x_stride: 512,
-            y_stride: 2048,
-            seed: 0x6E53,
-        },
-        Case {
-            label: format!("output.weight tail {tail_rows}x2048 r33"),
-            weights: tail,
-            quant: Quant::A4,
-            rows: tail_rows,
-            cols: 2048,
-            acts: 33,
-            x_stride: 2048,
-            y_stride: 1156,
-            seed: 0x6E54,
-        },
-    ])
+    let mut cases = Vec::new();
+    for site in sites.gemm {
+        let t = &site.tensor;
+        cases.push(Case {
+            label: format!("{} r{}", t.label(), site.acts),
+            weights: t.bytes(mlx)?,
+            quant: t.quant,
+            rows: t.rows,
+            cols: t.cols,
+            acts: site.acts,
+            x_stride: t.cols,
+            y_stride: t.rows.div_ceil(4) * 4,
+            seed: site.seed,
+        });
+    }
+    let hidden = h.geom().hidden;
+    let output_rows = mlx.output_rows()?;
+    cases.push(Case {
+        label: format!("output.weight tail {tail_rows}x{hidden} r33"),
+        weights: mlx.rows_at(
+            "output.weight",
+            gguf::quant::GgmlType::MLX_A4,
+            hidden,
+            output_rows - tail_rows,
+            tail_rows,
+        )?,
+        quant: Quant::A4,
+        rows: tail_rows,
+        cols: hidden,
+        acts: 33,
+        x_stride: hidden,
+        y_stride: tail_rows.div_ceil(4) * 4,
+        seed: HEAD_TAIL_SEED,
+    });
+    Ok(cases)
 }
 
 /// The store dot at every weight type's cases, both operand arms: every
@@ -651,12 +623,12 @@ pub fn gemm_q6k_resid(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     run_cases(h, GemmMode::Residual, &q6k_cases(fixture)?)
 }
 
-pub fn gemm_a4_store(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    run_cases(h, GemmMode::Store, &a4_cases(mlx)?)
+pub fn gemm_a4_store(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
+    run_cases(h, GemmMode::Store, &a4_cases(h, mlx, sites)?)
 }
 
-pub fn gemm_a4_resid(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    run_cases(h, GemmMode::Residual, &a4_cases(mlx)?)
+pub fn gemm_a4_resid(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
+    run_cases(h, GemmMode::Residual, &a4_cases(h, mlx, sites)?)
 }
 
 /// Every dense arm of one weight type on `h`'s kernels (the tensor-op
@@ -685,16 +657,16 @@ pub fn tensor_gemm_q6k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     dense_arms(h, &q6k_cases(fixture)?)
 }
 
-pub fn tensor_gemm_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    dense_arms(h, &a4_cases(mlx)?)
+pub fn tensor_gemm_a4(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
+    dense_arms(h, &a4_cases(h, mlx, sites)?)
 }
 
 /// Every segment of a segmented dispatch is the same bits as the same tensor
 /// run alone: the kernel does not change the order of a row's sum, and a
 /// segment's tiles are the ones a launch of it alone would run. One group
 /// per weight type, a tail segment in two of them, both operand arms and
-/// both epilogues.
-pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
+/// both epilogues; the A4 group is the row's own ([`Sites`]).
+pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture, sites: &Sites) -> Clause {
     let cols = SEG_COLS;
     let q4k_tail = fixture.rows_at(
         "blk.0.attn_qkv.weight",
@@ -742,41 +714,35 @@ pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
             )],
             mode: GemmMode::Residual,
         },
-        SegGroup {
-            quant: Quant::A4,
-            segments: vec![
-                (
-                    8192,
-                    mlx.rows(
-                        "blk.0.attn_qkv.weight",
-                        gguf::quant::GgmlType::MLX_A4,
-                        cols,
-                        8192,
-                    )?,
-                ),
-                (
-                    512,
-                    mlx.rows(
-                        "blk.1.attn_k.weight",
-                        gguf::quant::GgmlType::MLX_A4,
-                        cols,
-                        512,
-                    )?,
-                ),
-                (
-                    511,
-                    mlx.rows_at(
-                        "blk.1.attn_q.weight",
-                        gguf::quant::GgmlType::MLX_A4,
-                        cols,
-                        100,
-                        511,
-                    )?,
-                ),
-            ],
-            mode: GemmMode::Store,
-        },
+        a4_seg_group(mlx, sites)?,
     ];
+    Ok(Verdict::Noted(format!(
+        "every segment the same bits as its tensor alone: {}",
+        seg_groups(h, &groups)?.join(", ")
+    )))
+}
+
+/// The A4 group of a segmented dispatch at a row's sites: its whole tensors'
+/// segments, then the tail segment cut from the middle of a tensor.
+fn a4_seg_group<'a>(mlx: &'a Fixture, sites: &Sites) -> Result<SegGroup<'a>, String> {
+    let ty = gguf::quant::GgmlType::MLX_A4;
+    let mut segments = Vec::new();
+    for (name, rows) in sites.gemm_seg.whole {
+        segments.push((*rows, mlx.rows(name, ty, SEG_COLS, *rows)?));
+    }
+    let (name, at, rows) = sites.gemm_seg.tail;
+    segments.push((rows, mlx.rows_at(name, ty, SEG_COLS, at, rows)?));
+    Ok(SegGroup {
+        quant: Quant::A4,
+        segments,
+        mode: GemmMode::Store,
+    })
+}
+
+/// [`gemm_seg`] for a row that runs only its A4 sites: the A4 group, the same
+/// bits as each segment's tensor alone.
+pub fn gemm_seg_a4(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
+    let groups = [a4_seg_group(mlx, sites)?];
     Ok(Verdict::Noted(format!(
         "every segment the same bits as its tensor alone: {}",
         seg_groups(h, &groups)?.join(", ")
@@ -1380,20 +1346,16 @@ pub fn gemm_refusals(h: &Harness<'_>) -> Clause {
     )))
 }
 
-/// The clause table: one clause per entry, after the mat-vec families.
+/// The clause table of the whole row: one clause per entry, after the
+/// mat-vec families.
 pub fn table<'a>(
     h: &'a Harness<'a>,
     fixture: &'a Result<Fixture, String>,
     mlx: &'a Result<Fixture, String>,
 ) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    let sites = &clauses_a4::QWEN35_SITES;
     let with = |f: fn(&Harness<'_>, &Fixture) -> Clause| {
         Box::new(move || match fixture {
-            Ok(fix) => f(h, fix),
-            Err(e) => Err(e.clone()),
-        }) as super::ClauseRun<'a>
-    };
-    let with_mlx = |f: fn(&Harness<'_>, &Fixture) -> Clause| {
-        Box::new(move || match mlx {
             Ok(fix) => f(h, fix),
             Err(e) => Err(e.clone()),
         }) as super::ClauseRun<'a>
@@ -1403,16 +1365,45 @@ pub fn table<'a>(
         ("gemm_q4k_resid", with(gemm_q4k_resid)),
         ("gemm_q6k_store", with(gemm_q6k_store)),
         ("gemm_q6k_resid", with(gemm_q6k_resid)),
-        ("gemm_a4_store", with_mlx(gemm_a4_store)),
-        ("gemm_a4_resid", with_mlx(gemm_a4_resid)),
+        (
+            "gemm_a4_store",
+            clauses_a4::with(h, mlx, move |h, f| gemm_a4_store(h, f, sites)),
+        ),
+        (
+            "gemm_a4_resid",
+            clauses_a4::with(h, mlx, move |h, f| gemm_a4_resid(h, f, sites)),
+        ),
         (
             "gemm_seg",
             Box::new(move || match (fixture, mlx) {
-                (Ok(fix), Ok(split)) => gemm_seg(h, fix, split),
+                (Ok(fix), Ok(split)) => gemm_seg(h, fix, split, sites),
                 (Err(e), _) | (_, Err(e)) => Err(e.clone()),
             }),
         ),
         ("gemm_range", with(gemm_range)),
         ("gemm_refusals", Box::new(move || gemm_refusals(h))),
+    ]
+}
+
+/// The clauses of a row that runs its A4 sites only: [`table`]'s A4 clauses at
+/// that row's sites.
+pub fn shaped<'a>(
+    h: &'a Harness<'a>,
+    mlx: &'a Result<Fixture, String>,
+) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    let sites = &clauses_a4::QWEN3_SITES;
+    vec![
+        (
+            "gemm_a4_store",
+            clauses_a4::with(h, mlx, move |h, f| gemm_a4_store(h, f, sites)),
+        ),
+        (
+            "gemm_a4_resid",
+            clauses_a4::with(h, mlx, move |h, f| gemm_a4_resid(h, f, sites)),
+        ),
+        (
+            "gemm_seg",
+            clauses_a4::with(h, mlx, move |h, f| gemm_seg_a4(h, f, sites)),
+        ),
     ]
 }

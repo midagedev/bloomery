@@ -470,8 +470,9 @@ enum Table {
     Whole,
     /// The clauses of the kernels the instance's geometry shapes (router,
     /// experts, attention, and the prompt pass's rows and routing) and the A4
-    /// clauses at its sites, the main table's mutants of those clauses
-    /// (`kept`) and the instance's own (`own`).
+    /// clauses at its sites (the mat-vec's, the prompt pass's dense and
+    /// segmented GEMMs, and the tensor-op GEMMs' A4 clauses), the mutants of
+    /// those clauses in both tables (`kept`) and the instance's own (`own`).
     Shaped {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
@@ -920,6 +921,8 @@ fn clause_table<'a>(
             .chain(clauses_rows::shaped(ctx))
             .chain(clauses_route::shaped(ctx, mlx))
             .chain(clauses_a4::shaped(ctx.harness, mlx))
+            .chain(clauses_gemm::shaped(ctx.harness, mlx))
+            .chain(clauses_tensor::shaped(tensor, mlx))
             .collect(),
         Table::Whole => front(ctx)
             .into_iter()

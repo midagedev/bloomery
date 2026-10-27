@@ -21,11 +21,33 @@
 //! - `tensor_q8_0_*`, `tensor_q5k_*`: the dense, segmented and grouped GEMMs
 //!   of the owners no fixture holds yet, on synthetic rows
 //!   (`clauses_synth`).
+//!
+//! A row that runs its A4 sites only has `tensor_gemm_a4`, `tensor_gemm_seg`
+//! (its A4 group) and `tensor_grouped_a4`, at its own sites.
 
 use bloomery_device::conformance::Clause;
 
+use super::clauses_a4;
 use super::fixture::Fixture;
 use super::{ClauseRun, Harness, clauses_gemm, clauses_q5k, clauses_q8_0, clauses_route};
+
+/// `clause` on the tensor-op harness over `fix`: the harness's fault word
+/// cleared first, or the reason the tensor-op GEMMs or the fixture are not
+/// there.
+fn on<'a>(
+    tensor: &'a Result<Harness<'a>, String>,
+    fix: &'a Result<Fixture, String>,
+    clause: impl Fn(&Harness<'_>, &Fixture) -> Clause + 'a,
+) -> ClauseRun<'a> {
+    Box::new(move || match (tensor, fix) {
+        (Err(e), _) => Err(format!("the tensor-op GEMMs do not build here: {e}")),
+        (_, Err(e)) => Err(e.clone()),
+        (Ok(h), Ok(fix)) => {
+            h.clear_fault()?;
+            clause(h, fix)
+        }
+    })
+}
 
 /// The tensor-op clauses over `tensor`, the harness of the tensor-op GEMMs
 /// (or why this device has none).
@@ -34,26 +56,22 @@ pub fn table<'a>(
     fixture: &'a Result<Fixture, String>,
     mlx: &'a Result<Fixture, String>,
 ) -> Vec<(&'static str, ClauseRun<'a>)> {
-    let on = |f: fn(&Harness<'_>, &Fixture) -> Clause, fix: &'a Result<Fixture, String>| {
-        Box::new(move || match (tensor, fix) {
-            (Err(e), _) => Err(format!("the tensor-op GEMMs do not build here: {e}")),
-            (_, Err(e)) => Err(e.clone()),
-            (Ok(h), Ok(fix)) => {
-                h.clear_fault()?;
-                f(h, fix)
-            }
-        }) as ClauseRun<'a>
-    };
+    let sites = &clauses_a4::QWEN35_SITES;
     let mut clauses = vec![
         (
             "tensor_gemm_q4k",
-            on(clauses_gemm::tensor_gemm_q4k, fixture),
+            on(tensor, fixture, clauses_gemm::tensor_gemm_q4k),
         ),
         (
             "tensor_gemm_q6k",
-            on(clauses_gemm::tensor_gemm_q6k, fixture),
+            on(tensor, fixture, clauses_gemm::tensor_gemm_q6k),
         ),
-        ("tensor_gemm_a4", on(clauses_gemm::tensor_gemm_a4, mlx)),
+        (
+            "tensor_gemm_a4",
+            on(tensor, mlx, move |h, f| {
+                clauses_gemm::tensor_gemm_a4(h, f, sites)
+            }),
+        ),
         (
             "tensor_gemm_seg",
             Box::new(move || match (tensor, fixture, mlx) {
@@ -61,25 +79,55 @@ pub fn table<'a>(
                 (_, Err(e), _) | (_, _, Err(e)) => Err(e.clone()),
                 (Ok(h), Ok(fix), Ok(split)) => {
                     h.clear_fault()?;
-                    clauses_gemm::gemm_seg(h, fix, split)
+                    clauses_gemm::gemm_seg(h, fix, split, sites)
                 }
             }),
         ),
-        ("tensor_gemm_range", on(clauses_gemm::gemm_range, fixture)),
+        (
+            "tensor_gemm_range",
+            on(tensor, fixture, clauses_gemm::gemm_range),
+        ),
         (
             "tensor_grouped_q4k",
-            on(clauses_route::tensor_grouped_q4k, fixture),
+            on(tensor, fixture, clauses_route::tensor_grouped_q4k),
         ),
         (
             "tensor_grouped_q6k",
-            on(clauses_route::tensor_grouped_q6k, fixture),
+            on(tensor, fixture, clauses_route::tensor_grouped_q6k),
         ),
         (
             "tensor_grouped_a4",
-            on(clauses_route::tensor_grouped_a4, mlx),
+            on(tensor, mlx, clauses_route::tensor_grouped_a4),
         ),
     ];
     clauses.extend(clauses_q8_0::tensor_table(tensor));
     clauses.extend(clauses_q5k::tensor_table(tensor));
     clauses
+}
+
+/// The tensor-op clauses of a row that runs its A4 sites only: [`table`]'s A4
+/// clauses at that row's sites.
+pub fn shaped<'a>(
+    tensor: &'a Result<Harness<'a>, String>,
+    mlx: &'a Result<Fixture, String>,
+) -> Vec<(&'static str, ClauseRun<'a>)> {
+    let sites = &clauses_a4::QWEN3_SITES;
+    vec![
+        (
+            "tensor_gemm_a4",
+            on(tensor, mlx, move |h, f| {
+                clauses_gemm::tensor_gemm_a4(h, f, sites)
+            }),
+        ),
+        (
+            "tensor_gemm_seg",
+            on(tensor, mlx, move |h, f| {
+                clauses_gemm::gemm_seg_a4(h, f, sites)
+            }),
+        ),
+        (
+            "tensor_grouped_a4",
+            on(tensor, mlx, clauses_route::tensor_grouped_a4),
+        ),
+    ]
 }
