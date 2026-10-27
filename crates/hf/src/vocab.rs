@@ -27,7 +27,7 @@
 //! `tokenizer.json` spells for one name of `tokenizer.ggml.pre` (the name llama.cpp gives the
 //! vocabulary by the hash of its output), and the row `tokenizer.json` carries is the one
 //! written. A pipeline no row spells is refused by name, and a [`VocabSpec`] may name the row its
-//! model has. For the `qwen35` row the stop id array also makes serving encode as
+//! model has. For every row the stop id array also makes serving encode as
 //! `tokenizer.json` does: the regex folds a contraction's case by Unicode, and BPE skips a byte
 //! the vocabulary lacks.
 
@@ -70,6 +70,11 @@ macro_rules! qwen35_regex {
         r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
 }
+macro_rules! qwen2_regex {
+    () => {
+        r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
+    };
+}
 macro_rules! minimax_m2_regex {
     () => {
         r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
@@ -96,7 +101,7 @@ macro_rules! pre_tokenizer {
 /// `Removed` with `invert` keeps the regex's matches and drops what lies between them, which
 /// `Isolated` keeps as pieces of their own; both regexes match every codepoint, so no gap exists
 /// and the two split alike.
-pub const PRE: [(&str, &str); 2] = [
+pub const PRE: [(&str, &str); 3] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
@@ -104,6 +109,10 @@ pub const PRE: [(&str, &str); 2] = [
     (
         "minimax-m2",
         pre_tokenizer!(minimax_m2_regex, "Removed", true, true),
+    ),
+    (
+        "qwen2",
+        pre_tokenizer!(qwen2_regex, "Isolated", false, false),
     ),
 ];
 
@@ -1276,6 +1285,49 @@ mod tests {
             Some(&Value::String("qwen35".into()))
         );
         remove(&dir);
+    }
+
+    /// A tokenizer whose pre-tokenizer is Qwen2's, which Qwen3-MoE keeps (a word takes letters
+    /// alone, no mark), is the `qwen2` row; a spec that names the `qwen35` row refuses it by both
+    /// names.
+    #[test]
+    fn a_qwen2_tokenizer_is_the_qwen2_row() {
+        let qwen2 = PRE.iter().find(|r| r.0 == "qwen2").unwrap().1;
+        let dir = minimax_repo(|tokenizer, config| {
+            tokenizer["pre_tokenizer"] = serde_json::from_str(qwen2).unwrap();
+            config.as_object_mut().unwrap().remove("unk_token");
+        });
+        let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+        assert_eq!(
+            get(&keys.keys, "tokenizer.ggml.pre"),
+            Some(&Value::String("qwen2".into()))
+        );
+        super::keys(&dir, &spec_of(&dir).with_pre("qwen2").unwrap()).unwrap();
+        let e = super::keys(&dir, &spec_of(&dir).with_pre("qwen35").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("qwen2") && e.contains("qwen35") && e.contains("pre_tokenizer"),
+            "{e}"
+        );
+        remove(&dir);
+    }
+
+    /// The pre-tokenizer of mlx-community's Qwen3-30B-A3B-Instruct-2507-4bit at revision
+    /// `e9675aa3ca5f900ccef55267914466d55ab325fa` (its `tokenizer.json`'s normalizer and pipeline,
+    /// committed alone) is the `qwen2` row as the file spells it.
+    #[test]
+    fn the_real_qwen3_30b_pre_tokenizer_is_the_qwen2_row() {
+        let path = format!(
+            "{}/tests/fixtures/qwen3-30b-a3b-tokenizer-pipeline.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let pipeline: Json = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(pipeline["normalizer"]["type"], "NFC");
+        assert_eq!(
+            pre_row(Some(&pipeline["pre_tokenizer"])).unwrap().0,
+            "qwen2"
+        );
     }
 
     /// A pre-tokenizer no row spells is refused by name, one character of the regex off, a

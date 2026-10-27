@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""mlx-fixture.py — the qwen35moe GGUF fixture as an MLX-format checkpoint folder (bloomery #593 R3).
+"""mlx-fixture.py — the qwen35moe or qwen3moe GGUF fixture as an MLX-format checkpoint folder (bloomery #593 R3).
 
     tools/mlx-fixture.py make <fixture.gguf> <out dir> --config <real config.json>
     tools/mlx-fixture.py check <out dir> <fixture.gguf>
     tools/mlx-fixture.py --self-test
+
+The family is the fixture's `general.architecture`: `qwen35moe` (Qwen3.6, mlx-community's names below) or
+`qwen3moe` (Qwen3-30B-A3B: `model.layers.N.…`, `lm_head`, every layer attention over the stacked `switch_mlp`
+experts, no delta rule and no shared expert, the norm gammas as the GGUF holds them, the router 8 bits and every other
+linear 4 — a `quantization` block with no `mode`, as the real file's).
 
 `make` reads the fixture's tensors through the repo's one GGUF header parser
 (tools/ref/gguf-ranges.py, loaded the way tools/ref/gguf-respell.py loads it), dequantizes each
@@ -161,32 +166,58 @@ def gguf_f32(blob, ty):
 
 # ------------------------------------------------------------------ the naming
 
-P = "language_model.model."
+class Family:
+    """What differs between the families this maker writes: the checkpoint's name prefix of the text model
+    and of the head."""
+
+    def __init__(self, arch, prefix, lm_head):
+        self.arch, self.p, self.lm_head = arch, prefix, lm_head
 
 
-def mlx_names(layers):
+QWEN35 = Family("qwen35moe", "language_model.model.", "language_model.lm_head.weight")
+QWEN3 = Family("qwen3moe", "model.", "lm_head.weight")
+FAMILIES = {f.arch: f for f in (QWEN35, QWEN3)}
+
+
+def family_of(meta):
+    """The family of a fixture, by its header's `general.architecture`."""
+    arch = meta.get("general.architecture")
+    arch = arch.decode() if isinstance(arch, bytes) else arch
+    if arch not in FAMILIES:
+        raise Refusal(EXIT_REFUSED, f"general.architecture {arch!r} is not a family this maker "
+                                    f"writes ({sorted(FAMILIES)})")
+    return FAMILIES[arch]
+
+
+def mlx_names(family, layers):
     """The output tensors, in a fixed order: (mlx name, gguf name, kind, bits).
 
     `layers` is [(blk index, 'linear'|'full')]. Kinds: `quant` a linear transposed and
     quantized at `bits`; `bf16` a plain BF16 tensor; `alog`, `dt`, `conv` the
     step-bearing BF16 tensors.
     """
+    P = family.p
     out = [
         (f"{P}embed_tokens.weight", "token_embd.weight", "quant", 4),
-        ("language_model.lm_head.weight", "output.weight", "quant", 4),
+        (family.lm_head, "output.weight", "quant", 4),
         (f"{P}norm.weight", "output_norm.weight", "bf16", 0),
     ]
     for blk, kind in layers:
         L = f"{P}layers.{blk}."
         G = f"blk.{blk}."
-        common = [
-            (f"{L}input_layernorm.weight", f"{G}attn_norm.weight", "bf16", 0),
-            (f"{L}post_attention_layernorm.weight", f"{G}post_attention_norm.weight", "bf16", 0),
+        routed = [
             (f"{L}mlp.gate.weight", f"{G}ffn_gate_inp.weight", "quant", 8),
-            (f"{L}mlp.shared_expert_gate.weight", f"{G}ffn_gate_inp_shexp.weight", "quant", 8),
             (f"{L}mlp.switch_mlp.gate_proj.weight", f"{G}ffn_gate_exps.weight", "quant", 4),
             (f"{L}mlp.switch_mlp.up_proj.weight", f"{G}ffn_up_exps.weight", "quant", 4),
             (f"{L}mlp.switch_mlp.down_proj.weight", f"{G}ffn_down_exps.weight", "quant", 4),
+        ]
+        norms = [
+            (f"{L}input_layernorm.weight", f"{G}attn_norm.weight", "bf16", 0),
+            (f"{L}post_attention_layernorm.weight",
+             f"{G}{'ffn_norm' if family is QWEN3 else 'post_attention_norm'}.weight", "bf16", 0),
+        ]
+        shared = [
+            (f"{L}mlp.shared_expert_gate.weight", f"{G}ffn_gate_inp_shexp.weight", "quant", 8),
             (f"{L}mlp.shared_expert.gate_proj.weight", f"{G}ffn_gate_shexp.weight", "quant", 4),
             (f"{L}mlp.shared_expert.up_proj.weight", f"{G}ffn_up_shexp.weight", "quant", 4),
             (f"{L}mlp.shared_expert.down_proj.weight", f"{G}ffn_down_shexp.weight", "quant", 4),
@@ -210,7 +241,11 @@ def mlx_names(layers):
             (f"{L}self_attn.q_norm.weight", f"{G}attn_q_norm.weight", "bf16", 0),
             (f"{L}self_attn.k_norm.weight", f"{G}attn_k_norm.weight", "bf16", 0),
         ]
-        out.extend(common + (linear if kind == "linear" else full))
+        if family is QWEN3:
+            out.extend(norms + routed + full)
+        else:
+            out.extend(norms + routed[:1] + shared[:1] + routed[1:] + shared[1:]
+                       + (linear if kind == "linear" else full))
     return out
 
 
@@ -485,9 +520,10 @@ def make(fixture, out, config_path, quantizer, quiet=False):
     tokenizer_dir = os.path.dirname(os.path.abspath(config_path))
     if not os.path.isfile(os.path.join(tokenizer_dir, TOKENIZER_FILES[0])):
         raise Refusal(EXIT_REFUSED, f"{tokenizer_dir} has no {TOKENIZER_FILES[0]} beside the config")
-    _meta, info, layers = read_gguf(fixture)
+    meta, info, layers = read_gguf(fixture)
+    family = family_of(meta)
     head_v = value_head(info, layers)
-    entries = mlx_names(layers)
+    entries = mlx_names(family, layers)
     missing = [g for _, g, _, _ in entries if g not in info]
     if missing:
         raise Refusal(EXIT_REFUSED, f"the fixture has no tensor {missing[0]}")
@@ -545,7 +581,7 @@ def make(fixture, out, config_path, quantizer, quiet=False):
                    "weight_map": {k: weight_map[k] for k in sorted(weight_map)}},
                   fh, indent=2)
         fh.write("\n")
-    cut_config(config_path, layers, out)
+    cut_config(family, config_path, layers, out)
     copy_tokenizer(tokenizer_dir, out)
     return layers
 
@@ -559,22 +595,26 @@ def copy_tokenizer(src, out):
                 dst.write(fh.read())
 
 
-def cut_config(config_path, layers, out):
-    """The real config.json cut to the fixture's mirrored layers: num_hidden_layers,
-    layer_types and the quantization module entries; everything else verbatim, the
+def cut_config(family, config_path, layers, out):
+    """The real config.json cut to the fixture's mirrored layers: num_hidden_layers (and for qwen35moe
+    layer_types) and the quantization module entries; everything else verbatim, the
     `quantization_config` copy dropped (the maker's config carries the block alone)."""
     with open(config_path) as fh:
         config = json.load(fh)
-    text = config["text_config"]
-    text["num_hidden_layers"] = len(layers)
-    text["layer_types"] = ["full_attention" if kind == "full" else "linear_attention"
-                           for _, kind in layers]
+    if family is QWEN35:
+        text = config["text_config"]
+        text["num_hidden_layers"] = len(layers)
+        text["layer_types"] = ["full_attention" if kind == "full" else "linear_attention"
+                               for _, kind in layers]
+    else:
+        config["num_hidden_layers"] = len(layers)
     blks = {blk for blk, _ in layers}
+    at = f"{family.p}layers."
     kept = {k: v for k, v in config["quantization"].items()
-            if not k.startswith(f"{P}layers.") or int(k.split(".")[3]) in blks}
+            if not k.startswith(at) or int(k[len(at):].split(".")[0]) in blks}
     # every module the map quantizes at 8 bits carries its entry, whatever the
     # source config held (the folder's tensors and its config agree by construction)
-    for mlx_name, _, kind, bits in mlx_names(layers):
+    for mlx_name, _, kind, bits in mlx_names(family, layers):
         if kind == "quant" and bits == 8:
             kept[mlx_name[: -len(".weight")]] = {"group_size": GROUP, "bits": 8}
     config["quantization"] = kept
@@ -584,26 +624,29 @@ def cut_config(config_path, layers, out):
         fh.write("\n")
 
 
-def mlx_kind_key(name):
+def mlx_kind_key(family, name):
     """The per-kind error group: the tensor's role inside its layer, or its top-level name."""
-    if name.startswith(f"{P}layers."):
-        return ".".join(name.split(".")[4:])
-    if name.startswith(P):
-        return name.split(".")[2]  # embed_tokens, norm
-    return name.split(".")[1]  # lm_head
+    at = f"{family.p}layers."
+    if name.startswith(at):
+        return name[len(at):].split(".", 1)[1]
+    if name.startswith(family.p):
+        return name[len(family.p):].split(".")[0]  # embed_tokens, norm
+    return name.split(".")[-2]  # lm_head
 
 
 def check(out, fixture, quantizer, quiet=False):
     with open(os.path.join(out, "config.json")) as fh:
         qconf = json.load(fh)["quantization"]
-    if (qconf.get("group_size"), qconf.get("bits"), qconf.get("mode")) != (GROUP, 4, "affine"):
+    # an absent mode is the affine one, as the real qwen3moe file's block spells it
+    if (qconf.get("group_size"), qconf.get("bits")) != (GROUP, 4) or qconf.get("mode", "affine") != "affine":
         raise Refusal(EXIT_REFUSED,
                       f"config quantization is not affine group {GROUP} 4-bit: {qconf}")
     with open(os.path.join(out, "model.safetensors.index.json")) as fh:
         weight_map = json.load(fh)["weight_map"]
-    _meta, info, layers = read_gguf(fixture)
+    meta, info, layers = read_gguf(fixture)
+    family = family_of(meta)
     head_v = value_head(info, layers)
-    entries = {m: (g, kind, bits) for m, g, kind, bits in mlx_names(layers)}
+    entries = {m: (g, kind, bits) for m, g, kind, bits in mlx_names(family, layers)}
     expected = set(entries)
     for name, (_, kind, _) in entries.items():
         if kind == "quant":
@@ -663,7 +706,7 @@ def check(out, fixture, quantizer, quiet=False):
                     raise Refusal(EXIT_REFUSED,
                                   f"{name}: |err| past the quantizer's band (worst err/bound "
                                   f"{float((err / np.maximum(bound, np.float32(1e-30))).max()):.4f})")
-                key = mlx_kind_key(name)
+                key = mlx_kind_key(family, name)
                 w = worst.setdefault(key, [0, 0.0, 0])
                 w[0] = max(w[0], float(err.max()))
                 w[1] = max(w[1], float((err / np.maximum(s, np.float32(1e-30))).max()))
@@ -693,6 +736,8 @@ def check(out, fixture, quantizer, quiet=False):
 
 def self_test():
     import shutil
+
+    P = QWEN35.p
 
     def expect(name, cond, detail=""):
         if not cond:
@@ -919,6 +964,88 @@ def self_test():
                 expect(f"an index without {len(drop)} tensor(s) is refused",
                        e.code == EXIT_REFUSED and f"{len(drop)} missing" in str(e), str(e))
         shutil.rmtree(out)
+
+    # The qwen3moe family over a tiny fixture of two layers (3 experts of 64 values, 2 heads of 32
+    # over one key head), the stub quantizer again: the names, the router at 8 bits, a config with
+    # no `mode`, and a family this maker does not write.
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = os.path.join(tmp, "tiny3.gguf")
+        rng = np.random.default_rng(5)
+        f32 = lambda shape: rng.integers(1, 9, size=shape).astype(np.float32)
+
+        def tensor(name, dims):
+            return (name, F32, dims, f32(tuple(dims[::-1])).astype("<f4").tobytes())
+
+        tensors = [tensor("token_embd.weight", [64, 8]), tensor("output.weight", [64, 8]),
+                   tensor("output_norm.weight", [64])]
+        for blk in range(2):
+            g = f"blk.{blk}."
+            tensors += [tensor(g + "attn_norm.weight", [64]), tensor(g + "ffn_norm.weight", [64]),
+                        tensor(g + "attn_q.weight", [64, 64]), tensor(g + "attn_k.weight", [64, 32]),
+                        tensor(g + "attn_v.weight", [64, 32]), tensor(g + "attn_output.weight", [64, 64]),
+                        tensor(g + "attn_q_norm.weight", [32]), tensor(g + "attn_k_norm.weight", [32]),
+                        tensor(g + "ffn_gate_inp.weight", [64, 3]),
+                        tensor(g + "ffn_gate_exps.weight", [64, 8, 3]),
+                        tensor(g + "ffn_up_exps.weight", [64, 8, 3]),
+                        tensor(g + "ffn_down_exps.weight", [64, 64, 3])]
+        R.write_gguf(fixture, [R._kv_string("general.architecture", "qwen3moe")], tensors)
+        config_path = os.path.join(tmp, "config.json")
+        block = {"group_size": GROUP, "bits": 4,
+                 **{f"model.layers.{l}.mlp.gate": {"group_size": GROUP, "bits": 8} for l in range(48)}}
+        with open(config_path, "w") as fh:
+            json.dump({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+                       "quantization": block, "quantization_config": block}, fh)
+        with open(os.path.join(tmp, "tokenizer.json"), "w") as fh:
+            fh.write('{"version": "1.0"}')
+        out = os.path.join(tmp, "out3")
+        layers = make(fixture, out, config_path, StubQuantizer(), quiet=True)
+        expect("qwen3moe layers", layers == [(0, "full"), (1, "full")], str(layers))
+        with open(os.path.join(out, "config.json")) as fh:
+            cut = json.load(fh)
+        expect("qwen3moe cut layers", cut["num_hidden_layers"] == 2, str(cut["num_hidden_layers"]))
+        expect("qwen3moe cut quantization",
+               sorted(cut["quantization"]) == ["bits", "group_size", "model.layers.0.mlp.gate",
+                                               "model.layers.1.mlp.gate"], str(sorted(cut["quantization"])))
+        expect("qwen3moe copy dropped", "quantization_config" not in cut)
+        expect("qwen3moe mode stays absent", "mode" not in cut["quantization"])
+        with open(os.path.join(out, "model.safetensors.index.json")) as fh:
+            weight_map = json.load(fh)["weight_map"]
+        # 2 + 12 quantized linears per layer... embed, head, and per layer: q k v o, the router, three
+        # stacks = 8, a weight, scales and biases each; the BF16 norms: the final one and 4 a layer
+        expect("qwen3moe index holds every tensor", len(weight_map) == (2 + 2 * 8) * 3 + 1 + 2 * 4,
+               str(len(weight_map)))
+        for name in ("model.embed_tokens.weight", "lm_head.weight", "model.norm.weight",
+                     "model.layers.1.self_attn.q_proj.weight", "model.layers.1.mlp.gate.scales",
+                     "model.layers.0.mlp.switch_mlp.down_proj.biases",
+                     "model.layers.0.post_attention_layernorm.weight"):
+            expect("qwen3moe names", name in weight_map, name)
+        expect("qwen3moe has no delta or shared tensors",
+               not any("linear_attn" in k or "shared_expert" in k for k in weight_map))
+        reader = ShardReader(os.path.join(out, weight_map["model.layers.1.mlp.switch_mlp.up_proj.weight"]))
+        _dt, shape, _blob = reader.read("model.layers.1.mlp.switch_mlp.up_proj.weight")
+        reader.close()
+        expect("qwen3moe stack is [experts, rows, packed K]", shape == [3, 8, 8], str(shape))
+        check(out, fixture, StubQuantizer(), quiet=True)
+        # the router read at 4 bits, against the config's 8, is refused
+        with open(os.path.join(out, "config.json")) as fh:
+            wrong = json.load(fh)
+        wrong["quantization"].pop("model.layers.0.mlp.gate")
+        with open(os.path.join(out, "config.json"), "w") as fh:
+            json.dump(wrong, fh)
+        try:
+            check(out, fixture, StubQuantizer(), quiet=True)
+            expect("a router without its 8-bit entry is refused", False, "check passed")
+        except Refusal as e:
+            expect("a router without its 8-bit entry is refused",
+                   e.code == EXIT_REFUSED and "mlp.gate.weight: config says" in str(e), str(e))
+        other = os.path.join(tmp, "other.gguf")
+        R.write_gguf(other, [R._kv_string("general.architecture", "llama")], tensors[:1])
+        try:
+            make(other, os.path.join(tmp, "out_other"), config_path, StubQuantizer(), quiet=True)
+            expect("another family is refused", False, "made")
+        except Refusal as e:
+            expect("another family is refused",
+                   e.code == EXIT_REFUSED and "'llama' is not a family" in str(e), str(e))
     print("mlx-fixture self-test: ok")
 
 

@@ -140,7 +140,7 @@ mod generate;
 mod keep;
 #[path = "mlx.rs"]
 mod mlx;
-#[path = "../shared/qwen35moe_mlx_split.rs"]
+#[path = "../shared/mlx_split.rs"]
 mod mlx_split;
 #[path = "mutants.rs"]
 mod mutants;

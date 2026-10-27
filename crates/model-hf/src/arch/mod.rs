@@ -9,6 +9,9 @@ use crate::folder::{self, FolderMap};
 pub mod glm5next;
 pub mod minimaxm3;
 pub mod qwen35moe;
+pub mod qwen3moe;
+mod section;
+mod trunk;
 
 /// A folder map's row in [`MAPS`]: the `model_type`s it reads and the open of a folder it reads.
 pub struct MapRow {
@@ -27,7 +30,43 @@ pub const MAPS: &[MapRow] = &[
         model_types: <minimaxm3::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<minimaxm3::Checkpoint>,
     },
+    MapRow {
+        model_types: <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<qwen3moe::Checkpoint>,
+    },
 ];
+
+/// A program's work with one folder map `M`, which [`with_split_map`] picks by the folder's
+/// `model_type`.
+pub trait MapUse {
+    /// What the work gives.
+    type Out;
+
+    /// The work, with the map `M`.
+    fn with<M: FolderMap>(self) -> Self::Out;
+}
+
+/// The `model_type`s of the folders [`with_split_map`] reads.
+#[must_use]
+pub fn split_model_types() -> Vec<&'static str> {
+    [
+        <qwen35moe::Checkpoint as FolderMap>::MODEL_TYPES,
+        <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
+    ]
+    .concat()
+}
+
+/// `user` run with the map that reads folders of `model_type`, among the maps a folder becomes a
+/// GGUF split by (`prepare`); `None` for a type none reads.
+pub fn with_split_map<U: MapUse>(model_type: &str, user: U) -> Option<U::Out> {
+    if <qwen35moe::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
+        Some(user.with::<qwen35moe::Checkpoint>())
+    } else if <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
+        Some(user.with::<qwen3moe::Checkpoint>())
+    } else {
+        None
+    }
+}
 
 /// A checkpoint's `-exp(x)`, computed in f64 and rounded once to finite nonzero F32.
 fn neg_exp(x: f32) -> Result<f32, String> {

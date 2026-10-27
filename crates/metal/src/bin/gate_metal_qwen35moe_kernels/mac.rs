@@ -25,9 +25,10 @@
 //! the rows); `--fixture PATH` names the fixture's trunk file (the Mac's
 //! cache copy of the row's family otherwise) and runs the row whose instance
 //! the file selects; `--mlx-fixture PATH` names the MLX-format fixture split
-//! the A4 clauses read (the `qwen35moe-mlxsplit` copy under the fixture root
-//! otherwise); `--list` prints the clause names and exits; `--only CLAUSE`
-//! runs one clause, in the rows whose table has it; `--mutant NAME` runs the
+//! the A4 clauses read (the row's `<family>-mlxsplit` copy under the fixture
+//! root otherwise: `qwen35moe-mlxsplit`, `qwen3moe-mlxsplit`); `--list`
+//! prints the clause names and exits; `--only CLAUSE` runs one clause, in the
+//! rows whose table has it; `--mutant NAME` runs the
 //! one clause that must catch the named kernel defect (`mutants.rs`) against
 //! kernels compiled from the edited source of its row, and a clause that stays
 //! green on its mutant is the finding; `--mutants-all` runs every mutant of
@@ -95,7 +96,7 @@ mod clauses_tensor;
 mod common;
 #[path = "fixture.rs"]
 mod fixture;
-#[path = "../shared/qwen35moe_mlx_split.rs"]
+#[path = "../shared/mlx_split.rs"]
 mod mlx_split;
 #[path = "mutants.rs"]
 mod mutants;
@@ -468,9 +469,9 @@ enum Table {
     /// instance's fixture.
     Whole,
     /// The clauses of the kernels the instance's geometry shapes (router,
-    /// experts, attention, and the prompt pass's rows and routing), the main
-    /// table's mutants of those clauses (`kept`) and the instance's own
-    /// (`own`).
+    /// experts, attention, and the prompt pass's rows and routing) and the A4
+    /// clauses at its sites, the main table's mutants of those clauses
+    /// (`kept`) and the instance's own (`own`).
     Shaped {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
@@ -624,13 +625,14 @@ fn fixture_path(args: &[String], row: &InstanceRow) -> Result<PathBuf, String> {
         .map_err(|e| format!("{e} (name the fixture's trunk file with --fixture PATH)"))
 }
 
-/// The MLX-format fixture split the A4 clauses read: `--mlx-fixture PATH`,
-/// else [`mlx_split::path`].
-fn mlx_fixture_path(args: &[String]) -> Result<PathBuf, String> {
+/// The MLX-format fixture split the A4 clauses of `row` read: `--mlx-fixture PATH`,
+/// else [`mlx_split::path`] of the row's family.
+fn mlx_fixture_path(args: &[String], row: &InstanceRow) -> Result<PathBuf, String> {
     if let Some(path) = flag(args, "--mlx-fixture") {
         return Ok(PathBuf::from(path));
     }
-    mlx_split::path().map_err(|e| format!("{e} (name the split with --mlx-fixture PATH)"))
+    mlx_split::path(row.fixture)
+        .map_err(|e| format!("{e} (name the split with --mlx-fixture PATH)"))
 }
 
 /// Every mutant of each row's table, each in a child run of this gate
@@ -853,7 +855,7 @@ fn run_row(args: &[String], row: &InstanceRow) -> Row {
     // The MLX-format split beside it: the A4 clauses' weights. An A4 clause
     // run without it is red, not skipped — the split is the fixture the
     // family's MLX plan reads.
-    let mlx = mlx_fixture_path(args).and_then(|path| fixture::Fixture::open(&path));
+    let mlx = mlx_fixture_path(args, row).and_then(|path| fixture::Fixture::open(&path));
     match &mlx {
         Ok(f) => println!("mlx fixture: {}", f.path.display()),
         Err(e) => println!("mlx fixture: {e}"),
@@ -916,7 +918,8 @@ fn clause_table<'a>(
             .chain(clauses_experts::table(ctx))
             .chain(clauses_attention::table(ctx))
             .chain(clauses_rows::shaped(ctx))
-            .chain(clauses_route::shaped(ctx))
+            .chain(clauses_route::shaped(ctx, mlx))
+            .chain(clauses_a4::shaped(ctx.harness, mlx))
             .collect(),
         Table::Whole => front(ctx)
             .into_iter()
