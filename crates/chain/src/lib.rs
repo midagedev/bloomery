@@ -17,9 +17,13 @@
 //! the text, so what a gate pins reads the same on every backend.
 
 pub mod arch;
+pub mod hybrid;
 pub mod linear;
+mod noleg;
 pub mod rope;
 pub mod site;
+#[cfg(test)]
+pub(crate) mod test_file;
 
 use std::fmt;
 

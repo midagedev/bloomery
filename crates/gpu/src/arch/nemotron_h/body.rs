@@ -14,11 +14,14 @@ use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::site::SiteTy;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
+use chain::arch::nemotron_h::plan::Plan;
+use chain::arch::nemotron_h::read::layer_plans;
+use chain::hybrid::plan::LayerPlan;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::nemotron_h::hparams::{Hparams, Kind};
-use model::arch::nemotron_h::names;
+use model::arch::nemotron_h::{names, spec};
 use std::ops::Range;
 
 const WHAT: &str = "nemotron_h::Body::load";
@@ -28,6 +31,8 @@ pub struct Body {
     /// The Q5_0 token table's name.
     pub(super) embed: String,
     pub(super) sh: hybrid::Shape,
+    /// The chain's plans, one a layer: the walk's order, from the file's header.
+    pub(super) plans: Vec<Plan>,
     pub(super) layers: Vec<Layer>,
     pub(super) k: Kernels,
     pub(super) acts: Acts,
@@ -81,7 +86,9 @@ impl Body {
             ssm.conv_dim,
             stream,
         )?;
-        let mut names = Names {
+        let read = spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let plans = layer_plans(file, WHAT, &read.spec.layers, hidden, SITE_TYPES)?;
+        let names = Names {
             what: WHAT,
             file,
             w,
@@ -89,8 +96,9 @@ impl Body {
         };
         let embed = names::token_embd();
         names.site(&embed, (hp.n_vocab, hidden), &[SiteTy::Q5_0])?;
-        let layers = (0..hp.n_layer)
-            .map(|l| layer(&mut names, &hp, l, ctx, stream))
+        let layers = plans
+            .iter()
+            .map(|p| layer(&names, p, hidden, ctx, stream))
             .collect::<Result<Vec<_>, _>>()?;
         let sh = hybrid::Shape {
             hidden,
@@ -108,6 +116,7 @@ impl Body {
             r: DeviceBuffer::zeroed(stream, hidden)?,
             words: Words::new(n_kv),
             sh,
+            plans,
             layers,
             embed,
         })
@@ -127,30 +136,23 @@ impl Body {
     }
 }
 
-/// Layer `l` of the kind `hp` gives it, resolved against `names`.
+/// A layer of the kind its plan names, resolved against `names`.
 fn layer(
-    names: &mut Names<'_>,
-    hp: &Hparams,
-    l: usize,
+    names: &Names<'_>,
+    plan: &Plan,
+    hidden: usize,
     ctx: usize,
     stream: &CudaStream,
 ) -> Result<Layer, GpuError> {
-    let hidden = hp.n_embd;
-    let norm = names.vector(l, names::ATTN_NORM, hidden)?;
-    Ok(match hp.kinds[l] {
-        Kind::Mamba => Layer::Mamba(names.mamba((l, norm), &hp.ssm, hidden, stream)?),
-        Kind::Attention => {
-            Layer::Attn(names.attn((l, norm), (hp.n_head, hp.kv[l]), (hidden, ctx), stream)?)
-        }
-        Kind::Mlp => {
-            let ff = hp.ff[l];
-            Layer::Mlp(MlpLayer {
-                up: names.proj(l, names::FFN_UP, (ff, hidden))?,
-                down: names.proj(l, names::FFN_DOWN, (hidden, ff))?,
-                ff,
-                norm,
-            })
-        }
+    Ok(match plan {
+        LayerPlan::Mamba(p) => Layer::Mamba(names.mamba_of(p, hidden, stream)?),
+        LayerPlan::Attn(p) => Layer::Attn(names.attn_of(p, (hidden, ctx), stream)?),
+        LayerPlan::Ffn(p) => Layer::Mlp(MlpLayer {
+            norm: names.planned_vector(&p.norm, hidden)?,
+            up: names.planned(&p.up, p.up_ty, (p.ff, hidden))?,
+            down: names.planned(&p.down, p.down_ty, (hidden, p.ff))?,
+            ff: p.ff,
+        }),
     })
 }
 
