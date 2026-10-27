@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::path::PathBuf;
 
 use engram::EngramError;
 use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
@@ -284,18 +285,14 @@ impl Source for Checkpoint {
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
         let placed = self.placed(m);
         let ty = self.card_type(name, m)?;
-        // A whole tensor's stored bytes are read into memory of the read's own ([`read_whole`]);
+        // A whole tensor's stored bytes are read into memory of the read's own ([`Wholes::read`]);
         // a part reads only its rows through the mapping.
-        let mut read = HashMap::new();
-        if p.at.is_none() || m.step.is_some() {
-            for n in stored(&placed) {
-                if let Some(w) = read_whole(&self.folder, n)? {
-                    read.insert(n, w);
-                }
-            }
-        }
-        let get = |n: &str| match read.get(n) {
-            Some(w) => Ok(w.raw()),
+        let read = match p.at.is_none() || m.step.is_some() {
+            true => Wholes::read(&self.folder, stored(&placed))?,
+            false => None,
+        };
+        let get = |n: &str| match read.as_ref().and_then(|w| w.raw(n)) {
+            Some(raw) => Ok(raw),
             None => self.folder.raw(n),
         };
         let n = match (&p.at, &m.step) {
@@ -381,61 +378,126 @@ impl Source for Checkpoint {
     }
 }
 
-/// A stored tensor read whole into memory of its own ([`read_whole`]).
-struct Whole {
-    dtype: Dtype,
-    shape: Vec<usize>,
+/// Stored tensors whose aligned spans touch in one shard, read as one ([`Wholes::read`]).
+struct Extent<'n> {
+    path: PathBuf,
+    /// The aligned file offset and length.
+    start: u64,
+    len: usize,
+    /// Each tensor's name and file bytes.
+    held: Vec<(&'n str, Range<u64>)>,
+}
+
+impl Extent<'_> {
+    fn end(&self) -> u64 {
+        self.start + self.len as u64
+    }
+}
+
+/// The stored tensors a part reads whole, in one buffer of their own ([`Wholes::read`]).
+struct Wholes<'n> {
     buf: Vec<u8>,
-    /// The tensor's bytes in `buf`.
-    at: Range<usize>,
+    /// Each tensor's dtype, shape and bytes in `buf`.
+    at: HashMap<&'n str, (Dtype, Vec<usize>, Range<usize>)>,
 }
 
-impl Whole {
-    fn raw(&self) -> Raw<'_> {
-        Raw {
-            dtype: self.dtype,
-            shape: &self.shape,
-            bytes: &self.buf[self.at.clone()],
+impl<'n> Wholes<'n> {
+    /// Stored tensors `names` read whole from their shards past the page cache (engram's direct
+    /// reader) into one new buffer advised onto huge pages, so the reads take the drive's rate,
+    /// fault once each 2 MiB and leave the page cache as it was. A routed stack is thousands of
+    /// stored tensors, so each shard is opened, and its direct reads proved, once, and tensors
+    /// whose aligned spans touch in a shard are read as one extent. The extents run shard by
+    /// shard, so a read holds one shard open at a time, however many shards the part spans. `None` only when a shard's
+    /// filesystem refuses direct reads as invalid or unsupported ([`DirectFile::open`]); other
+    /// I/O errors propagate.
+    fn read(folder: &Folder, names: impl Iterator<Item = &'n str>) -> Result<Option<Self>, Error> {
+        let mut spans = names
+            .map(|name| Ok((folder.file_range(name)?, name)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        spans.sort_by(|((p, r), _), ((q, s), _)| (p, r.start).cmp(&(q, s.start)));
+        let mut extents: Vec<Extent<'n>> = Vec::new();
+        for ((path, range), name) in spans {
+            let (start, span, _) = aligned_span(range.start, range.end - range.start);
+            let end = start + span as u64;
+            match extents.last_mut() {
+                Some(e) if e.path == path && start <= e.end() => {
+                    e.len = (end.max(e.end()) - e.start) as usize;
+                    e.held.push((name, range));
+                }
+                _ => extents.push(Extent {
+                    path,
+                    start,
+                    len: span,
+                    held: vec![(name, range)],
+                }),
+            }
         }
-    }
-}
-
-/// Stored tensor `name` read whole from its shard past the page cache (engram's direct reader)
-/// into new memory advised onto huge pages, so the read takes the drive's rate, faults once each
-/// 2 MiB and leaves the page cache as it was. `None` only when the shard's filesystem refuses
-/// direct reads as invalid or unsupported ([`DirectFile::open`]); other I/O errors propagate.
-fn read_whole(folder: &Folder, name: &str) -> Result<Option<Whole>, Error> {
-    let (path, range) = folder.file_range(name)?;
-    let file = match DirectFile::open(&path) {
-        Ok(file) => file,
-        Err(EngramError::OpenDirect { source, .. } | EngramError::DirectProbe { source, .. })
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
-            ) =>
+        let mut size = 0usize;
+        for e in &extents {
+            size = size
+                .checked_add(e.len)
+                .ok_or_else(|| refuse(e.held[0].0, "the part's direct read bytes pass usize"))?;
+        }
+        let mut buf = vec![0u8; size + DIRECT_ALIGN];
+        os::advise_huge_within(&mut buf);
+        let mut slot = buf.as_ptr().align_offset(DIRECT_ALIGN);
+        let mut open: Option<DirectFile> = None;
+        let mut at = HashMap::new();
+        for Extent {
+            path,
+            start,
+            len: span,
+            held,
+        } in extents
         {
-            return Ok(None);
+            let file = match open.take() {
+                Some(file) if file.path() == path => open.insert(file),
+                held => {
+                    drop(held);
+                    match DirectFile::open(&path) {
+                        Ok(file) => open.insert(file),
+                        Err(
+                            EngramError::OpenDirect { source, .. }
+                            | EngramError::DirectProbe { source, .. },
+                        ) if matches!(
+                            source.kind(),
+                            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                        ) =>
+                        {
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            };
+            let got = file.read_span(&mut buf[slot..slot + span], start)? as u64;
+            for (name, range) in held {
+                if got < range.end - start {
+                    return Err(refuse(
+                        name,
+                        format!("{} ends inside its bytes", file.path().display()),
+                    ));
+                }
+                let raw = folder.raw(name)?;
+                let from = slot + (range.start - start) as usize;
+                at.insert(
+                    name,
+                    (raw.dtype, raw.shape.to_vec(), from..from + raw.bytes.len()),
+                );
+            }
+            slot += span;
         }
-        Err(e) => return Err(e.into()),
-    };
-    let raw = folder.raw(name)?;
-    let (start, span, need) = aligned_span(range.start, range.end - range.start);
-    let mut buf = vec![0u8; span + DIRECT_ALIGN];
-    os::advise_huge_within(&mut buf);
-    let lead = buf.as_ptr().align_offset(DIRECT_ALIGN);
-    if file.read_span(&mut buf[lead..lead + span], start)? < need {
-        return Err(refuse(
-            name,
-            format!("{} ends inside its bytes", path.display()),
-        ));
+        Ok(Some(Wholes { buf, at }))
     }
-    let skip = need - raw.bytes.len();
-    Ok(Some(Whole {
-        dtype: raw.dtype,
-        shape: raw.shape.to_vec(),
-        buf,
-        at: lead + skip..lead + need,
-    }))
+
+    /// Stored tensor `name` as read, `None` for one this read does not hold.
+    fn raw(&self, name: &str) -> Option<Raw<'_>> {
+        self.at.get(name).map(|(dtype, shape, at)| Raw {
+            dtype: *dtype,
+            shape,
+            bytes: &self.buf[at.clone()],
+        })
+    }
 }
 
 /// The stored tensors a tensor placed as `placed` is made of: each source, then the companions
@@ -919,54 +981,65 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A stack of four compressed-tensors NVFP4 experts (codes, block scales, a divisor and an
-    /// input scale each, as MiniMax-M3.1 stores them), with its GGUF, and the 2-D `lone.weight`.
-    fn stack_of_four(dir: &std::path::Path) -> (Checkpoint, Split) {
+    /// A stack of `experts` compressed-tensors NVFP4 experts (codes, block scales, a divisor and
+    /// an input scale each, as MiniMax-M3.1 stores them), each expert in a shard of its own, and
+    /// the 2-D `lone.weight` in `model.safetensors`.
+    fn stack(dir: &std::path::Path, experts: usize) -> Checkpoint {
         let f32s = |v: f32| v.to_le_bytes().to_vec();
-        let mut t: Vec<Stored> = vec![(
-            "lone.w".into(),
-            "U8",
-            vec![8, 64],
-            bytes(512, |i| (i * 5) as u8),
+        let mut shards: Vec<(String, Vec<Stored>)> = vec![(
+            "model.safetensors".into(),
+            vec![
+                (
+                    "lone.w".into(),
+                    "U8",
+                    vec![8, 64],
+                    bytes(512, |i| (i * 5) as u8),
+                ),
+                (
+                    "lone.s".into(),
+                    "F8_E4M3",
+                    vec![8, 8],
+                    bytes(64, |i| 0x38 + (i % 5) as u8),
+                ),
+                ("lone.g".into(), "F32", vec![], f32s(2.0)),
+                ("lone.i".into(), "F32", vec![], f32s(1.0)),
+            ],
         )];
-        t.push((
-            "lone.s".into(),
-            "F8_E4M3",
-            vec![8, 8],
-            bytes(64, |i| 0x38 + (i % 5) as u8),
-        ));
-        t.push(("lone.g".into(), "F32", vec![], f32s(2.0)));
-        t.push(("lone.i".into(), "F32", vec![], f32s(1.0)));
-        for e in 0..4 {
-            t.push((
-                format!("ex.{e}.w"),
-                "U8",
-                vec![32, 64],
-                bytes(2048, |i| (i * 13 + 41 * e) as u8),
+        for e in 0..experts {
+            shards.push((
+                format!("ex-{e}.safetensors"),
+                vec![
+                    (
+                        format!("ex.{e}.w"),
+                        "U8",
+                        vec![32, 64],
+                        bytes(2048, |i| (i * 13 + 41 * e) as u8),
+                    ),
+                    (
+                        format!("ex.{e}.s"),
+                        "F8_E4M3",
+                        vec![32, 8],
+                        bytes(256, |i| 0x30 + ((i + 3 * e) % 11) as u8),
+                    ),
+                    (
+                        format!("ex.{e}.g"),
+                        "F32",
+                        vec![],
+                        f32s(4.0 * (e + 1) as f32),
+                    ),
+                    (format!("ex.{e}.i"), "F32", vec![], f32s(1.0)),
+                ],
             ));
-            t.push((
-                format!("ex.{e}.s"),
-                "F8_E4M3",
-                vec![32, 8],
-                bytes(256, |i| 0x30 + ((i + 3 * e) % 11) as u8),
-            ));
-            t.push((
-                format!("ex.{e}.g"),
-                "F32",
-                vec![],
-                f32s(4.0 * (e + 1) as f32),
-            ));
-            t.push((format!("ex.{e}.i"), "F32", vec![], f32s(1.0)));
         }
-        let entries: Vec<_> = t
-            .iter()
-            .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
-            .collect();
-        std::fs::write(dir.join("model.safetensors"), safetensors::write(&entries)).unwrap();
-        let map: BTreeMap<_, _> = t
-            .iter()
-            .map(|(n, ..)| (n.as_str(), "model.safetensors"))
-            .collect();
+        let mut map = BTreeMap::new();
+        for (file, t) in &shards {
+            let entries: Vec<_> = t
+                .iter()
+                .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
+                .collect();
+            std::fs::write(dir.join(file), safetensors::write(&entries)).unwrap();
+            map.extend(t.iter().map(|(n, ..)| (n.as_str(), file.as_str())));
+        }
         std::fs::write(
             dir.join(Folder::INDEX),
             serde_json::json!({ "weight_map": map }).to_string(),
@@ -980,7 +1053,7 @@ pub(crate) mod tests {
                 .collect(),
         };
         let mut placed = BTreeMap::from([("lone.w".to_string(), ct("lone"))]);
-        for e in 0..4 {
+        for e in 0..experts {
             placed.insert(format!("ex.{e}.w"), ct(&format!("ex.{e}")));
         }
         let plan = Plan {
@@ -996,13 +1069,14 @@ pub(crate) mod tests {
         let made = BTreeMap::from([
             (
                 "ex.weight".to_string(),
-                made((0..4).map(|e| format!("ex.{e}.w")).collect(), &[128, 32, 4]),
+                made(
+                    (0..experts).map(|e| format!("ex.{e}.w")).collect(),
+                    &[128, 32, experts as u64],
+                ),
             ),
             ("lone.weight".into(), made(vec!["lone.w".into()], &[128, 8])),
         ]);
-        let c = Checkpoint::new(Folder::open(dir).unwrap(), plan, made).unwrap();
-        let file = gguf_of(&c, &dir.join("model.gguf"));
-        (c, file)
+        Checkpoint::new(Folder::open(dir).unwrap(), plan, made).unwrap()
     }
 
     /// The experts a list names of a stack are read by the folder and by its GGUF as the same
@@ -1015,7 +1089,8 @@ pub(crate) mod tests {
     #[test]
     fn a_stack_s_listed_experts_are_the_same_part_from_the_folder_and_its_gguf() {
         let dir = temp_dir("listed");
-        let (f, g) = stack_of_four(&dir);
+        let f = stack(&dir, 4);
+        let g = gguf_of(&f, &dir.join("model.gguf"));
         let list = |ids: &[u32], n: u64| ExpertList::new(ids.to_vec(), n).unwrap();
         let listed = |name: &'static str, l: ExpertList| {
             move |t: &str, _: GgmlType, _: &[u64]| {
@@ -1091,6 +1166,42 @@ pub(crate) mod tests {
             [one(0).3, one(2).3].concat(),
             "read again after release"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A whole stack spread over more shards than the process may hold open is read with one
+    /// shard open at a time: the test runs [`a_stack_of_64_shards_reads_past_the_page_cache`]
+    /// again under a soft open-file limit of 32. Mutant: each visited shard held open until the
+    /// part is read fails the read with too many open files.
+    #[test]
+    fn a_whole_stack_over_more_shards_than_open_files_reads() {
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                r#"ulimit -S -n 32 && exec "$0" --exact "$1" --include-ignored --test-threads=1"#,
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .arg("part::tests::a_stack_of_64_shards_reads_past_the_page_cache")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A stack of 64 experts, one a shard, read whole past the page cache.
+    #[test]
+    #[ignore = "a_whole_stack_over_more_shards_than_open_files_reads runs it under a soft open-file limit"]
+    fn a_stack_of_64_shards_reads_past_the_page_cache() {
+        let dir = temp_dir("many-shards");
+        let c = stack(&dir, 64);
+        let placed = c.placed(&c.made["ex.weight"]);
+        if Wholes::read(&c.folder, stored(&placed)).unwrap().is_none() {
+            eprintln!("direct reads unsupported; descriptor-limit check skipped");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
