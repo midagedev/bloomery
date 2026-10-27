@@ -74,6 +74,9 @@ impl Flags {
                 "--embd-hf" => "--hf",
                 _ => {
                     rest.push(a.clone());
+                    if crate::llama_launch::serve_takes_value(a) {
+                        rest.extend(it.next().cloned());
+                    }
                     continue;
                 }
             };
@@ -95,11 +98,21 @@ impl Flags {
         self.model.path.is_some() || self.model.hf.is_some()
     }
 
+    /// Checks the side model's image flags without opening or fetching either model.
+    pub fn check_before_model(&self) -> Result<(), GateError> {
+        source::resolve(&self.model, None)
+            .map_err(|e| format!("embedding flags (--embd-model/--embd-hf): {e}"))?;
+        self.image
+            .check_before_model(self.model.hf.is_some())
+            .map_err(|e| format!("embedding image flags: {e}").into())
+    }
+
     /// The side model the flags name, `None` when they name none: its file found, or fetched
     /// from `--embd-hf`'s repo; its architecture one of [`ROWS`]; its context the row's
     /// ([`Row::ctx`]); and its bytes. Each step refuses by name. A seat calls it after its levers
     /// and its own arguments, and before its plan.
     pub fn read(&self) -> Result<Option<Side>, GateError> {
+        self.check_before_model()?;
         let Some(path) = model_file::resolve(&self.model, None, hf::fetch::Sources::Gguf)? else {
             return Ok(None);
         };
@@ -144,9 +157,6 @@ impl Flags {
             None
         };
         let projector = match projector_path.as_deref() {
-            Some(_) if !cfg!(feature = "vision") => {
-                return Err("--embd-mmproj needs the vision build feature".into());
-            }
             Some(p) => {
                 let p = vision_seat::Projector::open(p, &self.image, row.projector_types)?;
                 let n_embd = split

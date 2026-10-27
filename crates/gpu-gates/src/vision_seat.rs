@@ -117,6 +117,7 @@ impl Flags {
             "--image-max-tokens" => self.max_tokens = Some(count(flag, value()?)?),
             _ => return Ok(false),
         }
+        self.mmproj()?;
         Ok(true)
     }
 
@@ -134,25 +135,39 @@ impl Flags {
         }
     }
 
+    /// Checks impossible explicit limits, the build's image support and limits on disabled
+    /// images. Unset bounds wait for the projector's defaults.
+    pub fn check_before_model(&self, from_repo: bool) -> Result<(), GateError> {
+        self.limits_over(TokenLimits::new(1, usize::MAX)?)?;
+        if !cfg!(feature = "vision") && (self.mmproj()?.is_some() || self.sets_limits()) {
+            return Err(NO_TOWER.into());
+        }
+        self.check_source(from_repo)?;
+        Ok(())
+    }
+
     /// [`Flags::mmproj`], refused by name when a token limit is given with no encoder file to
     /// bound: no `--mmproj`, and no `--hf` repo whose projector [`Flags::encoder`] could pick.
     pub fn wanted(&self) -> Result<Option<&Path>, GateError> {
+        self.check_source(crate::model_file::hf_repo().is_some())?;
+        self.mmproj()
+    }
+
+    /// Limits need an explicit projector or a repository from which one can be selected.
+    fn check_source(&self, from_repo: bool) -> Result<(), GateError> {
         match self.mmproj()? {
-            None if self.sets_limits() && !self.may_pick() => Err(
+            None if self.sets_limits() && !self.may_pick(from_repo) => Err(
                 "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound"
                     .into(),
             ),
-            file => Ok(file),
+            _ => Ok(()),
         }
     }
 
     /// Whether [`Flags::encoder`] may take the `--hf` repo's projector: a build with the encoder,
     /// a model file from `--hf`, and neither `--mmproj` nor `--no-mmproj`.
-    fn may_pick(&self) -> bool {
-        cfg!(feature = "vision")
-            && self.mmproj.is_none()
-            && !self.no_mmproj
-            && crate::model_file::hf_repo().is_some()
+    fn may_pick(&self, from_repo: bool) -> bool {
+        cfg!(feature = "vision") && self.mmproj.is_none() && !self.no_mmproj && from_repo
     }
 
     /// The encoder file the seat serves images with, as llama-server's `-hf` picks it:
@@ -167,7 +182,9 @@ impl Flags {
         record::require(record::groups::fetch::FETCH, "vision_seat::Flags::encoder");
         match self.mmproj()? {
             Some(file) => Ok(Some(file.to_owned())),
-            None if takes && self.may_pick() => crate::model_file::hf_projector(),
+            None if takes && self.may_pick(crate::model_file::hf_repo().is_some()) => {
+                crate::model_file::hf_projector()
+            }
             None => Ok(None),
         }
     }
@@ -1374,6 +1391,13 @@ mod tests {
     /// The four flags in llama-server's spelling; `--no-mmproj` has no value, a limit not given is
     /// the default the caller passes (mtmd's 8 and 4096 here), and every refusal names its flag.
     #[test]
+    fn a_repository_can_supply_limits_only_in_a_vision_build() {
+        let f = flags(&["--image-max-tokens", "1024"]).unwrap();
+        assert_eq!(f.check_source(true).is_ok(), cfg!(feature = "vision"));
+        assert!(f.check_source(false).is_err());
+    }
+
+    #[test]
     fn the_flags_read_llama_servers_spelling() {
         let f = flags(&["--mmproj", "/m/p.gguf", "--image-min-tokens", "16"]).unwrap();
         assert_eq!(f.mmproj().unwrap(), Some(Path::new("/m/p.gguf")));
@@ -1654,7 +1678,11 @@ mod tests {
             flags(&["--no-mmproj"]).unwrap().encoder(true).unwrap(),
             None
         );
-        let both = flags(&["--mmproj", "/m/p.gguf", "--no-mmproj"]).unwrap();
+        let both = Flags {
+            mmproj: Some(PathBuf::from("/m/p.gguf")),
+            no_mmproj: true,
+            ..Flags::default()
+        };
         assert!(both.encoder(true).is_err());
     }
 

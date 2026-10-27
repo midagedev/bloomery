@@ -310,13 +310,42 @@ impl<B: ChainBody + 'static> Seat for Nemotron<B> {
     }
 }
 
+/// The flags of `args`: the common set alone.
+fn parse_args(args: &[String]) -> Result<SeatFlags, GateError> {
+    let a = SeatFlags::parse(args, USAGE, |_, _| Ok(false))?;
+    if let Some(n) = a.parallel.filter(|&n| n > 1) {
+        return Err(format!(
+            "--parallel {n}: both nemotron bodies hold one sequence; the seat serves --parallel 1"
+        )
+        .into());
+    }
+    if let Some(place) = a.place {
+        place.serves("nemotron", 0)?;
+    }
+    Ok(a)
+}
+
+/// The levers (unless `read_levers` is false) and flags [`run`] reads first, checked before the
+/// model is fetched ([`bloomery_gpu_gates::bind::check_seat`]).
+pub fn check(
+    args: &[String],
+    read_levers: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<SeatFlags>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(read_levers.then_some(ACTS_ON), args, |args, _| {
+        parse_args(args)
+    })
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(ACTS_ON)?;
-    record::at_main(NAME, record::BLOOMERY_SERVE_NEMOTRON);
+    record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_NEMOTRON, |flag| {
+        bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+    });
+    let bloomery_gpu_gates::bind::CheckedSeat { args: a, levers } = check(args, true)?;
+    let levers = levers.expect("the run reads its levers");
+
     arm_screen(levers.screen());
-    let a = SeatFlags::parse(args, USAGE, |_, _| Ok(false))?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let first = split
@@ -327,14 +356,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         return Err(format!(
             "{} is a {} file; the nemotron seat serves nemotron_h and nemotron_h_moe files",
             path.display(),
-            arch.name()
-        )
-        .into());
-    }
-    if let Some(n) = a.parallel.filter(|&n| n > 1) {
-        return Err(format!(
-            "--parallel {n}: the {} body holds one sequence and no resident slots; the \
-             seat serves --parallel 1",
             arch.name()
         )
         .into());

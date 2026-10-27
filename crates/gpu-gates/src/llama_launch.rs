@@ -27,9 +27,61 @@ use model::placement::workstation::DeviceInfo;
 use crate::GateError;
 #[cfg(feature = "gpu")]
 use crate::generate::SEAT_STEPS;
-use crate::llama_place::{Flags, Target};
+use crate::llama_place::{self, Flags, Target};
 #[cfg(feature = "gpu")]
 use crate::llama_place::{LIST_DEVICES, take_with_env};
+
+/// Whether a serve option consumes its following value. The seat table owns its spellings.
+pub(crate) fn serve_takes_value(flag: &str) -> bool {
+    if let Some(read) = SEAT_FLAGS.iter().find(|read| read.spelled.contains(&flag)) {
+        return read.flag != "--mmproj" || flag != "--no-mmproj";
+    }
+    !matches!(
+        flag,
+        "--help"
+            | "-h"
+            | "--version"
+            | "--plan"
+            | "--embd-no-mmproj"
+            | "--list-devices"
+            | "--records-schema"
+            | "--levers"
+    ) && !llama_place::CPU_MOE.contains(&llama_place::spelled(flag).as_str())
+}
+
+/// Serve options paired with their values, leaving a value's spelling untouched.
+pub fn serve_args(args: &[String]) -> impl Iterator<Item = (&String, Option<&String>)> {
+    let mut it = args.iter();
+    std::iter::from_fn(move || {
+        let flag = it.next()?;
+        let value = if serve_takes_value(flag) {
+            it.next()
+        } else {
+            None
+        };
+        Some((flag, value))
+    })
+}
+
+/// Whether `wanted` occurs as a serve option, skipping values of other options.
+pub fn serve_option(args: &[String], wanted: &str) -> bool {
+    serve_args(args).any(|(flag, _)| flag == wanted)
+}
+
+/// Separates the named serve options and their values from all other option-value pairs.
+pub fn take_serve_args(args: &[String], flags: &[&str]) -> (Vec<String>, Vec<String>) {
+    let (mut selected, mut rest) = (Vec::new(), Vec::new());
+    for (flag, value) in serve_args(args) {
+        let out = if flags.contains(&flag.as_str()) {
+            &mut selected
+        } else {
+            &mut rest
+        };
+        out.push(flag.clone());
+        out.extend(value.cloned());
+    }
+    (selected, rest)
+}
 
 /// The prefix of llama-server's environment variables.
 const PREFIX: &str = "LLAMA_ARG_";
@@ -216,9 +268,7 @@ impl Launcher<'_> {
         A: AsRef<OsStr> + Clone + From<String>,
     {
         let env = llama_env(std::env::vars_os())?;
-        let (flags, rest, mut notes) = take_with_env(args, &env)?;
-        let (mut rest, more) = seat_args(rest, &env, self.reads)?;
-        notes.extend(more);
+        let (flags, mut rest, notes) = seat_view(args, &env, self.reads)?;
         self.say(&notes);
         if flags.is_empty() {
             return Ok(rest);
@@ -265,6 +315,25 @@ impl Launcher<'_> {
             eprintln!("{}: {line}", self.bin);
         }
     }
+}
+
+/// `args` as a seat's parser reads them before [`Launcher::placed`] appends the `--place` word the
+/// cards come to: llama-server's placement flags and the variables of `env` that are theirs taken
+/// out ([`take_with_env`]) and returned, the other variables carried and the short spellings
+/// respelled ([`seat_args`]), and the lines that say each reading, not printed. It reads no device.
+#[cfg(feature = "gpu")]
+pub fn seat_view<A>(
+    args: &[A],
+    env: &[(String, String)],
+    reads: Reads,
+) -> Result<(Flags, Vec<A>, Vec<String>), GateError>
+where
+    A: AsRef<OsStr> + Clone + From<String>,
+{
+    let (flags, rest, mut notes) = take_with_env(args, env)?;
+    let (rest, more) = seat_args(rest, env, reads)?;
+    notes.extend(more);
+    Ok((flags, rest, notes))
 }
 
 /// The process's arguments as [`Launcher::start`] left them, argv[0] first. A binary that did not
@@ -401,7 +470,18 @@ where
     A: AsRef<OsStr> + From<String>,
 {
     let (carried, notes) = {
-        let given: Vec<&str> = rest.iter().filter_map(|a| a.as_ref().to_str()).collect();
+        let mut given = Vec::new();
+        let mut it = rest.iter();
+        while let Some(raw) = it.next() {
+            if let Some(flag) = raw.as_ref().to_str() {
+                given.push(flag);
+                if reads.flags.iter().any(|read| read.spelled.contains(&flag))
+                    && serve_takes_value(flag)
+                {
+                    it.next();
+                }
+            }
+        }
         carry_env(env, &given, reads)
     };
     let mut out = respell(rest, reads);
@@ -443,21 +523,28 @@ pub fn respell<A>(args: Vec<A>, reads: Reads) -> Vec<A>
 where
     A: AsRef<OsStr> + From<String>,
 {
-    args.into_iter()
-        .map(|a| {
-            let flag = a.as_ref().to_str().and_then(|arg| {
-                reads
-                    .flags
-                    .iter()
-                    .find(|e| !arg.starts_with("--") && e.spelled.contains(&arg))
-                    .map(|e| e.flag)
-            });
-            match flag {
-                Some(flag) => A::from(flag.to_owned()),
-                None => a,
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let takes_value = a.as_ref().to_str().is_some_and(|arg| {
+            reads.flags.iter().any(|read| read.spelled.contains(&arg)) && serve_takes_value(arg)
+        });
+        let flag = a.as_ref().to_str().and_then(|arg| {
+            reads
+                .flags
+                .iter()
+                .find(|e| !arg.starts_with("--") && e.spelled.contains(&arg))
+                .map(|e| e.flag)
+        });
+        out.push(match flag {
+            Some(flag) => A::from(flag.to_owned()),
+            None => a,
+        });
+        if takes_value {
+            out.extend(it.next());
+        }
+    }
+    out
 }
 
 /// A negative `--cache-ram`, refused by name where the seat takes the flag. llama-server reads
@@ -468,9 +555,20 @@ pub fn refuse_unbounded_cache<A: AsRef<OsStr>>(args: &[A], reads: Reads) -> Resu
     if !reads.flags.iter().any(|e| e.flag == FLAG) {
         return Ok(());
     }
-    let text: Vec<Option<&str>> = args.iter().map(|a| a.as_ref().to_str()).collect();
-    for pair in text.windows(2) {
-        if let [Some(FLAG), Some(value)] = pair
+    let mut it = args.iter();
+    while let Some(raw) = it.next() {
+        let Some(arg) = raw.as_ref().to_str() else {
+            continue;
+        };
+        let Some(read) = reads.flags.iter().find(|read| read.spelled.contains(&arg)) else {
+            continue;
+        };
+        if !serve_takes_value(arg) {
+            continue;
+        }
+        let Some(raw_value) = it.next() else { continue };
+        if read.flag == FLAG
+            && let Some(value) = raw_value.as_ref().to_str()
             && value.starts_with('-')
         {
             return Err(format!(
@@ -499,8 +597,8 @@ pub fn model_args(
     if path.is_some() && repo.is_some() {
         return Err(format!("{MODEL} and {HF_REPO} are both set, and name two models").into());
     }
-    let on_the_line = args
-        .iter()
+    let on_the_line = serve_args(&args)
+        .map(|(flag, _)| flag)
         .find(|a| path_flags.contains(&a.as_str()) || a.as_str() == "--hf")
         .cloned();
     let mut notes = Vec::new();
@@ -577,6 +675,60 @@ pub fn resolve(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serve_options_skip_values_and_keep_switches() {
+        for flag in [
+            "--levers",
+            "--list-devices",
+            "--records-schema",
+            "--version",
+            "--help",
+        ] {
+            let args = ["--alias", flag, "-ngl", "all", "--ctx-size", "abc"].map(str::to_owned);
+            assert!(!serve_option(&args, flag), "{flag} is an alias");
+            assert!(serve_option(&args, "--ctx-size"));
+        }
+        for flag in [
+            "--plan",
+            "--no-mmproj",
+            "--embd-no-mmproj",
+            "--cpu-moe",
+            "--cpu_moe",
+            "-cmoe",
+        ] {
+            let args = [flag, "--levers"].map(str::to_owned);
+            assert!(serve_option(&args, "--levers"), "{flag} has no value");
+        }
+    }
+
+    #[test]
+    fn serve_values_survive_every_shared_reader() {
+        for value in [
+            "--cpu_moe",
+            "--cache-ram",
+            "-cram",
+            "--place",
+            "--model",
+            "--hf",
+            "--head",
+            "--embd-hf",
+        ] {
+            let args = ["--alias", value, "--ctx-size", "8192", "--plan"]
+                .map(str::to_owned)
+                .to_vec();
+            let (flags, rest, _) = take_with_env(&args, &[]).expect("placement leaves the alias");
+            assert!(flags.is_empty(), "{value}");
+            assert_eq!(rest, args, "{value}");
+            let (selected, _) = take_serve_args(&args, &[value]);
+            assert!(selected.is_empty(), "{value} is a value");
+            let (out, _) = seat_args(rest, &env_of(&[("LLAMA_ARG_CACHE_RAM", "256")]), SERVE)
+                .expect("the alias has no cache budget");
+            let mut expected = args;
+            expected.extend(["--cache-ram", "256"].map(str::to_owned));
+            assert_eq!(out, expected, "{value}");
+        }
+    }
+
     use model::placement::workstation::{MIB, census_usable};
 
     use super::*;

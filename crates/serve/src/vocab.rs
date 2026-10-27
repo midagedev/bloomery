@@ -189,6 +189,20 @@ impl TemplateFile {
         self.0 = Some(PathBuf::from(value));
     }
 
+    /// Checks the explicit template and keeps its startup snapshot for the selected seat.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(path) = self.path() {
+            Self::read(path)?;
+        }
+        Ok(())
+    }
+
+    /// Startup checks and the selected seat share one snapshot, including read failures.
+    fn read(file: &Path) -> Result<String, String> {
+        crate::flag::file_snapshot(file)
+            .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))
+    }
+
     /// The file, when the flag was given.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
@@ -219,8 +233,7 @@ impl ChatSurface {
         default_alias: &str,
     ) -> Result<ChatSurface, String> {
         let template = match template_file {
-            Some(file) => std::fs::read_to_string(file)
-                .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))?,
+            Some(file) => TemplateFile::read(file)?,
             None => template
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
@@ -238,6 +251,34 @@ impl ChatSurface {
 mod tests {
     use super::Vocab;
     use crate::engine::Tokenizer;
+
+    #[test]
+    fn a_template_file_is_one_startup_snapshot() {
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-template-snapshot-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("template");
+        std::fs::write(&path, "first").unwrap();
+        let mut file = super::TemplateFile::default();
+        file.set(path.to_str().unwrap());
+        file.check().unwrap();
+        std::fs::write(&path, "changed").unwrap();
+        let chat = super::ChatSurface::read(
+            std::path::Path::new("model.gguf"),
+            None,
+            None,
+            file.path(),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(chat.template, "first");
+        let absent = dir.join("missing");
+        file.set(absent.to_str().unwrap());
+        let first = file.check().expect_err("the template is absent");
+        std::fs::write(&absent, "now present").unwrap();
+        assert_eq!(file.check().expect_err("the first read is kept"), first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn chat_templates_register_only_a_special_message_start() {

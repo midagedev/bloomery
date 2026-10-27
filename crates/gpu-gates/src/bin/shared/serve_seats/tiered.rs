@@ -207,6 +207,9 @@ pub trait Tiered: Seat + Sized + 'static {
     /// plan.
     const TIER_SLOTS: bool = true;
 
+    /// The pool support of the body this seat loads.
+    const UNHOSTED_POOL: UnhostedPool = UnhostedPool::NotCarried;
+
     /// Whether `arch` is a file this seat serves.
     fn accepts(arch: Arch) -> bool;
 
@@ -223,6 +226,11 @@ pub trait Tiered: Seat + Sized + 'static {
             .into());
         }
         read_file(path)
+    }
+
+    /// Whether this seat's explicit flags select the one-token prompt feed.
+    fn prefill_steps(_flags: &Self::Flags) -> bool {
+        false
     }
 
     /// The file's plan inputs, its own `place::read`.
@@ -295,9 +303,9 @@ pub trait Tiered: Seat + Sized + 'static {
         Ok(None)
     }
 
-    /// Registers the record kinds the seat's server prints (`record::at_main` with its
-    /// `record::BLOOMERY_SERVE_*` list), first thing after the levers.
-    fn register();
+    /// Registers the record kinds the seat's server prints (`record::at_main_with_flags` with its
+    /// `record::BLOOMERY_SERVE_*` list), before the run checks its arguments.
+    fn register(args: &[String]);
 
     /// The seat's `listening` record, which the run fills once the port is bound.
     fn listening() -> Record;
@@ -314,7 +322,7 @@ pub trait Tiered: Seat + Sized + 'static {
         plan: &Plan<'_>,
     ) -> Result<Option<ResidencyPick>, GateError> {
         // The hybrid bodies host every churn pool and feed the prompt in batches.
-        residency_pick(levers, place, plan, false, UnhostedPool::NotCarried).map(Some)
+        residency_pick(levers, place, plan, false, Self::UNHOSTED_POOL).map(Some)
     }
 
     /// After the plan's record: the room check of a set word, the host pool's record under
@@ -341,6 +349,28 @@ pub trait Tiered: Seat + Sized + 'static {
     fn open(a: Open<Self::Flags>) -> Result<Self, GateError>;
 }
 
+/// Checks an explicit residency against the body's pool support and prompt feed.
+pub fn check_residency_feed(
+    levers: &Levers,
+    prefill_steps: bool,
+    carry: UnhostedPool,
+) -> Result<(), GateError> {
+    if let Some(word) = levers.residency() {
+        match carry {
+            UnhostedPool::NotCarried => Residency::parse(word)?,
+            UnhostedPool::Carried => Residency::parse_asking(word)?,
+        };
+        if word != "off" && prefill_steps {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={word} is refused beside --prefill steps (each prompt id would \
+                 end a pass the rule counts)"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// `BLOOMERY_RESIDENCY` for a tiered seat, printed as the `residency lever` record: set, as
 /// given; unset, the serving word on a serving placement (`place` other than `gate`), which
 /// the plan keeps, moves or turns `off`. `prefill_steps` is the seat's step feed, which the
@@ -360,14 +390,7 @@ pub fn residency_pick(
         route_trace: false,
         prefill_steps,
     });
-    if pick.why == ResidencyWhy::Set && pick.word != "off" && prefill_steps {
-        return Err(format!(
-            "BLOOMERY_RESIDENCY={} is refused beside --prefill steps (each prompt id would \
-             end a pass the rule counts)",
-            pick.word
-        )
-        .into());
-    }
+    check_residency_feed(levers, prefill_steps, carry)?;
     let pick = residency::at_plan(carry, plan, 0, pick)?;
     record::residency_lever(pick).eprint();
     if let Some(d) = pick.why.detail() {
@@ -445,14 +468,9 @@ fn plan_at<'a, H>(
     })
 }
 
-/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
-/// or the engine fails; `Ok` carries why the server ended.
-pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(S::ACTS_ON)?;
-    model::ops::set_host_lanes(levers.host_lanes());
-    S::register();
-    record::require(record::groups::tiered::RUN, "tiered::run");
-    arm_screen(levers.screen());
+/// The common flags of `args` and the seat's own; `--parallel` above one is refused by name on a
+/// body that holds one sequence.
+fn parse_args<S: Tiered>(args: &[String]) -> Result<(SeatFlags, S::Flags), GateError> {
     let mut flags = S::Flags::default();
     let a = SeatFlags::parse(args, S::USAGE, |f, v| S::flags(f, v, &mut flags))?;
     if !S::RESIDENT
@@ -465,6 +483,39 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         )
         .into());
     }
+    Ok((a, flags))
+}
+
+/// The levers (unless `read_levers` is false) and flags [`run`] reads first, checked before the
+/// model is fetched ([`bloomery_gpu_gates::bind::check_seat`]).
+pub fn check<S: Tiered>(
+    args: &[String],
+    read_levers: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<(SeatFlags, S::Flags)>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(read_levers.then_some(S::ACTS_ON), args, |args, levers| {
+        let a = parse_args::<S>(args)?;
+
+        if let Some(place) = a.0.place {
+            place.serves(S::FAMILY, S::TIER_RULE.tiers)?;
+            refuse_tier_slots::<S>(place, a.0.parallel.unwrap_or(1))?;
+        }
+        if let Some(levers) = levers {
+            check_residency_feed(levers, S::prefill_steps(&a.1), S::UNHOSTED_POOL)?;
+        }
+        Ok(a)
+    })
+}
+
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
+    S::register(args);
+    let bloomery_gpu_gates::bind::CheckedSeat { args: a, levers } = check::<S>(args, true)?;
+    let levers = levers.expect("the run reads its levers");
+    model::ops::set_host_lanes(levers.host_lanes());
+    record::require(record::groups::tiered::RUN, "tiered::run");
+    arm_screen(levers.screen());
+    let (a, flags) = a;
     let side = side.read()?;
     let path = ref_model_path()?;
     let Read {

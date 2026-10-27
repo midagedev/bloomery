@@ -738,6 +738,19 @@ fn window_positions(slots: usize) -> usize {
     (<Body38 as MtpBody>::VERIFY_ROWS + 1).saturating_mul(slots)
 }
 
+/// A slot must hold the whole MTP window at its chosen context.
+fn check_mtp_ctx(ctx: usize, slots: usize) -> Result<(), GateError> {
+    if slots.saturating_mul(ctx) < window_positions(slots) {
+        return Err(format!(
+            "a slot's context of {ctx} leaves no positions for the MTP draft's window; \
+             --ctx-size names a total of at least {}",
+            window_positions(slots)
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// How the run feeds a prompt and whether it records the routing
 /// (`BLOOMERY_PREFILL`, `BLOOMERY_ROUTE_TRACE`): the inputs the unset
 /// residency's rule reads beside the placement, and what [`refuse_feed`]
@@ -868,6 +881,21 @@ fn mtp_only_lever(levers: &bloomery_levers::Levers) -> Option<&'static str> {
     }
 }
 
+/// Refuses draft-only levers when the draft's final rule serves the plain path.
+fn refuse_mtp_levers(
+    levers: &bloomery_levers::Levers,
+    draft_off: &Option<Draft38Off>,
+) -> Result<(), GateError> {
+    if let Some(why) = draft_off
+        && let Some(lever) = mtp_only_lever(levers)
+    {
+        return Err(
+            format!("{lever} is the MTP draft's; the server drafts nothing ({why})").into(),
+        );
+    }
+    bloomery_gpu_gates::bind::refuse_plain_width(levers, draft_off.as_ref())
+}
+
 /// What an image load (`--mmproj`) refuses of the feed: `BLOOMERY_PREFILL=steps`, which feeds a
 /// prompt one step an id. A prompt call that holds images enters their rows only through the
 /// ubatch walk's media call (`Seat::prefill_media`), so the step feed would serve one path to the
@@ -883,6 +911,18 @@ pub(crate) fn refuse_media_feed(feed: Feed38) -> Result<(), GateError> {
         );
     }
     Ok(())
+}
+
+/// The draft kinds this seat serves, before any model is read.
+fn check_draft_word(levers: &bloomery_levers::Levers) -> Result<(), GateError> {
+    match levers.draft() {
+        None | Some("mtp" | "lookup" | "off") => Ok(()),
+        Some(other) => Err(format!(
+            "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window, lookup the n-gram \
+             lookup and off runs the plain path; dspark is the V4.1 binaries'"
+        )
+        .into()),
+    }
 }
 
 /// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions
@@ -913,15 +953,12 @@ fn draft38(
     looked: &[std::path::PathBuf],
     inputs: &PlanInputs,
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
+    check_draft_word(levers)?;
     match levers.draft() {
         Some("mtp") => Ok((true, None)),
         Some("lookup") => Ok((false, None)),
         Some("off") => Ok((false, Some(Draft38Off::Set))),
-        Some(other) => Err(format!(
-            "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window, lookup the n-gram \
-             lookup and off runs the plain path; dspark is the V4.1 binaries'"
-        )
-        .into()),
+        Some(_) => unreachable!("the draft word was checked"),
         None => {
             let at = Draft38At {
                 place_a: place.stage_a(),
@@ -1215,7 +1252,7 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     })
 }
 
-struct Args {
+pub(crate) struct Args {
     host: String,
     port: u16,
     /// `--place`; `None` takes the common rule's choice ([`Place::choose`]).
@@ -1319,7 +1356,62 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 .into(),
         );
     }
+    bloomery_gpu_gates::bind::check_slot_ctx(a.ctx, a.parallel)?;
     Ok(a)
+}
+
+/// The levers (unless `read_levers` is false), flags and ubatch size ([`ubatch_rule`]) [`run`]
+/// reads first, checked before the model is fetched ([`bloomery_gpu_gates::bind::check_seat`]).
+pub(crate) fn check(
+    args: &[String],
+    read_levers: bool,
+    from_repo: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<Args>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(read_levers.then_some(ACTS_ON), args, |args, levers| {
+        let a = parse_args(args)?;
+        a.template_file.check()?;
+        a.vision.check_before_model(from_repo)?;
+        ubatch_rule(a.ubatch)?;
+        if let Some(levers) = levers {
+            check_draft_word(levers)?;
+            let feed = Feed38::of(levers)?;
+            if levers.draft() == Some("lookup") {
+                refuse_lookup_feed(feed)?;
+                if let Some(lever) = mtp_only_lever(levers) {
+                    return Err(format!(
+                        "{lever} is the MTP draft's; BLOOMERY_DRAFT=lookup serves the lookup draft"
+                    )
+                    .into());
+                }
+            }
+            if levers.draft() == Some("off") {
+                refuse_mtp_levers(levers, &Some(Draft38Off::Set))?;
+            }
+            let residency = levers.residency().filter(|&r| r != "off");
+            refuse_feed(
+                feed,
+                (a.parallel.unwrap_or(1), levers.draft() == Some("mtp")),
+                residency,
+            )?;
+            if a.vision.mmproj()?.is_some() {
+                refuse_media_feed(feed)?;
+                draft_off_for(
+                    Draft38Off::Media,
+                    levers.draft(),
+                    (levers.draft() == Some("mtp"), None),
+                )?;
+            }
+            if levers.draft() == Some("mtp") {
+                let (slots, _) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
+                if let Some(ctx) = a.ctx {
+                    check_mtp_ctx(ctx / slots, slots)?;
+                }
+            }
+            WidthMode::of(levers.mtp_width())?;
+            experts38(levers)?;
+        }
+        Ok(a)
+    })
 }
 
 /// What `--mmproj` opened for the plans: the encoder file held against the text model's embedding
@@ -1335,10 +1427,7 @@ fn vision_of(
     spec: &ModelSpec,
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<Option<vision_seat::Opened>, GateError> {
-    #[cfg(not(feature = "vision"))]
-    if flags.wanted()?.is_some() {
-        return Err(vision_seat::NO_TOWER.into());
-    }
+    flags.check_before_model(bloomery_gpu_gates::model_file::hf_repo().is_some())?;
     let file = flags.encoder(takes)?;
     vision_seat::open_seat(
         flags,
@@ -1365,9 +1454,22 @@ fn reseated(at: vision_seat::Opened, place: Place) -> Result<vision_seat::Opened
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(ACTS_ON)?;
+    record::at_main_with_flags(
+        "bloomery-serve-qwen38",
+        record::BLOOMERY_SERVE_QWEN38,
+        |flag| bloomery_gpu_gates::llama_launch::serve_option(args, flag),
+    );
+    let bloomery_gpu_gates::bind::CheckedSeat {
+        args: mut a,
+        levers,
+    } = check(
+        args,
+        true,
+        bloomery_gpu_gates::model_file::hf_repo().is_some(),
+    )?;
+    let levers = levers.expect("the run reads its levers");
     model::ops::set_host_lanes(levers.host_lanes());
-    record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
+
     super::drafted::serves_widths();
     arm_screen(levers.screen());
     // Set, the word runs as given; unset, the Qwen3.8 rule picks it once the
@@ -1384,7 +1486,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => None,
     };
     let feed = Feed38::of(&levers)?;
-    let mut a = parse_args(args)?;
     // The one ubatch size the plans and the load take, each clipped to its context.
     let ubatch = ubatch_rule(a.ubatch)?
         .asked()
@@ -1479,31 +1580,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft
     // the plan turns off refuses them the same as one the rule did.
-    let refuse_mtp_levers = |draft_off: &Option<Draft38Off>| -> Result<(), GateError> {
-        if let Some(why) = draft_off {
-            if let Some(lever) = mtp_only_lever(&levers) {
-                return Err(format!(
-                    "{lever} is the MTP draft's; the server drafts nothing ({why})"
-                )
-                .into());
-            }
-            if levers.mtp_width().is_some() {
-                return Err(format!(
-                    "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server \
-                     drafts nothing ({why})"
-                )
-                .into());
-            }
-        }
-        Ok(())
-    };
     let lookup = levers.draft() == Some("lookup");
-    if lookup && let Some(lever) = mtp_only_lever(&levers) {
-        return Err(format!(
-            "{lever} is the MTP draft's; BLOOMERY_DRAFT=lookup serves the lookup draft"
-        )
-        .into());
-    }
     let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
@@ -1794,7 +1871,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             (drafts, if drafts { head } else { None }, draft_off, host)
         }
     };
-    refuse_mtp_levers(&draft_off)?;
+    refuse_mtp_levers(&levers, &draft_off)?;
     let residency_word = set.filter(|&(r, _)| r != Residency::Off).map(|(_, w)| w);
     if lookup {
         refuse_lookup_feed(feed)?;
@@ -1853,14 +1930,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // unset draft's own condition at the default's, the set draft's at any;
     // a draft the yield turned off needs no window (the plain rule's context
     // is the larger one it fell to).
-    if mtp && slots.saturating_mul(ctx) < window_positions(slots) {
-        return Err(format!(
-            "a slot's context of {ctx} leaves no positions for the MTP draft's window; \
-             --ctx-size names a total of at least {}",
-            window_positions(slots)
-        )
-        .into());
+    if mtp {
+        check_mtp_ctx(ctx, slots)?;
     }
+
     let ub = ubatch.min(ctx);
     let machine = a.place.machine(
         &inputs,

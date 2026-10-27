@@ -13,10 +13,12 @@ fn main() -> std::process::ExitCode {
     use bloomery_gpu_gates::llama_launch::{self, Launcher};
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match llama_launch::answer_list_devices(&args) {
-        Ok(true) => return std::process::ExitCode::SUCCESS,
-        Ok(false) => {}
-        Err(e) => return bloomery_gpu_gates::exit_with(NAME, Err(e)),
+    if llama_launch::serve_option(&args, "--list-devices") {
+        match llama_launch::answer_list_devices(&args) {
+            Ok(true) => return std::process::ExitCode::SUCCESS,
+            Ok(false) => {}
+            Err(e) => return bloomery_gpu_gates::exit_with(NAME, Err(e)),
+        }
     }
     // llama-server's placement flags and variables, read once the seat's own flags are out.
     let seat = || -> Result<&'static str, bloomery_gpu_gates::GateError> { Ok("qwen38") };

@@ -485,8 +485,10 @@ impl Tiered for Muse {
         Ok(inputs.streaming(bytes))
     }
 
-    fn register() {
-        record::at_main(NAME, record::BLOOMERY_SERVE_MUSESPARK);
+    fn register(args: &[String]) {
+        record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_MUSESPARK, |flag| {
+            bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+        });
     }
 
     fn listening() -> Record {
@@ -502,4 +504,10 @@ impl Tiered for Muse {
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     tiered::run::<Muse>(args, side)
+}
+
+/// The seat's levers (unless `read_levers` is false) and flags, checked before the model is fetched
+/// ([`tiered::check`]).
+pub fn check(args: &[String], read_levers: bool) -> Result<(), GateError> {
+    tiered::check::<Muse>(args, read_levers).map(drop)
 }

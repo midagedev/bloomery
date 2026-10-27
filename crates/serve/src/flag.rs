@@ -4,8 +4,22 @@
 //! ([`ApiKeys`]) both key flags add to and every request of both servers is
 //! checked against.
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
+
+/// Startup configuration files are read once per path, including failures and pipe inputs.
+pub(crate) fn file_snapshot(path: &Path) -> Result<String, String> {
+    static READ: Mutex<BTreeMap<PathBuf, Result<String, String>>> = Mutex::new(BTreeMap::new());
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read.entry(path.to_path_buf())
+        .or_insert_with(|| std::fs::read_to_string(path).map_err(|e| e.to_string()))
+        .clone()
+}
 
 /// The spellings of the context flag: `--ctx`, and llama-server's
 /// `--ctx-size` and `-c`.
@@ -62,6 +76,12 @@ impl ApiKeys {
     /// key at all is an error naming it, where llama-server would start with
     /// the check off, serving anyone who reaches the port while the user
     /// believes it locked.
+    ///
+    /// A key file is a startup snapshot: the process reads each path once,
+    /// and every later parse of the same flags takes what that read found,
+    /// the keys or the error, so a pipe (`/dev/stdin`, a FIFO) holds its keys for a start that
+    /// parses the flags more than once, and a change to the file after the
+    /// first read is not seen.
     pub fn add(&mut self, flag: &str, value: &str) -> Result<(), String> {
         let added: Vec<String> = match flag {
             "--api-key" => csv_row(value)
@@ -69,7 +89,7 @@ impl ApiKeys {
                 .filter(|k| !k.is_empty())
                 .collect(),
             "--api-key-file" => {
-                let text = std::fs::read_to_string(value)
+                let text = file_snapshot(Path::new(value))
                     .map_err(|e| format!("{flag} {value:?}: cannot read it: {e}"))?;
                 // `lines` drops a CRLF line's `\r`; llama-server's getline on
                 // Linux keeps it, in a key no header value ever matches.
@@ -245,6 +265,26 @@ mod tests {
                 missing.display().to_string()
             ))
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key file read that fails is part of the snapshot too: a later
+    /// parse of the same path gets the same error and opens nothing, so a
+    /// spent pipe cannot hang a second parse.
+    #[test]
+    fn a_failed_key_file_read_is_kept_like_its_keys() {
+        let dir = std::env::temp_dir().join(format!("bloomery-bad-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("keys");
+        std::fs::write(&file, b"\xff\n").unwrap();
+        let path = file.display().to_string();
+        let first = ApiKeys::default().add("--api-key-file", &path);
+        assert!(
+            first.as_ref().is_err_and(|e| e.contains("cannot read it")),
+            "{first:?}"
+        );
+        std::fs::write(&file, "now-valid\n").unwrap();
+        assert_eq!(ApiKeys::default().add("--api-key-file", &path), first);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

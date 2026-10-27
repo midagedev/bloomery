@@ -225,7 +225,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, TemplateFile,
     Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
 };
-use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, PlaceWhy, lane_at, mode_name};
+use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
@@ -291,7 +291,7 @@ pub const USER_START: &str = "<｜User｜>";
 /// later request keeps saves.
 const SPLIT_MIN: usize = 64;
 
-struct Args {
+pub(crate) struct Args {
     host: String,
     port: u16,
     /// The placement the seat runs by, resolved against this process's
@@ -324,7 +324,10 @@ struct Args {
     plan_only: bool,
 }
 
-fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
+/// The flags of `args`, and `--place`'s word: the placement is chosen against the devices
+/// ([`place::choose`]) by [`run`], since the flags are checked before any card is read
+/// ([`check`]).
+fn parse_args(args: &[String]) -> Result<(Args, Option<Place>), GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
@@ -386,9 +389,60 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
                 .into(),
         );
     }
-    let placed = place::choose(place_flag)?;
-    a.place = placed.place;
-    Ok((a, placed))
+    Ok((a, place_flag))
+}
+
+/// The levers (unless `read_levers` is false) and flags [`run`] reads first, checked before the
+/// model is fetched ([`bloomery_gpu_gates::bind::check_seat`]), and `--ctx` against the fewest
+/// slots the start can serve ([`slot_ctx`]): `--parallel`'s count, else one, the fewest an unset
+/// count comes to under any lever [`slot_count`] reads.
+pub(crate) fn check(
+    args: &[String],
+    read_levers: bool,
+    from_repo: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<(Args, Option<Place>)>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(
+        read_levers.then_some(crate::serve_levers::ACTS_ON),
+        args,
+        |args, levers| {
+            let (a, place) = parse_args(args)?;
+            a.template_file.check()?;
+            a.vision.check_before_model(from_repo)?;
+            let fewest = a
+                .parallel
+                .and_then(NonZeroUsize::new)
+                .unwrap_or(NonZeroUsize::MIN);
+            slot_ctx(a.ctx, fewest)?;
+            if let Some(levers) = levers {
+                let draft = Draft::check_levers(levers)?;
+                WidthMode::of(levers.mtp_width())?;
+                bloomery_gpu_gates::bind::refuse_plain_width(
+                    levers,
+                    (draft == Draft::Off).then_some("BLOOMERY_DRAFT is unset"),
+                )?;
+                let (slots, _) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
+                slot_ctx(a.ctx, slots)?;
+                let at = ResidencyAt {
+                    serving_place: place != Some(Place::Gate),
+                    check_finite: false,
+                    route_trace: levers.route_trace().is_some(),
+                    prefill_steps: body::PrefillMode::from_name(levers.prefill())
+                        == Some(body::PrefillMode::Steps),
+                };
+                let cfg = body::OpenCfg::from_levers_at(levers, at)?;
+                let residency = levers.residency_at(at);
+                if cfg.body.residency != Residency::Off && place == Some(Place::Gate) {
+                    return Err(format!("BLOOMERY_RESIDENCY={} under --place gate: the residency machine runs under \
+                                   --place a and bp only", residency.word).into());
+                }
+                check_trace(levers, &cfg, residency, (draft, slots))?;
+                if a.vision.mmproj()?.is_some() {
+                    refuse_media_prefill(cfg.body.prefill)?;
+                }
+            }
+            Ok((a, place))
+        },
+    )
 }
 
 /// A flag's value in MiB, as bytes.
@@ -441,6 +495,19 @@ fn slot_ctx(total: Option<usize>, slots: NonZeroUsize) -> Result<(), GateError> 
     Ok(())
 }
 
+/// An explicit projector feeds rows only through the batched prompt call.
+fn refuse_media_prefill(prefill: body::PrefillMode) -> Result<(), GateError> {
+    if prefill != body::PrefillMode::Batch {
+        return Err(format!(
+            "--mmproj under BLOOMERY_PREFILL={}: a media span's rows enter only through the \
+             batched prompt call (BLOOMERY_PREFILL=batch)",
+            prefill.name()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// What `--mmproj` opened for the plan ([`vision_seat::open_seat`]): the encoder file's card
 /// figure — refused by name when the file is not the V4.1 encoder's — and the seat that figure goes
 /// on, with the file's projector held against the text model's embedding width and vocabulary.
@@ -452,13 +519,8 @@ fn vision_of(
     n_embd: usize,
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<Option<Opened>, GateError> {
-    if a.vision.wanted()?.is_some() && prefill != body::PrefillMode::Batch {
-        return Err(format!(
-            "--mmproj under BLOOMERY_PREFILL={}: a media span's rows enter only through the \
-             batched prompt call (BLOOMERY_PREFILL=batch)",
-            prefill.name()
-        )
-        .into());
+    if a.vision.wanted()?.is_some() {
+        refuse_media_prefill(prefill)?;
     }
     let facts = TextFacts {
         n_embd,
@@ -487,23 +549,31 @@ fn vision_of(
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<(), GateError> {
     let _ = (prefill, n_embd, token);
-    if a.vision.mmproj()?.is_some() || a.vision.sets_limits() {
-        return Err(
-            "--mmproj: this build takes no images (built without the vision feature)".into(),
-        );
-    }
-    Ok(())
+    a.vision
+        .check_before_model(bloomery_gpu_gates::model_file::hf_repo().is_some())
 }
 
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
+    record::at_main_with_flags("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41, |flag| {
+        bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+    });
+    let bloomery_gpu_gates::bind::CheckedSeat {
+        args: (mut a, place_flag),
+        levers,
+    } = check(
+        args,
+        true,
+        bloomery_gpu_gates::model_file::hf_repo().is_some(),
+    )?;
+    let levers = levers.expect("the run reads its levers");
     model::ops::set_host_lanes(levers.host_lanes());
-    record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
+
     super::drafted::serves_widths();
     arm_screen(levers.screen());
-    let (a, placed) = parse_args(args)?;
+    let placed = place::choose(place_flag)?;
+    a.place = placed.place;
     placed.record().eprint();
     // The side model is read and seated before the plan, which holds its bytes when it sits on
     // the stage card.
@@ -526,26 +596,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let residency = levers.residency_at(at);
     let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
-    if cfg.body.residency != Residency::Off && a.place == Place::Gate {
-        return Err(format!(
-            "BLOOMERY_RESIDENCY={} under --place gate: the residency machine runs under \
-             --place a and bp only",
-            residency.word
-        )
-        .into());
-    }
     let draft = Draft::from_levers(&levers)?;
     let width = WidthMode::of(levers.mtp_width())?;
-    if draft == Draft::Off && levers.mtp_width().is_some() {
-        return Err(
-            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
-             BLOOMERY_DRAFT=off serves no draft"
-                .into(),
-        );
-    }
     let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
-    // Before anything is read or planned: a context no slot can serve.
-    slot_ctx(a.ctx, slots)?;
     // The rounds of several slots, decided once (the open takes it through
     // `SeatArgs`): one pass of the busy rows with no draft, else the fallback
     // loop ([`V41::one_pass`]).
@@ -708,15 +761,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         )?;
         std::process::exit(0);
     }
-    let trace = route_trace(
-        &levers,
-        &cfg,
-        residency,
-        (draft, slots),
-        a.place,
-        &path,
-        &inputs,
-    )?;
+    let trace = route_trace(&levers, &cfg, a.place, &path, &inputs)?;
     let (card, placement, cache, residency) = print_plan(
         &inputs,
         a.place,
@@ -796,21 +841,16 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     Ok(server.run())
 }
 
-/// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
-/// now, before the load; refused by name under the batched feed, a draft or
-/// several resident slots (`slots`), which it does not record.
-fn route_trace(
+/// The model-independent restrictions of a route trace.
+fn check_trace(
     levers: &bloomery_levers::Levers,
     cfg: &body::OpenCfg,
     residency: ResidencyPick,
     (draft, slots): (Draft, NonZeroUsize),
-    place: Place,
-    path: &Path,
-    inputs: &PlanInputs,
-) -> Result<Option<RouteTrace>, GateError> {
-    let Some(dir) = levers.route_trace() else {
-        return Ok(None);
-    };
+) -> Result<(), GateError> {
+    if levers.route_trace().is_none() {
+        return Ok(());
+    }
     if cfg.body.prefill != body::PrefillMode::Steps {
         return Err(
             "BLOOMERY_ROUTE_TRACE records the step feed: set BLOOMERY_PREFILL=steps \
@@ -845,6 +885,21 @@ fn route_trace(
         )
         .into());
     }
+    Ok(())
+}
+
+/// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
+/// now, before the load, after `check` validated its feed, draft and slot count.
+fn route_trace(
+    levers: &bloomery_levers::Levers,
+    cfg: &body::OpenCfg,
+    place: Place,
+    path: &Path,
+    inputs: &PlanInputs,
+) -> Result<Option<RouteTrace>, GateError> {
+    let Some(dir) = levers.route_trace() else {
+        return Ok(None);
+    };
     let hp = &inputs.hp;
     let yes = |b: bool| if b { "on" } else { "off" }.to_owned();
     let header = TraceHeader {

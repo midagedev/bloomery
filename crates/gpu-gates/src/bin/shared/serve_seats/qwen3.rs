@@ -298,7 +298,7 @@ fn seqs35(split: &Split, load: &Q3Load, parallel: usize) -> Result<Seqs, GateErr
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the qwen3 seat runs no prompt cache";
 
-struct Args {
+pub(crate) struct Args {
     host: String,
     port: u16,
     ctx: Option<usize>,
@@ -328,14 +328,10 @@ struct Args {
 }
 
 /// The K/V planes' format this run loads: `--cache-type-k`'s word when given
-/// (refused by name on any other), else the `BLOOMERY_QWEN3_KV` lever's,
+/// (refused by name on any other), else `set`, the `BLOOMERY_QWEN3_KV` lever's,
 /// else f16.
-fn cache_k(a: &Args, levers: &Levers) -> Result<KvQ8, GateError> {
-    let word = a
-        .cache_type_k
-        .as_deref()
-        .or(levers.qwen3_kv_set())
-        .unwrap_or("f16");
+fn cache_k(a: &Args, set: Option<&str>) -> Result<KvQ8, GateError> {
+    let word = a.cache_type_k.as_deref().or(set).unwrap_or("f16");
     KvQ8::parse(word)
         .ok_or_else(|| format!("--cache-type-k takes f16 or q8_0, not {word:?}").into())
 }
@@ -426,6 +422,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             }
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
+    }
+    if let Some(total) = a.ctx {
+        slot_ctx(total, a.parallel.unwrap_or(1))?;
     }
     Ok(a)
 }
@@ -1379,12 +1378,7 @@ impl Q35Mtp {
         (kv, vision): (KvQ8, Option<Opened>),
         width: WidthMode,
     ) -> Result<Q35Mtp, GateError> {
-        if slots != 1 {
-            return Err(format!("BLOOMERY_DRAFT=mtp: {ONE_SEQUENCE}").into());
-        }
-        if vision.is_some() {
-            return Err(format!("BLOOMERY_DRAFT=mtp: {MEDIA_DRAFT}").into());
-        }
+        check_mtp_inputs(slots, vision.is_some())?;
         if matches!(load, Q3Load::Placed { whole: None, .. }) {
             return Err(format!("BLOOMERY_DRAFT=mtp: {}", placed_no_verify()).into());
         }
@@ -1808,10 +1802,8 @@ fn vision_of(
             None => Ok(None),
         };
     }
-    #[cfg(not(feature = "vision"))]
-    if a.vision.wanted()?.is_some() {
-        return Err(vision_seat::NO_TOWER.into());
-    }
+    a.vision
+        .check_before_model(bloomery_gpu_gates::model_file::hf_repo().is_some())?;
     // Every attention layer rotates by IMROPE over the file's sections; a PLE site names the
     // image id its hash reads.
     let spec = model::arch::spec(split)?.spec;
@@ -1987,21 +1979,6 @@ enum Choice {
 /// two rows and one more, the same count the Qwen3.8 seat's window uses.
 fn window_need(slots: usize) -> usize {
     slots.saturating_mul(<Body35 as MtpBody>::VERIFY_ROWS + 1)
-}
-
-/// [`Draft38Off::Set`]'s display keeps the seat's existing width sentence.
-/// Any other why is the Qwen3.8 seat's.
-fn width_off(why: &str) -> String {
-    if why == "BLOOMERY_DRAFT=off" {
-        "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
-         BLOOMERY_DRAFT=off serves no draft"
-            .to_owned()
-    } else {
-        format!(
-            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server \
-             drafts nothing ({why})"
-        )
-    }
 }
 
 /// The file's next-token layer, or why it is not a draft. A missing layer
@@ -2191,13 +2168,21 @@ fn lookup_refusal(arch: Family) -> String {
     )
 }
 
-/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
-/// or the engine fails; `Ok` carries why the server ended.
-pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    // A placed load (`--place`) acts on the placement's levers; set beside
-    // an unplaced one, they are refused by name. Every load reads its ubatch
-    // size in place.
-    let placed = args.iter().any(|a| a == "--place");
+/// The input restrictions of the in-file draft independent of model headers.
+fn check_mtp_inputs(slots: usize, media: bool) -> Result<(), GateError> {
+    if slots != 1 {
+        return Err(format!("BLOOMERY_DRAFT=mtp: {ONE_SEQUENCE}").into());
+    }
+    if media {
+        return Err(format!("BLOOMERY_DRAFT=mtp: {MEDIA_DRAFT}").into());
+    }
+    Ok(())
+}
+
+/// The levers the seat acts on for `args`: a placed load (`--place`) acts on the placement's levers
+/// too; set beside an unplaced one, they are refused by name. Every load reads its ubatch size in
+/// place.
+fn acts_on(args: &[String]) -> Vec<&'static str> {
     let mut acts_on = vec![
         bloomery_levers::DRAFT,
         bloomery_levers::MTP_WIDTH,
@@ -2207,14 +2192,60 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         bloomery_levers::SCHEMAJUMP,
         UBATCH_ENV,
     ];
-    if placed {
+    if bloomery_gpu_gates::llama_launch::serve_option(args, "--place") {
         acts_on.extend(q3place::PLACED_LEVERS);
     }
-    let levers = bloomery_levers::at_main(&acts_on)?;
-    record::at_main(NAME, record::BLOOMERY_SERVE_QWEN3);
+    acts_on
+}
+
+/// The levers (unless `read_levers` is false) and flags [`run`] reads first, checked before the
+/// model is fetched ([`bloomery_gpu_gates::bind::check_seat`]).
+pub(crate) fn check(
+    args: &[String],
+    read_levers: bool,
+    from_repo: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<Args>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(
+        read_levers.then(|| acts_on(args)).as_deref(),
+        args,
+        |args, levers| {
+            let a = parse_args(args)?;
+            a.template_file.check()?;
+            a.vision.check_before_model(from_repo)?;
+            cache_k(&a, levers.and_then(Levers::qwen3_kv_set))?;
+            if let Some(levers) = levers {
+                let word = served::word(levers)?;
+                WidthMode::of(levers.mtp_width())?;
+                bind::refuse_plain_width(
+                    levers,
+                    (levers.draft() == Some("off")).then_some("BLOOMERY_DRAFT=off"),
+                )?;
+                served::draft_slots(a.parallel, served_draft(word), true)?;
+                if word == Word::Mtp {
+                    let (slots, _) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
+                    check_mtp_inputs(slots, a.vision.mmproj()?.is_some())?;
+                }
+            }
+            Ok(a)
+        },
+    )
+}
+
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
+    record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_QWEN3, |flag| {
+        bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+    });
+    let bloomery_gpu_gates::bind::CheckedSeat { args: a, levers } = check(
+        args,
+        true,
+        bloomery_gpu_gates::model_file::hf_repo().is_some(),
+    )?;
+    let levers = levers.expect("the run reads its levers");
+
     arm_screen(levers.screen());
-    let a = parse_args(args)?;
-    let kv = cache_k(&a, &levers)?;
+    let kv = cache_k(&a, levers.qwen3_kv_set())?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let name = split.architecture().unwrap_or("<missing>").to_owned();
@@ -2226,16 +2257,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // draft's own (`fixed`). An explicit off, and an unset qwen3moe file, refuse
     // it here. A qwen35 file whose default may still draft does not.
     let width = WidthMode::of(levers.mtp_width())?;
-    let explicit_off = levers.draft() == Some("off");
-    if levers.mtp_width().is_some()
-        && (explicit_off || (matches!(arch, Family::Qwen3moe) && levers.draft().is_none()))
-    {
-        return Err(
-            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
-             BLOOMERY_DRAFT=off serves no draft"
-                .into(),
-        );
-    }
+    bind::refuse_plain_width(
+        &levers,
+        (levers.draft() == Some("off")
+            || (matches!(arch, Family::Qwen3moe) && levers.draft().is_none()))
+        .then_some("no draft selected"),
+    )?;
     // The width chooser's record is printed on every request that may draft.
     let may_draft = matches!(word, Word::Lookup | Word::Dspark | Word::Mtp)
         || (levers.draft().is_none() && matches!(arch, Family::Qwen35moe | Family::Qwen35));
@@ -2279,11 +2306,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The DSpark draft's window is one sequence's: several slots are refused by name.
     // `mtp` decides no count here.
     let (slots, from) = served::draft_slots(a.parallel, served, true)?.unwrap_or((slots, from));
-    // A set `--ctx` is the total the slots split: a share under the rows a
-    // slot loads at is refused before any plan.
-    if let Some(total) = a.ctx {
-        slot_ctx(total, slots)?;
-    }
     // The delta lanes the seat's whole-card qwen35 family load keeps
     // ([`verdict_lanes`]): every whole-fit verdict below prices the load at
     // them, before the load is known.
@@ -2392,11 +2414,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     } else {
         None
     };
-    if let Some(Choice::Plain(why)) = &choice
-        && levers.mtp_width().is_some()
-    {
-        return Err(width_off(why).into());
-    }
+    bind::refuse_plain_width(
+        &levers,
+        match &choice {
+            Some(Choice::Plain(why)) => Some(why),
+            Some(Choice::InFile) | None => None,
+        },
+    )?;
     let draft_dir = match word {
         Word::Dspark => Some(dspark_hf::dir_from_env()?),
         Word::Off | Word::Lookup | Word::Mtp => None,

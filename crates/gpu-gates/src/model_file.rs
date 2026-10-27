@@ -26,7 +26,7 @@ pub use fetch::{
 };
 
 /// The refusal when nothing names the model.
-pub(crate) const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
+pub const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
                                or --hf <repo>[:<quant>], or set BLOOMERY_REF_MODEL";
 
 #[cfg(feature = "checkpoint")]

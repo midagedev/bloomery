@@ -390,6 +390,19 @@ const NEED: usize = VERIFY_ROWS + 1;
 /// [`NEED`] as the least a slot of a split holds under the draft.
 const NEED_FLOOR: NonZeroU64 = NonZeroU64::new(NEED as u64).expect("a window of at least one row");
 
+/// The draft kinds this seat serves without inspecting its NextN layers.
+fn check_draft_word(levers: &bloomery_levers::Levers) -> Result<(), GateError> {
+    match levers.draft() {
+        None | Some("mtp" | "off") => Ok(()),
+        Some(other) => Err(format!(
+            "BLOOMERY_DRAFT={other}: on a glm5next file mtp drafts the window (the file's NextN \
+             layer); lookup needs a load that verifies two rows, which a glm5next load holds \
+             (two KDA lanes) only with its NextN layer, and dspark is the V4.1 binaries'"
+        )
+        .into()),
+    }
+}
+
 /// `BLOOMERY_DRAFT` on stores of `ctx` positions, `unset` the seat's rule
 /// for it: `None` drafts with the NextN layer; `Some` runs the plain path,
 /// with why (the `load draft=off` record's). Unset, the rule's word and why
@@ -401,6 +414,7 @@ fn draft_of(
     ctx: usize,
     unset: GlmPick,
 ) -> Result<Option<String>, GateError> {
+    check_draft_word(levers)?;
     match levers.draft() {
         Some("mtp") if ctx < NEED => Err(format!(
             "BLOOMERY_DRAFT=mtp needs --ctx {NEED} or more: token 0 comes out of the feed, and \
@@ -409,12 +423,7 @@ fn draft_of(
         .into()),
         Some("mtp") => Ok(None),
         Some("off") => Ok(Some("BLOOMERY_DRAFT=off".to_owned())),
-        Some(other) => Err(format!(
-            "BLOOMERY_DRAFT={other}: on a glm5next file mtp drafts the window (the file's NextN \
-             layer); lookup needs a load that verifies two rows, which a glm5next load holds \
-             (two KDA lanes) only with its NextN layer, and dspark is the V4.1 binaries'"
-        )
-        .into()),
+        Some(_) => unreachable!("the draft word was checked"),
         None => {
             Record::new(&record::DRAFT_UNSET_GLM)
                 .w("draft", unset.word)
@@ -597,13 +606,11 @@ fn residency_of(
         why: ResidencyWhy::Set,
     })
     .eprint();
-    if r != Residency::Off && prefill == PrefillMode::Steps {
-        return Err(format!(
-            "BLOOMERY_RESIDENCY={word} is refused beside --prefill steps (each prompt id would \
-             end a pass the rule counts)"
-        )
-        .into());
-    }
+    super::tiered::check_residency_feed(
+        levers,
+        prefill == PrefillMode::Steps,
+        bloomery_levers::UnhostedPool::NotCarried,
+    )?;
     Ok(ResidencyLever::Set(r, word))
 }
 
@@ -655,7 +662,7 @@ fn residency_at(
     )
 }
 
-struct Args {
+pub(crate) struct Args {
     host: String,
     port: u16,
     /// `--place`; `None` takes the common rule's choice ([`Place::choose`]).
@@ -750,32 +757,101 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.parallel == Some(0) {
         return Err("--parallel 0: the server serves no slot".into());
     }
-    // `wanted` refuses `--mmproj` with `--no-mmproj` and a token limit with no file.
-    if a.vision.wanted()?.is_some() {
-        if a.prefill == PrefillMode::Steps {
-            return Err(
-                "--mmproj with --prefill steps: a media span's rows enter only through \
-                        the batched prompt call (--prefill batch)"
-                    .into(),
-            );
-        }
-        #[cfg(not(feature = "vision"))]
+    if a.vision.mmproj()?.is_some() && a.prefill == PrefillMode::Steps {
         return Err(
-            "--mmproj: this build takes no images (built without the vision feature)".into(),
+            "--mmproj with --prefill steps: a media span's rows enter only through \
+                        the batched prompt call (--prefill batch)"
+                .into(),
         );
     }
+    bloomery_gpu_gates::bind::check_slot_ctx(a.ctx, a.parallel)?;
     Ok(a)
+}
+
+/// The explicitly requested context split, including a set MTP draft's floor.
+fn checked_ctx(
+    a: &Args,
+    slots: usize,
+    levers: &bloomery_levers::Levers,
+) -> Result<Option<usize>, String> {
+    let (floor, why) = match levers.draft() {
+        Some("mtp") => (
+            NEED_FLOOR,
+            format!(
+                "BLOOMERY_DRAFT=mtp: token 0 comes out of the feed, and a window's {VERIFY_ROWS} \
+                 rows run after it"
+            ),
+        ),
+        _ => (
+            NonZeroU64::MIN,
+            "a slot holds at least one position".to_owned(),
+        ),
+    };
+    // The split is `placement::slots::split_ctx`'s, ⌊total / slots⌋
+    // (llama-server's `-np N` without `-kvu`); its refusal in the flags'
+    // words.
+    a.ctx
+        .map(|total| {
+            let share = split_ctx(total as u64, slots as u64, floor).map_err(|e| match e {
+                SplitError::NoSlots { .. } => {
+                    format!("--ctx {total}: --parallel 0 splits it among no slot ({why})")
+                }
+                SplitError::BelowFloor { split, floor, .. } => format!(
+                    "--ctx {total}: --parallel {slots} splits it to {split} positions a \
+                         slot, under the {floor} a slot needs ({why})"
+                ),
+            })?;
+            usize::try_from(share).map_err(|_| format!("a slot's {share} positions"))
+        })
+        .transpose()
+}
+
+/// The levers (unless `read_levers` is false) and flags [`run`] reads first, checked before the
+/// model is fetched ([`bloomery_gpu_gates::bind::check_seat`]).
+pub(crate) fn check(
+    args: &[String],
+    read_levers: bool,
+    from_repo: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<Args>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(read_levers.then_some(ACTS_ON), args, |args, levers| {
+        let a = parse_args(args)?;
+        a.template_file.check()?;
+        a.vision.check_before_model(from_repo)?;
+        if let Some(levers) = levers {
+            WidthMode::of(levers.mtp_width())?;
+            check_draft_word(levers)?;
+            super::tiered::check_residency_feed(
+                levers,
+                a.prefill == PrefillMode::Steps,
+                bloomery_levers::UnhostedPool::NotCarried,
+            )?;
+            if levers.draft() == Some("off") {
+                bloomery_gpu_gates::bind::refuse_plain_width(levers, Some("BLOOMERY_DRAFT=off"))?;
+            }
+            let (slots, _) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
+            checked_ctx(&a, slots, levers)?;
+        }
+        Ok(a)
+    })
 }
 
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(ACTS_ON)?;
+    record::at_main_with_flags(WHAT, record::BLOOMERY_SERVE_GLM, |flag| {
+        bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+    });
+    let bloomery_gpu_gates::bind::CheckedSeat { args: a, levers } = check(
+        args,
+        true,
+        bloomery_gpu_gates::model_file::hf_repo().is_some(),
+    )?;
+    let levers = levers.expect("the run reads its levers");
     model::ops::set_host_lanes(levers.host_lanes());
     let width = WidthMode::of(levers.mtp_width())?;
-    record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
+
     arm_screen(levers.screen());
-    let a = parse_args(args)?;
+    a.vision.wanted()?;
     // The side model is read before the plans, each of which holds its bytes when it sits on the
     // placement's stage card.
     let side = side.read()?;
@@ -821,38 +897,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // `--ctx` with no `--parallel` is one request's context — one slot at
     // the whole of it (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
-    let (floor, why) = match levers.draft() {
-        Some("mtp") => (
-            NEED_FLOOR,
-            format!(
-                "BLOOMERY_DRAFT=mtp: token 0 comes out of the feed, and a window's {VERIFY_ROWS} \
-                 rows run after it"
-            ),
-        ),
-        _ => (
-            NonZeroU64::MIN,
-            "a slot holds at least one position".to_owned(),
-        ),
-    };
-    // The split is `placement::slots::split_ctx`'s, ⌊total / slots⌋
-    // (llama-server's `-np N` without `-kvu`); its refusal in the flags'
-    // words.
-    let ctx_share = |slots: usize| -> Result<Option<usize>, String> {
-        a.ctx
-            .map(|total| {
-                let share = split_ctx(total as u64, slots as u64, floor).map_err(|e| match e {
-                    SplitError::NoSlots { .. } => {
-                        format!("--ctx {total}: --parallel 0 splits it among no slot ({why})")
-                    }
-                    SplitError::BelowFloor { split, floor, .. } => format!(
-                        "--ctx {total}: --parallel {slots} splits it to {split} positions a \
-                         slot, under the {floor} a slot needs ({why})"
-                    ),
-                })?;
-                usize::try_from(share).map_err(|_| format!("a slot's {share} positions"))
-            })
-            .transpose()
-    };
+    let ctx_share = |slots| checked_ctx(&a, slots, &levers);
     let set = ctx_share(slots)?;
     // The unset rule's window bound reads a slot's floor context — a default
     // is never under it while the card holds it — and the context the rule
@@ -947,13 +992,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     }
     // A width lever set on a server that drafts nothing is refused, with
     // why — after the yield said its last word.
-    if let (Some(why), Some(_)) = (&draft_off, levers.mtp_width()) {
-        return Err(format!(
-            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
-             nothing ({why})"
-        )
-        .into());
-    }
+    bloomery_gpu_gates::bind::refuse_plain_width(&levers, draft_off.as_deref())?;
     let nextn = if draft_off.is_none() { nextn } else { None };
     let Placed {
         place,

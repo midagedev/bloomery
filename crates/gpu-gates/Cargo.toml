@@ -809,6 +809,10 @@ required-features = ["vision"]
 name = "sentence_prompts"
 required-features = ["hf"]
 
+[[test]]
+name = "serve_preflight"
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "gemma-embedding2", "hf"]
+
 [[bin]]
 name = "gate_qwen38_media"
 required-features = ["vision", "deepseek41"]

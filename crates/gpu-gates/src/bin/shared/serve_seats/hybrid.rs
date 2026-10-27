@@ -70,7 +70,7 @@ pub trait Family: Sized + 'static {
     }
 
     /// The records the seat prints, registered once at `main`.
-    fn register();
+    fn register(args: &[String]);
 
     /// The seat's listening record, the one the run fills once the port is
     /// bound.
@@ -356,8 +356,8 @@ impl<F: Family> Tiered for Hybrid<F> {
         F::tier_batch(place, inputs)
     }
 
-    fn register() {
-        F::register();
+    fn register(args: &[String]) {
+        F::register(args);
     }
 
     fn listening() -> Record {
@@ -373,4 +373,10 @@ impl<F: Family> Tiered for Hybrid<F> {
 /// until the listener or the engine fails; `Ok` carries why the server ended.
 pub fn run<F: Family>(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     tiered::run::<Hybrid<F>>(args, side)
+}
+
+/// The seat's levers (unless `read_levers` is false) and flags, checked before the model is fetched
+/// ([`tiered::check`]).
+pub fn check<F: Family>(args: &[String], read_levers: bool) -> Result<(), GateError> {
+    tiered::check::<Hybrid<F>>(args, read_levers).map(drop)
 }

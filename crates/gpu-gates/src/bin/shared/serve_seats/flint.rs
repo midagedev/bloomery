@@ -60,8 +60,10 @@ impl Family for Flint {
         Ok(place::configure_group(inputs, group)?)
     }
 
-    fn register() {
-        record::at_main(NAME, record::BLOOMERY_SERVE_HYBRID);
+    fn register(args: &[String]) {
+        record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_HYBRID, |flag| {
+            bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+        });
     }
 
     fn listening() -> record::Record {
@@ -85,4 +87,10 @@ impl Family for Flint {
 /// Opens the real Flint session and serves resident sequences by select and step.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     super::hybrid::run::<Flint>(args, side)
+}
+
+/// The seat's levers (unless `read_levers` is false) and flags, checked before the model is fetched
+/// ([`super::hybrid::check`]).
+pub fn check(args: &[String], read_levers: bool) -> Result<(), GateError> {
+    super::hybrid::check::<Flint>(args, read_levers)
 }

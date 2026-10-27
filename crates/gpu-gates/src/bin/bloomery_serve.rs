@@ -72,8 +72,19 @@
 //! Two checks run before anything is fetched or loaded, each a named refusal
 //! (`serve::preflight`): first of all, on a CPU that does not run the
 //! release's x86-64-v3 host code, `cpu_gate` prints what it lacks and exits
-//! 1; after `--version` and `--help`, a driver below R580 (CUDA 13), or one
-//! whose `libcuda.so.1` does not load, ends the start with what it reported.
+//! 1; after `--version`, `--help` and the arguments' check below, a driver below R580 (CUDA 13), or
+//! one whose `libcuda.so.1` does not load, ends the start with what it reported.
+//!
+//! The arguments are checked as far as that needs no model, card or network before the driver is
+//! asked and before `--hf` fetches anything (`drive::early`): with `--model WORD`, `--help` or `-h`
+//! prints the seat's usage, `--levers` its lever table, and a flag, value or lever the seat refuses
+//! ends the start with the seat's own refusal; beside llama-server's placement flags, whose levers
+//! are known once the cards are read, the levers wait for the seat's run. A `--head` selects the
+//! decide seat; without it or `--model`, the model file picks the seat, so only arguments every
+//! seat refuses end the start there, each
+//! refusal once with the seats that give it, and the picked seat reads them again once the file is
+//! known. What needs the model (its architecture, its context, its draft) is checked after the
+//! fetch.
 //! Each seat's flags, records, `/props` fields and exit codes are its
 //! module's doc; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are this
 //! binary's ds41 and qwen38 seats alone.
@@ -153,10 +164,13 @@ mod place;
 
 #[cfg(feature = "glm5next")]
 mod drive {
+    use std::ffi::OsString;
     use std::process::ExitCode;
 
     use bloomery_gpu_gates::side_seat;
-    use bloomery_gpu_gates::{GateError, exit_with, llama_launch, model_file, ref_model_path};
+    use bloomery_gpu_gates::{
+        GateError, exit_with, llama_launch, llama_place, model_file, ref_model_path,
+    };
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::{Arch, DEEPSEEK4};
@@ -329,13 +343,9 @@ models (the --model word is optional with a model file: the file's architecture 
     /// the rest. `--model` with no value is refused by name.
     fn take_model(args: &[String]) -> Result<(Option<Word>, Vec<String>), GateError> {
         let mut word = None;
-        let mut rest = Vec::with_capacity(args.len());
-        let mut it = args.iter();
-        while let Some(flag) = it.next() {
-            if flag != "--model" {
-                rest.push(flag.clone());
-                continue;
-            }
+        let (selected, rest) = llama_launch::take_serve_args(args, &["--model"]);
+        let mut it = selected.iter();
+        while it.next().is_some() {
             let v = it.next().ok_or_else(|| {
                 format!(
                     "--model needs a value (ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint or {}): {USAGE}",
@@ -345,6 +355,21 @@ models (the --model word is optional with a model file: the file's architecture 
             word = Some(Word::parse(v)?);
         }
         Ok((word, rest))
+    }
+
+    /// The model source parser receives model options without mistaking other values for flags.
+    fn take_source(args: &[String]) -> Result<(hf::source::Flags, Vec<String>), GateError> {
+        let flags: Vec<&str> = PATH_FLAGS.iter().copied().chain(["--hf"]).collect();
+        let (selected, rest) = llama_launch::take_serve_args(args, &flags);
+        let (model, _) = model_file::take(&selected, PATH_FLAGS)?;
+        Ok((model, rest))
+    }
+
+    /// The head parser receives only head flags, preserving values of the seat's other options.
+    fn take_head(args: &[String]) -> Result<(serve::decide::HeadFlags, Vec<String>), GateError> {
+        let (selected, rest) = llama_launch::take_serve_args(args, &["--head", "--head-config"]);
+        let (head, _) = serve::decide::take_head(&selected)?;
+        Ok((head, rest))
     }
 
     /// Every seat's word, in [`USAGE`]'s order, as the refusal of a file no
@@ -467,7 +492,7 @@ models (the --model word is optional with a model file: the file's architecture 
         repo: Option<&str>,
         rest: &[String],
     ) -> Result<(Option<decide::Pick>, Vec<String>), GateError> {
-        let (given, rest) = serve::decide::take_head(rest)?;
+        let (given, rest) = take_head(rest)?;
         let (arch, decision, served) = file_facts()?;
         let ask = Ask {
             head: given.head.as_deref(),
@@ -507,7 +532,7 @@ models (the --model word is optional with a model file: the file's architecture 
     #[inline(never)]
     pub fn run() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.iter().any(|a| a == "--version") {
+        if llama_launch::serve_option(&args, "--version") {
             println!(
                 "{NAME} {} (commit {})",
                 env!("CARGO_PKG_VERSION"),
@@ -525,24 +550,34 @@ models (the --model word is optional with a model file: the file's architecture 
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };
-        if word.is_none() && (args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h")) {
+        if word.is_none()
+            && !llama_launch::serve_option(&args, "--head")
+            && (args.is_empty()
+                || llama_launch::serve_option(&args, "--help")
+                || llama_launch::serve_option(&args, "-h"))
+        {
             // No seat chosen yet; the seat's own usage follows once one is.
             return exit_with(NAME, Err(format!("{USAGE}\n{MODELS}").into()));
+        }
+        if let Err(e) = early(word, &rest, std::env::vars_os()) {
+            return exit_with(NAME, Err(e));
         }
         // A driver that cannot run the CUDA 13 code ends the start before any
         // download.
         if let Err(e) = serve::preflight::driver(&driver_found()) {
             return exit_with(NAME, Err(e.into()));
         }
-        match llama_launch::answer_list_devices(&args) {
-            Ok(true) => return ExitCode::SUCCESS,
-            Ok(false) => {}
-            Err(e) => return exit_with(NAME, Err(e)),
+        if llama_launch::serve_option(&args, llama_place::LIST_DEVICES) {
+            match llama_launch::answer_list_devices(&args) {
+                Ok(true) => return ExitCode::SUCCESS,
+                Ok(false) => {}
+                Err(e) => return exit_with(NAME, Err(e)),
+            }
         }
         eprintln!("{FIRST_START}");
         // The model file is named before any seat parses: `-m`, or a `--hf`
         // set fetched into the cache.
-        let (flags, rest) = match model_file::take(&rest, PATH_FLAGS) {
+        let (flags, rest) = match take_source(&rest) {
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };
@@ -566,11 +601,8 @@ models (the --model word is optional with a model file: the file's architecture 
             Err(e) => return exit_with(NAME, Err(e)),
         };
         if let Some(from) = from {
-            if side.names() {
-                return exit_with(
-                    NAME,
-                    Err("--embd-model: the decide seat answers its row's POST routes and no embeddings route".into()),
-                );
+            if let Err(e) = decide::check_side(&side) {
+                return exit_with(NAME, Err(e));
             }
             // The decision seat places no card, so the placement flags' start does not run for
             // it; the variables and short spellings of the flags it does take are read as the
@@ -602,20 +634,148 @@ models (the --model word is optional with a model file: the file's architecture 
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };
-        let r = match seat {
-            Model::Ds41 => ds41::run(&rest, &side),
-            Model::Qwen38 => qwen38::run(&rest, &side),
-            Model::Glm => glm::run(&rest, &side),
-            Model::Qwen3 => qwen3::run(&rest, &side),
-            Model::Mimo2 => mimo2::run(&rest, &side),
-            Model::Solar2 => solar2::run(&rest, &side),
-            Model::MinimaxM3 => minimaxm3::run(&rest, &side),
-            Model::Nemotron => nemotron::run(&rest, &side),
-            Model::Raon1 => raon1::run(&rest, &side),
-            Model::MuseSpark => musespark::run(&rest, &side),
-            Model::Flint => flint::run(&rest, &side),
+        let (run, _) = entries(seat);
+        ended(run(&rest, &side))
+    }
+
+    /// A generative seat's `run`.
+    type Run = fn(&[String], &side_seat::Flags) -> Result<ServeError, GateError>;
+    /// A generative seat's `check` before the fetch ([`early`]).
+    type Check = fn(&[String], bool, bool) -> Result<(), GateError>;
+
+    /// The entries of `seat`'s module: the start runs the one and [`early`] asks the other.
+    fn entries(seat: Model) -> (Run, Check) {
+        macro_rules! entry {
+            ($seat:ident, source) => {
+                ($seat::run, |args, read, from_repo| {
+                    $seat::check(args, read, from_repo).map(drop)
+                })
+            };
+            ($seat:ident) => {
+                ($seat::run, |args, read, _| {
+                    $seat::check(args, read).map(drop)
+                })
+            };
+        }
+        match seat {
+            Model::Ds41 => entry!(ds41, source),
+            Model::Qwen38 => entry!(qwen38, source),
+            Model::Glm => entry!(glm, source),
+            Model::Qwen3 => entry!(qwen3, source),
+            Model::Mimo2 => entry!(mimo2),
+            Model::Solar2 => entry!(solar2),
+            Model::MinimaxM3 => entry!(minimaxm3),
+            Model::Nemotron => entry!(nemotron),
+            Model::Raon1 => entry!(raon1),
+            Model::MuseSpark => entry!(musespark),
+            Model::Flint => entry!(flint),
+        }
+    }
+
+    /// The checks of `args` (the arguments less `--model`) that read no model, open no card and
+    /// fetch nothing, made before the driver is asked and the model fetched: the model, head and
+    /// side flags are taken out as the start takes them, then each seat the start may come to
+    /// checks what it would parse: the seat `word` names or `--head` selects, else every seat
+    /// ([`any_seat`]), since the model file picks it. A generative seat reads the arguments less
+    /// llama-server's placement flags and variables, which a refusal of theirs ends there
+    /// ([`llama_launch::seat_view`]); the decide seat, which places no card, reads them as its
+    /// start does ([`llama_launch::seat_args`]). What needs the model stays after the fetch.
+    /// `--list-devices` and `--records-schema` are left to the start, and so is `--levers` where no
+    /// seat is named or, at a generative seat, the placement flags hand levers over once the census
+    /// is read. `vars` supplies the reference model and the llama-server variables the seats read as
+    /// flags.
+    fn early(
+        word: Option<Word>,
+        args: &[String],
+        vars: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Result<(), GateError> {
+        let asked = |flag: &str| llama_launch::serve_option(args, flag);
+        if asked(llama_place::LIST_DEVICES) || asked("--records-schema") {
+            return Ok(());
+        }
+        let (model, rest) = take_source(args)?;
+        let vars: Vec<_> = vars.into_iter().collect();
+        let reference = vars
+            .iter()
+            .find_map(|(name, value)| {
+                (name.as_os_str() == std::ffi::OsStr::new("BLOOMERY_REF_MODEL")).then_some(value)
+            })
+            .map(|value| value.to_str().ok_or("BLOOMERY_REF_MODEL is not UTF-8"))
+            .transpose()?;
+        let source = hf::source::resolve(&model, reference)?;
+        let from_repo = matches!(source, Some(hf::source::Source::Hf(_)));
+        let (head, rest) = take_head(&rest)?;
+        serve::decide::check_head(
+            word.map(Word::word),
+            head.head.as_deref(),
+            head.config.as_deref(),
+        )?;
+        let word = word.or(head.head.map(|_| Word::Decide));
+        let (side, rest) = side_seat::Flags::take(&rest)?;
+        let env = llama_launch::llama_env(vars)?;
+        let check_decide = || -> Result<(), GateError> {
+            decide::check_side(&side)?;
+            let (unplaced, _) = llama_launch::seat_args(rest.clone(), &env, llama_launch::SERVE)?;
+            decide::check(&unplaced, from_repo).map(drop)
         };
-        ended(r)
+        if word == Some(Word::Decide) {
+            check_decide()?;
+            if source.is_none() {
+                return Err(model_file::NONE.into());
+            }
+            return Ok(());
+        }
+        side.check_before_model()?;
+        if word.is_none() && asked("--levers") {
+            return Ok(());
+        }
+        // The arguments as a generative seat reads them, and whether it reads its levers.
+        let view = llama_launch::seat_view(&rest, &env, llama_launch::SERVE)
+            .map(|(placement, placed, _)| (placed, placement.is_empty()));
+        if asked("--levers") && matches!(view, Ok((_, false))) {
+            return Ok(());
+        }
+        let check = |word| match (word, &view) {
+            (Word::Decide, _) => check_decide(),
+            (Word::Seat(seat), Ok((placed, read_levers))) => {
+                (entries(seat).1)(placed, *read_levers, from_repo)
+            }
+            (Word::Seat(_), Err(e)) => Err(e.to_string().into()),
+        };
+        match word {
+            Some(word) => check(word),
+            None => any_seat(check),
+        }?;
+        if source.is_none() {
+            return Err(model_file::NONE.into());
+        }
+        Ok(())
+    }
+
+    /// `check` at every seat, for a start whose model file picks the seat ([`early`]): `Ok` when
+    /// one seat takes the arguments, else each refusal once, with the seats that give it.
+    fn any_seat(check: impl Fn(Word) -> Result<(), GateError>) -> Result<(), GateError> {
+        let mut refused: Vec<(String, Vec<&str>)> = Vec::new();
+        let words = Model::ALL.iter().map(|&m| Word::Seat(m));
+        for word in words.chain([Word::Decide]) {
+            let Err(e) = check(word) else {
+                return Ok(());
+            };
+            let e = e.to_string();
+            match refused.iter_mut().find(|(text, _)| *text == e) {
+                Some((_, seats)) => seats.push(word.word()),
+                None => refused.push((e, vec![word.word()])),
+            }
+        }
+        let lines: Vec<String> = refused
+            .iter()
+            .map(|(e, seats)| format!("  --model {}: {e}", seats.join(", ")))
+            .collect();
+        Err(format!(
+            "no seat takes these arguments, each refusing them as follows (--model names the seat):\n{}",
+            lines.join("\n")
+        )
+        .into())
     }
 
     /// The process's exit for a seat's end, the decide seat's and the
@@ -629,6 +789,373 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             Ok(e) => exit_with(NAME, Err(e.into())),
             Err(e) => exit_with(NAME, Err(e)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn line(s: &str) -> Vec<String> {
+            s.split_whitespace().map(str::to_owned).collect()
+        }
+
+        #[test]
+        fn the_reference_source_comes_from_the_start_environment() {
+            let word = Some(Word::Seat(Model::Qwen38));
+            let e = early(
+                word,
+                &line("--hf o/r"),
+                [(
+                    OsString::from("BLOOMERY_REF_MODEL"),
+                    OsString::from("other.gguf"),
+                )],
+            )
+            .expect_err("the supplied environment names a second source");
+            assert!(
+                e.to_string().contains("BLOOMERY_REF_MODEL=other.gguf"),
+                "{e}"
+            );
+            early(word, &line("--hf o/r"), []).expect("no reference was supplied");
+            early(
+                word,
+                &[],
+                [(
+                    OsString::from("BLOOMERY_REF_MODEL"),
+                    OsString::from("other.gguf"),
+                )],
+            )
+            .expect("the supplied reference names a source without reading it");
+            let e = early(word, &[], []).expect_err("no source was supplied");
+            assert!(e.to_string().contains("no model file"), "{e}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                let e = early(
+                    word,
+                    &line("--hf o/r"),
+                    [(
+                        OsString::from("BLOOMERY_REF_MODEL"),
+                        OsString::from_vec(vec![0xff]),
+                    )],
+                )
+                .expect_err("the supplied reference is not UTF-8");
+                assert!(
+                    e.to_string().contains("BLOOMERY_REF_MODEL is not UTF-8"),
+                    "{e}"
+                );
+            }
+        }
+
+        /// What a start checks before the fetch ([`early`]): with a seat word, the seat's usage
+        /// and its refusal of a value, llama-server's placement flags out of its view; with none,
+        /// arguments accepted by any seat pass, and an argument every seat
+        /// refuses names each seat once. `--list-devices` is left to the start.
+        #[test]
+        fn a_start_checks_its_arguments_before_the_fetch() {
+            let qwen38 = Some(Word::Seat(Model::Qwen38));
+            let refusal = |word, s: &str| early(word, &line(s), []).expect_err(s).to_string();
+            let usage = refusal(qwen38, "--hf o/r --help");
+            assert!(usage.starts_with("usage: bloomery-serve-qwen38"), "{usage}");
+            let value = refusal(qwen38, "--hf o/r -ngl 99 --ctx-size abc");
+            assert!(value.starts_with("--ctx-size \"abc\""), "{value}");
+            // Values a seat's run refuses from the arguments alone, before the model.
+            let ds41 = Some(Word::Seat(Model::Ds41));
+            let qwen3 = Some(Word::Seat(Model::Qwen3));
+            let glm = Some(Word::Seat(Model::Glm));
+            for word in [qwen38, ds41, qwen3, glm, Some(Word::Decide), None] {
+                for s in [
+                    "--hf o/r --mmproj p.gguf --no-mmproj",
+                    "--hf o/r --no-mmproj --mmproj p.gguf",
+                ] {
+                    let e = refusal(word, s);
+                    assert!(e.contains("the two flags contradict"), "{word:?} {s}: {e}");
+                }
+            }
+            for (word, s, why) in [
+                (
+                    ds41,
+                    "--hf o/r --ctx-size 0",
+                    "each of the 1 slots serves 0 positions",
+                ),
+                (
+                    ds41,
+                    "--hf o/r --parallel 4 -c 7",
+                    "each of the 4 slots serves 1 positions",
+                ),
+                (
+                    qwen3,
+                    "--hf o/r --cache-type-k q4_0",
+                    "--cache-type-k takes f16 or q8_0",
+                ),
+            ] {
+                let e = refusal(word, s);
+                assert!(e.contains(why), "{s}: {e}");
+            }
+            for word in Model::ALL.iter().map(|&m| Some(Word::Seat(m))) {
+                let e = refusal(word, "--hf o/r --ctx-size 1 --parallel 2");
+                assert!(
+                    e.contains("--parallel") || e.contains("slots"),
+                    "{word:?}: {e}"
+                );
+            }
+            let nemotron = Some(Word::Seat(Model::Nemotron));
+            let e = refusal(nemotron, "--hf o/r --parallel 2");
+            assert!(e.contains("--parallel 2: both nemotron bodies"), "{e}");
+            for s in [
+                "--hf o/r --parallel 1",
+                "--hf o/r --alias --levers --parallel 1",
+            ] {
+                early(nemotron, &line(s), []).expect(s);
+            }
+            for (word, s) in [
+                (qwen38, "--hf o/r --alias --cpu_moe --plan"),
+                (qwen38, "--hf o/r --alias --cache-ram --ctx-size 8192"),
+                (qwen38, "--hf o/r --alias -cram --ctx-size 8192"),
+                (qwen38, "--hf o/r --alias --place --ctx-size 8192"),
+                (qwen38, "--hf o/r --alias --hf --ctx-size 8192"),
+                (qwen38, "--hf o/r --alias --model --ctx-size 8192"),
+                (qwen38, "--hf o/r --alias --head --ctx-size 8192"),
+                (qwen38, "--hf o/r --alias --embd-hf --ctx-size 8192"),
+                (
+                    qwen38,
+                    "--hf nvidia/Qwen3.8-Flash-Next-FP4-Local --alias --cache-ram -ngl all",
+                ),
+                (ds41, "--hf o/r --parallel 4 -c 8"),
+                (qwen3, "--hf o/r --cache-type-k q8_0"),
+            ] {
+                early(word, &line(s), []).expect(s);
+            }
+            if cfg!(feature = "vision") {
+                // The repository may hold the projector that supplies this limit.
+                early(glm, &line("--hf o/r --image-max-tokens 1024"), [])
+                    .expect("a vision build may pick the repository's projector");
+            }
+            for taken in [
+                "--hf o/r -ngl 99 --ctx-size 8192",
+                "--hf o/r --prefill steps",
+                "--list-devices --frobnicate",
+            ] {
+                early(None, &line(taken), []).expect(taken);
+            }
+            let config = refusal(None, "--hf o/r --head-config c");
+            assert!(
+                config.contains("--head-config c without --head"),
+                "{config}"
+            );
+            let conflict = refusal(qwen38, "--hf o/r --head h");
+            assert!(
+                conflict.contains("--model qwen38 with --head h"),
+                "{conflict}"
+            );
+            let head = refusal(None, "--hf o/r --head h --alias x");
+            assert!(head.contains("--alias"), "{head}");
+            assert!(
+                head.contains("usage: bloomery-serve [--model decide]"),
+                "{head}"
+            );
+            early(None, &line("--hf o/r --head h"), []).expect("a head picks decide");
+            let every = refusal(None, "--hf o/r --frobnicate 1");
+            let mut named: Vec<&str> = every
+                .lines()
+                .skip(1)
+                .flat_map(|l| {
+                    let (seats, why) = l
+                        .trim_start()
+                        .strip_prefix("--model ")
+                        .and_then(|l| l.split_once(": "))
+                        .expect(l);
+                    assert!(why.contains("--frobnicate"), "{l}");
+                    seats.split(", ")
+                })
+                .collect();
+            named.sort_unstable();
+            let mut words: Vec<&str> = Model::ALL
+                .iter()
+                .map(|m| m.word())
+                .chain([serve::decide::WORD])
+                .collect();
+            words.sort_unstable();
+            assert_eq!(named, words, "{every}");
+        }
+
+        /// llama-server's placement variables are the generative seats': the decide seat, named or
+        /// picked by the file, reads its arguments without them, as its start does, so a refused
+        /// split mode leaves it, and an argument it refuses names both readings.
+        #[test]
+        fn the_decide_seat_reads_no_placement_variable_before_the_fetch() {
+            let row = || {
+                [(
+                    OsString::from("LLAMA_ARG_SPLIT_MODE"),
+                    OsString::from("row"),
+                )]
+            };
+            for word in [Some(Word::Decide), None] {
+                early(word, &line("--hf o/r"), row()).expect("decide takes it");
+            }
+            let side = early(None, &line("--hf o/r --embd-hf o/embedding"), row())
+                .expect_err("no seat serves embeddings with this placement")
+                .to_string();
+            assert!(side.contains("no row split"), "{side}");
+            assert!(
+                side.contains("--model decide: --embd-model: the decide seat"),
+                "{side}"
+            );
+            let named = early(Some(Word::Seat(Model::Qwen38)), &line("--hf o/r"), row());
+            assert!(named.expect_err("row").to_string().contains("no row split"));
+            let both = early(None, &line("--hf o/r --frobnicate 1"), row())
+                .expect_err("no seat")
+                .to_string();
+            let decide = format!("--model {}: ", serve::decide::WORD);
+            let lines: Vec<&str> = both.lines().skip(1).map(str::trim_start).collect();
+            assert_eq!(lines.len(), 2, "{both}");
+            assert!(lines.iter().any(|l| l.contains("no row split")), "{both}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&decide) && l.contains("--frobnicate")),
+                "{both}"
+            );
+        }
+
+        #[test]
+        fn record_options_skip_alias_values_at_every_seat() {
+            const CASE: &str = "SERVE_RECORD_ALIAS_SEAT";
+            if let Ok(case) = std::env::var(CASE) {
+                let (word, mode) = case.split_once(':').unwrap();
+                let args = line(if mode == "schema" {
+                    "--records-schema"
+                } else {
+                    "--alias --records-schema --ctx-size abc"
+                });
+                let result = match Word::parse(word).unwrap() {
+                    Word::Seat(seat) => (entries(seat).0)(&args, &side_seat::Flags::default()),
+                    Word::Decide => decide::run(
+                        &args,
+                        serve::decide::HeadFrom::Given {
+                            head: "h".into(),
+                            config: None,
+                        },
+                        None,
+                    ),
+                };
+                let e = result
+                    .expect_err("the seat must parse the invalid arguments")
+                    .to_string();
+                assert!(e.contains("--ctx-size") || e.contains("--alias"), "{e}");
+                println!("seat parsed its arguments");
+                return;
+            }
+            let mut refused = Vec::new();
+            for word in Model::ALL
+                .iter()
+                .map(|m| m.word())
+                .chain([serve::decide::WORD])
+            {
+                for mode in ["alias", "schema"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "drive::tests::record_options_skip_alias_values_at_every_seat",
+                            "--nocapture",
+                            "--skip",
+                            "--records-schema",
+                        ])
+                        .env_clear()
+                        .env(CASE, format!("{word}:{mode}"))
+                        .output()
+                        .unwrap();
+                    let out = String::from_utf8_lossy(&output.stdout);
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    let answered = if mode == "schema" {
+                        out.lines().any(|l| l.starts_with('{'))
+                            && !out.contains("seat parsed its arguments")
+                    } else {
+                        out.contains("seat parsed its arguments")
+                    };
+                    if !output.status.success() || !answered {
+                        refused.push(format!("{word} {mode}: {out} {err}"));
+                    }
+                }
+            }
+            assert!(refused.is_empty(), "{}", refused.join("\n"));
+        }
+
+        /// A key file the start reads before the fetch and the seat reads again is one snapshot
+        /// (`serve::flag::ApiKeys::add`): a pipe gives its keys to both, and is opened once.
+        #[test]
+        fn a_piped_key_file_is_read_once_for_the_check_and_the_seat() {
+            let dir =
+                std::env::temp_dir().join(format!("bloomery-piped-key-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let fifo = dir.join("keys");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success(), "mkfifo: {made}");
+            // The writer offers one key, then an empty second stream after the release pipe opens.
+            let release = dir.join("release");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&release)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut writer = bloomery_gpu_gates::serve_client::Served::spawn_cmd(
+                std::process::Command::new("sh"),
+                &[
+                    "-c",
+                    "printf 'piped\\n' > \"$1\"; read -r _ < \"$2\"; : > \"$1\"",
+                    "sh",
+                    fifo.to_str().unwrap(),
+                    release.to_str().unwrap(),
+                ],
+                &dir,
+            )
+            .unwrap();
+            let args = line(&format!("--api-key-file {}", fifo.display()));
+            let early_args = [line("--hf o/r"), args.clone()].concat();
+            early(Some(Word::Seat(Model::Qwen38)), &early_args, [])
+                .expect("the check reads the key");
+            std::fs::write(&release, b"\n").unwrap();
+            (entries(Model::Qwen38).1)(&args, false, false).expect("the seat takes the same key");
+            // The parse opened nothing: open the pipe for the spent writer.
+            std::fs::read(&fifo).unwrap();
+            assert!(writer.child.wait().unwrap().success());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The ubatch size the qwen38 and decide seats take is held to the engine's before the
+        /// fetch (`ubatch_rule` in their checks), under both spellings and `LLAMA_ARG_UBATCH`.
+        #[test]
+        fn a_ubatch_size_is_checked_before_the_fetch() {
+            let ub = |word, s: &str, env: &[(&str, &str)]| {
+                let vars = env.iter().map(|&(k, v)| (k.into(), v.into()));
+                early(Some(word), &line(s), vars)
+            };
+            let none: &[(&str, &str)] = &[];
+            for word in [Word::Seat(Model::Qwen38), Word::Decide] {
+                for (s, env) in [
+                    ("--hf o/r -ub 4097", none),
+                    ("--hf o/r --ubatch-size 4097", none),
+                    ("--hf o/r", &[("LLAMA_ARG_UBATCH", "4097")]),
+                ] {
+                    let e = ub(word, s, env).expect_err(s).to_string();
+                    assert!(
+                        e.contains("--ubatch-size 4097 is not a ubatch size"),
+                        "{s}: {e}"
+                    );
+                }
+                ub(word, "--hf o/r -ub 48", none).expect("48 is a size");
+            }
+            let e = ub(Word::Seat(Model::Qwen38), "--hf o/r -ub 0", none).expect_err("0");
+            assert!(
+                e.to_string()
+                    .contains("--ubatch-size 0 is not a ubatch size"),
+                "{e}"
+            );
         }
     }
 }

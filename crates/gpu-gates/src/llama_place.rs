@@ -45,7 +45,7 @@ const SPLIT: &[&str] = &["-sm", "--split-mode"];
 const TENSOR_SPLIT: &[&str] = &["-ts", "--tensor-split"];
 const MAIN_GPU: &[&str] = &["-mg", "--main-gpu"];
 const GPU_LAYERS: &[&str] = &["-ngl", "--gpu-layers", "--n-gpu-layers"];
-const CPU_MOE: &[&str] = &["-cmoe", "--cpu-moe"];
+pub(crate) const CPU_MOE: &[&str] = &["-cmoe", "--cpu-moe"];
 const N_CPU_MOE: &[&str] = &["-ncmoe", "--n-cpu-moe"];
 const OVERRIDE_TENSOR: &[&str] = &["-ot", "--override-tensor"];
 const FIT: &[&str] = &["-fit", "--fit"];
@@ -203,6 +203,7 @@ where
     let mut flags = Flags::default();
     let mut rest = Vec::with_capacity(args.len());
     let mut typed: Vec<String> = Vec::new();
+    let mut place = false;
     let mut it = args.iter();
     while let Some(raw) = it.next() {
         let Some(arg) = raw.as_ref().to_str() else {
@@ -211,7 +212,16 @@ where
         };
         let name = spelled(arg);
         if !FLAGS.iter().any(|set| set.contains(&name.as_str())) {
+            place |= arg == "--place";
             rest.push(raw.clone());
+            let takes_value = arg == "--place"
+                || (crate::llama_launch::SEAT_FLAGS
+                    .iter()
+                    .any(|read| read.spelled.contains(&arg))
+                    && crate::llama_launch::serve_takes_value(arg));
+            if takes_value {
+                rest.extend(it.next().cloned());
+            }
             continue;
         }
         if CPU_MOE.contains(&name.as_str()) {
@@ -229,7 +239,6 @@ where
         }
         typed.push(name);
     }
-    let place = args.iter().any(|a| a.as_ref().to_str() == Some("--place"));
     if !flags.given.is_empty() && place {
         return Err(format!(
             "--place beside llama-server's placement flags ({}): name the cards one way",
@@ -797,7 +806,7 @@ fn once<T>(slot: &mut Option<T>, flag: &str, what: &str, value: T) -> Result<(),
 }
 
 /// `arg` as llama-server matches it: a long flag's `_` is `-`.
-fn spelled(arg: &str) -> String {
+pub(crate) fn spelled(arg: &str) -> String {
     if arg.starts_with("--") {
         arg.replace('_', "-")
     } else {

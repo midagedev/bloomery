@@ -112,7 +112,7 @@ mod gate {
     const TURN: &str = "Name three primary colours.";
 
     /// The words of the refusal of a second slot.
-    const ONE_SEQUENCE: &str = "holds one sequence";
+    const ONE_SEQUENCE: &str = "both nemotron bodies hold one sequence";
 
     /// This gate's seat: the one server's model word and the kinds it prints.
     const SEAT: SeatGate = SeatGate {

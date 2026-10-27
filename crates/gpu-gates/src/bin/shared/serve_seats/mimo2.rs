@@ -482,13 +482,17 @@ impl Tiered for Mimo {
     const RESIDENT: bool = true;
     const TIER_SLOTS: bool = false;
     const TIER_RULE: TierRule = TIER_RULE;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool =
+        <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL;
 
     fn accepts(arch: Arch) -> bool {
         matches!(arch, Arch::Mimo2)
     }
 
-    fn register() {
-        record::at_main(NAME, record::BLOOMERY_SERVE_MIMO2);
+    fn register(args: &[String]) {
+        record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_MIMO2, |flag| {
+            bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+        });
     }
 
     fn listening() -> Record {
@@ -518,6 +522,10 @@ impl Tiered for Mimo {
         }
     }
 
+    fn prefill_steps(flags: &Flags) -> bool {
+        flags.prefill == PrefillMode::Steps
+    }
+
     /// [`CacheFlag::budget`] over the plan's store bytes ([`seq_bytes`]: one position, each
     /// window layer's ring whole): a default under one saved state is off.
     fn cache_budget(
@@ -545,8 +553,8 @@ impl Tiered for Mimo {
             levers,
             place,
             plan,
-            flags.prefill == PrefillMode::Steps,
-            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            Self::prefill_steps(flags),
+            Self::UNHOSTED_POOL,
         )
         .map(Some)
     }
@@ -564,4 +572,10 @@ impl Tiered for Mimo {
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     tiered::run::<Mimo>(args, side)
+}
+
+/// The seat's levers (unless `read_levers` is false) and flags, checked before the model is fetched
+/// ([`tiered::check`]).
+pub fn check(args: &[String], read_levers: bool) -> Result<(), GateError> {
+    tiered::check::<Mimo>(args, read_levers).map(drop)
 }

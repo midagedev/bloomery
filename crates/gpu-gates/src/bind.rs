@@ -236,6 +236,25 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// Checks that an explicit context leaves at least one position in each requested slot.
+/// An unset slot count can serve one slot, and an unset context is sized by the plan.
+pub fn check_slot_ctx(ctx: Option<usize>, parallel: Option<usize>) -> Result<(), GateError> {
+    if let Some(total) = ctx {
+        model::placement::slots::split_ctx(
+            u64::try_from(total)?,
+            u64::try_from(parallel.unwrap_or(1))?,
+            std::num::NonZeroU64::MIN,
+        )
+        .map_err(|e| {
+            format!(
+                "--ctx-size {total} --parallel {}: {e}",
+                parallel.unwrap_or(1)
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// A serving seat's `--place` word, the one reader of the placement grammar:
 /// [`Place::parse`](crate::generate::Place::parse) (`a`, `gate`, `bp`, `tp`, or a card
 /// list `<stage>[+<tier>…]` of card names and device ordinals). `serves` is the
@@ -338,6 +357,8 @@ impl SeatFlags {
         if a.parallel == Some(0) {
             return Err("--parallel 0: the server serves no slot".into());
         }
+        a.template_file.check()?;
+        check_slot_ctx(a.ctx, a.parallel)?;
         Ok(a)
     }
 
@@ -456,6 +477,48 @@ pub fn arm_screen(on: bool) {
     if serve::screen::arm(on) {
         crate::record::tee(serve::screen::note);
     }
+}
+
+/// A plain path has no drafted window whose width could be configured.
+pub fn refuse_plain_width(
+    levers: &bloomery_levers::Levers,
+    why: Option<impl std::fmt::Display>,
+) -> Result<(), GateError> {
+    if let Some(why) = why
+        && levers.mtp_width().is_some()
+    {
+        return Err(format!(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts nothing ({why})"
+        ).into());
+    }
+    Ok(())
+}
+
+/// The arguments and optional lever reading shared by a seat's preflight and actual start.
+pub struct CheckedSeat<T> {
+    pub args: T,
+    pub levers: Option<bloomery_levers::Levers>,
+}
+
+/// Reads a seat's levers, unless placement still has to supply them, and checks its arguments
+/// through the same parser and model-independent rules its run uses.
+pub fn check_seat<T>(
+    acts_on: Option<&[&str]>,
+    args: &[String],
+    parse: impl FnOnce(&[String], Option<&bloomery_levers::Levers>) -> Result<T, GateError>,
+) -> Result<CheckedSeat<T>, GateError> {
+    let levers = acts_on
+        .map(|acts_on| {
+            bloomery_levers::at_main_with_flags(acts_on, |flag| {
+                crate::llama_launch::serve_option(args, flag)
+            })
+        })
+        .transpose()?;
+    let parsed = parse(args, levers.as_ref())?;
+    Ok(CheckedSeat {
+        args: parsed,
+        levers,
+    })
 }
 
 /// `/props`' placement of `plan` on `machine`: its cards by nvidia-smi

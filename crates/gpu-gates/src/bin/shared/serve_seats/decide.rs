@@ -351,7 +351,7 @@ mod image {
         "--mmproj: this build takes no images (built without the vision feature)";
 }
 
-struct Args {
+pub(crate) struct Args {
     host: String,
     port: u16,
     ctx: Option<usize>,
@@ -529,6 +529,8 @@ fn open_image(
     row: &dyn Decision,
     tokenizer: &Tokenizer,
 ) -> Result<Option<vision_seat::Opened>, GateError> {
+    l.vision
+        .check_before_model(bloomery_gpu_gates::model_file::hf_repo().is_some())?;
     let given = l.vision.mmproj()?;
     if !row.takes_images() {
         if given.is_some() || l.vision.sets_limits() {
@@ -544,10 +546,6 @@ fn open_image(
     let split = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
     // Every Qwen3.5 attention layer rotates by IMROPE over the file's sections.
     let text = TextFacts::of_imrope(&model::arch::spec(&split)?.spec)?;
-    #[cfg(not(feature = "vision"))]
-    if file.is_some() || l.vision.sets_limits() {
-        return Err(image::NO_IMAGES.into());
-    }
     vision_seat::open_seat(
         &l.vision,
         file.as_deref(),
@@ -706,14 +704,47 @@ fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
     }
 }
 
+/// The levers this seat acts on.
+const ACTS_ON: &[&str] = &[bloomery_levers::SCREEN, ubatch_rule::UBATCH_ENV];
+
+/// A decision seat serves its row's routes and cannot hold an embedding model beside it.
+pub fn check_side(side: &bloomery_gpu_gates::side_seat::Flags) -> Result<(), GateError> {
+    if side.names() {
+        return Err(
+            "--embd-model: the decide seat answers its row's POST routes and no embeddings route"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The levers, flags and ubatch size ([`ubatch_rule`]) [`run`] reads, checked before the model is
+/// fetched ([`bloomery_gpu_gates::bind::check_seat`]). No llama-server placement flag hands this seat a
+/// lever, so its levers are read whatever the other flags.
+pub(crate) fn check(
+    args: &[String],
+    from_repo: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<Args>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(Some(ACTS_ON), args, |args, _levers| {
+        let a = parse_args(args)?;
+        a.vision.check_before_model(from_repo)?;
+        ubatch_rule(a.ubatch)?;
+        Ok(a)
+    })
+}
+
 /// Opens the model `from` names and serves until the listener fails; `Ok`
 /// carries why the server ended. `hf` is the repo (`owner/name`) the model
 /// file came from under `--hf`: the model's name, else its file name.
 pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(&[bloomery_levers::SCREEN, ubatch_rule::UBATCH_ENV])?;
-    record::at_main(WHAT, record::BLOOMERY_SERVE_DECIDE);
+    record::at_main_with_flags(WHAT, record::BLOOMERY_SERVE_DECIDE, |flag| {
+        bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+    });
+    let bloomery_gpu_gates::bind::CheckedSeat { args: a, levers } =
+        check(args, bloomery_gpu_gates::model_file::hf_repo().is_some())?;
+    let levers = levers.expect("the run reads its levers");
+
     arm_screen(levers.screen());
-    let a = parse_args(args)?;
     let (row, head) = head_files(from)?;
     let model = ref_model_path()?;
     let split = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;

@@ -168,8 +168,10 @@ impl Family for Solar {
         model::arch::solar2::place::PlanInputs::read(split)
     }
 
-    fn register() {
-        record::at_main(NAME, record::BLOOMERY_SERVE_SOLAR2);
+    fn register(args: &[String]) {
+        record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_SOLAR2, |flag| {
+            bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+        });
     }
 
     fn listening() -> record::Record {
@@ -199,4 +201,10 @@ pub fn run(
     side: &side_seat::Flags,
 ) -> Result<ServeError, bloomery_gpu_gates::GateError> {
     super::hybrid::run::<Solar>(args, side)
+}
+
+/// The seat's levers (unless `read_levers` is false) and flags, checked before the model is fetched
+/// ([`super::hybrid::check`]).
+pub fn check(args: &[String], read_levers: bool) -> Result<(), bloomery_gpu_gates::GateError> {
+    super::hybrid::check::<Solar>(args, read_levers)
 }

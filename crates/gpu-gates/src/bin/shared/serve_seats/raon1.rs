@@ -250,6 +250,22 @@ struct OpenDraft {
     reserve: u64,
 }
 
+/// The draft word and width combinations this seat can serve without reading a model.
+fn draft_word(levers: &Levers) -> Result<Option<&str>, GateError> {
+    WidthMode::of(levers.mtp_width())?;
+    bloomery_gpu_gates::bind::refuse_plain_width(
+        levers,
+        (levers.draft() == Some("off")).then_some("BLOOMERY_DRAFT=off"),
+    )?;
+    match levers.draft() {
+        word @ (None | Some("off" | "dspark")) => Ok(word),
+        Some(w) => Err(format!(
+            "BLOOMERY_DRAFT={w}: the raon1 seat serves its DFlash2 draft (dspark), off or unset"
+        )
+        .into()),
+    }
+}
+
 /// What `BLOOMERY_DRAFT` resolves to for a target at `target` (`split` opened), before any
 /// plan: the draft to open, if any, with its card reserve, and the `draft rule` record's why.
 /// `dspark` with no draft file, `lookup`, `mtp` and a file that is not a DFlash2 draft are
@@ -261,28 +277,11 @@ fn draft_of(
 ) -> Result<(Option<OpenDraft>, String), GateError> {
     let width = WidthMode::of(levers.mtp_width())?;
     let set = refset::arch::draft::dspark_lever().map(PathBuf::from);
-    let word = levers.draft();
-    let refuse = |w: &str| -> GateError {
-        format!(
-            "BLOOMERY_DRAFT={w}: the raon1 seat serves its DFlash2 draft (dspark), off or unset"
-        )
-        .into()
-    };
-    let every = match word {
-        None => false,
-        Some("dspark") => true,
-        Some("off") => {
-            if levers.mtp_width().is_some() {
-                return Err(
-                    "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
-                            BLOOMERY_DRAFT=off serves no draft"
-                        .into(),
-                );
-            }
-            return Ok((None, "BLOOMERY_DRAFT=off".to_owned()));
-        }
-        Some(other) => return Err(refuse(other)),
-    };
+    let word = draft_word(levers)?;
+    if word == Some("off") {
+        return Ok((None, "BLOOMERY_DRAFT=off".to_owned()));
+    }
+    let every = word == Some("dspark");
     let (path, from) = match raon1_dflash::pick(set.as_deref(), target)? {
         Pick::File(path, from) => (path, from),
         Pick::Absent(dirs) => {
@@ -294,15 +293,9 @@ fn draft_of(
                 )
                 .into());
             }
-            if levers.mtp_width().is_some() {
-                return Err(format!(
-                    "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; no draft \
-                     file is in {}",
-                    looked.join(", ")
-                )
-                .into());
-            }
-            return Ok((None, format!("no DFlash2 draft at {}", looked.join(", "))));
+            let why = format!("no DFlash2 draft at {}", looked.join(", "));
+            bloomery_gpu_gates::bind::refuse_plain_width(levers, Some(&why))?;
+            return Ok((None, why));
         }
     };
     let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -322,14 +315,9 @@ fn draft_of(
         match think {
             Ok(t) => (Drafts::Thinking(t), format!("unset, {at}")),
             Err(why) => {
-                if levers.mtp_width().is_some() {
-                    return Err(format!(
-                        "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the \
-                         unset draft runs no request: {why}"
-                    )
-                    .into());
-                }
-                return Ok((None, format!("unset, {at}: {why}")));
+                let why = format!("unset, {at}: {why}");
+                bloomery_gpu_gates::bind::refuse_plain_width(levers, Some(&why))?;
+                return Ok((None, why));
             }
         }
     };
@@ -600,13 +588,48 @@ impl Seat for Raon1 {
     }
 }
 
+/// The flags of `args`; `--parallel` above one is refused by name, the body holding one sequence.
+fn parse_args(args: &[String]) -> Result<SeatFlags, GateError> {
+    let a = SeatFlags::parse(args, USAGE, |_, _| Ok(false))?;
+    if let Some(n) = a.parallel.filter(|&n| n > 1) {
+        return Err(format!(
+            "--parallel {n}: the raon1 body holds one sequence and no resident slots; the seat \
+             serves --parallel 1"
+        )
+        .into());
+    }
+    if let Some(place) = a.place {
+        place.serves("raon1", 0)?;
+    }
+    Ok(a)
+}
+
+/// The levers (unless `read_levers` is false) and flags [`run`] reads first, checked before the
+/// model is fetched ([`bloomery_gpu_gates::bind::check_seat`]).
+pub fn check(
+    args: &[String],
+    read_levers: bool,
+) -> Result<bloomery_gpu_gates::bind::CheckedSeat<SeatFlags>, GateError> {
+    bloomery_gpu_gates::bind::check_seat(read_levers.then_some(ACTS_ON), args, |args, levers| {
+        let a = parse_args(args)?;
+
+        if let Some(levers) = levers {
+            draft_word(levers)?;
+        }
+        Ok(a)
+    })
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(ACTS_ON)?;
-    record::at_main(NAME, record::BLOOMERY_SERVE_RAON1);
+    record::at_main_with_flags(NAME, record::BLOOMERY_SERVE_RAON1, |flag| {
+        bloomery_gpu_gates::llama_launch::serve_option(args, flag)
+    });
+    let bloomery_gpu_gates::bind::CheckedSeat { args: a, levers } = check(args, true)?;
+    let levers = levers.expect("the run reads its levers");
+
     arm_screen(levers.screen());
-    let a = SeatFlags::parse(args, USAGE, |_, _| Ok(false))?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let first = split
@@ -618,13 +641,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             "{} is a {} file; the raon1 seat serves raon1 files",
             path.display(),
             arch.name()
-        )
-        .into());
-    }
-    if let Some(n) = a.parallel.filter(|&n| n > 1) {
-        return Err(format!(
-            "--parallel {n}: the raon1 body holds one sequence and no resident slots; the seat \
-             serves --parallel 1"
         )
         .into());
     }

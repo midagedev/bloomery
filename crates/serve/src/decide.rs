@@ -271,20 +271,12 @@ pub fn pick<'r, O>(
             _ => Ok(Some(HeadFrom::InFile(row))),
         };
     }
+    check_head(ask.word, ask.head, ask.head_config)?;
     if let Some(head) = ask.head {
-        if let Some(w) = ask.word.filter(|_| !decide) {
-            return Err(format!(
-                "--model {w} with --head {}: a head is the decide seat's (--model {WORD}, or no --model)",
-                head.display()
-            ));
-        }
         return Ok(Some(HeadFrom::Given {
             head: head.to_path_buf(),
             config: ask.head_config.map(Path::to_path_buf),
         }));
-    }
-    if let Some(c) = ask.head_config {
-        return Err(format!("--head-config {} without --head", c.display()));
     }
     if let Some(row) = rows.iter().find(|r| r.in_file_arch(ask.arch))
         && (decide || ask.word.is_none())
@@ -407,6 +399,25 @@ pub fn row_of_config<'r, O>(
 pub struct HeadFlags {
     pub head: Option<PathBuf>,
     pub config: Option<PathBuf>,
+}
+
+/// Checks the head flags' relationship to the seat word without reading a model.
+pub fn check_head(
+    word: Option<&str>,
+    head: Option<&Path>,
+    config: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(head) = head {
+        if let Some(w) = word.filter(|&w| w != WORD) {
+            return Err(format!(
+                "--model {w} with --head {}: a head is the decide seat's (--model {WORD}, or no --model)",
+                head.display()
+            ));
+        }
+    } else if let Some(c) = config {
+        return Err(format!("--head-config {} without --head", c.display()));
+    }
+    Ok(())
 }
 
 /// `args` with `--head` and `--head-config` taken out: their values and the rest. A flag with no

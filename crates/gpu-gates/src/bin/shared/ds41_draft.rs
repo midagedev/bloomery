@@ -39,6 +39,11 @@ impl Draft {
             record::groups::ds41_draft::LOAD,
             "ds41_draft::Draft::from_levers",
         );
+        Self::check_levers(levers)
+    }
+
+    /// The draft word without record registration or model access.
+    pub fn check_levers(levers: &Levers) -> Result<Draft, GateError> {
         match levers.draft() {
             None => Ok(Draft::Off),
             Some("lookup") => Ok(Draft::Lookup),

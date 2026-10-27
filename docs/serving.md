@@ -90,6 +90,7 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   survives a tool turn. A `deepseek4` file keeps V4's tags; a parser reads the one spelling its template spells.
   A template given by `--chat-template-file` (the V4.1, Qwen3, Qwen3.8, GLM, MiMo and Nemotron seats take it) is read the same
   way, so a V4-spelled file on the V4.1 seat is respelled too.
+  The template file is read once at startup. Changes after that read take effect on the next start.
   A streamed `/v1/chat/completions` sends a call as the model writes it, in OpenAI's shape: the call's first delta carries
   `index`, `id`, `type` and `function.name`, and `function.arguments` fragments follow that concatenate to the
   `arguments` the non-streamed answer carries. A text parameter's value is released as it arrives, JSON-escaped, up to
@@ -154,11 +155,17 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   slots, and one `ubatch` line names the sizes it tried; a routed file takes `BLOOMERY_QWEN3_UBATCH` and refuses
   the flag. The qwen38 seat takes it too: the most positions one prompt ubatch runs, 1 to 4096, over
   `BLOOMERY_QWEN3_UBATCH`, else 4096, the same size in the plan and the load, and the `load` line's `ubatch=`),
-  `--host/--port`, `--alias`, `--mmproj <file>` and `--no-mmproj` (image input, below).
+  `--host/--port`, `--alias`, `--mmproj <file>` and `--no-mmproj` (image input, below). The flags are checked
+  before `--hf` downloads anything and before the driver is asked: with `--model` or `--head`, the selected seat's
+  `--help` and refusal of a flag, value or lever come first. A generative start with llama-server placement flags
+  resolves their overrides and checks its levers, including `--levers`, after device discovery. Without `--model`
+  or `--head`, the model file picks the seat,
+  so only what every seat refuses ends the start there. The picked seat uses the same checks after the download.
 - **The model's name** (`/v1/models` `id`, the `model` of every answer, `/props` `model_alias`) is `--alias`, else the
   GGUF's `general.name`, else the seat's own default. llama-server's default is the model file's name; this server
   names the model as its file does, which stays the same when a file is renamed or split into shards. A file whose
   `general.name` is a placeholder (a requantization script's) is named with `--alias`.
+  The qwen3 and decide seats refuse `--alias`.
 - **No placement flag needed**: leave `--place` out on every model and the load picks for you — the largest
   visible card, a split onto the CPU when the file does not fit it, and on GLM-5.3 the second card as an expert
   tier when its plan puts enough experts there to pay for it (the GLM row of the
@@ -183,7 +190,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   options, never a letter. A choice of more such options than there are single-token letters (26) is a 400 naming
   the question. `/props` lists the route in `routes`, and the 404 names it.
 - **`--api-key`/`--api-key-file`**, llama-server's authentication: a comma-separated list (a quoted item may
-  hold commas) and a file (one key per line, `#` lines comments), both flags adding to one set, carried by
+  hold commas) and a file (one key per line, `#` lines comments; read once at start, so a pipe such as
+  `/dev/stdin` serves, and a later edit takes a restart), both flags adding to one set, carried by
   `Authorization: Bearer <key>` or `X-Api-Key: <key>`. `/health`, `/v1/health` and `OPTIONS` stay public;
   every other route — generation, `/props`, `/slots`, `/shutdown` — answers llama-server's 401
   (`Invalid API Key`) without a valid one, and a flag that names no key refuses to start rather than serve
