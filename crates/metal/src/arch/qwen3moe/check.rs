@@ -1310,7 +1310,6 @@ impl Checked {
             pass_rows_max(geom).min(g.ctx),
             g.hidden,
             g.proj,
-            g.n_experts,
             delta_heads(&g.layers),
         )?;
         for bytes in lens.buffer_bytes() {
@@ -1710,7 +1709,7 @@ mod tests {
             slots,
             slots,
             slots,
-            route_table_words(slots, g.router.experts),
+            route_table_words(slots, g.router.rows),
             slots * g.experts.k,
             slots * hidden,
         ]

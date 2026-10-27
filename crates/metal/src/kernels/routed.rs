@@ -46,21 +46,21 @@ pub const TABLE_THREADS: usize = 1024;
 /// The threads of the combine's threadgroup a row.
 const COMBINE_THREADS: usize = 256;
 
-/// The table's entries for `slots` slots over `experts` routed experts and
-/// the shared group: every group's tiles are full but its last, so the count
-/// is at most the slots' tiles plus one partial tile a group. The shared group
-/// is counted whether or not the instance has one, so the bound holds for
-/// every instance and the table of one with none is a tile short of it.
+/// The table's entries for `slots` slots over `groups` groups: every group's
+/// tiles are full but its last, so the count is at most the slots' tiles plus
+/// one partial tile a group. The groups are the instance's routed experts and
+/// its shared expert when it has one (`RouterGeom::rows`), so the bound counts
+/// no group the instance lacks.
 #[must_use]
-pub fn route_tiles(slots: usize, experts: usize) -> usize {
-    slots.div_ceil(ROUTE_TILE) + experts + 1
+pub fn route_tiles(slots: usize, groups: usize) -> usize {
+    slots.div_ceil(ROUTE_TILE) + groups
 }
 
 /// The words of the table: a header entry of four words, then one entry of
 /// four words (group, first place, slots, 0) a tile.
 #[must_use]
-pub fn route_table_words(slots: usize, experts: usize) -> usize {
-    4 * (1 + route_tiles(slots, experts))
+pub fn route_table_words(slots: usize, groups: usize) -> usize {
+    4 * (1 + route_tiles(slots, groups))
 }
 
 /// The grouped GEMM's pipelines of one weight type: the pair and the plain
@@ -478,12 +478,12 @@ impl Kernels {
         check_window_len(TABLE_WHAT, "ids", p.ids.len(), p.slots)?;
         check_window_len(TABLE_WHAT, "sorted", p.sorted.len(), p.slots)?;
         check_window_len(TABLE_WHAT, "inv", p.inv.len(), p.slots)?;
-        let max_tiles = route_tiles(p.slots, p.experts);
+        let max_tiles = route_tiles(p.slots, router.rows);
         check_window_len(
             TABLE_WHAT,
             "tiles",
             p.tiles.len(),
-            route_table_words(p.slots, p.experts),
+            route_table_words(p.slots, router.rows),
         )?;
         four_aligned(TABLE_WHAT, "tiles", p.tiles.byte_range()?.start.get())?;
         let args = args_bytes([
@@ -718,5 +718,56 @@ impl Kernels {
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.fault.binding())?;
         slot.dispatch_groups(p.rows, delta.value_heads, delta.head_cols)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Geometry;
+    use crate::instance::REGISTERED;
+
+    /// The tiles of a table whose group `g` holds `counts[g]` slots.
+    fn tiles_of(counts: &[usize]) -> usize {
+        counts.iter().map(|n| n.div_ceil(ROUTE_TILE)).sum()
+    }
+
+    #[test]
+    fn the_table_bound_counts_the_groups_the_instance_has() {
+        for inst in REGISTERED {
+            let g = Geometry::of(inst);
+            let groups = g.router.experts + usize::from(g.experts.has_shared);
+            assert_eq!(
+                g.router.rows, groups,
+                "{}: the router's rows are the table's groups",
+                inst.name
+            );
+            for slots in [g.experts.slots, 1000 * g.experts.slots] {
+                assert_eq!(
+                    route_tiles(slots, g.router.rows),
+                    slots.div_ceil(ROUTE_TILE) + groups,
+                    "{}: {slots} slots, the slots' tiles and a partial tile a group",
+                    inst.name
+                );
+                assert_eq!(
+                    route_table_words(slots, g.router.rows),
+                    4 * (1 + route_tiles(slots, g.router.rows)),
+                    "{}: {slots} slots, a header entry and an entry a tile",
+                    inst.name
+                );
+            }
+            // The tables with the most tiles: one slot in every group, and a
+            // full tile and one more slot in every group.
+            let ones = vec![1; groups];
+            let over = vec![ROUTE_TILE + 1; groups];
+            for counts in [ones, over] {
+                let slots = counts.iter().sum();
+                assert!(
+                    tiles_of(&counts) <= route_tiles(slots, g.router.rows),
+                    "{}: {slots} slots over {groups} groups fit the bound",
+                    inst.name
+                );
+            }
+        }
     }
 }

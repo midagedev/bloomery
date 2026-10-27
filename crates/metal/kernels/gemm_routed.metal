@@ -257,16 +257,16 @@ kernel void gemm_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
     const uint expert = tile.x;
     const uint first = tile.y;
     const short count = (short)tile.z;
-    // A tile the table cannot write (an id past the shared group, a run
-    // empty or longer than the tile) raises the expert-id site and stores
-    // nothing.
-    if (expert > args.n_experts || count < 1 || count > ROUTED_ACTS) {
+    // A tile the table cannot write (a group past the routed experts and the
+    // shared group an instance has, a run empty or longer than the tile)
+    // raises the expert-id site and stores nothing.
+    if (expert >= args.n_experts + BLOOMERY_ROUTER_SHARED || count < 1 || count > ROUTED_ACTS) {
         if (tiitg == 0) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
         }
         return;
     }
-    const bool shared = expert == args.n_experts;
+    const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;
     device const typename Q::Block * wg = shared ? W_sh : W + (ulong)expert * args.stack_blocks;
     device const typename Q::Block * wu = PAIR ? (shared ? W_sh_up : W_up + (ulong)expert * args.stack_blocks) : wg;
     // The tile's first output: the pair's tile is 32 outputs (64 weight rows

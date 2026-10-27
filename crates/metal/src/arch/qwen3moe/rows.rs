@@ -192,14 +192,13 @@ pub(super) struct RowsLens {
 impl RowsLens {
     /// The lens of a pass of `cap` rows at the launch geometry `g` over a token
     /// arena of residual width `hidden`, a P1 output of `proj` values at its
-    /// widest, `n_experts` routed experts and delta layers of the key heads
-    /// `delta_heads` names, each refused by name when it does not fit.
+    /// widest and delta layers of the key heads `delta_heads` names, each
+    /// refused by name when it does not fit.
     pub(super) fn of(
         g: &Geometry,
         cap: usize,
         hidden: usize,
         proj: usize,
-        n_experts: usize,
         delta_heads: impl Iterator<Item = usize>,
     ) -> Result<RowsLens, SessionError> {
         if cap == 0 {
@@ -209,7 +208,7 @@ impl RowsLens {
         // The widest P1 output a layer writes, rounded up to the four floats
         // the GEMM's output rows are aligned to.
         let proj_stride = proj.next_multiple_of(4);
-        let words = route_table_words(slots, n_experts);
+        let words = route_table_words(slots, g.router.rows);
         let delta_prep_stride = delta_heads
             .map(|n_k| {
                 g.delta
@@ -309,7 +308,6 @@ impl RowsArena {
             cap,
             hidden,
             arena.proj.len().get(),
-            arena.n_experts,
             delta_heads,
         )?;
         let ids = device.buffer(Elems(lens.ids))?;

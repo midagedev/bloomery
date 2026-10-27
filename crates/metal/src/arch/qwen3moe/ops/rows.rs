@@ -210,6 +210,7 @@ impl MetalOps<'_, '_> {
             layers,
             faults,
             hidden,
+            geom,
             ..
         } = &mut *self.arena;
         let MixerBufs::Attention(a) = &layers[l].mixer else {
@@ -219,12 +220,16 @@ impl MetalOps<'_, '_> {
             )
             .into());
         };
+        let out_cols = geom
+            .attn
+            .out_len()
+            .ok_or_else(|| ChainError::shape(WHAT, "the attention output does not fit"))?;
         self.kernels.gemm(
             self.enc,
             GemmParams {
                 quant: a.out_quant,
                 rows: *hidden,
-                cols: rows.mix_stride,
+                cols: out_cols,
                 acts: m,
                 weights: all(&a.out)?,
                 x: rows.mix.window(Elems(0), Elems(m * rows.mix_stride))?,
@@ -510,7 +515,7 @@ impl MetalOps<'_, '_> {
                 inv: rows.inv.window_mut(Elems(0), Elems(slots))?,
                 tiles: rows
                     .tiles
-                    .window_mut(Elems(0), Elems(route_table_words(slots, *n_experts)))?,
+                    .window_mut(Elems(0), Elems(route_table_words(slots, geom.router.rows)))?,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -537,8 +542,8 @@ impl MetalOps<'_, '_> {
         } = &mut *self.arena;
         let f = &layers[l].ffn;
         let (slots, expert_k) = (m * geom.experts.slots, geom.experts.k);
-        let max_tiles = route_tiles(slots, *n_experts);
-        let table_words = route_table_words(slots, *n_experts);
+        let max_tiles = route_tiles(slots, geom.router.rows);
+        let table_words = route_table_words(slots, geom.router.rows);
         self.kernels.gemm_routed(
             self.enc,
             RoutedParams {
