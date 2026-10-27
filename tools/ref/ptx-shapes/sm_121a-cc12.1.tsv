@@ -184,7 +184,9 @@ generate_ds41 gemm_iq3s 24 16
 generate_ds41 gemm_iq3xxs 0 0
 generate_ds41 gemm_iq4nl 0 0
 generate_ds41 gemm_iq4xs 0 0
-generate_ds41 gemm_nvfp4_mma 0 0
+# PIN(2026-10-28): spill 0 -> 16 B, JIT local 0 -> 8 B (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84,
+# gate-ptx-spill): the whole-tile walk's five live-fragment counts; the route bench's down runs faster with them.
+generate_ds41 gemm_nvfp4_mma 16 8
 # PIN(2026-10-23): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes over 32 and 16 are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121a with that walk compiled out holds 32 and 16.
 # PIN(2026-10-24): staged NVFP4 weights: 64 spill bytes at sm_121a (ptxas 13.3.73),
 # 32 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.

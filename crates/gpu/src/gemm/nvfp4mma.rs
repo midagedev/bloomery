@@ -461,9 +461,10 @@ const _: () = {
 /// One thread's `cp.async` copies of step `$s` (64-value steps `HALVES * $s`
 /// on, below `$steps`) into stage `$st` (`$s % STAGES`) of `nvfp4_walk!`'s
 /// shared arrays `$wp`, `$bp`, `$sp` (its arguments): of each half, half
-/// `$half` of weight row `$wrow`'s codes and, for `$sr < 64`, of activation
-/// column `$col`'s, into shared row `$sr`; and half `$half`'s scale words. One
-/// group, empty for a step past the last. `$full` (a literal) says every step
+/// `$half` of weight row `$wrow`'s codes and, for `$sr < $bc`, of activation
+/// column `$col`'s, into shared row `$sr`; and half `$half`'s scale words,
+/// the activation's for `$sr < 64`. One group, empty for a step past the
+/// last. `$full` (a literal) says every step
 /// below `$steps` has both halves, so only the step itself is checked.
 macro_rules! nvfp4_copy {
     (
@@ -471,7 +472,7 @@ macro_rules! nvfp4_copy {
         ($s:expr, $st:expr),
         ($wq:ident, $we:ident, $wrow:ident),
         ($aq:ident, $ae:ident, $col:ident),
-        ($steps:ident, $sr:ident, $half:ident),
+        ($steps:ident, $sr:ident, $half:ident, $bc:expr),
         ($wp:ident, $bp:ident, $sp:ident)
     ) => {{
         let s: usize = $s;
@@ -492,9 +493,9 @@ macro_rules! nvfp4_copy {
                             $wq.as_ptr().add(($wrow * $steps + k) * 8 + 4 * $half),
                         )
                     };
-                    if $sr < 64 {
+                    if $sr < $bc {
                         // SAFETY: col is a live column whose aligned half of step k is in the plane;
-                        // sr < 64, h < HALVES and half < 2 put at, this thread's own aligned four-word
+                        // sr < bc <= 64, h < HALVES and half < 2 put at, this thread's own aligned four-word
                         // chunk, inside row sr of stage st of B, read by no other thread before the
                         // barrier after the wait that completes it.
                         unsafe {
@@ -538,11 +539,12 @@ macro_rules! nvfp4_copy {
 /// halves a step: each thread copies half `$half` of shared row `$sr` from
 /// weight row `$wrow` (`$wq` codes, `$we` scales) and, for `$sr < 64`, from
 /// activation column `$col` (`$aq`, `$ae`) two steps ahead
-/// ([`nvfp4_copy`]), and before a step's barrier turns its own weight halves
-/// of the step's stage into the MMA's nibble order ([`packed_pair`]); then
-/// `$body` reads each live half `$h` of the stage, in K order: its codes
-/// through `$wp` and `$bp` at [`chunk`] `2 * $h` and `2 * $h + 1`, its scale
-/// words through `$sp`. Every thread of the block runs it, `$steps` 64-value
+/// ([`nvfp4_copy`]), the activation codes of its first `$bc <= 64` rows
+/// alone, and before a step's barrier turns its own weight halves of the
+/// step's stage into the MMA's nibble order ([`packed_pair`]); then `$body`
+/// reads each live half `$h` of the stage, in K order: its codes through
+/// `$wp` and `$bp` at [`chunk`] `2 * $h` and `2 * $h + 1`, the activation's
+/// in its first `$bc` rows, its scale words through `$sp`. Every thread of the block runs it, `$steps` 64-value
 /// steps in all. `$full` (a literal) says `$steps` is even, so every step has
 /// both halves and none of the walk's half checks remain.
 macro_rules! nvfp4_walk {
@@ -550,7 +552,7 @@ macro_rules! nvfp4_walk {
         $full:literal,
         ($wq:ident, $we:ident, $wrow:ident),
         ($aq:ident, $ae:ident, $col:ident),
-        ($steps:ident, $sr:ident, $half:ident),
+        ($steps:ident, $sr:ident, $half:ident, $bc:expr),
         ($wp:ident, $bp:ident, $sp:ident, $h:ident),
         $body:block
     ) => {{
@@ -559,7 +561,7 @@ macro_rules! nvfp4_walk {
             (0, 0),
             ($wq, $we, $wrow),
             ($aq, $ae, $col),
-            ($steps, $sr, $half),
+            ($steps, $sr, $half, $bc),
             ($wp, $bp, $sp)
         );
         nvfp4_copy!(
@@ -567,7 +569,7 @@ macro_rules! nvfp4_walk {
             (1, 1),
             ($wq, $we, $wrow),
             ($aq, $ae, $col),
-            ($steps, $sr, $half),
+            ($steps, $sr, $half, $bc),
             ($wp, $bp, $sp)
         );
         // The stage this step reads, and the one its copies of step + 2 fill.
@@ -614,7 +616,7 @@ macro_rules! nvfp4_walk {
                 (step + 2, fill),
                 ($wq, $we, $wrow),
                 ($aq, $ae, $col),
-                ($steps, $sr, $half),
+                ($steps, $sr, $half, $bc),
                 ($wp, $bp, $sp)
             );
             let ($wp, $bp) = (ws, bs);
@@ -632,6 +634,28 @@ macro_rules! nvfp4_walk {
             step += 1;
         }
     }};
+}
+
+/// The activation rows a walk over a tile's first `live` fragments copies:
+/// the fragment pairs that hold them, which `b_pair` loads.
+#[inline(always)]
+const fn live_rows(live: usize) -> usize {
+    16 * live.div_ceil(2)
+}
+
+/// A local `$walk!(true, live)` over a route tile of `$len` columns: its first
+/// `live` 8-column fragments, the fewest of 1, 2, 4, 6 or 8 that hold its
+/// columns, a literal in each arm, so the walk keeps no fragment check.
+macro_rules! live_walk {
+    ($len:expr, $walk:ident) => {
+        match $len {
+            0..=8 => $walk!(true, 1),
+            9..=16 => $walk!(true, 2),
+            17..=32 => $walk!(true, 4),
+            33..=48 => $walk!(true, 6),
+            _ => $walk!(true, 8),
+        }
+    };
 }
 
 /// An MXFP8 weight's planes, staged as stored for the native W8A8 tile. Its
@@ -1193,16 +1217,16 @@ mod native {
         unsafe { columns.put((sr, half), source, ag, col) };
         let mut acc = [0.0f32; 32];
         // An even K walk over whole row tiles runs without the walk's and the
-        // fragments' checks: a tile of fewer than 64 columns also runs its
-        // dead fragments, over copies of its last live column (`source`),
-        // which no store reads.
+        // fragments' checks, over the tile's first `$live` fragments
+        // ([`live_walk`]): a dead fragment among them runs over copies of its
+        // last live column (`source`), which no store reads.
         macro_rules! walk {
-            ($full:literal) => {
+            ($full:literal, $live:literal) => {
                 nvfp4_walk!(
                     $full,
                     (wq, we, wr),
                     (aq, ae, col),
-                    (steps, sr, half),
+                    (steps, sr, half, live_rows($live)),
                     (wp, bp, sp, h),
                     {
                         if $full || row < rows {
@@ -1219,7 +1243,7 @@ mod native {
                             let sa = unsafe { *sp.add(r + 8 * (t & 1)) };
                             for q in 0..2 {
                                 ::cuda_device::thread::__unroll_config::<0>();
-                                if !$full && 4 * q >= nt {
+                                if 4 * q >= $live || (!$full && 4 * q >= nt) {
                                     continue;
                                 }
                                 // SAFETY: q < 2, inside this half's scale words.
@@ -1230,7 +1254,7 @@ mod native {
                                 for p in 0..2 {
                                     ::cuda_device::thread::__unroll_config::<0>();
                                     let n = 4 * q + 2 * p;
-                                    if !$full && n >= nt {
+                                    if n >= $live || (!$full && n >= nt) {
                                         continue;
                                     }
                                     // SAFETY: the whole warp loads; n + 1 < 8 and h < HALVES in this
@@ -1240,7 +1264,7 @@ mod native {
                                 for i in 0..4 {
                                     ::cuda_device::thread::__unroll_config::<0>();
                                     let n = 4 * q + i;
-                                    if !$full && n >= nt {
+                                    if n >= $live || (!$full && n >= nt) {
                                         continue;
                                     }
                                     let c = mma(
@@ -1262,9 +1286,9 @@ mod native {
             };
         }
         if steps.is_multiple_of(HALVES) && rows.is_multiple_of(TILE_ROWS) {
-            walk!(true);
+            live_walk!(len, walk);
         } else {
-            walk!(false);
+            walk!(false, 8);
         }
         if row >= rows {
             return;
@@ -1398,18 +1422,23 @@ mod native {
         let (gate_scale, up_scale) = (gw[expert], uw[expert]);
         let mut gacc = [0.0f32; 16];
         let mut uacc = [0.0f32; 16];
-        // An even K walk runs without the walk's and the fragments' checks: a
-        // tile of fewer than 64 columns also runs its dead fragments, over
-        // copies of its last live column (`source`), which no store reads.
+        // An even K walk runs without the walk's and the fragments' checks,
+        // over the tile's first `$live` fragments ([`live_walk`]): a warp
+        // whose four fragments are all past them waits at the barriers alone,
+        // and a dead fragment among them runs over copies of its last live
+        // column (`source`), which no store reads.
         macro_rules! walk {
-            ($full:literal) => {
+            ($full:literal, $live:literal) => {
                 nvfp4_walk!(
                     $full,
                     (wq, we, wrow),
                     (aq, ae, col),
-                    (steps, sr, half),
+                    (steps, sr, half, live_rows($live)),
                     (wp, bp, sp, h),
                     {
+                        if $live <= 4 && wc != 0 {
+                            continue;
+                        }
                         let a_row = 16 * wr + (lane & 15);
                         let a_off = chunk(a_row, 2 * h + (lane >> 4));
                         // SAFETY: all lanes issue the load; its four sets of eight aligned gate
@@ -1442,7 +1471,7 @@ mod native {
                         for p in 0..2 {
                             ::cuda_device::thread::__unroll_config::<0>();
                             let nn = 4 * wc + 2 * p;
-                            if !$full && nn >= nt {
+                            if nn >= $live || (!$full && nn >= nt) {
                                 continue;
                             }
                             // SAFETY: the whole warp loads; nn + 1 < 8 and h < HALVES in this published
@@ -1451,7 +1480,7 @@ mod native {
                         }
                         for n in 0..4 {
                             ::cuda_device::thread::__unroll_config::<0>();
-                            if !$full && 4 * wc + n >= nt {
+                            if 4 * wc + n >= $live || (!$full && 4 * wc + n >= nt) {
                                 continue;
                             }
                             let (b, sb) = (bs[n], sb[n]);
@@ -1493,9 +1522,9 @@ mod native {
             };
         }
         if steps.is_multiple_of(HALVES) {
-            walk!(true);
+            live_walk!(len, walk);
         } else {
-            walk!(false);
+            walk!(false, 8);
         }
         thread::sync_threads();
         // The lane's eight columns, fragment n's column j & 1 at i = 2n + (j & 1):
