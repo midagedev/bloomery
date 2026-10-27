@@ -47,6 +47,12 @@
 //! table maps onto `s t m d r v e l` are their ASCII capitals, so ASCII
 //! lowercasing is the same test.
 //!
+//! A Hugging Face `tokenizer.json` runs the same regex with Oniguruma, as it does qwen35's:
+//! `(?i:...)` folds case by Unicode (`'s` also matches `'ſ`) and the classes are Unicode 14.0's
+//! ([`Pre::Qwen2Hf`]). The regex has no `\p{M}`, so a mark is a plain codepoint of the symbol
+//! class there, as it is in the reference's splitter, and every position matches an alternative:
+//! the one-codepoint piece the splitter makes of a position none matches never arises.
+//!
 //! ## glm4
 //!
 //! The reference maps `glm4` to its CHATGLM4 type, whose one regex is qwen2's
@@ -264,17 +270,24 @@ fn match_space(c: &[u8], i: usize, hi: usize) -> usize {
     if w > 1 { w - 1 } else { w }
 }
 
-/// `P?[\p{L}\p{M}]+` at `i`, the word alternative of qwen35 and of deepseek-v3's regex 3: the
-/// prefix first (a greedy `?` backs off only when the run after it fails), then the run alone.
-/// `prefix(x)` is whether `x` is a codepoint of `P`.
-fn match_prefixed_word(c: &[u8], i: usize, hi: usize, prefix: impl Fn(u8) -> bool) -> usize {
+/// `P?W+` at `i`, the word alternative of qwen35 (`W` letters and marks), qwen2's regex (`W`
+/// letters) and deepseek-v3's regex 3: the prefix first (a greedy `?` backs off only when the run
+/// after it fails), then the run alone. `prefix(x)` is whether `x` is a codepoint of `P`, and
+/// `word(x)` whether it is one of `W`.
+fn match_prefixed_word(
+    c: &[u8],
+    i: usize,
+    hi: usize,
+    prefix: impl Fn(u8) -> bool,
+    word: impl Fn(u8) -> bool + Copy,
+) -> usize {
     if prefix(c[i]) && i + 1 < hi {
-        let n = run(c, i + 1, hi, is_letter_or_mark);
+        let n = run(c, i + 1, hi, word);
         if n > 0 {
             return 1 + n;
         }
     }
-    run(c, i, hi, is_letter_or_mark)
+    run(c, i, hi, word)
 }
 
 /// The alternatives every regex here ends with, at `i`: `\p{N}{1,digits}` (none when `digits` is
@@ -318,9 +331,13 @@ fn match_qwen35(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> us
 
     // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`: the prefix class takes a mark, a space or an
     // apostrophe as readily as qwen2's does.
-    let n = match_prefixed_word(c, i, hi, |x| {
-        !is_newline(x) && !is_letter(x) && !is_number(x)
-    });
+    let n = match_prefixed_word(
+        c,
+        i,
+        hi,
+        |x| !is_newline(x) && !is_letter(x) && !is_number(x),
+        is_letter_or_mark,
+    );
     if n > 0 {
         return n;
     }
@@ -328,6 +345,32 @@ fn match_qwen35(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> us
     // `\p{N}` (one number, however long the run), ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` and
     // `\s*[\r\n]+|\s+(?!\S)|\s+`
     match_tail(c, i, hi, 1, is_other_qwen35, is_newline)
+}
+
+/// The `qwen2` regex at `i`, as a regex engine runs it (the reference runs a hand-written
+/// splitter for it): [`match_qwen35`] with letters alone in the word run and the marks among the
+/// "other" run's codepoints. `fold(k)` is as there.
+fn match_qwen2(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> usize {
+    // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
+    let n = contraction(c, i, hi, fold);
+    if n > 0 {
+        return n;
+    }
+
+    // `[^\r\n\p{L}\p{N}]?\p{L}+`
+    let n = match_prefixed_word(
+        c,
+        i,
+        hi,
+        |x| !is_newline(x) && !is_letter(x) && !is_number(x),
+        is_letter,
+    );
+    if n > 0 {
+        return n;
+    }
+
+    // `\p{N}`, ` ?[^\s\p{L}\p{N}]+[\r\n]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
+    match_tail(c, i, hi, 1, is_other, is_newline)
 }
 
 /// Regex 3 at `i`: the first of its six alternatives that matches.
@@ -342,9 +385,13 @@ fn match_word(c: &[u8], i: usize, hi: usize) -> usize {
     }
 
     // `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
-    let n = match_prefixed_word(c, i, hi, |x| {
-        !is_newline(x) && !is_letter(x) && !is_punct_or_symbol(x)
-    });
+    let n = match_prefixed_word(
+        c,
+        i,
+        hi,
+        |x| !is_newline(x) && !is_letter(x) && !is_punct_or_symbol(x),
+        is_letter_or_mark,
+    );
     if n > 0 {
         return n;
     }
@@ -569,6 +616,10 @@ pub(crate) enum Pre {
     /// vocabulary lacks. Never named
     /// in a header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
     Qwen35Hf,
+    /// `qwen2` as a Hugging Face `tokenizer.json` runs it: contractions fold case by Unicode,
+    /// classes are Unicode 14.0's, and BPE skips a byte its vocabulary lacks. Never named in a
+    /// header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
+    Qwen2Hf,
     /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
     Pixtral,
@@ -612,6 +663,7 @@ impl Pre {
     /// own case; `None` for a name no folder's `tokenizer.json` spells.
     pub(crate) fn hf_reading(self) -> Option<Pre> {
         match self {
+            Pre::Qwen2 => Some(Pre::Qwen2Hf),
             Pre::Qwen35 => Some(Pre::Qwen35Hf),
             Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
             _ => None,
@@ -657,6 +709,7 @@ impl Pre {
             | Pre::Glm4
             | Pre::Qwen35
             | Pre::Qwen35Hf
+            | Pre::Qwen2Hf
             | Pre::MiniMaxM2Hf
             | Pre::Pixtral
             | Pre::MiniMaxM2
@@ -672,7 +725,7 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf => collapse_hf,
+        Pre::Qwen35Hf | Pre::Qwen2Hf => collapse_hf,
         Pre::MiniMaxM2Hf => collapse_cased,
         _ => collapse,
     };
@@ -690,6 +743,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::Qwen35 => split_qwen35(cpts, s, false),
         Pre::Qwen35Hf => split_qwen35(cpts, s, true),
+        Pre::Qwen2Hf => split_qwen2_hf(cpts, s),
         Pre::MiniMaxM2 | Pre::Gpt4o => split_minimax_m2::<M2Reference>(cpts, s),
         Pre::MiniMaxM2Hf => split_minimax_m2::<M2Hf>(cpts, s),
         Pre::Gemma4 => {
@@ -825,6 +879,15 @@ fn fold_at(cpts: &[u32], c: &[u8], k: usize, hf: bool) -> u8 {
 fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
         match_qwen35(c, i, hi, |k| fold_at(cpts, c, k, hf))
+    });
+    &s.b
+}
+
+/// [`split`] for [`Pre::Qwen2Hf`]: the `qwen2` regex over the collapsed bytes, contractions folded
+/// as Hugging Face's.
+fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+    split_one_piece(cpts.len(), s, |c, i, hi| {
+        match_qwen2(c, i, hi, |k| fold_at(cpts, c, k, true))
     });
     &s.b
 }
@@ -1230,6 +1293,100 @@ mod tests {
             assert_eq!(words(Pre::Qwen35Hf, text), hf, "hf {text:?}");
             assert_eq!(words(Pre::Qwen35, text), legacy, "qwen35 {text:?}");
         }
+    }
+
+    /// Hugging Face's qwen2 folds a contraction's case by Unicode as its qwen35 does (`ſ` is `s`,
+    /// the Kelvin sign no contraction's letter) and tells the same codepoints of Unicode 15.0 from
+    /// the letters and numbers the reference's tables class; a mark is no letter in either reading,
+    /// so it opens a word as the prefix.
+    ///
+    /// FAIL-first: with the ASCII fold for both, the first three rows fail; with the reference's
+    /// classes for both, the last two; with marks in the letter run, the mark rows.
+    #[test]
+    fn qwen2_hf_cases() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              hf                        qwen2
+            ("x'\u{17f}y", &["x", "'\u{17f}", "y"], &["x", "'\u{17f}y"]),
+            (
+                "'\u{17f}\u{17f}",
+                &["'\u{17f}", "\u{17f}"],
+                &["'\u{17f}\u{17f}"],
+            ),
+            (
+                "we'\u{17f}e",
+                &["we", "'\u{17f}", "e"],
+                &["we", "'\u{17f}e"],
+            ),
+            ("'\u{212a}x", &["'\u{212a}x"], &["'\u{212a}x"]),
+            ("IT'S", &["IT", "'S"], &["IT", "'S"]),
+            ("x\u{301}y", &["x", "\u{301}y"], &["x", "\u{301}y"]),
+            (
+                "x\u{301}\u{301}",
+                &["x", "\u{301}\u{301}"],
+                &["x", "\u{301}\u{301}"],
+            ),
+            (" \u{1d2c0}", &[" \u{1d2c0}"], &[" ", "\u{1d2c0}"]),
+            ("x\u{11f04}", &["x", "\u{11f04}"], &["x\u{11f04}"]),
+        ];
+        for &(text, hf, legacy) in cases {
+            assert_eq!(words(Pre::Qwen2Hf, text), hf, "hf {text:?}");
+            assert_eq!(words(Pre::Qwen2, text), legacy, "qwen2 {text:?}");
+        }
+    }
+
+    /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
+    /// (`hf_pieces_qwen2.py`: contractions in every case, letters and marks and numbers against
+    /// each other, spaces, symbols, code, every Unicode version's codepoints) is cut into pieces of
+    /// the byte lengths its pre-tokenizer gives.
+    ///
+    /// FAIL-first: with the reference's splitter in its place, the texts of codepoints Unicode 15.0
+    /// added and the `ſ` contractions fail; with marks in the letter run, the mark texts.
+    #[test]
+    fn qwen2_hf_pieces_are_hugging_faces() {
+        let path = format!(
+            "{}/../hf/tests/fixtures/qwen2-hf-pieces.json.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
+        ))
+        .unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(cases.len() >= 11_000, "{} cases in {path}", cases.len());
+        let mut s = Scratch::default();
+        let mut failures = Vec::new();
+        for case in cases {
+            let text = case["text"].as_str().unwrap();
+            let want: Vec<u64> = serde_json::from_value(case["pieces"].clone()).unwrap();
+            let cpts: Vec<u32> = text.chars().map(u32::from).collect();
+            let mut at = 0;
+            let ours: Vec<u64> = split(Pre::Qwen2Hf, &cpts, &mut s)
+                .iter()
+                .map(|&n| {
+                    let bytes: usize = cpts[at..at + n]
+                        .iter()
+                        .map(|&c| char::from_u32(c).unwrap().len_utf8())
+                        .sum();
+                    at += n;
+                    bytes as u64
+                })
+                .collect();
+            if ours != want {
+                failures.push(format!("{text:?}: ours {ours:?}, HF {want:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} texts:\n{}",
+            failures.len(),
+            cases.len(),
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// MiniMax's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus

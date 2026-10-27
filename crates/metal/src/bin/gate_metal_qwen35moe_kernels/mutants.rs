@@ -51,7 +51,8 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
 /// (`routed_shared_base`, `routed_shared_group_refused`), the picks' stride (`route_rows_per_row`), the
 /// logits' stride (`route_rows_stride`: the row's logits are dense, the stride
 /// its row count) and the key head swap (`prefill_kv_head`: four key heads
-/// make `1 - kv` wrap).
+/// make `1 - kv` wrap). The A4 mutants are kept but the head-normed scale's
+/// (`a4_headnorm_scale`), a delta net's.
 pub const Q30_KEPT: &[&str] = &[
     "router_logit",
     "router_ids",
@@ -101,6 +102,18 @@ pub const Q30_KEPT: &[&str] = &[
     "routed_last_row_unstaged",
     "combine_skip_shared",
     "gemm_f32w_rotate",
+    "a4_lane_pair",
+    "a4_word_offset",
+    "a4_bias_sign",
+    "a4_scale_bias",
+    "a4_tail_store",
+    "a4_norm_gain",
+    "a4_seg_weights",
+    "a4_pair_sum_sq",
+    "a4_fold_slot",
+    "a4_head_logit",
+    "a4_embed_code",
+    "a4_routed_bias_sign",
 ];
 
 /// The defects only a head-128, ungated, unshared instance shows, and those of
@@ -569,6 +582,54 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "    static inline float2 head_scales(threadgroup const float * scales, int ib) {\n        const int head = ib >> 1;\n        return float2(scales[head], scales[head]);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / (BLOOMERY_EXPERT_K / values_per_block());\n    }",
             "    static inline float2 head_scales(threadgroup const float * scales, int ib) {\n        const int head = ib >> 1;\n        return float2(scales[head], scales[head]);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / 16;\n    }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_tail_store",
+        clause: "a4_row_tail",
+        why: "the store of a pair no longer stops at the last row",
+        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 1)],
+    },
+    Mutant {
+        name: "a4_norm_gain",
+        clause: "a4_norm",
+        why: "the A4 norm load drops the gain of a value",
+        edits: &[("a0 *= gain[base + 4 * l + 0];", "a0 *= 1.f;", 1)],
+    },
+    Mutant {
+        name: "a4_seg_weights",
+        clause: "a4_seg",
+        why: "a segment reads the weights of the first segment",
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+    },
+    Mutant {
+        name: "a4_pair_sum_sq",
+        clause: "a4_pair",
+        why: "the A4 norm load's sum of squares drops a value",
+        edits: &[(
+            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= gain[base + 4 * l + 0];",
+            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= gain[base + 4 * l + 0];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_head_logit",
+        clause: "a4_head",
+        why: "the stored logit is doubled",
+        edits: &[(
+            "            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
+            "            logits[row] *= 2.f;\n            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_routed_bias_sign",
+        clause: "grouped_gemm",
+        why: "the A4 value the routed GEMM stages subtracts the bias, not adds it",
+        edits: &[(
+            "return scale_of(blk) * q + bias_of(blk);",
+            "return scale_of(blk) * q - bias_of(blk);",
             1,
         )],
     },

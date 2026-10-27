@@ -1,0 +1,36 @@
+{
+ "normalizer": {
+  "type": "NFC"
+ },
+ "pre_tokenizer": {
+  "type": "Sequence",
+  "pretokenizers": [
+   {
+    "type": "Split",
+    "pattern": {
+     "Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+    },
+    "behavior": "Isolated",
+    "invert": false
+   },
+   {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": false,
+    "use_regex": false
+   }
+  ]
+ },
+ "post_processor": {
+  "type": "ByteLevel",
+  "add_prefix_space": false,
+  "trim_offsets": false,
+  "use_regex": false
+ },
+ "decoder": {
+  "type": "ByteLevel",
+  "add_prefix_space": false,
+  "trim_offsets": false,
+  "use_regex": false
+ }
+}

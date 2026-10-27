@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::schema::{
     self, Fields,
-    Rule::{Need, Only, Read},
+    Rule::{Only, Read},
 };
 use safetensors::Dtype;
 
@@ -518,11 +518,12 @@ impl Mlx {
 }
 
 /// The `quantization` block's own keys, each read by [`mlx_format`]; `mode`
-/// must name the affine form this reader places.
+/// must name the affine form this reader places. An absent `mode` is the
+/// affine form: mlx-community's Qwen3-30B-A3B config names none.
 const MLX_BLOCK: &Fields = &[
     ("group_size", Read),
     ("bits", Read),
-    ("mode", Need("[\"affine\"]")),
+    ("mode", Only("[\"affine\"]")),
 ];
 
 /// The affine format of one `quantization` entry (`what` names it in a
@@ -2393,6 +2394,44 @@ mod tests {
         );
     }
 
+    /// The tensors of a committed header file of `tests/fixtures/checkpoint-headers`:
+    /// name, dtype and shape.
+    fn header_entries(file: &str) -> Vec<(String, Dtype, Vec<usize>)> {
+        let gz = std::fs::read(format!(
+            "{}/tests/fixtures/checkpoint-headers/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut text = Vec::new();
+        flate2::read::GzDecoder::new(gz.as_slice())
+            .read_to_end(&mut text)
+            .unwrap();
+        let header: serde_json::Map<String, Value> = serde_json::from_slice(&text).unwrap();
+        header
+            .iter()
+            .map(|(n, e)| {
+                (
+                    n.clone(),
+                    Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
+                    e["shape"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|d| d.as_u64().unwrap() as usize)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn tensors(
+        entries: &[(String, Dtype, Vec<usize>)],
+    ) -> impl Iterator<Item = (&str, Dtype, &[usize])> {
+        entries
+            .iter()
+            .map(|(n, d, s)| (n.as_str(), *d, s.as_slice()))
+    }
+
     /// MLX's own `quantization` block (mlx-community's Qwen3.6 4-bit, its
     /// config.json and the dtype and shape of every tensor of layers 0 and 3,
     /// the unlayered text tensors, `lm_head` and one `vision_tower` pair):
@@ -2415,38 +2454,7 @@ mod tests {
             c
         };
         let c = Config::parse(&real, None).unwrap();
-        let gz = std::fs::read(format!(
-            "{}/tests/fixtures/checkpoint-headers/qwen3.6-mlx-4bit-layers-0-3.tensors.json.gz",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
-        let mut text = Vec::new();
-        flate2::read::GzDecoder::new(gz.as_slice())
-            .read_to_end(&mut text)
-            .unwrap();
-        let header: serde_json::Map<String, Value> = serde_json::from_slice(&text).unwrap();
-        let entries: Vec<(String, Dtype, Vec<usize>)> = header
-            .iter()
-            .map(|(n, e)| {
-                (
-                    n.clone(),
-                    Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
-                    e["shape"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|d| d.as_u64().unwrap() as usize)
-                        .collect(),
-                )
-            })
-            .collect();
-        fn tensors(
-            entries: &[(String, Dtype, Vec<usize>)],
-        ) -> impl Iterator<Item = (&str, Dtype, &[usize])> {
-            entries
-                .iter()
-                .map(|(n, d, s)| (n.as_str(), *d, s.as_slice()))
-        }
+        let entries = header_entries("qwen3.6-mlx-4bit-layers-0-3.tensors.json.gz");
         let p = plan(&c, tensors(&entries), |_| None);
         assert!(p.refused.is_empty(), "{:?}", p.refused);
         let mut count = BTreeMap::new();
@@ -2603,6 +2611,52 @@ mod tests {
         assert!(
             e.to_string()
                 .contains("a quantization block beside quantization_config's quant_method fp8"),
+            "{e}"
+        );
+    }
+
+    /// mlx-community's Qwen3-30B-A3B-Instruct-2507-4bit carries a `quantization` block that names
+    /// no `mode`: it is the affine form. Its config and the dtype
+    /// and shape of all 1,351 tensors place every one — the 4-bit default for the embedding, the
+    /// head, the attention and the stacked experts, the 8-bit router by its per-module entries,
+    /// the norm gammas plain — and a `mode` that is present still has to be `affine`.
+    #[test]
+    fn an_absent_mode_is_the_affine_form() {
+        let real = fixture("mlx-community__Qwen3-30B-A3B-Instruct-2507-4bit__config.json").unwrap();
+        assert!(real["quantization"].get("mode").is_none());
+        let c = Config::parse(&real, None).unwrap();
+        let entries = header_entries("qwen3-30b-a3b-instruct-2507-mlx-4bit.tensors.json.gz");
+        assert_eq!(entries.len(), 1351);
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        let mut count = BTreeMap::new();
+        for pl in p.placed.values() {
+            *count.entry(pl.format.to_string()).or_insert(0) += 1;
+        }
+        assert_eq!(
+            count.into_iter().collect::<Vec<_>>(),
+            [
+                ("BF16", 193),
+                ("MLX-affine 4-bit group 64", 338),
+                ("MLX-affine 8-bit group 64", 48),
+            ]
+            .map(|(f, n)| (f.to_string(), n))
+        );
+        assert_eq!(
+            p.placed["model.layers.47.mlp.gate.weight"].format,
+            Format::MlxAffine { bits: 8, group: 64 }
+        );
+        assert_eq!(
+            p.placed["model.layers.47.mlp.switch_mlp.down_proj.weight"].format,
+            Format::MlxAffine { bits: 4, group: 64 }
+        );
+        let mut other = real.clone();
+        other["quantization"]["mode"] = "affine2".into();
+        other.as_object_mut().unwrap().remove("quantization_config");
+        let e = Config::parse(&other, None).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("quantization.mode \"affine2\" is unsupported"),
             "{e}"
         );
     }

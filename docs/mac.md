@@ -78,6 +78,11 @@ Either file works for Qwen3.6:
   target/release/prepare PATH/Qwen3.6-35B-A3B-4bit OUT/qwen36-mlx4    # writes OUT/qwen36-mlx4-00001-of-00001.gguf
   ```
 
+The Qwen3-30B-A3B MLX 4-bit folder,
+[`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit),
+converts the same way (`prepare` picks the map by the folder's `model_type`, `qwen3_moe`; the weights stay as stored).
+The split is 17.2 GB, and on a build after 0.3.9 `generate_metal` opens and runs it.
+
 A quick check from the command line (the rates print on stderr, `decode_tok_s=`):
 
 ```sh

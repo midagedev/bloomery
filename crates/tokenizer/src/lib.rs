@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     /// The explicit stop list selects Hugging Face's encoding, and only for a pre-tokenizer that
-    /// has an HF reading (`qwen35`, `minimax-m2`; `qwen2` has none and is refused): qwen35's
+    /// has an HF reading (`qwen35`, `qwen2`, `minimax-m2`; `glm4` has none and is refused): qwen35's
     /// regex folds `ſ` to `s` in a contraction ("'ſx" is `'ſ` and `x`, ids 257 and 120 under
     /// the merges below, where qwen35 merges the one word to 258), and its BPE skips a byte its
     /// vocabulary lacks and merges across it ("acb" is `ab`), and a pair listed twice ranks at its
@@ -1262,18 +1262,22 @@ mod tests {
             }
         }
         // The BPE is Hugging Face's under the marker whatever the pre-tokenizer: minimax-m2 skips
-        // the byte its vocabulary lacks and ranks a pair listed twice at its last place too.
-        for (kvs, text, hf, legacy) in [
-            (&sparse, "acb", &[2][..], &[0, 1][..]),
-            (&twice, "abc", &[3, 2][..], &[0, 4][..]),
+        // the byte its vocabulary lacks and ranks a pair listed twice at its last place too, and
+        // qwen2 folds `ſ` in a contraction as qwen35 does.
+        for (pre, kvs, text, hf, legacy) in [
+            ("minimax-m2", &sparse, "acb", &[2][..], &[0, 1][..]),
+            ("minimax-m2", &twice, "abc", &[3, 2][..], &[0, 4][..]),
+            ("qwen2", &sparse, "acb", &[2][..], &[0, 1][..]),
+            ("qwen2", &twice, "abc", &[3, 2][..], &[0, 4][..]),
+            ("qwen2", &contraction, "'ſx", &[257, 120][..], &[258][..]),
         ] {
-            let mut minimax = kvs.clone();
-            minimax[1].1 = Value::String("minimax-m2".into());
-            let mut marked = minimax.clone();
+            let mut named = kvs.clone();
+            named[1].1 = Value::String(pre.into());
+            let mut marked = named.clone();
             marked.push(stop.clone());
-            for (kvs, want) in [(&minimax, legacy), (&marked, hf)] {
+            for (kvs, want) in [(&named, legacy), (&marked, hf)] {
                 let tok = from_header(kvs).unwrap();
-                assert_eq!(tok.encode(text, false, false), want, "minimax-m2 {text:?}");
+                assert_eq!(tok.encode(text, false, false), want, "{pre} {text:?}");
             }
         }
         let mut off_vocab = header(["a", "b"].map(String::from).to_vec(), &["a b"], None);
@@ -1282,14 +1286,14 @@ mod tests {
             &["a b"],
             Some(vec![1, 4, 1]),
         );
-        let mut qwen2 = sparse.clone();
-        qwen2[1].1 = Value::String("qwen2".into());
+        let mut glm4 = sparse.clone();
+        glm4[1].1 = Value::String("glm4".into());
         let mut llama = sparse.clone();
         llama[0].1 = Value::String("llama".into());
         for (kvs, want, unmarked) in [
             (&mut off_vocab, "tokenizer.ggml.merges[0] \"a b\"", true),
             (&mut added_byte, "tokenizer.ggml.tokens[1] \"b\"", true),
-            (&mut qwen2, "pre-tokenizer \"qwen2\" has no reading", true),
+            (&mut glm4, "pre-tokenizer \"glm4\" has no reading", true),
             (&mut llama, "not SentencePiece", false),
         ] {
             // Without the marker the first three load; a SentencePiece one here has no byte tokens.

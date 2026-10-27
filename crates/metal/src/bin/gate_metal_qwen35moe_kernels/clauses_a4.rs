@@ -1,7 +1,8 @@
 //! The A4 clauses: MLX's affine 4-bit decode (`quant.metal`'s `A4` owner)
 //! against the f64 oracle, over the MLX-format fixture split. The Q4_K
 //! clauses' own shapes and fault inputs, every new entry: the five mat-vec
-//! modes, the pair, the fold, the head and the embedding.
+//! modes, the pair, the fold, the head and the embedding. The mat-vec shapes
+//! are a row's [`Sites`]: the tensors of its family's trunk, at its geometry.
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
@@ -14,20 +15,105 @@ use super::clauses_experts::{
 use super::clauses_head;
 use super::clauses_norm::head_partials;
 use super::common::{self, LAYER};
-use super::fixture::{Fixture, OUTPUT_ROWS};
+use super::fixture::Fixture;
 use super::oracle::{self, Kind};
 use super::{Harness, HeadNormLaunch, Launch, ModeSpec};
 
-/// The store dot at the Q4_K clause's shapes and the head's tail rows.
-pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
-    let tensors = [
+/// The tensors the mat-vec A4 clauses read at one row: the shapes of its
+/// family's sites. The head and the embedding are the fixture's own.
+pub struct Sites {
+    /// The store dot's tensors.
+    matvec: &'static [common::Tensor],
+    /// The tensor the row counts are cut from.
+    tail: common::Tensor,
+    /// The norm clause's tensors with the gain each loads under (the fixture's
+    /// own tensor, or none for a synthetic one). The second is also the
+    /// residual epilogue's and the fault inputs' tensor, and the residual
+    /// epilogue's tensors are the first three.
+    norm: &'static [(common::Tensor, Option<&'static str>)],
+    /// The segmented dispatches: each group's tensors with their rows.
+    seg: &'static [&'static [(&'static str, usize)]],
+    /// The gain the segments load under.
+    seg_gain: &'static str,
+}
+
+/// The Qwen3.6 row: the delta net's projections beside the gated attention
+/// query and the shared expert's down.
+pub const QWEN35_SITES: Sites = Sites {
+    matvec: &[
         common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192),
         common::Tensor::a4("blk.0.ssm_out.weight", 4096, 2048),
         common::Tensor::a4("blk.0.ffn_down_shexp.weight", 512, 2048),
         common::Tensor::a4("blk.1.attn_q.weight", 2048, 8192),
-    ];
+    ],
+    tail: common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192),
+    norm: &[
+        (
+            common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192),
+            Some("blk.0.attn_norm.weight"),
+        ),
+        (common::Tensor::a4("blk.0.ssm_out.weight", 4096, 2048), None),
+        (
+            common::Tensor::a4("blk.0.ffn_down_shexp.weight", 512, 2048),
+            None,
+        ),
+        (
+            common::Tensor::a4("output.weight", 2048, 4096),
+            Some("output_norm.weight"),
+        ),
+    ],
+    seg: &[
+        &[
+            ("blk.1.attn_q.weight", 8192),
+            ("blk.1.attn_k.weight", 512),
+            ("blk.1.attn_v.weight", 512),
+        ],
+        &[
+            ("blk.0.attn_qkv.weight", 8192),
+            ("blk.0.attn_gate.weight", 4096),
+        ],
+    ],
+    seg_gain: "blk.1.attn_norm.weight",
+};
+
+/// The Qwen3-30B row: the plain attention query of 32 heads of 128, the key
+/// and value of 4, and the output projection over the 4096 values they
+/// make.
+pub const QWEN3_SITES: Sites = Sites {
+    matvec: &[
+        common::Tensor::a4("blk.0.attn_q.weight", 2048, 4096),
+        common::Tensor::a4("blk.0.attn_output.weight", 4096, 2048),
+        common::Tensor::a4("blk.0.attn_k.weight", 2048, 512),
+        common::Tensor::a4("blk.1.attn_v.weight", 2048, 512),
+    ],
+    tail: common::Tensor::a4("blk.0.attn_q.weight", 2048, 4096),
+    norm: &[
+        (
+            common::Tensor::a4("blk.0.attn_q.weight", 2048, 4096),
+            Some("blk.0.attn_norm.weight"),
+        ),
+        (
+            common::Tensor::a4("blk.0.attn_output.weight", 4096, 2048),
+            None,
+        ),
+        (common::Tensor::a4("blk.0.attn_k.weight", 2048, 512), None),
+        (
+            common::Tensor::a4("output.weight", 2048, 4096),
+            Some("output_norm.weight"),
+        ),
+    ],
+    seg: &[&[
+        ("blk.1.attn_q.weight", 4096),
+        ("blk.1.attn_k.weight", 512),
+        ("blk.1.attn_v.weight", 512),
+    ]],
+    seg_gain: "blk.1.attn_norm.weight",
+};
+
+/// The store dot at the row's sites and the head's tail rows.
+pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture, sites: &Sites) -> Clause {
     let mut parts = Vec::new();
-    for (i, t) in tensors.iter().enumerate() {
+    for (i, t) in sites.matvec.iter().enumerate() {
         let x = oracle::activations(t.cols, 0x1A34 + i as u64, 1.0);
         let worst = common::run_checked(
             h,
@@ -45,14 +131,15 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
         parts.push(format!("{} {worst:.3}", t.label()));
     }
     // The head's last rows: a count no threadgroup divides, deep in the
-    // 248320-row tensor, in the Q6_K clause's shape.
+    // vocabulary's tensor, in the Q6_K clause's shape.
     let tail_rows = 1153;
     let hidden = h.geom().hidden;
+    let output_rows = fix.output_rows()?;
     let head = fix.rows_at(
         "output.weight",
         gguf::quant::GgmlType::MLX_A4,
         hidden,
-        OUTPUT_ROWS - tail_rows,
+        output_rows - tail_rows,
         tail_rows,
     )?;
     let x = oracle::activations(hidden, 0x1A3A, 1.0);
@@ -70,8 +157,8 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )
     .map_err(|e| {
         format!(
-            "output.weight rows {}..{OUTPUT_ROWS}: {e}",
-            OUTPUT_ROWS - tail_rows
+            "output.weight rows {}..{output_rows}: {e}",
+            output_rows - tail_rows
         )
     })?;
     parts.push(format!(
@@ -82,19 +169,19 @@ pub fn a4_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
 
 /// Row counts no threadgroup divides: every row written, no word past the
 /// last, in the Q4_K clause's counts.
-pub fn a4_row_tail(h: &Harness<'_>, fix: &Fixture) -> Clause {
+pub fn a4_row_tail(h: &Harness<'_>, fix: &Fixture, sites: &Sites) -> Clause {
     let counts = [1usize, 2, 3, 5, 6, 7, 4093, 4094, 4095];
-    let t = common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192);
+    let t = sites.tail;
     let all = t.bytes(fix)?;
-    let row_bytes = 2048 / Quant::A4.values_per_block() * Quant::A4.block_bytes();
-    let x = oracle::activations(2048, 0x1A60, 1.0);
+    let row_bytes = t.cols / Quant::A4.values_per_block() * Quant::A4.block_bytes();
+    let x = oracle::activations(t.cols, 0x1A60, 1.0);
     for rows in counts {
         common::run_checked(
             h,
             &Launch {
                 quant: Quant::A4,
                 rows,
-                cols: 2048,
+                cols: t.cols,
                 weights: &all[..rows * row_bytes],
                 x: &x,
                 y0: &common::sentinel_rows(rows),
@@ -112,25 +199,10 @@ pub fn a4_row_tail(h: &Harness<'_>, fix: &Fixture) -> Clause {
 /// The norm on load and the residual epilogue, with the fault inputs the
 /// Q4_K clause runs: a NaN input, an infinite one, a zero input with a zero
 /// epsilon, each raising the norm site and writing NaN rows.
-pub fn a4_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
+pub fn a4_norm(h: &Harness<'_>, fix: &Fixture, sites: &Sites) -> Clause {
     let eps = fix.rms_eps()?;
-    let cases = [
-        (
-            common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192),
-            Some("blk.0.attn_norm.weight"),
-        ),
-        (common::Tensor::a4("blk.0.ssm_out.weight", 4096, 2048), None),
-        (
-            common::Tensor::a4("blk.0.ffn_down_shexp.weight", 512, 2048),
-            None,
-        ),
-        (
-            common::Tensor::a4("output.weight", 2048, 4096),
-            Some("output_norm.weight"),
-        ),
-    ];
     let mut parts = Vec::new();
-    for (i, (t, gain_name)) in cases.iter().enumerate() {
+    for (i, (t, gain_name)) in sites.norm.iter().enumerate() {
         let gain = common::gain_for(fix, *gain_name, t.cols, 0x1AA1 + i as u64)?;
         let x = oracle::activations(t.cols, 0x1A40 + i as u64, 3.7);
         let worst = common::run_checked(
@@ -153,7 +225,7 @@ pub fn a4_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
         parts.push(format!("{} {worst:.3}", t.label()));
     }
 
-    let t = common::Tensor::a4("blk.0.ssm_out.weight", 4096, 2048);
+    let t = sites.norm[1].0;
     let gain = common::gain_for(fix, None, t.cols, 0x1AB0)?;
     // A zero input norms to zero with a positive epsilon: not a fault.
     common::run_checked(
@@ -210,12 +282,7 @@ pub fn a4_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     h.clear_fault()?;
 
     // The residual epilogue: the store's rows plus the output's own.
-    let tensors = [
-        common::Tensor::a4("blk.0.attn_qkv.weight", 2048, 8192),
-        common::Tensor::a4("blk.0.ssm_out.weight", 4096, 2048),
-        common::Tensor::a4("blk.0.ffn_down_shexp.weight", 512, 2048),
-    ];
-    for (i, t) in tensors.iter().enumerate() {
+    for (i, (t, _)) in sites.norm[..3].iter().enumerate() {
         let x = oracle::activations(t.cols, 0x1A50 + i as u64, 1.0);
         let resid = oracle::activations(t.rows, 0x1BE5 + i as u64, 2.0);
         let worst = common::run_checked(
@@ -238,28 +305,17 @@ pub fn a4_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
 
 /// Every segment of a segmented dispatch is the same bits as the same tensor
 /// run alone, in the Q4_K clause's layer shapes.
-pub fn a4_seg(h: &Harness<'_>, fix: &Fixture, layer_norm: &str) -> Clause {
+pub fn a4_seg(h: &Harness<'_>, fix: &Fixture, sites: &Sites) -> Clause {
     let eps = fix.rms_eps()?;
     let cols = 2048;
-    let groups = [
-        vec![
-            ("blk.1.attn_q.weight", 8192usize),
-            ("blk.1.attn_k.weight", 512),
-            ("blk.1.attn_v.weight", 512),
-        ],
-        vec![
-            ("blk.0.attn_qkv.weight", 8192),
-            ("blk.0.attn_gate.weight", 4096),
-        ],
-    ];
     let ty = gguf::quant::GgmlType::MLX_A4;
-    let gain = fix.f32s(layer_norm, cols)?;
+    let gain = fix.f32s(sites.seg_gain, cols)?;
     let mut parts = Vec::new();
-    for (i, tensors) in groups.iter().enumerate() {
+    for (i, tensors) in sites.seg.iter().enumerate() {
         let x = oracle::activations(cols, 0x1E86 + i as u64, 1.0);
         let mut segments: Vec<(usize, &[u8])> = Vec::new();
         let mut rows = 0usize;
-        for (name, n) in tensors {
+        for (name, n) in *tensors {
             segments.push((*n, fix.rows(name, ty, cols, *n)?));
             rows += n;
         }
@@ -392,8 +448,9 @@ pub fn a4_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
     clauses_experts::pair_faults(h, Quant::A4, &weights, &ffn_norm(fix)?)?;
     Ok(Verdict::Noted(format!(
         "worst error over its band: {worst}; ids -1 and the stack length raised expert_id, \
-         NaN in that slot only; the norm's fault inputs raised norm_quant, NaN in all nine \
-         slots' rows"
+         NaN in that slot only; the norm's fault inputs raised norm_quant, NaN in all {} \
+         slots' rows",
+        h.geom().experts.slots
     )))
 }
 
@@ -418,9 +475,10 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let eps = fix.rms_eps()?;
     let hidden = h.geom().hidden;
     let gain = fix.f32s("output_norm.weight", hidden)?;
+    let output_rows = fix.output_rows()?;
     let samples = [
         ("output.weight head", 0usize, 32usize, 0x1EAD_u64),
-        ("output.weight tail", OUTPUT_ROWS - 17, 17, 0x1EAE),
+        ("output.weight tail", output_rows - 17, 17, 0x1EAE),
     ];
     let mut worst = 0.0f64;
     let mut notes = Vec::new();
@@ -486,32 +544,65 @@ pub fn a4_embed(h: &Harness<'_>, fix: &Fixture) -> Clause {
     clauses_embed::embed(h, fix)
 }
 
-/// The clause table: one clause per entry, in the token's order.
+/// `clause` over the MLX split, or the reason it could not be opened: a clause
+/// run without the split is red, not skipped.
+fn with<'a>(
+    h: &'a Harness<'a>,
+    mlx: &'a Result<Fixture, String>,
+    clause: impl Fn(&Harness<'_>, &Fixture) -> Clause + 'a,
+) -> super::ClauseRun<'a> {
+    Box::new(move || match mlx {
+        Ok(fix) => clause(h, fix),
+        Err(e) => Err(e.clone()),
+    })
+}
+
+/// The clause table of the whole row: one clause per entry, in the token's order.
 pub fn table<'a>(
     h: &'a super::Harness<'a>,
     mlx: &'a Result<Fixture, String>,
 ) -> Vec<(&'static str, super::ClauseRun<'a>)> {
-    let with = |f: fn(&super::Harness<'_>, &Fixture) -> Clause| {
-        Box::new(move || match mlx {
-            Ok(fix) => f(h, fix),
-            Err(e) => Err(e.clone()),
-        }) as super::ClauseRun<'a>
-    };
+    let sites = &QWEN35_SITES;
     vec![
-        ("a4_matvec", with(a4_matvec)),
-        ("a4_row_tail", with(a4_row_tail)),
-        ("a4_norm", with(a4_norm)),
         (
-            "a4_seg",
-            Box::new(move || match mlx {
-                Ok(fix) => a4_seg(h, fix, "blk.1.attn_norm.weight"),
-                Err(e) => Err(e.clone()),
-            }),
+            "a4_matvec",
+            with(h, mlx, move |h, f| a4_matvec(h, f, sites)),
         ),
-        ("a4_headnorm", with(a4_headnorm)),
-        ("a4_pair", with(a4_pair)),
-        ("a4_fold", with(a4_fold)),
-        ("a4_head", with(a4_head)),
-        ("a4_embed", with(a4_embed)),
+        (
+            "a4_row_tail",
+            with(h, mlx, move |h, f| a4_row_tail(h, f, sites)),
+        ),
+        ("a4_norm", with(h, mlx, move |h, f| a4_norm(h, f, sites))),
+        ("a4_seg", with(h, mlx, move |h, f| a4_seg(h, f, sites))),
+        ("a4_headnorm", with(h, mlx, a4_headnorm)),
+        ("a4_pair", with(h, mlx, a4_pair)),
+        ("a4_fold", with(h, mlx, a4_fold)),
+        ("a4_head", with(h, mlx, a4_head)),
+        ("a4_embed", with(h, mlx, a4_embed)),
+    ]
+}
+
+/// The clauses of a row of no delta net: [`table`]'s but the head-normed
+/// residual, at that row's sites.
+pub fn shaped<'a>(
+    h: &'a super::Harness<'a>,
+    mlx: &'a Result<Fixture, String>,
+) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    let sites = &QWEN3_SITES;
+    vec![
+        (
+            "a4_matvec",
+            with(h, mlx, move |h, f| a4_matvec(h, f, sites)),
+        ),
+        (
+            "a4_row_tail",
+            with(h, mlx, move |h, f| a4_row_tail(h, f, sites)),
+        ),
+        ("a4_norm", with(h, mlx, move |h, f| a4_norm(h, f, sites))),
+        ("a4_seg", with(h, mlx, move |h, f| a4_seg(h, f, sites))),
+        ("a4_pair", with(h, mlx, a4_pair)),
+        ("a4_fold", with(h, mlx, a4_fold)),
+        ("a4_head", with(h, mlx, a4_head)),
+        ("a4_embed", with(h, mlx, a4_embed)),
     ]
 }
