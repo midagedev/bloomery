@@ -1405,7 +1405,7 @@ mod tests {
 
             let hp = Hparams::read(split).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!((hp.n_layer, hp.dense_lead, hp.n_vocab), (2, 1, 8));
-            assert_eq!(hp.sparse_attn, Some(vec![true, true]));
+            assert_eq!(hp.sparse_attn, [true, true]);
             assert_eq!(
                 (hp.kind(0).attn, hp.kind(0).ffn),
                 (Attn::Sparse, FfnKind::Dense)
@@ -1912,7 +1912,7 @@ mod tests {
         write_folder(&dir, &dims, Planes::Adjacent, untouched);
         let opened = folder::open(&dir).unwrap_or_else(|e| panic!("{e}"));
         let hp = Hparams::read(&opened.header).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(hp.sparse_attn, Some(vec![false, true]));
+        assert_eq!(hp.sparse_attn, [false, true]);
         assert_eq!(
             (hp.kind(0).attn, hp.kind(0).ffn),
             (Attn::Full, FfnKind::Dense)

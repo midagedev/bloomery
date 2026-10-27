@@ -8,7 +8,7 @@
 
 use gguf::{Split, Value};
 
-use super::roles::stems_of;
+use super::roles::{INDEXER, stems_of};
 use crate::arch::hybrid::layers_agree;
 use crate::arch::{
     dims_agree, finite_positive, meta_usize, metadata, n_vocab, noaux, optional_usize,
@@ -94,9 +94,9 @@ pub struct Hparams {
     pub n_ctx_train: usize,
     /// `leading_dense_block_count`: the layers before the first routed one.
     pub dense_lead: usize,
-    /// `attention.sparse_layers` when the file carries it, one entry a layer: true where attention
-    /// is sparse. Absent, [`Hparams::kind`] follows `dense_lead`.
-    pub sparse_attn: Option<Vec<bool>>,
+    /// One entry a layer: true where attention is sparse. `attention.sparse_layers` when the file
+    /// carries it, else the layers that carry their indexer tensors.
+    pub sparse_attn: Vec<bool>,
     /// `feed_forward_length`, the dense layers' width; `None` on a file with no dense layer.
     pub dense_ff: Option<usize>,
     /// The routed layers' router and experts.
@@ -214,7 +214,10 @@ impl Hparams {
                 format!("is {dense_lead} for {n_layer} layers; at least one layer must route"),
             ));
         }
-        let sparse_attn = read_sparse_layers(split, n_layer)?;
+        let sparse_attn = match read_sparse_layers(split, n_layer)? {
+            Some(flags) => flags,
+            None => indexed_layers(split, n_layer, dense_lead),
+        };
         let dense_ff = (dense_lead > 0)
             .then(|| positive(split, "feed_forward_length"))
             .transpose()?;
@@ -246,8 +249,7 @@ impl Hparams {
     }
 
     /// Layer `l`'s attention and feed-forward block. The feed-forward block is dense for
-    /// `l < dense_lead` and routed after it. Attention is sparse where `sparse_attn` says, and
-    /// where `l >= dense_lead` when the file carries no `attention.sparse_layers`.
+    /// `l < dense_lead` and routed after it. Attention is sparse where `sparse_attn` says.
     #[must_use]
     pub fn kind(&self, l: usize) -> Kind {
         assert!(
@@ -255,12 +257,12 @@ impl Hparams {
             "layer {l} past the file's {} layers",
             self.n_layer
         );
-        let sparse = match &self.sparse_attn {
-            Some(v) => v[l],
-            None => l >= self.dense_lead,
-        };
         Kind {
-            attn: if sparse { Attn::Sparse } else { Attn::Full },
+            attn: if self.sparse_attn[l] {
+                Attn::Sparse
+            } else {
+                Attn::Full
+            },
             ffn: if l < self.dense_lead {
                 FfnKind::Dense
             } else {
@@ -350,6 +352,23 @@ fn read_sparse_layers(split: &Split, n_layer: usize) -> Result<Option<Vec<bool>>
             "is not an array of one bool or u8 0 or 1 per layer",
         )),
     }
+}
+
+/// Which layers attend sparsely when the file carries no `attention.sparse_layers`: those that
+/// carry their indexer, as llama.cpp's loader decides it (a layer is sparse exactly when it has
+/// its indexer tensors). A routed layer always counts, so a file that lacks its indexer is refused
+/// by the missing tensor's name (`Hparams::tensors_agree`); a dense-block layer counts when it
+/// carries any of the four, so one with only some of them is refused by the name of the first it
+/// lacks.
+fn indexed_layers(split: &Split, n_layer: usize, dense_lead: usize) -> Vec<bool> {
+    (0..n_layer)
+        .map(|l| {
+            l >= dense_lead
+                || INDEXER
+                    .iter()
+                    .any(|s| split.find(&format!("blk.{l}.{}", s.name)).is_some())
+        })
+        .collect()
 }
 
 /// One `attention.sparse_layers` entry: a bool, or a u8 0 or 1.
@@ -749,7 +768,7 @@ pub(super) mod tests {
                 },
             ]
         );
-        assert!(hp.sparse_attn.is_none());
+        assert_eq!(hp.sparse_attn, [false, false, true, true, true]);
         assert!(hp.defaults.is_empty(), "{:?}", hp.defaults);
     }
 
@@ -767,6 +786,7 @@ pub(super) mod tests {
         hp.head_dim = 128;
         hp.rope.dims = 64;
         hp.dense_lead = 3;
+        hp.sparse_attn = (0..60).map(|l| l >= 3).collect();
         hp.dense_ff = Some(12288);
         hp.experts.n_expert = 128;
         hp.experts.n_used = 4;
@@ -965,9 +985,11 @@ pub(super) mod tests {
     }
 
     /// The file carries the three model-level tensors, a sparse layer needs its indexer, a dense
-    /// layer carries none, and neither carries the other kind's feed-forward block: the tensor set
-    /// must be exactly the kind's. Mutant: the indexer stems dropped from the sparse layers'
-    /// required set, or from the dense layers' banned set; the model-level names left unchecked.
+    /// layer carries none or, with `attention.sparse_layers` absent, all four (a part makes it
+    /// sparse, and the rest are missing), and neither carries the other kind's feed-forward block:
+    /// the tensor set must be exactly the kind's. Mutant: the indexer stems dropped from the sparse
+    /// layers' required set, or from the dense layers' banned set; the model-level names left
+    /// unchecked; a part of an indexer on a dense layer read as full attention.
     #[test]
     fn a_layers_tensors_must_be_its_kinds() {
         let without = |name: &str| -> Vec<(String, Vec<u64>)> {
@@ -1023,11 +1045,15 @@ pub(super) mod tests {
                 "blk.1.ffn_down.weight",
                 missing,
             ),
+            // PIN(2026-10-27): was `blk.1.indexer.q_norm.weight` misplaced on a dense layer. With the
+            // array absent, llama.cpp's loader makes a layer sparse exactly when it has its indexer
+            // tensors and refuses a layer with only some of the four, so the stray tensor makes
+            // layer 1 sparse and the first indexer tensor it lacks is named.
             (
-                "dense-indexer",
+                "dense-indexer-part",
                 plus("blk.1.indexer.q_norm.weight", vec![IDX_D]),
-                "blk.1.indexer.q_norm.weight",
-                misplaced,
+                "blk.1.indexer.q_proj.weight",
+                missing,
             ),
             (
                 "dense-routed",
@@ -1172,7 +1198,7 @@ pub(super) mod tests {
             (hp.n_layer, hp.dense_lead, hp.rope.base),
             (N, LEAD_F, 1.0e7)
         );
-        assert_eq!(hp.sparse_attn.as_deref(), Some(flags.as_slice()));
+        assert_eq!(hp.sparse_attn, flags);
         assert!(hp.defaults.is_empty(), "{:?}", hp.defaults);
         assert!(spec.mtp.is_empty());
         assert_eq!(spec.layers.len(), N);
@@ -1296,6 +1322,41 @@ pub(super) mod tests {
         ]);
     }
 
+    /// Without `attention.sparse_layers`, a layer attends sparsely exactly when the file carries its
+    /// indexer, as llama.cpp's loader decides it. The unkeyed file of MiniMax-M3.1-Flash (an
+    /// indexer on all 60 layers, three of them over a dense block) reads as its keyed twin does, and
+    /// a file whose dense-block layers differ reads per layer. Mutant: the absent array read as the
+    /// dense lead's rule, which refuses an indexer on a dense-block layer.
+    #[test]
+    fn an_unkeyed_file_attends_sparsely_where_it_carries_the_indexer() {
+        const N: usize = 60;
+        const LEAD_F: usize = 3;
+        let all = vec![true; N];
+        let t = tensors_shaped(N, LEAD_F, Some(&all));
+        let keyed = read("unkeyed-twin-keyed", &keys_shaped(N, LEAD_F, Some(all)), &t)
+            .expect("the keyed file reads");
+        let unkeyed = read("unkeyed-twin", &keys_shaped(N, LEAD_F, None), &t)
+            .expect("an indexer on every layer reads without the array");
+        assert_eq!(unkeyed, keyed);
+        assert!(unkeyed.sparse_attn.iter().all(|&s| s));
+
+        let per_layer = vec![true, false, true, true, true];
+        let t = tensors_shaped(LAYERS, LEAD, Some(&per_layer));
+        let hp = read("unkeyed-mixed", &keys(), &t)
+            .expect("a dense-block layer with an indexer beside one without reads");
+        assert_eq!(hp.sparse_attn, per_layer);
+        assert_eq!(
+            (0..LAYERS).map(|l| hp.kind(l).attn).collect::<Vec<_>>(),
+            [
+                Attn::Sparse,
+                Attn::Full,
+                Attn::Sparse,
+                Attn::Sparse,
+                Attn::Sparse
+            ]
+        );
+    }
+
     /// A full-attention layer over routed experts reads when the array says that layer is full, and
     /// the same tensors are refused when the array is absent. An array that restates the lead reads
     /// the lead's pairs. Mutant: the pair refused outright, or the absent array read as all-sparse.
@@ -1344,7 +1405,7 @@ pub(super) mod tests {
             &tensors(),
         )
         .expect("an array that restates the lead reads");
-        assert!(hp.sparse_attn.is_some());
+        assert_eq!(hp.sparse_attn, [false, false, true, true, true]);
         for l in 0..LAYERS {
             let want = if l < LEAD {
                 Kind {

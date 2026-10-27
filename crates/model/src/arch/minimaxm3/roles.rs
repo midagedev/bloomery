@@ -23,7 +23,7 @@ use crate::arch::stems::DENSE;
 use crate::arch::noaux::BLOCK as ROUTED;
 
 /// A sparse-attention layer's indexer.
-const INDEXER: &[Stem] = &[
+pub(super) const INDEXER: &[Stem] = &[
     req("indexer.q_proj.weight", Role::Attention),
     req("indexer.k_proj.weight", Role::Attention),
     req("indexer.q_norm.weight", Role::Attention),
