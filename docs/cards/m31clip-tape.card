@@ -1,0 +1,24 @@
+# The MiniMax-M3.1-Flash UD-Q2_K_XL (GGUF) clip's toktape tapes: two arms in one lease, `think` (no --no-think) and
+# `low` (--no-think, which the server sends as reasoning_effort low), the P4 prompt (the project's docs, ~5.6K
+# tokens), greedy, two discarded warm-ups, 1500 tokens each, a fresh load per arm of the unsloth file with both cards visible
+# (RTX A6000 + RTX 3090 at its 250 W cap), bloomery-serve --model minimaxm3 at the serving defaults (every BLOOMERY_*
+# lever unset, --place unset, --ctx-size 16384). The chat template has no thinking switch, so the model thinks and
+# the tape says so.
+# Bytes [derived from the plan print at --ctx-size 16384]: place bp, A6000 stage 1990 experts, 3090 tier 1259, host
+# 4047 (74.2 GB, 18.35 MB each, 55.5 % of the 7296 routed experts). The tape's figures are the clip's evidence, not a
+# measured table row; the terms below are predicted so the card reads against them.
+# Wall [derived], per arm: preheat of the 143.9 GB (page cache warm 15 s .. cold NVMe 26 s at the load's 5.5 GB/s) +
+# load 50..80 s (m31fix: 48.9 s at ctx 262144 with 1396 card experts; ctx 16384 uploads ~2x the card bytes) + warm-ups
+# ~10 s + the tape (TTFT 41..66 s, 1500 tokens at 21..26 tok/s = 58..71 s: 100..137 s) + stop ~15 s = 190..272 s;
+# two arms 380..544 s, plus the witnesses and the publish dry-runs ~25 s = 405..570 s. A gate item of another round
+# that is mid-run when the lease is taken adds at most its 910 s bound before the cards are idle.
+# The one term the derivation cannot fix: the host dot kernels' time per picked expert on the iq2_xs/iq3_xxs/iq4_xs
+# mix at a 512-row prompt unit. From the NVFP4 tape on the same plan family (98.3 tok/s at host share 75.5 %, i.e.
+# 74 tok/s x share) and the file's 55.5 % host share, P4 prefill is predicted 85..135 tok/s (x0.65..1.0 of the
+# 135 tok/s the share alone gives); decode at depth ~5.6K..6.2K is predicted 21..26 tok/s (m31fix's 19.1..20.9 tok/s
+# at ctx 262144, host share 80.9 %, scaled to 55.5 % with the card half and the bridge held at 10..20 ms).
+kind: exclusive
+reason: the user asked for an M3.1F GGUF clip on the tape site (2026-10-27); per-token times are the clip, so the box
+  must be quiet (a build or a load beside it moves them, and memory pressure re-reads the host experts); the file is
+  143.9 GB with 74 GB on the host, two fresh loads and three requests each
+minutes: 7..10
