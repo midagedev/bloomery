@@ -53,8 +53,8 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 | [Ornith-1.5-35B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), Q4_K_M | runs, text only: it has Qwen3.6's shapes, and its next-token layer is not read |
 | [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), Q4_K_M | runs on a build after 0.3.9, text only: its `mmproj` is not read. Release 0.3.9 refuses it: `qwen35moe arena: a vocabulary of 248144; the head reads 248320` |
 | [Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), Q4_K_M | not run on a Mac yet; it has Qwen3.6's shapes |
-| Qwen3.6 `UD-Q4_K_XL` | refused by name: it holds Q8_0 and Q5_K tensors, which the Metal kernels do not run. Planned next |
-| Qwen3-30B-A3B | refused by name: architecture `qwen3moe`. Planned next |
+| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
+| Qwen3.6 `UD-Q4_K_XL` | refused by name: it holds Q8_0, Q5_K and f32 tensors at sites a Metal session does not launch yet. Planned next |
 
 The mat-vec kernels run Q4_K, Q6_K and MLX 4-bit weights. The router and the shared-expert gate may be F32 or MLX 8-bit,
 which the open dequantizes. Any other type is refused when the file opens, and the error names the tensor. The evidence

@@ -50,9 +50,9 @@ tensor's name.
 | Ornith-1.5-35B, Q4_K_M | runs, text only, on v0.3.9's `crates/metal` too. It has Qwen3.6's shapes and a next-token layer beyond the trunk; the open reads the trunk's layers only (`crates/model/src/arch/qwen35moe/spec.rs:9`) | PR #805's comment: rc 0 at the base and with the change |
 | Sage-A1.5, Q4_K_M | not run on Metal in the sources of this page `[unverified]`. Its file has Qwen3.6's shapes, plans the same weight bytes (`--plan` on the CUDA path) and carries a next-token layer too ([`../models.md`](../models.md)), so it is expected to open as Ornith does | none yet |
 | Qwen3.6 `UD-Q4_K_XL` | refused by name today: its tensors of type Q8_0 and Q5_K are not types of the list above | the refusal sites above; PR #806's body (a `--plan` of a header cut: 350 items, every Q8_0, Q5_K and F32 site) |
-| Qwen3-30B-A3B | refused by name today: architecture `qwen3moe` | PR #806's body (a `--plan` of a header cut: refused at the architecture) |
+| Qwen3-30B-A3B-Instruct-2507, Q4_K_M | runs, text only (`qwen3moe`: attention layers only, no shared expert). `lab-metal-e2e` runs its fixture row against ik's reference sets | PR #856: the fixture row; on an M1 Pro (32 GB) the real file's prompt pass and stepped run give the same 32 greedy ids |
 
-The two refused files are the next two to open; the design is [`../research/metal-all-models.md`](../research/metal-all-models.md) (PR #802).
+The refused file is the next to open; the design is [`../research/metal-all-models.md`](../research/metal-all-models.md) (PR #802).
 
 The one rate in PR #805's comment: an Apple M1 Pro with 32 GB, macOS 27.0.1, `generate_metal --prompt "The capital of
 France is" -n 32`, greedy, with a download running on the same Mac. MiniCPM-V and Ornith each decoded at 43.4 tok/s.
