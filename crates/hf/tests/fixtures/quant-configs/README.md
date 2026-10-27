@@ -23,6 +23,7 @@ Bolt's two files list 27,921 modules (15 MB); they are cut to the first module o
 
 | `mlx-community/Qwen3.6-35B-A3B-4bit` | (the folder on the M4 Pro; no revision recorded) | MLX affine 4-bit g64, 8-bit router and shared-expert gates |
 | `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` | `e9675aa3ca5f900ccef55267914466d55ab325fa` | MLX affine 4-bit g64, the `quantization` block names no `mode`, 8-bit routers |
+| `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | `6e302ea604ad9ab206367e2c501d1571023e7b6d` | MLX affine 4-bit g64, the `quantization` block names no `mode`, 8-bit routers; its config names `qkv_bias`, `use_qk_norm` and `shared_expert_intermediate_size` |
 
 `bloomery__qwen3moe-mlx-fixture__config.json.gz` is the `config.json` of the MLX-format fixture folder `tools/mlx-fixture.py make` writes from the qwen3moe GGUF fixture (the Qwen3-30B-A3B config above cut to four layers and their quantization entries, no `mode` key), unchanged.
 

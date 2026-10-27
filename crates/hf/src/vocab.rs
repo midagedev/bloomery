@@ -275,6 +275,7 @@ const GENERATION: &Fields = &[
     ("temperature", Ignore(Type::Number, SAMPLING)),
     ("top_k", Ignore(Type::Number, SAMPLING)),
     ("top_p", Ignore(Type::Number, SAMPLING)),
+    ("repetition_penalty", Ignore(Type::Number, SAMPLING)),
     (
         "transformers_version",
         Ignore(
@@ -1082,6 +1083,7 @@ mod tests {
             ["generation_config.json", "", "temperature", 1.0, "hot"],
             ["generation_config.json", "", "top_k", 20, "20"],
             ["generation_config.json", "", "top_p", 0.95, [0.95]],
+            ["generation_config.json", "", "repetition_penalty", 1.05, "high"],
             ["generation_config.json", "", "transformers_version", "4.46.1", 4]
         ]"###)
         .unwrap();

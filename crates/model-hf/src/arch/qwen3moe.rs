@@ -31,7 +31,8 @@ const ROOT: &Fields = &[
     ("model_type", Need(r#"["qwen3_moe"]"#)),
     ("quantization", Read),
     ("quantization_config", Read),
-    // The dense feed-forward width: GGUF keeps it, and no layer is dense.
+    // The dense feed-forward width: the header keeps it as `feed_forward_length`, and no layer is
+    // dense, so no layer reads it.
     ("intermediate_size", Read),
     ("rope_theta", Read),
     // Every layer routes: HF's default is every layer, and no layer is listed dense.
@@ -39,6 +40,12 @@ const ROOT: &Fields = &[
     ("mlp_only_layers", Only("[[]]")),
     // The program renormalizes the chosen experts' weights, which HF's default does not.
     ("norm_topk_prob", Need("[true]")),
+    // No bias on the query, key or value projections, the per-head norms on the query and the key
+    // are applied on every layer, and there is no shared expert: the values the program computes
+    // with, which a Coder config spells out as keys.
+    ("qkv_bias", Only("[false]")),
+    ("use_qk_norm", Only("[true]")),
+    ("shared_expert_intermediate_size", Only("[0]")),
     // Attention is full and its rope is unscaled.
     ("rope_scaling", Only("[null]")),
     ("sliding_window", Only("[null]")),
@@ -375,14 +382,13 @@ mod tests {
         assert_eq!(Json::Object(keys_of(&checkpoint)), Json::Object(want));
     }
 
-    /// The real checkpoint's config and every tensor header of mlx-community's
-    /// Qwen3-30B-A3B-Instruct-2507-4bit (1,351 tensors) plan the file's 579 tensors at the
+    /// A real 30B-A3B folder's config, with the tensor header both folders store (1,351 tensors:
+    /// Coder's names, dtypes and shapes are the 2507's), plans the file's 579 tensors at the
     /// ggml dims of the model, MLX_A4 for the linears and the embedding and head, MLX_A8 for the
-    /// routers, F32 for the norms, with no move.
-    #[test]
-    fn the_real_qwen3_30b_headers_plan_the_whole_file() {
-        let real =
-            json("quant-configs/mlx-community__Qwen3-30B-A3B-Instruct-2507-4bit__config.json.gz");
+    /// routers, F32 for the norms, with no move. `dense_ff` is the config's `intermediate_size`,
+    /// the header's `feed_forward_length`.
+    fn assert_real_30b_plans(config: &str, dense_ff: u32) {
+        let real = json(config);
         let header =
             json("checkpoint-headers/qwen3-30b-a3b-instruct-2507-mlx-4bit.tensors.json.gz");
         let entries = entries(&header);
@@ -461,7 +467,7 @@ mod tests {
             ("attention.value_length", json!(["U32", 128])),
             ("expert_count", json!(["U32", 128])),
             ("expert_feed_forward_length", json!(["U32", 768])),
-            ("feed_forward_length", json!(["U32", 6144])),
+            ("feed_forward_length", json!(["U32", dense_ff])),
         ]
         .into_iter()
         .map(|(k, v)| (format!("{ARCHITECTURE}.{k}"), v))
@@ -469,9 +475,30 @@ mod tests {
         assert_eq!(Json::Object(keys_of(&checkpoint)), Json::Object(want));
     }
 
+    /// mlx-community's Qwen3-30B-A3B-Instruct-2507-4bit plans the whole file.
+    #[test]
+    fn the_real_qwen3_30b_headers_plan_the_whole_file() {
+        assert_real_30b_plans(
+            "quant-configs/mlx-community__Qwen3-30B-A3B-Instruct-2507-4bit__config.json.gz",
+            6144,
+        );
+    }
+
+    /// mlx-community's Qwen3-Coder-30B-A3B-Instruct-4bit plans the whole file: its config names
+    /// `qkv_bias`, `use_qk_norm` and `shared_expert_intermediate_size` at the values the map
+    /// computes, and a dense width of 5472.
+    #[test]
+    fn the_real_qwen3_coder_headers_plan_the_whole_file() {
+        assert_real_30b_plans(
+            "quant-configs/mlx-community__Qwen3-Coder-30B-A3B-Instruct-4bit__config.json.gz",
+            5472,
+        );
+    }
+
     /// The config refuses, by key, a model the program does not run as written: a dense layer, a
-    /// sliding window, a scaled rope, HF's un-renormalized routing, an unnamed key, heads that do
-    /// not group, more experts kept than routed over, and a missing count.
+    /// sliding window, a scaled rope, HF's un-renormalized routing, a bias on the attention, no
+    /// norm on the query and key, a shared expert, an unnamed key, heads that do not group, more
+    /// experts kept than routed over, and a missing count.
     #[test]
     fn the_config_refuses_what_it_does_not_read_by_name() {
         let base = json("quant-configs/bloomery__qwen3moe-mlx-fixture__config.json.gz");
@@ -497,6 +524,23 @@ mod tests {
                 c.insert(key.to_string(), value.clone());
             });
             assert!(e.contains(key), "{key}: {e}");
+        }
+        // Keys Coder's config names: a value other than the one the map computes is refused as
+        // unsupported, not as an unknown key.
+        for (key, value, supported) in [
+            ("qkv_bias", json!(true), "[false]"),
+            ("use_qk_norm", json!(false), "[true]"),
+            ("shared_expert_intermediate_size", json!(512), "[0]"),
+        ] {
+            let e = refuse(&|c| {
+                c.insert(key.to_string(), value.clone());
+            });
+            assert!(
+                e.contains(&format!(
+                    "config.json.{key} {value} is unsupported; supported: {supported}"
+                )),
+                "{key}: {e}"
+            );
         }
         let e = refuse(&|c| {
             c.insert("num_attention_heads".into(), json!(33));
@@ -752,6 +796,43 @@ mod tests {
                 "expert {expert} row {row}"
             );
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A folder whose files name no BOS id (Qwen3-Coder's) opens as a qwen3moe file whose split
+    /// carries no BOS key and whose tokenizer adds none; the same folder with `add_bos_token` set
+    /// is refused by the missing key.
+    #[test]
+    fn a_folder_that_names_no_bos_opens_without_a_bos_key() {
+        let dir = temp_dir("qwen3moe-no-bos");
+        crate::test_support::small_qwen3_folder(&dir);
+        let path = dir.join("config.json");
+        let mut config: Json = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            config
+                .as_object_mut()
+                .unwrap()
+                .remove("bos_token_id")
+                .is_some()
+        );
+        std::fs::write(&path, config.to_string()).unwrap();
+        let opened = crate::folder::open(&dir).unwrap();
+        assert_eq!(opened.header.value("tokenizer.ggml.bos_token_id"), None);
+        assert_eq!(
+            opened.header.value("tokenizer.ggml.add_bos_token"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(opened.tokenizer.specials().bos, None);
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"add_bos_token": true}"#,
+        )
+        .unwrap();
+        let e = crate::folder::open(&dir)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(e.contains("tokenizer.ggml.bos_token_id"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
