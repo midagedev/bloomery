@@ -33,8 +33,8 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
   cannot hold the host's share either, Qwen3.8, GLM-5.3-Flash and DeepSeek-V4.1-Flash page the rest from NVMe.
 - **Checkpoint folders as downloaded.** MiniMax-M3.1-Flash loads from its vendor's NVFP4 safetensors folder, and
   Qwen3.8 from its NVFP4 or FP4-Local folder, with no conversion and no requant. Everything else loads from GGUF.
-- **Apple Silicon.** A Metal backend serves Qwen3.6-35B-A3B (Q4_K_M, `UD-Q4_K_XL`, or an MLX 4-bit checkpoint) and
-  Qwen3-30B-A3B (Q4_K_M) on a Mac GPU, and runs Ornith-1.5-35B and MiniCPM-V 4.7 35B-A3B (Q4_K_M, text only); prompts run
+- **Apple Silicon.** A Metal backend serves Qwen3.6-35B-A3B and Qwen3-30B-A3B on a Mac GPU, from mlx-community's 4-bit
+  folders as downloaded or from Q4_K_M GGUF files (Qwen3.6 also from `UD-Q4_K_XL`), and runs Ornith-1.5-35B and MiniCPM-V 4.7 35B-A3B (Q4_K_M, text only); prompts run
   in batched passes, and a follow-up turn reads only its new messages ([below](#apple-silicon)).
 - **llama-server compatible.** The same HTTP API (OpenAI and Anthropic), GGUF files and flag spellings, including the
   placement flags (`-dev`, `-ts`, `-ngl`, `--cpu-moe`, `-ot`, `--fit`) with llama's meaning. Your client works
@@ -96,21 +96,23 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 
 ### Apple Silicon
 
-macOS 26.2 or newer; the binaries are signed and notarized. Two architectures run: `qwen35moe` and `qwen3moe`.
-Qwen3.6-35B-A3B runs from a Q4_K_M or `UD-Q4_K_XL` GGUF, or from an MLX 4-bit folder that `bloomery-prepare` converts
-once. Qwen3-30B-A3B-Instruct-2507 runs from its Q4_K_M GGUF. Two more Q4_K_M files with Qwen3.6's shapes run, text only:
-Ornith-1.5-35B, and MiniCPM-V 4.7 35B-A3B (its `mmproj` is not read). Sage-A1.5 has the same shapes and has not been run
-on a Mac yet. A file the Metal backend cannot run is refused by name when it opens. A file whose shapes the kernels take
-but no build has registered compiles its kernels when it opens, and the server says that no gate checked that shape.
+macOS 26.2 or newer; the binaries are signed and notarized. Two architectures run: `qwen35moe` and `qwen3moe`. On a
+build after 0.3.10, an mlx-community 4-bit folder opens as downloaded (`--hf mlx-community/<repo>` or `-m <folder>`):
+Qwen3.6-35B-A3B and Qwen3-30B-A3B-Instruct-2507. 0.3.10 converts the Qwen3.6 folder once with `bloomery-prepare`, which
+still writes one GGUF split for those who want one file. Both models also run from their Q4_K_M GGUF, and Qwen3.6 from
+`UD-Q4_K_XL`. Two more Q4_K_M files with Qwen3.6's shapes run, text only: Ornith-1.5-35B, and MiniCPM-V 4.7 35B-A3B (its
+`mmproj` is not read). Sage-A1.5 has the same shapes and has not been run on a Mac yet. A file the Metal backend cannot
+run is refused by name when it opens. A file whose shapes the kernels take but no build has registered compiles its
+kernels when it opens, and the server says that no gate checked that shape.
 
 ```sh
 # Homebrew, or the same installer as on Linux (bloomery-0.3.10-macos-arm64-metal.tar.gz on the releases page)
 brew install midagedev/tap/bloomery
 curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
 
+bloomery-serve-metal --hf mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit --port 8080   # after 0.3.10: fetched once
+bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-4bit --port 8080                         # after 0.3.10: a folder on disk
 bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf --port 8080
-bloomery-prepare PATH/Qwen3.6-35B-A3B-4bit OUT/qwen36-mlx4             # mlx-community's folder, once
-bloomery-serve-metal -m OUT/qwen36-mlx4-00001-of-00001.gguf --port 8080
 ```
 
 On an M4 Pro 48 GB (development loop, three rounds, tok/s): decode 101.2 and a 4,096-id prompt at 1,076.5 on the MLX
@@ -316,7 +318,7 @@ start screen), [@Burntgogi](https://github.com/Burntgogi) (the common owners eve
 | [`docs/serving.md`](docs/serving.md) | llama-server compatibility, flags, seats, concurrent requests, limits |
 | [`docs/models.md`](docs/models.md) | Recommended files and what each model needs |
 | [`docs/performance.md`](docs/performance.md) | Number conditions, why it is fast, verification, recorded sessions |
-| [`docs/mac.md`](docs/mac.md) | Apple Silicon: build, convert an MLX folder, serve, limits |
+| [`docs/mac.md`](docs/mac.md) | Apple Silicon: build, open an MLX folder, serve, limits |
 | [`docs/BUILD.md`](docs/BUILD.md), [`docs/cuda-oxide.md`](docs/cuda-oxide.md) | Building from source; the kernels in Rust |
 | [`docs/upstream/`](docs/upstream/) | The toolchain-defect ledger; our upstream pull-request drafts are in [rig-log](https://github.com/midagedev/rig-log/tree/main/docs/bloomery/upstream) |
 | [`docs/README.md`](docs/README.md) | Every other page and the design records |
