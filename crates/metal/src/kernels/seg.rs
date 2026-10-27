@@ -135,8 +135,8 @@ fn check(
     }
 
     // The weights: the buffer holds every segment's blocks, and the kernels
-    // read them as 16-bit words. A segment's rows are `rows` rows of
-    // `nblocks` blocks each.
+    // read them as 16-bit words (F32's as `float4`s). A segment's rows are
+    // `rows` rows of `nblocks` blocks each.
     let mut weight_end = 0usize;
     for s in p.segments {
         let span = super::weight_bytes(p.quant, s.rows, nblocks)
@@ -160,7 +160,7 @@ fn check(
     check_window_len(WHAT, "y", p.y.len(), out_end)?;
 
     let start = p.weights.byte_range()?.start.get();
-    super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
+    super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
 
     // The threadgroups: every segment's own, so a segment's rows are the rows
     // a launch of that segment alone would write.
@@ -217,14 +217,14 @@ impl Kernels {
     ) -> Result<(), DeviceError> {
         let shape = check(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes(args_words(&shape, p.norm.layer, p.norm.eps));
-        let family = match p.quant {
-            Quant::Q4K => &self.q4k,
-            Quant::Q6K => &self.q6k,
-            Quant::A4 => &self.a4,
-            Quant::Q8_0 => &self.q8_0,
-            Quant::Q5K => &self.q5k,
+        let pipeline = match p.quant {
+            Quant::F32 => &self.f32_seg,
+            dense => self
+                .dense_family(dense)
+                .expect("a type but F32 has a mat-vec family")
+                .seg(),
         };
-        encoder.set_pipeline(family.seg());
+        encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.x)?)?;

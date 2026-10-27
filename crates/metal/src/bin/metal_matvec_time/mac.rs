@@ -871,6 +871,7 @@ fn time_pair(
                     encoder,
                     PairParams {
                         quant,
+                        shared_quant: quant,
                         slots: EXPERT_SLOTS,
                         k: EXPERT_K,
                         cols,

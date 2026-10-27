@@ -41,9 +41,9 @@ use bloomery_metal::MetalBuffer;
 use bloomery_metal::geom::Geometry;
 use bloomery_metal::instance::REGISTERED;
 use bloomery_metal::kernels::{
-    CombineParams, F32GemmParams, HeadNormRowsParams, Kernels, Operand, PARTIALS_PER_HEAD, Quant,
-    ROUTE_TILE, RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, route_table_words,
-    route_tiles,
+    APART_DOWN, APART_GATE_UP, CombineParams, F32GemmParams, HeadNormRowsParams, Kernels, Operand,
+    PARTIALS_PER_HEAD, Quant, ROUTE_TILE, RouteSelectParams, RouteTableParams, RoutedKind,
+    RoutedParams, route_table_words, route_tiles,
 };
 use bloomery_metal::library::{GemmPath, Library, sources_of};
 use gguf::quant::GgmlType;
@@ -539,6 +539,12 @@ struct Experts {
     /// The down stack's type: the pair's, or the type of a layer whose down
     /// is wider.
     down_quant: Quant,
+    /// The type of the shared gate and up: the stacks', or the second of a
+    /// pair of the gate-up table.
+    shared_quant: Quant,
+    /// The type of the shared down: the down stack's, or the second of a
+    /// pair of the down table.
+    shared_down_quant: Quant,
     dims: Dims,
     gate: Vec<u8>,
     up: Vec<u8>,
@@ -583,6 +589,8 @@ fn experts_of(d: Dims, fix: &Fixture, quant: Quant) -> Result<Experts, String> {
     Ok(Experts {
         quant,
         down_quant: quant,
+        shared_quant: quant,
+        shared_down_quant: quant,
         dims: d,
         gate: stack(
             d.experts,
@@ -625,6 +633,7 @@ fn q6_down_experts(d: Dims, fix: &Fixture) -> Result<Experts, String> {
     let layer = fix.first_layer_of("ffn_down_exps.weight", GgmlType::Q6_K)?;
     Ok(Experts {
         down_quant: Quant::Q6K,
+        shared_down_quant: Quant::Q6K,
         down: stack(
             d.experts,
             fix,
@@ -651,6 +660,8 @@ fn synthetic_experts(d: Dims, quant: Quant, seed: u64) -> Experts {
     Experts {
         quant,
         down_quant: quant,
+        shared_quant: quant,
+        shared_down_quant: quant,
         dims: d,
         gate: synthetic::matrix(quant, d.experts * d.expert_k, d.k, seed),
         up: synthetic::matrix(quant, d.experts * d.expert_k, d.k, seed + 1),
@@ -799,6 +810,7 @@ fn grouped_launch(
             encoder,
             RoutedParams {
                 quant: ex.quant,
+                shared_quant: ex.shared_quant,
                 kind: RoutedKind::Pair,
                 operand,
                 cols: d.k,
@@ -837,6 +849,7 @@ fn grouped_launch(
             encoder,
             RoutedParams {
                 quant: ex.down_quant,
+                shared_quant: ex.shared_down_quant,
                 kind: RoutedKind::Plain,
                 operand,
                 cols: d.expert_k,
@@ -922,6 +935,9 @@ fn check_grouped(
     let slots = sc.rows * d.per_row;
     let (f_pair, ops_pair) = gemm_band(ex.quant, d.k, operand, path);
     let (f_down, ops_down) = gemm_band(ex.down_quant, d.expert_k, operand, path);
+    // The shared group's tiles run in the shared types.
+    let (f_pair_sh, ops_pair_sh) = gemm_band(ex.shared_quant, d.k, operand, path);
+    let (f_down_sh, ops_down_sh) = gemm_band(ex.shared_down_quant, d.expert_k, operand, path);
     // The f32 arm has no cast, so no subnormal term; its band is the dense
     // GEMM's own (`gemm_band`), and the subnormal terms are the f16 arm's.
     let sub = match operand {
@@ -934,6 +950,14 @@ fn check_grouped(
     };
     let mut abs_down = AbsSums {
         quant: ex.down_quant,
+        cache: HashMap::new(),
+    };
+    let mut abs_sh = AbsSums {
+        quant: ex.shared_quant,
+        cache: HashMap::new(),
+    };
+    let mut abs_down_sh = AbsSums {
+        quant: ex.shared_down_quant,
         cache: HashMap::new(),
     };
     let mut worst_pair = 0f64;
@@ -950,10 +974,17 @@ fn check_grouped(
             .map(|&v| f64::from(v))
             .collect();
         let x_abs: f64 = x.iter().map(|v| v.abs()).sum();
+        let shared = e == d.experts;
+        let (pair_quant, f_pair, ops_pair) = if shared {
+            (ex.shared_quant, f_pair_sh, ops_pair_sh)
+        } else {
+            (ex.quant, f_pair, ops_pair)
+        };
+        let abs = if shared { &mut abs_sh } else { &mut abs };
         let gate = ex.of(&ex.gate, &ex.shared_gate, e);
         let up = ex.of(&ex.up, &ex.shared_up, e);
-        let rg = oracle::reference(ex.quant, gate, d.expert_k, d.k, &x)?;
-        let ru = oracle::reference(ex.quant, up, d.expert_k, d.k, &x)?;
+        let rg = oracle::reference(pair_quant, gate, d.expert_k, d.k, &x)?;
+        let ru = oracle::reference(pair_quant, up, d.expert_k, d.k, &x)?;
         let wg = abs.of(0, e, gate, d.expert_k, d.k)?.to_vec();
         let wu = abs.of(1, e, up, d.expert_k, d.k)?.to_vec();
         let w = f64::from(sc.route_w[s]);
@@ -983,8 +1014,18 @@ fn check_grouped(
             .map(|&v| f64::from(v))
             .collect();
         let h_abs: f64 = hx.iter().map(|v| v.abs()).sum();
+        let (down_quant, f_down, ops_down) = if shared {
+            (ex.shared_down_quant, f_down_sh, ops_down_sh)
+        } else {
+            (ex.down_quant, f_down, ops_down)
+        };
+        let abs_down = if shared {
+            &mut abs_down_sh
+        } else {
+            &mut abs_down
+        };
         let down = ex.of(&ex.down, &ex.shared_down, e);
-        let rd = oracle::reference(ex.down_quant, down, d.k, d.expert_k, &hx)?;
+        let rd = oracle::reference(down_quant, down, d.k, d.expert_k, &hx)?;
         let wd = abs_down.of(2, e, down, d.k, d.expert_k)?.to_vec();
         for (n, &wd_n) in wd.iter().enumerate().take(d.k) {
             let width = dot_width(f_down, ops_down, sub, rd.magnitude[n], h_abs, wd_n);
@@ -1064,6 +1105,58 @@ fn grouped_quant(h: &Harness<'_>, ex: &Experts, operands: &[Operand]) -> Result<
     Ok(parts.join(", "))
 }
 
+/// A stack of `quant` gate and up and `down_quant` down beside a shared expert
+/// of `shared_quant` and `shared_down_quant`, from synthetic rows: each
+/// tensor its own seed.
+fn synthetic_apart_experts(
+    d: Dims,
+    (quant, shared_quant): (Quant, Quant),
+    (down_quant, shared_down_quant): (Quant, Quant),
+    seed: u64,
+) -> Experts {
+    Experts {
+        quant,
+        down_quant,
+        shared_quant,
+        shared_down_quant,
+        dims: d,
+        gate: synthetic::matrix(quant, d.experts * d.expert_k, d.k, seed),
+        up: synthetic::matrix(quant, d.experts * d.expert_k, d.k, seed + 1),
+        down: synthetic::matrix(down_quant, d.experts * d.k, d.expert_k, seed + 2),
+        shared_gate: synthetic::matrix(shared_quant, d.expert_k, d.k, seed + 3),
+        shared_up: synthetic::matrix(shared_quant, d.expert_k, d.k, seed + 4),
+        shared_down: synthetic::matrix(shared_down_quant, d.k, d.expert_k, seed + 5),
+    }
+}
+
+/// The grouped GEMM over a shared expert of another type than its stacks:
+/// every pair of the gate-up table with a pair of the down table, so each
+/// tile of each table runs, every arm of [`grouped_arms`] (the shared group's
+/// places held to the shared type's band).
+pub fn grouped_apart(h: &Harness<'_>) -> Clause {
+    let d = Dims::of(h);
+    if d.shared != 1 {
+        return Err("the Apart tiles need a router with a shared row".to_string());
+    }
+    let mut names = Vec::new();
+    for (i, (&pair, &down)) in APART_GATE_UP.iter().zip(&APART_DOWN).enumerate() {
+        let name = format!(
+            "{}|{} pair with {}|{} down",
+            pair.0.name(),
+            pair.1.name(),
+            down.0.name(),
+            down.1.name()
+        );
+        let ex = synthetic_apart_experts(d, pair, down, 0x6C00 + 16 * i as u64);
+        grouped_arms(h, &ex).map_err(|e| format!("{name}: {e}"))?;
+        names.push(name);
+    }
+    Ok(Verdict::Noted(format!(
+        "every grouped arm over {}",
+        names.join(", ")
+    )))
+}
+
 /// The pair and the down over the table's tiles are the oracle's, for every
 /// (row, slot), the shared expert's group (when the router has one) and a
 /// group of two tiles included. `a4` is the MLX fixture of the A4 family, for
@@ -1109,6 +1202,8 @@ fn q6k_experts(d: Dims, fix: &Fixture) -> Result<Experts, String> {
     Ok(Experts {
         quant: Quant::Q6K,
         down_quant: Quant::Q6K,
+        shared_quant: Quant::Q6K,
+        shared_down_quant: Quant::Q6K,
         dims: d,
         gate: cycled(0, d.experts * d.expert_k),
         up: cycled(qkv_rows / 2, d.experts * d.expert_k),
@@ -1984,6 +2079,7 @@ pub fn route_refusals(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
                     &mut enc,
                     RoutedParams {
                         quant: Quant::Q4K,
+                        shared_quant: Quant::Q4K,
                         kind,
                         operand: Operand::F16,
                         cols: d.k,

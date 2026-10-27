@@ -53,6 +53,8 @@ use gguf::Split;
 
 #[path = "clauses_a4.rs"]
 mod clauses_a4;
+#[path = "clauses_apart.rs"]
+mod clauses_apart;
 #[path = "clauses_attention.rs"]
 mod clauses_attention;
 #[path = "clauses_delta.rs"]
@@ -61,6 +63,8 @@ mod clauses_delta;
 mod clauses_embed;
 #[path = "clauses_experts.rs"]
 mod clauses_experts;
+#[path = "clauses_f32.rs"]
+mod clauses_f32;
 #[path = "clauses_gemm.rs"]
 mod clauses_gemm;
 #[path = "clauses_head.rs"]
@@ -121,6 +125,9 @@ pub const SENTINEL_BITS: u32 = 0x7FC0_DEAD;
 /// larger than the kernel needs), poisoned with 0xFF: a read through the
 /// wrong offset reads NaN scales.
 const WEIGHT_PAD: usize = 66;
+/// The weights' pad for a type whose kernel loads `float4`: the next
+/// 16-byte boundary past the same odd-looking offset.
+const FLOAT4_WEIGHT_PAD: usize = 80;
 const WEIGHT_TAIL: usize = 258;
 /// Values the activation and gain buffers hold before their windows.
 const VALUE_PAD: usize = 5;
@@ -304,7 +311,12 @@ impl Harness<'_> {
         }
         let weight_bytes = weights.len();
         let rows = out_offset;
-        let weights = padded(0xFFu8, WEIGHT_PAD, &weights, WEIGHT_TAIL);
+        let pad = if launch.quant == Quant::F32 {
+            FLOAT4_WEIGHT_PAD
+        } else {
+            WEIGHT_PAD
+        };
+        let weights = padded(0xFFu8, pad, &weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
         let x = padded(sentinel, VALUE_PAD, launch.x, 1);
         let x = device.upload(stream, &x).map_err(why)?;
@@ -317,7 +329,7 @@ impl Harness<'_> {
             quant: launch.quant,
             segments: &segments,
             weights: weights
-                .window(Elems(WEIGHT_PAD), Elems(weight_bytes))
+                .window(Elems(pad), Elems(weight_bytes))
                 .map_err(why)?,
             x: x.window(Elems(VALUE_PAD), Elems(launch.cols))
                 .map_err(why)?,
@@ -912,11 +924,16 @@ fn clause_table<'a>(
             .chain(clauses_a4::table(ctx.harness, mlx))
             .chain(clauses_q8_0::table(ctx.harness))
             .chain(clauses_q5k::table(ctx.harness))
+            .chain(std::iter::once((
+                "f32_seg",
+                Box::new(|| clauses_f32::f32_seg(ctx.harness)) as ClauseRun,
+            )))
             .chain(clauses_sites::table(ctx.harness))
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
             .chain(clauses_delta::table(ctx))
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))
+            .chain(clauses_apart::table(ctx))
             .chain(clauses_attention::table(ctx))
             .chain(clauses_head::table(ctx))
             .chain(clauses_rows::table(ctx))

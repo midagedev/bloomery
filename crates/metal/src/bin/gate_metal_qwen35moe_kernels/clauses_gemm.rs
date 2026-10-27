@@ -278,6 +278,7 @@ pub(super) fn gemm_band(
         Quant::Q4K | Quant::Q5K => 4,
         Quant::Q6K | Quant::A4 => 2,
         Quant::Q8_0 => 1,
+        Quant::F32 => panic!("F32 has no dense GEMM: its rows run as the router's f32 GEMM"),
     };
     let acc = match path {
         GemmPath::Simdgroup => cols / 8 + 8,

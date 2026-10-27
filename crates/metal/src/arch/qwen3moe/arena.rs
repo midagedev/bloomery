@@ -133,9 +133,14 @@ pub(super) enum MixerBufs {
     Attention(AttnBufs),
 }
 
-/// A shared expert's router row and weights.
+/// A shared expert's router row and weights, each of the type the launches
+/// read it in: its stacks', or a pair of the experts' `Apart` tables.
 pub(super) struct SharedBufs {
     pub(super) gate_inp: MetalBuffer<f32>,
+    /// The type of the gate and the up.
+    pub(super) gate_up_quant: Quant,
+    /// The type of the down.
+    pub(super) down_quant: Quant,
     pub(super) gate: MetalBuffer<u8>,
     pub(super) up: MetalBuffer<u8>,
     pub(super) down: MetalBuffer<u8>,
@@ -813,6 +818,8 @@ fn ffn(
             .map(|s| {
                 Ok::<_, SessionError>(SharedBufs {
                     gate_inp: load.values(&s.gate_inp)?,
+                    gate_up_quant: s.gate.quant,
+                    down_quant: s.down.quant,
                     gate: load.site(&s.gate)?,
                     up: load.site(&s.up)?,
                     down: load.site(&s.down)?,
@@ -832,13 +839,14 @@ mod tests {
     use chain::arch::qwen3moe::plan::SiteTy;
     use chain::site::BACKEND_SITES;
 
-    use crate::arch::qwen3moe::session::LAUNCHED;
+    use crate::arch::qwen3moe::session::{LAUNCHED, PROJECTED};
     use crate::kernels::Quant;
 
-    /// The session's site list and the mat-vecs' quant set name the same
+    /// The session's site lists and the mat-vecs' quant set name the same
     /// families, over the card's families and the backends' rows: a family
     /// the plan admits has a launch, and a launch the plan never admits is
-    /// dead.
+    /// dead. A projection may be any type with a launch, the rest only the
+    /// types with every launch.
     #[test]
     fn launched_sites_are_the_arena_quants() {
         let families = SiteTy::ALL
@@ -846,10 +854,16 @@ mod tests {
             .copied()
             .chain(BACKEND_SITES.iter().map(|r| r.1));
         for s in families {
+            let quant = Quant::of_ggml(s.ggml());
+            assert_eq!(
+                PROJECTED.contains(&s),
+                quant.is_some(),
+                "{s:?}: the session's PROJECTED and Quant::of_ggml disagree"
+            );
             assert_eq!(
                 LAUNCHED.contains(&s),
-                Quant::of_ggml(s.ggml()).is_some(),
-                "{s:?}: the session's LAUNCHED and Quant::of_ggml disagree"
+                quant.is_some_and(Quant::dense),
+                "{s:?}: the session's LAUNCHED and Quant::dense disagree"
             );
         }
     }

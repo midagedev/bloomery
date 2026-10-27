@@ -157,9 +157,10 @@ fn prefill_at_open(g: &Geometry) -> PrefillMode {
 }
 
 /// The site types Metal's mat-vecs launch: the kernels' quant set
-/// ([`Quant::of_ggml`](crate::kernels::Quant::of_ggml), held equal to this
-/// list by `arena`'s test) as families — Q4_K, Q6_K, Q8_0, Q5_K and MLX_A4,
-/// the A4 kernels' affine 4-bit groups. The F32 tensors a session reads as
+/// ([`Quant::of_ggml`](crate::kernels::Quant::of_ggml) read over
+/// [`Quant::dense`](crate::kernels::Quant::dense), held equal to this list by
+/// `arena`'s test) as families — Q4_K, Q6_K, Q8_0, Q5_K and MLX_A4, the A4
+/// kernels' affine 4-bit groups. The F32 tensors a session reads as
 /// values (the norms, the conv, the dt bias, `ssm_a`) and the router's
 /// MLX_A8, which its loader dequantizes exactly at open, are no typed site; a
 /// type outside the list is refused by name at the site (`file_site`).
@@ -171,10 +172,26 @@ pub(crate) const LAUNCHED: &[SiteTy] = &[
     SiteTy::Q5K,
 ];
 
-/// The site lists the plan reads: every list is [`LAUNCHED`].
+/// The types a layer's projections may be: [`LAUNCHED`] and F32, which the
+/// segmented mat-vec reads (the delta net's `ssm_alpha` and `ssm_beta`). Only
+/// a P1 site runs F32; the arena's checks refuse it at every other site by
+/// name ([`Quant::dense`](crate::kernels::Quant::dense)).
+pub(crate) const PROJECTED: &[SiteTy] = &[
+    SiteTy::Q4K,
+    SiteTy::Q6K,
+    SiteTy::MlxA4,
+    SiteTy::Q8_0,
+    SiteTy::Q5K,
+    SiteTy::F32,
+];
+
+/// The site lists the plan reads: [`PROJECTED`] for the projections and for
+/// the stacks list, which also holds β and α (the routed stacks and the
+/// shared parts it names are held to the dispatch lists below as well), every
+/// other list [`LAUNCHED`].
 pub const SITES: Sites35 = Sites35 {
-    proj: LAUNCHED,
-    stacks: LAUNCHED,
+    proj: PROJECTED,
+    stacks: PROJECTED,
     gate_up: LAUNCHED,
     down: LAUNCHED,
     shared: LAUNCHED,

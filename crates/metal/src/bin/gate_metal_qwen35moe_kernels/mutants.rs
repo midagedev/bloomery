@@ -1320,6 +1320,46 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "f32_seg_input_f16",
+        clause: "f32_seg",
+        why: "the F32 owner reads its first activation of a block through f16",
+        edits: &[(
+            "float a0 = block[base + 0];",
+            "float a0 = (float)(half)block[base + 0];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "apart_pair_shared_blocks",
+        clause: "apart_pair",
+        why: "the shared slot of an Apart pair walks its rows in the stacks' block count",
+        edits: &[(
+            "const uint shared_blocks = args.nblocks * (uint)Q::values_per_block() / (uint)QS::values_per_block();",
+            "const uint shared_blocks = args.nblocks;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "apart_fold_shared_hidden",
+        clause: "apart_fold",
+        why: "the shared slot of an Apart fold reads the first slot's hidden states",
+        edits: &[(
+            "device const float * hs = h + (ulong)BLOOMERY_EXPERT_SHARED * BLOOMERY_EXPERT_K;",
+            "device const float * hs = h;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "apart_grouped_shared_group",
+        clause: "apart_grouped",
+        why: "the shared group's tiles of an Apart grouped GEMM read the stacks' type past the stack",
+        edits: &[(
+            "if (BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts) {",
+            "if (false) {",
+            1,
+        )],
+    },
+    Mutant {
         name: "q8_0_lane_quarter",
         clause: "q8_0_matvec",
         why: "a Q8_0 lane dots its activations with the other quarter of the block's codes",

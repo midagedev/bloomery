@@ -38,10 +38,10 @@ use model::arch::names;
 
 use super::arena::LANES;
 use super::rows::RowsLens;
-use super::session::{LAUNCHED, SITES, SessionError, WHAT, pass_rows_max};
+use super::session::{PROJECTED, SITES, SessionError, WHAT, pass_rows_max};
 use crate::geom::Geometry;
 use crate::instance::{self, Instance};
-use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, head_groups, segments_for_keys};
+use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, head_groups, segments_for_keys, shared_entry};
 
 /// The arena's name in a refusal.
 const ARENA: &str = "qwen35moe arena";
@@ -170,8 +170,26 @@ impl Table<'_> {
     }
 
     /// Tensor `name`: `rows` rows of `cols`, every axis past the first
-    /// counted as rows, in a type a mat-vec runs.
+    /// counted as rows, in a type every launch of a site reads
+    /// ([`Quant::dense`]).
     fn site(&self, name: &str, cols: usize, rows: usize) -> Result<Site, SessionError> {
+        self.site_of(name, cols, rows, Quant::dense)
+    }
+
+    /// A projection of a layer's P1: [`Table::site`], and F32 rows too, which
+    /// the segmented mat-vec reads.
+    fn p1_site(&self, name: &str, cols: usize, rows: usize) -> Result<Site, SessionError> {
+        self.site_of(name, cols, rows, |_| true)
+    }
+
+    /// Tensor `name` as [`Table::site`] reads it, in a type `has` admits.
+    fn site_of(
+        &self,
+        name: &str,
+        cols: usize,
+        rows: usize,
+        has: fn(Quant) -> bool,
+    ) -> Result<Site, SessionError> {
         let (ty, dims) = self.info(name)?;
         let got_rows: u64 = dims.iter().skip(1).product();
         let shape_ok = dims.first().and_then(|&c| usize::try_from(c).ok()) == Some(cols)
@@ -181,10 +199,10 @@ impl Table<'_> {
                 "{name} is {dims:?}; the step reads {rows} rows of {cols}"
             )));
         }
-        let quant = Quant::of_ggml(ty).ok_or_else(|| {
+        let quant = Quant::of_ggml(ty).filter(|&q| has(q)).ok_or_else(|| {
             refuse(format!(
                 "{name} is {ty:?}, which no mat-vec of this backend runs ({})",
-                runs(|_| true).join(", ")
+                runs(has).join(", ")
             ))
         })?;
         Ok(Site {
@@ -299,8 +317,9 @@ pub(super) struct FfnLayout {
     pub(super) shared: Option<SharedLayout>,
 }
 
-/// A shared expert: its router row and its three sites, each of its routed
-/// stack's type.
+/// A shared expert: its router row and its three sites, each of its own type
+/// (its stack's, or a pair of [`crate::kernels::APART_GATE_UP`] or
+/// [`crate::kernels::APART_DOWN`]).
 pub(super) struct SharedLayout {
     pub(super) gate_inp: Values,
     pub(super) gate: Site,
@@ -385,6 +404,10 @@ struct SharedShapes {
     rope_base: Option<f32>,
     moe: Option<(usize, usize)>,
 }
+
+/// The rows an F32 projection's first output row is a multiple of (the pass's
+/// f32 GEMM stores `float4`s).
+const F32_ROW_ALIGN: usize = 4;
 
 fn count(n: usize) -> u64 {
     u64::try_from(n).expect("a count fits u64")
@@ -490,12 +513,16 @@ fn read_half<T>(
 /// holds) has only its strict refusal.
 fn mixer_sweep(split: &Split, pd: &PlanDims, kind: Kind35, l: usize) -> Vec<SessionError> {
     match plan_mixer(split, pd, kind, l, &WIDEST) {
-        Ok(MixerPlan::Delta(d)) => {
-            refused_sites(split, [d.qkv, d.gate, d.beta, d.alpha, d.ssm_out])
-        }
-        Ok(MixerPlan::Gqa(g)) => {
-            refused_sites(split, [g.attn_q, g.attn_k, g.attn_v, g.attn_output])
-        }
+        Ok(MixerPlan::Delta(d)) => refused_sites(
+            split,
+            [d.qkv, d.gate, d.beta, d.alpha, d.ssm_out],
+            PROJECTED,
+        ),
+        Ok(MixerPlan::Gqa(g)) => refused_sites(
+            split,
+            [g.attn_q, g.attn_k, g.attn_v, g.attn_output],
+            PROJECTED,
+        ),
         Err(_) => Vec::new(),
     }
 }
@@ -507,20 +534,29 @@ fn ffn_sweep(split: &Split, pd: &PlanDims, layer: &LayerSpec, l: usize) -> Vec<S
     match &layer.ffn {
         Ffn::Moe(_) => {
             let n = file_names(l);
-            refused_sites(split, [n.gate, n.sh_gate, n.up, n.sh_up, n.down, n.sh_down])
+            refused_sites(
+                split,
+                [n.gate, n.sh_gate, n.up, n.sh_up, n.down, n.sh_down],
+                PROJECTED,
+            )
         }
         Ffn::Dense { .. } => match plan_ffn(split, WHAT, pd, layer, l, &WIDEST, Read35::Whole) {
-            Ok(f) => refused_sites(split, [f.gate, f.up, f.down]),
+            Ok(f) => refused_sites(split, [f.gate, f.up, f.down], PROJECTED),
             Err(_) => Vec::new(),
         },
     }
 }
 
 /// The sites among `names` that the chain's own site check refuses at the
-/// launch list: its words, so the item is the one a strict read returns for
-/// the site. A site is judged by the shape the header gives it, so only its
+/// launch list `list` (the reader's, [`PROJECTED`] for the types a read names
+/// before the dispatch lists judge them): its words, so the item is the one a strict read
+/// returns for the site. A site is judged by the shape the header gives it, so only its
 /// type and presence are at stake.
-fn refused_sites(split: &Split, names: impl IntoIterator<Item = String>) -> Vec<SessionError> {
+fn refused_sites(
+    split: &Split,
+    names: impl IntoIterator<Item = String>,
+    list: &[SiteTy],
+) -> Vec<SessionError> {
     names
         .into_iter()
         .filter_map(|name| {
@@ -532,7 +568,7 @@ fn refused_sites(split: &Split, names: impl IntoIterator<Item = String>) -> Vec<
                     usize::try_from(k).unwrap_or(usize::MAX),
                 )
             });
-            file_site(split, WHAT, &name, shape, LAUNCHED)
+            file_site(split, WHAT, &name, shape, list)
                 .err()
                 .map(SessionError::Plan)
         })
@@ -837,7 +873,7 @@ fn p1_checks(
     let mut sites = Vec::with_capacity(parts.len());
     let mut ok = true;
     for &(name, rows) in parts {
-        match at.ok(t.site(name, cols, rows)) {
+        match at.ok(t.p1_site(name, cols, rows)) {
             Some(site) => {
                 if !cols.is_multiple_of(site.quant.values_per_block()) {
                     at.push(refuse(format!(
@@ -858,6 +894,18 @@ fn p1_checks(
         for s in &sites {
             at_row.push(next);
             next += s.rows;
+        }
+        // The pass runs an F32 segment as a GEMM whose output window starts
+        // at the segment's first row, four floats at least from a 16-byte
+        // boundary.
+        for (s, &row) in sites.iter().zip(&at_row) {
+            if s.quant == Quant::F32 && !row.is_multiple_of(F32_ROW_ALIGN) {
+                at.push(refuse(format!(
+                    "{}: an f32 projection's output starts at row {row}, not a multiple of {F32_ROW_ALIGN}",
+                    s.name
+                )));
+                ok = false;
+            }
         }
         for quant in Quant::ALL {
             let members: Vec<usize> = (0..sites.len())
@@ -1016,20 +1064,14 @@ fn ffn_checks(
     (n_experts, top_k): (usize, usize),
     l: usize,
 ) -> Option<FfnLayout> {
+    // A shared expert, in its stacks' types (`Joined`) or kept apart at its
+    // own: the launches read it as the router's last group either way, and
+    // `ok` below holds the type pairs they have an entry for.
     let joined = match &plan.ffn.route {
         FfnRoute::Router {
-            shared: Some(SharedPlan::Joined),
+            shared: Some(SharedPlan::Joined | SharedPlan::Apart(_)),
             ..
         } => true,
-        FfnRoute::Router {
-            shared: Some(SharedPlan::Apart(_)),
-            ..
-        } => {
-            at.push(refuse(
-                "a shared expert of another type than its stacks, which the fold does not run",
-            ));
-            return None;
-        }
         FfnRoute::Router { shared: None, .. } => false,
         FfnRoute::Dense => {
             at.push(refuse(
@@ -1066,11 +1108,21 @@ fn ffn_checks(
     let mut ok = true;
     match (&gate, &up, &shexp_gate, &shexp_up) {
         (Some(g), Some(u), Some(Some(sg)), Some(Some(su)))
-            if [u.quant, sg.quant, su.quant].iter().any(|&q| q != g.quant) =>
+            if u.quant != g.quant || su.quant != sg.quant =>
         {
             at.push(refuse(format!(
-                "gate {:?}, up {:?}, shared gate {:?}, shared up {:?}; the pair runs one type",
+                "gate {:?}, up {:?}, shared gate {:?}, shared up {:?}; the pair runs one type \
+                 for its stacks and one for its shared expert",
                 g.quant, u.quant, sg.quant, su.quant
+            )));
+            ok = false;
+        }
+        (Some(g), Some(_), Some(Some(sg)), Some(Some(_)))
+            if !shared_entry(g.quant, sg.quant, true) =>
+        {
+            at.push(refuse(format!(
+                "gate and up {:?}, shared gate and up {:?}; the pair has no entry for the types",
+                g.quant, sg.quant
             )));
             ok = false;
         }
@@ -1086,10 +1138,10 @@ fn ffn_checks(
     let down = at.ok(t.site(&file.down, experts.k, hidden * n_experts));
     let shexp_down = joined.then(|| at.ok(t.site(&file.sh_down, experts.k, hidden)));
     if let (Some(d), Some(Some(sd))) = (&down, &shexp_down)
-        && sd.quant != d.quant
+        && !shared_entry(d.quant, sd.quant, false)
     {
         at.push(refuse(format!(
-            "down {:?}, shared down {:?}; the fold runs one type",
+            "down {:?}, shared down {:?}; the fold has no entry for the types",
             d.quant, sd.quant
         )));
         ok = false;
@@ -1783,7 +1835,7 @@ mod tests {
         assert_eq!(
             got[0],
             "qwen35moe session: the plan: qwen35moe session: blk.0.attn_qkv.weight is q3_K in the \
-             file; this site launches Q4_K, Q6_K, MLX_A4, Q8_0, Q5_K"
+             file; this site launches Q4_K, Q6_K, MLX_A4, Q8_0, Q5_K, F32"
         );
     }
 
@@ -1922,6 +1974,120 @@ mod tests {
                 (Quant::Q8_0, &[0][..]),
                 (Quant::Q5K, &[1][..]),
             ]
+        );
+    }
+
+    /// The delta net's alpha and beta in F32, as a UD file holds them: a
+    /// dispatch of their own, last in the kernels' order, beside the Q8_0
+    /// projections.
+    #[test]
+    fn f32_projections_are_a_dispatch_of_their_own_at_a_p1() {
+        let t = retyped(Synthetic::new(), &DENSE, GgmlType::Q8_0)
+            .ty("blk.0.ssm_beta.weight", GgmlType::F32)
+            .ty("blk.0.ssm_alpha.weight", GgmlType::F32);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let layout = out.checked.expect("a checked file").layout;
+        let MixerLayout::Delta(d) = &layout.layers[0].mixer else {
+            panic!("layer 0 is a delta layer");
+        };
+        let got: Vec<(Quant, &[usize])> =
+            d.p1.dispatches
+                .iter()
+                .map(|x| (x.quant, x.members.as_slice()))
+                .collect();
+        assert_eq!(
+            got,
+            [(Quant::Q8_0, &[0usize, 1][..]), (Quant::F32, &[2, 3][..])]
+        );
+        assert_eq!(d.p1.sites[2].bytes(), 4 * 32 * 2048);
+    }
+
+    /// F32 is a type of the P1's projections only: every other site that
+    /// reads it refuses it by name.
+    #[test]
+    fn f32_is_refused_by_name_beyond_a_p1_projection() {
+        // A site the arena judges names its tensor.
+        for name in [
+            "blk.0.ssm_out.weight",
+            "blk.1.attn_output.weight",
+            "token_embd.weight",
+            "output.weight",
+        ] {
+            let t = Synthetic::new().ty(name, GgmlType::F32);
+            let got = texts(&t.split(), CTX);
+            assert!(
+                got.iter().any(|g| g.contains(name)),
+                "{name} in F32 is not an item: {got:?}"
+            );
+        }
+        // A stack or a shared part is judged by the dispatch lists.
+        for name in ["blk.0.ffn_gate_exps.weight", "blk.1.ffn_down_shexp.weight"] {
+            let t = Synthetic::new().ty(name, GgmlType::F32);
+            let got = texts(&t.split(), CTX);
+            assert!(
+                got.iter().any(|g| g.to_lowercase().contains("f32")),
+                "{name} in F32 is not an item: {got:?}"
+            );
+        }
+    }
+
+    /// A shared expert of a pair of the tables opens apart (the Q8_0 shared
+    /// expert of a UD file beside its Q4_K, Q5_K and Q6_K stacks), with each
+    /// part of the type it is read in; a pair outside them is refused.
+    #[test]
+    fn a_shared_expert_of_a_pair_of_the_tables_opens_apart() {
+        for (gate_up, down) in [
+            (GgmlType::Q4_K, GgmlType::Q5_K),
+            (GgmlType::Q5_K, GgmlType::Q6_K),
+        ] {
+            let mut t = Synthetic::new();
+            for l in 0..2 {
+                for name in ["gate", "up"] {
+                    t = t
+                        .ty(&format!("blk.{l}.ffn_{name}_exps.weight"), gate_up)
+                        .ty(&format!("blk.{l}.ffn_{name}_shexp.weight"), GgmlType::Q8_0);
+                }
+                t = t
+                    .ty(&format!("blk.{l}.ffn_down_exps.weight"), down)
+                    .ty(&format!("blk.{l}.ffn_down_shexp.weight"), GgmlType::Q8_0);
+            }
+            let out = check(&t.split(), CTX);
+            assert!(
+                out.items.is_empty(),
+                "{gate_up:?} {down:?}: {:?}",
+                out.items
+            );
+            let layout = out.checked.expect("a checked file").layout;
+            for layer in &layout.layers {
+                let shared = layer.ffn.shared.as_ref().expect("a shared expert");
+                assert_eq!(layer.ffn.gate_up_quant.ggml(), gate_up);
+                assert_eq!(layer.ffn.down_quant.ggml(), down);
+                assert_eq!(
+                    [shared.gate.quant, shared.up.quant, shared.down.quant],
+                    [Quant::Q8_0; 3]
+                );
+            }
+        }
+        // Q4_K gate and up beside a Q6_K shared pair: a pair of no entry.
+        let mut t = Synthetic::new();
+        for l in 0..2 {
+            t = t
+                .ty(&format!("blk.{l}.ffn_gate_shexp.weight"), GgmlType::Q6_K)
+                .ty(&format!("blk.{l}.ffn_up_shexp.weight"), GgmlType::Q6_K);
+        }
+        let got = texts(&t.split(), CTX);
+        assert_eq!(
+            got[0],
+            "qwen35moe arena: layer 0: gate and up Q4K, shared gate and up Q6K; the pair has no \
+             entry for the types"
+        );
+        // The shared gate and up in two types: the launch takes one.
+        let t = Synthetic::new().ty("blk.0.ffn_up_shexp.weight", GgmlType::Q8_0);
+        let got = texts(&t.split(), CTX);
+        assert!(
+            got[0].contains("one type for its stacks and one for its shared expert"),
+            "{got:?}"
         );
     }
 
@@ -2090,8 +2256,8 @@ mod tests {
 
     #[test]
     fn the_arena_rules_of_a_layer_name_the_layer() {
-        // A shared expert of another type than its stacks: the plan reads it
-        // apart, the arena's fold does not run it.
+        // A shared expert of another type than its stacks, a pair of no entry:
+        // the plan reads it apart, the arena's fold has no entry for it.
         let got = texts(
             &Synthetic::new()
                 .ty("blk.0.ffn_down_shexp.weight", GgmlType::Q6_K)
@@ -2101,8 +2267,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                "qwen35moe arena: layer 0: a shared expert of another type than its stacks, which \
-              the fold does not run"
+                "qwen35moe arena: layer 0: down Q4K, shared down Q6K; the fold has no entry for \
+                 the types"
             ]
         );
         // The router in a type the host does not dequantize.

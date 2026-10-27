@@ -64,11 +64,16 @@
 //! add (1) in place of the four-scale sum (3), so its path is the store's
 //! plus the head scale's product, within `n + 1` as Q4_K's.
 //!
+//! **F32** (quant.metal's `F32`), one term `w * x`: the product (1), the two
+//! pair adds of a quarter's four products (2), the lane's sum over its
+//! `ceil(nb / 8)` blocks of 16 values, and the 31 adds of the SIMD group:
+//! `n = 3 + ceil(nb / 8) + 31`. The terms' magnitudes are `|w_c x_c|`.
+//!
 //! **Norm on load** adds the gain product on the load (1) and the scale
 //! product at the end (1), and the scale itself: `s = rsqrt(S / K + eps)`, `S`
 //! the sum of squares in the kernel's own order (a square, two adds, the lane's
 //! chain of `8 ceil(nb / 4)` adds for Q4_K and Q5_K (one load), `4 ceil(nb /
-//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4 or `2 ceil(nb / 8)` for Q8_0, the 31
+//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4, `2 ceil(nb / 8)` for Q8_0 or `ceil(nb / 8)` for F32, the 31
 //! adds of the SIMD group), then the division and the addition. `s` is off
 //! by at most `(1 - t)^(-1/2) - 1` for `t = G(nS + 2)` (the worse direction),
 //! and by the library `rsqrt`'s own error, taken as `RSQRT_ULP` units in the
@@ -160,6 +165,14 @@ const Q8_0_STORE_BASE: usize = 9;
 /// sets the band.
 const Q5K_STORE_BASE: usize = 15;
 
+/// The operations of an F32 store path before the lane's blocks and the SIMD
+/// group's sum: the product, then the two pair adds of a quarter's four
+/// products, as the owner's `partial` orders them.
+///
+/// PIN(2026-10-27): the model in this module's doc, and no measured error,
+/// sets the band.
+const F32_STORE_BASE: usize = 3;
+
 /// The longest path through the SIMD group's sum: a binary tree over 32 lanes
 /// is at most 31 adds deep, whatever its shape.
 const SIMD_SUM_DEPTH: usize = 31;
@@ -230,6 +243,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
         Quant::A4 => (nblocks.div_ceil(8), A4_STORE_BASE),
         Quant::Q8_0 => (nblocks.div_ceil(8), Q8_0_STORE_BASE),
         Quant::Q5K => (nblocks.div_ceil(4), Q5K_STORE_BASE),
+        Quant::F32 => (nblocks.div_ceil(8), F32_STORE_BASE),
     };
     let n_store = base + lane_blocks + SIMD_SUM_DEPTH;
     match kind {
@@ -243,6 +257,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
                 Quant::Q6K => 4 * lane_blocks,
                 Quant::A4 => 4 * lane_blocks,
                 Quant::Q8_0 => 2 * lane_blocks,
+                Quant::F32 => lane_blocks,
             };
             let n_s = 1 + 2 + chain + SIMD_SUM_DEPTH;
             // The scale's argument is off by at most `t` relative, so the
@@ -364,7 +379,7 @@ pub fn reference(
         dequant_row(ty, row, &mut w).map_err(|e| format!("dequantizing a row: {e}"))?;
         let dot: f64 = w.iter().zip(x).map(|(&w, &x)| f64::from(w) * x).sum();
         let magnitude: f64 = match quant {
-            Quant::Q6K | Quant::Q8_0 => w
+            Quant::Q6K | Quant::Q8_0 | Quant::F32 => w
                 .iter()
                 .zip(x)
                 .map(|(&w, &x)| f64::from(w).abs() * x.abs())

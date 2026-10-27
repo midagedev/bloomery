@@ -1,4 +1,5 @@
-//! The launch of the Q4_K, Q6_K, A4, Q8_0 and Q5_K mat-vecs.
+//! The launch of the Q4_K, Q6_K, A4, Q8_0 and Q5_K mat-vecs, and the f32 one's
+//! segmented form ([`Quant::F32`]).
 
 use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
@@ -7,6 +8,10 @@ use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 use super::{Kernels, MatvecPipelines, args_bytes, check_window_len, pack, word};
+
+/// The values of the f32 block the kernels read: a quarter of a SIMD group's
+/// lanes take four of them each (`quant.metal`'s `block_f32_16`).
+const F32_BLOCK_VALUES: usize = 16;
 
 /// The weight type a mat-vec reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,24 +26,41 @@ pub enum Quant {
     Q8_0,
     /// GGUF `Q5_K`: 176-byte blocks of 256 values.
     Q5K,
+    /// GGUF `F32` rows, read in blocks of 16 values: 64 bytes. Its one launch
+    /// is the segmented mat-vec (and, in a pass, the segmented GEMM that
+    /// runs each segment as the router's f32 GEMM): the delta net's `ssm_alpha`
+    /// and `ssm_beta`. Every other launch refuses it by name
+    /// ([`Quant::dense`]).
+    F32,
 }
 
 impl Quant {
     /// The bytes of one block: gguf's own row for the type, the one owner
-    /// of the number.
+    /// of the number. F32's block is the kernel's, sixteen values (gguf's row
+    /// is one).
     #[must_use]
     pub fn block_bytes(self) -> usize {
-        usize::try_from(
-            self.ggml()
-                .type_size()
-                .expect("every kernel type has a GGUF row"),
-        )
-        .expect("a block size fits usize")
+        match self {
+            Self::F32 => F32_BLOCK_VALUES * 4,
+            _ => usize::try_from(
+                self.ggml()
+                    .type_size()
+                    .expect("every kernel type has a GGUF row"),
+            )
+            .expect("a block size fits usize"),
+        }
     }
 
     /// Every type a session's arena opens: all the mat-vec families, in the
     /// order a layer's P1 dispatches them.
-    pub const ALL: [Quant; 5] = [Self::Q4K, Self::Q6K, Self::A4, Self::Q8_0, Self::Q5K];
+    pub const ALL: [Quant; 6] = [
+        Self::Q4K,
+        Self::Q6K,
+        Self::A4,
+        Self::Q8_0,
+        Self::Q5K,
+        Self::F32,
+    ];
 
     /// The kernel type that reads file type `ty`, or `None` for a type a
     /// session does not open: [`Quant::ggml`] read backwards over
@@ -57,19 +79,45 @@ impl Quant {
             Self::A4 => gguf::quant::GgmlType::MLX_A4,
             Self::Q8_0 => gguf::quant::GgmlType::Q8_0,
             Self::Q5K => gguf::quant::GgmlType::Q5_K,
+            Self::F32 => gguf::quant::GgmlType::F32,
         }
     }
 
     /// The values one block holds, gguf's row for the type: the columns of a
     /// launch are a multiple of it, and its block count a division by it.
+    /// F32's block is the kernel's, sixteen values (gguf's row is one).
     #[must_use]
     pub fn values_per_block(self) -> usize {
-        usize::try_from(
-            self.ggml()
-                .blck_size()
-                .expect("every kernel type has a GGUF row"),
-        )
-        .expect("a block's value count fits usize")
+        match self {
+            Self::F32 => F32_BLOCK_VALUES,
+            _ => usize::try_from(
+                self.ggml()
+                    .blck_size()
+                    .expect("every kernel type has a GGUF row"),
+            )
+            .expect("a block's value count fits usize"),
+        }
+    }
+
+    /// Whether the type has every launch but the segmented mat-vec: the
+    /// plain, norm-on-load and residual mat-vecs, the dense GEMMs, the
+    /// experts' pair, fold and grouped GEMM. F32 has the segmented mat-vec
+    /// only, so a site that is not a layer's P1 projection refuses it by name.
+    #[must_use]
+    pub const fn dense(self) -> bool {
+        match self {
+            Self::Q4K | Self::Q6K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
+            Self::F32 => false,
+        }
+    }
+
+    /// The alignment the segmented mat-vec's weight reads need: the 16-bit
+    /// words of the quantized blocks, or F32's `float4` loads.
+    pub(crate) const fn weight_align(self) -> super::WeightAlign {
+        match self {
+            Self::F32 => super::WeightAlign::Float4,
+            Self::Q4K | Self::Q6K | Self::A4 | Self::Q8_0 | Self::Q5K => super::WeightAlign::Half,
+        }
     }
 
     /// Whether the embedding launch has an entry for the type: the
@@ -78,7 +126,7 @@ impl Quant {
     pub const fn embeds(self) -> bool {
         match self {
             Self::Q4K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
-            Self::Q6K => false,
+            Self::Q6K | Self::F32 => false,
         }
     }
 
@@ -88,7 +136,7 @@ impl Quant {
     pub const fn heads(self) -> bool {
         match self {
             Self::Q6K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
-            Self::Q4K => false,
+            Self::Q4K | Self::F32 => false,
         }
     }
 
@@ -99,7 +147,7 @@ impl Quant {
     pub const fn headnorms(self) -> bool {
         match self {
             Self::Q4K | Self::A4 | Self::Q8_0 | Self::Q5K => true,
-            Self::Q6K => false,
+            Self::Q6K | Self::F32 => false,
         }
     }
 
@@ -112,6 +160,7 @@ impl Quant {
             Self::A4 => "a4",
             Self::Q8_0 => "q8_0",
             Self::Q5K => "q5k",
+            Self::F32 => "f32",
         }
     }
 }
@@ -234,6 +283,19 @@ impl MatvecPipelines {
 }
 
 impl Kernels {
+    /// The pipelines of the mat-vec family of `quant`, or `None` for a type
+    /// whose one entry is the segmented mat-vec ([`Quant::dense`]).
+    pub(super) fn dense_family(&self, quant: Quant) -> Option<&MatvecPipelines> {
+        match quant {
+            Quant::Q4K => Some(&self.q4k),
+            Quant::Q6K => Some(&self.q6k),
+            Quant::A4 => Some(&self.a4),
+            Quant::Q8_0 => Some(&self.q8_0),
+            Quant::Q5K => Some(&self.q5k),
+            Quant::F32 => None,
+        }
+    }
+
     /// Encode one mat-vec dispatch on `encoder`. Every window is checked
     /// against the shape first; nothing is encoded for a launch that is
     /// refused.
@@ -249,13 +311,9 @@ impl Kernels {
             Mode::Store | Mode::Residual => (LAYER_NONE, 0.0),
         };
         let args = args_bytes([shape.rows, shape.nblocks, layer, eps.to_bits()]);
-        let family = match p.quant {
-            Quant::Q4K => &self.q4k,
-            Quant::Q6K => &self.q6k,
-            Quant::A4 => &self.a4,
-            Quant::Q8_0 => &self.q8_0,
-            Quant::Q5K => &self.q5k,
-        };
+        let family = self
+            .dense_family(p.quant)
+            .ok_or_else(|| refuse(format!("{} has no plain mat-vec entry", p.quant.name())))?;
         encoder.set_pipeline(family.of(&p.mode));
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;

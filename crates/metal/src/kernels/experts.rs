@@ -2,7 +2,9 @@
 //!
 //! Both are one dispatch. The pair's grid height is the slot, and it norms
 //! its input as it loads it. The fold maps every slot's blocks as one K' and
-//! adds the residual in the same kernel.
+//! adds the residual in the same kernel. A shared expert of another type than
+//! the stacks' (a pair of [`APART_GATE_UP`] or [`APART_DOWN`]) is the same dispatch over an entry of two
+//! types: the stacks' and the shared expert's.
 //! A launch whose shape is not that one is refused by name before anything
 //! is encoded.
 
@@ -20,13 +22,41 @@ use super::{Quant, args_bytes, check_window_len, pack, word};
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";
 
-/// The shared expert, or a refusal when its quant is not the routed experts'.
+/// The (gate and up stacks, shared gate and up) type pairs whose shared
+/// expert is read in a type of its own: the pair's entries and the grouped
+/// GEMM's pair tile. A pair of types outside the table is refused by name.
+pub const APART_GATE_UP: [(Quant, Quant); 2] =
+    [(Quant::Q4K, Quant::Q8_0), (Quant::Q5K, Quant::Q8_0)];
+
+/// The (down stack, shared down) type pairs whose shared expert is read in a
+/// type of its own: the fold's entries and the grouped GEMM's plain tile.
+pub const APART_DOWN: [(Quant, Quant); 2] = [(Quant::Q5K, Quant::Q8_0), (Quant::Q6K, Quant::Q8_0)];
+
+/// The table of the gate-up launches (`gate_up`) or the down launches.
+#[must_use]
+pub fn apart_table(gate_up: bool) -> &'static [(Quant, Quant); 2] {
+    if gate_up { &APART_GATE_UP } else { &APART_DOWN }
+}
+
+/// Whether a shared expert of type `shared` beside stacks of type `stack` has
+/// an entry: the same type, or a pair of the launch's table
+/// ([`apart_table`]).
+#[must_use]
+pub fn shared_entry(stack: Quant, shared: Quant, gate_up: bool) -> bool {
+    stack == shared || apart_table(gate_up).contains(&(stack, shared))
+}
+
+/// The shared expert, in the routed experts' quant or in one of its own.
 #[derive(Clone, Copy)]
 pub enum SharedPlan<'w> {
     /// One expert, in the routed experts' quant.
     Same(Window<'w, u8, MetalDevice>),
-    /// The shared expert's quant differs. The launch is refused by name.
-    Apart,
+    /// One expert in a quant of its own. A pair outside [`APART_DOWN`] is refused
+    /// by name.
+    Apart {
+        quant: Quant,
+        weights: Window<'w, u8, MetalDevice>,
+    },
     /// The layer has no shared expert: the slots are the routed picks, and
     /// the instance's experts have no shared slot.
     None,
@@ -55,6 +85,9 @@ pub struct PairParams<'w> {
     pub gate: Window<'w, u8, MetalDevice>,
     /// The up stack, the gate's shape.
     pub up: Window<'w, u8, MetalDevice>,
+    /// The type of the shared expert's gate and up: `quant`, or the second of
+    /// a pair of [`APART_GATE_UP`]. An instance with no shared slot takes `quant`.
+    pub shared_quant: Quant,
     /// The shared expert's gate, one expert: given exactly when the
     /// instance's experts have a shared slot.
     pub shared_gate: Option<Window<'w, u8, MetalDevice>>,
@@ -81,9 +114,9 @@ pub struct PairParams<'w> {
 /// One folded down: `y += sum_s w_s * down_s · h_s` over the instance's
 /// slots.
 pub struct FoldParams<'w, 'h, 'y, 'buf> {
-    /// The weight type. The shared expert is the same type, or [`SharedPlan::Apart`].
+    /// The weight type of the stacks.
     pub quant: Quant,
-    /// The shared expert's weights, or a refusal.
+    /// The shared expert's weights and type.
     pub shared: SharedPlan<'w>,
     /// The output rows.
     pub rows: usize,
@@ -199,12 +232,21 @@ fn check_pair(
     if p.out_stride < g.k {
         return Err(refuse_pair("the slot outputs overlap".to_string()));
     }
-    if !p.cols.is_multiple_of(p.quant.values_per_block()) || p.cols == 0 {
+    if !shared_entry(p.quant, p.shared_quant, true) {
         return Err(refuse_pair(format!(
-            "{} columns are not whole blocks of {}",
-            p.cols,
-            p.quant.values_per_block()
+            "stacks of {} and a shared expert of {}: no entry",
+            p.quant.name(),
+            p.shared_quant.name()
         )));
+    }
+    for quant in [p.quant, p.shared_quant] {
+        if !p.cols.is_multiple_of(quant.values_per_block()) || p.cols == 0 {
+            return Err(refuse_pair(format!(
+                "{} columns are not whole blocks of {}",
+                p.cols,
+                quant.values_per_block()
+            )));
+        }
     }
     let nblocks = p.cols / p.quant.values_per_block();
     let stack = weight_bytes(p.quant, g.k, nblocks, p.n_experts).ok_or_else(|| {
@@ -213,8 +255,19 @@ fn check_pair(
             p.n_experts, p.cols
         ))
     })?;
-    let shared_bytes = weight_bytes(p.quant, g.k, nblocks, 1)
-        .ok_or_else(|| refuse_pair("one shared expert wraps".to_string()))?;
+    let shared_bytes = weight_bytes(
+        p.shared_quant,
+        g.k,
+        p.cols / p.shared_quant.values_per_block(),
+        1,
+    )
+    .ok_or_else(|| refuse_pair("one shared expert wraps".to_string()))?;
+    if !g.has_shared && p.shared_quant != p.quant {
+        return Err(refuse_pair(format!(
+            "a shared expert of {}, and the experts run no shared slot",
+            p.shared_quant.name()
+        )));
+    }
     let shared = match (p.shared_gate, p.shared_up, g.has_shared) {
         (Some(gate), Some(up), true) => Some((gate, up)),
         (None, None, false) => None,
@@ -274,16 +327,21 @@ fn check_fold<'w>(
     p: &FoldParams<'w, '_, '_, '_>,
     simdgroups: usize,
     rows_per_simd_group: usize,
-) -> Result<(FoldShape, Window<'w, u8, MetalDevice>), DeviceError> {
+) -> Result<(FoldShape, Quant, Window<'w, u8, MetalDevice>), DeviceError> {
+    if let SharedPlan::Apart { quant, .. } = p.shared
+        && !shared_entry(p.quant, quant, false)
+    {
+        return Err(refuse_fold(format!(
+            "stacks of {} and a shared expert of {}: no entry",
+            p.quant.name(),
+            quant.name()
+        )));
+    }
     let shared = match (p.shared, g.has_shared) {
-        (SharedPlan::Apart, _) => {
-            return Err(refuse_fold(
-                "the shared expert is SharedPlan::Apart".to_string(),
-            ));
-        }
-        (SharedPlan::Same(window), true) => Some(window),
+        (SharedPlan::Same(window), true) => Some((p.quant, window)),
+        (SharedPlan::Apart { quant, weights }, true) => Some((quant, weights)),
         (SharedPlan::None, false) => None,
-        (SharedPlan::Same(_), false) => {
+        (SharedPlan::Same(_) | SharedPlan::Apart { .. }, false) => {
             return Err(refuse_fold(
                 "a shared expert, and the experts run no shared slot".to_string(),
             ));
@@ -309,11 +367,18 @@ fn check_fold<'w>(
     let nblocks = g.k / p.quant.values_per_block();
     let stack = weight_bytes(p.quant, p.rows, nblocks, p.n_experts)
         .ok_or_else(|| refuse_fold(format!("{} experts of {} rows wrap", p.n_experts, p.rows)))?;
-    let shared_bytes = weight_bytes(p.quant, p.rows, nblocks, 1)
-        .ok_or_else(|| refuse_fold("one shared expert wraps".to_string()))?;
     let hidden = g.slots * g.k;
     check_window_len(FOLD, "down", p.down.len(), stack)?;
-    if let Some(shared) = shared {
+    if let Some((quant, shared)) = shared {
+        if !g.k.is_multiple_of(quant.values_per_block()) {
+            return Err(refuse_fold(format!(
+                "the expert width {} is not whole blocks of {}",
+                g.k,
+                quant.values_per_block()
+            )));
+        }
+        let shared_bytes = weight_bytes(quant, p.rows, g.k / quant.values_per_block(), 1)
+            .ok_or_else(|| refuse_fold("one shared expert wraps".to_string()))?;
         check_window_len(FOLD, "shared down", shared.len(), shared_bytes)?;
         aligned(FOLD, "shared down", shared)?;
     }
@@ -323,15 +388,17 @@ fn check_fold<'w>(
     check_window_len(FOLD, "y", p.y.len(), p.rows)?;
     aligned(FOLD, "down", p.down)?;
     let rows_per_group = simdgroups * rows_per_simd_group;
+    // An instance with no shared slot binds the stack in its place, which the
+    // kernel does not read.
+    let (shared_quant, shared_window) = shared.unwrap_or((p.quant, p.down));
     Ok((
         FoldShape {
             rows: word(FOLD, "the row count", p.rows)?,
             n_experts: word(FOLD, "the expert count", p.n_experts)?,
             groups_x: p.rows.div_ceil(rows_per_group),
         },
-        // An instance with no shared slot binds the stack in its place,
-        // which the kernel does not read.
-        shared.unwrap_or(p.down),
+        shared_quant,
+        shared_window,
     ))
 }
 
@@ -347,12 +414,28 @@ pub(crate) struct Pipelines {
     fold_a4: Pipeline,
     fold_q8_0: Pipeline,
     fold_q5k: Pipeline,
+    /// The entries of two types: a pair of [`APART_GATE_UP`] for the pair, of
+    /// [`APART_DOWN`] for the fold.
+    pair_apart: Vec<((Quant, Quant), Pipeline)>,
+    fold_apart: Vec<((Quant, Quant), Pipeline)>,
 }
 
 impl Pipelines {
     /// `simdgroups` is the mat-vec function constant: the pair and the fold
     /// are mat-vec-shaped kernels whose threadgroup width is the same count.
     pub(crate) fn new(library: &Library, simdgroups: u32) -> Result<Self, DeviceError> {
+        let apart = |kind: &str, table: &[(Quant, Quant)]| {
+            table
+                .iter()
+                .map(|&(stack, shared)| {
+                    let name = format!("{}_{kind}_apart_{}", stack.name(), shared.name());
+                    Ok((
+                        (stack, shared),
+                        library.pipeline_with_simdgroups(&name, simdgroups)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DeviceError>>()
+        };
         Ok(Self {
             pair_q4: library.pipeline_with_simdgroups("q4k_pair_swiglu", simdgroups)?,
             pair_q6: library.pipeline_with_simdgroups("q6k_pair_swiglu", simdgroups)?,
@@ -364,27 +447,70 @@ impl Pipelines {
             fold_a4: library.pipeline_with_simdgroups("a4_down_fold", simdgroups)?,
             fold_q8_0: library.pipeline_with_simdgroups("q8_0_down_fold", simdgroups)?,
             fold_q5k: library.pipeline_with_simdgroups("q5k_down_fold", simdgroups)?,
+            pair_apart: apart("pair_swiglu", &APART_GATE_UP)?,
+            fold_apart: apart("down_fold", &APART_DOWN)?,
         })
     }
 
-    fn pair(&self, quant: Quant) -> &Pipeline {
-        match quant {
-            Quant::Q4K => &self.pair_q4,
-            Quant::Q6K => &self.pair_q6,
-            Quant::A4 => &self.pair_a4,
-            Quant::Q8_0 => &self.pair_q8_0,
-            Quant::Q5K => &self.pair_q5k,
+    /// The pair's pipeline for stacks of `quant` and a shared expert of
+    /// `shared`, or a named refusal for a type outside the tables.
+    fn pair(&self, quant: Quant, shared: Quant) -> Result<&Pipeline, DeviceError> {
+        if shared != quant {
+            return Self::apart(&self.pair_apart, quant, shared, PAIR);
         }
+        Self::of(quant, PAIR, |q| match q {
+            Quant::Q4K => Some(&self.pair_q4),
+            Quant::Q6K => Some(&self.pair_q6),
+            Quant::A4 => Some(&self.pair_a4),
+            Quant::Q8_0 => Some(&self.pair_q8_0),
+            Quant::Q5K => Some(&self.pair_q5k),
+            Quant::F32 => None,
+        })
     }
 
-    fn fold(&self, quant: Quant) -> &Pipeline {
-        match quant {
-            Quant::Q4K => &self.fold_q4,
-            Quant::Q6K => &self.fold_q6,
-            Quant::A4 => &self.fold_a4,
-            Quant::Q8_0 => &self.fold_q8_0,
-            Quant::Q5K => &self.fold_q5k,
+    /// The fold's pipeline, as [`Pipelines::pair`].
+    fn fold(&self, quant: Quant, shared: Quant) -> Result<&Pipeline, DeviceError> {
+        if shared != quant {
+            return Self::apart(&self.fold_apart, quant, shared, FOLD);
         }
+        Self::of(quant, FOLD, |q| match q {
+            Quant::Q4K => Some(&self.fold_q4),
+            Quant::Q6K => Some(&self.fold_q6),
+            Quant::A4 => Some(&self.fold_a4),
+            Quant::Q8_0 => Some(&self.fold_q8_0),
+            Quant::Q5K => Some(&self.fold_q5k),
+            Quant::F32 => None,
+        })
+    }
+
+    fn of<'a>(
+        quant: Quant,
+        what: &'static str,
+        pick: impl FnOnce(Quant) -> Option<&'a Pipeline>,
+    ) -> Result<&'a Pipeline, DeviceError> {
+        pick(quant).ok_or_else(|| super::range(what, format!("{} has no entry", quant.name())))
+    }
+
+    fn apart<'a>(
+        table: &'a [((Quant, Quant), Pipeline)],
+        quant: Quant,
+        shared: Quant,
+        what: &'static str,
+    ) -> Result<&'a Pipeline, DeviceError> {
+        table
+            .iter()
+            .find(|(pair, _)| *pair == (quant, shared))
+            .map(|(_, pipeline)| pipeline)
+            .ok_or_else(|| {
+                super::range(
+                    what,
+                    format!(
+                        "stacks of {} and a shared expert of {}: no entry",
+                        quant.name(),
+                        shared.name()
+                    ),
+                )
+            })
     }
 }
 
@@ -411,7 +537,7 @@ impl super::Kernels {
             shape.stride,
             p.eps.to_bits(),
         ]);
-        encoder.set_pipeline(self.experts.pair(p.quant));
+        encoder.set_pipeline(self.experts.pair(p.quant, p.shared_quant)?);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.gate)?)?;
         slot.set(Binding::of(&p.up)?)?;
@@ -441,14 +567,14 @@ impl super::Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: FoldParams<'_, '_, '_, '_>,
     ) -> Result<(), DeviceError> {
-        let (shape, shared) = check_fold(
+        let (shape, shared_quant, shared) = check_fold(
             &self.geom.experts,
             &p,
             self.simdgroups,
             self.rows_per_simd_group,
         )?;
         let args = args_bytes([shape.rows, shape.n_experts, p.layer, 0]);
-        encoder.set_pipeline(self.experts.fold(p.quant));
+        encoder.set_pipeline(self.experts.fold(p.quant, shared_quant)?);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.down)?)?;
         slot.set(Binding::of(&shared)?)?;

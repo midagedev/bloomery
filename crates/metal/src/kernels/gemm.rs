@@ -505,6 +505,13 @@ impl Kernels {
             Quant::A4 => &self.a4_gemm,
             Quant::Q8_0 => &self.q8_0_gemm,
             Quant::Q5K => &self.q5k_gemm,
+            // The f32 rows have no tile of this family: a pass runs each
+            // segment as the router's f32 GEMM (`Kernels::gemm_f32`).
+            Quant::F32 => {
+                return Err(refuse(
+                    "f32 has no dense GEMM entry; its rows run as the f32 GEMM".to_string(),
+                ));
+            }
         };
         encoder.set_pipeline(family.of(d.seg, d.mode, d.operand));
         let mut slot = Bindings::new(encoder);

@@ -82,6 +82,30 @@ impl RoutedFamily {
     }
 }
 
+/// A (stacks, shared expert) type pair's tile, in each operand.
+type ApartTile = ((Quant, Quant), [Pipeline; 2]);
+
+/// The `kind` tile of each pair of `table`, in each operand.
+fn apart_tiles(
+    library: &Library,
+    table: &[(Quant, Quant)],
+    kind: &str,
+) -> Result<Vec<ApartTile>, DeviceError> {
+    table
+        .iter()
+        .map(|&(stack, shared)| {
+            let one = |operand: &str| {
+                library.pipeline(&format!(
+                    "gemm_routed_{}_apart_{}_{kind}_{operand}",
+                    stack.name(),
+                    shared.name()
+                ))
+            };
+            Ok(((stack, shared), [one("f16")?, one("f32")?]))
+        })
+        .collect()
+}
+
 /// The pipelines of the pass's routing and grouped experts.
 pub(crate) struct RoutedPipelines {
     q4k: RoutedFamily,
@@ -89,6 +113,12 @@ pub(crate) struct RoutedPipelines {
     a4: RoutedFamily,
     q8_0: RoutedFamily,
     q5k: RoutedFamily,
+    /// The pair tile of a shared expert of another type than the stacks, a
+    /// pair of [`super::APART_GATE_UP`], and the plain tile of a pair of
+    /// [`super::APART_DOWN`]: the simdgroup program's, whichever program the
+    /// other families come from.
+    apart_pair: Vec<ApartTile>,
+    apart_plain: Vec<ApartTile>,
     f32w: Pipeline,
     select: Pipeline,
     table: Pipeline,
@@ -107,6 +137,8 @@ impl RoutedPipelines {
             a4: RoutedFamily::new(gemm, "a4")?,
             q8_0: RoutedFamily::new(gemm, "q8_0")?,
             q5k: RoutedFamily::new(gemm, "q5k")?,
+            apart_pair: apart_tiles(library, &super::APART_GATE_UP, "pair")?,
+            apart_plain: apart_tiles(library, &super::APART_DOWN, "plain")?,
             f32w: library.pipeline("gemm_f32w_store_f32")?,
             select: library.pipeline("route_rows_select")?,
             table: library.pipeline("route_table")?,
@@ -115,14 +147,30 @@ impl RoutedPipelines {
         })
     }
 
-    fn family(&self, quant: Quant) -> &RoutedFamily {
-        match quant {
+    /// The tiles for stacks of `quant` and shared tensors of `shared`, the
+    /// pair tile or the plain, one a pipeline per operand; `None` for a type
+    /// or a pair with no entry.
+    fn tiles(&self, quant: Quant, shared: Quant, pair: bool) -> Option<&[Pipeline; 2]> {
+        if shared != quant {
+            let table = if pair {
+                &self.apart_pair
+            } else {
+                &self.apart_plain
+            };
+            return table
+                .iter()
+                .find(|(types, _)| *types == (quant, shared))
+                .map(|(_, tiles)| tiles);
+        }
+        let family = match quant {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
             Quant::A4 => &self.a4,
             Quant::Q8_0 => &self.q8_0,
             Quant::Q5K => &self.q5k,
-        }
+            Quant::F32 => return None,
+        };
+        Some(if pair { &family.pair } else { &family.plain })
     }
 }
 
@@ -237,8 +285,12 @@ const ROUTED_WHAT: &str = "routed gemm";
 
 /// One grouped GEMM over the route table's tiles.
 pub struct RoutedParams<'w> {
-    /// The weight type of the stacks and the shared tensors.
+    /// The weight type of the stacks.
     pub quant: Quant,
+    /// The weight type of the shared tensors: `quant`, or the second of a
+    /// pair of the kind's table ([`super::apart_table`]). An instance with no
+    /// shared group takes `quant`.
+    pub shared_quant: Quant,
     /// The pair or the plain tile.
     pub kind: RoutedKind,
     /// The operand type the GEMM computes in.
@@ -536,13 +588,36 @@ impl Kernels {
                 p.slots, p.x_rows, p.max_tiles
             )));
         }
+        let pair = p.kind == RoutedKind::Pair;
+        let tiles = self
+            .routed
+            .tiles(p.quant, p.shared_quant, pair)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "stacks of {} and a shared expert of {}: no entry",
+                    p.quant.name(),
+                    p.shared_quant.name()
+                ))
+            })?;
+        if !p.cols.is_multiple_of(p.shared_quant.values_per_block()) {
+            return Err(refuse(format!(
+                "{} columns are not whole blocks of {}",
+                p.cols,
+                p.shared_quant.values_per_block()
+            )));
+        }
         let nblocks = p.cols / vpb;
         let one = weight_bytes(p.quant, p.rows, nblocks)
             .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
+        let shared_one = weight_bytes(
+            p.shared_quant,
+            p.rows,
+            p.cols / p.shared_quant.values_per_block(),
+        )
+        .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
         let stack_bytes = one
             .checked_mul(p.experts)
             .ok_or_else(|| refuse(format!("{} experts of {one} bytes wrap", p.experts)))?;
-        let pair = p.kind == RoutedKind::Pair;
         let has_shared = self.geom.experts.has_shared;
         if pair != p.stack_up.is_some() || p.shared_up.is_some() != (pair && p.shared.is_some()) {
             return Err(refuse(
@@ -563,10 +638,16 @@ impl Kernels {
                 ));
             }
         }
+        if p.shared.is_none() && p.shared_quant != p.quant {
+            return Err(refuse(format!(
+                "a shared type of {}, and no shared expert",
+                p.shared_quant.name()
+            )));
+        }
         check_window_len(ROUTED_WHAT, "stack", p.stack.len(), stack_bytes)?;
         let mut windows = vec![("stack", p.stack)];
         if let Some(shared) = p.shared {
-            check_window_len(ROUTED_WHAT, "shared", shared.len(), one)?;
+            check_window_len(ROUTED_WHAT, "shared", shared.len(), shared_one)?;
             windows.push(("shared", shared));
         }
         if let Some(up) = p.stack_up {
@@ -574,7 +655,7 @@ impl Kernels {
             windows.push(("up stack", up));
         }
         if let Some(shared_up) = p.shared_up {
-            check_window_len(ROUTED_WHAT, "shared up", shared_up.len(), one)?;
+            check_window_len(ROUTED_WHAT, "shared up", shared_up.len(), shared_one)?;
             windows.push(("shared up", shared_up));
         }
         for (name, w) in &windows {
@@ -600,9 +681,7 @@ impl Kernels {
             u32::from(p.gather),
             word(ROUTED_WHAT, "the outputs an expert", p.rows)?,
         ]);
-        let family = self.routed.family(p.quant);
-        let table = if pair { &family.pair } else { &family.plain };
-        encoder.set_pipeline(&table[operand_at(p.operand)]);
+        encoder.set_pipeline(&tiles[operand_at(p.operand)]);
         let mut slot = Bindings::new(encoder);
         // An instance with no shared group binds the stack in the shared
         // tensors' places, which the kernel does not read.
