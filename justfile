@@ -104,8 +104,10 @@ lab-metal:
 # (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count, the
 # fault path of a bad token id, the session as the generation loop's target (its greedy loop, logits read-back,
 # prompt and cut rules), the generation core the CLI runs (ids, stops, sink) and the profile step (its picks and logits
-# equal the plain step's, its group tags covering the count's groups, its weight bytes equal the file's own tensors);
-# then the gate's kernel mutants, each of which its clause must catch; then the generate_metal CLI's smoke on the qwen35moe fixture (and, for the ids
+# equal the plain step's, its group tags covering the count's groups, its weight bytes equal the file's own tensors) and
+# the MLX folder of the fixture opened as it is, which must tell what its prepared split tells (m_mlx_folder; before the
+# gate, model-hf's hw_a_ tests hold the two files' tensor bytes equal); then the gate's kernel mutants, each of which its
+# clause must catch; then the generate_metal CLI's smoke on the qwen35moe fixture (and, for the ids
 # and the text prompt, on the qwen3moe fixture): the batch set's first ids
 # through --tokens must print g_generate's reference ids (the fixture family is pinned by sha, so the ids are baked
 # here), a text prompt must decode to non-empty stdout, and the decode rate and the profile's decode_ms must count the
@@ -118,6 +120,8 @@ lab-metal-e2e:
     # A step that fails ends the recipe with its own exit code, named by its command line.
     run() { "$@" || { rc=$?; echo "lab-metal-e2e: '$*' failed (rc $rc)" >&2; exit "$rc"; }; }
     run cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e --bin generate_metal --bin bloomery-serve-metal
+    # model-hf's hw_a_ tests are #[ignore]d for the fixture root's MLX folders and their splits, which only this recipe has.
+    cargo test -p bloomery-model-hf --lib -- --ignored hw_a_
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3moe
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all

@@ -2404,8 +2404,8 @@ mod tests {
                 need: layout.file_len(),
             }
         );
-        assert_eq!(header.split.tensor_count(), t.tensors.len());
-        let out = check(&header.split, CTX);
+        assert_eq!(header.split().tensor_count(), t.tensors.len());
+        let out = check(header.split(), CTX);
         assert!(out.items.is_empty(), "{:?}", out.items);
         // The open of the same file stays a named error.
         let e = Split::open(&file.0).err().expect("the open refuses");

@@ -76,6 +76,10 @@
 //!   through the session — the reader admitting its sites through Metal's
 //!   site lists — and `generate` over `Plain` emits the session's own
 //!   host-fed picks (`t_target`'s greedy pattern on that session).
+//! - `m_mlx_folder`: the row's MLX checkpoint folder (`<family>-mlx` under the
+//!   fixture root), opened as it is with no `prepare`, tells what the split made
+//!   of it (`<family>-mlxsplit`) tells: the plan's lines, the first host-fed
+//!   ids and the first step's logits row, bit for bit.
 //!
 //! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`, `q_layers`,
 //!   `q_mark`, `q_mark_cut`, `q_marked`: the batched prompt pass (`pass.rs`): a prompt of at
@@ -489,7 +493,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 25] = [
+    const NAMES: [&str; 26] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -503,6 +507,7 @@ pub fn main() -> ExitCode {
         "f_deep",
         "p_profile",
         "m_mlx",
+        "m_mlx_folder",
         "q_short",
         "q_state",
         "q_chunk",
@@ -699,6 +704,7 @@ pub fn main() -> ExitCode {
                 "f_deep" => deep::f_deep(&device, library, &path),
                 "p_profile" => profile::p_profile(&device, library, &path),
                 "m_mlx" => mlx::m_mlx(&device, library),
+                "m_mlx_folder" => mlx::m_mlx_folder(&device, library),
                 "q_short" => pass::q_short(&device, library, &path),
                 "q_state" => pass::q_state(&device, library, &path),
                 "q_chunk" => pass::q_chunk(&device, library, &path),

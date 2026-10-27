@@ -845,9 +845,9 @@ generate_metal --plan [--ctx C]
         let header = plan::open_header(model)?;
         let ctx = match ctx {
             Some(c) => c,
-            None => default_ctx(&header.split, model)?,
+            None => default_ctx(header.split(), model)?,
         };
-        let outcome = check::check(&header.split, ctx);
+        let outcome = check::check(header.split(), ctx);
         Ok(plan::render(
             model,
             header.data,

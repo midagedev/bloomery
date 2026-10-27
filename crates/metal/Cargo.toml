@@ -104,6 +104,9 @@ bloomery-os.workspace = true
 # file's description the plan is read from.
 bloomery-chain.workspace = true
 bloomery-model = { path = "../model" }
+# The model file a session opens, a GGUF split or a checkpoint folder behind one
+# owner (`ModelFile`, `Weights`): this crate parses no checkpoint of its own.
+bloomery-model-hf = { path = "../model-hf" }
 # Where the fixture file sits (the one owner of the fixture root and layout),
 # and the e2e gate's oracle: ik's reference sets, opened through their family.
 bloomery-refset = { path = "../refset" }
