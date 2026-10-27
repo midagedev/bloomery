@@ -45,7 +45,7 @@ tensor's name.
 
 | File | State | Evidence |
 |---|---|---|
-| Qwen3.6-35B-A3B, Q4_K_M GGUF, or an MLX 4-bit folder converted by `prepare` | runs | [`../mac.md`](../mac.md) (numbers, conditions) |
+| Qwen3.6-35B-A3B, Q4_K_M GGUF, or an MLX 4-bit folder (`--hf` or `-m`; `prepare` is optional) | runs | [`../mac.md`](../mac.md) (numbers, conditions) |
 | MiniCPM-V 4.7 35B-A3B, Q4_K_M | runs, **text only**: its `mmproj` is not read on Metal. Its vocabulary is 248,144; the open refused it before PR #805 (`58d583fa6`) with `qwen35moe arena: a vocabulary of 248144; the head reads 248320`, and the v0.3.9 tag does not hold that commit | PR #805's comment: `generate_metal` on a real file, rc 1 at the base and rc 0 with the change |
 | Ornith-1.5-35B, Q4_K_M | runs, text only, on v0.3.9's `crates/metal` too. It has Qwen3.6's shapes and a next-token layer beyond the trunk; the open reads the trunk's layers only (`crates/model/src/arch/qwen35moe/spec.rs:9`) | PR #805's comment: rc 0 at the base and with the change |
 | Sage-A1.5, Q4_K_M | not run on Metal in the sources of this page `[unverified]`. Its file has Qwen3.6's shapes, plans the same weight bytes (`--plan` on the CUDA path) and carries a next-token layer too ([`../models.md`](../models.md)), so it is expected to open as Ornith does | none yet |

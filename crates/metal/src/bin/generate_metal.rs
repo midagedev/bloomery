@@ -1,21 +1,29 @@
 //! `generate_metal` — the qwen35moe session's decode CLI on Metal: a
 //! qwen35moe file opened on this Mac's device, greedy, one token a step, the
 //! generated text streamed as ids are picked. The flags spell what the CUDA
-//! family's `generate_qwen3moe` spells where the meaning is the same; the
-//! file is `$BLOOMERY_REF_MODEL`, as there.
+//! family's `generate_qwen3moe` spells where the meaning is the same.
 //!
-//!     generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
+//!     generate_metal [-m PATH | --hf REPO]
+//!                    (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--profile [N]] [--profile-layers]
 //!                    [--step-times [N]] [--prefill batch|steps] [--pass-times U]
-//!     generate_metal --plan [--ctx C]
+//!     generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
+//!
+//! The model is a GGUF file's first shard or a checkpoint folder (an MLX
+//! folder as downloaded, no `prepare`), named by `-m PATH`, by `--hf REPO`
+//! (fetched into the cache, `bloomery_metal::model_arg`) or by
+//! `$BLOOMERY_REF_MODEL`, as the CUDA CLIs read it. It is named once: a
+//! path beside `--hf`, `-m` or `--hf` twice, and a flag that differs from the
+//! variable are each a named error and exit 2. The file opens once, for the
+//! tokenizer, the plan's check and the session.
 //!
 //! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
-//! flag given twice takes its last value. `--prompt` tokenizes the text with
-//! the file's own vocabulary (`tokenizer`, the specials the header asks for,
-//! no chat template — the CUDA CLI runs none either; a server's seat runs
-//! the file's). The generation stops at the count, at an end-of-generation
-//! id of the vocabulary's own set, or at the cache's last row; the summary
-//! lines say which.
+//! flag given twice takes its last value, but `-m` and `--hf` (above).
+//! `--prompt` tokenizes the text with the file's own vocabulary (`tokenizer`,
+//! the specials the header asks for, no chat template — the CUDA CLI runs
+//! none either; a server's seat runs the file's). The generation stops at
+//! the count, at an end-of-generation id of the vocabulary's own set, or at
+//! the cache's last row; the summary lines say which.
 //!
 //! The text streams through the tokenizer's decoder, so a multi-byte
 //! character split across pieces prints once, complete; `--print-ids`
@@ -77,8 +85,9 @@
 //! open would make buffers of, every refusal the open's checks meet (not the
 //! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
 //! items` (exit 3). A file whose data section is cut short is read as a header
-//! alone; a header the plan cannot read is a named error and exit 64. It takes
-//! no generation flag.
+//! alone; a header the plan cannot read is a named error and exit 64; a repo
+//! it cannot fetch is a named error and exit 1. `--hf` fetches what the cache
+//! lacks before the plan reads it. It takes no generation flag.
 //!
 //! A bad flag or a bad value is a named error and exit 2; a refusal of the
 //! device, the session or the tokenizer, or a fault the device raised, is a
@@ -98,6 +107,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(target_os = "macos")]
 mod cli {
     use std::io::Write as _;
+    #[cfg(feature = "encode-trace")]
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
@@ -111,29 +121,42 @@ mod cli {
     };
     use bloomery_metal::device::MetalDevice;
     use bloomery_metal::kernels::PASS_ROWS;
+    use bloomery_metal::model_arg;
+    use hf::source::Source;
+    use model_hf::ModelFile;
     use runtime::prompt::PrefillMode;
     use runtime::{Target, Want};
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
 
-    /// The model file `MODEL_ENV` names, or why there is none.
-    fn model_path() -> Result<PathBuf, String> {
-        match std::env::var_os(MODEL_ENV) {
-            Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-            _ => Err(format!(
-                "no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
-            )),
-        }
+    /// The model's path flags; `--hf` is the repo's.
+    const PATH_FLAGS: &[&str] = &["-m"];
+
+    /// The model the flags and `MODEL_ENV` name, or why there is none; the repo is fetched
+    /// by the run, not here.
+    fn model_source() -> Result<Source, String> {
+        let env = match std::env::var(MODEL_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => return Err(format!("{MODEL_ENV}: {e}")),
+        };
+        model_arg::named(
+            &value_flags()?,
+            PATH_FLAGS,
+            env.as_deref(),
+            &format!("-m PATH or --hf REPO, or set {MODEL_ENV}"),
+        )
     }
 
     /// The cache rows' default cap.
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
-generate_metal --plan [--ctx C]
-  the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
+generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
+generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
+  the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
+  by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
   and the file's context_length; --plan reads the header alone and prints
   every refusal the open would make, the bytes it would allocate and the
   room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
@@ -147,6 +170,8 @@ generate_metal --plan [--ctx C]
 
     /// The flags that take a value.
     const VALUE_FLAGS: &[&str] = &[
+        "-m",
+        "--hf",
         "--prompt",
         "--tokens",
         "-n",
@@ -191,13 +216,13 @@ generate_metal --plan [--ctx C]
         /// `--encode-trace FILE`: where the run's encode trace is written.
         #[cfg(feature = "encode-trace")]
         encode_trace: Option<PathBuf>,
-        model: PathBuf,
+        model: Source,
     }
 
-    /// Every value of flag `name`, in order. The walk takes each value flag's
-    /// next argument as its value, so a value is never read as a flag; a
+    /// Every value flag with its value, in order. The walk takes each value
+    /// flag's next argument as its value, so a value is never read as a flag; a
     /// value flag without its value is refused by name.
-    fn flags(name: &str) -> Result<Vec<String>, String> {
+    fn value_flags() -> Result<Vec<(String, String)>, String> {
         let mut args = std::env::args().skip(1);
         let mut out = Vec::new();
         while let Some(a) = args.next() {
@@ -205,11 +230,18 @@ generate_metal --plan [--ctx C]
                 continue;
             }
             let value = args.next().ok_or_else(|| format!("{a} needs a value"))?;
-            if a == name {
-                out.push(value);
-            }
+            out.push((a, value));
         }
         Ok(out)
+    }
+
+    /// Every value of flag `name`, in order.
+    fn flags(name: &str) -> Result<Vec<String>, String> {
+        Ok(value_flags()?
+            .into_iter()
+            .filter(|(flag, _)| flag == name)
+            .map(|(_, value)| value)
+            .collect())
     }
 
     /// The last value of flag `name`, if it was given.
@@ -350,7 +382,7 @@ generate_metal --plan [--ctx C]
             Some(s) => PrefillMode::from_name(&s)
                 .ok_or_else(|| format!("--prefill {s}: batch or steps"))?,
         };
-        let model = model_path()?;
+        let model = model_source()?;
         Ok(Args {
             prompt,
             n: n_gen,
@@ -364,20 +396,6 @@ generate_metal --plan [--ctx C]
             encode_trace: flag("--encode-trace")?.map(PathBuf::from),
             model,
         })
-    }
-
-    /// The cache rows a run holds: the asked count, else the smaller of the
-    /// default cap and the file's `context_length` — the key the plan
-    /// reader reads, read here once more for the default alone.
-    fn ctx_of(a: &Args) -> Result<usize, String> {
-        match a.ctx {
-            Some(c) => Ok(c),
-            None => {
-                let split = gguf::Split::open(&a.model)
-                    .map_err(|e| format!("{}: {e}", a.model.display()))?;
-                default_ctx(&split, &a.model)
-            }
-        }
     }
 
     /// The `--ctx` value: absent, or a count of at least one row.
@@ -792,9 +810,9 @@ generate_metal --plan [--ctx C]
     }
 
     /// `--plan`: the header's plan on stdout, the code it ends with. It takes
-    /// `--ctx` and no other flag but `--help`, which `parse` answers first
-    /// in a generation run: a flag that would do nothing here is refused by
-    /// name.
+    /// `--ctx`, the model's flags and no other flag but `--help`, which
+    /// `parse` answers first in a generation run: a flag that would do
+    /// nothing here is refused by name.
     fn plan_run() -> ExitCode {
         if let Some(name) = unknown_flag() {
             eprintln!("generate_metal: {name} is not a flag of this CLI");
@@ -805,7 +823,7 @@ generate_metal --plan [--ctx C]
             return ExitCode::SUCCESS;
         }
         let other = std::env::args().skip(1).find(|a| {
-            (VALUE_FLAGS.contains(&a.as_str()) && a != "--ctx")
+            (VALUE_FLAGS.contains(&a.as_str()) && !["--ctx", "-m", "--hf"].contains(&a.as_str()))
                 || (BARE_FLAGS.contains(&a.as_str()) && a != "--plan")
                 || COUNT_FLAGS.contains(&a.as_str())
         });
@@ -820,14 +838,21 @@ generate_metal --plan [--ctx C]
                 return ExitCode::from(2);
             }
         };
-        let model = match model_path() {
-            Ok(p) => p,
+        let source = match model_source() {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("generate_metal: {e}");
                 return ExitCode::from(2);
             }
         };
-        match plan_of(&model, ctx) {
+        let model = match model_arg::resolve(&source) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("generate_metal: --plan: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match plan_of(&model.path, ctx) {
             Ok(printed) => {
                 for line in &printed.lines {
                     println!("{line}");
@@ -859,10 +884,12 @@ generate_metal --plan [--ctx C]
     }
 
     fn generate(a: &Args) -> Result<(), String> {
+        let model = model_arg::resolve(&a.model)?;
+        let file = ModelFile::open(&model.path).map_err(|e| e.to_string())?;
         // The tokenizer decodes what the run streams and owns the
         // end-of-generation set, so every run opens it, whatever named the
         // prompt.
-        let tok = tokenizer::Tokenizer::from_gguf(&a.model).map_err(|e| e.to_string())?;
+        let tok = file.tokenizer().map_err(|e| e.to_string())?;
         let prompt = match &a.prompt {
             Prompt::Text(t) => tok.encode(t, true, false),
             Prompt::Ids(v) => v.clone(),
@@ -870,9 +897,14 @@ generate_metal --plan [--ctx C]
         if prompt.is_empty() {
             return Err("the prompt has no ids".into());
         }
-        let ctx = ctx_of(a)?;
+        // The cache rows: the asked count, else the smaller of the default cap and the file's
+        // `context_length`.
+        let ctx = match a.ctx {
+            Some(c) => c,
+            None => default_ctx(file.header(), &model.path)?,
+        };
         // The library is the instance the file's shape selects, by the check `--plan` prints.
-        let instance = Session::instance_of(&a.model, ctx).map_err(|e| e.to_string())?;
+        let instance = Session::instance_of_model(&file, ctx).map_err(|e| e.to_string())?;
         if instance.name == bloomery_metal::instance::UNREGISTERED {
             eprintln!(
                 "metal: {instance}: no registered instance holds this shape, so no gate checked its output"
@@ -880,8 +912,10 @@ generate_metal --plan [--ctx C]
         }
         let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
         let t0 = Instant::now();
-        let mut session =
-            Session::open(&device, device.library(), &a.model, ctx).map_err(|e| e.to_string())?;
+        let mut session = Session::open_model(&device, device.library(), &file, ctx)
+            .map_err(|e| e.to_string())?;
+        // The session holds its own buffers: the file's mapping is not kept for the run.
+        drop(file);
         session.set_prefill(a.prefill);
         let open_s = t0.elapsed().as_secs_f64();
         #[cfg(feature = "encode-trace")]
@@ -917,7 +951,7 @@ generate_metal --plan [--ctx C]
         let prompt_s = out.prompt_wall.as_secs_f64();
         let decode_s = out.decode_wall.as_secs_f64();
         eprintln!("# development-loop numbers: no lease, no witness");
-        eprintln!("model={}", a.model.display());
+        eprintln!("model={}", model.path.display());
         eprintln!("gemm_path={}", device.library().gemm_path().name());
         eprintln!("open_s={open_s:.3}");
         let split = session.open_split();
