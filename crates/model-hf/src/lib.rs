@@ -5,13 +5,18 @@
 //! and layouts, [`arch::qwen35moe`] maps Qwen3.8-Flash-Next's onto qwen4exp's and Qwen3.6's MLX
 //! folder onto qwen35moe's, [`folder`] is the one reader of a checkpoint folder that every such
 //! map plugs into (its plan, header, located split and tokenizer check), the `prepare` bin writes
-//! a GGUF split from such a checkpoint folder, and [`part`] reads a load's tensors, whole or a
-//! rank's part, from a checkpoint folder as `model::part` reads them from a GGUF file.
+//! a GGUF split from such a checkpoint folder, [`part`] reads a load's tensors, whole or a
+//! rank's part, from a checkpoint folder as `model::part` reads them from a GGUF file, and
+//! [`model_file`] is the one owner of the choice between a GGUF split and a checkpoint folder:
+//! a path opens as either, and its header, tokenizer, name and weights are asked of one value.
 
 pub mod arch;
 pub mod folder;
+pub mod model_file;
 pub mod part;
 pub mod remote;
+
+pub use model_file::{ModelFile, Weights};
 
 #[cfg(test)]
 mod test_support {
@@ -204,6 +209,70 @@ mod test_support {
         for file in ["tokenizer_config.json", "generation_config.json"] {
             std::fs::write(dir.join(file), "{}").unwrap();
         }
+    }
+
+    /// A folder `dir` of two layers of a Qwen3-MoE as small as the groups allow, in MLX's names
+    /// with the real file's `quantization` block (no `mode`): the 4-bit linears and stacked
+    /// experts, the 8-bit routers, the BF16 vectors, and a tokenizer of eight ids.
+    pub(crate) fn small_qwen3_folder(dir: &Path) {
+        let mut quantization = json!({"group_size": 64, "bits": 4});
+        for l in 0..2 {
+            quantization.as_object_mut().unwrap().insert(
+                format!("model.layers.{l}.mlp.gate"),
+                json!({"group_size": 64, "bits": 8}),
+            );
+        }
+        let config = json!({
+            "architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
+            "attention_bias": false, "decoder_sparse_step": 1, "mlp_only_layers": [],
+            "norm_topk_prob": true, "rope_scaling": null, "sliding_window": null,
+            "tie_word_embeddings": false, "hidden_act": "silu",
+            "bos_token_id": 2, "eos_token_id": 2, "vocab_size": 8,
+            "num_hidden_layers": 2, "max_position_embeddings": 4096, "hidden_size": 64,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
+            "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64,
+            "intermediate_size": 128, "rms_norm_eps": 1e-6, "rope_theta": 1e6,
+            "quantization": quantization, "quantization_config": quantization,
+        });
+        let mut t: Vec<Stored> = vec![];
+        for stem in ["model.embed_tokens", "lm_head"] {
+            t.extend(mlx_linear(stem, 4, &[8], 64));
+        }
+        t.push(bf16_tensor("model.norm.weight", &[64], |_| 0x3fc0));
+        for l in 0..2 {
+            let m = format!("model.layers.{l}");
+            for (norm, bf16) in [
+                ("input_layernorm", 0x3fc0),
+                ("post_attention_layernorm", 0x3f80),
+            ] {
+                t.push(bf16_tensor(&format!("{m}.{norm}.weight"), &[64], |_| bf16));
+            }
+            t.extend(mlx_linear(&format!("{m}.mlp.gate"), 8, &[4], 64));
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                t.extend(mlx_linear(
+                    &format!("{m}.mlp.switch_mlp.{proj}"),
+                    4,
+                    &[4, 64],
+                    64,
+                ));
+            }
+            for (stem, rows) in [
+                ("q_proj", 64),
+                ("k_proj", 32),
+                ("v_proj", 32),
+                ("o_proj", 64),
+            ] {
+                t.extend(mlx_linear(&format!("{m}.self_attn.{stem}"), 4, &[rows], 64));
+            }
+            for norm in ["q_norm", "k_norm"] {
+                t.push(bf16_tensor(
+                    &format!("{m}.self_attn.{norm}.weight"),
+                    &[32],
+                    |_| 0x3e80,
+                ));
+            }
+        }
+        write_folder(dir, &t, &config, &tokenizer("qwen2"));
     }
 
     /// A fresh folder under the system's temporary one.
