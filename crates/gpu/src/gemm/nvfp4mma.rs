@@ -330,11 +330,47 @@ const W_STAGE: usize = TILE_ROWS * ROW_W;
 /// u32 words of one stage's 64 activation rows, the weight rows' pitch.
 const B_STAGE: usize = 64 * ROW_W;
 /// u32 words of one half's scale words: the weight rows', then the
-/// activation rows'.
+/// activation rows' in [`col_scale`] order.
 const S_HALF: usize = TILE_ROWS + 64;
 const S_STAGE: usize = HALVES * S_HALF;
 /// The K walk's shared stages: a step's planes land two steps ahead.
 const STAGES: usize = 3;
+
+/// Where activation column `c < 64` keeps its scale word among a half's
+/// activation scale words: column `8n + g`, fragment `n`'s column of lane
+/// group `g`, at `8g + n`, so a lane's scales of fragments `4q .. 4q + 4`
+/// are one aligned quad ([`scale_quad`]).
+#[inline(always)]
+const fn col_scale(c: usize) -> usize {
+    8 * (c % 8) + c / 8
+}
+const _: () = {
+    let mut seen = 0u64;
+    let mut c = 0;
+    while c < 64 {
+        seen |= 1 << col_scale(c);
+        c += 1;
+    }
+    assert!(seen == u64::MAX && TILE_ROWS.is_multiple_of(4) && S_HALF.is_multiple_of(4));
+};
+
+/// Lane group `g`'s activation scales of fragments `4q .. 4q + 4`, from a
+/// half's scale words `sp`.
+///
+/// # Safety
+/// `sp` is a half's [`S_HALF`] scale words in shared memory, 16-byte
+/// aligned, after the barrier that publishes them; `g < 8`, `q < 2`.
+#[inline(always)]
+unsafe fn scale_quad(sp: *mut u32, g: usize, q: usize) -> [u32; 4] {
+    // SAFETY: TILE_ROWS + 8g + 4q + 4 <= S_HALF for g < 8, q < 2, a multiple
+    // of four words past the aligned start (this fn's contract).
+    unsafe {
+        (*sp.add(TILE_ROWS + 8 * g + 4 * q)
+            .cast::<cuda_device::vector::U32x4>())
+        .0
+    }
+}
+
 /// u32 words of a route tile's [`TileColumns`]: each of its 64 columns' slot,
 /// then its input scale's bits.
 const COLUMN_WORDS: usize = 2 * 64;
@@ -485,7 +521,7 @@ macro_rules! nvfp4_copy {
                     // owns that half's word of the column in stage st.
                     unsafe {
                         cuda_device::async_copy::cp_async_ca_4(
-                            $sp.add(st * S_STAGE + $half * S_HALF + TILE_ROWS + $sr),
+                            $sp.add(st * S_STAGE + $half * S_HALF + TILE_ROWS + col_scale($sr)),
                             $ae.as_ptr().add($col * $steps + k),
                         )
                     };
@@ -1157,33 +1193,49 @@ mod native {
                             };
                             // SAFETY: each pair of lanes reads the scale row selected by the MMA layout.
                             let sa = unsafe { *sp.add(r + 8 * (t & 1)) };
-                            for n in 0..8 {
+                            for q in 0..2 {
                                 ::cuda_device::thread::__unroll_config::<0>();
-                                if !$full && n >= nt {
+                                if !$full && 4 * q >= nt {
                                     continue;
                                 }
-                                let br = n * 8 + g;
-                                let b_off = chunk(n * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
-                                // SAFETY: the whole warp loads two sets of eight aligned rows within
-                                // this activation stage.
-                                let b = unsafe {
-                                    ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
-                                        bp.add(b_off).cast_const().cast::<u8>(),
-                                    ))
-                                };
-                                // SAFETY: the activation scale follows the weight scales in this half's scale words.
-                                let sb = unsafe { *sp.add(TILE_ROWS + br) };
-                                let c = mma(
-                                    [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
-                                    a,
-                                    b,
-                                    sa,
-                                    sb,
-                                );
-                                acc[n * 4] = c[0];
-                                acc[n * 4 + 1] = c[1];
-                                acc[n * 4 + 2] = c[2];
-                                acc[n * 4 + 3] = c[3];
+                                // SAFETY: q < 2, inside this half's scale words.
+                                let sb = unsafe { scale_quad(sp, g, q) };
+                                // The quad's fragments load before its MMAs, so their shared
+                                // waits overlap.
+                                let mut b = [[0u32; 2]; 4];
+                                for i in 0..4 {
+                                    ::cuda_device::thread::__unroll_config::<0>();
+                                    let n = 4 * q + i;
+                                    if !$full && n >= nt {
+                                        continue;
+                                    }
+                                    let b_off = chunk(n * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
+                                    // SAFETY: the whole warp loads two sets of eight aligned rows within
+                                    // this activation stage.
+                                    b[i] = unsafe {
+                                        ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
+                                            bp.add(b_off).cast_const().cast::<u8>(),
+                                        ))
+                                    };
+                                }
+                                for i in 0..4 {
+                                    ::cuda_device::thread::__unroll_config::<0>();
+                                    let n = 4 * q + i;
+                                    if !$full && n >= nt {
+                                        continue;
+                                    }
+                                    let c = mma(
+                                        [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
+                                        a,
+                                        b[i],
+                                        sa,
+                                        sb[i],
+                                    );
+                                    acc[n * 4] = c[0];
+                                    acc[n * 4 + 1] = c[1];
+                                    acc[n * 4 + 2] = c[2];
+                                    acc[n * 4 + 3] = c[3];
+                                }
                             }
                         }
                     }
@@ -1364,6 +1416,10 @@ mod native {
                         // SAFETY: r < PAIR_ROWS, so PAIR_ROWS + r < TILE_ROWS is the up's scale row in this
                         // half's scale words.
                         let sa_up = unsafe { *sp.add(PAIR_ROWS + r) };
+                        // SAFETY: wc < 2, inside this half's scale words.
+                        let sb = unsafe { scale_quad(sp, g, wc) };
+                        // The warp's fragments load before its MMAs, so their shared waits overlap.
+                        let mut bs = [[0u32; 2]; 4];
                         for n in 0..4 {
                             ::cuda_device::thread::__unroll_config::<0>();
                             let nn = 4 * wc + n;
@@ -1372,13 +1428,18 @@ mod native {
                             }
                             let b_off = chunk(nn * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
                             // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
-                            let b = unsafe {
+                            bs[n] = unsafe {
                                 ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
                                     bp.add(b_off).cast_const().cast::<u8>(),
                                 ))
                             };
-                            // SAFETY: the activation scale follows the weight scales in this half's scale words.
-                            let sb = unsafe { *sp.add(TILE_ROWS + nn * 8 + g) };
+                        }
+                        for n in 0..4 {
+                            ::cuda_device::thread::__unroll_config::<0>();
+                            if !$full && 4 * wc + n >= nt {
+                                continue;
+                            }
+                            let (b, sb) = (bs[n], sb[n]);
                             let c = mma(
                                 [
                                     gacc[n * 4],
