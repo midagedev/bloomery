@@ -25,6 +25,7 @@ crates/gpu/src/host/nvtier.rs 2 the drop-queue tests' drop and read threads, fro
 crates/gpu/src/host/xstream.rs 1 the fallback-copy test's thread that releases the copy stream's hold, from a libtest thread that is never pinned
 crates/gpu/src/host/step.rs 1 the scalar go-wait test's host tier thread, from a libtest thread that is never pinned
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
+crates/gpu/src/parts.rs 1 a parts load's readers, scoped since they borrow the source; each sets its own mask to the pool's cpus before it reads
 crates/model/src/fixture/plan.rs 1 the gate fixture's builder, a gate-side tool
 crates/model/src/placement/host_lock.rs 1 PENDING (triage): the host set's walk at load, spawned by the step thread after pin_caller — every chunk on one cpu
 crates/model/src/r8file.rs 2 PENDING (triage): the r8 repack and check at load; available_parallelism reads the pinned caller's mask, so one thread

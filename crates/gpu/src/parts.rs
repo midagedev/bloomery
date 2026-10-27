@@ -1,18 +1,20 @@
 //! The one load of a part source onto a card (`model::part::Source`: a GGUF file or a
 //! checkpoint folder). The caller's rule says which tensors the card holds, whole, the part of
 //! a rank, or a stack's listed experts, as the source plans them; every planned part's card
-//! format is checked before any is read; then parts are read a run at a time over the pool and
-//! staged in order through one staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
+//! format is checked before any is read; then parts are read a run at a time and staged in
+//! order as they arrive through one staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
 //! ranks passes its family's cut; a one-card load passes its placement plan's card
 //! ([`OnCard`]), and a folder whose host reads tensors where its located header holds them
 //! passes those ([`InPlace`]): the card takes its share of a stack the plan splits between it
 //! and that host, the host reads the rest where the folder stores it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
-use model::part::{Planned, Source, Take, read_ahead};
+use model::part::{Part, Planned, Source, Take, read_ahead};
 use model::placement::workstation::{HostRead, host_available_read};
 use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
 
@@ -23,12 +25,12 @@ use crate::weights::{TensorPart, Weights, part_format, stage_parts};
 /// What the errors name.
 const WHAT: &str = "parts::load";
 
-/// The parts selected by `rule`, read over the pool in runs bounded by owned read and packing
-/// bytes, then staged in plan order. Oversized parts run alone. The placed caller reserves
-/// `LoadPlan::host_bytes` in its host need. Each run is checked against the live host reading
-/// and, when it does not fit, read in smaller runs down to one part at a time; a part alone over
-/// the reading is refused. A refusal drains pending copies before freeing device buffers. Under
-/// `release`, each run's source pages are dropped after staging.
+/// The parts selected by `rule`, read in runs bounded by owned read and packing bytes and staged
+/// in plan order while the run still reads ([`read_staged`]). Oversized parts run alone. The
+/// placed caller reserves `LoadPlan::host_bytes` in its host need. Each run is checked against
+/// the live host reading and, when it does not fit, read in smaller runs down to one part at a
+/// time; a part alone over the reading is refused. A refusal drains pending copies before freeing
+/// device buffers. Under `release`, each run's source pages are dropped after staging.
 pub fn load<S: Source + Sync, E: std::fmt::Display>(
     stream: &CudaStream,
     source: &S,
@@ -61,12 +63,8 @@ fn load_plan<S: Source + Sync>(
     let mut ring = UploadRing::new(stream, plan.upload_bytes)?;
     for run in plan.checked_runs(|| host_available_read().map_err(refused)) {
         let run = run?;
-        let parts = pool_map(run.iter().collect(), |p| {
-            source.read(p).map_err(|e| e.to_string())
-        });
         let mut done = Vec::with_capacity(run.len());
-        for (p, part) in run.iter().zip(parts) {
-            let part = part.map_err(refused)?;
+        read_staged(source, run, |p, part| {
             let one = TensorPart {
                 info: part.info.clone(),
                 spans: part.spans(),
@@ -76,7 +74,8 @@ fn load_plan<S: Source + Sync>(
             let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
             staged.extend(added);
             done.push((p, part));
-        }
+            Ok(())
+        })?;
         let released = pool_map(done, |(p, part)| {
             drop(part);
             match release {
@@ -91,6 +90,62 @@ fn load_plan<S: Source + Sync>(
     }
     ring.finish(stream)?;
     Ok(Weights::of_staged(staged))
+}
+
+/// `run`'s parts read on threads of their own while `stage` takes each, in run order, as soon as
+/// it and every part before it are read, so the staging of a run overlaps its reads. Staging
+/// packs and copies over the pool, which is not reentrant, so the readers are not the pool's;
+/// each first sets its mask to the pool's cpus, since a spawned thread inherits the caller's pin.
+/// The first refusal, a reader's, a read's or the stage's, stops the readers taking more parts.
+fn read_staged<'s, 'r, S: Source + Sync>(
+    source: &'s S,
+    run: &'r [Planned],
+    mut stage: impl FnMut(&'r Planned, Part<'s>) -> Result<(), GpuError>,
+) -> Result<(), GpuError> {
+    let pool = threads::pool();
+    let cpus: Vec<u32> = pool.topology().concat();
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..pool.threads().clamp(1, run.len().max(1)) {
+            let tx = tx.clone();
+            let (next, stop, cpus) = (&next, &stop, &cpus);
+            scope.spawn(move || {
+                let placed = os::set_mask(cpus).map_err(|e| format!("a part reader's cpus: {e}"));
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(p) = run.get(i) else { break };
+                    let read = placed
+                        .clone()
+                        .map(|()| (i, source.read(p).map_err(|e| e.to_string())));
+                    if tx.send(read).is_err() || placed.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut read: Vec<Option<Result<Part<'s>, String>>> = run.iter().map(|_| None).collect();
+        let mut at = 0;
+        let staged = (|| {
+            while at < run.len() {
+                let (i, part) = rx
+                    .recv()
+                    .map_err(|_| refused("a part reader stopped".into()))?
+                    .map_err(refused)?;
+                read[i] = Some(part);
+                while let Some(part) = read.get_mut(at).and_then(Option::take) {
+                    stage(&run[at], part.map_err(refused)?)?;
+                    at += 1;
+                }
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::Relaxed);
+        drop(rx);
+        staged
+    })
 }
 
 /// A placed source shares one admission and upload implementation across model components.
@@ -590,6 +645,72 @@ fn refused(detail: String) -> GpuError {
 mod tests {
     use super::*;
     use model::placement::Role;
+
+    /// A run's parts are staged in run order while later parts still read, and a read's refusal
+    /// stops the stage at that part. The last part's read waits, at most 10 s, for the first
+    /// part's stage. Mutants: staging in arrival order stages the later, faster reads first;
+    /// staging once every read is in leaves the last read waiting until it is refused.
+    #[test]
+    fn a_run_stages_in_order_as_its_reads_arrive() {
+        /// Signals the first part's stage, for the last part's read.
+        struct Slow(std::sync::Mutex<mpsc::Receiver<()>>);
+        impl Source for Slow {
+            type Error = std::io::Error;
+            fn plan<E: std::fmt::Display>(
+                &self,
+                _: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+            ) -> Result<Vec<Planned>, Self::Error> {
+                unreachable!()
+            }
+            fn read_bytes(&self, _: &Planned) -> Result<u64, Self::Error> {
+                unreachable!()
+            }
+            fn read(&self, p: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
+                let i = p.info.offset;
+                std::thread::sleep(std::time::Duration::from_millis(2 * (12 - i)));
+                if i == 8 {
+                    let first = self.0.lock().unwrap();
+                    first
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .map_err(|_| std::io::Error::other("part 8 read before part 0 staged"))?;
+                }
+                match i {
+                    9 => Err(std::io::Error::other("part 9 refused")),
+                    _ => Ok(model::part::Part::made(p.info.clone(), vec![i as u8], None)),
+                }
+            }
+        }
+        let run: Vec<Planned> = (0..12)
+            .map(|i| Planned {
+                at: None,
+                info: TensorInfo {
+                    name: format!("p{i}"),
+                    ty: GgmlType::F32,
+                    dims: vec![1],
+                    offset: i,
+                    nbytes: 4,
+                },
+            })
+            .collect();
+        let (staged, first) = mpsc::channel();
+        let slow = Slow(std::sync::Mutex::new(first));
+        let mut order = Vec::new();
+        let mut stage = |p: &Planned, part: model::part::Part<'_>| {
+            assert_eq!(part.spans(), [[p.info.offset as u8]]);
+            if p.info.offset == 0 {
+                staged.send(()).unwrap();
+            }
+            order.push(p.info.offset);
+            Ok(())
+        };
+        read_staged(&slow, &run[..9], &mut stage).unwrap();
+        let error = read_staged(&slow, &run, &mut stage)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("part 9 refused"), "{error}");
+        let want: Vec<u64> = (0..9).chain(0..9).collect();
+        assert_eq!(order, want);
+    }
 
     #[test]
     fn later_reads_use_their_own_peak_under_a_falling_host_room() {
