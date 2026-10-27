@@ -349,6 +349,10 @@ impl MetalOps<'_, '_> {
                 ids,
                 gate: all(&f.gate)?,
                 up: all(&f.up)?,
+                shared_quant: f
+                    .shared
+                    .as_ref()
+                    .map_or(f.gate_up_quant, |s| s.gate_up_quant),
                 shared_gate: f.shared.as_ref().map(|s| all(&s.gate)).transpose()?,
                 shared_up: f.shared.as_ref().map(|s| all(&s.up)).transpose()?,
                 x: x.window(Elems(0), Elems(*hidden))?,
@@ -389,7 +393,11 @@ impl MetalOps<'_, '_> {
             FoldParams {
                 quant: f.down_quant,
                 shared: match &f.shared {
-                    Some(s) => SharedPlan::Same(all(&s.down)?),
+                    Some(s) if s.down_quant == f.down_quant => SharedPlan::Same(all(&s.down)?),
+                    Some(s) => SharedPlan::Apart {
+                        quant: s.down_quant,
+                        weights: all(&s.down)?,
+                    },
                     None => SharedPlan::None,
                 },
                 rows: *hidden,

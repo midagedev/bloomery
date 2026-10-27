@@ -12,7 +12,7 @@
 //! there only then.
 //!
 //! The pass's operand is [`PASS_OPERAND`], one place for every GEMM of the
-//! pass but the router's, which is f32. The pass's step record slot, where
+//! pass but the router's and the f32 projections', which are f32. The pass's step record slot, where
 //! its faults land and its head writes its pick, is its last row's: the pass
 //! is the token at its last position as far as the record goes.
 
@@ -26,8 +26,8 @@ use super::{MetalOps, WHAT, all, all_mut};
 use crate::kernels::{
     AttentionPrefillParams, AttnCache, CombineParams, DeltaRowStrides, DeltaRowsParams, DeltaSnaps,
     EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
-    HeadNormRowsParams, HeadParams, NormRowsParams, Operand, RouteSelectParams, RouteTableParams,
-    RoutedKind, RoutedParams, route_table_words, route_tiles,
+    HeadNormRowsParams, HeadParams, NormRowsParams, Operand, Quant, RouteSelectParams,
+    RouteTableParams, RoutedKind, RoutedParams, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -112,6 +112,35 @@ impl MetalOps<'_, '_> {
         self.enc.memory_barrier();
         let stride = rows.proj_stride;
         for part in &p1.parts {
+            // The f32 projections run as the router's f32 GEMM, a segment a
+            // dispatch, both operands f32.
+            if part.quant == Quant::F32 {
+                for seg in &part.segments {
+                    let at = seg.weight_blocks * part.quant.block_bytes();
+                    let len = seg.rows * seg.cols * size_of::<f32>();
+                    self.kernels.gemm_f32(
+                        self.enc,
+                        F32GemmParams {
+                            rows: seg.rows,
+                            cols: seg.cols,
+                            acts: m,
+                            weights: all(&part.weights)?
+                                .sub(Elems(at), Elems(len))?
+                                .cast::<f32>()?,
+                            x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                            x_stride: *hidden,
+                            y: rows.proj.window_mut(
+                                Elems(seg.out_offset),
+                                Elems((m - 1) * stride + seg.rows),
+                            )?,
+                            y_stride: stride,
+                            fault: &faults[slot],
+                            layer: layer_word(l),
+                        },
+                    )?;
+                }
+                continue;
+            }
             self.kernels.gemm_seg(
                 self.enc,
                 GemmSegParams {
@@ -548,6 +577,10 @@ impl MetalOps<'_, '_> {
             self.enc,
             RoutedParams {
                 quant: f.gate_up_quant,
+                shared_quant: f
+                    .shared
+                    .as_ref()
+                    .map_or(f.gate_up_quant, |s| s.gate_up_quant),
                 kind: RoutedKind::Pair,
                 operand: PASS_OPERAND,
                 cols: *hidden,
@@ -577,6 +610,7 @@ impl MetalOps<'_, '_> {
             self.enc,
             RoutedParams {
                 quant: f.down_quant,
+                shared_quant: f.shared.as_ref().map_or(f.down_quant, |s| s.down_quant),
                 kind: RoutedKind::Plain,
                 operand: PASS_OPERAND,
                 cols: expert_k,

@@ -981,3 +981,96 @@ struct Q5K {
         }
     }
 };
+
+// Sixteen f32 values, 64 bytes: the block f32 weight rows are read in. The
+// router's GEMM (`F32W`, gemm_routed.metal) stages it sixteen values at a
+// time; the segmented mat-vec's `F32` owner below splits it over four lanes.
+struct block_f32_16 {
+    float v[16];
+};
+
+static_assert(sizeof(block_f32_16) == 64, "block_f32_16 is 64 bytes");
+
+// The f32 weight rows' decode owner (block_f32_16, above): the values as
+// they are, `y = w · x`. Four lanes split a 16-value block into quarters of
+// four values, one float4 each, so the 32 lanes cover eight blocks, 128
+// values, a pass (the stride). The owner serves the segmented mat-vec, the
+// one launch that reads f32 weights as a layer's projection (the delta net's
+// `ssm_alpha` and `ssm_beta`); the bodies that need `fold_blocks`, `value` or
+// `dequant16` are not instantiated over it. A quarter's dot is two pairs of
+// products added, so the sum order is fixed here, not by the compiler.
+struct F32 {
+    typedef block_f32_16 Block;
+
+    // The lane's map and registers: ix picks the lane's blocks (eight
+    // apart), il the quarter of one. yl holds the loaded activations, four
+    // consecutive values.
+    struct Lane {
+        short   ix;
+        short   il;
+        float   yl[4];
+    };
+
+    static inline Lane lane_of(ushort tiisg) {
+        Lane lane;
+        lane.ix = (short)(tiisg / 4);  // 0...7
+        lane.il = (short)(tiisg % 4);  // 0...3
+        return lane;
+    }
+
+    static inline int first_block(const thread Lane &lane) {
+        return lane.ix;
+    }
+
+    static inline int block_stride() {
+        return 8;
+    }
+
+    static inline int values_per_block() {
+        return 16;
+    }
+
+    // The lane's values' offset in a block: its quarter.
+    static inline int input_offset(const thread Lane &lane) {
+        return 4 * lane.il;
+    }
+
+    // The activations of one block, in the lane's registers. `gain` and
+    // `sum_sq` are read by the norm load only, `scale` by the route load.
+    template <LoadMode LOAD>
+    static inline void load(thread Lane &lane,
+                            device const float * block,
+                            device const float * gain,
+                            float scale,
+                            thread float * sum_sq) {
+        const int base = input_offset(lane);
+        float a0 = block[base + 0];
+        float a1 = block[base + 1];
+        float a2 = block[base + 2];
+        float a3 = block[base + 3];
+        if (LOAD == LOAD_ROUTE) {
+            a0 *= scale;
+            a1 *= scale;
+            a2 *= scale;
+            a3 *= scale;
+        } else if (LOAD == LOAD_NORM) {
+            *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+            a0 *= gain[base + 0];
+            a1 *= gain[base + 1];
+            a2 *= gain[base + 2];
+            a3 *= gain[base + 3];
+        }
+        lane.yl[0] = a0;
+        lane.yl[1] = a1;
+        lane.yl[2] = a2;
+        lane.yl[3] = a3;
+    }
+
+    // One block's contribution: the lane's quarter of the weights against
+    // its registers, two pairs of products added.
+    static inline float partial(device const Block & blk,
+                                const thread Lane & lane) {
+        const float4 w = *(device const float4 *)(blk.v + 4 * lane.il);
+        return (w.x * lane.yl[0] + w.y * lane.yl[1]) + (w.z * lane.yl[2] + w.w * lane.yl[3]);
+    }
+};

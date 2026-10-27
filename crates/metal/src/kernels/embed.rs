@@ -94,6 +94,9 @@ impl Kernels {
             Quant::Q6K => {
                 return Err(refuse("Q6_K has no embedding entry".to_string()));
             }
+            Quant::F32 => {
+                return Err(refuse("F32 has no embedding entry".to_string()));
+            }
         };
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);

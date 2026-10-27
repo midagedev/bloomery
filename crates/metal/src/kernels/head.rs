@@ -144,6 +144,9 @@ impl Kernels {
             Quant::Q4K => {
                 return Err(refuse("Q4_K has no head entry".to_string()));
             }
+            Quant::F32 => {
+                return Err(refuse("F32 has no head entry".to_string()));
+            }
         };
         let rows_per_threadgroup = HEAD_SIMD_GROUPS * self.rows_per_simd_group;
         let (nblocks, groups) = check(&p, rows_per_threadgroup)?;

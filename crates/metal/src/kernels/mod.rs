@@ -63,7 +63,9 @@ pub use delta_geom::PASS_ROWS;
 pub use delta_geom::RING_ROWS;
 pub use delta_geom::SNAPS;
 pub use embed::EmbedParams;
-pub use experts::{FoldParams, PairParams, SharedPlan};
+pub use experts::{
+    APART_DOWN, APART_GATE_UP, FoldParams, PairParams, SharedPlan, apart_table, shared_entry,
+};
 pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
 pub use gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, GemmSegParams, Operand};
 pub use geometry::{
@@ -120,6 +122,9 @@ pub struct Kernels {
     a4: MatvecPipelines,
     q8_0: MatvecPipelines,
     q5k: MatvecPipelines,
+    /// The f32 weights' one mat-vec entry, the segmented one
+    /// ([`Quant::dense`]).
+    f32_seg: Pipeline,
     /// The dense GEMM of each weight type: every epilogue and operand,
     /// plain and segmented (`gemm.metal`, or `gemm_tensor.metal` on the
     /// tensor-op path).
@@ -327,6 +332,7 @@ impl Kernels {
                 ],
                 count,
             )?,
+            f32_seg: library.pipeline_with_simdgroups("f32_matvec_seg", count)?,
             q4k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q4k")?,
             q6k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q6k")?,
             a4_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4")?,

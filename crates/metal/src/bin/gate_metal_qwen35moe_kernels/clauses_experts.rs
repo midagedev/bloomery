@@ -9,7 +9,9 @@ use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::geom::{ExpertsGeom, Geometry};
 use bloomery_metal::instance::REGISTERED;
-use bloomery_metal::kernels::{FoldParams, PairParams, Quant, ROWS_PER_SIMD_GROUP, SharedPlan};
+use bloomery_metal::kernels::{
+    APART_DOWN, APART_GATE_UP, FoldParams, PairParams, Quant, ROWS_PER_SIMD_GROUP, SharedPlan,
+};
 use gguf::quant::GgmlType;
 
 use super::common::{self, BadArg, Edit, LAYER};
@@ -117,6 +119,7 @@ fn tag(quant: Quant) -> u64 {
         Quant::A4 => 2,
         Quant::Q8_0 => 3,
         Quant::Q5K => 4,
+        Quant::F32 => 5,
     }
 }
 
@@ -165,7 +168,7 @@ pub fn pair_weights_for(
 ) -> Result<PairWeights, String> {
     let ty = quant.ggml();
     let weights = match quant {
-        Quant::Q8_0 | Quant::Q5K => {
+        Quant::Q8_0 | Quant::Q5K | Quant::F32 => {
             return Err(format!("the fixture has no {} experts", quant.name()));
         }
         Quant::Q4K => PairWeights {
@@ -309,7 +312,7 @@ pub fn fold_weights_for(
 ) -> Result<FoldWeights, String> {
     let ty = quant.ggml();
     let [name, shared] = match quant {
-        Quant::Q8_0 | Quant::Q5K => {
+        Quant::Q8_0 | Quant::Q5K | Quant::F32 => {
             return Err(format!("the fixture has no {} experts", quant.name()));
         }
         Quant::Q4K | Quant::A4 => [
@@ -343,6 +346,9 @@ pub fn fold_weights_for(
 
 pub struct PairIn<'a> {
     pub quant: Quant,
+    /// The type of the shared gate and up: `quant`, or the second of a pair
+    /// of the gate-up table.
+    pub shared_quant: Quant,
     pub n_experts: usize,
     pub ids: &'a [i32],
     pub gate: &'a [u8],
@@ -404,6 +410,7 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
             encoder,
             PairParams {
                 quant,
+                shared_quant: launch.shared_quant,
                 slots: e.slots,
                 k: e.k,
                 cols: PAIR_COLS,
@@ -434,6 +441,9 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
 
 pub struct FoldIn<'a> {
     pub quant: Quant,
+    /// The type of the shared down: `quant`, or the second of a pair of the
+    /// down table.
+    pub shared_quant: Quant,
     pub n_experts: usize,
     pub ids: &'a [i32],
     pub down: &'a [u8],
@@ -469,11 +479,19 @@ pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, Stri
     h.encode(|encoder| {
         let shared = shared.window(Elems(WEIGHT_PAD), Elems(launch.shared.len()))?;
         let out = y.window_mut(Elems(OUT_GUARD), Elems(rows))?;
+        let plan = if launch.shared_quant == quant {
+            shared_plan(&e, shared)
+        } else {
+            SharedPlan::Apart {
+                quant: launch.shared_quant,
+                weights: shared,
+            }
+        };
         h.kernels.fold(
             encoder,
             FoldParams {
                 quant,
-                shared: shared_plan(&e, shared),
+                shared: plan,
                 rows,
                 slots: e.slots,
                 k: e.k,
@@ -523,6 +541,18 @@ pub fn check_pair_weights(
     weights: &PairWeights,
     norm: &PairNorm,
 ) -> Result<String, String> {
+    check_pair_mixed(h, quant, quant, weights, norm)
+}
+
+/// [`check_pair_weights`] for stacks of `quant` and a shared expert of
+/// `shared_quant`: the shared slot's rows are held to the shared type's band.
+pub fn check_pair_mixed(
+    h: &Harness<'_>,
+    quant: Quant,
+    shared_quant: Quant,
+    weights: &PairWeights,
+    norm: &PairNorm,
+) -> Result<String, String> {
     let e = h.geom().experts;
     let x = oracle::activations(PAIR_COLS, 0xA11 + tag(quant), 1.0);
     let y0 = vec![f32::from_bits(SENTINEL_BITS); e.slots * e.k];
@@ -531,6 +561,7 @@ pub fn check_pair_weights(
         h,
         PairIn {
             quant,
+            shared_quant,
             n_experts: N_EXPERTS,
             ids: &IDS,
             gate: &weights.gate,
@@ -546,10 +577,16 @@ pub fn check_pair_weights(
         return Err(format!("{} pair raised {f}", quant.name()));
     }
     let x64 = oracle::rms_norm(&x, &norm.gain, norm.eps);
-    let nblocks = PAIR_COLS / quant.values_per_block();
-    let rb = row_bytes(quant, PAIR_COLS);
     let mut worst = 0.0f64;
     for slot in 0..e.slots {
+        // The shared slot is read in the shared type, the rest in the stacks'.
+        let slot_quant = if slot == e.shared_slot {
+            shared_quant
+        } else {
+            quant
+        };
+        let nblocks = PAIR_COLS / slot_quant.values_per_block();
+        let rb = row_bytes(slot_quant, PAIR_COLS);
         for row in 0..e.k {
             let (gate_row, up_row) = if slot == e.shared_slot {
                 (
@@ -561,10 +598,10 @@ pub fn check_pair_weights(
                 let at = (expert * e.k + row) * rb;
                 (&weights.gate[at..at + rb], &weights.up[at..at + rb])
             };
-            let g = oracle::reference(quant, gate_row, 1, PAIR_COLS, &x64)?;
-            let u = oracle::reference(quant, up_row, 1, PAIR_COLS, &x64)?;
+            let g = oracle::reference(slot_quant, gate_row, 1, PAIR_COLS, &x64)?;
+            let u = oracle::reference(slot_quant, up_row, 1, PAIR_COLS, &x64)?;
             let (want, width) = oracle_experts::pair_width(
-                quant,
+                slot_quant,
                 nblocks,
                 g.y[0],
                 g.magnitude[0],
@@ -619,6 +656,7 @@ pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
         h,
         PairIn {
             quant,
+            shared_quant: quant,
             n_experts: N_EXPERTS,
             ids: &IDS,
             gate: &weights.gate,
@@ -642,6 +680,7 @@ pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
             h,
             PairIn {
                 quant,
+                shared_quant: quant,
                 n_experts: N_EXPERTS,
                 ids: &ids,
                 gate: &weights.gate,
@@ -717,6 +756,7 @@ pub fn pair_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
                 h,
                 PairIn {
                     quant,
+                    shared_quant: quant,
                     n_experts: N_EXPERTS,
                     ids: &IDS,
                     gate: &weights.gate,
@@ -769,6 +809,7 @@ pub fn pair_faults(
         h,
         PairIn {
             quant,
+            shared_quant: quant,
             n_experts: N_EXPERTS,
             ids: &IDS,
             gate: &weights.gate,
@@ -791,6 +832,7 @@ pub fn pair_faults(
             h,
             PairIn {
                 quant,
+                shared_quant: quant,
                 n_experts: N_EXPERTS,
                 ids: &bad_ids,
                 gate: &weights.gate,
@@ -851,6 +893,7 @@ pub fn pair_faults(
             h,
             PairIn {
                 quant,
+                shared_quant: quant,
                 n_experts: N_EXPERTS,
                 ids: &IDS,
                 gate: &weights.gate,
@@ -896,6 +939,7 @@ fn solo_slot(
         h,
         PairIn {
             quant,
+            shared_quant: quant,
             n_experts: 1,
             ids: &ids,
             gate,
@@ -924,6 +968,7 @@ pub fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result
         h,
         PairIn {
             quant,
+            shared_quant: quant,
             n_experts: N_EXPERTS,
             ids: &IDS,
             gate: &weights.gate,
@@ -1014,6 +1059,19 @@ pub fn check_fold_weights(
     weights: &FoldWeights,
     rows: usize,
 ) -> Result<String, String> {
+    check_fold_mixed(h, quant, quant, weights, rows)
+}
+
+/// [`check_fold_weights`] for a down stack of `quant` and a shared down of
+/// `shared_quant`: the shared slot's rows are read in the shared type, and
+/// the band is the two ranges' paths end to end.
+pub fn check_fold_mixed(
+    h: &Harness<'_>,
+    quant: Quant,
+    shared_quant: Quant,
+    weights: &FoldWeights,
+    rows: usize,
+) -> Result<String, String> {
     let e = h.geom().experts;
     let route = route_weights(&e);
     let hidden = hidden_states(&e, quant);
@@ -1023,6 +1081,7 @@ pub fn check_fold_weights(
         h,
         FoldIn {
             quant,
+            shared_quant,
             n_experts: N_EXPERTS,
             ids: &IDS,
             down: &weights.down,
@@ -1035,12 +1094,17 @@ pub fn check_fold_weights(
     if let Some(f) = h.fault()? {
         return Err(format!("{} fold raised {f}", quant.name()));
     }
-    let rb = row_bytes(quant, e.k);
     let mut worst = 0.0f64;
     for row in 0..rows {
         let mut want = f64::from(resid[row]);
         let mut magnitude = 0.0;
         for slot in 0..e.slots {
+            let slot_quant = if slot == e.shared_slot {
+                shared_quant
+            } else {
+                quant
+            };
+            let rb = row_bytes(slot_quant, e.k);
             let bytes = if slot == e.shared_slot {
                 &weights.shared[row * rb..(row + 1) * rb]
             } else {
@@ -1052,11 +1116,15 @@ pub fn check_fold_weights(
                 .iter()
                 .map(|&v| f64::from(route[slot]) * f64::from(v))
                 .collect();
-            let reference = oracle::reference(quant, bytes, 1, e.k, &x)?;
+            let reference = oracle::reference(slot_quant, bytes, 1, e.k, &x)?;
             want += reference.y[0];
             magnitude += reference.magnitude[0];
         }
-        let width = oracle_experts::fold_width(&e, quant, magnitude, want);
+        let width = if shared_quant == quant {
+            oracle_experts::fold_width(&e, quant, magnitude, want)
+        } else {
+            oracle_experts::fold_width_apart(&e, quant, shared_quant, magnitude, want)
+        };
         let err = (f64::from(got[row]) - want).abs();
         if !got[row].is_finite() || err > width {
             let ratio = if width > 0.0 {
@@ -1089,6 +1157,7 @@ pub fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Resu
             h,
             FoldIn {
                 quant,
+                shared_quant: quant,
                 n_experts: N_EXPERTS,
                 ids: &ids,
                 down: &weights.down,
@@ -1198,6 +1267,7 @@ fn refuse_pair(
         encoder,
         PairParams {
             quant: Quant::Q4K,
+            shared_quant: Quant::Q4K,
             slots: a.slots,
             k: a.k,
             cols: PAIR_COLS,
@@ -1486,24 +1556,59 @@ pub fn fold_type(h: &Harness<'_>, fix: &Fixture) -> Clause {
             .map_err(why)?,
     };
     let cases = [
-        ("Apart", e.slots, e.k, 1usize, e.routed_ids),
-        ("Apart with a bad slot count", 1, e.k, 1, e.routed_ids),
-        ("Apart with a bad width", e.slots, 256, 1, e.routed_ids),
-        ("Apart with an empty stack", e.slots, e.k, 0, e.routed_ids),
-        ("Apart with an empty id list", e.slots, e.k, 1, 0),
+        (
+            "an Apart pair of no entry",
+            e.slots,
+            e.k,
+            1usize,
+            e.routed_ids,
+        ),
+        (
+            "an Apart pair of no entry with a bad slot count",
+            1,
+            e.k,
+            1,
+            e.routed_ids,
+        ),
+        (
+            "an Apart pair of no entry with a bad width",
+            e.slots,
+            256,
+            1,
+            e.routed_ids,
+        ),
+        (
+            "an Apart pair of no entry with an empty stack",
+            e.slots,
+            e.k,
+            0,
+            e.routed_ids,
+        ),
+        (
+            "an Apart pair of no entry with an empty id list",
+            e.slots,
+            e.k,
+            1,
+            0,
+        ),
     ]
     .into_iter()
     .map(|(what, slots, k, n_experts, id_len)| {
         BadArg::new(
             what,
-            "SharedPlan::Apart",
+            "no entry",
             Box::new(move |b: &mut Bufs, encoder| {
                 let y = b.marker.window_mut(Elems(0), Elems(8))?;
                 h.kernels.fold(
                     encoder,
                     FoldParams {
                         quant: Quant::Q4K,
-                        shared: SharedPlan::Apart,
+                        // Q4_K stacks beside a Q6_K shared expert: not a pair
+                        // of the down table.
+                        shared: SharedPlan::Apart {
+                            quant: Quant::Q6K,
+                            weights: b.down.window(Elems(0), Elems(16))?,
+                        },
                         rows: 4,
                         slots,
                         k,
@@ -1549,8 +1654,139 @@ pub fn fold_type(h: &Harness<'_>, fix: &Fixture) -> Clause {
         common::moved(h, &b.marker, |v| *v != 1.0)
     })?;
     Ok(Verdict::Noted(
-        "Apart is refused by name before the slot count, the width, an empty stack and an empty id list".to_string(),
+        "an Apart pair with no entry is refused by name before the slot count, the width, an empty stack and an empty id list".to_string(),
     ))
+}
+
+/// A mixed pair's weights from synthetic rows: the stacks in `quant`, the
+/// shared gate and up in `shared`.
+fn synthetic_pair_apart(
+    e: &ExpertsGeom,
+    (quant, shared): (Quant, Quant),
+    seed: u64,
+) -> PairWeights {
+    let stack = N_EXPERTS * e.k;
+    PairWeights {
+        gate: synthetic::matrix(quant, stack, PAIR_COLS, seed),
+        up: synthetic::matrix(quant, stack, PAIR_COLS, seed + 1),
+        shared_gate: synthetic::matrix(shared, e.k, PAIR_COLS, seed + 2),
+        shared_up: synthetic::matrix(shared, e.k, PAIR_COLS, seed + 3),
+    }
+}
+
+/// A mixed fold's weights from synthetic rows at `rows` rows an expert: the
+/// down stack in `quant`, the shared down in `shared`.
+fn synthetic_fold_apart(
+    e: &ExpertsGeom,
+    (quant, shared): (Quant, Quant),
+    rows: usize,
+    seed: u64,
+) -> FoldWeights {
+    FoldWeights {
+        down: synthetic::matrix(quant, N_EXPERTS * rows, e.k, seed),
+        shared: synthetic::matrix(shared, rows, e.k, seed + 1),
+    }
+}
+
+/// The epsilon the Apart clauses' norm takes.
+const APART_EPS: f32 = 1e-6;
+
+/// The pair over stacks of one type and a shared expert of another: every
+/// pair of the gate-up table against the oracle, the shared slot held to the
+/// shared type's band, and a pair of types outside the table refused by name.
+pub fn apart_pair(h: &Harness<'_>) -> Clause {
+    let e = h.geom().experts;
+    if !e.has_shared {
+        return Err("the Apart pair needs an instance with a shared slot".to_string());
+    }
+    let norm = synthetic_norm(APART_EPS);
+    let mut parts = Vec::new();
+    for (i, &(quant, shared)) in APART_GATE_UP.iter().enumerate() {
+        let weights = synthetic_pair_apart(&e, (quant, shared), 0xA9A0 + 8 * i as u64);
+        let worst = check_pair_mixed(h, quant, shared, &weights, &norm)?;
+        parts.push(format!("{worst} beside {}", shared.name()));
+    }
+    let (quant, shared) = (Quant::Q4K, Quant::Q6K);
+    let weights = synthetic_pair_apart(&e, (quant, shared), 0xA9B0);
+    let x = oracle::activations(PAIR_COLS, 0xA9B1, 1.0);
+    let launched = launch_pair(
+        h,
+        PairIn {
+            quant,
+            shared_quant: shared,
+            n_experts: N_EXPERTS,
+            ids: &IDS,
+            gate: &weights.gate,
+            up: &weights.up,
+            shared_gate: &weights.shared_gate,
+            shared_up: &weights.shared_up,
+            x: &x,
+            norm: &norm,
+            y0: &vec![f32::from_bits(SENTINEL_BITS); e.slots * e.k],
+        },
+    );
+    match launched {
+        Err(msg) if msg.contains("no entry") => {}
+        Err(msg) => {
+            return Err(format!(
+                "a pair of no entry was refused for another reason: {msg}"
+            ));
+        }
+        Ok(_) => return Err("stacks of q4k and a shared expert of q6k ran".to_string()),
+    }
+    Ok(Verdict::Noted(format!(
+        "worst error over its band: {}; a pair of no entry is refused by name",
+        parts.join(", ")
+    )))
+}
+
+/// The fold over a down stack of one type and a shared down of another:
+/// every pair of the down table against the oracle at the engine's rows and
+/// at a row count no threadgroup divides, and a pair outside the table
+/// refused by name.
+pub fn apart_fold(h: &Harness<'_>) -> Clause {
+    let e = h.geom().experts;
+    if !e.has_shared {
+        return Err("the Apart fold needs an instance with a shared slot".to_string());
+    }
+    let mut parts = Vec::new();
+    for (i, &(quant, shared)) in APART_DOWN.iter().enumerate() {
+        let seed = 0xA9C0 + 8 * i as u64;
+        for rows in [FOLD_ROWS, FOLD_TAIL_ROWS] {
+            let weights = synthetic_fold_apart(&e, (quant, shared), rows, seed);
+            let worst = check_fold_mixed(h, quant, shared, &weights, rows)?;
+            parts.push(format!("{worst} beside {} at {rows} rows", shared.name()));
+        }
+    }
+    let (quant, shared) = (Quant::Q4K, Quant::Q8_0);
+    let weights = synthetic_fold_apart(&e, (quant, shared), FOLD_ROWS, 0xA9D0);
+    let launched = launch_fold(
+        h,
+        FoldIn {
+            quant,
+            shared_quant: shared,
+            n_experts: N_EXPERTS,
+            ids: &IDS,
+            down: &weights.down,
+            shared: &weights.shared,
+            h: &hidden_states(&e, quant),
+            w: &route_weights(&e),
+            y0: &oracle::activations(FOLD_ROWS, 0xA9D1, 2.0),
+        },
+    );
+    match launched {
+        Err(msg) if msg.contains("no entry") => {}
+        Err(msg) => {
+            return Err(format!(
+                "a pair of no entry was refused for another reason: {msg}"
+            ));
+        }
+        Ok(_) => return Err("a down stack of q4k and a shared down of q8_0 ran".to_string()),
+    }
+    Ok(Verdict::Noted(format!(
+        "worst error over its band: {}; a pair of no entry is refused by name",
+        parts.join(", ")
+    )))
 }
 
 /// The expert pair and fold clauses, in gate order.

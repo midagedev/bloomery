@@ -70,3 +70,31 @@ pub fn fold_width(e: &ExpertsGeom, quant: Quant, magnitude: f64, y: f64) -> f64 
     let floor = n as f64 * f64::from(f32::MIN_POSITIVE);
     factor * magnitude * (1.0 + U) + U * y.abs() + floor
 }
+
+/// [`fold_width`] for a down stack of `quant` and a shared down of `shared`:
+/// both ranges add into one lane sum, so a term's path is bounded by its
+/// range's end to end with the other's.
+///
+/// PIN(2026-10-27): the model in this module's doc, and no measured error,
+/// sets the counts: the two store paths of the quants' own block counts, the
+/// route weight and the residual (2).
+#[must_use]
+pub fn fold_width_apart(
+    e: &ExpertsGeom,
+    quant: Quant,
+    shared: Quant,
+    magnitude: f64,
+    y: f64,
+) -> f64 {
+    let routed = oracle::band(
+        quant,
+        (e.slots - 1) * e.k / quant.values_per_block(),
+        Kind::Store,
+    )
+    .ops();
+    let shared = oracle::band(shared, e.k / shared.values_per_block(), Kind::Store).ops();
+    let n = routed + shared + FOLD_EXTRA_OPS;
+    let factor = oracle::gamma_bound(n);
+    let floor = n as f64 * f64::from(f32::MIN_POSITIVE);
+    factor * magnitude * (1.0 + U) + U * y.abs() + floor
+}

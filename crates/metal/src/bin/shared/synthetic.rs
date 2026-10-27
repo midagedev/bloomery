@@ -14,6 +14,14 @@ use super::oracle::Rng;
 /// wider range's weights reach 0.004 · 63 · 31, and their pair outputs pass
 /// the half range a GEMM's f16 operand takes.
 pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+    // F32 rows are the values themselves: small finite floats, not random
+    // bits (which would be NaNs and infinities).
+    if quant == Quant::F32 {
+        let mut rng = Rng::new(seed);
+        return (0..rows * cols)
+            .flat_map(|_| (0.1 * rng.signed()).to_le_bytes())
+            .collect();
+    }
     let block = quant.block_bytes();
     let blocks = rows * cols / quant.values_per_block();
     let mut rng = Rng::new(seed);
@@ -54,6 +62,7 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
                 b[32..34].copy_from_slice(&small_bf16(&mut rng));
                 b[34..36].copy_from_slice(&zero_bias);
             }
+            Quant::F32 => unreachable!("F32 rows are built above"),
         }
     }
     bytes
