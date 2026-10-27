@@ -20,7 +20,8 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::names::routed_stacks;
 use crate::arch::place_hybrid::{
-    self, ring_pass_bytes, route_bytes, stream_ring_bytes, tier_places_bytes, wide_bytes,
+    self, ring_forms_planned, ring_pass_bytes_in, route_bytes, stream_ring_bytes,
+    tier_places_bytes, wide_bytes,
 };
 use crate::placement::PlacementError;
 use crate::placement::accepts::{self, Program};
@@ -155,17 +156,18 @@ pub const STREAM_HALF_SLOTS: u64 = 32;
 
 /// The card bytes the prompt calls' expert stream takes on an M3 load (`BLOOMERY_XSTREAM=split`):
 /// the common rule ([`stream_ring_bytes`]) over the routed layers' three stacks at
-/// [`STREAM_HALF_SLOTS`] a half, beside the ring pass's GEMM buffers at [`PROMPT_ROWS`] rows
-/// ([`ring_pass_bytes`]). Refused by name as the rule refuses.
+/// [`STREAM_HALF_SLOTS`] a half, beside the ring pass's GEMM buffers at [`PROMPT_ROWS`] rows in the
+/// forms the routed stacks read ([`ring_pass_bytes_in`], [`ring_forms_planned`]). Refused by name as the rule refuses.
 pub fn stream_bytes(inputs: &PlanInputs) -> Result<u64, PlacementError> {
     let hp = &inputs.hp;
     let half = STREAM_HALF_SLOTS;
-    let pass = ring_pass_bytes(
+    let pass = ring_pass_bytes_in(
         PROMPT_ROWS,
         hp.experts.n_used,
         hp.n_embd,
         hp.experts.ff,
         half as usize,
+        ring_forms_planned(&inputs.model, routed_stacks),
     ) as u64;
     stream_ring_bytes(
         &inputs.model,

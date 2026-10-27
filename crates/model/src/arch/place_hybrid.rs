@@ -109,6 +109,31 @@ impl RingForms {
     }
 }
 
+/// The forms a plan prices a ring pass in over `model`'s routed layers (`stacks(l)`, the gate, up
+/// and down of layer `l`): a role is the grouped GEMM's form where any layer's type reads it, the
+/// larger of the two, else the 32-value form; a layer whose types no route GEMM reads, or that
+/// holds no routed stacks, adds nothing.
+#[must_use]
+pub fn ring_forms_planned(
+    model: &ModelTensors,
+    stacks: impl Fn(usize) -> [String; 3],
+) -> RingForms {
+    let ty = |name: &String| model.tensors.iter().find(|t| &t.name == name).map(|t| t.ty);
+    let mut forms = RingForms::BLOCKS32;
+    for l in 0..model.layers {
+        let [gate, _, down] = stacks(l);
+        let Some(f) = ty(&gate)
+            .zip(ty(&down))
+            .and_then(|(g, d)| RingForms::of(g, d))
+        else {
+            continue;
+        };
+        forms.gate_up32 &= f.gate_up32;
+        forms.down32 &= f.down32;
+    }
+    forms
+}
+
 /// Card bytes of `cols` columns of `k` values in one route GEMM's read form: the 32-value
 /// form's where `blocks32`, else the grouped GEMM's q8_1 blocks of 128.
 const fn ring_act_bytes(cols: usize, k: usize, blocks32: bool) -> usize {
@@ -791,7 +816,7 @@ mod tests {
 
     use super::*;
     use crate::placement::accepts::Program;
-    use crate::placement::{CardFormat, RoutedRule};
+    use crate::placement::{CardFormat, ModelTensor, Role, RoutedRule};
 
     /// A GQA layer of `kv` key heads, key width `k` and value width `v`, a window of `window`
     /// positions or none, and a rope of `rope` (base, dims) or none.
@@ -1229,5 +1254,73 @@ mod tests {
              expert tier; free host memory (the room is the host's available bytes, or \
              BLOOMERY_HOST_ROOM where set)"
         );
+    }
+
+    /// The planned ring forms: a role is the grouped GEMM's form where any routed layer's type reads
+    /// it (M3.1's i-quant GGUF), the 32-value form where every layer's does (NVFP4, Q8_0), and a
+    /// layer no route GEMM reads (an F32 header) or with no stacks adds nothing. Mutants: the
+    /// first layer's forms alone, a layer with no route GEMM read as the grouped form.
+    #[test]
+    fn a_ring_pass_is_planned_in_its_stacks_largest_forms() {
+        let model = |types: &[(usize, GgmlType, GgmlType)]| ModelTensors {
+            tensors: types
+                .iter()
+                .flat_map(|&(l, gu, d)| {
+                    let [g, u, dn] = crate::arch::names::routed_stacks(l);
+                    [(g, gu), (u, gu), (dn, d)]
+                })
+                .map(|(name, ty)| ModelTensor {
+                    name,
+                    shard: 0,
+                    layer: None,
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: Vec::new(),
+                    file_bytes: 0,
+                    gathered_rows: None,
+                })
+                .collect(),
+            layers: 4,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let planned = |types: &[(usize, GgmlType, GgmlType)]| {
+            ring_forms_planned(&model(types), crate::arch::names::routed_stacks)
+        };
+        let grouped = RingForms {
+            gate_up32: false,
+            down32: false,
+        };
+        assert_eq!(
+            planned(&[(1, GgmlType::IQ2_XS, GgmlType::IQ3_XXS)]),
+            grouped
+        );
+        assert_eq!(
+            planned(&[
+                (0, GgmlType::Q8_0, GgmlType::Q8_0),
+                (2, GgmlType::IQ2_XS, GgmlType::IQ4_XS)
+            ]),
+            grouped
+        );
+        assert_eq!(
+            planned(&[
+                (0, GgmlType::Q8_0, GgmlType::IQ3_XXS),
+                (1, GgmlType::Q8_0, GgmlType::Q8_0)
+            ]),
+            RingForms {
+                gate_up32: true,
+                down32: false
+            }
+        );
+        assert_eq!(
+            planned(&[(0, GgmlType::Q8_0, GgmlType::Q8_0)]),
+            RingForms::BLOCKS32
+        );
+        assert_eq!(
+            planned(&[(0, GgmlType::F32, GgmlType::F32)]),
+            RingForms::BLOCKS32
+        );
+        assert_eq!(planned(&[]), RingForms::BLOCKS32);
     }
 }

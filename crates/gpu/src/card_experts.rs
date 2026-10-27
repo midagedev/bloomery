@@ -47,10 +47,10 @@ use model::placement::kernels::{self, DownAct, DownForms};
 
 use crate::card_leg::ExpertInput;
 use crate::card_leg::{
-    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW, STACK_ROLES,
+    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, STACK_ROLES,
 };
 use crate::card_slots::{CardSlotKernels, Places};
-use crate::gemm::Gemm32Kernels;
+use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::host::xstream::RingLayer;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
@@ -147,9 +147,12 @@ impl CardBufs {
 pub struct CardBatch {
     bufs: CardBufs,
     sel: DeviceBuffer<u32>,
-    /// The ring pass's GEMM buffers in the 32-value form, once the expert
-    /// stream armed them ([`CardExperts::arm_ring`]).
+    /// The ring pass's GEMM buffers in the forms the resident stacks read,
+    /// once the expert stream armed them ([`CardExperts::arm_ring`]).
     ring: Option<RingGemm>,
+    /// The grouped GEMM's kernels, armed with the ring where a form is the
+    /// grouped GEMM's q8_1 blocks of 128.
+    gemm: Option<GemmKernels>,
 }
 
 impl CardBatch {
@@ -263,6 +266,10 @@ pub struct CardExperts {
     n: usize,
     /// The union of the resident layers' selected down activation forms.
     downs: DownForms,
+    /// The one pair of forms every resident layer's stacks read a ring pass
+    /// in ([`RingForms::of`]); `None` when the layers' forms differ or a type
+    /// has no route GEMM.
+    ring_forms: Option<RingForms>,
     expert_input: ExpertInput,
     /// The one-token step's buffers.
     step: CardBufs,
@@ -324,6 +331,7 @@ impl CardExperts {
         let mut per = Vec::with_capacity(layers.len());
         let mut tier_k = Vec::with_capacity(layers.len());
         let mut downs = DownForms::NONE;
+        let mut ring_forms: Option<Option<RingForms>> = None;
         for (l, spec) in layers.iter().enumerate() {
             // A dense block is outside the host run and has no row: no card
             // experts, which the resident-rows check below holds it to. A
@@ -368,6 +376,11 @@ impl CardExperts {
                 "the selected card down's activation form",
             ))?;
             downs = downs.with(act);
+            let forms = RingForms::of(stacks.gate_up_ty(), stacks.down_ty());
+            ring_forms = Some(match ring_forms {
+                None => forms,
+                Some(seen) => seen.filter(|_| seen == forms),
+            });
             per.push(Some(layer));
         }
         let downs = card_downs(downs);
@@ -384,6 +397,7 @@ impl CardExperts {
             ff,
             n,
             downs,
+            ring_forms: ring_forms.flatten(),
             expert_input: ExpertInput::Direct,
             step: CardBufs::new(gpu.stream(), &family, (n, ff, 1), downs)?,
             pass: (rows > 1)
@@ -507,15 +521,18 @@ impl CardExperts {
             bufs,
             sel: DeviceBuffer::zeroed(stream, cap * self.family.n_used)?,
             ring: None,
+            gemm: None,
         })
     }
 
     /// The ring pass's GEMM buffers in `cb` for a half of `half_slots` slots
-    /// of the expert stream's ring ([`RingGemm`], in the 32-value form the
-    /// ring pass reads): made once, when the stream starts; a second arming at
-    /// the same half is nothing. Refused by name: a re-arming at another half,
-    /// and buffers whose made bytes are not `place_hybrid::ring_pass_bytes` of
-    /// their widths. Load-time or first-prompt only.
+    /// of the expert stream's ring ([`RingGemm`], in the forms the resident
+    /// stacks' route GEMMs read, with the grouped GEMM's kernels where one is
+    /// its q8_1 blocks of 128): made once, when the stream starts; a second
+    /// arming at the same half is nothing. Refused by name: a re-arming at
+    /// another half, resident layers whose stacks read different forms, and
+    /// buffers whose made bytes are not `place_hybrid::ring_pass_bytes_in` of
+    /// their widths and forms. Load-time or first-prompt only.
     pub fn arm_ring(
         &self,
         gpu: &Gpu,
@@ -535,9 +552,18 @@ impl CardExperts {
                 ),
             ));
         }
+        let forms = self.ring_forms.ok_or_else(|| {
+            GpuError::shape(
+                what,
+                "the resident layers' stacks read a ring pass in different forms, or in none",
+            )
+        })?;
         let shape = (cb.bufs.cap(), self.family.n_used, self.n, self.ff);
-        let mut ring = RingGemm::new(gpu, shape, half_slots, RingForms::BLOCKS32)?;
+        let mut ring = RingGemm::new(gpu, shape, half_slots, forms)?;
         ring.set_expert_input(gpu, self.expert_input)?;
+        if !(forms.gate_up32 && forms.down32) {
+            cb.gemm = Some(GemmKernels::load(gpu.context())?);
+        }
         cb.ring = Some(ring);
         Ok(())
     }
@@ -685,7 +711,7 @@ impl CardExperts {
     /// of (the ring serves the stage card of a load with no tier), a half
     /// holding more experts than its slots, a batch whose ring pass buffers
     /// were not armed ([`CardExperts::arm_ring`]) or were armed for another
-    /// half, and ring stacks the 32-value GEMM does not read.
+    /// half.
     pub fn enqueue_rows_ring(
         &self,
         (gpu, w, g32): (&Gpu, &Weights, &Gemm32Kernels),
@@ -720,7 +746,12 @@ impl CardExperts {
                 ),
             ));
         }
-        let CardBatch { bufs, sel, ring } = cb;
+        let CardBatch {
+            bufs,
+            sel,
+            ring,
+            gemm,
+        } = cb;
         let rg = ring.as_mut().ok_or(GpuError::State {
             what,
             missing: "the ring pass's GEMM buffers (CardExperts::arm_ring at the stream's start)",
@@ -769,18 +800,6 @@ impl CardExperts {
         rg.enqueue_rows(gpu, g32, io.normed, io.m, fault)?;
         card_leg::with_ring(&stacks, layer.n_card, r, ctx, |half| {
             let [gate, up, down] = half.routes()?;
-            if [gate, up, down]
-                .iter()
-                .any(|w| matches!(w, RouteW::Grouped(..)))
-            {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "layer {l}: ring stacks the grouped GEMM reads; the ring pass runs the \
-                         32-value GEMM alone"
-                    ),
-                ));
-            }
             let blk = RouteBlock {
                 gate,
                 up,
@@ -791,7 +810,7 @@ impl CardExperts {
             for b in &r.batches {
                 rg.enqueue_batch(
                     gpu,
-                    (None, g32),
+                    (gemm.as_ref(), g32),
                     &blk,
                     b,
                     (ids, n_slots, n_used, n_expert),
