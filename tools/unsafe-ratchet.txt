@@ -755,7 +755,10 @@ gpu-flint 2 0 0
 # its refusals and its bench build their `RecoveryTable`s (three `unsafe` calls of its `new`), counted by
 # tools/check-unsafe.sh.
 # Each block has its SAFETY line.
-gpu-gates 109 5 1
+# PIN(2026-10-27): gpu-gates 109 -> 114 blocks, new code, not old code relaxed: oxart_jit --cubin's driver link of a
+# bundle's PTX (cuLinkCreate, cuLinkAddData, cuLinkComplete, the copy of the linked image, cuLinkDestroy), one call a
+# block, each with its SAFETY line.
+gpu-gates 114 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

@@ -34,6 +34,11 @@ bloomery-verbs = { path = "../verbs" }
 # The expert tier's page shared with a tier node's process through a /dev/shm file (`graph::MappedHost`).
 memmap2.workspace = true
 libc.workspace = true
+# A release binary's `.oxart.ptx` section, read when the driver refuses the cubins its `.oxart` carries
+# (`bundle_module`): the section through object's ELF reader and its bundles through the container parser
+# cuda-core's loader links. Both take the features cuda-core already turns on.
+oxide-artifacts.workspace = true
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
 # The huge-page advice for large new host memory (`tensor::host_filled`, `upload::pack_planes`).
 bloomery-os.workspace = true
 # The pinned pool the hybrid host tier waits on and computes with (the CPU

@@ -81,7 +81,9 @@ overrides the detected target; set it when invoking recipes from a machine witho
 the `sm_86` default.
 
 The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
-and the features above, `checkpoint` among them. It needs no toolchain: where a release carries it,
+and the features above, `checkpoint` among them. Its kernels are compiled for the GB10 when it is built (`oxart_jit
+--cubin` in `tools/release/build.sh`), so a first start compiles nothing; their PTX stays in the binary for a driver
+that refuses the compiled code. It needs no toolchain: where a release carries it,
 `tools/release/install.sh` picks it on a GB10 and links `bloomery-serve` into `~/.local/bin`. `just release-build
 <version>` makes it on a GB10, run there with `BLOOMERY_BOX_LOCAL=1`.
 

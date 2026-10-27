@@ -14,8 +14,9 @@
 //!     bloomery-serve --version
 //!
 //! Every start prints one line on stderr before the load begins
-//! ([`drive::FIRST_START`]): a first start on a new card compiles the GPU
-//! code for it, which takes tens of seconds.
+//! ([`drive::FIRST_START`]): a first start on a new card can compile the GPU
+//! code for it, which takes tens of seconds (an archive that carries the
+//! compiled code skips it).
 //!
 //! The model file is `-m` (`--model-file`), the first shard of a split
 //! set; `--hf` fetches a Hugging Face repo's GGUF set by its quant tag into
@@ -205,8 +206,8 @@ models (the --model word is optional with a model file: the file's architecture 
     /// What every start prints on stderr before the load begins: the claim
     /// holds for every start (a start cannot know whether it is the card's
     /// first).
-    const FIRST_START: &str = "bloomery-serve: a first start on a new card compiles the GPU \
-                               code for it (tens of seconds); later starts take seconds";
+    const FIRST_START: &str = "bloomery-serve: a first start on a new card can compile the \
+                               GPU code for it (tens of seconds); later starts take seconds";
 
     /// The spellings of the model path flag.
     const PATH_FLAGS: &[&str] = &["-m", "--model-file"];

@@ -21,7 +21,8 @@ the A6000's own rows, the measured history and the other engines' rows live on
 Each of two requests runs at 0.62–0.68× its speed alone, so one user waits longer and the machine serves more
 ([A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).
 
-A first start compiles the GPU code for the card (tens of seconds); later starts take seconds. A warm V4.1
+A first start compiles the GPU code for the card (tens of seconds), except from the GB10 archive, which carries
+it compiled; later starts take seconds. A warm V4.1
 load takes about 16 s.
 
 **Other engines.** The bench page also holds rows measured side by side with llama.cpp, mistral.rs and

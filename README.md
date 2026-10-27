@@ -146,7 +146,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 The server listens on `127.0.0.1:8080` and is ready when `GET /health` answers 200. The first start downloads the
 model into `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` moves it) and compiles the GPU code for the card once, which takes
-tens of seconds. `-m PATH` serves a file or folder you already have. OpenAI clients take the base URL
+tens of seconds; the GB10 archive carries that code compiled already. `-m PATH` serves a file or folder you already
+have. OpenAI clients take the base URL
 `http://localhost:8080/v1`, and Claude Code runs with `ANTHROPIC_BASE_URL=http://localhost:8080`. In Docker, the
 arguments after the image name go to `bloomery-serve`.
 

@@ -16,14 +16,16 @@ There are two Linux archives; the installer picks the one for the machine.
 
 - `linux-x86_64-cuda-sm86`: Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CPU needs AVX2 and FMA (x86-64-v3); AVX-512 is optional.
 - `linux-aarch64-cuda-sm121a`: a GB10 (DGX Spark and the other GB10 machines) on DGX OS 7 (Ubuntu 24.04, glibc 2.39). The archive
-  carries sm_121a PTX, which uses GB10's FP4 tensor cores and loads on compute capability 12.1 only; another aarch64
-  GPU builds from source (`docs/BUILD.md`).
+  carries its GPU code compiled for sm_121a, which uses GB10's FP4 tensor cores and loads on compute capability 12.1
+  only, so a first start compiles nothing. A driver that refuses that code gets the PTX the archive keeps beside it,
+  compiled on the first start, and the server says so on one line. Another aarch64 GPU builds from source
+  (`docs/BUILD.md`).
 - For the x86-64 archive, an NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
   card on first start. Run on an RTX A6000 and an RTX 3090 (driver 615.71, Ubuntu 24.04) and, for Clef-Flash, on an
   RTX 3060 under WSL2 (Windows driver 591.86), where the answers equal the A6000's byte for byte. Other cards and
   drivers are untested.
-- The NVIDIA driver R580 or newer (CUDA 13; `libcuda.so.1`). No CUDA toolkit is needed. The first start compiles the GPU code for the card
-  and caches it (about 10–25 s measured); later starts take a few seconds. Do not set `CUDA_CACHE_DISABLE=1`: every
+- The NVIDIA driver R580 or newer (CUDA 13; `libcuda.so.1`). No CUDA toolkit is needed. On x86-64 the first start compiles the GPU code for
+  the card and caches it (about 10–25 s measured); later starts skip it. Do not set `CUDA_CACHE_DISABLE=1`: every
   start then recompiles and takes minutes.
 - What fits where:
   - Clef-Flash: run on a 12 GB card with the `Q3_K_S` file (4.26 GB); the files run from 4.26 GB (`Q3_K_S`) to 9.55 GB (`Q8_0`).

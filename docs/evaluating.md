@@ -9,7 +9,7 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
    cuda-oxide rev ([`BUILD.md`](BUILD.md)); a release binary is the same code.
 3. **Start it with `--hf`**, for example
    `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --port 8080`. The first start downloads the files
-   (and the MTP draft where the repo has one). The first start also compiles the kernels for the card once. The plan
+   (and the MTP draft where the repo has one). The first start also compiles the kernels for the card once (the GB10 archive carries them compiled). The plan
    line in the log names the cards and how the experts are split. Wait until `GET /health` answers 200.
 4. **Pick the cards with `CUDA_VISIBLE_DEVICES`.** With `--place` unset the load takes the largest visible card and
    adds the host for the experts that do not fit it; on GLM-5.3 and Qwen3.8 it also adds the next card as an expert

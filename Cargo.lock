@@ -189,6 +189,8 @@ dependencies = [
  "indexmap",
  "libc",
  "memmap2",
+ "object",
+ "oxide-artifacts",
 ]
 
 [[package]]

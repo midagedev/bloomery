@@ -8,6 +8,10 @@
 #     code for x86-64-v3; built on the box;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
 #     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself).
+#     The packed binary carries the driver's JIT of that PTX as cubins: oxart_jit --cubin links each `.oxart` bundle on
+#     the building GB10's card, the result becomes the `.oxart` section the loader reads, and the PTX stays beside it as
+#     `.oxart.ptx`, which bloomery-gpu loads for a bundle whose cubin the driver refuses. A first start then compiles
+#     nothing.
 #
 # The failures it blocks, each checked on the built binaries before anything is packed:
 #   - a binary for another machine than the platform's (its ELF header);
@@ -183,10 +187,10 @@ fi
 case "$(uname -m)" in
   x86_64)
     PLATFORM=linux-x86_64-cuda-sm86 RELEASE_ARCH=sm_86 HOST_CPU=x86-64-v3 ELF_MACHINE='Advanced Micro Devices X86-64'
-    LOADER='ld-linux-x86-64\.so\.2' SCAN_V3=1 GLIBC_FLOOR=2.34 ;;
+    LOADER='ld-linux-x86-64\.so\.2' SCAN_V3=1 GLIBC_FLOOR=2.34 CUBIN= ;;
   aarch64)
     PLATFORM=linux-aarch64-cuda-sm121a RELEASE_ARCH=sm_121a HOST_CPU=gb10 ELF_MACHINE=AArch64
-    LOADER='ld-linux-aarch64\.so\.1' SCAN_V3= GLIBC_FLOOR=2.39 ;;
+    LOADER='ld-linux-aarch64\.so\.1' SCAN_V3= GLIBC_FLOOR=2.39 CUBIN=1 ;;
   *)
     echo "release: no Linux release for $(uname -m); the platforms are x86_64 and aarch64" >&2
     exit 64 ;;
@@ -212,6 +216,7 @@ else
   export RUSTFLAGS="-C target-cpu=$HOST_CPU"
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
+  [ -z "$CUBIN" ] || bin_args+=(--bin oxart_jit)
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
   BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}"
 fi
@@ -252,6 +257,13 @@ for b in "${BINS[@]}"; do
     fail=1
   fi
 
+  # A cubin archive's binary reads its code from `.oxart` and keeps the PTX it came from as `.oxart.ptx`.
+  if [ -n "$CHECK_ONLY" ] && [ -n "$CUBIN" ] &&
+    [ "$(readelf -S -W "$f" | grep -cE ' \.oxart(\.ptx)? ')" != 2 ]; then
+    echo "release: $b does not carry both .oxart (the cubins) and .oxart.ptx (their PTX)" >&2
+    fail=1
+  fi
+
   targets=$(strings -n 8 "$f" | sed -n 's/^\.target[[:space:]]\+\([a-z0-9_]*\).*/\1/p' | sort -u | tr '\n' ' ')
   if [ "$targets" != "$RELEASE_ARCH " ]; then
     echo "release: $b embeds PTX targets [$targets], not $RELEASE_ARCH alone" >&2
@@ -282,6 +294,16 @@ done
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin"
 for b in "${BINS[@]}"; do cp "$CARGO_TARGET_DIR/release/$b" "$STAGE/bin/"; done
+if [ -n "$CUBIN" ]; then
+  for b in "${BINS[@]}"; do
+    f="$STAGE/bin/$b"
+    objcopy --dump-section .oxart="$f.ptx.oxart" "$f"
+    bash tools/gpu-gate.sh --executable "$CARGO_TARGET_DIR/release/oxart_jit" --cubin "$f.ptx.oxart" "$f.cubin.oxart"
+    objcopy --rename-section .oxart=.oxart.ptx --add-section .oxart="$f.cubin.oxart" "$f"
+    rm "$f.ptx.oxart" "$f.cubin.oxart"
+  done
+  bash "$0" --check "$STAGE/bin"
+fi
 cp LICENSE THIRD_PARTY_NOTICES.md "$STAGE/"
 cp tools/release/README.release.md "$STAGE/README.md"
 printf '%s\n%s\n' "$VERSION" "$COMMIT" > "$STAGE/VERSION"

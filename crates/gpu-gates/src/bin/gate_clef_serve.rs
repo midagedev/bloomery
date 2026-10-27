@@ -256,8 +256,8 @@ mod gate {
 
     /// The note every start that passes the help branch prints on stderr
     /// before the load begins ([`drive::FIRST_START`] in `bloomery_serve.rs`).
-    const FIRST_START: &str = "bloomery-serve: a first start on a new card compiles the GPU \
-                               code for it (tens of seconds); later starts take seconds";
+    const FIRST_START: &str = "bloomery-serve: a first start on a new card can compile the \
+                               GPU code for it (tens of seconds); later starts take seconds";
 
     /// The face (module header): the two constant lines of the drive, read
     /// from what the binary printed. `--help` exits non-zero with the usage
