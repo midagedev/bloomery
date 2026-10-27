@@ -5,8 +5,9 @@
 //!
 //!     generate_metal [-m PATH | --hf REPO]
 //!                    (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
-//!                    [--print-ids] [--profile [N]] [--profile-layers]
-//!                    [--step-times [N]] [--prefill batch|steps] [--pass-times U]
+//!                    [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]]
+//!                    [--profile-layers] [--step-times [N]] [--prefill batch|steps]
+//!                    [--pass-times U]
 //!     generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
 //!
 //! The model is a GGUF file's first shard or a checkpoint folder (an MLX
@@ -24,6 +25,20 @@
 //! none either; a server's seat runs the file's). The generation stops at
 //! the count, at an end-of-generation id of the vocabulary's own set, or at
 //! the cache's last row; the summary lines say which.
+//!
+//! `--ignore-eos` (off by default) stops nothing at an end-of-generation id:
+//! the run goes on to the count or the cache's last row, and its ids hold the
+//! end-of-generation ids the model picks. The picks are the device's argmax,
+//! as without the flag, not a mask over the vocabulary's logits as the CUDA
+//! CLIs' `--ignore-eos` takes them: a run's ids through its first
+//! end-of-generation id equal the run without the flag. A decode timed at a
+//! depth of real text then is not cut short; the summary prints
+//! `ignore_eos=true`.
+//!
+//! `--repeat N` (default 1) runs the prompt N times on the one open, the
+//! session reset before each run after the first. Each run streams its own
+//! output; with N above 1 each run's summary block opens with `run=K`, and
+//! the open's lines print once, with the first run's.
 //!
 //! The text streams through the tokenizer's decoder, so a multi-byte
 //! character split across pieces prints once, complete; `--print-ids`
@@ -115,7 +130,7 @@ mod cli {
     use bloomery_metal::arch::qwen3moe::{
         check,
         count::{GroupKind, KINDS},
-        generate::greedy,
+        generate::{Generated, greedy},
         plan,
         session::{Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode},
     };
@@ -153,13 +168,15 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
+generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
 generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
   by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
   and the file's context_length; --plan reads the header alone and prints
   every refusal the open would make, the bytes it would allocate and the
   room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
+  --ignore-eos stops nothing at an end-of-generation id (the picks stay the device's argmax, unmasked);
+  --repeat N runs the prompt N times on one open, each run with its own summary block;
   --profile [N] (default 32) steps N more tokens after the summary, each
   group's GPU time and bytes printed; --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
@@ -178,11 +195,18 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         "--ctx",
         "--prefill",
         "--pass-times",
+        "--repeat",
         #[cfg(feature = "encode-trace")]
         "--encode-trace",
     ];
     /// The flags that stand alone.
-    const BARE_FLAGS: [&str; 4] = ["--print-ids", "--help", "--profile-layers", "--plan"];
+    const BARE_FLAGS: [&str; 5] = [
+        "--print-ids",
+        "--ignore-eos",
+        "--help",
+        "--profile-layers",
+        "--plan",
+    ];
     /// The profile tokens' default count, and the step-times' per mode.
     const PROFILE_DEFAULT: usize = 32;
 
@@ -206,6 +230,10 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         n: usize,
         ctx: Option<usize>,
         print_ids: bool,
+        /// `--ignore-eos`: no stop at an end-of-generation id.
+        ignore_eos: bool,
+        /// `--repeat N`: the runs on one open, at least one.
+        repeat: usize,
         profile: Option<Profile>,
         /// `--step-times [N]`: the step clock's tokens a mode.
         step_times: Option<usize>,
@@ -334,6 +362,20 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         }
         let ctx = ctx_flag()?;
         let print_ids = has_flag("--print-ids");
+        let ignore_eos = has_flag("--ignore-eos");
+        let repeat: usize = match flag("--repeat")? {
+            None => 1,
+            Some(s) => s.parse().map_err(|e| format!("--repeat {s}: {e}"))?,
+        };
+        if repeat == 0 {
+            return Err("--repeat 0: no run at all; drop the flag to run once".into());
+        }
+        #[cfg(feature = "encode-trace")]
+        let encode_trace = flag("--encode-trace")?.map(PathBuf::from);
+        #[cfg(feature = "encode-trace")]
+        if repeat > 1 && encode_trace.is_some() {
+            return Err("--repeat beside --encode-trace: the trace holds one run".into());
+        }
         // `--profile-layers` alone implies the profile.
         let profile_n = count_flag("--profile");
         let layers = has_flag("--profile-layers");
@@ -388,12 +430,14 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             n: n_gen,
             ctx,
             print_ids,
+            ignore_eos,
+            repeat,
             profile,
             step_times,
             prefill,
             pass_times,
             #[cfg(feature = "encode-trace")]
-            encode_trace: flag("--encode-trace")?.map(PathBuf::from),
+            encode_trace,
             model,
         })
     }
@@ -883,6 +927,45 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         ))
     }
 
+    /// The summary lines of one run: the prompt's and the decode's walls and
+    /// rates, why the run stopped and the residency's request count. `run` is
+    /// the run's place when `--repeat` asked for several, and opens the block.
+    fn print_run(
+        out: &Generated,
+        prompt_ids: usize,
+        run: Option<usize>,
+        ignore_eos: bool,
+        session: &Session,
+    ) {
+        let prompt_s = out.prompt_wall.as_secs_f64();
+        let decode_s = out.decode_wall.as_secs_f64();
+        if let Some(run) = run {
+            eprintln!("run={run}");
+        }
+        eprintln!("prompt_s={prompt_s:.3}");
+        eprintln!("prompt_tok_s={:.1}", prompt_ids as f64 / prompt_s);
+        eprintln!("decode_tokens={}", out.tokens());
+        eprintln!("decode_passes={}", out.passes);
+        eprintln!("decode_s={decode_s:.3}");
+        if out.passes == 0 {
+            eprintln!("decode_tok_s=none");
+        } else {
+            eprintln!("decode_tok_s={:.1}", out.passes as f64 / decode_s);
+        }
+        if ignore_eos {
+            eprintln!("ignore_eos=true");
+        }
+        eprintln!("stop={}", out.stop.name());
+        if let Some((first, rest)) = out.pass_walls.split_first() {
+            eprintln!("decode_first_ms={:.2}", first.as_secs_f64() * 1e3);
+            if !rest.is_empty() {
+                let mean = rest.iter().map(Duration::as_secs_f64).sum::<f64>() / rest.len() as f64;
+                eprintln!("decode_rest_ms={:.2}", mean * 1e3);
+            }
+        }
+        eprintln!("residency_requests={}", session.residency().requests);
+    }
+
     fn generate(a: &Args) -> Result<(), String> {
         let model = model_arg::resolve(&a.model)?;
         let file = ModelFile::open(&model.path).map_err(|e| e.to_string())?;
@@ -926,30 +1009,38 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         // live device buffers this process holds; the arena keeps no sum of
         // its own.
         let allocated = device.allocated_bytes().map_err(|e| e.to_string())?;
-        let mut stream = Stream {
-            decoder: (!a.print_ids).then(|| tokenizer::Decoder::new(&tok, true)),
+        // The picks stop at the vocabulary's end-of-generation set unless the run ignores it.
+        let eog: &[u32] = if a.ignore_eos { &[] } else { tok.eog() };
+        // One run of the prompt, its text or ids on stdout as they are picked.
+        let run_once = |session: &mut Session| -> Result<Generated, String> {
+            let mut stream = Stream {
+                decoder: (!a.print_ids).then(|| tokenizer::Decoder::new(&tok, true)),
+            };
+            let out = greedy(session, &prompt, a.n, eog, |id| stream.id(id))
+                .map_err(|e| e.to_string())?;
+            #[cfg(feature = "encode-trace")]
+            if let Some(path) = &a.encode_trace {
+                let mut text = bloomery_metal::trace::finish();
+                text.push_str(&format!(
+                    "# run prompt_ids={} decode_tokens={} gemm_path={}\n",
+                    prompt.len(),
+                    out.tokens(),
+                    device.library().gemm_path().name()
+                ));
+                std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            if a.print_ids {
+                let ids: Vec<String> = out.ids.iter().map(u32::to_string).collect();
+                println!("{}", ids.join(","));
+            } else {
+                stream.finish();
+                if a.repeat > 1 {
+                    println!();
+                }
+            }
+            Ok(out)
         };
-        let out = greedy(&mut session, &prompt, a.n, tok.eog(), |id| stream.id(id))
-            .map_err(|e| e.to_string())?;
-        #[cfg(feature = "encode-trace")]
-        if let Some(path) = &a.encode_trace {
-            let mut text = bloomery_metal::trace::finish();
-            text.push_str(&format!(
-                "# run prompt_ids={} decode_tokens={} gemm_path={}\n",
-                prompt.len(),
-                out.tokens(),
-                device.library().gemm_path().name()
-            ));
-            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-        if a.print_ids {
-            let ids: Vec<String> = out.ids.iter().map(u32::to_string).collect();
-            println!("{}", ids.join(","));
-        } else {
-            stream.finish();
-        }
-        let prompt_s = out.prompt_wall.as_secs_f64();
-        let decode_s = out.decode_wall.as_secs_f64();
+        let mut out = run_once(&mut session)?;
         eprintln!("# development-loop numbers: no lease, no witness");
         eprintln!("model={}", model.path.display());
         eprintln!("gemm_path={}", device.library().gemm_path().name());
@@ -970,25 +1061,14 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         eprintln!("resident_bytes={}", resident.bytes);
         eprintln!("rows_arena_bytes={}", session.rows_arena_bytes());
         eprintln!("prompt_ids={}", prompt.len());
-        eprintln!("prompt_s={prompt_s:.3}");
-        eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
-        eprintln!("decode_tokens={}", out.tokens());
-        eprintln!("decode_passes={}", out.passes);
-        eprintln!("decode_s={decode_s:.3}");
-        if out.passes == 0 {
-            eprintln!("decode_tok_s=none");
-        } else {
-            eprintln!("decode_tok_s={:.1}", out.passes as f64 / decode_s);
+        let first = (a.repeat > 1).then_some(1);
+        print_run(&out, prompt.len(), first, a.ignore_eos, &session);
+        for run in 2..=a.repeat {
+            session.reset().map_err(|e| e.to_string())?;
+            out = run_once(&mut session)?;
+            print_run(&out, prompt.len(), Some(run), a.ignore_eos, &session);
         }
-        eprintln!("stop={}", out.stop.name());
-        if let Some((first, rest)) = out.pass_walls.split_first() {
-            eprintln!("decode_first_ms={:.2}", first.as_secs_f64() * 1e3);
-            if !rest.is_empty() {
-                let mean = rest.iter().map(Duration::as_secs_f64).sum::<f64>() / rest.len() as f64;
-                eprintln!("decode_rest_ms={:.2}", mean * 1e3);
-            }
-        }
-        eprintln!("residency_requests={}", session.residency().requests);
+        let decode_s = out.decode_wall.as_secs_f64();
         if let Some(p) = &a.profile {
             let id = *out
                 .ids

@@ -3,31 +3,37 @@
 //! The method is the mat-vec probe's (`metal_matvec_time`): a timed command
 //! buffer holds many dispatches, its time is its own `GPUEndTime` minus
 //! `GPUStartTime`, read after it completed, and the figure is the median
-//! over the buffers. Two arms time the production launches through
-//! `Kernels`: `packed`, many dispatches in one serial command buffer with a
-//! memory barrier between each (the steady-state kernel time), and `lone`,
-//! one dispatch in its own command buffer (what a session sees when each
-//! group is its own buffer). Phase arms split the flash's time: a probe
-//! kernel compiled from the shipped source beside it, the shipped phases
-//! gated at run time by one word — append, q prepare, tile loads, tile
-//! compute — so `full − no_append` is the append and so on. The merge is
-//! timed the same two ways past one segment.
+//! over the buffers. The buffers go one at a time (`shared/gpu_time.rs`:
+//! committed, waited, read), so no buffer's interval holds a neighbour's
+//! queue time. Two arms time the production launches through `Kernels`:
+//! `packed`, many dispatches in one serial command buffer with a memory
+//! barrier between each (the steady-state kernel time), and `lone`, one
+//! dispatch in its own command buffer (what a session sees when each group is
+//! its own buffer). Phase arms split the flash's time: a probe kernel
+//! compiled from the shipped source beside it, the shipped phases gated at run
+//! time by one word — append, q prepare, tile loads, tile compute, the tile
+//! loop, the epilogue, the fold — so `full − no_append` is the append and so
+//! on. Before the phase arms run, a self-check holds the probe to the shipped
+//! flash: its `full` arm's output equals the shipped dispatch's bit for bit,
+//! and its epilogue bit decides whether the partials are written. A probe
+//! that fails it prints no phase row.
 //!
 //! Each row is one line, tab-separated: kernel, keys, arm, the GPU
-//! microseconds per dispatch (`us_median`, `us_p90`), the K/V bytes one
-//! dispatch reads and their GB/s. A development-loop instrument: a figure it
-//! prints is this machine's, taken with no timing lease, and is not a
+//! microseconds per dispatch (`us_median`, `us_min`, `us_p90`), the K/V bytes
+//! one dispatch reads and their GB/s. A development-loop instrument: a figure
+//! it prints is this machine's, taken with no timing lease, and is not a
 //! published number.
 //!
 //! Flags: `--trials N` (timed command buffers per arm, default 16; `lone`
 //! takes twice that), `--keys a,b,c` (default 100,512,1024,4096),
-//! `--no-phases` (skip the phase arms), `--help`.
+//! `--no-phases` (skip the phase arms and the self-check), `--help`.
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, Stream};
+use bloomery_metal::MetalStream;
+use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::instance::HOST;
@@ -36,19 +42,17 @@ use bloomery_metal::kernels::{
     partials_len, qg_len, segments_for_keys,
 };
 use bloomery_metal::library::{Library, Pipeline, SOURCE};
-use bloomery_metal::{GpuInterval, MetalStream};
+
+#[path = "../shared/gpu_time.rs"]
+mod gpu_time;
+
+use gpu_time::{Timed, WARMUPS, time_arm};
 
 /// The flash threadgroup's width, `attention_geom::FLASH_THREADS`.
 const FLASH_THREADS: usize = 256;
 
 /// The cache rows the probe holds: the largest key count it times.
 const CTX: u32 = 4096;
-
-/// The warm-up buffers ahead of the timed ones.
-const WARMUPS: usize = 2;
-
-/// How long the host waits for one timed command buffer.
-const BUFFER_WAIT: Duration = Duration::from_secs(30);
 
 /// The bytes one timed command buffer's dispatches read, so every buffer
 /// moves about the same total.
@@ -58,18 +62,79 @@ const PACKED_BYTES: usize = 64 << 20;
 /// raises nothing; the gate's own is 3.
 const LAYER: u32 = 3;
 
+/// The key count the self-check launches at: past one segment, so the flash
+/// writes partials and a fold follows, with every segment holding live keys.
+const CHECK_KEYS: u32 = 1024;
+
 const _: () = assert!(FLASH_THREADS == 256);
+
+/// The phase word's bits. The probe source reads them as the `PROBE_PHASE_*`
+/// macros [`phase_macros`] writes in front of it and the arm table builds its
+/// words from these constants, so a bit means one thing in the kernel and in
+/// the table.
+const PH_APPEND: u32 = 1;
+const PH_PREPARE: u32 = 2;
+const PH_LOADS: u32 = 4;
+const PH_COMPUTE: u32 = 8;
+/// Set: the ticket handshake and the fold are skipped.
+const PH_NO_FOLD: u32 = 16;
+/// Set: the epilogue, the partial or output write, is skipped.
+const PH_NO_EPILOGUE: u32 = 32;
+/// Set: the tile loop is skipped.
+const PH_NO_LOOP: u32 = 64;
+/// The shipped flash: the four phases on, nothing skipped.
+const PH_FULL: u32 = PH_APPEND | PH_PREPARE | PH_LOADS | PH_COMPUTE;
+
+/// The phase arms, each a name and a phase word. The two bits that empty the
+/// partials (the tile loop, the epilogue) change what the fold reads, so the
+/// pairs that toggle them keep the fold off in both arms.
+const ARMS: [(&str, u32); 10] = [
+    ("full", PH_FULL),
+    ("no_append", PH_FULL & !PH_APPEND),
+    ("no_prepare", PH_FULL & !PH_PREPARE),
+    ("loads_only", PH_FULL & !PH_COMPUTE),
+    // The tile loop runs with its loads and its arithmetic off.
+    ("no_tile", PH_APPEND | PH_PREPARE),
+    ("no_tile_no_fold", PH_APPEND | PH_PREPARE | PH_NO_FOLD),
+    (
+        "no_loop_no_fold",
+        PH_APPEND | PH_PREPARE | PH_NO_LOOP | PH_NO_FOLD,
+    ),
+    ("no_fold", PH_FULL | PH_NO_FOLD),
+    ("no_epilogue", PH_FULL | PH_NO_EPILOGUE),
+    ("no_fold_no_epilogue", PH_FULL | PH_NO_FOLD | PH_NO_EPILOGUE),
+];
+
+/// The macros the probe source reads the phase word with.
+fn phase_macros() -> String {
+    [
+        ("APPEND", PH_APPEND),
+        ("PREPARE", PH_PREPARE),
+        ("LOADS", PH_LOADS),
+        ("COMPUTE", PH_COMPUTE),
+        ("NO_FOLD", PH_NO_FOLD),
+        ("NO_EPILOGUE", PH_NO_EPILOGUE),
+        ("NO_LOOP", PH_NO_LOOP),
+    ]
+    .iter()
+    .map(|(name, bit)| format!("#define PROBE_PHASE_{name} {bit}u\n"))
+    .collect()
+}
+
+/// The shipped source with the probe kernel after it, the way the kernel gate
+/// compiles its mutants.
+fn probe_source() -> String {
+    format!("{SOURCE}\n{}{PROBE}", phase_macros())
+}
 
 /// The probe kernel: the shipped flash's phases, gated at run time by one
 /// word. The bodies are the shipped flash's, copied here so the shipped
 /// kernel carries no switch; the statics it calls are the shipped ones, so
-/// the split is of the production program. Compiled from [`SOURCE`] beside
-/// the library, the way the kernel gate compiles its mutants.
+/// the split is of the production program, which the self-check holds it to.
 const PROBE: &str = r#"
 // The attention timing probe. Not a shipped kernel: the gate's library does
-// not carry it. The phase word's bits: 1 the append, 2 the q prepare, 4 the
-// tile loads, 8 the tile compute, 16 the fold off, 32 the epilogue off,
-// 64 the tile loop off; 15 is the whole flash.
+// not carry it. The phase word's bits are the PROBE_PHASE_* macros written in
+// front of this text.
 #pragma METAL fp contract(off)
 
 struct AttnProbeArgs {
@@ -82,7 +147,7 @@ static_assert(sizeof(AttnProbeArgs) == 4, "AttnProbeArgs is 4 bytes: the probe p
 // A gated compute leaves the running state the loop's entry state.
 template <typename Cache>
 static void probe_tile_loop(Cache cache,
-                            constant AttnArgs &args,
+                            thread const AttnArgs &args,
                             bool ok,
                             uint kv,
                             uint seg,
@@ -91,13 +156,13 @@ static void probe_tile_loop(Cache cache,
                             uint tid,
                             uint lane,
                             uint phase,
-                            thread float qv[8],
+                            thread float qv[BLOOMERY_ATTN_LANE_DIMS],
                             thread float *running_m,
                             thread float *running_l,
-                            thread float acc[8]) {
+                            thread float acc[BLOOMERY_ATTN_LANE_DIMS]) {
     *running_m = -INFINITY;
     *running_l = 0.0f;
-    for (uint d = 0u; d < 8u; ++d) {
+    for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
         acc[d] = 0.0f;
     }
     if (!ok) {
@@ -107,7 +172,7 @@ static void probe_tile_loop(Cache cache,
     uint seg_hi = min((seg + 1u) * span, max_live);
     for (uint lo = lo0; lo < seg_hi; lo += BLOOMERY_ATTN_TILE) {
         uint hi = min(lo + BLOOMERY_ATTN_TILE, seg_hi);
-        if ((phase & 4u) != 0u) {
+        if ((phase & PROBE_PHASE_LOADS) != 0u) {
             cache.load(tid, kv, args.ctx, lo, hi);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -115,17 +180,17 @@ static void probe_tile_loop(Cache cache,
         bool live[BLOOMERY_ATTN_TILE];
         float tile_max = -INFINITY;
         uint nvalid = 0u;
-        float kvv[8];
+        float kvv[BLOOMERY_ATTN_LANE_DIMS];
         for (uint t = 0u; t < BLOOMERY_ATTN_TILE; ++t) {
             uint index = lo + t;
             bool on = index < hi && index < args.keys;
             live[t] = on;
             float dot = 0.0f;
-            if (on && (phase & 4u) != 0u) {
+            if (on && (phase & PROBE_PHASE_LOADS) != 0u) {
                 cache.key(t, lane, kvv);
             }
-            if (on && (phase & 8u) != 0u) {
-                for (uint d = 0u; d < 8u; ++d) {
+            if (on && (phase & PROBE_PHASE_COMPUTE) != 0u) {
+                for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
                     dot = fma(qv[d], kvv[d], dot);
                 }
             }
@@ -145,7 +210,7 @@ static void probe_tile_loop(Cache cache,
         float old_m = *running_m;
         float factor = old_m > -INFINITY ? exp(old_m - new_m) : 0.0f;
         *running_l *= factor;
-        for (uint d = 0u; d < 8u; ++d) {
+        for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
             acc[d] *= factor;
         }
         *running_m = new_m;
@@ -153,12 +218,12 @@ static void probe_tile_loop(Cache cache,
             if (!live[t]) {
                 continue;
             }
-            if ((phase & 4u) != 0u) {
+            if ((phase & PROBE_PHASE_LOADS) != 0u) {
                 cache.value(t, lane, kvv);
             }
             float weight = exp(scores[t] - new_m);
             *running_l += weight;
-            for (uint d = 0u; d < 8u; ++d) {
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
                 acc[d] = fma(weight, kvv[d], acc[d]);
             }
         }
@@ -169,7 +234,7 @@ static void probe_tile_loop(Cache cache,
 // The shipped flash with its phases gated by the probe's word.
 template <typename Cache>
 static void probe_flash(Cache cache,
-                        constant AttnArgs &args,
+                        thread const AttnArgs &args,
                         device float const *q,
                         device float const *k,
                         device float const *v,
@@ -192,98 +257,51 @@ static void probe_flash(Cache cache,
     uint seg = group - kv * args.segments;
     bool active = kv < BLOOMERY_ATTN_KV && seg < args.segments;
 
-    bool key_bad = args.keys == 0u || args.keys > args.ctx;
-    bool pos_bad = args.pos >= args.ctx;
-    bool ok = active && !key_bad && !pos_bad;
-    uint max_live = key_bad ? 0u : args.keys;
+    uint max_live;
+    bool ok = attn_bounds(args, faults, active, tid, max_live);
     uint span = attn_span(max_live, args.segments);
-    if (active) {
-        if ((phase & 1u) != 0u) {
-            attn_append(cache, args, k, v, k_gain, rope, faults, ok, kv, seg, span, sg, lane,
-                        scratch);
-        }
+    if (active && (phase & PROBE_PHASE_APPEND) != 0u) {
+        attn_append(cache, args, k, v, k_gain, rope, faults, ok, kv, seg, span, sg, lane,
+                    scratch);
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     if (active) {
-        float qv[8];
-        if ((phase & 2u) != 0u) {
+        float qv[BLOOMERY_ATTN_LANE_DIMS];
+        if ((phase & PROBE_PHASE_PREPARE) != 0u) {
             attn_prepare_q(args, q, q_gain, rope, ok, kv, sg, lane, scratch, qv);
         } else {
-            for (uint d = 0u; d < 8u; ++d) {
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
                 qv[d] = 0.0f;
             }
         }
         float running_m;
         float running_l;
-        float acc[8];
-        if ((phase & 64u) == 0u) {
+        float acc[BLOOMERY_ATTN_LANE_DIMS];
+        // The tiles load over the scratch the prepare paired through, so
+        // every thread's scratch reads end here.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((phase & PROBE_PHASE_NO_LOOP) == 0u) {
             probe_tile_loop(cache, args, ok, kv, seg, span, max_live, tid, lane, phase, qv,
                             &running_m, &running_l, acc);
         } else {
             running_m = -INFINITY;
             running_l = 0.0f;
-            for (uint d = 0u; d < 8u; ++d) {
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
                 acc[d] = 0.0f;
             }
         }
-        if ((phase & 32u) != 0u) {
+        if ((phase & PROBE_PHASE_NO_EPILOGUE) == 0u) {
             attn_epilogue(args, q, partials, out, faults, ok, kv, seg, sg, lane, &running_m,
                           &running_l, acc);
         }
     }
 
-    if (args.segments > 1u && (phase & 16u) == 0u) {
+    if (args.segments > 1u && (phase & PROBE_PHASE_NO_FOLD) == 0u) {
         ticket_is_last(ticket, groups, tid, last_flag);
         if (last_flag == 1u) {
             attn_fold(partials, ticket, args, q, out, faults, tid, (threadgroup float *)scratch);
         }
-    }
-}
-
-kernel void probe_noop(uint tid [[thread_index_in_threadgroup]],
-                       uint3 group [[threadgroup_position_in_grid]]) {
-    threadgroup float scratch[BLOOMERY_ATTN_SG * BLOOMERY_ATTN_HEAD];
-    if (tid == 0u) {
-        scratch[0] = float(group.x);
-    }
-}
-
-// The ticket handshake alone: is_last's device barrier and atomic, the
-// acquire fence, the reset.
-kernel void probe_ticket(device atomic_uint *ticket [[buffer(0)]],
-                         uint tid [[thread_index_in_threadgroup]],
-                         uint3 tpg [[threadgroups_per_grid]]) {
-    threadgroup uint last_flag = 0u;
-    ticket_is_last(ticket, tpg.x, tid, last_flag);
-    if (last_flag == 1u) {
-        ticket_acquire();
-        if (tid == 0u) {
-            ticket_reset(ticket);
-        }
-    }
-}
-
-// N coherent loads of the fold's shape: a thread's 16 dims of one segment
-// partial, N segments.
-kernel void probe_fold_loads(device coherent(device) float *partials [[buffer(0)]],
-                             constant AttnProbeArgs &probe [[buffer(1)]],
-                             device float *out [[buffer(2)]],
-                             uint tid [[thread_index_in_threadgroup]]) {
-    uint head = tid / 16u;
-    uint dim0 = (tid % 16u) * 16u;
-    float sink = 0.0f;
-    for (uint j = 0u; j < probe.phase; ++j) {
-        uint base = (head * 64u + j) * BLOOMERY_ATTN_PARTIAL;
-        float mj = ticket_load(partials, base);
-        float lj = ticket_load(partials, base + 1u);
-        sink += mj + lj;
-        for (uint d = 0u; d < 16u; ++d) {
-            sink += ticket_load(partials, base + 2u + dim0 + d);
-        }
-    }
-    if (sink == 12345.678f) {
-        out[0] = sink;
     }
 }
 
@@ -297,58 +315,39 @@ kernel void probe_flash_f16(device float const *q [[buffer(0)]],
                             device ushort *cache_v [[buffer(7)]],
                             device coherent(device) float *partials [[buffer(8)]],
                             device float *out [[buffer(9)]],
-                            constant AttnArgs &args [[buffer(10)]],
+                            constant AttnArgs &launch [[buffer(10)]],
                             device atomic_uint *faults [[buffer(11)]],
                             device atomic_uint *ticket [[buffer(12)]],
                             constant AttnProbeArgs &probe [[buffer(13)]],
                             uint tid [[thread_index_in_threadgroup]],
                             uint3 group [[threadgroup_position_in_grid]],
                             uint3 tpg [[threadgroups_per_grid]]) {
-    threadgroup uint4 shared[BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 4];
+    threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
+    AttnArgs args = launch;
     F16Cache cache;
     cache.k = cache_k;
     cache.v = cache_v;
-    cache.tile_k = shared;
-    cache.tile_v = shared + BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 8;
+    cache.tile_k = (threadgroup attn_lane_word *)shared;
+    cache.tile_v = cache.tile_k + BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_LANES;
     probe_flash(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults, ticket, tpg.x,
                 probe.phase, group.x, tid, (threadgroup float *)shared, last_flag);
 }
 "#;
 
-/// One arm's figure: the per-dispatch microseconds over the timed buffers.
-struct Timed {
-    us_median: f64,
-    us_p90: f64,
-}
-
-fn median(xs: &[f64]) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(f64::total_cmp);
-    v[v.len() / 2]
-}
-
-/// Nearest rank of `p`: the value at `ceil(p * len)`, counting from one.
-fn percentile(xs: &[f64], p: f64) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(f64::total_cmp);
-    let rank = (p * v.len() as f64).ceil() as usize;
-    v[rank.saturating_sub(1)]
-}
-
 /// The buffers one attention launch reads and writes, planted once.
 struct Bufs {
-    q: bloomery_metal::buffer::MetalBuffer<f32>,
-    k: bloomery_metal::buffer::MetalBuffer<f32>,
-    v: bloomery_metal::buffer::MetalBuffer<f32>,
-    q_gain: bloomery_metal::buffer::MetalBuffer<f32>,
-    k_gain: bloomery_metal::buffer::MetalBuffer<f32>,
-    rope: bloomery_metal::buffer::MetalBuffer<f32>,
-    cache_k: bloomery_metal::buffer::MetalBuffer<u16>,
-    cache_v: bloomery_metal::buffer::MetalBuffer<u16>,
-    partials: bloomery_metal::buffer::MetalBuffer<f32>,
-    out: bloomery_metal::buffer::MetalBuffer<f32>,
-    ticket: bloomery_metal::buffer::MetalBuffer<u32>,
+    q: MetalBuffer<f32>,
+    k: MetalBuffer<f32>,
+    v: MetalBuffer<f32>,
+    q_gain: MetalBuffer<f32>,
+    k_gain: MetalBuffer<f32>,
+    rope: MetalBuffer<f32>,
+    cache_k: MetalBuffer<u16>,
+    cache_v: MetalBuffer<u16>,
+    partials: MetalBuffer<f32>,
+    out: MetalBuffer<f32>,
+    ticket: MetalBuffer<u32>,
 }
 
 /// A small xorshift* the host plants its patterns with.
@@ -430,71 +429,6 @@ fn params<'w>(
             .window_mut(Elems(0), Elems(out_len().expect("the out length wraps")))?,
         fault,
         ticket: b.ticket.window_mut(Elems(0), Elems(1))?,
-    })
-}
-
-/// Encode one timed command buffer per repeat, submit them back to back and
-/// read each buffer's GPU interval. `encode` launches dispatch `n`, counted
-/// across the buffers. The warm-up buffers are not part of the figure.
-fn time_arm(
-    device: &MetalDevice,
-    stream: &MetalStream,
-    dispatches: usize,
-    trials: usize,
-    mut encode: impl FnMut(&mut ComputeEncoder<'_>, usize) -> Result<(), DeviceError>,
-) -> Result<Timed, String> {
-    if dispatches == 0 || trials == 0 {
-        return Err("a timed arm needs a dispatch and a repeat".to_string());
-    }
-    let buffers = WARMUPS + trials;
-    let mut pending = Vec::with_capacity(buffers);
-    for _ in 0..buffers {
-        let mut recording = stream.begin().map_err(why)?;
-        let stamps = recording.stamps();
-        {
-            let mut encoder = recording.compute_encoder().map_err(why)?;
-            for n in 0..dispatches {
-                if n > 0 {
-                    encoder.memory_barrier();
-                }
-                encode(&mut encoder, n).map_err(why)?;
-            }
-            encoder.end();
-        }
-        pending.push((recording, stamps));
-    }
-    let mut all_stamps = Vec::with_capacity(buffers);
-    for (recording, stamps) in pending {
-        stream.submit(recording).map_err(why)?;
-        all_stamps.push(stamps);
-    }
-    let mut gaps = Vec::with_capacity(trials);
-    for (i, stamps) in all_stamps.iter().enumerate() {
-        let gpu = match stamps.interval(BUFFER_WAIT) {
-            Ok(GpuInterval::Ran(gpu)) => gpu,
-            Ok(GpuInterval::StillRunning) => {
-                return Err(
-                    "the command buffer was still running on the GPU when the wait ended"
-                        .to_string(),
-                );
-            }
-            Err(e) => {
-                let _drained = stream.sync();
-                return Err(why(e));
-            }
-        };
-        if i >= WARMUPS {
-            gaps.push(gpu / dispatches as f64 * 1e6);
-        }
-    }
-    stream.sync().map_err(why)?;
-    if let Some(fault) = device.fault_word().read(stream).map_err(why)? {
-        return Err(format!("the launch raised {fault}"));
-    }
-    device.fault_word().clear(stream).map_err(why)?;
-    Ok(Timed {
-        us_median: median(&gaps),
-        us_p90: percentile(&gaps, 0.9),
     })
 }
 
@@ -593,12 +527,12 @@ metal_attention_time: development-loop timings of the decode attention.
 
 A number this prints is this machine's, from no timing lease, and is not a
 published result. Rows are tab-separated: kernel, keys, arm, us_median,
-us_p90, kv_bytes, gbps.
+us_min, us_p90, kv_bytes, gbps.
 
   --help        print this and exit 0
   --trials N    timed command buffers per arm (default 16; `lone` takes twice)
   --keys LIST   comma-separated key counts (default 100,512,1024,4096)
-  --no-phases   skip the phase arms"
+  --no-phases   skip the phase arms and the self-check they need"
     );
 }
 
@@ -664,8 +598,8 @@ fn print_row(kernel: &str, keys: u32, arm: &str, n: usize, t: &Timed) {
     let bytes = kv_bytes(keys);
     let gbps = bytes as f64 / t.us_median / 1000.0;
     println!(
-        "attn\tkernel={kernel}\tkeys={keys}\tarm={arm}\tn={n}\tus_median={:.3}\tus_p90={:.3}\tkv_bytes={bytes}\tgbps={gbps:.2}",
-        t.us_median, t.us_p90
+        "attn\tkernel={kernel}\tkeys={keys}\tarm={arm}\tn={n}\tus_median={:.3}\tus_min={:.3}\tus_p90={:.3}\tkv_bytes={bytes}\tgbps={gbps:.2}",
+        t.us_median, t.us_min, t.us_p90
     );
 }
 
@@ -759,7 +693,7 @@ fn timed(
     }
     let partials_host = vec![0f32; partials_len(segments_for_keys(CTX) as usize).expect("fits")];
     let out_host = vec![0f32; out_len().expect("the out length wraps")];
-    let upload = |host: &[f32]| -> Result<bloomery_metal::buffer::MetalBuffer<f32>, String> {
+    let upload = |host: &[f32]| -> Result<MetalBuffer<f32>, String> {
         device.upload(stream, host).map_err(why)
     };
     let mut bufs = Bufs {
@@ -778,6 +712,21 @@ fn timed(
     device.fault_word().clear(stream).map_err(why)?;
 
     let mut failed = false;
+    // The phase arms need the probe's pipeline, which exists only once its
+    // self-check holds: a probe that is not the shipped flash prints no phase
+    // row.
+    let probe = if run.phases {
+        match probe_pipeline(device, stream, kernels, &mut bufs) {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                println!("attn\tkernel=probe_flash_f16\tarm=self_check\tFAIL\t{e}");
+                failed = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
     for &keys in &run.keys {
         let pos = keys - 1;
         let segments = segments_for_keys(keys) as usize;
@@ -789,6 +738,7 @@ fn timed(
         );
         // The production flash: many dispatches in one buffer, then one per
         // buffer.
+        let mut shipped_us = None;
         for (name, dispatches, trials) in
             [("packed", packed, run.trials), ("lone", 1, 2 * run.trials)]
         {
@@ -796,24 +746,30 @@ fn timed(
                 let p = params(&mut bufs, segments, pos, keys, device.fault_word())?;
                 kernels.attention_flash(encoder, p)
             }) {
-                Ok(t) => print_row("gqa256_flash_f16", keys, name, dispatches, &t),
+                Ok(t) => {
+                    print_row("gqa256_flash_f16", keys, name, dispatches, &t);
+                    if name == "packed" {
+                        shipped_us = Some(t.us_median);
+                    }
+                }
                 Err(e) => {
                     println!("attn\tkernel=gqa256_flash_f16\tkeys={keys}\tarm={name}\tFAIL\t{e}");
                     failed = true;
                 }
             }
         }
-        if !run.phases {
+        let Some(pipeline) = &probe else {
             continue;
-        }
+        };
         let point = Point {
             keys,
             segments,
             args: &args,
             packed,
             trials: run.trials,
+            shipped_us,
         };
-        let phases = phase_arms(device, stream, &mut bufs, &point);
+        let phases = phase_arms(device, stream, &mut bufs, &point, pipeline);
         failed |= phases;
     }
     if failed {
@@ -831,16 +787,205 @@ struct Point<'a> {
     args: &'a [[u8; 4]; 7],
     packed: usize,
     trials: usize,
+    /// The shipped flash's packed figure at this key count, when it ran.
+    shipped_us: Option<f64>,
+}
+
+/// One command buffer holding one encoded dispatch, committed and waited.
+fn dispatch_once(
+    stream: &MetalStream,
+    encode: impl FnOnce(&mut ComputeEncoder<'_>) -> Result<(), DeviceError>,
+) -> Result<(), String> {
+    let mut recording = stream.begin().map_err(why)?;
+    {
+        let mut encoder = recording.compute_encoder().map_err(why)?;
+        encode(&mut encoder).map_err(why)?;
+        encoder.end();
+    }
+    stream.submit(recording).map_err(why)?;
+    stream.sync().map_err(why)
+}
+
+/// The scratch a launch writes (the partials, the output and the ticket),
+/// zeroed, so an arm that skips a write reads what no earlier arm left.
+fn clear_scratch(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    bufs: &mut Bufs,
+) -> Result<(), String> {
+    let parts = partials_len(segments_for_keys(CTX) as usize).expect("the partials fit");
+    bufs.partials = device.zeroed::<f32>(stream, Elems(parts)).map_err(why)?;
+    bufs.out = device
+        .zeroed::<f32>(stream, Elems(out_len().expect("the out length wraps")))
+        .map_err(why)?;
+    bufs.ticket = device.zeroed::<u32>(stream, Elems(1)).map_err(why)?;
+    Ok(())
+}
+
+/// The first `n` values of `buf`, read once the stream's work is done.
+fn read_f32(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    buf: &MetalBuffer<f32>,
+    n: usize,
+) -> Result<Vec<f32>, String> {
+    let mut host = vec![0f32; n];
+    device
+        .read(
+            stream,
+            buf.window(Elems(0), Elems(n)).map_err(why)?,
+            &mut host,
+        )
+        .map_err(why)?;
+    Ok(host)
+}
+
+/// The probe's pipeline, built once the probe has held to the shipped flash.
+fn probe_pipeline(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    kernels: &Kernels,
+    bufs: &mut Bufs,
+) -> Result<Pipeline, String> {
+    let library = Library::from_source_text(device, &probe_source()).map_err(why)?;
+    let pipeline = library.pipeline("probe_flash_f16").map_err(why)?;
+    self_check(device, stream, kernels, bufs, &pipeline)?;
+    Ok(pipeline)
+}
+
+/// Holds the probe to what its phase table says, at a scene past one segment.
+/// Every clause prints a `selfcheck` row; every failed clause is named in the
+/// error, and a failed probe times nothing.
+///
+/// - `full_equals_shipped`: the probe's all-phases arm writes the output
+///   the shipped flash writes, bit for bit, so what the phase arms time is
+///   the production program.
+/// - `epilogue_bit`: with the epilogue on (and the fold off) every segment
+///   of every head writes a partial with a positive weight sum; with the
+///   epilogue bit set nothing is written. The two arms differ in what they
+///   do, in the direction the bit's name says.
+fn self_check(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    kernels: &Kernels,
+    bufs: &mut Bufs,
+    pipeline: &Pipeline,
+) -> Result<(), String> {
+    let keys = CHECK_KEYS;
+    let pos = keys - 1;
+    let segments = segments_for_keys(keys) as usize;
+    if segments < 2 {
+        return Err(format!(
+            "the self-check scene of {keys} keys has {segments} segment; it needs a fold"
+        ));
+    }
+    let args = args_words(segments as u32, pos, keys);
+    let out_n = out_len().expect("the out length wraps");
+    let parts_all = partials_len(segments_for_keys(CTX) as usize).expect("the partials fit");
+    let parts_used = partials_len(segments).ok_or("the self-check partials do not fit")?;
+    // The floats of one (head, segment) partial: the max, the weight sum and
+    // the head's values.
+    let stride = partials_len(1).expect("the partials fit") / QUERY_HEADS;
+    let slots = QUERY_HEADS * segments;
+    let mut failures: Vec<String> = Vec::new();
+
+    clear_scratch(device, stream, bufs)?;
+    dispatch_once(stream, |encoder| {
+        let p = params(bufs, segments, pos, keys, device.fault_word())?;
+        kernels.attention_flash(encoder, p)
+    })?;
+    let shipped = read_f32(device, stream, &bufs.out, out_n)?;
+    clear_scratch(device, stream, bufs)?;
+    dispatch_once(stream, |encoder| {
+        encode_phase(
+            encoder,
+            pipeline,
+            bufs,
+            device.fault_word(),
+            &args,
+            PH_FULL,
+            segments,
+        )
+    })?;
+    let probed = read_f32(device, stream, &bufs.out, out_n)?;
+    let finite = shipped.iter().all(|x| x.is_finite());
+    let differing = shipped
+        .iter()
+        .zip(&probed)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "selfcheck\tclause=full_equals_shipped\tkeys={keys}\tvalues={out_n}\tfinite={finite}\tdiffering={differing}"
+    );
+    if !finite {
+        failures.push(
+            "full_equals_shipped: the shipped flash's output is not finite at the self-check scene"
+                .to_string(),
+        );
+    }
+    if differing != 0 {
+        failures.push(format!(
+            "full_equals_shipped: {differing} of {out_n} output values differ from the shipped flash's"
+        ));
+    }
+
+    let mut partials_of = |phase: u32| -> Result<Vec<f32>, String> {
+        clear_scratch(device, stream, bufs)?;
+        dispatch_once(stream, |encoder| {
+            encode_phase(
+                encoder,
+                pipeline,
+                bufs,
+                device.fault_word(),
+                &args,
+                phase,
+                segments,
+            )
+        })?;
+        read_f32(device, stream, &bufs.partials, parts_all)
+    };
+    let on = partials_of(PH_FULL | PH_NO_FOLD)?;
+    let off = partials_of(PH_FULL | PH_NO_FOLD | PH_NO_EPILOGUE)?;
+    let weighted_on = (0..slots)
+        .filter(|slot| on[slot * stride + 1] > 0.0)
+        .count();
+    let written_off = off[..parts_used]
+        .iter()
+        .filter(|x| x.to_bits() != 0)
+        .count();
+    println!(
+        "selfcheck\tclause=epilogue_bit\tkeys={keys}\tsegments={segments}\tslots={slots}\tweighted_slots_on={weighted_on}\twritten_words_off={written_off}"
+    );
+    if weighted_on != slots {
+        failures.push(format!(
+            "epilogue_bit: the epilogue-on arm wrote a weighted partial in {weighted_on} of {slots} slots"
+        ));
+    }
+    if written_off != 0 {
+        failures.push(format!(
+            "epilogue_bit: the epilogue-off arm wrote {written_off} partial words"
+        ));
+    }
+
+    if let Some(fault) = device.fault_word().read(stream).map_err(why)? {
+        failures.push(format!("the self-check launches raised {fault}"));
+    }
+    device.fault_word().clear(stream).map_err(why)?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// The phase arms of one key count: the probe kernel, the whole flash and
 /// one phase off at a time, then the split. Whether any arm failed.
-#[allow(clippy::type_complexity)]
 fn phase_arms(
     device: &MetalDevice,
     stream: &MetalStream,
     bufs: &mut Bufs,
     point: &Point<'_>,
+    pipeline: &Pipeline,
 ) -> bool {
     let Point {
         keys,
@@ -848,57 +993,19 @@ fn phase_arms(
         args,
         packed,
         trials,
+        shipped_us,
     } = *point;
-    // The phase word's bits: 1 the append, 2 the q prepare, 4 the tile
-    // loads, 8 the tile compute, 16 the fold off, 32 the epilogue off,
-    // 64 the tile loop off. 15 is the whole flash.
-    let phases: [(&str, u32); 6] = [
-        ("full", 15),
-        ("no_append", 14),
-        ("no_prepare", 13),
-        ("loads_only", 7),
-        ("no_tile", 3),
-        ("no_fold", 15 | 16),
-    ];
-    let library = match Library::from_source_text(device, &format!("{SOURCE}{PROBE}")) {
-        Ok(library) => library,
-        Err(e) => {
-            println!(
-                "attn\tkernel=probe_flash_f16\tkeys={keys}\tarm=phase\tFAIL\t{}",
-                why(e)
-            );
-            return true;
-        }
-    };
-    let pipeline = match library.pipeline("probe_flash_f16") {
-        Ok(pipeline) => pipeline,
-        Err(e) => {
-            println!(
-                "attn\tkernel=probe_flash_f16\tkeys={keys}\tarm=phase\tFAIL\t{}",
-                why(e)
-            );
-            return true;
-        }
-    };
     let mut figures: Vec<(&str, f64)> = Vec::new();
     let mut failed = false;
-    for (name, phase) in phases {
-        // A fresh ticket an arm: the fold resets it, but the arms that skip
-        // the fold leave it raised, and the next arm must start from zero.
-        bufs.ticket = match device.upload(stream, &[0u32]) {
-            Ok(ticket) => ticket,
-            Err(e) => {
-                println!(
-                    "attn\tkernel=probe_flash_f16\tkeys={keys}\tarm={name}\tFAIL\t{}",
-                    why(e)
-                );
-                return true;
-            }
-        };
+    for (name, phase) in ARMS {
+        if let Err(e) = clear_scratch(device, stream, bufs) {
+            println!("attn\tkernel=probe_flash_f16\tkeys={keys}\tarm={name}\tFAIL\t{e}");
+            return true;
+        }
         match time_arm(device, stream, packed, trials, |encoder, _| {
             encode_phase(
                 encoder,
-                &pipeline,
+                pipeline,
                 bufs,
                 device.fault_word(),
                 args,
@@ -917,21 +1024,42 @@ fn phase_arms(
         }
     }
     let at = |name: &str| figures.iter().find(|(n, _)| *n == name).map(|(_, us)| *us);
-    if let (Some(full), Some(no_append), Some(no_prepare), Some(loads_only), Some(no_tile)) = (
-        at("full"),
-        at("no_append"),
-        at("no_prepare"),
-        at("loads_only"),
-        at("no_tile"),
-    ) {
+    if let [
+        Some(full),
+        Some(no_append),
+        Some(no_prepare),
+        Some(loads_only),
+        Some(no_tile),
+        Some(no_tile_no_fold),
+        Some(no_loop_no_fold),
+        Some(no_fold),
+        Some(no_epilogue),
+        Some(bare),
+    ] = ARMS.map(|(name, _)| at(name))
+    {
+        // Each term is a difference of two arms that differ in one phase.
+        // `loop` is the tile loop's skeleton (its barriers, softmax and
+        // reductions with the loads and the arithmetic off), `epilogue` the
+        // partial write alone, `epilogue_and_fold` that write and the fold
+        // work it lets the fold do, and `floor` what stays with the tile loop,
+        // the epilogue's partials and the fold off (the launch, the append,
+        // the prepare). `probe_over_shipped` is the probe's whole-flash arm
+        // over the shipped flash's packed arm: the run-time gates are not
+        // free, so the split is of a program that may time apart from the
+        // shipped one even where its output equals it.
+        let ratio = shipped_us.map_or_else(|| "none".to_string(), |us| format!("{:.3}", full / us));
         println!(
-            "split\tkeys={keys}\tappend_us={:.3}\tprepare_us={:.3}\ttile_us={:.3}\tloads_us={:.3}\tcompute_us={:.3}\tskeleton_us={:.3}",
+            "split\tkeys={keys}\tappend_us={:.3}\tprepare_us={:.3}\ttile_us={:.3}\tloads_us={:.3}\tcompute_us={:.3}\tloop_us={:.3}\tfold_us={:.3}\tepilogue_us={:.3}\tepilogue_and_fold_us={:.3}\tfloor_us={:.3}\tprobe_over_shipped={ratio}",
             full - no_append,
             full - no_prepare,
             full - no_tile,
             loads_only - no_tile,
-            no_append - loads_only,
-            no_tile,
+            full - loads_only,
+            no_tile_no_fold - no_loop_no_fold,
+            full - no_fold,
+            no_fold - bare,
+            full - no_epilogue,
+            no_loop_no_fold,
         );
     }
     failed
