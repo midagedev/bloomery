@@ -64,7 +64,8 @@ enum GateUp {
     Ds41,
     /// One K-quant type for both, Q4_K or Q5_K: the fused clamped `_sel` over a stack of one expert, f32 `h` out.
     Fused(SiteTy),
-    /// A gemv each, then the clamped SwiGLU into the down's q8_1 blocks: no f32 `h`.
+    /// A gemv each, then the clamped SwiGLU: into the down's q8_1 blocks when the down is a K-quant (no f32 `h`),
+    /// else into the f32 `h` the down's own entry reads.
     Split { gate: SiteTy, up: SiteTy },
     /// Two types that read the f32 row: a gemv each over it, then the rule's f32 rows, f32 `h` out.
     Site { gate: SiteTy, up: SiteTy },
