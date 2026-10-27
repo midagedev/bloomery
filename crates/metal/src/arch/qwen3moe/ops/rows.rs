@@ -27,7 +27,7 @@ use crate::kernels::{
     AttentionPrefillParams, AttnCache, CombineParams, DeltaRowStrides, DeltaRowsParams, DeltaSnaps,
     EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
     HeadNormRowsParams, HeadParams, NormRowsParams, Operand, Quant, RouteSelectParams,
-    RouteTableParams, RoutedKind, RoutedParams, route_table_words, route_tiles,
+    RouteTableParams, RoutedKind, RoutedParams, TILE_ROWS, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -355,9 +355,10 @@ impl MetalOps<'_, '_> {
                     .delta_partials
                     .window_mut(Elems(0), Elems(m * strides.partials))?,
                 g: rows.mix.window_mut(Elems(0), Elems(m * strides.g))?,
-                prep: rows
-                    .delta_prep
-                    .window_mut(Elems(0), Elems(m * rows.delta_prep_stride))?,
+                prep: rows.delta_prep.window_mut(
+                    Elems(0),
+                    Elems(m.next_multiple_of(TILE_ROWS) * rows.delta_prep_stride),
+                )?,
                 faults: &faults[slot],
                 n_v: geom.delta.value_heads,
                 head: geom.delta.head_cols,

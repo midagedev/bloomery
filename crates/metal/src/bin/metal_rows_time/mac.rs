@@ -32,8 +32,8 @@ use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::{
     AttentionPrefillParams, AttentionRowsParams, AttnCache, CONV_TAPS, DeltaParams,
     DeltaRowStrides, DeltaRowsParams, HEAD_COLS, HEAD_DIM, HeadMap, KV_HEADS, Kernels, QUERY_HEADS,
-    ROT, VALUE_HEADS, channels, f16_len, out_len, partials_len, prepared_elems, qg_len, ring_elems,
-    state_elems,
+    ROT, TILE_ROWS, VALUE_HEADS, channels, f16_len, out_len, partials_len, prepared_elems, qg_len,
+    ring_elems, state_elems,
 };
 use bloomery_metal::library::{Library, SOURCE};
 
@@ -158,20 +158,41 @@ const PREP_OFF: (&str, &str) = (
     "    uint kh = tgp.x;\n    uint r = tgp.y;\n    uint tid = tpt.x;\n    uint ch = (2u * n_k + n_v) * head;",
     "    if (args.rows != 0xFFFFFFFFu) {\n        return;\n    }\n    uint kh = tgp.x;\n    uint r = tgp.y;\n    uint tid = tpt.x;\n    uint ch = (2u * n_k + n_v) * head;",
 );
-const RECUR_OFF: (&str, &str) = (
-    "    bool row_ok = lane_ok;\n    for (uint r = 0u; r < args.rows; ++r) {",
-    "    bool row_ok = lane_ok;\n    for (uint r = 0u; r < args.rows && args.rows == 0xFFFFFFFFu; ++r) {",
+const FACTORS_OFF: (&str, &str) = (
+    "    if (!gdn_chunk_at(tgp.y, args.rows, snaps, &first, &len)) {\n        return;\n    }",
+    "    if (args.rows != 0xFFFFFFFFu || !gdn_chunk_at(tgp.y, args.rows, snaps, &first, &len)) {\n        return;\n    }",
+);
+/// The chunked launch gated off leaves the sequential launch no row to take.
+const CHUNK_OFF_DONE: (&str, &str) = (
+    "    device uint *resume = (device uint *)(prep + args.prep.resume);\n\n    uint word = lane_buf[args.step.lane_at];",
+    "    device uint *resume = (device uint *)(prep + args.prep.resume);\n    if (args.rows != 0xFFFFFFFFu) {\n        if (tid == 0u) {\n            resume[tg] = rows;\n        }\n        return;\n    }\n\n    uint word = lane_buf[args.step.lane_at];",
+);
+/// The chunked launch gated off, as if it had stopped before the first row: the
+/// sequential launch takes every row.
+const CHUNK_OFF_ALL: (&str, &str) = (
+    "    device uint *resume = (device uint *)(prep + args.prep.resume);\n\n    uint word = lane_buf[args.step.lane_at];",
+    "    device uint *resume = (device uint *)(prep + args.prep.resume);\n    if (args.rows != 0xFFFFFFFFu) {\n        if (tid == 0u) {\n            resume[tg] = 0u;\n        }\n        return;\n    }\n\n    uint word = lane_buf[args.step.lane_at];",
+);
+const SEQ_OFF: (&str, &str) = (
+    "    for (uint r = start; r < args.rows; ++r) {",
+    "    for (uint r = start; r < args.rows && args.rows == 0xFFFFFFFFu; ++r) {",
 );
 const POST_OFF: (&str, &str) = (
     "    float oval = numerator[tid];\n    o2[tid] = oval * oval;",
     "    if (args.rows != 0xFFFFFFFFu) {\n        return;\n    }\n    float oval = numerator[tid];\n    o2[tid] = oval * oval;",
 );
 
-/// The phase arms: each is the launch with the other phases gated off.
+/// The phase arms: each is the launch with the other phases gated off. The
+/// sequential arm hands the sequential launch every row.
 const PHASES: &[(&str, &[(&str, &str)])] = &[
-    ("prep", &[RECUR_OFF, POST_OFF]),
-    ("recur", &[PREP_OFF, POST_OFF]),
-    ("post", &[PREP_OFF, RECUR_OFF]),
+    ("prep", &[FACTORS_OFF, CHUNK_OFF_DONE, SEQ_OFF, POST_OFF]),
+    ("factors", &[PREP_OFF, CHUNK_OFF_DONE, SEQ_OFF, POST_OFF]),
+    ("chunk", &[PREP_OFF, FACTORS_OFF, SEQ_OFF, POST_OFF]),
+    (
+        "sequential",
+        &[PREP_OFF, FACTORS_OFF, CHUNK_OFF_ALL, POST_OFF],
+    ),
+    ("post", &[PREP_OFF, FACTORS_OFF, CHUNK_OFF_DONE, SEQ_OFF]),
 ];
 
 fn print_delta(arm: &str, rows: usize, t: &Timed) {
@@ -374,6 +395,8 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
             "gqa256_flash_f16_rows",
             "gdn_rows",
             "gdn_prep_rows",
+            "gdn_chunk_prep",
+            "gdn_chunk_rows",
         ] {
             let pipeline = device.library().pipeline(name).map_err(why)?;
             println!(
@@ -572,7 +595,11 @@ fn delta_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), 
         ring: up(&planted(&mut s, ring_elems(N_K).ok_or("ring")?, 0.05))?,
         partials: up(&vec![0f32; top * P_ROW])?,
         g: up(&vec![0f32; top * G_ROW])?,
-        prep: up(&vec![0f32; top * prepared_elems(N_K).ok_or("prep")?])?,
+        prep: up(&vec![
+            0f32;
+            top.next_multiple_of(TILE_ROWS)
+                * prepared_elems(N_K).ok_or("prep")?
+        ])?,
     };
     device.fault_word().clear(stream).map_err(why)?;
     let strides = DeltaRowStrides::dense(N_K).ok_or("strides")?;
@@ -599,9 +626,10 @@ fn delta_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), 
                         .window_mut(Elems(0), Elems(ring_elems(N_K).unwrap()))?,
                     partials: bufs.partials.window_mut(Elems(0), Elems(rows * P_ROW))?,
                     g: bufs.g.window_mut(Elems(0), Elems(rows * G_ROW))?,
-                    prep: bufs
-                        .prep
-                        .window_mut(Elems(0), Elems(rows * prepared_elems(N_K).unwrap()))?,
+                    prep: bufs.prep.window_mut(
+                        Elems(0),
+                        Elems(rows.next_multiple_of(TILE_ROWS) * prepared_elems(N_K).unwrap()),
+                    )?,
                     faults: device.fault_word(),
                     n_v: VALUE_HEADS,
                     head: HEAD_COLS,

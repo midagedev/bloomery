@@ -911,10 +911,10 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "snap_row_late",
         clause: "delta_rows_snap",
-        why: "the rows launch copies the state lane one row after the row its copy names",
+        why: "the chunked launch cuts its chunk one row after the row its copy names, so the copy holds the state one row late",
         edits: &[(
-            "if (copy < copies && r == snaps->after[copy]) {",
-            "if (copy < copies && r == snaps->after[copy] + 1u) {",
+            "uint cut = copy < copies ? snaps->after[copy] + 1u : rows;",
+            "uint cut = copy < copies ? snaps->after[copy] + 2u : rows;",
             1,
         )],
     },
@@ -931,10 +931,10 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "rows_lane_parity",
         clause: "delta_rows",
-        why: "the rows launch writes the state to the lane it read, not the lane the write word names",
+        why: "the chunked launch writes the state to the lane it read, not the lane the write word names",
         edits: &[(
-            "    if (lane_ok) {\n        for (uint i = 0u; i < 16u; ++i) {\n            state[base_to + key_of(seat.j, i)] = st[i];",
-            "    if (lane_ok) {\n        for (uint i = 0u; i < 16u; ++i) {\n            state[base + key_of(seat.j, i)] = st[i];",
+            "        *((device float4 *)(state + base_to + row * head + 4u * c4)) =\n            *((threadgroup float4 *)(sm + row * GDN_SS + 4u * c4));\n    }\n    if (tid == 0u) {\n        resume[tg] = rows;",
+            "        *((device float4 *)(state + base + row * head + 4u * c4)) =\n            *((threadgroup float4 *)(sm + row * GDN_SS + 4u * c4));\n    }\n    if (tid == 0u) {\n        resume[tg] = rows;",
             1,
         )],
     },
@@ -1020,10 +1020,70 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "rows_recur_decay_row",
         clause: "delta_rows",
-        why: "the recurrence takes the decay of the previous row",
+        why: "the chunk's factors take the decay of the previous row",
         edits: &[(
-            "float decay = row[args.prep.decay + seat.h];",
-            "float decay = (r > 0u ? row - args.prep.stride : row)[args.prep.decay + seat.h];",
+            "gv[tid] = used ? (base + (ulong)tid * stride)[args.prep.decay + h] : 1.0f;",
+            "gv[tid] = used ? (base + (ulong)(tid > 0u ? tid - 1u : 0u) * stride)[args.prep.decay + h] : 1.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "chunk_no_inverse",
+        clause: "delta_rows",
+        why: "the chunk's triangular factor is the identity, so a row's update ignores the rows before it",
+        edits: &[(
+            "ts[i * GDN_TS + tid] = (i == tid ? 1.0f : 0.0f) - ((s0 + s1) + (s2 + s3));",
+            "ts[i * GDN_TS + tid] = (i == tid ? 1.0f : 0.0f);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "chunk_no_diagonal",
+        clause: "delta_rows",
+        why: "a row's output leaves out its own update: the score row stops short of the diagonal",
+        edits: &[(
+            "ps[i * GDN_TS + j] = (inside && j <= i) ? ms[i * GDN_TS + j] * qs[i * GDN_TS + j] : 0.0f;",
+            "ps[i * GDN_TS + j] = (inside && j < i) ? ms[i * GDN_TS + j] * qs[i * GDN_TS + j] : 0.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "chunk_update_undecayed",
+        clause: "delta_rows",
+        why: "the state a chunk leaves keeps the old state undecayed",
+        edits: &[(
+            "                acc.thread_elements()[0] *= last;\n                acc.thread_elements()[1] *= last;\n",
+            "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "chunk_update_unweighted",
+        clause: "delta_rows",
+        why: "the state update takes each row's correction without its decay to the chunk's end",
+        edits: &[(
+            "            b.thread_elements()[0] = mend * u0;\n            b.thread_elements()[1] = mend * u1;",
+            "            b.thread_elements()[0] = u0;\n            b.thread_elements()[1] = u1;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "chunk_nonfinite_kept",
+        clause: "delta_rows_nan",
+        why: "the chunked launch does not hand a chunk with a non-finite output or state to the sequential launch",
+        edits: &[(
+            "            sg_bad[sgitg] = unusable ? 1u : 0u;",
+            "            sg_bad[sgitg] = 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "chunk_resume_ignored",
+        clause: "delta_rows_resume",
+        why: "the sequential launch reads the lane the chunked launch read, not the lane it handed the state over in",
+        edits: &[(
+            "    uint from = start == 0u ? word : word_to;",
+            "    uint from = word;",
             1,
         )],
     },

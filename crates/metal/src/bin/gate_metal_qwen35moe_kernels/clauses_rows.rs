@@ -9,8 +9,9 @@ use bloomery_device::{Buffer, Device, Elems, Fault};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::geom::{AttnGeom, DeltaGeom};
 use bloomery_metal::kernels::{
-    AttentionParams, AttentionPrefillParams, AttentionRowsParams, AttnCache, DeltaParams,
+    AttentionParams, AttentionPrefillParams, AttentionRowsParams, AttnCache, CHUNK, DeltaParams,
     DeltaRowStrides, DeltaRowsParams, DeltaSnaps, HeadMap, NormRowsParams, PARTIALS_PER_HEAD,
+    TILE_ROWS,
 };
 
 use super::clauses_attention::{
@@ -18,7 +19,9 @@ use super::clauses_attention::{
     dequant_v_for, gate_of, head_row_for, load_tables_for, plant_f16_for, read_cache, take_qg_for,
     u, upload_cache,
 };
-use super::clauses_delta::{Fixed, KEY_HEADS, draw, fixed};
+use super::clauses_delta::{
+    Fixed, KEY_HEADS, band_kappa, band_out, band_state, draw, fixed, recur,
+};
 use super::clauses_router;
 use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
@@ -102,6 +105,8 @@ struct Out {
     partials: Vec<f32>,
     state: Vec<f32>,
     ring: Vec<f32>,
+    /// The prepared rows the launch left, whole tile rows of them.
+    prep: Vec<f32>,
     fault: Option<Fault>,
 }
 
@@ -144,7 +149,10 @@ impl Bufs {
                 .upload(stream, &vec![0f32; c.rows * g_row])
                 .map_err(why)?,
             prep: device
-                .upload(stream, &vec![0f32; c.rows * prep_row(delta)?])
+                .upload(
+                    stream,
+                    &vec![0f32; c.rows.next_multiple_of(TILE_ROWS) * prep_row(delta)?],
+                )
                 .map_err(why)?,
         })
     }
@@ -157,8 +165,12 @@ impl Bufs {
             partials: vec![0f32; c.rows * p_row(delta)],
             state: vec![0f32; c.state.len()],
             ring: vec![0f32; c.ring.len()],
+            prep: vec![0f32; c.rows.next_multiple_of(TILE_ROWS) * prep_row(delta)?],
             fault: h.fault()?,
         };
+        device
+            .read(stream, self.prep.whole().map_err(why)?, &mut out.prep)
+            .map_err(why)?;
         device
             .read(stream, self.g.whole().map_err(why)?, &mut out.g)
             .map_err(why)?;
@@ -203,7 +215,7 @@ fn run_rows_copied(
     let (g_row, p_row) = (g_row(delta), p_row(delta));
     let mut bufs = Bufs::new(h, fx, c)?;
     let strides = DeltaRowStrides::dense(N_K).ok_or("the strides do not fit")?;
-    let prep_len = c.rows * prep_row(delta)?;
+    let prep_len = c.rows.next_multiple_of(TILE_ROWS) * prep_row(delta)?;
     let lane_len = after.len() * elems(delta.state_elems(1), "a lane")?;
     let ring_len = after.len() * c.ring.len();
     let poison = |n: usize| -> Result<MetalBuffer<f32>, String> {
@@ -359,65 +371,251 @@ fn same_bits(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
     }
 }
 
-/// The rows launch left what the stepped launches left: the numerator and
-/// partials of every row, the whole state, the whole ring and the fault word.
-fn same_out(rows: &Out, stepped: &Out) -> Result<(), String> {
-    same_bits("g", &rows.g, &stepped.g)?;
-    same_bits("partials", &rows.partials, &stepped.partials)?;
-    same_bits("state", &rows.state, &stepped.state)?;
-    same_bits("ring", &rows.ring, &stepped.ring)?;
-    if rows.fault != stepped.fault {
-        let show = |f: &Option<Fault>| f.map_or("none".to_string(), |f| f.to_string());
-        return Err(format!(
-            "the fault word is {}, the stepped launches' {}",
-            show(&rows.fault),
-            show(&stepped.fault)
-        ));
-    }
-    Ok(())
-}
+/// The cases of the delta clause: rows, first position, the read and the
+/// write lane word, and whether the rows' conv inputs are tied (every row the
+/// first row's with a few percent of noise, so the keys of the rows are nearly
+/// parallel and the rows of a chunk bear on each other as hard as they can).
+/// A first position of 0 puts taps before the first position; 7 and 3 with 12
+/// and 64 rows wrap the ring. One row is a chunk of one; 33 and 130 rows end in
+/// a chunk of one and of two rows after full chunks, the second carrying the
+/// state through four.
+type DeltaCase = (usize, u32, (usize, usize), bool);
 
-/// The cases of the delta clause: rows, first position, and the read and the
-/// write lane word. A first position of 0 puts taps before the first
-/// position; 7 and 3 with 12 and 64 rows wrap the ring.
-const DELTA_CASES: [(usize, u32, (usize, usize)); 7] = [
-    (1, 4, (0, 1)),
-    (9, 0, (0, 1)),
-    (9, 20, (1, 0)),
-    (12, 7, (0, 1)),
-    (12, 3, (1, 1)),
-    (64, 5, (0, 0)),
-    (64, 9, (1, 0)),
+const DELTA_CASES: [DeltaCase; 11] = [
+    (1, 4, (0, 1), false),
+    (9, 0, (0, 1), false),
+    (9, 20, (1, 0), false),
+    (12, 7, (0, 1), false),
+    (12, 3, (1, 1), false),
+    (64, 5, (0, 0), false),
+    (64, 9, (1, 0), false),
+    (33, 2, (1, 1), false),
+    (130, 17, (0, 1), false),
+    (40, 6, (0, 1), true),
+    (64, 11, (1, 0), true),
 ];
 
-/// `m` rows are the bits of `m` stepped launches: numerators, partials, state,
-/// ring and fault word.
+/// Every row after the first is the first row's conv input with 3 % noise.
+fn tie_rows(c: &mut Chunk, ch: usize, rng: &mut oracle::Rng) {
+    for r in 1..c.rows {
+        for i in 0..ch {
+            c.x[r * ch + i] = c.x[i] * (1.0 + 0.03 * rng.signed());
+        }
+    }
+}
+
+/// The chunks of a launch of `rows` rows with copies after `after`: from each
+/// cut, [`CHUNK`] rows a chunk.
+fn chunk_units(rows: usize, after: &[u32]) -> usize {
+    let mut start = 0;
+    let mut chunks = 0;
+    for end in after.iter().map(|&a| a as usize + 1).chain([rows]) {
+        chunks += (end - start).div_ceil(CHUNK);
+        start = end;
+    }
+    chunks
+}
+
+/// The worst ratios of a launch's words to their bands.
+#[derive(Default)]
+struct Ratios {
+    chunked: f64,
+    stepped: f64,
+    state: f64,
+}
+
+/// `|got - want|` over `band`, or the words' error when it is over.
+fn within(what: &str, got: f64, want: f64, band: f64) -> Result<f64, String> {
+    if want.is_nan() {
+        return if got.is_nan() {
+            Ok(0.0)
+        } else {
+            Err(format!("{what} is {got:e}, the f64 recurrence's NaN"))
+        };
+    }
+    let diff = (got - want).abs();
+    if diff <= band {
+        Ok(if band > 0.0 { diff / band } else { 0.0 })
+    } else {
+        Err(format!(
+            "{what} is {got:e}, the f64 recurrence {want:e}: off by {diff:e}, over the band {band:e}"
+        ))
+    }
+}
+
+/// A rows launch (`rows`), and the stepped launches of the same chunk
+/// (`stepped`), held to the f64 recurrence of the prepared rows the rows
+/// launch left: every numerator, partial sum and state word of every column
+/// block `skip` does not name, within the band `band_out`/`band_state` derive.
+/// The ring and the fault word of the two are the same.
+fn held(
+    h: &Harness<'_>,
+    fx: &Fixed,
+    c: &Chunk,
+    (after, sequential): (&[u32], usize),
+    (rows, stepped): (&Out, &Out),
+    skip: &dyn Fn(usize, usize) -> bool,
+) -> Result<Ratios, String> {
+    let delta = &h.geom().delta;
+    let (n_v, head, blocks) = (delta.value_heads, delta.head_cols, PARTIALS_PER_HEAD);
+    let per = head / blocks;
+    let lane_len = elems(delta.state_elems(1), "a lane")?;
+    let stride = prep_row(delta)?;
+    let map = HeadMap::Tiled;
+    let lane = |v: &[f32], at: usize| v[at * lane_len..(at + 1) * lane_len].to_vec();
+    let rec = recur(
+        delta,
+        (N_K, map),
+        c.rows,
+        (&rows.prep, stride),
+        &lane(&c.state, c.lane_at),
+    )?;
+    let units = chunk_units(c.rows, after) + sequential;
+    let kappa_c = band_kappa(head, CHUNK);
+    let kappa_s = band_kappa(head, 0);
+    let (g_row, p_row) = (g_row(delta), p_row(delta));
+    let mut worst = Ratios::default();
+    for t in 0..c.rows {
+        for hv in 0..n_v {
+            let kh = map.k_head_of(hv, n_v, N_K);
+            let q = rec.q_norm[t * N_K + kh];
+            for block in 0..blocks {
+                if skip(hv, block) {
+                    continue;
+                }
+                let mut sum = 0.0;
+                let mut band_sum = 0.0;
+                for col in block * per..(block + 1) * per {
+                    let at = (t * n_v + hv) * head + col;
+                    let (o, gate) = (rec.o[at], rec.gate[at]);
+                    let gain = f64::from(fx.norm_w[col]);
+                    let want = (o * gain) * gate;
+                    let scale = rec.scale[hv * head + col];
+                    let weight = (gain * gate).abs();
+                    for (what, got, units, kappa) in [
+                        (
+                            "numerator",
+                            rows.g[t * g_row + hv * head + col],
+                            units,
+                            kappa_c,
+                        ),
+                        (
+                            "the stepped launches' numerator",
+                            stepped.g[t * g_row + hv * head + col],
+                            c.rows,
+                            kappa_s,
+                        ),
+                    ] {
+                        let band_o = band_out(units, kappa, head, scale, q);
+                        let band = weight * band_o + 4.0 * super::oracle::U * want.abs();
+                        let r = within(
+                            &format!("row {t} head {hv} column {col}: {what}"),
+                            f64::from(got),
+                            want,
+                            band,
+                        )?;
+                        if units == c.rows && kappa == kappa_s {
+                            worst.stepped = worst.stepped.max(r);
+                        } else {
+                            worst.chunked = worst.chunked.max(r);
+                        }
+                    }
+                    let band_o = band_out(units, kappa_c, head, scale, q);
+                    sum += o * o;
+                    band_sum += 2.0 * o.abs() * band_o + band_o * band_o;
+                }
+                let want = sum;
+                let band = band_sum + 20.0 * super::oracle::U * sum;
+                within(
+                    &format!("row {t} head {hv} block {block}: the partial sum"),
+                    f64::from(rows.partials[t * p_row + hv * blocks + block]),
+                    want,
+                    band,
+                )?;
+            }
+        }
+    }
+    let (got, base) = (
+        lane(&rows.state, c.lane_to),
+        lane(&stepped.state, c.lane_to),
+    );
+    for hv in 0..n_v {
+        for col in 0..head {
+            if skip(hv, col / per) {
+                continue;
+            }
+            let scale = rec.scale[hv * head + col];
+            for key in 0..head {
+                let at = (hv * head + col) * head + key;
+                let want = rec.state[at];
+                for (what, v, units, kappa) in [
+                    ("state", got[at], units, kappa_c),
+                    ("the stepped launches' state", base[at], c.rows, kappa_s),
+                ] {
+                    let r = within(
+                        &format!("head {hv} column {col} key {key}: {what}"),
+                        f64::from(v),
+                        want,
+                        band_state(units, kappa, scale),
+                    )?;
+                    worst.state = worst.state.max(r);
+                }
+            }
+        }
+    }
+    same_bits("ring", &rows.ring, &stepped.ring)?;
+    if rows.fault != stepped.fault {
+        return Err(format!(
+            "the fault word is {:?}, the stepped launches' {:?}",
+            rows.fault, stepped.fault
+        ));
+    }
+    Ok(worst)
+}
+
+/// `m` rows are within the band of the f64 recurrence of their prepared rows,
+/// as the stepped launches are, and leave the stepped launches' ring and
+/// fault word: numerators, partials, state.
 pub fn delta_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let delta = &h.geom().delta;
     let fx = fixed(delta, fixture)?;
     let mut rng = oracle::Rng::new(0xD0A5);
     let mut parts = Vec::new();
-    for (rows, pos, lanes) in DELTA_CASES {
-        let c = chunk(delta, &mut rng, rows, pos, lanes)?;
+    let mut worst = Ratios::default();
+    let ch = elems(delta.channels(N_K), "channels")?;
+    for (rows, pos, lanes, tied) in DELTA_CASES {
+        let mut c = chunk(delta, &mut rng, rows, pos, lanes)?;
+        if tied {
+            tie_rows(&mut c, ch, &mut rng);
+        }
         let a = run_rows(h, &fx, &c)?;
         let b = run_stepped(h, &fx, &c)?;
         if let Some(f) = a.fault {
             return Err(format!("{rows} rows from {pos} raised {f}"));
         }
-        same_out(&a, &b).map_err(|e| format!("{rows} rows from {pos}, lanes {lanes:?}: {e}"))?;
-        // The state moved: a rows launch that wrote nothing is not the
-        // stepped launches' bits by luck of an unchanged lane.
+        let w = held(h, &fx, &c, (&[], 0), (&a, &b), &|_, _| false)
+            .map_err(|e| format!("{rows} rows from {pos}, lanes {lanes:?}: {e}"))?;
+        worst.chunked = worst.chunked.max(w.chunked);
+        worst.stepped = worst.stepped.max(w.stepped);
+        worst.state = worst.state.max(w.state);
+        // The state moved: a rows launch that wrote nothing is not within the
+        // band by luck of an unchanged lane.
         if a.state == c.state {
             return Err(format!("{rows} rows from {pos} left the state as it was"));
         }
         if rows >= delta.ring_rows && a.ring == c.ring {
             return Err(format!("{rows} rows from {pos} left the ring as it was"));
         }
-        parts.push(format!("{rows}@{pos}"));
+        parts.push(format!("{rows}@{pos}{}", if tied { " tied" } else { "" }));
     }
     Ok(Verdict::Noted(format!(
-        "rows@first position {} are the stepped launches' bits",
-        parts.join(", ")
+        "rows@first position {} are within the band of the f64 recurrence of their prepared rows \
+         (worst ratio {:.4} of the numerator band, {:.4} of the state band; the stepped launches \
+         {:.4}) and leave the stepped launches' ring and fault word",
+        parts.join(", "),
+        worst.chunked,
+        worst.state,
+        worst.stepped
     )))
 }
 
@@ -459,9 +657,10 @@ const SNAP_CASES: [SnapCase; 5] = [
 
 /// A rows launch's copies are the bits a chunk ending at their rows leaves:
 /// copy `k`'s lane is the write lane, and its ring the ring, of the rows
-/// launch over rows `0..=after[k]` of the same inputs; and the copies move
-/// none of the launch's own outputs (numerators, partials, state, ring,
-/// fault word).
+/// launch over rows `0..=after[k]` of the same inputs with the copies before
+/// it (a copy is a cut of the chunks, so the same chunks); and the launch's
+/// own outputs are within the band of the f64 recurrence, as a launch's
+/// without copies.
 pub fn delta_rows_snap(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let delta = &h.geom().delta;
     let fx = fixed(delta, fixture)?;
@@ -475,11 +674,18 @@ pub fn delta_rows_snap(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         if let Some(f) = got.fault {
             return Err(format!("{at}: raised {f}"));
         }
-        let plain = run_rows(h, &fx, &c)?;
-        same_out(&got, &plain).map_err(|e| format!("{at}, against no copies: {e}"))?;
+        // The conv's ring slot arithmetic is not defined for positions within
+        // a ring of the last u32 position: that case pins the copies' ring
+        // only.
+        if pos <= u32::MAX - delta.ring_rows as u32 {
+            let stepped = run_stepped(h, &fx, &c)?;
+            held(h, &fx, &c, (after, 0), (&got, &stepped), &|_, _| false)
+                .map_err(|e| format!("{at}, against the f64 recurrence: {e}"))?;
+        }
         let ring_len = c.ring.len();
         for (k, &r) in after.iter().enumerate() {
-            let end = run_rows(h, &fx, &head_of(delta, &c, r as usize + 1)?)?;
+            let (end, _) =
+                run_rows_copied(h, &fx, &head_of(delta, &c, r as usize + 1)?, &after[..k])?;
             let lane = &end.state[c.lane_to * lane_len..(c.lane_to + 1) * lane_len];
             same_bits(
                 &format!("{at}: copy {k}'s lane"),
@@ -496,7 +702,7 @@ pub fn delta_rows_snap(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     }
     Ok(Verdict::Noted(format!(
         "rows@first position {}: each copy is the chunk ending at its row, bit for bit, and \
-         the launch's own outputs are the launch's without copies",
+         the launch's own outputs are within the band of the f64 recurrence",
         parts.join(", ")
     )))
 }
@@ -508,6 +714,10 @@ struct Poison {
     /// Whether every numerator word is NaN (a lane that cannot be read leaves
     /// no column a number), else only the columns the input reaches.
     everywhere: bool,
+    /// Whether the column block `(value head, block)` is one the poison
+    /// reaches: its chunk is the sequential launch's, so the stepped launches'
+    /// bits.
+    reaches: fn(usize, usize) -> bool,
     apply: fn(&DeltaGeom, &mut Chunk, usize),
 }
 
@@ -535,6 +745,45 @@ fn lane_past(_delta: &DeltaGeom, c: &mut Chunk, _ch: usize) {
     c.lane_words = vec![0, 7];
 }
 
+/// The words of the column blocks `reaches` names, in `rows` and in the
+/// stepped launches: numerators, partial sums and state, bit for bit.
+fn same_groups(
+    delta: &DeltaGeom,
+    c: &Chunk,
+    (rows, stepped): (&Out, &Out),
+    reaches: &dyn Fn(usize, usize) -> bool,
+) -> Result<(), String> {
+    let (head, blocks) = (delta.head_cols, PARTIALS_PER_HEAD);
+    let per = head / blocks;
+    let (g_row, p_row) = (g_row(delta), p_row(delta));
+    let lane_len = elems(delta.state_elems(1), "a lane")?;
+    for h in 0..delta.value_heads {
+        for block in (0..blocks).filter(|&b| reaches(h, b)) {
+            for t in 0..c.rows {
+                let g = t * g_row + h * head + block * per;
+                same_bits(
+                    &format!("row {t} head {h} block {block}: numerators"),
+                    &rows.g[g..g + per],
+                    &stepped.g[g..g + per],
+                )?;
+                let p = t * p_row + h * blocks + block;
+                same_bits(
+                    &format!("row {t} head {h} block {block}: partial sum"),
+                    &rows.partials[p..=p],
+                    &stepped.partials[p..=p],
+                )?;
+            }
+            let at = c.lane_to * lane_len + (h * head + block * per) * head;
+            same_bits(
+                &format!("head {h} block {block}: state"),
+                &rows.state[at..at + per * head],
+                &stepped.state[at..at + per * head],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// A row with a non-finite input raises the decode's site and is NaN on the
 /// columns the stepped launches make NaN; the other rows are unaffected.
 pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
@@ -546,30 +795,35 @@ pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             what: "a NaN conv input",
             site: FaultSite::LinearConv,
             everywhere: false,
+            reaches: |h, _| h % KEY_HEADS == 0,
             apply: nan_x,
         },
         Poison {
             what: "a NaN value conv input",
             site: FaultSite::LinearConv,
             everywhere: false,
+            reaches: |h, block| h == 2 && block == 0,
             apply: nan_value_x,
         },
         Poison {
             what: "an infinite β input",
             site: FaultSite::LinearConv,
             everywhere: false,
+            reaches: |h, _| h == 3,
             apply: inf_b,
         },
         Poison {
             what: "a NaN state key",
             site: FaultSite::DeltaLane,
             everywhere: false,
+            reaches: |h, block| h == 2 && block == 0,
             apply: nan_state,
         },
         Poison {
             what: "a write lane word past the lanes",
             site: FaultSite::DeltaLane,
             everywhere: true,
+            reaches: |_, _| true,
             apply: lane_past,
         },
     ];
@@ -586,7 +840,12 @@ pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         (case.apply)(delta, &mut c, ch);
         let a = run_rows(h, &fx, &c)?;
         let b = run_stepped(h, &fx, &c)?;
-        same_out(&a, &b).map_err(|e| format!("{}: {e}", case.what))?;
+        // The columns the poison reaches are the sequential launch's: the
+        // stepped launches' bits. The others are within the band.
+        held(h, &fx, &c, (&[], 0), (&a, &b), &case.reaches)
+            .map_err(|e| format!("{}: {e}", case.what))?;
+        same_groups(delta, &c, (&a, &b), &case.reaches)
+            .map_err(|e| format!("{}: {e}", case.what))?;
         match a.fault {
             Some(f) if f.layer == LAYER && f.sites & (1 << case.site as u32) != 0 => {}
             Some(f) => {
@@ -612,8 +871,48 @@ pub fn delta_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         parts.push(format!("{} ({nans} NaN words)", case.what));
     }
     Ok(Verdict::Noted(format!(
-        "each is the stepped launches' fault word, numerators and state: {}",
+        "each is the stepped launches' fault word, and its columns are the stepped launches' numerators, \
+         partials and state bit for bit, the others within the band: {}",
         parts.join(", ")
+    )))
+}
+
+/// A chunk the chunked launch stops at hands its state to the sequential
+/// launch, which takes every later row from the lane the state was handed over
+/// in: the rows of a launch of two chunks and a tail, with a value conv input
+/// that is not finite in the second chunk, are NaN where the stepped launches'
+/// are (the column block's rows that read it), the fault word is the stepped
+/// launches', and every other word of the block, before and after, is within
+/// the band of the f64 recurrence that skips those rows.
+pub fn delta_rows_resume(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let delta = &h.geom().delta;
+    let fx = fixed(delta, fixture)?;
+    let ch = elems(delta.channels(N_K), "channels")?;
+    let rows = 70;
+    let mut rng = oracle::Rng::new(0xD0B0);
+    let mut c = chunk(delta, &mut rng, rows, 5, (0, 1))?;
+    // A value channel of value head 2, column 9, in row 40.
+    c.x[40 * ch + (2 * N_K + 2) * delta.head_cols + 9] = f32::NAN;
+    let a = run_rows(h, &fx, &c)?;
+    let b = run_stepped(h, &fx, &c)?;
+    // The rows after the stop are the sequential launch's: its rounding, not
+    // the chunk launch's, over as many rows as it took.
+    held(h, &fx, &c, (&[], rows), (&a, &b), &|_, _| false)?;
+    match a.fault {
+        Some(f) if f.layer == LAYER && f.sites & (1 << FaultSite::LinearConv as u32) != 0 => {}
+        other => {
+            return Err(format!(
+                "the poisoned chunk raised {other:?}, not the conv site"
+            ));
+        }
+    }
+    let nans = a.g.iter().filter(|v| v.is_nan()).count();
+    if nans == 0 || nans == a.g.len() {
+        return Err(format!("{nans} of {} numerator words are NaN", a.g.len()));
+    }
+    Ok(Verdict::Noted(format!(
+        "{rows} rows with a NaN value conv input in row 40: {nans} NaN numerator words, the stepped \
+         launches' fault word and ring, every other word within the band"
     )))
 }
 
@@ -1567,7 +1866,7 @@ impl DeltaOver {
             lane_len: 2,
             lane_at: 0,
             lane_to: 1,
-            prep_len: REF_ROWS * prep,
+            prep_len: REF_ROWS.next_multiple_of(TILE_ROWS) * prep,
             prep_at: 0,
         }
     }
@@ -1670,7 +1969,7 @@ fn delta_refusals(h: &Harness<'_>) -> Result<usize, String> {
         partials: ones(REF_ROWS * p_row)?,
         g: ones(REF_ROWS * g_row)?,
         // One word more than the rows need, so a window can start a word in.
-        prep: ones(REF_ROWS * prep_row(delta)? + 1)?,
+        prep: ones(REF_ROWS.next_multiple_of(TILE_ROWS) * prep_row(delta)? + 1)?,
     };
     let whole = DeltaOver::whole(delta, ch, prep_row(delta)?);
     let case = |what, needle, edit| delta_case(h, whole, what, needle, edit);
@@ -2204,6 +2503,10 @@ pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
         ("delta_rows", Box::new(|| ctx.with(delta_rows))),
         ("delta_rows_nan", Box::new(|| ctx.with(delta_rows_nan))),
         ("delta_rows_snap", Box::new(|| ctx.with(delta_rows_snap))),
+        (
+            "delta_rows_resume",
+            Box::new(|| ctx.with(delta_rows_resume)),
+        ),
     ];
     clauses.extend(shaped(ctx));
     clauses

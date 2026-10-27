@@ -1783,7 +1783,7 @@ mod tests {
             cap * proj.next_multiple_of(4),
             cap * value_heads * head_cols,
             cap * g.delta.partials_stride,
-            cap * prepared,
+            cap.next_multiple_of(crate::kernels::TILE_ROWS) * prepared,
             cap * g.router.logit_stride,
             slots,
             slots,

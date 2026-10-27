@@ -30,7 +30,7 @@ use super::arena::{Arena, MixerBufs};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::geom::Geometry;
-use crate::kernels::{SNAPS, route_table_words};
+use crate::kernels::{SNAPS, TILE_ROWS, route_table_words};
 use crate::residency::Alloc;
 
 /// The widest a row of the delta numerator or the attention output is, at
@@ -239,8 +239,13 @@ impl RowsLens {
                 product(cap, g.delta.partials_stride, "the delta partials")?,
                 "the delta partials",
             )?,
+            // Whole tile rows: the chunked recurrence reads its last tile past the pass's rows.
             delta_prep: nonzero(
-                product(cap, delta_prep_stride.max(1), "the delta's prepared rows")?,
+                product(
+                    cap.next_multiple_of(TILE_ROWS),
+                    delta_prep_stride.max(1),
+                    "the delta's prepared rows",
+                )?,
                 "the delta's prepared rows",
             )?,
             delta_prep_stride,

@@ -25,7 +25,7 @@ use crate::fault::MetalFaultWord;
 use crate::geom::{DeltaGeom, HOST_GEOMETRY};
 use crate::library::{Library, Pipeline};
 
-use super::delta_geom::SNAPS;
+use super::delta_geom::{AUX_PER_HEAD, CHUNK, SNAPS, TILE_ROWS};
 use super::geometry::VALUE_HEADS;
 use super::rows::check_strided;
 use super::{Kernels, check_window_len, pack, word};
@@ -41,9 +41,11 @@ const WHAT: &str = "delta step";
 /// Where the parts of a prepared row sit, in floats from the row's start. The
 /// scaled queries, then the scaled keys (`n_k` key heads of `head_cols`
 /// values each), the value conv outputs and the gate's SiLU (`value_heads`
-/// heads of `head_cols`), β and the decay (`value_heads` each), and one
-/// status word for each recurrence threadgroup. Every part starts on a
-/// 16-byte boundary: the recurrence reads the keys four at a time.
+/// heads of `head_cols`), β and the decay (`value_heads` each), one status
+/// word for each recurrence threadgroup, the chunk factors (`AUX_PER_HEAD` a
+/// value head) and one resume word for each recurrence threadgroup (the first
+/// row's). Every part starts on a 16-byte boundary: the recurrence reads the
+/// keys four at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PrepLayout {
     stride: usize,
@@ -53,6 +55,8 @@ struct PrepLayout {
     decay: usize,
     beta: usize,
     bad: usize,
+    aux: usize,
+    resume: usize,
 }
 
 impl PrepLayout {
@@ -63,7 +67,9 @@ impl PrepLayout {
         let decay = gate.checked_add(g.value_heads * g.head_cols)?;
         let beta = decay.checked_add(g.value_heads)?;
         let bad = beta.checked_add(g.value_heads)?;
-        let stride = bad.checked_add(g.groups)?;
+        let aux = bad.checked_add(g.groups)?;
+        let resume = aux.checked_add(g.value_heads.checked_mul(AUX_PER_HEAD)?)?;
+        let stride = resume.checked_add(g.groups)?;
         Some(Self {
             stride,
             k,
@@ -72,11 +78,13 @@ impl PrepLayout {
             decay,
             beta,
             bad,
+            aux,
+            resume,
         })
     }
 
-    /// The seven words the kernel's `GdnPrepLayout` holds, in its order.
-    fn words(self) -> Result<[u32; 7], DeviceError> {
+    /// The nine words the kernel's `GdnPrepLayout` holds, in its order.
+    fn words(self) -> Result<[u32; 9], DeviceError> {
         let w = |name: &str, n: usize| word(WHAT, name, n);
         Ok([
             w("the prepared row stride", self.stride)?,
@@ -86,6 +94,8 @@ impl PrepLayout {
             w("the prepared decays offset", self.decay)?,
             w("the prepared betas offset", self.beta)?,
             w("the prepared status offset", self.bad)?,
+            w("the prepared chunk factors offset", self.aux)?,
+            w("the prepared resume offset", self.resume)?,
         ])
     }
 }
@@ -512,9 +522,10 @@ pub struct DeltaRowsParams<'w> {
     /// recurrence leaves the column outputs here, and the launch's last
     /// dispatch replaces them with the numerators.
     pub g: WindowMut<'w, f32, MetalDevice>,
-    /// The prepared rows' scratch, `DeltaGeom::prepared_elems` values a row, on a
-    /// 16-byte boundary. The launch writes and reads it; the caller reads
-    /// nothing from it.
+    /// The prepared rows' scratch, `DeltaGeom::prepared_elems` values a row for
+    /// the rows rounded up to a multiple of [`TILE_ROWS`] (the chunked
+    /// recurrence reads its last tile whole), on a 16-byte boundary. The
+    /// launch writes and reads it; the caller reads nothing from it.
     pub prep: WindowMut<'w, f32, MetalDevice>,
     /// The fault word a raise lands in.
     pub faults: &'w MetalFaultWord,
@@ -549,11 +560,15 @@ pub struct DeltaRowsParams<'w> {
     pub snaps: Option<DeltaSnaps<'w>>,
 }
 
-/// The pipelines of the rows launch: the state-free half, the recurrence, the
-/// numerators and partials, and the ring commit; and the recurrence and the
-/// ring's copy of a launch that leaves copies.
+/// The pipelines of the rows launch: the state-free half, the chunk factors and
+/// the chunked recurrence, the row-by-row recurrence that takes what the
+/// chunked one leaves, the numerators and partials, and the ring commit; and
+/// the recurrences and the ring's copy of a launch that leaves copies.
 pub(crate) struct RowsPipelines {
     prep: Pipeline,
+    chunk_prep: Pipeline,
+    chunk_rows: Pipeline,
+    chunk_rows_snap: Pipeline,
     rows: Pipeline,
     post: Pipeline,
     ring: Pipeline,
@@ -565,6 +580,9 @@ impl RowsPipelines {
     pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
         Ok(Self {
             prep: library.pipeline("gdn_prep_rows")?,
+            chunk_prep: library.pipeline("gdn_chunk_prep")?,
+            chunk_rows: library.pipeline("gdn_chunk_rows")?,
+            chunk_rows_snap: library.pipeline("gdn_chunk_rows_snap")?,
             rows: library.pipeline("gdn_rows")?,
             post: library.pipeline("gdn_post_rows")?,
             ring: library.pipeline("gdn_ring_rows")?,
@@ -631,7 +649,7 @@ fn check_rows(g: &DeltaGeom, p: &DeltaRowsParams<'_>) -> Result<(), DeviceError>
         WHAT,
         "prepared rows",
         p.prep.len(),
-        p.rows,
+        p.rows.next_multiple_of(TILE_ROWS),
         layout.stride,
         layout.stride,
     )?;
@@ -711,13 +729,15 @@ fn snap_args(
 
 impl Kernels {
     /// Encode the step over `p.rows` rows: the state-free half, a memory
-    /// barrier, the ring commit with the recurrence, a barrier, and the
-    /// numerators and partial sums. The shape and every window are checked
-    /// before any dispatch, and a refused launch encodes nothing. The ring
-    /// commit and the recurrence read and write disjoint windows, so they may
-    /// overlap. With copies, the ring's copies are encoded beside the
-    /// state-free half (both only read the ring, before the commit's barrier)
-    /// and the recurrence writes the lanes' copies as it passes their rows.
+    /// barrier, the ring commit with the chunk factors, a barrier, the chunked
+    /// recurrence, a barrier, the row-by-row recurrence over what the chunked
+    /// one left, a barrier, and the numerators and partial sums. The shape and
+    /// every window are checked before any dispatch, and a refused launch
+    /// encodes nothing. The ring commit and the factors read and write
+    /// disjoint windows, so they may overlap. With copies, the ring's copies
+    /// are encoded beside the state-free half (both only read the ring, before
+    /// the commit's barrier) and the recurrence writes the lanes' copies as it
+    /// passes their rows: a chunk ends after each.
     #[must_use = "a refused launch encoded nothing"]
     pub fn delta_rows(
         &self,
@@ -754,7 +774,7 @@ impl Kernels {
             .chain(layout.words()?)
             .map(u32::to_ne_bytes)
             .collect::<Vec<_>>();
-        let args: [[u8; 4]; 22] = args.try_into().expect("twenty-two words");
+        let args: [[u8; 4]; 24] = args.try_into().expect("twenty-four words");
         let ring_len = g.ring_elems(p.n_k).expect("check_rows fitted the ring");
         let snap = match &p.snaps {
             Some(s) => Some((s, snap_args(g, s, ring_len)?)),
@@ -809,6 +829,38 @@ impl Kernels {
             RING_THREADS,
         )?;
 
+        // The chunk factors read the prepared rows and write their aux part;
+        // the chunk launch reads those, so a barrier follows.
+        let no_copies = [[0u8; 4]; 3 + SNAPS];
+        let copies = snap.as_ref().map_or(&no_copies, |(_, words)| words);
+        let chunks = p.rows.div_ceil(CHUNK) + snap.as_ref().map_or(0, |(s, _)| s.after.len());
+        encoder.set_pipeline(&self.delta_rows.chunk_prep);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of_mut(&p.prep)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(Binding::bytes(pack(copies))?)?;
+        slot.dispatch_groups(p.n_k, chunks, g.group_threads)?;
+
+        encoder.memory_barrier();
+        let chunk_rows = match &snap {
+            Some(_) => &self.delta_rows.chunk_rows_snap,
+            None => &self.delta_rows.chunk_rows,
+        };
+        encoder.set_pipeline(chunk_rows);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of_mut(&p.prep)?)?;
+        slot.set(Binding::of(&p.lane)?)?;
+        slot.set(Binding::of_mut(&p.state)?)?;
+        slot.set(Binding::of_mut(&p.g)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        if let Some((s, words)) = &snap {
+            slot.set(Binding::of_mut(&s.lane)?)?;
+            slot.set(Binding::bytes(pack(words))?)?;
+        }
+        slot.dispatch_groups(g.groups, 1, g.group_threads)?;
+
+        // The sequential launch takes the rows a chunk launch stopped before.
+        encoder.memory_barrier();
         let rows = match &snap {
             Some(_) => &self.delta_rows.rows_snap,
             None => &self.delta_rows.rows,

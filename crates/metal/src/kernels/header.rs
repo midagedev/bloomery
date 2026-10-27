@@ -57,6 +57,7 @@ pub fn geometry_defines(g: &Geometry) -> String {
          // The conv ring, from src/kernels/delta_geom.rs.\n\
          #define BLOOMERY_DELTA_RING_ROWS {ring}\n\
          #define BLOOMERY_DELTA_SNAPS {snaps}\n\
+         #define BLOOMERY_DELTA_CHUNK {chunk}\n\
          // The router, from src/kernels/router_geom.rs.\n\
          #define BLOOMERY_ROUTER_ROWS {rrows}\n\
          #define BLOOMERY_ROUTER_EXPERTS {rexperts}\n\
@@ -99,6 +100,7 @@ pub fn geometry_defines(g: &Geometry) -> String {
         per = g.delta.head_cols / geometry::PARTIALS_PER_HEAD,
         ring = g.delta.ring_rows,
         snaps = delta_geom::SNAPS,
+        chunk = delta_geom::CHUNK,
         rrows = g.router.rows,
         rexperts = g.router.experts,
         rk = g.router.k,
@@ -199,6 +201,7 @@ mod tests {
             ),
             ("BLOOMERY_DELTA_RING_ROWS", g.delta.ring_rows),
             ("BLOOMERY_DELTA_SNAPS", delta_geom::SNAPS),
+            ("BLOOMERY_DELTA_CHUNK", delta_geom::CHUNK),
             ("BLOOMERY_ROUTER_ROWS", g.router.rows),
             ("BLOOMERY_ROUTER_EXPERTS", g.router.experts),
             ("BLOOMERY_ROUTER_K", g.router.k),

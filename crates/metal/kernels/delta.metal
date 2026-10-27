@@ -43,12 +43,23 @@
 // ring is committed by gdn_ring_rows: the last min(m, ring) positions land in
 // their slots, after the prepared rows were read.
 //
+// The recurrence of a rows launch runs in chunks of BLOOMERY_DELTA_CHUNK rows
+// on simdgroup matrices (gdn_chunk_prep, gdn_chunk_rows below: the chunk form
+// of the delta rule), which reorders the sums of the stepped launches: a row is
+// within the f32 rounding of the stepped launch's, not its bits. What the
+// chunked launch does not take (a lane word out of range, a chunk with a row
+// whose status word is set, an output or state that is not finite) it leaves,
+// from the first such chunk of a column block on, to gdn_rows, the row-by-row
+// recurrence of the stepped launches, which reads the row the chunked launch
+// stopped at from the first row's resume words and runs the rest in their bits.
+//
 // A rows launch may also leave copies after rows inside the chunk (a prompt
-// pass's marks): gdn_rows_snap is gdn_rows that writes the lane's registers
-// after each named row into that copy's lane, and gdn_ring_snap writes the
-// ring a chunk ending after that row would leave into that copy's ring, read
-// before gdn_ring_rows overwrites the slots. A copy is the bits a chunk ending
-// at its row leaves; the chunk's own outputs do not move.
+// pass's marks): the chunked launch ends a chunk after each named row and
+// writes the state it holds into that copy's lane (gdn_rows_snap does the same
+// row by row), and gdn_ring_snap writes the ring a chunk ending after that row
+// would leave into that copy's ring, read before gdn_ring_rows overwrites the
+// slots. A copy is the state a chunk ending at its row leaves; a cut moves the
+// chunks after it, so the launch's own outputs move by rounding.
 //
 // The state is read from the lane the word at `lane_at` names and written to
 // the lane the word at `lane_to` names. The two words may name one lane: the
@@ -94,9 +105,11 @@ struct GdnPrepLayout {
     uint decay; // one a value head
     uint beta;  // one a value head
     uint bad;   // one status word a recurrence threadgroup
+    uint aux;   // the chunk factors, GDN_AUX floats a value head
+    uint resume; // one word a recurrence threadgroup, in the first row: the row the sequential launch starts at
 };
 
-static_assert(sizeof(GdnPrepLayout) == 28, "GdnPrepLayout is 28 bytes: the host packs seven words");
+static_assert(sizeof(GdnPrepLayout) == 36, "GdnPrepLayout is 36 bytes: the host packs nine words");
 
 // The rows launch's argument block: the step's words, with `pos` the first
 // row's position, then the row count and the strides between rows (in floats)
@@ -114,7 +127,7 @@ struct DeltaRowsArgs {
     GdnPrepLayout prep;
 };
 
-static_assert(sizeof(DeltaRowsArgs) == 88, "DeltaRowsArgs is 88 bytes: the host packs twenty-two words");
+static_assert(sizeof(DeltaRowsArgs) == 96, "DeltaRowsArgs is 96 bytes: the host packs twenty-four words");
 
 // The ring commit's argument block: the channels, the rows of the chunk, the
 // conv input's row stride and the first row's position.
@@ -737,6 +750,514 @@ kernel void gdn_prep_rows(device const float *x [[buffer(0)]],
     }
 }
 
+// The chunked recurrence. A chunk is up to GDN_C rows. With S the state
+// (column × key), g_i the decay and β_i the weight of row i, k_i, q_i, v_i its
+// key, query and value, Γ_i the product of the decays of rows 0..i of the
+// chunk and M_ij the product of the decays of rows j+1..i (M_ii = 1), the
+// rows of the chunk are
+//
+//     u = T R,  R_i = β_i (v_i − Γ_i S k_i),  T = (I + A)⁻¹,
+//     A_ij = β_i M_ij (k_i · k_j) for j < i, else 0,
+//     o_i = Γ_i S q_i + Σ_{j ≤ i} M_ij (q_i · k_j) u_j,
+//     S' = Γ_{last} S + Σ_j M_{last,j} u_j k_jᵀ,
+//
+// the decay-first order of gdn_delta. The factors that do not read S (T, the
+// score rows P_ij = M_ij (q_i · k_j), Γ and M_{last,j}) are computed for every
+// chunk and value head in parallel by gdn_chunk_prep into the prepared rows'
+// aux part; the products with S run in gdn_chunk_rows, which carries S in
+// threadgroup memory across the chunks. A chunk ends at the row after a copy
+// the launch leaves, so a copy is the state a chunk ends in.
+//
+// The chunked launch computes only what is finite and usable. A chunk whose
+// rows carry a status word, whose output or new state is not finite, or a launch
+// whose lane words are out of range, is not computed: the threadgroup writes
+// the state it holds to the write lane (when it passed a chunk), records the
+// row it stopped at, and gdn_rows takes every later row.
+
+#define GDN_C ((uint)BLOOMERY_DELTA_CHUNK)
+// The floats a row keeps for each value head: the row of T, the row of P,
+// Γ_i, M_{last,i} and two pads.
+#define GDN_AUX (2u * GDN_C + 4u)
+// Row stride, in floats, of the threadgroup tiles of the chunk's factors.
+#define GDN_TS (GDN_C + 4u)
+// Row stride of the state tile (columns of a block by keys), and of a block's
+// chunk-by-column tiles.
+#define GDN_SS (BLOOMERY_DELTA_HEAD_COLS + 4u)
+#define GDN_RS (BLOOMERY_DELTA_COLS_PER_BLOCK + 4u)
+
+static_assert(BLOOMERY_DELTA_CHUNK % 8 == 0 && BLOOMERY_DELTA_CHUNK == 32,
+              "the chunk is four tile rows: the tile loops below are written for 32 rows");
+static_assert(BLOOMERY_DELTA_COLS_PER_BLOCK == 16, "a column block is two tile columns");
+static_assert(BLOOMERY_DELTA_HEAD_COLS == 128, "a head is sixteen tile columns of keys");
+
+// The chunk `index` of a launch of `rows` rows: its first row and length, or
+// false past the last chunk. Chunks run from each cut (the row after a copy,
+// and the launch's start) to the next, GDN_C rows at a time.
+inline bool gdn_chunk_at(uint index, uint rows, constant DeltaSnapArgs &snaps,
+                         thread uint *first, thread uint *len) {
+    uint start = 0u;
+    for (uint k = 0u; k <= snaps.n; ++k) {
+        uint end = k < snaps.n ? snaps.after[k] + 1u : rows;
+        uint chunks = (end - start + GDN_C - 1u) / GDN_C;
+        if (index < chunks) {
+            *first = start + index * GDN_C;
+            *len = min(GDN_C, end - *first);
+            return true;
+        }
+        index -= chunks;
+        start = end;
+    }
+    return false;
+}
+
+// The factors of one chunk of rows for the value heads of a key head. Grid:
+// (key heads, chunks) threadgroups of 128 threads. Each reads the prepared
+// rows' keys, queries, β and decays and writes the aux part of the chunk's
+// rows: for row i of head h, T_i, P_i, Γ_i, M_{last,i}. The tile products
+// K Kᵀ and Q Kᵀ are shared by the key head's value heads. A row past the
+// chunk's length is neither read nor written.
+kernel void gdn_chunk_prep(device float *prep [[buffer(0)]],
+                           constant DeltaRowsArgs &args [[buffer(1)]],
+                           constant DeltaSnapArgs &snaps [[buffer(2)]],
+                           uint3 tgp [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort tiisg [[thread_index_in_simdgroup]],
+                           ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint first;
+    uint len;
+    if (!gdn_chunk_at(tgp.y, args.rows, snaps, &first, &len)) {
+        return;
+    }
+    uint n_v = BLOOMERY_DELTA_VALUE_HEADS;
+    uint head = BLOOMERY_DELTA_HEAD_COLS;
+    uint n_k = args.step.n_k;
+    uint kh = tgp.x;
+    uint per = n_v / n_k;
+    ulong stride = args.prep.stride;
+    device float *base = prep + (ulong)first * stride;
+    device const float *kbase = base + args.prep.k + kh * head;
+    device const float *qbase = base + kh * head;
+
+    // The arrays are float4 storage seen as floats: the aux rows move as float4s.
+    threadgroup float4 gs4[GDN_C * GDN_TS / 4u];
+    threadgroup float4 qs4[GDN_C * GDN_TS / 4u];
+    threadgroup float4 ms4[GDN_C * GDN_TS / 4u];
+    threadgroup float4 am4[GDN_C * GDN_TS / 4u];
+    threadgroup float4 ps4[GDN_C * GDN_TS / 4u];
+    threadgroup float4 ts4[GDN_C * GDN_TS / 4u];
+    threadgroup float *gs = (threadgroup float *)gs4;
+    threadgroup float *qs = (threadgroup float *)qs4;
+    threadgroup float *ms = (threadgroup float *)ms4;
+    threadgroup float *amat = (threadgroup float *)am4;
+    threadgroup float *ps = (threadgroup float *)ps4;
+    threadgroup float *ts = (threadgroup float *)ts4;
+    threadgroup float gv[GDN_C];
+    threadgroup float bv[GDN_C];
+
+    // K Kᵀ and Q Kᵀ, the lower tile triangle. Tile task t is (row tile, column
+    // tile); a task whose tiles start past the chunk's length is skipped.
+    const uint ti_of[10] = {0u, 1u, 1u, 2u, 2u, 2u, 3u, 3u, 3u, 3u};
+    const uint tj_of[10] = {0u, 0u, 1u, 0u, 1u, 2u, 0u, 1u, 2u, 3u};
+    for (uint t = sgitg; t < 10u; t += 4u) {
+        uint ti = ti_of[t];
+        uint tj = tj_of[t];
+        if (8u * ti >= len || 8u * tj >= len) {
+            continue;
+        }
+        simdgroup_float8x8 kk = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 qk = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kt = 0u; kt < head / 8u; ++kt) {
+            simdgroup_float8x8 ak;
+            simdgroup_float8x8 aq;
+            simdgroup_float8x8 bk;
+            simdgroup_load(ak, kbase + (8u * ti) * stride + 8u * kt, stride);
+            simdgroup_load(aq, qbase + (8u * ti) * stride + 8u * kt, stride);
+            simdgroup_load(bk, kbase + (8u * tj) * stride + 8u * kt, stride, ulong2(0), true);
+            simdgroup_multiply_accumulate(kk, ak, bk, kk);
+            simdgroup_multiply_accumulate(qk, aq, bk, qk);
+        }
+        simdgroup_store(kk, gs + 8u * ti * GDN_TS + 8u * tj, GDN_TS);
+        simdgroup_store(qk, qs + 8u * ti * GDN_TS + 8u * tj, GDN_TS);
+    }
+
+    for (uint hi = 0u; hi < per; ++hi) {
+        uint h = args.step.grouped != 0u ? kh * per + hi : kh + hi * n_k;
+        // The tile stores above, and the previous head's reads of these
+        // arrays, end here.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < GDN_C) {
+            bool used = tid < len;
+            gv[tid] = used ? (base + (ulong)tid * stride)[args.prep.decay + h] : 1.0f;
+            bv[tid] = used ? (base + (ulong)tid * stride)[args.prep.beta + h] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // M, a column a lane: the product of the decays below the diagonal.
+        if (tid < GDN_C) {
+            float m = 1.0f;
+            for (uint i = 0u; i < GDN_C; ++i) {
+                if (i < tid) {
+                    ms[i * GDN_TS + tid] = 0.0f;
+                } else {
+                    m = i == tid ? 1.0f : m * gv[i];
+                    ms[i * GDN_TS + tid] = m;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < GDN_C * GDN_C; e += 128u) {
+            uint i = e / GDN_C;
+            uint j = e % GDN_C;
+            bool inside = i < len && j < len;
+            amat[i * GDN_TS + j] = (inside && j < i) ? bv[i] * ms[i * GDN_TS + j] * gs[i * GDN_TS + j]
+                                                  : 0.0f;
+            ps[i * GDN_TS + j] = (inside && j <= i) ? ms[i * GDN_TS + j] * qs[i * GDN_TS + j] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // T = (I + A)⁻¹ by forward substitution, a column a lane.
+        if (tid < GDN_C) {
+            for (uint i = 0u; i < len; ++i) {
+                float s0 = 0.0f;
+                float s1 = 0.0f;
+                float s2 = 0.0f;
+                float s3 = 0.0f;
+                uint l = 0u;
+                for (; l + 4u <= i; l += 4u) {
+                    s0 = fma(amat[i * GDN_TS + l], ts[l * GDN_TS + tid], s0);
+                    s1 = fma(amat[i * GDN_TS + l + 1u], ts[(l + 1u) * GDN_TS + tid], s1);
+                    s2 = fma(amat[i * GDN_TS + l + 2u], ts[(l + 2u) * GDN_TS + tid], s2);
+                    s3 = fma(amat[i * GDN_TS + l + 3u], ts[(l + 3u) * GDN_TS + tid], s3);
+                }
+                for (; l < i; ++l) {
+                    s0 = fma(amat[i * GDN_TS + l], ts[l * GDN_TS + tid], s0);
+                }
+                ts[i * GDN_TS + tid] = (i == tid ? 1.0f : 0.0f) - ((s0 + s1) + (s2 + s3));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The aux part of each row: T_i, P_i, then Γ_i and M_{last,i}.
+        for (uint e = tid; e < len * (GDN_AUX / 4u); e += 128u) {
+            uint i = e / (GDN_AUX / 4u);
+            uint c = e % (GDN_AUX / 4u);
+            float4 v;
+            if (c < GDN_C / 4u) {
+                v = *((threadgroup const float4 *)(ts + i * GDN_TS + 4u * c));
+            } else if (c < GDN_C / 2u) {
+                v = *((threadgroup const float4 *)(ps + i * GDN_TS + 4u * (c - GDN_C / 4u)));
+            } else {
+                v = float4(gv[0] * ms[i * GDN_TS], ms[(len - 1u) * GDN_TS + i], 0.0f, 0.0f);
+            }
+            *((device float4 *)(base + (ulong)i * stride + args.prep.aux + h * GDN_AUX + 4u * c)) = v;
+        }
+    }
+}
+
+// The state of a column block across the chunks of a launch, in threadgroup
+// memory, and the chunk's products with it on simdgroup matrices: rows of the
+// chunk are tile rows (simdgroup s the rows 8s..8s+7), the block's sixteen
+// columns two tile columns, the keys sixteen tile columns (simdgroup s the
+// keys 32s..32s+31 of the update). A prepared row is read through tiles, so
+// the window holds the rows of the launch rounded up to a multiple of eight.
+// Rows of a tile past the chunk's length are selected out, never multiplied
+// into a result, but a product of the update may read them: a non-finite word
+// there sends the chunk to the sequential launch.
+inline void gdn_chunk_rows_run(device float *prep, device const uint *lane_buf, device float *state,
+                               device float *g, constant DeltaRowsArgs &args, device float *snap,
+                               constant DeltaSnapArgs *snaps, threadgroup float4 *s4,
+                               threadgroup float4 *rs4, threadgroup float4 *vn4,
+                               threadgroup float4 *vd4, threadgroup uint *sg_bad,
+                               threadgroup uint *row_bad, uint3 tgp, uint tid, ushort tiisg,
+                               ushort sgitg) {
+    uint n_v = BLOOMERY_DELTA_VALUE_HEADS;
+    uint head = BLOOMERY_DELTA_HEAD_COLS;
+    uint tg = tgp.x;
+    uint h = tg / BLOOMERY_DELTA_COLUMN_BLOCKS;
+    uint block = tg % BLOOMERY_DELTA_COLUMN_BLOCKS;
+    uint n_k = args.step.n_k;
+    uint per = n_v / n_k;
+    uint kh = args.step.grouped != 0u ? h / per : h % n_k;
+    uint rows = args.rows;
+    ulong stride = args.prep.stride;
+    device uint *resume = (device uint *)(prep + args.prep.resume);
+
+    uint word = lane_buf[args.step.lane_at];
+    uint word_to = lane_buf[args.step.lane_to];
+    if (word >= args.step.lanes || word_to >= args.step.lanes) {
+        if (tid == 0u) {
+            resume[tg] = 0u;
+        }
+        return;
+    }
+    uint base = ((word * n_v + h) * head + block * BLOOMERY_DELTA_COLS_PER_BLOCK) * head;
+    uint base_to = ((word_to * n_v + h) * head + block * BLOOMERY_DELTA_COLS_PER_BLOCK) * head;
+    uint cell = (h * head + block * BLOOMERY_DELTA_COLS_PER_BLOCK) * head;
+    uint copies = snaps == nullptr ? 0u : snaps->n;
+    uint copy = 0u;
+
+    threadgroup float *sm = (threadgroup float *)s4;
+    threadgroup float *rs = (threadgroup float *)rs4;
+    threadgroup float *vn = (threadgroup float *)vn4;
+    threadgroup float *vd = (threadgroup float *)vd4;
+
+    // Where this lane sits in a tile: row `fm`, columns `fn` and `fn + 1`.
+    ushort qid = ushort(tiisg / 4u);
+    ushort fm = (qid & 4u) + ((tiisg / 2u) % 4u);
+    ushort fn = (qid & 2u) * 2u + (tiisg % 2u) * 2u;
+
+    for (uint e = tid; e < BLOOMERY_DELTA_COLS_PER_BLOCK * (BLOOMERY_DELTA_HEAD_COLS / 4u); e += 128u) {
+        uint row = e / (BLOOMERY_DELTA_HEAD_COLS / 4u);
+        uint c4 = e % (BLOOMERY_DELTA_HEAD_COLS / 4u);
+        *((threadgroup float4 *)(sm + row * GDN_SS + 4u * c4)) =
+            *((device const float4 *)(state + base + row * head + 4u * c4));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint r = 0u;
+    while (r < rows) {
+        uint cut = copy < copies ? snaps->after[copy] + 1u : rows;
+        uint len = min(GDN_C, cut - r);
+        device const float *rowp = prep + (ulong)r * stride;
+        device const float *aux = rowp + args.prep.aux + h * GDN_AUX;
+        bool live = 8u * sgitg < len;
+
+        if (sgitg == 0u) {
+            uint w = 0u;
+            if (tiisg < len) {
+                w = ((device const uint *)(rowp + (ulong)tiisg * stride + args.prep.bad))[tg];
+            }
+            w = simd_or(w);
+            if (tiisg == 0u) {
+                *row_bad = w;
+            }
+        }
+
+        // K Sᵀ and Q Sᵀ for this simdgroup's tile row.
+        simdgroup_float8x8 ky[2];
+        simdgroup_float8x8 qy[2];
+        ky[0] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        ky[1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        qy[0] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        qy[1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        if (live) {
+            device const float *krow = rowp + (ulong)(8u * sgitg) * stride + args.prep.k + kh * head;
+            device const float *qrow = rowp + (ulong)(8u * sgitg) * stride + kh * head;
+            _Pragma("clang loop unroll(full)")
+            for (uint kt = 0u; kt < head / 8u; ++kt) {
+                simdgroup_float8x8 ak;
+                simdgroup_float8x8 aq;
+                simdgroup_float8x8 b0;
+                simdgroup_float8x8 b1;
+                simdgroup_load(ak, krow + 8u * kt, stride);
+                simdgroup_load(aq, qrow + 8u * kt, stride);
+                simdgroup_load(b0, sm + 8u * kt, GDN_SS, ulong2(0), true);
+                simdgroup_load(b1, sm + 8u * GDN_SS + 8u * kt, GDN_SS, ulong2(0), true);
+                simdgroup_multiply_accumulate(ky[0], ak, b0, ky[0]);
+                simdgroup_multiply_accumulate(ky[1], ak, b1, ky[1]);
+                simdgroup_multiply_accumulate(qy[0], aq, b0, qy[0]);
+                simdgroup_multiply_accumulate(qy[1], aq, b1, qy[1]);
+            }
+        }
+
+        // R = β (v − Γ K Sᵀ); the query term scaled by Γ.
+        uint ri = 8u * sgitg + fm;
+        bool inside = ri < len;
+        device const float *mine = rowp + (ulong)ri * stride;
+        float beta = inside ? mine[args.prep.beta + h] : 0.0f;
+        float gamma = inside ? mine[args.prep.aux + h * GDN_AUX + 2u * GDN_C] : 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (uint ct = 0u; ct < 2u; ++ct) {
+            float2 v = inside ? *((device const float2 *)(mine + args.prep.v + h * head +
+                                                          block * BLOOMERY_DELTA_COLS_PER_BLOCK +
+                                                          8u * ct + fn))
+                              : float2(0.0f);
+            simdgroup_float8x8 rt;
+            rt.thread_elements()[0] = inside ? beta * (v.x - gamma * ky[ct].thread_elements()[0]) : 0.0f;
+            rt.thread_elements()[1] = inside ? beta * (v.y - gamma * ky[ct].thread_elements()[1]) : 0.0f;
+            simdgroup_store(rt, rs + 8u * sgitg * GDN_RS + 8u * ct, GDN_RS);
+            qy[ct].thread_elements()[0] *= gamma;
+            qy[ct].thread_elements()[1] *= gamma;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // u = T R, kept in two forms: the rows themselves for the scores, and
+        // the rows weighted by M_{last,j} for the update.
+        simdgroup_float8x8 un[2];
+        un[0] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        un[1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        if (live) {
+            device const float *trow = aux + (ulong)(8u * sgitg) * stride;
+            for (uint lb = 0u; lb <= sgitg; ++lb) {
+                simdgroup_float8x8 tt;
+                simdgroup_float8x8 r0;
+                simdgroup_float8x8 r1;
+                simdgroup_load(tt, trow + 8u * lb, stride);
+                simdgroup_load(r0, rs + 8u * lb * GDN_RS, GDN_RS);
+                simdgroup_load(r1, rs + 8u * lb * GDN_RS + 8u, GDN_RS);
+                simdgroup_multiply_accumulate(un[0], tt, r0, un[0]);
+                simdgroup_multiply_accumulate(un[1], tt, r1, un[1]);
+            }
+        }
+        float mend = inside ? mine[args.prep.aux + h * GDN_AUX + 2u * GDN_C + 1u] : 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (uint ct = 0u; ct < 2u; ++ct) {
+            float u0 = inside ? un[ct].thread_elements()[0] : 0.0f;
+            float u1 = inside ? un[ct].thread_elements()[1] : 0.0f;
+            simdgroup_float8x8 a;
+            simdgroup_float8x8 b;
+            a.thread_elements()[0] = u0;
+            a.thread_elements()[1] = u1;
+            b.thread_elements()[0] = mend * u0;
+            b.thread_elements()[1] = mend * u1;
+            simdgroup_store(a, vn + 8u * sgitg * GDN_RS + 8u * ct, GDN_RS);
+            simdgroup_store(b, vd + 8u * sgitg * GDN_RS + 8u * ct, GDN_RS);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // o = Γ Q Sᵀ + P u, to the numerator window.
+        bool unusable = false;
+        if (live) {
+            device const float *prow = aux + (ulong)(8u * sgitg) * stride + GDN_C;
+            for (uint lb = 0u; lb <= sgitg; ++lb) {
+                simdgroup_float8x8 pp;
+                simdgroup_float8x8 u0;
+                simdgroup_float8x8 u1;
+                simdgroup_load(pp, prow + 8u * lb, stride);
+                simdgroup_load(u0, vn + 8u * lb * GDN_RS, GDN_RS);
+                simdgroup_load(u1, vn + 8u * lb * GDN_RS + 8u, GDN_RS);
+                simdgroup_multiply_accumulate(qy[0], pp, u0, qy[0]);
+                simdgroup_multiply_accumulate(qy[1], pp, u1, qy[1]);
+            }
+            _Pragma("clang loop unroll(full)")
+            for (uint ct = 0u; ct < 2u; ++ct) {
+                float o0 = qy[ct].thread_elements()[0];
+                float o1 = qy[ct].thread_elements()[1];
+                if (inside) {
+                    *((device float2 *)(g + (ulong)(r + ri) * args.g_stride + h * head +
+                                        block * BLOOMERY_DELTA_COLS_PER_BLOCK + 8u * ct + fn)) =
+                        float2(o0, o1);
+                    unusable = unusable || !isfinite(o0) || !isfinite(o1);
+                }
+            }
+        }
+
+        // S' = Γ_last S + (M_last u)ᵀ K, each simdgroup its 32 keys.
+        float last = (prep + (ulong)(r + len - 1u) * stride)[args.prep.aux + h * GDN_AUX + 2u * GDN_C];
+        simdgroup_float8x8 ns[2][4];
+        uint jblocks = (len + 7u) / 8u;
+        _Pragma("clang loop unroll(full)")
+        for (uint ct = 0u; ct < 2u; ++ct) {
+            _Pragma("clang loop unroll(full)")
+            for (uint q = 0u; q < 4u; ++q) {
+                uint kt = 4u * sgitg + q;
+                simdgroup_float8x8 acc;
+                simdgroup_load(acc, sm + 8u * ct * GDN_SS + 8u * kt, GDN_SS);
+                acc.thread_elements()[0] *= last;
+                acc.thread_elements()[1] *= last;
+                for (uint jb = 0u; jb < jblocks; ++jb) {
+                    simdgroup_float8x8 av;
+                    simdgroup_float8x8 bk;
+                    simdgroup_load(av, vd + 8u * jb * GDN_RS + 8u * ct, GDN_RS, ulong2(0), true);
+                    simdgroup_load(bk, rowp + (ulong)(8u * jb) * stride + args.prep.k + kh * head + 8u * kt,
+                                   stride);
+                    simdgroup_multiply_accumulate(acc, av, bk, acc);
+                }
+                unusable = unusable || !isfinite(acc.thread_elements()[0]) ||
+                           !isfinite(acc.thread_elements()[1]);
+                ns[ct][q] = acc;
+            }
+        }
+        unusable = simd_any(unusable);
+        if (tiisg == 0u) {
+            sg_bad[sgitg] = unusable ? 1u : 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((*row_bad | sg_bad[0] | sg_bad[1] | sg_bad[2] | sg_bad[3]) != 0u) {
+            if (r > 0u) {
+                for (uint e = tid; e < BLOOMERY_DELTA_COLS_PER_BLOCK * (BLOOMERY_DELTA_HEAD_COLS / 4u);
+                     e += 128u) {
+                    uint row = e / (BLOOMERY_DELTA_HEAD_COLS / 4u);
+                    uint c4 = e % (BLOOMERY_DELTA_HEAD_COLS / 4u);
+                    *((device float4 *)(state + base_to + row * head + 4u * c4)) =
+                        *((threadgroup float4 *)(sm + row * GDN_SS + 4u * c4));
+                }
+            }
+            if (tid == 0u) {
+                resume[tg] = r;
+            }
+            return;
+        }
+        _Pragma("clang loop unroll(full)")
+        for (uint ct = 0u; ct < 2u; ++ct) {
+            _Pragma("clang loop unroll(full)")
+            for (uint q = 0u; q < 4u; ++q) {
+                simdgroup_store(ns[ct][q], sm + 8u * ct * GDN_SS + 8u * (4u * sgitg + q), GDN_SS);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        r += len;
+        if (copy < copies && r == cut) {
+            for (uint e = tid; e < BLOOMERY_DELTA_COLS_PER_BLOCK * (BLOOMERY_DELTA_HEAD_COLS / 4u);
+                 e += 128u) {
+                uint row = e / (BLOOMERY_DELTA_HEAD_COLS / 4u);
+                uint c4 = e % (BLOOMERY_DELTA_HEAD_COLS / 4u);
+                *((device float4 *)(snap + (ulong)copy * snaps->lane_len + cell + row * head + 4u * c4)) =
+                    *((threadgroup float4 *)(sm + row * GDN_SS + 4u * c4));
+            }
+            ++copy;
+        }
+    }
+    for (uint e = tid; e < BLOOMERY_DELTA_COLS_PER_BLOCK * (BLOOMERY_DELTA_HEAD_COLS / 4u); e += 128u) {
+        uint row = e / (BLOOMERY_DELTA_HEAD_COLS / 4u);
+        uint c4 = e % (BLOOMERY_DELTA_HEAD_COLS / 4u);
+        *((device float4 *)(state + base_to + row * head + 4u * c4)) =
+            *((threadgroup float4 *)(sm + row * GDN_SS + 4u * c4));
+    }
+    if (tid == 0u) {
+        resume[tg] = rows;
+    }
+}
+
+// The threadgroup memory of the chunked recurrence: the state tile and the
+// chunk's tiles as float4 storage (the state moves between the lane and the
+// tile as float4s), and the status words.
+#define GDN_CHUNK_SHARED                                                          \
+    threadgroup float4 s4[BLOOMERY_DELTA_COLS_PER_BLOCK * GDN_SS / 4u];            \
+    threadgroup float4 rs4[GDN_C * GDN_RS / 4u];                                   \
+    threadgroup float4 vn4[GDN_C * GDN_RS / 4u];                                   \
+    threadgroup float4 vd4[GDN_C * GDN_RS / 4u];                                   \
+    threadgroup uint sg_bad[4];                                                    \
+    threadgroup uint row_bad;
+
+kernel void gdn_chunk_rows(device float *prep [[buffer(0)]],
+                           device const uint *lane_buf [[buffer(1)]],
+                           device float *state [[buffer(2)]],
+                           device float *g [[buffer(3)]],
+                           constant DeltaRowsArgs &args [[buffer(4)]],
+                           uint3 tgp [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort tiisg [[thread_index_in_simdgroup]],
+                           ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    GDN_CHUNK_SHARED
+    gdn_chunk_rows_run(prep, lane_buf, state, g, args, nullptr, nullptr, s4, rs4, vn4, vd4, sg_bad,
+                       &row_bad, tgp, tid, tiisg, sgitg);
+}
+
+kernel void gdn_chunk_rows_snap(device float *prep [[buffer(0)]],
+                                device const uint *lane_buf [[buffer(1)]],
+                                device float *state [[buffer(2)]],
+                                device float *g [[buffer(3)]],
+                                constant DeltaRowsArgs &args [[buffer(4)]],
+                                device float *snap [[buffer(5)]],
+                                constant DeltaSnapArgs &snaps [[buffer(6)]],
+                                uint3 tgp [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                ushort tiisg [[thread_index_in_simdgroup]],
+                                ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    GDN_CHUNK_SHARED
+    gdn_chunk_rows_run(prep, lane_buf, state, g, args, snap, &snaps, s4, rs4, vn4, vd4, sg_bad,
+                       &row_bad, tgp, tid, tiisg, sgitg);
+}
+
 // The recurrence over a chunk of rows in one launch: the rows in order, the
 // state read once from the lane the word at `lane_at` names and written once,
 // after the last row, to the lane the word at `lane_to` names. The state stays
@@ -756,19 +1277,30 @@ inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
     uint n_v = BLOOMERY_DELTA_VALUE_HEADS;
     uint head = BLOOMERY_DELTA_HEAD_COLS;
 
+    // The chunked launch leaves the row its threadgroup stopped at: this
+    // launch takes the rows from there, from the lane that launch left the
+    // state in (the read lane when it stopped before any row).
+    uint start = ((device const uint *)(prep + args.prep.resume))[tgp.x];
+    if (start >= args.rows) {
+        return;
+    }
     uint word = lane_buf[args.step.lane_at];
     uint word_to = lane_buf[args.step.lane_to];
     bool lane_ok = word < args.step.lanes && word_to < args.step.lanes;
-    uint base = ((word * n_v + seat.h) * head + seat.col) * head;
+    uint from = start == 0u ? word : word_to;
+    uint base = ((from * n_v + seat.h) * head + seat.col) * head;
     uint base_to = ((word_to * n_v + seat.h) * head + seat.col) * head;
     uint cell = (seat.h * head + seat.col) * head;
     uint copies = snaps == nullptr ? 0u : snaps->n;
     uint copy = 0u;
+    while (copy < copies && snaps->after[copy] < start) {
+        ++copy;
+    }
 
     float st[16];
     gdn_load(state, base, seat.j, lane_ok, st);
     bool row_ok = lane_ok;
-    for (uint r = 0u; r < args.rows; ++r) {
+    for (uint r = start; r < args.rows; ++r) {
         device const float *row = prep + (ulong)r * args.prep.stride;
         device const float *qp = row + seat.kh * head;
         device const float *kp = row + args.prep.k + seat.kh * head;

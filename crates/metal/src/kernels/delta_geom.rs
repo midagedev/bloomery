@@ -26,6 +26,24 @@ pub const RING_ROWS: usize = ring_rows(CONV_TAPS);
 /// rows inside it: a prompt call's first and last message start.
 pub const SNAPS: usize = 2;
 
+/// Rows of one chunk of the rows launch's chunked recurrence: the tile rows of
+/// the intra-chunk products (a multiple of 8) and the width of a chunk's
+/// triangular factors.
+pub const CHUNK: usize = 32;
+
+/// f32s a row keeps for each value head of the chunked recurrence's factors:
+/// the chunk's triangular inverse row and the weighted score row (`CHUNK`
+/// each), the cumulative decay and the decay to the chunk's last row, padded
+/// to a multiple of four.
+pub const AUX_PER_HEAD: usize = 2 * CHUNK + 4;
+
+/// Rows of a tile of the chunked recurrence. The prepared rows a launch reads
+/// are held to a multiple of this, so a tile's rows past the launch's last row
+/// are the window's own.
+pub const TILE_ROWS: usize = 8;
+
+const _: () = assert!(CHUNK.is_multiple_of(TILE_ROWS));
+
 /// The geometry the delta kernels are written for, held for `g`'s delta axes
 /// (the axes its kernels are compiled at, [`crate::instance::Instance::delta_built`]):
 /// the kernels' own `static_assert`s, stated where the host sizes its launches.

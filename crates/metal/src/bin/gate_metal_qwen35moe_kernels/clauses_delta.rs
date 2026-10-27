@@ -957,6 +957,161 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
 }
 
 /// The gated-delta clauses, in gate order.
+/// Where the parts of a prepared row sit, in floats from its start: the kernel's
+/// `GdnPrepLayout` (queries, keys, values, the gate's SiLU, then the decay and β
+/// of each value head).
+struct Parts {
+    k: usize,
+    v: usize,
+    gate: usize,
+    decay: usize,
+    beta: usize,
+    /// One status word a recurrence threadgroup (value head, column block).
+    bad: usize,
+}
+
+fn parts(delta: &DeltaGeom, n_k: usize) -> Parts {
+    let k = n_k * delta.head_cols;
+    let v = 2 * k;
+    let gate = v + delta.value_heads * delta.head_cols;
+    let decay = gate + delta.value_heads * delta.head_cols;
+    let beta = decay + delta.value_heads;
+    Parts {
+        k,
+        v,
+        gate,
+        decay,
+        beta,
+        bad: beta + delta.value_heads,
+    }
+}
+
+/// The gated delta recurrence over prepared rows in f64, and what its error
+/// band scales with.
+pub(super) struct Recur {
+    /// The column outputs `o` (the numerators before the norm gain and the
+    /// gate): row, value head, column.
+    pub o: Vec<f64>,
+    /// The gate's SiLU as the launch prepared it: row, value head, column.
+    pub gate: Vec<f64>,
+    /// The state after the last row: value head, column, key.
+    pub state: Vec<f64>,
+    /// The largest of a column's state row (2-norm), values and outputs over
+    /// the rows: value head, column.
+    pub scale: Vec<f64>,
+    /// The 2-norm of each row's scaled query: row, key head.
+    pub q_norm: Vec<f64>,
+}
+
+/// The recurrence of `rows` prepared rows from the f32 `state` of one lane,
+/// in f64: decay, the delta update, the output, row by row, from the f32
+/// words the launch's state-free half wrote (`prep`, `stride` floats a row).
+/// A row whose status word for the column's group is not zero leaves the state
+/// as it was and its output NaN, as the stepped launch does. A non-finite word
+/// elsewhere is carried, not refused: the caller compares only the columns it
+/// knows are usable.
+pub(super) fn recur(
+    delta: &DeltaGeom,
+    (n_k, map): (usize, HeadMap),
+    rows: usize,
+    (prep, stride): (&[f32], usize),
+    state: &[f32],
+) -> Result<Recur, String> {
+    let (n_v, head) = (delta.value_heads, delta.head_cols);
+    let at = parts(delta, n_k);
+    if prep.len() < (rows - 1) * stride + at.bad + n_v * (head / 16)
+        || state.len() != n_v * head * head
+    {
+        return Err("the oracle's prepared rows or state are short".to_string());
+    }
+    let mut out = Recur {
+        o: vec![0.0; rows * n_v * head],
+        gate: vec![0.0; rows * n_v * head],
+        state: vec![0.0; n_v * head * head],
+        scale: vec![0.0; n_v * head],
+        q_norm: vec![0.0; rows * n_k],
+    };
+    for r in 0..rows {
+        let row = &prep[r * stride..];
+        for kh in 0..n_k {
+            let q = &row[kh * head..(kh + 1) * head];
+            out.q_norm[r * n_k + kh] = q.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+        }
+        for h in 0..n_v {
+            for c in 0..head {
+                out.gate[(r * n_v + h) * head + c] = f64::from(row[at.gate + h * head + c]);
+            }
+        }
+    }
+    for h in 0..n_v {
+        let kh = map.k_head_of(h, n_v, n_k);
+        for c in 0..head {
+            let mut s: Vec<f64> = state[(h * head + c) * head..(h * head + c + 1) * head]
+                .iter()
+                .map(|&x| f64::from(x))
+                .collect();
+            let mut scale = s.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for r in 0..rows {
+                let row = &prep[r * stride..];
+                if row[at.bad + h * (head / 16) + c / 16].to_bits() != 0 {
+                    out.o[(r * n_v + h) * head + c] = f64::NAN;
+                    continue;
+                }
+                let k = &row[at.k + kh * head..at.k + (kh + 1) * head];
+                let q = &row[kh * head..(kh + 1) * head];
+                let v = f64::from(row[at.v + h * head + c]);
+                let decay = f64::from(row[at.decay + h]);
+                let beta = f64::from(row[at.beta + h]);
+                let mut kv = 0.0;
+                for (x, &key) in s.iter_mut().zip(k) {
+                    *x *= decay;
+                    kv += *x * f64::from(key);
+                }
+                let u = (v - kv) * beta;
+                let mut o = 0.0;
+                for ((x, &key), &query) in s.iter_mut().zip(k).zip(q) {
+                    *x += f64::from(key) * u;
+                    o += *x * f64::from(query);
+                }
+                out.o[(r * n_v + h) * head + c] = o;
+                let norm = s.iter().map(|x| x * x).sum::<f64>().sqrt();
+                scale = scale.max(norm).max(v.abs()).max(o.abs());
+            }
+            out.scale[h * head + c] = scale;
+            out.state[(h * head + c) * head..(h * head + c + 1) * head].copy_from_slice(&s);
+        }
+    }
+    Ok(out)
+}
+
+/// What a chunked pass is held to against [`recur`]: `units` rounds of work
+/// the f32 evaluation did, each adding `kappa·U` of the column's `scale`.
+///
+/// A chunk's output is a dot product of `head_cols` products with the state
+/// row, plus a triangular solve and two products of the chunk's rows (at most
+/// `CHUNK` terms each); every operand is bounded by the column's `scale`, the
+/// keys by 1 and the queries by `‖q‖₂`, so by Cauchy–Schwarz one chunk
+/// injects at most `4·(head_cols + 2·CHUNK + 16)·U·scale` into each state
+/// word, and `(√head_cols + 1)` times that into an output (the state row's
+/// 2-norm against the query). The recurrence is non-expansive (decay at most
+/// 1, `I − β·k·kᵀ` of norm at most 1), so the injections of successive chunks
+/// add. `units` is the number of chunks; the sequential launches' reference
+/// takes one unit a row with `4·(head_cols + 16)`.
+pub(super) fn band_kappa(head: usize, window: usize) -> f64 {
+    4.0 * (head + window + 16) as f64
+}
+
+/// The absolute band of an output word of a column whose scale is `scale`,
+/// with query norm `q`, after `units` units of `kappa`.
+pub(super) fn band_out(units: usize, kappa: f64, head: usize, scale: f64, q: f64) -> f64 {
+    units as f64 * kappa * ((head as f64).sqrt() + 1.0) * oracle::U * scale * q
+}
+
+/// The absolute band of a state word.
+pub(super) fn band_state(units: usize, kappa: f64, scale: f64) -> f64 {
+    units as f64 * kappa * oracle::U * scale
+}
+
 pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
     vec![
         ("delta_step", Box::new(|| ctx.with(delta_step))),

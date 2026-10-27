@@ -1,0 +1,38 @@
+# Paper decomposition of the delta class, per layer-pass of 2048 rows (30 layers, two passes = 60
+# layer-passes). [derived] from delta.metal and the a4p report.
+# Base (a4p, M4 Pro, measured): delta class 5.94 ms = rows kernel 4.4 ms (7.5 GFLOP of ALU work at 1.7 TFLOPS)
+# + prep, ring, post 1.5 ms (404 MB at 263 GB/s).
+# Head FLOPs: factors 0.34 GFLOP (K Kt and Q Kt lower tiles, 1024 chunk-key-heads x 320 MMAs of 512 MAC) +
+# chunk 7.1 GFLOP (424 MMAs a threadgroup-chunk x 16384) = 7.4 GFLOP, 59 ms over 60 layer-passes at the 7.55
+# TFLOPS peak.
+# The FLOPs equal the sequential kernel's (3 D^2 MAC a row: S k, S q, k u^T) plus 5 C D for the intra-chunk
+# products; M4 Pro's MMA peak equals its FMA peak, so the whole gain is the efficiency e: rows part = 7.4
+# GFLOP / (e x 7.55 TFLOPS) + 0.27 ms of extra bytes (aux 17.8 MB written and read, K and Q read once more) +
+# 3 launches.
+# e = 0.5: 2.2 ms (saves 2.2 ms x 60 = 132 ms); e = 0.35: 3.1 ms (78 ms, centre); e = 0.25: 4.2 ms (12 ms).
+# 3789 ms - 78 ms = 3711 ms = 1104 tok/s = +2.1 %; the band 0.5..3.5 % is e from 0.28 to 0.5.
+# Spec's card (-200 ms, +5.6 %) assumed 0.45 TFLOP at 50..70 % of 7.55; that is the C = 16 FLOP count of the
+# products alone and leaves out the state products' 3 D^2 per row, which no chunk size removes: 200 ms needs
+# 8.5 TFLOPS, above the peak.
+# Resource timeline per layer-pass: GPU kernels are serial by barriers (wall = sum): prep+ring+post 1.5 ms
+# (bytes), factors ~0.3 ms, chunk ~2.0..3.0 ms, sequential launch ~0.02 ms; MMA pipe busy ~1.0 ms of the 3.8
+# ms; DRAM 0.4 GB/layer-pass = 1.5 ms of byte time under the sum; host CPU encode 0.2 %; PCIe, NVMe 0.
+kind: ab
+question: Does the chunked simdgroup-MMA form of the prompt pass's gated delta core cut the 4K pass, and by
+  how much against the paper decomposition?
+term: prompt tok/s @ P = 4096 (the first 4096 ids of the a4p prompt file), warm call (median of 3 inside the
+  process), Qwen3.6-35B-A3B MLX 4-bit split file, Apple M4 Pro 20-core GPU, head vs base 962d7162c
+unit: %
+predict: 0.5..3.5 %
+rounds: 5
+sd: 0.2 % a4p sitting 1, ours warm tok/s sd 1.6 over mean 1081.1, 5 rounds
+condition: Both arms in one sitting, arm order rotated each round, one fresh process per arm and round; uptime
+  and the stream probe (bw, chain) at the start and end; thermal nominal; the first generated ids equal across
+  base, head and mlx-lm; --pass-times 2048 gives the delta class's ms of each arm in the same run.
+decide-in: Keep the chunk size 32 and the three-launch split; the delta class lands at 3.0..3.4 ms a
+  layer-pass; the next lever is the 20 percent of the kernel the phases arm names.
+decide-below: Below +0.5 % the chunked kernels are issue- or latency-bound, not MMA-bound: read
+  metal_rows_time --phases (factors, chunk, sequential) before any other change, and judge the lever by the
+  phase that holds the time.
+decide-above: Above +3.5 % the MMA efficiency is above 0.5 of the peak: re-derive the efficiency term and try
+  the cheaper variants (chunk of 16, two columns blocks a threadgroup) in the same sitting.
