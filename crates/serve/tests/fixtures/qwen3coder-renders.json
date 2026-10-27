@@ -1,0 +1,761 @@
+{
+  "template": "qwen3coder-chat-template.jinja, the checkpoint's chat_template.jinja, byte for byte",
+  "reference": "transformers 5.21.0 render_jinja_template (jinja2 3.1.6, Python 3.14.7), the Hugging Face chat-template environment less its strftime_now global; each case rendered with the variables bloomery-serve's /apply-template passes (see render_qwen3coder.py); a case jinja2 refused carries its error in place of a prompt. Script: crates/serve/tests/fixtures/render_qwen3coder.py, run as `python3 render_qwen3coder.py qwen3coder-chat-template.jinja > qwen3coder-renders.json`",
+  "cases": [
+    {
+      "name": "system, two tools and a user turn",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a coding assistant."
+          },
+          {
+            "role": "user",
+            "content": "Weather in Seoul, and find TODOs."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "  Current weather for a city.\n",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": " City name, e.g. Seoul. "
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead.",
+                    "default": 3,
+                    "minimum": 1
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "search_files",
+              "description": "Search the files of a repository.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "A regular expression.",
+                    "examples": [
+                      "TODO",
+                      "fn main"
+                    ]
+                  },
+                  "filters": {
+                    "type": "object",
+                    "properties": {
+                      "ext": {
+                        "type": "string"
+                      },
+                      "max-size": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "ext"
+                    ]
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "uniqueItems": true,
+                    "nullable": null
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "x-internal id": "a$b",
+                    "$comment": "cap",
+                    "ratio": 0.5
+                  }
+                },
+                "required": [
+                  "query",
+                  "limit"
+                ]
+              },
+              "return": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nYou are a coding assistant.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Current weather for a city.</description>\n<parameters>\n<parameter>\n<name>location</name>\n<type>string</type>\n<description>City name, e.g. Seoul.</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n<description>How many days ahead.</description>\n<default>3</default>\n<minimum>1</minimum>\n</parameter>\n<parameter>\n<name>unit</name>\n<type>string</type>\n<enum>[`celsius`, `fahrenheit`]</enum>\n</parameter>\n<required>[`location`]</required>\n</parameters>\n</function>\n<function>\n<name>search_files</name>\n<description>Search the files of a repository.</description>\n<parameters>\n<parameter>\n<name>query</name>\n<type>string</type>\n<description>A regular expression.</description>\n<examples>['TODO', 'fn main']</examples>\n</parameter>\n<parameter>\n<name>filters</name>\n<type>object</type>\n<properties>{\"ext\": {\"type\": \"string\"}, \"max-size\": {\"type\": \"integer\"}}</properties>\n<required>[`ext`]</required>\n</parameter>\n<parameter>\n<name>tags</name>\n<type>array</type>\n<items>{\"type\": \"string\"}</items>\n<uniqueItems>True</uniqueItems>\n<nullable>None</nullable>\n</parameter>\n<parameter>\n<name>limit</name>\n<type>integer</type>\n<exclusiveMinimum>0</exclusiveMinimum>\n<x_internal_id>a$b</x_internal_id>\n<comment>cap</comment>\n<ratio>0.5</ratio>\n</parameter>\n<required>[`query`, `limit`]</required>\n</parameters>\n<return>{\"type\": \"array\", \"items\": {\"type\": \"string\"}}</return>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Seoul, and find TODOs.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "tools with no system message get the default identity",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              },
+              "return": "The time as HH:MM."
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "ping",
+              "parameters": {
+                "type": "object"
+              }
+            }
+          },
+          {
+            "function": {
+              "name": "echo",
+              "description": "Echo the text.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "description": "Anything."
+                  }
+                },
+                "required": [
+                  "text"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_time</name>\n<description>The time now.</description>\n<parameters>\n</parameters>\n<return>The time as HH:MM.</return>\n</function>\n<function>\n<name>ping</name>\n<description></description>\n<parameters>\n</parameters>\n</function>\n<function>\n<name>echo</name>\n<description>Echo the text.</description>\n<parameters>\n<parameter>\n<name>text</name>\n<description>Anything.</description>\n</parameter>\n<required>[`text`]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "no tools",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!"
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "no generation prompt",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im_start|>user\nHi<|im_end|>\n"
+    },
+    {
+      "name": "a tool call, its result and the generation prompt",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather in Seoul?"
+          },
+          {
+            "role": "assistant",
+            "content": "  Checking.\n",
+            "tool_calls": [
+              {
+                "id": "call_a",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": {
+                    "location": "Seoul",
+                    "days": 3
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": "{\"temp\": 21}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "  Current weather for a city.\n",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": " City name, e.g. Seoul. "
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead.",
+                    "default": 3,
+                    "minimum": 1
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "search_files",
+              "description": "Search the files of a repository.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "A regular expression.",
+                    "examples": [
+                      "TODO",
+                      "fn main"
+                    ]
+                  },
+                  "filters": {
+                    "type": "object",
+                    "properties": {
+                      "ext": {
+                        "type": "string"
+                      },
+                      "max-size": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "ext"
+                    ]
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "uniqueItems": true,
+                    "nullable": null
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "x-internal id": "a$b",
+                    "$comment": "cap",
+                    "ratio": 0.5
+                  }
+                },
+                "required": [
+                  "query",
+                  "limit"
+                ]
+              },
+              "return": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Current weather for a city.</description>\n<parameters>\n<parameter>\n<name>location</name>\n<type>string</type>\n<description>City name, e.g. Seoul.</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n<description>How many days ahead.</description>\n<default>3</default>\n<minimum>1</minimum>\n</parameter>\n<parameter>\n<name>unit</name>\n<type>string</type>\n<enum>[`celsius`, `fahrenheit`]</enum>\n</parameter>\n<required>[`location`]</required>\n</parameters>\n</function>\n<function>\n<name>search_files</name>\n<description>Search the files of a repository.</description>\n<parameters>\n<parameter>\n<name>query</name>\n<type>string</type>\n<description>A regular expression.</description>\n<examples>['TODO', 'fn main']</examples>\n</parameter>\n<parameter>\n<name>filters</name>\n<type>object</type>\n<properties>{\"ext\": {\"type\": \"string\"}, \"max-size\": {\"type\": \"integer\"}}</properties>\n<required>[`ext`]</required>\n</parameter>\n<parameter>\n<name>tags</name>\n<type>array</type>\n<items>{\"type\": \"string\"}</items>\n<uniqueItems>True</uniqueItems>\n<nullable>None</nullable>\n</parameter>\n<parameter>\n<name>limit</name>\n<type>integer</type>\n<exclusiveMinimum>0</exclusiveMinimum>\n<x_internal_id>a$b</x_internal_id>\n<comment>cap</comment>\n<ratio>0.5</ratio>\n</parameter>\n<required>[`query`, `limit`]</required>\n</parameters>\n<return>{\"type\": \"array\", \"items\": {\"type\": \"string\"}}</return>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Seoul?<|im_end|>\n<|im_start|>assistant\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nSeoul\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "two calls, two results, then a user turn",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather and time in Seoul?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_a",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": {
+                    "location": "Seoul"
+                  }
+                }
+              },
+              {
+                "id": "call_b",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": "21"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_b",
+            "content": "12:00"
+          },
+          {
+            "role": "user",
+            "content": "Thanks."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "  Current weather for a city.\n",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": " City name, e.g. Seoul. "
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead.",
+                    "default": 3,
+                    "minimum": 1
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              },
+              "return": "The time as HH:MM."
+            }
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Current weather for a city.</description>\n<parameters>\n<parameter>\n<name>location</name>\n<type>string</type>\n<description>City name, e.g. Seoul.</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n<description>How many days ahead.</description>\n<default>3</default>\n<minimum>1</minimum>\n</parameter>\n<parameter>\n<name>unit</name>\n<type>string</type>\n<enum>[`celsius`, `fahrenheit`]</enum>\n</parameter>\n<required>[`location`]</required>\n</parameters>\n</function>\n<function>\n<name>get_time</name>\n<description>The time now.</description>\n<parameters>\n</parameters>\n<return>The time as HH:MM.</return>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather and time in Seoul?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=location>\nSeoul\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21\n</tool_response>\n<tool_response>\n12:00\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "two tool blocks, the last one ends the prompt",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Go."
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "12:00"
+          },
+          {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [
+              {
+                "id": "c2",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              },
+              {
+                "id": "c3",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "12:30"
+          },
+          {
+            "role": "tool",
+            "content": "13:00"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              },
+              "return": "The time as HH:MM."
+            }
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_time</name>\n<description>The time now.</description>\n<parameters>\n</parameters>\n<return>The time as HH:MM.</return>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nGo.<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\nok\n\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:30\n</tool_response>\n<tool_response>\n13:00\n</tool_response>\n<|im_end|>\n"
+    },
+    {
+      "name": "arguments of every kind, in written order",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Search."
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_d",
+                "type": "function",
+                "function": {
+                  "name": "search_files",
+                  "arguments": {
+                    "query": "a<b & \"c\"\n서울 ☃",
+                    "filters": {
+                      "ext": "rs",
+                      "max-size": 10,
+                      "deep": [
+                        1,
+                        2.5,
+                        null,
+                        true
+                      ]
+                    },
+                    "limit": 3,
+                    "ratio": 0.5,
+                    "flag": false,
+                    "nothing": null,
+                    "tags": [
+                      "x",
+                      {
+                        "y": 1
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "search_files",
+              "description": "Search the files of a repository.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "A regular expression.",
+                    "examples": [
+                      "TODO",
+                      "fn main"
+                    ]
+                  },
+                  "filters": {
+                    "type": "object",
+                    "properties": {
+                      "ext": {
+                        "type": "string"
+                      },
+                      "max-size": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "ext"
+                    ]
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "uniqueItems": true,
+                    "nullable": null
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "x-internal id": "a$b",
+                    "$comment": "cap",
+                    "ratio": 0.5
+                  }
+                },
+                "required": [
+                  "query",
+                  "limit"
+                ]
+              },
+              "return": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>search_files</name>\n<description>Search the files of a repository.</description>\n<parameters>\n<parameter>\n<name>query</name>\n<type>string</type>\n<description>A regular expression.</description>\n<examples>['TODO', 'fn main']</examples>\n</parameter>\n<parameter>\n<name>filters</name>\n<type>object</type>\n<properties>{\"ext\": {\"type\": \"string\"}, \"max-size\": {\"type\": \"integer\"}}</properties>\n<required>[`ext`]</required>\n</parameter>\n<parameter>\n<name>tags</name>\n<type>array</type>\n<items>{\"type\": \"string\"}</items>\n<uniqueItems>True</uniqueItems>\n<nullable>None</nullable>\n</parameter>\n<parameter>\n<name>limit</name>\n<type>integer</type>\n<exclusiveMinimum>0</exclusiveMinimum>\n<x_internal_id>a$b</x_internal_id>\n<comment>cap</comment>\n<ratio>0.5</ratio>\n</parameter>\n<required>[`query`, `limit`]</required>\n</parameters>\n<return>{\"type\": \"array\", \"items\": {\"type\": \"string\"}}</return>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nSearch.<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=search_files>\n<parameter=query>\na<b & \"c\"\n서울 ☃\n</parameter>\n<parameter=filters>\n{'ext': 'rs', 'max-size': 10, 'deep': [1, 2.5, None, True]}\n</parameter>\n<parameter=limit>\n3\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=flag>\nFalse\n</parameter>\n<parameter=nothing>\nNone\n</parameter>\n<parameter=tags>\n['x', {'y': 1}]\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+    },
+    {
+      "name": "a call with no arguments, null content",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "get_time"
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              },
+              "return": "The time as HH:MM."
+            }
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_time</name>\n<description>The time now.</description>\n<parameters>\n</parameters>\n<return>The time as HH:MM.</return>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nTime?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n"
+    },
+    {
+      "name": "a tool result first",
+      "body": {
+        "messages": [
+          {
+            "role": "tool",
+            "content": "orphan"
+          },
+          {
+            "role": "user",
+            "content": "Thanks."
+          }
+        ]
+      },
+      "prompt": "<tool_response>\norphan\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "content parts flattened",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "Be brief."
+              },
+              {
+                "type": "text",
+                "text": "No lists."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "서울 날씨? ☃ \"quoted\" <b>"
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nBe brief.\nNo lists.<|im_end|>\n<|im_start|>user\n서울 날씨? ☃ \"quoted\" <b><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "a developer turn is sent as system, a late system turn renders as its own, an unknown role too",
+      "body": {
+        "messages": [
+          {
+            "role": "developer",
+            "content": "Answer in Korean."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "system",
+            "content": "Late."
+          },
+          {
+            "role": "narrator",
+            "content": "..."
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nAnswer in Korean.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>system\nLate.<|im_end|>\n<|im_start|>narrator\n...<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "string arguments",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_e",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              },
+              "return": "The time as HH:MM."
+            }
+          }
+        ]
+      },
+      "error": "TypeError: Can only get item pairs from a mapping."
+    }
+  ]
+}

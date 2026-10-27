@@ -1,0 +1,12 @@
+Source of qwen3coder-chat-template.jinja (kept byte-exact; this file records it):
+
+https://huggingface.co/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit/raw/main/chat_template.jinja
+(repo revision 6e302ea604ad9ab206367e2c501d1571023e7b6d; 6722 bytes)
+sha256 672e747c77e990320152343b0a4951222e40de5645297905d89afba05586d827  qwen3coder-chat-template.jinja
+
+The repo's `chat_template.jinja`, fetched verbatim. It is Qwen3-Coder-30B-A3B-Instruct's template (the
+checkpoint's own license is Apache-2.0, and the template is the model's). Its `tools` header filters a
+schema's keys with `param_fields.keys() | reject("in", handled_keys)`, and its assistant `tool_calls` branch
+teaches the same `<tool_call>` XML as Qwen3.6's and Qwen3.8's fixtures (`<function=` and `<parameter=` on
+their own lines). It has no thinking span and no thinking switch. Not in `FIXTURE_TEMPLATES`: only
+`tests/qwenxml.rs` reads it (its render gate and its tool-call gates).

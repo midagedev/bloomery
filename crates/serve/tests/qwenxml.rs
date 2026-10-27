@@ -67,6 +67,7 @@ const INDENT: &str = "</think><tool_call>\n<function=run_python>\n<parameter=cod
 const TEXT_THEN_CALL: &str = "</think>Let me inspect the directory.\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
 const THINK_THEN_CALL: &str = "I should inspect the directory.</think>Let me inspect it now.\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
 const TYPED: &str = "</think><tool_call>\n<function=save_note>\n<parameter=filter>\n{\"n\": [1, 2], \"q\": \"서울 ☃\"}\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=pinned>\ntrue\n</parameter>\n<parameter=text>\na<b & \"c\"\n</parameter>\n</function>\n</tool_call>";
+const BOOLEANS: &str = "</think><tool_call>\n<function=save_note>\n<parameter=pinned>\nTrue\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=save_note>\n<parameter=pinned>\n FALSE \n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=save_note>\n<parameter=pinned>\nfalse\n</parameter>\n</function>\n</tool_call>";
 const LIST_AND_UNTYPED: &str = "</think><tool_call>\n<function=lookup>\n<parameter=q>\nhello, world\n</parameter>\n<parameter=n>\n42\n</parameter>\n</function>\n</tool_call>";
 const RESOLVED: &str = "</think><tool_call>\n<function=resolve>\n<parameter=path>\nsrc/a.rs\n</parameter>\n<parameter=mode>\nfast\n</parameter>\n<parameter=when>\n2026-10-06\n</parameter>\n<parameter=either>\n7\n</parameter>\n<parameter=both>\nx\n</parameter>\n<parameter=limit>\n7\n</parameter>\n</function>\n</tool_call>";
 const NO_PROPS: &str =
@@ -240,6 +241,21 @@ fn fixtures() -> Vec<(
             ),
         ),
         (
+            "a boolean in either case, with whitespace around it, is spelled true or false",
+            ON,
+            Deepseek,
+            BOOLEANS,
+            msg(
+                "",
+                "",
+                vec![
+                    call(0, "save_note", r#"{"pinned":true}"#),
+                    call(1, "save_note", r#"{"pinned":false}"#),
+                    call(2, "save_note", r#"{"pinned":false}"#),
+                ],
+            ),
+        ),
+        (
             "a type list naming string is text, an untyped parameter JSON",
             ON,
             Deepseek,
@@ -364,6 +380,16 @@ fn malformed() -> Vec<(&'static str, &'static str, QwenXmlError)> {
                 key: "days".to_owned(),
                 ty: "integer".to_owned(),
                 value: "three".to_owned(),
+            },
+        ),
+        (
+            "a boolean parameter that is neither true nor false",
+            "</think><tool_call>\n<function=save_note>\n<parameter=pinned>\nyes\n</parameter>\n</function>\n</tool_call>",
+            QwenXmlError::NotBoolean {
+                index: 0,
+                name: "save_note".to_owned(),
+                key: "pinned".to_owned(),
+                value: "yes".to_owned(),
             },
         ),
         (
@@ -1681,4 +1707,162 @@ fn hw_reasoning_format_none_drops_nothing() {
             "tools={with_tools}: {v}"
         );
     }
+}
+
+// ---------------------------------------------------------------- Qwen3-Coder's own template
+
+/// Qwen3-Coder-30B-A3B-Instruct's template, the checkpoint's `chat_template.jinja` byte for byte
+/// (`tests/fixtures/qwen3coder-chat-template.source`). Its `tools` header filters a schema's keys with
+/// `reject("in", ...)`, and it has no thinking span.
+const CODER: &str = include_str!("fixtures/qwen3coder-chat-template.jinja");
+
+/// `body` with each tool call's `arguments` that is a JSON string parsed to the object it encodes: the body a template
+/// that walks `arguments` as an object renders, as the server hands it to one.
+fn coder_arguments_parsed(body: &Value) -> Value {
+    let mut body = body.clone();
+    for message in body["messages"].as_array_mut().expect("messages") {
+        for call in message["tool_calls"].as_array_mut().into_iter().flatten() {
+            let text = call["function"]["arguments"].as_str().map(str::to_owned);
+            if let Some(text) = text {
+                call["function"]["arguments"] = serde_json::from_str(&text).expect("JSON");
+            }
+        }
+    }
+    body
+}
+
+/// Qwen3-Coder's chat template renders as the Hugging Face reference does: every case of the fixture through
+/// `/apply-template` equals its reference render byte for byte. The case jinja2 refuses (tool-call `arguments` given as
+/// a JSON string, which the template walks with `|items`) renders as the same body with the string parsed does, as the
+/// server hands such a template the object. The cases reach `reject("in", ...)` over a schema's keys, a macro called
+/// with a default argument, `|replace` chains on a key, `|tojson|safe` on a mapping, `|string` on a list and a boolean,
+/// `loop.previtem` and `loop.nextitem` around a tool block, and the default identity line.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_qwen3coder_template_renders_as_the_reference() {
+    let addr = start_templated(Box::new(serve::MockEngine::new(4096)), CODER);
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/qwen3coder-renders.json"))
+        .expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 13, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        if case["error"].is_string() {
+            assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+            let parsed = post(
+                addr,
+                "/apply-template",
+                &coder_arguments_parsed(&case["body"]),
+            );
+            assert_eq!(parsed.status, 200, "{}: {}", case["name"], parsed.body);
+            assert_eq!(
+                r.json()["prompt"],
+                parsed.json()["prompt"],
+                "{}",
+                case["name"]
+            );
+            assert!(
+                r.json()["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("<function=get_time>")),
+                "{}: {}",
+                case["name"],
+                r.body
+            );
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
+}
+
+/// What picks the parser for Qwen3-Coder: the template's own spelling, `<tool_call>`, `<function=` and `<parameter=`,
+/// and the framing read from the call its probe render writes, a value on a line of its own. The probe renders the
+/// template with a `tools` header, so a template the engine cannot render is [`ToolFormat::Unparsed`].
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_qwen3coder_template_is_read_as_qwen_markup() {
+    let lines = ToolFormat::QwenXml(Framing::Lines);
+    let t = ChatTemplate::parse(CODER).expect("template parses");
+    assert_eq!(ToolFormat::of_chat_template(&t), lines);
+    assert_eq!(ToolFormat::of_template(CODER), lines);
+}
+
+/// A server on Qwen3-Coder's template answers a request with tools: a completion in the model's markup becomes
+/// OpenAI `tool_calls`, streamed and not, each parameter typed by the tool's schema (the string as written, a boolean
+/// as `true` or `false` in either case, the others as the JSON the model wrote); the next request, which carries the call and its result (the call's `arguments` the
+/// JSON string OpenAI sends), renders through the same template and is answered as text.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_server_on_qwen3coders_template_answers_a_call_and_its_result() {
+    let tools = json!([
+        {"type": "function", "function": {"name": "get_weather", "description": "Current weather.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                           "required": ["city"]}}},
+        {"type": "function", "function": {"name": "set_options", "parameters": {"type": "object",
+            "properties": {"verbose": {"type": "boolean"}, "retries": {"type": "integer"},
+                           "ratio": {"type": "number"}, "tags": {"type": "array"},
+                           "opts": {"type": "object"}, "note": {"type": "string"}}}}},
+    ]);
+    let script = "I will check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=set_options>\n<parameter=verbose>\nTrue\n</parameter>\n<parameter=retries>\n3\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=opts>\n{\"k\": 1}\n</parameter>\n<parameter=note>\nfirst\nsecond\n</parameter>\n</function>\n</tool_call>";
+    let addr = start_templated(Box::new(ScriptedEngine::new(4096, script)), CODER);
+    let body = |stream: bool| {
+        json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "What's the weather in Seoul?"}],
+            "temperature": 0,
+            "tools": tools,
+            "stream": stream,
+        })
+    };
+    let want = [
+        json!({"name": "get_weather", "arguments": r#"{"city":"Seoul"}"#}),
+        json!({"name": "set_options", "arguments":
+            r#"{"verbose":true,"retries":3,"ratio":0.5,"tags":["a", "b"],"opts":{"k": 1},"note":"first\nsecond"}"#}),
+    ];
+    let r = post(addr, "/v1/chat/completions", &body(false));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls", "{v}");
+    assert_eq!(c["message"]["content"], "I will check.\n", "{v}");
+    let calls: Vec<Value> = c["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls")
+        .iter()
+        .map(|tc| tc["function"].clone())
+        .collect();
+    assert_eq!(calls, want, "{v}");
+    let r = post(addr, "/v1/chat/completions", &body(true));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (finish, folded) = fold_stream(&r.body).expect("no error event");
+    assert_eq!(finish, "tool_calls");
+    assert_eq!(folded["content"], "I will check.\n");
+    assert_eq!(folded["calls"], json!(want), "streamed == non-streamed");
+
+    let addr = start_templated(
+        Box::new(ScriptedEngine::new(4096, "It is 21 degrees in Seoul.")),
+        CODER,
+    );
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "What's the weather in Seoul?"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call_a", "type": "function",
+                    "function": {"name": "get_weather", "arguments": r#"{"city":"Seoul"}"#}}]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "{\"temp\": 21}"},
+            ],
+            "temperature": 0,
+            "tools": tools,
+        }),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "stop", "{v}");
+    assert_eq!(c["message"]["content"], "It is 21 degrees in Seoul.", "{v}");
+    assert!(c["message"]["tool_calls"].is_null(), "{v}");
 }

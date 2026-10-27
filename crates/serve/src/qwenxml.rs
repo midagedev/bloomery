@@ -20,9 +20,11 @@
 //! bytes between the two tags, a newline in it its own. What the value is read
 //! as the request's tool schema says, the way llama.cpp's parser reads it: a
 //! parameter whose schema can resolve to a
-//! string ([`resolves_to_string`]) is the raw text; every other parameter
-//! (another `type`, a `type` list without `string`, or no `type` at all) is
-//! JSON, spelled in `arguments` as the model wrote it.
+//! string ([`resolves_to_string`]) is the raw text; a `boolean` parameter, as
+//! Qwen3-Coder's reference parser reads one, is `true` or `false` in either
+//! case ([`boolean`]), spelled in lower case; every other parameter (another
+//! `type`, a `type` list without `string`, or no `type` at all) is JSON,
+//! spelled in `arguments` as the model wrote it.
 //!
 //! A call is emitted when its `</tool_call>` arrives; the parameters become a
 //! JSON object in the model's order, serialized compactly to a string. Text
@@ -31,10 +33,11 @@
 //! nothing, as the template writes its calls one newline apart. Markup that
 //! does not parse — no function opener, no name, text where a tag belongs, a
 //! function or a parameter the request's tools do not name, one parameter
-//! twice, a value its schema types JSON that is not JSON — and a call still
-//! open when the stream ends are a [`QwenXmlError`], never content and never
-//! dropped; the chat parser reads a generation the token limit cut inside a
-//! call as an answer, not as this error ([`crate::dsml::ChatParser::try_finish_at`]).
+//! twice, a value its schema types JSON that is not JSON, a boolean that is
+//! neither word — and a call still open when the stream ends are a
+//! [`QwenXmlError`], never content and never dropped; the chat parser reads a
+//! generation the token limit cut inside a call as an answer, not as this error
+//! ([`crate::dsml::ChatParser::try_finish_at`]).
 //! The call a scan has opened and not closed is reported as it is read
 //! ([`Scanned::open`]): its name once `<function=NAME>` is whole, and the
 //! arguments so far, a prefix of the arguments the call closes with, the text
@@ -160,6 +163,16 @@ pub enum QwenXmlError {
         ty: String,
         value: String,
     },
+    /// A value that is neither `true` nor `false` where the schema typed it boolean.
+    #[error(
+        "tool call {index} ({name}): parameter {key} is typed boolean, and its value is neither true nor false: {value:?}"
+    )]
+    NotBoolean {
+        index: usize,
+        name: String,
+        key: String,
+        value: String,
+    },
 }
 
 impl QwenXmlError {
@@ -178,6 +191,8 @@ impl QwenXmlError {
 enum Kind {
     /// The schema can resolve to a string: the value is the raw text.
     String,
+    /// `type: boolean`: `true` or `false` in either case ([`boolean`]).
+    Bool,
     /// Every other schema: the value must be JSON. The type as written, for
     /// the error.
     Json(String),
@@ -292,12 +307,15 @@ const STRING_FORMATS: [&str; 8] = [
 ];
 
 /// One parameter's schema as a [`Kind`]: the raw text when the schema can
-/// resolve to a string, else JSON — the type as the schema wrote it, `none`
-/// when it wrote none. `root` is the tool's `parameters`, which a `$ref`
-/// points into.
+/// resolve to a string, a boolean for `type: boolean`, else JSON — the type as
+/// the schema wrote it, `none` when it wrote none. `root` is the tool's
+/// `parameters`, which a `$ref` points into.
 fn kind_of(schema: &Value, root: &Value) -> Kind {
     if resolves_to_string(schema, root, &mut Vec::new()) {
         return Kind::String;
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("boolean") {
+        return Kind::Bool;
     }
     let ty = match schema.get("type") {
         Some(Value::String(s)) => s.clone(),
@@ -421,6 +439,20 @@ impl QwenScan {
             content: rest,
             ..Scanned::default()
         })
+    }
+}
+
+/// The JSON spelling of a boolean parameter's text: `true` or `false` in either case, as the Qwen3-Coder reference
+/// parser reads one (a model that writes Python's `True` is understood), with JSON's whitespace around it allowed.
+/// Anything else is no boolean: the reference's `false` for it would be a guess.
+fn boolean(raw: &str) -> Option<&'static str> {
+    let word = raw.trim_matches([' ', '\t', '\n', '\r']);
+    if word.eq_ignore_ascii_case("true") {
+        Some("true")
+    } else if word.eq_ignore_ascii_case("false") {
+        Some("false")
+    } else {
+        None
     }
 }
 
@@ -549,6 +581,16 @@ fn parse_call(
         }
         let value = match kinds.kind(name, key) {
             Some(Kind::String) => callstream::string(raw),
+            Some(Kind::Bool) => {
+                boolean(raw)
+                    .map(str::to_owned)
+                    .ok_or_else(|| QwenXmlError::NotBoolean {
+                        index,
+                        name: name.to_owned(),
+                        key: key.to_owned(),
+                        value: quote(raw),
+                    })?
+            }
             Some(Kind::Json(ty)) => match serde_json::from_str::<Value>(raw) {
                 // The value as the model wrote it, as llama-server writes a
                 // typed value back; a re-serialization would respell it.
@@ -632,6 +674,10 @@ fn partial_call(s: &str, kinds: &ParamKinds, framing: Framing) -> Option<(String
         let raw = &v[..val_end];
         match kind {
             Some(Kind::String) => args.field(key, &callstream::string(raw)),
+            Some(Kind::Bool) => match boolean(raw) {
+                Some(word) => args.field(key, word),
+                None => break,
+            },
             Some(Kind::Json(_)) if serde_json::from_str::<Value>(raw).is_ok() => {
                 args.field(key, raw);
             }
