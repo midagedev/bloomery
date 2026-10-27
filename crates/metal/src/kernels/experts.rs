@@ -32,18 +32,14 @@ pub const APART_GATE_UP: [(Quant, Quant); 2] =
 /// type of its own: the fold's entries and the grouped GEMM's plain tile.
 pub const APART_DOWN: [(Quant, Quant); 2] = [(Quant::Q5K, Quant::Q8_0), (Quant::Q6K, Quant::Q8_0)];
 
-/// The table of the gate-up launches (`gate_up`) or the down launches.
-#[must_use]
-pub fn apart_table(gate_up: bool) -> &'static [(Quant, Quant); 2] {
-    if gate_up { &APART_GATE_UP } else { &APART_DOWN }
-}
-
 /// Whether a shared expert of type `shared` beside stacks of type `stack` has
 /// an entry: the same type, or a pair of the launch's table
-/// ([`apart_table`]).
+/// ([`APART_GATE_UP`] for the gate-up launches, [`APART_DOWN`] for the down
+/// launches).
 #[must_use]
 pub fn shared_entry(stack: Quant, shared: Quant, gate_up: bool) -> bool {
-    stack == shared || apart_table(gate_up).contains(&(stack, shared))
+    let table = if gate_up { &APART_GATE_UP } else { &APART_DOWN };
+    stack == shared || table.contains(&(stack, shared))
 }
 
 /// The shared expert, in the routed experts' quant or in one of its own.

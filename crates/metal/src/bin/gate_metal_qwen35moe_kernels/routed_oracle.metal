@@ -20,8 +20,8 @@ constexpr int routed_shmem_bytes() {
     return (ROUTED_ROWS + ROUTED_ACTS) * gemm_lda<T>() * (int)sizeof(T);
 }
 
-// A tile over quant Q from the group's gate (and up) tensors: the body both
-// kernels below take, the shipped kernels' prologue left to them.
+// A tile over quant Q from the group's gate (and up) tensors: the body the
+// kernel below takes, the shipped kernel's prologue left to it.
 template <typename Q, typename T, bool PAIR>
 inline void oracle_run(threadgroup char                * shmem,
                        device const typename Q::Block  * wg,
@@ -201,46 +201,8 @@ inline void oracle_run(threadgroup char                * shmem,
     }
 }
 
-template <typename Q, typename T, bool PAIR>
-kernel void gemm_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
-                               device const typename Q::Block * W_up [[buffer(1)]],
-                               device const typename Q::Block * W_sh [[buffer(2)]],
-                               device const typename Q::Block * W_sh_up [[buffer(3)]],
-                               device const float      * x [[buffer(4)]],
-                               device float            * y [[buffer(5)]],
-                               device const uint4      * tiles [[buffer(6)]],
-                               device const uint       * sorted [[buffer(7)]],
-                               device const float      * route_w [[buffer(8)]],
-                               constant RoutedArgs     & args [[buffer(9)]],
-                               device atomic_uint      * faults [[buffer(10)]],
-                               uint2  tgpig [[threadgroup_position_in_grid]],
-                               ushort tiitg [[thread_index_in_threadgroup]],
-                               ushort sgitg [[simdgroup_index_in_threadgroup]],
-                               ushort tiisg [[thread_index_in_simdgroup]]) {
-    threadgroup char shmem[routed_shmem_bytes<T>()];
-
-    if (tgpig.x >= tiles[0].x) {
-        return;
-    }
-    const uint4 tile = tiles[1 + tgpig.x];
-    const uint expert = tile.x;
-    const uint first = tile.y;
-    const short count = (short)tile.z;
-    if (expert >= args.n_experts + BLOOMERY_ROUTER_SHARED) {
-        if (tiitg == 0) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
-        }
-        return;
-    }
-    const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;
-    device const typename Q::Block * wg = shared ? W_sh : W + (ulong)expert * args.stack_blocks;
-    device const typename Q::Block * wu = PAIR ? (shared ? W_sh_up : W_up + (ulong)expert * args.stack_blocks) : wg;
-    oracle_run<Q, T, PAIR>(shmem, wg, wu, tgpig.y, first, count, x, y, sorted, route_w, args,
-                           faults, tiitg, sgitg, tiisg);
-}
-
-// The shipped Apart kernel's shape over the oracle's tile: the library the
-// host builds its kernels from holds every entry the shipped one does.
+// The shipped kernel's shape over the oracle's tile: the library the host
+// builds its kernels from holds every entry the shipped one does.
 template <typename Q, typename QS, typename T, bool PAIR>
 kernel void gemm_routed_apart_kernel(device const typename Q::Block  * W [[buffer(0)]],
                                      device const typename Q::Block  * W_up [[buffer(1)]],
@@ -283,46 +245,6 @@ kernel void gemm_routed_apart_kernel(device const typename Q::Block  * W [[buffe
     }
 }
 
-#define ROUTED_ENTRY(NAME, Q, T, PAIR)                                              \
-    template [[host_name("gemm_routed_" #NAME)]]                                    \
-    kernel void gemm_routed_kernel<Q, T, PAIR>(                                     \
-        device const Q::Block * W [[buffer(0)]],                                    \
-        device const Q::Block * W_up [[buffer(1)]],                                 \
-        device const Q::Block * W_sh [[buffer(2)]],                                 \
-        device const Q::Block * W_sh_up [[buffer(3)]],                              \
-        device const float    * x [[buffer(4)]],                                    \
-        device float          * y [[buffer(5)]],                                    \
-        device const uint4    * tiles [[buffer(6)]],                                \
-        device const uint     * sorted [[buffer(7)]],                               \
-        device const float    * route_w [[buffer(8)]],                              \
-        constant RoutedArgs   & args [[buffer(9)]],                                 \
-        device atomic_uint    * faults [[buffer(10)]],                              \
-        uint2  tgpig [[threadgroup_position_in_grid]],                              \
-        ushort tiitg [[thread_index_in_threadgroup]],                               \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                            \
-        ushort tiisg [[thread_index_in_simdgroup]]);
-
-ROUTED_ENTRY(q4k_pair_f16, Q4K, half, true)
-ROUTED_ENTRY(q4k_pair_f32, Q4K, float, true)
-ROUTED_ENTRY(q4k_plain_f16, Q4K, half, false)
-ROUTED_ENTRY(q4k_plain_f32, Q4K, float, false)
-ROUTED_ENTRY(q6k_pair_f16, Q6K, half, true)
-ROUTED_ENTRY(q6k_pair_f32, Q6K, float, true)
-ROUTED_ENTRY(q6k_plain_f16, Q6K, half, false)
-ROUTED_ENTRY(q6k_plain_f32, Q6K, float, false)
-ROUTED_ENTRY(a4_pair_f16, A4, half, true)
-ROUTED_ENTRY(a4_pair_f32, A4, float, true)
-ROUTED_ENTRY(a4_plain_f16, A4, half, false)
-ROUTED_ENTRY(a4_plain_f32, A4, float, false)
-ROUTED_ENTRY(q8_0_pair_f16, Q8_0, half, true)
-ROUTED_ENTRY(q8_0_pair_f32, Q8_0, float, true)
-ROUTED_ENTRY(q8_0_plain_f16, Q8_0, half, false)
-ROUTED_ENTRY(q8_0_plain_f32, Q8_0, float, false)
-ROUTED_ENTRY(q5k_pair_f16, Q5K, half, true)
-ROUTED_ENTRY(q5k_pair_f32, Q5K, float, true)
-ROUTED_ENTRY(q5k_plain_f16, Q5K, half, false)
-ROUTED_ENTRY(q5k_plain_f32, Q5K, float, false)
-
 #define ROUTED_APART_ENTRY(NAME, Q, BQ, QS, BQS, T, PAIR)                           \
     template [[host_name("gemm_routed_" #NAME)]]                                    \
     kernel void gemm_routed_apart_kernel<Q, QS, T, PAIR>(                           \
@@ -342,11 +264,25 @@ ROUTED_ENTRY(q5k_plain_f32, Q5K, float, false)
         ushort sgitg [[simdgroup_index_in_threadgroup]],                            \
         ushort tiisg [[thread_index_in_simdgroup]]);
 
-ROUTED_APART_ENTRY(q4k_apart_q8_0_pair_f16, Q4K, block_q4_K, Q8_0, block_q8_0, half, true)
-ROUTED_APART_ENTRY(q4k_apart_q8_0_pair_f32, Q4K, block_q4_K, Q8_0, block_q8_0, float, true)
-ROUTED_APART_ENTRY(q5k_apart_q8_0_pair_f16, Q5K, block_q5_K, Q8_0, block_q8_0, half, true)
-ROUTED_APART_ENTRY(q5k_apart_q8_0_pair_f32, Q5K, block_q5_K, Q8_0, block_q8_0, float, true)
-ROUTED_APART_ENTRY(q5k_apart_q8_0_plain_f16, Q5K, block_q5_K, Q8_0, block_q8_0, half, false)
-ROUTED_APART_ENTRY(q5k_apart_q8_0_plain_f32, Q5K, block_q5_K, Q8_0, block_q8_0, float, false)
-ROUTED_APART_ENTRY(q6k_apart_q8_0_plain_f16, Q6K, block_q6_K, Q8_0, block_q8_0, half, false)
-ROUTED_APART_ENTRY(q6k_apart_q8_0_plain_f32, Q6K, block_q6_K, Q8_0, block_q8_0, float, false)
+#define ROUTED_APART_PAIR(STEM, Q, BQ, QS, BQS)                                                \
+    ROUTED_APART_ENTRY(STEM##_pair_f16, Q, BQ, QS, BQS, half, true)                            \
+    ROUTED_APART_ENTRY(STEM##_pair_f32, Q, BQ, QS, BQS, float, true)
+
+#define ROUTED_APART_PLAIN(STEM, Q, BQ, QS, BQS)                                               \
+    ROUTED_APART_ENTRY(STEM##_plain_f16, Q, BQ, QS, BQS, half, false)                          \
+    ROUTED_APART_ENTRY(STEM##_plain_f32, Q, BQ, QS, BQS, float, false)
+
+ROUTED_APART_PAIR(q4k, Q4K, block_q4_K, Q4K, block_q4_K)
+ROUTED_APART_PLAIN(q4k, Q4K, block_q4_K, Q4K, block_q4_K)
+ROUTED_APART_PAIR(q6k, Q6K, block_q6_K, Q6K, block_q6_K)
+ROUTED_APART_PLAIN(q6k, Q6K, block_q6_K, Q6K, block_q6_K)
+ROUTED_APART_PAIR(a4, A4, block_mlx_a4, A4, block_mlx_a4)
+ROUTED_APART_PLAIN(a4, A4, block_mlx_a4, A4, block_mlx_a4)
+ROUTED_APART_PAIR(q8_0, Q8_0, block_q8_0, Q8_0, block_q8_0)
+ROUTED_APART_PLAIN(q8_0, Q8_0, block_q8_0, Q8_0, block_q8_0)
+ROUTED_APART_PAIR(q5k, Q5K, block_q5_K, Q5K, block_q5_K)
+ROUTED_APART_PLAIN(q5k, Q5K, block_q5_K, Q5K, block_q5_K)
+ROUTED_APART_PAIR(q4k_apart_q8_0, Q4K, block_q4_K, Q8_0, block_q8_0)
+ROUTED_APART_PAIR(q5k_apart_q8_0, Q5K, block_q5_K, Q8_0, block_q8_0)
+ROUTED_APART_PLAIN(q5k_apart_q8_0, Q5K, block_q5_K, Q8_0, block_q8_0)
+ROUTED_APART_PLAIN(q6k_apart_q8_0, Q6K, block_q6_K, Q8_0, block_q8_0)

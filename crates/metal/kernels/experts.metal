@@ -49,14 +49,17 @@
 // scales the activation as it is loaded, and the residual add is the store.
 // There is no second dispatch.
 //
-// A shared expert of another type than its stacks (`Apart`, the Q8_0 shared
-// expert of a mixed-type file) runs the same dispatch over two quants: the
-// `*_apart_*` entries are templates over the stacks' quant and the shared
-// expert's. The pair's slot is uniform in a threadgroup, so the shared slot's
-// threadgroups run the shared quant's body whole. The fold's K' is two
-// ranges, the eight routed slots' blocks in the stacks' quant and the shared
-// slot's in its own; a lane walks each range by its quant's stride and the
-// SIMD group sums both into one row.
+// The pair is one template over two quants, the stacks' and the shared
+// expert's, `pair_swiglu_apart_kernel<Q, QS>`. A file whose shared expert has
+// the stacks' type instantiates it with `QS == Q`, under the plain host names;
+// a shared expert of another type (`Apart`, the Q8_0 shared expert of a
+// mixed-type file) takes the `*_apart_*` entries. The pair's slot is uniform
+// in a threadgroup, so the shared slot's threadgroups run the shared quant's
+// body whole. The fold has a kernel for each case: the same type
+// (`down_fold_kernel<Q>`) and two quants (`down_fold_apart_kernel<Q, QS>`),
+// whose K' is two ranges, the eight routed slots' blocks in the stacks' quant
+// and the shared slot's in its own; a lane walks each range by its quant's
+// stride and the SIMD group sums both into one row.
 //
 // An id past the stack raises ExpertId and writes NaN before any weight is
 // loaded. The pair writes NaN only in the bad slot's row; the fold writes NaN
@@ -106,7 +109,7 @@ struct FoldArgs {
 static_assert(sizeof(FoldArgs) == 16, "FoldArgs is four words");
 
 // The shared slot reads `shexp`; every other slot reads `stack`. One copy of
-// the select, so both quants and both tensors follow it.
+// the select, so every quant of the fold follows it.
 inline device const char * expert_base(bool shared_slot,
                                        device const char * shexp,
                                        device const char * stack) {
@@ -158,23 +161,6 @@ inline void fold_write_bad(device float * y, int row0, int rows,
     }
 }
 
-// The rows of one expert. `expert` is zero for the shared slot, and the base
-// is then the shared tensor, so the byte offset stays zero.
-template <typename Block>
-inline device const Block * pair_rows(device const Block * stack,
-                                      device const Block * shared,
-                                      bool shared_slot,
-                                      int expert,
-                                      uint rows,
-                                      uint nblocks,
-                                      int row) {
-    device const char * base = expert_base(shared_slot,
-                                           (device const char *)shared,
-                                           (device const char *)stack);
-    ulong bytes = (ulong)expert * (ulong)rows * (ulong)nblocks * sizeof(Block);
-    return ((device const Block *)(base + bytes)) + (ulong)row * (ulong)nblocks;
-}
-
 // One block of the folded K'. The slot owns `per_slot` blocks — the quant's
 // count for one expert width — and the shared slot is the shared tensor. The
 // stack is not contiguous across experts, so the pointer is this block's own.
@@ -195,83 +181,6 @@ inline device const typename Q::Block * fold_block(device const typename Q::Bloc
                                            (device const char *)stack);
     ulong index = ((ulong)expert * (ulong)rows + (ulong)row) * (ulong)per_slot + (ulong)local;
     return ((device const typename Q::Block *)base) + index;
-}
-
-template <typename Q>
-kernel void pair_swiglu_kernel(device const typename Q::Block * gate [[buffer(0)]],
-                               device const typename Q::Block * up [[buffer(1)]],
-                               device const typename Q::Block * shexp_gate [[buffer(2)]],
-                               device const typename Q::Block * shexp_up [[buffer(3)]],
-                               device const float * x [[buffer(4)]],
-                               device const float * gain [[buffer(5)]],
-                               device const int * ids [[buffer(6)]],
-                               device float * y [[buffer(7)]],
-                               device atomic_uint * faults [[buffer(8)]],
-                               constant PairArgs & args [[buffer(9)]],
-                               uint3 tgpig [[threadgroup_position_in_grid]],
-                               ushort tiisg [[thread_index_in_simdgroup]],
-                               ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    typename Q::Lane lane = Q::lane_of(tiisg);
-    const uint slot = tgpig.y;
-    if (slot >= BLOOMERY_EXPERT_SLOTS) {
-        return;
-    }
-    // One pair (a gate row and an up row) to two rows of the mat-vec
-    // geometry: a SIMD group owns PAIR_OUTS outputs, the threadgroup
-    // BLOOMERY_MATVEC_SIMD_GROUPS of them.
-    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)PAIR_OUTS);
-    if (row0 >= (int)args.rows) {
-        return;
-    }
-
-    int expert = 0;
-    if (pair_expert(ids, slot, args.n_experts, expert)) {
-        if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
-                           BLOOMERY_FAULT_SITE_EXPERT_ID);
-        }
-        return;
-    }
-
-    device const typename Q::Block * grow[PAIR_OUTS];
-    device const typename Q::Block * urow[PAIR_OUTS];
-    for (short o = 0; o < PAIR_OUTS; ++o) {
-        grow[o] = pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert,
-                            args.rows, args.nblocks, row0 + o);
-        urow[o] = pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert,
-                            args.rows, args.nblocks, row0 + o);
-    }
-    float sumg[PAIR_OUTS];
-    float sumu[PAIR_OUTS];
-    for (short o = 0; o < PAIR_OUTS; ++o) {
-        sumg[o] = 0.f;
-        sumu[o] = 0.f;
-    }
-    float sum_sq = 0.f;
-    for (int ib = Q::first_block(lane); ib < (int)args.nblocks; ib += Q::block_stride()) {
-        Q::template load<LOAD_NORM>(lane, x + (ulong)ib * Q::values_per_block(),
-                                    gain + (ulong)ib * Q::values_per_block(), 1.f, &sum_sq);
-        for (short o = 0; o < PAIR_OUTS; ++o) {
-            sumg[o] += Q::partial(grow[o][ib], lane);
-            sumu[o] += Q::partial(urow[o][ib], lane);
-        }
-    }
-    const float sum_squares = simd_sum(sum_sq);
-    const float scale = rms_scale(sum_squares, args.nblocks * Q::values_per_block(), args.eps);
-    if (!rms_usable(sum_squares, scale)) {
-        if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
-                           BLOOMERY_FAULT_SITE_NORM_QUANT);
-        }
-        return;
-    }
-    for (short o = 0; o < PAIR_OUTS && row0 + o < (int)args.rows; ++o) {
-        float g = simd_sum(sumg[o]) * scale;
-        float u = simd_sum(sumu[o]) * scale;
-        if (tiisg == 0u) {
-            y[(ulong)slot * args.stride + (uint)(row0 + o)] = pair_swiglu(g, u);
-        }
-    }
 }
 
 template <typename Q>
@@ -327,8 +236,9 @@ kernel void down_fold_kernel(device const typename Q::Block * down [[buffer(0)]]
 }
 
 // The dots of one pair slot over quant Q: `gate` and `up` are the slot's
-// expert tensors, `nblocks` the blocks of one of their rows. The body of
-// pair_swiglu_kernel's slot, taken by the Apart entry for either quant.
+// expert tensors, `nblocks` the blocks of one of their rows. The pair kernel
+// runs it for a routed slot over the stacks' quant and for the shared slot
+// over the shared expert's.
 template <typename Q>
 inline void pair_slot(device const typename Q::Block * gate,
                       device const typename Q::Block * up,
@@ -367,7 +277,8 @@ inline void pair_slot(device const typename Q::Block * gate,
     const float scale = rms_scale(sum_squares, nblocks * Q::values_per_block(), args.eps);
     if (!rms_usable(sum_squares, scale)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
+                           BLOOMERY_FAULT_SITE_NORM_QUANT);
         }
         return;
     }
@@ -382,7 +293,7 @@ inline void pair_slot(device const typename Q::Block * gate,
 
 // The pair over stacks of quant Q and a shared expert of quant QS. `nblocks`
 // in the arguments is the stacks' rows' blocks; the shared expert's rows hold
-// the same columns in QS's blocks.
+// the same columns in QS's blocks, as many when QS is Q.
 template <typename Q, typename QS>
 kernel void pair_swiglu_apart_kernel(device const typename Q::Block * gate [[buffer(0)]],
                                      device const typename Q::Block * up [[buffer(1)]],
@@ -409,7 +320,8 @@ kernel void pair_swiglu_apart_kernel(device const typename Q::Block * gate [[buf
     int expert = 0;
     if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
+            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
+                           BLOOMERY_FAULT_SITE_EXPERT_ID);
         }
         return;
     }
@@ -545,87 +457,19 @@ kernel void down_fold_apart_kernel(device const typename Q::Block * down [[buffe
         ushort tiisg [[thread_index_in_simdgroup]],                                    \
         ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
+// The pair of a shared expert in the stacks' type, per quant.
+APART_PAIR_ENTRY("q4k_pair_swiglu", Q4K, block_q4_K, Q4K, block_q4_K)
+APART_PAIR_ENTRY("q6k_pair_swiglu", Q6K, block_q6_K, Q6K, block_q6_K)
+APART_PAIR_ENTRY("a4_pair_swiglu", A4, block_mlx_a4, A4, block_mlx_a4)
+APART_PAIR_ENTRY("q8_0_pair_swiglu", Q8_0, block_q8_0, Q8_0, block_q8_0)
+APART_PAIR_ENTRY("q5k_pair_swiglu", Q5K, block_q5_K, Q5K, block_q5_K)
+
 // The pairs of types a mixed file has: Q4_K and Q5_K gate and up stacks, Q5_K
 // and Q6_K down stacks, each beside a Q8_0 shared expert.
 APART_PAIR_ENTRY("q4k_pair_swiglu_apart_q8_0", Q4K, block_q4_K, Q8_0, block_q8_0)
 APART_PAIR_ENTRY("q5k_pair_swiglu_apart_q8_0", Q5K, block_q5_K, Q8_0, block_q8_0)
 APART_FOLD_ENTRY("q5k_down_fold_apart_q8_0", Q5K, block_q5_K, Q8_0, block_q8_0)
 APART_FOLD_ENTRY("q6k_down_fold_apart_q8_0", Q6K, block_q6_K, Q8_0, block_q8_0)
-
-template [[host_name("q4k_pair_swiglu")]]
-kernel void pair_swiglu_kernel<Q4K>(device const block_q4_K * gate [[buffer(0)]],
-                                    device const block_q4_K * up [[buffer(1)]],
-                                    device const block_q4_K * shexp_gate [[buffer(2)]],
-                                    device const block_q4_K * shexp_up [[buffer(3)]],
-                                    device const float * x [[buffer(4)]],
-                                    device const float * gain [[buffer(5)]],
-                                    device const int * ids [[buffer(6)]],
-                                    device float * y [[buffer(7)]],
-                                    device atomic_uint * faults [[buffer(8)]],
-                                    constant PairArgs & args [[buffer(9)]],
-                                    uint3 tgpig [[threadgroup_position_in_grid]],
-                                    ushort tiisg [[thread_index_in_simdgroup]],
-                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
-
-template [[host_name("q6k_pair_swiglu")]]
-kernel void pair_swiglu_kernel<Q6K>(device const block_q6_K * gate [[buffer(0)]],
-                                    device const block_q6_K * up [[buffer(1)]],
-                                    device const block_q6_K * shexp_gate [[buffer(2)]],
-                                    device const block_q6_K * shexp_up [[buffer(3)]],
-                                    device const float * x [[buffer(4)]],
-                                    device const float * gain [[buffer(5)]],
-                                    device const int * ids [[buffer(6)]],
-                                    device float * y [[buffer(7)]],
-                                    device atomic_uint * faults [[buffer(8)]],
-                                    constant PairArgs & args [[buffer(9)]],
-                                    uint3 tgpig [[threadgroup_position_in_grid]],
-                                    ushort tiisg [[thread_index_in_simdgroup]],
-                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
-
-template [[host_name("a4_pair_swiglu")]]
-kernel void pair_swiglu_kernel<A4>(device const block_mlx_a4 * gate [[buffer(0)]],
-                                   device const block_mlx_a4 * up [[buffer(1)]],
-                                   device const block_mlx_a4 * shexp_gate [[buffer(2)]],
-                                   device const block_mlx_a4 * shexp_up [[buffer(3)]],
-                                   device const float * x [[buffer(4)]],
-                                   device const float * gain [[buffer(5)]],
-                                   device const int * ids [[buffer(6)]],
-                                   device float * y [[buffer(7)]],
-                                   device atomic_uint * faults [[buffer(8)]],
-                                   constant PairArgs & args [[buffer(9)]],
-                                   uint3 tgpig [[threadgroup_position_in_grid]],
-                                   ushort tiisg [[thread_index_in_simdgroup]],
-                                   ushort sgitg [[simdgroup_index_in_threadgroup]]);
-
-template [[host_name("q8_0_pair_swiglu")]]
-kernel void pair_swiglu_kernel<Q8_0>(device const block_q8_0 * gate [[buffer(0)]],
-                                     device const block_q8_0 * up [[buffer(1)]],
-                                     device const block_q8_0 * shexp_gate [[buffer(2)]],
-                                     device const block_q8_0 * shexp_up [[buffer(3)]],
-                                     device const float * x [[buffer(4)]],
-                                     device const float * gain [[buffer(5)]],
-                                     device const int * ids [[buffer(6)]],
-                                     device float * y [[buffer(7)]],
-                                     device atomic_uint * faults [[buffer(8)]],
-                                     constant PairArgs & args [[buffer(9)]],
-                                     uint3 tgpig [[threadgroup_position_in_grid]],
-                                     ushort tiisg [[thread_index_in_simdgroup]],
-                                     ushort sgitg [[simdgroup_index_in_threadgroup]]);
-
-template [[host_name("q5k_pair_swiglu")]]
-kernel void pair_swiglu_kernel<Q5K>(device const block_q5_K * gate [[buffer(0)]],
-                                    device const block_q5_K * up [[buffer(1)]],
-                                    device const block_q5_K * shexp_gate [[buffer(2)]],
-                                    device const block_q5_K * shexp_up [[buffer(3)]],
-                                    device const float * x [[buffer(4)]],
-                                    device const float * gain [[buffer(5)]],
-                                    device const int * ids [[buffer(6)]],
-                                    device float * y [[buffer(7)]],
-                                    device atomic_uint * faults [[buffer(8)]],
-                                    constant PairArgs & args [[buffer(9)]],
-                                    uint3 tgpig [[threadgroup_position_in_grid]],
-                                    ushort tiisg [[thread_index_in_simdgroup]],
-                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
 template [[host_name("q4k_down_fold")]]
 kernel void down_fold_kernel<Q4K>(device const block_q4_K * down [[buffer(0)]],

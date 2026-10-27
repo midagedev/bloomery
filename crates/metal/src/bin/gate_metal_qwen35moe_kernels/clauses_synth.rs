@@ -49,7 +49,7 @@ fn salt(quant: Quant) -> u64 {
 }
 
 /// A positive synthetic gain: a dropped gain shows.
-fn gain(cols: usize, seed: u64) -> Vec<f32> {
+pub(super) fn gain(cols: usize, seed: u64) -> Vec<f32> {
     oracle::activations(cols, seed, 0.5)
         .iter()
         .map(|g| 1.0 + g.abs())

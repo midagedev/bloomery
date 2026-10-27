@@ -312,7 +312,7 @@ inline void tensor_plain_store(thread C & ct, short m0, short tn, short count,
 }
 
 // The grouped GEMM of the routed experts over the route table's tiles
-// (gemm_routed.metal's gemm_routed_kernel's tile, table and meaning).
+// (gemm_routed.metal's gemm_routed_apart_kernel's tile, table and meaning, with one quant).
 template <typename Q, typename T, bool PAIR>
 kernel void tensor_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
                                  device const typename Q::Block * W_up [[buffer(1)]],

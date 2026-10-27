@@ -11,21 +11,13 @@ use bloomery_metal::kernels::Quant;
 use super::common::{self, LAYER};
 use super::oracle::{self, Kind};
 use super::synthetic;
-use super::{Harness, SegLaunch};
+use super::{Harness, SegLaunch, clauses_synth};
 
 /// The epsilon every launch of the clause takes.
 const EPS: f32 = 1e-6;
 
 /// The input columns of the delta net's alpha and beta: the hidden width.
 const COLS: usize = 2048;
-
-/// A positive synthetic gain: a dropped gain shows.
-fn gain(seed: u64) -> Vec<f32> {
-    oracle::activations(COLS, seed, 0.5)
-        .iter()
-        .map(|g| 1.0 + g.abs())
-        .collect()
-}
 
 /// A segmented dispatch of f32 rows against the oracle: the segment lists a
 /// layer's P1 holds (the delta net's two value-head projections, and the most
@@ -47,7 +39,7 @@ pub fn f32_seg(h: &Harness<'_>) -> Clause {
             .enumerate()
             .map(|(j, &n)| synthetic::matrix(Quant::F32, n, COLS, seed + j as u64))
             .collect();
-        let gain = gain(seed + 8);
+        let gain = clauses_synth::gain(COLS, seed + 8);
         let x = oracle::activations(COLS, seed + 9, 3.7);
         let total: usize = rows.iter().sum();
         h.clear_fault()?;
@@ -86,7 +78,7 @@ pub fn f32_seg(h: &Harness<'_>) -> Clause {
         .enumerate()
         .map(|(j, &n)| synthetic::matrix(Quant::F32, n, COLS, 0xF3F0 + j as u64))
         .collect();
-    let g = gain(0xF3F8);
+    let g = clauses_synth::gain(COLS, 0xF3F8);
     for (what, mut x, eps) in [
         ("a NaN input", oracle::activations(COLS, 1, 1.0), EPS),
         ("an infinite input", oracle::activations(COLS, 2, 1.0), EPS),

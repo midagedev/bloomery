@@ -2,6 +2,8 @@
 // rows. The entry points, under their host names:
 //
 //   gemm_routed_{q4k,q6k,a4,q8_0,q5k}_{pair,plain}_{f16,f32}
+//   gemm_routed_{q4k,q5k}_apart_q8_0_pair_{f16,f32}
+//   gemm_routed_{q5k,q6k}_apart_q8_0_plain_{f16,f32}
 //   gemm_f32w_store_f32
 //
 //   pair     y[p][o] = silu(gate_e[o] . x) * (up_e[o] . x) * w[p], the
@@ -35,11 +37,13 @@
 // K loop's alone; the tile's height and its split over the SIMD groups do
 // not move it.
 //
-// A shared expert of another type than the stacks (`Apart`) is the same
-// kernel over two quants, `gemm_routed_apart_kernel<Q, QS>`: the tile is one
-// group's, so a tile of the shared group runs the shared quant's body whole
-// and every other tile the stacks'. These entries are in this program only:
-// the tensor-op program has none, and the host builds them from this one.
+// Every entry is `gemm_routed_apart_kernel<Q, QS>`, the kernel over two quants,
+// the stacks' and the shared expert's: the tile is one group's, so a tile of
+// the shared group runs the shared quant's body whole and every other tile
+// the stacks'. A file whose shared expert has the stacks' type instantiates it
+// with `QS == Q`, under the plain host names; a shared expert of another type
+// (`Apart`) takes the `*_apart_*` entries. Those are in this program only: the
+// tensor-op program has none, and the host builds them from this one.
 //
 // This file comes after gemm_shared.metal (the routed tile's geometry, its
 // argument block, pair_swiglu and gemm_stage_x), gemm.metal (the helpers
@@ -233,47 +237,29 @@ inline void routed_tile(threadgroup T                  * sa,
     }
 }
 
+// A tile's staging and multiply over quant Q, from the group's gate (and up)
+// tensors: the kernel's body after the group's weights are picked, taken for
+// the stacks' quant and for the shared tensors' quant.
 template <typename Q, typename T, bool PAIR>
-kernel void gemm_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
-                               device const typename Q::Block * W_up [[buffer(1)]],
-                               device const typename Q::Block * W_sh [[buffer(2)]],
-                               device const typename Q::Block * W_sh_up [[buffer(3)]],
-                               device const float      * x [[buffer(4)]],
-                               device float            * y [[buffer(5)]],
-                               device const uint4      * tiles [[buffer(6)]],
-                               device const uint       * sorted [[buffer(7)]],
-                               device const float      * route_w [[buffer(8)]],
-                               constant RoutedArgs     & args [[buffer(9)]],
-                               device atomic_uint      * faults [[buffer(10)]],
-                               uint2  tgpig [[threadgroup_position_in_grid]],
-                               ushort tiitg [[thread_index_in_threadgroup]],
-                               ushort sgitg [[simdgroup_index_in_threadgroup]],
-                               ushort tiisg [[thread_index_in_simdgroup]]) {
-    threadgroup char shmem[routed_shmem_bytes<T>()];
+inline void routed_run(threadgroup char                * shmem,
+                       device const typename Q::Block  * wg,
+                       device const typename Q::Block  * wu,
+                       uint                              tile_y,
+                       uint                              first,
+                       short                             count,
+                       device const float              * x,
+                       device float                    * y,
+                       device const uint               * sorted,
+                       device const float              * route_w,
+                       constant RoutedArgs             & args,
+                       device atomic_uint              * faults,
+                       ushort                            tiitg,
+                       ushort                            sgitg,
+                       ushort                            tiisg) {
     constexpr int LDA = gemm_lda<T>();
-
-    if (tgpig.x >= tiles[0].x) {
-        return;
-    }
-    const uint4 tile = tiles[1 + tgpig.x];
-    const uint expert = tile.x;
-    const uint first = tile.y;
-    const short count = (short)tile.z;
-    // A tile the table cannot write (a group past the routed experts and the
-    // shared group an instance has, a run empty or longer than the tile)
-    // raises the expert-id site and stores nothing.
-    if (expert >= args.n_experts + BLOOMERY_ROUTER_SHARED || count < 1 || count > ROUTED_ACTS) {
-        if (tiitg == 0) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
-        }
-        return;
-    }
-    const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;
-    device const typename Q::Block * wg = shared ? W_sh : W + (ulong)expert * args.stack_blocks;
-    device const typename Q::Block * wu = PAIR ? (shared ? W_sh_up : W_up + (ulong)expert * args.stack_blocks) : wg;
     // The tile's first output: the pair's tile is 32 outputs (64 weight rows
     // of two tensors), the plain tile 64 rows of one.
-    const uint r0 = tgpig.y * (PAIR ? ROUTED_ROWS / 2 : ROUTED_ROWS);
+    const uint r0 = tile_y * (PAIR ? ROUTED_ROWS / 2 : ROUTED_ROWS);
 
     const uint nb = args.cols / (uint)Q::values_per_block();
 
@@ -324,110 +310,6 @@ kernel void gemm_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
     }
 }
 
-#define ROUTED_ENTRY(NAME, Q, T, PAIR)                                              \
-    template [[host_name("gemm_routed_" #NAME)]]                                    \
-    kernel void gemm_routed_kernel<Q, T, PAIR>(                                     \
-        device const Q::Block * W [[buffer(0)]],                                    \
-        device const Q::Block * W_up [[buffer(1)]],                                 \
-        device const Q::Block * W_sh [[buffer(2)]],                                 \
-        device const Q::Block * W_sh_up [[buffer(3)]],                              \
-        device const float    * x [[buffer(4)]],                                    \
-        device float          * y [[buffer(5)]],                                    \
-        device const uint4    * tiles [[buffer(6)]],                                \
-        device const uint     * sorted [[buffer(7)]],                               \
-        device const float    * route_w [[buffer(8)]],                              \
-        constant RoutedArgs   & args [[buffer(9)]],                                 \
-        device atomic_uint    * faults [[buffer(10)]],                              \
-        uint2  tgpig [[threadgroup_position_in_grid]],                              \
-        ushort tiitg [[thread_index_in_threadgroup]],                               \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                            \
-        ushort tiisg [[thread_index_in_simdgroup]]);
-
-ROUTED_ENTRY(q4k_pair_f16, Q4K, half, true)
-ROUTED_ENTRY(q4k_pair_f32, Q4K, float, true)
-ROUTED_ENTRY(q4k_plain_f16, Q4K, half, false)
-ROUTED_ENTRY(q4k_plain_f32, Q4K, float, false)
-ROUTED_ENTRY(q6k_pair_f16, Q6K, half, true)
-ROUTED_ENTRY(q6k_pair_f32, Q6K, float, true)
-ROUTED_ENTRY(q6k_plain_f16, Q6K, half, false)
-ROUTED_ENTRY(q6k_plain_f32, Q6K, float, false)
-ROUTED_ENTRY(a4_pair_f16, A4, half, true)
-ROUTED_ENTRY(a4_pair_f32, A4, float, true)
-ROUTED_ENTRY(a4_plain_f16, A4, half, false)
-ROUTED_ENTRY(a4_plain_f32, A4, float, false)
-ROUTED_ENTRY(q8_0_pair_f16, Q8_0, half, true)
-ROUTED_ENTRY(q8_0_pair_f32, Q8_0, float, true)
-ROUTED_ENTRY(q8_0_plain_f16, Q8_0, half, false)
-ROUTED_ENTRY(q8_0_plain_f32, Q8_0, float, false)
-ROUTED_ENTRY(q5k_pair_f16, Q5K, half, true)
-ROUTED_ENTRY(q5k_pair_f32, Q5K, float, true)
-ROUTED_ENTRY(q5k_plain_f16, Q5K, half, false)
-ROUTED_ENTRY(q5k_plain_f32, Q5K, float, false)
-
-// A tile's staging and multiply over quant Q, from the group's gate (and up)
-// tensors: the body of gemm_routed_kernel after the group's weights are
-// picked, taken by the Apart entry for either quant.
-template <typename Q, typename T, bool PAIR>
-inline void routed_run(threadgroup char                * shmem,
-                       device const typename Q::Block  * wg,
-                       device const typename Q::Block  * wu,
-                       uint                              tile_y,
-                       uint                              first,
-                       short                             count,
-                       device const float              * x,
-                       device float                    * y,
-                       device const uint               * sorted,
-                       device const float              * route_w,
-                       constant RoutedArgs             & args,
-                       device atomic_uint              * faults,
-                       ushort                            tiitg,
-                       ushort                            sgitg,
-                       ushort                            tiisg) {
-    constexpr int LDA = gemm_lda<T>();
-    const uint r0 = tile_y * (PAIR ? ROUTED_ROWS / 2 : ROUTED_ROWS);
-    const uint nb = args.cols / (uint)Q::values_per_block();
-
-    threadgroup T * sa = (threadgroup T *)shmem;
-    threadgroup T * sb = sa + ROUTED_ROWS * LDA;
-
-    const short a_row = (short)(tiitg / 2);
-    const short a_koff = (short)((tiitg % 2) * 16);
-    device const typename Q::Block * a_src;
-    if (PAIR) {
-        const uint o = r0 + (uint)(8 * (a_row / 16) + a_row % 8);
-        a_src = ((a_row / 8) % 2 == 0 ? wg : wu) + (ulong)o * nb;
-    } else {
-        a_src = wg + (ulong)(r0 + a_row) * nb;
-    }
-    threadgroup vec<T, 4> * a_dst = (threadgroup vec<T, 4> *)(sa + a_row * LDA + a_koff);
-
-    const short b_row = (short)(tiitg / 2);
-    const uint b_place = first + (uint)min(b_row, (short)(count - 1));
-    const bool gathered = args.gather != 0u;
-    const ulong src_row = gathered ? ((ulong)sorted[b_place] / BLOOMERY_EXPERT_SLOTS) : ((ulong)b_place);
-    device const float * b_src = x + src_row * args.x_stride + a_koff;
-    threadgroup vec<T, 4> * b_dst = (threadgroup vec<T, 4> *)(sb + b_row * LDA + a_koff);
-
-    const short a_frags = (count + 7) / 8;
-    switch (a_frags) {
-#define ROUTED_TILE_CASE(NA)                                                              \
-    case NA:                                                                              \
-        routed_tile<Q, T, PAIR, NA>(sa, sb, a_src, a_dst, a_koff, b_src, b_dst,           \
-                                    count, first, r0, y, sorted, route_w, args, faults,   \
-                                    tiitg, sgitg, tiisg);                                 \
-        break;
-        ROUTED_TILE_CASE(1)
-        ROUTED_TILE_CASE(2)
-        ROUTED_TILE_CASE(3)
-        ROUTED_TILE_CASE(4)
-        ROUTED_TILE_CASE(5)
-        ROUTED_TILE_CASE(6)
-        ROUTED_TILE_CASE(7)
-        ROUTED_TILE_CASE(8)
-#undef ROUTED_TILE_CASE
-    }
-}
-
 template <typename Q, typename QS, typename T, bool PAIR>
 kernel void gemm_routed_apart_kernel(device const typename Q::Block  * W [[buffer(0)]],
                                      device const typename Q::Block  * W_up [[buffer(1)]],
@@ -453,13 +335,17 @@ kernel void gemm_routed_apart_kernel(device const typename Q::Block  * W [[buffe
     const uint expert = tile.x;
     const uint first = tile.y;
     const short count = (short)tile.z;
-    // The table's tile checks, gemm_routed_kernel's.
-    const uint groups = args.n_experts + BLOOMERY_ROUTER_SHARED;
-    if (expert >= groups || count < 1 || count > ROUTED_ACTS) {
-        if (tiitg == 0) { raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID); }
+    // A tile the table cannot write (a group past the routed experts and the
+    // shared group an instance has, a run empty or longer than the tile)
+    // raises the expert-id site and stores nothing.
+    if (expert >= args.n_experts + BLOOMERY_ROUTER_SHARED || count < 1 || count > ROUTED_ACTS) {
+        if (tiitg == 0) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
+        }
         return;
     }
-    if (BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts) {
+    const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;
+    if (shared) {
         routed_run<QS, T, PAIR>(shmem, W_sh, PAIR ? W_sh_up : W_sh, tgpig.y, first, count, x, y,
                                 sorted, route_w, args, faults, tiitg, sgitg, tiisg);
     } else {
@@ -496,6 +382,18 @@ kernel void gemm_routed_apart_kernel(device const typename Q::Block  * W [[buffe
 #define ROUTED_APART_PLAIN(STEM, Q, BQ, QS, BQS)                                               \
     ROUTED_APART_ENTRY(STEM##_plain_f16, Q, BQ, QS, BQS, half, false)                          \
     ROUTED_APART_ENTRY(STEM##_plain_f32, Q, BQ, QS, BQS, float, false)
+
+// The tiles of a shared expert in the stacks' type, per quant.
+ROUTED_APART_PAIR(q4k, Q4K, block_q4_K, Q4K, block_q4_K)
+ROUTED_APART_PLAIN(q4k, Q4K, block_q4_K, Q4K, block_q4_K)
+ROUTED_APART_PAIR(q6k, Q6K, block_q6_K, Q6K, block_q6_K)
+ROUTED_APART_PLAIN(q6k, Q6K, block_q6_K, Q6K, block_q6_K)
+ROUTED_APART_PAIR(a4, A4, block_mlx_a4, A4, block_mlx_a4)
+ROUTED_APART_PLAIN(a4, A4, block_mlx_a4, A4, block_mlx_a4)
+ROUTED_APART_PAIR(q8_0, Q8_0, block_q8_0, Q8_0, block_q8_0)
+ROUTED_APART_PLAIN(q8_0, Q8_0, block_q8_0, Q8_0, block_q8_0)
+ROUTED_APART_PAIR(q5k, Q5K, block_q5_K, Q5K, block_q5_K)
+ROUTED_APART_PLAIN(q5k, Q5K, block_q5_K, Q5K, block_q5_K)
 
 // The pairs of types a mixed file has: the pair tile over Q4_K and Q5_K gate
 // and up stacks, the plain tile over Q5_K and Q6_K down stacks, each beside a

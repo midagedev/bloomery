@@ -490,7 +490,11 @@ pub const MUTANTS: &[Mutant] = &[
         name: "pair_shared_stack",
         clause: "pair_shared",
         why: "slot 8 reads the expert stack",
-        edits: &[("return shared_slot ? shexp : stack;", "return stack;", 1)],
+        edits: &[(
+            "pair_slot<QS>(shexp_gate, shexp_up, x,",
+            "pair_slot<QS>((device const typename QS::Block *)gate, (device const typename QS::Block *)up, x,",
+            1,
+        )],
     },
     Mutant {
         name: "pair_norm_gain",
@@ -1182,8 +1186,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "grouped_gemm",
         why: "a group reads the next expert's weights",
         edits: &[(
-            ": W + (ulong)expert * args.stack_blocks;",
-            ": W + (ulong)(expert + 1u) * args.stack_blocks;",
+            "wg = W + (ulong)expert * args.stack_blocks;",
+            "wg = W + (ulong)(expert + 1u) * args.stack_blocks;",
             1,
         )],
     },
@@ -1191,7 +1195,11 @@ pub const MUTANTS: &[Mutant] = &[
         name: "routed_shared_base",
         clause: "grouped_gemm",
         why: "the shared group reads the stack's first expert, not the shared tensors",
-        edits: &[("shared ? W_sh : W +", "shared ? W : W +", 1)],
+        edits: &[(
+            "routed_run<QS, T, PAIR>(shmem, W_sh,",
+            "routed_run<QS, T, PAIR>(shmem, (device const typename QS::Block *)W,",
+            1,
+        )],
     },
     Mutant {
         name: "routed_shared_group_refused",
@@ -1354,8 +1362,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "apart_grouped",
         why: "the shared group's tiles of an Apart grouped GEMM read the stacks' type past the stack",
         edits: &[(
-            "if (BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts) {",
-            "if (false) {",
+            "const bool shared = BLOOMERY_ROUTER_SHARED != 0 && expert == args.n_experts;",
+            "const bool shared = false;",
             1,
         )],
     },

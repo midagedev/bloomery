@@ -63,9 +63,7 @@ pub use delta_geom::PASS_ROWS;
 pub use delta_geom::RING_ROWS;
 pub use delta_geom::SNAPS;
 pub use embed::EmbedParams;
-pub use experts::{
-    APART_DOWN, APART_GATE_UP, FoldParams, PairParams, SharedPlan, apart_table, shared_entry,
-};
+pub use experts::{APART_DOWN, APART_GATE_UP, FoldParams, PairParams, SharedPlan, shared_entry};
 pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
 pub use gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, GemmSegParams, Operand};
 pub use geometry::{

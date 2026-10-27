@@ -288,8 +288,9 @@ pub struct RoutedParams<'w> {
     /// The weight type of the stacks.
     pub quant: Quant,
     /// The weight type of the shared tensors: `quant`, or the second of a
-    /// pair of the kind's table ([`super::apart_table`]). An instance with no
-    /// shared group takes `quant`.
+    /// pair of the kind's table ([`super::APART_GATE_UP`] for the pair tile,
+    /// [`super::APART_DOWN`] for the plain). An instance with no shared group
+    /// takes `quant`.
     pub shared_quant: Quant,
     /// The pair or the plain tile.
     pub kind: RoutedKind,
