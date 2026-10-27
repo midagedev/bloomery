@@ -173,7 +173,7 @@ fn hw_the_penalty_window_opens_on_the_prompts_ids() {
     // id once the echo is pushed under it).
     let (a, floor) = (
         u64::from(serve::MockTokenizer.encode("a")[0]),
-        u64::from(serve::MockTokenizer.bos()),
+        u64::from(serve::MockTokenizer.bos().expect("a BOS")),
     );
     let first = |extra: Value| -> u64 {
         let mut body = json!({

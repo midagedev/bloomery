@@ -164,7 +164,7 @@ pub fn assemble<'a>(
     ::embed::input::assemble(
         parts,
         |text| tok.encode(text),
-        tok.add_bos().then(|| tok.bos()),
+        tok.bos_to_prepend()?,
         tok.add_eos().then(|| tok.eos()),
         tok.bos(),
         ctx,
@@ -927,7 +927,11 @@ mod tests {
             assert_eq!(v["error"]["type"], "invalid_request_error");
         }
         assert!(calls.lock().expect("calls").is_empty());
-        let ids = [MockTokenizer.bos(), id("a"), MockTokenizer.eos()];
+        let ids = [
+            MockTokenizer.bos().expect("a BOS"),
+            id("a"),
+            MockTokenizer.eos(),
+        ];
         let want = vector(&ids, 4, Norm::default());
         let (status, v) = post(addr, "/v1/embeddings", &json!({ "input": "a" }));
         assert_eq!(status, 200, "{v}");
@@ -1027,13 +1031,51 @@ mod tests {
         }
     }
 
+    /// An input of a vocabulary that names no BOS starts with the text where the vocabulary adds
+    /// none, is refused by name where it adds a BOS it does not name, and has no filler for a media
+    /// span either way.
+    #[test]
+    fn a_vocabulary_with_no_bos_assembles_text_only() {
+        use crate::mock::NoBosTokenizer;
+        use ::embed::input::InputPart;
+
+        let text = || [Ok(InputPart::Text("a"))].into_iter();
+        let media = || {
+            [Ok(InputPart::Media {
+                begin: "<",
+                end: ">",
+                positions: 2,
+                kind: "image",
+            })]
+            .into_iter()
+        };
+        let ids = assemble(text(), &NoBosTokenizer(false), 16).unwrap().ids;
+        assert_eq!(ids, MockTokenizer.encode("a"));
+        let e = assemble(text(), &NoBosTokenizer(true), 16)
+            .err()
+            .expect("refused");
+        assert!(
+            e.contains("adds a BOS") && e.contains("names no BOS token"),
+            "{e}"
+        );
+        let e = assemble(media(), &NoBosTokenizer(false), 16)
+            .err()
+            .expect("refused");
+        assert!(e.contains("image span has no filler token id"), "{e}");
+    }
+
     /// Which inputs a request holds and the ids each passes, as llama-server splits and
     /// tokenizes them, and the refusals of an input with nothing in it, an object input, and one
     /// of more ids than the context.
     #[test]
     fn inputs_split_and_tokenize_as_llama_server() {
         let (addr, _, calls, _) = serve(Some(MockEmbed::new(4)));
-        let (bos, eos, a, b) = (MockTokenizer.bos(), MockTokenizer.eos(), id("a"), id("b"));
+        let (bos, eos, a, b) = (
+            MockTokenizer.bos().expect("a BOS"),
+            MockTokenizer.eos(),
+            id("a"),
+            id("b"),
+        );
         for (input, want) in [
             (json!("ab"), vec![vec![bos, a, b, eos]]),
             (
@@ -1103,7 +1145,7 @@ mod tests {
                     let want: Vec<_> = ["a", "검색"]
                         .iter()
                         .map(|text| {
-                            let mut ids = vec![MockTokenizer.bos()];
+                            let mut ids = vec![MockTokenizer.bos().expect("a BOS")];
                             ids.extend(MockTokenizer.encode(&format!("{prefix}{text}")));
                             ids.push(MockTokenizer.eos());
                             ids
@@ -1117,7 +1159,11 @@ mod tests {
             assert_eq!(status, 200, "{v}");
             assert_eq!(
                 *calls.lock().expect("calls"),
-                vec![vec![MockTokenizer.bos(), id("a"), MockTokenizer.eos()]]
+                vec![vec![
+                    MockTokenizer.bos().expect("a BOS"),
+                    id("a"),
+                    MockTokenizer.eos()
+                ]]
             );
             calls.lock().expect("calls").clear();
             for name in [json!("missing"), json!("Query"), json!(7), Value::Null] {
@@ -1161,7 +1207,11 @@ mod tests {
     #[test]
     fn normalization_and_the_cut() {
         let (addr, ..) = serve(Some(MockEmbed::new(32)));
-        let ids = [MockTokenizer.bos(), id("a"), MockTokenizer.eos()];
+        let ids = [
+            MockTokenizer.bos().expect("a BOS"),
+            id("a"),
+            MockTokenizer.eos(),
+        ];
         for (body, width, norm) in [
             (json!({ "input": "a", "embd_normalize": -1 }), 4, -1),
             (json!({ "input": "a", "embd_normalize": 0 }), 4, 0),

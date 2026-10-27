@@ -2743,7 +2743,7 @@ mod cache_tests {
         fn decoder(&self) -> Box<dyn Decoder> {
             self.0.decoder()
         }
-        fn bos(&self) -> u32 {
+        fn bos(&self) -> Option<u32> {
             self.0.bos()
         }
         fn eos(&self) -> u32 {

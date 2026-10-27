@@ -128,8 +128,8 @@ impl Tokenizer for Pieces {
             held: Vec::new(),
         })
     }
-    fn bos(&self) -> u32 {
-        0
+    fn bos(&self) -> Option<u32> {
+        Some(0)
     }
     fn eos(&self) -> u32 {
         1

@@ -25,12 +25,13 @@ pub struct Assembled {
 
 /// Tokenize each part separately, with BOS and EOS around the whole input. Media spans are
 /// bounded by `ctx` before allocation; the caller checks the total length, including text and EOS.
+/// A media span is filled with `filler`; a span with none to fill it is refused by name.
 pub fn assemble<'a>(
     parts: impl Iterator<Item = Result<InputPart<'a>, String>>,
     encode: impl Fn(&str) -> Vec<u32>,
     bos: Option<u32>,
     eos: Option<u32>,
-    filler: u32,
+    filler: Option<u32>,
     ctx: usize,
 ) -> Result<Assembled, String> {
     let mut parts = parts.peekable();
@@ -64,6 +65,8 @@ pub fn assemble<'a>(
             .checked_add(positions)
             .filter(|&n| n <= ctx)
             .ok_or_else(|| format!("{kind} input exceeds the embedding context"))?;
+        let filler = filler
+            .ok_or_else(|| format!("an embedding {kind} span has no filler token id to fill it"))?;
         ids.resize(last, filler);
         spans.push(at..last);
         ids.extend(encode(end));

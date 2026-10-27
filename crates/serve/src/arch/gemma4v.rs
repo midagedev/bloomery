@@ -15,13 +15,13 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
     assert_eq!(parsed.len(), 1);
     let got = &parsed[0];
     assert_eq!(got.images.len(), 2);
-    let mut want = vec![side.tok.bos()];
+    let mut want = vec![side.tok.bos().expect("a BOS")];
     want.extend(side.tok.encode("a<|image>"));
     for (i, after) in [(0, "b"), (1, "")] {
         want.extend(side.tok.encode("<|image>"));
         assert_eq!(got.images[i].at, want.len());
         assert_eq!(got.images[i].prepared.span_len, 1);
-        want.extend([side.tok.bos(); 1]);
+        want.extend([side.tok.bos().expect("a BOS"); 1]);
         want.extend(side.tok.encode("<image|>"));
         want.extend(side.tok.encode(after));
     }
@@ -43,7 +43,7 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
             .unwrap_or_else(|e| panic!("{}", e.message));
         assert_eq!(mixed.images.len(), 1);
         assert_eq!(mixed.audio.len(), 1);
-        let mut want = vec![side.tok.bos()];
+        let mut want = vec![side.tok.bos().expect("a BOS")];
         for is_audio in [audio_first, !audio_first] {
             let (begin, end, at) = if is_audio {
                 assert_eq!(mixed.audio[0].chunks.len(), 1);
@@ -59,7 +59,7 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
             };
             want.extend(side.tok.encode(begin));
             assert_eq!(at, want.len());
-            want.push(side.tok.bos());
+            want.push(side.tok.bos().expect("a BOS"));
             want.extend(side.tok.encode(end));
         }
         if side.tok.add_eos() {
@@ -70,7 +70,7 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
     let model = side.media.as_ref().expect("image preparer");
     assert_eq!(model.image_token(), None);
     assert!(matches!(
-        media::expand_prompt(&[side.tok.bos()], &[], &**model),
+        media::expand_prompt(&[side.tok.bos().expect("a BOS")], &[], &**model),
         Err(media::MediaError::NoChatImageToken)
     ));
     // Only context changes: the same valid input fits exactly, but not one position below.
@@ -111,13 +111,16 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
             .collect::<Vec<_>>(),
         [72, 72]
     );
-    let mut want = vec![side.tok.bos()];
+    let mut want = vec![side.tok.bos().expect("a BOS")];
     want.extend(side.tok.encode("Video:"));
     let mut positions = Vec::new();
     for frame in &prepared {
         want.extend(side.tok.encode("<|image>"));
         positions.push(want.len());
-        want.extend(std::iter::repeat_n(side.tok.bos(), frame.span_len));
+        want.extend(std::iter::repeat_n(
+            side.tok.bos().expect("a BOS"),
+            frame.span_len,
+        ));
         want.extend(side.tok.encode("<image|>"));
     }
     if side.tok.add_eos() {
@@ -265,7 +268,7 @@ fn a_clip_in_an_embedding_input_is_planned_decoded_and_delimited() {
     assert_eq!(*mock.calls.lock().unwrap(), [(vec![0, 1, 2], 2)]);
     let tok = &side.tok;
     let text = tok.encode("Video:");
-    assert_eq!(input.ids[0], tok.bos());
+    assert_eq!(Some(input.ids[0]), tok.bos());
     assert_eq!(input.ids[1..=text.len()], text[..]);
     let (begin, end) = (tok.encode("<|image>").len(), tok.encode("<image|>").len());
     assert_eq!(input.images[0].at, 1 + text.len() + begin);

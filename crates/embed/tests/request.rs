@@ -174,11 +174,24 @@ fn ordered_parts_keep_one_pair_of_special_tokens() {
         .into_iter()
     };
     let encode = |s: &str| s.bytes().map(u32::from).collect();
-    let input = assemble(parts(), encode, Some(1), Some(2), 1, 8).unwrap();
+    let input = assemble(parts(), encode, Some(1), Some(2), Some(1), 8).unwrap();
     assert_eq!(input.ids, [1, 97, 98, 1, 1, 101, 122, 2]);
     assert_eq!(input.spans, vec![3..5]);
-    assert!(assemble(parts(), encode, Some(1), Some(2), 1, 4).is_err());
-    assert!(assemble(std::iter::empty(), encode, None, None, 1, 8).is_err());
+    assert!(assemble(parts(), encode, Some(1), Some(2), Some(1), 4).is_err());
+    assert!(assemble(std::iter::empty(), encode, None, None, Some(1), 8).is_err());
+    let e = assemble(parts(), encode, None, Some(2), None, 8)
+        .err()
+        .expect("a media span with no filler is refused");
+    assert!(e.contains("image span has no filler token id"), "{e}");
+    let text_only = assemble(
+        [Ok(InputPart::Text("a"))].into_iter(),
+        encode,
+        None,
+        Some(2),
+        None,
+        8,
+    );
+    assert_eq!(text_only.unwrap().ids, [97, 2]);
     assert!(
         assemble(
             [Ok(InputPart::Media {
@@ -191,7 +204,7 @@ fn ordered_parts_keep_one_pair_of_special_tokens() {
             encode,
             None,
             None,
-            1,
+            Some(1),
             8
         )
         .is_err()
@@ -201,7 +214,7 @@ fn ordered_parts_keep_one_pair_of_special_tokens() {
         encode,
         None,
         None,
-        1,
+        Some(1),
         8,
     );
     assert!(empty.is_err());

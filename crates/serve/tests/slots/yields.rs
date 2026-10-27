@@ -59,7 +59,7 @@ impl Tokenizer for Marked {
     fn decoder(&self) -> Box<dyn Decoder> {
         MockTokenizer.decoder()
     }
-    fn bos(&self) -> u32 {
+    fn bos(&self) -> Option<u32> {
         MockTokenizer.bos()
     }
     fn eos(&self) -> u32 {

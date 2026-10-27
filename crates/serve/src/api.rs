@@ -390,7 +390,8 @@ impl Server {
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
-            bos_text: tok.decode(&[tok.bos()]),
+            // A vocabulary with no BOS renders `bos_token` as empty text.
+            bos_text: tok.bos().map(|id| tok.decode(&[id])).unwrap_or_default(),
             eos_text: tok.decode(&[tok.eos()]),
         };
         let (end_tx, ended) = mpsc::channel();
@@ -3651,11 +3652,16 @@ fn prompt_ids(
     v: &Value,
     special: bool,
 ) -> Result<Vec<u32>, ApiError> {
+    let bos = if special {
+        tok.bos_to_prepend().map_err(|e| engine_error(&e))?
+    } else {
+        None
+    };
     ::embed::input::prompt_ids(
         k,
         v,
         |text| tok.encode(text),
-        (special && tok.add_bos()).then(|| tok.bos()),
+        bos,
         (special && tok.add_eos()).then(|| tok.eos()),
         tok.n_vocab(),
     )
@@ -4679,6 +4685,35 @@ mod tests {
         }
     }
 
+    /// A vocabulary that names no BOS serves where it adds none: `/tokenize` puts nothing before a
+    /// text and `bos_token` is empty text. Where it adds a BOS and names none, a text prompt is
+    /// refused by name, not started with another id.
+    #[test]
+    fn a_vocabulary_with_no_bos_serves_only_where_it_adds_none() {
+        for add_bos in [false, true] {
+            let (addr, _state, _ended) = super::testserve::spawn(
+                Box::new(crate::MockEngine::new(64).with_no_bos(add_bos)),
+                super::testserve::mock_config(),
+            );
+            let (status, props) = roundtrip(addr, "GET", "/props", "");
+            assert_eq!(status, 200, "{props}");
+            let props: Value = serde_json::from_str(&props).expect("JSON");
+            assert_eq!(props["bos_token"], "", "add_bos {add_bos}");
+            let ids = |body: &str| roundtrip(addr, "POST", "/tokenize", body);
+            let (status, plain) = ids(r#"{"content": "ab"}"#);
+            assert_eq!(status, 200, "{plain}");
+            let (status, special) = ids(r#"{"content": "ab", "add_special": true}"#);
+            if add_bos {
+                assert_eq!(status, 500, "{special}");
+                assert!(special.contains("adds a BOS"), "{special}");
+                assert!(special.contains("names no BOS token"), "{special}");
+            } else {
+                assert_eq!(status, 200, "{special}");
+                assert_eq!(special, plain);
+            }
+        }
+    }
+
     /// `/tokenize` takes `content` as a string or an array of strings and
     /// token ids, read as a `/completion` prompt is, with the BOS only under
     /// `add_special` and only before text; an absent `content` and any other
@@ -4695,7 +4730,7 @@ mod tests {
             assert_eq!(status, 200, "{body}: {text}");
             serde_json::from_str::<Value>(&text).expect("JSON")["tokens"].clone()
         };
-        let bos = crate::engine::Tokenizer::bos(&crate::mock::BosTokenizer);
+        let bos = crate::engine::Tokenizer::bos(&crate::mock::BosTokenizer).expect("a BOS");
         let ab = tokens(json!({"content": "ab"}));
         let ab_ids: Vec<u64> = ab
             .as_array()

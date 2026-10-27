@@ -205,8 +205,8 @@ impl Tokenizer for Vocab {
     fn decoder(&self) -> Box<dyn Decoder> {
         unreachable!("the chat-control tests do not generate")
     }
-    fn bos(&self) -> u32 {
-        self.0.specials().bos.expect("a BOS")
+    fn bos(&self) -> Option<u32> {
+        self.0.specials().bos
     }
     fn eos(&self) -> u32 {
         self.0.specials().eos.expect("an EOS")

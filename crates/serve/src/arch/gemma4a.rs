@@ -18,14 +18,14 @@ fn audio_parts_keep_their_delimiters_and_refuse_invalid_pcm() {
     let parsed = input(&side, "input", &body).unwrap_or_else(|e| panic!("{}", e.message));
     assert!(parsed.images.is_empty());
     assert_eq!(parsed.audio.len(), 2);
-    let mut want = vec![side.tok.bos()];
+    let mut want = vec![side.tok.bos().expect("a BOS")];
     want.extend(side.tok.encode("before"));
     for (feed, after) in parsed.audio.iter().zip(["after", ""]) {
         want.extend(side.tok.encode(vision::arch::gemma4a::BEGIN));
         assert_eq!(feed.at, want.len());
         assert_eq!(feed.chunks.len(), 1);
         assert_eq!(feed.chunks[0].tokens(), 1);
-        want.push(side.tok.bos());
+        want.push(side.tok.bos().expect("a BOS"));
         want.extend(side.tok.encode(vision::arch::gemma4a::END));
         want.extend(side.tok.encode(after));
     }

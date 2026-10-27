@@ -1138,12 +1138,9 @@ pub fn served_as_hf(
         ("tokenizer.ggml.unknown_token_id", specials.unk),
         ("tokenizer.ggml.seperator_token_id", specials.sep),
     ] {
-        if actual.is_none()
-            && matches!(
-                key,
-                "tokenizer.ggml.bos_token_id" | "tokenizer.ggml.eos_token_id"
-            )
-        {
+        // A BOS id is asked only where the vocabulary adds one, which the tokenizer refuses
+        // without it; a folder that names none (HF's own: no `bos_token`) keeps none.
+        if actual.is_none() && key == "tokenizer.ggml.eos_token_id" {
             return Err(format!("serving requires {key}").into());
         }
         if actual.map(u64::from) != expected(key).and_then(Value::as_u64) {

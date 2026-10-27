@@ -196,8 +196,9 @@ pub trait Tokenizer: Send + Sync {
     fn decode(&self, ids: &[u32]) -> String;
     /// A fresh streaming decoder.
     fn decoder(&self) -> Box<dyn Decoder>;
-    /// Beginning-of-sequence token id.
-    fn bos(&self) -> u32;
+    /// Beginning-of-sequence token id; `None` where the vocabulary names none, which a
+    /// vocabulary that adds no BOS ([`Tokenizer::add_bos`]) may do.
+    fn bos(&self) -> Option<u32>;
     /// End-of-sequence token id: the text `/props` names as `eos_token`.
     fn eos(&self) -> u32;
     /// Every id that ends a generation (a vocabulary's end-of-generation
@@ -208,6 +209,16 @@ pub trait Tokenizer: Send + Sync {
     }
     /// Whether a text prompt on `/completion` gets a BOS prepended (GGUF `add_bos_token`).
     fn add_bos(&self) -> bool;
+    /// The BOS a text prompt starts with: the vocabulary's where it adds one, none where it does
+    /// not. A vocabulary that adds a BOS and names none is refused by name.
+    fn bos_to_prepend(&self) -> Result<Option<u32>, String> {
+        if !self.add_bos() {
+            return Ok(None);
+        }
+        self.bos().map(Some).ok_or_else(|| {
+            "the vocabulary adds a BOS (add_bos_token) and names no BOS token".to_owned()
+        })
+    }
     /// Whether text tokenized with the vocabulary's special tokens gets an EOS appended (GGUF
     /// `add_eos_token`), beside the BOS [`Tokenizer::add_bos`] puts first.
     fn add_eos(&self) -> bool {

@@ -403,6 +403,17 @@ impl MockEngine {
         }
     }
 
+    /// The same mock whose tokenizer names no BOS ([`NoBosTokenizer`]) and adds one or not as
+    /// `add_bos` says.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_no_bos(self, add_bos: bool) -> Self {
+        MockEngine {
+            tok: Arc::new(NoBosTokenizer(add_bos)),
+            ..self
+        }
+    }
+
     fn push(&mut self, id: u32) -> Result<(), EngineError> {
         if self.ctx.len() >= self.ctx_max {
             return Err(EngineError(format!(
@@ -486,8 +497,8 @@ impl Tokenizer for MockTokenizer {
         Box::new(Utf8Decoder { held: Vec::new() })
     }
 
-    fn bos(&self) -> u32 {
-        0
+    fn bos(&self) -> Option<u32> {
+        Some(0)
     }
 
     fn eos(&self) -> u32 {
@@ -824,7 +835,7 @@ impl Tokenizer for BosTokenizer {
         MockTokenizer.decoder()
     }
 
-    fn bos(&self) -> u32 {
+    fn bos(&self) -> Option<u32> {
         MockTokenizer.bos()
     }
 
@@ -834,6 +845,50 @@ impl Tokenizer for BosTokenizer {
 
     fn add_bos(&self) -> bool {
         true
+    }
+
+    fn n_vocab(&self) -> usize {
+        MockTokenizer.n_vocab()
+    }
+}
+
+/// [`MockTokenizer`] with no BOS id: `add_bos` as the field says, so a vocabulary that adds none
+/// and one that asks for a BOS it does not name can both be served.
+#[cfg(test)]
+pub(crate) struct NoBosTokenizer(pub(crate) bool);
+
+#[cfg(test)]
+impl Tokenizer for NoBosTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        MockTokenizer.encode(text)
+    }
+
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> Cow<'a, str> {
+        MockTokenizer.guard(text, mark)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        MockTokenizer.encode_marked(text, mark)
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        MockTokenizer.decode(ids)
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        MockTokenizer.decoder()
+    }
+
+    fn bos(&self) -> Option<u32> {
+        None
+    }
+
+    fn eos(&self) -> u32 {
+        MockTokenizer.eos()
+    }
+
+    fn add_bos(&self) -> bool {
+        self.0
     }
 
     fn n_vocab(&self) -> usize {
@@ -868,7 +923,7 @@ impl Tokenizer for EmbedTokenizer {
         MockTokenizer.decoder()
     }
 
-    fn bos(&self) -> u32 {
+    fn bos(&self) -> Option<u32> {
         MockTokenizer.bos()
     }
 
@@ -1013,7 +1068,7 @@ impl Tokenizer for MediaTokenizer {
         Box::new(MediaDecoder(MockTokenizer.decoder()))
     }
 
-    fn bos(&self) -> u32 {
+    fn bos(&self) -> Option<u32> {
         MockTokenizer.bos()
     }
 
@@ -1540,7 +1595,7 @@ impl Tokenizer for StopsTokenizer {
         MockTokenizer.decoder()
     }
 
-    fn bos(&self) -> u32 {
+    fn bos(&self) -> Option<u32> {
         MockTokenizer.bos()
     }
 

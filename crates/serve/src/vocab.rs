@@ -13,18 +13,17 @@ use crate::engine::{Decoder, Tokenizer};
 /// The file's vocabulary as the server reads it.
 pub struct Vocab {
     tok: Arc<tokenizer::Tokenizer>,
-    bos: u32,
+    bos: Option<u32>,
     eos: u32,
     user_start: Vec<u32>,
 }
 
 impl Vocab {
-    /// Wraps a loaded vocabulary; refused when it names no BOS or EOS.
+    /// Wraps a loaded vocabulary; refused when it names no EOS. A BOS it does not name stays
+    /// none (the tokenizer itself refuses a vocabulary that adds a BOS without one).
     pub fn new(tok: tokenizer::Tokenizer) -> Result<Vocab, String> {
         let sp = tok.specials();
-        let bos = sp
-            .bos
-            .ok_or_else(|| "the vocabulary names no BOS token".to_owned())?;
+        let bos = sp.bos;
         let eos = sp
             .eos
             .ok_or_else(|| "the vocabulary names no EOS token".to_owned())?;
@@ -98,7 +97,7 @@ impl Tokenizer for Vocab {
         })
     }
 
-    fn bos(&self) -> u32 {
+    fn bos(&self) -> Option<u32> {
         self.bos
     }
 
@@ -277,5 +276,45 @@ mod tests {
                 .unwrap();
             assert_eq!(vocab.user_start(), expected, "{text} {kind} {template}");
         }
+    }
+
+    /// A vocabulary that names no BOS is wrapped where it adds none, with no BOS id of the
+    /// server's own making; one that adds a BOS and names none does not get past the tokenizer,
+    /// by name.
+    #[test]
+    fn a_vocabulary_names_no_bos_only_where_it_adds_none() {
+        use gguf::Value;
+
+        let keys = |add_bos: bool| {
+            vec![
+                ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                ("tokenizer.ggml.pre".into(), Value::String("qwen2".into())),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    Value::Array(
+                        ["a", "</s>", "<|im_start|>"]
+                            .into_iter()
+                            .map(|s| Value::String(s.into()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.token_type".into(),
+                    Value::Array([1, 3, 3].into_iter().map(Value::I32).collect()),
+                ),
+                ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+                ("tokenizer.ggml.eos_token_id".into(), Value::U32(1)),
+                ("tokenizer.ggml.add_bos_token".into(), Value::Bool(add_bos)),
+            ]
+        };
+        let tok = tokenizer::Tokenizer::from_keys(&keys(false)).unwrap();
+        let vocab = Vocab::new(tok).unwrap();
+        assert_eq!(vocab.bos(), None);
+        assert_eq!(vocab.bos_to_prepend(), Ok(None));
+        let e = tokenizer::Tokenizer::from_keys(&keys(true))
+            .err()
+            .expect("a BOS that is asked for and not named is refused")
+            .to_string();
+        assert!(e.contains("tokenizer.ggml.bos_token_id"), "{e}");
     }
 }

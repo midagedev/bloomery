@@ -849,19 +849,42 @@ mod tests {
                     let err = served_as_hf(&changed, &vocab).err().unwrap();
                     assert!(err.to_string().contains(error), "{second} {key}: {err}");
                 }
-                for key in ["tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id"] {
-                    let mut absent = hf::vocab::Keys {
-                        keys: keys.clone(),
-                        added: vocab.added.clone(),
-                        stop: vocab.stop.clone(),
-                    };
-                    absent.keys.retain(|(k, _)| k != key);
-                    let err = served_as_hf(&absent.keys, &absent).err().unwrap();
-                    assert!(
-                        err.to_string().contains(&format!("serving requires {key}")),
-                        "{err}"
-                    );
-                }
+                // The EOS id is asked whatever the flags say.
+                let mut absent = hf::vocab::Keys {
+                    keys: keys.clone(),
+                    added: vocab.added.clone(),
+                    stop: vocab.stop.clone(),
+                };
+                absent
+                    .keys
+                    .retain(|(k, _)| k != "tokenizer.ggml.eos_token_id");
+                let err = served_as_hf(&absent.keys, &absent).err().unwrap();
+                assert!(
+                    err.to_string()
+                        .contains("serving requires tokenizer.ggml.eos_token_id"),
+                    "{err}"
+                );
+                // PIN(2026-10-28): a BOS id is asked only where the vocabulary adds a BOS. It was
+                // asked always, and the Qwen3-Coder folder, which names none, was refused.
+                let mut absent = hf::vocab::Keys {
+                    keys: keys.clone(),
+                    added: vocab.added.clone(),
+                    stop: vocab.stop.clone(),
+                };
+                absent
+                    .keys
+                    .retain(|(k, _)| k != "tokenizer.ggml.bos_token_id");
+                let served = served_as_hf(&absent.keys, &absent).unwrap();
+                assert_eq!(served.specials().bos, None, "{second}");
+                absent
+                    .keys
+                    .push(("tokenizer.ggml.add_bos_token".into(), Value::Bool(true)));
+                let err = served_as_hf(&absent.keys, &absent).err().unwrap();
+                assert!(
+                    err.to_string()
+                        .contains("missing metadata key tokenizer.ggml.bos_token_id"),
+                    "{err}"
+                );
                 let mut both = keys.clone();
                 let mut expected = hf::vocab::Keys {
                     keys: both.clone(),
