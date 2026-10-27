@@ -23,9 +23,12 @@ use crate::folder::{Error, FolderMap, Mapped, Mapping, Origin, VocabSpec, refuse
 
 const ARCHITECTURE: &str = "qwen3moe";
 
-/// `config.json`'s keys beside [`trunk::KEYS`]: the checkpoint's class and type, MLX's
-/// `quantization` block (which `hf::quant_config` reads, with its verbatim copy), and the values
-/// the program computes with one value and GGUF has no key for.
+/// Every layer routes over experts.
+const FFN: trunk::Ffn = trunk::Ffn::Routed;
+
+/// `config.json`'s keys beside [`trunk::KEYS`] and the routed block's: the checkpoint's class and
+/// type, MLX's `quantization` block (which `hf::quant_config` reads, with its verbatim copy), and
+/// the values the program computes with one value and GGUF has no key for.
 const ROOT: &Fields = &[
     ("architectures", Need(r#"[["Qwen3MoeForCausalLM"]]"#)),
     ("model_type", Need(r#"["qwen3_moe"]"#)),
@@ -93,20 +96,25 @@ impl FolderMap for Checkpoint {
 
     fn parse(config: &Json) -> Result<Self, Error> {
         let root = Section::<Error>::new(config, "config.json")?;
-        root.check(&[ROOT, trunk::KEYS])?;
+        root.check(&[ROOT, trunk::KEYS, FFN.keys()])?;
         let mut counts = BTreeMap::new();
-        for &field in trunk::COUNTS {
+        for &field in trunk::COUNTS.iter().chain(FFN.counts()) {
             counts.insert(field, root.count(field)?);
         }
         let n = |key: &str| counts[key];
-        trunk::check_counts(&root, n)?;
+        trunk::check_counts(&root, FFN, n)?;
         let wide = |key: &str| u64::from(counts[key]);
         let rows = |heads: &str| {
             wide(heads)
                 .checked_mul(wide("head_dim"))
                 .ok_or_else(|| root.bad(heads, "times head_dim overflows u64"))
         };
-        let mut keys = trunk::metadata(n, root.number("rope_theta")?, root.number("rms_norm_eps")?);
+        let mut keys = trunk::metadata(
+            n,
+            FFN,
+            root.number("rope_theta")?,
+            root.number("rms_norm_eps")?,
+        );
         keys.push((
             "feed_forward_length".to_string(),
             Value::U32(root.count("intermediate_size")?),

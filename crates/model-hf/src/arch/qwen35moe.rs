@@ -1,7 +1,8 @@
 //! Qwen3.8-Flash-Next's Hugging Face checkpoint in the qwen4exp names, layouts and keys the
 //! program reads, as llama.cpp's converter (`conversion/qwen4exp.py`, `Qwen4ExpTextModel`, and
-//! the `qwen.py` classes it extends, at `098ce526`) writes them into a GGUF, and Qwen3.6's MLX
-//! folder in the qwen35moe ones ([`Family`]).
+//! the `qwen.py` classes it extends, at `098ce526`) writes them into a GGUF, Qwen3.6's MLX
+//! folder in the qwen35moe ones, and the dense Qwen3.5-class MLX folder (a SwiGLU block in place
+//! of the routed experts) in the qwen35 ones ([`Family`]).
 //!
 //! A checkpoint tensor maps to one tensor of the file ([`names`]), the way its role reads it
 //! ([`Use`]) and the [`Step`]s that move it into the program's layout once its format is
@@ -11,7 +12,8 @@
 //! carry it already), and `A_log` as `-exp`. The routed experts of a projection stack by expert
 //! id (Qwen3.6's arrive stacked, one `switch_mlp` tensor), and the PLE table's parts concatenate
 //! in part order. Qwen3.8's target and next-token layers share the layer map; Qwen3.6's
-//! next-token layers (`mtp.*`) and either vision tower are left out; any other name is refused.
+//! next-token layers (`mtp.*`) and either vision tower are left out, and the dense family's
+//! next-token layer is refused by name when a folder holds one; any other name is refused.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -61,10 +63,22 @@ pub enum Family {
     Qwen38,
     /// Qwen3.6 as MLX's convert stores it, written as a `qwen35moe` file.
     Qwen36,
+    /// The dense Qwen3.5-class model (`Qwen3_5ForConditionalGeneration`: the 27B) as MLX's convert
+    /// stores it, written as a `qwen35` file: Qwen3.6's layers with one SwiGLU block in place of
+    /// the routed experts.
+    Qwen35,
+    /// [`Family::Qwen35`] in the text-only class (`Qwen3_5ForCausalLM`), whose `config.json` is
+    /// the text model's own object.
+    Qwen35Text,
 }
 
 impl Family {
-    const ALL: [Family; 2] = [Family::Qwen38, Family::Qwen36];
+    const ALL: [Family; 4] = [
+        Family::Qwen38,
+        Family::Qwen36,
+        Family::Qwen35,
+        Family::Qwen35Text,
+    ];
 
     /// The family whose checkpoint class is `architecture`.
     fn of(architecture: &str) -> Option<Family> {
@@ -78,7 +92,33 @@ impl Family {
         match self {
             Family::Qwen38 => "Qwen4ExpForConditionalGeneration",
             Family::Qwen36 => "Qwen3_5MoeForConditionalGeneration",
+            Family::Qwen35 => "Qwen3_5ForConditionalGeneration",
+            Family::Qwen35Text => "Qwen3_5ForCausalLM",
         }
+    }
+
+    /// Whether the checkpoint is stored as MLX's convert writes it: its tensor names, the norm
+    /// gammas with the `+ 1` folded in, and the conv taps as `[channels, kernel, 1]`.
+    fn mlx(self) -> bool {
+        self != Family::Qwen38
+    }
+
+    /// The feed-forward block of every layer.
+    fn ffn(self) -> trunk::Ffn {
+        match self {
+            Family::Qwen38 | Family::Qwen36 => trunk::Ffn::Routed,
+            Family::Qwen35 | Family::Qwen35Text => trunk::Ffn::Dense,
+        }
+    }
+
+    /// Whether `config.json` is the text model's own object, with no `text_config` inside it.
+    fn text_only(self) -> bool {
+        self == Family::Qwen35Text
+    }
+
+    /// Whether the map reads a next-token layer ([`FolderMap::draft`]).
+    fn reads_draft(self) -> bool {
+        self.ffn() == trunk::Ffn::Routed
     }
 
     /// The file's `general.architecture`, which prefixes its keys.
@@ -86,6 +126,7 @@ impl Family {
         match self {
             Family::Qwen38 => "qwen4exp",
             Family::Qwen36 => "qwen35moe",
+            Family::Qwen35 | Family::Qwen35Text => "qwen35",
         }
     }
 
@@ -93,6 +134,7 @@ impl Family {
         match self {
             Family::Qwen38 => "Qwen3.8",
             Family::Qwen36 => "Qwen3.6",
+            Family::Qwen35 | Family::Qwen35Text => "Qwen3.5",
         }
     }
 
@@ -100,7 +142,7 @@ impl Family {
     fn text(self) -> &'static str {
         match self {
             Family::Qwen38 => "model.language_model.",
-            Family::Qwen36 => "language_model.model.",
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => "language_model.model.",
         }
     }
 
@@ -108,7 +150,7 @@ impl Family {
     fn lm_head(self) -> &'static str {
         match self {
             Family::Qwen38 => "lm_head.weight",
-            Family::Qwen36 => "language_model.lm_head.weight",
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => "language_model.lm_head.weight",
         }
     }
 
@@ -116,7 +158,7 @@ impl Family {
     fn vision(self) -> &'static str {
         match self {
             Family::Qwen38 => "model.visual.",
-            Family::Qwen36 => "vision_tower.",
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => "vision_tower.",
         }
     }
 
@@ -127,33 +169,56 @@ impl Family {
     }
 
     /// The `config.json` keys the family has beside [`ROOT_SHARED`].
-    fn root(self) -> &'static Fields {
+    fn root(self) -> &'static [&'static Fields] {
         match self {
-            Family::Qwen38 => ROOT_38,
-            Family::Qwen36 => ROOT_36,
+            Family::Qwen38 => &[ROOT_38],
+            Family::Qwen36 => &[ROOT_MLX, ROOT_36],
+            Family::Qwen35 => &[ROOT_MLX, ROOT_35],
+            Family::Qwen35Text => &[ROOT_MLX],
         }
     }
 
-    /// The `text_config` keys the family has beside [`TEXT_SHARED`].
-    fn text_config(self) -> &'static Fields {
-        match self {
+    /// The `text_config` keys the family has: [`TEXT_SHARED`], the trunk's, its feed-forward
+    /// block's, the shared expert's of a routed one, and its own.
+    fn text_config(self) -> Vec<&'static Fields> {
+        let mut tables = vec![TEXT_SHARED, trunk::KEYS, self.ffn().keys()];
+        if self.ffn() == trunk::Ffn::Routed {
+            tables.push(SHARED_EXPERT);
+        }
+        tables.push(match self {
             Family::Qwen38 => TEXT_38,
             Family::Qwen36 => TEXT_36,
-        }
+            Family::Qwen35 | Family::Qwen35Text => TEXT_35,
+        });
+        tables
     }
 
-    /// The `text_config` counts the family reads beside [`COUNTS`].
-    fn counts(self) -> &'static [&'static str] {
-        match self {
+    /// The `text_config` counts the family reads: [`COUNTS`], the trunk's and its block's, and
+    /// its own.
+    fn counts(self) -> impl Iterator<Item = &'static str> {
+        let routed: &[&str] = match self.ffn() {
+            trunk::Ffn::Routed => &["shared_expert_intermediate_size"],
+            trunk::Ffn::Dense => &[],
+        };
+        let own: &[&str] = match self {
             Family::Qwen38 => COUNTS_38,
-            Family::Qwen36 => &[],
-        }
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => &[],
+        };
+        COUNTS
+            .iter()
+            .chain(trunk::COUNTS)
+            .chain(self.ffn().counts())
+            .chain(routed)
+            .chain(own)
+            .copied()
     }
 }
 
 const VISION: &str = "the vision tower and its placeholders; this converter writes the text model";
 const MTP: &str =
     "the next-token layers, which this converter leaves out and the trunk never reads";
+const SAMPLING: &str =
+    "the checkpoint's sampling defaults; a request's own settings decide how the program samples";
 const PLE_SIZES: &str = "sized the PLE hash tables in training; the checkpoint's ngram_heads_offsets \
     and ngram_heads_vocab_sizes hold the sizes, which are exported";
 
@@ -189,20 +254,33 @@ const ROOT_38: &Fields = &[
     ("language_model_only", Ignore(Type::Bool, VISION)),
 ];
 
-/// Qwen3.6's `config.json` keys beside [`ROOT_SHARED`]: `quantization` is MLX's block, which
+/// An MLX family's `config.json` keys beside [`ROOT_SHARED`]: `quantization` is MLX's block, which
 /// `hf::quant_config` reads, and `eos_token_id` the ids `hf::vocab::Config` reads.
-const ROOT_36: &Fields = &[
-    ("model_type", Need(r#"["qwen3_5_moe"]"#)),
+const ROOT_MLX: &Fields = &[
     ("quantization", Read),
     ("eos_token_id", Read),
     ("image_token_id", Ignore(Type::Number, VISION)),
 ];
 
-/// `config.json`'s `text_config`, every family's keys beside [`trunk::KEYS`]. A setting the
-/// program computes with one value and GGUF has no key for is `Only` that value: another would
-/// be served as this one, and an absent one is it.
+/// Qwen3.6's `config.json` keys beside [`ROOT_SHARED`] and [`ROOT_MLX`].
+const ROOT_36: &Fields = &[("model_type", Need(r#"["qwen3_5_moe"]"#))];
+
+/// Qwen3.5's `config.json` keys beside [`ROOT_SHARED`] and [`ROOT_MLX`]: the checkpoint's
+/// sampling defaults sit at the top level and in `generation_config`.
+const ROOT_35: &Fields = &[
+    ("model_type", Need(r#"["qwen3_5"]"#)),
+    ("language_model_only", Ignore(Type::Bool, VISION)),
+    ("generation_config", Ignore(Type::Object, SAMPLING)),
+    ("do_sample", Ignore(Type::Bool, SAMPLING)),
+    ("temperature", Ignore(Type::Number, SAMPLING)),
+    ("top_k", Ignore(Type::Number, SAMPLING)),
+    ("top_p", Ignore(Type::Number, SAMPLING)),
+];
+
+/// `config.json`'s `text_config`, every family's keys beside [`trunk::KEYS`] and its block's. A
+/// setting the program computes with one value and GGUF has no key for is `Only` that value:
+/// another would be served as this one, and an absent one is it.
 const TEXT_SHARED: &Fields = &[
-    ("shared_expert_intermediate_size", Read),
     ("linear_conv_kernel_dim", Read),
     ("linear_key_head_dim", Read),
     ("linear_num_key_heads", Read),
@@ -220,13 +298,15 @@ const TEXT_SHARED: &Fields = &[
 /// The counts of [`TEXT_SHARED`] every family reads beside [`trunk::COUNTS`]: each a positive
 /// u32.
 const COUNTS: &[&str] = &[
-    "shared_expert_intermediate_size",
     "linear_conv_kernel_dim",
     "linear_key_head_dim",
     "linear_num_key_heads",
     "linear_num_value_heads",
     "linear_value_head_dim",
 ];
+
+/// The shared expert's width, which both routed families have.
+const SHARED_EXPERT: &Fields = &[("shared_expert_intermediate_size", Read)];
 
 /// Qwen3.8's counts beside [`COUNTS`] and [`trunk::COUNTS`].
 const COUNTS_38: &[&str] = &[
@@ -298,6 +378,25 @@ const TEXT_36: &Fields = &[
     ("attn_output_gate", Only("[true]")),
 ];
 
+/// Qwen3.5's `text_config` keys beside [`TEXT_SHARED`].
+const TEXT_35: &Fields = &[
+    (
+        "full_attention_interval",
+        Ignore(
+            Type::Number,
+            "layer_types lists every layer's kind, and the file's interval is made from that list",
+        ),
+    ),
+    ("model_type", Only(r#"["qwen3_5_text"]"#)),
+    // The attention query projection holds each head's output gate beside its query.
+    ("attn_output_gate", Only("[true]")),
+    // The gated delta rule's output gate is `silu(z)` (HF's `swish`, `GdnGate::Silu`).
+    ("output_gate_type", Only(r#"["swish"]"#)),
+    // The list names the layers a mixture-of-experts config makes dense; this family has no
+    // routed layer, so the list is HF's empty default.
+    ("mlp_only_layers", Only("[[]]")),
+];
+
 /// `text_config.rope_parameters`: interleaved M-RoPE (`RopeMode::Imrope`), unscaled.
 const ROPE: &Fields = &[
     ("rope_type", Only(r#"["default"]"#)),
@@ -321,6 +420,7 @@ pub struct Geometry {
     /// The indexer's query rows of `index_qk_proj`, its key rows following; 0 for a family
     /// without the indexer.
     indexer_q: usize,
+    /// The routed block's experts; 0 for a dense family.
     experts: usize,
     /// The PLE table's parts (`split_ngram_parts`).
     ple_parts: usize,
@@ -332,6 +432,8 @@ pub struct Checkpoint {
     pub geometry: Geometry,
     pub vocab: hf::vocab::Config,
     hidden: u32,
+    /// The dense block's width, `intermediate_size`; `None` for a routed family.
+    dense_ff: Option<u32>,
     indexer_k: u32,
     metadata: Vec<(String, Value)>,
     ple: Option<Ple>,
@@ -401,17 +503,29 @@ impl Checkpoint {
                 &format!("{arch:?}: only {known:?} are supported"),
             )
         })?;
-        schema::check(config, "config", &[ROOT_SHARED, family.root()]).map_err(Error::Config)?;
-        let c = Reader::new(root.field("text_config")?, "text_config")?;
-        schema::check(
-            c.value,
-            "text_config",
-            &[TEXT_SHARED, trunk::KEYS, family.text_config()],
-        )
-        .map_err(Error::Config)?;
+        if family.text_only() && config.get("text_config").is_some() {
+            return Err(root.bad(
+                "text_config",
+                "belongs to the multimodal class; a text-only config holds the text model's keys itself",
+            ));
+        }
+        let mut root_tables = vec![ROOT_SHARED];
+        root_tables.extend(family.root());
+        let c = if family.text_only() {
+            // A text-only checkpoint's config is the text model's own object: one object holds
+            // both tables.
+            root_tables.extend(family.text_config());
+            schema::check(config, "config", &root_tables).map_err(Error::Config)?;
+            Reader::new(config, "config")?
+        } else {
+            schema::check(config, "config", &root_tables).map_err(Error::Config)?;
+            let c = Reader::new(root.field("text_config")?, "text_config")?;
+            schema::check(c.value, "text_config", &family.text_config()).map_err(Error::Config)?;
+            c
+        };
         let vocab = hf::vocab::Config::parse(config).map_err(|e| Error::Config(e.to_string()))?;
         let mut counts = BTreeMap::new();
-        for &field in trunk::COUNTS.iter().chain(COUNTS).chain(family.counts()) {
+        for field in family.counts() {
             counts.insert(field, c.count(field)?);
         }
         let n = |key: &str| counts[key];
@@ -435,10 +549,10 @@ impl Checkpoint {
                 "must group by linear_num_key_heads",
             ));
         }
-        trunk::check_counts(&c, n)?;
+        trunk::check_counts(&c, family.ffn(), n)?;
         let exp = match family {
             Family::Qwen38 => Some(Exp::of(&c, &counts)?),
-            Family::Qwen36 => None,
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => None,
         };
         let kinds = c.array("layer_types")?;
         if kinds.len() != n("num_hidden_layers") as usize {
@@ -527,19 +641,25 @@ impl Checkpoint {
             return Err(rope.bad("mrope_section", "must sum to half the rotary head width"));
         }
         sections.resize(4, Value::I32(0));
-        let mut metadata =
-            trunk::metadata(n, rope.number("rope_theta")?, c.number("rms_norm_eps")?);
+        let mut metadata = trunk::metadata(
+            n,
+            family.ffn(),
+            rope.number("rope_theta")?,
+            c.number("rms_norm_eps")?,
+        );
         // The sections follow the head counts, before the rope's base: the order the split's keys
         // have always been written in.
         metadata.insert(
             5,
             ("rope.dimension_sections".into(), Value::Array(sections)),
         );
-        metadata.extend([
-            (
+        if family.ffn() == trunk::Ffn::Routed {
+            metadata.push((
                 "expert_shared_feed_forward_length".into(),
                 Value::U32(n("shared_expert_intermediate_size")),
-            ),
+            ));
+        }
+        metadata.extend([
             (
                 "ssm.conv_kernel".into(),
                 Value::U32(n("linear_conv_kernel_dim")),
@@ -679,10 +799,11 @@ impl Checkpoint {
                 head_k: n("linear_key_head_dim") as usize,
                 head_v: n("linear_value_head_dim") as usize,
                 indexer_q: exp.as_ref().map_or(0, |e| e.indexer_q as usize),
-                experts: n("num_experts") as usize,
+                experts: counts.get("num_experts").map_or(0, |&e| e as usize),
                 ple_parts,
             },
             hidden: n("hidden_size"),
+            dense_ff: counts.get("intermediate_size").copied(),
             indexer_k: counts.get("indexer_head_dim").copied().unwrap_or(0),
             vocab,
             metadata,
@@ -738,6 +859,32 @@ impl Checkpoint {
                         self.vocab.size()
                     ),
                 ));
+            }
+        }
+        if let Some(ff) = self.dense_ff {
+            // Every layer's block: gate and up are `[hidden_size, intermediate_size]`, down the
+            // transpose.
+            let (hidden, ff) = (u64::from(self.hidden), u64::from(ff));
+            for l in 0..self.geometry.layers {
+                for (name, want) in [
+                    (common::ffn_gate(l), [hidden, ff]),
+                    (common::ffn_up(l), [hidden, ff]),
+                    (common::ffn_down(l), [ff, hidden]),
+                ] {
+                    let m = mapped
+                        .get(&name)
+                        .ok_or_else(|| refuse(&name, "is missing"))?;
+                    if m.dims != want {
+                        return Err(refuse(
+                            &m.sources[0],
+                            format!(
+                                "dims {:?} disagree with hidden_size {hidden} and \
+                                 intermediate_size {ff}",
+                                m.dims
+                            ),
+                        ));
+                    }
+                }
             }
         }
         Ok(mapped)
@@ -880,7 +1027,8 @@ fn skip_reason(family: Family, name: &str) -> Option<&'static str> {
 impl FolderMap for Checkpoint {
     type Step = Step;
 
-    const MODEL_TYPES: &'static [&'static str] = &["qwen4_exp", "qwen3_5_moe"];
+    const MODEL_TYPES: &'static [&'static str] =
+        &["qwen4_exp", "qwen3_5_moe", "qwen3_5", "qwen3_5_text"];
 
     fn parse(config: &Json) -> Result<Self, crate::folder::Error> {
         Ok(Checkpoint::parse(config)?)
@@ -941,6 +1089,19 @@ impl FolderMap for Checkpoint {
         plan: &hf::quant_config::Plan,
         kvs: &[(String, Value)],
     ) -> Result<Option<(gguf::Split, Vec<folder::Planned>)>, crate::folder::Error> {
+        if !self.geometry.family.reads_draft() {
+            return match files.names().find(|n| n.starts_with("mtp.")) {
+                Some(name) => Err(refuse(
+                    name,
+                    format!(
+                        "a next-token layer, which the {} map does not read",
+                        self.geometry.family.label()
+                    ),
+                )
+                .into()),
+                None => Ok(None),
+            };
+        }
         folder::mtp(path, self, (files, plan), kvs)
     }
 }
@@ -1067,7 +1228,17 @@ fn map<'a>(
         }
         let short = name
             .strip_prefix(if draft { "mtp." } else { g.family.text() })
-            .ok_or_else(|| refuse(name, format!("not a {} tensor", g.family.label())))?;
+            .ok_or_else(|| {
+                refuse(
+                    name,
+                    if name.contains(".mtp.") {
+                        "a next-token layer under the text prefix; this map knows `mtp.` names only"
+                            .to_string()
+                    } else {
+                        format!("not a {} tensor", g.family.label())
+                    },
+                )
+            })?;
         let mixer = |rest: &str| match rest {
             "hc_norm.weight" => Some((Plain::F32, vec![Step::PlusOne])),
             "input_mix_weight_down.weight" | "input_mix_weight_up.weight" => {
@@ -1076,8 +1247,8 @@ fn map<'a>(
             _ => None,
         };
         // Qwen3.8's output norm is its hyper-connection mix, below.
-        if let Some((to, plain)) = trunk::global(short)
-            .filter(|_| g.family == Family::Qwen36 || short == "embed_tokens.weight")
+        if let Some((to, plain)) =
+            trunk::global(short).filter(|_| g.family.mlx() || short == "embed_tokens.weight")
         {
             put(to, one(Use::Matrix(plain), vec![], dims()))?;
             continue;
@@ -1262,13 +1433,15 @@ fn layer(
         Ok(vec![(to, mapped(plain, steps, dims.clone()))])
     };
     let qk = 2 * g.k_heads * g.head_k;
-    let (exp, q36) = (g.family == Family::Qwen38, g.family == Family::Qwen36);
+    let (exp, mlx, routed) = (
+        g.family == Family::Qwen38,
+        g.family.mlx(),
+        g.family.ffn() == trunk::Ffn::Routed,
+    );
     // The conv taps as `[kernel, channels]`.
     let taps = || -> Result<Vec<u64>, Error> {
-        match (g.family, shape) {
-            (Family::Qwen38, &[c, 1, k]) | (Family::Qwen36, &[c, k, 1]) => {
-                Ok(vec![k as u64, c as u64])
-            }
+        match (exp, shape) {
+            (true, &[c, 1, k]) | (false, &[c, k, 1]) => Ok(vec![k as u64, c as u64]),
             _ => Err(refuse(
                 name,
                 format!(
@@ -1324,7 +1497,7 @@ fn layer(
             _ => Err(refuse(name, "not a hyper-connection tensor")),
         };
     }
-    // Both families store the gated delta-rule's V heads grouped by K head (mlx-lm repeats a K
+    // Every family stores the gated delta-rule's V heads grouped by K head (mlx-lm repeats a K
     // head over its V heads in place, `gated_delta.py`), which the program reads tiled.
     let v = |from: usize, head: usize| vec![Step::VRows { from, head }];
     // An HF checkpoint stores a norm gamma `x` and the program reads `x + 1`; an MLX file stores
@@ -1340,10 +1513,16 @@ fn layer(
         };
         return one(to, plain, steps);
     }
-    if let Some((to, plain)) = trunk::router(l, rest) {
+    // The block: a routed layer's router (its experts and shared expert are below), or the dense
+    // layer's three projections.
+    let ffn = match g.family.ffn() {
+        trunk::Ffn::Routed => trunk::router(l, rest),
+        trunk::Ffn::Dense => trunk::dense_ffn(l, rest),
+    };
+    if let Some((to, plain)) = ffn {
         return one(to, plain, vec![]);
     }
-    if q36 && let Some((to, plain)) = trunk::block_norms(l, rest, post_attention_norm) {
+    if mlx && let Some((to, plain)) = trunk::block_norms(l, rest, post_attention_norm) {
         return one(to, plain, vec![]);
     }
     match rest {
@@ -1363,7 +1542,7 @@ fn layer(
         ),
         "linear_attn.conv1d.weight" => {
             // Qwen3.6's taps arrive `[channels, kernel, 1]`, Qwen3.8's `[channels, 1, kernel]`.
-            let mut steps = if q36 { vec![Step::Squeeze] } else { vec![] };
+            let mut steps = if mlx { vec![Step::Squeeze] } else { vec![] };
             steps.extend(v(qk, g.head_v));
             Ok(vec![(
                 names::ssm_conv1d(l),
@@ -1404,16 +1583,22 @@ fn layer(
                 (names::indexer_k_proj(l), part(g.indexer_q..rows)),
             ])
         }
-        "mlp.shared_expert_gate.weight" => match *shape {
+        "mlp.shared_expert_gate.weight" if routed => match *shape {
             [1, n] => Ok(vec![(
                 names::ffn_gate_inp_shexp(l),
                 mapped(Plain::Bf16, vec![], vec![n as u64]),
             )]),
             _ => Err(refuse(name, format!("{shape:?} is not one gate row"))),
         },
-        "mlp.shared_expert.gate_proj.weight" => one(names::ffn_gate_shexp(l), Plain::Q8_0, vec![]),
-        "mlp.shared_expert.up_proj.weight" => one(names::ffn_up_shexp(l), Plain::Q8_0, vec![]),
-        "mlp.shared_expert.down_proj.weight" => one(names::ffn_down_shexp(l), Plain::Q8_0, vec![]),
+        "mlp.shared_expert.gate_proj.weight" if routed => {
+            one(names::ffn_gate_shexp(l), Plain::Q8_0, vec![])
+        }
+        "mlp.shared_expert.up_proj.weight" if routed => {
+            one(names::ffn_up_shexp(l), Plain::Q8_0, vec![])
+        }
+        "mlp.shared_expert.down_proj.weight" if routed => {
+            one(names::ffn_down_shexp(l), Plain::Q8_0, vec![])
+        }
         "ple.key_proj.weight" if exp => one(names::ple_key(l), Plain::Q8_0, vec![]),
         "ple.value_proj.weight" if exp => one(names::ple_value(l), Plain::Q8_0, vec![]),
         "ple.norm_key.weight" if exp => {
@@ -1574,6 +1759,9 @@ impl Step {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod dense_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2230,7 +2418,10 @@ mod tests {
         let union = |a: &Fields, b: &Fields| -> Vec<(&'static str, schema::Rule)> {
             a.iter().chain(b).copied().collect()
         };
-        let (root, text) = (union(ROOT_SHARED, ROOT_38), union(TEXT_SHARED, TEXT_38));
+        let (root, text) = (
+            union(ROOT_SHARED, ROOT_38),
+            union(&union(TEXT_SHARED, SHARED_EXPERT), TEXT_38),
+        );
         let objects = [
             ("", &root[..]),
             ("/text_config", &text[..]),

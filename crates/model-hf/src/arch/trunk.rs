@@ -1,12 +1,13 @@
-//! What the Qwen mixture-of-experts maps read the same way: a text model of grouped-query
-//! attention with per-head query and key norms over a router and routed experts. Its
-//! `config.json` keys and counts ([`KEYS`], [`COUNTS`], [`check_counts`]), the header keys they
-//! make ([`metadata`]), and the program's tensor and role of each checkpoint tensor that every
-//! map names alike: the attention block ([`attention`]), the block norms ([`block_norms`]), the
-//! router ([`router`]), a layer's stacked routed experts ([`stacked_experts`]) and the
-//! model-level tensors ([`global`]), and the check that a tensor has values ([`sized`]). A map keeps what its architecture adds (the gated delta
-//! rule, the shared expert, the hyper-connections) and the steps that move a tensor into the
-//! program's layout.
+//! What the Qwen maps read the same way: a text model of grouped-query attention with per-head
+//! query and key norms over a feed-forward block, routed or dense ([`Ffn`]). Its `config.json`
+//! keys and counts ([`KEYS`], [`COUNTS`], [`Ffn::keys`], [`Ffn::counts`], [`check_counts`]), the
+//! header keys they make ([`metadata`]), and the program's tensor and role of each checkpoint
+//! tensor that every map names alike: the attention block ([`attention`]), the block norms
+//! ([`block_norms`]), the router ([`router`]), a layer's stacked routed experts
+//! ([`stacked_experts`]), a layer's dense block ([`dense_ffn`]) and the model-level tensors
+//! ([`global`]), and the check that a tensor has values ([`sized`]). A map keeps what its
+//! architecture adds (the gated delta rule, the shared expert, the hyper-connections) and the
+//! steps that move a tensor into the program's layout.
 
 use gguf::Value;
 use hf::modelopt::Plain;
@@ -22,10 +23,7 @@ pub(super) const KEYS: &Fields = &[
     ("hidden_size", Read),
     ("num_attention_heads", Read),
     ("num_key_value_heads", Read),
-    ("num_experts", Read),
-    ("num_experts_per_tok", Read),
     ("head_dim", Read),
-    ("moe_intermediate_size", Read),
     ("rms_norm_eps", Read),
     // hf::vocab::Config's.
     ("vocab_size", Read),
@@ -34,7 +32,7 @@ pub(super) const KEYS: &Fields = &[
     ("pad_token_id", Read),
     ("unk_token_id", Read),
     ("sep_token_id", Read),
-    // The routed experts' SwiGLU.
+    // The feed-forward block's SwiGLU, routed or dense.
     ("hidden_act", Only(r#"["silu"]"#)),
     ("attention_bias", Only("[false]")),
     ("tie_word_embeddings", Only("[false]")),
@@ -80,22 +78,64 @@ pub(super) const COUNTS: &[&str] = &[
     "hidden_size",
     "num_attention_heads",
     "num_key_value_heads",
-    "num_experts",
-    "num_experts_per_tok",
     "head_dim",
-    "moe_intermediate_size",
 ];
 
-/// The counts [`COUNTS`] names hold together: the query heads group by the key heads, and a token
-/// keeps no more experts than the layer routes over. `n` is a count by its key.
+/// The feed-forward block a trunk map's layers hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ffn {
+    /// A router over `num_experts` experts, `num_experts_per_tok` of them kept a token, each of
+    /// `moe_intermediate_size`.
+    Routed,
+    /// One SwiGLU block of `intermediate_size`: `mlp.{gate,up,down}_proj`, the program's
+    /// `ffn_{gate,up,down}`.
+    Dense,
+}
+
+/// The `config.json` keys of a routed block, beside [`KEYS`].
+const ROUTED_KEYS: &Fields = &[
+    ("num_experts", Read),
+    ("num_experts_per_tok", Read),
+    ("moe_intermediate_size", Read),
+];
+
+/// The `config.json` key of a dense block, beside [`KEYS`].
+const DENSE_KEYS: &Fields = &[("intermediate_size", Read)];
+
+impl Ffn {
+    /// The `config.json` keys of the block beside [`KEYS`].
+    pub fn keys(self) -> &'static Fields {
+        match self {
+            Ffn::Routed => ROUTED_KEYS,
+            Ffn::Dense => DENSE_KEYS,
+        }
+    }
+
+    /// The counts of [`Ffn::keys`]: each a positive u32.
+    pub fn counts(self) -> &'static [&'static str] {
+        match self {
+            Ffn::Routed => &[
+                "num_experts",
+                "num_experts_per_tok",
+                "moe_intermediate_size",
+            ],
+            Ffn::Dense => &["intermediate_size"],
+        }
+    }
+}
+
+/// The counts [`COUNTS`] and [`Ffn::counts`] name hold together: the query heads group by the
+/// key heads, and a routed token keeps no more experts than the layer routes over. `n` is a count
+/// by its key.
 pub(super) fn check_counts<E: From<String>>(
     c: &Section<'_, E>,
+    ffn: Ffn,
     n: impl Fn(&str) -> u32,
 ) -> Result<(), E> {
     if !n("num_attention_heads").is_multiple_of(n("num_key_value_heads")) {
         return Err(c.bad("num_attention_heads", "must group by num_key_value_heads"));
     }
-    if n("num_experts_per_tok") > n("num_experts") {
+    if ffn == Ffn::Routed && n("num_experts_per_tok") > n("num_experts") {
         return Err(c.bad("num_experts_per_tok", "exceeds num_experts"));
     }
     Ok(())
@@ -103,14 +143,16 @@ pub(super) fn check_counts<E: From<String>>(
 
 /// The header keys, under the architecture's name, that the counts and two numbers of the config
 /// make for every trunk map: the layers and the context, the widths, the heads, the rope's base
-/// and the norms' epsilon, the experts a layer routes over and a token keeps.
+/// and the norms' epsilon, and the block's: the experts a routed layer routes over and a token
+/// keeps with their width, or a dense layer's width.
 pub(super) fn metadata(
     n: impl Fn(&str) -> u32,
+    ffn: Ffn,
     rope_base: f32,
     rms_eps: f32,
 ) -> Vec<(String, Value)> {
     let count = |key: &str, from: &str| (key.to_string(), Value::U32(n(from)));
-    vec![
+    let mut keys = vec![
         count("block_count", "num_hidden_layers"),
         count("context_length", "max_position_embeddings"),
         count("embedding_length", "hidden_size"),
@@ -121,12 +163,22 @@ pub(super) fn metadata(
             "attention.layer_norm_rms_epsilon".to_string(),
             Value::F32(rms_eps),
         ),
-        count("expert_count", "num_experts"),
-        count("expert_used_count", "num_experts_per_tok"),
+    ];
+    if ffn == Ffn::Routed {
+        keys.extend([
+            count("expert_count", "num_experts"),
+            count("expert_used_count", "num_experts_per_tok"),
+        ]);
+    }
+    keys.extend([
         count("attention.key_length", "head_dim"),
         count("attention.value_length", "head_dim"),
-        count("expert_feed_forward_length", "moe_intermediate_size"),
-    ]
+    ]);
+    keys.push(match ffn {
+        Ffn::Routed => count("expert_feed_forward_length", "moe_intermediate_size"),
+        Ffn::Dense => count("feed_forward_length", "intermediate_size"),
+    });
+    keys
 }
 
 /// Whether `shape` names a tensor of at least one value, whose count fits `usize`.
@@ -170,6 +222,17 @@ pub(super) fn block_norms(
 /// The program's router of the checkpoint tensor `rest` of layer `l`.
 pub(super) fn router(l: usize, rest: &str) -> Option<(String, Plain)> {
     (rest == "mlp.gate.weight").then(|| (common::ffn_gate_inp(l), Plain::Bf16))
+}
+
+/// The program's dense block of the checkpoint tensor `rest` of layer `l`: the SwiGLU's gate, up
+/// and down projections.
+pub(super) fn dense_ffn(l: usize, rest: &str) -> Option<(String, Plain)> {
+    Some(match rest {
+        "mlp.gate_proj.weight" => (common::ffn_gate(l), Plain::Q8_0),
+        "mlp.up_proj.weight" => (common::ffn_up(l), Plain::Q8_0),
+        "mlp.down_proj.weight" => (common::ffn_down(l), Plain::Q8_0),
+        _ => return None,
+    })
 }
 
 /// The program's routed experts of the checkpoint tensor `rest` of layer `l` when the folder
@@ -260,6 +323,18 @@ mod tests {
             router(3, "mlp.gate.weight"),
             Some(("blk.3.ffn_gate_inp.weight".to_string(), Plain::Bf16))
         );
+        for (rest, to) in [
+            ("mlp.gate_proj.weight", "blk.3.ffn_gate.weight"),
+            ("mlp.up_proj.weight", "blk.3.ffn_up.weight"),
+            ("mlp.down_proj.weight", "blk.3.ffn_down.weight"),
+        ] {
+            assert_eq!(
+                dense_ffn(3, rest),
+                Some((to.to_string(), Plain::Q8_0)),
+                "{rest}"
+            );
+            assert_eq!(router(3, rest), None, "{rest}");
+        }
         assert_eq!(
             global("embed_tokens.weight"),
             Some(("token_embd.weight".to_string(), Plain::Q8_0))
@@ -274,13 +349,16 @@ mod tests {
             "linear_attn.in_proj_qkv.weight",
             "mlp.shared_expert_gate.weight",
             "mlp.gate.bias",
+            "mlp.gate_proj.bias",
         ] {
             assert_eq!(attention(3, rest), None, "{rest}");
             assert_eq!(block_norms(3, rest, ffn), None, "{rest}");
             assert_eq!(router(3, rest), None, "{rest}");
+            assert_eq!(dense_ffn(3, rest), None, "{rest}");
             assert!(stacked_experts(3, rest, &[8, 4, 4], 8).is_none(), "{rest}");
         }
         assert_eq!(global("layers.0.mlp.gate.weight"), None);
+        assert_eq!(dense_ffn(3, "mlp.switch_mlp.gate_proj.weight"), None);
     }
 
     /// A shape has values when no dim is zero and their product fits `usize`.
@@ -337,7 +415,7 @@ mod tests {
         let json = serde_json::json!({});
         let c = Section::<Why>::new(&json, "config.json").unwrap();
         let with = |heads: u32, kv: u32, experts: u32, used: u32| {
-            check_counts(&c, |key| match key {
+            check_counts(&c, Ffn::Routed, |key| match key {
                 "num_attention_heads" => heads,
                 "num_key_value_heads" => kv,
                 "num_experts" => experts,
@@ -345,6 +423,21 @@ mod tests {
                 other => panic!("{other}"),
             })
         };
+        // A dense block has no experts to count: asking for one panics.
+        let dense = |heads: u32, kv: u32| {
+            check_counts(&c, Ffn::Dense, |key| match key {
+                "num_attention_heads" => heads,
+                "num_key_value_heads" => kv,
+                other => panic!("{other}"),
+            })
+        };
+        assert_eq!(dense(24, 4), Ok(()));
+        assert_eq!(
+            dense(24, 5),
+            Err(Why(
+                "config.json.num_attention_heads must group by num_key_value_heads".into()
+            ))
+        );
         assert_eq!(with(32, 4, 128, 8), Ok(()));
         assert_eq!(
             with(32, 5, 128, 8),
@@ -377,6 +470,7 @@ mod tests {
                 "moe_intermediate_size" => 768,
                 other => panic!("{other}"),
             },
+            Ffn::Routed,
             1.0e7,
             1.0e-6,
         );
@@ -392,6 +486,59 @@ mod tests {
             get("attention.layer_norm_rms_epsilon"),
             Some(Value::F32(1.0e-6))
         );
-        assert_eq!(COUNTS.len(), 9);
+        assert_eq!(COUNTS.len() + Ffn::Routed.counts().len(), 9);
+    }
+
+    /// A dense block's header keys are the common ones and its width as `feed_forward_length`:
+    /// no expert key, and no count of one is asked for.
+    #[test]
+    fn a_dense_block_makes_its_width_key_and_no_expert_key() {
+        let keys = metadata(
+            |key| match key {
+                "num_hidden_layers" => 64,
+                "max_position_embeddings" => 262_144,
+                "hidden_size" => 5120,
+                "num_attention_heads" => 24,
+                "num_key_value_heads" => 4,
+                "head_dim" => 256,
+                "intermediate_size" => 17_408,
+                other => panic!("{other}"),
+            },
+            Ffn::Dense,
+            1.0e7,
+            1.0e-6,
+        );
+        let get = |key: &str| keys.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert_eq!(keys.len(), 10);
+        assert_eq!(get("feed_forward_length"), Some(Value::U32(17_408)));
+        assert_eq!(get("block_count"), Some(Value::U32(64)));
+        assert_eq!(get("attention.key_length"), Some(Value::U32(256)));
+        for key in [
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+        ] {
+            assert_eq!(get(key), None, "{key}");
+        }
+        assert_eq!(COUNTS.len() + Ffn::Dense.counts().len(), 7);
+    }
+
+    /// Every count a table names is a key the table reads, so a count the maps ask for is one
+    /// the schema lets through.
+    #[test]
+    fn every_count_is_a_read_key_of_its_table() {
+        for (keys, counts) in [
+            (KEYS, COUNTS),
+            (Ffn::Routed.keys(), Ffn::Routed.counts()),
+            (Ffn::Dense.keys(), Ffn::Dense.counts()),
+        ] {
+            for count in counts {
+                assert!(
+                    keys.iter()
+                        .any(|(key, rule)| key == count && matches!(rule, Read)),
+                    "{count}"
+                );
+            }
+        }
     }
 }

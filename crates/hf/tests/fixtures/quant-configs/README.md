@@ -24,6 +24,8 @@ Bolt's two files list 27,921 modules (15 MB); they are cut to the first module o
 | `mlx-community/Qwen3.6-35B-A3B-4bit` | (the folder on the M4 Pro; no revision recorded) | MLX affine 4-bit g64, 8-bit router and shared-expert gates |
 | `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` | `e9675aa3ca5f900ccef55267914466d55ab325fa` | MLX affine 4-bit g64, the `quantization` block names no `mode`, 8-bit routers |
 | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | `6e302ea604ad9ab206367e2c501d1571023e7b6d` | MLX affine 4-bit g64, the `quantization` block names no `mode`, 8-bit routers; its config names `qkv_bias`, `use_qk_norm` and `shared_expert_intermediate_size` |
+| `mlx-community/Qwen3.8-27B-4bit` | `10c35caafbb80f7dc6a7a432cdd11af10a6d4818` | MLX affine 4-bit g64, one `quantization` block with no entry of a module; `lmstudio-community/Qwen3.8-27B-MLX-4bit` at `6067b15cf581666a4aecf6af3afaba4bb5efc20c` has the same `config.json` byte for byte |
+| `mlx-community/Qwen3.6-27B-4bit` | `c000ac2c2057d94be3fa931000c31723aac53282` | the same quantization; its config lacks the top level's sampling keys (`do_sample`, `temperature`, `top_k`, `top_p`, `generation_config`) |
 
 `bloomery__qwen3moe-mlx-fixture__config.json.gz` is the `config.json` of the MLX-format fixture folder `tools/mlx-fixture.py make` writes from the qwen3moe GGUF fixture (the Qwen3-30B-A3B config above cut to four layers and their quantization entries, no `mode` key), unchanged.
 
