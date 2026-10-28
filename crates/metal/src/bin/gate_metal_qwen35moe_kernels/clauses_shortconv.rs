@@ -490,7 +490,7 @@ pub fn shortconv_nan(h: &Harness<'_>) -> Clause {
     only(&y, 9, "a NaN C")?;
 
     // A weight that is not finite.
-    let mut bad_w = w.clone();
+    let mut bad_w = w;
     bad_w[7 * taps + 3] = f32::INFINITY;
     let bad_w_b = device.upload(stream, &bad_w).map_err(why)?;
     let (y, _) = step_from(h, conv, &bad_w_b, &state, &row, &pos)?;
@@ -508,7 +508,7 @@ pub fn shortconv_nan(h: &Harness<'_>) -> Clause {
     let chunk = rows_of(8, 0x5CC3);
     let clean_rows = rows_from(h, conv, &w_b, &state, &chunk, 10)?;
     common::expect_clean(h, "the clean chunk")?;
-    let mut bad_chunk = chunk.clone();
+    let mut bad_chunk = chunk;
     bad_chunk[3 * 3 * HIDDEN + 2 * HIDDEN + 50] = f32::NAN;
     let rows = rows_from(h, conv, &w_b, &state, &bad_chunk, 10)?;
     common::expect_fault(h, "a NaN x in a chunk", FaultSite::LinearConv)?;
@@ -1029,7 +1029,7 @@ pub fn sandwich_nan(h: &Harness<'_>) -> Clause {
         return Err("an infinite epsilon left a stream element that is not NaN".to_string());
     }
 
-    let mut bad_gain = gain.clone();
+    let mut bad_gain = gain;
     bad_gain[11] = f32::INFINITY;
     let y = run(&clean, &bad_gain, eps)?;
     common::expect_fault(h, "an infinite gain", FaultSite::NormQuant)?;
