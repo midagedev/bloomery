@@ -1296,7 +1296,7 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         q_gain: vec![1e5; attn.head],
         k_gain: tables.k_gain.clone(),
         rope: tables.rope.clone(),
-        note: tables.note.clone(),
+        note: tables.note,
     };
     let inp = attn_inputs(attn, case.rows)?;
     let pre = attn_prefill_run(h, &big, &case, &inp, PREFILL_CTX)?;

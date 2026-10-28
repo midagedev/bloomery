@@ -310,7 +310,7 @@ fn check_seg(p: &GemmSegParams<'_>) -> Result<Shape, DeviceError> {
             )));
         }
         if s.rows == 0 {
-            return Err(refuse(format!("segment {i} has no rows").to_string()));
+            return Err(refuse(format!("segment {i} has no rows")));
         }
     }
     if !cols.is_multiple_of(p.quant.values_per_block()) {

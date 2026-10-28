@@ -265,7 +265,7 @@ fn check_ids(r: &RouterGeom, name: &str, out: &Out, step: &Step) -> Result<&'sta
             .iter()
             .map(|id| *id as usize)
             .collect();
-        let mut want = ranking.ids.clone();
+        let mut want = ranking.ids;
         got.sort_unstable();
         want.sort_unstable();
         if got != want {
