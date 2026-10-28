@@ -234,11 +234,18 @@ pub const Q30_MUTANTS: &[Mutant] = &[
         name: "attn_gate_ungated",
         clause: "attn_f16",
         why: "a query with no gate still multiplies the attention by the sigmoid of the value past its head",
-        edits: &[(
-            "#if ATTN_GATE\n            float g = attn_gate_value(gate_src, head, dim0 + d);",
-            "#if 1\n            float g = attn_gate_value(gate_src, head, dim0 + d);",
-            1,
-        )],
+        edits: &[
+            (
+                "#if BLOOMERY_ATTN_GATED\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+                "#if 1\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+                1,
+            ),
+            (
+                "#if ATTN_GATE\n            float gated = attn * attn_sigmoid(g);",
+                "#if 1\n            float gated = attn * attn_sigmoid(g);",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "routed_group_past_routed_open",
@@ -429,13 +436,29 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         name: "head_gate_per_channel",
         clause: "attn_head_gate",
         why: "the gate is read per channel, as the packed gate is, from a buffer that holds one value a head",
-        edits: &[("return src[head];", "return src[dim];", 1)],
+        edits: &[
+            ("float g = q[head];", "float g = q[dim0 + d];", 1),
+            ("float gate = q[head];", "float gate = q[dim];", 1),
+            (
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + dim];",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "head_gate_next_head",
         clause: "attn_head_gate",
         why: "head h is gated by head h + 1's value",
-        edits: &[("return src[head];", "return src[head + 1u];", 1)],
+        edits: &[
+            ("float g = q[head];", "float g = q[head + 1u];", 1),
+            ("float gate = q[head];", "float gate = q[head + 1u];", 1),
+            (
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head + 1u];",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "head_gate_no_sigmoid_s1",
@@ -472,8 +495,8 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         clause: "attn_head_gate",
         why: "every row of the rows launch is gated by the first row's values",
         edits: &[(
-            "ATTN_HGATE(row), partials + row * partials_stride,",
-            "ATTN_HGATE(0u), partials + row * partials_stride,",
+            "ATTN_HGATE_ACTUAL(row) partials + row * partials_stride,",
+            "ATTN_HGATE_ACTUAL(0u) partials + row * partials_stride,",
             1,
         )],
     },
@@ -482,8 +505,8 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         clause: "attn_head_gate",
         why: "every row of the prompt pass is gated by the first row's values",
         edits: &[(
-            "device float const *gate_row = hgate + (ulong)row * BLOOMERY_ATTN_Q;",
-            "device float const *gate_row = hgate;",
+            "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
+            "float g = hgate[head];",
             1,
         )],
     },
@@ -1374,8 +1397,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "norm_rows",
         why: "every row of the chunk takes row 0's sum of squares, so row 0's scale",
         edits: &[(
-            "        float4 xv = norm_rows_load4(xr, f4);",
-            "        float4 xv = norm_rows_load4(x, f4);",
+            "const uint f4s = args.cols / 4u;\n\n    float sum_sq = 0.f;\n    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n        float4 xv = norm_rows_load4(xr, f4);",
+            "const uint f4s = args.cols / 4u;\n\n    float sum_sq = 0.f;\n    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n        float4 xv = norm_rows_load4(x, f4);",
             1,
         )],
     },
@@ -1518,8 +1541,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "norm_rows_nan",
         why: "a row the norm cannot take is written as zeros, not NaN",
         edits: &[(
-            "*((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
-            "*((device float4 *)(yr + f4 * 4u)) = float4(0.f);",
+            "norm_rows_raise(faults, args.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
+            "norm_rows_raise(faults, args.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(0.f);",
             1,
         )],
     },
@@ -1527,7 +1550,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "sandwich_no_norm",
         clause: "sandwich",
         why: "the post norm is skipped: the stream takes the sub-layer's output as it is, a plain add",
-        edits: &[("+ add * value;", "+ norm_rows_load4(xr, f4);", 1)],
+        edits: &[("+ args.add * value;", "+ norm_rows_load4(xr, f4);", 1)],
     },
     Mutant {
         name: "sandwich_no_gain",
@@ -1539,15 +1562,15 @@ pub const MUTANTS: &[Mutant] = &[
         name: "sandwich_add_ignored",
         clause: "sandwich",
         why: "the add scale is ignored: the normed value is always added once",
-        edits: &[("+ add * value;", "+ value;", 1)],
+        edits: &[("+ args.add * value;", "+ value;", 1)],
     },
     Mutant {
         name: "sandwich_nan_stays",
         clause: "sandwich_nan",
         why: "a row the norm cannot take leaves the stream's row as it was, a finite value, not NaN",
         edits: &[(
-            "*((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
-            "*((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4);",
+            "norm_rows_raise(faults, args.norm.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
+            "norm_rows_raise(faults, args.norm.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4);",
             1,
         )],
     },

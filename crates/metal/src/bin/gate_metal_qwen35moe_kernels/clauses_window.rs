@@ -677,10 +677,10 @@ fn check(
     }
     for r in 0..case.rows {
         for kv in 0..attn.kv_heads {
-            expect_appended(attn, tables, inp, &seen.cache, r, case.from + r, kv).map_err(&at)?;
+            expect_appended(attn, tables, inp, &seen.cache, r, case.from + r, kv).map_err(at)?;
         }
     }
-    expect_untouched(attn, case, planted, &seen.cache).map_err(&at)?;
+    expect_untouched(attn, case, planted, &seen.cache).map_err(at)?;
     let end = case.from + case.rows;
     let rows_of = |dequant: fn(&AttnGeom, &CacheBack, usize, usize, usize) -> Vec<f32>| {
         (0..attn.kv_heads)

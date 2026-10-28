@@ -90,12 +90,13 @@ inline bool rms_usable(float sum_squares, float scale)
 // a narrower operand arm converts from it.
 //
 // The sandwich residual is this norm with a different store: norm_add_rows
-// runs the same body and adds the row's value into the residual stream, y +=
+// runs the same sums and adds the row's value into the residual stream, y +=
 // add · ((x · gain) · scale), in place (x is the sub-layer's output, y the
-// stream). The norm's sums are the same code, so the value added is the bits
-// norm_rows writes; the multiply by `add` and the add each round once. A row
-// the norm cannot take poisons the stream's row with NaN, as it poisons the
-// plain norm's output.
+// stream). Its sums are norm_rows' in the same order, so the value added is
+// the bits norm_rows writes; the multiply by `add` and the add each round
+// once. A row the norm cannot take poisons the stream's row with NaN, as it
+// poisons the plain norm's output. norm_rows itself is not touched by it: its
+// program is the plain norm's alone.
 
 #define NORM_ROWS_SG BLOOMERY_ROUTER_SG
 #define NORM_ROWS_THREADS (BLOOMERY_ROUTER_LANES * BLOOMERY_ROUTER_SG)
@@ -137,21 +138,17 @@ inline void norm_rows_raise(device atomic_uint *word, uint layer)
     raise(word, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
 }
 
-// The norm of one row, one threadgroup. SANDWICH stores into the residual
-// stream: y += add · value, in place; the plain norm stores the value.
-template <bool SANDWICH>
-static void norm_rows_body(device const float *x,
-                           device const float *gain,
-                           device float *y,
-                           constant NormRowsArgs &args,
-                           float add,
-                           device atomic_uint *faults,
-                           uint row,
-                           uint tid,
-                           uint lane,
-                           uint sg,
-                           threadgroup float *tg_sums)
+kernel void norm_rows(device const float *x [[buffer(0)]],
+                      device const float *gain [[buffer(1)]],
+                      device float *y [[buffer(2)]],
+                      constant NormRowsArgs &args [[buffer(3)]],
+                      device atomic_uint *faults [[buffer(4)]],
+                      uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]])
 {
+    threadgroup float tg_sums[NORM_ROWS_SG];
     device const float *xr = x + row * args.x_stride;
     device float *yr = y + row * args.y_stride;
     const uint f4s = args.cols / 4u;
@@ -185,31 +182,18 @@ static void norm_rows_body(device const float *x,
     for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
         float4 value = norm_rows_value(norm_rows_load4(xr, f4), norm_rows_load4(gain, f4), scale);
         bad = bad || !all(isfinite(value));
-        if constexpr (SANDWICH) {
-            *((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4) + add * value;
-        } else {
-            *((device float4 *)(yr + f4 * 4u)) = value;
-        }
+        *((device float4 *)(yr + f4 * 4u)) = value;
     }
     if (bad) {
         norm_rows_raise(faults, args.layer);
     }
 }
 
-kernel void norm_rows(device const float *x [[buffer(0)]],
-                      device const float *gain [[buffer(1)]],
-                      device float *y [[buffer(2)]],
-                      constant NormRowsArgs &args [[buffer(3)]],
-                      device atomic_uint *faults [[buffer(4)]],
-                      uint row [[threadgroup_position_in_grid]],
-                      uint tid [[thread_position_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]],
-                      uint sg [[simdgroup_index_in_threadgroup]])
-{
-    threadgroup float tg_sums[NORM_ROWS_SG];
-    norm_rows_body<false>(x, gain, y, args, 0.f, faults, row, tid, lane, sg, tg_sums);
-}
-
+// The sandwich residual: the norm's row, added into the residual stream, y +=
+// add · value, in place. The sums are norm_rows' in the same order (the same
+// loads, the same simd_sum, the groups' shares in group order, the same
+// `rms_scale`), so `value` is the bits norm_rows writes; the sandwich clause
+// holds the two equal.
 kernel void norm_add_rows(device const float *x [[buffer(0)]],
                           device const float *gain [[buffer(1)]],
                           device float *y [[buffer(2)]],
@@ -221,5 +205,42 @@ kernel void norm_add_rows(device const float *x [[buffer(0)]],
                           uint sg [[simdgroup_index_in_threadgroup]])
 {
     threadgroup float tg_sums[NORM_ROWS_SG];
-    norm_rows_body<true>(x, gain, y, args.norm, args.add, faults, row, tid, lane, sg, tg_sums);
+    device const float *xr = x + row * args.norm.x_stride;
+    device float *yr = y + row * args.norm.y_stride;
+    const uint f4s = args.norm.cols / 4u;
+
+    float sum_sq = 0.f;
+    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+        float4 xv = norm_rows_load4(xr, f4);
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+    }
+    sum_sq = simd_sum(sum_sq);
+    if (lane == 0u) {
+        tg_sums[sg] = sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.f;
+    for (uint g = 0u; g < NORM_ROWS_SG; ++g) {
+        total += tg_sums[g];
+    }
+    const float scale = rms_scale(total, args.norm.cols, args.norm.eps);
+
+    if (!rms_usable(total, scale)) {
+        if (tid == 0u) {
+            norm_rows_raise(faults, args.norm.layer);
+        }
+        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+            *((device float4 *)(yr + f4 * 4u)) = float4(NAN);
+        }
+        return;
+    }
+    bool bad = false;
+    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+        float4 value = norm_rows_value(norm_rows_load4(xr, f4), norm_rows_load4(gain, f4), scale);
+        bad = bad || !all(isfinite(value));
+        *((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4) + args.add * value;
+    }
+    if (bad) {
+        norm_rows_raise(faults, args.norm.layer);
+    }
 }

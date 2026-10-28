@@ -26,6 +26,8 @@ use super::{ClauseRun, Harness};
 
 /// The channels of the mixer the clauses launch at.
 const HIDDEN: usize = 2048;
+/// One row of the in_proj output `B | C | x`.
+const BCX_ROW: usize = 3 * HIDDEN;
 
 /// The conv widths the clauses cover: LFM3's and LFM2.5's.
 const TAPS: [usize; 2] = [7, 3];
@@ -242,7 +244,7 @@ pub fn shortconv_rows(h: &Harness<'_>) -> Clause {
                 let bcx = rows_of(rows, seed + 1 + i as u64);
                 let y = launch_rows(h, conv, &w_b, &mut ring, 0, &bcx, pos as u32)?;
                 common::expect_clean(h, "a chunk")?;
-                for row in bcx.chunks_exact(3 * HIDDEN) {
+                for row in bcx.as_chunks::<BCX_ROW>().0 {
                     seq.push(row)?;
                 }
                 let ratio = seq.fit_y(pos, &y).map_err(|e| {
@@ -292,7 +294,7 @@ pub fn shortconv_start(h: &Harness<'_>) -> Clause {
             return Err(format!("taps {taps}: a chunk at position 0 read the ring"));
         }
         let mut seq = Sequence::new(HIDDEN, taps, &w)?;
-        for row in bcx.chunks_exact(3 * HIDDEN) {
+        for row in bcx.as_chunks::<BCX_ROW>().0 {
             seq.push(row)?;
         }
         let chunk = seq.fit_y(0, &y_loud)?;
@@ -313,7 +315,7 @@ pub fn shortconv_start(h: &Harness<'_>) -> Clause {
             return Err(format!("taps {taps}: a step at position 0 read the ring"));
         }
         let mut step = 0.0f64;
-        for (s, row) in bcx4.chunks_exact(3 * HIDDEN).enumerate() {
+        for (s, row) in bcx4.as_chunks::<BCX_ROW>().0.iter().enumerate() {
             let mut one = Sequence::new(HIDDEN, taps, &w)?;
             one.push(row)?;
             step = step.max(one.fit_y(0, &step_loud[s * HIDDEN..(s + 1) * HIDDEN])?);
@@ -369,7 +371,7 @@ pub fn shortconv_state(h: &Harness<'_>) -> Clause {
         }
         let mut worst = 0.0f64;
         let mut lens = Vec::new();
-        for s in 0..slots {
+        for (s, seq) in seqs.iter_mut().enumerate() {
             let len = prompt_len(s, taps, ring_rows);
             lens.push(len);
             let first = len.div_ceil(2);
@@ -381,10 +383,10 @@ pub fn shortconv_state(h: &Harness<'_>) -> Clause {
                 let bcx = rows_of(rows, seed + 2 + 16 * s as u64 + i as u64);
                 let y = launch_rows(h, conv, &w_b, &mut ring, s * per, &bcx, pos as u32)?;
                 common::expect_clean(h, "a prompt chunk")?;
-                for row in bcx.chunks_exact(3 * HIDDEN) {
-                    seqs[s].push(row)?;
+                for row in bcx.as_chunks::<BCX_ROW>().0 {
+                    seq.push(row)?;
                 }
-                let ratio = seqs[s]
+                let ratio = seq
                     .fit_y(pos, &y)
                     .map_err(|e| format!("{case}, slot {s}, prompt chunk {i}: {e}"))?;
                 worst = worst.max(ratio);
@@ -404,7 +406,7 @@ pub fn shortconv_state(h: &Harness<'_>) -> Clause {
             let pos: Vec<u32> = lens.iter().map(|len| (len + i) as u32).collect();
             let y = launch_step(h, conv, &w_b, &mut ring, &bcx, &pos)?;
             common::expect_clean(h, "a decode step")?;
-            for (s, row) in bcx.chunks_exact(3 * HIDDEN).enumerate() {
+            for (s, row) in bcx.as_chunks::<BCX_ROW>().0.iter().enumerate() {
                 seqs[s].push(row)?;
                 let ratio = seqs[s]
                     .fit_y(lens[s] + i, &y[s * HIDDEN..(s + 1) * HIDDEN])
