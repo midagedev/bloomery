@@ -20,9 +20,9 @@
 //!
 //! The band is the card32 gate's: the card's relu² form and the host's differ by their
 //! activations' rounding and their sums' order alone, in the folder's NVFP4 planes as in the
-//! 32-value stacks, so the floor is [`COSINE_FLOOR`] and the argmax is held wherever the host
-//! arm's top-1 margin passes twice the max |Δ| [derived from that precedent, not tuned; the first
-//! box run prints each cosine beside the floor].
+//! 32-value stacks, so the floor is [`moe_arm::COSINE_FLOOR`] and the argmax is held wherever the
+//! host arm's top-1 margin passes twice the max |Δ| [derived from that precedent, not tuned; the
+//! first box run prints each cosine beside the floor].
 //!
 //! The clauses, each printing lines ending in PASS or FAIL (a step that raises the card's fault
 //! word is a FAIL naming the fault). A mutant that moves every arm's bits alike (a scale the map
@@ -41,10 +41,10 @@
 //!   or the clause fails as vacuous; its eager and replayed walks are bit-identical and its logits
 //!   keep the same floor and argmax band against the `host` arm's. Mutant (red): the same two.
 //! - `folder_prompt_near_steps` (self-consistency): on the `split` and `whole` arms, the prompt
-//!   path over the walk at passes of [`COLS`] rows and at the load's pass rows (the NVFP4 GEMMs at
-//!   both) keeps the same floor and argmax band against the arm's own steps. Mutant (red): the
-//!   prompt route's restore over the stack's scales given 1.0 while the step keeps them, or the
-//!   pass's relu² read as relu where the step reads relu².
+//!   path over the walk at passes of [`moe_arm::COLS`] rows and at the load's pass rows (the NVFP4
+//!   GEMMs at both) keeps the same floor and argmax band against the arm's own steps. Mutant
+//!   (red): the prompt route's restore over the stack's scales given 1.0 while the step keeps
+//!   them, or the pass's relu² read as relu where the step reads relu².
 //! - `folder_near_twin` (a diagnostic: it prints and decides nothing): the folder's last-position
 //!   logits on the `whole` arm against the twin's on its own whole placed load, over the same ids.
 //!   The two files round the same weights differently (NVFP4 against Q5_0, Q5_1 and Q8_0), so no
@@ -76,6 +76,14 @@ mod gate_card;
 #[cfg(feature = "gpu")]
 #[allow(
     dead_code,
+    reason = "the arm harness the card gates share; each takes the items it reads"
+)]
+#[path = "shared/nemotron_h_moe_arm.rs"]
+mod moe_arm;
+
+#[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
     reason = "the seats' folder open serves the gates too; the gate opens one folder and its model"
 )]
 #[path = "shared/serve_seats/folder.rs"]
@@ -85,19 +93,18 @@ mod folder;
 mod gate {
     use std::path::{Path, PathBuf};
 
-    use crate::e2e::{Run, argmax, cosine, fresh, max_delta, or_fault, same, second, walk};
+    use crate::e2e::{argmax, cosine, max_delta, walk};
+    use crate::moe_arm::{
+        CTX_SPARE, PROMPT_LEN, Premise, Words, arm, last_logits, near_host, prompt_arm,
+    };
     use crate::{folder, gate_card};
-    use bloomery_gpu::NemotronHMoeModel;
-    use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use gguf::Split;
     use model::arch::nemotron_h_moe::hparams::Hparams;
     use model::arch::nemotron_h_moe::place::{self as moe_place, Experts, Forms};
     use model::placement::PlanLevers;
     use model::placement::workstation::{self, CardSpec};
-
-    type Model = NemotronHMoeModel;
 
     const NAME: &str = "gate_nemotron_h_moe_folder";
 
@@ -109,68 +116,8 @@ mod gate {
     const PROMPT: &str = "folder_prompt_near_steps";
     const TWIN: &str = "folder_near_twin";
 
-    /// The cosine the card arms' logits keep against the host arm's, and the prompt path's against
-    /// the steps': the card32 gate's floor.
-    const COSINE_FLOOR: f64 = 0.999;
-
-    /// Tokens of the walk every clause runs.
-    const PROMPT_LEN: usize = 16;
-
-    /// Rows of the K/V planes a key head holds beyond the walk.
-    const CTX_SPARE: usize = 16;
-
-    /// The prompt path's short passes: the multi-column gemvs' run.
-    const COLS: usize = 8;
-
-    /// The words a clause's arm lines end in.
-    const VERDICT: (&str, &str) = ("PASS", "FAIL");
-
-    /// No lever is read: the arms plan and load by their own terms alone, so a lever left in the
-    /// runner's environment cannot move them.
-    const HOST: bloomery_levers::HostCfg = bloomery_levers::HostCfg {
-        populate: false,
-        lock: false,
-        card_dontneed: false,
-        r8: false,
-        route_trace: false,
-    };
-
-    /// `got`'s last logits against `want`'s: the floor, and the argmax wherever `want`'s top-1
-    /// margin passes twice the max |Δ|. One line naming `what`.
-    fn near(clause: &str, what: &str, got: &[f32], want: &[f32]) -> bool {
-        let cos = cosine(got, want);
-        let delta = max_delta(got, want);
-        let top = argmax(want);
-        let margin = f64::from(want[top as usize] - want[second(want, top) as usize]);
-        let decided = margin > 2.0 * delta;
-        let argmax_ok = !decided || argmax(got) == top;
-        let pass = cos >= COSINE_FLOOR && argmax_ok;
-        println!(
-            "{clause}: {what}: cosine {cos:.6} (floor {COSINE_FLOOR}), max |delta| {delta:.4}, \
-             top-1 margin {margin:.4} ({}), argmax {} vs {top} {}",
-            if decided {
-                "decides"
-            } else {
-                "within twice the delta"
-            },
-            argmax(got),
-            verdict(pass)
-        );
-        pass
-    }
-
-    /// What an arm's plan must hold for its clause to read anything: the `split` arm a layer with
-    /// experts on both sides, the `whole` arm every expert on the card.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Premise {
-        Host,
-        Split,
-        Whole,
-    }
-
-    /// Where an arm's model comes from: a fresh [`bloomery_gpu::folder::Model`] each call, a load
-    /// consuming it.
-    type Source<'a> = &'a dyn Fn() -> Result<bloomery_gpu::folder::Model, GateError>;
+    /// What the split arm is called in the clauses' lines.
+    const SPLIT_ARM: &str = "split";
 
     /// The model at `path`: the checkpoint folder a directory is (the map its config names, held to
     /// this family's architecture), or the GGUF split a file is.
@@ -192,110 +139,21 @@ mod gate {
         Ok(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?)
     }
 
-    /// The card budget of the `split` arm on `machine`: the bytes the whole plan puts on the card
-    /// less half of its routed experts', so the plan keeps about half the experts on the card (less
-    /// the card's margin, which stays free) and leaves the rest to the host.
+    /// The plan levers of the `split` arm on `spec`'s room: the card budget is the bytes the whole
+    /// plan puts on the card less half of its routed experts', so the plan keeps about half the
+    /// experts on the card (less the card's margin, which stays free) and leaves the rest to the
+    /// host.
     fn half_room(
         inputs: &moe_place::PlanInputs,
-        machine: &model::placement::Machine,
+        spec: CardSpec,
         ctx: u64,
-    ) -> Result<u64, GateError> {
-        let whole = inputs.plan_with(machine, ctx, &PlanLevers::default(), Experts::Placed)?;
+    ) -> Result<PlanLevers, GateError> {
+        let machine = workstation::placed_on(spec, inputs.model.layers, workstation::SCRATCH);
+        let whole = inputs.plan_with(&machine, ctx, &PlanLevers::default(), Experts::Placed)?;
         let card = whole.cards.first().ok_or("a plan of no card")?;
-        Ok(card.bytes() - card.expert_bytes / 2)
-    }
-
-    /// One arm: the plan of `premise` on `spec`'s room, its placed load of the model `source` gives,
-    /// the eager walk and its replay. `None` after a line naming the premise the plan misses, the
-    /// fault a launch raised or the bits that differ; `(pass, fail)` are the words the premise and
-    /// bits lines end in: a clause's verdict, or a diagnostic's plain words.
-    fn arm(
-        inputs: &moe_place::PlanInputs,
-        (hp, ctx): (&Hparams, u64),
-        (clause, name, premise, (pass, fail)): (&str, &str, Premise, (&str, &str)),
-        (spec, source, ids): (CardSpec, Source<'_>, &[u32]),
-    ) -> Result<Option<(Model, Run)>, GateError> {
-        let experts = if premise == Premise::Host {
-            Experts::Host
-        } else {
-            Experts::Placed
-        };
-        // The planner's layer count: the trunk, not `block_count`, which holds the file's next-token
-        // block too.
-        let layers = inputs.model.layers;
-        let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
-        let levers = if premise == Premise::Split {
-            PlanLevers {
-                card_budget_bytes: Some(half_room(inputs, &machine, ctx)?).into(),
-            }
-        } else {
-            PlanLevers::default()
-        };
-        let plan = inputs.plan_with(&machine, ctx, &levers, experts)?;
-        let card: Vec<(usize, u64, u64)> = (0..layers)
-            .filter_map(|l| Some((l, plan.n_l[l], hp.experts[l]?.n_expert as u64)))
-            .collect();
-        println!(
-            "{clause}: arm {name} plan on {} bytes: {} experts on the host, card experts by layer \
-             (layer, on card, of) {card:?}",
-            spec.total_bytes, plan.host.experts
-        );
-        let holds = match premise {
-            Premise::Host => true,
-            Premise::Split => {
-                card.iter().any(|&(_, on, _)| on > 0) && card.iter().any(|&(_, on, of)| on < of)
-            }
-            Premise::Whole => card.iter().all(|&(_, on, of)| on == of),
-        };
-        if !holds {
-            println!(
-                "{clause}: arm {name}: the plan misses the arm's premise (a layer with experts on \
-                 both sides for `split`, every expert on the card for `whole`) {fail}"
-            );
-            return Ok(None);
-        }
-        let mut m = Model::open_placed(source()?, &plan, 0, HOST)?;
-        m.set_mode(StepMode::Eager);
-        let eager = fresh(clause, "eager", &mut m, ids)?;
-        m.set_mode(StepMode::Graph);
-        m.capture_step()?;
-        let replay = fresh(clause, "replay", &mut m, ids)?;
-        let (Some(eager), Some(replay)) = (eager, replay) else {
-            return Ok(None);
-        };
-        let bits = same(&eager, &replay);
-        println!(
-            "{clause}: arm {name}: eager and replayed walks bit-identical {bits} {}",
-            if bits { pass } else { fail }
-        );
-        Ok(bits.then_some((m, replay)))
-    }
-
-    /// The prompt clause on arm `name`'s model `m`, its steps `steps` over `ids`.
-    fn prompt_near_steps(
-        name: &str,
-        m: &mut Model,
-        ids: &[u32],
-        steps: &Run,
-    ) -> Result<bool, GateError> {
-        let want = steps.logits.last().ok_or("an arm's walk is empty")?;
-        let cap = m.pass_rows()?;
-        let mut pass = true;
-        for rows in [COLS.min(cap), cap] {
-            m.reset()?;
-            let Some(_) = or_fault(PROMPT, "the prompt", m.prefill_with(ids, rows))? else {
-                pass = false;
-                continue;
-            };
-            let got = m.logits()?;
-            pass &= near(
-                PROMPT,
-                &format!("arm {name}, passes of {rows} rows"),
-                &got,
-                want,
-            );
-        }
-        Ok(pass)
+        Ok(PlanLevers {
+            card_budget_bytes: Some(card.bytes() - card.expert_bytes / 2).into(),
+        })
     }
 
     /// The model a header describes, its `Hparams` and plan inputs, refused by name unless its routed
@@ -400,6 +258,7 @@ mod gate {
             ..workstation::A6000
         };
         let source = || model_at(&path);
+        let words = Words::clause(SPLIT_ARM);
         // The 3090's room, planned and not loaded: whether it holds every expert of the folder.
         {
             let machine = workstation::placed_on(gate, inputs.model.layers, workstation::SCRATCH);
@@ -419,46 +278,42 @@ mod gate {
         }
         // Each arm is released before the next opens: no two share the card.
         let host_last = if split || whole {
-            arm(
+            last_logits(arm(
                 &inputs,
                 (&hp, ctx),
-                (SPLIT, "host", Premise::Host, VERDICT),
-                (room, &source, &ids),
-            )?
-            .and_then(|(m, run)| {
-                drop(m);
-                run.logits.last().cloned()
-            })
+                (SPLIT, "host", Premise::Host, words),
+                (room, PlanLevers::default(), &source, &ids),
+            )?)
         } else {
             None
         };
         let mut ok = true;
         let mut whole_last = None;
         for (clause, name, premise, on) in [
-            (SPLIT, "split", Premise::Split, split),
+            (SPLIT, SPLIT_ARM, Premise::Split, split),
             (WHOLE, "whole", Premise::Whole, whole),
         ] {
             if !on && !prompt && !(twin.is_some() && premise == Premise::Whole) {
                 continue;
             }
+            let levers = if premise == Premise::Split {
+                half_room(&inputs, room, ctx)?
+            } else {
+                PlanLevers::default()
+            };
             let run = arm(
                 &inputs,
                 (&hp, ctx),
-                (clause, name, premise, VERDICT),
-                (room, &source, &ids),
+                (clause, name, premise, words),
+                (room, levers, &source, &ids),
             )?;
             if on {
-                let pass = match (&run, &host_last) {
-                    (Some((_, steps)), Some(want)) => steps
-                        .logits
-                        .last()
-                        .is_some_and(|got| near(clause, &format!("{name} vs host"), got, want)),
-                    _ => false,
-                };
-                if !pass {
-                    println!("clause {clause} FAIL");
-                }
-                ok &= pass;
+                ok &= near_host(
+                    clause,
+                    name,
+                    run.as_ref().map(|(_, steps)| steps),
+                    host_last.as_deref(),
+                );
             }
             if premise == Premise::Whole {
                 whole_last = run
@@ -466,26 +321,24 @@ mod gate {
                     .and_then(|(_, steps)| steps.logits.last().cloned());
             }
             if prompt {
-                let pass = match run {
-                    Some((mut m, steps)) => prompt_near_steps(name, &mut m, &ids, &steps)?,
-                    None => false,
-                };
-                if !pass {
-                    println!("clause {PROMPT} FAIL (arm {name})");
-                }
-                ok &= pass;
+                ok &= prompt_arm(PROMPT, name, run, &ids)?;
             }
         }
         match (twin, whole_last) {
             (Some((p, thp, tinputs)), Some(got)) => {
                 let twin_source = || model_at(&p);
+                let diagnostic = Words {
+                    pass: "same",
+                    fail: "differ; skipped",
+                    ..words
+                };
                 let run = arm(
                     &tinputs,
                     (&thp, ctx),
-                    (TWIN, "twin", Premise::Whole, ("same", "differ; skipped")),
-                    (room, &twin_source, &ids),
+                    (TWIN, "twin", Premise::Whole, diagnostic),
+                    (room, PlanLevers::default(), &twin_source, &ids),
                 )?;
-                match run.and_then(|(_, steps)| steps.logits.last().cloned()) {
+                match last_logits(run) {
                     Some(want) => println!(
                         "{TWIN}: diagnostic, no verdict (the folder's NVFP4 and the twin's 32-value \
                          types round the same weights differently): whole vs twin cosine {:.6}, \

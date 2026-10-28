@@ -22,15 +22,15 @@
 //! - `card32_split_near_host` (self-consistency): the `card` plan holds an expert of some routed
 //!   layer on the card and leaves one on the host, or the clause fails as vacuous. Each arm's
 //!   eager and replayed walks are bit-identical, and the `card` arm's last-position logits keep
-//!   [`COSINE_FLOOR`] against the `host` arm's, the argmax the same wherever the host arm's top-1
-//!   margin passes twice the max |Δ|: the card's relu² and the host's differ by their
+//!   [`moe_arm::COSINE_FLOOR`] against the `host` arm's, the argmax the same wherever the host
+//!   arm's top-1 margin passes twice the max |Δ|: the card's relu² and the host's differ by their
 //!   activations' rounding and their sums' order alone.
 //! - `card32_whole_near_host` (self-consistency): the `whole` plan holds every expert on the
 //!   card, or the clause fails as vacuous; its eager and replayed walks are bit-identical, and its
 //!   logits keep the same floor and argmax band against the `host` arm's.
 //! - `card32_prompt_near_steps` (self-consistency): on the `card` and `whole` arms, the prompt
-//!   path over the walk at passes of [`COLS`] rows and at the load's pass rows (the 32-value
-//!   GEMMs at both) keeps the same floor and argmax band against the arm's own steps.
+//!   path over the walk at passes of [`moe_arm::COLS`] rows and at the load's pass rows (the
+//!   32-value GEMMs at both) keeps the same floor and argmax band against the arm's own steps.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -54,20 +54,27 @@ mod e2e;
 mod gate_card;
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the arm harness the card gates share; each takes the items it reads"
+)]
+#[path = "shared/nemotron_h_moe_arm.rs"]
+mod moe_arm;
+
+#[cfg(feature = "gpu")]
 mod gate {
-    use crate::e2e::{Run, argmax, cosine, fresh, max_delta, or_fault, same, second, walk};
+    use crate::e2e::walk;
     use crate::gate_card;
-    use bloomery_gpu::NemotronHMoeModel;
-    use bloomery_gpu::model::StepMode;
+    use crate::moe_arm::{
+        CTX_SPARE, PROMPT_LEN, Premise, Words, arm, last_logits, near_host, prompt_arm,
+    };
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, open_split};
     use model::arch::Arch;
     use model::arch::nemotron_h_moe::hparams::Hparams;
-    use model::arch::nemotron_h_moe::place::{self as moe_place, Experts, Forms};
+    use model::arch::nemotron_h_moe::place::{self as moe_place, Forms};
     use model::placement::PlanLevers;
     use model::placement::workstation::{self, CardSpec};
-
-    type Model = NemotronHMoeModel;
 
     const NAME: &str = "gate_nemotron_h_moe_card32";
 
@@ -78,147 +85,12 @@ mod gate {
     const WHOLE: &str = "card32_whole_near_host";
     const PROMPT: &str = "card32_prompt_near_steps";
 
-    /// The cosine the card arm's logits keep against the host arm's, and the
-    /// prompt path's against the steps': the e2e gate's floor.
-    const COSINE_FLOOR: f64 = 0.999;
+    /// What the split arm is called in the clauses' lines.
+    const SPLIT_ARM: &str = "card";
 
-    /// Tokens of the walk both clauses run.
-    const PROMPT_LEN: usize = 16;
-
-    /// Rows of the K/V planes a key head holds beyond the walk.
-    const CTX_SPARE: usize = 16;
-
-    /// The prompt path's short passes: the multi-column gemvs' run, below which the IQ2_XXS
-    /// stacks take their `_sel` fallback and the 32-value ones still their GEMMs.
-    const COLS: usize = 8;
-
-    /// No lever is read: the arms plan and load by their own terms alone, so a lever left in the
-    /// runner's environment cannot move them.
-    const HOST: bloomery_levers::HostCfg = bloomery_levers::HostCfg {
-        populate: false,
-        lock: false,
-        card_dontneed: false,
-        r8: false,
-        route_trace: false,
-    };
-
-    /// `got`'s last logits against `want`'s: the floor, and the argmax wherever `want`'s top-1
-    /// margin passes twice the max |Δ|. One line naming `what`.
-    fn near(clause: &str, what: &str, got: &[f32], want: &[f32]) -> bool {
-        let cos = cosine(got, want);
-        let delta = max_delta(got, want);
-        let top = argmax(want);
-        let margin = f64::from(want[top as usize] - want[second(want, top) as usize]);
-        let decided = margin > 2.0 * delta;
-        let argmax_ok = !decided || argmax(got) == top;
-        let pass = cos >= COSINE_FLOOR && argmax_ok;
-        println!(
-            "{clause}: {what}: cosine {cos:.6} (floor {COSINE_FLOOR}), max |delta| {delta:.4}, \
-             top-1 margin {margin:.4} ({}), argmax {} vs {top} {}",
-            if decided {
-                "decides"
-            } else {
-                "within twice the delta"
-            },
-            argmax(got),
-            verdict(pass)
-        );
-        pass
-    }
-
-    /// What an arm's plan must hold for its clause to read anything: the `card` arm a layer with
-    /// experts on both sides, the `whole` arm every expert on the card.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Premise {
-        Host,
-        Split,
-        Whole,
-    }
-
-    /// One arm: the plan of `premise` on `spec`'s room, its placed load, the eager walk and its
-    /// replay. `None` after a line naming the premise the plan misses, the fault a launch raised
-    /// or the bits that differ.
-    fn arm(
-        inputs: &moe_place::PlanInputs,
-        (hp, ctx): (&Hparams, u64),
-        (clause, name, premise): (&str, &str, Premise),
-        (spec, ids): (CardSpec, &[u32]),
-    ) -> Result<Option<(Model, Run)>, GateError> {
-        let experts = if premise == Premise::Host {
-            Experts::Host
-        } else {
-            Experts::Placed
-        };
-        // The planner's layer count: the trunk, not `block_count`, which holds the file's next-token
-        // block too.
-        let layers = inputs.model.layers;
-        let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
-        let plan = inputs.plan_with(&machine, ctx, &PlanLevers::default(), experts)?;
-        let card: Vec<(usize, u64, u64)> = (0..layers)
-            .filter_map(|l| Some((l, plan.n_l[l], hp.experts[l]?.n_expert as u64)))
-            .collect();
-        println!(
-            "{clause}: arm {name} plan on {} bytes: {} experts on the host, card experts by layer \
-             (layer, on card, of) {card:?}",
-            spec.total_bytes, plan.host.experts
-        );
-        let holds = match premise {
-            Premise::Host => true,
-            Premise::Split => {
-                card.iter().any(|&(_, on, _)| on > 0) && card.iter().any(|&(_, on, of)| on < of)
-            }
-            Premise::Whole => card.iter().all(|&(_, on, of)| on == of),
-        };
-        if !holds {
-            println!(
-                "{clause}: arm {name}: the plan misses the arm's premise (a layer with experts on \
-                 both sides for `card`, every expert on the card for `whole`) FAIL"
-            );
-            return Ok(None);
-        }
-        let mut m = Model::open_placed(open_split(Arch::NemotronHMoe, RECIPE)?, &plan, 0, HOST)?;
-        m.set_mode(StepMode::Eager);
-        let eager = fresh(clause, "eager", &mut m, ids)?;
-        m.set_mode(StepMode::Graph);
-        m.capture_step()?;
-        let replay = fresh(clause, "replay", &mut m, ids)?;
-        let (Some(eager), Some(replay)) = (eager, replay) else {
-            return Ok(None);
-        };
-        let bits = same(&eager, &replay);
-        println!(
-            "{clause}: arm {name}: eager and replayed walks bit-identical {bits} {}",
-            verdict(bits)
-        );
-        Ok(bits.then_some((m, replay)))
-    }
-
-    /// The prompt clause on arm `name`'s model `m`, its steps `steps` over `ids`.
-    fn prompt_near_steps(
-        name: &str,
-        m: &mut Model,
-        ids: &[u32],
-        steps: &Run,
-    ) -> Result<bool, GateError> {
-        const CLAUSE: &str = "card32_prompt_near_steps";
-        let want = steps.logits.last().ok_or("an arm's walk is empty")?;
-        let cap = m.pass_rows()?;
-        let mut pass = true;
-        for rows in [COLS.min(cap), cap] {
-            m.reset()?;
-            let Some(_) = or_fault(CLAUSE, "the prompt", m.prefill_with(ids, rows))? else {
-                pass = false;
-                continue;
-            };
-            let got = m.logits()?;
-            pass &= near(
-                CLAUSE,
-                &format!("arm {name}, passes of {rows} rows"),
-                &got,
-                want,
-            );
-        }
-        Ok(pass)
+    /// An arm's model: the file the gate runs, a split opened afresh for each load.
+    fn model_file() -> Result<bloomery_gpu::folder::Model, GateError> {
+        Ok(open_split(Arch::NemotronHMoe, RECIPE)?.into())
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -259,52 +131,42 @@ mod gate {
             name: gate.name,
             ..workstation::A6000
         };
+        let words = Words::clause(SPLIT_ARM);
         // Each arm is released before the next opens: no two share the card.
         let host_last = if split || whole {
-            arm(
+            last_logits(arm(
                 &inputs,
                 (&hp, ctx),
-                (SPLIT, "host", Premise::Host),
-                (gate, &ids),
-            )?
-            .and_then(|(m, run)| {
-                drop(m);
-                run.logits.last().cloned()
-            })
+                (SPLIT, "host", Premise::Host, words),
+                (gate, PlanLevers::default(), &model_file, &ids),
+            )?)
         } else {
             None
         };
         let mut ok = true;
         for (clause, name, premise, spec, on) in [
-            (SPLIT, "card", Premise::Split, gate, split),
+            (SPLIT, SPLIT_ARM, Premise::Split, gate, split),
             (WHOLE, "whole", Premise::Whole, room, whole),
         ] {
             if !on && !prompt {
                 continue;
             }
-            let run = arm(&inputs, (&hp, ctx), (clause, name, premise), (spec, &ids))?;
+            let run = arm(
+                &inputs,
+                (&hp, ctx),
+                (clause, name, premise, words),
+                (spec, PlanLevers::default(), &model_file, &ids),
+            )?;
             if on {
-                let pass = match (&run, &host_last) {
-                    (Some((_, steps)), Some(want)) => steps
-                        .logits
-                        .last()
-                        .is_some_and(|got| near(clause, &format!("{name} vs host"), got, want)),
-                    _ => false,
-                };
-                if !pass {
-                    println!("clause {clause} FAIL");
-                }
-                ok &= pass;
+                ok &= near_host(
+                    clause,
+                    name,
+                    run.as_ref().map(|(_, steps)| steps),
+                    host_last.as_deref(),
+                );
             }
             if prompt {
-                let pass = match run {
-                    Some((mut m, steps)) => prompt_near_steps(name, &mut m, &ids, &steps)?,
-                    None => false,
-                };
-                if !pass {
-                    println!("clause {PROMPT} FAIL (arm {name})");
-                }
-                ok &= pass;
+                ok &= prompt_arm(PROMPT, name, run, &ids)?;
             }
         }
         println!("{}", tier::tally_line());

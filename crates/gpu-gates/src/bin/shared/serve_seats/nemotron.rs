@@ -95,7 +95,7 @@
 //! the `deepseek41` feature: the server surface it binds through (`bind`, the
 //! `serve` and `sampler` crates) is scoped to it; it runs no V4.1 code.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -152,16 +152,82 @@ const NO_CACHE: &str = "the nemotron seat runs no prompt cache";
 const NO_STEP_BACK: &str =
     "the Mamba-2 state cannot step back: a prefix is kept only where the sequence stands";
 
+/// Where the seat's model is read from, decided once by the path: a directory is a checkpoint
+/// folder, anything else a GGUF file. Each is opened on the main thread for its header, which the
+/// plan is made from.
+enum Weights {
+    /// A checkpoint folder: its located header, tokenizer and part source (boxed: the tokenizer
+    /// outweighs a header).
+    Folder(Box<folder::Opened>),
+    /// A GGUF file's header; the engine thread opens the file again.
+    File(Split),
+}
+
+/// The model's open on the engine thread ([`Weights::hand_over`]).
+type OpenModel = Box<dyn FnOnce() -> Result<Model, GateError> + Send>;
+
+/// The GGUF file at `path`, opened.
+fn split_at(path: &Path) -> Result<Split, GateError> {
+    Ok(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?)
+}
+
+impl Weights {
+    /// The weights at `path`: the checkpoint folder a directory is (held to this family's
+    /// architecture), or the GGUF file.
+    fn open(path: &Path) -> Result<Weights, GateError> {
+        if path.is_dir() {
+            let f = folder::open(path, refset::arch::nemotron_h_moe::ARCH)?;
+            return Ok(Weights::Folder(Box::new(f)));
+        }
+        Ok(Weights::File(split_at(path)?))
+    }
+
+    /// The header the plan is made from: a split's first shard's, a folder's located header.
+    fn header(&self) -> &Split {
+        match self {
+            Weights::Folder(f) => &f.header,
+            Weights::File(header) => header,
+        }
+    }
+
+    /// Whether the weights load only through a plan: a checkpoint folder has no whole-card open.
+    fn is_folder(&self) -> bool {
+        matches!(self, Weights::Folder(_))
+    }
+
+    /// The tokenizer the vocabulary is built from at `path`, and the model's open on the engine
+    /// thread: a folder's header and part source go with it, a file is opened again there.
+    fn hand_over(self, path: &Path) -> Result<(Tokenizer, OpenModel), GateError> {
+        match self {
+            Weights::Folder(f) => {
+                let folder::Opened {
+                    header,
+                    tokenizer,
+                    source,
+                } = *f;
+                let open: OpenModel = Box::new(move || folder::model(header, source));
+                Ok((tokenizer, open))
+            }
+            Weights::File(header) => {
+                drop(header);
+                let tokenizer = Tokenizer::from_gguf(path)?;
+                let file = path.to_path_buf();
+                let open: OpenModel =
+                    Box::new(move || -> Result<Model, GateError> { Ok(split_at(&file)?.into()) });
+                Ok((tokenizer, open))
+            }
+        }
+    }
+}
+
 /// What the engine thread opens the seat with.
 struct OpenSeat {
     /// The planned card, by name and device: the open takes the device the
     /// plan resolved.
     card: String,
     device: Option<DeviceId>,
-    path: PathBuf,
-    /// The checkpoint folder's located header and part source when `path` is one, else the
-    /// file at `path` is opened on the engine thread.
-    folder: Option<(Split, folder::Source)>,
+    /// The model's open ([`Weights::hand_over`]).
+    model: OpenModel,
     /// The slot's positions the K/V planes are sized for.
     ctx: usize,
 }
@@ -238,23 +304,18 @@ fn whole_card_file(model: Model) -> Result<Split, GpuError> {
 }
 
 impl<B: ChainBody> Nemotron<B> {
-    /// The model at `a.path` (the file, or the folder `a.folder` the seat opened), built by
+    /// The model `a.model` opens (the file, or the folder the seat opened), built by
     /// `open` (the family's `GpuModel::open` on the planned card, or a placed load, which opens
     /// the card its plan names) and carrying its prompt path `prefill`,
     /// in graph mode with its step captured, the `load` record on stderr
     /// naming the body's architecture.
     fn open(
-        mut a: OpenSeat,
+        a: OpenSeat,
         open: impl FnOnce(Model) -> Result<GpuModel<B>, GpuError>,
         prefill: fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>,
     ) -> Result<Nemotron<B>, GateError> {
         let t = Instant::now();
-        let model: Model = match a.folder.take() {
-            Some((header, source)) => folder::model(header, source)?,
-            None => Split::open(&a.path)
-                .map_err(|e| format!("open {}: {e}", a.path.display()))?
-                .into(),
-        };
+        let model = (a.model)()?;
         let opened = t.elapsed();
         let mut m = open(model)?;
         m.set_mode(StepMode::Graph);
@@ -366,17 +427,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let path = ref_model_path()?;
     // A directory is a checkpoint folder, opened once here: its located header plans as a split's
     // first shard does, and the header and part source go to the engine thread.
-    let opened = path
-        .is_dir()
-        .then(|| folder::open(&path, refset::arch::nemotron_h_moe::ARCH))
-        .transpose()?;
-    let (split, parts) = match opened {
-        Some(f) => (f.header, Some((f.tokenizer, f.source))),
-        None => (
-            Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
-            None,
-        ),
-    };
+    let weights = Weights::open(&path)?;
+    let split = weights.header();
     let first = split
         .shard(0)
         .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
@@ -399,8 +451,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The family's `place::read`, the first of the two branches the
     // architecture takes (the other the open, at the spawn below).
     let inputs = match arch {
-        Arch::NemotronH => nemotron_place::read(&split)?,
-        Arch::NemotronHMoe => moe_place::read(&split)?,
+        Arch::NemotronH => nemotron_place::read(split)?,
+        Arch::NemotronHMoe => moe_place::read(split)?,
         _ => unreachable!("the arch check above refused every other architecture"),
     };
     let plan_levers = PlanLevers::from_levers(&levers)?;
@@ -428,7 +480,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // probe and the placed machine both carry the side seat's reserve.
     let mut whole = place.machine_untiered()?(layers);
     beside::reserve_on(&mut whole, held);
-    let placed = parts.is_some()
+    let placed = weights.is_folder()
         || (arch == Arch::NemotronHMoe
             && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err());
     let (machine, experts) = if placed {
@@ -441,7 +493,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The context, then the plan around it (`choose_ctx`, every seat's): a
     // tier card, a second card, a context the card cannot hold and a budget
     // that binds are refused here by name, before any load.
-    let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
+    let asked = choose_ctx(split, (a.ctx, slots), (None, None), |c| {
         probe_of(inputs.plan_with(&machine, c, &plan_levers, experts))
             .map_err(|e| beside::refusal(held, format!("--place {}: {e}", place.name())))
     })?;
@@ -456,7 +508,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         std::process::exit(0);
     }
     let props = EngineProps {
-        model: Some(model_props(&split, &inputs.model)),
+        model: Some(model_props(split, &inputs.model)),
         placement: placement_of(NAME, &machine, &plan),
         ..EngineProps::default()
     };
@@ -466,18 +518,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let host = levers.host();
     drop(plan);
     // A folder's header goes to the engine thread with its parts; a file's is reopened there.
-    let (tokenizer, folder) = match parts {
-        Some((tokenizer, source)) => (tokenizer, Some((split, source))),
-        None => {
-            drop(split);
-            (Tokenizer::from_gguf(&path)?, None)
-        }
-    };
+    let (tokenizer, model) = weights.hand_over(&path)?;
     let open = OpenSeat {
         card: card_name,
         device: card_device,
-        path: path.clone(),
-        folder,
+        model,
         ctx: slot_ctx,
     };
     let vocab = Arc::new(Vocab::new(tokenizer)?);
