@@ -660,9 +660,14 @@ mod gate {
     /// plan of the file needs (1 TiB), so its pool fits whatever the file.
     const CHURN_PLAN_ROOM: u64 = 1 << 40;
     /// The unhosted-pool clause's servers: the seat's defaults at
-    /// `--parallel 2` but for the prompt cache, off, so no cache budget moves
-    /// the context between the two rooms.
-    const CHURN_ARGS: [&str; 8] = [
+    /// `--parallel 2` but for the prompt cache, off, and a named context, so
+    /// neither a cache budget nor the default context's fit moves the plan
+    /// between the rooms. PIN(2026-10-29): the context is named (8,192
+    /// positions a slot): the default context fills the card down to the
+    /// residency's least experts a layer, which holds P 0 and no higher P, so
+    /// the unset word on this room had no P to climb to; the clause is about
+    /// the host's room, not the default context (`slots_default_*` holds that).
+    const CHURN_ARGS: [&str; 10] = [
         "--host",
         "127.0.0.1",
         "--port",
@@ -671,6 +676,8 @@ mod gate {
         "2",
         "--cache-ram",
         "0",
+        "--ctx-size",
+        "16384",
     ];
     /// The unhosted-pool clause's request: ids asked, and the least that
     /// must come back for a victim outside the host set to have been picked.

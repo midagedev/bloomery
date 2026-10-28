@@ -1082,16 +1082,6 @@ struct Worst {
     between: f64,
 }
 
-fn ratio(diff: f64, band: f64) -> f64 {
-    if band > 0.0 {
-        diff / band
-    } else if diff == 0.0 {
-        0.0
-    } else {
-        f64::INFINITY
-    }
-}
-
 /// Each (row, head) pair `pick` names: the prefill output, the decode flash's
 /// and the f64 attention of the cache the launch left, with the prefill band
 /// and the decode band.
@@ -1162,9 +1152,9 @@ fn prefill_bands(
                         bp[dim], bd[dim]
                     ));
                 }
-                worst.prefill = worst.prefill.max(ratio(dp, bp[dim]));
-                worst.decode = worst.decode.max(ratio(d0, bd[dim]));
-                worst.between = worst.between.max(ratio(between, bp[dim] + bd[dim]));
+                worst.prefill = worst.prefill.max(common::ratio(dp, bp[dim]));
+                worst.decode = worst.decode.max(common::ratio(d0, bd[dim]));
+                worst.between = worst.between.max(common::ratio(between, bp[dim] + bd[dim]));
             }
         }
     }
@@ -1366,16 +1356,6 @@ fn norm_rows_run(
     Ok((y, h.fault()?))
 }
 
-/// The rows of `x` laid out `stride` apart, the words between them NaN, so a
-/// read past a row poisons the output.
-fn strided_rows(rows: &[Vec<f32>], stride: usize) -> Vec<f32> {
-    let mut x = vec![f32::NAN; rows.len() * stride];
-    for (r, row) in rows.iter().enumerate() {
-        x[r * stride..r * stride + row.len()].copy_from_slice(row);
-    }
-    x
-}
-
 /// Row `x` as the decode router carries it. The router run with one nonzero
 /// weight in each routed row returns, as that row's logit, the one product
 /// `(x · gain)[c] · scale` the router's dot adds to zeros, so the logits of
@@ -1406,7 +1386,7 @@ pub fn norm_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         let data: Vec<Vec<f32>> = (0..rows)
             .map(|r| oracle::activations(k, 0x40A0 + r as u64, 3.7))
             .collect();
-        let x = strided_rows(&data, strides.0);
+        let x = common::strided(&data, strides.0, f32::NAN);
         let (y, fault) = norm_rows_run(h, &x, &gain, rows, strides, eps)?;
         if let Some(f) = fault {
             return Err(format!("{rows} rows raised {f}"));
@@ -1436,7 +1416,14 @@ pub fn norm_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let clean: Vec<Vec<f32>> = (0..rows)
         .map(|r| oracle::activations(k, 0x40B0 + r as u64, 3.7))
         .collect();
-    let (want, fault) = norm_rows_run(h, &strided_rows(&clean, k), &gain, rows, (k, k), eps)?;
+    let (want, fault) = norm_rows_run(
+        h,
+        &common::strided(&clean, k, f32::NAN),
+        &gain,
+        rows,
+        (k, k),
+        eps,
+    )?;
     if let Some(f) = fault {
         return Err(format!("the clean chunk raised {f}"));
     }
@@ -1456,19 +1443,40 @@ pub fn norm_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     };
     let mut zero = clean.clone();
     zero[3] = vec![0.0; k];
-    let (y, fault) = norm_rows_run(h, &strided_rows(&zero, k), &gain, rows, (k, k), eps)?;
+    let (y, fault) = norm_rows_run(
+        h,
+        &common::strided(&zero, k, f32::NAN),
+        &gain,
+        rows,
+        (k, k),
+        eps,
+    )?;
     nan_alone(&y, 3, "a zero row with eps 0")?;
     expect_norm_fault(fault, "a zero row with eps 0")?;
 
     let mut nan = clean.clone();
     nan[5][700] = f32::NAN;
-    let (y, fault) = norm_rows_run(h, &strided_rows(&nan, k), &gain, rows, (k, k), eps)?;
+    let (y, fault) = norm_rows_run(
+        h,
+        &common::strided(&nan, k, f32::NAN),
+        &gain,
+        rows,
+        (k, k),
+        eps,
+    )?;
     nan_alone(&y, 5, "a NaN input")?;
     expect_norm_fault(fault, "a NaN input")?;
 
     let mut bad_gain = gain.clone();
     bad_gain[11] = f32::INFINITY;
-    let (y, fault) = norm_rows_run(h, &strided_rows(&clean, k), &bad_gain, rows, (k, k), eps)?;
+    let (y, fault) = norm_rows_run(
+        h,
+        &common::strided(&clean, k, f32::NAN),
+        &bad_gain,
+        rows,
+        (k, k),
+        eps,
+    )?;
     expect_norm_fault(fault, "an infinite gain")?;
     for r in 0..rows {
         for c in 0..k {
@@ -1485,7 +1493,7 @@ pub fn norm_rows_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
     let (y, fault) = norm_rows_run(
         h,
-        &strided_rows(&clean, k),
+        &common::strided(&clean, k, f32::NAN),
         &gain,
         rows,
         (k, k),

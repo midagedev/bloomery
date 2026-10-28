@@ -35,7 +35,8 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
         Table::Shaped { kept, own }
         | Table::Delta { kept, own }
-        | Table::Attention { kept, own } => {
+        | Table::Attention { kept, own }
+        | Table::Window { kept, own } => {
             if let Some(name) = kept.iter().find(|name| {
                 !MUTANTS
                     .iter()
@@ -233,11 +234,18 @@ pub const Q30_MUTANTS: &[Mutant] = &[
         name: "attn_gate_ungated",
         clause: "attn_f16",
         why: "a query with no gate still multiplies the attention by the sigmoid of the value past its head",
-        edits: &[(
-            "#if BLOOMERY_ATTN_GATED\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
-            "#if 1\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
-            1,
-        )],
+        edits: &[
+            (
+                "#if BLOOMERY_ATTN_GATED\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+                "#if 1\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
+                1,
+            ),
+            (
+                "#if ATTN_GATE\n            float gated = attn * attn_sigmoid(g);",
+                "#if 1\n            float gated = attn * attn_sigmoid(g);",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "routed_group_past_routed_open",
@@ -329,6 +337,200 @@ pub const GQA_MUTANTS: &[Mutant] = &[
             "if (!writes) {",
             1,
         )],
+    },
+];
+
+/// The mutants of the other tables a window row keeps: none. The plain
+/// launches of the other clause files refuse an instance that cuts a window
+/// and gates per head, so the row runs only the clauses of `clauses_window`,
+/// which [`WINDOW_MUTANTS`] holds the mutants of.
+pub const WINDOW_KEPT: &[&str] = &[];
+
+/// The defects of a layer's window, per-head gate and rope table, each red on
+/// the clause that holds that axis. The table-side mutants (`rope_*`) edit no
+/// kernel text: the clause reads its name from the gate's command line and
+/// builds the defect into the launch's table, so the oracle's table stays
+/// the recipe.
+pub const WINDOW_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "window_255",
+        clause: "attn_window",
+        why: "a window of w keys attends w - 1: the last `window - 1` keys",
+        edits: &[(
+            "return (args.window != 0u && live > args.window) ? live - args.window : 0u;",
+            "return (args.window != 0u && live > args.window) ? live - args.window + 1u : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_257",
+        clause: "attn_window",
+        why: "a window of w keys attends w + 1: it reads the key before the window",
+        edits: &[(
+            "return (args.window != 0u && live > args.window) ? live - args.window : 0u;",
+            "return (args.window != 0u && live > args.window) ? live - args.window - 1u : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_ignored",
+        clause: "attn_window",
+        why: "a sliding layer's launch names its window and the flash attends every live key",
+        edits: &[(
+            "return (args.window != 0u && live > args.window) ? live - args.window : 0u;",
+            "return 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_always_256",
+        clause: "attn_window",
+        why: "a full layer's launch names no window and the flash cuts one of 256 keys",
+        edits: &[(
+            "return (args.window != 0u && live > args.window) ? live - args.window : 0u;",
+            "return live > 256u ? live - 256u : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_gqa_read_as_8",
+        clause: "attn_window",
+        why: "a key head's query heads start at eight a key head, whatever the group: the windowed flash at group 4 pairs a head with another key head's window",
+        edits: &[(
+            "uint head = kv * BLOOMERY_ATTN_GQA + sg * BLOOMERY_ATTN_HPT;",
+            "uint head = kv * 8u + sg * BLOOMERY_ATTN_HPT;",
+            2,
+        )],
+    },
+    Mutant {
+        name: "window_append_owner",
+        clause: "attn_window",
+        why: "the segment that appends the position's row is the one the unwindowed split gives it: a position past the window edge is stored by a segment that does not own it, or by none",
+        edits: &[(
+            "uint pos_seg = args.pos >= win_lo ? (args.pos - win_lo) / span : 0u;",
+            "uint pos_seg = args.pos / span;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_prefill_mask_off",
+        clause: "attn_window_prefill",
+        why: "a prompt row attends every key its block's first row does: the keys before its own window are not masked",
+        edits: &[(
+            "live[j] = live[j] && key >= row_lo;",
+            "live[j] = live[j];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_prefill_first_tile_late",
+        clause: "attn_window_prefill",
+        why: "the prompt pass starts one key tile after the block's first row's window: a key of the window in that tile is never read",
+        edits: &[(
+            "uint first_tile = attn_window_lo(first, first.keys) / BLOOMERY_ATTN_PF_KEYS;",
+            "uint first_tile = attn_window_lo(first, first.keys) / BLOOMERY_ATTN_PF_KEYS + 1u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_gate_per_channel",
+        clause: "attn_head_gate",
+        why: "the gate is read per channel, as the packed gate is, from a buffer that holds one value a head",
+        edits: &[
+            ("float g = q[head];", "float g = q[dim0 + d];", 1),
+            ("float gate = q[head];", "float gate = q[dim];", 1),
+            (
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + dim];",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "head_gate_next_head",
+        clause: "attn_head_gate",
+        why: "head h is gated by head h + 1's value",
+        edits: &[
+            ("float g = q[head];", "float g = q[head + 1u];", 1),
+            ("float gate = q[head];", "float gate = q[head + 1u];", 1),
+            (
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
+                "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head + 1u];",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "head_gate_no_sigmoid_s1",
+        clause: "attn_head_gate",
+        why: "a segment that stores the attention alone stores the raw gate's product with no sigmoid",
+        edits: &[(
+            "float gated = attn * attn_sigmoid(g);",
+            "float gated = attn * g;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_gate_no_sigmoid_fold",
+        clause: "attn_head_gate",
+        why: "the fold stores the raw gate's product with no sigmoid",
+        edits: &[(
+            "float merged = attn * attn_sigmoid(gate);",
+            "float merged = attn * gate;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_gate_no_sigmoid_prefill",
+        clause: "attn_head_gate",
+        why: "the prompt pass stores the raw gate's product with no sigmoid",
+        edits: &[(
+            "float product = attn * attn_sigmoid(g);",
+            "float product = attn * g;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_gate_rows_row0",
+        clause: "attn_head_gate",
+        why: "every row of the rows launch is gated by the first row's values",
+        edits: &[(
+            "ATTN_HGATE_ACTUAL(row) partials + row * partials_stride,",
+            "ATTN_HGATE_ACTUAL(0u) partials + row * partials_stride,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_gate_prefill_row0",
+        clause: "attn_head_gate",
+        why: "every row of the prompt pass is gated by the first row's values",
+        edits: &[(
+            "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
+            "float g = hgate[head];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rope_pairs_32",
+        clause: "attn_rope_factors",
+        why: "the appended key turns the pairs (i, i + 32), not the NeoX pairs (i, i + 64) of a 128-wide head",
+        edits: &[(
+            "uint pairs = BLOOMERY_ATTN_ROT / 2u;",
+            "uint pairs = 32u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rope_factors_ignored",
+        clause: "attn_rope_factors",
+        why: "the table the launch reads is built with no factors: every pair rotates",
+        edits: &[],
+    },
+    Mutant {
+        name: "rope_exponent_64",
+        clause: "attn_rope_factors",
+        why: "the table's exponent runs over 64 dims, not the head's 128",
+        edits: &[],
     },
 ];
 
@@ -869,6 +1071,87 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[("st[i] = NAN;", "st[i] = 0.0f;", 1)],
     },
     Mutant {
+        name: "shortconv_tap_order",
+        clause: "shortconv_rows",
+        why: "the taps run newest first: weight k pairs with the predecessor k back, not taps - 1 - k back",
+        edits: &[("r, a.taps - 1u - k, a);", "r, k, a);", 1)],
+    },
+    Mutant {
+        name: "shortconv_width_short",
+        clause: "shortconv_rows",
+        why: "the conv runs one tap short, a width-6 conv on seven taps' weights: the newest tap is dropped",
+        edits: &[(
+            "for (uint k = 0u; k < a.taps; ++k) {",
+            "for (uint k = 0u; k + 1u < a.taps; ++k) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_no_b",
+        clause: "shortconv_rows",
+        why: "the B gate is skipped: u is x, not B times x",
+        edits: &[(
+            "return row[c] * row[2u * a.hidden + c];",
+            "return row[2u * a.hidden + c];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_no_c",
+        clause: "shortconv_rows",
+        why: "the C epilogue is skipped: the output is the conv sum alone",
+        edits: &[(
+            "float y = acc * bcx[r * a.x_stride + a.hidden + c];",
+            "float y = acc;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_start_stale",
+        clause: "shortconv_start",
+        why: "a predecessor before the sequence's first position reads the ring's stale slot, not 0",
+        edits: &[(
+            "    if (pos0 < before) {\n        return 0.0f;\n    }\n",
+            "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_chunk_ring",
+        clause: "shortconv_rows",
+        why: "every predecessor of a chunk's rows is read from the ring, so a row inside the chunk reads the slot of the position before the chunk instead of its in-chunk predecessor",
+        edits: &[
+            ("if (back <= r) {", "if (false) {", 1),
+            ("uint before = back - r;", "uint before = back;", 1),
+        ],
+    },
+    Mutant {
+        name: "shortconv_ring_alias",
+        clause: "shortconv_state",
+        why: "the ring is cut to five rows, so a seven-tap conv's positions 1 and 6 back share a slot",
+        edits: &[(
+            "return pos % ring_rows;",
+            "return pos % min(ring_rows, 5u);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_no_raise",
+        clause: "shortconv_nan",
+        why: "an element that is not finite raises nothing",
+        edits: &[(
+            "inline void sc_raise(device atomic_uint *faults, uint layer) {\n    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);\n}",
+            "inline void sc_raise(device atomic_uint *faults, uint layer) {\n}",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_nan_plausible",
+        clause: "shortconv_nan",
+        why: "an element that is not finite is written as zero, not NaN",
+        edits: &[("return ok ? v : NAN;", "return ok ? v : 0.0f;", 1)],
+    },
+    Mutant {
         name: "attn_score_scale",
         clause: "attn_f16",
         why: "the score is twice the scaled dot",
@@ -1114,8 +1397,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "norm_rows",
         why: "every row of the chunk takes row 0's sum of squares, so row 0's scale",
         edits: &[(
-            "        float4 xv = norm_rows_load4(xr, f4);",
-            "        float4 xv = norm_rows_load4(x, f4);",
+            "const uint f4s = args.cols / 4u;\n\n    float sum_sq = 0.f;\n    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n        float4 xv = norm_rows_load4(xr, f4);",
+            "const uint f4s = args.cols / 4u;\n\n    float sum_sq = 0.f;\n    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n        float4 xv = norm_rows_load4(x, f4);",
             1,
         )],
     },
@@ -1258,8 +1541,36 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "norm_rows_nan",
         why: "a row the norm cannot take is written as zeros, not NaN",
         edits: &[(
-            "*((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
-            "*((device float4 *)(yr + f4 * 4u)) = float4(0.f);",
+            "norm_rows_raise(faults, args.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
+            "norm_rows_raise(faults, args.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(0.f);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "sandwich_no_norm",
+        clause: "sandwich",
+        why: "the post norm is skipped: the stream takes the sub-layer's output as it is, a plain add",
+        edits: &[("+ args.add * value;", "+ norm_rows_load4(xr, f4);", 1)],
+    },
+    Mutant {
+        name: "sandwich_no_gain",
+        clause: "sandwich",
+        why: "the norm's gain is not applied to the value",
+        edits: &[("return (x * gain) * scale;", "return x * scale;", 1)],
+    },
+    Mutant {
+        name: "sandwich_add_ignored",
+        clause: "sandwich",
+        why: "the add scale is ignored: the normed value is always added once",
+        edits: &[("+ args.add * value;", "+ value;", 1)],
+    },
+    Mutant {
+        name: "sandwich_nan_stays",
+        clause: "sandwich_nan",
+        why: "a row the norm cannot take leaves the stream's row as it was, a finite value, not NaN",
+        edits: &[(
+            "norm_rows_raise(faults, args.norm.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
+            "norm_rows_raise(faults, args.norm.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4);",
             1,
         )],
     },

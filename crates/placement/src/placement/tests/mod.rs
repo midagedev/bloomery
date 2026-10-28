@@ -10,6 +10,7 @@ use super::*;
 
 mod bounds;
 mod early;
+mod floor;
 mod legs;
 
 /// A plan of no rows under `budget`, for a planner [`plan_in_pool`]

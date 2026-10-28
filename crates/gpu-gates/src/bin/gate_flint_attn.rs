@@ -1,6 +1,6 @@
 //! Flint's head-128 attention kernels, model-free: the window-and-sinks flash
-//! (`gqa_flash_seg_h128_swa`, `gqa_flash_merge_h128_swa`) and the no-rope q/k
-//! RMS append (`qk_rms_append`).
+//! at a group of eight (`gqa_flash_seg_h128_swa`, `gqa_flash_merge_h128_swa`)
+//! and the no-rope q/k RMS append (`qk_rms_append`).
 //!
 //! The flash is held to an f64 softmax of the same f16 keys and values, over
 //! the gate's own window — the last `window` live keys, or every live key
@@ -176,7 +176,7 @@ mod gate {
     }
 
     /// A launch the host refuses before it reads a buffer length. `m`, the
-    /// group, the scale and the sinks are the fields those checks name.
+    /// group and the scale are the fields those checks name.
     fn early<'a>(
         q: &'a DeviceBuffer<f32>,
         half: &'a DeviceBuffer<u16>,
@@ -378,7 +378,7 @@ mod gate {
         let mut part_v = DeviceBuffer::<f32>::zeroed(s, 1)?;
         let mut part_ms = DeviceBuffer::<f32>::zeroed(s, 1)?;
         let mut y = DeviceBuffer::<f32>::zeroed(s, 1)?;
-        // The four checks below return before any buffer length is read.
+        // The three checks below return before any buffer length is read.
         let mut ok = refused(
             "m = 0",
             launch(
@@ -403,29 +403,21 @@ mod gate {
             ),
             "must be finite",
         );
+        // PIN(2026-10-29): a group of four is served (LFM3's), so the group refusal moves from
+        // four query heads to five, which no entry takes, and its phrase names both served
+        // groups. The "sinks missing" clause is removed: `sinks: None` is a layer with no sink
+        // term and launches (`gate_lfm3_kernels` holds that launch).
         ok &= refused(
-            "group not 8",
+            "group not 8 or 4",
             launch(
                 gpu,
                 k,
-                early(&one_f, &one_h, &one_u, Some(&one_f), 4, 1, 1.0),
+                early(&one_f, &one_h, &one_u, Some(&one_f), 5, 1, 1.0),
                 &mut part_v,
                 &mut part_ms,
                 &mut y,
             ),
-            "exactly 8",
-        );
-        ok &= refused(
-            "sinks missing",
-            launch(
-                gpu,
-                k,
-                early(&one_f, &one_h, &one_u, None, GROUP, 1, 1.0),
-                &mut part_v,
-                &mut part_ms,
-                &mut y,
-            ),
-            "pass the layer's sinks",
+            "8 or 4 query heads",
         );
 
         let n_head = GROUP;

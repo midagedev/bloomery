@@ -11,10 +11,40 @@
 
 use gguf::Value;
 use hf::modelopt::Plain;
-use hf::schema::{Fields, Rule::*, Type};
+use hf::schema::{Fields, Rule, Rule::*, Type};
 use model::arch::names as common;
 
 use super::section::Section;
+
+/// `tie_word_embeddings` of a map whose model has a head of its own: absent or false. A map
+/// that must read a folder whose head is the embedding takes [`HEAD_EITHER`] instead.
+pub(super) const HEAD_OWN: (&str, Rule) = ("tie_word_embeddings", Only("[false]"));
+
+/// `tie_word_embeddings` of a map whose model may tie its head to the embedding: read by
+/// [`tied`], and held against the folder's head by [`check_head`].
+pub(super) const HEAD_EITHER: (&str, Rule) = ("tie_word_embeddings", Read);
+
+/// `tie_word_embeddings`, which must be there and a bool.
+pub(super) fn tied<E: From<String>>(c: &Section<'_, E>) -> Result<bool, E> {
+    c.field("tie_word_embeddings")?
+        .as_bool()
+        .ok_or_else(|| c.bad("tie_word_embeddings", "must be a bool"))
+}
+
+/// The flag `tied` held against the head the folder holds (its name, `None` for none): a tied
+/// model has no head beside the embedding, and one that is not tied has one. Either mismatch is
+/// refused, so no folder is read as the head it does not hold.
+pub(super) fn check_head(tied: bool, head: Option<&str>) -> Result<(), String> {
+    match (tied, head) {
+        (true, Some(name)) => Err(format!(
+            "{name} is a head beside the embedding, where config.json.tie_word_embeddings is true"
+        )),
+        (false, None) => Err(
+            "config.json.tie_word_embeddings is false, and the folder holds no head".to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
 
 /// The `config.json` keys of the text model that every trunk map spells alike.
 pub(super) const KEYS: &Fields = &[
@@ -35,7 +65,7 @@ pub(super) const KEYS: &Fields = &[
     // The feed-forward block's SwiGLU, routed or dense.
     ("hidden_act", Only(r#"["silu"]"#)),
     ("attention_bias", Only("[false]")),
-    ("tie_word_embeddings", Only("[false]")),
+    HEAD_OWN,
     (
         "dtype",
         Ignore(
@@ -359,6 +389,46 @@ mod tests {
         }
         assert_eq!(global("layers.0.mlp.gate.weight"), None);
         assert_eq!(dense_ffn(3, "mlp.switch_mlp.gate_proj.weight"), None);
+    }
+
+    /// The tie flag must be there and a bool, and is held against the folder's head both ways:
+    /// a tied model that holds a head and an untied one that holds none are refused by name.
+    /// Mutants (each red at its line): `check_head` reading `(true, Some)` as fine (the
+    /// first), `(false, None)` as fine (the second), `tied` defaulting a missing flag (the
+    /// third).
+    #[test]
+    fn the_tie_flag_is_held_against_the_head_the_folder_holds() {
+        #[derive(Debug, PartialEq)]
+        struct Why(String);
+        impl From<String> for Why {
+            fn from(why: String) -> Why {
+                Why(why)
+            }
+        }
+        assert_eq!(check_head(true, None), Ok(()));
+        assert_eq!(check_head(false, Some("lm_head.weight")), Ok(()));
+        let e = check_head(true, Some("lm_head.weight")).unwrap_err();
+        assert!(e.contains("lm_head.weight") && e.contains("is true"), "{e}");
+        let e = check_head(false, None).unwrap_err();
+        assert!(e.contains("is false") && e.contains("no head"), "{e}");
+        let json = serde_json::json!({"tie_word_embeddings": true, "bad": 1});
+        let c = Section::<Why>::new(&json, "config.json").unwrap();
+        assert_eq!(tied(&c), Ok(true));
+        let json = serde_json::json!({"tie_word_embeddings": "yes"});
+        let c = Section::<Why>::new(&json, "config.json").unwrap();
+        assert_eq!(
+            tied(&c),
+            Err(Why("config.json.tie_word_embeddings must be a bool".into()))
+        );
+        let json = serde_json::json!({});
+        let c = Section::<Why>::new(&json, "config.json").unwrap();
+        assert_eq!(
+            tied(&c),
+            Err(Why("config.json.tie_word_embeddings is missing".into()))
+        );
+        // A map whose model has its own head refuses a tied folder, as before.
+        assert!(matches!(HEAD_OWN.1, Only("[false]")));
+        assert!(matches!(HEAD_EITHER.1, Read));
     }
 
     /// A shape has values when no dim is zero and their product fits `usize`.

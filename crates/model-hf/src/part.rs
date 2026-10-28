@@ -23,6 +23,8 @@ use model::placement::ExpertList;
 use model::placement::tp::TpError;
 use safetensors::{Dtype, Folder, Raw};
 
+use crate::folder::Constant;
+
 /// Why a part was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -68,12 +70,14 @@ pub struct Made {
     pub step: Option<Step>,
 }
 
-/// A checkpoint folder as a load reads it: its tensors, its quantization plan, and the tensors
-/// the model's map makes of them, by the program's names.
+/// A checkpoint folder as a load reads it: its tensors, its quantization plan, the tensors the
+/// model's map makes of them, and the ones it gives of its own, by the program's names.
 pub struct Checkpoint {
     folder: Folder,
     plan: Plan,
     made: BTreeMap<String, Made>,
+    /// The tensors no folder tensor holds ([`Constant`]), made whole and cut as a moved tensor is.
+    constants: BTreeMap<String, Constant>,
 }
 
 impl Checkpoint {
@@ -96,13 +100,31 @@ impl Checkpoint {
                 return Err(refuse(name, format!("its source {s} {why}")));
             }
         }
-        Ok(Checkpoint { folder, plan, made })
+        Ok(Checkpoint {
+            folder,
+            plan,
+            made,
+            constants: BTreeMap::new(),
+        })
+    }
+
+    /// This checkpoint with the tensors `constants` of the program that no folder tensor holds.
+    #[must_use]
+    pub fn with_constants(mut self, constants: BTreeMap<String, Constant>) -> Checkpoint {
+        self.constants = constants;
+        self
     }
 
     /// The tensors the map makes, by name.
     #[cfg(test)]
     pub(crate) fn made(&self) -> &BTreeMap<String, Made> {
         &self.made
+    }
+
+    /// The tensors no folder tensor holds, by name.
+    #[cfg(test)]
+    pub(crate) fn constants(&self) -> &BTreeMap<String, Constant> {
+        &self.constants
     }
 
     fn placed<'s>(&'s self, m: &'s Made) -> Vec<(&'s str, &'s Placed)> {
@@ -215,11 +237,25 @@ impl Source for Checkpoint {
             }
             out.push(Planned { at, info });
         }
+        for (name, c) in &self.constants {
+            let whole = whole(name, GgmlType::F32, &c.dims)?;
+            let Some(at) = part::take(&rule, &whole)? else {
+                continue;
+            };
+            let (info, _) = part::part_at(&whole, at.as_ref())?;
+            out.push(Planned { at, info });
+        }
         Ok(out)
     }
 
     fn read_bytes(&self, p: &Planned) -> Result<u64, Error> {
         let name = &p.info.name;
+        if let Some(c) = self.constants.get(name) {
+            return whole(name, GgmlType::F32, &c.dims)?
+                .nbytes
+                .checked_add(p.info.nbytes)
+                .ok_or_else(|| refuse(name, "normalized read bytes pass u64"));
+        }
         let m = self
             .made
             .get(name)
@@ -321,6 +357,28 @@ impl Source for Checkpoint {
     /// is refused by name.
     fn read(&self, p: &Planned) -> Result<Part<'_>, Error> {
         let name = p.info.name.as_str();
+        if let Some(c) = self.constants.get(name) {
+            let whole = whole(name, GgmlType::F32, &c.dims)?;
+            let all = c.bytes();
+            let bytes: Vec<u8> = match &p.at {
+                None => all,
+                Some(at) => {
+                    let (_, runs) = part::part_at(&whole, Some(at))?;
+                    runs.into_iter().flat_map(|r| &all[r]).copied().collect()
+                }
+            };
+            if bytes.len() as u64 != p.info.nbytes {
+                return Err(refuse(
+                    name,
+                    format!(
+                        "made {} bytes, not the planned {}",
+                        bytes.len(),
+                        p.info.nbytes
+                    ),
+                ));
+            }
+            return Ok(Part::made(p.info.clone(), bytes, None));
+        }
         let m = self
             .made
             .get(name)
@@ -403,6 +461,9 @@ impl Source for Checkpoint {
     /// part reads them.
     fn release(&self, p: &Planned) -> Result<(), Error> {
         let name = p.info.name.as_str();
+        if self.constants.contains_key(name) {
+            return Ok(());
+        }
         let m = self
             .made
             .get(name)

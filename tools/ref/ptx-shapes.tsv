@@ -211,6 +211,7 @@ generate_ds41   glm5next_router_pick                     0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_h128_swa                0           0
+generate_ds41   gqa_flash_merge_h128_swa_nosink         0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
 generate_ds41   gqa_flash_seg                            0           0
 generate_ds41   gqa_flash_seg_256                        0           0
@@ -218,6 +219,7 @@ generate_ds41   gqa_flash_seg_256_p2                     0           0
 generate_ds41   gqa_flash_seg_256_p4                     0           0
 generate_ds41   gqa_flash_seg_g5                         0           0
 generate_ds41   gqa_flash_seg_h128_swa                   0           0
+generate_ds41   gqa_flash_seg_h128_swa_g4                0           0
 generate_ds41   gqa_flash_seg_k192                       0           0
 generate_ds41   gqa_flash_seg_k192_ring                  0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
@@ -563,7 +565,9 @@ generate_ds41	swiglu_rule_rows	0	0
 # sm_86, ptxas 13.3.33, RTX 3090 cc8.6, driver 595.91.07 (CUDA API 13.2).
 # Full generate_ds41 JIT: 436 entries, cache off; each new entry has measured spill=0/jit_local=0.
 generate_ds41   gqa_flash_merge_h128_swa_ring             0           0
+generate_ds41   gqa_flash_merge_h128_swa_ring_nosink      0           0
 generate_ds41   gqa_flash_seg_h128_swa_ring               0           0
+generate_ds41   gqa_flash_seg_h128_swa_ring_g4            0           0
 generate_ds41   head_norm_neox_append_ring               0           0
 generate_ds41   normalize                                0           0
 generate_ds41   qk_rms_append_ring                        0           0

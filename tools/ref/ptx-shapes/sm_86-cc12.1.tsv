@@ -533,7 +533,12 @@ generate_ds41     nvfp4_gemv_sel_f32                           0           0
 generate_ds41     relu_sqr                                     0           0
 # PIN(2026-10-24): 0.3.9's generate_ds41 entries carry the cc 8.6 scan's values; no cc 12.1 scan has run on them yet.
 generate_ds41   gqa_flash_merge_h128_swa                 0           0
+# PIN(2026-10-29): LFM3's group-4 and no-sink head-128 entries (gqa_flash_seg_h128_swa_g4, gqa_flash_seg_h128_swa_ring_g4,
+# gqa_flash_merge_h128_swa_nosink, gqa_flash_merge_h128_swa_ring_nosink) at the cc 8.6 scan's values
+# (tools/ref/ptx-shapes.tsv), not measured on cc 12.1, until a GB10 scan runs.
+generate_ds41   gqa_flash_merge_h128_swa_nosink          0           0
 generate_ds41   gqa_flash_seg_h128_swa                   0           0
+generate_ds41   gqa_flash_seg_h128_swa_g4                0           0
 generate_ds41   gqa_prefill_flash_512_p4_lower           0           0
 generate_ds41   qk_rms_append                            0           0
 generate_ds41   qwen3moe_combine_tier                    0           0
@@ -577,7 +582,9 @@ generate_ds41   rope_norm_append                         0           0
 generate_ds41   rope_norm_append_q8                      0           0
 # PIN(2026-10-27): Flint's entries (gqa_flash_merge_h128_swa_ring, gqa_flash_seg_h128_swa_ring, head_norm_neox_append_ring, normalize, qk_rms_append_ring, restore, routed_shared_residual, sigmoid_floor_256_6_router, sigmoid_floor_256_6_router_pick) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv), not measured on cc 12.1, until a GB10 scan runs.
 generate_ds41   gqa_flash_merge_h128_swa_ring             0           0
+generate_ds41   gqa_flash_merge_h128_swa_ring_nosink      0           0
 generate_ds41   gqa_flash_seg_h128_swa_ring               0           0
+generate_ds41   gqa_flash_seg_h128_swa_ring_g4            0           0
 generate_ds41   head_norm_neox_append_ring               0           0
 generate_ds41   normalize                                0           0
 generate_ds41   qk_rms_append_ring                        0           0

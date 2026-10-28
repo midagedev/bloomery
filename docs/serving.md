@@ -144,7 +144,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   that plan is short of the card — or of the host, where the body keeps no tier past it, or of a unified pool no share
   of which between the card and the host fits, or that cannot also hold a checkpoint folder's load reading its parts
   one at a time — the largest context under it whose plan holds, a multiple of 1,024 down to 4,096;
-  one `ctx` line names the rule, `target` or `fitted`. A set value is the total the slots split, and
+  one `ctx` line names the rule, `target` or `fitted`. On Qwen3.8, where the adaptive residency runs with experts on the card
+  (`BLOOMERY_RESIDENCY` unset on plan (a) or (b′): two routed experts a layer; a set `mid-p<P>-s<S>` word: P + S + 1), the
+  plan holds only if it also leaves every layer of the card that many, so the context never takes all the card's room; where not even 4,096 positions leave them the fit is the plain one, the
+  residency resolves `off`, and a `ctx experts-floor=unmet` line says why. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
@@ -462,7 +465,7 @@ lookup draft, Qwen3.8 under `--place bp` and MiniMax-M3 step their slots in turn
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
 llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
-rows, on V4.1 the same way; with no context named, each slot holds the default's choice (the largest context the plan of N slots holds) and the total is that times N.
+rows, on V4.1 the same way; with no context named, each slot holds the default's choice (the largest context the plan of N slots holds, on Qwen3.8 one that also leaves the residency its experts, above) and the total is that times N.
 `--parallel 1` keeps one sequence with the whole context.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it.

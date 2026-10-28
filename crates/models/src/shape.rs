@@ -759,6 +759,22 @@ pub const GQA: &[GqaInst] = &[
         value_scale: false,
         at: "gpu/src/flash_gqa_h128_swa.rs gqa_flash_seg_h128_swa",
     },
+    // Head 128, value 128, one block of four, with a window and no sinks: the
+    // head-128 flash at a group of four (`gpu/src/attention_h128.rs`'s
+    // binding, plane and ring). Full layers launch window 0, so the row covers
+    // a layer with a window or without one. It claims no sinks: no layer of
+    // this group has them.
+    GqaInst {
+        head: 128,
+        value: 128,
+        pack: 4,
+        group: GroupRule::One,
+        window: true,
+        sinks: false,
+        value_scale: false,
+        at: "gpu/src/flash_gqa_h128_swa.rs gqa_flash_seg_h128_swa_g4 (the ring: \
+             gpu/src/attention_h128_ring.rs gqa_flash_seg_h128_swa_ring_g4)",
+    },
     GqaInst {
         head: 128,
         value: 128,
@@ -955,7 +971,7 @@ mod tests {
         RouterRule, Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
         select_router,
     };
-    use crate::{Act, Moe, Router, RouterNorm, Score, Shared};
+    use crate::{Act, Gqa, Moe, OutGate, Rope, RopeMode, Router, RouterNorm, Score, Shared};
 
     fn moe(rule: RouterRule, experts: u32, top_k: u32) -> MoeShape {
         MoeShape {
@@ -1394,8 +1410,11 @@ mod tests {
             e.why,
             Refusal::GqaGroup {
                 group: 12,
+                // PIN(2026-10-29): the head-128 group-of-four row (`GQA`'s
+                // pack-4 row at head 128) joins the groups served.
                 served: vec![
                     "exactly 8".to_string(),
+                    "exactly 4".to_string(),
                     "exactly 5".to_string(),
                     "exactly 7".to_string(),
                     "exactly 16".to_string()
@@ -1622,6 +1641,108 @@ mod tests {
         };
         assert_eq!(rules::BIASED_SIGMOID, rule);
         assert!(select_router(moe(rule, 288, 8)).is_ok());
+    }
+
+    /// LFM3-1.7B's attention as its description states it: 16 query heads over 4 key heads of
+    /// 128 values, no sinks, a window of 256 on the sliding layers and none on the full ones.
+    fn lfm3(window: Option<u32>) -> Gqa {
+        Gqa {
+            heads: 16,
+            kv_heads: 4,
+            head_dim: 128,
+            value_dim: 128,
+            rope: Rope {
+                mode: RopeMode::Neox,
+                dims: 128,
+                base: 1_000_000.0,
+                yarn: None,
+                factors: window.is_none(),
+            },
+            qk_norm: true,
+            o_norm: false,
+            out_gate: OutGate::ProjHead,
+            select: None,
+            window,
+            sinks: false,
+            value_scale: None,
+        }
+    }
+
+    /// Both of LFM3's layer kinds, read through the description, select the head-128 group-of-four
+    /// row: the sliding layer for its window, the full layer because the row's launch cuts window 0.
+    #[test]
+    fn lfm3_sliding_and_full_layers_select_the_group_of_four_row() {
+        for (name, window) in [("sliding", Some(256)), ("full", None)] {
+            let s = AttnShape::of(&lfm3(window));
+            let row = select_gqa(s).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                (row.head, row.value, row.pack, row.group),
+                (128, 128, 4, GroupRule::One),
+                "{name}"
+            );
+            assert!(row.window && !row.sinks && !row.value_scale, "{name}");
+            assert!(
+                row.at.contains("gqa_flash_seg_h128_swa_g4"),
+                "{name}: {}",
+                row.at
+            );
+            assert_eq!(row.packs(s.n_head / s.n_kv), 1, "{name}");
+        }
+        let sliding = AttnShape::of(&lfm3(Some(256)));
+        assert_eq!((sliding.window, sliding.sinks), (Some(256), false));
+        assert_eq!(AttnShape::of(&lfm3(None)).window, None);
+    }
+
+    /// The row claims no sinks and no value scale: a group-of-four layer that asks for either is
+    /// refused by name, as a window on a row that cuts none is.
+    #[test]
+    fn the_group_of_four_row_refuses_sinks_and_a_value_scale_by_name() {
+        let base = AttnShape::of(&lfm3(Some(256)));
+        let sunk = AttnShape {
+            sinks: true,
+            ..base
+        };
+        assert_eq!(select_gqa(sunk).expect_err("sinks").why, Refusal::Sinks);
+        let scaled = AttnShape {
+            scaled: true,
+            ..base
+        };
+        assert_eq!(
+            select_gqa(scaled).expect_err("a value scale").why,
+            Refusal::ValueScale
+        );
+    }
+
+    /// The group-of-four row changes no other shape's row: head 128 at eight query heads a key
+    /// head with or without a window still takes the pack-8 rows, and head 256 at four takes its
+    /// own pack-4 row, one block a key head.
+    #[test]
+    fn the_group_of_four_row_leaves_the_other_rows_alone() {
+        let plain = select_gqa(attn(32, 4, 128)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((plain.pack, plain.window, plain.sinks), (8, false, false));
+        assert!(plain.at.contains("HEAD, GROUP"), "{}", plain.at);
+        let windowed = select_gqa(AttnShape {
+            window: Some(513),
+            sinks: true,
+            ..attn(32, 4, 128)
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (windowed.pack, windowed.window, windowed.sinks),
+            (8, true, true)
+        );
+        let wide = select_gqa(attn(8, 2, 256)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (wide.head, wide.pack, wide.group),
+            (256, 4, GroupRule::Packs)
+        );
+        assert_eq!(wide.packs(4), 1);
+        assert_eq!(
+            gqa_row_v(128, 128, 4).map(|r| r.pack),
+            Some(4),
+            "head 128 at four query heads takes the new row"
+        );
+        assert_eq!(gqa_row_v(128, 128, 8).map(|r| r.pack), Some(8));
     }
 
     #[test]

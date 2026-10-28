@@ -1271,6 +1271,7 @@ mod tests {
                     tensors.insert(p.decl.name.as_str(), (&p.decl, m));
                 }
                 Make::Scale { of } => scales.push((&p.decl, of.as_str())),
+                Make::Constant(_) => panic!("{}: the map makes no constant", p.decl.name),
             }
         }
         assert_eq!(
@@ -1441,7 +1442,7 @@ mod tests {
             .iter()
             .filter_map(|p| match &p.make {
                 Make::Tensor(m) => Some(m.sources.iter().map(String::as_str)),
-                Make::Scale { .. } => None,
+                Make::Scale { .. } | Make::Constant(_) => None,
             })
             .flatten()
             .collect();

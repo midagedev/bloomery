@@ -4,11 +4,14 @@ use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::f32_to_f16_bits;
-use crate::flash::{MERGE_BATCH, half_bits_to_f32, online_fold};
+use crate::flash::{MERGE_BATCH, online_fold};
 use crate::flash_gqa::{
-    GROUP, HEAD, KEY_TILE, SEG_KEYS, SEGMENTS, seg_span, window_cut, window_segments,
+    GROUP, HEAD, KEY_TILE, SEG_KEYS, merge_sink_body, seg_span, window_cut, window_segments,
 };
-use crate::flash_gqa_h128_swa::{H128SwaArgs, fold_tile};
+use crate::flash_gqa_h128_swa::{
+    GROUP_4, H128SwaArgs, K_STRIDE, MERGE_THREADS, ROW_QWORDS, THREADS_G4_U32, THREADS_U32,
+    group_sinks_refusal, live_keys, seg_h128, served_group,
+};
 use crate::launch_u32;
 use crate::rope_neox::NeoxArgs;
 use crate::rope_neox::neox_pair;
@@ -18,31 +21,6 @@ use cuda_device::{
 };
 use cuda_host::cuda_module;
 use std::sync::Arc;
-
-/// u32 words of one key row, and the padded stride the key tile is staged at.
-const ROW_WORDS: usize = HEAD / 2;
-const K_STRIDE: usize = ROW_WORDS + 1;
-/// u64 words of one value row.
-const ROW_QWORDS: usize = HEAD / 4;
-const ILP: usize = 4;
-const THREADS: usize = GROUP * 32;
-const THREADS_U32: u32 = THREADS as u32;
-const MERGE_THREADS: u32 = HEAD as u32;
-const _: () = assert!(THREADS_U32 as usize == THREADS && MERGE_THREADS as usize == HEAD);
-const _: () = assert!(ROW_QWORDS == 32 && ROW_WORDS.is_multiple_of(ILP) && K_STRIDE % 2 == 1);
-// The launch's window: 513 positions is nine 64-key segments, and a row of
-// 600 live keys starts at key 87.
-const _: () = {
-    assert!(window_segments(0) == SEGMENTS && window_segments(513) == 9);
-    let (first, n_w) = window_cut(600, 513);
-    assert!(first == 87 && n_w == 513 && first + n_w == 600);
-};
-
-#[inline(always)]
-fn live_keys(count: u32, ctx: usize) -> usize {
-    let c = count as usize;
-    if c > ctx { 0 } else { c }
-}
 
 #[cuda_module]
 mod append_kernels {
@@ -351,6 +329,8 @@ mod append_kernels {
 #[cuda_module]
 mod flash_kernels {
     use super::*;
+    /// Segment pass at [`GROUP`] query heads a key head (`seg_h128` under
+    /// `RING`): a block of 256 threads, warp `w` is query head `kh·8 + w`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -385,152 +365,114 @@ mod flash_kernels {
         rows: u32,
         m: u32,
         window: u32,
-        mut part_v: DisjointSlice<f32>,
-        mut part_ms: DisjointSlice<f32>,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
     ) {
         static mut QS: SharedArray<f32, { GROUP * HEAD }> = SharedArray::UNINIT;
         static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
         static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { GROUP * KEY_TILE }> = SharedArray::UNINIT;
 
-        let b = thread::blockIdx_x() as usize;
-        let nkv = n_kv as usize;
-        let n_seg = segs as usize;
-        let tokens = m as usize;
-        if b >= tokens * nkv * n_seg {
-            return; // block-uniform
-        }
-        let t = b % tokens;
-        let sk = b / tokens;
-        let seg = sk / nkv;
-        let kh = sk - seg * nkv;
-        let tid = thread::threadIdx_x() as usize;
-        let w = tid / 32;
-        let lane = warp::lane_id() as usize;
-        let n_head = nkv * GROUP;
-        let h = kh * GROUP + w;
-        let idx = (t * n_head + h) * n_seg + seg;
-        let ctx = ctx as usize;
-        // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
-        let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-        let (first, n_w) = window_cut(limit, window as usize);
-        let span = seg_span(n_w, n_seg, seg_keys as usize);
-        let lo = first + seg * span;
-        if lo >= first + n_w {
-            if lane == 0 {
-                // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
-                unsafe {
-                    *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
-                    *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
-                }
-            }
-            return; // block-uniform: the window cut is the block's
-        }
-        let hi = (lo + span).min(first + n_w);
-
-        // SAFETY: each `static mut` is this block's own shared allocation.
-        // The raw form reaches it without a reference. Every index below is
-        // inside its array, and every write is ordered before its reads by a
-        // block barrier (or, for the weights, by the warp sync in `fold_tile`).
-        let (qs, ks, vs, ws) = unsafe {
-            (
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for GROUP query heads; the raw form reaches it
+        // without a reference. The launch contract is `seg_h128`'s under
+        // RING at GROUP, and the block is GROUP · 32 threads.
+        unsafe {
+            seg_h128::<GROUP, true>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                rows,
+                segs,
+                seg_keys,
+                m,
+                window,
+                part_v,
+                part_ms,
                 SharedArray::as_raw_mut_ptr(&raw mut QS),
                 SharedArray::as_raw_mut_ptr(&raw mut KS),
                 SharedArray::as_raw_mut_ptr(&raw mut VS),
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
             )
         };
+    }
 
-        let qb = (t * n_head + kh * GROUP) * HEAD;
-        let mut i = 0usize;
-        while i < 4 {
-            // SAFETY: qb + 4·tid + i is inside row t's group, and that row is
-            // inside q by the launch contract. The shared index is inside
-            // GROUP·HEAD.
-            unsafe { *qs.add(4 * tid + i) = *q.get_unchecked(qb + 4 * tid + i) };
-            i += 1;
-        }
+    /// [`gqa_flash_seg_h128_swa_ring`] at [`GROUP_4`] query heads a key head
+    /// (`seg_h128` under `RING`): a block of 128 threads, warp `w` is query
+    /// head `kh·4 + w`, and a head's partials are the group of eight's for the
+    /// same keys.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            rows >= 1,
+            rows <= ctx,
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            q.len() >= m * n_kv * 4 * 128,
+            kc.len() >= n_kv * rows * 128,
+            vc.len() >= n_kv * rows * 128,
+            part_v.len() >= m * n_kv * 4 * segs * 128,
+            part_ms.len() >= m * n_kv * 4 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_h128_swa_ring_g4(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        rows: u32,
+        m: u32,
+        window: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { GROUP_4 * HEAD }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP_4 * KEY_TILE }> = SharedArray::UNINIT;
 
-        let plane = kh * rows as usize * HEAD;
-        let k64 = kc.as_ptr() as *const u64;
-        let v64 = vc.as_ptr() as *const u64;
-        let mut mx = f32::NEG_INFINITY;
-        let mut s_sum = 0.0f32;
-        let mut acc = [0.0f32; 4];
-        let mut t0 = lo;
-        while t0 < hi {
-            thread::sync_threads();
-            let mut i = 0usize;
-            while i < 4 {
-                let e = tid + THREADS * i;
-                let key = e / ROW_QWORDS;
-                let word = e - key * ROW_QWORDS;
-                let (kw, vw) = if t0 + key < hi {
-                    // SAFETY: t0 + key < hi <= limit <= ctx, so the row is
-                    // mapped modulo rows inside key head kh's ring. A row is 32 u64 and the
-                    // planes start 8-byte aligned (a device allocation).
-                    unsafe {
-                        let r = (plane + ((t0 + key) % rows as usize) * HEAD) / 4 + word;
-                        (*k64.add(r), *v64.add(r))
-                    }
-                } else {
-                    (0u64, 0u64)
-                };
-                // SAFETY: key < 32 and word < 32, inside the staged tiles.
-                unsafe {
-                    *ks.add(key * K_STRIDE + 2 * word) = kw as u32;
-                    *ks.add(key * K_STRIDE + 2 * word + 1) = (kw >> 32) as u32;
-                    *vs.add(key * ROW_QWORDS + word) = vw;
-                }
-                i += 1;
-            }
-            thread::sync_threads();
-
-            let live = t0 + lane < hi;
-            let mut a = [0.0f32; ILP];
-            let mut wd = 0usize;
-            while wd < ROW_WORDS {
-                let mut p = 0usize;
-                while p < ILP {
-                    // SAFETY: lane < 32 and wd + p < ROW_WORDS, inside the
-                    // staged key tile. The query index is inside GROUP·HEAD.
-                    let (kw, q0, q1) = unsafe {
-                        (
-                            *ks.add(lane * K_STRIDE + wd + p),
-                            *qs.add(w * HEAD + 2 * (wd + p)),
-                            *qs.add(w * HEAD + 2 * (wd + p) + 1),
-                        )
-                    };
-                    let k0 = half_bits_to_f32(kw as u16);
-                    let k1 = half_bits_to_f32((kw >> 16) as u16);
-                    a[p] = f32::mul_add(q0, k0, a[p]);
-                    a[p] = f32::mul_add(q1, k1, a[p]);
-                    p += 1;
-                }
-                wd += ILP;
-            }
-            let dot = (a[0] + a[1]) + (a[2] + a[3]);
-            let sc = if live { dot * scale } else { f32::NEG_INFINITY };
-
-            // SAFETY: the weight and value tiles are this block's, the value
-            // tile was published by the barrier above, and w < GROUP.
-            unsafe { fold_tile(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane) };
-            t0 += KEY_TILE;
-        }
-
-        // SAFETY: idx is inside the partials. The four dims 4·lane .. +3 are
-        // this lane's alone, and lane 0 writes (max, sum).
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for GROUP_4 query heads; the raw form reaches it
+        // without a reference. The launch contract is `seg_h128`'s under
+        // RING at GROUP_4, and the block is GROUP_4 · 32 threads.
         unsafe {
-            let o = idx * HEAD + 4 * lane;
-            *part_v.get_unchecked_mut(o) = acc[0];
-            *part_v.get_unchecked_mut(o + 1) = acc[1];
-            *part_v.get_unchecked_mut(o + 2) = acc[2];
-            *part_v.get_unchecked_mut(o + 3) = acc[3];
-            if lane == 0 {
-                *part_ms.get_unchecked_mut(2 * idx) = mx;
-                *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
-            }
-        }
+            seg_h128::<GROUP_4, true>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                rows,
+                segs,
+                seg_keys,
+                m,
+                window,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
     }
 
     #[allow(
@@ -625,6 +567,59 @@ mod flash_kernels {
         };
         // SAFETY: b·HEAD + d is inside y; thread d owns it.
         unsafe { *y.get_unchecked_mut(b * HEAD + d) = out };
+    }
+
+    /// The merge of a layer with no sinks: [`gqa_flash_merge_h128_swa_ring`]'s
+    /// walk over the segments (`merge_sink_body` without the sink),
+    /// `acc · (1/s)`. Segments ascending: this order is the gate.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            part_v.len() >= m * n_head * segs * 128,
+            part_ms.len() >= m * n_head * segs * 2,
+            y.len() >= m * n_head * 128
+        )
+    )]
+    pub fn gqa_flash_merge_h128_swa_ring_nosink(
+        part_v: &[f32],
+        part_ms: &[f32],
+        n_keys_buf: &[u32],
+        n_head: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        window: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `merge_sink_body`'s at HEAD without
+        // the sink, and the block is HEAD threads.
+        unsafe {
+            merge_sink_body::<HEAD, false>(
+                part_v,
+                part_ms,
+                n_keys_buf,
+                &[],
+                n_head,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                window as usize,
+                fault,
+                y,
+            )
+        };
     }
 }
 
@@ -752,6 +747,10 @@ impl Kernels {
         Ok(())
     }
 
+    /// Enqueue `m` rows of a window layer over a ring of `rows` rows. `n_head`
+    /// is `8 · n_kv` or `4 · n_kv`; any other group is refused by name.
+    /// `sinks` `None` runs the merge with no sink term; sinks at a group of
+    /// four are refused by name (`group_sinks_refusal`).
     pub(crate) fn attention(
         &self,
         stream: &CudaStream,
@@ -781,7 +780,6 @@ impl Kernels {
             || rows == 0
             || rows > ctx
             || m == 0
-            || n_kv.checked_mul(GROUP) != Some(n_head)
             || !scale.is_finite()
             || window == 0
             || window > rows
@@ -794,7 +792,18 @@ impl Kernels {
                 ),
             ));
         }
-        let sinks = sinks.ok_or_else(|| GpuError::shape(WHAT, "per-head sinks required"))?;
+        let Some(group) = served_group(n_head, n_kv) else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the ring kernels take {GROUP} or {GROUP_4} query heads a key head; got \
+                     {n_head} heads over {n_kv}"
+                ),
+            ));
+        };
+        if let Some(why) = group_sinks_refusal(group, sinks.is_some()) {
+            return Err(GpuError::shape(WHAT, why));
+        }
         let segs = window_segments(window);
         let heads = m
             .checked_mul(n_head)
@@ -815,7 +824,6 @@ impl Kernels {
                 n_kv.checked_mul(rows).and_then(|n| n.checked_mul(HEAD)),
             ),
             ("n_keys", n_keys.len(), Some(m)),
-            ("sinks", sinks.len(), Some(n_head)),
             ("part_v", part_v.len(), partials.checked_mul(HEAD)),
             ("part_ms", part_ms.len(), partials.checked_mul(2)),
             ("y", y.len(), heads.checked_mul(HEAD)),
@@ -828,6 +836,14 @@ impl Kernels {
                     format!("{name}.len() {got} < {need}"),
                 ));
             }
+        }
+        if let Some(sinks) = sinks
+            && sinks.len() < n_head
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("sinks.len() {} < {n_head}", sinks.len()),
+            ));
         }
         let grid = launch_u32(
             WHAT,
@@ -844,37 +860,70 @@ impl Kernels {
         let mu = launch_u32(WHAT, "m", m)?;
         let window = launch_u32(WHAT, "window", window)?;
         let nh = launch_u32(WHAT, "heads", n_head)?;
-        let prep = self
-            .flash
-            .prepare_gqa_flash_seg_h128_swa_ring(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
-        self.flash.gqa_flash_seg_h128_swa_ring(
-            stream,
-            &prep,
-            q,
-            kc,
-            vc,
-            n_keys,
-            scale,
-            nkv,
-            ctx,
-            ns,
-            sk,
-            rows,
-            mu,
-            window,
-            &mut *part_v,
-            &mut *part_ms,
-        )?;
-        let prep = self
-            .flash
-            .prepare_gqa_flash_merge_h128_swa_ring(LaunchConfig1D::new(
-                launch_u32(WHAT, "merge grid", heads)?,
-                MERGE_THREADS,
-                0,
-            ))?;
-        self.flash.gqa_flash_merge_h128_swa_ring(
-            stream, &prep, part_v, part_ms, n_keys, sinks, nh, ctx, ns, sk, mu, window, fault, y,
-        )?;
+        if group == GROUP_4 {
+            let prep = self
+                .flash
+                .prepare_gqa_flash_seg_h128_swa_ring_g4(LaunchConfig1D::new(
+                    grid,
+                    THREADS_G4_U32,
+                    0,
+                ))?;
+            self.flash.gqa_flash_seg_h128_swa_ring_g4(
+                stream,
+                &prep,
+                q,
+                kc,
+                vc,
+                n_keys,
+                scale,
+                nkv,
+                ctx,
+                ns,
+                sk,
+                rows,
+                mu,
+                window,
+                &mut *part_v,
+                &mut *part_ms,
+            )?;
+        } else {
+            let prep = self
+                .flash
+                .prepare_gqa_flash_seg_h128_swa_ring(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
+            self.flash.gqa_flash_seg_h128_swa_ring(
+                stream,
+                &prep,
+                q,
+                kc,
+                vc,
+                n_keys,
+                scale,
+                nkv,
+                ctx,
+                ns,
+                sk,
+                rows,
+                mu,
+                window,
+                &mut *part_v,
+                &mut *part_ms,
+            )?;
+        }
+        let merge = LaunchConfig1D::new(launch_u32(WHAT, "merge grid", heads)?, MERGE_THREADS, 0);
+        if let Some(sinks) = sinks {
+            let prep = self.flash.prepare_gqa_flash_merge_h128_swa_ring(merge)?;
+            self.flash.gqa_flash_merge_h128_swa_ring(
+                stream, &prep, part_v, part_ms, n_keys, sinks, nh, ctx, ns, sk, mu, window, fault,
+                y,
+            )?;
+        } else {
+            let prep = self
+                .flash
+                .prepare_gqa_flash_merge_h128_swa_ring_nosink(merge)?;
+            self.flash.gqa_flash_merge_h128_swa_ring_nosink(
+                stream, &prep, part_v, part_ms, n_keys, nh, ctx, ns, sk, mu, window, fault, y,
+            )?;
+        }
         Ok(())
     }
 }

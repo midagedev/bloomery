@@ -4,7 +4,8 @@
 //! first-order bound of the `flash_gqa_prefill` walk at a head of `head`
 //! values and a key tile of `tile` keys. The model is `gate_qwen3moe_flash`'s
 //! (its module doc derives each term); each gate keeps the bounds of its own
-//! kernels and computes them from these terms.
+//! kernels and computes them from these terms. [`scalar_bound`] is the scalar
+//! pass's, for a gate whose kernel is that pass at some group.
 
 use crate::rounding::{U, gamma};
 
@@ -83,6 +84,36 @@ pub fn exact_attn(
         x,
         xmax,
     }
+}
+
+/// The scalar flash's bound on each output value of `ex` (`vh` its value
+/// rows): the score dot's `γ(head / 4 + 3)` (a partial's `head / 4` fused
+/// multiply-adds over four rotating partials, two combine levels, the scale),
+/// one rescale per `tile`-key tile and per segment, and the value and weight
+/// sums over a segment's `span` keys, the segments and the butterfly. `span`
+/// is the segment length the launch cut the `ex.pb.len()` keys by
+/// (`seg_span` of them); the pass is `gqa_flash_seg`'s scalar one at that
+/// head width, any group.
+#[must_use]
+pub fn scalar_bound(ex: &ExactAttn, vh: &[f32], head: usize, tile: usize, span: usize) -> Vec<f64> {
+    let n = ex.pb.len();
+    let segs = n.div_ceil(span);
+    let r = (n.div_ceil(tile) + segs) as f64;
+    let es = gamma(head / 4 + 3);
+    let acc = gamma(span + segs + 8);
+    (0..head)
+        .map(|d| {
+            let (mut t_s, mut pv) = (0.0f64, 0.0f64);
+            for j in 0..n {
+                let v = f64::from(vh[j * head + d]);
+                let dev = (v - ex.o[d]).abs();
+                let ee = 4.0 * U + 2.0 * U * ex.x[j];
+                t_s += ex.pb[j] * (es * ex.a[j] + ee + 4.0 * U * r + 2.0 * U * ex.xmax) * dev;
+                pv += ex.pb[j] * v.abs();
+            }
+            t_s + acc * (pv + ex.o[d].abs()) + 2.0 * U * ex.o[d].abs()
+        })
+        .collect()
 }
 
 /// The prefill flash's bound on each output value of `ex` (`vh` its value
@@ -190,6 +221,29 @@ pub fn judge_prefill<const H: usize, const TILE: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zero scores and unit values leave only the value and weight sums: the bound is
+    /// `γ(span + segs + 8)` over `1 + |o|`, and `2u|o|`, whatever the head width and tile.
+    #[test]
+    fn scalar_bound_of_unit_values_is_the_sum_terms() {
+        for n in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let keys = vec![0.0f32; n];
+            let values = vec![1.0f32; n];
+            let ex = exact_attn(&[0.0], &keys, &values, 1, n, 1.0);
+            for span in [64usize, 128] {
+                let segs = n.div_ceil(span);
+                let want = gamma(span + segs + 8) * 2.0 + 2.0 * U;
+                for tile in [32, 64] {
+                    let got = scalar_bound(&ex, &values, 1, tile, span)[0];
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "n={n} span={span} tile={tile}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn prefill_bound_counts_tiles_from_first_key() {

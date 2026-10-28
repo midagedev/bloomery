@@ -57,6 +57,25 @@
 //! weight sum, and four for the sigmoid and the product). The reference
 //! softmax and the reference sigmoid are f64.
 //!
+//! # The window, the per-head gate and the rope factors
+//!
+//! A layer's window is the last `window` of its live keys ([`window_tail`]): the
+//! softmax runs over those alone, so the band's key and rescale counts are
+//! theirs. A per-head gate is the head's one raw value in every channel
+//! ([`head_gate_row`]), and the band's gate terms hold unchanged.
+//!
+//! The kernels read a host table of `(cos, sin)` a pair a position, so the rope
+//! factors of ggml's `freq_factors` are the table's recipe ([`rope_row_f64`]):
+//! `theta_i = pos * base^(-2i/dims) / f_i`, in f64, one rounding to f32. A
+//! factor of `1e30` (f32 `1.0000000150474662e30`) leaves its pair unrotated
+//! within f32 and by no special case: `theta_i <= pos` (`theta_0 = pos`), so the
+//! angle is at most `pos * 1e-30`, `cos` of it is exactly 1 (`x^2/2` is under
+//! `2^-24` times 1 for any `x < 1e-4`), and `sin` of it is `x`, a normal f32
+//! (`pos * 1e-30` is above `1.2e-38` for any `pos >= 1`) that is below f32's
+//! resolution next to 1 (`1 + x == 1`). The turn `fma(n0, 1, -(n1 * x))` returns
+//! `n0` unless `|n0| < |n1| * x * 2^24`, which no normed value of a real layer
+//! is.
+//!
 //! # The prefill band
 //!
 //! The prefill kernel rounds the normed and roped query to f16 before the
@@ -453,4 +472,74 @@ fn band_of<R: AsRef<[f32]>, G: AsRef<[f32]> + ?Sized>(
         };
     }
     Ok(out)
+}
+
+/// The keys a layer attends: the last `window` of `rows`, all of them with no
+/// window or one of at least their count.
+#[must_use]
+pub fn window_tail<R>(rows: &[R], window: Option<u32>) -> &[R] {
+    match window {
+        Some(w) => {
+            let w = usize::try_from(w).expect("a window fits usize");
+            &rows[rows.len().saturating_sub(w)..]
+        }
+        None => rows,
+    }
+}
+
+/// A per-head gate as the per-channel values [`band`] takes: the head's one raw
+/// value in each of its `head` channels.
+#[must_use]
+pub fn head_gate_row(g: f32, head: usize) -> Vec<f32> {
+    vec![g; head]
+}
+
+/// The rope row of position `pos` for the NeoX pairs `(i, i + rot / 2)`: `rot`
+/// values, a `(cos, sin)` per pair, from ggml's recipe with `freq_factors`:
+/// `theta_i = pos * base^(-2i/dims) / f_i`, in f64 and rounded once to f32.
+/// `dims` is the width the exponent runs over (the head's, when the whole head
+/// turns), `rot` the width the row holds, and `factors` one divisor a pair
+/// (`rot / 2`), none for the plain rope.
+///
+/// # Errors
+///
+/// A `rot` or `dims` that is zero or a `rot` that is not whole pairs, or
+/// factors of another length than the pairs or any that is not finite and
+/// positive.
+pub fn rope_row_f64(
+    pos: usize,
+    base: f64,
+    dims: usize,
+    rot: usize,
+    factors: Option<&[f32]>,
+) -> Result<Vec<f32>, String> {
+    if rot == 0 || dims == 0 || !rot.is_multiple_of(2) {
+        return Err(format!(
+            "a rope row of {rot} values over {dims} dims is not whole pairs of a width"
+        ));
+    }
+    let pairs = rot / 2;
+    if let Some(f) = factors {
+        if f.len() != pairs {
+            return Err(format!(
+                "{} rope factors for {pairs} pairs: one a pair",
+                f.len()
+            ));
+        }
+        if let Some(bad) = f.iter().find(|v| !v.is_finite() || **v <= 0.0) {
+            return Err(format!("a rope factor {bad} is not finite and positive"));
+        }
+    }
+    let pos = f64_usize(pos);
+    let mut row = Vec::with_capacity(rot);
+    for i in 0..pairs {
+        let exp = -2.0 * f64_usize(i) / f64_usize(dims);
+        let mut theta = pos * base.powf(exp);
+        if let Some(f) = factors {
+            theta /= f64::from(f[i]);
+        }
+        row.push(theta.cos() as f32);
+        row.push(theta.sin() as f32);
+    }
+    Ok(row)
 }

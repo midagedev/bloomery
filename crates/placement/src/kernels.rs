@@ -376,6 +376,17 @@ pub const fn card_planes_runs(ty: GgmlType) -> bool {
         && matches!(down(ty), Some((DownEntry::Nvfp4, DownAct::Q8Blocks32)))
 }
 
+/// Whether the common card leg's relu² form ([`card_sel32_runs`]'s) launches a routed stack of
+/// `ty`, in either role: the 32-value-block types and NVFP4 in its planes ([`card_planes_runs`]:
+/// NVFP4 and a checkpoint folder's NVFP4_ROWS), whose up and down are one `_sel` over the
+/// 32-value activation (`nvfp4_gemv_sel32`: a row width of any multiple of 64). The rule of
+/// every caller that picks a relu² leg; [`card_sel32_runs`] keeps its meaning, the types whose
+/// `_sel` the 32-value-block entries launch.
+#[must_use]
+pub const fn card_relu2_runs(ty: GgmlType) -> bool {
+    card_sel32_runs(ty) || card_planes_runs(ty)
+}
+
 /// The K unit a card tensor's layout and kernel keep whole, beyond its format block.
 /// MXFP4 stacks need 256 values and MXFP8 planes 128. Other entries follow their activation:
 /// Q8Act needs 256, Q8Blocks32 needs 32, and f32 has no block. The tensor's role selects the
@@ -742,6 +753,42 @@ mod tests {
             Some(CardFormat::Nvfp4Planes)
         );
         assert!(!card_runs(GgmlType::NVFP4) && !card_sel32_runs(GgmlType::NVFP4));
+    }
+
+    /// The relu² form runs the four 32-value-block types and, beside them, the two NVFP4 planes
+    /// types, and no other: exactly the union of [`card_sel32_runs`] and [`card_planes_runs`],
+    /// each of which keeps its own set. Mutant: the rule that reads `card_sel32_runs` alone.
+    #[test]
+    fn card_relu2_runs_admits_nvfp4_planes() {
+        let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_relu2_runs(ty)).collect();
+        assert_eq!(
+            runs,
+            [
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::NVFP4,
+                GgmlType::IQ4_NL,
+                GgmlType::NVFP4_ROWS
+            ]
+        );
+        for ty in ALL {
+            assert_eq!(
+                card_relu2_runs(ty),
+                card_sel32_runs(ty) || card_planes_runs(ty),
+                "{ty:?}"
+            );
+        }
+        let sel32: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_sel32_runs(ty)).collect();
+        assert_eq!(
+            sel32,
+            [
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::IQ4_NL
+            ]
+        );
     }
 
     /// The GEMM entries that read 32-value blocks are the `Gemm32Weight`

@@ -78,6 +78,10 @@ host-qwen35moe-gdn48 = []
 # a group size that is not eight.
 host-qwen35moe-gqa6 = []
 host-qwen35moe-gqa4 = []
+# The host launch geometry is Qwen3.6's with the attention of LFM3-1.7B
+# (`instance::LFM3_ATTN`): 16 heads over 4 key heads of 128 values, a window a launch names and a
+# per-head output gate; the kernel gate's row of those axes.
+host-lfm3-attn = []
 
 [lints]
 workspace = true

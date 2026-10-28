@@ -67,6 +67,7 @@ gate-gpu-flint-attn	family	flint	kernel	attn_gqa
 gate-gpu-flint-router	family	flint	kernel	moe_route
 gate-gpu-flint-lib	family	flint	e2e	graph_fault+attn_gqa+moe_route+tier_legs+placement_sizing
 gate-gpu-flint-twocard	family	flint	tier	tier_legs+node_link+placement_sizing+prompt_walks+graph_fault
+gate-gpu-lfm3-kernels	family	lfm3	kernel	attn_gqa
 gate-gpu-muse-router	common		kernel	moe_route
 gate-gpu-gates-lib	tooling		harness	-
 gate-gpu-gemm	common		kernel	quant_gemm

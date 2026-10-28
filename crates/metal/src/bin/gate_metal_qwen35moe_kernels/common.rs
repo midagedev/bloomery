@@ -169,6 +169,27 @@ pub fn first_diff<T: PartialEq + Copy>(got: &[T], want: &[T]) -> Option<(usize, 
         .find_map(|(i, (g, w))| (*g != *w).then_some((i, *g, *w)))
 }
 
+/// An error over its band: 0 for no error where the band is 0, infinity for
+/// any error there.
+pub fn ratio(diff: f64, band: f64) -> f64 {
+    if band > 0.0 {
+        diff / band
+    } else if diff == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// The rows of `rows` laid `stride` apart, the words between them `pad`.
+pub fn strided(rows: &[Vec<f32>], stride: usize, pad: f32) -> Vec<f32> {
+    let mut out = vec![pad; rows.len() * stride];
+    for (r, row) in rows.iter().enumerate() {
+        out[r * stride..r * stride + row.len()].copy_from_slice(row);
+    }
+    out
+}
+
 /// The input the head-normed mat-vec dots with: the gated numerator times the
 /// scale of the head each column belongs to.
 pub fn head_scaled(

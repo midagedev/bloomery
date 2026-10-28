@@ -822,7 +822,7 @@ pub fn nvfp4_sel32_gemv(
             format!("{name}: {m} columns; the site's ids hold {KGEMV_COLS}"),
         ));
     }
-    kk.nvsel.enqueue_down(
+    kk.nvsel.enqueue_sel32(
         gpu.stream(),
         &Nvfp4Down {
             w: Nvfp4Stack { qs, e, scales },

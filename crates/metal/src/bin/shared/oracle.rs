@@ -129,6 +129,50 @@ pub const U: f64 = 1.0 / 16_777_216.0;
 /// The most error of the library's `rsqrt`, in units in the last place.
 pub const RSQRT_ULP: f64 = 2.0;
 
+/// One value and the absolute error an f32 evaluation may add: the
+/// arithmetic of the delta and the short conv referees (`oracle_delta.rs`,
+/// `oracle_shortconv.rs`), each operation rounding to nearest once.
+#[derive(Clone, Copy)]
+pub(crate) struct Ev {
+    pub(crate) v: f64,
+    pub(crate) e: f64,
+}
+
+impl Ev {
+    pub(crate) fn zero() -> Self {
+        Self { v: 0.0, e: 0.0 }
+    }
+
+    pub(crate) fn exact(v: f32) -> Self {
+        Self {
+            v: f64::from(v),
+            e: 0.0,
+        }
+    }
+}
+
+/// A product pays the two linear terms and `ea·eb`.
+pub(crate) fn mul(a: Ev, b: Ev) -> Ev {
+    let v = a.v * b.v;
+    let cross = a.e * b.v.abs() + b.e * a.v.abs() + a.e * b.e;
+    let mag = (a.v.abs() + a.e) * (b.v.abs() + b.e);
+    Ev {
+        v,
+        e: cross + U * mag,
+    }
+}
+
+/// An fma rounds `a·b + c` once.
+pub(crate) fn fma(a: Ev, b: Ev, c: Ev) -> Ev {
+    let v = a.v.mul_add(b.v, c.v);
+    let cross = a.e * b.v.abs() + b.e * a.v.abs() + a.e * b.e;
+    let mag = (a.v.abs() + a.e) * (b.v.abs() + b.e) + (c.v.abs() + c.e);
+    Ev {
+        v,
+        e: cross + c.e + U * mag,
+    }
+}
+
 /// The operations of a Q4_K store path before the lane's blocks and the SIMD
 /// group's sum: the `dmin` side's fixed count of the model in this module's
 /// doc.

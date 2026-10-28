@@ -7,10 +7,13 @@
 //! A6000 first, so a term restated wrong fails here before any large-card
 //! figure is read.
 
-use bloomery_levers::{Residency38Pick, Residency38Why, UnhostedPool, residency38_at_plan};
+use bloomery_levers::{
+    Residency38Pick, Residency38Why, UnhostedPool, residency38_at_plan, residency38_least_fewest,
+};
 use gguf::GgmlType;
 
 use super::churn::ChurnPool;
+use super::ctx_ask::{Probe, card_experts_floor, short_of};
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
     HostRead, MARGIN, MIB, PLAN_ROOM, ROW_PAGE, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
@@ -396,6 +399,22 @@ fn planned<'a>(
     room: u64,
     split: Option<Option<u64>>,
 ) -> Result<Plan<'a>, PlacementError> {
+    planned_drafting(model, machine, ctx, slots, room, split, None)
+}
+
+/// [`planned`] beside the MTP draft when `fixed` names its card bytes: those,
+/// and its store, 2,048 B a position of every slot, reserved out of the
+/// expert budget as the seat's drafted plan holds them, and the PLE table's
+/// floor counting the draft's saved state ([`state38`]).
+fn planned_drafting<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx: u64,
+    slots: u64,
+    room: u64,
+    split: Option<Option<u64>>,
+    fixed: Option<u64>,
+) -> Result<Plan<'a>, PlacementError> {
     let terms = SeqTerms {
         layers: Stores {
             kv: &Kv38,
@@ -407,6 +426,7 @@ fn planned<'a>(
     let rows = terms.plan_beside(slots);
     let kv = terms.slots_of(slots);
     let levers = PlanLevers::default();
+    let draft = fixed.map_or(0, |f| f + slots * 2048 * ctx);
     let mut plan = plan_routed_reserving(
         model,
         machine,
@@ -414,12 +434,12 @@ fn planned<'a>(
         &kv,
         &levers,
         routed_rule(Program::Qwen38Body),
-        rows,
+        rows + draft,
     )?;
     super::row_table_tier(
         &mut plan,
         room,
-        2 * state38(ctx, false),
+        2 * state38(ctx, fixed.is_some()),
         UBATCH_PLANNED,
         ROW_PAGE,
         super::RowTableSource::Split,
@@ -1952,4 +1972,119 @@ fn a_spark_defaults_to_the_ladders_target() {
             );
         }
     }
+}
+
+/// The MTP draft's fixed card bytes [derived: 3,180,890,540 B, the draft's
+/// card bytes in the gate's small-card row at 65,536 positions, less its
+/// store's 2,048 B a position].
+const MTP_FIXED: u64 = 3_046_672_812;
+
+/// The Qwen3.8 seat's plan on the 3090 of `slots` resident sequences of `ctx`
+/// positions a slot beside the MTP draft when `fixed` names its card bytes
+/// (`planned_drafting`), as a default context's probe reads it: the card's
+/// experts a layer when it holds, the memory it is short of when it does not,
+/// and with `least` a plan that leaves a layer fewer card experts is short
+/// too ([`card_experts_floor`]).
+fn default_probe(
+    model: &ModelTensors,
+    (slots, ctx): (u64, u64),
+    fixed: Option<u64>,
+    least: Option<u64>,
+) -> Result<Probe<Vec<u64>>, PlacementError> {
+    let machine = machine_a(RTX_3090);
+    let plan = match planned_drafting(model, &machine, ctx, slots, PLAN_ROOM, Some(None), fixed) {
+        Ok(plan) => plan,
+        Err(e) => return e.card_short().map(Probe::Short).ok_or(e),
+    };
+    let broken = plan.violations();
+    if let Some(short) = short_of(&broken) {
+        return Ok(Probe::Short(short));
+    }
+    assert!(broken.is_empty(), "ctx {ctx} slots {slots}: {broken:?}");
+    match least.map(|least| card_experts_floor(&plan, 0, least)) {
+        Some(Err(e)) => e.card_short().map(Probe::Short).ok_or(e),
+        _ => Ok(Probe::Holds(plan.n_l)),
+    }
+}
+
+/// An unset context leaves the unset residency its experts. On the 3090, at
+/// one and two slots, the fit that reads [`card_experts_floor`] takes the
+/// largest context whose plan leaves every layer
+/// [`residency38_least_fewest`] card experts, and the plan one step above
+/// does not. Where the plain default already leaves them (one slot, the
+/// trained 262,144 positions at the target [measured: the gate's `ctx` line
+/// on the 3090]) the choice is the same; where it spends the card on context
+/// (two slots) the floor costs under a tenth of it [derived: about 3 % at two
+/// slots with the draft, 173K to 168K].
+/// FAIL-first: the fit without the floor (`least` dropped from the probe),
+/// where two slots with the draft spend the card on context, leaves a layer
+/// one card expert (the gate's `fewest (1)`) and turns the first assertion
+/// red.
+#[test]
+fn a_default_context_on_the_3090_leaves_the_residency_floor() {
+    use super::ctx_ask::{Ask, Limit, Rule, Steps, choose};
+    let q4 = model(false);
+    let least = residency38_least_fewest();
+    let limit = Limit {
+        positions: 262_144,
+        source: "trained",
+    };
+    let steps = Steps {
+        floor: 4096,
+        step: 1024,
+    };
+    let fit = |slots: usize, fixed: Option<u64>, least: Option<u64>| {
+        let n = u64::try_from(slots).expect("slots");
+        choose(Ask::Default, slots, limit, steps, |c| {
+            default_probe(&q4, (n, c), fixed, least)
+        })
+        .expect("a default")
+    };
+    let fewest = |n_l: &[u64]| n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0);
+    for (slots, fixed) in [(1, None), (2, None), (2, Some(MTP_FIXED))] {
+        let (plain, floored) = (fit(slots, fixed, None), fit(slots, fixed, Some(least)));
+        eprintln!(
+            "3090, {slots} slot(s), draft {}: plain ctx {} (fewest {}, {:?}), floored ctx {} \
+             (fewest {}, {:?})",
+            fixed.is_some(),
+            plain.slot_ctx,
+            fewest(&plain.plan),
+            plain.rule,
+            floored.slot_ctx,
+            fewest(&floored.plan),
+            floored.rule,
+        );
+        assert!(
+            floored.plan.iter().all(|&n| n >= least),
+            "{slots} slot(s), draft {}: a layer under {least} card experts: {:?}",
+            fixed.is_some(),
+            floored.plan
+        );
+        assert!(
+            floored.slot_ctx <= plain.slot_ctx,
+            "the floor only takes context away"
+        );
+        // With the draft, this probe's plain fit spends a layer down to no
+        // card expert, which the seat does not (the gate's `fewest (1)` at
+        // 173,056), so its plain context is not the seat's to compare with.
+        if fixed.is_none() {
+            assert!(
+                plain.slot_ctx - floored.slot_ctx <= plain.slot_ctx / 10,
+                "the floor costs over a tenth of the context"
+            );
+        }
+        if fewest(&plain.plan) >= least {
+            assert_eq!(
+                (floored.slot_ctx, floored.rule),
+                (plain.slot_ctx, plain.rule),
+                "a plan that leaves the experts needs no floor"
+            );
+        }
+    }
+    let one = fit(1, None, Some(least));
+    assert_eq!(
+        (one.slot_ctx, one.rule),
+        (262_144, Rule::Target),
+        "one slot and no draft keep the trained context"
+    );
 }
