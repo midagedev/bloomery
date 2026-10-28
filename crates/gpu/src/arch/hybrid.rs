@@ -44,6 +44,7 @@ use model::arch::hybrid::{
     ATTN_K, ATTN_OUTPUT, ATTN_Q, ATTN_V, SSM_A, SSM_CONV, SSM_CONV_BIAS, SSM_D, SSM_DT_BIAS,
     SSM_IN, SSM_NORM, SSM_OUT, Ssm,
 };
+use model::arch::models::OutGate;
 use model::arch::names::blk as layer_name;
 use model::mamba2::{Checked, Geom};
 use runtime::stores;
@@ -955,6 +956,7 @@ fn out_gate(
     kernels.enqueue_out_gate(
         cx.gpu.stream(),
         OutGateArgs {
+            kind: OutGate::Proj,
             attn,
             gate: g,
             n_head: heads,

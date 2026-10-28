@@ -1,17 +1,24 @@
 //! The sigmoid output gate of a gated softmax-attention layer: `y = attn ·
 //! sigmoid(g)` elementwise over `m` tokens of `n_head` heads of [`HEAD`]
 //! values, `g` the gate projection's own output (its own buffer, not packed
-//! into the query's rows). Its output is the input of `W_o`.
+//! into the query's rows). Its output is the input of `W_o`. Two entries by
+//! the gate's shape: [`OutGate::Proj`], one `g` a value, `[m][n_head][HEAD]`
+//! (`attn_out_gate_sigmoid`), and [`OutGate::ProjHead`], one `g` a head,
+//! `[m][n_head]`, every value of the head gated alike
+//! (`attn_out_gate_sigmoid_head`).
 //!
 //! Geometry: one thread per value, [`OUT_GATE_THREADS`] a block, no shared
 //! memory. Value `v` of head `h` of token `t` sits at `(t·n_head + h)·HEAD +
-//! v` of `attn`, `gate` and `y`.
+//! v` of `attn` and `y`, and of `gate` under `Proj`; under `ProjHead` its gate
+//! is `gate[t·n_head + h]`, index `i / HEAD` of the value's index `i`.
 //!
-//! Numeric contract (the host rule [`out_gate_host`] is this): `y =` the
-//! product of `attn` and [`sigmoid`]`(g)`, rounded once.
+//! Numeric contract (the host rule [`out_gate_host`] is this, `gate` expanded
+//! to a value each under `ProjHead`): `y =` the product of `attn` and
+//! [`sigmoid`]`(g)`, rounded once.
 //!
 //! No silent failure: a non-finite `attn` or `g`, or a product that is not
 //! finite, raises [`FaultSite::F32Product`], and that value is written NaN.
+//! Under `ProjHead` a non-finite `g` makes every value of its head NaN.
 
 use super::{HEAD, sigmoid};
 use crate::GpuError;
@@ -21,6 +28,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::mul_rn_f32;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
+use model::arch::models::OutGate;
 use std::sync::Arc;
 
 const _: () = assert!(HEAD == 128);
@@ -72,12 +80,54 @@ mod out_gate_kernels {
         // thread per value.
         unsafe { *y.get_unchecked_mut(i) = if ok { out } else { f32::NAN } };
     }
+
+    /// `y = attn · sigmoid(gate[i / HEAD])` over `m` tokens of `n_head` heads
+    /// of [`HEAD`] values, one gate value a head (module doc). A non-finite
+    /// input or product raises [`FaultSite::F32Product`] and the value is
+    /// written NaN.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            attn.len() >= 128 * n_head * m,
+            gate.len() >= n_head * m,
+            y.len() >= 128 * n_head * m
+        )
+    )]
+    pub fn attn_out_gate_sigmoid_head(
+        attn: &[f32],
+        gate: &[f32],
+        n_head: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= HEAD * n_head as usize * m as usize {
+            return;
+        }
+        // SAFETY: i < HEAD·n_head·m <= attn.len() and i / HEAD < n_head·m <=
+        // gate.len() by the launch contract.
+        let (a, g) = unsafe { (*attn.get_unchecked(i), *gate.get_unchecked(i / HEAD)) };
+        let out = mul_rn_f32(a, sigmoid(g));
+        let ok = a.is_finite() & g.is_finite() & out.is_finite();
+        if !ok {
+            fault.raise(FaultSite::F32Product);
+        }
+        // SAFETY: i < HEAD·n_head·m <= y.len() by the launch contract; one
+        // thread per value.
+        unsafe { *y.get_unchecked_mut(i) = if ok { out } else { f32::NAN } };
+    }
 }
 
 /// [`OutGateKernels::enqueue_out_gate`]'s arguments: `m` tokens of the
-/// attention output `attn` and the gate projection's output `gate`
-/// (`[m][n_head][HEAD]` each), and the output `y` of the same shape.
+/// attention output `attn` (`[m][n_head][HEAD]`), the gate projection's output
+/// `gate` (the same shape under [`OutGate::Proj`], `[m][n_head]` under
+/// [`OutGate::ProjHead`]), and the output `y` of the attention's shape.
 pub struct OutGateArgs<'a> {
+    pub kind: OutGate,
     pub attn: &'a DeviceBuffer<f32>,
     pub gate: &'a DeviceBuffer<f32>,
     pub n_head: usize,
@@ -101,8 +151,9 @@ impl OutGateKernels {
     }
 
     /// Enqueue `y = attn · sigmoid(gate)` over `args.m` tokens of
-    /// `args.n_head` heads: `⌈m·n_head·HEAD / 256⌉` blocks of 256 threads.
-    /// Asynchronous, allocation-free, capturable.
+    /// `args.n_head` heads under the gate `args.kind`, `Proj` or `ProjHead`
+    /// (any other kind is refused by name): `⌈m·n_head·HEAD / 256⌉` blocks of
+    /// 256 threads. Asynchronous, allocation-free, capturable.
     pub fn enqueue_out_gate(
         &self,
         stream: &CudaStream,
@@ -110,6 +161,7 @@ impl OutGateKernels {
     ) -> Result<(), GpuError> {
         let what = "enqueue_out_gate";
         let OutGateArgs {
+            kind,
             attn,
             gate,
             n_head,
@@ -124,9 +176,22 @@ impl OutGateKernels {
             ));
         }
         let n = n_head * m * HEAD;
+        let per_head = match kind {
+            OutGate::Proj => false,
+            OutGate::ProjHead => true,
+            OutGate::None | OutGate::Packed => {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "{kind:?} is not a gate of its own: this entry takes Proj and ProjHead"
+                    ),
+                ));
+            }
+        };
+        let gates = if per_head { n_head * m } else { n };
         let lens = [
             ("attn", attn.len(), n),
-            ("gate", gate.len(), n),
+            ("gate", gate.len(), gates),
             ("y", y.len(), n),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -138,11 +203,16 @@ impl OutGateKernels {
         let grid = launch_u32(what, "grid", n.div_ceil(OUT_GATE_THREADS as usize))?;
         let n_head = launch_u32(what, "n_head", n_head)?;
         let m = launch_u32(what, "m", m)?;
-        let prep = self
-            .module
-            .prepare_attn_out_gate_sigmoid(LaunchConfig1D::new(grid, OUT_GATE_THREADS, 0))?;
-        self.module
-            .attn_out_gate_sigmoid(stream, &prep, attn, gate, n_head, m, fault, y)?;
+        let cfg = LaunchConfig1D::new(grid, OUT_GATE_THREADS, 0);
+        if per_head {
+            let prep = self.module.prepare_attn_out_gate_sigmoid_head(cfg)?;
+            self.module
+                .attn_out_gate_sigmoid_head(stream, &prep, attn, gate, n_head, m, fault, y)?;
+        } else {
+            let prep = self.module.prepare_attn_out_gate_sigmoid(cfg)?;
+            self.module
+                .attn_out_gate_sigmoid(stream, &prep, attn, gate, n_head, m, fault, y)?;
+        }
         Ok(())
     }
 }

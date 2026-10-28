@@ -228,6 +228,7 @@ name = "bloomery-gpu-gates"
 version = "0.3.10"
 dependencies = [
  "bloomery-app",
+ "bloomery-chain",
  "bloomery-decision",
  "bloomery-device",
  "bloomery-engram",

@@ -71,6 +71,7 @@ use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
 use gguf::quant::GgmlType;
+use model::arch::models::OutGate;
 use model::arch::raon1::names;
 
 /// What the refusals of this file name.
@@ -504,6 +505,7 @@ pub fn attend(
     k.out_gate.enqueue_out_gate(
         stream,
         OutGateArgs {
+            kind: OutGate::Proj,
             attn: s.av,
             gate: a.gate,
             n_head: d.heads,
@@ -657,6 +659,7 @@ pub fn attend_rows(
     k.out_gate.enqueue_out_gate(
         stream,
         OutGateArgs {
+            kind: OutGate::Proj,
             attn: s.av,
             gate: a.gate,
             n_head: d.heads,
@@ -1017,6 +1020,7 @@ pub(super) fn rows_wide(
     k.out_gate.enqueue_out_gate(
         stream,
         OutGateArgs {
+            kind: OutGate::Proj,
             attn: &*b.av,
             gate: &*b.gate,
             n_head: d.heads,

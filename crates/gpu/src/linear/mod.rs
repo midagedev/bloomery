@@ -4,6 +4,8 @@
 //! per-head RMS norm of its output ([`norm_gate`]), with the sigmoid output
 //! gate of a gated softmax-attention layer beside it ([`out_gate`]), and the
 //! write gate of a layer whose write and erase gates differ ([`write_gate`]).
+//! The gated short conv ([`shortconv`]) shares the conv ring's indexing
+//! ([`ring_input`]) and nothing else.
 //! The projections around them (`W_qkv`, `w_β`, `w_α`, `W_gate`, `W_out`) are the tree's dense
 //! gemv/GEMM and are not here.
 //!
@@ -58,6 +60,7 @@ pub mod delta;
 pub mod mixer_kda;
 pub mod norm_gate;
 pub mod out_gate;
+pub mod shortconv;
 pub mod write_gate;
 
 use crate::GpuError;
@@ -94,23 +97,32 @@ pub const CARRY_ROWS: usize = chain::linear::CARRY_ROWS;
 /// Words before the carry's rows: [`chain::linear::CARRY_HEAD`].
 pub const CARRY_HEAD: usize = chain::linear::CARRY_HEAD;
 
-/// The conv input `d` positions before `p` (`1 <= d <= CONV_ROWS`) of channel
-/// `c` of a ring of `ch` channels, when it lies before the call: zero while
-/// `p < d` (the sequence start, whatever the ring holds), else the row of
-/// slot `(p − d) mod RING_ROWS`. The one indexing of the ring; the delta
-/// layers' conv and the Mamba-2 step read through it.
+/// The conv input `d` positions before `p` (`1 <= d < rows`) of channel
+/// `c` of a ring of `rows` slots of `ch` channels, when it lies before the
+/// call: zero while `p < d` (the sequence start, whatever the ring holds),
+/// else the row of slot `(p − d) mod rows`. The one indexing of the ring
+/// ([`chain::linear::Ring::before`] is the host's); the delta layers' conv
+/// and the Mamba-2 step read through it with [`RING_ROWS`], the short conv
+/// with its own ring's rows.
 ///
 /// # Safety
 ///
-/// `ring` addresses `RING_ROWS · ch` readable f32s and `c < ch`.
+/// `ring` addresses `rows · ch` readable f32s, `c < ch` and `rows > d >= 1`.
 #[inline(always)]
-pub(crate) unsafe fn ring_input(ring: *const f32, p: usize, d: usize, ch: usize, c: usize) -> f32 {
+pub(crate) unsafe fn ring_input(
+    ring: *const f32,
+    rows: usize,
+    p: usize,
+    d: usize,
+    ch: usize,
+    c: usize,
+) -> f32 {
     if p < d {
         0.0
     } else {
-        // SAFETY: the slot (p − d) mod RING_ROWS is a row of the ring and
+        // SAFETY: the slot (p − d) mod rows is a row of the ring and
         // c < ch, by the contract.
-        unsafe { *ring.add((p + RING_ROWS - d) % RING_ROWS * ch + c) }
+        unsafe { *ring.add((p + rows - d) % rows * ch + c) }
     }
 }
 
