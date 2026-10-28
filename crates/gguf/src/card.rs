@@ -182,7 +182,7 @@ pub enum DownEntry {
     /// `Mxfp4SelKernels::enqueue_down` (`mxfp4_gemv_sel`, the file's 17-byte
     /// `block_mxfp4` stream) in `crates/gpu/src/mxfp4_sel.rs`.
     Mxfp4,
-    /// `Nvfp4SelKernels::enqueue_down` (`nvfp4_gemv_sel32`, the two planes
+    /// `Nvfp4SelKernels::enqueue_sel32` (`nvfp4_gemv_sel32`, the two planes
     /// and a tensor scale an expert) in `crates/gpu/src/mxfp4_sel.rs`.
     Nvfp4,
 }
@@ -277,7 +277,7 @@ pub enum SiteEntry {
     /// `Nvfp4Kernels::enqueue_gemv` (`nvfp4_gemv`, `crates/gpu/src/mxfp4.rs`)
     /// over the NVFP4 planes and the q8_1 rows, times the tensor's scale,
     /// through `site::kgemv`; at a width that is no multiple of 256
-    /// (`SiteEntry::reads_at`) `Nvfp4SelKernels::enqueue_down` (`nvfp4_gemv_sel32`)
+    /// (`SiteEntry::reads_at`) `Nvfp4SelKernels::enqueue_sel32` (`nvfp4_gemv_sel32`)
     /// over the planes as one expert and the `Q8Blocks32` rows, through
     /// `site::nvfp4_sel32_gemv`; wide, `Gemm32Weight::Nvfp4Planes` at any
     /// width of the format's 64-value blocks.

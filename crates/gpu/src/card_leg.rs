@@ -1425,7 +1425,7 @@ impl CardLeg {
                     rows_per_expert,
                     slots_per_col,
                 };
-                self.nvfp4.enqueue_down(stream, &d, fault, down)?;
+                self.nvfp4.enqueue_sel32(stream, &d, fault, down)?;
             }
             (Some((entry, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let run = Sel32Run {
@@ -2918,7 +2918,7 @@ pub(crate) mod tests {
                 rows_per_expert: N,
                 slots_per_col: SPC,
             };
-            nv.enqueue_down(stream, &d, sink, &mut want)
+            nv.enqueue_sel32(stream, &d, sink, &mut want)
                 .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
 
             let want = want.to_host_vec(stream).expect("the hand rows");

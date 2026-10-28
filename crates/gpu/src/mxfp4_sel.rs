@@ -1771,8 +1771,8 @@ pub struct Nvfp4GateUp<'a> {
 }
 
 /// An NVFP4 `_sel` launch over the 32-value activation ([`Nvfp4SelKernels::enqueue_sel32`]): a
-/// routed down ([`Nvfp4SelKernels::enqueue_down`]), the up of the relu² form (an up is a
-/// down-shaped `_sel`, slot `s` over column `s`) or a dense site's one expert.
+/// routed down, the up of the relu² form (an up is a down-shaped `_sel`, slot `s` over column
+/// `s`) or a dense site's one expert.
 pub struct Nvfp4Down<'a> {
     pub w: Nvfp4Stack<'a>,
     /// At least `n_slots` 32-value q8_1 columns: column `s` is read for `s <
@@ -1953,18 +1953,6 @@ impl Nvfp4SelKernels {
             launch!(prepare_nvfp4_gemv_sel32, nvfp4_gemv_sel32);
         }
         Ok(())
-    }
-
-    /// [`Nvfp4SelKernels::enqueue_sel32`] of a routed down: slot `s` writes `y[s ·
-    /// rows_per_expert ..][..rows_per_expert]` (module doc).
-    pub fn enqueue_down(
-        &self,
-        stream: &CudaStream,
-        a: &Nvfp4Down<'_>,
-        fault: FaultSink,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        self.enqueue_sel32(stream, a, fault, y)
     }
 }
 
@@ -2225,7 +2213,7 @@ mod tests {
                 &mut out,
             ));
         }
-        refusals.push(kernels.enqueue_down(
+        refusals.push(kernels.enqueue_sel32(
             stream,
             &Nvfp4Down {
                 w: stack(&bad),
@@ -2245,7 +2233,7 @@ mod tests {
             )),
             "gate, up and down refusals: {refusals:?}"
         );
-        let zero = kernels.enqueue_down(
+        let zero = kernels.enqueue_sel32(
             stream,
             &Nvfp4Down {
                 w: stack(&qs),

@@ -948,7 +948,7 @@ mod gate {
                 rows_per_expert: ROUTED_N,
                 slots_per_col: SPC,
             };
-            nv.enqueue_down(stream, &d, gpu.unlabelled_sink(), &mut y_dev)?;
+            nv.enqueue_sel32(stream, &d, gpu.unlabelled_sink(), &mut y_dev)?;
             let y = y_dev.to_host_vec(stream)?;
             let fault = gpu.take_fault()?;
             let per: Vec<(bool, f64, f64)> = par_map(n_slots * ROUTED_N, |at| {
@@ -989,7 +989,7 @@ mod gate {
                 rows_per_expert: ROUTED_N,
                 slots_per_col: SPC,
             };
-            nv.enqueue_down(stream, &d, gpu.unlabelled_sink(), &mut y_bad)?;
+            nv.enqueue_sel32(stream, &d, gpu.unlabelled_sink(), &mut y_bad)?;
             let y_bad = y_bad.to_host_vec(stream)?;
             let fault = gpu.take_fault()?;
             let down_named = fault.is_some_and(|f| {
@@ -1330,6 +1330,46 @@ mod gate {
                 let sel_dev = DeviceBuffer::from_host(stream, sel)?;
                 let tag = format!("m={m} slots={slots}");
                 let card = |s: &usize| sel[*s] != HOST;
+                // One stage of the hand pair: every card slot's rows judged against the host
+                // rule, the `HOST` slots still the sentinel, the card slots finite; prints a line.
+                let stage = |name: &str,
+                             part: usize,
+                             y: &[f32],
+                             cols: &[(Vec<i8>, Vec<f32>)],
+                             fault_none: bool| {
+                    let rows = parts[part].1;
+                    let per: Vec<(bool, f64, f64)> = par_map(slots * rows, |at| {
+                        let (s, r) = (at / rows, at % rows);
+                        if sel[s] == HOST {
+                            return (true, 0.0, 0.0);
+                        }
+                        let (q, d) = &cols[s];
+                        judge(y[at], rule(part, sel[s], r, q, d))
+                    });
+                    let cards: Vec<(bool, f64, f64)> = (0..slots)
+                        .filter(card)
+                        .flat_map(|s| per[s * rows..][..rows].iter().copied())
+                        .collect();
+                    let (bits, band, worst) = tally(&cards);
+                    let host = (0..slots)
+                        .filter(|s| !card(s))
+                        .all(|s| y[s * rows..][..rows].iter().all(|v| *v == SENT));
+                    let pass = fault_none
+                        && host
+                        && bits == cards.len()
+                        && band
+                        && (0..slots)
+                            .filter(card)
+                            .all(|s| y[s * rows..][..rows].iter().all(|v| v.is_finite()));
+                    println!(
+                        "nvfp4 clause=nvfp4_relu2_pair_lightning_widths {tag} stage={name} \
+                         fault_none={fault_none} host_slots_sentinel={host} bits_equal={bits}/{} \
+                         worst_err_over_band={worst:.3e} {}",
+                        cards.len(),
+                        verdict(pass)
+                    );
+                    pass
+                };
 
                 // The hand pair's up: each slot's column its token's row, quantized in 32-value
                 // blocks, then the `_sel` over the up stack.
@@ -1354,37 +1394,7 @@ mod gate {
                 let up_fault = gpu.take_fault()?;
                 let back_x = act_x.readback(stream)?;
                 let cols_x: Vec<_> = (0..slots).map(|s| back_x.column(s, N, slots)).collect();
-                let per_up: Vec<(bool, f64, f64)> = par_map(slots * FF, |at| {
-                    let (s, r) = (at / FF, at % FF);
-                    if sel[s] == HOST {
-                        return (true, 0.0, 0.0);
-                    }
-                    let (q, d) = &cols_x[s];
-                    judge(h[at], rule(0, sel[s], r, q, d))
-                });
-                let cards: Vec<(bool, f64, f64)> = (0..slots)
-                    .filter(card)
-                    .flat_map(|s| per_up[s * FF..][..FF].iter().copied())
-                    .collect();
-                let (bits_up, band_up, worst_up) = tally(&cards);
-                let host_up = (0..slots)
-                    .filter(|s| !card(s))
-                    .all(|s| h[s * FF..][..FF].iter().all(|v| *v == SENT));
-                let pass_up = up_fault.is_none()
-                    && host_up
-                    && bits_up == cards.len()
-                    && band_up
-                    && (0..slots)
-                        .filter(card)
-                        .all(|s| h[s * FF..][..FF].iter().all(|v| v.is_finite()));
-                println!(
-                    "nvfp4 clause=nvfp4_relu2_pair_lightning_widths {tag} stage=up \
-                     fault_none={} host_slots_sentinel={host_up} bits_equal={bits_up}/{} \
-                     worst_err_over_band={worst_up:.3e} {}",
-                    up_fault.is_none(),
-                    cards.len(),
-                    verdict(pass_up)
-                );
+                let pass_up = stage("up", 0, &h, &cols_x, up_fault.is_none());
 
                 // The squared ReLU on the host, the quantizer, and the `_sel` over the down stack.
                 let squared: Vec<f32> = h
@@ -1416,37 +1426,7 @@ mod gate {
                 let down_fault = gpu.take_fault()?;
                 let back_h = act_h.readback(stream)?;
                 let cols_h: Vec<_> = (0..slots).map(|s| back_h.column(s, FF, slots)).collect();
-                let per_down: Vec<(bool, f64, f64)> = par_map(slots * N, |at| {
-                    let (s, r) = (at / N, at % N);
-                    if sel[s] == HOST {
-                        return (true, 0.0, 0.0);
-                    }
-                    let (q, d) = &cols_h[s];
-                    judge(y[at], rule(1, sel[s], r, q, d))
-                });
-                let cards: Vec<(bool, f64, f64)> = (0..slots)
-                    .filter(card)
-                    .flat_map(|s| per_down[s * N..][..N].iter().copied())
-                    .collect();
-                let (bits_down, band_down, worst_down) = tally(&cards);
-                let host_down = (0..slots)
-                    .filter(|s| !card(s))
-                    .all(|s| y[s * N..][..N].iter().all(|v| *v == SENT));
-                let pass_down = down_fault.is_none()
-                    && host_down
-                    && bits_down == cards.len()
-                    && band_down
-                    && (0..slots)
-                        .filter(card)
-                        .all(|s| y[s * N..][..N].iter().all(|v| v.is_finite()));
-                println!(
-                    "nvfp4 clause=nvfp4_relu2_pair_lightning_widths {tag} stage=down \
-                     fault_none={} host_slots_sentinel={host_down} bits_equal={bits_down}/{} \
-                     worst_err_over_band={worst_down:.3e} {}",
-                    down_fault.is_none(),
-                    cards.len(),
-                    verdict(pass_down)
-                );
+                let pass_down = stage("down", 1, &y, &cols_h, down_fault.is_none());
 
                 // The leg's relu² form over the same places: the hand pair's rows bit for bit, a
                 // `HOST` slot's rows as the fresh buffers hold them.
@@ -1613,7 +1593,7 @@ mod gate {
                         slots_per_col: SLOTS,
                     };
                     i += 1;
-                    nv.enqueue_down(st, &d, sink, &mut y)
+                    nv.enqueue_sel32(st, &d, sink, &mut y)
                 };
                 let eager = burst(stream, &mut enq)?;
                 let g = gpu.capture(|st| (0..N).try_for_each(|_| enq(st)))?;

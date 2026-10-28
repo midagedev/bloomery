@@ -1191,8 +1191,8 @@ fn gemm32_form(
 }
 
 /// The resident routed stack `name` as the 32-value GEMM reads it: the file's
-/// blocks as words, or Q5_0 packed, of a type the kernel table names a
-/// 32-value GEMM for.
+/// blocks as words, or Q5_0 packed, or NVFP4's planes, of a type the kernel
+/// table names a 32-value GEMM for.
 fn gemm32_stack<'w>(w: &'w Weights, name: &str) -> Result<Gemm32Weight<'w>, GpuError> {
     let (ty, stack) = StackW::resident(WHAT, w, name)?;
     match stack.route(ty) {
