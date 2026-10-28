@@ -1837,6 +1837,15 @@ gate-gpu-minimaxm3-twocard:
 gate-gpu-nemotron-h-moe-card32:
     BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf}" BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
 
+# Nemotron-H MoE (Lightning) read from its ModelOpt checkpoint folder (NVFP4 routed experts, the dense projections
+# made at load): host (every expert on the host, read from the folder in place), split (the whole plan's card bytes less
+# half its routed experts', so about half stay on the host) and whole (the A6000's room) arms near the host path, the prompt
+# path near its steps, and the logits' cosine against the UD-Q4_K_XL twin as a diagnostic [derived, not measured: the
+# four loads decide the wall, about 10..20 min; no gate-times row yet]. BLOOMERY_REF_MODEL moves the folder,
+# LIGHTNING_TWIN (in BLOOMERY_BOX_ENV) the twin.
+gate-gpu-nemotron-h-moe-folder:
+    BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4}" BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-folder && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_nemotron_h_moe_folder && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_nemotron_h_moe_folder --twin "${LIGHTNING_TWIN:-/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf}"'
+
 # MiMo-V2 plan (b') on the A6000 and the 3090 (the 3090 an expert tier): the load, the walk equal to the union bit for
 # bit, eager equal to replay, the batch equal to the union and sent [derived: about 8..12 min warm]; the bound is
 # 2400 s.
@@ -2168,8 +2177,8 @@ gate-tokenizer:
 # llama's corpora go in rows of at most 1 MB, its tokenizer being quadratic in a text.
 # V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the
-# unicode_tolower fix, ik#2520). Nemotron uses /home/user/llama.cpp-mainline: ik-tokref has no nemotron_h
-# architecture, so it refuses the file, and that mainline binary loads it. MiniMax-M3 uses /home/user/llama.cpp-solar2
+# unicode_tolower fix, ik#2520). Nemotron uses /home/user/llama.cpp-19cce691: ik-tokref has no nemotron_h
+# architecture, and mainline reads its `pixtral` pre as TEKKEN from e197cef45 on. MiniMax-M3 uses /home/user/llama.cpp-solar2
 # (mainline 6ea215d17 plus the Solar-Open2 patch), whose lenient UTF-8 decoder the crate follows.
 # Pass --cases-only to dump the fixed texts without the large corpus snapshots.
 dump-ref-tokenizer VOCAB='all' *ARGS:

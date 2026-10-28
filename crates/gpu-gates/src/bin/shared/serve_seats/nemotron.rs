@@ -54,6 +54,16 @@
 //! card's room is the plan's, `BLOOMERY_CARD_BUDGET` included.
 //! A file the card holds whole loads whole, as before.
 //!
+//! A model path that is a directory is a checkpoint folder of a Bolt-family
+//! model (Nemotron 3.5 Lightning's ModelOpt NVFP4/FP8 checkpoint), served as
+//! stored (`folder::open`, no prepare step): its located header takes the
+//! first shard's place in every rule and plan, its tokenizer is the
+//! vocabulary and its `chat_template.jinja` the template. A folder has no
+//! whole-card open: it always loads placed, the engine reading its card
+//! tensors through the folder's parts ([`Model`]) and its host experts where
+//! the folder stores them, and a card that holds every expert is the folder's
+//! whole-card load. A folder of any other architecture is refused by name.
+//!
 //! `--ctx` is the one slot's context (`--ctx 0` is refused). The context
 //! comes first and the plan fills the machine around it
 //! (`generate::choose_ctx`, every seat's): a set value past the file's trained
@@ -89,6 +99,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
@@ -112,6 +123,8 @@ use model::placement::workstation::DeviceId;
 use model::placement::{Machine, PlanLevers};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
+
+use super::folder;
 
 const NAME: &str = "bloomery-serve-nemotron";
 
@@ -146,6 +159,9 @@ struct OpenSeat {
     card: String,
     device: Option<DeviceId>,
     path: PathBuf,
+    /// The checkpoint folder's located header and part source when `path` is one, else the
+    /// file at `path` is opened on the engine thread.
+    folder: Option<(Split, folder::Source)>,
     /// The slot's positions the K/V planes are sized for.
     ctx: usize,
 }
@@ -162,9 +178,9 @@ struct PlacedSeat {
 }
 
 impl PlacedSeat {
-    /// The placed load of `file` at `ctx` positions (the plan the seat
-    /// printed, made again here).
-    fn open(self, file: Split, ctx: usize) -> Result<NemotronHMoeModel, GpuError> {
+    /// The placed load of `file`, a split or a checkpoint folder, at `ctx` positions (the plan
+    /// the seat printed, made again here).
+    fn open(self, file: Model, ctx: usize) -> Result<NemotronHMoeModel, GpuError> {
         let plan = self
             .inputs
             .plan_with(
@@ -209,21 +225,38 @@ fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError>
     })
 }
 
+/// The split a whole-card load opens: a checkpoint folder has no whole-card open, its card
+/// tensors come through a plan's load, which the seat always makes for one.
+fn whole_card_file(model: Model) -> Result<Split, GpuError> {
+    match model {
+        Model::Split(file) => Ok(file),
+        Model::Folder(_) => Err(GpuError::shape(
+            "the nemotron seat's whole-card load",
+            "a checkpoint folder loads through a plan",
+        )),
+    }
+}
+
 impl<B: ChainBody> Nemotron<B> {
-    /// The model of the file at `a.path`, built by `open` (the family's
-    /// `GpuModel::open` on the planned card, or a placed load, which opens
+    /// The model at `a.path` (the file, or the folder `a.folder` the seat opened), built by
+    /// `open` (the family's `GpuModel::open` on the planned card, or a placed load, which opens
     /// the card its plan names) and carrying its prompt path `prefill`,
     /// in graph mode with its step captured, the `load` record on stderr
     /// naming the body's architecture.
     fn open(
-        a: OpenSeat,
-        open: impl FnOnce(Split) -> Result<GpuModel<B>, GpuError>,
+        mut a: OpenSeat,
+        open: impl FnOnce(Model) -> Result<GpuModel<B>, GpuError>,
         prefill: fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>,
     ) -> Result<Nemotron<B>, GateError> {
         let t = Instant::now();
-        let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
+        let model: Model = match a.folder.take() {
+            Some((header, source)) => folder::model(header, source)?,
+            None => Split::open(&a.path)
+                .map_err(|e| format!("open {}: {e}", a.path.display()))?
+                .into(),
+        };
         let opened = t.elapsed();
-        let mut m = open(file)?;
+        let mut m = open(model)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let ctx = m.ctx_max();
@@ -331,7 +364,19 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
     arm_screen(levers.screen());
     let path = ref_model_path()?;
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    // A directory is a checkpoint folder, opened once here: its located header plans as a split's
+    // first shard does, and the header and part source go to the engine thread.
+    let opened = path
+        .is_dir()
+        .then(|| folder::open(&path, refset::arch::nemotron_h_moe::ARCH))
+        .transpose()?;
+    let (split, parts) = match opened {
+        Some(f) => (f.header, Some((f.tokenizer, f.source))),
+        None => (
+            Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
+            None,
+        ),
+    };
     let first = split
         .shard(0)
         .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
@@ -378,12 +423,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let layers = inputs.model.layers;
     // A Bolt file the card cannot hold whole at the least context a seat asks
     // loads placed: the plan keeps the experts the card's room holds and the
-    // host tier serves the rest. Everything else loads whole, as before. The
+    // host tier serves the rest. A checkpoint folder always loads placed (it has no
+    // whole-card open). Everything else loads whole, as before. The
     // probe and the placed machine both carry the side seat's reserve.
     let mut whole = place.machine_untiered()?(layers);
     beside::reserve_on(&mut whole, held);
-    let placed =
-        arch == Arch::NemotronHMoe && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err();
+    let placed = parts.is_some()
+        || (arch == Arch::NemotronHMoe
+            && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err());
     let (machine, experts) = if placed {
         let mut machine = place.machine_placed()?(layers);
         beside::reserve_on(&mut machine, held);
@@ -414,17 +461,26 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         ..EngineProps::default()
     };
     let card = &machine.cards[0];
-    let open = OpenSeat {
-        card: card.name.clone(),
-        device: card.device,
-        path: path.clone(),
-        ctx: slot_ctx,
-    };
     let device = card.name.clone();
+    let (card_name, card_device) = (card.name.clone(), card.device);
     let host = levers.host();
     drop(plan);
-    drop(split);
-    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
+    // A folder's header goes to the engine thread with its parts; a file's is reopened there.
+    let (tokenizer, folder) = match parts {
+        Some((tokenizer, source)) => (tokenizer, Some((split, source))),
+        None => {
+            drop(split);
+            (Tokenizer::from_gguf(&path)?, None)
+        }
+    };
+    let open = OpenSeat {
+        card: card_name,
+        device: card_device,
+        path: path.clone(),
+        folder,
+        ctx: slot_ctx,
+    };
+    let vocab = Arc::new(Vocab::new(tokenizer)?);
     // The family's `GpuModel::open` and prompt path, the engine thread's body.
     let engine = match arch {
         Arch::NemotronH => SeatEngine::spawn(
@@ -433,7 +489,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 Nemotron::open(
                     open,
                     |file| {
-                        NemotronHModel::open(Gpu::open_card_after_hook(&card, device)?, file, ctx)
+                        NemotronHModel::open(
+                            Gpu::open_card_after_hook(&card, device)?,
+                            whole_card_file(file)?,
+                            ctx,
+                        )
                     },
                     prefill_nano,
                 )
@@ -471,7 +531,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     |file| {
                         NemotronHMoeModel::open(
                             Gpu::open_card_after_hook(&card, device)?,
-                            file,
+                            whole_card_file(file)?,
                             ctx,
                         )
                     },

@@ -130,6 +130,7 @@ gate-gpu-musespark-serve	family	muse-spark	serve	seats_serve_engine
 gate-gpu-musespark-twocard	family	muse-spark	tier	tier_legs+placement_sizing+prompt_walks
 gate-gpu-nemotron-serve	family	nemotron_h	serve	seats_serve_engine
 gate-gpu-nemotron-h-moe-card32	family	nemotron_h_moe	card32	tier_legs
+gate-gpu-nemotron-h-moe-folder	family	nemotron_h_moe	folder	checkpoint_folder+weights_load+tier_legs
 gate-gpu-nvfp4	common		kernel	quant_mxfp4
 gate-gpu-nvtier	family	qwen4exp	tier	tier_legs+residency
 gate-gpu-p0b	family	deepseek2	e2e	graph_fault+moe_route+weights_load

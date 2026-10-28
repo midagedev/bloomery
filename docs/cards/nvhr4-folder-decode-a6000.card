@@ -1,0 +1,46 @@
+# Round nvhr4: Nemotron 3.5 Lightning's ModelOpt checkpoint folder (NVFP4 routed experts, shared experts and
+# head; Mamba-2 and attention projections made Q8_0 at load) served by the nemotron seat on the A6000, against the
+# UD-Q4_K_XL twin's row of docs/cards/lightning-card32-a6000.card (164..244 tok/s [derived], not yet measured).
+# Bytes a token [derived from the shapes, hidden 2,688, routed width 1,856 top 6 of 128, 23 routed layers, shared 3,712,
+# vocab 131,072; the per-parameter byte counts of crates/gguf/src/qtype.rs: Q8_0 1.0625, NVFP4 0.5625]:
+#   folder  Mamba-2 in/out 0.946 + attention 0.149 + shared 0.258 + head 0.198 + router 0.032 = 1.583 GB trunk,
+#           routed 0.775 GB: 2.358 GB; twin trunk 0.946 + 0.149 + 0.488 + 0.374 + 0.032 = 1.989 GB, routed 1.029..1.038.
+# Resource timeline of one token at D = 512 (the wall is the sum along the layers, the card32 card's model: each
+# layer's experts wait for its trunk, the next layer's trunk for its sum; host DRAM, PCIe and NVMe 0, every expert on
+# the card):
+#   card SM trunk  1.583 GB at ~700 GB/s = 2.26 ms + the nodes' share 0.4..1.0 ms (the card32 card's trunk term less
+#                  its bytes)
+#   card SM routed 0.775 GB through the relu² form's `_sel`s at 450..700 GB/s = 1.11..1.72 ms
+#   => 3.77..4.98 ms = 201..265 tok/s; the twin on the same model: 2.84 + 0.4..1.0 + 1.5..2.3 = 4.7..6.1 ms, so the
+#   ratio folder / twin is 1.23..1.26 when the wall is these bytes, and 1.00..1.05 when it is a latency chain the bytes
+#   do not move (the design's census, nvhd §0.2: between x1.0 and x1.30). The row decides which.
+# The flow lever is none: decode has no other resource to overlap, and the folder only changes the bytes the one
+# resource reads.
+# depth-serve takes one model a profile (BLOOMERY_REF_MODEL moves it, no per-arm model), so the twin's row comes from
+# the card32 card's own sitting and the ratio between the two sittings carries the windows' ~5 % scatter.
+# Sitting (on the lead's go, after gate-gpu-nemotron-h-moe-folder is green), its own lease:
+#   BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/nvhr4-folder-decode-a6000.card
+#     BLOOMERY_REF_MODEL=/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 DEPTH_SERVE_CTX=4160' just depth-serve .:512
+kind: baseline
+question: what does the nemotron seat decode on Nemotron 3.5 Lightning's NVFP4 checkpoint folder at depth 512 on the
+  A6000, with every routed expert on the card?
+term: tg tok/s @ n=1, D = 512, bloomery-serve --model nemotron over the checkpoint folder (place unset -> a,
+  DEPTH_SERVE_CTX 4160), RTX A6000 alone, depth-serve rows (timings.predicted_per_second over 127 steps)
+unit: tok/s
+predict: 201..265
+condition: depth-serve in its own lease on the A6000, one fresh server a row; the `plan` record holds every one of
+  the 2,944 experts on the card and none on the host, and the `load` record names arch nemotron_h_moe with the folder
+  as -m, else the row is void; the witness shows no other model load; the twin's row of the card32 card's sitting is
+  in hand for the ratio
+reason: the design (nvhd §4) names this as the one timed term of the folder round: whether the folder's 0.77x
+  bytes show in the wall or a latency chain hides them; this row, read against the twin's, decides whether the folder
+  earns a README row
+decide-in: write the row beside the twin's in docs/models.md's Lightning row and the README's table with its lease
+  and witness; a ratio to the twin's row of 1.15 or more is the bytes showing in the wall, a ratio under 1.15 is
+  re-sat with a model arm in depth-serve before any row is written
+decide-below: read the ratio to the twin's row: under 1.05 the wall is a latency chain, which the bytes do not move
+  (record it in the plan's triage as that term, no lever); 1.05..1.15 is inside the windows' scatter, re-sit; and read
+  the relu² form's `_sel` time per layer (nsys on the step graph) against 1.11..1.72 ms a token before calling the
+  NVFP4 planes slower than the 32-value types
+decide-above: re-derive the trunk's nodes term (under 0.4 ms) and the routed bandwidth (over 700 GB/s) from this row;
+  the other families' rows are re-read with that trunk

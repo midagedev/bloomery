@@ -14,8 +14,10 @@ use crate::arch::hybrid::{
 use crate::card_leg::Relu2Leg;
 use crate::flash_gqa::GROUP_16;
 use crate::flash_gqa_prefill::FlashGqaPrefill;
+use crate::folder::Model;
 use crate::head::Head;
 use crate::host::StepLeg;
+use crate::host::swap::Residency;
 use crate::model::fit::FIT_RESERVE;
 use crate::model::{ChainBody, GpuModel, refuse_reserve_past, refuse_scratch_past};
 use crate::q38::{EmbedArgs, EmbedRows, Q38Kernels};
@@ -109,7 +111,10 @@ impl GpuModel<Body> {
     /// and closes it once the weights are resident. The prompt pass's rows
     /// are chosen at load from the card's room
     /// ([`choose_pass_rows`](super::prefill)): the largest that fits, at
-    /// most [`PASS_ROWS_MAX`](super::prefill::PASS_ROWS_MAX).
+    /// most [`PASS_ROWS_MAX`](super::prefill::PASS_ROWS_MAX). A checkpoint
+    /// folder has no whole-card open: its card tensors come through a part
+    /// source, which only a plan's load reads ([`GpuModel::open_placed`]), and
+    /// a plan whose card holds every routed expert is its whole-card load.
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
         Self::open_with_pass_rows(gpu, file, ctx, None)
     }
@@ -142,12 +147,16 @@ impl GpuModel<Body> {
     /// [`PLACED_ROWS`] rows through the host tier's batch port
     /// ([`GpuModel::prefill`](GpuModel::<Body>::prefill)), the pass's buffers
     /// cut from the card's room as a whole-card load's are.
+    /// `file` is a GGUF split or a checkpoint folder ([`Model`]): a folder's
+    /// card tensors are read through its part source and its host experts
+    /// where the folder stores them, and a plan that leaves no expert on the
+    /// host is the folder's whole-card load.
     /// Refused by name: a plan of other than one card holding every layer,
     /// with an expert tier, a layer whose card count the file's does not
     /// admit, scratch past the plan's term for it, and a prompt pass past the
     /// plan's reserve for it ([`place::pass_reserve_bytes`]).
     pub fn open_placed(
-        file: Split,
+        file: impl Into<Model>,
         plan: &Plan<'_>,
         card: usize,
         host: HostCfg,
@@ -156,8 +165,10 @@ impl GpuModel<Body> {
             .ok()
             .filter(|&c| c > 0)
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan's ctx_max {}", plan.ctx_max)))?;
-        GpuModel::load_placed(
+        let (file, origin) = file.into().into_origin(Residency::Off)?;
+        GpuModel::load_placed_bytes(
             file,
+            origin.bytes(),
             plan,
             card,
             host,

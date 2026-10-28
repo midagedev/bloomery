@@ -49,6 +49,15 @@ mod qwen38;
 #[path = "shared/xstream_rule.rs"]
 mod xstream_rule;
 
+// The seats' one owner of a checkpoint folder's open, a sibling of the seat as in `bloomery-serve`.
+#[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/folder.rs"]
+#[allow(
+    dead_code,
+    reason = "this binary opens a Qwen3.8 folder alone: the checked open is what it reads"
+)]
+mod folder;
+
 // A Qwen3.8 checkpoint folder, which the seat opens, a sibling of the seat as in `bloomery-serve`.
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/qwen38_folder.rs"]

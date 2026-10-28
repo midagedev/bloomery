@@ -40,6 +40,10 @@ pub const MAPS: &[MapRow] = &[
         model_types: <lfm3::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<lfm3::Checkpoint>,
     },
+    MapRow {
+        model_types: <nemotron_h::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<nemotron_h::Checkpoint>,
+    },
 ];
 
 /// A program's work with one folder map `M`, which [`with_split_map`] picks by the folder's

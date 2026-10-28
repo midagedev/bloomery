@@ -52,6 +52,14 @@ mod e2e;
 mod q38_oracle;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/folder.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate opens a Qwen3.8 folder alone: the checked open is what it reads"
+)]
+mod folder;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/qwen38_folder.rs"]
 #[allow(
     dead_code,

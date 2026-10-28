@@ -24,25 +24,9 @@ pub struct Opened {
 /// architecture is refused by name.
 #[cfg(feature = "checkpoint")]
 pub fn open(path: &Path) -> Result<Opened, GateError> {
-    let mut f = bloomery_gpu_gates::model_file::open_folder(path)?;
-    if f.header.architecture() != Some("qwen4exp") {
-        return Err(format!(
-            "checkpoint folder {}: a {} model, where this seat serves qwen4exp",
-            path.display(),
-            f.header.architecture().unwrap_or("<no architecture>")
-        )
-        .into());
-    }
-    let ple = f
-        .rows
-        .remove(&model::arch::qwen35moe::names::per_layer_token_embd());
-    if let Some(name) = f.rows.keys().next() {
-        return Err(format!(
-            "checkpoint folder {}: the row table {name}, which this seat does not read",
-            path.display()
-        )
-        .into());
-    }
+    let ple_name = model::arch::qwen35moe::names::per_layer_token_embd();
+    let mut f = super::folder::checked(path, "qwen4exp", std::slice::from_ref(&ple_name))?;
+    let ple = f.rows.remove(&ple_name);
     let source = f.source;
     Ok(Opened {
         header: f.header,
@@ -71,9 +55,5 @@ pub fn draft(path: &Path) -> Result<Split, GateError> {
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
 #[cfg(not(feature = "checkpoint"))]
 pub fn open(path: &Path) -> Result<Opened, GateError> {
-    Err(format!(
-        "{} is a directory: a checkpoint folder is opened by a build with the checkpoint feature",
-        path.display()
-    )
-    .into())
+    Err(super::folder::without_checkpoint(path))
 }

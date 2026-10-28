@@ -705,16 +705,21 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(
-            &file,
-            CardBytes::File,
-            plan,
-            card,
-            host,
-            (&[], 0),
-            &[],
-            derive,
-        )?;
+        GpuModel::load_placed_bytes(file, CardBytes::File, plan, card, host, derive, body)
+    }
+
+    /// [`GpuModel::load_placed`] with the card's tensors read from `bytes`: the file's own, or a
+    /// part source's when `file` is a checkpoint folder's header ([`CardBytes::Parts`]).
+    pub fn load_placed_bytes(
+        file: Split,
+        bytes: CardBytes<'_>,
+        plan: &Plan<'_>,
+        card: usize,
+        host: HostCfg,
+        derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
+        body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
+    ) -> Result<GpuModel<B>, GpuError> {
+        let (p, residency) = placed_pre(&file, bytes, plan, card, host, (&[], 0), &[], derive)?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())

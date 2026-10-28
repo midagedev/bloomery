@@ -1320,8 +1320,13 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::Head,
         matrices: false,
         names: Some(|n| n == "output.weight"),
-        what: "output head (the head reads q6_K, q4_K and q8_0)",
-        reads: &[GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0],
+        what: "output head (the head reads q6_K, q4_K, q8_0 and nvfp4)",
+        reads: &[
+            GgmlType::Q6_K,
+            GgmlType::Q4_K,
+            GgmlType::Q8_0,
+            GgmlType::NVFP4,
+        ],
     },
     TypePin {
         programs: &[Program::NemotronHBody],
@@ -1860,9 +1865,9 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::SharedExpert,
         matrices: false,
         names: None,
-        what: "shared expert (the card's iq2_xxs_gemv_sel reads iq2_xxs, its q8_0 site reads \
-               q8_0)",
-        row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0,
+        what: "shared expert (the card's iq2_xxs_gemv_sel reads iq2_xxs, its sites read q8_0 \
+               and nvfp4)",
+        row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0 || ty == GgmlType::NVFP4,
     },
     RowPin {
         program: Program::MuseSparkBody,
@@ -3500,12 +3505,17 @@ mod tests {
             ["q8_0 token embedding (the card reads q5_0 rows)".to_string()]
         );
         let head = |ty| whole("output.weight", Role::Head, ty, "output head");
-        for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K] {
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q6_K,
+            GgmlType::Q4_K,
+            GgmlType::NVFP4,
+        ] {
             assert_eq!(head(ty), Vec::<String>::new(), "{ty}");
         }
         assert_eq!(
             head(GgmlType::Q5_K),
-            ["q5_K output head (the head reads q6_K, q4_K and q8_0)".to_string()]
+            ["q5_K output head (the head reads q6_K, q4_K, q8_0 and nvfp4)".to_string()]
         );
         assert_eq!(
             embed(GgmlType::F32),
@@ -3513,7 +3523,7 @@ mod tests {
         );
         assert_eq!(
             head(GgmlType::F32),
-            ["f32 output head (the head reads q6_K, q4_K and q8_0)".to_string()]
+            ["f32 output head (the head reads q6_K, q4_K, q8_0 and nvfp4)".to_string()]
         );
         let proj = |name: &str, role: Role| whole(name, role, GgmlType::F32, "(the body reads");
         assert_eq!(

@@ -155,6 +155,14 @@ mod serve_gate;
 #[cfg(feature = "minimaxm3")]
 #[allow(
     dead_code,
+    reason = "the seats' folder open serves the gates too; the gate reads the model's header only"
+)]
+#[path = "shared/serve_seats/folder.rs"]
+mod folder;
+
+#[cfg(feature = "minimaxm3")]
+#[allow(
+    dead_code,
     reason = "the seat's open serves the gates too; the gate reads the model's header only"
 )]
 #[path = "shared/serve_seats/minimaxm3_folder.rs"]

@@ -32,6 +32,10 @@ use refset::arch::minimaxm3;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+/// The seats' one owner of a checkpoint folder's open, which the MiniMax folder's open sits on.
+#[path = "serve_seats/folder.rs"]
+mod folder;
+
 /// The model at a path: the one owner the serve seat opens a MiniMax folder through.
 #[path = "serve_seats/minimaxm3_folder.rs"]
 mod minimaxm3_folder;

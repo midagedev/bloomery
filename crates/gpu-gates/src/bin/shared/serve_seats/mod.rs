@@ -53,6 +53,9 @@ pub mod qwen38;
 #[cfg(feature = "deepseek41")]
 #[path = "../xstream_rule.rs"]
 pub mod xstream_rule;
+// The seats' one owner of a checkpoint folder's open (`minimaxm3_folder`, `qwen38_folder`, `nemotron`).
+#[cfg(feature = "deepseek41")]
+pub mod folder;
 // A Qwen3.8 checkpoint folder, which the qwen38 seat opens; [`header`] reads any folder.
 #[cfg(feature = "deepseek41")]
 pub mod qwen38_folder;

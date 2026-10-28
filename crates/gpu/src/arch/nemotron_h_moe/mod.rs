@@ -22,7 +22,10 @@
 //! prompt runs in passes of many rows ([`prefill`]). A load whose routed
 //! experts the card cannot all hold keeps the plan's share resident and serves
 //! the rest on the host tier ([`placed`]); its prompt runs in passes of up to
-//! the host union's columns through the tier's batch port.
+//! the host union's columns through the tier's batch port. The model is a
+//! GGUF split or a checkpoint folder read as stored
+//! ([`crate::folder::Model`]); a folder loads through that placed path, a plan
+//! that leaves no expert on the host being its whole-card load.
 
 mod body;
 mod moe;

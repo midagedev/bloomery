@@ -486,6 +486,10 @@ name = "gate_nemotron_h_moe_card32"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_nemotron_h_moe_folder"
+required-features = ["gpu", "checkpoint"]
+
+[[bin]]
 name = "gate_musespark_e2e"
 required-features = ["gpu"]
 
