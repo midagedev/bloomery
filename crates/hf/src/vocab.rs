@@ -28,9 +28,10 @@
 //! vocabulary by the hash of its output), and the row `tokenizer.json` carries is the one
 //! written, whatever `pretokenize_regex` of `tokenizer_config.json` says (a regex no row spells is
 //! refused) and whatever `ByteLevel` trims of an encoding's offsets. A pipeline no row spells is
-//! refused by name, and a [`VocabSpec`] may name the row its model has. For every row the stop
-//! id array also makes serving encode as `tokenizer.json` does: the regex folds a contraction's
-//! case by Unicode, and BPE skips a byte the vocabulary lacks.
+//! refused by name, and a [`VocabSpec`] may name the row its model has. A row also says whether
+//! its BPE takes a word that is itself a token whole, and `model.ignore_merges` must say the
+//! same. For every row the stop id array also makes serving encode as `tokenizer.json` does: the
+//! regex folds a contraction's case by Unicode, and BPE skips a byte the vocabulary lacks.
 
 use std::collections::HashMap;
 use std::fs;
@@ -76,6 +77,11 @@ macro_rules! qwen2_regex {
         r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
 }
+macro_rules! llama3_regex {
+    () => {
+        r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
+    };
+}
 macro_rules! minimax_m2_regex {
     () => {
         r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
@@ -98,28 +104,44 @@ macro_rules! pre_tokenizer {
     };
 }
 
-/// The pre-tokenizers, each as `tokenizer.json` spells it, under its `tokenizer.ggml.pre` name.
-/// `Removed` with `invert` keeps the regex's matches and drops what lies between them, which
-/// `Isolated` keeps as pieces of their own; both regexes match every codepoint, so no gap exists
-/// and the two split alike.
-pub const PRE: [(&str, &str); 3] = [
+/// The pre-tokenizers, each as `tokenizer.json` spells it, under its `tokenizer.ggml.pre` name,
+/// and whether its BPE takes a word that is itself a token whole (`model.ignore_merges`, which
+/// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
+/// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
+/// regexes match every codepoint, so no gap exists and the two split alike.
+pub const PRE: [(&str, &str, bool); 4] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
+        false,
     ),
     (
         "minimax-m2",
         pre_tokenizer!(minimax_m2_regex, "Removed", true, true),
+        false,
     ),
     (
         "qwen2",
         pre_tokenizer!(qwen2_regex, "Isolated", false, false),
+        false,
+    ),
+    (
+        "lfm2",
+        pre_tokenizer!(llama3_regex, "Isolated", false, true),
+        true,
     ),
 ];
 
 /// The names of [`PRE`], as the refusal of an unknown one lists them.
 fn pre_names() -> String {
-    PRE.map(|(name, _)| name).join(", ")
+    PRE.map(|(name, _, _)| name).join(", ")
+}
+
+/// Whether the row `name` of [`PRE`] has its BPE take a word that is itself a token whole.
+fn ignores_merges(name: &str) -> bool {
+    PRE.iter()
+        .find(|(row, _, _)| *row == name)
+        .is_some_and(|&(_, _, ignore)| ignore)
 }
 
 /// `pre_tokenizer` with its `ByteLevel` parts' `trim_offsets` cleared. The flag trims the offsets an
@@ -147,7 +169,7 @@ fn ids_only(pre: &Json) -> Json {
 /// Each row of [`PRE`] with its name, its pipeline as [`ids_only`] reads it and the regex it
 /// splits by.
 fn rows() -> impl Iterator<Item = (&'static str, Json, String)> {
-    PRE.into_iter().map(|(name, spelled)| {
+    PRE.into_iter().map(|(name, spelled, _)| {
         let row: Json = serde_json::from_str(spelled).expect("a pre-tokenizer row is JSON");
         let regex = row["pretokenizers"][0]["pattern"]["Regex"]
             .as_str()
@@ -186,11 +208,18 @@ const TOKENIZER: &Fields = &[
     ("normalizer", Only(r#"[null, {"type":"NFC"}]"#)),
     // The row it is, in `PRE`; the keys of `keys` take it from there.
     ("pre_tokenizer", Read),
-    // ByteLevel without trim_offsets moves no id, only offsets; as a decoder its options move
-    // nothing.
+    // ByteLevel without trim_offsets moves no id, only offsets, and as a post-processor its
+    // `add_prefix_space` and `use_regex` act on no text (LFM3 spells it true, false, true); as a
+    // decoder its options move nothing.
     (
         "post_processor",
-        Only(concat!("[null, ", byte_level!(false, false, false), "]")),
+        Only(concat!(
+            "[null, ",
+            byte_level!(false, false, false),
+            ", ",
+            byte_level!(true, false, true),
+            "]"
+        )),
     ),
     (
         "decoder",
@@ -216,7 +245,8 @@ const MODEL: &Fields = &[
     ("end_of_word_suffix", Only(r#"[null, ""]"#)),
     ("fuse_unk", Only("[false]")),
     ("byte_fallback", Only("[false]")),
-    ("ignore_merges", Only("[false]")),
+    // The pre-tokenizer row's own value ([`PRE`]); an absent key is HF's default, false.
+    ("ignore_merges", Only("[false, true]")),
 ];
 
 /// An added token, in `added_tokens` (with [`ID`]) or as `tokenizer_config.json` gives one.
@@ -295,11 +325,22 @@ const TOKENIZER_CONFIG: &Fields = &[
     ("audio_bos_token", Ignore(Type::String, MEDIA)),
     ("audio_eos_token", Ignore(Type::String, MEDIA)),
     ("audio_token", Ignore(Type::String, MEDIA)),
+    ("audio_out_token", Ignore(Type::String, MEDIA)),
     ("image_token", Ignore(Type::String, MEDIA)),
     ("video_token", Ignore(Type::String, MEDIA)),
     ("vision_bos_token", Ignore(Type::String, MEDIA)),
     ("vision_eos_token", Ignore(Type::String, MEDIA)),
+    ("vision_start_token", Ignore(Type::String, MEDIA)),
+    ("vision_end_token", Ignore(Type::String, MEDIA)),
     ("model_specific_special_tokens", Ignore(Type::Object, MEDIA)),
+    (
+        "response_template",
+        Ignore(
+            Type::Object,
+            "transformers' patterns that split generated text into content, reasoning and tool \
+             calls; the prompt's ids and rendering are the chat template's",
+        ),
+    ),
 ];
 
 const MEDIA: &str = "the processor's media markers by name; each is an added token of \
@@ -323,6 +364,34 @@ const GENERATION: &Fields = &[
         Ignore(
             Type::String,
             "the writer's library version; no id depends on it",
+        ),
+    ),
+    (
+        "_from_model_config",
+        Ignore(
+            Type::Bool,
+            "whether HF made the file from the model's config; no id depends on it",
+        ),
+    ),
+    (
+        "output_attentions",
+        Ignore(
+            Type::Bool,
+            "HF's forward returns the attentions beside an unchanged output",
+        ),
+    ),
+    (
+        "output_hidden_states",
+        Ignore(
+            Type::Bool,
+            "HF's forward returns the hidden states beside an unchanged output",
+        ),
+    ),
+    (
+        "use_cache",
+        Ignore(
+            Type::Bool,
+            "whether HF keeps its cache; outputs are the same",
         ),
     ),
 ];
@@ -400,7 +469,7 @@ impl VocabSpec {
     /// The model's tokenizer has the [`PRE`] row `name`: [`keys`] refuses a `tokenizer.json`
     /// whose pre-tokenizer is another row. A name no row has is refused here.
     pub fn with_pre(mut self, name: &'static str) -> Result<Self, Error> {
-        if !PRE.iter().any(|&(row, _)| row == name) {
+        if !PRE.iter().any(|&(row, _, _)| row == name) {
             return Err(Error::Vocab(format!(
                 "pre-tokenizer row {name:?} is not one of {}",
                 pre_names()
@@ -541,11 +610,20 @@ fn vocabulary<'a>(
             .ok_or_else(|| bad("additional_special_tokens is not an array".into()))?;
         declared.extend(tokens.iter().map(|v| ("additional_special_tokens", v)));
     }
-    if let Some(tokens) = tc.get("extra_special_tokens") {
-        let tokens = tokens
-            .as_object()
-            .ok_or_else(|| bad("extra_special_tokens is not an object".into()))?;
-        declared.extend(tokens.values().map(|v| ("extra_special_tokens", v)));
+    // transformers writes the extra special tokens as an object of names to tokens, or as a list.
+    match tc.get("extra_special_tokens") {
+        None => {}
+        Some(Json::Object(tokens)) => {
+            declared.extend(tokens.values().map(|v| ("extra_special_tokens", v)));
+        }
+        Some(Json::Array(tokens)) => {
+            declared.extend(tokens.iter().map(|v| ("extra_special_tokens", v)));
+        }
+        Some(_) => {
+            return Err(bad(
+                "extra_special_tokens is not an object or an array".into()
+            ));
+        }
     }
     for (field, t) in declared {
         if !t.is_string() {
@@ -691,8 +769,8 @@ fn special_ids(
 /// A file that cannot be read or parsed; in `tokenizer.json`, its `model`, an added token,
 /// `tokenizer_config.json` or `generation_config.json`, a key the tables of this module do not
 /// name or a value they do not allow; a pre-tokenizer no row of [`PRE`] spells or other than the
-/// row `spec` names, and a `pretokenize_regex` no row splits by; a `tokenizer.json` without
-/// its vocabulary or merges, or with a merge that is not two tokens without a space whose
+/// row `spec` names, a `pretokenize_regex` no row splits by, and an `ignore_merges` other than
+/// the row's; a `tokenizer.json` without its vocabulary or merges, or with a merge that is not two tokens without a space whose
 /// operands and joined token are all in its vocabulary; an added token whose id or content
 /// conflicts; a token spelled as an unused id's `[PAD<id>]`; a vocabulary size
 /// `config.json` does not give; a special token in `tokenizer_config.json` that is neither a
@@ -738,6 +816,13 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         .get("model")
         .ok_or_else(|| bad("tokenizer.json has no model".into()))?;
     schema::check(model, "model", &[MODEL]).map_err(bad)?;
+    let ignored = model["ignore_merges"].as_bool().unwrap_or(false);
+    if ignored != ignores_merges(pre) {
+        return Err(bad(format!(
+            "tokenizer.json.model.ignore_merges is {ignored}, where the {pre:?} row's is {}",
+            ignores_merges(pre)
+        )));
+    }
     let nfc = tok["normalizer"] == serde_json::json!({"type":"NFC"});
     let Vocabulary {
         tokens,
@@ -1064,6 +1149,8 @@ mod tests {
             ("tokenizer_config.json", "", all(TOKENIZER_CONFIG)),
             ("generation_config.json", "", all(GENERATION)),
         ];
+        // PIN(2026-10-28): `model.ignore_merges` true and an `extra_special_tokens` array were
+        // refused; the `lfm2` row has the first, and LFM3's `tokenizer_config.json` the second.
         // file, object, key, a value accepted ("$" keeps the base's), a value refused.
         let rows: Vec<(&str, &str, &str, Json, Json)> = serde_json::from_str(r###"[
             ["tokenizer.json", "", "version", "1.0", "2.0"],
@@ -1084,7 +1171,7 @@ mod tests {
             ["tokenizer.json", "/model", "end_of_word_suffix", "", "</w>"],
             ["tokenizer.json", "/model", "fuse_unk", false, true],
             ["tokenizer.json", "/model", "byte_fallback", false, true],
-            ["tokenizer.json", "/model", "ignore_merges", false, true],
+            ["tokenizer.json", "/model", "ignore_merges", false, "yes"],
             ["tokenizer.json", "/added_tokens/0", "id", 3, 8],
             ["tokenizer.json", "/added_tokens/0", "content", "$", ""],
             ["tokenizer.json", "/added_tokens/0", "special", true, "yes"],
@@ -1100,7 +1187,7 @@ mod tests {
             ["tokenizer_config.json", "/added_tokens_decoder/3", "rstrip", false, true],
             ["tokenizer_config.json", "", "added_tokens_decoder", {}, []],
             ["tokenizer_config.json", "", "additional_special_tokens", ["<|im_end|>"], ["<think>"]],
-            ["tokenizer_config.json", "", "extra_special_tokens", {"end":"<|im_end|>"}, []],
+            ["tokenizer_config.json", "", "extra_special_tokens", {"end":"<|im_end|>"}, "<|im_end|>"],
             ["tokenizer_config.json", "", "bos_token", "<|im_end|>", "missing"],
             ["tokenizer_config.json", "", "eos_token", {"content":"<|im_end|>","special":true}, 7],
             ["tokenizer_config.json", "", "pad_token", "<|im_end|>", {"content":"<|im_end|>","lstrip":true}],
@@ -1124,10 +1211,14 @@ mod tests {
             ["tokenizer_config.json", "", "audio_bos_token", "<|audio_start|>", 1],
             ["tokenizer_config.json", "", "audio_eos_token", "<|audio_end|>", 1],
             ["tokenizer_config.json", "", "audio_token", "<|audio_pad|>", 1],
+            ["tokenizer_config.json", "", "audio_out_token", "<|audio_out|>", 1],
             ["tokenizer_config.json", "", "image_token", "<|image_pad|>", 1],
             ["tokenizer_config.json", "", "video_token", "<|video_pad|>", 1],
             ["tokenizer_config.json", "", "vision_bos_token", "<|vision_start|>", 1],
             ["tokenizer_config.json", "", "vision_eos_token", "<|vision_end|>", 1],
+            ["tokenizer_config.json", "", "vision_start_token", "<|vision_start|>", 1],
+            ["tokenizer_config.json", "", "vision_end_token", "<|vision_end|>", 1],
+            ["tokenizer_config.json", "", "response_template", {"defaults":{"role":"assistant"}}, "x"],
             ["tokenizer_config.json", "", "model_specific_special_tokens", {"image_token":"<|image_pad|>"}, "x"],
             ["generation_config.json", "", "bos_token_id", 3, [3, 4]],
             ["generation_config.json", "", "eos_token_id", [3, 4], [3, "4"]],
@@ -1137,7 +1228,11 @@ mod tests {
             ["generation_config.json", "", "top_k", 20, "20"],
             ["generation_config.json", "", "top_p", 0.95, [0.95]],
             ["generation_config.json", "", "repetition_penalty", 1.05, "high"],
-            ["generation_config.json", "", "transformers_version", "4.46.1", 4]
+            ["generation_config.json", "", "transformers_version", "4.46.1", 4],
+            ["generation_config.json", "", "_from_model_config", true, "yes"],
+            ["generation_config.json", "", "output_attentions", false, "no"],
+            ["generation_config.json", "", "output_hidden_states", false, "no"],
+            ["generation_config.json", "", "use_cache", true, 1]
         ]"###)
         .unwrap();
         let mut missed = vec![];
@@ -1465,7 +1560,7 @@ mod tests {
     /// that row; its other options do move ids, and a pipeline that differs by one is refused.
     #[test]
     fn trim_offsets_moves_no_row_and_the_other_byte_level_options_do() {
-        for (name, spelled) in PRE {
+        for (name, spelled, _) in PRE {
             let mut row: Json = serde_json::from_str(spelled).unwrap();
             let trim = row["pretokenizers"][1]["trim_offsets"].as_bool().unwrap();
             row["pretokenizers"][1]["trim_offsets"] = (!trim).into();
@@ -1557,6 +1652,199 @@ mod tests {
                 PRE[i].0
             );
             assert_eq!(pre_row(Some(a)).unwrap().0, PRE[i].0);
+        }
+    }
+
+    /// LFM3-1.7B-MLX-4bit's tokenizer files as the folder ships them
+    /// (`lfm3-1.7b-tokenizer-files.json`: `tokenizer.json` but for the vocabulary and merges,
+    /// which are cut to three tokens, then `tokenizer_config.json`, `generation_config.json` and
+    /// `config.json` whole), after `edit`.
+    fn lfm3_repo(edit: impl FnOnce(&mut Json)) -> std::path::PathBuf {
+        let path = format!(
+            "{}/tests/fixtures/lfm3-1.7b-tokenizer-files.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut files: Json = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        files["tokenizer.json"]["model"]["vocab"] = serde_json::json!({"a":0,"b":1,"ab":2});
+        files["tokenizer.json"]["model"]["merges"] = serde_json::json!([["a", "b"]]);
+        edit(&mut files);
+        let texts: Vec<(&str, String)> = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "config.json",
+        ]
+        .into_iter()
+        .map(|name| (name, files[name].to_string()))
+        .collect();
+        repo(
+            &texts
+                .iter()
+                .map(|(n, t)| (*n, t.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// LFM3's real files are the `lfm2` row, a llama3 split with `ignore_merges` on: the special
+    /// ids by name (`<|startoftext|>`, `<|im_end|>`, `<|pad|>`), the stop id from the config's
+    /// list, 140 added tokens of which the 16 spelled not special (`<think>`, the tool-call
+    /// markers) are user-defined, and the ids past the added tokens unused. Mutants (each red
+    /// at this line): the `lfm2` row out of [`PRE`] (`tokenizer.json.pre_tokenizer ... is
+    /// unsupported`), `ignore_merges` back to `Only("[false]")`
+    /// (`tokenizer.json.model.ignore_merges true is unsupported`), the post-processor list
+    /// without `byte_level!(true, false, true)` (`tokenizer.json.post_processor ... is
+    /// unsupported`), `extra_special_tokens` read as an object alone (`extra_special_tokens is
+    /// not an object`), any of the six new keys' rows out of its table (`<file>.<key> is not a
+    /// key this converter reads`).
+    #[test]
+    fn the_real_lfm3_tokenizer_files_open_as_the_lfm2_row() {
+        let dir = lfm3_repo(|_| {});
+        let keys = super::keys(&dir, &spec_of(&dir).with_pre("lfm2").unwrap()).unwrap();
+        let value = |key: &str| get(&keys.keys, &format!("tokenizer.ggml.{key}")).cloned();
+        assert_eq!(value("pre"), Some(Value::String("lfm2".into())));
+        for (key, id) in [
+            ("bos_token_id", 124_894),
+            ("eos_token_id", 124_900),
+            ("padding_token_id", 124_893),
+        ] {
+            assert_eq!(value(key), Some(Value::U32(id)), "{key}");
+        }
+        for key in ["unknown_token_id", "seperator_token_id", "normalizer"] {
+            assert_eq!(value(key), None, "{key}");
+        }
+        assert_eq!(value("add_bos_token"), Some(Value::Bool(false)));
+        assert_eq!(value("add_eos_token"), Some(Value::Bool(false)));
+        assert_eq!(keys.stop, [124_900]);
+        assert_eq!(keys.added, (124_893..=125_032).collect::<Vec<u32>>());
+        let Some(Value::Array(types)) = value("token_type") else {
+            panic!("no token_type");
+        };
+        assert_eq!(types.len(), 128_000);
+        for (id, ty) in [
+            (0, 1),
+            (124_893, 3),
+            (124_894, 3),
+            (124_900, 3),
+            (124_901, 4),
+            (124_905, 4),
+            (125_032, 3),
+            (125_033, 5),
+            (127_999, 5),
+        ] {
+            assert_eq!(types[id], Value::I32(ty), "id {id}");
+        }
+        let user_defined = types.iter().filter(|t| **t == Value::I32(4)).count();
+        assert_eq!(user_defined, 16);
+        remove(&dir);
+    }
+
+    /// The `lfm2` row holds `ignore_merges` to its own value, both ways: LFM3's pipeline with the
+    /// flag off, a Qwen pipeline with it on, and a flag that is no boolean are each refused by
+    /// the key's name. Mutant (red at the first line): the check dropped, so a pipeline whose
+    /// merges serving would not skip (or would skip) reads as the row.
+    #[test]
+    fn ignore_merges_is_held_to_the_pre_tokenizer_row() {
+        let off = lfm3_repo(|f| f["tokenizer.json"]["model"]["ignore_merges"] = false.into());
+        let e = super::keys(&off, &spec_of(&off)).unwrap_err().to_string();
+        assert!(
+            e.contains("ignore_merges is false") && e.contains("\"lfm2\"") && e.contains("true"),
+            "{e}"
+        );
+        remove(&off);
+        let absent = lfm3_repo(|f| {
+            f["tokenizer.json"]["model"]
+                .as_object_mut()
+                .unwrap()
+                .remove("ignore_merges");
+        });
+        let e = super::keys(&absent, &spec_of(&absent))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ignore_merges is false"), "{e}");
+        remove(&absent);
+        let qwen = PRE[0].1;
+        let on = minimax_repo(|tokenizer, config| {
+            tokenizer["pre_tokenizer"] = serde_json::from_str(qwen).unwrap();
+            tokenizer["model"]["ignore_merges"] = true.into();
+            config.as_object_mut().unwrap().remove("unk_token");
+        });
+        let e = super::keys(&on, &spec_of(&on)).unwrap_err().to_string();
+        assert!(
+            e.contains("ignore_merges is true") && e.contains("\"qwen35\"") && e.contains("false"),
+            "{e}"
+        );
+        remove(&on);
+        let word = lfm3_repo(|f| f["tokenizer.json"]["model"]["ignore_merges"] = "yes".into());
+        let e = super::keys(&word, &spec_of(&word)).unwrap_err().to_string();
+        assert!(e.contains("ignore_merges"), "{e}");
+        remove(&word);
+        for (name, _, ignore) in PRE {
+            assert_eq!(ignores_merges(name), ignore, "{name}");
+        }
+        assert!(!ignores_merges("no such row"));
+    }
+
+    /// A `ByteLevel` post-processor that moves no id is read: absent, `false false false`, and
+    /// LFM3's `true false true`; one with `trim_offsets` set, or another processor, is refused by
+    /// the key's name. Mutant (red at the first line): the list without the third spelling.
+    #[test]
+    fn the_byte_level_post_processors_that_move_no_id_are_read() {
+        let post = |add: bool, trim: bool, regex: bool| {
+            serde_json::json!({"type":"ByteLevel","add_prefix_space":add,
+                "trim_offsets":trim,"use_regex":regex})
+        };
+        for (what, value) in [
+            ("true false true", post(true, false, true)),
+            ("false false false", post(false, false, false)),
+            ("absent", Json::Null),
+        ] {
+            let dir = lfm3_repo(|f| f["tokenizer.json"]["post_processor"] = value);
+            super::keys(&dir, &spec_of(&dir)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            remove(&dir);
+        }
+        for (what, value) in [
+            ("true true true", post(true, true, true)),
+            ("false false true", post(false, false, true)),
+            (
+                "a template",
+                serde_json::json!({"type":"TemplateProcessing"}),
+            ),
+        ] {
+            let dir = lfm3_repo(|f| f["tokenizer.json"]["post_processor"] = value);
+            let e = super::keys(&dir, &spec_of(&dir)).unwrap_err().to_string();
+            assert!(
+                e.contains("post_processor") && e.contains("unsupported"),
+                "{what}: {e}"
+            );
+            remove(&dir);
+        }
+    }
+
+    /// `extra_special_tokens` as a list reads like `additional_special_tokens`: each token must be
+    /// a special added token, so a list of one that is not (`<think>`, added but not special) or
+    /// that no added token spells is refused by name, and the empty list LFM3 ships is read.
+    /// Mutant (red at the first line): the key read as an object alone.
+    #[test]
+    fn extra_special_tokens_may_be_a_list() {
+        let set =
+            |list: Json| lfm3_repo(|f| f["tokenizer_config.json"]["extra_special_tokens"] = list);
+        for (what, list) in [
+            ("empty", serde_json::json!([])),
+            ("one", serde_json::json!(["<|im_end|>"])),
+        ] {
+            let dir = set(list);
+            super::keys(&dir, &spec_of(&dir)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            remove(&dir);
+        }
+        for (what, list) in [
+            ("not special", serde_json::json!(["<think>"])),
+            ("not added", serde_json::json!(["<|nowhere|>"])),
+            ("not a token", serde_json::json!([3])),
+        ] {
+            let dir = set(list);
+            let e = super::keys(&dir, &spec_of(&dir)).unwrap_err().to_string();
+            assert!(e.contains("extra_special_tokens"), "{what}: {e}");
+            remove(&dir);
         }
     }
 
