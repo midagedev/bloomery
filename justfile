@@ -149,9 +149,9 @@ lab-metal-e2e:
     out3="$(BLOOMERY_REF_MODEL="$fx3" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" || die "generate_metal qwen3moe text smoke: the run failed (rc $?)"
     [ -n "$out3" ] || die "generate_metal qwen3moe text smoke: empty stdout"
     # The qwen38d split's dense FFN runs the prompt as dense GEMMs: the same prompt ids as the qwen35moe split's (one vocabulary).
-    # TODO-lead: set want38 to the ids the first run prints (this line fails with them until then).
+    # Four of the 27B's layers pick the space token every step: the smoke holds the CLI path, m_logits holds the numbers.
     fx38="$(shard qwen38d)"
-    want38="TODO-lead"
+    want38="220,220,220,220,220,220,220,220"
     ids38="$(BLOOMERY_REF_MODEL="$fx38" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" || die "generate_metal qwen38d smoke: the run failed (rc $?)"
     [ "$ids38" = "$want38" ] || die "generate_metal qwen38d smoke: ids $ids38; $want38 is expected"
     out38="$(BLOOMERY_REF_MODEL="$fx38" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" || die "generate_metal qwen38d text smoke: the run failed (rc $?)"
