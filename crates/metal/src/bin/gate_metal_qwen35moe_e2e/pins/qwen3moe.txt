@@ -1,6 +1,6 @@
 version 1
 family qwen3moe
-ids 0
-steps 1
+ids 0,785,6722,315
+steps 4
 n 151936
-fnv1a 62a27f66ad6d4b1e
+fnv1a 46f95f1412341df5

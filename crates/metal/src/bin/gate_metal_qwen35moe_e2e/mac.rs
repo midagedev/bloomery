@@ -39,8 +39,9 @@
 //!   every typed site MLX_A4, its routers MLX_A8) opens through the session —
 //!   the reader admitting its sites through Metal's site lists — and
 //!   `generate` over `Plain` emits the session's own host-fed picks (`mlx.rs`).
-//! - `m_logits`: the split's first-step logit rows against the committed
-//!   mlx-lm dump of the row's folder (`mlx.rs`).
+//! - `m_logits`: the split's logit rows at each of the committed mlx-lm dump's
+//!   ids, teacher-forced one id a step, against the dump of the row's folder; the
+//!   verdict names each step's distance and the worst (`mlx.rs`).
 //! - `m_mlx_folder`: the row's MLX checkpoint folder (`<family>-mlx` under the
 //!   fixture root), opened as it is with no `prepare`, tells what the split made
 //!   of it (`<family>-mlxsplit`) tells: the plan's lines, the first host-fed
@@ -70,7 +71,10 @@
 //! the host-fed and chain step medians beside it (`wall.rs`). `--list` prints the clause names; `--only CLAUSE` runs one;
 //! `--mutant NAME` runs the clause that must catch a kernel defect against
 //! kernels compiled with it (`mutants.rs`); `--mutants-all` runs each in a
-//! child gate and is red when one stays green.
+//! child gate and is red when one stays green. A kept mutant, one no staying
+//! clause is expected to catch, runs over every clause: `--mutants-all` prints
+//! what turned red and `m_logits`' distance, and is red when one turns a clause
+//! red (the kept list is stale).
 //!
 //! Exit 1 when a clause failed, 78 when this machine cannot run the backend,
 //! 64 on a bad argument, 0 otherwise.
@@ -492,7 +496,11 @@ pub fn main() -> ExitCode {
         },
         None => None,
     };
-    let only = mutant.map(|(m, _)| m.clause).or(flag(&args, "--only"));
+    // A kept mutant has no clause that must catch it: every clause runs, or the one `--only` names.
+    let only = match mutant {
+        Some((m, _)) if !mutants::kept(m.name) => Some(m.clause),
+        _ => flag(&args, "--only"),
+    };
     if let Some(name) = only
         && !NAMES.contains(&name)
     {
@@ -630,8 +638,76 @@ pub fn main() -> ExitCode {
     report.finish(&format!("{GATE}{scope}"))
 }
 
+/// What a child gate run printed of its clauses.
+struct Observed {
+    /// Each clause's name and verdict word (`PASS`, `FAIL`, `SKIP`), in order.
+    verdicts: Vec<(String, String)>,
+    /// The `open` line's text: the session did not open.
+    open: Option<String>,
+    /// What `m_logits` said, its verdict word and note.
+    logits: Option<String>,
+}
+
+impl Observed {
+    /// The clause lines of a child's stdout.
+    fn of(text: &str) -> Self {
+        let mut seen = Observed {
+            verdicts: Vec::new(),
+            open: None,
+            logits: None,
+        };
+        for line in text.lines() {
+            let Some((name, said)) = line
+                .strip_prefix("clause ")
+                .and_then(|rest| rest.split_once(": "))
+            else {
+                continue;
+            };
+            if name == "open" {
+                seen.open = Some(said.to_string());
+                continue;
+            }
+            if name == "m_logits" {
+                seen.logits = Some(said.to_string());
+            }
+            let word = said.split(' ').next().unwrap_or(said);
+            seen.verdicts.push((name.to_string(), word.to_string()));
+        }
+        seen
+    }
+
+    /// The clauses that failed.
+    fn red(&self) -> Vec<&str> {
+        self.verdicts
+            .iter()
+            .filter(|(_, word)| word == "FAIL")
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// `; m_logits <its line>`, or nothing when the child did not run it.
+    fn logits_note(&self) -> String {
+        match &self.logits {
+            Some(said) => format!("; m_logits {said}"),
+            None => String::new(),
+        }
+    }
+}
+
+/// `--mutant NAME` in a child run of this gate.
+fn run_child(exe: &std::path::Path, name: &str) -> Result<std::process::Output, String> {
+    Command::new(exe)
+        .args(["--mutant", name])
+        .output()
+        .map_err(|e| format!("mutant {name}: the child gate did not start: {e}"))
+}
+
 /// Every mutant of the table, each in a child run of this gate
 /// (`--mutant NAME`): its clause must be red and the child's exit code not 0.
+/// Each kept mutant runs over every clause and the line says what turned red
+/// and `m_logits`' distance; a kept mutant that turns a clause red makes the
+/// run fail, since the list is then stale, and so does one whose child
+/// observed nothing.
 fn mutants_all() -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -644,10 +720,10 @@ fn mutants_all() -> ExitCode {
     let mut count = 0usize;
     for (mutant, _) in mutants::all() {
         count += 1;
-        let out = match Command::new(&exe).args(["--mutant", mutant.name]).output() {
+        let out = match run_child(&exe, mutant.name) {
             Ok(out) => out,
             Err(e) => {
-                println!("mutant {}: the child gate did not start: {e}", mutant.name);
+                println!("{e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -655,26 +731,80 @@ fn mutants_all() -> ExitCode {
         let red =
             !out.status.success() && text.contains(&format!("clause {}: FAIL", mutant.clause));
         println!(
-            "mutant {}: {} on {}",
+            "mutant {}: {} on {}{}",
             mutant.name,
             if red { "red" } else { "NOT RED" },
-            mutant.clause
+            mutant.clause,
+            Observed::of(&text).logits_note()
         );
         if !red {
             green.push(mutant.name);
         }
     }
+    let mut stale = Vec::new();
+    let mut unseen = Vec::new();
     for mutant in mutants::KEPT {
-        println!("mutant {}: kept, no staying clause turns red", mutant.name);
+        let out = match run_child(&exe, mutant.name) {
+            Ok(out) => out,
+            Err(e) => {
+                println!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let seen = Observed::of(&String::from_utf8_lossy(&out.stdout));
+        let red = seen.red();
+        if seen.open.is_some()
+            || seen.verdicts.is_empty()
+            || (red.is_empty() && !out.status.success())
+        {
+            let found = match &seen.open {
+                Some(said) => format!("the open line {said:?}"),
+                None => "no clause line".to_string(),
+            };
+            println!(
+                "mutant {}: no observation, the child gate ended with {} and {found}",
+                mutant.name, out.status
+            );
+            unseen.push(mutant.name);
+        } else if red.is_empty() {
+            println!(
+                "mutant {}: kept, red on none of {} clauses{}",
+                mutant.name,
+                seen.verdicts.len(),
+                seen.logits_note()
+            );
+        } else {
+            println!(
+                "mutant {}: now red on {} (nearest clause {}), the KEPT list is stale{}",
+                mutant.name,
+                red.join(", "),
+                mutant.clause,
+                seen.logits_note()
+            );
+            stale.push(mutant.name);
+        }
     }
-    if green.is_empty() {
+    if green.is_empty() && stale.is_empty() && unseen.is_empty() {
         println!(
             "{GATE} --mutants-all: PASS ({count} mutants, each red on its clause; {} kept, \
-             no staying clause turns red)",
+             no clause turns red on any)",
             mutants::KEPT.len()
         );
         return ExitCode::SUCCESS;
     }
-    println!("{GATE} --mutants-all: FAIL (not red: {})", green.join(", "));
+    let mut why = Vec::new();
+    if !green.is_empty() {
+        why.push(format!("not red: {}", green.join(", ")));
+    }
+    if !stale.is_empty() {
+        why.push(format!(
+            "the KEPT list is stale, now red: {}",
+            stale.join(", ")
+        ));
+    }
+    if !unseen.is_empty() {
+        why.push(format!("no observation: {}", unseen.join(", ")));
+    }
+    println!("{GATE} --mutants-all: FAIL ({})", why.join("; "));
     ExitCode::FAILURE
 }

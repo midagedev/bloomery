@@ -11,11 +11,16 @@
 //! the session as it is, with no `prepare`, and is the split's model: the
 //! same plan, the same greedy ids and the same first-step logits to the bit.
 //!
-//! `m_logits`: the session's first-step logit rows against a committed mlx-lm
-//! dump of that folder (`pins/<family>.txt` and `.f32` beside this module).
-//! The dump is the external oracle: mlx-lm's modules run in f32 over the
-//! exact dequant, so it carries the model's arithmetic without mlx-lm's bf16
-//! rounding. A missing pin is a named error.
+//! `m_logits`: the session's logit rows against a committed mlx-lm dump of
+//! that folder (`pins/<family>.txt` and `.f32` beside this module). The pin
+//! names its ids; the session runs them teacher-forced, one id a step with its
+//! cache kept, the way the dump does, and every step's row is held to the
+//! band. Position 0 reads one key (softmax 1), a rope angle of 0 and a zero
+//! delta state; the steps above it read the rope, the scale, the QK layout and
+//! the decay too. The dump is the external oracle: mlx-lm's modules run in f32
+//! over the exact dequant, so it carries the model's arithmetic without
+//! mlx-lm's bf16 rounding. A missing pin, or a pin whose steps, ids and bytes
+//! disagree, is a named error.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,21 +39,20 @@ use super::{CTX, mlx_split, row, says};
 /// The greedy tokens the loop and the host-fed reference run.
 const GREEDY: usize = 24;
 
-/// The token `m_mlx` and `m_logits` start from when the pin names one id.
+/// The token `m_mlx` and `m_mlx_folder` start from.
 const SEED: u32 = 0;
 
-/// PIN(2026-10-28): max |session − mlx-lm| on a first-step logit.
+/// PIN(2026-10-28): max |session − mlx-lm| on a logit, at each pinned step.
 /// The pin is mlx-lm's modules in f32 over the exact dequant of the same
 /// affine-4 weights (`tools/mlx-logits.py dump`), so the gap is the
 /// session's own rounding. A bound: were every projection's input rounded
 /// once into half (a relative error uniform within ±2^-11, rms
 /// 2^-11/√3 = 2.8e-4), a dot of 2,048 products would carry Δ = 2.8e-4 of
-/// its rms. The fixture is four layers plus the head: five projections. A
-/// logit of magnitude 25, above this head's row, moves at most
-/// 5Δ · 25 = 0.035; the session rounds fewer values than that (its f16 K/V
-/// rows), so 0.05 sits over the bound. A wiring fault moves a logit by
-/// order one, and so does flipping one.
-const LOGIT_ABS: f64 = 0.05;
+/// its rms. The fixture is four layers plus the head: five projections. The
+/// pins' largest logit is 5.03, so a logit moves at most 5Δ · 5.03 = 7.0e-3;
+/// the band rounds that up. Measured: the worst healthy step is 1.92e-3,
+/// and the nearest mutant (`rope_key_row_zero`) is 0.739 away.
+const LOGIT_ABS: f64 = 0.01;
 
 /// FNV-1a 64-bit, the pin file's checksum of the f32 little-endian bytes.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -165,18 +169,24 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
     let n: usize = field(&map, "n")?
         .parse()
         .map_err(|_| "the mlx-lm pin's n is not a count".to_string())?;
+    if n == 0 {
+        return Err("the mlx-lm pin's n is 0".to_string());
+    }
+    let bytes = steps
+        .checked_mul(n)
+        .and_then(|values| values.checked_mul(4))
+        .ok_or_else(|| format!("the mlx-lm pin's {steps} steps of {n} values wrap"))?;
+    if raw.len() != bytes {
+        return Err(format!(
+            "the mlx-lm pin holds {} bytes; {steps} steps of {n} f32s are {bytes} bytes",
+            raw.len()
+        ));
+    }
     let want = format!("{:016x}", fnv1a(raw));
     let got_sum = field(&map, "fnv1a")?;
     if got_sum != want {
         return Err(format!(
             "the mlx-lm pin's checksum is {got_sum}; the f32 bytes checksum to {want}"
-        ));
-    }
-    if raw.len() != steps * n * 4 {
-        return Err(format!(
-            "the mlx-lm pin holds {} bytes; {steps} steps of {n} f32s are {} bytes",
-            raw.len(),
-            steps * n * 4
         ));
     }
     let mut rows = Vec::with_capacity(steps * n);
@@ -186,26 +196,53 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
     Ok(Pin { ids, n, rows })
 }
 
-/// The largest |a − b|, and its index. A NaN is not a distance.
-fn max_abs(a: &[f32], b: &[f32]) -> Result<(f64, usize), String> {
-    if a.len() != b.len() {
+/// One step's row against the pin's row: the largest |a − b| and where, the
+/// values over [`LOGIT_ABS`] and the rms.
+struct Distance {
+    max: f64,
+    at: usize,
+    session: f32,
+    stored: f32,
+    over: usize,
+    rms: f64,
+}
+
+/// `got` against `want`. A NaN or an infinity is not a distance.
+fn distance(got: &[f32], want: &[f32]) -> Result<Distance, String> {
+    if got.len() != want.len() {
         return Err(format!(
             "the logit row holds {} values; the pin holds {}",
-            a.len(),
-            b.len()
+            got.len(),
+            want.len()
         ));
     }
-    let mut worst = (0.0f64, 0usize);
-    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+    let mut worst = Distance {
+        max: 0.0,
+        at: 0,
+        session: 0.0,
+        stored: 0.0,
+        over: 0,
+        rms: 0.0,
+    };
+    let mut sum_sq = 0.0f64;
+    for (i, (x, y)) in got.iter().zip(want).enumerate() {
         let d = f64::from(*x) - f64::from(*y);
         if !d.is_finite() {
             return Err(format!("logit {i} is {x} against the pin's {y}"));
         }
+        sum_sq += d * d;
         let d = d.abs();
-        if d > worst.0 {
-            worst = (d, i);
+        if d > LOGIT_ABS {
+            worst.over += 1;
+        }
+        if i == 0 || d > worst.max {
+            worst.max = d;
+            worst.at = i;
+            worst.session = *x;
+            worst.stored = *y;
         }
     }
+    worst.rms = (sum_sq / got.len() as f64).sqrt();
     Ok(worst)
 }
 
@@ -382,51 +419,46 @@ pub fn m_mlx_folder(device: &MetalDevice, library: &Library) -> Clause {
     )))
 }
 
-/// `m_logits`: the row's split, host-fed on the pin's ids, against mlx-lm's
-/// logit rows of the folder the split was made from. One row is the first
-/// step. The distance is the largest absolute difference, held to
-/// [`LOGIT_ABS`].
+/// `m_logits`: the row's split, host-fed on the pin's ids one step each with
+/// its cache kept, against mlx-lm's logit rows of the folder the split was
+/// made from. Each step's distance is the largest absolute difference of its
+/// row, held to [`LOGIT_ABS`]; the verdict names every step's and the worst.
 pub fn m_logits(device: &MetalDevice, library: &Library) -> Clause {
     let family = row::current().arch;
     let (text, raw) = pin_of(family)?;
     let pin = parse_pin(family, &text, &raw)?;
     let path = mlx_split::path(family)?;
     let mut s = Session::open(device, library, &path, CTX).map_err(says)?;
-    let mut got = Vec::with_capacity(pin.rows.len());
-    for &id in &pin.ids {
+    let mut steps = Vec::with_capacity(pin.ids.len());
+    for (k, (&id, want)) in pin.ids.iter().zip(pin.rows.chunks_exact(pin.n)).enumerate() {
         s.step(id, StepMode::HostFed).map_err(says)?;
         let row = s.logits_row().map_err(says)?;
-        if row.len() != pin.n {
-            return Err(format!(
-                "the session's logit row holds {} values; the pin holds {}",
-                row.len(),
-                pin.n
-            ));
-        }
-        got.extend_from_slice(row);
+        let d = distance(row, want).map_err(|e| format!("step {k} (id {id}): {e}"))?;
+        println!(
+            "m_logits step {k} (id {id}): max |logit| difference {:.3e} at {} (session {:.6}, \
+             pin {:.6}), {} values over the band, rms {:.3e}",
+            d.max, d.at, d.session, d.stored, d.over, d.rms
+        );
+        steps.push(d);
     }
-    let (worst, at) = max_abs(&got, &pin.rows)?;
-    let session = got[at];
-    let stored = pin.rows[at];
-    let mut over = 0usize;
-    let mut sum_sq = 0.0f64;
-    for (x, y) in got.iter().zip(&pin.rows) {
-        let d = f64::from(*x) - f64::from(*y);
-        sum_sq += d * d;
-        if d.abs() > LOGIT_ABS {
-            over += 1;
-        }
-    }
-    let rms = (sum_sq / got.len() as f64).sqrt();
+    let worst = (1..steps.len()).fold(0, |w, k| if steps[k].max > steps[w].max { k } else { w });
+    let w = &steps[worst];
+    let per_step: Vec<String> = steps.iter().map(|d| format!("{:.2e}", d.max)).collect();
+    let over: usize = steps.iter().map(|d| d.over).sum();
     let line = format!(
-        "mlx-lm pin {family}: max |logit| difference {worst:.3e} at {at} (session {session:.6}, \
-         pin {stored:.6}, band {LOGIT_ABS}), {over} values over the band, rms {rms:.3e}, \
-         {} step(s), {} values",
-        pin.ids.len(),
+        "mlx-lm pin {family}: max |logit| difference {:.3e} at step {worst} (id {}), logit {} \
+         (session {:.6}, pin {:.6}); per step [{}]; band {LOGIT_ABS}, {over} values over it; \
+         {} step(s) of {} values",
+        w.max,
+        pin.ids[worst],
+        w.at,
+        w.session,
+        w.stored,
+        per_step.join(", "),
+        steps.len(),
         pin.n
     );
-    println!("m_logits: {line}");
-    if worst <= LOGIT_ABS {
+    if w.max <= LOGIT_ABS {
         Ok(Verdict::Noted(line))
     } else {
         Err(line)

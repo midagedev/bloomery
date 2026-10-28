@@ -1,6 +1,7 @@
 //! The gate's kernel mutants: `--mutant NAME` compiles the kernels' source
 //! with one defect edited in, through `Library::from_source_text`, opens the
-//! session on those kernels and runs the clause that must catch it. A find
+//! session on those kernels and runs the clause that must catch it (a kept
+//! mutant, below, has none and runs over every clause). A find
 //! text that occurs a number of times other than the one named is an error
 //! by name, so a kernel edit cannot silently turn a mutant into a no-op.
 //!
@@ -38,6 +39,12 @@ pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
             .find(|m| m.name == name)
             .map(|m| (m, Program::Main))
     })
+}
+
+/// Whether `name` is in [`KEPT`]: a mutant no staying clause is expected to
+/// turn red, which `--mutant` runs over every clause.
+pub fn kept(name: &str) -> bool {
+    KEPT.iter().any(|m| m.name == name)
 }
 
 pub const MUTANTS: &[Mutant] = &[
@@ -115,21 +122,33 @@ pub const MUTANTS: &[Mutant] = &[
             1,
         )],
     },
-];
-
-/// Mutants no staying clause turns red on. `--mutants-all` names each and does
-/// not fail on it.
-///
-/// `conv_tap`'s catcher was `a_free`. `m_logits` moves, and it is already red
-/// on the healthy kernels. `q_state` and `c_resume` stay green.
-/// `merge_first_segment`'s catcher was `f_deep`. The self-bit clauses stay
-/// green; the first-step oracle does not move.
-/// `ahead_headless_last_row`'s catcher was `h_prompt`. `b_chain`, `m_mlx`,
-/// `e_token_id` and `d_count` stay green, and the first-step oracle does not move.
-/// `prefill_kv_offset`'s catcher was `q_ref`. `q_state`, `q_chunk`, `q_short`,
-/// `q_mark` and `q_free` stay green.
-/// PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
-pub const KEPT: &[Mutant] = &[
+    // The next three read nothing at position 0: one key makes the softmax 1, the rope
+    // angle is 0 and the delta state is zero. `m_logits` sees them at the pin's later steps.
+    Mutant {
+        name: "attn_score_unscaled",
+        clause: "m_logits",
+        why: "the attention score is the raw dot: the softmax over two or more keys is \
+              sharper than the model's",
+        edits: &[("float score = dot * args.scale;", "float score = dot;", 1)],
+    },
+    Mutant {
+        name: "rope_key_row_zero",
+        clause: "m_logits",
+        why: "a key is roped with position 0's row whatever its position: the query-key \
+              angle past position 0 is the query's alone",
+        edits: &[(
+            "device float const *rope_row = rope + args.pos * BLOOMERY_ATTN_ROT;",
+            "device float const *rope_row = rope;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_decay_one",
+        clause: "m_logits",
+        why: "the delta state never decays: a step above 0 reads the full state the step \
+              before left",
+        edits: &[("*decay = exp(sa * softplus(aa + dt));", "*decay = 1.0f;", 1)],
+    },
     Mutant {
         name: "conv_tap",
         clause: "m_logits",
@@ -140,6 +159,23 @@ pub const KEPT: &[Mutant] = &[
             1,
         )],
     },
+];
+
+/// Mutants no staying clause is expected to turn red. `--mutant NAME` runs one over every
+/// clause, and `--mutants-all` runs each like the others and prints the clauses that turned
+/// red and `m_logits`' distance. A kept mutant that turns a clause red is no longer kept: the
+/// run fails and says the list is stale, and the mutant moves to `MUTANTS` with that clause.
+/// A row's `clause` here is the staying clause nearest its defect.
+///
+/// The healthy session is green on `m_logits` (worst step 1.92e-3). Observed in the last
+/// `--mutants-all`, each red on none of the 19 clauses, `m_logits` unmoved:
+/// `merge_first_segment` (`f_deep`) merges a pass's segments; the session holds one segment
+/// of keys.
+/// `ahead_headless_last_row` (`h_prompt`) stores no pick, and `m_logits` feeds the pin's ids.
+/// `prefill_kv_offset` (`q_ref`) shifts the batched pass's append, and `m_logits` steps one
+/// token at a time.
+/// PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
+pub const KEPT: &[Mutant] = &[
     Mutant {
         name: "merge_first_segment",
         clause: "q_chunk",

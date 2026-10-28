@@ -41,18 +41,20 @@ gives the reasons).
 At a build after v0.3.9 two architectures run on Metal, `qwen35moe` and `qwen3moe`. The open takes mat-vec weights of type Q4_K, Q6_K or
 MLX's affine 4-bit (`MLX_A4`), the embedding as Q4_K or `MLX_A4` and the head as Q6_K or `MLX_A4`
 (`crates/metal/src/arch/qwen3moe/arena.rs:333,617,624`). Any other type at those sites is refused by name, with the
-tensor's name. The gate verifies the MLX 4-bit path. A GGUF file of these types runs, unverified.
+tensor's name. The gate verifies the MLX 4-bit path on the 4-layer fixture splits of Qwen3.6-35B-A3B and
+Qwen3-30B-A3B: their logits at positions 0 to 3 match mlx-lm's in f32 within 0.01. It opens no full folder. A full
+folder opens with the same code path. A GGUF file of these types runs, unverified.
 
 | File | State | Evidence |
 |---|---|---|
-| Qwen3.6-35B-A3B, an MLX 4-bit folder (`--hf` or `-m`; `prepare` is optional) | verified | [`../mac.md`](../mac.md) (numbers, conditions) |
+| Qwen3.6-35B-A3B, an MLX 4-bit folder (`--hf` or `-m`; `prepare` is optional) | verified on the 4-layer fixture split | [`../mac.md`](../mac.md) (numbers, conditions) |
 | Qwen3.6-35B-A3B, Q4_K_M GGUF | runs, unverified | [`../mac.md`](../mac.md) |
 | MiniCPM-V 4.7 35B-A3B, Q4_K_M | runs, unverified, **text only**: its `mmproj` is not read on Metal. Its vocabulary is 248,144; the open refused it before PR #805 (`58d583fa6`) with `qwen35moe arena: a vocabulary of 248144; the head reads 248320`, and the v0.3.9 tag does not hold that commit | PR #805's comment: `generate_metal` on a real file, rc 1 at the base and rc 0 with the change |
 | Ornith-1.5-35B, Q4_K_M | runs, unverified, text only, on v0.3.9's `crates/metal` too. It has Qwen3.6's shapes and a next-token layer beyond the trunk; the open reads the trunk's layers only (`crates/model/src/arch/qwen35moe/spec.rs:9`) | PR #805's comment: rc 0 at the base and with the change |
 | Sage-A1.5, Q4_K_M | runs, unverified. Not run on Metal in the sources of this page. Its file has Qwen3.6's shapes, plans the same weight bytes (`--plan` on the CUDA path) and carries a next-token layer too ([`../models.md`](../models.md)), so it is expected to open as Ornith does | none yet |
 | Qwen3.6 `UD-Q4_K_XL` | runs, unverified, text only, on a build after 0.3.9: Q8_0 and Q5_K at the mat-vec, embed and head sites, f32 `ssm_alpha`/`ssm_beta`, and a Q8_0 shared expert beside Q4_K/Q5_K routed stacks | #858 and its follow-up: `--plan` from 350 refusals (PR #806) to 70 to 0; on an M1 Pro (32 GB) the real file's prompt pass and stepped run give the same 32 greedy ids, and llama.cpp's CPU logprobs at those 33 steps put the same id first at every step |
 | Qwen3-30B-A3B-Instruct-2507, Q4_K_M | runs, unverified, text only (`qwen3moe`: attention layers only, no shared expert). The e2e gate's qwen3moe row opens the MLX split | PR #856: the fixture row; on an M1 Pro (32 GB) the real file's prompt pass and stepped run give the same 32 greedy ids |
-| Qwen3-Coder-30B-A3B-Instruct, MLX 4-bit folder (`--hf mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`) | verified, text only, on a build after 0.3.10 (`qwen3moe`; the folder names no BOS and adds none) | PR #886: on an M1 Pro (32 GB), `generate_metal --hf` at `6a05f2cf6` opened the folder from the hub cache (all 13 files' hashes checked) and wrote sensible Python; a `bloomery-serve-metal --hf` chat answered with a correct `is_prime`. The tool-call PR: a `get_weather` request returned `tool_calls` with `{"city":"Seoul"}`, and the tool's result came back as the answer |
+| Qwen3-Coder-30B-A3B-Instruct, MLX 4-bit folder (`--hf mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`) | verified, text only, on a build after 0.3.10, on Qwen3-30B-A3B's 4-layer fixture split: it has those shapes (`qwen3moe`), and the gate does not open its folder (the folder names no BOS and adds none) | PR #886: on an M1 Pro (32 GB), `generate_metal --hf` at `6a05f2cf6` opened the folder from the hub cache (all 13 files' hashes checked) and wrote sensible Python; a `bloomery-serve-metal --hf` chat answered with a correct `is_prime`. The tool-call PR: a `get_weather` request returned `tool_calls` with `{"city":"Seoul"}`, and the tool's result came back as the answer |
 
 The refused file is the next to open; the design is [`../research/metal-all-models.md`](../research/metal-all-models.md) (PR #802).
 

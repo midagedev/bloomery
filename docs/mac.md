@@ -50,20 +50,22 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 
 | File | State |
 |---|---|
-| Qwen3.6-35B-A3B, an MLX 4-bit folder | verified; the numbers are below |
+| Qwen3.6-35B-A3B, an MLX 4-bit folder | verified on the 4-layer fixture split; the numbers are below |
 | Qwen3.6-35B-A3B, Q4_K_M GGUF | runs, unverified |
 | [Ornith-1.5-35B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), Q4_K_M | runs, unverified, text only: it has Qwen3.6's shapes, and its next-token layer is not read |
 | [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), Q4_K_M | runs, unverified, text only: its `mmproj` is not read. Release 0.3.9 refuses it: `qwen35moe arena: a vocabulary of 248144; the head reads 248320` |
 | [Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), Q4_K_M | runs, unverified; no Mac run is recorded on this page. It has Qwen3.6's shapes |
-| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), an MLX 4-bit folder | verified on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
+| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), an MLX 4-bit folder | verified on the 4-layer fixture split, on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M | runs, unverified, text only |
-| [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct), an MLX 4-bit folder | verified on a build after 0.3.10, text only: it has Qwen3-30B-A3B's shapes (`qwen3moe`). Its XML tool calls parse into OpenAI `tool_calls` |
+| [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct), an MLX 4-bit folder | verified on a build after 0.3.10, text only, on Qwen3-30B-A3B's 4-layer fixture split: it has those shapes (`qwen3moe`), and the gate does not open its folder. Its XML tool calls parse into OpenAI `tool_calls` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `UD-Q4_K_XL` | runs, unverified, text only. Release 0.3.9 refuses it: its Q8_0, Q5_K and f32 tensors |
 
 The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights, and f32 at the delta layers' `ssm_alpha` and
-`ssm_beta`. The gate verifies the MLX 4-bit path. A GGUF file runs, unverified. A shared expert may have another type
-than its routed stacks. The router and the shared-expert gate may be F32 or MLX 8-bit, which the open dequantizes. Any
-other type is refused when the file opens, and the error names the tensor.
+`ssm_beta`. The gate verifies the MLX 4-bit path on the 4-layer fixture splits of Qwen3.6-35B-A3B and Qwen3-30B-A3B:
+their logits at positions 0 to 3 match mlx-lm's in f32 within 0.01. It opens no full folder. A full folder opens with the
+same code path. A GGUF file runs, unverified. A shared expert may have another type than its routed stacks. The router
+and the shared-expert gate may be F32 or MLX 8-bit, which the open dequantizes. Any other type is refused when the file
+opens, and the error names the tensor.
 A file whose shapes the kernels take but no build has registered compiles its kernels when it opens, and the server
 says that no gate checked that shape.
 The evidence for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
