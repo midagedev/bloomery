@@ -878,6 +878,17 @@ pub const GQA: &[GqaInst] = &[
 /// request, the refusal is the first such row's, in order: its window, then
 /// its sinks, then its value scale.
 pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
+    select_gqa_in(GQA, s)
+}
+
+/// [`select_gqa`] over `table`: a backend that compiles its own flash rows
+/// selects from them, and a refusal lists the widths and groups that table
+/// serves. `table` is in the order of preference, as [`GQA`] is.
+///
+/// # Errors
+///
+/// [`ShapeRefused`] as [`select_gqa`]'s, for `table`'s rows.
+pub fn select_gqa_in(table: &[GqaInst], s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     let refuse = |why| ShapeRefused {
         shape: Shape::Attn(s),
         why,
@@ -886,9 +897,9 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
         return Err(refuse(Refusal::Group));
     }
     let group = s.n_head / s.n_kv;
-    let head: Vec<&GqaInst> = GQA.iter().filter(|r| r.head == s.head).collect();
+    let head: Vec<&GqaInst> = table.iter().filter(|r| r.head == s.head).collect();
     if head.is_empty() {
-        let mut served: Vec<u32> = GQA.iter().map(|r| r.head).collect();
+        let mut served: Vec<u32> = table.iter().map(|r| r.head).collect();
         served.sort_unstable();
         served.dedup();
         return Err(refuse(Refusal::HeadWidth { served }));
@@ -913,7 +924,7 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     if let Some(row) = width.iter().find(|r| r.takes(group) && covers(r)) {
         return Ok(***row);
     }
-    let Some(row) = gqa_row_v(s.head, s.value, group) else {
+    let Some(row) = width.iter().find(|r| r.takes(group)) else {
         let mut served = Vec::new();
         for r in &width {
             let text = match r.group {
@@ -937,7 +948,7 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     // The window and the sinks were not the miss, and no row covered the
     // request, so the miss is the value scale.
     if !s.scaled || row.value_scale {
-        unreachable!("select_gqa: a covering row of this group was not returned");
+        unreachable!("select_gqa_in: a covering row of this group was not returned");
     }
     Err(refuse(Refusal::ValueScale))
 }
@@ -967,9 +978,9 @@ pub const fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterBody, RouterInst,
-        RouterRule, Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
-        select_router,
+        AttnShape, GQA, GqaInst, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterBody,
+        RouterInst, RouterRule, Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules,
+        select_gqa, select_gqa_in, select_router,
     };
     use crate::{Act, Gqa, Moe, OutGate, Rope, RopeMode, Router, RouterNorm, Score, Shared};
 
@@ -1641,6 +1652,95 @@ mod tests {
         };
         assert_eq!(rules::BIASED_SIGMOID, rule);
         assert!(select_router(moe(rule, 288, 8)).is_ok());
+    }
+
+    /// `select_gqa` is `select_gqa_in` over [`GQA`], and each row of the table
+    /// selects for the shape it can serve: the first row in the table's order
+    /// that has its head and value widths, takes its group and covers its
+    /// window, sinks and value scale. Mutant: `select_gqa` selects over
+    /// `&GQA[1..]`.
+    #[test]
+    fn select_gqa_is_select_gqa_in_over_the_table() {
+        for row in GQA {
+            let group = row.pack;
+            let s = AttnShape {
+                n_head: 2 * group,
+                n_kv: 2,
+                head: row.head,
+                value: row.value,
+                window: row.window.then_some(512),
+                sinks: row.sinks,
+                scaled: row.value_scale,
+            };
+            let first = GQA
+                .iter()
+                .find(|r| {
+                    r.head == s.head
+                        && r.value == s.value
+                        && r.takes(group)
+                        && (s.window.is_none() || r.window)
+                        && (!s.sinks || r.sinks)
+                        && (!s.scaled || r.value_scale)
+                })
+                .copied()
+                .expect("the row itself covers its own shape");
+            assert_eq!(select_gqa(s), Ok(first), "{}", row.at);
+            assert_eq!(select_gqa_in(GQA, s), select_gqa(s), "{}", row.at);
+        }
+    }
+
+    /// A table of its own is selected from, and a shape it lacks is refused by
+    /// its own widths, groups and window: a row of head 96 is no row of
+    /// [`GQA`], so the table selects it and `GQA` refuses the head. Mutant:
+    /// `select_gqa_in` reads [`GQA`] where it reads `table`.
+    #[test]
+    fn select_gqa_in_selects_from_the_table_it_is_given() {
+        let row = GqaInst {
+            head: 96,
+            value: 96,
+            pack: 3,
+            group: GroupRule::One,
+            window: true,
+            sinks: false,
+            value_scale: false,
+            at: "a test row",
+        };
+        let table = [row];
+        let s = attn(6, 2, 96);
+        assert_eq!(select_gqa_in(&table, s), Ok(row));
+        assert!(matches!(
+            select_gqa(s).expect_err("GQA has no head 96").why,
+            Refusal::HeadWidth { .. }
+        ));
+        assert_eq!(
+            select_gqa_in(&table, attn(16, 2, 128))
+                .expect_err("the table has no head 128")
+                .why,
+            Refusal::HeadWidth { served: vec![96] }
+        );
+        assert_eq!(
+            select_gqa_in(&table, attn(8, 2, 96))
+                .expect_err("the table takes group 3 alone")
+                .why,
+            Refusal::GqaGroup {
+                group: 4,
+                served: vec!["exactly 3".to_string()]
+            }
+        );
+        let cuts_none = [GqaInst {
+            window: false,
+            ..row
+        }];
+        let windowed = AttnShape {
+            window: Some(128),
+            ..s
+        };
+        assert_eq!(
+            select_gqa_in(&cuts_none, windowed)
+                .expect_err("the row cuts no window")
+                .why,
+            Refusal::Window { positions: 128 }
+        );
     }
 
     /// LFM3-1.7B's attention as its description states it: 16 query heads over 4 key heads of

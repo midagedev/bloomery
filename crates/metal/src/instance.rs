@@ -61,8 +61,10 @@ pub struct MoeAxes {
 /// An attention layer's axes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttnAxes {
-    /// The flash row of the shape table ([`shape::GQA`]): the head and value
-    /// widths, which size the lanes' register vectors, and the group.
+    /// The flash row: the head and value widths, which size the lanes'
+    /// register vectors, the group, and whether the flash cuts a window. The
+    /// Qwen instances' rows are the shape table's ([`shape::GQA`]); LFM3's is
+    /// this backend's own.
     pub row: GqaInst,
     pub n_head: u32,
     pub n_kv: u32,
@@ -235,7 +237,9 @@ pub const QWEN35MOE_GQA4: Instance = Instance {
 /// window each layer's launch names, and the output gate one value a head from
 /// a projection of its own. The kernel gate's row of the window, per-head gate
 /// and head-128 group-4 axes; every other axis is the one its clauses have a
-/// fixture for.
+/// fixture for. A file of LFM3-1.7B selects this row's flash ([`Key::of`]);
+/// its dense FFN and short convs have no row, so it opens an instance made
+/// at open.
 pub const LFM3_ATTN: Instance = Instance {
     name: "lfm3_attn",
     key: Key {
@@ -265,7 +269,7 @@ pub const LFM3_ATTN: Instance = Instance {
 /// Every instance `build.rs` writes and compiles. A shape with no row here
 /// is compiled at open when every kernel family takes its geometry
 /// ([`select`]), from the source; a row here is the route to its metallib
-/// (its router and flash rows in the shape table first).
+/// (its router row in the shape table first).
 pub const REGISTERED: &[Instance] = &[
     QWEN35MOE_A3B,
     QWEN3MOE_A3B,
@@ -484,41 +488,61 @@ fn agree<T: PartialEq>(
     }
 }
 
+/// The flash rows the registered instances compile, in the order
+/// [`shape::select_gqa_in`] prefers them: a row of one block a group ahead of
+/// a packed row, a wider pack ahead of a narrower, each row once. The shape
+/// table's own rows ([`shape::GQA`]) are the card's; a row here is a kernel
+/// of this backend.
+fn served_rows() -> Vec<GqaInst> {
+    let mut rows: Vec<GqaInst> = Vec::new();
+    for inst in REGISTERED {
+        let row = inst.key.attn.row;
+        if !rows.contains(&row) {
+            rows.push(row);
+        }
+    }
+    rows.sort_by_key(|r| {
+        (
+            r.group == shape::GroupRule::Packs,
+            core::cmp::Reverse(r.pack),
+        )
+    });
+    rows
+}
+
 impl Key {
     /// The axes of a file of `hidden` values a row whose layers are
-    /// `layers`: each routed layer's router row and each attention layer's
-    /// flash row through the shape table's own lookups
-    /// ([`shape::select_router`], [`shape::select_gqa`]), the rest as the
-    /// description states them. A file's layers are all routed or all dense:
-    /// an instance compiles one FFN.
+    /// `layers`: each routed layer's router row through the shape table's
+    /// own lookup ([`shape::select_router`]), each attention layer's flash
+    /// row from the rows the registered instances compile
+    /// ([`shape::select_gqa_in`]), the rest as the description states them. A
+    /// short conv layer has no axis. A file's layers are all routed or all
+    /// dense: an instance compiles one FFN.
     ///
     /// # Errors
     ///
-    /// [`Refused`] naming the layer when the shape table has no row for it,
-    /// it is of a kind no instance compiles, or its axes are not the earlier
-    /// layers' of its kind; and naming the kind when the file has no FFN or
-    /// no attention layer. A file of no delta layer has no delta axes.
+    /// [`Refused`] naming the layer when no flash row of this backend serves
+    /// it, the shape table has no router row for it, it is of a kind no
+    /// instance compiles, or its axes are not the earlier layers' of its
+    /// kind; and naming the kind when the file has no FFN or no attention
+    /// layer. A file of no delta layer has no delta axes.
     pub fn of<'a>(
         hidden: u32,
         layers: impl IntoIterator<Item = (&'a Mixer, &'a Ffn)>,
     ) -> Result<Key, Refused> {
         let (mut ffn_axes, mut attn, mut delta) = (None, None, None);
+        let flash = served_rows();
         for (layer, (mixer, ffn)) in layers.into_iter().enumerate() {
             match mixer {
                 Mixer::Gqa(g) => {
-                    if matches!(g.out_gate, OutGate::Proj | OutGate::ProjHead) {
+                    if g.out_gate == OutGate::Proj {
                         return Err(Refused::Kind {
                             layer,
-                            what: "an attention output gate on its own projection",
+                            what: "an attention output gate of a value a channel on its own \
+                                   projection",
                         });
                     }
-                    if g.rope.factors {
-                        return Err(Refused::Kind {
-                            layer,
-                            what: "a rope with frequency factors",
-                        });
-                    }
-                    let row = shape::select_gqa(AttnShape::of(g))
+                    let row = shape::select_gqa_in(&flash, AttnShape::of(g))
                         .map_err(|why| Refused::Row { layer, why })?;
                     let axes = AttnAxes {
                         row,
@@ -526,10 +550,11 @@ impl Key {
                         n_kv: g.kv_heads,
                         rot: g.rope.dims,
                         q_gate: g.out_gate == OutGate::Packed,
-                        head_gate: false,
+                        head_gate: g.out_gate == OutGate::ProjHead,
                     };
                     agree(&mut attn, axes, layer, "attention")?;
                 }
+                Mixer::ShortConv(_) => {}
                 Mixer::DeltaRule(d)
                     if matches!(
                         d.kind,
@@ -654,7 +679,7 @@ mod tests {
     use models::shape::{Refusal, Shape};
     use models::{
         Act, DeltaRule, GdnGate, Gqa, KHeadMap, Moe, Rope, RopeMode, Router, RouterNorm, Score,
-        Shared,
+        Shared, ShortConv,
     };
 
     use super::*;
@@ -1074,7 +1099,7 @@ mod tests {
             key(2048, &own),
             Err(Refused::Kind {
                 layer: 0,
-                what: "an attention output gate on its own projection"
+                what: "an attention output gate of a value a channel on its own projection"
             })
         );
         // The delta kernel gates its output with SiLU.
@@ -1151,5 +1176,158 @@ mod tests {
                 ),
             "{text}"
         );
+    }
+
+    /// LFM3-1.7B's attention layer: 16 heads over 4 of 128 values, NeoX over
+    /// the whole head, an output gate of a value a head from a projection of
+    /// its own. A sliding layer cuts a window and turns at its own θ; a full
+    /// layer's rope divides by the file's factors.
+    fn lfm3_attention(sliding: bool) -> Mixer {
+        Mixer::Gqa(Gqa {
+            heads: 16,
+            kv_heads: 4,
+            head_dim: 128,
+            value_dim: 128,
+            rope: Rope {
+                mode: RopeMode::Neox,
+                dims: 128,
+                base: if sliding { 10_000.0 } else { 1_000_000.0 },
+                yarn: None,
+                factors: !sliding,
+            },
+            qk_norm: true,
+            o_norm: false,
+            out_gate: OutGate::ProjHead,
+            select: None,
+            window: sliding.then_some(256),
+            sinks: false,
+            value_scale: None,
+        })
+    }
+
+    /// LFM3-1.7B's layers as its reader describes them: two short convs, a
+    /// full attention layer, a short conv, a sliding one, each over a dense
+    /// FFN of 7680 values.
+    fn lfm3() -> Vec<(Mixer, Ffn)> {
+        let conv = || Mixer::ShortConv(ShortConv { taps: 7 });
+        [
+            conv(),
+            conv(),
+            lfm3_attention(false),
+            conv(),
+            lfm3_attention(true),
+        ]
+        .into_iter()
+        .map(|m| (m, dense_ffn(7680)))
+        .collect()
+    }
+
+    /// LFM3-1.7B's layers select this backend's flash row for it: a short conv
+    /// layer has no axis, the full and the sliding attention layers agree on
+    /// one (the window and the rope's factors are a layer's, not the row's),
+    /// and the row is `LFM3_ATTN`'s, named by its kernel's file. No row
+    /// registers the dense FFN beside it, so the key opens an instance made at
+    /// open. Mutant: `Key::of` keeps the refusals of the per-head gate, of
+    /// rope factors or of a short conv, or selects over `shape::GQA`.
+    #[test]
+    fn lfm3_layers_select_the_lfm3_attn_row_and_open_an_instance_made_at_open() {
+        let layers = lfm3();
+        let k = key(2048, &layers).expect("this backend's rows serve LFM3's attention");
+        assert_eq!(k.attn.row, LFM3_ATTN.key.attn.row);
+        assert_eq!(k.attn, LFM3_ATTN.key.attn);
+        assert!(k.attn.head_gate && !k.attn.q_gate);
+        assert!(
+            k.attn.row.window && k.attn.row.at.starts_with("metal/kernels/attention.metal"),
+            "{}",
+            k.attn.row.at
+        );
+        assert_eq!(k.ffn, FfnAxes::Dense { ff: 7680 });
+        assert_eq!(k.delta, None);
+        assert!(of_key(k).is_err(), "no row registers a dense FFN");
+        let opened = open_key(k).expect("every kernel takes LFM3's geometry");
+        assert_eq!(opened.name, UNREGISTERED);
+        assert_eq!(opened.key, k);
+        assert!(opened.opens);
+        let g = Geometry::of(opened);
+        assert_eq!(g.check(), Ok(()));
+        assert_eq!(
+            (g.experts.slots, g.experts.k, g.experts.dense),
+            (1, 7680, true),
+            "one dense slot of the file's ff"
+        );
+        // The short convs alone have no attention layer to select a row for.
+        let conv_only: Vec<_> = layers
+            .iter()
+            .filter(|(m, _)| matches!(m, Mixer::ShortConv(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            key(2048, &conv_only),
+            Err(Refused::Missing { what: "attention" })
+        );
+    }
+
+    /// Each registered instance's attention shape selects its own flash row:
+    /// the order the rows are preferred in picks the pack of four for four
+    /// query heads a key head and the pack of two for six, as the card's table
+    /// does. Mutant: `served_rows` sorts the packed rows by ascending pack.
+    #[test]
+    fn each_registered_attention_selects_its_own_row() {
+        for inst in REGISTERED {
+            let a = inst.key.attn;
+            let gate = if a.q_gate {
+                OutGate::Packed
+            } else if a.head_gate {
+                OutGate::ProjHead
+            } else {
+                OutGate::None
+            };
+            let layers = vec![(
+                gqa_gated(a.n_head, a.n_kv, a.row.head, a.rot, gate),
+                dense_ffn(512),
+            )];
+            let got = key(inst.key.hidden, &layers).expect("a registered row's own shape");
+            assert_eq!(got.attn, a, "{}", inst.name);
+        }
+    }
+
+    /// A flash no registered row serves is refused by name at its layer, with
+    /// what this backend's rows serve: the widths are the registered rows',
+    /// not the card's table's (which lists heads 64 and 192 too), and a window
+    /// or sinks the selected row has no column for are that row's refusals.
+    /// Mutant: `Key::of` selects over `shape::GQA`, or the row's window column
+    /// is read as true.
+    #[test]
+    fn a_flash_no_registered_row_serves_is_refused_with_the_rows_it_serves() {
+        let refused = |layers: &[(Mixer, Ffn)]| match key(2048, layers) {
+            Err(Refused::Row { layer: 0, why }) => why.why,
+            got => panic!("not a row's refusal at layer 0: {got:?}"),
+        };
+        let wide: Vec<_> = qwen3_30b()
+            .into_iter()
+            .map(|(_, f)| (gqa_gated(16, 2, 160, 128, OutGate::None), f))
+            .collect();
+        assert_eq!(
+            refused(&wide),
+            Refusal::HeadWidth {
+                served: vec![128, 256]
+            }
+        );
+        let edit = |apply: fn(&mut Gqa)| -> Vec<(Mixer, Ffn)> {
+            qwen3_30b()
+                .into_iter()
+                .map(|(mut m, f)| {
+                    if let Mixer::Gqa(g) = &mut m {
+                        apply(g);
+                    }
+                    (m, f)
+                })
+                .collect()
+        };
+        assert_eq!(
+            refused(&edit(|g| g.window = Some(256))),
+            Refusal::Window { positions: 256 }
+        );
+        assert_eq!(refused(&edit(|g| g.sinks = true)), Refusal::Sinks);
     }
 }
