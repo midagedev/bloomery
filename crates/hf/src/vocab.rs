@@ -1149,8 +1149,10 @@ mod tests {
             ("tokenizer_config.json", "", all(TOKENIZER_CONFIG)),
             ("generation_config.json", "", all(GENERATION)),
         ];
-        // PIN(2026-10-28): `model.ignore_merges` true and an `extra_special_tokens` array were
-        // refused; the `lfm2` row has the first, and LFM3's `tokenizer_config.json` the second.
+        // PIN(2026-10-28): `model.ignore_merges` true, an `extra_special_tokens` array and a
+        // ByteLevel post-processor (true, false, true) were refused; the `lfm2` row has the first,
+        // LFM3's `tokenizer_config.json` the second, and its `tokenizer.json` the third (the
+        // post-processor's `add_prefix_space` and `use_regex` act on no text).
         // file, object, key, a value accepted ("$" keeps the base's), a value refused.
         let rows: Vec<(&str, &str, &str, Json, Json)> = serde_json::from_str(r###"[
             ["tokenizer.json", "", "version", "1.0", "2.0"],
