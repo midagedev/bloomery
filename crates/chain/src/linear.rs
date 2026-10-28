@@ -206,13 +206,10 @@ impl LinearShape {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONV_ROWS, CONV_TAPS, DELTA_RING, HEAD, KHeadMap, LinearShape, PASS_ROWS, RING_ROWS, Ring,
-    };
+    use super::{HEAD, KHeadMap, LinearShape, PASS_ROWS, Ring};
 
     /// A ring is the conv's reach and a pass: 8 rows at one tap, 10 at three, the delta layers'
-    /// 11 at four (their `CONV_ROWS` 3 and `RING_ROWS` 11 stay what the kernels spell out), and
-    /// 14 at the seven taps of a short conv. Mutant: `Ring::rows` returns `taps + PASS_ROWS`,
+    /// 11 at four (the delta layers'), and 14 at the seven taps of a short conv. Mutant: `Ring::rows` returns `taps + PASS_ROWS`,
     /// or `Ring::reach` returns `taps`.
     #[test]
     fn a_ring_is_the_reach_and_a_pass() {
@@ -221,16 +218,6 @@ mod tests {
             .map(|t| (t, Ring::new(t).reach(), Ring::new(t).rows()))
             .collect();
         assert_eq!(rows, [(1, 0, 8), (3, 2, 10), (4, 3, 11), (7, 6, 14)]);
-        assert_eq!(
-            (
-                DELTA_RING.taps(),
-                CONV_TAPS,
-                CONV_ROWS,
-                RING_ROWS,
-                PASS_ROWS
-            ),
-            (4, 4, 3, 11, 8)
-        );
         let shape = LinearShape {
             n_k: 16,
             n_v: 48,

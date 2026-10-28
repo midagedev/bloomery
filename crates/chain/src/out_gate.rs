@@ -6,7 +6,10 @@
 //!
 //! Arithmetic: `sigmoid(g) = 1 / (1 + e^−g)` in f32 with the host libm's `exp` (ggml's
 //! `ggml_vec_sigmoid_f32`), and `y = attn · sigmoid(g)` rounded once. A card kernel's `exp` is its
-//! own, an ulp or two apart, so a kernel is held to this within its band, not bit for bit.
+//! own, an ulp or two apart, so a kernel is held to this within its band, not bit for bit. The
+//! gated-attention kernels that exist today (`Proj`) keep their own gate's host rule,
+//! `gpu::linear::out_gate::out_gate_host`, which mirrors the device's sigmoid; this rule is the
+//! LFM3 kernels' reference (`ProjHead`, and `Proj` where an LFM3-side gate compares it).
 //!
 //! No silent failure: a gate of another kind or a length that does not fit is refused by name, and
 //! so is a non-finite input or product, as the kernels raise their fault word for it (`y` then
