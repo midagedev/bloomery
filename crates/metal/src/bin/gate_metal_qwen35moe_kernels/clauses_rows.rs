@@ -2247,13 +2247,12 @@ pub fn attention<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>
 /// The clauses of the row kernels an instance whose layers are all attention
 /// runs: the delta net's are left out.
 pub fn shaped<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
-    vec![
-        ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
-        ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
-        ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),
-        ("attn_prefill_nan", Box::new(|| ctx.with(attn_prefill_nan))),
+    let mut clauses = attention(ctx);
+    let rest: Vec<(&'static str, ClauseRun<'a>)> = vec![
         ("norm_rows", Box::new(|| ctx.with(norm_rows))),
         ("norm_rows_nan", Box::new(|| ctx.with(norm_rows_nan))),
         ("rows_refusals", Box::new(|| ctx.with(rows_refusals))),
-    ]
+    ];
+    clauses.extend(rest);
+    clauses
 }

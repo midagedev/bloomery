@@ -33,6 +33,7 @@ use std::process::ExitCode;
 use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, Stream};
 use bloomery_metal::MetalStream;
+use bloomery_metal::attention_geom::FLASH_THREADS;
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
@@ -47,10 +48,6 @@ use bloomery_metal::library::{Library, Pipeline, SOURCE};
 mod gpu_time;
 
 use gpu_time::{Timed, WARMUPS, time_arm};
-
-/// The flash threadgroup's width, `attention_geom::FLASH_THREADS`: a SIMD
-/// group of 32 lanes to each query head of a key head.
-const FLASH_THREADS: usize = 32 * (QUERY_HEADS / KV_HEADS);
 
 /// The cache rows the probe holds: the largest key count it times.
 const CTX: u32 = 4096;

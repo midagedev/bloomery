@@ -184,7 +184,7 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
         return refuse(
             "query heads",
             &a.query_heads,
-            "at most 63 (the fold's factors in 32 KB of threadgroup memory)",
+            "at most 62 (the fold's factors in 32 KB of threadgroup memory)",
         );
     }
     // The norm's pair tree (rope_neox's `owned_pair`): the turning pairs
@@ -327,6 +327,11 @@ mod tests {
         let odd = Geometry::of(&shaped(24, 3));
         let refused = holds(&odd).expect_err("three key heads");
         assert_eq!((refused.kernel, refused.axis), ("attention", "key heads"));
+        // 128 heads over 16: a group the flash takes, but 128 heads' fold
+        // factors (128 × 131 floats) are past 32 KB.
+        let many = Geometry::of(&shaped(128, 16));
+        let refused = holds(&many).expect_err("128 query heads");
+        assert_eq!((refused.kernel, refused.axis), ("attention", "query heads"));
     }
 
     #[test]
