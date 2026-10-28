@@ -15,7 +15,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
 | CUDA toolkit | 13.3, with the cuRAND headers (`libcurand-dev` on Ubuntu) | `CUDA_TOOLKIT_PATH` |
 | NVIDIA driver | 615.71.09 on the development machine | — |
-| GPU | sm_86: RTX A6000, RTX 3090; `sm_121a` on a DGX Spark's GB10 ([`contrib/dgx-spark.md`](contrib/dgx-spark.md#21-build), section 2.1) | `--arch sm_86`, `--arch sm_121a` |
+| GPU | sm_86: RTX A6000, RTX 3090; `sm_121a` on a DGX Spark's GB10 ([`contrib/dgx-spark.md`](contrib/dgx-spark.md#21-build), section 2.1); `sm_120a` for the RTX 50 series' release archive, built and never run by the maintainers | `--arch sm_86`, `--arch sm_121a`, `--arch sm_120a` |
 | CPU | x86-64; the build targets Zen 3 (see [The CPU flag](#the-cpu-flag)); a GB10's aarch64 cores build for themselves | `.cargo/config.toml` |
 | `just`, `python3` (3.11 or later) | any | only for the Mac checks and the scripts under `tools/`; the commands on this page need neither |
 | `hf` (from `huggingface_hub`) | any | for the downloads below; older releases call it `huggingface-cli download` |

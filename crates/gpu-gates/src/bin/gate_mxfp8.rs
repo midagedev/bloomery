@@ -40,7 +40,8 @@
 //! and `bits` equal to the F32 tile's rule `card::f32_dot` over the host
 //! dequant (lane `L` the values `32i + L` in increasing `i`, one fused
 //! multiply-add each, the butterfly), since its values are decoded exactly as
-//! they are staged. On GB10 `site::gemm` runs the BF16-operand MMA product
+//! they are staged. On a compute capability 12 device `site::gemm` runs the
+//! BF16-operand MMA product
 //! instead: its outputs are held to the operand band, and a subnormal first
 //! activation in column 1 leaves every other column's outputs their bits
 //! (`mma.neighbours`, `shared/dense_file.rs`); the clauses above then read
@@ -954,9 +955,10 @@ mod gate {
                     let mma = y_dev.to_host_vec(stream)?;
                     ok &= check_mma(&name, (&mma, &x, k), &wf);
                     ok &= mma_neighbours(gpu, &k32, (src, route), (&x, k, rows), (tag, &shown))?;
-                    // PIN(2026-10-22): GB10 BF16 operand rounding replaces the site's F32 bit
-                    // contract with the band/KL check above; the exact tile's output replaces
-                    // the site's here, so the bit checks below hold for the exact tile only.
+                    // PIN(2026-10-22): the BF16 operand rounding of a compute capability 12
+                    // device replaces the site's F32 bit contract with the band/KL check above;
+                    // the exact tile's output replaces the site's here, so the bit checks below
+                    // hold for the exact tile only.
                     g32.enqueue_e4m3_tile(
                         stream,
                         w.e4m3("gate_mxfp8", &name)?,

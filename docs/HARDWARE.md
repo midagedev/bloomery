@@ -35,4 +35,4 @@ A board with 4 DDR4 channels has about half the host bandwidth [derived]. The ho
 
 ## GPU architecture
 
-Every kernel is built for sm_86 (Ampere: RTX 3090, RTX A6000) and gated there, and for `sm_121a` on a DGX Spark's GB10 ([`contrib/dgx-spark.md`](contrib/dgx-spark.md) section 2.1). Other architectures have not been built or tested.
+Every kernel is built for sm_86 (Ampere: RTX 3090, RTX A6000) and gated there, and for `sm_121a` on a DGX Spark's GB10 ([`contrib/dgx-spark.md`](contrib/dgx-spark.md) section 2.1). The release's RTX 50 series archive is built for `sm_120a`; the maintainers have no compute capability 12.0 card, so it is compiled and never gated here. Other architectures have not been built or tested.

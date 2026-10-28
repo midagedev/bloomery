@@ -106,7 +106,7 @@ pub(crate) fn columns(
     Ok((x, x_dev, y_dev))
 }
 
-/// GB10's dense prompt product through `site::gemm` (`src`, `rows` rows,
+/// A compute capability 12 device's dense prompt product through `site::gemm` (`src`, `rows` rows,
 /// over `route` filled for the columns of `x`) keeps each column's bits
 /// whatever another column of its tile holds: with a subnormal first value in
 /// column 1, which the tensor cores refuse, every other column's outputs equal

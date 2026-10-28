@@ -34,7 +34,8 @@
 //! over the host's dequantized rows. BF16 words are widened into the same stage
 //! ([`Bf16Rows`], `q8f32`'s `bf16_tile_gemm`), bit for bit the F32 tile over those values.
 //!
-//! GB10 prompt sites select [`bf16_mma_body`] for BF16 and E4M3 weights.
+//! Prompt sites of a compute capability 12 device select [`bf16_mma_body`]
+//! for BF16 and E4M3 weights.
 //! It rounds activations and decoded weights to BF16 and accumulates in F32.
 //! A BF16 site whose input holds its columns already rounded
 //! ([`bf16_cols_body`], `GemmAct32::with_form`) copies those words instead,

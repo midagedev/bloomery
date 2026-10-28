@@ -56,8 +56,9 @@
 //! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
 //! the inject rows are the wide F32 tile, and a BF16 down or up the BF16
 //! prompt product (`Q8F32Kernels::enqueue_bf16_prompt`) on `xn` or the
-//! bottleneck, with BF16 operands on GB10 and F32 activations otherwise.
-//! On GB10 an inject site's BF16 down and its inject rows are one such
+//! bottleneck, with BF16 operands on a compute capability 12 device and F32
+//! activations otherwise. On such a device an inject site's BF16 down and its
+//! inject rows are one such
 //! product (`hc_gated_down_mma_4`, [`HcDownRows`]): the inject rows below
 //! the down's, rounded to BF16 as they are staged, so `xn` is read once;
 //! two glue entries finish the rule —
@@ -65,8 +66,8 @@
 //! inject row) and `hc_gated_mix_4` (`(xn_0·σ(g_0), fma for the rest)·¼`,
 //! the up's order). A column's values are a function of that column alone.
 //! The wide products use a different sum order from the narrow arm, with
-//! Q8_0 activations for Q8_0 weights and BF16 operands for BF16 weights on
-//! GB10. The gate checks their error bands, not bit equality between arms.
+//! Q8_0 activations for Q8_0 weights and BF16 operands for BF16 weights on a
+//! compute capability 12 device. The gate checks their error bands, not bit equality between arms.
 //! The same values raise [`SITE`].
 
 use crate::cores::l2_prefetch;
@@ -2469,7 +2470,8 @@ impl HcWideKernels {
     /// Enqueue one site's mix over `m` columns (module doc's wide arm): the
     /// norm after `before`, the down and optional inject projections, the
     /// bottleneck and weights, and the up/mix. Q8 projections add activation
-    /// quantizers. On GB10 an inject site's BF16 down and its inject are one
+    /// quantizers. On a compute capability 12 device an inject site's BF16
+    /// down and its inject are one
     /// product, and BF16 up projections with m > 8 consume g in the MMA
     /// epilogue; other paths use separate down and inject products and
     /// separate up and mix launches. An inject site leaves its combine weights

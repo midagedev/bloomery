@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Builds the prebuilt Linux release on the box and packs it: `just release-build <version>` runs it through
-# tools/box.sh with the Mac's commit. It builds into its own target dir (target/portable), so the measure runners'
+# tools/box.sh with the Mac's commit. It builds into its own target dir (target/portable, below), so the measure runners'
 # target/release is never touched.
 #
-# The release is the building machine's platform (uname -m), one archive each:
-#   - x86_64: bloomery-<v>-linux-x86_64-cuda-sm86, sm_86 PTX the driver compiles for any card of cc 8.6 or newer, host
-#     code for x86-64-v3; built on the box;
+# The release is the building machine's platform (uname -m) and CUDA arch (BLOOMERY_ARCH, tools/arch.sh), one archive each:
+#   - x86_64, sm_86: bloomery-<v>-linux-x86_64-cuda-sm86, sm_86 PTX the driver compiles for any card of cc 8.6 or newer,
+#     host code for x86-64-v3; built on the box, BLOOMERY_ARCH unset;
+#   - x86_64, sm_120a: bloomery-<v>-linux-x86_64-cuda-sm120a, sm_120a PTX (the Blackwell consumer parts' native FP4 and
+#     MXFP8 kernels, which load on cc 12.0 alone), the same host code; built on the box with BLOOMERY_ARCH=sm_120a, into
+#     its own target dir (target/portable-sm120a) so neither archive's build rebuilds the other's. A build machine with no
+#     cc 12.0 card cannot compile the PTX to cubins, so it stays PTX and the driver compiles it on the card's first start;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
 #     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself).
 #     The packed binary carries the driver's JIT of that PTX as cubins: oxart_jit --cubin links each `.oxart` bundle on
@@ -21,11 +25,13 @@
 #   - on x86_64, host code built for this box's CPU (znver3) instead of x86-64-v3: an instruction past x86-64-v3 outside a
 #     function that runs behind a runtime CPU check;
 #   - a binary with no embedded PTX of the platform's arch, or PTX for another target.
-# A BLOOMERY_ARCH naming another arch than the platform's (tools/arch.sh) ends a build with 64 before anything is built;
-# `--check` reads the binaries and never the variable.
+# A BLOOMERY_ARCH that is no arch of the machine's archives (tools/arch.sh) ends a build with 64 before anything is built;
+# `--check` reads the binaries and never the variable: the archive's arch is its argument, and an x86_64 binary checked
+# with none is held to sm_86.
 # Usage: tools/release/build.sh <version> <commit>
-#        tools/release/build.sh --check <dir>   (the binary checks alone, on <dir>/<bin>; builds and packs nothing)
-#        tools/release/build.sh --self-test     (the host-code scan on fixture listings; check-recipes runs it)
+#        tools/release/build.sh --check <dir> [<arch>]   (the binary checks alone, on <dir>/<bin>, for the archive of
+#                                                         <arch>, default the machine's sm_86 or sm_121a; builds and packs nothing)
+#        tools/release/build.sh --self-test     (the host-code scan on fixture listings and the platform table; check-recipes runs it)
 # The tarball and its .sha256 keep the names this script writes ($NAME.tar.gz…): install.sh resolves the release by
 # them and the Homebrew tap's formula pins them, so `gh release upload` must be given the files as named, not copies
 # under other names. The version the tarball carries is the serve crate's, so a release bumps that crate first.
@@ -33,9 +39,11 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-CHECK_ONLY= SELF_TEST=
+CHECK_ONLY= SELF_TEST= CHECK_ARCH=
 if [ "${1:-}" = --check ]; then
-  CHECK_ONLY=${2:?usage: tools/release/build.sh --check <dir>}
+  CHECK_ONLY=${2:?usage: tools/release/build.sh --check <dir> [<arch>]}
+  CHECK_ARCH=${3:-}
+  [ $# -le 3 ] || { echo "usage: tools/release/build.sh --check <dir> [<arch>]" >&2; exit 64; }
 elif [ "${1:-}" = --self-test ]; then
   [ $# = 1 ] || { echo "usage: tools/release/build.sh --self-test" >&2; exit 64; }
   SELF_TEST=1
@@ -91,6 +99,42 @@ scan_past_v3() {
       if (!insns) { print "release: the objdump listing holds no instruction; the scan reads GNU objdump -d lines (address, tab, bytes, tab, instruction)" > "/dev/stderr"; exit 1 }
       for (k in bad) print bad[k] " " k ", first at " first[k]
     }'
+}
+
+# set_platform <uname -m> <arch>: sets the archive's PLATFORM (its name), RELEASE_ARCH (its PTX target), HOST_CPU,
+# ELF_MACHINE, LOADER, SCAN_V3, GLIBC_FLOOR, CUBIN and TARGET_DIR (its build dir under target/) for the machine and the
+# arch the archive is for; an empty arch is the machine's own (sm_86 on x86_64, sm_121a on aarch64). Another machine or
+# arch is refused by name, rc 64. The x86-64 binary's host code is held to x86-64-v3 by the scan below, and its floor is the
+# oldest distribution the release names. The aarch64 one's target is GB10's own cores (rustc's `gb10`): its sm_121a PTX
+# runs on no other machine, and on a GB10 the `.cargo` table's `native` names the same CPU, so there is no CPU past the
+# target to scan for; its floor is DGX OS 7's glibc (Ubuntu 24.04), which every GB10 runs.
+set_platform() {
+  local machine=$1 arch=${2:-}
+  case "$machine" in
+    x86_64)
+      HOST_CPU=x86-64-v3 ELF_MACHINE='Advanced Micro Devices X86-64'
+      LOADER='ld-linux-x86-64\.so\.2' SCAN_V3=1 GLIBC_FLOOR=2.34 CUBIN=
+      case "${arch:-sm_86}" in
+        sm_86) PLATFORM=linux-x86_64-cuda-sm86 TARGET_DIR=portable ;;
+        sm_120a) PLATFORM=linux-x86_64-cuda-sm120a TARGET_DIR=portable-sm120a ;;
+        *)
+          echo "release: no x86_64 archive for $arch; the x86_64 archives are sm_86 (BLOOMERY_ARCH unset) and sm_120a" >&2
+          return 64 ;;
+      esac
+      RELEASE_ARCH=${arch:-sm_86} ;;
+    aarch64)
+      case "${arch:-sm_121a}" in
+        sm_121a) ;;
+        *)
+          echo "release: no aarch64 archive for $arch; the aarch64 archive is sm_121a (BLOOMERY_ARCH unset on a GB10)" >&2
+          return 64 ;;
+      esac
+      PLATFORM=linux-aarch64-cuda-sm121a RELEASE_ARCH=sm_121a HOST_CPU=gb10 ELF_MACHINE=AArch64 TARGET_DIR=portable
+      LOADER='ld-linux-aarch64\.so\.1' SCAN_V3= GLIBC_FLOOR=2.39 CUBIN=1 ;;
+    *)
+      echo "release: no Linux release for $machine; the platforms are x86_64 and aarch64" >&2
+      return 64 ;;
+  esac
 }
 
 # The scan on listings in GNU objdump's form: address, bytes and instruction, tab-separated, and the bytes past the
@@ -167,6 +211,28 @@ self_test() {
   listing=$(func "$in")
   expect no-instruction 1 "release: the objdump listing holds no instruction; the scan reads GNU objdump -d lines (address, tab, bytes, tab, instruction)"
 
+  # The platform table: the archive each machine and arch names, and the refusal of any other.
+  expect_platform() { # expect_platform <case> <uname -m> <arch> <want rc> <want output>
+    cases=$((cases + 1))
+    out=$( (set_platform "$2" "$3" && echo "$PLATFORM $RELEASE_ARCH $HOST_CPU $TARGET_DIR v3=$SCAN_V3 glibc=$GLIBC_FLOOR cubin=$CUBIN") 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$4" ] || [ "$out" != "$5" ]; then
+      echo "release self-test: platform $1: rc $rc (want $4), output: $out" >&2
+      echo "  want: $5" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  local x86='x86-64-v3' x86_tail='v3=1 glibc=2.34 cubin='
+  expect_platform x86-default x86_64 '' 0 "linux-x86_64-cuda-sm86 sm_86 $x86 portable $x86_tail"
+  expect_platform x86-sm86 x86_64 sm_86 0 "linux-x86_64-cuda-sm86 sm_86 $x86 portable $x86_tail"
+  expect_platform x86-sm120a x86_64 sm_120a 0 "linux-x86_64-cuda-sm120a sm_120a $x86 portable-sm120a $x86_tail"
+  expect_platform x86-sm121a x86_64 sm_121a 64 "release: no x86_64 archive for sm_121a; the x86_64 archives are sm_86 (BLOOMERY_ARCH unset) and sm_120a"
+  expect_platform x86-sm120f x86_64 sm_120f 64 "release: no x86_64 archive for sm_120f; the x86_64 archives are sm_86 (BLOOMERY_ARCH unset) and sm_120a"
+  expect_platform arm-default aarch64 '' 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable v3= glibc=2.39 cubin=1"
+  expect_platform arm-sm121a aarch64 sm_121a 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable v3= glibc=2.39 cubin=1"
+  expect_platform arm-sm86 aarch64 sm_86 64 "release: no aarch64 archive for sm_86; the aarch64 archive is sm_121a (BLOOMERY_ARCH unset on a GB10)"
+  expect_platform arm-sm120a aarch64 sm_120a 64 "release: no aarch64 archive for sm_120a; the aarch64 archive is sm_121a (BLOOMERY_ARCH unset on a GB10)"
+  expect_platform riscv riscv64 '' 64 "release: no Linux release for riscv64; the platforms are x86_64 and aarch64"
+
   if [ "$fails" = 0 ]; then
     echo "release: self-test ok ($cases cases)"
   else
@@ -179,38 +245,25 @@ if [ -n "$SELF_TEST" ]; then
   exit $?
 fi
 
-# The platform: its archive name, PTX arch, host CPU target, ELF machine, dynamic loader and glibc floor. The x86-64
-# binary's host code is held to x86-64-v3 by the scan below, and its floor is the oldest distribution the release names.
-# The aarch64 one's target is GB10's own cores (rustc's `gb10`): its sm_121a PTX runs on no other machine, and on a GB10
-# the `.cargo` table's `native` names the same CPU, so there is no CPU past the target to scan for; its floor is DGX OS
-# 7's glibc (Ubuntu 24.04), which every GB10 runs.
-case "$(uname -m)" in
-  x86_64)
-    PLATFORM=linux-x86_64-cuda-sm86 RELEASE_ARCH=sm_86 HOST_CPU=x86-64-v3 ELF_MACHINE='Advanced Micro Devices X86-64'
-    LOADER='ld-linux-x86-64\.so\.2' SCAN_V3=1 GLIBC_FLOOR=2.34 CUBIN= ;;
-  aarch64)
-    PLATFORM=linux-aarch64-cuda-sm121a RELEASE_ARCH=sm_121a HOST_CPU=gb10 ELF_MACHINE=AArch64
-    LOADER='ld-linux-aarch64\.so\.1' SCAN_V3= GLIBC_FLOOR=2.39 CUBIN=1 ;;
-  *)
-    echo "release: no Linux release for $(uname -m); the platforms are x86_64 and aarch64" >&2
-    exit 64 ;;
-esac
+# The archive's arch: a build's is BLOOMERY_ARCH, as tools/arch.sh resolves it; a check's is its argument (empty: the
+# machine's own).
+if [ -n "$CHECK_ONLY" ]; then
+  ARCH=$CHECK_ARCH
+else
+  # shellcheck source=tools/arch.sh
+  source "$ROOT/tools/arch.sh"
+  bloomery_arch release/build.sh || exit $?
+fi
+set_platform "$(uname -m)" "$ARCH" || exit $?
 ALLOWED_NEEDED="^(libc\\.so\\.6|libm\\.so\\.6|libgcc_s\\.so\\.1|$LOADER)\$"
 
 if [ -n "$CHECK_ONLY" ]; then
   BIN_DIR=$CHECK_ONLY
 else
-  # shellcheck source=tools/arch.sh
-  source "$ROOT/tools/arch.sh"
-  bloomery_arch release/build.sh || exit $?
-  if [ "$ARCH" != "$RELEASE_ARCH" ]; then
-    echo "release: BLOOMERY_ARCH is $ARCH, and this machine's release archive is $RELEASE_ARCH's (its name, $PLATFORM, and the PTX check below): build it with BLOOMERY_ARCH unset or $RELEASE_ARCH" >&2
-    exit 64
-  fi
   NAME="bloomery-$VERSION-$PLATFORM"
   DIST="$ROOT/target/release-dist"
   STAGE="$DIST/$NAME"
-  export CARGO_TARGET_DIR="$ROOT/target/portable"
+  export CARGO_TARGET_DIR="$ROOT/target/$TARGET_DIR"
   BIN_DIR="$CARGO_TARGET_DIR/release"
   # cargo-oxide appends RUSTFLAGS after the project's extra-rustflags, and rustc keeps the last -C target-cpu.
   export RUSTFLAGS="-C target-cpu=$HOST_CPU"

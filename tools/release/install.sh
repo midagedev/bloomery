@@ -6,7 +6,9 @@
 # or from a checkout (tools/release/install.sh [--version V]). No prompts, no
 # sudo: the release lands in ~/.local/opt/bloomery-<version> and symlinks go into
 # ~/.local/bin (created; a PATH note prints when the directory is not on PATH):
-# bloomery-serve on Linux x86-64 and on a GB10 (DGX Spark, Linux aarch64);
+# bloomery-serve on Linux x86-64 (the sm_120a archive when every GPU is compute
+# capability 12.0, the RTX 50 series; the sm_86 archive otherwise) and on a GB10
+# (DGX Spark, Linux aarch64);
 # bloomery-serve-metal, generate_metal and bloomery-prepare on an Apple Silicon
 # Mac. Everything the download needs is checked against the release's own
 # sha256 before anything is extracted over. --self-test checks the archive
@@ -28,13 +30,28 @@ done
 
 fail() { echo "install.sh: $*" >&2; exit 1; }
 
-# platform: the archive this machine takes, or the reason it takes none. The aarch64
-# archive's GPU code is sm_121a PTX (GB10's native FP4), which the driver loads on
-# compute capability 12.1 alone, so nvidia-smi must list at least one GPU and every
-# GPU it lists must be a GB10.
+# platform: the archive this machine takes, or the reason it takes none. The x86-64 sm_120a
+# archive's GPU code is sm_120a PTX, which the driver loads on compute capability 12.0
+# alone, so it is the pick only when nvidia-smi lists at least one GPU and every GPU it
+# lists is 12.0; any other answer (no nvidia-smi, a failed query, no GPU, a 12.0 card beside
+# another capability) takes the sm_86 archive, whose PTX the driver compiles for any card of
+# 8.6 or newer. The aarch64 archive's GPU code is sm_121a PTX (GB10's native FP4), which the
+# driver loads on compute capability 12.1 alone, so nvidia-smi must list at least one GPU and
+# every GPU it lists must be a GB10.
 platform() {
     case "$(uname -s)-$(uname -m)" in
-        Linux-x86_64) echo linux-x86_64-cuda-sm86 ;;
+        Linux-x86_64)
+            if command -v nvidia-smi > /dev/null && caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2> /dev/null); then
+                set -- $caps
+                if [ "$#" -gt 0 ]; then
+                    blackwell=1
+                    for c in "$@"; do
+                        [ "$c" = 12.0 ] || blackwell=
+                    done
+                    [ -z "$blackwell" ] || { echo linux-x86_64-cuda-sm120a; return; }
+                fi
+            fi
+            echo linux-x86_64-cuda-sm86 ;;
         Linux-aarch64)
             command -v nvidia-smi > /dev/null \
                 || fail "nvidia-smi is required to identify a GB10 (DGX Spark); install its driver first."
@@ -51,6 +68,21 @@ platform() {
         Linux-*) fail "the Linux release is for x86-64 and for aarch64 with a GB10 (DGX Spark); uname -m says $(uname -m)." ;;
         *) fail "the release is for Linux x86-64, a GB10 (DGX Spark) and Apple Silicon Macs (Windows: run it inside WSL2); this is $(uname -s)." ;;
     esac
+}
+
+# archive <platform> <tag>: the platform whose archive the release <tag> carries. A release that
+# predates the sm_120a archive answers 404 for its .sha256, and the machine then takes the sm_86
+# archive; any other answer, a dead network included, leaves the platform to the download, which
+# fails by name.
+archive() {
+    if [ "$1" = linux-x86_64-cuda-sm120a ]; then
+        code=$(curl -sI -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/$2/bloomery-${2#v}-$1.tar.gz.sha256" || true)
+        if [ "$code" = 404 ]; then
+            echo "install.sh: note: release $2 carries no $1 archive; installing linux-x86_64-cuda-sm86, whose GPU code the driver compiles for this card." >&2
+            set -- linux-x86_64-cuda-sm86 "$2"
+        fi
+    fi
+    echo "$1"
 }
 
 # The choice on stub uname and nvidia-smi: the stubs' directory is the whole PATH,
@@ -81,6 +113,14 @@ self_test() {
     }
     expect Linux x86_64 8.6 linux-x86_64-cuda-sm86
     expect Linux x86_64 none linux-x86_64-cuda-sm86
+    expect Linux x86_64 12.0 linux-x86_64-cuda-sm120a
+    expect Linux x86_64 "12.0 12.0" linux-x86_64-cuda-sm120a
+    expect Linux x86_64 "12.0 8.6" linux-x86_64-cuda-sm86
+    expect Linux x86_64 "8.6 12.0" linux-x86_64-cuda-sm86
+    expect Linux x86_64 12.1 linux-x86_64-cuda-sm86
+    expect Linux x86_64 9.0 linux-x86_64-cuda-sm86
+    expect Linux x86_64 "" linux-x86_64-cuda-sm86
+    expect Linux x86_64 fail linux-x86_64-cuda-sm86
     expect Darwin arm64 none macos-arm64-metal
     expect Linux aarch64 12.1 linux-aarch64-cuda-sm121a
     expect Linux aarch64 none "install.sh: nvidia-smi is required"
@@ -91,6 +131,25 @@ self_test() {
     expect Linux riscv64 none "install.sh: the Linux release is for x86-64 and for aarch64"
     expect Darwin x86_64 none "install.sh: the macOS release is for Apple Silicon"
     expect FreeBSD amd64 none "install.sh: the release is for Linux x86-64"
+    # expect_archive <platform> <tag> <the code curl prints for the .sha256 URL> <want> <the note stderr must hold, or ->:
+    # archive prints want.
+    expect_archive() {
+        cases=$((cases + 1))
+        rm -rf "$d/bin" && mkdir "$d/bin"
+        printf '#!/bin/sh\necho %s\n' "$3" > "$d/bin/curl"
+        chmod +x "$d/bin/curl"
+        got=$(PATH="$d/bin"; archive "$1" "$2" 2> "$d/err")
+        if [ "$got" != "$4" ] || { [ "$5" != - ] && ! grep -qF "$5" "$d/err"; } || { [ "$5" = - ] && [ -s "$d/err" ]; }; then
+            echo "install.sh self-test: archive $1 $2 (curl says $3): '$got' with note '$(cat "$d/err")', want '$4' and '$5'" >&2
+            fails=$((fails + 1))
+        fi
+    }
+    expect_archive linux-x86_64-cuda-sm120a v0.3.11 302 linux-x86_64-cuda-sm120a -
+    expect_archive linux-x86_64-cuda-sm120a v0.3.11 200 linux-x86_64-cuda-sm120a -
+    expect_archive linux-x86_64-cuda-sm120a v0.3.10 404 linux-x86_64-cuda-sm86 "install.sh: note: release v0.3.10 carries no linux-x86_64-cuda-sm120a archive"
+    expect_archive linux-x86_64-cuda-sm120a v0.3.11 000 linux-x86_64-cuda-sm120a -
+    expect_archive linux-x86_64-cuda-sm86 v0.3.10 404 linux-x86_64-cuda-sm86 -
+    expect_archive linux-aarch64-cuda-sm121a v0.3.10 404 linux-aarch64-cuda-sm121a -
     if [ "$fails" = 0 ]; then
         echo "install.sh: self-test ok ($cases cases)"
     else
@@ -115,7 +174,8 @@ OLDER=$(printf '%s\n26.2\n' "$OS" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)
 [ "$OLDER" = "26.2" ] || fail "macOS $OS is older than the Metal backend's floor, 26.2."
 else
 
-if [ "$PLATFORM" = linux-x86_64-cuda-sm86 ]; then
+case "$PLATFORM" in
+linux-x86_64-*)
 # The release's host code is built for x86-64-v3: on a CPU without AVX2, FMA or BMI2 it dies of
 # SIGILL ("Illegal instruction") at the first such instruction, so the install stops here instead.
 FLAGS=$(grep -m1 '^flags' /proc/cpuinfo 2> /dev/null || true)
@@ -131,11 +191,15 @@ if [ -n "$FLAGS" ]; then
 else
     echo "install.sh: could not read the CPU flags (/proc/cpuinfo); the release needs AVX2, FMA and BMI2 (x86-64-v3)." >&2
 fi
-fi
+;;
+esac
 
 # tools/release/build.sh's floor for each archive.
 FLOOR=2.34
-[ "$PLATFORM" = linux-x86_64-cuda-sm86 ] || FLOOR=2.39
+case "$PLATFORM" in
+linux-x86_64-*) ;;
+*) FLOOR=2.39 ;;
+esac
 GLIBC=$(ldd --version 2>/dev/null | head -1 | grep -o '[0-9]*\.[0-9]*$' || true)
 if [ -n "$GLIBC" ]; then
     OLDER=$(printf '%s\n%s\n' "$GLIBC" "$FLOOR" | sort -V | head -1)
@@ -156,6 +220,7 @@ if [ -z "$VERSION" ]; then
         | grep -m1 '"tag_name"' | grep -o 'v[0-9.]*') \
         || fail "could not read the latest release from GitHub."
 fi
+PLATFORM=$(archive "$PLATFORM" "$VERSION")
 ASSET="bloomery-${VERSION#v}-$PLATFORM.tar.gz"
 URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 

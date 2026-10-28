@@ -66,8 +66,9 @@
 //! up rows dotted in `card::f32_dot`'s order over the widened values, the
 //! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 prompt
 //! product with no quantizer, so a NaN raises the mix's site alone and a
-//! subnormal column leaves the other columns' bits unchanged. On GB10 that
-//! product runs on BF16 tensor cores: the down and up within the BF16
+//! subnormal column leaves the other columns' bits unchanged. On a compute
+//! capability 12 device that product runs on BF16 tensor cores: the down and
+//! up within the BF16
 //! operand bands (`check_mma`), the inject rows in the down's product
 //! (`hc_gated_down_mma_4`, dots `[m][324]`) within the same band and its
 //! weights within the F32 band plus that bound through `2·σ(·/4)`, and in a
@@ -1210,7 +1211,7 @@ mod gate {
 
     /// Whether the wide arm runs `site`'s down and inject as one product, its
     /// dots `[m][R + S]` in the scratch's `down` (else `[m][R]`, then
-    /// `[m][S]`): a BF16 inject site on GB10.
+    /// `[m][S]`): a BF16 inject site where `dense_mma` holds.
     fn packs(c: &Ctx, site: &Site, inject: bool) -> Result<bool, GateError> {
         Ok(inject
             && matches!(site.planes, Planes::Bf16 { .. })

@@ -644,7 +644,8 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 ## Limits
 
 - **sm_86+** GPUs and NVIDIA driver R580+ (CUDA 13); the x86-64 archive carries sm_86 PTX, compiled for the card
-  at the first start, and x86-64-v3 host code. The GB10 archive (Linux aarch64) carries its sm_121a code compiled for
+  at the first start, and x86-64-v3 host code; its sm_120a twin carries sm_120a PTX and is the installer's pick on
+  a machine whose every GPU is compute capability 12.0 (the RTX 50 series). The GB10 archive (Linux aarch64) carries its sm_121a code compiled for
   a DGX Spark, with that code's PTX for a driver that refuses it;
   another aarch64 machine builds from source with `BLOOMERY_ARCH` setting the CUDA arch
   ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)). The AVX2 kernels stay x86-64 only, and a quant type without an

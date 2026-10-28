@@ -2197,10 +2197,33 @@ pub(crate) fn row_prefetch(ctx: &CudaContext) -> Result<bool, GpuError> {
 }
 
 /// Whether `ctx`'s device runs the dense prompt sites and the wide BF16
-/// router on the BF16 tensor-core tile (`gemm::bf16_mma_body`): GB10, compute
-/// capability 12.1. Other devices keep the exact F32 products. Load-time only.
+/// router on the BF16 tensor-core tile (`gemm::bf16_mma_body`): the Blackwell
+/// consumer parts, compute capability 12 (the RTX 50 series, GB10), whose
+/// tensor cores take the tile at a higher rate than the F32 SIMT tile. The
+/// tile rounds activations to BF16, so an Ampere card (compute capability
+/// 8.6) keeps the exact F32 products. Load-time only.
 pub fn dense_mma(ctx: &CudaContext) -> Result<bool, GpuError> {
-    Ok(ctx.compute_capability()? == (12, 1))
+    Ok(dense_mma_on(ctx.compute_capability()?))
+}
+
+/// [`dense_mma`]'s rule on a device's `(major, minor)` compute capability.
+const fn dense_mma_on((major, _): (i32, i32)) -> bool {
+    major == 12
+}
+
+#[cfg(test)]
+mod dense_mma_tests {
+    use super::dense_mma_on;
+
+    /// The BF16 tile follows the capability's major version: the RTX 5090's
+    /// 12.0 and GB10's 12.1 take it, an Ampere card's 8.6 keeps the exact F32
+    /// products.
+    #[test]
+    fn the_dense_tile_runs_on_capability_12_and_not_on_ampere() {
+        for (cc, want) in [((8, 6), false), ((12, 0), true), ((12, 1), true)] {
+            assert_eq!(dense_mma_on(cc), want, "compute capability {cc:?}");
+        }
+    }
 }
 
 /// The room a device allocation can take on an integrated device: the

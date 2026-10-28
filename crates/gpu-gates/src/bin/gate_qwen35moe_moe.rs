@@ -106,8 +106,8 @@
 //!   per token, all BIT-EQUAL. Then a BF16 weight's words (LCG values cut
 //!   to BF16, a subnormal in one row and in one token's activations): the
 //!   fused launch at m = 1, 5, 8 and the ubatch pair over 70 BIT-EQUAL to
-//!   the F32 entries over the same values widened, or on a cc 12.1 device
-//!   to the dense MMA tile over the same words then the routing alone; the
+//!   the F32 entries over the same values widened, or on a compute capability
+//!   12 device to the dense MMA tile over the same words then the routing alone; the
 //!   ubatch pair BIT-EQUAL to the fused launch per token.
 //! - `shape`: the eleven entries compile with no local depot.
 //!
@@ -1282,7 +1282,7 @@ mod gate {
     /// words): LCG values cut to BF16, full mantissas, with a subnormal in
     /// router row 300 and in token 3's activations, values the tensor cores
     /// refuse. The reference: on a device whose dense prompt products run on
-    /// BF16 tensor cores (compute capability 12.1) the dense MMA tile
+    /// BF16 tensor cores (compute capability 12) the dense MMA tile
     /// (`enqueue_bf16_mma`, its refused row and column replayed on the exact
     /// owner) over the same words and activations, then the routing alone
     /// per token; on any other device the F32 entries over the same values
@@ -1294,7 +1294,7 @@ mod gate {
     fn wide_bf16(c: &Ctx) -> Result<bool, GateError> {
         let stream = c.stream();
         let sink = c.gpu.unlabelled_sink();
-        // PIN(2026-10-24): on a cc 12.1 device the BF16 entries run the dense
+        // PIN(2026-10-24): on a compute capability 12 device the BF16 entries run the dense
         // MMA tile's arithmetic (activations rounded to BF16), so there the
         // fused launch and the ubatch pair are held to that tile then the
         // routing alone, not to the F32 entries over the widened values,

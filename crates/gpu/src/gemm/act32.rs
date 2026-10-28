@@ -43,7 +43,7 @@ use gguf::GgmlType;
 /// refused by name rather than reading another call's bytes.
 ///
 /// A scratch made [`GemmAct32::with_form`] also holds room for its columns
-/// in a [`MmaForm`], which a site on GB10's dense MMA tile copies instead of
+/// in a [`MmaForm`], which a site on the dense MMA tile copies instead of
 /// converting the f32 rows in each tile.
 pub struct GemmAct32 {
     #[cfg(bloomery_nvfp4_mma)]
@@ -59,7 +59,7 @@ pub struct GemmAct32 {
     forms: [Option<ColsForm>; 2],
 }
 
-/// A form of a [`GemmAct32`]'s columns that a site on GB10's dense MMA tile
+/// A form of a [`GemmAct32`]'s columns that a site on the dense MMA tile
 /// copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmaForm {

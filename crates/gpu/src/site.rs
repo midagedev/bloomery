@@ -41,7 +41,8 @@
 //!   only), MXFP8 and FP8_B128 the same tile over their planes
 //!   (`mxfp8_tile_gemm`, `fp8_b128_tile_gemm`, the values decoded as they
 //!   are staged), BF16 the same tile over widened words (`bf16_tile_gemm`).
-//!   On GB10, BF16 and the E4M3 formats instead use BF16 tensor-core operands
+//!   On a compute capability 12 device, BF16 and the E4M3 formats instead use
+//!   BF16 tensor-core operands
 //!   with F32 accumulation (`bf16_mma_gemm`, `mxfp8_mma_gemm`, `fp8_b128_mma_gemm`);
 //!   a cell whose row or column holds an exceptional operand replays the exact
 //!   F32 tile within that kernel, and every other cell keeps its MMA value.
@@ -1660,7 +1661,7 @@ fn wide_by_name(
     gemm(gpu, k, (ty, w, src), rows, x, table, m, y)
 }
 
-/// Whether a site of type `ty` copies its input's `form` on GB10's dense MMA
+/// Whether a site of type `ty` copies its input's `form` on the dense MMA
 /// tile when the input holds it ([`GemmAct32::with_form`]): a BF16 site the
 /// BF16 form; on a native block-scaled build an MXFP8 site the MXFP8 form.
 fn copies_form(gpu: &Gpu, ty: SiteTy, form: MmaForm) -> bool {

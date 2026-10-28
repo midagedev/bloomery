@@ -3,7 +3,7 @@
 # box; this script is everything after it, so the upload cannot repeat v0.2.0's
 # mistake (gh named the assets from temp filenames and every download URL 404'd).
 #
-#   tools/release/publish.sh <version> [--dry-run] [--no-tap]
+#   tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a]
 #   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits, and step 3a's warnings; check-recipes runs it)
 #   tools/release/publish.sh --sitting-check <tarball> <name> <dir>...   step 3a alone, on the verdicts in each <dir>
 #
@@ -15,8 +15,11 @@
 #   2. the versions: the serve AND gpu-gates crates must both say <version> (--version
 #      reads gpu-gates, /props reads serve — v0.2.0 shipped with 0.1.0 in --version);
 #   3. the artifacts: on the box, where readelf and the ELF binary run — the release's
-#      own .sha256, build.sh's checks on the unpacked binary, and its --version;
-#      then the tarball and .sha256 come here for the upload and the tap's digest;
+#      own .sha256, build.sh's checks on the unpacked binary (for the archive's arch), and its --version;
+#      then the tarball and .sha256 come here for the upload and the tap's digest; the
+#      box holds two x86-64 archives, sm_86 (`just release-build <v>`) and sm_120a
+#      (`BLOOMERY_ARCH=sm_120a just release-build <v>`, the RTX 50 series'), and a release
+#      without the second one is published with --no-sm120a;
 #      the GB10 archive (linux-aarch64-cuda-sm121a) the same way on the GB10 that built
 #      it, named by BLOOMERY_GB10_BOX (unset: the release carries no GB10 archive, and
 #      step 6 says so);
@@ -30,12 +33,13 @@
 #      on the unpacked binaries, a Developer ID signature on each, and the commit the
 #      archive's README names;
 #   4. the upload: `gh release upload --clobber` with exactly the names the build scripts
-#      wrote (bloomery-<v>-linux-x86_64-cuda-sm86.tar.gz, bloomery-<v>-macos-arm64-metal.tar.gz,
-#      bloomery-<v>-linux-aarch64-cuda-sm121a.tar.gz with a GB10 archive, and their .sha256) —
+#      wrote (bloomery-<v>-linux-x86_64-cuda-sm86.tar.gz, bloomery-<v>-linux-x86_64-cuda-sm120a.tar.gz,
+#      bloomery-<v>-macos-arm64-metal.tar.gz, bloomery-<v>-linux-aarch64-cuda-sm121a.tar.gz with a GB10
+#      archive, and their .sha256) —
 #      it refuses to upload a file under any other name — then curls every URL for a 200;
 #   5. the Homebrew tap: bumps Formula/bloomery.rb's version and each platform's url and
-#      sha256 in ~/repo/homebrew-tap (the GB10 one where the formula has its url), commits
-#      and pushes;
+#      sha256 in ~/repo/homebrew-tap (the GB10 one where the formula has its url; the sm_120a
+#      archive is the installer's pick, never the formula's), commits and pushes;
 #   6. prints what is left to the lead: the release notes (gh release edit --notes-file)
 #      and the ghcr image — the v* tag push already triggered .github/workflows/container.yml.
 #
@@ -100,6 +104,16 @@ sitting_check() {
     return 0
 }
 
+# release_assets <version> <gb10 0|1> <sm120a 0|1>: the archives one release uploads, one name a line, no extension. The x86-64
+# sm_86 archive is first: step 4 uploads its .sha256 alone and last (the image workflow starts on it), so the files before it
+# are the other archives'.
+release_assets() {
+    echo "bloomery-$1-linux-x86_64-cuda-sm86"
+    [ "$3" = 0 ] || echo "bloomery-$1-linux-x86_64-cuda-sm120a"
+    [ "$2" = 0 ] || echo "bloomery-$1-linux-aarch64-cuda-sm121a"
+    echo "bloomery-$1-macos-arm64-metal"
+}
+
 # --self-test: a copy of this script in a temporary repository with no tag, beside a stub tools/rotation.py that exits with each
 # code. rc 1, 2 and 70 stop at the rotation with a message that names it; rc 0 passes it and stops at the tag check after it, so the
 # rotation is the first step and a green one lets the rest run.
@@ -129,6 +143,34 @@ if [ "${1:-}" = --self-test ]; then
     expect 2 "could not run (rc 2"
     expect 70 "could not run (rc 70"
     expect 0 "does not carry v0.0.0"
+    # The asset list (step 4): the sm_86 archive first and the macOS one last, the sm_120a one beside it unless --no-sm120a, the
+    # GB10 one when a GB10 archive was verified.
+    assets_expect() { # assets_expect <case> <gb10> <sm120a> <want, space-separated>
+        cases=$((cases + 1))
+        got=$(release_assets 0.0.0 "$2" "$3" | tr '\n' ' ')
+        got=${got% }
+        [ "$got" = "$4" ] || { echo "publish.sh self-test: assets $1: '$got', want '$4'" >&2; fails=$((fails + 1)); }
+    }
+    assets_expect "all four" 1 1 "bloomery-0.0.0-linux-x86_64-cuda-sm86 bloomery-0.0.0-linux-x86_64-cuda-sm120a bloomery-0.0.0-linux-aarch64-cuda-sm121a bloomery-0.0.0-macos-arm64-metal"
+    assets_expect "no GB10 archive" 0 1 "bloomery-0.0.0-linux-x86_64-cuda-sm86 bloomery-0.0.0-linux-x86_64-cuda-sm120a bloomery-0.0.0-macos-arm64-metal"
+    assets_expect "--no-sm120a" 1 0 "bloomery-0.0.0-linux-x86_64-cuda-sm86 bloomery-0.0.0-linux-aarch64-cuda-sm121a bloomery-0.0.0-macos-arm64-metal"
+    assets_expect "x86-64 and macOS only" 0 0 "bloomery-0.0.0-linux-x86_64-cuda-sm86 bloomery-0.0.0-macos-arm64-metal"
+    # An argument that is no option is refused by name (64) before any step runs; --no-sm120a is an option.
+    cases=$((cases + 1))
+    rc=0
+    got=$(bash "$t/tools/release/publish.sh" 0.0.0 --no-such-option 2>&1) || rc=$?
+    case "$rc:$got" in
+        64:*"unknown argument --no-such-option"*) ;;
+        *) echo "publish.sh self-test: an unknown option: rc $rc, want 64 naming it; got: $got" >&2; fails=$((fails + 1)) ;;
+    esac
+    cases=$((cases + 1))
+    printf 'import sys\nsys.exit(0)\n' > "$t/tools/rotation.py"
+    rc=0
+    got=$(bash "$t/tools/release/publish.sh" 0.0.0 --no-sm120a 2>&1) || rc=$?
+    case "$rc:$got" in
+        1:*"does not carry v0.0.0"*) ;;
+        *) echo "publish.sh self-test: --no-sm120a: rc $rc, want rc 1 at the tag step; got: $got" >&2; fails=$((fails + 1)) ;;
+    esac
     # The sitting step (3a): a verdict the tarball's member matches passes silently, anything else is a WARNING that names it, and
     # the status is 0 in every case — publishing is never refused for it.
     tn=bloomery-0.0.0-linux-x86_64-cuda-sm86
@@ -187,12 +229,13 @@ if [ "${1:-}" = --sitting-check ]; then
     exit 0
 fi
 
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] | --self-test | --sitting-check <tarball> <name> <dir>...}
-DRY=0; TAP=1
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | --self-test | --sitting-check <tarball> <name> <dir>...}
+DRY=0; TAP=1; BW=1
 for a in "${@:2}"; do
     case "$a" in
         --dry-run) DRY=1 ;;
         --no-tap) TAP=0 ;;
+        --no-sm120a) BW=0 ;;
         *) echo "publish.sh: unknown argument $a" >&2; exit 64 ;;
     esac
 done
@@ -201,6 +244,7 @@ BOX=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$ROOT")"}
 GB10_BOX=${BLOOMERY_GB10_BOX:-}
 NAME="bloomery-$VERSION-linux-x86_64-cuda-sm86"
+BW_NAME="bloomery-$VERSION-linux-x86_64-cuda-sm120a"
 GB10_NAME="bloomery-$VERSION-linux-aarch64-cuda-sm121a"
 MAC_NAME="bloomery-$VERSION-macos-arm64-metal"
 TAG="v$VERSION"
@@ -228,10 +272,10 @@ done
 
 # 3. the Linux artifacts, each verified on the machine that built it (readelf/objdump and the ELF binary are Linux's)
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-# linux_archive <box> <name>: <name>'s .sha256, build.sh --check and --version on <box>; then the tarball and .sha256
-# fetched into $TMP and hashed here. Prints the sha256.
+# linux_archive <box> <name> <arch>: <name>'s .sha256, build.sh --check (for the archive of <arch>) and --version on <box>;
+# then the tarball and .sha256 fetched into $TMP and hashed here. Prints the sha256.
 linux_archive() {
-    local box=$1 name=$2 sha got f
+    local box=$1 name=$2 arch=$3 sha got f
     local verify=(ssh "$box")
     # The box's command goes behind its guard; the GB10's runs over plain ssh, as the account that built it (box.sh's
     # guard reads /root's lease, which that account need not reach).
@@ -240,7 +284,7 @@ linux_archive() {
 sha256sum -c $name.tar.gz.sha256 > /dev/null; \
 rm -rf /tmp/pub-$VERSION; mkdir /tmp/pub-$VERSION; \
 tar -xzf $name.tar.gz -C /tmp/pub-$VERSION --strip-components=1; \
-bash $REMOTE/tools/release/build.sh --check /tmp/pub-$VERSION/bin; \
+bash $REMOTE/tools/release/build.sh --check /tmp/pub-$VERSION/bin $arch; \
 V=\$(/tmp/pub-$VERSION/bin/bloomery-serve --version); \
 [ \"\$V\" = \"bloomery-serve $VERSION (commit $COMMIT)\" ] || { echo \"the packed binary says: \$V\" >&2; exit 1; }" >&2 \
         || fail "$name failed verification on $box (just release-build $VERSION there first)"
@@ -254,10 +298,14 @@ V=\$(/tmp/pub-$VERSION/bin/bloomery-serve --version); \
     echo "publish.sh: $name.tar.gz $(stat -f %z "$TMP/$name.tar.gz") bytes, sha256 $sha, checks and --version ok on $box" >&2
     echo "$sha"
 }
-SHA=$(linux_archive "$BOX" "$NAME") || exit 1
+SHA=$(linux_archive "$BOX" "$NAME" sm_86) || exit 1
+BW_SHA=
+if [ "$BW" = 1 ]; then
+    BW_SHA=$(linux_archive "$BOX" "$BW_NAME" sm_120a) || exit 1
+fi
 GB10_SHA=
 if [ -n "$GB10_BOX" ]; then
-    GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME") || exit 1
+    GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME" sm_121a) || exit 1
 fi
 
 # 3a. the sitting's verdict beside the tarball on the box: its absence is the check's warning, not an error here
@@ -282,7 +330,9 @@ echo "publish.sh: $MAC_NAME.tar.gz $(stat -f %z "$TMP/$MAC_NAME.tar.gz") bytes, 
 
 # 4. the upload. gh uploads one call's files in parallel, and the image workflow starts when the x86-64 .sha256 is up,
 # so that file goes up alone after every other one.
-ASSETS=("$NAME" ${GB10_SHA:+"$GB10_NAME"} "$MAC_NAME")
+GB10=0; [ -z "$GB10_SHA" ] || GB10=1
+ASSETS=()
+while IFS= read -r a; do ASSETS+=("$a"); done < <(release_assets "$VERSION" "$GB10" "$BW")
 FILES=()
 for a in "${ASSETS[@]}"; do FILES+=("$a.tar.gz" "$a.tar.gz.sha256"); done
 if [ "$DRY" = 1 ]; then
@@ -343,6 +393,8 @@ fi
 # 6. the lead's remainder
 echo "publish.sh: left to the lead:"
 [ -n "$GB10_SHA" ] || echo "  - no GB10 archive in this release: BLOOMERY_GB10_BOX names the GB10 that ran 'just release-build $VERSION'"
+[ -n "$BW_SHA" ] || echo "  - no sm_120a archive in this release (--no-sm120a): the installer takes the sm_86 archive on an RTX 50 series card"
+[ -z "$BW_SHA" ] || echo "  - the sm_120a archive is install.sh's pick on a machine whose every GPU is compute capability 12.0 (sha256 $BW_SHA); Homebrew and the ghcr image stay on the sm_86 archive"
 echo "  - release notes: gh release edit $TAG --repo $REPO --notes-file <file>"
 echo "  - the ghcr image builds itself from the tag push (.github/workflows/container.yml); watch:"
 echo "      gh run watch \$(gh run list --repo $REPO --workflow 'Docker image' --limit 1 --json databaseId -q '.[0].databaseId')"
