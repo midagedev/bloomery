@@ -1,15 +1,18 @@
 //! The e2e gate's clauses (macOS only).
 //!
 //! The session (`bloomery_metal::arch::qwen3moe::session`) opens the row's
-//! MLX split (`<family>-mlxsplit` under the fixture root), and every clause
-//! starts from its reset. The gate runs over a row (`--row`, `row.rs`): the
-//! qwen35moe split by default, the qwen3moe split, or the qwen38d split (a
-//! dense FFN in every layer). A clause reads the file's numbers from the
-//! session's geometry and layers; a row names the clauses whose contract its
-//! file's architecture lacks (a delta layer's recurrent state, a router's
-//! picks), and the gate prints each as that clause's SKIP line with its
-//! reason. The kernel mutants (`--mutant`, `--mutants-all`) run on the rows
-//! that name a table of them: the default row's and the dense row's.
+//! model, and every clause starts from its reset. The gate runs over a row
+//! (`--row`, `row.rs`): the qwen35moe MLX split by default (`<family>-mlxsplit`
+//! under the fixture root), the qwen3moe split, the qwen38d split (a dense FFN
+//! in every layer), or the lfm3 checkpoint folder (`lfm3-mlx` under the fixture
+//! root: a short conv beside the attention layers, a sandwich residual, a
+//! dense FFN, a tied head; no `prepare` map reads it, so the folder is the
+//! model). A clause reads the file's numbers from the session's geometry and
+//! layers; a row names the clauses whose contract its file's architecture
+//! lacks (a delta layer's recurrent state, a router's picks), and the gate
+//! prints each as that clause's SKIP line with its reason. The kernel mutants
+//! (`--mutant`, `--mutants-all`) run on the rows that name a table of them: the
+//! default row's and the dense row's.
 //!
 //! The clauses that compared this session to ik's GGUF sets are gone, and so
 //! is the `--nodes` walk of those sets.
@@ -17,7 +20,8 @@
 //!
 //! - `d_count`: host-fed, then in chain steps, every step of a depth within
 //!   one segment of keys encodes the groups and dispatches
-//!   `count::token_count` gives (one barrier between groups) and waits once;
+//!   `count::token_count` gives (one barrier between groups), which a row that
+//!   derives its count on paper holds to that number first, and waits once;
 //!   the device's allocated size is the same before and after those steps
 //!   (the step allocates nothing on the device), and the host's allocation
 //!   calls, read as a difference around the step (each run's first step,
@@ -36,13 +40,16 @@
 //!   and last logits equal bit for bit over the same ids, one sample a
 //!   group covering every group the count counts, and the groups' weight
 //!   bytes equal to the file's own tensors walked under the plan's names.
-//! - `m_mlx`: the row's MLX split (`<family>-mlxsplit` under the fixture root,
-//!   every typed site MLX_A4, its routers MLX_A8) opens through the session —
-//!   the reader admitting its sites through Metal's site lists — and
-//!   `generate` over `Plain` emits the session's own host-fed picks (`mlx.rs`).
-//! - `m_logits`: the split's logit rows at each of the committed mlx-lm dump's
-//!   ids, teacher-forced one id a step, against the dump of the row's folder; the
-//!   verdict names each step's distance and the worst (`mlx.rs`).
+//! - `m_mlx`: the row's MLX model (a split `<family>-mlxsplit` under the
+//!   fixture root, every typed site MLX_A4, its routers MLX_A8, or the folder)
+//!   opens through the session — the reader admitting its sites through
+//!   Metal's site lists — and `generate` over `Plain` emits the session's own
+//!   host-fed picks (`mlx.rs`).
+//! - `m_logits`: the row's logit rows at each of the committed dump's ids,
+//!   teacher-forced one id a step, against the dump of the row's folder, each
+//!   held to the row's band and, where the pin names its argmax, the
+//!   session's pick equal to it; the verdict names each step's distance and
+//!   the worst (`mlx.rs`).
 //! - `m_mlx_folder`: the row's MLX checkpoint folder (`<family>-mlx` under the
 //!   fixture root), opened as it is with no `prepare`, tells what the split made
 //!   of it (`<family>-mlxsplit`) tells: the plan's lines, the first host-fed
@@ -89,7 +96,7 @@ use std::time::{Duration, Instant};
 use bloomery_device::DeviceError;
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
-use bloomery_metal::arch::qwen3moe::count::{Layer, LiveKeys, Ticket, token_count};
+use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::Instance;
@@ -128,9 +135,11 @@ const GATE: &str = "gate_metal_qwen35moe_e2e";
 /// depths `d_count` pins.
 const CTX: usize = bloomery_metal::kernels::SEGMENT_KEYS;
 
-/// The token `d_count` and `e_token_id` start from: any id the vocabulary
-/// holds. Neither clause reads a reference set.
-const SEED: u32 = 0;
+/// The token `d_count`, `e_token_id` and `p_profile` start from: the row's
+/// seed, an id the family's model runs from. None reads a reference set.
+fn seed() -> u32 {
+    row::current().seed
+}
 
 /// The chain steps `e_token_id` runs after its reset: past the position of
 /// the token ahead the faulted step dropped.
@@ -147,9 +156,14 @@ pub fn says(e: SessionError) -> String {
     e.to_string()
 }
 
-/// The row's MLX split, the file the session opens.
+/// The row's model, the file the session opens: the first shard of its MLX
+/// split, or its checkpoint folder where `prepare` made no split of the family.
 fn model_path() -> Result<PathBuf, String> {
-    mlx_split::path(row::current().arch)
+    let spec = row::current();
+    match spec.model {
+        row::Model::Split => mlx_split::path(spec.arch),
+        row::Model::Folder => mlx_split::folder(spec.arch),
+    }
 }
 
 /// Allocation calls the process has made, for `d_count`'s host half: read as
@@ -205,7 +219,7 @@ fn d_run(s: &mut Session, mode: StepMode) -> Result<Vec<Duration>, String> {
     let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
     let (groups, dispatches) = (want.groups as usize, want.dispatches as usize);
     let mut walls: Vec<Duration> = Vec::with_capacity(s.ctx());
-    let mut id = SEED;
+    let mut id = seed();
     for call in 0..s.ctx() {
         let pos = s.pos();
         let waits = s.stats().waits;
@@ -257,6 +271,17 @@ fn spread(mut walls: Vec<Duration>) -> (f64, f64) {
 /// step.
 fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
     let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
+    // The row's own count, derived on paper from the layer list: the count
+    // model and the encoder agree below only while both are right.
+    if let Some(paper) = row::current().count
+        && (want.groups, want.dispatches) != (paper.groups, paper.dispatches)
+    {
+        return Err(format!(
+            "the count model gives {} groups and {} dispatches for the file's layers; the row \
+             derives {} and {} on paper",
+            want.groups, want.dispatches, paper.groups, paper.dispatches
+        ));
+    }
     let before = device.allocated_bytes().map_err(why)?;
     let host = d_run(s, StepMode::HostFed)?;
     let stats0 = s.stats();
@@ -337,7 +362,7 @@ fn e_fault(s: &mut Session, mode: StepMode) -> Result<Fault, String> {
             s.pos()
         ));
     }
-    match s.step(SEED, mode) {
+    match s.step(seed(), mode) {
         Err(SessionError::Poisoned(f)) if f == fault => Ok(fault),
         Err(e) => Err(format!(
             "{mode:?}: the step after the fault: {e}; a refusal by poison is expected"
@@ -356,7 +381,7 @@ fn e_token_id(s: &mut Session) -> Clause {
     let fault = e_fault(s, StepMode::HostFed)?;
     s.reset().map_err(says)?;
     let st = s
-        .step(SEED, StepMode::HostFed)
+        .step(seed(), StepMode::HostFed)
         .map_err(|e| format!("the step after the reset: {}", says(e)))?;
     if st.id as usize >= s.vocab() {
         return Err(format!("the step after the reset picked {}", st.id));
@@ -372,7 +397,7 @@ fn e_token_id(s: &mut Session) -> Clause {
         return Err("the faulted chain step did not drop its token ahead".to_string());
     }
     s.reset().map_err(says)?;
-    let mut id = SEED;
+    let mut id = seed();
     for _ in 0..CHAIN_AFTER_RESET {
         id = s
             .step(id, StepMode::Chain)
@@ -576,15 +601,11 @@ pub fn main() -> ExitCode {
         instance.name,
         session.token_layers()
     );
-    let delta_layers = session
-        .token_layers()
-        .iter()
-        .filter(|l| matches!(l, Layer::Delta { .. }))
-        .count();
-    if (delta_layers > 0) != row.recurrent {
+    let recurrent_layers = keep::recurrent_layers(&session);
+    if (recurrent_layers > 0) != row.recurrent {
         println!(
-            "clause open: FAIL (row {} says recurrent = {}; the file has {delta_layers} delta \
-             layers)",
+            "clause open: FAIL (row {} says recurrent = {}; the file has {recurrent_layers} \
+             layers with a recurrent store, a delta state or a conv ring)",
             row.name, row.recurrent
         );
         return ExitCode::FAILURE;

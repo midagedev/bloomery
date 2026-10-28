@@ -1,0 +1,10 @@
+version 1
+family lfm3
+ids 124894,597,4104,10299
+steps 4
+n 128000
+fnv1a b8b1cbb105386439
+argmax 11,2719,368,35886
+folder LiquidAI/LFM3-1.7B-MLX-4bit at d0ca73dcfa70ce18733754a492cdc1fb0123262d, the 4-bit affine folder
+made tools/mlx-logits.py dump through mlx-vlm 0.7.11 lfm3 at 230fc308e on mlx 0.32.4, f32 over the exact dequant of the folder
+ids-start the ids start at BOS 124894: id 0 degenerates this model in mlx-vlm itself, so no pin starts there

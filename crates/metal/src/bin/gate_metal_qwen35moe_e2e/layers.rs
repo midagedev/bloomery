@@ -1,4 +1,4 @@
-//! `--dump-layers DIR`: the first host-fed step's residual and the probe
+//! `--dump-layers DIR`: the first host-fed step's (from the row's seed) residual and the probe
 //! nodes each op leaves, as little-endian f32 files. A tool, not a clause.
 //! The step is the traced one, so the read sees the op's writes; the kernels
 //! and the session path are the ones a host-fed step runs.
@@ -27,7 +27,7 @@ fn go(s: &mut Session, dir: &Path) -> Result<(), String> {
     s.reset().map_err(says)?;
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut saved: Vec<(String, Vec<f32>)> = Vec::new();
-    s.step_traced(0, |op, probe| {
+    s.step_traced(super::row::current().seed, |op, probe| {
         let mut take = |name: String, node: Node| -> Result<(), SessionError> {
             saved.push((name, probe.read(node)?));
             Ok(())
@@ -45,6 +45,8 @@ fn go(s: &mut Session, dir: &Path) -> Result<(), String> {
                 take(format!("L{l:02}.partials"), Node::DeltaPartials)?;
             }
             Op::DeltaOut(l) => take(format!("L{l:02}.mix"), Node::Residual)?,
+            Op::ConvIn(_) | Op::ConvCore(_) => {}
+            Op::ConvOut(l) => take(format!("L{l:02}.mix"), Node::Residual)?,
             Op::AttnIn(l) => {
                 take(format!("L{l:02}.q"), Node::AttnQ(l))?;
                 take(format!("L{l:02}.k"), Node::AttnK(l))?;
@@ -121,6 +123,7 @@ fn write_geom(s: &Session, dir: &Path, saved: &[(String, Vec<f32>)]) -> Result<(
     for (i, layer) in s.token_layers().iter().enumerate() {
         let kind = match layer {
             Layer::Delta { .. } => "delta",
+            Layer::ShortConv { .. } => "conv",
             Layer::Attention { .. } => "attention",
         };
         line(&format!("kind{i:02}"), kind)?;

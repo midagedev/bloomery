@@ -11,16 +11,18 @@
 //! the session as it is, with no `prepare`, and is the split's model: the
 //! same plan, the same greedy ids and the same first-step logits to the bit.
 //!
-//! `m_logits`: the session's logit rows against a committed mlx-lm dump of
-//! that folder (`pins/<family>.txt` and `.f32` beside this module). The pin
-//! names its ids; the session runs them teacher-forced, one id a step with its
-//! cache kept, the way the dump does, and every step's row is held to the
-//! band. Position 0 reads one key (softmax 1), a rope angle of 0 and a zero
-//! delta state; the steps above it read the rope, the scale, the QK layout and
-//! the decay too. The dump is the external oracle: mlx-lm's modules run in f32
-//! over the exact dequant, so it carries the model's arithmetic without
-//! mlx-lm's bf16 rounding. A missing pin, or a pin whose steps, ids and bytes
-//! disagree, is a named error.
+//! `m_logits`: the session's logit rows against a committed dump of that
+//! folder (`pins/<family>.txt` and `.f32` beside this module). The pin names
+//! its ids; the session runs them teacher-forced, one id a step with its cache
+//! kept, the way the dump does, and every step's row is held to the row's band
+//! (`Row::logit_abs`). A pin that names its argmax (a line `argmax`, one id a
+//! step, held to its own rows at read) also holds the session's pick of each
+//! step to it. Position 0 reads one key (softmax 1), a rope angle of 0 and a
+//! zero recurrent state; the steps above it read the rope, the scale, the QK
+//! layout and the decay or the conv taps too. The dump is the external oracle:
+//! the reference's modules run in f32 over the exact dequant, so it carries the
+//! model's arithmetic without bf16 activation rounding. A missing pin, or a pin
+//! whose steps, ids, argmax and bytes disagree, is a named error.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,20 +41,10 @@ use super::{CTX, mlx_split, row, says};
 /// The greedy tokens the loop and the host-fed reference run.
 const GREEDY: usize = 24;
 
-/// The token `m_mlx` and `m_mlx_folder` start from.
-const SEED: u32 = 0;
-
-/// PIN(2026-10-28): max |session − mlx-lm| on a logit, at each pinned step.
-/// The pin is mlx-lm's modules in f32 over the exact dequant of the same
-/// affine-4 weights (`tools/mlx-logits.py dump`), so the gap is the
-/// session's own rounding. A bound: were every projection's input rounded
-/// once into half (a relative error uniform within ±2^-11, rms
-/// 2^-11/√3 = 2.8e-4), a dot of 2,048 products would carry Δ = 2.8e-4 of
-/// its rms. The fixture is four layers plus the head: five projections. The
-/// pins' largest logit is 5.03, so a logit moves at most 5Δ · 5.03 = 7.0e-3;
-/// the band rounds that up. Measured: the worst healthy step is 1.92e-3,
-/// and the nearest mutant (`rope_key_row_zero`) is 0.739 away.
-const LOGIT_ABS: f64 = 0.01;
+/// The token `m_mlx` and `m_mlx_folder` start from: the row's seed.
+fn seed() -> u32 {
+    row::current().seed
+}
 
 /// FNV-1a 64-bit, the pin file's checksum of the f32 little-endian bytes.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -112,8 +104,24 @@ fn pin_of(family: &str) -> Result<(String, Vec<u8>), String> {
 
 struct Pin {
     ids: Vec<u32>,
+    /// The argmax of each step's row the pin's own line names, when it has one.
+    argmax: Option<Vec<u32>>,
     n: usize,
     rows: Vec<f32>,
+}
+
+/// The first index of the largest value of `row`: a NaN is not a candidate.
+fn argmax_of(row: &[f32]) -> Option<u32> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in row.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        if best.is_none_or(|(_, b)| v > b) {
+            best = Some((i, v));
+        }
+    }
+    best.and_then(|(i, _)| u32::try_from(i).ok())
 }
 
 fn field<'a>(map: &'a [(&str, &str)], key: &str) -> Result<&'a str, String> {
@@ -193,11 +201,35 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
     for chunk in raw.as_chunks::<4>().0 {
         rows.push(f32::from_le_bytes(*chunk));
     }
-    Ok(Pin { ids, n, rows })
+    let argmax = match map.iter().find(|(k, _)| *k == "argmax") {
+        None => None,
+        Some((_, list)) => {
+            let named: Vec<u32> = list
+                .split(',')
+                .map(|s| {
+                    s.parse::<u32>()
+                        .map_err(|_| format!("the mlx-lm pin's argmax holds {s:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+            let own: Vec<Option<u32>> = rows.chunks_exact(n).map(argmax_of).collect();
+            if own.len() != named.len() || own.iter().zip(&named).any(|(o, w)| *o != Some(*w)) {
+                return Err(format!(
+                    "the mlx-lm pin names the argmax {named:?}; its rows' are {own:?}"
+                ));
+            }
+            Some(named)
+        }
+    };
+    Ok(Pin {
+        ids,
+        argmax,
+        n,
+        rows,
+    })
 }
 
 /// One step's row against the pin's row: the largest |a − b| and where, the
-/// values over [`LOGIT_ABS`] and the rms.
+/// values over the band and the rms.
 struct Distance {
     max: f64,
     at: usize,
@@ -208,7 +240,7 @@ struct Distance {
 }
 
 /// `got` against `want`. A NaN or an infinity is not a distance.
-fn distance(got: &[f32], want: &[f32]) -> Result<Distance, String> {
+fn distance(got: &[f32], want: &[f32], band: f64) -> Result<Distance, String> {
     if got.len() != want.len() {
         return Err(format!(
             "the logit row holds {} values; the pin holds {}",
@@ -232,7 +264,7 @@ fn distance(got: &[f32], want: &[f32]) -> Result<Distance, String> {
         }
         sum_sq += d * d;
         let d = d.abs();
-        if d > LOGIT_ABS {
+        if d > band {
             worst.over += 1;
         }
         if i == 0 || d > worst.max {
@@ -246,17 +278,16 @@ fn distance(got: &[f32], want: &[f32]) -> Result<Distance, String> {
     Ok(worst)
 }
 
-/// `m_mlx`: the row's MLX split opens and generate over `Plain` emits the
+/// `m_mlx`: the row's MLX model opens and generate over `Plain` emits the
 /// session's own host-fed picks.
 pub fn m_mlx(device: &MetalDevice, library: &Library) -> Clause {
-    let family = row::current().arch;
-    let path = mlx_split::path(family)?;
+    let path = super::model_path()?;
     let mut s = Session::open(device, library, &path, CTX).map_err(says)?;
 
     // The reference: the first id and each pick host-fed, one step each.
     s.reset().map_err(says)?;
     let mut ref_picks = Vec::with_capacity(GREEDY);
-    let mut id = SEED;
+    let mut id = seed();
     for _ in 0..GREEDY {
         id = s.step(id, StepMode::HostFed).map_err(says)?.id;
         ref_picks.push(id);
@@ -265,7 +296,7 @@ pub fn m_mlx(device: &MetalDevice, library: &Library) -> Clause {
     // The loop over the target: the prompt again, then the passes.
     s.reset().map_err(says)?;
     let mut plain = Plain;
-    let prompt = [SEED];
+    let prompt = [seed()];
     let picked = plain
         .prompt(&mut s, &prompt)
         .map_err(|e| format!("the prompt's argmax: {}", says(e)))?;
@@ -298,7 +329,7 @@ pub fn m_mlx(device: &MetalDevice, library: &Library) -> Clause {
         ));
     }
     Ok(Verdict::Noted(format!(
-        "the MLX split {} opened ({} layers, every typed site MLX_A4) and generate over Plain \
+        "the MLX model {} opened ({} layers, every typed site MLX_A4) and generate over Plain \
          emitted the session's own {GREEDY} picks",
         path.display(),
         s.layer_count()
@@ -306,7 +337,7 @@ pub fn m_mlx(device: &MetalDevice, library: &Library) -> Clause {
 }
 
 /// What one model file's session says of itself: the plan's lines, the greedy
-/// ids from [`SEED`] and the logits row of the first step.
+/// ids from the row's seed and the logits row of the first step.
 struct Told {
     plan: Vec<String>,
     ids: Vec<u32>,
@@ -314,7 +345,7 @@ struct Told {
 }
 
 /// `file` opened through the session and run: the plan [`plan::render`] prints
-/// for it, then [`GREEDY`] host-fed steps from [`SEED`], the first step's
+/// for it, then [`GREEDY`] host-fed steps from the row's seed, the first step's
 /// logits row kept. The room lines are left out, they are the machine's.
 fn tell(device: &MetalDevice, library: &Library, file: &ModelFile) -> Result<Told, String> {
     let outcome = check::check(file.header(), CTX);
@@ -332,7 +363,7 @@ fn tell(device: &MetalDevice, library: &Library, file: &ModelFile) -> Result<Tol
     let mut s = Session::open_model(device, library, file, CTX).map_err(says)?;
     let mut ids = Vec::with_capacity(GREEDY);
     let mut first_logits = Vec::new();
-    let mut id = SEED;
+    let mut id = seed();
     for step in 0..GREEDY {
         id = s.step(id, StepMode::HostFed).map_err(says)?.id;
         if step == 0 {
@@ -419,26 +450,49 @@ pub fn m_mlx_folder(device: &MetalDevice, library: &Library) -> Clause {
     )))
 }
 
-/// `m_logits`: the row's split, host-fed on the pin's ids one step each with
-/// its cache kept, against mlx-lm's logit rows of the folder the split was
-/// made from. Each step's distance is the largest absolute difference of its
-/// row, held to [`LOGIT_ABS`]; the verdict names every step's and the worst.
+/// `m_logits`: the row's model, host-fed on the pin's ids one step each with
+/// its cache kept, against the reference's logit rows of the folder. Each
+/// step's distance is the largest absolute difference of its row, held to the
+/// row's band (`Row::logit_abs`), and its pick to the pin's argmax where the
+/// pin names it; the verdict names every step's distance and the worst.
+///
+/// Mutant: the row's band set below the largest distance a run prints
+/// (`LFM3_LOGIT_ABS` in `row.rs`), or the first id of the pin's `argmax` line
+/// changed (a named error at read, before any step runs).
 pub fn m_logits(device: &MetalDevice, library: &Library) -> Clause {
-    let family = row::current().arch;
+    let spec = row::current();
+    let family = spec.arch;
+    let band = spec.logit_abs;
     let (text, raw) = pin_of(family)?;
     let pin = parse_pin(family, &text, &raw)?;
-    let path = mlx_split::path(family)?;
+    let path = super::model_path()?;
     let mut s = Session::open(device, library, &path, CTX).map_err(says)?;
     let mut steps = Vec::with_capacity(pin.ids.len());
     for (k, (&id, want)) in pin.ids.iter().zip(pin.rows.chunks_exact(pin.n)).enumerate() {
-        s.step(id, StepMode::HostFed).map_err(says)?;
+        let picked = s.step(id, StepMode::HostFed).map_err(says)?.id;
         let row = s.logits_row().map_err(says)?;
-        let d = distance(row, want).map_err(|e| format!("step {k} (id {id}): {e}"))?;
+        let d = distance(row, want, band).map_err(|e| format!("step {k} (id {id}): {e}"))?;
+        let pinned = pin.argmax.as_ref().map(|a| a[k]);
         println!(
             "m_logits step {k} (id {id}): max |logit| difference {:.3e} at {} (session {:.6}, \
-             pin {:.6}), {} values over the band, rms {:.3e}",
-            d.max, d.at, d.session, d.stored, d.over, d.rms
+             pin {:.6}), {} values over the band, rms {:.3e}, pick {picked}{}",
+            d.max,
+            d.at,
+            d.session,
+            d.stored,
+            d.over,
+            d.rms,
+            pinned.map_or_else(String::new, |p| format!(" (pin {p})"))
         );
+        if let Some(p) = pinned
+            && p != picked
+        {
+            return Err(format!(
+                "step {k} (id {id}) picked {picked}; the pin's argmax is {p} (max |logit| \
+                 difference {:.3e}, band {band})",
+                d.max
+            ));
+        }
         steps.push(d);
     }
     let worst = (1..steps.len()).fold(0, |w, k| if steps[k].max > steps[w].max { k } else { w });
@@ -446,9 +500,9 @@ pub fn m_logits(device: &MetalDevice, library: &Library) -> Clause {
     let per_step: Vec<String> = steps.iter().map(|d| format!("{:.2e}", d.max)).collect();
     let over: usize = steps.iter().map(|d| d.over).sum();
     let line = format!(
-        "mlx-lm pin {family}: max |logit| difference {:.3e} at step {worst} (id {}), logit {} \
-         (session {:.6}, pin {:.6}); per step [{}]; band {LOGIT_ABS}, {over} values over it; \
-         {} step(s) of {} values",
+        "pin {family}: max |logit| difference {:.3e} at step {worst} (id {}), logit {} \
+         (session {:.6}, pin {:.6}); per step [{}]; band {band}, {over} values over it; \
+         {} step(s) of {} values{}",
         w.max,
         pin.ids[worst],
         w.at,
@@ -456,9 +510,12 @@ pub fn m_logits(device: &MetalDevice, library: &Library) -> Clause {
         w.stored,
         per_step.join(", "),
         steps.len(),
-        pin.n
+        pin.n,
+        pin.argmax.as_ref().map_or_else(String::new, |a| format!(
+            "; every pick the pin's argmax {a:?}"
+        ))
     );
-    if w.max <= LOGIT_ABS {
+    if w.max <= band {
         Ok(Verdict::Noted(line))
     } else {
         Err(line)

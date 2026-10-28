@@ -6,9 +6,11 @@ use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::kernels::{BLOCK_VALUES, NormOnLoad, Quant, SegParams, Segment};
 use gguf::quant::GgmlType;
 
+use super::clauses_synth;
 use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle;
+use super::synthetic;
 use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, SegLaunch};
 
 /// The groups of the segmented launch: the tensors of one type and one width
@@ -19,6 +21,83 @@ struct SegGroup {
     gain: &'static str,
     /// The tensors: their names and their row counts.
     tensors: Vec<(&'static str, usize)>,
+}
+
+/// The four segments of an A4 attention P1 with a per-head gate, at the
+/// hidden width and the head counts of a 16-head, 4-KV-head, head-128 layer:
+/// q, k, v and the gate, whose 16 rows are the shortest segment a launch runs.
+const GATE_P1: [(&str, usize); 4] = [
+    ("attn_q", 2048),
+    ("attn_k", 512),
+    ("attn_v", 512),
+    ("attn_gate", 16),
+];
+
+/// [`GATE_P1`] on seeded synthetic A4 weights, one dispatch: every segment the
+/// same bits as its tensor run alone, the gate's 16 rows among them. The
+/// fixture carries no tensor of these shapes, so the weights are drawn.
+///
+/// Mutant: `seg_weight_offset`, a segment reading the first segment's weights,
+/// turns the group red (the groups of [`seg_bit`] before it are red first);
+/// `seg_last_segment` does not reach the fourth segment, which no group of
+/// [`seg_bit`] but this one has.
+fn gate_p1(h: &Harness<'_>, eps: f32) -> Result<String, String> {
+    let cols = 2048;
+    let gain = clauses_synth::gain(cols, 0x5EA0);
+    let x = oracle::activations(cols, 0x5EA1, 1.0);
+    let owned: Vec<Vec<u8>> = GATE_P1
+        .iter()
+        .enumerate()
+        .map(|(j, (_, n))| synthetic::matrix(Quant::A4, *n, cols, 0xA4_5E60 + j as u64))
+        .collect();
+    let segments: Vec<(usize, &[u8])> = GATE_P1
+        .iter()
+        .zip(&owned)
+        .map(|((_, n), w)| (*n, w.as_slice()))
+        .collect();
+    let rows: usize = GATE_P1.iter().map(|(_, n)| n).sum();
+    let got = h.seg(&SegLaunch {
+        quant: Quant::A4,
+        cols,
+        segments: segments.clone(),
+        x: &x,
+        y0: &common::sentinel_rows(rows),
+        gain: &gain,
+        eps,
+        layer: LAYER,
+    })?;
+    if let Some(fault) = h.fault()? {
+        return Err(format!("the A4 gate P1 raised {fault}"));
+    }
+    let mut at = 0usize;
+    for (j, (n, bytes)) in segments.iter().enumerate() {
+        let alone = h.matvec(&Launch {
+            quant: Quant::A4,
+            rows: *n,
+            cols,
+            weights: bytes,
+            x: &x,
+            y0: &common::sentinel_rows(*n),
+            mode: ModeSpec::Norm {
+                gain: &gain,
+                eps,
+                layer: LAYER,
+            },
+        })?;
+        if let Some((k, a, b)) = common::first_diff(&got[at..at + n], &alone) {
+            return Err(format!(
+                "A4 {} segment {j} row {k}: the segment read {a:?}, the tensor alone read {b:?}",
+                GATE_P1[j].0
+            ));
+        }
+        at += n;
+    }
+    Ok(format!(
+        "A4 {} {} segments, the last {} rows",
+        GATE_P1[0].0,
+        GATE_P1.len(),
+        GATE_P1[GATE_P1.len() - 1].1
+    ))
 }
 
 /// Every segment of a segmented dispatch is the same bits as the same tensor
@@ -105,6 +184,7 @@ pub fn seg_bit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             group.tensors.len()
         ));
     }
+    parts.push(gate_p1(h, eps)?);
     common::noted(parts)
 }
 

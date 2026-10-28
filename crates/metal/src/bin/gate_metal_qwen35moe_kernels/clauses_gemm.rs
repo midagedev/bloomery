@@ -50,6 +50,8 @@
 //! sides are in the band. A value past the half range is a fault, not a band
 //! case.
 
+use std::process::Command;
+
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
@@ -63,7 +65,7 @@ use super::clauses_a4::{self, Sites};
 use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, U};
-use super::{Harness, SENTINEL_BITS};
+use super::{Harness, SENTINEL_BITS, flag};
 
 /// The half operand's cast rounds once, relatively.
 pub(super) const HALF_ROUND: f64 = 1.0 / 2048.0;
@@ -563,6 +565,42 @@ fn q6k_cases(fixture: &Fixture) -> Result<Vec<Case<'_>>, String> {
 /// The seed of the A4 head-tail case's activations.
 const HEAD_TAIL_SEED: u64 = 0x6E54;
 
+/// The weight rows of the A4 gate-projection cases: a per-head attention gate
+/// projects the hidden width to one value a head, 16 weight rows, a quarter of
+/// the 64 a tile holds. Its output rows are 16 wide, the tight stride.
+const GATE_ROWS: usize = 16;
+
+/// The activation rows and seeds of the gate-projection cases: 33 and 9 leave
+/// activation rows past the last of a tile.
+const GATE_ACTS: [(usize, u64); 2] = [(33, 0x6E55), (9, 0x6E56)];
+
+/// The A4 gate-projection cases: the first [`GATE_ROWS`] rows of the MLX
+/// split's head, a tile of 16 live weight rows, at the tight output stride.
+fn gate_cases<'a>(h: &Harness<'_>, mlx: &'a Fixture) -> Result<Vec<Case<'a>>, String> {
+    let hidden = h.geom().hidden;
+    let weights = mlx.rows_at(
+        "output.weight",
+        gguf::quant::GgmlType::MLX_A4,
+        hidden,
+        0,
+        GATE_ROWS,
+    )?;
+    Ok(GATE_ACTS
+        .iter()
+        .map(|&(acts, seed)| Case {
+            label: format!("output.weight head {GATE_ROWS}x{hidden} r{acts} stride {GATE_ROWS}"),
+            weights,
+            quant: Quant::A4,
+            rows: GATE_ROWS,
+            cols: hidden,
+            acts,
+            x_stride: hidden,
+            y_stride: GATE_ROWS,
+            seed,
+        })
+        .collect())
+}
+
 /// The A4 cases at a row's sites, the MLX-format fixture split's tensors: its
 /// whole tensors, then the head's last rows, a count no weight tile divides.
 fn a4_cases<'a>(h: &Harness<'_>, mlx: &'a Fixture, sites: &Sites) -> Result<Vec<Case<'a>>, String> {
@@ -601,6 +639,7 @@ fn a4_cases<'a>(h: &Harness<'_>, mlx: &'a Fixture, sites: &Sites) -> Result<Vec<
         y_stride: tail_rows.div_ceil(4) * 4,
         seed: HEAD_TAIL_SEED,
     });
+    cases.extend(gate_cases(h, mlx)?);
     Ok(cases)
 }
 
@@ -623,8 +662,132 @@ pub fn gemm_q6k_resid(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     run_cases(h, GemmMode::Residual, &q6k_cases(fixture)?)
 }
 
+/// What a child run of the gate under Metal's shader validation said on
+/// stderr.
+struct Validated {
+    /// Whether the validation layer announced itself.
+    started: bool,
+    /// How many accesses it reported.
+    reports: usize,
+    /// The first report's lines, for a clause that fails on it.
+    first: String,
+    /// The child's own verdict and last words.
+    exit: Result<(), String>,
+}
+
+/// The mutant a child of the control run carries: the one that stages the
+/// weight rows past a tile's live rows unclamped.
+const CLAMP_MUTANT: &str = "gemm_weight_edge";
+
+/// The gate's own binary, run as `--child gemm_a4_store` at this row's instance
+/// with Metal's shader validation on (its reports go to stderr), beside the
+/// parent's fixture flags and a `--mutant` when one is named.
+fn gate_under_validation(
+    h: &Harness<'_>,
+    args: &[String],
+    mutant: Option<&str>,
+) -> Result<Validated, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("the gate's own path: {e}"))?;
+    let mut child = Command::new(exe);
+    child.args([
+        "--child",
+        "gemm_a4_store",
+        "--instance",
+        h.library.instance().name,
+    ]);
+    for name in ["--fixture", "--mlx-fixture"] {
+        if let Some(path) = flag(args, name) {
+            child.args([name, path]);
+        }
+    }
+    if let Some(name) = mutant {
+        child.args(["--mutant", name]);
+    }
+    child
+        .env("MTL_SHADER_VALIDATION", "1")
+        .env("MTL_SHADER_VALIDATION_GLOBAL_MEMORY", "1")
+        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
+        .env("MTL_SHADER_VALIDATION_ENABLE_VERBOSE_LOGGING", "1");
+    let out = child
+        .output()
+        .map_err(|e| format!("the child gate did not start: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first = stderr
+        .split("=====")
+        .find(|block| block.contains("Invalid Metal usage"))
+        .map(|block| {
+            block
+                .lines()
+                .filter(|l| !l.is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default();
+    Ok(Validated {
+        started: stderr.contains("Metal GPU Validation Enabled"),
+        reports: stderr.matches("Invalid Metal usage").count(),
+        first,
+        exit: if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the child exited {}: {}",
+                out.status,
+                stdout.lines().last().unwrap_or("no output")
+            ))
+        },
+    })
+}
+
+/// The A4 store dot at the row's sites, the head's tail and the gate
+/// projection's 16 rows, every case within the band of the f64 oracle in both
+/// operands; and the gate projection's launches read no weight row past their
+/// buffer. The weight rows past a tile's live rows stage a clamped copy of the
+/// last live row and are never stored, so no output shows an unclamped read
+/// and only Metal's shader validation reports it; it must be on when the
+/// process starts, so the 16-row launches run in a child gate. The control:
+/// the same child with the `gemm_weight_edge` mutant, which reads those rows,
+/// must be reported, or the validation checked nothing and the clause is red.
+///
+/// Mutant: `gemm_weight_edge`, the clamp of the weight row removed.
 pub fn gemm_a4_store(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
-    run_cases(h, GemmMode::Store, &a4_cases(h, mlx, sites)?)
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--child") {
+        return run_cases(h, GemmMode::Store, &gate_cases(h, mlx)?);
+    }
+    let Verdict::Noted(values) = run_cases(h, GemmMode::Store, &a4_cases(h, mlx, sites)?)? else {
+        return Err("the A4 store cases ended in no note".to_string());
+    };
+    let control = gate_under_validation(h, &args, Some(CLAMP_MUTANT))?;
+    if !control.started || control.reports == 0 {
+        return Err(format!(
+            "shader validation {} for the control, a kernel that reads past its weights: nothing \
+             was checked",
+            if control.started {
+                "reported nothing"
+            } else {
+                "did not start"
+            }
+        ));
+    }
+    let own = gate_under_validation(h, &args, flag(&args, "--mutant"))?;
+    if !own.started {
+        return Err("shader validation did not start: nothing was checked".to_string());
+    }
+    if own.reports > 0 {
+        return Err(format!(
+            "{} accesses outside a buffer reported in the {GATE_ROWS}-row launches, the first: {}",
+            own.reports, own.first
+        ));
+    }
+    own.exit?;
+    Ok(Verdict::Noted(format!(
+        "{values}; no report in the {GATE_ROWS}-row launches under shader validation, {} for the \
+         control",
+        control.reports
+    )))
 }
 
 pub fn gemm_a4_resid(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {

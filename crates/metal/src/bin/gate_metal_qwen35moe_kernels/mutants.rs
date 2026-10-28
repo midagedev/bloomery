@@ -132,6 +132,7 @@ pub const Q30_KEPT: &[&str] = &[
     "gemm_resid_overwrite",
     "gemm_seg_weights",
     "gemm_a4_chunk_order",
+    "gemm_weight_edge",
     "tensor_resid_stores",
     "tensor_seg_out",
     "tensor_routed_block_rows",
@@ -1653,6 +1654,16 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "reg[j / 4][j % 4] = value(blk, (uint)(16 * il + j));",
             "reg[j / 4][j % 4] = value(blk, (uint)(16 * il + (j ^ 1)));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_weight_edge",
+        clause: "gemm_a4_store",
+        why: "the weight rows past a tile's live rows are staged unclamped: a tile of 16 live rows reads 48 rows past its weights, which no output shows and only shader validation reports",
+        edits: &[(
+            "const short row = min((short)(c0 / CHUNKS), (short)(nr0 - 1));",
+            "const short row = (short)(c0 / CHUNKS);",
             1,
         )],
     },

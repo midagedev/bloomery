@@ -9,18 +9,21 @@
 //!   greedy steps, then step an id that is not the pick, then run greedy to
 //!   the last row: arm A host-fed throughout, arm B in chain steps with the
 //!   broken promise host-fed, which drops the token ahead. From the broken
-//!   promise on, the picks are equal, and so is every delta layer's lane the
-//!   next token reads, bit for bit, after the broken promise and at the end.
+//!   promise on, the picks are equal, and so is every recurrent layer's store
+//!   the next token reads (a delta layer's lane, a short conv layer's ring),
+//!   bit for bit, after the broken promise and at the end.
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::count::Layer;
 use bloomery_metal::arch::qwen3moe::session::{Node, Session, StepMode, StepStats};
 
+use super::keep;
 use super::says;
 
-/// The prompt both clauses start from: ids the vocabulary holds. Neither
-/// clause reads a reference set; each arm is held to the other.
-const PROMPT: [u32; 4] = [0, 1000, 2000, 3000];
+/// The prompt both clauses start from after the row's seed: ids the
+/// vocabulary holds. Neither clause reads a reference set; each arm is held to
+/// the other.
+const PROMPT_AFTER_SEED: [u32; 3] = [1000, 2000, 3000];
 
 /// The greedy steps `c_resume` runs before the broken promise: an even
 /// count, so the dropped token's lane parity is the prompt's.
@@ -30,7 +33,8 @@ const RESUME_AT: usize = 8;
 fn prompt(s: &mut Session) -> Result<u32, String> {
     s.reset().map_err(says)?;
     let mut pick = 0;
-    for &id in &PROMPT {
+    let seed = super::row::current().seed;
+    for id in std::iter::once(seed).chain(PROMPT_AFTER_SEED) {
         pick = s.step(id, StepMode::HostFed).map_err(says)?.id;
     }
     Ok(pick)
@@ -83,8 +87,8 @@ pub fn moved(s: &Session, before: StepStats) -> StepStats {
     }
 }
 
-/// What the last step left: the logits, and each delta layer's lane the
-/// next token reads.
+/// What the last step left: the logits, and each recurrent layer's store the
+/// next token reads: a delta layer's state lane, a short conv layer's ring.
 struct Snapshot {
     logits: Vec<f32>,
     lanes: Vec<(usize, Vec<f32>)>,
@@ -97,8 +101,14 @@ fn snapshot(s: &Session) -> Result<Snapshot, String> {
         .token_layers()
         .iter()
         .enumerate()
-        .filter(|(_, layer)| matches!(layer, Layer::Delta { .. }))
-        .map(|(l, _)| Ok((l, probe.read(Node::DeltaState(l)).map_err(says)?)))
+        .filter(|(_, layer)| keep::is_recurrent(layer))
+        .map(|(l, layer)| {
+            let node = match layer {
+                Layer::ShortConv { .. } => Node::ConvRing(l),
+                _ => Node::DeltaState(l),
+            };
+            Ok((l, probe.read(node).map_err(says)?))
+        })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Snapshot { logits, lanes })
 }
@@ -112,7 +122,7 @@ fn differs(what: &str, a: &Snapshot, b: &Snapshot) -> Option<String> {
         .iter()
         .zip(&b.lanes)
         .find(|((_, x), (_, y))| !bits_equal(x, y))
-        .map(|((l, _), _)| format!("{what}: layer {l}'s lane the next token reads differs"))
+        .map(|((l, _), _)| format!("{what}: layer {l}'s store the next token reads differs"))
 }
 
 pub fn b_chain(s: &mut Session) -> Clause {
@@ -160,7 +170,7 @@ pub fn b_chain(s: &mut Session) -> Clause {
         "{calls} chain calls from a {}-id prompt to the last row: picks and last logits equal \
          the host-fed steps'; {} tokens ahead, all kept; call {calls}, at row {}, took the \
          last-row rule",
-        PROMPT.len(),
+        PROMPT_AFTER_SEED.len() + 1,
         stats.ahead,
         s.ctx()
     )))
@@ -206,7 +216,7 @@ pub fn c_resume(s: &mut Session) -> Clause {
     }
     if after_a.lanes.is_empty() == super::row::current().recurrent {
         return Err(format!(
-            "row {} says recurrent = {}; the token holds {} delta lanes",
+            "row {} says recurrent = {}; the token holds {} recurrent stores",
             super::row::current().name,
             super::row::current().recurrent,
             after_a.lanes.len()
@@ -229,7 +239,7 @@ pub fn c_resume(s: &mut Session) -> Clause {
     }
     Ok(Verdict::Noted(format!(
         "{RESUME_AT} chain steps, then id {x} for the promised {promised}: one token ahead \
-         dropped; the next {} picks, the logits and {} delta lanes equal the host-fed arm's \
+         dropped; the next {} picks, the logits and {} recurrent stores equal the host-fed arm's \
          after the broken promise and at the last row",
         rest_a.len() + 1,
         after_a.lanes.len()

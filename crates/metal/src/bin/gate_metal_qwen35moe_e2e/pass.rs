@@ -1,5 +1,6 @@
-//! The batched prompt pass (`Session::pass`) on the d1k set's prompt of about
-//! a thousand ids, held to the stepped path it replaces.
+//! The batched prompt pass (`Session::pass`) on the row's prompt of about a
+//! thousand ids (the d1k set's, or generated ids), held to the stepped path it
+//! replaces.
 //!
 //! - `q_short` (p′): a prompt of at most a step's window of ids is the step
 //!   path: the batch session and the steps session leave the same pick, logits
@@ -7,7 +8,8 @@
 //!   session ran no pass.
 //! - `q_state` (u): the prompt as one pass against the same ids stepped one at
 //!   a time: layer 0's recurrent state and conv ring within [`U_L0_REL`] of
-//!   the stepped run's; every delta layer's state distance printed.
+//!   the stepped run's (a short conv layer 0: its ring); every recurrent
+//!   layer's distance printed.
 //! - `q_chunk` (w): the pass size moves no bit: the same ids as passes of 512
 //!   (a checkpoint every 512), of 1,000 and 24, of 100 ten times and 24, and
 //!   as two calls cut at 700, leave the pick, the logits row and every store
@@ -28,11 +30,16 @@
 //!   its last row, taken as a point and cut back to, is the pass's own end
 //!   state bit for bit; a copy's ring slots of the positions before the pass
 //!   are the ring the pass found; and a copy is the same bits whichever other
-//!   copies the pass takes.
-//! - `q_mark_cut`: a prompt marked at two positions inside a pass, cut back
-//!   to each mark and continued to the end, twice: the same pick, logits row
-//!   and stores both times, and the tokens after it within `q_free`'s band of
-//!   the stepped run's.
+//!   copies the pass takes. A file whose recurrent store is a conv ring has no
+//!   such copy: the pass refuses the request by name and the clause holds the
+//!   refusal.
+//! - `q_mark_cut`: a prompt stepped with a mark, cut back to the mark and
+//!   continued, twice: the stores after each cut a fresh run's at the mark and
+//!   the continued ids the fresh run's bits, on every file with a recurrent
+//!   store; and, where a pass copies its stores, a prompt marked at two
+//!   positions inside a pass, cut back to each mark and continued to the end,
+//!   twice: the same pick, logits row and stores both times, and the tokens
+//!   after it within `q_free`'s band of the stepped run's.
 //! - `q_marked`: a prompt call with a mark inside it, longer than a step's
 //!   window, runs as a pass and leaves the unmarked call's bits; the stepped
 //!   run's pick and the teacher-forced tokens after it hold to `q_free`'s
@@ -145,16 +152,9 @@ const MARKED_AT: u32 = 20;
 const MARK_CUTS: [u32; 2] = [700, 1017];
 const MARK_EVERY: u32 = 512;
 
-/// The ids of a prompt of `n` ids: the d1k set's first.
+/// The ids of a prompt of `n` ids: the row's own (`sets::prompt_ids`).
 pub(super) fn prompt_ids(n: usize) -> Result<Vec<u32>, String> {
-    let man = sets::d1k()?;
-    let (_, _, prompt) = man
-        .step()
-        .map_err(|e| format!("the d1k set's tokens: {e}"))?;
-    prompt
-        .get(..n)
-        .map(<[u32]>::to_vec)
-        .ok_or_else(|| format!("the d1k set holds {} prompt ids, not {n}", prompt.len()))
+    sets::prompt_ids(n)
 }
 
 /// ‖a − b‖ / ‖b‖ in f64.
@@ -174,10 +174,11 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
     (num / den).sqrt()
 }
 
-/// One layer's store: a delta layer's state lane and conv ring, or an
-/// attention layer's key and value rows.
+/// One layer's store: a delta layer's state lane and conv ring, a short conv
+/// layer's ring, or an attention layer's key and value rows.
 enum Store {
     Rec { state: Vec<f32>, ring: Vec<f32> },
+    Conv { ring: Vec<f32> },
     Kv { k: Vec<f32>, v: Vec<f32> },
 }
 
@@ -212,6 +213,9 @@ fn read_stores(s: &mut Session, pick: u32, logits: Vec<u32>) -> Result<Stores, S
             Layer::Delta { .. } => Store::Rec {
                 state: probe.read(Node::DeltaState(l)).map_err(says)?,
                 ring: probe.read(Node::DeltaRing(l)).map_err(says)?,
+            },
+            Layer::ShortConv { .. } => Store::Conv {
+                ring: probe.read(Node::ConvRing(l)).map_err(says)?,
             },
             Layer::Attention { .. } => {
                 let (mut k, mut v) = (Vec::new(), Vec::new());
@@ -256,6 +260,7 @@ fn differs(what: &str, a: &Stores, b: &Stores) -> Option<String> {
                 }
                 bits(r) == bits(r2)
             }
+            (Store::Conv { ring: r }, Store::Conv { ring: r2 }) => bits(r) == bits(r2),
             (Store::Kv { k, v }, Store::Kv { k: k2, v: v2 }) => {
                 bits(k) == bits(k2) && bits(v) == bits(v2)
             }
@@ -308,7 +313,17 @@ pub fn q_short(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     )))
 }
 
-/// (u): layer 0's recurrent state and conv ring, one pass against steps.
+/// (u): layer 0's recurrent store, one pass against steps: a delta layer's
+/// state and conv ring, or a short conv layer's ring. A short conv's ring holds
+/// u = B ⊙ x, the product of two channel groups of the in_proj output, each
+/// carrying the pass's operand rounding Δ (see [`U_L0_REL`]): at most 2Δ under
+/// the band's 3Δ. Whether the conv ring is also bit equal is printed, not
+/// required: the pass's GEMM runs the f16 operand.
+///
+/// Mutant: in `shortconv.metal`, the step's ring write
+/// `slot_ring[sc_slot(p, args.ring_rows) * args.hidden + c]` with `p + 1u`
+/// for `p`: the stepped ring's slots sit one position late against the pass's,
+/// an error of order one.
 pub fn q_state(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let ids = prompt_ids(1024)?;
     let ctx = ids.len() + 1;
@@ -320,21 +335,27 @@ pub fn q_state(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     drop(pass);
     let mut steps = open(device, library, path, ctx, 2048, PrefillMode::Steps)?;
     let b = run_prompt(&mut steps, &ids)?;
-    let (
-        Some(Store::Rec {
-            state: s0,
-            ring: r0,
-        }),
-        Some(Store::Rec {
-            state: t0,
-            ring: u0,
-        }),
-    ) = (a.layers.first(), b.layers.first())
-    else {
-        return Err("layer 0 is not a delta layer".to_string());
+    let (kind, state0, ring0, ring_bits) = match (a.layers.first(), b.layers.first()) {
+        (
+            Some(Store::Rec {
+                state: s0,
+                ring: r0,
+            }),
+            Some(Store::Rec {
+                state: t0,
+                ring: u0,
+            }),
+        ) => (
+            "delta",
+            Some(rel(s0, t0)),
+            rel(r0, u0),
+            bits(r0) == bits(u0),
+        ),
+        (Some(Store::Conv { ring: r0 }), Some(Store::Conv { ring: u0 })) => {
+            ("conv", None, rel(r0, u0), bits(r0) == bits(u0))
+        }
+        _ => return Err("layer 0 keeps no recurrent store".to_string()),
     };
-    let state0 = rel(s0, t0);
-    let ring0 = rel(r0, u0);
     let others: Vec<String> = a
         .layers
         .iter()
@@ -344,6 +365,9 @@ pub fn q_state(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         .map(|(l, pair)| match pair {
             (Store::Rec { state: x, .. }, Store::Rec { state: y, .. }) => {
                 format!("delta layer {l} state {:.3e}", rel(x, y))
+            }
+            (Store::Conv { ring: x }, Store::Conv { ring: y }) => {
+                format!("conv layer {l} ring {:.3e}", rel(x, y))
             }
             (Store::Kv { k: x, v: xv }, Store::Kv { k: y, v: yv }) => {
                 format!(
@@ -355,19 +379,26 @@ pub fn q_state(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
             _ => format!("layer {l} of another kind"),
         })
         .collect();
+    let shown = state0.map_or_else(
+        || format!("{kind} layer 0 ring {ring0:.3e} (bit equal: {ring_bits})"),
+        |s| format!("{kind} layer 0 state {s:.3e} ring {ring0:.3e}"),
+    );
     println!(
-        "q_state: delta layer 0 state {state0:.3e} ring {ring0:.3e} (band {U_L0_REL:.1e}); {}; picks {} and {}",
+        "q_state: {shown} (band {U_L0_REL:.1e}); {}; picks {} and {}",
         others.join(", "),
         a.pick,
         b.pick
     );
-    if state0 <= U_L0_REL && ring0 <= U_L0_REL {
+    if state0.is_none_or(|s| s <= U_L0_REL) && ring0 <= U_L0_REL {
         Ok(Verdict::Noted(format!(
-            "layer 0 after 1,024 ids: state {state0:.3e}, ring {ring0:.3e} of the stepped run's, within {U_L0_REL:.1e}"
+            "{kind} layer 0 after 1,024 ids: {}ring {ring0:.3e} of the stepped run's, within \
+             {U_L0_REL:.1e}",
+            state0.map_or_else(String::new, |s| format!("state {s:.3e}, "))
         )))
     } else {
         Err(format!(
-            "layer 0 after 1,024 ids: state {state0:.3e}, ring {ring0:.3e}, past {U_L0_REL:.1e}"
+            "{kind} layer 0 after 1,024 ids: {}ring {ring0:.3e}, past {U_L0_REL:.1e}",
+            state0.map_or_else(String::new, |s| format!("state {s:.3e}, "))
         ))
     }
 }
@@ -758,8 +789,49 @@ fn found_slots(at: &Stores, found: &Stores, r: usize, ring_rows: usize) -> Optio
         })
 }
 
+/// `q_mark` on a file whose recurrent store is a short conv ring: a pass asked
+/// for copies after rows is refused by name, never run without them, and after
+/// a reset the session leaves the same bits as one never asked.
+///
+/// Mutant: the refusal deleted, so a conv layer's pass takes the request and
+/// copies nothing of its ring: the pass runs and the clause names its pick.
+fn copies_refused(s: &mut Session, ids: &[u32]) -> Clause {
+    let plain = copied_pass(s, ids, &[])?;
+    let [inner, _, last] = MARK_ROWS;
+    s.reset().map_err(says)?;
+    let after = [inner, last];
+    let refused = match s.pass(ids, PassOut::Last, StateOut { after_rows: &after }) {
+        Err(e @ SessionError::Shape { .. }) => e,
+        Err(e) => {
+            return Err(format!(
+                "a pass with copies after rows {after:?}: another error than a refusal by name: {e}"
+            ));
+        }
+        Ok(p) => {
+            return Err(format!(
+                "a pass with copies after rows {after:?} ran and picked {}: the copy of a conv \
+                 ring is not run, and the pass must refuse the request by name",
+                p.id
+            ));
+        }
+    };
+    let again = copied_pass(s, ids, &[])?;
+    if let Some(why) = differs(
+        "the pass after a refused request for copies",
+        &again,
+        &plain,
+    ) {
+        return Err(why);
+    }
+    Ok(Verdict::Noted(format!(
+        "a pass of {MARK_IDS} ids copying after rows {after:?} is refused by name ({refused}); \
+         after the reset the pass with no copies leaves the bits it left before the request"
+    )))
+}
+
 /// `q_mark`: a pass's copies are its own state at their rows and move none of
-/// its bits.
+/// its bits; on a file whose recurrent store is a conv ring the copies are
+/// refused by name ([`copies_refused`]).
 pub fn q_mark(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let ids = prompt_ids(MARK_IDS)?;
     let mut s = open(
@@ -770,6 +842,9 @@ pub fn q_mark(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         2048,
         PrefillMode::Batch,
     )?;
+    if !keep::pass_copies(&s) {
+        return copies_refused(&mut s, &ids);
+    }
     let ring_rows = s.geom().delta.ring_rows;
     s.reset().map_err(says)?;
     let found = read_stores(&mut s, 0, Vec::new())?;
@@ -820,9 +895,98 @@ pub fn q_mark(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     )))
 }
 
-/// `q_mark_cut`: cut back to a mark inside a pass and continued, twice, and
-/// the tokens after it against the stepped run's.
+/// The ids of the cut-and-re-step case: more than a ring's rows, so a ring slot
+/// has wrapped before the mark, and the mark inside them.
+const CUT_IDS: usize = 40;
+const CUT_AT: u32 = 25;
+
+/// A prompt stepped with a mark, cut back to the mark and continued, twice: the
+/// checkpoint holds every recurrent store. After the cut the stores are those
+/// of a fresh run of the ids before the mark, and the ids continued from it
+/// leave the bits of a fresh run of all of them. Whether a pass can copy its
+/// stores is returned with the line.
+///
+/// Mutant: in `Session::cut`, the `None if n < self.pos => Ok(())` arm taken
+/// for a file whose recurrent store is a conv ring (the checkpoints list of
+/// `Session::open` left empty for it): the mark leaves no checkpoint, and a cut
+/// returns `Ok` with the ring as the end of the run left it.
+fn cut_restep(
+    device: &MetalDevice,
+    library: &Library,
+    path: &Path,
+) -> Result<(String, bool), String> {
+    let ids = prompt_ids(CUT_IDS)?;
+    let at = CUT_AT as usize;
+    let mut s = open(
+        device,
+        library,
+        path,
+        ids.len() + 1,
+        2048,
+        PrefillMode::Steps,
+    )?;
+    let copies = keep::pass_copies(&s);
+    let at_mark = run_prompt(&mut s, &ids[..at])?;
+    let end = run_prompt(&mut s, &ids)?;
+    s.reset().map_err(says)?;
+    let (logits, pick) = keep::prompt_bits_marked(&mut s, &ids, &[CUT_AT])?;
+    if !s.checkpoint_positions().contains(&CUT_AT) {
+        return Err(format!(
+            "the prompt marked at {CUT_AT} left the checkpoints {:?}: none at the mark",
+            s.checkpoint_positions()
+        ));
+    }
+    let marked = read_stores(&mut s, pick, logits)?;
+    if let Some(why) = differs(&format!("a prompt marked at {CUT_AT}"), &marked, &end) {
+        return Err(format!("{why}, against the unmarked prompt"));
+    }
+    for round in 0..2 {
+        Target::cut(&mut s, CUT_AT).map_err(says)?;
+        if s.pos() != CUT_AT {
+            return Err(format!(
+                "a cut to {CUT_AT} stands at {} (round {round})",
+                s.pos()
+            ));
+        }
+        let cut = read_stores(&mut s, at_mark.pick, at_mark.logits.clone())?;
+        if let Some(why) = differs(&format!("the cut back to {CUT_AT}"), &cut, &at_mark) {
+            return Err(format!("{why}, against a fresh run of the ids before it"));
+        }
+        let (logits, pick) = keep::prompt_bits(&mut s, &ids[at..])?;
+        let again = read_stores(&mut s, pick, logits)?;
+        if let Some(why) = differs(&format!("the ids continued from {CUT_AT}"), &again, &end) {
+            return Err(format!("{why}, against a fresh run of all of them"));
+        }
+    }
+    Ok((
+        format!(
+            "{CUT_IDS} ids stepped marked at {CUT_AT} and cut back to the mark twice: the stores \
+             after each cut are a fresh run's at the mark, and the ids continued from it leave \
+             the fresh run's pick, logits row and stores"
+        ),
+        copies,
+    ))
+}
+
+/// `q_mark_cut`: cut back to a mark and continued ([`cut_restep`]), and on a
+/// file whose passes copy their stores, a mark inside a pass ([`cut_marked_pass`]).
 pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let (line, copies) = cut_restep(device, library, path)?;
+    if !copies {
+        return Ok(Verdict::Noted(format!(
+            "{line}; no mark inside a pass: a pass's copy of a conv ring is refused by name \
+             (`q_mark`)"
+        )));
+    }
+    match cut_marked_pass(device, library, path)? {
+        Verdict::Noted(rest) => Ok(Verdict::Noted(format!("{line}; {rest}"))),
+        other => Ok(other),
+    }
+}
+
+/// A prompt marked at two positions inside a pass, cut back to each mark and
+/// continued, twice, and the tokens after it against the stepped run's.
+fn cut_marked_pass(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let ids = prompt_ids(1024)?;
     let ctx = ids.len() + FREE_STEPS + 1;
     let mut steps = open(device, library, path, ctx, 2048, PrefillMode::Steps)?;

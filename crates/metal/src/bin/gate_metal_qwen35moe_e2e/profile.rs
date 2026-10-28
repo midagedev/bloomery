@@ -11,11 +11,12 @@
 //!   `count::token_count` at that step's live keys;
 //! - one sample a group, and the samples' kinds cover every group the count
 //!   counts, none twice: the per-kind counts the walk left against the
-//!   kinds the count model derives from the layer list;
+//!   kinds the file's layer plans derive (a sandwich layer's two joins and a
+//!   short conv's three groups among them);
 //! - the profiled groups' weight bytes sum to the file's own tensors walked
 //!   under the plan's names (the embedding's one row, each routed pick's
-//!   slice of its stacks, every other weight whole) — two paths to one
-//!   number;
+//!   slice of its stacks, every other weight whole, a tied head the
+//!   embedding's table) — two paths to one number;
 //! - a steady profiled step allocates nothing on the host.
 
 use std::path::Path;
@@ -24,17 +25,19 @@ use std::time::Instant;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::count::{
-    FfnKind, GroupKind, KINDS, Layer, LiveKeys, Ticket, token_count,
+    GroupKind, KINDS, Layer, LiveKeys, Ticket, token_count,
 };
 use bloomery_metal::arch::qwen3moe::session::{Node, ProfileGroup, Session, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::EncodeCount;
 use bloomery_metal::kernels::SEGMENT_KEYS;
 use bloomery_metal::library::Library;
-use chain::arch::qwen3moe::plan::FfnRoute;
+use chain::arch::qwen3moe::plan::{FfnRoute, LayerPlan, MixerPlan, ResidualPlan};
+use gguf::Split;
+use model_hf::ModelFile;
 
 use super::says;
-use super::{HOST_ALLOC_CALLS, SEED};
+use super::{HOST_ALLOC_CALLS, seed};
 
 const WHAT: &str = "gate_metal_qwen35moe_e2e p_profile";
 
@@ -59,44 +62,58 @@ fn live_of(n_keys: usize) -> LiveKeys {
     }
 }
 
-/// The kinds one token's groups are tagged with, as the count model derives
-/// them from the layer list and the live keys: the tags' own derivation is
-/// the walk's, so the two agree only while both are right.
-fn kinds_expected(layers: &[Layer], _live: LiveKeys) -> Vec<GroupKind> {
+/// The kinds one token's groups are tagged with, as the file's own layer plans
+/// derive them: a mixer's three groups (P1, core, out), a join after the mixer
+/// and another after the FFN where the layer's residual is a sandwich, the
+/// router where the FFN routes, then the gate-up and the down. The count
+/// model's own derivation is the walk's, so the two agree only while both are
+/// right.
+fn kinds_expected(plans: &[LayerPlan]) -> Vec<GroupKind> {
     let mut out = vec![GroupKind::Embed];
-    for layer in layers {
-        match layer {
-            Layer::Attention { .. } => {
+    for plan in plans {
+        let joins = matches!(plan.residual, ResidualPlan::Sandwich(_));
+        match &plan.mixer {
+            MixerPlan::Gqa(_) => {
                 out.push(GroupKind::AttnP1);
                 out.push(GroupKind::AttnFlash);
                 out.push(GroupKind::AttnOut);
             }
-            Layer::Delta { .. } => {
+            MixerPlan::Delta(_) => {
                 out.push(GroupKind::DeltaP1);
                 out.push(GroupKind::DeltaCore);
                 out.push(GroupKind::DeltaOut);
             }
+            MixerPlan::ShortConv(_) => {
+                out.push(GroupKind::ConvP1);
+                out.push(GroupKind::ConvCore);
+                out.push(GroupKind::ConvOut);
+            }
         }
-        if layer.ffn() == FfnKind::Routed {
+        if joins {
+            out.push(GroupKind::Join);
+        }
+        if matches!(plan.ffn.route, FfnRoute::Router { .. }) {
             out.push(GroupKind::Router);
         }
         out.push(GroupKind::GateUp);
         out.push(GroupKind::Down);
+        if joins {
+            out.push(GroupKind::Join);
+        }
     }
     out.push(GroupKind::Head);
     out
 }
 
-/// The samples' kinds against the count model's: every kind's count equal,
-/// so no group is untagged and none counted twice.
-fn tags_of(samples: &[ProfileGroup], layers: &[Layer], live: LiveKeys) -> Result<(), String> {
-    let expected = kinds_expected(layers, live);
+/// The samples' kinds against the plans' derivation: every kind's count
+/// equal, so no group is untagged and none counted twice.
+fn tags_of(samples: &[ProfileGroup], expected: &[GroupKind]) -> Result<(), String> {
     for kind in KINDS {
         let saw = samples.iter().filter(|g| g.kind == kind).count();
         let want = expected.iter().filter(|k| **k == kind).count();
         if saw != want {
             return Err(format!(
-                "{kind:?}: {saw} groups tagged, the count model derives {want}"
+                "{kind:?}: {saw} groups tagged, the plans derive {want}"
             ));
         }
     }
@@ -111,6 +128,7 @@ fn step_checked(
     id: u32,
     samples: &mut Vec<ProfileGroup>,
     steady: bool,
+    expected: &[GroupKind],
 ) -> Result<u32, String> {
     let pos = s.pos();
     let live = live_of(pos as usize + 1);
@@ -141,7 +159,7 @@ fn step_checked(
             c.groups
         ));
     }
-    tags_of(samples, s.token_layers(), live)?;
+    tags_of(samples, expected)?;
     if steady && calls != 0 {
         return Err(format!(
             "the profiled step at {pos}: {calls} host allocation calls; a steady step allocates \
@@ -211,18 +229,15 @@ fn whole_of(whole: u64, parts: u64, what: &str) -> Result<u64, String> {
     Ok(one)
 }
 
-/// The file's own weight bytes for one token, the second path: the plan's
-/// names walked in the gguf itself — the embedding's one row, each routed
-/// pick's slice of its stacks, every other weight whole. `picks` is every
-/// layer's router ids as the step left them.
-fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64>, String> {
-    let split = gguf::Split::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let read = model::arch::spec(&split).map_err(|e| e.to_string())?;
+/// The file's layer plans, the second path's names: the plan the session
+/// reads, rebuilt from the header alone, and the width of the residual.
+fn plans_of(split: &Split) -> Result<(Vec<LayerPlan>, u64), String> {
+    let read = model::arch::spec(split).map_err(|e| e.to_string())?;
     let spec = read.spec;
     let kinds = chain::arch::qwen3moe::plan::kinds_of(&spec.layers).map_err(|e| e.to_string())?;
     let pd = chain::arch::qwen3moe::read::PlanDims::of(&spec, WHAT).map_err(|e| e.to_string())?;
     let plans = chain::arch::qwen3moe::read::layer_plans(
-        &split,
+        split,
         WHAT,
         &pd,
         &kinds,
@@ -231,15 +246,26 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
         chain::arch::qwen3moe::read::Read35::Whole,
     )
     .map_err(|e| e.to_string())?;
+    Ok((plans, u64::from(spec.hidden)))
+}
+
+/// The file's own weight bytes for one token, the second path: the plan's
+/// names walked in the file's header — the embedding's one row, each routed
+/// pick's slice of its stacks, every other weight whole, the sandwich norms
+/// and a head gate among them. A tied head is the embedding's table read
+/// whole. `picks` is every layer's router ids as the step left them.
+fn file_weights(
+    split: &Split,
+    plans: &[LayerPlan],
+    hidden: u64,
+    vocab: usize,
+    picks: &[Vec<u32>],
+) -> Result<Vec<u64>, String> {
     let bytes = |name: &str| -> Result<u64, String> {
-        let (shard, info) = split
+        let (_, info) = split
             .find(name)
             .ok_or_else(|| format!("the file has no tensor {name}"))?;
-        let file = split
-            .shard(shard)
-            .ok_or_else(|| format!("{name}: shard {shard} is not open"))?;
-        let data = file.data(info).map_err(|e| format!("{name}: {e}"))?;
-        u64::try_from(data.len()).map_err(|_| format!("{name}: its bytes do not fit u64"))
+        Ok(info.nbytes)
     };
     // A value tensor the arena dequantizes at open: F32 as stored, MLX_A8 to
     // one f32 an element. The profile counts that buffer, so the packed file
@@ -258,7 +284,6 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
             )),
         }
     };
-    let hidden = u64::from(spec.hidden);
     if plans.len() != picks.len() {
         return Err(format!(
             "{} plans for {} layers' picks",
@@ -271,17 +296,19 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
     // and the head's the last.
     let mut per = vec![0u64; plans.len() + 1];
     let head = per.len() - 1;
-    per[head] = whole_of(
-        bytes(&model::arch::names::token_embd())?,
-        vocab,
-        "the embedding",
-    )?;
-    per[head] += bytes(&model::arch::names::output())?;
+    let embed = model::arch::names::token_embd();
+    per[head] = whole_of(bytes(&embed)?, vocab, "the embedding")?;
+    let output = model::arch::names::output();
+    per[head] += bytes(if split.find(&output).is_some() {
+        &output
+    } else {
+        &embed
+    })?;
     per[head] += bytes(&model::arch::names::output_norm())?;
     for (l, (plan, pick)) in plans.iter().zip(picks).enumerate() {
         let total = &mut per[l];
         match &plan.mixer {
-            chain::arch::qwen3moe::plan::MixerPlan::Gqa(g) => {
+            MixerPlan::Gqa(g) => {
                 *total += bytes(&g.attn_norm)?;
                 *total += bytes(&g.attn_q)?;
                 *total += bytes(&g.attn_k)?;
@@ -289,8 +316,11 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
                 *total += bytes(&g.attn_q_norm)?;
                 *total += bytes(&g.attn_k_norm)?;
                 *total += bytes(&g.attn_output)?;
+                if let Some(gate) = &g.gate {
+                    *total += bytes(&gate.name)?;
+                }
             }
-            chain::arch::qwen3moe::plan::MixerPlan::Delta(d) => {
+            MixerPlan::Delta(d) => {
                 *total += bytes(&d.attn_norm)?;
                 *total += bytes(&d.qkv)?;
                 *total += bytes(&d.gate)?;
@@ -302,53 +332,67 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
                 *total += bytes(&d.ssm_norm)?;
                 *total += bytes(&d.ssm_out)?;
             }
-            chain::arch::qwen3moe::plan::MixerPlan::ShortConv(c) => {
+            MixerPlan::ShortConv(c) => {
                 *total += bytes(&c.attn_norm)?;
                 *total += bytes(&c.conv_in)?;
                 *total += bytes(&c.conv)?;
                 *total += bytes(&c.conv_out)?;
             }
         }
-        let f = chain::arch::qwen3moe::read::file_names(l);
-        // The router's rows, from its shape. Its stored bytes are that count
-        // only while every value is f32; an MLX 8-bit router is not, and the
-        // profile counts the f32 buffer the open dequantized.
-        let (_, router_info) = split
-            .find(&f.router)
-            .ok_or_else(|| format!("the file has no tensor {}", f.router))?;
-        let elems = router_info.dims.iter().product::<u64>();
-        if hidden == 0 || elems % hidden != 0 {
-            return Err(format!(
-                "layer {l}: the router {} has shape {:?} which is not a whole number of \
-                 hidden rows ({hidden})",
-                f.router, router_info.dims
-            ));
+        if let ResidualPlan::Sandwich(sw) = &plan.residual {
+            for name in &sw.norms {
+                *total += bytes(name)?;
+            }
         }
-        let experts = elems / hidden;
-        let router = values_held(&f.router)?;
-        // The layer's last slot reads the shared expert when the plan has one.
-        let shared = match &plan.ffn.route {
-            FfnRoute::Router { shared, .. } => shared.is_some(),
-            FfnRoute::Dense => return Err(format!("layer {l}: a dense FFN, not a routed one")),
-        };
-        if experts == 0 || pick.len() <= usize::from(shared) {
-            return Err(format!(
-                "layer {l}: the router holds {} rows and the token picked {} ids",
-                experts,
-                pick.len()
-            ));
-        }
-        let picks = (pick.len() - usize::from(shared)) as u64;
-        *total += bytes(&plan.ffn.ffn_norm)? + router;
-        *total += picks
-            * (whole_of(bytes(&f.gate)?, experts, "a gate stack")?
-                + whole_of(bytes(&f.up)?, experts, "an up stack")?);
-        *total += picks * whole_of(bytes(&f.down)?, experts, "a down stack")?;
-        if shared {
-            *total += values_held(&f.router_gate)?
-                + bytes(&f.sh_gate)?
-                + bytes(&f.sh_up)?
-                + bytes(&f.sh_down)?;
+        match &plan.ffn.route {
+            FfnRoute::Dense => {
+                *total += bytes(&plan.ffn.ffn_norm)?
+                    + bytes(&plan.ffn.gate)?
+                    + bytes(&plan.ffn.up)?
+                    + bytes(&plan.ffn.down)?;
+            }
+            FfnRoute::Router { shared, .. } => {
+                let shared = shared.is_some();
+                let f = chain::arch::qwen3moe::read::file_names(l);
+                // The router's rows, from its shape. Its stored bytes are that
+                // count only while every value is f32; an MLX 8-bit router is
+                // not, and the profile counts the f32 buffer the open
+                // dequantized.
+                let (_, router_info) = split
+                    .find(&f.router)
+                    .ok_or_else(|| format!("the file has no tensor {}", f.router))?;
+                let elems = router_info.dims.iter().product::<u64>();
+                if hidden == 0 || elems % hidden != 0 {
+                    return Err(format!(
+                        "layer {l}: the router {} has shape {:?} which is not a whole number \
+                         of hidden rows ({hidden})",
+                        f.router, router_info.dims
+                    ));
+                }
+                let experts = elems / hidden;
+                let router = values_held(&f.router)?;
+                // The layer's last slot reads the shared expert when the plan
+                // has one.
+                if experts == 0 || pick.len() <= usize::from(shared) {
+                    return Err(format!(
+                        "layer {l}: the router holds {} rows and the token picked {} ids",
+                        experts,
+                        pick.len()
+                    ));
+                }
+                let picks = (pick.len() - usize::from(shared)) as u64;
+                *total += bytes(&plan.ffn.ffn_norm)? + router;
+                *total += picks
+                    * (whole_of(bytes(&f.gate)?, experts, "a gate stack")?
+                        + whole_of(bytes(&f.up)?, experts, "an up stack")?);
+                *total += picks * whole_of(bytes(&f.down)?, experts, "a down stack")?;
+                if shared {
+                    *total += values_held(&f.router_gate)?
+                        + bytes(&f.sh_gate)?
+                        + bytes(&f.sh_up)?
+                        + bytes(&f.sh_down)?;
+                }
+            }
         }
     }
     Ok(per)
@@ -379,10 +423,14 @@ fn plain_checked(s: &mut Session, id: u32) -> Result<(u32, EncodeCount), String>
 /// `p`: the profiled step against the step it instruments, within one
 /// segment of keys and past it.
 pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let file = ModelFile::open(path).map_err(|e| e.to_string())?;
+    let split = file.header();
+    let (plans, hidden) = plans_of(split)?;
+    let expected = kinds_expected(&plans);
     let mut s = Session::open(device, library, path, CTX).map_err(says)?;
     // The ids both arms feed, `ids[k]` the token at position `k`: the walk
     // is deterministic, so a replay of a prefix leaves the same state.
-    let mut ids = vec![SEED];
+    let mut ids = vec![seed()];
     let mut plain_counts: Vec<EncodeCount> = Vec::with_capacity(CTX);
     s.reset().map_err(says)?;
     for _ in 0..WITHIN {
@@ -395,7 +443,7 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
     s.reset().map_err(says)?;
     let mut samples: Vec<ProfileGroup> = Vec::new();
     for k in 0..WITHIN {
-        let pick = step_checked(&mut s, ids[k], &mut samples, k > 0)?;
+        let pick = step_checked(&mut s, ids[k], &mut samples, k > 0, &expected)?;
         if pick != ids[k + 1] {
             return Err(format!(
                 "the profiled step {k} picked {pick}; the host-fed step picked {}",
@@ -424,7 +472,7 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
     let gpu_within = samples.iter().map(|g| g.gpu_s).sum::<f64>() * 1e3;
     let weights = weights_agree(
         &weights_of_token(&s, &samples, pos_last)?,
-        &file_weights(path, s.vocab(), &picks_of(&s)?)?,
+        &file_weights(split, &plans, hidden, s.vocab(), &picks_of(&s)?)?,
     )?;
 
     // Past one segment: the host-fed step at the segment's last row, then
@@ -445,7 +493,7 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
     for id in &ids[..deep] {
         plain_checked(&mut s, *id)?;
     }
-    let pick_profiled = step_checked(&mut s, ids[deep], &mut samples, true)?;
+    let pick_profiled = step_checked(&mut s, ids[deep], &mut samples, true, &expected)?;
     let gpu_deep = samples.iter().map(|g| g.gpu_s).sum::<f64>() * 1e3;
     if pick_profiled != pick_deep {
         return Err(format!(
@@ -459,7 +507,7 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
     }
     let weights_deep = weights_agree(
         &weights_of_token(&s, &samples, deep as u32)?,
-        &file_weights(path, s.vocab(), &picks_of(&s)?)?,
+        &file_weights(split, &plans, hidden, s.vocab(), &picks_of(&s)?)?,
     )?;
     let flashes = samples
         .iter()
