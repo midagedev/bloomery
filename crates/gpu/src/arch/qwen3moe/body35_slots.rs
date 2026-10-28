@@ -107,6 +107,18 @@ impl SlotRows for Body35 {
     ) -> Result<(), GpuError> {
         self.slots_planned = None;
         self.refuse_verify()?;
+        if self.ropes.is_some()
+            || self
+                .plans
+                .iter()
+                .any(|p| matches!(p.mixer, MixerPlan::ShortConv(_)))
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                "a chain with short-conv layers or a rope table a layer, which a pass of several \
+                 slots does not run",
+            ));
+        }
         if self.taps.is_some() {
             return Err(GpuError::state(
                 WHAT,
@@ -182,6 +194,7 @@ impl SlotRows for Body35 {
             stores,
             rope,
             seq_rope,
+            ropes,
             a,
             k,
             head_state,
@@ -200,6 +213,7 @@ impl SlotRows for Body35 {
             mma: *mma,
             eps: *eps,
             table: live,
+            ropes: ropes.as_ref(),
         };
         let recs = rows
             .iter()
@@ -294,7 +308,10 @@ fn seq_launches(plans: &[LayerPlan]) -> usize {
             MixerPlan::Delta(_) => DELTA_SEQ_LAUNCHES,
             MixerPlan::Gqa(_) => GQA_SEQ_LAUNCHES,
             MixerPlan::ShortConv(_) => {
-                panic!("qwen35moe::seq_launches: a short-conv layer, which `kinds35` refuses")
+                panic!(
+                    "qwen35moe::seq_launches: a short-conv layer, which a pass of several slots \
+                     does not run (`plan_slots` refuses it)"
+                )
             }
         })
         .sum::<usize>()

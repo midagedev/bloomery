@@ -63,6 +63,7 @@ where
         mma: *mma,
         eps: hp.rms_eps,
         table: &rope.table,
+        ropes: None,
     };
     Program {
         c: &c,

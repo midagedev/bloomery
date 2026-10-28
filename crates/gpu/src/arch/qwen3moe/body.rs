@@ -25,6 +25,7 @@ use super::slot_pass::{SlotIn, SlotPass};
 use super::ubatch::{Q32, Ubatch, ubatch_size};
 use super::wide::GEMV_COLS;
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, RowTable, partials_ms_len, partials_v_len};
+use crate::flash_gqa_h128_swa::H128SwaKernels;
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
@@ -32,6 +33,8 @@ use crate::head::Head;
 use crate::host::StepLeg;
 use crate::host::swap_source::ResidencyGlue;
 use crate::linear::LinearKernels;
+use crate::linear::out_gate::OutGateKernels;
+use crate::linear::shortconv::ShortConvKernels;
 use crate::model::lookup::f32_gain;
 use crate::model::{
     ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
@@ -74,7 +77,8 @@ const _: () = assert!(crate::flash_gqa::HEAD_256 == 256);
 
 /// The kernels only Qwen3.6's layers launch: the delta rule's three, the
 /// gated router and the gated output projection's quantizer, the NORM rope
-/// append of a head-128 layer with no head norm; and what a
+/// append of a head-128 layer with no head norm, a short-conv layer's conv,
+/// the per-head output gate and the head-128 window flash; and what a
 /// site that is not one of the fused Q4_K groups launches — the 32-value
 /// GEMM family with its quantizers and the F32 tile, the K-quant gemv beyond
 /// the `Gpu`'s own (Q5_K), the Q8_0 embedding and the f32 out gate (a Q8_0
@@ -93,6 +97,13 @@ pub(super) struct Q35Kernels {
     pub(super) kgemv: KGemvKernels,
     /// The FFN's K-quant `_sel` family and its combine with a host sum.
     pub(super) ffn: dispatch::FfnKernels,
+    /// A short-conv layer's conv over its ring.
+    pub(super) short_conv: ShortConvKernels,
+    /// The output gate of one value a head (`OutGate::ProjHead`).
+    pub(super) out_gate: OutGateKernels,
+    /// The head-128 flash of eight or four query heads a key head over the planes, with a window
+    /// where the layer has one.
+    pub(super) swa: H128SwaKernels,
 }
 
 /// The kernels the chain launches beyond the crate's shared modules.
@@ -139,6 +150,9 @@ impl Kernels {
                     norm: RopeNormKernels::load(ctx)?,
                     kgemv: KGemvKernels::load(gpu)?,
                     ffn: dispatch::FfnKernels::load(gpu)?,
+                    short_conv: ShortConvKernels::load(ctx)?,
+                    out_gate: OutGateKernels::load(ctx)?,
+                    swa: H128SwaKernels::load(ctx)?,
                 })
             } else {
                 None
@@ -1114,6 +1128,7 @@ impl SlotRows for Body {
             mma: *mma,
             eps: hp.rms_eps,
             table: &rope.table,
+            ropes: None,
         };
         let mut planes: Vec<&mut [KvPlanes]> =
             parked.iter_mut().map(|seq| seq.kv.as_mut_slice()).collect();
@@ -1170,6 +1185,7 @@ fn enqueue_placed_chain(
         mma: *mma,
         eps: hp.rms_eps,
         table: &rope.table,
+        ropes: None,
     };
     let mut leg = StepLeg::new(gpu.stream(), hybrid);
     StepWalk {
@@ -1303,6 +1319,7 @@ fn enqueue_placed_slots(
         mma: *mma,
         eps: hp.rms_eps,
         table: &rope.table,
+        ropes: None,
     };
     let hidden = prefill.a.dims.hidden;
     for (j, r) in rows.iter().enumerate() {

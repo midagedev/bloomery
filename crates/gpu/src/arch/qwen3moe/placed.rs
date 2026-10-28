@@ -2566,7 +2566,7 @@ fn ctx_of<'a>(c: &'a PassCtx<'a>, l: usize) -> Result<Ctx<'a>, GpuError> {
         .plans
         .get(l)
         .ok_or(GpuError::state(WHAT, "a plan for every layer"))?;
-    Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table)
+    Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table_of(l)?)
 }
 
 /// The captured decode step's walk `(1, 1, Step)` through the host tier's

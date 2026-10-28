@@ -235,8 +235,9 @@ struct Class {
 /// the shape table's row (`models::shape::GQA`) the layer selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flash {
-    /// One block of eight query heads a key head (the `_256` entries; and
-    /// the head-128 entries' only form).
+    /// One block of a key head's whole group: eight query heads (the `_256`
+    /// entries, and the head-128 entries' only form), or four on the
+    /// head-gated head-128 window flash (the `_g4` entries).
     Group,
     /// Blocks of four query heads, `group / 4` a key head (the `_256_p4`
     /// entries): the scalar and the tensor-core segment pass.
@@ -554,9 +555,10 @@ pub fn kinds_of(layers: &[LayerSpec]) -> Result<Vec<Kind35>, ChainError> {
         .collect()
 }
 
-/// Layer `l`'s mixer kind for the card: [`kind_of`], and the layer is the
-/// gated attention of head 256 with routed experts of [`q35::EXPERT_FF`] and
-/// their shared expert, or a dense FFN, the instances the card's kernels are
+/// Layer `l`'s mixer kind for the card: [`kind_of`], and the layer's attention is
+/// one of the card's kinds (`CARD_KINDS`), its routed experts of [`q35::EXPERT_FF`]
+/// with their shared expert or its FFN dense, and its sandwich residual, where it
+/// has one, one the card joins (`card_fits`): the instances the card's kernels are
 /// built for. Any other layer is refused by name with what it holds.
 pub fn kind35(s: &LayerSpec, l: usize) -> Result<Kind35, ChainError> {
     let kind = kind_of(s, l)?;
@@ -573,40 +575,44 @@ pub fn kinds35(layers: &[LayerSpec]) -> Result<Vec<Kind35>, ChainError> {
         .collect()
 }
 
-/// The attention kinds the card's instances run: [`GqaKind::Gated256`], and the head-128
-/// attention turned by NORM pairs with no head norm (the `_g7` and group-of-8 head-128 entries).
-/// A short-conv layer and [`GqaKind::HeadGate128`] are in no list the card's kernels run.
-const CARD_KINDS: [GqaKind; 2] = [
+/// The attention kinds the card's instances run: [`GqaKind::Gated256`], the head-128 attention
+/// turned by NORM pairs with no head norm (the `_g7` and group-of-8 head-128 entries), and the
+/// head-128 attention with a gate of one value a head (the head-128 window flash of eight or four
+/// query heads a key head, and the per-head output gate).
+const CARD_KINDS: [GqaKind; 3] = [
     GqaKind::Gated256,
     GqaKind::Head128 {
         pairs: Pairs::Norm,
         head_norm: false,
     },
+    GqaKind::HeadGate128,
 ];
 
-/// Why the card's instances do not run `s`, which [`kind_of`] reads.
+/// Why the card's instances do not run `s`, which [`kind_of`] reads. The card joins a sandwich
+/// residual's normed output at the scale 1 alone, after a dense FFN (the routed combine adds the
+/// slots' sum to the stream in its own store).
 fn card_fits(s: &LayerSpec) -> Result<(), String> {
-    if !matches!(s.residual, Residual::Plain) {
+    if let Residual::Sandwich { add, .. } = &s.residual
+        && (add.map(f32::to_bits) != [1.0f32.to_bits(); 2] || matches!(s.ffn, Ffn::Moe(_)))
+    {
         return Err(format!(
-            "the residual {:?}; the card's ops join each half's output by the plain add",
-            s.residual
-        ));
-    }
-    if let Mixer::ShortConv(c) = &s.mixer {
-        return Err(format!(
-            "a short-conv mixer of {} taps; the card's kernels take the gated attention of heads \
-             of {} or heads of {HEAD_128} turned by NORM pairs with no head norm, and the delta \
-             rule",
-            c.taps,
-            q35::HEAD_DIM
+            "the residual {:?} beside {}; the card's ops join a sandwich's normed output at the \
+             scale 1 after a dense FFN",
+            s.residual,
+            if matches!(s.ffn, Ffn::Moe(_)) {
+                "routed experts"
+            } else {
+                "a dense FFN"
+            }
         ));
     }
     if let Mixer::Gqa(g) = &s.mixer
         && !CARD_KINDS.contains(&gqa_class(g)?)
     {
         return Err(format!(
-            "attention {g:?}; the card's kernels take the gated attention of heads of {} or \
-             heads of {HEAD_128} turned by NORM pairs with no head norm",
+            "attention {g:?}; the card's kernels take the gated attention of heads of {}, heads \
+             of {HEAD_128} turned by NORM pairs with no head norm, and heads of {HEAD_128} with a \
+             gate of one value a head",
             q35::HEAD_DIM
         ));
     }
@@ -686,7 +692,8 @@ pub(crate) fn layer_gqa(s: &LayerSpec) -> Result<(&Gqa, GqaKind), String> {
 
 /// The class and the flash of `g` when it is an attention the kernels run:
 /// the shape table's row for its group ([`select_gqa`]), one of eight, of
-/// quads or pairs, or the head-128 group of seven.
+/// quads or pairs, the head-128 group of seven, or the head-gated head-128
+/// group of four.
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
     let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
@@ -695,6 +702,7 @@ fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
         (_, 4, GroupRule::Packs) => Flash::Quads,
         (_, 2, GroupRule::Packs) => Flash::Pairs,
         (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
+        (GqaKind::HeadGate128, 4, GroupRule::One) => Flash::Group,
         _ => {
             return Err(format!(
                 "attention {}/{} heads of {} selects {}, which this body does not launch",
@@ -1403,21 +1411,34 @@ mod tests {
         }
     }
 
-    /// The card's kernels run neither a short conv, nor the head with a gate of its own, nor a
-    /// residual that is not the plain add, so the card's entry points refuse each by name with the
-    /// layer while the chain's read them.
+    /// The card runs LFM3's layers — the short conv, the head with a gate of its own on a full and
+    /// on a sliding layer, each with its sandwich residual at the scale 1 after a dense FFN — and
+    /// refuses by name with the layer a sandwich it does not join: after routed experts, or at
+    /// another scale. Mutant: `card_fits` drops its sandwich check (the last two accepted).
     #[test]
-    fn the_card_refuses_the_lfm3_layers_the_chain_reads() {
-        let gqa_layer = lfm3_layer(Mixer::Gqa(lfm3_gqa(None, true)));
-        let mut sandwiched = layer(delta());
-        sandwiched.residual = Residual::Sandwich {
+    fn the_card_runs_the_lfm3_layers_and_refuses_a_sandwich_it_does_not_join() {
+        let layers = [
+            lfm3_layer(lfm3_conv(7)),
+            lfm3_layer(Mixer::Gqa(lfm3_gqa(None, true))),
+            lfm3_layer(Mixer::Gqa(lfm3_gqa(Some(1024), false))),
+        ];
+        assert_eq!(
+            kinds35(&layers).unwrap_or_else(|e| panic!("{e}")),
+            kinds_of(&layers).unwrap_or_else(|e| panic!("{e}"))
+        );
+        let mut routed = layer(delta());
+        routed.residual = Residual::Sandwich {
             eps: 1e-5,
             add: [1.0, 1.0],
         };
+        let mut half = lfm3_layer(lfm3_conv(7));
+        half.residual = Residual::Sandwich {
+            eps: 1e-5,
+            add: [1.0, 0.5],
+        };
         for (what, l) in [
-            ("a short conv", lfm3_layer(lfm3_conv(7))),
-            ("the gated head", gqa_layer),
-            ("a sandwich residual", sandwiched),
+            ("a sandwich after routed experts", routed),
+            ("a sandwich at the scale 0.5", half),
         ] {
             assert!(kind_of(&l, 2).is_ok(), "{what}");
             match kind35(&l, 2) {

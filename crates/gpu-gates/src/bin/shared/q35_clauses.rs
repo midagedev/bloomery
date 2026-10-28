@@ -137,6 +137,7 @@ pub fn same_store(a: &StoreHost, b: &StoreHost) -> bool {
                 ring: rb,
             },
         ) => bits_equal(sa, sb) && bits_equal(ra, rb),
+        (StoreHost::Conv { ring: ra }, StoreHost::Conv { ring: rb }) => bits_equal(ra, rb),
         _ => false,
     }
 }
@@ -162,6 +163,9 @@ pub fn fresh(m: &mut Qwen35moeModel) -> Result<(), GateError> {
             },
             StoreHost::Rec { state, ring } => StoreHost::Rec {
                 state: vec![0.0; state.len()],
+                ring: vec![0.0; ring.len()],
+            },
+            StoreHost::Conv { ring } => StoreHost::Conv {
                 ring: vec![0.0; ring.len()],
             },
         };
@@ -434,6 +438,7 @@ impl SlotsAdapter for Slots35 {
                         })?
                 }
                 StoreHost::Rec { state, ring } => h.f32s(&state).f32s(&ring),
+                StoreHost::Conv { ring } => h.f32s(&ring),
             };
         }
         Ok(h.value())

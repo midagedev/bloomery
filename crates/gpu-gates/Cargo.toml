@@ -598,6 +598,10 @@ name = "gate_lfm3_kernels"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_lfm3_e2e"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_muse_router"
 required-features = ["gpu"]
 

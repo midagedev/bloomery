@@ -1920,6 +1920,15 @@ gate-gpu-flint-router:
 gate-gpu-lfm3-kernels:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_lfm3_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lfm3_kernels'
 
+# LFM3-1.7B end-to-end gate, one card, on the whole Q4_K_M file through the qwen3moe walk (Body35): the captured step's entries
+# against the layer kinds (a short conv a conv layer; the group-4 window flash, its merge with no sink and the per-head gate an
+# attention layer), eager = replay, reset rewinds, the conv rings and the K/V rows carry, the fault word stays clean; against
+# mainline's last-position logits (ref-lfm3-logits, `just dump-ref-lfm3`): the argmax and the cosine floor with the top-5 ids on
+# every prompt, on the step path, on the pass path (bit for bit the step path's) and on a step after a pass. A set the box lacks
+# fails by name. Real tier only: the set is the real file's and LFM3 has no fixture twin.
+gate-gpu-lfm3-e2e:
+    BLOOMERY_MODEL=lfm3 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-lfm3-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_lfm3_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lfm3_e2e'
+
 # Full-file eager/captured, resident-slot and ring-retention consumer transitions.
 gate-gpu-flint-lib:
     ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'

@@ -19,9 +19,9 @@
 
 use crate::site::Form;
 pub(super) use chain::arch::qwen3moe::plan::{
-    DeltaPlan, DownEntry, FfnPlan, FfnRoute, Flash, GateUpEntry, GqaKind, GqaPlan, Kind35,
-    LayerPlan, MixerPlan, Pairs, ResidualPlan, SharedPlan, SharedSites, SiteTy, down_entry,
-    gate_up_entry, kind35, kinds35, moe_fits, q35, shared_entry,
+    DeltaPlan, DownEntry, FfnPlan, FfnRoute, Flash, GateUpEntry, GqaKind, GqaPlan, Half, Kind35,
+    LayerPlan, MixerPlan, Pairs, ResidualPlan, SharedPlan, SharedSites, ShortConvPlan, SiteTy,
+    down_entry, gate_up_entry, kind35, kinds35, moe_fits, q35, shared_entry,
 };
 
 // The head the chain plans a `GqaKind::Head128` layer at is the one this crate's head-128 kernels

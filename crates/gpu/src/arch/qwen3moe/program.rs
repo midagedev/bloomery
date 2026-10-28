@@ -1,7 +1,7 @@
 //! The family's layer program ([`Program`]): the ops ([`ChainOps`]) the chain
 //! crate's walk ([`Walk`]) orders over one unit of `m` columns, `(1, m,
 //! Step)` — the decode step at `m = 1`, a pass at its `m`. Each op is one of
-//! the launch groups of [`dispatch`] and [`delta`], which picks its gemv or
+//! the launch groups of [`dispatch`], [`delta`] and [`conv`], which picks its gemv or
 //! wide arm from `m`. What follows the last layer is the program's [`Tail`]:
 //! a head, nothing, the final norm of every row (a prompt call that returns
 //! hidden states), or a caller's buffer the last layer's output goes into.
@@ -10,11 +10,12 @@
 //! with the gate's taps on, each layer's output copied into its tap row.
 
 use super::body::{Kernels, TapRows};
+use super::conv;
 use super::delta;
 use super::dispatch::{self, Ctx, PassCtx};
 use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
-use super::plan::{DeltaPlan, FfnPlan, GqaPlan};
+use super::plan::{DeltaPlan, FfnPlan, GqaPlan, ShortConvPlan};
 use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, cells_view};
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
@@ -178,7 +179,15 @@ impl<S: Stores + ?Sized> Program<'_, S> {
 /// Layer `l`'s launch context: what every launch of the layer reads besides
 /// the arena and the store.
 pub(super) fn layer_ctx<'x>(c: &'x PassCtx<'x>, l: LayerCtx<'x>) -> Result<Ctx<'x>, GpuError> {
-    Ctx::new(c.gpu, c.w, (l.plan, l.layer), c.k, c.mma, c.eps, c.table)
+    Ctx::new(
+        c.gpu,
+        c.w,
+        (l.plan, l.layer),
+        c.k,
+        c.mma,
+        c.eps,
+        c.table_of(l.layer)?,
+    )
 }
 
 /// Layer `layer`'s store, or a named refusal for a chain with fewer stores
@@ -214,12 +223,11 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
         let lc = layer_ctx(self.c, l)?;
         match store_of(self.stores, l.layer)? {
             StoreMut::Kv(kv) => dispatch::attn_core(&lc, g, kv, self.s, l.m),
-            StoreMut::Rec(_) => Err(dispatch::two_kinds(l.layer)),
+            StoreMut::Rec(_) | StoreMut::Conv(_) => Err(dispatch::two_kinds(l.layer)),
         }
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
-        l.plain_only("qwen3moe::Program::attn_out")?;
         let lc = layer_ctx(self.c, l)?;
         dispatch::attn_out(&lc, g, self.s, l.m)
     }
@@ -233,7 +241,7 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
         let lc = layer_ctx(self.c, l)?;
         match store_of(self.stores, l.layer)? {
             StoreMut::Rec(r) => delta::delta_core(&lc, d, r, self.s, self.io, l.m),
-            StoreMut::Kv(_) => Err(dispatch::two_kinds(l.layer)),
+            StoreMut::Kv(_) | StoreMut::Conv(_) => Err(dispatch::two_kinds(l.layer)),
         }
     }
 
@@ -241,6 +249,24 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
         l.plain_only("qwen3moe::Program::delta_out")?;
         let lc = layer_ctx(self.c, l)?;
         delta::delta_out(&lc, d, self.s, l.m)
+    }
+
+    fn conv_in(&mut self, l: LayerCtx<'_>, n: &ShortConvPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        conv::conv_in(&lc, n, self.s, l.m)
+    }
+
+    fn conv_core(&mut self, l: LayerCtx<'_>, n: &ShortConvPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        match store_of(self.stores, l.layer)? {
+            StoreMut::Conv(ring) => conv::conv_core(&lc, n, ring, self.s, l.m),
+            StoreMut::Kv(_) | StoreMut::Rec(_) => Err(dispatch::two_kinds(l.layer)),
+        }
+    }
+
+    fn conv_out(&mut self, l: LayerCtx<'_>, n: &ShortConvPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        conv::conv_out(&lc, n, self.s, l.m)
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
@@ -252,7 +278,6 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
     /// [`Tail`] names ([`Tail::last_out`]), and the decode step's tap of
     /// the layer's output ([`Tail::tap`]).
     fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
-        l.plain_only("qwen3moe::Program::experts")?;
         let lc = layer_ctx(self.c, l)?;
         let out = if l.last { self.tail.last_out() } else { None };
         dispatch::experts(&lc, f, self.s, l.m, out)?;

@@ -19,14 +19,15 @@
 //! that already streams its weights at the card's bandwidth.
 
 use super::body::{ATTN_SCALE, ATTN_SCALE_256, Body, Kernels};
+use super::conv;
 use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{
-    DownEntry, FfnPlan, FfnRoute, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan, Pairs,
-    SharedPlan, SharedSites, SiteTy, down_entry, down_sel, gate_up_entry, gate_up_fused, o_fused,
-    qkv_fused, reads_f32,
+    DownEntry, FfnPlan, FfnRoute, GateUpEntry, GqaKind, GqaPlan, Half, LayerPlan, MixerPlan, Pairs,
+    ResidualPlan, SharedPlan, SharedSites, SiteTy, down_entry, down_sel, gate_up_entry,
+    gate_up_fused, o_fused, qkv_fused, reads_f32,
 };
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
@@ -36,16 +37,19 @@ use crate::elem::EmbedRowsArgs;
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::kquant::{Act, GateUpAct, SelDown};
+use crate::linear::out_gate;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs};
 use crate::quant_sel::QuantSelKernels;
+use crate::rope_table::RopeRows;
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
+use model::arch::models::OutGate;
 use model::arch::qwen3moe::names::token_embd;
 
 /// What every launch of one layer reads besides the arena and the store:
@@ -123,6 +127,7 @@ pub(super) fn enqueue_chain(
         mma: *mma,
         eps: hp.rms_eps,
         table: &rope.table,
+        ropes: None,
     };
     Program {
         c: &c,
@@ -186,7 +191,9 @@ pub(super) fn enqueue_front(gpu: &Gpu, w: &Weights, b: &mut Body) -> Result<(), 
 
 /// What every launch of a prefill pass reads besides its arena, its inputs
 /// and the cache: the engine, the weights, every layer's plan, the kernels,
-/// the flash pass, the norm epsilon and the rope table.
+/// the flash pass, the norm epsilon and the rope table — with a layer's own
+/// table where the chain's attention layers turn by more than one
+/// ([`PassCtx::table_of`]).
 pub(super) struct PassCtx<'a> {
     pub(super) gpu: &'a Gpu,
     pub(super) w: &'a Weights,
@@ -195,6 +202,57 @@ pub(super) struct PassCtx<'a> {
     pub(super) mma: bool,
     pub(super) eps: f32,
     pub(super) table: &'a DeviceBuffer<f32>,
+    pub(super) ropes: Option<&'a LayerRopes>,
+}
+
+/// The rope tables of a chain whose attention layers do not all turn by one
+/// (a full layer's base with its frequency factors beside a sliding layer's
+/// base): the distinct tables, and each layer's index into them (`None`: a
+/// layer that turns nothing).
+pub(super) struct LayerRopes {
+    pub(super) tables: Vec<RopeRows>,
+    pub(super) pick: Vec<Option<usize>>,
+}
+
+impl LayerRopes {
+    /// The device bytes of the tables.
+    pub(super) fn bytes(&self) -> usize {
+        self.tables.iter().map(|t| t.table.num_bytes()).sum()
+    }
+}
+
+impl<'a> PassCtx<'a> {
+    /// Layer `layer`'s rope table: its own under per-layer tables, else the
+    /// chain's one. The chain's one turns with no frequency factors, so a
+    /// layer whose plan has them and no table of its own is refused by name.
+    pub(super) fn table_of(&self, layer: usize) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+        const WHAT: &str = "qwen3moe::PassCtx::table_of";
+        let Some(r) = self.ropes else {
+            return match self.plans.get(layer).map(|p| &p.mixer) {
+                Some(MixerPlan::Gqa(g)) if g.rope_freqs.is_some() => Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {layer} turns by frequency factors, and the pass holds no table \
+                         of its own for it"
+                    ),
+                )),
+                _ => Ok(self.table),
+            };
+        };
+        match r.pick.get(layer) {
+            Some(Some(t)) => r.tables.get(*t).map(|t| &t.table).ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} picks table {t} of {}", r.tables.len()),
+                )
+            }),
+            Some(None) => Ok(self.table),
+            None => Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer} of {} rope picks", r.pick.len()),
+            )),
+        }
+    }
 }
 
 /// Enqueue one prefill pass of `m` tokens over arena `s` from the input
@@ -251,6 +309,15 @@ pub(super) fn enqueue_pass(
 ///   shared down's quantizer, the shared down, and the combine — 11 of
 ///   Q8_0 or of K-quant shared sites at one row.
 ///
+/// - A short conv ([`conv::launches`]): norm+quant, the input projection,
+///   the conv, the output's quantizer and projection, and the join.
+/// - A head-128 attention with a gate of its own adds the gate's projection
+///   after q·k·v, and its rows' launches are the gate's product and a
+///   K-quant output's quantizer of it.
+/// - A sandwich residual joins each half with the norm and the add
+///   ([`join_launches`]) where the plain one adds (the output projection's
+///   fused add, the add, or a dense FFN's combine).
+///
 /// So a qwen3moe layer is 12 or 13 launches at one row and 12 or 14 at
 /// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
 /// embedding is followed by the unit's dense route table, and a layer is
@@ -286,22 +353,25 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 } else {
                     site(g.q_ty) + site(g.k_ty) + site(g.v_ty)
                 };
-                let out = if o_fused(g) {
+                let gate = g.gate.as_ref().map_or(0, |h| site(h.ty));
+                let out = if o_resid_fused(p, g) {
                     2
                 } else {
                     // The quantizer of the attention rows (a K-quant) or the
-                    // f32 out gate; head 128 has no out gate.
-                    let rows = usize::from(g.kind == GqaKind::Gated256 || g.o_ty.kquant());
-                    rows + out_resid_launches(g.o_ty, m)
+                    // f32 out gate at head 256; under a head's own gate the
+                    // gate's product and a K-quant's quantizer of it. A
+                    // plain head 128 has no out gate.
+                    let rows = match g.kind {
+                        GqaKind::HeadGate128 => 1 + usize::from(g.o_ty.kquant()),
+                        GqaKind::Gated256 => 1,
+                        GqaKind::Neox128 | GqaKind::Head128 { .. } => usize::from(g.o_ty.kquant()),
+                    };
+                    rows + site(g.o_ty) + join_launches(p)
                 };
-                1 + qkv + 3 + out
+                1 + qkv + gate + 3 + out
             }
             MixerPlan::Delta(d) => delta::launches(d, m),
-            MixerPlan::ShortConv(_) => {
-                panic!(
-                    "qwen3moe::pass_launches: a short-conv layer, which the card's plans never hold"
-                )
-            }
+            MixerPlan::ShortConv(n) => conv::launches(n, p, m),
         };
         let f = &p.ffn;
         let ffn = match (&f.route, wide) {
@@ -342,7 +412,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 } else {
                     usize::from(f.down_ty.kquant()) + site(f.down_ty)
                 };
-                2 + gate_up + down
+                1 + gate_up + down + join_launches(p)
             }
         };
         mixer + ffn
@@ -584,34 +654,13 @@ pub(super) fn attn_core(
     if m > GEMV_COLS {
         return wide::attn_core(c, n, kv, s, m);
     }
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let (gpu, k) = (c.gpu, c.k);
     let stream = gpu.stream();
     let d = s.dims;
     let i = s.col(m)?;
     match n.kind {
         GqaKind::Neox128 => {
-            // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
-            unsafe {
-                kv.append_128(
-                    &k.neox,
-                    stream,
-                    Append128 {
-                        q: &mut s.q,
-                        k: &mut s.k,
-                        v: &s.v,
-                        gq: f32_gain(w, &n.attn_q_norm)?,
-                        gk: f32_gain(w, &n.attn_k_norm)?,
-                        table: c.table,
-                        pos: &s.pos,
-                        eps: c.eps,
-                        n_head: d.n_head,
-                        n_kv: d.n_kv,
-                        ctx: d.ctx,
-                        m,
-                        fault: c.sink,
-                    },
-                )
-            }?;
+            append_neox_128(c, n, kv, s, m)?;
             kv.flash_128(
                 &k.flash,
                 stream,
@@ -647,12 +696,7 @@ pub(super) fn attn_core(
                 ),
             ));
         }
-        GqaKind::HeadGate128 => {
-            return Err(GpuError::shape(
-                "qwen3moe::attention",
-                "a head-128 attention with an output gate of its own, which no launch here serves",
-            ));
-        }
+        GqaKind::HeadGate128 => head_gate_128(c, n, kv, s, m)?,
     }
     Ok(())
 }
@@ -736,6 +780,28 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
         site_gemv(c, (n.k_ty, &n.attn_k), d.kv_len(), x, m, cols.as_mut(), kr)?;
         site_gemv(c, (n.v_ty, &n.attn_v), d.kv_len(), x, m, cols.as_mut(), v)?;
     }
+    if let Some(g) = &n.gate {
+        let Arena {
+            normed,
+            act_x,
+            cols,
+            head_gate,
+            ..
+        } = s;
+        let y = head_gate.as_mut().ok_or(GpuError::state(
+            "qwen3moe::attention",
+            "the arena's head gate rows",
+        ))?;
+        site_gemv(
+            c,
+            (g.ty, &g.name),
+            d.n_head,
+            (&act_x[i], normed),
+            m,
+            cols.as_mut(),
+            y,
+        )?;
+    }
     Ok(())
 }
 
@@ -747,13 +813,14 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
 /// ([`wide::attn_out`]).
 pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     if m > GEMV_COLS {
+        wide_plain(c)?;
         return wide::attn_out(c, n, s, m);
     }
     let (w, k) = (c.w, c.k);
     let stream = c.gpu.stream();
     let d = s.dims;
     let i = s.col(m)?;
-    if o_fused(n) {
+    if o_resid_fused(c.p, n) {
         let wo = kq_weight(w, &n.attn_output)?;
         return k.proj.enqueue_o_resid(
             stream,
@@ -772,26 +839,34 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
         attn,
         act_attn,
         ffn_inp,
+        down,
         cols,
         ..
     } = s;
     // An output projection of another type reads f32 rows: at head 128 the
-    // flash's own, at head 256 the products `gated_256` wrote into the gated
-    // rows. A K-quant one reads `act_attn`, so its f32 operand is unused.
+    // flash's own, at head 256 and under a head's own gate the products the
+    // middle wrote into the gated rows. A K-quant one reads `act_attn`, so
+    // its f32 operand is unused.
     let rows = match n.kind {
         GqaKind::Neox128 | GqaKind::Head128 { .. } => &*attn,
         GqaKind::Gated256 if n.o_ty.kquant() => &*attn,
-        GqaKind::Gated256 => gated_rows.as_ref().ok_or(GpuError::state(
+        GqaKind::Gated256 | GqaKind::HeadGate128 => gated_rows.as_ref().ok_or(GpuError::state(
             "qwen3moe::attention",
             "the arena's gated rows",
         ))?,
-        GqaKind::HeadGate128 => {
-            return Err(GpuError::shape(
-                "qwen3moe::attention",
-                "a head-128 attention with an output gate of its own, which no launch here serves",
-            ));
-        }
     };
+    if let ResidualPlan::Sandwich(_) = c.p.residual {
+        site_gemv(
+            c,
+            (n.o_ty, &n.attn_output),
+            d.hidden,
+            (&act_attn[i], rows),
+            m,
+            cols.as_mut(),
+            normed,
+        )?;
+        return join(c, Half::Mixer, (normed, down), x, (d.hidden, m), ffn_inp);
+    }
     out_resid(
         c,
         (n.o_ty, &n.attn_output),
@@ -829,6 +904,188 @@ pub(super) fn out_resid(
     c.gpu
         .elem()
         .enqueue_add(c.gpu.stream(), x, normed, m * hidden, y)
+}
+
+/// The refusal of a sandwich past [`GEMV_COLS`] rows: the wide arm joins a
+/// half with the plain add only.
+fn wide_plain(c: &Ctx<'_>) -> Result<(), GpuError> {
+    match c.p.residual {
+        ResidualPlan::Plain => Ok(()),
+        ResidualPlan::Sandwich(_) => Err(GpuError::shape(
+            "qwen3moe::wide",
+            format!(
+                "layer {}'s sandwich residual past {GEMV_COLS} rows, which the wide arm does not \
+                 join",
+                c.layer
+            ),
+        )),
+    }
+}
+
+/// Whether layer `p`'s output projection runs with the residual add in its
+/// store: a Q4_K one ([`o_fused`]) under the plain residual. A sandwich
+/// norms the projection's output before the add, so it projects alone and
+/// joins ([`join`]).
+pub(super) fn o_resid_fused(p: &LayerPlan, n: &GqaPlan) -> bool {
+    o_fused(n) && matches!(p.residual, ResidualPlan::Plain)
+}
+
+/// The launches [`join`] makes after a half of layer `p`: the add, and
+/// under a sandwich the norm before it.
+pub(super) fn join_launches(p: &LayerPlan) -> usize {
+    1 + usize::from(matches!(p.residual, ResidualPlan::Sandwich(_)))
+}
+
+/// `y = resid + out` after half `half` of the layer's plan, at `m` rows of
+/// `hidden` values: under the plain residual the add; under a
+/// sandwich the half's RMS norm of `out` into `tmp` first, then the add of
+/// the normed rows. The card joins at the scale 1 only (the chain's
+/// `card_fits` refuses any other plan); a plan past it is refused here by
+/// name too.
+pub(super) fn join(
+    c: &Ctx<'_>,
+    half: Half,
+    (out, tmp): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+    resid: &DeviceBuffer<f32>,
+    (hidden, m): (usize, usize),
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (stream, elem) = (c.gpu.stream(), c.gpu.elem());
+    match &c.p.residual {
+        ResidualPlan::Plain => elem.enqueue_add(stream, resid, out, m * hidden, y),
+        ResidualPlan::Sandwich(sw) => {
+            let scale = sw.scale(half);
+            if scale.to_bits() != 1.0f32.to_bits() {
+                return Err(GpuError::shape(
+                    "qwen3moe::join",
+                    format!(
+                        "layer {}'s {half:?} half joins at the scale {scale}; the card's join adds \
+                         at 1",
+                        c.layer
+                    ),
+                ));
+            }
+            elem.enqueue_rms_norm(
+                stream,
+                out,
+                f32_gain(c.w, sw.norm(half))?,
+                sw.eps,
+                hidden,
+                m,
+                tmp,
+            )?;
+            elem.enqueue_add(stream, resid, tmp, m * hidden, y)
+        }
+    }
+}
+
+/// The head norm of each query and key head, the NEOX turn of all 128
+/// values by the layer's rope table, and the cache append, at `m` rows.
+fn append_neox_128(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    let d = s.dims;
+    // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+    unsafe {
+        kv.append_128(
+            &c.k.neox,
+            c.gpu.stream(),
+            Append128 {
+                q: &mut s.q,
+                k: &mut s.k,
+                v: &s.v,
+                gq: f32_gain(c.w, &n.attn_q_norm)?,
+                gk: f32_gain(c.w, &n.attn_k_norm)?,
+                table: c.table,
+                pos: &s.pos,
+                eps: c.eps,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                m,
+                fault: c.sink,
+            },
+        )
+    }
+}
+
+/// The attention's head-128 middle with an output gate of its own
+/// ([`GqaKind::HeadGate128`]): the head norm and the NEOX turn of all 128
+/// values by the layer's rope table with the cache append; the flash over
+/// each row's last `n.window` keys (every key on a full layer) at the group
+/// the heads give, with no sink; each head's 128 values times `σ` of its
+/// gate value ([`attn_in`] projected it) into the gated rows; and, for a
+/// K-quant `attn_output`, their q8_1.
+fn head_gate_128(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::attention";
+    let (gpu, k) = (c.gpu, c.k);
+    let stream = gpu.stream();
+    let q35 = k.q35(WHAT)?;
+    let d = s.dims;
+    let i = s.col(m)?;
+    let window = match n.window {
+        None => 0,
+        Some(0) => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {}'s window of 0 keys", c.layer),
+            ));
+        }
+        Some(keys) => usize::try_from(keys)
+            .map_err(|_| GpuError::shape(WHAT, format!("a window of {keys} keys")))?,
+    };
+    append_neox_128(c, n, kv, s, m)?;
+    kv.flash_128_window(
+        &q35.swa,
+        stream,
+        FlashPass {
+            q: &s.q,
+            n_keys: &s.n_keys,
+            scale: ATTN_SCALE,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            m,
+            part_v: &mut s.part_v,
+            part_ms: &mut s.part_ms,
+            fault: c.sink,
+            y: &mut s.attn,
+        },
+        (d.n_head, window),
+    )?;
+    let gate = s
+        .head_gate
+        .as_ref()
+        .ok_or(GpuError::state(WHAT, "the arena's head gate rows"))?;
+    let gated = s
+        .gated_rows
+        .as_mut()
+        .ok_or(GpuError::state(WHAT, "the arena's gated rows"))?;
+    q35.out_gate.enqueue_out_gate(
+        stream,
+        out_gate::OutGateArgs {
+            kind: OutGate::ProjHead,
+            attn: &s.attn,
+            gate,
+            n_head: d.n_head,
+            m,
+            fault: c.sink,
+            y: &mut *gated,
+        },
+    )?;
+    if n.o_ty.kquant() {
+        gpu.enqueue_quantize_q8_1_layer(gated, &mut s.act_attn[i], c.layer)?;
+    }
+    Ok(())
 }
 
 /// The attention's head-128 middle with a NORM rope and no head norm
@@ -1116,7 +1373,17 @@ pub(super) fn experts(
     m: usize,
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
+    if matches!(c.p.residual, ResidualPlan::Sandwich(_)) && !matches!(n.route, FfnRoute::Dense) {
+        return Err(GpuError::shape(
+            "qwen3moe::ffn",
+            format!(
+                "layer {}'s sandwich after routed experts, which the card does not join",
+                c.layer
+            ),
+        ));
+    }
     if m > GEMV_COLS {
+        wide_plain(c)?;
         return wide::experts(c, n, s, m, out);
     }
     match n.apart() {
@@ -1301,6 +1568,20 @@ fn slots_down(
             cols.as_mut(),
             down,
         )?;
+    }
+    if let ResidualPlan::Sandwich(_) = c.p.residual {
+        let Arena {
+            x,
+            down,
+            normed,
+            ffn_inp,
+            ..
+        } = s;
+        let y = match out {
+            Some(y) => y,
+            None => x,
+        };
+        return join(c, Half::Ffn, (down, normed), ffn_inp, (d.hidden, m), y);
     }
     let y = match out {
         Some(y) => y,

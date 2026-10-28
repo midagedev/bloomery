@@ -390,6 +390,7 @@ impl Mtp35 {
             mma,
             eps: self.eps,
             table,
+            ropes: None,
         };
         // The projection is the trunk's site dispatch at the weight's own
         // type: the pack's quantizer runs only where that type reads the

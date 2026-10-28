@@ -2056,6 +2056,11 @@ mod gate {
             let upd_name = match kind {
                 LayerKind35::Delta => format!("linear_attn_out-{l}"),
                 LayerKind35::Attention => format!("attn_out-{l}"),
+                LayerKind35::ShortConv => {
+                    return Err(
+                        format!("layer {l}: a short conv, which no Qwen3.6 file holds").into(),
+                    );
+                }
             };
             let ik_upd = tap(man, &upd_name)?;
             let kept = ik_upd.len() / HIDDEN;
@@ -2106,6 +2111,9 @@ mod gate {
         p: usize,
     ) -> Result<StoreHost, GateError> {
         match kind {
+            LayerKind35::ShortConv => {
+                Err(format!("layer {l}: a short conv, which no Qwen3.6 file holds").into())
+            }
             LayerKind35::Delta => {
                 let s = ref_tensor_logical_in(&man.dir, man.input(&format!("cache_s_l{l}"), 0)?)?;
                 let conv_len = 3 * C;

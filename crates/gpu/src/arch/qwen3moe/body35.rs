@@ -80,7 +80,7 @@
 //! (`image::MediaRows`, the unit's front, `dispatch::unit_front`).
 
 use super::body::{Kernels, KvQ8, TapRows, f32_site};
-use super::dispatch::{self, PassCtx};
+use super::dispatch::{self, LayerRopes, PassCtx};
 use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
 use super::image::{
@@ -93,8 +93,8 @@ use super::placed::{
     prompt_rows, tally_shape,
 };
 use super::plan::{
-    FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, ResidualPlan, SharedPlan,
-    SiteTy, down_sel, gate_up_fused, input_fused, kind35, kinds35, moe_fits, o_fused, out_fused,
+    FfnPlan, FfnRoute, Flash, GqaKind, Half, Kind35, LayerPlan, MixerPlan, ResidualPlan,
+    SharedPlan, SiteTy, down_sel, gate_up_fused, input_fused, kind35, kinds35, moe_fits, out_fused,
     q35, qkv_fused,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
@@ -225,21 +225,20 @@ fn checkpoint_every(asked: usize, d: &Dims) -> Result<u32, GpuError> {
 
 /// The f32s of each store one checkpoint copies, in [`Copied35`]'s order:
 /// each delta layer's committed state lane, then its conv ring — one lane's
-/// state whatever the load's lane count. The one derivation of what a
+/// state whatever the load's lane count — and after them each short-conv
+/// layer's ring of `hidden` channels. The one derivation of what a
 /// checkpoint holds, read by the sequences' `Checkpoints` and by
 /// [`checkpoint_price35`].
-fn checkpoint_lens(kinds: &[Kind35]) -> Vec<usize> {
-    kinds
-        .iter()
-        .filter_map(|k| match k {
-            Kind35::Delta(shape) => Some(shape.lens(PLAIN_LANES)),
-            Kind35::Gqa(..) => None,
-            Kind35::ShortConv(_) => {
-                panic!("qwen35moe::checkpoint_lens: a short-conv layer, which `kinds35` refuses")
-            }
-        })
-        .flatten()
-        .collect()
+fn checkpoint_lens(kinds: &[Kind35], hidden: usize) -> Vec<usize> {
+    let deltas = kinds.iter().filter_map(|k| match k {
+        Kind35::Delta(shape) => Some(shape.lens(PLAIN_LANES)),
+        Kind35::Gqa(..) | Kind35::ShortConv(_) => None,
+    });
+    let convs = kinds.iter().filter_map(|k| match k {
+        Kind35::ShortConv(ring) => Some(ring.values(hidden)),
+        Kind35::Gqa(..) | Kind35::Delta(_) => None,
+    });
+    deltas.flatten().chain(convs).collect()
 }
 
 /// One sequence's checkpoints of stores of `lens` f32s: the ledger's
@@ -267,8 +266,9 @@ fn sequence_checkpoints(
 /// spacing reads no cache row, so the dims are read at one position.
 pub fn checkpoint_price35(spec: &ModelSpec, asked: usize) -> Result<Price, GpuError> {
     let kinds = kinds35(&spec.layers)?;
-    let every = checkpoint_every(asked, &dims(spec, &kinds, 1)?)?;
-    Ok(checkpoint::price(&checkpoint_lens(&kinds), every))
+    let d = dims(spec, &kinds, 1)?;
+    let every = checkpoint_every(asked, &d)?;
+    Ok(checkpoint::price(&checkpoint_lens(&kinds, d.hidden), every))
 }
 
 /// The host bytes one sequence's checkpoints pin at most in a load of `ctx`
@@ -363,6 +363,8 @@ pub enum LayerKind35 {
     Attention,
     /// The gated delta rule over the layer's recurrent store.
     Delta,
+    /// The gated short conv over the layer's conv ring.
+    ShortConv,
 }
 
 /// Everything Qwen3.6's chain owns on the device.
@@ -377,6 +379,9 @@ pub struct Body35 {
     /// of the sequence read it in place of `rope` ([`rope_table`]). `None`
     /// on a text load.
     pub(super) seq_rope: Option<SeqRope>,
+    /// Each attention layer's own table where they do not all turn by
+    /// `rope` (`dispatch::LayerRopes`); `None` when every one does.
+    pub(super) ropes: Option<LayerRopes>,
     /// What a media load makes each further sequence's table from
     /// ([`Slots::new_seq`]); `None` on a text load.
     rope_base: Option<RopeBase>,
@@ -460,12 +465,13 @@ pub struct Slot35 {
     pub(super) rope: Option<SeqRope>,
 }
 
-/// The delta layers' stores a checkpoint copies, lent for one call: each
-/// layer's state lane `lane` (the committed one) as a window of its lanes,
-/// and its conv ring.
+/// The recurrent stores a checkpoint copies, lent for one call: each delta
+/// layer's state lane `lane` (the committed one) as a window of its lanes
+/// and its conv ring, and each short-conv layer's ring.
 struct Copied35<'a> {
     lanes: Vec<WindowMut<'a, f32>>,
     rings: Vec<&'a mut DeviceBuffer<f32>>,
+    convs: Vec<&'a mut DeviceBuffer<f32>>,
 }
 
 impl<'a> Copied35<'a> {
@@ -475,35 +481,41 @@ impl<'a> Copied35<'a> {
         let mut c = Copied35 {
             lanes: Vec::new(),
             rings: Vec::new(),
+            convs: Vec::new(),
         };
         for s in stores {
-            if let LayerStore::Rec(r) = s {
-                let RecStore {
-                    state, ring, lanes, ..
-                } = r;
-                if lane as usize >= *lanes {
-                    return Err(GpuError::shape(
-                        "qwen35moe::Body35::copied",
-                        format!("lane {lane} of {lanes} lanes"),
-                    ));
+            match s {
+                LayerStore::Conv(ring) => c.convs.push(ring),
+                LayerStore::Rec(r) => {
+                    let RecStore {
+                        state, ring, lanes, ..
+                    } = r;
+                    if lane as usize >= *lanes {
+                        return Err(GpuError::shape(
+                            "qwen35moe::Body35::copied",
+                            format!("lane {lane} of {lanes} lanes"),
+                        ));
+                    }
+                    let len = state.len() / *lanes;
+                    let byte = lane as usize * len * size_of::<f32>();
+                    c.lanes.push(WindowMut::of_mut(state, byte, len)?);
+                    c.rings.push(ring);
                 }
-                let len = state.len() / *lanes;
-                let byte = lane as usize * len * size_of::<f32>();
-                c.lanes.push(WindowMut::of_mut(state, byte, len)?);
-                c.rings.push(ring);
+                LayerStore::Kv(_) => {}
             }
         }
         Ok(c)
     }
 
     /// The stores in [`Checkpoints::sequence`]'s order: each delta layer's
-    /// lane, then its ring.
+    /// lane, then its ring; then each short-conv layer's ring.
     fn list(&mut self) -> Vec<&mut DeviceBuffer<f32>> {
         let mut out: Vec<&mut DeviceBuffer<f32>> = Vec::new();
         for (l, r) in self.lanes.iter_mut().zip(self.rings.iter_mut()) {
             out.push(&mut **l);
             out.push(&mut **r);
         }
+        out.extend(self.convs.iter_mut().map(|r| &mut **r));
         out
     }
 }
@@ -613,6 +625,9 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<
             on(&g.attn_k, kv, h, g.k_ty)?;
             on(&g.attn_v, kv, h, g.v_ty)?;
             on(&g.attn_output, h, att, g.o_ty)?;
+            if let Some(gate) = &g.gate {
+                on(&gate.name, d.n_head, h, gate.ty)?;
+            }
         }
         MixerPlan::Delta(dp) => {
             let (c, nv) = (dp.shape.channels(), dp.shape.n_v);
@@ -627,11 +642,16 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<
             on(&dp.alpha, nv, h, dp.alpha_ty)?;
             on(&dp.ssm_out, h, nv * linear::HEAD, dp.out_ty)?;
         }
-        MixerPlan::ShortConv(_) => {
-            return Err(GpuError::shape(
-                WHAT,
-                "a short-conv layer, which this body runs no kernel for",
-            ));
+        MixerPlan::ShortConv(n) => {
+            f32_site(w, &n.attn_norm, 1, h)?;
+            f32_site(w, &n.conv, h, n.taps())?;
+            on(&n.conv_in, 3 * h, h, n.in_ty)?;
+            on(&n.conv_out, h, h, n.out_ty)?;
+        }
+    }
+    if let ResidualPlan::Sandwich(sw) = &p.residual {
+        for half in [Half::Mixer, Half::Ffn] {
+            f32_site(w, sw.norm(half), 1, h)?;
         }
     }
     let f = &p.ffn;
@@ -685,7 +705,7 @@ impl Forms {
         let mut hid: Vec<SiteTy> = Vec::new();
         let (mut attn, mut h, mut glu, mut cols) = (Vec::new(), Vec::new(), false, 0usize);
         let mut apart: Vec<SiteTy> = Vec::new();
-        let mut out_gate = false;
+        let (mut out_gate, mut conv, mut head_gate) = (false, false, false);
         let mut alone = |ty: SiteTy, rows: usize| {
             if site::kgemv_order(ty) == Some(Order::RowMajor) {
                 cols = cols.max(rows);
@@ -702,7 +722,13 @@ impl Forms {
                         alone(g.k_ty, d.kv_len());
                         alone(g.v_ty, d.kv_len());
                     }
-                    if !o_fused(g) {
+                    if let Some(gate) = &g.gate {
+                        hid.push(gate.ty);
+                        alone(gate.ty, d.n_head);
+                        out_gate = true;
+                        head_gate = true;
+                    }
+                    if !dispatch::o_resid_fused(p, g) {
                         alone(g.o_ty, d.hidden);
                     }
                 }
@@ -719,8 +745,11 @@ impl Forms {
                         alone(dp.out_ty, d.hidden);
                     }
                 }
-                MixerPlan::ShortConv(_) => {
-                    panic!("qwen35moe::Forms::of: a short-conv layer, which `kinds35` refuses")
+                MixerPlan::ShortConv(n) => {
+                    hid.extend([n.in_ty, n.out_ty]);
+                    conv = true;
+                    alone(n.in_ty, 3 * d.hidden);
+                    alone(n.out_ty, d.hidden);
                 }
             }
             let f = &p.ffn;
@@ -762,6 +791,8 @@ impl Forms {
                 },
             }),
             out_gate,
+            conv,
+            head_gate,
         }
     }
 }
@@ -784,6 +815,9 @@ struct Pre35 {
     /// The file's IMROPE sections and `rope.section_order`, read when the
     /// load takes media.
     sections: Option<([u32; 4], vision::mrope::SectionOrder)>,
+    /// Each attention layer's rope where they do not all turn by `(base,
+    /// rope_dims)` with no factors ([`layer_ropes`]).
+    ropes: Option<(Vec<RopeSpec>, Vec<Option<usize>>)>,
     /// The forms the layers the common card leg runs hold buffers of
     /// ([`CommonForms::NONE`] under a whole read).
     common: CommonForms,
@@ -885,6 +919,14 @@ impl Pre35 {
         let common = common_forms(file, &d, &spec.layers, mode)?;
         let pd = plan_dims(&d);
         let plans = layer_plans(file, WHAT, &pd, &kinds, &spec.layers, &Sites35::CARD, mode)?;
+        let ropes = layer_ropes(file, &spec.layers, &plans, (base, rope_dims))?;
+        if ropes.is_some() && sections.is_some() {
+            return Err(GpuError::shape(
+                WHAT,
+                "a media load whose attention layers turn by more than one rope table: an \
+                 image's positions follow one",
+            ));
+        }
         Ok(Pre35 {
             vocab,
             eps: spec.rms_eps,
@@ -896,9 +938,70 @@ impl Pre35 {
             base,
             rope_dims,
             sections,
+            ropes,
             common,
         })
     }
+}
+
+/// The distinct rope specs of a file's attention layers and each layer's index into them.
+type LayerRopeSpecs = (Vec<RopeSpec>, Vec<Option<usize>>);
+
+/// Each attention layer's rope from the description, its frequency factors
+/// read from the file's table the plan names (`GqaPlan::rope_freqs`): `None`
+/// when every attention layer turns by `RopeSpec::window(base, dims)` with
+/// no factors (the chain's one table), else the distinct specs and each
+/// layer's index into them (`None` for a layer with no rope).
+fn layer_ropes(
+    file: &Split,
+    layers: &[LayerSpec],
+    plans: &[LayerPlan],
+    (base, dims): (f32, usize),
+) -> Result<Option<LayerRopeSpecs>, GpuError> {
+    let mut keys: Vec<(u32, usize, Option<&str>)> = Vec::new();
+    let mut specs = Vec::new();
+    let mut pick = Vec::with_capacity(layers.len());
+    for (spec, plan) in layers.iter().zip(plans) {
+        let (Mixer::Gqa(g), MixerPlan::Gqa(gp)) = (&spec.mixer, &plan.mixer) else {
+            pick.push(None);
+            continue;
+        };
+        let key = (
+            g.rope.base.to_bits(),
+            g.rope.dims as usize,
+            gp.rope_freqs.as_deref(),
+        );
+        let at = match keys.iter().position(|k| *k == key) {
+            Some(at) => at,
+            None => {
+                let mut rope = RopeSpec::window(g.rope.base, g.rope.dims as usize);
+                if let Some(name) = &gp.rope_freqs {
+                    rope = rope.with_factors(&f32_values(file, name)?)?;
+                }
+                keys.push(key);
+                specs.push(rope);
+                keys.len() - 1
+            }
+        };
+        pick.push(Some(at));
+    }
+    let one = keys.iter().all(|k| *k == (base.to_bits(), dims, None));
+    Ok((!one).then_some((specs, pick)))
+}
+
+/// The little-endian f32 values of the file's tensor `name`.
+fn f32_values(file: &Split, name: &str) -> Result<Vec<f32>, GpuError> {
+    let bytes = file
+        .data(name)
+        .map_err(|e| GpuError::shape(WHAT, format!("{name}: {e}")))?;
+    let (values, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{name} holds {} bytes, not whole f32 values", bytes.len()),
+        ));
+    }
+    Ok(values.iter().map(|b| f32::from_le_bytes(*b)).collect())
 }
 
 /// The arena's dims of `spec`, whose kinds `kinds` the plan checked: the
@@ -1385,6 +1488,15 @@ impl Body35 {
                 ),
             ));
         }
+        if lanes != PLAIN_LANES && pre.kinds.iter().any(|k| matches!(k, Kind35::ShortConv(_))) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{lanes} lanes on a chain with short-conv layers, whose rings keep no lane a \
+                     verify row"
+                ),
+            ));
+        }
         let Pre35 {
             vocab,
             eps,
@@ -1396,6 +1508,7 @@ impl Body35 {
             base,
             rope_dims,
             sections,
+            ropes,
             common,
         } = pre;
         let ctx = o.ctx;
@@ -1411,17 +1524,23 @@ impl Body35 {
                 Kind35::Delta(shape) => {
                     LayerStore::Rec(RecStore::new(stream, shape.lens(lanes), lanes)?)
                 }
-                Kind35::ShortConv(_) => {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        "a short-conv layer, which this body runs no kernel for",
-                    ));
+                Kind35::ShortConv(ring) => {
+                    LayerStore::Conv(DeviceBuffer::zeroed(stream, ring.values(d.hidden))?)
                 }
             });
         }
         let forms = Forms::of(&plans, &d);
         let table = RopeTable::new(&RopeSpec::window(base, rope_dims))?;
         let rope = RopeRows::new(stream, &table, rope_dims, ctx)?;
+        let ropes = ropes
+            .map(|(specs, pick)| {
+                let tables = specs
+                    .iter()
+                    .map(|spec| RopeRows::new(stream, &RopeTable::new(spec)?, spec.n_dims, ctx))
+                    .collect::<Result<Vec<_>, GpuError>>()?;
+                Ok::<_, GpuError>(LayerRopes { tables, pick })
+            })
+            .transpose()?;
         let (seq_rope, rope_base) = match sections {
             Some((sections, order)) => {
                 let base: Arc<[f32]> = RopeRows::host_rows(&table, rope_dims, ctx)?.into();
@@ -1431,7 +1550,8 @@ impl Body35 {
             None => (None, None),
         };
         let every = checkpoint_every(asked, &d)?;
-        let ckpt = sequence_checkpoints(gpu.context(), checkpoint_lens(&kinds), ctx, every)?;
+        let ckpt =
+            sequence_checkpoints(gpu.context(), checkpoint_lens(&kinds, d.hidden), ctx, every)?;
         let (lane, views) = if lanes > PLAIN_LANES {
             let (word, views) = LaneWord::with_views(stream, lanes, 3)?;
             (Some(word), views)
@@ -1480,6 +1600,7 @@ impl Body35 {
             stores,
             rope,
             seq_rope,
+            ropes,
             rope_base,
             s,
             sp,
@@ -1518,9 +1639,7 @@ impl Body35 {
             .map(|p| match p.mixer {
                 MixerPlan::Gqa(_) => LayerKind35::Attention,
                 MixerPlan::Delta(_) => LayerKind35::Delta,
-                MixerPlan::ShortConv(_) => {
-                    panic!("qwen35moe::Body35::kinds: a short-conv layer, which `kinds35` refuses")
-                }
+                MixerPlan::ShortConv(_) => LayerKind35::ShortConv,
             })
             .collect()
     }
@@ -1975,6 +2094,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         stores,
         rope,
         seq_rope,
+        ropes,
         s,
         sp,
         k,
@@ -1993,6 +2113,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         mma: *mma,
         eps: *eps,
         table: rope_table(rope, seq_rope.as_ref()),
+        ropes: ropes.as_ref(),
     };
     if let Some(Placed {
         hybrid, side, step, ..
@@ -2064,6 +2185,7 @@ fn enqueue_rows(
         stores,
         rope,
         seq_rope,
+        ropes,
         a,
         rp,
         k,
@@ -2080,6 +2202,7 @@ fn enqueue_rows(
         mma: *mma,
         eps: *eps,
         table: rope_table(rope, seq_rope.as_ref()),
+        ropes: ropes.as_ref(),
     };
     Program {
         c: &c,
@@ -2148,6 +2271,7 @@ impl Body35 {
             stores,
             rope,
             seq_rope,
+            ropes,
             u,
             k,
             head_state,
@@ -2165,6 +2289,7 @@ impl Body35 {
             mma: *mma,
             eps: *eps,
             table: rope_table(rope, seq_rope.as_ref()),
+            ropes: ropes.as_ref(),
         };
         let tail = match end {
             UnitEnd::Head(head) => Tail::Last {
@@ -2677,8 +2802,10 @@ impl ChainBody for Body35 {
             p.reset(stream)?;
         }
         for s in &mut self.stores {
-            if let LayerStore::Rec(r) = s {
-                r.clear(stream)?;
+            match s {
+                LayerStore::Rec(r) => r.clear(stream)?,
+                LayerStore::Conv(ring) => ring.zero_async(stream)?,
+                LayerStore::Kv(_) => {}
             }
         }
         self.ckpt.clear();
@@ -2709,6 +2836,7 @@ impl ChainBody for Body35 {
     fn resident_bytes(&self) -> usize {
         self.store_bytes()
             + self.rope.table.num_bytes()
+            + self.ropes.as_ref().map_or(0, LayerRopes::bytes)
             + self.rope_bytes()
             + self.s.bytes()
             + self.sp.bytes()
@@ -3040,7 +3168,7 @@ mod tests {
                 }
             })
             .collect();
-        let lens = checkpoint_lens(&kinds);
+        let lens = checkpoint_lens(&kinds, 2048);
         assert_eq!(lens.len(), 60);
         assert!(lens.chunks(2).all(|c| c == [32 * 128 * 128, 11 * 8192]));
         assert_eq!(point_bytes(&lens), 73_728_000);

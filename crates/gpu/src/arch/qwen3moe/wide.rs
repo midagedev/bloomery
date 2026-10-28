@@ -249,7 +249,9 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
         + rows * att
         + rows * slots * (d.ff + d.hidden)
         + if forms.glu { 2 * n * slots * d.ff } else { 0 }
-        + if rows > 1 { n * forms.cols } else { 0 };
+        + if rows > 1 { n * forms.cols } else { 0 }
+        + if forms.conv { rows * 3 * d.hidden } else { 0 }
+        + if forms.head_gate { rows * d.n_head } else { 0 };
     let u32s = 2 * rows;
     let acts: usize = (1..=n)
         .map(|m| {
@@ -1569,6 +1571,7 @@ impl GpuModel<Body35> {
             mma: b.mma,
             eps: b.eps,
             table: &b.rope.table,
+            ropes: b.ropes.as_ref(),
         };
         // The FFN half reads no input record: the step's stands in.
         Program {

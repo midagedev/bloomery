@@ -25,6 +25,7 @@ use crate::flash_gqa::{
     FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable,
     partials_ms_len, partials_v_len, partials_v_len_256,
 };
+use crate::flash_gqa_h128_swa::{H128SwaArgs, H128SwaKernels};
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
@@ -900,6 +901,58 @@ impl KvPlanes {
         }
     }
 
+    /// The head-128 decode flash of `s`'s rows over these f16 planes at any
+    /// group the window entries serve, each row attending its last `window`
+    /// keys (0: every key) with no sink: `H128SwaKernels::enqueue`. A q8_0
+    /// cache is refused by name.
+    pub(super) fn flash_128_window(
+        &mut self,
+        swa: &H128SwaKernels,
+        stream: &CudaStream,
+        s: FlashPass<'_>,
+        (n_head, window): (usize, usize),
+    ) -> Result<(), GpuError> {
+        let FlashPass {
+            q,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => swa.enqueue(
+                stream,
+                H128SwaArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    window,
+                    sinks: None,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                n_head,
+            ),
+            KvPlanes::Q8 { .. } => Err(q8_unserved(
+                "qwen3moe::KvPlanes::flash_128_window",
+                Flash::Group,
+                "windowed",
+            )),
+        }
+    }
+
     /// The head-256 decode flash of `s`'s rows over these planes, the pass
     /// `flash` names (the pairs' pass scalar only), the f16 launches or, on
     /// the eight-head layout's tensor-core pass, its q8_0 twin's; any other
@@ -1316,8 +1369,11 @@ impl KvPlanes {
 /// more than one row (`cols` values a column); and on a chain with a layer
 /// that keeps its shared expert apart, that expert's buffers (`apart`); and
 /// on a chain whose gated head-256 layer has an output projection of a type
-/// other than a K-quant, the f32 rows of the gated flash output that
-/// projection reads (`out_gate`).
+/// other than a K-quant, or a head-128 layer with a gate of one value a
+/// head, the f32 rows of the gated flash output that projection reads
+/// (`out_gate`); on a chain with a short-conv layer, its input projection's
+/// three chunks a row (`conv`); and on a chain with a head-128 layer with a
+/// gate of one value a head, the gate projection's values (`head_gate`).
 /// [`Forms::KQUANT`] is a chain of fused Q4_K and Q6_K sites: the buffers
 /// the arena held before any other type ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1329,6 +1385,8 @@ pub(super) struct Forms {
     pub(super) cols: usize,
     pub(super) apart: Option<ApartForms>,
     pub(super) out_gate: bool,
+    pub(super) conv: bool,
+    pub(super) head_gate: bool,
 }
 
 /// What a chain whose layer keeps its shared expert apart from its routed
@@ -1348,6 +1406,8 @@ impl Forms {
         cols: 0,
         apart: None,
         out_gate: false,
+        conv: false,
+        head_gate: false,
     };
 }
 
@@ -1489,6 +1549,13 @@ pub(super) struct Arena {
     /// embeddings ([`Arena::write_media`]); `Some` only on a prompt arena of
     /// a media load.
     pub(super) media: Option<MediaRows>,
+    /// A short-conv layer's input projection, `B | C | x` of `hidden` values
+    /// each a row ([`Forms::conv`]); `None` on a chain with no short conv.
+    pub(super) bcx: Option<DeviceBuffer<f32>>,
+    /// The gate projection of a head-128 layer with a gate of one value a
+    /// head, `n_head` values a row ([`Forms::head_gate`]); `None` on a chain
+    /// with no such layer.
+    pub(super) head_gate: Option<DeviceBuffer<f32>>,
 }
 
 /// Where the FFN's slots come from: a router launch's results — the plain
@@ -1774,16 +1841,20 @@ impl LaneWord {
     }
 }
 
-/// A layer's state store: K/V planes by position, or a recurrent store.
+/// A layer's state store: K/V planes by position, a recurrent store, or a
+/// short-conv layer's conv ring (`[rows][hidden]` f32, the products of the
+/// last positions by position: `linear::shortconv`'s layout).
 pub(super) enum LayerStore {
     Kv(KvPlanes),
     Rec(RecStore),
+    Conv(DeviceBuffer<f32>),
 }
 
 /// A layer's store as one layer's enqueue borrows it.
 pub(super) enum StoreMut<'a> {
     Kv(&'a mut KvPlanes),
     Rec(&'a mut RecStore),
+    Conv(&'a mut DeviceBuffer<f32>),
 }
 
 impl LayerStore {
@@ -1791,6 +1862,7 @@ impl LayerStore {
         match self {
             Self::Kv(k) => StoreMut::Kv(k),
             Self::Rec(r) => StoreMut::Rec(r),
+            Self::Conv(ring) => StoreMut::Conv(ring),
         }
     }
 
@@ -1798,6 +1870,7 @@ impl LayerStore {
         match self {
             Self::Kv(k) => k.bytes(),
             Self::Rec(r) => r.bytes(),
+            Self::Conv(ring) => ring.num_bytes(),
         }
     }
 }
@@ -2141,6 +2214,8 @@ impl Arena {
                 .map(|_| ApartRows::new(stream, &d, narrow))
                 .transpose()?,
             media: None,
+            bcx: forms.conv.then(|| f(rows * 3 * d.hidden)).transpose()?,
+            head_gate: forms.head_gate.then(|| f(rows * d.n_head)).transpose()?,
             dims: d,
             rows,
         })
@@ -2220,6 +2295,8 @@ impl Arena {
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.q_out.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.gated_rows.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.bcx.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.head_gate.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.gdn.as_ref().map_or(0, GdnArena::bytes)
             + self.wide.as_ref().map_or(0, Wide::bytes)
             + self

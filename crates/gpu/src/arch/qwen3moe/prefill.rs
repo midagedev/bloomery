@@ -353,6 +353,7 @@ impl Body {
             mma: *mma,
             eps: hp.rms_eps,
             table: &rope.table,
+            ropes: None,
         };
         let Prefill {
             graphs,
@@ -426,6 +427,7 @@ impl Body {
             mma: *mma,
             eps: hp.rms_eps,
             table: &rope.table,
+            ropes: None,
         };
         let tail = match head {
             Some(head) => Tail::Last {
@@ -489,6 +491,7 @@ impl Body {
             mma: *mma,
             eps: hp.rms_eps,
             table: &rope.table,
+            ropes: None,
         };
         let tail = match head {
             Some(head) => Tail::Last {
@@ -553,6 +556,7 @@ impl Body {
             mma: *mma,
             eps: hp.rms_eps,
             table: &rope.table,
+            ropes: None,
         };
         side.refresh_maps(gpu.stream(), m)?;
         let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, side.cap);

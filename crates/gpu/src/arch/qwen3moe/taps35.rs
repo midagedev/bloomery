@@ -76,10 +76,12 @@ pub struct Layer35Run {
 /// A layer's store on the host, in the card's layouts: the K and V planes
 /// (`[n_kv][ctx][256]` f16 bits each), or the recurrent state (every lane,
 /// `[lanes][n_v][128 v][128 k]`) and the conv ring (`[RING_ROWS][C]`, the
-/// input of position `p` in slot `p mod RING_ROWS`).
+/// input of position `p` in slot `p mod RING_ROWS`), or a short conv's ring
+/// (`[rows][hidden]`, the same addressing at its own row count).
 pub enum StoreHost {
     Kv { k: Vec<u16>, v: Vec<u16> },
     Rec { state: Vec<f32>, ring: Vec<f32> },
+    Conv { ring: Vec<f32> },
 }
 
 /// The first `n` values of `b`, read back.
@@ -107,6 +109,9 @@ impl Body35 {
             LayerStore::Rec(r) => StoreHost::Rec {
                 state: r.state.to_host_vec(stream)?,
                 ring: r.ring.to_host_vec(stream)?,
+            },
+            LayerStore::Conv(ring) => StoreHost::Conv {
+                ring: ring.to_host_vec(stream)?,
             },
         })
     }
@@ -143,6 +148,16 @@ impl Body35 {
                 }
                 r.state.copy_from_host(stream, state)?;
                 r.ring.copy_from_host(stream, ring)?;
+            }
+            (LayerStore::Conv(r), StoreHost::Conv { ring }) => {
+                if ring.len() != r.len() {
+                    return Err(bad(format!(
+                        "a ring of {} values, given {}",
+                        r.len(),
+                        ring.len()
+                    )));
+                }
+                r.copy_from_host(stream, ring)?;
             }
             _ => return Err(bad("a store of the layer's own kind".into())),
         }
@@ -290,6 +305,7 @@ where
         mma: b.mma,
         eps: b.eps,
         table: rope_table(&b.rope, b.seq_rope.as_ref()),
+        ropes: b.ropes.as_ref(),
     };
     Program {
         c: &c,
