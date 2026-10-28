@@ -51,7 +51,7 @@ pub enum Store {
     IndexCompressorState,
     /// The pooled keys a token-pool selector scores.
     PooledKeys,
-    /// A delta-rule layer's causal conv inputs.
+    /// A delta-rule, Mamba-2 or short-conv layer's causal conv inputs.
     Conv,
     /// A delta-rule layer's recurrent state.
     State,
@@ -85,6 +85,12 @@ pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
             ));
             v.push((Store::State, StoreRule::Recurrent));
         }
+        Mixer::ShortConv(c) => v.push((
+            Store::Conv,
+            StoreRule::Window {
+                slots: c.taps.saturating_sub(1),
+            },
+        )),
         Mixer::Latent(a) => {
             v.push((
                 Store::Latent,
@@ -163,7 +169,7 @@ mod tests {
     use models::{
         Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap,
         KdaGate, Latent, LatentOut, LatentUp, Moe, OutGate, PoolRule, Residual, Rope, RopeMode,
-        Router, Score,
+        Router, Score, ShortConv,
     };
 
     fn moe() -> Ffn {
@@ -192,6 +198,7 @@ mod tests {
             dims,
             base: 10_000.0,
             yarn: None,
+            factors: false,
         }
     }
 
@@ -425,6 +432,17 @@ mod tests {
         assert!(copied(&q[3], false));
         assert!(!copied(&q[3], true));
         assert!(copied_layers(&q, &|l| l == 3).iter().all(|&l| l != 3));
+    }
+
+    /// A short-conv layer keeps the last `taps - 1` inputs of its conv and nothing else: a window
+    /// store a checkpoint copies, read past no window. Mutant: the arm adds a recurrent state or
+    /// sizes the ring `taps`.
+    #[test]
+    fn a_short_conv_layer_keeps_a_conv_ring_of_taps_minus_one() {
+        let s = layer(Mixer::ShortConv(ShortConv { taps: 3 }), Residual::Plain);
+        assert_eq!(stores(&s), [(Store::Conv, StoreRule::Window { slots: 2 })]);
+        assert!(!every_position(&s));
+        assert!(copied(&s, false));
     }
 
     /// A GLM-5.3-Flash-like trunk: KDA layers, every fourth a latent layer

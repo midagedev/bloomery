@@ -1694,6 +1694,11 @@ impl Body {
                         "layer {l}: a Mamba-2 mixer, which glm5next has none of"
                     )));
                 }
+                MixerKind::ShortConv => {
+                    return Err(shape(format!(
+                        "layer {l}: a short-conv mixer, which glm5next has none of"
+                    )));
+                }
                 MixerKind::None => {
                     return Err(shape(format!(
                         "layer {l}: no token mixer, which glm5next has none of"
@@ -2392,7 +2397,8 @@ pub(crate) fn layer_cfg(
             "layer {l}: a plain residual; every trunk block is wrapped in the streams"
         )));
     }
-    if let other @ (Mixer::Gqa(_) | Mixer::Mamba2(_) | Mixer::None) = &s.mixer {
+    if let other @ (Mixer::Gqa(_) | Mixer::Mamba2(_) | Mixer::ShortConv(_) | Mixer::None) = &s.mixer
+    {
         return Err(shape(format!(
             "layer {l}: {}, which glm5next has none of",
             other.what()
@@ -2458,6 +2464,11 @@ pub(crate) fn store(
         MixerKind::Gqa => return Err(shape("a GQA store, which glm5next has none of".into())),
         MixerKind::Mamba2 => {
             return Err(shape("a Mamba-2 store, which glm5next has none of".into()));
+        }
+        MixerKind::ShortConv => {
+            return Err(shape(
+                "a short-conv store, which glm5next has none of".into(),
+            ));
         }
         MixerKind::None => {
             return Err(shape(

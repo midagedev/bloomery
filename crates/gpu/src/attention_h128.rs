@@ -144,10 +144,11 @@ impl Binding {
         let heads = g.heads as usize;
         let kv = g.kv_heads as usize;
         let rotate = match g.rope.mode {
-            RopeMode::None if g.rope.dims == 0 && g.rope.yarn.is_none() => false,
+            RopeMode::None if g.rope.dims == 0 && g.rope.yarn.is_none() && !g.rope.factors => false,
             RopeMode::Neox
                 if g.rope.dims as usize == HEAD
                     && g.rope.yarn.is_none()
+                    && !g.rope.factors
                     && g.rope.base.is_finite()
                     && g.rope.base > 0.0 =>
             {

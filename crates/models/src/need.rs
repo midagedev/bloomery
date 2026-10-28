@@ -63,6 +63,11 @@ pub enum Need {
     /// The GQA output multiplied by a sigmoid gate a projection of the layer input of its own
     /// writes.
     OutGateProj,
+    /// The GQA output multiplied by a sigmoid gate a projection of the layer input of its own
+    /// writes, one gate per query head.
+    OutGateProjHead,
+    /// The rope's pair frequencies divided by the file's factors (`rope_freqs.weight`).
+    RopeFactors,
     /// The heads' outputs RMS-normed per head, with no gain, before the output gate:
     /// `head` values per head.
     OutNorm { head: u32 },
@@ -180,6 +185,8 @@ pub enum Need {
         n_groups: u32,
         d_conv: u32,
     },
+    /// A gated short-conv mixer of `taps` taps.
+    ShortConv { taps: u32 },
     /// Hyper-connections of `streams` streams.
     Hc { streams: u32 },
     /// Chart-constrained hyper-connections of `streams` streams, every sublayer its own mix, the
@@ -197,6 +204,9 @@ pub enum Need {
     /// The residual joined per channel, α·stream + β·branch, each sublayer's
     /// output normalized at `eps` first.
     AlphaBeta { eps: f32 },
+    /// Each sublayer's output weight-normed at `eps` before it joins the stream, scaled by
+    /// `add` (mixer, feed-forward block) when it does.
+    Sandwich { eps: f32, add: [f32; 2] },
     /// An engram site whose gate reads `row`-value rows.
     Engram { row: u32 },
     /// A model with no engram site, for a program that runs one.
@@ -282,6 +292,10 @@ impl fmt::Display for Need {
             Need::OutGateProj => {
                 f.write_str("attention output gate: sigmoid of its own projection")
             }
+            Need::OutGateProjHead => f.write_str(
+                "attention output gate: sigmoid of its own projection, one gate per head",
+            ),
+            Need::RopeFactors => f.write_str("rope frequency factors (rope_freqs.weight)"),
             Need::OutNorm { head } => {
                 write!(
                     f,
@@ -469,6 +483,7 @@ impl fmt::Display for Need {
                 f,
                 "Mamba-2 mixer: inner {d_inner}, state {d_state}, {n_heads} heads, {n_groups} groups, conv {d_conv}"
             ),
+            Need::ShortConv { taps } => write!(f, "gated short-conv mixer: {taps} taps"),
             Need::Hc { streams } => write!(f, "hyper-connections of {streams} streams"),
             Need::HcChart { streams, collapse } => write!(
                 f,
@@ -489,6 +504,10 @@ impl fmt::Display for Need {
             Need::AlphaBeta { eps } => write!(
                 f,
                 "the alpha/beta residual mix, each sublayer's output normed at {eps} first"
+            ),
+            Need::Sandwich { eps, add } => write!(
+                f,
+                "sandwich norms: each sublayer's output weight-normed at {eps}, then added scaled by {add:?}"
             ),
             Need::Engram { row } => write!(f, "an engram gate of {row}-value rows"),
             Need::NoEngram => f.write_str("a model without engram sites"),
@@ -578,10 +597,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                         dims: g.rope.dims,
                     });
                 }
+                if g.rope.factors {
+                    at(Need::RopeFactors);
+                }
                 match g.out_gate {
                     OutGate::None => {}
                     OutGate::Packed => at(Need::OutGate),
                     OutGate::Proj => at(Need::OutGateProj),
+                    OutGate::ProjHead => at(Need::OutGateProjHead),
                 }
                 if g.o_norm {
                     at(Need::OutNorm { head: g.head_dim });
@@ -639,6 +662,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 n_groups: m.n_groups,
                 d_conv: m.d_conv,
             }),
+            Mixer::ShortConv(c) => at(Need::ShortConv { taps: c.taps }),
             Mixer::None => {}
         }
         match &layer.ffn {
@@ -709,6 +733,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             Residual::AlphaBeta { eps } => {
                 at(Need::AlphaBeta { eps });
             }
+            Residual::Sandwich { eps, add } => at(Need::Sandwich { eps, add }),
         }
         if let Some(e) = &spec.encoder {
             if e.post_norms {
@@ -863,7 +888,7 @@ fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
 mod tests {
     use crate::{
         Act, Ffn, Gqa, LayerSpec, LogitEpilogue, Mixer, ModelSpec, Moe, Need, OutGate, Residual,
-        Rope, RopeMode, Router, Score, needs,
+        Rope, RopeMode, Router, Score, ShortConv, needs,
     };
 
     /// One Muse-shaped layer: a Proj-gated GQA mixer whose output norm is
@@ -894,6 +919,7 @@ mod tests {
                         dims: 64,
                         base: 0.0,
                         yarn: None,
+                        factors: false,
                     },
                     qk_norm: true,
                     o_norm,
@@ -959,6 +985,7 @@ mod tests {
                             dims: if mode == RopeMode::None { 0 } else { 64 },
                             base: 0.0,
                             yarn: None,
+                            factors: false,
                         },
                         qk_norm,
                         o_norm: false,
@@ -1086,6 +1113,128 @@ mod tests {
                     | Need::AlphaBeta { .. }
                     | Need::LogitEpilogue { .. }
             )),
+            "{got:?}"
+        );
+    }
+
+    /// An LFM3-shaped pair of layers: a short-conv layer, then a GQA layer of head 128 whose rope
+    /// carries `factors`, whose gate is `gate`, both joined as `residual`, over a dense SwiGLU
+    /// block each.
+    fn lfm3_spec(factors: bool, gate: OutGate, residual: Residual) -> ModelSpec {
+        let dense = || Ffn::Dense {
+            ff: 32,
+            act: Act::SwiGlu { limit: None },
+        };
+        let mut s = spec(&[]);
+        s.arch = crate::Arch::Lfm3;
+        s.layers = vec![
+            LayerSpec {
+                mixer: Mixer::ShortConv(ShortConv { taps: 7 }),
+                ffn: dense(),
+                residual,
+                extras: Vec::new(),
+            },
+            LayerSpec {
+                mixer: Mixer::Gqa(Gqa {
+                    heads: 4,
+                    kv_heads: 2,
+                    head_dim: 128,
+                    value_dim: 128,
+                    rope: Rope {
+                        mode: RopeMode::Neox,
+                        dims: 128,
+                        base: 1e6,
+                        yarn: None,
+                        factors,
+                    },
+                    qk_norm: true,
+                    o_norm: false,
+                    out_gate: gate,
+                    select: None,
+                    window: None,
+                    sinks: false,
+                    value_scale: None,
+                }),
+                ffn: dense(),
+                residual,
+                extras: Vec::new(),
+            },
+        ];
+        s
+    }
+
+    /// The short conv, the rope factors, the per-head gate and the sandwich residual each need a
+    /// row of their own, on the layer that carries them. FAIL-first: with any emission removed,
+    /// its row fails; with the factors riding the rope's row (a `QkRope` that names no factors),
+    /// a program that runs the plain rope would cover the factored one and the second assertion
+    /// fails.
+    #[test]
+    fn the_lfm3_parts_need_their_rows() {
+        let got = needs(&lfm3_spec(
+            true,
+            OutGate::ProjHead,
+            Residual::Sandwich {
+                eps: 1e-5,
+                add: [1.0, 1.0],
+            },
+        ));
+        for (l, want) in [
+            (0, "gated short-conv mixer: 7 taps"),
+            (
+                0,
+                "sandwich norms: each sublayer's output weight-normed at 0.00001, then added scaled by [1.0, 1.0]",
+            ),
+            (1, "rope frequency factors (rope_freqs.weight)"),
+            (
+                1,
+                "attention output gate: sigmoid of its own projection, one gate per head",
+            ),
+            (
+                1,
+                "sandwich norms: each sublayer's output weight-normed at 0.00001, then added scaled by [1.0, 1.0]",
+            ),
+        ] {
+            assert!(
+                got.iter()
+                    .any(|(n, layer)| *layer == Some(l) && n.to_string() == want),
+                "{want}: not in the needs of layer {l}: {got:?}"
+            );
+        }
+        assert!(
+            got.iter().any(|(n, l)| *l == Some(1)
+                && matches!(
+                    n,
+                    Need::QkRope {
+                        head: 128,
+                        dims: 128,
+                        mode: RopeMode::Neox,
+                        ..
+                    }
+                )),
+            "{got:?}"
+        );
+        assert!(
+            !got.iter().any(|(n, _)| matches!(n, Need::OutGateProj)),
+            "the per-head gate is not the per-channel one: {got:?}"
+        );
+    }
+
+    /// None of it without the facts: no factors, the per-channel gate and the plain residual
+    /// need none of the rows, and a short-conv layer needs no attention row.
+    #[test]
+    fn a_layer_without_the_lfm3_parts_needs_none_of_their_rows() {
+        let got = needs(&lfm3_spec(false, OutGate::Proj, Residual::Plain));
+        assert!(
+            !got.iter().any(|(n, _)| matches!(
+                n,
+                Need::RopeFactors | Need::OutGateProjHead | Need::Sandwich { .. }
+            )),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|(n, _)| matches!(n, Need::OutGateProj)));
+        assert!(
+            !got.iter()
+                .any(|(n, l)| *l == Some(0) && matches!(n, Need::Gqa { .. } | Need::QkRope { .. })),
             "{got:?}"
         );
     }

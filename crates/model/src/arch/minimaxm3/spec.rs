@@ -51,6 +51,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         dims: spec_u32("rope.dimension_count", hp.rope.dims)?,
         base: hp.rope.base,
         yarn: None,
+        factors: false,
     };
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
         let kind = hp.kind(l);

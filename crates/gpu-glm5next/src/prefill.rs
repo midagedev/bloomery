@@ -3189,6 +3189,11 @@ impl<'a> LayerProgram for PromptProgram<'a> {
                         "layer {l}: a Mamba-2 mixer, which glm5next has none of"
                     )));
                 }
+                MixerKind::ShortConv => {
+                    return Err(shape(format!(
+                        "layer {l}: a short-conv mixer, which glm5next has none of"
+                    )));
+                }
                 MixerKind::None => {
                     return Err(shape(format!(
                         "layer {l}: no token mixer, which glm5next has none of"

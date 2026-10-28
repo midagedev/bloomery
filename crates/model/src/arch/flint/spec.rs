@@ -37,6 +37,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
                         dims: spec_u32("attention.key_length", hp.head)?,
                         base: hp.base,
                         yarn: None,
+                        factors: false,
                     }
                 } else {
                     Rope {
@@ -44,6 +45,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
                         dims: 0,
                         base: 0.0,
                         yarn: None,
+                        factors: false,
                     }
                 },
                 qk_norm: true,

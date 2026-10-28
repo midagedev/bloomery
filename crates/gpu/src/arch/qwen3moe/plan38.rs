@@ -400,7 +400,7 @@ pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
                 }
                 Kind38::Qsa
             }
-            other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
+            other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::ShortConv(_) | Mixer::None) => {
                 return Err(refuse(format!(
                     "{}, which no kernel here runs",
                     other.what()
@@ -456,7 +456,10 @@ pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
 /// Whether `g` is the selecting gated attention the kernels run.
 fn gqa_fits(g: &Gqa) -> bool {
     let rope_ok = |r: &model::arch::models::Rope| {
-        turns_as_neox(r.mode, r.dims) && r.dims as usize == geo::ROPE && r.yarn.is_none()
+        turns_as_neox(r.mode, r.dims)
+            && r.dims as usize == geo::ROPE
+            && r.yarn.is_none()
+            && !r.factors
     };
     let select_ok = match g.select {
         Some(Selector::TokenPool {

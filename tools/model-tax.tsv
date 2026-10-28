@@ -224,3 +224,7 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	llama	2	PIN(2026-10-26) llama: fa
 crates/model/src/arch/mod.rs	llama	2	PIN(2026-10-26) llama: the family's module declaration (`pub mod llama;`) and the SentencePiece rule's tokenizer-model word; the module list is not a registry
 crates/models/src/lib.rs	llama	2	PIN(2026-10-26) llama: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	llama	1	PIN(2026-10-26) llama: program_of matches every models::Arch exhaustively, so the variant needs its arm to the Qwen35Body program
+crates/model/src/arch/mod.rs	lfm	1	PIN(2026-10-28) lfm: the family's module declaration (`pub mod lfm3;`); the module list is not a registry
+crates/models/src/lib.rs	lfm	2	PIN(2026-10-28) lfm: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
+crates/placement/src/accepts.rs	lfm	1	PIN(2026-10-28) lfm: program_of matches every models::Arch exhaustively, so the variant needs its arm; none runs the family yet
+crates/gpu-gates/src/bin/shared/routed_legs.rs	lfm	2	PIN(2026-10-28) lfm: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter, and the dense trunk routes nothing

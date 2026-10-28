@@ -24,6 +24,7 @@ mod gemma_encoder;
 pub mod glm5next;
 pub mod hybrid;
 pub mod kda;
+pub mod lfm3;
 pub mod llama;
 pub mod mimo2;
 pub mod minimaxm3;

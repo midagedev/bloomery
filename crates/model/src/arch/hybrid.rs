@@ -418,6 +418,7 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
             dims: 0,
             base: 0.0,
             yarn: None,
+            factors: false,
         },
         qk_norm: false,
         o_norm: false,

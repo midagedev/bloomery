@@ -1,0 +1,469 @@
+{
+  "template": "lfm3-chat-template.jinja",
+  "reference": "jinja2 3.1.2 (Python 3.14.7), the Hugging Face chat-template environment (ImmutableSandboxedEnvironment with trim_blocks, lstrip_blocks, the loopcontrols extension and the generation tag; tojson = json.dumps with ensure_ascii=False, indent=None, separators=None, sort_keys=False as defaults; the global raise_exception); a case jinja2 refused carries its error in place of a prompt. Script: crates/jinja/tests/fixtures/render_lfm3.py, run as `python3 render_lfm3.py lfm3-chat-template.jinja > lfm3-renders.json`",
+  "cases": [
+    {
+      "name": "a user turn",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "system and user, thinking off",
+      "vars": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "add_generation_prompt": true,
+        "enable_thinking": false,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+    },
+    {
+      "name": "no generation prompt",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "add_generation_prompt": false,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n"
+    },
+    {
+      "name": "thinking kept after the last user turn only",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": "The user greets.\n"
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello again.",
+            "reasoning_content": "The user repeats."
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>Hello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n<think>The user repeats.</think>Hello again.<|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "thinking kept in every turn",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": "The user greets.\n"
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello again.",
+            "reasoning_content": "The user repeats."
+          },
+          {
+            "role": "user",
+            "content": "One more."
+          }
+        ],
+        "add_generation_prompt": true,
+        "preserve_thinking": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>The user greets.\n</think>Hello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n<think>The user repeats.</think>Hello again.<|im_end|>\n<|im_start|>user\nOne more.<|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "thinking inside the content",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nGreet back.\n</think>\n\nHello!"
+          },
+          {
+            "role": "user",
+            "content": "Bye"
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>Hello!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "content parts",
+      "vars": {
+        "messages": [
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "Be brief."
+              },
+              {
+                "type": "text",
+                "text": "No lists."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "서울 날씨? ☃ \"quoted\" <b>"
+              },
+              {
+                "type": "image",
+                "image": "x"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>system\nBe brief.No lists.<|im_end|>\n<|im_start|>user\n서울 날씨? ☃ \"quoted\" <b><|vision_start|><|image|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "tools and a user turn",
+      "vars": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Weather in Seoul?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. 서울."
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>system\nYou are terse.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. 서울.\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Seoul?<|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "a tool call and its answer",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather in Seoul?"
+          },
+          {
+            "role": "assistant",
+            "content": "Checking.",
+            "tool_calls": [
+              {
+                "id": "c",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": {
+                    "location": "서울",
+                    "days": 3,
+                    "detail": {
+                      "hourly": true,
+                      "n": [
+                        1,
+                        2.5,
+                        null
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "{\"temp\": 21}"
+          },
+          {
+            "role": "assistant",
+            "content": "21 degrees."
+          },
+          {
+            "role": "user",
+            "content": "Thanks."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. 서울."
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. 서울.\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Seoul?<|im_end|>\n<|im_start|>assistant\n<think></think>Checking.<tool_call>\n<function=get_weather>\n<parameter=location>\n서울\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=detail>\n{\"hourly\": true, \"n\": [1, 2.5, null]}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>21 degrees.<|im_end|>\n<|im_start|>user\nThanks.<|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "two calls, two answers",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather and time in Seoul?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "c",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": {
+                    "location": "Seoul"
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "21"
+          },
+          {
+            "role": "tool",
+            "content": "12:00"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. 서울."
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": true,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. 서울.\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools><|im_end|>\n<|im_start|>user\nWeather and time in Seoul?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=location>\nSeoul\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n21\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+    },
+    {
+      "name": "a string argument value",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Note."
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "c",
+                "type": "function",
+                "function": {
+                  "name": "save",
+                  "arguments": {
+                    "text": "a\nb",
+                    "n": 1,
+                    "ok": false
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": false,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nNote.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=save>\n<parameter=text>\na\nb\n</parameter>\n<parameter=n>\n1\n</parameter>\n<parameter=ok>\nfalse\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+    },
+    {
+      "name": "the final message continues",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Count."
+          },
+          {
+            "role": "assistant",
+            "content": "1, 2, CONTINUE_FINAL_MESSAGE_TAG "
+          }
+        ],
+        "add_generation_prompt": false,
+        "bos_token": "<|startoftext|>"
+      },
+      "prompt": "<|startoftext|><|im_start|>user\nCount.<|im_end|>\n<|im_start|>assistant\n<think></think>1, 2, CONTINUE_FINAL_MESSAGE_TAG <|im_end|>\n"
+    },
+    {
+      "name": "JSON-encoded arguments are refused",
+      "vars": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "c",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": "{\"tz\": \"UTC\"}"
+                }
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": false,
+        "bos_token": "<|startoftext|>"
+      },
+      "error": "TemplateError: Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template"
+    }
+  ]
+}

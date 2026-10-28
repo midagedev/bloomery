@@ -23,6 +23,8 @@ pub enum MixerKind {
     DeltaRule,
     /// A Mamba-2 mixer.
     Mamba2,
+    /// A gated short-convolution mixer.
+    ShortConv,
     /// This layer has no token mixer.
     None,
 }
@@ -47,6 +49,8 @@ pub enum ResidualKind {
     /// The plain stream with each sub-layer's input and output scaled by its
     /// own learned constants.
     AlphaBeta,
+    /// The plain stream with each sub-layer's output weight-normed before it joins.
+    Sandwich,
 }
 
 /// One layer's sub-layer programs.
@@ -67,6 +71,7 @@ impl Layer {
                 Mixer::Latent(_) => MixerKind::Latent,
                 Mixer::DeltaRule(_) => MixerKind::DeltaRule,
                 Mixer::Mamba2(_) => MixerKind::Mamba2,
+                Mixer::ShortConv(_) => MixerKind::ShortConv,
                 Mixer::None => MixerKind::None,
             },
             ffn: match spec.ffn {
@@ -77,6 +82,7 @@ impl Layer {
                 Residual::Plain => ResidualKind::Plain,
                 Residual::Hc => ResidualKind::Hc,
                 Residual::AlphaBeta { .. } => ResidualKind::AlphaBeta,
+                Residual::Sandwich { .. } => ResidualKind::Sandwich,
             },
         }
     }
@@ -134,7 +140,7 @@ mod tests {
     use crate::state::{Store, StoreRule, every_position, stores};
     use models::{
         Act, DeltaKind, DeltaRule, KdaGate, Latent, LatentOut, LatentUp, Moe, OutGate, PoolRule,
-        Router, Score, Selector, Shared,
+        Router, Score, Selector, Shared, ShortConv,
     };
 
     /// GLM-5.3-Flash's 45 trunk layers as `glm5next_meta.rs`'s `VIEW` pins
@@ -233,6 +239,32 @@ mod tests {
             );
             assert_eq!(k.host_leg(), l >= 3, "layer {l}");
         }
+    }
+
+    /// A short-conv layer under sandwich norms is its own program kind on both axes. Mutant: an
+    /// arm mapping either to a neighbour's kind.
+    #[test]
+    fn a_short_conv_layer_is_its_own_kind() {
+        let s = LayerSpec {
+            mixer: Mixer::ShortConv(ShortConv { taps: 3 }),
+            ffn: Ffn::Dense {
+                ff: 8192,
+                act: Act::SwiGlu { limit: None },
+            },
+            residual: Residual::Sandwich {
+                eps: 1e-5,
+                add: [1.0, 1.0],
+            },
+            extras: Vec::new(),
+        };
+        assert_eq!(
+            Layer::of(&s),
+            Layer {
+                mixer: MixerKind::ShortConv,
+                ffn: FfnKind::Dense,
+                residual: ResidualKind::Sandwich
+            }
+        );
     }
 
     /// The host tier serves GLM's routing layers, 3 to 44; a dense layer

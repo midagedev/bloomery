@@ -16,8 +16,8 @@ use gguf::Split;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, llama, mimo2, minimaxm3,
-    musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
+    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, lfm3, llama, mimo2,
+    minimaxm3, musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
 
@@ -202,6 +202,14 @@ pub static ROWS: &[ArchRow] = &[
         arch: None,
         names: &["llama"],
         read: Some(llama::spec::read),
+        draft: None,
+        fixture: None,
+    },
+    ArchRow {
+        // No `Arch` variant: no program runs the file yet.
+        arch: None,
+        names: &["lfm3"],
+        read: Some(lfm3::spec::read),
         draft: None,
         fixture: None,
     },
@@ -396,6 +404,7 @@ mod tests {
             a if QWEN35_BODY.contains(&a) => qwen35moe::spec::read,
             "glm5next" | GLM5_NEXT_LLAMA_CPP => glm5next::spec::read,
             "llama" => llama::spec::read,
+            "lfm3" => lfm3::spec::read,
             "mimo2" => mimo2::spec::read,
             "minimax-m3" => minimaxm3::spec::read,
             "raon1" => raon1::spec::read,

@@ -1205,6 +1205,7 @@ mod gate {
                 MixerKind::Latent => ("kqv_2d", "kqv_out"),
                 MixerKind::Gqa => return Err(format!("layer {l}: a GQA mixer").into()),
                 MixerKind::Mamba2 => return Err(format!("layer {l}: a Mamba-2 mixer").into()),
+                MixerKind::ShortConv => return Err(format!("layer {l}: a short-conv mixer").into()),
                 MixerKind::None => return Err(format!("layer {l}: no token mixer").into()),
             };
             let gap_y = quant_gap(&tap(man, &format!("{y_name}-{l}"))?);

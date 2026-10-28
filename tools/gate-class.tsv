@@ -195,6 +195,7 @@ gate-levers	common		lever	levers
 gate-device	common		device	device_seam
 gate-gpu-device	common		device	device_seam
 gate-llama-meta	family	llama	meta	arch_registry
+gate-lfm3-meta	family	lfm3	meta	arch_registry
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-minimax31-folder	family	minimax-m3	by-hand	arch_registry
 gate-model-hf	common		host	arch_registry+checkpoint_folder

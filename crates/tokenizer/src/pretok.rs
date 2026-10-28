@@ -100,6 +100,12 @@
 //! token is that token, and merges do not run on it. [`Pre::ignore_merges`]
 //! carries the flag for any pre, so the two names do not share a variant.
 //!
+//! A Hugging Face `tokenizer.json` of this name (Llama 3's and its descendants': a `Split` on this
+//! regex, `Isolated`, then `ByteLevel` without a regex of its own, and `model.ignore_merges` true)
+//! runs it with Oniguruma, as qwen2's: Unicode case folds in `(?i:...)` and Unicode 14.0's
+//! classes. [`Pre::PixtralHf`] is that reading, qwen2's with the run of numbers cut in threes, for
+//! a vocabulary that declares itself a Hugging Face one.
+//!
 //! ## minimax-m2
 //!
 //! The reference maps `minimax-m2` to its MINIMAX_M2 type, which shares GPT4O's
@@ -321,7 +327,8 @@ fn match_tail(
 /// the first of the alternatives that matches, under ECMAScript semantics (alternatives in order,
 /// greedy quantifiers that back off). None of them can match the empty string, and a mark is a
 /// plain codepoint of its own class here: the regex runs on the collapsed bytes. `fold(k)` is the
-/// lowercase ASCII letter the codepoint at `k` matches in a contraction.
+/// lowercase ASCII letter the codepoint at `k` matches in a contraction; `digits` is the longest
+/// run of numbers one word holds (`\p{N}` is 1, `\p{N}{1,3}` is 3).
 fn match_qwen(
     c: &[u8],
     i: usize,
@@ -329,6 +336,7 @@ fn match_qwen(
     fold: impl Fn(usize) -> u8,
     word: impl Fn(u8) -> bool + Copy,
     other: impl Fn(u8) -> bool,
+    digits: usize,
 ) -> usize {
     // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
     let n = contraction(c, i, hi, fold);
@@ -349,9 +357,9 @@ fn match_qwen(
         return n;
     }
 
-    // `\p{N}` (one number, however long the run), ` ?[^\s<word>\p{N}]+[\r\n]*` and
+    // `\p{N}` or `\p{N}{1,3}` (up to `digits` numbers), ` ?[^\s<word>\p{N}]+[\r\n]*` and
     // `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_tail(c, i, hi, 1, other, is_newline)
+    match_tail(c, i, hi, digits, other, is_newline)
 }
 
 /// Regex 3 at `i`: the first of its six alternatives that matches.
@@ -604,6 +612,11 @@ pub(crate) enum Pre {
     /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
     Pixtral,
+    /// `pixtral` as a Hugging Face `tokenizer.json` runs it: contractions fold case by Unicode,
+    /// classes are Unicode 14.0's, and BPE skips a byte its vocabulary lacks; a word that is itself
+    /// a token is still taken whole. Never named in a header; a vocabulary with
+    /// `tokenizer.bloomery.eog_token_ids` gets it.
+    PixtralHf,
     /// `minimax-m2`: GPT4O's one regex, run as a regex over the collapsed text.
     MiniMaxM2,
     /// `gpt-4o`: [`Pre::MiniMaxM2`]'s regex under the name of a tree whose UTF-8 reader is the
@@ -624,7 +637,7 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 13] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 14] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -633,6 +646,7 @@ impl Pre {
         ("glm4", Pre::Glm4),
         ("qwen35", Pre::Qwen35),
         ("pixtral", Pre::Pixtral),
+        ("lfm2", Pre::Pixtral),
         ("minimax-m2", Pre::MiniMaxM2),
         ("gpt-4o", Pre::Gpt4o),
         ("gemma4", Pre::Gemma4),
@@ -646,6 +660,7 @@ impl Pre {
         match self {
             Pre::Qwen2 => Some(Pre::Qwen2Hf),
             Pre::Qwen35 => Some(Pre::Qwen35Hf),
+            Pre::Pixtral => Some(Pre::PixtralHf),
             Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
             _ => None,
         }
@@ -662,9 +677,9 @@ impl Pre {
     }
 
     /// Whether a word that is itself a vocabulary token is taken whole,
-    /// before merges. Any pre can carry it; `pixtral` does.
+    /// before merges. Any pre can carry it; `pixtral` does, in either reading.
     pub(crate) fn ignore_merges(self) -> bool {
-        matches!(self, Pre::Pixtral)
+        matches!(self, Pre::Pixtral | Pre::PixtralHf)
     }
 
     /// Whether the reference NFC-normalizes the text before this pre-tokenizer whatever the
@@ -693,6 +708,7 @@ impl Pre {
             | Pre::Qwen2Hf
             | Pre::MiniMaxM2Hf
             | Pre::Pixtral
+            | Pre::PixtralHf
             | Pre::MiniMaxM2
             | Pre::Gpt4o
             | Pre::Raon
@@ -706,7 +722,7 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf | Pre::Qwen2Hf => collapse_hf,
+        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::PixtralHf => collapse_hf,
         Pre::MiniMaxM2Hf => collapse_cased,
         _ => collapse,
     };
@@ -724,7 +740,8 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::Qwen35 => split_qwen35(cpts, s, false),
         Pre::Qwen35Hf => split_qwen35(cpts, s, true),
-        Pre::Qwen2Hf => split_qwen2_hf(cpts, s),
+        Pre::Qwen2Hf => split_qwen2_hf(cpts, s, 1),
+        Pre::PixtralHf => split_qwen2_hf(cpts, s, 3),
         Pre::MiniMaxM2 | Pre::Gpt4o => split_minimax_m2::<M2Reference>(cpts, s),
         Pre::MiniMaxM2Hf => split_minimax_m2::<M2Hf>(cpts, s),
         Pre::Gemma4 => {
@@ -866,16 +883,25 @@ fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
             |k| fold_at(cpts, c, k, hf),
             is_letter_or_mark,
             is_other_qwen35,
+            1,
         )
     });
     &s.b
 }
 
-/// [`split`] for [`Pre::Qwen2Hf`]: the `qwen2` regex over the collapsed bytes, contractions folded
-/// as Hugging Face's.
-fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+/// [`split`] for [`Pre::Qwen2Hf`] (`digits` 1) and [`Pre::PixtralHf`] (`digits` 3): the `qwen2`
+/// regex, or its llama3 form, over the collapsed bytes, contractions folded as Hugging Face's.
+fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch, digits: usize) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
-        match_qwen(c, i, hi, |k| fold_at(cpts, c, k, true), is_letter, is_other)
+        match_qwen(
+            c,
+            i,
+            hi,
+            |k| fold_at(cpts, c, k, true),
+            is_letter,
+            is_other,
+            digits,
+        )
     });
     &s.b
 }
@@ -1045,6 +1071,15 @@ mod tests {
     #[test]
     fn solar_open_is_qwen2() {
         assert_eq!(crate::named(&Pre::NAMES, "solar-open"), Some(Pre::Qwen2));
+    }
+
+    /// `lfm2` runs the `pixtral` splitter: mainline maps `tokenizer.ggml.pre = lfm2` to its
+    /// Llama-3 expression with `ignore_merges`, which `pixtral` is here. LFM3's header spells it
+    /// so. FAIL-first: a row that names another splitter, or none, fails it.
+    #[test]
+    fn lfm2_is_pixtral() {
+        assert_eq!(crate::named(&Pre::NAMES, "lfm2"), Some(Pre::Pixtral));
+        assert!(crate::runs_pre_tokenizer("lfm2"));
     }
 
     /// `gpt-4o` is a row of its own (the UTF-8 reader of its tree is the strict one) that runs the
@@ -1320,6 +1355,30 @@ mod tests {
             assert_eq!(words(Pre::Qwen2Hf, text), hf, "hf {text:?}");
             assert_eq!(words(Pre::Qwen2, text), legacy, "qwen2 {text:?}");
         }
+    }
+
+    /// Hugging Face's llama3 regex is qwen2's with up to three numbers a word: it folds a
+    /// contraction's case and classes the codepoints as its qwen2 reading does, and cuts a run of
+    /// numbers into words of three from its start.
+    ///
+    /// FAIL-first: with the ASCII fold for both, the first row fails; with the reference's classes
+    /// for both, the next two; with one number a word, the last two.
+    #[test]
+    fn pixtral_hf_cases() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              hf                        pixtral
+            ("x'\u{17f}y", &["x", "'\u{17f}", "y"], &["x", "'\u{17f}y"]),
+            (" \u{1d2c0}", &[" \u{1d2c0}"], &[" ", "\u{1d2c0}"]),
+            ("x\u{11f04}", &["x", "\u{11f04}"], &["x\u{11f04}"]),
+            ("1234567", &["123", "456", "7"], &["123", "456", "7"]),
+            (" 12345", &[" ", "123", "45"], &[" ", "123", "45"]),
+        ];
+        for &(text, hf, legacy) in cases {
+            assert_eq!(words(Pre::PixtralHf, text), hf, "hf {text:?}");
+            assert_eq!(words(Pre::Pixtral, text), legacy, "pixtral {text:?}");
+        }
+        assert!(Pre::PixtralHf.ignore_merges());
+        assert_eq!(Pre::Pixtral.hf_reading(), Some(Pre::PixtralHf));
     }
 
     /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus

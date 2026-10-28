@@ -377,7 +377,7 @@ pub fn kind_of(s: &LayerSpec, l: usize) -> Result<Kind35, ChainError> {
             Kind35::Gqa(kind, flash)
         }
         Mixer::DeltaRule(d) => Kind35::Delta(delta_shape(d).map_err(refuse)?),
-        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
+        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::ShortConv(_) | Mixer::None) => {
             return Err(refuse(format!(
                 "{}, which no kernel here runs",
                 other.what()
@@ -454,10 +454,11 @@ pub const HEAD_128: u32 = 128;
 
 /// The attention class `g`'s geometry selects, or why none does: the class
 /// table's row ([`GqaKind::CLASSES`]) of its head width, the values the rope
-/// turns, how it pairs them, its head norm and its output gate, with no yarn,
-/// output norm, key selection, window, sinks or value scale.
+/// turns, how it pairs them, its head norm and its output gate, with no yarn or rope
+/// factors, output norm, key selection, window, sinks or value scale.
 pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
     let plain = g.rope.yarn.is_none()
+        && !g.rope.factors
         && !g.o_norm
         && g.select.is_none()
         && g.window.is_none()
@@ -495,7 +496,7 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
                 .collect();
             Err(format!(
                 "attention {g:?}; the kernels take {} (NEOX by IMROPE sections covering them), \
-                 with no output norm, key selection, window, sinks or value scale",
+                 with no rope factors, output norm, key selection, window, sinks or value scale",
                 classes.join(" or ")
             ))
         }
@@ -663,6 +664,7 @@ pub(crate) mod fixtures {
                 dims: q35::ROPE_DIMS,
                 base: 1e7,
                 yarn: None,
+                factors: false,
             },
             qk_norm: true,
             o_norm: false,
@@ -730,6 +732,7 @@ pub(crate) mod fixtures {
                 dims: 128,
                 base: 1e7,
                 yarn: None,
+                factors: false,
             },
             qk_norm: true,
             o_norm: false,
@@ -943,6 +946,7 @@ mod tests {
                     dims: 128,
                     base: 1.2e8,
                     yarn: None,
+                    factors: false,
                 },
                 qk_norm: false,
                 o_norm: false,
@@ -961,7 +965,7 @@ mod tests {
             assert_eq!(got, [Kind35::Gqa(norm, flash)], "{heads}/{kv_heads}");
         }
         type Misfit<'a> = (&'a str, u32, &'a dyn Fn(&mut Gqa));
-        let misfits: [Misfit; 8] = [
+        let misfits: [Misfit; 9] = [
             ("a NEOX turn", 8, &|g: &mut Gqa| {
                 g.rope.mode = RopeMode::Neox
             }),
@@ -971,6 +975,9 @@ mod tests {
                 g.out_gate = OutGate::Packed
             }),
             ("a rope over 64 values", 8, &|g: &mut Gqa| g.rope.dims = 64),
+            ("a rope with frequency factors", 8, &|g: &mut Gqa| {
+                g.rope.factors = true
+            }),
             ("no rope", 8, &|g: &mut Gqa| g.rope.mode = RopeMode::None),
             ("a group of 5", 5, &|_: &mut Gqa| {}),
             ("a head of 64", 8, &|g: &mut Gqa| {

@@ -90,6 +90,7 @@ pub fn attn_args(l: usize, s: &LayerSpec, built: AttnBuilt) -> Result<AttnArgs, 
     }
     if g.rope.mode != RopeMode::Neox
         || g.rope.yarn.is_some()
+        || g.rope.factors
         || g.qk_norm
         || g.out_gate != OutGate::None
         || g.select.is_some()
@@ -97,7 +98,7 @@ pub fn attn_args(l: usize, s: &LayerSpec, built: AttnBuilt) -> Result<AttnArgs, 
         return Err(refuse(
             l,
             "a rope, norm, gate or selector the K192 append does not run (NEOX, no scaling, \
-             no QK norm, no output gate, no selector)"
+             no frequency factors, no QK norm, no output gate, no selector)"
                 .to_string(),
         ));
     }
@@ -342,6 +343,7 @@ mod tests {
                 dims: 64,
                 base,
                 yarn: None,
+                factors: false,
             },
             qk_norm: false,
             o_norm: false,

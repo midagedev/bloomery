@@ -3516,6 +3516,7 @@ mod tests {
                         dims: 8,
                         base: 1e4,
                         yarn: None,
+                        factors: false,
                     },
                     qk_norm: false,
                     o_norm: false,

@@ -105,6 +105,9 @@ pub enum Arch {
     /// A dense Llama: GQA layers with the pairwise (NORM) rope and a SwiGLU
     /// feed-forward block of `feed_forward_length`, on an untied head.
     Llama,
+    /// LFM3: gated short-conv layers and GQA layers (sliding or full) in one trunk, a dense
+    /// SwiGLU block in every layer, sandwich norms, a tied head.
+    Lfm3,
 }
 
 impl Arch {
@@ -132,6 +135,7 @@ impl Arch {
             Arch::Flint => "flint",
             Arch::MuseSpark => "muse-spark",
             Arch::Llama => "llama",
+            Arch::Lfm3 => "lfm3",
         }
     }
 }
@@ -209,6 +213,8 @@ pub enum Mixer {
     /// A Mamba-2 mixer: a short conv, then a selective scan of [`Mamba2::n_heads`]
     /// heads of [`Mamba2::head_dim`] values in [`Mamba2::n_groups`] groups.
     Mamba2(Mamba2),
+    /// A gated short convolution: `C ⊙ conv(B ⊙ x)` over the projection's three chunks.
+    ShortConv(ShortConv),
     /// This layer has no token mixer. Its feed-forward block is the layer.
     None,
 }
@@ -222,6 +228,7 @@ impl Mixer {
             Mixer::Latent(_) => "a latent-attention mixer",
             Mixer::DeltaRule(_) => "a delta-rule mixer",
             Mixer::Mamba2(_) => "a Mamba-2 mixer",
+            Mixer::ShortConv(_) => "a short-conv mixer",
             Mixer::None => "no token mixer",
         }
     }
@@ -245,6 +252,16 @@ pub struct Mamba2 {
     pub d_conv: u32,
     /// Input-projection columns: `2 * d_inner + 2 * n_groups * d_state + n_heads`.
     pub d_in_proj: u32,
+}
+
+/// A gated short-convolution mixer. The input projection writes three chunks of `hidden` values,
+/// `B | C | x` in that order; the mixer's output is `C ⊙ conv(B ⊙ x)`, the conv causal and
+/// depthwise (one filter of `taps` values per channel, the oldest tap first), with no bias and
+/// no activation. The output projection follows outside the mixer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortConv {
+    /// `shortconv.l_cache`: the filter's taps, the current position's among them.
+    pub taps: u32,
 }
 
 /// Grouped-query attention.
@@ -286,8 +303,12 @@ pub enum OutGate {
     None,
     /// `attn_q` also writes a per-head gate beside the query, interleaved with it.
     Packed,
-    /// A projection of the layer input of its own (`attn_gate`).
+    /// A projection of the layer input of its own (`attn_gate`), one value per query-head
+    /// channel.
     Proj,
+    /// A projection of the layer input of its own (`attn_gate`) with one value per query head:
+    /// a head's gate multiplies every value of that head alike.
+    ProjHead,
 }
 
 impl Gqa {
@@ -316,8 +337,8 @@ pub struct Latent {
     /// (`qk_rope_head_dim` of a model that rotates none). 0: the row is the latent alone.
     pub pe: u32,
     /// The gate on the heads' outputs before the output projection; [`OutGate::Proj`] is a
-    /// projection of the layer input of its own (`attn_gate`). [`OutGate::Packed`] is not a
-    /// latent layer's.
+    /// projection of the layer input of its own (`attn_gate`). [`OutGate::Packed`] and
+    /// [`OutGate::ProjHead`] are not a latent layer's.
     pub out_gate: OutGate,
     pub out: LatentOut,
     /// The raw positions attended; `None`: every position.
@@ -531,6 +552,10 @@ pub struct Rope {
     pub base: f32,
     /// `None`: plain rope.
     pub yarn: Option<Yarn>,
+    /// `rope_freqs.weight`, `dims / 2` factors: pair `i`'s frequency is divided by factor `i`
+    /// (ggml's `freq_factors`), so a pair with a very large factor turns nothing; `false`: no
+    /// factors.
+    pub factors: bool,
 }
 
 /// How a rope pairs a head's values.
@@ -705,6 +730,13 @@ pub enum Residual {
     /// and α² + β² = 1 per channel, resolved at conversion.
     AlphaBeta {
         eps: f32,
+    },
+    /// Each sublayer's output goes through its own weighted RMS norm at `eps` before it joins
+    /// the stream: `x += add[i] · gain ⊙ rms_norm(out)`, `i` 0 for the mixer (`post_attention_norm`)
+    /// and 1 for the feed-forward block (`post_ffw_norm`).
+    Sandwich {
+        eps: f32,
+        add: [f32; 2],
     },
 }
 

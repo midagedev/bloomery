@@ -231,6 +231,7 @@ pub(crate) fn layer_spec(
                 dims: spec_u32(rope_key, a.rope_dims)?,
                 base: a.rope_base,
                 yarn: None,
+                factors: false,
             },
             qk_norm: true,
             o_norm: false,

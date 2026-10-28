@@ -1621,6 +1621,7 @@ mod tests {
                     dims: 16,
                     base: 10_000.0,
                     yarn: None,
+                    factors: false,
                 },
                 qk_norm: true,
                 o_norm: false,

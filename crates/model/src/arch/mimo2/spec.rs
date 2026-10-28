@@ -62,6 +62,7 @@ pub fn spec_of(
                     Kind::Swa => hp.rope_base_swa,
                 },
                 yarn: None,
+                factors: false,
             },
             qk_norm: false,
             o_norm: false,

@@ -41,6 +41,17 @@ pub(crate) fn model_level_role(name: &str) -> Option<(Role, Option<usize>)> {
     }
 }
 
+/// The rope's per-pair frequency factors (llama.cpp's `rope_freqs`), a model-level tensor of
+/// `rope.dimension_count / 2` values that only a family whose rope divides by them reads.
+pub(crate) const ROPE_FREQS: &str = "rope_freqs.weight";
+
+/// The role of the rope's factors for a family that reads them: [`Role::Unread`], on no layer. The
+/// load reads its few values once, by name, into the rope table the layers turn by; no step reads
+/// the tensor, and the placement holds no bytes for it. `None` for any other name.
+pub(crate) fn rope_freqs_role(name: &str) -> Option<(Role, Option<usize>)> {
+    (name == ROPE_FREQS).then_some((Role::Unread, None))
+}
+
 /// A `blk.{layer}.{stem}` name as its layer and stem; `None` for any other name and for a layer
 /// not below `n_layer`.
 pub(crate) fn block_stem(name: &str, n_layer: usize) -> Option<(usize, &str)> {
@@ -267,6 +278,13 @@ mod tests {
         }
         assert_eq!(model_level_role("blk.0.attn_q.weight"), None);
         assert_eq!(model_level_role("rope_freqs.weight"), None);
+        assert_eq!(
+            super::rope_freqs_role("rope_freqs.weight"),
+            Some((Role::Unread, None))
+        );
+        for name in ["rope_freqs", "blk.0.rope_freqs.weight", "token_embd.weight"] {
+            assert_eq!(super::rope_freqs_role(name), None, "{name}");
+        }
         assert_eq!(
             block_stem("blk.47.attn_q.weight", 48),
             Some((47, "attn_q.weight"))

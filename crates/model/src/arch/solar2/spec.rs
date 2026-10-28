@@ -151,7 +151,8 @@ mod tests {
                             mode: RopeMode::None,
                             dims: 0,
                             base: 0.0,
-                            yarn: None
+                            yarn: None,
+                            factors: false,
                         }
                     );
                     assert_eq!(g.out_gate, OutGate::Proj);

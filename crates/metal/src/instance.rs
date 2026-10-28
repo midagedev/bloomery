@@ -446,10 +446,16 @@ impl Key {
         for (layer, (mixer, ffn)) in layers.into_iter().enumerate() {
             match mixer {
                 Mixer::Gqa(g) => {
-                    if g.out_gate == OutGate::Proj {
+                    if matches!(g.out_gate, OutGate::Proj | OutGate::ProjHead) {
                         return Err(Refused::Kind {
                             layer,
                             what: "an attention output gate on its own projection",
+                        });
+                    }
+                    if g.rope.factors {
+                        return Err(Refused::Kind {
+                            layer,
+                            what: "a rope with frequency factors",
                         });
                     }
                     let row = shape::select_gqa(AttnShape::of(g))
@@ -608,6 +614,7 @@ mod tests {
                 dims: rot,
                 base: 10_000_000.0,
                 yarn: None,
+                factors: false,
             },
             qk_norm: true,
             o_norm: false,

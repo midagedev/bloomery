@@ -1462,6 +1462,14 @@ gate-qwen35moe-meta:
 gate-llama-meta:
     BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::llama --nocapture && bash tools/gate.sh --release -p bloomery-model --test llama_meta -- --ignored --nocapture'
 
+# lfm3 (LFM3-1.7B Q4_K_M) header gate: the reader's refusals on synthetic headers (a missing key, a wrong conv width, a wrong layer
+# pattern, a rope factor table of the wrong length or type, a missing or unclaimed tensor), the roles and the store bytes of each
+# layer kind, then what the reader resolves from the real file (the description line by line, the coverage list naming each part
+# no program runs, the rope factors' 32 x 1 and 32 x 1e30). Headers only, seconds. No program runs the description yet, so the
+# coverage list is printed and its new parts pinned, not empty. No fixture-tier conversion: the file is the fixture (`self`).
+gate-lfm3-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::lfm3 arch::classify --nocapture && bash tools/gate.sh --release -p bloomery-model --test lfm3_meta -- --ignored --nocapture'
+
 # Cache append safety contracts and model-less plane/ring writer refusals.
 gate-gpu-rope-writers:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'

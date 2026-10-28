@@ -2621,6 +2621,7 @@ mod tests {
                 dims: rope_dims,
                 base: 1e7,
                 yarn: None,
+                factors: false,
             },
             qk_norm: false,
             o_norm: false,
@@ -3412,6 +3413,7 @@ mod tests {
                             dims: 64,
                             base: 1e7,
                             yarn: None,
+                            factors: false,
                         },
                         qk_norm: true,
                         o_norm: false,
@@ -3808,6 +3810,7 @@ mod tests {
                 dims: 64,
                 base: 1e7,
                 yarn: None,
+                factors: false,
             };
             let gdn = Mixer::DeltaRule(DeltaRule {
                 kind: DeltaKind::Gdn {

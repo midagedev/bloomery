@@ -616,6 +616,7 @@ pub fn mixer_terms(
         ]),
         MixerKind::Gqa => Err(format!("layer {l}: a GQA mixer").into()),
         MixerKind::Mamba2 => Err(format!("layer {l}: a Mamba-2 mixer").into()),
+        MixerKind::ShortConv => Err(format!("layer {l}: a short-conv mixer").into()),
         MixerKind::None => Err(format!("layer {l}: no token mixer").into()),
     }
 }

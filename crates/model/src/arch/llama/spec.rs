@@ -49,6 +49,7 @@ pub(crate) fn spec_of(
         dims: spec_u32("rope.dimension_count", hp.rope.dims)?,
         base: hp.rope.base,
         yarn: None,
+        factors: false,
     };
     let heads = spec_u32("attention.head_count", hp.n_head)?;
     let kv_heads = spec_u32("attention.head_count_kv", hp.n_head_kv)?;

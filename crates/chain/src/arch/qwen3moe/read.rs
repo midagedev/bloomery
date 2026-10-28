@@ -44,7 +44,7 @@ impl PlanDims {
         let gate = match g.out_gate {
             OutGate::None => 1,
             OutGate::Packed => 2,
-            OutGate::Proj => {
+            OutGate::Proj | OutGate::ProjHead => {
                 return Err(ChainError::shape(
                     what,
                     "an output gate projected on its own (`attn_gate`), which no attention site \

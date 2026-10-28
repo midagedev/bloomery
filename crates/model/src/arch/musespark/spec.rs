@@ -101,6 +101,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                     },
                     base: if sliding { hp.rope_base } else { 0.0 },
                     yarn: None,
+                    factors: false,
                 },
                 qk_norm: true,
                 o_norm: true,

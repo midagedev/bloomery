@@ -86,6 +86,7 @@ pub fn spec_of(
         dims: spec_u32("rope.dimension_count", hp.rope_dims)?,
         base: hp.rope_base,
         yarn: None,
+        factors: false,
     };
     let layers = (0..hp.n_trunk)
         .map(|l| {

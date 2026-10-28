@@ -25,7 +25,13 @@ fn rope(r: &Rope) -> String {
             y.factor, y.orig_ctx, y.beta_fast, y.beta_slow
         )
     });
-    format!("{:?} {} base {} yarn {yarn}", r.mode, r.dims, r.base)
+    // The factors join the text only where the rope has them, so every attached model's pins keep
+    // theirs.
+    let factors = if r.factors { " factors" } else { "" };
+    format!(
+        "{:?} {} base {} yarn {yarn}{factors}",
+        r.mode, r.dims, r.base
+    )
 }
 
 fn act(a: &Act) -> String {
@@ -149,6 +155,9 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                 m.d_inner, m.d_state, m.n_heads, m.head_dim, m.n_groups, m.d_conv, m.d_in_proj
             );
         }
+        Mixer::ShortConv(c) => {
+            let _ = write!(o, "shortconv taps {}", c.taps);
+        }
         Mixer::None => o.push_str("none"),
     }
     match &layer.ffn {
@@ -196,6 +205,7 @@ pub fn layer_line(layer: &LayerSpec) -> String {
             Residual::Plain => "plain",
             Residual::Hc => "hc",
             Residual::AlphaBeta { .. } => "alpha-beta",
+            Residual::Sandwich { .. } => "sandwich",
         },
         if layer.extras.is_empty() {
             String::new()

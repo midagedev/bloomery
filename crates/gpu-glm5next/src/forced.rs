@@ -114,6 +114,7 @@ impl Body {
             MixerKind::Latent => mla::mla(gpu, w, &mut p, l)?,
             MixerKind::Gqa => return Err(shape(format!("layer {l}: a GQA mixer"))),
             MixerKind::Mamba2 => return Err(shape(format!("layer {l}: a Mamba-2 mixer"))),
+            MixerKind::ShortConv => return Err(shape(format!("layer {l}: a short-conv mixer"))),
             MixerKind::None => return Err(shape(format!("layer {l}: no token mixer"))),
         }
         let mix_out = p.s.out.to_host_vec(stream)?;

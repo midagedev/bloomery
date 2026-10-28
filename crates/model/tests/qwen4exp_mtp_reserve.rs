@@ -55,6 +55,7 @@ fn description() -> ModelSpec {
         dims: 64,
         base: 1e7,
         yarn: None,
+        factors: false,
     };
     let gdn = Mixer::DeltaRule(DeltaRule {
         kind: DeltaKind::Gdn {
@@ -236,6 +237,7 @@ fn draft() -> MtpDraft {
                     dims: 64,
                     base: 1e7,
                     yarn: None,
+                    factors: false,
                 },
                 qk_norm: true,
                 o_norm: false,

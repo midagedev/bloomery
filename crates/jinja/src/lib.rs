@@ -4671,17 +4671,17 @@ mod tests {
 
     const RAON: &str = include_str!("../tests/fixtures/raon-chat-template.jinja");
     const RAON_RENDERS: &str = include_str!("../tests/fixtures/raon-renders.json");
+    const LFM3: &str = include_str!("../tests/fixtures/lfm3-chat-template.jinja");
+    const LFM3_RENDERS: &str = include_str!("../tests/fixtures/lfm3-renders.json");
 
-    /// Raon-1-mini's chat template renders as Python's jinja2 renders it in the Hugging Face
-    /// environment, byte for byte, on every case of `raon-renders.json`: the thinking spans (kept,
-    /// truncated from history, `enable_thinking` off), the content parts, the tool schemas and the
-    /// calls and their answers, and the template's own refusals by their texts.
-    #[test]
-    fn raon_template_renders_as_jinja2() {
-        let fixture: Value = serde_json::from_str(RAON_RENDERS).expect("fixture JSON");
+    /// `template` renders as Python's jinja2 renders it in the Hugging Face environment, byte for
+    /// byte, on each of the `count` cases of `renders` (a fixture's JSON): the prompt of a case
+    /// that renders, and the template's own refusals by their texts.
+    fn renders_as_jinja2(template: &str, renders: &str, count: usize) {
+        let fixture: Value = serde_json::from_str(renders).expect("fixture JSON");
         let cases = fixture["cases"].as_array().expect("cases");
-        assert_eq!(cases.len(), 18);
-        let t = ChatTemplate::parse(RAON).expect("the template parses");
+        assert_eq!(cases.len(), count);
+        let t = ChatTemplate::parse(template).expect("the template parses");
         for case in cases {
             let name = case["name"].as_str().expect("name");
             let Value::Object(vars) = case["vars"].clone() else {
@@ -4699,5 +4699,25 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    /// Raon-1-mini's chat template renders as Python's jinja2 renders it in the Hugging Face
+    /// environment, on every case of `raon-renders.json`: the thinking spans (kept, truncated from
+    /// history, `enable_thinking` off), the content parts, the tool schemas and the calls and
+    /// their answers, and the template's own refusals by their texts.
+    #[test]
+    fn raon_template_renders_as_jinja2() {
+        renders_as_jinja2(RAON, RAON_RENDERS, 18);
+    }
+
+    /// LFM3-1.7B's chat template (the GGUF's own, which teaches the `<tool_call>` markup of
+    /// `ToolFormat::QwenXml` and the `<think>` span) renders as Python's jinja2 renders it in the
+    /// Hugging Face environment, on every case of `lfm3-renders.json`: the thinking spans (kept
+    /// after the last user turn, kept in every turn, off), the content parts, the tool schemas, one
+    /// call, two calls, a string argument value, the continued final message, and the refusal of
+    /// JSON-encoded arguments by its text.
+    #[test]
+    fn lfm3_template_renders_as_jinja2() {
+        renders_as_jinja2(LFM3, LFM3_RENDERS, 13);
     }
 }
