@@ -1,7 +1,7 @@
 // Decode attention for one grouped-query layer at the instance's geometry:
-// BLOOMERY_ATTN_Q query heads over BLOOMERY_ATTN_KV key heads, eight a key
-// head, BLOOMERY_ATTN_HEAD values a head. A threadgroup is one (key head,
-// segment) of eight SIMD groups; each SIMD group holds one query head, and
+// BLOOMERY_ATTN_Q query heads over BLOOMERY_ATTN_KV key heads, BLOOMERY_ATTN_GQA
+// a key head, BLOOMERY_ATTN_HEAD values a head. A threadgroup is one (key head,
+// segment) of BLOOMERY_ATTN_GQA SIMD groups; each SIMD group holds one query head, and
 // its 32 lanes split the head, BLOOMERY_ATTN_LANE_DIMS dims a lane (8 at
 // head 256, 4 at head 128). The segment's keys stream from the cache
 // straight into registers, one lane word a key a lane (16 bytes at 8 dims,
@@ -41,6 +41,12 @@
 // fold adds the segments' partials in ascending segment order. The value
 // sum is one fma a key in key order, per dim.
 //
+// A tile loop holds no branch on a key's liveness: a key past the segment's
+// end is a zero row, scores -infinity and weighs exactly 0, so the tile's
+// sixteen keys are one straight line the compiler schedules together. The
+// next tile's rows are fetched into registers before the arithmetic on this
+// tile and stored to threadgroup memory after it.
+//
 // The rows launches run a chunk of causal queries. attn_norm_rope_rows appends
 // row r's key and value at position from + r, by the same append the decode
 // flash runs, one SIMD group a (key head, row). gqa256_flash_f16_rows is the
@@ -67,9 +73,9 @@
 #pragma METAL fp contract(off)
 
 static_assert(BLOOMERY_ATTN_GQA == BLOOMERY_ATTN_Q / BLOOMERY_ATTN_KV,
-              "eight query heads share a key head");
+              "a key head's query heads are the group");
 static_assert(BLOOMERY_ATTN_HPT * BLOOMERY_ATTN_SG == BLOOMERY_ATTN_GQA,
-              "eight groups of one head cover a key head");
+              "the SIMD groups of one head each cover a key head");
 static_assert(BLOOMERY_ATTN_PARTIAL == BLOOMERY_ATTN_HEAD + 2u,
               "a partial is the max, the weight sum and the head");
 static_assert(BLOOMERY_ATTN_GATED == 0u || BLOOMERY_ATTN_GATED == 1u,
@@ -77,13 +83,15 @@ static_assert(BLOOMERY_ATTN_GATED == 0u || BLOOMERY_ATTN_GATED == 1u,
 static_assert(BLOOMERY_ATTN_QG == BLOOMERY_ATTN_HEAD * (1u + BLOOMERY_ATTN_GATED),
               "a query head is the query and then the gate when the layer has one");
 static_assert(BLOOMERY_ATTN_THREADS == BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_SG,
-              "the flash threadgroup is eight SIMD groups");
+              "the flash threadgroup is the key head's SIMD groups");
 static_assert(BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_LANE_DIMS == BLOOMERY_ATTN_HEAD,
               "a lane's values cover the head");
 static_assert(BLOOMERY_ATTN_LANE_DIMS == 8u || BLOOMERY_ATTN_LANE_DIMS == 4u,
               "a lane word is 16 or 8 bytes of halves");
-static_assert(BLOOMERY_ATTN_Q * BLOOMERY_ATTN_HEAD == BLOOMERY_ATTN_THREADS * 16u,
-              "the folding group covers the heads at 16 dims a thread");
+static_assert(BLOOMERY_ATTN_LANES % BLOOMERY_ATTN_KV == 0u,
+              "the fold's threads a head divide the lanes of a SIMD group");
+static_assert(BLOOMERY_ATTN_Q * (BLOOMERY_ATTN_LANES / BLOOMERY_ATTN_KV) == BLOOMERY_ATTN_THREADS,
+              "the folding group is a thread to each head's share");
 static_assert(BLOOMERY_ATTN_HEAD % 64u == 0u &&
                   (BLOOMERY_ATTN_ROT / 2u <= BLOOMERY_ATTN_LANES ||
                    BLOOMERY_ATTN_ROT == BLOOMERY_ATTN_HEAD),
@@ -103,14 +111,18 @@ typedef uint2 attn_lane_word;
 #define ATTN_Q8_BLOCK_LANES (32u / BLOOMERY_ATTN_LANE_DIMS)
 #define ATTN_Q8_LANE_WORDS (BLOOMERY_ATTN_LANE_DIMS / 4u)
 
-// The fold's threads a head: 16 values each.
-#define ATTN_FOLD_SUBS (BLOOMERY_ATTN_HEAD / 16u)
+// The fold's threads a head, and the values each holds: a thread owns the
+// values sub, sub + SUBS, ... of its head, so a head's load or store is a run
+// of contiguous words across its threads.
+#define ATTN_FOLD_SUBS (BLOOMERY_ATTN_LANES / BLOOMERY_ATTN_KV)
+#define ATTN_FOLD_VALS (BLOOMERY_ATTN_HEAD / ATTN_FOLD_SUBS)
 
 // The flash's one shared block, in 16-byte words: the K and V f16 tiles,
-// or the fold's factors (two floats a segment a head, at the segment cap),
-// whichever is larger.
+// or the fold's factors (two floats a segment a head, at the segment cap,
+// then three floats a head), whichever is larger.
 #define ATTN_TILE_WORDS (BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_HEAD / 4u)
-#define ATTN_FACTOR_WORDS (BLOOMERY_ATTN_Q * BLOOMERY_ATTN_SEGMENT_CAP * 2u / 4u)
+#define ATTN_FACTOR_WORDS \
+    ((BLOOMERY_ATTN_Q * (BLOOMERY_ATTN_SEGMENT_CAP * 2u + 3u) + 3u) / 4u)
 #define ATTN_SHARED_WORDS \
     (ATTN_TILE_WORDS > ATTN_FACTOR_WORDS ? ATTN_TILE_WORDS : ATTN_FACTOR_WORDS)
 
@@ -456,24 +468,36 @@ inline void attn_commit_plain(device float *out, uint index, float attn) {
 }
 
 // The f16 cache. One tile of rows sits in threadgroup memory as lane
-// words: the group loads it once, cooperatively, and the eight SIMD groups
-// read it a head at a time. The lane's values of a tile row are one word.
-// A row past the live keys loads as zero bits, the value 0.0f.
+// words: the group loads it once, cooperatively, and the SIMD groups of the
+// key head read it a head at a time. The lane's values of a tile row are one
+// word. A row past the live keys loads as zero bits, the value 0.0f. A
+// thread's share of a tile is fetched into registers (`fetch`) and stored to
+// threadgroup memory (`commit`) in two steps, so the next tile's loads are in
+// flight while this tile's arithmetic runs.
+#define ATTN_F16_WORDS (BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_LANES)
+#define ATTN_F16_PENDING \
+    ((ATTN_F16_WORDS + BLOOMERY_ATTN_THREADS - 1u) / BLOOMERY_ATTN_THREADS)
+
 struct F16Cache {
     device ushort *k;
     device ushort *v;
     threadgroup attn_lane_word *tile_k;
     threadgroup attn_lane_word *tile_v;
 
-    void load(uint tid, uint kv, uint ctx, uint lo, uint hi) {
-        constexpr uint words = BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_LANES;
-        for (uint e = tid; e < words; e += BLOOMERY_ATTN_THREADS) {
+    struct Pending {
+        attn_lane_word k[ATTN_F16_PENDING];
+        attn_lane_word v[ATTN_F16_PENDING];
+    };
+
+    void fetch(uint tid, uint kv, uint ctx, uint lo, uint hi, thread Pending &pending) {
+        for (uint i = 0u; i < ATTN_F16_PENDING; ++i) {
+            uint e = tid + i * BLOOMERY_ATTN_THREADS;
             uint t = e / BLOOMERY_ATTN_LANES;
             uint c = e - t * BLOOMERY_ATTN_LANES;
             uint index = lo + t;
             attn_lane_word wk = 0u;
             attn_lane_word wv = 0u;
-            if (index < hi) {
+            if (e < ATTN_F16_WORDS && index < hi) {
                 uint row = kv * ctx + index;
                 const device attn_lane_word *pk =
                     (const device attn_lane_word *)(k + row * BLOOMERY_ATTN_HEAD);
@@ -482,8 +506,18 @@ struct F16Cache {
                 wk = pk[c];
                 wv = pv[c];
             }
-            tile_k[e] = wk;
-            tile_v[e] = wv;
+            pending.k[i] = wk;
+            pending.v[i] = wv;
+        }
+    }
+
+    void commit(uint tid, thread const Pending &pending) {
+        for (uint i = 0u; i < ATTN_F16_PENDING; ++i) {
+            uint e = tid + i * BLOOMERY_ATTN_THREADS;
+            if (e < ATTN_F16_WORDS) {
+                tile_k[e] = pending.k[i];
+                tile_v[e] = pending.v[i];
+            }
         }
     }
 
@@ -509,7 +543,15 @@ struct F16Cache {
 // The q8_0 cache, one tile in threadgroup memory: HEAD/4 code words and
 // HEAD/32 scales a row, low byte first. A row past the live keys loads as
 // zero codes and a zero scale, the value 0.0f. The lane's values sit in
-// its code words of one 32-value block.
+// its code words of one 32-value block. Fetched and committed as the f16
+// cache's tile is.
+#define ATTN_Q8_TILE_WORDS (BLOOMERY_ATTN_TILE * ATTN_Q8_ROW_WORDS)
+#define ATTN_Q8_TILE_SCALES (BLOOMERY_ATTN_TILE * ATTN_Q8_ROW_SCALES)
+#define ATTN_Q8_PENDING_WORDS \
+    ((ATTN_Q8_TILE_WORDS + BLOOMERY_ATTN_THREADS - 1u) / BLOOMERY_ATTN_THREADS)
+#define ATTN_Q8_PENDING_SCALES \
+    ((ATTN_Q8_TILE_SCALES + BLOOMERY_ATTN_THREADS - 1u) / BLOOMERY_ATTN_THREADS)
+
 struct Q8Cache {
     device uint *k_codes;
     device ushort *k_scales;
@@ -520,40 +562,60 @@ struct Q8Cache {
     threadgroup uint *tile_v_codes;
     threadgroup ushort *tile_v_scales;
 
-    void load(uint tid, uint kv, uint ctx, uint lo, uint hi) {
-        for (uint e = tid; e < BLOOMERY_ATTN_TILE * ATTN_Q8_ROW_WORDS; e += BLOOMERY_ATTN_THREADS) {
+    struct Pending {
+        uint k[ATTN_Q8_PENDING_WORDS];
+        uint v[ATTN_Q8_PENDING_WORDS];
+        ushort ks[ATTN_Q8_PENDING_SCALES];
+        ushort vs[ATTN_Q8_PENDING_SCALES];
+    };
+
+    void fetch(uint tid, uint kv, uint ctx, uint lo, uint hi, thread Pending &pending) {
+        for (uint i = 0u; i < ATTN_Q8_PENDING_WORDS; ++i) {
+            uint e = tid + i * BLOOMERY_ATTN_THREADS;
             uint t = e / ATTN_Q8_ROW_WORDS;
             uint c = e - t * ATTN_Q8_ROW_WORDS;
             uint index = lo + t;
-            uint w = 0u;
-            if (index < hi) {
-                w = k_codes[(kv * ctx + index) * ATTN_Q8_ROW_WORDS + c];
+            uint wk = 0u;
+            uint wv = 0u;
+            if (e < ATTN_Q8_TILE_WORDS && index < hi) {
+                uint at = (kv * ctx + index) * ATTN_Q8_ROW_WORDS + c;
+                wk = k_codes[at];
+                wv = v_codes[at];
             }
-            tile_k_codes[e] = w;
+            pending.k[i] = wk;
+            pending.v[i] = wv;
         }
-        for (uint e = tid; e < BLOOMERY_ATTN_TILE * ATTN_Q8_ROW_WORDS; e += BLOOMERY_ATTN_THREADS) {
-            uint t = e / ATTN_Q8_ROW_WORDS;
-            uint c = e - t * ATTN_Q8_ROW_WORDS;
-            uint index = lo + t;
-            uint w = 0u;
-            if (index < hi) {
-                w = v_codes[(kv * ctx + index) * ATTN_Q8_ROW_WORDS + c];
-            }
-            tile_v_codes[e] = w;
-        }
-        if (tid < BLOOMERY_ATTN_TILE * ATTN_Q8_ROW_SCALES) {
-            uint t = tid / ATTN_Q8_ROW_SCALES;
-            uint b = tid - t * ATTN_Q8_ROW_SCALES;
+        for (uint i = 0u; i < ATTN_Q8_PENDING_SCALES; ++i) {
+            uint e = tid + i * BLOOMERY_ATTN_THREADS;
+            uint t = e / ATTN_Q8_ROW_SCALES;
+            uint b = e - t * ATTN_Q8_ROW_SCALES;
             uint index = lo + t;
             ushort ks = 0u;
             ushort vs = 0u;
-            if (index < hi) {
+            if (e < ATTN_Q8_TILE_SCALES && index < hi) {
                 uint row = kv * ctx + index;
                 ks = k_scales[row * ATTN_Q8_ROW_SCALES + b];
                 vs = v_scales[row * ATTN_Q8_ROW_SCALES + b];
             }
-            tile_k_scales[tid] = ks;
-            tile_v_scales[tid] = vs;
+            pending.ks[i] = ks;
+            pending.vs[i] = vs;
+        }
+    }
+
+    void commit(uint tid, thread const Pending &pending) {
+        for (uint i = 0u; i < ATTN_Q8_PENDING_WORDS; ++i) {
+            uint e = tid + i * BLOOMERY_ATTN_THREADS;
+            if (e < ATTN_Q8_TILE_WORDS) {
+                tile_k_codes[e] = pending.k[i];
+                tile_v_codes[e] = pending.v[i];
+            }
+        }
+        for (uint i = 0u; i < ATTN_Q8_PENDING_SCALES; ++i) {
+            uint e = tid + i * BLOOMERY_ATTN_THREADS;
+            if (e < ATTN_Q8_TILE_SCALES) {
+                tile_k_scales[e] = pending.ks[i];
+                tile_v_scales[e] = pending.vs[i];
+            }
         }
     }
 
@@ -660,8 +722,12 @@ static void attn_prepare_q(thread const AttnArgs &args,
 }
 
 // Online softmax over this segment's tiles, the keys streamed a row a
-// lane. The running max, weight sum and values stay in registers. No
-// barrier: one SIMD group works one head over its own registers.
+// lane. The running max, weight sum and values stay in registers. A tile's
+// rows are stored to threadgroup memory after the previous tile's arithmetic
+// and read by the SIMD groups of the key head, which share no state: the
+// barriers are the tile's own. A key past the segment's live end (`hi`) is a
+// zero row: its score is -infinity and its weight exactly 0, so the loop has
+// no branch on a key and its dead fma adds an exact 0.
 template <typename Cache>
 static void attn_tile_loop(Cache cache,
                            thread const AttnArgs &args,
@@ -686,39 +752,29 @@ static void attn_tile_loop(Cache cache,
     }
     uint lo0 = seg * span;
     uint seg_hi = min((seg + 1u) * span, max_live);
+    typename Cache::Pending ahead;
+    cache.fetch(tid, kv, args.ctx, lo0, min(lo0 + BLOOMERY_ATTN_TILE, seg_hi), ahead);
     for (uint lo = lo0; lo < seg_hi; lo += BLOOMERY_ATTN_TILE) {
         uint hi = min(lo + BLOOMERY_ATTN_TILE, seg_hi);
-        cache.load(tid, kv, args.ctx, lo, hi);
+        cache.commit(tid, ahead);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint next = lo + BLOOMERY_ATTN_TILE;
+        if (next < seg_hi) {
+            cache.fetch(tid, kv, args.ctx, next, min(next + BLOOMERY_ATTN_TILE, seg_hi), ahead);
+        }
         float scores[BLOOMERY_ATTN_TILE];
-        bool live[BLOOMERY_ATTN_TILE];
         float tile_max = -INFINITY;
-        uint nvalid = 0u;
-        float kvv[BLOOMERY_ATTN_LANE_DIMS];
         for (uint t = 0u; t < BLOOMERY_ATTN_TILE; ++t) {
-            uint index = lo + t;
-            bool on = index < hi && index < args.keys;
-            live[t] = on;
+            float kvv[BLOOMERY_ATTN_LANE_DIMS];
+            cache.key(t, lane, kvv);
             float dot = 0.0f;
-            if (on) {
-                cache.key(t, lane, kvv);
-                for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
-                    dot = fma(qv[d], kvv[d], dot);
-                }
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+                dot = fma(qv[d], kvv[d], dot);
             }
-            // `on` is the same for every lane. The sum still runs on the
-            // lanes that loaded nothing, whose dot is zero.
             dot = simd_sum(dot);
             float score = dot * args.scale;
-            scores[t] = 0.0f;
-            if (on) {
-                scores[t] = score;
-                tile_max = max(tile_max, score);
-                nvalid += 1u;
-            }
-        }
-        if (nvalid == 0u) {
-            continue;
+            scores[t] = lo + t < hi ? score : -INFINITY;
+            tile_max = max(tile_max, scores[t]);
         }
         float new_m = max(*running_m, tile_max);
         float old_m = *running_m;
@@ -729,11 +785,9 @@ static void attn_tile_loop(Cache cache,
         }
         *running_m = new_m;
         for (uint t = 0u; t < BLOOMERY_ATTN_TILE; ++t) {
-            if (!live[t]) {
-                continue;
-            }
+            float kvv[BLOOMERY_ATTN_LANE_DIMS];
             cache.value(t, lane, kvv);
-            float weight = exp(scores[t] - new_m);
+            float weight = lo + t < hi ? exp(scores[t] - new_m) : 0.0f;
             *running_l += weight;
             for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
                 acc[d] = fma(weight, kvv[d], acc[d]);
@@ -804,16 +858,18 @@ static void attn_epilogue(thread const AttnArgs &args,
 // The merge, folded into the flash: the dispatch's last threadgroup folds
 // every head's segment partials in ascending segment order, applies the
 // gate when the layer has one and writes the output, then resets the
-// ticket. A thread folds 16 values of one head. The arithmetic is the
-// merge dispatch's, per head, in two passes: the first walks the maxima and
-// the weight sums and names each segment's rescale factor, the second
-// replays the merge's fma order with those factors over the values. The
-// running max at a segment is the prefix maximum of the earlier segments'
-// maxima, so no factor's exp reads another's: the first pass's exps and
-// both passes' loads are independent of the fma chains that consume them.
-// The factors sit in the shared block the loop left, one pair a segment a
-// head; the block is sized for them at the segment cap. A NaN partial (a refused position) writes NaN and stops. An empty
-// partial is skipped.
+// ticket. A head is ATTN_FOLD_SUBS threads, each holding ATTN_FOLD_VALS of its
+// values (the values sub, sub + SUBS, ...). The arithmetic is the merge
+// dispatch's, per head, in two passes. The first stages every head's segment
+// maxima and weight sums in the shared block at once, then one thread a head
+// walks them and names each segment's rescale factor in place: a kind (1 the
+// segment's maximum is the new one, 0 it is not, 2 it holds no weight) and the
+// factor. The running max at a segment is the prefix maximum of the earlier
+// segments' maxima, so no factor's exp reads another's. The second pass
+// replays the merge's fma order over the values with those factors. Each
+// head's final max, weight sum and refusal sit after the factors, three floats
+// a head. A NaN partial (a refused position) writes NaN and stops its head.
+// An empty partial is skipped.
 //
 // The reads are the ticket's coherent ones: the writers fence before they
 // arrive, and the acquire fence plus a coherent read is the visibility the
@@ -830,59 +886,69 @@ static void attn_fold(device coherent(device) float *partials,
     ticket_acquire();
     uint head = tid / ATTN_FOLD_SUBS;
     uint sub = tid % ATTN_FOLD_SUBS;
-    uint dim0 = sub * 16u;
     threadgroup float *mine = factors + head * args.segments * 2u;
-    float m = -INFINITY;
-    float l = 0.0f;
-    bool refused = false;
-    for (uint seg = 0u; seg < args.segments; ++seg) {
-        uint base = (head * args.segments + seg) * BLOOMERY_ATTN_PARTIAL;
-        float mj = ticket_load(partials, base);
-        float lj = ticket_load(partials, base + 1u);
-        if (isnan(mj) || isnan(lj)) {
-            refused = true;
-            break;
-        }
-        if (!(lj > 0.0f)) {
-            continue;
-        }
-        if (mj > m) {
-            float f = m > -INFINITY ? exp(m - mj) : 0.0f;
-            if (sub == 0u) {
+    threadgroup float *header = factors + BLOOMERY_ATTN_Q * args.segments * 2u;
+    for (uint p = tid; p < BLOOMERY_ATTN_Q * args.segments; p += BLOOMERY_ATTN_THREADS) {
+        uint base = p * BLOOMERY_ATTN_PARTIAL;
+        factors[2u * p] = ticket_load(partials, base);
+        factors[2u * p + 1u] = ticket_load(partials, base + 1u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sub == 0u) {
+        float m = -INFINITY;
+        float l = 0.0f;
+        bool refused = false;
+        for (uint seg = 0u; seg < args.segments; ++seg) {
+            float mj = mine[2u * seg];
+            float lj = mine[2u * seg + 1u];
+            if (isnan(mj) || isnan(lj)) {
+                refused = true;
+                break;
+            }
+            if (!(lj > 0.0f)) {
+                mine[2u * seg] = 2.0f;
+                continue;
+            }
+            if (mj > m) {
                 // Up: the values enter raw and the accumulator rescales. The
                 // kind word is one, so a first segment's factor of zero is a
                 // factor, not the other branch.
+                float f = m > -INFINITY ? exp(m - mj) : 0.0f;
                 mine[2u * seg] = 1.0f;
                 mine[2u * seg + 1u] = f;
-            }
-            m = mj;
-            l = fma(l, f, lj);
-        } else {
-            float g = exp(mj - m);
-            if (sub == 0u) {
+                m = mj;
+                l = fma(l, f, lj);
+            } else {
                 // Down: the values rescale and the accumulator stays.
+                float g = exp(mj - m);
                 mine[2u * seg] = 0.0f;
                 mine[2u * seg + 1u] = g;
+                l = fma(lj, g, l);
             }
-            l = fma(lj, g, l);
         }
+        header[3u * head] = m;
+        header[3u * head + 1u] = l;
+        header[3u * head + 2u] = refused ? 1.0f : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float acc[16];
-    for (uint d = 0u; d < 16u; ++d) {
+    float m = header[3u * head];
+    float l = header[3u * head + 1u];
+    bool refused = header[3u * head + 2u] != 0.0f;
+    float acc[ATTN_FOLD_VALS];
+    for (uint d = 0u; d < ATTN_FOLD_VALS; ++d) {
         acc[d] = 0.0f;
     }
     if (!refused) {
         for (uint seg = 0u; seg < args.segments; ++seg) {
-            uint base = (head * args.segments + seg) * BLOOMERY_ATTN_PARTIAL;
-            float lj = ticket_load(partials, base + 1u);
-            if (isnan(lj) || !(lj > 0.0f)) {
+            float kind = mine[2u * seg];
+            if (kind == 2.0f) {
                 continue;
             }
-            bool up = mine[2u * seg] != 0.0f;
+            uint base = (head * args.segments + seg) * BLOOMERY_ATTN_PARTIAL + 2u + sub;
+            bool up = kind != 0.0f;
             float f = mine[2u * seg + 1u];
-            for (uint d = 0u; d < 16u; ++d) {
-                float vj = ticket_load(partials, base + 2u + dim0 + d);
+            for (uint d = 0u; d < ATTN_FOLD_VALS; ++d) {
+                float vj = ticket_load(partials, base + d * ATTN_FOLD_SUBS);
                 if (up) {
                     acc[d] = fma(acc[d], f, vj);
                 } else {
@@ -891,21 +957,22 @@ static void attn_fold(device coherent(device) float *partials,
             }
         }
     }
-    uint o = head * BLOOMERY_ATTN_HEAD + dim0;
+    uint o = head * BLOOMERY_ATTN_HEAD;
     if (refused || !(l > 0.0f) || !isfinite(m)) {
-        for (uint d = 0u; d < 16u; ++d) {
-            out[o + d] = NAN;
+        for (uint d = 0u; d < ATTN_FOLD_VALS; ++d) {
+            out[o + d * ATTN_FOLD_SUBS + sub] = NAN;
         }
     } else {
         float inv = 1.0f / l;
-        for (uint d = 0u; d < 16u; ++d) {
+        for (uint d = 0u; d < ATTN_FOLD_VALS; ++d) {
+            uint dim = d * ATTN_FOLD_SUBS + sub;
             float attn = acc[d] * inv;
 #if BLOOMERY_ATTN_GATED
-            float gate = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];
+            float gate = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim];
             float merged = attn * attn_sigmoid(gate);
-            attn_commit(out, o + d, attn, gate, merged, faults, args.layer);
+            attn_commit(out, o + dim, attn, gate, merged, faults, args.layer);
 #else
-            attn_commit_plain(out, o + d, attn);
+            attn_commit_plain(out, o + dim, attn);
 #endif
         }
     }
@@ -1142,9 +1209,12 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
 
 // The flash of a chunk of rows with simdgroup matrices. A threadgroup holds
 // four consecutive positions of one key head, a SIMD group each; a SIMD
-// group's rows are the 8 query heads of the key head at its position, so the
-// 8x8 fragments of its score matrix are (heads x keys) and every key of a
-// tile serves all 8 heads. The causal mask is therefore one position a SIMD
+// group's rows are the query heads of the key head at its position, padded
+// with zero queries to the fragment's 8 rows when the key head has fewer, so
+// the 8x8 fragments of its score matrix are (heads x keys) and every key of a
+// tile serves all the heads. A padded row has a zero query, so its scores,
+// weights and values are finite and no other row reads them, and it stores
+// nothing. The causal mask is therefore one position a SIMD
 // group, never a row. The K and V tiles of 16 keys sit in threadgroup memory
 // beside the other three SIMD groups' and are the loop's only shared state:
 // the queries, the running max and weight sum and the head's values of each
@@ -1171,7 +1241,9 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
 
 #define PF_STRIDE (BLOOMERY_ATTN_HEAD + BLOOMERY_ATTN_PF_PAD)
 #define PF_TILE_HALVES (BLOOMERY_ATTN_PF_KEYS * PF_STRIDE)
-#define PF_STAGE_ROWS (BLOOMERY_ATTN_PF_POSITIONS * BLOOMERY_ATTN_GQA)
+// The rows of a fragment: the query heads of a key head, padded to eight.
+#define PF_ROWS 8u
+#define PF_STAGE_ROWS (BLOOMERY_ATTN_PF_POSITIONS * PF_ROWS)
 // Every loop over the fragments of the query or the accumulator is unrolled
 // in full: a fragment array indexed by a run-time value lives in memory, and
 // the products then run at a fraction of the matrix unit's rate.
@@ -1183,7 +1255,7 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
 static_assert(PF_STAGE_ROWS * PF_STRIDE <= 2u * PF_TILE_HALVES,
               "the query stage fits in the K and V tiles it shares memory with");
 static_assert(BLOOMERY_ATTN_PF_KEYS == 16u, "a tile is two 8-key fragments");
-static_assert(BLOOMERY_ATTN_GQA == 8u, "a fragment's rows are the 8 query heads of a key head");
+static_assert(BLOOMERY_ATTN_GQA <= PF_ROWS, "a fragment's rows hold a key head's query heads");
 static_assert(PF_LOADS * BLOOMERY_ATTN_PF_POSITIONS * 32u == BLOOMERY_ATTN_PF_KEYS * PF_ROW_WORDS,
               "the threadgroup's loads cover a tile exactly");
 
@@ -1224,11 +1296,11 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
     threadgroup float *sc = scratch + sg * BLOOMERY_ATTN_HEAD;
     bool overflow = false;
     bool unusable = !ok;
-    for (uint h = 0u; h < BLOOMERY_ATTN_GQA; ++h) {
+    for (uint h = 0u; h < PF_ROWS; ++h) {
         uint head = kv * BLOOMERY_ATTN_GQA + h;
         float y[BLOOMERY_ATTN_LANE_DIMS];
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (ok) {
+        if (ok && h < BLOOMERY_ATTN_GQA) {
             device float const *src = q + (ulong)row * args.q_stride + head * BLOOMERY_ATTN_QG +
                                       lane * BLOOMERY_ATTN_LANE_DIMS;
             for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
@@ -1240,7 +1312,7 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
                 y[d] = 0.0f;
             }
         }
-        threadgroup half *dst = shared + (sg * BLOOMERY_ATTN_GQA + h) * PF_STRIDE +
+        threadgroup half *dst = shared + (sg * PF_ROWS + h) * PF_STRIDE +
                                 lane * BLOOMERY_ATTN_LANE_DIMS;
         for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
             half hv = half(y[d]);
@@ -1260,7 +1332,7 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
     simdgroup_half8x8 qf[PF_DCHUNKS];
     #pragma clang loop unroll(full)
     for (uint c = 0u; c < PF_DCHUNKS; ++c) {
-        simdgroup_load(qf[c], shared + sg * BLOOMERY_ATTN_GQA * PF_STRIDE + c * 8u, PF_STRIDE);
+        simdgroup_load(qf[c], shared + sg * PF_ROWS * PF_STRIDE + c * 8u, PF_STRIDE);
     }
     // The K and V tiles are loaded over the stage.
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1371,7 +1443,7 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
     // The weight sum of a row is the sum of its four lanes' partial sums.
     running_l += simd_shuffle_xor(running_l, ushort(1));
     running_l += simd_shuffle_xor(running_l, ushort(8));
-    if (!writes) {
+    if (!writes || fm >= BLOOMERY_ATTN_GQA) {
         return;
     }
     uint head = kv * BLOOMERY_ATTN_GQA + fm;

@@ -29,8 +29,10 @@ pub(super) const CTX: usize = 80;
 /// past the live keys that stay unread.
 const DEEP_CTX: usize = 4112;
 /// The key counts the attention scenes run at: the rule's one-segment
-/// waterline and its counted splits, the ticket's fold past the first.
-const SCENE_KEYS: [u32; 5] = [1, 64, 100, 512, 4096];
+/// waterline and its counted splits, the ticket's fold past the first, and
+/// the deepest scene, whose 64 segments of five tiles leave the last twelve
+/// holding no key.
+const SCENE_KEYS: [u32; 6] = [1, 64, 100, 512, 4096, 4112];
 /// An f16 cache word no packed value of the planted rows uses as its check.
 const F16_HOLE: u16 = 0x0BAD;
 /// A q8_0 code word planted where no row was written.

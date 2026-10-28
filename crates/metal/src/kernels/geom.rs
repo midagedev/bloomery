@@ -354,9 +354,15 @@ mod tests {
                 |i| i.key.attn.n_head = 32,
                 ("attention", "query heads a key head", "16"),
             ),
+            // PIN(2026-10-28): the fold's threads a head follow the key heads, so a head
+            // of 128 over 16 heads holds; the key head count that is no divisor of the
+            // SIMD width is the refusal (3 key heads give a 24-head group of eight).
             (
-                |i| attention(i, 128, 16),
-                ("attention", "query heads x head", "2048"),
+                |i| {
+                    i.key.attn.n_head = 24;
+                    i.key.attn.n_kv = 3;
+                },
+                ("attention", "key heads", "3"),
             ),
             (|i| i.key.attn.rot = 128, ("attention", "rope dims", "128")),
             (|i| i.key.attn.rot = 33, ("attention", "rope dims", "33")),

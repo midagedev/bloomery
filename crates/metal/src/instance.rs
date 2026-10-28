@@ -154,11 +154,59 @@ pub const QWEN35MOE_GDN48: Instance = Instance {
     host_feature: Some("host-qwen35moe-gdn48"),
 };
 
+/// Qwen3.6's shape with the attention layers of a dense Qwen3.8-27B: 24 heads
+/// over 4 key heads of 256 values, six query heads a key head. The kernel
+/// gate's row of a group size that is not eight; every other axis is the one
+/// its clauses have a fixture for.
+pub const QWEN35MOE_GQA6: Instance = Instance {
+    name: "qwen35moe_gqa6",
+    key: Key {
+        attn: AttnAxes {
+            row: match shape::gqa_row(256, 24 / 4) {
+                Some(r) => r,
+                None => panic!("the shape table has no GQA row for this head at this group"),
+            },
+            n_head: 24,
+            n_kv: 4,
+            rot: 64,
+            q_gate: true,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-qwen35moe-gqa6"),
+};
+
+/// Qwen3.6's shape with the attention layers of a 9B-class model: 16 heads
+/// over 4 key heads of 256 values, four query heads a key head.
+pub const QWEN35MOE_GQA4: Instance = Instance {
+    name: "qwen35moe_gqa4",
+    key: Key {
+        attn: AttnAxes {
+            row: match shape::gqa_row(256, 16 / 4) {
+                Some(r) => r,
+                None => panic!("the shape table has no GQA row for this head at this group"),
+            },
+            n_head: 16,
+            n_kv: 4,
+            rot: 64,
+            q_gate: true,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-qwen35moe-gqa4"),
+};
+
 /// Every instance `build.rs` writes and compiles. A shape with no row here
 /// is compiled at open when every kernel family takes its geometry
 /// ([`select`]), from the source; a row here is the route to its metallib
 /// (its router and flash rows in the shape table first).
-pub const REGISTERED: &[Instance] = &[QWEN35MOE_A3B, QWEN3MOE_A3B, QWEN35MOE_GDN48];
+pub const REGISTERED: &[Instance] = &[
+    QWEN35MOE_A3B,
+    QWEN3MOE_A3B,
+    QWEN35MOE_GDN48,
+    QWEN35MOE_GQA6,
+    QWEN35MOE_GQA4,
+];
 
 /// The name of an instance made at open for a shape no row registers. No
 /// registered instance has it.
@@ -169,9 +217,23 @@ pub const UNREGISTERED: &str = "unregistered";
 /// kernels refuse a library of any other (`Kernels::with_geometry`). A
 /// build picks it by feature: Qwen3.6's by default, Qwen3-30B-A3B's under
 /// `host-qwen3moe-a3b`, the 48-value-head delta net's under
-/// `host-qwen35moe-gdn48`.
-#[cfg(not(any(feature = "host-qwen3moe-a3b", feature = "host-qwen35moe-gdn48")))]
+/// `host-qwen35moe-gdn48`, the six-query-head group's under
+/// `host-qwen35moe-gqa6`, the four-query-head group's under `host-qwen35moe-gqa4`.
+#[cfg(not(any(
+    feature = "host-qwen3moe-a3b",
+    feature = "host-qwen35moe-gdn48",
+    feature = "host-qwen35moe-gqa6",
+    feature = "host-qwen35moe-gqa4"
+)))]
 pub const HOST: Instance = QWEN35MOE_A3B;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-qwen35moe-gqa6")]
+pub const HOST: Instance = QWEN35MOE_GQA6;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-qwen35moe-gqa4")]
+pub const HOST: Instance = QWEN35MOE_GQA4;
 
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-qwen3moe-a3b")]

@@ -44,7 +44,8 @@ use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{
-    self, Instance, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, REGISTERED,
+    self, Instance, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4, QWEN35MOE_GQA6,
+    REGISTERED,
 };
 use bloomery_metal::kernels::{
     Geometry, HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant,
@@ -498,6 +499,15 @@ enum Table {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
     },
+    /// The clauses of the attention kernels an instance's group size shapes
+    /// (the decode flash, the rows flash and the prefill flash) on its own
+    /// geometry: an instance that is another registered instance's but for
+    /// its attention layers. The mutants of those clauses in both tables
+    /// (`kept`) and the instance's own (`own`).
+    Attention {
+        kept: &'static [&'static str],
+        own: &'static [mutants::Mutant],
+    },
 }
 
 /// A registered instance's row of the gate: the architecture whose fixture
@@ -529,6 +539,22 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         table: Table::Delta {
             kept: mutants::GDN48_KEPT,
             own: mutants::GDN48_MUTANTS,
+        },
+    },
+    InstanceRow {
+        instance: &QWEN35MOE_GQA6,
+        fixture: "qwen35moe",
+        table: Table::Attention {
+            kept: mutants::ATTN_KEPT,
+            own: mutants::GQA_MUTANTS,
+        },
+    },
+    InstanceRow {
+        instance: &QWEN35MOE_GQA4,
+        fixture: "qwen35moe",
+        table: Table::Attention {
+            kept: mutants::ATTN_KEPT,
+            own: mutants::GQA_MUTANTS,
         },
     },
 ];
@@ -946,6 +972,10 @@ fn clause_table<'a>(
         Table::Delta { .. } => instances()
             .chain(clauses_delta::wide(ctx))
             .chain(clauses_rows::wide(ctx))
+            .collect(),
+        Table::Attention { .. } => instances()
+            .chain(clauses_attention::table(ctx))
+            .chain(clauses_rows::attention(ctx))
             .collect(),
         Table::Shaped { .. } => instances()
             .chain(clauses_router::table(ctx))

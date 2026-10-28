@@ -73,6 +73,11 @@ host-qwen3moe-a3b = []
 # The host launch geometry is Qwen3.6's with a delta net of 48 value heads
 # (`instance::QWEN35MOE_GDN48`): the kernel gate's row of the value-head axis.
 host-qwen35moe-gdn48 = []
+# The host launch geometry is Qwen3.6's with the attention of six query heads a key head
+# (`instance::QWEN35MOE_GQA6`), or of four (`instance::QWEN35MOE_GQA4`): the kernel gate's rows of
+# a group size that is not eight.
+host-qwen35moe-gqa6 = []
+host-qwen35moe-gqa4 = []
 
 [lints]
 workspace = true

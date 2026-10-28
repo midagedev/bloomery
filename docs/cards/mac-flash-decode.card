@@ -1,0 +1,28 @@
+# Terms, per attention layer of the Qwen3.6-35B-A3B decode step at 4,088..4,216 keys, M4 Pro (10 attention layers of 40):
+#   flash, one dispatch alone, probe at 4,096 keys and 64 segments (the rule's count): shipped 138.0 us; fold staged
+#   with the values dealt by stride + next-tile fetch into registers + masked straight-line tile arithmetic 89.2 us
+#   (-48.8 us); the same terms at 1,088 keys and 32 segments: 63.0 -> 44.2 us. Each change is bit-identical to the shipped
+#   flash (the probe's self-check at 1,024 keys, the kernel gate's bands, the e2e gate's ids).
+#   profile of the base at depth 4,088 (mac-dec4): attn_flash 148.7 us a layer (probe lone 138.0 here: 0.93), step 11.17 ms
+#   (11.07..11.63).
+#   saving: 10 layers x 48.8 us x (0.6..1.1 of the probe figure's reach in a chain) = -0.29..-0.54 ms of 11.17
+#   (-0.45 at the 0.93 centre): 89.5 -> 93.3 tok/s, +4.2 % (+2.6..+4.8)
+kind: ab
+question: Does the redesigned decode flash (staged fold, next-tile fetch, masked tile arithmetic) cut the 35B decode
+  step at 4,088 keys by the 0.3 ms or more the stop rule asks, and by how much against the probe's prediction?
+term: decode tok/s @ 128 tokens (decode_tok_s of generate_metal --ignore-eos -n 128), depth 4,088 (the first 4,088 ids of
+  the 4,400-id prompt the mac-dec4 sitting used), ctx 4,352, Qwen3.6-35B-A3B MLX 4-bit split file, Apple M4 Pro
+  20-core, head vs base 088286a77
+unit: %
+predict: 2.6..4.8
+rounds: 6
+sd: 1.5 % mac-dec4 report 3 (ours at 4,088 keys sd 3.4 % across rounds on the user's laptop; a pair inside one round cancels the drift, halving taken [unverified])
+condition: Base and head are built on the testbed from their own trees; one fresh process per arm and round, arm order
+  rotated every round, --repeat 2 on one open and the second run read; uptime and the stream probe at the start and
+  end; thermal nominal; the decoded ids equal across arms (the head is bit-identical to the base).
+decide-in: The redesign stands: land it with the kernel gate and e2e results, and open the flash's next terms (the
+  fold's second pass, the loop's remaining skeleton) against the byte floor of 35 us a layer.
+decide-below: Below +2.6 % the probe's lone figure does not carry into the chain: read generate_metal --profile
+  attn_flash ms at 4,088 keys for both binaries (base 1.487 ms) and the stream probe before any further flash work.
+decide-above: Above +4.8 % the saving includes more than the flash dispatch (the partials traffic or the launch gaps):
+  split with --profile before pricing the next lever on the 10 layers.

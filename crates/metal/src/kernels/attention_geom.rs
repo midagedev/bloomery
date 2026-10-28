@@ -30,7 +30,8 @@ pub const fn gqa(inst: &Instance) -> usize {
 pub const TILE: usize = 16;
 
 /// SIMD groups in the flash threadgroup of `inst`: its group of query
-/// heads, [`HEADS_PER_SG`] a SIMD group.
+/// heads, [`HEADS_PER_SG`] a SIMD group. The threadgroup is as many SIMD
+/// groups as the key head has query heads.
 #[must_use]
 pub const fn simd_groups(inst: &Instance) -> usize {
     gqa(inst) / HEADS_PER_SG
@@ -73,7 +74,8 @@ pub const QG_STRIDE: usize = qg_stride(&HOST);
 /// model reads this as the waterline its two scenes sit either side of).
 pub const SEGMENT_KEYS: usize = 64;
 
-/// Threads in the flash threadgroup of `inst`.
+/// Threads in the flash threadgroup of `inst`: a SIMD group to each query
+/// head of a key head.
 #[must_use]
 pub const fn flash_threads(inst: &Instance) -> usize {
     SIMD_WIDTH * simd_groups(inst)
@@ -119,6 +121,13 @@ pub const PREFILL_PAD: usize = 8;
 /// Threads in the prefill threadgroup.
 pub const PREFILL_THREADS: usize = PREFILL_POSITIONS * SIMD_WIDTH;
 
+/// Rows of a prefill fragment: the query heads of a key head, padded with
+/// zero queries when the key head has fewer.
+pub const PREFILL_ROWS: usize = 8;
+
+/// The threadgroup memory one threadgroup may hold, in bytes.
+const SHARED_BYTES: usize = 32 * 1024;
+
 /// The geometry every flash kernel is written for, held for `g`: the
 /// kernels' own `static_assert`s, stated where the host sizes its launches.
 ///
@@ -147,20 +156,35 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
     if a.gqa * a.kv_heads != a.query_heads {
         return refuse("query heads", &a.query_heads, "a multiple of the key heads");
     }
-    // One SIMD group a query head, and 256 threads in the flash threadgroup.
-    if HEADS_PER_SG * a.simd_groups != a.gqa || a.flash_threads != 256 || a.gqa != 8 {
+    // One SIMD group a query head, so a flash of the key head's group of
+    // SIMD groups; the prefill's fragments hold at most eight of them.
+    if HEADS_PER_SG * a.simd_groups != a.gqa
+        || a.flash_threads != SIMD_WIDTH * a.simd_groups
+        || !(1..=PREFILL_ROWS).contains(&a.gqa)
+    {
         return refuse(
             "query heads a key head",
             &a.gqa,
-            "8 (one SIMD group each in a 256-thread flash)",
+            "1 to 8 (a SIMD group each in a flash of that many)",
         );
     }
-    // The fold: one thread a 16 values of a head, every head at once.
-    if a.query_heads * a.head != a.flash_threads * 16 {
+    // The fold: a thread to each head's share, every head at once, so the
+    // flash's threads are the query heads times the threads a head has, a
+    // SIMD width over the key heads.
+    if !SIMD_WIDTH.is_multiple_of(a.kv_heads) {
         return refuse(
-            "query heads x head",
-            &(a.query_heads * a.head),
-            "4096 (the fold's 256 threads of 16 values)",
+            "key heads",
+            &a.kv_heads,
+            "a divisor of 32 (the fold's threads a head)",
+        );
+    }
+    // The fold's factors, two floats a segment a head and three a head, sit
+    // in one threadgroup's memory at the segment cap.
+    if a.query_heads * (2 * SEGMENT_CAP + 3) * 4 > SHARED_BYTES {
+        return refuse(
+            "query heads",
+            &a.query_heads,
+            "at most 63 (the fold's factors in 32 KB of threadgroup memory)",
         );
     }
     // The norm's pair tree (rope_neox's `owned_pair`): the turning pairs
@@ -257,6 +281,52 @@ mod tests {
                 inst.name
             );
         }
+    }
+
+    /// Qwen3.6's instance with the attention axes of `n_head` heads over
+    /// `n_kv` key heads of 256 values.
+    fn shaped(n_head: u32, n_kv: u32) -> Instance {
+        let mut inst = crate::instance::QWEN35MOE_A3B;
+        inst.key.attn.row = models::shape::gqa_row(256, n_head / n_kv)
+            .expect("the shape table has a row for the group");
+        inst.key.attn.n_head = n_head;
+        inst.key.attn.n_kv = n_kv;
+        inst
+    }
+
+    #[test]
+    fn the_flash_takes_the_groups_of_a_fragment() {
+        // Qwen3.6-35B-A3B (8 a key head), Qwen3.8-27B (6) and a 16-head 9B
+        // shape over 4 key heads (4), and the group of two.
+        for (n_head, n_kv, gqa, threads) in [
+            (16u32, 2u32, 8usize, 256usize),
+            (24, 4, 6, 192),
+            (16, 4, 4, 128),
+            (8, 4, 2, 64),
+        ] {
+            let g = Geometry::of(&shaped(n_head, n_kv));
+            assert_eq!(holds(&g), Ok(()), "{n_head} heads over {n_kv}");
+            assert_eq!(g.attn.gqa, gqa, "{n_head}/{n_kv}: group");
+            assert_eq!(g.attn.flash_threads, threads, "{n_head}/{n_kv}: threads");
+            assert_eq!(
+                g.attn.query_heads * g.attn.head,
+                g.attn.flash_threads * (g.attn.head * g.attn.kv_heads / SIMD_WIDTH),
+                "{n_head}/{n_kv}: the fold's threads hold every value"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flash_refuses_a_group_past_a_fragment_and_key_heads_off_the_width() {
+        let wide = Geometry::of(&shaped(20, 2));
+        let refused = holds(&wide).expect_err("ten query heads a key head");
+        assert_eq!(
+            (refused.kernel, refused.axis),
+            ("attention", "query heads a key head")
+        );
+        let odd = Geometry::of(&shaped(24, 3));
+        let refused = holds(&odd).expect_err("three key heads");
+        assert_eq!((refused.kernel, refused.axis), ("attention", "key heads"));
     }
 
     #[test]

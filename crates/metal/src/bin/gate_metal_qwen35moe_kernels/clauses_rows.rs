@@ -2232,6 +2232,18 @@ pub fn wide<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     ]
 }
 
+/// The clauses of the attention kernels of the row launches: the append, the
+/// rows flash and the prefill flash, for an instance whose attention layers
+/// are the only axes its row differs in.
+pub fn attention<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    vec![
+        ("norm_rope_rows", Box::new(|| ctx.with(norm_rope_rows))),
+        ("attn_rows_v0", Box::new(|| ctx.with(attn_rows_v0))),
+        ("attn_prefill", Box::new(|| ctx.with(attn_prefill))),
+        ("attn_prefill_nan", Box::new(|| ctx.with(attn_prefill_nan))),
+    ]
+}
+
 /// The clauses of the row kernels an instance whose layers are all attention
 /// runs: the delta net's are left out.
 pub fn shaped<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {

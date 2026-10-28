@@ -37,7 +37,9 @@ use super::Table;
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
-        Table::Shaped { kept, own } | Table::Delta { kept, own } => {
+        Table::Shaped { kept, own }
+        | Table::Delta { kept, own }
+        | Table::Attention { kept, own } => {
             if let Some(name) = kept.iter().find(|name| {
                 !MUTANTS
                     .iter()
@@ -90,6 +92,10 @@ pub const Q30_KEPT: &[&str] = &[
     "attn_s1_partials",
     "attn_half",
     "attn_bounds",
+    "attn_tile_dead_unmasked",
+    "attn_prefetch_stale",
+    "attn_fold_stage_l",
+    "attn_fold_empty_unskipped",
     "rows_rope_relative",
     "rows_causal_plus1",
     "rows_norm_shared",
@@ -263,6 +269,70 @@ pub const Q30_MUTANTS: &[Mutant] = &[
                 1,
             ),
         ],
+    },
+];
+
+/// The mutants of the clauses an attention row runs (the decode flash, the
+/// rows flash and the prefill flash), every one a defect that row shows at a
+/// group size of six or four as at eight.
+pub const ATTN_KEPT: &[&str] = &[
+    "attn_score_scale",
+    "attn_q8_id",
+    "attn_key_count",
+    "attn_no_fold",
+    "attn_f16_round",
+    "attn_s1_partials",
+    "attn_half",
+    "attn_bounds",
+    "attn_gate_s1",
+    "attn_gate_merge",
+    "attn_tile_dead_unmasked",
+    "attn_prefetch_stale",
+    "attn_fold_stage_l",
+    "attn_fold_empty_unskipped",
+    "rows_rope_relative",
+    "rows_causal_plus1",
+    "prefill_causal_plus1",
+    "prefill_kv_head",
+    "prefill_tile_relative",
+    "prefill_no_rescale",
+    "prefill_score_scale",
+    "prefill_overflow_no_raise",
+    "prefill_nan_plausible",
+];
+
+/// The defects only a group size under eight or four key heads show: each
+/// edit is the same program at Qwen3.6's eight query heads over two key heads.
+pub const GQA_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "attn_gqa_read_as_8",
+        clause: "attn_f16",
+        why: "a key head's query heads start at eight a key head, whatever the group",
+        edits: &[(
+            "uint head = kv * BLOOMERY_ATTN_GQA + sg * BLOOMERY_ATTN_HPT;",
+            "uint head = kv * 8u + sg * BLOOMERY_ATTN_HPT;",
+            2,
+        )],
+    },
+    Mutant {
+        name: "fold_dim_stride_16",
+        clause: "attn_f16",
+        why: "the fold's thread owns the values 16 apart, whatever the key heads divide the SIMD width into",
+        edits: &[(
+            "uint dim = d * ATTN_FOLD_SUBS + sub;",
+            "uint dim = d * 16u + sub;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_pad_rows_stored",
+        clause: "attn_prefill",
+        why: "the fragment's padded rows store their outputs over the next key head's heads",
+        edits: &[(
+            "if (!writes || fm >= BLOOMERY_ATTN_GQA) {",
+            "if (!writes) {",
+            1,
+        )],
     },
 ];
 
@@ -1754,6 +1824,49 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "const short at = (s & 1) + 4 * (s >> 2);",
             "const short at = (s & 1) + 2 * (s >> 2);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_tile_dead_unmasked",
+        clause: "attn_f16",
+        why: "a key past the segment's end scores its zero row as 0 and weighs in",
+        edits: &[
+            (
+                "scores[t] = lo + t < hi ? score : -INFINITY;",
+                "scores[t] = score;",
+                1,
+            ),
+            (
+                "float weight = lo + t < hi ? exp(scores[t] - new_m) : 0.0f;",
+                "float weight = exp(scores[t] - new_m);",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "attn_prefetch_stale",
+        clause: "attn_f16",
+        why: "the next tile is never fetched, so every tile after the first is the first's rows again",
+        edits: &[("if (next < seg_hi) {", "if (false) {", 1)],
+    },
+    Mutant {
+        name: "attn_fold_stage_l",
+        clause: "attn_f16",
+        why: "the fold stages a segment's first value in place of its weight sum",
+        edits: &[(
+            "factors[2u * p + 1u] = ticket_load(partials, base + 1u);",
+            "factors[2u * p + 1u] = ticket_load(partials, base + 2u);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_fold_empty_unskipped",
+        clause: "attn_f16",
+        why: "a segment holding no key keeps its staged maximum and weight sum as a kind and a factor, and rescales the accumulator to zero",
+        edits: &[(
+            "                mine[2u * seg] = 2.0f;\n                continue;",
+            "                continue;",
             1,
         )],
     },
