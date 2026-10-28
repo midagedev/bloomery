@@ -312,9 +312,9 @@ fn the_other_27b_folders_and_the_text_only_class_read_as_the_same_model() {
 
 /// One row of the dense config's tables: the object, the key, a value accepted ("$" keeps the
 /// checkpoint's, `null` removes the key), a value refused, and what the refusal names.
-type Row = (String, String, Json, Json, String);
+pub(super) type Row = (String, String, Json, Json, String);
 
-fn config_rows() -> Vec<Row> {
+pub(super) fn config_rows() -> Vec<Row> {
     serde_json::from_str(
         r#"[
         ["", "model_type", "qwen3_5", "qwen3_5_moe", "model_type"],
@@ -463,7 +463,8 @@ fn every_key_of_the_dense_tables_has_a_row() {
 
 /// What the dense map refuses by name: a router, a shared expert or a stack of experts (the
 /// routed families' tensors), a block whose width the config does not give, a projection missing
-/// from a layer, and an MLX folder's next-token layer under the text prefix.
+/// from a layer, an MLX folder's next-token layer under the text prefix, and an `mtp.` tensor
+/// the next-token layer does not have.
 #[test]
 fn the_dense_map_refuses_what_it_does_not_read_by_name() {
     let config = json(CONFIG_38);
@@ -515,6 +516,13 @@ fn the_dense_map_refuses_what_it_does_not_read_by_name() {
     });
     assert!(
         e.contains("language_model.mtp.fc.weight") && e.contains("next-token layer"),
+        "{e}"
+    );
+    let e = refuse(&config, &|e| {
+        e.push(("mtp.zzz.weight".into(), Dtype::Bf16, vec![4, 4]));
+    });
+    assert!(
+        e.contains("mtp.zzz.weight") && e.contains("next-token layer this map names"),
         "{e}"
     );
 }

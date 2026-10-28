@@ -46,6 +46,15 @@ pub(super) fn check_head(tied: bool, head: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// `dtype`, which names no tensor's format: each tensor keeps its stored one.
+pub(super) const DTYPE: (&str, Rule) = (
+    "dtype",
+    Ignore(
+        Type::String,
+        "the dtype HF loads in; each tensor keeps its stored dtype and format",
+    ),
+);
+
 /// The `config.json` keys of the text model that every trunk map spells alike.
 pub(super) const KEYS: &Fields = &[
     ("num_hidden_layers", Read),
@@ -66,13 +75,7 @@ pub(super) const KEYS: &Fields = &[
     ("hidden_act", Only(r#"["silu"]"#)),
     ("attention_bias", Only("[false]")),
     HEAD_OWN,
-    (
-        "dtype",
-        Ignore(
-            Type::String,
-            "the dtype HF loads in; each tensor keeps its stored dtype and format",
-        ),
-    ),
+    DTYPE,
     (
         "attention_dropout",
         Ignore(Type::Number, "dropout acts in training only"),

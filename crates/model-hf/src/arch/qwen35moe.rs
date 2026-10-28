@@ -2,25 +2,29 @@
 //! program reads, as llama.cpp's converter (`conversion/qwen4exp.py`, `Qwen4ExpTextModel`, and
 //! the `qwen.py` classes it extends, at `098ce526`) writes them into a GGUF, Qwen3.6's MLX
 //! folder in the qwen35moe ones, and the dense Qwen3.5-class MLX folder (a SwiGLU block in place
-//! of the routed experts) in the qwen35 ones ([`Family`]).
+//! of the routed experts) in the qwen35 ones ([`Family`]), and ModelOpt's export of that dense
+//! class (`nvidia/Qwen3.8-27B-NVFP4`: transformers' names, gammas and conv taps, FP8 attention,
+//! NVFP4 feed-forward blocks and head) in the same ones.
 //!
 //! A checkpoint tensor maps to one tensor of the file ([`names`]), the way its role reads it
 //! ([`Use`]) and the [`Step`]s that move it into the program's layout once its format is
 //! normalized ([`hf::modelopt::normalize`]): the gated delta-rule V heads from grouped by K head
 //! to tiled (`_LinearAttentionVReorderBase`; an MLX file keeps HF's grouped order), the indexer's
-//! joint q and k projection split by rows, `+1` on Qwen3.8's zero-centred gammas (an MLX file's
-//! carry it already), and `A_log` as `-exp`. The routed experts of a projection stack by expert
-//! id (Qwen3.6's arrive stacked, one `switch_mlp` tensor), and the PLE table's parts concatenate
-//! in part order. Qwen3.8's target and next-token layers share the layer map; Qwen3.6's
-//! next-token layers (`mtp.*`) and either vision tower are left out, and the dense family's
-//! next-token layer is refused by name when a folder holds one; any other name is refused.
+//! joint q and k projection split by rows, `+1` on the zero-centred gammas of an HF-native
+//! checkpoint (an MLX file's carry it already), and `A_log` as `-exp`. The routed experts of a
+//! projection stack by expert id (Qwen3.6's arrive stacked, one `switch_mlp` tensor), and the PLE
+//! table's parts concatenate in part order. Qwen3.8's target and next-token layers share the
+//! layer map; Qwen3.6's next-token layers (`mtp.*`) and every family's vision tower are left out.
+//! The dense families' next-token layer is left out by the name of each of its tensors
+//! ([`dense_next_token`]) and refused by name as a draft when a folder holds one; any other name
+//! is refused.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 
 use gguf::Value;
 use hf::modelopt::{Normal, Plain, Use};
-use hf::schema::{self, Fields, Rule::*, Type};
+use hf::schema::{self, Fields, Rule, Rule::*, Type};
 use serde_json::Value as Json;
 
 use model::arch::names as common;
@@ -70,9 +74,16 @@ pub enum Family {
     /// [`Family::Qwen35`] in the text-only class (`Qwen3_5ForCausalLM`), whose `config.json` is
     /// the text model's own object.
     Qwen35Text,
+    /// [`Family::Qwen35`]'s class as ModelOpt exports it (`nvidia/Qwen3.8-27B-NVFP4`): the same
+    /// layers in transformers' own names, gammas and conv taps, written as a `qwen35` file. Its
+    /// config names the class [`Family::Qwen35`] has, so [`Family::of`] tells them apart by the
+    /// quantization config's producer.
+    Qwen35Hf,
 }
 
 impl Family {
+    /// The families a config's class name picks; [`Family::Qwen35Hf`] shares [`Family::Qwen35`]'s
+    /// name and is picked by [`Family::of`] from it.
     const ALL: [Family; 4] = [
         Family::Qwen38,
         Family::Qwen36,
@@ -80,11 +91,17 @@ impl Family {
         Family::Qwen35Text,
     ];
 
-    /// The family whose checkpoint class is `architecture`.
-    fn of(architecture: &str) -> Option<Family> {
-        Family::ALL
+    /// The family whose checkpoint class is `architecture`, `modelopt` whether the config's
+    /// `quantization_config.quant_method` is `modelopt`: the dense class is stored as MLX's convert
+    /// writes it, unless ModelOpt exported it.
+    fn of(architecture: &str, modelopt: bool) -> Option<Family> {
+        let family = Family::ALL
             .into_iter()
-            .find(|f| f.architecture() == architecture)
+            .find(|f| f.architecture() == architecture)?;
+        Some(match family {
+            Family::Qwen35 if modelopt => Family::Qwen35Hf,
+            family => family,
+        })
     }
 
     /// The checkpoint's class, `config.json`'s `architectures`.
@@ -92,22 +109,38 @@ impl Family {
         match self {
             Family::Qwen38 => "Qwen4ExpForConditionalGeneration",
             Family::Qwen36 => "Qwen3_5MoeForConditionalGeneration",
-            Family::Qwen35 => "Qwen3_5ForConditionalGeneration",
+            Family::Qwen35 | Family::Qwen35Hf => "Qwen3_5ForConditionalGeneration",
             Family::Qwen35Text => "Qwen3_5ForCausalLM",
         }
     }
 
-    /// Whether the checkpoint is stored as MLX's convert writes it: its tensor names, the norm
-    /// gammas with the `+ 1` folded in, and the conv taps as `[channels, kernel, 1]`.
-    fn mlx(self) -> bool {
-        self != Family::Qwen38
+    /// Whether the checkpoint is stored as transformers writes it (and ModelOpt exports it): its
+    /// tensor names under `model.language_model.`, the norm gammas without the `+ 1` the program
+    /// reads, and the conv taps as `[channels, 1, kernel]`. MLX's convert writes names under
+    /// `language_model.model.`, the gammas with the `+ 1` folded in and taps `[channels, kernel,
+    /// 1]`.
+    fn hf(self) -> bool {
+        matches!(self, Family::Qwen38 | Family::Qwen35Hf)
+    }
+
+    /// The role of an attention or delta-rule projection. The dense Qwen3.5 body reads these as
+    /// Q8_0 whatever the checkpoint stores, so an HF dense family asks [`Use::Q8_0`] (an FP8
+    /// projection is decoded exactly and quantized again at load); the others keep the stored
+    /// format, and `Plain::Q8_0` writes an unquantized one as Q8_0.
+    fn projection(self) -> Use {
+        match self {
+            Family::Qwen35Hf => Use::Q8_0,
+            Family::Qwen38 | Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => {
+                Use::Matrix(Plain::Q8_0)
+            }
+        }
     }
 
     /// The feed-forward block of every layer.
     fn ffn(self) -> trunk::Ffn {
         match self {
             Family::Qwen38 | Family::Qwen36 => trunk::Ffn::Routed,
-            Family::Qwen35 | Family::Qwen35Text => trunk::Ffn::Dense,
+            Family::Qwen35 | Family::Qwen35Text | Family::Qwen35Hf => trunk::Ffn::Dense,
         }
     }
 
@@ -126,7 +159,7 @@ impl Family {
         match self {
             Family::Qwen38 => "qwen4exp",
             Family::Qwen36 => "qwen35moe",
-            Family::Qwen35 | Family::Qwen35Text => "qwen35",
+            Family::Qwen35 | Family::Qwen35Text | Family::Qwen35Hf => "qwen35",
         }
     }
 
@@ -134,38 +167,51 @@ impl Family {
         match self {
             Family::Qwen38 => "Qwen3.8",
             Family::Qwen36 => "Qwen3.6",
-            Family::Qwen35 | Family::Qwen35Text => "Qwen3.5",
+            Family::Qwen35 | Family::Qwen35Text | Family::Qwen35Hf => "Qwen3.5",
         }
     }
 
     /// The checkpoint's prefix of the text model's tensors.
     fn text(self) -> &'static str {
-        match self {
-            Family::Qwen38 => "model.language_model.",
-            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => "language_model.model.",
+        if self.hf() {
+            "model.language_model."
+        } else {
+            "language_model.model."
         }
     }
 
     /// The checkpoint's output head.
     fn lm_head(self) -> &'static str {
-        match self {
-            Family::Qwen38 => "lm_head.weight",
-            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => "language_model.lm_head.weight",
+        if self.hf() {
+            "lm_head.weight"
+        } else {
+            "language_model.lm_head.weight"
         }
     }
 
     /// The checkpoint's prefix of the vision tower's tensors.
     fn vision(self) -> &'static str {
-        match self {
-            Family::Qwen38 => "model.visual.",
-            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => "vision_tower.",
+        if self.hf() {
+            "model.visual."
+        } else {
+            "vision_tower."
+        }
+    }
+
+    /// Whether `name` is a tensor of the next-token layers: anything under `mtp.` for a routed
+    /// family, whose draft map refuses what it does not know, and for a dense one the tensors
+    /// [`dense_next_token`] names, so another `mtp.` name is refused by the map.
+    fn next_token(self, name: &str) -> bool {
+        match self.ffn() {
+            trunk::Ffn::Routed => name.starts_with("mtp."),
+            trunk::Ffn::Dense => dense_next_token(name),
         }
     }
 
     /// Whether `name` is a tensor the map leaves out: the vision tower by its prefix, and the
-    /// next-token layers (`mtp.*`) in the target's map or everything else in the draft's.
+    /// next-token layers in the target's map or everything else in the draft's.
     fn leaves_out(self, name: &str, draft: bool) -> bool {
-        name.starts_with(self.vision()) || name.starts_with("mtp.") != draft
+        name.starts_with(self.vision()) || self.next_token(name) != draft
     }
 
     /// The `config.json` keys the family has beside [`ROOT_SHARED`].
@@ -175,6 +221,7 @@ impl Family {
             Family::Qwen36 => &[ROOT_MLX, ROOT_36],
             Family::Qwen35 => &[ROOT_MLX, ROOT_35],
             Family::Qwen35Text => &[ROOT_MLX],
+            Family::Qwen35Hf => &[ROOT_HF_DENSE],
         }
     }
 
@@ -188,7 +235,7 @@ impl Family {
         tables.push(match self {
             Family::Qwen38 => TEXT_38,
             Family::Qwen36 => TEXT_36,
-            Family::Qwen35 | Family::Qwen35Text => TEXT_35,
+            Family::Qwen35 | Family::Qwen35Text | Family::Qwen35Hf => TEXT_35,
         });
         tables
     }
@@ -202,7 +249,7 @@ impl Family {
         };
         let own: &[&str] = match self {
             Family::Qwen38 => COUNTS_38,
-            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => &[],
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text | Family::Qwen35Hf => &[],
         };
         COUNTS
             .iter()
@@ -240,18 +287,28 @@ const ROOT_SHARED: &Fields = &[
     ("vision_end_token_id", Ignore(Type::Number, VISION)),
 ];
 
+/// `language_model_only`, a flag of the multimodal class that only the vision tower reads.
+const LANGUAGE_MODEL_ONLY: (&str, Rule) = ("language_model_only", Ignore(Type::Bool, VISION));
+
+/// `image_token_id` of a family whose program has no image token.
+const IMAGE_TOKEN_UNREAD: (&str, Rule) = ("image_token_id", Ignore(Type::Number, VISION));
+
 /// Qwen3.8's `config.json` keys beside [`ROOT_SHARED`].
 const ROOT_38: &Fields = &[
     ("model_type", Need(r#"["qwen4_exp"]"#)),
     ("image_token_id", Read),
-    (
-        "dtype",
-        Ignore(
-            Type::String,
-            "the dtype HF loads in; each tensor keeps its stored dtype and format",
-        ),
-    ),
-    ("language_model_only", Ignore(Type::Bool, VISION)),
+    trunk::DTYPE,
+    LANGUAGE_MODEL_ONLY,
+];
+
+/// The HF-native dense family's `config.json` keys beside [`ROOT_SHARED`]: the keys of ModelOpt's
+/// export, which has no MLX `quantization` block, no root `eos_token_id` (the text model's is
+/// `hf::vocab::Config`'s) and no sampling defaults (they sit in `generation_config.json`).
+const ROOT_HF_DENSE: &Fields = &[
+    ("model_type", Need(r#"["qwen3_5"]"#)),
+    IMAGE_TOKEN_UNREAD,
+    trunk::DTYPE,
+    LANGUAGE_MODEL_ONLY,
 ];
 
 /// An MLX family's `config.json` keys beside [`ROOT_SHARED`]: `quantization` is MLX's block, which
@@ -259,7 +316,7 @@ const ROOT_38: &Fields = &[
 const ROOT_MLX: &Fields = &[
     ("quantization", Read),
     ("eos_token_id", Read),
-    ("image_token_id", Ignore(Type::Number, VISION)),
+    IMAGE_TOKEN_UNREAD,
 ];
 
 /// Qwen3.6's `config.json` keys beside [`ROOT_SHARED`] and [`ROOT_MLX`].
@@ -269,7 +326,7 @@ const ROOT_36: &Fields = &[("model_type", Need(r#"["qwen3_5_moe"]"#))];
 /// sampling defaults sit at the top level and in `generation_config`.
 const ROOT_35: &Fields = &[
     ("model_type", Need(r#"["qwen3_5"]"#)),
-    ("language_model_only", Ignore(Type::Bool, VISION)),
+    LANGUAGE_MODEL_ONLY,
     ("generation_config", Ignore(Type::Object, SAMPLING)),
     ("do_sample", Ignore(Type::Bool, SAMPLING)),
     ("temperature", Ignore(Type::Number, SAMPLING)),
@@ -492,8 +549,12 @@ impl Checkpoint {
     pub fn parse(config: &Json) -> Result<Self, Error> {
         let root = Reader::new(config, "config")?;
         let arch = root.array("architectures")?;
+        let modelopt = config
+            .pointer("/quantization_config/quant_method")
+            .and_then(Json::as_str)
+            == Some("modelopt");
         let family = match arch {
-            [Json::String(s)] => Family::of(s),
+            [Json::String(s)] => Family::of(s, modelopt),
             _ => None,
         }
         .ok_or_else(|| {
@@ -552,7 +613,7 @@ impl Checkpoint {
         trunk::check_counts(&c, family.ffn(), n)?;
         let exp = match family {
             Family::Qwen38 => Some(Exp::of(&c, &counts)?),
-            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text => None,
+            Family::Qwen36 | Family::Qwen35 | Family::Qwen35Text | Family::Qwen35Hf => None,
         };
         let kinds = c.array("layer_types")?;
         if kinds.len() != n("num_hidden_layers") as usize {
@@ -1000,11 +1061,40 @@ impl From<Error> for crate::folder::Error {
     }
 }
 
+/// Whether `name` is a tensor of the dense families' next-token layer: its fusion projection and
+/// norms, and the layer's own, an attention layer's with a dense block (the names [`trunk`] gives
+/// them). The dense map leaves these out until a draft reads them; any other `mtp.` name is not
+/// the map's and is refused.
+fn dense_next_token(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("mtp.") else {
+        return false;
+    };
+    if [
+        "fc.weight",
+        "norm.weight",
+        "pre_fc_norm_embedding.weight",
+        "pre_fc_norm_hidden.weight",
+    ]
+    .contains(&rest)
+    {
+        return true;
+    }
+    rest.strip_prefix("layers.")
+        .and_then(|r| r.split_once('.'))
+        .is_some_and(|(layer, rest)| {
+            layer.parse::<usize>().is_ok()
+                && trunk::attention(0, rest)
+                    .or_else(|| trunk::dense_ffn(0, rest))
+                    .or_else(|| trunk::block_norms(0, rest, post_attention_norm))
+                    .is_some()
+        })
+}
+
 /// Why the checkpoint tensor `name` of `family` is left out of the header, when the map reads no
 /// part of it: the next-token layers, the vision tower, and the PLE hash constants, which are
 /// header keys ([`Checkpoint::header`]).
 fn skip_reason(family: Family, name: &str) -> Option<&'static str> {
-    if name.starts_with("mtp.") {
+    if family.next_token(name) {
         return Some(MTP);
     }
     if name.starts_with(family.vision()) {
@@ -1090,7 +1180,7 @@ impl FolderMap for Checkpoint {
         kvs: &[(String, Value)],
     ) -> Result<Option<(gguf::Split, Vec<folder::Planned>)>, crate::folder::Error> {
         if !self.geometry.family.reads_draft() {
-            return match files.names().find(|n| n.starts_with("mtp.")) {
+            return match files.names().find(|n| self.geometry.family.next_token(n)) {
                 Some(name) => Err(refuse(
                     name,
                     format!(
@@ -1234,6 +1324,11 @@ fn map<'a>(
                     if name.contains(".mtp.") {
                         "a next-token layer under the text prefix; this map knows `mtp.` names only"
                             .to_string()
+                    } else if name.starts_with("mtp.") {
+                        format!(
+                            "not a tensor of the {} next-token layer this map names",
+                            g.family.label()
+                        )
                     } else {
                         format!("not a {} tensor", g.family.label())
                     },
@@ -1247,10 +1342,17 @@ fn map<'a>(
             _ => None,
         };
         // Qwen3.8's output norm is its hyper-connection mix, below.
-        if let Some((to, plain)) =
-            trunk::global(short).filter(|_| g.family.mlx() || short == "embed_tokens.weight")
+        if let Some((to, plain)) = trunk::global(short)
+            .filter(|_| g.family != Family::Qwen38 || short == "embed_tokens.weight")
         {
-            put(to, one(Use::Matrix(plain), vec![], dims()))?;
+            // The one F32 global is the output norm, whose gamma an HF checkpoint stores without
+            // the `+ 1`.
+            let steps = if plain == Plain::F32 && g.family.hf() {
+                vec![Step::PlusOne]
+            } else {
+                vec![]
+            };
+            put(to, one(Use::Matrix(plain), steps, dims()))?;
             continue;
         }
         if let Some(rest) = short
@@ -1422,31 +1524,38 @@ fn layer(
     shape: &[usize],
 ) -> Result<Vec<(String, Mapped)>, Error> {
     let dims: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
-    let mapped = |plain: Plain, steps: Vec<Step>, dims: Vec<u64>| Mapped {
+    let made = |role: Use, steps: Vec<Step>, dims: Vec<u64>| Mapped {
         sources: vec![name.to_string()],
-        role: Use::Matrix(plain),
+        role,
         steps,
         dims,
         origin: Origin::Made,
     };
+    let mapped =
+        |plain: Plain, steps: Vec<Step>, dims: Vec<u64>| made(Use::Matrix(plain), steps, dims);
     let one = |to: String, plain: Plain, steps: Vec<Step>| {
         Ok(vec![(to, mapped(plain, steps, dims.clone()))])
     };
+    // An attention or delta-rule projection, in the role the family reads it
+    // ([`Family::projection`]).
+    let projection = |to: String, steps: Vec<Step>| {
+        Ok(vec![(to, made(g.family.projection(), steps, dims.clone()))])
+    };
     let qk = 2 * g.k_heads * g.head_k;
-    let (exp, mlx, routed) = (
+    let (exp, hf, routed) = (
         g.family == Family::Qwen38,
-        g.family.mlx(),
+        g.family.hf(),
         g.family.ffn() == trunk::Ffn::Routed,
     );
     // The conv taps as `[kernel, channels]`.
     let taps = || -> Result<Vec<u64>, Error> {
-        match (exp, shape) {
+        match (hf, shape) {
             (true, &[c, 1, k]) | (false, &[c, k, 1]) => Ok(vec![k as u64, c as u64]),
             _ => Err(refuse(
                 name,
                 format!(
                     "conv taps {shape:?} are not {}",
-                    if exp {
+                    if hf {
                         "[channels, 1, kernel]"
                     } else {
                         "[channels, kernel, 1]"
@@ -1503,15 +1612,14 @@ fn layer(
     // An HF checkpoint stores a norm gamma `x` and the program reads `x + 1`; an MLX file stores
     // `x + 1` already (mlx-lm's `sanitize` adds it only to a file whose conv taps are still HF's
     // `[channels, 1, kernel]`).
-    let plus_one = || if exp { vec![Step::PlusOne] } else { vec![] };
+    let plus_one = || if hf { vec![Step::PlusOne] } else { vec![] };
     if let Some((to, plain)) = trunk::attention(l, rest) {
         // Only the per-head norms are F32 here, and they carry the `+ 1` an HF file lacks.
-        let steps = if plain == Plain::F32 {
-            plus_one()
+        return if plain == Plain::F32 {
+            one(to, plain, plus_one())
         } else {
-            vec![]
+            projection(to, vec![])
         };
-        return one(to, plain, steps);
     }
     // The block: a routed layer's router (its experts and shared expert are below), or the dense
     // layer's three projections.
@@ -1522,12 +1630,13 @@ fn layer(
     if let Some((to, plain)) = ffn {
         return one(to, plain, vec![]);
     }
-    if mlx && let Some((to, plain)) = trunk::block_norms(l, rest, post_attention_norm) {
-        return one(to, plain, vec![]);
+    // Qwen3.8's block norms are its hyper-connection mixes, above.
+    if !exp && let Some((to, plain)) = trunk::block_norms(l, rest, post_attention_norm) {
+        return one(to, plain, plus_one());
     }
     match rest {
-        "linear_attn.in_proj_qkv.weight" => one(names::attn_qkv(l), Plain::Q8_0, v(qk, g.head_v)),
-        "linear_attn.in_proj_z.weight" => one(names::attn_gate(l), Plain::Q8_0, v(0, g.head_v)),
+        "linear_attn.in_proj_qkv.weight" => projection(names::attn_qkv(l), v(qk, g.head_v)),
+        "linear_attn.in_proj_z.weight" => projection(names::attn_gate(l), v(0, g.head_v)),
         "linear_attn.in_proj_a.weight" => one(names::ssm_alpha(l), Plain::F32, v(0, 1)),
         "linear_attn.in_proj_b.weight" => one(names::ssm_beta(l), Plain::F32, v(0, 1)),
         "linear_attn.A_log" => one(
@@ -1541,8 +1650,8 @@ fn layer(
             vec![Step::VCols { head: 1 }],
         ),
         "linear_attn.conv1d.weight" => {
-            // Qwen3.6's taps arrive `[channels, kernel, 1]`, Qwen3.8's `[channels, 1, kernel]`.
-            let mut steps = if mlx { vec![Step::Squeeze] } else { vec![] };
+            // MLX's taps arrive `[channels, kernel, 1]`, an HF file's `[channels, 1, kernel]`.
+            let mut steps = if hf { vec![] } else { vec![Step::Squeeze] };
             steps.extend(v(qk, g.head_v));
             Ok(vec![(
                 names::ssm_conv1d(l),
@@ -1550,11 +1659,9 @@ fn layer(
             )])
         }
         "linear_attn.norm.weight" => one(names::ssm_norm(l), Plain::F32, vec![]),
-        "linear_attn.out_proj.weight" => one(
-            names::ssm_out(l),
-            Plain::Q8_0,
-            vec![Step::VCols { head: g.head_v }],
-        ),
+        "linear_attn.out_proj.weight" => {
+            projection(names::ssm_out(l), vec![Step::VCols { head: g.head_v }])
+        }
         "self_attn.indexer.q_layernorm.weight" if exp => {
             one(names::indexer_q_norm(l), Plain::F32, vec![Step::PlusOne])
         }
@@ -1755,6 +1862,9 @@ impl Step {
 
 #[cfg(test)]
 mod dense_tests;
+
+#[cfg(test)]
+mod hf_dense_tests;
 
 #[cfg(test)]
 mod tests {
