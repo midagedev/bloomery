@@ -239,7 +239,24 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
         let data = file.data(info).map_err(|e| format!("{name}: {e}"))?;
         u64::try_from(data.len()).map_err(|_| format!("{name}: its bytes do not fit u64"))
     };
-    let hidden = spec.hidden as usize;
+    // A value tensor the arena dequantizes at open: F32 as stored, MLX_A8 to
+    // one f32 an element. The profile counts that buffer, so the packed file
+    // length is the same number only for F32.
+    let values_held = |name: &str| -> Result<u64, String> {
+        let (_, info) = split
+            .find(name)
+            .ok_or_else(|| format!("the file has no tensor {name}"))?;
+        let elems = info.dims.iter().product::<u64>();
+        match info.ty {
+            gguf::GgmlType::F32 | gguf::GgmlType::MLX_A8 => elems
+                .checked_mul(4)
+                .ok_or_else(|| format!("{name}: its f32 bytes do not fit u64")),
+            other => Err(format!(
+                "{name} is {other:?}; the profile holds F32 or MLX_A8"
+            )),
+        }
+    };
+    let hidden = u64::from(spec.hidden);
     if plans.len() != picks.len() {
         return Err(format!(
             "{} plans for {} layers' picks",
@@ -285,9 +302,22 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
             }
         }
         let f = chain::arch::qwen3moe::read::file_names(l);
-        let router = bytes(&f.router)?;
-        // The experts' count from the router's own rows, as the arena holds it.
-        let experts = router / 4 / hidden as u64;
+        // The router's rows, from its shape. Its stored bytes are that count
+        // only while every value is f32; an MLX 8-bit router is not, and the
+        // profile counts the f32 buffer the open dequantized.
+        let (_, router_info) = split
+            .find(&f.router)
+            .ok_or_else(|| format!("the file has no tensor {}", f.router))?;
+        let elems = router_info.dims.iter().product::<u64>();
+        if hidden == 0 || elems % hidden != 0 {
+            return Err(format!(
+                "layer {l}: the router {} has shape {:?} which is not a whole number of \
+                 hidden rows ({hidden})",
+                f.router, router_info.dims
+            ));
+        }
+        let experts = elems / hidden;
+        let router = values_held(&f.router)?;
         // The layer's last slot reads the shared expert when the plan has one.
         let shared = match &plan.ffn.route {
             FfnRoute::Router { shared, .. } => shared.is_some(),
@@ -307,8 +337,10 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
                 + whole_of(bytes(&f.up)?, experts, "an up stack")?);
         *total += picks * whole_of(bytes(&f.down)?, experts, "a down stack")?;
         if shared {
-            *total +=
-                bytes(&f.router_gate)? + bytes(&f.sh_gate)? + bytes(&f.sh_up)? + bytes(&f.sh_down)?;
+            *total += values_held(&f.router_gate)?
+                + bytes(&f.sh_gate)?
+                + bytes(&f.sh_up)?
+                + bytes(&f.sh_down)?;
         }
     }
     Ok(per)

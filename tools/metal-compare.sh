@@ -12,7 +12,7 @@
 #      by allocation order, offset and length, every `setBytes` value), barrier and commit/wait/event of a run, at depth ~0 (a
 #      3-id prompt) and at depth 600 (a 600-id prompt, where the attention grid is the segment count of 600 keys). The generated ids
 #      of both runs are compared as well.
-# Both on the qwen35moe fixture ($BLOOMERY_FIXTURE_ROOT/qwen35moe/…). The scan and the trace need the `pipeline-scan` and
+# Both on the qwen35moe MLX split ($BLOOMERY_FIXTURE_ROOT/qwen35moe-mlxsplit). The scan and the trace need the `pipeline-scan` and
 # `encode-trace` features of bloomery-metal; the shipped builds have neither, so their host code is the shipped code.
 #
 # The sides. BASE (any rev that names a commit) is read through `git archive` into $METAL_COMPARE_WORK/<tree>/<sha12> (default
@@ -54,7 +54,17 @@ die() { # die <rc> <message>
 source "$ROOT/tools/nightly/units.sh" # archive_tree reads a commit, tree_commit labels this tree
 
 FEATURES=pipeline-scan,encode-trace
-FIXTURE=${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf
+# The trace opens the MLX split. An older base that cannot open it is named
+# below; there is no GGUF fallback.
+# PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
+SPLIT=${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe-mlxsplit
+shopt -s nullglob
+mlx_shards=("$SPLIT"/*-00001-of-*.gguf)
+shopt -u nullglob
+if [ "${#mlx_shards[@]}" -ne 1 ]; then
+  die 66 "qwen35moe-mlxsplit has ${#mlx_shards[@]} first shards under $SPLIT"
+fi
+FIXTURE=${mlx_shards[0]}
 WORK=${METAL_COMPARE_WORK:-$HOME/.cache/bloomery/metal-compare}
 TARGET=${METAL_COMPARE_TARGET:-$ROOT/target/metal-compare}
 SHALLOW_IDS=760,6511,314 # the e2e smoke's prompt (lab-metal-e2e), depth ~0
@@ -184,10 +194,18 @@ trace_side() {
   echo "metal-compare: $name: trace at depth ~0 and $DEEP_ROWS" >&2
   BLOOMERY_REF_MODEL=$FIXTURE "$o/generate_metal" --tokens "$SHALLOW_IDS" -n "$DECODE" --print-ids --encode-trace "$o/trace-d0.txt" > "$o/ids-d0.txt" 2> "$o/gen-d0.log"
   rc=$?
-  [ "$rc" = 0 ] || { tail -n 20 "$o/gen-d0.log" >&2; die 1 "$name: generate_metal (depth ~0) ended rc $rc ($o/gen-d0.log)"; }
+  [ "$rc" = 0 ] || {
+    echo "metal-compare: $name did not run on the MLX split $FIXTURE (rc $rc); there is no GGUF fallback" >&2
+    tail -n 20 "$o/gen-d0.log" >&2
+    die 1 "$name: generate_metal (depth ~0) ended rc $rc ($o/gen-d0.log)"
+  }
   BLOOMERY_REF_MODEL=$FIXTURE "$o/generate_metal" --tokens "$deep" -n "$DECODE" --print-ids --encode-trace "$o/trace-d$DEEP_ROWS.txt" > "$o/ids-d$DEEP_ROWS.txt" 2> "$o/gen-d$DEEP_ROWS.log"
   rc=$?
-  [ "$rc" = 0 ] || { tail -n 20 "$o/gen-d$DEEP_ROWS.log" >&2; die 1 "$name: generate_metal (depth $DEEP_ROWS) ended rc $rc ($o/gen-d$DEEP_ROWS.log)"; }
+  [ "$rc" = 0 ] || {
+    echo "metal-compare: $name did not run on the MLX split $FIXTURE (rc $rc); there is no GGUF fallback" >&2
+    tail -n 20 "$o/gen-d$DEEP_ROWS.log" >&2
+    die 1 "$name: generate_metal (depth $DEEP_ROWS) ended rc $rc ($o/gen-d$DEEP_ROWS.log)"
+  }
 }
 
 # --- the sides

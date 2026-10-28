@@ -1,15 +1,18 @@
 //! The e2e gate's clauses (macOS only).
 //!
-//! The session (`bloomery_metal::arch::qwen3moe::session`) opens the file
-//! the fixture family runs (`refset::fixture::first_shard`), the file its
-//! reference sets were dumped from, and every clause starts from its reset.
-//! The gate runs over a row (`--row`, `row.rs`): the qwen35moe fixture by
-//! default, or the qwen3moe fixture. A clause reads the file's numbers from
-//! the session's geometry and layers; a row names the clauses whose contract
-//! its file's architecture lacks (a delta layer's recurrent state), and the
-//! gate prints each as that clause's SKIP line with its reason. The kernel
-//! mutants (`--mutant`, `--mutants-all`) and the `--nodes` walk run on the
-//! default row.
+//! The session (`bloomery_metal::arch::qwen3moe::session`) opens the row's
+//! MLX split (`<family>-mlxsplit` under the fixture root), and every clause
+//! starts from its reset. The gate runs over a row (`--row`, `row.rs`): the
+//! qwen35moe split by default, or the qwen3moe split. A clause reads the
+//! file's numbers from the session's geometry and layers; a row names the
+//! clauses whose contract its file's architecture lacks (a delta layer's
+//! recurrent state), and the gate prints each as that clause's SKIP line
+//! with its reason. The kernel mutants (`--mutant`, `--mutants-all`) run on
+//! the default row.
+//!
+//! The clauses that compared this session to ik's GGUF sets are gone, and so
+//! is the `--nodes` walk of those sets.
+//! PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
 //!
 //! - `d_count`: host-fed, then in chain steps, every step of a depth within
 //!   one segment of keys encodes the groups and dispatches
@@ -27,67 +30,27 @@
 //!   faulted token's, its position does not move, and after the reset chain
 //!   steps run clean past the dropped token's position.
 //! - `b_chain`, `c_resume`: the run-ahead clauses (`chain.rs`).
-//! - `h_prompt`: the prompt loop's known-id run-ahead (`ahead.rs`): every
-//!   id but the last of each checkpoint span steps the next id ahead with
-//!   no head on a row whose pick nobody reads; the prompt's pick, logits,
-//!   recurrent state, KV rows and greedy picks match the host-fed loop's
-//!   bit for bit with a mark crossed and without, `StepStats` shows the ids
-//!   ahead all kept, and a checkpoint with a token ahead drops it and keeps
-//!   the point clean.
-//! - `a_free`: the batch set's tokens host-fed one at a time; every layer's
-//!   output over the rows ik kept within [`free::FREE_BAND`] of ik's, the
-//!   last position's argmax as the fixture tier takes it, the rows a
-//!   near-tie router flip carries left unheld by the CUDA gate's rule; and
-//!   the traced run's logits and picks equal to the plain steps'.
-//! - `s_serve`: the server's engine over a session of its own: greedy picks,
-//!   a sampled step's row and the keep rule held to this session's host-fed
-//!   steps (`serve.rs`).
-//! - `k_keep`: checkpoints of the delta state (`keep.rs`). A prompt leaves
-//!   points at `seqstate::marks`; a cut back to one matches a fresh prompt,
-//!   including while a token runs ahead; a cut where no point stands is
-//!   refused; the engine keeps a prefill's end.
-//! - `t_target`: the session as the generation loop's target
-//!   (`runtime::Target`): `generate` over `Plain` and a count stop emits the
-//!   plain steps' own greedy picks with every chained token kept; a
-//!   `Want::Logits` step's row equals `Node::Logits` after the same step and
-//!   its argmax is the row's own; the target's prompt leaves the stepped
-//!   run's position and last logits; the refusals (an empty prompt, a prompt
-//!   past the cache, a cut between 0 and the position) by name with the
-//!   session stepping on, the cut rule's `kept` table, and no host
-//!   allocation call in a steady step of either read-back.
-//! - `g_generate`: the generation core (`arch::qwen3moe::generate`) the CLI
-//!   runs: greedy over the batch set's first ids emits the session's own
-//!   picks, the count stop ends a run at its budget, an end-id set holding
-//!   the pick at a step ends the run at that step, and the sink sees every
-//!   id in order.
-//! - `f_deep`: the d1k set's prompt host-fed one id at a time through a
-//!   session of the set's depth, past one segment of keys, then its step
-//!   token traced; every step's count by its live keys (one wait a step, one
-//!   barrier between groups), the device's allocation unmoved and no host
-//!   allocation call in a steady step, every layer's step output within
-//!   [`free::FREE_BAND`] of ik's and the head's pick by its tie rule.
 //! - `p_profile`: the profile step (`Session::step_profile`) against the
 //!   step it instruments, within one segment of keys and past it: the picks
 //!   and last logits equal bit for bit over the same ids, one sample a
 //!   group covering every group the count counts, and the groups' weight
 //!   bytes equal to the file's own tensors walked under the plan's names.
-//! - `m_mlx`: the MLX-format fixture split (`qwen35moe-mlxsplit` under the
-//!   fixture root, every typed site MLX_A4, its routers MLX_A8) opens
-//!   through the session — the reader admitting its sites through Metal's
-//!   site lists — and `generate` over `Plain` emits the session's own
-//!   host-fed picks (`t_target`'s greedy pattern on that session).
+//! - `m_mlx`: the row's MLX split (`<family>-mlxsplit` under the fixture root,
+//!   every typed site MLX_A4, its routers MLX_A8) opens through the session —
+//!   the reader admitting its sites through Metal's site lists — and
+//!   `generate` over `Plain` emits the session's own host-fed picks (`mlx.rs`).
+//! - `m_logits`: the split's first-step logit rows against the committed
+//!   mlx-lm dump of the row's folder (`mlx.rs`).
 //! - `m_mlx_folder`: the row's MLX checkpoint folder (`<family>-mlx` under the
 //!   fixture root), opened as it is with no `prepare`, tells what the split made
 //!   of it (`<family>-mlxsplit`) tells: the plan's lines, the first host-fed
 //!   ids and the first step's logits row, bit for bit.
 //!
-//! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`, `q_layers`,
+//! - `q_short`, `q_state`, `q_chunk`, `q_free`, `q_fault`, `q_layers`,
 //!   `q_mark`, `q_mark_cut`, `q_marked`: the batched prompt pass (`pass.rs`): a prompt of at
 //!   most a step's window is the step path; one pass against the stepped ids
 //!   leaves layer 0's state and ring within a derived band; the pass size moves
-//!   no bit; the step at the prompt's depth against ik's `l_out` and logits, the
-//!   pass run's distance over the stepped run's within a ratio; the greedy tokens
-//!   teacher-forced through both; an id past the vocabulary in a pass raises the
+//!   no bit; the greedy tokens teacher-forced through both; an id past the vocabulary in a pass raises the
 //!   token-id site and poisons; a pass is one command buffer a layer and leaves
 //!   the profiled pass's bits; a pass's copies at rows inside it move none of its
 //!   bits and are its state there, and a prompt cut back to a mark inside its
@@ -101,10 +64,9 @@
 //!   (`resident.rs`): the set holds every byte the open and the first pass
 //!   allocated, and a submit after an idle gap renews its request once.
 //!
-//! `--nodes` is a tool, not a clause: its set's prompt host-fed, then its
-//! step token traced, every named node against ik's, the first past its
-//! band printed (`--set d1k` walks the d1k set at its depth; the step set is
-//! the default). `--ops` is another: each op's wall in the traced step,
+//! `--dump-layers DIR` is a tool: the first host-fed step's residual after
+//! each op, read back through the traced step's probe (`layers.rs`).
+//! `--ops` is a tool: each op's wall in the traced step,
 //! the host-fed and chain step medians beside it (`wall.rs`). `--list` prints the clause names; `--only CLAUSE` runs one;
 //! `--mutant NAME` runs the clause that must catch a kernel defect against
 //! kernels compiled with it (`mutants.rs`); `--mutants-all` runs each in a
@@ -128,28 +90,20 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::Instance;
 use bloomery_metal::library::{Library, sources_of};
 
-#[path = "ahead.rs"]
-mod ahead;
 #[path = "chain.rs"]
 mod chain;
-#[path = "deep.rs"]
-mod deep;
 #[path = "flip.rs"]
 mod flip;
-#[path = "free.rs"]
-mod free;
-#[path = "generate.rs"]
-mod generate;
 #[path = "keep.rs"]
 mod keep;
+#[path = "layers.rs"]
+mod layers;
 #[path = "mlx.rs"]
 mod mlx;
 #[path = "../shared/mlx_split.rs"]
 mod mlx_split;
 #[path = "mutants.rs"]
 mod mutants;
-#[path = "nodes.rs"]
-mod nodes;
 #[path = "pass.rs"]
 mod pass;
 #[path = "profile.rs"]
@@ -158,12 +112,8 @@ mod profile;
 mod resident;
 #[path = "row.rs"]
 mod row;
-#[path = "serve.rs"]
-mod serve;
 #[path = "sets.rs"]
 mod sets;
-#[path = "target.rs"]
-mod target;
 #[path = "wall.rs"]
 mod wall;
 
@@ -192,27 +142,9 @@ pub fn says(e: SessionError) -> String {
     e.to_string()
 }
 
-/// The file the row's fixture family runs: the one its sets were dumped from.
+/// The row's MLX split, the file the session opens.
 fn model_path() -> Result<PathBuf, String> {
-    refset::fixture::first_shard(row::current().arch)
-        .map(PathBuf::from)
-        .map_err(|e| format!("the fixture file: {e}"))
-}
-
-/// The cache rows the `--nodes` walk needs: the step set's depth within one
-/// segment, the d1k set's prompt plus its step token.
-fn nodes_ctx(set: sets::Set) -> Result<usize, String> {
-    match set {
-        sets::Set::Step => Ok(CTX),
-        sets::Set::D1k => {
-            let man = sets::open(set)?;
-            let (pos, step, _) = man
-                .step()
-                .map_err(|e| format!("the d1k set's tokens: {e}"))?;
-            Ok(pos as usize + step.len())
-        }
-        sets::Set::Batch => Err("--nodes walks a step set".to_string()),
-    }
+    mlx_split::path(row::current().arch)
 }
 
 /// Allocation calls the process has made, for `d_count`'s host half: read as
@@ -486,32 +418,25 @@ fn tensor_text_of(
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(name) = ["--only", "--mutant", "--row"]
+    if let Some(name) = ["--only", "--mutant", "--row", "--dump-layers"]
         .into_iter()
         .find(|name| args.last().is_some_and(|last| last == name))
     {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 26] = [
+    const NAMES: [&str; 19] = [
         "d_count",
         "e_token_id",
         "b_chain",
         "c_resume",
-        "h_prompt",
-        "a_free",
-        "t_target",
-        "s_serve",
-        "k_keep",
-        "g_generate",
-        "f_deep",
         "p_profile",
         "m_mlx",
         "m_mlx_folder",
+        "m_logits",
         "q_short",
         "q_state",
         "q_chunk",
-        "q_ref",
         "q_free",
         "q_tensor",
         "q_fault",
@@ -581,36 +506,13 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let nodes = args.iter().any(|a| a == "--nodes");
-    if nodes && !default_row {
+    if args.iter().any(|a| a == "--nodes" || a == "--set") {
         println!(
-            "{GATE}: --nodes walks the {} row's nodes",
-            row::QWEN35MOE.name
+            "{GATE}: --nodes compared the session to ik's GGUF sets and was removed: Metal verifies MLX only; the GGUF path runs unverified"
         );
         return ExitCode::from(64);
     }
-    let nodes_set = match flag(&args, "--set") {
-        None => sets::Set::Step,
-        Some(name) => match name {
-            "step4" => sets::Set::Step,
-            "d1k" => sets::Set::D1k,
-            other => {
-                println!("{GATE}: --set takes step4 or d1k, not {other}");
-                return ExitCode::from(64);
-            }
-        },
-    };
-    if !nodes && flag(&args, "--set").is_some() {
-        println!("{GATE}: --set names the --nodes walk's set");
-        return ExitCode::from(64);
-    }
-    let ctx = match if nodes { nodes_ctx(nodes_set) } else { Ok(CTX) } {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            println!("clause open: FAIL ({e})");
-            return ExitCode::FAILURE;
-        }
-    };
+    let ctx = CTX;
     // The library is the instance the file's shape selects.
     let instance = match Session::instance_of(&path, ctx) {
         Ok(instance) => instance,
@@ -678,8 +580,12 @@ pub fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    if nodes {
-        return nodes::run(&mut session, nodes_set);
+    if let Some(dir) = flag(&args, "--dump-layers") {
+        if mutant.is_some() {
+            println!("{GATE}: --dump-layers reads the unmutated session");
+            return ExitCode::from(64);
+        }
+        return layers::run(&mut session, std::path::Path::new(dir));
     }
     if args.iter().any(|a| a == "--ops") {
         return wall::run(&mut session);
@@ -696,19 +602,13 @@ pub fn main() -> ExitCode {
                 "e_token_id" => e_token_id(&mut session),
                 "b_chain" => chain::b_chain(&mut session),
                 "c_resume" => chain::c_resume(&mut session),
-                "h_prompt" => ahead::h_prompt(&device, library, &path),
-                "t_target" => target::t_target(&mut session),
-                "s_serve" => serve::s_serve(&mut session, &device, library, &path),
-                "k_keep" => keep::k_keep(&device, library, &path),
-                "g_generate" => generate::g_generate(&mut session),
-                "f_deep" => deep::f_deep(&device, library, &path),
                 "p_profile" => profile::p_profile(&device, library, &path),
                 "m_mlx" => mlx::m_mlx(&device, library),
                 "m_mlx_folder" => mlx::m_mlx_folder(&device, library),
+                "m_logits" => mlx::m_logits(&device, library),
                 "q_short" => pass::q_short(&device, library, &path),
                 "q_state" => pass::q_state(&device, library, &path),
                 "q_chunk" => pass::q_chunk(&device, library, &path),
-                "q_ref" => pass::q_ref(&device, library, &path),
                 "q_free" => pass::q_free(&device, library, &path),
                 "q_tensor" => pass::q_tensor(&device, library, &tensor_text, &path),
                 "q_fault" => pass::q_fault(&device, library, &path),
@@ -717,7 +617,7 @@ pub fn main() -> ExitCode {
                 "q_mark_cut" => pass::q_mark_cut(&device, library, &path),
                 "q_marked" => pass::q_marked(&device, library, &path),
                 "r_resident" => resident::r_resident(&device, library, &path),
-                _ => free::a_free(&mut session),
+                other => Err(format!("no clause named {other}")),
             },
         };
         report.clause(name, result);
@@ -764,8 +664,15 @@ fn mutants_all() -> ExitCode {
             green.push(mutant.name);
         }
     }
+    for mutant in mutants::KEPT {
+        println!("mutant {}: kept, no staying clause turns red", mutant.name);
+    }
     if green.is_empty() {
-        println!("{GATE} --mutants-all: PASS ({count} mutants, each red on its clause)");
+        println!(
+            "{GATE} --mutants-all: PASS ({count} mutants, each red on its clause; {} kept, \
+             no staying clause turns red)",
+            mutants::KEPT.len()
+        );
         return ExitCode::SUCCESS;
     }
     println!("{GATE} --mutants-all: FAIL (not red: {})", green.join(", "));

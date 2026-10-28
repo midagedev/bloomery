@@ -1,6 +1,5 @@
 //! The batched prompt pass (`Session::pass`) on the d1k set's prompt of about
-//! a thousand ids, held to the stepped path it replaces and to ik's
-//! reference set.
+//! a thousand ids, held to the stepped path it replaces.
 //!
 //! - `q_short` (p′): a prompt of at most a step's window of ids is the step
 //!   path: the batch session and the steps session leave the same pick, logits
@@ -13,11 +12,6 @@
 //!   (a checkpoint every 512), of 1,000 and 24, of 100 ten times and 24, and
 //!   as two calls cut at 700, leave the pick, the logits row and every store
 //!   of the one-pass run bit for bit.
-//! - `q_ref` (d): the step at the prompt's depth free-running from the pass
-//!   run's state and from the stepped run's own: each layer's output distance
-//!   from ik's `l_out` within [`FREE_BAND`], the pass run's over the stepped
-//!   run's within [`LAYER_RATIO`], the logits' within [`LOGITS_RATIO`], and
-//!   the head's pick by its tie rule.
 //! - `q_fault`: an id past the vocabulary in a pass raises the token-id site
 //!   at layer 0, the position does not move, the next pass and the next step
 //!   are refused by poison, and after the reset a pass runs clean.
@@ -59,17 +53,15 @@ use bloomery_metal::arch::qwen3moe::session::{
     Node, Op, PassOut, Session, SessionError, StateOut, StepMode,
 };
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::geom::Geometry;
 use bloomery_metal::library::{GemmPath, Library};
 use runtime::prompt::PrefillMode;
 use runtime::{Target, Want};
 
 use super::chain;
 use super::flip;
-use super::free::{FREE_BAND, FREE_FLIPS_MAX};
 use super::keep;
 use super::says;
-use super::sets::{self, Set};
+use super::sets;
 
 /// PIN(2026-10-24): (u)'s band on layer 0's recurrent state and conv ring
 /// against the stepped run's (`‖pass − stepped‖ / ‖stepped‖`). Layer 0's
@@ -87,36 +79,17 @@ use super::sets::{self, Set};
 /// reads an error of order one.
 const U_L0_REL: f64 = 1.2e-3;
 
-/// PIN(2026-10-24): (d)'s bound on a layer's store distance from ik's (a
-/// recurrent state and the conv rows ik keeps, or the key and value rows, the
-/// larger of the two), the pass run's over the stepped run's: the CUDA gate's
-/// PROMPT_RATIO, with the derivation of [`LAYER_RATIO`] below.
-const PROMPT_RATIO: f64 = 2.5;
+/// PIN(2026-09-27): the band on a layer output's relative distance from the
+/// stepped run's. The derivation is the CUDA gate's free-running bound:
+/// per-layer errors of about 4e-2 of a layer's update, added in quadrature
+/// over 40 layers, √40 · 4e-2 ≈ 0.25.
+const FREE_BAND: f64 = 0.26;
 
-/// PIN(2026-10-24): (d)'s bound on a layer's output distance from ik's, the
-/// pass run's over the stepped run's. The pass run is another realization of
-/// the stepped run's rule (the f16 operand's roundings, the GEMM's sum order),
-/// so each distance is one excursion of the state it started from, not an
-/// average, and the two runs' own distance up to 2.3 times the stepped run's
-/// gives √(1 + 2.3²) = 2.5: the CUDA gate's PROMPT_RATIO and placed step
-/// ratio, with the same derivation. A wiring fault adds an error of order one
-/// to distances of 1e-2 to 0.3, a ratio above 3 on every layer it reaches.
-const LAYER_RATIO: f64 = 2.5;
-
-/// PIN(2026-10-24): (d)'s bound on the logits' distance from ik's, the pass
-/// run's over the stepped run's: the one tensor all layers' excursions average
-/// into, the CUDA gate's STEP_RATIO.
-const LOGITS_RATIO: f64 = 1.5;
-
-/// The conv rows ik's state holds: the taps less the current token's.
-fn conv_rows(g: &Geometry) -> usize {
-    g.delta.conv_taps - 1
-}
-
-/// A row of the cache: one cell's key (or value) heads.
-fn kv_row(g: &Geometry) -> usize {
-    g.attn.kv_heads * g.attn.head
-}
+/// PIN(2026-10-13): the cap on router sites whose picks differ from the
+/// stepped run's. The derivation is the CUDA gate's: a broken router flips
+/// about every one of the sixteen sites, a correct one about eight; the cap
+/// is three quarters.
+const FREE_FLIPS_MAX: usize = 12;
 
 /// The ids of `q_layers`'s pass: more than a step's window, so the pass runs
 /// every rows arm.
@@ -144,7 +117,7 @@ const MARK_EVERY: u32 = 512;
 
 /// The ids of a prompt of `n` ids: the d1k set's first.
 pub(super) fn prompt_ids(n: usize) -> Result<Vec<u32>, String> {
-    let man = sets::open(Set::D1k)?;
+    let man = sets::d1k()?;
     let (_, _, prompt) = man
         .step()
         .map_err(|e| format!("the d1k set's tokens: {e}"))?;
@@ -263,99 +236,6 @@ fn differs(what: &str, a: &Stores, b: &Stores) -> Option<String> {
         }
     }
     None
-}
-
-/// The rows of the three positions before `p` in a conv ring, a position's
-/// row first: the rows ik's conv state holds.
-fn kept_ring(ring: &[f32], p: usize, g: &Geometry) -> Vec<f32> {
-    let (taps, ring_rows) = (conv_rows(g), g.delta.ring_rows);
-    let ch = ring.len() / ring_rows;
-    let mut out = Vec::with_capacity(taps * ch);
-    for j in 0..taps {
-        let slot = (p + j - taps) % ring_rows;
-        out.extend_from_slice(&ring[slot * ch..(slot + 1) * ch]);
-    }
-    out
-}
-
-/// ik's stores after its prompt batch, from the d1k set's inputs: a delta
-/// layer's state (ik's `[k][v]` per head transposed into ours) and the three
-/// conv rows it keeps (its `[C][3]` window), an attention layer's key and
-/// value rows `0..p` (rows of one cell's two heads, 512 values, the flash
-/// layout the fixture's set has; any other shape is refused by name).
-fn ik_stores(
-    man: &refset::ik::RefManifest,
-    g: &Geometry,
-    kinds: &[Layer],
-    p: usize,
-) -> Result<Vec<Store>, String> {
-    let (conv_rows, kv_row) = (conv_rows(g), kv_row(g));
-    let (value_heads, head_cols) = (g.delta.value_heads, g.delta.head_cols);
-    let mut out = Vec::new();
-    for (l, kind) in kinds.iter().enumerate() {
-        out.push(match kind {
-            Layer::Delta { .. } => {
-                let s = sets::input(man, &format!("cache_s_l{l}"))?;
-                let ssm_len = value_heads * head_cols * head_cols;
-                let conv_len = s.len().checked_sub(ssm_len).unwrap_or(1);
-                if conv_len == 0 || conv_len % conv_rows != 0 {
-                    return Err(format!("cache_s_l{l} holds {} values", s.len()));
-                }
-                let channels = conv_len / conv_rows;
-                let (conv, ssm) = s.split_at(conv_len);
-                let mut state = vec![0.0f32; ssm.len()];
-                for h in 0..value_heads {
-                    for k in 0..head_cols {
-                        for v in 0..head_cols {
-                            state[(h * head_cols + v) * head_cols + k] =
-                                ssm[(h * head_cols + k) * head_cols + v];
-                        }
-                    }
-                }
-                let mut ring = vec![0.0f32; conv_len];
-                for j in 0..conv_rows {
-                    for ch in 0..channels {
-                        ring[j * channels + ch] = conv[ch * conv_rows + j];
-                    }
-                }
-                Store::Rec { state, ring }
-            }
-            Layer::Attention { .. } => {
-                let plane = |name: String| -> Result<Vec<f32>, String> {
-                    let (vals, ne) = sets::input_f16_rows(man, &name)?;
-                    let rows_of_cell_heads =
-                        ne[0] as usize == g.attn.head && (ne[1] as usize / g.attn.kv_heads) >= p;
-                    let flat = ne[1] == 1 && (ne[0] as usize / kv_row) >= p;
-                    if !(rows_of_cell_heads || flat) || vals.len() < p * kv_row {
-                        return Err(format!(
-                            "{name} is {ne:?}, not rows of {kv_row} holding {p} positions"
-                        ));
-                    }
-                    Ok(vals[..p * kv_row].to_vec())
-                };
-                Store::Kv {
-                    k: plane(format!("cache_k_l{l}"))?,
-                    v: plane(format!("cache_v_l{l}"))?,
-                }
-            }
-        });
-    }
-    Ok(out)
-}
-
-/// A layer's distance from `base` (ik's): the larger of its two stores'
-/// `‖ours − base‖ / ‖base‖`, a ring read at the three rows ik keeps.
-fn store_dist(ours: &Store, base: &Store, p: usize, g: &Geometry) -> f64 {
-    match (ours, base) {
-        (Store::Rec { state, ring }, Store::Rec { state: s, ring: r }) => flip::worse(
-            flip::rel_to(state, s),
-            flip::rel_to(&kept_ring(ring, p, g), r),
-        ),
-        (Store::Kv { k, v }, Store::Kv { k: kb, v: vb }) => {
-            flip::worse(flip::rel_to(k, kb), flip::rel_to(v, vb))
-        }
-        _ => f64::INFINITY,
-    }
 }
 
 fn open(
@@ -498,12 +378,11 @@ pub fn q_chunk(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     )))
 }
 
-/// One layer's output and the logits of the step token through the traced
-/// step.
+/// One layer's residual and the routers' picks of the step token through the
+/// traced step.
 struct Traced {
     outs: Vec<Vec<f32>>,
     ids: Vec<Vec<u32>>,
-    logits: Vec<f32>,
     top: u32,
 }
 
@@ -511,16 +390,11 @@ fn traced_step(s: &mut Session, tok: u32) -> Result<Traced, String> {
     let n = s.layer_count();
     let mut outs: Vec<Vec<f32>> = vec![Vec::new(); n];
     let mut ids: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut logits = Vec::new();
     let stepped = s
         .step_traced(tok, |op, probe| {
-            match op {
-                Op::Experts(l) => {
-                    outs[l] = probe.read(Node::Residual)?;
-                    ids[l] = probe.router_ids(l)?;
-                }
-                Op::Head => logits = probe.read(Node::Logits)?,
-                _ => {}
+            if let Op::Experts(l) = op {
+                outs[l] = probe.read(Node::Residual)?;
+                ids[l] = probe.router_ids(l)?;
             }
             Ok(())
         })
@@ -528,107 +402,12 @@ fn traced_step(s: &mut Session, tok: u32) -> Result<Traced, String> {
     Ok(Traced {
         outs,
         ids,
-        logits,
         top: stepped.id,
     })
 }
 
-/// (d): the step at the prompt's depth against ik, from the pass run's state
-/// and from the stepped run's.
-pub fn q_ref(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
-    let man = sets::open(Set::D1k)?;
-    let (pos, step, prompt) = man
-        .step()
-        .map_err(|e| format!("the d1k set's tokens: {e}"))?;
-    let [tok] = step else {
-        return Err(format!("the d1k set holds {} step tokens", step.len()));
-    };
-    let ctx = pos as usize + 1;
-    let ids = prompt.to_vec();
-    let mut pass = open(device, library, path, ctx, 2048, PrefillMode::Batch)?;
-    let mut steps = open(device, library, path, ctx, 2048, PrefillMode::Steps)?;
-    let n = pass.layer_count();
-    let ik_out: Vec<Vec<f32>> = (0..n)
-        .map(|l| sets::tap(&man, &format!("l_out-{l}")))
-        .collect::<Result<_, _>>()?;
-    let ik_logits = sets::tap(&man, "result_output")?;
-    let vocab = pass.vocab();
-    let ik_last = ik_logits
-        .len()
-        .checked_sub(vocab)
-        .map(|at| &ik_logits[at..])
-        .ok_or("result_output holds no row")?;
-    let stores_pass = run_prompt(&mut pass, &ids)?;
-    let stores_steps = run_prompt(&mut steps, &ids)?;
-    let p = ids.len();
-    let geom = *pass.geom();
-    let ik_layers = ik_stores(&man, &geom, pass.token_layers(), p)?;
-    let mut worst_store = (0f64, 0usize);
-    for (l, ik) in ik_layers.iter().enumerate() {
-        let (dp, ds) = (
-            store_dist(&stores_pass.layers[l], ik, p, &geom),
-            store_dist(&stores_steps.layers[l], ik, p, &geom),
-        );
-        let ratio = flip::worse(0.0, dp / ds.max(f64::MIN_POSITIVE));
-        println!(
-            "q_ref store layer={l} pass_from_ik={dp:.3e} steps_from_ik={ds:.3e} ratio={ratio:.2}"
-        );
-        if ratio > worst_store.0 {
-            worst_store = (ratio, l);
-        }
-    }
-    if worst_store.0 > PROMPT_RATIO {
-        return Err(format!(
-            "layer {}'s store is {:.2} times as far from ik's after the pass as after the steps, past {PROMPT_RATIO}",
-            worst_store.1, worst_store.0
-        ));
-    }
-    let a = traced_step(&mut pass, *tok)?;
-    let b = traced_step(&mut steps, *tok)?;
-    let mut worst_ratio = 0f64;
-    let (mut worst_a, mut worst_b) = (0f64, 0f64);
-    for (l, want) in ik_out.iter().enumerate().take(n) {
-        let (ea, eb) = (
-            flip::rel_to(&a.outs[l], want),
-            flip::rel_to(&b.outs[l], want),
-        );
-        worst_a = flip::worse(worst_a, ea);
-        worst_b = flip::worse(worst_b, eb);
-        let ratio = ea / eb.max(f64::MIN_POSITIVE);
-        println!(
-            "q_ref layer={l} pass_l_out_rel={ea:.3e} steps_l_out_rel={eb:.3e} ratio={ratio:.2}"
-        );
-        if ea > FREE_BAND || !ea.is_finite() {
-            return Err(format!(
-                "layer {l}: the pass run's output is {ea:.3e} from ik's, past {FREE_BAND}"
-            ));
-        }
-        if ratio > LAYER_RATIO {
-            return Err(format!(
-                "layer {l}: the pass run is {ea:.3e} from ik's and the stepped run {eb:.3e}, a ratio {ratio:.2} past {LAYER_RATIO}"
-            ));
-        }
-        worst_ratio = worst_ratio.max(ratio);
-    }
-    let (la, lb) = (
-        flip::rel_to(&a.logits, ik_last),
-        flip::rel_to(&b.logits, ik_last),
-    );
-    let logits_ratio = la / lb.max(f64::MIN_POSITIVE);
-    let head_in = flip::rel_to(&a.outs[n - 1], &ik_out[n - 1]);
-    let tie = head_in.is_finite() && flip::head_tie(ik_last, a.top, head_in);
-    let line = format!(
-        "the d1k step after a pass prompt: worst l_out_rel {worst_a:.3e} (stepped {worst_b:.3e}, worst layer ratio {worst_ratio:.2}, band {LAYER_RATIO}); logits_rel {la:.3e} (stepped {lb:.3e}, ratio {logits_ratio:.2}, band {LOGITS_RATIO}); pick ours={} stepped={} ik={}",
-        a.top,
-        b.top,
-        flip::argmax(ik_last)
-    );
-    if logits_ratio <= LOGITS_RATIO && tie {
-        Ok(Verdict::Noted(line))
-    } else {
-        Err(line)
-    }
-}
+// `q_ref` compared the step at the prompt's depth to ik's d1k set.
+// PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
 
 /// `q_free`: the greedy tokens of the stepped run teacher-forced through the
 /// pass run.

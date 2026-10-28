@@ -9,8 +9,10 @@
 #   - a binary that links a library outside /usr/lib and /System/Library, so it would not start on a Mac without it;
 #   - a binary whose LC_BUILD_VERSION minos is not MACOS_FLOOR (the backend's floor, crates/metal/src/device.rs), or
 #     that is not arm64, or that carries no code signature (an unsigned arm64 binary does not run);
-#   - when a qwen35moe fixture is given, a generate_metal whose greedy ids differ from lab-metal-e2e's.
-# Usage: tools/release/build-mac.sh <version> [<fixture.gguf>]
+#   - when the qwen35moe MLX split's first shard is given, a generate_metal whose greedy ids differ from lab-metal-e2e's.
+# The GGUF smoke ids left with the ik clauses.
+# PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
+# Usage: tools/release/build-mac.sh <version> [<qwen35moe-mlxsplit-first-shard>]
 #        tools/release/build-mac.sh --check <dir>   (the binary checks alone, on <dir>/<bin>)
 # Writes target/mac-release/dist/$NAME.tar.gz and its .sha256; upload them with `gh release upload v<version>` as named.
 set -euo pipefail
@@ -18,7 +20,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 BINS=(bloomery-serve-metal generate_metal prepare)
 MACOS_FLOOR=26.2
-FIXTURE_IDS=134895,160927,412,163951,82046,43343,102520,19258
+FIXTURE_IDS=95971,52281,135771,76423,11251,224948,16570,68738
 fail() { echo "build-mac.sh: $*" >&2; exit 1; }
 
 check_bins() {

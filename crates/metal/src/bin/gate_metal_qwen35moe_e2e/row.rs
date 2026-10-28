@@ -1,12 +1,12 @@
-//! The gate's rows: one fixture file each, with the family its reference sets
-//! belong to and the clauses its architecture has no contract for.
+//! The gate's rows: one MLX split each, and the clauses its architecture has
+//! no contract for.
 //!
 //! A clause reads the file's own numbers from the session (`Session::geom`,
 //! `Session::token_layers`); a row names only what the file cannot say: which
-//! fixture directory and which set family the run belongs to, whether the file
-//! has a recurrent store, and the clauses that hold a contract the file's
-//! architecture does not have, each with its reason, printed as that clause's
-//! SKIP line.
+//! fixture directory the split lives in, the d1k set whose prompt ids the
+//! self-bit clauses feed, whether the file has a recurrent store, and the
+//! clauses that hold a contract the file's architecture does not have, each
+//! with its reason, printed as that clause's SKIP line.
 
 use std::sync::OnceLock;
 
@@ -18,13 +18,9 @@ pub struct Row {
     pub name: &'static str,
     /// The architecture the fixture directory is named by.
     pub arch: &'static str,
-    /// The family of ik's sets dumped from the fixture file.
+    /// The family of the d1k set the prompt ids are read from.
     pub ik: &'static Family,
-    /// The set of the prompt's tokens from position 0.
-    pub batch: &'static str,
-    /// The set of the prompt, then one decode step with every node dumped.
-    pub step4: &'static str,
-    /// The set of the step at the depth of its own prompt.
+    /// The set whose prompt ids the self-bit clauses feed.
     pub d1k: &'static str,
     /// Whether the file has delta layers: a recurrent state with checkpoints,
     /// a conv ring and a pass's copies of them.
@@ -48,8 +44,6 @@ pub static QWEN35MOE: Row = Row {
     name: "qwen35moe",
     arch: refset::arch::qwen35moe::ARCH,
     ik: &refset::arch::qwen35moe::fixture::IK,
-    batch: refset::arch::qwen35moe::fixture::BATCH,
-    step4: refset::arch::qwen35moe::fixture::STEP4,
     d1k: refset::arch::qwen35moe::fixture::D1K,
     recurrent: true,
     skips: &[],
@@ -60,21 +54,13 @@ pub static QWEN3MOE: Row = Row {
     name: "qwen3moe",
     arch: refset::arch::qwen3moe::ARCH,
     ik: &refset::arch::qwen3moe::fixture::IK,
-    batch: refset::arch::qwen3moe::fixture::BATCH,
-    step4: refset::arch::qwen3moe::fixture::STEP4,
     d1k: refset::arch::qwen3moe::fixture::D1K,
     recurrent: false,
     skips: &[
         (
-            "k_keep",
-            "checkpoints hold a recurrent state and the file has none: a cut keeps any position up \
-             to it, which t_target and s_serve hold",
-        ),
-        ("m_mlx", "the MLX-format split is the qwen35moe fixture's"),
-        (
             "q_state",
             "the clause compares a delta layer's state and conv ring and the file has no delta \
-             layer; q_chunk and q_ref hold the pass's key and value rows",
+             layer; q_chunk holds the pass's key and value rows",
         ),
         (
             "q_mark",

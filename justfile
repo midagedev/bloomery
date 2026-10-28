@@ -99,20 +99,19 @@ lab-metal:
     cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && BLOOMERY_GATE_BOUND=1800 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
 # The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over two rows (`--row`): the qwen35moe
-# fixture, then the qwen3moe fixture (attention layers only, no shared expert, no recurrent store; the clauses that
-# hold a delta contract print SKIP with their reason). Each row: the fixture family's file
-# (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count, the
-# fault path of a bad token id, the session as the generation loop's target (its greedy loop, logits read-back,
-# prompt and cut rules), the generation core the CLI runs (ids, stops, sink) and the profile step (its picks and logits
-# equal the plain step's, its group tags covering the count's groups, its weight bytes equal the file's own tensors) and
-# the MLX folder of the fixture opened as it is, which must tell what its prepared split tells (m_mlx_folder; before the
-# gate, model-hf's hw_a_ tests hold the two files' tensor bytes equal); then the gate's kernel mutants, each of which its
-# clause must catch; then the generate_metal CLI's smoke on the qwen35moe fixture (and, for the ids
-# and the text prompt, on the qwen3moe fixture): the batch set's first ids
-# through --tokens must print g_generate's reference ids (the fixture family is pinned by sha, so the ids are baked
-# here), a text prompt must decode to non-empty stdout, and the decode rate and the profile's decode_ms must count the
-# loop's passes (none for a one-token run, 7 for eight tokens). A lab-* recipe: the box has no Metal device, so no
-# landing batch selects it.
+# MLX split, then the qwen3moe MLX split (attention layers only, no shared expert, no recurrent store; the clauses that
+# hold a delta contract print SKIP with their reason). Each row opens `$BLOOMERY_FIXTURE_ROOT/<family>-mlxsplit`: the
+# token's encoded count, the fault path of a bad token id, the generation core the CLI runs (ids, stops, sink), the
+# profile step (its picks and logits equal the plain step's, its group tags covering the count's groups, its weight
+# bytes equal the file's own tensors), the MLX folder opened as it is, which must tell what its prepared split tells
+# (m_mlx_folder; before the gate, model-hf's hw_a_ tests hold the two files' tensor bytes equal), and the first-step
+# logits against the committed mlx-lm dump (m_logits); then the gate's kernel mutants, each of which its clause must
+# catch; then the generate_metal CLI's smoke on the qwen35moe split (and, for the ids and the text prompt, on the
+# qwen3moe split). The prompt ids through --tokens must print the ids pinned here, a text prompt must decode to
+# non-empty stdout, and the decode rate and the profile's decode_ms must count the loop's passes (none for a one-token
+# run, 7 for eight tokens). The GGUF fixture smoke left with the ik clauses.
+# PIN(2026-10-28): removed, user decision, Metal verifies MLX only; the GGUF path runs unverified
+# A lab-* recipe: the box has no Metal device, so no landing batch selects it.
 lab-metal-e2e:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -125,14 +124,22 @@ lab-metal-e2e:
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3moe
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
-    fx="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf"
-    want="134895,160927,412,163951,82046,43343,102520,19258"
+    # The smoke opens the MLX split's first shard, the same file the e2e gate opens.
+    shard() {
+        local dir="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$1-mlxsplit" found=()
+        shopt -s nullglob
+        found=("$dir"/*-00001-of-*.gguf)
+        shopt -u nullglob
+        [ "${#found[@]}" -eq 1 ] || die "$1-mlxsplit has ${#found[@]} first shards under $dir"
+        printf '%s\n' "${found[0]}"
+    }
+    fx="$(shard qwen35moe)"
+    want="95971,52281,135771,76423,11251,224948,16570,68738"
     ids="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" || die "generate_metal smoke: the run failed (rc $?)"
     [ "$ids" = "$want" ] || die "generate_metal smoke: ids $ids; $want is expected"
-    # The qwen3moe fixture's batch set opens with 785,6722,315: the CLI picks the library of the file's instance. The first
-    # id is ik's g_generate reference after those three ids; the eight pin this engine's greedy output on the fixture.
-    fx3="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen3moe/qwen3moe-fixture-00001-of-00001.gguf"
-    want3="86066,124430,50136,141037,109958,50136,109958,48396"
+    # The qwen3moe split's prompt is 785,6722,315: the CLI picks the library of the file's instance.
+    fx3="$(shard qwen3moe)"
+    want3="54792,120829,120829,120829,120829,54792,54792,14152"
     ids3="$(BLOOMERY_REF_MODEL="$fx3" ./target/release/generate_metal --tokens 785,6722,315 -n 8 --print-ids)" || die "generate_metal qwen3moe smoke: the run failed (rc $?)"
     [ "$ids3" = "$want3" ] || die "generate_metal qwen3moe smoke: ids $ids3; $want3 is expected"
     out3="$(BLOOMERY_REF_MODEL="$fx3" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" || die "generate_metal qwen3moe text smoke: the run failed (rc $?)"

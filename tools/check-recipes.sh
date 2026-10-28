@@ -396,6 +396,7 @@ pytools_list() {
     "tools/hf-arch-check.py --self-test"
     "tools/mac-disk.py --self-test"
     "tools/mlx-fixture.py --self-test"
+    "tools/mlx-logits.py --self-test"
     "tools/model_tax.py --self-test"
     "tools/owners_check.py --self-test"
     "tools/pr-gate-lines.py --self-test"
