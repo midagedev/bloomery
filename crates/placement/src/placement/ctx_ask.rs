@@ -640,7 +640,7 @@ mod tests {
         choose(Ask::Default, 1, TRAINED, STEPS, |c| {
             Ok::<_, String>(match card.plan(c)? {
                 Probe::Short(s) => Probe::Short(short(c, s)),
-                held => held,
+                held @ Probe::Holds(_) => held,
             })
         })
         .expect("holds")

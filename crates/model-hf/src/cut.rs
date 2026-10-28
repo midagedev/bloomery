@@ -3117,7 +3117,7 @@ pub(crate) mod tests {
             );
         }
         let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
-        let mut want = before.clone();
+        let mut want = before;
         want["text_config"]["num_hidden_layers"] = json!(4);
         want["text_config"]["layer_types"] = json!([
             "linear_attention",
