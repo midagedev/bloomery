@@ -15,15 +15,16 @@
 //!    the slots' one column), the squared ReLU, the down rows (`w → latent`)
 //!    (llama-graph.cpp :2321, :2422-2430, :2435): IQ2_XXS stacks (Bolt) by
 //!    `iq2_xxs_gemv_sel`, 32-value-block stacks (Lightning's Q5_0, Q5_1 and
-//!    Q8_0) by the card leg's relu² form ([`Relu2Leg`]), both stacks of a
-//!    layer one form ([`Form`]);
+//!    Q8_0) and NVFP4 stacks in their planes (Lightning's checkpoint folder) by
+//!    the card leg's relu² form ([`Relu2Leg`]), both stacks of a layer one
+//!    form ([`Form`]);
 //! 5. the slots' downs times their weights, summed in slot order
 //!    (:2451-2480);
 //! 6. `ffn_latent_up` (Q8_0, `latent → hidden`, :332-334), where the file
 //!    has a latent; without one the experts' sum is the hidden row;
 //! 7. the shared expert on the normed row: up (IQ2_XXS, `hidden → 5376`), the
 //!    squared ReLU, down (:336-341), each a one-expert `iq2_xxs_gemv_sel`; a
-//!    file whose shared expert is Q8_0 runs it as a dense site instead;
+//!    file whose shared expert is Q8_0 or NVFP4 runs it as a dense site instead;
 //! 8. `moe_out + shared` (:344), then the residual add (:243).
 //!
 //! The expert count and width are the layer's own (its router's rows, its
@@ -50,16 +51,18 @@ use model::placement::{accepts, kernels};
 /// The latent pair's site types: Q8_0 through the f32 gemv.
 const LATENT_TYPES: &[SiteTy] = &[SiteTy::Q8_0];
 
-/// The shared expert's site types: Q8_0 through the f32 gemv.
-const SHARED_TYPES: &[SiteTy] = &[SiteTy::Q8_0];
+/// The shared expert's site types: Q8_0 through the f32 gemv, NVFP4 through
+/// the gemv or, at a width the q8_1 form does not take, the 32-value `_sel`
+/// gemv ([`crate::site::reads_at`]).
+const SHARED_TYPES: &[SiteTy] = &[SiteTy::Q8_0, SiteTy::Nvfp4];
 
 /// The shared expert's two projections: the IQ2_XXS stack the card's
-/// one-expert sel reads (Bolt), or the Q8_0 sites its gemv reads (a file
-/// whose shared expert is Q8_0, Lightning).
+/// one-expert sel reads (Bolt), or the dense sites its gemv reads (a file
+/// whose shared expert is Q8_0 or NVFP4, Lightning).
 pub(super) enum Shared {
     /// The IQ2_XXS stacks, in the file's blocks.
     Sel { up: String, down: String },
-    /// The Q8_0 sites.
+    /// The dense sites ([`SHARED_TYPES`]).
     Site { up: Site, down: Site },
 }
 
@@ -68,15 +71,15 @@ pub(super) enum Shared {
 pub(super) enum Form {
     /// IQ2_XXS stacks, which `iq2_xxs_gemv_sel` reads.
     Iq2,
-    /// Stacks of a 32-value-block type ([`kernels::card_sel32_runs`]: Q5_0,
-    /// Q5_1, Q8_0, IQ4_NL), which the card leg's relu² form ([`Relu2Leg`]) and
-    /// the 32-value GEMM read.
+    /// Stacks of a type the relu² form runs ([`kernels::card_relu2_runs`]:
+    /// Q5_0, Q5_1, Q8_0, IQ4_NL, NVFP4), which the card leg's relu² form
+    /// ([`Relu2Leg`]) and the 32-value GEMM read.
     Sel32,
 }
 
 /// The form layer `l`'s routed stacks in `file` take on the card: both
-/// IQ2_XXS, or both of a 32-value-block type. A stack absent from the file,
-/// of another type, or a pair of two forms is refused by name.
+/// IQ2_XXS, or both of a type the relu² form runs. A stack absent from the
+/// file, of another type, or a pair of two forms is refused by name.
 fn form_of(file: &Split, l: usize, what: &'static str) -> Result<Form, GpuError> {
     let ty = |stem: &str| {
         let name = layer_name(l, stem);
@@ -87,13 +90,13 @@ fn form_of(file: &Split, l: usize, what: &'static str) -> Result<Form, GpuError>
     let (up, down) = (ty(FFN_UP_EXPS)?, ty(FFN_DOWN_EXPS)?);
     match (up, down) {
         (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS) => Ok(Form::Iq2),
-        (u, d) if kernels::card_sel32_runs(u) && kernels::card_sel32_runs(d) => Ok(Form::Sel32),
+        (u, d) if kernels::card_relu2_runs(u) && kernels::card_relu2_runs(d) => Ok(Form::Sel32),
         (u, d) => Err(GpuError::shape(
             what,
             format!(
                 "layer {l}: the routed up is {u:?} and the down {d:?}; the card runs a layer's \
-                 two stacks as IQ2_XXS or as 32-value-block types (Q5_0, Q5_1, Q8_0, IQ4_NL), \
-                 one form"
+                 two stacks as IQ2_XXS or as 32-value-block types (Q5_0, Q5_1, Q8_0, IQ4_NL) or \
+                 NVFP4 planes, one form"
             ),
         )),
     }
@@ -150,6 +153,11 @@ pub(super) struct MoeLayer {
     up_exps: Option<String>,
     down_exps: Option<String>,
     form: Option<Form>,
+    /// Whether the relu² form's card experts are NVFP4 planes
+    /// ([`kernels::card_planes_runs`] of the file's up type): the pass's
+    /// 32-value GEMM forms hold the native FP4 columns beside them, where the
+    /// build has them.
+    fp4: bool,
     /// The shared expert's two projections.
     pub(super) shared: Shared,
     pub(super) route: RouteOut,
@@ -397,7 +405,7 @@ impl MoeLayer {
             None => (None, None),
         };
         // The shared expert: the IQ2_XXS stack the card's one-expert sel
-        // reads, or the Q8_0 sites its gemv reads.
+        // reads, or the Q8_0 or NVFP4 sites its gemv reads.
         let shared = match names
             .file
             .find(&layer_name(l, FFN_UP_SHEXP))
@@ -407,7 +415,7 @@ impl MoeLayer {
                 up: iq2_xxs(w, what, &layer_name(l, FFN_UP_SHEXP), (shf, hidden))?,
                 down: iq2_xxs(w, what, &layer_name(l, FFN_DOWN_SHEXP), (hidden, shf))?,
             },
-            Some(GgmlType::Q8_0) => Shared::Site {
+            Some(GgmlType::Q8_0 | GgmlType::NVFP4) => Shared::Site {
                 up: names.site(&layer_name(l, FFN_UP_SHEXP), (shf, hidden), SHARED_TYPES)?,
                 down: names.site(&layer_name(l, FFN_DOWN_SHEXP), (hidden, shf), SHARED_TYPES)?,
             },
@@ -416,7 +424,7 @@ impl MoeLayer {
                     what,
                     format!(
                         "layer {l}: the shared expert is {other:?}, neither the iq2_xxs stack the \
-                         card's sel reads nor the q8_0 site its gemv reads"
+                         card's sel reads nor the q8_0 or nvfp4 site its gemv reads"
                     ),
                 ));
             }
@@ -454,6 +462,11 @@ impl MoeLayer {
                 (Some(up), Some(down))
             }
         };
+        let fp4 = form == Some(Form::Sel32)
+            && names
+                .file
+                .find(&layer_name(l, FFN_UP_EXPS))
+                .is_some_and(|(_, t)| kernels::card_planes_runs(t.ty));
         let layer = MoeLayer {
             router,
             bias: names.vector(l, EXP_PROBS_B, n)?,
@@ -465,6 +478,7 @@ impl MoeLayer {
             up_exps,
             down_exps,
             form,
+            fp4,
             shared,
             route,
             norm,
@@ -500,7 +514,7 @@ impl MoeLayer {
     }
 
     /// The sites the layer's launches read: the latent pair, where the file
-    /// has one, and the shared expert's Q8_0 sites.
+    /// has one, and the shared expert's dense sites.
     pub(super) fn sites(&self) -> Vec<&Site> {
         let mut sites = Vec::new();
         if let Some(s) = &self.latent_down {
@@ -538,6 +552,11 @@ impl MoeLayer {
     /// where they are 32-value stacks on the card, else none.
     pub(super) fn relu2_ff(&self) -> Option<usize> {
         (self.form == Some(Form::Sel32)).then_some(self.ff)
+    }
+
+    /// Whether the layer's card experts in the relu² form are NVFP4 planes.
+    pub(super) fn relu2_fp4(&self) -> bool {
+        self.fp4
     }
 }
 

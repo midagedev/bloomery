@@ -229,6 +229,7 @@ mod gate {
             != (Forms {
                 iq2: false,
                 sel32: true,
+                fp4: false,
             })
         {
             return Err(format!(

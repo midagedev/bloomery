@@ -4,9 +4,10 @@
 //!
 //! - a projection is its site's gemv over column runs of at most
 //!   [`COLS`] rows ([`project_rows`]): Q8_0 `q8_0_gemv_mcol` on the f32 rows,
-//!   NVFP4 `nvfp4_gemv` on the run's q8_1 columns, each weight read once a
-//!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass
-//!   and an NVFP4 site the same GEMM over its resident NVFP4 planes
+//!   NVFP4 `nvfp4_gemv` on the run's q8_1 columns (at a width the q8_1 form
+//!   does not take, the `_sel` gemv on its q8 blocks of 32), each weight read
+//!   once a run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the
+//!   pass and an NVFP4 site the same GEMM over its resident NVFP4 planes
 //!   ([`site::gemm`]);
 //! - a Mamba-2 layer is one pass over its tokens
 //!   ([`Mamba2Kernels::enqueue_pass`] with the chunked SSD scan,
@@ -77,9 +78,10 @@ use crate::kquant::SelDown;
 use crate::mamba2::{Mamba2Kernels, Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, largest_fit};
+use crate::q5::Q8Blocks32;
 use crate::q38::{EmbedArgs, EmbedRows};
 use crate::quant_sel::QuantSelKernels;
-use crate::site::{self, SiteTy};
+use crate::site::{self, Form, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideForms, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
 use crate::weights::{DevWeight, Weights};
@@ -150,8 +152,15 @@ pub(super) struct PassSizes {
     /// The 32-value GEMM forms of the layers whose card experts are 32-value
     /// stacks ([`experts_gemm32`]), as `gemm_acts`.
     gemm32_acts: Vec<(usize, usize)>,
-    /// The NVFP4 gemv run forms' widths.
+    /// Whether a layer's card experts are NVFP4 planes: the 32-value GEMM
+    /// forms are then made with the native FP4 columns beside them where the
+    /// build has them ([`GemmAct32::new_routed_for`]).
+    routed_fp4: bool,
+    /// The NVFP4 gemv run forms' widths, where the q8_1 form takes them.
     run_k: Vec<usize>,
+    /// The NVFP4 gemv run forms' widths where it does not: [`COLS`] columns
+    /// of q8 blocks of 32 for the `_sel` gemv ([`site::reads_at`]).
+    run32_k: Vec<usize>,
     /// The q8 blocks of 32 the wide GEMMs read, one a site width.
     wide_k: Vec<usize>,
     /// Whether the pass runs on a placed load: its rows' places and the
@@ -210,6 +219,7 @@ impl PassSizes {
                 gemm32_acts.push((k, per_row));
             }
         };
+        let mut routed_fp4 = false;
         for m in moes() {
             // The table runs over the card's experts of the layer: every
             // expert on a whole-card load, the plan's share on a placed one.
@@ -226,6 +236,7 @@ impl PassSizes {
                     Some(ff) => {
                         want_acts32(moe.width, 1);
                         want_acts32(ff, moe.top_k);
+                        routed_fp4 |= m.relu2_fp4();
                     }
                 }
             }
@@ -235,10 +246,20 @@ impl PassSizes {
             }
         }
         let mut run_k: Vec<usize> = Vec::new();
+        let mut run32_k: Vec<usize> = Vec::new();
         let mut wide_k: Vec<usize> = Vec::new();
         for s in layers.iter().flat_map(Layer::sites) {
-            if s.ty == SiteTy::Nvfp4 && !run_k.contains(&s.k) {
-                run_k.push(s.k);
+            if s.ty == SiteTy::Nvfp4 {
+                // The q8_1 run form where the site reads it, the 32-value one
+                // at a width it does not take.
+                let runs = if s.reads() == Form::Q8Blocks32 {
+                    &mut run32_k
+                } else {
+                    &mut run_k
+                };
+                if !runs.contains(&s.k) {
+                    runs.push(s.k);
+                }
             }
             if matches!(s.ty, SiteTy::Q8_0 | SiteTy::Nvfp4) && !wide_k.contains(&s.k) {
                 wide_k.push(s.k);
@@ -254,7 +275,9 @@ impl PassSizes {
             route_n,
             gemm_acts,
             gemm32_acts,
+            routed_fp4,
             run_k,
+            run32_k,
             wide_k,
             placed,
         }
@@ -287,9 +310,27 @@ impl PassSizes {
             route_n: self.route_n.clone(),
             gemm_acts: self.gemm_acts.clone(),
             gemm32_acts: self.gemm32_acts.clone(),
+            native32_acts: self.native32_acts(),
             run_k: self.run_k.clone(),
+            run32_k: self.run32_k.clone(),
             wide_k: self.wide_k.clone(),
             placed: self.placed,
+        }
+    }
+
+    /// The 32-value GEMM forms that hold the native FP4 columns beside them
+    /// ([`GemmAct32::new_routed_for`]): where a layer's card experts are NVFP4
+    /// planes and the build has native FP4 products, those of a width of whole
+    /// 64-value steps.
+    fn native32_acts(&self) -> Vec<(usize, usize)> {
+        if cfg!(bloomery_nvfp4_mma) && self.routed_fp4 {
+            self.gemm32_acts
+                .iter()
+                .copied()
+                .filter(|&(k, _)| k.is_multiple_of(place::GEMM32_STEP))
+                .collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -455,6 +496,9 @@ struct Arms {
     /// The q8_1 forms of one run of [`COLS`] columns the NVFP4 gemv reads,
     /// one a width.
     runs: Vec<Q8Act>,
+    /// The q8 blocks of 32 of one run of [`COLS`] columns the NVFP4 `_sel`
+    /// gemv reads at a width the q8_1 form does not take, one a width.
+    runs32: Vec<Q8Blocks32>,
     /// The q8 blocks of 32 a Q8_0 GEMM reads, the pass's rows, one a width.
     wide: Vec<(usize, WideActs)>,
     /// The pass's one-expert table: slot `s` reads column `s`, filled once a
@@ -507,13 +551,21 @@ impl Prompt {
             let cols = per_row * cut;
             ex.acts.push((k, cols, GemmAct::new(stream, cols, k)?));
         }
+        // NVFP4 planes take the native FP4 columns beside the q8 blocks where
+        // the build has them; every other type's forms are the q8 blocks alone.
+        let routed = sizes.routed_fp4.then_some(GgmlType::NVFP4);
         for &(k, per_row) in &sizes.gemm32_acts {
             let cols = per_row * cut;
-            ex.acts32.push((k, cols, GemmAct32::new(stream, cols, k)?));
+            ex.acts32
+                .push((k, cols, GemmAct32::new_routed_for(stream, cols, k, routed)?));
         }
         let mut runs: Vec<Q8Act> = Vec::new();
         for &k in &sizes.run_k {
             runs.push(Q8Act::with_k(stream, COLS, k)?);
+        }
+        let mut runs32: Vec<Q8Blocks32> = Vec::new();
+        for &k in &sizes.run32_k {
+            runs32.push(Q8Blocks32::new(stream, k, COLS)?);
         }
         let mut wide: Vec<(usize, WideActs)> = Vec::new();
         for &k in &sizes.wide_k {
@@ -550,6 +602,7 @@ impl Prompt {
                 ex,
                 arms: Arms {
                     runs,
+                    runs32,
                     wide,
                     route: GemmRoute::new(stream, cut, 1)?,
                 },
@@ -602,6 +655,11 @@ impl Prompt {
             + b.zero_ids.num_bytes()
             + b.slots.iter().map(|s| s.2.device_bytes()).sum::<usize>()
             + b.arms.runs.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + b.arms
+                .runs32
+                .iter()
+                .map(|a| a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes())
+                .sum::<usize>()
             + b.arms.wide.iter().map(|a| a.1.bytes()).sum::<usize>()
             + b.arms.route.bytes()
             + b.ex.routes.iter().map(|r| r.1.bytes()).sum::<usize>()
@@ -645,9 +703,11 @@ struct Cx<'a> {
 /// `y = W · x` for site `s` over the pass's `m` rows of `x` (`s.k` values a
 /// row), `rows` output values a row, token-major. Up to [`COLS`] rows runs of
 /// up to [`COLS`] columns, each its family's multi-column gemv (the step's
-/// sums); a Q8_0 or NVFP4 site past [`COLS`] rows is one 32-value GEMM over
-/// the pass's table ([`site::gemm`]), on the rows' q8 blocks of 32. A type the
-/// pass does not run is refused by name.
+/// sums; an NVFP4 site at a width the q8_1 form does not take, the `_sel` gemv
+/// over the run's q8 blocks of 32, [`site::nvfp4_sel32_gemv`]); a Q8_0 or
+/// NVFP4 site past [`COLS`] rows is one 32-value GEMM over the pass's table
+/// ([`site::gemm`]), on the rows' q8 blocks of 32. A type the pass does not
+/// run is refused by name.
 fn project_rows(
     cx: &Cx<'_>,
     arms: &mut Arms,
@@ -682,6 +742,24 @@ fn project_rows(
             cx.m,
             y,
         );
+    }
+    if s.ty == SiteTy::Nvfp4 && s.reads() == Form::Q8Blocks32 {
+        // At most COLS rows, one run: the form quantizes its COLS columns (the
+        // pass's rows and, past them, rows the buffer's cut holds) and the
+        // gemv writes its COLS columns of `rows` values inside the buffer's cut.
+        let act = arms
+            .runs32
+            .iter_mut()
+            .find(|a| a.k() == s.k)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("no q8 blocks of 32 run form of width {}", s.k),
+                )
+            })?;
+        let fault = gpu.layer_sink(layer)?;
+        gpu.q5().enqueue_quantize_q8(gpu.stream(), x, act, fault)?;
+        return site::nvfp4_sel32_gemv(gpu, cx.kgemv, key, act, fault, y);
     }
     let mut c0 = 0;
     while c0 < cx.m {

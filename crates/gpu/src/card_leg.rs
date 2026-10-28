@@ -22,8 +22,8 @@
 //! prompt batch and a decode step leave the same bits for the same slot.
 //!
 //! The relu² form ([`Relu2Leg`]) is the same four launches for an expert with
-//! no gate, `h = relu(up · x)²`, over the 32-value-block types
-//! ([`kernels::card_sel32_runs`]) alone:
+//! no gate, `h = relu(up · x)²`, over the types [`kernels::card_relu2_runs`]
+//! admits alone, the 32-value-block types and NVFP4 in its planes:
 //! - the token's normed row in 32-value q8_1, once in the column of each of
 //!   its slots (`Q5Kernels::enqueue_quantize_q8_rep`), so the up is a
 //!   down-shaped `_sel` that reads column `s` for slot `s` ([`kernels::up`])
@@ -292,7 +292,8 @@ pub(crate) enum StackW<'a> {
 impl<'a> StackW<'a> {
     /// The resident routed stack `name` of `w` and its file type, for a walk
     /// whose route GEMM reads it ([`StackW::route`]): the file's blocks as
-    /// words or Q5_0 packed. Any other weight is refused by name as `what`'s.
+    /// words, Q5_0 packed, or NVFP4's planes (type [`GgmlType::NVFP4`]). Any
+    /// other weight is refused by name as `what`'s.
     pub(crate) fn resident(
         what: &'static str,
         w: &'a Weights,
@@ -301,10 +302,13 @@ impl<'a> StackW<'a> {
         match w.get(name) {
             Some(DevWeight::KQuant { ty, w, .. }) => Ok((*ty, StackW::Words(w))),
             Some(DevWeight::Q5_0 { w, .. }) => Ok((GgmlType::Q5_0, StackW::Q5_0(w))),
+            Some(DevWeight::Nvfp4Stack { .. }) => {
+                Ok((GgmlType::NVFP4, StackW::Nvfp4(w.nvfp4_stack(what, name)?)))
+            }
             _ => Err(GpuError::tensor(
                 what,
                 name,
-                "a resident routed stack (the file's blocks as words, or Q5_0 packed)",
+                "a resident routed stack (the file's blocks as words, Q5_0 packed, or NVFP4 planes)",
             )),
         }
     }
@@ -1060,6 +1064,7 @@ impl CardLeg {
             q51: &self.q51,
             q80: &self.q80,
             iq: &self.quant,
+            nvfp4: &self.nvfp4,
         }
     }
 
@@ -1430,6 +1435,7 @@ impl CardLeg {
                     sel,
                     n_slots: slots,
                     rows_per_expert,
+                    slots_per_col,
                 };
                 self.sel32(gpu).enqueue(stream, &run, fault, down)?;
             }
@@ -1523,13 +1529,16 @@ struct Sel32<'a> {
     q51: &'a Q51SelKernels,
     q80: &'a Q80SelKernels,
     iq: &'a QuantSelKernels,
+    nvfp4: &'a Nvfp4SelKernels,
 }
 
 /// One 32-value-block `_sel` launch: slot `s` writes the `rows_per_expert`
 /// rows of expert `sel[s]` of `stack` dotted with column `s` of `act`, to
 /// `y[s · rows_per_expert ..]`. `entry` is the table's row for the stack's
 /// type, [`kernels::down`]'s for a down and [`kernels::up`]'s for an up (one
-/// entry: an up is a down-shaped `_sel`).
+/// entry: an up is a down-shaped `_sel`). `slots_per_col` is the slots of a
+/// token, which the NVFP4 entry reads to serve a run of tokens whose slots
+/// can name one expert.
 #[derive(Clone, Copy)]
 struct Sel32Run<'a> {
     entry: DownEntry,
@@ -1538,6 +1547,7 @@ struct Sel32Run<'a> {
     sel: &'a DeviceBuffer<u32>,
     n_slots: usize,
     rows_per_expert: usize,
+    slots_per_col: usize,
 }
 
 impl Sel32<'_> {
@@ -1557,6 +1567,7 @@ impl Sel32<'_> {
             sel,
             n_slots,
             rows_per_expert,
+            slots_per_col,
         } = *run;
         match entry {
             DownEntry::Q5_0 => self.q5.enqueue_gemv_q5_0_sel_at(
@@ -1597,13 +1608,24 @@ impl Sel32<'_> {
                 };
                 self.iq.enqueue_down(stream, &d, fault, y)
             }
+            DownEntry::Nvfp4 => {
+                let d = Nvfp4Down {
+                    w: stack.planes()?,
+                    act,
+                    sel,
+                    n_slots,
+                    rows_per_expert,
+                    slots_per_col,
+                };
+                self.nvfp4.enqueue_sel32(stream, &d, fault, y)
+            }
             _ => Err(stack.unrun()),
         }
     }
 }
 
 /// A layer's two resident routed stacks of an expert with no gate: the up and
-/// the down, each of a type [`kernels::card_sel32_runs`] admits (not
+/// the down, each of a type [`kernels::card_relu2_runs`] admits (not
 /// necessarily the same one).
 pub struct Relu2Stacks<'a> {
     up: LegStack<'a>,
@@ -1612,16 +1634,17 @@ pub struct Relu2Stacks<'a> {
 
 impl<'a> Relu2Stacks<'a> {
     /// The stacks named `[up, down]` in `w`, each a resident
-    /// `DevWeight::KQuant` of a 32-value-block type the relu² form runs, or
-    /// for Q5_0 a `DevWeight::Q5_0` in the packed layout its entry reads.
+    /// `DevWeight::KQuant` of a 32-value-block type the relu² form runs, for
+    /// Q5_0 a `DevWeight::Q5_0` in the packed layout its entry reads, or for
+    /// NVFP4 a `DevWeight::Nvfp4Stack` in its planes.
     /// Allocation-free on success.
     pub fn of(w: &'a Weights, names: [&'a str; 2]) -> Result<Relu2Stacks<'a>, GpuError> {
-        const UP: &str = "a resident routed up stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
-        const DOWN: &str = "a resident routed down stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
+        const UP: &str = "a resident routed up stack of a type the relu² card leg runs (`kernels::card_relu2_runs`)";
+        const DOWN: &str = "a resident routed down stack of a type the relu² card leg runs (`kernels::card_relu2_runs`)";
         let [up, down] = names;
         Ok(Relu2Stacks {
-            up: LegStack::of(w, up, kernels::card_sel32_runs, UP)?,
-            down: LegStack::of(w, down, kernels::card_sel32_runs, DOWN)?,
+            up: LegStack::of(w, up, kernels::card_relu2_runs, UP)?,
+            down: LegStack::of(w, down, kernels::card_relu2_runs, DOWN)?,
         })
     }
 
@@ -1721,6 +1744,7 @@ pub struct Relu2Leg {
     q51: Q51SelKernels,
     q80: Q80SelKernels,
     iq: QuantSelKernels,
+    nvfp4: Nvfp4SelKernels,
     slots: CardSlotKernels,
 }
 
@@ -1732,17 +1756,19 @@ impl Relu2Leg {
             q51: Q51SelKernels::load(ctx, word)?,
             q80: Q80SelKernels::load(ctx, word)?,
             iq: QuantSelKernels::load(ctx, word)?,
+            nvfp4: Nvfp4SelKernels::load(ctx, word)?,
             slots: CardSlotKernels::load(ctx)?,
         })
     }
 
-    /// The modules the 32-value-block `_sel`s run on, the q5 module `gpu`'s.
+    /// The modules the 32-value `_sel`s run on, the q5 module `gpu`'s.
     fn sel32<'a>(&'a self, gpu: &'a Gpu) -> Sel32<'a> {
         Sel32 {
             q5: gpu.q5(),
             q51: &self.q51,
             q80: &self.q80,
             iq: &self.iq,
+            nvfp4: &self.nvfp4,
         }
     }
 
@@ -1802,6 +1828,7 @@ impl Relu2Leg {
             sel: run.sel,
             n_slots: slots,
             rows_per_expert: ff,
+            slots_per_col,
         };
         sel32.enqueue(stream, &up, fault, h)?;
         let q = QuantSel {
@@ -1819,6 +1846,7 @@ impl Relu2Leg {
             sel: run.sel,
             n_slots: slots,
             rows_per_expert: n,
+            slots_per_col,
         };
         sel32.enqueue(stream, &dn, fault, down)?;
         let Some(sum) = sum else {
@@ -2797,8 +2825,8 @@ pub(crate) mod tests {
     /// whose layers' downs read either), for a run of every token the buffers
     /// hold and of fewer. A slot the card serves holds a
     /// finite value the run wrote, a host slot what it held, and the rows are
-    /// the hand launches' bit for bit; a stack the leg holds in planes is
-    /// refused by the relu² form by name.
+    /// the hand launches' bit for bit; the up and down stacks the leg holds in
+    /// planes are the relu² form's as well, of the shape's rows and widths.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_the_leg_runs_the_nvfp4_arms_as_their_sel_launches() {
@@ -2813,7 +2841,20 @@ pub(crate) mod tests {
         nvfp4_stack(&gpu, &mut w, names[2], N, FF, 0x33);
         let stacks = LegStacks::of(&w, names).expect("the stacks");
         stacks.check(N_CARD, SHAPE).expect("the stacks' shape");
-        assert!(Relu2Stacks::of(&w, [names[1], names[2]]).is_err());
+        Relu2Stacks::of(&w, [names[1], names[2]])
+            .expect("the relu² form's stacks")
+            .check(N_CARD, SHAPE)
+            .expect("the relu² stacks' shape");
+        // A prompt walk's route GEMM reads a resident NVFP4 stack as its planes.
+        let (ty, stack) = StackW::resident(WHAT, &w, names[1]).expect("a resident NVFP4 stack");
+        assert_eq!(ty, GgmlType::NVFP4);
+        assert!(
+            matches!(
+                stack.route(ty),
+                Some(RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(_)))
+            ),
+            "the 32-value GEMM reads an NVFP4 stack as its planes"
+        );
         let host_normed: Vec<f32> = (0..CAP * N)
             .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
             .collect();
@@ -3596,8 +3637,10 @@ pub(crate) mod tests {
     }
 
     /// The relu² form against the launches it is made of, run by hand on
-    /// buffers of exactly the run's slots, for every type of both roles
-    /// (`R2_CASES`) at Lightning's widths and `R2_RUNS` tokens of six slots
+    /// buffers of exactly the run's slots, for every 32-value-block type of both
+    /// roles (`R2_CASES`: [`kernels::card_sel32_runs`]'s; the NVFP4 planes' arms
+    /// are `hw_the_leg_runs_the_nvfp4_arms_as_their_sel_launches`'s) at
+    /// Lightning's widths and `R2_RUNS` tokens of six slots
     /// through buffers of `R2_CAP`: the q8_1 columns after the repeating
     /// quantizer and after the squared-ReLU select quantizer are the plain
     /// quantizer's of the repeated rows and the select quantizer's of

@@ -5,8 +5,8 @@
 //! [`read`] refuses a file whose features no program runs, every one listed);
 //! the plan is the hybrid trunk's ([`PlanInputs::plan_with`]): the whole model
 //! on one card, each routed stack in the format the body's `_sel` launches
-//! read (IQ2_XXS, or a 32-value-block type in the card leg's relu² form:
-//! [`crate::placement::accepts::latent_leg_runs`]), and the routed experts where
+//! read (IQ2_XXS, or a 32-value-block type or NVFP4 in its planes in the card
+//! leg's relu² form: [`crate::placement::accepts::latent_leg_runs`]), and the routed experts where
 //! [`Experts`] says. [`PlanInputs::plan`]
 //! is the whole card's. A plan under [`Experts::Placed`] or [`Experts::Host`]
 //! may put experts on the host; the load still refuses that until the body has
@@ -16,13 +16,15 @@
 //! layer's scan state and conv ring; a latent MoE layer holds nothing
 //! ([`Holds`]).
 
-use gguf::Split;
+use gguf::{GgmlType, Split};
 
 use super::hparams::{Hparams, Kind};
 use super::spec;
 pub use crate::arch::hybrid::{Experts, Holds, KvLayout, PlaceError, PlanInputs};
 use crate::placement::PlacementError;
-use crate::placement::kernels::{card_sel32_runs, q8_act_bytes};
+use crate::placement::kernels::{
+    card_planes_runs, card_relu2_runs, q8_act_bytes, q8_blocks32_bytes,
+};
 
 /// The rows the plan keeps a prompt pass's buffers for: the host union's columns, the most a
 /// placed load's pass takes. A whole-card load's pass is the card's room, at least these.
@@ -88,8 +90,15 @@ pub struct PassDims {
     pub gemm_acts: Vec<(usize, usize)>,
     /// The 32-value GEMM forms of 32-value routed stacks, `(k, slots a row)`.
     pub gemm32_acts: Vec<(usize, usize)>,
-    /// The NVFP4 gemv run forms' widths.
+    /// The forms of `gemm32_acts` that also hold the native FP4 columns
+    /// ([`native_act_col_bytes`]): those of NVFP4 routed stacks, at a width of whole 64-value
+    /// steps, on a build with native FP4 products.
+    pub native32_acts: Vec<(usize, usize)>,
+    /// The NVFP4 gemv run forms' widths, at the widths the q8_1 form takes.
     pub run_k: Vec<usize>,
+    /// The NVFP4 gemv run forms' widths at the widths it does not: [`COLS`] columns of q8 blocks
+    /// of 32 for the `_sel` gemv.
+    pub run32_k: Vec<usize>,
     /// The q8 blocks of 32 the wide GEMMs read, one a site width.
     pub wide_k: Vec<usize>,
     /// Whether the pass runs on a placed load: its rows' places and the host's sums are buffers of
@@ -106,6 +115,13 @@ fn act_col_bytes(k: usize) -> usize {
 /// scales and two sums.
 fn act32_col_bytes(k: usize) -> usize {
     k.div_ceil(GEMM32_STEP) * (16 + 2 + 2) * 4
+}
+
+/// Bytes of one native FP4 column of `k` values (a multiple of 64) beside a `GemmAct32` column:
+/// a code nibble a value (`k / 8` words), a scale word a 64-value step (`k / 64` words) and the
+/// column's f32 scale.
+fn native_act_col_bytes(k: usize) -> usize {
+    k / 2 + k / 16 + size_of::<f32>()
 }
 
 /// Bytes of a `GemmRoute` table for `slots` slots over `experts` experts.
@@ -128,8 +144,9 @@ fn route_bytes(slots: usize, experts: usize) -> usize {
 /// `d_inner` rows; the query and attention rows (`2 · n_head · HEAD`); the host sums on a placed
 /// load (`width`); the flash's partials for at most [`MAX_PASS_ROWS`] rows; the word record, the
 /// ids, the places, the shared expert's slots and the positions; the GEMM routes and activation
-/// forms, the 32-value GEMMs' among them; the flash split's sub-group rows; and the Mamba-2 pass
-/// scratch.
+/// forms, the 32-value GEMMs' among them and the native FP4 columns beside those of NVFP4 stacks;
+/// the gemv run forms, the q8_1 ones and the 32-value ones of an NVFP4 site at a width the q8_1
+/// form does not take; the flash split's sub-group rows; and the Mamba-2 pass scratch.
 #[must_use]
 pub fn pass_bytes(d: &PassDims, rows: usize) -> usize {
     let cut = rows.next_multiple_of(COLS);
@@ -168,6 +185,10 @@ pub fn pass_bytes(d: &PassDims, rows: usize) -> usize {
         + d.gemm32_acts
             .iter()
             .map(|&(k, per_row)| per_row * cut * act32_col_bytes(k))
+            .sum::<usize>()
+        + d.native32_acts
+            .iter()
+            .map(|&(k, per_row)| per_row * cut * native_act_col_bytes(k))
             .sum::<usize>();
     let forms = d
         .slots
@@ -177,6 +198,10 @@ pub fn pass_bytes(d: &PassDims, rows: usize) -> usize {
         + d.run_k
             .iter()
             .map(|&k| COLS * act_col_bytes(k))
+            .sum::<usize>()
+        + d.run32_k
+            .iter()
+            .map(|&k| q8_blocks32_bytes(COLS as u64, k as u64) as usize)
             .sum::<usize>()
         + d.wide_k
             .iter()
@@ -195,27 +220,46 @@ fn add<T: PartialEq>(list: &mut Vec<T>, item: T) {
 }
 
 /// Which of the body's two card forms a file's routed stacks take ([`forms_of`]): IQ2_XXS (the
-/// `_sel` fallback's q8_1 forms and the grouped GEMM's), and a 32-value-block type (the 32-value
-/// GEMM's forms; the relu² form's step buffers are scratch, not the pass's).
+/// `_sel` fallback's q8_1 forms and the grouped GEMM's), and a type the relu² form runs, a
+/// 32-value-block type or NVFP4 in its planes (the 32-value GEMM's forms; the relu² form's step
+/// buffers are scratch, not the pass's). `fp4` marks the NVFP4 planes among the second: their
+/// 32-value GEMM forms may hold the native FP4 columns beside them ([`PassDims::native32_acts`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Forms {
     pub iq2: bool,
     pub sel32: bool,
+    pub fp4: bool,
+}
+
+impl Forms {
+    /// These forms and the one a routed up stack of file type `ty` takes: IQ2_XXS counts `iq2`, a
+    /// type the relu² form runs ([`card_relu2_runs`]) `sel32` (and `fp4` for NVFP4 and NVFP4_ROWS),
+    /// any other type neither.
+    #[must_use]
+    pub fn with_up(mut self, ty: GgmlType) -> Forms {
+        match ty {
+            GgmlType::IQ2_XXS => self.iq2 = true,
+            ty if card_relu2_runs(ty) => {
+                self.sel32 = true;
+                self.fp4 |= card_planes_runs(ty);
+            }
+            _ => {}
+        }
+        self
+    }
 }
 
 /// The forms `split`'s routed up stacks take, over every MoE layer of `hp`: a layer whose up is
-/// IQ2_XXS counts the first, one of a 32-value-block type the second. A layer of another type
-/// counts neither (its experts stay on the host: the coverage pin names it, and the load refuses
-/// a pair of two forms by name).
+/// IQ2_XXS counts the first, one of a type the relu² form runs the second ([`Forms::with_up`]). A
+/// layer of another type counts neither (its experts stay on the host: the coverage pin names it,
+/// and the load refuses a pair of two forms by name).
 #[must_use]
 pub fn forms_of(split: &Split, hp: &Hparams) -> Forms {
     let mut forms = Forms::default();
     for (l, _) in hp.experts.iter().enumerate().filter(|(_, e)| e.is_some()) {
         let name = crate::arch::names::blk(l, super::names::FFN_UP_EXPS);
-        match split.find(&name).map(|(_, t)| t.ty) {
-            Some(gguf::GgmlType::IQ2_XXS) => forms.iq2 = true,
-            Some(ty) if card_sel32_runs(ty) => forms.sel32 = true,
-            _ => {}
+        if let Some((_, t)) = split.find(&name) {
+            forms = forms.with_up(t.ty);
         }
     }
     forms
@@ -228,7 +272,11 @@ pub fn forms_of(split: &Split, hp: &Hparams) -> Forms {
 /// their own form), a router table at the layer's whole expert count, and every site width as a
 /// gemv run form and as a wide GEMM form (the body's, the NVFP4 and the Q8_0 sites' only): the
 /// Mamba-2 in-projection's `hidden` and the out-projection's `d_inner`, the attention's `hidden`
-/// and `n_head · value_len`, the latent pair and the shared expert.
+/// and `n_head · value_len`, the latent pair and the shared expert. The q8_1 run form of a width
+/// holds at least the 32-value run form an NVFP4 site at a width the q8_1 form does not take
+/// reads, so the body's `run32_k` is inside `run_k`; the native FP4 columns are counted for every
+/// 32-value GEMM form of an NVFP4 file at a width of whole 64-value steps, as a build with native
+/// FP4 products makes them (the plan does not know the build).
 #[must_use]
 pub fn pass_dims(hp: &Hparams, forms: Forms) -> PassDims {
     let width = hp.experts_width() as usize;
@@ -283,8 +331,18 @@ pub fn pass_dims(hp: &Hparams, forms: Forms) -> PassDims {
         slots,
         route_n: experts().map(|e| e.n_expert).collect(),
         gemm_acts,
+        native32_acts: if forms.fp4 {
+            gemm32_acts
+                .iter()
+                .copied()
+                .filter(|&(k, _)| k.is_multiple_of(GEMM32_STEP))
+                .collect()
+        } else {
+            Vec::new()
+        },
         gemm32_acts,
         run_k: sites.clone(),
+        run32_k: Vec::new(),
         wide_k: sites,
         placed: true,
     }
@@ -339,7 +397,9 @@ pub fn kv_layout(hp: &Hparams) -> KvLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{PASS_ROWS, PassDims, pass_bytes};
+    use super::{COLS, Forms, PASS_ROWS, PassDims, act_col_bytes, pass_bytes};
+    use crate::placement::kernels::q8_blocks32_bytes;
+    use gguf::GgmlType;
 
     /// Bolt's widths as the plan collects them ([`super::pass_dims`]): 4,096 wide; 32 query heads
     /// over 2 key heads of 128; Mamba-2 of inner 8,192, 128 heads and 10,240 conv channels; routed
@@ -376,7 +436,9 @@ mod tests {
                 .collect(),
             gemm_acts,
             gemm32_acts: Vec::new(),
+            native32_acts: Vec::new(),
             run_k: vec![4096, 8192, 1024, 5376],
+            run32_k: Vec::new(),
             wide_k: vec![4096, 8192, 1024, 5376],
             placed,
         }
@@ -411,5 +473,71 @@ mod tests {
         let base = pass_bytes(&d, PASS_ROWS);
         d.gemm32_acts = vec![(2688, 1), (1856, 6)];
         assert_eq!(pass_bytes(&d, PASS_ROWS) - base, 8_847_360);
+    }
+
+    /// The native FP4 columns beside Lightning's 32-value GEMM forms are 3,995,648 B of the pass
+    /// at the union's 512 rows [derived]: a column of `k` values holds `k / 2` bytes of codes,
+    /// `k / 16` of block scales and one f32 scale, 1,516 B at 2,688 and 1,048 B at 1,856, over
+    /// 512 columns and 6 x 512. Mutant: the codes counted a byte a value, or the term left out
+    /// of `pass_bytes`.
+    #[test]
+    fn the_native_fp4_columns_are_their_columns_at_the_unions_rows() {
+        let mut d = bolt(true);
+        d.gemm32_acts = vec![(2688, 1), (1856, 6)];
+        let base = pass_bytes(&d, PASS_ROWS);
+        d.native32_acts = d.gemm32_acts.clone();
+        assert_eq!(pass_bytes(&d, PASS_ROWS) - base, 3_995_648);
+    }
+
+    /// The 32-value run forms of Lightning's NVFP4 shared expert (a site at 2,688 and at 3,712
+    /// values, widths the q8_1 form does not take) are 70,144 B of the pass [derived]: 8 columns
+    /// of 3,744 B and of 5,024 B. The plan's q8_1 run forms at the same widths, which it counts
+    /// for every site width, hold at least as much, so the plan's reserve covers them. Mutant:
+    /// the term left out of `pass_bytes`.
+    #[test]
+    fn the_32_value_run_forms_are_inside_the_plans_q8_1_run_forms() {
+        let mut d = bolt(true);
+        let base = pass_bytes(&d, PASS_ROWS);
+        d.run32_k = vec![2688, 3712];
+        assert_eq!(pass_bytes(&d, PASS_ROWS) - base, 8 * 3_744 + 8 * 5_024);
+        for k in [2688, 3712] {
+            let blocks32 = q8_blocks32_bytes(COLS as u64, k as u64) as usize;
+            assert!(COLS * act_col_bytes(k) >= blocks32, "k = {k}");
+        }
+    }
+
+    /// A routed up stack counts the form its file type takes: IQ2_XXS the first, the four
+    /// 32-value-block types the second, NVFP4 and NVFP4_ROWS the second and the native FP4
+    /// columns, any other type none. Mutant: the rule over `card_sel32_runs`, which counts NVFP4
+    /// and NVFP4_ROWS none.
+    #[test]
+    fn a_routed_up_counts_the_form_its_type_takes() {
+        let of = |ty| Forms::default().with_up(ty);
+        let iq2 = Forms {
+            iq2: true,
+            ..Forms::default()
+        };
+        let sel32 = Forms {
+            sel32: true,
+            ..Forms::default()
+        };
+        let fp4 = Forms {
+            sel32: true,
+            fp4: true,
+            ..Forms::default()
+        };
+        assert_eq!(of(GgmlType::IQ2_XXS), iq2);
+        for ty in [
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::IQ4_NL,
+        ] {
+            assert_eq!(of(ty), sel32, "{ty}");
+        }
+        for ty in [GgmlType::NVFP4, GgmlType::NVFP4_ROWS] {
+            assert_eq!(of(ty), fp4, "{ty}");
+        }
+        assert_eq!(of(GgmlType::Q4_K), Forms::default());
     }
 }

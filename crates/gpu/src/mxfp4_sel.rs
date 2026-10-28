@@ -64,7 +64,8 @@
 //!   ([`lane_partials`]), multiplies each reduced dot by its stack's scale of
 //!   expert `sel[s]` and writes `act::apply_checked` of the two.
 //! - `nvfp4_gemv_sel32`: slot `s` dots the rows of expert `sel[s]` of the
-//!   down stack with column `s` of a [`Q8Blocks32`] ([`lane_partials`],
+//!   down stack (or, in the relu² form, the up stack) with column `s` of a
+//!   [`Q8Blocks32`] ([`lane_partials`],
 //!   one scale a 32-value unit), times the stack's scale of expert `sel[s]`.
 //!   The 32-value form takes any row width the format does (a multiple of
 //!   64), where a `Q8Act` takes whole 256-value super-blocks only.
@@ -1769,7 +1770,9 @@ pub struct Nvfp4GateUp<'a> {
     pub rule: Act,
 }
 
-/// An NVFP4 down launch ([`Nvfp4SelKernels::enqueue_down`]).
+/// An NVFP4 `_sel` launch over the 32-value activation ([`Nvfp4SelKernels::enqueue_sel32`]): a
+/// routed down ([`Nvfp4SelKernels::enqueue_down`]), the up of the relu² form (an up is a
+/// down-shaped `_sel`, slot `s` over column `s`) or a dense site's one expert.
 pub struct Nvfp4Down<'a> {
     pub w: Nvfp4Stack<'a>,
     /// At least `n_slots` 32-value q8_1 columns: column `s` is read for `s <
@@ -1889,18 +1892,20 @@ impl Nvfp4SelKernels {
         Ok(())
     }
 
-    /// Enqueue the NVFP4 down `_sel`: slot `s` writes `y[s · rows_per_expert
-    /// ..][..rows_per_expert]` (module doc). A stack of another width than
-    /// the activation's, fewer activation columns or ids than slots, or a
-    /// short `y` are named errors. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_down(
+    /// Enqueue the NVFP4 `_sel` over the 32-value activation: slot `s` writes
+    /// `y[s · rows_per_expert ..][..rows_per_expert]` (module doc). The launch of
+    /// a routed down, of the relu² form's up and of a dense site read as a stack of
+    /// one expert; the rows are the stack's, whatever the role. A stack of another
+    /// width than the activation's, fewer activation columns or ids than slots, or
+    /// a short `y` are named errors. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_sel32(
         &self,
         stream: &CudaStream,
         a: &Nvfp4Down<'_>,
         fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "Nvfp4SelKernels::enqueue_down";
+        let what = "Nvfp4SelKernels::enqueue_sel32";
         let (n_slots, rpe, k) = (a.n_slots, a.rows_per_expert, a.act.k());
         if a.slots_per_col == 0 {
             return Err(GpuError::shape(
@@ -1948,6 +1953,18 @@ impl Nvfp4SelKernels {
             launch!(prepare_nvfp4_gemv_sel32, nvfp4_gemv_sel32);
         }
         Ok(())
+    }
+
+    /// [`Nvfp4SelKernels::enqueue_sel32`] of a routed down: slot `s` writes `y[s ·
+    /// rows_per_expert ..][..rows_per_expert]` (module doc).
+    pub fn enqueue_down(
+        &self,
+        stream: &CudaStream,
+        a: &Nvfp4Down<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_sel32(stream, a, fault, y)
     }
 }
 

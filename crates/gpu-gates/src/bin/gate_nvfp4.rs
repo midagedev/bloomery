@@ -35,6 +35,18 @@
 //! output inside the same band as above (a 32-value block a scale), no fault raised. A site
 //! that read the q8_1 rows at these widths is refused by its launch contract.
 //!
+//! `nvfp4_relu2_pair_lightning_widths`: Lightning's relu² routed pair, an up of 1,856 rows of
+//! 2,688 values and a down of 2,688 rows of 1,856 an expert (neither width a multiple of 256),
+//! four experts on the card, six slots a token with duplicates inside and across tokens, every
+//! expert and a `HOST` slot in each token, at one token and at three. The pair is run by hand
+//! (the 32-value quantizer of each slot's row, `Nvfp4SelKernels::enqueue_sel32` over the up, the
+//! host's `max(v, 0)²`, the quantizer, `enqueue_sel32` over the down) and each stage is held to
+//! the host rule on the card's own read-back columns: `bits` equal to `lane_partial_host::<Nvfp4,
+//! 0>`, the butterfly and the expert's scale, and inside the band above, no fault raised, a `HOST`
+//! slot's rows at the sentinel. Then the leg's relu² form (`Relu2Leg` over the `Relu2Stacks` the
+//! planner's rule admits, one run at the same places) gives the hand pair's down rows bit for
+//! bit, a `HOST` slot's rows as its fresh buffers hold them, no fault raised.
+//!
 //! The routed pair (`bloomery_gpu::mxfp4_sel`: `Nvfp4SelKernels`) at
 //! Qwen3.8's widths, the gate and up stacks 640 rows of 2,560 an expert and
 //! the down 2,560 rows of 640, six experts in the file, each with a scale of
@@ -399,6 +411,7 @@ mod gate {
         }
         ok &= two_shards(gpu, dir)?;
         ok &= routed::run(gpu, dir)?;
+        ok &= relu2::run(gpu, dir)?;
         Ok(ok)
     }
 
@@ -1203,6 +1216,269 @@ mod gate {
                 verdict(band)
             );
             clean && sentinel && bits == card.len() && band
+        }
+    }
+
+    /// The `nvfp4_relu2_pair_lightning_widths` clause (module doc): Lightning's relu² routed pair
+    /// as the common leg's relu² form runs it, against the same pair run by hand through the
+    /// kernels and a host transcription of the squared ReLU.
+    mod relu2 {
+        use super::{dequant_rows, host_rule, judge, nvfp4_bytes, tally, weight_decls};
+        use bloomery_gpu::Gpu;
+        use bloomery_gpu::card_leg::{LegShape, Relu2Bufs, Relu2Leg, Relu2Run, Relu2Stacks};
+        use bloomery_gpu::hybrid::HOST;
+        use bloomery_gpu::mxfp4::{NV_BLOCK_BYTES, NV_BLOCK_VALUES};
+        use bloomery_gpu::mxfp4_sel::{Nvfp4Down, Nvfp4SelKernels};
+        use bloomery_gpu::q5::Q8Blocks32;
+        use bloomery_gpu::weights::Weights;
+        use bloomery_gpu_gates::{GateError, GateRng, par_map, verdict, write_gguf};
+        use cuda_core::DeviceBuffer;
+        use gguf::Split;
+        use std::path::Path;
+
+        /// Lightning's hidden width and routed width, neither a multiple of 256: the up's row width
+        /// and the down's.
+        const N: usize = 2688;
+        const FF: usize = 1856;
+        /// Experts in the file, all on the card.
+        const EXPERTS: usize = 4;
+        /// Slots a token (Lightning's top 6) and the tokens the leg's buffers hold.
+        const SPC: usize = 6;
+        const CAP: usize = 3;
+        /// Three tokens' places: every expert, duplicates inside a token and across tokens, and a
+        /// `HOST` slot in each.
+        const SEL: [u32; CAP * SPC] = [
+            2, 0, HOST, 3, 0, 1, //
+            1, 1, 2, HOST, 3, 0, //
+            3, 2, 0, 0, HOST, 1,
+        ];
+        /// The runs: one token, and the buffers' cap.
+        const RUNS: [usize; 2] = [1, CAP];
+        /// What a slot the hand launches leave alone still holds.
+        const SENT: f32 = 1.0e30;
+
+        pub(super) fn run(gpu: &Gpu, dir: &Path) -> Result<bool, GateError> {
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            // The up and the down stacks as a file holds them, a tensor scale an expert.
+            let parts = [("up", FF, N, 0x5eed_0301u64), ("down", N, FF, 0x5eed_0302)];
+            let mut decls = Vec::new();
+            let mut raw: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
+            for (part, rows, k, seed) in parts {
+                let bytes = nvfp4_bytes(EXPERTS * rows, k, seed);
+                let mut rng = GateRng(seed ^ 0x5ca1e);
+                let scales: Vec<f32> = (0..EXPERTS).map(|_| rng.uni(0.004, 0.02)).collect();
+                decls.extend(weight_decls(
+                    &format!("blk.0.ffn_{part}_exps"),
+                    &[k, rows, EXPERTS],
+                    bytes.clone(),
+                    &scales,
+                ));
+                raw.push((bytes, scales));
+            }
+            let path = dir.join("relu2.gguf");
+            write_gguf(&path, &[], &decls)?;
+            let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let names = ["blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"];
+            let w = Weights::load_where(stream, &split, |n| n == names[0] || n == names[1])?;
+            let planes = [
+                w.nvfp4_stack("gate_nvfp4", names[0])?,
+                w.nvfp4_stack("gate_nvfp4", names[1])?,
+            ];
+            // The host rule's weights: every expert's rows dequantized.
+            let deq: Vec<Vec<Vec<Vec<f32>>>> = raw
+                .iter()
+                .zip(parts)
+                .map(|((bytes, _), (_, rows, k, _))| {
+                    (0..EXPERTS)
+                        .map(|e| dequant_rows(bytes, e * rows..(e + 1) * rows, k))
+                        .collect()
+                })
+                .collect();
+            // Row `r` of expert `e` of part `part` against one quantized column, by the host rule
+            // with the expert's tensor scale.
+            let rule = |part: usize, e: u32, r: usize, q: &[i8], d: &[f32]| {
+                let (rows, k) = (parts[part].1, parts[part].2);
+                let row_bytes = k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
+                let (bytes, scales) = &raw[part];
+                let row = &bytes[(e as usize * rows + r) * row_bytes..][..row_bytes];
+                host_rule(
+                    row,
+                    &deq[part][e as usize][r],
+                    (q, d),
+                    32,
+                    scales[e as usize],
+                )
+            };
+
+            let nv = Nvfp4SelKernels::load(gpu.context(), gpu.fault_word())?;
+            let leg = Relu2Leg::load(gpu)?;
+            let stacks = Relu2Stacks::of(&w, names)?;
+            let shape = LegShape {
+                cap: CAP,
+                slots_per_col: SPC,
+                n: N,
+                ff: FF,
+            };
+            stacks.check(EXPERTS, shape)?;
+            let mut rng = GateRng(0x5eed_0303);
+            let x: Vec<f32> = (0..CAP * N).map(|_| rng.uni(-2.0, 2.0)).collect();
+            let mut ok = true;
+            for m in RUNS {
+                let slots = m * SPC;
+                let sel = &SEL[..slots];
+                let sel_dev = DeviceBuffer::from_host(stream, sel)?;
+                let tag = format!("m={m} slots={slots}");
+                let card = |s: &usize| sel[*s] != HOST;
+
+                // The hand pair's up: each slot's column its token's row, quantized in 32-value
+                // blocks, then the `_sel` over the up stack.
+                let rows: Vec<f32> = (0..slots)
+                    .flat_map(|s| x[(s / SPC) * N..][..N].iter().copied())
+                    .collect();
+                let rows_dev = DeviceBuffer::from_host(stream, &rows)?;
+                let mut act_x = Q8Blocks32::with_slots(stream, N, slots)?;
+                gpu.q5()
+                    .enqueue_quantize_q8(stream, &rows_dev, &mut act_x, sink)?;
+                let mut h_dev = DeviceBuffer::from_host(stream, &vec![SENT; slots * FF])?;
+                let up = Nvfp4Down {
+                    w: planes[0],
+                    act: &act_x,
+                    sel: &sel_dev,
+                    n_slots: slots,
+                    rows_per_expert: FF,
+                    slots_per_col: SPC,
+                };
+                nv.enqueue_sel32(stream, &up, sink, &mut h_dev)?;
+                let h = h_dev.to_host_vec(stream)?;
+                let up_fault = gpu.take_fault()?;
+                let back_x = act_x.readback(stream)?;
+                let cols_x: Vec<_> = (0..slots).map(|s| back_x.column(s, N, slots)).collect();
+                let per_up: Vec<(bool, f64, f64)> = par_map(slots * FF, |at| {
+                    let (s, r) = (at / FF, at % FF);
+                    if sel[s] == HOST {
+                        return (true, 0.0, 0.0);
+                    }
+                    let (q, d) = &cols_x[s];
+                    judge(h[at], rule(0, sel[s], r, q, d))
+                });
+                let cards: Vec<(bool, f64, f64)> = (0..slots)
+                    .filter(card)
+                    .flat_map(|s| per_up[s * FF..][..FF].iter().copied())
+                    .collect();
+                let (bits_up, band_up, worst_up) = tally(&cards);
+                let host_up = (0..slots)
+                    .filter(|s| !card(s))
+                    .all(|s| h[s * FF..][..FF].iter().all(|v| *v == SENT));
+                let pass_up = up_fault.is_none()
+                    && host_up
+                    && bits_up == cards.len()
+                    && band_up
+                    && (0..slots)
+                        .filter(card)
+                        .all(|s| h[s * FF..][..FF].iter().all(|v| v.is_finite()));
+                println!(
+                    "nvfp4 clause=nvfp4_relu2_pair_lightning_widths {tag} stage=up \
+                     fault_none={} host_slots_sentinel={host_up} bits_equal={bits_up}/{} \
+                     worst_err_over_band={worst_up:.3e} {}",
+                    up_fault.is_none(),
+                    cards.len(),
+                    verdict(pass_up)
+                );
+
+                // The squared ReLU on the host, the quantizer, and the `_sel` over the down stack.
+                let squared: Vec<f32> = h
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        if sel[i / FF] == HOST {
+                            return 0.0;
+                        }
+                        let r = v.max(0.0);
+                        r * r
+                    })
+                    .collect();
+                let squared_dev = DeviceBuffer::from_host(stream, &squared)?;
+                let mut act_h = Q8Blocks32::with_slots(stream, FF, slots)?;
+                gpu.q5()
+                    .enqueue_quantize_q8(stream, &squared_dev, &mut act_h, sink)?;
+                let mut y_dev = DeviceBuffer::from_host(stream, &vec![SENT; slots * N])?;
+                let down = Nvfp4Down {
+                    w: planes[1],
+                    act: &act_h,
+                    sel: &sel_dev,
+                    n_slots: slots,
+                    rows_per_expert: N,
+                    slots_per_col: SPC,
+                };
+                nv.enqueue_sel32(stream, &down, sink, &mut y_dev)?;
+                let y = y_dev.to_host_vec(stream)?;
+                let down_fault = gpu.take_fault()?;
+                let back_h = act_h.readback(stream)?;
+                let cols_h: Vec<_> = (0..slots).map(|s| back_h.column(s, FF, slots)).collect();
+                let per_down: Vec<(bool, f64, f64)> = par_map(slots * N, |at| {
+                    let (s, r) = (at / N, at % N);
+                    if sel[s] == HOST {
+                        return (true, 0.0, 0.0);
+                    }
+                    let (q, d) = &cols_h[s];
+                    judge(y[at], rule(1, sel[s], r, q, d))
+                });
+                let cards: Vec<(bool, f64, f64)> = (0..slots)
+                    .filter(card)
+                    .flat_map(|s| per_down[s * N..][..N].iter().copied())
+                    .collect();
+                let (bits_down, band_down, worst_down) = tally(&cards);
+                let host_down = (0..slots)
+                    .filter(|s| !card(s))
+                    .all(|s| y[s * N..][..N].iter().all(|v| *v == SENT));
+                let pass_down = down_fault.is_none()
+                    && host_down
+                    && bits_down == cards.len()
+                    && band_down
+                    && (0..slots)
+                        .filter(card)
+                        .all(|s| y[s * N..][..N].iter().all(|v| v.is_finite()));
+                println!(
+                    "nvfp4 clause=nvfp4_relu2_pair_lightning_widths {tag} stage=down \
+                     fault_none={} host_slots_sentinel={host_down} bits_equal={bits_down}/{} \
+                     worst_err_over_band={worst_down:.3e} {}",
+                    down_fault.is_none(),
+                    cards.len(),
+                    verdict(pass_down)
+                );
+
+                // The leg's relu² form over the same places: the hand pair's rows bit for bit, a
+                // `HOST` slot's rows as the fresh buffers hold them.
+                let normed = DeviceBuffer::from_host(stream, &x[..m * N])?;
+                let mut bufs = Relu2Bufs::new(stream, shape)?;
+                let run = Relu2Run {
+                    layer: 0,
+                    stacks: &stacks,
+                    normed: &normed,
+                    m,
+                    sel: &sel_dev,
+                    n_card: EXPERTS,
+                };
+                leg.enqueue(gpu, &mut bufs, &run, None)?;
+                let got = bufs.down().to_host_vec(stream)?;
+                let leg_fault = gpu.take_fault()?;
+                let equal = (0..slots)
+                    .filter(card)
+                    .all(|s| (0..N).all(|r| got[s * N + r].to_bits() == y[s * N + r].to_bits()));
+                let untouched = (0..slots)
+                    .filter(|s| !card(s))
+                    .all(|s| got[s * N..][..N].iter().all(|v| *v == 0.0));
+                let pass_leg = leg_fault.is_none() && equal && untouched;
+                println!(
+                    "nvfp4 clause=nvfp4_relu2_pair_lightning_widths {tag} stage=leg \
+                     fault_none={} rows_equal_the_hand_pair={equal} host_slots_untouched={untouched} {}",
+                    leg_fault.is_none(),
+                    verdict(pass_leg)
+                );
+                ok &= pass_up && pass_down && pass_leg;
+            }
+            Ok(ok)
         }
     }
 
