@@ -331,7 +331,7 @@ pub struct BlockDraft {
 Derived as methods, not fields:
 - `LayerSpec::sources()`, where `Own` resolves to the layer itself;
 - `Gqa::group()`;
-- `ModelSpec::{dense_lead, hash_layers, ratio_segments, engram_sites}`, for the meta gates.
+- `ModelSpec::{dense_lead, hash_layers}`, for the meta gates.
 
 **The V4-only fields.** None of the four targets needs these:
 - `Compressor.{ape, overlap}`;

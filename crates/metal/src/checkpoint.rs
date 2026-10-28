@@ -18,7 +18,7 @@ use std::fmt;
 
 use bloomery_device::{DeviceError, Elems};
 use objc2_metal::MTLDevice;
-use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Stats, Take};
+use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Take};
 
 use crate::buffer::MetalBuffer;
 use crate::handle::Handle;
@@ -148,12 +148,6 @@ impl Checkpoints {
     #[must_use]
     pub(crate) fn every(&self) -> u32 {
         self.every
-    }
-
-    /// The ledger's counts.
-    #[must_use]
-    pub(crate) fn stats(&self) -> Stats {
-        self.ledger.stats()
     }
 
     /// The checkpoints' positions, ascending.
