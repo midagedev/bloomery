@@ -8,6 +8,7 @@ use crate::folder::{self, FolderMap};
 
 pub mod glm5next;
 pub mod minimaxm3;
+pub mod nemotron_h;
 pub mod qwen35moe;
 pub mod qwen3moe;
 mod section;
@@ -90,10 +91,11 @@ pub fn module_class(module: &str) -> Option<hf::quant_config::ModuleClass> {
     let short = module
         .strip_prefix("model.language_model.")
         .or_else(|| module.strip_prefix("model."))
+        .or_else(|| module.strip_prefix("backbone."))
         .or_else(|| module.strip_prefix("mtp."))
         .unwrap_or(module);
     match short {
-        "embed_tokens" => return Some(Embedding),
+        "embed_tokens" | "embeddings" => return Some(Embedding),
         "lm_head" | "fc_embedding" | "fc_hidden" => return Some(Linear),
         "hyper_connection_mixer.input_mix_weight_down"
         | "hyper_connection_mixer.input_mix_weight_up" => return Some(Linear),
@@ -101,7 +103,10 @@ pub fn module_class(module: &str) -> Option<hf::quant_config::ModuleClass> {
     }
     let (layer, rest) = short.strip_prefix("layers.")?.split_once('.')?;
     layer.parse::<usize>().ok()?;
-    if let Some(expert) = rest.strip_prefix("mlp.experts.") {
+    if let Some(expert) = rest
+        .strip_prefix("mlp.experts.")
+        .or_else(|| rest.strip_prefix("mixer.experts."))
+    {
         let (id, projection) = expert.split_once('.')?;
         id.parse::<usize>().ok()?;
         return matches!(projection, "gate_proj" | "up_proj" | "down_proj").then_some(Linear);
@@ -152,6 +157,15 @@ pub fn module_class(module: &str) -> Option<hf::quant_config::ModuleClass> {
             | "mlp.shared_expert.up_proj"
             | "mlp.shared_expert.down_proj"
             | "mlp.shared_expert_gate"
+            | "mixer.in_proj"
+            | "mixer.out_proj"
+            | "mixer.q_proj"
+            | "mixer.k_proj"
+            | "mixer.v_proj"
+            | "mixer.o_proj"
+            | "mixer.gate"
+            | "mixer.shared_experts.up_proj"
+            | "mixer.shared_experts.down_proj"
             | "ple.key_proj"
             | "ple.value_proj"
     )
@@ -196,6 +210,17 @@ mod tests {
                 "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0",
                 Some(Embedding),
             ),
+            ("backbone.embeddings", Some(Embedding)),
+            ("backbone.layers.0.mixer.in_proj", Some(Linear)),
+            ("backbone.layers.1.mixer.gate", Some(Linear)),
+            ("backbone.layers.1.mixer.experts.7.up_proj", Some(Linear)),
+            (
+                "backbone.layers.1.mixer.shared_experts.down_proj",
+                Some(Linear),
+            ),
+            ("mtp.layers.0.mixer.q_proj", Some(Linear)),
+            ("backbone.layers.0.mixer.conv1d", None),
+            ("backbone.layers.0.mixer.unknown_proj", None),
             ("model.layers.0.input_layernorm", None),
             ("model.language_model.layers.0.linear_attn.conv1d", None),
             (

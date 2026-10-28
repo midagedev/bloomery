@@ -10,6 +10,7 @@
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | `b9ce18a6887e18c089fdea8509a33e63429a3300` | ModelOpt MIXED_PRECISION in `config.json` alone: NVFP4 with csf scales, W4A16_NVFP4, MXFP8 |
 | `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB` | `c6cc2e8ffa353403213d6b9b18aaf8eb684d705a` | ModelOpt MIXED_PRECISION with Q8_0 and IQ2_XXS (refused); cut, see below |
 | `nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8` | `3fe6dab75665a93884214ad4b1b95cf02717d081` | ModelOpt FP8 |
+| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` | `bee7596271d1495f6992ae224aefde4410e816b8` | ModelOpt MIXED_PRECISION: FP8 per tensor for the Mamba-2 projections (46 modules), W4A16_NVFP4 for the routed and shared experts and the head (5,935), `kv_cache_quant_algo` FP8; `hf_quant_config.json` unchanged, `config.json` with its `quantization_config` cut to `quant_method`, `quant_algo`, `kv_cache_scheme` and `producer` (the rest is a verbatim copy of `hf_quant_config.json`) |
 | `zai-org/GLM-5.3-Flash` | `46a050bec13002ad29ee795c16e61cf4fa3c4a9c` | fp8, 128x128 blocks |
 | `Qwen/Qwen3.8-Flash-Next-FP8` | `236dfdf285828023ca3bcd3f37366c58a3469b13` | fp8, 128x128 blocks |
 | `deepseek-ai/DeepSeek-V4.1-Flash` | `314113f8a7dadb388215396ba5fbee2c610a04d6` | fp8, 32x32 blocks, MXFP4 experts |
