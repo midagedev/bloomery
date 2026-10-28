@@ -49,7 +49,7 @@ use crate::draft::{self, DraftHead, Feed, Hidden, WalkBounds, WalkMode};
 use crate::head::{Head, HeadNorm};
 use crate::model::lookup::f32_gain;
 use crate::mtp::{MtpInputArgs, MtpKernels};
-use crate::site::{self, Form, SiteTy};
+use crate::site::{self, SiteTy};
 use crate::tensor::{Q8Act, Window};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{Gpu, GpuError, launch_u32};
@@ -394,7 +394,7 @@ impl Mtp35 {
         // The projection is the trunk's site dispatch at the weight's own
         // type: the pack's quantizer runs only where that type reads the
         // q8_1 rows, and the gemv takes the form it names.
-        if quantizes_pack(self.eh_ty) {
+        if dispatch::reads_q8_1(self.eh_ty) {
             gpu.enqueue_quantize_q8_1_layer(&self.pack, &mut self.act, self.index)?;
         }
         dispatch::site_gemv(
@@ -464,16 +464,6 @@ fn no_layer() -> GpuError {
         WHAT,
         "the load carries no next-token layer (open it with GpuModel::open_mtp)",
     )
-}
-
-/// Whether a step quantizes the join's pack for an `eh_proj` of site type
-/// `ty`: the projection's gemv reads the q8_1 rows then, and the pack's f32
-/// rows at any other type ([`site::kgemv_order`]'s split, the one
-/// [`dispatch::site_gemv`] dispatches by). Not `SiteTy::kquant`: a type can
-/// read the q8_1 rows with no wide GEMM (NVFP4) and the quantizer still has
-/// to run for it.
-fn quantizes_pack(ty: SiteTy) -> bool {
-    ty.reads() == Form::Q8x128
 }
 
 /// Copy arena row `row` and RMS-norm it by the target's `output_norm` into
@@ -767,24 +757,4 @@ pub fn prompt_with35(
             m.prefill_hooked(ids, path, Some(&mut hook))
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SiteTy, quantizes_pack};
-    use crate::site::kgemv_order;
-
-    /// The pack's quantizer runs exactly where the eh site's gemv takes the
-    /// q8_1 rows ([`kgemv_order`], the split `dispatch::site_gemv` routes
-    /// by): every K-quant, and no type whose gemv reads the f32 rows.
-    /// `SiteTy::kquant` is not that split — NVFP4 reads the q8_1 rows with
-    /// no wide GEMM — so the guard must not be written as it.
-    #[test]
-    fn the_pack_quantizes_where_the_eh_gemv_reads_q8_1() {
-        for &ty in SiteTy::ALL {
-            assert_eq!(quantizes_pack(ty), kgemv_order(ty).is_some(), "{ty}");
-        }
-        assert!(quantizes_pack(SiteTy::Q4K));
-        assert!(!quantizes_pack(SiteTy::Bf16));
-    }
 }

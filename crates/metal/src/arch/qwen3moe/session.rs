@@ -200,6 +200,7 @@ pub(crate) const PROJECTED: &[SiteTy] = &[
 /// other list [`LAUNCHED`].
 pub const SITES: Sites35 = Sites35 {
     proj: PROJECTED,
+    dense: PROJECTED,
     stacks: PROJECTED,
     gate_up: LAUNCHED,
     down: LAUNCHED,

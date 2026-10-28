@@ -1602,7 +1602,8 @@ impl GpuModel<Body35> {
 
 #[cfg(test)]
 mod tests {
-    use super::GEMV_COLS;
+    use super::{Dims, FfnRoute, Forms, GEMV_COLS, GqaKind, SiteTy, arena_bytes};
+    use crate::arch::qwen3moe::plan::fixtures::layer;
     use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
     use model::placement::workstation::SCRATCH;
 
@@ -1627,5 +1628,32 @@ mod tests {
                 "{n_head} heads of {head}: {bytes} B of partials past the {SCRATCH} B scratch"
             );
         }
+    }
+
+    /// A dense layer's wide arena holds the forms its sites read on the wide arm
+    /// ([`crate::site::reads_wide`]): an NVFP4 FFN reads the q8 blocks of 32, so beside Q8_0
+    /// attention its arena is a Q8_0 FFN's, and a K-quant FFN's, which also reads the q8_1 blocks
+    /// of 128, is larger. The bytes are what a plan counts for the card (`arena_bytes`).
+    #[test]
+    fn a_dense_nvfp4_ffn_holds_the_q32_forms_its_wide_sites_read() {
+        let d = Dims {
+            hidden: 5120,
+            n_head: 32,
+            n_kv: 4,
+            head: HEAD,
+            q_rows: 32 * HEAD,
+            ff: 17408,
+            router: None,
+            lin: None,
+            ctx: 4096,
+        };
+        let bytes = |ffn: SiteTy| {
+            let mut p = layer(GqaKind::Neox128, [SiteTy::Q8_0; 4]);
+            p.ffn.route = FfnRoute::Dense;
+            [p.ffn.gate_ty, p.ffn.up_ty, p.ffn.down_ty] = [ffn; 3];
+            arena_bytes(&d, 2 * GEMV_COLS, Forms::of(&[p], &d))
+        };
+        assert_eq!(bytes(SiteTy::Nvfp4), bytes(SiteTy::Q8_0));
+        assert!(bytes(SiteTy::Q5K) > bytes(SiteTy::Nvfp4));
     }
 }

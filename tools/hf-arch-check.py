@@ -174,8 +174,8 @@ DECIDE_ROWS = (
      "head_repo": None, "quant_repo": None, "unserved": ()},
 )
 # The decide seat's backbone body has one owner list of the weight types each site kind launches: its `const` lists of
-# SiteTy. The layers' lists are the chain crate's plan reader's (BODY35_LAYERS_RS: PROJ and PROJ_F32, read at each site by
-# `ty_of` and `routed_ty`), the embedding's and the head's the card body's (BODY35_RS: EMBED and HEAD_TY, read by
+# SiteTy. The layers' lists are the chain crate's plan reader's (BODY35_LAYERS_RS: PROJ, DENSE_FFN and PROJ_F32, read at
+# each site by `ty_of` and `routed_ty`), the embedding's and the head's the card body's (BODY35_RS: EMBED and HEAD_TY, read by
 # `file_site`); BODY35_SOURCES are both. The lists are read from those sources each run (body35_lists joins SiteTy::entry
 # in the chain crate's site.rs to the card! dense column in gguf's qtype.rs), so a type added is followed. BODY35_ARCHS
 # are the architectures that body reads (crates/model/src/arch/mod.rs:QWEN35_BODY); BODY35_SITES the tensors each list is
@@ -196,9 +196,9 @@ BODY35_SITES = (
     (r"blk\.\d+\.attn_qkv\.weight", "PROJ"),
     (r"blk\.\d+\.attn_gate\.weight", "PROJ"),
     (r"blk\.\d+\.ssm_out\.weight", "PROJ"),
-    (r"blk\.\d+\.ffn_gate\.weight", "PROJ"),
-    (r"blk\.\d+\.ffn_up\.weight", "PROJ"),
-    (r"blk\.\d+\.ffn_down\.weight", "PROJ"),
+    (r"blk\.\d+\.ffn_gate\.weight", "DENSE_FFN"),
+    (r"blk\.\d+\.ffn_up\.weight", "DENSE_FFN"),
+    (r"blk\.\d+\.ffn_down\.weight", "DENSE_FFN"),
     (r"blk\.\d+\.shortconv\.in_proj\.weight", "PROJ"),
     (r"blk\.\d+\.shortconv\.out_proj\.weight", "PROJ"),
     # The head-gate class's gate, one value a head, is read against PROJ_F32; a qwen35 file's attn_gate matches both
@@ -2068,7 +2068,7 @@ def self_test():
                  ("output.weight", inside("HEAD_TY"), [256, 2], b"\0" * 8),
                  ("blk.0.attn_q.weight", inside("PROJ"), [256, 2], b"\0" * 8),
                  ("blk.0.ssm_beta.weight", inside("PROJ_F32"), [8, 2], b"\0" * 8),
-                 ("blk.0.ffn_down.weight", inside("PROJ"), [32, 2], b"\0" * 8),
+                 ("blk.0.ffn_down.weight", inside("DENSE_FFN"), [32, 2], b"\0" * 8),
                  ("blk.0.attn_norm.weight", 0, [8], b"\0" * 8)]
         line, green, _ = row_line("decide", "clef", dense)
         check("a clef file whose sites read their lists is types=ok", green and "types=ok (5 site tensors" in line
@@ -2089,6 +2089,15 @@ def self_test():
         bad = outside("PROJ")
         line, green, _ = row_line("decide", "clef", swapped("blk.0.attn_q.weight", bad))
         check("a projection outside PROJ is a red row", not green and f"blk.0.attn_q.weight is {type_name(bad)}" in line, line)
+        bad = outside("DENSE_FFN")
+        line, green, _ = row_line("decide", "clef", swapped("blk.0.ffn_down.weight", bad))
+        check("a dense FFN matrix outside DENSE_FFN is a red row naming the chain's list", not green
+              and f"blk.0.ffn_down.weight is {type_name(bad)}; {BODY35_LAYERS_RS}:" in line, line)
+        nvfp4 = tid["NVFP4"]
+        line, green, _ = row_line("decide", "clef", swapped("blk.0.ffn_down.weight", nvfp4))
+        check("an NVFP4 dense FFN matrix is read", green and "DENSE_FFN" in lists and "NVFP4" in lists["DENSE_FFN"], line)
+        line, green, _ = row_line("decide", "clef", swapped("blk.0.attn_q.weight", nvfp4))
+        check("an NVFP4 attention matrix is a red row", not green and "blk.0.attn_q.weight is NVFP4" in line, line)
         bad = outside("PROJ_F32")
         line, green, _ = row_line("decide", "clef", swapped("blk.0.ssm_beta.weight", bad))
         check("a beta outside PROJ_F32 is a red row naming the chain's list", not green
