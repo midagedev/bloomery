@@ -37,6 +37,9 @@ use super::trunk;
 use crate::folder::{Error, FolderMap, Mapped, Mapping, Origin, VocabSpec, refuse};
 use crate::part;
 
+/// A layer's experts: (layer, projection) to each expert's name and shape.
+type Stacks<'a> = BTreeMap<(usize, Projection), BTreeMap<usize, (&'a str, &'a [usize])>>;
+
 /// The `model_type`s of a vision-language wrapper around the text model, whose `llm_config` holds
 /// it.
 const WRAPPERS: &[&str] = &["nemotron_h_omni", "NemotronH_Nano_VL_V2"];
@@ -955,9 +958,7 @@ impl FolderMap for Checkpoint {
     fn map<'a>(&self, tensors: &[(&'a str, &'a [usize])]) -> Result<Mapping<Step>, Error> {
         let mut out: BTreeMap<String, Mapped<Step>> = BTreeMap::new();
         let mut skipped = BTreeMap::new();
-        // A layer's experts: (layer, projection) to each expert's name and shape.
-        let mut stacks: BTreeMap<(usize, Projection), BTreeMap<usize, (&str, &[usize])>> =
-            BTreeMap::new();
+        let mut stacks: Stacks<'a> = BTreeMap::new();
         let mut put = |to: String, m: Mapped<Step>| match out.insert(to, m) {
             Some(prev) => Err(refuse(
                 &prev.sources[0],
