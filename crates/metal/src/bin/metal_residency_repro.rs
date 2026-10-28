@@ -3,11 +3,13 @@
 //! is the queue-drain fix's FAIL-first, not a gate clause.
 //!
 //! `--iterations N` (default 1000) runs the loop N times. `--wait` waits for
-//! each command buffer before the teardown (the rule the fix keeps), so the
-//! loop runs to the end; without it the teardown frees the buffer under an
-//! in-flight command buffer, the driver walks a freed resource, and the
-//! kernel faults. **Do not run the no-`--wait` arm except on a Mac the user
-//! names, with the user's go: it panics the machine.**
+//! each command buffer to finish before the teardown (the rule the fix keeps),
+//! so the loop runs to the end; without it the teardown frees the buffer under
+//! an in-flight command buffer, the driver walks a freed resource, and the
+//! kernel faults. `--settle` waits only for the buffer's signal, the state a
+//! step refused by a raised fault leaves its session in. **Run an arm other
+//! than `--wait` only on a Mac the user names, with the user's go: on a build
+//! without the stream drain it can panic the machine.**
 //!
 //! The body is macOS only; elsewhere it refuses and exits 78.
 
@@ -15,10 +17,21 @@
 fn main() -> std::process::ExitCode {
     use bloomery_metal::device::MetalDevice;
     use bloomery_metal::instance::HOST;
-    use bloomery_metal::residency;
+    use bloomery_metal::residency::{self, ReproWait};
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let wait = args.iter().any(|a| a == "--wait");
+    let wait = match (
+        args.iter().any(|a| a == "--wait"),
+        args.iter().any(|a| a == "--settle"),
+    ) {
+        (false, false) => ReproWait::None,
+        (false, true) => ReproWait::Settle,
+        (true, false) => ReproWait::Sync,
+        (true, true) => {
+            eprintln!("metal_residency_repro: --wait and --settle are two arms; name one");
+            return std::process::ExitCode::from(64);
+        }
+    };
     let iterations: u32 = match args.iter().position(|a| a == "--iterations") {
         Some(i) => match args.get(i + 1).and_then(|v| v.parse().ok()) {
             Some(n) => n,
@@ -37,12 +50,13 @@ fn main() -> std::process::ExitCode {
         }
     };
     println!(
-        "metal_residency_repro: {iterations} iterations, wait_for_queue={wait} \
-         ({})",
-        if wait {
-            "the rule the fix keeps"
-        } else {
-            "the buggy teardown; panics the kernel on a build without the stream drain"
+        "metal_residency_repro: {iterations} iterations, wait {wait:?} ({})",
+        match wait {
+            ReproWait::Sync => "the rule the fix keeps",
+            ReproWait::Settle => "the signal only, as a fault-refused step leaves it",
+            ReproWait::None => {
+                "the buggy teardown; panics the kernel on a build without the stream drain"
+            }
         }
     );
     match residency::repro(&device, iterations, wait) {

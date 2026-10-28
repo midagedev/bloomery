@@ -92,6 +92,7 @@ impl Residency {
         queue: &Handle<dyn MTLCommandQueue>,
     ) -> Result<Self, DeviceError> {
         let descriptor = MTLResidencySetDescriptor::new();
+        mark("set", format_args!("newResidencySet + addResidencySet"));
         let set = device
             .newResidencySetWithDescriptor_error(&descriptor)
             .map_err(|e| {
@@ -240,6 +241,21 @@ impl<'a> Alloc<'a> {
     }
 }
 
+/// What [`repro`] does between a command buffer's commit and its stream's
+/// drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReproWait {
+    /// Nothing: the teardown runs with the command buffer in flight.
+    None,
+    /// The stream's event waited to the buffer's signal, as a step's settle
+    /// waits: the signal is reached, while the buffer can still be pending in
+    /// the driver.
+    Settle,
+    /// Every committed buffer waited to a terminal status: the rule the fix
+    /// keeps.
+    Sync,
+}
+
 /// A loop of the residency-set teardown pattern the Metal e2e gate panicked
 /// the kernel in, for the queue-drain fix's FAIL-first. Each iteration opens a
 /// stream on the device's shared command queue, gives it a residency set,
@@ -255,16 +271,15 @@ impl<'a> Alloc<'a> {
 /// and the kernel faults; with the drain the drop waits first and the loop
 /// runs to the end.
 ///
-/// `wait_for_queue` settles the stream before it drops, so on a build without
-/// the drain this flag is the FAIL-first switch in one binary: unset it
-/// faults, set it survives. On a build with the drain both survive. Bounded by
-/// `iterations`; it opens nothing else. The faulting arm panics the kernel, so
-/// it is run only on a Mac the user names, with the user's go.
-pub fn repro(
-    device: &MetalDevice,
-    iterations: u32,
-    wait_for_queue: bool,
-) -> Result<(), DeviceError> {
+/// `wait` is what runs between the commit and the drop ([`ReproWait`]): on a
+/// build without the drain, [`ReproWait::Sync`] is the FAIL-first switch in
+/// one binary (`None` faults, `Sync` survives), and [`ReproWait::Settle`]
+/// asks whether a wait on the signal alone, which is all a step refused by a
+/// raised fault has done before its session drops, is enough. On a build with
+/// the drain every arm survives. Bounded by `iterations`; it opens nothing
+/// else. A faulting arm panics the kernel, so it is run only on a Mac the user
+/// names, with the user's go.
+pub fn repro(device: &MetalDevice, iterations: u32, wait: ReproWait) -> Result<(), DeviceError> {
     // A buffer big enough that its wiring is real work the GPU holds past the
     // commit, so the window the teardown races is not a hair's breadth.
     const ELEMS: usize = 1 << 18;
@@ -283,13 +298,19 @@ pub fn repro(
             let _buffer = alloc.buffer::<f32>(Elems(ELEMS))?;
             staged.commit();
         }
-        // A command buffer the set backs, committed and left unsettled.
+        // A command buffer the set backs, committed; `wait` names what the
+        // host waits for before the drop.
         let recording = stream.begin()?;
-        let _signalled = stream.submit_signalled(recording)?;
-        if wait_for_queue {
+        let signalled = stream.submit_signalled(recording)?;
+        match wait {
+            ReproWait::None => {}
+            ReproWait::Settle => {
+                let _settled = stream.settle(signalled)?;
+            }
             // The rule, forced here too for a build whose stream teardown does
-            // not yet wait: settle before the stream (and its set) drops.
-            bloomery_device::Stream::sync(&stream)?;
+            // not yet wait: every buffer done before the stream (and its set)
+            // drops.
+            ReproWait::Sync => bloomery_device::Stream::sync(&stream)?,
         }
         drop(stream);
     }
