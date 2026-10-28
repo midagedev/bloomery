@@ -302,6 +302,12 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
                 *total += bytes(&d.ssm_norm)?;
                 *total += bytes(&d.ssm_out)?;
             }
+            chain::arch::qwen3moe::plan::MixerPlan::ShortConv(c) => {
+                *total += bytes(&c.attn_norm)?;
+                *total += bytes(&c.conv_in)?;
+                *total += bytes(&c.conv)?;
+                *total += bytes(&c.conv_out)?;
+            }
         }
         let f = chain::arch::qwen3moe::read::file_names(l);
         // The router's rows, from its shape. Its stored bytes are that count

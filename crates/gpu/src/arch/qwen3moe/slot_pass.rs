@@ -262,6 +262,7 @@ impl ChainOps for SlotOps<'_, '_> {
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::SlotOps::attn_out")?;
         let p = &mut self.pass;
         dispatch::attn_out(&layer_ctx(p.c, l)?, g, p.s, l.m)
     }
@@ -284,6 +285,7 @@ impl ChainOps for SlotOps<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::SlotOps::experts")?;
         let p = &mut self.pass;
         dispatch::experts(&layer_ctx(p.c, l)?, f, p.s, l.m, None)
     }

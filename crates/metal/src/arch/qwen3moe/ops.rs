@@ -477,6 +477,7 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
+        l.plain_only("qwen3moe::MetalOps::attn_out")?;
         if self.arm(l.m)? == Arm::Rows {
             return self.rows_attn_out(l.layer, l.m);
         }
@@ -564,6 +565,7 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
+        l.plain_only("qwen3moe::MetalOps::delta_out")?;
         if self.arm(l.m)? == Arm::Rows {
             return self.rows_delta_out(l.layer, l.m);
         }
@@ -652,6 +654,7 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, plan: &FfnPlan) -> Result<(), SessionError> {
+        l.plain_only("qwen3moe::MetalOps::experts")?;
         if self.arm(l.m)? == Arm::Rows {
             return match &plan.route {
                 FfnRoute::Dense => self.rows_dense_ffn(l.layer, l.m),

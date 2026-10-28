@@ -1,6 +1,7 @@
 //! The family's walk: the order of one layer's ops — the mixer, then the FFN half — with the unit's
 //! front ahead of layer 0 and its end after the last layer, written once over [`ChainOps`] for
-//! every backend.
+//! every backend. A half's join into the stream is inside the op that ends it, by the layer's
+//! `residual`, so a sandwich layer walks the ops of a plain one.
 //!
 //! A chain with no host leg walks one unit of `m` rows through [`runtime::sched::walk`]
 //! ([`Walk::run`]): each layer is the walk's front, the head its end, and a port that exchanges
@@ -160,7 +161,8 @@ pub fn layer<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error>
     ffn(ops, cx)
 }
 
-/// The mixer the plan names: its input side, its middle and its output side.
+/// The mixer the plan names: its input side, its middle and its output side, which joins the
+/// mixer's output into the stream.
 fn mixer<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
     match &cx.plan.mixer {
         MixerPlan::Gqa(g) => {
@@ -173,11 +175,16 @@ fn mixer<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
             ops.delta_core(cx, d)?;
             ops.delta_out(cx, d)
         }
+        MixerPlan::ShortConv(c) => {
+            ops.conv_in(cx, c)?;
+            ops.conv_core(cx, c)?;
+            ops.conv_out(cx, c)
+        }
     }
 }
 
 /// One layer's FFN half: the router's pick, then the experts and their combine into the layer's
-/// output rows.
+/// output rows, which joins the FFN's output into the stream.
 pub fn ffn<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
     let f = &cx.plan.ffn;
     ops.route(cx, f)?;
@@ -187,11 +194,12 @@ pub fn ffn<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
 #[cfg(test)]
 mod tests {
     use super::super::plan::{
-        DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy,
+        DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Half, HeadGate, LayerPlan,
+        MixerPlan, ResidualPlan, SandwichPlan, ShortConvPlan, SiteTy,
     };
     use super::{ChainOps, LayerCtx, NoLeg, Steps, Walk, ffn, front, layer};
     use crate::ChainError;
-    use crate::linear::{KHeadMap, LinearShape};
+    use crate::linear::{KHeadMap, LinearShape, Ring};
     use runtime::sched::{self, Overlap, PortKind};
 
     /// Rows of the arena a test walk's port holds.
@@ -210,6 +218,15 @@ mod tests {
         }
     }
 
+    /// The join `half`'s ending op does by the layer's residual, as the log line carries it:
+    /// nothing for a plain residual, the half's norm and scale for a sandwich.
+    fn join(l: LayerCtx<'_>, half: Half) -> String {
+        match &l.plan.residual {
+            ResidualPlan::Plain => String::new(),
+            ResidualPlan::Sandwich(s) => format!("+sandwich({}, {})", s.norm(half), s.scale(half)),
+        }
+    }
+
     impl ChainOps for Rec {
         type Error = ChainError;
 
@@ -222,7 +239,66 @@ mod tests {
         fn attn_core(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
             self.put("attn_core")
         }
-        fn attn_out(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
+        fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
+            self.put(&format!("attn_out{}", join(l, Half::Mixer)))
+        }
+        fn delta_in(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
+            self.put("delta_in")
+        }
+        fn delta_core(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
+            self.put("delta_core")
+        }
+        fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
+            self.put(&format!("delta_out{}", join(l, Half::Mixer)))
+        }
+        fn route(&mut self, _: LayerCtx<'_>, _: &FfnPlan) -> Result<(), ChainError> {
+            self.put("route")
+        }
+        fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), ChainError> {
+            self.put(&format!("experts({}){}", l.layer, join(l, Half::Ffn)))
+        }
+        fn head(&mut self, m: usize) -> Result<(), ChainError> {
+            self.put(&format!("head({m})"))
+        }
+        fn conv_in(&mut self, _: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), ChainError> {
+            self.put("conv_in")
+        }
+        fn conv_core(&mut self, _: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), ChainError> {
+            self.put("conv_core")
+        }
+        fn conv_out(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), ChainError> {
+            self.put(&format!("conv_out{}", join(l, Half::Mixer)))
+        }
+    }
+
+    /// A backend that implements only the ops every backend has, so the short conv's keep their
+    /// default bodies, and that joins by the plain add only. It records the ops it runs.
+    #[derive(Default)]
+    struct Bare {
+        log: Vec<String>,
+    }
+
+    impl Bare {
+        fn put(&mut self, op: &str) -> Result<(), ChainError> {
+            self.log.push(op.to_string());
+            Ok(())
+        }
+    }
+
+    impl ChainOps for Bare {
+        type Error = ChainError;
+
+        fn embed(&mut self, _: usize) -> Result<(), ChainError> {
+            self.put("embed")
+        }
+        fn attn_in(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
+            self.put("attn_in")
+        }
+        fn attn_core(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
+            self.put("attn_core")
+        }
+        fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
+            l.plain_only("Bare::attn_out")?;
             self.put("attn_out")
         }
         fn delta_in(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
@@ -231,17 +307,19 @@ mod tests {
         fn delta_core(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
             self.put("delta_core")
         }
-        fn delta_out(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
+        fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
+            l.plain_only("Bare::delta_out")?;
             self.put("delta_out")
         }
         fn route(&mut self, _: LayerCtx<'_>, _: &FfnPlan) -> Result<(), ChainError> {
             self.put("route")
         }
         fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), ChainError> {
-            self.put(&format!("experts({})", l.layer))
+            l.plain_only("Bare::experts")?;
+            self.put("experts")
         }
-        fn head(&mut self, m: usize) -> Result<(), ChainError> {
-            self.put(&format!("head({m})"))
+        fn head(&mut self, _: usize) -> Result<(), ChainError> {
+            self.put("head")
         }
     }
 
@@ -258,25 +336,80 @@ mod tests {
         }
     }
 
+    fn gqa_plan(kind: GqaKind) -> GqaPlan {
+        GqaPlan {
+            kind,
+            flash: Flash::Group,
+            attn_norm: String::new(),
+            attn_q: String::new(),
+            attn_k: String::new(),
+            attn_v: String::new(),
+            attn_q_norm: String::new(),
+            attn_k_norm: String::new(),
+            attn_output: String::new(),
+            q_ty: SiteTy::Q4K,
+            k_ty: SiteTy::Q4K,
+            v_ty: SiteTy::Q4K,
+            o_ty: SiteTy::Q4K,
+            window: None,
+            gate: None,
+            rope_freqs: None,
+        }
+    }
+
     fn gqa_layer() -> LayerPlan {
         LayerPlan {
+            mixer: MixerPlan::Gqa(gqa_plan(GqaKind::Gated256)),
+            ffn: ffn_plan(),
+            residual: ResidualPlan::Plain,
+        }
+    }
+
+    /// An attention layer with a gate of its own and a window of eight positions.
+    fn head_gate_layer(residual: ResidualPlan) -> LayerPlan {
+        LayerPlan {
             mixer: MixerPlan::Gqa(GqaPlan {
-                kind: GqaKind::Gated256,
-                flash: Flash::Group,
-                attn_norm: String::new(),
-                attn_q: String::new(),
-                attn_k: String::new(),
-                attn_v: String::new(),
-                attn_q_norm: String::new(),
-                attn_k_norm: String::new(),
-                attn_output: String::new(),
-                q_ty: SiteTy::Q4K,
-                k_ty: SiteTy::Q4K,
-                v_ty: SiteTy::Q4K,
-                o_ty: SiteTy::Q4K,
+                window: Some(8),
+                gate: Some(HeadGate {
+                    name: String::new(),
+                    ty: SiteTy::Q4K,
+                }),
+                ..gqa_plan(GqaKind::HeadGate128)
             }),
             ffn: ffn_plan(),
+            residual,
         }
+    }
+
+    /// A short-conv layer of seven taps.
+    fn conv_layer(residual: ResidualPlan) -> LayerPlan {
+        LayerPlan {
+            mixer: MixerPlan::ShortConv(ShortConvPlan {
+                attn_norm: String::new(),
+                conv_in: String::new(),
+                conv: String::new(),
+                conv_out: String::new(),
+                hidden: 64,
+                ring: Ring::new(7),
+                in_ty: SiteTy::Q4K,
+                out_ty: SiteTy::Q4K,
+            }),
+            ffn: ffn_plan(),
+            residual,
+        }
+    }
+
+    /// The sandwich of the mixer at scale 1 and the FFN at scale ½, so a join of the wrong half
+    /// shows in the scale it reads.
+    fn sandwich() -> ResidualPlan {
+        ResidualPlan::Sandwich(SandwichPlan {
+            eps: 1e-5,
+            add: [1.0, 0.5],
+            norms: [
+                "post_attention_norm.weight".to_string(),
+                "post_ffw_norm.weight".to_string(),
+            ],
+        })
     }
 
     fn delta_layer() -> LayerPlan {
@@ -304,6 +437,7 @@ mod tests {
                 out_ty: SiteTy::Q4K,
             }),
             ffn: ffn_plan(),
+            residual: ResidualPlan::Plain,
         }
     }
 
@@ -456,5 +590,123 @@ mod tests {
             )
         );
         assert!(ops.log.is_empty(), "{:?}", ops.log);
+    }
+
+    /// An LFM3 chain of a short-conv layer and a window attention layer, each a sandwich: the
+    /// ops are a plain chain's (the conv's three, the router's pick, the experts; the attention's
+    /// three, the pick, the experts), each half's ending op sees its own half's norm and scale
+    /// in the layer's plan, and the walk adds no op for the join — the same at every `m`.
+    #[test]
+    fn a_sandwich_chain_walks_a_plain_chains_ops_and_each_half_ending_op_reads_its_join() {
+        let plans = [conv_layer(sandwich()), head_gate_layer(sandwich())];
+        for m in [1, 2] {
+            let mut ops = Rec::default();
+            Walk::new(&mut ops, &plans, m)
+                .run(ARENA_ROWS)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let (embed, head) = (format!("embed({m})"), format!("head({m})"));
+            assert_eq!(
+                ops.log,
+                [
+                    embed.as_str(),
+                    "conv_in",
+                    "conv_core",
+                    "conv_out+sandwich(post_attention_norm.weight, 1)",
+                    "route",
+                    "experts(0)+sandwich(post_ffw_norm.weight, 0.5)",
+                    "attn_in",
+                    "attn_core",
+                    "attn_out+sandwich(post_attention_norm.weight, 1)",
+                    "route",
+                    "experts(1)+sandwich(post_ffw_norm.weight, 0.5)",
+                    head.as_str(),
+                ]
+            );
+        }
+    }
+
+    /// The join follows each layer's own residual: in a chain of a sandwich layer then a plain one
+    /// the plain layer's ending ops carry no join, and what a caller lays between a layer's
+    /// halves runs after the mixer's ending op.
+    #[test]
+    fn the_join_follows_each_layers_own_residual() {
+        let plans = [conv_layer(sandwich()), conv_layer(ResidualPlan::Plain)];
+        let mut ops = Rec::default();
+        Walk::new(&mut ops, &plans, 1)
+            .run_between(ARENA_ROWS, |o: &mut Rec, cx| {
+                o.put(&format!("between({}, last {})", cx.layer, cx.last))
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            ops.log,
+            [
+                "embed(1)",
+                "conv_in",
+                "conv_core",
+                "conv_out+sandwich(post_attention_norm.weight, 1)",
+                "between(0, last false)",
+                "route",
+                "experts(0)+sandwich(post_ffw_norm.weight, 0.5)",
+                "conv_in",
+                "conv_core",
+                "conv_out",
+                "between(1, last true)",
+                "route",
+                "experts(1)",
+                "head(1)",
+            ]
+        );
+    }
+
+    /// A backend that keeps the default bodies of the short conv's ops refuses by name, with the
+    /// op, the layer and the backend's type, and the walk stops there. A backend that joins by
+    /// the plain add only refuses a sandwich layer by name in the op that ends its first half,
+    /// before it adds anything, and runs a plain layer.
+    #[test]
+    fn a_backend_with_no_such_kernels_refuses_the_op_by_name() {
+        let refusal = |plans: &[LayerPlan], ops: &mut Bare| {
+            Walk::new(ops, plans, 1)
+                .run(ARENA_ROWS)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let mut ops = Bare::default();
+        let err = refusal(&[gqa_layer(), conv_layer(ResidualPlan::Plain)], &mut ops);
+        let err = err.expect("a short conv run by a backend with no short-conv ops");
+        assert!(
+            err.starts_with("qwen3moe::ChainOps::conv_in: layer 1: the backend ")
+                && err.ends_with("Bare implements no such op"),
+            "{err}"
+        );
+        assert_eq!(
+            ops.log,
+            [
+                "embed",
+                "attn_in",
+                "attn_core",
+                "attn_out",
+                "route",
+                "experts"
+            ]
+        );
+        let mut ops = Bare::default();
+        let err = refusal(&[gqa_layer(), head_gate_layer(sandwich())], &mut ops);
+        assert_eq!(
+            err.as_deref(),
+            Some("Bare::attn_out: layer 1: a sandwich residual, which this backend does not run")
+        );
+        assert_eq!(
+            ops.log,
+            [
+                "embed",
+                "attn_in",
+                "attn_core",
+                "attn_out",
+                "route",
+                "experts",
+                "attn_in",
+                "attn_core"
+            ]
+        );
     }
 }

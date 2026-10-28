@@ -1399,7 +1399,12 @@ pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
     plans
         .into_iter()
         .enumerate()
-        .map(|(l, LayerPlan { mixer, ffn })| {
+        .map(|(l, plan)| {
+            let LayerPlan {
+                mixer,
+                ffn,
+                residual,
+            } = plan;
             let ffn = match ffn.route {
                 FfnRoute::Router {
                     gate_inp,
@@ -1423,7 +1428,11 @@ pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
                 },
                 route => FfnPlan { route, ..ffn },
             };
-            LayerPlan { mixer, ffn }
+            LayerPlan {
+                mixer,
+                ffn,
+                residual,
+            }
         })
         .collect()
 }

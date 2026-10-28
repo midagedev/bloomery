@@ -93,8 +93,9 @@ use super::placed::{
     prompt_rows, tally_shape,
 };
 use super::plan::{
-    FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, down_sel,
-    gate_up_fused, input_fused, kind35, kinds35, moe_fits, o_fused, out_fused, q35, qkv_fused,
+    FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, ResidualPlan, SharedPlan,
+    SiteTy, down_sel, gate_up_fused, input_fused, kind35, kinds35, moe_fits, o_fused, out_fused,
+    q35, qkv_fused,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
@@ -233,6 +234,9 @@ fn checkpoint_lens(kinds: &[Kind35]) -> Vec<usize> {
         .filter_map(|k| match k {
             Kind35::Delta(shape) => Some(shape.lens(PLAIN_LANES)),
             Kind35::Gqa(..) => None,
+            Kind35::ShortConv(_) => {
+                panic!("qwen35moe::checkpoint_lens: a short-conv layer, which `kinds35` refuses")
+            }
         })
         .flatten()
         .collect()
@@ -623,6 +627,12 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<
             on(&dp.alpha, nv, h, dp.alpha_ty)?;
             on(&dp.ssm_out, h, nv * linear::HEAD, dp.out_ty)?;
         }
+        MixerPlan::ShortConv(_) => {
+            return Err(GpuError::shape(
+                WHAT,
+                "a short-conv layer, which this body runs no kernel for",
+            ));
+        }
     }
     let f = &p.ffn;
     let e = match &f.route {
@@ -708,6 +718,9 @@ impl Forms {
                     if !out_fused(dp) {
                         alone(dp.out_ty, d.hidden);
                     }
+                }
+                MixerPlan::ShortConv(_) => {
+                    panic!("qwen35moe::Forms::of: a short-conv layer, which `kinds35` refuses")
                 }
             }
             let f = &p.ffn;
@@ -900,7 +913,7 @@ impl Pre35 {
 fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError> {
     let mut shapes = kinds.iter().filter_map(|k| match k {
         Kind35::Delta(s) => Some(*s),
-        Kind35::Gqa(..) => None,
+        Kind35::Gqa(..) | Kind35::ShortConv(_) => None,
     });
     let lin = shapes.next();
     if let Some(s) = lin
@@ -1067,6 +1080,7 @@ fn draft_layer(
             &Sites35::CARD,
             Read35::Whole,
         )?,
+        residual: ResidualPlan::Plain,
     };
     let prefix = blk(l, "");
     let mut w = Weights::load_where(gpu.stream(), file, |name| name.starts_with(&prefix))?;
@@ -1397,6 +1411,12 @@ impl Body35 {
                 Kind35::Delta(shape) => {
                     LayerStore::Rec(RecStore::new(stream, shape.lens(lanes), lanes)?)
                 }
+                Kind35::ShortConv(_) => {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        "a short-conv layer, which this body runs no kernel for",
+                    ));
+                }
             });
         }
         let forms = Forms::of(&plans, &d);
@@ -1498,6 +1518,9 @@ impl Body35 {
             .map(|p| match p.mixer {
                 MixerPlan::Gqa(_) => LayerKind35::Attention,
                 MixerPlan::Delta(_) => LayerKind35::Delta,
+                MixerPlan::ShortConv(_) => {
+                    panic!("qwen35moe::Body35::kinds: a short-conv layer, which `kinds35` refuses")
+                }
             })
             .collect()
     }

@@ -26,7 +26,8 @@ use chain::arch::qwen3moe::plan::{
     DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, kinds_of,
 };
 use chain::arch::qwen3moe::read::{
-    PlanDims, Read35, Sites35, file_names, plan_delta, plan_ffn, plan_gqa,
+    PlanDims, Read35, Sites35, file_names, plan_delta, plan_ffn, plan_gqa, plan_residual,
+    plan_shortconv,
 };
 use chain::linear::LinearShape;
 use chain::rope::{RopeSpec, RopeTable};
@@ -477,6 +478,9 @@ fn plan_mixer(
             MixerPlan::Gqa(plan_gqa(split, WHAT, pd, l, (kind, flash), sites)?)
         }
         Kind35::Delta(shape) => MixerPlan::Delta(plan_delta(split, WHAT, pd, shape, l, sites)?),
+        Kind35::ShortConv(ring) => {
+            MixerPlan::ShortConv(plan_shortconv(split, WHAT, pd, ring, l, sites)?)
+        }
     })
 }
 
@@ -526,7 +530,7 @@ fn mixer_sweep(split: &Split, pd: &PlanDims, kind: Kind35, l: usize) -> Vec<Sess
             [g.attn_q, g.attn_k, g.attn_v, g.attn_output],
             PROJECTED,
         ),
-        Err(_) => Vec::new(),
+        Ok(MixerPlan::ShortConv(_)) | Err(_) => Vec::new(),
     }
 }
 
@@ -665,7 +669,22 @@ fn read(
             plan_ffn(split, WHAT, &pd, layer, l, &SITES, Read35::Whole),
             || ffn_sweep(split, &pd, layer, l),
         );
-        plans.push(mixer.zip(ffn).map(|(mixer, ffn)| LayerPlan { mixer, ffn }));
+        let residual = read_half(
+            items,
+            l,
+            plan_residual(split, WHAT, &pd, layer, l),
+            Vec::new,
+        );
+        plans.push(
+            mixer
+                .zip(ffn)
+                .zip(residual)
+                .map(|((mixer, ffn), residual)| LayerPlan {
+                    mixer,
+                    ffn,
+                    residual,
+                }),
+        );
     }
     let table = geom.as_ref().map(|geom| Table { split, geom });
     let head = table.as_ref().and_then(|table| {

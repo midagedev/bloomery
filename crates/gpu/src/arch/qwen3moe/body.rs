@@ -11,8 +11,8 @@ use super::placed::{
     common_forms, counted_arena, placed_bytes, placed_scratch, slot_chain,
 };
 use super::plan::{
-    FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
-    gate_up_entry, kq_sel, o_fused, qkv_fused,
+    FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, ResidualPlan, SiteTy,
+    down_entry, gate_up_entry, kq_sel, o_fused, qkv_fused,
 };
 use super::prefill::Prefill;
 use super::program::Tail;
@@ -397,6 +397,9 @@ fn parts_of(l: usize) -> (GqaPlan, FfnPlan) {
         k_ty: SiteTy::Q4K,
         v_ty: SiteTy::Q4K,
         o_ty: SiteTy::Q4K,
+        window: None,
+        gate: None,
+        rope_freqs: None,
     };
     let f = FfnPlan {
         ffn_norm: names::ffn_norm(l),
@@ -445,12 +448,14 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPla
         return Ok(LayerPlan {
             mixer: MixerPlan::Gqa(g),
             ffn: f,
+            residual: ResidualPlan::Plain,
         });
     }
     [f.gate_ty, f.up_ty, f.down_ty] = stack_tys(w, [&f.gate, &f.up, &f.down], (e, ff, h), l)?;
     Ok(LayerPlan {
         mixer: MixerPlan::Gqa(g),
         ffn: f,
+        residual: ResidualPlan::Plain,
     })
 }
 
@@ -533,6 +538,7 @@ fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuErr
     Ok(LayerPlan {
         mixer: MixerPlan::Gqa(g),
         ffn: f,
+        residual: ResidualPlan::Plain,
     })
 }
 
