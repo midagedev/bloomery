@@ -32,6 +32,7 @@ pub const MTP_DRAFT: &str = "BLOOMERY_MTP_DRAFT";
 pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
 pub const MTP_WIDTH: &str = "BLOOMERY_MTP_WIDTH";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
+pub const METAL_BREADCRUMB: &str = "BLOOMERY_METAL_BREADCRUMB";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const XSTREAM: &str = "BLOOMERY_XSTREAM";
 pub const SPLIT_WALK: &str = "BLOOMERY_SPLIT_WALK";
@@ -84,6 +85,8 @@ const SESSION: &str = "session";
 const ISA_OWNER: &str = "isa-owner";
 
 const OPS: &str = "crates/model/src/ops.rs";
+const METAL_STREAM: &str = "crates/metal/src/stream.rs";
+const METAL_BREADCRUMB_STAYS: &str = "stays: the Metal crash breadcrumb";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
 const HYBRID: &str = "crates/gpu/src/hybrid.rs";
 const DECODE: &str = "crates/model/src/bin/bloomery-decode.rs";
@@ -2756,4 +2759,22 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "`tools/release/pass_checks.py`: the default of `--dir`, where each check's request and \
          reply are kept, one JSON a check.",
     ),
+    LeverSpec {
+        name: METAL_BREADCRUMB,
+        class: Class::D,
+        kind: Kind::Path,
+        default: Unset::Means("off: no breadcrumb written"),
+        doc: "Metal host crash breadcrumb: names a file each driver-facing call class \
+              (`queue`, `set`, `event`, `commit`, `wait`, `teardown`) and each e2e-gate clause \
+              appends one fsync'd line to before the call, so the file's last line names the call \
+              in flight after a kernel panic; unset it is one branch off the step path.",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: METAL_STREAM,
+                round: METAL_BREADCRUMB_STAYS,
+            }],
+            phase: Phase::Load,
+            by: Readers::Every,
+        },
+    },
 ];

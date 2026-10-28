@@ -76,6 +76,7 @@ impl MetalDevice {
             )
         })?;
         let device = Handle(device);
+        crate::stream::mark("queue", format_args!("newCommandQueue"));
         let queue = device.newCommandQueue().ok_or_else(|| {
             DeviceError::backend(
                 "command queue",

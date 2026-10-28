@@ -603,6 +603,9 @@ pub fn main() -> ExitCode {
         if only.is_some_and(|o| o != name) {
             continue;
         }
+        // The crash breadcrumb names the clause in flight: the file's last
+        // line after a kernel panic is the clause that was running.
+        bloomery_metal::stream::breadcrumb_clause(name);
         let result = match row.skip_of(name) {
             Some(why) => Ok(Verdict::Skip(format!("row {}: {why}", row.name))),
             None => match name {

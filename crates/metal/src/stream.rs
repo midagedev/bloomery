@@ -28,6 +28,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
+use std::io::Write;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -104,6 +105,7 @@ impl Committed {
             .retain(|b| b.0.status() != MTLCommandBufferStatus::Completed);
         #[cfg(feature = "encode-trace")]
         crate::trace::commit(&buffer);
+        mark("commit", format_args!("submit {}", self.submits + 1));
         buffer.commit();
         self.submits += 1;
         self.pending.push(CommandBufferHandle(buffer));
@@ -385,6 +387,61 @@ pub(crate) fn host_secs() -> f64 {
     (unsafe { mach_absolute_time() } as f64) * per_tick
 }
 
+/// The crash breadcrumb file, opened once from `BLOOMERY_METAL_BREADCRUMB`
+/// (the one Metal-host debug lever), or `None` when the name is unset. Each
+/// driver-facing call class appends one line through it and fsyncs before the
+/// call, so the file's last line names the call in flight after a panic.
+/// Unset, [`mark`] is one branch and no work, off the step path's cost.
+static BREADCRUMB: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+/// The breadcrumb file, opened on the first [`mark`]. Read in place: the one
+/// Metal-host lever (`BLOOMERY_METAL_BREADCRUMB`,
+/// `crates/levers/src/registry.rs`); a name that cannot be opened for append
+/// turns the breadcrumb off with one named stderr line, since the breadcrumb
+/// only observes and must not stop the run it watches.
+fn breadcrumb() -> &'static Option<Mutex<std::fs::File>> {
+    BREADCRUMB.get_or_init(|| {
+        let path = std::env::var_os("BLOOMERY_METAL_BREADCRUMB")?;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => Some(Mutex::new(file)),
+            Err(e) => {
+                eprintln!(
+                    "bloomery_metal: BLOOMERY_METAL_BREADCRUMB={}: cannot open for append ({e}); \
+                     the breadcrumb is off",
+                    path.to_string_lossy()
+                );
+                None
+            }
+        }
+    })
+}
+
+/// One breadcrumb line before a driver-facing call, then fsync; nothing when
+/// the breadcrumb is unset (one branch, no formatting — `detail` is lazy).
+/// `class` names the call class (`queue`, `set`, `event`, `commit`, `wait`,
+/// `teardown`) and `detail` the value in flight. A poisoned lock is taken as
+/// it stands: the file is only appended to.
+pub(crate) fn mark(class: &str, detail: std::fmt::Arguments<'_>) {
+    let Some(file) = breadcrumb() else {
+        return;
+    };
+    let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = writeln!(file, "{:.9} {class} {detail}", host_secs());
+    // fsync so the line survives the kernel panic the breadcrumb hunts.
+    let _ = file.sync_data();
+}
+
+/// A breadcrumb line at the start of a gate clause, so the file after a panic
+/// names the clause that was running. The one breadcrumb entry the crate's
+/// binaries reach from outside the crate; unset, it is one branch.
+pub fn breadcrumb_clause(name: &str) {
+    mark("clause", format_args!("{name}"));
+}
+
 impl MetalStream {
     /// A stream on `queue`, with its own event.
     pub(crate) fn new(
@@ -528,6 +585,7 @@ impl MetalStream {
             crate::trace::signal_event(&recording.buffer, "boundary", value);
             crate::trace::signal_event(&recording.buffer, "timeline", value);
         }
+        mark("event", format_args!("signal boundary+timeline {value}"));
         recording
             .buffer
             .encodeSignalEvent_value(&self.boundary, value);
@@ -550,6 +608,7 @@ impl MetalStream {
         let value = signalled.value;
         #[cfg(feature = "encode-trace")]
         crate::trace::host(|| format!("settle {value}"));
+        mark("wait", format_args!("settle {value}"));
         let deadline = Instant::now() + SYNC_TIMEOUT;
         while !self
             .timeline
@@ -597,6 +656,7 @@ impl MetalStream {
         self.waits.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "encode-trace")]
         crate::trace::host(|| "sync".to_string());
+        mark("wait", format_args!("sync {} ms", timeout.as_millis()));
         let deadline = Instant::now() + timeout;
         let not_done = || {
             DeviceError::backend(
@@ -643,6 +703,50 @@ impl MetalStream {
     }
 }
 
+impl Drop for MetalStream {
+    /// Drain the queue before the residency set is torn down.
+    ///
+    /// The residency set, and the buffers it holds as allocations, back the
+    /// resource groups of the shared queue: the queue rebuilds those groups
+    /// from every attached set on each commit and on `removeResidencySet`,
+    /// reading each allocation. A buffer freed while a command buffer that
+    /// bound the set is still in flight leaves a group naming a resource the
+    /// driver can no longer find, and the driver faults walking it. The
+    /// invariant: the set outlives every command buffer on the queue that it
+    /// backs. So a stream with a set waits (bounded by [`SYNC_TIMEOUT`]) for
+    /// every committed buffer to finish before `residency` drops
+    /// ([`Residency`]'s `endResidency`, `removeResidencySet`, the buffers
+    /// released). A stream with no set (the device's own) has nothing to free
+    /// under the GPU and returns at once.
+    fn drop(&mut self) {
+        if self.residency.is_none() {
+            return;
+        }
+        let pending = self.committed().pending.len();
+        mark("teardown", format_args!("drain {pending} pending"));
+        // The failure a buffer ended with is read elsewhere; here only that
+        // every buffer reached a terminal status matters, so the result is
+        // dropped and the pending list decides.
+        let _ = self.sync_for(SYNC_TIMEOUT);
+        if !self.committed().pending.is_empty() {
+            // The queue did not drain inside the bound: a command buffer is
+            // still in flight. Freeing the set now would fault the driver, so
+            // the set (and the buffers it retains) is kept for the process's
+            // remaining life rather than torn down under the GPU. Loud, not
+            // silent: a leaked set at teardown is a wedged queue to report.
+            eprintln!(
+                "bloomery_metal: a stream's command buffers did not finish within {} ms at \
+                 teardown; its residency set is leaked, not freed, so the driver never walks a \
+                 freed resource",
+                SYNC_TIMEOUT.as_millis()
+            );
+            if let Some(residency) = self.residency.take() {
+                core::mem::forget(residency);
+            }
+        }
+    }
+}
+
 /// Whether a command buffer has finished, by completing or by failing.
 fn is_over(status: MTLCommandBufferStatus) -> bool {
     matches!(
@@ -669,6 +773,7 @@ impl Stream for MetalStream {
         let value = committed.next_value();
         #[cfg(feature = "encode-trace")]
         crate::trace::signal_event(&buffer, "timeline", value);
+        mark("event", format_args!("record signal timeline {value}"));
         buffer.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.timeline), value);
         committed.commit(buffer);
         Ok(MetalEvent {
@@ -681,6 +786,7 @@ impl Stream for MetalStream {
         let buffer = self.command_buffer()?;
         #[cfg(feature = "encode-trace")]
         crate::trace::wait_event(&buffer, "timeline", e.value);
+        mark("event", format_args!("wait timeline {}", e.value));
         buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*e.event), e.value);
         self.committed().commit(buffer);
         Ok(())
