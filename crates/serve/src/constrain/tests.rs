@@ -1142,7 +1142,10 @@ fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usiz
     };
     let mut p = ChatParser::with_tools("", ReasoningFormat::None, Some(scan));
     let (a, b) = (p.try_push(text)?, p.try_finish()?);
-    Ok((a.content + &b.content, a.calls.len() + b.calls.len()))
+    Ok((
+        format!("{}{}", a.content, b.content),
+        a.calls.len() + b.calls.len(),
+    ))
 }
 
 /// A `response_format` beside tools the parser scans for: the reply is
@@ -1485,7 +1488,7 @@ fn the_jump_arm_takes_the_step_arms_ids() {
         ),
         (bytes_tok(), QWEN, call.clone()),
         (bytes_tok(), QWEN_COMPACT, call.clone()),
-        (stop_tok(), GLM, call.clone()),
+        (stop_tok(), GLM, call),
     ] {
         let c = build(&tok, format, &body).expect("served");
         for seed in 0..8 {

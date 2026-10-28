@@ -770,7 +770,7 @@ mod tests {
         let addr = served(Box::new(MockEngine::new(4096)));
         let body = json!({"prompt": "abacaba", "n_predict": 6, "temperature": 0, "n_probs": 2});
         let (_, whole) = post(addr, "/completion", &body);
-        let mut b = body.clone();
+        let mut b = body;
         b["stream"] = json!(true);
         let evs = events(addr, "/completion", &b);
         let (last, chunks) = evs.split_last().expect("a final event");

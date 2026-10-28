@@ -1073,7 +1073,7 @@ mod tests {
         let earlier = content();
         let (c, e) = served(&d, "a/b", "m.gguf", &earlier);
         let p = run(&c, "a/b", &e).0.expect("fetch");
-        let mut grown = earlier.clone();
+        let mut grown = earlier;
         grown[5] ^= 1;
         grown.extend_from_slice(b"grown");
         let (c, e) = served(&d, "a/b", "m.gguf", &grown);

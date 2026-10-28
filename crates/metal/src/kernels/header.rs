@@ -136,7 +136,9 @@ pub fn geometry_defines(g: &Geometry) -> String {
 /// The whole header of `g`: the fault site's table, then its geometry.
 #[must_use]
 pub fn render(g: &Geometry) -> String {
-    fault_sites() + &geometry_defines(g)
+    let mut text = fault_sites();
+    text.push_str(&geometry_defines(g));
+    text
 }
 
 /// The kernels' files joined: each under its name, in the order given (the
@@ -292,7 +294,7 @@ mod tests {
         let body = files(&[("a", "int a;\n".to_string()), ("b", "int b;\n".to_string())]);
         assert_eq!(body, "\n// a\nint a;\n\n// b\nint b;\n");
         let text = program(&g, &body);
-        assert_eq!(text, render(&g) + &body);
+        assert_eq!(text, format!("{}{body}", render(&g)));
         assert!(text.starts_with("// The fault site's codes"));
     }
 }

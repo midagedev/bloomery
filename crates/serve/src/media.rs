@@ -2013,7 +2013,7 @@ mod tests {
         let png = data("image/png", PNG_B64);
         let head = |i: u32| [100, 200 + i, 300];
         let ids = |a: u32, b: u32| [&[1][..], &head(a), &[7, 2], &head(b), &[7, 3]].concat();
-        for (ids, index) in [(ids(0, 0).to_vec(), 1), (vec![7, 2], 0)] {
+        for (ids, index) in [(ids(0, 0), 1), (vec![7, 2], 0)] {
             let urls = vec![png.as_str(); if index == 1 { 2 } else { 1 }];
             match err(expand_prompt(&ids, &Medium::images(&urls), &NumberedMedia)) {
                 MediaError::ImageNumber { index: got } => assert_eq!(got, index, "{ids:?}"),

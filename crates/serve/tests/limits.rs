@@ -135,7 +135,7 @@ mod connections {
             .unwrap_or_else(|| panic!("no Content-Length in {head:?}"));
         let mut body = vec![0u8; len];
         s.read_exact(&mut body).expect("read a response body");
-        head + &String::from_utf8_lossy(&body)
+        format!("{head}{}", String::from_utf8_lossy(&body))
     }
 
     /// Waits for the server to close `s` and returns how long after `since` it did;

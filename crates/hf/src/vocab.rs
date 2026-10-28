@@ -965,7 +965,7 @@ mod tests {
             "use_regex":false});
         let regex = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         let pre = json!({"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":regex},
-            "behavior":"Isolated","invert":false}, byte_level.clone()]});
+            "behavior":"Isolated","invert":false}, byte_level]});
         let end = json!({"id":3,"content":"<|im_end|>","special":true,"normalized":false,
             "single_word":false,"lstrip":false,"rstrip":false});
         let mut decoded = end.clone();
@@ -1445,7 +1445,9 @@ mod tests {
             Value::Array(items) => {
                 h.update(b"[");
                 h.update(u32::try_from(items.len()).unwrap().to_le_bytes());
-                items.iter().for_each(|item| feed(h, item));
+                for item in items {
+                    feed(h, item);
+                }
             }
             other => panic!("{other:?}"),
         }

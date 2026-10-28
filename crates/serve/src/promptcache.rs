@@ -436,7 +436,7 @@ mod tests {
         assert!(c.covers(&a));
         assert!(!c.covers(&imaged(3, &tail)), "another image is not covered");
         let mut c = PromptCache::new(1 << 20);
-        c.insert(a.clone(), Arc::new(Fours(30)), 0.0, true);
+        c.insert(a, Arc::new(Fours(30)), 0.0, true);
         let p = c.best(&imaged(1, &[200, 201]), 0).expect("a pick");
         assert_eq!(
             (p.common, p.kept),
@@ -453,7 +453,7 @@ mod tests {
         let a = ids(50, 1);
         c.insert(head(&a, 20), state(20, 30, None), 0.0, true);
         c.insert(ids(30, 9), state(30, 30, None), 0.0, true);
-        let notes = c.insert(a.clone(), state(50, 30, None), 0.0, true);
+        let notes = c.insert(a, state(50, 30, None), 0.0, true);
         assert!(
             matches!(notes[0], CacheNote::Evict { positions: 20, why, .. }
                 if why == "a newer state keeps all of it")
@@ -574,7 +574,7 @@ mod tests {
         );
         assert_eq!((c.len(), c.bytes()), (1, 60), "the cache is as it was");
         // A newer state that keeps all of it: it stays while the copy runs.
-        let mut longer = a.clone();
+        let mut longer = a;
         longer.ids.extend(ids(10, 5).ids);
         let notes = c.insert(longer.clone(), state(60, 30, None), 0.0, true);
         assert!(

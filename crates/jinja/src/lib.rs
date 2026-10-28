@@ -1196,7 +1196,7 @@ impl Lexer {
                 }
                 Expr::Dict(items)
             }
-            other => return err(format!("unexpected {other:?}")),
+            other @ Tok::Op(_) => return err(format!("unexpected {other:?}")),
         })
     }
 }
@@ -3020,7 +3020,11 @@ fn binop(l: &V, op: BinOp, r: &V) -> Result<V, TemplateError> {
             };
             Value::Bool(found == (op == In))
         }
-        Concat => Value::String(to_str(l)? + &to_str(r)?),
+        Concat => {
+            let mut joined = to_str(l)?;
+            joined.push_str(&to_str(r)?);
+            Value::String(joined)
+        }
         Add => match (l, r) {
             (V::J(Value::String(a)), V::J(Value::String(b))) => Value::String(format!("{a}{b}")),
             (V::J(Value::Array(a)), V::J(Value::Array(b))) => {

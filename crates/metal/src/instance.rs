@@ -852,7 +852,7 @@ mod tests {
             Err(Refused::Missing { what: "attention" }),
             "a file of no attention layer"
         );
-        let mut dense = layers.clone();
+        let mut dense = layers;
         dense[2].1 = Ffn::Dense {
             ff: 512,
             act: Act::SwiGlu { limit: None },

@@ -687,7 +687,7 @@ fn hw_v41_spelled_calls_parse_streamed_and_whole() {
     assert_eq!(whole["content"], "", "{v}");
     call_ids(&mut whole);
 
-    let mut sb = body.clone();
+    let mut sb = body;
     sb["stream"] = json!(true);
     let r = post(addr, "/v1/chat/completions", &sb);
     assert_eq!(r.status, 200, "{}", r.body);

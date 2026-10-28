@@ -14,7 +14,7 @@ fn audio_parts_keep_their_delimiters_and_refuse_invalid_pcm() {
     let audio = json!({"type":"input_audio","input_audio":{
         "format":"f32","sample_rate":16000,"channels":1,"data":media::encode_base64(&pcm)
     }});
-    let body = json!({"content":[{"type":"text","text":"before"},audio.clone(),{"type":"text","text":"after"},audio.clone()]});
+    let body = json!({"content":[{"type":"text","text":"before"},audio,{"type":"text","text":"after"},audio]});
     let parsed = input(&side, "input", &body).unwrap_or_else(|e| panic!("{}", e.message));
     assert!(parsed.images.is_empty());
     assert_eq!(parsed.audio.len(), 2);
@@ -34,9 +34,9 @@ fn audio_parts_keep_their_delimiters_and_refuse_invalid_pcm() {
     }
     assert_eq!(parsed.ids, want);
     side.ctx = parsed.ids.len();
-    assert!(inputs(&side, "input", &json!([body.clone()])).is_ok());
+    assert!(inputs(&side, "input", &json!([body])).is_ok());
     side.ctx -= 1;
-    let error = inputs(&side, "input", &json!([body.clone()]))
+    let error = inputs(&side, "input", &json!([body]))
         .err()
         .expect("context limit");
     assert_eq!(error.kind, "exceed_context_size_error");

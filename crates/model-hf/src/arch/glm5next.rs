@@ -342,14 +342,11 @@ fn layer(
         "self_attn.o_norm.weight" => one(names::ssm_norm(l)),
         "self_attn.dt_bias" => one(names::ssm_dt_bias(l)),
         "self_attn.q_conv1d.weight" | "self_attn.k_conv1d.weight" | "self_attn.v_conv1d.weight" => {
-            let (channels, kernel) = match *shape {
-                [c, 1, k] | [c, k] => (c, k),
-                _ => {
-                    return Err(refuse(
-                        name,
-                        format!("conv taps {shape:?} are not [channels, 1, kernel]"),
-                    ));
-                }
+            let (&[channels, 1, kernel] | &[channels, kernel]) = shape else {
+                return Err(refuse(
+                    name,
+                    format!("conv taps {shape:?} are not [channels, 1, kernel]"),
+                ));
             };
             let part = rest.as_bytes()["self_attn.".len()] as char;
             Ok(vec![(
@@ -1595,7 +1592,7 @@ mod tests {
             &["e_score_correction_bias", "shared_head.norm.weight"],
         );
         open(&dir).unwrap();
-        let mut trunk_only = config.clone();
+        let mut trunk_only = config;
         trunk_only["text_config"]["num_nextn_predict_layers"] = serde_json::json!(0);
         write(&trunk_only, &["layers.3."]);
         assert_eq!(

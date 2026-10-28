@@ -193,7 +193,8 @@ fn write_as<M: FolderMap>(dir: &Path, prefix: &str, limit: u64, q8: bool) -> Res
     );
 
     let get = |n: &str| folder.raw(n);
-    let mut tensor_scales: std::collections::HashMap<String, Vec<f32>> = Default::default();
+    let mut tensor_scales: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::default();
     let (shards, layouts): (Vec<_>, Vec<_>) = shards.into_iter().unzip();
     write_split(
         prefix,
@@ -1182,7 +1183,7 @@ mod tests {
                 }
             })
             .collect();
-        let mut single = config.clone();
+        let mut single = config;
         single["text_config"]["num_experts"] = 1.into();
         single["text_config"]["num_experts_per_tok"] = 1.into();
         let single = Checkpoint::parse(&single).unwrap();

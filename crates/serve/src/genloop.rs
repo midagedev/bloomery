@@ -3092,7 +3092,7 @@ mod cache_tests {
             [vec![u1], vec![u2], vec![]],
             "each piece is handed the marks in it: its end"
         );
-        let mut b = system.clone();
+        let mut b = system;
         b.extend(enc("<｜User｜>a dog ran and the "));
         let (kept, tb) = run(&mut slot, &b);
         assert_eq!(kept, u1, "the system prompt, where the second call starts");
@@ -3125,7 +3125,7 @@ mod cache_tests {
             assert_eq!(log.calls[..1], [a.len() - 1], "one prompt call");
             assert_eq!(log.marks[0], [u1, u2], "the call's marks");
         }
-        let mut b = system.clone();
+        let mut b = system;
         b.extend(enc("<｜User｜>a dog ran and the "));
         let (kept, tb) = run(&mut slot, &b);
         assert_eq!(kept, u1, "the system prompt, a mark inside the first call");

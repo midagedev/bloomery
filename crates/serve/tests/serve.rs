@@ -732,7 +732,7 @@ fn hw_chat_images_expand_to_spans() {
         rendered.len() + 1,
         "one placeholder, two positions"
     );
-    let mut ids = rendered.clone();
+    let mut ids = rendered;
     ids.insert(at, IMAGE_ID);
     ids.pop();
     let key = serve::media::load(&url).expect("the fixture").key;
@@ -3302,7 +3302,7 @@ fn think_chat(extra: Value) -> Value {
         "chat_template_kwargs": {"thinking": true},
     });
     if let (Value::Object(b), Value::Object(e)) = (&mut b, extra) {
-        b.extend(e.clone());
+        b.extend(e);
     }
     b
 }

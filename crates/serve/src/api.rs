@@ -4740,7 +4740,7 @@ mod tests {
             .collect();
         assert!(!ab_ids.is_empty(), "{ab}");
         assert_eq!(tokens(json!({"content": ["ab"]})), ab);
-        assert_eq!(tokens(json!({"content": ab_ids.clone()})), ab);
+        assert_eq!(tokens(json!({"content": ab_ids})), ab);
         assert_eq!(tokens(json!({"content": ["a", ab_ids[1]]})), ab);
         let mut with_bos = vec![bos as u64];
         with_bos.extend(&ab_ids);
@@ -5406,7 +5406,7 @@ mod tests {
             }
         }
         let want = "<user>w?<assistant>[get_weather city=Seoul n=3]";
-        let (_, text) = applied(served_with(WALKS_ARGUMENTS), &tool_call_body(args.clone()));
+        let (_, text) = applied(served_with(WALKS_ARGUMENTS), &tool_call_body(args));
         assert_eq!(applied_prompt(&text), want);
         // A template that prints the string takes it as it came, valid JSON or not.
         let addr = served_with(PRINTS_ARGUMENTS);
@@ -6766,8 +6766,8 @@ mod tests {
                 let serve = Arc::new(move |server| {
                     super::super::keep_alive(
                         server,
-                        &Default::default(),
-                        &Default::default(),
+                        &super::super::Answers::default(),
+                        &crate::flag::ApiKeys::default(),
                         |req, w| {
                             assert!(
                                 w.write_timeout()? == Some(Duration::from_secs(10)),

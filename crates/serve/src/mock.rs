@@ -974,7 +974,7 @@ pub(crate) struct MockEmbed {
 impl MockEmbed {
     pub(crate) fn new(ctx: usize) -> MockEmbed {
         MockEmbed {
-            prompts: Default::default(),
+            prompts: std::collections::BTreeMap::default(),
             ctx,
             fail: None,
             calls: Arc::default(),

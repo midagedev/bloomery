@@ -10,7 +10,7 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         vision::size::SizeRule::new(16, 3, vision::arch::TokenLimits::new(1, 4).unwrap()).unwrap();
     side.media = Some(Arc::new(vision::arch::gemma4v::Media::new(rule)));
     let image = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGM4kWIERAAKxQK9KV6Y1QAAAABJRU5ErkJggg=="}});
-    let body = json!({"content":[{"type":"text","text":"a<|image>"},image.clone(),{"type":"text","text":"b"},image.clone()]});
+    let body = json!({"content":[{"type":"text","text":"a<|image>"},image,{"type":"text","text":"b"},image]});
     let parsed = inputs(&side, "input", &json!([body])).unwrap_or_else(|e| panic!("{}", e.message));
     assert_eq!(parsed.len(), 1);
     let got = &parsed[0];
@@ -94,7 +94,7 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
     }
     side.ctx = 8192;
     let second = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPgEpHTMLIBAAI3ANNbVlHYAAAAAElFTkSuQmCC"}});
-    let video = json!({"content":[{"type":"text","text":"Video:"},image.clone(),second.clone()]});
+    let video = json!({"content":[{"type":"text","text":"Video:"},image,second]});
     let files = [&image, &second]
         .map(|part| media::load(part["image_url"]["url"].as_str().unwrap()).unwrap());
     assert_ne!(files[0].key, files[1].key);
@@ -219,7 +219,7 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         json!([{"type":"text","text":"Video:"},{"type":"text","text":"not a frame"}]),
         Value::Array(
             std::iter::once(json!({"type":"text","text":"Video:"}))
-                .chain(std::iter::repeat_n(image.clone(), 33))
+                .chain(std::iter::repeat_n(image, 33))
                 .collect(),
         ),
     ] {
@@ -467,7 +467,7 @@ fn a_still_and_an_audio_span_are_charged_before_the_clip_is_planned() {
         &side_at(30),
         &mock.support(1),
         "input",
-        &json!([{"content": [still.clone(), audio.clone(), clip.clone()]}]),
+        &json!([{"content": [still, audio, clip]}]),
     )
     .err()
     .expect("a refusal");

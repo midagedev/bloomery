@@ -2530,7 +2530,7 @@ mod tests {
             "{:?}",
             p.refused
         );
-        let mut narrow = entries.clone();
+        let mut narrow = entries;
         let at = narrow
             .iter()
             .position(|(n, _, _)| n == &format!("{l0}.mlp.gate.scales"))
@@ -2650,7 +2650,7 @@ mod tests {
             p.placed["model.layers.47.mlp.switch_mlp.down_proj.weight"].format,
             Format::MlxAffine { bits: 4, group: 64 }
         );
-        let mut other = real.clone();
+        let mut other = real;
         other["quantization"]["mode"] = "affine2".into();
         other.as_object_mut().unwrap().remove("quantization_config");
         let e = Config::parse(&other, None).unwrap_err();

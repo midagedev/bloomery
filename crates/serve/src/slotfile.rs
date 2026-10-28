@@ -353,7 +353,7 @@ mod tests {
             Held::from(imaged().ids)
         );
         assert_eq!(r, b"engine");
-        let mut v3 = v2.clone();
+        let mut v3 = v2;
         v3[8..12].copy_from_slice(&3u32.to_le_bytes());
         let e = read(&v3).expect_err("version 3").to_string();
         assert!(e.contains("reads versions 1 and 2"), "{e}");

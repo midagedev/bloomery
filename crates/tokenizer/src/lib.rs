@@ -1288,7 +1288,7 @@ mod tests {
         );
         let mut glm4 = sparse.clone();
         glm4[1].1 = Value::String("glm4".into());
-        let mut llama = sparse.clone();
+        let mut llama = sparse;
         llama[0].1 = Value::String("llama".into());
         for (kvs, want, unmarked) in [
             (&mut off_vocab, "tokenizer.ggml.merges[0] \"a b\"", true),

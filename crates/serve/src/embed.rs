@@ -44,7 +44,7 @@ pub trait Embed: Send {
     fn dims(&self) -> Vec<usize>;
     /// Named input prefixes from the model's sentence-transformers configuration.
     fn prompts(&self) -> std::collections::BTreeMap<String, String> {
-        Default::default()
+        std::collections::BTreeMap::default()
     }
     /// The side model's image preparer, present when a projector is loaded.
     fn media(&self) -> Option<crate::media::SharedMediaModel> {

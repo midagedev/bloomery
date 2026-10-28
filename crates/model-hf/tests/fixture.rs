@@ -1331,7 +1331,7 @@ fn hw_fixture_v41_budget() {
         let slots = NonZeroUsize::new(slots).unwrap();
         inputs
             .plan_with_slots(&machine, ctx, &levers, slots)
-            .map(|plan| plan.n_l.clone())
+            .map(|plan| plan.n_l)
             .map_err(|e| e.to_string())
     };
     let ctx = v41::BUDGET_CTX;
@@ -1368,7 +1368,7 @@ fn hw_fixture_v41_budget() {
     }
 
     // `verify` re-plans the written file under the budget its header records.
-    let mut edited = p.target.clone();
+    let mut edited = p.target;
     *kv(&mut edited.kvs, KEY_CARD_BUDGET) = Value::U64(recorded - (64 << 20));
     let g2 = dir("v41budget-edited");
     let first2 = header_only(&edited, &g2.0);
@@ -1824,7 +1824,7 @@ fn fixture_reads_only_the_sources_header() {
     // The low byte of the last element of `toy.per_layer`, a value the header holds.
     let key = b"toy.per_layer";
     let at = header.windows(key.len()).position(|w| w == key).unwrap() + key.len() + 4 + 4 + 8 + 12;
-    let mut edited = header.clone();
+    let mut edited = header;
     assert_eq!(edited[at], 13);
     edited[at] = 14;
     let other = write_sparse(&sparse_dir.join("toy-edited-00001-of-00001.gguf"), &edited);
@@ -2752,7 +2752,6 @@ fn hw_fixture_q38_budget() {
             .plan_with_slots(&machine, q38::BUDGET_CTX, &levers, Experts::Card, 1)
             .unwrap()
             .n_l
-            .clone()
     };
     let want = |n: u64| -> Vec<u64> {
         (0..layers)
@@ -3291,7 +3290,7 @@ fn hw_fixture_glm_budget() {
         };
         inputs
             .plan_nextn(&machine, ctx, &levers, &nextn)
-            .map(|plan| plan.plan.n_l.clone())
+            .map(|plan| plan.plan.n_l)
             .map_err(|e| e.to_string())
     };
     let plain = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
@@ -3300,7 +3299,7 @@ fn hw_fixture_glm_budget() {
         };
         inputs
             .plan(&machine, ctx, &levers)
-            .map(|plan| plan.n_l.clone())
+            .map(|plan| plan.n_l)
             .map_err(|e| e.to_string())
     };
     let ctx = glm::BUDGET_CTX;
@@ -3340,7 +3339,7 @@ fn hw_fixture_glm_budget() {
     }
 
     // `verify` re-plans the written file under the budget its header records.
-    let mut edited = p.target.clone();
+    let mut edited = p.target;
     *kv(&mut edited.kvs, KEY_CARD_BUDGET) = Value::U64(recorded - (64 << 20));
     let g2 = dir("glmbudget-edited");
     let fx2 = Split::open(header_only(&edited, &g2.0)).unwrap();
@@ -5327,7 +5326,6 @@ fn hw_fixture_solar_budget() {
             .plan(&machine, ctx, &levers)
             .unwrap_or_else(|e| panic!("the plan under {budget:?}: {e}"))
             .n_l
-            .clone()
     };
     // PIN(2026-10-23): the Q6_K-down layers (f0, f1) are card-eligible: the common card leg's
     // down arm runs a Q6_K down (`kernels::card_down_runs`). Mutant: that arm without Q6_K — f0 and

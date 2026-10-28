@@ -1110,12 +1110,12 @@ fn hw_anthropic_vision_format_accepted() {
     ]});
     let cases = [
         (
-            json!([{"role": "user", "content": [data.clone(), text.clone()]}]),
-            json!([{"role": "user", "content": [data_part.clone(), text.clone()]}]),
+            json!([{"role": "user", "content": [data, text]}]),
+            json!([{"role": "user", "content": [data_part, text]}]),
         ),
         (
-            json!([{"role": "user", "content": [url, text.clone()]}]),
-            json!([{"role": "user", "content": [url_part, text.clone()]}]),
+            json!([{"role": "user", "content": [url, text]}]),
+            json!([{"role": "user", "content": [url_part, text]}]),
         ),
         (
             json!([question.clone(), call, {"role": "user", "content": [

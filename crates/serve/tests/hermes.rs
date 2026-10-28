@@ -567,7 +567,7 @@ fn qwen_chat(extra: Value) -> Value {
         "max_tokens": 32,
     });
     if let (Value::Object(b), Value::Object(e)) = (&mut b, extra) {
-        b.extend(e.clone());
+        b.extend(e);
     }
     b
 }

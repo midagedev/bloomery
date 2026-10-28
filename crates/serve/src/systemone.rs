@@ -553,9 +553,8 @@ mod tests {
             r#"{"state":NaN,"questions":{"q":{"type":"noul"}}}"#,
             "{",
         ] {
-            let want = match json::parse(body).and_then(|j| Asked::from_json(&j)) {
-                Ok(_) => panic!("{body} is valid"),
-                Err(e) => e,
+            let Err(want) = json::parse(body).and_then(|j| Asked::from_json(&j)) else {
+                panic!("{body} is valid");
             };
             let (status, got) = post_to(&rules(), "/v1/systemone", body);
             let (code, kind) = match want {
