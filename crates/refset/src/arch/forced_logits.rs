@@ -284,12 +284,8 @@ pub(crate) mod tests {
         if complete {
             lines.push("# complete\t1\t0".to_string());
         }
-        std::fs::write(dir.join("MANIFEST.tsv"), {
-            let mut out = lines.join("\n");
-            out.push('\n');
-            out
-        })
-        .expect("manifest");
+        std::fs::write(dir.join("MANIFEST.tsv"), format!("{}\n", lines.join("\n")))
+            .expect("manifest");
         dir
     }
 

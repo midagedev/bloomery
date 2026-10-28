@@ -2094,12 +2094,8 @@ mod tests {
             lines.push("# complete\t1\t0".to_string());
         }
         let path = dir.join("MANIFEST.tsv");
-        std::fs::write(&path, {
-            let mut out = lines.join("\n");
-            out.push('\n');
-            out
-        })
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        std::fs::write(&path, format!("{}\n", lines.join("\n")))
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
 
     /// The fixture file `FIXTURE_FILE` names, as a family's `runs` reads it: a static, since a
@@ -2221,16 +2217,14 @@ mod tests {
         let text = e.to_string();
         assert!(
             text.starts_with("fixture oracle c: ik head: stale set: ")
-                && text.contains(&format!("dumped from {}", {
-                    let mut out = refset::fixture::LINE_PREFIX.to_owned();
-                    out.push_str(&theirs);
-                    out
-                }))
-                && text.contains(&format!("the tree runs {}", {
-                    let mut out = refset::fixture::LINE_PREFIX.to_owned();
-                    out.push_str(ours);
-                    out
-                }))
+                && text.contains(&format!(
+                    "dumped from {}{theirs}",
+                    refset::fixture::LINE_PREFIX
+                ))
+                && text.contains(&format!(
+                    "the tree runs {}{ours}",
+                    refset::fixture::LINE_PREFIX
+                ))
                 && text.ends_with(&format!("dump it again with `{RECIPE}`")),
             "{text}"
         );

@@ -864,13 +864,8 @@ impl NextnInputs {
             });
         }
         if let Some(missing) = nextn_required().find(|stem| {
-            !tensors.iter().any(|t| {
-                t.name == {
-                    let mut out = prefix.clone();
-                    out.push_str(stem);
-                    out
-                }
-            })
+            let want = format!("{prefix}{stem}");
+            !tensors.iter().any(|t| t.name == want)
         }) {
             return Err(PlacementError::Tensor {
                 name: format!("{prefix}{missing}"),

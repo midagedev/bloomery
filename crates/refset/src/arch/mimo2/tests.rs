@@ -29,12 +29,8 @@ fn check(dir: &Path, model: &str, build: &str, arch: &str, complete: bool) -> Re
         lines.push("# complete\t1\t0".to_string());
     }
     let path = dir.join("MANIFEST.tsv");
-    std::fs::write(&path, {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    })
-    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    std::fs::write(&path, format!("{}\n", lines.join("\n")))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     IK.check_set(dir).map(|_| ())
 }
 

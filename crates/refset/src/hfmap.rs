@@ -266,12 +266,7 @@ mod tests {
         if complete {
             lines.push(format!("# complete\t{}", files.len()));
         }
-        std::fs::write(dir.join(MANIFEST), {
-            let mut out = lines.join("\n");
-            out.push('\n');
-            out
-        })
-        .unwrap();
+        std::fs::write(dir.join(MANIFEST), format!("{}\n", lines.join("\n"))).unwrap();
     }
 
     const HEAD: [(&str, &str); 4] = [

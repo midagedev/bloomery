@@ -32,12 +32,8 @@ fn write_set(dir: &Path, checkpoint: &str, image: &str, complete: bool) {
     if complete {
         lines.push("# complete\t1\t1\t1".to_string());
     }
-    std::fs::write(dir.join("MANIFEST.tsv"), {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    })
-    .unwrap_or_else(|e| panic!("{e}"));
+    std::fs::write(dir.join("MANIFEST.tsv"), format!("{}\n", lines.join("\n")))
+        .unwrap_or_else(|e| panic!("{e}"));
     std::fs::write(
         dir.join("plans.tsv"),
         "# kind\tw\th\tn_llm_h\tn_llm_w\tbest_h\tbest_w\tn_tokens\tresized_w\tresized_h\toff_x\toff_y\n\

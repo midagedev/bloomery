@@ -41,11 +41,7 @@ fn write_set(dir: &Path, model: &str, draft: &str, rows: &[&str]) {
     lines.extend(COLUMNS.iter().map(|c| c.to_string()));
     lines.extend(rows.iter().map(|r| r.to_string()));
     lines.push("# complete\t3\t0".to_string());
-    let text = {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    };
+    let text = format!("{}\n", lines.join("\n"));
     std::fs::write(dir.join("MANIFEST.tsv"), text)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
 }

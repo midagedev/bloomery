@@ -102,12 +102,8 @@ fn write(dir: &Path, s: &Set) {
     if s.complete {
         lines.push("# complete\t2\t8".to_string());
     }
-    std::fs::write(dir.join("MANIFEST.tsv"), {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    })
-    .unwrap_or_else(|e| panic!("{e}"));
+    std::fs::write(dir.join("MANIFEST.tsv"), format!("{}\n", lines.join("\n")))
+        .unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// The manifest reads by its column lines and each case's files by their

@@ -59,11 +59,7 @@ fn write(dir: &Path) {
         "tensor\tl_out-0\t0\tf32\t1\t1\t1\t1\t4\t0\tADD".to_string(),
         "# complete\t1\t0".to_string(),
     ];
-    put(dir, "MANIFEST.tsv", &{
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    });
+    put(dir, "MANIFEST.tsv", &format!("{}\n", lines.join("\n")));
     put(dir, "topk.tsv", TOPK);
     put(dir, "greedy.tsv", GREEDY);
 }

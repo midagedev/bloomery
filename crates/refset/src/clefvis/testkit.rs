@@ -116,12 +116,7 @@ pub(crate) fn finish(dir: &Path, head: &Head, extra: &[String], rows: &[String])
     }
     write(
         &dir.join("MANIFEST.tsv"),
-        {
-            let mut out = l.join("\n");
-            out.push('\n');
-            out
-        }
-        .as_bytes(),
+        format!("{}\n", l.join("\n")).as_bytes(),
     );
 }
 

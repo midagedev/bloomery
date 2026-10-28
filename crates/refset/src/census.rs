@@ -612,12 +612,8 @@ mod tests {
     /// The manifest `lines` written at `<dir>/stubs.tsv`.
     fn manifest(dir: &Path, lines: &[String]) -> PathBuf {
         let p = dir.join("stubs.tsv");
-        std::fs::write(&p, {
-            let mut out = lines.join("\n");
-            out.push('\n');
-            out
-        })
-        .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        std::fs::write(&p, format!("{}\n", lines.join("\n")))
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         p
     }
 

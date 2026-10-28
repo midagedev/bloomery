@@ -32,12 +32,7 @@ fn write(path: &Path, bytes: &[u8]) {
 fn manifest(dir: &Path, lines: &[&str]) -> Result<RefManifest, RefError> {
     write(
         &dir.join("MANIFEST.tsv"),
-        {
-            let mut out = lines.join("\n");
-            out.push('\n');
-            out
-        }
-        .as_bytes(),
+        format!("{}\n", lines.join("\n")).as_bytes(),
     );
     RefManifest::read(dir)
 }
