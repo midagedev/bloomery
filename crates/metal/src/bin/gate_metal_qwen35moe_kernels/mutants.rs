@@ -1048,6 +1048,87 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[("st[i] = NAN;", "st[i] = 0.0f;", 1)],
     },
     Mutant {
+        name: "shortconv_tap_order",
+        clause: "shortconv_rows",
+        why: "the taps run newest first: weight k pairs with the predecessor k back, not taps - 1 - k back",
+        edits: &[("r, a.taps - 1u - k, a);", "r, k, a);", 1)],
+    },
+    Mutant {
+        name: "shortconv_width_short",
+        clause: "shortconv_rows",
+        why: "the conv runs one tap short, a width-6 conv on seven taps' weights: the newest tap is dropped",
+        edits: &[(
+            "for (uint k = 0u; k < a.taps; ++k) {",
+            "for (uint k = 0u; k + 1u < a.taps; ++k) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_no_b",
+        clause: "shortconv_rows",
+        why: "the B gate is skipped: u is x, not B times x",
+        edits: &[(
+            "return row[c] * row[2u * a.hidden + c];",
+            "return row[2u * a.hidden + c];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_no_c",
+        clause: "shortconv_rows",
+        why: "the C epilogue is skipped: the output is the conv sum alone",
+        edits: &[(
+            "float y = acc * bcx[r * a.x_stride + a.hidden + c];",
+            "float y = acc;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_start_stale",
+        clause: "shortconv_start",
+        why: "a predecessor before the sequence's first position reads the ring's stale slot, not 0",
+        edits: &[(
+            "    if (pos0 < before) {\n        return 0.0f;\n    }\n",
+            "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_chunk_ring",
+        clause: "shortconv_rows",
+        why: "every predecessor of a chunk's rows is read from the ring, so a row inside the chunk reads the slot of the position before the chunk instead of its in-chunk predecessor",
+        edits: &[
+            ("if (back <= r) {", "if (false) {", 1),
+            ("uint before = back - r;", "uint before = back;", 1),
+        ],
+    },
+    Mutant {
+        name: "shortconv_ring_alias",
+        clause: "shortconv_state",
+        why: "the ring is cut to five rows, so a seven-tap conv's positions 1 and 6 back share a slot",
+        edits: &[(
+            "return pos % ring_rows;",
+            "return pos % min(ring_rows, 5u);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_no_raise",
+        clause: "shortconv_nan",
+        why: "an element that is not finite raises nothing",
+        edits: &[(
+            "inline void sc_raise(device atomic_uint *faults, uint layer) {\n    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);\n}",
+            "inline void sc_raise(device atomic_uint *faults, uint layer) {\n}",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_nan_plausible",
+        clause: "shortconv_nan",
+        why: "an element that is not finite is written as zero, not NaN",
+        edits: &[("return ok ? v : NAN;", "return ok ? v : 0.0f;", 1)],
+    },
+    Mutant {
         name: "attn_score_scale",
         clause: "attn_f16",
         why: "the score is twice the scaled dot",
@@ -1439,6 +1520,34 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "*((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
             "*((device float4 *)(yr + f4 * 4u)) = float4(0.f);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "sandwich_no_norm",
+        clause: "sandwich",
+        why: "the post norm is skipped: the stream takes the sub-layer's output as it is, a plain add",
+        edits: &[("+ add * value;", "+ norm_rows_load4(xr, f4);", 1)],
+    },
+    Mutant {
+        name: "sandwich_no_gain",
+        clause: "sandwich",
+        why: "the norm's gain is not applied to the value",
+        edits: &[("return (x * gain) * scale;", "return x * scale;", 1)],
+    },
+    Mutant {
+        name: "sandwich_add_ignored",
+        clause: "sandwich",
+        why: "the add scale is ignored: the normed value is always added once",
+        edits: &[("+ add * value;", "+ value;", 1)],
+    },
+    Mutant {
+        name: "sandwich_nan_stays",
+        clause: "sandwich_nan",
+        why: "a row the norm cannot take leaves the stream's row as it was, a finite value, not NaN",
+        edits: &[(
+            "*((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
+            "*((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4);",
             1,
         )],
     },

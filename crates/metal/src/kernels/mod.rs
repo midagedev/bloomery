@@ -19,6 +19,8 @@
 //! The gated delta step ([`delta`]) writes the numerator and the partials that
 //! mat-vec reads. Its kernel is `kernels/delta.metal`.
 //! The head ([`head`]) is one more pipeline: `kernels/head.metal`, the same ticket.
+//! The short conv ([`shortconv`]) of a gated-conv mixer is `kernels/shortconv.metal`; the
+//! sandwich residual is `kernels/norm.metal`'s `norm_add_rows`.
 
 mod attention;
 use crate::attention_geom;
@@ -38,6 +40,8 @@ pub mod router;
 use crate::router_geom;
 mod rows;
 mod seg;
+mod shortconv;
+mod shortconv_geom;
 
 pub use attention::AttentionPrefillParams;
 pub use attention::AttentionRowsParams;
@@ -74,6 +78,7 @@ pub use geometry::{
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, head_groups};
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
+pub use norm::NormAddRowsParams;
 pub use norm::NormRowsParams;
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
@@ -81,6 +86,8 @@ pub use routed::{
     route_table_words, route_tiles,
 };
 pub use seg::{SegParams, Segment};
+pub use shortconv::{ShortConvRowsParams, ShortConvStepParams};
+pub use shortconv_geom::MAX_SLOTS as SHORTCONV_MAX_SLOTS;
 
 use bloomery_device::DeviceError;
 
@@ -149,6 +156,10 @@ pub struct Kernels {
     router: Pipeline,
     /// The RMS norm over rows.
     norm_rows: Pipeline,
+    /// The sandwich residual: the norm of rows added into the stream.
+    norm_add_rows: Pipeline,
+    /// The short conv: the step, a chunk's rows and the ring commit.
+    shortconv: shortconv::Pipelines,
     /// The pass's routing, grouped experts and row glue (`route.metal`,
     /// `gemm_routed.metal`).
     routed: routed::RoutedPipelines,
@@ -348,6 +359,8 @@ impl Kernels {
             embed_q5k: library.pipeline("embed_q5k")?,
             router: library.pipeline("router35")?,
             norm_rows: library.pipeline("norm_rows")?,
+            norm_add_rows: library.pipeline("norm_add_rows")?,
+            shortconv: shortconv::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,

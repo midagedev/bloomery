@@ -208,6 +208,7 @@ fn main() {
         "route",
         "gemm_routed",
         "delta",
+        "shortconv",
         "attention",
         "head",
     ] {

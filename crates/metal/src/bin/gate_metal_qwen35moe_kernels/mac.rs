@@ -89,6 +89,8 @@ mod clauses_router;
 mod clauses_rows;
 #[path = "clauses_seg.rs"]
 mod clauses_seg;
+#[path = "clauses_shortconv.rs"]
+mod clauses_shortconv;
 #[path = "clauses_sites.rs"]
 mod clauses_sites;
 #[path = "clauses_synth.rs"]
@@ -115,6 +117,8 @@ mod oracle_delta;
 mod oracle_experts;
 #[path = "../shared/oracle_router.rs"]
 mod oracle_router;
+#[path = "../shared/oracle_shortconv.rs"]
+mod oracle_shortconv;
 #[path = "../shared/synthetic.rs"]
 mod synthetic;
 
@@ -1021,6 +1025,7 @@ fn clause_table<'a>(
             .chain(clauses_sites::table(ctx.harness))
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
             .chain(clauses_delta::table(ctx))
+            .chain(clauses_shortconv::table(ctx))
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))
             .chain(clauses_apart::table(ctx))
