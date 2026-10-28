@@ -1341,7 +1341,8 @@ mod tests {
     #[test]
     fn an_output_projection_runs_wide_only_over_blocks_of_32() {
         for &ty in SiteTy::ALL {
-            let runs = matches!(ty, SiteTy::Q8_0 | SiteTy::Q5_0);
+            // NVFP4's wide GEMM reads the q8 blocks of 32 too (`site::reads_wide`).
+            let runs = matches!(ty, SiteTy::Q8_0 | SiteTy::Q5_0 | SiteTy::Nvfp4);
             for (what, r) in [
                 ("an output projection", out_runs(ty)),
                 ("a query up projection", qb_runs(ty)),
