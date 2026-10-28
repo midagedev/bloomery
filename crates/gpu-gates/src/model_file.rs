@@ -29,6 +29,11 @@ pub use fetch::{
 pub const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
                                or --hf <repo>[:<quant>], or set BLOOMERY_REF_MODEL";
 
+/// A checkpoint folder as read ([`open_folder`]) and the part source its load reads card tensors
+/// through, named here so a seat reaches the folder reader through this crate's `checkpoint` feature.
+#[cfg(feature = "checkpoint")]
+pub use model_hf::{folder::Opened as Folder, part::Checkpoint};
+
 #[cfg(feature = "checkpoint")]
 static KEPT: std::sync::Mutex<Option<(PathBuf, model_hf::folder::Opened)>> =
     std::sync::Mutex::new(None);

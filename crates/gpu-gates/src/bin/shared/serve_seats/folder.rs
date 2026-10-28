@@ -11,10 +11,10 @@ use bloomery_gpu_gates::GateError;
 use gguf::Split;
 use tokenizer::Tokenizer;
 
-/// What a folder's load reads card tensors through (`model_hf::folder::Opened::source`). A build
+/// What a folder's load reads card tensors through (`model_file::Folder::source`). A build
 /// without the `checkpoint` feature opens no folder, so it has none.
 #[cfg(feature = "checkpoint")]
-pub type Source = model_hf::part::Checkpoint;
+pub type Source = bloomery_gpu_gates::model_file::Checkpoint;
 #[cfg(not(feature = "checkpoint"))]
 pub type Source = ();
 
@@ -34,7 +34,7 @@ pub fn checked(
     dir: &Path,
     arch: &str,
     rows: &[String],
-) -> Result<model_hf::folder::Opened, GateError> {
+) -> Result<bloomery_gpu_gates::model_file::Folder, GateError> {
     let f = bloomery_gpu_gates::model_file::open_folder(dir)?;
     if f.header.architecture() != Some(arch) {
         return Err(format!(
