@@ -87,6 +87,11 @@ macro_rules! minimax_m2_regex {
         r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
 }
+macro_rules! tekken_regex {
+    () => {
+        r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
+    };
+}
 // One regex split, then ByteLevel without its own regex.
 macro_rules! pre_tokenizer {
     ($regex:ident, $behavior:literal, $invert:literal, $trim:literal) => {
@@ -109,7 +114,7 @@ macro_rules! pre_tokenizer {
 /// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
 /// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
 /// regexes match every codepoint, so no gap exists and the two split alike.
-pub const PRE: [(&str, &str, bool); 4] = [
+pub const PRE: [(&str, &str, bool); 5] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
@@ -128,6 +133,13 @@ pub const PRE: [(&str, &str, bool); 4] = [
     (
         "lfm2",
         pre_tokenizer!(llama3_regex, "Isolated", false, true),
+        true,
+    ),
+    // Nemotron-3.5's pipeline, under the name its GGUF twin states; the tokenizer crate runs the
+    // name, and `tekken`, as the Tekken regex.
+    (
+        "pixtral",
+        pre_tokenizer!(tekken_regex, "Isolated", false, true),
         true,
     ),
 ];
@@ -301,6 +313,11 @@ const TOKENIZER_CONFIG: &Fields = &[
     ),
     // Both build the fast tokenizer from tokenizer.json.
     ("backend", Only(r#"["tokenizers"]"#)),
+    // The tensors HF's model call takes; the ids are tokenizer.json's either way.
+    (
+        "model_input_names",
+        Only(r#"[["input_ids", "attention_mask"]]"#),
+    ),
     (
         "is_local",
         Ignore(
@@ -745,6 +762,9 @@ fn special_ids(
             stop = generated
                 .or_else(|| spec.ids[i].clone())
                 .or(id.map(|id| vec![id]));
+        } else if *kind == "pad" && named.is_some() {
+            // gguf-py's SpecialVocab takes the named token and reads a config's id only for a
+            // kind it has not set; no id and no serving path reads the pad id.
         } else if let Some(other) = [&spec.ids[i], &generated]
             .into_iter()
             .flatten()
@@ -925,6 +945,46 @@ mod tests {
 
     fn get<'a>(keys: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
         keys.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// A pad token the tokenizer names wins over a config's other pad id, as gguf-py's
+    /// SpecialVocab takes it; a bos id that disagrees stays refused.
+    #[test]
+    fn a_named_pad_token_wins_over_a_config_s_pad_id() {
+        let files = |tc: &'static str| {
+            [
+                (
+                    "tokenizer.json",
+                    r#"{"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"Sequence","pretokenizers":[
+                {"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},
+                {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+                "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+                "model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]},
+                "added_tokens":[{"id":3,"content":"<|im_end|>","special":true}]}"#,
+                ),
+                ("tokenizer_config.json", tc),
+                ("config.json", r#"{"text_config":{"vocab_size":4}}"#),
+                (
+                    "generation_config.json",
+                    r#"{"bos_token_id":0,"pad_token_id":0}"#,
+                ),
+                ("chat_template.jinja", "{{ messages }}"),
+            ]
+        };
+        let keys = self::keys(&repo(&files(
+            r#"{"eos_token":"<|im_end|>","pad_token":"<|im_end|>","bos_token":null,"add_bos_token":false}"#,
+        )))
+        .unwrap();
+        assert_eq!(
+            get(&keys, "tokenizer.ggml.padding_token_id"),
+            Some(&Value::U32(3))
+        );
+        let err = self::keys(&repo(&files(
+            r#"{"eos_token":"<|im_end|>","bos_token":"<|im_end|>","add_bos_token":false}"#,
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bos_token_id 0 disagrees"), "{err}");
     }
 
     /// A Qwen-shaped tokenizer: four tokens and three added ones (one special, one only looking
@@ -1207,6 +1267,7 @@ mod tests {
             ["tokenizer_config.json", "", "tokenizer_class", "PreTrainedTokenizerFast", "LlamaTokenizer"],
             ["tokenizer_config.json", "", "model_max_length", 262144, "long"],
             ["tokenizer_config.json", "", "backend", "tokenizers", "sentencepiece"],
+            ["tokenizer_config.json", "", "model_input_names", ["input_ids", "attention_mask"], ["input_ids"]],
             ["tokenizer_config.json", "", "is_local", true, "yes"],
             ["tokenizer_config.json", "", "local_files_only", false, "yes"],
             ["tokenizer_config.json", "", "processor_class", "Qwen3VLProcessor", 1],
@@ -1460,6 +1521,50 @@ mod tests {
             .to_string();
         assert!(
             e.contains("qwen2") && e.contains("qwen35") && e.contains("pre_tokenizer"),
+            "{e}"
+        );
+        remove(&dir);
+    }
+
+    /// A tokenizer whose pre-tokenizer is Nemotron-3.5's (a `Split` on the Tekken regex, `Isolated`,
+    /// then `ByteLevel` with `trim_offsets`) and whose `model.ignore_merges` is true is the
+    /// `pixtral` row, the name llama.cpp gives that vocabulary; a spec that names another row
+    /// refuses it by both names, and the row holds `ignore_merges` to true.
+    ///
+    /// FAIL-first: the row out of [`PRE`] (`tokenizer.json.pre_tokenizer ... is unsupported`), its
+    /// flag false (`ignore_merges is true, where the "pixtral" row's is false`) or one character of
+    /// its regex changed fails it.
+    #[test]
+    fn a_tekken_pipeline_is_the_pixtral_row() {
+        let tekken = PRE.iter().find(|r| r.0 == "pixtral").unwrap().1;
+        let edit = |tokenizer: &mut Json, config: &mut Json| {
+            tokenizer["pre_tokenizer"] = serde_json::from_str(tekken).unwrap();
+            tokenizer["model"]["ignore_merges"] = true.into();
+            config.as_object_mut().unwrap().remove("unk_token");
+        };
+        let dir = minimax_repo(edit);
+        let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+        assert_eq!(
+            get(&keys.keys, "tokenizer.ggml.pre"),
+            Some(&Value::String("pixtral".into()))
+        );
+        super::keys(&dir, &spec_of(&dir).with_pre("pixtral").unwrap()).unwrap();
+        let e = super::keys(&dir, &spec_of(&dir).with_pre("qwen35").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("pixtral") && e.contains("qwen35") && e.contains("pre_tokenizer"),
+            "{e}"
+        );
+        remove(&dir);
+
+        let dir = minimax_repo(|tokenizer, config| {
+            edit(tokenizer, config);
+            tokenizer["model"]["ignore_merges"] = false.into();
+        });
+        let e = super::keys(&dir, &spec_of(&dir)).unwrap_err().to_string();
+        assert!(
+            e.contains("ignore_merges is false") && e.contains("\"pixtral\"") && e.contains("true"),
             "{e}"
         );
         remove(&dir);
