@@ -144,7 +144,7 @@ unsafe fn conv_head(
                 if d <= t {
                     *x.get_unchecked((t - d) * ch + c)
                 } else {
-                    ring_input(ring, p, d, ch, c)
+                    ring_input(ring, RING_ROWS, p, d, ch, c)
                 }
             };
         }

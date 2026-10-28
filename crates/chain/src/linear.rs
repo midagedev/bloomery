@@ -1,6 +1,7 @@
 //! The geometry of a Gated DeltaNet layer (linear attention): the widths, the conv ring and the
 //! head counts a layer's plan and its kernels agree on. The layer's rule and layouts are written
-//! with the kernels that run them.
+//! with the kernels that run them. The conv ring is [`Ring`], whatever the conv's width: the
+//! delta layers and Mamba-2 keep [`DELTA_RING`], four taps, and a short conv keeps its own.
 
 use crate::ChainError;
 use runtime::stores;
@@ -8,22 +9,98 @@ use runtime::stores;
 /// Width of every query, key and value head (d_k = d_v).
 pub const HEAD: usize = 128;
 
-/// Taps of the causal conv.
+/// Taps of the delta layers' and Mamba-2's causal conv.
 pub const CONV_TAPS: usize = 4;
 
-/// A token's predecessors the conv reads: the inputs of its last
-/// `CONV_TAPS − 1` positions.
-pub const CONV_ROWS: usize = CONV_TAPS - 1;
+/// The conv ring of the delta layers and Mamba-2: [`CONV_TAPS`] taps.
+pub const DELTA_RING: Ring = Ring::new(CONV_TAPS);
+
+/// A token's predecessors the delta conv reads: the inputs of its last
+/// `CONV_TAPS − 1` positions ([`Ring::reach`] of [`DELTA_RING`]).
+pub const CONV_ROWS: usize = DELTA_RING.reach();
 
 /// The widest call a later call may roll back into: the pass of up to eight
-/// positions (a verify of up to seven drafted tokens).
-pub const PASS_ROWS: usize = 8;
+/// positions (a verify of up to seven drafted tokens). `runtime::stores` owns
+/// the count.
+pub const PASS_ROWS: usize = stores::PASS_ROWS;
 
-/// Slots of the conv ring. A rollback to position `n` inside a call of `m <=
-/// PASS_ROWS` positions from `p` reads the inputs of `n − 3 .. n − 1 >= p −
-/// 2`, which the ring holds while it keeps `m + 2` positions; with `m + 3`
-/// the call's writes also never land on the slots of `p − 3 .. p − 1`.
-pub const RING_ROWS: usize = CONV_ROWS + PASS_ROWS;
+/// Slots of the delta conv ring ([`Ring::rows`] of [`DELTA_RING`]).
+pub const RING_ROWS: usize = DELTA_RING.rows();
+
+/// The conv ring of a layer whose causal depthwise conv has `taps` taps: the inputs of the last
+/// positions a call wrote, the input of position `p` in slot `p mod rows`, so a later call finds
+/// its tokens' predecessors by position without a copy. The delta layers' conv, Mamba-2's and a
+/// short conv's differ in `taps` alone; what a ring does with it is here once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ring {
+    taps: usize,
+}
+
+impl Ring {
+    /// The ring of a `taps`-tap conv.
+    ///
+    /// # Panics
+    ///
+    /// On a conv of no tap, by name.
+    #[must_use]
+    pub const fn new(taps: usize) -> Ring {
+        assert!(taps >= 1, "Ring::new: a conv of at least one tap");
+        Ring { taps }
+    }
+
+    /// Taps of the conv, the current position's among them.
+    #[must_use]
+    pub const fn taps(self) -> usize {
+        self.taps
+    }
+
+    /// A token's predecessors the conv reads: the inputs of its last `taps − 1` positions.
+    #[must_use]
+    pub const fn reach(self) -> usize {
+        self.taps - 1
+    }
+
+    /// Slots of the ring, [`stores::conv_ring_rows`]: the reach and a pass ([`PASS_ROWS`]). A
+    /// rollback to position `n` inside a call of `m <= PASS_ROWS` positions from `p` reads the
+    /// inputs of `n − reach .. n − 1 >= p − reach + 1`, which the ring holds while it keeps
+    /// `m + reach − 1` positions; with `m + reach` the call's writes also never land on the slots
+    /// of `p − reach .. p − 1`.
+    #[must_use]
+    pub const fn rows(self) -> usize {
+        stores::conv_ring_rows(self.taps)
+    }
+
+    /// f32s of a ring over `channels` channels: `rows · channels`.
+    #[must_use]
+    pub const fn values(self, channels: usize) -> usize {
+        self.rows() * channels
+    }
+
+    /// The slot of the input `d` positions before position `p` (`1 <= d <= reach`): `None` while
+    /// `p < d`, the sequence's start, where the input is zero whatever the ring holds; else
+    /// `(p − d) mod rows`. The one indexing of the ring, which the kernels spell out in their own
+    /// terms.
+    ///
+    /// # Panics
+    ///
+    /// On a `d` of 0 or past the reach, by name.
+    #[must_use]
+    pub const fn before(self, p: usize, d: usize) -> Option<usize> {
+        assert!(
+            d >= 1,
+            "Ring::before: a predecessor at least 1 position back"
+        );
+        assert!(
+            d <= self.reach(),
+            "Ring::before: a predecessor at most taps − 1 positions back"
+        );
+        if p < d {
+            None
+        } else {
+            Some((p + self.rows() - d) % self.rows())
+        }
+    }
+}
 
 /// Tokens of one chunk of the prompt form (the chunked delta rule): a
 /// prompt's chunks start at the multiples of it from the position its rows
@@ -92,7 +169,7 @@ impl LinearShape {
     /// f32s of the conv ring: `RING_ROWS·C`.
     #[must_use]
     pub fn ring_len(&self) -> usize {
-        RING_ROWS * self.channels()
+        DELTA_RING.values(self.channels())
     }
 
     /// f32s of the carry: [`CARRY_HEAD`] words, then [`CARRY_ROWS`] rows of
@@ -124,5 +201,93 @@ impl LinearShape {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONV_ROWS, CONV_TAPS, DELTA_RING, HEAD, KHeadMap, LinearShape, PASS_ROWS, RING_ROWS, Ring,
+    };
+
+    /// A ring is the conv's reach and a pass: 8 rows at one tap, 10 at three, the delta layers'
+    /// 11 at four (their `CONV_ROWS` 3 and `RING_ROWS` 11 stay what the kernels spell out), and
+    /// 14 at the seven taps of a short conv. Mutant: `Ring::rows` returns `taps + PASS_ROWS`,
+    /// or `Ring::reach` returns `taps`.
+    #[test]
+    fn a_ring_is_the_reach_and_a_pass() {
+        let rows: Vec<(usize, usize, usize)> = [1, 3, 4, 7]
+            .into_iter()
+            .map(|t| (t, Ring::new(t).reach(), Ring::new(t).rows()))
+            .collect();
+        assert_eq!(rows, [(1, 0, 8), (3, 2, 10), (4, 3, 11), (7, 6, 14)]);
+        assert_eq!(
+            (
+                DELTA_RING.taps(),
+                CONV_TAPS,
+                CONV_ROWS,
+                RING_ROWS,
+                PASS_ROWS
+            ),
+            (4, 4, 3, 11, 8)
+        );
+        let shape = LinearShape {
+            n_k: 16,
+            n_v: 48,
+            map: KHeadMap::Tiled,
+        };
+        assert_eq!(shape.channels(), (2 * 16 + 48) * HEAD);
+        assert_eq!(shape.ring_len(), 11 * 10_240);
+        assert_eq!(Ring::new(7).values(2048), 14 * 2048);
+    }
+
+    /// After a call of `m <= PASS_ROWS` positions from `p`, the slots hold the inputs the next
+    /// call reads, whether it continues at `p + m` or a rollback restarts it at any `n` between,
+    /// `p` itself included: every predecessor `n − d` is in slot [`Ring::before`] names, or is
+    /// before the sequence's start and so zero. The value written at position `q` is `q + 1`.
+    /// Mutant: `Ring::rows` one row short (`reach + PASS_ROWS − 1`: the call at `m = PASS_ROWS`
+    /// overwrites the slot of `p − reach`), or `before` returns `(p + d) % rows`.
+    #[test]
+    fn a_ring_holds_every_input_the_next_call_reads() {
+        for taps in 1..=8 {
+            let ring = Ring::new(taps);
+            let rows = ring.rows();
+            for p in 0..2 * rows + 3 {
+                for m in 1..=PASS_ROWS {
+                    let mut slots = vec![0usize; rows];
+                    for q in 0..p + m {
+                        slots[q % rows] = q + 1;
+                    }
+                    for n in p..=p + m {
+                        for d in 1..=ring.reach() {
+                            let want = if n < d { 0 } else { n - d + 1 };
+                            let got = ring.before(n, d).map_or(0, |slot| slots[slot]);
+                            assert_eq!(
+                                got, want,
+                                "taps {taps}, call {m} from {p}, next at {n}, d {d}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sequence start reads zeros whatever the ring holds: `before` is `None` while the
+    /// position is short of the distance. Mutant: `Ring::before` tests `p <= d`.
+    #[test]
+    fn a_position_short_of_its_distance_has_no_slot() {
+        let ring = Ring::new(7);
+        assert_eq!(ring.before(2, 3), None);
+        assert_eq!(ring.before(3, 3), Some(0));
+        assert_eq!(ring.before(20, 6), Some(0));
+        assert_eq!(ring.before(21, 6), Some(1));
+    }
+
+    /// No conv has no tap.
+    #[test]
+    #[should_panic(expected = "Ring::new: a conv of at least one tap")]
+    fn a_ring_of_no_tap_is_refused_by_name() {
+        let _ = Ring::new(0);
     }
 }

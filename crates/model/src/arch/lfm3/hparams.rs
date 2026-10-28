@@ -146,6 +146,27 @@ impl Hparams {
         Ok(hp)
     }
 
+    /// The values of the file's `rope_freqs.weight` for the full layers' rope: one f32 a pair of
+    /// [`Hparams::rope_dims`], in the file's order, or `None` when the file carries no table. The
+    /// header read checked the table's dims and type; this reads its bytes, so a split without its
+    /// data is refused by name. The rope divides each pair's angle by its value, and
+    /// `chain::rope::RopeSpec::with_factors` refuses a value it cannot divide by.
+    pub fn rope_factor_values(&self, split: &Split) -> Result<Option<Vec<f32>>, PlacementError> {
+        if !self.rope_factors {
+            return Ok(None);
+        }
+        let tensor = |detail: String| PlacementError::Tensor {
+            name: ROPE_FREQS.to_string(),
+            detail,
+        };
+        let bytes = split
+            .data(ROPE_FREQS)
+            .map_err(|e| tensor(format!("cannot be read: {e}")))?;
+        factors_from_le(bytes, self.rope_dims / 2)
+            .map(Some)
+            .map_err(tensor)
+    }
+
     /// The dims the keys give layer `l` of `kind`, ggml order.
     fn want(&self, l: usize, kind: Kind) -> Vec<(&'static str, Vec<u64>)> {
         let e = self.n_embd as u64;
@@ -227,6 +248,23 @@ fn layer_kinds(split: &Split, kv: &[usize], pattern: &[bool]) -> Result<Vec<Kind
         .collect()
 }
 
+/// `pairs` little-endian f32 from `bytes`, which hold exactly that many.
+fn factors_from_le(bytes: &[u8], pairs: usize) -> Result<Vec<f32>, String> {
+    if bytes.len() != pairs * 4 {
+        return Err(format!(
+            "has {} bytes; {pairs} pairs of f32 are {}",
+            bytes.len(),
+            pairs * 4
+        ));
+    }
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect())
+}
+
 /// Whether the file carries the rope's factors: `rope_freqs.weight`, one f32 for each of the
 /// `rope_dims / 2` pairs, or none. A table of another length or type is refused by name.
 fn rope_factors(split: &Split, rope_dims: usize) -> Result<bool, PlacementError> {
@@ -252,4 +290,51 @@ fn rope_factors(split: &Split, rope_dims: usize) -> Result<bool, PlacementError>
         });
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use gguf::Split;
+
+    use super::super::names::ROPE_FREQS;
+    use super::super::spec::tests::{keys, tensors};
+    use super::{Hparams, factors_from_le};
+    use crate::arch::synthetic::{V, header_shaped};
+
+    /// The table's bytes are little-endian f32, one a pair, in the file's order: `1.0` is
+    /// `00 00 80 3f`, and a table of another byte count is refused by name. Mutant: the decode is
+    /// big-endian, or the count check is dropped.
+    #[test]
+    fn the_factor_bytes_are_little_endian_f32_a_pair() {
+        let mut bytes = Vec::new();
+        for f in [1.0f32, 1e30] {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(bytes[..4], [0x00, 0x00, 0x80, 0x3f]);
+        assert_eq!(factors_from_le(&bytes, 2), Ok(vec![1.0, 1e30]));
+        let err = factors_from_le(&bytes, 3).expect_err("a short table");
+        assert_eq!(err, "has 8 bytes; 3 pairs of f32 are 12");
+    }
+
+    /// A file with the table gives one value a pair of the rope's dims, a file without gives none.
+    /// The synthetic file's tensor data are zeros, so this pins the count and the read path; the
+    /// real file's values are `hw_lfm3_rope_factors`'s. Mutant: the table is read for a file that
+    /// has none, or the count is the dims and not the pairs.
+    #[test]
+    fn a_file_with_the_table_gives_a_value_a_pair_and_one_without_gives_none() {
+        let global = [("tokenizer.ggml.pre", V::Str("lfm2"))];
+        let mut bare = tensors();
+        bare.retain(|(n, _)| n != ROPE_FREQS);
+        for (tag, file, want) in [
+            ("lfm3-factor-values", tensors(), Some(vec![0.0; 4])),
+            ("lfm3-factor-none", bare, None),
+        ] {
+            let path = header_shaped(tag, "lfm3", &keys(), &global, &file);
+            let split = Split::open(&path).expect("the synthetic header opens");
+            let hp = Hparams::read(&split).expect("the synthetic header reads");
+            let got = hp.rope_factor_values(&split);
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(got.expect("a readable table"), want, "{tag}");
+        }
+    }
 }

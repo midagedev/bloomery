@@ -9,6 +9,11 @@
 //! crate holds the plans, the readers that make them and the walks, so a backend that cannot build
 //! the CUDA crates (a Mac's) takes the same plan and order the card does.
 //!
+//! The host rules a description's parts are held to are here too, one reading of each that every
+//! backend's gates compare their kernels with: the rope's table ([`rope`]), the conv ring and the
+//! short conv ([`linear`], [`shortconv`]), the output gate ([`out_gate`]) and the sandwich residual
+//! ([`residual`]).
+//!
 //! The crate holds no device code and makes no operating-system call of its own: it depends on the
 //! model description, the GGUF header reader and the runtime's device-free layer scheduler
 //! (`runtime::sched`).
@@ -18,7 +23,10 @@
 
 pub mod arch;
 pub mod linear;
+pub mod out_gate;
+pub mod residual;
 pub mod rope;
+pub mod shortconv;
 pub mod site;
 
 use std::fmt;

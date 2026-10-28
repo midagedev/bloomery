@@ -471,6 +471,7 @@ pub fn rope_spec(rope: &Rope, n_dims: usize) -> Result<RopeSpec, GpuError> {
         beta_fast: rope.beta_fast,
         beta_slow: rope.beta_slow,
         n_ctx_orig,
+        factors: None,
     })
 }
 

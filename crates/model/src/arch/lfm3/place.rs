@@ -113,10 +113,10 @@ impl KvLayout {
                 }])
             };
             layers.push(match &l.mixer {
-                Mixer::ShortConv(c) => {
-                    let rows = stores::conv_ring_rows(c.taps as usize) as u64;
-                    Store::Ring(rows * u64::from(spec.hidden) * stores::F32_BYTES)
-                }
+                Mixer::ShortConv(c) => Store::Ring(stores::conv_ring_bytes(
+                    c.taps as usize,
+                    u64::from(spec.hidden),
+                )),
                 Mixer::Gqa(g) if g.select.is_none() => {
                     if g.rope.mode != RopeMode::None {
                         let rope = (g.rope.base.to_bits(), g.rope.dims, g.rope.factors);

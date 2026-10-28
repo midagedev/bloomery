@@ -37,6 +37,16 @@ pub const fn conv_ring_rows(conv: usize) -> usize {
     conv - 1 + PASS_ROWS
 }
 
+/// A recurrent layer's conv ring in bytes: [`conv_ring_rows`] rows of `channels` f32 values.
+///
+/// # Panics
+///
+/// On a conv of no tap, by name.
+#[must_use]
+pub const fn conv_ring_bytes(conv: usize, channels: u64) -> u64 {
+    conv_ring_rows(conv) as u64 * channels * F32_BYTES
+}
+
 /// Rows of a PLE conv ring: the reach of `taps` taps `dilation` apart and a
 /// pass.
 ///
@@ -130,7 +140,7 @@ pub const fn pooled_rows(ctx: usize, pool: usize) -> usize {
 pub const fn recurrent_bytes(v_heads: usize, k_heads: usize, state: usize, conv: usize) -> u64 {
     let (v, k, d) = (v_heads as u64, k_heads as u64, state as u64);
     let channels = 2 * k * d + v * d;
-    v * d * d * F32_BYTES + conv_ring_rows(conv) as u64 * channels * F32_BYTES
+    v * d * d * F32_BYTES + conv_ring_bytes(conv, channels)
 }
 
 /// A Mamba-2 layer's stores in f32 values, `[state, ring]`: `d_inner` channels
@@ -260,10 +270,10 @@ pub const fn selecting_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_rows, cut_depth_keeps,
-        delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, kv_row_bytes,
-        mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes,
-        ring_rows, selecting_bytes, window_rows,
+        DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_bytes, conv_ring_rows,
+        cut_depth_keeps, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes,
+        kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows,
+        recurrent_bytes, ring_rows, selecting_bytes, window_rows,
     };
 
     /// A GQA layer's planes over `ctx` positions are `ctx` rows of the layout asked for: f16 K and V,
@@ -273,6 +283,20 @@ mod tests {
         assert_eq!(kv_plane_bytes(4, 128, false, 32_768), 32_768 * 2048);
         assert_eq!(kv_plane_bytes(4, 128, true, 32_768), 32_768 * 1088);
         assert_eq!(kv_plane_bytes(4, 128, false, 0), 0);
+    }
+
+    /// A conv ring is `conv_ring_rows` rows of `channels` f32: a seven-tap conv over 2,048 channels
+    /// holds 14 rows, 14 · 2,048 · 4 = 114,688 bytes; a four-tap conv over 10,240 channels 11
+    /// rows, 450,560 bytes (the ring term of [`recurrent_bytes`]). Mutant: f16 bytes, or `conv`
+    /// rows (the pass left out).
+    #[test]
+    fn a_conv_ring_is_its_rows_of_f32_channels() {
+        assert_eq!(conv_ring_bytes(7, 2048), 114_688);
+        assert_eq!(conv_ring_bytes(4, 10_240), 450_560);
+        assert_eq!(
+            recurrent_bytes(48, 16, 128, 4) - 48 * 128 * 128 * 4,
+            conv_ring_bytes(4, 10_240)
+        );
     }
 
     /// A Mamba-2 layer of 32 channels at state 128 with a 4-tap conv over
