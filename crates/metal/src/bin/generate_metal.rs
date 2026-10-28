@@ -36,9 +36,12 @@
 //! `ignore_eos=true`.
 //!
 //! `--repeat N` (default 1) runs the prompt N times on the one open, the
-//! session reset before each run after the first. Each run streams its own
-//! output; with N above 1 each run's summary block opens with `run=K`, and
-//! the open's lines print once, with the first run's.
+//! session reset before each run after the first (the reset the server's
+//! target takes). Each run streams its own output; with N above 1 each run's
+//! summary block opens with `run=K`, and the open's lines print once, with
+//! the first run's. A greedy run from a reset session picks the first run's
+//! ids: a run whose ids differ ends the process with a named error, exit 1,
+//! and prints no summary block.
 //!
 //! The text streams through the tokenizer's decoder, so a multi-byte
 //! character split across pieces prints once, complete; `--print-ids`
@@ -931,6 +934,31 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         ))
     }
 
+    /// A repeated run's ids against the first run's, which a greedy run of the
+    /// same prompt from a reset session reproduces: a difference is named by
+    /// its run and its first index.
+    fn same_ids(first: &[u32], got: &[u32], run: usize) -> Result<(), String> {
+        if first == got {
+            return Ok(());
+        }
+        let at = first
+            .iter()
+            .zip(got)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| first.len().min(got.len()));
+        let show = |ids: &[u32]| {
+            ids.get(at)
+                .map_or_else(|| String::from("none"), u32::to_string)
+        };
+        Err(format!(
+            "--repeat: run {run}'s ids differ from run 1's at index {at} (id {} against {}; {} ids against {})",
+            show(got),
+            show(first),
+            got.len(),
+            first.len()
+        ))
+    }
+
     /// The summary lines of one run: the prompt's and the decode's walls and
     /// rates, why the run stopped and the residency's request count. `run` is
     /// the run's place when `--repeat` asked for several, and opens the block.
@@ -1067,9 +1095,11 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         eprintln!("prompt_ids={}", prompt.len());
         let first = (a.repeat > 1).then_some(1);
         print_run(&out, prompt.len(), first, a.ignore_eos, &session);
+        let first_ids = out.ids.clone();
         for run in 2..=a.repeat {
             session.reset().map_err(|e| e.to_string())?;
             out = run_once(&mut session)?;
+            same_ids(&first_ids, &out.ids, run)?;
             print_run(&out, prompt.len(), Some(run), a.ignore_eos, &session);
         }
         let decode_s = out.decode_wall.as_secs_f64();
@@ -1097,6 +1127,27 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             step_times_run(&mut session, n, id)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod repeat_tests {
+        use super::same_ids;
+
+        #[test]
+        fn a_repeat_whose_ids_differ_is_refused_by_name() {
+            let first = [7, 8, 9];
+            same_ids(&first, &[7, 8, 9], 2).expect("equal ids pass");
+            let diff = same_ids(&first, &[7, 5, 9], 3).expect_err("a differing id");
+            assert!(
+                diff.contains("run 3's ids differ from run 1's at index 1"),
+                "{diff}"
+            );
+            let short = same_ids(&first, &[7, 8], 2).expect_err("a shorter run");
+            assert!(
+                short.contains("at index 2 (id none against 9; 2 ids against 3)"),
+                "{short}"
+            );
+        }
     }
 }
 
