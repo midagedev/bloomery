@@ -62,7 +62,8 @@
 //!   type reads (the down's activation), and the down [`gemm`] over those
 //!   rows, one column a slot.
 //!
-//! Which activation form a site reads is [`SiteTy::reads`]: a body
+//! Which activation form a site reads is [`SiteTy::reads`] on the gemv arm
+//! ([`reads_at`] at its width) and [`reads_wide`] on the wide arm: a body
 //! quantizes a unit's rows into exactly the forms its sites read.
 //!
 //! A body that names a weight and leaves its type to the file calls a site
@@ -108,12 +109,25 @@ pub use model::placement::kernels::SiteAct as Form;
 /// The activation form a site of family `ty` reads over rows of `k` values: [`SiteTy::reads`],
 /// the kernel table's, except NVFP4 at a width the q8_1 super-blocks of 256 values do not
 /// divide, which reads the 32-value [`Form::Q8Blocks32`] its one-expert `_sel` gemv takes
-/// ([`nvfp4_sel32_gemv`]). A body picks a site's launch and the forms it quantizes into by this.
+/// ([`nvfp4_sel32_gemv`]). A body picks a gemv-arm site's launch and the forms it quantizes into
+/// by this; the wide arm's form is [`reads_wide`].
 #[must_use]
 pub fn reads_at(ty: SiteTy, k: usize) -> Form {
     match kernels::dense(ty.ggml()) {
         Some(entry) => entry.reads_at(k as u64),
         None => ty.reads(),
+    }
+}
+
+/// The activation form a site of family `ty` reads on the wide arm ([`gemm`]): [`SiteTy::reads`],
+/// except NVFP4, whose GEMM reads the q8 blocks of 32 ([`Form::Q8x32`]) at any width of its
+/// 64-value blocks while its gemv reads the q8_1 rows ([`reads_at`]). [`WideActs::wants`] and the
+/// form a [`gated`] block's SwiGLU writes follow this, so the arm's forms have one owner.
+#[must_use]
+pub fn reads_wide(ty: SiteTy) -> Form {
+    match ty {
+        SiteTy::Nvfp4 => Form::Q8x32,
+        _ => ty.reads(),
     }
 }
 
@@ -172,8 +186,8 @@ pub fn kgemv_order(ty: SiteTy) -> Option<Order> {
 }
 
 /// The grouped GEMM's type of a K-quant, the one the kernel table's GEMM entry for the file type names
-/// (`kernels::gemm`); `None` for Q5_0, Q8_0, F32, MXFP8, FP8_B128 and BF16, whose wide GEMM is the 32-value
-/// family's ([`gemm`]), and NVFP4, which has none.
+/// (`kernels::gemm`); `None` for Q5_0, Q8_0, F32, MXFP8, FP8_B128, BF16 and NVFP4, whose wide GEMM is the
+/// 32-value family's ([`gemm`]).
 #[must_use]
 pub fn gemm_weight(ty: SiteTy) -> Option<GemmWeight> {
     kernels::gemm(ty.ggml()).and_then(GemmWeight::of_entry)
@@ -1233,8 +1247,8 @@ impl WideKernels<'_> {
 }
 
 /// Which forms of one wide input the sites of a unit read: q8_1 blocks of 128
-/// for a K-quant site, q8 blocks of 32 for a Q8_0 or Q5_0 site, the f32 rows
-/// for an F32, MXFP8, FP8_B128 or BF16 site ([`SiteTy::reads`]).
+/// for a K-quant site, q8 blocks of 32 for a Q8_0, Q5_0 or NVFP4 site, the f32
+/// rows for an F32, MXFP8, FP8_B128 or BF16 site ([`reads_wide`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WideForms {
     pub q128: bool,
@@ -1284,9 +1298,9 @@ impl WideForms {
 }
 
 /// One wide input's forms, each held when a site of the unit reads it: q8_1
-/// blocks of 128 for a K-quant site, q8 blocks of 32 for a Q8_0 or Q5_0 site,
-/// and the f32 rows of a unit whose rows a SwiGLU writes (a down that reads
-/// f32). An input's f32 rows are the caller's ([`WideActs::input`]).
+/// blocks of 128 for a K-quant site, q8 blocks of 32 for a Q8_0, Q5_0 or NVFP4
+/// site, and the f32 rows of a unit whose rows a SwiGLU writes (a down that
+/// reads f32). An input's f32 rows are the caller's ([`WideActs::input`]).
 pub struct WideActs {
     pub q128: Option<GemmAct>,
     pub q32: Option<GemmAct32>,
@@ -1294,16 +1308,19 @@ pub struct WideActs {
 }
 
 impl WideActs {
-    /// The wide forms a site of type `ty` reads: q8_1 blocks of 128 for a
-    /// K-quant site; q8 blocks of 32 (`GemmAct32`) for a Q8_0 site and for a
-    /// Q5_0 site, whose gemv reads `Q8Blocks32` and whose GEMM reads the same
-    /// blocks in the wide layout; the f32 rows for a site that reads those.
+    /// The wide forms a site of type `ty` reads ([`reads_wide`]): q8_1 blocks
+    /// of 128 for a K-quant site; q8 blocks of 32 (`GemmAct32`) for a Q8_0 site,
+    /// for an NVFP4 site, whose gemv reads the q8_1 rows ([`reads_at`]) and
+    /// whose GEMM reads these, and for a Q5_0 site, whose gemv reads
+    /// `Q8Blocks32` and whose GEMM reads the same blocks in the wide layout;
+    /// the f32 rows for a site that reads those.
     #[must_use]
     pub fn wants(ty: SiteTy) -> WideForms {
+        let reads = reads_wide(ty);
         WideForms {
-            q128: ty.reads() == Form::Q8x128,
-            q32: matches!(ty.reads(), Form::Q8x32 | Form::Q8Blocks32),
-            f32: ty.reads() == Form::F32,
+            q128: reads == Form::Q8x128,
+            q32: matches!(reads, Form::Q8x32 | Form::Q8Blocks32),
+            f32: reads == Form::F32,
         }
     }
 
@@ -1428,7 +1445,7 @@ impl WideActsMut<'_> {
         if want.q32 {
             let a = self.q32.as_deref_mut().ok_or(GpuError::state(
                 WHAT_Q,
-                "the unit's q8 blocks of 32 (a Q8_0 or Q5_0 site reads them)",
+                "the unit's q8 blocks of 32 (a Q8_0, Q5_0 or NVFP4 site reads them)",
             ))?;
             k.g32(
                 WHAT_Q,
@@ -1456,7 +1473,8 @@ impl WideActsMut<'_> {
 /// a form the site reads that `x` lacks is refused by name. `w` holds the
 /// resident weights `src` may name. An NVFP4 site's GEMM reads the q8 blocks
 /// of 32 ([`WideIn::q32`]), not the q8_1 blocks of 128 its gemv reads
-/// ([`WideActs::wants`]): a caller quantizes them for it as for a Q8_0 site.
+/// ([`reads_at`]); [`WideActs::wants`] names them, and a caller quantizes them
+/// for it as for a Q8_0 site.
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
@@ -1777,7 +1795,7 @@ pub(crate) fn reads_form(gpu: &Gpu, w: &Weights, names: &[&str], form: MmaForm) 
 /// The forms of the first `m` columns of the f32 rows `x` that a site of one
 /// of the resident weights `names` reads into `q32`: the q8 blocks of 32
 /// ([`WideActs::wants`] of its type, [`of_resident`]), what [`resident_gemm`]
-/// reads for a Q8_0 or Q5_0 site; and each [`MmaForm`] that `q32` holds room
+/// reads for a Q8_0, Q5_0 or NVFP4 site; and each [`MmaForm`] that `q32` holds room
 /// for and a site reads ([`reads_form`], [`write_forms`]). A form no site
 /// reads is left marked as another rows', so no later site reads it.
 pub fn resident_quantize(
@@ -1859,18 +1877,6 @@ fn write_forms(
     Ok(())
 }
 
-/// An NVFP4 site in a [`gated`] block, which has no SwiGLU launch into the 32-value rows its
-/// wide GEMM reads, refused by name as `what`'s.
-fn not_gated(what: &'static str, name: &str, ty: SiteTy) -> GpuError {
-    GpuError::shape(
-        what,
-        format!(
-            "{name} is {ty}: its gemv is `site::kgemv` and its wide GEMM `site::gemm`; a gated \
-             block has no SwiGLU launch into the rows that GEMM reads"
-        ),
-    )
-}
-
 /// One gated block over a table: the three sites, their shapes, the gate·up
 /// rule between them. The gate and up read the input rows through `input`;
 /// the down reads the SwiGLU rows, slot `s` its own column `s`
@@ -1903,17 +1909,14 @@ impl<'a> Gated<'a> {
     fn check(&self) -> Result<(), GpuError> {
         for (ty, src) in [self.gate, self.up, self.down] {
             src.check("site::gated", ty)?;
-            if ty == SiteTy::Nvfp4 {
-                return Err(not_gated("site::gated", src.name(), ty));
-            }
         }
         swiglu_launch((self.down.0, self.down.1.name()), self.rule).map(|_| ())
     }
 }
 
 /// Where a [`gated`] block's SwiGLU writes its rows: the form the down's type
-/// reads ([`SiteTy::reads`]). A form the down does not read may be absent; a
-/// form it reads that is absent is refused by name.
+/// reads on the wide arm ([`reads_wide`]). A form the down does not read may
+/// be absent; a form it reads that is absent is refused by name.
 ///
 /// A unit that holds a [`WideActs`] takes them from it
 /// ([`WideActs::swiglu_rows`]), which holds every form its downs read. A
@@ -2015,10 +2018,11 @@ enum SwigluLaunch {
     F32Rule,
 }
 
-/// The launch of a SwiGLU into the form down site `(ty, name)` reads under
-/// `rule`; a rule the form's launch lacks is refused by name.
+/// The launch of a SwiGLU into the form down site `(ty, name)` reads on the
+/// wide arm ([`reads_wide`]) under `rule`; a rule the form's launch lacks is
+/// refused by name.
 fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, GpuError> {
-    match (ty.reads(), rule) {
+    match (reads_wide(ty), rule) {
         (
             Form::Q8x128,
             Act::SiluMul | Act::SwigluClamp { .. } | Act::SwigluOai { .. } | Act::Situ { .. },
@@ -2118,7 +2122,7 @@ fn swiglu(
 mod tests {
     use super::{
         Form, Order, SiteTy, SwigluLaunch, WideActs, WideForms, by_name_extra, file_site,
-        gemm_weight, kgemv_order, reads_at, swiglu_launch,
+        gemm_weight, kgemv_order, reads_at, reads_wide, swiglu_launch,
     };
     use crate::gemm::GemmWeight;
     use crate::kquant::Act;
@@ -2148,6 +2152,38 @@ mod tests {
         }
         assert_eq!(reads_at(SiteTy::Nvfp4, 2688), Form::Q8Blocks32);
         assert_eq!(reads_at(SiteTy::Nvfp4, 4096), Form::Q8x128);
+    }
+
+    /// The wide arm's form is the type's own except NVFP4's: its GEMM reads the q8 blocks of 32
+    /// where its gemv reads the q8_1 rows, so a unit that holds an NVFP4 site holds the q8 blocks
+    /// of 32 and no q8_1 blocks of 128 for it, at any width of its 64-value blocks.
+    ///
+    /// FAIL-first: `reads_wide` answering `ty.reads()` for NVFP4 wants the q8_1 blocks of 128 and
+    /// none of 32.
+    #[test]
+    fn an_nvfp4_site_wants_the_q32_rows_on_the_wide_arm() {
+        for &ty in SiteTy::ALL {
+            let want = if ty == SiteTy::Nvfp4 {
+                Form::Q8x32
+            } else {
+                ty.reads()
+            };
+            assert_eq!(reads_wide(ty), want, "{ty}");
+        }
+        assert_eq!(WideActs::wants(SiteTy::Nvfp4), WideForms::q8(false, true));
+        assert_eq!(
+            WideActs::wants_of(&[SiteTy::Nvfp4, SiteTy::Nvfp4, SiteTy::Nvfp4]),
+            WideForms::q8(false, true)
+        );
+        // A K-quant gate and up beside an NVFP4 down hold both quantized forms.
+        assert_eq!(
+            WideActs::wants_of(&[SiteTy::Q4K, SiteTy::Nvfp4]),
+            WideForms::q8(true, true)
+        );
+        // The gemv arm's forms are the same as before.
+        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
+        assert_eq!(reads_at(SiteTy::Nvfp4, 5120), Form::Q8x128);
+        assert_eq!(reads_at(SiteTy::Nvfp4, 2688), Form::Q8Blocks32);
     }
 
     /// A by-name projection's extra launches follow the type: none for a site
@@ -2341,11 +2377,13 @@ mod tests {
     }
 
     /// The SwiGLU's launch is the down's form under the rule: every K-quant
-    /// one launch into q8_1 blocks of 128, Q8_0 the plain 32-value entry
-    /// under `SiluMul` (the rule's entry for the clamp and the OAI form), F32,
-    /// BF16 and MXFP8 the plain f32 rows under `SiluMul` and the rule's f32
-    /// rows under the clamp, the OAI form and SiTU. Mutant: the f32 rule arm
-    /// dropped (the rule refused on an f32 down, as before the MXFP8 blocks).
+    /// one launch into q8_1 blocks of 128, Q8_0 and NVFP4 (whose wide GEMM
+    /// reads the q8 blocks of 32) the plain 32-value entry under `SiluMul`
+    /// (the rule's entry for the clamp and the OAI form), F32, BF16 and MXFP8
+    /// the plain f32 rows under `SiluMul` and the rule's f32 rows under the
+    /// clamp, the OAI form and SiTU. Mutants: the f32 rule arm dropped (the
+    /// rule refused on an f32 down, as before the MXFP8 blocks); the form
+    /// read as `ty.reads()`, which sends an NVFP4 down to the q8_1 rows.
     #[test]
     fn the_swiglu_launch_is_the_downs_form_under_the_rule() {
         let clamp = Act::SwigluClamp { limit: 7.0 };
@@ -2371,6 +2409,16 @@ mod tests {
         );
         for rule in [clamp, oai] {
             assert_eq!(launch(SiteTy::Q8_0, rule).ok(), Some(SwigluLaunch::Q32Rule));
+        }
+        assert_eq!(
+            launch(SiteTy::Nvfp4, Act::SiluMul).ok(),
+            Some(SwigluLaunch::Q32Plain)
+        );
+        for rule in [clamp, oai] {
+            assert_eq!(
+                launch(SiteTy::Nvfp4, rule).ok(),
+                Some(SwigluLaunch::Q32Rule)
+            );
         }
         let situ = Act::Situ {
             beta: 1.0,
@@ -2438,8 +2486,8 @@ mod tests {
         };
         for &ty in SiteTy::ALL {
             let w = WideActs::wants(ty);
-            assert_eq!(w.f32, ty.reads() == Form::F32, "{ty}");
-            assert_eq!(w.q128, ty.reads() == Form::Q8x128, "{ty}");
+            assert_eq!(w.f32, reads_wide(ty) == Form::F32, "{ty}");
+            assert_eq!(w.q128, reads_wide(ty) == Form::Q8x128, "{ty}");
         }
         for ty in [SiteTy::Mxfp8, SiteTy::Bf16, SiteTy::F32] {
             assert_eq!(WideActs::wants_of(&[ty]), f32_rows, "{ty}");

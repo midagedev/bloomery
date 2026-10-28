@@ -47,6 +47,32 @@
 //! planner's rule admits, one run at the same places) gives the hand pair's down rows bit for
 //! bit, a `HOST` slot's rows as its fresh buffers hold them, no fault raised.
 //!
+//! `nvfp4_gated_block`: `site::gated` over an NVFP4 gate, up and down at Qwen3.8-27B's widths (gate
+//! and up 17,408 rows of 5,120, down 5,120 rows of 17,408; both widths are whole 64-value blocks,
+//! the 32-value GEMM's rule on K) under `Act::SiluMul`, at m = 1, 8, 9, 64 and 512 columns of the
+//! one-expert table. The unit holds what the wide arm of its sites reads (`WideActs::wants_of`: q8
+//! blocks of 32, no q8_1 rows). Per count, at every column and at every 137th row of the 17,408,
+//! every 41st of the 5,120 and the last row (odd steps, so the rows spread over the positions of a
+//! 128-row slab):
+//! - `written`: every output finite over a NaN sentinel, no fault raised;
+//! - `input`: the card's q8 blocks of 32 of the input are the host quantizer's
+//!   (`gemm32::host_act`) bit for bit;
+//! - `gate` and `up`: each output equal bit for bit to the 32-value GEMM's contract
+//!   (`gemm32::dot32_nv`: per 32-value unit the two exact sub-block dots, `acc = fma(d_a, fma(d1,
+//!   i1, d0 · i0), acc)`, the store `scale · acc`) and within `γ(2K/32 + 4) · Σ |scale · d_a ·
+//!   (d0 · i0 + d1 · i1)|` of the f64 reference over `gguf::quant`'s dequantization (`d_s · code`
+//!   is `dequant_row`'s value bit for bit, checked per row), `gate_gemm`'s `g32_nvfp4_dense`
+//!   contract and band at these widths;
+//! - `swiglu`: the q8 blocks of 32 the block's SwiGLU wrote for the down are the host quantizer's
+//!   over the card's own elementwise `silu(g) · u` of the gate and up it read back, bit for bit;
+//! - `down`: each output equal bit for bit to the contract over those rows and within the same
+//!   band at K = 17,408;
+//! - `refusal`: a unit that holds the q8_1 rows and no q8 blocks of 32, as the input and as the SwiGLU
+//!   rows, is refused by name where it would feed an NVFP4 site (`reads q8 blocks of 32, which the
+//!   unit did not quantize`; `..., which the SwiGLU rows lack`), never read stale.
+//!
+//! A block `site::gated` refuses on the counts above is a `refused=` line and a FAIL.
+//!
 //! The routed pair (`bloomery_gpu::mxfp4_sel`: `Nvfp4SelKernels`) at
 //! Qwen3.8's widths, the gate and up stacks 640 rows of 2,560 an expert and
 //! the down 2,560 rows of 640, six experts in the file, each with a scale of
@@ -412,6 +438,7 @@ mod gate {
         ok &= two_shards(gpu, dir)?;
         ok &= routed::run(gpu, dir)?;
         ok &= relu2::run(gpu, dir)?;
+        ok &= gated::run(gpu, dir)?;
         Ok(ok)
     }
 
@@ -1459,6 +1486,472 @@ mod gate {
                 ok &= pass_up && pass_down && pass_leg;
             }
             Ok(ok)
+        }
+    }
+
+    /// The `nvfp4_gated_block` clause (module doc): `site::gated` over an NVFP4 gate, up and down.
+    mod gated {
+        use super::{judge, nvfp4_bytes, tally, weight_decls};
+        use bloomery_gpu::gemm::{Gemm32Kernels, GemmAct32, GemmInput, GemmKernels, GemmRoute};
+        use bloomery_gpu::kquant::Act;
+        use bloomery_gpu::mxfp4::{NV_BLOCK_BYTES, NV_BLOCK_VALUES, ue4m3_half};
+        use bloomery_gpu::site::{
+            self, Gated, GatedIo, SiteTy, SiteWeight, WideActs, WideForms, WideKernels,
+        };
+        use bloomery_gpu::weights::Weights;
+        use bloomery_gpu::{Gpu, GpuError};
+        use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32_nv, host_act};
+        use bloomery_gpu_gates::rounding::gamma;
+        use bloomery_gpu_gates::{GateError, GateRng, par_map, verdict, write_gguf};
+        use cuda_core::{CudaStream, DeviceBuffer};
+        use gguf::Split;
+        use gguf::quant::{GgmlType, KVALUES_MXFP4, dequant_row};
+        use std::path::Path;
+
+        /// Qwen3.8-27B's hidden width (the gate's and up's row width, the down's rows) and MLP
+        /// width (the gate's and up's rows, the down's row width). Both are whole 64-value blocks,
+        /// the 32-value GEMM's rule on K.
+        const HIDDEN: usize = 5120;
+        const FF: usize = 17_408;
+        /// The column counts: one, a tile's eight, one past it, a few tiles and a prompt batch.
+        const MS: [usize; 5] = [1, 8, 9, 64, 512];
+
+        /// One projection: its tensor stem, rows, row width, tensor scale and seed. The scales are
+        /// no power of two and put the gate and up sums near one, so the SwiGLU is neither
+        /// saturated nor linear and the down's input is a spread of block scales.
+        struct Part {
+            stem: &'static str,
+            rows: usize,
+            k: usize,
+            scale: f32,
+            seed: u64,
+        }
+
+        const PARTS: [Part; 3] = [
+            Part {
+                stem: "blk.0.ffn_gate",
+                rows: FF,
+                k: HIDDEN,
+                scale: 1.371e-4,
+                seed: 0x5eed_0401,
+            },
+            Part {
+                stem: "blk.0.ffn_up",
+                rows: FF,
+                k: HIDDEN,
+                scale: 9.13e-5,
+                seed: 0x5eed_0402,
+            },
+            Part {
+                stem: "blk.0.ffn_down",
+                rows: HIDDEN,
+                k: FF,
+                scale: 3.37e-5,
+                seed: 0x5eed_0403,
+            },
+        ];
+
+        /// The rows of a projection of `rows` outputs the clause checks: every `rows / 128 + 1`-th
+        /// and the last. The step is odd, so the sampled rows spread over the positions of a
+        /// 128-row slab and of a 16-row warp tile.
+        fn sampled_rows(rows: usize) -> Vec<usize> {
+            let mut picked: Vec<usize> = (0..rows).step_by(rows / 128 + 1).collect();
+            if picked.last() != Some(&(rows - 1)) {
+                picked.push(rows - 1);
+            }
+            picked
+        }
+
+        /// One NVFP4 row's E2M1 codes in value order and its sub-block scales as the contract
+        /// reads them ([`dot32_nv`]), each value `d_s · code` equal to `gguf::quant`'s
+        /// dequantization bit for bit; a row where one is not is refused.
+        fn decode_row(row: &[u8], k: usize) -> Result<(Vec<i8>, Vec<f32>), String> {
+            let mut want = vec![0.0f32; k];
+            dequant_row(GgmlType::NVFP4, row, &mut want).map_err(|e| format!("dequant: {e}"))?;
+            let (mut q, mut ds) = (Vec::with_capacity(k), Vec::with_capacity(k / 16));
+            for blk in row.as_chunks::<NV_BLOCK_BYTES>().0 {
+                for (s, &scale) in blk[..4].iter().enumerate() {
+                    ds.push(ue4m3_half(u32::from(scale)));
+                    let codes = &blk[4 + 8 * s..][..8];
+                    q.extend(codes.iter().map(|&b| KVALUES_MXFP4[usize::from(b & 0x0f)]));
+                    q.extend(codes.iter().map(|&b| KVALUES_MXFP4[usize::from(b >> 4)]));
+                }
+            }
+            if let Some(v) = (0..k).find(|&v| ds[v / 16] * f32::from(q[v]) != want[v]) {
+                return Err(format!(
+                    "value {v}: the contract's decode is not the dequantization"
+                ));
+            }
+            Ok((q, ds))
+        }
+
+        /// A projection's sampled rows, decoded.
+        struct Sampled {
+            rows: Vec<usize>,
+            q: Vec<Vec<i8>>,
+            ds: Vec<Vec<f32>>,
+        }
+
+        impl Sampled {
+            /// The sampled rows of `bytes`, `rows` rows of `k` values.
+            fn new(bytes: &[u8], rows: usize, k: usize) -> Result<Sampled, GateError> {
+                let row_bytes = k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
+                let picked = sampled_rows(rows);
+                let (mut q, mut ds) = (Vec::new(), Vec::new());
+                for &r in &picked {
+                    let (qr, dr) = decode_row(&bytes[r * row_bytes..][..row_bytes], k)
+                        .map_err(|e| format!("row {r}: {e}"))?;
+                    q.push(qr);
+                    ds.push(dr);
+                }
+                Ok(Sampled {
+                    rows: picked,
+                    q,
+                    ds,
+                })
+            }
+
+            /// Every sampled output of `y` (`y[c · rows + r]`, `rows` rows of `k` values a column)
+            /// at the `m` columns of `a`, under the tensor scale `scale`, by [`judge`]: its bits
+            /// against the 32-value GEMM's contract ([`dot32_nv`]) and its distance from the f64
+            /// reference with the band `γ(2K/32 + 4) · Σ |scale · d_a · (d0 · i0 + d1 · i1)|`, the
+            /// contract's own roundings.
+            fn check(
+                &self,
+                y: &[f32],
+                (rows, k): (usize, usize),
+                scale: f32,
+                (a, m): (&HostAct, usize),
+            ) -> Vec<(bool, f64, f64)> {
+                let n = self.rows.len();
+                par_map(m * n, |at| {
+                    let (c, i) = (at / n, at % n);
+                    let (want, reference, mag) = dot32_nv(&self.q[i], &self.ds[i], scale, a, c);
+                    let band = gamma(2 * (k / 32) + 4) * mag;
+                    judge(y[c * rows + self.rows[i]], (want, reference, band))
+                })
+            }
+        }
+
+        /// The device planes of the first `n` columns equal the host's bit for bit, padding included.
+        fn planes_equal(
+            act: &GemmAct32,
+            n: usize,
+            want: &Planes32,
+            stream: &CudaStream,
+        ) -> Result<bool, GateError> {
+            let st = act.steps();
+            let q = act.q().to_host_vec(stream)?;
+            let d = act.d().to_host_vec(stream)?;
+            let s = act.s().to_host_vec(stream)?;
+            Ok(q[..n * 16 * st] == want.0[..]
+                && d[..n * 2 * st].len() == want.1.len()
+                && d[..n * 2 * st]
+                    .iter()
+                    .zip(&want.1)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                && s[..n * 2 * st] == want.2[..])
+        }
+
+        /// A stage's line: its [`tally`] over `per` and whether it passes.
+        fn stage(m: usize, name: &str, per: &[(bool, f64, f64)]) -> bool {
+            let (bits, band, worst) = tally(per);
+            let pass = bits == per.len() && band;
+            println!(
+                "nvfp4 clause=nvfp4_gated_block m={m} stage={name} bits_equal={bits}/{} \
+                 worst_err_over_band={worst:.3e} {}",
+                per.len(),
+                verdict(pass)
+            );
+            pass
+        }
+
+        /// The gated block over the three resident weights `names`, on the table `route`.
+        fn block<'a>(w: &'a Weights, route: &'a GemmRoute, names: &'a [String]) -> Gated<'a> {
+            let ty = SiteTy::Nvfp4;
+            Gated {
+                w,
+                route,
+                gate: (ty, SiteWeight::Resident(&names[0])),
+                up: (ty, SiteWeight::Resident(&names[1])),
+                down: (ty, SiteWeight::Resident(&names[2])),
+                ff: FF,
+                hidden: HIDDEN,
+                rule: Act::SiluMul,
+                input: GemmInput::PerSlot,
+            }
+        }
+
+        /// `site::gated` over the first `m` columns of the f32 rows `x`, the input's forms
+        /// `acts_in`, the SwiGLU's `acts_h` and the gate, up and down outputs `out`.
+        fn launch(
+            gpu: &Gpu,
+            wk: &WideKernels<'_>,
+            blk: &Gated<'_>,
+            (acts_in, acts_h): (&WideActs, &mut WideActs),
+            (x, m): (&DeviceBuffer<f32>, usize),
+            out: (
+                &mut DeviceBuffer<f32>,
+                &mut DeviceBuffer<f32>,
+                &mut DeviceBuffer<f32>,
+            ),
+        ) -> Result<(), GpuError> {
+            let input = acts_in.input(x);
+            let io = GatedIo {
+                x: &input,
+                gate: out.0,
+                up: out.1,
+                rows: acts_h.swiglu_rows(),
+                y: out.2,
+            };
+            site::gated(gpu, wk, blk, (m, m), io, gpu.unlabelled_sink())
+        }
+
+        /// What every column count runs over: the card, the kernels, the resident weights, the
+        /// sampled rows, the one-expert table and the unit's forms. The unit holds the forms the
+        /// wide arm of its sites reads and nothing else; its buffers serve every column count.
+        struct Rig<'a> {
+            gpu: &'a Gpu,
+            gk: &'a GemmKernels,
+            wk: WideKernels<'a>,
+            w: &'a Weights,
+            names: &'a [String],
+            sampled: &'a [Sampled],
+            route: GemmRoute,
+            acts_in: WideActs,
+            acts_h: WideActs,
+        }
+
+        impl Rig<'_> {
+            /// `n` NaNs on the card: what a launch that leaves a value unwritten shows.
+            fn nans(&self, n: usize) -> Result<DeviceBuffer<f32>, GateError> {
+                Ok(DeviceBuffer::from_host(
+                    self.gpu.stream(),
+                    &vec![f32::NAN; n],
+                )?)
+            }
+
+            /// The block at each column count: the clauses of the module doc.
+            fn counts(&mut self) -> Result<bool, GateError> {
+                let (gpu, ty) = (self.gpu, SiteTy::Nvfp4);
+                let stream = gpu.stream();
+                let mut ok = true;
+                for m in MS {
+                    let mut rng = GateRng(0x5eed_0410 ^ m as u64);
+                    let x: Vec<f32> = (0..m * HIDDEN).map(|_| rng.uni(-2.0, 2.0)).collect();
+                    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+                    let (mut gate, mut up, mut y) = (
+                        self.nans(m * FF)?,
+                        self.nans(m * FF)?,
+                        self.nans(m * HIDDEN)?,
+                    );
+                    self.gk.enqueue_route_dense(
+                        stream,
+                        m,
+                        &mut self.route,
+                        gpu.unlabelled_sink(),
+                    )?;
+                    self.acts_in.quantize(
+                        gpu,
+                        &self.wk,
+                        gpu.unlabelled_sink(),
+                        &x_dev,
+                        m,
+                        &[ty, ty],
+                    )?;
+                    let blk = block(self.w, &self.route, self.names);
+                    let launched = launch(
+                        gpu,
+                        &self.wk,
+                        &blk,
+                        (&self.acts_in, &mut self.acts_h),
+                        (&x_dev, m),
+                        (&mut gate, &mut up, &mut y),
+                    );
+                    stream.synchronize()?;
+                    let fault = gpu.take_fault()?;
+                    if let Err(e) = launched {
+                        println!(
+                            "nvfp4 clause=nvfp4_gated_block m={m} refused={e} {}",
+                            verdict(false)
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    let (gate_h, up_h, y_h) = (
+                        gate.to_host_vec(stream)?,
+                        up.to_host_vec(stream)?,
+                        y.to_host_vec(stream)?,
+                    );
+                    let written = gate_h
+                        .iter()
+                        .chain(&up_h)
+                        .chain(&y_h)
+                        .all(|v| v.is_finite());
+                    println!(
+                        "nvfp4 clause=nvfp4_gated_block m={m} stage=written finite={written} \
+                         fault_none={} {}",
+                        fault.is_none(),
+                        verdict(written && fault.is_none())
+                    );
+                    let (ha_x, planes_x) = host_act(&x, HIDDEN, m);
+                    let input_q32 = self
+                        .acts_in
+                        .q32
+                        .as_ref()
+                        .ok_or("the input unit holds no q8 blocks of 32")?;
+                    let input_eq = planes_equal(input_q32, m, &planes_x, stream)?;
+                    println!(
+                        "nvfp4 clause=nvfp4_gated_block m={m} stage=input planes_eq_host={input_eq} {}",
+                        verdict(input_eq)
+                    );
+                    let at = |i: usize| (PARTS[i].rows, PARTS[i].k);
+                    let sampled = self.sampled;
+                    let gate_per = sampled[0].check(&gate_h, at(0), PARTS[0].scale, (&ha_x, m));
+                    let up_per = sampled[1].check(&up_h, at(1), PARTS[1].scale, (&ha_x, m));
+                    let gate_ok = stage(m, "gate", &gate_per);
+                    let up_ok = stage(m, "up", &up_per);
+                    // The SwiGLU's rows are the host quantizer's over the card's own elementwise
+                    // `silu(g) · u` of the gate and up it read back, the composition the fused
+                    // launch is held to (`gate_gemm`'s `g32_quant`).
+                    let mut h_dev = DeviceBuffer::<f32>::zeroed(stream, m * FF)?;
+                    gpu.elem()
+                        .enqueue_swiglu(stream, &gate, &up, m * FF, &mut h_dev)?;
+                    stream.synchronize()?;
+                    let (ha_h, planes_h) = host_act(&h_dev.to_host_vec(stream)?, FF, m);
+                    let rows_q32 = self
+                        .acts_h
+                        .q32
+                        .as_ref()
+                        .ok_or("the SwiGLU rows hold no q8 blocks of 32")?;
+                    let rows_eq = planes_equal(rows_q32, m, &planes_h, stream)?;
+                    println!(
+                        "nvfp4 clause=nvfp4_gated_block m={m} stage=swiglu \
+                         planes_eq_host_of_card_swiglu={rows_eq} {}",
+                        verdict(rows_eq)
+                    );
+                    let down_per = sampled[2].check(&y_h, at(2), PARTS[2].scale, (&ha_h, m));
+                    let down = stage(m, "down", &down_per);
+                    ok &= written
+                        && fault.is_none()
+                        && input_eq
+                        && gate_ok
+                        && up_ok
+                        && rows_eq
+                        && down;
+                }
+                Ok(ok)
+            }
+
+            /// A unit that holds the q8_1 rows and no q8 blocks of 32 is refused by name where it
+            /// would feed an NVFP4 site, as the input and as the SwiGLU rows, and is never read
+            /// stale.
+            fn refusals(&mut self) -> Result<bool, GateError> {
+                let (gpu, ty, m) = (self.gpu, SiteTy::Nvfp4, MS[1]);
+                let stream = gpu.stream();
+                let x_dev = DeviceBuffer::from_host(stream, &vec![1.0f32; m * HIDDEN])?;
+                self.gk
+                    .enqueue_route_dense(stream, m, &mut self.route, gpu.unlabelled_sink())?;
+                self.acts_in.quantize(
+                    gpu,
+                    &self.wk,
+                    gpu.unlabelled_sink(),
+                    &x_dev,
+                    m,
+                    &[ty, ty],
+                )?;
+                let bare_in = WideActs::new(stream, WideForms::q8(true, false), m, HIDDEN)?;
+                let mut bare_h = WideActs::new(stream, WideForms::q8(true, false), m, FF)?;
+                let mut ok = true;
+                for (bare_rows, name, want) in [
+                    (
+                        false,
+                        "input",
+                        "reads q8 blocks of 32, which the unit did not quantize",
+                    ),
+                    (
+                        true,
+                        "swiglu",
+                        "reads q8 blocks of 32, which the SwiGLU rows lack",
+                    ),
+                ] {
+                    let blk = block(self.w, &self.route, self.names);
+                    let (mut gate, mut up, mut y) = (
+                        self.nans(m * FF)?,
+                        self.nans(m * FF)?,
+                        self.nans(m * HIDDEN)?,
+                    );
+                    let out = (&mut gate, &mut up, &mut y);
+                    let launched = if bare_rows {
+                        let units = (&self.acts_in, &mut bare_h);
+                        launch(gpu, &self.wk, &blk, units, (&x_dev, m), out)
+                    } else {
+                        let units = (&bare_in, &mut self.acts_h);
+                        launch(gpu, &self.wk, &blk, units, (&x_dev, m), out)
+                    };
+                    stream.synchronize()?;
+                    gpu.take_fault()?;
+                    let got = match launched {
+                        Ok(()) => "launched".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    let pass = got.contains(want);
+                    println!(
+                        "nvfp4 clause=nvfp4_gated_block refusal={name} want={want:?} got={got:?} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+                Ok(ok)
+            }
+        }
+
+        pub(super) fn run(gpu: &Gpu, dir: &Path) -> Result<bool, GateError> {
+            let stream = gpu.stream();
+            let mut decls = Vec::new();
+            let mut sampled = Vec::new();
+            for p in &PARTS {
+                let bytes = nvfp4_bytes(p.rows, p.k, p.seed);
+                sampled.push(Sampled::new(&bytes, p.rows, p.k)?);
+                decls.extend(weight_decls(p.stem, &[p.k, p.rows], bytes, &[p.scale]));
+            }
+            let path = dir.join("gated.gguf");
+            write_gguf(&path, &[], &decls)?;
+            drop(decls);
+            let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let names: Vec<String> = PARTS.iter().map(|p| format!("{}.weight", p.stem)).collect();
+            let w = Weights::load_where(stream, &split, |n| names.iter().any(|v| v.as_str() == n))?;
+            for (p, name) in PARTS.iter().zip(&names) {
+                let found =
+                    site::file_site(&split, "gate_nvfp4", name, (p.rows, p.k), &[SiteTy::Nvfp4])?;
+                site::site(&w, "gate_nvfp4", name, (p.rows, p.k), found)?;
+            }
+            let ty = SiteTy::Nvfp4;
+            let max = MS[MS.len() - 1];
+            let gk = GemmKernels::load(gpu.context())?;
+            let g32 = Gemm32Kernels::load(gpu.context())?;
+            let mut rig = Rig {
+                gpu,
+                gk: &gk,
+                wk: WideKernels {
+                    gemm: &gk,
+                    g32: Some(&g32),
+                },
+                w: &w,
+                names: &names,
+                sampled: &sampled,
+                route: GemmRoute::new(stream, max, 1)?,
+                acts_in: WideActs::new(
+                    stream,
+                    WideActs::wants_of(&[ty, ty]).without_f32(),
+                    max,
+                    HIDDEN,
+                )?,
+                acts_h: WideActs::new(stream, WideActs::wants_of(&[ty]), max, FF)?,
+            };
+            let counts = rig.counts()?;
+            let refusals = rig.refusals()?;
+            Ok(counts && refusals)
         }
     }
 

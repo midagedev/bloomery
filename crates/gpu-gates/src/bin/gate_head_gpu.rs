@@ -24,6 +24,15 @@
 //!   rounding), the argmax the logits' maximum under the tie rule above;
 //! - a head of three rows: row `c`'s logits and token are the one-row head's on that row, bit for
 //!   bit (the gemv is token-major and the copy puts it in the argmax's layout).
+//!
+//! `nvfp4_head_k5120`, the same file at Qwen3.8-27B's hidden width, 5,120 values a row (whole q8_1
+//! super-blocks of 256, so the head reads the q8_1 rows through `site::kgemv`):
+//! - each logit equal bit for bit to the gemv's host rule over the head's own normed row (the
+//!   host's q8_1 codes, `lane_partial_host::<Nvfp4, 2>` per lane, the butterfly, the multiply by the
+//!   scale) and within the derived band of the f64 `scale · Σ w_j x_j` (the activation's half
+//!   block scale a value, the gemv's roundings), the argmax the logits' maximum under the tie rule
+//!   above;
+//! - a head of three rows: row `c`'s logits and token are the one-row head's, bit for bit.
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Gpu;
@@ -236,12 +245,15 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
     idx.into_iter().map(|i| (i, v[i])).collect()
 }
 
-/// The `nvfp4_head_k2688` clause (module doc).
+/// The `nvfp4_head_k2688` and `nvfp4_head_k5120` clauses (module doc).
 #[cfg(feature = "gpu")]
 mod nvfp4_head {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::head::Head;
+    use bloomery_gpu::mxfp4::{Nvfp4, lane_partial_host};
     use bloomery_gpu::weights::{HEAD_TENSOR, Weights};
+    use bloomery_gpu_gates::act_rule::{Q8_1_BLOCK, q8_1_codes};
+    use bloomery_gpu_gates::rounding::{U64, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, GateRng, par_map, verdict, write_gguf};
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row};
@@ -249,6 +261,9 @@ mod nvfp4_head {
 
     /// Lightning's hidden width and a vocabulary of a few blocks of rows.
     const K: usize = 2688;
+    /// Qwen3.8-27B's hidden width: whole q8_1 super-blocks of 256 values, so its head reads the q8_1
+    /// rows through `site::kgemv`.
+    const K_Q8_1: usize = 5120;
     const N_VOCAB: usize = 1000;
     /// Rows of the multi-row head.
     const M: usize = 3;
@@ -274,22 +289,25 @@ mod nvfp4_head {
         out
     }
 
-    /// Row `c` of a head of `M` rows: the inputs the one-row head is run on one at a time.
-    fn input(c: usize) -> Vec<f32> {
-        (0..K)
+    /// Row `c` of a head of `M` rows of `k` values: the inputs the one-row head is run on one at a
+    /// time.
+    fn input(k: usize, c: usize) -> Vec<f32> {
+        (0..k)
             .map(|i| (((i + 7 * c) * 37 % 101) as f32 - 50.0 + c as f32) / 25.0)
             .collect()
     }
 
-    pub(super) fn run(gpu: &Gpu) -> Result<bool, GateError> {
-        let rows = nvfp4_rows(N_VOCAB, K, 0x5eed_0301);
-        let gain: Vec<u8> = (0..K)
+    /// A synthetic file holding an NVFP4 `output.weight` of `k` values a row from `seed`, its
+    /// `.scale` and the final norm's gain, loaded: the weight's bytes and the weights.
+    fn load(gpu: &Gpu, k: usize, seed: u64) -> Result<(Vec<u8>, Weights), GateError> {
+        let rows = nvfp4_rows(N_VOCAB, k, seed);
+        let gain: Vec<u8> = (0..k)
             .flat_map(|i| (0.5 + (i % 7) as f32 / 8.0).to_le_bytes())
             .collect();
         let decls = vec![
             (
                 HEAD_TENSOR.to_string(),
-                vec![K as u64, N_VOCAB as u64],
+                vec![k as u64, N_VOCAB as u64],
                 GgmlType::NVFP4,
                 rows.clone(),
             ),
@@ -299,7 +317,7 @@ mod nvfp4_head {
                 GgmlType::F32,
                 SCALE.to_le_bytes().to_vec(),
             ),
-            (output_norm(), vec![K as u64], GgmlType::F32, gain),
+            (output_norm(), vec![k as u64], GgmlType::F32, gain),
         ];
         let dir = std::env::temp_dir().join(format!("bloomery-nvfp4-head-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
@@ -314,7 +332,68 @@ mod nvfp4_head {
         let cleanup = std::fs::remove_dir_all(&dir).map_err(|e| format!("cleanup: {e}"));
         let w = loaded?;
         cleanup?;
+        Ok((rows, w))
+    }
 
+    /// One row through the head: its normed row, its logits and its token.
+    fn one(
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        x: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, u32), GateError> {
+        head.set_input(gpu, x)?;
+        head.enqueue(gpu, w)?;
+        let token = head.token(gpu)?;
+        Ok((head.normed_to_host(gpu)?, head.logits_to_host(gpu)?, token))
+    }
+
+    /// The index of the logits' maximum under the kernel's tie rule: strictly greater replaces, so
+    /// equal values keep the lower index.
+    fn argmax(logits: &[f32]) -> usize {
+        logits
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if v > b.1 { (i, v) } else { b }
+            })
+            .0
+    }
+
+    /// A head of `M` rows of `k` values: row `c`'s logits and token are the one-row head's on that
+    /// row, bit for bit (the gemv is token-major and the copy puts it in the argmax's layout).
+    fn three_rows(gpu: &Gpu, w: &Weights, head: &mut Head, k: usize) -> Result<bool, GateError> {
+        let inputs: Vec<Vec<f32>> = (0..M).map(|c| input(k, c)).collect();
+        let mut multi = Head::with_m(gpu, w, EPS, M)?;
+        multi.set_input(gpu, &inputs.concat())?;
+        multi.enqueue(gpu, w)?;
+        let got = multi.logits_to_host(gpu)?;
+        let tokens = multi.tokens(gpu)?;
+        let mut rows_equal = got.len() == M * N_VOCAB && tokens.len() == M;
+        for (c, x) in inputs.iter().enumerate() {
+            let (_, want, want_token) = one(gpu, w, head, x)?;
+            rows_equal &= tokens.get(c) == Some(&want_token)
+                && want
+                    .iter()
+                    .enumerate()
+                    .all(|(v, w1)| got.get(v * M + c).map(|g| g.to_bits()) == Some(w1.to_bits()));
+        }
+        println!(
+            "nvfp4 clause=nvfp4_head_k{k} rows={M} three_rows_are_the_one_row_heads_bit_for_bit={rows_equal} {}",
+            verdict(rows_equal)
+        );
+        Ok(rows_equal)
+    }
+
+    pub(super) fn run(gpu: &Gpu) -> Result<bool, GateError> {
+        let sel32 = sel32_head(gpu)?;
+        let q8_1 = q8_1_head(gpu)?;
+        Ok(sel32 && q8_1)
+    }
+
+    /// The `nvfp4_head_k2688` clause (module doc).
+    fn sel32_head(gpu: &Gpu) -> Result<bool, GateError> {
+        let (rows, w) = load(gpu, K, 0x5eed_0301)?;
         let mut head = Head::new(gpu, &w, EPS)?;
         println!(
             "nvfp4_head hidden={} n_vocab={} resident_bytes={}",
@@ -322,13 +401,7 @@ mod nvfp4_head {
             head.n_vocab(),
             head.resident_bytes()
         );
-        let one = |head: &mut Head, x: &[f32]| -> Result<(Vec<f32>, Vec<f32>, u32), GateError> {
-            head.set_input(gpu, x)?;
-            head.enqueue(gpu, &w)?;
-            let token = head.token(gpu)?;
-            Ok((head.normed_to_host(gpu)?, head.logits_to_host(gpu)?, token))
-        };
-        let (normed, logits, token) = one(&mut head, &input(0))?;
+        let (normed, logits, token) = one(gpu, &w, &mut head, &input(K, 0))?;
         let row_bytes = K / 64 * 36;
         let per: Vec<(bool, f64)> = par_map(N_VOCAB, |r| {
             let mut wv = vec![0.0f32; K];
@@ -350,39 +423,59 @@ mod nvfp4_head {
         });
         let in_band = per.iter().all(|p| p.0);
         let worst = per.iter().map(|p| p.1).fold(0.0f64, f64::max);
-        let best = logits
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
-                if v > b.1 { (i, v) } else { b }
-            })
-            .0;
-        let argmax = token as usize == best;
+        let argmax_ok = token as usize == argmax(&logits);
         println!(
             "nvfp4 clause=nvfp4_head_k2688 rows={N_VOCAB} k={K} in_band={in_band} \
-             worst_err_over_row_scale={worst:.3e} argmax_is_the_maximum={argmax} {}",
-            verdict(in_band && argmax)
+             worst_err_over_row_scale={worst:.3e} argmax_is_the_maximum={argmax_ok} {}",
+            verdict(in_band && argmax_ok)
         );
+        let rows_equal = three_rows(gpu, &w, &mut head, K)?;
+        Ok(in_band && argmax_ok && rows_equal)
+    }
 
-        let inputs: Vec<Vec<f32>> = (0..M).map(input).collect();
-        let mut multi = Head::with_m(gpu, &w, EPS, M)?;
-        multi.set_input(gpu, &inputs.concat())?;
-        multi.enqueue(gpu, &w)?;
-        let got = multi.logits_to_host(gpu)?;
-        let tokens = multi.tokens(gpu)?;
-        let mut rows_equal = got.len() == M * N_VOCAB && tokens.len() == M;
-        for (c, x) in inputs.iter().enumerate() {
-            let (_, want, want_token) = one(&mut head, x)?;
-            rows_equal &= tokens.get(c) == Some(&want_token)
-                && want
-                    .iter()
-                    .enumerate()
-                    .all(|(v, w1)| got.get(v * M + c).map(|g| g.to_bits()) == Some(w1.to_bits()));
-        }
+    /// The `nvfp4_head_k5120` clause (module doc). The band is derived per row, not a share of the
+    /// row's scale: each activation value is off its q8_1 value by at most half its 128-block's
+    /// scale `d`, so the logit moves by at most `scale · Σ |w_j| d_j / 2`, and the gemv's own
+    /// roundings are `gate_nvfp4`'s `γ(2 · ⌈K/1024⌉ + 6) + K/16 · u64` of `scale · Σ |w_j x̃_j|`,
+    /// with `|x̃_j|` at most `|x_j| + d_j / 2`.
+    fn q8_1_head(gpu: &Gpu) -> Result<bool, GateError> {
+        const K: usize = K_Q8_1;
+        let (rows, w) = load(gpu, K, 0x5eed_0302)?;
+        let mut head = Head::new(gpu, &w, EPS)?;
+        let (normed, logits, token) = one(gpu, &w, &mut head, &input(K, 0))?;
+        let (q, d) = q8_1_codes(&normed);
+        let row_bytes = K / 64 * 36;
+        let scale = f64::from(SCALE);
+        let rounding = gamma(2 * (K / 32).div_ceil(32) + 6) + (K / 16) as f64 * U64;
+        let per: Vec<(bool, f64)> = par_map(N_VOCAB, |r| {
+            let row = &rows[r * row_bytes..][..row_bytes];
+            let mut wv = vec![0.0f32; K];
+            dequant_row(GgmlType::NVFP4, row, &mut wv).unwrap_or_else(|e| panic!("row {r}: {e}"));
+            let lanes: [f32; 32] =
+                std::array::from_fn(|lane| lane_partial_host::<Nvfp4, 2>(row, &q, &d, lane));
+            let bits = (butterfly(lanes) * SCALE).to_bits() == logits[r].to_bits();
+            let (mut want, mut mag, mut step) = (0.0f64, 0.0f64, 0.0f64);
+            for (j, (&a, &x)) in wv.iter().zip(&normed).enumerate() {
+                let term = f64::from(a) * f64::from(x);
+                want += term;
+                mag += term.abs();
+                step += f64::from(a).abs() * f64::from(d[j / Q8_1_BLOCK]);
+            }
+            let half = 0.5001 * step;
+            let band = scale.abs() * (half + rounding * (mag + half)) + 1e-6;
+            let err = (f64::from(logits[r]) - scale * want).abs();
+            (bits, err / band)
+        });
+        let bits = per.iter().filter(|p| p.0).count();
+        let worst = per.iter().map(|p| p.1).fold(0.0f64, f64::max);
+        let argmax_ok = token as usize == argmax(&logits);
+        let pass = bits == N_VOCAB && worst <= 1.0 && argmax_ok;
         println!(
-            "nvfp4 clause=nvfp4_head_k2688 rows={M} three_rows_are_the_one_row_heads_bit_for_bit={rows_equal} {}",
-            verdict(rows_equal)
+            "nvfp4 clause=nvfp4_head_k5120 rows={N_VOCAB} k={K} bits_equal={bits}/{N_VOCAB} \
+             worst_err_over_band={worst:.3e} argmax_is_the_maximum={argmax_ok} {}",
+            verdict(pass)
         );
-        Ok(in_band && argmax && rows_equal)
+        let rows_equal = three_rows(gpu, &w, &mut head, K)?;
+        Ok(pass && rows_equal)
     }
 }

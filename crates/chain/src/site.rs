@@ -24,7 +24,8 @@ pub enum SiteTy {
     Q5_0,
     Q8_0,
     F32,
-    /// NVFP4 in its two planes and the tensor's scale; no wide GEMM.
+    /// NVFP4 in its two planes and the tensor's scale; its gemv reads the q8_1 rows, its wide GEMM
+    /// the q8 blocks of 32.
     Nvfp4,
     /// bloomery's MXFP8 in its two planes, read on the f32 rows, narrow and wide.
     Mxfp8,

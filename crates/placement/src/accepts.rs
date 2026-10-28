@@ -249,8 +249,9 @@ pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<LegSplit> {
 /// body's arena carries ([`SiteAct::Q8x128`], [`SiteAct::Q8x32`],
 /// [`SiteAct::F32`] — `Form::Q8x128`, `Form::Q8x32`, `Form::F32`). A Q5_0
 /// site reads [`SiteAct::Q8Blocks32`], which the arena does not carry, and
-/// is `None`. An NVFP4 site has a gemv and no wide GEMM, which the body's
-/// prompt units run every dense site through, and is `None`. A BF16 site
+/// is `None`. An NVFP4 site reads the q8_1 rows on its gemv and the q8 blocks
+/// of 32 on its wide GEMM, and the body's dense dispatch and arena carry no
+/// per-arm form choice, so it is `None`. A BF16 site
 /// reads the words only a load under `ModelTensors::bf16_words` keeps, which
 /// the qwen3moe files do not set, and is `None`. Its legacy shared-expert
 /// dispatch does not feed IQ4_XS sites either. The body's load and the
