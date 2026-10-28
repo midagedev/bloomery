@@ -2,14 +2,24 @@
 //! named once so [`super::walk`] orders them the same way for every backend.
 //!
 //! The order is the walk's; an op is the backend's. A layer is its mixer (attention over K/V
-//! planes, or the delta rule over a recurrent store), then its FFN half (the router, then the
-//! experts), and the unit ends in its head. Which kernel an op launches follows from the unit's
-//! rows and the plan inside the op, and where the layer's output rows go (the residual stream, or
-//! after the last layer what the unit ends in) from [`LayerCtx::last`] and the backend's own end
-//! of the unit.
+//! planes, the delta rule over a recurrent store, or the short conv over a conv ring), then its
+//! FFN half (the router, then the experts), and the unit ends in its head. Which kernel an op
+//! launches follows from the unit's rows and the plan inside the op, and where the layer's output
+//! rows go (the residual stream, or after the last layer what the unit ends in) from
+//! [`LayerCtx::last`] and the backend's own end of the unit.
+//!
+//! The join of a half's output into the stream has no op of its own: the op that ends each half
+//! (`attn_out`, `delta_out` or `conv_out` for the mixer, `experts` for the FFN) reads
+//! `l.plan.residual` and joins its output itself, `x += out` for a plain residual and
+//! `x += add · gain ⊙ rms_norm(out)` for a sandwich (`ResidualPlan::Sandwich`). A backend that
+//! joins by the plain add only calls [`LayerCtx::plain_only`] first in those ops, so a sandwich
+//! layer stops at its first half with a named refusal and never runs as a plain one. An op a
+//! backend has no kernels for has a default body that refuses by name, so a backend that does not
+//! run a part of a layer stops at it and never runs the layer as another.
 
-use super::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan};
+use super::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, ResidualPlan, ShortConvPlan};
 use crate::ChainError;
+use std::any::type_name;
 
 /// What an op of one layer of a walk is given beside the plan part it runs: the layer, its plan, the
 /// unit's rows, and whether the layer is the chain's last.
@@ -40,6 +50,21 @@ impl<'p> LayerCtx<'p> {
             last: layer + 1 == plans.len(),
         })
     }
+
+    /// `Ok` for a plain residual, and a named refusal of `op` for a sandwich: what a backend that
+    /// joins a half's output by the plain add calls first in each op that ends a half.
+    pub fn plain_only(&self, op: &'static str) -> Result<(), ChainError> {
+        match &self.plan.residual {
+            ResidualPlan::Plain => Ok(()),
+            ResidualPlan::Sandwich(_) => Err(ChainError::shape(
+                op,
+                format!(
+                    "layer {}: a sandwich residual, which this backend does not run",
+                    self.layer
+                ),
+            )),
+        }
+    }
 }
 
 /// What a backend enqueues for a layer's parts. Every op only enqueues: no synchronization, no
@@ -53,15 +78,19 @@ pub trait ChainOps {
     /// unit beside them.
     fn embed(&mut self, m: usize) -> Result<(), Self::Error>;
 
-    /// The attention half's input side: the norm with its quantizer, then q, k and v.
+    /// The attention half's input side: the norm with its quantizer, then q, k and v (and, on a
+    /// kind with a gate of its own, the gate's projection of the normed rows).
     fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), Self::Error>;
 
-    /// The attention half's middle: the q/k norm and rope with the cache append, the flash over
-    /// the rows' live keys, and the output projection's input (with the output gate at head 256).
+    /// The attention half's middle: the q/k norm and rope (by the plan's frequency factors, where
+    /// it has them) with the cache append, the flash over the rows' live keys (the plan's window
+    /// of them, where it has one), and the output projection's input (with the output gate where
+    /// the kind has one).
     fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), Self::Error>;
 
-    /// The attention half's output side: the output projection and the residual add into the
-    /// FFN's input.
+    /// The attention half's output side: the output projection and the join of its output into
+    /// the FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's `Half::Mixer`
+    /// norm and scale).
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), Self::Error>;
 
     /// The delta rule's input side: the norm with its quantizer and the four input projections.
@@ -71,19 +100,55 @@ pub trait ChainOps {
     /// state, and the gated norm.
     fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), Self::Error>;
 
-    /// The delta rule's output side: the output projection and the residual add into the FFN's
-    /// input.
+    /// The delta rule's output side: the output projection and the join of its output into the
+    /// FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's `Half::Mixer` norm
+    /// and scale).
     fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), Self::Error>;
+
+    /// The short conv's input side: the norm with its quantizer and the input projection of the
+    /// normed rows to the three chunks `B | C | x` of `hidden` values each. A backend with no
+    /// short-conv kernels keeps the default body, which refuses by name.
+    fn conv_in(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), Self::Error> {
+        Err(unrun::<Self>("qwen3moe::ChainOps::conv_in", l.layer).into())
+    }
+
+    /// The short conv's middle: `B ⊙ x`, the causal depthwise conv over the layer's ring and the
+    /// rows' predecessors, and `C ⊙` the conv's output, the input of the output projection. A
+    /// backend with no short-conv kernels keeps the default body, which refuses by name.
+    fn conv_core(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), Self::Error> {
+        Err(unrun::<Self>("qwen3moe::ChainOps::conv_core", l.layer).into())
+    }
+
+    /// The short conv's output side: the output projection and the join of its output into the
+    /// FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's `Half::Mixer` norm
+    /// and scale). A backend with no short-conv kernels keeps the default body, which refuses by
+    /// name.
+    fn conv_out(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), Self::Error> {
+        Err(unrun::<Self>("qwen3moe::ChainOps::conv_out", l.layer).into())
+    }
 
     /// The FFN half's front: the FFN norm with its quantizer, and the router's pick of every
     /// row's slots (a dense FFN has no pick: its one slot a row).
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), Self::Error>;
 
     /// The FFN half's rest: the routed slots' gate·up·SwiGLU and down, the shared expert, and the
-    /// combine into the layer's output rows.
+    /// combine into the layer's output rows, joined to the half's input rows by `l.plan.residual`
+    /// (the plain add, or the sandwich's `Half::Ffn` norm and scale).
     fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), Self::Error>;
 
     /// What the unit ends in after its last layer: the head over the unit's rows, or the final
     /// norm of every row, or nothing when the last layer's output stays in the residual stream.
     fn head(&mut self, m: usize) -> Result<(), Self::Error>;
+}
+
+/// The refusal a default op body returns: the op, the layer and the backend (`B`'s type name)
+/// that has no kernels for it.
+fn unrun<B: ?Sized>(op: &'static str, layer: usize) -> ChainError {
+    ChainError::shape(
+        op,
+        format!(
+            "layer {layer}: the backend {} implements no such op",
+            type_name::<B>()
+        ),
+    )
 }

@@ -199,6 +199,11 @@ BODY35_SITES = (
     (r"blk\.\d+\.ffn_gate\.weight", "PROJ"),
     (r"blk\.\d+\.ffn_up\.weight", "PROJ"),
     (r"blk\.\d+\.ffn_down\.weight", "PROJ"),
+    (r"blk\.\d+\.shortconv\.in_proj\.weight", "PROJ"),
+    (r"blk\.\d+\.shortconv\.out_proj\.weight", "PROJ"),
+    # The head-gate class's gate, one value a head, is read against PROJ_F32; a qwen35 file's attn_gate matches both
+    # rows, and PROJ is a subset of PROJ_F32.
+    (r"blk\.\d+\.attn_gate\.weight", "PROJ_F32"),
     (r"blk\.\d+\.ssm_beta\.weight", "PROJ_F32"),
     (r"blk\.\d+\.ssm_alpha\.weight", "PROJ_F32"),
     (r"blk\.\d+\.ffn_(?:gate|up|down)_exps\.weight", "PROJ_F32"),

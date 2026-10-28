@@ -221,6 +221,12 @@ impl Body35 {
                     y: head_of(stream, &a.attn, m * zl)?,
                 })
             }
+            MixerPlan::ShortConv(_) => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    "a short-conv layer, which this body runs no kernel for",
+                ));
+            }
         };
         Ok(Layer35Run {
             mixer,

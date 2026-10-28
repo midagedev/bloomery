@@ -20,8 +20,8 @@
 use crate::site::Form;
 pub(super) use chain::arch::qwen3moe::plan::{
     DeltaPlan, DownEntry, FfnPlan, FfnRoute, Flash, GateUpEntry, GqaKind, GqaPlan, Kind35,
-    LayerPlan, MixerPlan, Pairs, SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry,
-    kind35, kinds35, moe_fits, q35, shared_entry,
+    LayerPlan, MixerPlan, Pairs, ResidualPlan, SharedPlan, SharedSites, SiteTy, down_entry,
+    gate_up_entry, kind35, kinds35, moe_fits, q35, shared_entry,
 };
 
 // The head the chain plans a `GqaKind::Head128` layer at is the one this crate's head-128 kernels
@@ -102,7 +102,9 @@ pub(super) fn reads_f32(sh: &SharedSites) -> bool {
 /// Plans the unit tests of the dispatch and the ubatch share.
 #[cfg(test)]
 pub(super) mod fixtures {
-    use super::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
+    use super::{
+        FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, ResidualPlan, SiteTy,
+    };
 
     /// One layer of `kind` with the attention types `[q, k, v, o]` over the
     /// plain routed FFN of Q4_K stacks.
@@ -123,6 +125,9 @@ pub(super) mod fixtures {
                 k_ty: k,
                 v_ty: v,
                 o_ty: o,
+                window: None,
+                gate: None,
+                rope_freqs: None,
             }),
             ffn: FfnPlan {
                 ffn_norm: name("ffn_norm"),
@@ -137,6 +142,7 @@ pub(super) mod fixtures {
                 up_ty: SiteTy::Q4K,
                 down_ty: SiteTy::Q4K,
             },
+            residual: ResidualPlan::Plain,
         }
     }
 }

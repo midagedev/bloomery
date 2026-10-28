@@ -297,6 +297,11 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 1 + qkv + 3 + out
             }
             MixerPlan::Delta(d) => delta::launches(d, m),
+            MixerPlan::ShortConv(_) => {
+                panic!(
+                    "qwen3moe::pass_launches: a short-conv layer, which the card's plans never hold"
+                )
+            }
         };
         let f = &p.ffn;
         let ffn = match (&f.route, wide) {
@@ -642,6 +647,12 @@ pub(super) fn attn_core(
                 ),
             ));
         }
+        GqaKind::HeadGate128 => {
+            return Err(GpuError::shape(
+                "qwen3moe::attention",
+                "a head-128 attention with an output gate of its own, which no launch here serves",
+            ));
+        }
     }
     Ok(())
 }
@@ -774,6 +785,12 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
             "qwen3moe::attention",
             "the arena's gated rows",
         ))?,
+        GqaKind::HeadGate128 => {
+            return Err(GpuError::shape(
+                "qwen3moe::attention",
+                "a head-128 attention with an output gate of its own, which no launch here serves",
+            ));
+        }
     };
     out_resid(
         c,

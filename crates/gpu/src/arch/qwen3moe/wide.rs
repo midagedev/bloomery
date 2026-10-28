@@ -381,6 +381,7 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
             let env = (c.gpu, c.w, c.k);
             neox_128_in(env, (c.eps, c.sink), n, (&d, m), &mut neox_rows(s)?)
         }
+        GqaKind::HeadGate128 => Err(head_gate_refused()),
     }
 }
 
@@ -404,6 +405,7 @@ pub(super) fn attn_core(
             let at = (c.table, c.eps, c.sink);
             neox_128_core(env, at, (n, kv), (&d, m), &mut neox_rows(s)?)
         }
+        GqaKind::HeadGate128 => Err(head_gate_refused()),
     }
 }
 
@@ -417,10 +419,20 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
             let d = s.dims;
             neox_128_out((c.gpu, c.w, c.k), n, (&d, m), &mut neox_rows(s)?)
         }
+        GqaKind::HeadGate128 => Err(head_gate_refused()),
     }
 }
 
 const WHAT_GATED: &str = "qwen3moe::wide::attention";
+
+/// The refusal of the head-128 attention with an output gate of its own, which no launch here
+/// serves.
+fn head_gate_refused() -> GpuError {
+    GpuError::shape(
+        WHAT_GATED,
+        "a head-128 attention with an output gate of its own, which no launch here serves",
+    )
+}
 
 /// The head-256 half's input side ([`GqaKind::Gated256`], [`attn_in`]): the
 /// `[q | gate]` rows, k and v of the normed rows.
