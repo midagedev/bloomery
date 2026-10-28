@@ -69,6 +69,18 @@
 // nothing, gated or not. That fault is already the quant site, and the
 // product site is the smaller code, so raising it would replace the quant
 // site.
+//
+// A per-head gate (BLOOMERY_ATTN_HEAD_GATE) is one raw value a query head from
+// a buffer of its own, BLOOMERY_ATTN_Q values a row; every value of the head
+// is multiplied by its sigmoid, under the same fault rules as the packed gate.
+//
+// A layer's window (BLOOMERY_ATTN_WINDOW, the launch word `window`, 0 for
+// none) is the last `window` of its live keys: of `keys` live keys, key k is
+// attended when k + window >= keys. The segments tile those keys alone, so a
+// key before the window is never fetched, and a segment the caller counted
+// that holds none of them is empty and skipped by the fold. An append position
+// before the window belongs to the first segment. The prefill kernel starts at
+// the tile of the first window of its block and masks every row's own.
 
 #pragma METAL fp contract(off)
 
@@ -82,6 +94,12 @@ static_assert(BLOOMERY_ATTN_GATED == 0u || BLOOMERY_ATTN_GATED == 1u,
               "a layer's query is gated or plain");
 static_assert(BLOOMERY_ATTN_QG == BLOOMERY_ATTN_HEAD * (1u + BLOOMERY_ATTN_GATED),
               "a query head is the query and then the gate when the layer has one");
+static_assert(BLOOMERY_ATTN_HEAD_GATE == 0u || BLOOMERY_ATTN_HEAD_GATE == 1u,
+              "a layer's output gate is per head or it is not");
+static_assert(BLOOMERY_ATTN_GATED == 0u || BLOOMERY_ATTN_HEAD_GATE == 0u,
+              "a layer's output gate is packed in its query or per head, not both");
+static_assert(BLOOMERY_ATTN_WINDOW == 0u || BLOOMERY_ATTN_WINDOW == 1u,
+              "a flash cuts a window or it does not");
 static_assert(BLOOMERY_ATTN_THREADS == BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_SG,
               "the flash threadgroup is the key head's SIMD groups");
 static_assert(BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_LANE_DIMS == BLOOMERY_ATTN_HEAD,
@@ -142,9 +160,16 @@ struct AttnArgs {
     float scale;
     uint pos;
     uint keys;
+#if BLOOMERY_ATTN_WINDOW
+    uint window;
+#endif
 };
 
+#if BLOOMERY_ATTN_WINDOW
+static_assert(sizeof(AttnArgs) == 32, "AttnArgs is 32 bytes: the host packs eight words");
+#else
 static_assert(sizeof(AttnArgs) == 28, "AttnArgs is 28 bytes: the host packs seven words");
+#endif
 
 // The rows launches' argument block: a chunk of `rows` queries whose first
 // sits at position `from`, row r at position from + r with from + r + 1 live
@@ -162,9 +187,16 @@ struct AttnRowsArgs {
     uint k_stride;
     uint v_stride;
     uint out_stride;
+#if BLOOMERY_ATTN_WINDOW
+    uint window;
+#endif
 };
 
+#if BLOOMERY_ATTN_WINDOW
+static_assert(sizeof(AttnRowsArgs) == 48, "AttnRowsArgs is 48 bytes: the host packs twelve words");
+#else
 static_assert(sizeof(AttnRowsArgs) == 44, "AttnRowsArgs is 44 bytes: the host packs eleven words");
+#endif
 
 // The decode launch's words for row `row` of a rows launch.
 inline AttnArgs attn_row_args(constant AttnRowsArgs &args, uint row) {
@@ -176,8 +208,46 @@ inline AttnArgs attn_row_args(constant AttnRowsArgs &args, uint row) {
     a.scale = args.scale;
     a.pos = args.from + row;
     a.keys = a.pos + 1u;
+#if BLOOMERY_ATTN_WINDOW
+    a.window = args.window;
+#endif
     return a;
 }
+
+// The first key a layer attends: the last `window` of its `live` keys, and
+// the first of them when the launch names no window (0). A flash with no
+// window attends every live key.
+inline uint attn_window_lo(thread const AttnArgs &args, uint live) {
+#if BLOOMERY_ATTN_WINDOW
+    return (args.window != 0u && live > args.window) ? live - args.window : 0u;
+#else
+    return 0u;
+#endif
+}
+
+// The layer's output gate, packed in its query or one value a head.
+#define ATTN_GATE (BLOOMERY_ATTN_GATED || BLOOMERY_ATTN_HEAD_GATE)
+
+// The raw gate of channel `dim` of query head `head`, from `src`: the head's
+// packed gate beside its query row, or the head's one value in its row of the
+// per-head gate buffer.
+inline float attn_gate_value(device float const *src, uint head, uint dim) {
+#if BLOOMERY_ATTN_HEAD_GATE
+    return src[head];
+#else
+    return src[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim];
+#endif
+}
+
+// The per-head gate buffer's kernel parameter, bound by a launch whose layer
+// gates per head, and its row `row`'s start as the flash takes it.
+#if BLOOMERY_ATTN_HEAD_GATE
+#define ATTN_HGATE_PARAM(n) , device float const *hgate [[buffer(n)]]
+#define ATTN_HGATE(row) (hgate + (ulong)(row) * BLOOMERY_ATTN_Q)
+#else
+#define ATTN_HGATE_PARAM(n)
+#define ATTN_HGATE(row) ((device float const *)nullptr)
+#endif
 
 // The hardware half conversion. A finite pattern is the host `half_to_f32`.
 // The cast clears the sign of a negative NaN; the source sign is put back,
@@ -657,7 +727,9 @@ struct Q8Cache {
 };
 
 // The segment that owns the position appends that key and value. The whole
-// owning SIMD group builds each row and stores it a lane at a time.
+// owning SIMD group builds each row and stores it a lane at a time. The
+// segments tile the keys from `win_lo`; a position before them is the first
+// segment's.
 template <typename Cache>
 static void attn_append(Cache cache,
                         thread const AttnArgs &args,
@@ -670,13 +742,15 @@ static void attn_append(Cache cache,
                         uint kv,
                         uint seg,
                         uint span,
+                        uint win_lo,
                         uint sg,
                         uint lane,
                         threadgroup float *scratch) {
     if (sg != 0u) {
         return;
     }
-    bool owns = ok && args.pos < args.keys && args.pos / span == seg;
+    uint pos_seg = args.pos >= win_lo ? (args.pos - win_lo) / span : 0u;
+    bool owns = ok && args.pos < args.keys && pos_seg == seg;
     if (!owns) {
         return;
     }
@@ -735,6 +809,7 @@ static void attn_tile_loop(Cache cache,
                            uint kv,
                            uint seg,
                            uint span,
+                           uint win_lo,
                            uint max_live,
                            uint tid,
                            uint lane,
@@ -750,8 +825,8 @@ static void attn_tile_loop(Cache cache,
     if (!ok) {
         return;
     }
-    uint lo0 = seg * span;
-    uint seg_hi = min((seg + 1u) * span, max_live);
+    uint lo0 = win_lo + seg * span;
+    uint seg_hi = min(win_lo + (seg + 1u) * span, max_live);
     typename Cache::Pending ahead;
     cache.fetch(tid, kv, args.ctx, lo0, min(lo0 + BLOOMERY_ATTN_TILE, seg_hi), ahead);
     for (uint lo = lo0; lo < seg_hi; lo += BLOOMERY_ATTN_TILE) {
@@ -798,9 +873,10 @@ static void attn_tile_loop(Cache cache,
 }
 
 // One segment writes the output, gated when the layer has a gate. More than
-// one writes the partial.
+// one writes the partial. `gate_src` is where the gate is read from: the
+// query rows when it is packed, the per-head gate's row otherwise.
 static void attn_epilogue(thread const AttnArgs &args,
-                          device float const *q,
+                          device float const *gate_src,
                           device coherent(device) float *partials,
                           device float *out,
                           device atomic_uint *faults,
@@ -825,8 +901,8 @@ static void attn_epilogue(thread const AttnArgs &args,
         float inv = 1.0f / *running_l;
         for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
             float attn = acc[d] * inv;
-#if BLOOMERY_ATTN_GATED
-            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];
+#if ATTN_GATE
+            float g = attn_gate_value(gate_src, head, dim0 + d);
             float gated = attn * attn_sigmoid(g);
             attn_commit(out, o + d, attn, g, gated, faults, args.layer);
 #else
@@ -878,7 +954,7 @@ static void attn_epilogue(thread const AttnArgs &args,
 static void attn_fold(device coherent(device) float *partials,
                       device atomic_uint *ticket,
                       thread const AttnArgs &args,
-                      device float const *q,
+                      device float const *gate_src,
                       device float *out,
                       device atomic_uint *faults,
                       uint tid,
@@ -967,8 +1043,8 @@ static void attn_fold(device coherent(device) float *partials,
         for (uint d = 0u; d < ATTN_FOLD_VALS; ++d) {
             uint dim = d * ATTN_FOLD_SUBS + sub;
             float attn = acc[d] * inv;
-#if BLOOMERY_ATTN_GATED
-            float gate = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim];
+#if ATTN_GATE
+            float gate = attn_gate_value(gate_src, head, dim);
             float merged = attn * attn_sigmoid(gate);
             attn_commit(out, o + dim, attn, gate, merged, faults, args.layer);
 #else
@@ -1007,6 +1083,8 @@ static bool attn_bounds(thread const AttnArgs &args,
 // The flash of one position. APPEND is the decode's: the owning segment
 // appends this position's key and value first. The rows launch has appended
 // them already (attn_norm_rope_rows) and passes no key, value or key gain.
+// `hgate` is this position's row of the per-head gate buffer, null when the
+// layer has none.
 template <typename Cache, bool APPEND>
 static void attn_flash(Cache cache,
                        thread const AttnArgs &args,
@@ -1016,6 +1094,7 @@ static void attn_flash(Cache cache,
                        device float const *q_gain,
                        device float const *k_gain,
                        device float const *rope,
+                       device float const *hgate,
                        device coherent(device) float *partials,
                        device float *out,
                        device atomic_uint *faults,
@@ -1030,15 +1109,23 @@ static void attn_flash(Cache cache,
     uint kv = group / args.segments;
     uint seg = group - kv * args.segments;
     bool active = kv < BLOOMERY_ATTN_KV && seg < args.segments;
+#if BLOOMERY_ATTN_HEAD_GATE
+    device float const *gate_src = hgate;
+#else
+    device float const *gate_src = q;
+#endif
 
     uint max_live;
     bool ok = attn_bounds(args, faults, active, tid, max_live);
 
-    uint span = attn_span(max_live, args.segments);
+    // The segments tile the keys the layer attends, the last `window` of the
+    // live ones.
+    uint win_lo = attn_window_lo(args, max_live);
+    uint span = attn_span(max_live - win_lo, args.segments);
     if constexpr (APPEND) {
         if (active) {
-            attn_append(cache, args, k, v, k_gain, rope, faults, ok, kv, seg, span, sg, lane,
-                        scratch);
+            attn_append(cache, args, k, v, k_gain, rope, faults, ok, kv, seg, span, win_lo, sg,
+                        lane, scratch);
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
@@ -1052,9 +1139,9 @@ static void attn_flash(Cache cache,
         // The tiles load over the scratch the prepare paired through, so
         // every thread's scratch reads end here.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        attn_tile_loop(cache, args, ok, kv, seg, span, max_live, tid, lane, qv, &running_m,
-                       &running_l, acc);
-        attn_epilogue(args, q, partials, out, faults, ok, kv, seg, sg, lane, &running_m,
+        attn_tile_loop(cache, args, ok, kv, seg, span, win_lo, max_live, tid, lane, qv,
+                       &running_m, &running_l, acc);
+        attn_epilogue(args, gate_src, partials, out, faults, ok, kv, seg, sg, lane, &running_m,
                       &running_l, acc);
     }
 
@@ -1063,7 +1150,8 @@ static void attn_flash(Cache cache,
     if (args.segments > 1u) {
         ticket_is_last(ticket, groups, tid, last_flag);
         if (last_flag == 1u) {
-            attn_fold(partials, ticket, args, q, out, faults, tid, (threadgroup float *)scratch);
+            attn_fold(partials, ticket, args, gate_src, out, faults, tid,
+                      (threadgroup float *)scratch);
         }
     }
 }
@@ -1088,7 +1176,7 @@ kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
                              device atomic_uint *ticket [[buffer(12)]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint3 group [[threadgroup_position_in_grid]],
-                             uint3 tpg [[threadgroups_per_grid]]) {
+                             uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(13)) {
     threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
     AttnArgs args = launch;
@@ -1097,9 +1185,9 @@ kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
     cache.v = cache_v;
     cache.tile_k = (threadgroup attn_lane_word *)shared;
     cache.tile_v = cache.tile_k + BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_LANES;
-    attn_flash<F16Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults,
-                               ticket, tpg.x, group.x, tid, (threadgroup float *)shared,
-                               last_flag);
+    attn_flash<F16Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope, ATTN_HGATE(0u),
+                               partials, out, faults, ticket, tpg.x, group.x, tid,
+                               (threadgroup float *)shared, last_flag);
 }
 
 kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
@@ -1119,7 +1207,7 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
                             device atomic_uint *ticket [[buffer(14)]],
                             uint tid [[thread_index_in_threadgroup]],
                             uint3 group [[threadgroup_position_in_grid]],
-                            uint3 tpg [[threadgroups_per_grid]]) {
+                            uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(15)) {
     // The q8_0 tiles are a row's code words and scales a tile row, K then V,
     // the scales given four 16-byte words a tile row; the shared block covers
     // the f16 tiles, which the scratch also pairs through.
@@ -1137,9 +1225,9 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
     cache.tile_v_codes = (threadgroup uint *)(shared + BLOOMERY_ATTN_TILE * (codes_words + 4u));
     cache.tile_v_scales =
         (threadgroup ushort *)(shared + BLOOMERY_ATTN_TILE * (2u * codes_words + 4u));
-    attn_flash<Q8Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults,
-                              ticket, tpg.x, group.x, tid, (threadgroup float *)shared,
-                              last_flag);
+    attn_flash<Q8Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope, ATTN_HGATE(0u),
+                              partials, out, faults, ticket, tpg.x, group.x, tid,
+                              (threadgroup float *)shared, last_flag);
 }
 
 // The append of a chunk of rows to the f16 cache: row r's key is normed and
@@ -1170,7 +1258,7 @@ kernel void attn_norm_rope_rows(device float const *k [[buffer(0)]],
     // One segment owns every position: its span covers the live keys.
     uint span = attn_span(max_live, 1u);
     attn_append(cache, a, k + row * args.k_stride, v + row * args.v_stride, k_gain, rope, faults,
-                ok, kv, 0u, span, 0u, lane, scratch);
+                ok, kv, 0u, span, 0u, 0u, lane, scratch);
 }
 
 // The flash of a chunk of rows over the f16 cache: the decode flash with a
@@ -1190,7 +1278,7 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
                                   device atomic_uint *ticket [[buffer(9)]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint3 group [[threadgroup_position_in_grid]],
-                                  uint3 tpg [[threadgroups_per_grid]]) {
+                                  uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(10)) {
     threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
     F16Cache cache;
@@ -1202,7 +1290,7 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
     AttnArgs a = attn_row_args(args, row);
     uint partials_stride = BLOOMERY_ATTN_Q * args.segments * BLOOMERY_ATTN_PARTIAL;
     attn_flash<F16Cache, false>(cache, a, q + row * args.q_stride, nullptr, nullptr, q_gain,
-                                nullptr, rope, partials + row * partials_stride,
+                                nullptr, rope, ATTN_HGATE(row), partials + row * partials_stride,
                                 out + row * args.out_stride, faults, ticket + row, tpg.x, group.x,
                                 tid, (threadgroup float *)shared, last_flag);
 }
@@ -1271,7 +1359,7 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
                              uint sg [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint3 group [[threadgroup_position_in_grid]],
-                             uint3 tpg [[threadgroups_per_grid]]) {
+                             uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(8)) {
     threadgroup half shared[2u * PF_TILE_HALVES];
     threadgroup float scratch[BLOOMERY_ATTN_PF_POSITIONS * BLOOMERY_ATTN_HEAD];
     threadgroup half *tile_k = shared;
@@ -1291,6 +1379,15 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
     if (block_keys > args.ctx) {
         block_keys = 0u;
     }
+#if BLOOMERY_ATTN_WINDOW
+    // The first key this row attends, and the first tile of the block: the one
+    // holding the window of its first row, the earliest of the block's.
+    AttnArgs first = attn_row_args(args, row0);
+    uint row_lo = attn_window_lo(a, a.keys);
+    uint first_tile = attn_window_lo(first, first.keys) / BLOOMERY_ATTN_PF_KEYS;
+#else
+    uint first_tile = 0u;
+#endif
 
     // The queries of this position, normed and roped, as f16 rows of the stage.
     threadgroup float *sc = scratch + sg * BLOOMERY_ATTN_HEAD;
@@ -1352,7 +1449,7 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
     float running_l = 0.0f;
 
     uint tiles = (block_keys + BLOOMERY_ATTN_PF_KEYS - 1u) / BLOOMERY_ATTN_PF_KEYS;
-    for (uint t = 0u; t < tiles; ++t) {
+    for (uint t = first_tile; t < tiles; ++t) {
         uint k0 = t * BLOOMERY_ATTN_PF_KEYS;
         for (uint i = 0u; i < PF_LOADS; ++i) {
             uint e = tid + i * (BLOOMERY_ATTN_PF_POSITIONS * 32u);
@@ -1391,6 +1488,9 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
             float raw = j < 2u ? s0.thread_elements()[j] : s1.thread_elements()[j - 2u];
             uint key = k0 + (j / 2u) * 8u + fn + (j % 2u);
             live[j] = key <= a.pos;
+#if BLOOMERY_ATTN_WINDOW
+            live[j] = live[j] && key >= row_lo;
+#endif
             sv[j] = raw * a.scale;
             if (live[j]) {
                 tile_max = max(tile_max, sv[j]);
@@ -1449,6 +1549,13 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
     uint head = kv * BLOOMERY_ATTN_GQA + fm;
     bool whole = !unusable && running_l > 0.0f && isfinite(running_m);
     float inv = 1.0f / running_l;
+#if ATTN_GATE
+#if BLOOMERY_ATTN_HEAD_GATE
+    device float const *gate_row = hgate + (ulong)row * BLOOMERY_ATTN_Q;
+#else
+    device float const *gate_row = q + (ulong)row * args.q_stride;
+#endif
+#endif
     #pragma clang loop unroll(full)
     for (uint c = 0u; c < PF_DCHUNKS; ++c) {
         for (uint e = 0u; e < 2u; ++e) {
@@ -1459,8 +1566,8 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
                 continue;
             }
             float attn = acc[c].thread_elements()[e] * inv;
-#if BLOOMERY_ATTN_GATED
-            float g = q[(ulong)row * args.q_stride + head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim];
+#if ATTN_GATE
+            float g = attn_gate_value(gate_row, head, dim);
             float product = attn * attn_sigmoid(g);
             attn_commit(out, at, attn, g, product, faults, a.layer);
 #else

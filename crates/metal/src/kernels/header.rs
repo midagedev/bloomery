@@ -87,6 +87,8 @@ pub fn geometry_defines(g: &Geometry) -> String {
          #define BLOOMERY_ATTN_THREADS {athreads}\n\
          #define BLOOMERY_ATTN_LANE_DIMS {alanedims}\n\
          #define BLOOMERY_ATTN_GATED {agated}\n\
+         #define BLOOMERY_ATTN_HEAD_GATE {aheadgate}\n\
+         #define BLOOMERY_ATTN_WINDOW {awindow}\n\
          #define BLOOMERY_ATTN_SEGMENT_CAP {asegcap}\n\
          #define BLOOMERY_ATTN_PF_POSITIONS {apfpos}\n\
          #define BLOOMERY_ATTN_PF_KEYS {apfkeys}\n\
@@ -126,6 +128,8 @@ pub fn geometry_defines(g: &Geometry) -> String {
         athreads = g.attn.flash_threads,
         alanedims = g.attn.lane_dims,
         agated = u32::from(g.attn.gated),
+        aheadgate = u32::from(g.attn.head_gate),
+        awindow = u32::from(g.attn.windowed),
         asegcap = attention_geom::SEGMENT_CAP,
         apfpos = attention_geom::PREFILL_POSITIONS,
         apfkeys = attention_geom::PREFILL_KEYS,
@@ -228,6 +232,8 @@ mod tests {
             ("BLOOMERY_ATTN_THREADS", g.attn.flash_threads),
             ("BLOOMERY_ATTN_LANE_DIMS", g.attn.lane_dims),
             ("BLOOMERY_ATTN_GATED", usize::from(g.attn.gated)),
+            ("BLOOMERY_ATTN_HEAD_GATE", usize::from(g.attn.head_gate)),
+            ("BLOOMERY_ATTN_WINDOW", usize::from(g.attn.windowed)),
             ("BLOOMERY_ATTN_SEGMENT_CAP", attention_geom::SEGMENT_CAP),
             (
                 "BLOOMERY_ATTN_PF_POSITIONS",

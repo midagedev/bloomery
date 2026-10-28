@@ -16,6 +16,9 @@ pub struct Instance {
     /// The cargo feature a build whose host is this instance ([`HOST`]) is
     /// made with; none for the default build's.
     pub host_feature: Option<&'static str>,
+    /// Whether a model session opens files at this instance: false for a row
+    /// only the kernel gate compiles, whose family has no session yet.
+    pub opens: bool,
 }
 
 /// The axes an instance's kernels are compiled at: what a file's shape is
@@ -67,6 +70,9 @@ pub struct AttnAxes {
     pub rot: u32,
     /// `attn_q` writes a gate beside each head's query.
     pub q_gate: bool,
+    /// The output gate is one value a query head from a projection of its own
+    /// (`OutGate::ProjHead`): exclusive with `q_gate`.
+    pub head_gate: bool,
 }
 
 /// A gated delta layer's axes.
@@ -128,10 +134,12 @@ pub const QWEN35MOE_A3B: Instance = Instance {
             n_kv: 2,
             rot: 64,
             q_gate: true,
+            head_gate: false,
         },
         delta: Some(QWEN35_GDN),
     },
     host_feature: None,
+    opens: true,
 };
 
 /// Qwen3-30B-A3B's shape (`qwen3moe`): the softmax router over 128 experts
@@ -155,10 +163,12 @@ pub const QWEN3MOE_A3B: Instance = Instance {
             n_kv: 4,
             rot: 128,
             q_gate: false,
+            head_gate: false,
         },
         delta: None,
     },
     host_feature: Some("host-qwen3moe-a3b"),
+    opens: true,
 };
 
 /// Qwen3.6's shape with the delta net of [`GDN_48`]: the kernel gate's row of
@@ -171,6 +181,7 @@ pub const QWEN35MOE_GDN48: Instance = Instance {
         ..QWEN35MOE_A3B.key
     },
     host_feature: Some("host-qwen35moe-gdn48"),
+    opens: true,
 };
 
 /// Qwen3.6's shape with the attention layers of a dense Qwen3.8-27B: 24 heads
@@ -189,10 +200,12 @@ pub const QWEN35MOE_GQA6: Instance = Instance {
             n_kv: 4,
             rot: 64,
             q_gate: true,
+            head_gate: false,
         },
         ..QWEN35MOE_A3B.key
     },
     host_feature: Some("host-qwen35moe-gqa6"),
+    opens: true,
 };
 
 /// Qwen3.6's shape with the attention layers of a 9B-class model: 16 heads
@@ -209,10 +222,44 @@ pub const QWEN35MOE_GQA4: Instance = Instance {
             n_kv: 4,
             rot: 64,
             q_gate: true,
+            head_gate: false,
         },
         ..QWEN35MOE_A3B.key
     },
     host_feature: Some("host-qwen35moe-gqa4"),
+    opens: true,
+};
+
+/// Qwen3.6's shape with the attention layers of LFM3-1.7B: 16 heads over 4
+/// key heads of 128 values turned whole (four query heads a key head), a
+/// window each layer's launch names, and the output gate one value a head from
+/// a projection of its own. The kernel gate's row of the window, per-head gate
+/// and head-128 group-4 axes; every other axis is the one its clauses have a
+/// fixture for.
+pub const LFM3_ATTN: Instance = Instance {
+    name: "lfm3_attn",
+    key: Key {
+        attn: AttnAxes {
+            row: GqaInst {
+                head: 128,
+                value: 128,
+                pack: 4,
+                group: shape::GroupRule::One,
+                window: true,
+                sinks: false,
+                value_scale: false,
+                at: "metal/kernels/attention.metal (a window word, a per-head gate buffer)",
+            },
+            n_head: 16,
+            n_kv: 4,
+            rot: 128,
+            q_gate: false,
+            head_gate: true,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-lfm3-attn"),
+    opens: false,
 };
 
 /// Every instance `build.rs` writes and compiles. A shape with no row here
@@ -225,6 +272,7 @@ pub const REGISTERED: &[Instance] = &[
     QWEN35MOE_GDN48,
     QWEN35MOE_GQA6,
     QWEN35MOE_GQA4,
+    LFM3_ATTN,
 ];
 
 /// The name of an instance made at open for a shape no row registers. No
@@ -237,12 +285,14 @@ pub const UNREGISTERED: &str = "unregistered";
 /// build picks it by feature: Qwen3.6's by default, Qwen3-30B-A3B's under
 /// `host-qwen3moe-a3b`, the 48-value-head delta net's under
 /// `host-qwen35moe-gdn48`, the six-query-head group's under
-/// `host-qwen35moe-gqa6`, the four-query-head group's under `host-qwen35moe-gqa4`.
+/// `host-qwen35moe-gqa6`, the four-query-head group's under `host-qwen35moe-gqa4`,
+/// the windowed, per-head gated head-128 attention's under `host-lfm3-attn`.
 #[cfg(not(any(
     feature = "host-qwen3moe-a3b",
     feature = "host-qwen35moe-gdn48",
     feature = "host-qwen35moe-gqa6",
-    feature = "host-qwen35moe-gqa4"
+    feature = "host-qwen35moe-gqa4",
+    feature = "host-lfm3-attn"
 )))]
 pub const HOST: Instance = QWEN35MOE_A3B;
 
@@ -253,6 +303,10 @@ pub const HOST: Instance = QWEN35MOE_GQA6;
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-qwen35moe-gqa4")]
 pub const HOST: Instance = QWEN35MOE_GQA4;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-lfm3-attn")]
+pub const HOST: Instance = LFM3_ATTN;
 
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-qwen3moe-a3b")]
@@ -360,7 +414,13 @@ impl fmt::Display for Key {
             a.row.head,
             a.row.value,
             a.rot,
-            if a.q_gate { ", a gated query" } else { "" },
+            if a.q_gate {
+                ", a gated query"
+            } else if a.head_gate {
+                ", a per-head output gate"
+            } else {
+                ""
+            },
         )?;
         match &self.delta {
             Some(d) => write!(
@@ -466,6 +526,7 @@ impl Key {
                         n_kv: g.kv_heads,
                         rot: g.rope.dims,
                         q_gate: g.out_gate == OutGate::Packed,
+                        head_gate: false,
                     };
                     agree(&mut attn, axes, layer, "attention")?;
                 }
@@ -558,6 +619,7 @@ pub fn open_key(key: Key) -> Result<&'static Instance, Refused> {
         name: UNREGISTERED,
         key,
         host_feature: None,
+        opens: true,
     };
     Geometry::of(&made)
         .check()

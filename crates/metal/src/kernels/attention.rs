@@ -19,6 +19,17 @@
 //! [`Kernels::attention_prefill`] is the same chunk run by the prefill
 //! kernel: simdgroup matrices over tiles of keys, held to the decode launch by
 //! a band rather than by bits.
+//!
+//! What differs layer to layer inside one instance is [`AttnLayer`]: the
+//! window the layer attends (the last `window` of its live keys; a layer with
+//! none attends every key) and, for an instance whose output gate is one value
+//! a query head, the gate's window. The launches without a layer argument
+//! launch [`AttnLayer::full`]. The keys of a windowed layer are the last
+//! `window` of the live ones, so its split-K segments are those of
+//! [`segments_for_window`]: a segment holding no key of the window is never
+//! launched, and one a caller counts anyway is empty and skipped by the fold.
+//! The store is the planar cache of every position; the window only cuts what
+//! the launch reads.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -30,9 +41,10 @@ use std::sync::OnceLock;
 use crate::library::{Library, Pipeline};
 
 use super::rows::check_strided;
-use super::{Kernels, args_bytes, check_window_len, pack, word};
+use super::{Kernels, args_bytes, check_window_len, word};
 use crate::geom::{AttnGeom, HOST_GEOMETRY};
 
+pub use super::attention_geom::segments_for_window;
 pub use super::attention_geom::{
     HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP, SEGMENT_KEYS, TILE,
     segments_for_keys,
@@ -59,6 +71,30 @@ pub enum AttnCache<'w> {
         /// Value scales, f16 bits.
         v_scales: WindowMut<'w, u16, MetalDevice>,
     },
+}
+
+/// What one layer adds to an attention launch beyond the instance's shape.
+pub struct AttnLayer<'w> {
+    /// The layer attends the last `window` of its live keys; `None` attends
+    /// every key. Only an instance whose flash row cuts a window
+    /// (`AttnGeom::windowed`) takes one, and a window of 0 keys is refused.
+    pub window: Option<u32>,
+    /// The raw per-head gate values, `[rows][query heads]`, before the
+    /// sigmoid. Held exactly when the instance's output gate is one value a
+    /// query head (`AttnGeom::head_gate`).
+    pub head_gate: Option<Window<'w, f32, MetalDevice>>,
+}
+
+impl AttnLayer<'_> {
+    /// The layer of a launch with no layer argument: every key, no per-head
+    /// gate.
+    #[must_use]
+    pub const fn full() -> Self {
+        AttnLayer {
+            window: None,
+            head_gate: None,
+        }
+    }
 }
 
 /// One attention launch. A key count of 0 or past `ctx`, and an append
@@ -240,11 +276,73 @@ fn refuse(detail: String) -> DeviceError {
     }
 }
 
-struct Checked {
-    args: [[u8; 4]; 7],
+/// The window word `layer` launches, refused by name when the instance cannot
+/// take the layer: a window its flash row does not cut or of no keys, a
+/// per-head gate window the instance has none for, or none where it gates per
+/// head, or one of another length than `rows` rows of the query heads.
+fn check_layer(
+    what: &'static str,
+    g: &AttnGeom,
+    layer: &AttnLayer<'_>,
+    rows: usize,
+) -> Result<u32, DeviceError> {
+    let refuse = |detail: String| refuse_in(what, detail);
+    let window = match layer.window {
+        None => 0,
+        Some(0) => {
+            return Err(refuse(
+                "a window of 0 keys: a layer attends its own key at least, and none is None"
+                    .to_string(),
+            ));
+        }
+        Some(w) if g.windowed => w,
+        Some(w) => {
+            return Err(refuse(format!(
+                "a window of {w} keys, the instance's flash row cuts no window"
+            )));
+        }
+    };
+    match (&layer.head_gate, g.head_gate) {
+        (Some(gate), true) => {
+            let need = rows
+                .checked_mul(g.query_heads)
+                .ok_or_else(|| refuse("the head gate length wraps".to_string()))?;
+            check_window_len(what, "head gate", gate.len(), need)?;
+        }
+        (None, true) => {
+            return Err(refuse(
+                "the instance gates per head, the launch holds no head gate window".to_string(),
+            ));
+        }
+        (Some(_), false) => {
+            return Err(refuse(
+                "a head gate window, the instance has no per-head gate".to_string(),
+            ));
+        }
+        (None, false) => {}
+    }
+    Ok(window)
 }
 
-fn checked(g: &AttnGeom, p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
+/// The launch's argument words, then the layer's window when the instance's
+/// flash takes one.
+fn with_window(words: &[[u8; 4]], g: &AttnGeom, window: u32) -> Vec<[u8; 4]> {
+    let mut out = words.to_vec();
+    if g.windowed {
+        out.push(window.to_ne_bytes());
+    }
+    out
+}
+
+struct Checked {
+    args: Vec<[u8; 4]>,
+}
+
+fn checked(
+    g: &AttnGeom,
+    p: &AttentionParams<'_>,
+    layer: &AttnLayer<'_>,
+) -> Result<Checked, DeviceError> {
     if p.head_dim != g.head {
         return Err(refuse(format!(
             "head dim {}, the kernel takes {}",
@@ -352,6 +450,7 @@ fn checked(g: &AttnGeom, p: &AttentionParams<'_>) -> Result<Checked, DeviceError
     // takes the segment count itself.
     let segments = word("attention", "segments", p.segments)?;
     let ctx = word("attention", "ctx", p.ctx)?;
+    let window = check_layer("attention", g, layer, 1)?;
     let args = args_bytes([
         segments,
         ctx,
@@ -361,13 +460,16 @@ fn checked(g: &AttnGeom, p: &AttentionParams<'_>) -> Result<Checked, DeviceError
         p.pos,
         p.n_keys,
     ]);
-    Ok(Checked { args })
+    Ok(Checked {
+        args: with_window(&args, g, window),
+    })
 }
 
 fn bind_flash(
     encoder: &mut ComputeEncoder<'_>,
     p: &AttentionParams<'_>,
-    args: &[[u8; 4]; 7],
+    args: &[[u8; 4]],
+    layer: &AttnLayer<'_>,
 ) -> Result<(), DeviceError> {
     encoder.set_binding(0, Binding::of(&p.q)?)?;
     encoder.set_binding(1, Binding::of(&p.k)?)?;
@@ -381,9 +483,12 @@ fn bind_flash(
             encoder.set_binding(7, Binding::of_mut(v)?)?;
             encoder.set_binding(8, Binding::of_mut(&p.partials)?)?;
             encoder.set_binding(9, Binding::of_mut(&p.out)?)?;
-            encoder.set_binding(10, Binding::bytes(pack(args))?)?;
+            encoder.set_binding(10, Binding::bytes(args.as_flattened())?)?;
             encoder.set_binding(11, p.fault.binding())?;
             encoder.set_binding(12, Binding::of_mut(&p.ticket)?)?;
+            if let Some(gate) = &layer.head_gate {
+                encoder.set_binding(13, Binding::of(gate)?)?;
+            }
         }
         AttnCache::Q8 {
             k_codes,
@@ -397,9 +502,12 @@ fn bind_flash(
             encoder.set_binding(9, Binding::of_mut(v_scales)?)?;
             encoder.set_binding(10, Binding::of_mut(&p.partials)?)?;
             encoder.set_binding(11, Binding::of_mut(&p.out)?)?;
-            encoder.set_binding(12, Binding::bytes(pack(args))?)?;
+            encoder.set_binding(12, Binding::bytes(args.as_flattened())?)?;
             encoder.set_binding(13, p.fault.binding())?;
             encoder.set_binding(14, Binding::of_mut(&p.ticket)?)?;
+            if let Some(gate) = &layer.head_gate {
+                encoder.set_binding(15, Binding::of(gate)?)?;
+            }
         }
     }
     Ok(())
@@ -413,18 +521,32 @@ impl Kernels {
         self.attention.prefill().map(|_| ())
     }
 
-    /// Encode the flash. One dispatch, which past one segment also folds
-    /// the partials and writes the gated output. A shape the kernel does
-    /// not take, or a window that is not that shape, is refused by name and
-    /// nothing is encoded.
+    /// Encode the flash of a layer that attends every key. An instance that
+    /// gates per head refuses it by name: its launches name the gate
+    /// ([`Kernels::attention_flash_layer`]).
     #[must_use = "a refused launch encoded nothing"]
     pub fn attention_flash(
         &self,
         encoder: &mut ComputeEncoder<'_>,
         p: AttentionParams<'_>,
     ) -> Result<(), DeviceError> {
+        self.attention_flash_layer(encoder, p, AttnLayer::full())
+    }
+
+    /// Encode the flash. One dispatch, which past one segment also folds
+    /// the partials and writes the gated output. A shape the kernel does
+    /// not take, or a window that is not that shape, is refused by name and
+    /// nothing is encoded. `layer` names the keys the layer attends and its
+    /// per-head gate.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn attention_flash_layer(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: AttentionParams<'_>,
+        layer: AttnLayer<'_>,
+    ) -> Result<(), DeviceError> {
         let g = &self.geom.attn;
-        let checked = checked(g, &p)?;
+        let checked = checked(g, &p, &layer)?;
         let pipeline = match &p.cache {
             AttnCache::F16 { .. } => &self.attention.f16,
             AttnCache::Q8 { .. } => &self.attention.q8,
@@ -434,7 +556,7 @@ impl Kernels {
             .checked_mul(p.segments)
             .ok_or_else(|| refuse("the flash grid wraps".to_string()))?;
         encoder.set_pipeline(pipeline);
-        bind_flash(encoder, &p, &checked.args)?;
+        bind_flash(encoder, &p, &checked.args, &layer)?;
         encoder.dispatch_groups(groups, 1, g.flash_threads)
     }
 }
@@ -537,16 +659,18 @@ struct ChunkView<'a, 'w> {
 }
 
 impl ChunkView<'_, '_> {
-    /// The rows launches' argument words, in `AttnRowsArgs`' order.
+    /// The rows launches' argument words, in `AttnRowsArgs`' order, then the
+    /// layer's window when the instance's flash takes one.
     fn words(
         &self,
         g: &AttnGeom,
         segments: usize,
         layer: u32,
         eps: f32,
-    ) -> Result<[[u8; 4]; 11], DeviceError> {
+        window: u32,
+    ) -> Result<Vec<[u8; 4]>, DeviceError> {
         let what = self.what;
-        Ok(args_bytes([
+        let words = args_bytes([
             word(what, "segments", segments)?,
             word(what, "ctx", self.ctx)?,
             layer,
@@ -558,7 +682,8 @@ impl ChunkView<'_, '_> {
             word(what, "the k stride", self.k_stride)?,
             word(what, "the v stride", self.v_stride)?,
             word(what, "the out stride", self.out_stride)?,
-        ]))
+        ]);
+        Ok(with_window(&words, g, window))
     }
 }
 
@@ -674,7 +799,11 @@ fn rows_view<'a, 'w>(p: &'a AttentionRowsParams<'w>) -> ChunkView<'a, 'w> {
     }
 }
 
-fn checked_rows(g: &AttnGeom, p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 11], DeviceError> {
+fn checked_rows(
+    g: &AttnGeom,
+    p: &AttentionRowsParams<'_>,
+    layer: &AttnLayer<'_>,
+) -> Result<Vec<[u8; 4]>, DeviceError> {
     if p.segments == 0 {
         return Err(refuse_in(ROWS_WHAT, "segments of 0".to_string()));
     }
@@ -708,7 +837,8 @@ fn checked_rows(g: &AttnGeom, p: &AttentionRowsParams<'_>) -> Result<[[u8; 4]; 1
             "the ticket word is not 4-byte aligned".to_string(),
         ));
     }
-    view.words(g, p.segments, p.layer, p.eps)
+    let window = check_layer(ROWS_WHAT, g, layer, p.rows)?;
+    view.words(g, p.segments, p.layer, p.eps, window)
 }
 
 /// One prefill attention launch over a chunk of `rows` causal queries on the
@@ -772,7 +902,8 @@ pub struct AttentionPrefillParams<'w> {
 fn checked_prefill(
     g: &AttnGeom,
     p: &AttentionPrefillParams<'_>,
-) -> Result<[[u8; 4]; 11], DeviceError> {
+    layer: &AttnLayer<'_>,
+) -> Result<Vec<[u8; 4]>, DeviceError> {
     let view = ChunkView {
         what: PREFILL_WHAT,
         head_dim: p.head_dim,
@@ -795,25 +926,40 @@ fn checked_prefill(
         out_stride: p.out_stride,
     };
     check_chunk(g, &view)?;
+    let window = check_layer(PREFILL_WHAT, g, layer, p.rows)?;
     // The append dispatch's span rule takes one segment: the prefill has no split.
-    view.words(g, 1, p.layer, p.eps)
+    view.words(g, 1, p.layer, p.eps, window)
 }
 
 impl Kernels {
-    /// Encode the attention over a chunk of rows: the append of every row's
-    /// key and value, a memory barrier, and the flash with a row grid
-    /// dimension. A shape the kernels do not take, or a window that is not
-    /// that shape, is refused by name and nothing is encoded. The two
-    /// dispatches are one group each, the barrier the flash's order after the
-    /// appends.
+    /// Encode the rows launch of a layer that attends every key. An instance
+    /// that gates per head refuses it by name
+    /// ([`Kernels::attention_rows_layer`]).
     #[must_use = "a refused launch encoded nothing"]
     pub fn attention_rows(
         &self,
         encoder: &mut ComputeEncoder<'_>,
         p: AttentionRowsParams<'_>,
     ) -> Result<(), DeviceError> {
+        self.attention_rows_layer(encoder, p, AttnLayer::full())
+    }
+
+    /// Encode the attention over a chunk of rows: the append of every row's
+    /// key and value, a memory barrier, and the flash with a row grid
+    /// dimension. A shape the kernels do not take, or a window that is not
+    /// that shape, is refused by name and nothing is encoded. The two
+    /// dispatches are one group each, the barrier the flash's order after the
+    /// appends. `layer` names the keys the layer attends and its per-head
+    /// gate, one row of the query heads' values a row of the chunk.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn attention_rows_layer(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: AttentionRowsParams<'_>,
+        layer: AttnLayer<'_>,
+    ) -> Result<(), DeviceError> {
         let g = &self.geom.attn;
-        let args = checked_rows(g, &p)?;
+        let args = checked_rows(g, &p, &layer)?;
         let AttnCache::F16 {
             k: cache_k,
             v: cache_v,
@@ -828,7 +974,7 @@ impl Kernels {
         encoder.set_binding(3, Binding::of(&p.rope)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
-        encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
+        encoder.set_binding(6, Binding::bytes(args.as_flattened())?)?;
         encoder.set_binding(7, p.fault.binding())?;
         encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
@@ -845,9 +991,12 @@ impl Kernels {
         encoder.set_binding(4, Binding::of_mut(cache_v)?)?;
         encoder.set_binding(5, Binding::of_mut(&p.partials)?)?;
         encoder.set_binding(6, Binding::of_mut(&p.out)?)?;
-        encoder.set_binding(7, Binding::bytes(pack(&args))?)?;
+        encoder.set_binding(7, Binding::bytes(args.as_flattened())?)?;
         encoder.set_binding(8, p.fault.binding())?;
         encoder.set_binding(9, Binding::of_mut(&p.ticket)?)?;
+        if let Some(gate) = &layer.head_gate {
+            encoder.set_binding(10, Binding::of(gate)?)?;
+        }
         encoder.dispatch_groups(groups, p.rows, g.flash_threads)
     }
 
@@ -858,21 +1007,37 @@ impl Kernels {
         self.attention.prefill().map(|_| ())
     }
 
-    /// Encode the prefill attention over a chunk of rows: the append of every
-    /// row's key and value (the rows launch's own), a memory barrier, and the
-    /// simdgroup-matrix flash, one threadgroup a key head and
-    /// [`PREFILL_POSITIONS`] positions. A shape the kernels do not take, or a
-    /// window that is not that shape, is refused by name and nothing is
-    /// encoded. The rows are within a band of the decode launch's, not its
-    /// bits.
+    /// Encode the prefill launch of a layer that attends every key. An
+    /// instance that gates per head refuses it by name
+    /// ([`Kernels::attention_prefill_layer`]).
     #[must_use = "a refused launch encoded nothing"]
     pub fn attention_prefill(
         &self,
         encoder: &mut ComputeEncoder<'_>,
         p: AttentionPrefillParams<'_>,
     ) -> Result<(), DeviceError> {
+        self.attention_prefill_layer(encoder, p, AttnLayer::full())
+    }
+
+    /// Encode the prefill attention over a chunk of rows: the append of every
+    /// row's key and value (the rows launch's own), a memory barrier, and the
+    /// simdgroup-matrix flash, one threadgroup a key head and
+    /// [`PREFILL_POSITIONS`] positions. A shape the kernels do not take, or a
+    /// window that is not that shape, is refused by name and nothing is
+    /// encoded. The rows are within a band of the decode launch's, not its
+    /// bits. `layer` names the keys the layer attends and its per-head gate,
+    /// one row of the query heads' values a row of the chunk. The flash starts
+    /// at the tile of the first window of each block of positions, so the
+    /// tiles before every window of the block are never read.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn attention_prefill_layer(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: AttentionPrefillParams<'_>,
+        layer: AttnLayer<'_>,
+    ) -> Result<(), DeviceError> {
         let g = &self.geom.attn;
-        let args = checked_prefill(g, &p)?;
+        let args = checked_prefill(g, &p, &layer)?;
         let flash = self.attention.prefill()?;
         let AttnCache::F16 {
             k: cache_k,
@@ -888,7 +1053,7 @@ impl Kernels {
         encoder.set_binding(3, Binding::of(&p.rope)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
-        encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
+        encoder.set_binding(6, Binding::bytes(args.as_flattened())?)?;
         encoder.set_binding(7, p.fault.binding())?;
         encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
@@ -900,8 +1065,11 @@ impl Kernels {
         encoder.set_binding(3, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_v)?)?;
         encoder.set_binding(5, Binding::of_mut(&p.out)?)?;
-        encoder.set_binding(6, Binding::bytes(pack(&args))?)?;
+        encoder.set_binding(6, Binding::bytes(args.as_flattened())?)?;
         encoder.set_binding(7, p.fault.binding())?;
+        if let Some(gate) = &layer.head_gate {
+            encoder.set_binding(8, Binding::of(gate)?)?;
+        }
         let blocks = p.rows.div_ceil(PREFILL_POSITIONS);
         encoder.dispatch_groups(blocks, g.kv_heads, PREFILL_THREADS)
     }

@@ -87,6 +87,11 @@ pub struct AttnGeom {
     pub scale: f32,
     /// The query projection writes a gate beside each head's query.
     pub gated: bool,
+    /// The flash cuts a window a launch names.
+    pub windowed: bool,
+    /// The layer's output gate is one value a query head, from a projection
+    /// of its own that the launch binds.
+    pub head_gate: bool,
 }
 
 /// The numbers of the gated delta step for one instance: its own axes, or the
@@ -229,6 +234,8 @@ impl Geometry {
                 flash_threads: attention_geom::flash_threads(inst),
                 scale: attention_geom::scale_of(head),
                 gated: key.attn.q_gate,
+                windowed: attention_geom::windowed(inst),
+                head_gate: attention_geom::head_gate(inst),
             },
             delta: DeltaGeom {
                 value_heads,
@@ -527,6 +534,8 @@ mod tests {
             assert_eq!(a.qg_stride, a.head * (1 + gate), "{name}: qg stride");
             assert_eq!(a.flash_threads, 32 * a.simd_groups, "{name}: flash threads");
             assert_eq!(a.gated, key.attn.q_gate, "{name}: gated");
+            assert_eq!(a.windowed, key.attn.row.window, "{name}: windowed");
+            assert_eq!(a.head_gate, key.attn.head_gate, "{name}: head gate");
             let ik = 1.0f32 / (a.head as f32).sqrt();
             assert_eq!(a.scale.to_bits(), ik.to_bits(), "{name}: scale");
 

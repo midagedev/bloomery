@@ -1755,7 +1755,7 @@ mod tests {
     /// the row's head is refused by name at the row's own width.
     #[test]
     fn each_registered_instance_is_judged_at_its_own_geometry() {
-        for inst in instance::REGISTERED {
+        for inst in instance::REGISTERED.iter().filter(|i| i.opens) {
             let name = inst.name;
             let t = Synthetic::of(inst);
             let out = check(&t.split(), CTX);

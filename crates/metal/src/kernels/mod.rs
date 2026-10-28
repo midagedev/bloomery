@@ -46,6 +46,7 @@ pub use attention::{
     SEGMENT_CAP, SEGMENT_KEYS, TILE, f16_len, out_len, partials_len, q8_code_len, q8_scale_len,
     qg_len, segments_for_keys,
 };
+pub use attention::{AttnLayer, segments_for_window};
 pub use delta::DeltaParams;
 pub use delta::DeltaRowStrides;
 pub use delta::DeltaRowsParams;
