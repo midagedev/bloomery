@@ -324,18 +324,40 @@ fn check_layer(
     Ok(window)
 }
 
+/// The most argument words an attention launch sends: the rows launches'
+/// eleven and the layer's window.
+const MAX_ARG_WORDS: usize = 12;
+
+/// An attention launch's argument words, each in the machine's byte order:
+/// the launch sends `words[..len]`.
+struct LaunchArgs {
+    words: [[u8; 4]; MAX_ARG_WORDS],
+    len: usize,
+}
+
+impl LaunchArgs {
+    /// The bytes the launch binds.
+    fn bytes(&self) -> &[u8] {
+        self.words[..self.len].as_flattened()
+    }
+}
+
 /// The launch's argument words, then the layer's window when the instance's
 /// flash takes one.
-fn with_window(words: &[[u8; 4]], g: &AttnGeom, window: u32) -> Vec<[u8; 4]> {
-    let mut out = words.to_vec();
+fn with_window<const N: usize>(words: [[u8; 4]; N], g: &AttnGeom, window: u32) -> LaunchArgs {
+    const { assert!(N < MAX_ARG_WORDS, "no room for the window word") };
+    let mut out = [[0; 4]; MAX_ARG_WORDS];
+    out[..N].copy_from_slice(&words);
+    let mut len = N;
     if g.windowed {
-        out.push(window.to_ne_bytes());
+        out[len] = window.to_ne_bytes();
+        len += 1;
     }
-    out
+    LaunchArgs { words: out, len }
 }
 
 struct Checked {
-    args: Vec<[u8; 4]>,
+    args: LaunchArgs,
 }
 
 fn checked(
@@ -461,14 +483,14 @@ fn checked(
         p.n_keys,
     ]);
     Ok(Checked {
-        args: with_window(&args, g, window),
+        args: with_window(args, g, window),
     })
 }
 
 fn bind_flash(
     encoder: &mut ComputeEncoder<'_>,
     p: &AttentionParams<'_>,
-    args: &[[u8; 4]],
+    args: &[u8],
     layer: &AttnLayer<'_>,
 ) -> Result<(), DeviceError> {
     encoder.set_binding(0, Binding::of(&p.q)?)?;
@@ -483,7 +505,7 @@ fn bind_flash(
             encoder.set_binding(7, Binding::of_mut(v)?)?;
             encoder.set_binding(8, Binding::of_mut(&p.partials)?)?;
             encoder.set_binding(9, Binding::of_mut(&p.out)?)?;
-            encoder.set_binding(10, Binding::bytes(args.as_flattened())?)?;
+            encoder.set_binding(10, Binding::bytes(args)?)?;
             encoder.set_binding(11, p.fault.binding())?;
             encoder.set_binding(12, Binding::of_mut(&p.ticket)?)?;
             if let Some(gate) = &layer.head_gate {
@@ -502,7 +524,7 @@ fn bind_flash(
             encoder.set_binding(9, Binding::of_mut(v_scales)?)?;
             encoder.set_binding(10, Binding::of_mut(&p.partials)?)?;
             encoder.set_binding(11, Binding::of_mut(&p.out)?)?;
-            encoder.set_binding(12, Binding::bytes(args.as_flattened())?)?;
+            encoder.set_binding(12, Binding::bytes(args)?)?;
             encoder.set_binding(13, p.fault.binding())?;
             encoder.set_binding(14, Binding::of_mut(&p.ticket)?)?;
             if let Some(gate) = &layer.head_gate {
@@ -556,7 +578,7 @@ impl Kernels {
             .checked_mul(p.segments)
             .ok_or_else(|| refuse("the flash grid wraps".to_string()))?;
         encoder.set_pipeline(pipeline);
-        bind_flash(encoder, &p, &checked.args, &layer)?;
+        bind_flash(encoder, &p, checked.args.bytes(), &layer)?;
         encoder.dispatch_groups(groups, 1, g.flash_threads)
     }
 }
@@ -668,7 +690,7 @@ impl ChunkView<'_, '_> {
         layer: u32,
         eps: f32,
         window: u32,
-    ) -> Result<Vec<[u8; 4]>, DeviceError> {
+    ) -> Result<LaunchArgs, DeviceError> {
         let what = self.what;
         let words = args_bytes([
             word(what, "segments", segments)?,
@@ -683,7 +705,7 @@ impl ChunkView<'_, '_> {
             word(what, "the v stride", self.v_stride)?,
             word(what, "the out stride", self.out_stride)?,
         ]);
-        Ok(with_window(&words, g, window))
+        Ok(with_window(words, g, window))
     }
 }
 
@@ -803,7 +825,7 @@ fn checked_rows(
     g: &AttnGeom,
     p: &AttentionRowsParams<'_>,
     layer: &AttnLayer<'_>,
-) -> Result<Vec<[u8; 4]>, DeviceError> {
+) -> Result<LaunchArgs, DeviceError> {
     if p.segments == 0 {
         return Err(refuse_in(ROWS_WHAT, "segments of 0".to_string()));
     }
@@ -903,7 +925,7 @@ fn checked_prefill(
     g: &AttnGeom,
     p: &AttentionPrefillParams<'_>,
     layer: &AttnLayer<'_>,
-) -> Result<Vec<[u8; 4]>, DeviceError> {
+) -> Result<LaunchArgs, DeviceError> {
     let view = ChunkView {
         what: PREFILL_WHAT,
         head_dim: p.head_dim,
@@ -974,7 +996,7 @@ impl Kernels {
         encoder.set_binding(3, Binding::of(&p.rope)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
-        encoder.set_binding(6, Binding::bytes(args.as_flattened())?)?;
+        encoder.set_binding(6, Binding::bytes(args.bytes())?)?;
         encoder.set_binding(7, p.fault.binding())?;
         encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
@@ -991,7 +1013,7 @@ impl Kernels {
         encoder.set_binding(4, Binding::of_mut(cache_v)?)?;
         encoder.set_binding(5, Binding::of_mut(&p.partials)?)?;
         encoder.set_binding(6, Binding::of_mut(&p.out)?)?;
-        encoder.set_binding(7, Binding::bytes(args.as_flattened())?)?;
+        encoder.set_binding(7, Binding::bytes(args.bytes())?)?;
         encoder.set_binding(8, p.fault.binding())?;
         encoder.set_binding(9, Binding::of_mut(&p.ticket)?)?;
         if let Some(gate) = &layer.head_gate {
@@ -1053,7 +1075,7 @@ impl Kernels {
         encoder.set_binding(3, Binding::of(&p.rope)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
-        encoder.set_binding(6, Binding::bytes(args.as_flattened())?)?;
+        encoder.set_binding(6, Binding::bytes(args.bytes())?)?;
         encoder.set_binding(7, p.fault.binding())?;
         encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
@@ -1065,7 +1087,7 @@ impl Kernels {
         encoder.set_binding(3, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_v)?)?;
         encoder.set_binding(5, Binding::of_mut(&p.out)?)?;
-        encoder.set_binding(6, Binding::bytes(args.as_flattened())?)?;
+        encoder.set_binding(6, Binding::bytes(args.bytes())?)?;
         encoder.set_binding(7, p.fault.binding())?;
         if let Some(gate) = &layer.head_gate {
             encoder.set_binding(8, Binding::of(gate)?)?;

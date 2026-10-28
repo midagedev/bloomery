@@ -20,10 +20,14 @@ use crate::fault::MetalFaultWord;
 use crate::library::Pipeline;
 
 use super::rows::check_strided;
-use super::{Kernels, WeightAlign, check_weights_align, check_window_len, word};
+use super::{Kernels, WeightAlign, args_bytes, check_weights_align, check_window_len, word};
 
 const WHAT: &str = "norm rows";
 const WHAT_ADD: &str = "norm add rows";
+
+/// The argument words both norm kernels take: cols, layer, eps and the two
+/// strides.
+const SHARED_WORDS: usize = 5;
 
 /// The norm of `rows` rows of `cols` values.
 pub struct NormRowsParams<'w> {
@@ -134,23 +138,22 @@ impl Kernels {
         ] {
             check_weights_align(what, name, start, WeightAlign::Float4)?;
         }
-        let mut words = vec![
+        // The add scale is the sixth word, sent only by the sandwich residual.
+        let args = args_bytes([
             word(what, "cols", p.cols)?,
             p.layer,
             p.eps.to_bits(),
             word(what, "the x stride", p.x_stride)?,
             word(what, "the y stride", p.y_stride)?,
-        ];
-        if let Some(add) = add {
-            words.push(add.to_bits());
-        }
-        let args: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            add.map_or(0, f32::to_bits),
+        ]);
+        let sent = &args[..SHARED_WORDS + usize::from(add.is_some())];
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of(&p.gain)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
-        slot.set(Binding::bytes(&args)?)?;
+        slot.set(Binding::bytes(sent.as_flattened())?)?;
         slot.set(p.fault.binding())?;
         slot.dispatch_groups(p.rows, 1, self.router_threads())
     }

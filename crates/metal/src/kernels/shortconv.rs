@@ -219,7 +219,11 @@ impl Kernels {
         };
         check(&shape, &held, "slots")?;
         let args = arg_words(&shape, p.layer, 0)?;
-        let pos: Vec<u8> = p.pos.iter().flat_map(|q| q.to_ne_bytes()).collect();
+        // A count past MAX_SLOTS is refused above, so every position has a lane.
+        let mut pos = [[0u8; 4]; MAX_SLOTS];
+        for (lane, q) in pos.iter_mut().zip(p.pos) {
+            *lane = q.to_ne_bytes();
+        }
         encoder.set_pipeline(&self.shortconv.step);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.bcx)?)?;
@@ -227,7 +231,7 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.ring)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
-        slot.set(Binding::bytes(&pos)?)?;
+        slot.set(Binding::bytes(pos[..slots].as_flattened())?)?;
         slot.set(p.faults.binding())?;
         slot.dispatch_groups(groups(p.hidden), slots, THREADS)
     }
