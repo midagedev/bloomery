@@ -4,10 +4,14 @@
 //! the caller supplies absolute positions and causal counts, and exchanges only cache planes
 //! between slots. Ring appends are cut to `capacity - window + 1` rows before attention, so
 //! a later row never overwrites a key still readable by the first row of the chunk.
+//!
+//! The flash takes eight or four query heads a key head, with or without per-head sinks. The
+//! rope table the caller passes to [`Binding::enqueue`] is built from the layer's own `Rope`,
+//! factors included when the layer has them: the kernels read the table, whatever made it.
 
 use crate::attention_h128_ring;
-use crate::flash_gqa::{GROUP, HEAD, window_segments};
-use crate::flash_gqa_h128_swa::{H128SwaArgs, H128SwaKernels};
+use crate::flash_gqa::{HEAD, window_segments};
+use crate::flash_gqa_h128_swa::{H128SwaArgs, H128SwaKernels, served_group};
 use crate::gemm::{GEMM_MAX_SLOTS, Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
 use crate::qk_rms::{QkRmsArgs, QkRmsKernels};
 use crate::rope_neox::{NeoxArgs, RopeNeoxKernels};
@@ -17,7 +21,7 @@ use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
-use model::arch::models::{LayerSpec, Mixer, OutGate, RopeMode};
+use model::arch::models::{Gqa, LayerSpec, Mixer, OutGate, RopeMode};
 use model::arch::names;
 use model::placement::kernels::attention::{Forms, Head128Scratch};
 
@@ -83,7 +87,7 @@ impl Projection {
     }
 }
 
-/// A layer's loaded sites, gains, sinks, and independent attention policies.
+/// A layer's loaded sites, gains, optional sinks, and independent attention policies.
 pub struct Binding {
     layer: usize,
     hidden: usize,
@@ -97,7 +101,7 @@ pub struct Binding {
     norm: String,
     qnorm: String,
     knorm: String,
-    sinks: String,
+    sinks: Option<String>,
     q: Projection,
     k: Projection,
     v: Projection,
@@ -123,6 +127,83 @@ fn vector(file: &Split, w: &Weights, name: String, len: usize) -> Result<String,
     site::vector(w, WHAT, name, len)
 }
 
+/// What the kernels run of one layer's description, once every field they do not run is
+/// refused by name.
+#[derive(Debug, PartialEq, Eq)]
+struct Admitted {
+    heads: usize,
+    kv: usize,
+    window: usize,
+    capacity: usize,
+    rotate: bool,
+    sinks: bool,
+}
+
+fn admit(layer: usize, g: &Gqa, hidden: usize, eps: f32, ctx: usize) -> Result<Admitted, GpuError> {
+    let heads = g.heads as usize;
+    let kv = g.kv_heads as usize;
+    // The table is the caller's, so a layer with rope factors is the same rotation launch
+    // as one without: only the values in the table differ.
+    let rotate = match g.rope.mode {
+        RopeMode::None if g.rope.dims == 0 && g.rope.yarn.is_none() && !g.rope.factors => false,
+        RopeMode::Neox
+            if g.rope.dims as usize == HEAD
+                && g.rope.yarn.is_none()
+                && g.rope.base.is_finite()
+                && g.rope.base > 0.0 =>
+        {
+            true
+        }
+        _ => {
+            return Err(GpuError::shape(
+                WHAT,
+                "need NoPE or whole-head NeoX without YaRN",
+            ));
+        }
+    };
+    if g.out_gate != OutGate::None {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {layer} has output gate {:?}; the gate is the output-gate kernel's launch, \
+                 which this binding does not run",
+                g.out_gate
+            ),
+        ));
+    }
+    let window = g.window.map_or(0, |n| n as usize);
+    if hidden == 0
+        || ctx == 0
+        || u32::try_from(ctx).is_err()
+        || kv == 0
+        || served_group(heads, kv).is_none()
+        || g.head_dim as usize != HEAD
+        || g.value_dim as usize != HEAD
+        || !g.qk_norm
+        || g.o_norm
+        || g.select.is_some()
+        || g.value_scale.is_some()
+        || !eps.is_finite()
+        || eps <= 0.0
+        || g.window == Some(0)
+    {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("unsupported head128 layer {layer}: {g:?}"),
+        ));
+    }
+    // The same capacity owner sizes the plan and the physical allocation.
+    let capacity = runtime::stores::Rows::Ring.count(g.window.map(u64::from), ctx as u64) as usize;
+    Ok(Admitted {
+        heads,
+        kv,
+        window,
+        capacity,
+        rotate,
+        sinks: g.sinks,
+    })
+}
+
 impl Binding {
     /// Bind actual file and resident formats once. No architecture-name dispatch is involved.
     #[allow(
@@ -141,67 +222,31 @@ impl Binding {
         let Mixer::Gqa(g) = &spec.mixer else {
             return Err(GpuError::shape(WHAT, "a GQA layer is required"));
         };
-        let heads = g.heads as usize;
-        let kv = g.kv_heads as usize;
-        let rotate = match g.rope.mode {
-            RopeMode::None if g.rope.dims == 0 && g.rope.yarn.is_none() && !g.rope.factors => false,
-            RopeMode::Neox
-                if g.rope.dims as usize == HEAD
-                    && g.rope.yarn.is_none()
-                    && !g.rope.factors
-                    && g.rope.base.is_finite()
-                    && g.rope.base > 0.0 =>
-            {
-                true
-            }
-            _ => return Err(GpuError::shape(WHAT, "need NoPE or whole-head plain NeoX")),
-        };
-        let window = g.window.map_or(0, |n| n as usize);
-        if hidden == 0
-            || ctx == 0
-            || u32::try_from(ctx).is_err()
-            || kv == 0
-            || kv.checked_mul(GROUP) != Some(heads)
-            || g.head_dim as usize != HEAD
-            || g.value_dim as usize != HEAD
-            || !g.qk_norm
-            || !g.sinks
-            || g.o_norm
-            || g.out_gate != OutGate::None
-            || g.select.is_some()
-            || g.value_scale.is_some()
-            || !eps.is_finite()
-            || eps <= 0.0
-            || g.window == Some(0)
-        {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("unsupported head128 layer {layer}: {g:?}"),
-            ));
-        }
-        // The same capacity owner sizes the plan and the physical allocation.
-        let capacity =
-            runtime::stores::Rows::Ring.count(g.window.map(u64::from), ctx as u64) as usize;
-        let qwidth = heads
+        let a = admit(layer, g, hidden, eps, ctx)?;
+        let qwidth = a
+            .heads
             .checked_mul(HEAD)
             .ok_or_else(|| GpuError::shape(WHAT, "query width overflow"))?;
-        let kvwidth = kv
-            .checked_mul(HEAD)
-            .ok_or_else(|| GpuError::shape(WHAT, "KV width overflow"))?;
+        let kvwidth =
+            a.kv.checked_mul(HEAD)
+                .ok_or_else(|| GpuError::shape(WHAT, "KV width overflow"))?;
         Ok(Self {
             layer,
             hidden,
-            heads,
-            kv,
+            heads: a.heads,
+            kv: a.kv,
             ctx,
-            capacity,
-            window,
-            rotate,
+            capacity: a.capacity,
+            window: a.window,
+            rotate: a.rotate,
             eps,
             norm: vector(file, w, names::attn_norm(layer), hidden)?,
             qnorm: vector(file, w, names::attn_q_norm(layer), HEAD)?,
             knorm: vector(file, w, names::attn_k_norm(layer), HEAD)?,
-            sinks: vector(file, w, names::attn_sinks(layer), heads)?,
+            sinks: a
+                .sinks
+                .then(|| vector(file, w, names::attn_sinks(layer), a.heads))
+                .transpose()?,
             q: Projection::load(file, w, names::attn_q(layer), qwidth, hidden)?,
             k: Projection::load(file, w, names::attn_k(layer), kvwidth, hidden)?,
             v: Projection::load(file, w, names::attn_v(layer), kvwidth, hidden)?,
@@ -228,7 +273,8 @@ impl Binding {
     }
 
     /// Full attention sub-layer: RMS, Q/K/V, head RMS and optional NeoX, append,
-    /// sink-folded attention, O projection, residual. Every scratch cell read is written.
+    /// attention (sink-folded when the layer has sinks), O projection, residual. Every
+    /// scratch cell read is written.
     ///
     /// # Safety
     /// `pos[0..m]` are consecutive absolute positions and `n_keys[t] == pos[t] + 1`.
@@ -306,6 +352,11 @@ impl Binding {
             .enqueue(gpu, w, &wide, &s.input, &s.xn, &s.route, m, &mut s.v)?;
         let gq = w.f32_buf(WHAT, &self.qnorm)?;
         let gk = w.f32_buf(WHAT, &self.knorm)?;
+        let sinks = self
+            .sinks
+            .as_ref()
+            .map(|name| w.f32_buf(WHAT, name))
+            .transpose()?;
         // SAFETY: positions and initialized retained rows are the caller's contract;
         // chunk_rows prevents wrapped appends from destroying an earlier row's window.
         unsafe {
@@ -344,7 +395,7 @@ impl Binding {
                 ctx: self.ctx,
                 m,
                 window: self.window,
-                sinks: Some(w.f32_buf(WHAT, &self.sinks)?),
+                sinks,
                 part_v: &mut s.part_v,
                 part_ms: &mut s.part_ms,
                 fault,
@@ -610,5 +661,133 @@ impl Scratch {
             + self.input.bytes()
             + self.output.bytes()
             + self.route.bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::arch::models::Rope;
+
+    const BASE: f32 = 1_000_000.0;
+
+    fn neox(factors: bool) -> Rope {
+        Rope {
+            mode: RopeMode::Neox,
+            dims: 128,
+            base: BASE,
+            yarn: None,
+            factors,
+        }
+    }
+
+    /// A layer of 16 query heads over 4 key heads of head 128: no sinks, no gate, q/k norms.
+    fn layer(rope: Rope, window: Option<u32>) -> Gqa {
+        Gqa {
+            heads: 16,
+            kv_heads: 4,
+            head_dim: 128,
+            value_dim: 128,
+            rope,
+            qk_norm: true,
+            o_norm: false,
+            out_gate: OutGate::None,
+            select: None,
+            window,
+            sinks: false,
+            value_scale: None,
+        }
+    }
+
+    fn admitted(g: &Gqa) -> Result<Admitted, GpuError> {
+        admit(3, g, 2048, 1e-5, 4096)
+    }
+
+    fn refusal(r: Result<Admitted, GpuError>) -> String {
+        r.expect_err("a refusal").to_string()
+    }
+
+    /// A group of four runs, a sliding layer on the ring and a full layer on the plane, with
+    /// no sinks.
+    #[test]
+    fn a_group_of_four_runs_sliding_and_full() {
+        let sliding = admitted(&layer(neox(false), Some(256))).expect("sliding");
+        assert_eq!((sliding.heads, sliding.kv, sliding.window), (16, 4, 256));
+        assert_eq!(sliding.capacity, 768);
+        assert!(sliding.rotate && !sliding.sinks);
+        let full = admitted(&layer(neox(true), None)).expect("full");
+        assert_eq!((full.window, full.capacity), (0, 4096));
+        assert!(full.rotate && !full.sinks);
+    }
+
+    /// The group of eight with sinks keeps its admission, and the sinks are carried.
+    #[test]
+    fn a_group_of_eight_with_sinks_is_admitted() {
+        let g = Gqa {
+            heads: 32,
+            kv_heads: 4,
+            sinks: true,
+            ..layer(neox(false), Some(512))
+        };
+        let a = admitted(&g).expect("eight");
+        assert_eq!((a.heads, a.kv, a.sinks), (32, 4, true));
+    }
+
+    /// A group other than eight and four is refused by name, whatever else holds.
+    #[test]
+    fn another_group_is_refused() {
+        for (heads, kv) in [(20, 4), (24, 4), (16, 8), (4, 4), (16, 3)] {
+            let g = Gqa {
+                heads,
+                kv_heads: kv,
+                ..layer(neox(false), None)
+            };
+            assert!(
+                refusal(admitted(&g)).contains("unsupported head128 layer 3"),
+                "{heads}/{kv}"
+            );
+        }
+    }
+
+    /// Rope factors ride a whole-head NeoX layer; they do not make a NoPE layer one, and YaRN
+    /// is still refused.
+    #[test]
+    fn rope_factors_need_the_neox_table() {
+        assert!(admitted(&layer(neox(true), None)).is_ok());
+        let nope = Rope {
+            mode: RopeMode::None,
+            dims: 0,
+            base: 0.0,
+            yarn: None,
+            factors: false,
+        };
+        assert!(!admitted(&layer(nope, None)).expect("nope").rotate);
+        let nope_factors = Rope {
+            factors: true,
+            ..nope
+        };
+        assert!(refusal(admitted(&layer(nope_factors, None))).contains("NoPE or whole-head NeoX"));
+        let partial = Rope {
+            dims: 64,
+            ..neox(true)
+        };
+        assert!(refusal(admitted(&layer(partial, None))).contains("NoPE or whole-head NeoX"));
+    }
+
+    /// The per-head output gate is the gate kernel's launch: refused by name, not run silently
+    /// without it.
+    #[test]
+    fn an_output_gate_is_refused_by_name() {
+        for gate in [OutGate::ProjHead, OutGate::Proj, OutGate::Packed] {
+            let g = Gqa {
+                out_gate: gate,
+                ..layer(neox(false), Some(256))
+            };
+            let e = refusal(admitted(&g));
+            assert!(
+                e.contains(&format!("{gate:?}")) && e.contains("output-gate kernel"),
+                "{e}"
+            );
+        }
     }
 }

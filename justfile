@@ -1915,6 +1915,11 @@ gate-gpu-flint-attn:
 gate-gpu-flint-router:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_flint_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_flint_router'
 
+# LFM3's head-128 flash at a group of four query heads a key head (window 256 and none, plane and ring, no sinks), against an f64
+# reference and bit for bit against the group of eight. Model-free: seeded inputs. No model file.
+gate-gpu-lfm3-kernels:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_lfm3_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lfm3_kernels'
+
 # Full-file eager/captured, resident-slot and ring-retention consumer transitions.
 gate-gpu-flint-lib:
     ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'

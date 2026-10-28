@@ -194,11 +194,12 @@ pub const AVAILABLE: &[Available] = &[
                     scaled: false,
                 // The pack-5 and pack-16 rows (head 128, groups 5 and 16) are
                 // launched by neither whole-card body, and the pack-7 row (group 7) by
-                // Body35 alone; the programs that launch them name their own
-                // entries.
+                // Body35 alone; the head-128 pack-4 row is the head-128 attention
+                // binding's. The programs that launch them name their own entries.
                 } if value == head
-                    && gqa_row(*head, *group)
-                        .is_some_and(|r| r.pack != 5 && r.pack != 7 && r.pack != 16)
+                    && gqa_row(*head, *group).is_some_and(|r| {
+                        r.pack != 5 && r.pack != 7 && r.pack != 16 && (r.head != 128 || r.pack != 4)
+                    })
             )
         },
     },
@@ -2273,6 +2274,17 @@ mod tests {
                     head,
                     value: head,
                     group: 5,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                },
+            ),
+            (
+                "group 4, the head-128 attention binding's row",
+                Need::Gqa {
+                    head,
+                    value: head,
+                    group: 4,
                     window: None,
                     sinks: false,
                     scaled: false,

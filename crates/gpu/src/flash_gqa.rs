@@ -3265,7 +3265,7 @@ unsafe fn seg_scalar_kv<const PACK: usize, const RING: bool>(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
 )]
-unsafe fn merge_sink_body<const HEAD: usize, const SINKS: bool>(
+pub(crate) unsafe fn merge_sink_body<const HEAD: usize, const SINKS: bool>(
     part_v: &[f32],
     part_ms: &[f32],
     n_keys_buf: &[u32],
