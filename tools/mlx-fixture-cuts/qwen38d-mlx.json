@@ -1,0 +1,34 @@
+{
+  "name": "qwen38d-mlx",
+  "arch": "qwen35",
+  "source": "mlx-community/Qwen3.8-27B-4bit",
+  "rev": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+  "expect": {"tensors": 2180, "data_bytes": 16054262240},
+  "layers": [0, 1, 2, 3],
+  "layer_prefix": "language_model.model.layers.",
+  "keep": [
+    "language_model.model.embed_tokens.weight",
+    "language_model.model.embed_tokens.scales",
+    "language_model.model.embed_tokens.biases",
+    "language_model.lm_head.weight",
+    "language_model.lm_head.scales",
+    "language_model.lm_head.biases",
+    "language_model.model.norm.weight"
+  ],
+  "drop": ["vision_tower.", "language_model.mtp.", "mtp."],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "vocab.json"
+  ],
+  "widths": {},
+  "planes": [],
+  "config": {
+    "layer_count": "text_config.num_hidden_layers",
+    "widths": {},
+    "per_layer": ["text_config.layer_types"],
+    "layer_names": []
+  }
+}

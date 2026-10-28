@@ -7,7 +7,9 @@
 //! cut and its source range and holds both to the record.
 //!
 //! The cut knows no model. Which tensors are kept, which are sliced along which axis and in what
-//! block units, and which config fields move are the spec's data (`tools/fixture-cuts/<name>.json`).
+//! block units, and which config fields move are the spec's data (`tools/fixture-cuts/<name>.json`
+//! for a registry row's cut; `tools/mlx-fixture-cuts/<name>.json` for a Metal-only MLX folder, which
+//! the Metal gates open by name and which has no row).
 //! A layer's tensors keep the order they have in their source shard, so a layer stored with each
 //! matrix's codes and scales adjacent stays so, and one stored with every scale plane before every
 //! code plane stays so. A layer is never split across shards.
@@ -2919,5 +2921,219 @@ pub(crate) mod tests {
             (w1.shape.as_slice(), w1.view.count, w1.view.take),
             ([512, 384].as_slice(), 1, 512 * 384)
         );
+    }
+
+    /// The committed fixture `name` of the hf crate (`tests/fixtures`), gunzipped.
+    fn gunzipped(name: &str) -> Vec<u8> {
+        use std::io::Read;
+        let path = format!("{}/../hf/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let raw = fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(raw.as_slice())
+            .read_to_end(&mut out)
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        out
+    }
+
+    /// The qwen38d spec: the Metal-only MLX fixture cut, which has no registry row.
+    fn qwen38d_spec() -> Spec {
+        Spec::parse(include_str!(
+            "../../../tools/mlx-fixture-cuts/qwen38d-mlx.json"
+        ))
+        .unwrap()
+    }
+
+    /// The tensors of the 27B MLX folder from its three committed shard headers, each tensor's first
+    /// byte where its shard file holds it (the length word, the header, then its data offset): the
+    /// source [`plan`] reads, with no tensor bytes behind it.
+    fn real_27b_source() -> Vec<Src> {
+        let mut out = Vec::new();
+        for n in 1..=3 {
+            let raw = gunzipped(&format!(
+                "checkpoint-headers/qwen3.8-27b-mlx-4bit-model-0000{n}-of-00003.header.json.gz"
+            ));
+            let header: Value = serde_json::from_slice(&raw).unwrap();
+            let base = 8 + to_u64(raw.len());
+            for (name, e) in header.as_object().unwrap() {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let (from, to) = (
+                    e["data_offsets"][0].as_u64().unwrap(),
+                    e["data_offsets"][1].as_u64().unwrap(),
+                );
+                out.push(Src {
+                    name: name.clone(),
+                    dtype: Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
+                    shape: e["shape"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|d| usize::try_from(d.as_u64().unwrap()).unwrap())
+                        .collect(),
+                    shard: format!("model-0000{n}-of-00003.safetensors"),
+                    start: base + from,
+                    len: to - from,
+                });
+            }
+        }
+        out
+    }
+
+    /// The qwen38d spec over the real 27B folder's three shard headers (2,180 tensors,
+    /// 16,054,262,240 bytes) plans the four-layer fixture: layers 0 to 3, which are three delta
+    /// layers and the first full-attention layer (the interval is 4), with the embedding, the head
+    /// and the final norm; every tensor whole in its stored bits, each quantized matrix's codes,
+    /// scales and biases together; one shard, no layer split; the vision tower and layers 4 to 63
+    /// dropped by name. From the headers: 122 tensors and 2,286,737,728 bytes (the seven unlayered
+    /// tensors 1,430,333,440; layers 0 to 2 215,665,088 each; layer 3 209,409,024).
+    #[test]
+    fn the_qwen38d_spec_plans_the_four_layer_fixture_from_the_real_27b_headers() {
+        let spec = qwen38d_spec();
+        let src = real_27b_source();
+        Source {
+            dir: PathBuf::new(),
+            tensors: src.clone(),
+        }
+        .check_identity(&spec)
+        .unwrap();
+        let p = plan(&spec, &src, DEFAULT_SHARD_BYTES).unwrap();
+        assert_eq!(p.tensors.len(), 122);
+        assert_eq!(
+            p.tensors.iter().map(|t| t.view.len()).sum::<u64>(),
+            2_286_737_728
+        );
+        assert_eq!(p.shards, 1);
+        // The vision tower's 333, and layers 4 to 63: 45 delta layers of 30 and 15 attention layers of 25.
+        assert_eq!(p.dropped_tensors, 333 + 45 * 30 + 15 * 25);
+        assert_eq!(p.dropped_bytes, 13_767_524_512);
+
+        let in_layer = |t: &Planned, l: usize| {
+            t.name
+                .starts_with(&format!("language_model.model.layers.{l}."))
+        };
+        let layer_bytes = |l: usize| {
+            p.tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.view.len())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| !t.name.contains(".layers."))
+                .map(|t| t.view.len())
+                .sum::<u64>(),
+            1_430_333_440
+        );
+        assert_eq!(
+            (0..4).map(layer_bytes).collect::<Vec<_>>(),
+            [215_665_088, 215_665_088, 215_665_088, 209_409_024]
+        );
+        for l in 0..4 {
+            let names: Vec<&str> = p
+                .tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.name.as_str())
+                .collect();
+            let has = |part: &str| names.iter().any(|n| n.contains(part));
+            // mlx-lm's rule: layer l is full attention when (l + 1) % 4 == 0.
+            assert_eq!(has(".linear_attn."), (l + 1) % 4 != 0, "layer {l}");
+            assert_eq!(has(".self_attn."), (l + 1) % 4 == 0, "layer {l}");
+            for part in ["mlp.gate_proj.", "mlp.up_proj.", "mlp.down_proj."] {
+                assert!(has(part), "layer {l}: no {part}");
+            }
+            assert_eq!(
+                names.len(),
+                if (l + 1) % 4 == 0 { 25 } else { 30 },
+                "layer {l}"
+            );
+        }
+        assert!(
+            !p.tensors
+                .iter()
+                .any(|t| t.name.starts_with("vision_tower."))
+        );
+        assert!(
+            !p.tensors
+                .iter()
+                .any(|t| layered(&spec.layer_prefix, &t.name).is_some_and(|(id, _)| id >= 4))
+        );
+
+        let by_name: HashMap<&str, &Planned> =
+            p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        let source_of: HashMap<&str, &Src> = src.iter().map(|t| (t.name.as_str(), t)).collect();
+        for t in &p.tensors {
+            let s = source_of[t.src_name.as_str()];
+            assert_eq!(t.view, View::whole(s.start, s.len), "{}", t.name);
+            assert_eq!((&t.shape, t.dtype), (&s.shape, s.dtype), "{}", t.name);
+        }
+        let mut matrices = 0;
+        for t in p.tensors.iter().filter(|t| t.dtype == Dtype::U32) {
+            let stem = t.name.strip_suffix(".weight").expect("a code plane");
+            let groups = [t.shape[0], t.shape[1] / 8];
+            for plane in ["scales", "biases"] {
+                let c = by_name
+                    .get(format!("{stem}.{plane}").as_str())
+                    .unwrap_or_else(|| panic!("{stem}: no {plane} beside its codes"));
+                assert_eq!(
+                    (c.dtype, c.shape.as_slice()),
+                    (Dtype::Bf16, groups.as_slice()),
+                    "{stem}.{plane}"
+                );
+            }
+            matrices += 1;
+        }
+        assert_eq!(matrices, 33);
+    }
+
+    /// The qwen38d spec over the real 27B `config.json` edits the two fields that name the layers
+    /// and nothing else: `text_config.num_hidden_layers` 4 and `text_config.layer_types` its first
+    /// four entries, three `linear_attention` then `full_attention`, which are the layer kinds
+    /// mlx-lm builds from the kept `full_attention_interval` of 4. The config's `quantization` and
+    /// `quantization_config` hold the one block for every module (no entry names a layer), so no
+    /// per-module entry is left for a dropped layer.
+    #[test]
+    fn the_qwen38d_spec_edits_the_real_27b_config_to_four_layers() {
+        let spec = qwen38d_spec();
+        let real = String::from_utf8(gunzipped(
+            "quant-configs/mlx-community__Qwen3.8-27B-4bit__config.json.gz",
+        ))
+        .unwrap();
+        let before: Value = serde_json::from_str(&real).unwrap();
+        for key in ["quantization", "quantization_config"] {
+            let block: BTreeSet<&str> = before[key]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                block,
+                BTreeSet::from(["bits", "group_size", "mode"]),
+                "{key}"
+            );
+        }
+        let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
+        let mut want = before.clone();
+        want["text_config"]["num_hidden_layers"] = json!(4);
+        want["text_config"]["layer_types"] = json!([
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention"
+        ]);
+        assert_eq!(edited, want);
+        let text = &edited["text_config"];
+        let interval = text["full_attention_interval"].as_u64().unwrap();
+        for (i, kind) in text["layer_types"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                (to_u64(i) + 1) % interval == 0,
+                kind == "full_attention",
+                "layer {i}: layer_types and the interval disagree"
+            );
+        }
     }
 }

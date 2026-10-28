@@ -11,8 +11,11 @@
 `--ids` names them, one step each, teacher-forced). The forward is mlx-lm's modules in f32:
 every quantized linear and embedding is replaced by its exact dequant (scales and biases
 widened before `mx.dequantize`) and every bf16 parameter is widened, so the row carries the
-model's arithmetic without bf16 activation rounding. A folder that does not floatize fully
-is refused by name. It prints two blocks on stdout:
+model's arithmetic without bf16 activation rounding. The embedding is not floatized whole: only
+the rows of the dumped ids are gathered from the quantized embedding and dequantized the same
+way (the head stays whole in f32), and an id outside that set raises by name; a folder whose
+head is tied to the embedding keeps the whole f32 embedding. A folder that does not floatize
+fully is refused by name. It prints two blocks on stdout:
 
     ----- <family>.txt -----
     version 1
@@ -178,6 +181,7 @@ def dump(folder: str, family: str, ids: list[int]) -> None:
     from mlx_lm.utils import load
 
     model, _tokenizer = load_folder(folder, load)
+    gather_embedding(model, ids)
     note, replaced = floatize(model)
     if replaced == 0 or "bf16 parameters left: 0" not in note:
         raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
@@ -685,6 +689,96 @@ def gguf_name_of(tail: str) -> str | None:
     return None
 
 
+def dequantize_f32(mod, weight, scales, biases):
+    """`weight`, `scales` and `biases` (the whole of the quantized module `mod`, or the same rows
+    of each) as exact f32 values.
+
+    The scales and biases widen first: dequantized in their stored bf16, every weight would round
+    to bf16 once more. Each value is its own group's `scale * code + bias`, so a row's values do
+    not depend on which other rows are dequantized with it.
+    """
+    import mlx.core as mx
+
+    return mx.dequantize(
+        weight,
+        scales=scales.astype(mx.float32),
+        biases=None if biases is None else biases.astype(mx.float32),
+        group_size=mod.group_size,
+        bits=mod.bits,
+        mode=getattr(mod, "mode", "affine"),
+    ).astype(mx.float32)
+
+
+def gather_embedding(model, ids: list[int]) -> bool:
+    """Replace the quantized embedding by a module that holds only the f32 rows of `ids`.
+
+    The rows are `dequantize_f32` of the same rows of the quantized embedding, the values
+    `floatize` would give the whole table, and the module returns them where the embedding
+    would; an id it was not given raises by name, and so does one beyond the table. A folder whose
+    head is tied to the embedding (no `lm_head` module) or whose embedding is not one quantized
+    `embed_tokens` module is left to `floatize` whole. Returns whether it replaced the embedding.
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    leaves = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    embeds = [(path, mod) for path, mod in leaves if path.split(".")[-1] == "embed_tokens"]
+    has_head = any(path.split(".")[-1] == "lm_head" for path, _ in leaves)
+    if len(embeds) != 1 or not has_head or type(embeds[0][1]).__name__ != "QuantizedEmbedding":
+        print(
+            "mlx-logits: embedding floatized whole (tied head, or not one quantized embed_tokens)",
+            file=sys.stderr,
+        )
+        return False
+    path, mod = embeds[0]
+    rows = sorted(set(ids))
+    if rows[-1] >= mod.weight.shape[0]:
+        raise SystemExit(
+            f"mlx-logits: id {rows[-1]} is outside the embedding's {mod.weight.shape[0]} rows"
+        )
+    at = mx.array(rows, dtype=mx.int32)
+    values = dequantize_f32(
+        mod,
+        mx.take(mod.weight, at, axis=0),
+        mx.take(mod.scales, at, axis=0),
+        None if mod.get("biases", None) is None else mx.take(mod.biases, at, axis=0),
+    )
+    mx.eval(values)
+
+    class Index:
+        """The position of each gathered id; a plain object, so the module keeps it out of its
+        parameter tree."""
+
+        def __init__(self):
+            self.at = {i: k for k, i in enumerate(rows)}
+
+    class GatheredEmbedding(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rows = values
+            self.index = Index()
+
+        def __call__(self, x):
+            flat_ids = x.reshape(-1).tolist()
+            missing = sorted({i for i in flat_ids if i not in self.index.at})
+            if missing:
+                raise SystemExit(
+                    f"mlx-logits: the embedding holds the rows of ids {rows}; "
+                    f"the model asked for {missing}"
+                )
+            take = mx.array([self.index.at[i] for i in flat_ids], dtype=mx.int32)
+            return mx.take(self.rows, take, axis=0).reshape(*x.shape, self.rows.shape[-1])
+
+    model.update_modules(tree_unflatten([(path, GatheredEmbedding())]))
+    print(
+        f"mlx-logits: embedding {path}: {len(rows)} rows of {mod.weight.shape[0]} gathered "
+        f"({mod.bits}-bit, group {mod.group_size}); the head stays whole in f32",
+        file=sys.stderr,
+    )
+    return True
+
+
 def floatize(model) -> tuple[str, int]:
     """Replace quantized linears and embeddings with f32 copies, and widen bf16 parameters.
 
@@ -719,17 +813,7 @@ def floatize(model) -> tuple[str, int]:
         if name not in ("QuantizedLinear", "QuantizedEmbedding"):
             return mod
         try:
-            # The scales and biases widen first: dequantized in their stored bf16, every
-            # weight would round to bf16 once more.
-            biases = mod.get("biases", None)
-            weight = mx.dequantize(
-                mod.weight,
-                scales=mod.scales.astype(mx.float32),
-                biases=None if biases is None else biases.astype(mx.float32),
-                group_size=mod.group_size,
-                bits=mod.bits,
-                mode=getattr(mod, "mode", "affine"),
-            ).astype(mx.float32)
+            weight = dequantize_f32(mod, mod.weight, mod.scales, mod.get("biases", None))
         except Exception as exc:
             skipped.append(f"{name}: {exc}")
             return mod
