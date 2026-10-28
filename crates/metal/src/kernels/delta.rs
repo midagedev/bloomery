@@ -454,8 +454,7 @@ impl DeltaRowStrides {
     }
 
     /// Rows laid end to end. A shim: the build's host instance's
-    /// (`DeltaRowStrides::of`). Callers left: the arch, the kernel gate and the
-    /// probes.
+    /// (`DeltaRowStrides::of`). Callers left: the probes.
     #[must_use]
     pub fn dense(n_k: usize) -> Option<Self> {
         Self::of(&HOST_GEOMETRY.delta, n_k)

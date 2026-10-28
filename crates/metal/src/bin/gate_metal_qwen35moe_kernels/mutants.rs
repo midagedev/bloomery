@@ -326,8 +326,8 @@ pub const GDN48_MUTANTS: &[Mutant] = &[
         clause: "headnorm_q4k",
         why: "the head norm's scales stop at the SIMD width, so the value heads past it keep unset scales",
         edits: &[(
-            "for (uint head = 32u + tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {",
-            "for (uint head = 32u + tiisg; head < 32u; head += 32u) {",
+            "for (uint head = tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {",
+            "for (uint head = tiisg; head < 32u; head += 32u) {",
             1,
         )],
     },
@@ -458,7 +458,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "sum / float(BLOOMERY_DELTA_HEAD_COLS)",
             "sum / float(BLOOMERY_DELTA_HEAD_COLS * 2)",
-            2,
+            1,
         )],
     },
     Mutant {
@@ -469,7 +469,7 @@ pub const MUTANTS: &[Mutant] = &[
             (
                 "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
                 "",
-                2,
+                1,
             ),
             (
                 "raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",

@@ -331,7 +331,7 @@ mod tests {
         // One case a clause of each kernel family's `holds`, each moving the
         // axes of Qwen3.6's row (hidden 2048, expert ff 512, 16 heads of 256
         // over 2, rope 64, 32 delta heads of 128 and 4 taps) to the named one.
-        let cases: [Case; 14] = [
+        let cases: [Case; 15] = [
             (|i| i.key.hidden = 3136, ("router", "hidden", "3136")),
             (
                 |i| i.key.moe.router = shape::router_row(RouterBody::BiasedSigmoid, 256),
@@ -371,6 +371,7 @@ mod tests {
             (|i| delta(i, 32, 128, 5), ("delta", "conv taps", "5")),
             // PIN(2026-10-28): the 48-value-head case is now an axis; the odd count is its refusal.
             (|i| delta(i, 33, 128, 4), ("delta", "value heads", "33")),
+            (|i| delta(i, 0, 128, 4), ("delta", "value heads", "0")),
             (|i| delta(i, 32, 64, 4), ("delta", "head columns", "64")),
         ];
         let mut wrong = Vec::new();
@@ -416,17 +417,21 @@ mod tests {
             assert_eq!(d.groups, n_v * geometry::PARTIALS_PER_HEAD, "{n_v}: groups");
             assert_eq!(d.partials_stride, d.groups, "{n_v}: partials");
             assert_eq!(d.group_threads, 128, "{n_v}: threads a group");
-            assert_eq!(
-                d.channels(n_k),
-                Some((2 * n_k + n_v) * 128),
-                "{n_v}: channels"
-            );
-            let prepared = d.prepared_elems(n_k).expect("the prepared row fits");
-            assert_eq!(
-                prepared % 4,
-                0,
-                "{n_v}: a prepared row is whole 16-byte words"
-            );
+            // The step's buffers are the Mac side's (`kernels::delta`).
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(
+                    d.channels(n_k),
+                    Some((2 * n_k + n_v) * 128),
+                    "{n_v}: channels"
+                );
+                let prepared = d.prepared_elems(n_k).expect("the prepared row fits");
+                assert_eq!(
+                    prepared % 4,
+                    0,
+                    "{n_v}: a prepared row is whole 16-byte words"
+                );
+            }
         }
     }
 
