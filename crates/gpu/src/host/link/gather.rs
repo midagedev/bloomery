@@ -1063,8 +1063,9 @@ mod tests {
             while !ends.iter().all(|e| e.query().expect("an event query")) {
                 if Instant::now() > until || ring.broken().is_some() {
                     ring.release().expect("the loopback's ends settle");
-                    gpus.iter()
-                        .for_each(|g| g.stream().synchronize().expect("drained"));
+                    for g in gpus.iter() {
+                        g.stream().synchronize().expect("drained");
+                    }
                     panic!("{ranks} ranks: the chains stalled: {:?}", ring.broken());
                 }
                 std::thread::yield_now();

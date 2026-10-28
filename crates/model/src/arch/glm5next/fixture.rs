@@ -252,7 +252,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
         .plan_nextn(&machine, BUDGET_CTX, &levers, &nextn)
         .map_err(|e| FixtureError::Budget(e.to_string()))?;
     Ok(CardExperts {
-        per_layer: plan.plan.n_l.clone(),
+        per_layer: plan.plan.n_l,
         experts: inputs.model.experts,
     })
 }

@@ -237,7 +237,7 @@ mod gate {
         crate::gate_card::init()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
         let (draft, dhp) = dspark::draft_hparams()?;
-        let layers = dhp.target_layers.clone();
+        let layers = dhp.target_layers;
         let path = crate::ds41_tier::model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;

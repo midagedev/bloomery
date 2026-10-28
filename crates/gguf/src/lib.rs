@@ -1816,9 +1816,8 @@ mod split_tests {
     }
 
     fn refusal(dir: &Path) -> LoadError {
-        let e = match Split::open(shard_path(dir, 0)) {
-            Ok(_) => panic!("the split in {} must be refused", dir.display()),
-            Err(e) => e,
+        let Err(e) = Split::open(shard_path(dir, 0)) else {
+            panic!("the split in {} must be refused", dir.display())
         };
         std::fs::remove_dir_all(dir).unwrap();
         e
@@ -2580,7 +2579,7 @@ mod located_tests {
         assert_eq!(alone.place("f.weight"), Some(&Place::Made));
         let e = alone.data("f.weight").unwrap_err();
         assert!(matches!(e, LoadError::OutOfBounds { .. }), "{e}");
-        let e = Split::located(path.clone(), &l, &[], places())
+        let e = Split::located(path, &l, &[], places())
             .err()
             .unwrap()
             .to_string();

@@ -245,7 +245,9 @@ mod gate {
             }
         }
         for t in &mut out.tier_n_l {
-            t.iter_mut().for_each(|n| *n = 0);
+            for n in t.iter_mut() {
+                *n = 0;
+            }
         }
         Ok(out)
     }

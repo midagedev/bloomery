@@ -49,7 +49,7 @@ pub fn serve_default(split: &Split) -> Result<String, String> {
         levers: &levers,
         kv: KvQ8::F16,
         media: false,
-        beside: Default::default(),
+        beside: bloomery_gpu_gates::beside::Beside::default(),
         ubatch: None,
     };
     let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)

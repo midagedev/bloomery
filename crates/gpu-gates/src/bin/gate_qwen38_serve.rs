@@ -5125,10 +5125,13 @@ mod gate {
     /// a seeded draw from a verified row is the draw from that position's
     /// step.
     fn lookup_main(dir: &Path, prompt: &str, reference: &[u32]) -> Result<bool, GateError> {
-        let code = (0..12)
-            .map(|i| format!("def add_{i}(a, b):\n    return a + b + {i}\n\n"))
-            .collect::<String>()
-            + "def add_12(a, b):\n";
+        let code = {
+            let mut out = (0..12)
+                .map(|i| format!("def add_{i}(a, b):\n    return a + b + {i}\n\n"))
+                .collect::<String>();
+            out.push_str("def add_12(a, b):\n");
+            out
+        };
         let prose = "Write the numbers from one to two hundred in English words, separated by \
                      commas: one, two, three, four, five,";
         let mut args = SERVER_ARGS.to_vec();

@@ -496,9 +496,9 @@ struct Sample {
 
 struct Rig {
     /// Layer `l`'s stacks are tables `3 l ..= 3 l + 2`, in [`STACKS`] order.
-    tables: Arc<Vec<SplitTable>>,
+    tables: Arc<[SplitTable]>,
     /// Each table's shard, opened `O_DIRECT` (the reader's own handle).
-    files: Arc<Vec<Arc<DirectFile>>>,
+    files: Arc<[Arc<DirectFile>]>,
     pool: Pool,
     /// The single-thread arm's buffer.
     scratch: Vec<u8>,
@@ -575,8 +575,8 @@ impl Rig {
             .collect();
         pool.run(prime)?;
         Ok(Rig {
-            tables: Arc::new(tables),
-            files: Arc::new(files),
+            tables: Arc::from(tables),
+            files: Arc::from(files),
             pool,
             scratch: vec![0; buffer],
             layers,

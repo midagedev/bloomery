@@ -3160,7 +3160,7 @@ mod tests {
         };
         let cases = [
             (GgmlType::NVFP4_ROWS, GgmlType::NVFP4_ROWS, none.clone()),
-            (GgmlType::Q4_K, GgmlType::Q6_K, none.clone()),
+            (GgmlType::Q4_K, GgmlType::Q6_K, none),
             (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),
         ];
         let wrong: Vec<_> = cases
@@ -3222,7 +3222,7 @@ mod tests {
             (GgmlType::IQ1_M, GgmlType::IQ1_M, none.clone()),
             // The host's alone: no card format, a fused kernel.
             (GgmlType::Q2_K, GgmlType::IQ2_XXS, none.clone()),
-            (GgmlType::Q2_K, GgmlType::Q2_K, none.clone()),
+            (GgmlType::Q2_K, GgmlType::Q2_K, none),
             // No side: q4_0 has no card format and no fused kernel.
             (GgmlType::Q4_0, GgmlType::Q4_K, item(GgmlType::Q4_0)),
         ];
@@ -3300,7 +3300,7 @@ mod tests {
             // at its 64-value block (placement's
             // `glm5next_arms_are_the_leg_with_planes_over_both_forms` holds
             // the rule-left-on-the-common-leg mutant).
-            (GgmlType::NVFP4, GgmlType::NVFP4, none.clone()),
+            (GgmlType::NVFP4, GgmlType::NVFP4, none),
             // No side: bf16 has no card expert and no fused qdot kernel, as
             // a gate and up or as a down.
             (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),
@@ -4090,7 +4090,7 @@ mod tests {
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0].feature.contains("window 128"), "{items:?}");
 
-        let mut other = model.clone();
+        let mut other = model;
         for t in &mut other.tensors {
             if t.name == "blk.3.attn_qkv.weight" {
                 t.ty = GgmlType::Q4_K;

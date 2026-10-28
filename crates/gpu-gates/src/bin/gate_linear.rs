@@ -3403,7 +3403,9 @@ mod gate {
                     *x = 0.85 * d + 0.15 * r.uniform(-1.0, 1.0);
                 }
                 let n = key.iter().map(|x| x * x).sum::<f32>().sqrt();
-                key.iter_mut().for_each(|x| *x /= n);
+                for x in key.iter_mut() {
+                    *x /= n;
+                }
             }
         }
         near.beta = r.fill(MOST * nv, 0.9, 1.0);
@@ -3860,7 +3862,7 @@ mod gate {
         );
         let lane_c = lane_of(&d.state, c);
         let o_last = &h.o[held * nv * HEAD..];
-        let mut want = stamp.clone();
+        let mut want = stamp;
         want[c] = step.p0 + 1;
         let pass = bits_equal(&d.o, o_last) && bits_equal(&lane_c, &h.state) && sp == want;
         println!(

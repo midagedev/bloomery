@@ -98,6 +98,10 @@ use tokenizer::Tokenizer;
 
 use crate::{clef_seat, lev_seat};
 
+#[allow(
+    clippy::duplicate_mod,
+    reason = "three seats of one bin include this file"
+)]
 #[path = "../ubatch_rule.rs"]
 mod ubatch_rule;
 use ubatch_rule::ubatch_rule;

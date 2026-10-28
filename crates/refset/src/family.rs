@@ -442,7 +442,7 @@ impl Family {
                 Ok(Provenance {
                     dumped_from: stated(set.man.header.model()),
                     draft: None,
-                    build: set.man.build.clone(),
+                    build: set.man.build,
                 })
             }
             Identity::Emb2(..) => {
@@ -450,7 +450,7 @@ impl Family {
                 Ok(Provenance {
                     dumped_from: stated(set.man.header.model()),
                     draft: None,
-                    build: set.man.build.clone(),
+                    build: set.man.build,
                 })
             }
             Identity::Checkpoint { .. } => {

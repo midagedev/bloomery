@@ -801,7 +801,7 @@ mod tests {
             WarmProfile::decode(&bytes, &key("a"), 3, 5),
             Err(ProfileError::Section(WarmError::Shape { .. }))
         ));
-        let mut heat = p.clone();
+        let mut heat = p;
         heat.section.recent = vec![1.0; 12];
         assert_eq!(
             WarmProfile::decode(&profile_bytes(&heat), &key("a"), 3, 4),

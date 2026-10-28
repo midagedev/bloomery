@@ -48,7 +48,7 @@ fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
         levers: &levers,
         kv: KvQ8::F16,
         media: false,
-        beside: Default::default(),
+        beside: bloomery_gpu_gates::beside::Beside::default(),
         ubatch: None,
     };
     let total = floor_or(
@@ -77,8 +77,14 @@ fn open35(split: &Split, ctx: usize) -> Result<Open35, Outcome> {
 /// reading (`q3place::PlaceQ3::qwen35_on` rebuilds it).
 fn arm(split: &Split, name: &'static str, o: &Open35, seqs: q3place::Seqs) -> Result<Arm, Outcome> {
     let census = q3place::census().map_err(|e| outcome_of(e.as_ref()))?;
-    match q3place::unplaced_qwen35_slots(split, &census, o, seqs, Default::default())
-        .map_err(|e| outcome_of(e.as_ref()))
+    match q3place::unplaced_qwen35_slots(
+        split,
+        &census,
+        o,
+        seqs,
+        bloomery_gpu_gates::beside::Beside::default(),
+    )
+    .map_err(|e| outcome_of(e.as_ref()))
     {
         Ok(q3place::Unplaced::Whole(_)) => {
             let placed = q3place::PlaceQ3::qwen35_on(
@@ -87,7 +93,7 @@ fn arm(split: &Split, name: &'static str, o: &Open35, seqs: q3place::Seqs) -> Re
                 &census,
                 q3place::share(o, o.ctx, seqs.slots),
                 seqs,
-                Default::default(),
+                bloomery_gpu_gates::beside::Beside::default(),
             )
             .map_err(|e| outcome_of(e.as_ref()))?;
             let ctx = o.ctx;

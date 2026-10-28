@@ -338,13 +338,17 @@ impl<P: Page> Wire for Memory<P> {
 fn release_settled<P>(ends: &[&dyn Side<P>], v: u32) -> Result<(), String> {
     let offs: Vec<Vec<usize>> = ends.iter().map(|end| end.counters()).collect();
     for (end, offs) in ends.iter().zip(&offs) {
-        offs.iter().for_each(|&off| end.stop(off));
+        for &off in offs.iter() {
+            end.stop(off);
+        }
     }
     let settled: Vec<bool> = ends.iter().map(|end| end.settle()).collect();
     let mut held = Vec::new();
     for ((end, offs), settled) in ends.iter().zip(&offs).zip(settled) {
         if settled {
-            offs.iter().for_each(|&off| end.release(off, v));
+            for &off in offs.iter() {
+                end.release(off, v);
+            }
         } else {
             held.extend(end.unsettled());
         }

@@ -1084,7 +1084,7 @@ mod gate {
         // Fed the close as an ordinary prompt id, the model continues as the
         // capped run did: the engine's context really carries the close.
         let after = if closed {
-            let mut fed = p.clone();
+            let mut fed = p;
             fed.extend(&capped[..through]);
             run(&fed, Value::Null, THINK_PREDICT - through)?
         } else {
@@ -2101,9 +2101,8 @@ mod gate {
             .reserves
             .push(("image encoder".to_owned(), s.bytes.total()));
         let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
-        let (card, tcard) = match plan.cards.as_slice() {
-            [c, t, ..] => (c, t),
-            _ => return Err("plan (b′) is not a stage card and a tier card".into()),
+        let [card, tcard, ..] = plan.cards.as_slice() else {
+            return Err("plan (b′) is not a stage card and a tier card".into());
         };
         let (stage_bytes, tier_bytes) = (
             card.dense_bytes + card.expert_bytes,
@@ -3178,7 +3177,7 @@ mod gate {
             "chat content={:?} finish_reason={} usage={}",
             plain_content, plain["choices"][0]["finish_reason"], plain["usage"]
         );
-        let mut streamed = chat.clone();
+        let mut streamed = chat;
         streamed["stream"] = json!(true);
         let (st, sse) = curl(&url("/v1/chat/completions"), Some(&streamed), true)?;
         std::fs::write(a.dir.join("chat-stream.sse"), &sse)?;
@@ -3307,7 +3306,7 @@ mod gate {
             // last, so the engine takes that one position back.
             let last = g3[REUSE_PREDICT - 2];
             let alt = if a.ids[0] != last { a.ids[0] } else { a.ids[1] };
-            let mut back = cont.clone();
+            let mut back = cont;
             back.extend(&g3[..REUSE_PREDICT - 2]);
             back.push(alt);
             let (g4, c4) = reuse(&back, true)?;

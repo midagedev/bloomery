@@ -2021,7 +2021,7 @@ impl Body38 {
             n_used: geo::N_USED,
         };
         let hosted: Vec<usize> =
-            HostRun::viewed(run.clone(), machine, (|l| card.n_card(l), geo::EXPERTS)).collect();
+            HostRun::viewed(run, machine, (|l| card.n_card(l), geo::EXPERTS)).collect();
         let mut experts = crate::model::host_run(
             gpu.context(),
             plan,

@@ -5850,7 +5850,7 @@ mod tests {
         let source = HostSource {
             skew: CARD_PAGE,
             dev: Some(DEV),
-            gave: Default::default(),
+            gave: std::sync::atomic::AtomicUsize::default(),
         };
         let tier = eight_tier_over(&scratch, 2, NvTierEvict::Tick, ArenaKind::Provided(&source));
         assert_eq!(
@@ -5904,7 +5904,7 @@ mod tests {
         let source = HostSource {
             skew: 0,
             dev: None,
-            gave: Default::default(),
+            gave: std::sync::atomic::AtomicUsize::default(),
         };
         let tier = eight_tier_over(&scratch, 2, NvTierEvict::Tick, ArenaKind::Provided(&source));
         assert_eq!(tier.card_arena(), None);

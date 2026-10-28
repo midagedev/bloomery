@@ -1198,7 +1198,7 @@ mod gate {
 
         // A NaN router weight: every token of the fused launch is refused, and
         // the norm-fused launch's routing too, its q8_1 bytes the clean run's.
-        let mut wn = wh.clone();
+        let mut wn = wh;
         wn[17 * kk + 3] = f32::NAN;
         let wnd = DeviceTensor::upload(stream, &wn, N_EXPERT, kk)?;
         k.enqueue_fused(stream, &wnd, &xc, m, sink, &mut fout)?;

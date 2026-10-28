@@ -110,7 +110,11 @@ pub(crate) fn write_set(dir: &Path, s: &Stated<'_>, cases_file_md5: &str) {
     if s.complete {
         lines.push("# complete".to_string());
     }
-    w("MANIFEST.tsv", &(lines.join("\n") + "\n"));
+    w("MANIFEST.tsv", &{
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    });
 }
 
 fn remove(dir: &Path) {
@@ -256,8 +260,12 @@ fn a_set_of_another_vocabulary_is_stale() {
         .lines()
         .filter(|l| !l.starts_with("# vocabulary"))
         .collect();
-    std::fs::write(dir.join("MANIFEST.tsv"), stripped.join("\n") + "\n")
-        .unwrap_or_else(|e| panic!("{e}"));
+    std::fs::write(dir.join("MANIFEST.tsv"), {
+        let mut out = stripped.join("\n");
+        out.push('\n');
+        out
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
     assert!(matches!(
         TokenizerSet::open(&dir, &FAMILY),
         Err(RefError::Stale { .. })

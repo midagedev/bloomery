@@ -280,12 +280,9 @@ fn main() {
     let mut only = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let v = match (a.as_str(), args.next()) {
-            ("--only", Some(v)) => v,
-            _ => {
-                eprintln!("qdot-rate: usage: qdot-rate [--only TYPE@K]..., got {a:?}");
-                std::process::exit(64);
-            }
+        let ("--only", Some(v)) = (a.as_str(), args.next()) else {
+            eprintln!("qdot-rate: usage: qdot-rate [--only TYPE@K]..., got {a:?}");
+            std::process::exit(64);
         };
         if !ROWS.iter().any(|r| name(r) == v) {
             let all: Vec<String> = ROWS.iter().map(name).collect();

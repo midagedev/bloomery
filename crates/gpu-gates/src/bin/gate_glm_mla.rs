@@ -340,7 +340,7 @@ mod gate {
         let (want, sites) = host(&p.w, &p.b, &pos, LN_EPS);
         let differ = diff_u16(&card, &want);
         let next: Vec<u32> = pos.iter().map(|&q| q + 1).collect();
-        let mut swapped = want.clone();
+        let mut swapped = want;
         for row in swapped.chunks_mut(INDEX_ROW) {
             row.rotate_left(INDEX_HEAD);
         }

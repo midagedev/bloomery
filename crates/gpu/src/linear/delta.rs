@@ -2280,9 +2280,8 @@ pub fn delta_host(
 /// [`CARRY_ROWS`], or `lane` is shorter than a lane.
 #[must_use]
 pub fn carry_fold_host(carry: &[f32], lane: &[f32], p0: u32, shape: LinearShape) -> Vec<f32> {
-    let held = match held_rows(carry[0].to_bits() as usize, carry[1].to_bits(), p0) {
-        Some(n) => n,
-        None => panic!("carry_fold_host: carry count exceeds CARRY_ROWS"),
+    let Some(held) = held_rows(carry[0].to_bits() as usize, carry[1].to_bits(), p0) else {
+        panic!("carry_fold_host: carry count exceeds CARRY_ROWS")
     };
     if held == 0 {
         return lane.to_vec();

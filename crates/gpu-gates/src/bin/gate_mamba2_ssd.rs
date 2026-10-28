@@ -814,7 +814,7 @@ mod gate {
             reach: |t, col| t == 80 && col == 15 * HEAD_DIM + 40,
         });
         // σ of head 0 at token 40: every channel of head 0.
-        let mut p = base.clone();
+        let mut p = base;
         p.sd[2 * (40 * HEADS)] = f32::NAN;
         plants.push(Plant {
             label: "NaN sigma",

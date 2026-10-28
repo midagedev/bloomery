@@ -93,8 +93,12 @@ mod tests {
                 "# complete\t1\t0".to_string(),
             ];
             let path = dir.join("MANIFEST.tsv");
-            std::fs::write(&path, lines.join("\n") + "\n")
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            std::fs::write(&path, {
+                let mut out = lines.join("\n");
+                out.push('\n');
+                out
+            })
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             HF.check_set(&dir)
         };
         let p = check(MODEL, HARNESS)?;

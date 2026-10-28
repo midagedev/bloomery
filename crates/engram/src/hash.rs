@@ -151,7 +151,7 @@ impl Hash {
         let constant = |f: &HashFact, per_site: usize| -> Result<Vec<u64>, EngramError> {
             let c = facts::hash_constant(meta, ARCH, f, sites).map_err(fact)?;
             let name = key(f.kv_name());
-            need_len(name.clone(), c.values.len(), sites * per_site)?;
+            need_len(name, c.values.len(), sites * per_site)?;
             if let Some(dims) = c.dims {
                 let want = [u64::try_from(per_site).unwrap_or(u64::MAX), sites as u64];
                 if dims != want {

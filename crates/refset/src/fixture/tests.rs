@@ -538,8 +538,12 @@ fn write_node_set(
         lines.push("# complete\t1\t0".to_string());
     }
     let path = dir.join("MANIFEST.tsv");
-    std::fs::write(&path, lines.join("\n") + "\n")
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    std::fs::write(&path, {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    })
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
 /// A node-dump set dumped from a copy of the fixture file at another root
@@ -892,7 +896,15 @@ fn write_logits_set(dir: &Path, arch: &str, model: &str, fixture: Option<&str>, 
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     };
-    write("MANIFEST.tsv", (lines.join("\n") + "\n").as_bytes());
+    write(
+        "MANIFEST.tsv",
+        {
+            let mut out = lines.join("\n");
+            out.push('\n');
+            out
+        }
+        .as_bytes(),
+    );
     write("p.ids", b"0\n3\n");
     let logits: Vec<u8> = [0.5f32, -1.0, 2.0, 0.0]
         .into_iter()
@@ -1001,8 +1013,12 @@ fn write_mtp_set(
         "# complete\t1\t0".to_string(),
     ]);
     let path = dir.join("MANIFEST.tsv");
-    std::fs::write(&path, lines.join("\n") + "\n")
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    std::fs::write(&path, {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    })
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
 /// The same cases for an MTP set (GLM's, whose target carries the draft

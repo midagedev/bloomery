@@ -78,7 +78,9 @@ impl Axis {
                 ww += w;
             }
             if ww != 0.0 {
-                k.iter_mut().for_each(|w| *w /= ww);
+                for w in k.iter_mut() {
+                    *w /= ww;
+                }
             }
             bounds.push((xmin, taps));
         }

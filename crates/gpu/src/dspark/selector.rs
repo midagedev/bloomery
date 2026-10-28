@@ -1165,7 +1165,7 @@ mod tests {
                     rank: RANK,
                     top_k: 8,
                 },
-                full.clone(),
+                full,
             ),
             (
                 want,

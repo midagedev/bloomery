@@ -1889,7 +1889,7 @@ mod gate {
         // user turn. The stripped clause's runs left the slot holding the
         // stripped conversation, so the fresh turn runs again first — the
         // slot back at the reply's end, its prompt call's end mark standing.
-        let (held_again, _) = greedy(url, p1.clone(), dir, "extend35_first", false)?;
+        let (held_again, _) = greedy(url, p1, dir, "extend35_first", false)?;
         if held_again.tokens != held_run.tokens {
             return Err(
                 "the extension's fresh turn answered ids the first one did not: the clause                  cannot hold a shared prefix"
@@ -4429,12 +4429,9 @@ mod gate {
                 return false;
             }
         };
-        let utf8 = match model.to_str() {
-            Some(m) => m,
-            None => {
-                println!("mtp: the model path is not UTF-8");
-                return false;
-            }
+        let Some(utf8) = model.to_str() else {
+            println!("mtp: the model path is not UTF-8");
+            return false;
         };
         let once = |name: &str, word: &str| -> Option<(Answer, Value)> {
             let sub = dir.join(name);

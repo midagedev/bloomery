@@ -759,7 +759,7 @@ mod tests {
                 nbytes: rows.len() as u64,
             },
             TensorDecl {
-                name: output_norm().to_string(),
+                name: output_norm(),
                 dims: vec![K as u64],
                 type_id: GgmlType::F32.as_u32(),
                 nbytes: gain.len() as u64,

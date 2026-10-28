@@ -2547,13 +2547,10 @@ fn cand_role(
         what: WHAT,
         detail: format!("layer {l}: the candidate mask's {role:?}: {detail}"),
     };
-    let (st, ks) = match (kind.indexer, stream, kind.stream) {
-        (true, Some(st), Some(ks)) => (st, ks),
-        _ => {
-            return Err(refuse(
-                "it runs no indexer over a compressed stream".to_string(),
-            ));
-        }
+    let (true, Some(st), Some(ks)) = (kind.indexer, stream, kind.stream) else {
+        return Err(refuse(
+            "it runs no indexer over a compressed stream".to_string(),
+        ));
     };
     match role {
         CandidateRole::Source => {

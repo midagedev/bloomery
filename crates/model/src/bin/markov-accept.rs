@@ -510,7 +510,9 @@ fn run(args: &[String]) -> Result<(), RunError> {
     let hash = fnv1a64(&table);
     let distinct = {
         let mut seen = vec![false; head.vocab];
-        table.iter().for_each(|&a| seen[a as usize] = true);
+        for &a in table.iter() {
+            seen[a as usize] = true;
+        }
         seen.iter().filter(|&&s| s).count()
     };
     println!(

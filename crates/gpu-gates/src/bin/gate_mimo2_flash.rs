@@ -1817,7 +1817,7 @@ mod gate {
             full &= same;
         }
         let clean = spread_counts(1025);
-        let mut bad = clean.clone();
+        let mut bad = clean;
         bad[3] = u32::try_from(sh.ctx + 1)?;
         bad[5] = 0;
         let sink = gpu.layer_sink(layer)?;

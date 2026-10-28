@@ -1250,7 +1250,7 @@ mod tests {
             read_header(&format),
             &format!("format {};", STATE_FORMAT + 1),
         );
-        let mut past = b.clone();
+        let mut past = b;
         past.push(0);
         let mut input = past.as_slice();
         let mut r = Take::new(&mut input);

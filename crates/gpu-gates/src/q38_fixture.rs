@@ -268,7 +268,7 @@ mod tests {
         // Dense sites that read q8_1 rows: a delta layer's q·k·v, z and output and the shared
         // expert's gate and up (five sites) and a selecting layer's six and the same two (eight)
         // quantize once a launch; past one row Q4_K and Q6_K sites copy token-major too.
-        let by = fix.clone().with_by_name(ByName {
+        let by = fix.with_by_name(ByName {
             one: 2 * 5 + 2 * 8,
             rows: 2 * 5 + 2 * 8 + 3 + 4,
             slot: 2,

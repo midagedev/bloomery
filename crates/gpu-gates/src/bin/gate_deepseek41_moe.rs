@@ -2721,7 +2721,7 @@ mod gate {
             ),
             ("all_equal", vec![1.0; N_EXPERT], zero.clone()),
             ("bias_decides", vec![1.0; N_EXPERT], bias_decides),
-            ("all_underflow", vec![-30.0; N_EXPERT], zero.clone()),
+            ("all_underflow", vec![-30.0; N_EXPERT], zero),
         ];
         let mut x = vec![0.0f32; K];
         x[0] = 1.0;

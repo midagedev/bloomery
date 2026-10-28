@@ -603,11 +603,7 @@ mod gate {
             ),
             ("all_equal".to_string(), vec![1.0; I::E], zero.clone()),
             ("bias_decides".to_string(), vec![1.0; I::E], bias_decides),
-            (
-                "all_zero_scores".to_string(),
-                vec![-200.0; I::E],
-                zero.clone(),
-            ),
+            ("all_zero_scores".to_string(), vec![-200.0; I::E], zero),
         ];
         let mut all = true;
         for (name, logits, bias) in cases {

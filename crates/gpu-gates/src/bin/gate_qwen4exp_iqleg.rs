@@ -356,7 +356,7 @@ mod gate {
             .routed()
             .ok_or("the description holds no routed layer")?;
         Ok((
-            plan.n_l.clone(),
+            plan.n_l,
             inputs.spec.hidden as usize,
             routed.expert_ff as usize,
             routed.top_k as usize,

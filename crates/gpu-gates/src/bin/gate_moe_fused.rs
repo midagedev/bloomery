@@ -201,21 +201,15 @@ fn run() -> Result<(), GateError> {
     }
     let wg = kq(&wts, "blk.1.ffn_gate_exps.weight")?;
     let wu = kq(&wts, "blk.1.ffn_up_exps.weight")?;
-    let wd = match wts.get("blk.1.ffn_down_exps.weight") {
-        Some(DevWeight::Q5_0 { w, .. }) => w,
-        _ => {
-            return Err(
-                "gate_moe_fused: blk.1.ffn_down_exps.weight is not a Q5_0 resident weight".into(),
-            );
-        }
+    let Some(DevWeight::Q5_0 { w: wd, .. }) = wts.get("blk.1.ffn_down_exps.weight") else {
+        return Err(
+            "gate_moe_fused: blk.1.ffn_down_exps.weight is not a Q5_0 resident weight".into(),
+        );
     };
-    let wr = match wts.get("blk.1.ffn_gate_inp.weight") {
-        Some(DevWeight::F32 { w, .. }) => w,
-        _ => {
-            return Err(
-                "gate_moe_fused: blk.1.ffn_gate_inp.weight is not an F32 resident weight".into(),
-            );
-        }
+    let Some(DevWeight::F32 { w: wr, .. }) = wts.get("blk.1.ffn_gate_inp.weight") else {
+        return Err(
+            "gate_moe_fused: blk.1.ffn_gate_inp.weight is not an F32 resident weight".into(),
+        );
     };
 
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
@@ -637,7 +631,7 @@ fn run() -> Result<(), GateError> {
         )?;
         stream.synchronize()?;
         let fault = gpu.take_fault()?;
-        let mut sel_host = ids_h.clone();
+        let mut sel_host = ids_h;
         sel_host[n_used - 1] = HOST;
         let sel_host_dev = DeviceBuffer::from_host(stream, &sel_host)?;
         let mut h_host = DeviceBuffer::from_host(stream, &vec![SENT; span])?;

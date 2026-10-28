@@ -716,7 +716,7 @@ impl Body {
             .map(|l| store(gpu, file, w, inputs, &dims, l))
             .collect::<Result<Vec<_>, _>>()?;
         let held: u64 = stores.iter().map(|s| s.bytes() as u64).sum();
-        let planned = inputs.kv.bytes(layers.clone(), plan.ctx_max);
+        let planned = inputs.kv.bytes(layers, plan.ctx_max);
         if held != planned {
             return Err(shape(format!(
                 "the stores hold {held} device bytes; the plan's layout counts {planned}"

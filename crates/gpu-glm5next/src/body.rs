@@ -1876,7 +1876,9 @@ impl Body {
         glue.attach_tier(experts.tier())?;
         let nvme_tier = experts.tier().cloned();
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
-        if let Some(l) = run.clone().find(|&l| experts_on_card.hostless(l)) {
+        // `find` advances the range it is called on. The copy is the scan.
+        let mut scan = run;
+        if let Some(l) = scan.find(|&l| experts_on_card.hostless(l)) {
             hybrid.mark_unserved(l);
         }
         hybrid.watch_fault(gpu.fault_word())?;

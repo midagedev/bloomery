@@ -358,7 +358,7 @@ mod gate {
         let before = cx.gpu.take_fault()?;
         let (clean_m, clean_h) = run_hc_kernel(cx, p, &x, m)?;
         let clean_word = cx.gpu.take_fault()?;
-        let mut xb = x.clone();
+        let mut xb = x;
         xb[bad * p.k + 777] = BIG;
         let (km, kh) = run_hc_kernel(cx, p, &xb, m)?;
         let got = cx.gpu.take_fault()?;

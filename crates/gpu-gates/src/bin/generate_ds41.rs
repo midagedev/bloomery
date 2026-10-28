@@ -1315,7 +1315,7 @@ mod drive {
             0,
             pick,
         )?;
-        Ok((Some(plan.n_l.clone()), pick))
+        Ok((Some(plan.n_l), pick))
     }
 
     /// The load of a plan that counts `slots` resident sequences

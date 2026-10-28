@@ -1860,7 +1860,7 @@ mod gate {
         let mut sel = SEL51;
         sel[1] = E51 as u32 + 3;
         let (got, fault) = down51(c, &st, &act, &sel)?;
-        let mut want = clean.clone();
+        let mut want = clean;
         want[rpe..2 * rpe].fill(SENT);
         let values_ok = bits_equal(&got, &want);
         let pass = values_ok && fault == expert_id;
@@ -2366,7 +2366,7 @@ mod gate {
         let qf = c.gpu.take_fault()?;
         // A NaN card sum: the combine raises.
         let f32_product = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
-        let mut an = acc.clone();
+        let mut an = acc;
         an[N38 + 5] = f32::NAN;
         let an = DeviceBuffer::from_host(stream, &an)?;
         leg.q38.enqueue_card_shared_add(

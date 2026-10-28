@@ -640,7 +640,7 @@ mod gate {
         let before = cx.gpu.take_fault()?;
         let (out, ring) = kv_run(cx, &dev(&x)?, m, width, window)?;
         let clean_word = cx.gpu.take_fault()?;
-        let mut xb = x.clone();
+        let mut xb = x;
         xb[3] = BIG;
         let (out_b, ring_b) = kv_run(cx, &dev(&xb)?, m, width, window)?;
         let got = cx.gpu.take_fault()?;
@@ -650,7 +650,7 @@ mod gate {
             .iter()
             .all(|&h| h != SENTINEL && gguf::quant::half_to_f32(h).is_nan());
         let others = bits_equal(&out_b[width..], &out[width..]) && {
-            let mut want_ring = ring.clone();
+            let mut want_ring = ring;
             want_ring[slot * width..(slot + 1) * width]
                 .copy_from_slice(&ring_b[slot * width..(slot + 1) * width]);
             ring_b == want_ring

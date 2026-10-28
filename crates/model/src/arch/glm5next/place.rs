@@ -863,9 +863,15 @@ impl NextnInputs {
                 ..t.clone()
             });
         }
-        if let Some(missing) =
-            nextn_required().find(|stem| !tensors.iter().any(|t| t.name == prefix.clone() + stem))
-        {
+        if let Some(missing) = nextn_required().find(|stem| {
+            !tensors.iter().any(|t| {
+                t.name == {
+                    let mut out = prefix.clone();
+                    out.push_str(stem);
+                    out
+                }
+            })
+        }) {
             return Err(PlacementError::Tensor {
                 name: format!("{prefix}{missing}"),
                 detail: "is not in the file; the NextN load needs it".to_string(),

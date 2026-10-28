@@ -166,7 +166,7 @@ mod tests {
                 }
             }
         }
-        let mut seen = rows.clone();
+        let mut seen = rows;
         seen.sort_unstable();
         assert!(
             seen.iter().enumerate().all(|(i, &v)| i == v),

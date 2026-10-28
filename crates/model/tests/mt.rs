@@ -314,13 +314,14 @@ fn hw_ccd_lanes_gate() {
         (None, false),
     ] {
         let err = ccd_child(threads_env, poison);
-        eprint!(
-            "{}",
-            err.lines()
+        eprint!("{}", {
+            let mut out = err
+                .lines()
                 .filter(|l| l.starts_with("ccd lanes"))
                 .collect::<Vec<_>>()
-                .join("\n")
-                + "\n"
-        );
+                .join("\n");
+            out.push('\n');
+            out
+        });
     }
 }
