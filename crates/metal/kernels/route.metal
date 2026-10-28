@@ -271,10 +271,10 @@ kernel void swiglu_rows(device float *gate [[buffer(0)]],
                         device const float *up [[buffer(1)]],
                         constant SwigluRowsArgs &args [[buffer(2)]],
                         uint2 tg [[threadgroup_position_in_grid]],
-                        uint tid [[thread_position_in_threadgroup]],
-                        uint threads [[threads_per_threadgroup]])
+                        uint2 tpg [[thread_position_in_threadgroup]],
+                        uint2 ntg [[threads_per_threadgroup]])
 {
-    const uint col = tg.x * threads + tid;
+    const uint col = tg.x * ntg.x + tpg.x;
     if (col >= args.cols) {
         return;
     }

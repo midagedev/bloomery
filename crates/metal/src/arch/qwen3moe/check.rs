@@ -1566,7 +1566,7 @@ mod tests {
                     u("ssm.inner_size", d.value_heads * d.head_cols),
                     u("full_attention_interval", 2),
                     (
-                        "qwen35moe.rope.dimension_sections".to_owned(),
+                        format!("{arch}.rope.dimension_sections"),
                         Value::Array(vec![
                             Value::I32(11),
                             Value::I32(11),
