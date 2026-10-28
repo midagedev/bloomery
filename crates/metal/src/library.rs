@@ -142,6 +142,21 @@ pub fn sources_of(inst: &Instance) -> Result<(&'static str, &'static str), Devic
     Ok((built.source, built.tensor))
 }
 
+/// The kernels' source and the tensor-op GEMMs' source of any instance, in
+/// that order: the embedded text for a registered one, [`rendered`]'s for one
+/// made at open. The text the gates edit their mutants into, so a mutant can
+/// run on an instance no row registers.
+///
+/// # Errors
+///
+/// [`DeviceError`] naming the geometry some kernel cannot take.
+pub fn sources_for(inst: &Instance) -> Result<(String, String), DeviceError> {
+    match built_of(inst) {
+        Some(built) => Ok((built.source.to_string(), built.tensor.to_string())),
+        None => rendered(inst),
+    }
+}
+
 /// The kernels' source and the tensor-op GEMMs' source of `inst`, in that
 /// order, written at open from its geometry: the header of [`Geometry::of`]
 /// in front of the kernels' files. For a registered instance it is the text

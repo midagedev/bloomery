@@ -20,10 +20,6 @@
 //! any device that compiles them.
 
 #[path = "../shared/mutants.rs"]
-#[allow(
-    dead_code,
-    reason = "the e2e gate reads the host shim `source_of`; this gate reads `source_at`"
-)]
 mod program;
 
 pub use program::{Mutant, Program, source_at};

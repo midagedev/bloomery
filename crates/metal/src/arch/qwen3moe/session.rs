@@ -80,7 +80,7 @@ use bloomery_device::fault::Fault;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy};
+use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use chain::arch::qwen3moe::read::Sites35;
 use chain::arch::qwen3moe::walk::Walk;
 use model_hf::ModelFile;
@@ -138,17 +138,20 @@ pub fn pass_rows_max(g: &Geometry) -> usize {
 
 /// How a session of `g`'s instance feeds a prompt call when nothing sets it:
 /// in passes when the rows arm's launches take the instance's slots, a step
-/// each otherwise. The arm's slots are the router's picks and the shared
-/// expert's slot exactly when the router has a shared row, and its route
-/// table has a group for each routed expert and one for the shared expert
-/// when there is one; the instances the arm runs are those that agree on
-/// both, a layer with a shared expert and one without alike.
+/// each otherwise. A dense FFN's one slot has its own rows arm (the dense
+/// GEMMs), so an instance of one always takes passes. A routed instance's
+/// slots are the router's picks and the shared expert's slot exactly when the
+/// router has a shared row, and its route table has a group for each routed
+/// expert and one for the shared expert when there is one; the instances the
+/// arm runs are those that agree on both, a layer with a shared expert and one
+/// without alike.
 fn prefill_at_open(g: &Geometry) -> PrefillMode {
     let (router, experts) = (&g.router, &g.experts);
     let shared = router.shared == 1;
-    if experts.has_shared == shared
-        && experts.slots == experts.routed_ids + router.shared
-        && router.rows == router.experts + router.shared
+    if experts.dense
+        || (experts.has_shared == shared
+            && experts.slots == experts.routed_ids + router.shared
+            && router.rows == router.experts + router.shared)
     {
         PrefillMode::Batch
     } else {
@@ -603,7 +606,12 @@ impl Probe<'_> {
                 }
                 Ok(out)
             }
-            Node::RouterLogits(l) => whole(&ffn(l)?.logits),
+            Node::RouterLogits(l) => match &ffn(l)?.router {
+                Some(router) => whole(&router.logits),
+                None => Err(refuse(format!(
+                    "{node:?}: layer {l} has a dense FFN and no router"
+                ))),
+            },
             Node::RouterWeights(l) => whole(&ffn(l)?.weights),
             Node::ExpertRows => whole(&a.h),
             Node::Logits => whole(&a.logits),
@@ -1922,6 +1930,10 @@ where
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        if matches!(f.route, FfnRoute::Dense) {
+            // No router, so no group of its own.
+            return Ok(());
+        }
         self.one(Op::Route(l.layer), |o| o.route(l, f))
     }
 
@@ -2006,6 +2018,10 @@ impl ChainOps for PassLayers<'_> {
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        if matches!(f.route, FfnRoute::Dense) {
+            // No router, so no group of its own.
+            return Ok(());
+        }
         self.one(Some(l.layer), |o| o.route(l, f))
     }
 
@@ -2181,6 +2197,10 @@ impl ChainOps for PassProfiler<'_> {
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        if matches!(f.route, FfnRoute::Dense) {
+            // No router, so no group of its own.
+            return Ok(());
+        }
         self.one(Op::Route(l.layer), |o| o.route(l, f))
     }
 
@@ -2287,6 +2307,10 @@ impl ChainOps for Profiler<'_> {
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        if matches!(f.route, FfnRoute::Dense) {
+            // No router, so no group of its own.
+            return Ok(());
+        }
         self.one(GroupKind::Router, Some(l.layer), |o| o.route(l, f))
     }
 
@@ -2320,6 +2344,20 @@ mod tests {
                 inst.name
             );
         }
+    }
+
+    /// A dense FFN's one slot has its own rows arm: its instance feeds a
+    /// prompt call in passes, whatever the router the program holds.
+    #[test]
+    fn a_dense_instance_opens_in_passes() {
+        let mut inst = crate::instance::QWEN35MOE_A3B;
+        inst.key.ffn = crate::instance::FfnAxes::Dense { ff: 512 };
+        let g = Geometry::of(&inst);
+        assert!(g.experts.dense);
+        assert_eq!(prefill_at_open(&g), PrefillMode::Batch);
+        // A pass of the dense instance holds the family's most rows: its one
+        // slot a row.
+        assert_eq!(pass_rows_max(&g), CHECKPOINT_EVERY as usize);
     }
 
     /// A geometry whose slots are not the picks and the shared slot the

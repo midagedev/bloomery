@@ -1,7 +1,7 @@
 //! The launches of the prompt pass's routing and grouped experts: the router's
 //! logits over rows, the selection of every row's slots, the route table, the
-//! grouped GEMM over the table's tiles, the combine and the head-norm scale
-//! over rows. The kernels are `kernels/route.metal` and
+//! grouped GEMM over the table's tiles, the combine, the head-norm scale and a
+//! dense FFN's SwiGLU over rows. The kernels are `kernels/route.metal` and
 //! `kernels/gemm_routed.metal`.
 //!
 //! A pass of `rows` rows has `rows * ExpertsGeom::slots` slots: a row's picks
@@ -45,6 +45,9 @@ pub const TABLE_THREADS: usize = 1024;
 
 /// The threads of the combine's threadgroup a row.
 const COMBINE_THREADS: usize = 256;
+
+/// The threads of the SwiGLU's threadgroup: a run of columns of one row.
+const SWIGLU_THREADS: usize = 256;
 
 /// The table's entries for `slots` slots over `groups` groups: every group's
 /// tiles are full but its last, so the count is at most the slots' tiles plus
@@ -124,6 +127,7 @@ pub(crate) struct RoutedPipelines {
     table: Pipeline,
     combine: Pipeline,
     headnorm: Pipeline,
+    swiglu: Pipeline,
 }
 
 impl RoutedPipelines {
@@ -144,6 +148,7 @@ impl RoutedPipelines {
             table: library.pipeline("route_table")?,
             combine: library.pipeline("combine_rows")?,
             headnorm: library.pipeline("headnorm_rows")?,
+            swiglu: library.pipeline("swiglu_rows")?,
         })
     }
 
@@ -363,6 +368,24 @@ pub struct CombineParams<'w> {
     pub x: WindowMut<'w, f32, MetalDevice>,
     /// Elements between rows of `x`, a multiple of four.
     pub x_stride: usize,
+}
+
+const SWIGLU_WHAT: &str = "swiglu rows";
+
+/// A dense FFN's two projections combined,
+/// `gate[row][c] = silu(gate[row][c]) * up[row][c]`, in place over the gate's
+/// rows.
+pub struct SwigluRowsParams<'w> {
+    /// Rows in the pass.
+    pub rows: usize,
+    /// The columns of a row: the FFN's width.
+    pub cols: usize,
+    /// The gate projection's rows, which the activation replaces.
+    pub gate: WindowMut<'w, f32, MetalDevice>,
+    /// The up projection's rows, the gate's shape.
+    pub up: Window<'w, f32, MetalDevice>,
+    /// The f32 elements between the rows of both.
+    pub stride: usize,
 }
 
 const HEADNORM_WHAT: &str = "headnorm rows";
@@ -753,6 +776,35 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.x)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.dispatch_groups(p.rows, 1, COMBINE_THREADS)
+    }
+
+    /// Encode the SwiGLU of a dense FFN's rows: a run of columns of one row a
+    /// threadgroup. A shape the kernel does not take or a window that is not
+    /// that shape is refused by name and nothing is encoded.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn swiglu_rows(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: SwigluRowsParams<'_>,
+    ) -> Result<(), DeviceError> {
+        if p.rows == 0 || p.cols == 0 {
+            return Err(range(
+                SWIGLU_WHAT,
+                format!("{} rows of {} columns is empty", p.rows, p.cols),
+            ));
+        }
+        check_strided(SWIGLU_WHAT, "gate", p.gate.len(), p.rows, p.stride, p.cols)?;
+        check_strided(SWIGLU_WHAT, "up", p.up.len(), p.rows, p.stride, p.cols)?;
+        let args = args_bytes([
+            word(SWIGLU_WHAT, "the column count", p.cols)?,
+            word(SWIGLU_WHAT, "the stride", p.stride)?,
+        ]);
+        encoder.set_pipeline(&self.routed.swiglu);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of_mut(&p.gate)?)?;
+        slot.set(Binding::of(&p.up)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.dispatch_groups(p.cols.div_ceil(SWIGLU_THREADS), p.rows, SWIGLU_THREADS)
     }
 
     /// Encode the head-norm scale over rows: a threadgroup a (row, head). A

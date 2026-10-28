@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::count::{
-    GroupKind, KINDS, Layer, LiveKeys, Ticket, token_count,
+    FfnKind, GroupKind, KINDS, Layer, LiveKeys, Ticket, token_count,
 };
 use bloomery_metal::arch::qwen3moe::session::{Node, ProfileGroup, Session, StepMode};
 use bloomery_metal::device::MetalDevice;
@@ -77,7 +77,9 @@ fn kinds_expected(layers: &[Layer], _live: LiveKeys) -> Vec<GroupKind> {
                 out.push(GroupKind::DeltaOut);
             }
         }
-        out.push(GroupKind::Router);
+        if layer.ffn() == FfnKind::Routed {
+            out.push(GroupKind::Router);
+        }
         out.push(GroupKind::GateUp);
         out.push(GroupKind::Down);
     }

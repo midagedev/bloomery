@@ -12,6 +12,9 @@
 //                      sorted list, summed in slot order
 //   headnorm_rows      the gated delta numerator times each head's norm
 //                      scale, in place: the head-norm mat-vec's input
+//   swiglu_rows        a dense FFN's gate rows replaced by silu(gate) * up,
+//                      the experts' SwiGLU (pair_swiglu) over two dense GEMMs'
+//                      outputs
 //
 // The route table. A pass of R rows has 9 R slots: a row's eight picks and
 // the shared expert, whose id is the router's 256 (an instance with no gated
@@ -251,4 +254,30 @@ kernel void headnorm_rows(device float *g [[buffer(0)]],
         s = NAN;
     }
     g[(ulong)row * args.g_stride + head * BLOOMERY_DELTA_HEAD_COLS + tid] *= s;
+}
+
+struct SwigluRowsArgs {
+    uint cols;
+    uint stride;
+};
+
+static_assert(sizeof(SwigluRowsArgs) == 8, "SwigluRowsArgs is two words");
+
+// gate[row][c] = silu(gate[row][c]) * up[row][c], in place over the gate's
+// rows: the pair's epilogue (pair_swiglu, the decode pair's and the grouped
+// pair tile's) over the two outputs of a dense FFN's gate and up GEMMs. A
+// threadgroup is a run of columns of one row, a thread a column.
+kernel void swiglu_rows(device float *gate [[buffer(0)]],
+                        device const float *up [[buffer(1)]],
+                        constant SwigluRowsArgs &args [[buffer(2)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint threads [[threads_per_threadgroup]])
+{
+    const uint col = tg.x * threads + tid;
+    if (col >= args.cols) {
+        return;
+    }
+    const ulong at = (ulong)tg.y * (ulong)args.stride + (ulong)col;
+    gate[at] = pair_swiglu(gate[at], up[at]);
 }

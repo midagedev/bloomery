@@ -33,7 +33,7 @@ use chain::rope::{RopeSpec, RopeTable};
 use chain::site::file_site;
 use gguf::Split;
 use gguf::quant::GgmlType;
-use model::arch::models::{Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
+use model::arch::models::{Act, Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
 use model::arch::names;
 
 use super::arena::LANES;
@@ -305,10 +305,12 @@ pub(super) enum MixerLayout {
 }
 
 /// A layer's FFN half: the router's values and the experts' sites, the
-/// shared expert's apart from the routed stacks.
+/// shared expert's apart from the routed stacks. A dense layer has no router:
+/// its three matrices are the one expert of the sites, picked every token.
 pub(super) struct FfnLayout {
     pub(super) norm: Values,
-    pub(super) gate_inp: Values,
+    /// The router's weight; none for a dense FFN.
+    pub(super) gate_inp: Option<Values>,
     pub(super) gate_up_quant: Quant,
     pub(super) gate: Site,
     pub(super) up: Site,
@@ -1075,14 +1077,15 @@ fn ffn_checks(
             ..
         } => true,
         FfnRoute::Router { shared: None, .. } => false,
-        FfnRoute::Dense => {
-            at.push(refuse(
-                "a dense FFN, which this backend's experts do not run",
-            ));
-            return None;
-        }
+        FfnRoute::Dense => return dense_ffn_checks(at, t, plan, hidden),
     };
     let (router, experts) = (&t.geom.router, &t.geom.experts);
+    if experts.dense {
+        at.push(refuse(
+            "a routed FFN, and the instance's experts run one dense slot",
+        ));
+        return None;
+    }
     if joined != (router.shared == 1) {
         at.push(refuse(if joined {
             "a shared expert, which the instance's router and experts run none of"
@@ -1165,13 +1168,58 @@ fn ffn_checks(
     let (gate, up, down) = (gate?, up?, down?);
     ok.then_some(FfnLayout {
         norm: norm?,
-        gate_inp: gate_inp?,
+        gate_inp: Some(gate_inp?),
         gate_up_quant: gate.quant,
         down_quant: down.quant,
         gate,
         up,
         down,
         shared,
+    })
+}
+
+/// A dense layer's FFN: its gate, up and down are the one expert of the
+/// instance's one-expert stacks, at the instance's width, the pair's two in one
+/// type. The launches read it as the experts' one slot, id 0 at weight 1, and no
+/// router weight is read.
+fn dense_ffn_checks(
+    at: &mut At<'_>,
+    t: &Table<'_>,
+    plan: &LayerPlan,
+    hidden: usize,
+) -> Option<FfnLayout> {
+    let experts = &t.geom.experts;
+    if !experts.dense {
+        at.push(refuse(
+            "a dense FFN, and the instance's experts run routed slots",
+        ));
+        return None;
+    }
+    let f = &plan.ffn;
+    let gate = at.ok(t.site(&f.gate, hidden, experts.k));
+    let up = at.ok(t.site(&f.up, hidden, experts.k));
+    let down = at.ok(t.site(&f.down, experts.k, hidden));
+    let mut ok = true;
+    if let (Some(g), Some(u)) = (&gate, &up)
+        && u.quant != g.quant
+    {
+        at.push(refuse(format!(
+            "gate {:?}, up {:?}; the pair runs one type",
+            g.quant, u.quant
+        )));
+        ok = false;
+    }
+    let norm = at.ok(t.f32s(&f.ffn_norm, hidden));
+    let (gate, up, down) = (gate?, up?, down?);
+    ok.then_some(FfnLayout {
+        norm: norm?,
+        gate_inp: None,
+        gate_up_quant: gate.quant,
+        down_quant: down.quant,
+        gate,
+        up,
+        down,
+        shared: None,
     })
 }
 
@@ -1220,13 +1268,21 @@ fn layer_checks(
             None
         }
     };
-    let Ffn::Moe(m) = &layer.ffn else {
-        at.push(refuse(
-            "a dense FFN, which this backend's experts do not run",
-        ));
-        return None;
+    // A dense FFN is the one expert of a one-expert stack, picked by every
+    // token: the shape the layers share, and the width the experts run.
+    let (shape, width) = match &layer.ffn {
+        Ffn::Moe(m) => ((m.experts as usize, m.top_k as usize), m.expert_ff as usize),
+        Ffn::Dense { ff, act } => {
+            if !matches!(act, Act::SwiGlu { limit: None }) {
+                at.push(refuse(format!(
+                    "a dense FFN of {}; the pair runs SwiGLU",
+                    act.what()
+                )));
+                return None;
+            }
+            ((1, 1), *ff as usize)
+        }
     };
-    let shape = (m.experts as usize, m.top_k as usize);
     let mut ok = true;
     match shared.moe {
         None => shared.moe = Some(shape),
@@ -1238,11 +1294,15 @@ fn layer_checks(
             ok = false;
         }
     }
-    if m.expert_ff as usize != t.geom.experts.k {
-        at.push(refuse(format!(
-            "an expert of {}; the experts run {}",
-            m.expert_ff, t.geom.experts.k
-        )));
+    if width != t.geom.experts.k {
+        at.push(refuse(if matches!(layer.ffn, Ffn::Dense { .. }) {
+            format!(
+                "a dense FFN of {width} values; the experts run {}",
+                t.geom.experts.k
+            )
+        } else {
+            format!("an expert of {width}; the experts run {}", t.geom.experts.k)
+        }));
         ok = false;
     }
     let ffn = ffn_checks(at, t, plan, hidden, shape, l);
@@ -1350,16 +1410,22 @@ impl Checked {
             {
                 b.weights.add(s.bytes());
             }
-            for v in [Some(&f.norm), Some(&f.gate_inp), sh.map(|s| &s.gate_inp)]
+            for v in [Some(&f.norm), f.gate_inp.as_ref(), sh.map(|s| &s.gate_inp)]
                 .into_iter()
                 .flatten()
             {
                 b.weights.add(f32s(v.len));
             }
-            // The router's logits, picks, weights, partials and ticket.
-            let ids = g.top_k + geom.router.shared;
-            for words in [geom.router.rows, ids, ids, geom.router.partials, 1] {
-                b.scratch.add(f32s(words));
+            // The picks and their weights, and a router's logits, partials
+            // and ticket: a dense layer has the fixed route alone.
+            let slots = geom.experts.slots;
+            let words = if f.gate_inp.is_some() {
+                vec![geom.router.rows, slots, slots, geom.router.partials, 1]
+            } else {
+                vec![slots, slots]
+            };
+            for n in words {
+                b.scratch.add(f32s(n));
             }
         }
         for words in [
@@ -1408,6 +1474,7 @@ mod tests {
     use gguf::write::{Layout as FileLayout, TensorDecl};
 
     use super::*;
+    use crate::instance::{FfnAxes, MoeAxes};
 
     /// A file's header and tensor table, in memory, at a registered row's
     /// shapes: two layers (the Qwen3.6 row's a delta layer, then an attention
@@ -1437,14 +1504,21 @@ mod tests {
         /// delta layer ahead of it when the row has a delta axis).
         fn of(inst: &Instance) -> Synthetic {
             let key = &inst.key;
-            let (arch, pre, delta) = match (key.delta, key.moe.router.rule.gated) {
-                (Some(d), true) => ("qwen35moe", "qwen35", Some(d)),
-                (None, false) => ("qwen3moe", "qwen2", None),
+            let moe = key.routed();
+            let (arch, pre, delta) = match (key.delta, moe.map(|m| m.router.rule.gated)) {
+                (Some(d), Some(true)) => ("qwen35moe", "qwen35", Some(d)),
+                (None, Some(false)) => ("qwen3moe", "qwen2", None),
+                // A dense qwen35 file: the delta net beside the attention, each
+                // layer's FFN one SwiGLU block.
+                (Some(d), None) => ("qwen35", "qwen35", Some(d)),
                 _ => panic!("{}: no synthetic file is written for this shape", inst.name),
             };
             let u = |k: &str, v: u32| (format!("{arch}.{k}"), Value::U32(v));
             let a = &key.attn;
-            let ff = key.moe.expert_ff;
+            let ff = match key.ffn {
+                FfnAxes::Routed(m) => m.expert_ff,
+                FfnAxes::Dense { ff } => ff,
+            };
             let mut kvs = vec![
                 (
                     gguf::GENERAL_ARCHITECTURE.to_owned(),
@@ -1467,17 +1541,24 @@ mod tests {
                     format!("{arch}.attention.layer_norm_rms_epsilon"),
                     Value::F32(1e-6),
                 ),
-                u("expert_count", key.moe.router.experts),
-                u("expert_used_count", key.moe.top_k),
                 u("attention.key_length", a.row.head),
                 u("attention.value_length", a.row.value),
-                u("expert_feed_forward_length", ff),
                 (format!("{arch}.rope.freq_base"), Value::F32(10_000_000.0)),
                 u("rope.dimension_count", a.rot),
             ];
+            match moe {
+                Some(m) => kvs.extend([
+                    u("expert_count", m.router.experts),
+                    u("expert_used_count", m.top_k),
+                    u("expert_feed_forward_length", ff),
+                ]),
+                None => kvs.push(u("feed_forward_length", ff)),
+            }
             if let Some(d) = delta {
+                if moe.is_some() {
+                    kvs.push(u("expert_shared_feed_forward_length", ff));
+                }
                 kvs.extend([
-                    u("expert_shared_feed_forward_length", ff),
                     u("ssm.conv_kernel", d.conv_taps),
                     u("ssm.state_size", d.head_cols),
                     u("ssm.group_count", KEY_HEADS),
@@ -1500,7 +1581,10 @@ mod tests {
                 tensors: Vec::new(),
             };
             let hidden = u64::from(key.hidden);
-            let (ff, experts) = (u64::from(ff), u64::from(key.moe.router.experts));
+            let (ff, experts) = (
+                u64::from(ff),
+                moe.map_or(1, |m| u64::from(m.router.experts)),
+            );
             let q = GgmlType::Q4_K;
             t.add("token_embd.weight", &[hidden, VOCAB], q);
             t.add("output.weight", &[hidden, VOCAB], GgmlType::Q6_K);
@@ -1545,6 +1629,12 @@ mod tests {
                     "ffn_norm.weight"
                 };
                 t.add(&b(norm), &[hidden], GgmlType::F32);
+                if moe.is_none() {
+                    t.add(&b("ffn_gate.weight"), &[hidden, ff], q);
+                    t.add(&b("ffn_up.weight"), &[hidden, ff], q);
+                    t.add(&b("ffn_down.weight"), &[ff, hidden], q);
+                    continue;
+                }
                 t.add(&b("ffn_gate_inp.weight"), &[hidden, experts], GgmlType::F32);
                 if delta.is_some() {
                     t.add(&b("ffn_gate_inp_shexp.weight"), &[hidden], GgmlType::F32);
@@ -1797,6 +1887,123 @@ mod tests {
         assert_eq!(bytes.rows, class(&rows));
     }
 
+    /// A dense file's FFN is an instance's axis: its layers are the experts'
+    /// one slot, the arena holds no router weight, and the plan names the
+    /// fixed route.
+    #[test]
+    fn a_dense_file_opens_at_a_dense_instance_made_for_it() {
+        let mut inst = instance::QWEN35MOE_A3B;
+        inst.key.ffn = FfnAxes::Dense { ff: 512 };
+        let t = Synthetic::of(&inst);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let summary = out.spec.clone().expect("the description reads");
+        assert_eq!((summary.experts, summary.picks), (0, 0));
+        let checked = out.checked.expect("a checked file");
+        assert_eq!(checked.instance.name, instance::UNREGISTERED);
+        assert_eq!(checked.instance.key, inst.key, "the instance");
+        assert!(checked.geom.experts.dense);
+        assert_eq!((checked.layout.n_experts, checked.layout.top_k), (1, 1));
+        for (layer, plan) in checked.layout.layers.iter().zip(&checked.plans) {
+            assert!(layer.ffn.gate_inp.is_none() && layer.ffn.shared.is_none());
+            assert!(matches!(plan.ffn.route, FfnRoute::Dense));
+        }
+        let bytes = checked.bytes().expect("the bytes");
+        assert_eq!(bytes.weights.requested, t.tensor_bytes(), "the weights");
+    }
+
+    /// `Checked::bytes` of a dense file: a layer's fixed route (one id, one
+    /// weight) and no router buffers, and a rows arena with no routed buffers
+    /// but the gate's and the up's rows of the FFN's width.
+    #[test]
+    fn the_bytes_of_a_dense_file_hold_the_fixed_route_and_two_ffn_rows() {
+        use super::super::arena::RECORD_SLOTS;
+
+        const N_K: usize = KEY_HEADS as usize;
+        let mut inst = instance::QWEN35MOE_A3B;
+        inst.key.ffn = FfnAxes::Dense { ff: 512 };
+        let g = Geometry::of(&inst);
+        let (value_heads, head_cols) = (g.delta.value_heads, g.delta.head_cols);
+        let (hidden, vocab) = (HIDDEN as usize, VOCAB as usize);
+        let checked = check(&Synthetic::of(&inst).split(), CTX)
+            .checked
+            .expect("a checked file");
+        let bytes = checked.bytes().expect("the bytes");
+        let f32s = |n: usize| count(n) * 4;
+
+        let channels = (2 * N_K + value_heads) * head_cols;
+        let proj = channels + value_heads * head_cols + 2 * value_heads;
+        let attn_partials = g
+            .attn
+            .partials_len(segments_for_keys(CTX as u32) as usize)
+            .expect("the partials fit");
+        let mut scratch: Vec<u64> = [1usize; 4].into_iter().map(f32s).collect();
+        scratch.extend(
+            [
+                hidden,                        // x
+                proj,                          // proj
+                value_heads * head_cols,       // g
+                g.delta.partials_stride,       // delta_partials
+                value_heads * head_cols,       // attn
+                attn_partials,                 // attn_partials
+                1,                             // attn_ticket
+                CTX * g.attn.rot,              // rope
+                g.experts.slots * g.experts.k, // h
+                vocab,                         // logits
+            ]
+            .map(f32s),
+        );
+        scratch.push(count(head_groups(vocab)) * 8); // candidates
+        scratch.extend([1, RECORD_SLOTS, 1, LANES].map(f32s)); // head_ticket, step_id, id_in, lane
+        scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
+        assert_eq!(bytes.scratch, class(&scratch));
+
+        let cap = pass_rows_max(&g).min(CTX);
+        let prepared = g.delta.prepared_elems(N_K).expect("the prepared row fits");
+        let rows = [
+            cap,
+            cap * hidden,
+            cap * hidden,
+            cap * proj.next_multiple_of(4),
+            cap * value_heads * head_cols,
+            cap * g.delta.partials_stride,
+            cap * prepared,
+            cap * g.experts.k, // the gate's rows
+            cap * g.experts.k, // the up's rows
+        ]
+        .map(f32s);
+        assert_eq!(bytes.rows, class(&rows));
+    }
+
+    /// A dense layer the pair cannot run is refused by name at its layer.
+    #[test]
+    fn a_dense_layer_the_launches_cannot_run_is_refused_by_name() {
+        let mut inst = instance::QWEN35MOE_A3B;
+        inst.key.ffn = FfnAxes::Dense { ff: 512 };
+        // The gate and the up in two types: the pair launch reads one.
+        let t = Synthetic::of(&inst).ty("blk.0.ffn_up.weight", GgmlType::Q6_K);
+        let got = texts(&t.split(), CTX);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].ends_with("layer 0: gate Q4K, up Q6K; the pair runs one type"),
+            "{got:?}"
+        );
+        // A down of another width than the experts run.
+        let t = Synthetic::of(&inst).dims("blk.1.ffn_down.weight", &[1024, 2048]);
+        let got = texts(&t.split(), CTX);
+        assert!(
+            got.iter().any(|e| e.contains("blk.1.ffn_down.weight")),
+            "{got:?}"
+        );
+        // F32 rows have no pair or fold entry.
+        let t = Synthetic::of(&inst).ty("blk.0.ffn_gate.weight", GgmlType::F32);
+        let got = texts(&t.split(), CTX);
+        assert!(
+            got.iter().any(|e| e.contains("blk.0.ffn_gate.weight")),
+            "{got:?}"
+        );
+    }
+
     #[test]
     fn the_architecture_verdict_is_the_one_item() {
         // An architecture no description reader reads.
@@ -1839,7 +2046,10 @@ mod tests {
     fn a_geometry_no_row_registers_is_judged_at_its_own_instance() {
         let mut inst = instance::QWEN35MOE_A3B;
         inst.key.hidden = 3072;
-        inst.key.moe.expert_ff = 1024;
+        inst.key.ffn = FfnAxes::Routed(MoeAxes {
+            expert_ff: 1024,
+            ..inst.key.routed().expect("a routed row")
+        });
         let t = Synthetic::of(&inst);
         let out = check(&t.split(), CTX);
         assert!(out.items.is_empty(), "{:?}", out.items);

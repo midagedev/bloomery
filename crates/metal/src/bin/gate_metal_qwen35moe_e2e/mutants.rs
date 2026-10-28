@@ -21,30 +21,53 @@
 //! buffer that skips the token boundary's wait — are the host's too and have
 //! no kernel side. The host edits themselves are one-off edits recorded in the
 //! round that proves the clause.
+//!
+//! A row names which tables its program takes (`row::Mutants`): the routed
+//! rows' are [`MUTANTS`], [`KEPT`] and [`TENSOR_MUTANTS`]; the dense row's
+//! are [`DENSE`], edits of the pair and fold kernels at the dense FFN's one
+//! slot, and of the dense prompt's SwiGLU. The edits compile into the
+//! row's own instance's source (`program::source_at`), so they land in the
+//! program the row runs.
 
 #[path = "../shared/mutants.rs"]
 mod program;
 
-pub use program::{Mutant, Program, source_of};
+use super::row::Mutants;
 
-/// Every mutant of both tables, with the program it edits.
-pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
-    program::all(MUTANTS, TENSOR_MUTANTS)
+pub use program::{Mutant, Program, source_at};
+
+/// Every mutant of `set`'s tables, with the program it edits.
+pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
+    let (main, tensor): (&'static [Mutant], &'static [Mutant]) = match set {
+        Mutants::Routed => (MUTANTS, TENSOR_MUTANTS),
+        Mutants::Dense => (DENSE, &[]),
+        Mutants::None => (&[], &[]),
+    };
+    program::all(main, tensor)
 }
 
-/// The mutant of this name, and the program it edits.
-pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
-    all().find(|(m, _)| m.name == name).or_else(|| {
-        KEPT.iter()
+/// The mutants of `set` no staying clause is expected to turn red.
+pub fn kept_of(set: Mutants) -> &'static [Mutant] {
+    match set {
+        Mutants::Routed => KEPT,
+        Mutants::Dense | Mutants::None => &[],
+    }
+}
+
+/// The mutant of this name in `set`, and the program it edits.
+pub fn find(set: Mutants, name: &str) -> Option<(&'static Mutant, Program)> {
+    all(set).find(|(m, _)| m.name == name).or_else(|| {
+        kept_of(set)
+            .iter()
             .find(|m| m.name == name)
             .map(|m| (m, Program::Main))
     })
 }
 
-/// Whether `name` is in [`KEPT`]: a mutant no staying clause is expected to
-/// turn red, which `--mutant` runs over every clause.
-pub fn kept(name: &str) -> bool {
-    KEPT.iter().any(|m| m.name == name)
+/// Whether `name` is in `set`'s kept mutants: no staying clause is expected
+/// to turn red, which `--mutant` runs over every clause.
+pub fn kept(set: Mutants, name: &str) -> bool {
+    kept_of(set).iter().any(|m| m.name == name)
 }
 
 pub const MUTANTS: &[Mutant] = &[
@@ -215,3 +238,40 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[Mutant {
     why: "the routed pair's gate and up accumulators swap places in the tensor-op SwiGLU",
     edits: &[("pair_swiglu(cg[i], cu[i])", "pair_swiglu(cu[i], cg[i])", 1)],
 }];
+
+/// The dense FFN's defects. A dense layer is expert 0 of a one-expert stack
+/// run at one slot with weight 1, so a defect in the slot's id or weight
+/// reaches every layer, and `m_logits` (every layer's FFN, one token a step)
+/// sees it. The prompt's dense GEMM sites are the pass's: `q_free` holds the
+/// pass to the stepped run, which runs the pair and fold kernels.
+pub const DENSE: &[Mutant] = &[
+    Mutant {
+        name: "dense_slot_one",
+        clause: "m_logits",
+        why: "the dense FFN's pair reads id 1 where its stack holds one expert: the pair \
+              raises the expert-id site and the step is refused",
+        edits: &[("int id = ids[slot];", "int id = ids[slot] + 1;", 1)],
+    },
+    Mutant {
+        name: "dense_weight_half",
+        clause: "m_logits",
+        why: "the dense FFN's fold weight is 0.5 where the route lays 1: every layer adds half \
+              its FFN output",
+        edits: &[(
+            "float scale = w[Q::fold_slot(ib)];",
+            "float scale = 0.5f * w[Q::fold_slot(ib)];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "dense_pass_swiglu_swapped",
+        clause: "q_free",
+        why: "the dense prompt's SwiGLU takes the up rows through the activation and scales \
+              them by the gate: the pass's layer outputs part from the stepped run's",
+        edits: &[(
+            "gate[at] = pair_swiglu(gate[at], up[at]);",
+            "gate[at] = pair_swiglu(up[at], gate[at]);",
+            1,
+        )],
+    },
+];

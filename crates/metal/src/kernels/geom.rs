@@ -112,7 +112,9 @@ pub struct DeltaGeom {
     pub q_scale: f32,
 }
 
-/// The numbers of the router for one instance.
+/// The numbers of the router for one instance: its own, or the axes its
+/// kernels are compiled at when its files have a dense FFN and launch none
+/// ([`Instance::router_built`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RouterGeom {
     /// The routed experts.
@@ -152,6 +154,9 @@ pub struct ExpertsGeom {
     pub has_shared: bool,
     /// The expert intermediate width: the pair's rows and the fold's K.
     pub k: usize,
+    /// The FFN is dense: its one slot is expert 0 of one-expert stacks at
+    /// weight 1, no router picks it and no shared expert follows it.
+    pub dense: bool,
 }
 
 /// The launch geometry of one instance: every number the host sizes a launch,
@@ -204,9 +209,10 @@ impl Geometry {
         let value_heads = delta.value_heads as usize;
         let head_cols = delta.head_cols as usize;
         let conv_taps = delta.conv_taps as usize;
+        let router = inst.router_built();
         let rows = router_geom::rows(inst);
         let slots = experts_geom::slots(inst);
-        let routed_ids = key.moe.top_k as usize;
+        let routed_ids = experts_geom::routed_ids(inst);
         Geometry {
             instance: *inst,
             hidden,
@@ -235,13 +241,13 @@ impl Geometry {
                 q_scale: attention_geom::scale_of(head_cols),
             },
             router: RouterGeom {
-                experts: key.moe.router.experts as usize,
+                experts: router.router.experts as usize,
                 rows,
-                shared: key.moe.router.rule.gated as usize,
+                shared: router.router.rule.gated as usize,
                 k: hidden,
                 partials: router_geom::partials(inst),
                 groups: router_geom::groups(inst),
-                top_k_max: routed_ids,
+                top_k_max: router.top_k as usize,
                 float4s: router_geom::float4s(hidden),
                 logit_stride: router_geom::logit_stride(rows),
             },
@@ -250,7 +256,8 @@ impl Geometry {
                 routed_ids,
                 shared_slot: experts_geom::shared_slot(inst),
                 has_shared: slots > routed_ids,
-                k: key.moe.expert_ff as usize,
+                k: experts_geom::expert_k(inst),
+                dense: key.is_dense(),
             },
         }
     }
@@ -279,7 +286,7 @@ mod tests {
     use models::shape::{self, RouterBody};
 
     use super::*;
-    use crate::instance::{DeltaAxes, QWEN35MOE_A3B, REGISTERED};
+    use crate::instance::{DeltaAxes, FfnAxes, MoeAxes, QWEN35MOE_A3B, REGISTERED};
 
     /// A case of the refusal table: how Qwen3.6's row is moved, and the kernel,
     /// axis and value (a prefix of it) the geometry is then refused at.
@@ -287,6 +294,13 @@ mod tests {
         fn(&mut Instance),
         (&'static str, &'static str, &'static str),
     );
+
+    /// `inst`'s routed axes, edited by `edit`.
+    fn moe(inst: &mut Instance, edit: impl FnOnce(&mut MoeAxes)) {
+        let mut axes = inst.key.routed().expect("a routed row");
+        edit(&mut axes);
+        inst.key.ffn = FfnAxes::Routed(axes);
+    }
 
     /// Attention of `n_head` heads of `head` values over the shape table's
     /// row of a group of eight.
@@ -321,7 +335,7 @@ mod tests {
         // A shape no row registers, with the axes the kernels take free.
         let mut inst = QWEN35MOE_A3B;
         inst.key.hidden = 3072;
-        inst.key.moe.expert_ff = 1024;
+        moe(&mut inst, |m| m.expert_ff = 1024);
         inst.key.attn.rot = 32;
         assert_eq!(Geometry::of(&inst).check(), Ok(()));
     }
@@ -334,11 +348,15 @@ mod tests {
         let cases: [Case; 15] = [
             (|i| i.key.hidden = 3136, ("router", "hidden", "3136")),
             (
-                |i| i.key.moe.router = shape::router_row(RouterBody::BiasedSigmoid, 256),
+                |i| {
+                    moe(i, |m| {
+                        m.router = shape::router_row(RouterBody::BiasedSigmoid, 256);
+                    });
+                },
                 ("router", "router rule", "Sigmoid scores, bias yes"),
             ),
             (
-                |i| i.key.moe.expert_ff = 700,
+                |i| moe(i, |m| m.expert_ff = 700),
                 ("experts", "expert ff", "700"),
             ),
             (|i| attention(i, 64, 16), ("attention", "head", "64")),
@@ -401,6 +419,48 @@ mod tests {
         assert_eq!(
             Geometry::of(&inst).check().unwrap_err().to_string(),
             "router: hidden is 3136; it must be a multiple of 1024 (a float4 a lane over 256 threads)"
+        );
+    }
+
+    #[test]
+    fn a_dense_ffn_is_one_slot_of_its_width_and_launches_no_router() {
+        let dense = |hidden: u32, ff: u32| {
+            let mut inst = QWEN35MOE_A3B;
+            inst.key.hidden = hidden;
+            inst.key.ffn = FfnAxes::Dense { ff };
+            inst
+        };
+        // Qwen3.8-27B's FFN: 17,408 values over a residual of 5,120.
+        let inst = dense(5120, 17_408);
+        let g = Geometry::of(&inst);
+        assert_eq!(g.check(), Ok(()));
+        let e = g.experts;
+        assert_eq!(
+            (
+                e.slots,
+                e.routed_ids,
+                e.shared_slot,
+                e.has_shared,
+                e.k,
+                e.dense
+            ),
+            (1, 1, 1, false, 17_408, true)
+        );
+        // The router's kernels are in the program at Qwen3.6's axes and launch
+        // nowhere: the header's router rows are the unlaunched ones.
+        let built = QWEN35MOE_A3B.router_built();
+        assert_eq!(inst.router_built(), built);
+        assert_eq!(g.router.experts, built.router.experts as usize);
+        assert_eq!(g.router.top_k_max, built.top_k as usize);
+        assert_eq!(g.router.k, 5120);
+        // A width the fold's blocks do not divide is refused by name.
+        let got = Geometry::of(&dense(5120, 17_400)).check();
+        let Err(why) = &got else {
+            panic!("a dense FFN of 17400 values: {got:?}");
+        };
+        assert_eq!(
+            (why.kernel, why.axis, why.value.as_str()),
+            ("experts", "expert ff", "17400")
         );
     }
 
@@ -494,7 +554,7 @@ mod tests {
             assert_eq!(d.q_scale.to_bits(), ik.to_bits(), "{name}: q scale");
 
             let r = g.router;
-            let moe = &key.moe;
+            let moe = key.routed().expect("a registered row is routed");
             assert_eq!(r.experts, moe.router.experts as usize, "{name}: experts");
             assert_eq!(
                 r.shared,
@@ -527,6 +587,7 @@ mod tests {
             );
             assert_eq!(e.shared_slot, e.routed_ids, "{name}: shared slot");
             assert_eq!(e.k, moe.expert_ff as usize, "{name}: expert k");
+            assert!(!e.dense, "{name}: a routed row is not dense");
 
             if *inst == HOST {
                 assert_eq!(g, HOST_GEOMETRY, "{name}: the host's geometry");

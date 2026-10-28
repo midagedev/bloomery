@@ -24,10 +24,20 @@ pub struct Instance {
 pub struct Key {
     /// The residual width: the router's K, a trip count its lanes unroll.
     pub hidden: u32,
-    pub moe: MoeAxes,
+    pub ffn: FfnAxes,
     pub attn: AttnAxes,
     /// The gated delta net's axes; none for a file of no delta layer.
     pub delta: Option<DeltaAxes>,
+}
+
+/// The FFN every layer of a file has: an instance compiles one kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnAxes {
+    /// A routed FFN: the router's picks, then the experts they name.
+    Routed(MoeAxes),
+    /// A dense FFN of `ff` values: the experts' launches at one slot, expert
+    /// 0 of a one-expert stack, at weight 1, and no router.
+    Dense { ff: u32 },
 }
 
 /// A routed layer's axes.
@@ -69,6 +79,19 @@ pub struct DeltaAxes {
     pub conv_taps: u32,
 }
 
+/// The routed FFN of the 256-expert row: the gated softmax router over 256
+/// experts and the shared expert, eight picks of 512 values.
+const GATED_ROUTED: MoeAxes = MoeAxes {
+    router: shape::router_row(RouterBody::Qwen35moe, 256),
+    top_k: 8,
+    expert_ff: 512,
+};
+
+/// The routed axes an instance of a dense FFN compiles its router's kernels
+/// at: every instance's translation unit holds them, and no layer of its
+/// files launches them.
+const ROUTER_UNLAUNCHED: MoeAxes = GATED_ROUTED;
+
 /// Qwen3.6-35B-A3B's gated delta net.
 const QWEN35_GDN: DeltaAxes = DeltaAxes {
     value_heads: 32,
@@ -95,11 +118,7 @@ pub const QWEN35MOE_A3B: Instance = Instance {
     name: "qwen35moe_a3b",
     key: Key {
         hidden: 2048,
-        moe: MoeAxes {
-            router: shape::router_row(RouterBody::Qwen35moe, 256),
-            top_k: 8,
-            expert_ff: 512,
-        },
+        ffn: FfnAxes::Routed(GATED_ROUTED),
         attn: AttnAxes {
             row: match shape::gqa_row(256, 16 / 2) {
                 Some(r) => r,
@@ -122,11 +141,11 @@ pub const QWEN3MOE_A3B: Instance = Instance {
     name: "qwen3moe_a3b",
     key: Key {
         hidden: 2048,
-        moe: MoeAxes {
+        ffn: FfnAxes::Routed(MoeAxes {
             router: shape::router_row(RouterBody::Qwen3moe, 128),
             top_k: 8,
             expert_ff: 768,
-        },
+        }),
         attn: AttnAxes {
             row: match shape::gqa_row(128, 32 / 4) {
                 Some(r) => r,
@@ -243,6 +262,23 @@ pub const HOST: Instance = QWEN3MOE_A3B;
 #[cfg(feature = "host-qwen35moe-gdn48")]
 pub const HOST: Instance = QWEN35MOE_GDN48;
 
+impl Key {
+    /// The routed axes; none for a dense FFN.
+    #[must_use]
+    pub const fn routed(&self) -> Option<MoeAxes> {
+        match self.ffn {
+            FfnAxes::Routed(m) => Some(m),
+            FfnAxes::Dense { .. } => None,
+        }
+    }
+
+    /// Whether the FFN is dense.
+    #[must_use]
+    pub const fn is_dense(&self) -> bool {
+        matches!(self.ffn, FfnAxes::Dense { .. })
+    }
+}
+
 impl Instance {
     /// The delta axes this instance's delta kernels are compiled at: its
     /// own, or [`DELTA_UNLAUNCHED`] when its files have no delta layer.
@@ -251,6 +287,16 @@ impl Instance {
         match self.key.delta {
             Some(d) => d,
             None => DELTA_UNLAUNCHED,
+        }
+    }
+
+    /// The routed axes this instance's router kernels are compiled at: its
+    /// own, or [`ROUTER_UNLAUNCHED`] when its files have a dense FFN.
+    #[must_use]
+    pub const fn router_built(&self) -> MoeAxes {
+        match self.key.ffn {
+            FfnAxes::Routed(m) => m,
+            FfnAxes::Dense { .. } => ROUTER_UNLAUNCHED,
         }
     }
 }
@@ -276,7 +322,7 @@ pub enum Refused {
     /// A layer whose axes are not those of the earlier layers of its kind:
     /// an instance compiles each kind at one shape.
     Layers { layer: usize, what: &'static str },
-    /// No layer of a kind every instance compiles: routed or attention.
+    /// No layer of a kind every instance compiles: an FFN or attention.
     Missing { what: &'static str },
     /// The file's axes are no registered instance's.
     NoInstance { key: Key },
@@ -288,21 +334,27 @@ pub enum Refused {
 
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (m, a) = (&self.moe, &self.attn);
+        write!(f, "hidden {}; ", self.hidden)?;
+        match &self.ffn {
+            FfnAxes::Routed(m) => write!(
+                f,
+                "router {:?} of {} experts{}, top {}, expert ff {}",
+                m.router.body,
+                m.router.experts,
+                if m.router.rule.gated {
+                    " and a gated shared expert"
+                } else {
+                    ""
+                },
+                m.top_k,
+                m.expert_ff,
+            )?,
+            FfnAxes::Dense { ff } => write!(f, "a dense FFN of ff {ff}")?,
+        }
+        let a = &self.attn;
         write!(
             f,
-            "hidden {}; router {:?} of {} experts{}, top {}, expert ff {}; attention {}/{} heads \
-             of {} (value {}), rope {}{}; ",
-            self.hidden,
-            m.router.body,
-            m.router.experts,
-            if m.router.rule.gated {
-                " and a gated shared expert"
-            } else {
-                ""
-            },
-            m.top_k,
-            m.expert_ff,
+            "; attention {}/{} heads of {} (value {}), rope {}{}; ",
             a.n_head,
             a.n_kv,
             a.row.head,
@@ -377,19 +429,20 @@ impl Key {
     /// `layers`: each routed layer's router row and each attention layer's
     /// flash row through the shape table's own lookups
     /// ([`shape::select_router`], [`shape::select_gqa`]), the rest as the
-    /// description states them.
+    /// description states them. A file's layers are all routed or all dense:
+    /// an instance compiles one FFN.
     ///
     /// # Errors
     ///
     /// [`Refused`] naming the layer when the shape table has no row for it,
     /// it is of a kind no instance compiles, or its axes are not the earlier
-    /// layers' of its kind; and naming the kind when the file has no routed
-    /// or no attention layer. A file of no delta layer has no delta axes.
+    /// layers' of its kind; and naming the kind when the file has no FFN or
+    /// no attention layer. A file of no delta layer has no delta axes.
     pub fn of<'a>(
         hidden: u32,
         layers: impl IntoIterator<Item = (&'a Mixer, &'a Ffn)>,
     ) -> Result<Key, Refused> {
-        let (mut moe, mut attn, mut delta) = (None, None, None);
+        let (mut ffn_axes, mut attn, mut delta) = (None, None, None);
         for (layer, (mixer, ffn)) in layers.into_iter().enumerate() {
             match mixer {
                 Mixer::Gqa(g) => {
@@ -439,24 +492,23 @@ impl Key {
                     });
                 }
             }
-            let Ffn::Moe(m) = ffn else {
-                return Err(Refused::Kind {
-                    layer,
-                    what: "a dense FFN",
-                });
+            let axes = match ffn {
+                Ffn::Moe(m) => {
+                    let router = shape::select_router(MoeShape::of(m))
+                        .map_err(|why| Refused::Row { layer, why })?;
+                    FfnAxes::Routed(MoeAxes {
+                        router,
+                        top_k: m.top_k,
+                        expert_ff: m.expert_ff,
+                    })
+                }
+                Ffn::Dense { ff, .. } => FfnAxes::Dense { ff: *ff },
             };
-            let router =
-                shape::select_router(MoeShape::of(m)).map_err(|why| Refused::Row { layer, why })?;
-            let axes = MoeAxes {
-                router,
-                top_k: m.top_k,
-                expert_ff: m.expert_ff,
-            };
-            agree(&mut moe, axes, layer, "routed FFN")?;
+            agree(&mut ffn_axes, axes, layer, "FFN")?;
         }
         Ok(Key {
             hidden,
-            moe: moe.ok_or(Refused::Missing { what: "routed" })?,
+            ffn: ffn_axes.ok_or(Refused::Missing { what: "FFN" })?,
             attn: attn.ok_or(Refused::Missing { what: "attention" })?,
             delta,
         })
@@ -606,6 +658,14 @@ mod tests {
         })
     }
 
+    /// A dense SwiGLU FFN of `ff` values.
+    fn dense_ffn(ff: u32) -> Ffn {
+        Ffn::Dense {
+            ff,
+            act: Act::SwiGlu { limit: None },
+        }
+    }
+
     /// Qwen3.6's four kinds of layer as its fixture keeps them: delta,
     /// attention, delta, attention.
     fn qwen36() -> Vec<(Mixer, Ffn)> {
@@ -638,7 +698,10 @@ mod tests {
     #[test]
     fn the_registered_rows_are_the_shape_tables() {
         for inst in REGISTERED {
-            let m = &inst.key.moe;
+            let m = inst
+                .key
+                .routed()
+                .expect("a registered row is a routed FFN's");
             let s = MoeShape {
                 rule: m.router.rule,
                 experts: m.router.experts,
@@ -853,17 +916,80 @@ mod tests {
             "a file of no attention layer"
         );
         let mut dense = layers;
-        dense[2].1 = Ffn::Dense {
-            ff: 512,
-            act: Act::SwiGlu { limit: None },
-        };
+        dense[2].1 = dense_ffn(512);
         assert_eq!(
             key(2048, &dense),
-            Err(Refused::Kind {
+            Err(Refused::Layers {
                 layer: 2,
-                what: "a dense FFN"
+                what: "FFN"
             }),
-            "a dense layer"
+            "a dense layer among routed ones: an instance compiles one FFN"
+        );
+    }
+
+    /// Qwen3.8-27B's four kinds of layer as its fixture keeps them: three
+    /// delta layers of 48 value heads and one attention layer of 24 heads over
+    /// 4, each with a dense FFN of 17,408 values.
+    fn qwen38_27b() -> Vec<(Mixer, Ffn)> {
+        let mut layers: Vec<(Mixer, Ffn)> = (0..3).map(|_| (gdn(48), dense_ffn(17_408))).collect();
+        layers.push((gqa(24, 4, 256, 64), dense_ffn(17_408)));
+        layers
+    }
+
+    #[test]
+    fn a_dense_file_is_one_ffn_axis_and_opens_an_instance_made_at_open() {
+        let layers = qwen38_27b();
+        let key = key(5120, &layers).expect("the shape table has its rows");
+        assert_eq!(key.ffn, FfnAxes::Dense { ff: 17_408 });
+        assert!(key.is_dense() && key.routed().is_none());
+        assert!(of_key(key).is_err(), "no row registers a dense FFN");
+        let text = key.to_string();
+        assert!(
+            text.starts_with("hidden 5120; a dense FFN of ff 17408; attention 24/4 heads of 256"),
+            "{text}"
+        );
+        let opened = open_key(key).expect("every kernel takes the 27B's geometry");
+        assert_eq!(opened.name, UNREGISTERED);
+        assert_eq!(opened.key, key);
+        let g = Geometry::of(opened);
+        assert_eq!(g.check(), Ok(()));
+        let e = g.experts;
+        assert_eq!(
+            (e.slots, e.routed_ids, e.has_shared, e.k, e.dense),
+            (1, 1, false, 17_408, true),
+            "one slot, expert 0, no shared slot"
+        );
+        assert_eq!(
+            opened.router_built(),
+            QWEN35MOE_A3B.router_built(),
+            "an instance of a dense FFN compiles the router kernels at Qwen3.6's axes"
+        );
+        // Every routed row keeps the geometry it had: none is dense.
+        for inst in REGISTERED {
+            assert!(!Geometry::of(inst).experts.dense, "{}", inst.name);
+        }
+    }
+
+    #[test]
+    fn a_routed_layer_among_dense_ones_is_refused_by_name() {
+        let mut layers = qwen38_27b();
+        layers[1].1 = moe(256, 8, 512, true);
+        assert_eq!(
+            key(5120, &layers),
+            Err(Refused::Layers {
+                layer: 1,
+                what: "FFN"
+            }),
+            "a routed layer among dense ones"
+        );
+        layers[1].1 = dense_ffn(8192);
+        assert_eq!(
+            key(5120, &layers),
+            Err(Refused::Layers {
+                layer: 1,
+                what: "FFN"
+            }),
+            "two dense widths in one file"
         );
     }
 

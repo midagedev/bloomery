@@ -12,13 +12,32 @@ use core::num::NonZeroU32;
 ///
 /// `qkv` and `v` are the projection that is P1: one dispatch for each weight
 /// type its tensors hold, all in one group (`qkv` on a delta layer, `v` on
-/// an attention layer).
+/// an attention layer). `ffn` is how the layer's FFN picks its slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
-    Delta { qkv: Projection },
+    Delta { qkv: Projection, ffn: FfnKind },
     /// A gated attention layer. Live keys past 64 add the memory dispatch.
-    Attention { v: Projection },
+    Attention { v: Projection, ffn: FfnKind },
+}
+
+/// How a layer's FFN picks its slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnKind {
+    /// The router picks them: a group of its own ahead of the gate-up.
+    Routed,
+    /// One slot on expert 0 at weight 1: no router, no group.
+    Dense,
+}
+
+impl Layer {
+    /// How the layer's FFN picks its slots.
+    #[must_use]
+    pub const fn ffn(&self) -> FfnKind {
+        match self {
+            Layer::Delta { ffn, .. } | Layer::Attention { ffn, .. } => *ffn,
+        }
+    }
 }
 
 /// How many dispatches P1 is, in one group.
@@ -84,28 +103,37 @@ pub struct TokenCount {
 /// The groups and the dispatches one token encodes for `layers`.
 ///
 /// The embed and the head are the 2. Each layer adds six groups: P1, the
-/// mixer, its out, the router, the gate-up and the down. Those six already
-/// include the flash — the attention's fold runs inside it, so past the
-/// segment rule's waterline the count is the same — and the FFN norm, which
-/// the router and the gate-up each apply as they load the residual. A
+/// mixer, its out, the router, the gate-up and the down; a layer of a dense
+/// FFN has no router, so five. Those already include the flash — the
+/// attention's fold runs inside it, so past the segment rule's waterline the
+/// count is the same — and the FFN norm, which the router and the gate-up
+/// each apply as they load the residual (a dense layer's gate-up alone). A
 /// projection of more than one dispatch adds the rest. An unfolded ticket
-/// adds one group for each layer's router and one for the head. A count that
-/// does not fit `u32` panics by name.
+/// adds one group for each routed layer's router and one for the head. A
+/// count that does not fit `u32` panics by name.
 pub fn token_count(layers: &[Layer], _live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut n = 0u32;
+    let mut routers = 0u32;
     let mut n_split = 0u32;
     for layer in layers {
         n = fit("layer", n.checked_add(1));
         let p1 = match layer {
-            Layer::Delta { qkv } => qkv,
-            Layer::Attention { v } => v,
+            Layer::Delta { qkv, .. } => qkv,
+            Layer::Attention { v, .. } => v,
         };
         n_split = fit("P1", n_split.checked_add(p1.dispatches() - 1));
+        if layer.ffn() == FfnKind::Routed {
+            routers = fit("router", routers.checked_add(1));
+        }
     }
-    let mut groups = fit("group", 2u32.checked_add(fit("group", 6u32.checked_mul(n))));
+    let per_layer = fit("group", 5u32.checked_mul(n));
+    let mut groups = fit(
+        "group",
+        2u32.checked_add(fit("group", per_layer.checked_add(routers))),
+    );
     let mut dispatches = fit("dispatch", groups.checked_add(n_split));
     if matches!(ticket, Ticket::Unfolded) {
-        let extra = fit("group", n.checked_add(1));
+        let extra = fit("group", routers.checked_add(1));
         groups = fit("group", groups.checked_add(extra));
         dispatches = fit("dispatch", dispatches.checked_add(extra));
     }
@@ -143,7 +171,8 @@ pub enum GroupKind {
     DeltaCore,
     /// The delta step's head-norm projection back to the residual.
     DeltaOut,
-    /// The router: the routed logits, the picks and their weights.
+    /// The router: the routed logits, the picks and their weights. A dense
+    /// FFN has none.
     Router,
     /// The experts' gate and up, the routed picks' and the shared expert's.
     GateUp,
@@ -215,35 +244,58 @@ impl GroupBytes {
 mod tests {
     use super::*;
 
+    fn routed_delta(qkv: Projection) -> Layer {
+        Layer::Delta {
+            qkv,
+            ffn: FfnKind::Routed,
+        }
+    }
+
+    fn routed_attention(v: Projection) -> Layer {
+        Layer::Attention {
+            v,
+            ffn: FfnKind::Routed,
+        }
+    }
+
+    /// `layers` with a dense FFN: no layer has a router.
+    fn dense(layers: &[Layer]) -> Vec<Layer> {
+        layers
+            .iter()
+            .map(|l| match *l {
+                Layer::Delta { qkv, .. } => Layer::Delta {
+                    qkv,
+                    ffn: FfnKind::Dense,
+                },
+                Layer::Attention { v, .. } => Layer::Attention {
+                    v,
+                    ffn: FfnKind::Dense,
+                },
+            })
+            .collect()
+    }
+
     fn fixture() -> [Layer; 4] {
         [
-            Layer::Delta {
-                qkv: Projection::ONE,
-            },
-            Layer::Attention { v: Projection::ONE },
-            Layer::Delta {
-                qkv: Projection::TWO,
-            },
-            Layer::Attention { v: Projection::TWO },
+            routed_delta(Projection::ONE),
+            routed_attention(Projection::ONE),
+            routed_delta(Projection::TWO),
+            routed_attention(Projection::TWO),
         ]
     }
 
     /// 16 delta layers of one P1 dispatch, 14 of two, 4 attention layers of one,
     /// 6 of two.
     fn target() -> [Layer; 40] {
-        let mut layers = [Layer::Delta {
-            qkv: Projection::ONE,
-        }; 40];
+        let mut layers = [routed_delta(Projection::ONE); 40];
         for layer in &mut layers[16..30] {
-            *layer = Layer::Delta {
-                qkv: Projection::TWO,
-            };
+            *layer = routed_delta(Projection::TWO);
         }
         for layer in &mut layers[30..34] {
-            *layer = Layer::Attention { v: Projection::ONE };
+            *layer = routed_attention(Projection::ONE);
         }
         for layer in &mut layers[34..40] {
-            *layer = Layer::Attention { v: Projection::TWO };
+            *layer = routed_attention(Projection::TWO);
         }
         layers
     }
@@ -340,12 +392,12 @@ mod tests {
     /// eighth on.
     fn q30_target() -> Vec<Layer> {
         (0..48)
-            .map(|i| Layer::Attention {
-                v: if !(6..42).contains(&i) || (i - 6) % 3 == 2 {
+            .map(|i| {
+                routed_attention(if !(6..42).contains(&i) || (i - 6) % 3 == 2 {
                     Projection::TWO
                 } else {
                     Projection::ONE
-                },
+                })
             })
             .collect()
     }
@@ -358,6 +410,46 @@ mod tests {
             TokenCount {
                 groups: 290,
                 dispatches: 314
+            }
+        );
+    }
+
+    /// A dense layer has no router group: five groups a layer, the folded
+    /// ticket's count one group fewer for each, and the unfolded one's extra
+    /// group is the head's alone.
+    #[test]
+    fn a_dense_layer_has_no_router_group() {
+        assert_eq!(
+            token_count(&dense(&fixture()), LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 22,
+                dispatches: 24
+            }
+        );
+        assert_eq!(
+            token_count(&dense(&fixture()), LiveKeys::Within64, Ticket::Unfolded),
+            TokenCount {
+                groups: 23,
+                dispatches: 25
+            }
+        );
+        // 2 + 5 · 64 groups for the 27B's layers.
+        let layers = vec![routed_delta(Projection::ONE); 64];
+        assert_eq!(
+            token_count(&dense(&layers), LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 322,
+                dispatches: 322
+            }
+        );
+        // One routed layer among dense ones adds its router's group.
+        let mut mixed = dense(&fixture());
+        mixed[1] = routed_attention(Projection::ONE);
+        assert_eq!(
+            token_count(&mixed, LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 23,
+                dispatches: 25
             }
         );
     }

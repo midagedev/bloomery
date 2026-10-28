@@ -1,8 +1,8 @@
 // The mutant support both Metal gates share: a module of each gate's
 // `mutants.rs`, whose own tables `MUTANTS` and `TENSOR_MUTANTS` it walks.
 
-use bloomery_metal::instance::{HOST, Instance};
-use bloomery_metal::library::sources_of;
+use bloomery_metal::instance::Instance;
+use bloomery_metal::library::sources_for;
 
 /// The program a mutant's edits go into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,19 +37,12 @@ pub fn all(
 /// applied; an edit whose find text occurs another number of times than it
 /// names is refused.
 pub fn source_at(inst: &Instance, mutant: &Mutant, program: Program) -> Result<String, String> {
-    let (main, tensor) = sources_of(inst).map_err(|e| e.to_string())?;
+    let (main, tensor) = sources_for(inst).map_err(|e| e.to_string())?;
     let base = match program {
         Program::Main => main,
         Program::Tensor => tensor,
     };
-    edited(base, mutant)
-}
-
-/// The source of `program` of the build's host instance ([`HOST`]) with the
-/// mutant's edits applied. A shim of [`source_at`]. Callers left: the e2e
-/// gate.
-pub fn source_of(mutant: &Mutant, program: Program) -> Result<String, String> {
-    source_at(&HOST, mutant, program)
+    edited(&base, mutant)
 }
 
 /// `base` with the mutant's edits applied, in order.

@@ -9,7 +9,9 @@
 //! the combine. Each op closes its group with a barrier, as the step's do.
 //! A layer's slots are the routed picks and, when the instance's router has a
 //! shared row, the shared expert's: its gate GEMM, id, group and tensors are
-//! there only then.
+//! there only then. A layer of a dense FFN has no router, selection or table:
+//! its FFN is the norm, the gate and up GEMMs, the SwiGLU over their rows and
+//! the down GEMM adding into the residual ([`MetalOps::rows_dense_ffn`]).
 //!
 //! The pass's operand is [`PASS_OPERAND`], one place for every GEMM of the
 //! pass but the router's and the f32 projections', which are f32. The pass's step record slot, where
@@ -21,13 +23,14 @@ use bloomery_device::{Buffer, Elems};
 use chain::ChainError;
 
 use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
+use super::super::rows::FfnRows;
 use super::super::session::SessionError;
 use super::{MetalOps, WHAT, all, all_mut};
 use crate::kernels::{
     AttentionPrefillParams, AttnCache, CombineParams, DeltaRowStrides, DeltaRowsParams, DeltaSnaps,
     EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
     HeadNormRowsParams, HeadParams, NormRowsParams, Operand, Quant, RouteSelectParams,
-    RouteTableParams, RoutedKind, RoutedParams, route_table_words, route_tiles,
+    RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -41,6 +44,15 @@ impl MetalOps<'_, '_> {
 
     fn no_rows<T>() -> Result<T, SessionError> {
         Err(ChainError::shape(WHAT, "a rows arm of ops built with no rows arena").into())
+    }
+
+    /// The refusal of a routed arm over a rows arena of a dense FFN.
+    fn not_routed<T>(l: usize) -> Result<T, SessionError> {
+        Err(ChainError::shape(
+            WHAT,
+            format!("layer {l}: a routed rows arm over the buffers of a dense FFN"),
+        )
+        .into())
     }
 
     /// The embedding of the pass's ids, which the host wrote to the rows
@@ -453,6 +465,9 @@ impl MetalOps<'_, '_> {
             return Self::no_rows();
         };
         let rows = &mut *ctx.arena;
+        let FfnRows::Routed(routed) = &mut rows.ffn else {
+            return Self::not_routed(l);
+        };
         let Arena {
             layers,
             faults,
@@ -464,6 +479,13 @@ impl MetalOps<'_, '_> {
             ..
         } = &mut *self.arena;
         let f = &layers[l].ffn;
+        let Some(router) = &f.router else {
+            return Err(ChainError::shape(
+                WHAT,
+                format!("layer {l}: a router launch on a layer with none"),
+            )
+            .into());
+        };
         let slots = m * geom.experts.slots;
         let logit_stride = geom.router.logit_stride;
         self.kernels.norm_rows(
@@ -489,10 +511,10 @@ impl MetalOps<'_, '_> {
                 rows: *n_experts,
                 cols: *hidden,
                 acts: m,
-                weights: all(&f.gate_inp)?,
+                weights: all(&router.gate_inp)?,
                 x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
                 x_stride: *hidden,
-                y: rows
+                y: routed
                     .logits
                     .window_mut(Elems(0), Elems(routed_cols + *n_experts))?,
                 y_stride: logit_stride,
@@ -510,7 +532,7 @@ impl MetalOps<'_, '_> {
                     weights: all(&shared.gate_inp)?,
                     x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
                     x_stride: *hidden,
-                    y: rows
+                    y: routed
                         .logits
                         .window_mut(Elems(*n_experts), Elems(routed_cols + 1))?,
                     y_stride: logit_stride,
@@ -525,10 +547,10 @@ impl MetalOps<'_, '_> {
             RouteSelectParams {
                 rows: m,
                 top_k: *top_k,
-                logits: rows.logits.window(Elems(0), Elems(m * logit_stride))?,
+                logits: routed.logits.window(Elems(0), Elems(m * logit_stride))?,
                 logit_stride,
-                ids: rows.pick_ids.window_mut(Elems(0), Elems(slots))?,
-                weights: rows.pick_weights.window_mut(Elems(0), Elems(slots))?,
+                ids: routed.pick_ids.window_mut(Elems(0), Elems(slots))?,
+                weights: routed.pick_weights.window_mut(Elems(0), Elems(slots))?,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -540,10 +562,10 @@ impl MetalOps<'_, '_> {
                 slots,
                 per_row: geom.experts.slots,
                 experts: *n_experts,
-                ids: rows.pick_ids.window(Elems(0), Elems(slots))?,
-                sorted: rows.sorted.window_mut(Elems(0), Elems(slots))?,
-                inv: rows.inv.window_mut(Elems(0), Elems(slots))?,
-                tiles: rows
+                ids: routed.pick_ids.window(Elems(0), Elems(slots))?,
+                sorted: routed.sorted.window_mut(Elems(0), Elems(slots))?,
+                inv: routed.inv.window_mut(Elems(0), Elems(slots))?,
+                tiles: routed
                     .tiles
                     .window_mut(Elems(0), Elems(route_table_words(slots, geom.router.rows)))?,
                 fault: &faults[slot],
@@ -562,6 +584,9 @@ impl MetalOps<'_, '_> {
             return Self::no_rows();
         };
         let rows = &mut *ctx.arena;
+        let FfnRows::Routed(routed) = &mut rows.ffn else {
+            return Self::not_routed(l);
+        };
         let Arena {
             layers,
             faults,
@@ -599,9 +624,9 @@ impl MetalOps<'_, '_> {
                 y_stride: expert_k,
                 slots,
                 max_tiles,
-                sorted: rows.sorted.window(Elems(0), Elems(slots))?,
-                route_w: rows.pick_weights.window(Elems(0), Elems(slots))?,
-                tiles: rows.tiles.window(Elems(0), Elems(table_words))?,
+                sorted: routed.sorted.window(Elems(0), Elems(slots))?,
+                route_w: routed.pick_weights.window(Elems(0), Elems(slots))?,
+                tiles: routed.tiles.window(Elems(0), Elems(table_words))?,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -625,13 +650,13 @@ impl MetalOps<'_, '_> {
                 x_rows: slots,
                 x_stride: expert_k,
                 gather: false,
-                y: rows.y.window_mut(Elems(0), Elems(slots * *hidden))?,
+                y: routed.y.window_mut(Elems(0), Elems(slots * *hidden))?,
                 y_stride: *hidden,
                 slots,
                 max_tiles,
-                sorted: rows.sorted.window(Elems(0), Elems(slots))?,
-                route_w: rows.pick_weights.window(Elems(0), Elems(slots))?,
-                tiles: rows.tiles.window(Elems(0), Elems(table_words))?,
+                sorted: routed.sorted.window(Elems(0), Elems(slots))?,
+                route_w: routed.pick_weights.window(Elems(0), Elems(slots))?,
+                tiles: routed.tiles.window(Elems(0), Elems(table_words))?,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
@@ -643,12 +668,110 @@ impl MetalOps<'_, '_> {
                 rows: m,
                 per_row: geom.experts.slots,
                 cols: *hidden,
-                y: rows.y.window(Elems(0), Elems(slots * *hidden))?,
+                y: routed.y.window(Elems(0), Elems(slots * *hidden))?,
                 y_rows: slots,
                 y_stride: *hidden,
-                inv: rows.inv.window(Elems(0), Elems(slots))?,
+                inv: routed.inv.window(Elems(0), Elems(slots))?,
                 x: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
                 x_stride: *hidden,
+            },
+        )?;
+        self.enc.memory_barrier();
+        Ok(())
+    }
+
+    /// Layer `l`'s dense FFN over the rows: the FFN norm, the gate and the up
+    /// GEMMs over the normed rows, the SwiGLU over their two outputs, and the
+    /// down GEMM added into the residual. The GEMMs are the dense GEMM of the
+    /// mixers' projections; no row is routed, so no table, gather or combine
+    /// stands between the norm and the residual.
+    pub(super) fn rows_dense_ffn(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
+        let slot = self.pass_slot(m);
+        let Some(ctx) = self.rows.as_mut() else {
+            return Self::no_rows();
+        };
+        let rows = &mut *ctx.arena;
+        let FfnRows::Dense { up } = &mut rows.ffn else {
+            return Err(ChainError::shape(
+                WHAT,
+                format!("layer {l}: a dense FFN over the buffers of a routed one"),
+            )
+            .into());
+        };
+        let Arena {
+            layers,
+            faults,
+            eps,
+            hidden,
+            geom,
+            ..
+        } = &mut *self.arena;
+        let f = &layers[l].ffn;
+        let width = geom.experts.k;
+        self.kernels.norm_rows(
+            self.enc,
+            NormRowsParams {
+                rows: m,
+                cols: *hidden,
+                x: rows.x.window(Elems(0), Elems(m * *hidden))?,
+                x_stride: *hidden,
+                gain: all(&f.norm)?,
+                y: rows.xn.window_mut(Elems(0), Elems(m * *hidden))?,
+                y_stride: *hidden,
+                eps: *eps,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
+        self.enc.memory_barrier();
+        for (weights, out) in [(&f.gate, &mut rows.h), (&f.up, &mut *up)] {
+            self.kernels.gemm(
+                self.enc,
+                GemmParams {
+                    quant: f.gate_up_quant,
+                    rows: width,
+                    cols: *hidden,
+                    acts: m,
+                    weights: all(weights)?,
+                    x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                    x_stride: *hidden,
+                    y: out.window_mut(Elems(0), Elems(m * width))?,
+                    y_stride: width,
+                    mode: GemmMode::Store,
+                    operand: PASS_OPERAND,
+                    fault: &faults[slot],
+                    layer: layer_word(l),
+                },
+            )?;
+        }
+        self.enc.memory_barrier();
+        self.kernels.swiglu_rows(
+            self.enc,
+            SwigluRowsParams {
+                rows: m,
+                cols: width,
+                gate: rows.h.window_mut(Elems(0), Elems(m * width))?,
+                up: up.window(Elems(0), Elems(m * width))?,
+                stride: width,
+            },
+        )?;
+        self.enc.memory_barrier();
+        self.kernels.gemm(
+            self.enc,
+            GemmParams {
+                quant: f.down_quant,
+                rows: *hidden,
+                cols: width,
+                acts: m,
+                weights: all(&f.down)?,
+                x: rows.h.window(Elems(0), Elems(m * width))?,
+                x_stride: width,
+                y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
+                y_stride: *hidden,
+                mode: GemmMode::Residual,
+                operand: PASS_OPERAND,
+                fault: &faults[slot],
+                layer: layer_word(l),
             },
         )?;
         self.enc.memory_barrier();

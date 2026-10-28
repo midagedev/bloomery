@@ -30,7 +30,7 @@ use model_hf::model_file::Error as WeightError;
 use super::check::{
     AttnLayout, DeltaLayout, FfnLayout, LayerLayout, Layout, MixerLayout, P1Layout, Site, Values,
 };
-use super::count::{GroupBytes, GroupKind, Layer, Projection};
+use super::count::{FfnKind, GroupBytes, GroupKind, Layer, Projection};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
@@ -149,12 +149,29 @@ pub(super) struct SharedBufs {
     pub(super) down: MetalBuffer<u8>,
 }
 
-/// A layer's FFN half: the router's weights and outputs, and the experts.
-/// Each layer keeps its own router outputs, so every layer's picks are
-/// readable after a step.
+/// A routed layer's router: its weight and the buffers it selects through.
+pub(super) struct RouterBufs {
+    pub(super) gate_inp: MetalBuffer<f32>,
+    pub(super) logits: MetalBuffer<f32>,
+    pub(super) partials: MetalBuffer<f32>,
+    pub(super) ticket: MetalBuffer<u32>,
+}
+
+/// The id of a dense FFN's one slot: expert 0 of its one-expert stacks.
+const DENSE_ID: u32 = 0;
+
+/// The route weight of a dense FFN's one slot.
+const DENSE_WEIGHT: f32 = 1.0;
+
+/// A layer's FFN half: the router and its outputs, and the experts. Each layer
+/// keeps its own router outputs, so every layer's picks are readable after a
+/// step. A dense layer has no router: its slot's id and weight are the fixed
+/// route [`DENSE_ID`] and [`DENSE_WEIGHT`], laid once at the open, and its gate,
+/// up and down are the one expert of the stacks.
 pub(super) struct FfnBufs {
     pub(super) norm: MetalBuffer<f32>,
-    pub(super) gate_inp: MetalBuffer<f32>,
+    /// The router; none for a dense FFN.
+    pub(super) router: Option<RouterBufs>,
     pub(super) gate_up_quant: Quant,
     pub(super) gate: MetalBuffer<u8>,
     pub(super) up: MetalBuffer<u8>,
@@ -162,11 +179,10 @@ pub(super) struct FfnBufs {
     pub(super) down: MetalBuffer<u8>,
     /// The shared expert, on a router that runs one.
     pub(super) shared: Option<SharedBufs>,
-    pub(super) logits: MetalBuffer<f32>,
+    /// The slots' ids and route weights: the router's picks, or the dense
+    /// FFN's fixed route.
     pub(super) ids: MetalBuffer<u32>,
     pub(super) weights: MetalBuffer<f32>,
-    pub(super) partials: MetalBuffer<f32>,
-    pub(super) ticket: MetalBuffer<u32>,
 }
 
 /// One layer's buffers.
@@ -371,14 +387,14 @@ impl<'a> Loader<'a> {
     }
 
     /// One layer's buffers, from its layout.
-    fn layer(&self, layer: &LayerLayout, top_k: usize) -> Result<LayerBufs, SessionError> {
+    fn layer(&self, layer: &LayerLayout) -> Result<LayerBufs, SessionError> {
         let mixer = match &layer.mixer {
             MixerLayout::Delta(d) => MixerBufs::Delta(delta(self, d)?),
             MixerLayout::Attention(a) => MixerBufs::Attention(attention(self, a)?),
         };
         Ok(LayerBufs {
             mixer,
-            ffn: ffn(self, self.device, &layer.ffn, top_k)?,
+            ffn: ffn(self, self.device, &layer.ffn)?,
         })
     }
 }
@@ -463,7 +479,7 @@ impl Arena {
         let head_norm = load.values(&g.head_norm)?;
         let mut layers = Vec::with_capacity(g.layers.len());
         for (l, layer) in g.layers.iter().enumerate() {
-            layers.push(load.layer(layer, g.top_k).map_err(|e| at_layer(l, e))?);
+            layers.push(load.layer(layer).map_err(|e| at_layer(l, e))?);
         }
         let mut rope = device.buffer(Elems(g.rope_len))?;
         rope.write(&rope_rows(&g.rope, ctx, geom.attn.rot))?;
@@ -510,13 +526,22 @@ impl Arena {
     pub(super) fn token_layers(&self) -> Vec<Layer> {
         self.layers
             .iter()
-            .map(|l| match &l.mixer {
-                MixerBufs::Delta(d) => Layer::Delta {
-                    qkv: d.p1.projection(),
-                },
-                MixerBufs::Attention(a) => Layer::Attention {
-                    v: a.p1.projection(),
-                },
+            .map(|l| {
+                let ffn = if l.ffn.router.is_some() {
+                    FfnKind::Routed
+                } else {
+                    FfnKind::Dense
+                };
+                match &l.mixer {
+                    MixerBufs::Delta(d) => Layer::Delta {
+                        qkv: d.p1.projection(),
+                        ffn,
+                    },
+                    MixerBufs::Attention(a) => Layer::Attention {
+                        v: a.p1.projection(),
+                        ffn,
+                    },
+                }
             })
             .collect()
     }
@@ -668,17 +693,22 @@ impl Arena {
             GroupKind::Router => {
                 no_ids()?;
                 let f = &bufs()?.ffn;
+                let Some(r) = &f.router else {
+                    return Err(refuse(format!(
+                        "{kind:?}: layer {layer} has a dense FFN and no router"
+                    )));
+                };
                 Ok(GroupBytes {
-                    weights: bytes_of(&f.gate_inp)
+                    weights: bytes_of(&r.gate_inp)
                         + f.shared.as_ref().map_or(0, |s| bytes_of(&s.gate_inp))
                         + bytes_of(&f.norm),
                     // The residual read; the logits, the ids, the weights,
                     // the partials and the ticket written.
                     acts: f32s(self.hidden)
-                        + bytes_of(&f.logits)
+                        + bytes_of(&r.logits)
                         + bytes_of(&f.ids)
                         + bytes_of(&f.weights)
-                        + bytes_of(&f.partials)
+                        + bytes_of(&r.partials)
                         + 4,
                     state: 0,
                 })
@@ -686,7 +716,7 @@ impl Arena {
             GroupKind::GateUp | GroupKind::Down => {
                 let f = &bufs()?.ffn;
                 let picks = self.top_k;
-                let shared = self.geom.router.shared;
+                let shared = usize::from(self.geom.experts.has_shared);
                 if ids.len() != picks + shared {
                     return Err(refuse(format!(
                         "{kind:?}: {} router ids; the picks, then any shared expert's, are {}",
@@ -767,7 +797,9 @@ impl Arena {
                     a.v_cache.zero();
                 }
             }
-            layer.ffn.ticket.zero();
+            if let Some(router) = &mut layer.ffn.router {
+                router.ticket.zero();
+            }
         }
         self.head_ticket.zero();
         self.attn_ticket.zero();
@@ -821,41 +853,70 @@ fn attention(load: &Loader<'_>, a: &AttnLayout) -> Result<AttnBufs, SessionError
     })
 }
 
-fn ffn(
-    load: &Loader<'_>,
-    device: Alloc<'_>,
-    f: &FfnLayout,
-    top_k: usize,
-) -> Result<FfnBufs, SessionError> {
-    Ok(FfnBufs {
-        norm: load.values(&f.norm)?,
-        // The router and the shared-expert gate: F32 in a GGUF file, MLX's
-        // affine 8-bit in an MLX file, dequantized exactly at open.
-        gate_inp: load.values(&f.gate_inp)?,
-        gate_up_quant: f.gate_up_quant,
-        gate: load.site(&f.gate)?,
-        up: load.site(&f.up)?,
-        down_quant: f.down_quant,
-        down: load.site(&f.down)?,
-        shared: f
-            .shared
-            .as_ref()
-            .map(|s| {
-                Ok::<_, SessionError>(SharedBufs {
-                    gate_inp: load.values(&s.gate_inp)?,
-                    gate_up_quant: s.gate.quant,
-                    down_quant: s.down.quant,
-                    gate: load.site(&s.gate)?,
-                    up: load.site(&s.up)?,
-                    down: load.site(&s.down)?,
-                })
+fn ffn(load: &Loader<'_>, device: Alloc<'_>, f: &FfnLayout) -> Result<FfnBufs, SessionError> {
+    let geom = load.geom;
+    // The buffers are made in the order the arena always made them: the
+    // weights, then the router's logits, the picks, the router's partials and
+    // its ticket. A dense FFN makes the picks alone.
+    let norm = load.values(&f.norm)?;
+    // The router and the shared-expert gate: F32 in a GGUF file, MLX's
+    // affine 8-bit in an MLX file, dequantized exactly at open.
+    let gate_inp = f.gate_inp.as_ref().map(|v| load.values(v)).transpose()?;
+    let gate = load.site(&f.gate)?;
+    let up = load.site(&f.up)?;
+    let down = load.site(&f.down)?;
+    let shared = f
+        .shared
+        .as_ref()
+        .map(|s| {
+            Ok::<_, SessionError>(SharedBufs {
+                gate_inp: load.values(&s.gate_inp)?,
+                gate_up_quant: s.gate.quant,
+                down_quant: s.down.quant,
+                gate: load.site(&s.gate)?,
+                up: load.site(&s.up)?,
+                down: load.site(&s.down)?,
             })
-            .transpose()?,
-        logits: zeroed(device, load.geom.router.rows)?,
-        ids: zeroed(device, top_k + load.geom.router.shared)?,
-        weights: zeroed(device, top_k + load.geom.router.shared)?,
-        partials: zeroed(device, load.geom.router.partials)?,
-        ticket: zeroed(device, 1)?,
+        })
+        .transpose()?;
+    let logits: Option<MetalBuffer<f32>> = gate_inp
+        .as_ref()
+        .map(|_| zeroed(device, geom.router.rows))
+        .transpose()?;
+    let mut ids: MetalBuffer<u32> = zeroed(device, geom.experts.slots)?;
+    let mut weights: MetalBuffer<f32> = zeroed(device, geom.experts.slots)?;
+    let partials: Option<MetalBuffer<f32>> = gate_inp
+        .as_ref()
+        .map(|_| zeroed(device, geom.router.partials))
+        .transpose()?;
+    let ticket: Option<MetalBuffer<u32>> =
+        gate_inp.as_ref().map(|_| zeroed(device, 1)).transpose()?;
+    let router = match (gate_inp, logits, partials, ticket) {
+        (Some(gate_inp), Some(logits), Some(partials), Some(ticket)) => Some(RouterBufs {
+            gate_inp,
+            logits,
+            partials,
+            ticket,
+        }),
+        _ => {
+            // A dense FFN's route is fixed: its one slot is expert 0 at
+            // weight 1, laid once.
+            ids.write(&[DENSE_ID])?;
+            weights.write(&[DENSE_WEIGHT])?;
+            None
+        }
+    };
+    Ok(FfnBufs {
+        norm,
+        router,
+        gate_up_quant: f.gate_up_quant,
+        gate,
+        up,
+        down_quant: f.down_quant,
+        down,
+        shared,
+        ids,
+        weights,
     })
 }
 

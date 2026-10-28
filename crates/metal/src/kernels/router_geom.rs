@@ -7,13 +7,14 @@ use crate::instance::{HOST, Instance};
 /// The routed rows, and the id of the shared expert. A shim: the build's host
 /// instance's router row (`Geometry::router`'s `experts`). Callers left: the
 /// arch, the e2e and kernel gates, their oracles and the probes.
-pub const EXPERTS: usize = HOST.key.moe.router.experts as usize;
+pub const EXPERTS: usize = HOST.router_built().router.experts as usize;
 
 /// The rows `inst`'s router reads: the routed experts, and a gated shared
 /// expert's gate after them.
 #[must_use]
 pub const fn rows(inst: &Instance) -> usize {
-    inst.key.moe.router.experts as usize + inst.key.moe.router.rule.gated as usize
+    let router = inst.router_built().router;
+    router.experts as usize + router.rule.gated as usize
 }
 
 /// The rows the router reads. A shim: the build's host instance's. Callers
@@ -23,7 +24,7 @@ pub const ROWS: usize = rows(&HOST);
 /// A gated shared expert: one more router row, and one more id and weight
 /// after the routed picks. Zero or one. A shim: the build's host instance's.
 /// Callers left: the arch, the kernel gate, its oracles and the probes.
-pub const SHARED: usize = HOST.key.moe.router.rule.gated as usize;
+pub const SHARED: usize = HOST.router_built().router.rule.gated as usize;
 
 /// The columns of every row: the hidden width. A shim: the build's host
 /// instance's. Callers left: the arch, the kernel gate, its oracles and the
@@ -72,7 +73,7 @@ pub const GROUPS: usize = groups(&HOST);
 /// The most routed experts one launch selects. A shim: the build's host
 /// instance's picks. Callers left: the kernel gate, its oracles and the
 /// probes.
-pub const TOP_K_MAX: usize = HOST.key.moe.top_k as usize;
+pub const TOP_K_MAX: usize = HOST.router_built().top_k as usize;
 
 /// The float4s one lane loads from one split of a row of `k` columns.
 #[must_use]
@@ -97,7 +98,7 @@ pub const fn logit_stride(rows: usize) -> usize {
 pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
     // The rule the kernel computes: a softmax over the logits, no selection
     // bias, the kept scores divided by their sum.
-    let rule = g.instance.key.moe.router.rule;
+    let rule = g.instance.router_built().router.rule;
     if !matches!(rule.score, Score::Softmax)
         || rule.bias
         || !matches!(rule.norm, RouterNorm::SelectedSum)

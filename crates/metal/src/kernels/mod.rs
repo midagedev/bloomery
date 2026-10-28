@@ -76,7 +76,7 @@ pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
-    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, TABLE_THREADS,
+    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, TABLE_THREADS,
     route_table_words, route_tiles,
 };
 pub use seg::{SegParams, Segment};

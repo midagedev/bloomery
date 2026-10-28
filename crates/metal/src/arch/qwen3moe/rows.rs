@@ -11,7 +11,10 @@
 //!
 //! The expert buffers hold a row per slot (`m` times the instance's slots),
 //! the pair's output and the down's output at their widths: they are most of
-//! the arena.
+//! the arena. An instance of a dense FFN has no router, no route table and no
+//! down outputs: its gate GEMM's rows are the pair's buffer and its up GEMM's
+//! rows the one beside it ([`FfnRows::Dense`]), and the down GEMM adds into
+//! the residual.
 //!
 //! The copies a pass leaves after rows inside it ([`SnapBufs`]) are opened
 //! apart from the arena, by the open of a session that marks or else by the
@@ -54,6 +57,36 @@ fn product(a: usize, b: usize, what: &str) -> Result<usize, SessionError> {
         .ok_or_else(|| refuse(format!("{what}: {a} x {b} does not fit")))
 }
 
+/// The buffers of a routed FFN's pass: the router's logits, the picks, the
+/// route table and the down's outputs.
+pub(super) struct RoutedRows {
+    /// The router's logits, `RouterGeom::logit_stride` a row.
+    pub(super) logits: MetalBuffer<f32>,
+    /// The picks of each row, the shared expert's id last when the instance
+    /// has one.
+    pub(super) pick_ids: MetalBuffer<u32>,
+    /// The picks' weights, the shared expert's gate last when the instance
+    /// has one.
+    pub(super) pick_weights: MetalBuffer<f32>,
+    /// The slot at each place of the expert-sorted list.
+    pub(super) sorted: MetalBuffer<u32>,
+    /// The place of each slot.
+    pub(super) inv: MetalBuffer<u32>,
+    /// The route table's tiles.
+    pub(super) tiles: MetalBuffer<u32>,
+    /// The down's outputs, a row of the hidden width a place.
+    pub(super) y: MetalBuffer<f32>,
+}
+
+/// What a pass holds for the FFN beside the pair's (or the gate's) outputs
+/// [`RowsArena::h`].
+pub(super) enum FfnRows {
+    /// A routed FFN.
+    Routed(RoutedRows),
+    /// A dense FFN: the up GEMM's rows, `ExpertsGeom::k` a row.
+    Dense { up: MetalBuffer<f32> },
+}
+
 /// The buffers of a pass.
 pub(super) struct RowsArena {
     /// The most rows a pass holds.
@@ -77,24 +110,11 @@ pub(super) struct RowsArena {
     pub(super) delta_prep: MetalBuffer<f32>,
     /// The f32s of one prepared delta row.
     pub(super) delta_prep_stride: usize,
-    /// The router's logits, `RouterGeom::logit_stride` a row.
-    pub(super) logits: MetalBuffer<f32>,
-    /// The picks of each row, the shared expert's id last when the instance
-    /// has one.
-    pub(super) pick_ids: MetalBuffer<u32>,
-    /// The picks' weights, the shared expert's gate last when the instance
-    /// has one.
-    pub(super) pick_weights: MetalBuffer<f32>,
-    /// The slot at each place of the expert-sorted list.
-    pub(super) sorted: MetalBuffer<u32>,
-    /// The place of each slot.
-    pub(super) inv: MetalBuffer<u32>,
-    /// The route table's tiles.
-    pub(super) tiles: MetalBuffer<u32>,
-    /// The pair's outputs, a row of `ExpertsGeom::k` a place.
+    /// The pair's outputs, a row of `ExpertsGeom::k` a place; a dense FFN's
+    /// gate rows, activated in place.
     pub(super) h: MetalBuffer<f32>,
-    /// The down's outputs, a row of the hidden width a place.
-    pub(super) y: MetalBuffer<f32>,
+    /// The FFN's other buffers.
+    pub(super) ffn: FfnRows,
     /// The bytes the buffers take.
     pub(super) bytes: u64,
     /// The copies of the delta layers' stores, once a pass has taken one.
@@ -168,6 +188,23 @@ impl SnapBufs {
     }
 }
 
+/// The element counts of the buffers of a routed FFN's pass.
+pub(super) struct RoutedLens {
+    pub(super) logits: usize,
+    pub(super) slots: usize,
+    pub(super) tiles: usize,
+    pub(super) y: usize,
+}
+
+/// The element counts of the FFN's buffers a pass holds beside the pair's.
+pub(super) enum FfnLens {
+    Routed(RoutedLens),
+    /// A dense FFN's up rows.
+    Dense {
+        up: usize,
+    },
+}
+
 /// The element counts of the rows arena's buffers, from the file's shapes and
 /// the launches' geometry: the one owner of the sizes, so the open and a
 /// header-only plan make the same count.
@@ -182,11 +219,8 @@ pub(super) struct RowsLens {
     pub(super) delta_partials: usize,
     pub(super) delta_prep: usize,
     pub(super) delta_prep_stride: usize,
-    pub(super) logits: usize,
-    pub(super) slots: usize,
-    pub(super) tiles: usize,
     pub(super) h: usize,
-    pub(super) y: usize,
+    pub(super) ffn: FfnLens,
 }
 
 impl RowsLens {
@@ -208,7 +242,6 @@ impl RowsLens {
         // The widest P1 output a layer writes, rounded up to the four floats
         // the GEMM's output rows are aligned to.
         let proj_stride = proj.next_multiple_of(4);
-        let words = route_table_words(slots, g.router.rows);
         let delta_prep_stride = delta_heads
             .map(|n_k| {
                 g.delta
@@ -224,6 +257,24 @@ impl RowsLens {
             }
         };
         let mix_stride = mix_stride(g);
+        let h = nonzero(
+            product(slots, g.experts.k, "the pair rows")?,
+            "the pair outputs",
+        )?;
+        let ffn = if g.experts.dense {
+            FfnLens::Dense { up: h }
+        } else {
+            let words = route_table_words(slots, g.router.rows);
+            FfnLens::Routed(RoutedLens {
+                logits: nonzero(
+                    product(cap, g.router.logit_stride, "the logit rows")?,
+                    "the logits",
+                )?,
+                slots: nonzero(slots, "the picks")?,
+                tiles: nonzero(words, "the route table")?,
+                y: nonzero(product(slots, hidden, "the down rows")?, "the down outputs")?,
+            })
+        };
         Ok(RowsLens {
             ids: nonzero(cap, "the ids")?,
             x: nonzero(product(cap, hidden, "the residual rows")?, "the residual")?,
@@ -244,43 +295,40 @@ impl RowsLens {
                 "the delta's prepared rows",
             )?,
             delta_prep_stride,
-            logits: nonzero(
-                product(cap, g.router.logit_stride, "the logit rows")?,
-                "the logits",
-            )?,
-            slots: nonzero(slots, "the picks")?,
-            tiles: nonzero(words, "the route table")?,
-            h: nonzero(
-                product(slots, g.experts.k, "the pair rows")?,
-                "the pair outputs",
-            )?,
-            y: nonzero(product(slots, hidden, "the down rows")?, "the down outputs")?,
+            h,
+            ffn,
         })
     }
 
     /// Each buffer's bytes: the residual, the normed input, the P1 output,
-    /// the mixer rows, the delta's partials and prepared rows, the logits,
-    /// the pair's and the down's outputs (f32); the ids, the picks, the sorted
-    /// slots, their places and the route table (u32); the pick weights (f32).
-    pub(super) fn buffer_bytes(&self) -> [u64; 15] {
+    /// the mixer rows, the delta's partials and prepared rows (f32) and the
+    /// ids (u32), then a routed FFN's logits, picks, weights, sorted slots,
+    /// places, route table, pair outputs and down outputs, or a dense FFN's
+    /// gate and up rows (f32).
+    pub(super) fn buffer_bytes(&self) -> Vec<u64> {
         let w = |n: usize| 4 * u64::try_from(n).expect("a length fits u64");
-        [
-            w(self.ids),
-            w(self.x),
-            w(self.xn),
-            w(self.proj),
-            w(self.mix),
-            w(self.delta_partials),
-            w(self.delta_prep),
-            w(self.logits),
-            w(self.slots),
-            w(self.slots),
-            w(self.slots),
-            w(self.slots),
-            w(self.tiles),
-            w(self.h),
-            w(self.y),
+        let mut bytes: Vec<u64> = [
+            self.ids,
+            self.x,
+            self.xn,
+            self.proj,
+            self.mix,
+            self.delta_partials,
+            self.delta_prep,
         ]
+        .into_iter()
+        .map(w)
+        .collect();
+        match &self.ffn {
+            FfnLens::Routed(r) => bytes.extend(
+                [
+                    r.logits, r.slots, r.slots, r.slots, r.slots, r.tiles, self.h, r.y,
+                ]
+                .map(w),
+            ),
+            FfnLens::Dense { up } => bytes.extend([self.h, *up].map(w)),
+        }
+        bytes
     }
 
     /// The bytes the buffers ask of the driver.
@@ -317,14 +365,36 @@ impl RowsArena {
         let mix = device.buffer(Elems(lens.mix))?;
         let delta_partials = device.buffer(Elems(lens.delta_partials))?;
         let delta_prep = device.buffer(Elems(lens.delta_prep))?;
-        let logits = device.buffer(Elems(lens.logits))?;
-        let pick_ids = device.buffer(Elems(lens.slots))?;
-        let pick_weights = device.buffer(Elems(lens.slots))?;
-        let sorted = device.buffer(Elems(lens.slots))?;
-        let inv = device.buffer(Elems(lens.slots))?;
-        let tiles = device.buffer(Elems(lens.tiles))?;
-        let h = device.buffer(Elems(lens.h))?;
-        let y = device.buffer(Elems(lens.y))?;
+        // The routed FFN's buffers are made in the order the arena always made
+        // them: the logits, the picks, the table, then the pair's and the
+        // down's outputs.
+        let (h, ffn) = match &lens.ffn {
+            FfnLens::Routed(r) => {
+                let logits = device.buffer(Elems(r.logits))?;
+                let pick_ids = device.buffer(Elems(r.slots))?;
+                let pick_weights = device.buffer(Elems(r.slots))?;
+                let sorted = device.buffer(Elems(r.slots))?;
+                let inv = device.buffer(Elems(r.slots))?;
+                let tiles = device.buffer(Elems(r.tiles))?;
+                let h = device.buffer(Elems(lens.h))?;
+                let y = device.buffer(Elems(r.y))?;
+                let routed = RoutedRows {
+                    logits,
+                    pick_ids,
+                    pick_weights,
+                    sorted,
+                    inv,
+                    tiles,
+                    y,
+                };
+                (h, FfnRows::Routed(routed))
+            }
+            FfnLens::Dense { up } => {
+                let h = device.buffer(Elems(lens.h))?;
+                let up = device.buffer(Elems(*up))?;
+                (h, FfnRows::Dense { up })
+            }
+        };
         let (proj_stride, mix_stride, delta_prep_stride, bytes) = (
             lens.proj_stride,
             lens.mix_stride,
@@ -343,14 +413,8 @@ impl RowsArena {
             delta_partials,
             delta_prep,
             delta_prep_stride,
-            logits,
-            pick_ids,
-            pick_weights,
-            sorted,
-            inv,
-            tiles,
             h,
-            y,
+            ffn,
             bytes,
             snaps: None,
         })

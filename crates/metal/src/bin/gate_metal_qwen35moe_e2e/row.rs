@@ -4,13 +4,26 @@
 //! A clause reads the file's own numbers from the session (`Session::geom`,
 //! `Session::token_layers`); a row names only what the file cannot say: which
 //! fixture directory the split lives in, the d1k set whose prompt ids the
-//! self-bit clauses feed, whether the file has a recurrent store, and the
-//! clauses that hold a contract the file's architecture does not have, each
-//! with its reason, printed as that clause's SKIP line.
+//! self-bit clauses feed, whether the file has a recurrent store, which
+//! kernel mutants edit its program, and the clauses that hold a contract the
+//! file's architecture does not have, each with its reason, printed as that
+//! clause's SKIP line.
 
 use std::sync::OnceLock;
 
 use refset::family::Family;
+
+/// The kernel mutants a row runs `--mutant` and `--mutants-all` over: the
+/// tables of `mutants.rs` that edit the program the row's instance runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mutants {
+    /// The routed FFN's: every table but the dense row's.
+    Routed,
+    /// The dense FFN's: the pair and fold launches at one slot.
+    Dense,
+    /// None: the row runs the kernels of another row's tables.
+    None,
+}
 
 /// One model file the gate runs over.
 pub struct Row {
@@ -25,6 +38,8 @@ pub struct Row {
     /// Whether the file has delta layers: a recurrent state with checkpoints,
     /// a conv ring and a pass's copies of them.
     pub recurrent: bool,
+    /// The kernel mutants that edit this row's program.
+    pub mutants: Mutants,
     /// The clauses the row does not run, each with the contract it lacks.
     pub skips: &'static [(&'static str, &'static str)],
 }
@@ -46,6 +61,7 @@ pub static QWEN35MOE: Row = Row {
     ik: &refset::arch::qwen35moe::fixture::IK,
     d1k: refset::arch::qwen35moe::fixture::D1K,
     recurrent: true,
+    mutants: Mutants::Routed,
     skips: &[],
 };
 
@@ -56,6 +72,7 @@ pub static QWEN3MOE: Row = Row {
     ik: &refset::arch::qwen3moe::fixture::IK,
     d1k: refset::arch::qwen3moe::fixture::D1K,
     recurrent: false,
+    mutants: Mutants::None,
     skips: &[
         (
             "q_state",
@@ -73,8 +90,25 @@ pub static QWEN3MOE: Row = Row {
     ],
 };
 
+/// Qwen3.8-27B's fixture: the gated delta net beside the attention layers and
+/// a dense FFN in every layer, no router and no experts. The prompt ids are
+/// Qwen3.6's d1k set's: the two families share a vocabulary and a tokenizer.
+pub static QWEN38D: Row = Row {
+    name: "qwen38d",
+    arch: "qwen38d",
+    ik: &refset::arch::qwen35moe::fixture::IK,
+    d1k: refset::arch::qwen35moe::fixture::D1K,
+    recurrent: true,
+    mutants: Mutants::Dense,
+    skips: &[(
+        "p_profile",
+        "not on a dense FFN: the clause walks each layer's router picks and the experts' stack \
+         slices of the file's own tensors",
+    )],
+};
+
 /// Every row, the default first.
-pub static ROWS: [&Row; 2] = [&QWEN35MOE, &QWEN3MOE];
+pub static ROWS: [&Row; 3] = [&QWEN35MOE, &QWEN3MOE, &QWEN38D];
 
 /// The row `--row` names.
 pub fn find(name: &str) -> Option<&'static Row> {

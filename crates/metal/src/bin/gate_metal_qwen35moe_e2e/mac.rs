@@ -3,12 +3,13 @@
 //! The session (`bloomery_metal::arch::qwen3moe::session`) opens the row's
 //! MLX split (`<family>-mlxsplit` under the fixture root), and every clause
 //! starts from its reset. The gate runs over a row (`--row`, `row.rs`): the
-//! qwen35moe split by default, or the qwen3moe split. A clause reads the
-//! file's numbers from the session's geometry and layers; a row names the
-//! clauses whose contract its file's architecture lacks (a delta layer's
-//! recurrent state), and the gate prints each as that clause's SKIP line
-//! with its reason. The kernel mutants (`--mutant`, `--mutants-all`) run on
-//! the default row.
+//! qwen35moe split by default, the qwen3moe split, or the qwen38d split (a
+//! dense FFN in every layer). A clause reads the file's numbers from the
+//! session's geometry and layers; a row names the clauses whose contract its
+//! file's architecture lacks (a delta layer's recurrent state, a router's
+//! picks), and the gate prints each as that clause's SKIP line with its
+//! reason. The kernel mutants (`--mutant`, `--mutants-all`) run on the rows
+//! that name a table of them: the default row's and the dense row's.
 //!
 //! The clauses that compared this session to ik's GGUF sets are gone, and so
 //! is the `--nodes` walk of those sets.
@@ -92,7 +93,7 @@ use bloomery_metal::arch::qwen3moe::count::{Layer, LiveKeys, Ticket, token_count
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::Instance;
-use bloomery_metal::library::{Library, sources_of};
+use bloomery_metal::library::{Library, sources_for};
 
 #[path = "chain.rs"]
 mod chain;
@@ -389,15 +390,17 @@ fn e_token_id(s: &mut Session) -> Clause {
 }
 
 /// The library the session's kernels come from: the device's, or the
-/// source with a mutant's edits in. A tensor-op mutant leaves it the
-/// device's: its edits are in the program `q_tensor` forces.
+/// source of the file's instance with a mutant's edits in. A tensor-op
+/// mutant leaves it the device's: its edits are in the program `q_tensor`
+/// forces.
 fn library_of(
     device: &MetalDevice,
+    instance: &'static Instance,
     mutant: Option<(&mutants::Mutant, mutants::Program)>,
 ) -> Result<Option<Library>, String> {
     match mutant {
         Some((m, mutants::Program::Main)) => {
-            let text = mutants::source_of(m, mutants::Program::Main)?;
+            let text = mutants::source_at(instance, m, mutants::Program::Main)?;
             Library::from_source_text(device, &text)
                 .map(Some)
                 .map_err(why)
@@ -413,10 +416,10 @@ fn tensor_text_of(
     mutant: Option<(&mutants::Mutant, mutants::Program)>,
 ) -> Result<String, String> {
     match mutant {
-        Some((m, mutants::Program::Tensor)) => mutants::source_of(m, mutants::Program::Tensor),
-        _ => sources_of(instance)
-            .map(|(_, tensor)| tensor.to_string())
-            .map_err(why),
+        Some((m, mutants::Program::Tensor)) => {
+            mutants::source_at(instance, m, mutants::Program::Tensor)
+        }
+        _ => sources_for(instance).map(|(_, tensor)| tensor).map_err(why),
     }
 }
 
@@ -468,29 +471,27 @@ pub fn main() -> ExitCode {
         },
     };
     row::select(row);
-    let default_row = std::ptr::eq(row, &row::QWEN35MOE);
+    let wants_mutants = args.iter().any(|a| a == "--mutants-all" || a == "--mutant");
+    if wants_mutants && row.mutants == row::Mutants::None {
+        let rows: Vec<&str> = row::ROWS
+            .iter()
+            .filter(|r| r.mutants != row::Mutants::None)
+            .map(|r| r.name)
+            .collect();
+        println!(
+            "{GATE}: the kernel mutants edit the program of the rows {rows:?}, not row {}'s",
+            row.name
+        );
+        return ExitCode::from(64);
+    }
     if args.iter().any(|a| a == "--mutants-all") {
-        if !default_row {
-            println!(
-                "{GATE}: --mutants-all: the kernel mutants edit the {} row's program",
-                row::QWEN35MOE.name
-            );
-            return ExitCode::from(64);
-        }
-        return mutants_all();
+        return mutants_all(row);
     }
     let mutant = match flag(&args, "--mutant") {
-        Some(name) => match mutants::find(name) {
-            Some(m) if default_row => Some(m),
-            Some(_) => {
-                println!(
-                    "{GATE}: --mutant {name}: the kernel mutants edit the {} row's program",
-                    row::QWEN35MOE.name
-                );
-                return ExitCode::from(64);
-            }
+        Some(name) => match mutants::find(row.mutants, name) {
+            Some(m) => Some(m),
             None => {
-                println!("{GATE}: no mutant named {name}");
+                println!("{GATE}: row {} has no mutant named {name}", row.name);
                 return ExitCode::from(64);
             }
         },
@@ -498,7 +499,7 @@ pub fn main() -> ExitCode {
     };
     // A kept mutant has no clause that must catch it: every clause runs, or the one `--only` names.
     let only = match mutant {
-        Some((m, _)) if !mutants::kept(m.name) => Some(m.clause),
+        Some((m, _)) if !mutants::kept(row.mutants, m.name) => Some(m.clause),
         _ => flag(&args, "--only"),
     };
     if let Some(name) = only
@@ -540,7 +541,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mutated = match library_of(&device, mutant) {
+    let mutated = match library_of(&device, instance, mutant) {
         Ok(lib) => lib,
         Err(e) => {
             println!("{GATE}: the mutant does not build: {e}");
@@ -697,21 +698,26 @@ impl Observed {
     }
 }
 
-/// `--mutant NAME` in a child run of this gate.
-fn run_child(exe: &std::path::Path, name: &str) -> Result<std::process::Output, String> {
+/// `--mutant NAME` in a child run of this gate over `row`.
+fn run_child(
+    exe: &std::path::Path,
+    row: &row::Row,
+    name: &str,
+) -> Result<std::process::Output, String> {
     Command::new(exe)
-        .args(["--mutant", name])
+        .args(["--row", row.name, "--mutant", name])
         .output()
         .map_err(|e| format!("mutant {name}: the child gate did not start: {e}"))
 }
 
-/// Every mutant of the table, each in a child run of this gate
-/// (`--mutant NAME`): its clause must be red and the child's exit code not 0.
+/// Every mutant of `row`'s tables, each in a child run of this gate
+/// (`--row`, `--mutant NAME`): its clause must be red and the child's exit
+/// code not 0.
 /// Each kept mutant runs over every clause and the line says what turned red
 /// and `m_logits`' distance; a kept mutant that turns a clause red makes the
 /// run fail, since the list is then stale, and so does one whose child
 /// observed nothing.
-fn mutants_all() -> ExitCode {
+fn mutants_all(row: &row::Row) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -721,9 +727,9 @@ fn mutants_all() -> ExitCode {
     };
     let mut green = Vec::new();
     let mut count = 0usize;
-    for (mutant, _) in mutants::all() {
+    for (mutant, _) in mutants::all(row.mutants) {
         count += 1;
-        let out = match run_child(&exe, mutant.name) {
+        let out = match run_child(&exe, row, mutant.name) {
             Ok(out) => out,
             Err(e) => {
                 println!("{e}");
@@ -746,8 +752,8 @@ fn mutants_all() -> ExitCode {
     }
     let mut stale = Vec::new();
     let mut unseen = Vec::new();
-    for mutant in mutants::KEPT {
-        let out = match run_child(&exe, mutant.name) {
+    for mutant in mutants::kept_of(row.mutants) {
+        let out = match run_child(&exe, row, mutant.name) {
             Ok(out) => out,
             Err(e) => {
                 println!("{e}");
@@ -789,9 +795,10 @@ fn mutants_all() -> ExitCode {
     }
     if green.is_empty() && stale.is_empty() && unseen.is_empty() {
         println!(
-            "{GATE} --mutants-all: PASS ({count} mutants, each red on its clause; {} kept, \
-             no clause turns red on any)",
-            mutants::KEPT.len()
+            "{GATE} --mutants-all: PASS (row {}, {count} mutants, each red on its clause; {} \
+             kept, no clause turns red on any)",
+            row.name,
+            mutants::kept_of(row.mutants).len()
         );
         return ExitCode::SUCCESS;
     }

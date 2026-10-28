@@ -1,0 +1,6 @@
+version 1
+family qwen38d
+ids 0,760,6511,314
+steps 4
+n 248320
+fnv1a a642ef745c47ae59

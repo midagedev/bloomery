@@ -3,8 +3,8 @@
 //! barrier.
 //!
 //! The DAG, one group per op past the embed: `E | P1 | mixer | out | R | G |
-//! W` for every layer, then `H`. P1 is one dispatch per weight type of the
-//! layer's projections in one group. An attention mixer past one segment of
+//! W` for every layer, then `H`; a layer of a dense FFN has no `R`. P1 is one
+//! dispatch per weight type of the layer's projections in one group. An attention mixer past one segment of
 //! keys is two groups: the flash writes its partials, the barrier, then the
 //! merge folds them into the output. The FFN norm has no group of its own:
 //! the router (R) and the gate-up pair (G) each norm the residual as they
@@ -24,7 +24,7 @@ use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Window, WindowMut};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan};
+use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaPlan};
 
 use super::arena::{Arena, LANES, MixerBufs, lane_of, layer_word, slot_before, slot_of};
 use super::rows::RowsArena;
@@ -598,8 +598,14 @@ impl ChainOps for MetalOps<'_, '_> {
         Ok(())
     }
 
-    fn route(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
-        if self.arm(l.m)? == Arm::Rows {
+    fn route(&mut self, l: LayerCtx<'_>, plan: &FfnPlan) -> Result<(), SessionError> {
+        let arm = self.arm(l.m)?;
+        if matches!(plan.route, FfnRoute::Dense) {
+            // A dense FFN has no router: its one slot is the fixed route the
+            // open laid, and its norm is the gate-up's.
+            return Ok(());
+        }
+        if arm == Arm::Rows {
             return self.rows_route(l.layer, l.m);
         }
         let slot = slot_of(self.pos);
@@ -614,19 +620,26 @@ impl ChainOps for MetalOps<'_, '_> {
             ..
         } = &mut *self.arena;
         let f = &mut layers[l.layer].ffn;
+        let Some(r) = f.router.as_mut() else {
+            return Err(ChainError::shape(
+                WHAT,
+                format!("layer {}: a router launch on a layer with none", l.layer),
+            )
+            .into());
+        };
         self.kernels.router(
             self.enc,
             RouterParams {
                 rows: geom.router.rows,
                 k: *hidden,
                 top_k: *top_k,
-                routed: all(&f.gate_inp)?,
+                routed: all(&r.gate_inp)?,
                 shared: f.shared.as_ref().map(|s| all(&s.gate_inp)).transpose()?,
                 x: x.window(Elems(0), Elems(*hidden))?,
                 gain: all(&f.norm)?,
-                partials: all_mut(&mut f.partials)?,
-                ticket: all_mut(&mut f.ticket)?,
-                logits: all_mut(&mut f.logits)?,
+                partials: all_mut(&mut r.partials)?,
+                ticket: all_mut(&mut r.ticket)?,
+                logits: all_mut(&mut r.logits)?,
                 ids: all_mut(&mut f.ids)?,
                 weights: all_mut(&mut f.weights)?,
                 eps: *eps,
@@ -638,9 +651,12 @@ impl ChainOps for MetalOps<'_, '_> {
         Ok(())
     }
 
-    fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
+    fn experts(&mut self, l: LayerCtx<'_>, plan: &FfnPlan) -> Result<(), SessionError> {
         if self.arm(l.m)? == Arm::Rows {
-            return self.rows_experts(l.layer, l.m);
+            return match &plan.route {
+                FfnRoute::Dense => self.rows_dense_ffn(l.layer, l.m),
+                FfnRoute::Router { .. } => self.rows_experts(l.layer, l.m),
+            };
         }
         self.experts_pair(l.layer)?;
         self.experts_fold(l.layer)
