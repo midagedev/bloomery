@@ -109,8 +109,9 @@ target/release/generate_metal -m PATH/Qwen3-30B-A3B-Instruct-2507-4bit --prompt 
 either flag twice, or a flag that differs from the variable is refused by name.
 
 `generate_metal --ignore-eos` stops nothing at an end-of-generation id (off by default; the picks stay the device's
-argmax, so a decode timed on real text is not cut short), and `--repeat N` runs the prompt N times on one open, each run
-with its own summary block.
+argmax, so a decode timed on real text is not cut short), and `--repeat N` runs the prompt N times on one open (the session
+reset the server takes between runs), each run with its own summary block; a run whose ids differ from the first's ends
+the process with a named error.
 
 To learn whether a model opens before it loads: `generate_metal [-m PATH | --hf REPO] --plan [--ctx C]` reads only the
 header and tensor table, a folder's or a GGUF file's. It prints every refusal, not only the first, the bytes the open
