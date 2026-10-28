@@ -726,7 +726,7 @@ fn open_arm(
 }
 
 /// One arm: the model loaded under `residency` with `room` given (or the
-/// machine's reading), its [`PROMPT`] ids as one prompt call and [`STEPS`]
+/// workstation's plan room, [`PLAN_ROOM`]), its [`PROMPT`] ids as one prompt call and [`STEPS`]
 /// greedy steps, the residency boundaries' reports summed; on a load with a
 /// tier and a `band` (none under `--audit`), the footprint read through
 /// `probe`, the gate's own open of the file, with that edge band.
