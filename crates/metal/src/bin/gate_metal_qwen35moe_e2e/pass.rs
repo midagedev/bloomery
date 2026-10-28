@@ -20,8 +20,9 @@
 //!   stores bit for bit, the profiled pass committing a buffer an op.
 //! - `q_free`: the same N greedy tokens teacher-forced through the pass run
 //!   and the stepped run: every layer's output of every token within
-//!   [`FREE_BAND`] of the stepped run's, and the routers' picks differing in
-//!   no more than [`FREE_FLIPS_MAX`] sites.
+//!   [`FREE_BAND`] of the stepped run's ([`FREE_BAND_DENSE_LAYER`] over the
+//!   layers where no layer routes), and the routers' picks differing in no more than
+//!   [`FREE_FLIPS_MAX`] sites.
 //! - `q_mark`: a pass's copies of its delta stores (`StateOut::after_rows`)
 //!   move none of its bits (pick, logits row, every store); the copy after
 //!   its last row, taken as a point and cut back to, is the pass's own end
@@ -48,7 +49,7 @@ use std::path::Path;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
-use bloomery_metal::arch::qwen3moe::count::Layer;
+use bloomery_metal::arch::qwen3moe::count::{FfnKind, Layer};
 use bloomery_metal::arch::qwen3moe::session::{
     Node, Op, PassOut, Session, SessionError, StateOut, StepMode,
 };
@@ -85,11 +86,40 @@ const U_L0_REL: f64 = 1.2e-3;
 /// over 40 layers, √40 · 4e-2 ≈ 0.25.
 const FREE_BAND: f64 = 0.26;
 
+/// PIN(2026-10-28): the band on a layer output's relative distance from the
+/// stepped run's for a session none of whose layers route, which
+/// [`FREE_BAND`]'s router-flip term does not reach. A dense FFN has no router,
+/// so the two runs take the same slot and differ in operands alone: the
+/// stepped mat-vec reads f32 activations and weights, and the pass's GEMMs run
+/// the f16 operand (`PASS_OPERAND`), which rounds each weight and each
+/// activation once into half. `U_L0_REL` reads that rounding as Δ = 4.0e-4 of
+/// a projection element's own rms. A layer's update carries at most 3Δ: the
+/// mixer's, by `U_L0_REL`'s count; the FFN's gate and up GEMMs at Δ each
+/// through silu(g)·u, whose log-slope is at most 1.28 where g > 0 and the
+/// sum's weight sits, 1.6Δ, then the down GEMM at Δ, 1.9Δ. Taking the update
+/// as the layer's whole output (the residual only dilutes it), 3Δ = 1.2e-3 a
+/// layer [derived]; [`free_band`] adds the session's layers in quadrature
+/// (the fixture's four: 3Δ · √4 = 2.4e-3).
+const FREE_BAND_DENSE_LAYER: f64 = 1.2e-3;
+
 /// PIN(2026-10-13): the cap on router sites whose picks differ from the
 /// stepped run's. The derivation is the CUDA gate's: a broken router flips
 /// about every one of the sixteen sites, a correct one about eight; the cap
 /// is three quarters.
 const FREE_FLIPS_MAX: usize = 12;
+
+/// The band a session's layer outputs are held to, with the words that name it
+/// in a verdict line: [`FREE_BAND_DENSE_LAYER`] over the session's layers in
+/// quadrature where no layer's FFN is routed (the session's own layer kinds),
+/// [`FREE_BAND`] otherwise.
+fn free_band(s: &Session) -> (f64, &'static str) {
+    if s.token_layers().iter().any(|l| l.ffn() == FfnKind::Routed) {
+        (FREE_BAND, "band")
+    } else {
+        let layers = s.layer_count() as f64;
+        (FREE_BAND_DENSE_LAYER * layers.sqrt(), "dense band")
+    }
+}
 
 /// The ids of `q_layers`'s pass: more than a step's window, so the pass runs
 /// every rows arm.
@@ -454,7 +484,7 @@ fn free_run(device: &MetalDevice, library: &Library, path: &Path, clause: &str) 
 
 /// The greedy tokens of `steps` teacher-forced through both sessions, which
 /// hold the same prompt (`after` names it), `picks` the two runs' prompt
-/// picks: every layer's output of every token within [`FREE_BAND`] of the
+/// picks: every layer's output of every token within [`free_band`] of the
 /// stepped run's and the routers' picks differing in no more than
 /// [`FREE_FLIPS_MAX`] sites.
 fn teacher_forced(
@@ -469,6 +499,7 @@ fn teacher_forced(
     let (mut worst, mut flips, mut agree) = (0f64, 0usize, usize::from(pick == pass_pick));
     let layers = pass.layer_count();
     let routed = pass.geom().experts.routed_ids;
+    let (band, band_name) = free_band(pass);
     for t in 0..FREE_STEPS {
         let b = traced_step(steps, tok)?;
         let a = traced_step(pass, tok)?;
@@ -489,10 +520,10 @@ fn teacher_forced(
         tok = b.top;
     }
     let line = format!(
-        "{FREE_STEPS} teacher-forced tokens after {after}: worst layer output {worst:.3e} of the stepped run's (band {FREE_BAND}), {flips} router sites with other picks (cap {FREE_FLIPS_MAX}), {agree} of {} picks equal",
+        "{FREE_STEPS} teacher-forced tokens after {after}: worst layer output {worst:.3e} of the stepped run's ({band_name} {band}), {flips} router sites with other picks (cap {FREE_FLIPS_MAX}), {agree} of {} picks equal",
         FREE_STEPS + 1
     );
-    if worst <= FREE_BAND && flips <= FREE_FLIPS_MAX {
+    if worst <= band && flips <= FREE_FLIPS_MAX {
         Ok(Verdict::Noted(line))
     } else {
         Err(line)
@@ -811,6 +842,7 @@ pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Claus
     }
     let layers = s.layer_count();
     let routed = s.geom().experts.routed_ids;
+    let (band, band_name) = free_band(&s);
     let mut notes = Vec::new();
     // Descending: a cut drops the points past it.
     for &u in MARK_CUTS.iter().rev() {
@@ -842,10 +874,10 @@ pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Claus
         }
         let line = format!(
             "from {u}: {FREE_STEPS} teacher-forced tokens worst layer output {worst:.3e} of the \
-             stepped run's (band {FREE_BAND}), {flips} router sites with other picks (cap \
+             stepped run's ({band_name} {band}), {flips} router sites with other picks (cap \
              {FREE_FLIPS_MAX}), pick {start} against the stepped run's {pick}"
         );
-        if worst > FREE_BAND || flips > FREE_FLIPS_MAX {
+        if worst > band || flips > FREE_FLIPS_MAX {
             return Err(line);
         }
         notes.push(line);
