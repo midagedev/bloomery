@@ -2192,7 +2192,7 @@ mod gate {
         let tail = HC_MIX * n..;
         let past_ok = mixes[tail.clone()]
             .iter()
-            .chain(&hc[tail.clone()])
+            .chain(&hc[tail])
             .all(|v| v.to_bits() == SENT.to_bits());
         let again_ok = bits(&mixes2[..HC_MIX * n]) == bits(&mixes[..HC_MIX * n])
             && bits(&hc2[..HC_MIX * n]) == bits(&hc[..HC_MIX * n]);

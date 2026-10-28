@@ -104,10 +104,7 @@ mod tests {
             (PathBuf::from(DRAFT), DraftFrom::Family(MTP_LEVER))
         );
         std::fs::write(&beside, b"").unwrap_or_else(|e| panic!("{}: {e}", beside.display()));
-        assert_eq!(
-            draft_file(None, &target),
-            (beside.clone(), DraftFrom::Beside)
-        );
+        assert_eq!(draft_file(None, &target), (beside, DraftFrom::Beside));
         let other = dir.join("elsewhere.gguf");
         assert_eq!(
             draft_file(Some(&other), &target),

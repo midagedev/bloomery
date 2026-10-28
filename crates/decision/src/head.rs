@@ -507,7 +507,9 @@ impl ClefHead {
                 }
             }
             let inv = (b - a) as f32;
-            m.iter_mut().for_each(|v| *v /= inv);
+            for v in m.iter_mut() {
+                *v /= inv;
+            }
             m
         };
         let qvecs: Vec<f32> = enc
@@ -664,7 +666,9 @@ impl ClefHead {
                 features.extend(field.iter().zip(o).map(|(f, o)| (f - o).abs()));
             }
             let mut hidden_r = linear(&features, 4 * w, &self.scorer0_w, Some(&self.scorer0_b));
-            hidden_r.iter_mut().for_each(|v| *v = gelu(*v));
+            for v in hidden_r.iter_mut() {
+                *v = gelu(*v);
+            }
             let residual = linear(&hidden_r, w, &self.scorer3_w, None);
             let mut out = Vec::with_capacity(k);
             for (oi, o) in opts.chunks_exact(w).enumerate() {

@@ -555,7 +555,7 @@ pub fn clauses(
             "tier: {} tier entries on {} layers unchanged: {}",
             tier_at_load.len(),
             {
-                let mut t = tier_layers.clone();
+                let mut t = tier_layers;
                 t.dedup();
                 t.len()
             },

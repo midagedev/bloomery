@@ -2431,7 +2431,7 @@ mod gate {
         let attn = activations(QK, m, 780);
         let clean_g = gate_rows(m, spread_g);
         let clean = gated_q8act(gq, stream, &attn, &clean_g, m, unl)?;
-        let mut bad_g = clean_g.clone();
+        let mut bad_g = clean_g;
         let (c0, b0, c1, b1) = (0usize, 3usize, 4usize, 20usize);
         let at = |c: usize, b: usize| {
             let i = 128 * b + 37;

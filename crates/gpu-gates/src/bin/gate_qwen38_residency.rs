@@ -788,7 +788,7 @@ mod gate {
         let after = live_sets(s)?;
         let step = match s.step(next, Want::Logits)? {
             Out::Logits { row, .. } => row.to_vec(),
-            _ => return Err("the step after the call returned no logits row".into()),
+            Out::Argmax(_) => return Err("the step after the call returned no logits row".into()),
         };
         take_passes(s)?;
         s.model_mut().body_parts(NAME)?.2.set_return_at_end(false)?;

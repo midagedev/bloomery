@@ -3189,7 +3189,7 @@ mod gate {
         }
         let mut table: Vec<(Vec<&str>, Vec<usize>, bool)> = Vec::new();
         let mut ok_table = true;
-        for l in layers.clone() {
+        for l in layers {
             let launches = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;

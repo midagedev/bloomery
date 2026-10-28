@@ -114,7 +114,15 @@ pub(crate) fn finish(dir: &Path, head: &Head, extra: &[String], rows: &[String])
         let written = rows.iter().filter(|r| r.starts_with("tensor\t")).count();
         l.push(format!("# complete\t{written}\t0"));
     }
-    write(&dir.join("MANIFEST.tsv"), (l.join("\n") + "\n").as_bytes());
+    write(
+        &dir.join("MANIFEST.tsv"),
+        {
+            let mut out = l.join("\n");
+            out.push('\n');
+            out
+        }
+        .as_bytes(),
+    );
 }
 
 /// A preproc set of one image (128x96, 4x3 tokens).

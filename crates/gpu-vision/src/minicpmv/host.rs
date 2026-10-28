@@ -258,7 +258,7 @@ mod tests {
         let y2 = vit_merger_f32(&w, &x2, 1e-6);
         assert_eq!(&y[..DIM], &y2[..DIM]);
         assert_ne!(&y[DIM..], &y2[DIM..]);
-        let mut x3 = x.clone();
+        let mut x3 = x;
         x3[2 * DIM + 3] += 0.5;
         assert_ne!(&y[..DIM], &vit_merger_f32(&w, &x3, 1e-6)[..DIM]);
     }

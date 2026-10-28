@@ -82,7 +82,12 @@ fn write_set(dir: &Path, s: &Stated<'_>) {
     if s.complete {
         lines.push("# complete".to_string());
     }
-    std::fs::write(dir.join(MANIFEST), lines.join("\n") + "\n").unwrap_or_else(|e| panic!("{e}"));
+    std::fs::write(dir.join(MANIFEST), {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
 }
 
 fn remove(dir: &Path) {

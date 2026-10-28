@@ -554,7 +554,7 @@ mod gate {
         let plane = vec![NAN_F16; pools_for(rows) * INDEX_HEAD];
         let card = cx.pool(cx.gpu.unlabelled_sink(), &cache, &ape, &counts, &plane)?;
         let word = cx.gpu.take_fault()?;
-        let mut want = plane.clone();
+        let mut want = plane;
         let sites = index_pool_host(&cache, &ape, &counts, &mut want);
         let differ = diff_u16(&card, &want);
         let pools = rows / POOL;

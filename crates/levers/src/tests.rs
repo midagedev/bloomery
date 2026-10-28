@@ -1697,7 +1697,7 @@ fn a_paged_plan_turns_only_an_unset_draft_off() {
     );
     assert_eq!(
         paged_draft(&at(arena, false, false), Some(Draft38Off::Yield(y))),
-        (false, paged.clone()),
+        (false, paged),
         "a yield judged on the abandoned plan"
     );
     let file = Path::new("/models/q/mtp.gguf");

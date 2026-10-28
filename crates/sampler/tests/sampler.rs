@@ -531,7 +531,7 @@ fn same_seed_same_tokens() {
     assert_eq!(a, b, "two samplers with seed 42 disagree");
     let other = run(SamplerParams { seed: 43, ..p });
     let differ = a.iter().zip(&other).filter(|(x, y)| x != y).count();
-    let mut distinct = a.clone();
+    let mut distinct = a;
     distinct.sort_unstable();
     distinct.dedup();
     println!(

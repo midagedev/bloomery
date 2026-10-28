@@ -932,8 +932,7 @@ mod tests {
 
         // The host's own record of the same changes: its cut gives the rows the card's must.
         let mut host =
-            SeqRows::with_order(base.clone(), SECTIONS_Z, SectionOrder::Zyxt, CANVAS_CTX)
-                .expect("rows");
+            SeqRows::with_order(base, SECTIONS_Z, SectionOrder::Zyxt, CANVAS_CTX).expect("rows");
         host.push_canvases(&[(first + 2, group)])
             .expect("the group");
         let cut = host.cut(5).expect("a cut at the group").expect("a rewrite");

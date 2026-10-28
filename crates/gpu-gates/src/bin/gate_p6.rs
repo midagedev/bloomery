@@ -339,7 +339,7 @@ fn run() -> Result<(), GateError> {
         *v = f32::NEG_INFINITY;
     }
     ok &= refused_case(&router, &gpu, "neg_inf_tail", &inf_tail, 1, &[0], scale)?;
-    let mut inf_top = live.clone();
+    let mut inf_top = live;
     inf_top[0] = f32::NEG_INFINITY;
     inf_top[2] = f32::NEG_INFINITY;
     ok &= refused_case(&router, &gpu, "neg_inf_in_top6", &inf_top, 1, &[0], scale)?;

@@ -59,6 +59,10 @@ use model::placement::{
     WholeLoad, WholeNeed,
 };
 
+#[allow(
+    clippy::duplicate_mod,
+    reason = "three seats of one bin include this file"
+)]
 #[path = "ubatch_rule.rs"]
 mod ubatch_rule;
 use ubatch_rule::ubatch_rule;
@@ -2143,11 +2147,11 @@ pub(super) mod tests {
         };
         let census = [census.into_iter().next().expect("the stage card"), tier];
         let two = Place::parse("cuda0+1").expect("two card words");
-        let refusal =
-            match PlaceQ3::qwen35_on(&split, two, &census, o, Seqs::ONE, Beside::default()) {
-                Err(e) => e,
-                Ok(_) => panic!("a dense model cannot use an expert tier"),
-            };
+        let Err(refusal) =
+            PlaceQ3::qwen35_on(&split, two, &census, o, Seqs::ONE, Beside::default())
+        else {
+            panic!("a dense model cannot use an expert tier")
+        };
         assert!(matches!(
             refusal.downcast_ref::<PlacementError>(),
             Some(PlacementError::Metadata { key, .. }) if key == "Qwen3.6 expert tier"

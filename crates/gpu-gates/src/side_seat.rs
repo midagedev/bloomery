@@ -225,7 +225,7 @@ impl SideEngine {
             }
         };
         Ok(SideEngine {
-            prompts: Default::default(),
+            prompts: std::collections::BTreeMap::default(),
             jobs: Some(jobs),
             thread: Some(thread),
             tokenizer,

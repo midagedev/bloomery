@@ -8487,7 +8487,7 @@ pub(crate) mod planes_tests {
             rows_of_fp4.contains("located in no other layout"),
             "{rows_of_fp4}"
         );
-        let second = StackRuns::new(RowLayout::Rows, codes_at.clone(), scales_at.clone(), cp, sp);
+        let second = StackRuns::new(RowLayout::Rows, codes_at.clone(), scales_at, cp, sp);
         assert!(
             second
                 .unwrap_err()
@@ -8531,7 +8531,7 @@ pub(crate) mod planes_tests {
         let mut nan = scale.clone();
         nan[3] = f32::NAN;
         assert!(refused(&info, nan).contains("[3] is NaN, not a finite value"));
-        let mut q4k = info.clone();
+        let mut q4k = info;
         q4k.ty = GgmlType::Q4_K;
         assert!(placed_scales(&q4k, Vec::new()).unwrap().is_none());
         assert!(refused(&q4k, scale).contains("none for another"));

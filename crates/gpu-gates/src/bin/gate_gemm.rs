@@ -4813,7 +4813,7 @@ mod gate {
                 );
                 ok &= pass;
                 // A place in [n_card, HOST): `ExpertId`, its column unwritten.
-                let mut stray = sel.clone();
+                let mut stray = sel;
                 stray[host_col] = n_card as u32;
                 let stray_d = DeviceBuffer::from_host(stream, &stray)?;
                 dev.g32.enqueue_swiglu_quant32_sel(
@@ -6789,7 +6789,7 @@ mod gate {
                     bytes,
                     d: w.d.clone(),
                     m: w.m.clone(),
-                    q: w.q.clone(),
+                    q: w.q,
                 };
                 let resn = Res::new(dev, &wn, true, n_exp * rows)?;
                 let ids = [0u32; 8];

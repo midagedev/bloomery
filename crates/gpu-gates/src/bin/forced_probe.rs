@@ -218,7 +218,7 @@ fn run() -> Res<()> {
         ffn_shexp: Vec::new(),
         l_out: b0.l_out,
     });
-    for l in layers.clone().skip(1) {
+    for l in layers.skip(1) {
         let t = model.step_layer_taps(l, &x, pos)?;
         x.clone_from(&t.l_out);
         taps.push(t);

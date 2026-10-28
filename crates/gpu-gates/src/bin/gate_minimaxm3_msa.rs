@@ -696,7 +696,7 @@ mod gate {
 
         // 5. A NaN key: pool_select raised, the list still defined.
         {
-            let mut bad = ik_bits.clone();
+            let mut bad = ik_bits;
             bad[(3 * BLOCK + 5) * DIM + 9] = NAN16;
             let bad_d = DeviceBuffer::from_host(stream, &bad)?;
             let counts = [32768u32];

@@ -462,17 +462,14 @@ pub fn check_kinds(
     }
     for (f, &l) in spec.layers.iter().enumerate() {
         for stem in STEMS {
-            let (a, b) = match (
+            let (Some((_, a)), Some((_, b))) = (
                 fixture.find(&crate::arch::names::blk(f, stem)),
                 source.find(&crate::arch::names::blk(l, stem)),
-            ) {
-                (Some((_, a)), Some((_, b))) => (a, b),
-                _ => {
-                    return Err(bad(
-                        format!("layer {f} (source {l})"),
-                        format!("{stem} is missing from the fixture or the source"),
-                    ));
-                }
+            ) else {
+                return Err(bad(
+                    format!("layer {f} (source {l})"),
+                    format!("{stem} is missing from the fixture or the source"),
+                ));
             };
             if a.ty != b.ty {
                 return Err(bad(
@@ -483,14 +480,11 @@ pub fn check_kinds(
         }
     }
     for global in [token_embd(), output_norm(), output()] {
-        let (a, b) = match (fixture.find(&global), source.find(&global)) {
-            (Some((_, a)), Some((_, b))) => (a, b),
-            _ => {
-                return Err(bad(
-                    global,
-                    "is missing from the fixture or the source".into(),
-                ));
-            }
+        let (Some((_, a)), Some((_, b))) = (fixture.find(&global), source.find(&global)) else {
+            return Err(bad(
+                global,
+                "is missing from the fixture or the source".into(),
+            ));
         };
         if a.ty != b.ty {
             return Err(bad(
@@ -631,9 +625,9 @@ mod tests {
 
     fn source_tensors() -> MiniTensors {
         let mut t = vec![
-            (token_embd().to_string(), vec![EMBD, 2], Ty::Q4K),
-            (output_norm().to_string(), vec![EMBD], Ty::F32),
-            (output().to_string(), vec![EMBD, 2], Ty::Q6K),
+            (token_embd(), vec![EMBD, 2], Ty::Q4K),
+            (output_norm(), vec![EMBD], Ty::F32),
+            (output(), vec![EMBD, 2], Ty::Q6K),
         ];
         for l in 0..SLIDING.len() {
             layer_tensors(l, HEADS, LATENT_SRC, &mut t);
@@ -693,9 +687,9 @@ mod tests {
         let (q, kvd) = (heads as u64 * 64, KV_HEADS * 64);
         let (x, w, lat) = (EXPERTS, FF, latent);
         let mut t: MiniTensors = vec![
-            (token_embd().to_string(), vec![e, 2], Ty::Q4K),
-            (output_norm().to_string(), vec![e], Ty::F32),
-            (output().to_string(), vec![e, 2], Ty::Q6K),
+            (token_embd(), vec![e, 2], Ty::Q4K),
+            (output_norm(), vec![e], Ty::F32),
+            (output(), vec![e, 2], Ty::Q6K),
         ];
         for l in 0..4 {
             for (stem, dims, ty) in [

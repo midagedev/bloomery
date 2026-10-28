@@ -98,7 +98,7 @@ fn check_confined(
     );
     assert_eq!(got.data.len(), want.len(), "{what}: length");
     let mut worst = 0.0f32;
-    let mut over: std::collections::BTreeSet<usize> = Default::default();
+    let mut over: std::collections::BTreeSet<usize> = std::collections::BTreeSet::default();
     let mut n_over = 0usize;
     for (i, (&g, &w)) in got.data.iter().zip(&want).enumerate() {
         let d = (g - w).abs();

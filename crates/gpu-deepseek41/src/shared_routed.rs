@@ -751,7 +751,7 @@ impl<R: RouterEntry> Routed<R> {
                     let rule = rule_of("dense activation", l, act)?;
                     DenseFfn::load((file, w), l, (ff as usize, d.embd, rule)).map(Some)
                 }
-                _ => Ok(None),
+                Ffn::Moe(_) => Ok(None),
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
         let routes = (0..layers.len())

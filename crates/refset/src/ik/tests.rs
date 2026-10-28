@@ -32,7 +32,12 @@ fn write(path: &Path, bytes: &[u8]) {
 fn manifest(dir: &Path, lines: &[&str]) -> Result<RefManifest, RefError> {
     write(
         &dir.join("MANIFEST.tsv"),
-        (lines.join("\n") + "\n").as_bytes(),
+        {
+            let mut out = lines.join("\n");
+            out.push('\n');
+            out
+        }
+        .as_bytes(),
     );
     RefManifest::read(dir)
 }
@@ -691,7 +696,7 @@ fn prefill_routes_hold_every_layer_over_the_ubatches_in_order() -> Result<(), Re
     let dir = set_dir("routes-read")?;
     let lines = route_set(&dir, &[3, 2], &[5, 2], GLM_LAST);
     let routes = routes_of(&dir, &lines, GLM_LAST)?;
-    let mut reversed = lines.clone();
+    let mut reversed = lines;
     reversed[4..].reverse();
     assert_eq!(routes_of(&dir, &reversed, GLM_LAST)?, routes);
     assert_eq!(
@@ -1121,7 +1126,7 @@ fn the_picks_twin_must_hold_a_pick_for_every_cell_of_its_row() -> Result<(), Ref
 fn a_reader_refusal_is_named_by_set_and_row() -> Result<(), RefError> {
     let dir = set_dir("routes-reader")?;
     let whole = route_set(&dir, &[3, 2], &[2, 5], GLM_LAST);
-    let mut lines = whole.clone();
+    let mut lines = whole;
     lines.retain(|l| {
         !l.starts_with("int\tprefill.ffn_moe_topk-2\t0\t") || !l.contains("\tlogical\t")
     });

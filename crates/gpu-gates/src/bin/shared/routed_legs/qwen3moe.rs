@@ -38,7 +38,7 @@ impl Adapter for Row {
             levers: &levers,
             kv: KvQ8::F16,
             media: false,
-            beside: Default::default(),
+            beside: bloomery_gpu_gates::beside::Beside::default(),
             ubatch: None,
         };
         let serve = floor_or(
@@ -63,17 +63,29 @@ impl Adapter for Row {
 fn arm(split: &Split, name: &'static str, ctx: usize, slots: usize) -> Result<Arm, Outcome> {
     let kv = KvQ8::F16;
     let census = q3place::census().map_err(|e| outcome_of(e.as_ref()))?;
-    match q3place::unplaced_qwen3_slots(split, &census, ctx, slots, (kv, Default::default()))
-        .map_err(|e| outcome_of(e.as_ref()))
+    match q3place::unplaced_qwen3_slots(
+        split,
+        &census,
+        ctx,
+        slots,
+        (kv, bloomery_gpu_gates::beside::Beside::default()),
+    )
+    .map_err(|e| outcome_of(e.as_ref()))
     {
         Ok(q3place::Unplaced::Whole(_)) => {
             // The placed path at the same context: the probe the default
             // built on `a`'s card (`PlaceQ3::qwen3_on` lays out the same one
             // on the same reading; `Place::A` is the unresolved alias it
             // resolves there).
-            let placed =
-                q3place::PlaceQ3::qwen3_on(split, Place::A, &census, ctx, kv, Default::default())
-                    .map_err(|e| outcome_of(e.as_ref()))?;
+            let placed = q3place::PlaceQ3::qwen3_on(
+                split,
+                Place::A,
+                &census,
+                ctx,
+                kv,
+                bloomery_gpu_gates::beside::Beside::default(),
+            )
+            .map_err(|e| outcome_of(e.as_ref()))?;
             Ok(Arm {
                 name,
                 whole: true,

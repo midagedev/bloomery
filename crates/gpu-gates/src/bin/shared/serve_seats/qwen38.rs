@@ -440,9 +440,13 @@ mod qwen38_levers;
 pub(crate) use qwen38_levers::ACTS_ON;
 #[path = "../route_trace38.rs"]
 mod route_trace38;
+use super::xstream_rule::{Stage, xstream_rule};
+#[allow(
+    clippy::duplicate_mod,
+    reason = "three seats of one bin include this file"
+)]
 #[path = "../ubatch_rule.rs"]
 mod ubatch_rule;
-use super::xstream_rule::{Stage, xstream_rule};
 use route_trace38::{TraceRun, experts_name};
 use ubatch_rule::ubatch_rule;
 

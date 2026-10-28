@@ -352,7 +352,7 @@ fn run() -> Result<(), GateError> {
             model.seed_layer_cache(LAYER, &seed5)?;
             let taps = model.step_layer_taps(LAYER, &column(t), last as u32)?;
             if taps.moe_ids != taps1.moe_ids {
-                probe = Some((t, taps.moe_ids.clone()));
+                probe = Some((t, taps.moe_ids));
                 break;
             }
         }

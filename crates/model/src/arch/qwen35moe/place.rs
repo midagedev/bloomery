@@ -2058,9 +2058,8 @@ pub fn mtp_tensors(d: &MtpDraft) -> Result<Vec<MtpTensor>, PlacementError> {
         .shared
         .filter(|s| s.sigmoid_gate)
         .ok_or_else(|| refuse("it has no gated shared expert"))?;
-    let (streams, rank) = match d.hc.map(|h| (h.streams, h.kind)) {
-        Some((s, HcKind::Gated { rank })) => (s, rank),
-        _ => return Err(refuse("it has no gated hyper-connections")),
+    let Some((streams, HcKind::Gated { rank })) = d.hc.map(|h| (h.streams, h.kind)) else {
+        return Err(refuse("it has no gated hyper-connections"));
     };
     let u = u64::from;
     let (h, hd) = (u(d.hidden), u(g.head_dim));
@@ -2763,7 +2762,7 @@ mod tests {
             .expect("the folder header describes");
         let machine = super::machine(super::A6000, inputs.model.layers, 8);
         let levers = PlanLevers {
-            card_budget_bytes: Default::default(),
+            card_budget_bytes: bloomery_levers::CardBudget::default(),
         };
         for (input, tier) in [
             (&inputs, placement::Device::Host),

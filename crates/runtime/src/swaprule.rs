@@ -1355,7 +1355,9 @@ impl SwapRule {
             let cells = self.cells();
             for (heat, &live) in self.heat.chunks_exact_mut(cells).zip(&self.live) {
                 if live {
-                    heat.iter_mut().for_each(|h| *h *= decay);
+                    for h in heat.iter_mut() {
+                        *h *= decay;
+                    }
                 }
             }
             if self.params.delay == 0 {

@@ -998,7 +998,7 @@ mod tests {
         /// hidden the block divides.
         fn wide() -> Case {
             let kv = |mut kv: Vec<(&'static str, V)>| {
-                kv.iter_mut().for_each(|(k, v)| {
+                for (k, v) in kv.iter_mut() {
                     if *k == "embedding_length" {
                         *v = V::U32(256);
                     } else if *k == "embedding_length_per_layer_input" {
@@ -1006,7 +1006,7 @@ mod tests {
                         // embedding's width.
                         *v = V::U32(64);
                     }
-                });
+                }
                 kv
             };
             let tensors = |ts: Vec<(String, Vec<u64>, Ty)>| {
@@ -1357,11 +1357,11 @@ mod tests {
             }
         );
         let mut tk = keys();
-        tk.iter_mut().for_each(|(k, v)| {
+        for (k, v) in tk.iter_mut() {
             if *k == "embedding_length" {
                 *v = V::U32(256);
             }
-        });
+        }
         let path = header_typed("mtp-hk-q6k", "qwen4exp", &tk, &tokens(), &c.target);
         let target = gguf::Split::open(&path).expect("the synthetic target opens");
         let got = head_kind(&target, 256, 2).expect("the target's head reads");
@@ -1389,11 +1389,11 @@ mod tests {
             }
         );
         let mut tk = keys();
-        tk.iter_mut().for_each(|(k, v)| {
+        for (k, v) in tk.iter_mut() {
             if *k == "embedding_length" {
                 *v = V::U32(256);
             }
-        });
+        }
         let path = header_typed("mtp-hk-bf16", "qwen4exp", &tk, &tokens(), &c.target);
         let target = gguf::Split::open(&path).expect("the synthetic target opens");
         let got = head_kind(&target, 256, 2).expect("the target's head reads");

@@ -260,7 +260,7 @@ impl Rgb8 {
                     .iter()
                     .for_each(|p| data.extend_from_slice(&[p[0], p[0], p[0]]));
             }),
-            other => {
+            other @ png::ColorType::Indexed => {
                 return Err(VisionError::Format(format!(
                     "a {other:?} PNG after palette expansion"
                 )));
@@ -448,7 +448,7 @@ mod tests {
             panic!("a short decode was accepted");
         };
         assert_eq!(msg, "5 RGB bytes for a 2x1 frame");
-        let mut short = ok.clone();
+        let mut short = ok;
         short.data.pop();
         let Err(e) = short.check() else {
             panic!("a short image passed the check");

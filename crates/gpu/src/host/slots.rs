@@ -470,7 +470,7 @@ impl SlotMap {
         }
         let code = slot.entry()?;
         let row = i * self.n_expert..(i + 1) * self.n_expert;
-        if let Some(other) = self.slots[row.clone()].iter().position(|&e| e == code) {
+        if let Some(other) = self.slots[row].iter().position(|&e| e == code) {
             return Err(GpuError::shape(
                 WHAT,
                 format!("layer {layer}: {slot:?} holds expert {other}"),

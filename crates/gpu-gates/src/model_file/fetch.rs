@@ -182,12 +182,12 @@ pub fn sentence_prompts(
             Err(e) if no_file(&e) => {
                 let Some(base) = model_card(&repo)?.as_deref().and_then(hf::card::base_model)
                 else {
-                    return Ok(Default::default());
+                    return Ok(std::collections::BTreeMap::default());
                 };
                 let base = hf::RepoRef::parse(&base)?.repo;
                 match c.resolve_exact(&base, &[NAME], &mut print) {
                     Ok(paths) => paths,
-                    Err(e) if no_file(&e) => return Ok(Default::default()),
+                    Err(e) if no_file(&e) => return Ok(std::collections::BTreeMap::default()),
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -206,7 +206,7 @@ pub fn sentence_prompts(
             if e.kind() == std::io::ErrorKind::NotFound
                 && (flags.path.is_some() || flags.hf.is_none()) =>
         {
-            return Ok(Default::default());
+            return Ok(std::collections::BTreeMap::default());
         }
         Err(e) => return Err(format!("{}: {e}", path.display()).into()),
     };

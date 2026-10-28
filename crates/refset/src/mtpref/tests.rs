@@ -76,8 +76,12 @@ fn write_set(dir: &Path, model: &str, build: &str, arch: &str, rows: &[&str], co
     if complete {
         lines.push("# complete\t3\t0".to_string());
     }
-    std::fs::write(dir.join("MANIFEST.tsv"), lines.join("\n") + "\n")
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    std::fs::write(dir.join("MANIFEST.tsv"), {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    })
+    .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
 }
 
 /// The family's own set: the file, build and arch it pins, every row kind.

@@ -677,7 +677,7 @@ mod gate {
             within_bands(rels.iter().map(|r| r.2[layer]).collect())
         };
         let clean = (0..LAYERS_TAPPED).all(|l| held(&ours, l));
-        let mut nan = ours.clone();
+        let mut nan = ours;
         nan[(VERIFY_ROWS - 1) * w + SEG] = f32::NAN;
         let refused = !held(&nan, 1) && held(&nan, 0);
         println!(

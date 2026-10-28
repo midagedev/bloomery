@@ -2815,7 +2815,8 @@ mod gate {
         w: &[f32],
         n: usize,
     ) -> Result<Vec<f64>, GateError> {
-        let mut by_e: std::collections::BTreeMap<usize, Vec<(usize, usize)>> = Default::default();
+        let mut by_e: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::default();
         for t in 0..n {
             for s in 0..N_SLOTS {
                 by_e.entry(ids[t * N_SLOTS + s] as usize)

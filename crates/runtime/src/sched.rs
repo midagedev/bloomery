@@ -304,7 +304,7 @@ pub trait Port {
     fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), Self::Error> {
         match order {
             BatchOrder::Ahead => self.open(o),
-            order => Err(Self::refused(Refused::Order {
+            order @ BatchOrder::Fronts => Err(Self::refused(Refused::Order {
                 order,
                 port: Self::KIND,
             })),

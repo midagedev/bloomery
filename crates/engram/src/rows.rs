@@ -547,7 +547,7 @@ mod tests {
         ));
         let past = RunTable::open("t", 4, &[run(&b, 16, 2)], PageAdvice::Random);
         assert!(matches!(past, Err(EngramError::PastEndOfFile { .. })));
-        let torn = RunTable::open("t", 4, &[(a.clone(), 3..9)], PageAdvice::Random);
+        let torn = RunTable::open("t", 4, &[(a, 3..9)], PageAdvice::Random);
         assert!(matches!(torn, Err(EngramError::Untiled { .. })));
         std::fs::remove_dir_all(&dir).unwrap();
     }

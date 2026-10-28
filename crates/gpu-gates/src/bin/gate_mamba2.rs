@@ -1158,7 +1158,7 @@ mod gate {
         // plant non-finite (the norm group of head 0, or head 0's channels).
         let mut bad = tok.clone();
         bad.dt[0] = f32::NEG_INFINITY;
-        let toks = [tok.clone(), bad, tok.clone()];
+        let toks = [tok.clone(), bad, tok];
         for norm in [true, false] {
             let (got, _) = pass_run(cx, &mut dev, (&ring0, &st.scan, P0), &toks, norm, false)?;
             let f = cx.gpu.take_fault()?;
@@ -1423,7 +1423,9 @@ mod gate {
         if reverse {
             chunks.iter().rev().for_each(|c| total += c);
         } else {
-            chunks.iter().for_each(|c| total += c);
+            for c in chunks.iter() {
+                total += c;
+            }
         }
         let mean = (total / y.len() as f64) as f32;
         (mean, 1.0 / (mean + EPS).sqrt())

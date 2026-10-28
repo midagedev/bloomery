@@ -779,7 +779,7 @@ mod tests {
             .iter()
             .filter_map(|l| match &l.ffn {
                 Ffn::Moe(m) => Some(m),
-                _ => None,
+                Ffn::Dense { .. } => None,
             })
             .next()
             .expect("a MoE layer");
@@ -1079,7 +1079,7 @@ mod tests {
             .iter()
             .filter_map(|l| match &l.ffn {
                 Ffn::Moe(m) => Some(m),
-                _ => None,
+                Ffn::Dense { .. } => None,
             })
             .next()
             .expect("a MoE layer");

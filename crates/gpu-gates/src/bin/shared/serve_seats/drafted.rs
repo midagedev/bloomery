@@ -281,7 +281,9 @@ impl<T: Target> Lookups<T> {
         let l = self.before(t, slot, pos, Call::Moved)?;
         let next = call(t)?;
         l.stand(pos, first);
-        rest.iter().for_each(|&id| l.push(id));
+        for &id in rest.iter() {
+            l.push(id);
+        }
         l.push(next);
         Ok(next)
     }

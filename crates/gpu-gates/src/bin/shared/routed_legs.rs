@@ -1538,7 +1538,7 @@ fn place3_of(p: &Place3Error) -> Outcome {
     let kind = match p {
         Place3Error::Positions => "positions",
         Place3Error::Placement(e) => return refused_of(e),
-        _ => return Outcome::Red(p.to_string()),
+        Place3Error::Broken(_) => return Outcome::Red(p.to_string()),
     };
     Outcome::Refused(Refusal {
         kind,

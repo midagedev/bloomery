@@ -530,15 +530,33 @@ mod tests {
                     }
                 )
             }),
-            ("not an id", rows_file(10, &[0], 1) + "x\n", |e| {
-                matches!(e, HeadRowsError::NotAnId { line: 3, .. })
-            }),
-            ("blank line", rows_file(10, &[0], 1) + "\n", |e| {
-                matches!(e, HeadRowsError::NotAnId { line: 3, .. })
-            }),
-            ("signed", rows_file(10, &[], 0) + "+1\n", |e| {
-                matches!(e, HeadRowsError::NotAnId { line: 2, .. })
-            }),
+            (
+                "not an id",
+                {
+                    let mut out = rows_file(10, &[0], 1);
+                    out.push_str("x\n");
+                    out
+                },
+                |e| matches!(e, HeadRowsError::NotAnId { line: 3, .. }),
+            ),
+            (
+                "blank line",
+                {
+                    let mut out = rows_file(10, &[0], 1);
+                    out.push('\n');
+                    out
+                },
+                |e| matches!(e, HeadRowsError::NotAnId { line: 3, .. }),
+            ),
+            (
+                "signed",
+                {
+                    let mut out = rows_file(10, &[], 0);
+                    out.push_str("+1\n");
+                    out
+                },
+                |e| matches!(e, HeadRowsError::NotAnId { line: 2, .. }),
+            ),
             ("past the vocabulary", rows_file(10, &[0, 10], 2), |e| {
                 matches!(
                     e,

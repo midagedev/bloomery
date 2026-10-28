@@ -529,7 +529,7 @@ mod tests {
         let part = format!(r#"{{"type":"image_url","image_url":{{"url":{png:?}}}}}"#);
         let nine = vec![format!("{png:?}"); 9].join(",");
         let five = vec![format!("{png:?}"); 5].join(",");
-        let four = vec![part.clone(); 4].join(",");
+        let four = vec![part; 4].join(",");
         for (text, want) in [
             (
                 format!(r#"{{"state":1,"images":"x",{q}}}"#),

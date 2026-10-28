@@ -156,8 +156,12 @@ mod tests {
             lines.push("# complete\t1\t0".to_string());
         }
         let path = dir.join("MANIFEST.tsv");
-        std::fs::write(&path, lines.join("\n") + "\n")
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        std::fs::write(&path, {
+            let mut out = lines.join("\n");
+            out.push('\n');
+            out
+        })
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
 
     /// The family takes a complete set of the Q4_K_M file, the pinned

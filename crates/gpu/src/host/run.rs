@@ -993,7 +993,7 @@ mod tests {
                     let den: f64 = b.iter().map(|&b| f64::from(b).powi(2)).sum();
                     (num / den).sqrt()
                 };
-                let mut agg_normed = agg0.clone();
+                let mut agg_normed = agg0;
                 norm.norm(&mut agg_normed);
                 assert!(
                     far(&agg_normed, &want0) > 1e-3,

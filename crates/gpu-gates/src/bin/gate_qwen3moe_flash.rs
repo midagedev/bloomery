@@ -1357,7 +1357,7 @@ mod gate {
 
             // The refusal path: rows 3 and 5 of the eight-row launch.
             let (bad_hi, bad_zero) = (3usize, 5usize);
-            let mut bad = limits.clone();
+            let mut bad = limits;
             bad[bad_hi] = u32::try_from(g.ctx + 1)?;
             bad[bad_zero] = 0;
             let bd = DeviceBuffer::from_host(stream, &bad)?;

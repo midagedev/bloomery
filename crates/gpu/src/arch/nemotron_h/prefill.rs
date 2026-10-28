@@ -206,9 +206,8 @@ impl Body {
         let at = Prompt::ids_at(n_kv);
         p.host_words[at..at + m].copy_from_slice(ids);
         p.words.copy_from_host(stream, &p.host_words)?;
-        let table = match w.get(&self.embed) {
-            Some(DevWeight::Q5_0 { w, .. }) => w,
-            _ => return Err(GpuError::tensor(WHAT, &self.embed, "a Q5_0 table")),
+        let Some(DevWeight::Q5_0 { w: table, .. }) = w.get(&self.embed) else {
+            return Err(GpuError::tensor(WHAT, &self.embed, "a Q5_0 table"));
         };
         {
             let ids_w = Window::<u32>::of(&p.words, at * size_of::<u32>(), m)?;

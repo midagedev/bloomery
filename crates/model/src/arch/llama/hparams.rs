@@ -338,11 +338,11 @@ mod tests {
     #[test]
     fn unsupported_values_are_refused_by_key_and_value() {
         let mut odd_width = without(&["attention.key_length", "attention.value_length"]);
-        odd_width.iter_mut().for_each(|(k, v)| {
+        for (k, v) in odd_width.iter_mut() {
             if *k == "embedding_length" {
                 *v = V::U32(7169);
             }
-        });
+        }
         let cases = [
             (
                 with("attention.head_count_kv", V::U32(5)),

@@ -87,14 +87,14 @@ impl PlanRefusal for PlaceError {
     fn placement(&self) -> Option<&PlacementError> {
         match self {
             Self::Placement(e) => Some(e),
-            _ => None,
+            Self::Broken(_) => None,
         }
     }
 
     fn violations(&self) -> Option<&[Violation]> {
         match self {
             Self::Broken(v) => Some(v),
-            _ => None,
+            Self::Placement(_) => None,
         }
     }
 }

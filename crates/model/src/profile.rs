@@ -153,6 +153,7 @@ impl CallAcc {
     /// Every stage scaled by `num/den` — a mixed group's per-type share of
     /// one call's accumulators. Floor-rounded, so the per-type rows sum to
     /// at most the whole call, never more.
+    #[must_use]
     pub fn scaled(&self, num: u64, den: u64) -> CallAcc {
         let f = |ns: u64| {
             u64::try_from((u128::from(ns) * u128::from(num)) / u128::from(den))

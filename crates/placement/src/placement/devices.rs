@@ -1259,7 +1259,7 @@ mod tests {
         // The A6000 resolved at ordinal 1 of the 3090-first enumeration, in
         // a process that numbers it 0, and in one that does not see it.
         let a6000_first = census(&[(NAME_A6000, TOTAL_A6000)]);
-        let mut moved = a6000_first.clone();
+        let mut moved = a6000_first;
         moved[0].uuid = both[1].uuid;
         let e = device_on_host("A6000", Some(both[1].device()), &moved).expect_err("moved");
         assert_eq!(e.at, Some(0));

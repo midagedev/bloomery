@@ -60,8 +60,8 @@ impl Layer {
     pub(super) fn sites(&self) -> Vec<&Site> {
         match self {
             Layer::Mamba(m) => m.sites().to_vec(),
-            Layer::Attn(a) => a.sites().to_vec(),
-            Layer::Moe(m) => m.sites().to_vec(),
+            Layer::Attn(a) => a.sites(),
+            Layer::Moe(m) => m.sites(),
         }
     }
 }

@@ -502,7 +502,7 @@ impl GpuModel<Body> {
                 index,
                 name,
                 us_mean: s.iter().sum::<f64>() / s.len() as f64,
-                us_min: s.iter().cloned().fold(f64::INFINITY, f64::min),
+                us_min: s.iter().copied().fold(f64::INFINITY, f64::min),
                 bytes,
             })
             .collect())

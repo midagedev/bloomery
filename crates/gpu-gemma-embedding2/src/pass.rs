@@ -513,7 +513,9 @@ impl Encoder {
             &mut rows,
         )?;
         let scale = (e as f32).sqrt();
-        rows.iter_mut().for_each(|v| *v *= scale);
+        for v in rows.iter_mut() {
+            *v *= scale;
+        }
         Ok(rows)
     }
 

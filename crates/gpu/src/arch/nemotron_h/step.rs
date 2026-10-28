@@ -83,9 +83,8 @@ impl Body {
             k: &self.k,
             sh: self.sh,
         };
-        let table = match w.get(&self.embed) {
-            Some(DevWeight::Q5_0 { w, .. }) => w,
-            _ => return Err(GpuError::tensor(WHAT, &self.embed, "a Q5_0 table")),
+        let Some(DevWeight::Q5_0 { w: table, .. }) = w.get(&self.embed) else {
+            return Err(GpuError::tensor(WHAT, &self.embed, "a Q5_0 table"));
         };
         let hin = head.input_mut();
         let mut in_head = self.layers.len().is_multiple_of(2);

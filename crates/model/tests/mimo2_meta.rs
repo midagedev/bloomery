@@ -667,7 +667,9 @@ fn put_raw(b: &mut Vec<u8>, v: &Value) {
             };
             b.extend_from_slice(&tag_of(first).to_le_bytes());
             b.extend_from_slice(&(items.len() as u64).to_le_bytes());
-            items.iter().for_each(|x| put_raw(b, x));
+            for x in items.iter() {
+                put_raw(b, x);
+            }
         }
         Value::U64(x) => b.extend_from_slice(&x.to_le_bytes()),
         Value::I64(x) => b.extend_from_slice(&x.to_le_bytes()),

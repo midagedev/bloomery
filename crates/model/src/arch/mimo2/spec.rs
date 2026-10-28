@@ -204,7 +204,7 @@ mod tests {
                 .chain(&r.spec.mtp)
                 .filter_map(|l| match &l.ffn {
                     Ffn::Moe(m) => Some(m.router.bias),
-                    _ => None,
+                    Ffn::Dense { .. } => None,
                 })
                 .collect()
         };

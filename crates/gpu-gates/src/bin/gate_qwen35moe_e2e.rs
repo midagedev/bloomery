@@ -3842,8 +3842,7 @@ mod gate {
             .body("gate_qwen35moe_e2e")?
             .placed()
             .ok_or("an open_placed load with no placed side")?
-            .card_counts()
-            .to_vec();
+            .card_counts();
         println!(
             "placed common {label}: card budget {budget} B card_experts={} host_experts={} card \
              experts per layer {counts:?} resident_bytes={} in {:.1} s (runtime value)",
@@ -3954,7 +3953,8 @@ mod gate {
     /// past the map, or a map value at or past the card set that is not
     /// [`HOST`]). (o9r)'s oracle, the rule `gemm_route_remap` states.
     fn oracle_route(ids: &[u32], map: &[u32], n_card: usize) -> (Vec<u32>, Vec<GemmTile>, usize) {
-        let mut per: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        let mut per: std::collections::BTreeMap<u32, Vec<u32>> =
+            std::collections::BTreeMap::default();
         let mut refused = 0usize;
         for (s, &id) in ids.iter().enumerate() {
             match map.get(id as usize).copied() {

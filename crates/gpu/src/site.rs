@@ -761,9 +761,8 @@ pub fn blocks32_gemv(
             format!("{name} is {ty}: `site::blocks32_gemv` runs a Q5_0 site"),
         ));
     };
-    let wt = match w.get(name) {
-        Some(DevWeight::Q5_0 { w, .. }) => w,
-        _ => return Err(GpuError::tensor(WHAT, name, "a packed Q5_0 weight")),
+    let Some(DevWeight::Q5_0 { w: wt, .. }) = w.get(name) else {
+        return Err(GpuError::tensor(WHAT, name, "a packed Q5_0 weight"));
     };
     gpu.q5()
         .enqueue_gemv_q5_0(gpu.stream(), wt, act, 0, wt.rows(), 0, act.m(), y, 0)

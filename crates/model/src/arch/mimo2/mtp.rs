@@ -255,7 +255,7 @@ impl<'a> Target<'a> {
             .iter()
             .find_map(|l| match &l.ffn {
                 Ffn::Dense { ff, .. } => Some((&l.ffn, *ff)),
-                _ => None,
+                Ffn::Moe(_) => None,
             })
             .ok_or_else(|| target_lacks("a dense feed-forward layer"))?;
         Ok(Target {

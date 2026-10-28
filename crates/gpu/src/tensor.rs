@@ -895,9 +895,8 @@ mod tests {
             // or `ctx` is used.
             unsafe { DeviceTensor::<u32>::window(sys::CUdeviceptr::MAX, usize::MAX, 2, &ctx) };
         }));
-        let payload = match panicked {
-            Err(payload) => payload,
-            Ok(_) => panic!("the overflow must panic, not wrap"),
+        let Err(payload) = panicked else {
+            panic!("the overflow must panic, not wrap")
         };
         let msg = payload
             .downcast_ref::<String>()

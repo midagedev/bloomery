@@ -3954,7 +3954,7 @@ pub(crate) mod tests {
 
         // A NaN in token 1's row: the repeating quantizer refuses the blocks
         // of its card slots' columns and raises Q5Quant.
-        let mut nan_normed = host_normed.clone();
+        let mut nan_normed = host_normed;
         nan_normed[R2_N + 5] = f32::NAN;
         let nan_normed = DeviceBuffer::from_host(stream, &nan_normed).expect("the rows");
         leg.enqueue(

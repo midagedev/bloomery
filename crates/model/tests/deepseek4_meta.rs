@@ -569,7 +569,7 @@ fn hw_deepseek4_spec() {
         })
         .collect();
     let mut got = spec_view::items(&inputs.unimplemented());
-    let mut want_sorted = want.clone();
+    let mut want_sorted = want;
     got.sort();
     want_sorted.sort();
     for g in &got {

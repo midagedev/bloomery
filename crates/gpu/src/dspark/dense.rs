@@ -1856,7 +1856,7 @@ mod tests {
         // New rows (0, 1) are the file's (0, 4): NEOX pair 0; (2, 3) the file's (1, 5); and so on.
         assert_eq!(src, [0, 4, 1, 5, 2, 6, 3, 7]);
         // It is a permutation: every file row once.
-        let mut seen = src.clone();
+        let mut seen = src;
         seen.sort_unstable();
         assert_eq!(seen, (0..hd).collect::<Vec<_>>());
         // At 256 as well.

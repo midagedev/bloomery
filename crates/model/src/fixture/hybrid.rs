@@ -179,7 +179,7 @@ pub(crate) fn check_trunk<K: Copy + Debug + PartialEq>(
             .map(|(a, b)| ("feed-forward length", a[f], b[l]));
         for (key, a, b) in std::iter::once(("kv heads", fx.kv[f], src.kv[l])).chain(ff) {
             if a != b {
-                return Err(bad(what.clone(), format!("{key} {a}, the source's {b}")));
+                return Err(bad(what, format!("{key} {a}, the source's {b}")));
             }
         }
         if fx.kinds[f] != src.kinds[l] {

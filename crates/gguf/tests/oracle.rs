@@ -121,7 +121,7 @@ fn hw_coverage() {
     // And the names the oracle used match our enum's names (dump filename
     // compatibility for the dequant test).
     for (ty, n) in &counts {
-        let (oname, ocount) = oracle.get(&ty.as_u32()).unwrap();
+        let (oname, ocount) = &oracle[&ty.as_u32()];
         assert_eq!(
             ty.name().unwrap(),
             oname.as_str(),

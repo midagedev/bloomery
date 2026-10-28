@@ -570,7 +570,7 @@ mod gate {
         let k_same = bits_equal(&k_got[..RMS_HEAD], &k_host);
         rot_gap = rot_gap.min(max_abs(&k_got[..RMS_HEAD], &rotated(&k_host)));
         let mut expect_k = cache.clone();
-        let mut expect_v = cache.clone();
+        let mut expect_v = cache;
         let row = good_pos as usize * RMS_HEAD;
         for d in 0..RMS_HEAD {
             expect_k[row + d] = f32_to_f16_bits(k_host[d]);

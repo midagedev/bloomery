@@ -255,13 +255,11 @@ impl<'w> LayerTensors<'w> {
             _ => return Err(refuse(&n.q, "Q3_K, joined with the indexer's query")),
         };
         let groups = d.n_head * d.head_dim / d.group_k;
-        let out_a = match Dense::of(w, &n.out_a, d.group_k, groups * d.o_lora_rank)? {
-            Dense::Q3K(t) => t,
-            _ => return Err(refuse(&n.out_a, "Q3_K")),
+        let Dense::Q3K(out_a) = Dense::of(w, &n.out_a, d.group_k, groups * d.o_lora_rank)? else {
+            return Err(refuse(&n.out_a, "Q3_K"));
         };
-        let out_b = match Dense::of(w, &n.out_b, groups * d.o_lora_rank, d.n_embd)? {
-            Dense::Q3K(t) => t,
-            _ => return Err(refuse(&n.out_b, "Q3_K")),
+        let Dense::Q3K(out_b) = Dense::of(w, &n.out_b, groups * d.o_lora_rank, d.n_embd)? else {
+            return Err(refuse(&n.out_b, "Q3_K"));
         };
         let source = match &lp.source {
             Some(sp) => {
@@ -973,9 +971,8 @@ fn sub_pre(
             what: WHAT_BATCH,
             missing: "the compressor's batch buffers",
         };
-        let (raw, comp) = match (b.comp_raw.as_mut(), b.comp.as_mut()) {
-            (Some(r), Some(c)) => (r, c),
-            _ => return Err(missing),
+        let (Some(raw), Some(comp)) = (b.comp_raw.as_mut(), b.comp.as_mut()) else {
+            return Err(missing);
         };
         let width = compress::WIDTH;
         // The gate's rows of a split pair go after a sub-block's kv rows.

@@ -3984,7 +3984,7 @@ mod gate {
     fn card_whole(toks: &[u32]) -> Result<bool, GateError> {
         let fixture = Tier::from_env()? == Tier::Fixture;
         let levers = PlanLevers {
-            card_budget_bytes: Default::default(),
+            card_budget_bytes: bloomery_levers::CardBudget::default(),
         };
         let (rows, next) = verify_rows(toks)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;

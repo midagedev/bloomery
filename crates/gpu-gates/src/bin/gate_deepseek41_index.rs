@@ -1272,7 +1272,7 @@ mod gate {
         let (ik_off, _) = ids_vs_rule(&ik_ids, &rule_b.score, &beta, k);
         let mut dev_set: Vec<u32> = b.list[..k].to_vec();
         dev_set.sort_unstable();
-        let mut ik_set = ik_ids.clone();
+        let mut ik_set = ik_ids;
         ik_set.sort_unstable();
         let symdiff = dev_set
             .iter()
@@ -1569,7 +1569,7 @@ mod gate {
             .all(|&c| got[c].to_bits() == got[star].to_bits());
         let exact = out.list[..k] == exact_top(got, k)[..];
         let (rule_off, band_rows) = ids_vs_rule(&out.list[..k], &r.score, &r.kernel, k);
-        let mut group: Vec<usize> = copies.clone();
+        let mut group: Vec<usize> = copies;
         group.push(star);
         group.sort_unstable();
         let taken: Vec<usize> = group

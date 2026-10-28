@@ -1134,28 +1134,33 @@ pub(crate) mod synthetic {
                     b.extend_from_slice(&9u32.to_le_bytes());
                     b.extend_from_slice(&5u32.to_le_bytes());
                     b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
-                    xs.iter()
-                        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                    for x in xs.iter() {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
                 }
                 V::F32s(xs) => {
                     b.extend_from_slice(&9u32.to_le_bytes());
                     b.extend_from_slice(&6u32.to_le_bytes());
                     b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
-                    xs.iter()
-                        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                    for x in xs.iter() {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
                 }
                 V::U64s(xs) => {
                     b.extend_from_slice(&9u32.to_le_bytes());
                     b.extend_from_slice(&10u32.to_le_bytes());
                     b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
-                    xs.iter()
-                        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                    for x in xs.iter() {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
                 }
                 V::Bools(xs) => {
                     b.extend_from_slice(&9u32.to_le_bytes());
                     b.extend_from_slice(&7u32.to_le_bytes());
                     b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
-                    xs.iter().for_each(|x| b.push(u8::from(*x)));
+                    for x in xs.iter() {
+                        b.push(u8::from(*x));
+                    }
                 }
             }
         }
@@ -1164,8 +1169,9 @@ pub(crate) mod synthetic {
             let (id, bytes) = ty.id_and_bytes(dims.iter().product::<u64>());
             string(&mut b, name);
             b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
-            dims.iter()
-                .for_each(|d| b.extend_from_slice(&d.to_le_bytes()));
+            for d in dims.iter() {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
             b.extend_from_slice(&id.to_le_bytes());
             b.extend_from_slice(&offset.to_le_bytes());
             offset += bytes.div_ceil(32) * 32;
