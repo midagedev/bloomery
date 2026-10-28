@@ -836,8 +836,7 @@ fn mark_snapshot(root: &Path, repo: &str, entries: &[Entry]) -> Result<(), HfErr
         }
         workers
             .into_iter()
-            .map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect::<Result<(), HfError>>()
+            .try_for_each(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
     })
 }
 
