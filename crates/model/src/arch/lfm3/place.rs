@@ -228,7 +228,7 @@ mod tests {
             }
         }
         assert_eq!(kv.layer_bytes(KINDS.len(), 9), 0);
-        let plane = kv.clone().with_rows(Rows::Plane);
+        let plane = kv.with_rows(Rows::Plane);
         assert_eq!(plane.layer_bytes(4, 4096), row() * 4096);
         assert_eq!(plane.layer_bytes(0, 4096), ring_bytes());
     }
