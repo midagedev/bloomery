@@ -809,15 +809,6 @@ pub fn shortconv_bounds(h: &Harness<'_>) -> Clause {
     )))
 }
 
-/// The rows of `rows` laid `stride` apart, the words between them `pad`.
-fn strided(rows: &[Vec<f32>], stride: usize, pad: f32) -> Vec<f32> {
-    let mut out = vec![pad; rows.len() * stride];
-    for (r, row) in rows.iter().enumerate() {
-        out[r * stride..r * stride + row.len()].copy_from_slice(row);
-    }
-    out
-}
-
 /// The `rows` rows of `strided`, `stride` apart, `HIDDEN` values each.
 fn dense(strided: &[f32], rows: usize, stride: usize) -> Vec<f32> {
     (0..rows)
@@ -911,8 +902,8 @@ pub fn sandwich(h: &Harness<'_>) -> Clause {
         let streams: Vec<Vec<f32>> = (0..rows)
             .map(|r| oracle::activations(k, seed + 0x20 + r as u64, 1.0))
             .collect();
-        let x = strided(&outs, xs, f32::NAN);
-        let stream = strided(&streams, ys, pad);
+        let x = common::strided(&outs, xs, f32::NAN);
+        let stream = common::strided(&streams, ys, pad);
         let blank = vec![pad; rows * ys];
         let norm = Norm {
             x: &x,
@@ -988,9 +979,9 @@ pub fn sandwich_nan(h: &Harness<'_>) -> Clause {
     let streams: Vec<Vec<f32>> = (0..rows)
         .map(|r| oracle::activations(k, 0x5DB0 + r as u64, 1.0))
         .collect();
-    let stream = strided(&streams, k, pad);
+    let stream = common::strided(&streams, k, pad);
     let run = |outs: &[Vec<f32>], gain: &[f32], eps: f32| -> Result<Vec<f32>, String> {
-        let x = strided(outs, k, f32::NAN);
+        let x = common::strided(outs, k, f32::NAN);
         norm_launch(
             h,
             &Norm {

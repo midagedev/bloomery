@@ -15,7 +15,7 @@
 //! position has reached holds what the ring began with. The ring is compared
 //! bit for bit.
 //!
-//! The error is the model of the delta conv's oracle (`oracle_delta.rs`): the
+//! The error is the model of the delta conv's oracle (`oracle.rs` owns its arithmetic): the
 //! kernel's sum is one fma chain from the oldest tap and the C product, each
 //! operation rounds to nearest once, `U = 2^-24`. A product pays `ea·eb` as
 //! well as the two linear terms, and an fma rounds `a·b + c` once. The
@@ -41,50 +41,10 @@
 //! `|add · v| · factor · (1 + U) + U |y| +` the floor, one minimum-positive
 //! f32 per operation of the path.
 
-use super::oracle::{RSQRT_ULP, U, gamma_bound};
+use super::oracle::{Ev, RSQRT_ULP, U, fma, gamma_bound, mul};
 
 /// The adds of a SIMD-group sum, longest path, whatever its tree.
 const SIMD_SUM_DEPTH: usize = 31;
-
-/// One value and the absolute error an f32 evaluation may add.
-#[derive(Clone, Copy)]
-struct Ev {
-    v: f64,
-    e: f64,
-}
-
-impl Ev {
-    fn zero() -> Self {
-        Self { v: 0.0, e: 0.0 }
-    }
-
-    fn exact(v: f32) -> Self {
-        Self {
-            v: f64::from(v),
-            e: 0.0,
-        }
-    }
-}
-
-fn mul(a: Ev, b: Ev) -> Ev {
-    let v = a.v * b.v;
-    let cross = a.e * b.v.abs() + b.e * a.v.abs() + a.e * b.e;
-    let mag = (a.v.abs() + a.e) * (b.v.abs() + b.e);
-    Ev {
-        v,
-        e: cross + U * mag,
-    }
-}
-
-fn fma(a: Ev, b: Ev, c: Ev) -> Ev {
-    let v = a.v.mul_add(b.v, c.v);
-    let cross = a.e * b.v.abs() + b.e * a.v.abs() + a.e * b.e;
-    let mag = (a.v.abs() + a.e) * (b.v.abs() + b.e) + (c.v.abs() + c.e);
-    Ev {
-        v,
-        e: cross + c.e + U * mag,
-    }
-}
 
 /// One sequence's history, a position at a time: the products `B ⊙ x` the
 /// ring keeps and the `C` factors, as the f32 values the kernels read.

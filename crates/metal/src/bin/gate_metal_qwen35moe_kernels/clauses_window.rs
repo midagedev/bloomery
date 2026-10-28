@@ -27,7 +27,7 @@ use super::clauses_attention::{
     CacheBack, KIND_K, KIND_Q, KIND_V, cache_of_for, dequant_k_for, dequant_v_for, gate_of,
     head_row_for, read_cache, take_qg_for, u, upload_cache,
 };
-use super::common::{LAYER, first_diff};
+use super::common::{LAYER, first_diff, ratio};
 use super::oracle::sigmoid;
 use super::oracle_attention::{
     attend, band, head_gate_row, norm_rope, pack_f16, pack_q8, prefill_band, rope_row_f64,
@@ -641,16 +641,6 @@ fn expect_untouched(
         }
     }
     Ok(())
-}
-
-fn ratio(diff: f64, limit: f64) -> f64 {
-    if limit > 0.0 {
-        diff / limit
-    } else if diff == 0.0 {
-        0.0
-    } else {
-        f64::INFINITY
-    }
 }
 
 /// The launch left no fault, no ticket set, the appended and the planted rows
