@@ -101,7 +101,7 @@ impl KvLayout {
     /// GQA layer that selects positions.
     pub fn of_spec(spec: &ModelSpec) -> Result<KvLayout, PlacementError> {
         let mut layers = Vec::with_capacity(spec.layers.len());
-        let mut ropes: Vec<(u32, u32)> = Vec::new();
+        let mut ropes: Vec<(u32, u32, bool)> = Vec::new();
         for (layer, l) in spec.layers.iter().enumerate() {
             let refuse = |what: &str| {
                 PlacementError::Unimplemented(vec![Unimplemented {
@@ -119,7 +119,7 @@ impl KvLayout {
                 }
                 Mixer::Gqa(g) if g.select.is_none() => {
                     if g.rope.mode != RopeMode::None {
-                        let rope = (g.rope.base.to_bits(), g.rope.dims);
+                        let rope = (g.rope.base.to_bits(), g.rope.dims, g.rope.factors);
                         if !ropes.contains(&rope) {
                             ropes.push(rope);
                         }
@@ -140,7 +140,7 @@ impl KvLayout {
             rows: Rows::Ring,
             rope_row: ropes
                 .iter()
-                .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
+                .map(|&(_, dims, _)| u64::from(dims) * stores::F32_BYTES)
                 .sum(),
         })
     }
@@ -239,6 +239,29 @@ mod tests {
     #[test]
     fn two_ropes_are_two_tables() {
         let kv = inputs("lfm3-place-rope").kv;
+        assert_eq!(kv.stage_position_bytes(10), 2 * HEAD * 4 * 10);
+    }
+
+    /// A rope with frequency factors is a table of its own beside one of the same θ without
+    /// them: full layers that divide by the factors and sliding layers that do not stay two
+    /// tables when the file gives both one base. A key without the factors counts one.
+    #[test]
+    fn factors_keep_a_rope_of_the_same_base_a_table_of_its_own() {
+        let mut spec = inputs("lfm3-place-rope-factors").spec;
+        let base = spec
+            .layers
+            .iter()
+            .find_map(|l| match &l.mixer {
+                models::Mixer::Gqa(g) if g.rope.factors => Some(g.rope.base),
+                _ => None,
+            })
+            .expect("a full layer");
+        for l in &mut spec.layers {
+            if let models::Mixer::Gqa(g) = &mut l.mixer {
+                g.rope.base = base;
+            }
+        }
+        let kv = KvLayout::of_spec(&spec).expect("the layout");
         assert_eq!(kv.stage_position_bytes(10), 2 * HEAD * 4 * 10);
     }
 
