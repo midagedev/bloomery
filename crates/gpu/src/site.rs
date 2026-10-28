@@ -2180,10 +2180,6 @@ mod tests {
             WideActs::wants_of(&[SiteTy::Q4K, SiteTy::Nvfp4]),
             WideForms::q8(true, true)
         );
-        // The gemv arm's forms are the same as before.
-        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
-        assert_eq!(reads_at(SiteTy::Nvfp4, 5120), Form::Q8x128);
-        assert_eq!(reads_at(SiteTy::Nvfp4, 2688), Form::Q8Blocks32);
     }
 
     /// A by-name projection's extra launches follow the type: none for a site

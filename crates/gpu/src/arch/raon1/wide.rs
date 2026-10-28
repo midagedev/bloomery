@@ -1001,7 +1001,7 @@ pub(super) fn down_form(
     ff: usize,
     (dense_ff, shared_ff): (usize, usize),
 ) -> Option<DownForm> {
-    match down.reads() {
+    match site::reads_wide(down) {
         Form::Q8x128 if ff == dense_ff => Some(DownForm::Q128),
         Form::Q8x32 if ff == shared_ff => Some(DownForm::Q32),
         _ => None,
