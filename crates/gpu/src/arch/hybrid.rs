@@ -147,7 +147,7 @@ impl Acts {
             q8_1: Vec::new(),
         };
         for s in sites {
-            match s.ty.reads() {
+            match s.reads() {
                 Form::Q8Blocks32 if !acts.blocks32.iter().any(|a| a.k() == s.k) => {
                     acts.blocks32.push(Q8Blocks32::new(stream, s.k, 1)?);
                 }
@@ -466,6 +466,12 @@ impl Site {
         self.k
     }
 
+    /// The activation form the site's launch reads at its width ([`site::reads_at`]).
+    #[must_use]
+    pub fn reads(&self) -> Form {
+        site::reads_at(self.ty, self.k)
+    }
+
     /// `y = W · act` over the site's already-quantized q8_1 form, raising
     /// into layer `layer`'s fault sink — the gemv half of the q8_1 arm of
     /// [`Site::project`], which a caller that quantized by other means
@@ -494,7 +500,7 @@ impl Site {
     ) -> Result<(), GpuError> {
         let gpu = cx.gpu;
         let key = (self.ty, cx.w, self.name.as_str());
-        match self.ty.reads() {
+        match self.reads() {
             // Q8_0's form: the f32 rows on this gemv arm.
             Form::F32 | Form::Q8x32 => site::gemv(gpu, cx.g32, key, x, 1, y),
             Form::Q8Blocks32 => {
@@ -505,9 +511,12 @@ impl Site {
                     .ok_or_else(|| {
                         GpuError::state(cx.what, "a Q8Blocks32 form at the site's width")
                     })?;
-                gpu.q5()
-                    .enqueue_quantize_q8(gpu.stream(), x, act, gpu.layer_sink(layer)?)?;
-                site::blocks32_gemv(gpu, key, act, y)
+                let fault = gpu.layer_sink(layer)?;
+                gpu.q5().enqueue_quantize_q8(gpu.stream(), x, act, fault)?;
+                match self.ty {
+                    SiteTy::Nvfp4 => site::nvfp4_sel32_gemv(gpu, cx.kgemv, key, act, fault, y),
+                    _ => site::blocks32_gemv(gpu, key, act, y),
+                }
             }
             Form::Q8x128 => {
                 let act = acts.q8_1_at(cx.what, self.k, 1)?;
@@ -579,7 +588,7 @@ pub(crate) fn mamba_layer(
         sh.mamba.conv_dim(),
         sh.mamba.geom().n_heads,
     );
-    if m.ssm_in.ty.reads() == Form::Q8x128 {
+    if m.ssm_in.reads() == Form::Q8x128 {
         // The fused launch writes the normed row into `xn` and the q8_1 form
         // `ssm_in`'s gemv reads — the norm + quantize pair it folds, bit for
         // bit; `xn` has no other reader on this path.

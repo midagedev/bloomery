@@ -15,6 +15,15 @@
 //! The head's input is the dump's `l_out-26` (occurrence 0, the residual ADD,
 //! `{2048, 1}`) — the same tensor the CPU head gate feeds
 //! (`crates/model/tests/head.rs`).
+//!
+//! `nvfp4_head_k2688`, on a synthetic file: an NVFP4 `output.weight` of 2,688 values a row
+//! (Lightning's hidden width: whole 64-value blocks and no whole q8_1 super-block of 256, so the
+//! head reads the 32-value rows through `site::nvfp4_sel32_gemv`) beside its `.scale`:
+//! - each logit within the band of the f64 `scale · Σ w_j x_j` of the host's dequantized row and
+//!   the head's own normed row (`NVFP4_BAND` of the row's own scale, the 32-value activation
+//!   rounding), the argmax the logits' maximum under the tie rule above;
+//! - a head of three rows: row `c`'s logits and token are the one-row head's on that row, bit for
+//!   bit (the gemv is token-major and the copy puts it in the argmax's layout).
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Gpu;
@@ -66,7 +75,8 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
-    let mut ok = true;
+    let gpu = Gpu::new()?;
+    let mut ok = nvfp4_head::run(&gpu)?;
     let file = Split::open(ref_model_path()?)?;
     let man = ref_manifest()?;
     let dir = ref_dir();
@@ -90,7 +100,6 @@ fn run() -> Result<(), GateError> {
         .arch_get_f32("attention.layer_norm_rms_epsilon")
         .ok_or("gate_head_gpu: rms eps key missing or not f32")?;
 
-    let gpu = Gpu::new()?;
     // Globals only: the head reads no block tensors and no derived weights,
     // so nothing is derived after the load.
     let w = Weights::load(gpu.stream(), &file, 0..0, true)?;
@@ -225,4 +234,155 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
     idx.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
     idx.truncate(5);
     idx.into_iter().map(|i| (i, v[i])).collect()
+}
+
+/// The `nvfp4_head_k2688` clause (module doc).
+#[cfg(feature = "gpu")]
+mod nvfp4_head {
+    use bloomery_gpu::Gpu;
+    use bloomery_gpu::head::Head;
+    use bloomery_gpu::weights::{HEAD_TENSOR, Weights};
+    use bloomery_gpu_gates::{GateError, GateRng, par_map, verdict, write_gguf};
+    use gguf::Split;
+    use gguf::quant::{GgmlType, dequant_row};
+    use model::arch::names::output_norm;
+
+    /// Lightning's hidden width and a vocabulary of a few blocks of rows.
+    const K: usize = 2688;
+    const N_VOCAB: usize = 1000;
+    /// Rows of the multi-row head.
+    const M: usize = 3;
+    /// The tensor scale, no power of two, and far enough from 1 that a logit without it leaves the
+    /// band on nearly every row.
+    const SCALE: f32 = 0.371_9;
+    const EPS: f32 = 1e-6;
+    /// The band of a logit about the f64 reference, a share of the row's own scale `scale ·
+    /// sqrt(Σ (w_j x_j)²)`: the 32-value activation's rounding is at most 1/254 of a block's largest
+    /// value a value, which keeps the dot's error near 0.4 % of that scale; 3 % is the Q5_K head
+    /// test's band over the same kind of rounding.
+    const NVFP4_BAND: f64 = 0.03;
+
+    /// `rows` NVFP4 rows of `k` values drawn from `seed`: each block's four scale bytes uniform
+    /// over the 127 UE4M3 bytes the format defines, its 32 code bytes uniform over all 256.
+    fn nvfp4_rows(rows: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut rng = GateRng(seed);
+        let mut out = Vec::with_capacity(rows * k / 64 * 36);
+        for _ in 0..rows * k / 64 {
+            out.extend((0..4).map(|_| rng.below(0x7F) as u8));
+            out.extend((0..32).map(|_| rng.below(256) as u8));
+        }
+        out
+    }
+
+    /// Row `c` of a head of `M` rows: the inputs the one-row head is run on one at a time.
+    fn input(c: usize) -> Vec<f32> {
+        (0..K)
+            .map(|i| (((i + 7 * c) * 37 % 101) as f32 - 50.0 + c as f32) / 25.0)
+            .collect()
+    }
+
+    pub(super) fn run(gpu: &Gpu) -> Result<bool, GateError> {
+        let rows = nvfp4_rows(N_VOCAB, K, 0x5eed_0301);
+        let gain: Vec<u8> = (0..K)
+            .flat_map(|i| (0.5 + (i % 7) as f32 / 8.0).to_le_bytes())
+            .collect();
+        let decls = vec![
+            (
+                HEAD_TENSOR.to_string(),
+                vec![K as u64, N_VOCAB as u64],
+                GgmlType::NVFP4,
+                rows.clone(),
+            ),
+            (
+                "output.scale".to_string(),
+                vec![1],
+                GgmlType::F32,
+                SCALE.to_le_bytes().to_vec(),
+            ),
+            (output_norm(), vec![K as u64], GgmlType::F32, gain),
+        ];
+        let dir = std::env::temp_dir().join(format!("bloomery-nvfp4-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("head.gguf");
+        let loaded = write_gguf(&path, &[], &decls).and_then(|()| {
+            let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let w = Weights::load_where(gpu.stream(), &split, |n| {
+                n == HEAD_TENSOR || n == output_norm()
+            })?;
+            Ok(w)
+        });
+        let cleanup = std::fs::remove_dir_all(&dir).map_err(|e| format!("cleanup: {e}"));
+        let w = loaded?;
+        cleanup?;
+
+        let mut head = Head::new(gpu, &w, EPS)?;
+        println!(
+            "nvfp4_head hidden={} n_vocab={} resident_bytes={}",
+            head.hidden(),
+            head.n_vocab(),
+            head.resident_bytes()
+        );
+        let one = |head: &mut Head, x: &[f32]| -> Result<(Vec<f32>, Vec<f32>, u32), GateError> {
+            head.set_input(gpu, x)?;
+            head.enqueue(gpu, &w)?;
+            let token = head.token(gpu)?;
+            Ok((head.normed_to_host(gpu)?, head.logits_to_host(gpu)?, token))
+        };
+        let (normed, logits, token) = one(&mut head, &input(0))?;
+        let row_bytes = K / 64 * 36;
+        let per: Vec<(bool, f64)> = par_map(N_VOCAB, |r| {
+            let mut wv = vec![0.0f32; K];
+            dequant_row(
+                GgmlType::NVFP4,
+                &rows[r * row_bytes..(r + 1) * row_bytes],
+                &mut wv,
+            )
+            .unwrap_or_else(|e| panic!("row {r}: {e}"));
+            let terms = wv
+                .iter()
+                .zip(&normed)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b));
+            let scale = f64::from(SCALE);
+            let want = scale * terms.clone().sum::<f64>();
+            let own = scale * terms.map(|t| t * t).sum::<f64>().sqrt();
+            let err = (f64::from(logits[r]) - want).abs();
+            (err <= NVFP4_BAND * own + 1e-6, err / own.max(1e-30))
+        });
+        let in_band = per.iter().all(|p| p.0);
+        let worst = per.iter().map(|p| p.1).fold(0.0f64, f64::max);
+        let best = logits
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if v > b.1 { (i, v) } else { b }
+            })
+            .0;
+        let argmax = token as usize == best;
+        println!(
+            "nvfp4 clause=nvfp4_head_k2688 rows={N_VOCAB} k={K} in_band={in_band} \
+             worst_err_over_row_scale={worst:.3e} argmax_is_the_maximum={argmax} {}",
+            verdict(in_band && argmax)
+        );
+
+        let inputs: Vec<Vec<f32>> = (0..M).map(input).collect();
+        let mut multi = Head::with_m(gpu, &w, EPS, M)?;
+        multi.set_input(gpu, &inputs.concat())?;
+        multi.enqueue(gpu, &w)?;
+        let got = multi.logits_to_host(gpu)?;
+        let tokens = multi.tokens(gpu)?;
+        let mut rows_equal = got.len() == M * N_VOCAB && tokens.len() == M;
+        for (c, x) in inputs.iter().enumerate() {
+            let (_, want, want_token) = one(&mut head, x)?;
+            rows_equal &= tokens.get(c) == Some(&want_token)
+                && want
+                    .iter()
+                    .enumerate()
+                    .all(|(v, w1)| got.get(v * M + c).map(|g| g.to_bits()) == Some(w1.to_bits()));
+        }
+        println!(
+            "nvfp4 clause=nvfp4_head_k2688 rows={M} three_rows_are_the_one_row_heads_bit_for_bit={rows_equal} {}",
+            verdict(rows_equal)
+        );
+        Ok(in_band && argmax && rows_equal)
+    }
 }

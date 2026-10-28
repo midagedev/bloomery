@@ -5,10 +5,12 @@
 //! A layer is Mamba-2, attention (no position) or a feed-forward block, as the config's layer
 //! kinds say ([`Layers`]); a model with a routed layer is `nemotron_h_moe`, one with none is
 //! `nemotron_h`, which this map refuses until its tensors are mapped. A Mamba-2 projection is FP8
-//! with one tensor scale (FP8_B128), a layer's routed experts stay as one stack of NVFP4 planes a
+//! with one tensor scale, a layer's routed experts stay as one stack of NVFP4 planes a
 //! projection ([`Origin::Stack`]), the shared experts and the head are NVFP4, the embedding and
-//! the attention projections are BF16 their role reads as Q8_0, and the router and its bias stay
-//! F32 in the folder's bytes. The norm gains, the convolution and the scan's constants are F32:
+//! the attention projections are BF16, and the router and its bias stay F32 in the folder's
+//! bytes. The Mamba-2 projections, the embedding and the attention projections are read as Q8_0
+//! whatever the folder stores ([`Use::Q8_0`]: an FP8 weight is decoded exactly and quantized
+//! again), so the card runs every dense projection on its Q8_0 path. The norm gains, the convolution and the scan's constants are F32:
 //! the convolution's taps and the grouped norm's gain change their dims and no byte, `D` too, and
 //! `A` is stored as its log ([`Step::NegExp`]).
 //!
@@ -719,21 +721,26 @@ impl Checkpoint {
     /// What the map makes of the folder tensor `name` of logical `shape`.
     fn item(&self, name: &str, shape: &[usize]) -> Result<Item, Error> {
         let ggml: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
-        let one = |to: String, plain: Plain, steps: Vec<Step>, dims: Vec<u64>, origin: Origin| {
+        let one = |to: String, role: Use, steps: Vec<Step>, dims: Vec<u64>, origin: Origin| {
             Item::One(
                 to,
                 Mapped {
                     sources: vec![name.to_string()],
-                    role: Use::Matrix(plain),
+                    role,
                     steps,
                     dims,
                     origin,
                 },
             )
         };
-        let made = |to: String, plain: Plain| one(to, plain, vec![], ggml.clone(), Origin::Made);
+        let made = |to: String, plain: Plain| {
+            one(to, Use::Matrix(plain), vec![], ggml.clone(), Origin::Made)
+        };
+        // A projection the card reads as Q8_0 whatever the folder stores: BF16 (the embedding and
+        // the attention) or FP8 (the Mamba-2 projections).
+        let q8 = |to: String| one(to, Use::Q8_0, vec![], ggml.clone(), Origin::Made);
         match name {
-            "backbone.embeddings.weight" => return Ok(made(token_embd(), Plain::Q8_0)),
+            "backbone.embeddings.weight" => return Ok(q8(token_embd())),
             "backbone.norm_f.weight" => return Ok(made(output_norm(), Plain::F32)),
             "lm_head.weight" => return Ok(made(output(), Plain::Q8_0)),
             _ => {}
@@ -775,7 +782,7 @@ impl Checkpoint {
         let kept = |stem: &str| {
             one(
                 blk(l, stem),
-                Plain::F32,
+                Use::Matrix(Plain::F32),
                 vec![],
                 ggml.clone(),
                 Origin::File(GgmlType::F32),
@@ -783,18 +790,18 @@ impl Checkpoint {
         };
         Ok(match part {
             Part::BlockNorm => made(blk(l, ATTN_NORM), Plain::F32),
-            Part::InProj => made(blk(l, SSM_IN), Plain::Q8_0),
-            Part::OutProj => made(blk(l, SSM_OUT), Plain::Q8_0),
+            Part::InProj => q8(blk(l, SSM_IN)),
+            Part::OutProj => q8(blk(l, SSM_OUT)),
             Part::ALog => one(
                 blk(l, SSM_A),
-                Plain::F32,
+                Use::Matrix(Plain::F32),
                 vec![Step::NegExp],
                 unit_first(),
                 Origin::Made,
             ),
             Part::D => one(
                 blk(l, SSM_D),
-                Plain::F32,
+                Use::Matrix(Plain::F32),
                 vec![],
                 unit_first(),
                 Origin::Made,
@@ -811,7 +818,7 @@ impl Checkpoint {
                 };
                 one(
                     blk(l, SSM_CONV),
-                    Plain::F32,
+                    Use::Matrix(Plain::F32),
                     vec![],
                     vec![taps as u64, channels as u64],
                     Origin::Made,
@@ -835,16 +842,16 @@ impl Checkpoint {
                 }
                 one(
                     blk(l, SSM_NORM),
-                    Plain::F32,
+                    Use::Matrix(Plain::F32),
                     vec![],
                     vec![width as u64 / groups, groups],
                     Origin::Made,
                 )
             }
-            Part::Query => made(blk(l, ATTN_Q), Plain::Q8_0),
-            Part::Key => made(blk(l, ATTN_K), Plain::Q8_0),
-            Part::Value => made(blk(l, ATTN_V), Plain::Q8_0),
-            Part::Output => made(blk(l, ATTN_OUTPUT), Plain::Q8_0),
+            Part::Query => q8(blk(l, ATTN_Q)),
+            Part::Key => q8(blk(l, ATTN_K)),
+            Part::Value => q8(blk(l, ATTN_V)),
+            Part::Output => q8(blk(l, ATTN_OUTPUT)),
             Part::KScale | Part::VScale => Item::Skip(KV_SCALE),
             Part::Router => kept(FFN_GATE_INP),
             Part::RouterBias => kept(EXP_PROBS_B),
@@ -1132,17 +1139,17 @@ mod tests {
             .unwrap_or((None, name))
     }
 
-    /// The twin's types of the tensor `stem` and the type the folder holds it in, a BF16 matrix
-    /// written as Q8_0: the Mamba-2 projections FP8 with one tensor scale, the shared experts and
-    /// the head NVFP4, the routed stacks NVFP4 planes, and the F32 tensors F32.
+    /// The twin's types of the tensor `stem` and the type the folder holds it in, a BF16 or FP8
+    /// matrix the card reads as Q8_0 written as Q8_0: the Mamba-2 projections, the embedding and the
+    /// attention; the shared experts and the head NVFP4, the routed stacks NVFP4 planes, and the F32
+    /// tensors F32.
     fn family(stem: &str) -> (&'static [GgmlType], GgmlType) {
         const Q8: &[GgmlType] = &[GgmlType::Q8_0];
         const ROUTED: &[GgmlType] = &[GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0];
         const F32: &[GgmlType] = &[GgmlType::F32];
         match stem {
-            "ssm_in.weight" | "ssm_out.weight" => (Q8, GgmlType::FP8_B128),
-            "token_embd.weight" | "attn_q.weight" | "attn_k.weight" | "attn_v.weight"
-            | "attn_output.weight" => (Q8, GgmlType::Q8_0),
+            "ssm_in.weight" | "ssm_out.weight" | "token_embd.weight" | "attn_q.weight"
+            | "attn_k.weight" | "attn_v.weight" | "attn_output.weight" => (Q8, GgmlType::Q8_0),
             "output.weight" | "ffn_up_shexp.weight" | "ffn_down_shexp.weight" => {
                 (Q8, GgmlType::NVFP4)
             }
@@ -1325,13 +1332,22 @@ mod tests {
                 format!("{}.scale", of.strip_suffix(".weight").unwrap())
             );
         }
-        // Opened as stored, a BF16 matrix stays BF16 where `prepare` writes Q8_0.
+        // PIN(2026-10-28): opened as stored, the BF16 embedding and attention and the FP8 Mamba-2
+        // projections are Q8_0 too, where they were BF16 and FP8_B128: the card runs one Q8_0 path
+        // for every dense projection ([`Use::Q8_0`] is no lever's, so opening as stored keeps it).
+        // Derivation: `Use::Q8_0` is not `Use::Matrix(Plain::Q8_0)`, the one role the opened
+        // folder keeps BF16 for. FAIL-first: the embedding's role back to `Matrix(Plain::Q8_0)`
+        // opens it BF16.
         let open = plan_of(&config, &entries, false).unwrap();
-        for name in ["token_embd.weight", "blk.5.attn_q.weight"] {
+        for name in [
+            "token_embd.weight",
+            "blk.5.attn_q.weight",
+            "blk.0.ssm_in.weight",
+        ] {
             let planned = open.planned.iter().find(|p| p.decl.name == name).unwrap();
             assert_eq!(
                 GgmlType::from_u32(planned.decl.type_id),
-                GgmlType::BF16,
+                GgmlType::Q8_0,
                 "{name}"
             );
         }

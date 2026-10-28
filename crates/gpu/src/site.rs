@@ -19,7 +19,9 @@
 //!   (`GgmlType::FP8_B128`) the same walk's FP8_B128 entries
 //!   (`fp8_b128_gemv`, `fp8_b128_gemv_mcol`). BF16 uses `bf16_gemv`
 //!   token-major over widened words, bit for bit the F32 entries.
-//!   A K-quant site's gemv is [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
+//!   A K-quant site's gemv is [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`]. An
+//!   NVFP4 site's is [`kgemv`] at a width of whole q8_1 super-blocks of 256
+//!   values and [`nvfp4_sel32_gemv`] at another ([`reads_at`]).
 //! - [`kgemv`], a site at most eight columns over the q8_1 rows: Q3_K, Q4_K
 //!   and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K row of an odd
 //!   super-block count the down `_sel` over one expert, one column); Q5_K
@@ -28,6 +30,9 @@
 //!   token-major. [`kgemv_order`] is this family's layout and is
 //!   `None` for Q5_0. Where a body copies a row-major output token-major,
 //!   and its fused groups of Q4_K launches, stay the body's.
+//! - [`nvfp4_sel32_gemv`], an NVFP4 site of a width that is no multiple of 256,
+//!   at most eight columns over the `Q8Blocks32` rows: `nvfp4_gemv_sel32` over
+//!   the planes as one expert times the tensor's scale, token-major.
 //! - [`blocks32_gemv`], a Q5_0 site at most eight columns over the
 //!   `Q8Blocks32` rows: `enqueue_gemv_q5_0` over the packed weight, the site
 //!   as one expert (`row0 = 0`), row-major (`y[r · m + c]`). That row-major
@@ -47,8 +52,10 @@
 //!   F32 tile within that kernel, and every other cell keeps its MMA value.
 //!   A site's weight is the resident tensor of its name, rows of it (a part
 //!   of a weight joined at load), or, for a K-quant, the words a caller
-//!   holds ([`SiteWeight`]). NVFP4 has no wide GEMM and is refused here by
-//!   name.
+//!   holds ([`SiteWeight`]). NVFP4 the 32-value GEMM over its planes
+//!   (`Gemm32Weight::Nvfp4Planes`, the tensor's scale applied at the store) on
+//!   the q8 blocks of 32 of the unit's one-expert table, at any width of the
+//!   format's 64-value blocks; a caller quantizes them as a Q8_0 site's.
 //! - [`gated`], a wide gate·up·down block over one table: the gate and up
 //!   [`gemm`]s, the gate·up rule's SwiGLU written into the form the down's
 //!   type reads (the down's activation), and the down [`gemm`] over those
@@ -76,6 +83,7 @@ use crate::gemm::{
 use crate::kquant::{Act, SelDown};
 use crate::model::fit::{act_col_bytes, act32_col_bytes};
 use crate::mxfp4::Nvfp4Kernels;
+use crate::mxfp4_sel::{Nvfp4Down, Nvfp4SelKernels, Nvfp4Stack};
 use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q8f32::{
@@ -95,6 +103,18 @@ pub use chain::site::{SiteTy, file_site};
 
 /// The activation form a site's launch reads: the kernel table's fact.
 pub use model::placement::kernels::SiteAct as Form;
+
+/// The activation form a site of family `ty` reads over rows of `k` values: [`SiteTy::reads`],
+/// the kernel table's, except NVFP4 at a width the q8_1 super-blocks of 256 values do not
+/// divide, which reads the 32-value [`Form::Q8Blocks32`] its one-expert `_sel` gemv takes
+/// ([`nvfp4_sel32_gemv`]). A body picks a site's launch and the forms it quantizes into by this.
+#[must_use]
+pub fn reads_at(ty: SiteTy, k: usize) -> Form {
+    match kernels::dense(ty.ggml()) {
+        Some(entry) => entry.reads_at(k as u64),
+        None => ty.reads(),
+    }
+}
 
 /// Where [`kgemv`] writes output `r` of column `c` of a site of `rows` rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,12 +628,14 @@ const KGEMV_COLS: usize = 8;
 /// The kernels a site's [`kgemv`] launches beyond the `Gpu`'s own: the
 /// K-quant `_sel` family, whose Q5_K down entry over a stack of one expert is
 /// the Q5_K gemv, the Q6_K `_sel` entry, which a Q6_K row of an odd
-/// super-block count runs the same way, NVFP4's gemv, and that one expert's
-/// id for each of [`KGEMV_COLS`] slots.
+/// super-block count runs the same way, NVFP4's gemv and its `_sel` down
+/// ([`nvfp4_sel32_gemv`]), and that one expert's id for each of
+/// [`KGEMV_COLS`] slots.
 pub struct KGemvKernels {
     kq: QuantSelKernels,
     q6: Q6kSelKernels,
     nv: Nvfp4Kernels,
+    nvsel: Nvfp4SelKernels,
     one: DeviceBuffer<u32>,
 }
 
@@ -631,6 +653,7 @@ impl KGemvKernels {
             kq: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
             q6: Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
             nv: Nvfp4Kernels::load(gpu.context())?,
+            nvsel: Nvfp4SelKernels::load(gpu.context(), gpu.fault_word())?,
             one: DeviceBuffer::zeroed(gpu.stream(), KGEMV_COLS)?,
         })
     }
@@ -766,6 +789,51 @@ pub fn blocks32_gemv(
     };
     gpu.q5()
         .enqueue_gemv_q5_0(gpu.stream(), wt, act, 0, wt.rows(), 0, act.m(), y, 0)
+}
+
+/// `y = W · act` for NVFP4 site `name` whose row width is no multiple of 256 ([`reads_at`]) over
+/// the `act.m()` (1..=8) columns of the `Q8Blocks32` rows `act`, token-major (`y[c · rows + r]`):
+/// `nvfp4_gemv_sel32` over the planes as a stack of one expert, every column's id 0, times the
+/// tensor's scale. A site of another type, a weight that is not NVFP4 planes, a width other than
+/// the activation's and more columns than the ids hold are refused by name.
+pub fn nvfp4_sel32_gemv(
+    gpu: &Gpu,
+    kk: &KGemvKernels,
+    (ty, w, name): (SiteTy, &Weights, &str),
+    act: &Q8Blocks32,
+    fault: FaultSink,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "site::nvfp4_sel32_gemv";
+    let SiteTy::Nvfp4 = ty else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: `site::nvfp4_sel32_gemv` runs an NVFP4 site"),
+        ));
+    };
+    let DevWeight::Nvfp4 { qs, e, scales, .. } = w.resident(WHAT, name)? else {
+        return Err(GpuError::tensor(WHAT, name, "an NVFP4 weight"));
+    };
+    let m = act.m();
+    if m > KGEMV_COLS {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{name}: {m} columns; the site's ids hold {KGEMV_COLS}"),
+        ));
+    }
+    kk.nvsel.enqueue_down(
+        gpu.stream(),
+        &Nvfp4Down {
+            w: Nvfp4Stack { qs, e, scales },
+            act,
+            sel: &kk.one,
+            n_slots: m,
+            rows_per_expert: qs.rows(),
+            slots_per_col: m,
+        },
+        fault,
+        y,
+    )
 }
 
 /// The most columns a [`ByName`] projection runs: the K-quant gemv's.
@@ -1385,7 +1453,9 @@ impl WideActsMut<'_> {
 /// 32-value GEMM over the unit's one-expert table must find it filled for
 /// exactly `m` slots, and an F32 site runs only there (one column a slot);
 /// a form the site reads that `x` lacks is refused by name. `w` holds the
-/// resident weights `src` may name.
+/// resident weights `src` may name. An NVFP4 site's GEMM reads the q8 blocks
+/// of 32 ([`WideIn::q32`]), not the q8_1 blocks of 128 its gemv reads
+/// ([`WideActs::wants`]): a caller quantizes them for it as for a Q8_0 site.
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
@@ -1425,7 +1495,27 @@ pub fn gemm(
     };
     src.check(WHAT, ty)?;
     match ty {
-        SiteTy::Nvfp4 => Err(no_wide_gemm(WHAT, name, ty)),
+        SiteTy::Nvfp4 => {
+            dense()?;
+            let DevWeight::Nvfp4 { qs, e, scales, .. } = w.resident(WHAT, name)? else {
+                return Err(GpuError::tensor(WHAT, name, "an NVFP4 weight"));
+            };
+            k.g32(
+                WHAT,
+                "the 32-value kernels an NVFP4 site runs on (this load holds none)",
+            )?
+            .enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales }),
+                    rows_per_expert: rows,
+                    act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
+                    route,
+                    input,
+                    y,
+                },
+            )
+        }
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Iq4Xs => {
             k.gemm.enqueue_gemm(
                 stream,
@@ -1768,12 +1858,15 @@ fn write_forms(
     Ok(())
 }
 
-/// A site of type `ty` on the wide arm, which has no GEMM for it, refused by
-/// name as `what`'s.
-fn no_wide_gemm(what: &'static str, name: &str, ty: SiteTy) -> GpuError {
+/// An NVFP4 site in a [`gated`] block, which has no SwiGLU launch into the 32-value rows its
+/// wide GEMM reads, refused by name as `what`'s.
+fn not_gated(what: &'static str, name: &str, ty: SiteTy) -> GpuError {
     GpuError::shape(
         what,
-        format!("{name} is {ty}: it has a gemv (`site::kgemv`) and no wide GEMM"),
+        format!(
+            "{name} is {ty}: its gemv is `site::kgemv` and its wide GEMM `site::gemm`; a gated \
+             block has no SwiGLU launch into the rows that GEMM reads"
+        ),
     )
 }
 
@@ -1810,7 +1903,7 @@ impl<'a> Gated<'a> {
         for (ty, src) in [self.gate, self.up, self.down] {
             src.check("site::gated", ty)?;
             if ty == SiteTy::Nvfp4 {
-                return Err(no_wide_gemm("site::gated", src.name(), ty));
+                return Err(not_gated("site::gated", src.name(), ty));
             }
         }
         swiglu_launch((self.down.0, self.down.1.name()), self.rule).map(|_| ())
@@ -2024,7 +2117,7 @@ fn swiglu(
 mod tests {
     use super::{
         Form, Order, SiteTy, SwigluLaunch, WideActs, WideForms, by_name_extra, file_site,
-        gemm_weight, kgemv_order, swiglu_launch,
+        gemm_weight, kgemv_order, reads_at, swiglu_launch,
     };
     use crate::gemm::GemmWeight;
     use crate::kquant::Act;
@@ -2032,6 +2125,29 @@ mod tests {
     use gguf::quant::GgmlType;
     use gguf::write::{Layout, TensorDecl};
     use model::placement::kernels;
+
+    /// A site's activation form is the kernel table's for its type at any width, except NVFP4,
+    /// whose gemv reads whole q8_1 super-blocks of 256 values: at a width they do not divide (the
+    /// 2688 and 3712 of a hidden and a shared width of 64 blocks) it reads the 32-value rows its
+    /// one-expert `_sel` gemv takes.
+    ///
+    /// FAIL-first: `SiteEntry::reads_at` answering `reads()` for every width reads NVFP4 at 2688
+    /// as the q8_1 rows.
+    #[test]
+    fn an_nvfp4_site_reads_the_form_its_width_takes() {
+        for &ty in SiteTy::ALL {
+            for k in [64usize, 256, 2688, 3712, 4096] {
+                let want = if ty == SiteTy::Nvfp4 && !k.is_multiple_of(256) {
+                    Form::Q8Blocks32
+                } else {
+                    ty.reads()
+                };
+                assert_eq!(reads_at(ty, k), want, "{ty} at {k}");
+            }
+        }
+        assert_eq!(reads_at(SiteTy::Nvfp4, 2688), Form::Q8Blocks32);
+        assert_eq!(reads_at(SiteTy::Nvfp4, 4096), Form::Q8x128);
+    }
 
     /// A by-name projection's extra launches follow the type: none for a site
     /// that reads the f32 rows or the q8 blocks of 32, the quantization for a
