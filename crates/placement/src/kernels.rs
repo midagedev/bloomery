@@ -406,21 +406,6 @@ pub const fn card_k_unit(ty: GgmlType, role: Role) -> u64 {
     }
 }
 
-/// [`card_k_unit`] for a tensor of `ty` in `role` whose rows hold `k` values. A dense NVFP4 site at
-/// a width the q8_1 super-block's 256 values do not divide runs the one-expert `_sel` gemv over
-/// 32-value activations ([`SiteEntry::reads_at`]), which keeps the format's own 64-value block
-/// whole; every other tensor keeps [`card_k_unit`]'s unit.
-#[must_use]
-pub fn card_k_unit_at(ty: GgmlType, role: Role, k: u64) -> u64 {
-    match (role, dense(ty)) {
-        (Role::RoutedExperts, _) | (_, None) => card_k_unit(ty, role),
-        (_, Some(entry)) => match entry.reads_at(k) {
-            SiteAct::Q8Blocks32 if entry == SiteEntry::Nvfp4 => 64,
-            _ => card_k_unit(ty, role),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,44 +864,6 @@ mod tests {
                 (GgmlType::NVFP4, HeadEntry::Nvfp4),
             ]
         );
-    }
-
-    /// A dense NVFP4 site reads the q8_1 rows at a width of whole super-blocks and the 32-value
-    /// rows at another (every NVFP4 row is whole 64-value blocks): its K unit is the super-block's
-    /// 256 or the format's 64. No other type's read or unit follows the width.
-    ///
-    /// FAIL-first: `SiteEntry::reads_at` answering `reads()` for every width reads Lightning's 2688
-    /// as q8_1 rows.
-    #[test]
-    fn a_dense_nvfp4_site_reads_by_its_width() {
-        let nvfp4 = dense(GgmlType::NVFP4).unwrap();
-        for (k, reads, unit) in [
-            (256, SiteAct::Q8x128, 256),
-            (4096, SiteAct::Q8x128, 256),
-            (2688, SiteAct::Q8Blocks32, 64),
-            (3712, SiteAct::Q8Blocks32, 64),
-            (64, SiteAct::Q8Blocks32, 64),
-        ] {
-            assert_eq!(nvfp4.reads_at(k), reads, "k {k}");
-            for role in [Role::Attention, Role::DenseFfn, Role::SharedExpert] {
-                assert_eq!(card_k_unit_at(GgmlType::NVFP4, role, k), unit, "k {k}");
-            }
-            assert_eq!(card_k_unit_at(GgmlType::NVFP4, Role::RoutedExperts, k), 32);
-            for ty in [
-                GgmlType::Q8_0,
-                GgmlType::Q5_0,
-                GgmlType::Q4_K,
-                GgmlType::BF16,
-            ] {
-                let entry = dense(ty).unwrap();
-                assert_eq!(entry.reads_at(k), entry.reads(), "{ty} k {k}");
-                assert_eq!(
-                    card_k_unit_at(ty, Role::DenseFfn, k),
-                    card_k_unit(ty, Role::DenseFfn),
-                    "{ty} k {k}"
-                );
-            }
-        }
     }
 
     #[test]

@@ -186,7 +186,8 @@ impl GpuModel<Body> {
 }
 
 impl Body {
-    /// Every site's width must be one the form its weight type reads takes:
+    /// Every site's width must be one the form it reads at that width takes
+    /// ([`crate::arch::hybrid::Site::reads`]):
     /// a K-quant site's q8_1 blocks of 256 values, a Q8_0 or Q5_0 site's q8
     /// blocks of 32 (the Q8_0 site's gemv reads the f32 rows, its wide GEMM
     /// the blocks of 32), an F32 site's f32 rows (any width). A width no
@@ -194,7 +195,7 @@ impl Body {
     fn refuse_widths(layers: &[Layer]) -> Result<(), GpuError> {
         for l in layers {
             for s in l.sites() {
-                let gran = match s.ty.reads() {
+                let gran = match s.reads() {
                     Form::Q8x128 => 256,
                     Form::Q8Blocks32 | Form::Q8x32 => 32,
                     Form::F32 => continue,

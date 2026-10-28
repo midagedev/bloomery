@@ -257,9 +257,9 @@ mod nvfp4_head {
     const SCALE: f32 = 0.371_9;
     const EPS: f32 = 1e-6;
     /// The band of a logit about the f64 reference, a share of the row's own scale `scale ·
-    /// sqrt(Σ (w_j x_j)²)`: the 32-value activation's rounding is at most 1/254 of a block's largest
-    /// value a value, which keeps the dot's error near 0.4 % of that scale; 3 % is the Q5_K head
-    /// test's band over the same kind of rounding.
+    /// sqrt(Σ (w_j x_j)²)`: the 32-value activation rounds each value by at most 1/254 of its block's
+    /// largest magnitude, which keeps the dot's error near 0.4 % of that scale [derived]; 3 % is the
+    /// Q5_K head test's band over the same kind of rounding.
     const NVFP4_BAND: f64 = 0.03;
 
     /// `rows` NVFP4 rows of `k` values drawn from `seed`: each block's four scale bytes uniform
