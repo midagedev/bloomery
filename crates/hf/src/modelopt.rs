@@ -2572,8 +2572,10 @@ mod tests {
         };
         let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let grid = [0.5f32, f32::from_bits(0x3951 << 16), -3.0, 2f32.powi(-20)];
+        // Row scales from 2^-15 to just under 1: with E4M3's largest value 448 every Q8_0 block's
+        // scale stays inside F16, which a larger checkpoint scale would leave (refused below).
         let row_scales: Vec<f32> = (0..rows as u32)
-            .map(|r| f32::from_bits((0x3800 + 0x93 * r % 0x1000) << 16))
+            .map(|r| f32::from_bits((0x3800 + 0x93 * r % 0x400) << 16))
             .collect();
         let tensor_scale = [f32::from_bits(0x3e45 << 16)];
         let file = |scales: &[u8], shape: &[usize]| {
@@ -2636,6 +2638,18 @@ mod tests {
                 assert_eq!(got.as_slice(), &want[..], "{format} Q8_0 block {blk}");
             }
         }
+
+        // A scale whose Q8_0 block scale F16 cannot hold is refused by name, never written as inf.
+        let huge = f32_bytes(&vec![30464.0f32; rows]);
+        let st = file(&huge, &[rows]);
+        let err = normalize(
+            |n| st.raw(n),
+            &[("f.weight", &placed(Format::Fp8Channel))],
+            Use::Q8_0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unrepresentable scale"), "{err}");
 
         let bf16: Vec<u8> = (0..128)
             .map(|i| (((i as f32 - 60.0) / 7.0).to_bits() >> 16) as u16)
