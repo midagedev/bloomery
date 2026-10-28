@@ -1,7 +1,7 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
-//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`),
+//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`lfm2`), [`Pre::Tekken`] (`tekken`, `pixtral`),
 //! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
 //! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
@@ -89,21 +89,21 @@
 //! [`Pre::Qwen35Hf`] is that reading, for a vocabulary that declares itself
 //! a Hugging Face one.
 //!
-//! ## pixtral
+//! ## llama3
 //!
-//! The reference maps `pixtral` to its LLAMA3 type. That type's one regex is
+//! The reference maps `lfm2` to its LLAMA3 type. That type's one regex is
 //! the one [`Pre::Glm4`] runs — qwen2's with `\p{N}{1,3}` in place of `\p{N}` —
 //! and it goes to the same hand-written splitter (`unicode_regex_split_custom_llama3`),
 //! so [`split`] uses [`split_custom`] with a run of three numbers, the `glm4`
-//! arm. The reference also sets `ignore_merges` for this name and not for
+//! arm. The reference also sets `ignore_merges` for this type and not for
 //! `glm4`: a pre-tokenizer word whose byte-encoded text is itself a vocabulary
 //! token is that token, and merges do not run on it. [`Pre::ignore_merges`]
-//! carries the flag for any pre, so the two names do not share a variant.
+//! carries the flag for any pre, so the two types do not share a variant.
 //!
-//! A Hugging Face `tokenizer.json` of this name (Llama 3's and its descendants': a `Split` on this
+//! A Hugging Face `tokenizer.json` of this type (Llama 3's and its descendants': a `Split` on this
 //! regex, `Isolated`, then `ByteLevel` without a regex of its own, and `model.ignore_merges` true)
 //! runs it with Oniguruma, as qwen2's: Unicode case folds in `(?i:...)` and Unicode 14.0's
-//! classes. [`Pre::PixtralHf`] is that reading, qwen2's with the run of numbers cut in threes, for
+//! classes. [`Pre::Llama3Hf`] is that reading, qwen2's with the run of numbers cut in threes, for
 //! a vocabulary that declares itself a Hugging Face one.
 //!
 //! ## minimax-m2
@@ -128,9 +128,31 @@
 //! letter can start, so a run of capitals ending in a non-ASCII letter leaves
 //! that letter to the plus. The second alternative runs only when the first did
 //! not: capitals alone. A contraction follows either, and a mark is not a letter
-//! here ([`match_minimax_m2`]). Past the words the alternatives are qwen2's, but
+//! here ([`match_cased_words`]). Past the words the alternatives are qwen2's, but
 //! the symbol run's tail is `[\r\n/]*`, a slash as well as the newlines. The
 //! reference sets `clean_spaces` false for this name; this crate cleans no spaces.
+//!
+//! ## tekken
+//!
+//! The reference maps `tekken` and `pixtral` to its TEKKEN type, whose one regex is
+//!
+//! `[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+|
+//! [^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*|
+//! \p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+//!
+//! and sets `ignore_merges`. It is [`Pre::MiniMaxM2`]'s regex without the contractions, one number
+//! a word instead of three, and `\p{M}` beside `\p{L}` in the lookaheads, so it runs through the
+//! same matcher ([`match_cased_words`] with [`CasedShape::TEKKEN`]) on the collapsed text with the
+//! same piece-local semantics. A mark is a letter of either case there ([`TekkenReference`]): it
+//! joins the word beside it, and a lone one is a word. A tree older than the one that gives
+//! `pixtral` this type (ik is one) reads the name as LLAMA3, which cuts digits in threes and keeps
+//! `HelloWorld` whole; ik's TEKKEN looks ahead at `\p{L}` alone, so a mark is no word there.
+//!
+//! A Hugging Face `tokenizer.json` spells the classes by category
+//! (`[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+` and the capitals-only twin) and
+//! runs them with Oniguruma over Unicode 14.0's classes: [`Pre::TekkenHf`] reads them as
+//! [`Pre::MiniMaxM2Hf`] does (a non-ASCII capital is no lowercase letter there), with no
+//! contraction.
 //!
 //! ## raon
 //!
@@ -407,10 +429,10 @@ fn is_letter_cased(c: u8) -> bool {
     matches!(c, LETTER | UPPER_LETTER | LOWER_LETTER) || c.is_ascii_alphabetic()
 }
 
-/// What a reading of the `minimax-m2` regex tells apart in a letter. Its word alternatives are
-/// `P? U* L+ C?` and `P? U+ L* C?` for the classes below, `C` a contraction and `P` the prefix
-/// `[^\r\n\p{L}\p{N}]` (a mark is one).
-trait M2Letters {
+/// What a reading of the `minimax-m2` or `tekken` regex tells apart in a letter. Their word
+/// alternatives are `P? U* L+ C?` and `P? U+ L* C?` for the classes below, `C` a contraction
+/// (`tekken` has none, [`CasedShape`]) and `P` the prefix `[^\r\n\p{L}\p{N}]` (a mark is one).
+trait CasedLetters {
     /// Whether the reading folds `ſ` (U+017F) to `s` in a contraction, as Hugging Face's
     /// Unicode folding does.
     const HF: bool;
@@ -429,7 +451,7 @@ trait M2Letters {
 /// letter here.
 struct M2Reference;
 
-impl M2Letters for M2Reference {
+impl CasedLetters for M2Reference {
     const HF: bool = false;
 
     fn letter(c: u8) -> bool {
@@ -445,11 +467,34 @@ impl M2Letters for M2Reference {
     }
 }
 
-/// The regex as MiniMax's `tokenizer.json` spells it, over [`collapse_cased`]'s bytes: `U` is
-/// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and `L` is `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`, a mark in both.
-struct M2Hf;
+/// The `tekken` regex as the reference spells it, `((?=[\p{L}\p{M}])([^a-z]))` for `U` and
+/// `((?=[\p{L}\p{M}])([^A-Z]))` for `L`, over [`collapse`]'s bytes: a non-ASCII letter and a mark
+/// are each one byte that is in neither `a-z` nor `A-Z`, so each is `U` and `L` at once. A mark is
+/// no `\p{L}`, so it is a prefix too ([`M2Reference`] differs in the mark alone).
+struct TekkenReference;
 
-impl M2Letters for M2Hf {
+impl CasedLetters for TekkenReference {
+    const HF: bool = false;
+
+    fn letter(c: u8) -> bool {
+        is_letter(c)
+    }
+
+    fn upper(c: u8) -> bool {
+        c.is_ascii_uppercase() || matches!(c, LETTER | MARK)
+    }
+
+    fn lower(c: u8) -> bool {
+        c.is_ascii_lowercase() || matches!(c, LETTER | MARK)
+    }
+}
+
+/// The regex as a `tokenizer.json` spells it (MiniMax's, Tekken's), over [`collapse_cased`]'s
+/// bytes: `U` is `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and `L` is `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`, a mark
+/// in both.
+struct CasedHf;
+
+impl CasedLetters for CasedHf {
     const HF: bool = true;
 
     fn letter(c: u8) -> bool {
@@ -465,21 +510,43 @@ impl M2Letters for M2Hf {
     }
 }
 
-/// The `minimax-m2` regex at `i`, as the reading `K` spells it: the first of its seven
-/// alternatives that matches, under ECMAScript semantics (alternatives in order, greedy
-/// quantifiers that back off, the optional prefix taken first). None of them can match the empty
-/// string, and a mark is a plain codepoint of its own class: the regex runs on the collapsed
-/// bytes. `fold(k)` is the lowercase ASCII letter the codepoint at `k` matches in a contraction.
+/// What the two case-split regexes differ in beside their letters.
+#[derive(Clone, Copy)]
+struct CasedShape {
+    /// Whether a word may end in a contraction (`minimax-m2` does).
+    contraction: bool,
+    /// The longest run of numbers one word holds (`\p{N}` is 1, `\p{N}{1,3}` is 3).
+    digits: usize,
+}
+
+impl CasedShape {
+    const MINIMAX_M2: Self = Self {
+        contraction: true,
+        digits: 3,
+    };
+    const TEKKEN: Self = Self {
+        contraction: false,
+        digits: 1,
+    };
+}
+
+/// The `minimax-m2` regex, or with `shape` the `tekken` one, at `i`, as the reading `K` spells it:
+/// the first of its seven alternatives that matches, under ECMAScript semantics (alternatives in
+/// order, greedy quantifiers that back off, the optional prefix taken first). None of them can
+/// match the empty string, and a mark is a plain codepoint of its own class: the regex runs on the
+/// collapsed bytes. `fold(k)` is the lowercase ASCII letter the codepoint at `k` matches in a
+/// contraction.
 ///
 /// A mark can be both a prefix and a word codepoint, so the prefix is tried taken and not taken.
 /// `U*` gives back until `L+` can start: at the lowercase letter that ended the run, else at the
 /// run's last codepoint that is an `L` too (a capital is not). The second word alternative runs
 /// only when the first did not: capitals alone. Past the words the alternatives are qwen2's, but
 /// the symbol run's tail is `[\r\n/]*`, a slash as well as the newlines.
-fn match_minimax_m2<K: M2Letters>(
+fn match_cased_words<K: CasedLetters>(
     c: &[u8],
     i: usize,
     hi: usize,
+    shape: CasedShape,
     fold: impl Fn(usize) -> u8,
 ) -> usize {
     let x = c[i];
@@ -488,7 +555,14 @@ fn match_minimax_m2<K: M2Letters>(
     } else {
         &[i]
     };
-    let contract = |end: usize| end + contraction(c, end, hi, &fold) - i;
+    let contract = |end: usize| {
+        let tail = if shape.contraction {
+            contraction(c, end, hi, &fold)
+        } else {
+            0
+        };
+        end + tail - i
+    };
     // `P? U* L+ C?`
     for &s in starts {
         let ups = run(c, s, hi, K::upper);
@@ -512,12 +586,13 @@ fn match_minimax_m2<K: M2Letters>(
         }
     }
 
-    // `\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n/]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
+    // `\p{N}{1,3}` (`\p{N}` for `tekken`), ` ?[^\s\p{L}\p{N}]+[\r\n/]*` and
+    // `\s*[\r\n]+|\s+(?!\S)|\s+`
     match_tail(
         c,
         i,
         hi,
-        3,
+        shape.digits,
         |b| !is_space(b) && !K::letter(b) && !is_number(b),
         |b| is_newline(b) || b == b'/',
     )
@@ -609,14 +684,22 @@ pub(crate) enum Pre {
     /// classes are Unicode 14.0's, and BPE skips a byte its vocabulary lacks. Never named in a
     /// header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
     Qwen2Hf,
-    /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
+    /// `lfm2`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
-    Pixtral,
-    /// `pixtral` as a Hugging Face `tokenizer.json` runs it: contractions fold case by Unicode,
+    Llama3,
+    /// `lfm2` as a Hugging Face `tokenizer.json` runs it: contractions fold case by Unicode,
     /// classes are Unicode 14.0's, and BPE skips a byte its vocabulary lacks; a word that is itself
     /// a token is still taken whole. Never named in a header; a vocabulary with
     /// `tokenizer.bloomery.eog_token_ids` gets it.
-    PixtralHf,
+    Llama3Hf,
+    /// `tekken`, `pixtral`: the reference's TEKKEN regex, run as a regex over the collapsed text,
+    /// and a word that is itself a token is taken whole ([`Pre::ignore_merges`]).
+    Tekken,
+    /// `tekken` as a Hugging Face `tokenizer.json` spells and runs it: the letter categories apart,
+    /// `\p{M}` in the word classes, Unicode 14.0's classes, and BPE skips a byte its vocabulary
+    /// lacks; a word that is itself a token is still taken whole. Never named in a header; a
+    /// vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
+    TekkenHf,
     /// `minimax-m2`: GPT4O's one regex, run as a regex over the collapsed text.
     MiniMaxM2,
     /// `gpt-4o`: [`Pre::MiniMaxM2`]'s regex under the name of a tree whose UTF-8 reader is the
@@ -637,7 +720,7 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 14] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 15] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -645,8 +728,9 @@ impl Pre {
         ("solar-open", Pre::Qwen2),
         ("glm4", Pre::Glm4),
         ("qwen35", Pre::Qwen35),
-        ("pixtral", Pre::Pixtral),
-        ("lfm2", Pre::Pixtral),
+        ("tekken", Pre::Tekken),
+        ("pixtral", Pre::Tekken),
+        ("lfm2", Pre::Llama3),
         ("minimax-m2", Pre::MiniMaxM2),
         ("gpt-4o", Pre::Gpt4o),
         ("gemma4", Pre::Gemma4),
@@ -660,7 +744,8 @@ impl Pre {
         match self {
             Pre::Qwen2 => Some(Pre::Qwen2Hf),
             Pre::Qwen35 => Some(Pre::Qwen35Hf),
-            Pre::Pixtral => Some(Pre::PixtralHf),
+            Pre::Llama3 => Some(Pre::Llama3Hf),
+            Pre::Tekken => Some(Pre::TekkenHf),
             Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
             _ => None,
         }
@@ -677,9 +762,12 @@ impl Pre {
     }
 
     /// Whether a word that is itself a vocabulary token is taken whole,
-    /// before merges. Any pre can carry it; `pixtral` does, in either reading.
+    /// before merges. Any pre can carry it; `lfm2` and `tekken` do, in either reading.
     pub(crate) fn ignore_merges(self) -> bool {
-        matches!(self, Pre::Pixtral | Pre::PixtralHf)
+        matches!(
+            self,
+            Pre::Llama3 | Pre::Llama3Hf | Pre::Tekken | Pre::TekkenHf
+        )
     }
 
     /// Whether the reference NFC-normalizes the text before this pre-tokenizer whatever the
@@ -690,10 +778,11 @@ impl Pre {
 
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
     /// An overlong form is not a codepoint there; older readers accept it. The trees that read
-    /// `gpt-4o`, `raon` and `flint` reject it; the trees the other names' sets are read by
-    /// (ik, the Solar-Open2 patch, mainline before the check) accept it.
+    /// `gpt-4o`, `raon`, `flint` and `tekken` (every tree that maps `pixtral` to it has the check)
+    /// reject it; the trees the other names' sets are read by (ik, the Solar-Open2 patch,
+    /// mainline before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
-        matches!(self, Pre::Raon | Pre::Flint | Pre::Gpt4o)
+        matches!(self, Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken)
     }
 
     /// How this pre-tokenizer's words are spelled in the vocabulary.
@@ -707,8 +796,10 @@ impl Pre {
             | Pre::Qwen35Hf
             | Pre::Qwen2Hf
             | Pre::MiniMaxM2Hf
-            | Pre::Pixtral
-            | Pre::PixtralHf
+            | Pre::Llama3
+            | Pre::Llama3Hf
+            | Pre::Tekken
+            | Pre::TekkenHf
             | Pre::MiniMaxM2
             | Pre::Gpt4o
             | Pre::Raon
@@ -722,8 +813,8 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::PixtralHf => collapse_hf,
-        Pre::MiniMaxM2Hf => collapse_cased,
+        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf => collapse_hf,
+        Pre::MiniMaxM2Hf | Pre::TekkenHf => collapse_cased,
         _ => collapse,
     };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
@@ -734,16 +825,18 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
             &s.b
         }
-        Pre::Glm4 | Pre::Pixtral => {
+        Pre::Glm4 | Pre::Llama3 => {
             split_custom(cpts, &s.collapsed, 3, &mut s.b);
             &s.b
         }
         Pre::Qwen35 => split_qwen35(cpts, s, false),
         Pre::Qwen35Hf => split_qwen35(cpts, s, true),
         Pre::Qwen2Hf => split_qwen2_hf(cpts, s, 1),
-        Pre::PixtralHf => split_qwen2_hf(cpts, s, 3),
-        Pre::MiniMaxM2 | Pre::Gpt4o => split_minimax_m2::<M2Reference>(cpts, s),
-        Pre::MiniMaxM2Hf => split_minimax_m2::<M2Hf>(cpts, s),
+        Pre::Llama3Hf => split_qwen2_hf(cpts, s, 3),
+        Pre::MiniMaxM2 | Pre::Gpt4o => split_cased::<M2Reference>(cpts, s, CasedShape::MINIMAX_M2),
+        Pre::MiniMaxM2Hf => split_cased::<CasedHf>(cpts, s, CasedShape::MINIMAX_M2),
+        Pre::Tekken => split_cased::<TekkenReference>(cpts, s, CasedShape::TEKKEN),
+        Pre::TekkenHf => split_cased::<CasedHf>(cpts, s, CasedShape::TEKKEN),
         Pre::Gemma4 => {
             split_newlines(cpts, &mut s.b);
             &s.b
@@ -889,7 +982,7 @@ fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
     &s.b
 }
 
-/// [`split`] for [`Pre::Qwen2Hf`] (`digits` 1) and [`Pre::PixtralHf`] (`digits` 3): the `qwen2`
+/// [`split`] for [`Pre::Qwen2Hf`] (`digits` 1) and [`Pre::Llama3Hf`] (`digits` 3): the `qwen2`
 /// regex, or its llama3 form, over the collapsed bytes, contractions folded as Hugging Face's.
 fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch, digits: usize) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
@@ -906,11 +999,16 @@ fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch, digits: usize) -> &'s [u
     &s.b
 }
 
-/// [`split`] for [`Pre::MiniMaxM2`], and with the reading `K` for [`Pre::MiniMaxM2Hf`]: its one
-/// regex over the collapsed bytes.
-fn split_minimax_m2<'s, K: M2Letters>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+/// [`split`] for [`Pre::MiniMaxM2`] (`shape` [`CasedShape::MINIMAX_M2`]) and [`Pre::Tekken`]
+/// (`shape` [`CasedShape::TEKKEN`]), and with the reading `K` for [`Pre::MiniMaxM2Hf`] and
+/// [`Pre::TekkenHf`]: their one regex over the collapsed bytes.
+fn split_cased<'s, K: CasedLetters>(
+    cpts: &[u32],
+    s: &'s mut Scratch,
+    shape: CasedShape,
+) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
-        match_minimax_m2::<K>(c, i, hi, |k| fold_at(cpts, c, k, K::HF))
+        match_cased_words::<K>(c, i, hi, shape, |k| fold_at(cpts, c, k, K::HF))
     });
     &s.b
 }
@@ -1073,12 +1171,12 @@ mod tests {
         assert_eq!(crate::named(&Pre::NAMES, "solar-open"), Some(Pre::Qwen2));
     }
 
-    /// `lfm2` runs the `pixtral` splitter: mainline maps `tokenizer.ggml.pre = lfm2` to its
-    /// Llama-3 expression with `ignore_merges`, which `pixtral` is here. LFM3's header spells it
+    /// `lfm2` runs the llama3 splitter: mainline maps `tokenizer.ggml.pre = lfm2` to its
+    /// Llama-3 expression with `ignore_merges`, which `Pre::Llama3` is. LFM3's header spells it
     /// so. FAIL-first: a row that names another splitter, or none, fails it.
     #[test]
-    fn lfm2_is_pixtral() {
-        assert_eq!(crate::named(&Pre::NAMES, "lfm2"), Some(Pre::Pixtral));
+    fn lfm2_is_llama3() {
+        assert_eq!(crate::named(&Pre::NAMES, "lfm2"), Some(Pre::Llama3));
         assert!(crate::runs_pre_tokenizer("lfm2"));
     }
 
@@ -1231,10 +1329,10 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Glm4, text), want, "{text:?}");
-            // `pixtral` is the same regex and the same splitter. What the
+            // `lfm2` is the same regex and the same splitter. What the
             // two names do not share is `ignore_merges`, which runs after
             // this split.
-            assert_eq!(words(Pre::Pixtral, text), want, "pixtral {text:?}");
+            assert_eq!(words(Pre::Llama3, text), want, "llama3 {text:?}");
         }
     }
 
@@ -1364,9 +1462,9 @@ mod tests {
     /// FAIL-first: with the ASCII fold for both, the first row fails; with the reference's classes
     /// for both, the next two; with one number a word, the last two.
     #[test]
-    fn pixtral_hf_cases() {
+    fn llama3_hf_cases() {
         let cases: &[(&str, &[&str], &[&str])] = &[
-            //                              hf                        pixtral
+            //                              hf                        llama3
             ("x'\u{17f}y", &["x", "'\u{17f}", "y"], &["x", "'\u{17f}y"]),
             (" \u{1d2c0}", &[" \u{1d2c0}"], &[" ", "\u{1d2c0}"]),
             ("x\u{11f04}", &["x", "\u{11f04}"], &["x\u{11f04}"]),
@@ -1374,11 +1472,11 @@ mod tests {
             (" 12345", &[" ", "123", "45"], &[" ", "123", "45"]),
         ];
         for &(text, hf, legacy) in cases {
-            assert_eq!(words(Pre::PixtralHf, text), hf, "hf {text:?}");
-            assert_eq!(words(Pre::Pixtral, text), legacy, "pixtral {text:?}");
+            assert_eq!(words(Pre::Llama3Hf, text), hf, "hf {text:?}");
+            assert_eq!(words(Pre::Llama3, text), legacy, "llama3 {text:?}");
         }
-        assert!(Pre::PixtralHf.ignore_merges());
-        assert_eq!(Pre::Pixtral.hf_reading(), Some(Pre::PixtralHf));
+        assert!(Pre::Llama3Hf.ignore_merges());
+        assert_eq!(Pre::Llama3.hf_reading(), Some(Pre::Llama3Hf));
     }
 
     /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
@@ -1554,6 +1652,130 @@ mod tests {
             for &(text, want) in cases {
                 assert_eq!(words(pre, text), want, "{pre:?} {text:?}");
             }
+        }
+    }
+
+    /// `tekken` and `pixtral` are one row, the reference's TEKKEN type (a tree that reads `pixtral`
+    /// as LLAMA3 predates the mapping), which takes a word that is itself a token whole, and it has
+    /// a Hugging Face twin that does too.
+    ///
+    /// A tree that maps `pixtral` to it has the strict UTF-8 reader, so the reference reading
+    /// is strict; the Hugging Face twin reads valid text alone, as the other twins do.
+    ///
+    /// FAIL-first: `pixtral` on `Pre::Llama3`, a missing `tekken` row, `Pre::ignore_merges`
+    /// without the two Tekken readings, `Pre::hf_reading` without `Pre::Tekken`, or
+    /// `Pre::strict_utf8` without it fails it.
+    #[test]
+    fn tekken_names() {
+        for name in ["tekken", "pixtral"] {
+            assert_eq!(crate::named(&Pre::NAMES, name), Some(Pre::Tekken), "{name}");
+            assert!(crate::runs_pre_tokenizer(name), "{name}");
+        }
+        assert_eq!(Pre::Tekken.hf_reading(), Some(Pre::TekkenHf));
+        assert!(Pre::Tekken.ignore_merges());
+        assert!(Pre::TekkenHf.ignore_merges());
+        assert!(Pre::Tekken.strict_utf8());
+        assert!(!Pre::TekkenHf.strict_utf8());
+    }
+
+    /// The `tekken` regex's alternatives, one case each, derived by hand from the expression run on
+    /// the collapsed bytes (a non-ASCII letter is `U` and `L` at once), beside the llama3 split a
+    /// tree that predates the `pixtral` mapping gives: one number a word, a word cut where a
+    /// lowercase letter meets a capital, no contraction, a symbol run that takes the slashes after
+    /// a newline.
+    ///
+    /// FAIL-first: with `CasedShape::TEKKEN.digits` 3 the digit rows fail; with its `contraction`
+    /// true the `it'sa` row; with the symbol run's tail `[\r\n]*` for `[\r\n/]*` the `a/\n/b` row
+    /// (and `x/\n/y` of `minimax_m2_cases`); with llama3's split in its place the `HelloWorld`,
+    /// `iPhone` and mixed-script rows.
+    #[test]
+    fn tekken_cases() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              tekken                    llama3
+            // `\p{N}`: a number is a word; llama3's `\p{N}{1,3}` takes three from the start.
+            ("2026", &["2", "0", "2", "6"], &["202", "6"]),
+            // The space before a number opens no word: the words need a letter, ` ?[^\s\p{L}\p{N}]+`
+            // a symbol, `\s+(?!\S)` fails at the number, so `\s+` takes the space alone.
+            (" 12", &[" ", "1", "2"], &[" ", "12"]),
+            // `HelloWorld`: at 0 `U*` takes `H`, `L+` takes `ello` and stops at the capital `W`;
+            // the second word is `World`. llama3's `\p{L}+` takes all ten.
+            ("HelloWorld", &["Hello", "World"], &["HelloWorld"]),
+            // `iPhone`: `U*` is empty at `i`, `L+` takes `i` alone; `P` then `hone` is a word.
+            ("iPhone", &["i", "Phone"], &["iPhone"]),
+            // No contraction alternative: `'sa` is a prefix and a lowercase run, where llama3 cuts
+            // `'s` first.
+            ("it'sa", &["it", "'sa"], &["it", "'s", "a"]),
+            // At the first `/` no word fits (the next codepoint is `\n`), so the symbol run takes
+            // it and `[\r\n/]*` takes `\n/` after it; the last `/` would open `/b` for llama3,
+            // whose tail is `[\r\n]*`.
+            ("a/\n/b", &["a", "/\n/", "b"], &["a", "/\n", "/b"]),
+            // The slash is `b`'s prefix, and `\n` is a run of its own: both agree.
+            ("a/b\n", &["a", "/b", "\n"], &["a", "/b", "\n"]),
+            // A non-ASCII letter is `U` and `L` at once: `U*` takes `\u{dc}`, `L+` the rest.
+            ("Ünïcode", &["Ünïcode"], &["Ünïcode"]),
+            // Han, digits, a space and Cyrillic: `H` then `L+` over `ello` and the two Han letters;
+            // each digit a word; the space is the prefix of a word whose `U*` takes all three
+            // Cyrillic letters and gives the last one back to `L+`.
+            (
+                "Hello世界2026 Мир",
+                &["Hello世界", "2", "0", "2", "6", " Мир"],
+                &["Hello世界", "202", "6", " Мир"],
+            ),
+        ];
+        for &(text, tekken, llama3) in cases {
+            assert_eq!(words(Pre::Tekken, text), tekken, "tekken {text:?}");
+            assert_eq!(words(Pre::Llama3, text), llama3, "llama3 {text:?}");
+        }
+    }
+
+    /// A mark is a letter of either case in `tekken`'s lookaheads (`[\p{L}\p{M}]`), where
+    /// `minimax-m2`'s read `\p{L}` alone: it stays in the word beside it, and a lone one is a word
+    /// of its own; both Tekken readings agree on it.
+    ///
+    /// FAIL-first: with `TekkenReference` as `M2Reference` (no mark in `U` and `L`) every row
+    /// fails the `tekken` assertion; with `CasedHf` without the mark in `U` and `L`, the `tekken hf`
+    /// one.
+    #[test]
+    fn tekken_marks_are_word_letters() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              tekken                    minimax-m2
+            // `L+` takes `e`, the mark and `x`; minimax-m2's `L+` stops at the mark, a prefix there.
+            ("e\u{301}x", &["e\u{301}x"], &["e", "\u{301}x"]),
+            // The mark alone is `L+` (the prefix taken first, nothing after it); the dot a symbol run.
+            ("\u{301}.", &["\u{301}", "."], &["\u{301}."]),
+            // The dot is a prefix, the mark a capital that gives way to `a` as `L+`.
+            (".\u{301}a", &[".\u{301}a"], &[".\u{301}", "a"]),
+        ];
+        for &(text, tekken, minimax) in cases {
+            assert_eq!(words(Pre::Tekken, text), tekken, "tekken {text:?}");
+            assert_eq!(words(Pre::TekkenHf, text), tekken, "tekken hf {text:?}");
+            assert_eq!(words(Pre::MiniMaxM2, text), minimax, "minimax-m2 {text:?}");
+        }
+    }
+
+    /// Hugging Face's `tekken` regex tells the letters by category and its classes are Unicode
+    /// 14.0's: a capital outside ASCII is no lowercase letter there, where the reference's one
+    /// byte for every such letter is both, and a codepoint Unicode 15.0 added is of no class (a
+    /// Kaktovik numeral and a Kawi letter are neither number nor letter).
+    ///
+    /// FAIL-first: with `collapse` in place of `collapse_cased` for the Hugging Face reading every
+    /// row fails; with `collapse_hf`, which tells no letter's case, the first.
+    #[test]
+    fn tekken_hf_cases() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              hf                        tekken
+            // `\u{dc}` is `Lu`: `U*` takes it, `L+` takes `ber` and stops at the second capital,
+            // which starts the next word.
+            ("ÜberÜber", &["Über", "Über"], &["ÜberÜber"]),
+            // The numeral is of no class: the space and it are one symbol run; as a number it is
+            // a word of its own and the space is another.
+            (" \u{1d2c0}", &[" \u{1d2c0}"], &[" ", "\u{1d2c0}"]),
+            // The Kawi letter is of no class: `x` is the word and the letter a symbol run.
+            ("x\u{11f04}", &["x", "\u{11f04}"], &["x\u{11f04}"]),
+        ];
+        for &(text, hf, reference) in cases {
+            assert_eq!(words(Pre::TekkenHf, text), hf, "tekken hf {text:?}");
+            assert_eq!(words(Pre::Tekken, text), reference, "tekken {text:?}");
         }
     }
 

@@ -92,9 +92,11 @@ A `gemma4` model always runs `gemma4`; SentencePiece uses no regex pre-tokenizer
 Bloomery's optional string key `tokenizer.ggml.normalizer = "NFC"` normalizes BPE fragments after raw special-token matching, with the Unicode 9.0 tables Hugging Face's tokenizers normalizes with; omission preserves unnormalized encoding, and other values are refused.
 Model `coverage` asks `runs_pre_tokenizer`: BPE specs use the pre-tokenizer's name, and a SentencePiece spec
 uses `llama`, its tokenizer model. `default` alone does not identify a supported BPE pre-tokenizer.
-`ignore_merges` is a property of the pre (`Pre::ignore_merges`): `pixtral` takes a word whose byte-encoded text is
-itself a vocabulary token. SentencePiece instead merges the highest `tokenizer.ggml.scores` first, with the
-leftmost pair winning ties. Its `add_space_prefix` flag defaults to true and follows the header when present.
+`ignore_merges` is a property of the pre (`Pre::ignore_merges`): `Pre::Llama3` (`lfm2`) and `Pre::Tekken` (`tekken`,
+`pixtral`) take a word whose byte-encoded text is itself a vocabulary token. A tree older than mainline's change that
+maps `pixtral` to TEKKEN (ik is one) reads that name as LLAMA3, so a `pixtral` vocabulary's oracle is a later mainline
+tree (Nemotron's: the `nemotron` profile of `crates/tokenizer/tools/oracle.sh`). SentencePiece instead merges the
+highest `tokenizer.ggml.scores` first, with the leftmost pair winning ties. Its `add_space_prefix` flag defaults to true and follows the header when present.
 Both metaspace paths share whitespace spelling, byte fallback validation, special-token partition and decoding.
 MiMo needed no new tokenizer code: its spec reads `qwen2`,
 `ToolFormat::QwenXml` and the `<think>` span (`crates/model/src/arch/mimo2/spec.rs:25,31`). A new tool-call syntax is a

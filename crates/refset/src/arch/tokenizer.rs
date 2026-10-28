@@ -12,9 +12,11 @@
 //! (`/home/user/ik-tilde`); Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 by the tree
 //! with the tolower fix (`/home/user/ik-tokref`). Nemotron's file is
 //! `nemotron_h`, which that tree refuses, so its set is read by
-//! `/home/user/llama.cpp-mainline`, whose `pixtral` pre is the LLAMA3 regex
-//! with `ignore_merges`; Nanbeige4.3-33B's file is SentencePiece (`llama`) and
-//! is read by the same tree. MiniMax-M3's file is read by `/home/user/llama.cpp-solar2`
+//! `/home/user/llama.cpp-19cce691` (mainline at `19cce6919`, no patch;
+//! [`NEMOTRON_BUILD`]), whose `pixtral` pre is the TEKKEN regex with
+//! `ignore_merges`; Nanbeige4.3-33B's file is SentencePiece (`llama`) and is
+//! read by `/home/user/llama.cpp-mainline` ([`MAINLINE_BUILD`]), whose
+//! `pixtral` is still LLAMA3. MiniMax-M3's file is read by `/home/user/llama.cpp-solar2`
 //! (the Solar-Open2 patch on mainline `6ea215d17`; [`MINIMAXM3_BUILD`]).
 //! Muse Spark Open's `gpt-4o` pre is this tree's `minimax-m2` regex under its
 //! own name, and its set is read by `/home/user/llama.cpp-muse`
@@ -51,10 +53,19 @@ pub const TILDE_BUILD: &str = "dad2cb3e5+0e498d9dab2a";
 pub const TOKREF_BUILD: &str = "db517b690+29cabc43ed4d";
 
 /// The tree `/home/user/llama.cpp-mainline`, whose `llama-tokenize` loads the
-/// Nemotron and Nanbeige4.3 files (ik-tokref has no `nemotron_h` architecture):
-/// the mainline commit the Qwen3.5 families name for the same tree, with no patch.
+/// Nanbeige4.3 file: the mainline commit the Qwen3.5 families name for the same
+/// tree, with no patch. It predates the mainline change that maps the GGUF pre
+/// `pixtral` to TEKKEN, so it is no reference for [`NEMOTRON_BUILD`]'s file.
 // PIN(2026-10-18): the commit, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
 pub(crate) const MAINLINE_BUILD: &str = super::qwen35::LCPP_BUILD;
+
+/// The tree `/home/user/llama.cpp-19cce691` (the lfm3 logits oracle's tree, no
+/// patch), whose `llama-tokenize` loads the Nemotron file (ik-tokref has no
+/// `nemotron_h` architecture). Its `pixtral` pre is the TEKKEN type, which
+/// `Pre::Tekken` follows; a set dumped by a tree that reads the name as LLAMA3
+/// ([`MAINLINE_BUILD`]) is refused by its `# build` line.
+// PIN(2026-10-29): the commit that holds the pixtral-to-TEKKEN mapping, not one machine's llama-tokenize and libllama.so.0 md5s.
+pub(crate) const NEMOTRON_BUILD: &str = "19cce6919";
 
 /// The tree `/home/user/llama.cpp-solar2`, whose `llama-tokenize` loads the MiniMax-M3 file: mainline `6ea215d17` plus the
 /// Solar-Open2 patch ([`super::solar2::PAI_BUILD`] names the patch by its file's hash, this pin by the tree's tracked files).
@@ -137,7 +148,7 @@ pub static NEMOTRON: Family = Family {
     recipe: "just dump-ref-tokenizer nemotron",
     identity: Identity::Vocabulary,
     arch: None,
-    build: Some(Build::Is(MAINLINE_BUILD)),
+    build: Some(Build::Is(NEMOTRON_BUILD)),
     runs: Some(nemotron_model),
     draft_runs: None,
     consumers: &["gate-tokenizer"],
@@ -236,7 +247,8 @@ pub static FAMILIES: &[&Family] = &[
 mod tests {
     use super::{
         ARCH, FAMILIES, GLM5NEXT, MAINLINE_BUILD, MINIMAXM3, MINIMAXM3_BUILD, MUSESPARK,
-        MUSESPARK_BUILD, NANBEIGE43, NEMOTRON, QWEN3MOE, QWEN38, TILDE_BUILD, TOKREF_BUILD, V41,
+        MUSESPARK_BUILD, NANBEIGE43, NEMOTRON, NEMOTRON_BUILD, QWEN3MOE, QWEN38, TILDE_BUILD,
+        TOKREF_BUILD, V41,
     };
     use crate::RefError;
     use crate::emb2::LCPP_BUILD;
@@ -316,7 +328,7 @@ mod tests {
             (&QWEN3MOE, TOKREF_BUILD, true),
             (&GLM5NEXT, TOKREF_BUILD, true),
             (&QWEN38, TOKREF_BUILD, true),
-            (&NEMOTRON, MAINLINE_BUILD, false),
+            (&NEMOTRON, NEMOTRON_BUILD, false),
             (&MINIMAXM3, MINIMAXM3_BUILD, true),
             (&MUSESPARK, MUSESPARK_BUILD, false),
             (&NANBEIGE43, MAINLINE_BUILD, false),
@@ -325,8 +337,10 @@ mod tests {
             assert_eq!(pin(f), want, "{} pins the wrong tree", f.name);
             assert_eq!(parts(want).1.is_some(), patched, "{}", f.name);
         }
-        // Nemotron's and Nanbeige4.3's tree is the one the Qwen3.5 families name, and no other family's.
+        // Nanbeige4.3's tree is the one the Qwen3.5 families name, and no other family's. Nemotron's is a later
+        // one: the commit that gives `pixtral` the TEKKEN type the engine follows.
         assert_eq!(MAINLINE_BUILD, crate::arch::qwen35::LCPP_BUILD);
+        assert_ne!(parts(NEMOTRON_BUILD).0, parts(MAINLINE_BUILD).0);
         assert_ne!(parts(TILDE_BUILD).0, parts(TOKREF_BUILD).0);
         let sets: Vec<_> = FAMILIES.iter().map(|f| f.sets[0]).collect();
         assert_eq!(

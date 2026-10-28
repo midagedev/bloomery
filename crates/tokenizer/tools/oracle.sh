@@ -38,7 +38,7 @@
 #   qwen3moe  the Qwen3-MoE file                  ik-tokref (the unicode_tolower fix)                  ref-tokenizer-qwen3moe
 #   glm5next  GLM-5.3-Flash's first shard         ik-tokref                                            ref-tokenizer-glm5next
 #   qwen38    Qwen3.8-Flash-Next's first shard    ik-tokref                                            ref-tokenizer-qwen38
-#   nemotron  Nemotron 3 Nano 4B                  llama.cpp-mainline (pixtral; --no-bos, below)        ref-tokenizer-nemotron
+#   nemotron  Nemotron 3 Nano 4B                  llama.cpp-19cce691 (pixtral; --no-bos, below)        ref-tokenizer-nemotron
 #   minimaxm3 MiniMax-M3-UD-IQ4_XS's first shard  llama.cpp-solar2 (minimax-m2; --no-bos, below)       ref-tokenizer-minimaxm3
 #   musespark Muse-Spark-Open's first shard       llama.cpp-muse (gpt-4o; --no-bos, below)             ref-tokenizer-musespark
 #   gemma4    EmbeddingGemma 2's Q8_0 file        mainline 6868a52cb (the gemma-embedding2 profile's  ref-tokenizer-gemma4
@@ -206,6 +206,7 @@ tree_tokref() {
 }
 
 # llama.cpp-mainline: mainline at 53ed051ce, no patch; the commit the qwen35 families (crates/refset/src/arch/qwen35) name.
+# nanbeige43's tree. Its `pixtral` pre is still LLAMA3, so nemotron's is the later tree below.
 tree_mainline() {
   ORACLE_TREE=/home/user/llama.cpp-mainline
   BUILD_PIN=53ed051ce5e8193652e449f43216ca3859454f49 BUILD_PATCH=
@@ -243,9 +244,12 @@ profile() {
       ;;
     nemotron)
       # ik-tokref knows the pre name and refuses the file: its loader has no
-      # nemotron_h architecture. This tree's binary loads it. The pre is the
-      # same LLAMA3 regex with ignore_merges.
-      tree_mainline
+      # nemotron_h architecture. This tree's binary loads it. llama.cpp-19cce691: mainline at 19cce6919, no patch (the lfm3
+      # logits oracle's tree, tools/ref/models/lfm3.sh). Its `pixtral` pre is the TEKKEN regex with ignore_merges, which
+      # `Pre::Tekken` follows; mainline 53ed051ce reads the name as LLAMA3.
+      ORACLE_TREE=/home/user/llama.cpp-19cce691
+      BUILD_PIN=19cce6919992fdffd92e0ac152caaf1e2b8f254e BUILD_PATCH=
+      TREE_FLAGS=()
       SHARD=/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
       SET=ref-tokenizer-nemotron
       # The file sets add_bos_token, so llama-tokenize prepends BOS. The gate's
@@ -285,7 +289,7 @@ profile() {
       REF_FLAGS=(--no-bos --no-escape)
       ;;
     nanbeige43)
-      # Mainline's tree, as nemotron's. The file is the nanbeige43 profile's own MODEL, not the one tools/box.sh resolved for the
+      # Mainline's tree (53ed051ce). The file is the nanbeige43 profile's own MODEL, not the one tools/box.sh resolved for the
       # default profile.
       tree_mainline
       # shellcheck disable=SC2016 # the child shell expands it
