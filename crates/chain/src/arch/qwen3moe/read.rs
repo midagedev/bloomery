@@ -909,7 +909,7 @@ mod tests {
             MixerPlan::ShortConv(c) => out.extend([
                 format!(
                     "shortconv {} taps of {}, ring {} rows",
-                    c.taps(),
+                    c.ring.taps(),
                     c.hidden,
                     c.ring.rows()
                 ),

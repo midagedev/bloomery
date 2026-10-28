@@ -71,8 +71,8 @@ pub enum ResidualPlan {
     Sandwich(SandwichPlan),
 }
 
-/// A layer's sandwich norms: `x += add[i] · gain[i] ⊙ rms_norm(out)`, the half's index `i` from
-/// [`Half::index`], the gain the file's own weight (plain `w · x̂`).
+/// A layer's sandwich norms: `x += add[i] · gain[i] ⊙ rms_norm(out)`, the mixer at index 0 and the
+/// FFN at index 1, the gain the file's own weight (plain `w · x̂`).
 pub struct SandwichPlan {
     /// The norm's epsilon, inside the root.
     pub eps: f32,
@@ -80,40 +80,6 @@ pub struct SandwichPlan {
     pub add: [f32; 2],
     /// The norms' weights, mixer then FFN: `post_attention_norm`, `post_ffw_norm`.
     pub norms: [String; 2],
-}
-
-/// One of a layer's two halves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Half {
-    /// The mixer: attention, the delta rule or the short conv.
-    Mixer,
-    /// The FFN: the router's pick and the experts, or the dense FFN.
-    Ffn,
-}
-
-impl Half {
-    /// The half's place in a sandwich's `add` and `norms`.
-    #[must_use]
-    pub const fn index(self) -> usize {
-        match self {
-            Half::Mixer => 0,
-            Half::Ffn => 1,
-        }
-    }
-}
-
-impl SandwichPlan {
-    /// The scale `half`'s normed output is added at.
-    #[must_use]
-    pub fn scale(&self, half: Half) -> f32 {
-        self.add[half.index()]
-    }
-
-    /// The name of the norm weight `half`'s output goes through.
-    #[must_use]
-    pub fn norm(&self, half: Half) -> &str {
-        &self.norms[half.index()]
-    }
 }
 
 /// The attention geometries a kernel set is built for.
@@ -178,7 +144,6 @@ impl GqaKind {
             pairs: Pairs::Neox,
             head_norm: true,
             gate: OutGate::None,
-            varies: false,
         },
         Class {
             kind: GqaKind::Head128 {
@@ -190,7 +155,6 @@ impl GqaKind {
             pairs: Pairs::Norm,
             head_norm: false,
             gate: OutGate::None,
-            varies: false,
         },
         Class {
             kind: GqaKind::Gated256,
@@ -199,7 +163,6 @@ impl GqaKind {
             pairs: Pairs::Neox,
             head_norm: true,
             gate: OutGate::Packed,
-            varies: false,
         },
         Class {
             kind: GqaKind::HeadGate128,
@@ -208,7 +171,6 @@ impl GqaKind {
             pairs: Pairs::Neox,
             head_norm: true,
             gate: OutGate::ProjHead,
-            varies: true,
         },
     ];
 }
@@ -226,17 +188,15 @@ struct Class {
     head_norm: bool,
     /// Where the output gate comes from.
     gate: OutGate,
-    /// Whether a layer of the class keeps a window and a rope that divides by the file's
-    /// frequency factors; a class that does not takes neither.
-    varies: bool,
 }
 
 /// How the head-256 flash entries cover a key head's group of query heads:
 /// the shape table's row (`models::shape::GQA`) the layer selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flash {
-    /// One block of eight query heads a key head (the `_256` entries; and
-    /// the head-128 entries' only form).
+    /// One block of a key head's whole group: eight query heads (the `_256`
+    /// entries, and the head-128 entries' only form), or four on the
+    /// head-gated head-128 window flash (the `_g4` entries).
     Group,
     /// Blocks of four query heads, `group / 4` a key head (the `_256_p4`
     /// entries): the scalar and the tensor-core segment pass.
@@ -305,14 +265,6 @@ pub struct ShortConvPlan {
     /// The file's types of `shortconv.in_proj` and `shortconv.out_proj`.
     pub in_ty: SiteTy,
     pub out_ty: SiteTy,
-}
-
-impl ShortConvPlan {
-    /// Taps of the conv, the current position's among them.
-    #[must_use]
-    pub fn taps(&self) -> usize {
-        self.ring.taps()
-    }
 }
 
 /// A gated-delta-rule layer's names, types and head counts.
@@ -624,7 +576,7 @@ pub const HEAD_128: u32 = 128;
 /// table's row ([`GqaKind::CLASSES`]) of its head width, the values the rope
 /// turns, how it pairs them, its head norm and its output gate, with no yarn, output norm,
 /// key selection, sinks or value scale, and a window or rope factors only where the class
-/// keeps them per layer (`Class::varies`).
+/// keeps them per layer ([`GqaKind::head_gate`]).
 pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
     let plain = g.rope.yarn.is_none()
         && !g.o_norm
@@ -648,9 +600,9 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
                 && g.qk_norm == c.head_norm
                 && g.out_gate == c.gate
         })
-        .map(|c| (c.kind, c.varies));
+        .map(|c| c.kind);
     match class {
-        Some((kind, varies)) if plain && (varies || fixed) => Ok(kind),
+        Some(kind) if plain && (kind.head_gate() || fixed) => Ok(kind),
         _ => {
             let classes: Vec<String> = GqaKind::CLASSES
                 .iter()
@@ -686,7 +638,8 @@ pub(crate) fn layer_gqa(s: &LayerSpec) -> Result<(&Gqa, GqaKind), String> {
 
 /// The class and the flash of `g` when it is an attention the kernels run:
 /// the shape table's row for its group ([`select_gqa`]), one of eight, of
-/// quads or pairs, or the head-128 group of seven.
+/// quads or pairs, the head-128 group of seven, or the head-gated head-128
+/// group of four.
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
     let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
@@ -695,6 +648,7 @@ fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
         (_, 4, GroupRule::Packs) => Flash::Quads,
         (_, 2, GroupRule::Packs) => Flash::Pairs,
         (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
+        (GqaKind::HeadGate128, 4, GroupRule::One) => Flash::Group,
         _ => {
             return Err(format!(
                 "attention {}/{} heads of {} selects {}, which this body does not launch",

@@ -89,7 +89,7 @@ pub trait ChainOps {
     fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), Self::Error>;
 
     /// The attention half's output side: the output projection and the join of its output into
-    /// the FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's `Half::Mixer`
+    /// the FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's mixer
     /// norm and scale).
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), Self::Error>;
 
@@ -101,7 +101,7 @@ pub trait ChainOps {
     fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), Self::Error>;
 
     /// The delta rule's output side: the output projection and the join of its output into the
-    /// FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's `Half::Mixer` norm
+    /// FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's mixer norm
     /// and scale).
     fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), Self::Error>;
 
@@ -120,7 +120,7 @@ pub trait ChainOps {
     }
 
     /// The short conv's output side: the output projection and the join of its output into the
-    /// FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's `Half::Mixer` norm
+    /// FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's mixer norm
     /// and scale). A backend with no short-conv kernels keeps the default body, which refuses by
     /// name.
     fn conv_out(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), Self::Error> {
@@ -133,7 +133,7 @@ pub trait ChainOps {
 
     /// The FFN half's rest: the routed slots' gate·up·SwiGLU and down, the shared expert, and the
     /// combine into the layer's output rows, joined to the half's input rows by `l.plan.residual`
-    /// (the plain add, or the sandwich's `Half::Ffn` norm and scale).
+    /// (the plain add, or the sandwich's FFN norm and scale).
     fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), Self::Error>;
 
     /// What the unit ends in after its last layer: the head over the unit's rows, or the final

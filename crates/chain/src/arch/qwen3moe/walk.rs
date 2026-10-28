@@ -194,8 +194,8 @@ pub fn ffn<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
 #[cfg(test)]
 mod tests {
     use super::super::plan::{
-        DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Half, HeadGate, LayerPlan,
-        MixerPlan, ResidualPlan, SandwichPlan, ShortConvPlan, SiteTy,
+        DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, HeadGate, LayerPlan, MixerPlan,
+        ResidualPlan, SandwichPlan, ShortConvPlan, SiteTy,
     };
     use super::{ChainOps, LayerCtx, NoLeg, Steps, Walk, ffn, front, layer};
     use crate::ChainError;
@@ -218,12 +218,17 @@ mod tests {
         }
     }
 
+    /// A sandwich's mixer half, at index 0 of its `add` and `norms`.
+    const MIXER: usize = 0;
+    /// A sandwich's FFN half, at index 1.
+    const FFN: usize = 1;
+
     /// The join `half`'s ending op does by the layer's residual, as the log line carries it:
     /// nothing for a plain residual, the half's norm and scale for a sandwich.
-    fn join(l: LayerCtx<'_>, half: Half) -> String {
+    fn join(l: LayerCtx<'_>, half: usize) -> String {
         match &l.plan.residual {
             ResidualPlan::Plain => String::new(),
-            ResidualPlan::Sandwich(s) => format!("+sandwich({}, {})", s.norm(half), s.scale(half)),
+            ResidualPlan::Sandwich(s) => format!("+sandwich({}, {})", s.norms[half], s.add[half]),
         }
     }
 
@@ -240,7 +245,7 @@ mod tests {
             self.put("attn_core")
         }
         fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
-            self.put(&format!("attn_out{}", join(l, Half::Mixer)))
+            self.put(&format!("attn_out{}", join(l, MIXER)))
         }
         fn delta_in(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
             self.put("delta_in")
@@ -249,13 +254,13 @@ mod tests {
             self.put("delta_core")
         }
         fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), ChainError> {
-            self.put(&format!("delta_out{}", join(l, Half::Mixer)))
+            self.put(&format!("delta_out{}", join(l, MIXER)))
         }
         fn route(&mut self, _: LayerCtx<'_>, _: &FfnPlan) -> Result<(), ChainError> {
             self.put("route")
         }
         fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), ChainError> {
-            self.put(&format!("experts({}){}", l.layer, join(l, Half::Ffn)))
+            self.put(&format!("experts({}){}", l.layer, join(l, FFN)))
         }
         fn head(&mut self, m: usize) -> Result<(), ChainError> {
             self.put(&format!("head({m})"))
@@ -267,7 +272,7 @@ mod tests {
             self.put("conv_core")
         }
         fn conv_out(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), ChainError> {
-            self.put(&format!("conv_out{}", join(l, Half::Mixer)))
+            self.put(&format!("conv_out{}", join(l, MIXER)))
         }
     }
 
