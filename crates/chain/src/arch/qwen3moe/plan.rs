@@ -893,7 +893,7 @@ pub(crate) mod fixtures {
     pub fn lfm3_gqa(window: Option<u32>, factors: bool) -> Gqa {
         Gqa {
             heads: 16,
-            kv_heads: 2,
+            kv_heads: 4,
             head_dim: 128,
             value_dim: 128,
             rope: Rope {

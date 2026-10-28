@@ -1234,7 +1234,7 @@ mod tests {
     /// (the gate's projection Q4_K, the rope's factors) and layer 2 sliding (the gate F32); every
     /// layer has both spellings of the post-norms the sandwich reads beside its pre-FFN norm.
     fn lfm3_tensors() -> Vec<TensorDecl> {
-        let (h, ff, att, kv) = (256u64, 512u64, 2048u64, 256u64);
+        let (h, ff, att, kv) = (256u64, 512u64, 2048u64, 512u64);
         let mut t = vec![decl("rope_freqs.weight".to_string(), &[64], F32)];
         for l in 0..3 {
             t.extend([
@@ -1338,7 +1338,7 @@ mod tests {
         let pd = PlanDims::of(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             (pd.hidden, pd.ff, pd.q_rows, pd.kv_len, pd.attn_len),
-            (256, 512, 2048, 256, 2048)
+            (256, 512, 2048, 512, 2048)
         );
         let own = |lines: &[&str]| -> Vec<String> {
             lines.iter().map(|line| (*line).to_string()).collect()
