@@ -3,7 +3,7 @@
 bloomery runs on a Mac's GPU through its own Metal backend: `bloomery-serve-metal` serves the llama-server HTTP API,
 and `generate_metal` runs one prompt from the command line. The host side is Rust; the kernels are Metal Shading
 Language. Two architectures run on a build after 0.3.9: `qwen35moe` (Qwen3.6-35B-A3B and files with its shapes) and
-`qwen3moe` (Qwen3-30B-A3B) ([which files](#which-files-run)). The release carries a signed and notarized Apple
+`qwen3moe` (Qwen3-30B-A3B); a build after 0.3.10 adds `lfm3` (LFM3-1.7B) ([which files](#which-files-run)). The release carries a signed and notarized Apple
 Silicon build; building from source works too. The port's map and design are in [`contrib/mac.md`](contrib/mac.md) and issue
 [#593](https://github.com/midagedev/bloomery/issues/593).
 
@@ -59,6 +59,7 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M | runs, unverified, text only |
 | [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct), an MLX 4-bit folder | verified on a build after 0.3.10, text only, on Qwen3-30B-A3B's 4-layer fixture split: it has those shapes (`qwen3moe`), and the gate does not open its folder. Its XML tool calls parse into OpenAI `tool_calls` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `UD-Q4_K_XL` | runs, unverified, text only. Release 0.3.9 refuses it: its Q8_0, Q5_K and f32 tensors |
+| [LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit), an MLX 4-bit folder | verified on a build after 0.3.10, text only, on the whole folder: its logits at positions 0 to 3 match mlx-vlm's `lfm3` in f32 within 0.06. No gate reads it past its 256-key sliding window yet |
 
 The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights, and f32 at the delta layers' `ssm_alpha` and
 `ssm_beta`. The gate verifies the MLX 4-bit path on the 4-layer fixture splits of Qwen3.6-35B-A3B and Qwen3-30B-A3B:
