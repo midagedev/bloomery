@@ -109,6 +109,13 @@ bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
 ([0.3.10](https://github.com/midagedev/bloomery/releases/tag/v0.3.10)).
 
+The release after 0.3.10 adds an archive for the RTX 50 series (`linux-x86_64-cuda-sm120a`, compute capability 12.0:
+the RTX 5090 and the RTX PRO Blackwell cards), built for the Blackwell FP4 and FP8 tensor cores. The installer takes it
+when every GPU the machine lists is compute capability 12.0, and the `linux-x86_64-cuda-sm86` archive on any other
+machine, or from a release without the new one. Docker and Homebrew stay on the sm_86 archive. No maintainer machine
+has a 12.0 card, so this archive is checked by compiling it and by the users who run it; to take the sm_86 archive on
+such a card, download it by name from the releases page.
+
 ### Windows (WSL2)
 
 Run the Linux x86-64 release inside WSL2: `wsl --install` from an administrator PowerShell, reboot, then run the

@@ -73,7 +73,7 @@
 //! up rows dotted in `card::f32_dot`'s order over the widened values, the
 //! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 prompt
 //! product with no quantizer, so a NaN raises the mix's site alone and a
-//! subnormal column leaves the other columns' bits unchanged. On GB10 that
+//! subnormal column leaves the other columns' bits unchanged. On a compute capability 12 device that
 //! product runs on BF16 tensor cores over `xn` kept as BF16 values: the
 //! wide norm's `xn` is the capped entry's rounded to nearest even, within
 //! `XN_BAND` plus BF16's unit roundoff of the rule, the glue's `mixed` the
@@ -1352,14 +1352,14 @@ mod gate {
     }
 
     /// Whether the wide arm keeps `site`'s normed streams as BF16 values: a
-    /// BF16 site on GB10.
+    /// BF16 site on a compute capability 12 device.
     fn xn_bf16(c: &Ctx, site: &Site) -> Result<bool, GateError> {
         Ok(matches!(site.planes, Planes::Bf16 { .. }) && bloomery_gpu::dense_mma(c.gpu.context())?)
     }
 
     /// Whether the wide arm runs `site`'s down and inject as one product, its
     /// dots `[m][R + S]` in the scratch's `down` (else `[m][R]`, then
-    /// `[m][S]`): a BF16 inject site on GB10.
+    /// `[m][S]`): a BF16 inject site on a compute capability 12 device.
     fn packs(c: &Ctx, site: &Site, inject: bool) -> Result<bool, GateError> {
         Ok(inject && xn_bf16(c, site)?)
     }
@@ -1380,7 +1380,7 @@ mod gate {
     }
 
     /// The wide scratch's normed streams of `m` columns as values: its F32
-    /// values, or for a BF16 site on GB10 its BF16 halfwords widened.
+    /// values, or for a BF16 site on a compute capability 12 device its BF16 halfwords widened.
     fn wide_xn(c: &Ctx, site: &Site, s: &HcWideScratch, m: usize) -> Result<Vec<f32>, GateError> {
         let n = c.geo.sizes(m).xn;
         let raw = s.xn.to_host_vec(c.gpu.stream())?;
@@ -1732,7 +1732,7 @@ mod gate {
             .wgt
             .copy_from_host(c.gpu.stream(), &padded(&first.wgt, w.scratch.wgt.len()))?;
         let wide = wide_mix(c, &mut w, site, true, &res, Pre::Combine(&y), m)?;
-        // A BF16 site on GB10 keeps xn as the capped entry's values rounded
+        // A BF16 site on a compute capability 12 device keeps xn as the capped entry's values rounded
         // to BF16.
         let bf16 = xn_bf16(c, site)?;
         let xn = if bf16 {
@@ -1903,7 +1903,7 @@ mod gate {
             );
         }
         // (c) the error model's bands against the f64 rule, per column.
-        // PIN(2026-10-28): BF16 xn (a BF16 site on GB10) is the F32 norm
+        // PIN(2026-10-28): BF16 xn (a BF16 site on a compute capability 12 device) is the F32 norm
         // rounded to nearest even once, each value within BF16's unit
         // roundoff 2^-8 of itself: within 2^-8 · (1 + `XN_BAND`) of max|xn|
         // beyond `XN_BAND`.
@@ -2071,7 +2071,7 @@ mod gate {
                 .iter()
                 .enumerate()
                 .all(|(k, &word)| word == u32::from(k == 2));
-            // On GB10 the column's normed values are BF16 subnormals, which the
+            // On a compute capability 12 device the column's normed values are BF16 subnormals, which the
             // down's tile refuses as their copies land: its dots are the F32
             // tile's bits over the widened values.
             let replayed = if xn_bf16(c, site)? {

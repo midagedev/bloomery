@@ -286,7 +286,7 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # rows a thread a pass over the shared two-lanes-a-thread tile body.
 # PIN(2026-10-25): 176 -> 104 JIT local bytes: the cc 8.6 JIT's reading of the body that sums two rows a thread (the
 # release batch's A6000, driver 615.71.09); 176 was its reading of the body before that replay (1352 spill bytes), kept
-# through the 484 step. The spill pin stands (484 read again). The entry launches only where dense_mma holds, cc 12.1
+# through the 484 step. The spill pin stands (484 read again). The entry launches only where dense_mma holds, cc 12
 # (q8f32.rs Q8F32Kernels::load), so these cc 8.6 bytes are never run.
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
 # PIN(2026-10-26): hc_gated_up_mma_mix_4 jit_local 104 -> 216 on cc 8.6 (gate-ptx-spill on the box's RTX card, the

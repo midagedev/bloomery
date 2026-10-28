@@ -278,8 +278,9 @@
 //! - `g32_f32tile`: `enqueue_f32_tile` bit for bit `enqueue_f32_gemv` over
 //!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
 //!   columns, nothing written past its output.
-//! - `dense_mma`: GB10's dense prompt MMA for BF16, MXFP8 and FP8_B128
-//!   weights (`enqueue_bf16_mma`, `enqueue_e4m3_mma`) at ragged shapes (one
+//! - `dense_mma`: the dense prompt MMA of a compute capability 12 device for
+//!   BF16, MXFP8 and FP8_B128 weights (`enqueue_bf16_mma`,
+//!   `enqueue_e4m3_mma`) at ragged shapes (one
 //!   with columns past a raster group) and range edges: every output within
 //!   the BF16 operand band, the cells of an edge's row and column the exact
 //!   tile's bits, nothing written past the output and a graph replay the

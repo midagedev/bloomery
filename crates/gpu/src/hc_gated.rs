@@ -60,8 +60,8 @@
 //! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
 //! the inject rows are the wide F32 tile, and a BF16 down or up the BF16
 //! prompt product (`Q8F32Kernels::enqueue_bf16_prompt`) on `xn` or the
-//! bottleneck, with BF16 operands on GB10 and F32 activations otherwise.
-//! On GB10 a BF16 down's site keeps `xn` as BF16 values: the norm rounds
+//! bottleneck, with BF16 operands on a compute capability 12 device and F32 activations otherwise.
+//! On a compute capability 12 device a BF16 down's site keeps `xn` as BF16 values: the norm rounds
 //! each to nearest even as it writes it (`hc_gated_norm_4w_bf16`,
 //! `hc_gated_norm_4w16_bf16`), and the
 //! down, its inject rows and the mix read those values. The down and an
@@ -74,8 +74,8 @@
 //! the up's order; `hc_gated_mix_4_bf16` over BF16 `xn`). A column's values
 //! are a function of that column alone.
 //! The wide products use a different sum order from the narrow arm, with
-//! Q8_0 activations for Q8_0 weights and BF16 operands for BF16 weights on
-//! GB10. The gate checks their error bands, not bit equality between arms.
+//! Q8_0 activations for Q8_0 weights and BF16 operands for BF16 weights on a
+//! compute capability 12 device. The gate checks their error bands, not bit equality between arms.
 //! The same values raise [`SITE`].
 
 use crate::cores::l2_prefetch;
@@ -2759,7 +2759,7 @@ impl HcWideKernels {
     /// norm after `before` over the streams in either form, the down and
     /// optional inject projections, the bottleneck and weights, and the
     /// up/mix. Q8 projections add activation
-    /// quantizers. On GB10 a BF16 down reads the normed streams as BF16
+    /// quantizers. On a compute capability 12 device a BF16 down reads the normed streams as BF16
     /// words, which the norm writes in place of their F32 values, and the
     /// mix reads the same words: the down and an inject site's inject are one
     /// product, and a BF16 up with m > 8 consumes g in the MMA epilogue.

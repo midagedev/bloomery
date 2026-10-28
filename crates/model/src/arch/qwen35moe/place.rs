@@ -1403,7 +1403,7 @@ pub fn card_route_run(card: &Card, u: u64, tiered: bool) -> Result<(u64, u64), P
 }
 
 /// What a stage card's reserve for the ubatch walk's activations in the
-/// forms GB10's dense MMA tile copies is called ([`machine_for_experts`]):
+/// forms the dense MMA tile copies is called ([`machine_for_experts`]):
 /// the model-width rows rounded once to BF16 for their BF16 sites, and the
 /// model-width, attention-width and SwiGLU rows in MXFP8 for their MXFP8
 /// sites' W8A8 products. A load reads it from the row ([`act_forms_bytes`]).
@@ -1496,10 +1496,11 @@ pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
 /// ([`card_route_scratch_bytes`]) is counted beside the ubatch's — the walk
 /// holds those buffers when the plan puts experts on the card. A unified
 /// card's stage reserves the activations' MMA forms
-/// ([`ACT_FORMS_RESERVE`]): GB10's dense MMA tile reads them, and the plan
+/// ([`ACT_FORMS_RESERVE`]): the dense MMA tile reads them, and the plan
 /// sees the pool, not the compute capability or the sites' formats, so
 /// another unified card's load, or a load with no site of a form, leaves
-/// those bytes unread. A discrete card reserves none.
+/// those bytes unread. A discrete card reserves none, and its dense MMA
+/// tile, where its device runs it, converts the f32 rows in each tile.
 #[must_use]
 pub fn machine_for_experts(
     card: CardSpec,

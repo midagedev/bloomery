@@ -12,19 +12,25 @@ measurements and the full README: https://github.com/midagedev/bloomery
 
 ## Requirements
 
-There are two Linux archives; the installer picks the one for the machine.
+There are three Linux archives; the installer picks the one for the machine.
 
 - `linux-x86_64-cuda-sm86`: Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CPU needs AVX2 and FMA (x86-64-v3); AVX-512 is optional.
+- `linux-x86_64-cuda-sm120a`: the same host code and requirements, for a machine whose every GPU is compute capability 12.0 (the
+  RTX 50 series, the RTX PRO Blackwell cards). Its GPU code is sm_120a PTX, which uses the Blackwell FP4 and FP8 tensor cores
+  and loads on compute capability 12.0 only; the driver compiles it for the card on the first start, as for the sm_86
+  archive. It is built from the same tree as the others, and no maintainer machine has a 12.0 card, so the code path
+  that card takes is checked by compiling it, and by the users who run it. A machine with a 12.0 card beside another
+  capability takes the sm_86 archive, and so does a release that carries no sm_120a archive.
 - `linux-aarch64-cuda-sm121a`: a GB10 (DGX Spark and the other GB10 machines) on DGX OS 7 (Ubuntu 24.04, glibc 2.39). The archive
   carries its GPU code compiled for sm_121a, which uses GB10's FP4 tensor cores and loads on compute capability 12.1
   only, so a first start compiles nothing. A driver that refuses that code gets the PTX the archive keeps beside it,
   compiled on the first start, and the server says so on one line. Another aarch64 GPU builds from source
   (`docs/BUILD.md`).
-- For the x86-64 archive, an NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
+- For the x86-64 sm_86 archive, an NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
   card on first start. Run on an RTX A6000 and an RTX 3090 (driver 615.71, Ubuntu 24.04) and, for Clef-Flash, on an
   RTX 3060 under WSL2 (Windows driver 591.86), where the answers equal the A6000's byte for byte. Other cards and
   drivers are untested.
-- The NVIDIA driver R580 or newer (CUDA 13; `libcuda.so.1`). No CUDA toolkit is needed. On x86-64 the first start compiles the GPU code for
+- The NVIDIA driver R580 or newer (CUDA 13; `libcuda.so.1`). No CUDA toolkit is needed. On x86-64 (either archive) the first start compiles the GPU code for
   the card and caches it (about 10–25 s measured); later starts skip it. Do not set `CUDA_CACHE_DISABLE=1`: every
   start then recompiles and takes minutes.
 - What fits where:

@@ -3142,8 +3142,8 @@ impl Q8F32Kernels {
         Ok(())
     }
 
-    /// Dense prompt product, using BF16 tensor cores on GB10 and the exact
-    /// F32-activation tile on other devices.
+    /// Dense prompt product, using BF16 tensor cores on a compute capability 12
+    /// device and the exact F32-activation tile on other devices.
     pub fn enqueue_bf16_prompt(
         &self,
         stream: &CudaStream,
