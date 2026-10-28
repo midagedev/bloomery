@@ -1257,6 +1257,33 @@ build-ref-nemotron-moe:
 dump-ref-nemotron-moe:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=312 BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'bash tools/ref/dump-nemotron.sh'
 
+# LFM3-1.7B oracle: llama.cpp mainline at 19cce6919, the commit that added `lfm3` (ik has none), in a tree of its own,
+# /home/user/llama.cpp-19cce691: the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh) with the pin, tree, sentinel
+# directory and targets by environment, so the md5s the nemotron_h logits family pins stay where they are. Detached, pid, log and rc
+# under /root/lcpp-lfm3; the rc file is the end (0 built). The pin and tree are the lfm3 profile's (tools/ref/models/lfm3.sh).
+build-lfm3-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=19cce6919992fdffd92e0ac152caaf1e2b8f254e LCPP_BUILD_TREE=/home/user/llama.cpp-19cce691 LCPP_BUILD_DIR=/root/lcpp-lfm3 LCPP_BUILD_TARGETS=llama,mtmd,llama-common,llama-tokenize,llama-bench' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-lfm3-lcpp: this recipe requires root on the box (/root/lcpp-lfm3 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
+# LFM3-1.7B's three GGUF files (Q4_K_M, Q8_0, BF16) at the profile's Hugging Face revision into /models/LFM3-1.7B-GGUF, checked against
+# the table's bytes and sha256, and the REVISION file beside them (tools/ref/fetch-lfm3.sh). A file that matches stays. The queue's
+# 300 s is derived (6.41 GB at an assumed 100 MB/s plus the sha256 pass); the box's link is not measured.
+fetch-lfm3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=300 BLOOMERY_MODEL=lfm3 ./tools/box.sh 'bash tools/ref/fetch-lfm3.sh'
+
+# LFM3-1.7B last-position logits, mainline on the CPU: nemotron_ref (tools/ref/nemotron_ref.cpp) linked against the lfm3 tree's
+# build (tools/ref/build-nemotron-ref.sh under the lfm3 profile; it does not rebuild the tree) into $BLOOMERY_DATA/bin/nemotron_ref_lfm3,
+# and its `build` line is the two md5s crates/refset/src/arch/lfm3 pins. Run after build-lfm3-lcpp's rc is 0. No card: the lane is none.
+build-ref-lfm3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=lfm3 ./tools/box.sh 'bash tools/ref/build-nemotron-ref.sh'
+
+# The three sets of the three files, one after the other (tools/ref/dump-lfm3.sh over tools/ref/dump-nemotron.sh): ten prompts each,
+# into $BLOOMERY_DATA/ref-lfm3-logits (Q4_K_M), ref-lfm3-q8-logits and ref-lfm3-bf16-logits (refset families of those names). CUDA
+# stays hidden. The queue's 600 s is derived, not measured: 6,499 prompt tokens a file at about 2.9 GFLOP a token (the header's
+# shapes), over an assumed 80 prompt tokens/s for the Q4_K_M file at -t 8 and slower for Q8_0 and BF16; that rate is the one term
+# the run measures.
+dump-ref-lfm3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=600 BLOOMERY_MODEL=lfm3 ./tools/box.sh 'bash tools/ref/dump-lfm3.sh'
+
 # Solar-Open2-250B oracle: solar2_dump linked against the existing PAI build (llama.cpp 6ea215d17 + prometheusAIR's solar_open2 patch,
 # /home/user/llama.cpp-solar2), which this does not rebuild (tools/ref/solar2-dump-build.sh); the binary and its build record land in
 # $BLOOMERY_DATA/bin.

@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # Link nemotron_ref (tools/ref/nemotron_ref.cpp, with tools/ref/ref_io.h) against the existing mainline build of the
-# nemotron_h or nemotron_h_moe profile (each names its own LCPP; the binary takes the architecture as --arch). This does
-# not configure or rebuild that tree: a rebuild moves the md5s the nemotron_h logits family pins. The .build record spells those
+# nemotron_h, nemotron_h_moe or lfm3 profile (each names its own LCPP; the binary takes the architecture as --arch). This does
+# not configure or rebuild that tree: a rebuild moves the md5s the logits families pin. The .build record spells those
 # md5s as crate::tokenizer::build_id does (llama-tokenize <md5> libllama.so <md5>; the file on disk is libllama.so.0).
-# Output: $BLOOMERY_DATA/bin/<name> and <name>.build beside it; <name> is nemotron_ref under nemotron_h and nemotron_ref_moe under
-# nemotron_h_moe, because the two profiles name different mainline trees (dump-nemotron.sh derives the same name).
+# Output: $BLOOMERY_DATA/bin/<name> and <name>.build beside it; <name> is nemotron_ref under nemotron_h, nemotron_ref_moe under
+# nemotron_h_moe and nemotron_ref_lfm3 under lfm3, because the profiles name different mainline trees (dump-nemotron.sh names
+# the same binary).
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
 case $MODEL_NAME in
-  nemotron_h | nemotron_h_moe) ;;
+  nemotron_h) NAME=nemotron_ref ;;
+  nemotron_h_moe) NAME=nemotron_ref_moe ;;
+  lfm3) NAME=nemotron_ref_lfm3 ;;
   *)
-    echo "build-nemotron-ref: this binary is built under the nemotron_h or nemotron_h_moe profile; this command picked $MODEL_NAME" >&2
+    echo "build-nemotron-ref: this binary is built under the nemotron_h, nemotron_h_moe or lfm3 profile; this command picked $MODEL_NAME" >&2
     exit 2
     ;;
 esac
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 OUT=${NEMOTRON_OUT:-$BLOOMERY_DATA/bin}
-NAME=nemotron_ref${MODEL_NAME#nemotron_h}
 SRC=$HERE/tools/ref/nemotron_ref.cpp
 IO=$HERE/tools/ref/ref_io.h
 git_lcpp() { git -c safe.directory="$LCPP" -C "$LCPP" "$@"; }
@@ -26,6 +28,12 @@ dirty=$(git_lcpp status --porcelain --untracked-files=no) ||
 if [ -n "$dirty" ]; then
   echo "build-nemotron-ref: $LCPP has tracked changes; the oracle is the commit's build, not an edited tree" >&2
   exit 2
+fi
+if [ "$MODEL_NAME" = lfm3 ]; then
+  head=$(git_lcpp rev-parse HEAD) ||
+    { echo "build-nemotron-ref: cannot read the commit of $LCPP" >&2; exit 2; }
+  [ "$head" = "$LCPP_COMMIT" ] ||
+    { echo "build-nemotron-ref: $LCPP is at $head, the lfm3 profile pins $LCPP_COMMIT" >&2; exit 2; }
 fi
 TOKENIZE=$LCPP/build/bin/llama-tokenize
 [ -x "$TOKENIZE" ] || { echo "build-nemotron-ref: no llama-tokenize at $TOKENIZE" >&2; exit 66; }

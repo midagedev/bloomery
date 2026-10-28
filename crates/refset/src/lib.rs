@@ -35,8 +35,8 @@
 //!   type (`tools/ref/quant-oracle.sh`).
 //! - [`hfmap`]: a Hugging Face checkpoint's name map oracle, its shard headers and small
 //!   tensors beside the reference GGUF's table and tensors (`tools/ref/glm5next-hf-map.py`).
-//! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano and
-//!   3.5 Bolt (`tools/ref/nemotron_ref.cpp`).
+//! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano,
+//!   3.5 Bolt and LFM3-1.7B (`tools/ref/nemotron_ref.cpp`).
 //! - [`census`]: the census stubs — header-only copies of many users' model
 //!   files, pinned by `tools/census/stubs.tsv` (the writer
 //!   `tools/type-census.py --stubs`) and checked against it.

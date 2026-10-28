@@ -16,6 +16,7 @@ pub mod forced_logits;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;
 pub mod glm5next;
+pub mod lfm3;
 pub mod llama;
 pub mod mimo2;
 pub mod minicpmv4_7;
@@ -56,6 +57,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (raon1::ARCH, raon1::FAMILIES),
     (nemotron_h::ARCH, nemotron_h::FAMILIES),
     (nemotron_h_moe::ARCH, nemotron_h_moe::FAMILIES),
+    (lfm3::ARCH, lfm3::FAMILIES),
     (musespark::ARCH, musespark::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),

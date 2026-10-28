@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Dump the last-position logit rows of the profile's prompts (ten for each), for the profile the
 # command runs under: nemotron_h (Nano 4B) into
-# $BLOOMERY_DATA/ref-nemotron-logits, nemotron_h_moe (Bolt 74B-A9B) into $BLOOMERY_DATA/ref-nemotron-moe-logits. The script,
-# its checks and the harness source are one for both; the profile picks the model file, the set, the binary, the
+# $BLOOMERY_DATA/ref-nemotron-logits, nemotron_h_moe (Bolt 74B-A9B) into $BLOOMERY_DATA/ref-nemotron-moe-logits, lfm3 (LFM3-1.7B)
+# into the set its profile's LOGITS_SETS names for the model file (tools/ref/dump-lfm3.sh runs it once a file). The script,
+# its checks and the harness source are one for all; the profile picks the model file, the set, the binary, the
 # architecture nemotron_ref must find in the file and the prompts.
 # The prompts are 1 to 4096 ids: a few short ones, the counts on each side of a 256-row
 # chunk (255, 256, 257), and two long ones (1024 prose, 4096 code).
@@ -12,6 +13,8 @@
 # README. The Nano file sets add_bos_token, so llama-tokenize adds BOS and the counts include that id. The Bolt
 # file does not (add_bos_token false): on the same text its ids are the Nano's without the leading BOS (id 1),
 # so a Bolt prompt of n ids is the Nano's ids 2 to n+1.
+# The lfm3 files set add_bos_token false, as the Bolt's does: a prompt is the text's own ids. Its text is the
+# nemotron tokenizer oracle's, which no model owns.
 # Mainline is not rebuilt.
 # BLOOMERY_TIER=fixture dumps the profile's set on its fixture file (ref-paths.sh: the model is its first shard): the set
 # is its real twin's name behind `fx_` (fixture_dump_tier) and carries the file's `# fixture` line (fixture_line), which
@@ -20,15 +23,28 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
 case $MODEL_NAME in
-  nemotron_h) SET_NAME=ref-nemotron-logits ;;
-  nemotron_h_moe) SET_NAME=ref-nemotron-moe-logits ;;
+  nemotron_h) SET_NAME=ref-nemotron-logits BIN_NAME=nemotron_ref ;;
+  nemotron_h_moe) SET_NAME=ref-nemotron-moe-logits BIN_NAME=nemotron_ref_moe ;;
+  lfm3)
+    # The set of the model file, one entry of the profile's LOGITS_SETS (<set>:<file>:<bytes>:<sha256>).
+    SET_NAME=
+    BIN_NAME=nemotron_ref_lfm3
+    for entry in "${LOGITS_SETS[@]}"; do
+      IFS=: read -r set_of file_of _ <<< "$entry"
+      [ "$file_of" != "$MODEL" ] || SET_NAME=$set_of
+    done
+    [ -n "$SET_NAME" ] || {
+      echo "dump-nemotron: $MODEL is none of the lfm3 profile's LOGITS_SETS files; no set is named for it (exit 2)" >&2
+      exit 2
+    }
+    ;;
   *)
-    echo "dump-nemotron: this dump runs under the nemotron_h or nemotron_h_moe profile; this command picked $MODEL_NAME" >&2
+    echo "dump-nemotron: this dump runs under the nemotron_h, nemotron_h_moe or lfm3 profile; this command picked $MODEL_NAME" >&2
     exit 2
     ;;
 esac
-# Both profiles dump the ten prompts at one context: the Nano's gate (gate_nemotron_e2e, CTX 4160) holds its
-# prompt path on every one.
+# Every profile dumps the ten prompts at one context: the Nano's gate (gate_nemotron_e2e, CTX 4160) holds its
+# prompt path on every one; lfm3's window (256 rows) is cut by the 255, 256 and 257 prompts.
 CTX=4096
 PROMPTS=(code5 code29 code4096 prose1 prose64 prose255 prose256 prose257 prose512 prose1024)
 fixture_dump_tier dump-nemotron.sh
@@ -40,14 +56,14 @@ SET_NAME=$SET_PREFIX$SET_NAME
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SRC=$HERE/tools/ref/nemotron_ref.cpp
 IO=$HERE/tools/ref/ref_io.h
-BIN=${NEMOTRON_BIN:-$BLOOMERY_DATA/bin/nemotron_ref${MODEL_NAME#nemotron_h}}
+BIN=${NEMOTRON_BIN:-$BLOOMERY_DATA/bin/$BIN_NAME}
 REC=$BIN.build
-[ -x "$BIN" ] || { echo "dump-nemotron: no $BIN — run just build-ref-nemotron (build-ref-nemotron-moe under nemotron_h_moe)" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "dump-nemotron: no $BIN — run just build-ref-nemotron (build-ref-nemotron-moe under nemotron_h_moe, build-ref-lfm3 under lfm3)" >&2; exit 2; }
 # cpp then the shared header, the same order build-nemotron-ref.sh records. A header-only edit is a mismatch.
 want=$(cat "$SRC" "$IO" | sha256sum | cut -d' ' -f1)
 got=$(awk '$1 == "source_sha256" { print $2; exit }' "$REC")
 [ "$want" = "$got" ] || {
-  echo "dump-nemotron: $BIN was linked from another nemotron_ref.cpp or ref_io.h — run just build-ref-nemotron (build-ref-nemotron-moe under nemotron_h_moe)" >&2
+  echo "dump-nemotron: $BIN was linked from another nemotron_ref.cpp or ref_io.h — run just build-ref-nemotron (build-ref-nemotron-moe under nemotron_h_moe, build-ref-lfm3 under lfm3)" >&2
   exit 2
 }
 TOKENIZE=$LCPP/build/bin/llama-tokenize
@@ -104,7 +120,7 @@ STAGE=$SET.staging
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 trap 'drop_incomplete_stage; rm -rf "$WORK"' EXIT
-"$BIN" -m "$MODEL" --arch "$MODEL_NAME" --out "$STAGE" -c "$CTX" -ub 512 -t 8 "${FIXTURE_ARGS[@]}" "${ARGS[@]}"
+"$BIN" -m "$MODEL" --arch "$MODEL_NAME" --out "$STAGE" -c "$CTX" -ub 512 -t 8 ${FIXTURE_ARGS[@]+"${FIXTURE_ARGS[@]}"} "${ARGS[@]}"
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" || {
   echo "dump-nemotron: the staged set has no completion trailer — not installing it" >&2
   exit 1

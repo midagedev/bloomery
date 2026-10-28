@@ -1,12 +1,12 @@
-//! Last-position logits of Nemotron 3 Nano and 3.5 Bolt (`tools/ref/nemotron_ref.cpp`,
-//! `just dump-ref-nemotron`, `just dump-ref-nemotron-moe`). One prompt is one row, read by the names on
+//! Last-position logits of Nemotron 3 Nano, 3.5 Bolt and LFM3-1.7B (`tools/ref/nemotron_ref.cpp`,
+//! `just dump-ref-nemotron`, `just dump-ref-nemotron-moe`, `just dump-ref-lfm3`). One prompt is one row, read by the names on
 //! `# prompt columns`. `logits` is the last position only, `n_vocab` f32,
 //! little-endian; `ids` is that prompt, one id a line.
 //!
 //! ```text
 //! # model    <path>
 //! # build    llama-tokenize <md5> libllama.so <md5>
-//! # arch     nemotron_h (the Bolt: nemotron_h_moe)
+//! # arch     nemotron_h (the Bolt: nemotron_h_moe, LFM3: lfm3)
 //! # prompt columns  name  n_ids  n_vocab  ids  logits
 //! prompt  code5  5  131072  code5.ids  code5.logits.f32
 //! # complete  4  0
@@ -465,8 +465,8 @@ mod tests {
             n += 1;
         }
         assert!(
-            n >= 2,
-            "the arch table holds {n} logits families, want the Nano's and the Bolt's"
+            n >= 5,
+            "the arch table holds {n} logits families, want the Nano's, the Bolt's and LFM3's three"
         );
     }
 

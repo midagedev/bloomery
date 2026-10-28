@@ -352,6 +352,7 @@ class Builders(unittest.TestCase):
         scripts = (
             ("tools/ref/build-hidden.sh", "qwen35"),
             ("tools/ref/build-nemotron-ref.sh", "nemotron_h"),
+            ("tools/ref/build-nemotron-ref.sh", "lfm3"),
             ("tools/ref/clefvis/build-clefvis.sh", "qwen35"),
             ("tools/ref/qvis/build-lcpp-qvis.sh", "qwen35"),
             ("tools/ref/vision/build-fork.sh", "deepseek41"),

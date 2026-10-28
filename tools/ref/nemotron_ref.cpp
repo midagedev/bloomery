@@ -8,7 +8,8 @@
 //   nemotron_ref -m <gguf> --arch <name> --out <dir> --prompt <name>:<n>:<ids> ... [-c <ctx>] [-ub <ubatch>] [-t <threads>]
 //                [--fixture-line <line>]
 //
-// --arch is the general.architecture the file must state (nemotron_h or nemotron_h_moe); any other is refused.
+// --arch is the general.architecture the file must state (nemotron_h, nemotron_h_moe or lfm3); a file that states another is
+// refused. Nothing else in this harness is a nemotron fact: it decodes the ids it is given on whatever the mainline build loads.
 // --fixture-line is the fixture file's `# fixture` line (refset-check --fixture-line), written verbatim beside # model.
 // A file with routed experts also gets each MoE layer's selection at the last position: the graph's ffn_moe_topk-<il>
 // tensor (the ids ggml_top_k picked over the biased probabilities) read through the eval callback, its last token's
