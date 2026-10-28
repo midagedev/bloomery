@@ -13,9 +13,15 @@
 //! compiled from the shipped source beside it, the shipped phases gated at run
 //! time by one word — append, q prepare, the tile loop, the epilogue, the
 //! ticket, the fold — so `full − no_append` is the append and so on. Before the phase arms run, a self-check holds the probe to the shipped
-//! flash: its `full` arm's output equals the shipped dispatch's bit for bit,
-//! and its epilogue bit decides whether the partials are written. A probe
-//! that fails it prints no phase row.
+//! flash: the arm table says what each name does to the phase word
+//! ([`check_arms`]), the `full` arm's output equals the shipped dispatch's
+//! bit for bit, and the epilogue bit decides whether the partials are
+//! written. A probe that fails it prints no phase row.
+//!
+//! The phase arms time in one of two units (`--phase-arms`): `lone`, one
+//! dispatch to a command buffer like the shipped `lone` arm (the default),
+//! or `packed`, the shipped `packed` arm's many dispatches to a buffer. The
+//! split's `probe_over_shipped` divides by the shipped arm of the same unit.
 //!
 //! Each row is one line, tab-separated: kernel, keys, arm, the GPU
 //! microseconds per dispatch (`us_median`, `us_min`, `us_p90`), the K/V bytes
@@ -26,6 +32,7 @@
 //! Flags: `--trials N` (timed command buffers per arm, default 16; `lone`
 //! takes twice that), `--keys a,b,c` (default 100,512,1024,4096), `--segs
 //! a,b,c` (segment counts timed at every key count, in place of the rule's),
+//! `--phase-arms lone|packed` (the phase arms' unit, default `lone`),
 //! `--no-phases` (skip the phase arms and the self-check), `--help`.
 
 use std::process::ExitCode;
@@ -96,6 +103,108 @@ const ARMS: [(&str, u32); 9] = [
     ("no_fold_no_epilogue", PH_FULL | PH_NO_FOLD | PH_NO_EPILOGUE),
     ("ticket_only", PH_FULL | PH_TICKET_ONLY),
 ];
+
+/// The arms the split row reads, in the order [`phase_arms`] binds them.
+const SPLIT_READS: [&str; 9] = [
+    "full",
+    "no_append",
+    "no_prepare",
+    "no_loop",
+    "no_loop_no_fold",
+    "no_fold",
+    "no_epilogue",
+    "no_fold_no_epilogue",
+    "ticket_only",
+];
+
+/// The bits whose set state skips a phase.
+const SKIP_BITS: u32 = PH_NO_FOLD | PH_NO_EPILOGUE | PH_NO_LOOP | PH_TICKET_ONLY;
+
+/// The phase word an arm's name says. `full` is [`PH_FULL`] and `ticket_only`
+/// adds [`PH_TICKET_ONLY`]. `no_<phase>`, joined by `_no_`, turns each named
+/// phase off from [`PH_FULL`]: the append and the prepare by clearing their
+/// bit, the loop, the fold and the epilogue by setting their skip bit.
+fn word_named(name: &str) -> Result<u32, String> {
+    match name {
+        "full" => return Ok(PH_FULL),
+        "ticket_only" => return Ok(PH_FULL | PH_TICKET_ONLY),
+        _ => {}
+    }
+    let Some(phases) = name.strip_prefix("no_") else {
+        return Err(format!(
+            "arm {name}: a name is `full`, `ticket_only` or `no_<phase>`"
+        ));
+    };
+    let mut word = PH_FULL;
+    for phase in phases.split("_no_") {
+        match phase {
+            "append" => word &= !PH_APPEND,
+            "prepare" => word &= !PH_PREPARE,
+            "loop" => word |= PH_NO_LOOP,
+            "fold" => word |= PH_NO_FOLD,
+            "epilogue" => word |= PH_NO_EPILOGUE,
+            other => return Err(format!("arm {name}: there is no phase `{other}`")),
+        }
+    }
+    Ok(word)
+}
+
+/// Holds an arm table to the phase bits' meaning: the bits are one each and
+/// distinct, `full` is the shipped flash's work (the append and the prepare on,
+/// no skip bit set, so the epilogue runs), every arm's word is the one its
+/// name says ([`word_named`]), no name or word repeats, and every arm the
+/// split row reads is in the table. Every failed clause is named.
+fn check_arms(arms: &[(&str, u32)]) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+    let mut seen = 0u32;
+    for bit in [
+        PH_APPEND,
+        PH_PREPARE,
+        PH_NO_FOLD,
+        PH_NO_EPILOGUE,
+        PH_NO_LOOP,
+        PH_TICKET_ONLY,
+    ] {
+        if !bit.is_power_of_two() || (seen & bit) != 0 {
+            failures.push(format!("phase bit {bit} is not a bit of its own"));
+        }
+        seen |= bit;
+    }
+    if (PH_FULL & SKIP_BITS) != 0
+        || (PH_FULL & (PH_APPEND | PH_PREPARE)) != (PH_APPEND | PH_PREPARE)
+    {
+        failures.push(format!(
+            "full word {PH_FULL} is not the shipped flash: the append and the prepare on, no skip bit"
+        ));
+    }
+    for (i, (name, word)) in arms.iter().enumerate() {
+        match word_named(name) {
+            Ok(said) if said == *word => {}
+            Ok(said) => failures.push(format!(
+                "arm {name}: the table's word is {word}, its name says {said}"
+            )),
+            Err(e) => failures.push(e),
+        }
+        if arms[..i].iter().any(|(other, _)| other == name) {
+            failures.push(format!("arm {name} stands twice"));
+        }
+        if let Some((other, _)) = arms[..i].iter().find(|(_, w)| w == word) {
+            failures.push(format!("arms {other} and {name} share the word {word}"));
+        }
+    }
+    for name in SPLIT_READS {
+        if !arms.iter().any(|(arm, _)| *arm == name) {
+            failures.push(format!(
+                "the split row reads arm {name}, which the table lacks"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
 
 /// The macros the probe source reads the phase word with.
 fn phase_macros() -> String {
@@ -443,8 +552,30 @@ us_min, us_p90, kv_bytes, gbps.
   --trials N    timed command buffers per arm (default 16; `lone` takes twice)
   --keys LIST   comma-separated key counts (default 100,512,1024,4096)
   --segs LIST   comma-separated segment counts timed at every key count, in place of the rule's
+  --phase-arms U  the phase arms' unit: `lone` (default), one dispatch to a command buffer like
+                the shipped `lone` arm, or `packed`, many dispatches to a buffer like the shipped
+                `packed` arm
   --no-phases   skip the phase arms and the self-check they need"
     );
+}
+
+/// What one timed command buffer of a phase arm holds.
+#[derive(Clone, Copy)]
+enum PhaseUnit {
+    /// One dispatch, the shipped `lone` arm's unit.
+    Lone,
+    /// The packed rule's dispatches with a barrier between each, the shipped
+    /// `packed` arm's unit.
+    Packed,
+}
+
+impl PhaseUnit {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Lone => "lone",
+            Self::Packed => "packed",
+        }
+    }
 }
 
 struct Run {
@@ -453,6 +584,7 @@ struct Run {
     /// Segment counts to time at every key count, in place of the rule's.
     segs: Vec<usize>,
     phases: bool,
+    phase_unit: PhaseUnit,
 }
 
 fn parse(args: &[String]) -> Result<Run, String> {
@@ -460,12 +592,24 @@ fn parse(args: &[String]) -> Result<Run, String> {
     let mut keys = vec![100u32, 512, 1024, 4096];
     let mut segs: Vec<usize> = Vec::new();
     let mut phases = true;
+    let mut phase_unit = PhaseUnit::Lone;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         let next = || args.get(i + 1);
         match arg {
             "--no-phases" => phases = false,
+            "--phase-arms" => {
+                let value = next().ok_or("--phase-arms takes lone or packed")?;
+                phase_unit = match value.as_str() {
+                    "lone" => PhaseUnit::Lone,
+                    "packed" => PhaseUnit::Packed,
+                    other => {
+                        return Err(format!("--phase-arms takes lone or packed, not {other:?}"));
+                    }
+                };
+                i += 1;
+            }
             "--trials" => {
                 let value = next().ok_or("--trials takes a value")?;
                 trials = value
@@ -523,6 +667,7 @@ fn parse(args: &[String]) -> Result<Run, String> {
         keys,
         segs,
         phases,
+        phase_unit,
     })
 }
 
@@ -592,10 +737,11 @@ fn timed(
 ) -> Result<(), String> {
     let stream = device.stream();
     println!(
-        "info\tinstrument=development-loop\tdevice={info_name}\tlib={}\ttrials={}\tlone_trials={}\twarmups={WARMUPS}",
+        "info\tinstrument=development-loop\tdevice={info_name}\tlib={}\ttrials={}\tlone_trials={}\twarmups={WARMUPS}\tphase_arms={}",
         device.library().path().name(),
         run.trials,
         2 * run.trials,
+        run.phase_unit.name(),
     );
 
     // The planted buffers: a query with finite gates, one K and V row per
@@ -675,22 +821,26 @@ fn timed(
         let tgs = KV_HEADS * segments;
         let args = args_words(segments as u32, pos, keys);
         let packed = packed_dispatches(keys);
+        let (dispatches, trials) = match run.phase_unit {
+            PhaseUnit::Lone => (1, 2 * run.trials),
+            PhaseUnit::Packed => (packed, run.trials),
+        };
         println!(
-            "scene\tkeys={keys}\tpos={pos}\tsegments={segments}\tthreadgroups={tgs}\tthreads={FLASH_THREADS}\tpacked_n={packed}"
+            "scene\tkeys={keys}\tpos={pos}\tsegments={segments}\tthreadgroups={tgs}\tthreads={FLASH_THREADS}\tpacked_n={packed}\tphase_n={dispatches}"
         );
         // The production flash: many dispatches in one buffer, then one per
-        // buffer.
+        // buffer. The phase arms divide by the one of their own unit.
         let mut shipped_us = None;
-        for (name, dispatches, trials) in
+        for (name, arm_dispatches, arm_trials) in
             [("packed", packed, run.trials), ("lone", 1, 2 * run.trials)]
         {
-            match time_arm(device, stream, dispatches, trials, |encoder, _| {
+            match time_arm(device, stream, arm_dispatches, arm_trials, |encoder, _| {
                 let p = params(&mut bufs, segments, pos, keys, device.fault_word())?;
                 kernels.attention_flash(encoder, p)
             }) {
                 Ok(t) => {
-                    print_row("gqa256_flash_f16", keys, name, dispatches, &t);
-                    if name == "packed" {
+                    print_row("gqa256_flash_f16", keys, name, arm_dispatches, &t);
+                    if arm_dispatches == dispatches {
                         shipped_us = Some(t.us_median);
                     }
                 }
@@ -707,8 +857,8 @@ fn timed(
             keys,
             segments,
             args: &args,
-            packed,
-            trials: run.trials,
+            dispatches,
+            trials,
             shipped_us,
         };
         failed |= phase_arms(device, stream, &mut bufs, &point, pipeline);
@@ -726,9 +876,11 @@ struct Point<'a> {
     keys: u32,
     segments: usize,
     args: &'a [[u8; 4]; 7],
-    packed: usize,
+    /// The dispatches of each timed command buffer.
+    dispatches: usize,
+    /// The timed command buffers of each arm.
     trials: usize,
-    /// The shipped flash's packed figure at this key count, when it ran.
+    /// The shipped flash's figure of the same unit at this key count, when it ran.
     shipped_us: Option<f64>,
 }
 
@@ -781,13 +933,16 @@ fn read_f32(
     Ok(host)
 }
 
-/// The probe's pipeline, built once the probe has held to the shipped flash.
+/// The probe's pipeline, built once the arm table holds to the phase bits'
+/// meaning and the probe has held to the shipped flash.
 fn probe_pipeline(
     device: &MetalDevice,
     stream: &MetalStream,
     kernels: &Kernels,
     bufs: &mut Bufs,
 ) -> Result<Pipeline, String> {
+    check_arms(&ARMS)?;
+    println!("selfcheck\tclause=arm_table\tarms={}", ARMS.len());
     let library = Library::from_source_text(device, &probe_source()).map_err(why)?;
     let pipeline = library.pipeline("probe_flash_f16").map_err(why)?;
     self_check(device, stream, kernels, bufs, &pipeline)?;
@@ -932,7 +1087,7 @@ fn phase_arms(
         keys,
         segments,
         args,
-        packed,
+        dispatches,
         trials,
         shipped_us,
     } = *point;
@@ -943,7 +1098,7 @@ fn phase_arms(
             println!("attn\tkernel=probe_flash_f16\tkeys={keys}\tarm={name}\tFAIL\t{e}");
             return true;
         }
-        match time_arm(device, stream, packed, trials, |encoder, _| {
+        match time_arm(device, stream, dispatches, trials, |encoder, _| {
             encode_phase(
                 encoder,
                 pipeline,
@@ -955,7 +1110,7 @@ fn phase_arms(
             )
         }) {
             Ok(t) => {
-                print_row("probe_flash_f16", keys, name, packed, &t);
+                print_row("probe_flash_f16", keys, name, dispatches, &t);
                 figures.push((name, t.us_median));
             }
             Err(e) => {
@@ -975,7 +1130,7 @@ fn phase_arms(
         Some(no_epilogue),
         Some(bare),
         Some(ticket_only),
-    ] = ARMS.map(|(name, _)| at(name))
+    ] = SPLIT_READS.map(at)
     {
         // Each term is a difference of two arms that differ in one phase.
         // `loop` is the tile loop whole, `fold` the ticket and the fold,
@@ -984,7 +1139,7 @@ fn phase_arms(
         // and the fold work it lets the fold do, and `floor` what stays with
         // the tile loop, the epilogue's partials and the fold off (the
         // launch, the append, the prepare). `probe_over_shipped` is the
-        // probe's whole-flash arm over the shipped flash's packed arm: the
+        // probe's whole-flash arm over the shipped flash's arm of the same unit: the
         // run-time gates are not free, so the split is of a program that may
         // time apart from the shipped one even where its output equals it.
         let ratio = shipped_us.map_or_else(|| "none".to_string(), |us| format!("{:.3}", full / us));
@@ -1002,4 +1157,54 @@ fn phase_arms(
         );
     }
     failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped table with the word of the arm `name` replaced.
+    fn with_word(name: &str, word: u32) -> Vec<(&'static str, u32)> {
+        ARMS.iter()
+            .map(|&(n, w)| (n, if n == name { word } else { w }))
+            .collect()
+    }
+
+    #[test]
+    fn the_arm_table_is_held_to_the_phase_bit_meaning() {
+        check_arms(&ARMS).expect("the shipped table holds");
+        let mut dropped = ARMS.to_vec();
+        dropped.retain(|(n, _)| *n != "ticket_only");
+        let mut twice = ARMS.to_vec();
+        twice.push(("no_fold", PH_FULL | PH_NO_FOLD));
+        let mut unnamed = ARMS.to_vec();
+        unnamed.push(("no_prefetch", PH_FULL));
+        let cases = [
+            (
+                "an epilogue arm that never sets its bit",
+                with_word("no_epilogue", PH_FULL | PH_NO_FOLD),
+                "arm no_epilogue: the table's word",
+            ),
+            (
+                "a full arm that skips the epilogue",
+                with_word("full", PH_FULL | PH_NO_EPILOGUE),
+                "arm full: the table's word",
+            ),
+            (
+                "an arm the split reads, dropped",
+                dropped,
+                "reads arm ticket_only",
+            ),
+            ("a name twice", twice, "arm no_fold stands twice"),
+            (
+                "a name no phase says",
+                unnamed,
+                "there is no phase `prefetch`",
+            ),
+        ];
+        for (what, table, said) in cases {
+            let err = check_arms(&table).expect_err(what);
+            assert!(err.contains(said), "{what}: {err}");
+        }
+    }
 }
