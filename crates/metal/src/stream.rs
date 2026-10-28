@@ -26,7 +26,7 @@
 //! ([`MetalStream::waits`]), and so is every committed buffer
 //! ([`MetalStream::submits`]).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::io::Write;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -430,9 +430,20 @@ pub(crate) fn mark(class: &str, detail: std::fmt::Arguments<'_>) {
         return;
     };
     let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = writeln!(file, "{:.9} {class} {detail}", host_secs());
     // fsync so the line survives the kernel panic the breadcrumb hunts.
-    let _ = file.sync_data();
+    let written =
+        writeln!(file, "{:.9} {class} {detail}", host_secs()).and_then(|()| file.sync_data());
+    if let Err(e) = written {
+        // A line that did not reach the disk leaves an older last line naming
+        // the wrong call after a panic: said once, the breadcrumb then stale.
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "bloomery_metal: BLOOMERY_METAL_BREADCRUMB: a line before `{class}` did not reach \
+                 the disk ({e}); the file's last line may name an earlier call"
+            );
+        }
+    }
 }
 
 /// A breadcrumb line at the start of a gate clause, so the file after a panic
@@ -706,14 +717,13 @@ impl MetalStream {
 impl Drop for MetalStream {
     /// Drain the queue before the residency set is torn down.
     ///
-    /// The residency set, and the buffers it holds as allocations, back the
-    /// resource groups of the shared queue: the queue rebuilds those groups
-    /// from every attached set on each commit and on `removeResidencySet`,
-    /// reading each allocation. A buffer freed while a command buffer that
-    /// bound the set is still in flight leaves a group naming a resource the
-    /// driver can no longer find, and the driver faults walking it. The
-    /// invariant: the set outlives every command buffer on the queue that it
-    /// backs. So a stream with a set waits (bounded by [`SYNC_TIMEOUT`]) for
+    /// The residency set, and the buffers it holds as allocations, are
+    /// attached to every command buffer the shared queue commits, and Metal
+    /// lets a resource leave a set only once the GPU no longer needs it. A
+    /// kernel fault in the driver's resource-group update on this queue
+    /// (`set_resource_groups` dereferencing a resource that is gone) is read
+    /// as that rule broken at teardown. The invariant: the set outlives every
+    /// command buffer on the queue that it backs. So a stream with a set waits (bounded by [`SYNC_TIMEOUT`]) for
     /// every committed buffer to finish before `residency` drops
     /// ([`Residency`]'s `endResidency`, `removeResidencySet`, the buffers
     /// released). A stream with no set (the device's own) has nothing to free
@@ -724,10 +734,12 @@ impl Drop for MetalStream {
         }
         let pending = self.committed().pending.len();
         mark("teardown", format_args!("drain {pending} pending"));
-        // The failure a buffer ended with is read elsewhere; here only that
-        // every buffer reached a terminal status matters, so the result is
-        // dropped and the pending list decides.
-        let _ = self.sync_for(SYNC_TIMEOUT);
+        // The drain takes each finished buffer off the list, so a buffer that
+        // ended in error is named here or nowhere; the pending list then
+        // decides whether the set may go.
+        if let Err(e) = self.sync_for(SYNC_TIMEOUT) {
+            eprintln!("bloomery_metal: at a stream's teardown: {e}");
+        }
         if !self.committed().pending.is_empty() {
             // The queue did not drain inside the bound: a command buffer is
             // still in flight. Freeing the set now would fault the driver, so
