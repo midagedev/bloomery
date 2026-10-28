@@ -675,6 +675,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             "route",
             "experts",
             "delta",
+            "conv",
             "attention",
             "embed_head",
         ]
@@ -686,10 +687,16 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             let mut t: Vec<f64> = runs.iter().map(|r| r[i].gpu_s).collect();
             let med = median(&mut t);
             let class = match runs[0][i].op {
-                Op::AttnIn(_) | Op::AttnOut(_) | Op::DeltaIn(_) | Op::DeltaOut(_) => "gemm",
+                Op::AttnIn(_)
+                | Op::AttnOut(_)
+                | Op::DeltaIn(_)
+                | Op::DeltaOut(_)
+                | Op::ConvIn(_)
+                | Op::ConvOut(_) => "gemm",
                 Op::Route(_) => "route",
                 Op::Experts(_) => "experts",
                 Op::DeltaCore(_) => "delta",
+                Op::ConvCore(_) => "conv",
                 Op::AttnCore(_) => "attention",
                 Op::Embed | Op::Head => "embed_head",
             };

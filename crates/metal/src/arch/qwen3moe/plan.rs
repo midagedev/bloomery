@@ -332,11 +332,12 @@ pub fn render(
     }
     if let Some(s) = &outcome.spec {
         lines.push(format!(
-            "plan: arch={} layers={} (delta {}, attention {}) hidden={} vocab={} experts={} \
-             picks={} trained_ctx={}",
+            "plan: arch={} layers={} (delta {}, conv {}, attention {}) hidden={} vocab={} \
+             experts={} picks={} trained_ctx={}",
             s.arch,
             s.layers,
             s.delta,
+            s.conv,
             s.attention,
             s.hidden,
             s.vocab,

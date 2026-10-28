@@ -36,10 +36,13 @@ use crate::geom::Geometry;
 use crate::kernels::{SNAPS, route_table_words};
 use crate::residency::Alloc;
 
-/// The widest a row of the delta numerator or the attention output is, at
-/// `g`: the value heads' columns or the query heads' values.
+/// The widest a row of the delta numerator, the attention output or a short
+/// conv's output is, at `g`: the value heads' columns, the query heads' values
+/// or the hidden width.
 fn mix_stride(g: &Geometry) -> usize {
-    (g.delta.value_heads * g.delta.head_cols).max(g.attn.query_heads * g.attn.head)
+    (g.delta.value_heads * g.delta.head_cols)
+        .max(g.attn.query_heads * g.attn.head)
+        .max(g.hidden)
 }
 
 const WHAT: &str = "qwen35moe rows arena";
@@ -100,7 +103,8 @@ pub(super) struct RowsArena {
     /// The P1 output, `proj_stride` values a row.
     pub(super) proj: MetalBuffer<f32>,
     pub(super) proj_stride: usize,
-    /// The delta numerator, or the attention output: `mix_stride` a row.
+    /// The delta numerator, the attention output or a short conv's output:
+    /// `mix_stride` a row.
     pub(super) mix: MetalBuffer<f32>,
     pub(super) mix_stride: usize,
     /// The delta step's partial sums of squares, a row each.
@@ -110,6 +114,11 @@ pub(super) struct RowsArena {
     pub(super) delta_prep: MetalBuffer<f32>,
     /// The f32s of one prepared delta row.
     pub(super) delta_prep_stride: usize,
+    /// The attention's output gate, one value a query head a row, contiguous
+    /// (`AttnGeom::query_heads` a row): the flash reads a row's gate there,
+    /// not in the P1 rows' stride. Only an instance with a per-head gate has
+    /// it.
+    pub(super) gate: Option<MetalBuffer<f32>>,
     /// The pair's outputs, a row of `ExpertsGeom::k` a place; a dense FFN's
     /// gate rows, activated in place.
     pub(super) h: MetalBuffer<f32>,
@@ -219,6 +228,9 @@ pub(super) struct RowsLens {
     pub(super) delta_partials: usize,
     pub(super) delta_prep: usize,
     pub(super) delta_prep_stride: usize,
+    /// The per-head gate rows: `cap` rows of the query heads; none for an
+    /// instance without the gate.
+    pub(super) gate: Option<usize>,
     pub(super) h: usize,
     pub(super) ffn: FfnLens,
 }
@@ -275,6 +287,14 @@ impl RowsLens {
                 y: nonzero(product(slots, hidden, "the down rows")?, "the down outputs")?,
             })
         };
+        let gate = if g.attn.head_gate {
+            Some(nonzero(
+                product(cap, g.attn.query_heads, "the gate rows")?,
+                "the gate rows",
+            )?)
+        } else {
+            None
+        };
         Ok(RowsLens {
             ids: nonzero(cap, "the ids")?,
             x: nonzero(product(cap, hidden, "the residual rows")?, "the residual")?,
@@ -295,6 +315,7 @@ impl RowsLens {
                 "the delta's prepared rows",
             )?,
             delta_prep_stride,
+            gate,
             h,
             ffn,
         })
@@ -304,7 +325,8 @@ impl RowsLens {
     /// the mixer rows, the delta's partials and prepared rows (f32) and the
     /// ids (u32), then a routed FFN's logits, picks, weights, sorted slots,
     /// places, route table, pair outputs and down outputs, or a dense FFN's
-    /// gate and up rows (f32).
+    /// gate and up rows (f32), then the attention's gate rows where an
+    /// instance has them.
     pub(super) fn buffer_bytes(&self) -> Vec<u64> {
         let w = |n: usize| 4 * u64::try_from(n).expect("a length fits u64");
         let mut bytes: Vec<u64> = [
@@ -328,6 +350,7 @@ impl RowsLens {
             ),
             FfnLens::Dense { up } => bytes.extend([self.h, *up].map(w)),
         }
+        bytes.extend(self.gate.map(w));
         bytes
     }
 
@@ -349,7 +372,7 @@ impl RowsArena {
         let hidden = arena.hidden;
         let delta_heads = arena.layers.iter().filter_map(|l| match &l.mixer {
             MixerBufs::Delta(d) => Some(d.n_k),
-            MixerBufs::Attention(_) => None,
+            MixerBufs::Attention(_) | MixerBufs::ShortConv(_) => None,
         });
         let lens = RowsLens::of(
             &arena.geom,
@@ -365,6 +388,10 @@ impl RowsArena {
         let mix = device.buffer(Elems(lens.mix))?;
         let delta_partials = device.buffer(Elems(lens.delta_partials))?;
         let delta_prep = device.buffer(Elems(lens.delta_prep))?;
+        let gate = lens
+            .gate
+            .map(|n| device.buffer::<f32>(Elems(n)))
+            .transpose()?;
         // The routed FFN's buffers are made in the order the arena always made
         // them: the logits, the picks, the table, then the pair's and the
         // down's outputs.
@@ -413,6 +440,7 @@ impl RowsArena {
             delta_partials,
             delta_prep,
             delta_prep_stride,
+            gate,
             h,
             ffn,
             bytes,

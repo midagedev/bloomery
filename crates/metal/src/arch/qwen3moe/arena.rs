@@ -21,21 +21,22 @@ use core::ops::Range;
 use std::borrow::Cow;
 
 use bloomery_device::{Elem, Elems};
-use chain::rope::{Direction, RopeTable};
+use chain::rope::{Direction, RopeSpec, RopeTable};
 use gguf::quant::GgmlType;
 use model::part::Part;
 use model_hf::Weights;
 use model_hf::model_file::Error as WeightError;
 
 use super::check::{
-    AttnLayout, DeltaLayout, FfnLayout, LayerLayout, Layout, MixerLayout, P1Layout, Site, Values,
+    AttnLayout, ConvLayout, DeltaLayout, FfnLayout, LayerLayout, Layout, MixerLayout, P1Layout,
+    PostLayout, RopeLayout, Site, Values,
 };
-use super::count::{FfnKind, GroupBytes, GroupKind, Layer, Projection};
+use super::count::{FfnKind, GroupBytes, GroupKind, Layer, Projection, Residual};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::geom::Geometry;
-use crate::kernels::{HeadMap, Quant, Segment, head_groups, segments_for_keys};
+use crate::kernels::{HeadMap, Quant, Segment, head_groups, segments_for_window};
 use crate::residency::Alloc;
 
 const WHAT: &str = "qwen35moe arena";
@@ -122,6 +123,13 @@ pub(super) struct AttnBufs {
     pub(super) q: Range<usize>,
     pub(super) k: Range<usize>,
     pub(super) v: Range<usize>,
+    /// Where the output gate of one value a query head sits in the P1 output,
+    /// after the value, on a layer that has one.
+    pub(super) gate: Option<Range<usize>>,
+    /// The positions the layer attends; none: every position.
+    pub(super) window: Option<u32>,
+    /// The layer's rope table, by place in [`Arena::ropes`].
+    pub(super) rope: usize,
     pub(super) q_norm: MetalBuffer<f32>,
     pub(super) k_norm: MetalBuffer<f32>,
     pub(super) out: MetalBuffer<u8>,
@@ -130,10 +138,37 @@ pub(super) struct AttnBufs {
     pub(super) v_cache: MetalBuffer<u16>,
 }
 
+/// A gated short conv layer's buffers: its input projection is one segment of
+/// the P1, and the ring keeps the conv's inputs of the last positions.
+pub(super) struct ConvBufs {
+    pub(super) p1: P1,
+    /// Where `B | C | x`, `3 · hidden` values, sit in the P1 output.
+    pub(super) bcx: Range<usize>,
+    /// The filters, `[hidden][taps]`, the oldest tap first.
+    pub(super) conv: MetalBuffer<f32>,
+    /// `out_proj`, in a type the mat-vec reads.
+    pub(super) out: MetalBuffer<u8>,
+    /// The out projection's type: the launch reads it.
+    pub(super) out_quant: Quant,
+    /// The ring: `ring_rows` rows of `hidden` f32.
+    pub(super) ring: MetalBuffer<f32>,
+    pub(super) taps: usize,
+    pub(super) ring_rows: usize,
+}
+
 /// A layer's mixer.
 pub(super) enum MixerBufs {
     Delta(DeltaBufs),
     Attention(AttnBufs),
+    ShortConv(ConvBufs),
+}
+
+/// A layer's sandwich: the gain of the norm each half's output goes through
+/// before it joins the stream, `x += add[i] · gain[i] ⊙ rms_norm(out)`, the
+/// mixer's half first (the order of `SandwichPlan`'s `norms`). The epsilon and
+/// the scales are the plan's (`SandwichPlan`).
+pub(super) struct PostBufs {
+    pub(super) gains: [MetalBuffer<f32>; 2],
 }
 
 /// A shared expert's router row and weights, each of the type the launches
@@ -189,6 +224,8 @@ pub(super) struct FfnBufs {
 pub(super) struct LayerBufs {
     pub(super) mixer: MixerBufs,
     pub(super) ffn: FfnBufs,
+    /// The sandwich; none on a layer that adds each half to the stream.
+    pub(super) post: Option<PostBufs>,
 }
 
 /// Every buffer of the session.
@@ -223,8 +260,15 @@ pub(super) struct Arena {
     /// The attention fold's ticket, one word: the flash's last threadgroup
     /// resets it, so every launch finds it zero.
     pub(super) attn_ticket: MetalBuffer<u32>,
-    /// `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`.
-    pub(super) rope: MetalBuffer<f32>,
+    /// A short conv's output, `hidden` values; none for a file with no short
+    /// conv layer.
+    pub(super) conv_y: Option<MetalBuffer<f32>>,
+    /// What a half's out projection writes before its join, `hidden` values;
+    /// none for a file with no sandwich.
+    pub(super) join: Option<MetalBuffer<f32>>,
+    /// The rope tables, one for each distinct base and factors the attention
+    /// layers have: `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`.
+    pub(super) ropes: Vec<MetalBuffer<f32>>,
     /// The experts' activations, one row of `ExpertsGeom::k` per slot.
     pub(super) h: MetalBuffer<f32>,
     pub(super) logits: MetalBuffer<f32>,
@@ -309,6 +353,15 @@ impl<'a> Loader<'a> {
     /// reader (`s·q + b` in f32, the pair's product exact). The reader's own
     /// refusals (a non-finite scale or bias) name the tensor and its block.
     fn values(&self, v: &Values) -> Result<MetalBuffer<f32>, SessionError> {
+        let values = self.host_values(v)?;
+        let mut buffer = self.device.buffer(Elems(v.len))?;
+        buffer.write(&values)?;
+        Ok(buffer)
+    }
+
+    /// The f32 values of `v`, as [`Loader::values`] reads them, kept on the
+    /// host: what a table the arena builds from them is made of.
+    fn host_values(&self, v: &Values) -> Result<Vec<f32>, SessionError> {
         let part = self.part(&v.name)?;
         let bytes = joined(&part.spans());
         let mut values = vec![0f32; v.len];
@@ -329,9 +382,22 @@ impl<'a> Loader<'a> {
                 )));
             }
         }
-        let mut buffer = self.device.buffer(Elems(v.len))?;
-        buffer.write(&values)?;
-        Ok(buffer)
+        Ok(values)
+    }
+
+    /// The rope table `r` describes, `ctx` positions of `rot` values: the
+    /// window rope of its base, dividing by the file's factors when it has
+    /// them. A factor the rope cannot divide by is refused by name here, where
+    /// the values are read.
+    fn rope(&self, r: &RopeLayout, ctx: usize, rot: usize) -> Result<Vec<f32>, SessionError> {
+        let mut spec = RopeSpec::window(r.base, rot);
+        if let Some(factors) = &r.factors {
+            spec = spec
+                .with_factors(&self.host_values(factors)?)
+                .map_err(|e| refuse(format!("{}: {e}", factors.name)))?;
+        }
+        let table = RopeTable::new(&spec).map_err(|e| refuse(format!("the rope table: {e}")))?;
+        Ok(rope_rows(&table, ctx, rot))
     }
 
     /// Site `s` as its own buffer, written from its part.
@@ -391,10 +457,12 @@ impl<'a> Loader<'a> {
         let mixer = match &layer.mixer {
             MixerLayout::Delta(d) => MixerBufs::Delta(delta(self, d)?),
             MixerLayout::Attention(a) => MixerBufs::Attention(attention(self, a)?),
+            MixerLayout::ShortConv(c) => MixerBufs::ShortConv(short_conv(self, c)?),
         };
         Ok(LayerBufs {
             mixer,
             ffn: ffn(self, self.device, &layer.ffn)?,
+            post: layer.post.as_ref().map(|p| post(self, p)).transpose()?,
         })
     }
 }
@@ -430,7 +498,9 @@ fn bytes_of<T: Elem>(b: &MetalBuffer<T>) -> u64 {
 fn attn_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&AttnBufs, SessionError> {
     match &layer.mixer {
         MixerBufs::Attention(a) => Ok(a),
-        MixerBufs::Delta(_) => Err(refuse(format!("{kind:?}: layer {l} is no attention layer"))),
+        MixerBufs::Delta(_) | MixerBufs::ShortConv(_) => {
+            Err(refuse(format!("{kind:?}: layer {l} is no attention layer")))
+        }
     }
 }
 
@@ -438,7 +508,20 @@ fn attn_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&AttnBufs, Se
 fn delta_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&DeltaBufs, SessionError> {
     match &layer.mixer {
         MixerBufs::Delta(d) => Ok(d),
-        MixerBufs::Attention(_) => Err(refuse(format!("{kind:?}: layer {l} is no delta layer"))),
+        MixerBufs::Attention(_) | MixerBufs::ShortConv(_) => {
+            Err(refuse(format!("{kind:?}: layer {l} is no delta layer")))
+        }
+    }
+}
+
+/// Layer `layer`'s short conv buffers for the byte rule, or the named
+/// refusal.
+fn conv_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&ConvBufs, SessionError> {
+    match &layer.mixer {
+        MixerBufs::ShortConv(c) => Ok(c),
+        MixerBufs::Delta(_) | MixerBufs::Attention(_) => Err(refuse(format!(
+            "{kind:?}: layer {l} is no short conv layer"
+        ))),
     }
 }
 
@@ -454,6 +537,12 @@ fn rope_rows(table: &RopeTable, ctx: usize, rot: usize) -> Vec<f32> {
         table.push(pos, Direction::Forward, &mut out);
     }
     out
+}
+
+/// The stream-sized buffers a layer's out projection touches: the residual,
+/// read and written (2), or on a sandwich the join buffer, written (1).
+fn stream_of(layer: &LayerBufs) -> u64 {
+    if layer.post.is_some() { 1 } else { 2 }
 }
 
 impl Arena {
@@ -481,8 +570,12 @@ impl Arena {
         for (l, layer) in g.layers.iter().enumerate() {
             layers.push(load.layer(layer).map_err(|e| at_layer(l, e))?);
         }
-        let mut rope = device.buffer(Elems(g.rope_len))?;
-        rope.write(&rope_rows(&g.rope, ctx, geom.attn.rot))?;
+        let mut ropes = Vec::with_capacity(g.ropes.len());
+        for r in &g.ropes {
+            let mut table = device.buffer(Elems(g.rope_len))?;
+            table.write(&load.rope(r, ctx, geom.attn.rot)?)?;
+            ropes.push(table);
+        }
         let mut lane = device.buffer(Elems(LANES))?;
         lane.write(&LANE_WORDS)?;
         Ok(Arena {
@@ -506,7 +599,9 @@ impl Arena {
             attn: zeroed(device, g.attn_out)?,
             attn_partials: zeroed(device, g.attn_partials)?,
             attn_ticket: zeroed(device, 1)?,
-            rope,
+            conv_y: g.has_conv().then(|| zeroed(device, hidden)).transpose()?,
+            join: g.has_join().then(|| zeroed(device, hidden)).transpose()?,
+            ropes,
             h: zeroed(device, geom.experts.slots * geom.experts.k)?,
             logits: zeroed(device, vocab)?,
             candidates: zeroed(device, head_groups(vocab))?,
@@ -532,14 +627,26 @@ impl Arena {
                 } else {
                     FfnKind::Dense
                 };
+                let residual = if l.post.is_some() {
+                    Residual::Sandwich
+                } else {
+                    Residual::Plain
+                };
                 match &l.mixer {
                     MixerBufs::Delta(d) => Layer::Delta {
                         qkv: d.p1.projection(),
                         ffn,
+                        residual,
                     },
                     MixerBufs::Attention(a) => Layer::Attention {
                         v: a.p1.projection(),
                         ffn,
+                        residual,
+                    },
+                    MixerBufs::ShortConv(c) => Layer::ShortConv {
+                        in_proj: c.p1.projection(),
+                        ffn,
+                        residual,
                     },
                 }
             })
@@ -558,8 +665,9 @@ impl Arena {
     /// and writes (the residual, the projections' output, the experts'
     /// rows, the norms, the logits and the router's small outputs); and the
     /// state the group reads and writes (the attention's key and value
-    /// rows — the live keys read, the token's own row written — and the
-    /// delta state's read and written lanes with the conv ring).
+    /// rows — the live keys of its window read, the token's own row written
+    /// — the delta state's read and written lanes with the conv ring, and a
+    /// short conv's ring rows).
     pub(super) fn group_bytes(
         &self,
         kind: GroupKind,
@@ -596,11 +704,12 @@ impl Arena {
                     state: 0,
                 })
             }
-            GroupKind::AttnP1 | GroupKind::DeltaP1 => {
+            GroupKind::AttnP1 | GroupKind::DeltaP1 | GroupKind::ConvP1 => {
                 no_ids()?;
                 let l = bufs()?;
                 let p1 = match kind {
                     GroupKind::AttnP1 => &attn_of(l, layer, kind)?.p1,
+                    GroupKind::ConvP1 => &conv_of(l, layer, kind)?.p1,
                     _ => &delta_of(l, layer, kind)?.p1,
                 };
                 let out_end = p1.parts.iter().map(|p| p.out_end).max().unwrap_or(0);
@@ -615,10 +724,13 @@ impl Arena {
             GroupKind::AttnFlash => {
                 no_ids()?;
                 let a = attn_of(bufs()?, layer, kind)?;
-                let n_keys = u64::from(pos) + 1;
+                // The keys the layer attends: the last `window` of the live
+                // keys, or all of them.
+                let live = pos + 1;
+                let n_keys = u64::from(a.window.map_or(live, |w| live.min(w)));
                 let attn = &self.geom.attn;
                 let kv_row = count_u64(attn.kv_heads * attn.head, "a cache row") * 2;
-                let segments = segments_for_keys(pos + 1);
+                let segments = segments_for_window(live, a.window);
                 let parts = attn
                     .partials_len(segments as usize)
                     .ok_or_else(|| refuse("the attention partials do not fit"))?;
@@ -632,20 +744,66 @@ impl Arena {
                 Ok(GroupBytes {
                     // The query's and the key's head norms.
                     weights: 2 * f32s(attn.head),
-                    // The query with its gate, the rope row, and the flash's
-                    // output.
-                    acts: f32s(a.q.len()) + f32s(attn.rot) + wrote,
+                    // The query with its gate, the output gate of one value a
+                    // query head where the layer has one, the rope row, and the
+                    // flash's output.
+                    acts: f32s(a.q.len())
+                        + a.gate.as_ref().map_or(0, |g| f32s(g.len()))
+                        + f32s(attn.rot)
+                        + wrote,
                     // The live keys and values read, this token's row written.
                     state: 2 * (n_keys * kv_row + kv_row),
                 })
             }
             GroupKind::AttnOut => {
                 no_ids()?;
-                let a = attn_of(bufs()?, layer, kind)?;
+                let l = bufs()?;
+                let a = attn_of(l, layer, kind)?;
                 Ok(GroupBytes {
                     weights: bytes_of(&a.out),
-                    // The attention output read, the residual read and written.
-                    acts: bytes_of(&self.attn) + 2 * f32s(self.hidden),
+                    // The attention output read; the residual read and
+                    // written, or the join buffer written on a sandwich.
+                    acts: bytes_of(&self.attn) + stream_of(l) * f32s(self.hidden),
+                    state: 0,
+                })
+            }
+            GroupKind::ConvCore => {
+                no_ids()?;
+                let c = conv_of(bufs()?, layer, kind)?;
+                Ok(GroupBytes {
+                    weights: bytes_of(&c.conv),
+                    // The `B | C | x` rows read, the conv's output written.
+                    acts: f32s(c.bcx.len()) + f32s(self.hidden),
+                    // The taps − 1 predecessor rows of the ring read and the
+                    // token's own row written.
+                    state: count_u64(c.taps, "the conv's taps") * f32s(self.hidden),
+                })
+            }
+            GroupKind::ConvOut => {
+                no_ids()?;
+                let l = bufs()?;
+                let c = conv_of(l, layer, kind)?;
+                Ok(GroupBytes {
+                    weights: bytes_of(&c.out),
+                    // The conv's output read; the residual read and written,
+                    // or the join buffer written on a sandwich.
+                    acts: f32s(self.hidden) + stream_of(l) * f32s(self.hidden),
+                    state: 0,
+                })
+            }
+            GroupKind::Join => {
+                no_ids()?;
+                let Some(post) = &bufs()?.post else {
+                    return Err(refuse(format!(
+                        "{kind:?}: layer {layer} adds its halves to the stream and runs no join"
+                    )));
+                };
+                Ok(GroupBytes {
+                    // A gain of either half: `hidden` values.
+                    weights: bytes_of(&post.gains[0]),
+                    // The half's output and the residual read, the residual
+                    // written.
+                    acts: 3 * f32s(self.hidden),
                     state: 0,
                 })
             }
@@ -714,7 +872,9 @@ impl Arena {
                 })
             }
             GroupKind::GateUp | GroupKind::Down => {
-                let f = &bufs()?.ffn;
+                let l = bufs()?;
+                let f = &l.ffn;
+                let layer_joins = l.post.is_some();
                 let picks = self.top_k;
                 let shared = usize::from(self.geom.experts.has_shared);
                 if ids.len() != picks + shared {
@@ -738,18 +898,34 @@ impl Arena {
                 // A pick reads its expert's slice of every stack it runs; the
                 // shared expert's parts run with the picks'.
                 let picks = count_u64(picks, "the picks");
+                // The FFN norm is a weight of the router's group; a dense FFN
+                // has no router, and the pair's group holds it.
+                let norm = bytes_of(&f.norm);
+                let (norm_weight, norm_read) = if f.router.is_none() {
+                    (norm, 0)
+                } else {
+                    (0, norm)
+                };
                 let (weights, acts) = match kind {
                     GroupKind::GateUp => (
                         picks * (expert(&f.gate)? + expert(&f.up)?)
                             + f.shared
                                 .as_ref()
-                                .map_or(0, |s| bytes_of(&s.gate) + bytes_of(&s.up)),
+                                .map_or(0, |s| bytes_of(&s.gate) + bytes_of(&s.up))
+                            + norm_weight,
                         // The residual normed as it is loaded, the ids read,
                         // the experts' rows written.
                         f32s(self.hidden)
-                            + bytes_of(&f.norm)
+                            + norm_read
                             + 4 * count_u64(ids.len(), "ids")
                             + bytes_of(&self.h),
+                    ),
+                    _ if layer_joins => (
+                        picks * expert(&f.down)?,
+                        // The one slot's row read, the join buffer written: a
+                        // sandwich's down stores its projection, and no route
+                        // weight scales it.
+                        bytes_of(&self.h) + f32s(self.hidden),
                     ),
                     _ => (
                         picks * expert(&f.down)?
@@ -796,6 +972,7 @@ impl Arena {
                     a.k_cache.zero();
                     a.v_cache.zero();
                 }
+                MixerBufs::ShortConv(c) => c.ring.zero(),
             }
             if let Some(router) = &mut layer.ffn.router {
                 router.ticket.zero();
@@ -835,6 +1012,29 @@ fn delta(load: &Loader<'_>, d: &DeltaLayout) -> Result<DeltaBufs, SessionError> 
     })
 }
 
+fn short_conv(load: &Loader<'_>, c: &ConvLayout) -> Result<ConvBufs, SessionError> {
+    let (p1, ranges) = load.p1(&c.p1)?;
+    let out = load.site(&c.out)?;
+    Ok(ConvBufs {
+        bcx: ranges[0].clone(),
+        p1,
+        conv: load.values(&c.conv)?,
+        out,
+        out_quant: c.out.quant,
+        ring: zeroed(load.device, c.ring)?,
+        taps: c.taps,
+        ring_rows: c.ring_rows,
+    })
+}
+
+/// The sandwich norms' gains of a layer, each a buffer of its own.
+fn post(load: &Loader<'_>, p: &PostLayout) -> Result<PostBufs, SessionError> {
+    let [mixer, ffn] = &p.gains;
+    Ok(PostBufs {
+        gains: [load.values(mixer)?, load.values(ffn)?],
+    })
+}
+
 fn attention(load: &Loader<'_>, a: &AttnLayout) -> Result<AttnBufs, SessionError> {
     let (p1, ranges) = load.p1(&a.p1)?;
     let out = load.site(&a.out)?;
@@ -843,6 +1043,9 @@ fn attention(load: &Loader<'_>, a: &AttnLayout) -> Result<AttnBufs, SessionError
         q: ranges[0].clone(),
         k: ranges[1].clone(),
         v: ranges[2].clone(),
+        gate: a.gate.then(|| ranges[3].clone()),
+        window: a.window,
+        rope: a.rope,
         p1,
         q_norm: load.values(&a.q_norm)?,
         k_norm: load.values(&a.k_norm)?,

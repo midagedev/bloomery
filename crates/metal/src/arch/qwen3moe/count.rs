@@ -10,15 +10,31 @@ use core::num::NonZeroU32;
 
 /// One layer of the token.
 ///
-/// `qkv` and `v` are the projection that is P1: one dispatch for each weight
-/// type its tensors hold, all in one group (`qkv` on a delta layer, `v` on
-/// an attention layer). `ffn` is how the layer's FFN picks its slots.
+/// `qkv`, `v` and `in_proj` are the projection that is P1: one dispatch for
+/// each weight type its tensors hold, all in one group (`qkv` on a delta
+/// layer, `v` on an attention layer, `in_proj` on a short conv layer). `ffn` is
+/// how the layer's FFN picks its slots, `residual` how its two halves join the
+/// stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
-    Delta { qkv: Projection, ffn: FfnKind },
+    Delta {
+        qkv: Projection,
+        ffn: FfnKind,
+        residual: Residual,
+    },
     /// A gated attention layer. Live keys past 64 add the memory dispatch.
-    Attention { v: Projection, ffn: FfnKind },
+    Attention {
+        v: Projection,
+        ffn: FfnKind,
+        residual: Residual,
+    },
+    /// A gated short conv layer.
+    ShortConv {
+        in_proj: Projection,
+        ffn: FfnKind,
+        residual: Residual,
+    },
 }
 
 /// How a layer's FFN picks its slots.
@@ -30,13 +46,72 @@ pub enum FfnKind {
     Dense,
 }
 
+/// How a layer's two halves, its mixer and its FFN, join the residual stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residual {
+    /// The half's out projection (the mixer's out, the FFN's down) adds into
+    /// the stream: no group of its own.
+    Plain,
+    /// The half's projection writes a buffer of its own and a norm-and-add
+    /// group joins it to the stream: two more groups a layer.
+    Sandwich,
+}
+
+/// The groups of a layer's mixer: P1, the core, its out.
+const MIXER_GROUPS: u32 = 3;
+
+/// The groups of a layer's FFN: the gate-up and the down, and the router's
+/// ahead of them when it has one.
+const FFN_GROUPS: u32 = 2;
+
+/// The groups a sandwich adds: a join after the mixer's out and one after the
+/// FFN's down.
+const JOIN_GROUPS: u32 = 2;
+
 impl Layer {
     /// How the layer's FFN picks its slots.
     #[must_use]
     pub const fn ffn(&self) -> FfnKind {
         match self {
-            Layer::Delta { ffn, .. } | Layer::Attention { ffn, .. } => *ffn,
+            Layer::Delta { ffn, .. }
+            | Layer::Attention { ffn, .. }
+            | Layer::ShortConv { ffn, .. } => *ffn,
         }
+    }
+
+    /// How the layer's two halves join the stream.
+    #[must_use]
+    pub const fn residual(&self) -> Residual {
+        match self {
+            Layer::Delta { residual, .. }
+            | Layer::Attention { residual, .. }
+            | Layer::ShortConv { residual, .. } => *residual,
+        }
+    }
+
+    /// The dispatches of the layer's P1: its group's size.
+    #[must_use]
+    pub const fn p1(&self) -> Projection {
+        match self {
+            Layer::Delta { qkv, .. } => *qkv,
+            Layer::Attention { v, .. } => *v,
+            Layer::ShortConv { in_proj, .. } => *in_proj,
+        }
+    }
+
+    /// The groups the layer encodes: its mixer's three, its FFN's two and a
+    /// router's ahead of them, and a sandwich's two joins.
+    #[must_use]
+    pub const fn groups(&self) -> u32 {
+        let router = match self.ffn() {
+            FfnKind::Routed => 1,
+            FfnKind::Dense => 0,
+        };
+        let joins = match self.residual() {
+            Residual::Plain => 0,
+            Residual::Sandwich => JOIN_GROUPS,
+        };
+        MIXER_GROUPS + FFN_GROUPS + router + joins
     }
 }
 
@@ -102,35 +177,28 @@ pub struct TokenCount {
 
 /// The groups and the dispatches one token encodes for `layers`.
 ///
-/// The embed and the head are the 2. Each layer adds six groups: P1, the
-/// mixer, its out, the router, the gate-up and the down; a layer of a dense
-/// FFN has no router, so five. Those already include the flash — the
-/// attention's fold runs inside it, so past the segment rule's waterline the
-/// count is the same — and the FFN norm, which the router and the gate-up
-/// each apply as they load the residual (a dense layer's gate-up alone). A
-/// projection of more than one dispatch adds the rest. An unfolded ticket
-/// adds one group for each routed layer's router and one for the head. A
-/// count that does not fit `u32` panics by name.
+/// The embed and the head are the 2. Each layer adds [`Layer::groups`]: P1,
+/// the mixer, its out, the router, the gate-up and the down, so six; a layer
+/// of a dense FFN has no router, so five; a sandwich adds a join after the
+/// mixer's out and one after the down, so seven. Those already include the
+/// flash — the attention's fold runs inside it, so past the segment rule's
+/// waterline the count is the same — and the FFN norm, which the router and
+/// the gate-up each apply as they load the residual (a dense layer's gate-up
+/// alone). A projection of more than one dispatch adds the rest. An unfolded
+/// ticket adds one group for each routed layer's router and one for the head.
+/// A count that does not fit `u32` panics by name.
 pub fn token_count(layers: &[Layer], _live: LiveKeys, ticket: Ticket) -> TokenCount {
-    let mut n = 0u32;
+    let mut in_layers = 0u32;
     let mut routers = 0u32;
     let mut n_split = 0u32;
     for layer in layers {
-        n = fit("layer", n.checked_add(1));
-        let p1 = match layer {
-            Layer::Delta { qkv, .. } => qkv,
-            Layer::Attention { v, .. } => v,
-        };
-        n_split = fit("P1", n_split.checked_add(p1.dispatches() - 1));
+        in_layers = fit("layer groups", in_layers.checked_add(layer.groups()));
+        n_split = fit("P1", n_split.checked_add(layer.p1().dispatches() - 1));
         if layer.ffn() == FfnKind::Routed {
             routers = fit("router", routers.checked_add(1));
         }
     }
-    let per_layer = fit("group", 5u32.checked_mul(n));
-    let mut groups = fit(
-        "group",
-        2u32.checked_add(fit("group", per_layer.checked_add(routers))),
-    );
+    let mut groups = fit("group", 2u32.checked_add(in_layers));
     let mut dispatches = fit("dispatch", groups.checked_add(n_split));
     if matches!(ticket, Ticket::Unfolded) {
         let extra = fit("group", routers.checked_add(1));
@@ -153,7 +221,7 @@ fn fit(what: &str, n: Option<u32>) -> u32 {
 /// segment of keys also folds its partials; the gate-up group and the down
 /// group each carry the shared expert's part with the routed picks' — the
 /// pair and the fold run them together, so no kind of the shared expert
-/// stands alone.
+/// stands alone. A sandwich's join is one kind for both halves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GroupKind {
     /// The token's embedding row.
@@ -171,6 +239,15 @@ pub enum GroupKind {
     DeltaCore,
     /// The delta step's head-norm projection back to the residual.
     DeltaOut,
+    /// A short conv layer's P1: the norm on load and its input projection.
+    ConvP1,
+    /// The short conv over the layer's ring.
+    ConvCore,
+    /// The conv's output projection, into a buffer of its own when the layer
+    /// is a sandwich, else into the residual.
+    ConvOut,
+    /// A sandwich's join: the half's output normed and added to the stream.
+    Join,
     /// The router: the routed logits, the picks and their weights. A dense
     /// FFN has none.
     Router,
@@ -195,6 +272,10 @@ impl GroupKind {
             GroupKind::DeltaP1 => "delta_p1",
             GroupKind::DeltaCore => "delta_core",
             GroupKind::DeltaOut => "delta_out",
+            GroupKind::ConvP1 => "conv_p1",
+            GroupKind::ConvCore => "conv_core",
+            GroupKind::ConvOut => "conv_out",
+            GroupKind::Join => "join",
             GroupKind::Router => "router",
             GroupKind::GateUp => "gate_up",
             GroupKind::Down => "down",
@@ -204,7 +285,7 @@ impl GroupKind {
 }
 
 /// Every kind, in the token's walk order: the order a profile's lines print.
-pub const KINDS: [GroupKind; 11] = [
+pub const KINDS: [GroupKind; 15] = [
     GroupKind::Embed,
     GroupKind::AttnP1,
     GroupKind::AttnFlash,
@@ -212,6 +293,10 @@ pub const KINDS: [GroupKind; 11] = [
     GroupKind::DeltaP1,
     GroupKind::DeltaCore,
     GroupKind::DeltaOut,
+    GroupKind::ConvP1,
+    GroupKind::ConvCore,
+    GroupKind::ConvOut,
+    GroupKind::Join,
     GroupKind::Router,
     GroupKind::GateUp,
     GroupKind::Down,
@@ -248,6 +333,7 @@ mod tests {
         Layer::Delta {
             qkv,
             ffn: FfnKind::Routed,
+            residual: Residual::Plain,
         }
     }
 
@@ -255,6 +341,7 @@ mod tests {
         Layer::Attention {
             v,
             ffn: FfnKind::Routed,
+            residual: Residual::Plain,
         }
     }
 
@@ -263,14 +350,45 @@ mod tests {
         layers
             .iter()
             .map(|l| match *l {
-                Layer::Delta { qkv, .. } => Layer::Delta {
+                Layer::Delta { qkv, residual, .. } => Layer::Delta {
                     qkv,
                     ffn: FfnKind::Dense,
+                    residual,
                 },
-                Layer::Attention { v, .. } => Layer::Attention {
+                Layer::Attention { v, residual, .. } => Layer::Attention {
                     v,
                     ffn: FfnKind::Dense,
+                    residual,
                 },
+                Layer::ShortConv {
+                    in_proj, residual, ..
+                } => Layer::ShortConv {
+                    in_proj,
+                    ffn: FfnKind::Dense,
+                    residual,
+                },
+            })
+            .collect()
+    }
+
+    /// LFM3-1.7B's 24 layers, `ccFcScFcScFcScFcScFcScFc`: a short conv (c), a
+    /// full attention layer (F) or a sliding one (S), each over a dense FFN
+    /// and a sandwich, each P1 one dispatch.
+    fn lfm3_target() -> Vec<Layer> {
+        "ccFcScFcScFcScFcScFcScFc"
+            .chars()
+            .map(|c| match c {
+                'c' => Layer::ShortConv {
+                    in_proj: Projection::ONE,
+                    ffn: FfnKind::Dense,
+                    residual: Residual::Sandwich,
+                },
+                'F' | 'S' => Layer::Attention {
+                    v: Projection::ONE,
+                    ffn: FfnKind::Dense,
+                    residual: Residual::Sandwich,
+                },
+                other => panic!("no layer kind {other}"),
             })
             .collect()
     }
@@ -450,6 +568,76 @@ mod tests {
             TokenCount {
                 groups: 23,
                 dispatches: 25
+            }
+        );
+    }
+
+    /// A sandwich's two joins are two groups and two dispatches a layer, on
+    /// the delta, attention and short conv layers alike, and no layer's kind
+    /// changes the count of the rest: LFM3's 24 layers are 2 + 24 · 7 = 170
+    /// groups and 170 dispatches, 13 of them short conv and 11 attention.
+    /// Mutant: `JOIN_GROUPS` is 1, or `Layer::groups` counts the router of a
+    /// dense layer.
+    #[test]
+    fn a_sandwich_adds_two_groups_a_layer() {
+        let layers = lfm3_target();
+        let convs = layers
+            .iter()
+            .filter(|l| matches!(l, Layer::ShortConv { .. }))
+            .count();
+        assert_eq!((layers.len(), convs), (24, 13));
+        for ticket in [Ticket::Folded, Ticket::Unfolded] {
+            let got = token_count(&layers, LiveKeys::Within64, ticket);
+            let head = u32::from(matches!(ticket, Ticket::Unfolded));
+            assert_eq!(
+                got,
+                TokenCount {
+                    groups: 170 + head,
+                    dispatches: 170 + head
+                },
+                "{ticket:?}"
+            );
+        }
+        // The same layers with the plain add: five groups a layer.
+        let plain: Vec<Layer> = layers
+            .iter()
+            .map(|l| match *l {
+                Layer::ShortConv { in_proj, ffn, .. } => Layer::ShortConv {
+                    in_proj,
+                    ffn,
+                    residual: Residual::Plain,
+                },
+                Layer::Attention { v, ffn, .. } => Layer::Attention {
+                    v,
+                    ffn,
+                    residual: Residual::Plain,
+                },
+                Layer::Delta { qkv, ffn, .. } => Layer::Delta {
+                    qkv,
+                    ffn,
+                    residual: Residual::Plain,
+                },
+            })
+            .collect();
+        assert_eq!(
+            token_count(&plain, LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 122,
+                dispatches: 122
+            }
+        );
+        // A short conv's P1 of two dispatches adds one dispatch, no group.
+        let mut split = layers;
+        split[0] = Layer::ShortConv {
+            in_proj: Projection::TWO,
+            ffn: FfnKind::Dense,
+            residual: Residual::Sandwich,
+        };
+        assert_eq!(
+            token_count(&split, LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 170,
+                dispatches: 171
             }
         );
     }

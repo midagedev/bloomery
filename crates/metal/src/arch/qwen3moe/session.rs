@@ -30,13 +30,16 @@
 //! step is refused by name until [`Session::reset`].
 //!
 //! A checkpoint copies each delta layer's state lane at the position's parity
-//! and its whole conv ring. [`Session::checkpoint`] takes one at the position
-//! the session stands at, with no token ahead and the stream idle;
-//! [`Session::checkpoint_copy`] takes one at a position inside the last pass,
-//! from the copies that pass left ([`StateOut::after_rows`]).
-//! [`Session::cut`] back to a point copies that lane and ring back and stands
-//! there; a cut to 0 is a reset, which drops the points too. A cut the ledger
-//! refuses leaves the position and every store as they were.
+//! and its whole conv ring, and each short conv layer's whole ring.
+//! [`Session::checkpoint`] takes one at the position the session stands at,
+//! with no token ahead and the stream idle; [`Session::checkpoint_copy`] takes
+//! one at a position inside the last pass, from the copies that pass left
+//! ([`StateOut::after_rows`]).
+//! [`Session::cut`] back to a point copies those lanes and rings back and
+//! stands there; a cut to 0 is a reset, which drops the points too. A cut the
+//! ledger refuses leaves the position and every store as they were. A file
+//! with a recurrent store of either kind has checkpoints; only a file with
+//! none (its caches hold every position) has none.
 //!
 //! [`Session::pass`] runs more than a step's window of ids as one pass: every
 //! layer once over all the rows, its GEMMs and row kernels over the rows
@@ -50,7 +53,8 @@
 //! at its checkpoint marks ([`Session::prefill`]). A pass may also leave
 //! copies of the delta layers' lanes and rings after rows inside it: each is
 //! the state the pass held after that row, and the pass's own bits do not
-//! move.
+//! move. A file with a short conv layer takes no such copies: a pass that asks
+//! for one is refused by name.
 //!
 //! Every buffer the kernels bind is registered into the stream's residency
 //! set when the session allocates it, and the open waits for the set to be
@@ -80,17 +84,19 @@ use bloomery_device::fault::Fault;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
+use chain::arch::qwen3moe::plan::{
+    DeltaPlan, FfnPlan, FfnRoute, GqaPlan, LayerPlan, ResidualPlan, ShortConvPlan, SiteTy,
+};
 use chain::arch::qwen3moe::read::Sites35;
 use chain::arch::qwen3moe::walk::Walk;
 use model_hf::ModelFile;
 use runtime::prompt::PrefillMode;
 use runtime::seqstate::Kept;
 
-use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
+use super::arena::{Arena, LANES, LayerBufs, MixerBufs, lane_of, slot_of};
 use super::check;
 use super::count::{GroupBytes, GroupKind, Layer};
-use super::ops::{Feed, MetalOps, RowsCtx};
+use super::ops::{Feed, Half, MetalOps, RowsCtx};
 use super::rows::{RowsArena, SnapBufs};
 use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints, Restore};
@@ -99,7 +105,7 @@ use crate::encode::EncodeCount;
 use crate::geom::Geometry;
 use crate::handle::Handle;
 use crate::instance::Instance;
-use crate::kernels::{Kernels, PASS_ROWS, SNAPS, segments_for_keys};
+use crate::kernels::{Kernels, PASS_ROWS, SNAPS};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
 use crate::stream::{
@@ -486,6 +492,9 @@ pub enum Op {
     DeltaIn(usize),
     DeltaCore(usize),
     DeltaOut(usize),
+    ConvIn(usize),
+    ConvCore(usize),
+    ConvOut(usize),
     Route(usize),
     Experts(usize),
     Head,
@@ -512,6 +521,8 @@ pub enum Node {
     DeltaState(usize),
     /// Layer `l`'s conv ring: every slot of the conv input rows.
     DeltaRing(usize),
+    /// Layer `l`'s short conv ring: every slot of the conv's `B ⊙ x` rows.
+    ConvRing(usize),
     /// The attention output after its gate.
     AttnOut,
     /// Layer `l`'s cache row `pos`, every key (or value) head, as f32.
@@ -556,6 +567,12 @@ impl Probe<'_> {
             Some(MixerBufs::Attention(at)) => Ok(at),
             _ => Err(refuse(format!("{node:?}: layer {l} is no attention layer"))),
         };
+        let conv = |l: usize| match a.layers.get(l).map(|x| &x.mixer) {
+            Some(MixerBufs::ShortConv(c)) => Ok(c),
+            _ => Err(refuse(format!(
+                "{node:?}: layer {l} is no short conv layer"
+            ))),
+        };
         let ffn = |l: usize| {
             a.layers
                 .get(l)
@@ -584,6 +601,7 @@ impl Probe<'_> {
                 read(&delta(l)?.state, at..at + lane)
             }
             Node::DeltaRing(l) => whole(&delta(l)?.ring),
+            Node::ConvRing(l) => whole(&conv(l)?.ring),
             Node::AttnOut => whole(&a.attn),
             Node::KeyRow(l, pos) | Node::ValueRow(l, pos) => {
                 let at = attn(l)?;
@@ -646,9 +664,10 @@ pub struct Session {
     /// The step clock, when a caller started one; `None` steps and times
     /// nothing.
     clock: Option<StepClock>,
-    /// Each delta layer's state lane and conv ring, at the positions a
-    /// prompt call takes; none for a file of no recurrent store, whose
-    /// caches hold every position below the one it stands at.
+    /// Each delta layer's state lane and conv ring and each short conv
+    /// layer's ring, at the positions a prompt call takes; none for a file of
+    /// no recurrent store, whose caches hold every position below the one it
+    /// stands at.
     checkpoints: Option<Checkpoints>,
     /// The device the mark copies are opened on, by the first pass that
     /// takes one when the open did not make them.
@@ -727,6 +746,9 @@ pub struct Passed {
     pub id: u32,
     pub count: EncodeCount,
 }
+
+/// A recurrent store's pages, the range a checkpoint copies and its name.
+type Store<'a> = (&'a MetalBuffer<f32>, Range<usize>, &'static str);
 
 impl Session {
     /// The instance the file at `path` selects by its shape: the library a
@@ -854,7 +876,8 @@ impl Session {
         let load = started.elapsed();
         let started = Instant::now();
         let mut rows = RowsArena::open(alloc, &arena, pass_rows_max(&checked.geom).min(arena.ctx))?;
-        // A file of no recurrent store has nothing a mark copies.
+        // A file with no delta layer has nothing a mark copies: a short conv
+        // ring is not copied inside a pass (the pass is refused by name).
         let stores = arena
             .layers
             .iter()
@@ -1198,6 +1221,18 @@ impl Session {
             return Err(refuse(format!(
                 "a pass of {m} ids with copies after rows {after:?}: at most {SNAPS}, ascending, \
                  each a row of the pass"
+            )));
+        }
+        if !after.is_empty()
+            && self
+                .arena
+                .layers
+                .iter()
+                .any(|l| matches!(l.mixer, MixerBufs::ShortConv(_)))
+        {
+            return Err(refuse(format!(
+                "a pass of {m} ids with copies after rows {after:?}: a file with a short conv layer \
+                 takes none, the ring's copy is not run"
             )));
         }
         let from = self.pos;
@@ -1633,10 +1668,10 @@ impl Session {
 
     /// A checkpoint at the position, the stream idle: the token ahead is
     /// waited out and dropped first, then each delta layer's state lane at
-    /// the position's parity and its ring are copied once, from the shared
-    /// pages straight into the point's slot. A file of no recurrent store
-    /// has nothing to copy: its caches hold the position. Refused while the
-    /// session is poisoned.
+    /// the position's parity and its ring, and each short conv layer's ring,
+    /// are copied once, from the shared pages straight into the point's slot.
+    /// A file of no recurrent store has nothing to copy: its caches hold the
+    /// position. Refused while the session is poisoned.
     pub fn checkpoint(&mut self) -> Result<(), SessionError> {
         self.take_point(self.pos, None)
     }
@@ -1663,15 +1698,16 @@ impl Session {
         }
     }
 
-    /// The point at `at` from each delta layer's live stores (`copy` none:
-    /// the lane at `at`'s parity, `at` the position) or from the last pass's
-    /// copy `copy`, after the stream is idle. Refused while poisoned.
+    /// The point at `at` from each recurrent layer's live stores (`copy` none:
+    /// a delta layer's lane at `at`'s parity, `at` the position, and each
+    /// ring) or from the last pass's copy `copy`, after the stream is idle. A
+    /// short conv layer has no pass copy. Refused while poisoned.
     fn take_point(&mut self, at: u32, copy: Option<usize>) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
         }
         self.quiesce()?;
-        let lane_len = lane_len(&self.arena.geom)?;
+        let lane_len = held_lane_len(&self.arena)?;
         let live = lane_of(at)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
@@ -1687,55 +1723,69 @@ impl Session {
         };
         let mut views = Vec::new();
         for (l, layer) in self.arena.layers.iter().enumerate() {
-            let MixerBufs::Delta(d) = &layer.mixer else {
-                continue;
-            };
-            let (pages, lane_at, ring_at) = match copies {
-                None => ((&d.state, &d.ring), live, 0),
-                Some((k, c)) => {
-                    let at =
-                        c.at.get(l)
-                            .copied()
-                            .flatten()
-                            .ok_or_else(|| refuse(format!("delta layer {l} has no copies")))?;
-                    (
-                        (&c.lane, &c.ring),
-                        at.lane + k * lane_len,
-                        at.ring + k * at.ring_len,
-                    )
+            // The layer's stores in the order `store_lens` lists them: each
+            // one's pages, the range its copy covers and its name.
+            let stores: [Option<Store<'_>>; 2] = match &layer.mixer {
+                MixerBufs::Attention(_) => [None, None],
+                MixerBufs::ShortConv(c) => {
+                    if copy.is_some() {
+                        return Err(refuse(format!("short conv layer {l} has no pass copies")));
+                    }
+                    let ring = 0..c.ring.pages().len().get();
+                    [Some((&c.ring, ring, "a short conv ring")), None]
+                }
+                MixerBufs::Delta(d) => {
+                    let (pages, lane_at, ring_at) = match copies {
+                        None => ((&d.state, &d.ring), live, 0),
+                        Some((k, c)) => {
+                            let at =
+                                c.at.get(l).copied().flatten().ok_or_else(|| {
+                                    refuse(format!("delta layer {l} has no copies"))
+                                })?;
+                            (
+                                (&c.lane, &c.ring),
+                                at.lane + k * lane_len,
+                                at.ring + k * at.ring_len,
+                            )
+                        }
+                    };
+                    let ring_len = d.ring.len().get();
+                    [
+                        Some((pages.0, lane_at..lane_at + lane_len, "a delta state lane")),
+                        Some((pages.1, ring_at..ring_at + ring_len, "a delta conv ring")),
+                    ]
                 }
             };
-            let ring_len = d.ring.len().get();
-            // SAFETY: `quiesce` above left the stream idle (no token ahead,
-            // every committed buffer done), and the views borrow the arena
-            // and the rows arena, whose device work and host writes all go
-            // through `&mut self`, until the take below has copied them:
-            // nothing writes the pages while they are read.
-            let (lane, ring) = unsafe { (pages.0.pages().as_slice(), pages.1.pages().as_slice()) };
-            views.push(
-                lane.get(lane_at..lane_at + lane_len)
-                    .ok_or_else(|| refuse("a delta state lane lies past its buffer"))?,
-            );
-            views.push(
-                ring.get(ring_at..ring_at + ring_len)
-                    .ok_or_else(|| refuse("a delta conv ring lies past its buffer"))?,
-            );
+            for (buf, range, what) in stores.into_iter().flatten() {
+                // SAFETY: `quiesce` above left the stream idle (no token
+                // ahead, every committed buffer done), and the views borrow
+                // the arena and the rows arena, whose device work and host
+                // writes all go through `&mut self`, until the take below has
+                // copied them: nothing writes the pages while they are read.
+                let pages = unsafe { buf.pages().as_slice() };
+                views.push(
+                    pages
+                        .get(range)
+                        .ok_or_else(|| refuse(format!("{what} lies past its buffer")))?,
+                );
+            }
         }
         match self.checkpoints.as_mut() {
             Some(c) => c.take(at, &views).map_err(checkpoint_error),
             // No recurrent store: the caches hold the position as they are.
+            None if has_recurrent_store(&self.arena) => Err(no_checkpoints()),
             None => Ok(()),
         }
     }
 
     /// Cut to position `n`. A cut to 0 resets, which drops the checkpoints. A
     /// cut to the position does nothing. A cut to a checkpoint waits out the
-    /// token ahead, copies that position's state lane and conv ring back once,
-    /// from the point's slot straight into the stores, and stands at `n`. Any
-    /// other `n` is the ledger's refusal, by name, after the token ahead is
-    /// dropped: the position and every store stay. A copy back that fails
-    /// resets the session before the error returns. Refused while the session
-    /// is poisoned.
+    /// token ahead, copies that position's state lanes and conv rings back
+    /// once, from the point's slot straight into the stores, and stands at
+    /// `n`. Any other `n` is the ledger's refusal, by name, after the token
+    /// ahead is dropped: the position and every store stay. A copy back that
+    /// fails resets the session before the error returns. Refused while the
+    /// session is poisoned.
     pub fn cut(&mut self, n: u32) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
@@ -1747,28 +1797,39 @@ impl Session {
             return Ok(());
         }
         self.quiesce()?;
-        let lane_len = lane_len(&self.arena.geom)?;
+        let lane_len = held_lane_len(&self.arena)?;
         let start = lane_of(n)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
-        // The lane `lane_of(n)` of each delta state and the whole ring. The
-        // other lane is the one the next token writes, so it is left as it is.
+        let recurrent = has_recurrent_store(&self.arena);
+        // The lane `lane_of(n)` of each delta state and the whole ring of
+        // each delta and short conv layer. The other lane is the one the next
+        // token writes, so it is left as it is.
         let mut dst = Vec::new();
         for layer in &mut self.arena.layers {
-            let MixerBufs::Delta(d) = &mut layer.mixer else {
-                continue;
-            };
-            dst.push(Restore {
-                buf: &mut d.state,
-                at: Elems(start),
-            });
-            dst.push(Restore {
-                buf: &mut d.ring,
-                at: Elems(0),
-            });
+            match &mut layer.mixer {
+                MixerBufs::Attention(_) => {}
+                MixerBufs::Delta(d) => {
+                    dst.push(Restore {
+                        buf: &mut d.state,
+                        at: Elems(start),
+                    });
+                    dst.push(Restore {
+                        buf: &mut d.ring,
+                        at: Elems(0),
+                    });
+                }
+                MixerBufs::ShortConv(c) => dst.push(Restore {
+                    buf: &mut c.ring,
+                    at: Elems(0),
+                }),
+            }
         }
         let cut = match self.checkpoints.as_mut() {
             Some(c) => c.cut(n, self.pos, &mut dst),
+            // A recurrent store with no checkpoints would keep a position
+            // whose store no point holds.
+            None if recurrent => return Err(no_checkpoints()),
             // No recurrent store: the caches hold every position below `n`,
             // and the next step's append overwrites the rows past it.
             None if n < self.pos => Ok(()),
@@ -1822,32 +1883,103 @@ fn lane_len(g: &Geometry) -> Result<usize, SessionError> {
         .ok_or_else(|| refuse("a delta state lane's length overflowed"))
 }
 
-/// Each delta layer's state lane, then its conv ring: none for a file of no
-/// delta layer. The state buffer is both lanes; a checkpoint copies one.
-fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
-    let lane_len = lane_len(&arena.geom)?;
+/// What one layer holds that a checkpoint copies, by the lengths of its
+/// buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// An attention layer: its caches hold every position below the one the
+    /// session stands at.
+    Caches,
+    /// A delta layer: its state (both lanes) and its conv ring.
+    Delta { state: usize, ring: usize },
+    /// A short conv layer: its ring.
+    Conv { ring: usize },
+}
+
+impl Held {
+    fn of(layer: &LayerBufs) -> Held {
+        match &layer.mixer {
+            MixerBufs::Attention(_) => Held::Caches,
+            MixerBufs::Delta(d) => Held::Delta {
+                state: d.state.pages().len().get(),
+                ring: d.ring.pages().len().get(),
+            },
+            MixerBufs::ShortConv(c) => Held::Conv {
+                ring: c.ring.pages().len().get(),
+            },
+        }
+    }
+}
+
+/// Whether any layer of `arena` holds a recurrent store: the file has
+/// checkpoints exactly then.
+fn has_recurrent_store(arena: &Arena) -> bool {
+    arena
+        .layers
+        .iter()
+        .any(|layer| Held::of(layer) != Held::Caches)
+}
+
+/// The refusal of a file with a recurrent store and no checkpoints.
+fn no_checkpoints() -> SessionError {
+    refuse("a file with a recurrent store holds no checkpoints")
+}
+
+/// f32s of one delta state lane of the file's delta layers: none for a file
+/// with no delta layer, whose geometry holds no lane.
+fn held_lane_len(arena: &Arena) -> Result<usize, SessionError> {
+    if arena
+        .layers
+        .iter()
+        .any(|layer| matches!(layer.mixer, MixerBufs::Delta(_)))
+    {
+        lane_len(&arena.geom)
+    } else {
+        Ok(0)
+    }
+}
+
+/// The f32s of each store a checkpoint copies, in the order every layer lists
+/// them: a delta layer's state lane then its ring, a short conv layer's ring.
+/// None for a file with no recurrent store. The state buffer is both lanes; a
+/// checkpoint copies one.
+fn store_lens_of(
+    layers: impl IntoIterator<Item = Held>,
+    lane_len: usize,
+) -> Result<Vec<usize>, SessionError> {
     let both = lane_len
         .checked_mul(LANES)
         .ok_or_else(|| refuse("the delta state's length overflowed"))?;
     let mut lens = Vec::new();
-    for layer in &arena.layers {
-        let MixerBufs::Delta(d) = &layer.mixer else {
-            continue;
-        };
-        let state_len = d.state.pages().len().get();
-        if state_len != both {
-            return Err(refuse(format!(
-                "a delta state of {state_len} f32s; {LANES} lanes of {lane_len} are {both}"
-            )));
+    for held in layers {
+        match held {
+            Held::Caches => {}
+            Held::Delta { state, ring } => {
+                if state != both {
+                    return Err(refuse(format!(
+                        "a delta state of {state} f32s; {LANES} lanes of {lane_len} are {both}"
+                    )));
+                }
+                if ring == 0 {
+                    return Err(refuse("a conv ring of no f32s"));
+                }
+                lens.push(lane_len);
+                lens.push(ring);
+            }
+            Held::Conv { ring } => {
+                if ring == 0 {
+                    return Err(refuse("a short conv ring of no f32s"));
+                }
+                lens.push(ring);
+            }
         }
-        let ring_len = d.ring.pages().len().get();
-        if ring_len == 0 {
-            return Err(refuse("a conv ring of no f32s"));
-        }
-        lens.push(lane_len);
-        lens.push(ring_len);
     }
     Ok(lens)
+}
+
+/// [`store_lens_of`] over the arena's layers.
+fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
+    store_lens_of(arena.layers.iter().map(Held::of), held_lane_len(arena)?)
 }
 
 /// The traced step's ops: each op of [`MetalOps`] on its own command buffer,
@@ -1927,6 +2059,18 @@ where
 
     fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
         self.one(Op::DeltaOut(l.layer), |o| o.delta_out(l, d))
+    }
+
+    fn conv_in(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Op::ConvIn(l.layer), |o| o.conv_in(l, c))
+    }
+
+    fn conv_core(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Op::ConvCore(l.layer), |o| o.conv_core(l, c))
+    }
+
+    fn conv_out(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Op::ConvOut(l.layer), |o| o.conv_out(l, c))
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
@@ -2015,6 +2159,18 @@ impl ChainOps for PassLayers<'_> {
 
     fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
         self.one(Some(l.layer), |o| o.delta_out(l, d))
+    }
+
+    fn conv_in(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.conv_in(l, c))
+    }
+
+    fn conv_core(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.conv_core(l, c))
+    }
+
+    fn conv_out(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.conv_out(l, c))
     }
 
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
@@ -2196,6 +2352,18 @@ impl ChainOps for PassProfiler<'_> {
         self.one(Op::DeltaOut(l.layer), |o| o.delta_out(l, d))
     }
 
+    fn conv_in(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Op::ConvIn(l.layer), |o| o.conv_in(l, c))
+    }
+
+    fn conv_core(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Op::ConvCore(l.layer), |o| o.conv_core(l, c))
+    }
+
+    fn conv_out(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(Op::ConvOut(l.layer), |o| o.conv_out(l, c))
+    }
+
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
         if matches!(f.route, FfnRoute::Dense) {
             // No router, so no group of its own.
@@ -2215,8 +2383,9 @@ impl ChainOps for PassProfiler<'_> {
 
 /// The profiled step's groups: each group of [`MetalOps`] on its own command
 /// buffer, waited, its GPU interval read, one sample appended. The groups
-/// are the token's as the encoder counts them, so the walk's `attn_core`
-/// past one segment of keys and its `experts` are two groups each.
+/// are the token's as the encoder counts them, so the walk's `experts` is two
+/// groups (the gate-up and the down), and on a sandwich every half's out and
+/// the down are each followed by a join group.
 struct Profiler<'s> {
     stream: &'s MetalStream,
     kernels: &'s Kernels,
@@ -2229,6 +2398,15 @@ struct Profiler<'s> {
 }
 
 impl Profiler<'_> {
+    /// The join group of `half` on a sandwich layer; a plain residual has
+    /// none, and no group is sampled.
+    fn join(&mut self, l: LayerCtx<'_>, half: Half) -> Result<(), SessionError> {
+        if !matches!(l.plan.residual, ResidualPlan::Sandwich(_)) {
+            return Ok(());
+        }
+        self.one(GroupKind::Join, Some(l.layer), |o| o.join(l, half))
+    }
+
     fn one(
         &mut self,
         kind: GroupKind,
@@ -2283,15 +2461,14 @@ impl ChainOps for Profiler<'_> {
     }
 
     fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
-        let n_keys = self.pos + 1;
-        let segments = segments_for_keys(n_keys);
         self.one(GroupKind::AttnFlash, Some(l.layer), |o| {
-            o.attn_flash(l.layer, n_keys, segments)
+            o.attn_flash(l.layer)
         })
     }
 
-    fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
-        self.one(GroupKind::AttnOut, Some(l.layer), |o| o.attn_out(l, g))
+    fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::AttnOut, Some(l.layer), |o| o.attn_project(l))?;
+        self.join(l, Half::Mixer)
     }
 
     fn delta_in(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
@@ -2306,6 +2483,19 @@ impl ChainOps for Profiler<'_> {
         self.one(GroupKind::DeltaOut, Some(l.layer), |o| o.delta_out(l, d))
     }
 
+    fn conv_in(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::ConvP1, Some(l.layer), |o| o.conv_in(l, c))
+    }
+
+    fn conv_core(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::ConvCore, Some(l.layer), |o| o.conv_core(l, c))
+    }
+
+    fn conv_out(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::ConvOut, Some(l.layer), |o| o.conv_project(l))?;
+        self.join(l, Half::Mixer)
+    }
+
     fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
         if matches!(f.route, FfnRoute::Dense) {
             // No router, so no group of its own.
@@ -2318,7 +2508,8 @@ impl ChainOps for Profiler<'_> {
         self.one(GroupKind::GateUp, Some(l.layer), |o| {
             o.experts_pair(l.layer)
         })?;
-        self.one(GroupKind::Down, Some(l.layer), |o| o.experts_fold(l.layer))
+        self.one(GroupKind::Down, Some(l.layer), |o| o.experts_down(l))?;
+        self.join(l, Half::Ffn)
     }
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
@@ -2330,6 +2521,7 @@ impl ChainOps for Profiler<'_> {
 mod tests {
     use super::*;
     use crate::instance::REGISTERED;
+    use chain::linear::Ring;
 
     /// A session feeds its prompt calls in passes at every registered
     /// instance: the rows arm runs a layer that has a shared expert and one
@@ -2358,6 +2550,59 @@ mod tests {
         // A pass of the dense instance holds the family's most rows: its one
         // slot a row.
         assert_eq!(pass_rows_max(&g), CHECKPOINT_EVERY as usize);
+    }
+
+    /// A short conv layer's ring is a checkpointed store: a file of conv and
+    /// attention layers lists one store per conv layer, in layer order beside
+    /// a delta layer's lane and ring, so the file has checkpoints and a cut
+    /// restores its rings.
+    ///
+    /// Mutant: `store_lens_of` does nothing for `Held::Conv`: the list of the
+    /// conv layout is empty, the file has no checkpoints, and a cut keeps a
+    /// position whose rings nobody restored (`q_mark_cut`'s conv row).
+    #[test]
+    fn a_short_conv_ring_is_a_checkpointed_store() {
+        let ring = Ring::new(7).values(2048);
+        let lfm3 = "ccFcScFcScFcScFcScFcScFc".chars().map(|c| {
+            if c == 'c' {
+                Held::Conv { ring }
+            } else {
+                Held::Caches
+            }
+        });
+        assert_eq!(store_lens_of(lfm3, 0).unwrap(), vec![ring; 13]);
+        let lane = 4096;
+        let mixed = [
+            Held::Delta {
+                state: LANES * lane,
+                ring: 99,
+            },
+            Held::Caches,
+            Held::Conv { ring },
+        ];
+        assert_eq!(store_lens_of(mixed, lane).unwrap(), vec![lane, 99, ring]);
+    }
+
+    /// A file whose layers all hold caches lists no store and so has no
+    /// checkpoints: its caches hold every position below the one it stands
+    /// at.
+    ///
+    /// Mutant: `store_lens_of` pushes a store for `Held::Caches`.
+    #[test]
+    fn a_file_of_caches_lists_no_store() {
+        assert!(store_lens_of([Held::Caches; 4], 0).unwrap().is_empty());
+    }
+
+    /// A ring of no values, and a delta state that is not both lanes, are
+    /// refused by name: a store the checkpoint could not copy is no store.
+    ///
+    /// Mutant: delete the `ring == 0` refusal of `Held::Conv`, or the
+    /// `state != both` refusal of `Held::Delta`.
+    #[test]
+    fn a_store_that_cannot_be_copied_is_refused_by_name() {
+        let refusal = |held| store_lens_of([held], 8).unwrap_err().to_string();
+        assert!(refusal(Held::Conv { ring: 0 }).contains("short conv ring of no f32s"));
+        assert!(refusal(Held::Delta { state: 8, ring: 4 }).contains("2 lanes of 8 are 16"));
     }
 
     /// A geometry whose slots are not the picks and the shared slot the

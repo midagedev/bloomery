@@ -2,11 +2,13 @@
 //! op a GEMM or a row kernel over the rows arena.
 //!
 //! The groups of a layer, in the order the walk names them: the norm and the
-//! P1 GEMMs; the delta step over the rows (or the attention's append and
-//! flash, one launch for each run of rows that share a segment count), then
-//! the out projection, a GEMM adding into the residual; the FFN norm, the
-//! router's GEMM, the selection and the route table; the grouped experts and
-//! the combine. Each op closes its group with a barrier, as the step's do.
+//! P1 GEMMs; the delta step over the rows, the short conv over the rows and
+//! the ring's commit, or the attention's append and flash, then the out
+//! projection, a GEMM adding into the residual (on a sandwich a GEMM storing
+//! into the pass's normed-rows buffer, and the join that norms those rows
+//! into the stream); the FFN norm, the router's GEMM, the selection and the
+//! route table; the grouped experts and the combine. Each op closes its group
+//! with a barrier, as the step's do.
 //! A layer's slots are the routed picks and, when the instance's router has a
 //! shared row, the shared expert's: its gate GEMM, id, group and tensors are
 //! there only then. A layer of a dense FFN has no router, selection or table:
@@ -19,22 +21,75 @@
 //! is the token at its last position as far as the record goes.
 
 use bloomery_device::fault::LAYER_HEAD;
-use bloomery_device::{Buffer, Elems};
+use bloomery_device::{Buffer, Elems, WindowMut};
 use chain::ChainError;
+use chain::arch::qwen3moe::ops::LayerCtx;
+use chain::arch::qwen3moe::plan::ResidualPlan;
 
-use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
+use super::super::arena::{Arena, ConvBufs, LayerBufs, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::rows::FfnRows;
 use super::super::session::SessionError;
-use super::{MetalOps, WHAT, all, all_mut};
+use super::{Half, MetalOps, WHAT, all, all_mut, post_gain, refuse, rope_of};
+use crate::buffer::MetalBuffer;
+use crate::device::MetalDevice;
 use crate::kernels::{
-    AttentionPrefillParams, AttnCache, CombineParams, DeltaRowStrides, DeltaRowsParams, DeltaSnaps,
-    EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
-    HeadNormRowsParams, HeadParams, NormRowsParams, Operand, Quant, RouteSelectParams,
-    RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, route_table_words, route_tiles,
+    AttentionPrefillParams, AttnCache, AttnLayer, CombineParams, DeltaRowStrides, DeltaRowsParams,
+    DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
+    HeadNormRowsParams, HeadParams, NormAddRowsParams, NormRowsParams, Operand, Quant,
+    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams,
+    SwigluRowsParams, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
 pub(in super::super) const PASS_OPERAND: Operand = Operand::F16;
+
+/// Where the out GEMM of one half of a pass writes, and how: a plain residual
+/// adds into the stream in the residual epilogue; a sandwich stores into the
+/// pass's normed rows, which the projections' GEMMs have read by then, and
+/// [`MetalOps::rows_join`] norms them into the stream.
+fn half_out<'b>(
+    l: LayerCtx<'_>,
+    x: &'b mut MetalBuffer<f32>,
+    xn: &'b mut MetalBuffer<f32>,
+    len: usize,
+) -> Result<(WindowMut<'b, f32, MetalDevice>, GemmMode), SessionError> {
+    match &l.plan.residual {
+        ResidualPlan::Plain => Ok((x.window_mut(Elems(0), Elems(len))?, GemmMode::Residual)),
+        ResidualPlan::Sandwich(_) => Ok((xn.window_mut(Elems(0), Elems(len))?, GemmMode::Store)),
+    }
+}
+
+/// Layer `l`'s short conv buffers, or the named refusal for a layer of another
+/// mixer.
+fn conv_of_rows(layers: &mut [LayerBufs], l: usize) -> Result<&mut ConvBufs, SessionError> {
+    match &mut layers[l].mixer {
+        MixerBufs::ShortConv(c) => Ok(c),
+        MixerBufs::Delta(_) | MixerBufs::Attention(_) => Err(ChainError::shape(
+            WHAT,
+            format!("layer {l}: a short conv op on a layer of another mixer"),
+        )
+        .into()),
+    }
+}
+
+/// The weight bytes and the output columns `segments` of one dispatch of
+/// `quant` span: the extents a segmented launch holds its windows to.
+fn extents(quant: Quant, segments: &[Segment]) -> (usize, usize) {
+    let (mut weights, mut out) = (0, 0);
+    for s in segments {
+        let bytes = s.rows * (s.cols / quant.values_per_block()) * quant.block_bytes();
+        weights = weights.max(s.weight_blocks * quant.block_bytes() + bytes);
+        out = out.max(s.out_offset + s.rows);
+    }
+    (weights, out)
+}
+
+/// The elements `rows` rows of `width` values, `stride` apart, span: the last
+/// row ends where its values do, and the stride's gap after it is no row's. A
+/// GEMM holds its activation and output windows to exactly this length.
+fn strided_len(rows: usize, stride: usize, width: usize) -> usize {
+    (rows - 1) * stride + width
+}
 
 impl MetalOps<'_, '_> {
     /// The pass's step record slot: its last row's.
@@ -44,6 +99,13 @@ impl MetalOps<'_, '_> {
 
     fn no_rows<T>() -> Result<T, SessionError> {
         Err(ChainError::shape(WHAT, "a rows arm of ops built with no rows arena").into())
+    }
+
+    /// The refusal of a per-head gate over a pass arena with no gate rows.
+    fn no_gate_rows(l: usize) -> SessionError {
+        refuse(format!(
+            "layer {l}: a per-head gate over a pass arena with no gate rows"
+        ))
     }
 
     /// The refusal of a routed arm over a rows arena of a dense FFN.
@@ -88,7 +150,10 @@ impl MetalOps<'_, '_> {
         Ok(())
     }
 
-    /// Layer `l`'s P1: the norm of the rows, then one GEMM a weight type.
+    /// Layer `l`'s P1: the norm of the rows, then one GEMM a weight type. An
+    /// attention layer's per-head gate is not a column of the P1 rows: the
+    /// flash reads a row's gate contiguous, so the gate's segment leaves its
+    /// dispatch and has a GEMM of its own into the pass's gate rows.
     pub(super) fn rows_p1(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
@@ -100,12 +165,24 @@ impl MetalOps<'_, '_> {
             faults,
             eps,
             hidden,
+            geom,
             ..
         } = &mut *self.arena;
-        let p1 = match &layers[l].mixer {
-            MixerBufs::Delta(d) => &d.p1,
-            MixerBufs::Attention(a) => &a.p1,
+        let (p1, gate) = match &layers[l].mixer {
+            MixerBufs::Delta(d) => (&d.p1, None),
+            MixerBufs::Attention(a) => (&a.p1, a.gate.as_ref()),
+            MixerBufs::ShortConv(c) => (&c.p1, None),
         };
+        if let Some(g) = gate
+            && !p1
+                .parts
+                .iter()
+                .any(|part| part.segments.iter().any(|s| s.out_offset == g.start))
+        {
+            return Err(refuse(format!(
+                "layer {l}: the per-head gate is in no dispatch of the layer's P1"
+            )));
+        }
         self.kernels.norm_rows(
             self.enc,
             NormRowsParams {
@@ -123,13 +200,48 @@ impl MetalOps<'_, '_> {
         )?;
         self.enc.memory_barrier();
         let stride = rows.proj_stride;
+        let heads = geom.attn.query_heads;
         for part in &p1.parts {
+            // The gate's segment is the last of its dispatch, so the
+            // dispatch's others are a prefix of its list.
+            let at_gate =
+                gate.and_then(|g| part.segments.iter().position(|s| s.out_offset == g.start));
+            let segments = match at_gate {
+                None => &part.segments[..],
+                Some(i) if i + 1 == part.segments.len() => &part.segments[..i],
+                Some(_) => {
+                    return Err(refuse(format!(
+                        "layer {l}: the per-head gate is not the last segment of its dispatch"
+                    )));
+                }
+            };
+            if let Some(i) = at_gate {
+                let seg = part.segments[i];
+                if seg.rows != heads {
+                    return Err(refuse(format!(
+                        "layer {l}: a per-head gate of {} rows, the instance has {heads} query heads",
+                        seg.rows
+                    )));
+                }
+            }
             // The f32 projections run as the router's f32 GEMM, a segment a
             // dispatch, both operands f32.
             if part.quant == Quant::F32 {
-                for seg in &part.segments {
+                for seg in segments.iter().chain(at_gate.map(|i| &part.segments[i])) {
                     let at = seg.weight_blocks * part.quant.block_bytes();
                     let len = seg.rows * seg.cols * size_of::<f32>();
+                    let (y, y_stride) = if gate.is_some_and(|g| g.start == seg.out_offset) {
+                        let gate_rows = rows.gate.as_mut().ok_or_else(|| Self::no_gate_rows(l))?;
+                        (gate_rows.window_mut(Elems(0), Elems(m * heads))?, heads)
+                    } else {
+                        (
+                            rows.proj.window_mut(
+                                Elems(seg.out_offset),
+                                Elems(strided_len(m, stride, seg.rows)),
+                            )?,
+                            stride,
+                        )
+                    };
                     self.kernels.gemm_f32(
                         self.enc,
                         F32GemmParams {
@@ -141,11 +253,8 @@ impl MetalOps<'_, '_> {
                                 .cast::<f32>()?,
                             x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
                             x_stride: *hidden,
-                            y: rows.proj.window_mut(
-                                Elems(seg.out_offset),
-                                Elems((m - 1) * stride + seg.rows),
-                            )?,
-                            y_stride: stride,
+                            y,
+                            y_stride,
                             fault: &faults[slot],
                             layer: layer_word(l),
                         },
@@ -153,32 +262,62 @@ impl MetalOps<'_, '_> {
                 }
                 continue;
             }
-            self.kernels.gemm_seg(
-                self.enc,
-                GemmSegParams {
-                    quant: part.quant,
-                    segments: &part.segments,
-                    weights: all(&part.weights)?,
-                    x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
-                    x_stride: *hidden,
-                    acts: m,
-                    y: rows
-                        .proj
-                        .window_mut(Elems(0), Elems((m - 1) * stride + part.out_end))?,
-                    y_stride: stride,
-                    mode: GemmMode::Store,
-                    operand: PASS_OPERAND,
-                    fault: &faults[slot],
-                    layer: layer_word(l),
-                },
-            )?;
+            if !segments.is_empty() {
+                let (weight_end, out_end) = extents(part.quant, segments);
+                self.kernels.gemm_seg(
+                    self.enc,
+                    GemmSegParams {
+                        quant: part.quant,
+                        segments,
+                        weights: all(&part.weights)?.sub(Elems(0), Elems(weight_end))?,
+                        x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                        x_stride: *hidden,
+                        acts: m,
+                        y: rows
+                            .proj
+                            .window_mut(Elems(0), Elems(strided_len(m, stride, out_end)))?,
+                        y_stride: stride,
+                        mode: GemmMode::Store,
+                        operand: PASS_OPERAND,
+                        fault: &faults[slot],
+                        layer: layer_word(l),
+                    },
+                )?;
+            }
+            if let Some(i) = at_gate {
+                let seg = part.segments[i];
+                let at = seg.weight_blocks * part.quant.block_bytes();
+                let len = seg.rows
+                    * (seg.cols / part.quant.values_per_block())
+                    * part.quant.block_bytes();
+                let gate_rows = rows.gate.as_mut().ok_or_else(|| Self::no_gate_rows(l))?;
+                self.kernels.gemm(
+                    self.enc,
+                    GemmParams {
+                        quant: part.quant,
+                        rows: seg.rows,
+                        cols: seg.cols,
+                        acts: m,
+                        weights: all(&part.weights)?.sub(Elems(at), Elems(len))?,
+                        x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                        x_stride: *hidden,
+                        y: gate_rows.window_mut(Elems(0), Elems(m * heads))?,
+                        y_stride: heads,
+                        mode: GemmMode::Store,
+                        operand: PASS_OPERAND,
+                        fault: &faults[slot],
+                        layer: layer_word(l),
+                    },
+                )?;
+            }
         }
         self.enc.memory_barrier();
         Ok(())
     }
 
     /// Layer `l`'s attention over the pass: the prefill flash appends the
-    /// chunk's keys and values and runs every row against the cache.
+    /// chunk's keys and values and runs every row against the cache, over the
+    /// layer's window of keys and with its per-head gate where it has them.
     pub(super) fn rows_attn_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
         let from = self.pos;
@@ -188,7 +327,7 @@ impl MetalOps<'_, '_> {
         let rows = &mut *ctx.arena;
         let Arena {
             layers,
-            rope,
+            ropes,
             faults,
             eps,
             ctx: cache_rows,
@@ -198,16 +337,27 @@ impl MetalOps<'_, '_> {
         let MixerBufs::Attention(a) = &mut layers[l].mixer else {
             return Err(ChainError::shape(
                 WHAT,
-                format!("layer {l}: an attention op on a delta layer"),
+                format!("layer {l}: an attention op on a layer of another mixer"),
             )
             .into());
+        };
+        let rope = rope_of(ropes, l, a.rope)?;
+        let head_gate = if a.gate.is_some() {
+            let gate_rows = rows.gate.as_ref().ok_or_else(|| Self::no_gate_rows(l))?;
+            Some(gate_rows.window(Elems(0), Elems(m * geom.attn.query_heads))?)
+        } else {
+            None
+        };
+        let layer = AttnLayer {
+            window: a.window,
+            head_gate,
         };
         let stride = rows.proj_stride;
         let at = |range_start: usize| -> (usize, usize) { (range_start, m * stride - range_start) };
         let (q_at, q_len) = at(a.q.start);
         let (k_at, k_len) = at(a.k.start);
         let (v_at, v_len) = at(a.v.start);
-        self.kernels.attention_prefill(
+        self.kernels.attention_prefill_layer(
             self.enc,
             AttentionPrefillParams {
                 head_dim: geom.attn.head,
@@ -235,13 +385,15 @@ impl MetalOps<'_, '_> {
                 out_stride: rows.mix_stride,
                 fault: &faults[slot],
             },
+            layer,
         )?;
         self.enc.memory_barrier();
         Ok(())
     }
 
-    /// Layer `l`'s attention output projection, added into the residual.
-    pub(super) fn rows_attn_out(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
+    /// Layer `l`'s attention output projection, added into the residual, or
+    /// stored for the join on a sandwich.
+    pub(super) fn rows_attn_out(&mut self, l: LayerCtx<'_>, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
@@ -254,10 +406,13 @@ impl MetalOps<'_, '_> {
             geom,
             ..
         } = &mut *self.arena;
-        let MixerBufs::Attention(a) = &layers[l].mixer else {
+        let MixerBufs::Attention(a) = &layers[l.layer].mixer else {
             return Err(ChainError::shape(
                 WHAT,
-                format!("layer {l}: an attention op on a delta layer"),
+                format!(
+                    "layer {}: an attention op on a layer of another mixer",
+                    l.layer
+                ),
             )
             .into());
         };
@@ -265,6 +420,7 @@ impl MetalOps<'_, '_> {
             .attn
             .out_len()
             .ok_or_else(|| ChainError::shape(WHAT, "the attention output does not fit"))?;
+        let (y, mode) = half_out(l, &mut rows.x, &mut rows.xn, m * *hidden)?;
         self.kernels.gemm(
             self.enc,
             GemmParams {
@@ -273,14 +429,147 @@ impl MetalOps<'_, '_> {
                 cols: out_cols,
                 acts: m,
                 weights: all(&a.out)?,
-                x: rows.mix.window(Elems(0), Elems(m * rows.mix_stride))?,
+                x: rows
+                    .mix
+                    .window(Elems(0), Elems(strided_len(m, rows.mix_stride, out_cols)))?,
                 x_stride: rows.mix_stride,
-                y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
+                y,
                 y_stride: *hidden,
-                mode: GemmMode::Residual,
+                mode,
                 operand: PASS_OPERAND,
                 fault: &faults[slot],
+                layer: layer_word(l.layer),
+            },
+        )?;
+        self.enc.memory_barrier();
+        self.rows_join(l, Half::Mixer, m)
+    }
+
+    /// Layer `l`'s short conv over the pass: `C ⊙ conv(B ⊙ x)` for every row
+    /// into the pass's mixer rows, over the pre-pass ring and the rows'
+    /// predecessors, and the ring's commit after them (one chunk: the
+    /// dispatch, a barrier, the commit). The ring's copy after a row inside
+    /// the pass is not run: a pass that asks for one is refused by name.
+    pub(super) fn rows_conv_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
+        let slot = self.pass_slot(m);
+        let from = self.pos;
+        let Some(ctx) = self.rows.as_mut() else {
+            return Self::no_rows();
+        };
+        if !ctx.after.is_empty() {
+            return Err(refuse(format!(
+                "layer {l}: a copy of the conv ring after rows {:?} of a pass: the ring's copy is not run",
+                ctx.after
+            )));
+        }
+        let rows = &mut *ctx.arena;
+        let Arena {
+            layers,
+            faults,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let c = conv_of_rows(layers, l)?;
+        let stride = rows.proj_stride;
+        self.kernels.shortconv_rows(
+            self.enc,
+            ShortConvRowsParams {
+                rows: m,
+                bcx: rows
+                    .proj
+                    .window(Elems(c.bcx.start), Elems(m * stride - c.bcx.start))?,
+                bcx_stride: stride,
+                conv_w: all(&c.conv)?,
+                ring: all_mut(&mut c.ring)?,
+                y: rows.mix.window_mut(Elems(0), Elems(m * rows.mix_stride))?,
+                y_stride: rows.mix_stride,
+                faults: &faults[slot],
+                hidden: *hidden,
+                taps: c.taps,
+                ring_rows: c.ring_rows,
                 layer: layer_word(l),
+                pos: from,
+            },
+        )?;
+        self.enc.memory_barrier();
+        Ok(())
+    }
+
+    /// Layer `l`'s short conv output projection over the pass's mixer rows,
+    /// added into the residual, or stored for the join on a sandwich.
+    pub(super) fn rows_conv_out(&mut self, l: LayerCtx<'_>, m: usize) -> Result<(), SessionError> {
+        let slot = self.pass_slot(m);
+        let Some(ctx) = self.rows.as_mut() else {
+            return Self::no_rows();
+        };
+        let rows = &mut *ctx.arena;
+        let Arena {
+            layers,
+            faults,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let c = conv_of_rows(layers, l.layer)?;
+        let (y, mode) = half_out(l, &mut rows.x, &mut rows.xn, m * *hidden)?;
+        self.kernels.gemm(
+            self.enc,
+            GemmParams {
+                quant: c.out_quant,
+                rows: *hidden,
+                cols: *hidden,
+                acts: m,
+                weights: all(&c.out)?,
+                x: rows
+                    .mix
+                    .window(Elems(0), Elems(strided_len(m, rows.mix_stride, *hidden)))?,
+                x_stride: rows.mix_stride,
+                y,
+                y_stride: *hidden,
+                mode,
+                operand: PASS_OPERAND,
+                fault: &faults[slot],
+                layer: layer_word(l.layer),
+            },
+        )?;
+        self.enc.memory_barrier();
+        self.rows_join(l, Half::Mixer, m)
+    }
+
+    /// Layer `l`'s join over the pass's rows on a sandwich: the half's output
+    /// rows in the pass's normed-rows buffer, normed by the half's gain and
+    /// added into the stream at the half's scale. A plain residual has no
+    /// join: its out and down GEMMs already added into the stream.
+    fn rows_join(&mut self, l: LayerCtx<'_>, half: Half, m: usize) -> Result<(), SessionError> {
+        let ResidualPlan::Sandwich(s) = &l.plan.residual else {
+            return Ok(());
+        };
+        let slot = self.pass_slot(m);
+        let Some(ctx) = self.rows.as_mut() else {
+            return Self::no_rows();
+        };
+        let rows = &mut *ctx.arena;
+        let Arena {
+            layers,
+            faults,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        self.kernels.norm_add_rows(
+            self.enc,
+            NormAddRowsParams {
+                norm: NormRowsParams {
+                    rows: m,
+                    cols: *hidden,
+                    x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                    x_stride: *hidden,
+                    gain: all(post_gain(layers, l.layer, half)?)?,
+                    y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
+                    y_stride: *hidden,
+                    eps: s.eps,
+                    fault: &faults[slot],
+                    layer: layer_word(l.layer),
+                },
+                add: s.add[half.index()],
             },
         )?;
         self.enc.memory_barrier();
@@ -310,7 +599,7 @@ impl MetalOps<'_, '_> {
         let MixerBufs::Delta(d) = &mut layers[l].mixer else {
             return Err(ChainError::shape(
                 WHAT,
-                format!("layer {l}: a delta op on an attention layer"),
+                format!("layer {l}: a delta op on a layer of another mixer"),
             )
             .into());
         };
@@ -410,7 +699,7 @@ impl MetalOps<'_, '_> {
         let MixerBufs::Delta(d) = &layers[l].mixer else {
             return Err(ChainError::shape(
                 WHAT,
-                format!("layer {l}: a delta op on an attention layer"),
+                format!("layer {l}: a delta op on a layer of another mixer"),
             )
             .into());
         };
@@ -682,10 +971,16 @@ impl MetalOps<'_, '_> {
 
     /// Layer `l`'s dense FFN over the rows: the FFN norm, the gate and the up
     /// GEMMs over the normed rows, the SwiGLU over their two outputs, and the
-    /// down GEMM added into the residual. The GEMMs are the dense GEMM of the
-    /// mixers' projections; no row is routed, so no table, gather or combine
-    /// stands between the norm and the residual.
-    pub(super) fn rows_dense_ffn(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
+    /// down GEMM added into the residual (on a sandwich stored into the
+    /// normed rows, which the join then norms into the residual). The GEMMs
+    /// are the dense GEMM of the mixers' projections; no row is routed, so no
+    /// table, gather or combine stands between the norm and the residual.
+    pub(super) fn rows_dense_ffn(
+        &mut self,
+        cx: LayerCtx<'_>,
+        m: usize,
+    ) -> Result<(), SessionError> {
+        let l = cx.layer;
         let slot = self.pass_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
@@ -756,6 +1051,7 @@ impl MetalOps<'_, '_> {
             },
         )?;
         self.enc.memory_barrier();
+        let (y, mode) = half_out(cx, &mut rows.x, &mut rows.xn, m * *hidden)?;
         self.kernels.gemm(
             self.enc,
             GemmParams {
@@ -766,16 +1062,16 @@ impl MetalOps<'_, '_> {
                 weights: all(&f.down)?,
                 x: rows.h.window(Elems(0), Elems(m * width))?,
                 x_stride: width,
-                y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
+                y,
                 y_stride: *hidden,
-                mode: GemmMode::Residual,
+                mode,
                 operand: PASS_OPERAND,
                 fault: &faults[slot],
                 layer: layer_word(l),
             },
         )?;
         self.enc.memory_barrier();
-        Ok(())
+        self.rows_join(cx, Half::Ffn, m)
     }
 
     /// The head over the pass's last row.
@@ -825,8 +1121,58 @@ impl MetalOps<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{extents, strided_len};
     use crate::geom::Geometry;
     use crate::instance::REGISTERED;
+    use crate::kernels::{Quant, Segment};
+
+    /// The activation window of an out GEMM over rows `stride` apart ends where
+    /// its last row's values do: a stride wider than the row (the mixer rows
+    /// of a file with no delta layer are as wide as the delta numerator) leaves
+    /// a gap after the last row that is no row's, and a row as wide as its
+    /// stride leaves none.
+    ///
+    /// Mutant: `strided_len` is `rows * stride`.
+    #[test]
+    fn a_strided_window_ends_where_its_last_row_does() {
+        assert_eq!(strided_len(1024, 4096, 2048), 1023 * 4096 + 2048);
+        assert_eq!(strided_len(12, 4096, 2048), 47104);
+        assert_eq!(strided_len(9, 2048, 2048), 9 * 2048);
+    }
+
+    /// A P1 dispatch of q, k, v and the per-head gate, laid out one segment
+    /// after another as the loader lays them: the extents of the dispatch
+    /// without its gate end exactly where the gate begins, in weight bytes and
+    /// in output columns, and those of the whole dispatch end where it ends.
+    /// The segmented launch holds its windows to its segments' extents, so a
+    /// dispatch with the gate left out takes a prefix of both windows.
+    ///
+    /// Mutant: `extents` counts a segment's weight bytes without its
+    /// `weight_blocks` offset, or its columns without `out_offset`.
+    #[test]
+    fn the_extents_of_a_p1_without_its_gate_end_where_the_gate_begins() {
+        let quant = Quant::A4;
+        let cols = 2048;
+        let nblocks = cols / quant.values_per_block();
+        let mut segments = Vec::new();
+        let (mut bytes, mut out) = (0, 0);
+        for rows in [2048, 512, 512, 16] {
+            segments.push(Segment {
+                cols,
+                rows,
+                weight_blocks: bytes / quant.block_bytes(),
+                out_offset: out,
+            });
+            bytes += rows * nblocks * quant.block_bytes();
+            out += rows;
+        }
+        let gate = segments[3];
+        assert_eq!(
+            extents(quant, &segments[..3]),
+            (gate.weight_blocks * quant.block_bytes(), gate.out_offset)
+        );
+        assert_eq!(extents(quant, &segments), (bytes, out));
+    }
 
     /// The logit rows of every registered instance hold the routed experts and
     /// any shared gate, at a stride the GEMM's output rows are aligned to.

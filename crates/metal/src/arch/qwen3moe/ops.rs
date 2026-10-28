@@ -4,14 +4,16 @@
 //!
 //! The DAG, one group per op past the embed: `E | P1 | mixer | out | R | G |
 //! W` for every layer, then `H`; a layer of a dense FFN has no `R`. P1 is one
-//! dispatch per weight type of the layer's projections in one group. An attention mixer past one segment of
-//! keys is two groups: the flash writes its partials, the barrier, then the
-//! merge folds them into the output. The FFN norm has no group of its own:
-//! the router (R) and the gate-up pair (G) each norm the residual as they
-//! load it. The head is the token's last group and closes no barrier; a
-//! token whose pick nobody reads encodes none of it. Every op only encodes:
-//! no wait, no allocation past the launches' own argument lists, no host
-//! round trip.
+//! dispatch per weight type of the layer's projections in one group. The
+//! flash folds its segments' partials in its last threadgroup, so an attention
+//! mixer is one group at any depth. A layer whose residual is a sandwich has a
+//! join group `J` after the mixer's out and after the down: the out and the
+//! down store into the join buffer, and `J` norms that buffer into the stream
+//! ([`MetalOps::join`]). The FFN norm has no group of its own: the router (R)
+//! and the gate-up pair (G) each norm the residual as they load it. The head
+//! is the token's last group and closes no barrier; a token whose pick nobody
+//! reads encodes none of it. Every op only encodes: no wait, no allocation
+//! past the launches' own argument lists, no host round trip.
 //!
 //! The token at `pos` binds the step record slot of its position: the head
 //! writes its id there and every kernel raises that slot's fault word. A
@@ -24,9 +26,11 @@ use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Window, WindowMut};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaPlan};
+use chain::arch::qwen3moe::plan::{
+    DeltaPlan, FfnPlan, FfnRoute, GqaPlan, ResidualPlan, ShortConvPlan,
+};
 
-use super::arena::{Arena, LANES, MixerBufs, lane_of, layer_word, slot_before, slot_of};
+use super::arena::{Arena, LANES, LayerBufs, MixerBufs, lane_of, layer_word, slot_before, slot_of};
 use super::rows::RowsArena;
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
@@ -34,14 +38,38 @@ use crate::device::MetalDevice;
 use crate::encode::ComputeEncoder;
 use crate::kernels::router::RouterParams;
 use crate::kernels::{
-    AttentionParams, AttnCache, DeltaParams, EmbedParams, FoldParams, HEAD_SIMD_GROUPS,
-    HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormOnLoad, PASS_ROWS, PairParams,
-    SegParams, SharedPlan, segments_for_keys,
+    AttentionParams, AttnCache, AttnLayer, DeltaParams, EmbedParams, FoldParams, HEAD_SIMD_GROUPS,
+    HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormAddRowsParams, NormOnLoad,
+    NormRowsParams, PASS_ROWS, PairParams, SegParams, SharedPlan, ShortConvStepParams,
+    segments_for_window,
 };
+
+/// The half of a layer a sandwich joins: the mixer's, then the FFN's, the
+/// order of `SandwichPlan`'s gains and scales.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Half {
+    Mixer,
+    Ffn,
+}
+
+impl Half {
+    /// The half's index into `SandwichPlan`'s `norms` and `add`.
+    pub(super) fn index(self) -> usize {
+        self as usize
+    }
+}
 
 mod rows;
 
 const WHAT: &str = "qwen35moe ops";
+
+/// A request this arena or this arm does not run, refused by name.
+fn refuse(detail: impl Into<String>) -> SessionError {
+    SessionError::Shape {
+        what: WHAT,
+        detail: detail.into(),
+    }
+}
 
 /// The whole of `b`.
 fn all<T: Elem>(b: &MetalBuffer<T>) -> Result<Window<'_, T, MetalDevice>, DeviceError> {
@@ -183,6 +211,7 @@ impl<'a, 'e> MetalOps<'a, 'e> {
         let p1 = match &layers[l].mixer {
             MixerBufs::Delta(d) => &d.p1,
             MixerBufs::Attention(a) => &a.p1,
+            MixerBufs::ShortConv(c) => &c.p1,
         };
         for part in &p1.parts {
             self.kernels.matvec_seg(
@@ -207,7 +236,7 @@ impl<'a, 'e> MetalOps<'a, 'e> {
     }
 }
 
-/// The layer's delta buffers, or a named refusal for an attention layer.
+/// The layer's delta buffers, or a named refusal for a layer of another mixer.
 macro_rules! delta_of {
     ($layers:expr, $l:expr) => {
         match &mut $layers[$l].mixer {
@@ -219,11 +248,19 @@ macro_rules! delta_of {
                 )
                 .into());
             }
+            MixerBufs::ShortConv(_) => {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!("layer {}: a delta op on a short conv layer", $l),
+                )
+                .into());
+            }
         }
     };
 }
 
-/// The layer's attention buffers, or a named refusal for a delta layer.
+/// The layer's attention buffers, or a named refusal for a layer of another
+/// mixer.
 macro_rules! attention_of {
     ($layers:expr, $l:expr) => {
         match &mut $layers[$l].mixer {
@@ -235,26 +272,116 @@ macro_rules! attention_of {
                 )
                 .into());
             }
+            MixerBufs::ShortConv(_) => {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!("layer {}: an attention op on a short conv layer", $l),
+                )
+                .into());
+            }
         }
     };
+}
+
+/// The layer's short conv buffers, or a named refusal for a layer of another
+/// mixer.
+macro_rules! conv_of {
+    ($layers:expr, $l:expr) => {
+        match &mut $layers[$l].mixer {
+            MixerBufs::ShortConv(c) => c,
+            MixerBufs::Delta(_) => {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!("layer {}: a short conv op on a delta layer", $l),
+                )
+                .into());
+            }
+            MixerBufs::Attention(_) => {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!("layer {}: a short conv op on an attention layer", $l),
+                )
+                .into());
+            }
+        }
+    };
+}
+
+/// Where the out projection of one half of layer `l` writes, and how: a plain
+/// residual adds into the stream in the residual epilogue; a sandwich stores
+/// into the join buffer, which [`MetalOps::join`] then norms into the stream.
+fn half_out<'b>(
+    l: LayerCtx<'_>,
+    x: &'b mut MetalBuffer<f32>,
+    join: &'b mut Option<MetalBuffer<f32>>,
+    hidden: usize,
+) -> Result<(WindowMut<'b, f32, MetalDevice>, Mode<'b>), SessionError> {
+    match &l.plan.residual {
+        ResidualPlan::Plain => Ok((x.window_mut(Elems(0), Elems(hidden))?, Mode::Residual)),
+        ResidualPlan::Sandwich(_) => {
+            let join = join.as_mut().ok_or_else(|| no_join(l.layer))?;
+            Ok((all_mut(join)?, Mode::Store))
+        }
+    }
+}
+
+/// The refusal of a sandwich layer over an arena with no join buffer.
+fn no_join(l: usize) -> SessionError {
+    refuse(format!(
+        "layer {l}: a sandwich residual over an arena with no join buffer"
+    ))
+}
+
+/// The refusal of a sandwich over a routed FFN: its combine only adds into the
+/// stream.
+fn routed_sandwich(l: usize) -> SessionError {
+    refuse(format!(
+        "layer {l}: a sandwich residual over a routed FFN, whose combine only adds into the stream"
+    ))
+}
+
+/// The refusal of a short conv layer over an arena with no conv output buffer.
+fn no_conv_y(l: usize) -> SessionError {
+    refuse(format!(
+        "layer {l}: a short conv layer over an arena with no conv output buffer"
+    ))
+}
+
+/// Layer `l`'s sandwich norm gain of `half`, or the refusal of a layer the
+/// arena holds none for.
+fn post_gain(
+    layers: &[LayerBufs],
+    l: usize,
+    half: Half,
+) -> Result<&MetalBuffer<f32>, SessionError> {
+    let post = layers
+        .get(l)
+        .and_then(|layer| layer.post.as_ref())
+        .ok_or_else(|| {
+            refuse(format!(
+                "layer {l}: a sandwich residual over a layer with no norm gains"
+            ))
+        })?;
+    Ok(&post.gains[half.index()])
 }
 
 impl MetalOps<'_, '_> {
     /// The attention launch of layer `l` at `pos`: the one shape both its
     /// dispatches read, built per dispatch (the windows it holds are `Copy`,
-    /// the parameters are not).
+    /// the parameters are not), and what the layer adds to it: its window of
+    /// keys and its per-head gate.
     fn attn_params(
         arena: &mut Arena,
         l: usize,
         pos: u32,
         n_keys: u32,
         segments: u32,
-    ) -> Result<AttentionParams<'_>, SessionError> {
+    ) -> Result<(AttentionParams<'_>, AttnLayer<'_>), SessionError> {
         let slot = slot_of(pos);
         let Arena {
             proj,
             layers,
-            rope,
+            ropes,
             attn,
             attn_partials,
             attn_ticket,
@@ -265,6 +392,7 @@ impl MetalOps<'_, '_> {
             ..
         } = &mut *arena;
         let a = attention_of!(layers, l);
+        let rope = rope_of(ropes, l, a.rope)?;
         // The arena holds the partials of the cache's whole segment count;
         // the launch reads and writes the prefix this token's keys take.
         let parts =
@@ -274,7 +402,15 @@ impl MetalOps<'_, '_> {
                     what: WHAT,
                     detail: format!("the partials of {segments} segments do not fit"),
                 })?;
-        Ok(AttentionParams {
+        let head_gate = match &a.gate {
+            Some(g) => Some(part(proj, g)?),
+            None => None,
+        };
+        let layer = AttnLayer {
+            window: a.window,
+            head_gate,
+        };
+        let params = AttentionParams {
             head_dim: geom.attn.head,
             query_heads: geom.attn.query_heads,
             kv_heads: geom.attn.kv_heads,
@@ -298,22 +434,39 @@ impl MetalOps<'_, '_> {
             out: all_mut(attn)?,
             fault: &faults[slot],
             ticket: attn_ticket.window_mut(Elems(0), Elems(1))?,
-        })
+        };
+        Ok((params, layer))
     }
 }
 
+/// The rope table `at` of layer `l`, or the refusal of an index the arena's
+/// tables do not reach.
+fn rope_of(
+    ropes: &[MetalBuffer<f32>],
+    l: usize,
+    at: usize,
+) -> Result<&MetalBuffer<f32>, SessionError> {
+    ropes.get(at).ok_or_else(|| {
+        refuse(format!(
+            "layer {l}: rope table {at} of an arena with {}",
+            ropes.len()
+        ))
+    })
+}
+
 impl MetalOps<'_, '_> {
-    /// Layer `l`'s flash group: the attention over its `n_keys` live keys in
-    /// `segments` segments, this position's keys stored first. The group a
-    /// merge follows past one segment.
-    pub(super) fn attn_flash(
-        &mut self,
-        l: usize,
-        n_keys: u32,
-        segments: u32,
-    ) -> Result<(), SessionError> {
-        let p = Self::attn_params(&mut *self.arena, l, self.pos, n_keys, segments)?;
-        self.kernels.attention_flash(self.enc, p)?;
+    /// Layer `l`'s flash group: the attention over the keys the layer attends
+    /// (the last `window` of the `pos + 1` live keys, or all of them), in the
+    /// segments those keys take, this position's keys stored first. Live keys
+    /// past one segment fold inside the flash: its last threadgroup merges the
+    /// partials and writes the gated output. The one place the segment rule
+    /// meets the layer's window, for the step and the profiled step alike.
+    pub(super) fn attn_flash(&mut self, l: usize) -> Result<(), SessionError> {
+        let n_keys = self.pos + 1;
+        let window = attention_of!(self.arena.layers, l).window;
+        let segments = segments_for_window(n_keys, window);
+        let (p, layer) = Self::attn_params(&mut *self.arena, l, self.pos, n_keys, segments)?;
+        self.kernels.attention_flash_layer(self.enc, p, layer)?;
         self.close();
         Ok(())
     }
@@ -416,6 +569,188 @@ impl MetalOps<'_, '_> {
         self.close();
         Ok(())
     }
+
+    /// Layer `l`'s down group of a dense FFN under a sandwich: its one slot's
+    /// down projection stored into the join buffer. The fold only adds into
+    /// its output, and the sandwich norms the projection before it joins the
+    /// stream, so the dense down is the plain mat-vec; a dense slot's route
+    /// weight is 1.
+    fn dense_down_store(&mut self, l: usize) -> Result<(), SessionError> {
+        let Arena {
+            layers,
+            h,
+            join,
+            hidden,
+            geom,
+            ..
+        } = &mut *self.arena;
+        let f = &layers[l].ffn;
+        let join = join.as_mut().ok_or_else(|| no_join(l))?;
+        self.kernels.matvec(
+            self.enc,
+            MatvecParams {
+                quant: f.down_quant,
+                rows: *hidden,
+                cols: geom.experts.k,
+                weights: all(&f.down)?,
+                x: h.window(Elems(0), Elems(geom.experts.k))?,
+                y: all_mut(join)?,
+                mode: Mode::Store,
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s down group: a plain residual folds the experts' down
+    /// projections into the stream; a sandwich over a dense FFN stores its one
+    /// down projection into the join buffer for [`MetalOps::join`]. A
+    /// sandwich over a routed FFN is refused by name: the combine only adds.
+    pub(super) fn experts_down(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        match (&l.plan.ffn.route, &l.plan.residual) {
+            (_, ResidualPlan::Plain) => self.experts_fold(l.layer),
+            (FfnRoute::Dense, ResidualPlan::Sandwich(_)) => self.dense_down_store(l.layer),
+            (FfnRoute::Router { .. }, ResidualPlan::Sandwich(_)) => Err(routed_sandwich(l.layer)),
+        }
+    }
+
+    /// Layer `l`'s attention out group: the output projection of the flash's
+    /// gated output, added into the stream (plain) or stored into the join
+    /// buffer (sandwich).
+    pub(super) fn attn_project(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        let Arena {
+            layers,
+            attn,
+            x,
+            join,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let a = attention_of!(layers, l.layer);
+        let (y, mode) = half_out(l, x, join, *hidden)?;
+        self.kernels.matvec(
+            self.enc,
+            MatvecParams {
+                quant: a.out_quant,
+                rows: *hidden,
+                cols: attn.len().get(),
+                weights: all(&a.out)?,
+                x: all(attn)?,
+                y,
+                mode,
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s short conv group: the conv over the layer's ring for the
+    /// token at `pos`, `C ⊙ conv(B ⊙ x)` into the conv output buffer.
+    fn conv_step(&mut self, l: usize) -> Result<(), SessionError> {
+        let pos = [self.pos];
+        let slot = slot_of(self.pos);
+        let Arena {
+            proj,
+            layers,
+            conv_y,
+            faults,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let c = conv_of!(layers, l);
+        let y = conv_y.as_mut().ok_or_else(|| no_conv_y(l))?;
+        self.kernels.shortconv_step(
+            self.enc,
+            ShortConvStepParams {
+                bcx: part(proj, &c.bcx)?,
+                bcx_stride: c.bcx.len(),
+                conv_w: all(&c.conv)?,
+                ring: all_mut(&mut c.ring)?,
+                y: all_mut(y)?,
+                y_stride: *hidden,
+                faults: &faults[slot],
+                hidden: *hidden,
+                taps: c.taps,
+                ring_rows: c.ring_rows,
+                layer: layer_word(l),
+                pos: &pos,
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s conv out group: the output projection of the conv's output,
+    /// added into the stream (plain) or stored into the join buffer
+    /// (sandwich).
+    pub(super) fn conv_project(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        let Arena {
+            layers,
+            conv_y,
+            x,
+            join,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let c = conv_of!(layers, l.layer);
+        let y = conv_y.as_ref().ok_or_else(|| no_conv_y(l.layer))?;
+        let (out, mode) = half_out(l, x, join, *hidden)?;
+        self.kernels.matvec(
+            self.enc,
+            MatvecParams {
+                quant: c.out_quant,
+                rows: *hidden,
+                cols: *hidden,
+                weights: all(&c.out)?,
+                x: all(y)?,
+                y: out,
+                mode,
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s join group of `half` on a sandwich: the half's output in
+    /// the join buffer normed by the half's gain and added into the stream at
+    /// the half's scale, `x += add · gain ⊙ rms_norm(out)`. A plain residual
+    /// has no join group (its out and down added into the stream) and nothing
+    /// is encoded.
+    pub(super) fn join(&mut self, l: LayerCtx<'_>, half: Half) -> Result<(), SessionError> {
+        let ResidualPlan::Sandwich(s) = &l.plan.residual else {
+            return Ok(());
+        };
+        let slot = slot_of(self.pos);
+        let Arena {
+            layers,
+            x,
+            join,
+            faults,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let out = join.as_ref().ok_or_else(|| no_join(l.layer))?;
+        self.kernels.norm_add_rows(
+            self.enc,
+            NormAddRowsParams {
+                norm: NormRowsParams {
+                    rows: 1,
+                    cols: *hidden,
+                    x: all(out)?,
+                    x_stride: *hidden,
+                    gain: all(post_gain(layers, l.layer, half)?)?,
+                    y: x.window_mut(Elems(0), Elems(*hidden))?,
+                    y_stride: *hidden,
+                    eps: s.eps,
+                    fault: &faults[slot],
+                    layer: layer_word(l.layer),
+                },
+                add: s.add[half.index()],
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
 }
 
 impl ChainOps for MetalOps<'_, '_> {
@@ -469,40 +804,15 @@ impl ChainOps for MetalOps<'_, '_> {
         if self.arm(l.m)? == Arm::Rows {
             return self.rows_attn_core(l.layer, l.m);
         }
-        let n_keys = self.pos + 1;
-        let segments = segments_for_keys(n_keys);
-        // Live keys past one segment fold inside the flash: its last
-        // threadgroup merges the partials and writes the gated output.
-        self.attn_flash(l.layer, n_keys, segments)
+        self.attn_flash(l.layer)
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
-        l.plain_only("qwen3moe::MetalOps::attn_out")?;
         if self.arm(l.m)? == Arm::Rows {
-            return self.rows_attn_out(l.layer, l.m);
+            return self.rows_attn_out(l, l.m);
         }
-        let Arena {
-            layers,
-            attn,
-            x,
-            hidden,
-            ..
-        } = &mut *self.arena;
-        let a = attention_of!(layers, l.layer);
-        self.kernels.matvec(
-            self.enc,
-            MatvecParams {
-                quant: a.out_quant,
-                rows: *hidden,
-                cols: attn.len().get(),
-                weights: all(&a.out)?,
-                x: all(attn)?,
-                y: x.window_mut(Elems(0), Elems(*hidden))?,
-                mode: Mode::Residual,
-            },
-        )?;
-        self.close();
-        Ok(())
+        self.attn_project(l)?;
+        self.join(l, Half::Mixer)
     }
 
     fn delta_in(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
@@ -565,6 +875,8 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
+        // The head-norm projection has the residual epilogue only: a sandwich
+        // over the delta rule is refused by name, at the open and here.
         l.plain_only("qwen3moe::MetalOps::delta_out")?;
         if self.arm(l.m)? == Arm::Rows {
             return self.rows_delta_out(l.layer, l.m);
@@ -598,6 +910,28 @@ impl ChainOps for MetalOps<'_, '_> {
         )?;
         self.close();
         Ok(())
+    }
+
+    fn conv_in(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {
+        match self.arm(l.m)? {
+            Arm::Step => self.p1(l.layer),
+            Arm::Rows => self.rows_p1(l.layer, l.m),
+        }
+    }
+
+    fn conv_core(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_conv_core(l.layer, l.m);
+        }
+        self.conv_step(l.layer)
+    }
+
+    fn conv_out(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_conv_out(l, l.m);
+        }
+        self.conv_project(l)?;
+        self.join(l, Half::Mixer)
     }
 
     fn route(&mut self, l: LayerCtx<'_>, plan: &FfnPlan) -> Result<(), SessionError> {
@@ -654,15 +988,21 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, plan: &FfnPlan) -> Result<(), SessionError> {
-        l.plain_only("qwen3moe::MetalOps::experts")?;
-        if self.arm(l.m)? == Arm::Rows {
+        let arm = self.arm(l.m)?;
+        if let (FfnRoute::Router { .. }, ResidualPlan::Sandwich(_)) =
+            (&plan.route, &l.plan.residual)
+        {
+            return Err(routed_sandwich(l.layer));
+        }
+        if arm == Arm::Rows {
             return match &plan.route {
-                FfnRoute::Dense => self.rows_dense_ffn(l.layer, l.m),
+                FfnRoute::Dense => self.rows_dense_ffn(l, l.m),
                 FfnRoute::Router { .. } => self.rows_experts(l.layer, l.m),
             };
         }
         self.experts_pair(l.layer)?;
-        self.experts_fold(l.layer)
+        self.experts_down(l)?;
+        self.join(l, Half::Ffn)
     }
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {

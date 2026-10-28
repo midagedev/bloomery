@@ -23,13 +23,14 @@
 use bloomery_device::fault::FAULT_WORDS;
 use chain::ChainError;
 use chain::arch::qwen3moe::plan::{
-    DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, kinds_of,
+    DeltaPlan, FfnRoute, GqaPlan, Kind35, LayerPlan, MixerPlan, ResidualPlan, SharedPlan,
+    ShortConvPlan, SiteTy, kinds_of,
 };
 use chain::arch::qwen3moe::read::{
-    PlanDims, Read35, Sites35, file_names, plan_delta, plan_ffn, plan_gqa, plan_residual,
+    PlanDims, Read35, Sites35, file_names, plan_delta, plan_ffn, plan_gqa_of, plan_residual,
     plan_shortconv,
 };
-use chain::linear::LinearShape;
+use chain::linear::{LinearShape, Ring};
 use chain::rope::{RopeSpec, RopeTable};
 use chain::site::file_site;
 use gguf::Split;
@@ -298,11 +299,50 @@ pub(super) struct AttnLayout {
     pub(super) k_norm: Values,
     /// The elements of one cache plane.
     pub(super) cache: usize,
+    /// The output gate of one value a query head is the P1's fourth segment,
+    /// after the query, the key and the value.
+    pub(super) gate: bool,
+    /// The positions the layer attends; none: every position.
+    pub(super) window: Option<u32>,
+    /// The layer's rope table, by place in [`Layout::ropes`].
+    pub(super) rope: usize,
+}
+
+/// A gated short conv layer: its input projection is one P1 segment of
+/// `3 · hidden` rows (`B | C | x`), and the ring keeps the conv's inputs of
+/// the last positions.
+pub(super) struct ConvLayout {
+    pub(super) p1: P1Layout,
+    pub(super) out: Site,
+    /// The filters, `[hidden][taps]` f32, the oldest tap first.
+    pub(super) conv: Values,
+    pub(super) taps: usize,
+    /// The slots of the ring ([`Ring::rows`]).
+    pub(super) ring_rows: usize,
+    /// The elements of the ring: `ring_rows` rows of `hidden` ([`Ring::values`]).
+    pub(super) ring: usize,
 }
 
 pub(super) enum MixerLayout {
     Delta(DeltaLayout),
     Attention(AttnLayout),
+    ShortConv(ConvLayout),
+}
+
+/// A layer's sandwich: the norm each half's output goes through before it
+/// joins the stream, `x += add[i] · gain[i] ⊙ rms_norm(out)`. The epsilon and
+/// the scales are the plan's (`SandwichPlan`), read by the join.
+pub(super) struct PostLayout {
+    /// The mixer's gain, then the FFN's: F32, `hidden` values.
+    pub(super) gains: [Values; 2],
+}
+
+/// A rope table's inputs: θ's base, and the file's factors the pair
+/// frequencies divide by on a layer whose rope has them. The factors' values
+/// are read at open, where the table is built.
+pub(super) struct RopeLayout {
+    pub(super) base: f32,
+    pub(super) factors: Option<Values>,
 }
 
 /// A layer's FFN half: the router's values and the experts' sites, the
@@ -334,6 +374,8 @@ pub(super) struct SharedLayout {
 pub(super) struct LayerLayout {
     pub(super) mixer: MixerLayout,
     pub(super) ffn: FfnLayout,
+    /// The sandwich norms; none on a layer that adds each half to the stream.
+    pub(super) post: Option<PostLayout>,
 }
 
 /// What the arena holds, resolved: every tensor it copies, every length it
@@ -345,17 +387,36 @@ pub(super) struct Layout {
     pub(super) eps: f32,
     pub(super) top_k: usize,
     pub(super) n_experts: usize,
-    pub(super) rope: RopeTable,
+    /// The rope tables, one for each distinct base and factors the attention
+    /// layers have.
+    pub(super) ropes: Vec<RopeLayout>,
     pub(super) embed: Site,
+    /// The head: `output.weight`, or the token embedding again for a file with
+    /// no `output.weight`.
     pub(super) head: Site,
     pub(super) head_norm: Values,
     pub(super) layers: Vec<LayerLayout>,
-    /// The elements of the rope table, the attention's partials and output.
+    /// The elements of one rope table, the attention's partials and output.
     pub(super) rope_len: usize,
     pub(super) attn_partials: usize,
     pub(super) attn_out: usize,
     /// The widest P1 output a layer writes.
     pub(super) proj: usize,
+}
+
+impl Layout {
+    /// Whether a layer is a short conv: the arena holds the conv's output.
+    pub(super) fn has_conv(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| matches!(l.mixer, MixerLayout::ShortConv(_)))
+    }
+
+    /// Whether a layer is a sandwich: the arena holds the buffer a half's
+    /// out projection writes before its join.
+    pub(super) fn has_join(&self) -> bool {
+        self.layers.iter().any(|l| l.post.is_some())
+    }
 }
 
 /// A file the open runs: the instance its shape selects and that instance's
@@ -375,6 +436,7 @@ pub struct Summary {
     pub arch: String,
     pub layers: usize,
     pub delta: usize,
+    pub conv: usize,
     pub attention: usize,
     pub hidden: usize,
     pub vocab: usize,
@@ -396,16 +458,17 @@ pub struct Outcome {
 fn delta_heads(layers: &[LayerLayout]) -> impl Iterator<Item = usize> + '_ {
     layers.iter().filter_map(|l| match &l.mixer {
         MixerLayout::Delta(d) => Some(d.n_k),
-        MixerLayout::Attention(_) => None,
+        MixerLayout::Attention(_) | MixerLayout::ShortConv(_) => None,
     })
 }
 
-/// The facts the layers must share, each set by the first layer that has one
-/// and held by every later layer: the rope table's base (one table serves
-/// one) and the MoE's experts-and-picks shape.
+/// The facts the layers collect: the rope tables (one for each distinct base
+/// and factors, in the order a layer first asks for them) and the MoE's
+/// experts-and-picks shape, which every layer must share (the first layer that
+/// has it sets it, every later layer holds to it).
 #[derive(Default)]
 struct SharedShapes {
-    rope_base: Option<f32>,
+    ropes: Vec<RopeLayout>,
     moe: Option<(usize, usize)>,
 }
 
@@ -465,17 +528,28 @@ pub fn check(split: &Split, ctx: usize) -> Outcome {
 }
 
 /// The plan of layer `l`'s mixer of kind `kind`, at the lists `sites`: the
-/// arm of the chain's `layer_plans` loop.
+/// arm of the chain's `layer_plans` loop. An attention layer is planned from
+/// its own description `layer`, which holds its window and its rope's factors.
 fn plan_mixer(
     split: &Split,
     pd: &PlanDims,
     kind: Kind35,
+    layer: &LayerSpec,
     l: usize,
     sites: &Sites35,
 ) -> Result<MixerPlan, ChainError> {
     Ok(match kind {
         Kind35::Gqa(kind, flash) => {
-            MixerPlan::Gqa(plan_gqa(split, WHAT, pd, l, (kind, flash), sites)?)
+            let SpecMixer::Gqa(g) = &layer.mixer else {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}: the kind reads attention; the description's mixer is {}",
+                        layer.mixer.what()
+                    ),
+                ));
+            };
+            MixerPlan::Gqa(plan_gqa_of(split, WHAT, pd, l, (kind, flash), g, sites)?)
         }
         Kind35::Delta(shape) => MixerPlan::Delta(plan_delta(split, WHAT, pd, shape, l, sites)?),
         Kind35::ShortConv(ring) => {
@@ -518,8 +592,14 @@ fn read_half<T>(
 /// order. The sites are named by the plan read at the widest lists; a half
 /// that read fails even there (a missing tensor, a shape, a type no family
 /// holds) has only its strict refusal.
-fn mixer_sweep(split: &Split, pd: &PlanDims, kind: Kind35, l: usize) -> Vec<SessionError> {
-    match plan_mixer(split, pd, kind, l, &WIDEST) {
+fn mixer_sweep(
+    split: &Split,
+    pd: &PlanDims,
+    kind: Kind35,
+    layer: &LayerSpec,
+    l: usize,
+) -> Vec<SessionError> {
+    match plan_mixer(split, pd, kind, layer, l, &WIDEST) {
         Ok(MixerPlan::Delta(d)) => refused_sites(
             split,
             [d.qkv, d.gate, d.beta, d.alpha, d.ssm_out],
@@ -527,10 +607,13 @@ fn mixer_sweep(split: &Split, pd: &PlanDims, kind: Kind35, l: usize) -> Vec<Sess
         ),
         Ok(MixerPlan::Gqa(g)) => refused_sites(
             split,
-            [g.attn_q, g.attn_k, g.attn_v, g.attn_output],
+            [g.attn_q, g.attn_k, g.attn_v, g.attn_output]
+                .into_iter()
+                .chain(g.gate.map(|h| h.name)),
             PROJECTED,
         ),
-        Ok(MixerPlan::ShortConv(_)) | Err(_) => Vec::new(),
+        Ok(MixerPlan::ShortConv(c)) => refused_sites(split, [c.conv_in, c.conv_out], PROJECTED),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -584,11 +667,7 @@ fn refused_sites(
 
 /// The facts of `spec` a plan prints first, before any check.
 fn summarize(split: &Split, spec: &ModelSpec) -> Summary {
-    let delta = spec
-        .layers
-        .iter()
-        .filter(|l| matches!(l.mixer, SpecMixer::DeltaRule(_)))
-        .count();
+    let count = |is: fn(&SpecMixer) -> bool| spec.layers.iter().filter(|l| is(&l.mixer)).count();
     let (experts, picks) = spec
         .layers
         .iter()
@@ -600,8 +679,9 @@ fn summarize(split: &Split, spec: &ModelSpec) -> Summary {
     Summary {
         arch: split.architecture().unwrap_or("").to_owned(),
         layers: spec.layers.len(),
-        delta,
-        attention: spec.layers.len() - delta,
+        delta: count(|m| matches!(m, SpecMixer::DeltaRule(_))),
+        conv: count(|m| matches!(m, SpecMixer::ShortConv(_))),
+        attention: count(|m| matches!(m, SpecMixer::Gqa(_))),
         hidden: spec.hidden as usize,
         vocab: spec.vocab as usize,
         experts,
@@ -632,7 +712,20 @@ fn read(
             return None;
         }
     };
-    *summary = Some(summarize(split, &spec));
+    read_spec(split, &spec, &path, ctx, items, summary)
+}
+
+/// [`read`] from the description `spec` the header gave: the instance, the
+/// plans and the arena's rules. `path` names the file in a refusal.
+fn read_spec(
+    split: &Split,
+    spec: &ModelSpec,
+    path: &str,
+    ctx: usize,
+    items: &mut Vec<Item>,
+    summary: &mut Option<Summary>,
+) -> Option<Checked> {
+    *summary = Some(summarize(split, spec));
     // The library a session of the file runs on: the instance its shape
     // selects (a registered one, or one made at open), a geometry no kernel
     // takes refused by name. The arena's rules below are judged at the
@@ -642,10 +735,10 @@ fn read(
         items: &mut *items,
         layer: None,
     }
-    .ok(instance::select(&spec).map_err(|e| super::session::refuse(format!("{path}: {e}"))));
+    .ok(instance::select(spec).map_err(|e| super::session::refuse(format!("{path}: {e}"))));
     let geom = inst.map(Geometry::of);
     let (kinds, pd) = match kinds_of(&spec.layers)
-        .and_then(|kinds| PlanDims::of(&spec, WHAT).map(|pd| (kinds, pd)))
+        .and_then(|kinds| PlanDims::of(spec, WHAT).map(|pd| (kinds, pd)))
     {
         Ok(read) => read,
         Err(e) => {
@@ -660,9 +753,12 @@ fn read(
     // Each layer's two halves, in the order `layer_plans` reads them.
     let mut plans: Vec<Option<LayerPlan>> = Vec::with_capacity(kinds.len());
     for (l, (kind, layer)) in kinds.iter().zip(&spec.layers).enumerate() {
-        let mixer = read_half(items, l, plan_mixer(split, &pd, *kind, l, &SITES), || {
-            mixer_sweep(split, &pd, *kind, l)
-        });
+        let mixer = read_half(
+            items,
+            l,
+            plan_mixer(split, &pd, *kind, layer, l, &SITES),
+            || mixer_sweep(split, &pd, *kind, layer, l),
+        );
         let ffn = read_half(
             items,
             l,
@@ -694,7 +790,7 @@ fn read(
                 layer: None,
             },
             table,
-            &spec,
+            spec,
             ctx,
         )
     });
@@ -728,17 +824,25 @@ fn read(
     let moe = clean
         .then(|| file.ok(shared.moe.ok_or_else(|| refuse("a file of no layer"))))
         .flatten();
-    let rope = clean
+    let ropes = clean
         .then(|| {
-            file.ok(shared
-                .rope_base
-                .ok_or_else(|| refuse("no attention layer to read the rope from")))
+            file.ok(if shared.ropes.is_empty() {
+                Err(refuse("no attention layer to read the rope from"))
+            } else {
+                Ok(shared.ropes)
+            })
         })
         .flatten()
-        .and_then(|base| {
+        .and_then(|ropes| {
+            // The table each layer's rope turns by: built at open, from the
+            // base and the factors; a base or a width it cannot take is
+            // refused here, and a factor it cannot divide by at the open.
             let rot = geom?.attn.rot;
-            file.ok(RopeTable::new(&RopeSpec::window(base, rot))
-                .map_err(|e| refuse(format!("the rope table: {e}"))))
+            for r in &ropes {
+                file.ok(RopeTable::new(&RopeSpec::window(r.base, rot))
+                    .map_err(|e| refuse(format!("the rope table: {e}"))))?;
+            }
+            Some(ropes)
         });
     let layers: Option<Vec<LayerLayout>> = layouts.into_iter().collect();
     let proj = layers.as_ref().and_then(|layers| {
@@ -747,6 +851,7 @@ fn read(
             .flat_map(|l| match &l.mixer {
                 MixerLayout::Delta(d) => &d.p1.dispatches,
                 MixerLayout::Attention(a) => &a.p1.dispatches,
+                MixerLayout::ShortConv(c) => &c.p1.dispatches,
             })
             .map(|d| d.out_end)
             .max()
@@ -759,8 +864,8 @@ fn read(
             .ok_or_else(|| refuse("the attention output does not fit")))
     });
     let plans: Option<Vec<LayerPlan>> = plans.into_iter().collect();
-    let (inst, geom, head, (n_experts, top_k), rope, layers, proj, attn_out, plans) = (
-        inst?, geom?, head?, moe?, rope?, layers?, proj?, attn_out?, plans?,
+    let (inst, geom, head, (n_experts, top_k), ropes, layers, proj, attn_out, plans) = (
+        inst?, geom?, head?, moe?, ropes?, layers?, proj?, attn_out?, plans?,
     );
     Some(Checked {
         instance: inst,
@@ -773,7 +878,7 @@ fn read(
             eps: spec.rms_eps,
             top_k,
             n_experts,
-            rope,
+            ropes,
             embed: head.embed,
             head: head.head,
             head_norm: head.head_norm,
@@ -828,6 +933,18 @@ fn cache_lens(g: &Geometry, ctx: usize, trained: usize) -> Result<(usize, usize)
     Ok((rope_len, attn_partials))
 }
 
+/// The tensor the head reads: `output.weight`, or the token embedding when the
+/// file has no `output.weight` (a head tied to the embedding, which the loader
+/// then makes a second buffer of). A file with neither is answered
+/// `output.weight`, which the site check refuses by name as absent.
+fn head_tensor(split: &Split) -> String {
+    if split.find(&names::output()).is_none() && split.find(&names::token_embd()).is_some() {
+        names::token_embd()
+    } else {
+        names::output()
+    }
+}
+
 /// The cache, the hidden width, the vocabulary, the embedding and the head.
 fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> Option<HeadChecks> {
     let lens = at.ok(cache_lens(t.geom, ctx, spec.ctx_train as usize));
@@ -861,12 +978,12 @@ fn head_checks(at: &mut At<'_>, t: &Table<'_>, spec: &ModelSpec, ctx: usize) -> 
             }
             fits
         });
-    let head = at.ok(t.site(&names::output(), hidden, vocab)).filter(|s| {
+    let head_name = head_tensor(t.split);
+    let head = at.ok(t.site(&head_name, hidden, vocab)).filter(|s| {
         let fits = s.quant.heads();
         if !fits {
             at.push(refuse(format!(
-                "{} is {:?}; the head reads {}",
-                names::output(),
+                "{head_name} is {:?}; the head reads {}",
                 s.quant,
                 reading(Quant::heads)
             )));
@@ -1042,6 +1159,7 @@ fn attention_checks(
     g: &GqaPlan,
     hidden: usize,
     ctx: usize,
+    rope: Option<usize>,
 ) -> Option<AttnLayout> {
     let a = &t.geom.attn;
     let q_rows = at.ok(a
@@ -1049,17 +1167,17 @@ fn attention_checks(
         .ok_or_else(|| refuse("the query rows do not fit")));
     let kv_rows = a.kv_heads * a.head;
     let p1 = q_rows.and_then(|q_rows| {
-        p1_checks(
-            at,
-            t,
-            &g.attn_norm,
-            &[
-                (&g.attn_q, q_rows),
-                (&g.attn_k, kv_rows),
-                (&g.attn_v, kv_rows),
-            ],
-            hidden,
-        )
+        // The output gate of one value a query head, when the layer has one,
+        // is the segment after the value's.
+        let mut parts = vec![
+            (g.attn_q.as_str(), q_rows),
+            (g.attn_k.as_str(), kv_rows),
+            (g.attn_v.as_str(), kv_rows),
+        ];
+        if let Some(gate) = &g.gate {
+            parts.push((gate.name.as_str(), a.query_heads));
+        }
+        p1_checks(at, t, &g.attn_norm, &parts, hidden)
     });
     let att = at.ok(a
         .out_len()
@@ -1076,7 +1194,113 @@ fn attention_checks(
         q_norm: q_norm?,
         k_norm: k_norm?,
         cache: cache?,
+        gate: g.gate.is_some(),
+        window: g.window,
+        rope: rope?,
     })
+}
+
+/// A short conv layer: its input projection as the one segment of its P1, its
+/// output projection, its filters and the ring `taps` taps take. The plan's
+/// ring is held to the ring those taps make, so a plan and a description that
+/// disagree on the conv are refused by name here.
+fn conv_checks(
+    at: &mut At<'_>,
+    t: &Table<'_>,
+    c: &ShortConvPlan,
+    taps: usize,
+    hidden: usize,
+) -> Option<ConvLayout> {
+    if taps == 0 {
+        at.push(refuse("a short conv of no tap"));
+        return None;
+    }
+    let ring = Ring::new(taps);
+    if c.ring != ring {
+        at.push(refuse(format!(
+            "the plan's conv ring is {} taps; the layer's conv has {taps}",
+            c.ring.taps()
+        )));
+        return None;
+    }
+    let p1 = p1_checks(
+        at,
+        t,
+        &c.attn_norm,
+        &[(c.conv_in.as_str(), 3 * hidden)],
+        hidden,
+    );
+    let out = at.ok(t.site(&c.conv_out, hidden, hidden));
+    let conv = at.ok(t.f32s(&c.conv, hidden * taps));
+    Some(ConvLayout {
+        p1: p1?,
+        out: out?,
+        conv: conv?,
+        taps,
+        ring_rows: ring.rows(),
+        ring: ring.values(hidden),
+    })
+}
+
+/// The place in [`SharedShapes::ropes`] of the rope table a layer turns by:
+/// θ's `base` and the factors tensor `freqs` names, if any. An earlier
+/// layer's table when it has the same pair, else a new one whose factors the
+/// header must give as F32, one for each pair of the values the rope turns.
+fn rope_checks(
+    at: &mut At<'_>,
+    t: &Table<'_>,
+    shared: &mut SharedShapes,
+    base: f32,
+    freqs: Option<&str>,
+) -> Option<usize> {
+    let same = |r: &RopeLayout| {
+        r.base.to_bits() == base.to_bits() && r.factors.as_ref().map(|v| v.name.as_str()) == freqs
+    };
+    if let Some(place) = shared.ropes.iter().position(same) {
+        return Some(place);
+    }
+    let factors = match freqs {
+        Some(name) => Some(at.ok(t.f32s(name, t.geom.attn.rot / 2))?),
+        None => None,
+    };
+    shared.ropes.push(RopeLayout { base, factors });
+    Some(shared.ropes.len() - 1)
+}
+
+/// A layer's residual form. The plain add has nothing to read. A sandwich
+/// reads its two gains, F32 of `hidden` values, and keeps the plan's epsilon
+/// and scales. The join runs after the out projection of an attention or a
+/// short conv layer and after a dense FFN's down; a sandwich on a gated delta
+/// layer or over a routed FFN is refused by name, since the delta's out
+/// projection and the routed fold add into the stream. `None`: refused.
+fn post_checks(
+    at: &mut At<'_>,
+    t: &Table<'_>,
+    plan: &LayerPlan,
+    hidden: usize,
+) -> Option<Option<PostLayout>> {
+    let ResidualPlan::Sandwich(s) = &plan.residual else {
+        return Some(None);
+    };
+    let mut ok = true;
+    if matches!(plan.mixer, MixerPlan::Delta(_)) {
+        at.push(refuse(
+            "a sandwich residual on a gated delta layer; the delta step's out projection adds \
+             into the stream",
+        ));
+        ok = false;
+    }
+    if matches!(plan.ffn.route, FfnRoute::Router { .. }) {
+        at.push(refuse(
+            "a sandwich residual over a routed FFN; the routed fold adds into the stream",
+        ));
+        ok = false;
+    }
+    let [mixer, ffn] = s.norms.each_ref().map(|name| at.ok(t.f32s(name, hidden)));
+    let (mixer, ffn) = (mixer?, ffn?);
+    ok.then_some(Some(PostLayout {
+        gains: [mixer, ffn],
+    }))
 }
 
 fn ffn_checks(
@@ -1268,19 +1492,12 @@ fn layer_checks(
                 )));
                 ok = false;
             }
-            match shared.rope_base {
-                None => shared.rope_base = Some(spec_g.rope.base),
-                Some(b) if b == spec_g.rope.base => {}
-                Some(b) => {
-                    at.push(refuse(format!(
-                        "a rope base of {}, another layer's is {b}; one table serves one",
-                        spec_g.rope.base
-                    )));
-                    ok = false;
-                }
-            }
-            let attn = attention_checks(at, t, g, hidden, ctx);
+            let rope = rope_checks(at, t, shared, spec_g.rope.base, g.rope_freqs.as_deref());
+            let attn = attention_checks(at, t, g, hidden, ctx, rope);
             attn.filter(|_| ok).map(MixerLayout::Attention)
+        }
+        (MixerPlan::ShortConv(c), SpecMixer::ShortConv(spec_c)) => {
+            conv_checks(at, t, c, spec_c.taps as usize, hidden).map(MixerLayout::ShortConv)
         }
         _ => {
             at.push(refuse("the plan's mixer and the description's differ"));
@@ -1325,9 +1542,11 @@ fn layer_checks(
         ok = false;
     }
     let ffn = ffn_checks(at, t, plan, hidden, shape, l);
+    let post = post_checks(at, t, plan, hidden);
     ok.then_some(LayerLayout {
         mixer: mixer?,
         ffn: ffn?,
+        post: post?,
     })
 }
 
@@ -1413,6 +1632,17 @@ impl Checked {
                     b.kv.add(count(a.cache) * 2);
                     b.kv.add(count(a.cache) * 2);
                 }
+                MixerLayout::ShortConv(c) => {
+                    p1_weights(&mut b.weights, &c.p1);
+                    b.weights.add(c.out.bytes());
+                    b.weights.add(f32s(c.conv.len));
+                    b.state.add(f32s(c.ring));
+                }
+            }
+            if let Some(post) = &layer.post {
+                for gain in &post.gains {
+                    b.weights.add(f32s(gain.len));
+                }
             }
             let f = &layer.ffn;
             let sh = f.shared.as_ref();
@@ -1447,8 +1677,17 @@ impl Checked {
                 b.scratch.add(f32s(n));
             }
         }
+        // The rope tables, one a distinct base and factors; the conv's output
+        // and the sandwich's join buffer, where a layer has them.
+        for _ in &g.ropes {
+            b.scratch.add(f32s(g.rope_len));
+        }
+        for held in [g.has_conv(), g.has_join()] {
+            if held {
+                b.scratch.add(f32s(g.hidden));
+            }
+        }
         for words in [
-            g.rope_len,
             g.hidden,
             g.proj,
             geom.delta.value_heads * geom.delta.head_cols,
@@ -1488,26 +1727,52 @@ impl Checked {
 mod tests {
     use std::path::PathBuf;
 
+    use chain::arch::qwen3moe::plan::SandwichPlan;
     use chain::arch::qwen3moe::read::layer_plans;
     use gguf::Value;
     use gguf::write::{Layout as FileLayout, TensorDecl};
+    use model::arch::models::Residual;
 
     use super::*;
     use crate::instance::{FfnAxes, MoeAxes};
 
     /// A file's header and tensor table, in memory, at a registered row's
-    /// shapes: two layers (the Qwen3.6 row's a delta layer, then an attention
-    /// one: `full_attention_interval` 2), every weight Q4_K but the head's
-    /// Q6_K, and no weight byte anywhere. A test edits it and reads it back as
-    /// a `Split`.
+    /// shapes (or `lfm3_instance`'s): two layers (the Qwen3.6 row's a delta
+    /// layer, then an attention one: `full_attention_interval` 2), every
+    /// weight Q4_K but the head's Q6_K, and no weight byte anywhere. A test
+    /// edits it and reads it back as a `Split`.
     struct Synthetic {
         kvs: Vec<(String, Value)>,
         tensors: Vec<(String, Vec<u64>, GgmlType)>,
+        /// The first attention layer's place.
+        attn_layer: usize,
     }
 
     /// The Qwen3.6 row's residual width, for the tests that pin its words.
     const HIDDEN: u64 = 2048;
     const VOCAB: u64 = 248_320;
+    /// LFM3-1.7B's layers: a short conv (c), a full attention layer (F) or a
+    /// sliding one (S).
+    const LFM3_KINDS: &str = "ccFcScFcScFcScFcScFcScFc";
+    const LFM3_VOCAB: u64 = 128_000;
+    /// A sliding layer's window, and the taps of every short conv.
+    const LFM3_WINDOW: u32 = 256;
+    const LFM3_TAPS: u64 = 7;
+    /// The dense FFN of LFM3-1.7B's every layer.
+    const LFM3_FF: u32 = 7680;
+
+    /// The instance of an LFM3-1.7B file: no row registers its dense FFN, so
+    /// it is the one made at open for its key, at the attention axes of the
+    /// kernel gate's `LFM3_ATTN` row.
+    fn lfm3_instance() -> &'static Instance {
+        let key = instance::Key {
+            hidden: u32::try_from(HIDDEN).expect("the width fits u32"),
+            ffn: FfnAxes::Dense { ff: LFM3_FF },
+            attn: instance::LFM3_ATTN.key.attn,
+            delta: None,
+        };
+        instance::open_key(key).expect("every kernel takes LFM3's geometry")
+    }
     /// The key heads of the delta layer's conv channels: a file's own count,
     /// no axis of an instance.
     const KEY_HEADS: u32 = 16;
@@ -1523,6 +1788,9 @@ mod tests {
         /// delta layer ahead of it when the row has a delta axis).
         fn of(inst: &Instance) -> Synthetic {
             let key = &inst.key;
+            if key.delta.is_none() && key.is_dense() {
+                return Synthetic::lfm3(inst);
+            }
             let moe = key.routed();
             let (arch, pre, delta) = match (key.delta, moe.map(|m| m.router.rule.gated)) {
                 (Some(d), Some(true)) => ("qwen35moe", "qwen35", Some(d)),
@@ -1598,6 +1866,7 @@ mod tests {
             let mut t = Synthetic {
                 kvs,
                 tensors: Vec::new(),
+                attn_layer: 1,
             };
             let hidden = u64::from(key.hidden);
             let (ff, experts) = (
@@ -1670,6 +1939,116 @@ mod tests {
             t
         }
 
+        /// The table of an LFM3 file of `inst`'s shape (`lfm3`): the
+        /// [`LFM3_KINDS`] layers, a dense FFN and the sandwich's two norms in
+        /// each, the rope's factors, and a head tied to the embedding (no
+        /// `output.weight`), whose type, Q5_K, both the embedding and the head
+        /// read. Every weight is Q4_K but the embedding.
+        fn lfm3(inst: &Instance) -> Synthetic {
+            let key = &inst.key;
+            let a = &key.attn;
+            let FfnAxes::Dense { ff } = key.ffn else {
+                panic!("{}: the LFM3 table has a dense FFN", inst.name);
+            };
+            let u = |k: &str, v: u32| (format!("lfm3.{k}"), Value::U32(v));
+            let kv_heads: Vec<Value> = LFM3_KINDS
+                .chars()
+                .map(|c| {
+                    Value::I32(if c == 'c' {
+                        0
+                    } else {
+                        i32::try_from(a.n_kv).expect("fits")
+                    })
+                })
+                .collect();
+            let sliding: Vec<Value> = LFM3_KINDS.chars().map(|c| Value::Bool(c == 'S')).collect();
+            let kvs = vec![
+                (
+                    gguf::GENERAL_ARCHITECTURE.to_owned(),
+                    Value::String("lfm3".to_owned()),
+                ),
+                (
+                    "tokenizer.ggml.pre".to_owned(),
+                    Value::String("lfm2".to_owned()),
+                ),
+                u(
+                    "block_count",
+                    u32::try_from(LFM3_KINDS.len()).expect("the layer count fits u32"),
+                ),
+                u("embedding_length", key.hidden),
+                u("context_length", 128_000),
+                u(
+                    "vocab_size",
+                    u32::try_from(LFM3_VOCAB).expect("the vocabulary fits u32"),
+                ),
+                u("feed_forward_length", ff),
+                u("attention.head_count", a.n_head),
+                (
+                    "lfm3.attention.head_count_kv".to_owned(),
+                    Value::Array(kv_heads),
+                ),
+                u("attention.key_length", a.row.head),
+                u("attention.value_length", a.row.value),
+                (
+                    "lfm3.attention.layer_norm_rms_epsilon".to_owned(),
+                    Value::F32(1e-5),
+                ),
+                u("attention.sliding_window", LFM3_WINDOW),
+                (
+                    "lfm3.attention.sliding_window_pattern".to_owned(),
+                    Value::Array(sliding),
+                ),
+                ("lfm3.rope.freq_base".to_owned(), Value::F32(1e6)),
+                ("lfm3.rope.freq_base_swa".to_owned(), Value::F32(1e4)),
+                u("rope.dimension_count", a.rot),
+                u("shortconv.l_cache", 7),
+            ];
+            let mut t = Synthetic {
+                kvs,
+                tensors: Vec::new(),
+                attn_layer: LFM3_KINDS.find(['F', 'S']).expect("an attention layer"),
+            };
+            let e = u64::from(key.hidden);
+            let (heads, kv, head) = (
+                u64::from(a.n_head),
+                u64::from(a.n_kv),
+                u64::from(a.row.head),
+            );
+            let ff = u64::from(ff);
+            let q = GgmlType::Q4_K;
+            t.add("token_embd.weight", &[e, LFM3_VOCAB], GgmlType::Q5_K);
+            t.add("output_norm.weight", &[e], GgmlType::F32);
+            t.add("rope_freqs.weight", &[u64::from(a.rot) / 2], GgmlType::F32);
+            for (l, kind) in LFM3_KINDS.chars().enumerate() {
+                let b = |s: &str| format!("blk.{l}.{s}.weight");
+                for norm in [
+                    "attn_norm",
+                    "post_attention_norm",
+                    "ffn_norm",
+                    "post_ffw_norm",
+                ] {
+                    t.add(&b(norm), &[e], GgmlType::F32);
+                }
+                t.add(&b("ffn_gate"), &[e, ff], q);
+                t.add(&b("ffn_up"), &[e, ff], q);
+                t.add(&b("ffn_down"), &[ff, e], q);
+                if kind == 'c' {
+                    t.add(&b("shortconv.in_proj"), &[e, 3 * e], q);
+                    t.add(&b("shortconv.conv"), &[LFM3_TAPS, e], GgmlType::F32);
+                    t.add(&b("shortconv.out_proj"), &[e, e], q);
+                } else {
+                    t.add(&b("attn_q"), &[e, heads * head], q);
+                    t.add(&b("attn_k"), &[e, kv * head], q);
+                    t.add(&b("attn_v"), &[e, kv * head], q);
+                    t.add(&b("attn_output"), &[heads * head, e], q);
+                    t.add(&b("attn_gate"), &[e, heads], q);
+                    t.add(&b("attn_q_norm"), &[head], GgmlType::F32);
+                    t.add(&b("attn_k_norm"), &[head], GgmlType::F32);
+                }
+            }
+            t
+        }
+
         fn add(&mut self, name: &str, dims: &[u64], ty: GgmlType) {
             self.tensors.push((name.to_owned(), dims.to_vec(), ty));
         }
@@ -1707,6 +2086,21 @@ mod tests {
         /// The bytes of every tensor the table holds.
         fn tensor_bytes(&self) -> u64 {
             self.decls().iter().map(|d| d.nbytes).sum()
+        }
+
+        /// The bytes of the weight buffers the arena makes of the table: every
+        /// tensor but the rope's factors (they make a table of the arena's
+        /// own), and the embedding a second time when the head is tied to it.
+        fn weight_bytes(&self) -> u64 {
+            let of = |name: &str| {
+                self.decls()
+                    .iter()
+                    .find(|d| d.name == name)
+                    .map_or(0, |d| d.nbytes)
+            };
+            let tied = of("output.weight") == 0;
+            self.tensor_bytes() - of("rope_freqs.weight")
+                + if tied { of("token_embd.weight") } else { 0 }
         }
 
         fn decls(&self) -> Vec<TensorDecl> {
@@ -1785,20 +2179,21 @@ mod tests {
             let bytes = checked.bytes().expect("the bytes");
             assert_eq!(
                 bytes.weights.requested,
-                t.tensor_bytes(),
+                t.weight_bytes(),
                 "{name}: the weights"
             );
             assert!(bytes.total().paged >= bytes.total().requested, "{name}");
 
             let head = inst.key.attn.row.head;
             let wrong = u64::from(head) + 32;
-            let t = t.dims("blk.1.attn_q_norm.weight", &[wrong]);
+            let l = t.attn_layer;
+            let t = t.dims(&format!("blk.{l}.attn_q_norm.weight"), &[wrong]);
             let got = texts(&t.split(), CTX);
             assert_eq!(
                 got,
                 [format!(
-                    "qwen35moe arena: layer 1: blk.1.attn_q_norm.weight is F32 [{wrong}]; the step \
-                     reads {head} F32 values"
+                    "qwen35moe arena: layer {l}: blk.{l}.attn_q_norm.weight is F32 [{wrong}]; the \
+                     step reads {head} F32 values"
                 )],
                 "{name}"
             );
@@ -2665,6 +3060,486 @@ mod tests {
             .chain(chain::site::BACKEND_SITES.iter().map(|r| r.1))
         {
             assert!(ANY.contains(&family), "{family:?} is in no widest list");
+        }
+    }
+
+    /// An LFM3-1.7B file opens the instance made at open for its key, at the
+    /// attention row of `LFM3_ATTN`, with a layout of each of its kinds: thirteen short convs of seven taps over a ring of fourteen
+    /// slots, eleven attention layers whose P1 holds the output gate as the
+    /// fourth segment, a window on the sliding layers only, two rope tables (the
+    /// full layers' θ with the file's factors, the sliding layers' without),
+    /// a sandwich on every layer, and a head that is the embedding again.
+    /// Mutant: `conv_checks` or `rope_checks` or `post_checks` is a refusal, or
+    /// the gate is left out of the P1's parts.
+    #[test]
+    fn an_lfm3_file_opens_an_instance_made_at_open_with_a_layout_of_each_kind() {
+        let inst = lfm3_instance();
+        let out = check(&Synthetic::of(inst).split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let summary = out.spec.clone().expect("the description reads");
+        assert_eq!(
+            (
+                summary.layers,
+                summary.delta,
+                summary.conv,
+                summary.attention
+            ),
+            (24, 0, 13, 11)
+        );
+        assert_eq!((summary.experts, summary.picks), (0, 0));
+        let checked = out.checked.expect("a checked file");
+        assert_eq!(*checked.instance, *inst);
+        assert_eq!(inst.name, instance::UNREGISTERED);
+        assert_eq!(inst.key.attn, instance::LFM3_ATTN.key.attn);
+        assert_eq!(checked.geom, Geometry::of(inst), "the geometry");
+        let layout = &checked.layout;
+        let table = |i: usize| {
+            let r = &layout.ropes[i];
+            (r.base, r.factors.as_ref().map(|v| (v.name.as_str(), v.len)))
+        };
+        assert_eq!(layout.ropes.len(), 2);
+        assert_eq!(table(0), (1e6, Some(("rope_freqs.weight", 64))));
+        assert_eq!(table(1), (1e4, None));
+        for (l, (kind, layer)) in LFM3_KINDS.chars().zip(&layout.layers).enumerate() {
+            match (kind, &layer.mixer) {
+                ('c', MixerLayout::ShortConv(c)) => {
+                    assert_eq!(
+                        (c.taps, c.ring_rows, c.ring),
+                        (7, 14, 14 * HIDDEN as usize),
+                        "layer {l}"
+                    );
+                    assert_eq!(c.p1.dispatches.len(), 1, "layer {l}");
+                    assert_eq!(c.p1.dispatches[0].members, [0], "layer {l}");
+                    assert_eq!(c.p1.range(0), 0..3 * HIDDEN as usize, "layer {l}");
+                }
+                ('F' | 'S', MixerLayout::Attention(a)) => {
+                    let want = if kind == 'F' {
+                        (None, 0)
+                    } else {
+                        (Some(LFM3_WINDOW), 1)
+                    };
+                    assert_eq!((a.window, a.rope), want, "layer {l}");
+                    assert!(a.gate, "layer {l}: the head gate");
+                    assert_eq!(a.p1.dispatches.len(), 1, "layer {l}");
+                    assert_eq!(a.p1.dispatches[0].members, [0, 1, 2, 3], "layer {l}");
+                    assert_eq!(a.p1.range(3).len(), 16, "layer {l}: a row a query head");
+                }
+                _ => panic!("layer {l} is not a {kind}"),
+            }
+            assert!(layer.post.is_some(), "layer {l}: a sandwich");
+        }
+        assert_eq!(layout.head.name, "token_embd.weight");
+        assert_eq!(layout.embed.name, "token_embd.weight");
+    }
+
+    /// `Checked::bytes` of an LFM3-1.7B file, class by class: thirteen conv
+    /// rings of 114,688 B in the state, the eleven attention layers' caches,
+    /// two rope tables, a conv output and a join buffer among the arena's
+    /// buffers, the gate rows beside the pass's, and the embedding twice in the
+    /// weights (the tied head is its second buffer). Mutant: the head or the
+    /// ring count, a rope table, `conv_y`, `join` or the gate rows is left out
+    /// of `Checked::bytes` or of `RowsLens`.
+    #[test]
+    fn the_bytes_of_an_lfm3_file_pin_the_rings_the_tables_the_gate_rows_and_the_head() {
+        use super::super::arena::RECORD_SLOTS;
+
+        let inst = lfm3_instance();
+        let g = Geometry::of(inst);
+        let t = Synthetic::of(inst);
+        let checked = check(&t.split(), CTX).checked.expect("a checked file");
+        let bytes = checked.bytes().expect("the bytes");
+        let f32s = |n: usize| count(n) * 4;
+        let (hidden, vocab) = (HIDDEN as usize, LFM3_VOCAB as usize);
+
+        // The tensors but the factors, and the embedding again: the head. The
+        // buffers are the head's three, a conv layer's ten (P1, its norm, out,
+        // filters, two gains, gate, up, down, the FFN's norm) and an attention
+        // layer's eleven (P1, its norm, out, two head norms, the same six).
+        assert_eq!(bytes.weights.requested, t.weight_bytes());
+        assert_eq!(bytes.weights.buffers, 3 + 13 * 10 + 11 * 11);
+
+        // The K and the V cache of each attention layer, f16.
+        let cache = count(g.attn.kv_heads * CTX * g.attn.head) * 2;
+        assert_eq!(bytes.kv, class(&[cache; 22]));
+
+        // A conv layer's ring: `rows` rows of the hidden width, f32.
+        let ring = f32s(Ring::new(7).values(hidden));
+        assert_eq!(ring, 114_688);
+        assert_eq!(bytes.state, class(&[ring; 13]));
+
+        // Each layer's fixed route (one id, one weight), the two rope tables,
+        // the conv's output and the join buffer, then the token arena's
+        // buffers in field order.
+        let proj = 3 * hidden;
+        let attn_out = g.attn.out_len().expect("the attention rows fit");
+        let attn_partials = g
+            .attn
+            .partials_len(segments_for_keys(CTX as u32) as usize)
+            .expect("the partials fit");
+        let mut scratch: Vec<u64> = vec![f32s(1); 2 * 24];
+        scratch.extend([CTX * g.attn.rot; 2].map(f32s));
+        scratch.extend([hidden; 2].map(f32s));
+        scratch.extend(
+            [
+                hidden,                                  // x
+                proj,                                    // proj
+                g.delta.value_heads * g.delta.head_cols, // g
+                g.delta.partials_stride,                 // delta_partials
+                attn_out,                                // attn
+                attn_partials,                           // attn_partials
+                1,                                       // attn_ticket
+                g.experts.slots * g.experts.k,           // h
+                vocab,                                   // logits
+                1,                                       // head_ticket
+                RECORD_SLOTS,                            // step_id
+                1,                                       // id_in
+                LANES,                                   // lane
+            ]
+            .map(f32s),
+        );
+        scratch.push(count(head_groups(vocab)) * 8); // candidates
+        scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
+        assert_eq!(bytes.scratch, class(&scratch));
+
+        // The rows arena of a pass of `cap` rows: ids, residual, normed input,
+        // P1 output, mixer rows, delta partials and prepared rows, a dense
+        // FFN's gate and up rows, and the output gate, a row of the query heads.
+        let cap = pass_rows_max(&g).min(CTX);
+        let mix = (g.delta.value_heads * g.delta.head_cols)
+            .max(g.attn.query_heads * g.attn.head)
+            .max(hidden);
+        let rows = [
+            cap,
+            cap * hidden,
+            cap * hidden,
+            cap * proj.next_multiple_of(4),
+            cap * mix,
+            cap * g.delta.partials_stride,
+            cap,
+            cap * g.experts.k,
+            cap * g.experts.k,
+            cap * g.attn.query_heads,
+        ]
+        .map(f32s);
+        assert_eq!(bytes.rows, class(&rows));
+    }
+
+    /// A file with no `output.weight` reads its head from the token embedding;
+    /// a file with its own head reads that; a file with neither refuses the
+    /// embedding and the head each by name; and a tied embedding the head
+    /// cannot read is refused in the head's words. Mutant: `head_tensor`
+    /// answers the embedding without finding it, or never answers it.
+    #[test]
+    fn a_head_with_no_output_weight_is_the_embedding_again() {
+        let inst = lfm3_instance();
+        let split = Synthetic::of(inst).split();
+        let checked = check(&split, CTX).checked.expect("a tied file opens");
+        assert_eq!(checked.layout.head.name, "token_embd.weight");
+        assert_eq!(checked.layout.head.quant, Quant::Q5K);
+
+        let mut own = Synthetic::of(inst);
+        own.add("output.weight", &[HIDDEN, LFM3_VOCAB], GgmlType::Q6_K);
+        let checked = check(&own.split(), CTX)
+            .checked
+            .expect("an untied file opens");
+        assert_eq!(checked.layout.head.name, "output.weight");
+        assert_eq!(checked.layout.embed.name, "token_embd.weight");
+
+        // Neither: the description reads the intact file, the tables are judged
+        // on the file with the embedding dropped.
+        let spec = model::arch::spec(&split)
+            .expect("the description reads")
+            .spec;
+        let bare = Synthetic::of(inst).drop("token_embd.weight").split();
+        let geom = Geometry::of(inst);
+        let mut items = Vec::new();
+        let got = head_checks(
+            &mut At {
+                items: &mut items,
+                layer: None,
+            },
+            &Table {
+                split: &bare,
+                geom: &geom,
+            },
+            &spec,
+            CTX,
+        );
+        assert!(got.is_none());
+        let said: Vec<String> = items.iter().map(|i| i.error.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "qwen35moe arena: the file has no tensor token_embd.weight",
+                "qwen35moe arena: the file has no tensor output.weight"
+            ]
+        );
+
+        let got = texts(
+            &Synthetic::of(inst)
+                .ty("token_embd.weight", GgmlType::Q4_K)
+                .split(),
+            CTX,
+        );
+        assert_eq!(
+            got,
+            [
+                "qwen35moe arena: token_embd.weight is Q4K; the head reads Q6_K, MLX_A4, Q8_0 or \
+                 Q5_K"
+            ]
+        );
+    }
+
+    /// Layer `l` of `t` as the layer check meets it with its residual replaced
+    /// by a sandwich of the file's own `attn_norm` (F32, `hidden` values): its
+    /// items, and whether it has a layout.
+    fn sandwiched(t: &Synthetic, l: usize) -> (Vec<String>, bool) {
+        let split = t.split();
+        let spec = model::arch::spec(&split)
+            .expect("the description reads")
+            .spec;
+        let kinds = kinds_of(&spec.layers).expect("the kinds read");
+        let pd = PlanDims::of(&spec, WHAT).expect("the dims read");
+        let mut plans = layer_plans(
+            &split,
+            WHAT,
+            &pd,
+            &kinds,
+            &spec.layers,
+            &SITES,
+            Read35::Whole,
+        )
+        .expect("the plans read");
+        let norm = format!("blk.{l}.attn_norm.weight");
+        plans[l].residual = ResidualPlan::Sandwich(SandwichPlan {
+            eps: 1e-5,
+            add: [1.0, 1.0],
+            norms: [norm.clone(), norm],
+        });
+        let inst = instance::select(&spec).expect("the instance");
+        let geom = Geometry::of(inst);
+        let table = Table {
+            split: &split,
+            geom: &geom,
+        };
+        let mut items = Vec::new();
+        let layout = layer_checks(
+            &mut At {
+                items: &mut items,
+                layer: Some(l),
+            },
+            &table,
+            &plans[l],
+            &spec.layers[l],
+            spec.hidden as usize,
+            CTX,
+            &mut SharedShapes::default(),
+        );
+        (
+            items.iter().map(|i| i.error.to_string()).collect(),
+            layout.is_some(),
+        )
+    }
+
+    /// A sandwich is run after an attention or a short conv layer's out
+    /// projection and after a dense FFN's down; on a gated delta layer, or over
+    /// a routed FFN, it is refused by name at the layer. Mutant: either refusal
+    /// is deleted from `post_checks`, or the sandwich is refused whatever the
+    /// layer.
+    #[test]
+    fn a_sandwich_is_refused_by_name_on_a_delta_layer_and_over_a_routed_ffn() {
+        let mut dense_inst = instance::QWEN35MOE_A3B;
+        dense_inst.key.ffn = FfnAxes::Dense { ff: 512 };
+        let dense = Synthetic::of(&dense_inst);
+        // Layer 1 is attention over a dense FFN: the sandwich runs.
+        assert_eq!(sandwiched(&dense, 1), (Vec::new(), true));
+        // Layer 0 is a delta layer.
+        assert_eq!(
+            sandwiched(&dense, 0),
+            (
+                vec![
+                    "qwen35moe arena: layer 0: a sandwich residual on a gated delta layer; the \
+                     delta step's out projection adds into the stream"
+                        .to_owned()
+                ],
+                false
+            )
+        );
+        // Qwen3.6's layer 1 is attention over a routed FFN; its layer 0 is both.
+        let routed = Synthetic::new();
+        let fold = "qwen35moe arena: layer 1: a sandwich residual over a routed FFN; the routed \
+                    fold adds into the stream";
+        assert_eq!(sandwiched(&routed, 1), (vec![fold.to_owned()], false));
+        let (items, laid_out) = sandwiched(&routed, 0);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(!laid_out && items[0].contains("a gated delta layer"));
+        assert!(items[1].ends_with("over a routed FFN; the routed fold adds into the stream"));
+    }
+
+    /// A rope table is one for each base and factors the layers ask for, and
+    /// the factors are read as F32, a value for each pair of the values the
+    /// rope turns: a table of another length or type is refused by name at
+    /// the layer that asks, and makes no table. Mutant: `rope_checks` reads
+    /// the factors' tensor without `f32s`, or matches a table by its base
+    /// alone.
+    #[test]
+    fn a_rope_table_is_one_a_base_and_factors_and_a_factor_table_is_held_to_f32_pairs() {
+        let inst = lfm3_instance();
+        let geom = Geometry::of(inst);
+        for (case, t, want) in [
+            (
+                "length",
+                Synthetic::of(inst).dims("rope_freqs.weight", &[31]),
+                "rope_freqs.weight is F32 [31]; the step reads 64 F32 values",
+            ),
+            (
+                "type",
+                Synthetic::of(inst).ty("rope_freqs.weight", GgmlType::F16),
+                "rope_freqs.weight is F16 [64]; the step reads 64 F32 values",
+            ),
+        ] {
+            let split = t.split();
+            let mut items = Vec::new();
+            let mut shared = SharedShapes::default();
+            let got = rope_checks(
+                &mut At {
+                    items: &mut items,
+                    layer: Some(2),
+                },
+                &Table {
+                    split: &split,
+                    geom: &geom,
+                },
+                &mut shared,
+                1e6,
+                Some("rope_freqs.weight"),
+            );
+            assert_eq!(got, None, "{case}");
+            assert!(shared.ropes.is_empty(), "{case}: no table was made");
+            let said: Vec<String> = items.iter().map(|i| i.error.to_string()).collect();
+            assert_eq!(
+                said,
+                [format!("qwen35moe arena: layer 2: {want}")],
+                "{case}"
+            );
+        }
+
+        let split = Synthetic::of(inst).split();
+        let table = Table {
+            split: &split,
+            geom: &geom,
+        };
+        let mut shared = SharedShapes::default();
+        let mut items = Vec::new();
+        let mut place = |base: f32, freqs: Option<&str>| {
+            rope_checks(
+                &mut At {
+                    items: &mut items,
+                    layer: Some(2),
+                },
+                &table,
+                &mut shared,
+                base,
+                freqs,
+            )
+        };
+        assert_eq!(place(1e6, Some("rope_freqs.weight")), Some(0));
+        assert_eq!(place(1e4, None), Some(1));
+        assert_eq!(place(1e6, Some("rope_freqs.weight")), Some(0), "one table");
+        assert_eq!(place(1e6, None), Some(2), "the factors are the table's own");
+        assert_eq!(place(1e4, None), Some(1));
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    /// The plan's conv ring is held to the ring the layer's taps make: a plan
+    /// and a description that disagree on the conv are refused by name.
+    /// Mutant: `conv_checks` does not compare the ring.
+    #[test]
+    fn a_conv_plan_ring_that_differs_from_the_layers_is_refused_by_name() {
+        let inst = lfm3_instance();
+        let split = Synthetic::of(inst).split();
+        let geom = Geometry::of(inst);
+        let spec = model::arch::spec(&split)
+            .expect("the description reads")
+            .spec;
+        let pd = PlanDims::of(&spec, WHAT).expect("the dims read");
+        let mut plan =
+            plan_shortconv(&split, WHAT, &pd, Ring::new(7), 0, &SITES).expect("the plan reads");
+        let table = Table {
+            split: &split,
+            geom: &geom,
+        };
+        let run = |plan: &ShortConvPlan| {
+            let mut items = Vec::new();
+            let got = conv_checks(
+                &mut At {
+                    items: &mut items,
+                    layer: Some(0),
+                },
+                &table,
+                plan,
+                7,
+                HIDDEN as usize,
+            );
+            let said: Vec<String> = items.iter().map(|i| i.error.to_string()).collect();
+            (got.is_some(), said)
+        };
+        assert_eq!(run(&plan), (true, Vec::new()));
+        plan.ring = Ring::new(5);
+        assert_eq!(
+            run(&plan),
+            (
+                false,
+                vec![
+                    "qwen35moe arena: layer 0: the plan's conv ring is 5 taps; the layer's conv \
+                     has 7"
+                        .to_owned()
+                ]
+            )
+        );
+    }
+
+    /// A description whose residual is neither the plain add nor the sandwich
+    /// is refused by name at its layer, from the description alone, and the
+    /// check returns none. A layer that is not a sandwich reads one pre-FFN
+    /// norm, so the file's two norms at the layer refuse its FFN half beside
+    /// the residual's own refusal: both are at the layer, the residual's once.
+    /// Mutant: chain's `plan_residual` plans `Residual::Hc` or
+    /// `Residual::AlphaBeta` as the plain add.
+    #[test]
+    fn a_residual_the_session_does_not_run_is_refused_by_name_at_check() {
+        let inst = lfm3_instance();
+        let split = Synthetic::of(inst).split();
+        for residual in [Residual::Hc, Residual::AlphaBeta { eps: 1e-5 }] {
+            let mut spec = model::arch::spec(&split)
+                .expect("the description reads")
+                .spec;
+            spec.layers[3].residual = residual;
+            let mut items = Vec::new();
+            let mut summary = None;
+            let checked = read_spec(
+                &split,
+                &spec,
+                "synthetic.gguf",
+                CTX,
+                &mut items,
+                &mut summary,
+            );
+            assert!(checked.is_none(), "{residual:?}");
+            let said: Vec<String> = items.iter().map(|i| i.error.to_string()).collect();
+            assert!(
+                items.iter().all(|i| i.layer == Some(3)),
+                "{residual:?}: {said:?}"
+            );
+            let refused = said
+                .iter()
+                .filter(|s| s.contains("layer 3: the residual") && s.contains("no walk here runs"))
+                .count();
+            assert_eq!(refused, 1, "{residual:?}: {said:?}");
+            assert!(
+                said.iter().any(|s| s.contains("the pre-FFN norm is one")),
+                "{residual:?}: {said:?}"
+            );
         }
     }
 }
