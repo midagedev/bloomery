@@ -105,6 +105,12 @@ pub trait FolderMap: Sized {
     /// The tokenizer's vocabulary fields of the config.
     fn vocab(&self) -> &VocabSpec;
 
+    /// The tensors of the header that no folder tensor holds, by the program's name: values the
+    /// map makes of the config. A name a mapped tensor has is refused.
+    fn constants(&self) -> Result<BTreeMap<String, Constant>, Error> {
+        Ok(BTreeMap::new())
+    }
+
     /// The draft the folder holds beside the target the map reads (tensors the map skips as a
     /// draft's), as a load opens it: its header, named by `path` as the target's header is, and
     /// its planned tensors, each in its stored format, which join the part source; `None` for a
@@ -209,6 +215,23 @@ impl<S> Mapped<S> {
     }
 }
 
+/// A tensor of the header that no folder tensor holds: F32 values the map makes of the config,
+/// such as the rope's frequency factors, which a GGUF file stores as a tensor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Constant {
+    /// ggml's dims, the fastest axis first.
+    pub dims: Vec<u64>,
+    /// The values, as many as the dims hold, all finite.
+    pub values: Vec<f32>,
+}
+
+impl Constant {
+    /// The values as the little-endian bytes of the F32 tensor.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+}
+
 /// `x + 1` on an F32 norm gain: the Gemma norm scales by `1 + weight`, and the program's norm
 /// scales by its gain. A map whose only move is this one takes it as its [`FolderMap::Step`]; a
 /// map with moves of its own has a step that calls it.
@@ -237,6 +260,30 @@ impl PlusOne {
     }
 }
 
+/// The one unit dim of a 3-D tensor dropped, its bytes as they are: an MLX convolution stores its
+/// taps `[channels, kernel, 1]` (ggml dims `[1, kernel, channels]`), rows of `kernel` values once
+/// it is gone. A map whose only move is this one takes it as its [`FolderMap::Step`]; a map with
+/// moves of its own has a step that calls it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Squeeze;
+
+impl Squeeze {
+    /// Drop the unit dim of the 3-D tensor `t`. A tensor of another rank, or with no unit dim or
+    /// more than one, is refused with why (the caller names the tensor), and `t` is then as it
+    /// was.
+    pub fn apply(&self, t: &mut Normal) -> Result<(), String> {
+        let unit = t.dims.iter().filter(|&&n| n == 1).count();
+        if t.dims.len() != 3 || unit != 1 {
+            return Err(format!(
+                "{:?} is not a 3-D tensor with one unit dim",
+                t.dims
+            ));
+        }
+        t.dims.retain(|&n| n != 1);
+        Ok(())
+    }
+}
+
 /// One tensor of the split: its declaration and how its bytes are made.
 pub struct Planned<S> {
     pub decl: TensorDecl,
@@ -249,6 +296,8 @@ pub enum Make<S> {
     Tensor(Mapped<S>),
     /// The `.scale` beside the tensor `of`: its tensor scales, one a source for a stack.
     Scale { of: String },
+    /// The values the map gives ([`FolderMap::constants`]); no folder tensor is a source.
+    Constant(Constant),
 }
 
 /// The folder as both readers take it: its config, its tensors, the quantization plan, the
@@ -532,11 +581,20 @@ fn assemble<M: FolderMap>(
     let layout = Layout::new(kvs, planned.iter().map(|p| p.decl.clone()).collect())?;
     let mut spots = Vec::with_capacity(planned.len());
     let mut made = BTreeMap::new();
+    let mut constants = BTreeMap::new();
     let mut rows = BTreeMap::new();
     for Planned { decl, make } in planned {
-        let Make::Tensor(m) = make else {
-            spots.push(Spot::Made);
-            continue;
+        let m = match make {
+            Make::Tensor(m) => m,
+            Make::Constant(c) => {
+                constants.insert(decl.name.clone(), c);
+                spots.push(Spot::Made);
+                continue;
+            }
+            Make::Scale { .. } => {
+                spots.push(Spot::Made);
+                continue;
+            }
         };
         if m.role == Use::Rows {
             rows.insert(decl.name.clone(), table_rows(&folder, &plan, &decl, &m)?);
@@ -617,8 +675,12 @@ fn assemble<M: FolderMap>(
             };
             let mut parts = BTreeMap::new();
             for Planned { decl, make } in tensors {
-                let Make::Tensor(m) = make else {
-                    continue;
+                let m = match make {
+                    Make::Tensor(m) => m,
+                    Make::Scale { .. } => continue,
+                    Make::Constant(_) => {
+                        return Err(refuse(&decl.name, "a draft's constant is not read"));
+                    }
                 };
                 if m.role == Use::Rows {
                     return Err(refuse(&decl.name, "a draft's row table is not read"));
@@ -640,7 +702,7 @@ fn assemble<M: FolderMap>(
     Ok(Assembled {
         header,
         draft,
-        source: part::Checkpoint::new(folder, plan, made)?,
+        source: part::Checkpoint::new(folder, plan, made)?.with_constants(constants),
         rows,
     })
 }
@@ -881,7 +943,11 @@ pub fn plan_tensors<M: FolderMap>(
         } else {
             HashMap::new()
         };
-    let planned = planned_tensors(&plan, mapped, q8, &stored)?;
+    let mut planned = planned_tensors(&plan, mapped, q8, &stored)?;
+    for (name, constant) in checkpoint.constants()? {
+        let one = planned_constant(&planned, name, constant)?;
+        planned.push(one);
+    }
     Ok(Planning {
         plan,
         planned,
@@ -984,6 +1050,52 @@ pub fn planned_tensors<S>(
         }
     }
     Ok(planned)
+}
+
+/// The constant `name` declared F32 at its dims. A name another tensor of the header has, dims
+/// that are empty, hold a zero or do not take as many values as the constant has, and a value
+/// that is not finite are refused by name.
+fn planned_constant<S>(
+    taken: &[Planned<S>],
+    name: String,
+    constant: Constant,
+) -> Result<Planned<S>, Error> {
+    if taken.iter().any(|p| p.decl.name == name) {
+        return Err(refuse(
+            &name,
+            "is a constant of the map and a tensor of the folder's",
+        ));
+    }
+    let count = constant
+        .dims
+        .iter()
+        .try_fold(1u64, |n, &d| n.checked_mul(d))
+        .filter(|&n| n > 0 && !constant.dims.is_empty());
+    if count != Some(constant.values.len() as u64) {
+        return Err(refuse(
+            &name,
+            format!(
+                "dims {:?} do not take its {} values",
+                constant.dims,
+                constant.values.len()
+            ),
+        ));
+    }
+    if let Some(v) = constant.values.iter().find(|v| !v.is_finite()) {
+        return Err(refuse(&name, format!("the constant holds {v}")));
+    }
+    let type_id = GgmlType::F32.as_u32();
+    let nbytes = size_of(type_id, &constant.dims)
+        .ok_or_else(|| format!("{name}: dims {:?} are not whole F32 rows", constant.dims))?;
+    Ok(Planned {
+        decl: TensorDecl {
+            name,
+            dims: constant.dims.clone(),
+            type_id,
+            nbytes,
+        },
+        make: Make::Constant(constant),
+    })
 }
 
 /// The type id of the tensor `name`, mapped as `m` to stay in the one file tensor as stored: its
@@ -1311,7 +1423,7 @@ mod tests {
     /// A model of a few tensors that asks for every way the owner keeps one: an embedding and a
     /// router kept as stored, a norm made with a step, three experts kept as a stack, and a
     /// vision tensor skipped. Anything else the folder holds the map reads nor skips.
-    struct Toy(VocabSpec, bool);
+    struct Toy(VocabSpec, bool, Option<String>);
 
     impl FolderMap for Toy {
         type Step = ();
@@ -1321,6 +1433,7 @@ mod tests {
             Ok(Toy(
                 VocabSpec::parse(config)?,
                 config["keep"].as_bool().unwrap_or(true),
+                config["constant"].as_str().map(str::to_string),
             ))
         }
 
@@ -1412,6 +1525,23 @@ mod tests {
 
         fn vocab(&self) -> &VocabSpec {
             &self.0
+        }
+
+        fn constants(&self) -> Result<BTreeMap<String, Constant>, Error> {
+            Ok(self
+                .2
+                .iter()
+                .map(|name| {
+                    let values = vec![1.0, 1e30, -2.0, 0.5];
+                    (
+                        name.clone(),
+                        Constant {
+                            dims: vec![2, 2],
+                            values,
+                        },
+                    )
+                })
+                .collect())
         }
     }
 
@@ -1653,6 +1783,114 @@ mod tests {
             assert!(a.rows.is_empty());
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A constant of the map is a tensor of the header that no folder tensor holds: declared F32
+    /// at its dims, made (no run of any file), held by the part source beside the folder's
+    /// tensors, and read by it whole or cut along a dim as its values are. One that takes a name
+    /// a folder tensor's program name has, and one whose dims do not take its values or that has a
+    /// value that is not finite, are refused by name. Mutants (each red at its line): the
+    /// constants not handed to the part source (`constants()` is empty), a cut read whole (the
+    /// bytes of the part), the collision check dropped (`is a constant of the map`).
+    #[test]
+    fn a_constant_is_a_made_tensor_no_folder_tensor_holds() {
+        use model::part::{Source, Take};
+        let dir = temp_dir("folder-constant");
+        toy_folder(&dir, Experts::Planes, &[]);
+        let config = |name: &str| {
+            std::fs::write(
+                dir.join("config.json"),
+                json!({"model_type": "toy", "vocab_size": 16, "constant": name}).to_string(),
+            )
+            .unwrap();
+            read_config(&dir).unwrap()
+        };
+        let folded = |name: &str| fold::<Toy>(&dir, &config(name), false);
+        let Folded {
+            checkpoint,
+            folder,
+            plan,
+            planned,
+            kvs,
+            ..
+        } = folded("rope.weight").unwrap();
+        let constants: BTreeMap<String, Constant> = planned
+            .iter()
+            .filter_map(|p| match &p.make {
+                Make::Constant(c) => Some((p.decl.name.clone(), c.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            constants.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["rope.weight"]
+        );
+        let a = assemble(&checkpoint, &dir, folder, plan, planned, &kvs).unwrap();
+        let (_, info) = a.header.find("rope.weight").unwrap();
+        assert_eq!(
+            (info.ty, info.dims.clone(), info.nbytes),
+            (GgmlType::F32, vec![2, 2], 16)
+        );
+        assert_eq!(a.header.place("rope.weight"), Some(&Place::Made));
+        assert_eq!(
+            a.source.made().len(),
+            4,
+            "a constant is no tensor of the folder"
+        );
+        assert_eq!(a.source.constants(), &constants);
+
+        let Folded { folder, plan, .. } = folded("rope.weight").unwrap();
+        let source = part::Checkpoint::new(folder, plan, BTreeMap::new())
+            .unwrap()
+            .with_constants(constants);
+        let bytes: Vec<u8> = [1.0f32, 1e30, -2.0, 0.5]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let whole = source.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
+        let [p] = &whole[..] else {
+            panic!("one tensor: {}", whole.len());
+        };
+        assert_eq!(source.read(p).unwrap().spans().concat(), bytes);
+        assert_eq!(source.read_bytes(p).unwrap(), 32);
+        source.release(p).unwrap();
+        // The second row of the two by two, cut along its second dim.
+        let cut = source
+            .plan(|_, _, _| Ok::<_, String>(Take::Part(1, 1..2)))
+            .unwrap();
+        let [p] = &cut[..] else {
+            panic!("one part: {}", cut.len());
+        };
+        assert_eq!(p.info.dims, [2, 1]);
+        assert_eq!(
+            source.read(p).unwrap().spans().concat(),
+            bytes[8..].to_vec()
+        );
+
+        let e = folded("output_norm.weight").err().unwrap().to_string();
+        assert!(
+            e.contains("output_norm.weight") && e.contains("is a constant of the map"),
+            "{e}"
+        );
+        let planned_of = |dims: Vec<u64>, values: Vec<f32>| {
+            planned_constant::<()>(&[], "c.weight".into(), Constant { dims, values })
+        };
+        for (what, dims, values) in [
+            ("dims of no value", vec![], vec![1.0]),
+            ("a zero dim", vec![0, 2], vec![]),
+            ("too few values", vec![2, 2], vec![1.0; 3]),
+            ("too many values", vec![2], vec![1.0; 3]),
+            ("a NaN", vec![2], vec![1.0, f32::NAN]),
+            ("an infinity", vec![2], vec![f32::INFINITY, 1.0]),
+        ] {
+            let e = planned_of(dims, values)
+                .err()
+                .unwrap_or_else(|| panic!("{what} is refused"))
+                .to_string();
+            assert!(e.contains("c.weight"), "{what}: {e}");
+        }
+        assert!(planned_of(vec![2, 2], vec![1.0; 4]).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A map that keeps no tensor in place gets the header alone, named by the folder, as a header

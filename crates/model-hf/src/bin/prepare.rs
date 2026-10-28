@@ -213,6 +213,9 @@ fn write_as<M: FolderMap>(dir: &Path, prefix: &str, limit: u64, q8: bool) -> Res
                             &s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
                         )?;
                     }
+                    Make::Constant(c) => {
+                        w.tensor(name, &c.bytes())?;
+                    }
                     Make::Tensor(m) if m.role == Use::Rows => {
                         // A row table's parts, one at a time, all with the table's one scale.
                         let (mut failed, mut scale) = (None, vec![]);

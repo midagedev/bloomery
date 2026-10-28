@@ -29,7 +29,7 @@ use model::arch::qwen35moe::names::{self, Sub};
 
 use super::section::Section;
 use super::trunk;
-use crate::folder::{FolderMap, Mapping, Origin, PlusOne, VocabSpec};
+use crate::folder::{FolderMap, Mapping, Origin, PlusOne, Squeeze, VocabSpec};
 
 pub mod folder;
 
@@ -229,7 +229,7 @@ const ROOT_SHARED: &Fields = &[
     ("text_config", Read),
     ("quantization_config", Read),
     // The map needs a separate lm_head.
-    ("tie_word_embeddings", Only("[false]")),
+    trunk::HEAD_OWN,
     (
         "transformers_version",
         Ignore(Type::String, "the version that wrote the file"),
@@ -1718,14 +1718,7 @@ impl Step {
                 t.dims = vec![joined_width, matrix_rows as u64];
             }
             Step::Squeeze => {
-                let unit = t.dims.iter().filter(|&&n| n == 1).count();
-                if t.dims.len() != 3 || unit != 1 {
-                    return Err(refuse(
-                        name,
-                        format!("{:?} is not a 3-D tensor with one unit dim", t.dims),
-                    ));
-                }
-                t.dims.retain(|&n| n != 1);
+                Squeeze.apply(t).map_err(|why| refuse(name, why))?;
                 return Ok(());
             }
             Step::Rows(ref keep) => {
