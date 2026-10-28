@@ -31,9 +31,9 @@ pub const LOGITS_BF16_SET: &str = "ref-lfm3-bf16-logits";
 
 /// The executable and library of `/home/user/llama.cpp-19cce691` that `nemotron_ref_lfm3` is linked against, spelled as
 /// [`crate::tokenizer::build_id`]. The two words after `llama-tokenize` and `libllama.so` are the md5s that
-/// `just build-ref-lfm3` prints on its `build` line once the tree is built; until they are placed, every set is refused
-/// by name for the build it names.
-const BUILD: &str = "llama-tokenize 3a2f117f9db7b3195ccbb64ada4c4f24 libllama.so 2a6f0050bbd0280f604182bbc881da6a";
+/// `just build-ref-lfm3` prints on its `build` line; a set dumped by another build is refused by name.
+const BUILD: &str =
+    "llama-tokenize 3a2f117f9db7b3195ccbb64ada4c4f24 libllama.so 2a6f0050bbd0280f604182bbc881da6a";
 
 /// [`MODEL`], as a family's `runs`.
 fn model() -> Result<String, RefError> {
