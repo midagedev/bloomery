@@ -27,6 +27,14 @@
 //! A weight whose `.scale` sits in another shard of a split loads with that scale
 //! (`two_shards`).
 //!
+//! `nvfp4_site_k64_through_sel32`: a site whose width is a multiple of 64 and no
+//! multiple of 256, Lightning's shared-expert up (3,712 rows of 2,688) and down (2,688
+//! rows of 3,712), reads the 32-value rows (`site::reads_at`) and runs
+//! `site::nvfp4_sel32_gemv`: `written`, and `bits` equal to the host rule
+//! (`lane_partial_host::<Nvfp4, 0>`, the butterfly, the multiply by the scale) with every
+//! output inside the same band as above (a 32-value block a scale), no fault raised. A site
+//! that read the q8_1 rows at these widths is refused by its launch contract.
+//!
 //! The routed pair (`bloomery_gpu::mxfp4_sel`: `Nvfp4SelKernels`) at
 //! Qwen3.8's widths, the gate and up stacks 640 rows of 2,560 an expert and
 //! the down 2,560 rows of 640, six experts in the file, each with a scale of
@@ -93,7 +101,8 @@ fn main() -> std::process::ExitCode {
 
 mod gate {
     use bloomery_gpu::mxfp4::{NV_BLOCK_BYTES, NV_BLOCK_VALUES, Nvfp4, lane_partial_host};
-    use bloomery_gpu::site::{self, KGemvKernels, SiteTy};
+    use bloomery_gpu::q5::Q8Blocks32;
+    use bloomery_gpu::site::{self, Form, KGemvKernels, SiteTy};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{Gpu, Q8Act};
     use bloomery_gpu_gates::act_rule::{Q8_1_BLOCK, q8_1_codes};
@@ -133,6 +142,27 @@ mod gate {
             scale: 1.732_9,
             ms: [1, 8],
             seed: 0x5eed_0002,
+        },
+    ];
+
+    /// Lightning's shared-expert up and down: widths of whole 64-value blocks that no q8_1
+    /// super-block of 256 values divides, 2,688 and 3,712 (`nvfp4_site_k64_through_sel32`).
+    pub(crate) const SEL32_SHAPES: [Shape; 2] = [
+        Shape {
+            stem: "blk.0.ffn_up_shexp",
+            rows: 3712,
+            k: 2688,
+            scale: 0.037_13,
+            ms: [1, 3],
+            seed: 0x5eed_0201,
+        },
+        Shape {
+            stem: "blk.0.ffn_down_shexp",
+            rows: 2688,
+            k: 3712,
+            scale: 0.413_7,
+            ms: [1, 8],
+            seed: 0x5eed_0202,
         },
     ];
 
@@ -291,6 +321,12 @@ mod gate {
             raw.push(bytes.clone());
             decls.extend(weight_decls(s.stem, &[s.k, s.rows], bytes, &[s.scale]));
         }
+        let mut raw32 = Vec::new();
+        for s in &SEL32_SHAPES {
+            let bytes = nvfp4_bytes(s.rows, s.k, s.seed);
+            raw32.push(bytes.clone());
+            decls.extend(weight_decls(s.stem, &[s.k, s.rows], bytes, &[s.scale]));
+        }
         // The refusals' tensors: 8 rows of 256, scale 1 unless named.
         let small = |seed| nvfp4_bytes(8, 256, seed);
         decls.extend(weight_decls("nan", &[256, 8], small(7), &[f32::NAN]));
@@ -323,6 +359,9 @@ mod gate {
         let mut ok = true;
         for (s, bytes) in SHAPES.iter().zip(&raw) {
             ok &= shape_case(gpu, &kk, &split, s, bytes)?;
+        }
+        for (s, bytes) in SEL32_SHAPES.iter().zip(&raw32) {
+            ok &= sel32_case(gpu, &kk, &split, s, bytes)?;
         }
         for (stem, want) in [
             ("nan", "not a finite value"),
@@ -463,6 +502,89 @@ mod gate {
                 verdict(bits)
             );
             ok &= written && d8_same && band_ok && bits;
+        }
+        Ok(ok)
+    }
+
+    /// One shape of [`SEL32_SHAPES`] at each of its column counts: the `nvfp4_site_k64_through_sel32`
+    /// clause (module doc). The form the width reads picks the launch, as a body's site does
+    /// ([`site::reads_at`]); a width that read the q8_1 rows would launch `site::kgemv` and end on
+    /// its contract's refusal.
+    fn sel32_case(
+        gpu: &Gpu,
+        kk: &KGemvKernels,
+        split: &Split,
+        s: &Shape,
+        bytes: &[u8],
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let name = format!("{}.weight", s.stem);
+        let (rows, k) = (s.rows, s.k);
+        let ty = site::file_site(split, "gate_nvfp4", &name, (rows, k), &[SiteTy::Nvfp4])?;
+        let w = Weights::load_where(stream, split, |n| n == name)?;
+        site::site(&w, "gate_nvfp4", &name, (rows, k), ty)?;
+        let row_bytes = k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
+        let wf = dequant_rows(bytes, 0..rows, k);
+        let form = site::reads_at(ty, k);
+        let mut ok = true;
+        for (i, &m) in s.ms.iter().enumerate() {
+            let mut rng = GateRng(s.seed ^ (0x1000 + i as u64));
+            let x: Vec<f32> = (0..m * k).map(|_| rng.uni(-2.0, 2.0)).collect();
+            let x_dev = DeviceBuffer::from_host(stream, &x)?;
+            let mut y_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; m * rows])?;
+            let tag = format!("shape={} rows={rows} k={k} m={m}", s.stem);
+            if form != Form::Q8Blocks32 {
+                let mut act = Q8Act::with_k(stream, m, k)?;
+                gpu.enqueue_quantize_q8_1_layer(&x_dev, &mut act, 0)?;
+                site::kgemv(
+                    gpu,
+                    kk,
+                    (ty, &w, &name),
+                    &act,
+                    gpu.unlabelled_sink(),
+                    &mut y_dev,
+                )?;
+                println!(
+                    "nvfp4 clause=nvfp4_site_k64_through_sel32 {tag} form={form:?} \
+                     want=Q8Blocks32 {}",
+                    verdict(false)
+                );
+                ok = false;
+                continue;
+            }
+            let mut act = Q8Blocks32::new(stream, k, m)?;
+            gpu.q5()
+                .enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
+            site::nvfp4_sel32_gemv(
+                gpu,
+                kk,
+                (ty, &w, &name),
+                &act,
+                gpu.unlabelled_sink(),
+                &mut y_dev,
+            )?;
+            stream.synchronize()?;
+            let y = y_dev.to_host_vec(stream)?;
+            let fault = gpu.take_fault()?;
+            let back = act.readback(stream)?;
+            let cols: Vec<(Vec<i8>, Vec<f32>)> = (0..m).map(|c| back.column(c, k, m)).collect();
+            let written = y.iter().all(|v| v.is_finite());
+            let per: Vec<(bool, f64, f64)> = par_map(m * rows, |at| {
+                let (c, r) = (at / rows, at % rows);
+                let (q, d) = &cols[c];
+                let row = &bytes[r * row_bytes..][..row_bytes];
+                judge(y[at], host_rule(row, &wf[r], (q, d), 32, s.scale))
+            });
+            let (bits_n, band_ok, worst) = tally(&per);
+            let pass = written && fault.is_none() && band_ok && bits_n == per.len();
+            println!(
+                "nvfp4 clause=nvfp4_site_k64_through_sel32 {tag} form={form:?} written={written} \
+                 fault_none={} worst_err_over_band={worst:.3e} bits_equal={bits_n}/{} {}",
+                fault.is_none(),
+                m * rows,
+                verdict(pass)
+            );
+            ok &= pass;
         }
         Ok(ok)
     }

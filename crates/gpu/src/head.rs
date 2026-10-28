@@ -1,9 +1,12 @@
 //! The GPU output head: `result_norm → lm_head → argmax` as one capturable
 //! sequence over resident scratch (docs/gpu-design.md decisions 4 and 6). No
 //! kernels of its own: after `rms_norm`, a K-quant head uses the shared
-//! q8_1 quantizer and its format's gemv, then `argmax_fault`. Q8_0, BF16
-//! and E4M3 heads read f32 activations through the shared gemvs and use
-//! `argmax_finite_fault`. The quantized path refuses non-finite inputs;
+//! q8_1 quantizer and its format's gemv, then `argmax_fault`; an NVFP4 head
+//! the site's launch for its width ([`site::reads_at`]: `site::kgemv` on the
+//! q8_1 rows, `site::nvfp4_sel32_gemv` on the 32-value rows), its token-major
+//! logits copied into the argmax's layout past one row, then `argmax_fault`.
+//! Q8_0, BF16 and E4M3 heads read f32 activations through the shared gemvs and
+//! use `argmax_finite_fault`. The quantized path refuses non-finite inputs;
 //! the f32-activation path refuses non-finite logits, using for `m > 1` rows
 //! `argmax_rows_finite_fault`, whose last block to finish copies the word, so
 //! the readback carries every row's raise.
@@ -34,8 +37,10 @@ use crate::Gpu;
 use crate::GpuError;
 use crate::fault::{Fault, FaultSink, LAYER_HEAD};
 use crate::kquant::SelDown;
+use crate::q5::Q8Blocks32;
 use crate::q8f32::{E4m3GemvArgs, E4m3Weight, GemvOut};
 use crate::quant_sel::QuantSelKernels;
+use crate::site::{self, Form, KGemvKernels, SiteTy};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
@@ -44,8 +49,8 @@ use model::arch::names::output_norm;
 use model::placement::kernels::{self, HeadEntry};
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
-/// K-quant words over q8_1 rows, E4M3 or Q8_0 planes, or BF16's
-/// words over the f32 rows.
+/// K-quant words over q8_1 rows, NVFP4's planes over q8_1 or 32-value rows,
+/// E4M3 or Q8_0 planes, or BF16's words over the f32 rows.
 enum OutW<'a> {
     Q6K(&'a DeviceTensor<u32>),
     Q5K(&'a DeviceTensor<u32>),
@@ -56,6 +61,12 @@ enum OutW<'a> {
     },
     Bf16(&'a DeviceTensor<u32>),
     E4m3(E4m3Weight<'a>),
+    /// NVFP4's planes and the tensor's scale, read as the site's launch for `form` reads them
+    /// ([`site::reads_at`] at the head's width); `rows` is the vocabulary.
+    Nvfp4 {
+        rows: usize,
+        form: Form,
+    },
 }
 
 impl OutW<'_> {
@@ -65,6 +76,7 @@ impl OutW<'_> {
             OutW::Q6K(w) | OutW::Q5K(w) | OutW::Q4K(w) | OutW::Bf16(w) => w.rows(),
             OutW::Q8_0 { d, .. } => d.rows(),
             OutW::E4m3(w) => w.qs.rows(),
+            OutW::Nvfp4 { rows, .. } => *rows,
         }
     }
 
@@ -74,10 +86,20 @@ impl OutW<'_> {
         matches!(self, OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_))
     }
 
+    /// Whether its gemv reads the q8_1 rows the head quantizes its normed rows into: a K-quant
+    /// head, and an NVFP4 one at a width of whole super-blocks (an NVFP4 head of another width
+    /// quantizes into the 32-value rows).
+    fn reads_q8_1(&self) -> bool {
+        match self {
+            OutW::Nvfp4 { form, .. } => *form == Form::Q8x128,
+            other => !other.reads_f32(),
+        }
+    }
+
     /// Whether its gemv writes token-major columns that a copy interleaves
-    /// into the argmax's layout past one row: the `_sel` Q5_K gemv.
+    /// into the argmax's layout past one row: the `_sel` Q5_K gemv and NVFP4's.
     fn copies_rows(&self) -> bool {
-        matches!(self, OutW::Q5K(_))
+        matches!(self, OutW::Q5K(_) | OutW::Nvfp4 { .. })
     }
 }
 
@@ -99,20 +121,34 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
             Some(HeadEntry::Q6k) => Ok((OutW::Q6K(w), *k)),
             Some(HeadEntry::Q5k) => Ok((OutW::Q5K(w), *k)),
             Some(HeadEntry::Q4k) => Ok((OutW::Q4K(w), *k)),
-            Some(HeadEntry::Q8_0 | HeadEntry::Bf16) | None => Err(GpuError::shape(
-                "head_out_w",
-                format!("{HEAD_TENSOR} is {ty} words, which no head entry reads (kernels::head)"),
-            )),
+            Some(HeadEntry::Q8_0 | HeadEntry::Bf16 | HeadEntry::Nvfp4) | None => {
+                Err(GpuError::shape(
+                    "head_out_w",
+                    format!(
+                        "{HEAD_TENSOR} is {ty} words, which no head entry reads (kernels::head)"
+                    ),
+                ))
+            }
         },
         Some(DevWeight::Q8_0 { qs, d, k }) => Ok((OutW::Q8_0 { qs, d }, *k)),
         Some(DevWeight::Bf16 { w, k }) => Ok((OutW::Bf16(w), *k)),
         Some(DevWeight::Mxfp8 { k, .. } | DevWeight::Fp8B128 { k, .. }) => {
             Ok((OutW::E4m3(w.e4m3("head_out_w", HEAD_TENSOR)?), *k))
         }
+        Some(DevWeight::Nvfp4 { qs, k, .. }) => {
+            let form = site::reads_at(SiteTy::Nvfp4, *k);
+            Ok((
+                OutW::Nvfp4 {
+                    rows: qs.rows(),
+                    form,
+                },
+                *k,
+            ))
+        }
         Some(_) => Err(GpuError::tensor(
             "head_out_w",
             HEAD_TENSOR,
-            "K-quant words, Q8_0 or E4M3 planes, or BF16 words",
+            "K-quant words, NVFP4, Q8_0 or E4M3 planes, or BF16 words",
         )),
         None => Err(GpuError::tensor(
             "head_out_w",
@@ -128,13 +164,16 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
 fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
     match head_out_w(w)?.0 {
         OutW::Q6K(w) => Ok(w),
-        OutW::Q5K(_) | OutW::Q4K(_) | OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_) => {
-            Err(GpuError::tensor(
-                "head_q6k_w",
-                HEAD_TENSOR,
-                "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
-            ))
-        }
+        OutW::Q5K(_)
+        | OutW::Q4K(_)
+        | OutW::Q8_0 { .. }
+        | OutW::Bf16(_)
+        | OutW::E4m3(_)
+        | OutW::Nvfp4 { .. } => Err(GpuError::tensor(
+            "head_q6k_w",
+            HEAD_TENSOR,
+            "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
+        )),
     }
 }
 
@@ -256,6 +295,8 @@ pub struct Head {
     rows_done: Option<DeviceBuffer<u32>>,
     /// A Q5_K head's gemv: the `_sel` kernels and the one expert's id.
     q5k: Option<Q5kHead>,
+    /// An NVFP4 head's kernels and forms.
+    nvfp4: Option<Nvfp4Head>,
 }
 
 /// The kernels a Q5_K head's projection launches: the `_sel` Q5_K gemv, which
@@ -266,12 +307,21 @@ pub struct Head {
 struct Q5kHead {
     kernels: QuantSelKernels,
     one: DeviceBuffer<u32>,
-    rows: Option<Q5kRows>,
+    rows: Option<TokenRows>,
 }
 
-/// A Q5_K head of more than one row: the gemv's token-major logits and the
-/// copy into the interleaved layout.
-struct Q5kRows {
+/// The kernels an NVFP4 head's projection launches (the site's: [`site::kgemv`],
+/// [`site::nvfp4_sel32_gemv`]), the 32-value form of its normed rows at a width of no whole
+/// super-blocks (the head's q8_1 form holds the others'), and past one row the logits' copy.
+struct Nvfp4Head {
+    kernels: KGemvKernels,
+    act32: Option<Q8Blocks32>,
+    rows: Option<TokenRows>,
+}
+
+/// A head of more than one row whose gemv writes token-major logits: the gemv's columns and the
+/// copy into the interleaved layout the argmax reads.
+struct TokenRows {
     cols: DeviceBuffer<f32>,
     token_major: TokenMajor,
 }
@@ -351,18 +401,30 @@ impl Head {
         } else {
             None
         };
+        let token_rows = || -> Result<Option<TokenRows>, GpuError> {
+            if m == 1 {
+                return Ok(None);
+            }
+            Ok(Some(TokenRows {
+                cols: DeviceBuffer::zeroed(stream, m * n_vocab)?,
+                token_major: TokenMajor::load(gpu.context())?,
+            }))
+        };
         let q5k = match out_w {
             OutW::Q5K(_) => Some(Q5kHead {
                 kernels: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
                 one: DeviceBuffer::zeroed(stream, m)?,
-                rows: if m > 1 {
-                    Some(Q5kRows {
-                        cols: DeviceBuffer::zeroed(stream, m * n_vocab)?,
-                        token_major: TokenMajor::load(gpu.context())?,
-                    })
-                } else {
-                    None
-                },
+                rows: token_rows()?,
+            }),
+            _ => None,
+        };
+        let nvfp4 = match out_w {
+            OutW::Nvfp4 { form, .. } => Some(Nvfp4Head {
+                kernels: KGemvKernels::load(gpu)?,
+                act32: (form == Form::Q8Blocks32)
+                    .then(|| Q8Blocks32::new(stream, hidden, m))
+                    .transpose()?,
+                rows: token_rows()?,
             }),
             _ => None,
         };
@@ -381,15 +443,16 @@ impl Head {
             n_vocab,
             m,
             x,
-            act: if out_w.reads_f32() {
-                None
-            } else {
+            act: if out_w.reads_q8_1() {
                 Some(Q8Act::with_k(stream, m, hidden)?)
+            } else {
+                None
             },
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
             rows_done,
             q5k,
+            nvfp4,
         })
     }
 
@@ -429,6 +492,13 @@ impl Head {
             + self.rows_done.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.q5k.as_ref().map_or(0, |q| {
                 q.one.num_bytes() + q.rows.as_ref().map_or(0, |r| r.cols.num_bytes())
+            })
+            + self.nvfp4.as_ref().map_or(0, |n| {
+                n.kernels.device_bytes()
+                    + n.act32
+                        .as_ref()
+                        .map_or(0, |a| a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes())
+                    + n.rows.as_ref().map_or(0, |r| r.cols.num_bytes())
             })
             + self.act.as_ref().map_or(0, Q8Act::device_bytes)
     }
@@ -506,6 +576,44 @@ impl Head {
                 let act = held(&mut self.act)?;
                 gpu.enqueue_quantize_q8_1_head(rows, act)?;
                 gpu.enqueue_gemv_q4k(out_w, &*act, &mut self.logits)?;
+            }
+            OutW::Nvfp4 { form, .. } => {
+                let q = self.nvfp4.as_mut().ok_or_else(|| {
+                    GpuError::state(
+                        "Head::enqueue",
+                        "an NVFP4 head's kernels (made with the head)",
+                    )
+                })?;
+                let key = (SiteTy::Nvfp4, out, HEAD_TENSOR);
+                // Past one row the gemv's token-major columns land beside the logits and a copy
+                // interleaves them.
+                let y = match q.rows.as_mut() {
+                    Some(r) => &mut r.cols,
+                    None => &mut self.logits,
+                };
+                if form == Form::Q8Blocks32 {
+                    let act = q.act32.as_mut().ok_or_else(|| {
+                        GpuError::state(
+                            "Head::enqueue",
+                            "a Q8Blocks32 form (an NVFP4 head of a width past whole super-blocks)",
+                        )
+                    })?;
+                    gpu.q5().enqueue_quantize_q8(stream, rows, act, fault)?;
+                    site::nvfp4_sel32_gemv(gpu, &q.kernels, key, act, fault, y)?;
+                } else {
+                    let act = held(&mut self.act)?;
+                    gpu.enqueue_quantize_q8_1_head(rows, act)?;
+                    site::kgemv(gpu, &q.kernels, key, &*act, fault, y)?;
+                }
+                if let Some(r) = q.rows.as_mut() {
+                    r.token_major.enqueue(
+                        stream,
+                        &r.cols,
+                        self.m,
+                        self.n_vocab,
+                        &mut self.logits,
+                    )?;
+                }
             }
             OutW::Q8_0 { qs, d } => {
                 gpu.q8f32()

@@ -276,7 +276,11 @@ pub enum SiteEntry {
     F32,
     /// `Nvfp4Kernels::enqueue_gemv` (`nvfp4_gemv`, `crates/gpu/src/mxfp4.rs`)
     /// over the NVFP4 planes and the q8_1 rows, times the tensor's scale,
-    /// through `site::kgemv`. No wide GEMM.
+    /// through `site::kgemv`; at a width that is no multiple of 256
+    /// (`SiteEntry::reads_at`) `Nvfp4SelKernels::enqueue_down` (`nvfp4_gemv_sel32`)
+    /// over the planes as one expert and the `Q8Blocks32` rows, through
+    /// `site::nvfp4_sel32_gemv`; wide, `Gemm32Weight::Nvfp4Planes` at any
+    /// width of the format's 64-value blocks.
     Nvfp4,
     /// `Q8F32Kernels::enqueue_e4m3_gemv` (`mxfp8_gemv`, `mxfp8_gemv_mcol`,
     /// `crates/gpu/src/q8f32.rs`) over bloomery's MXFP8 planes
@@ -294,6 +298,9 @@ pub enum SiteEntry {
     /// IQ4_XS blocks and `Q8Act` columns; wide, the grouped IQ4_XS GEMM.
     Iq4xs,
 }
+
+/// The values of one q8_1 super-block, the unit a [`SiteAct::Q8x128`] column holds whole.
+const Q8_1_SUPER_BLOCK: u64 = 256;
 
 /// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
 /// names it `Form` and a body quantizes a unit's rows into exactly the forms
@@ -329,6 +336,20 @@ impl SiteEntry {
             SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
             SiteEntry::Nvfp4 => SiteAct::Q8x128,
             SiteEntry::Mxfp8 | SiteEntry::Fp8B128 | SiteEntry::Bf16 => SiteAct::F32,
+        }
+    }
+
+    /// The activation this site's launch reads over rows of `k` values: what
+    /// [`SiteEntry::reads`] says, except NVFP4 at a width that is no multiple
+    /// of the q8_1 super-block's 256 values. Its gemv reads whole super-blocks;
+    /// the one-expert `_sel` gemv (`nvfp4_gemv_sel32`) reads the 32-value
+    /// [`SiteAct::Q8Blocks32`] and takes every width the format's 64-value block
+    /// divides, which every NVFP4 row's is.
+    #[must_use]
+    pub fn reads_at(self, k: u64) -> SiteAct {
+        match self {
+            SiteEntry::Nvfp4 if !k.is_multiple_of(Q8_1_SUPER_BLOCK) => SiteAct::Q8Blocks32,
+            _ => self.reads(),
         }
     }
 
@@ -396,6 +417,12 @@ pub enum HeadEntry {
     /// logits are copied into the layout the rows' argmax reads
     /// (`token_major::TokenMajor`).
     Q5k,
+    /// The NVFP4 dense gemv over the matrix's planes and the tensor's scale
+    /// (`site::kgemv` over the q8_1 rows, or `site::nvfp4_sel32_gemv` over the
+    /// `Q8Blocks32` rows at a width that is no multiple of 256: [`SiteEntry::reads_at`]),
+    /// its token-major logits copied into the layout the rows' argmax reads
+    /// past one row (`token_major::TokenMajor`), then `argmax_fault`.
+    Nvfp4,
 }
 
 /// A card embedding row lookup: the rows of the ids dequantized token-major,

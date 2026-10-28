@@ -7,7 +7,7 @@
 //!   NVFP4 `nvfp4_gemv` on the run's q8_1 columns, each weight read once a
 //!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass
 //!   and an NVFP4 site the same GEMM over its resident NVFP4 planes
-//!   ([`Gemm32Weight::Nvfp4Planes`]);
+//!   ([`site::gemm`]);
 //! - a Mamba-2 layer is one pass over its tokens
 //!   ([`Mamba2Kernels::enqueue_pass`] with the chunked SSD scan,
 //!   [`PassScan::Ssd`]: within its derived f16 bound of the exact scan, not
@@ -77,7 +77,6 @@ use crate::kquant::SelDown;
 use crate::mamba2::{Mamba2Kernels, Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, largest_fit};
-use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q38::{EmbedArgs, EmbedRows};
 use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, SiteTy};
@@ -644,11 +643,11 @@ struct Cx<'a> {
 }
 
 /// `y = W · x` for site `s` over the pass's `m` rows of `x` (`s.k` values a
-/// row), `rows` output values a row, token-major. Up to [`COLS`] rows, and
-/// for an NVFP4 site at any count, runs of up to [`COLS`] columns, each its
-/// family's multi-column gemv (the step's sums); a Q8_0 site past [`COLS`]
-/// rows is one 32-value GEMM over the pass's table, on the rows' q8 blocks of
-/// 32. A type the pass does not run is refused by name.
+/// row), `rows` output values a row, token-major. Up to [`COLS`] rows runs of
+/// up to [`COLS`] columns, each its family's multi-column gemv (the step's
+/// sums); a Q8_0 or NVFP4 site past [`COLS`] rows is one 32-value GEMM over
+/// the pass's table ([`site::gemm`]), on the rows' q8 blocks of 32. A type the
+/// pass does not run is refused by name.
 fn project_rows(
     cx: &Cx<'_>,
     arms: &mut Arms,
@@ -659,12 +658,20 @@ fn project_rows(
 ) -> Result<(), GpuError> {
     let (gpu, f) = (cx.gpu, size_of::<f32>());
     let key = (s.ty, cx.w, s.name.as_str());
-    if s.ty == SiteTy::Q8_0 && cx.m > COLS {
+    if matches!(s.ty, SiteTy::Q8_0 | SiteTy::Nvfp4) && cx.m > COLS {
         let a =
             arms.wide.iter_mut().find(|a| a.0 == s.k).ok_or_else(|| {
                 GpuError::shape(WHAT, format!("no q8 blocks of 32 of width {}", s.k))
             })?;
-        a.1.quantize(gpu, &cx.wk, gpu.layer_sink(layer)?, x, cx.m, &[s.ty])?;
+        // Both GEMMs read the q8 blocks of 32, quantized as a Q8_0 site's are.
+        a.1.quantize(
+            gpu,
+            &cx.wk,
+            gpu.layer_sink(layer)?,
+            x,
+            cx.m,
+            &[SiteTy::Q8_0],
+        )?;
         return site::gemm(
             gpu,
             &cx.wk,
@@ -674,39 +681,6 @@ fn project_rows(
             (&arms.route, GemmInput::PerSlot),
             cx.m,
             y,
-        );
-    }
-    if s.ty == SiteTy::Nvfp4 && cx.m > COLS {
-        let a =
-            arms.wide.iter_mut().find(|a| a.0 == s.k).ok_or_else(|| {
-                GpuError::shape(WHAT, format!("no q8 blocks of 32 of width {}", s.k))
-            })?;
-        a.1.quantize(
-            gpu,
-            &cx.wk,
-            gpu.layer_sink(layer)?,
-            x,
-            cx.m,
-            &[SiteTy::Q8_0],
-        )?;
-        let planes = match cx.w.resident(WHAT, &s.name)? {
-            DevWeight::Nvfp4 { qs, e, scales, .. } => Nvfp4Stack { qs, e, scales },
-            _ => return Err(GpuError::tensor(WHAT, &s.name, "an NVFP4 weight")),
-        };
-        return cx.g32.enqueue_gemm32(
-            gpu.stream(),
-            Gemm32Args {
-                w: Gemm32Weight::Nvfp4Planes(planes),
-                rows_per_expert: rows,
-                act: a
-                    .1
-                    .input(x)
-                    .q32
-                    .ok_or(GpuError::state(WHAT, "the q8 blocks of 32"))?,
-                route: &arms.route,
-                input: GemmInput::PerSlot,
-                y,
-            },
         );
     }
     let mut c0 = 0;

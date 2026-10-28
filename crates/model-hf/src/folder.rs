@@ -955,7 +955,7 @@ pub fn planned_tensors<S>(
             .reads_scale()
             .then_some(match m.role {
                 Use::Rows => 1,
-                Use::Matrix(_) => m.sources.len(),
+                Use::Matrix(_) | Use::Q8_0 => m.sources.len(),
             });
         let decl = TensorDecl {
             name: name.clone(),
@@ -999,12 +999,12 @@ fn kept_file<S>(
     let [source] = m.sources.as_slice() else {
         return Err(refuse(name, "kept in the file, it has exactly one source"));
     };
-    let Use::Matrix(_) = m.role else {
+    if m.role == Use::Rows {
         return Err(refuse(
             source,
             "a row table is not kept as one run of bytes",
         ));
-    };
+    }
     if !m.steps.is_empty() {
         return Err(refuse(source, "kept in the file, it has no step"));
     }
@@ -1049,9 +1049,9 @@ fn kept_file<S>(
 /// The type id of the stack `name`, mapped as `m` to stay in the folder's tensors as stored: one
 /// matrix a source, `ty`.
 fn kept_stack<S>(name: &str, m: &Mapped<S>, ty: GgmlType) -> Result<u32, Error> {
-    let Use::Matrix(_) = m.role else {
+    if m.role == Use::Rows {
         return Err(refuse(name, "a row table is not kept as a stack"));
-    };
+    }
     if !m.steps.is_empty() {
         return Err(refuse(name, "kept in place, a stack has no step"));
     }

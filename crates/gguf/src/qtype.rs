@@ -141,7 +141,7 @@ pub const QROWS: &[QRow] = &[
     // then 32 bytes of 4-bit codes. Mainline pairs it with Q8_0; qdot's dot reads the Q8_2_X4 column MXFP4's does, and
     // leaves the tensor's `.scale` to its caller.
     QRow { ty: T::NVFP4, name: "nvfp4", blck: 64, bytes: 36, dequant: true, host_act: H::Q8_2X4,
-           card: card!(Nvfp4Planes   Nvfp4Planes   Nvfp4   (Nvfp4, Q8Blocks32) Nvfp4  Nvfp4   -    -) },
+           card: card!(Nvfp4Planes   Nvfp4Planes   Nvfp4   (Nvfp4, Q8Blocks32) Nvfp4  Nvfp4   Nvfp4 -) },
     // q1_0: mainline's (llama.cpp 36a73916 ggml-common.h:180-185, ggml.c:677), one f16 d then 16 bytes of 1-bit codes; ik's
     // q1_0_g128 is the same block at the same id (ggml-common.h:553-558). Its dot takes Q8_0 (ggml-cpu.c:228); sized only here.
     QRow { ty: T::Q1_0, name: "q1_0", blck: 128, bytes: 18, dequant: false, host_act: H::None, card: Card::NONE },
