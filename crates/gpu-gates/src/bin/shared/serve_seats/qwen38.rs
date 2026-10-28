@@ -69,7 +69,15 @@
 //! share it holds, before the load. Unset, a slot asks the limit and, where
 //! that plan is short of the card or of the unified pool the card shares with
 //! the host, takes the largest context under it, a multiple of 1024 down to
-//! the floor, whose plan holds. An unset MTP draft yields to the context:
+//! the floor, whose plan holds. Where a residency runs the machine with
+//! experts on the card (a set `mid` word, or the lever unset on the stage
+//! plan (a) or (b′)) a plan holds only if it also leaves every layer of the
+//! card the experts that word runs on ([`default_floor`]), so the context
+//! never takes the room the residency needs; where not even the floor of the search leaves them, the
+//! context is the plain fit, the unset word resolves `off` (a set word is
+//! refused by name), and a
+//! `ctx experts-floor=unmet` line says why. An unset MTP draft yields to the
+//! context:
 //! when the drafted plan fits a context at most half the one the plain plan
 //! holds, or holds not even the floor, the draft goes off and a `draft
 //! yield` record names both. The
@@ -394,7 +402,7 @@ use bloomery_gpu_gates::bind::{
     SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
     model_props, note_line, parallel_line, place_word, placement_of, put_back, slots_of,
 };
-use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
+use bloomery_gpu_gates::generate::{BreakEven, FloorShort, Lane, Place, lane_of};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
@@ -405,7 +413,7 @@ use bloomery_gpu_gates::residency38::{
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
     ChurnHosting, Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy,
-    draft38_unset, residency38_unset,
+    draft38_unset, residency_word_least_fewest, residency38_least_fewest, residency38_unset,
 };
 use cuda_core::sys;
 use gguf::Split;
@@ -417,7 +425,7 @@ use model::arch::qwen35moe::place::{
     widen_card_route,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
+use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule, card_experts_floor};
 use model::placement::workstation::{
     CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
 };
@@ -1130,6 +1138,9 @@ struct Plans<'a> {
     ubatch: usize,
     /// The checkpoint folder the load reads its card's parts from; `None` for a GGUF file.
     folder: Option<&'a Folder38>,
+    /// The card experts a layer a default context leaves ([`default_floor`]);
+    /// `None` where the load runs no residency machine to leave them for.
+    floor: Option<u64>,
 }
 
 impl Plans<'_> {
@@ -1137,11 +1148,22 @@ impl Plans<'_> {
     /// does. A folder's plan also holds the least of its parts' reads
     /// ([`Folder38::least_reads`], [`folder_holds`]).
     fn holds(&self, ctx: usize) -> Result<(), GateError> {
+        self.holds_leaving(ctx, None)
+    }
+
+    /// [`Plans::holds`], and with `least` the plan also leaves every layer
+    /// of the card that many experts ([`card_experts_floor`]): a default
+    /// context's fit, which would otherwise spend the card's room on context
+    /// and leave the unset residency none.
+    fn holds_leaving(&self, ctx: usize, least: Option<u64>) -> Result<(), GateError> {
         self.read(ctx, |plan| -> Result<(), GateError> {
-            match self.folder {
-                Some(folder) => folder_holds(plan, folder.least_reads(plan, CARD38)?),
-                None => Ok(()),
+            if let Some(folder) = self.folder {
+                folder_holds(plan, folder.least_reads(plan, CARD38)?)?;
             }
+            if let Some(least) = least {
+                card_experts_floor(plan, CARD38, least)?;
+            }
+            Ok(())
         })?
         .1
     }
@@ -1223,6 +1245,10 @@ struct Ctx38 {
     ctx: usize,
     line: String,
     rule: Rule,
+    /// The line that says the default could not leave the unset residency
+    /// its experts at any context ([`ctx38`]), `None` when it did or the
+    /// context was not the default's.
+    unmet: Option<String>,
 }
 
 /// Whether a checkpoint folder's `plan` holds `reads`, the least of its
@@ -1246,21 +1272,78 @@ pub(crate) fn folder_holds(plan: &Plan<'_>, reads: u64) -> Result<(), GateError>
     Ok(())
 }
 
+/// The card experts a layer a default context leaves the residency, where
+/// the plan's expert rule puts experts on the card: a set `mid` word's own
+/// least ([`residency_word_least_fewest`]); unset,
+/// [`residency38_least_fewest`], the fewest the unset word runs on, where the
+/// rule runs the machine on this load's plan — the stage plan (a) or (b′), no
+/// route trace or step feed. `None` where nothing runs to leave them for
+/// (`off`, the host's experts, the unset rule off), and the context takes the
+/// room.
+fn default_floor(
+    place: Place38,
+    feed: Feed38,
+    experts: Experts,
+    set: Option<(Residency, &str)>,
+) -> Option<u64> {
+    if !matches!(experts, Experts::Card) {
+        return None;
+    }
+    match set {
+        Some((_, word)) => residency_word_least_fewest(word),
+        None => residency38_unset(feed.residency_at(place))
+            .is_none()
+            .then(residency38_least_fewest),
+    }
+}
+
 /// The seat's context (the module doc) by the family's common choice
 /// (`q38place::ctx_choice`): a set `--ctx-size` (`set`, the total the slots
 /// split) whose share passes the limit stops by name, and one the machine
 /// cannot hold stops with the largest share it would hold; unset, a slot asks
 /// the target and fits under it while the plan of every slot is short there
-/// ([`Plans::holds`]). A tier card the plan leaves idle is refused as itself:
-/// no context gives it an expert.
+/// ([`Plans::holds`]) or leaves a layer of the card fewer experts than the
+/// unset residency runs on ([`Plans::floor`]). Where not even the least
+/// context leaves them the card cannot run the residency at any context the
+/// default tries: the context is fitted as if it left none, the residency
+/// resolves `off`, and `unmet` names the floor as the cause. A tier card the
+/// plan leaves idle is refused as itself: no context gives it an expert.
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
-    let chosen = q38place::ctx_choice(plans.inputs, (set, plans.slots), |c| {
-        plans.holds(usize::try_from(c)?)
-    })?;
+    let ask = (set, plans.slots);
+    let mut unmet = None;
+    let floored = match plans.floor.filter(|_| set.is_none()) {
+        None => None,
+        Some(least) => {
+            let probe = |c: u64| plans.holds_leaving(usize::try_from(c)?, Some(least));
+            match q38place::ctx_choice(plans.inputs, ask, probe) {
+                Ok(chosen) => Some(chosen),
+                Err(e) => {
+                    let short = e.downcast_ref::<FloorShort>().map(|f| (f.floor, f.short));
+                    let Some((floor, short)) = short else {
+                        return Err(e);
+                    };
+                    unmet = Some(format!(
+                        "ctx experts-floor=unmet least={least} floor_ctx={floor} slots={}: the \
+                         residency needs {least} experts in every layer of the card, {} B, and \
+                         the card holds {} B of them at {floor} positions a slot, the least \
+                         context the default tries: the unset word resolves off and a set word \
+                         is refused; fewer slots or a smaller model file leave room",
+                        plans.slots, short.need, short.room
+                    ));
+                    None
+                }
+            }
+        }
+    };
+    let chosen = match floored {
+        Some(chosen) => chosen,
+        None => q38place::ctx_choice(plans.inputs, ask, |c| plans.holds(usize::try_from(c)?))?,
+    };
     Ok(Ctx38 {
         ctx: usize::try_from(chosen.slot_ctx)?,
         line: chosen.line(),
         rule: chosen.rule,
+        unmet,
     })
 }
 
@@ -1708,6 +1791,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         image: None,
         media: false,
     };
+    // What a default context leaves the unset residency, decided once for every plan below.
+    let floor = default_floor(a.place, feed, experts, set);
     // Plan (b′)'s tier cards held too, and the room read again: every plan
     // below and the engine thread's take it.
     let tiers = &a.place.cards.card_specs()?[1..];
@@ -1737,6 +1822,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             feed,
             ubatch,
             folder: folder.as_ref(),
+            floor,
         };
         let ctx = ctx38(&plans, a.ctx)?.ctx;
         let at = u64::try_from(ctx)?;
@@ -1792,6 +1878,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 feed,
                 ubatch,
                 folder: folder.as_ref(),
+                floor,
             };
             if plain.holds(ctx).is_ok() {
                 plain.host(ctx, set)?.2
@@ -1821,6 +1908,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         feed,
         ubatch,
         folder: folder.as_ref(),
+        floor,
     };
     // The unset draft's yield to the context (the module doc): the context
     // comes first, so when the drafted load fitted its context, or holds not
@@ -1915,6 +2003,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         mtp_inputs = None;
     }
     eprintln!("{}", rule.line);
+    if let Some(unmet) = &rule.unmet {
+        eprintln!("{unmet}");
+    }
     eprint_noted(&cache.line());
     // The rounds of several slots, decided once (the open takes it through
     // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
@@ -3402,6 +3493,72 @@ mod tests {
             );
         }
     }
+    /// A default context leaves the residency its experts only where a word
+    /// runs the machine with experts on the card: a set `mid` word asks its
+    /// own least, and unset, the rule's least where it runs on the plan (the
+    /// stage plan (a) or (b′), no route trace and no step feed).
+    /// FAIL-first: a floor that reads a set lever as unset (`set` ignored),
+    /// or asks one of `off`, the gate placement, a traced or step-fed run or
+    /// the host's experts turns a row red.
+    #[test]
+    fn a_default_context_leaves_the_residency_its_experts_only_where_it_runs() {
+        use bloomery_gpu_gates::generate::Place;
+        use model::arch::qwen35moe::place::Experts;
+
+        use super::{Feed38, Place38, Prompt38, Residency, default_floor};
+
+        let batch = Feed38 {
+            prompt: Prompt38::Auto,
+            traced: false,
+        };
+        let a = Place38::A;
+        let least = bloomery_levers::residency38_least_fewest();
+        assert_eq!(
+            default_floor(a, batch, Experts::Card, None),
+            Some(least),
+            "the unset word on plan (a) with experts on the card runs the machine"
+        );
+        let word = "mid-p3-s1-unhosted";
+        let mid = Some((Residency::parse_asking(word).expect("a mid word"), word));
+        assert_eq!(
+            default_floor(a, batch, Experts::Card, mid),
+            Some(5),
+            "a set mid word asks its own P, its spare and one that moves"
+        );
+        let off = Some((Residency::Off, "off"));
+        for (place, feed, experts, set) in [
+            (a, batch, Experts::Host, mid),
+            (a, batch, Experts::Card, off),
+            (a, batch, Experts::Host, None),
+            (Place38::of(Place::Gate), batch, Experts::Card, None),
+            (
+                a,
+                Feed38 {
+                    traced: true,
+                    ..batch
+                },
+                Experts::Card,
+                None,
+            ),
+            (
+                a,
+                Feed38 {
+                    prompt: Prompt38::Step,
+                    ..batch
+                },
+                Experts::Card,
+                None,
+            ),
+        ] {
+            assert_eq!(
+                default_floor(place, feed, experts, set),
+                None,
+                "{place:?}, lever set {}: no machine runs, so the context takes the room",
+                set.is_some()
+            );
+        }
+    }
+
     /// A checkpoint folder's plan holds its least part reads where its NVMe
     /// tier arena shrinks to its floor for them, as the load's own check
     /// grants (`HostNeed::grant`), and one byte past that room is refused.
@@ -3603,6 +3760,7 @@ mod tests {
             },
             ubatch: 1,
             folder: Some(&folder),
+            floor: None,
         };
         plans
             .holds(half)

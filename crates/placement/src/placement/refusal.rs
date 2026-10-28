@@ -279,6 +279,23 @@ pub enum PlacementError {
     /// small.
     #[error("{}", .0.as_ref())]
     CardFreeFloor(Box<CardFreeFloor>),
+    /// A plan that holds its card but leaves `layers` of the stage's layers
+    /// under `least` card experts each ([`super::ctx_ask::card_experts_floor`]):
+    /// it holds `room` bytes of the `need` bytes `least` experts a layer take
+    /// over every layer with routed experts. A context whose sequence state
+    /// leaves the experts that little room is what this names, so a smaller
+    /// context is what it asks for.
+    #[error(
+        "card {card}: the plan leaves {layers} layer(s) under {least} experts a layer, the least \
+         the unset residency runs on: it holds {room} B of the {need} B that takes"
+    )]
+    CardExpertsFloor {
+        card: String,
+        least: u64,
+        layers: usize,
+        need: u64,
+        room: u64,
+    },
 }
 
 /// The terms of [`PlacementError::CardFreeFloor`]: a card whose device

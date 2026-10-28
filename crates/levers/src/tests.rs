@@ -1225,6 +1225,75 @@ fn residency38_at_plan_resolves_a_paged_plan_by_its_own_rule() {
     );
 }
 
+/// The least fewest card experts a layer ([`residency_least_fewest`]) is
+/// where [`room_for`] stops saying `NoRoom`, for every target and spares: the
+/// count a default context's fit leaves the card, read from the rule's own
+/// card side. The Qwen3.8 unset word (P 0, one spare) needs two
+/// ([`residency38_least_fewest`]), and a plan of that many resolves the word
+/// where one of one fewer resolves `off`.
+/// FAIL-first: a least fewest of `target + spares`, one under what the card
+/// side holds, turns the grid red at target 0 and one spare; a
+/// `RESIDENCY38_PINNED` moved from 0 turns the Qwen3.8 pins at two red.
+#[test]
+fn the_least_fewest_is_where_the_card_side_holds_the_word() {
+    let room = |target: usize, spares: usize, fewest: u64| {
+        room_for(
+            false,
+            target,
+            spares,
+            [fewest],
+            |_| Ok::<u64, ()>(0),
+            1 << 40,
+            1 << 40,
+        )
+        .expect("no pool error")
+    };
+    for target in 0..6 {
+        for spares in 0..4 {
+            let least = residency_least_fewest(target, spares);
+            for fewest in 1..=least as u64 + 3 {
+                let no_room = matches!(
+                    room(target, spares, fewest),
+                    Room::Short(RoomShort::NoRoom { .. })
+                );
+                assert_eq!(
+                    no_room,
+                    (fewest as usize) < least,
+                    "target {target}, spares {spares}, fewest {fewest}, least {least}"
+                );
+            }
+        }
+    }
+    // A target past what the fewest holds runs at half of it: 3 is the least
+    // that leaves one pinned (the room test's `[3]` row).
+    assert_eq!(
+        residency_least_fewest(40, 1),
+        3,
+        "three card experts leave one pinned beside a spare and one that moves"
+    );
+    assert_eq!(
+        residency_least_fewest(0, RESIDENCY38_SPARES),
+        2,
+        "the unset word's P 0 needs its spare and one that moves"
+    );
+    let least = residency38_least_fewest();
+    assert_eq!(least, 2, "the Qwen3.8 word's own least fewest");
+    let word_at = |fewest: u64| {
+        residency38_at_plan(
+            UnhostedPool::Carried,
+            [fewest, fewest],
+            1,
+            |_| Ok::<u64, ()>(0),
+            1 << 40,
+            1 << 40,
+        )
+        .expect("no pool error")
+        .pinned
+    };
+    assert_eq!(word_at(least - 1), None, "under the least the word is off");
+    assert_eq!(word_at(least), Some(0), "at the least the word runs");
+}
+
 /// The plan's room for a family's target word ([`room_for`]): the word at
 /// its target where its card slots and its host take it, at half the fewest
 /// where its card slots do not, at that P with the pool unhosted where the
@@ -2963,4 +3032,32 @@ fn the_process_hands_its_overrides_once() {
     let again = override_with(&pairs(&[(CARD_BUDGET, "2G")])).expect_err("a second hand-over");
     assert!(again.to_string().contains("handed over once already"));
     assert_eq!(override_of(CARD_BUDGET), Some("1G"));
+}
+
+/// A set `mid` word's least fewest is the fewest whose card side holds the
+/// word's own P with its spares and one that moves: at it [`card_p`] gives P,
+/// one under it does not. `off` and a value outside the grammar ask none.
+/// FAIL-first: a count without the one that moves (`pinned + spares`) leaves
+/// the card one slot short of P.
+#[test]
+fn a_set_words_least_fewest_holds_its_own_p() {
+    for (word, pinned, spares) in [
+        ("mid-p0-s1", 0usize, 1usize),
+        ("mid-p0-s1-unhosted", 0, 1),
+        ("mid-p3-s2", 3, 2),
+        ("mid-p12-s1-unhosted", 12, 1),
+    ] {
+        let least = residency_word_least_fewest(word).expect(word);
+        let least = usize::try_from(least).expect("a count");
+        assert_eq!(card_p(pinned, spares, least), Some(pinned), "{word}");
+        assert_ne!(card_p(pinned, spares, least - 1), Some(pinned), "{word}");
+    }
+    assert_eq!(
+        residency_word_least_fewest("mid-p0-s1"),
+        Some(residency38_least_fewest()),
+        "the unset word's own parameters ask the same floor"
+    );
+    for word in ["off", "mid-p0-s0", "high"] {
+        assert_eq!(residency_word_least_fewest(word), None, "{word}");
+    }
 }

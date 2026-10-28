@@ -13,15 +13,19 @@
 //! plus that context's sequence state, when its unified pool no card share
 //! fits, or when its host cannot hold what the card then leaves it where the
 //! body has no tier past the host ([`Probe::Short`]); any other refusal is
-//! the seat's error as it stands. Callers validate a set context against the
-//! model's limit; here it only sets the default.
+//! the seat's error as it stands. A seat whose unset residency runs on its
+//! plan also leaves the default the experts that rule needs: a plan whose
+//! card holds fewer than the rule's least in a layer is short too
+//! ([`card_experts_floor`]), so the card's room is not all spent on context.
+//! A set context is the user's and is not read that way. Callers validate a
+//! set context against the model's limit; here it only sets the default.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 
 use super::workstation::HostShort;
-use super::{PlacementError, Violation};
+use super::{PlacementError, Plan, Role, Violation, per_expert};
 
 /// The slots a load serves when `--parallel` is unset.
 pub const DEFAULT_SLOTS: usize = 1;
@@ -70,7 +74,8 @@ pub enum Probe<P> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     /// The card: the load's resident bytes plus the context's sequence
-    /// state pass its bytes.
+    /// state pass its bytes, or leave its experts under the floor
+    /// ([`card_experts_floor`]).
     Card,
     /// The host: the experts the card leaves it pass its room, on a body
     /// that serves no tier past the host.
@@ -140,7 +145,9 @@ impl PlacementError {
     /// its device had free, or a unified pool no card share of which leaves
     /// the host its NVMe tier's floor ([`PlacementError::PoolBudget`]: the
     /// card and the host read one memory, and a context's sequence state is
-    /// part of it), short on the host by the first plan's floor and room.
+    /// part of it), short on the host by the first plan's floor and room; or
+    /// a plan whose card leaves a layer under the experts a default context
+    /// keeps for the residency rule ([`PlacementError::CardExpertsFloor`]).
     /// Every other refusal, the host's room and the NVMe tier's floor at one
     /// share among them, is `None`: a smaller context is not what it asks
     /// for.
@@ -160,6 +167,11 @@ impl PlacementError {
                 on: Side::Card,
                 need: f.floor,
                 room: f.free,
+            }),
+            Self::CardExpertsFloor { need, room, .. } => Some(Short {
+                on: Side::Card,
+                need: *need,
+                room: *room,
             }),
             _ => None,
         }
@@ -212,6 +224,63 @@ pub fn probe_of<P, E: PlanRefusal>(planned: Result<P, E>) -> Result<Probe<P>, E>
         Ok(plan) => Ok(Probe::Holds(plan)),
         Err(e) => e.short().map(Probe::Short).ok_or(e),
     }
+}
+
+/// A default context's floor on the card's experts: stage card `card` of
+/// `plan` holds, in every layer its stage runs that has routed experts, at
+/// least `least` of them (the layer's whole stack where that is fewer) — the
+/// count the unset residency rule needs of the plan's fewest layer
+/// (`bloomery_levers::residency38_least_fewest`), under which the word
+/// resolves `off`. A plan under it is short on the card by the experts it
+/// lacks ([`PlacementError::CardExpertsFloor`], read as a short card by
+/// [`PlacementError::card_short`]), so a default that fits under it takes the
+/// largest context that leaves them. A stage with no routed experts has none
+/// to ask for.
+///
+/// # Errors
+/// [`PlacementError::CardExpertsFloor`] for a plan under the floor;
+/// [`PlacementError::Experts`] for a `card` the plan's machine has no stage
+/// for, and the refusal of a routed stack that is not one of the model's
+/// experts ([`per_expert`]).
+pub fn card_experts_floor(plan: &Plan<'_>, card: usize, least: u64) -> Result<(), PlacementError> {
+    let model = plan.model;
+    let stage = plan.machine.cards.get(card).ok_or_else(|| {
+        PlacementError::Experts(format!(
+            "card {card} is no stage card of a plan of {} cards",
+            plan.machine.cards.len()
+        ))
+    })?;
+    let (mut need, mut room, mut layers) = (0u64, 0u64, 0usize);
+    for l in stage.layers.clone() {
+        // One expert of the layer: every routed stack's bytes of it.
+        let mut stacks = model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
+            .peekable();
+        if stacks.peek().is_none() {
+            continue;
+        }
+        let mut per = 0u64;
+        for t in stacks {
+            per = per.saturating_add(per_expert(t, model.experts_of(t))?.1);
+        }
+        let want = least.min(model.layer_experts(l));
+        let held = plan.n_l.get(l).copied().unwrap_or(0).min(want);
+        need = need.saturating_add(want.saturating_mul(per));
+        room = room.saturating_add(held.saturating_mul(per));
+        layers += usize::from(held < want);
+    }
+    if layers == 0 {
+        return Ok(());
+    }
+    Err(PlacementError::CardExpertsFloor {
+        card: stage.name.clone(),
+        least,
+        layers,
+        need,
+        room,
+    })
 }
 
 /// What set the context.
