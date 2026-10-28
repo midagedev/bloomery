@@ -1223,13 +1223,7 @@ impl Session {
                  each a row of the pass"
             )));
         }
-        if !after.is_empty()
-            && self
-                .arena
-                .layers
-                .iter()
-                .any(|l| matches!(l.mixer, MixerBufs::ShortConv(_)))
-        {
+        if !after.is_empty() && !self.copies_in_pass() {
             return Err(refuse(format!(
                 "a pass of {m} ids with copies after rows {after:?}: a file with a short conv layer \
                  takes none, the ring's copy is not run"
@@ -1664,6 +1658,17 @@ impl Session {
             Some(c) => c.kept(n, self.pos),
             None => Kept::rule(n, self.pos, n.min(self.pos)),
         }
+    }
+
+    /// Whether a pass can copy the recurrent stores after one of its rows
+    /// ([`StateOut::after_rows`]): not on a file with a short conv layer, whose
+    /// ring has no pass copy; a caller marks such a file between passes.
+    pub fn copies_in_pass(&self) -> bool {
+        !self
+            .arena
+            .layers
+            .iter()
+            .any(|l| matches!(l.mixer, MixerBufs::ShortConv(_)))
     }
 
     /// A checkpoint at the position, the stream idle: the token ahead is

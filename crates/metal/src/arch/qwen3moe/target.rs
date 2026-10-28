@@ -221,6 +221,16 @@ impl Call<'_> {
             }
             return step_batch(s, self.ids, i(from), i(e), self.last);
         }
+        if !marks.is_empty() && !s.copies_in_pass() {
+            // No copy inside a pass: a pass to each mark, then its point.
+            let mut from = a;
+            for &u in marks {
+                self.run(s, from, u, &[])?;
+                Session::checkpoint(s)?;
+                from = u;
+            }
+            return self.run(s, from, e, &[]);
+        }
         if let Some(&cut) = marks.get(SNAPS) {
             self.run(s, a, cut, &marks[..SNAPS])?;
             Session::checkpoint(s)?;

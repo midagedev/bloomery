@@ -225,18 +225,11 @@ pub static LFM3: Row = Row {
         dispatches: 170,
     }),
     mutants: Mutants::None,
-    skips: &[
-        (
-            "m_mlx_folder",
-            "the folder is every clause's model and there is no prepared split to tell it against; \
+    skips: &[(
+        "m_mlx_folder",
+        "the folder is every clause's model and there is no prepared split to tell it against; \
              `m_logits` holds the folder's own logits to the pin",
-        ),
-        (
-            "q_marked",
-            "a mark inside a pass copies the recurrent stores after its row, and a pass's copy of a \
-             conv ring is refused by name; `q_mark` holds that refusal",
-        ),
-    ],
+    )],
 };
 
 /// Every row, the default first.
