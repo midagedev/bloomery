@@ -31,13 +31,20 @@ fully is refused by name. It prints two blocks on stdout:
 The checksum is FNV-1a 64-bit over those bytes (offset basis 14695981039346656037, prime
 1099511628211), the same function the e2e gate recomputes. A flipped logit changes it.
 
+An LFM3 folder (`model_type` `lfm3`) loads through mlx-vlm's `lfm3` instead, since mlx-lm has none:
+its language model alone runs, with the same floatize and the same two blocks. Before it loads, the
+folder's `config.json` and safetensors headers are held to what the Rust folder map reads (MLX's
+4-bit affine blocks, conv taps stored `[channels, kernel, 1]`, the tie flag against `lm_head`), so a
+pin is never taken of a folder the map would refuse.
+
 A Qwen3.6 fixture folder names each layer in `layer_types` and may still carry the source
 model's `full_attention_interval`. mlx-lm builds the layer kind from that interval. When the
 two disagree, the load uses the interval `layer_types` implies, the same one the split's
 converter writes, so the forward is the folder's layers.
 
 `--self-test` checks that checksum, a missing key, and that flipping the first logit moves
-the max-abs distance. No mlx and no folder.
+the max-abs distance, the loader chosen by `model_type`, the LFM3 folder's checks over a header-only
+folder, and the logits taken from either module's output. No mlx and no model.
 
 `layers` writes each layer's output residual and the final norm, plus the mixer inputs the
 modules return, through mlx-lm's own modules. It then replaces each quantized linear and
@@ -174,24 +181,157 @@ def load_folder(folder: str, load):
         return load(str(view))
 
 
+# The model types mlx-lm has no module for: the folder loads through mlx-vlm's module of the same
+# name, and its language model alone runs.
+VLM_TYPES = ("lfm3",)
+
+
+def read_config(folder: str) -> dict:
+    """`config.json` of `folder`, refused by name when it is not there or not an object."""
+    import json
+    import pathlib
+
+    path = pathlib.Path(folder) / "config.json"
+    if not path.is_file():
+        raise SystemExit(f"mlx-logits: {path} is not there")
+    cfg = json.loads(path.read_text())
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"mlx-logits: {path} is not an object")
+    return cfg
+
+
+def model_type_of(folder: str) -> str:
+    """`config.json`'s `model_type`, else its `text_config`'s; refused by name when it has none."""
+    cfg = read_config(folder)
+    text = cfg.get("text_config")
+    kind = cfg.get("model_type") or (text.get("model_type") if isinstance(text, dict) else None)
+    if not isinstance(kind, str) or not kind:
+        raise SystemExit(f"mlx-logits: {folder}/config.json names no model_type")
+    return kind
+
+
+def loader_of(model_type: str) -> str:
+    """Which library runs a folder of `model_type`: `mlx-vlm` for the types in `VLM_TYPES`."""
+    return "mlx-vlm" if model_type in VLM_TYPES else "mlx-lm"
+
+
+def safetensors_shapes(folder: str) -> dict:
+    """Every tensor's shape in the folder's safetensors files, from their headers alone (the
+    8-byte little-endian length, then the JSON): no weight is read."""
+    import json
+    import pathlib
+
+    root = pathlib.Path(folder)
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        names = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+    else:
+        names = sorted(p.name for p in root.glob("*.safetensors"))
+    if not names:
+        raise SystemExit(f"mlx-logits: {folder} holds no safetensors")
+    shapes = {}
+    for name in names:
+        with open(root / name, "rb") as handle:
+            (n,) = struct.unpack("<Q", handle.read(8))
+            header = json.loads(handle.read(n))
+        for key, entry in header.items():
+            if key != "__metadata__":
+                shapes[key] = list(entry["shape"])
+    return shapes
+
+
+def check_lfm3_folder(folder: str) -> None:
+    """Hold an LFM3 folder to what the Rust folder map reads, by name: `model_type` `lfm3`, MLX's
+    affine 4-bit blocks of group 64, every conv layer's taps stored `[channels, kernel, 1]` with
+    `conv_L_cache` taps (mlx-vlm transposes only `[channels, 1, kernel]`), and the head tied to the
+    embedding exactly when the folder holds no `lm_head`."""
+    cfg = read_config(folder)
+    if cfg.get("model_type") != "lfm3":
+        raise SystemExit(f"mlx-logits: {folder}: model_type {cfg.get('model_type')!r} is not lfm3")
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict) or (
+        quant.get("bits"),
+        quant.get("group_size"),
+        quant.get("mode", "affine"),
+    ) != (4, 64, "affine"):
+        raise SystemExit(
+            f"mlx-logits: {folder}: quantization {quant!r} is not affine 4-bit of group 64"
+        )
+    kinds = cfg.get("layer_types")
+    if not isinstance(kinds, list) or len(kinds) != cfg.get("num_hidden_layers"):
+        raise SystemExit(f"mlx-logits: {folder}: layer_types does not list num_hidden_layers layers")
+    hidden = cfg.get("hidden_size")
+    taps = cfg.get("conv_L_cache")
+    shapes = safetensors_shapes(folder)
+    for layer, kind in enumerate(kinds):
+        if kind != "conv":
+            continue
+        key = f"language_model.model.layers.{layer}.conv.conv.weight"
+        if shapes.get(key) != [hidden, taps, 1]:
+            raise SystemExit(
+                f"mlx-logits: {key} is {shapes.get(key)}, not MLX's [channels, kernel, 1] "
+                f"= [{hidden}, {taps}, 1]"
+            )
+    has_head = "language_model.lm_head.weight" in shapes
+    tied = cfg.get("tie_word_embeddings")
+    if not isinstance(tied, bool) or tied == has_head:
+        raise SystemExit(
+            f"mlx-logits: {folder}: tie_word_embeddings {tied!r} with "
+            f"{'an' if has_head else 'no'} lm_head"
+        )
+
+
+def load_lfm3(folder: str):
+    """The language model of an LFM3 folder through mlx-vlm's `lfm3` (mlx-lm has none): the
+    folder is checked first ([`check_lfm3_folder`]), and the loaded module is the model's
+    `language_model`, the same one the Rust side runs."""
+    import pathlib
+
+    import mlx_vlm
+    from mlx_vlm.utils import load_model
+
+    check_lfm3_folder(folder)
+    model = load_model(pathlib.Path(folder), lazy=False)
+    print(
+        f"mlx-logits: {folder} loaded through mlx-vlm {getattr(mlx_vlm, '__version__', 'unknown')}'s lfm3",
+        file=sys.stderr,
+    )
+    return model.language_model
+
+
+def unwrap_logits(out):
+    """The logits of a module's output: mlx-lm returns them (or a tuple that starts with them),
+    mlx-vlm's language model an object that holds them as `logits`."""
+    if isinstance(out, tuple):
+        return out[0]
+    return getattr(out, "logits", out)
+
+
 def dump(folder: str, family: str, ids: list[int]) -> None:
     import mlx.core as mx
     import numpy as np
-    from mlx_lm.models import cache as mlx_cache
-    from mlx_lm.utils import load
 
-    model, _tokenizer = load_folder(folder, load)
+    if loader_of(model_type_of(folder)) == "mlx-vlm":
+        model = load_lfm3(folder)
+        make_cache = model.make_cache
+    else:
+        from mlx_lm.models import cache as mlx_cache
+        from mlx_lm.utils import load
+
+        model, _tokenizer = load_folder(folder, load)
+
+        def make_cache():
+            return mlx_cache.make_prompt_cache(model)
+
     gather_embedding(model, ids)
     note, replaced = floatize(model)
     if replaced == 0 or "bf16 parameters left: 0" not in note:
         raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
-    prompt_cache = mlx_cache.make_prompt_cache(model)
+    prompt_cache = make_cache()
     rows = []
     for token in ids:
         y = mx.array([token])
-        logits = model(y[None], cache=prompt_cache)
-        if isinstance(logits, tuple):
-            logits = logits[0]
+        logits = unwrap_logits(model(y[None], cache=prompt_cache))
         logits = logits[:, -1, :]
         mx.eval(logits)
         row = np.ascontiguousarray(np.array(logits.astype(mx.float32)), dtype=np.float32)
@@ -301,11 +441,129 @@ def self_test() -> int:
     except ImportError:
         pass
 
+    fails += self_test_lfm3()
     if fails:
         print(f"mlx-logits self-test: {fails} failed", file=sys.stderr)
         return 1
     print("mlx-logits self-test: ok")
     return 0
+
+
+def self_test_lfm3() -> int:
+    """The LFM3 path's checks that need no mlx and no weights: the loader by `model_type`, the
+    folder's checks over header-only folders, and the logits taken from either output shape."""
+    import json
+    import pathlib
+    import tempfile
+
+    fails = 0
+
+    def check(name: str, ok: bool) -> None:
+        nonlocal fails
+        if not ok:
+            print(f"mlx-logits self-test FAIL: {name}", file=sys.stderr)
+            fails += 1
+
+    def refused(call, needle: str) -> bool:
+        try:
+            call()
+        except SystemExit as exc:
+            return needle in str(exc)
+        return False
+
+    check("lfm3 runs through mlx-vlm", loader_of("lfm3") == "mlx-vlm")
+    check("qwen runs through mlx-lm", loader_of("qwen3_5_moe") == "mlx-lm")
+
+    class Out:
+        logits = [1.0]
+
+    check("logits of an object", unwrap_logits(Out()) == [1.0])
+    check("logits of a tuple", unwrap_logits(([2.0], None)) == [2.0])
+    check("logits of an array", unwrap_logits([3.0]) == [3.0])
+
+    def header_only(path, entries: dict) -> None:
+        body = json.dumps(
+            {name: {"dtype": "BF16", "shape": shape, "data_offsets": [0, 0]} for name, shape in entries.items()}
+        ).encode()
+        path.write_bytes(struct.pack("<Q", len(body)) + body)
+
+    layers = ["conv", "full_attention"]
+    config = {
+        "model_type": "lfm3",
+        "hidden_size": 4,
+        "conv_L_cache": 3,
+        "num_hidden_layers": 2,
+        "layer_types": layers,
+        "tie_word_embeddings": True,
+        "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+    }
+    conv = "language_model.model.layers.0.conv.conv.weight"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+
+        def folder(cfg: dict, tensors: dict) -> str:
+            (root / "config.json").write_text(json.dumps(cfg))
+            header_only(root / "model.safetensors", tensors)
+            return str(root)
+
+        check("model type of a config", model_type_of(folder(config, {conv: [4, 3, 1]})) == "lfm3")
+        check("a taps layout of MLX's passes", not refused(lambda: check_lfm3_folder(str(root)), ""))
+        check(
+            "taps of HF's layout are refused",
+            refused(
+                lambda: check_lfm3_folder(folder(config, {conv: [4, 1, 3]})),
+                "[channels, kernel, 1]",
+            ),
+        )
+        check(
+            "taps of another width are refused",
+            refused(
+                lambda: check_lfm3_folder(folder(config, {conv: [4, 7, 1]})),
+                "[channels, kernel, 1]",
+            ),
+        )
+        check(
+            "a head under a tied flag is refused",
+            refused(
+                lambda: check_lfm3_folder(
+                    folder(config, {conv: [4, 3, 1], "language_model.lm_head.weight": [8, 2]})
+                ),
+                "tie_word_embeddings",
+            ),
+        )
+        untied = dict(config, tie_word_embeddings=False)
+        check(
+            "no head under an untied flag is refused",
+            refused(
+                lambda: check_lfm3_folder(folder(untied, {conv: [4, 3, 1]})),
+                "tie_word_embeddings",
+            ),
+        )
+        check(
+            "an untied folder with its head passes",
+            not refused(
+                lambda: check_lfm3_folder(
+                    folder(untied, {conv: [4, 3, 1], "language_model.lm_head.weight": [8, 2]})
+                ),
+                "",
+            ),
+        )
+        eight = dict(config, quantization={"group_size": 64, "bits": 8, "mode": "affine"})
+        check(
+            "8-bit blocks are refused",
+            refused(lambda: check_lfm3_folder(folder(eight, {conv: [4, 3, 1]})), "affine 4-bit"),
+        )
+        other = dict(config, model_type="lfm2")
+        check(
+            "another model type is refused",
+            refused(lambda: check_lfm3_folder(folder(other, {conv: [4, 3, 1]})), "is not lfm3"),
+        )
+        bare = {k: v for k, v in config.items() if k != "model_type"}
+        check(
+            "a config with no model type is refused by name",
+            refused(lambda: model_type_of(folder(bare, {conv: [4, 3, 1]})), "no model_type"),
+        )
+    return fails
 
 
 def save_f32(path, values) -> None:
