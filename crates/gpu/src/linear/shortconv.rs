@@ -38,7 +38,7 @@
 //! leaves it as it was: a product that is not finite stays in the ring and every later call that
 //! reads it raises again, until the model resets.
 
-use super::{BLOCK, PASS_ROWS, ring_input};
+use super::{BLOCK, ring_input};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
@@ -53,7 +53,7 @@ use std::sync::Arc;
 /// kernel's loops run over `taps` and no table is sized by it.
 pub const MAX_TAPS: usize = 16;
 // The entry's `launch_contract` bounds are literals.
-const _: () = assert!(BLOCK == 128 && MAX_TAPS == 16 && PASS_ROWS == 8);
+const _: () = assert!(BLOCK == 128 && MAX_TAPS == 16);
 
 /// The units of a call of `m` tokens at `taps` taps (module doc): unit 0, and one for each token
 /// past the first `taps − 1`.
