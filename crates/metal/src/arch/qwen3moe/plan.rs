@@ -11,10 +11,11 @@
 //! states what each says.
 //!
 //! A GGUF file whose data section is cut short (a header fetched by a range
-//! read) is read from its header and tensor table alone ([`open_header`]); the
-//! open of such a file stays a named error. A checkpoint folder is read through
-//! the model file's own header.
+//! read) is read from its header and tensor table alone ([`open_plan_header`]);
+//! the open of such a file stays a named error. A checkpoint folder is read
+//! through the model file's own header.
 
+use std::fmt;
 use std::path::Path;
 
 use bloomery_device::Census;
@@ -58,11 +59,52 @@ impl Header {
     }
 }
 
-/// The file at `path` as the plan reads it: the open's own model file when the
-/// file is whole, else a GGUF's header and tensor table alone. A header the
-/// reader cannot take, a folder the open refuses, or a GGUF that is whole and
-/// still refused by the reader, is a named error.
+/// Why the plan has no header to read, with the code it ends with
+/// ([`OpenError::code`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenError {
+    /// The open refuses the file: a folder no map reads or whose config or
+    /// tensors a map refuses, or a GGUF whose header reads and that the reader
+    /// still refuses whole. The text is the open's own refusal.
+    Refused(String),
+    /// The header cannot be read: no GGUF, a table cut short, a tensor type no
+    /// table sizes, or the first of several shards cut.
+    Unreadable(String),
+}
+
+impl OpenError {
+    /// The exit code of `generate_metal --plan` for this error.
+    #[must_use]
+    pub fn code(&self) -> u8 {
+        match self {
+            OpenError::Refused(_) => EXIT_REFUSED,
+            OpenError::Unreadable(_) => EXIT_UNREADABLE,
+        }
+    }
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::Refused(why) | OpenError::Unreadable(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+/// [`open_plan_header`] with its error as text, for a caller that only prints
+/// it.
 pub fn open_header(path: &Path) -> Result<Header, String> {
+    open_plan_header(path).map_err(|e| e.to_string())
+}
+
+/// The file at `path` as the plan reads it: the open's own model file when the
+/// file is whole, else a GGUF's header and tensor table alone. A folder the
+/// open refuses, or a GGUF that is whole and still refused by the reader, is
+/// [`OpenError::Refused`]; a header the reader cannot take is
+/// [`OpenError::Unreadable`].
+pub fn open_plan_header(path: &Path) -> Result<Header, OpenError> {
     let refused = match ModelFile::open(path) {
         Ok(file) => {
             return Ok(Header {
@@ -71,20 +113,24 @@ pub fn open_header(path: &Path) -> Result<Header, String> {
             });
         }
         Err(FileError::Gguf { source, .. }) => source,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(OpenError::Refused(e.to_string())),
     };
-    let inv = gguf::inventory_of(path)
-        .map_err(|e| format!("{}: {refused}; the header alone: {e}", path.display()))?;
+    let inv = gguf::inventory_of(path).map_err(|e| {
+        OpenError::Unreadable(format!(
+            "{}: {refused}; the header alone: {e}",
+            path.display()
+        ))
+    })?;
     let mut end = 0u64;
     let mut decls = Vec::with_capacity(inv.tensors.len());
     for t in &inv.tensors {
         let nbytes = t.nbytes.ok_or_else(|| {
-            format!(
+            OpenError::Unreadable(format!(
                 "{}: tensor {:?} has the type id {}, which no table sizes",
                 path.display(),
                 t.name,
                 t.type_id
-            )
+            ))
         })?;
         end = end.max(t.offset.saturating_add(nbytes));
         decls.push(TensorDecl {
@@ -96,20 +142,25 @@ pub fn open_header(path: &Path) -> Result<Header, String> {
     }
     let need = inv.data_base.saturating_add(end);
     if inv.file_len >= need {
-        return Err(format!("{}: {refused}", path.display()));
+        return Err(OpenError::Refused(format!("{}: {refused}", path.display())));
     }
     if let Some(count) = inv.value("split.count").and_then(gguf::Value::as_unsigned)
         && count > 1
     {
-        return Err(format!(
+        return Err(OpenError::Unreadable(format!(
             "{}: the first of {count} shards, cut short: a plan reads one file's header",
             path.display()
-        ));
+        )));
     }
-    let layout = FileLayout::new(&inv.meta, decls)
-        .map_err(|e| format!("{}: the header does not lay out: {e}", path.display()))?;
-    let split = Split::header_only(path.to_path_buf(), &layout)
-        .map_err(|e| format!("{}: the header-only split: {e}", path.display()))?;
+    let layout = FileLayout::new(&inv.meta, decls).map_err(|e| {
+        OpenError::Unreadable(format!(
+            "{}: the header does not lay out: {e}",
+            path.display()
+        ))
+    })?;
+    let split = Split::header_only(path.to_path_buf(), &layout).map_err(|e| {
+        OpenError::Unreadable(format!("{}: the header-only split: {e}", path.display()))
+    })?;
     Ok(Header {
         file: ModelFile::Gguf(split),
         data: Data::Cut {
@@ -414,6 +465,41 @@ Pages purgeable:                                3987.
             e.starts_with(&format!("checkpoint folder {}: ", dir.display())),
             "{e}"
         );
+    }
+
+    /// A folder the open refuses is [`OpenError::Refused`], which ends the plan with 3; a header
+    /// cut inside its own table is [`OpenError::Unreadable`], which ends it with 64.
+    #[test]
+    fn a_refused_folder_ends_the_plan_with_3_and_an_unreadable_header_with_64() {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let dir = tmp.join(format!("bloomery-metal-plan-refused-{pid}"));
+        std::fs::create_dir_all(&dir).expect("the directory is made");
+        std::fs::write(dir.join("config.json"), r#"{"model_type": "nope"}"#)
+            .expect("the config is written");
+        let folder = open_plan_header(&dir).err();
+        std::fs::remove_dir_all(&dir).expect("the directory is removed");
+        let folder = folder.expect("a model_type no map reads is refused");
+        assert!(matches!(folder, OpenError::Refused(_)), "{folder:?}");
+        assert_eq!(folder.code(), EXIT_REFUSED);
+        assert!(
+            folder
+                .to_string()
+                .contains("model_type \"nope\" has no folder map"),
+            "{folder}"
+        );
+
+        let file = tmp.join(format!("bloomery-metal-plan-cut-{pid}.gguf"));
+        let mut cut = b"GGUF".to_vec();
+        cut.extend(3u32.to_le_bytes());
+        cut.extend(1u64.to_le_bytes());
+        cut.extend(0u64.to_le_bytes());
+        std::fs::write(&file, cut).expect("the file is written");
+        let header = open_plan_header(&file).err();
+        std::fs::remove_file(&file).expect("the file is removed");
+        let header = header.expect("a header cut inside its tensor table is no plan");
+        assert!(matches!(header, OpenError::Unreadable(_)), "{header:?}");
+        assert_eq!(header.code(), EXIT_UNREADABLE);
     }
 
     #[test]

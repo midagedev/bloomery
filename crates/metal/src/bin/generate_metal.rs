@@ -100,9 +100,10 @@
 //! open would make buffers of, every refusal the open's checks meet (not the
 //! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
 //! items` (exit 3). A file whose data section is cut short is read as a header
-//! alone; a header the plan cannot read is a named error and exit 64; a repo
-//! it cannot fetch is a named error and exit 1. `--hf` fetches what the cache
-//! lacks before the plan reads it. It takes no generation flag.
+//! alone. A folder or file the open refuses before the plan can check it is a
+//! named error and exit 3; a header the plan cannot read is a named error and
+//! exit 64; a repo it cannot fetch is a named error and exit 1. `--hf` fetches
+//! what the cache lacks before the plan reads it. It takes no generation flag.
 //!
 //! A bad flag or a bad value is a named error and exit 2; a refusal of the
 //! device, the session or the tokenizer, or a fault the device raised, is a
@@ -905,16 +906,19 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             }
             Err(e) => {
                 eprintln!("generate_metal: --plan: {e}");
-                ExitCode::from(plan::EXIT_UNREADABLE)
+                ExitCode::from(e.code())
             }
         }
     }
 
-    fn plan_of(model: &std::path::Path, ctx: Option<usize>) -> Result<plan::Printed, String> {
-        let header = plan::open_header(model)?;
+    fn plan_of(
+        model: &std::path::Path,
+        ctx: Option<usize>,
+    ) -> Result<plan::Printed, plan::OpenError> {
+        let header = plan::open_plan_header(model)?;
         let ctx = match ctx {
             Some(c) => c,
-            None => default_ctx(header.split(), model)?,
+            None => default_ctx(header.split(), model).map_err(plan::OpenError::Unreadable)?,
         };
         let outcome = check::check(header.split(), ctx);
         Ok(plan::render(

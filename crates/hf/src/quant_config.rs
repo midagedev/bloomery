@@ -7,11 +7,11 @@
 //! module outside `ignored_layers` and, with `moe_quant_algo`, NVFP4 pack-quantized
 //! ([`Format::Nvfp4Ct`]) to the routed experts. MLX's own block (`config.json` `quantization`,
 //! what mlx-lm's convert writes, with a verbatim copy at `quantization_config`) gives
-//! `group_size`, `bits`, `mode` and per-module `{group_size, bits}` overrides keyed as the tensor
-//! names minus `.weight`. [`Config`] reads them into the formats
-//! each module is declared, and [`plan`] gives every tensor of a checkpoint one [`Format`]: each
-//! weight's stored tensors (dtype, shape and companion scales) are matched against the formats
-//! its module is declared.
+//! `group_size`, `bits`, `mode` and per-module `{group_size, bits, mode}` overrides keyed as the
+//! tensor names minus `.weight`, and `false` for a module it left unquantized. [`Config`] reads
+//! them into the formats each module is declared, and [`plan`] gives every tensor of a checkpoint
+//! one [`Format`]: each weight's stored tensors (dtype, shape and companion scales) are matched
+//! against the formats its module is declared.
 //!
 //! A BF16 or F32 tensor is placed as stored: configs quantize linears, and a tensor table cannot
 //! tell a linear from a norm. A quantized weight whose module the config leaves unquantized, or
@@ -263,13 +263,14 @@ struct Modelopt {
 }
 
 /// MLX's `quantization` block: the affine format every module takes, and the
-/// per-module `{group_size, bits}` entries that override it, keyed exactly as
-/// the tensor names minus `.weight` (mlx-lm's convert writes them from the
-/// module paths it quantized).
+/// per-module `{group_size, bits, mode}` entries that override it, keyed
+/// exactly as the tensor names minus `.weight` (mlx-lm's convert writes them
+/// from the module paths it quantized). A `false` entry is a module the convert
+/// left unquantized: `None`, whose tensors the plan holds to stored floats.
 #[derive(Debug)]
 struct Mlx {
     all: Format,
-    layers: BTreeMap<String, Format>,
+    layers: BTreeMap<String, Option<Format>>,
 }
 
 #[derive(Debug)]
@@ -415,8 +416,14 @@ impl Config {
     ) -> (Vec<Format>, Option<&str>) {
         if let Some(m) = &self.mlx {
             // The block has no exclude list: a module takes its own entry or
-            // the block's format, so no module is left unquantized.
-            return (vec![*m.layers.get(module).unwrap_or(&m.all)], None);
+            // the block's format, and is left unquantized only by a `false`
+            // entry, which no quantized tensor of it fits.
+            let formats = match m.layers.get(module) {
+                Some(Some(own)) => vec![*own],
+                Some(None) => vec![],
+                None => vec![m.all],
+            };
+            return (formats, None);
         }
         if let Some(m) = &self.modelopt {
             let layer = m
@@ -484,8 +491,14 @@ const LAYER: &Fields = &[
     ("weight_scale_encoding", Read),
 ];
 
-/// A per-module `quantization` entry's keys, each read by [`mlx_format`].
-const MLX_LAYER: &Fields = &[("group_size", Read), ("bits", Read)];
+/// A per-module `quantization` entry's keys, each read by [`mlx_format`]; `mode`
+/// is the block's rule: mlx-lm writes it into every entry of a fine-grained
+/// config.
+const MLX_LAYER: &Fields = &[
+    ("group_size", Read),
+    ("bits", Read),
+    ("mode", Only("[\"affine\"]")),
+];
 
 impl Mlx {
     fn parse(q: &Value) -> Result<Mlx, Error> {
@@ -499,14 +512,19 @@ impl Mlx {
                 block.insert(key.clone(), entry.clone());
                 continue;
             }
+            if entry.as_bool() == Some(false) {
+                layers.insert(key.clone(), None);
+                continue;
+            }
             let entry = entry.as_object().ok_or_else(|| {
                 bad(format!(
-                    "quantization {key} is neither a per-module object nor one of the block's keys"
+                    "quantization {key} {entry} is neither a per-module object, false nor one of \
+                     the block's keys"
                 ))
             })?;
             let value = Value::Object(entry.clone());
             schema::check(&value, &format!("quantization {key}"), &[MLX_LAYER]).map_err(bad)?;
-            layers.insert(key.clone(), mlx_format(key, &value)?);
+            layers.insert(key.clone(), Some(mlx_format(key, &value)?));
         }
         let block = Value::Object(block);
         schema::check(&block, "quantization", &[MLX_BLOCK]).map_err(bad)?;
@@ -2659,5 +2677,122 @@ mod tests {
                 .contains("quantization.mode \"affine2\" is unsupported"),
             "{e}"
         );
+    }
+
+    /// mlx-lm writes `mode` into every per-module entry of a fine-grained config. An `affine` one
+    /// is the block's rule and parses to the layers an entry without it does; another mode is
+    /// refused naming the module.
+    #[test]
+    fn a_per_module_mode_is_the_blocks_affine_form() {
+        let gate = "model.layers.0.mlp.gate";
+        let config = |mode: Option<&str>| {
+            let mut entry = serde_json::json!({ "group_size": 64, "bits": 8 });
+            if let Some(mode) = mode {
+                entry["mode"] = mode.into();
+            }
+            let mut q = serde_json::json!({ "group_size": 64, "bits": 4, "mode": "affine" });
+            q[gate] = entry;
+            serde_json::json!({ "quantization": q })
+        };
+        let with = Config::parse(&config(Some("affine")), None).unwrap();
+        let without = Config::parse(&config(None), None).unwrap();
+        for module in [gate, "model.layers.0.self_attn.q_proj"] {
+            assert_eq!(
+                with.declared(module, || None).0,
+                without.declared(module, || None).0,
+                "{module}"
+            );
+        }
+        assert_eq!(
+            with.declared(gate, || None).0,
+            [Format::MlxAffine { bits: 8, group: 64 }]
+        );
+        let e = Config::parse(&config(Some("mxfp4")), None).unwrap_err();
+        assert!(
+            e.to_string().contains(&format!(
+                "quantization {gate}.mode \"mxfp4\" is unsupported"
+            )),
+            "{e}"
+        );
+    }
+
+    /// mlx-lm writes `"<module>": false` for a module it left unquantized, a norm's among them.
+    /// The module is declared no format: its stored floats are placed plain, and a quantized
+    /// tensor or a scale beside them is refused by name. A value other than an object or `false`
+    /// in an entry's place is refused too.
+    #[test]
+    fn a_false_entry_leaves_its_module_unquantized() {
+        let norm = "model.layers.0.self_attn.q_norm";
+        let proj = "model.layers.0.self_attn.q_proj";
+        let config = |entries: &[(&str, Value)]| {
+            let mut q = serde_json::json!({ "group_size": 64, "bits": 4 });
+            for (module, entry) in entries {
+                q[*module] = entry.clone();
+            }
+            serde_json::json!({ "quantization": q })
+        };
+        let entry = |name: String, dtype: Dtype, shape: &[usize]| (name, dtype, shape.to_vec());
+        let stored = vec![
+            entry(format!("{norm}.weight"), Dtype::Bf16, &[128]),
+            entry(format!("{proj}.weight"), Dtype::U32, &[256, 32]),
+            entry(format!("{proj}.scales"), Dtype::Bf16, &[256, 4]),
+            entry(format!("{proj}.biases"), Dtype::Bf16, &[256, 4]),
+        ];
+        let off = Value::Bool(false);
+
+        // The `false` module reads as unquantized, its BF16 weight is placed plain, and the
+        // quantized module beside it keeps the block's format.
+        let c = Config::parse(&config(&[(norm, off.clone())]), None).unwrap();
+        assert!(
+            c.declared(norm, || None).0.is_empty(),
+            "a false entry declares its module no format"
+        );
+        let block = Format::MlxAffine { bits: 4, group: 64 };
+        assert_eq!(c.declared(proj, || None).0, [block]);
+        let p = plan(&c, tensors(&stored), |_| None);
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        assert_eq!(p.placed[&format!("{norm}.weight")].format, Format::Bf16);
+        assert_eq!(p.placed[&format!("{proj}.weight")].format, block);
+
+        // A quantized weight under a `false` entry is refused with its scales.
+        let c = Config::parse(&config(&[(norm, off.clone()), (proj, off.clone())]), None).unwrap();
+        let p = plan(&c, tensors(&stored), |_| None);
+        assert!(
+            p.refused[&format!("{proj}.weight")]
+                .contains(&format!("the config leaves {proj} unquantized")),
+            "{:?}",
+            p.refused
+        );
+        assert!(
+            p.refused[&format!("{proj}.scales")].contains("a companion no placed weight reads"),
+            "{:?}",
+            p.refused
+        );
+
+        // A scale beside a float weight of a `false` module is refused, the weight stays plain.
+        let c = Config::parse(&config(&[(norm, off)]), None).unwrap();
+        let strays = vec![
+            entry(format!("{norm}.weight"), Dtype::Bf16, &[128]),
+            entry(format!("{norm}.scales"), Dtype::Bf16, &[128, 2]),
+        ];
+        let p = plan(&c, tensors(&strays), |_| None);
+        assert_eq!(p.placed[&format!("{norm}.weight")].format, Format::Bf16);
+        assert!(
+            p.refused[&format!("{norm}.scales")].contains("a companion no placed weight reads"),
+            "{:?}",
+            p.refused
+        );
+
+        // Any other value in an entry's place is refused by the module's name.
+        for other in [Value::Bool(true), 3.into(), "no".into()] {
+            let e = Config::parse(&config(&[(norm, other.clone())]), None).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!(
+                    "quantization {norm} {other} is neither a per-module object, false nor one \
+                     of the block's keys"
+                )),
+                "{e}"
+            );
+        }
     }
 }
