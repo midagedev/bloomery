@@ -1587,10 +1587,10 @@ gate-gpu-qwen35moe-media:
 # positions the steps read), (F) the tower's rows through the seat's resident encoder against set B within the tower
 # gate's band, and (G) one served answer (`bloomery-serve --model qwen38 --mmproj`: set E's prompt ids, set F's ids or a
 # near tie, and the 400 of a server with no --mmproj). The plan runs on the gate card's bytes less the tower's and the
-# rotation tables'. Real file only (the sets are dumped from it). Stays solo, reason: the host set (the most of the file)
-# loads under the big-load lock four times, the text load, the media load and the two servers one after the other, and
-# a neighbour's load moves the host room each plan reads.
-[group('solo')]
+# rotation tables'. Real file only (the sets are dumped from it). A chain member (v41-load, not solo): the host set (the most
+# of the file) loads under the big-load lock four times, the text load, the media load and the two servers one after the
+# other, and the gate's own plans take the workstation's plan room (PLAN_ROOM), so a neighbour's load moves none of them;
+# the two servers plan on the host's reading, which no admitted neighbour (a lane item beside the chain) lowers to the need.
 [group('v41-load')]
 gate-gpu-qwen38-media:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-media && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen38_media && D=target/qwen38-media-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=2400 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen38_media --dir $D'
@@ -2851,8 +2851,8 @@ weekly-gpu-ds41-serve:
 # 페이지드 티어의 두 이름 붙은 거부(HOST_LOCK 병행, r8 상주 사본)를 뺐다 — 커버리지 변경, 게이트 머리말에 근거.
 # 계획은 gate_card의 3090 바이트로 서므로 어느 카드든 같은 핀이 선다 — 카드를 고정할 사실이 없어 any.
 # Real-only (no fixture conversion): under the fixture tier box.sh exports the qwen4exp fixture's BLOOMERY_CARD_BUDGET, and
-# gate_nvtier refuses it as a lever it does not act on.
-[group('solo')]
+# gate_nvtier refuses it as a lever it does not act on. A chain member (v41-load, not solo): the all-RAM arm's plan takes the
+# workstation's plan room (PLAN_ROOM), the paged arms and the grant children set their rooms, so a neighbour's load moves no plan.
 [group('v41-load')]
 gate-gpu-nvtier:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nvtier && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvtier'
@@ -2861,10 +2861,9 @@ gate-gpu-nvtier:
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice
 # with flips landed, every admitted slot byte for byte a static load's, the passes' kinds and kept rows (the prompt one
 # pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Plan (a) on the A6000 (the
-# gate plans with the A6000 machine). Loads the whole host set: alone in a batch, under the big-load lock.
-# Stays solo on the A6000 (no conversion). Real-only: no fixture tier yet (the router double, R4); it opens the real file whatever the
-# tier names.
-[group('solo')]
+# gate plans with the A6000 machine). Loads the whole host set under the big-load lock: a chain member (v41-load, not solo) on
+# the A6000 (no conversion), its plan room the workstation's own (PLAN_ROOM), so a neighbour's load moves no plan. Real-only: no
+# fixture tier yet (the router double, R4); it opens the real file whatever the tier names.
 [group('v41-load')]
 gate-gpu-qwen38-residency:
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-residency && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'

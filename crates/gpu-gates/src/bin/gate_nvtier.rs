@@ -290,7 +290,7 @@ use model::moe::UNION_BATCH_IDS;
 use model::moe::{Claim, TierSlots};
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
-use model::placement::workstation::{ArenaGrant, HostNeed, HostRead};
+use model::placement::workstation::{ArenaGrant, HostNeed, HostRead, PLAN_ROOM};
 use model::placement::{ArenaFloor, Machine, PlanLevers};
 use runtime::{Out, Target, Want};
 use threads::helper::{Placement, spawn_helper};
@@ -673,14 +673,15 @@ struct Seam {
     counters: [NvTierStats; 2],
 }
 
-/// The plan of `file` on `machine` with `room` given, or the machine's own
-/// reading when `None`.
+/// The plan of `file` with `room` given, or with the workstation's whole plan
+/// room ([`PLAN_ROOM`]) when `None`: the all-RAM arm's plan holds the host leg
+/// whatever a neighbour's load leaves of the host's reading.
+// PIN(2026-10-28): `None` read `MemAvailable`, which another process's load moves.
 fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
-    let mut inputs = PlanInputs::describe(file)?;
-    if let Some(room) = room {
-        inputs.room = (room, HostRead::Given);
-    }
-    Ok(inputs)
+    Ok(PlanInputs::describe_in(
+        file,
+        (room.unwrap_or(PLAN_ROOM), HostRead::Given),
+    )?)
 }
 
 /// The model of `plan` (made of `inputs` over `file`) loaded under
@@ -703,7 +704,7 @@ fn open_arm(
             if room.is_some() {
                 "the dial gave the room no tier — check the floor and the room"
             } else {
-                "the host's own room does not hold the host leg (BLOOMERY_HOST_ROOM set?)"
+                "the workstation's plan room does not hold the host leg"
             }
         )
         .into());

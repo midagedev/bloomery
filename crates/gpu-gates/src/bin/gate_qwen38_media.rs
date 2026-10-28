@@ -108,7 +108,7 @@ mod gate {
     use gguf::Split;
     use model::arch::qwen35moe::place::Experts;
     use model::placement::PlanLevers;
-    use model::placement::workstation::CardSpec;
+    use model::placement::workstation::{CardSpec, PLAN_ROOM};
     use refset::arch::qwen4exp::MODEL;
     use refset::arch::qwen4exp::vis::{
         CHATIDS, DECODE, HIDDEN, MMPROJ_BF16, MMPROJ_BF16_SHA256, TAPS,
@@ -459,7 +459,9 @@ mod gate {
                 slots: 1,
                 plan_levers: &self.plan_levers,
                 host: self.host,
-                room: None,
+                // PIN(2026-10-28): the plan read `MemAvailable`, which another process's load
+                // moves; the room is the workstation's own.
+                room: Some(PLAN_ROOM),
                 residency: Residency::Off,
             }
             .plan(file)?;

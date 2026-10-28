@@ -13,12 +13,6 @@
 #   glm5next   --place gate: need=173,015,891,968 B (the glm5next serve log's cache line)
 #   qwen4exp   --place gate: need=92,054,154,240 B (the qwen38 serve log's cache line); the serve/residency seats add
 #              the churn pool 35.6e9 B beside it; iqleg loads the file twice (both resident): 2 x.
-#   nvtier     gate_nvtier: the all-RAM arm loads first and its load need is 105,818,045,440 B (host experts 62,397,542,400 B +
-#              tables 28,800,138,240 B + reserves 6,694,629,376 B + residency churn pool 14,620,364,800 B − OS reserve 6,694,629,376 B);
-#              the paged arm loads after it, 5.5e9 B need + 23.5e9 B arena, the smaller. [derived from the load check's refusal line]
-#   qwen38-media: the qwen38-serve row's need, qwen4exp --place gate (the text load, the media load and the servers load one
-#              after the other, never two at once; the media load's rotation tables are card bytes, none are host bytes);
-#              the server arms may run the residency pool, whose 35.6e9 B the serve row carries [derived]
 #   mimo2      --place gate: every routed expert on the host — host routed 160,859,947,008 B (mimo2_meta's pin) + the
 #              host embedding 664,010,752 B, rounded up to 161.6e9 [derived]; the serve gate loads twice, one after the
 #              other, never both.
@@ -46,9 +40,6 @@ gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
 gate-gpu-glm5next-serve	-	173015891968
 gate-gpu-glm5next-twocard	-	173015891968
-gate-gpu-nvtier	-	105818045440
-gate-gpu-qwen38-media	-	127654154240
-gate-gpu-qwen38-residency	-	127700000000
 gate-gpu-qwen38-serve	-	127654154240
 gate-gpu-qwen38-twocard	-	92054154240
 gate-gpu-qwen3moe-twocard	-	92054154240

@@ -186,7 +186,7 @@ mod gate {
     use model::placement::Machine;
     use model::placement::PlanLevers;
     use model::placement::churn::ChurnPool;
-    use model::placement::workstation::A6000;
+    use model::placement::workstation::{A6000, HostRead, PLAN_ROOM};
     use refset::arch::qwen4exp::MODEL;
     use runtime::swaprule::SwapRule;
     use runtime::{Out, Target, Verify, Want};
@@ -1485,8 +1485,11 @@ mod gate {
         ])?;
         let host = levers.host();
         let path = Path::new(MODEL);
-        let inputs = PlanInputs::describe(
+        // PIN(2026-10-28): the plan read `MemAvailable`, which another process's load moves; the
+        // room is the workstation's own, so the machine's host figure alone binds `refuse`.
+        let inputs = PlanInputs::describe_in(
             &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
+            (PLAN_ROOM, HostRead::Given),
         )?;
         let ub = ubatch_for(CTX)?;
         let machine =
