@@ -30,7 +30,7 @@ bloomery-chain = { path = "crates/chain" }
 # The decision head's host sgemm (crates/decision); its own threading stays off.
 matrixmultiply = { version = "0.3.10", default-features = false, features = ["std"] }
 memmap2 = "0.9"
-sha2 = { version = "0.10", features = ["asm"] }
+sha2 = "0.10"
 thiserror = "2"
 
 # The Metal backend's Objective-C bindings, pinned by version: a bound that

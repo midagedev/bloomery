@@ -23,3 +23,8 @@ libc.workspace = true
 # The dequant oracle's sets open through their refset family; refset reads the GGUF files
 # through this crate, so the tests link the lib once and refset beside it.
 bloomery-refset = { path = "../refset" }
+
+# sha256 on an aarch64 host runs the CPU's SHA2 instructions (sha2's `asm`, assembled by the native C toolchain);
+# elsewhere, including the Mac's x86_64-linux cross check, which has no cross C compiler, the portable path.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
