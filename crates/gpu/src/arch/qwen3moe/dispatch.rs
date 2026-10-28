@@ -242,8 +242,8 @@ pub(super) fn enqueue_pass(
 ///
 /// - A dense FFN: `norm_quant` and the four launches after the router — 5;
 ///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
-///   one launch with no quantizer, a Q3_K or Q5_K one the quantizer and its
-///   projection ([`site_launches`]).
+///   one launch with no quantizer, a Q3_K, Q5_K or NVFP4 one the quantizer
+///   and its projection ([`reads_q8_1`], [`site_launches`]).
 /// - A routed FFN whose shared expert is kept apart ([`apart_down`]): the
 ///   norm with the router (`norm_quant` and the router, two, when the
 ///   shared gate or up reads f32 rows), the card list, the routed gate·up,
@@ -264,7 +264,7 @@ pub(super) fn enqueue_pass(
 /// 14, beside the input's quantizers; a dense FFN's norm, quantizer, gate,
 /// up, SwiGLU quantizer, down and combine, 7. A wide input is quantized once
 /// for each form its sites read ([`wide_quants`]: none for F32 sites alone, two for
-/// a K-quant beside a Q8_0), and a gated output projection not of a K-quant
+/// a K-quant beside a Q8_0 or an NVFP4), and a gated output projection not of a K-quant
 /// takes the f32 out gate and its own quantizer in place of the gated one.
 pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
     let wide = m > GEMV_COLS;
@@ -324,7 +324,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                     + site(sh.gate_ty)
                     + site(sh.up_ty)
                     + 1
-                    + usize::from(sh.down_ty.kquant())
+                    + usize::from(reads_q8_1(sh.down_ty))
                     + site(sh.down_ty)
                     + 1
             }
@@ -340,7 +340,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 let down = if down_sel(f) {
                     2
                 } else {
-                    usize::from(f.down_ty.kquant()) + site(f.down_ty)
+                    usize::from(reads_q8_1(f.down_ty)) + site(f.down_ty)
                 };
                 2 + gate_up + down
             }
@@ -480,6 +480,16 @@ pub(super) fn site_launches(ty: SiteTy, m: usize) -> usize {
     1 + usize::from(site::kgemv_order(ty) == Some(Order::RowMajor) && m > 1)
 }
 
+/// Whether a site of type `ty` reads the q8_1 rows on the gemv arm, so a quantizer runs into
+/// them before its launch: the form it reads ([`site::reads_at`]), which [`site_gemv`] dispatches
+/// by ([`site::kgemv_order`]). Not [`SiteTy::kquant`]: NVFP4 and IQ4_XS read them and are no
+/// K-quant. Every width of this arena's q8_1 rows is whole super-blocks of 256, where `reads_at`
+/// is [`SiteTy::reads`]. The launch and the node count ([`pass_launches`]) both ask this one
+/// function, so they cannot disagree.
+pub(super) fn reads_q8_1(ty: SiteTy) -> bool {
+    ty.reads() == site::Form::Q8x128
+}
+
 /// `y = W · x` for site `name` of type `ty`, `rows` rows, at `m <=
 /// GEMV_COLS` rows, token-major: a K-quant's `site::kgemv` on the q8_1 rows
 /// `act` (a row-major one past one row into `cols`, then copied
@@ -534,12 +544,12 @@ pub(super) struct SharedDenseBufs<'a> {
 /// ([`apart_down`]) and for a placed layer whose shared expert the `_sel`
 /// table does not run (`placed::SharedFfn::Sites`). Gate and up
 /// ([`site_gemv`]) read the normed rows in the form their type reads: `xin`
-/// is `(q8_1 of the normed rows, the f32 normed rows)`, a K-quant site the
-/// first, a Q8_0 or F32 site the second. Then the SwiGLU of the `ff`-wide
-/// rows into `b.h` (f32), its q8_1 form `b.act` only when the down is a
-/// K-quant site (any other down reads `b.h`), and the down into `b.y`
-/// (`hidden` wide). `cols` is the row-major scratch of a K-quant site
-/// launched alone past one row.
+/// is `(q8_1 of the normed rows, the f32 normed rows)`, a site that reads the
+/// q8_1 rows ([`reads_q8_1`]) the first, a Q8_0 or F32 site the second. Then
+/// the SwiGLU of the `ff`-wide rows into `b.h` (f32), its q8_1 form `b.act`
+/// only when the down reads those (any other down reads `b.h`), and the down
+/// into `b.y` (`hidden` wide). `cols` is the row-major scratch of a K-quant
+/// site launched alone past one row.
 pub(super) fn shared_dense(
     c: &Ctx<'_>,
     sh: &SharedSites,
@@ -563,7 +573,7 @@ pub(super) fn shared_dense(
     c.gpu
         .elem()
         .enqueue_swiglu(c.gpu.stream(), g, u, m * ff, h)?;
-    if sh.down_ty.kquant() {
+    if reads_q8_1(sh.down_ty) {
         c.gpu.enqueue_quantize_q8_1_layer(h, act, c.layer)?;
     }
     site_gemv(c, (sh.down_ty, &sh.down), hidden, (act, h), m, cols, y)
@@ -1282,7 +1292,7 @@ fn slots_down(
     } else {
         // A dense FFN's one slot a token: the down over the token's SwiGLU
         // row is the plain projection, token-major.
-        if n.down_ty.kquant() {
+        if reads_q8_1(n.down_ty) {
             gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
         }
         let Arena {
@@ -1528,9 +1538,10 @@ fn apart_down(
 
 #[cfg(test)]
 mod tests {
-    use super::pass_launches;
+    use super::{pass_launches, reads_q8_1, wide_quants};
     use crate::arch::qwen3moe::plan::fixtures::layer;
-    use crate::arch::qwen3moe::plan::{GqaKind, Pairs, SiteTy};
+    use crate::arch::qwen3moe::plan::{FfnRoute, GqaKind, Pairs, SiteTy};
+    use crate::site::{Form, kgemv_order, reads_at};
 
     /// The launches of a one-layer pass at `m` rows, less the embedding.
     fn one(kind: GqaKind, tys: [SiteTy; 4], m: usize) -> usize {
@@ -1573,5 +1584,54 @@ mod tests {
         };
         assert_eq!(one(norm, [Q4K; 4], 1), 7 + ffn);
         assert_eq!(one(norm, [Q4K, Q4K, Q4K, Q8_0], 1), 7 + ffn);
+    }
+
+    /// The quantizer runs exactly where a site's gemv reads the q8_1 rows: the form it reads at the
+    /// whole-super-block widths this arena holds ([`reads_at`]), the split `site_gemv` dispatches
+    /// by ([`kgemv_order`]). NVFP4 and IQ4_XS read them and are no K-quant.
+    #[test]
+    fn the_quantizer_runs_where_the_gemv_reads_q8_1() {
+        for &ty in SiteTy::ALL {
+            assert_eq!(reads_q8_1(ty), reads_at(ty, 5120) == Form::Q8x128, "{ty}");
+            assert_eq!(reads_q8_1(ty), kgemv_order(ty).is_some(), "{ty}");
+        }
+        use SiteTy::{Bf16, F32, Fp8B128, Iq4Xs, Mxfp8, Nvfp4, Q3K, Q4K, Q5_0, Q5K, Q6K, Q8_0};
+        for ty in [Q3K, Q4K, Q5K, Q6K, Iq4Xs, Nvfp4] {
+            assert!(reads_q8_1(ty), "{ty}");
+        }
+        for ty in [Q5_0, Q8_0, F32, Mxfp8, Fp8B128, Bf16] {
+            assert!(!reads_q8_1(ty), "{ty}");
+        }
+    }
+
+    /// A dense FFN's launches follow its sites' forms. At one row: `norm_quant` and the combine
+    /// beside the gate, the up and the SwiGLU, then the down — alone for a Q8_0 one, behind its
+    /// q8_1 quantizer for a Q5_K or NVFP4 one, one `_sel` launch for a fused Q4_K one. Past
+    /// [`super::GEMV_COLS`] rows: the norm, one quantizer a form the gate and up read, the gate, the
+    /// up, the SwiGLU's quantizer, the down and the combine, whatever the types; an NVFP4 site
+    /// reads the q8 blocks of 32 there, so it takes a second quantizer beside a K-quant.
+    #[test]
+    fn a_dense_ffn_launches_by_its_site_types() {
+        use SiteTy::{Nvfp4, Q4K, Q5K, Q8_0};
+        let launches = |gate_up: SiteTy, down: SiteTy, m: usize| {
+            let mut p = layer(GqaKind::Neox128, [Q4K; 4]);
+            p.ffn.route = FfnRoute::Dense;
+            [p.ffn.gate_ty, p.ffn.up_ty, p.ffn.down_ty] = [gate_up, gate_up, down];
+            pass_launches(&[p], m)
+        };
+        // The embedding, the fused attention's 7 and the FFN.
+        assert_eq!(launches(Q4K, Q4K, 1), 1 + 7 + 5);
+        assert_eq!(launches(Nvfp4, Nvfp4, 1), 1 + 7 + 7);
+        assert_eq!(launches(Q5K, Q5K, 1), launches(Nvfp4, Nvfp4, 1));
+        assert_eq!(launches(Q8_0, Q8_0, 1) + 1, launches(Nvfp4, Nvfp4, 1));
+        // A Q4_K gate·up beside an NVFP4 down: the fused gate·up, then the quantizer and the
+        // projection the Q4_K `_sel` down also takes.
+        assert_eq!(launches(Q4K, Nvfp4, 1), launches(Q4K, Q4K, 1));
+        // The embedding and the route table, the wide attention's 10 and the FFN's 7.
+        for ty in [Q4K, Q8_0, Nvfp4] {
+            assert_eq!(launches(ty, ty, 9), 1 + 1 + 10 + 7, "{ty}");
+        }
+        assert_eq!(wide_quants(&[Q4K, Nvfp4]), 2);
+        assert_eq!(wide_quants(&[Q8_0, Nvfp4]), 1);
     }
 }

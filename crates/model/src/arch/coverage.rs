@@ -1108,7 +1108,8 @@ const NEMOTRON_SITES: &[GgmlType] = &[
 
 /// The per-tensor type pins of the programs, as lists (the qwen3moe body's
 /// dense FFN; `Body35`'s
-/// site types, its `PROJ`, `EMBED` and `HEAD_TY` in
+/// site types, its `PROJ` and `DENSE_FFN` in
+/// the chain's reader, its `EMBED` and `HEAD_TY` in
 /// `gpu/src/arch/qwen3moe/body35.rs`, each a launch of `gpu/src/site.rs`; the
 /// pins read from the card kernel table's rows are [`ROW_PINS`]; the V4.1
 /// chain's attention gemvs, whose head-split sites in `chain/attn.rs` take
@@ -1147,16 +1148,21 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::DenseFfn,
         matrices: true,
         names: None,
-        what: "dense FFN (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)",
-        reads: Q35_PROJ,
+        what: "dense FFN (the body reads q3_K, q4_K, q5_K, q6_K, q8_0 and nvfp4)",
+        reads: Q35_DENSE_FFN,
     },
     TypePin {
         programs: &[Program::Qwen35Body],
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the head reads q6_K, q4_K and q8_0)",
-        reads: &[GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0],
+        what: "output head (the head reads q6_K, q4_K, q8_0 and nvfp4)",
+        reads: &[
+            GgmlType::Q6_K,
+            GgmlType::Q4_K,
+            GgmlType::Q8_0,
+            GgmlType::NVFP4,
+        ],
     },
     TypePin {
         programs: &[Program::Qwen35Body],
@@ -1908,14 +1914,28 @@ fn gated_block_site(ty: GgmlType) -> bool {
     )
 }
 
-/// `Body35`'s projection types (`PROJ`): every attention, delta-rule and
-/// dense FFN matrix.
+/// `Body35`'s projection types (`PROJ`): every attention and delta-rule matrix.
 const Q35_PROJ: &[GgmlType] = &[
     GgmlType::Q3_K,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
     GgmlType::Q6_K,
     GgmlType::Q8_0,
+];
+
+/// `Body35`'s dense FFN types (`Sites35::CARD.dense`, pinned to this list by the chain's test):
+/// The projection types and NVFP4.
+// PIN(2026-10-29): widened with NVFP4; derivation: a dense FFN's NVFP4 gate, up and down launch
+// `site::kgemv`'s `nvfp4_gemv` on the gemv arm and `site::gated`'s `gemm_nvfp4p` on the wide arm
+// (`dispatch::slots_down`, `wide::slots_gemm`); an NVFP4 attention or delta-rule matrix still
+// reads no launch, so the mixers keep the projection list.
+pub const Q35_DENSE_FFN: &[GgmlType] = &[
+    GgmlType::Q3_K,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q8_0,
+    GgmlType::NVFP4,
 ];
 
 /// The dense site `Body35` runs a part of a shared expert of `ty` with when
@@ -2987,8 +3007,44 @@ mod tests {
                 Program::Qwen35Body,
                 &matrix("ffn_up.weight", Role::DenseFfn, bf16)
             ),
-            ["bf16 dense FFN (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)"]
+            ["bf16 dense FFN (the body reads q3_K, q4_K, q5_K, q6_K, q8_0 and nvfp4)"]
         );
+    }
+
+    /// `Body35` reads NVFP4 at its dense FFN and its head: those matrices are no items, while an
+    /// NVFP4 attention, delta-rule, shared-expert or embedding matrix is one by name (their lists
+    /// hold none).
+    // FAIL-first: without NVFP4 in the dense FFN or head pin, that row of this test is an item.
+    #[test]
+    fn body35_reads_nvfp4_at_its_dense_ffn_and_head_only() {
+        let body = |name, role| items(Program::Qwen35Body, &matrix(name, role, GgmlType::NVFP4));
+        for (name, role) in [
+            ("ffn_gate.weight", Role::DenseFfn),
+            ("ffn_up.weight", Role::DenseFfn),
+            ("ffn_down.weight", Role::DenseFfn),
+            ("output.weight", Role::Head),
+        ] {
+            assert_eq!(body(name, role), Vec::<String>::new(), "{name}");
+        }
+        for (name, role, want) in [
+            (
+                "attn_qkv.weight",
+                Role::Attention,
+                "nvfp4 attention and delta-rule matrices (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)",
+            ),
+            (
+                "ffn_gate_shexp.weight",
+                Role::SharedExpert,
+                "nvfp4 shared expert (the body reads q3_K, q4_K, q5_K, q6_K and q8_0)",
+            ),
+            (
+                "token_embd.weight",
+                Role::TokenEmbedding,
+                "nvfp4 token embedding (the card reads q3_K, q4_K, q5_K and q6_K rows and q8_0 planes)",
+            ),
+        ] {
+            assert_eq!(body(name, role), [want], "{name}");
+        }
     }
 
     /// A routed stack of a qwen4exp file passes when the program can run it

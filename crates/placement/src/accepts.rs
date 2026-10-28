@@ -1204,10 +1204,11 @@ mod tests {
     }
 
     /// The qwen3moe body's dense owner is the table row kept to the forms
-    /// its arena carries and to a wide GEMM: `None` for Q5_0 (it reads
-    /// `Q8Blocks32`) and NVFP4 (no wide GEMM), `Some` for Q3_K, Q4_K, Q5_K,
-    /// Q6_K, Q8_0 and F32. Nor its head and embedding rows BF16: its load
-    /// keeps no BF16 words.
+    /// its arena carries: `None` for Q5_0 (it reads `Q8Blocks32`) and NVFP4
+    /// (its gemv reads the q8_1 rows and its wide GEMM the q8 blocks of 32,
+    /// two forms where a row of this owner holds one), `Some` for Q3_K,
+    /// Q4_K, Q5_K, Q6_K, Q8_0 and F32. Nor its head and embedding rows BF16:
+    /// its load keeps no BF16 words.
     #[test]
     fn the_qwen3moe_body_dense_owner_refuses_q5_0() {
         use crate::kernels::SiteEntry;

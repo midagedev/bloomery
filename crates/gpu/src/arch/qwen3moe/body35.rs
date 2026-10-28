@@ -509,8 +509,8 @@ impl<'a> Copied35<'a> {
 }
 
 /// The types the embedding and the head read (`crate::site`): the embedding
-/// Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K, Q4_K or Q8_0
-/// (`Head`).
+/// Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K, Q4_K, Q8_0 or
+/// NVFP4 (`Head`).
 const EMBED: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -518,7 +518,7 @@ const EMBED: &[SiteTy] = &[
     SiteTy::Q6K,
     SiteTy::Q8_0,
 ];
-const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q4K, SiteTy::Q8_0];
+const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q4K, SiteTy::Q8_0, SiteTy::Nvfp4];
 
 /// The forms the layers the common card leg runs ([`model::placement::accepts::LegSplit::Common`]) hold
 /// buffers of, from `file`'s header: [`CommonForms::NONE`] unless the read is a

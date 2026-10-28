@@ -161,6 +161,17 @@ const PROJ: &[SiteTy] = &[
     SiteTy::Q6K,
     SiteTy::Q8_0,
 ];
+/// The types a card dense FFN's gate, up and down launch at: [`PROJ`] and
+/// NVFP4, whose planes the gemv arm reads over the q8_1 rows and the wide
+/// GEMM over the q8 blocks of 32. A mixer's projection reads no NVFP4.
+const DENSE_FFN: &[SiteTy] = &[
+    SiteTy::Q3K,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+    SiteTy::Nvfp4,
+];
 /// [`PROJ`] and F32: the types the card's β and α launch at, and those a
 /// routed layer's stacks and its shared expert are read at, which the card
 /// kernel table's entries then admit ([`plan_ffn`]); under a placed read the
@@ -185,6 +196,8 @@ const PROJ_F32: &[SiteTy] = &[
 pub struct Sites35 {
     /// A projection of the normed rows or an output projection.
     pub proj: &'static [SiteTy],
+    /// A dense FFN's gate, up and down.
+    pub dense: &'static [SiteTy],
     /// The routed stacks, the shared expert's parts, β and α.
     pub stacks: &'static [SiteTy],
     /// The gate·up launch's types: one launch reads the gate and the up of
@@ -198,13 +211,15 @@ pub struct Sites35 {
 }
 
 impl Sites35 {
-    /// The card's lists: the projections' and the stacks' of today, and the
-    /// FFN dispatch's three from the kernel tables (`model::arch::coverage`'s
-    /// `qwen35_gate_up`, `qwen35_down` and `qwen35_shared`), each pinned to
-    /// its table by test. A backend with launches of its own states its
-    /// lists beside them (Metal's beside its session).
+    /// The card's lists: the projections', the dense FFN's and the stacks' of
+    /// today, and the FFN dispatch's three from the kernel tables
+    /// (`model::arch::coverage`'s `qwen35_gate_up`, `qwen35_down` and
+    /// `qwen35_shared`), each pinned to its table by test, the dense FFN's to
+    /// the coverage pin (`Q35_DENSE_FFN`). A backend with launches of its own
+    /// states its lists beside them (Metal's beside its session).
     pub const CARD: Sites35 = Sites35 {
         proj: PROJ,
+        dense: DENSE_FFN,
         stacks: PROJ_F32,
         gate_up: &[SiteTy::Q4K, SiteTy::Q5K],
         down: &[SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K],
@@ -376,7 +391,7 @@ fn ffn_norm_name(
 /// card runs whatever the stacks are; the common leg's layers
 /// ([`LegSplit::Common`]) are among them, their types the placed side's to
 /// read. A dense one: its three matrices a stack of one expert on the
-/// arena's fixed route.
+/// arena's fixed route, each at a type of the backend's `dense` list.
 pub fn plan_ffn(
     file: &Split,
     what: &'static str,
@@ -482,9 +497,9 @@ pub fn plan_ffn(
             Ok(FfnPlan {
                 ffn_norm,
                 route: FfnRoute::Dense,
-                gate_ty: ty_of(file, what, &gate, ff, h, sites.proj)?,
-                up_ty: ty_of(file, what, &up, ff, h, sites.proj)?,
-                down_ty: ty_of(file, what, &down, h, ff, sites.proj)?,
+                gate_ty: ty_of(file, what, &gate, ff, h, sites.dense)?,
+                up_ty: ty_of(file, what, &up, ff, h, sites.dense)?,
+                down_ty: ty_of(file, what, &down, h, ff, sites.dense)?,
                 gate,
                 up,
                 down,
@@ -815,10 +830,10 @@ mod tests {
     use crate::arch::qwen3moe::plan::{Kind35, kinds_of, kinds35};
     use crate::linear::Ring;
     use gguf::Split;
-    use gguf::quant::GgmlType::{self, F16, F32, Q4_K, Q6_K, Q8_0};
+    use gguf::quant::GgmlType::{self, F16, F32, NVFP4, Q4_K, Q6_K, Q8_0};
     use gguf::write::{Layout, TensorDecl};
-    use model::arch::coverage::{qwen35_down, qwen35_gate_up, qwen35_shared};
-    use model::arch::models::{Mixer, ModelSpec, OutGate, Residual};
+    use model::arch::coverage::{Q35_DENSE_FFN, qwen35_down, qwen35_gate_up, qwen35_shared};
+    use model::arch::models::{Act, Ffn, LayerSpec, Mixer, ModelSpec, OutGate, Residual};
     use std::path::PathBuf;
 
     /// `name`, `dims` (`dims[0]` the contiguous axis) at `ty`, as a file header declares it.
@@ -1596,5 +1611,59 @@ mod tests {
             &Sites35::CARD,
         );
         assert!(neox.is_ok(), "a plain description under its plain kind");
+    }
+
+    /// The card's dense FFN list is the coverage pin's types: a type the pin reads and the list
+    /// lacks is covered, then refused at the plan; the reverse is a type the plan reads that
+    /// coverage lists as an item.
+    #[test]
+    fn the_card_dense_ffn_list_is_the_coverage_pin() {
+        let pinned: Vec<SiteTy> = SiteTy::ALL
+            .iter()
+            .copied()
+            .filter(|s| Q35_DENSE_FFN.contains(&s.ggml()))
+            .collect();
+        assert_eq!(pinned, Sites35::CARD.dense);
+    }
+
+    /// A dense FFN reads NVFP4 at its gate, up and down; a card projection of a mixer does not,
+    /// so an NVFP4 attention site is refused by name.
+    #[test]
+    fn a_dense_ffn_reads_nvfp4_and_a_mixer_projection_does_not() {
+        let (h, ff): (u64, u64) = (512, 1024);
+        let dense = LayerSpec {
+            ffn: Ffn::Dense {
+                ff: ff as u32,
+                act: Act::SwiGlu { limit: None },
+            },
+            ..layer(gqa())
+        };
+        let spec = spec(vec![dense], h as u32);
+        let pd = PlanDims::of(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
+        let mut t = gqa_header(0, h, (8192, 512, 4096), Q4_K);
+        t.extend([
+            decl(blk(0, "ffn_norm.weight"), &[h], F32),
+            decl(blk(0, "ffn_gate.weight"), &[h, ff], NVFP4),
+            decl(blk(0, "ffn_up.weight"), &[h, ff], NVFP4),
+            decl(blk(0, "ffn_down.weight"), &[ff, h], NVFP4),
+        ]);
+        let plan = plan_ffn(
+            &header(t.clone()),
+            "t",
+            &pd,
+            &spec.layers[0],
+            0,
+            &Sites35::CARD,
+            Read35::Whole,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(plan.route, FfnRoute::Dense));
+        assert_eq!([plan.gate_ty, plan.up_ty, plan.down_ty], [SiteTy::Nvfp4; 3]);
+        t[0] = decl(blk(0, "attn_q.weight"), &[h, 8192], NVFP4);
+        let kind = (GqaKind::Gated256, Flash::Group);
+        match plan_gqa(&header(t), "t", &pd, 0, kind, &Sites35::CARD) {
+            Err(e) => assert!(e.to_string().contains("blk.0.attn_q.weight"), "{e}"),
+            Ok(g) => panic!("an NVFP4 attention site read as {}", g.q_ty),
+        }
     }
 }

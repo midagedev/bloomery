@@ -70,9 +70,10 @@ const ANY: &[SiteTy] = &[
     SiteTy::MlxA4,
 ];
 
-/// [`ANY`] as the reader's five lists.
+/// [`ANY`] as the reader's six lists.
 const WIDEST: Sites35 = Sites35 {
     proj: ANY,
+    dense: ANY,
     stacks: ANY,
     gate_up: ANY,
     down: ANY,
