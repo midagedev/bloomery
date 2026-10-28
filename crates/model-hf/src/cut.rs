@@ -3130,7 +3130,7 @@ pub(crate) mod tests {
         let interval = text["full_attention_interval"].as_u64().unwrap();
         for (i, kind) in text["layer_types"].as_array().unwrap().iter().enumerate() {
             assert_eq!(
-                (to_u64(i) + 1) % interval == 0,
+                (to_u64(i) + 1).is_multiple_of(interval),
                 kind == "full_attention",
                 "layer {i}: layer_types and the interval disagree"
             );
