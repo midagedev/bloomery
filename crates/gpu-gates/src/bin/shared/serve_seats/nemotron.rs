@@ -112,7 +112,7 @@ use bloomery_gpu_gates::generate::{Place, SEAT_STEPS, choose_ctx};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
-use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+use bloomery_gpu_gates::{GateError, gpu_census, model_file, ref_model_path};
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::Arch;
@@ -166,11 +166,6 @@ enum Weights {
 /// The model's open on the engine thread ([`Weights::hand_over`]).
 type OpenModel = Box<dyn FnOnce() -> Result<Model, GateError> + Send>;
 
-/// The GGUF file at `path`, opened.
-fn split_at(path: &Path) -> Result<Split, GateError> {
-    Ok(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?)
-}
-
 impl Weights {
     /// The weights at `path`: the checkpoint folder a directory is (held to this family's
     /// architecture), or the GGUF file.
@@ -179,7 +174,7 @@ impl Weights {
             let f = folder::open(path, refset::arch::nemotron_h_moe::ARCH)?;
             return Ok(Weights::Folder(Box::new(f)));
         }
-        Ok(Weights::File(split_at(path)?))
+        Ok(Weights::File(model_file::header(path)?))
     }
 
     /// The header the plan is made from: a split's first shard's, a folder's located header.
@@ -212,8 +207,9 @@ impl Weights {
                 drop(header);
                 let tokenizer = Tokenizer::from_gguf(path)?;
                 let file = path.to_path_buf();
-                let open: OpenModel =
-                    Box::new(move || -> Result<Model, GateError> { Ok(split_at(&file)?.into()) });
+                let open: OpenModel = Box::new(move || -> Result<Model, GateError> {
+                    Ok(model_file::header(&file)?.into())
+                });
                 Ok((tokenizer, open))
             }
         }

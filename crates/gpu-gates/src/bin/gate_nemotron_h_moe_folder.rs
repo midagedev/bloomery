@@ -258,7 +258,7 @@ mod gate {
             ..workstation::A6000
         };
         let source = || model_at(&path);
-        let words = Words::clause(SPLIT_ARM);
+        let words = Words::clause();
         // The 3090's room, planned and not loaded: whether it holds every expert of the folder.
         {
             let machine = workstation::placed_on(gate, inputs.model.layers, workstation::SCRATCH);
@@ -330,7 +330,6 @@ mod gate {
                 let diagnostic = Words {
                     pass: "same",
                     fail: "differ; skipped",
-                    ..words
                 };
                 let run = arm(
                     &tinputs,

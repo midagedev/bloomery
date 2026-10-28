@@ -131,7 +131,7 @@ mod gate {
             name: gate.name,
             ..workstation::A6000
         };
-        let words = Words::clause(SPLIT_ARM);
+        let words = Words::clause();
         // Each arm is released before the next opens: no two share the card.
         let host_last = if split || whole {
             last_logits(arm(

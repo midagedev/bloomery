@@ -60,17 +60,14 @@ pub struct Words<'a> {
     pub pass: &'a str,
     /// What they end in when it does not.
     pub fail: &'a str,
-    /// The name the premise line gives the `Split` arm.
-    pub split: &'a str,
 }
 
-impl<'a> Words<'a> {
-    /// A clause's words: its verdict, the `Split` arm called `split`.
-    pub fn clause(split: &'a str) -> Self {
+impl Words<'_> {
+    /// A clause's words: its verdict.
+    pub fn clause() -> Self {
         Words {
             pass: verdict(true),
             fail: verdict(false),
-            split,
         }
     }
 }
@@ -137,8 +134,8 @@ pub fn arm(
     if !holds {
         println!(
             "{clause}: arm {name}: the plan misses the arm's premise (a layer with experts on \
-             both sides for `{}`, every expert on the card for `whole`) {}",
-            words.split, words.fail
+             both sides for the split arm, every expert on the card for `whole`) {}",
+            words.fail
         );
         return Ok(None);
     }
