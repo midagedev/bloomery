@@ -154,6 +154,7 @@ mod gate {
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
+    use model::arch::models::OutGate;
 
     /// Qwen3.6-35B-A3B's linear layers.
     const SHAPE: LinearShape = LinearShape {
@@ -1815,6 +1816,7 @@ mod gate {
             self.k.out_gate.enqueue_out_gate(
                 s,
                 OutGateArgs {
+                    kind: OutGate::Proj,
                     attn: &ad,
                     gate: &gd,
                     n_head,

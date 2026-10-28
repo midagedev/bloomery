@@ -45,6 +45,9 @@ memmap2.workspace = true
 # device crate at all, so plain `cargo build`/`cargo test` never resolve the
 # embedded-bundle anchor symbol (which only the cargo-oxide backend defines).
 bloomery-gpu = { path = "../gpu", optional = true }
+# The host rules the LFM3 kernel gate holds a kernel to (`chain::shortconv`, `chain::out_gate`), through the `gpu`
+# feature.
+bloomery-chain = { workspace = true, optional = true }
 # The device contract, through the `gpu` feature: `gate_gpu_device` runs its clauses on the card.
 bloomery-device = { path = "../device", optional = true }
 # The V4.1 device crate, reached only through the `deepseek41` feature (the V4.1 op gates): a
@@ -116,6 +119,7 @@ checkpoint = ["hf", "dep:bloomery-model-hf"]
 glm5next-hf = ["glm5next", "checkpoint"]
 gpu = [
     "dep:bloomery-gpu",
+    "dep:bloomery-chain",
     "dep:bloomery-device",
     "dep:bloomery-verbs",
     "dep:bloomery-threads",

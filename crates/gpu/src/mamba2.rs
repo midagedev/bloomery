@@ -308,9 +308,9 @@ mod mamba2_kernels {
                     // slot is written by this thread alone; item < STAGED.
                     unsafe {
                         let cur = *xbc.get_unchecked(c);
-                        let x0 = ring_input(ringp.cast_const(), p, 3, conv_dim, c);
-                        let x1 = ring_input(ringp.cast_const(), p, 2, conv_dim, c);
-                        let x2 = ring_input(ringp.cast_const(), p, 1, conv_dim, c);
+                        let x0 = ring_input(ringp.cast_const(), RING_ROWS, p, 3, conv_dim, c);
+                        let x1 = ring_input(ringp.cast_const(), RING_ROWS, p, 2, conv_dim, c);
+                        let x2 = ring_input(ringp.cast_const(), RING_ROWS, p, 1, conv_dim, c);
                         *cs.add(item) = conv_out(x0, x1, x2, cur, conv_w, conv_b, c);
                         if writes {
                             *ringp.add(p % RING_ROWS * conv_dim + c) = cur;
@@ -1110,7 +1110,7 @@ unsafe fn pass_input(
         unsafe { *rows.get_unchecked((t - k) * ld + x0 + c) }
     } else {
         // SAFETY: the ring and c < ch, by the contract.
-        unsafe { ring_input(ring, p + t, k, ch, c) }
+        unsafe { ring_input(ring, RING_ROWS, p + t, k, ch, c) }
     }
 }
 

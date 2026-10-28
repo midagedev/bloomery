@@ -1,8 +1,9 @@
-//! LFM3's attention kernel, model-free: the head-128 flash at a group of four
+//! LFM3's kernels, model-free: the head-128 flash at a group of four
 //! query heads a key head (16 query heads over 4 key heads), with a window of
 //! 256 and with none, on a plane (`rows == ctx`) and on a ring (`rows < ctx`),
 //! through the binding's launch (`attention_h128::Kernels::enqueue_attention`),
-//! with no sink term: a group of four folds none.
+//! with no sink term (a group of four folds none); the gated short conv and the per-head output
+//! gate.
 //!
 //! The flash is not bit-identical to an f64 softmax; it is held to the
 //! first-order band of `flash_band::scalar_bound` (the scalar pass's, the one
@@ -30,6 +31,23 @@
 //!   by name on the plane and on the ring before any launch.
 //! - `flash_h128_group4_sinks_refusal`: a group of four with sinks is refused
 //!   by name on the plane and on the ring before any launch.
+//!
+//! The short conv is held to its host rule bit for bit (`chain::shortconv::short_conv`,
+//! one arithmetic order), the per-head gate to the card's own sigmoid rule and within a band
+//! to the chain's, whose `exp` is the host libm's.
+//!
+//! - `short_conv_twin`: the kernel against `short_conv` bit for bit, outputs and ring after every call,
+//!   at d = 2048 and the taps of LFM3 (7) and of LFM2.5 (3): one decode token at position 0; decode
+//!   calls on past the ring's wrap; a prompt chunk of 37 from 0, decode calls after it, a chunk
+//!   shorter than the conv's reach, and a second chunk of 37 from the middle of the sequence. The
+//!   rings start NaN, so a read of a slot nothing wrote poisons the output.
+//! - `short_conv_fault`: a NaN in `x`, a NaN in `C` and a position that is not consecutive each raise
+//!   the fault word; the NaN outputs are exactly the tokens that read the value, every other
+//!   output equals the twin's bit for bit.
+//! - `out_gate_head_twin`: `attn_out_gate_sigmoid_head` at 16 heads of 128, one token and 37, against
+//!   the card's host rule over the gate spread to every value of its head, bit for bit, and against
+//!   `chain::out_gate` within a band; a gate kind the entry does not take is refused by name; a
+//!   non-finite gate makes its whole head NaN and a non-finite value only its own.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -40,13 +58,19 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::attention_h128::Kernels;
-    use bloomery_gpu::fault::Fault;
+    use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{HEAD, KEY_TILE, SEG_KEYS, seg_span, window_segments};
     use bloomery_gpu::flash_gqa_h128_swa::{GROUP_4, H128SwaArgs};
+    use bloomery_gpu::linear::out_gate::{OutGateArgs, OutGateKernels, out_gate_host};
+    use bloomery_gpu::linear::shortconv::{ShortConvArgs, ShortConvKernels};
     use bloomery_gpu_gates::flash_band::{exact_attn, scalar_bound};
     use bloomery_gpu_gates::{GateError, activations, bits_equal, checks_failed, par_map, verdict};
+    use chain::linear::Ring;
+    use chain::out_gate::out_gate;
+    use chain::shortconv::short_conv;
     use cuda_core::DeviceBuffer;
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
+    use model::arch::models::OutGate;
 
     /// An f16 NaN: the rows a launch must not read.
     const NAN16: u16 = 0x7e00;
@@ -59,6 +83,12 @@ mod gate {
     /// A prompt chunk's rows in the band clause, and in the group clause.
     const CHUNK: usize = 64;
     const SMALL_CHUNK: usize = 8;
+    /// LFM3-1.7B's hidden width, `lfm3.embedding_length`: the short conv's channels.
+    const D: usize = 2048;
+    /// LFM3-1.7B's `lfm3.shortconv.l_cache`: the taps of the short conv's filter.
+    const TAPS: usize = 7;
+    /// LFM2.5-24B-A2B's taps, the short conv's second customer, at the same width.
+    const TAPS_3: usize = 3;
 
     /// A layer kind and the cache it runs on. `rows == ctx` is a plane; a
     /// smaller `rows` is the ring a window layer holds past its window plus a
@@ -565,6 +595,415 @@ mod gate {
         Ok(ok)
     }
 
+    /// What one conv launch left: its output rows and the fault word.
+    struct Launched {
+        y: Vec<f32>,
+        fault: Option<Fault>,
+    }
+
+    /// One sequence's short conv on both sides: the filters `[D][taps]`, and the ring as the
+    /// twin keeps it (`host`) and as the card does (`dev`).
+    struct Conv {
+        ring: Ring,
+        w: Vec<f32>,
+        wd: DeviceBuffer<f32>,
+        host: Vec<f32>,
+        dev: DeviceBuffer<f32>,
+    }
+
+    impl Conv {
+        /// A conv of `taps` taps whose ring holds `ring0` (`[rows][D]`) on both sides.
+        fn new(gpu: &Gpu, taps: usize, ring0: &[f32]) -> Result<Conv, GateError> {
+            let w = activations(taps, D, 5 + taps as u32);
+            let s = gpu.stream();
+            Ok(Conv {
+                ring: Ring::new(taps),
+                wd: DeviceBuffer::from_host(s, &w)?,
+                w,
+                host: ring0.to_vec(),
+                dev: DeviceBuffer::from_host(s, ring0)?,
+            })
+        }
+
+        /// The twin's call: the rows and, on success, the ring.
+        fn twin(&mut self, bcx: &[f32], pos: &[u32]) -> Result<Vec<f32>, GateError> {
+            let mut y = vec![0.0f32; pos.len() * D];
+            short_conv(self.ring, D, bcx, &self.w, pos, &mut self.host, &mut y)?;
+            Ok(y)
+        }
+
+        /// The kernel's call on the card, with a clean fault word before it.
+        fn launch(
+            &mut self,
+            gpu: &Gpu,
+            kernels: &ShortConvKernels,
+            bcx: &[f32],
+            pos: &[u32],
+        ) -> Result<Launched, GateError> {
+            let s = gpu.stream();
+            let m = pos.len();
+            let bd = DeviceBuffer::from_host(s, bcx)?;
+            let pd = DeviceBuffer::from_host(s, pos)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(s, m * D)?;
+            gpu.take_fault()?;
+            kernels.enqueue_short_conv(
+                s,
+                ShortConvArgs {
+                    ring: self.ring,
+                    d: D,
+                    m,
+                    bcx: &bd,
+                    weights: &self.wd,
+                    pos: &pd,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut y,
+                    state: &mut self.dev,
+                },
+            )?;
+            s.synchronize()?;
+            Ok(Launched {
+                y: y.to_host_vec(s)?,
+                fault: gpu.take_fault()?,
+            })
+        }
+
+        /// The card's ring.
+        fn ring_on_card(&self, gpu: &Gpu) -> Result<Vec<f32>, GateError> {
+            Ok(self.dev.to_host_vec(gpu.stream())?)
+        }
+    }
+
+    /// The positions `from .. from + m` as the words the rope reads.
+    fn positions(from: usize, m: usize) -> Vec<u32> {
+        (from..from + m).map(|p| p as u32).collect()
+    }
+
+    /// A ring of `rows` slots every value of which is NaN: a slot nothing wrote, whose read
+    /// poisons the output.
+    fn nan_ring(taps: usize) -> Vec<f32> {
+        vec![f32::NAN; Ring::new(taps).values(D)]
+    }
+
+    /// One case of `short_conv_twin`: `calls` of `(first position, tokens)` one after another on
+    /// `conv`, each held to the twin's rows and ring bit for bit with no fault. Whether all were.
+    fn twin_case(
+        gpu: &Gpu,
+        kernels: &ShortConvKernels,
+        (conv, name): (&mut Conv, &str),
+        calls: &[(usize, usize)],
+        seed: u32,
+    ) -> Result<bool, GateError> {
+        let taps = conv.ring.taps();
+        let mut ok = true;
+        for (n, &(from, m)) in calls.iter().enumerate() {
+            let bcx = activations(3 * D, m, seed + n as u32);
+            let pos = positions(from, m);
+            let want = conv.twin(&bcx, &pos)?;
+            let got = conv.launch(gpu, kernels, &bcx, &pos)?;
+            let (rows_ok, ring_ok) = (
+                bits_equal(&got.y, &want),
+                bits_equal(&conv.ring_on_card(gpu)?, &conv.host),
+            );
+            let clean = got.fault.is_none();
+            if !(rows_ok && ring_ok && clean) {
+                println!(
+                    "short_conv_twin taps {taps} {name}: call {n} (from {from}, {m} tokens): rows \
+                     {rows_ok} ring {ring_ok} fault {:?} FAIL",
+                    got.fault
+                );
+            }
+            ok &= rows_ok && ring_ok && clean;
+        }
+        println!(
+            "short_conv_twin taps {taps} d {D} {name}: {} calls, rows and ring == twin bit for bit, no \
+             fault {}",
+            calls.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `short_conv_twin`. Mutants that turn it red: the taps read newest first (the filters are
+    /// asymmetric); `B ⊙ x` taken as `x`, or `C` left out; the ring read at the sequence start
+    /// (its slots are NaN) or at the slot `pos mod taps`, or with `rows = taps`; the ring written at
+    /// the slot `t mod rows`, or one token short (`m.saturating_sub(rows) + 1`); the ring written
+    /// before a token that reads it (the chunk of 37 and the chunk from the middle read it at their
+    /// first tokens and overwrite it at their last), or by a unit that does not read it; the units
+    /// split at the wrong token (at 7 taps the chunk of 3 is one unit, the chunks of 37 are thirty-two).
+    fn short_conv_twin(gpu: &Gpu, kernels: &ShortConvKernels) -> Result<bool, GateError> {
+        let mut all = true;
+        for taps in [TAPS, TAPS_3] {
+            let rows = Ring::new(taps).rows();
+            // Decode calls from position 0, on past the ring's first wrap.
+            let mut a = Conv::new(gpu, taps, &nan_ring(taps))?;
+            all &= twin_case(
+                gpu,
+                kernels,
+                (&mut a, "decode at position 0"),
+                &[(0, 1)],
+                100,
+            )?;
+            let on: Vec<(usize, usize)> = (1..rows + 6).map(|p| (p, 1)).collect();
+            all &= twin_case(gpu, kernels, (&mut a, "decode past the wrap"), &on, 200)?;
+            // A prompt chunk, decode after it, a chunk shorter than the conv's reach, and a second
+            // chunk from the middle of the sequence.
+            let mut b = Conv::new(gpu, taps, &nan_ring(taps))?;
+            all &= twin_case(
+                gpu,
+                kernels,
+                (&mut b, "prompt chunk of 37 from 0"),
+                &[(0, 37)],
+                300,
+            )?;
+            let after: Vec<(usize, usize)> = (37..37 + rows + 2).map(|p| (p, 1)).collect();
+            let from = 37 + rows + 2;
+            all &= twin_case(
+                gpu,
+                kernels,
+                (&mut b, "decode after the chunk"),
+                &after,
+                400,
+            )?;
+            all &= twin_case(gpu, kernels, (&mut b, "chunk of 3"), &[(from, 3)], 500)?;
+            all &= twin_case(
+                gpu,
+                kernels,
+                (&mut b, "chunk of 37 from mid-sequence"),
+                &[(from + 3, 37)],
+                600,
+            )?;
+        }
+        Ok(all)
+    }
+
+    /// `short_conv_fault`: the call over 20 tokens from position 30 at LFM3's taps, its ring
+    /// holding finite values, planted with a fault. `nan` lists the `(token, channel)` outputs
+    /// that must be NaN, every output that reads the value; every other output is the clean
+    /// twin's bit for bit, and the fault word is the conv's site alone. The tokens straddle the
+    /// units of the launch (token 9 is past the first six). Mutants that turn it red: the finite
+    /// test on the accumulator where the product with `C` is (the `C` plant), the position check
+    /// left out, a NaN written as the plain value, the fault raised by unit 0 alone.
+    fn short_conv_fault(gpu: &Gpu, kernels: &ShortConvKernels) -> Result<bool, GateError> {
+        const M: usize = 20;
+        const FROM: usize = 30;
+        const T0: usize = 9;
+        const C0: usize = 100;
+        let reach = TAPS - 1;
+        let ring0 = activations(D, Ring::new(TAPS).rows(), 9);
+        let clean_bcx = activations(3 * D, M, 77);
+        let clean_pos = positions(FROM, M);
+        let clean_y = Conv::new(gpu, TAPS, &ring0)?.twin(&clean_bcx, &clean_pos)?;
+
+        type Patch = fn(&mut [f32], &mut [u32]);
+        struct Plant {
+            what: &'static str,
+            bad: Patch,
+            nan: Vec<(usize, usize)>,
+        }
+        let plants = [
+            Plant {
+                what: "NaN in x",
+                bad: |bcx, _| bcx[T0 * 3 * D + 2 * D + C0] = f32::NAN,
+                // The product of row T0 is read by the tokens T0 ..= T0 + reach.
+                nan: (T0..=T0 + reach).map(|t| (t, C0)).collect(),
+            },
+            Plant {
+                what: "NaN in C",
+                bad: |bcx, _| bcx[T0 * 3 * D + D + C0] = f32::NAN,
+                nan: vec![(T0, C0)],
+            },
+            Plant {
+                what: "position not consecutive",
+                bad: |_, pos| pos[T0] += 1,
+                nan: (0..D).map(|c| (T0, c)).collect(),
+            },
+        ];
+        let mut all = true;
+        for plant in plants {
+            let (mut bcx, mut pos) = (clean_bcx.clone(), clean_pos.clone());
+            (plant.bad)(&mut bcx, &mut pos);
+            let got = Conv::new(gpu, TAPS, &ring0)?.launch(gpu, kernels, &bcx, &pos)?;
+            let want_fault = Fault::at(LAYER_NONE, FaultSite::LinearConv);
+            let fault_ok = got.fault == Some(want_fault);
+            let mut wrong = 0usize;
+            for t in 0..M {
+                for c in 0..D {
+                    let (g, w) = (got.y[t * D + c], clean_y[t * D + c]);
+                    let right = if plant.nan.contains(&(t, c)) {
+                        g.is_nan()
+                    } else {
+                        g.to_bits() == w.to_bits()
+                    };
+                    wrong += usize::from(!right);
+                }
+            }
+            let ok = fault_ok && wrong == 0;
+            println!(
+                "short_conv_fault {}: fault {:?} (want {want_fault:?}), {wrong} outputs wrong {}",
+                plant.what,
+                got.fault,
+                verdict(ok)
+            );
+            all &= ok;
+        }
+        Ok(all)
+    }
+
+    /// One launch of the per-head out gate (`ProjHead`, or the kind `kind`) over `m` tokens of
+    /// `N_HEAD` heads: the output and the fault word.
+    fn head_gate_launch(
+        gpu: &Gpu,
+        kernels: &OutGateKernels,
+        kind: OutGate,
+        (attn, gate): (&[f32], &[f32]),
+        m: usize,
+    ) -> Result<Launched, GateError> {
+        let s = gpu.stream();
+        let ad = DeviceBuffer::from_host(s, attn)?;
+        let gd = DeviceBuffer::from_host(s, gate)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(s, attn.len())?;
+        gpu.take_fault()?;
+        kernels.enqueue_out_gate(
+            s,
+            OutGateArgs {
+                kind,
+                attn: &ad,
+                gate: &gd,
+                n_head: N_HEAD,
+                m,
+                fault: gpu.unlabelled_sink(),
+                y: &mut y,
+            },
+        )?;
+        s.synchronize()?;
+        Ok(Launched {
+            y: y.to_host_vec(s)?,
+            fault: gpu.take_fault()?,
+        })
+    }
+
+    /// The gate of value `i` of a `[m][N_HEAD][HEAD]` tensor, one value a head: the gate spread
+    /// to a value each.
+    fn spread(gate: &[f32]) -> Vec<f32> {
+        (0..gate.len() * HEAD).map(|i| gate[i / HEAD]).collect()
+    }
+
+    /// `out_gate_head_twin`. Mutants that turn it red: the gate index `i % N_HEAD`, `i / HEAD %
+    /// N_HEAD` (the token dropped) or `i` (one gate a value, reading past the gate), the sigmoid of
+    /// `-g`, and the finite test on `g` left out (the infinite gate passes the value through).
+    fn out_gate_head_twin(gpu: &Gpu, kernels: &OutGateKernels) -> Result<bool, GateError> {
+        let mut all = true;
+        for m in [1usize, 37] {
+            let n = m * N_HEAD * HEAD;
+            let attn = activations(HEAD, m * N_HEAD, 41 + m as u32);
+            let gate: Vec<f32> = activations(1, m * N_HEAD, 43 + m as u32)
+                .into_iter()
+                .map(|g| g * 3.0)
+                .collect();
+            let got = head_gate_launch(gpu, kernels, OutGate::ProjHead, (&attn, &gate), m)?;
+            let want = out_gate_host(&attn, &spread(&gate));
+            let exact = bits_equal(&got.y, &want);
+            // The chain's rule takes the host libm's `exp`, so the card is held to it within a
+            // band [derived]: the card's polynomial `exp` is a few ulp off, the sum, the division
+            // and the product round half an ulp each, on both sides.
+            let mut chain_y = vec![0.0f32; n];
+            out_gate(OutGate::ProjHead, &attn, &gate, N_HEAD, HEAD, &mut chain_y)?;
+            let in_band = got
+                .y
+                .iter()
+                .zip(&chain_y)
+                .all(|(&g, &c)| (g - c).abs() <= 1e-6 * c.abs() + 1e-30);
+            let clean = got.fault.is_none();
+            println!(
+                "out_gate_head_twin m {m} n_head {N_HEAD}: {n} values == card rule bit for bit {}, \
+                 within 1e-6 of the chain's {}, no fault {}",
+                verdict(exact),
+                verdict(in_band),
+                verdict(clean)
+            );
+            all &= exact && in_band && clean;
+        }
+
+        // A gate kind the entry does not take is refused before any launch.
+        for kind in [OutGate::None, OutGate::Packed] {
+            let r = head_gate_launch(
+                gpu,
+                kernels,
+                kind,
+                (&[0.0; HEAD * N_HEAD], &[0.0; N_HEAD]),
+                1,
+            );
+            let pass = r
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("is not a gate of its own"));
+            println!(
+                "out_gate_head_twin refusal {kind:?}: {} {}",
+                r.map_or_else(|e| e.to_string(), |_| "accepted".to_string()),
+                verdict(pass)
+            );
+            all &= pass;
+        }
+
+        // Faults: a non-finite gate makes the whole head NaN, a non-finite value only itself.
+        const M: usize = 2;
+        let attn = activations(HEAD, M * N_HEAD, 59);
+        let gate = activations(1, M * N_HEAD, 61);
+        let want = out_gate_host(&attn, &spread(&gate));
+        let head = |t: usize, h: usize| (t * N_HEAD + h) * HEAD;
+        for (what, bad_attn, bad_gate, nan) in [
+            (
+                "NaN gate",
+                None,
+                Some((head(1, 3) / HEAD, f32::NAN)),
+                head(1, 3)..head(1, 3) + HEAD,
+            ),
+            (
+                "infinite gate",
+                None,
+                Some((head(0, 15) / HEAD, f32::INFINITY)),
+                head(0, 15)..head(0, 15) + HEAD,
+            ),
+            (
+                "NaN value",
+                Some((head(1, 7) + 5, f32::NAN)),
+                None,
+                head(1, 7) + 5..head(1, 7) + 6,
+            ),
+        ] {
+            let (mut a, mut g) = (attn.clone(), gate.clone());
+            if let Some((i, v)) = bad_attn {
+                a[i] = v;
+            }
+            if let Some((i, v)) = bad_gate {
+                g[i] = v;
+            }
+            let got = head_gate_launch(gpu, kernels, OutGate::ProjHead, (&a, &g), M)?;
+            let fault_ok = got.fault == Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+            let wrong = got
+                .y
+                .iter()
+                .zip(&want)
+                .enumerate()
+                .filter(|&(i, (g, w))| {
+                    if nan.contains(&i) {
+                        !g.is_nan()
+                    } else {
+                        g.to_bits() != w.to_bits()
+                    }
+                })
+                .count();
+            let pass = fault_ok && wrong == 0;
+            println!(
+                "out_gate_head_twin fault {what}: fault {:?}, {wrong} outputs wrong {}",
+                got.fault,
+                verdict(pass)
+            );
+            all &= pass;
+        }
+        Ok(all)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let gpu = Gpu::new()?;
@@ -579,6 +1018,11 @@ mod gate {
         ok &= no_sink_term(&gpu, &kernels)?;
         ok &= group_refusal(&gpu, &kernels)?;
         ok &= group4_sinks_refusal(&gpu, &kernels)?;
+        let short = ShortConvKernels::load(gpu.context())?;
+        let gate = OutGateKernels::load(gpu.context())?;
+        ok &= short_conv_twin(&gpu, &short)?;
+        ok &= short_conv_fault(&gpu, &short)?;
+        ok &= out_gate_head_twin(&gpu, &gate)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }
