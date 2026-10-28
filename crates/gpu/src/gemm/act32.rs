@@ -268,6 +268,18 @@ impl GemmAct32 {
         }
     }
 
+    /// Whether the scratch holds the native FP4 form beside the 32-value one
+    /// ([`GemmAct32::new_routed`] on a native FP4 build).
+    #[must_use]
+    pub fn has_native_form(&self) -> bool {
+        #[cfg(bloomery_nvfp4_mma)]
+        {
+            self.native.is_some()
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        false
+    }
+
     /// Columns this scratch holds.
     #[must_use]
     pub fn cols(&self) -> usize {

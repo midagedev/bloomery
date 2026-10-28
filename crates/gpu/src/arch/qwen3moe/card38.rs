@@ -501,6 +501,11 @@ impl Card38 {
         self.hostless[l]
     }
 
+    /// Every layer of the load runs without a host leg ([`Card38::hostless`]).
+    pub(super) fn all_hostless(&self) -> bool {
+        self.hostless.iter().all(|&h| h)
+    }
+
     /// Layer `l`'s card experts: 0 on a layer without them.
     pub(super) fn n_card(&self, l: usize) -> usize {
         self.layer(l).map_or(0, |c| c.n_card)

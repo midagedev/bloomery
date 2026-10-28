@@ -9130,6 +9130,44 @@ mod gate {
                     let tail = eager[slots * rows..]
                         .iter()
                         .all(|v| v.to_bits() == SENT.to_bits());
+                    // The BF16 product: each cell the F32 one rounded to nearest even, the
+                    // tail untouched; a scratch without the native form is refused by name.
+                    let bf16_eq = fused || {
+                        const GUARD: u16 = 0xAAAA;
+                        let mut yb =
+                            DeviceBuffer::from_host(stream, &vec![GUARD; slots * rows + 16])?;
+                        let got = dev.g32.enqueue_gemm32_bf16(
+                            stream,
+                            Gemm32Args {
+                                w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
+                                    qs: &wq,
+                                    e: &we,
+                                    scales: &ws,
+                                }),
+                                rows_per_expert: rows,
+                                act: &act,
+                                route: &route,
+                                input: GemmInput::PerSlot,
+                                y: &mut yb,
+                            },
+                        );
+                        if native {
+                            got?;
+                            let yb = yb.to_host_vec(stream)?;
+                            let (cells, guard) = yb.split_at(slots * rows);
+                            cells
+                                .iter()
+                                .zip(&eager)
+                                .all(|(&b, &v)| b == cuda_device::convert::f32_to_bf16_rne(v))
+                                && guard.iter().all(|&b| b == GUARD)
+                        } else {
+                            matches!(
+                                &got,
+                                Err(bloomery_gpu::GpuError::Shape { what, .. })
+                                    if *what == "Gemm32Kernels::enqueue_gemm32_bf16"
+                            )
+                        }
+                    };
                     let host_want = if host {
                         let (ha, _) = host_act(&x_host, k, slots);
                         let host_w: Vec<i8> = (0..rows * k)
@@ -9214,10 +9252,11 @@ mod gate {
                         && replay_eq
                         && q8_eq
                         && producer_eq
+                        && bf16_eq
                         && legacy_fault == want_fault
                         && gpu.take_fault()? == want_fault;
                     println!(
-                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} input={input:?} fused={fused} native={native} q8_eq={q8_eq} producer_eq={producer_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} hash={hash:016x} {}",
+                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} input={input:?} fused={fused} native={native} q8_eq={q8_eq} producer_eq={producer_eq} bf16_eq={bf16_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} hash={hash:016x} {}",
                         verdict(pass)
                     );
                     ok &= pass;

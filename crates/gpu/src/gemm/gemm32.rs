@@ -1476,15 +1476,16 @@ pub enum Gemm32Weight<'a> {
 
 /// [`Gemm32Kernels::enqueue_gemm32`]'s arguments: `w` the stack, `route`
 /// the table its last fill left over the stack's experts, `input` each
-/// slot's activation column, `y` `n_slots · rows_per_expert` f32,
-/// slot-major (`y[s · rows + r]`).
-pub struct Gemm32Args<'a> {
+/// slot's activation column, `y` `n_slots · rows_per_expert` cells (f32, or
+/// BF16 bits for [`Gemm32Kernels::enqueue_gemm32_bf16`]), slot-major
+/// (`y[s · rows + r]`).
+pub struct Gemm32Args<'a, Y = f32> {
     pub w: Gemm32Weight<'a>,
     pub rows_per_expert: usize,
     pub act: &'a GemmAct32,
     pub route: &'a GemmRoute,
     pub input: GemmInput,
-    pub y: &'a mut DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<Y>,
 }
 
 /// [`Gemm32Kernels::enqueue_gate_up_sel32`]'s arguments: a routed block's
@@ -1533,7 +1534,7 @@ impl Gemm32Launch {
     /// rows a positive multiple of 16 that make the table's experts, the
     /// stack's layout at the activations' K, whole tokens of `top_k`, room in
     /// `act` and `y` for every slot; then every launch argument in `u32`.
-    fn check(what: &'static str, a: &Gemm32Args<'_>) -> Result<Gemm32Launch, GpuError> {
+    fn check<Y>(what: &'static str, a: &Gemm32Args<'_, Y>) -> Result<Gemm32Launch, GpuError> {
         let n_slots = a
             .route
             .filled
@@ -1804,7 +1805,7 @@ impl Gemm32Kernels {
                             slots: g.n_slots,
                             max_tiles: g.max_tiles,
                             slot_div: g.slot_div,
-                            y,
+                            y: super::nvfp4mma::ProductOut::F32(y),
                         },
                     );
                 }
@@ -1818,6 +1819,50 @@ impl Gemm32Kernels {
             }
         }
         Ok(())
+    }
+
+    /// [`Gemm32Kernels::enqueue_gemm32`]'s products as BF16 bits, each value
+    /// its F32 one rounded to nearest even (a value past the BF16 range an
+    /// infinity), from NVFP4 planes over the native FP4 activation form
+    /// alone: another stack or form is refused by name, nothing launched.
+    /// Asynchronous, allocation-free, capturable.
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub fn enqueue_gemm32_bf16(
+        &self,
+        stream: &CudaStream,
+        a: Gemm32Args<'_, u16>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_gemm32_bf16";
+        let g = Gemm32Launch::check(what, &a)?;
+        #[cfg(bloomery_nvfp4_mma)]
+        if let Gemm32Weight::Nvfp4Planes(w) = a.w
+            && a.act.native.is_some()
+        {
+            return self.native.product(
+                stream,
+                super::nvfp4mma::ProductArgs {
+                    w,
+                    act: a.act,
+                    route: a.route,
+                    rows: g.rows,
+                    slots: g.n_slots,
+                    max_tiles: g.max_tiles,
+                    slot_div: g.slot_div,
+                    y: super::nvfp4mma::ProductOut::Bf16(a.y),
+                },
+            );
+        }
+        Err(GpuError::shape(
+            what,
+            format!(
+                "BF16 products of {} rows come from NVFP4 planes over the native FP4 activation \
+                 form",
+                g.rows
+            ),
+        ))
     }
 
     /// Enqueue `act = q8_1_32(silu(g) · u)` over the slots of the last fill

@@ -39,7 +39,9 @@
 //!   layer with card experts (`q38_card_shared_add`); on a layer without a
 //!   host leg the shared expert runs first and each run's card sum is the
 //!   block's output with its gated rows added (`q38_card_sum_shared_add`),
-//!   no acc, no host sum and nothing left for the back;
+//!   no acc, no host sum and nothing left for the back; when every layer
+//!   runs so over NVFP4 downs in the native FP4 form, the down rows are
+//!   BF16 (`Down38`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
 //!   prefill flash over each row's list in runs of the arena's selection rows
@@ -175,13 +177,13 @@ use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::router::gated;
-use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
+use super::scratch::{Io, KvPlanes, RecStore, cells_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, Store38, no_carry};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
 use crate::card_leg::{RouteW, StackW};
-use crate::card_slots::CardAcc;
+use crate::card_slots::{CardAcc, DownRows};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::{GqaPrefillArgs, QueryNorm};
@@ -783,7 +785,7 @@ pub(super) struct CardRoute38 {
     /// The down GEMM's output, ten slots a run token of [`geo::HIDDEN`]
     /// values, slot-major — a token of the whole unit on a load with an
     /// expert tier, whose join reads every run's rows after the host's wait.
-    down: DeviceBuffer<f32>,
+    down: Down38,
     /// The card slots' weighted sums, a row a token of the whole walk; a
     /// unit's sums are its window of them ([`UnitRows38`]'s `acc`).
     acc: DeviceBuffer<f32>,
@@ -825,6 +827,53 @@ pub(super) enum CardSum<'b> {
         sh: &'b DeviceBuffer<f32>,
         y: &'b mut DeviceBuffer<f32>,
     },
+}
+
+/// A card route's down rows ([`CardRoute38`]'s): BF16 bits on a load whose
+/// every layer runs without a host leg over NVFP4 downs in the native FP4
+/// form, which the down product stores (`enqueue_gemm32_bf16`) and the
+/// block's card sum reads; F32 on any other load.
+enum Down38 {
+    F32(DeviceBuffer<f32>),
+    Bf16(DeviceBuffer<u16>),
+}
+
+impl Down38 {
+    /// Cells `off .. off + len` as a run's window.
+    ///
+    /// # Safety
+    ///
+    /// [`cells_view`]'s over the rows.
+    unsafe fn window(&self, off: usize, len: usize) -> DownWin {
+        match self {
+            // SAFETY: the caller's contract.
+            Self::F32(d) => DownWin::F32(unsafe { cells_view(d, off, len) }),
+            // SAFETY: the caller's contract.
+            Self::Bf16(d) => DownWin::Bf16(unsafe { cells_view(d, off, len) }),
+        }
+    }
+
+    fn rows(&self) -> DownRows<'_> {
+        match self {
+            Self::F32(d) => DownRows::F32(d),
+            Self::Bf16(d) => DownRows::Bf16(d),
+        }
+    }
+}
+
+/// A run's window of a card route's down rows ([`Down38::window`]).
+enum DownWin {
+    F32(Win<f32>),
+    Bf16(Win<u16>),
+}
+
+impl DownWin {
+    fn rows(&self) -> DownRows<'_> {
+        match self {
+            Self::F32(d) => DownRows::F32(d),
+            Self::Bf16(d) => DownRows::Bf16(d),
+        }
+    }
 }
 
 /// The ring pass's buffers: the route table over a half of the expert
@@ -901,7 +950,7 @@ fn enqueue_gemm_batch(
     down: Gemm32Weight<'_>,
     (n, n_places): (usize, usize),
     sink: FaultSink,
-    down_y: &mut DeviceBuffer<f32>,
+    down_y: &mut DownWin,
     (g, u, act): (
         &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
@@ -972,17 +1021,22 @@ fn enqueue_gemm_batch(
             sink,
         )?,
     }
-    c.k.g32.enqueue_gemm32(
-        stream,
-        Gemm32Args {
-            w: down,
-            rows_per_expert: geo::HIDDEN,
-            act,
-            route,
-            input: GemmInput::PerSlot,
-            y: down_y,
-        },
-    )
+    macro_rules! down_args {
+        ($y:expr) => {
+            Gemm32Args {
+                w: down,
+                rows_per_expert: geo::HIDDEN,
+                act,
+                route,
+                input: GemmInput::PerSlot,
+                y: $y,
+            }
+        };
+    }
+    match down_y {
+        DownWin::F32(y) => c.k.g32.enqueue_gemm32(stream, down_args!(y)),
+        DownWin::Bf16(y) => c.k.g32.enqueue_gemm32_bf16(stream, down_args!(y)),
+    }
 }
 
 impl CardRoute38 {
@@ -1014,6 +1068,16 @@ impl CardRoute38 {
         }
         let slots = run * geo::N_USED;
         let kept = if tiered { rows * geo::N_USED } else { slots };
+        let act = GemmAct32::new_routed_for(
+            stream,
+            slots,
+            geo::FF,
+            card.routed_types().map(|(_, down)| down),
+        )?;
+        let bf16_down = !tiered
+            && card.all_hostless()
+            && act.has_native_form()
+            && card.routed_types().all(|(_, down)| down == GgmlType::NVFP4);
         Ok(CardRoute38 {
             run,
             ids: DeviceBuffer::zeroed(stream, slots)?,
@@ -1030,13 +1094,12 @@ impl CardRoute38 {
             },
             g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
-            act: GemmAct32::new_routed_for(
-                stream,
-                slots,
-                geo::FF,
-                card.routed_types().map(|(_, down)| down),
-            )?,
-            down: DeviceBuffer::zeroed(stream, kept * geo::HIDDEN)?,
+            act,
+            down: if bf16_down {
+                Down38::Bf16(DeviceBuffer::zeroed(stream, kept * geo::HIDDEN)?)
+            } else {
+                Down38::F32(DeviceBuffer::zeroed(stream, kept * geo::HIDDEN)?)
+            },
             acc: DeviceBuffer::zeroed(stream, rows * geo::HIDDEN)?,
             tsel: tiered
                 .then(|| DeviceBuffer::zeroed(stream, rows * geo::N_USED))
@@ -1092,7 +1155,10 @@ impl CardRoute38 {
             + self.g.num_bytes()
             + self.u.num_bytes()
             + self.act.bytes()
-            + self.down.num_bytes()
+            + match &self.down {
+                Down38::F32(d) => d.num_bytes(),
+                Down38::Bf16(d) => d.num_bytes(),
+            }
             + self.acc.num_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.trank.as_ref().map_or(0, DeviceBuffer::num_bytes)
@@ -1261,11 +1327,10 @@ impl CardRoute38 {
                 let (ids_w, w_w, x_w, mut sel_w, mut down_w) = unsafe {
                     (
                         param_view::<u32>(ids, c0 * pitch, n * pitch),
-                        f32_view(weights, c0 * pitch, n * pitch),
-                        f32_view(ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                        cells_view(weights, c0 * pitch, n * pitch),
+                        cells_view(ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
                         param_view::<u32>(&self.sel, at * geo::N_USED, n * geo::N_USED),
-                        f32_view(
-                            &self.down,
+                        self.down.window(
                             at * geo::N_USED * geo::HIDDEN,
                             n * geo::N_USED * geo::HIDDEN,
                         ),
@@ -1379,9 +1444,10 @@ impl CardRoute38 {
                         // SAFETY: tokens c0 .. c0 + n <= m of the unit's card
                         // sum (`m · HIDDEN`, checked at entry), which stays in
                         // place for this run's launch.
-                        let mut acc_w = unsafe { f32_view(acc, c0 * geo::HIDDEN, n * geo::HIDDEN) };
+                        let mut acc_w =
+                            unsafe { cells_view(acc, c0 * geo::HIDDEN, n * geo::HIDDEN) };
                         let a = CardAcc {
-                            down: &down_w,
+                            down: down_w.rows().f32(WHAT)?,
                             w: &w_w,
                             sel: sum_places.0,
                             n: geo::HIDDEN,
@@ -1400,14 +1466,14 @@ impl CardRoute38 {
                         // this run's launch.
                         let (sh_w, mut y_w) = unsafe {
                             (
-                                f32_view(sh, c0 * geo::HIDDEN, n * geo::HIDDEN),
-                                f32_view(y, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                                cells_view(sh, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                                cells_view(y, c0 * geo::HIDDEN, n * geo::HIDDEN),
                             )
                         };
                         c.k.q38.enqueue_card_sum_shared_add(
                             stream,
                             CardSumSharedAddArgs {
-                                down: &down_w,
+                                down: down_w.rows(),
                                 w: &w_w,
                                 sel: sum_places.0,
                                 sh: &sh_w,
@@ -1479,7 +1545,7 @@ impl CardRoute38 {
         c.k.q38.enqueue_card_tier_acc(
             stream,
             CardTierAccArgs {
-                down: &self.down,
+                down: self.down.rows().f32(WHAT)?,
                 trows,
                 w: weights,
                 sel: &self.sel,
@@ -2140,7 +2206,7 @@ impl WideParts<'_> {
             // SAFETY: tokens c0 .. c0 + n of the unit's `ffn_x` (`m` rows,
             // c0 + n <= m); `ffn_x` stays in place while the window lives
             // (this run's router launch).
-            let xw = unsafe { f32_view(&u.ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN) };
+            let xw = unsafe { cells_view(&u.ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN) };
             self.c
                 .k
                 .router
@@ -2156,8 +2222,8 @@ impl WideParts<'_> {
                 // (`n <= ROUTE_ROWS` tokens); both stay in place for the copy.
                 let (mut tw, lw) = unsafe {
                     (
-                        f32_view(lt, (u.r0 + c0) * width, n * width),
-                        f32_view(&s.route.logits, 0, n * width),
+                        cells_view(lt, (u.r0 + c0) * width, n * width),
+                        cells_view(&s.route.logits, 0, n * width),
                     )
                 };
                 tw.copy_from_device_async(&lw, stream)?;
@@ -2178,8 +2244,8 @@ impl WideParts<'_> {
                     // last. Both stay in place for the copy.
                     let (mut dw, pw) = unsafe {
                         (
-                            f32_view(&s.route.logits, t * width, geo::EXPERTS),
-                            f32_view(lf, (at + t) * geo::EXPERTS, geo::EXPERTS),
+                            cells_view(&s.route.logits, t * width, geo::EXPERTS),
+                            cells_view(lf, (at + t) * geo::EXPERTS, geo::EXPERTS),
                         )
                     };
                     dw.copy_from_device_async(&pw, stream)?;
@@ -2195,9 +2261,9 @@ impl WideParts<'_> {
             let (mut iw, mut ww, ri, rw) = unsafe {
                 (
                     param_view::<u32>(&u.ids, c0 * slots, n * slots),
-                    f32_view(&u.weights, c0 * slots, n * slots),
+                    cells_view(&u.weights, c0 * slots, n * slots),
                     param_view::<u32>(&s.route.ids, 0, n * slots),
-                    f32_view(&s.route.weights, 0, n * slots),
+                    cells_view(&s.route.weights, 0, n * slots),
                 )
             };
             iw.copy_from_device_async(&ri, stream)?;
@@ -2704,10 +2770,10 @@ fn qsa(
         // in place for the launch.
         let (gw, nw, pw, mut yw) = unsafe {
             (
-                f32_view(&q.qg, t0 * geo::Q_ROWS, dense * geo::Q_ROWS),
+                cells_view(&q.qg, t0 * geo::Q_ROWS, dense * geo::Q_ROWS),
                 param_view::<u32>(&u.n_keys, 0, dense),
                 param_view::<u32>(&u.pos, 0, dense),
-                f32_view(attn, 0, dense * geo::ATTN),
+                cells_view(attn, 0, dense * geo::ATTN),
             )
         };
         c.k.prefill.enqueue_256_p4_gated(
@@ -2745,11 +2811,11 @@ fn qsa(
         // and `attn` (`m` rows); they stay in place for this run's launches.
         let (qi, nw, gw, pw, mut yw) = unsafe {
             (
-                f32_view(&q.qi, at * idx, n * idx),
+                cells_view(&q.qi, at * idx, n * idx),
                 param_view::<u32>(&u.n_keys, r, n),
-                f32_view(&q.qg, at * geo::Q_ROWS, n * geo::Q_ROWS),
+                cells_view(&q.qg, at * geo::Q_ROWS, n * geo::Q_ROWS),
                 param_view::<u32>(&u.pos, r, n),
-                f32_view(attn, r * geo::ATTN, n * geo::ATTN),
+                cells_view(attn, r * geo::ATTN, n * geo::ATTN),
             )
         };
         c.k.qsa.enqueue_select(

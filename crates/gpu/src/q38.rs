@@ -31,7 +31,9 @@
 //!   the card sum of `crate::card_slots`' `ds41_ffn_card_acc_10` over the
 //!   card slots' down rows and `q38_card_shared_add`'s combine of it with the
 //!   zeros an empty host list sums to, in one launch — the two launches'
-//!   bits, without writing the sum or reading a host sum.
+//!   bits, without writing the sum or reading a host sum;
+//!   `q38_card_sum_shared_add_bf16` reads BF16 down rows, each widened
+//!   exactly to F32.
 //! - [`q38_kernels::q38_card_tier_shared_add`] — the join of a layer an
 //!   expert tier holds experts of, after the wait: the sum of
 //!   `crate::card_slots`' `ds41_ffn_card_acc_10` over
@@ -78,7 +80,7 @@
 //! hold, raises [`FaultSite::ExpertId`] as a card slot's does. Every value is
 //! written as computed.
 
-use crate::card_slots::card_acc_at;
+use crate::card_slots::{DownRows, card_acc_at};
 use crate::elem::EmbedRowsArgs;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
@@ -213,6 +215,40 @@ fn combine(h: f32, a: f32, s: f32, w: f32, fault: FaultSink) -> f32 {
         fault.raise(FaultSite::F32Product);
     }
     out
+}
+
+/// The two card sum entries' value `i` (the thread's), one thread a value.
+///
+/// # Safety
+/// `down` holds `10·n·m` cells, `w` `11·m`, `sel` `10·m`, `sh` and `y`
+/// `n·m`.
+#[inline(always)]
+unsafe fn card_sum_shared_add_at(
+    i: usize,
+    down: impl RowValues,
+    (w, sel, sh): (&[f32], &[u32], &[f32]),
+    (n, m, n_card): (u32, u32, u32),
+    fault: FaultSink,
+    y: &mut DisjointSlice<f32>,
+) {
+    let (n, m) = (n as usize, m as usize);
+    if i >= n * m {
+        return;
+    }
+    // SAFETY: i < n·m, and this fn's contract gives every length the
+    // helper's contract asks for at SLOTS slots and a pitch of W_PITCH.
+    let a = unsafe { card_acc_at::<SLOTS>(down, w, sel, n, n_card, W_PITCH, fault, i) };
+    // SAFETY: i < n·m <= sh.len() by this fn's contract.
+    let s = unsafe { *sh.get_unchecked(i) };
+    // SAFETY: i / n < m puts 11(i / n) + 10 below 11m <= w.len() by this
+    // fn's contract.
+    let wt = unsafe { *w.get_unchecked(i / n * W_PITCH + SLOTS) };
+    let out = combine(0.0, a, s, wt, fault);
+    // SAFETY: i < n·m <= y.len() by this fn's contract; thread i is
+    // y[i]'s only writer.
+    unsafe {
+        *y.get_unchecked_mut(i) = out;
+    }
 }
 
 #[cuda_module]
@@ -564,25 +600,44 @@ mod q38_kernels {
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
-        let (n, m) = (n as usize, m as usize);
         let i = thread::index_1d().get();
-        if i >= n * m {
-            return;
-        }
-        // SAFETY: i < n·m, and the launch contract gives every length the
-        // helper's contract asks for at SLOTS slots and a pitch of W_PITCH.
-        let a = unsafe { card_acc_at::<SLOTS>(down, w, sel, n, n_card, W_PITCH, fault, i) };
-        // SAFETY: i < n·m <= sh.len() by the launch contract.
-        let s = unsafe { *sh.get_unchecked(i) };
-        // SAFETY: i / n < m puts 11(i / n) + 10 below 11m <= w.len() by the
-        // launch contract.
-        let wt = unsafe { *w.get_unchecked(i / n * W_PITCH + SLOTS) };
-        let out = combine(0.0, a, s, wt, fault);
-        // SAFETY: i < n·m <= y.len() by the launch contract; thread i is
-        // y[i]'s only writer.
-        unsafe {
-            *y.get_unchecked_mut(i) = out;
-        }
+        // SAFETY: the launch contract's lengths, read as the body's.
+        unsafe { card_sum_shared_add_at(i, down, (w, sel, sh), (n, m, n_card), fault, &mut y) }
+    }
+
+    /// [`q38_card_sum_shared_add`] over BF16 down rows (each cell widened
+    /// exactly to F32): the same sum, combine and faults.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 10 * n * m,
+            w.len() >= 11 * m,
+            sel.len() >= 10 * m,
+            sh.len() >= n * m,
+            y.len() >= n * m
+        )
+    )]
+    pub fn q38_card_sum_shared_add_bf16(
+        down: &[u16],
+        w: &[f32],
+        sel: &[u32],
+        sh: &[f32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract's lengths, read as the body's.
+        unsafe { card_sum_shared_add_at(i, down, (w, sel, sh), (n, m, n_card), fault, &mut y) }
     }
 
     /// The join of a tier layer over `m` tokens of `n` values, one thread a
@@ -1016,7 +1071,7 @@ pub struct CardSharedAddArgs<'a> {
 /// last) and the places (below `n_card`, else [`HOST`]) — the shared
 /// expert's outputs (`[m][n]`), the sink and the output.
 pub struct CardSumSharedAddArgs<'a> {
-    pub down: &'a DeviceBuffer<f32>,
+    pub down: DownRows<'a>,
     pub w: &'a DeviceBuffer<f32>,
     pub sel: &'a DeviceBuffer<u32>,
     pub sh: &'a DeviceBuffer<f32>,
@@ -1489,27 +1544,40 @@ impl Q38Kernels {
         short(
             what,
             &[
-                ("down", a.down.len(), SLOTS * nm),
+                ("down", a.down.cells(), SLOTS * nm),
                 ("w", a.w.len(), W_PITCH * a.m),
                 ("sel", a.sel.len(), SLOTS * a.m),
                 ("sh", a.sh.len(), nm),
                 ("y", a.y.len(), nm),
             ],
         )?;
-        let prep = self.module.prepare_q38_card_sum_shared_add(cfg)?;
-        self.module.q38_card_sum_shared_add(
-            stream,
-            &prep,
-            a.down,
-            a.w,
-            a.sel,
-            a.sh,
+        let (n, m, n_card) = (
             launch_u32(what, "n", a.n)?,
             launch_u32(what, "m", a.m)?,
             launch_u32(what, "n_card", a.n_card)?,
-            a.fault,
-            a.y,
-        )?;
+        );
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident, $down:expr) => {{
+                let prep = self.module.$prepare(cfg)?;
+                self.module.$entry(
+                    stream, &prep, $down, a.w, a.sel, a.sh, n, m, n_card, a.fault, a.y,
+                )?;
+            }};
+        }
+        match a.down {
+            DownRows::F32(down) => {
+                launch!(
+                    prepare_q38_card_sum_shared_add,
+                    q38_card_sum_shared_add,
+                    down
+                );
+            }
+            DownRows::Bf16(down) => launch!(
+                prepare_q38_card_sum_shared_add_bf16,
+                q38_card_sum_shared_add_bf16,
+                down
+            ),
+        }
         Ok(())
     }
 

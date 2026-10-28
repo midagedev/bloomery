@@ -27,6 +27,7 @@
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
+use crate::q8f32::RowValues;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
@@ -410,6 +411,16 @@ mod card_slots_kernels {
     }
 }
 
+/// BF16 bits, each widened exactly to F32: the slot-major down rows a card
+/// sum reads in BF16.
+impl RowValues for &[u16] {
+    #[inline(always)]
+    unsafe fn at(self, i: usize) -> f32 {
+        // SAFETY: i is below the slice's length by this fn's contract.
+        cuda_device::convert::bf16_to_f32(unsafe { *self.get_unchecked(i) })
+    }
+}
+
 /// The card slots' sum of value `i` (token `t = i / n`, value `d = i % n`)
 /// of `N` slots a token: `acc = fma(down[(Nt + j)·n + d], w[t·w_pitch + j],
 /// acc)` from zero for each slot `j` below `N` whose place `sel[Nt + j]` is
@@ -418,15 +429,15 @@ mod card_slots_kernels {
 /// place in `[n_card, HOST)` raises [`FaultSite::ExpertId`] (from the token's
 /// value 0) and the value is NaN.
 ///
-/// SAFETY: `i < n · m` for an `m` with `down.len() >= N · n · m`, `sel.len()
-/// >= N · m`, and `w.len() >= w_pitch · m` with `w_pitch >= N`.
+/// SAFETY: `i < n · m` for an `m` with `down` holding `N · n · m` cells,
+/// `sel.len() >= N · m`, and `w.len() >= w_pitch · m` with `w_pitch >= N`.
 #[allow(
     clippy::too_many_arguments,
     reason = "device helper: the entries' arguments flat (rust-quality R8)"
 )]
 #[inline(always)]
 pub(crate) unsafe fn card_acc_at<const N: usize>(
-    down: &[f32],
+    down: impl RowValues,
     w: &[f32],
     sel: &[u32],
     n: usize,
@@ -445,13 +456,8 @@ pub(crate) unsafe fn card_acc_at<const N: usize>(
         if place < n_card {
             // SAFETY: t < m and j < N <= w_pitch put t·w_pitch + j below
             // w_pitch·m <= w.len(), and s < N·m and d < n put s·n + d below
-            // N·n·m <= down.len(), by this fn's contract.
-            let (ws, ds) = unsafe {
-                (
-                    *w.get_unchecked(t * w_pitch + j),
-                    *down.get_unchecked(s * n + d),
-                )
-            };
+            // the N·n·m cells of down, by this fn's contract.
+            let (ws, ds) = unsafe { (*w.get_unchecked(t * w_pitch + j), down.at(s * n + d)) };
             acc = ds.mul_add(ws, acc);
         } else if place != HOST {
             if d == 0 {
@@ -487,6 +493,39 @@ pub struct ColPlaces<'a> {
     pub map: &'a DeviceBuffer<u32>,
     pub row_off: usize,
     pub n_expert: usize,
+}
+
+/// A card route's slot-major down rows as a card sum reads them: F32, or
+/// BF16 bits (the native FP4 product's, `enqueue_gemm32_bf16`).
+#[derive(Clone, Copy)]
+pub enum DownRows<'a> {
+    F32(&'a DeviceBuffer<f32>),
+    Bf16(&'a DeviceBuffer<u16>),
+}
+
+impl DownRows<'_> {
+    /// The rows' cell count.
+    #[must_use]
+    pub fn cells(&self) -> usize {
+        match self {
+            Self::F32(d) => d.len(),
+            Self::Bf16(d) => d.len(),
+        }
+    }
+}
+
+impl<'a> DownRows<'a> {
+    /// The F32 rows of a launch that reads F32 rows alone (`what`'s): BF16
+    /// rows are refused by name.
+    pub fn f32(self, what: &'static str) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+        match self {
+            Self::F32(d) => Ok(d),
+            Self::Bf16(_) => Err(GpuError::state(
+                what,
+                "F32 down rows (BF16 rows feed the block's card sum alone)",
+            )),
+        }
+    }
 }
 
 /// What [`CardSlotKernels::enqueue_card_acc`] reads, `m` tokens of `n_used`

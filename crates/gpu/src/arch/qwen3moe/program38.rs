@@ -63,7 +63,7 @@ use super::body::ATTN_SCALE_256;
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site};
 use super::router::gated;
-use super::scratch::{Io, f32_view};
+use super::scratch::{Io, cells_view};
 use super::scratch38::{Arena38, Store38, Taps38};
 use super::tier38::{STAGE_TIER, TierSide38};
 use crate::card_slots::CardSlotKernels;
@@ -1875,7 +1875,7 @@ impl<'a> Pass38<'a> {
         // SAFETY: 1 <= m <= rows (checked above), so row m − 1 spans `hidden`
         // values inside `mixed` (`rows · hidden`), which stays in place while
         // the window lives (one copy).
-        let row = unsafe { f32_view(&self.p.s.mixed, (m - 1) * h, h) };
+        let row = unsafe { cells_view(&self.p.s.mixed, (m - 1) * h, h) };
         head.input_mut()
             .copy_from_device_async(&row, gpu.stream())?;
         head.enqueue(gpu, self.p.c.w)

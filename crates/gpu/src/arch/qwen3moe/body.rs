@@ -19,7 +19,7 @@ use super::program::Tail;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
 use super::scratch::{
-    Append128, Arena, Dims, FlashPass, Forms, KvPlanes, RopeRows, StepParams, f32_view,
+    Append128, Arena, Dims, FlashPass, Forms, KvPlanes, RopeRows, StepParams, cells_view,
 };
 use super::slot_pass::{SlotIn, SlotPass};
 use super::ubatch::{Q32, Ubatch, ubatch_size};
@@ -224,7 +224,7 @@ impl TapRows {
                 // SAFETY: row `l` spans elements `l·hidden .. (l+1)·hidden` of
                 // `buf`, which moves into the same `TapRows` beside its windows
                 // and outlives them.
-                .map(|l| unsafe { f32_view(&buf, l * hidden, hidden) })
+                .map(|l| unsafe { cells_view(&buf, l * hidden, hidden) })
                 .collect();
             *taps = Some(Self { buf, rows });
         }
@@ -1536,7 +1536,7 @@ impl GpuModel<Body> {
         // SAFETY: rows `positions` end at or below the table's rows, inside
         // it; the window lives for this copy alone.
         let rows = unsafe {
-            f32_view(
+            cells_view(
                 &rope.table,
                 positions.start * rope.width,
                 positions.len() * rope.width,

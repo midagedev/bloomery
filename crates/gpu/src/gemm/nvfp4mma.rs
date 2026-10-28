@@ -957,6 +957,49 @@ unsafe fn mxfp8_cols_body(
     unsafe { store_refused(refused, c, n, fits) };
 }
 
+/// A product entry's output cell: the F32 sum as stored.
+trait ProductCell: Copy {
+    fn of(v: f32) -> Self;
+}
+
+impl ProductCell for f32 {
+    #[inline(always)]
+    fn of(v: f32) -> Self {
+        v
+    }
+}
+
+impl ProductCell for u16 {
+    #[inline(always)]
+    fn of(v: f32) -> Self {
+        cuda_device::convert::f32_to_bf16_rne(v)
+    }
+}
+
+/// A product block's shared weight, activation and scale stages and its
+/// column words ([`TileColumns`]), as raw pointers.
+macro_rules! product_stages {
+    () => {{
+        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
+            cuda_device::SharedArray::UNINIT;
+        // SAFETY: W, B, S and C are this block's own shared allocations.
+        unsafe {
+            (
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W),
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B),
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S),
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C),
+            )
+        }
+    }};
+}
+
 #[cuda_module]
 mod native {
     use super::*;
@@ -1131,6 +1174,11 @@ mod native {
         }
     }
 
+    /// The route tiles' products `y[slot · rows + row]`: block
+    /// `tile · row_tiles + rt` walks route tile `tile`'s columns over rows
+    /// `rt · TILE_ROWS ..` of its expert, each value the F32 sum of the
+    /// block-scaled MMA times the expert's and the column's scales; every row
+    /// of a refused slot is NaN.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1155,6 +1203,82 @@ mod native {
         row_tiles: u32,
         mut y: DisjointSlice<f32>,
     ) {
+        let (wp, bp, sp, cp) = product_stages!();
+        // SAFETY: the launch contract's 256 threads, and the block's own
+        // shared stages and column words.
+        unsafe {
+            product_body(
+                (wq, we, ws),
+                (aq, ae, ag),
+                (cols, tiles, ntiles),
+                (rows, steps, slots, slot_div, row_tiles),
+                &mut y,
+                (wp, bp, sp, cp),
+            )
+        }
+    }
+
+    /// [`gemm_nvfp4_mma`]'s products as BF16, each value its F32 one rounded
+    /// to nearest even ([`ProductCell`]); a value past the BF16 range rounds
+    /// to an infinity, which the reader's finite check sees.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(domain = 1, block = (256, 1, 1))]
+    pub fn gemm_nvfp4_mma_bf16(
+        wq: &[u32],
+        we: &[u32],
+        ws: &[f32],
+        aq: &[u32],
+        ae: &[u32],
+        ag: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        ntiles: &[u32],
+        rows: u32,
+        steps: u32,
+        slots: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<u16>,
+    ) {
+        let (wp, bp, sp, cp) = product_stages!();
+        // SAFETY: the launch contract's 256 threads, and the block's own
+        // shared stages and column words.
+        unsafe {
+            product_body(
+                (wq, we, ws),
+                (aq, ae, ag),
+                (cols, tiles, ntiles),
+                (rows, steps, slots, slot_div, row_tiles),
+                &mut y,
+                (wp, bp, sp, cp),
+            )
+        }
+    }
+
+    /// The two product entries' walk and store, each value
+    /// [`ProductCell::of`] its F32 sum.
+    ///
+    /// # Safety
+    /// 256 converged threads of a [`gemm_nvfp4_mma`] launch, `wp`, `bp`, `sp`
+    /// and `cp` the block's [`product_stages`] allocations.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device body: the entries' arguments (rust-quality R8)"
+    )]
+    #[inline(always)]
+    unsafe fn product_body<Y: ProductCell>(
+        (wq, we, ws): (&[u32], &[u32], &[f32]),
+        (aq, ae, ag): (&[u32], &[u32], &[f32]),
+        (cols, tiles, ntiles): (&[u32], &[u32], &[u32]),
+        (rows, steps, slots, slot_div, row_tiles): (u32, u32, u32, u32, u32),
+        y: &mut DisjointSlice<Y>,
+        (wp, bp, sp, cp): (*mut u32, *mut u32, *mut u32, *mut u32),
+    ) {
         let block = thread::blockIdx_x() as usize;
         let tile = block / row_tiles as usize;
         let rt = block % row_tiles as usize;
@@ -1172,7 +1296,7 @@ mod native {
                     // SAFETY: the route's refused slots are disjoint from live tiles; one thread owns this row.
                     unsafe {
                         *y.get_unchecked_mut(cols[first + i / TILE_ROWS] as usize * rows + row) =
-                            f32::NAN;
+                            Y::of(f32::NAN);
                     }
                 }
                 i += TILE_THREADS as usize;
@@ -1184,22 +1308,7 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
-            cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
-            cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
-            cuda_device::SharedArray::UNINIT;
-        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
-            cuda_device::SharedArray::UNINIT;
-        // SAFETY: W is this block's shared weight allocation.
-        let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
-        // SAFETY: B is this block's shared activation allocation.
-        let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
-        // SAFETY: S is this block's shared scale allocation.
-        let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
-        // SAFETY: C is this block's shared column allocation.
-        let columns = TileColumns(unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) });
+        let columns = TileColumns(cp);
         let row = rt * TILE_ROWS + 16 * (tid / 32);
         let g = lane / 4;
         let t = lane & 3;
@@ -1299,36 +1408,36 @@ mod native {
         let column_of = |i: usize| 8 * (i / 2) + 2 * t + (i & 1);
         let mut slot = [0usize; 16];
         let mut input_scale = [0.0f32; 16];
-        #[unroll]
         for i in 0..16 {
+            ::cuda_device::thread::__unroll_config::<0>();
             if column_of(i) < len {
                 // SAFETY: column_of(i) < len <= 64, after the walk's barriers.
                 (slot[i], input_scale[i]) = unsafe { columns.get(column_of(i)) };
             }
         }
-        #[unroll]
         for i in 0..16 {
+            ::cuda_device::thread::__unroll_config::<0>();
             if column_of(i) < len {
                 let (n, j) = (i / 2, i & 1);
                 // SAFETY: this lane owns the first row of this live column; row counts divide 16.
                 unsafe {
                     *y.get_unchecked_mut(slot[i] * rows + row + g) =
-                        crate::gemm::grouped::scaled_sum(
+                        Y::of(crate::gemm::grouped::scaled_sum(
                             [f64::from(acc[n * 4 + j]), 0.0],
                             [weight_scale, 0.0],
                             input_scale[i],
                             0.0,
-                        ) as f32;
+                        ) as f32);
                 }
                 // SAFETY: this lane owns the row eight positions later in the same live column.
                 unsafe {
                     *y.get_unchecked_mut(slot[i] * rows + row + g + 8) =
-                        crate::gemm::grouped::scaled_sum(
+                        Y::of(crate::gemm::grouped::scaled_sum(
                             [f64::from(acc[n * 4 + j + 2]), 0.0],
                             [weight_scale, 0.0],
                             input_scale[i],
                             0.0,
-                        ) as f32;
+                        ) as f32);
                 }
             }
         }
@@ -1882,7 +1991,14 @@ pub(super) struct ProductArgs<'a> {
     pub(super) slots: u32,
     pub(super) max_tiles: u32,
     pub(super) slot_div: u32,
-    pub(super) y: &'a mut DeviceBuffer<f32>,
+    pub(super) y: ProductOut<'a>,
+}
+
+/// Where [`Kernels::product`] stores: F32 ([`native::gemm_nvfp4_mma`]) or
+/// BF16 ([`native::gemm_nvfp4_mma_bf16`]) cells, slot-major.
+pub(super) enum ProductOut<'a> {
+    F32(&'a mut DeviceBuffer<f32>),
+    Bf16(&'a mut DeviceBuffer<u16>),
 }
 
 impl Kernels {
@@ -2079,28 +2195,35 @@ impl Kernels {
         let grid = max_tiles
             .checked_mul(rt)
             .ok_or_else(|| GpuError::shape("NVFP4 MMA", "grid overflow"))?;
-        let prep =
-            self.module
-                .prepare_gemm_nvfp4_mma(LaunchConfig1D::new(grid, TILE_THREADS, 0))?;
-        self.module.gemm_nvfp4_mma(
-            stream,
-            &prep,
-            w.qs.buf(),
-            w.e.buf(),
-            w.scales.buf(),
-            &a.q,
-            &a.e,
-            &a.scale,
-            &route.cols,
-            &route.tiles,
-            &route.n_tiles,
-            rows,
-            (act.k / 64) as u32,
-            slots,
-            slot_div,
-            rt,
-            y,
-        )?;
+        let cfg = LaunchConfig1D::new(grid, TILE_THREADS, 0);
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident, $y:expr) => {{
+                let prep = self.module.$prepare(cfg)?;
+                self.module.$entry(
+                    stream,
+                    &prep,
+                    w.qs.buf(),
+                    w.e.buf(),
+                    w.scales.buf(),
+                    &a.q,
+                    &a.e,
+                    &a.scale,
+                    &route.cols,
+                    &route.tiles,
+                    &route.n_tiles,
+                    rows,
+                    (act.k / 64) as u32,
+                    slots,
+                    slot_div,
+                    rt,
+                    $y,
+                )?;
+            }};
+        }
+        match y {
+            ProductOut::F32(y) => launch!(prepare_gemm_nvfp4_mma, gemm_nvfp4_mma, y),
+            ProductOut::Bf16(y) => launch!(prepare_gemm_nvfp4_mma_bf16, gemm_nvfp4_mma_bf16, y),
+        }
         Ok(())
     }
 

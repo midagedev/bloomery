@@ -42,7 +42,7 @@
 
 use super::card38::{LegLayer, SelRun, leg_layers};
 use super::plan38::geo;
-use super::scratch::{f32_view, param_view};
+use super::scratch::{cells_view, param_view};
 use super::scratch38::ROUTE_ROWS;
 use super::swap38::Qwen38Stacks;
 use super::wide38::down_weight;
@@ -445,7 +445,7 @@ impl BlockRoute38 {
             let (sel_w, x_w, rank_w) = unsafe {
                 (
                     param_view::<u32>(io.sel, c0 * n, m * n),
-                    f32_view(io.x, c0 * h, m * h),
+                    cells_view(io.x, c0 * h, m * h),
                     param_view::<u32>(&self.rank, c0 * n, m * n),
                 )
             };

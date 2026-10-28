@@ -15,7 +15,7 @@ use super::dispatch::{self, Ctx, PassCtx};
 use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
 use super::plan::{DeltaPlan, FfnPlan, GqaPlan};
-use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, f32_view};
+use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, cells_view};
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
 use crate::tensor::Window;
@@ -312,7 +312,7 @@ pub(super) fn enqueue_last(
     }
     // SAFETY: row m − 1 < rows spans `hidden` values inside `x` (rows ·
     // hidden), which stays in place while the window lives (one copy).
-    let row = unsafe { f32_view(&s.x, (m - 1) * h, h) };
+    let row = unsafe { cells_view(&s.x, (m - 1) * h, h) };
     head.input_mut()
         .copy_from_device_async(&row, gpu.stream())?;
     dispatch::enqueue_head(gpu, w, k, state, head)

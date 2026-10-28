@@ -2487,7 +2487,7 @@ impl GpuModel<Body35> {
                 // SAFETY: rows `0..t` of `normed` span `t · hidden` values
                 // inside it (`rows · hidden`, `t <= rows` by the walk's
                 // refusal), and the arena stays in place for the copy.
-                let rows = unsafe { super::scratch::f32_view(&body.u.normed, 0, t * hidden) };
+                let rows = unsafe { super::scratch::cells_view(&body.u.normed, 0, t * hidden) };
                 rows.copy_to_host(gpu.stream(), out)?;
                 Ok(false)
             })?;

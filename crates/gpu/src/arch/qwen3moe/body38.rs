@@ -3758,7 +3758,7 @@ impl Body38 {
         // waits for this thread, so it takes its rows at its PLE site and
         // their read runs under the layers before it; any other walk copies
         // them in now.
-        self.ple_late = self.tier.is_none() && (0..self.plans.len()).all(|l| self.card.hostless(l));
+        self.ple_late = self.tier.is_none() && self.card.all_hostless();
         let hist = match self.ple_late {
             true => self.ple.name_spanned(pos, tokens, &spans)?,
             false => self.ple.fill_spanned(pos, tokens, &spans)?,

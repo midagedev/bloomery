@@ -57,7 +57,7 @@ pub use super::image::ImageWrite;
 use super::image::{ImageWindows, PromptImage};
 use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, MixerPlan, SiteTy};
 use super::router::RouterOut;
-use super::scratch::{Arena, Dims, KvPlanes, f32_view};
+use super::scratch::{Arena, Dims, KvPlanes, cells_view};
 use super::wide::{self, Neox128Rows};
 use crate::flash_gqa::HEAD;
 use crate::gemm::GemmAct32;
@@ -502,7 +502,7 @@ impl Ubatch {
         }
         // SAFETY: row t − 1 < rows spans `hidden` values inside `x` (rows ·
         // hidden), which stays in place while the window lives (one copy).
-        Ok(unsafe { f32_view(x, (t - 1) * h, h) })
+        Ok(unsafe { cells_view(x, (t - 1) * h, h) })
     }
 }
 

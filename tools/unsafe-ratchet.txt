@@ -653,7 +653,12 @@ gguf 7 2 0
 # `scale_quad` (nvfp4mma.rs), one aligned shared read of a lane's four activation scales in place of four, and
 # `b_pair`, one `ldmatrix` of two activation fragments in place of two, with their calls. Each block has its SAFETY
 # line.
-gpu 2778 357 10
+# PIN(2026-10-28): gpu 2778 -> 2784 blocks, 357 -> 364 fns, new code, not old code relaxed: BF16 down rows
+# of a hostless native NVFP4 card route: the product's shared stages and body (nvfp4mma.rs `product_stages`,
+# `product_body`, the `gemm_nvfp4_mma_bf16` entry), the card sum's cell readers (card_slots.rs `DownCells`) and
+# body (q38.rs `card_sum_shared_add_at`, the `q38_card_sum_shared_add_bf16` entry), and the route's window
+# (scratch.rs `cells_view`, wide38.rs `Down38::window`). Each block and fn has its SAFETY line or Safety section.
+gpu 2784 364 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

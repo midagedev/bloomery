@@ -1624,12 +1624,12 @@ impl GdnArena {
         // allocation), where it outlives them.
         let (x, z, b, a, from_z, from_b) = unsafe {
             (
-                f32_view(&proj, 0, at_z),
-                f32_view(&proj, at_z, rows * zl),
-                f32_view(&proj, at_b, rows * nv),
-                f32_view(&proj, at_a, rows * nv),
-                f32_view(&proj, at_z, end - at_z),
-                f32_view(&proj, at_b, end - at_b),
+                cells_view(&proj, 0, at_z),
+                cells_view(&proj, at_z, rows * zl),
+                cells_view(&proj, at_b, rows * nv),
+                cells_view(&proj, at_a, rows * nv),
+                cells_view(&proj, at_z, end - at_z),
+                cells_view(&proj, at_b, end - at_b),
             )
         };
         Ok(GdnArena {
@@ -2013,19 +2013,19 @@ pub(super) unsafe fn param_view<T>(
     unsafe { WindowMut::from_raw(ptr, len, parent.context()) }
 }
 
-/// A non-owning window of `len` f32 over `parent` from element `off`,
+/// A non-owning window of `len` cells over `parent` from cell `off`,
 /// released as [`param_view`]'s.
 ///
 /// # Safety
 ///
 /// `off + len <= parent.len()`, and `parent` must outlive the window unmoved
 /// in memory (a captured graph bakes the address in).
-pub(super) unsafe fn f32_view(
-    parent: &DeviceBuffer<f32>,
+pub(super) unsafe fn cells_view<T>(
+    parent: &DeviceBuffer<T>,
     off: usize,
     len: usize,
-) -> WindowMut<'static, f32> {
-    let ptr = parent.cu_deviceptr() + (off * size_of::<f32>()) as u64;
+) -> WindowMut<'static, T> {
+    let ptr = parent.cu_deviceptr() + (off * size_of::<T>()) as u64;
     // SAFETY: the range is the caller's contract above, inside `parent`.
     unsafe { WindowMut::from_raw(ptr, len, parent.context()) }
 }
@@ -2084,11 +2084,11 @@ impl Arena {
         let (x_rows, q, k, v) = unsafe {
             (
                 (0..narrow)
-                    .map(|t| f32_view(&x, t * d.hidden, d.hidden))
+                    .map(|t| cells_view(&x, t * d.hidden, d.hidden))
                     .collect(),
-                f32_view(&qkv, 0, rows * q_len),
-                f32_view(&qkv, rows * q_len, rows * kv_len),
-                f32_view(&qkv, rows * (q_len + kv_len), rows * kv_len),
+                cells_view(&qkv, 0, rows * q_len),
+                cells_view(&qkv, rows * q_len, rows * kv_len),
+                cells_view(&qkv, rows * (q_len + kv_len), rows * kv_len),
             )
         };
         Ok(Arena {
@@ -2236,7 +2236,7 @@ impl Arena {
 #[cfg(test)]
 mod tests {
     use super::super::body::TapRows;
-    use super::{Inbox, LaneWord, PassRecord, f32_view};
+    use super::{Inbox, LaneWord, PassRecord, cells_view};
     use cuda_core::DeviceBuffer;
     use std::sync::Arc;
 
@@ -2260,7 +2260,7 @@ mod tests {
             assert_eq!(taps.as_ref().map(|t| t.rows.len()), Some(3));
             TapRows::set(&mut taps, &stream, 3, 4, true).expect("the taps again");
             // SAFETY: values 4 .. 8 of `rows`, which outlives the view.
-            let _row = unsafe { f32_view(&rows, 4, 4) };
+            let _row = unsafe { cells_view(&rows, 4, 4) };
         }
         stream.synchronize().expect("the upload");
         let after = Arc::strong_count(&ctx);

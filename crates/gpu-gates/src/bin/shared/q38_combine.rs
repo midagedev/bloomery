@@ -1,12 +1,15 @@
 //! Clause 10's Qwen3.8 combine launches beside `gate_kquant`'s card leg:
-//! the one launch of a layer without a host leg (`q38_card_sum_shared_add`),
-//! its check, and the refusals of both combine launchers.
+//! the one launch of a layer without a host leg (`q38_card_sum_shared_add`,
+//! on F32 and on BF16 down rows), its check, and the refusals of both combine
+//! launchers.
 
+use bloomery_gpu::card_slots::DownRows;
 use bloomery_gpu::hybrid::HOST;
 use bloomery_gpu::q38::{CardSharedAddArgs, CardSumSharedAddArgs, SLOTS, W_PITCH};
 use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_NONE};
 use bloomery_gpu_gates::{GateError, bits_equal, verdict};
 use cuda_core::DeviceBuffer;
+use cuda_device::convert::{bf16_to_f32, f32_to_bf16_rne};
 
 use crate::gate::{Ctx, E38, Leg38, M38, N38, SEL38, SEL38_STRAY, SENT, mismatch, shown};
 
@@ -17,11 +20,12 @@ const NEG0: usize = 3;
 type CombineRefusal = (&'static str, &'static str, Result<(), GpuError>);
 
 impl Leg38 {
-    /// A layer without a host leg's one launch on the leg's down rows,
+    /// A layer without a host leg's one launch on `down` and the leg's
     /// weights and shared rows, `m` tokens placed by `sel`, into `y`.
     fn sum_hostless(
         &self,
         c: &Ctx,
+        down: DownRows<'_>,
         sel: &DeviceBuffer<u32>,
         m: usize,
         y: &mut DeviceBuffer<f32>,
@@ -29,7 +33,7 @@ impl Leg38 {
         self.q38.enqueue_card_sum_shared_add(
             c.gpu.stream(),
             CardSumSharedAddArgs {
-                down: &self.y_down,
+                down,
                 w: &self.w,
                 sel,
                 sh: &self.sh,
@@ -67,7 +71,7 @@ impl Leg38 {
         let two = self.y.to_host_vec(stream)?;
         let fused = |leg: &Leg38, sel: &DeviceBuffer<u32>| -> Result<_, GateError> {
             let mut y = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
-            leg.sum_hostless(c, sel, M38, &mut y)?;
+            leg.sum_hostless(c, DownRows::F32(&leg.y_down), sel, M38, &mut y)?;
             stream.synchronize()?;
             Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
         };
@@ -102,6 +106,34 @@ impl Leg38 {
             shown(want),
             verdict(pass)
         );
+        // BF16 down rows: the F32 launch over the same rows widened, bit for
+        // bit, its faults included.
+        let bf16: Vec<u16> = down.iter().map(|&v| f32_to_bf16_rne(v)).collect();
+        let widened: Vec<f32> = bf16.iter().map(|&b| bf16_to_f32(b)).collect();
+        let bf16 = DeviceBuffer::from_host(stream, &bf16)?;
+        let widened = DeviceBuffer::from_host(stream, &widened)?;
+        for (name, places) in [("placed", &SEL38), ("stray_place", &SEL38_STRAY)] {
+            let sel = DeviceBuffer::from_host(stream, places)?;
+            let run = |rows: DownRows<'_>| -> Result<_, GateError> {
+                let mut y = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
+                self.sum_hostless(c, rows, &sel, M38, &mut y)?;
+                stream.synchronize()?;
+                Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
+            };
+            let (got, got_fault) = run(DownRows::Bf16(&bf16))?;
+            let (want, want_fault) = run(DownRows::F32(&widened))?;
+            let same = bits_equal(&got, &want);
+            let pass = same && got_fault == want_fault;
+            ok &= pass;
+            println!(
+                "q38_card_hostless[bf16_rows, {name}] is_f32_launch_over_widened_rows={same} \
+                 fault=\"{}\" want=\"{}\" {}{}",
+                shown(got_fault),
+                shown(want_fault),
+                verdict(pass),
+                mismatch("first_mismatch", &got, &want, N38),
+            );
+        }
         Ok(ok)
     }
 
@@ -126,9 +158,10 @@ impl Leg38 {
             },
         );
         let mut y = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
-        let r_no_token = self.sum_hostless(c, &self.sel, 0, &mut y);
+        let rows = DownRows::F32(&self.y_down);
+        let r_no_token = self.sum_hostless(c, rows, &self.sel, 0, &mut y);
         let mut short = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38 - 1])?;
-        let r_short = self.sum_hostless(c, &self.sel, M38, &mut short);
+        let r_short = self.sum_hostless(c, rows, &self.sel, M38, &mut short);
         let what = "q38::enqueue_card_sum_shared_add";
         Ok([
             ("q38::enqueue_card_shared_add", "slot_11_of_11", r_slot),

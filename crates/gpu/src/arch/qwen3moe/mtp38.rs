@@ -107,7 +107,7 @@ use super::body::ATTN_SCALE_256;
 use super::plan38::{HcSite, geo, router};
 use super::program38::{Ctx38, Kernels38, MMA};
 use super::router::{RouterDims, RouterOut, gated};
-use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
+use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, cells_view, param_view, put_input};
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::saved::Spans;
@@ -1025,8 +1025,12 @@ impl TapBufs {
         // SAFETY: `src` holds MTP_ROWS rows of the node's width (the arena's
         // buffer the node names) and the tap as many; m <= MTP_ROWS; the
         // windows live for this copy.
-        let (mut dst, src) =
-            unsafe { (f32_view(&self.nodes[node.at()], 0, n), f32_view(src, 0, n)) };
+        let (mut dst, src) = unsafe {
+            (
+                cells_view(&self.nodes[node.at()], 0, n),
+                cells_view(src, 0, n),
+            )
+        };
         dst.copy_from_device_async(&src, stream)?;
         Ok(())
     }
@@ -1982,8 +1986,8 @@ impl Mtp38 {
             // live for this enqueue.
             let (x, mut y) = unsafe {
                 (
-                    f32_view(&a.pack, at * 2 * h, run * 2 * h),
-                    f32_view(&a.res, at * h, run * h),
+                    cells_view(&a.pack, at * 2 * h, run * 2 * h),
+                    cells_view(&a.res, at * h, run * h),
                 )
             };
             cx.dense_gemv(&n.eh, &x, run, &mut y)?;
@@ -1992,8 +1996,12 @@ impl Mtp38 {
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
             // SAFETY: the first m rows of the tap and of the streams, both
             // MTP_ROWS · WIDE values; the windows live for this copy.
-            let (mut dst, src) =
-                unsafe { (f32_view(&t.eh, 0, m * WIDE), f32_view(&a.res, 0, m * WIDE)) };
+            let (mut dst, src) = unsafe {
+                (
+                    cells_view(&t.eh, 0, m * WIDE),
+                    cells_view(&a.res, 0, m * WIDE),
+                )
+            };
             dst.copy_from_device_async(&src, stream)?;
         }
 
@@ -2222,7 +2230,7 @@ impl Mtp38 {
         // (the full head's, or a list no longer than the vocabulary, refused
         // at open otherwise), m <= MTP_ROWS; the window lives for the
         // projection and the argmax.
-        let mut lg = unsafe { f32_view(&a.logits, 0, rows * m) };
+        let mut lg = unsafe { cells_view(&a.logits, 0, rows * m) };
         match head_out {
             HeadOut::Q8_0 { qs, d } => match map {
                 None => gpu
@@ -2330,7 +2338,7 @@ impl Mtp38 {
         let (id, row) = unsafe {
             (
                 param_view::<u32>(&a.out, m - 1, 1),
-                f32_view(&a.res, (m - 1) * WIDE, WIDE),
+                cells_view(&a.res, (m - 1) * WIDE, WIDE),
             )
         };
         a.own_id.copy_from_device_async(&id, stream)?;
