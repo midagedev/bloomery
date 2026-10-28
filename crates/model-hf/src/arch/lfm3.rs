@@ -1041,7 +1041,7 @@ mod tests {
             e.contains("tie_word_embeddings is false") && e.contains("no head"),
             "{e}"
         );
-        let both = [base.clone(), head].concat();
+        let both = [base, head].concat();
         let checkpoint = Checkpoint::parse(&untied).unwrap();
         let planning = planning(&checkpoint, &untied, &both).unwrap();
         let output = planning
