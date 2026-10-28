@@ -29,7 +29,7 @@ use bloomery_metal::geom::{DeltaGeom, Geometry};
 use bloomery_metal::instance::REGISTERED;
 use bloomery_metal::kernels::{HeadMap, PARTIALS_PER_HEAD, key_of};
 
-use super::oracle::U;
+use super::oracle::{Ev, U, fma, mul};
 
 /// What the kernel's lane map and the oracle's association are written for,
 /// held for every registered row: a head of 128 columns (32 lanes of four,
@@ -51,36 +51,6 @@ const _: () = {
 /// PIN(2026-10-22): the model in this module's doc sets the one-step band.
 const FLOOR: f64 = 8.0 * (f32::MIN_POSITIVE as f64);
 
-/// One value and the absolute error an f32 evaluation may add.
-#[derive(Clone, Copy)]
-struct Ev {
-    v: f64,
-    e: f64,
-}
-
-impl Ev {
-    fn zero() -> Self {
-        Self { v: 0.0, e: 0.0 }
-    }
-
-    fn exact(v: f32) -> Self {
-        Self {
-            v: f64::from(v),
-            e: 0.0,
-        }
-    }
-}
-
-fn mul(a: Ev, b: Ev) -> Ev {
-    let v = a.v * b.v;
-    let cross = a.e * b.v.abs() + b.e * a.v.abs() + a.e * b.e;
-    let mag = (a.v.abs() + a.e) * (b.v.abs() + b.e);
-    Ev {
-        v,
-        e: cross + U * mag,
-    }
-}
-
 fn add(a: Ev, b: Ev) -> Ev {
     let v = a.v + b.v;
     let mag = (a.v.abs() + a.e) + (b.v.abs() + b.e);
@@ -92,16 +62,6 @@ fn add(a: Ev, b: Ev) -> Ev {
 
 fn sub(a: Ev, b: Ev) -> Ev {
     add(a, Ev { v: -b.v, e: b.e })
-}
-
-fn fma(a: Ev, b: Ev, c: Ev) -> Ev {
-    let v = a.v.mul_add(b.v, c.v);
-    let cross = a.e * b.v.abs() + b.e * a.v.abs() + a.e * b.e;
-    let mag = (a.v.abs() + a.e) * (b.v.abs() + b.e) + (c.v.abs() + c.e);
-    Ev {
-        v,
-        e: cross + c.e + U * mag,
-    }
 }
 
 fn div(a: Ev, b: Ev) -> Result<Ev, String> {

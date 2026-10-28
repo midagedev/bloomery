@@ -50,7 +50,7 @@ pub enum Program {
     /// The nemotron_h_moe body (`crates/gpu/src/arch/nemotron_h_moe`):
     /// whole-card, the Nano's Mamba-2 and NoPE GQA layers over the shared
     /// hybrid owner (`crates/gpu/src/arch/hybrid.rs`) and the latent MoE layer,
-    /// whose routed stacks run [`latent_leg_runs`] and shared expert IQ2_XXS or Q8_0.
+    /// whose routed stacks run [`latent_leg_runs`] and shared expert IQ2_XXS, Q8_0 or NVFP4.
     NemotronHMoeBody,
     /// The EmbeddingGemma encoders (`crates/gpu-gemma-embedding2`): one
     /// pass of a dense trunk on a card, no routed experts.
@@ -444,12 +444,12 @@ pub fn leg_pair(p: Program) -> Option<LegPair> {
 /// of `ty` in again, for the card leg's relu² form: the leg's card format
 /// ([`leg_card_format`]) where the file's own layout ([`CardFormat::of`]) is
 /// another (Q8_0's planes and Q5_1's packed codes, as the file's blocks);
-/// `None` where the stack already is in it (Q5_0's packed words) or the form
+/// `None` where the stack already is in it (Q5_0's packed words, NVFP4's planes) or the form
 /// does not run the type.
 #[must_use]
 pub fn relu2_relayout(ty: GgmlType) -> Option<CardFormat> {
     let read = leg_card_format(ty);
-    (kernels::card_sel32_runs(ty) && CardFormat::of(ty) != Some(read)).then_some(read)
+    (kernels::card_relu2_runs(ty) && CardFormat::of(ty) != Some(read)).then_some(read)
 }
 
 /// The latent MoE body's routed stacks: an up and a down (no gate) of the
@@ -458,13 +458,13 @@ pub const BOLT_LEG: GgmlType = GgmlType::IQ2_XXS;
 
 /// Whether the latent MoE body runs a routed up or down stack of type `ty` on
 /// the card: [`BOLT_LEG`] by its `iq2_xxs_gemv_sel` launches, or a
-/// 32-value-block type by the card leg's relu² form
-/// ([`kernels::card_sel32_runs`]: Q5_0, Q5_1, Q8_0, IQ4_NL). A layer runs one
-/// form for both stacks, so the load refuses by name a layer whose up and down
-/// take different forms.
+/// 32-value-block type or NVFP4 in its planes by the card leg's relu² form
+/// ([`kernels::card_relu2_runs`]: Q5_0, Q5_1, Q8_0, IQ4_NL, NVFP4, NVFP4_ROWS). A
+/// layer runs one form for both stacks, so the load refuses by name a layer
+/// whose up and down take different forms.
 #[must_use]
 pub const fn latent_leg_runs(ty: GgmlType) -> bool {
-    matches!(ty, BOLT_LEG) || kernels::card_sel32_runs(ty)
+    matches!(ty, BOLT_LEG) || kernels::card_relu2_runs(ty)
 }
 
 /// The muse-spark body's routed stacks: a gate, an up and a down of the one
@@ -1152,17 +1152,53 @@ mod tests {
 
     /// A whole-card load of the latent MoE body re-uploads a stack for the relu² form only where
     /// the file's own layout is not the one its `_sel` reads: Q5_1 and Q8_0 as the file's blocks,
-    /// not Q5_0, whose packed words are the leg's format already, and no type the form does not
-    /// run. Mutant: the re-upload as the file's blocks for every type the form runs.
+    /// not Q5_0, whose packed words are the leg's format already, not NVFP4 or NVFP4_ROWS, whose
+    /// planes are, and no type the form does not run. Mutant: the re-upload as the leg's format
+    /// for every type the form runs.
     #[test]
     fn a_relu2_stack_is_uploaded_again_only_off_the_legs_layout() {
         assert_eq!(relu2_relayout(GgmlType::Q5_0), None);
         assert_eq!(relu2_relayout(GgmlType::Q5_1), Some(CardFormat::KQuant));
         assert_eq!(relu2_relayout(GgmlType::Q8_0), Some(CardFormat::KQuant));
+        assert_eq!(relu2_relayout(GgmlType::NVFP4), None);
+        assert_eq!(relu2_relayout(GgmlType::NVFP4_ROWS), None);
         for ty in types() {
-            if !kernels::card_sel32_runs(ty) {
+            if !kernels::card_relu2_runs(ty) {
                 assert_eq!(relu2_relayout(ty), None, "{ty}");
             }
+        }
+    }
+
+    /// The latent MoE body's card leg runs, beside IQ2_XXS and the four 32-value-block types the
+    /// relu² form ran, NVFP4 and the checkpoint folder's NVFP4_ROWS, each loaded in its planes by
+    /// the program's plan rule, and no other type. Mutant: `latent_leg_runs` reading
+    /// [`kernels::card_sel32_runs`], which refuses both.
+    #[test]
+    fn the_latent_moe_body_runs_nvfp4_planes_in_the_relu2_form() {
+        for ty in types() {
+            let want = matches!(
+                ty,
+                GgmlType::IQ2_XXS
+                    | GgmlType::Q5_0
+                    | GgmlType::Q5_1
+                    | GgmlType::Q8_0
+                    | GgmlType::IQ4_NL
+                    | GgmlType::NVFP4
+            );
+            assert_eq!(latent_leg_runs(ty), want, "{ty}");
+        }
+        let RoutedRule::Leg { gate_up, down, .. } = routed_rule(Program::NemotronHMoeBody) else {
+            panic!("the latent MoE body's routed experts run on a card leg");
+        };
+        for ty in [GgmlType::NVFP4, GgmlType::NVFP4_ROWS] {
+            assert!(latent_leg_runs(ty), "{ty}");
+            assert_eq!(
+                leg_runs(Program::NemotronHMoeBody, [ty; 3]),
+                Some(true),
+                "{ty}"
+            );
+            assert_eq!(gate_up(ty), Some(CardFormat::Nvfp4Planes), "{ty}");
+            assert_eq!(down(ty), Some(CardFormat::Nvfp4Planes), "{ty}");
         }
     }
 

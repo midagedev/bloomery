@@ -44,8 +44,8 @@ use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{
-    self, Instance, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4, QWEN35MOE_GQA6,
-    REGISTERED,
+    self, Instance, LFM3_ATTN, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4,
+    QWEN35MOE_GQA6, REGISTERED,
 };
 use bloomery_metal::kernels::{
     Geometry, HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant,
@@ -89,12 +89,16 @@ mod clauses_router;
 mod clauses_rows;
 #[path = "clauses_seg.rs"]
 mod clauses_seg;
+#[path = "clauses_shortconv.rs"]
+mod clauses_shortconv;
 #[path = "clauses_sites.rs"]
 mod clauses_sites;
 #[path = "clauses_synth.rs"]
 mod clauses_synth;
 #[path = "clauses_tensor.rs"]
 mod clauses_tensor;
+#[path = "clauses_window.rs"]
+mod clauses_window;
 #[path = "common.rs"]
 mod common;
 #[path = "fixture.rs"]
@@ -113,6 +117,8 @@ mod oracle_delta;
 mod oracle_experts;
 #[path = "../shared/oracle_router.rs"]
 mod oracle_router;
+#[path = "../shared/oracle_shortconv.rs"]
+mod oracle_shortconv;
 #[path = "../shared/synthetic.rs"]
 mod synthetic;
 
@@ -508,6 +514,15 @@ enum Table {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
     },
+    /// The clauses of the attention kernels an instance's window and
+    /// per-head gate axes shape, with the rope table's: the instance's
+    /// flash cuts a window a launch names and gates per head, so the plain
+    /// launches of the other clause files refuse it by name. The mutants of
+    /// those clauses in both tables (`kept`) and the instance's own (`own`).
+    Window {
+        kept: &'static [&'static str],
+        own: &'static [mutants::Mutant],
+    },
 }
 
 /// A registered instance's row of the gate: the architecture whose fixture
@@ -555,6 +570,14 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         table: Table::Attention {
             kept: mutants::ATTN_KEPT,
             own: mutants::GQA_MUTANTS,
+        },
+    },
+    InstanceRow {
+        instance: &LFM3_ATTN,
+        fixture: "qwen35moe",
+        table: Table::Window {
+            kept: mutants::WINDOW_KEPT,
+            own: mutants::WINDOW_MUTANTS,
         },
     },
 ];
@@ -976,7 +999,9 @@ fn clause_table<'a>(
         Table::Attention { .. } => instances()
             .chain(clauses_attention::table(ctx))
             .chain(clauses_rows::attention(ctx))
+            .chain(clauses_window::refusals(ctx))
             .collect(),
+        Table::Window { .. } => instances().chain(clauses_window::table(ctx)).collect(),
         Table::Shaped { .. } => instances()
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))
@@ -1000,6 +1025,7 @@ fn clause_table<'a>(
             .chain(clauses_sites::table(ctx.harness))
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
             .chain(clauses_delta::table(ctx))
+            .chain(clauses_shortconv::table(ctx))
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))
             .chain(clauses_apart::table(ctx))

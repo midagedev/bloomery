@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 /// as `tokenizers` does is refused by name, so a row added to `PRE` without its reading ends here.
 #[test]
 fn every_pre_row_has_a_hugging_face_reading() {
-    for (name, _) in hf::vocab::PRE {
+    for (name, _, _) in hf::vocab::PRE {
         let keys: Vec<(String, Value)> = vec![
             ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
             ("tokenizer.ggml.pre".into(), Value::String(name.into())),

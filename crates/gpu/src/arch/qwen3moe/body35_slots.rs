@@ -293,6 +293,9 @@ fn seq_launches(plans: &[LayerPlan]) -> usize {
         .map(|p| match p.mixer {
             MixerPlan::Delta(_) => DELTA_SEQ_LAUNCHES,
             MixerPlan::Gqa(_) => GQA_SEQ_LAUNCHES,
+            MixerPlan::ShortConv(_) => {
+                panic!("qwen35moe::seq_launches: a short-conv layer, which `kinds35` refuses")
+            }
         })
         .sum::<usize>()
 }
@@ -597,6 +600,7 @@ impl ChainOps for Slots35<'_, '_> {
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::Slots35::attn_out")?;
         dispatch::attn_out(&layer_ctx(self.c, l)?, n, self.s, l.m)
     }
 
@@ -689,6 +693,7 @@ impl ChainOps for Slots35<'_, '_> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::Slots35::delta_out")?;
         delta::output(&layer_ctx(self.c, l)?, d, self.s, l.m)
     }
 
@@ -697,6 +702,7 @@ impl ChainOps for Slots35<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::Slots35::experts")?;
         dispatch::experts(&layer_ctx(self.c, l)?, f, self.s, l.m, None)
     }
 

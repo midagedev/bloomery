@@ -5626,7 +5626,7 @@ mod tests {
 mod planes_union_tests {
     use super::{Claim, LegRun, TierError, TierPin, TierSlots, UnionScratch, serve_union};
     use crate::ops::planes_tests::{ORDERS, Order, contiguous, place, planes_matrix, stack_info};
-    use crate::ops::{ExpertStack, StackRuns, StackTier, Tensor2};
+    use crate::ops::{ExpertForm, ExpertInput, ExpertStack, Lanes, StackRuns, StackTier, Tensor2};
     use gguf::GgmlType;
     use gguf::quant::Nvfp4Rows;
 
@@ -5838,6 +5838,107 @@ mod planes_union_tests {
                         bits(&got[j * EMBD..(j + 1) * EMBD]),
                         bits(&transcription(&f, xc, list)),
                         "{order:?} {cols} columns: column {j} against the leg on the source matrices"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`run`] for a relu² layer: the folder's up stack twice, in the gate's slot again as
+    /// `HostLayer::stacks` holds a relu² layer's, then its down; `spans` and `runs` as [`run`]'s,
+    /// the up's the second.
+    fn run_relu2(
+        spans: [&[u8]; 3],
+        runs: &[StackRuns; 3],
+        x: &Tensor2,
+        lists: &[Vec<(u32, f32)>],
+    ) -> Vec<f32> {
+        let infos = [
+            stack_info("up_exps", [EMBD, FF, N_EXPERT]),
+            stack_info("down_exps", [FF, EMBD, N_EXPERT]),
+        ];
+        let tensor_scales = [scales(1), scales(2)];
+        let stack = |at: usize, part: usize| {
+            ExpertStack::located(
+                &infos[at],
+                spans[part],
+                &runs[part],
+                Some(&tensor_scales[at]),
+            )
+            .expect("a stack that fits its runs")
+        };
+        let stacks = [stack(0, 1), stack(0, 1), stack(1, 2)];
+        let cols = x.ne1;
+        let mut us = UnionScratch::new_routed(EMBD, FF, cols, 2).unwrap();
+        let refs: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+        let mut out = vec![0.0f32; cols * EMBD];
+        let relu2 = LegRun {
+            form: ExpertForm::Relu2,
+            input: ExpertInput::Direct,
+            lanes: Lanes::Flat,
+            post: None,
+        };
+        serve_union(stacks, relu2, x.view(), &refs, &mut out, &mut us, None)
+            .expect("the union call runs");
+        out
+    }
+
+    /// One column's relu² leg written out on the source matrices, never through a stack: x
+    /// quantized, each listed expert's up dotted at its scale, `max(up, 0)²`, quantized, the down
+    /// dotted at its scale, the weighted sum in list order from zero.
+    fn transcription_relu2(f: &Folder, x: &[f32], list: &[(u32, f32)]) -> Vec<f32> {
+        let xq = quantized(x);
+        let mut out = vec![0.0f32; EMBD];
+        for &(e, w) in list {
+            let (m, e) = (&f.mats[e as usize], e as usize);
+            let up = dots(&m[1], EMBD, FF, &xq, scale(1, e));
+            let par: Vec<f32> = up
+                .iter()
+                .map(|&v| {
+                    let r = v.max(0.0);
+                    r * r
+                })
+                .collect();
+            let down = dots(&m[2], FF, EMBD, &quantized(&par), scale(2, e));
+            for (o, d) in out.iter_mut().zip(&down) {
+                *o += w * d;
+            }
+        }
+        out
+    }
+
+    /// The host tier serves a checkpoint folder's NVFP4 experts in the relu² form through the
+    /// common planes row (`qdot::dot_nvfp4_planes_row`): the union call over a located relu²
+    /// layer — the up in the gate's slot again, the down — gives the bits of the same experts in
+    /// one contiguous planes run each and the bits of the leg written out on the source matrices,
+    /// at 1, 3 and 9 columns in each order the folder may store the matrices. Mutant: the combine
+    /// writing `max(up, 0)` (`relu2_into`'s `r * r` as `r`), which the transcription's square
+    /// differs from.
+    #[test]
+    fn a_located_planes_relu2_layer_gives_the_union_call_the_transcription_bits() {
+        for order in ORDERS {
+            let f = folder(order);
+            let (spans, plain) = plain(&f);
+            for cols in [1usize, 3, 9] {
+                let lists = lists(cols);
+                let xs: Vec<Vec<f32>> = (0..cols).map(column).collect();
+                let x = Tensor2::from_vec(EMBD, cols, xs.concat());
+                let got = run_relu2([&f.span, &f.span, &f.span], &f.runs, &x, &lists);
+                let want = run_relu2([&spans[0], &spans[1], &spans[2]], &plain, &x, &lists);
+                assert!(
+                    got.iter().all(|v| v.is_finite()) && got.iter().any(|v| v.abs() > 1e-3),
+                    "{order:?} {cols} columns: the call's values are finite and not all zero"
+                );
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "{order:?} {cols} columns: located against contiguous"
+                );
+                for (j, (xc, list)) in xs.iter().zip(&lists).enumerate() {
+                    assert_eq!(
+                        bits(&got[j * EMBD..(j + 1) * EMBD]),
+                        bits(&transcription_relu2(&f, xc, list)),
+                        "{order:?} {cols} columns: column {j} against the relu² leg on the source matrices"
                     );
                 }
             }

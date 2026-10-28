@@ -219,6 +219,7 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::Program::attn_out")?;
         let lc = layer_ctx(self.c, l)?;
         dispatch::attn_out(&lc, g, self.s, l.m)
     }
@@ -237,6 +238,7 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::Program::delta_out")?;
         let lc = layer_ctx(self.c, l)?;
         delta::delta_out(&lc, d, self.s, l.m)
     }
@@ -250,6 +252,7 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
     /// [`Tail`] names ([`Tail::last_out`]), and the decode step's tap of
     /// the layer's output ([`Tail::tap`]).
     fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        l.plain_only("qwen3moe::Program::experts")?;
         let lc = layer_ctx(self.c, l)?;
         let out = if l.last { self.tail.last_out() } else { None };
         dispatch::experts(&lc, f, self.s, l.m, out)?;

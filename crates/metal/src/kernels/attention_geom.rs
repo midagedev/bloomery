@@ -68,6 +68,20 @@ pub const fn qg_stride(inst: &Instance) -> usize {
 /// build's host instance's. Callers left: the kernel gate.
 pub const QG_STRIDE: usize = qg_stride(&HOST);
 
+/// Whether the flash of `inst` cuts a window a launch names: its shape-table
+/// row does.
+#[must_use]
+pub const fn windowed(inst: &Instance) -> bool {
+    inst.key.attn.row.window
+}
+
+/// Whether the layers of `inst` gate their output with one value a query
+/// head, from a projection of their own, in a buffer the launch binds.
+#[must_use]
+pub const fn head_gate(inst: &Instance) -> bool {
+    inst.key.attn.head_gate
+}
+
 /// The live-key ceiling one segment holds. At or under it the flash is one
 /// dispatch that finishes in its epilogue; past it the segment rule splits
 /// the keys and the flash's last threadgroup folds the partials (the count
@@ -196,10 +210,10 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
             "an even count of at most 64, or the whole head",
         );
     }
-    // The shape table's row that cuts a window, folds sinks or multiplies the
-    // value rows is a layer that asks for one: the flash attends every
-    // position and appends the values as they are.
-    if row.window || row.sinks || row.value_scale {
+    // The shape table's row that folds sinks or multiplies the value rows is
+    // a layer that asks for one: the flash folds no sinks and appends the
+    // values as they are. A window is the launch's word.
+    if row.sinks || row.value_scale {
         return refuse(
             "flash row",
             &format_args!(
@@ -208,7 +222,15 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
                 yes_no(row.sinks),
                 yes_no(row.value_scale)
             ),
-            "a row with no window, no sinks and no value multiplier",
+            "a row with no sinks and no value multiplier",
+        );
+    }
+    // The gate is packed in the query or one value a head, not both.
+    if a.gated && a.head_gate {
+        return refuse(
+            "output gate",
+            &"packed in the query and per head",
+            "packed in the query or per head",
         );
     }
     Ok(())
@@ -220,6 +242,15 @@ const _: () = {
     // A prefill tile's row stride keeps the head's 8-value alignment.
     assert!(PREFILL_PAD.is_multiple_of(8));
 };
+
+/// Segments the keys a layer attends take: [`segments_for_keys`] of the last
+/// `window` of its `n_keys` live keys, or of all of them with no window. A
+/// segment the rule does not count holds no key of the window and is never
+/// launched.
+#[must_use]
+pub fn segments_for_window(n_keys: u32, window: Option<u32>) -> u32 {
+    segments_for_keys(window.map_or(n_keys, |w| n_keys.min(w)))
+}
 
 /// Segments a live key count takes.
 ///
@@ -332,6 +363,61 @@ mod tests {
         let many = Geometry::of(&shaped(128, 16));
         let refused = holds(&many).expect_err("128 query heads");
         assert_eq!((refused.kernel, refused.axis), ("attention", "query heads"));
+    }
+
+    #[test]
+    fn the_flash_takes_group_four_at_head_128_with_a_window_and_a_head_gate() {
+        let g = Geometry::of(&crate::instance::LFM3_ATTN);
+        assert_eq!(holds(&g), Ok(()));
+        let a = g.attn;
+        assert_eq!(
+            (a.head, a.rot, a.query_heads, a.kv_heads, a.gqa),
+            (128, 128, 16, 4, 4)
+        );
+        assert_eq!((a.simd_groups, a.flash_threads, a.lane_dims), (4, 128, 4));
+        assert!(a.windowed && a.head_gate && !a.gated);
+        assert_eq!(a.qg_stride, a.head, "a head gate adds nothing to the query");
+        // The fold's threads hold every value of every head.
+        assert_eq!(
+            a.query_heads * a.head,
+            a.flash_threads * (a.head * a.kv_heads / SIMD_WIDTH)
+        );
+        // A whole head turns: thread t of each of the two warps owns the
+        // pair (t, t + 64).
+        assert_eq!(a.rot, a.head);
+    }
+
+    #[test]
+    fn a_window_is_the_launchs_and_sinks_and_two_gates_are_refused_by_name() {
+        let mut inst = crate::instance::LFM3_ATTN;
+        inst.key.attn.row.sinks = true;
+        let refused = holds(&Geometry::of(&inst)).expect_err("a row with sinks");
+        assert_eq!((refused.kernel, refused.axis), ("attention", "flash row"));
+        assert!(refused.value.starts_with("window yes, sinks yes"));
+        let mut inst = crate::instance::LFM3_ATTN;
+        inst.key.attn.q_gate = true;
+        let refused = holds(&Geometry::of(&inst)).expect_err("both gates");
+        assert_eq!((refused.kernel, refused.axis), ("attention", "output gate"));
+    }
+
+    #[test]
+    fn a_window_takes_the_segments_of_its_own_keys() {
+        for (n_keys, window, want) in [
+            (300u32, Some(256u32), 8u32),
+            (1025, Some(256), 8),
+            (5000, Some(256), 8),
+            (1025, None, 33),
+            (100, Some(256), 7),
+            (300, Some(4096), 10),
+            (1025, Some(1), 1),
+            (64, Some(64), 1),
+        ] {
+            assert_eq!(
+                segments_for_window(n_keys, window),
+                want,
+                "{n_keys} keys, window {window:?}"
+            );
+        }
     }
 
     #[test]

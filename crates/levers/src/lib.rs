@@ -1923,6 +1923,43 @@ pub enum Room {
     Short(RoomShort),
 }
 
+/// The pinned count a word of `target` pinned experts and `spares` free slots
+/// a layer runs at on a plan whose fewest card experts a layer is `fewest`:
+/// its target where a layer leaves it the spares and one that moves, else
+/// half the fewest, the share the Qwen3.8 rule derives, never under
+/// [`RESIDENCY_MIN_P`] nor past the ceiling; `None` where the card slots hold
+/// neither. [`room_for`]'s card side, which [`residency_least_fewest`] reads
+/// too.
+fn card_p(target: usize, spares: usize, fewest: usize) -> Option<usize> {
+    let ceiling = card_ceiling(fewest, spares);
+    if target as isize <= ceiling {
+        return Some(target);
+    }
+    let half = fewest / 2;
+    (half >= RESIDENCY_MIN_P && half as isize <= ceiling).then_some(half)
+}
+
+/// The most pinned experts a layer of `fewest` card experts holds beside
+/// `spares` free slots and one that moves; negative where it holds none.
+fn card_ceiling(fewest: usize, spares: usize) -> isize {
+    (fewest as isize)
+        .saturating_sub(spares as isize)
+        .saturating_sub(1)
+}
+
+/// The least fewest card experts a layer at which a word of `target` pinned
+/// experts and `spares` free slots a layer runs on the card side of
+/// [`room_for`]: below it a plan's room is [`RoomShort::NoRoom`], at it and
+/// above the card slots hold the word. A context that leaves the card fewer
+/// experts a layer than this runs no residency, so the context's own fit asks
+/// it of its plan.
+fn residency_least_fewest(target: usize, spares: usize) -> usize {
+    let holds = target.saturating_add(spares).saturating_add(1);
+    (1..=holds)
+        .find(|&fewest| card_p(target, spares, fewest).is_some())
+        .unwrap_or(holds)
+}
+
 /// The room a plan leaves a family's target residency word: `target` the
 /// word's pinned experts, `spares` its free slots a layer, `card_experts`
 /// the plan's card experts a layer (a layer holding none left out),
@@ -1958,23 +1995,11 @@ pub fn room_for<E>(
         return Ok(Room::Short(RoomShort::NoCardExperts));
     };
     let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
-    // The card side: a layer holds the word's P pinned, its spares and one
-    // that moves, so the plan's fewest layer leaves P at most fewest −
-    // spares − 1.
-    let ceiling = (fewest as isize)
-        .saturating_sub(spares as isize)
-        .saturating_sub(1);
-    // The word's P: its target where the card side holds it, else half the
-    // fewest, the share the Qwen3.8 rule derives — under the floor not at
-    // all, and past the ceiling no more than the target was.
-    let p = if target as isize <= ceiling {
-        target
-    } else {
-        let half = fewest / 2;
-        if half < RESIDENCY_MIN_P || half as isize > ceiling {
-            return Ok(Room::Short(RoomShort::NoRoom { fewest }));
-        }
-        half
+    // The card side: the word's P ([`card_p`]), at most the ceiling the
+    // fewest layer leaves.
+    let ceiling = card_ceiling(fewest, spares);
+    let Some(p) = card_p(target, spares, fewest) else {
+        return Ok(Room::Short(RoomShort::NoRoom { fewest }));
     };
     // The host side at P: the churn pool there fits the plan's host headroom
     // and what the host's room leaves past the plan's own host need.
@@ -2118,6 +2143,35 @@ pub fn residency_beside_paged_planes(pick: ResidencyPick, pages_planes: bool) ->
 
 /// The slots a layer the Qwen3.8 unset word frees for flips in flight.
 pub const RESIDENCY38_SPARES: usize = 1;
+
+/// The pinned experts a layer the Qwen3.8 unset word asks for before the
+/// plan's room moves it ([`residency38_at_plan`]): none.
+const RESIDENCY38_PINNED: usize = 0;
+
+/// The fewest card experts a layer a plan holds for the Qwen3.8 unset word
+/// to run the machine at all (the least fewest [`room_for`] holds its target
+/// and spares at): the count a context's fit leaves the card its experts for,
+/// since a plan under it resolves `off` ([`Residency38Why::NoRoom`]).
+#[must_use]
+pub fn residency38_least_fewest() -> u64 {
+    let least = residency_least_fewest(RESIDENCY38_PINNED, RESIDENCY38_SPARES);
+    u64::try_from(least).unwrap_or(u64::MAX)
+}
+
+/// The fewest card experts a layer a plan holds for a set `mid` word to run
+/// as asked: its `pinned` experts, its `spares` and one that moves (the card
+/// side of [`room_for`] at the word's own P, which a set word does not trade
+/// for half the fewest); `None` for `off` and for a value the grammar does
+/// not take ([`residency_word`]).
+#[must_use]
+pub fn residency_word_least_fewest(word: &str) -> Option<u64> {
+    match residency_word(word)? {
+        ResidencyWord::Mid { pinned, spares, .. } => {
+            u64::try_from(pinned.saturating_add(spares).saturating_add(1)).ok()
+        }
+        ResidencyWord::Off => None,
+    }
+}
 
 /// What decides [`RESIDENCY`] unset in `generate_qwen3moe` before any plan:
 /// the file and the run's flags ([`residency38_unset`]).
@@ -2320,7 +2374,7 @@ pub fn residency38_at_plan<E>(
     Ok(
         match room_for(
             carry.takes(false),
-            0,
+            RESIDENCY38_PINNED,
             RESIDENCY38_SPARES,
             layers,
             pool_bytes,

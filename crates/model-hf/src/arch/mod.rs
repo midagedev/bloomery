@@ -7,6 +7,7 @@ use serde_json::Value as Json;
 use crate::folder::{self, FolderMap};
 
 pub mod glm5next;
+pub mod lfm3;
 pub mod minimaxm3;
 pub mod nemotron_h;
 pub mod qwen35moe;
@@ -34,6 +35,10 @@ pub const MAPS: &[MapRow] = &[
     MapRow {
         model_types: <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<qwen3moe::Checkpoint>,
+    },
+    MapRow {
+        model_types: <lfm3::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<lfm3::Checkpoint>,
     },
 ];
 

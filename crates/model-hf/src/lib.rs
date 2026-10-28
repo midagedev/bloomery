@@ -55,6 +55,7 @@ mod test_support {
             Value::U32(x) => json!(["U32", x]),
             Value::F32(x) => json!(["F32", f64::from(*x)]),
             Value::String(s) => json!(["STR", s]),
+            Value::Bool(b) => json!(["BOOL", b]),
             Value::Array(a) => {
                 let (tag, items): (&str, Vec<Json>) = match a.first() {
                     Some(Value::I32(_)) => (
@@ -62,6 +63,15 @@ mod test_support {
                         a.iter()
                             .map(|x| match x {
                                 Value::I32(i) => json!(i),
+                                _ => unreachable!(),
+                            })
+                            .collect(),
+                    ),
+                    Some(Value::Bool(_)) => (
+                        "BOOL",
+                        a.iter()
+                            .map(|x| match x {
+                                Value::Bool(b) => json!(b),
                                 _ => unreachable!(),
                             })
                             .collect(),
@@ -169,15 +179,16 @@ mod test_support {
     /// The byte-level BPE tokenizer `tokenizer.json` of eight ids, its one special token `</s>`
     /// id 2, with the pre-tokenizer row `pre` of `hf::vocab::PRE`.
     pub(crate) fn tokenizer(pre: &str) -> Json {
-        let (_, row) = hf::vocab::PRE
+        let (_, row, ignore_merges) = hf::vocab::PRE
             .iter()
-            .find(|(name, _)| *name == pre)
+            .find(|(name, _, _)| *name == pre)
             .unwrap_or_else(|| panic!("no pre-tokenizer row {pre}"));
         let pre_tokenizer: Json = serde_json::from_str(row).unwrap();
         json!({"normalizer":{"type":"NFC"},"pre_tokenizer":pre_tokenizer,
             "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
             "post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
-            "model":{"type":"BPE","vocab":{"A":0,"a":1,"Aa":7},"merges":[["A","a"]]},
+            "model":{"type":"BPE","vocab":{"A":0,"a":1,"Aa":7},"merges":[["A","a"]],
+                "ignore_merges":ignore_merges},
             "added_tokens":[{"id":2,"content":"</s>","special":true}]})
     }
 

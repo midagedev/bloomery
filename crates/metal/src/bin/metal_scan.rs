@@ -564,7 +564,7 @@ kernel void bloomery_scan_calibration(device float * x [[buffer(0)]], uint i [[t
                 .to_string(),
         );
         head("gpu", device.metal().name().to_string());
-        head("architecture", units.architecture.clone());
+        head("architecture", units.architecture);
         // The languages and options `Library::source_of` compiles with.
         head("language_version", "main=3.2 tensor=4.0".to_string());
         head(

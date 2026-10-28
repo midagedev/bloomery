@@ -48,7 +48,7 @@ const ROOT: &Fields = &[
     ("text_config", Read),
     ("quantization_config", Read),
     // The map needs a separate lm_head.
-    ("tie_word_embeddings", Only("[false]")),
+    super::trunk::HEAD_OWN,
     // A reward head would be tensors the map does not read.
     ("num_reward_heads", Only("[0]")),
     (
@@ -115,7 +115,7 @@ const TEXT_CONFIG: &Fields = &[
     // The router scores by sigmoid and adds the stored selection bias to choose.
     ("scoring_func", Need(r#"["sigmoid"]"#)),
     ("use_routing_bias", Need("[true]")),
-    ("tie_word_embeddings", Only("[false]")),
+    super::trunk::HEAD_OWN,
     // The folder carries no next-token layers, and the program reads none.
     ("use_mtp", Only("[false]")),
     ("num_mtp_modules", Only("[0]")),

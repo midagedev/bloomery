@@ -16,19 +16,24 @@
 //! weight 1 ([`FfnRoute::Dense`]): the routed FFN's launches without the
 //! router. A dense Llama's layers are [`MixerPlan::Gqa`] at head 128 turned
 //! by NORM pairs with no head norm ([`GqaKind::Head128`]), each followed by
-//! the same dense FFN. A layer's kind comes from its [`LayerSpec`] — the
-//! file's tensors, cross-checked with its interval key by the reader — never
-//! from the layer's number.
+//! the same dense FFN. LFM3 interleaves [`MixerPlan::ShortConv`] (a gated
+//! short conv over its own conv ring) with attention of head 128 that has an
+//! output gate of one value a head ([`GqaKind::HeadGate128`]), a window on
+//! some layers and the file's rope frequency factors on the others, each
+//! followed by the dense FFN; every half's output joins the stream through the
+//! layer's sandwich norm ([`ResidualPlan::Sandwich`]). A layer's kind comes
+//! from its [`LayerSpec`] — the file's tensors, cross-checked with its
+//! interval key by the reader — never from the layer's number.
 
 use super::router::RouterDims;
 use crate::ChainError;
-use crate::linear::{self, LinearShape};
+use crate::linear::{self, LinearShape, Ring};
 pub use model::arch::coverage::{DownEntry, GateUpEntry};
 use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_shared, turns_as_neox};
 use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
 use model::arch::models::{
     Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, OutGate,
-    RopeMode,
+    Residual, RopeMode, ShortConv,
 };
 
 pub use crate::site::SiteTy;
@@ -37,6 +42,15 @@ pub use crate::site::SiteTy;
 pub struct LayerPlan {
     pub mixer: MixerPlan,
     pub ffn: FfnPlan,
+    /// How each half's output joins the residual stream. The walk has no op for the join: the op
+    /// that ends each half ([`ChainOps::attn_out`], `delta_out`, `conv_out` for the mixer,
+    /// [`ChainOps::experts`] for the FFN) reads this and joins its output itself, and a backend
+    /// that cannot run a sandwich refuses it by name inside that op ([`LayerCtx::plain_only`]).
+    ///
+    /// [`ChainOps::attn_out`]: super::ops::ChainOps::attn_out
+    /// [`ChainOps::experts`]: super::ops::ChainOps::experts
+    /// [`LayerCtx::plain_only`]: super::ops::LayerCtx::plain_only
+    pub residual: ResidualPlan,
 }
 
 /// What a layer mixes its tokens with.
@@ -45,6 +59,27 @@ pub enum MixerPlan {
     Gqa(GqaPlan),
     /// The gated delta rule over the layer's recurrent state and conv ring.
     Delta(DeltaPlan),
+    /// The gated short conv over the layer's conv ring.
+    ShortConv(ShortConvPlan),
+}
+
+/// How a layer's two halves, its mixer and its FFN, join the residual stream.
+pub enum ResidualPlan {
+    /// The half's output is added to the stream: `x += out`.
+    Plain,
+    /// The half's output goes through its own weighted RMS norm first.
+    Sandwich(SandwichPlan),
+}
+
+/// A layer's sandwich norms: `x += add[i] · gain[i] ⊙ rms_norm(out)`, the mixer at index 0 and the
+/// FFN at index 1, the gain the file's own weight (plain `w · x̂`).
+pub struct SandwichPlan {
+    /// The norm's epsilon, inside the root.
+    pub eps: f32,
+    /// The scale each half's normed output is added at.
+    pub add: [f32; 2],
+    /// The norms' weights, mixer then FFN: `post_attention_norm`, `post_ffw_norm`.
+    pub norms: [String; 2],
 }
 
 /// The attention geometries a kernel set is built for.
@@ -60,6 +95,13 @@ pub enum GqaKind {
     /// whole head turned by `pairs`: the q/k norm before the rope when
     /// `head_norm`, none otherwise. [`GqaKind::Neox128`] is `{ Neox, true }`.
     Head128 { pairs: Pairs, head_norm: bool },
+    /// LFM3: a head of 128 values, the whole head turned by NEOX, the q/k norm before the
+    /// rope, and an output gate of its own: `attn_gate` projects the layer input to one value
+    /// a query head, and the flash output of a head is multiplied by the sigmoid of its value
+    /// ([`GqaPlan::gate`]). A layer attends the last `window` positions or every one
+    /// ([`GqaPlan::window`]), and its rope divides by the file's frequency factors or does not
+    /// ([`GqaPlan::rope_freqs`]).
+    HeadGate128,
 }
 
 impl GqaKind {
@@ -68,9 +110,16 @@ impl GqaKind {
     #[must_use]
     pub fn head_norm(self) -> bool {
         match self {
-            GqaKind::Neox128 | GqaKind::Gated256 => true,
+            GqaKind::Neox128 | GqaKind::Gated256 | GqaKind::HeadGate128 => true,
             GqaKind::Head128 { head_norm, .. } => head_norm,
         }
+    }
+
+    /// Whether the kind gates the flash output by a projection of its own (`attn_gate`, one
+    /// value a query head) and so reads the description's window and rope factors per layer.
+    #[must_use]
+    pub fn head_gate(self) -> bool {
+        matches!(self, GqaKind::HeadGate128)
     }
 }
 
@@ -87,7 +136,7 @@ impl GqaKind {
     /// Every class with the geometry that selects it: a head's width, the
     /// values of it the rope turns and how it pairs them, the head norm, and
     /// where the output gate comes from.
-    const CLASSES: [Class; 3] = [
+    const CLASSES: [Class; 4] = [
         Class {
             kind: GqaKind::Neox128,
             head: HEAD_128,
@@ -115,6 +164,14 @@ impl GqaKind {
             head_norm: true,
             gate: OutGate::Packed,
         },
+        Class {
+            kind: GqaKind::HeadGate128,
+            head: HEAD_128,
+            rope: HEAD_128,
+            pairs: Pairs::Neox,
+            head_norm: true,
+            gate: OutGate::ProjHead,
+        },
     ];
 }
 
@@ -137,8 +194,9 @@ struct Class {
 /// the shape table's row (`models::shape::GQA`) the layer selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flash {
-    /// One block of eight query heads a key head (the `_256` entries; and
-    /// the head-128 entries' only form).
+    /// One block of a key head's whole group: eight query heads (the `_256`
+    /// entries, and the head-128 entries' only form), or four on the
+    /// head-gated head-128 window flash (the `_g4` entries).
     Group,
     /// Blocks of four query heads, `group / 4` a key head (the `_256_p4`
     /// entries): the scalar and the tensor-core segment pass.
@@ -168,6 +226,45 @@ pub struct GqaPlan {
     pub k_ty: SiteTy,
     pub v_ty: SiteTy,
     pub o_ty: SiteTy,
+    /// The positions the layer attends: the keys `[max(0, p − w + 1), p]` of position `p`, its
+    /// own among them; `None`: every position. Only a kind with its own gate
+    /// ([`GqaKind::head_gate`]) has one.
+    pub window: Option<u32>,
+    /// The output gate's own projection, on a kind that has one ([`GqaKind::head_gate`]).
+    pub gate: Option<HeadGate>,
+    /// The file's rope frequency factors (`rope_freqs.weight`, F32, one a pair of the rope's
+    /// values), on a layer whose rope divides by them; a backend reads the values at load
+    /// (`RopeSpec::with_factors`). Only a kind with its own gate has them.
+    pub rope_freqs: Option<String>,
+}
+
+/// An attention layer's output gate of its own: `attn_gate`, which projects the layer input to
+/// one value a query head.
+pub struct HeadGate {
+    pub name: String,
+    /// The file's type of the projection: which launch it takes is a backend's, from the type.
+    pub ty: SiteTy,
+}
+
+/// A gated short-conv layer's names, types and geometry: `in_proj` writes three chunks of
+/// `hidden` values a token, `B | C | x`, and the layer's mixing is `C ⊙ conv(B ⊙ x)` over the
+/// conv ring, then `out_proj` back to the residual.
+pub struct ShortConvPlan {
+    /// The mixer's pre-norm.
+    pub attn_norm: String,
+    /// The input projection, `3 · hidden` rows (`shortconv.in_proj`).
+    pub conv_in: String,
+    /// The conv's filters, `[hidden][taps]` F32, the oldest tap first (`shortconv.conv`).
+    pub conv: String,
+    /// The output projection (`shortconv.out_proj`).
+    pub conv_out: String,
+    /// Values of the residual stream: the conv's channels.
+    pub hidden: usize,
+    /// The layer's conv ring; the conv's taps are [`Ring::taps`].
+    pub ring: Ring,
+    /// The file's types of `shortconv.in_proj` and `shortconv.out_proj`.
+    pub in_ty: SiteTy,
+    pub out_ty: SiteTy,
 }
 
 /// A gated-delta-rule layer's names, types and head counts.
@@ -256,7 +353,7 @@ pub struct SharedSites {
 }
 
 impl LayerPlan {
-    /// The GQA plan, or a named refusal for a delta layer: what a path that
+    /// The GQA plan, or a named refusal for a delta or short-conv layer: what a path that
     /// runs attention only (qwen3moe's ubatch) takes.
     pub fn gqa(&self, what: &'static str, l: usize) -> Result<&GqaPlan, ChainError> {
         match &self.mixer {
@@ -264,6 +361,10 @@ impl LayerPlan {
             MixerPlan::Delta(_) => Err(ChainError::shape(
                 what,
                 format!("layer {l} is a delta-rule layer; this path runs attention layers only"),
+            )),
+            MixerPlan::ShortConv(_) => Err(ChainError::shape(
+                what,
+                format!("layer {l} is a short-conv layer; this path runs attention layers only"),
             )),
         }
     }
@@ -344,6 +445,8 @@ pub fn shared_entry(ty: SiteTy, what: &'static str) -> Result<SiteEntry, ChainEr
 pub enum Kind35 {
     Gqa(GqaKind, Flash),
     Delta(LinearShape),
+    /// A gated short conv; its conv ring holds the taps.
+    ShortConv(Ring),
 }
 
 /// The geometry the card's kernels are built for: query heads of 256 with
@@ -377,7 +480,8 @@ pub fn kind_of(s: &LayerSpec, l: usize) -> Result<Kind35, ChainError> {
             Kind35::Gqa(kind, flash)
         }
         Mixer::DeltaRule(d) => Kind35::Delta(delta_shape(d).map_err(refuse)?),
-        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::ShortConv(_) | Mixer::None) => {
+        Mixer::ShortConv(c) => Kind35::ShortConv(conv_ring(c).map_err(refuse)?),
+        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
             return Err(refuse(format!(
                 "{}, which no kernel here runs",
                 other.what()
@@ -423,6 +527,7 @@ pub fn kinds35(layers: &[LayerSpec]) -> Result<Vec<Kind35>, ChainError> {
 
 /// The attention kinds the card's instances run: [`GqaKind::Gated256`], and the head-128
 /// attention turned by NORM pairs with no head norm (the `_g7` and group-of-8 head-128 entries).
+/// A short-conv layer and [`GqaKind::HeadGate128`] are in no list the card's kernels run.
 const CARD_KINDS: [GqaKind; 2] = [
     GqaKind::Gated256,
     GqaKind::Head128 {
@@ -433,6 +538,21 @@ const CARD_KINDS: [GqaKind; 2] = [
 
 /// Why the card's instances do not run `s`, which [`kind_of`] reads.
 fn card_fits(s: &LayerSpec) -> Result<(), String> {
+    if !matches!(s.residual, Residual::Plain) {
+        return Err(format!(
+            "the residual {:?}; the card's ops join each half's output by the plain add",
+            s.residual
+        ));
+    }
+    if let Mixer::ShortConv(c) = &s.mixer {
+        return Err(format!(
+            "a short-conv mixer of {} taps; the card's kernels take the gated attention of heads \
+             of {} or heads of {HEAD_128} turned by NORM pairs with no head norm, and the delta \
+             rule",
+            c.taps,
+            q35::HEAD_DIM
+        ));
+    }
     if let Mixer::Gqa(g) = &s.mixer
         && !CARD_KINDS.contains(&gqa_class(g)?)
     {
@@ -454,16 +574,16 @@ pub const HEAD_128: u32 = 128;
 
 /// The attention class `g`'s geometry selects, or why none does: the class
 /// table's row ([`GqaKind::CLASSES`]) of its head width, the values the rope
-/// turns, how it pairs them, its head norm and its output gate, with no yarn or rope
-/// factors, output norm, key selection, window, sinks or value scale.
+/// turns, how it pairs them, its head norm and its output gate, with no yarn, output norm,
+/// key selection, sinks or value scale, and a window or rope factors only where the class
+/// keeps them per layer ([`GqaKind::head_gate`]).
 pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
     let plain = g.rope.yarn.is_none()
-        && !g.rope.factors
         && !g.o_norm
         && g.select.is_none()
-        && g.window.is_none()
         && !g.sinks
         && g.value_scale.is_none();
+    let fixed = g.window.is_none() && !g.rope.factors;
     let pairs = if turns_as_neox(g.rope.mode, g.rope.dims) {
         Some(Pairs::Neox)
     } else if g.rope.mode == RopeMode::NormTail {
@@ -482,7 +602,7 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
         })
         .map(|c| c.kind);
     match class {
-        Some(kind) if plain => Ok(kind),
+        Some(kind) if plain && (kind.head_gate() || fixed) => Ok(kind),
         _ => {
             let classes: Vec<String> = GqaKind::CLASSES
                 .iter()
@@ -496,18 +616,19 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
                 .collect();
             Err(format!(
                 "attention {g:?}; the kernels take {} (NEOX by IMROPE sections covering them), \
-                 with no rope factors, output norm, key selection, window, sinks or value scale",
+                 with no yarn, output norm, key selection, sinks or value scale, and a window or \
+                 rope factors only on the head with an output gate of its own",
                 classes.join(" or ")
             ))
         }
     }
 }
 
-/// The attention class of layer `s`, which a plan reads as attention: the class its geometry
+/// The attention of layer `s`, which a plan reads as attention, with the class its geometry
 /// selects ([`gqa_class`]), or why `s` is no attention layer.
-pub(crate) fn layer_class(s: &LayerSpec) -> Result<GqaKind, String> {
+pub(crate) fn layer_gqa(s: &LayerSpec) -> Result<(&Gqa, GqaKind), String> {
     match &s.mixer {
-        Mixer::Gqa(g) => gqa_class(g),
+        Mixer::Gqa(g) => Ok((g, gqa_class(g)?)),
         other => Err(format!(
             "the plan reads attention; the description's mixer is {}",
             other.what()
@@ -517,7 +638,8 @@ pub(crate) fn layer_class(s: &LayerSpec) -> Result<GqaKind, String> {
 
 /// The class and the flash of `g` when it is an attention the kernels run:
 /// the shape table's row for its group ([`select_gqa`]), one of eight, of
-/// quads or pairs, or the head-128 group of seven.
+/// quads or pairs, the head-128 group of seven, or the head-gated head-128
+/// group of four.
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
     let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
@@ -526,6 +648,7 @@ fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
         (_, 4, GroupRule::Packs) => Flash::Quads,
         (_, 2, GroupRule::Packs) => Flash::Pairs,
         (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
+        (GqaKind::HeadGate128, 4, GroupRule::One) => Flash::Group,
         _ => {
             return Err(format!(
                 "attention {}/{} heads of {} selects {}, which this body does not launch",
@@ -549,6 +672,14 @@ fn dense_fits(ff: u32, act: Act) -> Result<(), String> {
             q35::SUPER_BLOCK
         ))
     }
+}
+
+/// The conv ring of a short conv of `c`, or why none exists: a conv of no tap has no ring.
+fn conv_ring(c: &ShortConv) -> Result<Ring, String> {
+    if c.taps == 0 {
+        return Err("a short conv of no tap".to_string());
+    }
+    Ok(Ring::new(c.taps as usize))
 }
 
 /// The delta kernels' launch shape of `d`, or why they do not run it.
@@ -637,13 +768,14 @@ fn moe_router(m: &Moe) -> Result<RouterDims, String> {
     }
 }
 
-/// The descriptions the chain's tests read: Qwen3.6's layers and Qwen3-30B-A3B's.
+/// The descriptions the chain's tests read: Qwen3.6's layers, Qwen3-30B-A3B's and LFM3's.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::q35;
     use model::arch::models::{
         Act, Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer,
         ModelSpec, Moe, OutGate, Residual, Rope, RopeMode, Router, RouterNorm, Score, Shared,
+        ShortConv,
     };
 
     /// Qwen3.6's 16/2 heads.
@@ -755,6 +887,53 @@ pub(crate) mod fixtures {
         l
     }
 
+    /// LFM3's attention: 16/2 heads of 128 (a group of eight, a row the shape table has), the whole
+    /// head turned by NEOX, q/k norms and a gate of one value a head; `window` the positions it
+    /// attends and `factors` whether its rope divides by the file's table.
+    pub fn lfm3_gqa(window: Option<u32>, factors: bool) -> Gqa {
+        Gqa {
+            heads: 16,
+            kv_heads: 4,
+            head_dim: 128,
+            value_dim: 128,
+            rope: Rope {
+                mode: RopeMode::Neox,
+                dims: 128,
+                base: if window.is_some() { 1e4 } else { 1e6 },
+                yarn: None,
+                factors,
+            },
+            qk_norm: true,
+            o_norm: false,
+            out_gate: OutGate::ProjHead,
+            select: None,
+            window,
+            sinks: false,
+            value_scale: None,
+        }
+    }
+
+    /// LFM3's short conv of `taps` taps.
+    pub fn lfm3_conv(taps: u32) -> Mixer {
+        Mixer::ShortConv(ShortConv { taps })
+    }
+
+    /// An LFM3 layer: `mixer`, a dense SwiGLU FFN of 512 and the sandwich residual at 1e-5.
+    pub fn lfm3_layer(mixer: Mixer) -> LayerSpec {
+        LayerSpec {
+            mixer,
+            ffn: Ffn::Dense {
+                ff: 512,
+                act: Act::SwiGlu { limit: None },
+            },
+            residual: Residual::Sandwich {
+                eps: 1e-5,
+                add: [1.0, 1.0],
+            },
+            extras: Vec::new(),
+        }
+    }
+
     /// A description of `layers` over `hidden` values a residual row.
     pub fn spec(layers: Vec<LayerSpec>, hidden: u32) -> ModelSpec {
         ModelSpec {
@@ -781,14 +960,16 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{delta, gqa, gqa_of, layer, q30_gqa, q30_layer};
+    use super::fixtures::{
+        delta, gqa, gqa_of, layer, lfm3_conv, lfm3_gqa, lfm3_layer, q30_gqa, q30_layer,
+    };
     use super::{
         Flash, GqaKind, Kind35, Pairs, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits,
     };
-    use crate::linear::{KHeadMap as LinearMap, LinearShape};
+    use crate::linear::{KHeadMap as LinearMap, LinearShape, Ring};
     use model::arch::models::{
-        Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, OutGate, Rope,
-        RopeMode, Shared,
+        Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, OutGate,
+        Residual, Rope, RopeMode, Shared,
     };
 
     /// The plan's kinds follow the description layer by layer, wherever its
@@ -1114,5 +1295,89 @@ mod tests {
             panic!("a routed layer")
         };
         assert!(moe_fits(m, "t").is_ok());
+    }
+
+    /// LFM3's layers read by their geometry: a short conv is its ring (seven taps keep the reach
+    /// of six and a pass of eight, fourteen slots), and attention of head 128 with a gate of one
+    /// value a head is one kind on a full layer, whose rope has the file's factors, and on a
+    /// sliding one, which has a window.
+    #[test]
+    fn an_lfm3_layer_reads_as_its_kind() {
+        let layers = [
+            lfm3_layer(lfm3_conv(7)),
+            lfm3_layer(Mixer::Gqa(lfm3_gqa(None, true))),
+            lfm3_layer(Mixer::Gqa(lfm3_gqa(Some(1024), false))),
+        ];
+        let got = kinds_of(&layers).unwrap_or_else(|e| panic!("{e}"));
+        let head_gate = Kind35::Gqa(GqaKind::HeadGate128, Flash::Group);
+        assert_eq!(got, [Kind35::ShortConv(Ring::new(7)), head_gate, head_gate]);
+        let Kind35::ShortConv(ring) = got[0] else {
+            panic!("{:?}", got[0])
+        };
+        assert_eq!((ring.taps(), ring.rows()), (7, 14));
+        assert!(GqaKind::HeadGate128.head_gate() && GqaKind::HeadGate128.head_norm());
+        assert!(!GqaKind::Neox128.head_gate() && !GqaKind::Gated256.head_gate());
+    }
+
+    /// The head with a gate of its own is the one class that keeps a window and rope factors per
+    /// layer; what else it does not take is refused by name with the layer: no q/k norm, a gate
+    /// of one value a channel, a rope over part of the head or NORM pairs, an output norm, sinks
+    /// and a value scale. A short conv of no tap has no ring.
+    #[test]
+    fn what_the_head_gate_class_does_not_take_is_refused_by_name() {
+        type Misfit<'a> = (&'a str, &'a dyn Fn(&mut Gqa));
+        let misfits: [Misfit; 7] = [
+            ("no q/k norm", &|g: &mut Gqa| g.qk_norm = false),
+            ("a gate a channel", &|g: &mut Gqa| {
+                g.out_gate = OutGate::Proj
+            }),
+            ("a rope over 64 values", &|g: &mut Gqa| g.rope.dims = 64),
+            ("NORM pairs", &|g: &mut Gqa| {
+                g.rope.mode = RopeMode::NormTail
+            }),
+            ("an output norm", &|g: &mut Gqa| g.o_norm = true),
+            ("sinks", &|g: &mut Gqa| g.sinks = true),
+            ("a value scale", &|g: &mut Gqa| g.value_scale = Some(2.0)),
+        ];
+        for (what, edit) in misfits {
+            let mut g = lfm3_gqa(Some(1024), true);
+            edit(&mut g);
+            let layers = [lfm3_layer(lfm3_conv(7)), lfm3_layer(Mixer::Gqa(g))];
+            match kinds_of(&layers) {
+                Err(e) => assert!(e.to_string().contains("layer 1:"), "{what}: {e}"),
+                Ok(k) => panic!("{what} accepted: {k:?}"),
+            }
+        }
+        match kind_of(&lfm3_layer(lfm3_conv(0)), 4) {
+            Err(e) => assert!(
+                e.to_string().contains("layer 4:") && e.to_string().contains("no tap"),
+                "{e}"
+            ),
+            Ok(k) => panic!("a conv of no tap accepted: {k:?}"),
+        }
+    }
+
+    /// The card's kernels run neither a short conv, nor the head with a gate of its own, nor a
+    /// residual that is not the plain add, so the card's entry points refuse each by name with the
+    /// layer while the chain's read them.
+    #[test]
+    fn the_card_refuses_the_lfm3_layers_the_chain_reads() {
+        let gqa_layer = lfm3_layer(Mixer::Gqa(lfm3_gqa(None, true)));
+        let mut sandwiched = layer(delta());
+        sandwiched.residual = Residual::Sandwich {
+            eps: 1e-5,
+            add: [1.0, 1.0],
+        };
+        for (what, l) in [
+            ("a short conv", lfm3_layer(lfm3_conv(7))),
+            ("the gated head", gqa_layer),
+            ("a sandwich residual", sandwiched),
+        ] {
+            assert!(kind_of(&l, 2).is_ok(), "{what}");
+            match kind35(&l, 2) {
+                Err(e) => assert!(e.to_string().contains("layer 2:"), "{what}: {e}"),
+                Ok(k) => panic!("{what}: the card accepted {k:?}"),
+            }
+        }
     }
 }

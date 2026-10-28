@@ -206,8 +206,9 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
     let (positions, source) = bounds.limit();
     choose(ask, slots, Limit { positions, source }, SEAT_STEPS, plan_at).map_err(|e| match e {
         AskError::Plan(e) => e.into(),
-        AskError::FloorShort { floor, .. } => Box::new(FloorShort {
+        AskError::FloorShort { floor, short, .. } => Box::new(FloorShort {
             floor,
+            short,
             text: e.to_string(),
         }),
         other => other.to_string().into(),
@@ -221,6 +222,8 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
 pub struct FloorShort {
     /// The least context the default asked.
     pub floor: u64,
+    /// The plan at `floor` and the memory it is short of.
+    pub short: placement::ctx_ask::Short,
     text: String,
 }
 
