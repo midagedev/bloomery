@@ -675,7 +675,12 @@ gguf 7 2 0
 # calls it over its own shared tiles, where the old bodies held a raw-pointer block each; the two no-sink merges
 # (`gqa_flash_merge_h128_swa_nosink`, `gqa_flash_merge_h128_swa_ring_nosink`) hold one block each over
 # `merge_sink_body`, each with its SAFETY line.
-gpu 2807 377 10
+# PIN(2026-10-29): gpu 2807 -> 2799 blocks, 377 -> 376 fns, two bodies merged, not old code relaxed: the head-128
+# segment pass is `seg_h128<G, RING>` alone (flash_gqa_h128_swa.rs), and `seg_h128_ring` (attention_h128_ring.rs) is
+# deleted with its unsafe fn and its 8 blocks (the count read, the neutral partial, the query stage, the key and value
+# stage, the shared stores, the score reads, the `fold_tile` call and the partial writes). The merged body holds the
+# plane body's blocks unchanged, and the four entries' calls are as before. Counted by tools/check-unsafe.sh.
+gpu 2799 376 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

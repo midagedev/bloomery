@@ -2,7 +2,7 @@
 //! query heads a key head (16 query heads over 4 key heads), with a window of
 //! 256 and with none, on a plane (`rows == ctx`) and on a ring (`rows < ctx`),
 //! through the binding's launch (`attention_h128::Kernels::enqueue_attention`),
-//! with no sink term.
+//! with no sink term: a group of four folds none.
 //!
 //! The flash is not bit-identical to an f64 softmax; it is held to the
 //! first-order band of `flash_band::scalar_bound` (the scalar pass's, the one
@@ -21,12 +21,14 @@
 //!   chunk that crosses a window edge or the ring's wrap; no fault word.
 //! - `flash_h128_group4_is_group8`: a group-of-four launch over `2 · n_kv` key
 //!   heads that hold one plane twice equals the group-of-eight launch over that
-//!   plane bit for bit, with and without sinks, on the plane and the ring: the
-//!   per-head arithmetic is the group's alone, so the block's head indexing is
-//!   the only thing that differs.
+//!   plane bit for bit, with no sinks, on the plane and the ring: the per-head
+//!   arithmetic is the group's alone, so the block's head indexing is the only
+//!   thing that differs.
 //! - `flash_h128_no_sink_term`: a launch with no sinks equals one whose sinks
-//!   are `-inf` (neutral), at both groups.
+//!   are `-inf` (neutral), at the group of eight.
 //! - `flash_h128_group_refusal`: a group other than eight and four is refused
+//!   by name on the plane and on the ring before any launch.
+//! - `flash_h128_group4_sinks_refusal`: a group of four with sinks is refused
 //!   by name on the plane and on the ring before any launch.
 
 #[cfg(feature = "gpu")]
@@ -345,12 +347,6 @@ mod gate {
         Ok(all)
     }
 
-    /// Per-head sinks of a launch of `n` heads: logits in the range the scores
-    /// span, so the sink moves the output.
-    fn sinks_of(n: usize) -> Vec<f32> {
-        (0..n).map(|h| 0.5 * h as f32 - 2.0).collect()
-    }
-
     /// The same plane `twice`: key head 0 then key head 1, for a launch of
     /// `2 · n_kv` key heads that holds one plane in both.
     fn twice(plane: &[u16]) -> Vec<u16> {
@@ -359,13 +355,12 @@ mod gate {
 
     /// `flash_h128_group4_is_group8`: eight query heads over one key head at a
     /// group of eight, and the same eight over a plane held twice at a group
-    /// of four. `sinks` runs both with the same per-head sinks.
-    fn group4_is_group8(gpu: &Gpu, kernels: &Kernels, sinks: bool) -> Result<bool, GateError> {
+    /// of four, both with no sinks.
+    fn group4_is_group8(gpu: &Gpu, kernels: &Kernels) -> Result<bool, GateError> {
         const HEADS: usize = 2 * GROUP_4;
         let mut all = true;
         for kind in &KINDS {
             let p = planes(1, kind.ctx, 19);
-            let sink_h = sinks_of(HEADS);
             let (mut ok, mut launches) = (true, 0usize);
             let mut starts: Vec<usize> = kind.starts.to_vec();
             starts.push(kind.rows - 1);
@@ -394,7 +389,7 @@ mod gate {
                             k,
                             v,
                             counts: &counts,
-                            sinks: sinks.then_some(sink_h.as_slice()),
+                            sinks: None,
                         },
                     )?;
                     if fault.is_some() {
@@ -415,8 +410,8 @@ mod gate {
                 launches += 1;
             }
             println!(
-                "flash_h128_group4_is_group8 {} sinks={sinks}: {launches} launches, 2 x 4 heads == 8 \
-                 heads bit for bit {}",
+                "flash_h128_group4_is_group8 {}: {launches} launches, 2 x 4 heads == 8 heads bit \
+                 for bit {}",
                 kind.name,
                 verdict(ok)
             );
@@ -426,68 +421,77 @@ mod gate {
     }
 
     /// `flash_h128_no_sink_term`: no sinks equals sinks of `-inf`, at the group
-    /// of four (16 heads over 4 key heads) and the group of eight (16 over 2).
+    /// of eight (16 heads over 2 key heads).
     fn no_sink_term(gpu: &Gpu, kernels: &Kernels) -> Result<bool, GateError> {
+        // PIN(2026-10-29): the group-of-four arm (16 heads over 4 key heads) is removed, because
+        // a group of four takes no sinks and its launch with `-inf` sinks is refused
+        // (`flash_h128_group4_sinks_refusal`). The merges that arm ran take `(n_head, m)` alone,
+        // so the group-of-eight arm runs the same entries over the same 16 heads, and
+        // `flash_h128_group4_is_group8` holds the no-sink walk of four equal to eight's.
+        const N_KV8: usize = N_KV / 2;
         let mut all = true;
         for kind in &KINDS {
-            for n_kv in [N_KV, N_KV / 2] {
-                let p = planes(n_kv, kind.ctx, 29);
-                let counts: Vec<u32> = (kind.ctx - SMALL_CHUNK + 1..=kind.ctx)
-                    .map(|n| n as u32)
-                    .collect();
-                let hi = kind.ctx;
-                let k = layout(&p.k, n_kv, kind.ctx, kind.rows, resident(hi, kind.rows));
-                let v = layout(&p.v, n_kv, kind.ctx, kind.rows, resident(hi, kind.rows));
-                let q = query(counts.len(), N_HEAD, 31);
-                let neg_inf = vec![f32::NEG_INFINITY; N_HEAD];
-                let run = |sinks: Option<&[f32]>| -> Result<Vec<f32>, GateError> {
-                    let (y, fault) = launch(
-                        gpu,
-                        kernels,
-                        &Case {
-                            n_kv,
-                            n_head: N_HEAD,
-                            ctx: kind.ctx,
-                            rows: kind.rows,
-                            window: kind.window,
-                            q: &q,
-                            k: &k,
-                            v: &v,
-                            counts: &counts,
-                            sinks,
-                        },
-                    )?;
-                    if fault.is_some() {
-                        return Err(format!("fault {fault:?}").into());
-                    }
-                    Ok(y)
-                };
-                let none = run(None)?;
-                let neutral = run(Some(&neg_inf))?;
-                // A neutral sink changes nothing but the sign of a zero.
-                let same = none.len() == neutral.len()
-                    && none.iter().zip(&neutral).all(|(a, b)| a == b)
-                    && none.iter().all(|x| x.is_finite());
-                println!(
-                    "flash_h128_no_sink_term {} group {}: no sinks == sinks -inf {}",
-                    kind.name,
-                    N_HEAD / n_kv,
-                    verdict(same)
-                );
-                all &= same;
-            }
+            let p = planes(N_KV8, kind.ctx, 29);
+            let counts: Vec<u32> = (kind.ctx - SMALL_CHUNK + 1..=kind.ctx)
+                .map(|n| n as u32)
+                .collect();
+            let hi = kind.ctx;
+            let k = layout(&p.k, N_KV8, kind.ctx, kind.rows, resident(hi, kind.rows));
+            let v = layout(&p.v, N_KV8, kind.ctx, kind.rows, resident(hi, kind.rows));
+            let q = query(counts.len(), N_HEAD, 31);
+            let neg_inf = vec![f32::NEG_INFINITY; N_HEAD];
+            let run = |sinks: Option<&[f32]>| -> Result<Vec<f32>, GateError> {
+                let (y, fault) = launch(
+                    gpu,
+                    kernels,
+                    &Case {
+                        n_kv: N_KV8,
+                        n_head: N_HEAD,
+                        ctx: kind.ctx,
+                        rows: kind.rows,
+                        window: kind.window,
+                        q: &q,
+                        k: &k,
+                        v: &v,
+                        counts: &counts,
+                        sinks,
+                    },
+                )?;
+                if fault.is_some() {
+                    return Err(format!("fault {fault:?}").into());
+                }
+                Ok(y)
+            };
+            let none = run(None)?;
+            let neutral = run(Some(&neg_inf))?;
+            // A neutral sink changes nothing but the sign of a zero.
+            let same = none.len() == neutral.len()
+                && none.iter().zip(&neutral).all(|(a, b)| a == b)
+                && none.iter().all(|x| x.is_finite());
+            println!(
+                "flash_h128_no_sink_term {} group {}: no sinks == sinks -inf {}",
+                kind.name,
+                N_HEAD / N_KV8,
+                verdict(same)
+            );
+            all &= same;
         }
         Ok(all)
     }
 
-    /// Whether `r` is a refusal naming `phrase`.
-    fn refused(label: &str, r: Result<(Vec<f32>, Option<Fault>), GateError>, phrase: &str) -> bool {
+    /// Whether `r` is a refusal naming `phrase`, printed under `clause`.
+    fn refused(
+        clause: &str,
+        label: &str,
+        r: Result<(Vec<f32>, Option<Fault>), GateError>,
+        phrase: &str,
+    ) -> bool {
         let pass = match &r {
             Err(e) => e.to_string().contains(phrase),
             Ok(_) => false,
         };
         println!(
-            "flash_h128_group_refusal {label}: {} {}",
+            "{clause} {label}: {} {}",
             r.map_or_else(|e| e.to_string(), |_| "accepted".to_string()),
             verdict(pass)
         );
@@ -522,7 +526,41 @@ mod gate {
                     sinks: None,
                 },
             );
-            ok &= refused(label, r, phrase);
+            ok &= refused("flash_h128_group_refusal", label, r, phrase);
+        }
+        Ok(ok)
+    }
+
+    /// `flash_h128_group4_sinks_refusal`: four query heads over one key head
+    /// with per-head sinks, on a plane and on a ring.
+    fn group4_sinks_refusal(gpu: &Gpu, kernels: &Kernels) -> Result<bool, GateError> {
+        const HEADS: usize = GROUP_4;
+        let phrase = "folds no per-head sinks";
+        let mut ok = true;
+        for (label, window, ctx, rows) in
+            [("plane", 0usize, 8usize, 8usize), ("ring", 256, 1024, 512)]
+        {
+            let k = vec![0u16; rows * HEAD];
+            let q = vec![0.0f32; HEADS * HEAD];
+            let sinks = vec![0.0f32; HEADS];
+            let counts = [1u32];
+            let r = launch(
+                gpu,
+                kernels,
+                &Case {
+                    n_kv: 1,
+                    n_head: HEADS,
+                    ctx,
+                    rows,
+                    window,
+                    q: &q,
+                    k: &k,
+                    v: &k,
+                    counts: &counts,
+                    sinks: Some(&sinks),
+                },
+            );
+            ok &= refused("flash_h128_group4_sinks_refusal", label, r, phrase);
         }
         Ok(ok)
     }
@@ -533,10 +571,14 @@ mod gate {
         println!("gate_lfm3_kernels: device {}", gpu.device_name()?);
         let kernels = Kernels::load(&gpu)?;
         let mut ok = group4_window(&gpu, &kernels)?;
-        ok &= group4_is_group8(&gpu, &kernels, false)?;
-        ok &= group4_is_group8(&gpu, &kernels, true)?;
+        // PIN(2026-10-29): the sinks arm of `flash_h128_group4_is_group8` is removed with the group
+        // of four's sinks: a group of four takes none, so there is no sinks launch of four to
+        // compare with eight's. `flash_h128_group4_sinks_refusal` holds the refusal; the sinks
+        // merge is the group of eight's, held against its reference by `gate_flint_attn`.
+        ok &= group4_is_group8(&gpu, &kernels)?;
         ok &= no_sink_term(&gpu, &kernels)?;
         ok &= group_refusal(&gpu, &kernels)?;
+        ok &= group4_sinks_refusal(&gpu, &kernels)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

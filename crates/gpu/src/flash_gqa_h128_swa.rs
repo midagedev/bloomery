@@ -2,16 +2,18 @@
 //!
 //! One block holds the query heads of one key head, one warp each: a group of
 //! [`GROUP`] (eight, the `_swa` entries) or of [`GROUP_4`] (four, the `_swa_g4`
-//! entries, a block of 128 threads). Both run the one segment body
-//! (`seg_h128`), so a head's scores, tile order and partials are the same at
-//! either group. Scores run over [`HEAD`] key values and the values are
+//! entries, a block of 128 threads). Both groups, on a plane here and on a
+//! ring in `attention_h128_ring.rs`, run the one segment body (`seg_h128`), so
+//! a head's scores, tile order and partials are the same at either group and
+//! either cache. Scores run over [`HEAD`] key values and the values are
 //! [`HEAD`] wide, the same scalar tile as `gqa_flash_seg`. The keys a row
 //! attends are [`window_cut`]: the last `window` live keys, or every live key
 //! when `window` is 0, cut into [`window_segments`] from that first key. A
 //! layer with sinks has its sink join the softmax last, as the partial
 //! `(sink, 1, 0)`, after the segments in order; a layer with none has no sink
-//! term, and its merge (`..._nosink`) is the same walk without it. A full
-//! layer launches window 0.
+//! term, and its merge (`..._nosink`) is the same walk without it. Only the
+//! group of eight carries sinks (`group_sinks_refusal`). A full layer
+//! launches window 0.
 //!
 //! The window's lower bound is [`window_cut`]'s. This file does not own a
 //! second inequality.
@@ -33,17 +35,19 @@ use std::sync::Arc;
 
 /// u32 words of one key row, and the padded stride the key tile is staged at.
 const ROW_WORDS: usize = HEAD / 2;
-const K_STRIDE: usize = ROW_WORDS + 1;
+pub(crate) const K_STRIDE: usize = ROW_WORDS + 1;
 /// u64 words of one value row.
-const ROW_QWORDS: usize = HEAD / 4;
+pub(crate) const ROW_QWORDS: usize = HEAD / 4;
 const ILP: usize = 4;
 /// Query heads a key head that the `_g4` entries serve: the segment body of
 /// the group of eight with four warps.
 pub const GROUP_4: usize = 4;
 const THREADS: usize = GROUP * 32;
-const THREADS_U32: u32 = THREADS as u32;
-const THREADS_G4_U32: u32 = (GROUP_4 * 32) as u32;
-const MERGE_THREADS: u32 = HEAD as u32;
+/// Threads of a block at the group of eight, and at the group of four.
+pub(crate) const THREADS_U32: u32 = THREADS as u32;
+pub(crate) const THREADS_G4_U32: u32 = (GROUP_4 * 32) as u32;
+/// Threads of a merge block: one a value dim.
+pub(crate) const MERGE_THREADS: u32 = HEAD as u32;
 const _: () = assert!(THREADS_U32 as usize == THREADS && MERGE_THREADS as usize == HEAD);
 // The entries' launch contracts spell GROUP and GROUP_4 out as 8 and 4, and
 // their blocks as 256 and 128 threads.
@@ -61,7 +65,7 @@ const _: () = {
 /// refused row's segments are neutral and its merge raises
 /// [`FaultSite::KeyCount`].
 #[inline(always)]
-fn live_keys(count: u32, ctx: usize) -> usize {
+pub(crate) fn live_keys(count: u32, ctx: usize) -> usize {
     let c = count as usize;
     if c > ctx { 0 } else { c }
 }
@@ -80,7 +84,7 @@ fn live_keys(count: u32, ctx: usize) -> usize {
     clippy::too_many_arguments,
     reason = "the tile step's state is the caller's registers, passed by reference"
 )]
-pub(crate) unsafe fn fold_tile(
+unsafe fn fold_tile(
     sc: f32,
     live: bool,
     mx: &mut f32,
@@ -136,24 +140,32 @@ pub(crate) unsafe fn fold_tile(
     warp::sync_mask(u32::MAX);
 }
 
-/// The segment pass of the `_swa` entries at `G` query heads a key head. Block
-/// `b = (seg·n_kv + kh)·m + t` walks the windowed keys `[first + seg·span,
-/// first + min((seg + 1)·span, n_w))` of key head `kh`, where `(first, n_w)` is
-/// [`window_cut`] of the row's live count and `span` is [`seg_span`] of `n_w`.
-/// Warp `w` is query head `kh·G + w`. A segment past the window writes a
-/// neutral partial.
+/// The segment pass of the `_swa` entries at `G` query heads a key head, on a
+/// plane (`RING` false) or on a ring (`RING` true, the entries of
+/// `attention_h128_ring.rs`). Block `b = (seg·n_kv + kh)·m + t` walks the
+/// windowed keys `[first + seg·span, first + min((seg + 1)·span, n_w))` of key
+/// head `kh`, where `(first, n_w)` is [`window_cut`] of the row's live count
+/// and `span` is [`seg_span`] of `n_w`. Warp `w` is query head `kh·G + w`. A
+/// segment past the window writes a neutral partial.
+///
+/// The planes hold `plane_rows` rows a key head: `ctx` of them in a plane
+/// entry (key position `p` is row `p`), and under `RING` a ring of
+/// `plane_rows <= ctx` rows (position `p` is row `p mod plane_rows`). `ctx`
+/// stays the bound of the live count.
 ///
 /// SAFETY: the entry's launch contract at `G` query heads a key head (every
-/// buffer bound it names), a block of `G · 32` threads, and the four tiles this
-/// block's shared memory as the entry declared them: the group's query rows
-/// (`G · HEAD` f32), the key tile at stride `K_STRIDE` words, the value tile
-/// (`KEY_TILE · ROW_QWORDS` u64) and the weight tile (`G · KEY_TILE` f32).
+/// buffer bound it names, the planes of `n_kv · plane_rows` rows, and under
+/// `RING` `plane_rows >= 1` with every key the row reads resident in the
+/// ring), a block of `G · 32` threads, and the four tiles this block's shared
+/// memory as the entry declared them: the group's query rows (`G · HEAD`
+/// f32), the key tile at stride `K_STRIDE` words, the value tile (`KEY_TILE ·
+/// ROW_QWORDS` u64) and the weight tile (`G · KEY_TILE` f32).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
 )]
-unsafe fn seg_h128<const G: usize>(
+pub(crate) unsafe fn seg_h128<const G: usize, const RING: bool>(
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
@@ -161,6 +173,7 @@ unsafe fn seg_h128<const G: usize>(
     scale: f32,
     n_kv: u32,
     ctx: u32,
+    plane_rows: u32,
     segs: u32,
     seg_keys: u32,
     m: u32,
@@ -224,7 +237,8 @@ unsafe fn seg_h128<const G: usize>(
         i += 1;
     }
 
-    let plane = kh * ctx * HEAD;
+    let plane_rows = plane_rows as usize;
+    let plane = kh * plane_rows * HEAD;
     let k64 = kc.as_ptr() as *const u64;
     let v64 = vc.as_ptr() as *const u64;
     let mut mx = f32::NEG_INFINITY;
@@ -240,10 +254,16 @@ unsafe fn seg_h128<const G: usize>(
             let word = e - key * ROW_QWORDS;
             let (kw, vw) = if t0 + key < hi {
                 // SAFETY: t0 + key < hi <= limit <= ctx, so the row is
-                // inside key head kh's plane. A row is 32 u64 and the
-                // planes start 8-byte aligned (a device allocation).
+                // inside key head kh's plane (below plane_rows = ctx), or
+                // mapped modulo plane_rows inside its ring. A row is 32 u64
+                // and the planes start 8-byte aligned (a device allocation).
                 unsafe {
-                    let r = (plane + (t0 + key) * HEAD) / 4 + word;
+                    let at = if RING {
+                        (t0 + key) % plane_rows
+                    } else {
+                        t0 + key
+                    };
+                    let r = (plane + at * HEAD) / 4 + word;
                     (*k64.add(r), *v64.add(r))
                 }
             } else {
@@ -353,16 +373,17 @@ mod h128_swa_kernels {
 
         // SAFETY: each `static mut` above is this block's own shared
         // allocation, sized for GROUP query heads; the raw form reaches it
-        // without a reference. The launch contract is `seg_h128`'s at GROUP,
-        // and the block is GROUP · 32 threads.
+        // without a reference. The launch contract is `seg_h128`'s on a plane
+        // at GROUP, and the block is GROUP · 32 threads.
         unsafe {
-            seg_h128::<GROUP>(
+            seg_h128::<GROUP, false>(
                 q,
                 kc,
                 vc,
                 n_keys_buf,
                 scale,
                 n_kv,
+                ctx,
                 ctx,
                 segs,
                 seg_keys,
@@ -422,16 +443,17 @@ mod h128_swa_kernels {
 
         // SAFETY: each `static mut` above is this block's own shared
         // allocation, sized for GROUP_4 query heads; the raw form reaches it
-        // without a reference. The launch contract is `seg_h128`'s at GROUP_4,
-        // and the block is GROUP_4 · 32 threads.
+        // without a reference. The launch contract is `seg_h128`'s on a plane
+        // at GROUP_4, and the block is GROUP_4 · 32 threads.
         unsafe {
-            seg_h128::<GROUP_4>(
+            seg_h128::<GROUP_4, false>(
                 q,
                 kc,
                 vc,
                 n_keys_buf,
                 scale,
                 n_kv,
+                ctx,
                 ctx,
                 segs,
                 seg_keys,
@@ -628,6 +650,21 @@ pub(crate) fn served_group(n_head: usize, n_kv: usize) -> Option<usize> {
         .find(|&g| n_kv.checked_mul(g) == Some(n_head))
 }
 
+/// Why a launch of `group` query heads a key head cannot carry per-head sinks,
+/// or `None` when it can: only [`GROUP`] runs the merge with a sink term, and
+/// the shape table's group-of-four row (`models::shape::GQA`) claims none. The
+/// one owner of that rule: `attention_h128`'s admission and both launchers
+/// (this file's and the ring's) ask it.
+#[must_use]
+pub(crate) fn group_sinks_refusal(group: usize, sinks: bool) -> Option<String> {
+    (sinks && group != GROUP).then(|| {
+        format!(
+            "a group of {group} query heads a key head folds no per-head sinks; only a group of \
+             {GROUP} does"
+        )
+    })
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct H128SwaKernels {
     module: h128_swa_kernels::LoadedModule,
@@ -644,7 +681,8 @@ impl H128SwaKernels {
 
     /// Enqueue `m` rows. `n_head` is `8 · n_kv` or `4 · n_kv` (one block a key
     /// head); any other group is refused by name. `sinks` `None` runs the
-    /// merge with no sink term. A non-finite scale, a zero count or a short
+    /// merge with no sink term; sinks at a group of four are refused by name
+    /// (`group_sinks_refusal`). A non-finite scale, a zero count or a short
     /// buffer is refused by name before the launch. A live count of zero or
     /// past `ctx` raises [`FaultSite::KeyCount`] and the row is NaN.
     pub fn enqueue(
@@ -685,6 +723,9 @@ impl H128SwaKernels {
                 ),
             ));
         };
+        if let Some(why) = group_sinks_refusal(group, sinks.is_some()) {
+            return Err(GpuError::shape(what, why));
+        }
         if !scale.is_finite() {
             return Err(GpuError::shape(
                 what,

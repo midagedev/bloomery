@@ -5,13 +5,14 @@
 //! between slots. Ring appends are cut to `capacity - window + 1` rows before attention, so
 //! a later row never overwrites a key still readable by the first row of the chunk.
 //!
-//! The flash takes eight or four query heads a key head, with or without per-head sinks. The
-//! rope table the caller passes to [`Binding::enqueue`] is built from the layer's own `Rope`,
-//! factors included when the layer has them: the kernels read the table, whatever made it.
+//! The flash takes eight query heads a key head, with or without per-head sinks, or four with
+//! none. The rope table the caller passes to [`Binding::enqueue`] is built from the layer's own
+//! `Rope`, factors included when the layer has them: the kernels read the table, whatever made
+//! it.
 
 use crate::attention_h128_ring;
 use crate::flash_gqa::{HEAD, window_segments};
-use crate::flash_gqa_h128_swa::{H128SwaArgs, H128SwaKernels, served_group};
+use crate::flash_gqa_h128_swa::{H128SwaArgs, H128SwaKernels, group_sinks_refusal, served_group};
 use crate::gemm::{GEMM_MAX_SLOTS, Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
 use crate::qk_rms::{QkRmsArgs, QkRmsKernels};
 use crate::rope_neox::{NeoxArgs, RopeNeoxKernels};
@@ -191,6 +192,11 @@ fn admit(layer: usize, g: &Gqa, hidden: usize, eps: f32, ctx: usize) -> Result<A
             WHAT,
             format!("unsupported head128 layer {layer}: {g:?}"),
         ));
+    }
+    let sinks_refused =
+        served_group(heads, kv).and_then(|group| group_sinks_refusal(group, g.sinks));
+    if let Some(why) = sinks_refused {
+        return Err(GpuError::shape(WHAT, format!("layer {layer}: {why}")));
     }
     // The same capacity owner sizes the plan and the physical allocation.
     let capacity = runtime::stores::Rows::Ring.count(g.window.map(u64::from), ctx as u64) as usize;
@@ -731,6 +737,24 @@ mod tests {
         };
         let a = admitted(&g).expect("eight");
         assert_eq!((a.heads, a.kv, a.sinks), (32, 4, true));
+    }
+
+    /// Sinks at a group of four are refused by name, with or without a window: the group of four
+    /// folds none.
+    #[test]
+    fn a_group_of_four_with_sinks_is_refused() {
+        for window in [Some(256), None] {
+            let g = Gqa {
+                sinks: true,
+                ..layer(neox(false), window)
+            };
+            let e = refusal(admitted(&g));
+            assert!(
+                e.contains("layer 3")
+                    && e.contains("a group of 4 query heads a key head folds no per-head sinks"),
+                "{e}"
+            );
+        }
     }
 
     /// A group other than eight and four is refused by name, whatever else holds.
