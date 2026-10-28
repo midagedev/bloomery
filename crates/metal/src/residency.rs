@@ -37,7 +37,9 @@ use objc2_metal::{
 use bloomery_device::{DeviceError, Elem, Elems};
 
 use crate::buffer::MetalBuffer;
+use crate::device::MetalDevice;
 use crate::handle::{Handle, ResidencySetHandle};
+use crate::stream::mark;
 
 /// How long a set may go without a request before the next submit renews it:
 /// well under the gap after which the driver lets wiring lapse.
@@ -129,6 +131,7 @@ impl Residency {
     /// for.
     fn commit(&self, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
         let set = self.set();
+        mark("set", format_args!("commit {} allocations", buffers.len()));
         for buffer in buffers {
             let allocation: &ProtocolObject<dyn MTLAllocation> =
                 ProtocolObject::from_ref(&**buffer);
@@ -154,6 +157,7 @@ impl Residency {
             return;
         }
         self.renewed_gap_min_ns.fetch_min(gap, Ordering::Relaxed);
+        mark("set", format_args!("renew request at gap {gap} ns"));
         self.set().0.requestResidency();
         self.note_request();
     }
@@ -189,6 +193,7 @@ impl Residency {
 impl Drop for Residency {
     fn drop(&mut self) {
         let set = self.set();
+        mark("set", format_args!("endResidency + removeResidencySet"));
         set.0.endResidency();
         self.queue.removeResidencySet(&set.0);
     }
@@ -233,4 +238,60 @@ impl<'a> Alloc<'a> {
             .push(buffer.metal().retain());
         Ok(buffer)
     }
+}
+
+/// A loop of the residency-set teardown pattern the Metal e2e gate panicked
+/// the kernel in, for the queue-drain fix's FAIL-first. Each iteration opens a
+/// stream on the device's shared command queue, gives it a residency set,
+/// wires one buffer into the set, commits a command buffer the set backs, and
+/// drops the stream — the engine's own open/teardown, minus the step work.
+///
+/// The invariant the fix keeps ([`crate::stream::MetalStream`]'s `Drop`): the
+/// set, and the buffers it holds as allocations, outlive every command buffer
+/// on the queue that it backs. On a build without that drain, the drop frees
+/// the set and its buffer while the committed command buffer is still in
+/// flight, the driver walks a resource that is gone
+/// (`IOGPUDevice::getResource` → `lockResourceNamespace` on a null device),
+/// and the kernel faults; with the drain the drop waits first and the loop
+/// runs to the end.
+///
+/// `wait_for_queue` settles the stream before it drops, so on a build without
+/// the drain this flag is the FAIL-first switch in one binary: unset it
+/// faults, set it survives. On a build with the drain both survive. Bounded by
+/// `iterations`; it opens nothing else. The faulting arm panics the kernel, so
+/// it is run only on a Mac the user names, with the user's go.
+pub fn repro(
+    device: &MetalDevice,
+    iterations: u32,
+    wait_for_queue: bool,
+) -> Result<(), DeviceError> {
+    // A buffer big enough that its wiring is real work the GPU holds past the
+    // commit, so the window the teardown races is not a hair's breadth.
+    const ELEMS: usize = 1 << 18;
+    for _ in 0..iterations {
+        let mut stream = device.new_stream()?;
+        stream.enable_residency(device.metal())?;
+        {
+            let residency = stream
+                .residency()
+                .expect("the stream was just given a residency set");
+            let staged = residency.stage();
+            let alloc = Alloc::new(device.metal(), &staged);
+            // The host's handle drops at the block's end; the set keeps its
+            // own retained copy, so the buffer lives until the set is torn
+            // down.
+            let _buffer = alloc.buffer::<f32>(Elems(ELEMS))?;
+            staged.commit();
+        }
+        // A command buffer the set backs, committed and left unsettled.
+        let recording = stream.begin()?;
+        let _signalled = stream.submit_signalled(recording)?;
+        if wait_for_queue {
+            // The rule, forced here too for a build whose stream teardown does
+            // not yet wait: settle before the stream (and its set) drops.
+            bloomery_device::Stream::sync(&stream)?;
+        }
+        drop(stream);
+    }
+    Ok(())
 }

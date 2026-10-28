@@ -50,6 +50,10 @@ name = "metal_scan"
 path = "src/bin/metal_scan.rs"
 required-features = ["pipeline-scan"]
 
+[[bin]]
+name = "metal_residency_repro"
+path = "src/bin/metal_residency_repro.rs"
+
 # The Metal move proof (tools/metal-compare.sh): what a change that should not move a kernel is
 # checked by, in place of a timing sitting. Both are off in every build the gates and the
 # serve binary use, so their host code is the shipped code.
