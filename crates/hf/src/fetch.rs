@@ -43,6 +43,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use sha1::Digest as _;
@@ -51,6 +54,9 @@ use crate::{Check, Entry, GgufSet, HfError, RepoRef, cache_path, exact, gguf_set
 
 /// How often a running download prints its progress.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+/// How many files of one snapshot [`verify_snapshot`] hashes at once.
+const SNAPSHOT_HASH_THREADS: usize = 4;
 
 /// Seconds curl waits for the connection alone, not the transfer, so an
 /// offline start reaches the cache without curl's default wait.
@@ -651,6 +657,7 @@ impl Client {
             && let Some(files) = crate::checkpoint_files(&entries)
         {
             let dir = checkpoint(r, sources, &self.root, &files, events)?;
+            self.verify_snapshot_if_ready(&r.repo, &files)?;
             for e in &files {
                 self.fetch(&r.repo, e, events)?;
             }
@@ -658,6 +665,7 @@ impl Client {
         }
         let set = crate::pick(&r.repo, &sets, r.quant.as_deref())?;
         events(&Event::Set { repo: &r.repo, set });
+        self.verify_snapshot_if_ready(&r.repo, &set.files)?;
         let mut files = Vec::with_capacity(set.files.len());
         for e in &set.files {
             files.push(self.fetch(&r.repo, e, events)?);
@@ -771,11 +779,108 @@ impl Client {
             }
             Listed::Hub(entries) => entries,
         };
-        exact(repo, &entries, paths)?
-            .into_iter()
-            .map(|e| self.fetch(repo, e, events))
-            .collect()
+        let files: Vec<Entry> = exact(repo, &entries, paths)?.into_iter().cloned().collect();
+        self.verify_snapshot_if_ready(repo, &files)?;
+        files.iter().map(|e| self.fetch(repo, e, events)).collect()
     }
+
+    /// When every `files` entry is already on disk at its listed size, checks in parallel the ones
+    /// whose `.verified` marker does not name their digest, and writes each marker so
+    /// [`Client::fetch`] trusts them without re-reading.
+    fn verify_snapshot_if_ready(&self, repo: &str, files: &[Entry]) -> Result<(), HfError> {
+        if snapshot_on_disk(&self.root, repo, files) {
+            verify_snapshot(&self.root, repo, &unmarked(&self.root, repo, files))?;
+        }
+        Ok(())
+    }
+}
+
+/// Every `files` entry of `repo` under `root` is present at its listed size.
+fn snapshot_on_disk(root: &Path, repo: &str, files: &[Entry]) -> bool {
+    files.iter().all(|e| {
+        cache_path(root, repo, &e.path)
+            .ok()
+            .and_then(|p| size_of(&p).ok().flatten())
+            .is_some_and(|n| n == e.size)
+    })
+}
+
+/// The files of `files` whose `.verified` marker does not name their digest: the ones a fetch would hash.
+fn unmarked(root: &Path, repo: &str, files: &[Entry]) -> Vec<Entry> {
+    files
+        .iter()
+        .filter(|e| {
+            cache_path(root, repo, &e.path)
+                .ok()
+                .and_then(|p| fs::read_to_string(with_suffix(&p, ".verified")).ok())
+                .is_none_or(|m| m.trim() != e.digest.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Each file of a repo snapshot under `root`, checked against its listing digest in parallel,
+/// up to four at a time. The first refusal in `entries` order is returned.
+pub fn verify_snapshot(root: &Path, repo: &str, entries: &[Entry]) -> Result<(), HfError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if entries.len() == 1 {
+        return verify_one_snapshot(root, repo, &entries[0]);
+    }
+    let threads = SNAPSHOT_HASH_THREADS.min(entries.len());
+    let (done_tx, done_rx) = mpsc::channel();
+    let next = AtomicUsize::new(0);
+    let root = root.to_path_buf();
+    let repo = repo.to_owned();
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= entries.len() {
+                        break;
+                    }
+                    let r = verify_one_snapshot(&root, &repo, &entries[i]);
+                    if done_tx.send((i, r)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut slots: Vec<Option<Result<(), HfError>>> = (0..entries.len()).map(|_| None).collect();
+    for _ in 0..entries.len() {
+        let (i, r) = done_rx.recv().expect("every file was hashed");
+        slots[i] = Some(r);
+    }
+    for slot in slots {
+        slot.expect("every file was hashed")?;
+    }
+    Ok(())
+}
+
+fn verify_one_snapshot(root: &Path, repo: &str, entry: &Entry) -> Result<(), HfError> {
+    let path = cache_path(root, repo, &entry.path)?;
+    let len = size_of(&path)?.unwrap_or(0);
+    if len != entry.size {
+        return Err(HfError::Size {
+            file: path.display().to_string(),
+            bytes: len,
+            want: entry.size,
+        });
+    }
+    let got = digest(&path, entry.check, entry.size)?;
+    if got != entry.digest {
+        return Err(HfError::Hash {
+            file: path.display().to_string(),
+            check: entry.check,
+            got,
+            want: entry.digest.clone(),
+        });
+    }
+    write_marker(&with_suffix(&path, ".verified"), &got)?;
+    Ok(())
 }
 
 /// The folder in `root`'s cache of the checkpoint `files` of `r`'s repo, which a resolve gives
@@ -1302,6 +1407,68 @@ mod tests {
         for size in [0, body.len() as u64, u64::MAX] {
             assert_eq!(digest(&p, Check::Sha256, size).expect("digest"), expected);
         }
+    }
+
+    #[test]
+    fn a_marked_file_is_not_hashed_again_before_the_fetch() {
+        let d = scratch("snapshot-marked");
+        let repo = "a/b";
+        let (c, marked) = served(&d, repo, "m.bin", b"marked");
+        c.fetch(repo, &marked, &mut |_| {}).expect("fetch");
+        let (c, bare) = served(&d, repo, "u.bin", b"unmarked");
+        c.fetch(repo, &bare, &mut |_| {}).expect("fetch");
+        let root = d.join("cache");
+        let path = cache_path(&root, repo, &bare.path).expect("path");
+        fs::remove_file(with_suffix(&path, ".verified")).expect("marker");
+        let left: Vec<String> = unmarked(&root, repo, &[marked, bare])
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(left, ["u.bin"]);
+    }
+
+    #[test]
+    fn concurrent_snapshot_hashing_matches_sequential_hashing() {
+        let d = scratch("snapshot-hash");
+        let repo = "a/b";
+        let mut entries = Vec::new();
+        for i in 0..6 {
+            let name = format!("f{i}.bin");
+            let body = content();
+            let (c, e) = served(&d, repo, &name, &body);
+            c.fetch(repo, &e, &mut |_| {}).expect("fetch");
+            entries.push(e);
+        }
+        let root = d.join("cache");
+        for e in &entries {
+            verify_one_snapshot(&root, repo, e).expect("sequential");
+        }
+        verify_snapshot(&root, repo, &entries).expect("concurrent");
+    }
+
+    #[test]
+    fn concurrent_snapshot_hashing_refuses_the_first_file_in_listing_order() {
+        let d = scratch("snapshot-hash-order");
+        let repo = "a/b";
+        let (c, good) = served(&d, repo, "ok.bin", b"ok");
+        c.fetch(repo, &good, &mut |_| {}).expect("fetch");
+        let (c, bad) = served(&d, repo, "bad.bin", b"bad");
+        c.fetch(repo, &bad, &mut |_| {}).expect("fetch");
+        let root = d.join("cache");
+        let mut first = bad;
+        first.digest = "0".repeat(64);
+        let entries = vec![first, good];
+        let seq = verify_one_snapshot(&root, repo, &entries[0]).expect_err("sequential");
+        let par = verify_snapshot(&root, repo, &entries).expect_err("concurrent");
+        assert_eq!(seq.to_string(), par.to_string());
+        let HfError::Hash {
+            file, got, want, ..
+        } = &seq
+        else {
+            panic!("{seq:?}");
+        };
+        assert!(file.contains("bad.bin"), "{file}");
+        assert_ne!(got, want);
     }
 
     #[test]
