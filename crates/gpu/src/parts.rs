@@ -293,12 +293,16 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
         )
     }
 
-    fn load_whole(&self, stream: &CudaStream) -> Result<Weights, GpuError> {
+    fn load_whole(
+        &self,
+        stream: &CudaStream,
+        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
+    ) -> Result<Weights, GpuError> {
         load(
             stream,
             &self.source,
             |_, _, _| Ok::<_, std::convert::Infallible>(Take::Whole),
-            |_| None,
+            card,
             false,
         )
     }
