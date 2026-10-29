@@ -246,6 +246,10 @@ blk_lcppwarm() { tool_selftest ref/lcpp-warm.sh; }
 # is not the one 3090, a relative or existing out dir), the chats' records and the stop by the server's own pid, against a stub
 # gate runner and server (python3, curl, 127.0.0.1), are tested here, no box.
 blk_q38srv() { tool_selftest ref/q38-3090-server.sh; }
+# load-ab.sh is the model load's wall runner (cold or warm page cache, arms alternated, each stopped at its `load phases`
+# record): its rotation, the eviction's refusal, the stop at the record, the rows and the paired effects, on stub arms and
+# no card, no lease and no drive, are tested here, no box.
+blk_loadab() { tool_selftest ref/load-ab.sh; }
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 blk_maccheck() { tool_selftest mac-check.sh; }
@@ -1203,7 +1207,7 @@ proc_leg_gpu() {
   return 1
 }
 
-BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
+BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv loadab
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a

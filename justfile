@@ -925,6 +925,14 @@ ab-decode *DIRS: build-decode
     for d in {{DIRS}}; do names="$names $(basename "$d")"; done
     ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS} ${BLOOMERY_AB_DEPTH:+BLOOMERY_AB_DEPTH=$BLOOMERY_AB_DEPTH} ${BLOOMERY_AB_ENVS:+BLOOMERY_AB_ENVS='$BLOOMERY_AB_ENVS'} ${BLOOMERY_AB_IK:+BLOOMERY_AB_IK=$BLOOMERY_AB_IK} bash tools/ref/ab-decode.sh$names"
 
+# The model load's wall, one start per arm per round under the lease, each stopped at its `load phases` record (lead-only):
+# the arms are trees under ~/repo/ on the box whose generate_ds41 was built there (as time-gpu-ds41 builds it), the first
+# the base; the model file is evicted from the page cache before each timed start, `--warm` leaves it. tools/ref/load-ab.sh's
+# header has the rows and the paired effects. The card and the rounds go through BLOOMERY_BOX_ENV:
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/cflra-load.card BLOOMERY_AB_ROUNDS=3' just load-ab bloomery-base bloomery-new
+load-ab *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && bash tools/ref/load-ab.sh {{ARGS}}'
+
 # The Mac shell's BLOOMERY_PROFILE_DEPTH and BLOOMERY_PROFILE_LEVELS ride in front of the remote command, as in
 # ab-decode; lever env goes through BLOOMERY_BOX_ENV:
 #   BLOOMERY_BOX_ENV="BLOOMERY_FLASH_SEGMENTS=8" BLOOMERY_PROFILE_DEPTH=1024 just measure-profile
