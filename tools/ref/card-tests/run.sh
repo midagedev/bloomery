@@ -1916,5 +1916,18 @@ else
   pass "the sj-vs-clef runner's stub tests (sj-vs-clef.sh --self-test)"
 fi
 
+# load-ab.sh is the model load's wall runner (cold or warm page cache, arms alternated, each stopped at its `load phases`
+# record): its rotation, the eviction's refusal, the stop at the record, the rows and the paired effects, on stub arms and no
+# card, no lease and no drive. The runner calls lease_take, so it is tested in this harness, as depth-serve.sh is.
+bash "$ROOT/tools/ref/load-ab.sh" --self-test > "$tmp/load-ab.out" 2>&1
+lrc=$?
+if [ "$lrc" != 0 ]; then
+  fail "the load-ab runner's stub tests (load-ab.sh --self-test)" "rc $lrc, want 0" "$tmp/load-ab.out"
+elif ! grep -Eq -- '^load-ab self-test: ok ' "$tmp/load-ab.out"; then
+  fail "the load-ab runner's stub tests (load-ab.sh --self-test)" "no line matches /^load-ab self-test: ok /" "$tmp/load-ab.out"
+else
+  pass "the load-ab runner's stub tests (load-ab.sh --self-test)"
+fi
+
 echo "card-tests: $n tests, $failed failed"
 [ "$failed" = 0 ]
