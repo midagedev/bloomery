@@ -39,8 +39,7 @@
 //!   against an empty cache, refused as the class `network` before any
 //!   load);
 //! - the refusals, each a process that exits non-zero before it listens,
-//!   its stderr naming why: `qwen35_with_no_head` (`-m <gguf>`),
-//!   `decide_with_no_head` (`--model decide -m <gguf>`), `qwen3_with_head`
+//!   its stderr naming why: `decide_with_no_head` (`--model decide -m <gguf>`), `qwen3_with_head`
 //!   (`--model qwen3 -m <gguf> --head <head>`), `unknown_head_config`
 //!   (`--head-config` of a config no row knows), `narrow_head` (a head of
 //!   hidden width 16, written into `<dir>`, against the file's
@@ -948,18 +947,8 @@ mod gate {
         check(&mut ok, "face_pins_the_constants", pass);
 
         // The refusals first: none of them loads the backbone.
-        let pass = refused(
-            &a.dir,
-            "qwen35_with_no_head",
-            &["-m", model],
-            &[
-                "a qwen35 file with no head",
-                "--head",
-                "clef (head repo Cloudflare/clef-flash, backbone qwen35; --hf \
-                 bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M)",
-            ],
-        )?;
-        check(&mut ok, "qwen35_with_no_head", pass);
+        // `-m <gguf>` with no head is not refused: a qwen35 file a generative seat serves is that seat's, and
+        // gate_lev_serve's qwen35_with_no_head holds the refusal of one no seat serves.
         let pass = refused(
             &a.dir,
             "decide_with_no_head",

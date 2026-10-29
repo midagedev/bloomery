@@ -43,10 +43,9 @@
 //! the minimaxm3 seat,
 //! nemotron_h and nemotron_h_moe the nemotron seat, raon1 the raon1 seat, muse-spark the musespark seat,
 //! and flint the flint seat;
-//! a dense qwen35 file generates through `--model qwen3`, and a qwen35
-//! checkpoint folder with no model word as well. With no model word a file
-//! keeps the decision selection rules: a file with no head is
-//! refused by name, saying what would seat it (`--head`, a row's `--hf`
+//! a dense qwen35 file a generative seat serves generates with or without
+//! `--model qwen3`. With no model word a file keeps the decision selection rules: a file with no head
+//! that no generative seat serves is refused by name, saying what would seat it (`--head`, a row's `--hf`
 //! repo, or a file that carries its head); a
 //! file whose architecture no seat serves is refused by name listing the
 //! seat words, or, when the model reader describes it, listing what no
@@ -504,17 +503,16 @@ models (the --model word is optional with a model file: the file's architecture 
 
     /// The seat the model file's ([`ref_model_path`]) first shard holds: the one
     /// generative seat that serves the file ([`Model::serves`]). A file of a decision
-    /// row's backbone (`qwen35`, Clef's) here has no head: its refusal
-    /// ([`serve::decide::no_head`]) says what would seat it. An explicit
-    /// generative word admits a dense qwen35 file through the existing Qwen
-    /// seat, and so does a checkpoint folder: a row's backbone is a GGUF
-    /// file, so a folder is a generative model's download. Any other file, and a shard that names no architecture, is refused by name
+    /// row's backbone (`qwen35`, Clef's) here has no head: a generative seat
+    /// that serves it takes it, saying on stderr what a decision model needs,
+    /// and one no seat serves is refused by [`serve::decide::no_head`], which
+    /// says what would seat it. Any other file, and a shard that names no architecture, is refused by name
     /// listing the seat words; an explicit seat word that is not the file's seat is
     /// refused naming the file's. A file the Qwen3.5 body runs (Qwen3.6, a dense
     /// `llama` trunk) is the qwen3 seat's.
     fn seat_of_file(word: Option<Word>) -> Result<Model, GateError> {
+        let generative = matches!(word, Some(Word::Seat(Model::Qwen3)));
         let path = ref_model_path()?;
-        let generative = matches!(word, Some(Word::Seat(Model::Qwen3))) || path.is_dir();
         model_file::with_header(&path, |split| {
             let seat = match split.architecture() {
                 Some(a) if side_seat::row(a).is_some() => {
@@ -528,7 +526,11 @@ models (the --model word is optional with a model file: the file's architecture 
                     )
                     .into());
                 }
-                Some(a) if !generative && decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
+                Some(a)
+                    if !generative
+                        && decide::ROWS.iter().any(|r| r.backbones.contains(&a))
+                        && !Model::ALL.iter().any(|m| m.serves(split)) =>
+                {
                     return Err(Refusal::new(
                         Code::Unsupported,
                         format!(
@@ -540,6 +542,14 @@ models (the --model word is optional with a model file: the file's architecture 
                     .into());
                 }
                 Some(a) => {
+                    if !generative && decide::ROWS.iter().any(|r| r.backbones.contains(&a)) {
+                        eprintln!(
+                            "{NAME}: {} is a {a} file with no head: it serves as a generative \
+                             model; a decision model takes --head <weights> or the --hf repo \
+                             that names its head",
+                            path.display()
+                        );
+                    }
                     let seat = Model::ALL
                         .iter()
                         .copied()
