@@ -63,7 +63,6 @@ crates/model-hf/src/arch/minimaxm3.rs	BLOOMERY_MM31_FOLDER	stays: the MiniMax-M3
 crates/engram-lab/tests/lab.rs	BLOOMERY_DATA	stays: the data directory
 crates/model/tests/attn.rs	BLOOMERY_FLASH_SIMD_CHILD_DUMP,BLOOMERY_KV_PREFETCH_CHILD,BLOOMERY_SPLITK_BAND_DUMP,BLOOMERY_SPLITK_CHILD_DUMP,BLOOMERY_BUNDLE_BAND_DUMP	stays: the gate's handshakes with the children it runs
 crates/model/tests/common/model_path.rs	BLOOMERY_MODEL	stays: the model file the harnesses open
-crates/model/tests/deepseek4_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens
 crates/model/tests/ds41_meta.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model-hf/tests/fixture.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model/tests/flint_meta.rs	BLOOMERY_MODEL	stays: the pinned model file or header prefix the harness opens

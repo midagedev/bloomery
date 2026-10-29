@@ -14,7 +14,6 @@ gate-arch-registry	common		registry	arch_registry
 gate-ds2-debug	family	deepseek2	host	model_host_ops+moe_route
 gate-chain	common		host	chain_plan
 gate-decision	common		constrain	decision_head
-gate-deepseek4-meta	family	deepseek41	meta	arch_registry
 gate-ds41-bind	family	deepseek41	host	-
 gate-ds41-host	family	deepseek41	host	-
 gate-ds41-kld	family	deepseek41	host	-

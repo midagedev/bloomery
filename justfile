@@ -3450,12 +3450,6 @@ gate-gpu-glm5v-tower:
 gate-gpu-radio-tower:
     ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-radio-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_radio_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_radio_tower'
 
-# V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
-# top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과
-# 카드 예산이 담을 expert 수[유도], 엔진이 거절하는 기능 목록을 tests/common/deepseek4_pins.rs에 대조한다. 헤더만, 초 단위.
-gate-deepseek4-meta:
-    BLOOMERY_MODEL=deepseek4 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41 --nocapture && bash tools/gate.sh --release -p bloomery-model --test deepseek4_meta -- --ignored --nocapture'
-
 # glm5next (GLM-5.3-Flash) header gate: the reader's refusals on synthetic headers, then its description of the
 # file and the coverage check's list. Headers only, seconds; needs all six shards.
 gate-glm5next-meta:
