@@ -1,0 +1,10 @@
+kind: baseline
+question: what are 0.3.11's headline pp512, pp4096 and decode for Qwen3.8-27B from its NVFP4 folder on the RTX 3090 alone, and the other families' rows at the serving defaults on the release tarball's bloomery-serve
+term: decode tok/s of Qwen3.8-27B NVFP4 at D=512, the release tarball's bloomery-serve, RTX 3090 alone (250 W cap), --place unset, ctx unset
+unit: tok/s
+predict: 18.0..45.0
+condition: one hold, tools/release/sitting.sh through rig-log tools/bloomery-release/sit.sh 0.3.11 --binary portable; cells ~/.cache/bloomery/devspeed/rel0311/cells.tsv; tools/ref/depth-serve.sh arms D=512 and D=4096, 2 rounds, N 128, each round a fresh server with every lever unset and ctx unset
+reason: [derived] the folder's weights are ~15 GB of NVFP4 (27e9 weights at 4.5 bits with their scales) plus the BF16 embedding and head, ~16.5 GB a token; at the ~700 GB/s a near-roofline kernel reads on the 3090 that is ~42 tok/s, and sm_86 has no FP4 tensor core, so the dequant runs on the cores and the low end assumes half of that; no run of this file exists (0.3.10 refused it)
+decide-in: write the four numbers per row into the release notes' table with these conditions
+decide-below: under 18.0: read the plan, the pick and the witness block before writing a number; compare with the tape's decode in the same window
+decide-above: beyond 45.0: read the witness block, the MTP line and the plan line before writing a number
