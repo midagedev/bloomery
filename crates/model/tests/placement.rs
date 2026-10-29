@@ -1079,6 +1079,7 @@ fn hw_placement_unified_pool_lowers_the_card_budget() {
         uuid: [0x10; 16],
         pci_bus: "000f:01:00.0".to_string(),
         held_by: None,
+        compute_capability: Some((12, 1)),
     });
     let room = (free - workstation::HOST_DRIFT, HostRead::Given);
     let inputs =

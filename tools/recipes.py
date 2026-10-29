@@ -5805,10 +5805,16 @@ class Reach:
                         "yield", "continue", "move", "async", "await", "unsafe", "const"}
         opaque_owners: set[str] = set()
         outside_ownership = False
+        def reached_owners(reached: dict[int, tuple[int, str]]) -> set[str]:
+            # A reached unit of a package the recipe does not link sits in a file a script reads: its impl that no item reach can place
+            # (a type a macro writes) is reached whenever its file is linked. That package compiles nothing here, so it owns no
+            # compilation read (`compiled` holds the linked ones); the file is an input as the script's read, whatever the reach.
+            return {self.nodes[m][0][0] for m in reached if self.nodes[m][2] >= 0} & linked_packages
+
         # An unused --extern rlib is a compilation input, not necessarily part of the executable. Start
         # with uncut reached owners, then honor explicit side-effect links even without a called item.
         # Within each runtime-active owner scan *all* compilation files: an unreachable ctor can run.
-        active_owners = {self.nodes[m][0][0] for m in par if self.nodes[m][2] >= 0}
+        active_owners = reached_owners(par)
         work = list(active_owners)
         source_seeds: set[Hit] = set()
         closed_seeds: set[Hit] = set()
@@ -5903,7 +5909,7 @@ class Reach:
                 break
             par = self._close(graph, n, None, source_seeds)
             closed_seeds = set(source_seeds)
-            added = {self.nodes[m][0][0] for m in par if self.nodes[m][2] >= 0} - active_owners
+            added = reached_owners(par) - active_owners
             active_owners.update(added)
             work.extend(added)
         keep |= {self.nodes[m][1] for m in par}
@@ -12879,7 +12885,8 @@ def orphan_self_test(expect, real: Side) -> None:
     gg_lib = next(t.src for t in real.tree.packages["bloomery-gpu-gates"].targets if t.kind == "lib")
     n_bind = sum(1 for t in TestScan(real.tree).tests_of(gg_lib)[0] if t.path.startswith("bind::"))
     n_seats = sum(1 for t in TestScan(real.tree).tests_of(gg_lib)[0] if t.path.startswith(("vision_seat::", "side_seat::")))
-    expect(n_bind > 0, "orphan scan: the tree holds no bind:: test for the FAIL-first clause to orphan")
+    n_start = sum(1 for t in TestScan(real.tree).tests_of(gg_lib)[0] if t.path.startswith("start::"))  # the recipe's last command (the start path's agent half)
+    expect(n_bind > 0 and n_start > 0, "orphan scan: the tree holds no bind:: or start:: test for the FAIL-first clause to orphan")
     orphans, errors, checked = orphan_tests(real.tree, real.recipes)
     expect(not errors, f"orphan scan on the real tree: {errors[:3]}")
     expect(not any(" bind::tests::" in o for o in orphans), f"orphan scan: a bind test is an orphan on the real tree: {[o for o in orphans if 'bind::' in o]}")
@@ -12889,7 +12896,7 @@ def orphan_self_test(expect, real: Side) -> None:
     with tempfile.TemporaryDirectory(prefix="recipes-orphan-ff-") as tmp:
         p = os.path.join(tmp, "justfile")
         # (a) the recipe removed: every bind test red, each naming the cfg the lib run lacks (that run carries the hf feature, which only
-        # the fetch tests need; the deepseek41 cfg it still lacks is the point)
+        # the fetch tests need; the deepseek41 cfg it still lacks is the point), and every start test, each naming the gpu cfg that run lacks
         m = re.search(r"^(?:\[[^\n]*\]\n)*gate-ds41-bind:\n(?:    .*\n)+", text, re.M)  # its attributes go with it
         if m is None:
             expect(False, "orphan FAIL-first: no gate-ds41-bind recipe to remove")
@@ -12898,9 +12905,12 @@ def orphan_self_test(expect, real: Side) -> None:
                 fh.write(text[: m.start()] + text[m.end() :])
             got = set(orphan_tests(real.tree, load_justfile(p))[0]) - base
             bind = [o for o in got if " bind::tests::" in o]
-            expect(len(bind) == n_bind and len(got) == n_bind + n_seats and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (features dspark-hf,hf)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
+            start = [o for o in got if " start::" in o]
+            expect(len(bind) == n_bind and len(start) == n_start and len(got) == n_bind + n_seats + n_start
+                   and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (features dspark-hf,hf)" in o for o in bind)
+                   and all('cfg(feature = "gpu") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (features dspark-hf,hf)" in o for o in start), f"orphan FAIL-first (a): {sorted(got)}")
         # (c) a filter that matches nothing of its module: the tests only that filter reached go red
-        for pat in (r"--lib -- (bind::)'", r"--ignored (hw_ds41_oracle) "):
+        for pat in (r"--lib -- (bind::)(?= &&|')", r"--lib -- (start::)(?= &&|')", r"--ignored (hw_ds41_oracle) "):
             m = re.search(pat, text)
             if m is None:
                 expect(False, f"orphan FAIL-first: no anchor {pat}")
@@ -13607,6 +13617,28 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         opaque_meta["packages"][0] = pkg("base", [("lib", "base", "src/lib.rs")], ["leaf", "side"])
         inputs = Graph(Tree(tmp, opaque_meta), rs).key_inputs("gate-app")
         expect(inputs.match("side/src/lib.rs") is not None, "explicit side-effect extern-crate link lost its opaque owner")
+        # A script reads a Rust file of a package no target of the recipe links, and the file holds an impl its item reach cannot place
+        # (its type is written by a macro, so the rule that reaches such an impl whenever its file is linked fires on the read). That
+        # package compiles nothing there, so it owns no compilation read; the file stays an input as the script's read, and the key builds.
+        data = {
+            "tools/read-data.sh": "cat crates/data/src/table.rs\n", "crates/data/Cargo.toml": "", "crates/data/src/lib.rs": "mod table;\n",
+            "crates/data/src/table.rs": (
+                "macro_rules! make {\n    () => {\n        pub enum Code {\n            A,\n        }\n    };\n}\nmake!();\n"
+                "impl std::fmt::Display for Code {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        f.write_str(\"a\")\n    }\n}\n"
+            ),
+        }
+        for rel, text in data.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        unlinked = pkg("data", [("lib", "data", "src/lib.rs")], [])
+        unlinked["manifest_path"] = os.path.join(tmp, "crates/data/Cargo.toml")
+        unlinked["targets"][0]["src_path"] = os.path.join(tmp, "crates/data/src/lib.rs")
+        data_meta = dict(opaque_meta, workspace_members=[*opaque_meta["workspace_members"], "data"], packages=[*opaque_meta["packages"], unlinked])
+        reads_data = {"gate-data": Recipe("gate-data", [*rs["gate-app"].lines, "bash tools/read-data.sh"], [], "")}
+        inputs = Graph(Tree(tmp, data_meta), reads_data).key_inputs("gate-data")
+        expect(inputs.match("crates/data/src/table.rs") is not None, "a script's read of a Rust file of a package the recipe does not link left the key")
+        expect(inputs.match("crates/data/src/lib.rs") is None and "crates/data/Cargo.toml" not in inputs.files, "a script's read of one file of an unlinked package keyed the package")
 
     # the table's check on the real tree: the held rows, and the derivation's own lines
     tree, recipes, graph = side.tree, side.recipes, side.graph

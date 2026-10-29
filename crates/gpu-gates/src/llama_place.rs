@@ -1038,6 +1038,7 @@ mod tests {
                 uuid: [u8::try_from(i).expect("small") + 1; 16],
                 pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                 held_by: None,
+                compute_capability: Some((8, 6)),
             })
             .collect()
     }
@@ -1875,6 +1876,7 @@ mod seat_words {
             uuid: [u8::try_from(i).expect("small") + 1; 16],
             pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
             held_by: None,
+            compute_capability: Some((8, 6)),
         })
         .collect()
     }

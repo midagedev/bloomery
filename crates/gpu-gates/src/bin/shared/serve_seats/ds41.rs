@@ -756,7 +756,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             residency,
             a.cache_ram,
         )?;
-        std::process::exit(0);
+        bloomery_gpu_gates::start::plan_exit();
     }
     let trace = route_trace(&levers, &cfg, a.place, &path, &inputs)?;
     let (card, placement, cache, residency) = print_plan(

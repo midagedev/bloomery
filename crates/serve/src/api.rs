@@ -76,6 +76,8 @@ use crate::engine::{
     DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
     SamplingParams, StateError, Tokenizer,
 };
+use crate::event;
+use crate::exit::Code;
 use crate::flag::ApiKeys;
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
@@ -92,6 +94,8 @@ use crate::swap::Park;
 use crate::video::{self, VideoSupport};
 use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 
+use self::listener::Listener;
+
 /// Anthropic's Messages API, a child of this module so it runs the chat path's
 /// own steps.
 #[path = "anthropic.rs"]
@@ -100,6 +104,11 @@ mod anthropic;
 /// they read a prompt as the completion path does.
 #[path = "embeddings.rs"]
 pub mod embeddings;
+/// The listening socket bound before the model loads, which answers `loading`
+/// until a server takes it over; a child of this module so it serves through
+/// the accept loop and the refusal written here.
+#[path = "listener.rs"]
+pub mod listener;
 /// Per-token log-probabilities, which the generation loop collects and the
 /// completion and chat answers render.
 #[path = "logprobs.rs"]
@@ -294,11 +303,13 @@ impl fmt::Display for Stop {
 
 /// A bound, not yet running server.
 pub struct Server {
-    listener: TcpListener,
+    listener: Listener,
     state: Arc<State>,
-    ended: mpsc::Receiver<End>,
     /// The engine and its slots, until [`Server::run`] starts their thread.
     slot: Slot,
+    /// The placement's word the `ready` event names, when a seat says one
+    /// ([`Server::with_place`]).
+    place: Option<String>,
 }
 
 /// The slot count `slots` asks of `engine`, or why it cannot be served.
@@ -363,9 +374,34 @@ impl Server {
     /// ([`Engine::media_model`]) in turns parked as ids, and a depth no queue
     /// can reach are refused by name ([`ServeError::Slots`]), as is a chat
     /// template that does not parse or whose thinking probe does not render
-    /// ([`ServeError::Template`]).
+    /// ([`ServeError::Template`]). The socket is bound after those checks and
+    /// accepts nothing until the server runs.
     pub fn bind_with(
         addr: impl ToSocketAddrs,
+        engine: Box<dyn Engine>,
+        config: ServerConfig,
+        slots: SlotConfig,
+    ) -> Result<Self, ServeError> {
+        Server::assemble(|| Listener::bind(addr), engine, config, slots)
+    }
+
+    /// [`bind_with`](Server::bind_with) on a listener bound earlier
+    /// ([`Listener::early`]): it keeps answering `loading` until the server
+    /// runs, then serves from the same socket. The refusals are
+    /// `bind_with`'s, made before the listener is handed over.
+    pub fn bind_listener(
+        listener: Listener,
+        engine: Box<dyn Engine>,
+        config: ServerConfig,
+        slots: SlotConfig,
+    ) -> Result<Self, ServeError> {
+        Server::assemble(|| Ok(listener), engine, config, slots)
+    }
+
+    /// The checks both binds make, then the server over the listener `open`
+    /// yields at the point the socket used to be bound.
+    fn assemble(
+        open: impl FnOnce() -> io::Result<Listener>,
         engine: Box<dyn Engine>,
         config: ServerConfig,
         slots: SlotConfig,
@@ -376,7 +412,7 @@ impl Server {
             return Err(ServeError::SlotSavePath(dir.clone()));
         }
         let depth = check_slots(&*engine, &slots)?;
-        let listener = TcpListener::bind(addr)?;
+        let listener = open()?;
         let tok = engine.tokenizer();
         if tok.stops().is_empty() {
             return Err(ServeError::NoStops);
@@ -394,11 +430,10 @@ impl Server {
             bos_text: tok.bos().map(|id| tok.decode(&[id])).unwrap_or_default(),
             eos_text: tok.decode(&[tok.eos()]),
         };
-        let (end_tx, ended) = mpsc::channel();
         let parallel = slots.parallel;
         let shared = Shared::new(
             Board::new(parallel, depth, slots.picker),
-            end_tx,
+            listener.end(),
             config.sampler.unwrap_or_else(sampling::reference_factory),
         );
         if let Some(note) = thinking_off.note() {
@@ -431,14 +466,22 @@ impl Server {
         Ok(Server {
             listener,
             state: Arc::new(state),
-            ended,
             slot: Slot::with_slots(engine, parallel).schema_jump(slots.schema_jump),
+            place: None,
         })
     }
 
     /// The bound address (the real port when bound to port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        Ok(self.listener.local_addr())
+    }
+
+    /// The server with `place` as the placement word its `ready` event names
+    /// (`a`, `bp`, …), which only the seat that planned the placement knows.
+    #[must_use]
+    pub fn with_place(mut self, place: impl Into<String>) -> Server {
+        self.place = Some(place.into());
+        self
     }
 
     /// The server with `embed` beside its engine: the embeddings routes'
@@ -488,8 +531,8 @@ impl Server {
         let Server {
             listener,
             state,
-            ended,
             slot,
+            place: _,
         } = self;
         let shared = Arc::clone(&state.shared);
         thread::Builder::new()
@@ -499,7 +542,7 @@ impl Server {
                 io::Error::new(e.kind(), format!("cannot start the engine thread: {e}"))
             })?;
         let conn_state = Arc::clone(&state);
-        accept(listener, state.shared.end.clone(), move |stream| {
+        let ended = listener.serve(move |stream| {
             keep_alive(
                 stream,
                 &conn_state.shared.answers,
@@ -514,10 +557,11 @@ impl Server {
     /// asked to stop, and returns why. An orderly stop never returns: it ends
     /// the process inside [`exit_shutdown`], so every seat's
     /// `Ok(server.run())` is the error paths' alone. Once the listener
-    /// serves, the start screen is drawn when a seat armed it
-    /// ([`crate::screen`]), and the live view takes its keys where it can
-    /// ([`crate::live`]).
-    pub fn run(self) -> ServeError {
+    /// serves, the `ready` event is printed ([`crate::event`]), the start
+    /// screen is drawn when a seat armed it ([`crate::screen`]), and the live
+    /// view takes its keys where it can ([`crate::live`]); the `stopped` event
+    /// is printed before `run` returns or the process exits.
+    pub fn run(mut self) -> ServeError {
         // The signals are installed before the listener serves: from the
         // first answer on, Ctrl+C or a kill stops the server the orderly way.
         install_signals({
@@ -529,10 +573,19 @@ impl Server {
             }
         });
         let addr = self.local_addr();
+        let url = event::url(self.listener.local_addr());
+        let place = self.place.take();
         let (state, ended) = match self.start() {
             Ok(s) => s,
             Err(e) => return ServeError::Io(e),
         };
+        event::emit(&event::Event::Ready {
+            url: &url,
+            model: &state.alias,
+            ctx: state.info.ctx_max as u64,
+            slots: state.parallel as u64,
+            place: place.as_deref(),
+        });
         let live = match addr {
             Ok(addr) => crate::live::keys().then_some(addr),
             Err(e) => {
@@ -550,6 +603,7 @@ impl Server {
         match wait_end(&ended, state.fatal_linger) {
             Ended::Error(e) => {
                 crate::live::restore();
+                emit_stopped(&e);
                 e
             }
             Ended::Stop(cause) => exit_shutdown(&cause, |bound| state.shared.wait_stop(bound)),
@@ -954,6 +1008,21 @@ pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
     }
 }
 
+/// Prints the `stopped` event of a run that ended in `e`, before the run
+/// returns it: the engine's failure or the listener's, with the status the
+/// process then exits with ([`Code::of`]). Both servers call it.
+pub(crate) fn emit_stopped(e: &ServeError) {
+    let cause = if matches!(e, ServeError::Engine(_)) {
+        event::Cause::Engine
+    } else {
+        event::Cause::Listener
+    };
+    event::emit(&event::Event::Stopped {
+        cause,
+        exit: Code::of(e),
+    });
+}
+
 // ---------------------------------------------------------------- orderly stop
 
 /// How long an orderly stop waits, in all, before the process exits: on the
@@ -1110,6 +1179,13 @@ pub(crate) fn exit_shutdown(cause: &Stop, wait: impl FnOnce(Duration) -> Waited)
     let waited = wait(ENGINE_STOP);
     let ended = waited == Waited::Done;
     eprintln!("{}", stop_line(cause, waited));
+    event::emit(&event::Event::Stopped {
+        cause: match cause {
+            Stop::Sigint | Stop::Sigterm => event::Cause::Signal,
+            Stop::Posted(_) => event::Cause::Shutdown,
+        },
+        exit: Code::Ok,
+    });
     if !ended {
         if let Err(e) = io::Write::flush(&mut io::stdout()) {
             eprintln!("bloomery-serve: stdout: {e}");
@@ -1200,14 +1276,19 @@ fn admit<F>(
 }
 
 /// Answers a connection the server does not serve with a 503 carrying
-/// `Retry-After`, then closes it after reading what the client sent, for at most
-/// about [`REFUSE_DRAIN`] twice. Runs on the connection's thread, never the
-/// listener's accept loop.
-fn refuse(mut stream: TcpStream, message: &str) {
+/// `message`, as [`refuse_with`] does.
+fn refuse(stream: TcpStream, message: &str) {
+    refuse_with(stream, &error_body(503, "unavailable_error", message));
+}
+
+/// Answers a connection the server does not serve with a 503 carrying `body`
+/// and `Retry-After`, then closes it after reading what the client sent, for
+/// at most about [`REFUSE_DRAIN`] twice. Runs on the connection's thread, never
+/// the listener's accept loop.
+fn refuse_with(mut stream: TcpStream, body: &Value) {
     if stream.set_write_timeout(Some(REFUSE_DRAIN)).is_err() {
         return;
     }
-    let body = error_body(503, "unavailable_error", message);
     let sent = http::respond(
         &mut stream,
         &closing(),

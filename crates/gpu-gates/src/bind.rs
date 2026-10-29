@@ -122,7 +122,16 @@ pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeErr
         slot_save_path: l.slot_save_path,
         api_keys: l.api_keys,
     };
-    let server = Server::bind_with((l.host, l.port), Box::new(engine), config, slots)?;
+    // A start by an agent bound its listener before the fetch ([`crate::start::bind_early`]);
+    // the server takes that socket over, so the port never unbinds.
+    let server = match crate::start::take_early(l.host, l.port).map_err(ServeError::Io)? {
+        Some(listener) => Server::bind_listener(listener, Box::new(engine), config, slots)?,
+        None => Server::bind_with((l.host, l.port), Box::new(engine), config, slots)?,
+    };
+    let server = match crate::start::noted_place() {
+        Some(place) => server.with_place(place),
+        None => server,
+    };
     Ok(match l.side {
         Some(side) => server.with_side(Box::new(side)),
         None => server,
@@ -272,6 +281,12 @@ pub fn place_word(
     Ok(place)
 }
 
+/// The address a serving seat listens on unless `--host` and `--port` say another: the one
+/// owner of the default, which the start's early listener ([`crate::start::bind_early`]) shares.
+pub const DEFAULT_HOST: &str = "127.0.0.1";
+/// See [`DEFAULT_HOST`].
+pub const DEFAULT_PORT: u16 = 8080;
+
 /// The flags every serving seat takes beside its own: the listener (`--host`,
 /// `--port`, `--queue-depth`), the keys (`--api-key`, `--api-key-file`), the
 /// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
@@ -309,8 +324,8 @@ impl SeatFlags {
         mut own: impl FnMut(&str, &str) -> Result<bool, GateError>,
     ) -> Result<SeatFlags, GateError> {
         let mut a = SeatFlags {
-            host: "127.0.0.1".to_owned(),
-            port: 8080,
+            host: DEFAULT_HOST.to_owned(),
+            port: DEFAULT_PORT,
             ctx: None,
             place: None,
             alias: None,

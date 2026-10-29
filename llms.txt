@@ -1,0 +1,5 @@
+# bloomery
+
+> An LLM inference engine for one workstation. It serves an OpenAI- and Anthropic-compatible API from a local model.
+
+To start the server from an agent, read [docs/agents.md](https://raw.githubusercontent.com/midagedev/bloomery/main/docs/agents.md). `bloomery-serve --recommend --json` lists what this machine serves, `bloomery-serve --model NAME` starts it, and the `ready` event on stdout says when to send requests.

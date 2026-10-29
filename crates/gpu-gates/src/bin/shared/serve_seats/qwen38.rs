@@ -2110,7 +2110,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     if a.plan_only {
         // The records before the load are out; nothing was loaded and the
         // route trace's directory is not made.
-        std::process::exit(0);
+        bloomery_gpu_gates::start::plan_exit();
     }
     // Made last among the refusals, so a load that stops before the engine
     // leaves no directory behind.
@@ -3725,6 +3725,7 @@ mod tests {
             uuid: [1; 16],
             pci_bus: "0000:01:00.0".to_string(),
             held_by: None,
+            compute_capability: Some((12, 1)),
         };
         let place = Place38::of(
             Place::parse("0")

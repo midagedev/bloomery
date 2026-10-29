@@ -38,6 +38,11 @@ pub struct DeviceInfo {
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device allocates from host
     /// memory (GB10), one pool with the host.
     pub integrated: bool,
+    /// The device's CUDA compute capability, `(major, minor)`
+    /// (`CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` and `_MINOR`), read
+    /// without a context; `None` on a backend that has none (Metal, the
+    /// mock) and on a tier node's census, whose protocol does not carry it.
+    pub compute_capability: Option<(u32, u32)>,
     /// `cuDeviceGetUuid`.
     pub uuid: [u8; 16],
     /// `cuDeviceGetPCIBusId`.
@@ -56,6 +61,46 @@ impl DeviceInfo {
         DeviceId {
             ordinal: self.ordinal,
             uuid: self.uuid,
+        }
+    }
+
+    /// The class this device is for a build that has the native FP4
+    /// products or not (`native_fp4`); `None` when the census read no
+    /// compute capability, which no class can be drawn from.
+    #[must_use]
+    pub fn card_class(&self, native_fp4: bool) -> Option<CardClass> {
+        self.compute_capability
+            .map(|cc| CardClass::of(cc, self.integrated, native_fp4))
+    }
+}
+
+/// The class of card a format order is kept for: the formats a card runs
+/// fastest follow its compute capability and the build's native FP4 products,
+/// and an integrated device ranks beside them by its own pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardClass {
+    /// No native FP4 products: a card of compute capability below 12, and
+    /// any card of a build without them (an `sm_86` archive on an RTX 5090
+    /// runs the products of an Ampere card).
+    Ampere,
+    /// A discrete card of compute capability 12 on a build with the native
+    /// FP4 products.
+    Blackwell,
+    /// An integrated device of compute capability 12 (GB10) on such a build.
+    Gb10,
+}
+
+impl CardClass {
+    /// The class of a device of compute capability `cc` (`major`, `minor`)
+    /// that is `integrated` or not, on a build that has the native FP4
+    /// products or not. The minor version does not take part: GB10's 12.1
+    /// and the RTX 5090's 12.0 differ by `integrated` alone.
+    #[must_use]
+    pub const fn of((major, _): (u32, u32), integrated: bool, native_fp4: bool) -> CardClass {
+        match (major, integrated, native_fp4) {
+            (12, true, true) => CardClass::Gb10,
+            (12, false, true) => CardClass::Blackwell,
+            _ => CardClass::Ampere,
         }
     }
 }
@@ -678,8 +723,8 @@ impl std::error::Error for CardNotInView {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ALIASES, CardNotInView, DeviceInfo, Pick, PickError, PickWhy, WordError, census_usable,
-        device_on_host, listed_index, resolve, spec_of_device, visible, word_picks,
+        ALIASES, CardClass, CardNotInView, DeviceInfo, Pick, PickError, PickWhy, WordError,
+        census_usable, device_on_host, listed_index, resolve, spec_of_device, visible, word_picks,
         workstation_spec,
     };
     use crate::placement::workstation::{
@@ -719,6 +764,7 @@ mod tests {
                 pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                 held_by: None,
                 integrated: false,
+                compute_capability: None,
             })
             .collect()
     }
@@ -1307,5 +1353,41 @@ mod tests {
             e.starts_with("0 nvidia-smi devices are on cuda0's bus 0000:4B:00.0"),
             "{e}"
         );
+    }
+
+    /// The class follows the compute capability's major version, the device's
+    /// pool and the build's FP4 products, not the minor version: an Ampere
+    /// card (8.6) is Ampere on any build, a 12.0 card is Blackwell on a build
+    /// with the native FP4 products and Ampere without them, GB10 (12.1,
+    /// integrated) is Gb10 on one and Ampere without. A device whose census
+    /// read no capability has no class.
+    #[test]
+    fn the_class_follows_capability_pool_and_build() {
+        for (cc, integrated, fp4, want) in [
+            ((8, 6), false, false, CardClass::Ampere),
+            ((8, 6), false, true, CardClass::Ampere),
+            ((8, 9), false, true, CardClass::Ampere),
+            ((12, 0), false, true, CardClass::Blackwell),
+            ((12, 0), false, false, CardClass::Ampere),
+            ((12, 1), true, true, CardClass::Gb10),
+            ((12, 1), true, false, CardClass::Ampere),
+            ((12, 1), false, true, CardClass::Blackwell),
+            ((12, 0), true, true, CardClass::Gb10),
+        ] {
+            assert_eq!(
+                CardClass::of(cc, integrated, fp4),
+                want,
+                "capability {cc:?}, integrated {integrated}, native FP4 {fp4}"
+            );
+        }
+        let mut a6000 = census(&[(NAME_A6000, TOTAL_A6000)]).remove(0);
+        assert_eq!(a6000.card_class(true), None, "a census with no capability");
+        a6000.compute_capability = Some((8, 6));
+        assert_eq!(a6000.card_class(true), Some(CardClass::Ampere));
+        let mut gb10 = census(&[(NAME_GB10, TOTAL_GB10)]).remove(0);
+        gb10.integrated = true;
+        gb10.compute_capability = Some((12, 1));
+        assert_eq!(gb10.card_class(true), Some(CardClass::Gb10));
+        assert_eq!(gb10.card_class(false), Some(CardClass::Ampere));
     }
 }

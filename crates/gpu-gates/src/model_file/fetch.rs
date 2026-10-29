@@ -1,7 +1,7 @@
 //! What fetches: `--hf <repo>[:<quant>]` into the cache ([`hf::fetch`]) and the files beside a set.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use gguf::Split;
 use hf::HfError;
@@ -29,15 +29,118 @@ pub fn take(args: &[String], path_flags: &[&str]) -> Result<(Flags, Vec<String>)
     Ok(source::take(args, path_flags)?)
 }
 
-/// The cache client: its root `$BLOOMERY_CACHE`, else
-/// `~/.cache/bloomery/hf`; offline under `$HF_HUB_OFFLINE`.
-fn client() -> Result<Client, GateError> {
-    let root = hf::cache_root(std::env::var_os("BLOOMERY_CACHE"), std::env::var_os("HOME"))?;
-    Ok(Client::new(root)?)
+/// The repo a start by name pinned and the revision it reads: a catalog row names a commit of its
+/// repo, and every listing and download of that repo is held to it ([`pin_revision`]).
+static PIN: OnceLock<(String, String)> = OnceLock::new();
+
+/// Pins `repo` to `revision` for every fetch of this process; a second pin that differs is
+/// refused by name.
+pub fn pin_revision(repo: &str, revision: &str) -> Result<(), GateError> {
+    let pin = PIN.get_or_init(|| (repo.to_owned(), revision.to_owned()));
+    if pin.0 == repo && pin.1 == revision {
+        return Ok(());
+    }
+    Err(format!(
+        "{repo} at {revision} cannot be pinned: {} is pinned at {} already",
+        pin.0, pin.1
+    )
+    .into())
 }
 
-/// A fetch's event as its record line on stderr.
+/// `client` reading the revision [`pin_revision`] pinned when it is `repo` that was pinned.
+fn pinned(mut client: Client, repo: &str) -> Client {
+    if let Some((pinned, revision)) = PIN.get()
+        && pinned == repo
+    {
+        client.revision.clone_from(revision);
+    }
+    client
+}
+
+/// The cache client for `repo` at [`cache_root`]; offline under `$HF_HUB_OFFLINE`.
+fn client(repo: &str) -> Result<Client, GateError> {
+    Ok(pinned(Client::new(cache_root()?)?, repo))
+}
+
+/// The hub cache's root: `$BLOOMERY_CACHE`, else `~/.cache/bloomery/hf`.
+pub fn cache_root() -> Result<PathBuf, GateError> {
+    Ok(hf::cache_root(
+        std::env::var_os("BLOOMERY_CACHE"),
+        std::env::var_os("HOME"),
+    )?)
+}
+
+/// `$BLOOMERY_REF_MODEL`, the model the gates' variable names, which a start's own flags must not
+/// name a second time ([`resolve`]).
+pub fn ref_model() -> Option<String> {
+    std::env::var("BLOOMERY_REF_MODEL").ok()
+}
+
+/// What a fetch has written of a set or checkpoint, as the start reports it on `/health`:
+/// the bytes the files hold, the bytes of the files passed and the size of the one in flight.
+#[derive(Default)]
+struct Tally {
+    total: u64,
+    passed: u64,
+    current: u64,
+}
+
+impl Tally {
+    /// The `(written, total)` bytes after `e`, `None` where `e` says nothing of them. A file
+    /// beyond the set (the MTP draft) grows the total.
+    fn on(&mut self, e: &Event<'_>) -> Option<(u64, u64)> {
+        let done = match e {
+            Event::Set { set, .. } => {
+                *self = Tally {
+                    total: set.bytes(),
+                    ..Tally::default()
+                };
+                0
+            }
+            Event::Checkpoint { bytes, .. } => {
+                *self = Tally {
+                    total: *bytes,
+                    ..Tally::default()
+                };
+                0
+            }
+            Event::File { bytes, from, .. } => {
+                self.passed += self.current;
+                self.current = *bytes;
+                self.passed + from
+            }
+            Event::Progress { have, .. } => self.passed + have,
+            Event::Done { .. } => self.passed + self.current,
+            Event::Offline { .. } | Event::DraftSkip { .. } => return None,
+        };
+        self.total = self.total.max(self.passed + self.current);
+        Some((done, self.total))
+    }
+}
+
+static TALLY: Mutex<Tally> = Mutex::new(Tally {
+    total: 0,
+    passed: 0,
+    current: 0,
+});
+
+/// What a start does with the bytes a fetch reports: (written, total).
+static TRANSFER: OnceLock<Box<dyn Fn(u64, u64) + Send + Sync>> = OnceLock::new();
+
+/// Installs what runs as a fetch writes bytes (once; a second call is ignored): the start moves
+/// its `/health` answer's download figures.
+pub fn on_transfer(hook: impl Fn(u64, u64) + Send + Sync + 'static) {
+    let _ = TRANSFER.set(Box::new(hook));
+}
+
+/// A fetch's event as its record line on stderr, and its bytes to the start's hook.
 fn print(e: &Event<'_>) {
+    if let Some(hook) = TRANSFER.get() {
+        let seen = TALLY.lock().unwrap_or_else(PoisonError::into_inner).on(e);
+        if let Some((done, total)) = seen {
+            hook(done, total);
+        }
+    }
     match e {
         Event::Set { repo, set } => Record::new(&record::HF_SET)
             .w("repo", repo)
@@ -131,6 +234,11 @@ pub fn resolve(
     match source::resolve(flags, env)? {
         None => Ok(None),
         Some(Source::File(p)) => Ok(Some(PathBuf::from(p))),
+        Some(Source::Named(name)) => Err(format!(
+            "{name} names a catalog model, which the start's pick turns into a repo before any \
+             fetch"
+        )
+        .into()),
         Some(Source::Hf(r)) => {
             let files: Vec<(&BesideDraft, Candidate)> = refset::arch::beside_drafts()
                 .iter()
@@ -150,7 +258,7 @@ pub fn resolve(
                     usable: usable.as_ref(),
                 })
                 .collect();
-            let files = client()?.resolve_drafts(&r, sources, &drafts, &mut print)?;
+            let files = client(&r.repo)?.resolve_drafts(&r, sources, &drafts, &mut print)?;
             Ok(Some(files.into_iter().next().ok_or_else(|| {
                 format!("--hf {r}: the picked set has no file")
             })?))
@@ -162,7 +270,7 @@ pub fn resolve(
 /// paths in that order.
 pub fn fetch_exact(repo: &str, paths: &[&str]) -> Result<Vec<PathBuf>, GateError> {
     record::require(record::groups::fetch::FETCH, "model_file::fetch_exact");
-    Ok(client()?.resolve_exact(repo, paths, &mut print)?)
+    Ok(client(repo)?.resolve_exact(repo, paths, &mut print)?)
 }
 
 /// Named embedding prefixes beside a local model, or in its HF repo or single base model.
@@ -176,7 +284,7 @@ pub fn sentence_prompts(
     {
         record::require(record::groups::fetch::FETCH, "model_file::sentence_prompts");
         let repo = hf::RepoRef::parse(repo)?.repo;
-        let c = client()?;
+        let c = client(&repo)?;
         let paths = match c.resolve_exact(&repo, &[NAME], &mut print) {
             Ok(paths) => paths,
             Err(e) if no_file(&e) => {
@@ -185,7 +293,7 @@ pub fn sentence_prompts(
                     return Ok(std::collections::BTreeMap::default());
                 };
                 let base = hf::RepoRef::parse(&base)?.repo;
-                match c.resolve_exact(&base, &[NAME], &mut print) {
+                match client(&base)?.resolve_exact(&base, &[NAME], &mut print) {
                     Ok(paths) => paths,
                     Err(e) if no_file(&e) => return Ok(std::collections::BTreeMap::default()),
                     Err(e) => return Err(e.into()),
@@ -227,7 +335,7 @@ fn no_file(error: &HfError) -> bool {
 }
 
 fn model_card(repo: &str) -> Result<Option<String>, GateError> {
-    let card = match client()?.resolve_exact(repo, &["README.md"], &mut print) {
+    let card = match client(repo)?.resolve_exact(repo, &["README.md"], &mut print) {
         Ok(paths) => paths
             .into_iter()
             .next()
@@ -245,7 +353,7 @@ fn model_card(repo: &str) -> Result<Option<String>, GateError> {
 pub fn name(flags: &Flags) -> Result<(), GateError> {
     record::require(record::groups::fetch::FETCH, "model_file::name");
     record::require(record::groups::fetch::SET, "model_file::name");
-    let env = std::env::var("BLOOMERY_REF_MODEL").ok();
+    let env = ref_model();
     let sources = if cfg!(feature = "checkpoint") {
         Sources::GgufOrCheckpoint
     } else {
@@ -274,7 +382,7 @@ pub fn name(flags: &Flags) -> Result<(), GateError> {
 /// reads it ([`model_hf::folder::architecture`]; a folder declares no decision type). Under
 /// `HF_HUB_OFFLINE` there is no listing to read it from.
 pub fn repo_architecture(r: &hf::RepoRef) -> Result<(String, Option<String>), GateError> {
-    let client = client()?;
+    let client = client(&r.repo)?;
     if client.offline {
         return Err(format!("--hf {r}: HF_HUB_OFFLINE is set, so there is no listing").into());
     }
@@ -338,7 +446,7 @@ pub fn hf_projector() -> Result<Option<PathBuf>, GateError> {
         .ancestors()
         .nth(repo.split('/').count())
         .ok_or_else(in_repo)?;
-    let Some(path) = Client::new(root.to_path_buf())?.mmproj_path(repo, &rel)? else {
+    let Some(path) = pinned(Client::new(root.to_path_buf())?, repo).mmproj_path(repo, &rel)? else {
         return Ok(None);
     };
     Ok(fetch_exact(repo, &[path.as_str()])?.into_iter().next())
@@ -374,6 +482,76 @@ mod tests {
         );
         std::fs::remove_file(config).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// A fetch's bytes as `/health` reports them: the set's size is the total, a file in flight
+    /// adds the bytes written so far to the files passed, a cached file counts whole when the
+    /// next one begins, and a file beyond the set grows the total.
+    #[test]
+    fn a_fetch_reports_its_bytes_against_the_sets_total() {
+        use super::Tally;
+        use hf::fetch::{Event, State};
+        let file = |path: &str, size: u64| hf::Entry {
+            path: path.to_owned(),
+            size,
+            check: hf::Check::Sha256,
+            digest: String::new(),
+        };
+        let set = hf::GgufSet {
+            name: "m".to_owned(),
+            tag: String::new(),
+            files: vec![file("m-1.gguf", 100), file("m-2.gguf", 50)],
+            count: 2,
+        };
+        let mut tally = Tally::default();
+        let mut at = |e: Event<'_>| tally.on(&e);
+        let first = |state, from| Event::File {
+            file: "m-1.gguf",
+            bytes: 100,
+            state,
+            from,
+        };
+        assert_eq!(
+            at(Event::Set {
+                repo: "o/n",
+                set: &set
+            }),
+            Some((0, 150))
+        );
+        assert_eq!(at(first(State::Resume, 20)), Some((20, 150)));
+        assert_eq!(
+            at(Event::Progress {
+                file: "m-1.gguf",
+                have: 70,
+                of: 100
+            }),
+            Some((70, 150))
+        );
+        let second = Event::File {
+            file: "m-2.gguf",
+            bytes: 50,
+            state: State::Cached,
+            from: 50,
+        };
+        assert_eq!(at(second), Some((150, 150)), "a cached file is whole");
+        let draft = Event::File {
+            file: "mtp-m.gguf",
+            bytes: 30,
+            state: State::Fetch,
+            from: 10,
+        };
+        assert_eq!(
+            at(draft),
+            Some((160, 180)),
+            "a file beyond the set grows the total"
+        );
+        assert_eq!(
+            at(Event::Offline {
+                repo: "o/n",
+                why: "w"
+            }),
+            None
+        );
     }
 
     #[test]

@@ -8,10 +8,11 @@
 //! the files named exactly ([`exact`]), the MTP draft by its file name
 //! ([`mtp_draft`]), a model's image-projector sibling ([`mmproj_sibling`]),
 //! the cache paths ([`cache_root`],
-//! [`cache_path`]), where a model file comes from ([`source`]) and what a
-//! model card says ([`card`]). The network part, [`fetch`], is `curl`, the
-//! checks of what it wrote, and the cache standing in when the network
-//! refuses the listing.
+//! [`cache_path`]), where a model file comes from ([`source`]), the models
+//! bloomery starts by name and the rule that picks a file for a machine
+//! ([`catalog`]) and what a model card says ([`card`]). The network part,
+//! [`fetch`], is `curl`, the checks of what it wrote, and the cache standing
+//! in when the network refuses the listing.
 //!
 //! The picking follows llama.cpp's `common/download.cpp`: a split set
 //! (`-00001-of-0000N.gguf`) is one set by its prefix and count, and the
@@ -34,6 +35,7 @@
 //! runtime's shape); [`schema`] holds the keys and values a checkpoint reader accepts.
 
 pub mod card;
+pub mod catalog;
 pub mod csf;
 pub mod dspark;
 pub mod fetch;
@@ -259,6 +261,13 @@ impl Entry {
     pub fn name(&self) -> &str {
         self.path.rsplit('/').next().unwrap_or(&self.path)
     }
+}
+
+/// Whether `rev` is a commit (a git sha-1, 40 hex digits): a revision whose files never change,
+/// where a branch or a tag may move.
+#[must_use]
+pub fn is_commit(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn hex_of(v: Option<&Value>, len: usize) -> Option<String> {
@@ -1117,5 +1126,23 @@ mod tests {
             Some("https://huggingface.co/api/models/a/b/tree/main?recursive=true&cursor=xyz")
         );
         assert_eq!(next_link("HTTP/2 200\r\ncontent-type: x\r\n"), None);
+    }
+
+    /// A commit is 40 hex digits; a branch, a tag or a short sha may move or be ambiguous.
+    #[test]
+    fn only_a_full_sha_is_a_commit() {
+        assert!(is_commit("766911a6b7369840a91dbcd95f9f997acaab6cd6"));
+        assert!(is_commit("766911A6B7369840A91DBCD95F9F997ACAAB6CD6"));
+        for not in [
+            "main",
+            "refs/pr/1",
+            "766911a",
+            "",
+            "766911a6b7369840a91dbcd95f9f997acaab6cd",
+            "766911a6b7369840a91dbcd95f9f997acaab6cd66",
+            "g66911a6b7369840a91dbcd95f9f997acaab6cd6",
+        ] {
+            assert!(!is_commit(not), "{not:?}");
+        }
     }
 }

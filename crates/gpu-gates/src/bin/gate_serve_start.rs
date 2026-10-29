@@ -56,6 +56,26 @@
 //!   exits 0 listens, and that hook's input is its own `need` record. The hook is consulted by the placed load
 //!   before its own open of the card: that start's hook waits `HOOK_WAIT_S` seconds, and the load's `context_s`
 //!   phase (the open of the card) stays under half of them. A consult after the open puts the wait in that phase.
+//! - (s7) a start by catalog name (`--model <name>`), offline from a cache laid out as the catalog row's repo: the
+//!   family's default model's first verified GGUF row (read from `tools/catalog.tsv`), its shards the fixture's, linked
+//!   under the row's own file names, each beside a `.verified` marker. The `pick` event names the cached row (variant,
+//!   source, `cached`, nothing to download). `pick` and `bound` come before `ready`, which repeats the `bound` url; a
+//!   text chat is a 200; every stdout line is an event of the one schema; a SIGTERM ends the server with exit 0 and a
+//!   `stopped` event whose cause is `signal`.
+//! - (s8) `--model <name> --dry-run --json` prints one JSON document and exits 0 without a start: one model entry whose
+//!   pick is the cached row, and `start`, the argument list a real start would run: `--model <name>:<variant>` and the
+//!   flags given, no `--hf` and no `--revision`, so the start replays the pick at the row's pinned commit. That start's
+//!   `--plan --json` prints the same `pick` (variant, source, revision) and a plan that equals the dry run's pick in place,
+//!   context, slots and paged bytes, and is the plan of the fixture file (the same need bytes and limit).
+//! - (s9) the loading window of (s7)'s start: from the `bound` event on, `GET /health` answers 503 `loading` (phase,
+//!   byte counts and the `error` object llama-server answers with) until the first 200; no 200 is answered before the
+//!   `ready` event is on stdout, and no 503 after it.
+//! - (s10) the exit table, on the refusals a start meets, each ending in an `error` event of the code's name and
+//!   status: an unknown name is 64; a `--model` value that is a path is 64 with a `next` that names `-m`; an embedding
+//!   file is 65 and names `--embd-model`; a card budget below the dense trunk is 80, and its `next` offers only variants
+//!   smaller than the one asked, the next smaller one among them (the families' default models have none, so theirs
+//!   offers no variant); a `BLOOMERY_*` value no lever takes is 78 and names it; a port another process holds is 83,
+//!   found before the load, with `--port 0` in `next`.
 //!
 //! A clause's failure never ends the run: an error inside a clause (a server that exits before it listens,
 //! a kind the log is not read by) is that clause's FAIL line, and (s4) reads every log the run wrote.
@@ -66,7 +86,7 @@
 //! The fixture tier is the only tier with a file this gate may start a server on; the real tier ends by
 //! name before anything runs.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -78,14 +98,19 @@ use bloomery_gpu_gates::record::{self, Fields, Kind};
 use bloomery_gpu_gates::serve_client::{
     self, Served, curl, json_of, rendered, server_log, tokenized,
 };
+use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::tier::{self, Tier};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, Flags, Projector};
 use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
+use bloomery_levers::CARD_BUDGET;
 use gguf::Split;
+use gguf::write::{Layout, TensorDecl, Writer};
 use refset::arch::deepseek41v::{VISION, VISION_SET};
 use refset::arch::glm5next::vis::MMPROJ_BF16;
 use refset::vision::VisionSet;
 use serde_json::{Value, json};
+use serve::event::SCHEMA as EVENT_SCHEMA;
+use serve::exit::Code;
 
 const NAME: &str = "gate_serve_start";
 const USAGE: &str = "usage: gate_serve_start --family glm|ds41 --dir <out>";
@@ -118,6 +143,23 @@ const SET_DIR: &str = "fixture";
 const FILE_MARK: &str = "FILE-TEMPLATE|";
 /// What a server's log must never hold.
 const NEEDLES: [&str; 2] = ["does not print this kind", "panicked"];
+/// The model catalog's committed print, relative to the repository root: the by-name clauses take the family's row
+/// from it.
+const CATALOG: &str = "tools/catalog.tsv";
+/// The columns of a catalog row.
+const CATALOG_COLUMNS: usize = 11;
+/// The schema the `--plan --json` line names.
+const PLAN_SCHEMA: &str = "bloomery.plan/1";
+/// How often a start's stdout and `/health` are read while the gate waits for the server.
+const EVENT_GAP: Duration = Duration::from_millis(50);
+/// The longest a start that must refuse, or a stop that must be orderly, may take.
+const END_WAIT: Duration = Duration::from_secs(120);
+/// A card budget below the floor of any plan.
+const BUDGET_BELOW_FLOOR: &str = "64M";
+/// A card budget no lever parser takes.
+const BUDGET_NOT_BYTES: &str = "banana";
+/// A model name no catalog holds.
+const NO_SUCH_MODEL: &str = "no-such-model";
 
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with(NAME, run())
@@ -402,13 +444,392 @@ impl Drop for CacheDir {
 
 /// `target` linked into `dir` under its own name, beside a `.verified` marker holding `sha`.
 fn link(target: &Path, dir: &Path, sha: &str) -> Result<(), GateError> {
+    link_as(target, dir, &file_name(target), sha)
+}
+
+/// `target` linked into `dir` as `name`, beside a `.verified` marker holding `sha`.
+fn link_as(target: &Path, dir: &Path, name: &str, sha: &str) -> Result<(), GateError> {
     let target = std::path::absolute(target)?;
-    let at = dir.join(file_name(&target));
+    let at = dir.join(name);
     std::os::unix::fs::symlink(target, &at)?;
     let mut marker = at.into_os_string();
     marker.push(".verified");
     std::fs::write(marker, format!("{sha}\n"))?;
     Ok(())
+}
+
+/// A row of the catalog print: the columns the by-name clauses read.
+struct CatalogRow {
+    name: String,
+    aliases: Vec<String>,
+    seat: String,
+    variant: String,
+    format: String,
+    hf: String,
+    bytes: Option<u64>,
+    verified: bool,
+}
+
+/// The rows of the catalog print `text`: a line of another width, a count that is none and a verdict that is neither
+/// `true` nor `false` are refused by name.
+fn catalog_rows(text: &str) -> Result<Vec<CatalogRow>, GateError> {
+    let mut rows = Vec::new();
+    let mut header = false;
+    for (n, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if !header {
+            if cols.first() != Some(&"name") {
+                return Err(format!("{CATALOG}:{}: the header line is missing", n + 1).into());
+            }
+            header = true;
+            continue;
+        }
+        let &[
+            name,
+            aliases,
+            seat,
+            _arch,
+            variant,
+            format,
+            hf,
+            _revision,
+            bytes,
+            verified,
+            _note,
+        ] = cols.as_slice()
+        else {
+            return Err(format!(
+                "{CATALOG}:{}: {} columns, not {CATALOG_COLUMNS}",
+                n + 1,
+                cols.len()
+            )
+            .into());
+        };
+        let bytes = match bytes {
+            "-" => None,
+            b => Some(
+                b.parse::<u64>()
+                    .map_err(|e| format!("{CATALOG}:{}: bytes {b:?}: {e}", n + 1))?,
+            ),
+        };
+        let verified = match verified {
+            "true" => true,
+            "false" => false,
+            v => return Err(format!("{CATALOG}:{}: verified is {v:?}", n + 1).into()),
+        };
+        rows.push(CatalogRow {
+            name: name.to_owned(),
+            aliases: aliases.split(',').map(str::to_owned).collect(),
+            seat: seat.to_owned(),
+            variant: variant.to_owned(),
+            format: format.to_owned(),
+            hf: hf.to_owned(),
+            bytes,
+            verified,
+        });
+    }
+    if rows.is_empty() {
+        return Err(format!("{CATALOG}: no rows").into());
+    }
+    Ok(rows)
+}
+
+/// The catalog row a by-name start of a seat takes.
+struct NamedRow {
+    /// The catalog name: the model whose alias is the seat's word.
+    model: String,
+    /// The model's first verified GGUF row the automatic pick takes (a format of 8 bits or more is explicit-only).
+    variant: String,
+    repo: String,
+    /// The variants of the model the catalog records fewer bytes for.
+    smaller: Vec<String>,
+    /// The next smaller variant: the largest verified row of the smaller ones in an automatic format (2 to 4 bits).
+    /// For the two families this gate runs no smaller row is of another automatic format.
+    step: Option<String>,
+}
+
+impl NamedRow {
+    /// The row of the model that has `seat` as an alias.
+    fn of(seat: &str, rows: &[CatalogRow]) -> Result<NamedRow, GateError> {
+        let model = rows
+            .iter()
+            .find(|r| r.seat == seat && r.aliases.iter().any(|a| a == seat))
+            .map(|r| r.name.clone())
+            .ok_or_else(|| format!("{CATALOG}: no model has the seat word {seat} as an alias"))?;
+        let of_model: Vec<&CatalogRow> = rows.iter().filter(|r| r.name == model).collect();
+        let row = of_model
+            .iter()
+            .find(|r| {
+                r.verified
+                    && r.hf.contains(':')
+                    && !matches!(r.format.as_str(), "gguf8" | "gguf6" | "gguf5")
+            })
+            .ok_or_else(|| format!("{CATALOG}: {model} has no verified GGUF row to start from"))?;
+        let (repo, variant) = row
+            .hf
+            .split_once(':')
+            .ok_or_else(|| format!("{CATALOG}: {} names no quant", row.hf))?;
+        let under: Vec<&&CatalogRow> = of_model
+            .iter()
+            .filter(|r| matches!((r.bytes, row.bytes), (Some(a), Some(b)) if a < b))
+            .collect();
+        let smaller = under.iter().map(|r| r.variant.clone()).collect();
+        let step = under
+            .iter()
+            .filter(|r| r.verified && matches!(r.format.as_str(), "gguf2" | "gguf3" | "gguf4"))
+            .max_by_key(|r| r.bytes)
+            .map(|r| r.variant.clone());
+        Ok(NamedRow {
+            variant: variant.to_owned(),
+            repo: repo.to_owned(),
+            model,
+            smaller,
+            step,
+        })
+    }
+
+    /// The `--hf` value that names the row.
+    fn hf(&self) -> String {
+        format!("{}:{}", self.repo, self.variant)
+    }
+}
+
+/// The lines of a stdout `text` that are complete: a last line with no newline is still being written.
+fn complete_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.rfind('\n')
+        .map_or("", |i| &text[..i])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+}
+
+/// The event a stdout line is: a JSON object that names [`EVENT_SCHEMA`] and an event.
+fn event_of(line: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .filter(|v| v["schema"] == EVENT_SCHEMA && v["event"].is_string())
+}
+
+/// The events of a server's stdout `text`; the first line that is no event is refused by name.
+fn events_in(text: &str) -> Result<Vec<Value>, GateError> {
+    complete_lines(text)
+        .map(|l| {
+            event_of(l).ok_or_else(|| {
+                GateError::from(format!(
+                    "a stdout line that is no event of {EVENT_SCHEMA}: {}",
+                    tail(l, 200)
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The events of a stdout `text` so far, a line that is no event left out: the polls read a file the server is still
+/// writing, and [`events_in`] judges it whole.
+fn events_seen(text: &str) -> Vec<Value> {
+    complete_lines(text).filter_map(event_of).collect()
+}
+
+/// The first event named `name`.
+fn event<'a>(events: &'a [Value], name: &str) -> Option<&'a Value> {
+    events.iter().find(|e| e["event"] == name)
+}
+
+/// The file at `path`, read as text.
+fn read_lossy(path: &Path) -> Result<String, GateError> {
+    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
+/// Whether the `ready` event is on the server's stdout.
+fn ready_printed(out: &Path) -> Result<bool, GateError> {
+    Ok(event(&events_seen(&read_lossy(out)?), "ready").is_some())
+}
+
+/// The events of a server's stdout once `want` holds of them. The server ending first, or the wait running out, is an
+/// error that names `what` and ends with the server's stderr.
+fn events_until(
+    served: &mut Served,
+    out: &Path,
+    err: &Path,
+    what: &str,
+    want: &dyn Fn(&[Value]) -> bool,
+) -> Result<Vec<Value>, GateError> {
+    let until = Instant::now() + POLL * u32::try_from(POLLS)?;
+    loop {
+        let events = events_seen(&read_lossy(out)?);
+        if want(&events) {
+            return Ok(events);
+        }
+        if let Some(status) = served.child.try_wait()? {
+            return Err(format!(
+                "the server ended ({status}) before {what}; {}",
+                tail(&read_lossy(err)?, 1500)
+            )
+            .into());
+        }
+        if Instant::now() >= until {
+            return Err(format!(
+                "no {what} within the wait; {}",
+                tail(&read_lossy(err)?, 1500)
+            )
+            .into());
+        }
+        std::thread::sleep(EVENT_GAP);
+    }
+}
+
+/// Sends SIGTERM to the process `pid`, one this gate spawned.
+fn terminate(pid: u32) -> Result<(), GateError> {
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+    if !status.success() {
+        return Err(format!("kill -TERM {pid} ended {status}").into());
+    }
+    Ok(())
+}
+
+/// A server's `--json` answer: exactly one stdout line, a JSON object.
+fn one_json_line(what: &str, stdout: &str) -> Result<Value, GateError> {
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let &[line] = lines.as_slice() else {
+        return Err(format!(
+            "{what}: stdout holds {} lines, not one JSON object: {}",
+            lines.len(),
+            tail(stdout, 300)
+        )
+        .into());
+    };
+    serde_json::from_str(line)
+        .map_err(|e| GateError::from(format!("{what}: {e}: {}", tail(line, 300))))
+}
+
+/// The plan line and the events of a `--plan --json` run's stdout: every line is a JSON object, exactly one names
+/// [`PLAN_SCHEMA`], and the others are events of the one schema.
+fn plan_and_events(what: &str, stdout: &str) -> Result<(Value, Vec<Value>), GateError> {
+    let mut plan = None;
+    let mut events = Vec::new();
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let v: Value = serde_json::from_str(line)
+            .map_err(|e| GateError::from(format!("{what}: {e}: {}", tail(line, 300))))?;
+        if v["schema"] == PLAN_SCHEMA {
+            if plan.replace(v).is_some() {
+                return Err(format!("{what}: stdout holds two plan lines").into());
+            }
+        } else if v["schema"] == EVENT_SCHEMA {
+            events.push(v);
+        } else {
+            return Err(format!(
+                "{what}: a stdout line names the schema {}, not {PLAN_SCHEMA} or {EVENT_SCHEMA}",
+                v["schema"]
+            )
+            .into());
+        }
+    }
+    let plan = plan.ok_or_else(|| {
+        GateError::from(format!(
+            "{what}: stdout holds no line of the schema {PLAN_SCHEMA}: {}",
+            tail(stdout, 300)
+        ))
+    })?;
+    Ok((plan, events))
+}
+
+/// Whether the `error` event `e` lists the argument list `argv` in its `next`.
+fn next_has(e: &Value, argv: &[&str]) -> bool {
+    e["next"].as_array().is_some_and(|next| {
+        next.iter().any(|list| {
+            list.as_array().is_some_and(|list| {
+                list.len() == argv.len() && list.iter().zip(argv).all(|(a, b)| a == b)
+            })
+        })
+    })
+}
+
+/// Whether every key of `keys` is set in `a` and `b` and equal.
+fn same(a: &Value, b: &Value, keys: &[&str]) -> bool {
+    keys.iter().all(|k| !a[*k].is_null() && a[*k] == b[*k])
+}
+
+/// A GGUF file at `path` whose architecture is `arch`, with one tensor: what a start reads of a file to seat it.
+fn gguf_of_arch(path: &Path, arch: &str) -> Result<(), GateError> {
+    let kvs = [
+        (
+            gguf::GENERAL_ARCHITECTURE.to_owned(),
+            gguf::Value::String(arch.to_owned()),
+        ),
+        // The fixture tier opens only files its generator wrote: this one carries the generator's key, and
+        // the server refuses it for what it is.
+        (tier::VERSION_KEY.to_owned(), gguf::Value::U32(1)),
+    ];
+    let name = "token_embd.weight";
+    let decl = TensorDecl {
+        name: name.to_owned(),
+        dims: vec![4],
+        type_id: 0,
+        nbytes: 16,
+    };
+    let mut writer = Writer::new(std::fs::File::create(path)?, Layout::new(&kvs, vec![decl])?)?;
+    writer.tensor(name, &[0u8; 16])?;
+    writer.finish()?;
+    Ok(())
+}
+
+/// What one `GET /health` saw of a start that is loading, and whether the `ready` event was on the server's stdout
+/// before the request and after its answer.
+struct Probe {
+    status: u16,
+    body: String,
+    ready_before: bool,
+    ready_after: bool,
+}
+
+impl Probe {
+    /// Whether the answer is the 503 a loading server gives: the status word `loading`, the phase, both byte counts and
+    /// the `error` object llama-server answers with.
+    fn is_loading(&self) -> bool {
+        self.status == 503
+            && serde_json::from_str::<Value>(&self.body).is_ok_and(|b| {
+                b["status"] == "loading"
+                    && matches!(b["phase"].as_str(), Some("fetch" | "plan" | "load"))
+                    && b["bytes_done"].is_u64()
+                    && b["bytes_total"].is_u64()
+                    && b["error"]["code"].as_u64() == Some(503)
+                    && b["error"]["type"] == "unavailable_error"
+            })
+    }
+}
+
+/// A start that must end by refusing: its exit status, the events it printed and its stderr file.
+struct Refusal {
+    status: Option<i32>,
+    events: Vec<Value>,
+    err: PathBuf,
+}
+
+impl Refusal {
+    /// The `error` event the process printed last.
+    fn error(&self) -> Option<&Value> {
+        self.events.iter().rev().find(|e| e["event"] == "error")
+    }
+
+    /// Whether the process ended with `code`'s status and said so in an `error` event: the status, the name and a hint.
+    fn is(&self, code: Code) -> bool {
+        self.status == Some(i32::from(code.status()))
+            && self.error().is_some_and(|e| {
+                e["exit"].as_u64() == Some(u64::from(code.status()))
+                    && e["code"] == code.name()
+                    && e["hint"].as_str().is_some_and(|h| !h.is_empty())
+            })
+    }
+
+    /// Whether the `error` event's message holds `needle`.
+    fn says(&self, needle: &str) -> bool {
+        self.error()
+            .is_some_and(|e| e["message"].as_str().is_some_and(|m| m.contains(needle)))
+    }
 }
 
 /// The sha256 of each file, one thread a file; an error names the file.
@@ -523,6 +944,19 @@ struct Gate {
     images: Result<Images, String>,
     /// `/apply-template` of [`call_messages`] on (s1)'s server, which (s5) compares its render with.
     plain_render: OnceCell<String>,
+    /// The thread that hashes the shards and the projector, until [`Gate::digests`] joins it.
+    hashing: RefCell<Option<Hashed>>,
+    /// The sha256 of the shards and then the projector (the shards alone when no projector opened), once the
+    /// hashing thread is joined.
+    digests: OnceCell<Result<Vec<String>, String>>,
+    /// The family's catalog row and the offline cache that holds it, which (s7), (s8) and (s10) start from.
+    named: OnceCell<Result<Named, String>>,
+}
+
+/// What the by-name clauses start from: the family's catalog row and an offline cache that holds it.
+struct Named {
+    row: NamedRow,
+    cache: CacheDir,
 }
 
 impl Gate {
@@ -547,6 +981,9 @@ impl Gate {
             shards,
             images,
             plain_render: OnceCell::new(),
+            hashing: RefCell::new(None),
+            digests: OnceCell::new(),
+            named: OnceCell::new(),
         })
     }
 
@@ -554,13 +991,27 @@ impl Gate {
         self.images.as_ref().map_err(|e| GateError::from(e.clone()))
     }
 
-    /// The sha256 of the shards and then the projector, computed beside the plain and the `--mmproj` starts.
-    fn hash_in_background(&self) -> Hashed {
+    /// Starts hashing the shards and then the projector, beside the plain and the `--mmproj` starts.
+    fn hash_in_background(&self) {
         let mut files = self.shards.clone();
         if let Ok(im) = &self.images {
             files.push(im.file.clone());
         }
-        hash_in_background(files)
+        *self.hashing.borrow_mut() = Some(hash_in_background(files));
+    }
+
+    /// The digests of the shards and then the projector: the hashing thread's answer, joined at the first call.
+    fn digests(&self) -> Result<&[String], GateError> {
+        let done = self
+            .digests
+            .get_or_init(|| match self.hashing.borrow_mut().take() {
+                Some(thread) => thread
+                    .join()
+                    .map_err(|_| "the hashing thread panicked".to_owned())
+                    .and_then(|hashed| hashed),
+                None => Err("no hashing thread was started".to_owned()),
+            });
+        done.as_deref().map_err(|e| GateError::from(e.clone()))
     }
 
     /// The arguments every start shares: the loopback address and an ephemeral port.
@@ -682,11 +1133,10 @@ impl Gate {
         Ok(ok)
     }
 
-    /// (s3): `hashed` is the thread of [`Gate::hash_in_background`].
-    fn hf(&self, hashed: Hashed) -> Result<bool, GateError> {
+    /// (s3).
+    fn hf(&self) -> Result<bool, GateError> {
         let im = self.images()?;
-        let hashes = hashed.join().map_err(|_| "the hashing thread panicked")??;
-        let cache = self.build_cache(&hashes, im)?;
+        let cache = self.build_cache(self.digests()?, im)?;
         let root = cache.0.as_path();
         let mut args = vec!["--hf".to_owned(), format!("{}:{QUANT}", self.family.repo())];
         args.extend(Self::base_args());
@@ -1006,6 +1456,489 @@ impl Gate {
         Ok(ok)
     }
 
+    /// The family's catalog row and the offline cache that holds it, made at the first call.
+    fn named(&self) -> Result<&Named, GateError> {
+        self.named
+            .get_or_init(|| self.make_named().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| GateError::from(e.clone()))
+    }
+
+    fn make_named(&self) -> Result<Named, GateError> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(CATALOG);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let row = NamedRow::of(self.family.word(), &catalog_rows(&text)?)?;
+        let cache = self.build_named_cache(&row)?;
+        Ok(Named { row, cache })
+    }
+
+    /// The cache of the by-name clauses in `<dir>/named_hf`: the layout of the catalog row's repo, the fixture's
+    /// shards linked under the file names the row's set has (the repo's name less `-GGUF`, the variant, the shard
+    /// counts), each beside the sha256 of the file it points at.
+    fn build_named_cache(&self, row: &NamedRow) -> Result<CacheDir, GateError> {
+        let digests = self
+            .digests()?
+            .get(..self.shards.len())
+            .ok_or("the hashing thread returned fewer digests than shards")?;
+        let root = self.dir.join("named_hf");
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = CacheDir(root.clone());
+        let set_dir = root.join(&row.repo).join(&row.variant);
+        std::fs::create_dir_all(&set_dir)?;
+        let stem = row.repo.rsplit('/').next().unwrap_or(&row.repo);
+        let stem = stem.strip_suffix("-GGUF").unwrap_or(stem);
+        let count = self.shards.len();
+        for (i, (shard, sha)) in self.shards.iter().zip(digests).enumerate() {
+            let name = if count == 1 {
+                format!("{stem}-{}.gguf", row.variant)
+            } else {
+                format!("{stem}-{}-{:05}-of-{count:05}.gguf", row.variant, i + 1)
+            };
+            link_as(shard, &set_dir, &name, sha)?;
+        }
+        println!(
+            "named: cache {} holds {count} shards as {}/{}",
+            root.display(),
+            row.repo,
+            row.variant
+        );
+        Ok(cache)
+    }
+
+    /// (s7) and (s9): the start by catalog name from the offline cache. One server runs from the `bound` event through
+    /// a SIGTERM; `GET /health` is read from the `bound` event to its first 200.
+    fn by_name(&self) -> Result<bool, GateError> {
+        let named = self.named()?;
+        let dir = self.dir.join("s7");
+        std::fs::create_dir_all(&dir)?;
+        let mut args = vec!["--model".to_owned(), named.row.model.clone()];
+        args.extend(Self::base_args());
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        println!("s7: bloomery-serve {}", argv.join(" "));
+        let mut served = Served::spawn_cmd(command(Some(named.cache.0.as_path()))?, &argv, &dir)?;
+        let (out, err) = (dir.join("server.out"), dir.join("server.err"));
+        let bound = events_until(&mut served, &out, &err, "the bound event", &|events| {
+            event(events, "bound").is_some()
+        })?;
+        let url = event(&bound, "bound")
+            .and_then(|b| b["url"].as_str())
+            .ok_or("the bound event names no url")?
+            .to_owned();
+        let mut ok = check(
+            "s9_the_bound_event_says_loading",
+            event(&bound, "bound").is_some_and(|b| b["phase"] == "loading"),
+        );
+        // The loading window: every answer before the first 200, with the `ready` event's presence on each side.
+        let mut probes: Vec<Probe> = Vec::new();
+        let until = Instant::now() + POLL * u32::try_from(POLLS)?;
+        loop {
+            let ready_before = ready_printed(&out)?;
+            let (status, body) = curl(&format!("{url}/health"), None, false)?;
+            let ready_after = ready_printed(&out)?;
+            probes.push(Probe {
+                status,
+                body,
+                ready_before,
+                ready_after,
+            });
+            if status == 200 {
+                break;
+            }
+            if let Some(exit) = served.child.try_wait()? {
+                return Err(format!(
+                    "the server ended ({exit}) while loading; {}",
+                    tail(&read_lossy(&err)?, 1500)
+                )
+                .into());
+            }
+            if Instant::now() >= until {
+                return Err("the server answered /health with a 503 for the whole wait".into());
+            }
+            std::thread::sleep(EVENT_GAP);
+        }
+        let loading: Vec<&Probe> = probes.iter().filter(|p| p.status != 200).collect();
+        println!(
+            "s9: {} reads of /health, {} before the first 200",
+            probes.len(),
+            loading.len()
+        );
+        if let Some(first) = loading.first() {
+            println!("s9: the first answer: {}", tail(&first.body, 300));
+        }
+        ok &= check(
+            "s9_health_is_503_loading_until_the_first_200",
+            !loading.is_empty() && loading.iter().all(|p| p.is_loading()),
+        );
+        ok &= check(
+            "s9_no_200_before_the_ready_event",
+            probes.iter().all(|p| p.status != 200 || p.ready_after),
+        );
+        ok &= check(
+            "s9_no_503_after_the_ready_event",
+            probes.iter().all(|p| !p.ready_before || p.status == 200),
+        );
+
+        let events = events_seen(&read_lossy(&out)?);
+        let at = |name: &str| events.iter().position(|e| e["event"] == name);
+        println!(
+            "s7: events {:?}",
+            events
+                .iter()
+                .map(|e| e["event"].as_str())
+                .collect::<Vec<_>>()
+        );
+        ok &= check(
+            "s7_pick_event_names_the_cached_row",
+            event(&events, "pick").is_some_and(|p| {
+                p["variant"] == named.row.variant.as_str()
+                    && p["source"] == named.row.hf().as_str()
+                    && p["cached"].as_bool() == Some(true)
+                    && p["download"].as_u64() == Some(0)
+            }),
+        );
+        ok &= check(
+            "s7_pick_and_bound_come_before_ready",
+            matches!(
+                (at("pick"), at("bound"), at("ready")),
+                (Some(pick), Some(bound), Some(ready)) if pick < ready && bound < ready
+            ),
+        );
+        ok &= check(
+            "s7_ready_event_names_the_server",
+            event(&events, "ready").is_some_and(|r| {
+                r["url"].as_str() == Some(url.as_str())
+                    && r["model"].as_str().is_some_and(|m| !m.is_empty())
+                    && r["ctx"].as_u64().is_some_and(|c| c > 0)
+                    && r["slots"].as_u64().is_some_and(|n| n > 0)
+            }),
+        );
+        let url_of = |p: &str| format!("{url}{p}");
+        ok &= check("s7_health_ok", health(&url_of)?);
+        let (st, body) = chat(&url_of, &text_messages())?;
+        println!(
+            "s7: text chat HTTP {st}, prompt_tokens {:?}",
+            prompt_tokens(&body)
+        );
+        ok &= check(
+            "s7_text_chat_200",
+            st == 200 && prompt_tokens(&body).is_some_and(|n| n > 0),
+        );
+        // The orderly stop: SIGTERM to the pid this gate spawned.
+        terminate(served.child.id())?;
+        let status = ended(&mut served.child, END_WAIT)?;
+        let all = events_in(&read_lossy(&out)?);
+        if let Err(e) = &all {
+            println!("s7: {e}");
+        }
+        ok &= check("s7_stdout_holds_events_only", all.is_ok());
+        let stopped = all.as_ref().ok().and_then(|e| event(e, "stopped"));
+        println!("s7: ended {status:?}; stopped event {stopped:?}");
+        ok &= check(
+            "s7_a_sigterm_ends_it_orderly_with_a_stopped_event",
+            status.is_some_and(|s| s.code() == Some(0))
+                && stopped.is_some_and(|s| {
+                    s["cause"] == "signal"
+                        && s["exit"].as_u64() == Some(u64::from(Code::Ok.status()))
+                }),
+        );
+        Ok(ok)
+    }
+
+    /// `args` with `--plan --json` run to its end: the plan the server printed, one JSON line that names
+    /// [`PLAN_SCHEMA`], and the events before it (a start by name prints its `pick`; every other stdout line is
+    /// refused by name). Its stderr is kept in `<dir>/<tag>/plan.err`.
+    fn plan_json(
+        &self,
+        tag: &str,
+        args: &[String],
+        cache: Option<&Path>,
+    ) -> Result<(Value, Vec<Value>), GateError> {
+        let dir = self.dir.join(tag);
+        std::fs::create_dir_all(&dir)?;
+        let out = command(cache)?
+            .args(args)
+            .args(["--plan", "--json"])
+            .stdin(Stdio::null())
+            .output()?;
+        let text = String::from_utf8_lossy(&out.stderr).into_owned();
+        std::fs::write(dir.join("plan.err"), &text)?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        println!(
+            "{tag}: --plan --json rc {:?}; {}",
+            out.status.code(),
+            tail(stdout.trim_end(), 300)
+        );
+        if out.status.code() != Some(0) {
+            return Err(format!(
+                "{tag}: --plan --json ended {}; {}",
+                out.status,
+                tail(&text, 1500)
+            )
+            .into());
+        }
+        plan_and_events(&format!("{tag}: --plan --json"), &stdout)
+    }
+
+    /// (s8): the dry run by name prints the pick, and the argument list of the start it would make, whose plan is the
+    /// plan of the fixture file.
+    fn dry_run(&self) -> Result<bool, GateError> {
+        let named = self.named()?;
+        let cache = Some(named.cache.0.as_path());
+        let (file_plan, _) = self.plan_json("s8_file", &self.file_args(), None)?;
+        let dir = self.dir.join("s8");
+        std::fs::create_dir_all(&dir)?;
+        let mut args = vec!["--model".to_owned(), named.row.model.clone()];
+        args.extend(Self::base_args());
+        let out = command(cache)?
+            .args(args)
+            .args(["--dry-run", "--json"])
+            .stdin(Stdio::null())
+            .output()?;
+        std::fs::write(dir.join("dry.err"), &out.stderr)?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        println!(
+            "s8: --model {} --dry-run --json rc {:?}; {}",
+            named.row.model,
+            out.status.code(),
+            tail(stdout.trim_end(), 600)
+        );
+        let mut ok = check("s8_dry_run_exits_0", out.status.code() == Some(0));
+        let doc = one_json_line("s8: --dry-run --json", &stdout)?;
+        let entry = doc["models"].as_array().and_then(|m| match m.as_slice() {
+            [e] => Some(e),
+            _ => None,
+        });
+        ok &= check(
+            "s8_one_model_entry_the_one_named",
+            entry.is_some_and(|e| e["name"] == named.row.model.as_str()),
+        );
+        let pick = entry.map(|e| &e["pick"]);
+        ok &= check(
+            "s8_pick_names_the_cached_row",
+            pick.is_some_and(|p| {
+                p["variant"] == named.row.variant.as_str()
+                    && p["source"] == named.row.hf().as_str()
+                    && p["cached"].as_bool() == Some(true)
+            }),
+        );
+        let start: Vec<String> = doc["start"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // PIN(2026-10-29): the start replays the pick by name (`--model <name>:<variant>`), not by the repo it resolves to
+        // (`--hf`): the name carries the row's pinned commit, which a repo spelling would read at `main`.
+        let replay = [
+            "--model".to_owned(),
+            format!("{}:{}", named.row.model, named.row.variant),
+        ]
+        .into_iter()
+        .chain(Self::base_args())
+        .collect::<Vec<String>>();
+        ok &= check(
+            "s8_start_replays_the_pick_by_name_at_its_pinned_commit",
+            start == replay,
+        );
+        if start.is_empty() {
+            return Ok(false);
+        }
+        let (start_plan, replayed) = self.plan_json("s8_start", &start, cache)?;
+        ok &= check(
+            "s8_the_start_prints_the_pick_it_replays",
+            matches!(
+                (pick, event(&replayed, "pick")),
+                (Some(dry), Some(made))
+                    if same(dry, made, &["variant", "source", "revision", "place", "ctx", "slots", "paged"])
+            ),
+        );
+        ok &= check(
+            "s8_pick_equals_the_plan_of_its_start",
+            pick.is_some_and(|p| same(p, &start_plan, &["place", "ctx", "slots", "paged"])),
+        );
+        ok &= check(
+            "s8_the_start_plans_as_the_fixture_file_does",
+            same(
+                &file_plan,
+                &start_plan,
+                &["place", "ctx", "slots", "paged", "limit"],
+            ) && same(&file_plan["need"], &start_plan["need"], &["bytes"]),
+        );
+        Ok(ok)
+    }
+
+    /// A start with `args` and `env` set on top of the inherited environment, run to its end: its exit status, the
+    /// events it printed and its stderr file, in `<dir>/<tag>`.
+    fn refusal(
+        &self,
+        tag: &str,
+        env: &[(&str, &str)],
+        args: &[String],
+        cache: Option<&Path>,
+    ) -> Result<Refusal, GateError> {
+        let dir = self.dir.join(tag);
+        std::fs::create_dir_all(&dir)?;
+        let mut cmd = command(cache)?;
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        println!("{tag}: bloomery-serve {}", argv.join(" "));
+        let mut served = Served::spawn_cmd(cmd, &argv, &dir)?;
+        let status = ended(&mut served.child, END_WAIT)?;
+        let events = events_seen(&read_lossy(&dir.join("server.out"))?);
+        let err = dir.join("server.err");
+        println!("{tag}: ended {status:?}; {}", tail(&read_lossy(&err)?, 300));
+        Ok(Refusal {
+            status: status.and_then(|s| s.code()),
+            events,
+            err,
+        })
+    }
+
+    /// The base arguments after `head`.
+    fn args_of(head: &[&str]) -> Vec<String> {
+        head.iter()
+            .map(|a| (*a).to_owned())
+            .chain(Self::base_args())
+            .collect()
+    }
+
+    /// (s10): the exit table, on the refusals a start meets.
+    fn exit_table(&self) -> Result<bool, GateError> {
+        let named = self.named().map_err(|e| e.to_string());
+        let model = self.model.display().to_string();
+        let mut ok = true;
+        // A name the catalog does not hold: the message lists the names it has.
+        let r = self.refusal(
+            "s10_unknown",
+            &[],
+            &Self::args_of(&["--model", NO_SUCH_MODEL]),
+            None,
+        )?;
+        ok &= check(
+            "s10_an_unknown_name_is_64_usage",
+            r.is(Code::Usage)
+                && r.says(NO_SUCH_MODEL)
+                && named.as_ref().is_ok_and(|n| r.says(&n.row.model)),
+        );
+        // A path where a name goes: the `next` names the flag that takes a path.
+        let r = self.refusal("s10_path", &[], &Self::args_of(&["--model", &model]), None)?;
+        ok &= check(
+            "s10_a_model_value_that_is_a_path_is_64_and_next_names_dash_m",
+            r.is(Code::Usage) && r.error().is_some_and(|e| next_has(e, &["-m", &model])),
+        );
+        // A file no chat seat serves: an embedding model.
+        let Some(embedding) = side_seat::ROWS.first() else {
+            return Err("this build serves no embedding architecture".into());
+        };
+        let dir = self.dir.join("s10_embedding");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("embedding.gguf");
+        gguf_of_arch(&file, embedding.arch)?;
+        let r = self.refusal(
+            "s10_embedding",
+            &[],
+            &Self::args_of(&["-m", &file.display().to_string()]),
+            None,
+        )?;
+        ok &= check(
+            "s10_an_embedding_file_is_65_unsupported_and_names_embd_model",
+            r.is(Code::Unsupported) && r.says("--embd-model"),
+        );
+        // A card budget below the dense trunk: no fit, and every smaller variant of the model is a `next`.
+        match &named {
+            Ok(n) => {
+                let target = format!("{}:{}", n.row.model, n.row.variant);
+                let r = self.refusal(
+                    "s10_no_fit",
+                    &[(CARD_BUDGET, BUDGET_BELOW_FLOOR)],
+                    &Self::args_of(&["--model", &target]),
+                    Some(n.cache.0.as_path()),
+                )?;
+                ok &= check(
+                    "s10_a_card_budget_below_the_dense_trunk_is_80_no_fit",
+                    r.is(Code::NoFit),
+                );
+                println!(
+                    "s10: {} variants of {} are smaller than {}; the next smaller is {:?}",
+                    n.row.smaller.len(),
+                    n.row.model,
+                    n.row.variant,
+                    n.row.step
+                );
+                // PIN(2026-10-29): `next` offers the next smaller variant (the design's exit table), not every smaller
+                // one; the check holds both sides, since the default rows of both families have nothing smaller and a
+                // check of "every smaller" would pass on an empty `next`.
+                ok &= check(
+                    "s10_no_fit_next_offers_the_next_smaller_variant_and_no_other",
+                    r.error().is_some_and(|e| {
+                        let offered =
+                            e["next"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|list| {
+                                    let list = list.as_array()?;
+                                    match (list.first()?.as_str()?, list.get(1)?.as_str()?) {
+                                        ("--model", value) => Some(value.to_owned()),
+                                        _ => None,
+                                    }
+                                });
+                        let want: Vec<String> = n
+                            .row
+                            .step
+                            .iter()
+                            .map(|v| format!("{}:{v}", n.row.model))
+                            .collect();
+                        offered.collect::<Vec<String>>() == want
+                    }),
+                );
+            }
+            Err(e) => {
+                println!("s10: no catalog row to start from: {e}");
+                ok &= check(
+                    "s10_a_card_budget_below_the_dense_trunk_is_80_no_fit",
+                    false,
+                );
+            }
+        }
+        // A `BLOOMERY_*` value no lever takes: the message names the lever.
+        let r = self.refusal(
+            "s10_lever",
+            &[(CARD_BUDGET, BUDGET_NOT_BYTES)],
+            &self.file_args(),
+            None,
+        )?;
+        ok &= check(
+            "s10_a_bad_lever_value_is_78_lever_and_names_the_lever",
+            r.is(Code::Lever) && r.says(CARD_BUDGET),
+        );
+        // A port another process holds is found before the model is loaded.
+        let held = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = held.local_addr()?.port().to_string();
+        let args = ["-m", &model, "--host", "127.0.0.1", "--port", &port].map(str::to_owned);
+        let r = self.refusal("s10_port", &[], &args, None)?;
+        drop(held);
+        ok &= check("s10_a_held_port_is_83_port_in_use", r.is(Code::PortInUse));
+        ok &= check(
+            "s10_port_in_use_next_names_port_0",
+            r.error().is_some_and(|e| next_has(e, &["--port", "0"])),
+        );
+        ok &= check(
+            "s10_a_held_port_is_found_before_the_load",
+            server_log(&r.err, self.family.kinds())?
+                .first(&record::LOAD_PHASES)?
+                .is_none(),
+        );
+        Ok(ok)
+    }
+
     /// (s4).
     fn no_unregistered_kind(&self) -> Result<bool, GateError> {
         let mut logs = Vec::new();
@@ -1052,17 +1985,23 @@ fn run() -> Result<(), GateError> {
         gate.family.word(),
         gate.model.display()
     );
-    let hashed = gate.hash_in_background();
+    gate.hash_in_background();
     tier::sc("s1_plain_start")?;
     let mut ok = guarded("s1", gate.plain());
     tier::sc("s2_mmproj_start")?;
     ok &= guarded("s2", gate.mmproj());
     tier::sc("s3_hf_offline_start")?;
-    ok &= guarded("s3", gate.hf(hashed));
+    ok &= guarded("s3", gate.hf());
     tier::sc("s5_template_file_start")?;
     ok &= guarded("s5", gate.template_file());
     tier::sc("s6_need_hook_start")?;
     ok &= guarded("s6", gate.need_hook());
+    tier::sc("s7_start_by_name")?;
+    ok &= guarded("s7", gate.by_name());
+    tier::sc("s8_dry_run_by_name")?;
+    ok &= guarded("s8", gate.dry_run());
+    tier::sc("s10_exit_table")?;
+    ok &= guarded("s10", gate.exit_table());
     tier::sc("s4_no_unregistered_kind")?;
     ok &= guarded("s4", gate.no_unregistered_kind());
     println!("{}", tier::tally_line());

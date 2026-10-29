@@ -176,8 +176,8 @@ gate-gpu-qwen4exp-nvfp4	family	qwen4exp	by-hand	quant_mxfp4
 gate-gpu-radio-tower	family	nemotron_h	media	serve_media
 gate-gpu-routed-legs	common		tier	tier_legs+placement_sizing
 gate-gpu-rope-writers	common		kernel	attn_gqa
-gate-gpu-serve-start-ds41	family	deepseek41	serve	seats_serve_engine+placement_sizing
-gate-gpu-serve-start-glm	family	glm5next	serve	seats_serve_engine+placement_sizing
+gate-gpu-serve-start-ds41	family	deepseek41	serve	seats_serve_engine+placement_sizing+serve_start
+gate-gpu-serve-start-glm	family	glm5next	serve	seats_serve_engine+placement_sizing+serve_start
 gate-gpu-solar2-e2e	family	solar-open2	e2e	graph_fault+attn_linear_gdn_kda+moe_route
 gate-gpu-solar2-prefill	family	solar-open2	e2e	prompt_walks
 gate-gpu-solar2-serve	family	solar-open2	serve	seats_serve_engine

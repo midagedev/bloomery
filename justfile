@@ -298,6 +298,12 @@ check-defaults:
 check-model-tax BASE='origin/main':
     bash tools/check-model-tax.sh check --base {{BASE}}
 
+# The docs a start by name is read from, held to the code they repeat (Mac, text only): the README's Use table and docs/models.md's
+# Recommended file against the model catalog (tools/catalog.tsv), and docs/agents.md's exit table, event names, stop causes and loading
+# phases against crates/serve (tools/check-catalog-docs.py has each copy and its owner).
+check-catalog-docs:
+    bash tools/check-catalog-docs.sh
+
 # 주석 규약(AGENTS.md Conventions): 엔진 크레이트 src/ 주석에 이슈 번호·날짜 금지, 예외는 `PIN(날짜):`.
 check-comments:
     ./tools/check-comments.sh
@@ -2236,7 +2242,7 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # are planned, every named refusal, `/props` `modalities.video`. The decoder's own subprocess rules (src/video): an ffprobe past
 # its limit and an ffmpeg that does not end after its last frame are killed and named; a decode is taken only when ffmpeg ended well.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test callstream --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract -- --include-ignored --nocapture'
 
 # The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
 # naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule
@@ -2548,10 +2554,12 @@ gate-gpu-ds41-lib:
 # 사이드 좌석(side_seat: 플래그)의 호스트 단위 시험:
 # 샘플링 스텝이 엔진의 로짓 버퍼 하나를 빌려 쓰고, 길이가 다른 호출자 버퍼는 이름 붙은 오류다. 카드·게이트 락 없음.
 # With `checkpoint` on, model_file::fetch's admission test runs too: a checkpoint build's `--hf` takes a checkpoint
-# repo, and the side seat, which opens GGUF only, refuses it before any shard download.
+# repo, and the side seat, which opens GGUF only, refuses it before any shard download. The start's agent half
+# (start::, behind the same feature: the class an error of the start path names, the plan line a seat's notes make, the
+# early listener's hand-over) runs here, since gate-gpu-gates-lib builds without it.
 [group('host')]
 gate-ds41-bind:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- vision_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- side_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,checkpoint --lib -- model_file::fetch::tests::checkpoint_support_is_checked_before_download --nocapture && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- bind::'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- vision_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- side_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,checkpoint --lib -- model_file::fetch::tests::checkpoint_support_is_checked_before_download --nocapture && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- bind:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- start::'
 
 # The Qwen3.8 serve seat's feed rules (bloomery-serve-qwen38's own unit tests, behind the deepseek41 feature like bind):
 # the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes
@@ -3748,12 +3756,20 @@ gate-gpu-glm5next-serve:
 weekly-gpu-glm5next-media-serve:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-media-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-media-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm media --dir $D --mmproj /models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf'
 
-# The shipped `bloomery-serve` started once per image flag on the GLM-5.3 fixture (gate_serve_start's header has the clauses): (s1)
-# `-m <fixture>` with the serving defaults and one text chat; (s2) `--place a --mmproj <unsloth's mmproj-BF16.gguf>`, the tower's
-# `vision` record and one image chat (free-448x448.png) answered with its 16 x 16 + 2 positions; (s3) `--hf bloomery-fixture/glm5next:fixture`
-# offline from a cache of symlinks to the fixture and the projector, each beside a `.verified` marker holding the file's sha256; (s4) no
-# server stderr of the run holds "does not print this kind" or "panicked"; (s5) `--chat-template-file` with the fixture's own template behind
-# a marker: its call-carrying conversation renders the marker and then exactly what (s1) rendered. Each of (s1) to (s3) is preceded by a `--plan`
+# The shipped `bloomery-serve` started once per image flag on the GLM-5.3 fixture, then by catalog name and through the agent contract
+# (gate_serve_start's header has the clauses): (s1) `-m <fixture>` with the serving defaults and one text chat; (s2) `--place a --mmproj
+# <unsloth's mmproj-BF16.gguf>`, the tower's `vision` record and one image chat (free-448x448.png) answered with its 16 x 16 + 2 positions;
+# (s3) `--hf bloomery-fixture/glm5next:fixture` offline from a cache of symlinks to the fixture and the projector, each beside a `.verified`
+# marker holding the file's sha256; (s4) no server stderr of the run holds "does not print this kind" or "panicked"; (s5) `--chat-template-file`
+# with the fixture's own template behind a marker: its call-carrying conversation renders the marker and then exactly what (s1) rendered;
+# (s6) the need hook (`BLOOMERY_NEED_HOOK`): exit 75 ends the start before it listens with the hook's input the `need` record, exit 0
+# lets it listen; (s7) `--model <catalog name>` offline from a cache laid out as the catalog row's repo: the `pick`, `bound` and `ready`
+# events in order, a chat, stdout holding events only, and a SIGTERM ending it with exit 0 and a `stopped` event; (s8) `--model <name>
+# --dry-run --json`: one document whose pick is the cached row, and a `start` that replays the pick by name (the same row, revision and
+# context: its `--plan --json` equals the pick and the fixture file's); (s9) the loading window of (s7): `/health` is 503 `loading` from
+# the `bound` event until the first 200, none before `ready` is printed and none after; (s10) the exit table on the refusals a start
+# meets: an unknown name 64, a path given as a name 64 with `-m` in `next`, an embedding file 65, a card budget below the floor 80, a bad
+# lever 78, a held port 83 found before the load, each ending in an `error` event of its code. The launcher's checks (`tests/serve_preflight.rs`) run beside it: the normal inputs reaching the fetch, and a seat word alone starting by name and refusing offline as `network`. Each of (s1) to (s3) is preceded by a `--plan`
 # run of its arguments. It holds the image-flag starts at the fixture tier, which the real-tier seat gates do not. The bloomery-serve built is the release's
 # (--features glm5next,clef,vision,mimo2,solar2). Both cards in view
 # (BLOOMERY_CARD=both: both gate locks, alone in a batch): with `--place a` the other card is off the plan, so the tower sits there and no
@@ -3761,20 +3777,26 @@ weekly-gpu-glm5next-media-serve:
 # (tools/ref/fixture-only.sh): the real tier would hash the real shards and start the real model three times, so a real-tier batch
 # defers the recipe by name. Predicted wall [derived from gate-times.tsv: glm5next-twocard at the fixture tier is 49 s median over eight
 # loads, qwen38-serve 89 s over ten-plus spawns]: four starts of about 8 s, three `--plan` runs of about 2 s, a warm build, the sha256 of the
-# 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 53 to 98 s warm; the bound is the runner's 900 s.
+# 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 53 to 98 s warm; (s7) to (s10) add about 25 s [derived: (s7)
+# one start of about 8 s, the pick's `--plan` child of about 2 s and the stop, 11 s; (s8) three `--plan` runs and a dry run, 9 s; (s10) six
+# refusals, the no-fit one with a pick's child, 6 s]; the bound is the runner's 900 s.
 [group('solo')]
 gate-gpu-serve-start-glm:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
     ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_device_list_alias_reaches_the_selected_seat'
     ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_preflight_normal_inputs_reach_the_fetch'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_seat_word_alone_starts_by_name_and_refuses_offline'
 
-# The same gate on the V4.1 fixture (the file's architecture picks the seat, which has no `--plan`, so its plan is read from each
-# start's own log). The projector is the `# mmproj` line of the V4.1 vision set ($BLOOMERY_DATA/ref-vision/deepseek41v, `just dump-ref-vision`),
-# the file the V4.1 image gates load. The serving defaults are the seat's own (context 32768, two slots), planned under the fixture's
-# card budget. A fourth start takes `--chat-template-file` (the fixture's own template behind a marker): its call-carrying conversation
-# renders the marker and then exactly what the plain start rendered, so the seat's respell of V4's DSML spelling reached the file's text.
+# The same gate on the V4.1 fixture, clauses (s1) to (s10) (the file's architecture picks the seat; (s1) to (s3) read its plan from each
+# start's own log, and (s8)'s `--plan --json` runs end through `start::plan_exit`). The projector is the `# mmproj` line of the V4.1 vision set
+# ($BLOOMERY_DATA/ref-vision/deepseek41v, `just dump-ref-vision`), the file the V4.1 image gates load. The serving defaults are the seat's own
+# (context 32768, two slots), planned under the fixture's card budget. A fourth start takes `--chat-template-file` (the fixture's own template
+# behind a marker): its call-carrying conversation renders the marker and then exactly what the plain start rendered, so the seat's respell of
+# V4's DSML spelling reached the file's text. (s7) to (s10) start by catalog name, read `--dry-run --json` and refuse as the exit table says
+# (the GLM recipe above lists them).
 # Predicted wall [derived, as above]: four starts of about 12 s over the 15 GB host set, the sha256 of the set and the projector in threads
-# beside the first two starts, a warm build: 72 to 132 s warm; the bound is the runner's 900 s.
+# beside the first two starts, a warm build: 72 to 132 s warm; (s7) to (s10) add about 30 s [derived: the starts of about 12 s and the
+# `--plan` runs of about 3 s over the same set, 14 s + 10 s + 6 s]; the bound is the runner's 900 s.
 [group('solo')]
 gate-gpu-serve-start-ds41:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/ds41 && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family ds41 --dir $D'

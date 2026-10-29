@@ -72,12 +72,14 @@
 //!
 //! Two checks run before anything is fetched or loaded, each a named refusal
 //! (`serve::preflight`): first of all, on a CPU that does not run the
-//! release's x86-64-v3 host code, `cpu_gate` prints what it lacks and exits
-//! 1; after `--version`, `--help` and the arguments' check below, a driver below R580 (CUDA 13), or
-//! one whose `libcuda.so.1` does not load, ends the start with what it reported.
+//! release's x86-64-v3 host code, `cpu_gate` prints what it lacks and ends as
+//! the class `no-device` (status 69, with its `error` event); after
+//! `--version`, `--help` and the arguments' check below, a driver below R580
+//! (CUDA 13), or one whose `libcuda.so.1` does not load, ends the start with
+//! what it reported.
 //!
 //! The arguments are checked as far as that needs no model, card or network before the driver is
-//! asked and before `--hf` fetches anything (`drive::early`): with `--model WORD`, `--help` or `-h`
+//! asked and before `--hf` fetches anything (`drive::early_named`): with `--model WORD`, `--help` or `-h`
 //! prints the seat's usage, `--levers` its lever table, and a flag, value or lever the seat refuses
 //! ends the start with the seat's own refusal; beside llama-server's placement flags, whose levers
 //! are known once the cards are read, the levers wait for the seat's run. A `--head` selects the
@@ -89,6 +91,17 @@
 //! read that way (`HF_HUB_OFFLINE`, no network) leaves the arguments to the picked seat, which
 //! reads them again once the file is known. What needs the rest of the model (its context, its
 //! draft) is checked after the fetch.
+//!
+//! An agent starts the server by a model's name, the way `docs/agents.md` says: `--model
+//! NAME[:VARIANT]` (a catalog model by its name, an alias or its seat word, `hf::catalog`) picks
+//! the row of the model that holds on this machine, fetches it at its pinned commit (`--revision
+//! REV` reads another) and starts it; `--recommend` does that pick for every model and prints it,
+//! `--dry-run` for one, each with `--json` as one document on stdout; `--plan --json` ends with
+//! the plan as one JSON line (`bloomery_gpu_gates::start`). The start's events are JSON lines on
+//! stdout (`serve::event`: `pick`, `bound`, `ready`, `error`, `stopped`), its listener answers
+//! `/health` 503 `loading` from before the fetch, and every refusal ends with the status of
+//! `serve::exit::Code`. `--help` and a bare start print the usage on stdout and exit 0.
+//!
 //! Each seat's flags, records, `/props` fields and exit codes are its
 //! module's doc; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are this
 //! binary's ds41 and qwen38 seats alone.
@@ -172,15 +185,19 @@ mod drive {
     use std::process::ExitCode;
 
     use bloomery_gpu_gates::side_seat;
+    use bloomery_gpu_gates::start::{self, Refusal};
     use bloomery_gpu_gates::{
-        GateError, exit_with, llama_launch, llama_place, model_file, ref_model_path,
+        GateError, gpu_census, llama_launch, llama_place, model_file, ref_model_path,
     };
-    use cuda_core::sys;
     use gguf::Split;
+    use hf::catalog::{self, CatalogError, CatalogRef, Outcome};
     use model::arch::{Arch, DEEPSEEK4};
+    use serde_json::{Value, json};
     use serve::ServeError;
     use serve::decide::Ask;
-    use serve::preflight::Driver;
+    use serve::event::{self, Event};
+    use serve::exit::Code;
+    use serve::listener::{Phase, Progress};
 
     use crate::serve_seats::{
         decide, ds41, flint, glm, mimo2, minimaxm3, musespark, nemotron, qwen3, qwen38, raon1,
@@ -189,7 +206,14 @@ mod drive {
 
     const NAME: &str = "bloomery-serve";
 
-    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide] \
+    /// The first line of `--help` and of a bare start: what an agent runs to learn what this
+    /// machine serves, and how it starts one.
+    const LEAD: &str = "bloomery-serve: run `bloomery-serve --recommend --json` to see what this \
+                        machine can serve, then `bloomery-serve --model NAME` to start it \
+                        (docs/agents.md)";
+
+    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide] \
+                         [--revision REV] [--recommend] [--dry-run] [--json] \
                          [-m PATH | --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
                          <repo>[:<quant>]] [--embd-ctx N] [--embd-cache-bytes N] [--embd-mmproj FILE | \
@@ -348,22 +372,107 @@ models (the --model word is optional with a model file: the file's architecture 
         }
     }
 
-    /// `args` with every `--model V` pair taken out: the last pair's word and
+    /// The flags of the agent contract, taken out before any seat parses the rest.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Agent {
+        /// `--json`: the result as one JSON document (`--recommend`, `--dry-run`) or line
+        /// (`--plan`) on stdout.
+        json: bool,
+        /// `--dry-run`: the pick of a start by name, then stop before any download.
+        dry_run: bool,
+        /// `--recommend`: the pick for every model of the catalog, then stop.
+        recommend: bool,
+        /// `--revision`: read the picked repos at this revision instead of the rows' commits.
+        revision: Option<String>,
+    }
+
+    /// `args` with the agent contract's flags taken out, and what they said.
+    fn take_agent(args: &[String]) -> Result<(Agent, Vec<String>), GateError> {
+        let (valued, rest) = llama_launch::take_serve_args(args, &["--revision"]);
+        let mut agent = Agent::default();
+        let mut kept = Vec::new();
+        for (flag, value) in llama_launch::serve_args(&rest) {
+            match flag.as_str() {
+                "--json" => agent.json = true,
+                "--dry-run" => agent.dry_run = true,
+                "--recommend" => agent.recommend = true,
+                _ => {
+                    kept.push(flag.clone());
+                    kept.extend(value.cloned());
+                }
+            }
+        }
+        let mut it = valued.iter();
+        while it.next().is_some() {
+            let v = it
+                .next()
+                .ok_or_else(|| Refusal::new(Code::Usage, "--revision needs a value"))?;
+            agent.revision = Some(v.clone());
+        }
+        Ok((agent, kept))
+    }
+
+    /// What a `--model` value names: a seat's word, a catalog model, or both (a model by its seat
+    /// word).
+    type Named = (Option<Word>, Option<CatalogRef>);
+
+    /// The `--model` value `v`: a catalog model by its name, alias or seat word with an optional
+    /// `:VARIANT` ([`CatalogRef::parse`]), else a seat word. A value that is an existing path is
+    /// refused naming `-m`; any other value is refused listing the catalog's names and the seat
+    /// words.
+    fn name_of(v: &str) -> Result<Named, GateError> {
+        if std::path::Path::new(v).exists() {
+            return Err(Refusal::new(
+                Code::Usage,
+                format!(
+                    "--model {v} is an existing path: --model takes a catalog model's name or a \
+                     seat word, and a model file is -m {v}"
+                ),
+            )
+            .offering(&["-m", v])
+            .into());
+        }
+        match CatalogRef::parse(v) {
+            Ok(target) => Ok((Some(Word::parse(target.model.seat)?), Some(target))),
+            Err(CatalogError::UnknownModel { names, .. }) => match Word::parse(v) {
+                Ok(word) => Ok((Some(word), None)),
+                Err(_) => Err(Refusal::new(
+                    Code::Usage,
+                    format!(
+                        "--model {v} is no model of the catalog and no seat word; the catalog's \
+                         models: {}; the seat words: {}",
+                        names.join(", "),
+                        seat_words()
+                    ),
+                )
+                .offering(&["--recommend", "--json"])
+                .into()),
+            },
+            Err(e) => Err(Refusal::new(Code::Usage, e.to_string()).into()),
+        }
+    }
+
+    /// `args` with every `--model V` pair taken out: the last pair's word and catalog model and
     /// the rest. `--model` with no value is refused by name.
-    fn take_model(args: &[String]) -> Result<(Option<Word>, Vec<String>), GateError> {
-        let mut word = None;
+    fn take_model(args: &[String]) -> Result<(Named, Vec<String>), GateError> {
+        let mut named: Named = (None, None);
         let (selected, rest) = llama_launch::take_serve_args(args, &["--model"]);
         let mut it = selected.iter();
         while it.next().is_some() {
             let v = it.next().ok_or_else(|| {
-                format!(
-                    "--model needs a value (ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint or {}): {USAGE}",
-                    serve::decide::WORD
+                Refusal::new(
+                    Code::Usage,
+                    format!(
+                        "--model needs a value (a catalog model's name, or ds41, qwen38, glm, \
+                         qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint or \
+                         {}): {USAGE}",
+                        serve::decide::WORD
+                    ),
                 )
             })?;
-            word = Some(Word::parse(v)?);
+            named = name_of(v)?;
         }
-        Ok((word, rest))
+        Ok((named, rest))
     }
 
     /// The model source parser receives model options without mistaking other values for flags.
@@ -407,18 +516,24 @@ models (the --model word is optional with a model file: the file's architecture 
         model_file::with_header(&path, |split| {
             let seat = match split.architecture() {
                 Some(a) if side_seat::row(a).is_some() => {
-                    return Err(format!(
-                        "{} is a {a} file, an embedding model: serve it beside a chat model with \
-                     --embd-model",
-                        path.display()
+                    return Err(Refusal::new(
+                        Code::Unsupported,
+                        format!(
+                            "{} is a {a} file, an embedding model: serve it beside a chat model \
+                             with --embd-model",
+                            path.display()
+                        ),
                     )
                     .into());
                 }
                 Some(a) if !generative && decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
-                    return Err(format!(
-                        "{}: {}",
-                        path.display(),
-                        serve::decide::no_head(a, decide::ROWS)
+                    return Err(Refusal::new(
+                        Code::Unsupported,
+                        format!(
+                            "{}: {}",
+                            path.display(),
+                            serve::decide::no_head(a, decide::ROWS)
+                        ),
                     )
                     .into());
                 }
@@ -427,24 +542,34 @@ models (the --model word is optional with a model file: the file's architecture 
                         .iter()
                         .copied()
                         .find(|m| m.serves(split))
-                        .ok_or_else(|| no_seat(&path, split, a))?;
+                        .ok_or_else(|| {
+                            Refusal::new(Code::Unsupported, no_seat(&path, split, a))
+                                .offering(&["--recommend", "--json"])
+                        })?;
                     if let Some(Word::Seat(word)) = word
                         && !word.serves(split)
                     {
-                        return Err(format!(
-                            "--model {} on a {a} file, which serves --model {}",
-                            word.word(),
-                            seat.word()
+                        return Err(Refusal::new(
+                            Code::Usage,
+                            format!(
+                                "--model {} on a {a} file, which serves --model {}",
+                                word.word(),
+                                seat.word()
+                            ),
                         )
+                        .offering(&["--model", seat.word()])
                         .into());
                     }
                     seat
                 }
                 None => {
-                    return Err(format!(
-                        "{}: the first shard names no architecture; the seats are --model {}",
-                        path.display(),
-                        seat_words()
+                    return Err(Refusal::new(
+                        Code::Unsupported,
+                        format!(
+                            "{}: the first shard names no architecture; the seats are --model {}",
+                            path.display(),
+                            seat_words()
+                        ),
                     )
                     .into());
                 }
@@ -547,26 +672,9 @@ models (the --model word is optional with a model file: the file's architecture 
         Ok((from, rest))
     }
 
-    /// What the driver answers a start: its library's load as cuda-bindings
-    /// loads it (`dyn_load`: `libcuda.so.1`, then `libcuda.so`, and its
-    /// `cuDriverGetVersion` refused as too old below the CUDA major the
-    /// build's toolkit is), read through that crate's own
-    /// `cuda_driver_load_error`.
-    fn driver_found() -> Driver {
-        match sys::cuda_driver_load_error() {
-            None => Driver::Loaded,
-            Some(sys::DynLoadError::RuntimeTooOld {
-                runtime_version, ..
-            }) => i32::try_from(*runtime_version).map_or_else(
-                |_| Driver::Missing(format!("a runtime version {runtime_version}")),
-                Driver::Version,
-            ),
-            Some(e) => Driver::Missing(e.to_string()),
-        }
-    }
-
     #[inline(never)]
     pub fn run() -> ExitCode {
+        event::enable();
         let args: Vec<String> = std::env::args().skip(1).collect();
         if llama_launch::serve_option(&args, "--version") {
             println!(
@@ -580,84 +688,171 @@ models (the --model word is optional with a model file: the file's architecture 
         // command line does.
         let args = match llama_launch::model_from_env(NAME, args, PATH_FLAGS) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Usage, e),
         };
-        let (word, rest) = match take_model(&args) {
+        let (agent, args) = match take_agent(&args) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Usage, e),
+        };
+        let asked = |flag: &str| llama_launch::serve_option(&args, flag);
+        start::set_plan_json(agent.json && asked("--plan"));
+        let ((word, name), rest) = match take_model(&args) {
+            Ok(v) => v,
+            Err(e) => return refuse(Code::Usage, e),
         };
         if word.is_none()
-            && !llama_launch::serve_option(&args, "--head")
-            && (args.is_empty()
-                || llama_launch::serve_option(&args, "--help")
-                || llama_launch::serve_option(&args, "-h"))
+            && name.is_none()
+            && !agent.recommend
+            && !asked("--head")
+            && (args.is_empty() || asked("--help") || asked("-h"))
         {
             // No seat chosen yet; the seat's own usage follows once one is.
-            return exit_with(NAME, Err(format!("{USAGE}\n{MODELS}").into()));
+            println!("{LEAD}\n{USAGE}\n{MODELS}");
+            return ExitCode::SUCCESS;
         }
-        if let Err(e) = early(
+        if agent.recommend {
+            return recommend(&agent, name, &rest);
+        }
+        if agent.dry_run && name.is_none() {
+            return refuse(
+                Code::Usage,
+                Refusal::new(
+                    Code::Usage,
+                    "--dry-run picks a catalog model: name one with --model NAME",
+                )
+                .offering(&["--recommend", "--json"])
+                .into(),
+            );
+        }
+        if agent.revision.is_some() && name.is_none() {
+            return refuse(
+                Code::Usage,
+                Refusal::new(
+                    Code::Usage,
+                    "--revision reads a catalog model's repo at a revision: name the model with \
+                     --model NAME",
+                )
+                .into(),
+            );
+        }
+        if let Err(e) = early_named(
             word,
+            name,
             &rest,
             std::env::vars_os(),
             &model_file::repo_architecture,
         ) {
-            return exit_with(NAME, Err(e));
+            // A seat asked for its usage answers with it as its refusal: that is the answer.
+            let text = e.to_string();
+            if (asked("--help") || asked("-h")) && text.starts_with("usage: ") {
+                println!("{text}");
+                return ExitCode::SUCCESS;
+            }
+            return refuse(Code::Usage, e);
         }
-        // A driver that cannot run the CUDA 13 code ends the start before any
-        // download.
-        if let Err(e) = serve::preflight::driver(&driver_found()) {
-            return exit_with(NAME, Err(e.into()));
+        // A driver that cannot run the CUDA 13 code ends the start before any download.
+        if let Err(e) = serve::preflight::driver(&start::driver_found()) {
+            return refuse(Code::NoDevice, e.into());
         }
         if llama_launch::serve_option(&args, llama_place::LIST_DEVICES) {
             match llama_launch::answer_list_devices(&args) {
                 Ok(true) => return ExitCode::SUCCESS,
                 Ok(false) => {}
-                Err(e) => return exit_with(NAME, Err(e)),
+                Err(e) => return refuse(Code::Refused, e),
             }
         }
         eprintln!("{FIRST_START}");
-        // The model file is named before any seat parses: `-m`, or a `--hf`
-        // set fetched into the cache.
-        let (flags, rest) = match take_source(&rest) {
+        // The model file is named before any seat parses: `-m`, or a `--hf` set fetched into the
+        // cache, or a catalog model's pick turned into one.
+        let (mut flags, rest) = match take_source(&rest) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Usage, e),
         };
+        flags.name = name;
+        let by_name = match hf::source::resolve(&flags, model_file::ref_model().as_deref()) {
+            Ok(Some(hf::source::Source::Named(target))) => Some(target),
+            Ok(_) => None,
+            Err(e) => return refuse(Code::Usage, e.into()),
+        };
+        let asked_as = by_name.as_ref().map(|target| target.model.name);
+        // The listener comes up before the pick and the fetch, so a port that is taken is found
+        // first and a client sees the start at once; a run that ends before it serves binds none.
+        let serves =
+            !(agent.dry_run || asked("--plan") || asked("--levers") || asked("--records-schema"));
+        let progress = if serves {
+            match bind_start(&rest) {
+                Ok(p) => Some(p),
+                Err(e) => return refuse(Code::Refused, e),
+            }
+        } else {
+            None
+        };
+        if let Some(target) = by_name {
+            let row = match pick_by_name(&target, &agent, &rest) {
+                Ok(Some(row)) => row,
+                Ok(None) => return ExitCode::SUCCESS,
+                Err(end) => return end,
+            };
+            flags.name = None;
+            flags.hf = Some(row.hf());
+            let revision = agent.revision.as_deref().unwrap_or(row.revision);
+            if let Err(e) = model_file::pin_revision(row.repo, revision) {
+                return refuse(Code::Refused, e);
+            }
+        }
+        if let Some(p) = &progress {
+            p.phase(Phase::Fetch);
+        }
         if let Err(e) = model_file::name(&flags) {
-            return exit_with(NAME, Err(e));
+            return refuse(Code::Refused, e);
+        }
+        if let Some(p) = &progress {
+            p.phase(Phase::Plan);
+        }
+        if let Ok(path) = ref_model_path()
+            && !path.exists()
+        {
+            let missing = Refusal::new(
+                Code::NoModel,
+                format!("{}: no such file or folder", path.display()),
+            );
+            return refuse(Code::NoModel, missing.into());
         }
         // A head names the decide seat; with none the file goes to the
         // generative seats.
         let repo = match flags.hf.as_deref().map(hf::RepoRef::parse).transpose() {
             Ok(r) => r.map(|r| r.repo),
-            Err(e) => return exit_with(NAME, Err(e.into())),
+            Err(e) => return refuse(Code::Usage, e.into()),
         };
         let (from, rest) = match head_of(word, repo.as_deref(), &rest) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Refused, e),
         };
         // The side model's flags come out before the seat reads its own; its file is read in the
         // seat, after the levers.
         let (side, rest) = match side_seat::Flags::take(&rest) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Usage, e),
         };
         if let Some(from) = from {
             if let Err(e) = decide::check_side(&side) {
-                return exit_with(NAME, Err(e));
+                return refuse(Code::Usage, e);
             }
             // The decision seat places no card, so the placement flags' start does not run for
             // it; the variables and short spellings of the flags it does take are read as the
             // generative seats' are, `LLAMA_API_KEY` among them.
             let rest = match llama_launch::seat_from_env(NAME, rest, llama_launch::SERVE) {
                 Ok(v) => v,
-                Err(e) => return exit_with(NAME, Err(e)),
+                Err(e) => return refuse(Code::Usage, e),
             };
-            return ended(decide::run(&rest, from, repo.as_deref()));
+            start::note_seat(serve::decide::WORD);
+            return start::ended(NAME, decide::run(&rest, from, repo.as_deref()));
         }
         let seat = match seat_of_file(word) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Refused, e),
         };
+        start::note_seat(seat.word());
         // llama-server's placement flags and variables, read once the seat is known: the levers some
         // are, and the `--place` word the others come to.
         let seat_word = || -> Result<&'static str, GateError> { Ok(seat.word()) };
@@ -673,20 +868,344 @@ models (the --model word is optional with a model file: the file's architecture 
         };
         let rest = match launcher.placed(&rest) {
             Ok(v) => v,
-            Err(e) => return exit_with(NAME, Err(e)),
+            Err(e) => return refuse(Code::Usage, e),
         };
         let (run, _) = entries(seat);
-        ended(run(&rest, &side))
+        start::ended(NAME, run(&served_as(rest, asked_as), &side))
+    }
+
+    /// The arguments of a start by name, serving the catalog name it asked by: `--alias NAME`
+    /// joins them, since the served name is the file's `general.name`, which a repo's maker may
+    /// have left as anything (NVIDIA's Nemotron file says `Hf`). An alias the start gave stays:
+    /// the flag, `-a` and `LLAMA_ARG_ALIAS` are all `--alias` once the launcher has read them.
+    fn served_as(mut rest: Vec<String>, name: Option<&str>) -> Vec<String> {
+        if let Some(name) = name
+            && !llama_launch::serve_option(&rest, "--alias")
+        {
+            rest.extend(["--alias".to_owned(), name.to_owned()]);
+        }
+        rest
+    }
+
+    /// Ends the start with `e`: its stderr lines, its `error` event and the status of its class
+    /// (`start::exit_serve`). An error no type names takes the class `unnamed`, which is the
+    /// start's phase: its arguments' check is a usage refusal, its driver's a missing device.
+    fn refuse(unnamed: Code, e: GateError) -> ExitCode {
+        start::exit_serve(NAME, Err(e), unnamed, |_| Vec::new())
+    }
+
+    /// The address a start listens on, read as the seats read it (`--host` and `--port`, under
+    /// llama-server's variables), bound before the fetch ([`start::bind_early`]): the listener
+    /// answers 503 `loading`, and the handle moves its phase and its download's bytes as the start
+    /// goes on.
+    fn bind_start(rest: &[String]) -> Result<Progress, GateError> {
+        let env = llama_launch::llama_env(std::env::vars_os())?;
+        let (args, _) = llama_launch::seat_args(rest.to_vec(), &env, llama_launch::SERVE)?;
+        let mut host = bloomery_gpu_gates::bind::DEFAULT_HOST.to_owned();
+        let mut port = bloomery_gpu_gates::bind::DEFAULT_PORT;
+        for (flag, value) in llama_launch::serve_args(&args) {
+            match (flag.as_str(), value) {
+                ("--host", Some(v)) => host.clone_from(v),
+                ("--port", Some(v)) => port = serve::flag::number("--port", v)?,
+                _ => {}
+            }
+        }
+        let progress = start::bind_early(&host, port).map_err(ServeError::Io)?;
+        progress.phase(Phase::Plan);
+        let written = progress.clone();
+        model_file::on_transfer(move |done, total| written.bytes(done, total));
+        let loading = progress.clone();
+        start::on_loading(move || loading.phase(Phase::Load));
+        Ok(progress)
+    }
+
+    /// What this machine is to a pick: its cards, the class of the stage card, the host's room
+    /// and the cache's.
+    struct Machine {
+        census: Vec<model::placement::workstation::DeviceInfo>,
+        class: model::placement::devices::CardClass,
+        host_room: u64,
+        cache_root: std::path::PathBuf,
+        cache_free: u64,
+    }
+
+    impl Machine {
+        /// The census, the stage card's class (the largest visible card's, which `--place a`
+        /// stages on) in this build, the host's room and the cache's free bytes.
+        fn read() -> Result<Machine, GateError> {
+            let census = gpu_census::census()?;
+            let stage = census
+                .iter()
+                .max_by_key(|d| d.total_bytes)
+                .ok_or_else(|| Refusal::new(Code::NoDevice, "no CUDA device is visible"))?;
+            let class = stage.card_class(bloomery_gpu::NATIVE_FP4).ok_or_else(|| {
+                Refusal::new(
+                    Code::NoDevice,
+                    format!("{}: the census read no compute capability", stage.name),
+                )
+            })?;
+            let (host_room, _) = model::placement::workstation::host_available_read()?;
+            let cache_root = model_file::cache_root()?;
+            let cache_free = catalog::cache_free_bytes(&cache_root)?;
+            Ok(Machine {
+                census,
+                class,
+                host_room,
+                cache_root,
+                cache_free,
+            })
+        }
+
+        /// What the catalog's pick reads of it: the class, the cards' memory together and the
+        /// cache's room.
+        fn for_pick(&self) -> catalog::Machine {
+            catalog::Machine {
+                class: self.class,
+                card_bytes: self.census.iter().map(|d| d.total_bytes).sum(),
+                cache_free_bytes: self.cache_free,
+            }
+        }
+
+        /// The `machine` object of the JSON contract.
+        fn json(&self) -> Value {
+            let cards: Vec<Value> = self
+                .census
+                .iter()
+                .map(|d| {
+                    json!({
+                        "ordinal": d.ordinal,
+                        "name": d.name,
+                        "cc": d.compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
+                        "integrated": d.integrated,
+                        "total": d.total_bytes,
+                        "free": d.free_bytes,
+                    })
+                })
+                .collect();
+            json!({
+                "build": {
+                    "cuda_target": bloomery_gpu::BUILD_TARGET,
+                    "fp4": bloomery_gpu::NATIVE_FP4,
+                },
+                "class": catalog::class_name(self.class),
+                "cards": cards,
+                "host": {"room": self.host_room},
+                "cache": {"dir": self.cache_root.display().to_string(), "free": self.cache_free},
+            })
+        }
+    }
+
+    /// One model's pick as the lines a person reads: the picked variant and where it goes, or
+    /// that nothing fits, then each rejected variant with its reason.
+    fn model_text(entry: &Value) -> String {
+        let name = entry["name"].as_str().unwrap_or_default();
+        let pick = &entry["pick"];
+        let mut out = if pick.is_null() {
+            format!("{name}: nothing fits")
+        } else {
+            format!(
+                "{name}: {} ({}), place {}, ctx {}, {} bytes to download",
+                pick["variant"].as_str().unwrap_or_default(),
+                pick["source"].as_str().unwrap_or_default(),
+                pick["place"].as_str().unwrap_or_default(),
+                pick["ctx"],
+                pick["download"],
+            )
+        };
+        for rejected in entry["rejected"].as_array().into_iter().flatten() {
+            out.push_str(&format!(
+                "\n  {}: {}",
+                rejected["variant"].as_str().unwrap_or_default(),
+                rejected["why"].as_str().unwrap_or_default()
+            ));
+        }
+        out
+    }
+
+    /// The models of `entries` on stdout: the JSON contract's one document (`start` the argument
+    /// list a dry run's start would run), or lines for a person.
+    fn print_models(json: bool, machine: &Machine, entries: &[Value], start: Option<Vec<String>>) {
+        if !json {
+            for entry in entries {
+                println!("{}", model_text(entry));
+            }
+            return;
+        }
+        let mut doc = json!({
+            "schema": "bloomery.recommend/1",
+            "machine": machine.json(),
+            "models": entries,
+        });
+        if let Some(argv) = start {
+            doc["start"] = json!(argv);
+        }
+        println!("{doc}");
+    }
+
+    /// `--recommend`: the pick of every catalog model (or of the one `--model` names), under the
+    /// user's flags, printed; the exit is 0 whether or not a model fits (each entry says).
+    fn recommend(agent: &Agent, name: Option<CatalogRef>, flags: &[String]) -> ExitCode {
+        if let Err(e) = serve::preflight::driver(&start::driver_found()) {
+            return refuse(Code::NoDevice, e.into());
+        }
+        let machine = match Machine::read() {
+            Ok(m) => m,
+            Err(e) => return refuse(Code::NoDevice, e),
+        };
+        let targets: Vec<CatalogRef> = match name {
+            Some(target) => vec![target],
+            None => catalog::models()
+                .iter()
+                .map(|model| CatalogRef {
+                    model,
+                    variant: None,
+                })
+                .collect(),
+        };
+        let mut entries = Vec::new();
+        for target in &targets {
+            match choose(target, &machine, agent, flags) {
+                Ok(outcome) => entries.push(catalog::model_json(target.model, &outcome)),
+                Err(e) => return refuse(Code::Refused, e),
+            }
+        }
+        print_models(agent.json, &machine, &entries, None);
+        ExitCode::SUCCESS
+    }
+
+    /// The pick of `target` on `machine` under the user's `flags`.
+    fn choose(
+        target: &CatalogRef,
+        machine: &Machine,
+        agent: &Agent,
+        flags: &[String],
+    ) -> Result<Outcome, GateError> {
+        model_file::pick::choose(&model_file::pick::Ask {
+            target,
+            machine: &machine.for_pick(),
+            flags,
+            revision: agent.revision.as_deref(),
+        })
+    }
+
+    /// A start by name: the row of `target` that holds on this machine. A real start prints the
+    /// `pick` event and goes on with the row; a dry run prints the pick (and what the start would
+    /// run) and stops, `Ok(None)`. A pick that finds no row ends the start as the class of its
+    /// rejections says ([`no_pick`]).
+    fn pick_by_name(
+        target: &CatalogRef,
+        agent: &Agent,
+        flags: &[String],
+    ) -> Result<Option<&'static catalog::Row>, ExitCode> {
+        let machine = Machine::read().map_err(|e| refuse(Code::NoDevice, e))?;
+        let outcome =
+            choose(target, &machine, agent, flags).map_err(|e| refuse(Code::Refused, e))?;
+        let entry = catalog::model_json(target.model, &outcome);
+        if agent.dry_run {
+            let start = outcome.picked.as_ref().map(|picked| {
+                let mut argv = vec![
+                    "--model".to_owned(),
+                    format!("{}:{}", target.model.name, picked.row.variant),
+                ];
+                if let Some(revision) = &agent.revision {
+                    argv.extend(["--revision".to_owned(), revision.clone()]);
+                }
+                argv.extend(flags.iter().cloned());
+                argv
+            });
+            print_models(agent.json, &machine, std::slice::from_ref(&entry), start);
+        }
+        let Some(picked) = &outcome.picked else {
+            return Err(no_pick(target, &outcome, &machine));
+        };
+        if agent.dry_run {
+            return Ok(None);
+        }
+        let mut fields = catalog::pick_fields(picked);
+        fields.insert("model".to_owned(), json!(target.model.name));
+        fields.insert("rejected".to_owned(), entry["rejected"].clone());
+        event::emit(&Event::Pick(&fields));
+        eprintln!(
+            "{NAME}: pick: {} is --hf {} at {} ({} bytes to download)",
+            target.model.name,
+            picked.row.hf(),
+            agent.revision.as_deref().unwrap_or(picked.row.revision),
+            picked.download_bytes
+        );
+        Ok(Some(picked.row))
+    }
+
+    /// The end of a start whose pick found no row: the class its rejections share
+    /// ([`model_file::pick::why_none`]), every rejection with its reason, and, for a variant the
+    /// start named that does not fit, the next smaller one.
+    fn no_pick(target: &CatalogRef, outcome: &Outcome, machine: &Machine) -> ExitCode {
+        use model_file::pick::{Why, why_none};
+        let why = why_none(outcome);
+        let (code, what) = match why {
+            Why::NotInRepo => (Code::NoModel, "no row of the model is in its repo"),
+            Why::Offline => (
+                Code::Network,
+                "no listing could be read and no row of the model is cached",
+            ),
+            Why::DiskShort => (
+                Code::DiskShort,
+                "the cache's drive cannot take the least row of the model",
+            ),
+            Why::NoFit => (
+                Code::NoFit,
+                "no row of the model fits this machine as asked",
+            ),
+            Why::PlanRefused(ref word) => (
+                Code::from_name(word).unwrap_or(Code::NoFit),
+                "the seat's plan refuses every row of the model, and the refusal is not a lack \
+                 of room",
+            ),
+            Why::NamedOnly => (
+                Code::Usage,
+                "no row of the model starts on its name alone: each is explicit-only or \
+                 unverified, so none was planned on this machine; start one by naming its \
+                 variant (--model NAME:VARIANT)",
+            ),
+        };
+        let reasons: Vec<String> = outcome
+            .rejected
+            .iter()
+            .map(|r| format!("{}: {}", r.row.variant, r.why))
+            .collect();
+        let need = outcome
+            .least_need_bytes()
+            .map_or_else(String::new, |bytes| {
+                format!(" (the least plan needs {bytes} bytes)")
+            });
+        let mut refusal = Refusal::new(
+            code,
+            format!("{target}: {what}{need}; {}", reasons.join("; ")),
+        );
+        if why == Why::NamedOnly {
+            for rejected in &outcome.rejected {
+                let named = format!("{}:{}", target.model.name, rejected.row.variant);
+                refusal = refusal.offering(&["--model", &named]);
+            }
+        }
+        if code == Code::NoFit
+            && let Some(variant) = target.variant
+            && let Some(row) = target.model.row(variant)
+            && let Some(smaller) = catalog::next_smaller(target.model, machine.class, row)
+        {
+            let smaller = format!("{}:{}", target.model.name, smaller.variant);
+            refusal = refusal.offering(&["--model", &smaller]);
+        }
+        refuse(code, refusal.into())
     }
 
     /// A generative seat's `run`.
     type Run = fn(&[String], &side_seat::Flags) -> Result<ServeError, GateError>;
-    /// A generative seat's `check` before the fetch ([`early`]).
+    /// A generative seat's `check` before the fetch ([`early_named`]).
     type Check = fn(&[String], bool, bool) -> Result<(), GateError>;
-    /// A `--hf` repo's model as [`early`] reads it: the architecture and the decision type.
+    /// A `--hf` repo's model as [`early_named`] reads it: the architecture and the decision type.
     type Held = Result<(String, Option<String>), GateError>;
 
-    /// The entries of `seat`'s module: the start runs the one and [`early`] asks the other.
+    /// The entries of `seat`'s module: the start runs the one and [`early_named`] asks the other.
     fn entries(seat: Model) -> (Run, Check) {
         macro_rules! entry {
             ($seat:ident, source) => {
@@ -728,8 +1247,9 @@ models (the --model word is optional with a model file: the file's architecture 
     /// is read. `vars` supplies the reference model and the llama-server variables the seats read as
     /// flags, and `held` the architecture and decision type of a `--hf` repo's model, which narrow
     /// the seats a start with no seat word may come to ([`any_seat`]).
-    fn early(
+    fn early_named(
         word: Option<Word>,
+        name: Option<CatalogRef>,
         args: &[String],
         vars: impl IntoIterator<Item = (OsString, OsString)>,
         held: &dyn Fn(&hf::RepoRef) -> Held,
@@ -739,6 +1259,7 @@ models (the --model word is optional with a model file: the file's architecture 
             return Ok(());
         }
         let (model, rest) = take_source(args)?;
+        let model = hf::source::Flags { name, ..model };
         let vars: Vec<_> = vars.into_iter().collect();
         let reference = vars
             .iter()
@@ -748,7 +1269,11 @@ models (the --model word is optional with a model file: the file's architecture 
             .map(|value| value.to_str().ok_or("BLOOMERY_REF_MODEL is not UTF-8"))
             .transpose()?;
         let source = hf::source::resolve(&model, reference)?;
-        let from_repo = matches!(source, Some(hf::source::Source::Hf(_)));
+        // A catalog name's pick is a repo.
+        let from_repo = matches!(
+            source,
+            Some(hf::source::Source::Hf(_) | hf::source::Source::Named(_))
+        );
         let (head, rest) = take_head(&rest)?;
         serve::decide::check_head(
             word.map(Word::word),
@@ -766,7 +1291,7 @@ models (the --model word is optional with a model file: the file's architecture 
         if word == Some(Word::Decide) {
             check_decide()?;
             if source.is_none() {
-                return Err(model_file::NONE.into());
+                return Err(no_model().into());
             }
             return Ok(());
         }
@@ -799,12 +1324,28 @@ models (the --model word is optional with a model file: the file's architecture 
             None => any_seat(check, seats),
         }?;
         if source.is_none() {
-            return Err(model_file::NONE.into());
+            return Err(no_model().into());
         }
         Ok(())
     }
 
-    /// `check` at every seat, for a start whose model file picks the seat ([`early`]): `Ok` when
+    /// The refusal when nothing names the model: the class `no-model`, with what lists the models.
+    fn no_model() -> Refusal {
+        Refusal::new(Code::NoModel, model_file::NONE).offering(&["--recommend", "--json"])
+    }
+
+    /// [`early_named`] for a start that names no catalog model.
+    #[cfg(test)]
+    fn early(
+        word: Option<Word>,
+        args: &[String],
+        vars: impl IntoIterator<Item = (OsString, OsString)>,
+        held: &dyn Fn(&hf::RepoRef) -> Held,
+    ) -> Result<(), GateError> {
+        early_named(word, None, args, vars, held)
+    }
+
+    /// `check` at every seat, for a start whose model file picks the seat ([`early_named`]): `Ok` when
     /// every seat takes the arguments. When only some do, `held` names the model and the seats it
     /// may come to ([`seats_of`]), and the start ends unless one of those takes them; a model
     /// `held` cannot name before the fetch (no `--hf`, no listing, a set it cannot read) leaves
@@ -815,9 +1356,13 @@ models (the --model word is optional with a model file: the file's architecture 
         held: impl FnOnce() -> Option<(String, Vec<Word>)>,
     ) -> Result<(), GateError> {
         let words = Model::ALL.iter().map(|&m| Word::Seat(m));
-        let refused: Vec<(Word, String)> = words
+        let refused: Vec<Refused> = words
             .chain([Word::Decide])
-            .filter_map(|word| check(word).err().map(|e| (word, e.to_string())))
+            .filter_map(|word| {
+                check(word)
+                    .err()
+                    .map(|e| (word, start::class_of(&e), e.to_string()))
+            })
             .collect();
         if refused.is_empty() {
             return Ok(());
@@ -828,9 +1373,9 @@ models (the --model word is optional with a model file: the file's architecture 
         let Some((model, seats)) = held() else {
             return Ok(());
         };
-        let refused: Vec<(Word, String)> = refused
+        let refused: Vec<Refused> = refused
             .into_iter()
-            .filter(|(word, _)| seats.contains(word))
+            .filter(|(word, ..)| seats.contains(word))
             .collect();
         if refused.len() < seats.len() {
             return Ok(());
@@ -841,10 +1386,17 @@ models (the --model word is optional with a model file: the file's architecture 
         ))
     }
 
-    /// `head`, then each refusal of `refused` once, with the seats that give it.
-    fn each_refusal(head: &str, refused: &[(Word, String)]) -> GateError {
+    /// A seat's refusal of the arguments: the seat, the class the refusal names, its text.
+    type Refused = (Word, Option<Code>, String);
+
+    /// `head`, then each refusal of `refused` once, with the seats that give it. The refusal is of
+    /// the class the seats' refusals name when they name one (a lever's value is refused as a
+    /// lever at every seat), else of no class: the start's phase gives it one.
+    fn each_refusal(head: &str, refused: &[Refused]) -> GateError {
         let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
-        for (word, e) in refused {
+        let mut named: Vec<Code> = Vec::new();
+        for (word, class, e) in refused {
+            named.extend(*class);
             match grouped.iter_mut().find(|(text, _)| text == e) {
                 Some((_, seats)) => seats.push(word.word()),
                 None => grouped.push((e, vec![word.word()])),
@@ -854,24 +1406,13 @@ models (the --model word is optional with a model file: the file's architecture 
             .iter()
             .map(|(e, seats)| format!("  --model {}: {e}", seats.join(", ")))
             .collect();
-        format!(
+        let text = format!(
             "{head}, each refusing them as follows (--model names the seat):\n{}",
             lines.join("\n")
-        )
-        .into()
-    }
-
-    /// The process's exit for a seat's end, the decide seat's and the
-    /// generative seats' alike.
-    fn ended(r: Result<ServeError, GateError>) -> ExitCode {
-        match r {
-            // EX_SOFTWARE: the engine, not the listener or the load, ended the run.
-            Ok(ServeError::Engine(f)) => {
-                eprintln!("{NAME}: {f}");
-                ExitCode::from(70)
-            }
-            Ok(e) => exit_with(NAME, Err(e.into())),
-            Err(e) => exit_with(NAME, Err(e)),
+        );
+        match named.first() {
+            Some(&code) if named.iter().all(|c| *c == code) => Refusal::new(code, text).into(),
+            _ => text.into(),
         }
     }
 
@@ -883,14 +1424,19 @@ models (the --model word is optional with a model file: the file's architecture 
             s.split_whitespace().map(str::to_owned).collect()
         }
 
-        /// [`super::early`] where no `--hf` repo can be read before the fetch: the tests reach
-        /// no hub.
+        /// The `--hf` repo's model of a start where none can be read before the fetch: the tests
+        /// reach no hub.
+        fn no_hub(r: &hf::RepoRef) -> Held {
+            Err(format!("{r}: no hub").into())
+        }
+
+        /// [`super::early`] with [`no_hub`].
         fn early(
             word: Option<Word>,
             args: &[String],
             vars: impl IntoIterator<Item = (OsString, OsString)>,
         ) -> Result<(), GateError> {
-            super::early(word, args, vars, &|r| Err(format!("{r}: no hub").into()))
+            super::early(word, args, vars, &no_hub)
         }
 
         /// A start with no seat word on a `--hf` repo whose model is read before the fetch
@@ -945,6 +1491,29 @@ models (the --model word is optional with a model file: the file's architecture 
             .expect("every seat takes it");
         }
 
+        /// A start by name serves the catalog name it was asked by; an alias the start gave, as the
+        /// flag or through the variable the launcher has already read, and a start that named no
+        /// catalog model, are left as they are.
+        #[test]
+        fn a_start_by_name_serves_the_name_it_was_asked_by() {
+            let rest = line("--host 127.0.0.1 --port 0");
+            assert_eq!(
+                served_as(rest.clone(), Some("nemotron-3-nano-4b")),
+                line("--host 127.0.0.1 --port 0 --alias nemotron-3-nano-4b")
+            );
+            for given in ["--alias mine --port 0", "--port 0 --alias mine"] {
+                let given = line(given);
+                assert_eq!(served_as(given.clone(), Some("glm-5.3-flash")), given);
+            }
+            assert_eq!(served_as(rest.clone(), None), rest);
+            // A value that spells `--alias` is the value of another flag, not an alias.
+            let value = line("--api-key --alias");
+            assert_eq!(
+                served_as(value, Some("glm-5.3-flash")),
+                line("--api-key --alias --alias glm-5.3-flash")
+            );
+        }
+
         #[test]
         fn the_reference_source_comes_from_the_start_environment() {
             let word = Some(Word::Seat(Model::Qwen38));
@@ -990,6 +1559,148 @@ models (the --model word is optional with a model file: the file's architecture 
                     "{e}"
                 );
             }
+        }
+
+        /// The code a refusal of the start path ends with: a [`Refusal`] in the error.
+        fn code_of(e: &GateError) -> Code {
+            e.downcast_ref::<Refusal>()
+                .map(|r| r.code)
+                .expect("a typed refusal")
+        }
+
+        /// The agent contract's flags come out wherever they stand and take no value of their
+        /// own: a value that spells one (an alias named `--json`) is left to its flag.
+        #[test]
+        fn the_agent_flags_come_out_of_the_arguments() {
+            let (agent, rest) = take_agent(&line(
+                "--json --model glm --alias --json --dry-run --revision abc --ctx-size 8",
+            ))
+            .expect("flags");
+            assert_eq!(
+                agent,
+                Agent {
+                    json: true,
+                    dry_run: true,
+                    recommend: false,
+                    revision: Some("abc".to_owned()),
+                }
+            );
+            assert_eq!(rest, line("--model glm --alias --json --ctx-size 8"));
+            let (agent, rest) = take_agent(&line("--recommend")).expect("flags");
+            assert!(agent.recommend && rest.is_empty());
+            let e = take_agent(&line("--revision")).expect_err("no value");
+            assert_eq!(code_of(&e), Code::Usage);
+        }
+
+        /// A `--model` value is a catalog model by name, alias or seat word (with its variant),
+        /// or a seat word the catalog has no model for; an unknown name lists both sets, and an
+        /// existing path is `-m`'s.
+        /// A start whose file picks the seat refuses as the class the seats' refusals name: a lever's
+        /// bad value is the class `lever` whichever seats read it, a seat whose refusal names no class
+        /// does not hide it, and refusals no seat classes stay unclassed.
+        #[test]
+        fn every_seat_refusing_in_one_class_ends_the_start_as_that_class() {
+            let lever =
+                || -> GateError { Refusal::new(Code::Lever, "BLOOMERY_X=\"b\" is refused").into() };
+            let err = any_seat(|_| Err(lever()), || None).expect_err("every seat refuses");
+            assert_eq!(start::class_of(&err), Some(Code::Lever));
+            assert!(err.to_string().contains("BLOOMERY_X"), "{err}");
+            let mixed = |w: Word| match w {
+                Word::Decide => Err("a string refusal".into()),
+                Word::Seat(_) => Err(lever()),
+            };
+            let err = any_seat(mixed, || None).expect_err("every seat refuses");
+            assert_eq!(start::class_of(&err), Some(Code::Lever));
+            let two = |w: Word| match w {
+                Word::Decide => Err(Refusal::new(Code::NoFit, "no fit").into()),
+                Word::Seat(_) => Err(lever()),
+            };
+            let err = any_seat(two, || None).expect_err("every seat refuses");
+            assert_eq!(start::class_of(&err), None, "two classes name no one");
+            let plain =
+                any_seat(|_| Err("--ctx-size \"abc\"".into()), || None).expect_err("refused");
+            assert_eq!(start::class_of(&plain), None);
+            let one = |w: Word| match w {
+                Word::Seat(Model::Glm) => Ok(()),
+                _ => Err("not this seat".into()),
+            };
+            assert!(any_seat(one, || None).is_ok());
+        }
+
+        /// A start whose `--hf` repo's model narrows the seats ends as the class those seats'
+        /// refusals name, as one whose every seat refuses does.
+        #[test]
+        fn a_models_seats_refusing_in_one_class_end_the_start_as_that_class() {
+            let glm = |w: Word| match w {
+                Word::Seat(Model::Glm) => {
+                    Err(Refusal::new(Code::Lever, "BLOOMERY_X=\"b\" is refused").into())
+                }
+                _ => Ok(()),
+            };
+            let held = || {
+                Some((
+                    "--hf o/r holds a glm5next model".to_owned(),
+                    vec![Word::Seat(Model::Glm)],
+                ))
+            };
+            let err = any_seat(glm, held).expect_err("the seat the model comes to refuses");
+            assert_eq!(start::class_of(&err), Some(Code::Lever));
+            assert!(
+                err.to_string()
+                    .starts_with("--hf o/r holds a glm5next model"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_model_value_is_a_catalog_name_or_a_seat_word() {
+            let seat = |word: &str| Some(Word::parse(word).expect("a seat word"));
+            let (word, target) = name_of("glm").expect("a seat word that is a model's alias");
+            assert_eq!(
+                (word, target.map(|t| t.model.name)),
+                (seat("glm"), Some("glm-5.3-flash"))
+            );
+            let (word, target) = name_of("qwen3.8-27b:nvfp4").expect("a model and its variant");
+            assert_eq!(word, seat("qwen3"));
+            assert_eq!(target.and_then(|t| t.variant), Some("nvfp4"));
+            let (word, target) = name_of("decide").expect("a seat word with no model");
+            assert_eq!((word, target), (Some(Word::Decide), None));
+            let e = name_of("no-such-model").expect_err("unknown");
+            assert_eq!(code_of(&e), Code::Usage);
+            let text = e.to_string();
+            assert!(
+                text.contains("glm-5.3-flash") && text.contains("musespark"),
+                "{text}"
+            );
+            let e = name_of("glm:no-such-variant").expect_err("unknown variant");
+            assert_eq!(code_of(&e), Code::Usage);
+            let dir =
+                std::env::temp_dir().join(format!("bloomery-serve-model-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.to_str().expect("utf8");
+            let e = name_of(path).expect_err("a path");
+            assert_eq!(code_of(&e), Code::Usage);
+            let refusal = e.downcast_ref::<Refusal>().expect("typed");
+            assert_eq!(refusal.next, vec![vec!["-m".to_owned(), path.to_owned()]]);
+            std::fs::remove_dir_all(dir).expect("clean");
+        }
+
+        /// A catalog name alone names the model (the pick turns it into a repo), so the start's
+        /// check passes where a seat word alone is "no model file"; a variant beside `-m` is the
+        /// model named twice, and nothing named is `no-model`.
+        #[test]
+        fn a_catalog_name_names_the_model_before_the_fetch() {
+            let (word, name) = name_of("glm").expect("name");
+            early_named(word, name, &[], [], &no_hub).expect("a name is a model");
+            let (word, _) = name_of("glm").expect("name");
+            let e = early_named(word, None, &[], [], &no_hub).expect_err("a word alone");
+            assert_eq!(code_of(&e), Code::NoModel);
+            let (word, name) = name_of("glm:Q8_0").expect("name");
+            let e = early_named(word, name, &line("-m /x.gguf"), [], &no_hub).expect_err("twice");
+            assert!(e.to_string().contains("named twice"), "{e}");
+            let (word, name) = name_of("glm").expect("name");
+            early_named(word, name, &line("-m /x.gguf"), [], &no_hub)
+                .expect("a name beside -m picks the seat");
         }
 
         /// What a start checks before the fetch ([`early`]): with a seat word, the seat's usage

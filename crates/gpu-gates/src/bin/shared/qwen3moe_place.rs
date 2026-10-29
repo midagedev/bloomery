@@ -2123,6 +2123,7 @@ pub(super) mod tests {
             uuid: [1; 16],
             pci_bus: "0000:41:00.0".to_owned(),
             held_by: None,
+            compute_capability: Some((8, 6)),
             integrated: false,
         }];
         let place = Place::parse("cuda0").expect("a card word");
@@ -2145,6 +2146,7 @@ pub(super) mod tests {
             uuid: [2; 16],
             pci_bus: "0000:81:00.0".to_owned(),
             held_by: None,
+            compute_capability: Some((8, 6)),
             integrated: false,
         };
         let census = [census.into_iter().next().expect("the stage card"), tier];

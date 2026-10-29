@@ -2170,22 +2170,68 @@ fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> 
     Ok(uuid.bytes.map(|c| c.to_ne_bytes()[0]))
 }
 
+/// Device `dev`'s integer attribute `attribute`, asked of the driver without
+/// a context; `what` names the call in an error.
+fn raw_device_attribute(
+    dev: cuda_core::sys::CUdevice,
+    attribute: cuda_core::sys::CUdevice_attribute,
+    what: &'static str,
+) -> Result<i32, GpuError> {
+    let mut value = 0;
+    // SAFETY: `value` is a live out-pointer for the call and `dev` a
+    // device handle the driver returned.
+    let rc = unsafe { cuda_core::sys::cuDeviceGetAttribute(&mut value, attribute, dev) };
+    graph::cu(rc, what)?;
+    Ok(value)
+}
+
 /// Whether device `dev` allocates from host memory
 /// (`CU_DEVICE_ATTRIBUTE_INTEGRATED`), asked of the driver without a context.
 fn raw_device_integrated(dev: cuda_core::sys::CUdevice) -> Result<bool, GpuError> {
-    let mut integrated = 0;
-    // SAFETY: `integrated` is a live out-pointer for the call and `dev` a
-    // device handle the driver returned.
-    let rc = unsafe {
-        cuda_core::sys::cuDeviceGetAttribute(
-            &mut integrated,
-            cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_INTEGRATED,
-            dev,
-        )
-    };
-    graph::cu(rc, "cuDeviceGetAttribute(INTEGRATED)")?;
+    let integrated = raw_device_attribute(
+        dev,
+        cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_INTEGRATED,
+        "cuDeviceGetAttribute(INTEGRATED)",
+    )?;
     Ok(integrated != 0)
 }
+
+/// Device `dev`'s compute capability, `(major, minor)`, asked of the driver
+/// without a context.
+fn raw_device_compute_capability(dev: cuda_core::sys::CUdevice) -> Result<(u32, u32), GpuError> {
+    let major = raw_device_attribute(
+        dev,
+        cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        "cuDeviceGetAttribute(COMPUTE_CAPABILITY_MAJOR)",
+    )?;
+    let minor = raw_device_attribute(
+        dev,
+        cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        "cuDeviceGetAttribute(COMPUTE_CAPABILITY_MINOR)",
+    )?;
+    compute_capability_of(major, minor)
+}
+
+/// A compute capability from the driver's two attributes; a negative one is
+/// a named error, not a clamped figure.
+fn compute_capability_of(major: i32, minor: i32) -> Result<(u32, u32), GpuError> {
+    match (u32::try_from(major), u32::try_from(minor)) {
+        (Ok(major), Ok(minor)) => Ok((major, minor)),
+        _ => Err(GpuError::shape(
+            "census",
+            format!("a compute capability of {major}.{minor}"),
+        )),
+    }
+}
+
+/// The CUDA target this crate was built for (`CUDA_OXIDE_TARGET`, such as
+/// `sm_86`); `None` when the build was given none.
+pub const BUILD_TARGET: Option<&str> = option_env!("GPU_BUILD_TARGET");
+
+/// Whether this build carries the native FP4 products, which a build for
+/// `sm_120a`, `sm_121a` or their `f` forms alone has (`build.rs`): a card of
+/// compute capability 12 on any other build runs them as an Ampere card does.
+pub const NATIVE_FP4: bool = cfg!(bloomery_nvfp4_mma);
 
 /// Whether `ctx`'s device launches the decode gemvs' `_prefetch` entries
 /// ([`cores::l2_prefetch`] of the row first): true on an integrated device,
@@ -2209,6 +2255,66 @@ pub fn dense_mma(ctx: &CudaContext) -> Result<bool, GpuError> {
 /// [`dense_mma`]'s rule on a device's `(major, minor)` compute capability.
 const fn dense_mma_on((major, _): (i32, i32)) -> bool {
     major == 12
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::{BUILD_TARGET, Gpu, NATIVE_FP4, census, compute_capability_of};
+    use ::model::placement::devices::spec_of_device;
+    use ::model::placement::workstation::{A6000, RTX_3090};
+
+    /// The census reads every visible device's compute capability as a
+    /// context on that device does, and this workstation's two Ampere cards
+    /// read 8.6.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_census_reads_each_devices_compute_capability() {
+        let seen = census().expect("the census");
+        assert!(!seen.is_empty(), "a visible device");
+        for d in &seen {
+            let read = d
+                .compute_capability
+                .unwrap_or_else(|| panic!("{}: the census read no compute capability", d.name));
+            let ordinal = usize::try_from(d.ordinal).expect("a u32 ordinal fits usize");
+            let gpu = Gpu::with_device(ordinal).expect("a Gpu on the device");
+            let (major, minor) = gpu.context().compute_capability().expect("its capability");
+            assert_eq!(
+                (i64::from(read.0), i64::from(read.1)),
+                (i64::from(major), i64::from(minor)),
+                "{}: the census and a context on it read different capabilities",
+                d.name
+            );
+            let card = spec_of_device(d).name;
+            if card == A6000.name || card == RTX_3090.name {
+                assert_eq!(
+                    read,
+                    (8, 6),
+                    "{}: an Ampere card of this workstation",
+                    d.name
+                );
+            }
+        }
+    }
+
+    /// A negative attribute is refused by name; a driver's figures pass whole.
+    #[test]
+    fn a_negative_capability_attribute_is_refused() {
+        assert_eq!(compute_capability_of(8, 6).expect("8.6"), (8, 6));
+        for (major, minor) in [(-1, 0), (8, -1)] {
+            let e = compute_capability_of(major, minor).expect_err("a negative attribute");
+            assert!(e.to_string().contains("compute capability"), "{e}");
+        }
+    }
+
+    /// A build for a native-FP4 target says so: the FP4 products follow a
+    /// target of compute capability 12.
+    #[test]
+    fn native_fp4_follows_a_capability_12_target() {
+        assert!(
+            !NATIVE_FP4 || BUILD_TARGET.is_some_and(|t| t.starts_with("sm_12")),
+            "native FP4 on a build for {BUILD_TARGET:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2239,7 +2345,8 @@ fn integrated_room(what: &'static str) -> Result<u64, GpuError> {
 /// without a context but its free bytes, which the primary context answers:
 /// ordinal, name, `cuDeviceTotalMem`, free bytes (on a device that allocates
 /// from host memory, the host's room: [`raw_device_free_bytes`]), whether it
-/// does, UUID and PCI bus id — the census a plan resolves its cards against
+/// does, compute capability, UUID and PCI bus id — the census a plan resolves
+/// its cards against
 /// ([`::model::placement::workstation::resolve`]) and an open checks them
 /// against ([`Gpu::open_card`]). No device is an empty census, not an error.
 /// The holder list (`DeviceInfo::held_by`) stays empty here; the gates'
@@ -2279,6 +2386,7 @@ pub(crate) fn device_info(
         total_bytes: total as u64,
         free_bytes: raw_device_free_bytes(dev, integrated)?,
         integrated,
+        compute_capability: Some(raw_device_compute_capability(dev)?),
         uuid: raw_device_uuid(dev)?,
         pci_bus: String::from_utf8_lossy(&bus).into_owned(),
         held_by: None,

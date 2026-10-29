@@ -204,15 +204,36 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
         None => Ask::Default,
     };
     let (positions, source) = bounds.limit();
-    choose(ask, slots, Limit { positions, source }, SEAT_STEPS, plan_at).map_err(|e| match e {
-        AskError::Plan(e) => e.into(),
-        AskError::FloorShort { floor, short, .. } => Box::new(FloorShort {
-            floor,
-            short,
-            text: e.to_string(),
-        }),
-        other => other.to_string().into(),
-    })
+    let chosen = choose(ask, slots, Limit { positions, source }, SEAT_STEPS, plan_at).map_err(
+        |e| -> GateError {
+            match e {
+                AskError::Plan(e) => e.into(),
+                AskError::FloorShort { floor, short, .. } => Box::new(FloorShort {
+                    floor,
+                    short,
+                    text: e.to_string(),
+                }),
+                AskError::DoesNotFit {
+                    slots,
+                    short,
+                    largest,
+                    ..
+                } => Box::new(CtxDoesNotFit {
+                    largest_total: largest.and_then(|share| share.checked_mul(slots as u64)),
+                    short,
+                    text: e.to_string(),
+                }),
+                other => other.to_string().into(),
+            }
+        },
+    )?;
+    crate::start::note_ctx(
+        chosen.slot_ctx,
+        chosen.slots as u64,
+        chosen.rule.word(),
+        chosen.limit.positions,
+    );
+    Ok(chosen)
 }
 
 /// A default context whose floor the machine cannot hold
@@ -234,6 +255,26 @@ impl std::fmt::Display for FloorShort {
 }
 
 impl std::error::Error for FloorShort {}
+
+/// A set context the machine cannot hold ([`placement::ctx_ask::AskError::DoesNotFit`]'s words),
+/// kept as its own type so a start can offer the largest context that does.
+#[derive(Debug)]
+pub struct CtxDoesNotFit {
+    /// The `--ctx` total the largest share a slot holds gives over the slots; `None` when not
+    /// even the floor holds.
+    pub largest_total: Option<u64>,
+    /// The plan at the asked context and the memory it is short of.
+    pub short: placement::ctx_ask::Short,
+    text: String,
+}
+
+impl std::fmt::Display for CtxDoesNotFit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for CtxDoesNotFit {}
 
 /// A seat's boxed plan refusal read as a short memory
 /// ([`placement::ctx_ask::PlanRefusal::short`]): the family's error `E` when
@@ -332,6 +373,7 @@ impl PlaceWhy {
     /// where the rule asked the plan for it; the rule's break-even and basis
     /// whenever it has them.
     pub fn record(&self) -> Record {
+        crate::start::note_place(self.place.name(), self.why);
         let r = Record::new(&record::PLACE_UNSET)
             .w("place", self.place.name())
             .w("why", self.why);
@@ -2660,14 +2702,19 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| {
-                let (name, total_bytes) = match *n {
-                    "3090" => ("NVIDIA GeForce RTX 3090".to_string(), 25_351_356_416),
-                    "A6000" => ("NVIDIA RTX A6000".to_string(), 50_952_536_064),
+                let (name, total_bytes, compute_capability) = match *n {
+                    "3090" => (
+                        "NVIDIA GeForce RTX 3090".to_string(),
+                        25_351_356_416,
+                        Some((8, 6)),
+                    ),
+                    "A6000" => ("NVIDIA RTX A6000".to_string(), 50_952_536_064, Some((8, 6))),
                     "Blackwell" => (
                         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition".to_string(),
                         96 * 1024 * 1024 * 1024,
+                        None,
                     ),
-                    other => (other.to_string(), 2 * 50_952_536_064),
+                    other => (other.to_string(), 2 * 50_952_536_064, None),
                 };
                 DeviceInfo {
                     ordinal: u32::try_from(i).expect("small"),
@@ -2678,6 +2725,7 @@ mod tests {
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                     held_by: None,
                     integrated: false,
+                    compute_capability,
                 }
             })
             .collect()

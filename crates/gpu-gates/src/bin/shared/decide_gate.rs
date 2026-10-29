@@ -70,6 +70,42 @@ pub fn refused(dir: &Path, name: &str, args: &[&str], want: &[&str]) -> Result<b
     Ok(pass)
 }
 
+/// Whether the server of `args` exits with status 0 within [`REFUSE_WITHIN`] having printed every
+/// one of `want` on its stdout, and nothing on its stderr: `--help` answers with the usage.
+pub fn answered(dir: &Path, name: &str, args: &[&str], want: &[&str]) -> Result<bool, GateError> {
+    let (mut s, d) = spawn(dir, name, args)?;
+    let t = Instant::now();
+    let status = loop {
+        if let Some(status) = s.child.try_wait()? {
+            break Some(status);
+        }
+        if t.elapsed() > REFUSE_WITHIN {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let out = std::fs::read_to_string(d.join("server.out"))?;
+    let err = std::fs::read_to_string(d.join("server.err"))?;
+    let pass = match status {
+        Some(st) => {
+            let named = want.iter().all(|w| out.contains(w));
+            println!("{name}: exit {st}, stdout names {want:?}: {named}");
+            st.success() && named && err.is_empty()
+        }
+        None => {
+            println!(
+                "{name}: still running after {REFUSE_WITHIN:?}: {}",
+                s.stop()?
+            );
+            false
+        }
+    };
+    if !pass {
+        println!("{name} stdout:\n{out}\n{name} stderr:\n{err}");
+    }
+    Ok(pass)
+}
+
 /// How long the server may take to load and listen, and how often its
 /// stderr is read meanwhile.
 pub const LISTEN_WITHIN: Duration = Duration::from_secs(300);

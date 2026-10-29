@@ -1,11 +1,15 @@
 //! Where a server's model file comes from: a path (`-m PATH`, `--model-file
 //! PATH`, and whatever other spellings a binary gives the flag), a repo
-//! (`--hf <repo>[:<quant>]`), or the gates' environment variable
-//! `BLOOMERY_REF_MODEL`. A model is named once: a flag given twice, a path
+//! (`--hf <repo>[:<quant>]`), the gates' environment variable
+//! `BLOOMERY_REF_MODEL`, or a catalog model by name ([`Source::Named`], which the
+//! pick turns into a repo). A model is named once: a flag given twice, a path
 //! beside `--hf`, and a flag beside the variable when the two name different
 //! files are each refused by name with both values. A path flag equal to the
-//! variable is the same file named twice and stands.
+//! variable is the same file named twice and stands. A catalog name beside
+//! one of those only chooses the seat, as a seat word does; a catalog variant
+//! beside one is the model named twice.
 
+use crate::catalog::CatalogRef;
 use crate::{HfError, RepoRef};
 
 /// The model flags taken out of a binary's arguments.
@@ -15,6 +19,8 @@ pub struct Flags {
     pub path: Option<(String, String)>,
     /// `--hf`'s value.
     pub hf: Option<String>,
+    /// The catalog model a binary's name flag gave, parsed by the caller; [`take`] never sets it.
+    pub name: Option<CatalogRef>,
 }
 
 /// `args` with every model flag and its value taken out: `path_flags`
@@ -61,11 +67,42 @@ pub enum Source {
     File(String),
     /// A repo to fetch.
     Hf(RepoRef),
+    /// A catalog model by name, no model flag beside it: the pick turns it into a repo
+    /// ([`Source::Hf`]). A caller that has no pick refuses it by name.
+    Named(CatalogRef),
 }
 
-/// The source `flags` and the variable's value `env` name; `None` when
-/// neither names one. An empty `env` counts as unset.
+/// The source `flags` and the variable's value `env` name; `None` when neither names one. An
+/// empty `env` counts as unset. A catalog name beside a path, a repo or the variable only chooses
+/// the seat and the other source stands; a catalog variant beside one of them is the model named
+/// twice. A catalog name alone is [`Source::Named`].
 pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<Source>, HfError> {
+    let source = file_or_repo(flags, env)?;
+    match (flags.name, source) {
+        (None, source) => Ok(source),
+        (Some(name), None) => Ok(Some(Source::Named(name))),
+        (Some(name), Some(source)) => match name.variant {
+            None => Ok(Some(source)),
+            Some(_) => Err(HfError::Source(format!(
+                "the model is named twice: --model {name} and {}",
+                other_source(flags, env)
+            ))),
+        },
+    }
+}
+
+/// How the path flag, `--hf` or the variable that `file_or_repo` took is spelled.
+fn other_source(flags: &Flags, env: Option<&str>) -> String {
+    match (&flags.path, &flags.hf, env.filter(|e| !e.is_empty())) {
+        (Some((flag, p)), _, _) => format!("{flag} {p}"),
+        (None, Some(h), _) => format!("--hf {h}"),
+        (None, None, Some(e)) => format!("BLOOMERY_REF_MODEL={e}"),
+        (None, None, None) => String::new(),
+    }
+}
+
+/// The path, repo or variable `flags` and `env` name, the catalog name aside.
+fn file_or_repo(flags: &Flags, env: Option<&str>) -> Result<Option<Source>, HfError> {
     let env = env.filter(|e| !e.is_empty());
     match (&flags.path, &flags.hf, env) {
         (Some((flag, p)), _, Some(e)) if p != e => Err(HfError::Source(format!(
@@ -122,7 +159,7 @@ mod tests {
     fn a_flag_and_the_variable_are_one_model_or_refused() {
         let m = |p: &str| Flags {
             path: Some(("-m".to_owned(), p.to_owned())),
-            hf: None,
+            ..Flags::default()
         };
         assert_eq!(
             resolve(&m("/a"), None).expect("flag"),
@@ -142,8 +179,8 @@ mod tests {
             Some(Source::File("/a".into()))
         );
         let hf = Flags {
-            path: None,
             hf: Some("a/b:Q8_0".to_owned()),
+            ..Flags::default()
         };
         assert!(resolve(&hf, Some("/b")).is_err());
         assert_eq!(
@@ -156,8 +193,8 @@ mod tests {
         assert!(matches!(
             resolve(
                 &Flags {
-                    path: None,
-                    hf: Some("bad".into())
+                    hf: Some("bad".into()),
+                    ..Flags::default()
                 },
                 None
             ),
@@ -168,5 +205,60 @@ mod tests {
             Some(Source::File("/e".into()))
         );
         assert_eq!(resolve(&Flags::default(), None).expect("none"), None);
+    }
+
+    #[test]
+    fn a_catalog_name_beside_a_model_source_only_chooses_the_seat() {
+        let named = |target: &str| {
+            Some(CatalogRef::parse(target).unwrap_or_else(|e| panic!("{target}: {e}")))
+        };
+        let file = |p: &str| Some(("-m".to_owned(), p.to_owned()));
+
+        // Alone, a name is the catalog's: `resolve` hands it to the pick as `Source::Named`.
+        let alone = Flags {
+            name: named("qwen3.8-flash-next:q8_0"),
+            ..Flags::default()
+        };
+        assert_eq!(
+            resolve(&alone, None).expect("name"),
+            alone.name.map(Source::Named)
+        );
+
+        // A bare name beside a path, a repo or the variable chooses the seat; the source stands.
+        for (path, hf, env, source) in [
+            (file("/a"), None, None, Source::File("/a".into())),
+            (
+                None,
+                Some("x/y:Q4_K_M"),
+                None,
+                Source::Hf(RepoRef::parse("x/y:Q4_K_M").expect("repo")),
+            ),
+            (None, None, Some("/e"), Source::File("/e".into())),
+        ] {
+            let flags = Flags {
+                path,
+                hf: hf.map(str::to_owned),
+                name: named("glm"),
+            };
+            assert_eq!(resolve(&flags, env).expect("seat only"), Some(source));
+        }
+
+        // A variant beside one of them names the model twice, with both spellings.
+        for (path, hf, env, other) in [
+            (file("/a"), None, None, "-m /a"),
+            (None, Some("x/y"), None, "--hf x/y"),
+            (None, None, Some("/e"), "BLOOMERY_REF_MODEL=/e"),
+        ] {
+            let flags = Flags {
+                path,
+                hf: hf.map(str::to_owned),
+                name: named("glm:UD-Q4_K_XL"),
+            };
+            let e = resolve(&flags, env).expect_err("twice").to_string();
+            assert!(
+                e.contains("glm-5.3-flash:UD-Q4_K_XL") && e.contains(other),
+                "{e}"
+            );
+        }
     }
 }

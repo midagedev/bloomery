@@ -2,10 +2,12 @@
 //! may have to supply, so the flags exist in a build with the `hf` feature.
 
 use hf::source;
+use serve::exit::Code;
 
 use super::{ROWS, Side, row};
 use crate::GateError;
 use crate::model_file;
+use crate::start::Refusal;
 use crate::vision_seat;
 use gguf::Split;
 
@@ -118,13 +120,14 @@ impl Flags {
         };
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let arch = split.architecture().unwrap_or("<missing>");
-        let row = row(arch).ok_or_else(|| {
+        let row = row(arch).ok_or_else(|| -> GateError {
             let archs: Vec<&str> = ROWS.iter().map(|r| r.arch).collect();
-            format!(
+            let why = format!(
                 "--embd-model {}: a {arch} file; a side seat serves {}",
                 path.display(),
                 archs.join(", ")
-            )
+            );
+            Box::new(Refusal::new(Code::Unsupported, why).offering(&["--recommend", "--json"]))
         })?;
         let train = split
             .arch_get_u64("context_length")
@@ -374,5 +377,28 @@ mod tests {
             let e = Flags::take(&args(bad)).expect_err("refused").to_string();
             assert!(e.contains(why), "{bad:?}: {e}");
         }
+    }
+
+    /// A file of an architecture no side seat serves is refused as the class `unsupported`, with
+    /// the models this machine serves as the next step: the one owner of the refusal, so every seat
+    /// that takes `--embd-model` ends the same way.
+    #[test]
+    fn an_embedding_file_of_an_unsupported_architecture_is_the_class_unsupported() {
+        let path = std::env::temp_dir().join(format!("side-arch-{}.gguf", std::process::id()));
+        let layout = gguf::write::Layout::new(
+            &[(
+                gguf::GENERAL_ARCHITECTURE.into(),
+                gguf::Value::String("qwen4exp".into()),
+            )],
+            Vec::new(),
+        )
+        .expect("layout");
+        std::fs::write(&path, layout.header_bytes()).expect("header");
+        let model = path.to_str().expect("utf-8 path");
+        let (flags, _) = Flags::take(&args(&["--embd-model", model])).expect("take");
+        let e = flags.read().err().expect("refused");
+        std::fs::remove_file(&path).expect("clean");
+        assert!(e.to_string().contains("a qwen4exp file"), "{e}");
+        assert_eq!(crate::start::class_of(&e), Some(Code::Unsupported), "{e}");
     }
 }

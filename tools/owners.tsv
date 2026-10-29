@@ -16,7 +16,8 @@ seats_serve_engine	seat	crates/serve/src/engine.rs crates/serve/src/worker.rs cr
 drafts_mtp	draft	crates/model/src/arch/draft.rs crates/gpu/src/mtp.rs crates/runtime/src/speculative.rs crates/runtime/src/combine.rs crates/runtime/src/width.rs crates/runtime/src/lookup.rs crates/app/src/mtp.rs
 drafts_dspark	draft	crates/model/src/arch/dspark.rs crates/gpu/src/dspark/*.rs crates/runtime/src/dspark.rs crates/runtime/src/selector.rs
 residency	residency	crates/gpu/src/host/residency.rs crates/gpu/src/host/census.rs crates/runtime/src/warmprof.rs crates/gpu/src/host/swap_source.rs crates/runtime/src/swaprule.rs
-serve_http_api	serve	crates/serve/src/api.rs crates/serve/src/http.rs crates/serve/src/oaicompl.rs crates/serve/src/anthropic.rs crates/serve/src/responses.rs crates/serve/src/sampling.rs crates/serve/src/stop.rs crates/serve/src/logprobs.rs crates/serve/src/promptcache.rs crates/serve/src/preflight.rs crates/serve/src/reasoning.rs crates/serve/src/flag.rs
+serve_http_api	serve	crates/serve/src/api.rs crates/serve/src/http.rs crates/serve/src/oaicompl.rs crates/serve/src/anthropic.rs crates/serve/src/responses.rs crates/serve/src/sampling.rs crates/serve/src/stop.rs crates/serve/src/logprobs.rs crates/serve/src/promptcache.rs crates/serve/src/preflight.rs crates/serve/src/reasoning.rs crates/serve/src/flag.rs crates/serve/src/listener.rs crates/serve/src/event.rs crates/serve/src/exit.rs
+serve_start	serve	crates/gpu-gates/src/start.rs crates/gpu-gates/src/model_file/pick.rs
 serve_toolcall	serve	crates/serve/src/callstream.rs crates/serve/src/dsml.rs crates/serve/src/glmxml.rs crates/serve/src/hermes.rs crates/serve/src/museatem.rs crates/serve/src/qwenxml.rs
 serve_media	media	crates/serve/src/media.rs crates/serve/src/video.rs crates/vision/src/image.rs crates/vision/src/video.rs crates/vision/src/media.rs crates/gpu/src/media.rs
 serve_embed	serve	crates/serve/src/embed.rs crates/serve/src/embeddings.rs crates/serve/src/embed_cache.rs

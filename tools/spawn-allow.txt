@@ -12,7 +12,7 @@ crates/gpu-gates/src/serve_client.rs 2 a serve gate's two concurrent requests (t
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 2 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned; the worker test's job thread, from a libtest thread that is never pinned
 crates/serve/src/api.rs 4 the HTTP server's threads and the signal handlers' reader thread, spawned by the serve main or its accept loop, never pinned
 crates/serve/src/embeddings.rs 2 two tests' requests that wait for a held lock (the model's, the cache's), from the test main, never pinned
-crates/serve/src/decide.rs 1 the decision server's connection threads, spawned by its accept loop, never pinned
+crates/serve/src/decide.rs 2 two tests' threads that run a decision server to its end (`serving`'s, which sends what `run` returns, and the early-listener takeover test's), from a libtest thread that is never pinned
 crates/decision/src/pool.rs 1 the head's resident workers, one per CPU, started on first use by the decision bins, gates and server, never pinned
 crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those never pin
 crates/gpu-gates/src/ik_q8_2.rs 1 a host reference the gate binaries run; those never pin
@@ -59,3 +59,4 @@ crates/gpu/src/checkpoint/staging.rs 1 a gate test drops an extent on a thread o
 crates/jinja/src/lib.rs 1 a test parses on a thread with a fixed stack size, from a libtest thread that is never pinned
 crates/device/src/pages.rs 2 a test's writer and reader threads, spawned in one scope by the test harness, never pinned
 crates/metal/src/bin/gate_metal_device/mac.rs 1 the stream clause's two waiter threads, scoped in the gate main, never pinned (macOS has no affinity call)
+crates/model-hf/src/remote.rs 1 a set's header reads, up to eight at once in a thread scope (network waits, no compute), from the start by name's pick and the fixture bin's main thread, never pinned

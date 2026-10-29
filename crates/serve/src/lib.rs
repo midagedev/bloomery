@@ -17,10 +17,14 @@
 //! (`POST /v1/systemone`) on the same HTTP layer. [`preflight`] is what a
 //! server checks before it fetches or loads (the CPU, the driver), [`flag`]
 //! the seats' shared flag spellings, [`screen`] the start screen a person
-//! reads at a terminal.
+//! reads at a terminal. For the agent that starts the server: [`Listener`]
+//! binds the socket before the model loads and answers 503 `loading` until
+//! the server runs, [`event`] prints the start's events as JSON lines on
+//! stdout, and [`exit`] is the one table of exit statuses.
 
 mod api;
 pub use api::embeddings;
+pub use api::listener::{self, Listener};
 pub mod callstream;
 mod constrain;
 pub mod decide;
@@ -28,6 +32,8 @@ pub mod dsml;
 pub mod embed;
 pub mod embed_cache;
 pub mod engine;
+pub mod event;
+pub mod exit;
 pub mod flag;
 mod genloop;
 pub mod glmxml;

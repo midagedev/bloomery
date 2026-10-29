@@ -159,6 +159,9 @@ have. OpenAI clients take the base URL
 `http://localhost:8080/v1`, and Claude Code runs with `ANTHROPIC_BASE_URL=http://localhost:8080`. In Docker, the
 arguments after the image name go to `bloomery-serve`.
 
+An agent or a script starts the server by a model's name: [`docs/agents.md`](docs/agents.md) has the exact commands,
+the events to wait on and every exit code.
+
 Start with `--place` and the `BLOOMERY_*` variables unset: the load picks the cards and the split onto the CPU itself, and
 its plan line names what it picked. The file's architecture picks the seat (the model family's engine):
 

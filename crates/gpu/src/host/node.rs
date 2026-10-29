@@ -217,6 +217,7 @@ impl NodeCensus {
                 uuid,
                 pci_bus,
                 held_by: (!held.is_empty()).then_some(held),
+                compute_capability: None,
             });
         }
         Ok(NodeCensus {
@@ -2120,6 +2121,7 @@ pub(super) mod tests {
             uuid: [uuid; 16],
             pci_bus: "000F:01:00.0".into(),
             held_by: None,
+            compute_capability: None,
         }
     }
 

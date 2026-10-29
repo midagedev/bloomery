@@ -882,6 +882,7 @@ mod tests {
                 uuid: [0; 16],
                 pci_bus: String::new(),
                 held_by: None,
+                compute_capability: None,
             })
         }
 

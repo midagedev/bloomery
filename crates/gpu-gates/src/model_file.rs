@@ -22,9 +22,11 @@ use crate::GateError;
 mod fetch;
 #[cfg(feature = "hf")]
 pub use fetch::{
-    fetch_exact, hf_projector, hf_repo, name, quantized_from, repo_architecture, resolve,
-    sentence_prompts, take,
+    cache_root, fetch_exact, hf_projector, hf_repo, name, on_transfer, pin_revision,
+    quantized_from, ref_model, repo_architecture, resolve, sentence_prompts, take,
 };
+#[cfg(feature = "hf")]
+pub mod pick;
 
 /// The refusal when nothing names the model.
 pub const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \

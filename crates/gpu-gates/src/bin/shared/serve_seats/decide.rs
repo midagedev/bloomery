@@ -809,12 +809,15 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         name,
         n_ctx: ctx,
     };
-    let server = DecideServer::bind_with_keys(
-        addr.as_str(),
-        &seated,
-        Box::new(Seat { jobs, props }),
-        a.api_keys,
-    )
+    let decider = Box::new(Seat { jobs, props });
+    // A start by an agent bound its listener before the fetch (`start::bind_early`); the server
+    // takes that socket over.
+    let early = bloomery_gpu_gates::start::take_early(&a.host, a.port)
+        .map_err(|e| format!("bind {addr}: {e}"))?;
+    let server = match early {
+        Some(listener) => DecideServer::bind_listener(listener, &seated, decider, a.api_keys),
+        None => DecideServer::bind_with_keys(addr.as_str(), &seated, decider, a.api_keys),
+    }
     .map_err(|e| format!("bind {addr}: {e}"))?;
     // The bound address: `--port 0` binds a free port.
     let bound = server.local_addr()?;

@@ -45,6 +45,7 @@ impl MetalCensus {
             uuid,
             pci_bus: String::new(),
             held_by: None,
+            compute_capability: None,
         })
     }
 

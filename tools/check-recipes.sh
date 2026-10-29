@@ -395,6 +395,7 @@ blk_releasesitting() {
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
 pytools_list() {
   selftests=(
+    "tools/bloomery/catalog.py --self-test"
     "tools/bloomery/manifest.py --self-test"
     "tools/bloomery/records.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
@@ -402,6 +403,7 @@ pytools_list() {
     "tools/bloomery/selftest.py --self-test"
     "tools/boxq-check.py --self-test"
     "tools/boxq.py --self-test"
+    "tools/check-catalog-docs.py --self-test"
     "tools/check-comment-only.py --self-test"
     "tools/check-defaults.py --self-test"
     "tools/check-ptx-names.py --self-test"

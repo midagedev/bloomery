@@ -27,13 +27,13 @@ crates/gguf/src/lib.rs	deepseek	1	baseline T 1: case-table row, a fixture label 
 crates/gpu-gates/src/arch/embedding.rs	gemma	16	baseline O 16: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/bloomery_chat.rs	deepseek	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	clef	7	baseline S 7: MK9 seat by program
-crates/gpu-gates/src/bin/bloomery_serve.rs	deepseek	21	PIN(2026-10-22) deepseek: MK9 seat by program: the qwen3 seat includes the shared DSpark reader and the quiet log under the deepseek41 feature; two module attributes, the reader itself is common
-crates/gpu-gates/src/bin/bloomery_serve.rs	glm	16	baseline S 16: MK9 seat by program
-crates/gpu-gates/src/bin/bloomery_serve.rs	minimax	10	PIN(2026-10-21) minimax: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
-crates/gpu-gates/src/bin/bloomery_serve.rs	mimo	10	baseline S 11: MK9 seat by program
-crates/gpu-gates/src/bin/bloomery_serve.rs	nemotron	12	baseline S 15: MK9 seat by program
-crates/gpu-gates/src/bin/bloomery_serve.rs	qwen	21	baseline S 21: MK9 seat by program
-crates/gpu-gates/src/bin/bloomery_serve.rs	solar	10	PIN(2026-10-20) solar: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
+crates/gpu-gates/src/bin/bloomery_serve.rs	deepseek	20	PIN(2026-10-22) deepseek: MK9 seat by program: the qwen3 seat includes the shared DSpark reader and the quiet log under the deepseek41 feature; two module attributes, the reader itself is common
+crates/gpu-gates/src/bin/bloomery_serve.rs	glm	15	baseline S 16: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	minimax	9	PIN(2026-10-21) minimax: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
+crates/gpu-gates/src/bin/bloomery_serve.rs	mimo	9	baseline S 11: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	nemotron	11	baseline S 15: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	qwen	20	baseline S 21: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	solar	9	PIN(2026-10-20) solar: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/bin/exact_ref.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/forced_probe.rs	deepseek	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_bf16.rs	qwen	6	PIN(2026-10-20) qwen: the embedding lookup it checks (embed_rows_bf16 beside embed_rows_q8_0) is a kernel of bloomery_gpu::q38, the module named after its first model; the lookup would sit in a module named for what it does
@@ -205,7 +205,7 @@ crates/models/src/lib.rs	raon	2	PIN(2026-10-21) raon: ModelSpec.arch names the f
 crates/placement/src/accepts.rs	raon	5	PIN(2026-10-21) raon: program_of, Program::name, leg_arms and routed_rule match every Program or models::Arch exhaustively, so the body's variant needs an arm in each; the program would own its arms and rule instead of the matches naming programs
 crates/gpu-gates/src/bin/shared/routed_legs.rs	raon	2	PIN(2026-10-21) raon: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists
 crates/model/src/arch/coverage.rs	raon	27	PIN(2026-10-21) raon: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the raon1 body runs lists its variant; the program would own its rows instead of the list naming programs
-crates/gpu-gates/src/bin/bloomery_serve.rs	raon	10	PIN(2026-10-21) raon: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
+crates/gpu-gates/src/bin/bloomery_serve.rs	raon	9	PIN(2026-10-21) raon: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/record.rs	raon	6	PIN(2026-10-21) raon: MK12 per-bin Kind statics into record/<bin>.rs: the seat's draft-rule, load and listening kinds and its list are the common file's, where every seat's are
 crates/gpu/src/token_major.rs	qwen	3	PIN(2026-10-21) qwen: the row-major to token-major copy is shared by qwen3moe and raon1, and its entry `qwen3moe_token_major` keeps the name the PTX tables pin (tools/ref/ptx-shapes*.tsv) until the entries are renamed by what they compute
 crates/model/src/arch/mod.rs	muse	4	PIN(2026-10-23) muse: the family's module declaration (`pub mod musespark;`), and its `model::arch::Arch` variant with the arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a reader reads, so each family adds its directory, variant and two arms here until the registry owns them
@@ -214,13 +214,13 @@ crates/placement/src/accepts.rs	muse	12	PIN(2026-10-23) muse: Program is the key
 crates/gpu-gates/src/bin/shared/routed_legs.rs	muse	2	PIN(2026-10-23) muse: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists
 crates/serve/src/dsml.rs	muse	9	PIN(2026-10-23) muse: ToolFormat, Tools and Scan name the recipient protocol's parser beside the other chat formats, and the parser's arms route it; the parser itself lives in crates/serve/src/museatem.rs
 crates/serve/src/lib.rs	muse	1	PIN(2026-10-23) muse: the recipient-protocol parser's module declaration beside the other chat formats'
-crates/gpu-gates/src/bin/bloomery_serve.rs	muse	10	PIN(2026-10-23) muse: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
+crates/gpu-gates/src/bin/bloomery_serve.rs	muse	9	PIN(2026-10-23) muse: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/record.rs	muse	4	PIN(2026-10-23) muse: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds and its list are the common file's, where every seat's are
 crates/model/src/arch/coverage.rs	muse	25	PIN(2026-10-23) muse: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the musespark body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/hf/src/vocab.rs	minimax	3	PIN(2026-10-23) minimax: the minimax-m2 pre-tokenizer's name, regex and pipeline row; tokenizer programs are not yet described by ModelSpec
 crates/hf/src/vocab.rs	lfm	1	PIN(2026-10-28) lfm: the lfm2 pre-tokenizer's name in the pre-tokenizer table (the llama3 regex row with ignore_merges); tokenizer programs are not yet described by ModelSpec
 crates/gpu-gates/src/prompts.rs	deepseek	1	PIN(2026-10-23) deepseek: the measured logit σ is named for the one family it was measured on (SIGMA_LOGIT_V41); other families carry it in their gate description until their own is measured
-crates/gpu-gates/src/bin/bloomery_serve.rs	flint	10	PIN(2026-10-25) flint: MK9 seat by program: the seat word, help/models list, architecture match and dispatch register the implemented shared hybrid seat until the description selects it
+crates/gpu-gates/src/bin/bloomery_serve.rs	flint	9	PIN(2026-10-25) flint: MK9 seat by program: the seat word, help/models list, architecture match and dispatch register the implemented shared hybrid seat until the description selects it
 crates/model/src/arch/coverage.rs	flint	11	PIN(2026-10-25) flint: the implemented Program selects its actual head128 attention, floor router, dense/shared sites, embedding/head and expert-stack capabilities in the existing coverage owners
 crates/gpu-gates/src/bin/shared/routed_legs.rs	llama	2	PIN(2026-10-26) llama: family_of and skip_of match every models::Arch exhaustively; the dense trunk has no routed-legs adapter
 crates/model/src/arch/mod.rs	llama	2	PIN(2026-10-26) llama: the family's module declaration (`pub mod llama;`) and the SentencePiece rule's tokenizer-model word; the module list is not a registry
@@ -230,3 +230,5 @@ crates/model/src/arch/mod.rs	lfm	1	PIN(2026-10-28) lfm: the family's module decl
 crates/models/src/lib.rs	lfm	2	PIN(2026-10-28) lfm: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	lfm	1	PIN(2026-10-28) lfm: program_of matches every models::Arch exhaustively, so the variant needs its arm; none runs the family yet
 crates/gpu-gates/src/bin/shared/routed_legs.rs	lfm	2	PIN(2026-10-28) lfm: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter, and the dense trunk routes nothing
+crates/gpu-gates/src/start.rs	deepseek	2	PIN(2026-10-29) deepseek: the agent half of a start needs the serve crate, which only the deepseek41 and clef features link; no feature names that capability, so its two cfg lines name them
+crates/gpu-gates/src/start.rs	clef	2	PIN(2026-10-29) clef: the agent half of a start needs the serve crate, which only the deepseek41 and clef features link; no feature names that capability, so its two cfg lines name them

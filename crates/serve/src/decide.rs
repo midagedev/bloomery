@@ -28,7 +28,7 @@
 //! row, and a decision type no row serves is refused by name.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -37,14 +37,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::api::{
-    Answers, End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
-    fatal_health, install_signals, keep_alive, panic_text, relock, stopping, stopping_message,
-    wait_end,
+    Answers, End, Ended, JSON, cors_preflight, emit_stopped, engine_object, error_body,
+    exit_shutdown, fatal_health, install_signals, keep_alive, panic_text, relock, stopping,
+    stopping_message, wait_end,
 };
+use crate::event;
 use crate::flag::ApiKeys;
 use crate::http::{self, Request};
 use crate::models::Listed;
-use crate::{EngineFailure, EngineProps, FATAL_LINGER, ServeError};
+use crate::{EngineFailure, EngineProps, FATAL_LINGER, Listener, ServeError};
 
 /// One answered request.
 #[derive(Clone, Debug)]
@@ -623,9 +624,11 @@ fn decide(s: &Shared, body: &str) -> Reply {
 
 /// A bound, not yet running decision server.
 pub struct DecideServer {
-    listener: TcpListener,
+    listener: Listener,
     shared: Arc<Shared>,
-    ended: mpsc::Receiver<End>,
+    /// The model's name and context, which the `ready` event says.
+    model: String,
+    ctx: usize,
 }
 
 impl DecideServer {
@@ -651,6 +654,30 @@ impl DecideServer {
         decider: Box<dyn Decide>,
         api_keys: ApiKeys,
     ) -> io::Result<DecideServer> {
+        DecideServer::assemble(|| Listener::bind(addr), seated, decider, api_keys)
+    }
+
+    /// [`bind_with_keys`](DecideServer::bind_with_keys) on a listener bound
+    /// earlier ([`Listener::early`]): it keeps answering `loading` until the
+    /// server runs, then serves from the same socket. The refusals are
+    /// `bind_with_keys`', made before the listener is handed over.
+    pub fn bind_listener(
+        listener: Listener,
+        seated: &Seated,
+        decider: Box<dyn Decide>,
+        api_keys: ApiKeys,
+    ) -> io::Result<DecideServer> {
+        DecideServer::assemble(|| Ok(listener), seated, decider, api_keys)
+    }
+
+    /// The checks both binds make, then the server over the listener `open`
+    /// yields at the point the socket used to be bound.
+    fn assemble(
+        open: impl FnOnce() -> io::Result<Listener>,
+        seated: &Seated,
+        decider: Box<dyn Decide>,
+        api_keys: ApiKeys,
+    ) -> io::Result<DecideServer> {
         let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
         check_routes(seated.routes).map_err(invalid)?;
         let created = SystemTime::now()
@@ -668,8 +695,8 @@ impl DecideServer {
                 created,
             ),
         };
-        let listener = TcpListener::bind(addr)?;
-        let (end, ended) = mpsc::channel();
+        let listener = open()?;
+        let end = listener.end();
         Ok(DecideServer {
             listener,
             shared: Arc::new(Shared {
@@ -682,26 +709,30 @@ impl DecideServer {
                 answers: Answers::default(),
                 end,
             }),
-            ended,
+            model: seated.name.clone(),
+            ctx: seated.n_ctx,
         })
     }
 
     /// The bound address (the real port when bound to port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        Ok(self.listener.local_addr())
     }
 
     /// Serves until the listener fails or the decider does, and returns why: the listener's
     /// error ([`ServeError::Io`]), or after [`FATAL_LINGER`], during which `/health` answers it,
     /// the decider's failure ([`ServeError::Engine`], its crash block), as the generative server
-    /// does. Once the listener serves, the start screen is drawn when the seat armed it
-    /// ([`crate::screen`]).
+    /// does. Once the listener serves, the `ready` event is printed ([`crate::event`]) and the
+    /// start screen is drawn when the seat armed it ([`crate::screen`]); the `stopped` event is
+    /// printed before `run` returns or the process exits.
     pub fn run(self) -> ServeError {
         let DecideServer {
             listener,
             shared,
-            ended,
+            model,
+            ctx,
         } = self;
+        let url = event::url(listener.local_addr());
         // The signals are installed before the listener serves, the generative
         // server's owner of them: the first SIGINT/SIGTERM is this server's
         // orderly stop too.
@@ -714,10 +745,18 @@ impl DecideServer {
             }
         });
         let conn = Arc::clone(&shared);
-        accept(listener, shared.end.clone(), move |stream| {
+        let ended = listener.serve(move |stream| {
             keep_alive(stream, &conn.answers, &conn.api_keys, |req, w| {
                 answer(&conn, req, w)
             });
+        });
+        // The decider runs on the connections' threads, one request at a time.
+        event::emit(&event::Event::Ready {
+            url: &url,
+            model: &model,
+            ctx: ctx as u64,
+            slots: 1,
+            place: None,
         });
         // The decision server has no slots and no counters for a live view.
         crate::screen::draw(false);
@@ -725,7 +764,10 @@ impl DecideServer {
         // An orderly stop never returns: it ends the process once the answers
         // in flight are written.
         match wait_end(&ended, FATAL_LINGER) {
-            Ended::Error(e) => e,
+            Ended::Error(e) => {
+                emit_stopped(&e);
+                e
+            }
             Ended::Stop(cause) => {
                 exit_shutdown(&cause, |bound| shared.answers.wait(Instant::now() + bound))
             }
@@ -939,6 +981,36 @@ mod tests {
         let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
         let status = head.split(' ').nth(1).and_then(|c| c.parse().ok());
         (status.expect("a status line"), body.to_owned())
+    }
+
+    /// A decide server that takes an early listener over: the listener answers `loading` until the
+    /// server runs, then the server answers from the same socket.
+    #[test]
+    fn a_decide_server_takes_an_early_listener_over() {
+        let seated = Seated {
+            routes: ROUTES,
+            name: "m.gguf".to_owned(),
+            n_ctx: 16,
+        };
+        let listener = Listener::early("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr();
+        let (status, body) = call(addr, "GET", "/health");
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains(r#""status":"loading""#), "{body}");
+        let server =
+            DecideServer::bind_listener(listener, &seated, Box::new(Echo), ApiKeys::default())
+                .expect("take over");
+        std::thread::spawn(move || server.run());
+        // `run` installs the server's handler on its own thread: ask until it has.
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        let (status, body) = loop {
+            let (status, body) = call(addr, "GET", "/health");
+            if status == 200 || Instant::now() > until {
+                break (status, body);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!((status, body.as_str()), (200, r#"{"status":"ok"}"#));
     }
 
     /// A decide server over `decider`, its lock poisoned first when `poison`, run on a free port;

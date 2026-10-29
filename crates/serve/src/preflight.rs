@@ -1,14 +1,18 @@
 //! What a server checks before it fetches or loads anything: that the CPU
 //! runs the release's host code ([`cpu_gate`], over [`runs_v3`] and
-//! [`cpu_lacks`]) and that the NVIDIA driver runs its CUDA code
-//! ([`driver`]). The verdicts are pure functions of what the caller read: the
-//! CPU's feature words ([`CpuWords`]) and the driver's answer ([`Driver`]).
+//! [`cpu_lacks`]; its refusal is the class `no-device`) and that the NVIDIA
+//! driver runs its CUDA code ([`driver`]). The verdicts are pure functions of
+//! what the caller read: the CPU's feature words ([`CpuWords`]) and the
+//! driver's answer ([`Driver`]).
 //!
 //! The release's host code is built for x86-64-v3, so the compiler may use
 //! any of its instructions anywhere. `std::is_x86_feature_detected!` cannot
 //! see a CPU without them: under a target feature the build enables it is
 //! `true` at compile time. The words are read with `cpuid` itself
 //! ([`CpuWords::read`]).
+
+#[cfg(any(target_arch = "x86_64", test))]
+use crate::exit::Code;
 
 /// The CUDA version the release's code needs of the driver, as
 /// `cuDriverGetVersion` gives it (`1000 * major + 10 * minor`): 13.0, which
@@ -168,46 +172,91 @@ pub fn cpu_lacks(w: &CpuWords) -> Vec<&'static str> {
 const CPU_HEAD: &str = ": this CPU lacks ";
 
 /// The refusal's text after them.
-const CPU_TAIL: &str = ", which the release's host code (built for x86-64-v3) runs; a virtual \
-                        machine needs the host's CPU type passed through\n";
+const CPU_REASON: &str = ", which the release's host code (built for x86-64-v3) runs; a virtual \
+                          machine needs the host's CPU type passed through";
+
+/// The `error` event's line up to its message, as [`crate::event::render`] writes it for the class
+/// [`Code::NoDevice`]: a refused CPU writes the event from static pieces (a test holds them to that
+/// rendering), since nothing of ours that formats may run on a CPU that lacks x86-64-v3.
+#[cfg(any(target_arch = "x86_64", test))]
+const EVENT_HEAD: &str =
+    r#"{"schema":"bloomery.event/1","event":"error","exit":69,"code":"no-device","message":""#;
+
+/// The `error` event's line from the end of its message: the hint's key and, after the hint, an empty `next`.
+#[cfg(any(target_arch = "x86_64", test))]
+const EVENT_HINT: &str = r#"","hint":""#;
+#[cfg(any(target_arch = "x86_64", test))]
+const EVENT_END: &str = "\",\"next\":[]}\n";
 
 /// The refusal `cpu_gate` prints for the features `lacks`, as one string:
 /// what a test reads of it.
 #[must_use]
 pub fn cpu_refusal(name: &str, lacks: &[&str]) -> String {
-    format!("{name}{CPU_HEAD}{}{CPU_TAIL}", lacks.join(", "))
+    format!("{name}{CPU_HEAD}{}{CPU_REASON}\n", lacks.join(", "))
 }
 
-/// The process's first act on x86-64: on a CPU that does not run x86-64-v3
-/// code ([`runs_v3`]), print [`cpu_refusal`]'s text on stderr and exit 1,
-/// before any of that code runs. It is a call from `main` that is not
-/// inlined; its passing path is `cpuid` and three scalar masks, and its
-/// refusing path writes static pieces through std's own `write_all` — std is
-/// built for baseline x86-64 — with no allocation or formatting of ours in
-/// between.
-#[cfg(target_arch = "x86_64")]
+/// The names of the features `w` lacks, written to `out` in [`V3`]'s order, joined by `, `.
+#[cfg(any(target_arch = "x86_64", test))]
 #[inline(never)]
-pub fn cpu_gate(name: &str) {
-    use std::io::Write as _;
-    let w = CpuWords::read();
-    if runs_v3(&w) {
-        return;
-    }
-    let mut err = std::io::stderr();
-    let _ = err.write_all(name.as_bytes());
-    let _ = err.write_all(CPU_HEAD.as_bytes());
+fn write_lacks(w: &CpuWords, out: &mut dyn std::io::Write) {
     let mut first = true;
     for f in &V3 {
         if w.word(f.reg) & f.bit == 0 {
             if !first {
-                let _ = err.write_all(b", ");
+                let _ = out.write_all(b", ");
             }
-            let _ = err.write_all(f.name.as_bytes());
+            let _ = out.write_all(f.name.as_bytes());
             first = false;
         }
     }
-    let _ = err.write_all(CPU_TAIL.as_bytes());
-    std::process::exit(1);
+}
+
+/// What a CPU that does not run x86-64-v3 code ([`runs_v3`]) is told: the text of [`cpu_refusal`] on `err` and
+/// the `error` event of the class [`Code::NoDevice`] on `out`, both written from static pieces and `write_all`
+/// of std (built for baseline x86-64), with no allocation or formatting of ours in between. Returns the class the
+/// process ends with.
+#[cfg(any(target_arch = "x86_64", test))]
+#[inline(never)]
+fn refuse_cpu(
+    name: &str,
+    w: &CpuWords,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Code {
+    let _ = err.write_all(name.as_bytes());
+    let _ = err.write_all(CPU_HEAD.as_bytes());
+    write_lacks(w, err);
+    let _ = err.write_all(CPU_REASON.as_bytes());
+    let _ = err.write_all(b"\n");
+    let _ = out.write_all(EVENT_HEAD.as_bytes());
+    let _ = out.write_all(name.as_bytes());
+    let _ = out.write_all(CPU_HEAD.as_bytes());
+    write_lacks(w, out);
+    let _ = out.write_all(CPU_REASON.as_bytes());
+    let _ = out.write_all(EVENT_HINT.as_bytes());
+    let _ = out.write_all(Code::NoDevice.hint().as_bytes());
+    let _ = out.write_all(EVENT_END.as_bytes());
+    let _ = out.flush();
+    Code::NoDevice
+}
+
+/// The process's first act on x86-64: on a CPU that does not run x86-64-v3
+/// code ([`runs_v3`]), print [`cpu_refusal`]'s text on stderr and its
+/// `error` event on stdout ([`refuse_cpu`]), and exit with the status of
+/// the class [`Code::NoDevice`], before any of that code runs. It is a call
+/// from `main` that is not inlined; its passing path is `cpuid` and three
+/// scalar masks, and its refusing path writes static pieces through std's own
+/// `write_all` — std is built for baseline x86-64 — with no allocation or
+/// formatting of ours in between.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+pub fn cpu_gate(name: &str) {
+    let w = CpuWords::read();
+    if runs_v3(&w) {
+        return;
+    }
+    let code = refuse_cpu(name, &w, &mut std::io::stdout(), &mut std::io::stderr());
+    std::process::exit(i32::from(code.status()));
 }
 
 /// What the driver answered a server's start, as the CUDA bindings' loader
@@ -251,7 +300,10 @@ pub fn driver(d: &Driver) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CUDA_MIN, CpuWords, Driver, cpu_lacks, cpu_refusal, driver, runs_v3};
+    use super::{
+        CUDA_MIN, Code, CpuWords, Driver, cpu_lacks, cpu_refusal, driver, refuse_cpu, runs_v3,
+    };
+    use crate::event::{self, Event};
 
     /// A Zen 3's words: every x86-64-v3 bit, and OSXSAVE.
     const ZEN3: CpuWords = CpuWords {
@@ -368,6 +420,32 @@ mod tests {
             "bloomery-serve: this CPU lacks AVX, AVX2, which the release's host code (built for \
              x86-64-v3) runs; a virtual machine needs the host's CPU type passed through\n"
         );
+    }
+
+    /// A CPU that lacks x86-64-v3 is told on stderr what it lacks and on stdout, in the one event of the
+    /// start's schema, the class `no-device` (status 69): the pieces a refused CPU writes without formatting are
+    /// the line `event::render` makes of the same message, for every feature name.
+    ///
+    /// PIN(2026-10-29): the refusal ended with status 1 and no event on stdout before the exit table.
+    #[test]
+    fn a_refused_cpu_prints_its_error_event_and_ends_as_no_device() {
+        let kvm64 = CpuWords {
+            leaf1_ecx: 0x8020_0001,
+            leaf7_ebx: 0,
+            ext1_ecx: 0x0000_0001,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = refuse_cpu("bloomery-serve", &kvm64, &mut out, &mut err);
+        assert_eq!(code, Code::NoDevice);
+        assert_eq!(code.status(), 69);
+        let said = cpu_refusal("bloomery-serve", &cpu_lacks(&kvm64));
+        assert_eq!(String::from_utf8(err).expect("text"), said);
+        let line = event::render(&Event::Error {
+            code,
+            message: said.trim_end(),
+            next: &[],
+        });
+        assert_eq!(String::from_utf8(out).expect("text"), format!("{line}\n"));
     }
 
     #[test]

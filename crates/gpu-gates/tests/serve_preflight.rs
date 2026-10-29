@@ -2,6 +2,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bloomery_gpu_gates::serve_client::Served;
+use serde_json::Value;
+use serve::event::SCHEMA;
+use serve::exit::Code;
 
 #[test]
 fn invalid_arguments_end_before_the_driver_or_fetch() {
@@ -209,13 +212,10 @@ fn hw_a_device_list_alias_reaches_the_selected_seat() {
 #[test]
 fn a_head_asks_the_decide_seat_for_its_usage() {
     for help in ["--help", "-h"] {
-        refusal(
+        usage_answered(
             &format!("head{help}"),
-            env!("CARGO_BIN_EXE_bloomery-serve"),
             &["--head", "h", help],
-            None,
-            "bloomery-serve: usage: bloomery-serve [--model decide]",
-            true,
+            "usage: bloomery-serve [--model decide]",
         );
     }
 }
@@ -262,7 +262,10 @@ fn refusal(
         .map(|value| ("LLAMA_ARG_ALIAS", value))
         .into_iter()
         .collect();
-    let (dir, err) = startup(name, bin, args, &env);
+    let (dir, err, code) = startup_coded(name, bin, args, &env);
+    if before_model {
+        assert_eq!(code, Code::Usage, "{args:?} {alias:?}: {err}");
+    }
     let message = if before_model {
         err.as_str()
     } else {
@@ -279,6 +282,41 @@ fn startup(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> (std::path::PathBuf, String) {
+    let (dir, err, _) = startup_coded(name, bin, args, env);
+    (dir, err)
+}
+
+/// The events a refused start printed on stdout, the `error` event last: every line is an event of the server's
+/// schema, and the only event before the `error` is `bound`, which a start that got as far as its listener prints.
+/// Anything else, or no `error`, is a failure. Returns the `error` event and how many events came before it.
+fn error_event(out: &str, context: &str) -> (Value, usize) {
+    let events: Vec<Value> = out
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("stdout is not an event ({e}): {context}: {line}"))
+        })
+        .collect();
+    let Some((error, before)) = events.split_last() else {
+        panic!("a refusal prints an error event on stdout: {context}: {out:?}");
+    };
+    assert_eq!(error["schema"], SCHEMA, "{context}: {out}");
+    assert_eq!(error["event"], "error", "{context}: {out}");
+    for event in before {
+        assert_eq!(event["schema"], SCHEMA, "{context}: {out}");
+        assert_eq!(event["event"], "bound", "{context}: {out}");
+    }
+    (error.clone(), before.len())
+}
+
+/// `bin` with `args` and `env`, run in a fresh directory under an offline empty cache until it ends: the directory,
+/// the status and what it printed on stdout and stderr.
+fn run_start(
+    name: &str,
+    bin: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (std::path::PathBuf, std::process::ExitStatus, String, String) {
     let dir = std::env::temp_dir().join(format!(
         "bloomery-serve-preflight-{}-{name}",
         std::process::id()
@@ -305,9 +343,49 @@ fn startup(
         std::thread::sleep(Duration::from_millis(10));
     };
     let err = std::fs::read_to_string(dir.join("server.err")).unwrap();
-    assert_eq!(status.code(), Some(1), "{args:?} {env:?}: {err}");
+    let out = std::fs::read_to_string(dir.join("server.out")).unwrap();
     drop(server);
-    (dir, err)
+    (dir, status, out, err)
+}
+
+/// [`startup`], and the class the refusal ended in: the status the process left with, which its `error` event
+/// names with the code's own name.
+///
+/// PIN(2026-10-29): a start of `bloomery-serve`, `bloomery-serve-ds41` or `bloomery-serve-qwen38` that is refused ends
+/// with the status of its class (`serve::exit`) and an `error` event on stdout. It ended with status 1 and an empty
+/// stdout before the exit table and the events, and the two stand-alone seat binaries kept that until they took the
+/// contract (`bloomery_gpu_gates::seat_bin`); the branch on the binary is gone.
+fn startup_coded(
+    name: &str,
+    bin: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (std::path::PathBuf, String, Code) {
+    let (dir, status, out, err) = run_start(name, bin, args, env);
+    let context = format!("{args:?} {env:?}: {err}");
+    let (event, _) = error_event(&out, &context);
+    let code = status
+        .code()
+        .and_then(|s| u8::try_from(s).ok())
+        .and_then(Code::from_status)
+        .unwrap_or_else(|| panic!("the status {status} is no code of the table: {context}"));
+    assert_ne!(code, Code::Ok, "{context}");
+    assert_eq!(event["exit"], code.status(), "{context}");
+    assert_eq!(event["code"], code.name(), "{context}");
+    (dir, err, code)
+}
+
+/// A start that answers with the seat's usage: status 0, the usage on stdout and nothing on stderr.
+///
+/// PIN(2026-10-29): `--help` is an answer, not a refusal: the usage goes to stdout and the status is 0. It was a
+/// refusal with the usage on stderr and status 1.
+fn usage_answered(name: &str, args: &[&str], expected: &str) {
+    let (dir, status, out, err) = run_start(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, &[]);
+    assert!(status.success(), "{args:?}: {status}: {err}");
+    assert!(out.starts_with(expected), "{args:?}: {out}");
+    assert!(err.is_empty(), "{args:?}: {err}");
+    assert_eq!(std::fs::read_dir(dir.join("cache")).unwrap().count(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -565,7 +643,22 @@ fn preflight_mimo2_tier_slots() {
 }
 
 fn checked_refusal(name: &str, args: &[&str], env: &[(&str, &str)], expected: &str) {
-    let (dir, err) = startup(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, env);
+    let (dir, err, _) = startup_coded(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, env);
+    assert!(err.contains(expected), "{err}");
+    clean_refusal(&dir, &err, true);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// [`checked_refusal`] for a refusal of a known class.
+fn checked_refusal_as(
+    name: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    expected: &str,
+    class: Code,
+) {
+    let (dir, err, code) = startup_coded(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, env);
+    assert_eq!(code, class, "{args:?} {env:?}: {err}");
     assert!(err.contains(expected), "{err}");
     clean_refusal(&dir, &err, true);
     std::fs::remove_dir_all(dir).unwrap();
@@ -607,12 +700,13 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
             if alias {
                 args.extend(["--alias", value]);
             }
-            let (dir, err) = startup(
+            let (dir, err, code) = startup_coded(
                 &format!("normal-{model}-{value}"),
                 env!("CARGO_BIN_EXE_bloomery-serve"),
                 &args,
                 &[],
             );
+            assert_eq!(code, Code::Network, "{model} {value}: {err}");
             assert!(err.contains("first start"), "{model} {value}: {err}");
             assert!(err.contains("HF_HUB_OFFLINE"), "{model} {value}: {err}");
             std::fs::remove_dir_all(dir).unwrap();
@@ -684,12 +778,13 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
     {
         let mut args = vec!["--model", model, "--hf", "o/r"];
         args.extend_from_slice(tail);
-        let (dir, err) = startup(
+        let (dir, err, code) = startup_coded(
             &format!("boundary-{model}-{i}"),
             env!("CARGO_BIN_EXE_bloomery-serve"),
             &args,
             env,
         );
+        assert_eq!(code, Code::Network, "{model} {tail:?} {env:?}: {err}");
         assert!(
             err.contains("first start") && err.contains("HF_HUB_OFFLINE"),
             "{model} {tail:?} {env:?}: {err}"
@@ -708,12 +803,13 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
             } else {
                 args.extend(["--image-max-tokens", "1024"]);
             }
-            let (dir, err) = startup(
+            let (dir, err, code) = startup_coded(
                 &format!("{model}-repo-limits-{side}"),
                 env!("CARGO_BIN_EXE_bloomery-serve"),
                 &args,
                 &[],
             );
+            assert_eq!(code, Code::Network, "{model} {side}: {err}");
             assert!(
                 err.contains("first start") && err.contains("HF_HUB_OFFLINE"),
                 "{err}"
@@ -803,11 +899,38 @@ fn clean_refusal(dir: &std::path::Path, err: &str, before_model: bool) {
         assert!(!err.contains("first start"), "{err}");
     }
     assert_eq!(std::fs::read_dir(dir.join("cache")).unwrap().count(), 0);
-    assert!(std::fs::read(dir.join("server.out")).unwrap().is_empty());
+    // Stdout holds the refusal's `error` event and nothing else: before the model nothing came earlier (the
+    // listener was not bound), and after it only the `bound` event did.
+    let out = std::fs::read_to_string(dir.join("server.out")).unwrap();
+    if !out.is_empty() {
+        let (_, before) = error_event(&out, err);
+        if before_model {
+            assert_eq!(before, 0, "{out}");
+        }
+    }
 }
 
+/// PIN(2026-10-29): a seat word that is also a catalog model's alias (`--model glm`) is a start by name, which picks
+/// a file and refuses by the pick's class ([`hw_a_seat_word_alone_starts_by_name_and_refuses_offline`]); it was
+/// the refusal "no model file". The words that name no catalog model keep that refusal, now the class `no-model`.
 #[test]
 fn preflight_missing_model_source() {
+    for model in ["raon1", "flint", "decide"] {
+        checked_refusal_as(
+            &format!("{model}-missing-source"),
+            &["--model", model],
+            &[],
+            "no model file",
+            Code::NoModel,
+        );
+    }
+}
+
+/// A seat word that names a catalog model, started with no file offline and a cache that holds nothing: the pick
+/// finds no listing and no cached set, so the start ends as the class `network`, naming what it could not read.
+#[test]
+#[ignore = "requires an NVIDIA CUDA 13 driver"]
+fn hw_a_seat_word_alone_starts_by_name_and_refuses_offline() {
     for model in [
         "ds41",
         "qwen38",
@@ -817,17 +940,20 @@ fn preflight_missing_model_source() {
         "solar2",
         "minimaxm3",
         "nemotron",
-        "raon1",
-        "musespark",
-        "flint",
-        "decide",
     ] {
-        checked_refusal(
-            &format!("{model}-missing-source"),
-            &["--model", model],
+        let (dir, err, code) = startup_coded(
+            &format!("{model}-by-name"),
+            env!("CARGO_BIN_EXE_bloomery-serve"),
+            &["--model", model, "--host", "127.0.0.1", "--port", "0"],
             &[],
-            "no model file",
         );
+        assert_eq!(code, Code::Network, "{model}: {err}");
+        assert!(
+            err.contains("no row of the model is cached"),
+            "{model}: {err}"
+        );
+        clean_refusal(&dir, &err, false);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

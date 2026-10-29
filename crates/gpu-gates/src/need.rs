@@ -83,6 +83,12 @@ pub fn of(plan: &Plan<'_>, extra: u64, cache_ram: u64) -> Result<Need, GateError
 pub fn staged(plan: &Plan<'_>, extra: u64, cache_ram: u64) -> Result<Record, GateError> {
     record::require(record::groups::need::PRINT, "need::staged");
     let need = of(plan, extra, cache_ram)?;
+    crate::start::note_need(
+        need.bytes,
+        &need.cards,
+        plan.host.expert_bytes + plan.host.nvme_expert_bytes,
+        plan.host.nvme_expert_bytes,
+    );
     need_hook::stage(&record::need(&need).line());
     Ok(record::need(&need))
 }

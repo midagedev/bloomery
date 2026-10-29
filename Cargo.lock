@@ -370,6 +370,7 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-os",
+ "bloomery-placement",
  "bloomery-runtime",
  "bloomery-safetensors",
  "bloomery-tokenizer",

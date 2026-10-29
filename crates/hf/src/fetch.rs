@@ -162,6 +162,9 @@ pub struct Client {
     /// `HF_HUB_OFFLINE` ([`hub_offline`]): no listing is asked for; the
     /// cache's verified files stand in.
     pub offline: bool,
+    /// The revision of the repo a resolve lists and downloads: `main`, or a
+    /// commit hash, a tag or another branch a caller pins.
+    pub revision: String,
 }
 
 /// Why a resolve under `HF_HUB_OFFLINE` asked the hub for no listing.
@@ -238,17 +241,24 @@ enum Listed {
     Cache(String),
 }
 
+/// What [`curl_why`] says of a 401 or 403; `gpu-gates` reads the class of a refusal from it.
+pub const DENIED_HINT: &str = "a gated or private one";
+
+/// What [`curl_why`] says of a 404; `gpu-gates` reads the class of a refusal from it.
+pub const NOT_THERE_HINT: &str = "no such repo or file";
+
 /// curl's failure as a sentence: an HTTP 401 or 403 says the repo may be
-/// gated, a 404 that it or the file is not there.
+/// gated ([`DENIED_HINT`]), a 404 that it or the file is not there
+/// ([`NOT_THERE_HINT`]).
 fn curl_why(code: Option<i32>, stderr: &str) -> String {
     let said = stderr.trim().lines().collect::<Vec<_>>().join("; ");
     let hint = match http_status(stderr) {
-        Some(401 | 403) => {
-            " (no such repo, or a gated or private one: accept its terms on huggingface.co and \
+        Some(401 | 403) => format!(
+            " (no such repo, or {DENIED_HINT}: accept its terms on huggingface.co and \
              set HF_TOKEN, or write the token to ~/.cache/huggingface/token)"
-        }
-        Some(404) => " (no such repo or file)",
-        _ => "",
+        ),
+        Some(404) => format!(" ({NOT_THERE_HINT})"),
+        _ => String::new(),
     };
     match code {
         Some(c) => format!("exit {c}: {said}{hint}"),
@@ -278,6 +288,7 @@ impl Client {
             root,
             curl: "curl".into(),
             offline,
+            revision: "main".to_owned(),
         })
     }
 
@@ -346,7 +357,7 @@ impl Client {
         if self.offline {
             return Ok(Listed::Cache(HUB_OFFLINE_WHY.to_owned()));
         }
-        match self.listing(repo) {
+        match self.listing_at(repo, &self.revision) {
             Ok(entries) => Ok(Listed::Hub(entries)),
             Err(HfError::Network { why, .. } | HfError::Unavailable { why, .. }) => {
                 Ok(Listed::Cache(why))
@@ -512,7 +523,7 @@ impl Client {
     /// token and errors as every other call, nothing cached and nothing
     /// checked against the listing's digest. A hub that
     /// ignores the range and answers the whole file is stopped by its
-    /// `Content-Length` (`--max-filesize`) instead of being read; a body of
+    /// `Content-Length` (`--max-filesize`, [`range_limit`]) instead of being read; a body of
     /// another length than `len` is [`HfError::Range`], so the caller clips
     /// `len` to the file's listed size first.
     pub fn fetch_range(
@@ -529,7 +540,7 @@ impl Client {
             return Ok(Vec::new());
         }
         let range = format!("{from}-{}", from + len - 1);
-        let max = len.to_string();
+        let max = range_limit(len).to_string();
         let body = self.curl(
             &what,
             &[
@@ -563,7 +574,10 @@ impl Client {
         if let Some(dir) = part.parent() {
             fs::create_dir_all(dir).map_err(|e| HfError::io(dir, e))?;
         }
-        let url = format!("{}/{repo}/resolve/main/{}", self.base, entry.path);
+        let url = format!(
+            "{}/{repo}/resolve/{}/{}",
+            self.base, self.revision, entry.path
+        );
         let what = format!("download {url}");
         let mut cmd = Command::new(&self.curl);
         cmd.args(["--fail", "--location", "--silent", "--show-error"]);
@@ -978,6 +992,14 @@ fn write_marker(path: &Path, digest: &str) -> Result<(), HfError> {
     fs::write(path, format!("{digest}\n")).map_err(|e| HfError::io(path, e))
 }
 
+/// The bytes `--max-filesize` allows a range read of `len` bytes: curl holds the redirect the hub
+/// answers first (its body counts) to the same limit, and a hub's redirect body is a few hundred
+/// bytes whatever the range, so a short range gets this much room beyond `len`.
+fn range_limit(len: u64) -> u64 {
+    const REDIRECT_BODY: u64 = 4096;
+    len.saturating_add(REDIRECT_BODY)
+}
+
 /// The digest of the whole file at `path` by `check`, lowercase hex.
 /// For a Git blob, `size` supplies the header's size, not a read limit.
 pub fn digest(path: &Path, check: Check, size: u64) -> Result<String, HfError> {
@@ -1038,6 +1060,7 @@ mod tests {
             root: dir.join("cache"),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         };
         let entry = Entry {
             path: path.to_owned(),
@@ -1078,6 +1101,7 @@ mod tests {
             root: dir.join("cache"),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         }
     }
 
@@ -1316,6 +1340,44 @@ mod tests {
         fs::write(tree.join("0123abc"), json(11)).expect("rev listing");
         assert_eq!(c.listing("a/b").expect("main")[0].size, 10);
         assert_eq!(c.listing_at("a/b", "0123abc").expect("rev")[0].size, 11);
+    }
+
+    /// A client's revision is the one its listing and its download read: a pinned revision's file
+    /// is fetched, not `main`'s.
+    #[test]
+    fn a_clients_revision_names_the_listing_and_the_download() {
+        let d = scratch("client-rev");
+        let (mut c, _) = served(&d, "a/b", "m.bin", b"main bytes");
+        let older: &[u8] = b"older bytes";
+        let rev = d.join("hub/a/b/resolve/0123abc");
+        fs::create_dir_all(&rev).expect("rev dir");
+        fs::write(rev.join("m.bin"), older).expect("rev file");
+        let tree = d.join("hub/api/models/a/b/tree");
+        fs::create_dir_all(&tree).expect("tree dir");
+        let listing = |content: &[u8]| {
+            format!(
+                "[{{\"type\":\"file\",\"path\":\"m.bin\",\"size\":{},\"lfs\":{{\"oid\":\"{}\",\"size\":{}}}}}]",
+                content.len(),
+                hex(&sha2::Sha256::digest(content)),
+                content.len()
+            )
+        };
+        fs::write(tree.join("main"), listing(b"main bytes")).expect("main listing");
+        fs::write(tree.join("0123abc"), listing(older)).expect("rev listing");
+        c.revision = "0123abc".to_owned();
+        let got = c
+            .resolve_exact("a/b", &["m.bin"], &mut |_| {})
+            .expect("resolve");
+        assert_eq!(fs::read(&got[0]).expect("read"), older);
+    }
+
+    /// The hub answers a request with a redirect whose body is longer than a short range (310
+    /// bytes for the 202-byte `generation_config.json` of a checkpoint folder): the limit holds it.
+    #[test]
+    fn a_short_range_is_given_room_for_a_redirects_body() {
+        assert!(range_limit(202) >= 310);
+        assert!(range_limit(0) >= 310);
+        assert_eq!(range_limit(u64::MAX), u64::MAX);
     }
 
     #[test]
@@ -1643,6 +1705,7 @@ mod tests {
             root: root.to_owned(),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         }
     }
 
@@ -1675,6 +1738,7 @@ mod tests {
             root: root.to_owned(),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         }
     }
 
@@ -2286,7 +2350,10 @@ mod tests {
         assert_eq!(token_of(None, None), None);
         let err = "curl: (22) The requested URL returned error: 401";
         assert_eq!(http_status(err), Some(401));
-        assert!(curl_why(Some(22), err).contains("gated"));
+        assert!(curl_why(Some(22), err).contains(DENIED_HINT));
+        let missing = "curl: (22) The requested URL returned error: 404";
+        assert_eq!(http_status(missing), Some(404));
+        assert!(curl_why(Some(22), missing).contains(NOT_THERE_HINT));
         assert_eq!(http_status("curl: (6) Could not resolve host"), None);
     }
 }

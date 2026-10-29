@@ -1453,6 +1453,7 @@ mod tests {
             uuid: [uuid; 16],
             pci_bus: format!("0000:0{ordinal}:00.0"),
             held_by: None,
+            compute_capability: None,
             integrated: false,
         }
     }

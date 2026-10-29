@@ -63,12 +63,16 @@ pub mod residency38;
 #[cfg(feature = "gpu")]
 pub mod rope_gate;
 pub mod rounding;
+#[cfg(all(feature = "deepseek41", feature = "hf"))]
+pub mod seat_bin;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;
 #[cfg(feature = "deepseek41")]
 pub mod side_seat;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
+#[cfg(feature = "gpu")]
+pub mod start;
 #[cfg(feature = "gpu")]
 pub mod swiglu_host;
 pub mod tap_dump;
@@ -142,6 +146,14 @@ fn exit_status(
     let Err(e) = r else {
         return std::process::ExitCode::SUCCESS;
     };
+    print_refusal(name, &e, refusal.as_deref());
+    failure_status(refusal.is_some())
+}
+
+/// The stderr lines of a failed run's error `e`: `<name>: <error>`, each `source()` beneath it
+/// as `  caused by: ...`, and the need hook's `refusal` line when the error lost it. The text
+/// every exit of a gate or a server prints before its status ([`exit_with`], `start::exit_serve`).
+pub(crate) fn print_refusal(name: &str, e: &GateError, refusal: Option<&str>) {
     let msg = e.to_string();
     if msg.starts_with(&format!("{name}: ")) {
         eprintln!("{msg}");
@@ -153,10 +165,9 @@ fn exit_status(
         eprintln!("  caused by: {c}");
         cause = c.source();
     }
-    if let Some(why) = refusal.as_deref().filter(|why| !msg.contains(why)) {
+    if let Some(why) = refusal.filter(|why| !msg.contains(why)) {
         eprintln!("{name}: {why}");
     }
-    failure_status(refusal.is_some())
 }
 
 /// The status of a failed run: [`need_hook::REFUSED`] when the need hook

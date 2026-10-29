@@ -57,6 +57,10 @@ pub fn resolve(source: &Source) -> Result<Model, String> {
             let client = Client::new(root).map_err(|e| format!("--hf {repo}: {e}"))?;
             fetch(&client, repo, &mut |line| eprintln!("{line}"))
         }
+        Source::Named(name) => Err(format!(
+            "{name} names a catalog model, which this binary does not pick: name the model with \
+             -m PATH or --hf REPO"
+        )),
     }
 }
 
@@ -247,6 +251,7 @@ mod tests {
             root,
             curl: "curl-is-never-run".into(),
             offline: true,
+            revision: "main".to_owned(),
         }
     }
 
