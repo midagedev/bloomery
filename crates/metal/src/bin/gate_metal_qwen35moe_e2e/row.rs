@@ -6,11 +6,11 @@
 //! fixture directory its model lives in and whether that is a split or the
 //! checkpoint folder, where the self-bit clauses' prompt ids come from, the
 //! id a generation starts at, whether the file has a recurrent store (a delta
-//! state or a conv ring), the band its logits are held to against the pin,
-//! the count of groups a token encodes where it is derived on paper, which
-//! kernel mutants edit its program, and the clauses that hold a contract the
-//! file's architecture does not have, each with its reason, printed as that
-//! clause's SKIP line.
+//! state or a conv ring), the band its logits are held to against the pin and
+//! the band of its deep pin where it has one, the count of groups a token
+//! encodes where it is derived on paper, which kernel mutants edit its program,
+//! and the clauses that hold a contract the file's architecture does not have,
+//! each with its reason, printed as that clause's SKIP line.
 
 use std::sync::OnceLock;
 
@@ -24,6 +24,9 @@ pub enum Mutants {
     Routed,
     /// The dense FFN's: the pair and fold launches at one slot.
     Dense,
+    /// LFM3's: the windowed flash and the short conv's step ring, which only the
+    /// row's deep pin reads (`m_logits_deep`).
+    Lfm3,
     /// None: the row runs the kernels of another row's tables.
     None,
 }
@@ -81,6 +84,9 @@ pub struct Row {
     pub recurrent: bool,
     /// The largest |session − pin| on a logit `m_logits` accepts.
     pub logit_abs: f64,
+    /// The largest |session − pin| on a logit `m_logits_deep` accepts at the
+    /// deep pin's positions; None where the row holds no deep pin.
+    pub deep_logit_abs: Option<f64>,
     /// The groups and dispatches a token encodes where the row derives them
     /// from the layer list on paper, held beside the count model's own.
     pub count: Option<Count>,
@@ -128,6 +134,26 @@ const LFM3_LOGIT_CAP: f64 = 0.40;
 
 const _: () = assert!(LFM3_LOGIT_ABS <= LFM3_LOGIT_CAP);
 
+/// PIN(2026-10-29): max |session − pin| on a logit of LFM3-1.7B at each step of its
+/// deep pin (`pins/deep/lfm3.txt`: a 600-id walk, rows kept at steps 255, 256, 257,
+/// 300, 302, 357 and 599). [`LFM3_LOGIT_ABS`] sums the projections' rounding outright
+/// and would see a window one key off, the defect this pin is for, at two of the
+/// pinned rows only (mlx-vlm in f32: a window of 255 keys moves them by 0.023 to
+/// 0.113, of 257 keys by 0 to 0.153, 0 where the window has not begun to cut). The
+/// band is the same rounding rule simulated, not summed: mlx-vlm in f32 with the input of every
+/// projection and the head, and the K and V it stores, rounded once into half, against
+/// the pin's own rows. At the pinned steps its worst is 1.43e-2 (step 357), and at the
+/// BOS pin's four steps 1.48e-2 where the session's worst is 3.07e-3 (`LFM3_LOGIT_ABS`),
+/// so the simulation sits above the session there; the band rounds its worst up.
+/// Ignoring the rope's factors moves the pinned rows by 0.34 to 0.87.
+const LFM3_DEEP_LOGIT_ABS: f64 = 0.02;
+
+/// Half the smallest top-2 gap of the deep pin's seven rows, 0.0203 at step 256, rounded
+/// down.
+const LFM3_DEEP_LOGIT_CAP: f64 = 0.02;
+
+const _: () = assert!(LFM3_DEEP_LOGIT_ABS <= LFM3_DEEP_LOGIT_CAP);
+
 /// Qwen3.6-35B-A3B's fixture: the gated delta net beside the attention layers.
 pub static QWEN35MOE: Row = Row {
     name: "qwen35moe",
@@ -140,6 +166,7 @@ pub static QWEN35MOE: Row = Row {
     seed: 0,
     recurrent: true,
     logit_abs: QWEN_LOGIT_ABS,
+    deep_logit_abs: None,
     count: None,
     mutants: Mutants::Routed,
     skips: &[],
@@ -157,6 +184,7 @@ pub static QWEN3MOE: Row = Row {
     seed: 0,
     recurrent: false,
     logit_abs: QWEN_LOGIT_ABS,
+    deep_logit_abs: None,
     count: None,
     mutants: Mutants::None,
     skips: &[
@@ -190,6 +218,7 @@ pub static QWEN38D: Row = Row {
     seed: 0,
     recurrent: true,
     logit_abs: QWEN_LOGIT_ABS,
+    deep_logit_abs: None,
     count: None,
     mutants: Mutants::Dense,
     skips: &[(
@@ -220,11 +249,12 @@ pub static LFM3: Row = Row {
     seed: 124_894,
     recurrent: true,
     logit_abs: LFM3_LOGIT_ABS,
+    deep_logit_abs: Some(LFM3_DEEP_LOGIT_ABS),
     count: Some(Count {
         groups: 170,
         dispatches: 170,
     }),
-    mutants: Mutants::None,
+    mutants: Mutants::Lfm3,
     skips: &[(
         "m_mlx_folder",
         "the folder is every clause's model and there is no prepared split to tell it against; \

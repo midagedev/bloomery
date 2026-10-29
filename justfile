@@ -110,8 +110,9 @@ lab-metal:
 # profile step (its picks and logits equal the plain step's, its group tags covering the count's groups, its weight
 # bytes equal the file's own tensors), the MLX folder opened as it is, which must tell what its prepared split tells
 # (m_mlx_folder; before the gate, model-hf's hw_a_ tests hold the two files' tensor bytes equal), and the first-step
-# logits against the committed mlx-lm dump (m_logits); then the gate's kernel mutants of the qwen35moe row and of the
-# qwen38d row, each of which its clause must catch; then the generate_metal CLI's smoke on the qwen35moe split (and, for
+# logits against the committed mlx-lm dump (m_logits, and for the lfm3 row m_logits_deep over its deep pin, past the
+# sliding window); then the gate's kernel mutants of the qwen35moe row, of the qwen38d row and of the lfm3 row, each of
+# which its clause must catch; then the generate_metal CLI's smoke on the qwen35moe split (and, for
 # the ids and the text prompt, on the qwen3moe and qwen38d splits). The prompt ids through --tokens must print the ids
 # pinned here, a text prompt must decode to non-empty stdout, and the decode rate and the profile's decode_ms must count the loop's passes (none for a one-token
 # run, 7 for eight tokens). The GGUF fixture smoke left with the ik clauses.
@@ -132,6 +133,7 @@ lab-metal-e2e:
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row lfm3
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen38d --mutants-all
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row lfm3 --mutants-all
     # The smoke opens the MLX split's first shard, the same file the e2e gate opens.
     shard() {
         local dir="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$1-mlxsplit" found=()

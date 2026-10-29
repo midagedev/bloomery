@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mlx-logits.py — mlx-lm's first-step logit rows of an MLX fixture folder, the Metal e2e pin.
 
-    tools/mlx-logits.py dump <folder> <family>
+    tools/mlx-logits.py dump <folder> <family> [--ids 0,1 | --ids-walk N:FIRST] [--positions P,P] [--out DIR]
     tools/mlx-logits.py layers <folder> <dir> [--split FIRST.gguf]
     tools/mlx-logits.py compare <ours-dir> <mlx-dir>
     tools/mlx-logits.py f64 <ours-dir> <mlx-dir> <split.gguf>
@@ -30,6 +30,15 @@ fully is refused by name. It prints two blocks on stdout:
 
 The checksum is FNV-1a 64-bit over those bytes (offset basis 14695981039346656037, prime
 1099511628211), the same function the e2e gate recomputes. A flipped logit changes it.
+
+`--ids-walk N:FIRST` is the deep sequence: N ids, FIRST and then `(i * 7919) % 90001 + 1000` for
+i from 1, the walk `tools/metal-compare.sh` feeds its deep trace (ids from 1000 to 91000). `--positions
+P,P,...` keeps only the rows of those steps (0-based, increasing, each below the id count): the f32
+block then holds one row per position, the text adds a line `positions` and a line `argmax` (the
+first index of the largest value of each kept row, in the same order), and the checksum is over those
+rows. The gate's `m_logits_deep` reads such a pin from `pins/deep/`. `--out DIR` writes
+`DIR/<family>.txt` and `DIR/<family>.f32` (the f32 bytes themselves, not base64) in place of the two
+stdout blocks.
 
 An LFM3 folder (`model_type` `lfm3`) loads through mlx-vlm's `lfm3` instead, since mlx-lm has none:
 its language model alone runs, with the same floatize and the same two blocks. Before it loads, the
@@ -61,7 +70,8 @@ import struct
 import sys
 
 USAGE = (
-    "usage: tools/mlx-logits.py dump <folder> <family> [--ids 0,1]"
+    "usage: tools/mlx-logits.py dump <folder> <family> [--ids 0,1 | --ids-walk N:FIRST]"
+    " [--positions P,P] [--out DIR]"
     " | layers <folder> <dir> [--split FIRST.gguf]"
     " | compare <ours-dir> <mlx-dir>"
     " | f64 <ours-dir> <mlx-dir> <split.gguf> | --self-test"
@@ -79,13 +89,28 @@ def fnv1a(data: bytes) -> int:
     return h
 
 
-def header(family: str, ids: list[int], steps: int, n: int, raw: bytes) -> str:
+def header(
+    family: str,
+    ids: list[int],
+    steps: int,
+    n: int,
+    raw: bytes,
+    positions: list[int] | None = None,
+    argmax: list[int] | None = None,
+) -> str:
+    """The pin's text. Without `positions` the f32 block holds a row for each step; with them, one
+    row for each position, in order, and `argmax` names each such row's first largest index."""
     if steps != len(ids):
         raise SystemExit(f"mlx-logits: steps {steps} and {len(ids)} ids differ")
-    if len(raw) != steps * n * 4:
-        raise SystemExit(f"mlx-logits: {len(raw)} bytes is not {steps} * {n} f32s")
+    rows = steps if positions is None else len(positions)
+    if positions is not None:
+        check_positions(positions, steps)
+    if argmax is not None and len(argmax) != rows:
+        raise SystemExit(f"mlx-logits: {len(argmax)} argmax values for {rows} rows")
+    if len(raw) != rows * n * 4:
+        raise SystemExit(f"mlx-logits: {len(raw)} bytes is not {rows} * {n} f32s")
     ids_s = ",".join(str(i) for i in ids)
-    return (
+    text = (
         "version 1\n"
         f"family {family}\n"
         f"ids {ids_s}\n"
@@ -93,13 +118,69 @@ def header(family: str, ids: list[int], steps: int, n: int, raw: bytes) -> str:
         f"n {n}\n"
         f"fnv1a {fnv1a(raw):016x}\n"
     )
+    if positions is not None:
+        text += "positions " + ",".join(str(p) for p in positions) + "\n"
+    if argmax is not None:
+        text += "argmax " + ",".join(str(a) for a in argmax) + "\n"
+    return text
 
 
-def emit(family: str, text: str, raw: bytes) -> None:
+def emit(family: str, text: str, raw: bytes, out: str | None = None) -> None:
+    """The pin's two files: as stdout blocks (the f32 bytes in base64), or into the directory `out`."""
+    if out is not None:
+        import pathlib
+
+        root = pathlib.Path(out)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{family}.txt").write_text(text if text.endswith("\n") else text + "\n")
+        (root / f"{family}.f32").write_bytes(raw)
+        return
     print(f"----- {family}.txt -----")
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
     print(f"----- {family}.f32 -----")
     print(base64.b64encode(raw).decode("ascii"))
+
+
+WALK_STEP = 7919
+WALK_MOD = 90001
+WALK_LO = 1000
+
+
+def walk_ids(count: int, first: int) -> list[int]:
+    """`count` ids: `first`, then `(i * 7919) % 90001 + 1000` for i from 1, the walk
+    tools/metal-compare.sh feeds its deep trace."""
+    if count < 1:
+        raise SystemExit(f"mlx-logits: a walk of {count} ids")
+    return [first] + [(i * WALK_STEP) % WALK_MOD + WALK_LO for i in range(1, count)]
+
+
+def parse_walk(text: str) -> list[int]:
+    """`N:FIRST` as the ids of [`walk_ids`]."""
+    count, sep, first = text.partition(":")
+    if not sep or not count.isdigit() or not first.isdigit():
+        raise SystemExit(f"mlx-logits: {text!r} is not N:FIRST, a count and a first id")
+    return walk_ids(int(count), int(first))
+
+
+def check_positions(positions: list[int], steps: int) -> None:
+    """Positions are steps of the run: increasing, each below the step count, at least one."""
+    if not positions:
+        raise SystemExit("mlx-logits: the position list is empty")
+    for a, b in zip(positions, positions[1:]):
+        if b <= a:
+            raise SystemExit(f"mlx-logits: positions {a},{b} are not increasing")
+    if positions[-1] >= steps:
+        raise SystemExit(f"mlx-logits: position {positions[-1]} is past the {steps} steps")
+
+
+def parse_positions(text: str, steps: int) -> list[int]:
+    out = []
+    for part in text.split(","):
+        if part == "" or not part.isdigit():
+            raise SystemExit(f"mlx-logits: {text!r} is not a list of positions")
+        out.append(int(part))
+    check_positions(out, steps)
+    return out
 
 
 def parse_ids(text: str) -> list[int]:
@@ -307,7 +388,13 @@ def unwrap_logits(out):
     return getattr(out, "logits", out)
 
 
-def dump(folder: str, family: str, ids: list[int]) -> None:
+def dump(
+    folder: str,
+    family: str,
+    ids: list[int],
+    positions: list[int] | None = None,
+    out: str | None = None,
+) -> None:
     import mlx.core as mx
     import numpy as np
 
@@ -328,17 +415,32 @@ def dump(folder: str, family: str, ids: list[int]) -> None:
     if replaced == 0 or "bf16 parameters left: 0" not in note:
         raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
     prompt_cache = make_cache()
+    keep = None if positions is None else set(positions)
     rows = []
-    for token in ids:
+    argmax = []
+    n = 0
+    for step, token in enumerate(ids):
         y = mx.array([token])
         logits = unwrap_logits(model(y[None], cache=prompt_cache))
         logits = logits[:, -1, :]
         mx.eval(logits)
         row = np.ascontiguousarray(np.array(logits.astype(mx.float32)), dtype=np.float32)
-        rows.append(row.tobytes())
+        if not n:
+            n = row.size
+            if max(ids) >= n:
+                raise SystemExit(f"mlx-logits: id {max(ids)} is outside the vocabulary of {n}")
+        if not np.isfinite(row).all():
+            raise SystemExit(f"mlx-logits: step {step} (id {token}) has a non-finite logit")
+        if keep is None or step in keep:
+            rows.append(row.tobytes())
+            argmax.append(int(np.argmax(row)))
     raw = b"".join(rows)
-    n = len(rows[0]) // 4
-    emit(family, header(family, ids, len(ids), n, raw), raw)
+    text = header(
+        family, ids, len(ids), n, raw, positions, None if positions is None else argmax
+    )
+    emit(family, text, raw, out)
+    if out is not None:
+        print(f"mlx-logits: wrote {out}/{family}.txt and {out}/{family}.f32", file=sys.stderr)
 
 
 def self_test() -> int:
@@ -442,11 +544,74 @@ def self_test() -> int:
         pass
 
     fails += self_test_lfm3()
+    fails += self_test_deep()
     if fails:
         print(f"mlx-logits self-test: {fails} failed", file=sys.stderr)
         return 1
     print("mlx-logits self-test: ok")
     return 0
+
+
+def self_test_deep() -> int:
+    """The deep pin's options: the id walk, the kept positions, the header lines they add, and
+    the directory writer. No mlx and no model."""
+    import pathlib
+    import tempfile
+
+    fails = 0
+
+    def check(name: str, ok: bool) -> None:
+        nonlocal fails
+        if not ok:
+            print(f"mlx-logits self-test FAIL: {name}", file=sys.stderr)
+            fails += 1
+
+    def refused(call, needle: str) -> bool:
+        try:
+            call()
+        except SystemExit as exc:
+            return needle in str(exc)
+        return False
+
+    check("walk steps from its first id", walk_ids(3, 124894) == [124894, 8919, 16838])
+    walk = parse_walk("600:124894")
+    check(
+        "walk of 600 stays within 1000 to 91000",
+        len(walk) == 600 and walk[0] == 124894 and 1000 <= min(walk[1:]) and max(walk[1:]) <= 91000,
+    )
+    check("walk's last id", walk[599] == (599 * 7919) % 90001 + 1000)
+    check("walk needs a first id", refused(lambda: parse_walk("600"), "N:FIRST"))
+    check("walk needs a count", refused(lambda: parse_walk("x:5"), "N:FIRST"))
+    check("walk of none is refused", refused(lambda: walk_ids(0, 5), "walk of 0 ids"))
+
+    check("positions parse", parse_positions("255,256,599", 600) == [255, 256, 599])
+    check("a position past the steps is refused", refused(lambda: parse_positions("600", 600), "past the 600"))
+    check("positions must increase", refused(lambda: parse_positions("256,255", 600), "not increasing"))
+    check("a repeated position is refused", refused(lambda: parse_positions("5,5", 600), "not increasing"))
+    check("an empty position is refused", refused(lambda: parse_positions("5,", 600), "list of positions"))
+
+    raw = struct.pack("<6f", 0.0, 1.0, 2.0, 5.0, 4.0, 3.0)
+    ids = [10, 11, 12, 13]
+    text = header("lfm3", ids, 4, 3, raw, [1, 3], [2, 0])
+    check("positions line", "steps 4\nn 3\n" in text and "positions 1,3\n" in text)
+    check("argmax line", text.endswith("argmax 2,0\n"))
+    check("checksum over the kept rows", f"fnv1a {fnv1a(raw):016x}\n" in text)
+    check(
+        "rows of the wrong count are refused",
+        refused(lambda: header("lfm3", ids, 4, 3, raw, [1, 2, 3]), "bytes is not 3 * 3"),
+    )
+    check(
+        "argmax of the wrong count is refused",
+        refused(lambda: header("lfm3", ids, 4, 3, raw, [1, 3], [2]), "1 argmax values for 2 rows"),
+    )
+    check("no positions keeps the plain header", "positions" not in header("lfm3", [0], 1, 3, raw[:12]))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        emit("lfm3", text, raw, tmp)
+        root = pathlib.Path(tmp)
+        check("the directory writer's text", (root / "lfm3.txt").read_text() == text)
+        check("the directory writer's bytes", (root / "lfm3.f32").read_bytes() == raw)
+    return fails
 
 
 def self_test_lfm3() -> int:
@@ -1708,19 +1873,33 @@ def main(argv: list[str]) -> int:
         print(USAGE, file=sys.stderr)
         return 64
     folder, family = argv[1], argv[2]
-    ids = [0]
+    ids = None
+    positions_text = None
+    out = None
     rest = argv[3:]
     while rest:
-        if rest[0] == "--ids" and len(rest) >= 2:
-            ids = parse_ids(rest[1])
+        if rest[0] in ("--ids", "--ids-walk") and len(rest) >= 2:
+            if ids is not None:
+                print("mlx-logits: --ids and --ids-walk name the ids once", file=sys.stderr)
+                return 64
+            ids = parse_ids(rest[1]) if rest[0] == "--ids" else parse_walk(rest[1])
+            rest = rest[2:]
+        elif rest[0] == "--positions" and len(rest) >= 2:
+            positions_text = rest[1]
+            rest = rest[2:]
+        elif rest[0] == "--out" and len(rest) >= 2:
+            out = rest[1]
             rest = rest[2:]
         else:
             print(USAGE, file=sys.stderr)
             return 64
+    if ids is None:
+        ids = [0]
+    positions = None if positions_text is None else parse_positions(positions_text, len(ids))
     if not family or "/" in family or family.startswith("."):
         print(f"mlx-logits: {family!r} is not a family name", file=sys.stderr)
         return 64
-    dump(folder, family, ids)
+    dump(folder, family, ids, positions, out)
     return 0
 
 

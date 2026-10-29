@@ -12,7 +12,7 @@
 //! lacks (a delta layer's recurrent state, a router's picks), and the gate
 //! prints each as that clause's SKIP line with its reason. The kernel mutants
 //! (`--mutant`, `--mutants-all`) run on the rows that name a table of them: the
-//! default row's and the dense row's.
+//! default row's, the dense row's and LFM3's.
 //!
 //! The clauses that compared this session to ik's GGUF sets are gone, and so
 //! is the `--nodes` walk of those sets.
@@ -50,6 +50,9 @@
 //!   held to the row's band and, where the pin names its argmax, the
 //!   session's pick equal to it; the verdict names each step's distance and
 //!   the worst (`mlx.rs`).
+//! - `m_logits_deep`: the same over the row's deep pin, a long id walk fed one id
+//!   a step with the dump's rows kept at the steps it names, each held to the
+//!   row's deep band; a row with no deep pin prints SKIP (`mlx.rs`).
 //! - `m_mlx_folder`: the row's MLX checkpoint folder (`<family>-mlx` under the
 //!   fixture root), opened as it is with no `prepare`, tells what the split made
 //!   of it (`<family>-mlxsplit`) tells: the plan's lines, the first host-fed
@@ -457,7 +460,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 19] = [
+    const NAMES: [&str; 20] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -466,6 +469,7 @@ pub fn main() -> ExitCode {
         "m_mlx",
         "m_mlx_folder",
         "m_logits",
+        "m_logits_deep",
         "q_short",
         "q_state",
         "q_chunk",
@@ -639,6 +643,7 @@ pub fn main() -> ExitCode {
                 "m_mlx" => mlx::m_mlx(&device, library),
                 "m_mlx_folder" => mlx::m_mlx_folder(&device, library),
                 "m_logits" => mlx::m_logits(&device, library),
+                "m_logits_deep" => mlx::m_logits_deep(&device, library),
                 "q_short" => pass::q_short(&device, library, &path),
                 "q_state" => pass::q_state(&device, library, &path),
                 "q_chunk" => pass::q_chunk(&device, library, &path),

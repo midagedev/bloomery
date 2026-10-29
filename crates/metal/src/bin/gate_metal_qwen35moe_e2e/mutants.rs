@@ -25,7 +25,9 @@
 //! A row names which tables its program takes (`row::Mutants`): the routed
 //! rows' are [`MUTANTS`], [`KEPT`] and [`TENSOR_MUTANTS`]; the dense row's
 //! are [`DENSE`], edits of the pair and fold kernels at the dense FFN's one
-//! slot, and of the dense prompt's SwiGLU. The edits compile into the
+//! slot, and of the dense prompt's SwiGLU; LFM3's are [`LFM3`], edits of the
+//! windowed flash's first key and of the short conv's step ring, which only its
+//! deep pin (`m_logits_deep`) reads. The edits compile into the
 //! row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
@@ -41,6 +43,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
     let (main, tensor): (&'static [Mutant], &'static [Mutant]) = match set {
         Mutants::Routed => (MUTANTS, TENSOR_MUTANTS),
         Mutants::Dense => (DENSE, &[]),
+        Mutants::Lfm3 => (LFM3, &[]),
         Mutants::None => (&[], &[]),
     };
     program::all(main, tensor)
@@ -50,7 +53,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
 pub fn kept_of(set: Mutants) -> &'static [Mutant] {
     match set {
         Mutants::Routed => KEPT,
-        Mutants::Dense | Mutants::None => &[],
+        Mutants::Dense | Mutants::Lfm3 | Mutants::None => &[],
     }
 }
 
@@ -191,7 +194,7 @@ pub const MUTANTS: &[Mutant] = &[
 /// A row's `clause` here is the staying clause nearest its defect.
 ///
 /// The healthy session is green on `m_logits` (worst step 1.92e-3). Observed in the last
-/// `--mutants-all`, each red on none of the 19 clauses, `m_logits` unmoved:
+/// `--mutants-all`, each red on none of the clauses, `m_logits` unmoved:
 /// `merge_first_segment` (`f_deep`) merges a pass's segments; the session holds one segment
 /// of keys.
 /// `ahead_headless_last_row` (`h_prompt`) stores no pick, and `m_logits` feeds the pin's ids.
@@ -271,6 +274,48 @@ pub const DENSE: &[Mutant] = &[
         edits: &[(
             "gate[at] = pair_swiglu(gate[at], up[at]);",
             "gate[at] = pair_swiglu(up[at], gate[at]);",
+            1,
+        )],
+    },
+];
+
+/// LFM3's defects the deep pin must catch, edits of the windowed flash and the short conv's
+/// step kernel. The first steps cannot: a window of 255 or 257 keys cuts nothing before
+/// position 255, and the conv ring (14 rows) reads nothing it wrapped before position 15.
+/// `m_logits` at steps 0 to 3 is green on each of them. The rope factors ignored is a host
+/// edit and has no row here (`m_logits_deep`'s doc names it).
+pub const LFM3: &[Mutant] = &[
+    Mutant {
+        name: "swa_window_short",
+        clause: "m_logits_deep",
+        why: "a sliding layer attends the last 255 keys, not 256: from the step at which 256 \
+              keys are live its first key is one early",
+        edits: &[(
+            "return (args.window != 0u && live > args.window) ? live - args.window : 0u;",
+            "return (args.window != 0u && live > args.window - 1u) ? live - (args.window - 1u) : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "swa_window_long",
+        clause: "m_logits_deep",
+        why: "a sliding layer attends the last 257 keys, not 256: from the step at which 257 \
+              keys are live its first key is one late",
+        edits: &[(
+            "return (args.window != 0u && live > args.window) ? live - args.window : 0u;",
+            "return (args.window != 0u && live > args.window + 1u) ? live - (args.window + 1u) : 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "shortconv_ring_no_wrap",
+        clause: "m_logits_deep",
+        why: "the step writes its u at row min(position, last row), not at the position's \
+              slot: from position 14 every u lands in the last row, and from position 15 a \
+              tap reads a u that is stale or overwritten",
+        edits: &[(
+            "slot_ring[sc_slot(p, args.ring_rows) * args.hidden + c] = sc_u(row, 0u, c, args);",
+            "slot_ring[min(p, args.ring_rows - 1u) * args.hidden + c] = sc_u(row, 0u, c, args);",
             1,
         )],
     },

@@ -16,13 +16,24 @@
 //! its ids; the session runs them teacher-forced, one id a step with its cache
 //! kept, the way the dump does, and every step's row is held to the row's band
 //! (`Row::logit_abs`). A pin that names its argmax (a line `argmax`, one id a
-//! step, held to its own rows at read) also holds the session's pick of each
-//! step to it. Position 0 reads one key (softmax 1), a rope angle of 0 and a
-//! zero recurrent state; the steps above it read the rope, the scale, the QK
-//! layout and the decay or the conv taps too. The dump is the external oracle:
-//! the reference's modules run in f32 over the exact dequant, so it carries the
-//! model's arithmetic without bf16 activation rounding. A missing pin, or a pin
-//! whose steps, ids, argmax and bytes disagree, is a named error.
+//! held row, held to its own rows at read) also holds the session's pick at
+//! each of them to it. Position 0 reads one key (softmax 1), a rope angle of 0
+//! and a zero recurrent state; the steps above it read the rope, the scale, the
+//! QK layout and the decay or the conv taps too. The dump is the external
+//! oracle: the reference's modules run in f32 over the exact dequant, so it
+//! carries the model's arithmetic without bf16 activation rounding. A missing
+//! pin, or a pin whose steps, ids, positions, argmax and bytes disagree, is a
+//! named error.
+//!
+//! A pin may hold fewer rows than steps: a line `positions` names the steps
+//! whose rows the f32 file keeps, in order, and every other id is fed and not
+//! compared. `m_logits_deep`: the row's deep pin (`pins/deep/<family>.txt` and
+//! `.f32`), a long id walk with its rows kept at the steps either side of a
+//! sliding window's edge and well past it, read by the same reader and held to
+//! the row's deep band (`Row::deep_logit_abs`). It reaches what the first steps
+//! cannot: a window that has begun to cut keys, the rope's low-frequency pairs
+//! at an angle, a conv ring that has wrapped. A row with no deep pin prints
+//! SKIP.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,10 +88,17 @@ impl PassSink<Session> for Quiet {
     }
 }
 
-/// The committed pin for `family`: the text and the f32 little-endian rows.
-fn pin_of(family: &str) -> Result<(String, Vec<u8>), String> {
-    let dir =
+/// The directory under `pins/` that holds the deep pins.
+const DEEP_DIR: &str = "deep";
+
+/// The committed pin for `family` in `pins/<sub>` (`pins/` for none): the text
+/// and the f32 little-endian rows.
+fn pin_of(sub: Option<&str>, family: &str) -> Result<(String, Vec<u8>), String> {
+    let mut dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/gate_metal_qwen35moe_e2e/pins");
+    if let Some(sub) = sub {
+        dir.push(sub);
+    }
     let text_path = dir.join(format!("{family}.txt"));
     let raw_path = dir.join(format!("{family}.f32"));
     if !text_path.is_file() {
@@ -104,7 +122,10 @@ fn pin_of(family: &str) -> Result<(String, Vec<u8>), String> {
 
 struct Pin {
     ids: Vec<u32>,
-    /// The argmax of each step's row the pin's own line names, when it has one.
+    /// The step each held row belongs to, increasing: every step where the pin
+    /// names no `positions`.
+    positions: Vec<usize>,
+    /// The argmax of each held row the pin's own line names, when it has one.
     argmax: Option<Vec<u32>>,
     n: usize,
     rows: Vec<f32>,
@@ -180,13 +201,37 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
     if n == 0 {
         return Err("the mlx-lm pin's n is 0".to_string());
     }
-    let bytes = steps
+    let positions: Vec<usize> = match map.iter().find(|(k, _)| *k == "positions") {
+        None => (0..steps).collect(),
+        Some((_, list)) => {
+            let named: Vec<usize> = list
+                .split(',')
+                .map(|s| {
+                    s.parse::<usize>()
+                        .map_err(|_| format!("the mlx-lm pin's positions hold {s:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+            if named.windows(2).any(|w| w[1] <= w[0]) {
+                return Err(format!(
+                    "the mlx-lm pin's positions {named:?} are not increasing"
+                ));
+            }
+            if named.last().is_none_or(|&last| last >= steps) {
+                return Err(format!(
+                    "the mlx-lm pin's positions {named:?} reach past its {steps} steps"
+                ));
+            }
+            named
+        }
+    };
+    let held = positions.len();
+    let bytes = held
         .checked_mul(n)
         .and_then(|values| values.checked_mul(4))
-        .ok_or_else(|| format!("the mlx-lm pin's {steps} steps of {n} values wrap"))?;
+        .ok_or_else(|| format!("the mlx-lm pin's {held} rows of {n} values wrap"))?;
     if raw.len() != bytes {
         return Err(format!(
-            "the mlx-lm pin holds {} bytes; {steps} steps of {n} f32s are {bytes} bytes",
+            "the mlx-lm pin holds {} bytes; {held} rows of {n} f32s are {bytes} bytes",
             raw.len()
         ));
     }
@@ -197,7 +242,7 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
             "the mlx-lm pin's checksum is {got_sum}; the f32 bytes checksum to {want}"
         ));
     }
-    let mut rows = Vec::with_capacity(steps * n);
+    let mut rows = Vec::with_capacity(held * n);
     for chunk in raw.as_chunks::<4>().0 {
         rows.push(f32::from_le_bytes(*chunk));
     }
@@ -222,6 +267,7 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
     };
     Ok(Pin {
         ids,
+        positions,
         argmax,
         n,
         rows,
@@ -460,21 +506,63 @@ pub fn m_mlx_folder(device: &MetalDevice, library: &Library) -> Clause {
 /// (`LFM3_LOGIT_ABS` in `row.rs`), or the first id of the pin's `argmax` line
 /// changed (a named error at read, before any step runs).
 pub fn m_logits(device: &MetalDevice, library: &Library) -> Clause {
+    hold(device, library, "m_logits", None, row::current().logit_abs)
+}
+
+/// `m_logits_deep`: [`m_logits`] over the row's deep pin, fed the whole walk
+/// and held at the pin's positions to the row's deep band
+/// (`Row::deep_logit_abs`). The session is opened on a cache of the walk's
+/// length, so the rope table and the cache reach the last position.
+///
+/// Mutants, each red here and green on `m_logits`, whose steps 0 to 3 reach
+/// none of what they edit: a window of 255 keys (`swa_window_short`) or of 257
+/// (`swa_window_long`) and a conv ring that stops wrapping
+/// (`shortconv_ring_no_wrap`), kernel edits of `mutants.rs`'s `LFM3` table; and
+/// the rope's factors ignored, a host edit with no table row: in `arena.rs`'s
+/// `rope`, `if let Some(factors) = &r.factors {` becomes
+/// `if let Some(factors) = r.factors.as_ref().filter(|_| false) {`, and the
+/// full layers' low-frequency pairs turn at their unfactored angles.
+pub fn m_logits_deep(device: &MetalDevice, library: &Library) -> Clause {
     let spec = row::current();
-    let family = spec.arch;
-    let band = spec.logit_abs;
-    let (text, raw) = pin_of(family)?;
+    let Some(band) = spec.deep_logit_abs else {
+        return Ok(Verdict::Skip(format!(
+            "row {}: the row holds no deep pin",
+            spec.name
+        )));
+    };
+    hold(device, library, "m_logits_deep", Some(DEEP_DIR), band)
+}
+
+/// The pin of the current row in `pins/<sub>`, run through a session: every
+/// id fed one step with its cache kept, and at each step the pin holds a row
+/// for, the session's row held to `band` and its pick to the pin's argmax
+/// where the pin names it. The cache holds the pin's ids, or one segment of
+/// keys where that is more.
+fn hold(
+    device: &MetalDevice,
+    library: &Library,
+    clause: &str,
+    sub: Option<&str>,
+    band: f64,
+) -> Clause {
+    let family = row::current().arch;
+    let (text, raw) = pin_of(sub, family)?;
     let pin = parse_pin(family, &text, &raw)?;
     let path = super::model_path()?;
-    let mut s = Session::open(device, library, &path, CTX).map_err(says)?;
-    let mut steps = Vec::with_capacity(pin.ids.len());
-    for (k, (&id, want)) in pin.ids.iter().zip(pin.rows.chunks_exact(pin.n)).enumerate() {
+    let mut s = Session::open(device, library, &path, CTX.max(pin.ids.len())).map_err(says)?;
+    let mut steps = Vec::with_capacity(pin.positions.len());
+    let mut held = 0;
+    for (k, &id) in pin.ids.iter().enumerate() {
         let picked = s.step(id, StepMode::HostFed).map_err(says)?.id;
+        if pin.positions.get(held) != Some(&k) {
+            continue;
+        }
+        let want = &pin.rows[held * pin.n..(held + 1) * pin.n];
         let row = s.logits_row().map_err(says)?;
         let d = distance(row, want, band).map_err(|e| format!("step {k} (id {id}): {e}"))?;
-        let pinned = pin.argmax.as_ref().map(|a| a[k]);
+        let pinned = pin.argmax.as_ref().map(|a| a[held]);
         println!(
-            "m_logits step {k} (id {id}): max |logit| difference {:.3e} at {} (session {:.6}, \
+            "{clause} step {k} (id {id}): max |logit| difference {:.3e} at {} (session {:.6}, \
              pin {:.6}), {} values over the band, rms {:.3e}, pick {picked}{}",
             d.max,
             d.at,
@@ -493,24 +581,35 @@ pub fn m_logits(device: &MetalDevice, library: &Library) -> Clause {
                 d.max
             ));
         }
-        steps.push(d);
+        steps.push((k, d));
+        held += 1;
     }
-    let worst = (1..steps.len()).fold(0, |w, k| if steps[k].max > steps[w].max { k } else { w });
-    let w = &steps[worst];
-    let per_step: Vec<String> = steps.iter().map(|d| format!("{:.2e}", d.max)).collect();
-    let over: usize = steps.iter().map(|d| d.over).sum();
+    let worst = (1..steps.len()).fold(0, |w, i| {
+        if steps[i].1.max > steps[w].1.max {
+            i
+        } else {
+            w
+        }
+    });
+    let (at_step, w) = &steps[worst];
+    let per_step: Vec<String> = steps
+        .iter()
+        .map(|(k, d)| format!("{k}: {:.2e}", d.max))
+        .collect();
+    let over: usize = steps.iter().map(|(_, d)| d.over).sum();
     let line = format!(
-        "pin {family}: max |logit| difference {:.3e} at step {worst} (id {}), logit {} \
+        "pin {family}: max |logit| difference {:.3e} at step {at_step} (id {}), logit {} \
          (session {:.6}, pin {:.6}); per step [{}]; band {band}, {over} values over it; \
-         {} step(s) of {} values{}",
+         {} step(s) of {} values held of {} fed{}",
         w.max,
-        pin.ids[worst],
+        pin.ids[*at_step],
         w.at,
         w.session,
         w.stored,
         per_step.join(", "),
         steps.len(),
         pin.n,
+        pin.ids.len(),
         pin.argmax.as_ref().map_or_else(String::new, |a| format!(
             "; every pick the pin's argmax {a:?}"
         ))
