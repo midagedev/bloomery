@@ -15,18 +15,19 @@
 #                 target/release/fixture cut /models/Qwen3.8-27B-NVFP4 /models/fixtures/qwen38nv --spec tools/fixture-cuts/qwen38nv.json \
 #                   --card-budget 8G
 #                 target/release/fixture verify /models/fixtures/qwen38nv --source /models/Qwen3.8-27B-NVFP4
-#   MODEL       the twin: mainline's converter (convert_hf_to_gguf.py at the LCPP_PIN commit) over the cut folder, in a directory
-#               of its own under the cut's (the fixture's first-shard glob does not see it):
-#                 python3 $LCPP/convert_hf_to_gguf.py /models/fixtures/qwen38nv --no-mtp --outtype bf16 --fp8-as-q8 --outfile /models/fixtures/qwen38nv/twin/qwen38nv-twin.gguf
-#               NVFP4 blocks go through as they are (36 bytes per 64 values, the per-block UE4M3 scale bits kept, the tensor scale
-#               and the input scale as F32 scalars beside the weight); the FP8 projections are dequantized and written Q8_0
-#               (--fp8-as-q8); the embedding, the beta/alpha projections stay BF16 as stored (--outtype bf16), the gammas, taps
-#               and vectors F32. These are the types the folder open gives the same tensors, so the twin is the cut folder's own
-#               bits in GGUF form; the cut's `text_config.mtp_num_hidden_layers` stays 1 and --no-mtp is what keeps the converter from
-#               asking for the dropped block. `python3 tools/ref/dense-logits.py identity <MODEL>` measures the size and sha256
-#               that tools/ref/dense-logits.py TARGETS holds for it (None until then: a dump refuses by name). BLOOMERY_REF_MODEL
-#               moves it
-#   LCPP        the mainline llama.cpp tree that converts and is the numeric oracle: the qwen35 profile's, at LCPP_PIN (NVFP4 is
+#   MODEL       the twin: `prepare` (crates/model-hf/src/bin/prepare.rs) over the cut folder, so each tensor is written by the folder map's
+#               own conversion (hf::modelopt::normalize), in a directory of its own under the cut's (the fixture's first-shard glob
+#               does not see it):
+#                 cargo build --release -p bloomery-model-hf --bin prepare
+#                 target/release/prepare /models/fixtures/qwen38nv /models/fixtures/qwen38nv/twin/qwen38nv-twin
+#                 mv /models/fixtures/qwen38nv/twin/qwen38nv-twin-00001-of-00001.gguf /models/fixtures/qwen38nv/twin/qwen38nv-twin.gguf
+#               NVFP4 blocks go through as the cut stores them (36 bytes per 64 values, the per-block UE4M3 scale bits kept, the
+#               tensor scale as an F32 scalar beside the weight); the FP8 projections are dequantized and written Q8_0, the
+#               embedding stays BF16 as stored, the beta/alpha projections, the gammas, taps and vectors F32; the input scales are not written
+#               (mainline reads `input_scale` and no graph multiplies by it). The cut's `mtp.*` tensors are left out by the map.
+#               `python3 tools/ref/dense-logits.py identity <MODEL>` measures the size and sha256 that tools/ref/dense-logits.py
+#               TARGETS holds for it (a dump refuses by name when they differ). BLOOMERY_REF_MODEL moves it
+#   LCPP        the mainline llama.cpp tree that is the numeric oracle: the qwen35 profile's, at LCPP_PIN (NVFP4 is
 #               GGML_TYPE_NVFP4 there, with CUDA and CPU kernels; ik reads none, so no ik oracle exists for this profile).
 #               dense_logits_ref (tools/ref/dense_logits_ref.cpp) is the binary the qwen38d profile builds; the same one writes these
 #               sets (`just build-dense-logits-ref`). IK is the default the scripts that expand IKBIN beside every profile take
