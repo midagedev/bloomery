@@ -924,6 +924,7 @@ pub(crate) fn gb10(free: u64) -> CardSpec {
         uuid: [0x10; 16],
         pci_bus: "000f:01:00.0".to_string(),
         held_by: None,
+        compute_capability: Some((12, 1)),
         integrated: true,
     })
 }
@@ -2239,6 +2240,7 @@ mod tests {
             uuid: [0x10; 16],
             pci_bus: "000f:01:00.0".to_string(),
             held_by: None,
+            compute_capability: Some((12, 1)),
         };
         let pinned = ("pinned".to_string(), 1 << 30);
         for integrated in [true, false] {

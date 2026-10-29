@@ -160,6 +160,7 @@ mod tests {
             uuid,
             pci_bus: String::new(),
             held_by: None,
+            compute_capability: None,
             integrated: false,
         };
         let a6000 = [

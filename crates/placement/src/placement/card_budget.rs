@@ -306,6 +306,7 @@ mod tests {
             uuid: [1; 16],
             pci_bus: "0000:41:00.0".to_owned(),
             held_by: None,
+            compute_capability: Some((8, 6)),
         }];
         assert!(check_visible(&per(&[(0, 1 << 30)]), &census).is_ok());
         assert!(check_visible(&CardBudget::Every(1), &census).is_ok());
@@ -340,6 +341,7 @@ mod tests {
             uuid: [1; 16],
             pci_bus: "0000:41:00.0".to_owned(),
             held_by: None,
+            compute_capability: Some((8, 6)),
         }];
         let e = check_visible(&shares, &seen)
             .expect_err("CUDA1")

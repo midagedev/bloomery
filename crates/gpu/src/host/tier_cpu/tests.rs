@@ -36,6 +36,7 @@ fn node_nvme_host_budget_keeps_the_os_reserve() {
             uuid: [1; 16],
             pci_bus: "0000:01:00.0".into(),
             held_by: None,
+            compute_capability: Some((8, 6)),
         }],
         false,
         TierAct::F32,

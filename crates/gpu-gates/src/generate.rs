@@ -2660,14 +2660,19 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| {
-                let (name, total_bytes) = match *n {
-                    "3090" => ("NVIDIA GeForce RTX 3090".to_string(), 25_351_356_416),
-                    "A6000" => ("NVIDIA RTX A6000".to_string(), 50_952_536_064),
+                let (name, total_bytes, compute_capability) = match *n {
+                    "3090" => (
+                        "NVIDIA GeForce RTX 3090".to_string(),
+                        25_351_356_416,
+                        Some((8, 6)),
+                    ),
+                    "A6000" => ("NVIDIA RTX A6000".to_string(), 50_952_536_064, Some((8, 6))),
                     "Blackwell" => (
                         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition".to_string(),
                         96 * 1024 * 1024 * 1024,
+                        None,
                     ),
-                    other => (other.to_string(), 2 * 50_952_536_064),
+                    other => (other.to_string(), 2 * 50_952_536_064, None),
                 };
                 DeviceInfo {
                     ordinal: u32::try_from(i).expect("small"),
@@ -2678,6 +2683,7 @@ mod tests {
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                     held_by: None,
                     integrated: false,
+                    compute_capability,
                 }
             })
             .collect()

@@ -54,6 +54,7 @@ fn census_96(n: usize) -> Vec<DeviceInfo> {
             uuid: [u8::try_from(i).expect("small") + 0x30; 16],
             pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
             held_by: None,
+            compute_capability: None,
             integrated: false,
         })
         .collect()

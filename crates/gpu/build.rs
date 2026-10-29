@@ -3,6 +3,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(bloomery_nvfp4_mma)");
     println!("cargo:rustc-check-cfg=cfg(bloomery_e4m3_cvt)");
     let target = std::env::var("CUDA_OXIDE_TARGET").unwrap_or_default();
+    // The crate's `BUILD_TARGET`: absent when the build was given no target.
+    if !target.is_empty() {
+        println!("cargo:rustc-env=GPU_BUILD_TARGET={target}");
+    }
     if matches!(
         target.as_str(),
         "sm_120a" | "sm_120f" | "sm_121a" | "sm_121f"
