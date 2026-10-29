@@ -59,14 +59,14 @@ TARGETS = {
         "file": "Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf",
         "arch": "llama",
     },
-    # The GGUF twin of the Qwen3.8-27B NVFP4 fixture cut (tools/ref/models/qwen38nv.sh holds the conversion): mainline's converter
-    # at the oracle pin turns the cut folder into NVFP4 feed-forward and head blocks (36 bytes per 64 values), Q8_0 attention and
-    # delta-rule projections and BF16 for the rest. Its bytes are made on the box, so size and sha256 stay None, a run refuses by
-    # name, until `dense-logits.py identity <file>` has measured them and they are written here.
+    # The GGUF twin of the Qwen3.8-27B NVFP4 fixture cut (tools/ref/models/qwen38nv.sh holds the conversion): `prepare` over the cut
+    # folder, so each tensor is the bytes the folder's own map makes (NVFP4 feed-forward and head blocks, 36 bytes per 64 values,
+    # Q8_0 attention and delta-rule projections, the token embedding BF16 as stored, F32 for the rest). Its bytes are made on the box; a file whose
+    # size or sha256 differs from these is refused by name, `dense-logits.py identity <file>` measures them.
     "qwen38nv-twin": {
         "vocab": 248320,
-        "size": 4353225792,
-        "sha256": "58c869888d4d505cc7605213394c3148af75c468c3cfa08195deac3686c784c8",
+        "size": 4356173664,
+        "sha256": "b41ffb200b9053ff3c34bfb3ce4600be37c5d5b65f97a5beb820d5b35122d71f",
         "repository": "nvidia/Qwen3.8-27B-NVFP4",
         "revision": "482ca0f3832238542f8f5295dde86b5f22711d80",
         "file": "qwen38nv-twin.gguf",

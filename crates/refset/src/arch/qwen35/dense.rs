@@ -7,8 +7,8 @@
 //! [`crate::arch::forced_logits`]'s; this module is the family's row and the reader aimed at it.
 //!
 //! The NVFP4 build of the model is a second family, [`NV_LOGITS`] (`logits-qwen38nv`): the same kind of set, written from
-//! [`NV_TWIN`], the GGUF that mainline's converter makes of the fixture cut (layers 0 to 3 of `nvidia/Qwen3.8-27B-NVFP4`,
-//! `tools/fixture-cuts/qwen38nv.json`; the conversion is in `tools/ref/models/qwen38nv.sh`). Mainline reads NVFP4 and ik does
+//! [`NV_TWIN`], the GGUF that `prepare` writes of the fixture cut (layers 0 to 3 of `nvidia/Qwen3.8-27B-NVFP4`,
+//! `tools/fixture-cuts/qwen38nv.json`; the command is in `tools/ref/models/qwen38nv.sh`). Mainline reads NVFP4 and ik does
 //! not, so the twin is what the fixture tier's oracle runs on.
 
 use super::{ARCH, LCPP_BUILD};
@@ -30,7 +30,7 @@ pub const SETS: &[&str] = &[P64, P4096];
 /// The profile whose fixture-tier row is the NVFP4 cut (`tools/fixture-dirs.tsv`).
 pub const NV_PROFILE: &str = "qwen38d";
 
-/// The GGUF twin of the NVFP4 cut: mainline's converter over the cut folder, kept in a directory of its own under the cut's
+/// The GGUF twin of the NVFP4 cut: `prepare` over the cut folder, kept in a directory of its own under the cut's
 /// (`tools/ref/models/qwen38nv.sh` holds the command). The fixture root's default and the cut's directory are
 /// `tools/fixture-dirs.tsv`'s; a test holds them to it.
 pub const NV_TWIN: &str = "/models/fixtures/qwen38nv/twin/qwen38nv-twin.gguf";
