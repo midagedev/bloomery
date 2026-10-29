@@ -176,6 +176,7 @@ pub(crate) enum Encoding {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct Vocab {
     pub(crate) texts: Vec<String>,
     pub(crate) attrs: Vec<u32>,

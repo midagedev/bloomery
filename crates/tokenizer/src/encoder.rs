@@ -8,6 +8,7 @@ use crate::spelling::{Spelling, escape_whitespace};
 use crate::vocab::{Encoding, Vocab};
 use crate::{Error, bpe, pretok, spm, unicode};
 
+#[derive(Clone)]
 pub(crate) enum Encoder {
     Bpe {
         pre: pretok::Pre,

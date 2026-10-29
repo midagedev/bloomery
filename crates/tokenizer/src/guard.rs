@@ -9,6 +9,7 @@
 use memchr::memmem::Finder;
 
 /// The spellings of the multi-character special tokens, indexed for the three searches.
+#[derive(Clone)]
 pub(crate) struct Spellings {
     needles: Vec<Box<[u8]>>,
     finders: Vec<Finder<'static>>,

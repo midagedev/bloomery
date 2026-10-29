@@ -27,6 +27,7 @@ impl PartialOrd for Score {
 
 pub(crate) type Scratch = merge::Scratch<Score>;
 
+#[derive(Clone)]
 pub(crate) struct Spm {
     scores: Vec<f32>,
     bytes: Box<[u32; 256]>,

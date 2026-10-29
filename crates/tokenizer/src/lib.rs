@@ -109,7 +109,9 @@ fn spans_cut(cuts: &[usize], start: usize, end: usize) -> bool {
         .is_some_and(|&c| c <= end)
 }
 
-/// A loaded vocabulary with its encoder and decoder tables.
+/// A loaded vocabulary with its encoder and decoder tables. A clone is the
+/// same tables, copied: cheaper than building them again from the keys.
+#[derive(Clone)]
 pub struct Tokenizer {
     vocab: Vocab,
     encoder: encoder::Encoder,

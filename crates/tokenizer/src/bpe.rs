@@ -35,6 +35,7 @@ use crate::unicode::{byte_to_cpt_table, encode_cpt};
 
 /// Each spelling's starting symbols and byte fallback; the tables are boxed
 /// so the two variants are the same small size.
+#[derive(Clone)]
 enum Units {
     ByteLevel {
         /// The intern id of each byte's one-character string, or `NONE`.
@@ -53,6 +54,7 @@ enum Units {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct Bpe {
     n_tokens: u32,
     units: Units,

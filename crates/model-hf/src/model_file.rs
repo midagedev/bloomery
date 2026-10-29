@@ -87,10 +87,13 @@ impl ModelFile {
         }
     }
 
-    /// The tokenizer the header's keys build; a folder's keys were checked against Hugging
-    /// Face's at [`ModelFile::open`].
+    /// The tokenizer the header's keys build. A folder's was built from those keys and checked
+    /// against Hugging Face's at [`ModelFile::open`]; it is that one, copied, not built twice.
     pub fn tokenizer(&self) -> Result<Tokenizer, Error> {
-        Ok(Tokenizer::from_keys(self.header().keys())?)
+        match self {
+            ModelFile::Gguf(split) => Ok(Tokenizer::from_keys(split.keys())?),
+            ModelFile::Folder(opened) => Ok(opened.tokenizer.clone()),
+        }
     }
 
     /// The name the model goes by: the header's `general.name`, else a folder's own name; `None`
@@ -269,7 +272,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A folder's tokenizer encodes as the one `open` checked against Hugging Face's.
+    /// A folder's tokenizer encodes as the one `open` checked against Hugging Face's, and so
+    /// does the one its header's keys build: the copy handed out is the tokenizer the header
+    /// spells.
     #[test]
     fn a_folder_s_tokenizer_is_the_checked_one() {
         let dir = temp_dir("model-file-tokenizer");
@@ -278,10 +283,14 @@ mod tests {
         let ModelFile::Folder(opened) = &file else {
             panic!("a directory opens as a folder");
         };
-        let built = file.tokenizer().unwrap();
+        let handed = file.tokenizer().unwrap();
+        let built = Tokenizer::from_keys(file.header().keys()).unwrap();
+        assert_eq!(handed.eog(), built.eog());
+        assert_eq!(handed.special_tokens(), built.special_tokens());
         for text in ["Aa", "aAaA", "AA"] {
             let ids = built.encode(text, true, true);
             assert!(!ids.is_empty(), "{text:?}");
+            assert_eq!(ids, handed.encode(text, true, true), "{text:?}");
             assert_eq!(ids, opened.tokenizer.encode(text, true, true), "{text:?}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
