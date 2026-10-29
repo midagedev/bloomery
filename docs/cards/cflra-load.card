@@ -1,0 +1,38 @@
+# Round cflra: the load path overlaps NVMe, host conversion and card upload (cflow load L1, L3, L4).
+# The term is the card upload's wall, `load phases` upload_s, of one V4.1 start on a plan with a host set
+# (plan (a), A6000), the model file evicted from the page cache first (the cold start). Decomposition
+# [derived from the cflow audit's load notes and their measured rows]: the
+# base binary's card upload reads its file bytes through the load thread's and the pool's page faults,
+# 0.85-2.7 GB/s on a cold file against the 6.83 GB/s the host set's populate gets from the same drive
+# (rig-log plan-triage.md:2062); the new binary reads the next segments ahead on 16 helpers (window 1 GiB,
+# chunks 8 MiB), so the drive is the bound: upload rate 4.5-6.8 GB/s. Upload wall = bytes / rate, so the
+# ratio new / base is (1.0..2.7) / (6.8..4.5): 0.15..0.60 at the band's corners, and 0.22..0.40 at its
+# centre pairing (base 1.3 [23.2 GB in 17.3 s, derived from the 47.2 s cold start] against new 3.3-5.6).
+# The same sitting prints the whole `load phases` line, so the cold wall (47.2 s base [measured, int039bat
+# g-gate-ds41-load.log]; predicted 33-37 s after, with the host set's walk now beside the upload) and
+# the restart wall (10.2 s base [measured]; predicted 5.4-7.3 s after) are read from the same rows without
+# a second sitting; only upload_s is the card's term.
+kind: ab
+question: does reading the next card segments' file pages ahead of the copy (and the host set's walk
+  starting beside the context and upload) take the V4.1 cold start's card upload from the faulting
+  rate to the drive's?
+term: `load phases` upload_s @ one start of generate_ds41, V4.1 plan (a), A6000, model files evicted
+  from the page cache before each start, CARD_DONTNEED at its default - (new - base) / base, paired by round
+unit: %
+predict: -78..-60
+rounds: 3
+sd: 8 % assumed: a cold drive read's spread between runs; no cold-start repeat is recorded, and the
+  band's near edge is 60 %, so the ruler does not decide the card
+condition: tools/ref/load-ab.sh under the lease runs the base binary (a worktree at ca0a535df, generate_ds41
+  built by cargo oxide in its own remote dir) and the new binary alternating, the order rotated every round, after
+  one discarded start per arm; each start is stopped at its `load phases` record; before each timed start every
+  shard of the model file is dropped from the page cache (posix_fadvise DONTNEED on each; mincore reads under 1 % of
+  its pages resident, else the start fails by name, rc=evict) and the row records majflt, pgpgin and `Cached` from
+  /proc/meminfo over the start; no row [cpu-busy] or [other-busy]
+decide-in: land the three changes; open R9 (the restart's card drop on a plan with no host set) and
+  R10 (the tier card's upload beside the main card's) on the new rate
+decide-below: faster than the drive's 6.83 GB/s is not possible: the eviction did not take (Cached
+  at start, majflt near 0): redo the eviction before reading any row
+decide-above: the upload did not reach the drive's rate: read /proc/vmstat pgpgin over the upload
+  against the plan's card bytes (the helpers read them) and perf the pool's memcpy with -e cpu-clock
+  before any change; the bound is then the staging memcpy or the barrier per 32 MB piece, not the read

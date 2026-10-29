@@ -1,0 +1,27 @@
+# Round loadab: the restart wall of the cflra load path, read beside docs/cards/cflra-load.card (same pair of binaries).
+# The term is `load_s` of one V4.1 start on plan (a) with the model file left in the page cache by the start before it
+# (--warm: the host set resident, the card segments' pages dropped by the load itself). The band is re-derived for the
+# A6000 plan (a), not copied from cflra-load.card, whose absolute numbers (23.2 GB card, 10.2 s restart, 5.4-7.3 s after)
+# are the 3090 gate plan's: `generate_ds41 --plan --place a` on the A6000 prints card_experts=2668 (44.75 GB) and
+# host_experts=12692 (214.0 GB), both binaries. [derived] card bytes 44.75 + the trunk's ~4.0 GB (the gate plan's 23.23
+# GB card minus its 19.22 GB of experts) = ~48.8 GB; the new binary reads them at the drive's 4.5-6.8 GB/s = 7.2-10.8 s
+# (the base at its measured restart rate 2.7 GB/s = 18 s); context + plan 0.5 s, the host set's join 0.3-0.4 s (pages
+# resident: a PTE walk), body 1.5-3.1 s [measured on the gate plan, audit load.md]: 0.5 + 7.2 + 0.3 + 1.5 = 9.5 s to
+# 0.5 + 10.8 + 0.4 + 3.1 = 14.8 s. A profile card: two rounds of each arm, so no ruler; each timed start's row is read.
+kind: profile
+question: does the new binary's V4.1 plan (a) restart (host set resident) take the load from the base's derived ~22 s
+  to the derived 9.5-14.8 s, upload_s from the faulting rate to the drive's?
+term: `load` load_s of one start of generate_ds41, V4.1 plan (a), A6000, the new binary, the model file left in the page
+  cache by the start before it (load-ab.sh --warm, two rounds after the discarded start of each arm)
+unit: s
+predict: 9.5..14.8
+condition: tools/ref/load-ab.sh --warm under the lease runs the base binary (a worktree at ca0a535df) and the new binary
+  alternating after one discarded start per arm; no eviction; the row records majflt, pgpgin and `Cached` over the start;
+  no row [cpu-busy] or [other-busy]
+decide-in: the restart prediction holds: read the rows' phases against the derivation above, then open R9 (the restart's
+  card drop on a plan with no host set) on the new wall
+decide-below: faster than derived: read the new arm's majflt and pgpgin before believing it, since a card segment's pages
+  left in the page cache would hide the upload
+decide-above: slower than derived: read which phase did not move in the new arm's row, upload_s or host_set_s; the
+  `residency host` line under the row says whether the plan has the hosted churn pool (it does under the default
+  residency: the walk stays after the upload there, and host_set_s is then the whole walk when the pages are not resident)
