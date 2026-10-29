@@ -365,14 +365,16 @@ mod gate {
     /// A `--plan` reads the file's header and exits; it opens no card.
     const PLAN_WITHIN: Duration = Duration::from_secs(120);
 
-    /// The words the slot split's refusal names (`--ctx 1 --parallel 2`,
-    /// `ctx_ask::AskError::NoPosition`): the total, the slots, and the least
-    /// total that gives each a position.
-    // PIN(2026-10-14): the seats' common words (ctx-first); were the seat's own
-    // "--parallel 2 splits it to 0 positions a slot".
+    /// The words the slot split's refusal names (`--ctx 1 --parallel 2`): the
+    /// flags, then the split's one owner (`placement::slots::split_ctx`, through
+    /// `bind::check_slot_ctx` before the driver is asked): the total, the slots,
+    /// the share and the floor.
+    // PIN(2026-10-30): the seat's flags are checked before the driver (b1b138ec8), so
+    // the split owner's words refuse first; were `ctx_ask`'s "--ctx 1 over 2 slots
+    // gives a slot no position" and "ask at least 2", and the clause was red on them.
     const SPLIT_REFUSAL: [&str; 2] = [
-        "--ctx 1 over 2 slots gives a slot no position",
-        "ask at least 2",
+        "--ctx-size 1 --parallel 2",
+        "1 positions across 2 slots give a slot 0, below the floor of 1",
     ];
 
     /// The words the refusal of a set total the card cannot hold names
