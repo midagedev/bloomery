@@ -362,8 +362,12 @@ struct Args {
     /// The element the weights' window starts at in its buffer.
     weights_at: usize,
     x: usize,
+    /// The element the input's window starts at in its buffer.
+    x_at: usize,
     y: usize,
     gain: Option<usize>,
+    /// The element the gain's window starts at in its buffer.
+    gain_at: usize,
 }
 
 impl Args {
@@ -375,8 +379,10 @@ impl Args {
             weights: bytes,
             weights_at: 0,
             x: cols,
+            x_at: 0,
             y: rows,
             gain: None,
+            gain_at: 0,
         }
     }
 }
@@ -389,7 +395,7 @@ fn refuse(
 ) -> Result<(), bloomery_device::DeviceError> {
     let mode = match a.gain {
         Some(len) => Mode::NormOnLoad(NormOnLoad {
-            gain: b.gain.window(Elems(0), Elems(len))?,
+            gain: b.gain.window(Elems(a.gain_at), Elems(len))?,
             eps: 1e-6,
             fault: h.device.fault_word(),
             layer: common::LAYER,
@@ -403,7 +409,7 @@ fn refuse(
             rows: a.rows,
             cols: a.cols,
             weights: b.weights.window(Elems(a.weights_at), Elems(a.weights))?,
-            x: b.x.window(Elems(0), Elems(a.x))?,
+            x: b.x.window(Elems(a.x_at), Elems(a.x))?,
             y: b.y.window_mut(Elems(0), Elems(a.y))?,
             mode,
         },
@@ -430,6 +436,10 @@ fn bad<'a>(
 
 /// The launches the host module must refuse: the shape it is told and the
 /// length of each window it is given, each refused naming the argument.
+///
+/// An input or gain window that does not start on 16 bytes is refused too:
+/// deleting the `Float4` check of `x` or of `gain` in `matvec.rs`'s `check`
+/// turns its case red.
 pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
     let (device, stream) = (h.device, h.stream);
     let rows = 8usize;
@@ -477,11 +487,28 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
             whole,
         ),
         bad("a short x window", "x window", |a| a.x -= 1, h, whole),
+        bad(
+            "an x window one float into its buffer",
+            "16-byte aligned",
+            |a| a.x_at = 1,
+            h,
+            whole,
+        ),
         bad("a short y window", "y window", |a| a.y -= 1, h, whole),
         bad(
             "a short gain window",
             "gain",
             |a| a.gain = Some(cols - 1),
+            h,
+            whole,
+        ),
+        bad(
+            "a gain window one float into its buffer",
+            "16-byte aligned",
+            |a| {
+                a.gain = Some(cols);
+                a.gain_at = 1;
+            },
             h,
             whole,
         ),

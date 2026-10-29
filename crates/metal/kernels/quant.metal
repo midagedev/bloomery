@@ -109,6 +109,14 @@ enum LoadMode {
     LOAD_ROUTE,
 };
 
+// Four consecutive activations (or gains) in one load. The address is a
+// multiple of 16 bytes: every lane offset below is a multiple of four values,
+// and each launch refuses an input or gain window that does not start on 16
+// bytes.
+inline float4 act4(device const float * p) {
+    return *(device const float4 *)p;
+}
+
 // The four 16-bit words of a Q4_K-packed scale table's half `iq`: the eight
 // 6-bit scales and mins of that half's four 32-value groups, as bytes
 // [scale 2iq, scale 2iq+1, min 2iq, min 2iq+1, scale 2iq+4, scale 2iq+5,
@@ -181,31 +189,48 @@ struct Q4K {
                             thread float * sum_sq) {
         const int base = input_offset(lane);
         lane.sumy = float4(0.f, 0.f, 0.f, 0.f);
-        for (short i = 0; i < 8; ++i) {
-            float a0 = block[base + i +  0];
-            float a1 = block[base + i + 32];
-            float a2 = block[base + i + 128];
-            float a3 = block[base + i + 160];
-            if (LOAD == LOAD_ROUTE) {
-                a0 *= scale;
-                a1 *= scale;
-                a2 *= scale;
-                a3 *= scale;
-            } else if (LOAD == LOAD_NORM) {
-                *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-                a0 *= gain[base + i +  0];
-                a1 *= gain[base + i + 32];
-                a2 *= gain[base + i + 128];
-                a3 *= gain[base + i + 160];
+        FOR_UNROLL (short j = 0; j < 8; j += 4) {
+            const float4 x0 = act4(block + base + j +   0);
+            const float4 x1 = act4(block + base + j +  32);
+            const float4 x2 = act4(block + base + j + 128);
+            const float4 x3 = act4(block + base + j + 160);
+            float4 g0 = float4(1.f);
+            float4 g1 = float4(1.f);
+            float4 g2 = float4(1.f);
+            float4 g3 = float4(1.f);
+            if (LOAD == LOAD_NORM) {
+                g0 = act4(gain + base + j +   0);
+                g1 = act4(gain + base + j +  32);
+                g2 = act4(gain + base + j + 128);
+                g3 = act4(gain + base + j + 160);
             }
-            lane.yl[i + 0] = a0;
-            lane.sumy[0] += a0;
-            lane.yl[i + 8] = a1;
-            lane.sumy[1] += a1;
-            lane.yh[i + 0] = a2;
-            lane.sumy[2] += a2;
-            lane.yh[i + 8] = a3;
-            lane.sumy[3] += a3;
+            FOR_UNROLL (short k = 0; k < 4; ++k) {
+                const short i = j + k;
+                float a0 = x0[k];
+                float a1 = x1[k];
+                float a2 = x2[k];
+                float a3 = x3[k];
+                if (LOAD == LOAD_ROUTE) {
+                    a0 *= scale;
+                    a1 *= scale;
+                    a2 *= scale;
+                    a3 *= scale;
+                } else if (LOAD == LOAD_NORM) {
+                    *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+                    a0 *= g0[k];
+                    a1 *= g1[k];
+                    a2 *= g2[k];
+                    a3 *= g3[k];
+                }
+                lane.yl[i + 0] = a0;
+                lane.sumy[0] += a0;
+                lane.yl[i + 8] = a1;
+                lane.sumy[1] += a1;
+                lane.yh[i + 0] = a2;
+                lane.sumy[2] += a2;
+                lane.yh[i + 8] = a3;
+                lane.sumy[3] += a3;
+            }
         }
     }
 
@@ -389,11 +414,25 @@ struct Q6K {
                             float scale,
                             thread float * sum_sq) {
         const int base = input_offset(lane);
-        for (short l = 0; l < 4; ++l) {
-            float a0 = block[base + l +  0];
-            float a1 = block[base + l + 32];
-            float a2 = block[base + l + 64];
-            float a3 = block[base + l + 96];
+        const float4 x0 = act4(block + base +  0);
+        const float4 x1 = act4(block + base + 32);
+        const float4 x2 = act4(block + base + 64);
+        const float4 x3 = act4(block + base + 96);
+        float4 g0 = float4(1.f);
+        float4 g1 = float4(1.f);
+        float4 g2 = float4(1.f);
+        float4 g3 = float4(1.f);
+        if (LOAD == LOAD_NORM) {
+            g0 = act4(gain + base +  0);
+            g1 = act4(gain + base + 32);
+            g2 = act4(gain + base + 64);
+            g3 = act4(gain + base + 96);
+        }
+        FOR_UNROLL (short l = 0; l < 4; ++l) {
+            float a0 = x0[l];
+            float a1 = x1[l];
+            float a2 = x2[l];
+            float a3 = x3[l];
             if (LOAD == LOAD_ROUTE) {
                 a0 *= scale;
                 a1 *= scale;
@@ -401,10 +440,10 @@ struct Q6K {
                 a3 *= scale;
             } else if (LOAD == LOAD_NORM) {
                 *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-                a0 *= gain[base + l +  0];
-                a1 *= gain[base + l + 32];
-                a2 *= gain[base + l + 64];
-                a3 *= gain[base + l + 96];
+                a0 *= g0[l];
+                a1 *= g1[l];
+                a2 *= g2[l];
+                a3 *= g3[l];
             }
             lane.yl[4 * l + 0] = a0;
             lane.yl[4 * l + 1] = a1;
@@ -547,11 +586,16 @@ struct A4 {
                             thread float * sum_sq) {
         const int base = input_offset(lane);
         lane.sumy = 0.f;
-        for (short l = 0; l < 4; ++l) {
-            float a0 = block[base + 4 * l + 0];
-            float a1 = block[base + 4 * l + 1];
-            float a2 = block[base + 4 * l + 2];
-            float a3 = block[base + 4 * l + 3];
+        FOR_UNROLL (short l = 0; l < 4; ++l) {
+            const float4 xq = act4(block + base + 4 * l);
+            float4 gq = float4(1.f);
+            if (LOAD == LOAD_NORM) {
+                gq = act4(gain + base + 4 * l);
+            }
+            float a0 = xq.x;
+            float a1 = xq.y;
+            float a2 = xq.z;
+            float a3 = xq.w;
             if (LOAD == LOAD_ROUTE) {
                 a0 *= scale;
                 a1 *= scale;
@@ -559,10 +603,10 @@ struct A4 {
                 a3 *= scale;
             } else if (LOAD == LOAD_NORM) {
                 *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-                a0 *= gain[base + 4 * l + 0];
-                a1 *= gain[base + 4 * l + 1];
-                a2 *= gain[base + 4 * l + 2];
-                a3 *= gain[base + 4 * l + 3];
+                a0 *= gq.x;
+                a1 *= gq.y;
+                a2 *= gq.z;
+                a3 *= gq.w;
             }
             lane.yl[4 * l + 0] = a0;
             lane.yl[4 * l + 1] = a1;
@@ -714,11 +758,16 @@ struct Q8_0 {
                             float scale,
                             thread float * sum_sq) {
         const int base = input_offset(lane);
-        for (short l = 0; l < 8; l += 4) {
-            float a0 = block[base + l + 0];
-            float a1 = block[base + l + 1];
-            float a2 = block[base + l + 2];
-            float a3 = block[base + l + 3];
+        FOR_UNROLL (short l = 0; l < 8; l += 4) {
+            const float4 x8 = act4(block + base + l);
+            float4 g8 = float4(1.f);
+            if (LOAD == LOAD_NORM) {
+                g8 = act4(gain + base + l);
+            }
+            float a0 = x8.x;
+            float a1 = x8.y;
+            float a2 = x8.z;
+            float a3 = x8.w;
             if (LOAD == LOAD_ROUTE) {
                 a0 *= scale;
                 a1 *= scale;
@@ -726,10 +775,10 @@ struct Q8_0 {
                 a3 *= scale;
             } else if (LOAD == LOAD_NORM) {
                 *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-                a0 *= gain[base + l + 0];
-                a1 *= gain[base + l + 1];
-                a2 *= gain[base + l + 2];
-                a3 *= gain[base + l + 3];
+                a0 *= g8.x;
+                a1 *= g8.y;
+                a2 *= g8.z;
+                a3 *= g8.w;
             }
             lane.yl[l + 0] = a0;
             lane.yl[l + 1] = a1;

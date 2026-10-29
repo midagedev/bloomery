@@ -196,6 +196,17 @@ fn aligned(
     super::check_weights_align(what, name, start, quant.weight_align())
 }
 
+/// An activation window the kernels read as `float4`s: its first byte is a
+/// multiple of 16 in its buffer.
+fn float4_aligned(
+    what: &'static str,
+    name: &str,
+    window: Window<'_, f32, MetalDevice>,
+) -> Result<(), DeviceError> {
+    let start = window.byte_range()?.start.get();
+    super::check_weights_align(what, name, start, super::WeightAlign::Float4)
+}
+
 fn hidden_overlaps_output(
     h: Window<'_, f32, MetalDevice>,
     y: &WindowMut<'_, f32, MetalDevice>,
@@ -302,6 +313,8 @@ fn check_pair(
     check_window_len(PAIR, "y", p.y.len(), y_len)?;
     aligned(PAIR, "gate", p.quant, p.gate)?;
     aligned(PAIR, "up", p.quant, p.up)?;
+    float4_aligned(PAIR, "x", p.x)?;
+    float4_aligned(PAIR, "gain", p.gain)?;
     Ok(PairShape {
         nblocks: word(PAIR, "the block count", nblocks)?,
         rows: word(PAIR, "the row count", g.k)?,
@@ -384,6 +397,7 @@ fn check_fold<'w>(
     check_window_len(FOLD, "ids", p.ids.len(), g.routed_ids)?;
     check_window_len(FOLD, "y", p.y.len(), p.rows)?;
     aligned(FOLD, "down", p.quant, p.down)?;
+    float4_aligned(FOLD, "hidden", p.h)?;
     let rows_per_group = simdgroups * rows_per_simd_group;
     // An instance with no shared slot binds the stack in its place, which the
     // kernel does not read.

@@ -26,10 +26,18 @@
 //! head's time is `[plain]` plus the norm's term (`[norm]` less `[plain]`)
 //! plus the pick's term (the head less `[norm]`, which `[pick]` reads on its
 //! own). A plain mat-vec of the gate's shape is timed beside its norm-on-load
-//! form and three cuts of the A4 row loop: `[fma]` (the dot accumulated with
-//! `fma`, the one float change), `[vecx]` (the activations read as `float4`s:
-//! the same bits) and `[lite]` (the dot reduced to a conversion and an add a
-//! word, the weight reads kept: what the loads alone cost).
+//! form and four cuts of the A4 row loop: `[fma]` (the dot accumulated with
+//! `fma`, the one float change), `[scalarx]` (the activation and gain loads as
+//! scalar floats, the shipped loads' predecessor: the same bits), `[unroll]`
+//! (the walk over a SIMD group's rows forced to unroll: the same bits) and
+//! `[lite]` (the dot reduced to a conversion and an add a word, the weight
+//! reads kept: what the loads alone cost).
+//!
+//! `--only lfm3,sweep` times every row (but the cuts) once more under each
+//! geometry of `SWEEP` (rows a SIMD group and SIMD groups a threadgroup),
+//! the variants compiled in this process and timed right after the default, so
+//! a geometry is judged against the default in one clock state. A variant's
+//! rows carry the geometry in their label.
 //!
 //! A cut is a copy of the instance's program text with counted edits, the way
 //! the phase cuts of the other rows are: each find text must occur exactly
@@ -53,8 +61,8 @@ use bloomery_metal::kernels::{Kernels, Quant};
 use bloomery_metal::library::{Library, sources_for};
 
 use super::{
-    HeadPart, Run, Shape, WARMUPS, WINDOW_BYTES, WORKING_SET_BYTES, geometry_kernels, time_arms,
-    time_shape,
+    Geometry, HeadPart, Run, Shape, WARMUPS, WINDOW_BYTES, WORKING_SET_BYTES, geometry_kernels,
+    time_arms, time_shape,
 };
 
 /// LFM3-1.7B's residual width, dense FFN width and vocabulary.
@@ -98,41 +106,49 @@ const ACC_FMA: &str = concat!(
 /// the scale and bias reads stay, and the per-value work goes.
 const ACC_LITE: &str = "            acc[0] += float(words[m]);\n";
 
-/// The A4 block's activation reads: sixteen scalar floats a lane.
-const LOAD_FIND: &str = concat!(
-    "        lane.sumy = 0.f;\n",
-    "        for (short l = 0; l < 4; ++l) {\n",
-    "            float a0 = block[base + 4 * l + 0];\n",
-    "            float a1 = block[base + 4 * l + 1];\n",
-    "            float a2 = block[base + 4 * l + 2];\n",
-    "            float a3 = block[base + 4 * l + 3];\n",
-);
+/// The activation and gain loads of every row loop: four values in one
+/// `float4` load.
+const ACT4_FIND: &str = "    return *(device const float4 *)p;\n";
 
-/// The same reads as four `float4`s: the lane's sixteen values start at a
-/// multiple of 64 bytes of the input.
-const LOAD_VEC: &str = concat!(
-    "        lane.sumy = 0.f;\n",
-    "        device const float4 * block4 = (device const float4 *)(block + base);\n",
-    "        for (short l = 0; l < 4; ++l) {\n",
-    "            const float4 v4 = block4[l];\n",
-    "            float a0 = v4.x;\n",
-    "            float a1 = v4.y;\n",
-    "            float a2 = v4.z;\n",
-    "            float a3 = v4.w;\n",
-);
+/// The same four values as four scalar float loads: the loads the row loops
+/// had before `act4`.
+const ACT4_SCALAR: &str = "    return float4(p[0], p[1], p[2], p[3]);\n";
 
+static UNROLL: Cut = Cut {
+    name: "unroll",
+    edits: &[(ROWS_FIND, ROWS_UNROLL)],
+};
 static FMA: Cut = Cut {
     name: "fma",
     edits: &[(ACC_FIND, ACC_FMA)],
 };
-static VECX: Cut = Cut {
-    name: "vecx",
-    edits: &[(LOAD_FIND, LOAD_VEC)],
+/// The row loop's walk over a SIMD group's rows, left to the compiler's choice
+/// of unrolling.
+const ROWS_FIND: &str = concat!(
+    "        for (short row = 0; row < NR0; ++row) {\n",
+    "            if constexpr (HEADNORM) {\n",
+);
+
+/// The same walk with the unroll forced: the four rows' weight loads are then
+/// all in sight of the scheduler at once. The same bits.
+const ROWS_UNROLL: &str = concat!(
+    "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+    "            if constexpr (HEADNORM) {\n",
+);
+
+static SCALARX: Cut = Cut {
+    name: "scalarx",
+    edits: &[(ACT4_FIND, ACT4_SCALAR)],
 };
 static LITE: Cut = Cut {
     name: "lite",
     edits: &[(ACC_FIND, ACC_LITE)],
 };
+
+/// The geometries a `sweep` run times beside the default: (rows a SIMD group,
+/// SIMD groups a threadgroup), the counts the kernels take (2, 4 or 8 rows; a
+/// threadgroup of up to 1024 threads).
+const SWEEP: [(usize, usize); 5] = [(2, 2), (4, 4), (4, 8), (8, 2), (8, 4)];
 
 /// The band a row's window arm is predicted to fall in, and the measured
 /// line it was derived from.
@@ -288,7 +304,7 @@ fn rows() -> Vec<Row> {
         ),
         cut: None,
     });
-    for cut in [&FMA, &VECX, &LITE] {
+    for cut in [&SCALARX, &UNROLL, &FMA, &LITE] {
         rows.push(Row {
             label: format!("lfm3 loop matvec a4 {ff}x{hidden} store [{}]", cut.name),
             shape: loop_shape(),
@@ -296,6 +312,34 @@ fn rows() -> Vec<Row> {
             cut: Some(cut),
         });
     }
+    // The norm-on-load rows carry the gain loads too, so the scalar loads'
+    // cost is read on them as well: the segmented loop shape, the gate-up pair
+    // and the head's norm row.
+    rows.push(Row {
+        label: format!("lfm3 loop [norm] seg a4 1x{ff}x{hidden} [{}]", SCALARX.name),
+        shape: a4_seg(&[ff]),
+        expect: None,
+        cut: Some(&SCALARX),
+    });
+    rows.push(Row {
+        label: format!("lfm3 gate_up pair a4 1x{ff}x{hidden} [{}]", SCALARX.name),
+        shape: Shape::DensePair {
+            quant: Quant::A4,
+            rows: ff,
+            cols: hidden,
+        },
+        expect: None,
+        cut: Some(&SCALARX),
+    });
+    rows.push(Row {
+        label: format!(
+            "lfm3 head [norm] seg a4 1x{VOCAB}x{hidden} [{}]",
+            SCALARX.name
+        ),
+        shape: a4_seg(&[VOCAB]),
+        expect: None,
+        cut: Some(&SCALARX),
+    });
     rows
 }
 
@@ -306,6 +350,13 @@ pub(super) fn selected(only: &[String]) -> bool {
         .any(|tok| tok.trim() == "lfm3")
 }
 
+/// The selection also names the geometry sweep.
+fn swept(only: &[String]) -> bool {
+    only.iter()
+        .flat_map(|spec| spec.split(','))
+        .any(|tok| tok.trim() == "sweep")
+}
+
 /// A row is timed when the selection names no further filter, or one of its
 /// further values is the row's kernel or a part of its label.
 fn wanted(only: &[String], kind: &str, label: &str) -> bool {
@@ -313,7 +364,7 @@ fn wanted(only: &[String], kind: &str, label: &str) -> bool {
         .iter()
         .flat_map(|spec| spec.split(','))
         .map(str::trim)
-        .filter(|tok| *tok != "lfm3")
+        .filter(|tok| *tok != "lfm3" && *tok != "sweep")
         .collect();
     filters.is_empty()
         || filters
@@ -403,6 +454,28 @@ pub(super) fn main(run: &Run) -> ExitCode {
 
     let geom = run.geometry.label();
     let mut failed = false;
+    // The sweep's variants, compiled once: each row is timed under the
+    // default and then under each of these.
+    let mut variants: Vec<(String, Kernels)> = Vec::new();
+    if swept(&run.only) {
+        for (per_simd_group, simdgroups) in SWEEP {
+            let variant = Geometry {
+                rows: per_simd_group,
+                simdgroups,
+                ..Geometry::DEFAULT
+            };
+            if variant == run.geometry {
+                continue;
+            }
+            match geometry_kernels(&device, &source, variant) {
+                Ok(kernels) => variants.push((variant.label(), kernels)),
+                Err(e) => {
+                    println!("geometry rows={per_simd_group} sg={simdgroups}: FAIL ({e})");
+                    failed = true;
+                }
+            }
+        }
+    }
     for row in rows() {
         if !wanted(&run.only, row.shape.kind(), &row.label) {
             continue;
@@ -424,34 +497,42 @@ pub(super) fn main(run: &Run) -> ExitCode {
             },
         };
         let launched = cut_built.as_ref().unwrap_or(&kernels);
-        let label = format!("{}{geom}", row.label);
-        if let Some(e) = &row.expect {
-            println!(
-                "expect\tshape={label}\tgbps={:.0}-{:.0}\tbasis={}",
-                e.lo, e.hi, e.basis
-            );
+        // The default's arm, then the sweep's: a cut compiles the default
+        // geometry only.
+        let mut arms: Vec<(&str, &Kernels)> = vec![(geom.as_str(), launched)];
+        if row.cut.is_none() {
+            arms.extend(variants.iter().map(|(label, k)| (label.as_str(), k)));
         }
-        let outcome = time_arms(
-            run,
-            row.shape.kind(),
-            &label,
-            row.shape.bytes(),
-            None,
-            None,
-            |arm| {
-                time_shape(
-                    &device,
-                    launched,
-                    &row.shape,
-                    arm,
-                    run.trials,
-                    run.check && row.cut.is_none(),
-                )
-            },
-        );
-        failed |= outcome.failed;
-        if outcome.stuck {
-            return ExitCode::FAILURE;
+        for (suffix, arm_kernels) in arms {
+            let label = format!("{}{suffix}", row.label);
+            if let Some(e) = &row.expect {
+                println!(
+                    "expect\tshape={label}\tgbps={:.0}-{:.0}\tbasis={}",
+                    e.lo, e.hi, e.basis
+                );
+            }
+            let outcome = time_arms(
+                run,
+                row.shape.kind(),
+                &label,
+                row.shape.bytes(),
+                None,
+                None,
+                |arm| {
+                    time_shape(
+                        &device,
+                        arm_kernels,
+                        &row.shape,
+                        arm,
+                        run.trials,
+                        run.check && row.cut.is_none(),
+                    )
+                },
+            );
+            failed |= outcome.failed;
+            if outcome.stuck {
+                return ExitCode::FAILURE;
+            }
         }
     }
     if failed {

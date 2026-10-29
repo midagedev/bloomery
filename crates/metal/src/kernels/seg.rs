@@ -41,7 +41,8 @@ pub struct SegParams<'w> {
     pub segments: &'w [Segment],
     /// The weights of every segment, one buffer.
     pub weights: Window<'w, u8, MetalDevice>,
-    /// The input vector, one value per column.
+    /// The input vector, one value per column, starting on a 16-byte boundary
+    /// of its buffer.
     pub x: Window<'w, f32, MetalDevice>,
     /// The output of every segment, one buffer.
     pub y: WindowMut<'w, f32, MetalDevice>,
@@ -161,6 +162,13 @@ fn check(
 
     let start = p.weights.byte_range()?.start.get();
     super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
+    // The input and the gain are read as `float4`s.
+    for (name, start) in [
+        ("x", p.x.byte_range()?.start.get()),
+        ("gain", p.norm.gain.byte_range()?.start.get()),
+    ] {
+        super::check_weights_align(WHAT, name, start, super::WeightAlign::Float4)?;
+    }
 
     // The threadgroups: every segment's own, so a segment's rows are the rows
     // a launch of that segment alone would write.

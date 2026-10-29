@@ -19,7 +19,9 @@ use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 use crate::library::Pipeline;
 
-use super::{Kernels, Quant, args_bytes, check_weights_align, check_window_len, pack, word};
+use super::{
+    Kernels, Quant, WeightAlign, args_bytes, check_weights_align, check_window_len, pack, word,
+};
 
 /// The columns of every row of the head: the hidden width (`Geometry::hidden`).
 /// A launch takes any positive multiple of the type's block values. A shim:
@@ -54,9 +56,10 @@ pub struct HeadParams<'w> {
     pub simdgroups: usize,
     /// The weights, `rows * (k / values_per_block())` blocks.
     pub weights: Window<'w, u8, MetalDevice>,
-    /// The input, `k` values.
+    /// The input, `k` values, starting on a 16-byte boundary of its buffer.
     pub x: Window<'w, f32, MetalDevice>,
-    /// The output norm's gain, `k` values.
+    /// The output norm's gain, `k` values, starting on a 16-byte boundary of
+    /// its buffer.
     pub gain: Window<'w, f32, MetalDevice>,
     /// The logits, `rows` values: the first dispatch's output and the
     /// second's input.
@@ -118,6 +121,13 @@ fn check(p: &HeadParams<'_>, rows_per_group: usize) -> Result<Shape, DeviceError
     check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
     let start = p.weights.byte_range()?.start.get();
     check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
+    // The input and the gain are read as `float4`s.
+    for (name, start) in [
+        ("x", p.x.byte_range()?.start.get()),
+        ("gain", p.gain.byte_range()?.start.get()),
+    ] {
+        check_weights_align(WHAT, name, start, WeightAlign::Float4)?;
+    }
     if p.simdgroups != HEAD_SIMD_GROUPS {
         return Err(refuse(format!(
             "the SIMD-group count is {}, the kernel runs {HEAD_SIMD_GROUPS}",

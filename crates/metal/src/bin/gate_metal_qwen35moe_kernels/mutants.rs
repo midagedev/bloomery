@@ -124,6 +124,8 @@ pub const Q30_KEPT: &[&str] = &[
     "a4_norm_gain",
     "a4_seg_weights",
     "a4_pair_sum_sq",
+    "a4_load_x",
+    "a4_load_gain",
     "a4_fold_slot",
     "a4_head_logit",
     "a4_embed_code",
@@ -641,7 +643,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "norm_gain",
         clause: "norm_on_load",
         why: "the Q4_K norm drops the gain of a value",
-        edits: &[("a0 *= gain[base + i +  0];", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= g0[k];", "a0 *= 1.f;", 1)],
     },
     Mutant {
         name: "norm_no_raise",
@@ -873,7 +875,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "pair_norm_gain",
         clause: "pair",
         why: "the pair's Q4_K norm drops the gain of a value",
-        edits: &[("a0 *= gain[base + i +  0];", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= g0[k];", "a0 *= 1.f;", 1)],
     },
     Mutant {
         name: "pair_norm_no_raise",
@@ -955,7 +957,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "a4_norm_gain",
         clause: "a4_norm",
         why: "the A4 norm load drops the gain of a value",
-        edits: &[("a0 *= gain[base + 4 * l + 0];", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= gq.x;", "a0 *= 1.f;", 1)],
     },
     Mutant {
         name: "a4_seg_weights",
@@ -968,8 +970,78 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_pair",
         why: "the A4 norm load's sum of squares drops a value",
         edits: &[(
-            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= gain[base + 4 * l + 0];",
-            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= gain[base + 4 * l + 0];",
+            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= gq.x;",
+            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= gq.x;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_load_x",
+        clause: "a4_matvec",
+        why: "an A4 lane's activation load takes the next quarter of its sixteen values, wrapped",
+        edits: &[(
+            "const float4 xq = act4(block + base + 4 * l);",
+            "const float4 xq = act4(block + base + 4 * ((l + 1) & 3));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_load_gain",
+        clause: "a4_norm",
+        why: "an A4 lane's gain load takes the next quarter of its sixteen values, wrapped",
+        edits: &[(
+            "gq = act4(gain + base + 4 * l);",
+            "gq = act4(gain + base + 4 * ((l + 1) & 3));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q4k_load_x",
+        clause: "q4k_matvec",
+        why: "a Q4_K lane's second activation group is read from sixty-four values on, not thirty-two",
+        edits: &[(
+            "const float4 x1 = act4(block + base + j +  32);",
+            "const float4 x1 = act4(block + base + j +  64);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q4k_load_gain",
+        clause: "norm_on_load",
+        why: "a Q4_K lane's third gain group is read from the fourth group's place",
+        edits: &[(
+            "g2 = act4(gain + base + j + 128);",
+            "g2 = act4(gain + base + j + 160);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q6k_load_x",
+        clause: "q6k_matvec",
+        why: "a Q6_K lane's third activation group is read from the fourth group's place",
+        edits: &[(
+            "const float4 x2 = act4(block + base + 64);",
+            "const float4 x2 = act4(block + base + 96);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_load_x",
+        clause: "q8_0_matvec",
+        why: "a Q8_0 lane's activation load takes the other half of its eight values",
+        edits: &[(
+            "const float4 x8 = act4(block + base + l);",
+            "const float4 x8 = act4(block + base + (l ^ 4));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_load_gain",
+        clause: "q8_0_norm",
+        why: "a Q8_0 lane's gain load takes the other half of its eight values",
+        edits: &[(
+            "g8 = act4(gain + base + l);",
+            "g8 = act4(gain + base + (l ^ 4));",
             1,
         )],
     },
@@ -1978,7 +2050,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "q8_0_norm_gain",
         clause: "q8_0_norm",
         why: "the Q8_0 norm load drops the gain of a value",
-        edits: &[("a0 *= gain[base + l + 0];", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= g8.x;", "a0 *= 1.f;", 1)],
     },
     Mutant {
         name: "q8_0_seg_weights",
@@ -2001,8 +2073,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "q8_0_pair",
         why: "the Q8_0 norm load's sum of squares drops a value",
         edits: &[(
-            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= gain[base + l + 0];",
-            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= gain[base + l + 0];",
+            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= g8.x;",
+            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= g8.x;",
             1,
         )],
     },

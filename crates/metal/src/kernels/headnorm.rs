@@ -34,7 +34,8 @@ pub struct HeadNormParams<'w> {
     pub cols: usize,
     /// The out projection's weights.
     pub weights: Window<'w, u8, MetalDevice>,
-    /// The gated numerator, one value per input column.
+    /// The gated numerator, one value per input column, starting on a 16-byte
+    /// boundary of its buffer.
     pub g: Window<'w, f32, MetalDevice>,
     /// The partial sums of the squares of the values: every head's row of
     /// one partial per column block.
@@ -89,6 +90,9 @@ fn check(
     check_window_len(WHAT, "y", p.y.len(), p.rows)?;
     let start = p.weights.byte_range()?.start.get();
     super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
+    // The gated numerator is read as `float4`s.
+    let start = p.g.byte_range()?.start.get();
+    super::check_weights_align(WHAT, "g", start, super::WeightAlign::Float4)?;
     Ok(Shape {
         nblocks: word(WHAT, "the block count", nblocks)?,
         rows: word(WHAT, "the row count", p.rows)?,

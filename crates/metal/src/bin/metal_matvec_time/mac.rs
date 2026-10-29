@@ -1571,7 +1571,9 @@ us_p90, gbps.
                          Unset times every shape. `lfm3` runs LFM3-1.7B's
                          decode rows alone (lfm3.rs); a further value there
                          narrows them to a kernel (pair, fold, head, seg,
-                         matvec) or a label part (`[plain]`, `[fma]`).
+                         matvec) or a label part (`[plain]`, `[scalarx]`);
+                         `sweep` times each row under the geometry variants
+                         of lfm3.rs too.
   --trials N             timed command buffers per arm (default 16)
   --chain N              also time N back-to-back dispatches: arm lone (one
                          dispatch), serial and concurrent (a memory barrier

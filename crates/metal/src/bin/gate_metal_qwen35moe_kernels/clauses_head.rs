@@ -722,7 +722,11 @@ struct Args {
     /// The byte the weights' window starts at in its buffer.
     weights_at: usize,
     x: usize,
+    /// The element the input's window starts at in its buffer.
+    x_at: usize,
     gain: usize,
+    /// The element the gain's window starts at in its buffer.
+    gain_at: usize,
     logits: usize,
     step_id: usize,
 }
@@ -737,7 +741,9 @@ impl Args {
             weights: weights_len,
             weights_at: 0,
             x: k,
+            x_at: 0,
             gain: k,
+            gain_at: 0,
             logits: rows,
             step_id: 1,
         }
@@ -768,8 +774,8 @@ fn refuse(
             k: a.k,
             simdgroups: a.simdgroups,
             weights: bufs.weights.window(Elems(a.weights_at), Elems(a.weights))?,
-            x: bufs.x.window(Elems(0), Elems(a.x))?,
-            gain: bufs.gain.window(Elems(0), Elems(a.gain))?,
+            x: bufs.x.window(Elems(a.x_at), Elems(a.x))?,
+            gain: bufs.gain.window(Elems(a.gain_at), Elems(a.gain))?,
             logits: bufs.logits.window_mut(Elems(0), Elems(a.logits))?,
             step_id: bufs.step_id.window_mut(Elems(0), Elems(a.step_id))?,
             eps: a.eps,
@@ -802,6 +808,10 @@ fn bad<'a>(
 ///
 /// PIN(2026-10-29): the head has no candidates or ticket window, so the four
 /// refusal cases of those windows are gone with them.
+///
+/// An input or gain window that does not start on 16 bytes is refused:
+/// deleting the `Float4` check of `x` or of `gain` in `head.rs`'s `check`
+/// turns its case red.
 pub fn head_bounds(h: &Harness<'_>) -> Clause {
     const K: usize = 256;
     const ROWS: usize = 16;
@@ -854,9 +864,19 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
             Box::new(|a| a.x = whole.x + 1),
         ),
         case(
+            "an x window one float into its buffer",
+            "16-byte aligned",
+            Box::new(|a| a.x_at = 1),
+        ),
+        case(
             "a short gain window",
             "gain",
             Box::new(|a| a.gain = whole.gain - 1),
+        ),
+        case(
+            "a gain window one float into its buffer",
+            "16-byte aligned",
+            Box::new(|a| a.gain_at = 1),
         ),
         case(
             "a long gain window",

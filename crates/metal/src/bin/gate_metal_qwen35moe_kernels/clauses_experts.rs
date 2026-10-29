@@ -20,7 +20,8 @@ use super::oracle;
 use super::oracle_experts;
 use super::synthetic;
 use super::{
-    Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_TAIL, check_guards, padded, weight_pad,
+    ACT_PAD, Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_TAIL, check_guards, padded,
+    weight_pad,
 };
 const N_EXPERTS: usize = 4;
 const PAIR_COLS: usize = 2048;
@@ -391,13 +392,8 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
         launch.shared_up,
         WEIGHT_TAIL,
     );
-    let x = padded(f32::from_bits(SENTINEL_BITS), VALUE_PAD, launch.x, 1);
-    let gain = padded(
-        f32::from_bits(SENTINEL_BITS),
-        VALUE_PAD,
-        &launch.norm.gain,
-        1,
-    );
+    let x = padded(f32::from_bits(SENTINEL_BITS), ACT_PAD, launch.x, 1);
+    let gain = padded(f32::from_bits(SENTINEL_BITS), ACT_PAD, &launch.norm.gain, 1);
     let ids = padded(-1, VALUE_PAD, launch.ids, 1);
     let y_words = padded(
         f32::from_bits(SENTINEL_BITS),
@@ -446,8 +442,8 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
                         )
                     })
                     .transpose()?,
-                x: x.window(Elems(VALUE_PAD), Elems(launch.x.len()))?,
-                gain: gain.window(Elems(VALUE_PAD), Elems(launch.norm.gain.len()))?,
+                x: x.window(Elems(ACT_PAD), Elems(launch.x.len()))?,
+                gain: gain.window(Elems(ACT_PAD), Elems(launch.norm.gain.len()))?,
                 eps: launch.norm.eps,
                 y: y.window_mut(Elems(OUT_GUARD), Elems(y_len))?,
                 out_stride: e.k,
@@ -483,7 +479,7 @@ pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, Stri
         launch.shared,
         WEIGHT_TAIL,
     );
-    let hidden = padded(f32::from_bits(SENTINEL_BITS), VALUE_PAD, launch.h, 1);
+    let hidden = padded(f32::from_bits(SENTINEL_BITS), ACT_PAD, launch.h, 1);
     let route = padded(0.0, VALUE_PAD, launch.w, 1);
     let ids = padded(-1, VALUE_PAD, launch.ids, 1);
     let y_words = padded(
@@ -526,7 +522,7 @@ pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, Stri
                 n_experts,
                 ids: ids.window(Elems(VALUE_PAD), Elems(launch.ids.len()))?,
                 down: down.window(Elems(weight_pad(launch.quant)), Elems(launch.down.len()))?,
-                h: hidden.window(Elems(VALUE_PAD), Elems(launch.h.len()))?,
+                h: hidden.window(Elems(ACT_PAD), Elems(launch.h.len()))?,
                 w: route.window(Elems(VALUE_PAD), Elems(launch.w.len()))?,
                 y: &out,
                 fault: device.fault_word(),
@@ -1255,6 +1251,10 @@ struct PairArgs {
     gate_len: usize,
     stride: usize,
     x: usize,
+    /// The element the input's window starts at in its buffer.
+    x_at: usize,
+    /// The element the gain's window starts at in its buffer.
+    gain_at: usize,
     y_len: usize,
 }
 
@@ -1270,6 +1270,8 @@ impl PairArgs {
             gate_len,
             stride: e.k,
             x: 16,
+            x_at: 0,
+            gain_at: 0,
             y_len: 64,
         }
     }
@@ -1311,8 +1313,8 @@ fn refuse_pair(
                 .has_shared
                 .then(|| b.bytes.window(Elems(0), Elems(a.gate_len)))
                 .transpose()?,
-            x: b.values.window(Elems(0), Elems(a.x))?,
-            gain: b.values.window(Elems(0), Elems(a.x))?,
+            x: b.values.window(Elems(a.x_at), Elems(a.x))?,
+            gain: b.values.window(Elems(a.gain_at), Elems(a.x))?,
             eps: 1e-6,
             y: b.marker.window_mut(Elems(0), Elems(a.y_len))?,
             out_stride: a.stride,
@@ -1333,6 +1335,8 @@ struct FoldArgs {
     rows: usize,
     down_len: usize,
     h_len: usize,
+    /// The element the hidden window starts at in its buffer.
+    h_at: usize,
     y_len: usize,
 }
 
@@ -1348,6 +1352,7 @@ impl FoldArgs {
             rows: 8,
             down_len: 16,
             h_len: 16,
+            h_at: 0,
             y_len: 64,
         }
     }
@@ -1371,7 +1376,7 @@ fn refuse_fold(
             n_experts: a.n_experts,
             ids: b.ids.window(Elems(0), Elems(a.id_len))?,
             down: b.bytes.window(Elems(0), Elems(a.down_len))?,
-            h: b.values.window(Elems(0), Elems(a.h_len))?,
+            h: b.values.window(Elems(a.h_at), Elems(a.h_len))?,
             w: b.route.window(Elems(0), Elems(e.slots))?,
             y: &b.marker.window_mut(Elems(0), Elems(a.y_len))?,
             fault: h.device.fault_word(),
@@ -1380,6 +1385,10 @@ fn refuse_fold(
     )
 }
 
+/// The launches the pair and the fold must refuse, each by name, with nothing
+/// written. A pair's input or gain window and a fold's hidden window that do
+/// not start on 16 bytes are refused: deleting the `float4_aligned` calls in
+/// `experts.rs` turns those cases red.
 pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
     let e = h.geom().experts;
     let (device, stream) = (h.device, h.stream);
@@ -1389,8 +1398,10 @@ pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
             .upload(stream, &vec![1.0f32; e.slots * e.k])
             .map_err(why)?,
         bytes: device.upload(stream, &vec![0u8; gate_len]).map_err(why)?,
+        // Four floats past the longest window, so a window can start one
+        // float in.
         values: device
-            .upload(stream, &vec![0f32; e.slots * e.k])
+            .upload(stream, &vec![0f32; e.slots * e.k + 4])
             .map_err(why)?,
         route: device.upload(stream, &vec![1.0f32; e.slots]).map_err(why)?,
         ids: device
@@ -1452,6 +1463,26 @@ pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
             "window",
             Box::new(|a| a.stride = 1),
         ),
+        BadArg::new(
+            "a pair input window one float into its buffer",
+            "16-byte aligned",
+            Box::new(move |b: &mut Refusals, encoder| {
+                let mut a = pair_good;
+                a.x_at = 1;
+                refuse_pair(h, b, &a, encoder)
+            }),
+        )
+        .naming("the x window"),
+        BadArg::new(
+            "a pair gain window one float into its buffer",
+            "16-byte aligned",
+            Box::new(move |b: &mut Refusals, encoder| {
+                let mut a = pair_good;
+                a.gain_at = 1;
+                refuse_pair(h, b, &a, encoder)
+            }),
+        )
+        .naming("the gain window"),
     ];
     let fold_whole = FoldArgs::whole(&e);
     let bad_fold = |what: &'static str,
@@ -1500,6 +1531,19 @@ pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
             "window",
             Box::new(|a| a.id_len = 0),
         ),
+        BadArg::new(
+            "a fold hidden window one float into its buffer",
+            "16-byte aligned",
+            Box::new(move |b: &mut Refusals, encoder| {
+                let mut a = fold_whole;
+                a.down_len = a.rows * row_bytes(Quant::Q4K, e.k);
+                a.h_len = e.slots * e.k;
+                a.y_len = a.rows;
+                a.h_at = 1;
+                refuse_fold(h, b, &a, encoder)
+            }),
+        )
+        .naming("the hidden window"),
         {
             // The hidden states window of the overlap case is the output
             // window, so the launch is built by hand.

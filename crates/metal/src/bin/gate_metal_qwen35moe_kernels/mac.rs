@@ -155,6 +155,9 @@ pub fn weight_pad(quant: Quant) -> usize {
 const WEIGHT_TAIL: usize = 258;
 /// Values the activation and gain buffers hold before their windows.
 const VALUE_PAD: usize = 5;
+/// The same for the kernels that read the activations and the gain as
+/// `float4`s: a multiple of four, so the window starts on 16 bytes.
+const ACT_PAD: usize = 8;
 /// Words the output buffer holds on either side of its window.
 const OUT_GUARD: usize = 7;
 
@@ -276,13 +279,13 @@ impl Harness<'_> {
         let pad = weight_pad(launch.quant);
         let weights = padded(0xFFu8, pad, launch.weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
-        let x = padded(sentinel, VALUE_PAD, launch.x, 1);
+        let x = padded(sentinel, ACT_PAD, launch.x, 1);
         let x = device.upload(stream, &x).map_err(why)?;
         let y_words = padded(sentinel, OUT_GUARD, launch.y0, OUT_GUARD);
         let mut y = device.upload(stream, &y_words).map_err(why)?;
         let gain_buffer = match &launch.mode {
             ModeSpec::Norm { gain, .. } => {
-                let gain = padded(sentinel, VALUE_PAD, gain, 1);
+                let gain = padded(sentinel, ACT_PAD, gain, 1);
                 Some(device.upload(stream, &gain).map_err(why)?)
             }
             _ => None,
@@ -293,7 +296,7 @@ impl Harness<'_> {
             (ModeSpec::Residual, _) => Mode::Residual,
             (ModeSpec::Norm { eps, layer, .. }, Some(gain)) => Mode::NormOnLoad(NormOnLoad {
                 gain: gain
-                    .window(Elems(VALUE_PAD), Elems(launch.cols))
+                    .window(Elems(ACT_PAD), Elems(launch.cols))
                     .map_err(why)?,
                 eps: *eps,
                 fault: device.fault_word(),
@@ -308,8 +311,7 @@ impl Harness<'_> {
             weights: weights
                 .window(Elems(pad), Elems(launch.weights.len()))
                 .map_err(why)?,
-            x: x.window(Elems(VALUE_PAD), Elems(launch.cols))
-                .map_err(why)?,
+            x: x.window(Elems(ACT_PAD), Elems(launch.cols)).map_err(why)?,
             y: y.window_mut(Elems(OUT_GUARD), Elems(launch.rows))
                 .map_err(why)?,
             mode,
@@ -348,11 +350,11 @@ impl Harness<'_> {
         let pad = weight_pad(launch.quant);
         let weights = padded(0xFFu8, pad, &weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
-        let x = padded(sentinel, VALUE_PAD, launch.x, 1);
+        let x = padded(sentinel, ACT_PAD, launch.x, 1);
         let x = device.upload(stream, &x).map_err(why)?;
         let y_words = padded(sentinel, OUT_GUARD, launch.y0, OUT_GUARD);
         let mut y = device.upload(stream, &y_words).map_err(why)?;
-        let gain = padded(sentinel, VALUE_PAD, launch.gain, 1);
+        let gain = padded(sentinel, ACT_PAD, launch.gain, 1);
         let gain = device.upload(stream, &gain).map_err(why)?;
 
         let params = SegParams {
@@ -361,12 +363,11 @@ impl Harness<'_> {
             weights: weights
                 .window(Elems(pad), Elems(weight_bytes))
                 .map_err(why)?,
-            x: x.window(Elems(VALUE_PAD), Elems(launch.cols))
-                .map_err(why)?,
+            x: x.window(Elems(ACT_PAD), Elems(launch.cols)).map_err(why)?,
             y: y.window_mut(Elems(OUT_GUARD), Elems(rows)).map_err(why)?,
             norm: NormOnLoad {
                 gain: gain
-                    .window(Elems(VALUE_PAD), Elems(launch.cols))
+                    .window(Elems(ACT_PAD), Elems(launch.cols))
                     .map_err(why)?,
                 eps: launch.eps,
                 fault: device.fault_word(),
@@ -390,7 +391,7 @@ impl Harness<'_> {
         let pad = weight_pad(launch.quant);
         let weights = padded(0xFFu8, pad, launch.weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
-        let g = padded(sentinel, VALUE_PAD, launch.g, 1);
+        let g = padded(sentinel, ACT_PAD, launch.g, 1);
         let g = device.upload(stream, &g).map_err(why)?;
         let partials = padded(sentinel, VALUE_PAD, launch.partials, 1);
         let partials = device.upload(stream, &partials).map_err(why)?;
@@ -404,8 +405,7 @@ impl Harness<'_> {
             weights: weights
                 .window(Elems(pad), Elems(launch.weights.len()))
                 .map_err(why)?,
-            g: g.window(Elems(VALUE_PAD), Elems(launch.cols))
-                .map_err(why)?,
+            g: g.window(Elems(ACT_PAD), Elems(launch.cols)).map_err(why)?,
             partials: partials
                 .window(Elems(VALUE_PAD), Elems(launch.partials.len()))
                 .map_err(why)?,

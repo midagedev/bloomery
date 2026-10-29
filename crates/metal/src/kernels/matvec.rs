@@ -172,7 +172,8 @@ impl Quant {
 /// not finite, raises the norm site of `layer` on `fault` and writes NaN to
 /// its rows.
 pub struct NormOnLoad<'w> {
-    /// The norm's gain, one value per input column.
+    /// The norm's gain, one value per input column, starting on a 16-byte
+    /// boundary of its buffer.
     pub gain: Window<'w, f32, MetalDevice>,
     /// The epsilon added to the mean of the squares.
     pub eps: f32,
@@ -204,7 +205,8 @@ pub struct MatvecParams<'w> {
     pub cols: usize,
     /// The weights' bytes: `rows * cols / values_per_block()` blocks.
     pub weights: Window<'w, u8, MetalDevice>,
-    /// The input vector, `cols` values.
+    /// The input vector, `cols` values, starting on a 16-byte boundary of its
+    /// buffer.
     pub x: Window<'w, f32, MetalDevice>,
     /// The output, `rows` values.
     pub y: WindowMut<'w, f32, MetalDevice>,
@@ -264,9 +266,16 @@ fn check(
         check_window_len(WHAT, "gain", norm.gain.len(), p.cols)?;
     }
     // The kernels read the weights as words of the type's width, from the
-    // window's byte offset in its buffer.
+    // window's byte offset in its buffer, and the input and the gain as
+    // `float4`s.
     let start = p.weights.byte_range()?.start.get();
     super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
+    let start = p.x.byte_range()?.start.get();
+    super::check_weights_align(WHAT, "x", start, super::WeightAlign::Float4)?;
+    if let Mode::NormOnLoad(norm) = &p.mode {
+        let start = norm.gain.byte_range()?.start.get();
+        super::check_weights_align(WHAT, "gain", start, super::WeightAlign::Float4)?;
+    }
     Ok(Shape {
         nblocks: word(WHAT, "the block count", nblocks)?,
         rows: word(WHAT, "the row count", p.rows)?,

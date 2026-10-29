@@ -206,6 +206,10 @@ struct Args {
     segments: [Option<Segment>; 5],
     weights_len: usize,
     y_len: usize,
+    /// The element the input's window starts at in its buffer.
+    x_at: usize,
+    /// The element the gain's window starts at in its buffer.
+    gain_at: usize,
 }
 
 impl Args {
@@ -227,6 +231,8 @@ impl Args {
             ],
             weights_len,
             y_len,
+            x_at: 0,
+            gain_at: 0,
         }
     }
 
@@ -248,10 +254,10 @@ fn refuse(
             quant: Quant::Q4K,
             segments: &segments,
             weights: b.weights.window(Elems(0), Elems(a.weights_len))?,
-            x: b.x.window(Elems(0), Elems(b.cols))?,
+            x: b.x.window(Elems(a.x_at), Elems(b.cols))?,
             y: b.y.window_mut(Elems(0), Elems(a.y_len))?,
             norm: NormOnLoad {
-                gain: b.gain.window(Elems(0), Elems(b.cols))?,
+                gain: b.gain.window(Elems(a.gain_at), Elems(b.cols))?,
                 eps: 1e-6,
                 fault: h.device.fault_word(),
                 layer: LAYER,
@@ -281,7 +287,9 @@ fn bad<'a>(
 
 /// The bounds of a segment list: a list the kernel cannot run is refused by
 /// name, and nothing is encoded for it. A dispatch of the most segments writes
-/// every row and nothing past the last.
+/// every row and nothing past the last. An input or gain window that does not
+/// start on 16 bytes is refused: deleting the `Float4` checks in `seg.rs`'s
+/// `check` turns its cases red.
 pub fn seg_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = fixture.rms_eps()?;
     let cols = 2048;
@@ -386,6 +394,26 @@ pub fn seg_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             },
             h,
             bytes * 16,
+        ),
+        bad(
+            "an x window one float into its buffer",
+            "16-byte aligned",
+            |a| {
+                a.y_len = 8;
+                a.x_at = 1;
+            },
+            h,
+            8 * bytes,
+        ),
+        bad(
+            "a gain window one float into its buffer",
+            "16-byte aligned",
+            |a| {
+                a.y_len = 8;
+                a.gain_at = 1;
+            },
+            h,
+            8 * bytes,
         ),
     ];
     let unchanged = |h: &Harness<'_>, b: &Refusals| common::still(h, &b.y, |v| *v == 1.0);
