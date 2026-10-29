@@ -1501,7 +1501,7 @@ mod tests {
                 "{e}"
             );
         }
-        // No --model and no head: no seat here; the generative side refuses by no_head.
+        // No --model and no head: no seat here; the generative side serves the file or refuses it by no_head.
         assert!(matches!(
             pick(&ask("qwen35"), ROWS, &mut card(None, &mut n)),
             Ok(None)
