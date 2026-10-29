@@ -82,11 +82,16 @@ pub const fn head_gate(inst: &Instance) -> bool {
     inst.key.attn.head_gate
 }
 
-/// The live-key ceiling one segment holds. At or under it the flash is one
-/// dispatch that finishes in its epilogue; past it the segment rule splits
-/// the keys and the flash's last threadgroup folds the partials (the count
-/// model reads this as the waterline its two scenes sit either side of).
+/// The keys the split rule sizes its segments by: past [`ONE_PASS_KEYS`] a
+/// segment holds two tiles, `SEGMENT_KEYS / 2` keys (the count model and the
+/// e2e gate read it as their sessions' one segment of keys).
 pub const SEGMENT_KEYS: usize = 64;
+
+/// The live-key ceiling one segment holds. At or under it the f16 launch is
+/// the one-pass flash, a threadgroup a query head over every key the layer
+/// attends, which writes no partial; past it the segment rule splits the
+/// keys and the flash's last threadgroup folds the partials.
+pub const ONE_PASS_KEYS: usize = 16384;
 
 /// Threads in the flash threadgroup of `inst`: a SIMD group to each query
 /// head of a key head.
@@ -98,6 +103,37 @@ pub const fn flash_threads(inst: &Instance) -> usize {
 /// Threads in the flash threadgroup. A shim: the build's host instance's.
 /// Callers left: the probes.
 pub const FLASH_THREADS: usize = flash_threads(&HOST);
+
+/// SIMD groups in the one-pass flash's threadgroup (the f16 launch of one
+/// segment): one threadgroup a query head, its groups taking the keys
+/// strided. Groups 0, 1 and 2 prepare the query, the key and the value.
+pub const ONE_PASS_SG: usize = 16;
+
+/// Keys one SIMD group of the one-pass flash streams into registers at a
+/// time, between two rescales of its softmax.
+pub const ONE_PASS_CHUNK: usize = 4;
+
+/// Threads in the one-pass flash's threadgroup.
+pub const ONE_PASS_THREADS: usize = SIMD_WIDTH * ONE_PASS_SG;
+
+/// The one-pass flash's threadgroup memory at a head of `head` values
+/// (`ATTN_ONE_FLOATS` in attention.metal, in 16-byte words): the query, the
+/// key's scratch, the key's and value's halves, and each group's maximum,
+/// weight sum and values.
+#[must_use]
+pub const fn one_pass_bytes(head: usize) -> usize {
+    (3 * head + ONE_PASS_SG * (2 + head)).div_ceil(4) * 16
+}
+
+const _: () = {
+    assert!(
+        ONE_PASS_SG >= 3,
+        "the one-pass prepare takes three SIMD groups"
+    );
+    // A round of chunks spans a tile, so a key meets no more rescales than the
+    // band's tile count.
+    assert!(ONE_PASS_SG * ONE_PASS_CHUNK >= TILE);
+};
 
 /// The score's scale for a head of `head` values: ik's
 /// `1.0f/sqrtf(float(head))` in f32 (exact at 256; at 128 the f32 nearest,
@@ -201,6 +237,16 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
             "at most 62 (the fold's factors in 32 KB of threadgroup memory)",
         );
     }
+    // The one-pass flash merges a thread a value, and holds the query, the
+    // key's scratch, the key's and value's halves and every group's values in
+    // one threadgroup's memory.
+    if ONE_PASS_THREADS < a.head || one_pass_bytes(a.head) > SHARED_BYTES {
+        return refuse(
+            "head",
+            &a.head,
+            "at most the one-pass flash's threads, its values in 32 KB",
+        );
+    }
     // The norm's pair tree (rope_neox's `owned_pair`): the turning pairs
     // inside warp 0 or every value turning.
     if !a.rot.is_multiple_of(2) || a.rot > a.head || (a.rot / 2 > SIMD_WIDTH && a.rot != a.head) {
@@ -254,21 +300,17 @@ pub fn segments_for_window(n_keys: u32, window: Option<u32>) -> u32 {
 
 /// Segments a live key count takes.
 ///
-/// At or under [`SEGMENT_KEYS`] the keys are one segment: the flash is one
-/// dispatch that finishes in its epilogue, and the count model's waterline
-/// holds. Past it, while a tile a segment still fills more of the card than
-/// two tiles a segment would (up to twice [`SEGMENT_KEYS`]), the keys split
-/// a tile a segment; past that, two tiles a segment, capped so the partials
-/// the split writes and the fold reads stay a small share of the K/V bytes
-/// at depth. Zero keys are still one segment: the flash raises on that
-/// count.
+/// At or under [`ONE_PASS_KEYS`] the keys are one segment: the f16 flash is
+/// the one-pass launch, one dispatch that finishes in its epilogue. Past it
+/// the keys split two tiles a segment, capped so the partials the split
+/// writes and the fold reads stay a small share of the K/V bytes at depth
+/// (at today's waterline every split count is the cap). Zero keys are still
+/// one segment: the flash raises on that count.
 #[must_use]
 pub fn segments_for_keys(n_keys: u32) -> u32 {
     let n = u64::from(n_keys);
-    let segments = if n <= SEGMENT_KEYS as u64 {
+    let segments = if n <= ONE_PASS_KEYS as u64 {
         1
-    } else if n <= 2 * SEGMENT_KEYS as u64 {
-        n.div_ceil(TILE as u64)
     } else {
         n.div_ceil((SEGMENT_KEYS / 2) as u64)
             .min(SEGMENT_CAP as u64)
@@ -403,12 +445,13 @@ mod tests {
     #[test]
     fn a_window_takes_the_segments_of_its_own_keys() {
         for (n_keys, window, want) in [
-            (300u32, Some(256u32), 8u32),
-            (1025, Some(256), 8),
-            (5000, Some(256), 8),
-            (1025, None, 33),
-            (100, Some(256), 7),
-            (300, Some(4096), 10),
+            (300u32, Some(256u32), 1u32),
+            (1025, Some(256), 1),
+            (20_000, Some(256), 1),
+            (20_000, None, 64),
+            (100, Some(256), 1),
+            (20_000, Some(16_384), 1),
+            (20_000, Some(16_385), 64),
             (1025, Some(1), 1),
             (64, Some(64), 1),
         ] {
@@ -422,34 +465,23 @@ mod tests {
 
     #[test]
     fn one_segment_holds_the_waterline() {
-        for n in [1u32, 2, 63, 64] {
+        for n in [1u32, 2, 63, 64, 65, 256, 1024, 4096, 16_383, 16_384] {
             assert_eq!(segments_for_keys(n), 1, "{n} keys are one segment");
         }
     }
 
     #[test]
     fn the_rule_picks_the_counted_splits() {
-        // The counted splits: a tile a segment to twice the waterline, then
-        // two tiles a segment to the cap.
-        for (n, want) in [
-            (65u32, 5u32),
-            (100, 7),
-            (128, 8),
-            (129, 5),
-            (256, 8),
-            (512, 16),
-            (1024, 32),
-            (2048, 64),
-            (4096, 64),
-            (8192, 64),
-        ] {
+        // The counted splits past the waterline: two tiles a segment would
+        // pass the cap, so every count is the cap.
+        for (n, want) in [(16_385u32, 64u32), (32_768, 64), (262_144, 64)] {
             assert_eq!(segments_for_keys(n), want, "{n} keys");
         }
     }
 
     #[test]
     fn the_segments_cover_every_count() {
-        for n in 1..=8192u32 {
+        for n in 1..=20_000u32 {
             let segments = segments_for_keys(n);
             let span = span_mirror(n, segments);
             // The segments tile [0, segments * span) contiguously, so the

@@ -1,15 +1,19 @@
 //! The launch of decode GQA attention at the library's instance geometry
-//! (`AttnGeom`: its query heads over its key heads, its values a head). One
-//! threadgroup is one key head and one segment of eight SIMD groups, one
-//! query head a group, the keys streamed from the cache into registers.
+//! (`AttnGeom`: its query heads over its key heads, its values a head).
 //!
-//! One segment is the flash: it normalizes, applies the gate when the
-//! layer's query carries one (`AttnGeom::qg_stride` is twice the head) and
-//! writes the output. More than one writes partials, and the dispatch's last
-//! threadgroup — the ticket's — folds them, applies the gate and writes the
-//! output in the same launch. The ticket is one word the caller holds
-//! zeroed; the fold resets it, so the next launch finds it zero. There is
-//! no merge dispatch.
+//! One segment of the f16 cache is the one-pass flash: one threadgroup a
+//! query head, its SIMD groups taking the keys strided, merged in
+//! threadgroup memory; it normalizes, applies the gate when the layer's query
+//! carries one (`AttnGeom::qg_stride` is twice the head) and writes the
+//! output, and writes no partial. One segment of the q8_0 cache is the
+//! segmented flash below with one segment, which ends the same way.
+//!
+//! Past one segment, one threadgroup is one key head and one segment, one
+//! query head a SIMD group, the keys streamed from the cache into registers.
+//! Each writes partials, and the dispatch's last threadgroup — the ticket's —
+//! folds them, applies the gate and writes the output in the same launch.
+//! The ticket is one word the caller holds zeroed; the fold resets it, so the
+//! next launch finds it zero. There is no merge dispatch.
 //!
 //! [`Kernels::attention_rows`] is the same attention over a chunk of rows,
 //! each row a causal query at its own position: the append of the chunk's
@@ -46,10 +50,10 @@ use crate::geom::{AttnGeom, HOST_GEOMETRY};
 
 pub use super::attention_geom::segments_for_window;
 pub use super::attention_geom::{
-    HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP, SEGMENT_KEYS, TILE,
-    segments_for_keys,
+    HEAD_DIM, KV_HEADS, ONE_PASS_KEYS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP,
+    SEGMENT_KEYS, TILE, segments_for_keys,
 };
-use super::attention_geom::{PREFILL_POSITIONS, PREFILL_THREADS, SIMD_WIDTH};
+use super::attention_geom::{ONE_PASS_THREADS, PREFILL_POSITIONS, PREFILL_THREADS, SIMD_WIDTH};
 
 /// The f16 cache or the q8_0 planes a launch reads and appends.
 pub enum AttnCache<'w> {
@@ -240,6 +244,10 @@ pub(crate) struct AttentionPipelines {
     q8: Pipeline,
     append_rows: Pipeline,
     flash_rows: Pipeline,
+    /// The f16 launch of one segment: one threadgroup a query head.
+    one: Pipeline,
+    /// The rows launch of one segment on the one-pass flash.
+    one_rows: Pipeline,
     /// The prefill flash is built on its first launch: its registers spill to
     /// a scratch buffer the device allocates when the pipeline first runs, and
     /// a decode-only session never pays it.
@@ -263,6 +271,8 @@ impl AttentionPipelines {
             q8: library.pipeline("gqa256_flash_q8")?,
             append_rows: library.pipeline("attn_norm_rope_rows")?,
             flash_rows: library.pipeline("gqa256_flash_f16_rows")?,
+            one: library.pipeline("attn_flash_one_f16")?,
+            one_rows: library.pipeline("attn_flash_one_f16_rows")?,
             prefill: OnceLock::new(),
             library: library.clone(),
         })
@@ -569,17 +579,23 @@ impl Kernels {
     ) -> Result<(), DeviceError> {
         let g = &self.geom.attn;
         let checked = checked(g, &p, &layer)?;
-        let pipeline = match &p.cache {
-            AttnCache::F16 { .. } => &self.attention.f16,
-            AttnCache::Q8 { .. } => &self.attention.q8,
+        let split = || {
+            g.kv_heads
+                .checked_mul(p.segments)
+                .ok_or_else(|| refuse("the flash grid wraps".to_string()))
         };
-        let groups = g
-            .kv_heads
-            .checked_mul(p.segments)
-            .ok_or_else(|| refuse("the flash grid wraps".to_string()))?;
+        // One segment of the f16 cache is the one-pass flash, a threadgroup a
+        // query head; the rest are a threadgroup a (key head, segment).
+        let (pipeline, groups, threads) = match &p.cache {
+            AttnCache::F16 { .. } if p.segments == 1 => {
+                (&self.attention.one, g.query_heads, ONE_PASS_THREADS)
+            }
+            AttnCache::F16 { .. } => (&self.attention.f16, split()?, g.flash_threads),
+            AttnCache::Q8 { .. } => (&self.attention.q8, split()?, g.flash_threads),
+        };
         encoder.set_pipeline(pipeline);
         bind_flash(encoder, &p, checked.args.bytes(), &layer)?;
-        encoder.dispatch_groups(groups, 1, g.flash_threads)
+        encoder.dispatch_groups(groups, 1, threads)
     }
 }
 
@@ -1001,11 +1017,17 @@ impl Kernels {
         encoder.dispatch_groups(g.kv_heads, p.rows, SIMD_WIDTH)?;
 
         encoder.memory_barrier();
-        let groups = g
-            .kv_heads
-            .checked_mul(p.segments)
-            .ok_or_else(|| refuse_in(ROWS_WHAT, "the flash grid wraps".to_string()))?;
-        encoder.set_pipeline(&self.attention.flash_rows);
+        // One segment is the one-pass flash, a threadgroup a (query head, row).
+        let (pipeline, groups, threads) = if p.segments == 1 {
+            (&self.attention.one_rows, g.query_heads, ONE_PASS_THREADS)
+        } else {
+            let groups = g
+                .kv_heads
+                .checked_mul(p.segments)
+                .ok_or_else(|| refuse_in(ROWS_WHAT, "the flash grid wraps".to_string()))?;
+            (&self.attention.flash_rows, groups, g.flash_threads)
+        };
+        encoder.set_pipeline(pipeline);
         encoder.set_binding(0, Binding::of(&p.q)?)?;
         encoder.set_binding(1, Binding::of(&p.q_gain)?)?;
         encoder.set_binding(2, Binding::of(&p.rope)?)?;
@@ -1019,7 +1041,7 @@ impl Kernels {
         if let Some(gate) = &layer.head_gate {
             encoder.set_binding(10, Binding::of(gate)?)?;
         }
-        encoder.dispatch_groups(groups, p.rows, g.flash_threads)
+        encoder.dispatch_groups(groups, p.rows, threads)
     }
 
     /// Build the prefill attention's pipeline if no launch has built it yet. A

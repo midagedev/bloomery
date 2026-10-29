@@ -662,10 +662,12 @@ fn selected_rows(args: &[String]) -> Result<Vec<&'static InstanceRow>, String> {
 }
 
 /// The entries whose bodies an instance's geometry shapes.
-const INSTANCE_ENTRIES: [&str; 9] = [
+const INSTANCE_ENTRIES: [&str; 11] = [
     "gqa256_flash_f16",
     "gqa256_flash_q8",
     "gqa256_flash_f16_rows",
+    "attn_flash_one_f16",
+    "attn_flash_one_f16_rows",
     "attn_norm_rope_rows",
     "attn_prefill_f16",
     "router35",

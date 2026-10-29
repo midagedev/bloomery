@@ -90,6 +90,8 @@ pub fn geometry_defines(g: &Geometry) -> String {
          #define BLOOMERY_ATTN_HEAD_GATE {aheadgate}\n\
          #define BLOOMERY_ATTN_WINDOW {awindow}\n\
          #define BLOOMERY_ATTN_SEGMENT_CAP {asegcap}\n\
+         #define BLOOMERY_ATTN_ONE_SG {aonesg}\n\
+         #define BLOOMERY_ATTN_ONE_CHUNK {aonechunk}\n\
          #define BLOOMERY_ATTN_PF_POSITIONS {apfpos}\n\
          #define BLOOMERY_ATTN_PF_KEYS {apfkeys}\n\
          #define BLOOMERY_ATTN_PF_PAD {apfpad}\n",
@@ -131,6 +133,8 @@ pub fn geometry_defines(g: &Geometry) -> String {
         aheadgate = u32::from(g.attn.head_gate),
         awindow = u32::from(g.attn.windowed),
         asegcap = attention_geom::SEGMENT_CAP,
+        aonesg = attention_geom::ONE_PASS_SG,
+        aonechunk = attention_geom::ONE_PASS_CHUNK,
         apfpos = attention_geom::PREFILL_POSITIONS,
         apfkeys = attention_geom::PREFILL_KEYS,
         apfpad = attention_geom::PREFILL_PAD,
@@ -235,6 +239,8 @@ mod tests {
             ("BLOOMERY_ATTN_HEAD_GATE", usize::from(g.attn.head_gate)),
             ("BLOOMERY_ATTN_WINDOW", usize::from(g.attn.windowed)),
             ("BLOOMERY_ATTN_SEGMENT_CAP", attention_geom::SEGMENT_CAP),
+            ("BLOOMERY_ATTN_ONE_SG", attention_geom::ONE_PASS_SG),
+            ("BLOOMERY_ATTN_ONE_CHUNK", attention_geom::ONE_PASS_CHUNK),
             (
                 "BLOOMERY_ATTN_PF_POSITIONS",
                 attention_geom::PREFILL_POSITIONS,

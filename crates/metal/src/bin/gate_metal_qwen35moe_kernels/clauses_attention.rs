@@ -9,7 +9,7 @@ use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::geom::AttnGeom;
-use bloomery_metal::kernels::{AttentionParams, AttnCache, segments_for_keys};
+use bloomery_metal::kernels::{AttentionParams, AttnCache, ONE_PASS_KEYS, segments_for_keys};
 use bloomery_metal::library::Library;
 use bloomery_metal::{MetalBuffer, MetalDevice};
 use gguf::quant::{GgmlType, dequant_row, half_to_f32};
@@ -28,11 +28,19 @@ pub(super) const CTX: usize = 80;
 /// The widest key-count scene's cache rows: the 4096-key scene plus rows
 /// past the live keys that stay unread.
 const DEEP_CTX: usize = 4112;
-/// The key counts the attention scenes run at: the rule's one-segment
-/// waterline and its counted splits, the ticket's fold past the first, and
-/// the deepest scene, whose 64 segments of five tiles leave the last twelve
-/// holding no key.
-const SCENE_KEYS: [u32; 6] = [1, 64, 100, 512, 4096, 4112];
+/// The key counts the attention scenes run at by the rule, every one under the
+/// one-pass waterline (`ONE_PASS_KEYS`): one key, one round of the SIMD
+/// groups' chunks, then two, eight, sixteen, 64 and a part round.
+const SCENE_KEYS: [u32; 7] = [1, 64, 100, 512, 1024, 4096, 4112];
+const _: () = assert!(
+    SCENE_KEYS[6] as usize <= ONE_PASS_KEYS,
+    "the rule's scenes are the one-pass flash's"
+);
+/// The split flash, off the rule, at the segment counts its rule gives the
+/// same keys: a tile a segment, two tiles a segment, the ticket's fold at the
+/// cap, and the deepest scene, whose 64 segments of five tiles leave the last
+/// twelve holding no key.
+const SPLIT_SCENES: [(u32, usize); 5] = [(100, 7), (512, 16), (1024, 32), (4096, 64), (4112, 64)];
 /// An f16 cache word no packed value of the planted rows uses as its check.
 const F16_HOLE: u16 = 0x0BAD;
 /// A q8_0 code word planted where no row was written.
@@ -246,6 +254,15 @@ fn scene_one(segments: usize, q8: bool) -> Scene {
         n_keys: 64,
         prefill: 63,
         q8,
+    }
+}
+
+/// The split flash off the rule: `segments` segments of `n_keys` live keys,
+/// the append at the last live row.
+fn scene_split(n_keys: u32, segments: usize, q8: bool) -> Scene {
+    Scene {
+        segments,
+        ..scene_keys(n_keys, q8)
     }
 }
 
@@ -932,48 +949,49 @@ fn noted_band(tables: &Tables, worst: f64, what: &str) -> Verdict {
 }
 
 /// f16 attention and the appended row match the oracle at the rule's key
-/// counts: the one-segment waterline, its counted splits, the ticket's fold
-/// past the first segment, and the four-segment scene the split rule leaves.
+/// counts (the one-pass flash), at the split's own counts off the rule (the
+/// tiles and the ticket's fold), and in the four-segment scene the split rule
+/// leaves.
 pub fn attn_f16(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables_for(&h.geom().attn, fixture)?;
-    let mut worst = 0.0f64;
-    let mut note = String::new();
-    for &n_keys in &SCENE_KEYS {
-        let checked = run(h, &tables, &scene_keys(n_keys, false))?;
-        worst = wider(worst, checked.worst);
-        note.push_str(&format!(
-            " keys={n_keys}/S={} by the rule",
-            segments_for_keys(n_keys)
-        ));
-    }
-    let four = run(h, &tables, &scene_one(4, false))?;
-    Ok(noted_band(
-        &tables,
-        wider(worst, four.worst),
-        &format!("f16{note} and S=4 off the rule"),
-    ))
+    let (worst, note) = key_scenes(h, &tables, false)?;
+    Ok(noted_band(&tables, worst, &format!("f16{note}")))
 }
 
 /// The appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention
 /// over it is inside the band, at the same key counts.
 pub fn attn_q8(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables_for(&h.geom().attn, fixture)?;
+    let (worst, note) = key_scenes(h, &tables, true)?;
+    Ok(noted_band(
+        &tables,
+        worst,
+        &format!("q8_0{note}, append gguf::quant::quantize_q8_0"),
+    ))
+}
+
+/// Every key-count scene of the f16 or the q8_0 cache: the rule's, the split
+/// at the segment counts [`SPLIT_SCENES`] names, and four segments of 64 keys.
+/// The worst ratio and the scenes' note.
+fn key_scenes(h: &Harness<'_>, tables: &Tables, q8: bool) -> Result<(f64, String), String> {
     let mut worst = 0.0f64;
     let mut note = String::new();
     for &n_keys in &SCENE_KEYS {
-        let checked = run(h, &tables, &scene_keys(n_keys, true))?;
+        let checked = run(h, tables, &scene_keys(n_keys, q8))?;
         worst = wider(worst, checked.worst);
         note.push_str(&format!(
             " keys={n_keys}/S={} by the rule",
             segments_for_keys(n_keys)
         ));
     }
-    let four = run(h, &tables, &scene_one(4, true))?;
-    Ok(noted_band(
-        &tables,
-        wider(worst, four.worst),
-        &format!("q8_0{note} and S=4 off the rule, append gguf::quant::quantize_q8_0"),
-    ))
+    for (n_keys, segments) in SPLIT_SCENES {
+        let checked = run(h, tables, &scene_split(n_keys, segments, q8))?;
+        worst = wider(worst, checked.worst);
+        note.push_str(&format!(" keys={n_keys}/S={segments}"));
+    }
+    let four = run(h, tables, &scene_one(4, q8))?;
+    note.push_str(" keys=64/S=4 off the rule");
+    Ok((wider(worst, four.worst), note))
 }
 
 /// The hardware half conversion matches `half_to_f32` on every pattern.
@@ -1297,7 +1315,8 @@ fn bad_arg<'a>(
 }
 
 /// A head dim, head count or window the kernel does not take is refused by name.
-/// The same clause then runs one segment, so a span that drops keys is red.
+/// The same clause then runs one segment, the one-pass flash, so a key it
+/// drops is red.
 pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let attn = h.geom().attn;
     let tables = load_tables_for(&attn, fixture)?;

@@ -188,6 +188,14 @@ impl Case {
         }
     }
 
+    /// The scene launched in `segments` segments, off the rule: the split
+    /// flash and its fold at a key count the one-pass flash takes.
+    fn split(mut self, segments: usize) -> Self {
+        self.segments = segments;
+        self.label.push_str(&format!(" segments {segments}"));
+        self
+    }
+
     /// The first key the first row of the chunk attends.
     fn first_key(&self) -> usize {
         self.window.map_or(0, |w| {
@@ -783,14 +791,9 @@ pub fn attn_window(h: &Harness<'_>) -> Clause {
         Case::decode(300, Some(64)),
         Case::decode(1025, Some(1)),
     ];
-    // Segments counted by the unwindowed rule: the ones past the window's
-    // keys are empty.
-    let mut off_rule = Case::decode(1025, Some(256));
-    off_rule.segments = segments_for_window(1025, None) as usize;
-    off_rule
-        .label
-        .push_str(&format!(" segments {}", off_rule.segments));
-    cases.push(off_rule);
+    // The split's count of 1025 unwindowed keys: the segments past the
+    // window's keys are empty.
+    cases.push(Case::decode(1025, Some(256)).split(33));
     let mut q8 = Case::decode(1025, Some(256));
     q8.q8 = true;
     q8.label.push_str(" q8_0");
@@ -818,31 +821,41 @@ pub fn attn_window(h: &Harness<'_>) -> Clause {
 }
 
 /// The chunks of the rows launch with a window: the window past the first
-/// rows' positions, a chunk that crosses it, a deep chunk, a narrow window,
-/// and no window. Every row is within the band of the oracle and is the bits
-/// of the decode launch at its position with the same segment count.
+/// rows' positions, a chunk that crosses it (also split, off the rule), a deep
+/// chunk, a narrow window, and no window. Every row is within the band of the
+/// oracle and is the bits of the decode launch at its position with the same
+/// segment count.
 pub fn attn_window_rows(h: &Harness<'_>) -> Clause {
     let attn = &h.geom().attn;
     let tables = Tables::plain(attn)?;
     let chunks = [
-        (0usize, 9usize, Some(256u32)),
-        (250, 20, Some(256)),
-        (300, 17, Some(100)),
-        (1000, 33, Some(256)),
-        (300, 9, None),
+        (0usize, 9usize, Some(256u32), None),
+        (250, 20, Some(256), None),
+        (250, 20, Some(256), Some(8usize)),
+        (300, 17, Some(100), None),
+        (1000, 33, Some(256), None),
+        (300, 9, None, None),
     ];
     let mut worst = 0.0f64;
     let mut parts = Vec::new();
-    for (from, rows, window) in chunks {
-        let rows_case = Case::rows(Path::Rows, from, rows, window);
+    for (from, rows, window, split) in chunks {
+        let at = |path| {
+            let case = Case::rows(path, from, rows, window);
+            match split {
+                Some(segments) => case.split(segments),
+                None => case,
+            }
+        };
+        let rows_case = at(Path::Rows);
         let (a, w) = run(h, &tables, &rows_case)?;
         worst = worst.max(w);
-        let stepped = Case::rows(Path::Stepped, from, rows, window);
+        let stepped = at(Path::Stepped);
         let (b, _) = run(h, &tables, &stepped)?;
         same_bits(&rows_case.label, &a.out, &b.out)?;
         parts.push(format!(
-            "{rows}@{from}/{}",
-            window.map_or("full".to_string(), |w| w.to_string())
+            "{rows}@{from}/{}{}",
+            window.map_or("full".to_string(), |w| w.to_string()),
+            split.map_or(String::new(), |s| format!(" S={s}"))
         ));
     }
     noted("rows@first position/window", &parts, worst)
@@ -877,9 +890,9 @@ pub fn attn_window_prefill(h: &Harness<'_>) -> Clause {
 }
 
 /// The per-head gate multiplies every value of a head by the sigmoid of that
-/// head's own raw value, on every path: one segment's epilogue, the fold, the
-/// rows launch with a fold, the prefill launch. The gate values differ head to
-/// head and row to row. The instances with no per-head gate are the other
+/// head's own raw value, on every path: the one-pass flash (one segment), the
+/// split's fold, the rows launch of one segment and with a fold, the prefill
+/// launch. The gate values differ head to head and row to row. The instances with no per-head gate are the other
 /// rows' attention clauses, with the launch's gate window refused by name
 /// (`attn_layer_refusals`).
 pub fn attn_head_gate(h: &Harness<'_>) -> Clause {
@@ -894,7 +907,9 @@ pub fn attn_head_gate(h: &Harness<'_>) -> Clause {
         Case::decode(20, None),
         Case::decode(64, None),
         Case::decode(300, None),
+        Case::decode(300, None).split(10),
         Case::rows(Path::Rows, 200, 9, None),
+        Case::rows(Path::Rows, 200, 9, None).split(7),
         Case::rows(Path::Prefill, 37, 9, None),
         Case::rows(Path::Prefill, 300, 9, Some(256)),
     ];

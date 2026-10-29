@@ -55,7 +55,7 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
 
 /// The mutants of the clauses the Qwen3-30B-A3B row runs, less
 /// those whose text its preprocessor removes or whose edit is the same
-/// program there: the gated epilogues (`attn_gate_s1`, `attn_gate_merge`),
+/// program there: the gated epilogues (`attn_gate_s1`, `attn_gate_s1_q8`, `attn_gate_merge`),
 /// the shared slot (`pair_shared_stack`), the shared group of the grouped GEMM
 /// (`routed_shared_base`, `routed_shared_group_refused`), the picks' stride (`route_rows_per_row`), the
 /// logits' stride (`route_rows_stride`: the row's logits are dense, the stride
@@ -89,10 +89,16 @@ pub const Q30_KEPT: &[&str] = &[
     "attn_s1_partials",
     "attn_half",
     "attn_bounds",
+    "attn_span_tile",
     "attn_tile_dead_unmasked",
     "attn_prefetch_stale",
     "attn_fold_stage_l",
     "attn_fold_empty_unskipped",
+    "attn_one_dead_unmasked",
+    "attn_one_chunk_rescale",
+    "attn_one_merge_unscaled",
+    "attn_one_store_owner",
+    "attn_one_local_key_swap",
     "rows_rope_relative",
     "rows_causal_plus1",
     "rows_norm_shared",
@@ -235,8 +241,8 @@ pub const Q30_MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_gate_ungated",
-        clause: "attn_f16",
-        why: "a query with no gate still multiplies the attention by the sigmoid of the value past its head",
+        clause: "attn_q8",
+        why: "a query with no gate still multiplies the q8_0 cache's one-segment attention by the sigmoid of the value past its head",
         edits: &[
             (
                 "#if BLOOMERY_ATTN_GATED\n            float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim0 + d];",
@@ -246,6 +252,23 @@ pub const Q30_MUTANTS: &[Mutant] = &[
             (
                 "#if ATTN_GATE\n            float gated = attn * attn_sigmoid(g);",
                 "#if 1\n            float gated = attn * attn_sigmoid(g);",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "attn_one_gate_ungated",
+        clause: "attn_f16",
+        why: "a query with no gate still multiplies the one-pass flash's attention by the sigmoid of the value past its head",
+        edits: &[
+            (
+                "#if BLOOMERY_ATTN_GATED\n    float g = gate_src[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + tid];",
+                "#if 1\n    float g = gate_src[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + tid];",
+                1,
+            ),
+            (
+                "#if ATTN_GATE\n    attn_commit(out, o, attn, g, attn * attn_sigmoid(g), faults, args.layer);",
+                "#if 1\n    attn_commit(out, o, attn, g, attn * attn_sigmoid(g), faults, args.layer);",
                 1,
             ),
         ],
@@ -291,12 +314,19 @@ pub const ATTN_KEPT: &[&str] = &[
     "attn_s1_partials",
     "attn_half",
     "attn_bounds",
+    "attn_span_tile",
     "attn_gate_s1",
+    "attn_gate_s1_q8",
     "attn_gate_merge",
     "attn_tile_dead_unmasked",
     "attn_prefetch_stale",
     "attn_fold_stage_l",
     "attn_fold_empty_unskipped",
+    "attn_one_dead_unmasked",
+    "attn_one_chunk_rescale",
+    "attn_one_merge_unscaled",
+    "attn_one_store_owner",
+    "attn_one_local_key_swap",
     "rows_rope_relative",
     "rows_causal_plus1",
     "prefill_causal_plus1",
@@ -319,6 +349,16 @@ pub const GQA_MUTANTS: &[Mutant] = &[
             "uint head = kv * BLOOMERY_ATTN_GQA + sg * BLOOMERY_ATTN_HPT;",
             "uint head = kv * 8u + sg * BLOOMERY_ATTN_HPT;",
             2,
+        )],
+    },
+    Mutant {
+        name: "attn_one_gqa_read_as_8",
+        clause: "attn_f16",
+        why: "the one-pass flash's query head reads key head head / 8, whatever the group",
+        edits: &[(
+            "uint kv = head / BLOOMERY_ATTN_GQA;",
+            "uint kv = head / 8u;",
+            1,
         )],
     },
     Mutant {
@@ -406,6 +446,16 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "window_one_gqa_read_as_8",
+        clause: "attn_window",
+        why: "the one-pass flash's query head reads key head head / 8, whatever the group: at group 4 a head attends another key head's window and the last two key heads' rows are never stored",
+        edits: &[(
+            "uint kv = head / BLOOMERY_ATTN_GQA;",
+            "uint kv = head / 8u;",
+            1,
+        )],
+    },
+    Mutant {
         name: "window_append_owner",
         clause: "attn_window",
         why: "the segment that appends the position's row is the one the unwindowed split gives it: a position past the window edge is stored by a segment that does not own it, or by none",
@@ -441,6 +491,7 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         why: "the gate is read per channel, as the packed gate is, from a buffer that holds one value a head",
         edits: &[
             ("float g = q[head];", "float g = q[dim0 + d];", 1),
+            ("float g = gate_src[head];", "float g = gate_src[tid];", 1),
             ("float gate = q[head];", "float gate = q[dim];", 1),
             (
                 "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
@@ -455,6 +506,11 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         why: "head h is gated by head h + 1's value",
         edits: &[
             ("float g = q[head];", "float g = q[head + 1u];", 1),
+            (
+                "float g = gate_src[head];",
+                "float g = gate_src[head + 1u];",
+                1,
+            ),
             ("float gate = q[head];", "float gate = q[head + 1u];", 1),
             (
                 "float g = hgate[(ulong)row * BLOOMERY_ATTN_Q + head];",
@@ -466,10 +522,10 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "head_gate_no_sigmoid_s1",
         clause: "attn_head_gate",
-        why: "a segment that stores the attention alone stores the raw gate's product with no sigmoid",
+        why: "the one-pass flash (one segment of the f16 cache) stores the raw gate's product with no sigmoid",
         edits: &[(
-            "float gated = attn * attn_sigmoid(g);",
-            "float gated = attn * g;",
+            "attn_commit(out, o, attn, g, attn * attn_sigmoid(g), faults, args.layer);",
+            "attn_commit(out, o, attn, g, attn * g, faults, args.layer);",
             1,
         )],
     },
@@ -500,6 +556,16 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         edits: &[(
             "ATTN_HGATE_ACTUAL(row) partials + row * partials_stride,",
             "ATTN_HGATE_ACTUAL(0u) partials + row * partials_stride,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_gate_one_rows_row0",
+        clause: "attn_head_gate",
+        why: "every row of the one-pass rows launch is gated by the first row's values",
+        edits: &[(
+            "device float const *gate_src = hgate + (ulong)row * BLOOMERY_ATTN_Q;",
+            "device float const *gate_src = hgate;",
             1,
         )],
     },
@@ -1227,11 +1293,11 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_score_scale",
         clause: "attn_f16",
-        why: "the score is twice the scaled dot",
+        why: "the score is twice the scaled dot, in the segmented and the one-pass flash",
         edits: &[(
             "float score = dot * args.scale;",
             "float score = dot * args.scale * 2.0f;",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1253,7 +1319,17 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_gate_s1",
         clause: "attn_f16",
-        why: "one segment stores the attention without the gate",
+        why: "the one-pass flash (one segment of the f16 cache) stores the attention without the gate",
+        edits: &[(
+            "attn_commit(out, o, attn, g, attn * attn_sigmoid(g), faults, args.layer);",
+            "attn_commit(out, o, attn, g, attn, faults, args.layer);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_gate_s1_q8",
+        clause: "attn_q8",
+        why: "one segment of the q8_0 cache stores the attention without the gate",
         edits: &[(
             "float gated = attn * attn_sigmoid(g);",
             "float gated = attn;",
@@ -1292,8 +1368,8 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_s1_partials",
-        clause: "attn_f16",
-        why: "one segment writes partials and leaves the output untouched",
+        clause: "attn_q8",
+        why: "one segment of the q8_0 cache writes partials and leaves the output untouched",
         edits: &[("if (args.segments == 1u)", "if (args.segments == 0u)", 1)],
     },
     Mutant {
@@ -1309,7 +1385,17 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_bounds",
         clause: "attn_bounds",
-        why: "every segment spans one tile, so a longer key count is only partly attended",
+        why: "the one-pass flash's chunk reads neighbouring keys, not keys a round of SIMD groups apart, so one segment's keys are partly attended",
+        edits: &[(
+            "uint j = base + c * BLOOMERY_ATTN_ONE_SG;",
+            "uint j = base + c;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_span_tile",
+        clause: "attn_f16",
+        why: "every segment of the split spans one tile, so a longer key count is only partly attended",
         edits: &[(
             "return per < BLOOMERY_ATTN_TILE ? BLOOMERY_ATTN_TILE : per;",
             "return BLOOMERY_ATTN_TILE;",
@@ -2340,6 +2426,55 @@ pub const MUTANTS: &[Mutant] = &[
             "                continue;",
             1,
         )],
+    },
+    Mutant {
+        name: "attn_one_dead_unmasked",
+        clause: "attn_f16",
+        why: "a chunk slot past the live keys in the one-pass flash scores its zero row as 0 and weighs in",
+        edits: &[
+            (
+                "s[c] = base + c * BLOOMERY_ATTN_ONE_SG < max_live ? score : -INFINITY;",
+                "s[c] = score;",
+                1,
+            ),
+            (
+                "float weight = base + c * BLOOMERY_ATTN_ONE_SG < max_live ? exp(s[c] - new_m) : 0.0f;",
+                "float weight = exp(s[c] - new_m);",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "attn_one_chunk_rescale",
+        clause: "attn_f16",
+        why: "a SIMD group of the one-pass flash never rescales its sums when a later chunk raises its maximum",
+        edits: &[(
+            "float factor = m > -INFINITY ? exp(m - new_m) : 0.0f;",
+            "float factor = 1.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_one_merge_unscaled",
+        clause: "attn_f16",
+        why: "the one-pass merge adds each SIMD group's sums at its own maximum, not rescaled to the largest",
+        edits: &[("float f = exp(pm[g] - big);", "float f = 1.0f;", 1)],
+    },
+    Mutant {
+        name: "attn_one_store_owner",
+        clause: "attn_f16",
+        why: "only the first query head of the first key head stores the appended rows: the other key heads' rows are never written",
+        edits: &[(
+            "bool stores = local && head % BLOOMERY_ATTN_GQA == 0u;",
+            "bool stores = local && head == 0u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_one_local_key_swap",
+        clause: "attn_f16",
+        why: "the one-pass flash scores this position's key against the value's halves it holds in threadgroup memory",
+        edits: &[("a = kp[lane];", "a = vp[lane];", 1)],
     },
 ];
 

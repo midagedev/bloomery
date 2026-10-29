@@ -1,10 +1,11 @@
 //! `p_profile`: the profile step (`Session::step_profile`) held to the step
 //! it instruments, on the fixture.
 //!
-//! The clause opens its own session — rows past one segment of keys, the
-//! other clauses' session holds one segment — and walks it over the same
-//! ids host-fed and profiled, on both sides of the segment boundary (the
-//! merge's group appears only past one segment):
+//! The clause opens its own session — rows past `SEGMENT_KEYS`, the other
+//! clauses' session holds that many — and walks it over the same ids
+//! host-fed and profiled, on both sides of that row. Both sides run the
+//! one-pass flash (one segment up to `ONE_PASS_KEYS`); the split path and its
+//! merge are held by the kernel gate's forced-split cases:
 //!
 //! - every pick and the last logits equal bit for bit, and every profiled
 //!   step's groups, dispatches and barriers are the plain step's own count,

@@ -48,9 +48,9 @@ mod shortconv_geom;
 pub use attention::AttentionPrefillParams;
 pub use attention::AttentionRowsParams;
 pub use attention::{
-    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE,
-    SEGMENT_CAP, SEGMENT_KEYS, TILE, f16_len, out_len, partials_len, q8_code_len, q8_scale_len,
-    qg_len, segments_for_keys,
+    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, ONE_PASS_KEYS, QG_STRIDE, QUERY_HEADS, ROT,
+    SCALE, SEGMENT_CAP, SEGMENT_KEYS, TILE, f16_len, out_len, partials_len, q8_code_len,
+    q8_scale_len, qg_len, segments_for_keys,
 };
 pub use attention::{AttnLayer, segments_for_window};
 pub use delta::DeltaParams;

@@ -47,6 +47,18 @@
 //! `θ = G(n_keys + n_rescale) + n_rescale * η`. Dimension `d` of the attention
 //! is held to `B = (rel + θ) * sum_j w_j |v_jd|`, `w` the f64 softmax weight.
 //!
+//! PIN(2026-10-29): the one-pass flash (the f16 cache's one segment) sums in
+//! another order, and the one-segment band holds it unchanged. Its score is
+//! the segmented flash's: the same lane fmas, SIMD sum and scale. Its `n`
+//! keys are strided over 16 SIMD groups, so a group adds at most
+//! `ceil(n / 16)` weights and rescales once a round of `16 * 4` keys, and the
+//! merge adds the live groups' sums by fma, at most `min(n, 16)` of them, each
+//! times one factor `exp(m_g - M)`. A product's path is then at most
+//! `ceil(n / 16) + ceil(n / 64) - 1 + min(n, 16) <= n + ceil(n / 16) + 1`
+//! roundings, and a weight meets at most `ceil(n / 64) <= ceil(n / 16) + 1`
+//! exps past its own: inside `G(n_keys + n_rescale)` and `n_rescale * η` at
+//! `segments = 1`.
+//!
 //! A layer with no gate stores `y = attn`, held to `B` plus the floor. A
 //! gated layer stores `y = attn * σ(g)`, `σ(g) = 1 / (1 + exp(-g))`.
 //! `|Δσ| ≤ η σ (1-σ) + 2 U σ`: the exp's relative slip through `dσ/de * e`

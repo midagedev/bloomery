@@ -36,7 +36,7 @@
 //!   steps run clean past the dropped token's position.
 //! - `b_chain`, `c_resume`: the run-ahead clauses (`chain.rs`).
 //! - `p_profile`: the profile step (`Session::step_profile`) against the
-//!   step it instruments, within one segment of keys and past it: the picks
+//!   step it instruments, within `SEGMENT_KEYS` keys and past it: the picks
 //!   and last logits equal bit for bit over the same ids, one sample a
 //!   group covering every group the count counts, and the groups' weight
 //!   bytes equal to the file's own tensors walked under the plan's names.
