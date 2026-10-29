@@ -1431,18 +1431,39 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the pick's unrolled run takes three of its four loads, so a winner in the \
               fourth is lost",
         edits: &[(
-            "FOR_UNROLL (short u = 0; u < 4; ++u) {\n            head_take(",
-            "FOR_UNROLL (short u = 0; u < 3; ++u) {\n            head_take(",
+            "FOR_UNROLL (short u = 0; u < 4; ++u) {\n            const uint row",
+            "FOR_UNROLL (short u = 0; u < 3; ++u) {\n            const uint row",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_quad_last",
+        clause: "head_id",
+        why: "the pick's unrolled run takes three logits of each quad, so a winner in a \
+              quad's last is lost",
+        edits: &[(
+            "FOR_UNROLL (short c = 0; c < 4; ++c) {\n                head_take(v[u][c]",
+            "FOR_UNROLL (short c = 0; c < 3; ++c) {\n                head_take(v[u][c]",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_quad_tail",
+        clause: "head_id",
+        why: "the pick's quad tail stops a quad short, so a winner in the last quad is lost",
+        edits: &[(
+            "for (; q < nq; q += HEAD_THREADS) {",
+            "for (; q + 1u < nq; q += HEAD_THREADS) {",
             1,
         )],
     },
     Mutant {
         name: "head_last_row",
         clause: "head_partial",
-        why: "the pick's tail loop stops one row short, so the last row's logit is never read",
+        why: "the pick's row tail stops one row short, so the last row's logit is never read",
         edits: &[(
-            "for (; row < args.rows; row += HEAD_THREADS) {",
-            "for (; row < args.rows - 1u; row += HEAD_THREADS) {",
+            "if (row < args.rows) {\n        head_take(logits[row]",
+            "if (row + 1u < args.rows) {\n        head_take(logits[row]",
             1,
         )],
     },

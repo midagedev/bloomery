@@ -32,8 +32,8 @@ const _: () = {
         i += 1;
     }
 };
-const _: () = assert!(HEAD_SIMD_GROUPS == 8);
-const _: () = assert!(HEAD_THREADS == 256);
+const _: () = assert!(HEAD_SIMD_GROUPS == 32);
+const _: () = assert!(HEAD_THREADS == 1_024);
 // The fixture's head is whole threadgroups of the logits dispatch.
 const _: () = assert!(OUTPUT_ROWS / ROWS_PER_GROUP * ROWS_PER_GROUP == OUTPUT_ROWS);
 
@@ -275,10 +275,11 @@ pub fn head_id(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = fixture.rms_eps()?;
     let wide = wide_margin(h, fixture, eps)?;
     let tie = bit_tie(h, fixture, eps)?;
+    let tail = quad_tail(h, fixture, eps)?;
     if let Some(f) = h.fault()? {
         return Err(format!("head-id raised {f}"));
     }
-    Ok(Verdict::Noted(format!("{wide}; {tie}")))
+    Ok(Verdict::Noted(format!("{wide}; {tie}; {tail}")))
 }
 
 /// A real output row whose logit, normed by itself at gain 1, is a wide positive
@@ -296,8 +297,9 @@ fn wide_row(hidden: usize, fixture: &Fixture, eps: f32) -> Result<(&[u8], f64, f
 }
 
 fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
-    /// The fourth load of a thread's unrolled run in the pick's first pass.
-    const WINNER: usize = 3 * HEAD_THREADS + 100;
+    /// The last logit of the fourth load of a thread's unrolled run in the
+    /// pick's first pass.
+    const WINNER: usize = 4 * (3 * HEAD_THREADS + 25) + 3;
     let hidden = h.geom().hidden;
     let bytes = row_bytes(hidden);
     let (row, y, width) = wide_row(hidden, fixture, eps)?;
@@ -332,35 +334,37 @@ fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, S
     Ok(format!("wide id {want}"))
 }
 
+/// A real output row's first Q6_K block whose logit, normed by itself at gain
+/// 1 over its 256 values, is a wide positive margin over a zero row.
+fn wide_block(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<Vec<u8>, String> {
+    let hidden = h.geom().hidden;
+    let bytes = row_bytes(hidden);
+    let block = block_bytes();
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, 64)?;
+    for row in pool.chunks_exact(bytes) {
+        let one = &row[..block];
+        let (y, width) = margin(one, 256, eps)?;
+        if y.is_finite() && y > 0.0 && y > width {
+            return Ok(one.to_vec());
+        }
+    }
+    Err("construction: no Q6_K block is a wide positive margin over a zero row".to_string())
+}
+
 fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
-    /// Past the pick's first unrolled run: four loads a thread, and a tail.
-    const ROWS: usize = 5 * HEAD_THREADS;
+    /// Past the pick's first unrolled run: four quads a thread, a quad tail and
+    /// a row tail.
+    const ROWS: usize = 20 * HEAD_THREADS + 2;
     const K: usize = 256;
     /// The tied rows: two threads' first rows, and each thread's own later row,
     /// so the tie is met inside a thread and between threads.
     const LOW: usize = 5;
     const HIGH: usize = 9;
-    const LOW_AGAIN: usize = LOW + HEAD_THREADS;
-    const HIGH_AGAIN: usize = HIGH + 2 * HEAD_THREADS;
+    const LOW_AGAIN: usize = LOW + 4 * HEAD_THREADS;
+    const HIGH_AGAIN: usize = HIGH + 8 * HEAD_THREADS;
     const TIED: [usize; 4] = [LOW, HIGH, LOW_AGAIN, HIGH_AGAIN];
-    let hidden = h.geom().hidden;
-    let bytes = row_bytes(hidden);
     let block = block_bytes();
-    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, 64)?;
-    let mut chosen: Option<Vec<u8>> = None;
-    for row in pool.chunks_exact(bytes) {
-        let one = &row[..block];
-        let (y, width) = margin(one, K, eps)?;
-        if y.is_finite() && y > 0.0 && y > width {
-            chosen = Some(one.to_vec());
-            break;
-        }
-    }
-    let Some(good) = chosen else {
-        return Err(
-            "construction: no Q6_K block is a wide positive margin over a zero row".to_string(),
-        );
-    };
+    let good = wide_block(h, fixture, eps)?;
     let mut weights = vec![0u8; ROWS * block];
     for row in TIED {
         weights[row * block..(row + 1) * block].copy_from_slice(&good);
@@ -412,6 +416,42 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
         ));
     }
     Ok(format!("tie id {low}"))
+}
+
+/// The winner planted in the pick's last quad, which the quad tail reaches on
+/// its second pass: four quads a thread in the unrolled run, one tail quad a
+/// thread, and one more for thread 0. A tail that stops a quad short, or takes
+/// one quad a thread, loses the winner.
+fn quad_tail(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
+    const ROWS: usize = 20 * HEAD_THREADS + 4;
+    const K: usize = 256;
+    const WINNER: usize = ROWS - 1;
+    let block = block_bytes();
+    let good = wide_block(h, fixture, eps)?;
+    let mut weights = vec![0u8; ROWS * block];
+    weights[WINNER * block..(WINNER + 1) * block].copy_from_slice(&good);
+    let x = dequant(&good, K)?;
+    let gain = vec![1f32; K];
+    let out = run(
+        h,
+        HeadRun {
+            quant: Quant::Q6K,
+            weights: &weights,
+            x: &x,
+            gain: &gain,
+            rows: ROWS,
+            k: K,
+            eps,
+        },
+    )?;
+    let want = u32::try_from(WINNER).map_err(|_| "the winner index does not fit the step id")?;
+    if out.id != want {
+        return Err(format!(
+            "head-id quad tail: step id is {}, the planted row is {want}",
+            out.id
+        ));
+    }
+    Ok(format!("quad tail id {want}"))
 }
 
 /// The head over a row count no threadgroup divides, as a vocabulary of 248,144
@@ -734,6 +774,8 @@ struct Args {
     /// The element the gain's window starts at in its buffer.
     gain_at: usize,
     logits: usize,
+    /// The element the logits' window starts at in its buffer.
+    logits_at: usize,
     step_id: usize,
 }
 
@@ -751,6 +793,7 @@ impl Args {
             gain: k,
             gain_at: 0,
             logits: rows,
+            logits_at: 0,
             step_id: 1,
         }
     }
@@ -785,7 +828,9 @@ fn refuse(
                 gain: bufs.gain.window(Elems(a.gain_at), Elems(a.gain))?,
                 eps: a.eps,
             },
-            logits: bufs.logits.window_mut(Elems(0), Elems(a.logits))?,
+            logits: bufs
+                .logits
+                .window_mut(Elems(a.logits_at), Elems(a.logits))?,
             step_id: bufs.step_id.window_mut(Elems(0), Elems(a.step_id))?,
             fault: h.device.fault_word(),
             layer: LAYER,
@@ -817,9 +862,9 @@ fn bad<'a>(
 /// PIN(2026-10-29): the head has no candidates or ticket window, so the four
 /// refusal cases of those windows are gone with them.
 ///
-/// An input or gain window that does not start on 16 bytes is refused:
-/// deleting the `Float4` check of `x` or of `gain` in `head.rs`'s `check`
-/// turns its case red.
+/// An input, gain or logits window that does not start on 16 bytes is refused:
+/// deleting the `Float4` check of `x`, `gain` or `logits` in `head.rs`'s
+/// `check` turns its case red.
 pub fn head_bounds(h: &Harness<'_>) -> Clause {
     const K: usize = 256;
     const ROWS: usize = 16;
@@ -900,6 +945,11 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
             "a long logits window",
             "logits",
             Box::new(|a| a.logits = whole.logits + 1),
+        ),
+        case(
+            "a logits window one float into its buffer",
+            "16-byte aligned",
+            Box::new(|a| a.logits_at = 1),
         ),
         case(
             "an empty step id window",

@@ -29,11 +29,12 @@ use super::{
 /// the build's host instance's. Callers left: the kernel gate and the probes.
 pub const HEAD_K: usize = crate::instance::HOST.key.hidden as usize;
 
-/// The SIMD groups in the pick's threadgroup.
-pub const HEAD_SIMD_GROUPS: usize = 8;
+/// The SIMD groups in the pick's threadgroup: the most a threadgroup holds, so
+/// the one threadgroup keeps the most logit loads in flight.
+pub const HEAD_SIMD_GROUPS: usize = 32;
 
 /// The threads in the pick's threadgroup.
-pub const HEAD_THREADS: usize = 256;
+pub const HEAD_THREADS: usize = 1024;
 
 const _: () = assert!(HEAD_THREADS == 32 * HEAD_SIMD_GROUPS);
 
@@ -126,6 +127,13 @@ fn check(p: &HeadParams<'_>, rows_per_group: usize) -> Result<Shape, DeviceError
         WHAT,
         "x",
         p.x.byte_range()?.start.get(),
+        WeightAlign::Float4,
+    )?;
+    // The pick reads the logits as `float4`s.
+    check_weights_align(
+        WHAT,
+        "logits",
+        p.logits.byte_range()?.start.get(),
         WeightAlign::Float4,
     )?;
     if p.simdgroups != HEAD_SIMD_GROUPS {

@@ -141,8 +141,12 @@ static inline void head_take(float v, uint row, thread float &best_v, thread uin
     }
 }
 
-// One threadgroup over the `rows` logits. A thread keeps four loads in flight
-// at a time, and its rows still reach head_take in order.
+// One threadgroup over the `rows` logits. A thread reads four logits a load
+// (quad q is rows 4q to 4q + 3) and keeps four loads in flight; the rows past
+// the last whole quad are taken one a thread after the quads, so a thread's
+// rows still reach head_take in order. The launch checks that the logits
+// start on 16 bytes.
+[[max_total_threads_per_threadgroup(32u * HEAD_STAGE_MAX)]]
 kernel void logits_argmax(device const float *logits [[buffer(0)]],
                           device uint *step_id [[buffer(1)]],
                           device atomic_uint *faults [[buffer(2)]],
@@ -155,17 +159,29 @@ kernel void logits_argmax(device const float *logits [[buffer(0)]],
 
     float best_v = -INFINITY;
     uint best_i = 0u;
-    uint row = tid;
-    for (; row < args.rows && args.rows - row > 3u * HEAD_THREADS; row += 4u * HEAD_THREADS) {
-        float v[4];
+    device const float4 *quads = (device const float4 *)logits;
+    const uint nq = args.rows / 4u;
+    uint q = tid;
+    for (; q < nq && nq - q > 3u * HEAD_THREADS; q += 4u * HEAD_THREADS) {
+        float4 v[4];
         FOR_UNROLL (short u = 0; u < 4; ++u) {
-            v[u] = logits[row + (uint)u * HEAD_THREADS];
+            v[u] = quads[q + (uint)u * HEAD_THREADS];
         }
         FOR_UNROLL (short u = 0; u < 4; ++u) {
-            head_take(v[u], row + (uint)u * HEAD_THREADS, best_v, best_i, faults, args);
+            const uint row = 4u * (q + (uint)u * HEAD_THREADS);
+            FOR_UNROLL (short c = 0; c < 4; ++c) {
+                head_take(v[u][c], row + (uint)c, best_v, best_i, faults, args);
+            }
         }
     }
-    for (; row < args.rows; row += HEAD_THREADS) {
+    for (; q < nq; q += HEAD_THREADS) {
+        const float4 v = quads[q];
+        FOR_UNROLL (short c = 0; c < 4; ++c) {
+            head_take(v[c], 4u * q + (uint)c, best_v, best_i, faults, args);
+        }
+    }
+    const uint row = 4u * nq + tid;
+    if (row < args.rows) {
         head_take(logits[row], row, best_v, best_i, faults, args);
     }
 
