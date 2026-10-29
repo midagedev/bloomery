@@ -136,9 +136,7 @@ mod nv {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{
-        GateError, checks_failed, data_dir, kld, quantile, ref_model_path, verdict,
-    };
+    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, kld, quantile, verdict};
     use bloomery_levers::{CARD_BUDGET, CardBudget};
     use refset::arch::qwen35::dense::{NV_P64, NV_P4096, NV_PROFILE, NV_TWIN, NvForcedLogits};
     use std::collections::BTreeMap;
@@ -202,16 +200,14 @@ mod nv {
             )
             .into());
         };
-        let folder = ref_model_path()?;
-        println!("{GATE} (fixture tier): the cut {}", folder.display());
+        // A profile's cut is read only by the clauses that name it (tools/fixture-dirs.tsv): the folder is the table's
+        // cut of NV_PROFILE, not the model path the tier resolves by architecture (qwen35 has no fixture of its own).
         let first = refset::fixture::first_shard(NV_PROFILE)?;
-        if Path::new(&first).parent() != Some(folder.as_path()) {
-            return Err(format!(
-                "{GATE}: the model is {}, the fixture table's cut of {NV_PROFILE} is {first}'s folder",
-                folder.display()
-            )
-            .into());
-        }
+        let folder = Path::new(&first)
+            .parent()
+            .ok_or_else(|| format!("{GATE}: the cut's first shard {first} has no folder"))?
+            .to_path_buf();
+        println!("{GATE} (fixture tier): the cut {}", folder.display());
         println!("  {}", refset::fixture::line(Path::new(&first))?.trim_end());
         let twin = Path::new(NV_TWIN);
         if !twin.is_file() {
