@@ -1129,10 +1129,10 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "a4_routed_bias_sign",
         clause: "grouped_gemm",
-        why: "the A4 value the routed GEMM stages subtracts the bias, not adds it",
+        why: "the A4 values the routed GEMM stages (dequant16) subtract the bias, not add it",
         edits: &[(
-            "return scale_of(blk) * q + bias_of(blk);",
-            "return scale_of(blk) * q - bias_of(blk);",
+            "const float b = bias_of(blk);",
+            "const float b = -bias_of(blk);",
             1,
         )],
     },
@@ -2601,10 +2601,10 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "tensor_range_no_raise",
         clause: "tensor_gemm_range",
-        why: "an activation past the half range stages NaN but raises no quantizer site",
+        why: "an activation past the half range casts as NaN but raises no quantizer site",
         edits: &[(
-            "            if (any(bad)) {\n                raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);",
-            "            if (any(bad)) {",
+            "    if (any(bad)) {\n        raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);",
+            "    if (any(bad)) {",
             1,
         )],
     },
