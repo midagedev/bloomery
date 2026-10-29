@@ -150,8 +150,26 @@ fn tensor_scale_role(
     role_of(&weight).map(|(_, layer)| (Role::Unread, layer))
 }
 
+/// The role of an NVFP4 tensor's activation scale, `<stem>.input_scale` beside an NVFP4
+/// `<stem>.weight` (mainline's converter writes ModelOpt's): the load quantizes activations from
+/// their own blocks and never reads it, so it is unread, on the tensor's layer. `None` for any other
+/// name, and for one beside a tensor of another type or one `role_of` does not claim.
+fn input_scale_role(
+    split: &Split,
+    name: &str,
+    role_of: &impl Fn(&str) -> Option<(Role, Option<usize>)>,
+) -> Option<(Role, Option<usize>)> {
+    let weight = format!("{}.weight", name.strip_suffix(".input_scale")?);
+    let (_, t) = split.find(&weight)?;
+    if t.ty != gguf::GgmlType::NVFP4 {
+        return None;
+    }
+    role_of(&weight).map(|(_, layer)| (Role::Unread, layer))
+}
+
 /// Every tensor of `split` with the role `role_of` gives its name, or a
-/// format's tensor scale's beside its tensor ([`tensor_scale_role`]), refusing
+/// format's tensor scale's or an NVFP4 activation scale's beside its tensor
+/// ([`tensor_scale_role`], [`input_scale_role`]), refusing
 /// the file with every name no role claims listed ([`PlacementError::Unclassified`]
 /// — no catch-all role exists). The token embedding reads one gathered row; a
 /// family whose own tables gather rows (an engram or per-layer-embedding
@@ -164,8 +182,9 @@ pub(crate) fn classify_with(
     let mut tensors = Vec::with_capacity(split.tensor_count());
     let mut unclassified = Vec::new();
     for (shard, t) in split.iter_tensors() {
-        let Some((role, layer)) =
-            role_of(&t.name).or_else(|| tensor_scale_role(split, &t.name, &role_of))
+        let Some((role, layer)) = role_of(&t.name)
+            .or_else(|| tensor_scale_role(split, &t.name, &role_of))
+            .or_else(|| input_scale_role(split, &t.name, &role_of))
         else {
             unclassified.push(t.name.clone());
             continue;
@@ -475,9 +494,10 @@ mod tests {
 
     /// A format's tensor scale needs no row in a family's table: `<stem>.scale`
     /// beside an NVFP4 `<stem>.weight` the table claims is unread on that
-    /// tensor's layer. One beside a tensor of a type that reads none (an F32
-    /// token embedding) and one with no tensor beside it fail the file by
-    /// name. Mutants: no scale rule, or one that skips the type.
+    /// tensor's layer, and so is its `<stem>.input_scale`. One beside a tensor of a
+    /// type that reads none (an F32 token embedding) and one with no tensor
+    /// beside it fail the file by name. Mutants: no scale rule, no input-scale
+    /// rule, or one that skips the type.
     #[test]
     fn a_tensor_scale_takes_its_tensors_layer() {
         use crate::arch::synthetic::{Ty, header_typed};
@@ -487,6 +507,7 @@ mod tests {
                 ("token_embd.weight".to_string(), vec![1], Ty::F32),
                 ("blk.0.attn_q.weight".to_string(), vec![64, 1], Ty::Nvfp4),
                 ("blk.0.attn_q.scale".to_string(), vec![1], Ty::F32),
+                ("blk.0.attn_q.input_scale".to_string(), vec![1], Ty::F32),
             ];
             t.extend(extra.iter().map(|n| ((*n).to_string(), vec![1], Ty::F32)));
             t
@@ -505,6 +526,12 @@ mod tests {
             .find(|t| t.name == "blk.0.attn_q.scale")
             .map(|t| (t.role, t.layer));
         assert_eq!(scale, Some((Role::Unread, Some(0))));
+        let input = model
+            .tensors
+            .iter()
+            .find(|t| t.name == "blk.0.attn_q.input_scale")
+            .map(|t| (t.role, t.layer));
+        assert_eq!(input, Some((Role::Unread, Some(0))));
         let _ = std::fs::remove_file(&path);
 
         let path = header_typed(
@@ -512,14 +539,17 @@ mod tests {
             "qwen3moe",
             &[],
             &[],
-            &typed(&["token_embd.scale", "rope.scale"]),
+            &typed(&["token_embd.scale", "rope.scale", "token_embd.input_scale"]),
         );
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let err = classify_with(&split, role, counts).expect_err("two scales read by no tensor");
         let PlacementError::Unclassified { names } = err else {
             panic!("the refusal is Unclassified, got {err}");
         };
-        assert_eq!(names, ["token_embd.scale", "rope.scale"]);
+        assert_eq!(
+            names,
+            ["token_embd.scale", "rope.scale", "token_embd.input_scale"]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
