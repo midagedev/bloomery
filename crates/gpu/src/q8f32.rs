@@ -94,6 +94,7 @@ use crate::gemm::{
     bf16_mma_launch, f32_tile_body, tile_launch,
 };
 use crate::launch_u32;
+use crate::planes::{self, Format};
 use crate::tensor::DeviceTensor;
 use crate::upload::pack_planes;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -102,7 +103,7 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
-use gguf::quant::{GgmlType, check_fp8_b128, check_mxfp8};
+use gguf::quant::GgmlType;
 use std::sync::Arc;
 
 // --------------------------------------------------------------- cores
@@ -3974,48 +3975,11 @@ pub fn e4m3_planes(
             ),
         ));
     }
-    pack_planes(
-        what,
-        bytes,
-        (rows, row_bytes),
-        [k / 4, k / 128],
-        |first, src, qs, e| {
-            for (r, row) in src.chunks_exact(row_bytes).enumerate() {
-                let checked = match scales {
-                    E4m3Scales::Mxfp8 => check_mxfp8(row),
-                    E4m3Scales::Fp8B128 => check_fp8_b128(row),
-                };
-                checked.map_err(|why| format!("row {}: {why}", first + r))?;
-                for (g, group) in row.as_chunks::<132>().0.iter().enumerate() {
-                    let at = r * (k / 128) + g;
-                    let words = &mut qs[32 * at..][..32];
-                    match scales {
-                        E4m3Scales::Mxfp8 => {
-                            let mut word = 0u32;
-                            for (i, blk) in group.as_chunks::<33>().0.iter().enumerate() {
-                                word |= u32::from(blk[0]) << (8 * i);
-                                for (w, c) in words[8 * i..][..8]
-                                    .iter_mut()
-                                    .zip(blk[1..].as_chunks::<4>().0)
-                                {
-                                    *w = u32::from_le_bytes(*c);
-                                }
-                            }
-                            e[at] = word;
-                        }
-                        E4m3Scales::Fp8B128 => {
-                            let (scale, values) = group.split_at(4);
-                            e[at] = u32::from_le_bytes([scale[0], scale[1], scale[2], scale[3]]);
-                            for (w, c) in words.iter_mut().zip(values.as_chunks::<4>().0) {
-                                *w = u32::from_le_bytes(*c);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        },
-    )
+    let format = match scales {
+        E4m3Scales::Mxfp8 => Format::Mxfp8,
+        E4m3Scales::Fp8B128 => Format::Fp8B128,
+    };
+    planes::split_vecs(what, format, k / 128, rows, bytes)
 }
 
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_heads_mcol`]'s arguments. The strides

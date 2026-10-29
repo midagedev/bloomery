@@ -8,6 +8,7 @@
 //! reads.
 
 use crate::GpuError;
+use crate::planes::{self, Format};
 use crate::tensor::window;
 use cuda_core::{CudaStream, DeviceCopy, PinnedHostBuffer, sys};
 use std::mem::ManuallyDrop;
@@ -34,7 +35,7 @@ const SLOT_MAX: usize = 32 << 20;
 const SLOT_MIN: usize = 256 << 10;
 /// The least bytes a piece is worth the worker pool for; shorter pieces copy
 /// on the calling thread, the dispatch costing more than the copy.
-const TEAM_MIN: usize = 1 << 20;
+pub(crate) const TEAM_MIN: usize = 1 << 20;
 
 /// One staging slot: its pinned bytes and the event recorded after the copy
 /// that last read them.
@@ -154,6 +155,94 @@ impl UploadRing {
         Ok(())
     }
 
+    /// Split the first `take` bytes of `src`'s slices — whole rows of `row_recs`
+    /// records of `format`, a slice a run of rows — into two planes on the
+    /// device: the codes into the bytes at `codes.dst`, the scale bytes into
+    /// those at `heads.dst` ([`planes`]), a slot's worth of rows a piece. Each
+    /// piece's rows are split straight into the slot's two regions, so every
+    /// file byte is read once and written once, and one event follows the
+    /// piece's two copies. A row a check refuses, a slice that is not whole
+    /// rows and planes the rows overrun are refused by name, the stream
+    /// drained first when a piece is already enqueued.
+    pub(crate) fn copy_split(
+        &mut self,
+        stream: &CudaStream,
+        (codes, heads): (&Stage<'_>, &Stage<'_>),
+        (format, row_recs): (Format, usize),
+        src: &[&[u8]],
+        take: usize,
+    ) -> Result<(), GpuError> {
+        let (what, name) = (codes.what, codes.name);
+        let shape = |detail: String| GpuError::shape(what, format!("tensor {name}: {detail}"));
+        let row = row_recs
+            .checked_mul(format.record_bytes())
+            .filter(|&r| r > 0)
+            .ok_or_else(|| shape(format!("a {format:?} row of {row_recs} records")))?;
+        let (code_row, head_row) = (
+            row_recs * format.code_bytes(),
+            row_recs * format.head_bytes(),
+        );
+        let held: usize = src.iter().map(|s| s.len()).sum();
+        if held < take || !take.is_multiple_of(row) {
+            return Err(shape(format!(
+                "{held} bytes held, {take} taken, are not whole rows of {row} bytes"
+            )));
+        }
+        let rows = take / row;
+        if rows * code_row > codes.dst_bytes || rows * head_row > heads.dst_bytes {
+            let detail = format!(
+                "{rows} rows split into {} and {} plane bytes",
+                rows * code_row,
+                rows * head_row
+            );
+            return Err(shape(detail));
+        }
+        let Some(slot_bytes) = self.slots.first().map(|s| s.host.len()) else {
+            return if take == 0 {
+                Ok(())
+            } else {
+                Err(shape(format!("the ring holds no slots for {take} bytes")))
+            };
+        };
+        let per_piece = planes::piece_rows(format, row_recs, slot_bytes).ok_or_else(|| {
+            shape(format!(
+                "a row of {row} bytes does not fit a {slot_bytes}-byte slot"
+            ))
+        })?;
+        let mut first = 0usize;
+        let mut left = take;
+        for slice in src {
+            if left == 0 {
+                break;
+            }
+            let mut run = &slice[..slice.len().min(left)];
+            if !run.len().is_multiple_of(row) {
+                let detail = format!("a span of {} bytes is not whole rows of {row}", run.len());
+                return Err(shape(detail));
+            }
+            while !run.is_empty() {
+                let n = (run.len() / row).min(per_piece);
+                let (piece, rest) = run.split_at(n * row);
+                let at = |plane: &Stage<'_>, per: usize| {
+                    u64::try_from(first * per)
+                        .map(|off| plane.dst + off)
+                        .map_err(|_| shape(format!("row {first} passes u64")))
+                };
+                self.push_split(
+                    stream,
+                    (at(codes, code_row)?, at(heads, head_row)?),
+                    (format, row_recs, first),
+                    piece,
+                    (what, name),
+                )?;
+                first += n;
+                left -= piece.len();
+                run = rest;
+            }
+        }
+        Ok(())
+    }
+
     /// Wait for every copy this ring enqueued: the load's one synchronize,
     /// which the caller owes before anything it staged is read or released.
     pub(crate) fn finish(&self, stream: &CudaStream) -> Result<(), GpuError> {
@@ -179,27 +268,7 @@ impl UploadRing {
         })?;
         let staging = &mut slot.host.as_mut_slice()[..piece.len()];
         memcpy_pool(staging, piece);
-        // SAFETY: the window is the `piece.len()` bytes at `at` of the
-        // caller's allocation at `dst`, inside the `dst_bytes` copy_bytes
-        // checked; the allocation is a cuMemAlloc one that outlives this
-        // window, which is released below and frees nothing.
-        let mut window = unsafe { window::<u8>(at, piece.len(), stream.context()) };
-        // SAFETY: `staging` is pinned memory this ring owns and nothing
-        // rewrites before `done` — recorded right below, after the copy —
-        // has passed: the next use of this slot waits it, and the ring's
-        // drop waits every slot's. The copy is enqueued, not run, here.
-        let enqueue = unsafe { window.copy_from_host_async_unchecked(stream, staging) };
-        drop(ManuallyDrop::into_inner(window).into_raw_parts());
-        if let Err(source) = enqueue {
-            // A piece before this one may still be copying into the caller's
-            // buffer, which this error is about to drop: drain first, so
-            // nothing is freed under a running copy.
-            let _ = stream.synchronize();
-            return Err(GpuError::Driver {
-                op: Some("the staged copy of an upload piece"),
-                source,
-            });
-        }
+        enqueue_from_slot(stream, at, staging)?;
         if let Err(source) = slot.done.record(stream) {
             // The copy above sits enqueued without its event: nothing may
             // free the slot before it completes, so the stream is drained
@@ -212,6 +281,81 @@ impl UploadRing {
         }
         Ok(())
     }
+
+    /// One split piece: wait the next slot's earlier copy out, split `piece`'s
+    /// rows into its two regions ([`planes::fill_piece`], rows from `first` of the
+    /// tensor), enqueue the two device copies and record the slot's event after
+    /// them.
+    fn push_split(
+        &mut self,
+        stream: &CudaStream,
+        (codes_at, heads_at): (sys::CUdeviceptr, sys::CUdeviceptr),
+        (format, row_recs, first): (Format, usize, usize),
+        piece: &[u8],
+        (what, name): (&'static str, &str),
+    ) -> Result<(), GpuError> {
+        let i = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &mut self.slots[i];
+        slot.done.synchronize().map_err(|source| GpuError::Driver {
+            op: Some("cuEventSynchronize (an upload slot)"),
+            source,
+        })?;
+        let rows = piece.len() / (row_recs * format.record_bytes());
+        let (code_len, head_len) = (
+            rows * row_recs * format.code_bytes(),
+            rows * row_recs * format.head_bytes(),
+        );
+        let staging = &mut slot.host.as_mut_slice()[..code_len + head_len];
+        if let Err(detail) = planes::fill_piece(format, row_recs, first, piece, staging) {
+            // A piece before this one may still be copying into the caller's
+            // buffers, which this error is about to drop.
+            let _ = stream.synchronize();
+            return Err(GpuError::shape(what, format!("tensor {name}: {detail}")));
+        }
+        let (codes, heads) = staging.split_at(code_len);
+        for (at, bytes) in [(codes_at, codes), (heads_at, heads)] {
+            enqueue_from_slot(stream, at, bytes)?;
+        }
+        if let Err(source) = slot.done.record(stream) {
+            let _ = stream.synchronize();
+            return Err(GpuError::Driver {
+                op: Some("the upload event of a staged piece"),
+                source,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Enqueue the copy of `staging`, bytes of a ring slot, to the `staging.len()`
+/// bytes at `at` of a caller's allocation, which the caller sized to hold them.
+/// A refusal drains the stream first: a piece before this one may still be
+/// copying into the buffer the error is about to drop.
+fn enqueue_from_slot(
+    stream: &CudaStream,
+    at: sys::CUdeviceptr,
+    staging: &[u8],
+) -> Result<(), GpuError> {
+    // SAFETY: the window is the `staging.len()` bytes at `at` of the caller's
+    // allocation, inside the size its `Stage` states; the allocation is a
+    // cuMemAlloc one that outlives this window, which is released below and
+    // frees nothing.
+    let mut window = unsafe { window::<u8>(at, staging.len(), stream.context()) };
+    // SAFETY: `staging` is pinned memory a ring slot owns and nothing rewrites
+    // before the slot's event — recorded by the caller after this copy — has
+    // passed: the next use of the slot waits it, and the ring's drop waits
+    // every slot's. The copy is enqueued, not run, here.
+    let enqueue = unsafe { window.copy_from_host_async_unchecked(stream, staging) };
+    drop(ManuallyDrop::into_inner(window).into_raw_parts());
+    if let Err(source) = enqueue {
+        let _ = stream.synchronize();
+        return Err(GpuError::Driver {
+            op: Some("the staged copy of an upload piece"),
+            source,
+        });
+    }
+    Ok(())
 }
 
 impl Drop for UploadRing {

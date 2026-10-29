@@ -76,6 +76,7 @@ pub mod mtp;
 pub mod mxfp4;
 pub mod mxfp4_sel;
 pub mod parts;
+pub mod planes;
 pub mod ple;
 pub mod probe;
 pub mod prompt_timing;
@@ -2938,10 +2939,20 @@ impl Gpu {
         name: &str,
         device: Option<::model::placement::workstation::DeviceId>,
     ) -> Result<Gpu, GpuError> {
+        Gpu::with_device(Gpu::resolve_card(name, device)?)
+    }
+
+    /// The ordinal of the visible device a plan's card is, with every refusal
+    /// of [`Gpu::open_card`] that names a card and none of its context or
+    /// module load: what a load checks before it starts work beside the open.
+    pub(crate) fn resolve_card(
+        name: &str,
+        device: Option<::model::placement::workstation::DeviceId>,
+    ) -> Result<usize, GpuError> {
         let seen = census()?;
         let ordinal = ::model::placement::workstation::device_on_host(name, device, &seen)
             .map_err(|e| GpuError::plan("Gpu::open_card", e))?;
-        Gpu::with_device(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
+        Ok(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
     }
 
     /// [`Gpu::open_card`] for a load whose plan printed its `need` record:

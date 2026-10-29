@@ -71,8 +71,8 @@
 
 use crate::cores::{table16, table16_word};
 use crate::kquant::q8_0::q8_0_code;
+use crate::planes::{self, Format};
 use crate::tensor::Q8Act;
-use crate::upload::pack_planes;
 use crate::{DeviceTensor, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::dotprod::dp4a_s32;
@@ -188,6 +188,8 @@ pub trait Fp4 {
     const NAME: &'static str;
     /// The `what` of the repack's refusals.
     const REPACK: &'static str;
+    /// The file record the planes are split from ([`planes`]).
+    const PLANES: Format;
     /// Values per file block.
     const BLOCK_VALUES: usize;
     /// File bytes per block: the scale bytes, then the code bytes.
@@ -230,6 +232,7 @@ pub struct Mxfp4;
 impl Fp4 for Mxfp4 {
     const NAME: &'static str = "MXFP4";
     const REPACK: &'static str = "mxfp4::repack";
+    const PLANES: Format = Format::Mxfp4;
     const BLOCK_VALUES: usize = BLOCK_VALUES;
     const BLOCK_BYTES: usize = BLOCK_BYTES;
     const SCALE_BYTES: usize = 1;
@@ -279,6 +282,7 @@ pub struct Nvfp4;
 impl Fp4 for Nvfp4 {
     const NAME: &'static str = "NVFP4";
     const REPACK: &'static str = "nvfp4::repack";
+    const PLANES: Format = Format::Nvfp4;
     const BLOCK_VALUES: usize = NV_BLOCK_VALUES;
     const BLOCK_BYTES: usize = NV_BLOCK_BYTES;
     const SCALE_BYTES: usize = 4;
@@ -616,43 +620,7 @@ pub fn repack<F: Fp4>(bytes: &[u8], rows: usize, k: usize) -> Result<Planes, Gpu
             ),
         ));
     }
-    let code_words = (F::BLOCK_BYTES - F::SCALE_BYTES) / 4;
-    let widths = [n_blk * code_words, n_blk * F::SCALE_BYTES / 4];
-    let (qs, e) = pack_planes(
-        what,
-        bytes,
-        (rows, n_blk * F::BLOCK_BYTES),
-        widths,
-        |first, src, qs, e| {
-            for (j, blk) in src.chunks_exact(F::BLOCK_BYTES).enumerate() {
-                let (scales, codes) = blk.split_at(F::SCALE_BYTES);
-                for (s, &byte) in scales.iter().enumerate() {
-                    F::scale_ok(byte).map_err(|why| {
-                        let sub = if F::SCALE_BYTES > 1 {
-                            format!(" sub-block {s}")
-                        } else {
-                            String::new()
-                        };
-                        let i = first * n_blk + j;
-                        format!(
-                            "row {} block {}{sub}: scale byte {why}",
-                            i / n_blk,
-                            i % n_blk
-                        )
-                    })?;
-                    let at = j * F::SCALE_BYTES + s;
-                    e[at / 4] |= u32::from(byte) << (8 * (at % 4));
-                }
-                for (w, c) in qs[j * code_words..][..code_words]
-                    .iter_mut()
-                    .zip(codes.as_chunks::<4>().0)
-                {
-                    *w = u32::from_le_bytes(*c);
-                }
-            }
-            Ok(())
-        },
-    )?;
+    let (qs, e) = planes::split_vecs(what, F::PLANES, n_blk, rows, bytes)?;
     Ok(Planes { qs, e })
 }
 
