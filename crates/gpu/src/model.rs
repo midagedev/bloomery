@@ -55,13 +55,13 @@ use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream};
 use engram::direct::DIRECT_ALIGN;
-use gguf::Split;
+use gguf::{Split, TensorInfo};
 use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
 use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
-use model::placement::{ArenaFloor, ExpertList, Plan};
+use model::placement::{ArenaFloor, CardFormat, ExpertList, Plan};
 use model::r8file::R8Source;
 use std::ops::Range;
 use std::sync::Arc;
@@ -654,17 +654,27 @@ impl<B: ChainBody> GpuModel<B> {
         head: bool,
         body: impl FnOnce(&Gpu, &mut Weights) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        GpuModel::load_blocks_from(gpu, file, CardBytes::File, ctx_max, layers, head, body)
+        GpuModel::load_blocks_from(
+            gpu,
+            file,
+            (CardBytes::File, &|_| None),
+            ctx_max,
+            layers,
+            head,
+            body,
+        )
     }
 
     /// [`GpuModel::load_blocks`] with the card's tensors read from `bytes`: the file's own, or a
-    /// part source's when `file` is a checkpoint folder's header ([`CardBytes::Parts`]). A folder
+    /// part source's when `file` is a checkpoint folder's header ([`CardBytes::Parts`]), each in
+    /// the card format `card` gives it (the body's description, `ModelTensors::card_format`, the
+    /// format the whole-fit verdict sizes) and in its type's own where `card` gives none. A folder
     /// loads the whole model, every layer and the head: a part of its layers, and a head tied to
     /// the token embedding (which its part load does not alias), are refused by name.
     pub(crate) fn load_blocks_from(
         gpu: Gpu,
         file: &Split,
-        bytes: CardBytes<'_>,
+        (bytes, card): (CardBytes<'_>, &dyn Fn(&TensorInfo) -> Option<CardFormat>),
         ctx_max: usize,
         layers: Range<usize>,
         head: bool,
@@ -683,10 +693,10 @@ impl<B: ChainBody> GpuModel<B> {
         }
         one_shard(file, what)?;
         let mut weights = match bytes {
-            CardBytes::File => Weights::load(gpu.stream(), file, layers, true)?,
+            CardBytes::File => Weights::load_as(gpu.stream(), file, layers, true, card)?,
             CardBytes::Parts(parts) => {
                 refuse_partial_folder(file, &layers, n_layers, head)?;
-                parts.load_whole(gpu.stream())?
+                parts.load_whole(gpu.stream(), card)?
             }
         };
         let body = body(&gpu, &mut weights)?;
@@ -2269,9 +2279,14 @@ pub trait PartsLoad: Send {
         room: u64,
     ) -> Result<Weights, GpuError>;
 
-    /// Every tensor the source makes on the card, each whole in its type's card format: the
-    /// load of a model that sits wholly on one card, with no plan ([`GpuModel::load_blocks_from`]).
-    fn load_whole(&self, stream: &CudaStream) -> Result<Weights, GpuError>;
+    /// Every tensor the source makes on the card, each whole in the card format `card` gives it
+    /// and in its type's own where `card` gives none: the load of a model that sits wholly on
+    /// one card, with no plan ([`GpuModel::load_blocks_from`]).
+    fn load_whole(
+        &self,
+        stream: &CudaStream,
+        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
+    ) -> Result<Weights, GpuError>;
 
     /// The host admission and exact read peak to pass to load.
     fn host_need(

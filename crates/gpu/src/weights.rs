@@ -402,6 +402,20 @@ impl Weights {
         layers: Range<usize>,
         globals: bool,
     ) -> Result<Weights, GpuError> {
+        Weights::load_as(stream, split, layers, globals, &|_| None)
+    }
+
+    /// [`Weights::load`] with each tensor in the card format `card` gives it, and in its type's
+    /// own where `card` gives none: a model's description
+    /// ([`ModelTensors::card_format`]) picks a format no file type loads in by itself, as BF16
+    /// words a kernel widens as it reads them.
+    pub(crate) fn load_as(
+        stream: &CudaStream,
+        split: &Split,
+        layers: Range<usize>,
+        globals: bool,
+        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
+    ) -> Result<Weights, GpuError> {
         let n_layers = split
             .arch_get_u64("block_count")
             .ok_or(GpuError::metadata("Weights::load", "block_count"))?
@@ -423,7 +437,7 @@ impl Weights {
             }
         }
         let tied = globals && head_tensor(split) == EMBED_TENSOR;
-        Weights::load_named(stream, split, |name| keep.contains(name), tied)
+        Weights::load_named(stream, split, |name| keep.contains(name), tied, card)
     }
 
     /// Upload every segment `plan` puts on card `card` ([`Weights::load_rows`]
@@ -486,7 +500,7 @@ impl Weights {
         split: &Split,
         keep: impl FnMut(&str) -> bool,
     ) -> Result<Weights, GpuError> {
-        Weights::load_named(stream, split, keep, false)
+        Weights::load_named(stream, split, keep, false, &|_| None)
     }
 
     /// Upload `parts` beside the weights held, each a tensor or a part of one that a caller cut
@@ -522,12 +536,13 @@ impl Weights {
     }
 
     /// [`Weights::load_where`], and with `tied` the token embedding is also the head
-    /// ([`Weights::get`]).
+    /// ([`Weights::get`]); each tensor in the format `card` gives it ([`Weights::load_as`]).
     fn load_named(
         stream: &CudaStream,
         split: &Split,
         mut keep: impl FnMut(&str) -> bool,
         tied: bool,
+        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
     ) -> Result<Weights, GpuError> {
         stream.context().bind_to_thread()?;
         let mut by_name = BTreeMap::new();
@@ -552,7 +567,7 @@ impl Weights {
             })?;
             by_name.insert(
                 t.name.clone(),
-                upload_file_tensor_with(&mut ring, stream, gguf, t, |n| {
+                upload_file_tensor_with(&mut ring, stream, gguf, t, card(t), |n| {
                     let (s, info) = split.find(n)?;
                     Some((split.shard(s)?, info))
                 })?,
@@ -1367,22 +1382,25 @@ pub fn upload_file_tensor(
     t: &TensorInfo,
 ) -> Result<DevWeight, GpuError> {
     let mut ring = UploadRing::new(stream, upload_budget(t))?;
-    let dw = upload_file_tensor_with(&mut ring, stream, gguf, t, |n| Some((gguf, gguf.find(n)?)))?;
+    let dw = upload_file_tensor_with(&mut ring, stream, gguf, t, None, |n| {
+        Some((gguf, gguf.find(n)?))
+    })?;
     ring.finish(stream)?;
     Ok(dw)
 }
 
-/// [`upload_file_tensor`] on a caller's ring, which the caller synchronizes. `find` resolves a
-/// tensor of the file by name (its shard and entry), so an NVFP4 weight's `.scale` may sit in
-/// another shard of the split.
+/// [`upload_file_tensor`] on a caller's ring, which the caller synchronizes, in format `card`, or
+/// its type's own when `card` is `None`. `find` resolves a tensor of the file by name (its shard
+/// and entry), so an NVFP4 weight's `.scale` may sit in another shard of the split.
 fn upload_file_tensor_with<'g>(
     ring: &mut UploadRing,
     stream: &CudaStream,
     gguf: &Gguf,
     t: &TensorInfo,
+    card: Option<CardFormat>,
     find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<DevWeight, GpuError> {
-    let Some(format) = file_format(t) else {
+    let Some(format) = card.or_else(|| file_format(t)) else {
         return Err(GpuError::shape(
             "Weights::load",
             format!("tensor {} has type {} with no device format", t.name, t.ty),

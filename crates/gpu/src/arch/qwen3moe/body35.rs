@@ -134,13 +134,14 @@ use chain::arch::qwen3moe::read::{
     PlanDims, Read35, Sites35, joint, joint_gate_inp, layer_plans, plan_ffn, plan_gqa,
 };
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use gguf::Split;
+use gguf::{Split, TensorInfo};
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, OutGate};
 pub(super) use model::arch::names::blk;
-use model::placement::{Plan, WholeLoad};
+use model::placement::{CardFormat, Plan, WholeLoad};
 use runtime::seqstate::{Kept, Price};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -789,6 +790,10 @@ struct Pre35 {
     /// The forms the layers the common card leg runs hold buffers of
     /// ([`CommonForms::NONE`] under a whole read).
     common: CommonForms,
+    /// The card format the description gives each tensor
+    /// (`ModelTensors::card_format`, the one the whole-fit verdict sizes), which
+    /// a whole load uploads it in.
+    formats: BTreeMap<String, CardFormat>,
 }
 
 impl Pre35 {
@@ -815,6 +820,12 @@ impl Pre35 {
             ..
         } = o;
         let read = model::arch::spec(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let formats = read
+            .tensors
+            .tensors
+            .iter()
+            .filter_map(|t| Some((t.name.clone(), read.tensors.card_format(t)?)))
+            .collect();
         let spec = read.spec;
         if ctx == 0 {
             return Err(GpuError::shape(
@@ -899,6 +910,7 @@ impl Pre35 {
             rope_dims,
             sections,
             common,
+            formats,
         })
     }
 }
@@ -1185,7 +1197,7 @@ impl GpuModel<Body35> {
         let (file, origin) = whole_origin(file, mtp)?;
         let n_layers = trunk_count(&file, "qwen35moe GpuModel::open")?;
         let draft = mtp.then(|| draft_of(&file, o)).transpose()?;
-        let pre = Pre35::read(&file, o, Read35::Whole)?;
+        let mut pre = Pre35::read(&file, o, Read35::Whole)?;
         if pre.layers.len() != n_layers {
             return Err(GpuError::shape(
                 WHAT,
@@ -1195,10 +1207,12 @@ impl GpuModel<Body35> {
                 ),
             ));
         }
+        let formats = std::mem::take(&mut pre.formats);
+        let card = |t: &TensorInfo| formats.get(&t.name).copied();
         GpuModel::load_blocks_from(
             gpu,
             &file,
-            origin.bytes(),
+            (origin.bytes(), &card),
             o.ctx,
             0..n_layers,
             true,
@@ -1449,6 +1463,7 @@ impl Body35 {
             rope_dims,
             sections,
             common,
+            formats: _,
         } = pre;
         let ctx = o.ctx;
         let stream = gpu.stream();
