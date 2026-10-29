@@ -2,8 +2,8 @@
 //!
 //!   bloomery-serve [--host 127.0.0.1] [--port 8080] [--model <first.gguf>]
 //!                  [--chat-template-file <path>] [--alias <name>] [--ctx-size <n>]
-//!                  [--print-template] [--mock-fail-at <k>] [--slot-save-path <dir>]
-//!                  [--parallel <n>] [--queue-depth <q>]
+//!                  [--print-template] [--mock-fail-at <k>] [--mock-load-ms <ms>]
+//!                  [--slot-save-path <dir>] [--parallel <n>] [--queue-depth <q>]
 //!
 //! `--model` reads `tokenizer.chat_template` and `general.name` from the GGUF
 //! header only; the engine is always the mock here. The binding to the GPU
@@ -11,6 +11,15 @@
 //!
 //! `--mock-fail-at k` makes the mock's `k`-th `next` an engine error: the crash
 //! path's gate. The process then prints the crash block and exits 70.
+//!
+//! `--mock-load-ms ms` makes the mock's load take `ms` milliseconds: the listener is bound
+//! first ([`serve::Listener::early`]) and answers 503 `loading` until the load ends, as the
+//! real seats' does while they fetch and load.
+//!
+//! The start's events are JSON lines on stdout ([`serve::event`]): `bound` when the listener
+//! is up, `ready` when requests are served, `error` before a non-zero exit, `stopped` when
+//! the server ends. The exit statuses are [`serve::exit::Code`]'s; `--help` prints the usage
+//! on stdout and exits 0.
 //!
 //! `--slot-save-path dir` enables `POST /slots/{id}?action=save|restore` on
 //! files in `dir`, which must exist (the process exits 64 otherwise).
@@ -21,11 +30,21 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use serve::event::{self, Event};
+use serve::exit::{self, Code};
 use serve::flag::ApiKeys;
+use serve::listener::Phase;
 use serve::{
-    FATAL_LINGER, MAX_CONNECTIONS, MockEngine, ServeError, Server, ServerConfig, SlotConfig,
+    FATAL_LINGER, Listener, MAX_CONNECTIONS, MockEngine, ServeError, Server, ServerConfig,
+    SlotConfig,
 };
+
+const USAGE: &str = "usage: bloomery-serve [--host H] [--port P] [--model GGUF] \
+                     [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template] \
+                     [--mock-fail-at K] [--mock-load-ms MS] [--slot-save-path DIR] [--parallel N] \
+                     [--queue-depth Q] [--api-key KEY] [--api-key-file FNAME]";
 
 /// Used when neither `--model` nor `--chat-template-file` gives one.
 const FALLBACK_TEMPLATE: &str = "{{- bos_token -}}{%- for m in messages -%}<|{{ m['role'] }}|>{{ m['content'] or '' }}\n{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
@@ -39,13 +58,15 @@ struct Args {
     ctx: usize,
     print_template: bool,
     fail_at: Option<usize>,
+    load_ms: u64,
     slot_save_path: Option<PathBuf>,
     parallel: usize,
     queue_depth: Option<usize>,
     api_keys: ApiKeys,
 }
 
-fn parse_args() -> Result<Args, String> {
+/// The arguments, or `None` when the usage was asked for.
+fn parse_args() -> Result<Option<Args>, String> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
@@ -55,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
         ctx: 4096,
         print_template: false,
         fail_at: None,
+        load_ms: 0,
         slot_save_path: None,
         parallel: 1,
         queue_depth: None,
@@ -76,6 +98,9 @@ fn parse_args() -> Result<Args, String> {
             "--mock-fail-at" => {
                 a.fail_at = Some(val()?.parse().map_err(|e| format!("--mock-fail-at: {e}"))?)
             }
+            "--mock-load-ms" => {
+                a.load_ms = val()?.parse().map_err(|e| format!("--mock-load-ms: {e}"))?
+            }
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(val()?)),
             "--parallel" | "-np" => {
                 a.parallel = val()?.parse().map_err(|e| format!("--parallel: {e}"))?
@@ -84,25 +109,38 @@ fn parse_args() -> Result<Args, String> {
                 a.queue_depth = Some(val()?.parse().map_err(|e| format!("--queue-depth: {e}"))?)
             }
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, &val()?)?,
-            "--help" | "-h" => {
-                return Err("usage: bloomery-serve [--host H] [--port P] [--model GGUF] \
-                            [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template] \
-                            [--mock-fail-at K] [--slot-save-path DIR] [--parallel N] [--queue-depth Q] \
-                            [--api-key KEY] [--api-key-file FNAME]"
-                    .to_owned());
-            }
+            "--help" | "-h" => return Ok(None),
             other => return Err(format!("unknown flag {other}")),
         }
     }
-    Ok(a)
+    Ok(Some(a))
+}
+
+/// Ends the start that `e` refused: its stderr line, its `error` event, its status.
+fn refused(e: &ServeError) -> ExitCode {
+    eprintln!("{e}");
+    let code = Code::of(e);
+    let next: &[&[&str]] = if code == Code::PortInUse {
+        &[&["--port", "0"]]
+    } else if code == Code::Usage {
+        &[&["--help"]]
+    } else {
+        &[]
+    };
+    exit::refused(code, &e.to_string(), next)
 }
 
 fn main() -> ExitCode {
+    event::enable();
     let args = match parse_args() {
-        Ok(a) => a,
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(64);
+            return exit::refused(Code::Usage, &e, &[&["--help"]]);
         }
     };
     let mut template = FALLBACK_TEMPLATE.to_owned();
@@ -112,7 +150,7 @@ fn main() -> ExitCode {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("{path}: {e}");
-                return ExitCode::from(66);
+                return exit::refused(Code::NoModel, &format!("{path}: {e}"), &[]);
             }
         };
         match inv
@@ -131,7 +169,7 @@ fn main() -> ExitCode {
             Ok(t) => template = t,
             Err(e) => {
                 eprintln!("{path}: {e}");
-                return ExitCode::from(66);
+                return exit::refused(Code::NoModel, &format!("{path}: {e}"), &[]);
             }
         }
     }
@@ -149,6 +187,17 @@ fn main() -> ExitCode {
         slot_save_path: args.slot_save_path,
         api_keys: args.api_keys,
     };
+    // The listener comes first, so a port that is taken is found before the load and a client sees
+    // the start at once.
+    let listener = match Listener::early((args.host.as_str(), args.port)) {
+        Ok(l) => l,
+        Err(e) => return refused(&ServeError::Io(e)),
+    };
+    listener.progress().phase(Phase::Load);
+    event::emit(&Event::Bound {
+        url: &event::url(listener.local_addr()),
+    });
+    std::thread::sleep(Duration::from_millis(args.load_ms));
     let engine = match args.fail_at {
         Some(k) => MockEngine::failing_at(args.ctx, k),
         None => MockEngine::new(args.ctx),
@@ -166,17 +215,9 @@ fn main() -> ExitCode {
         queue_depth: args.queue_depth,
         ..SlotConfig::default()
     };
-    let addr = (args.host.as_str(), args.port);
-    let server = match Server::bind_with(addr, Box::new(engine), config, slots) {
+    let server = match Server::bind_listener(listener, Box::new(engine), config, slots) {
         Ok(s) => s,
-        Err(e @ (ServeError::SlotSavePath(_) | ServeError::Slots(_))) => {
-            eprintln!("{e}");
-            return ExitCode::from(64);
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
+        Err(e) => return refused(&e),
     };
     match server.local_addr() {
         Ok(addr) => eprintln!("bloomery-serve: mock engine, listening on http://{addr}"),
@@ -184,13 +225,6 @@ fn main() -> ExitCode {
     }
     let e = server.run();
     eprintln!("bloomery-serve: {e}");
-    match e {
-        // EX_SOFTWARE: the engine, not the listener, ended the run.
-        ServeError::Engine(_) => ExitCode::from(70),
-        ServeError::Io(_)
-        | ServeError::Template(_)
-        | ServeError::SlotSavePath(_)
-        | ServeError::NoStops
-        | ServeError::Slots(_) => ExitCode::from(1),
-    }
+    let code = Code::of(&e);
+    exit::refused(code, &e.to_string(), &[])
 }

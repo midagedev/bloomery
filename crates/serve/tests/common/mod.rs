@@ -89,6 +89,18 @@ pub fn drop_dir(dir: &Path) {
     std::fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
 }
 
+/// A spawned server process, killed and reaped if a gate panics before it exits.
+pub struct Reaped(pub std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 pub struct Reply {
     pub status: u16,
     pub head: String,
