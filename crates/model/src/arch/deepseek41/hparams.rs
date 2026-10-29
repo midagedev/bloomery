@@ -1620,7 +1620,7 @@ mod tests {
 
     const V4_RATIOS_KEY: &str = "deepseek4.attention.compress_ratios";
 
-    /// The V4-Flash file's layer table as `just gate-deepseek4-meta` pins it:
+    /// The V4-Flash layer table, built from the ratios alone:
     /// ratio 0 on layers 0-1, then 4 and 128 alternating from layer 2 to 42;
     /// every compressed layer owns its gated compressor (twice the latent wide
     /// at ratio 4), the ratio-4 layers their indexer and index-key compressor.
