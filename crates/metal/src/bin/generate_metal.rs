@@ -7,7 +7,7 @@
 //!                    (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]]
 //!                    [--profile-layers] [--step-times [N]] [--prefill batch|steps]
-//!                    [--pass-times U]
+//!                    [--pass-times U] [--logits-hash [N]]
 //!     generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
 //!
 //! The model is a GGUF file's first shard or a checkpoint folder (an MLX
@@ -92,6 +92,14 @@
 //! step's wall does: a host-fed step pays all four serially, a chain or
 //! ahead step encodes the next token under the current one's GPU time.
 //!
+//! `--logits-hash [N]` (default N 32) runs the prompt once more from a reset
+//! session and N − 1 more tokens host-fed, each token's logits read back,
+//! and prints one `logits_hash` line a token on stderr: its index, its pick
+//! and the FNV-1a 64 of the logits row's f32 little-endian bytes. The run
+//! and every other mode read no logits back. Two builds whose kernels give
+//! the same bits print the same lines, so a bit-identical change's end to
+//! end proof is one compare of the two lists (`grep '^logits_hash '`).
+//!
 //! The wall and rate lines are development-loop numbers: no lease, no
 //! witness, this Mac whatever else it runs. The `prof` lines are too: the
 //! profiled token runs one command buffer a group, waited, which the real
@@ -144,7 +152,7 @@ mod cli {
     use hf::source::Source;
     use model_hf::ModelFile;
     use runtime::prompt::PrefillMode;
-    use runtime::{Target, Want};
+    use runtime::{Out, Target, Want};
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
@@ -172,7 +180,7 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
+generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]]
 generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
   by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
@@ -187,7 +195,8 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   clock's phases a mode printed; --prefill steps feeds the prompt a step an
   id, batch (the default) in passes; --pass-times U[,U…] times the ops of one
   pass of the first U prompt ids, one command buffer at a time, beside the
-  pass's own wall";
+  pass's own wall; --logits-hash [N] (default 32) runs the prompt again and
+  N − 1 tokens host-fed, one logits_hash line a token (FNV-1a 64 of its logits)";
 
     /// The flags that take a value.
     const VALUE_FLAGS: &[&str] = &[
@@ -241,6 +250,8 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         profile: Option<Profile>,
         /// `--step-times [N]`: the step clock's tokens a mode.
         step_times: Option<usize>,
+        /// `--logits-hash [N]`: the tokens whose logits are hashed.
+        logits_hash: Option<usize>,
         prefill: PrefillMode,
         /// `--pass-times U[,U…]`: the rows of each pass whose ops are timed
         /// alone.
@@ -290,7 +301,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     }
 
     /// The flags that stand alone or take a count.
-    const COUNT_FLAGS: [&str; 2] = ["--profile", "--step-times"];
+    const COUNT_FLAGS: [&str; 3] = ["--profile", "--step-times", "--logits-hash"];
 
     /// The flag words among the arguments, in order, each with the count it
     /// took. A value flag's value is skipped, never read as a flag; a count
@@ -404,6 +415,12 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 "--step-times 0: a step-times run of no tokens; drop the flag to run none".into(),
             );
         }
+        let logits_hash = count_flag("--logits-hash");
+        if logits_hash == Some(0) {
+            return Err(
+                "--logits-hash 0: a hash list of no tokens; drop the flag to run none".into(),
+            );
+        }
         let pass_times = match flag("--pass-times")? {
             None => None,
             Some(s) => {
@@ -438,6 +455,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             repeat,
             profile,
             step_times,
+            logits_hash,
             prefill,
             pass_times,
             #[cfg(feature = "encode-trace")]
@@ -1133,7 +1151,58 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 .ok_or("a step-times run of no token: the run picked none")?;
             step_times_run(&mut session, n, id)?;
         }
+        if let Some(n) = a.logits_hash {
+            logits_hash_run(&mut session, &prompt, n)?;
+        }
         Ok(())
+    }
+
+    /// FNV-1a 64 over `row`'s f32 little-endian bytes.
+    fn fnv1a(row: &[f32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in row.iter().flat_map(|v| v.to_le_bytes()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// `--logits-hash N`: the prompt from a reset session, then `n − 1`
+    /// tokens host-fed, each fed the pick before it, one `logits_hash` line a
+    /// token. The steps are the target's `Want::Logits` calls: the row is the
+    /// token's own, read after its step settled. The tokens must fit the
+    /// cache.
+    fn logits_hash_run(s: &mut Session, prompt: &[u32], n: usize) -> Result<(), String> {
+        let rows = prompt.len().saturating_add(n - 1);
+        if rows > s.ctx() {
+            return Err(format!(
+                "--logits-hash {n}: the prompt's {} ids and {} more tokens pass the cache's {} rows",
+                prompt.len(),
+                n - 1,
+                s.ctx()
+            ));
+        }
+        s.reset().map_err(|e| e.to_string())?;
+        let out = Target::prompt(s, prompt, Want::Logits).map_err(|e| e.to_string())?;
+        let mut id = logits_line(0, &out)?;
+        for k in 1..n {
+            let out = Target::step(s, id, Want::Logits).map_err(|e| e.to_string())?;
+            id = logits_line(k, &out)?;
+        }
+        eprintln!(
+            "logits_hash {n} tokens of {} prompt ids, host-fed",
+            prompt.len()
+        );
+        Ok(())
+    }
+
+    /// Token `k`'s line, and its pick, the next token's id.
+    fn logits_line(k: usize, out: &Out<'_>) -> Result<u32, String> {
+        let Out::Logits { argmax, row } = out else {
+            return Err("--logits-hash: the target read no logits row back".into());
+        };
+        eprintln!("logits_hash k={k} id={argmax} fnv1a={:016x}", fnv1a(row));
+        Ok(*argmax)
     }
 
     #[cfg(test)]
