@@ -191,6 +191,14 @@
 //! whole-card verifying load, one context a slot, and a qwen3moe file refuses
 //! it by name (its body runs no pass of several rows).
 //!
+//! A model path that is a directory is a dense Qwen3.5-family checkpoint folder (ModelOpt's
+//! Qwen3.8-27B NVFP4), read as stored (`qwen3_folder::open`, no prepare step): its located header
+//! plans as a file's first shard does, its tokenizer and chat template are the folder's, and the
+//! engine loads every card tensor through the folder's part source, whole on the card. The folder's
+//! `mtp.*` tensors are not read: unset or `off` serves the plain path, and `BLOOMERY_DRAFT=mtp` and
+//! `BLOOMERY_MTP_WIDTH` are refused by name. A folder of another architecture, and a build without
+//! the `checkpoint` feature, are refused by name.
+//!
 //! The seat sits behind the `deepseek41` feature, the server surface's
 //! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code;
 //! a placed load acts on the plan's and the host tier's levers
@@ -211,6 +219,7 @@ use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
@@ -243,6 +252,7 @@ use tokenizer::Tokenizer;
 
 use super::drafted::SlotDrafts;
 use super::served::{self, ServedDraft, Word};
+use super::{folder, qwen3_folder};
 use crate::draft::Draft;
 use crate::dspark_hf;
 use crate::quiet::Quiet;
@@ -430,6 +440,76 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     Ok(a)
 }
 
+/// The model's open on the engine thread ([`Weights::hand_over`]).
+type OpenModel = Box<dyn FnOnce() -> Result<Model, GateError> + Send>;
+
+/// Where the seat's model is read from, decided once by the path: a directory is a dense
+/// checkpoint folder ([`qwen3_folder`]), anything else a GGUF file. Each is opened on the main
+/// thread for its header, which the plans are made from.
+enum Weights {
+    /// A checkpoint folder, boxed: its part source outweighs a header.
+    Folder(Box<Stored>),
+    /// A GGUF file's header; the engine thread opens the file again.
+    File(Split),
+}
+
+/// A checkpoint folder's located header and part source, which the engine thread's whole-card
+/// load reads every card tensor through.
+struct Stored {
+    header: Split,
+    source: folder::Source,
+}
+
+impl Weights {
+    /// The weights at `path`, and the folder's own tokenizer (`None` for a file, whose
+    /// vocabulary is the file's).
+    fn open(path: &Path) -> Result<(Weights, Option<Tokenizer>), GateError> {
+        if path.is_dir() {
+            let folder::Opened {
+                header,
+                tokenizer,
+                source,
+            } = qwen3_folder::open(path)?;
+            let stored = Box::new(Stored { header, source });
+            return Ok((Weights::Folder(stored), Some(tokenizer)));
+        }
+        let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Ok((Weights::File(split), None))
+    }
+
+    /// The header the plans are made from: a split's first shard's, a folder's located header.
+    fn header(&self) -> &Split {
+        match self {
+            Weights::Folder(stored) => &stored.header,
+            Weights::File(header) => header,
+        }
+    }
+
+    fn is_folder(&self) -> bool {
+        matches!(self, Weights::Folder(_))
+    }
+
+    /// The model's open on the engine thread: a folder's header and part source go with it, a
+    /// file is opened again there.
+    fn hand_over(self, path: &Path) -> OpenModel {
+        match self {
+            Weights::Folder(stored) => {
+                let Stored { header, source } = *stored;
+                Box::new(move || folder::model(header, source))
+            }
+            Weights::File(header) => {
+                drop(header);
+                let file = path.to_path_buf();
+                Box::new(move || -> Result<Model, GateError> {
+                    Ok(Split::open(&file)
+                        .map_err(|e| format!("open {}: {e}", file.display()))?
+                        .into())
+                })
+            }
+        }
+    }
+}
+
 /// One of the two bodies the seat serves, opened as `generate_qwen3moe`
 /// opens it, its prompt schedule and its keep rule. Both hold resident
 /// sequences ([`Slots`]): the session adds and selects them alike.
@@ -452,14 +532,15 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     fn serves_one_pass(tiered: bool) -> bool {
         Self::ONE_PASS && !tiered
     }
-    /// The model of `file` with a `ctx`-row cache by `load`, decided before
+    /// The model of `file`, a GGUF split or a checkpoint folder ([`Model`]: only a qwen35moe
+    /// body's whole-card load reads a folder), with a `ctx`-row cache by `load`, decided before
     /// the open at the total its `slots` sequences of that shape split
     /// ([`decide`]), the `plan` record on stderr first when a plan loads it, then the encoder's
     /// `vision_seat` record; `planes` is the cache planes' format and the encoder `--mmproj`
     /// seated, which gives the load an image input ([`open35`]'s `media`) and which only a
     /// qwen35moe body takes.
     fn open(
-        file: Split,
+        file: Model,
         ctx: usize,
         slots: usize,
         load: Q3Load,
@@ -577,7 +658,7 @@ impl Body3 for Body {
     /// load holding a sequence of `ctx` rows for each of `slots`
     /// (`q3place::open_qwen3_slots`).
     fn open(
-        file: Split,
+        file: Model,
         ctx: usize,
         slots: usize,
         load: Q3Load,
@@ -585,6 +666,13 @@ impl Body3 for Body {
         (kv, vision): (KvQ8, Option<&Opened>),
         verifying: bool,
     ) -> Result<Qwen3moeModel, GateError> {
+        let Model::Split(file) = file else {
+            return Err(
+                "a qwen3moe load reads a GGUF file: a checkpoint folder is a dense qwen35 \
+                        model's"
+                    .into(),
+            );
+        };
         if verifying {
             return Err("a qwen3moe load verifies no rows: a draft needs a qwen35moe file".into());
         }
@@ -672,7 +760,7 @@ impl Body3 for Body35 {
     /// machine carrying the sequences' rows, its load holding a sequence of
     /// `ctx` rows for each of `slots` (`q3place::open_qwen35_slots`).
     fn open(
-        file: Split,
+        file: Model,
         ctx: usize,
         slots: usize,
         load: Q3Load,
@@ -680,7 +768,12 @@ impl Body3 for Body35 {
         (kv, vision): (KvQ8, Option<&Opened>),
         verifying: bool,
     ) -> Result<Qwen35moeModel, GateError> {
-        let o = load.open35(q3place::serve_open35(&file, ctx, kv, vision.is_some())?);
+        let o = load.open35(q3place::serve_open35(
+            file.header(),
+            ctx,
+            kv,
+            vision.is_some(),
+        )?);
         let mut m = match load {
             Q3Load::Whole(on) => {
                 vision_seat::print_seat(vision);
@@ -719,7 +812,14 @@ impl Body3 for Body35 {
                                 .into(),
                         );
                     }
-                    None => q3place::open_qwen35_slots(file, &plan, slots, o, levers.host())?,
+                    None => {
+                        let Model::Split(file) = file else {
+                            return Err("a checkpoint folder loads whole on the card: a placed \
+                                        load reads a GGUF file"
+                                .into());
+                        };
+                        q3place::open_qwen35_slots(file, &plan, slots, o, levers.host())?
+                    }
                 }
             }
         };
@@ -984,7 +1084,8 @@ struct Q3<B: Body3> {
 }
 
 impl<B: Body3> Q3<B> {
-    /// The model of the file at `path` in graph mode by `load`
+    /// The model `at` names, the GGUF file at `path` or the checkpoint folder the main thread
+    /// opened ([`Weights::hand_over`]), in graph mode by `load`
     /// ([`Body3::open`]), its step captured and, unless placed, its passes,
     /// `slots` resident sequences parked after them (each capturing on its
     /// first use), the session over it; the `load` record on stderr. The
@@ -994,7 +1095,7 @@ impl<B: Body3> Q3<B> {
         reason = "the seat's one engine-thread call takes its plan, cards, planes and optional draft"
     )]
     fn open(
-        path: &Path,
+        (path, at): (&Path, OpenModel),
         ctx: usize,
         slots: usize,
         pass: Pass,
@@ -1007,8 +1108,12 @@ impl<B: Body3> Q3<B> {
         draft_off: Option<String>,
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
-        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let arch = file.architecture().unwrap_or("<missing>").to_owned();
+        let file = at()?;
+        let arch = file
+            .header()
+            .architecture()
+            .unwrap_or("<missing>")
+            .to_owned();
         let opened = t.elapsed();
         let card = match &load {
             Q3Load::Whole(on) => on.card.name,
@@ -2001,6 +2106,28 @@ fn layer_choice(file: &Split) -> Choice {
     }
 }
 
+/// Why a checkpoint folder drafts no next-token layer: its map leaves the folder's `mtp.*` tensors
+/// out of the load.
+const FOLDER_NO_MTP: &str = "a checkpoint folder's mtp.* tensors are not read";
+
+/// `BLOOMERY_DRAFT` `mtp`, `off` or unset on a checkpoint folder, whose next-token layer the load
+/// does not read: set `mtp` is refused by name, `off` and unset take the plain path and print why
+/// on `load draft=off`.
+fn folder_choice(draft: Option<&str>) -> Result<Choice, GateError> {
+    match draft {
+        Some("mtp") => Err(format!(
+            "BLOOMERY_DRAFT=mtp: {FOLDER_NO_MTP}; serve the folder with BLOOMERY_DRAFT unset or \
+             off, or a GGUF file that carries the layer"
+        )
+        .into()),
+        Some("off") => Ok(Choice::Plain(Draft38Off::Set.to_string())),
+        None => Ok(Choice::Plain(FOLDER_NO_MTP.to_owned())),
+        Some(other) => {
+            Err(format!("BLOOMERY_DRAFT {other:?} is not an in-file draft decision").into())
+        }
+    }
+}
+
 /// `BLOOMERY_DRAFT` `mtp`, `off` or unset on a qwen35moe or qwen35 file, once
 /// the load is known. `whole` is a load that opens the model on the card.
 /// Set `mtp` is refused by name where the load cannot draft. Unset takes
@@ -2248,9 +2375,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     arm_screen(levers.screen());
     let kv = cache_k(&a, levers.qwen3_kv_set())?;
     let path = ref_model_path()?;
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    // A directory is a checkpoint folder, opened once here: its located header plans as a
+    // split's first shard does, and the header and part source go to the engine thread.
+    let (weights, folder_tokenizer) = Weights::open(&path)?;
+    let split = weights.header();
     let name = split.architecture().unwrap_or("<missing>").to_owned();
-    let arch = Family::of(&split).map_err(|e| format!("{}: {e}", path.display()))?;
+    let arch = Family::of(split).map_err(|e| format!("{}: {e}", path.display()))?;
     // The draft word, before anything is planned or loaded.
     let word = draft_of(arch, &name, &levers, &path)?;
     let served = served_draft(word);
@@ -2283,7 +2413,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         a.template_file.path(),
         "qwen3",
     )?;
-    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_chat_template(&template)?);
+    let tokenizer = match folder_tokenizer {
+        Some(tokenizer) => tokenizer,
+        None => Tokenizer::from_gguf(&path)?,
+    };
+    let vocab = Arc::new(Vocab::new(tokenizer)?.with_chat_template(&template)?);
     let tok = vocab.tokenizer();
     let token = |id| tok.text(id).map(str::to_owned);
     // A string that is exactly one token: MiniCPM's marks and its `<unk>` pad.
@@ -2291,7 +2425,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let ids = tok.encode(text, false, true);
         (ids.len() == 1).then(|| ids[0])
     };
-    let vision = vision_of(&a, arch, (&path, &split), &token, &one)?;
+    let vision = vision_of(&a, arch, (&path, split), &token, &one)?;
     // Keep the stage context and bundle resident before planning, as the CLI does.
     let stage = a
         .place
@@ -2321,7 +2455,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         Family::Qwen35moe | Family::Qwen35 => verdict_lanes(
             &levers,
             word,
-            &split,
+            split,
             a.place.unwrap_or(Place::A).name(),
             vision.is_some(),
             slots,
@@ -2333,7 +2467,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let vision = vision_seat::kept(vision, &a.vision, |v| {
         let plan_levers = PlanLevers::from_levers(&levers)?;
         let asked = ctx_and_load(
-            &split,
+            split,
             (a.ctx, slots),
             serve_opts((a.place, &plan_levers), (kv, a.ubatch), (v, embedding)),
             lanes,
@@ -2359,7 +2493,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // count is never lowered: the default is one slot.
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let asked = ctx_and_load(
-        &split,
+        split,
         (a.ctx, slots),
         serve_opts(
             (a.place, &plan_levers),
@@ -2377,7 +2511,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let slot_ctx = slot_ctx(usize::try_from(asked.total)?, slots)?;
     let load = asked.plan;
     if matches!(arch, Family::Qwen35moe | Family::Qwen35) {
-        q3place::checkpoints_fit(seqs35(&split, &load, slots)?, slot_ctx, load.placed_body())?;
+        q3place::checkpoints_fit(seqs35(split, &load, slots)?, slot_ctx, load.placed_body())?;
     }
     // The shape of a round of several slots, from the load's body
     // ([`Q3Load::placed_body`], [`Q3Load::tiered`]); the open holds the
@@ -2409,16 +2543,20 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let choice = if matches!(arch, Family::Qwen35moe | Family::Qwen35)
         && matches!(word, Word::Off | Word::Mtp)
     {
-        Some(decide_q35(
-            &levers,
-            &path,
-            &split,
-            slots,
-            slot_ctx,
-            !placed,
-            chosen.place.name(),
-            vision.is_some(),
-        )?)
+        Some(if weights.is_folder() {
+            folder_choice(levers.draft())?
+        } else {
+            decide_q35(
+                &levers,
+                &path,
+                split,
+                slots,
+                slot_ctx,
+                !placed,
+                chosen.place.name(),
+                vision.is_some(),
+            )?
+        })
     } else {
         None
     };
@@ -2464,7 +2602,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         placement,
         ..EngineProps::default()
     };
-    drop(split);
+    let at = weights.hand_over(&path);
     let open = path.clone();
     let device = match &load {
         Q3Load::Whole(on) => on.card.name,
@@ -2476,7 +2614,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (Family::Qwen3moe, _) => SeatEngine::spawn(
             move || {
                 Q3::<Body>::open(
-                    &open,
+                    (&open, at),
                     slot_ctx,
                     slots,
                     pass,
@@ -2506,7 +2644,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (_, Some(Choice::Plain(why))) => SeatEngine::spawn(
             move || {
                 Q3::<Body35>::open(
-                    &open,
+                    (&open, at),
                     slot_ctx,
                     slots,
                     pass,
@@ -2528,7 +2666,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (_, None) => SeatEngine::spawn(
             move || {
                 Q3::<Body35>::open(
-                    &open,
+                    (&open, at),
                     slot_ctx,
                     slots,
                     pass,
@@ -2580,7 +2718,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{Choice, folder_choice, parse_args};
     use model::placement::workstation::{A6000, RTX_3090};
 
     /// The seat reads `--place` as the shared grammar and leaves a tier card
@@ -2609,5 +2747,26 @@ mod tests {
             panic!("b2 is no card or ordinal");
         };
         assert!(e.to_string().starts_with("--place is a, gate, bp"), "{e}");
+    }
+
+    /// A checkpoint folder's next-token layer is not read: `BLOOMERY_DRAFT=mtp` is refused by
+    /// name, and `off` and unset take the plain path and say why.
+    #[test]
+    fn a_checkpoint_folder_serves_no_next_token_layer() {
+        let e = folder_choice(Some("mtp")).err().unwrap().to_string();
+        assert!(
+            e.contains("BLOOMERY_DRAFT=mtp") && e.contains("mtp.* tensors are not read"),
+            "{e}"
+        );
+        let Ok(Choice::Plain(why)) = folder_choice(None) else {
+            panic!("unset is the plain path");
+        };
+        assert!(why.contains("mtp.* tensors are not read"), "{why}");
+        let Ok(Choice::Plain(why)) = folder_choice(Some("off")) else {
+            panic!("off is the plain path");
+        };
+        assert_eq!(why, "BLOOMERY_DRAFT=off");
+        let e = folder_choice(Some("dspark")).err().unwrap().to_string();
+        assert!(e.contains("is not an in-file draft decision"), "{e}");
     }
 }

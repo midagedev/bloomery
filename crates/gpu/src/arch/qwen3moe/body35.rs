@@ -109,6 +109,7 @@ use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
 use super::wide38::STREAM_FLOOR;
 use crate::checkpoint::{self, Checkpoints};
+use crate::folder::{Model, Origin};
 use crate::head::Head;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::swap::{CallPick, CallReport, Residency};
@@ -1089,15 +1090,45 @@ fn draft_layer(
     Ok((w, plan))
 }
 
+/// The header a whole-card load of `file` plans by and where its card tensors come from
+/// ([`Model::into_origin`]); the next-token layer (`mtp`) of a checkpoint folder is refused by
+/// name, since the folder's map leaves its `mtp.*` tensors out.
+fn whole_origin(file: Model, mtp: bool) -> Result<(Split, Origin), GpuError> {
+    let (header, origin) = file.into_origin(Residency::Off)?;
+    if mtp && matches!(origin, Origin::Folder { .. }) {
+        return Err(GpuError::shape(
+            "qwen35moe GpuModel::open_mtp",
+            "a checkpoint folder's next-token layer is not read: its mtp.* tensors are left out \
+             of the load",
+        ));
+    }
+    Ok((header, origin))
+}
+
+/// The split a placed load reads: the plan's card segments and the host tier's experts come from
+/// the file's own mapped tensors, and a checkpoint folder's tensors come through a part source
+/// that only a whole-card load reads, so a folder is refused by name.
+fn placed_split(file: Model, what: &'static str) -> Result<Split, GpuError> {
+    match file {
+        Model::Split(file) => Ok(file),
+        Model::Folder(_) => Err(GpuError::shape(
+            what,
+            "a checkpoint folder loads whole on the card; a placed load reads a GGUF file",
+        )),
+    }
+}
+
 impl GpuModel<Body35> {
-    /// The whole Qwen3.6 model of `file` resident on `gpu`, plus the output
-    /// head, with caches of `o.ctx` rows, the decode flash `o.mma` (the
+    /// The whole Qwen3.6 model of `file`, a GGUF split or a checkpoint folder
+    /// ([`Model`]: a folder's card tensors are read through its part source,
+    /// every layer and the head), resident on `gpu`, plus the output head,
+    /// with caches of `o.ctx` rows, the decode flash `o.mma` (the
     /// tensor-core pass when `true`) and ubatches of `o.ubatch` tokens
     /// ([`Open35`]). Every site's type is read from the file's header and a
     /// type no launch reads refused by name before any upload. The model
     /// takes the file.
-    pub fn open(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, PLAIN_LANES, false)
+    pub fn open(gpu: Gpu, file: impl Into<Model>, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
+        GpuModel::open_lanes(gpu, file.into(), o, PLAIN_LANES, false)
     }
 
     /// [`GpuModel::open`] with the file's own next-token layer resident
@@ -1112,9 +1143,14 @@ impl GpuModel<Body35> {
     /// [`GpuModel::open_verifying`]'s does, with its refusals: the layer's
     /// every proposal is verified by a pass of several rows, whose commit
     /// keeps any `1..=m` of them, and one lane holds only the last row's
-    /// state.
-    pub fn open_mtp(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, Body35::VERIFY_LANES, true)
+    /// state. A checkpoint folder is refused by name: its map leaves the
+    /// next-token layer's tensors out ([`whole_origin`]).
+    pub fn open_mtp(
+        gpu: Gpu,
+        file: impl Into<Model>,
+        o: Open35,
+    ) -> Result<GpuModel<Body35>, GpuError> {
+        GpuModel::open_lanes(gpu, file.into(), o, Body35::VERIFY_LANES, true)
     }
 
     /// [`GpuModel::open`] for a load that will verify drafted rows
@@ -1128,19 +1164,24 @@ impl GpuModel<Body35> {
     /// and its `gdn_delta` launch, byte for byte. Refused by name past
     /// [`GpuModel::open`]'s refusals: resident slots beyond the live
     /// sequence ([`Slots::new_seq`]) and a pass of several slots.
-    pub fn open_verifying(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, Body35::VERIFY_LANES, false)
+    pub fn open_verifying(
+        gpu: Gpu,
+        file: impl Into<Model>,
+        o: Open35,
+    ) -> Result<GpuModel<Body35>, GpuError> {
+        GpuModel::open_lanes(gpu, file.into(), o, Body35::VERIFY_LANES, false)
     }
 
     /// The whole-card load with `lanes` lanes a delta store, and the file's
     /// next-token layer when `mtp`.
     fn open_lanes(
         gpu: Gpu,
-        file: Split,
+        file: Model,
         o: Open35,
         lanes: usize,
         mtp: bool,
     ) -> Result<GpuModel<Body35>, GpuError> {
+        let (file, origin) = whole_origin(file, mtp)?;
         let n_layers = trunk_count(&file, "qwen35moe GpuModel::open")?;
         let draft = mtp.then(|| draft_of(&file, o)).transpose()?;
         let pre = Pre35::read(&file, o, Read35::Whole)?;
@@ -1153,20 +1194,28 @@ impl GpuModel<Body35> {
                 ),
             ));
         }
-        GpuModel::load_blocks(gpu, &file, o.ctx, 0..n_layers, true, |gpu, w| {
-            // Before the body, so its ubatch arena is sized from what the
-            // draft leaves free.
-            let d = pre.d;
-            let mtp = draft
-                .map(|draft| {
-                    let layer = draft_layer(gpu, &file, &d, &draft)?;
-                    Mtp35::open(gpu, w, &draft, layer, (d, o.kv))
-                })
-                .transpose()?;
-            let mut body = Body35::load(gpu, w, pre, o, lanes)?;
-            body.mtp = mtp;
-            Ok(body)
-        })
+        GpuModel::load_blocks_from(
+            gpu,
+            &file,
+            origin.bytes(),
+            o.ctx,
+            0..n_layers,
+            true,
+            |gpu, w| {
+                // Before the body, so its ubatch arena is sized from what the
+                // draft leaves free.
+                let d = pre.d;
+                let mtp = draft
+                    .map(|draft| {
+                        let layer = draft_layer(gpu, &file, &d, &draft)?;
+                        Mtp35::open(gpu, w, &draft, layer, (d, o.kv))
+                    })
+                    .transpose()?;
+                let mut body = Body35::load(gpu, w, pre, o, lanes)?;
+                body.mtp = mtp;
+                Ok(body)
+            },
+        )
     }
 
     /// The card bytes a placed load of `file` opened with `o` holds past the
@@ -1222,9 +1271,10 @@ impl GpuModel<Body35> {
     /// run is the host tier's ([`Read35::Placed`]) and a routed stack of a
     /// type no tier runs is refused instead; for a plan of another context,
     /// as the placed side refuses ([`Placed::new`]), and as the family's
-    /// stack table refuses a layer's types ([`swap35::stacks`]).
+    /// stack table refuses a layer's types ([`swap35::stacks`]), and as a
+    /// checkpoint folder is refused ([`placed_split`]).
     pub fn open_placed(
-        file: Split,
+        file: impl Into<Model>,
         plan: &Plan<'_>,
         o: Open35,
         host: HostCfg,
@@ -1246,13 +1296,14 @@ impl GpuModel<Body35> {
     /// `refresh_maps`), and a step's boundary is the step loop's. The body has
     /// no steps-feed path to refuse.
     pub fn open_placed_residency(
-        file: Split,
+        file: impl Into<Model>,
         plan: &Plan<'_>,
         o: Open35,
         host: HostCfg,
         residency: Residency,
     ) -> Result<GpuModel<Body35>, GpuError> {
         const WHAT_P: &str = "qwen35moe GpuModel::open_placed";
+        let file = placed_split(file.into(), WHAT_P)?;
         let asked = o.ubatch;
         let o = placed_open(o);
         let n_layers = trunk_count(&file, WHAT_P)?;
@@ -3014,9 +3065,80 @@ impl Instrumented for Body35 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flash, GqaKind, Kind35, checkpoint_lens};
+    use super::{Flash, GqaKind, Kind35, checkpoint_lens, placed_split, whole_origin};
     use crate::checkpoint::{point_bytes, price};
+    use crate::folder::{Folder, Model};
     use crate::linear::{KHeadMap, LinearShape};
+    use crate::model::CardBytes;
+    use gguf::Split;
+    use gguf::Value;
+    use gguf::write::{Layout, TensorDecl};
+    use model::part::{Part, Planned, Source, Take};
+
+    /// A part source that holds nothing: a load that read it would be refused by name.
+    struct NoParts;
+
+    impl Source for NoParts {
+        type Error = std::fmt::Error;
+
+        fn plan<E: std::fmt::Display>(
+            &self,
+            _: impl Fn(&str, gguf::GgmlType, &[u64]) -> Result<Take, E>,
+        ) -> Result<Vec<Planned>, Self::Error> {
+            Err(std::fmt::Error)
+        }
+
+        fn read_bytes(&self, _: &Planned) -> Result<u64, Self::Error> {
+            Err(std::fmt::Error)
+        }
+
+        fn read(&self, _: &Planned) -> Result<Part<'_>, Self::Error> {
+            Err(std::fmt::Error)
+        }
+    }
+
+    fn header() -> Split {
+        let kvs = [("toy.layers".to_string(), Value::U32(1))];
+        let tensors = vec![TensorDecl {
+            name: "w.weight".into(),
+            dims: vec![32],
+            type_id: gguf::GgmlType::F32.as_u32(),
+            nbytes: 128,
+        }];
+        let layout = Layout::new(&kvs, tensors).unwrap();
+        Split::header_only(std::env::temp_dir().join("body35-folder-toy.gguf"), &layout).unwrap()
+    }
+
+    fn folder() -> Model {
+        Folder::new(header(), NoParts).into()
+    }
+
+    /// A placed load reads a GGUF file's mapped tensors, so a checkpoint folder handed to it is
+    /// refused by name, and a split passes.
+    #[test]
+    fn a_placed_load_refuses_a_checkpoint_folder() {
+        let e = placed_split(folder(), "toy").err().unwrap().to_string();
+        assert!(
+            e.contains("a checkpoint folder loads whole on the card"),
+            "{e}"
+        );
+        assert!(placed_split(Model::from(header()), "toy").is_ok());
+    }
+
+    /// A whole-card load reads a folder's card tensors through its part source and a split's own,
+    /// and refuses a folder's next-token layer by name, whose tensors the folder's map leaves out;
+    /// a split's next-token layer is the draft rule's to refuse or take.
+    #[test]
+    fn a_whole_load_reads_a_folder_through_its_parts_and_refuses_its_draft() {
+        let (_, origin) = whole_origin(folder(), false).unwrap();
+        assert!(matches!(origin.bytes(), CardBytes::Parts(_)));
+        let e = whole_origin(folder(), true).err().unwrap().to_string();
+        assert!(e.contains("a checkpoint folder's next-token layer"), "{e}");
+        for mtp in [false, true] {
+            let (_, origin) = whole_origin(Model::from(header()), mtp).unwrap();
+            assert!(matches!(origin.bytes(), CardBytes::File));
+        }
+    }
 
     /// A checkpoint of Qwen3.6-35B-A3B's trunk — 30 delta layers of 16 key
     /// and 32 value heads among 10 attention layers — copies each delta
