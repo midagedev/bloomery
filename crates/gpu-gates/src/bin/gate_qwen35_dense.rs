@@ -139,6 +139,7 @@ mod nv {
     use bloomery_gpu_gates::{
         GateError, checks_failed, data_dir, kld, quantile, ref_model_path, verdict,
     };
+    use bloomery_levers::{CARD_BUDGET, CardBudget};
     use refset::arch::qwen35::dense::{NV_P64, NV_P4096, NV_PROFILE, NV_TWIN, NvForcedLogits};
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -189,9 +190,18 @@ mod nv {
         Ok(())
     }
 
-    /// The twin through ours, then the folder through ours, one model on the card at a time.
+    /// The twin through ours, then the folder through ours, one model on the card at a time. Each side's weights are
+    /// held to the card budget the cut records (`BLOOMERY_CARD_BUDGET`, which the fixture tier exports): a dense cut
+    /// plans whole on one card, so its weights fit under that budget.
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        let CardBudget::Every(budget) = levers.card_budget() else {
+            return Err(format!(
+                "{GATE}: {CARD_BUDGET} is {:?}; the fixture tier sets it to the one byte count the cut's header records",
+                levers.card_budget()
+            )
+            .into());
+        };
         let folder = ref_model_path()?;
         println!("{GATE} (fixture tier): the cut {}", folder.display());
         let first = refset::fixture::first_shard(NV_PROFILE)?;
@@ -223,6 +233,7 @@ mod nv {
         let mut twin_run: Option<Side> = None;
         if want("g3") && tier::run_clause(G3, Tag::FixtureOracle)? {
             let side = run_side(twin, load_twin)?;
+            within_budget("the twin", &side, budget)?;
             ok &= g3(&side, sets)?;
             twin_run = Some(side);
         }
@@ -232,6 +243,7 @@ mod nv {
                 None => run_side(twin, load_twin)?,
             };
             let folder_side = run_side(&folder, load_folder)?;
+            within_budget("the folder", &folder_side, budget)?;
             ok &= g4(&folder_side, &twin_side, sets)?;
         }
         if only.is_none() {
@@ -281,6 +293,20 @@ mod nv {
             .filter_map(|n| w.get(n).map(|d| (n.to_string(), d.resident_bytes())))
             .collect();
         Ok(Side { rows, weights })
+    }
+
+    /// `side`'s resident weight bytes against the cut's card budget: over it is a named error, since the clauses would
+    /// then compare a load the budget does not describe.
+    fn within_budget(what: &str, side: &Side, budget: u64) -> Result<(), GateError> {
+        let bytes: u64 = side.weights.values().map(|&b| b as u64).sum();
+        println!("  {what}: {bytes} B of weights resident, card budget {budget} B");
+        if bytes > budget {
+            return Err(format!(
+                "{GATE}: {what} holds {bytes} B of weights on the card, over the cut's card budget of {budget} B"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// The median, 90th percentile and largest of `v`.
