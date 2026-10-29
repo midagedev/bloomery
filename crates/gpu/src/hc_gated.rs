@@ -2698,9 +2698,13 @@ impl HcWideScratch {
 }
 
 /// Residual streams `[m][streams][hidden]` a kernel reads and writes in
-/// place: F32 values, or BF16 values (a ubatch walk's, as the reference
-/// engines carry them), each rounded to nearest even as it is written and
-/// widened exactly as it is read ([`Slots`]).
+/// place: F32 values, or BF16 values (a ubatch walk's), each rounded to
+/// nearest even as it is written and widened exactly as it is read
+/// ([`Slots`]). The BF16 form is ours: ik's and mainline's Qwen3.8 graphs
+/// keep the streams as F32 tensors between layers (ik
+/// `src/graphs/build_qwen4exp.cpp:590` the init from the F32 embedding rows,
+/// `:96` the combine's add; mainline `src/models/qwen4exp.cpp:389` and
+/// `:346`, its fused combine taking only an F32 residual, `ggml.c:6572`).
 pub enum Streams<'a> {
     F32(&'a mut DeviceBuffer<f32>),
     Bf16(&'a mut DeviceBuffer<u16>),

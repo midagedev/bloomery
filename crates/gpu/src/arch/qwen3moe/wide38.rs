@@ -113,11 +113,11 @@
 //! values a scale for the gate·up's input, a 32-value q8_1 of the SwiGLU),
 //! so the two card legs differ only in their sums' order.
 //!
-//! The walk carries the residual streams as BF16 values, as the reference
-//! engines carry them, in the halfwords of the arena's other stream buffer
-//! ([`Arena38::res`]): each value a mix's combine or init or the PLE site
-//! writes is rounded to nearest even once, and each mix normalizes the
-//! values the streams hold. The PLE site reads the combined streams as F32
+//! The walk carries the residual streams as BF16 values (ik and mainline
+//! keep them as F32 tensors, [`Streams`]), in the halfwords of the arena's
+//! other stream buffer ([`Arena38::res`]): each value a mix's combine or init
+//! or the PLE site writes is rounded to nearest even once, and each mix
+//! normalizes the values the streams hold. The PLE site reads the combined streams as F32
 //! values, and the last layer's combine writes them as F32 values into the
 //! final buffer ([`combine`]), which the head's mix and every reader of the
 //! target's rows read. The pass keeps F32 streams; against it the walk's
