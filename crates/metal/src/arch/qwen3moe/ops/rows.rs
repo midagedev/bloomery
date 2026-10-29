@@ -26,7 +26,7 @@ use chain::ChainError;
 use chain::arch::qwen3moe::ops::LayerCtx;
 use chain::arch::qwen3moe::plan::ResidualPlan;
 
-use super::super::arena::{Arena, LayerBufs, MixerBufs, lane_of, layer_word, slot_of};
+use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::rows::FfnRows;
 use super::super::session::SessionError;
 use super::{Half, MetalOps, WHAT, all, all_mut, conv_bufs, post_gain, refuse, rope_of};
