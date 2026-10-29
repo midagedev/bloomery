@@ -17,7 +17,7 @@ use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
-use super::gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, Operand};
+use super::gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, Operand, simdgroup_grid};
 use super::matvec::Quant;
 use super::router_geom;
 use super::rows::check_strided;
@@ -465,11 +465,10 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.fault.binding())?;
-        slot.dispatch_groups(
-            p.acts.div_ceil(GEMM_ACTS),
-            p.rows.div_ceil(GEMM_ROWS),
-            GEMM_THREADS,
-        )
+        // The entry is the dense GEMM's simdgroup tile on either path: its
+        // grid is that tile's.
+        let (x, y) = simdgroup_grid(p.rows.div_ceil(GEMM_ROWS), p.acts.div_ceil(GEMM_ACTS));
+        slot.dispatch_groups(x, y, GEMM_THREADS)
     }
 
     /// Encode the selection of every row's slots from its logits: one

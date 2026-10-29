@@ -35,7 +35,7 @@ use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::kernels::{
     AttentionPrefillParams, AttnCache, AttnLayer, CombineParams, DeltaRowStrides, DeltaRowsParams,
-    DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams,
+    DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, GemmXParams,
     HeadNormRowsParams, NormAddRowsParams, NormRowsParams, Operand, Quant, RouteSelectParams,
     RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams, SwigluRowsParams,
     route_table_words, route_tiles,
@@ -187,6 +187,20 @@ impl MetalOps<'_, '_> {
             },
         )?;
         self.enc.memory_barrier();
+        // The quantized projections' GEMMs read the normed rows cast once.
+        let x = self.kernels.gemm_x(
+            self.enc,
+            GemmXParams {
+                x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                x_stride: *hidden,
+                cols: *hidden,
+                acts: m,
+                operand: PASS_OPERAND,
+                half: &mut rows.xh,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
         let stride = rows.proj_stride;
         let heads = geom.attn.query_heads;
         for part in &p1.parts {
@@ -258,8 +272,7 @@ impl MetalOps<'_, '_> {
                         quant: part.quant,
                         segments,
                         weights: all(&part.weights)?.sub(Elems(0), Elems(weight_end))?,
-                        x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
-                        x_stride: *hidden,
+                        x,
                         acts: m,
                         y: rows
                             .proj
@@ -287,8 +300,7 @@ impl MetalOps<'_, '_> {
                         cols: seg.cols,
                         acts: m,
                         weights: all(&part.weights)?.sub(Elems(at), Elems(len))?,
-                        x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
-                        x_stride: *hidden,
+                        x,
                         y: gate_rows.window_mut(Elems(0), Elems(m * heads))?,
                         y_stride: heads,
                         mode: GemmMode::Store,
@@ -408,6 +420,21 @@ impl MetalOps<'_, '_> {
             .attn
             .out_len()
             .ok_or_else(|| ChainError::shape(WHAT, "the attention output does not fit"))?;
+        let x = self.kernels.gemm_x(
+            self.enc,
+            GemmXParams {
+                x: rows
+                    .mix
+                    .window(Elems(0), Elems(strided_len(m, rows.mix_stride, out_cols)))?,
+                x_stride: rows.mix_stride,
+                cols: out_cols,
+                acts: m,
+                operand: PASS_OPERAND,
+                half: &mut rows.xh,
+                fault: &faults[slot],
+                layer: layer_word(l.layer),
+            },
+        )?;
         let (y, mode) = half_out(l, &mut rows.x, &mut rows.xn, m * *hidden)?;
         self.kernels.gemm(
             self.enc,
@@ -417,10 +444,7 @@ impl MetalOps<'_, '_> {
                 cols: out_cols,
                 acts: m,
                 weights: all(&a.out)?,
-                x: rows
-                    .mix
-                    .window(Elems(0), Elems(strided_len(m, rows.mix_stride, out_cols)))?,
-                x_stride: rows.mix_stride,
+                x,
                 y,
                 y_stride: *hidden,
                 mode,
@@ -498,6 +522,21 @@ impl MetalOps<'_, '_> {
             ..
         } = &mut *self.arena;
         let c = conv_bufs(layers, l.layer)?;
+        let x = self.kernels.gemm_x(
+            self.enc,
+            GemmXParams {
+                x: rows
+                    .mix
+                    .window(Elems(0), Elems(strided_len(m, rows.mix_stride, *hidden)))?,
+                x_stride: rows.mix_stride,
+                cols: *hidden,
+                acts: m,
+                operand: PASS_OPERAND,
+                half: &mut rows.xh,
+                fault: &faults[slot],
+                layer: layer_word(l.layer),
+            },
+        )?;
         let (y, mode) = half_out(l, &mut rows.x, &mut rows.xn, m * *hidden)?;
         self.kernels.gemm(
             self.enc,
@@ -507,10 +546,7 @@ impl MetalOps<'_, '_> {
                 cols: *hidden,
                 acts: m,
                 weights: all(&c.out)?,
-                x: rows
-                    .mix
-                    .window(Elems(0), Elems(strided_len(m, rows.mix_stride, *hidden)))?,
-                x_stride: rows.mix_stride,
+                x,
                 y,
                 y_stride: *hidden,
                 mode,
@@ -711,6 +747,19 @@ impl MetalOps<'_, '_> {
             },
         )?;
         self.enc.memory_barrier();
+        let x = self.kernels.gemm_x(
+            self.enc,
+            GemmXParams {
+                x: rows.mix.window(Elems(0), Elems(m * dense.g))?,
+                x_stride: dense.g,
+                cols: dense.g,
+                acts: m,
+                operand: PASS_OPERAND,
+                half: &mut rows.xh,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
         self.kernels.gemm(
             self.enc,
             GemmParams {
@@ -719,8 +768,7 @@ impl MetalOps<'_, '_> {
                 cols: dense.g,
                 acts: m,
                 weights: all(&d.out)?,
-                x: rows.mix.window(Elems(0), Elems(m * dense.g))?,
-                x_stride: dense.g,
+                x,
                 y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
                 y_stride: *hidden,
                 mode: GemmMode::Residual,
@@ -1007,6 +1055,20 @@ impl MetalOps<'_, '_> {
             },
         )?;
         self.enc.memory_barrier();
+        // The gate and the up GEMMs read the normed rows cast once.
+        let x = self.kernels.gemm_x(
+            self.enc,
+            GemmXParams {
+                x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                x_stride: *hidden,
+                cols: *hidden,
+                acts: m,
+                operand: PASS_OPERAND,
+                half: &mut rows.xh,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
         for (weights, out) in [(&f.gate, &mut rows.h), (&f.up, &mut *up)] {
             self.kernels.gemm(
                 self.enc,
@@ -1016,8 +1078,7 @@ impl MetalOps<'_, '_> {
                     cols: *hidden,
                     acts: m,
                     weights: all(weights)?,
-                    x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
-                    x_stride: *hidden,
+                    x,
                     y: out.window_mut(Elems(0), Elems(m * width))?,
                     y_stride: width,
                     mode: GemmMode::Store,
@@ -1039,6 +1100,19 @@ impl MetalOps<'_, '_> {
             },
         )?;
         self.enc.memory_barrier();
+        let x = self.kernels.gemm_x(
+            self.enc,
+            GemmXParams {
+                x: rows.h.window(Elems(0), Elems(m * width))?,
+                x_stride: width,
+                cols: width,
+                acts: m,
+                operand: PASS_OPERAND,
+                half: &mut rows.xh,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
         let (y, mode) = half_out(cx, &mut rows.x, &mut rows.xn, m * *hidden)?;
         self.kernels.gemm(
             self.enc,
@@ -1048,8 +1122,7 @@ impl MetalOps<'_, '_> {
                 cols: width,
                 acts: m,
                 weights: all(&f.down)?,
-                x: rows.h.window(Elems(0), Elems(m * width))?,
-                x_stride: width,
+                x,
                 y,
                 y_stride: *hidden,
                 mode,

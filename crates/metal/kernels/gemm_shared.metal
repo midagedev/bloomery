@@ -46,7 +46,8 @@ struct GemmArgs {
     uint cols;     // the input columns K, a whole number of the type's blocks
     uint rows;     // the weight rows N, the output's columns
     uint acts;     // the activation rows R, the output's rows
-    uint x_stride; // the f32 elements between x's rows, at least cols
+    uint x_stride; // the elements between x's rows (f32, or half for an
+                   // _h16 entry), at least cols
     uint y_stride; // the f32 elements between y's rows, at least rows
     uint layer;    // the layer a raise is recorded in
 };
@@ -103,28 +104,46 @@ inline float pair_swiglu(float gate, float up) {
     return gate / (1.0f + exp(-gate)) * up;
 }
 
+// The f16 operand's cast of four activations, the activation quantizer's: a
+// value that is not finite or past the half range (one test: not at most the
+// half maximum in magnitude, which a NaN fails too) raises the quantizer's
+// site and casts as NaN, so the row's outputs are NaN — never a silent inf.
+// Every GEMM of both libraries casts its activations through this one cast,
+// in its staging or in the half-input GEMMs' own pass (gemm_cast_rows).
+inline half4 gemm_half4(float4 v, device atomic_uint * faults, uint layer) {
+    const bool4 bad = !(fabs(v) <= 65504.f);
+    if (any(bad)) {
+        raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+        return half4(select(v, float4(NAN), bad));
+    }
+    return half4(v);
+}
+
 // One 16-value run of an activation row, staged for a GEMM's tile: loaded
-// as scalars (no window alignment is assumed) and checked as float4s. The
-// f16 arm's cast is the activation quantizer's: a value that is not finite
-// or past the half range (one test: not at most the half maximum in
-// magnitude, which a NaN fails too) raises the quantizer's site and stages
-// NaN, so the row's outputs are NaN — never a silent inf. Every GEMM of both
-// libraries stages its activations through this one cast.
+// as scalars (no window alignment is assumed) and composed into float4s, the
+// f16 arm's through the checked cast (gemm_half4).
 template <typename T>
 inline void gemm_stage_x(device const float * xr, threadgroup vec<T, 4> * dst,
                          device atomic_uint * faults, uint layer) {
     FOR_UNROLL(short g = 0; g < 4; ++g) {
         const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
         if (sizeof(T) == 2) {
-            const bool4 bad = !(fabs(v) <= 65504.f);
-            if (any(bad)) {
-                raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-                dst[g] = vec<T, 4>(select(v, float4(NAN), bad));
-            } else {
-                dst[g] = vec<T, 4>(v);
-            }
+            dst[g] = vec<T, 4>(gemm_half4(v, faults, layer));
         } else {
             dst[g] = vec<T, 4>(v);
         }
+    }
+}
+
+// One 16-value run of a half activation row, the checked cast already run
+// over it (gemm_cast_rows): four half4 loads, staged as they are. The rows
+// are 8-byte aligned and their stride a multiple of four (kernels/gemm.rs
+// refuses any other window). Only the f16 arm stages half rows.
+template <typename T>
+inline void gemm_stage_x(device const half * xr, threadgroup vec<T, 4> * dst,
+                         device atomic_uint *, uint) {
+    static_assert(sizeof(T) == 2, "half rows stage into the f16 arm only");
+    FOR_UNROLL(short g = 0; g < 4; ++g) {
+        dst[g] = *(device const half4 *)(xr + 4 * g);
     }
 }

@@ -140,6 +140,11 @@ pub const Q30_KEPT: &[&str] = &[
     "gemm_resid_overwrite",
     "gemm_seg_weights",
     "gemm_a4_chunk_order",
+    "gemm_a4_nibble_scale",
+    "gemm_seg_grid_order",
+    "gemm_h16_stage",
+    "gemm_cast_stride",
+    "gemm_cast_unchecked",
     "gemm_weight_edge",
     "tensor_resid_stores",
     "tensor_seg_out",
@@ -1910,10 +1915,20 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "gemm_a4_chunk_order",
         clause: "gemm_a4_store",
-        why: "an A4 chunk stages its values with each neighbouring pair swapped",
+        why: "an A4 chunk stages each code word's second value in its first value's place",
         edits: &[(
-            "reg[j / 4][j % 4] = value(blk, (uint)(16 * il + j));",
-            "reg[j / 4][j % 4] = value(blk, (uint)(16 * il + (j ^ 1)));",
+            "reg[h][0] = fma((float)(word & 0x000Fu), s0, b);",
+            "reg[h][0] = fma((float)(word & 0x00F0u), s1, b);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_a4_nibble_scale",
+        clause: "gemm_a4_store",
+        why: "an A4 chunk's third nibble is scaled as if it sat one place lower, so those values are 16 times too large",
+        edits: &[(
+            "const float s2 = s0 * (1.f / 256.f);",
+            "const float s2 = s0 * (1.f / 16.f);",
             1,
         )],
     },
@@ -1954,6 +1969,56 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "const short n = gn + 16 * j + fn;",
             "const short n = 16 * j + fn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_grid_order",
+        clause: "gemm_q4k_store",
+        why: "the plain GEMM reads its weight tile from the grid's y and its activation tile from x, the launch's other order, so tiles are missed or read past the output",
+        edits: &[(
+            "(int)tgpig.x * GEMM_ROWS, (int)tgpig.y * GEMM_ACTS,",
+            "(int)tgpig.y * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_seg_grid_order",
+        clause: "gemm_seg",
+        why: "the segmented GEMM picks its segment from the grid's y, the activation tiles' axis",
+        edits: &[(
+            "if (tgpig.x >= args.segs[i - 1u].first_group) {",
+            "if (tgpig.y >= args.segs[i - 1u].first_group) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_h16_stage",
+        clause: "gemm_half_rows",
+        why: "a half row's chunk stages its four runs pairwise swapped",
+        edits: &[(
+            "        dst[g] = *(device const half4 *)(xr + 4 * g);",
+            "        dst[g] = *(device const half4 *)(xr + 4 * (g ^ 1));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_cast_stride",
+        clause: "gemm_half_rows",
+        why: "the cast reads the f32 rows at their width, not at the stride they are kept at",
+        edits: &[(
+            "device const float * xr = x + (ulong)tgpig.y * args.x_stride + c;",
+            "device const float * xr = x + (ulong)tgpig.y * args.cols + c;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_cast_unchecked",
+        clause: "gemm_half_rows",
+        why: "the cast skips the staging's range check, so an activation past the half range casts to inf",
+        edits: &[(
+            "+ c) = gemm_half4(v, faults, args.layer);",
+            "+ c) = half4(v);",
             1,
         )],
     },

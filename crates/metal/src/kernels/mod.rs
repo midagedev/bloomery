@@ -72,7 +72,10 @@ pub use delta_geom::SNAPS;
 pub use embed::EmbedParams;
 pub use experts::{APART_DOWN, APART_GATE_UP, FoldParams, PairParams, SharedPlan, shared_entry};
 pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
-pub use gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, GemmSegParams, Operand};
+pub use gemm::{
+    GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, GemmSegParams, GemmX, GemmXParams,
+    Operand,
+};
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
@@ -156,6 +159,9 @@ pub struct Kernels {
     a4_gemm: gemm::GemmPipelines,
     q8_0_gemm: gemm::GemmPipelines,
     q5k_gemm: gemm::GemmPipelines,
+    /// The cast of the half-row GEMMs' activations (`gemm.metal`'s
+    /// `gemm_cast_rows`): the engine library's on either path.
+    gemm_cast: Pipeline,
     /// The program the dense and the grouped GEMMs run: the library's
     /// [`Library::gemm_path`].
     gemm_path: GemmPath,
@@ -379,11 +385,32 @@ impl Kernels {
                 count,
             )?,
             f32_seg: library.pipeline_with_simdgroups("f32_matvec_seg", count)?,
-            q4k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q4k")?,
-            q6k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q6k")?,
-            a4_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4")?,
-            q8_0_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q8_0")?,
-            q5k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q5k")?,
+            q4k_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_q4k",
+                library.gemm_path(),
+            )?,
+            q6k_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_q6k",
+                library.gemm_path(),
+            )?,
+            a4_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_a4",
+                library.gemm_path(),
+            )?,
+            q8_0_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_q8_0",
+                library.gemm_path(),
+            )?,
+            q5k_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_q5k",
+                library.gemm_path(),
+            )?,
+            gemm_cast: library.pipeline("gemm_cast_rows")?,
             gemm_path: library.gemm_path(),
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             headnorm_a4: library.pipeline_with_simdgroups("a4_matvec_headnorm_resid", count)?,

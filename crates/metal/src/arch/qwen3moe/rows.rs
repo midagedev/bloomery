@@ -9,6 +9,11 @@
 //! arena's: a pass reads and writes the same ones, so a pass and a step
 //! continue each other.
 //!
+//! The dense GEMMs of the simdgroup path read their activations as half
+//! rows, cast once per input into one buffer ([`RowsArena::xh`]) as wide as
+//! the widest input a dense GEMM of the pass reads: a mixer row, or a dense
+//! FFN's activated row.
+//!
 //! The expert buffers hold a row per slot (`m` times the instance's slots),
 //! the pair's output and the down's output at their widths: they are most of
 //! the arena. An instance of a dense FFN has no router, no route table and no
@@ -124,6 +129,9 @@ pub(super) struct RowsArena {
     pub(super) h: MetalBuffer<f32>,
     /// The FFN's other buffers.
     pub(super) ffn: FfnRows,
+    /// The half rows the dense GEMMs read ([`crate::kernels::Kernels::gemm_x`]),
+    /// packed at the input's width: `cap` rows of the widest input.
+    pub(super) xh: MetalBuffer<u16>,
     /// The bytes the buffers take.
     pub(super) bytes: u64,
     /// The copies of the delta layers' stores, once a pass has taken one.
@@ -233,6 +241,9 @@ pub(super) struct RowsLens {
     pub(super) gate: Option<usize>,
     pub(super) h: usize,
     pub(super) ffn: FfnLens,
+    /// The half rows: `cap` rows of the widest dense GEMM input, the mixer
+    /// rows' stride or a dense FFN's width.
+    pub(super) xh: usize,
 }
 
 impl RowsLens {
@@ -273,6 +284,12 @@ impl RowsLens {
             product(slots, g.experts.k, "the pair rows")?,
             "the pair outputs",
         )?;
+        let xh_width = if g.experts.dense {
+            mix_stride.max(g.experts.k)
+        } else {
+            mix_stride
+        };
+        let xh = nonzero(product(cap, xh_width, "the half rows")?, "the half rows")?;
         let ffn = if g.experts.dense {
             FfnLens::Dense { up: h }
         } else {
@@ -318,6 +335,7 @@ impl RowsLens {
             gate,
             h,
             ffn,
+            xh,
         })
     }
 
@@ -326,7 +344,7 @@ impl RowsLens {
     /// ids (u32), then a routed FFN's logits, picks, weights, sorted slots,
     /// places, route table, pair outputs and down outputs, or a dense FFN's
     /// gate and up rows (f32), then the attention's gate rows where an
-    /// instance has them.
+    /// instance has them, then the half rows (two bytes a value).
     pub(super) fn buffer_bytes(&self) -> Vec<u64> {
         let w = |n: usize| 4 * u64::try_from(n).expect("a length fits u64");
         let mut bytes: Vec<u64> = [
@@ -351,6 +369,7 @@ impl RowsLens {
             FfnLens::Dense { up } => bytes.extend([self.h, *up].map(w)),
         }
         bytes.extend(self.gate.map(w));
+        bytes.push(2 * u64::try_from(self.xh).expect("a length fits u64"));
         bytes
     }
 
@@ -422,6 +441,7 @@ impl RowsArena {
                 (h, FfnRows::Dense { up })
             }
         };
+        let xh = device.buffer(Elems(lens.xh))?;
         let (proj_stride, mix_stride, delta_prep_stride, bytes) = (
             lens.proj_stride,
             lens.mix_stride,
@@ -443,6 +463,7 @@ impl RowsArena {
             gate,
             h,
             ffn,
+            xh,
             bytes,
             snaps: None,
         })

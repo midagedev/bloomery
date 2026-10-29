@@ -2,7 +2,8 @@
 //! the fixture's real tensors, every weight type, both operand arms and both
 //! epilogues, held to the f64 oracle's band; the segmented dispatch
 //! bit-equal to its segments' own single launches; the f16 operand's range
-//! fault; and the launch module's refusals.
+//! fault; the half-row entries bit-equal to the f32-row ones; and the launch
+//! module's refusals.
 //!
 //! # The band
 //!
@@ -56,7 +57,7 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::kernels::{
-    GEMM_ACTS, GemmMode, GemmParams, GemmSegParams, Operand, Quant, Segment,
+    GEMM_ACTS, GemmMode, GemmParams, GemmSegParams, GemmX, GemmXParams, Operand, Quant, Segment,
 };
 use bloomery_metal::library::GemmPath;
 use gguf::quant::dequant_row;
@@ -119,6 +120,55 @@ fn padded<T: Copy>(pad: T, before: usize, body: &[T], after: usize) -> Vec<T> {
 /// reads them, and a read past the last row lands on them, not outside the
 /// buffer.
 pub fn launch_gemm(h: &Harness<'_>, launch: &GemmLaunch<'_>) -> Result<Vec<f32>, String> {
+    launch_gemm_as(h, launch, Rows::F32)
+}
+
+/// The activation rows a gate launch hands its GEMM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// The f32 rows, cast as the kernel stages them.
+    F32,
+    /// The rows through [`bloomery_metal::kernels::Kernels::gemm_x`] in the
+    /// same command buffer: half rows where the path takes them (the gate
+    /// refuses a path that does but handed f32 rows back, and one that does
+    /// not but cast).
+    Cast,
+}
+
+/// The cast's half rows, NaN bits until the cast writes them, so a value it
+/// left unwritten reads as a NaN output.
+fn half_rows(h: &Harness<'_>, len: usize) -> Result<bloomery_metal::MetalBuffer<u16>, String> {
+    h.device
+        .upload(h.stream, &vec![0x7E01u16; len])
+        .map_err(why)
+}
+
+/// The rows `gemm_x` handed back, against the path's own rule.
+fn check_cast(h: &Harness<'_>, x: &GemmX<'_>) -> Result<(), DeviceError> {
+    let half = matches!(x, GemmX::F16 { .. });
+    if half == h.kernels.gemm_takes_half() {
+        return Ok(());
+    }
+    Err(DeviceError::Range {
+        what: "gate cast",
+        detail: format!(
+            "gemm_x handed back {} rows on a path whose f16 GEMMs {} half rows",
+            if half { "half" } else { "f32" },
+            if h.kernels.gemm_takes_half() {
+                "read"
+            } else {
+                "do not read"
+            }
+        ),
+    })
+}
+
+/// [`launch_gemm`] over the rows `rows` names.
+pub fn launch_gemm_as(
+    h: &Harness<'_>,
+    launch: &GemmLaunch<'_>,
+    rows: Rows,
+) -> Result<Vec<f32>, String> {
     let (device, stream) = (h.device, h.stream);
     let sentinel = f32::from_bits(SENTINEL_BITS);
     let weights = padded(
@@ -135,25 +185,56 @@ pub fn launch_gemm(h: &Harness<'_>, launch: &GemmLaunch<'_>) -> Result<Vec<f32>,
     let mut y = device.upload(stream, &y_words).map_err(why)?;
     let x_len = (launch.acts - 1) * launch.x_stride + launch.cols;
     let y_len = (launch.acts - 1) * launch.y_stride + launch.rows;
-    let params = GemmParams {
-        quant: launch.quant,
-        rows: launch.rows,
-        cols: launch.cols,
-        acts: launch.acts,
-        weights: weights
-            .window(Elems(super::WEIGHT_PAD), Elems(launch.weights.len()))
-            .map_err(why)?,
-        x: x.window(Elems(super::VALUE_PAD), Elems(x_len))
-            .map_err(why)?,
-        x_stride: launch.x_stride,
-        y: y.window_mut(Elems(Y_GUARD), Elems(y_len)).map_err(why)?,
-        y_stride: launch.y_stride,
-        mode: launch.mode,
-        operand: launch.operand,
-        fault: device.fault_word(),
-        layer: LAYER,
-    };
-    h.encode(|encoder| h.kernels.gemm(encoder, params))?;
+    let mut half = half_rows(h, launch.acts * launch.cols)?;
+    let xw = x
+        .window(Elems(super::VALUE_PAD), Elems(x_len))
+        .map_err(why)?;
+    let weights = weights
+        .window(Elems(super::WEIGHT_PAD), Elems(launch.weights.len()))
+        .map_err(why)?;
+    let yw = y.window_mut(Elems(Y_GUARD), Elems(y_len)).map_err(why)?;
+    h.encode(|encoder| {
+        let x = match rows {
+            Rows::F32 => GemmX::F32 {
+                x: xw,
+                stride: launch.x_stride,
+            },
+            Rows::Cast => {
+                let x = h.kernels.gemm_x(
+                    encoder,
+                    GemmXParams {
+                        x: xw,
+                        x_stride: launch.x_stride,
+                        cols: launch.cols,
+                        acts: launch.acts,
+                        operand: launch.operand,
+                        half: &mut half,
+                        fault: device.fault_word(),
+                        layer: LAYER,
+                    },
+                )?;
+                check_cast(h, &x)?;
+                x
+            }
+        };
+        h.kernels.gemm(
+            encoder,
+            GemmParams {
+                quant: launch.quant,
+                rows: launch.rows,
+                cols: launch.cols,
+                acts: launch.acts,
+                weights,
+                x,
+                y: yw,
+                y_stride: launch.y_stride,
+                mode: launch.mode,
+                operand: launch.operand,
+                fault: device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    })?;
     let mut back = vec![0f32; y_len + Y_GUARD + Y_TAIL];
     device
         .read(stream, y.whole().map_err(why)?, &mut back)
@@ -183,6 +264,15 @@ pub struct GemmSegLaunch<'a> {
 /// Run `launch` and read the output window back, after checking the words
 /// around it are as they were ([`launch_gemm`]'s own guards).
 pub fn launch_gemm_seg(h: &Harness<'_>, launch: &GemmSegLaunch<'_>) -> Result<Vec<f32>, String> {
+    launch_gemm_seg_as(h, launch, Rows::F32)
+}
+
+/// [`launch_gemm_seg`] over the rows `rows` names.
+pub fn launch_gemm_seg_as(
+    h: &Harness<'_>,
+    launch: &GemmSegLaunch<'_>,
+    rows: Rows,
+) -> Result<Vec<f32>, String> {
     let (device, stream) = (h.device, h.stream);
     let sentinel = f32::from_bits(SENTINEL_BITS);
     let block = launch.quant.block_bytes();
@@ -210,24 +300,55 @@ pub fn launch_gemm_seg(h: &Harness<'_>, launch: &GemmSegLaunch<'_>) -> Result<Ve
     let x = device.upload(stream, &x_words).map_err(why)?;
     let y_words = padded(sentinel, Y_GUARD, launch.y0, Y_TAIL);
     let mut y = device.upload(stream, &y_words).map_err(why)?;
-    let params = GemmSegParams {
-        quant: launch.quant,
-        segments: &list,
-        weights: weights
-            .window(Elems(super::WEIGHT_PAD), Elems(weight_bytes))
-            .map_err(why)?,
-        x: x.window(Elems(super::VALUE_PAD), Elems(x_len))
-            .map_err(why)?,
-        x_stride: cols,
-        y: y.window_mut(Elems(Y_GUARD), Elems(y_len)).map_err(why)?,
-        y_stride: launch.y_stride,
-        acts,
-        mode: launch.mode,
-        operand: launch.operand,
-        fault: device.fault_word(),
-        layer: LAYER,
-    };
-    h.encode(|encoder| h.kernels.gemm_seg(encoder, params))?;
+    let mut half = half_rows(h, acts * cols)?;
+    let xw = x
+        .window(Elems(super::VALUE_PAD), Elems(x_len))
+        .map_err(why)?;
+    let weights = weights
+        .window(Elems(super::WEIGHT_PAD), Elems(weight_bytes))
+        .map_err(why)?;
+    let yw = y.window_mut(Elems(Y_GUARD), Elems(y_len)).map_err(why)?;
+    h.encode(|encoder| {
+        let x = match rows {
+            Rows::F32 => GemmX::F32 {
+                x: xw,
+                stride: cols,
+            },
+            Rows::Cast => {
+                let x = h.kernels.gemm_x(
+                    encoder,
+                    GemmXParams {
+                        x: xw,
+                        x_stride: cols,
+                        cols,
+                        acts,
+                        operand: launch.operand,
+                        half: &mut half,
+                        fault: device.fault_word(),
+                        layer: LAYER,
+                    },
+                )?;
+                check_cast(h, &x)?;
+                x
+            }
+        };
+        h.kernels.gemm_seg(
+            encoder,
+            GemmSegParams {
+                quant: launch.quant,
+                segments: &list,
+                weights,
+                x,
+                y: yw,
+                y_stride: launch.y_stride,
+                acts,
+                mode: launch.mode,
+                operand: launch.operand,
+                fault: device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    })?;
     let mut back = vec![0f32; y_len + Y_GUARD + Y_TAIL];
     device
         .read(stream, y.whole().map_err(why)?, &mut back)
@@ -1122,6 +1243,136 @@ pub fn gemm_range(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )))
 }
 
+/// The half-row GEMMs: on a path whose f16 GEMMs read half rows, the
+/// activations cast once ([`Rows::Cast`]) give the f32-row entries' outputs
+/// bit for bit — the dense A4 cases at both epilogues, the residual's at f32
+/// rows strided wider than their columns, and the segmented group — and the
+/// cast's range check is the staging's: an activation past the half range,
+/// or NaN, raises the activation quantizer's site and every output is the
+/// f32-row entry's bits, the faulted row's NaN among them. A path whose f16
+/// GEMMs do not read half rows gets its f32 rows back from the cast.
+pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
+    let same = |what: &str, want: &[f32], got: &[f32]| -> Result<(), String> {
+        match want
+            .iter()
+            .zip(got)
+            .position(|(w, g)| w.to_bits() != g.to_bits())
+        {
+            None => Ok(()),
+            Some(i) => Err(format!(
+                "{what}: element {i} is {:?} over the cast rows, {:?} over the f32 rows",
+                got[i], want[i]
+            )),
+        }
+    };
+    h.clear_fault()?;
+    let cases = a4_cases(h, mlx, sites)?;
+    for case in &cases {
+        for (mode, x_stride) in [
+            (GemmMode::Store, case.x_stride),
+            (GemmMode::Residual, case.x_stride + 20),
+        ] {
+            let x = oracle::activations((case.acts - 1) * x_stride + case.cols, case.seed, 1.0);
+            let y_len = (case.acts - 1) * case.y_stride + case.rows;
+            let y0 = oracle::activations(y_len, case.seed ^ 0x5A5A, 1.0);
+            let launch = GemmLaunch {
+                quant: case.quant,
+                rows: case.rows,
+                cols: case.cols,
+                acts: case.acts,
+                weights: case.weights,
+                x: &x,
+                x_stride,
+                y0: &y0,
+                y_stride: case.y_stride,
+                mode,
+                operand: Operand::F16,
+            };
+            let want = launch_gemm_as(h, &launch, Rows::F32)?;
+            let got = launch_gemm_as(h, &launch, Rows::Cast)?;
+            common::expect_clean(h, &case.label)?;
+            same(
+                &format!("{} {mode:?} x stride {x_stride}", case.label),
+                &want,
+                &got,
+            )?;
+        }
+    }
+    let group = a4_seg_group(mlx, sites)?;
+    let (acts, cols) = (33, SEG_COLS);
+    let seg_rows: usize = group.segments.iter().map(|(r, _)| r).sum();
+    let y_stride = seg_rows.div_ceil(4) * 4;
+    let x = oracle::activations(acts * cols, 0x6E91, 1.0);
+    let y0 = oracle::activations((acts - 1) * y_stride + seg_rows, 0x6E92, 1.0);
+    for mode in [GemmMode::Store, GemmMode::Residual] {
+        let launch = GemmSegLaunch {
+            quant: group.quant,
+            cols,
+            acts,
+            segments: group.segments.clone(),
+            x: &x,
+            y0: &y0,
+            y_stride,
+            mode,
+            operand: Operand::F16,
+        };
+        let want = launch_gemm_seg_as(h, &launch, Rows::F32)?;
+        let got = launch_gemm_seg_as(h, &launch, Rows::Cast)?;
+        common::expect_clean(h, "the segmented launch")?;
+        same(&format!("the segmented A4 group {mode:?}"), &want, &got)?;
+    }
+    let case = cases.first().ok_or("no A4 case at the row's sites")?;
+    for (what, value, bad_row) in [
+        ("an activation past the half range", 65_536.0f32, 7usize),
+        ("a NaN activation", f32::NAN, 0),
+    ] {
+        let mut x = oracle::activations(acts * case.cols, 0x6E93, 1.0);
+        x[bad_row * case.cols + 11] = value;
+        let y0 = oracle::activations((acts - 1) * case.y_stride + case.rows, 0x6E94, 1.0);
+        let launch = GemmLaunch {
+            quant: case.quant,
+            rows: case.rows,
+            cols: case.cols,
+            acts,
+            weights: case.weights,
+            x: &x,
+            x_stride: case.cols,
+            y0: &y0,
+            y_stride: case.y_stride,
+            mode: GemmMode::Store,
+            operand: Operand::F16,
+        };
+        h.clear_fault()?;
+        let want = launch_gemm_as(h, &launch, Rows::F32)?;
+        common::expect_fault(h, what, FaultSite::QuantColumn)?;
+        h.clear_fault()?;
+        let got = launch_gemm_as(h, &launch, Rows::Cast)?;
+        common::expect_fault(
+            h,
+            &format!("{what} through the cast"),
+            FaultSite::QuantColumn,
+        )?;
+        same(what, &want, &got)?;
+        if !got[bad_row * case.y_stride].is_nan() {
+            return Err(format!(
+                "{what}: row {bad_row}'s first output is {:?}, not NaN",
+                got[bad_row * case.y_stride]
+            ));
+        }
+    }
+    h.clear_fault()?;
+    Ok(Verdict::Noted(format!(
+        "{} dense A4 cases at both epilogues and the segmented group, the cast rows' bits the \
+         f32 rows' ({}); the range fault and NaN rows through the cast",
+        cases.len(),
+        if h.kernels.gemm_takes_half() {
+            "half rows"
+        } else {
+            "f32 rows handed back"
+        }
+    )))
+}
+
 /// The buffers of the refusal table.
 struct Refusals {
     cols: usize,
@@ -1178,8 +1429,10 @@ fn refuse(
             cols: a.cols,
             acts: a.acts,
             weights: b.weights.window(Elems(a.weights_at), Elems(a.weights))?,
-            x: b.x.window(Elems(0), Elems(a.x))?,
-            x_stride: a.x_stride,
+            x: GemmX::F32 {
+                x: b.x.window(Elems(0), Elems(a.x))?,
+                stride: a.x_stride,
+            },
             y: b.y.window_mut(Elems(a.y_at), Elems(a.y))?,
             y_stride: a.y_stride,
             mode: GemmMode::Store,
@@ -1257,8 +1510,10 @@ fn refuse_seg(
             quant: Quant::Q4K,
             segments: &segments,
             weights: b.weights.window(Elems(0), Elems(a.weights_len))?,
-            x: b.x.window(Elems(0), Elems(b.cols * 33))?,
-            x_stride: b.cols,
+            x: GemmX::F32 {
+                x: b.x.window(Elems(0), Elems(b.cols * 33))?,
+                stride: b.cols,
+            },
             acts: 33,
             y: b.y.window_mut(Elems(0), Elems(a.y_len))?,
             y_stride: a
@@ -1544,6 +1799,10 @@ pub fn table<'a>(
             }),
         ),
         ("gemm_range", with(gemm_range)),
+        (
+            "gemm_half_rows",
+            clauses_a4::with(h, mlx, move |h, f| gemm_half_rows(h, f, sites)),
+        ),
         ("gemm_refusals", Box::new(move || gemm_refusals(h))),
     ]
 }
@@ -1567,6 +1826,10 @@ pub fn shaped<'a>(
         (
             "gemm_seg",
             clauses_a4::with(h, mlx, move |h, f| gemm_seg_a4(h, f, sites)),
+        ),
+        (
+            "gemm_half_rows",
+            clauses_a4::with(h, mlx, move |h, f| gemm_half_rows(h, f, sites)),
         ),
     ]
 }

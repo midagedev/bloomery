@@ -2282,7 +2282,7 @@ mod tests {
         let cap = pass_rows_max(&g).min(CTX);
         let slots = cap * g.experts.slots;
         let prepared = g.delta.prepared_elems(N_K).expect("the prepared row fits");
-        let rows = [
+        let mut rows = [
             cap,
             cap * hidden,
             cap * hidden,
@@ -2299,7 +2299,11 @@ mod tests {
             slots * g.experts.k,
             slots * hidden,
         ]
-        .map(f32s);
+        .map(f32s)
+        .to_vec();
+        // PIN(2026-10-29): the half rows the dense GEMMs read
+        // (`RowsArena::xh`), `cap` rows of the mixer's width, two bytes a value.
+        rows.push(count(cap * value_heads * head_cols) * 2);
         assert_eq!(bytes.rows, class(&rows));
     }
 
@@ -2375,7 +2379,7 @@ mod tests {
 
         let cap = pass_rows_max(&g).min(CTX);
         let prepared = g.delta.prepared_elems(N_K).expect("the prepared row fits");
-        let rows = [
+        let mut rows = [
             cap,
             cap * hidden,
             cap * hidden,
@@ -2386,7 +2390,12 @@ mod tests {
             cap * g.experts.k, // the gate's rows
             cap * g.experts.k, // the up's rows
         ]
-        .map(f32s);
+        .map(f32s)
+        .to_vec();
+        // PIN(2026-10-29): the half rows the dense GEMMs read
+        // (`RowsArena::xh`), `cap` rows of the wider of the mixer and the FFN's
+        // activated row, two bytes a value.
+        rows.push(count(cap * (value_heads * head_cols).max(g.experts.k)) * 2);
         assert_eq!(bytes.rows, class(&rows));
     }
 
@@ -3210,7 +3219,7 @@ mod tests {
         let mix = (g.delta.value_heads * g.delta.head_cols)
             .max(g.attn.query_heads * g.attn.head)
             .max(hidden);
-        let rows = [
+        let mut rows = [
             cap,
             cap * hidden,
             cap * hidden,
@@ -3222,7 +3231,12 @@ mod tests {
             cap * g.experts.k,
             cap * g.attn.query_heads,
         ]
-        .map(f32s);
+        .map(f32s)
+        .to_vec();
+        // PIN(2026-10-29): the half rows the dense GEMMs read
+        // (`RowsArena::xh`), `cap` rows of the wider of the mixer and the FFN's
+        // activated row, two bytes a value.
+        rows.push(count(cap * mix.max(g.experts.k)) * 2);
         assert_eq!(bytes.rows, class(&rows));
     }
 

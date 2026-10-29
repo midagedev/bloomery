@@ -1,7 +1,8 @@
 // The dense quantized GEMM: y[r][n] = sum_k W[n][k] * x[r][k] over R
 // activation rows, one dispatch. The entry points, under their host names:
 //
-//   gemm_{q4k,q6k,a4,q8_0,q5k}_{store,resid}[_seg]_{f16,f32}
+//   gemm_{q4k,q6k,a4,q8_0,q5k}_{store,resid}[_seg]_{f16,f32,h16}
+//   gemm_cast_rows
 //
 //   store    y = W . x
 //   resid    y = y + W . x, in place: the residual epilogue, the decode
@@ -13,6 +14,10 @@
 //            half: the staged half values load into float fragments, so a
 //            product of two half values accumulates in f32 exactly
 //   f32      both operands f32
+//   h16      the f16 arm over half activation rows: gemm_cast_rows ran the
+//            staging's checked cast over them once, so the tile stages the
+//            same half values the f16 entry's cast would, without the f32
+//            loads and the check its every weight tile repeats
 //
 // The structure is MLX's quantized matmul (MIT licence; see
 // THIRD_PARTY_NOTICES.md), the steel form its `qmm_t` runs where no
@@ -36,7 +41,11 @@
 //     store stays per element, not through a threadgroup staging tile.
 //
 // Geometry: a threadgroup is 128 threads in four SIMD groups, and owns 64
-// weight rows (the output's columns) by 64 activation rows (its rows). A
+// weight rows (the output's columns) by 64 activation rows (its rows). The
+// weight tiles run across the grid's x, its fastest axis (MLX's order): the
+// threadgroups in flight together share one activation tile, whose rows
+// are then read from memory once while the weight tiles pass, where the
+// other order streams every activation row once per weight tile. A
 // K step covers 32 values, both arms — the f32 arm's tile takes 18 KB of
 // the 32 KB this Mac allows a threadgroup, the f16 arm's 10 KB, so two to
 // three f16 threadgroups sit on one core against the f32 arm's one: the
@@ -119,10 +128,10 @@ static inline void frag_mma_half(thread vec<float, 2> &       d,
 // One threadgroup's tile of the GEMM: the whole K loop and the store, shared
 // by the plain and the segmented entries the way the mat-vec's row loop is
 // (`first_row` there, `r0` and `r1` here).
-template <typename Q, typename T, bool RESID>
+template <typename Q, typename T, typename X, bool RESID>
 inline void gemm_tile(threadgroup char        * shmem,
                       device const typename Q::Block * W,
-                      device const float      * x,
+                      device const X          * x,
                       device float            * y,
                       int rows,
                       int cols,
@@ -169,7 +178,7 @@ inline void gemm_tile(threadgroup char        * shmem,
         a_src[a] = W + (ulong)(r0 + row) * nb;
         a_dst[a] = (threadgroup vec<T, 4> *)(sa + row * LDA + a_koff[a]);
     }
-    device const float * b_src[B_CHUNKS];
+    device const X * b_src[B_CHUNKS];
     threadgroup vec<T, 4> * b_dst[B_CHUNKS];
     FOR_UNROLL(short b = 0; b < B_CHUNKS; ++b) {
         const short c0 = (short)tiitg + b * GEMM_THREADS;
@@ -210,10 +219,10 @@ inline void gemm_tile(threadgroup char        * shmem,
     }
 
     // B: whole 16-value runs of the activation rows, each through the
-    // checked cast (gemm_stage_x).
+    // checked cast, or as they are when the rows are half (gemm_stage_x).
     auto stage_b = [&](int k0) {
         FOR_UNROLL(short b = 0; b < B_CHUNKS; ++b) {
-            device const float * xr = b_src[b] + k0;
+            device const X * xr = b_src[b] + k0;
             gemm_stage_x<T>(xr, b_dst[b], faults, layer);
         }
     };
@@ -330,9 +339,9 @@ inline void gemm_tile(threadgroup char        * shmem,
 }
 
 // The plain GEMM, storing or adding into the output.
-template <typename Q, typename T, bool RESID>
+template <typename Q, typename T, typename X, bool RESID>
 kernel void gemm_kernel(device const typename Q::Block * W [[buffer(0)]],
-                        device const float      * x [[buffer(1)]],
+                        device const X          * x [[buffer(1)]],
                         device float            * y [[buffer(2)]],
                         constant GemmArgs       & args [[buffer(3)]],
                         device atomic_uint      * faults [[buffer(4)]],
@@ -341,9 +350,9 @@ kernel void gemm_kernel(device const typename Q::Block * W [[buffer(0)]],
                         ushort sgitg [[simdgroup_index_in_threadgroup]],
                         ushort tiisg [[thread_index_in_simdgroup]]) {
     threadgroup char shmem[gemm_shmem_bytes<T>()];
-    gemm_tile<Q, T, RESID>(shmem, W, x, y, (int)args.rows, (int)args.cols, (int)args.acts,
+    gemm_tile<Q, T, X, RESID>(shmem, W, x, y, (int)args.rows, (int)args.cols, (int)args.acts,
                            args.x_stride, args.y_stride, args.layer, faults,
-                           (int)tgpig.y * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS,
+                           (int)tgpig.x * GEMM_ROWS, (int)tgpig.y * GEMM_ACTS,
                            tiitg, sgitg, tiisg);
 }
 
@@ -351,9 +360,9 @@ kernel void gemm_kernel(device const typename Q::Block * W [[buffer(0)]],
 // threadgroup takes the segment whose first weight-tile group it is at or
 // past, and the rows are the ones a launch of that segment alone would
 // write, at the segment's own column offset.
-template <typename Q, typename T, bool RESID>
+template <typename Q, typename T, typename X, bool RESID>
 kernel void gemm_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
-                            device const float      * x [[buffer(1)]],
+                            device const X          * x [[buffer(1)]],
                             device float            * y [[buffer(2)]],
                             constant GemmSegArgs    & args [[buffer(3)]],
                             device atomic_uint      * faults [[buffer(4)]],
@@ -364,28 +373,29 @@ kernel void gemm_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
     threadgroup char shmem[gemm_shmem_bytes<T>()];
     uint s = 0;
     for (uint i = args.nseg; i > 0; --i) {
-        if (tgpig.y >= args.segs[i - 1u].first_group) {
+        if (tgpig.x >= args.segs[i - 1u].first_group) {
             s = i - 1u;
             break;
         }
     }
-    const uint local = tgpig.y - args.segs[s].first_group;
+    const uint local = tgpig.x - args.segs[s].first_group;
     const ulong wblocks = args.segs[s].wblocks;
-    gemm_tile<Q, T, RESID>(shmem,
+    gemm_tile<Q, T, X, RESID>(shmem,
                            W + wblocks,
                            x,
                            y + args.segs[s].out,
                            (int)args.segs[s].rows, (int)args.cols, (int)args.acts,
                            args.x_stride, args.y_stride, args.layer, faults,
-                           (int)local * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS,
+                           (int)local * GEMM_ROWS, (int)tgpig.y * GEMM_ACTS,
                            tiitg, sgitg, tiisg);
 }
 
 // The entries, under the names the host launches: every weight type, both
-// epilogues, both operand types, plain and segmented.
+// epilogues, both operand types and the f16 arm over half rows, plain and
+// segmented.
 
 #define GEMM_ENTRY(SUFFIX, Q, T, RESID, SEG)                                          \
-    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, T, RESID>(             \
+    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, T, float, RESID>(      \
         device const Q::Block * W [[buffer(0)]],                                     \
         device const float    * x [[buffer(1)]],                                     \
         device float          * y [[buffer(2)]],                                     \
@@ -397,7 +407,7 @@ kernel void gemm_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
         ushort tiisg [[thread_index_in_simdgroup]]);
 
 #define GEMM_SEG_ENTRY(SUFFIX, Q, T, RESID, SEG)                                      \
-    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, T, RESID>(             \
+    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, T, float, RESID>(      \
         device const Q::Block * W [[buffer(0)]],                                     \
         device const float    * x [[buffer(1)]],                                     \
         device float          * y [[buffer(2)]],                                     \
@@ -448,3 +458,62 @@ GEMM_SEG_ENTRY(q5k_seg_store_f16, Q5K, half, false, gemm_seg_kernel)
 GEMM_SEG_ENTRY(q5k_seg_store_f32, Q5K, float, false, gemm_seg_kernel)
 GEMM_SEG_ENTRY(q5k_seg_resid_f16, Q5K, half, true, gemm_seg_kernel)
 GEMM_SEG_ENTRY(q5k_seg_resid_f32, Q5K, float, true, gemm_seg_kernel)
+
+#define GEMM_H16_ENTRY(SUFFIX, Q, RESID, SEG, ARGS)                                   \
+    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, half, half, RESID>(    \
+        device const Q::Block * W [[buffer(0)]],                                     \
+        device const half     * x [[buffer(1)]],                                     \
+        device float          * y [[buffer(2)]],                                     \
+        constant ARGS         & args [[buffer(3)]],                                  \
+        device atomic_uint    * faults [[buffer(4)]],                                \
+        uint3  tgpig [[threadgroup_position_in_grid]],                               \
+        ushort tiitg [[thread_index_in_threadgroup]],                                \
+        ushort sgitg [[simdgroup_index_in_threadgroup]],                              \
+        ushort tiisg [[thread_index_in_simdgroup]]);
+
+#define GEMM_H16_ENTRIES(STEM, Q)                                                     \
+    GEMM_H16_ENTRY(STEM##_store_h16, Q, false, gemm_kernel, GemmArgs)                 \
+    GEMM_H16_ENTRY(STEM##_resid_h16, Q, true, gemm_kernel, GemmArgs)                  \
+    GEMM_H16_ENTRY(STEM##_seg_store_h16, Q, false, gemm_seg_kernel, GemmSegArgs)      \
+    GEMM_H16_ENTRY(STEM##_seg_resid_h16, Q, true, gemm_seg_kernel, GemmSegArgs)
+
+GEMM_H16_ENTRIES(q4k, Q4K)
+GEMM_H16_ENTRIES(q6k, Q6K)
+GEMM_H16_ENTRIES(a4, A4)
+GEMM_H16_ENTRIES(q8_0, Q8_0)
+GEMM_H16_ENTRIES(q5k, Q5K)
+
+// The argument block of the activations' cast, bound by value at slot 2.
+struct GemmCastArgs {
+    uint cols;     // the values of a row, a multiple of four
+    uint acts;     // the rows
+    uint x_stride; // the f32 elements between x's rows, at least cols
+    uint y_stride; // the half elements between y's rows, a multiple of four
+    uint layer;    // the layer a raise is recorded in
+};
+
+static_assert(sizeof(GemmCastArgs) == 20, "GemmCastArgs is five words");
+
+// The threads of a cast threadgroup, four values each: 512 values of one row.
+#define GEMM_CAST_THREADS 128
+
+// The half rows the _h16 entries read: every value of `acts` rows of `cols`
+// through the staging's own checked cast (gemm_half4), once — the f16
+// entries run it over every value once per weight tile. A thread loads four
+// values as scalars (no window alignment is assumed, the staging's own
+// loads) and stores them as one half4; the grid is the rows' 512-value runs
+// across x and the rows down y.
+kernel void gemm_cast_rows(device const float      * x [[buffer(0)]],
+                           device half             * y [[buffer(1)]],
+                           constant GemmCastArgs   & args [[buffer(2)]],
+                           device atomic_uint      * faults [[buffer(3)]],
+                           uint3  tgpig [[threadgroup_position_in_grid]],
+                           ushort tiitg [[thread_index_in_threadgroup]]) {
+    const uint c = 4u * (tgpig.x * GEMM_CAST_THREADS + (uint)tiitg);
+    if (c >= args.cols || tgpig.y >= args.acts) {
+        return;
+    }
+    device const float * xr = x + (ulong)tgpig.y * args.x_stride + c;
+    const float4 v = float4(xr[0], xr[1], xr[2], xr[3]);
+    *(device half4 *)(y + (ulong)tgpig.y * args.y_stride + c) = gemm_half4(v, faults, args.layer);
+}

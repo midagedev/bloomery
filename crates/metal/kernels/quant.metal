@@ -691,15 +691,29 @@ struct A4 {
 
     // Sixteen consecutive values of a group, [16*il, 16*il + 16) in natural
     // order (value 16*il + j at reg[j/4][j%4]), the GEMM's A staging: the
-    // 4x4 of the operand type one thread holds. The value is the owner's
-    // own `value` (a quarter of a group is whole inside its two code words),
-    // computed in f32 and rounded once into the operand type.
+    // 4x4 of the operand type one thread holds, `value`'s bits in fewer
+    // instructions. A 16-bit code word holds four values; value t of it is
+    // its nibble t masked in place, q·16^t (exact as a float), times the
+    // scale over 16^t (exact: a power of two), plus the bias in one fma.
+    // The product q·s is exact (a 4-bit code by a BF16's 8-bit mantissa), so
+    // the fma's one rounding is `value`'s add and the f32 sum is `value`'s;
+    // it is rounded once into the operand type.
     template <typename T>
     static inline void dequant16(device const Block & blk,
                                  short il,
                                  thread matrix<T, 4, 4> & reg) {
-        for (short j = 0; j < 16; ++j) {
-            reg[j / 4][j % 4] = value(blk, (uint)(16 * il + j));
+        device const uint16_t * w = (device const uint16_t *)blk.qs + 4 * il;
+        const float s0 = scale_of(blk);
+        const float b = bias_of(blk);
+        const float s1 = s0 * (1.f / 16.f);
+        const float s2 = s0 * (1.f / 256.f);
+        const float s3 = s0 * (1.f / 4096.f);
+        FOR_UNROLL(short h = 0; h < 4; ++h) {
+            const uint word = (uint)w[h];
+            reg[h][0] = fma((float)(word & 0x000Fu), s0, b);
+            reg[h][1] = fma((float)(word & 0x00F0u), s1, b);
+            reg[h][2] = fma((float)(word & 0x0F00u), s2, b);
+            reg[h][3] = fma((float)(word & 0xF000u), s3, b);
         }
     }
 };
