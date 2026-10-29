@@ -34,8 +34,10 @@
 //!   anything moves. Each precondition line prints the host's wall waiting
 //!   for the tier, not a clause. Structure [derived]: the
 //!   tier's stage step graph and each verify graph hold the reference's
-//!   nodes less one a tier layer (its card leg drops the card sum, which the
-//!   join takes after the wait) plus [`HOST_LEG_NODES`] a tier layer the
+//!   nodes less one a tier layer the reference's plan hosts experts on (its
+//!   card leg drops the card sum, which the join takes after the wait; a
+//!   layer the reference hosts nothing on already joins its card rows there)
+//!   plus [`HOST_LEG_NODES`] a tier layer the
 //!   reference's plan hosts nothing on, read per layer from that plan (the
 //!   reference's load runs such a layer without a host leg, no go and no
 //!   wait; the tier load keeps the leg on every tier layer, its stage card
@@ -432,15 +434,20 @@ mod gate {
             .map(|&l| reference.host_experts(l))
             .collect::<Result<Vec<u64>, _>>()?;
         let unhosted = hosted.iter().filter(|&&n| n == 0).count();
+        // PIN(2026-10-29): a hostless layer joins its retained card rows with the shared add in
+        // one launch (c7b642055), as a tier layer does, so only a tier layer the reference hosts
+        // experts on drops a card sum: the reference's [121, 125, 125, 125] with all four tier
+        // layers unhosted gives [129, 133, 133, 133], the count this clause was red on.
+        let hosted_tier = t - unhosted;
         let stage: Vec<usize> = want
             .stage_nodes
             .iter()
-            .map(|n| n + HOST_LEG_NODES * unhosted - t)
+            .map(|n| n + HOST_LEG_NODES * unhosted - hosted_tier)
             .collect();
         let mut ok = got.stage_nodes == stage;
         println!(
             "structure: the stage graphs of the step and the 2, 3, 4-row verifies hold {:?} nodes, \
-             the reference's {:?} less one a tier layer ({t}) plus the go and the wait \
+             the reference's {:?} less one a tier layer it hosts experts on ({hosted_tier}) plus the go and the wait \
              ({HOST_LEG_NODES}) of each tier layer its plan hosts nothing on ({unhosted}; host \
              experts a tier layer {hosted:?}) = {stage:?}: {}",
             got.stage_nodes,
