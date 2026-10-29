@@ -39,8 +39,10 @@ pub fn main(seat: &Seat) -> ExitCode {
         Ok(v) => v,
         Err(e) => return refuse(Code::Usage, e),
     };
-    // `--list-devices` is answered before any argument is read, as `bloomery-serve` does.
+    // `--list-devices` and `--records-schema` are left to the start, as `bloomery-serve` leaves
+    // them: the seat's check would refuse a flag its own parser does not read.
     if !asked(llama_place::LIST_DEVICES)
+        && !asked("--records-schema")
         && let Err(e) = early(seat, &rest, &side)
     {
         // A seat asked for its usage answers with it as its refusal: that is the answer.
