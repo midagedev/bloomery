@@ -14,6 +14,7 @@ in [`docs/bloomery/`](https://github.com/midagedev/rig-log/tree/main/docs/bloome
 | Page | What it covers |
 |---|---|
 | [`evaluating.md`](evaluating.md) | A checklist to run bloomery and compare it fairly; hardware reports |
+| [`agents.md`](agents.md) | Starting the server from an agent: the commands, the events to wait on, the exit codes |
 | [`serving.md`](serving.md) | llama-server compatibility, the flags, the seats, concurrent requests, drafts, residency, limits |
 | [`models.md`](models.md) | The recommended files and what each model needs in GPU, RAM and disk |
 | [`performance.md`](performance.md) | The numbers' conditions, why it is fast, how it is verified, recorded sessions |

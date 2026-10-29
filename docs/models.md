@@ -25,6 +25,10 @@
 | lev | [`Q4_K_M`](https://huggingface.co/ggml-org/lev-GGUF) (ggml-org) | whole on one GPU; its label readout in the file |
 | DeepSeek-V2-Lite-Chat | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
 
+A model starts by name (`bloomery-serve --model NAME`, [`agents.md`](agents.md)) from a row of `tools/catalog.tsv`.
+`tools/check-catalog-docs.sh` holds the Recommended file of each row above that the catalog names, and the README's Use
+table, to those rows.
+
 Each file is the public upload as downloaded; the downloads are checked against the uploads' sha256. How close
 each Clef quantization answers to the BF16 release, per question: [agreement table](https://huggingface.co/midagedev/clef-flash-bloomery).
 The DSpark draft for V4.1 is converted from DeepSeek's checkpoint (the converter in llama.cpp's V4.1 pull

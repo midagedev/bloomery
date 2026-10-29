@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every `bloomery-serve --hf <repo>:<quant>` row of the README's Use table is checked against what Hugging Face serves now: the quant's shard 1 is range-read and its `general.architecture` goes through a mirror of the serve router, because a file's architecture string can differ from the module name and only the file the hub serves today shows it.
+"""Every GGUF row of the model catalog (tools/catalog.tsv) is checked against what Hugging Face serves now, and so is every row of the README's Use table whose seat the catalog names no model of (the decide seat): the quant's shard 1 is range-read and its `general.architecture` goes through a mirror of the serve router, because a file's architecture string can differ from the module name and only the file the hub serves today shows it.
 
     tools/hf-arch-check.py --live         read the hub, check every row (network: huggingface.co only)
     tools/hf-arch-check.py --live --box [--box-hash]
@@ -8,10 +8,13 @@
     tools/hf-arch-check.py box-facts [--hash] [--grep FILE STRING]... <paths...>
                                           what --live --box runs on the box
 
---live reads README.md's Use table (the rows are the table's, never a list of this tool's), the listing of each
-repo (`api/models/<repo>/tree/main?recursive=true`), picks the quant's set as the hf crate does, and range-reads
-shard 1's header with curl: 1 MiB, then doubled by fetching only the next slice, at most 64 MiB a row. It prints
-one line per row:
+--live reads the catalog (the rows are tools/catalog.tsv's, through tools/bloomery/catalog.py, never a list of this
+tool's) and README.md's Use table (rows of a seat the catalog has no model of; the Use table's other rows are held to the
+catalog by tools/check-catalog-docs.sh). Each row is read at its revision: the commit the catalog pins, `main` where it pins
+none. A catalog row is started by name, so the router is asked as that start asks it, with the seat's word beside the file.
+A checkpoint-folder row has no GGUF header and is named on stderr, not read. For each row it reads the listing of the repo
+(`api/models/<repo>/tree/<revision>?recursive=true`), picks the quant's set as the hf crate does, and range-reads shard 1's
+header with curl: 1 MiB, then doubled by fetching only the next slice, at most 64 MiB a row. It prints one line per row:
 
     hf-arch <seat> <repo>:<quant> shard1=<path> arch=<arch> route=<ok|REFUSED: ...> embd=<type> exps=<types> types=<ok|printed|REFUSED: ...>
 
@@ -25,7 +28,7 @@ tensor and its list); every other seat
 decides its weight types in several places, so types=printed names them and nothing is judged from the types.
 
 --live --box runs `box-facts` on the box through tools/box.sh (it syncs this tree to the box and builds nothing) for
-every file of every row's set at the paths `BOX_FILES` names, and compares each with the hub's listing: absent, size, then
+every file of the set of each README Use row (the files the gates load) at the paths `BOX_FILES` names, and compares each with the hub's listing: absent, size, then
 the sha256 from the file's `.verified` marker, else from this machine's cache (path, size, mtime_ns), else the file stays
 `unhashed` and the run prints the one hash command with the bytes it reads and its wall. `--box-hash` hashes those files on
 the box with O_DIRECT reads into page-aligned buffers, never through the page cache and with no buffered fallback. Per file:
@@ -43,7 +46,7 @@ string it is a FAIL naming the exception.
 architecture strings of `Arch::from_name` and of the model reader are not mirrored: they are read from
 tools/arch-registry.tsv, the print of the model crate's registry (`fixture registry`, crates/model/src/arch/registry.rs),
 which a model test holds equal to the registry; the self-test fails where a seat serves a string the registry has no
-reader for. It also runs the checks on synthetic GGUF headers, the README parser and the hf crate's own `names` examples.
+reader for. It also runs the checks on synthetic GGUF headers, the README parser, the catalog rows and the hf crate's own `names` examples.
 
 Exit status: 0 every row green (and, with --box, no file FAIL); 1 a row red (every row is checked first) or a self-test failed; 64 a usage error;
 65 a README or a source this tool cannot read, by name; 69 the network or the hub (curl 5, 6, 7, 28, 35, 52, 55, 56,
@@ -90,6 +93,8 @@ def load_by_path(name, *rel):
 # The hub reads, the GGUF sets of a listing, the ggml type names and the header read are tools/bloomery/hf.py's, which
 # tools/type-census.py reads the same way.
 hf = load_by_path("bloomery_hf", "tools", "bloomery", "hf.py")
+# The catalog's rows are tools/bloomery/catalog.py's, the one reader of tools/catalog.tsv.
+catalog = load_by_path("bloomery_catalog", "tools", "bloomery", "catalog.py")
 Refuse, Red, Entry, NeedMore = hf.Refuse, hf.Red, hf.Entry, hf.NeedMore
 GGML_TYPES = hf.GGML_TYPES
 alnum, is_model, split_of, tag_of, gguf_sets = hf.alnum, hf.is_model, hf.split_of, hf.tag_of, hf.gguf_sets
@@ -97,6 +102,9 @@ parse_listing, hex_of, next_link = hf.parse_listing, hf.hex_of, hf.next_link
 gguf_ranges, parse_header, read_header = hf.gguf_ranges, hf.parse_header, hf.read_header
 MIB, FIRST_READ = hf.MIB, hf.FIRST_READ
 ROW_BUDGET = 64 * MIB
+# One row of the live check: the seat, the repo and quant the start names, the row's line in its file, the revision the
+# row is read at, the seat word the start passes beside the file (None: `--hf` alone, no word) and where the row is from.
+Row = collections.namedtuple("Row", "seat repo quant line revision word origin", defaults=("main", None, "README"))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -259,10 +267,11 @@ def serves(seat, arch):
     return arch in seat_names(seat)
 
 
-def decide_pick(arch, decision, repo, card):
-    """crates/serve/src/decide.rs:pick with no --model word and no head flag, as `bloomery-serve` calls it
-    (bloomery_serve.rs:head_of): ("refused", text), ("decide", row) or None for the generative seats. `card(repo)`
-    is the repo the model card says `repo` quantizes (None for no such card); it is called only where pick reads it."""
+def decide_pick(arch, decision, repo, card, word=None):
+    """crates/serve/src/decide.rs:pick with no head flag, as `bloomery-serve` calls it (bloomery_serve.rs:head_of), and
+    `word` the `--model` word beside the file (None: no word; a start by catalog name passes its seat's word):
+    ("refused", text), ("decide", row) or None for the generative seats. `card(repo)` is the repo the model card says
+    `repo` quantizes (None for no such card); it is called only where pick reads it."""
     for row in DECIDE_ROWS:
         for unserved_arch, why in row["unserved"]:
             if unserved_arch == arch:
@@ -273,13 +282,16 @@ def decide_pick(arch, decision, repo, card):
         if row is None:
             return ("refused", f"a {arch} file whose {arch}.decision.type is {decision}: this server serves no such "
                                f"decision model; it serves {served_in_file()}")
+        if word not in (None, DECIDE_WORD):
+            return ("refused", f"--model {word} on a {decision} file: a decision model is the decide seat's "
+                               f"(--model {DECIDE_WORD}, or no --model)")
         return ("decide", row)
     row = next((r for r in DECIDE_ROWS if arch in r["in_file_arch"]), None)
-    if row is not None:
+    if row is not None and word in (None, DECIDE_WORD):
         return ("decide", row)
     backbone = any(arch in r["backbones"] for r in DECIDE_ROWS)
     generative = arch != "qwen35" and any(serves(s, arch) for s in SEAT_ORDER)
-    if generative or not backbone:
+    if word != DECIDE_WORD and (word is not None or generative or not backbone):
         return None
     base = card(repo)
     row = next((r for r in DECIDE_ROWS if r["head_repo"] is not None and base == r["head_repo"]
@@ -304,20 +316,22 @@ def no_head(arch):
             f"whose model card names a row's head repo as the model it quantizes seats it: {heads}")
 
 
-def route(arch, decision, repo, card, spec=None):
+def route(arch, decision, repo, card, spec=None, word=None):
     """The seat `bloomery-serve --hf <repo>` seats a first shard of architecture `arch` in
     (bloomery_serve.rs:run: head_of, then seat_of_file), and whether the model reader takes it.
-    `spec` is the architectures the reader takes (SPEC). -> (seat word, None) or (None, refusal text)."""
+    `spec` is the architectures the reader takes (SPEC); `word` the `--model` word beside the file (a start by catalog
+    name passes its seat's). -> (seat word, None) or (None, refusal text)."""
     spec = SPEC if spec is None else spec
     if arch is None:
         return None, ("the first shard names no architecture; the seats are --model "
                       + ", ".join(SEAT_WORDS))
-    picked = decide_pick(arch, decision, repo, card)
+    picked = decide_pick(arch, decision, repo, card, word)
     if picked is not None and picked[0] == "refused":
         return None, picked[1]
     if picked is not None:
         seat = DECIDE_WORD
-    elif any(arch in r["backbones"] for r in DECIDE_ROWS):
+    elif word != "qwen3" and any(arch in r["backbones"] for r in DECIDE_ROWS):
+        # seat_of_file: the qwen3 word alone admits a decision row's backbone (a dense `qwen35` file) as a chat model.
         return None, no_head(arch)
     else:
         seat = next((s for s in SEAT_ORDER if serves(s, arch)), None)
@@ -622,9 +636,10 @@ def body35_types(tensors_by_shard, lists=None):
 
 
 def check_row(row, hub, scratch, picked=None):
-    """One README row: (stdout line, green). The hub's own refusals of the row's repo are a red line; the network's
-    are a Refuse(69). The set the quant picked is `picked["files"]` (Entry list) once it is."""
-    seat, repo, quant, _ = row
+    """One row (a Row, or its first fields): (stdout line, green). The hub's own refusals of the row's repo are a red
+    line; the network's are a Refuse(69). The set the quant picked is `picked["files"]` (Entry list) once it is."""
+    row = Row(*row)
+    seat, repo, quant, revision = row.seat, row.repo, row.quant, row.revision
     unread = "unread"
     shard1, arch = "none", unread
     head = f"hf-arch {seat} {repo}:{quant}"
@@ -633,11 +648,11 @@ def check_row(row, hub, scratch, picked=None):
     def fetch(p):
         def go(start, end):
             spent[0] += end - start
-            return hub.range(repo, p, start, end)
+            return hub.range(repo, p, start, end, revision)
         return go
 
     try:
-        entries = hub.listing(repo)
+        entries = hub.listing(repo, revision)
         chosen = pick(repo, gguf_sets(repo, entries), quant)
         if picked is not None:
             picked["files"] = chosen["files"]
@@ -650,9 +665,9 @@ def check_row(row, hub, scratch, picked=None):
                     f"types=not-reached"), False
         arch = meta_str(meta, "general.architecture")
         decision = meta_str(meta, f"{arch}.decision.type") if arch else None
-        seat_of, why = route(arch, decision, repo, lambda r: hub.card(r, entries))
+        seat_of, why = route(arch, decision, repo, lambda r: hub.card(r, entries), word=row.word)
         if why is None and seat_of != seat:
-            why = f"the router seats a {arch} file in the {seat_of} seat, and the README row says {seat}"
+            why = f"the router seats a {arch} file in the {seat_of} seat, and the {row.origin} row says {seat}"
         shown_route = "ok" if why is None else f"REFUSED: {why}"
     except Red as e:
         return (f"{head} shard1={shard1} arch={arch} route=REFUSED: {e} embd={unread} exps={unread} "
@@ -685,7 +700,8 @@ def check_row(row, hub, scratch, picked=None):
                          f"{body35_where('PROJ', 'the lists are declared in')} and "
                          f"{body35_where('EMBED', 'the lists are declared in')})")
     elif types is None:
-        types = "printed (no one owner: " + ", ".join(places(seat)) + ")"
+        types = ("printed (no one owner: " + ", ".join(places(seat)) + ")") if seat in TYPE_PLACES else (
+            f"printed (the {seat} seat decides its types in its own code; this tool lists no place for it)")
     return (f"{head} shard1={shard1} arch={arch or '<missing>'} route={shown_route} embd={embd or 'not-found'}{tail} "
             f"exps={exps or 'none'}{tail} types={types}"), green
 
@@ -1106,15 +1122,41 @@ def box_compare(picked, runner, cache_path, hash_misses, out):
     return green, counts["fail"]
 
 
-def live(readme_path=None, text=None, box=False, box_hash=False, hub_factory=None, runner=None, cache_path=BOX_CACHE):
-    if text is None:
-        path = readme_path or os.path.join(ROOT, README)
-        try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-        except OSError as e:
-            raise Refuse(65, f"{path}: {e.strerror}")
-    rows = use_rows(text)
+def catalog_rows(rows):
+    """(the live Rows of the catalog `rows`' GGUF rows, the checkpoint-folder rows it does not read). A start by catalog
+    name passes its seat's word beside the file, so the router is asked with it."""
+    gguf = [Row(r.seat, r.repo, r.quant, r.line, r.revision, r.seat, "catalog") for r in rows if r.quant is not None]
+    return gguf, [r for r in rows if r.quant is None]
+
+
+def read_text_of(path, given=None):
+    """`given`, else the text of `path`; a file this cannot read is a Refuse(65) naming it."""
+    if given is not None:
+        return given
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        raise Refuse(65, f"{path}: {e.strerror}")
+
+
+def live(readme_path=None, text=None, box=False, box_hash=False, hub_factory=None, runner=None, cache_path=BOX_CACHE,
+         catalog_text=None):
+    """The live check: every GGUF row of the catalog and the README's Use rows of seats the catalog has no model of. The
+    box comparison is of the README's rows, the files the gates load."""
+    text = read_text_of(readme_path or os.path.join(ROOT, README), text)
+    try:
+        cat = catalog.read(read_text_of(os.path.join(ROOT, catalog.CATALOG_TSV), catalog_text), catalog.CATALOG_TSV)
+    except catalog.Invalid as e:
+        raise Refuse(65, str(e))
+    use = use_rows(text)
+    catalog_live, folders = catalog_rows(cat)
+    seats = {r.seat for r in cat}
+    rows = catalog_live + [Row(*u) for u in use if u[0] not in seats]
+    boxed = {(u[0], u[1], u[2]) for u in use}
+    if folders:
+        print("hf-arch: not read, checkpoint folders (no GGUF header): " + ", ".join(
+            f"{r.seat} {r.hf}" for r in folders), file=sys.stderr, flush=True)
     green_rows, picked = [], {}
     with tempfile.TemporaryDirectory() as scratch:
         hub = (hub_factory or Hub)(scratch)
@@ -1123,11 +1165,11 @@ def live(readme_path=None, text=None, box=False, box_hash=False, hub_factory=Non
             got = {}
             line, green = check_row(row, hub, scratch, got)
             print(line, flush=True)
-            print(f"hf-arch: {row[1]}:{row[2]} {hub.requests - before[0]} requests, {hub.bytes - before[1]} bytes",
+            print(f"hf-arch: {row.repo}:{row.quant} {hub.requests - before[0]} requests, {hub.bytes - before[1]} bytes",
                   file=sys.stderr, flush=True)
             green_rows.append(green)
-            if "files" in got:
-                picked[len(green_rows) - 1] = (row[0], row[1], row[2], got["files"])
+            if "files" in got and (row.seat, row.repo, row.quant) in boxed:
+                picked[len(green_rows) - 1] = (row.seat, row.repo, row.quant, got["files"])
     if box:
         boxed, _ = box_compare(picked, runner or box_runner, cache_path, box_hash, sys.stdout)
         green_rows = [g and boxed.get(i, True) for i, g in enumerate(green_rows)]
@@ -1844,11 +1886,14 @@ class FakeHub:
         self.repos, self.cards = repos, cards or {}
         self.requests = self.bytes = 0
         self.card_asked = []
+        self.revisions = []
 
-    def listing(self, repo):
+    def listing(self, repo, revision="main"):
+        self.revisions.append(("listing", repo, revision))
         return [Entry(p, len(b), "sha256", hashlib.sha256(b).hexdigest()) for p, b in self.repos[repo].items()]
 
-    def range(self, repo, path, start, end):
+    def range(self, repo, path, start, end, revision="main"):
+        self.revisions.append(("range", repo, revision))
         data = self.repos[repo][path][start:end]
         if len(data) != end - start:
             raise Red(f"{repo}: the range {start}-{end - 1} of {path} is past its {len(self.repos[repo][path])} bytes")
@@ -2007,12 +2052,13 @@ def self_test():
 
     # -- synthetic headers through check_row
     with tempfile.TemporaryDirectory() as tmp:
-        def row_line(seat, arch, tensors=(), extra=(), vocab=0, quant="Q4_K_M", cards=None, files=None, repo="own/m-GGUF"):
+        def row_line(seat, arch, tensors=(), extra=(), vocab=0, quant="Q4_K_M", cards=None, files=None, repo="own/m-GGUF",
+                     word=None, origin="README", revision="main"):
             path = os.path.join(tmp, "m.gguf")
             blob = synth(path, arch, tensors, extra, vocab)
             fs = files if files is not None else {f"m-{quant}.gguf": blob}
             hub = FakeHub({repo: fs}, cards)
-            line, green = check_row((seat, repo, quant, 0), hub, tmp)
+            line, green = check_row(Row(seat, repo, quant, 0, revision, word, origin), hub, tmp)
             return line, green, hub
 
         small = [("token_embd.weight", 11, [256, 2], b"\0" * 8), ("blk.0.ffn_gate_exps.weight", 12, [256, 2, 2], b"\0" * 8),
@@ -2044,6 +2090,24 @@ def self_test():
         line, green, _ = row_line("qwen3", "llama", small)
         check("a llama file routes to the qwen3 seat, by the program of its description",
               green and "arch=llama route=ok" in line, line)
+        # a start by catalog name passes its seat's word beside the file
+        line, green, _ = row_line("qwen3", "qwen35", small)
+        check("a dense qwen35 file with no word is a decision backbone with no head",
+              not green and "a qwen35 file with no head" in line, line)
+        line, green, _ = row_line("qwen3", "qwen35", small, word="qwen3", origin="catalog")
+        check("the qwen3 word admits a dense qwen35 file as a chat model", "arch=qwen35 route=ok" in line, line)
+        line, green, _ = row_line("qwen3", "qwen35", small, word="glm", origin="catalog")
+        check("another generative word does not admit it", not green and "a qwen35 file with no head" in line, line)
+        line, green, _ = row_line("glm", "deepseek41", small, word="glm", origin="catalog")
+        check("a catalog row the router seats elsewhere is refused for the catalog's seat, as the catalog row",
+              not green and "in the ds41 seat, and the catalog row says glm" in line, line)
+        line, green, _ = row_line("solar2", "solar-open2", small, word="solar2", origin="catalog")
+        check("a seat with no type places is printed with no list and is not an error",
+              green and "types=printed (the solar2 seat decides its types in its own code" in line, line)
+        line, green, hub = row_line("glm", "glm5-next", small, word="glm", origin="catalog", revision="b" * 40)
+        check("a row is read at its revision, the listing and every range",
+              green and hub.revisions and all(r == "b" * 40 for _, _, r in hub.revisions)
+              and {k for k, _, _ in hub.revisions} == {"listing", "range"}, str(hub.revisions))
         # a split set: the experts are in shard 2
         p1, p2 = os.path.join(tmp, "s1.gguf"), os.path.join(tmp, "s2.gguf")
         b1 = synth(p1, "glm5-next", [small[0]])
@@ -2208,6 +2272,13 @@ def self_test():
     check("a qwen35 file whose decision type is lev seats the decide row", seat == "decide" and why is None, str(why))
     (seat, why), _ = asked("qwen35", "kev")
     check("a decision type no row serves is refused by name", seat is None and "decision.type is kev" in why, str(why))
+    clef_kind = next(k for r in DECIDE_ROWS for k in r["in_file_decision"])
+    clef_arch = next(a for r in DECIDE_ROWS if clef_kind in r["in_file_decision"] for a in r["backbones"])
+    check("a decision file with the decide word or none goes to the decide seat",
+          all(route(clef_arch, clef_kind, "o/r", lambda r: None, word=w)[0] == DECIDE_WORD for w in (None, DECIDE_WORD)))
+    (seat, why) = route(clef_arch, clef_kind, "o/r", lambda r: None, word="glm")
+    check("a decision file beside a generative word is refused by name",
+          seat is None and f"--model glm on a {clef_kind} file" in why, str(why))
     (seat, why), calls = asked("glm5-next")
     check("a generative file reads no card", seat == "glm" and not calls, f"{seat} {calls}")
     (seat, why) = route("glm5-next", None, "o/r", lambda r: None, spec=tuple(a for a in SPEC if a != "glm5-next"))
@@ -2565,11 +2636,16 @@ def box_checks(check, raises):
                 return "\n".join(lines + [f"box-fact-end\t{len(paths)}"]) + "\n"
             return run
 
+        flow_catalog = "\t".join(catalog.HEADER) + "\n" + "\t".join([
+            "glm-5.3-flash", "glm", "glm", "glm5next", "UD-Q4_K_XL", "gguf4", "unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL",
+            "a" * 40, "1", "true", "the flow test's row"]) + "\n"
+
         def run_live(table, cache="flow.tsv", **kw):
             import contextlib
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                rc = live(text=readme, box=True, hub_factory=hub, cache_path=os.path.join(tmp, cache), **kw)
+                rc = live(text=readme, box=True, hub_factory=hub, cache_path=os.path.join(tmp, cache),
+                          catalog_text=flow_catalog, **kw)
             return rc, out.getvalue()
 
         saved = BOX_FILES["glm"]
@@ -2610,6 +2686,41 @@ def box_checks(check, raises):
         stale["/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00002-of-00006.gguf"] = "f" * 64
         rc, text = run_live(box, cache="stale.tsv", runner=runner_of(box, hashed=stale), box_hash=True)
         check("a digest that differs after a hash run is a red row naming both", rc == 1 and "verdict=FAIL: digest box=" + "f" * 64 in text, text)
+
+        # the catalog's rows: every GGUF row at its own revision, a folder named and not read, and the box compared for the
+        # README's rows only
+        cat_text = "\t".join(catalog.HEADER) + "\n" + "\n".join("\t".join(r) for r in [
+            ["m-a", "ma", "glm", "glm5next", "Q4_K_M", "gguf4", "o/a-GGUF:Q4_K_M", "c" * 40, "1", "true", "n"],
+            ["m-a", "ma", "glm", "glm5next", "Q8_0", "gguf8", "o/a-GGUF:Q8_0", "main", "1", "false", "n"],
+            ["m-b", "-", "qwen3", "qwen35moe", "nvfp4", "nvfp4", "o/b-nvfp4", "d" * 40, "-", "true", "n"],
+        ]) + "\n"
+        gguf, folders = catalog_rows(catalog.read(cat_text))
+        check("the catalog's GGUF rows are the live rows, each with its seat as the word; a folder is not read",
+              [(r.seat, r.repo, r.quant, r.revision, r.word, r.origin) for r in gguf] == [
+                  ("glm", "o/a-GGUF", "Q4_K_M", "c" * 40, "glm", "catalog"), ("glm", "o/a-GGUF", "Q8_0", "main", "glm", "catalog")]
+              and [r.hf for r in folders] == ["o/b-nvfp4"], str((gguf, folders)))
+        one = blob("a.gguf", "glm5-next")
+        hub2 = FakeHub({"o/a-GGUF": {"a-Q4_K_M.gguf": one, "a-Q8_0.gguf": one},
+                        "bartowski/Cloudflare_clef-flash-GGUF": clef_file})
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = live(text=readme, box=True, hub_factory=lambda scratch: hub2, cache_path=os.path.join(tmp, "cat.tsv"),
+                      catalog_text=cat_text, runner=runner_of(box))
+        text = out.getvalue()
+        check("a catalog row is a row of the run, and the README's row of a seat the catalog names no model of is one too",
+              rc == 0 and "hf-arch rows=3 ok=3 red=0" in text and text.count("hf-arch glm o/a-GGUF:") == 2
+              and "hf-arch decide bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M " in text, text)
+        check("a README row of a seat the catalog names a model of is not read twice", "unsloth/GLM-5.3-Flash-GGUF" not in text, text)
+        check("each row is read at its own revision", ("listing", "o/a-GGUF", "c" * 40) in hub2.revisions
+              and ("listing", "o/a-GGUF", "main") in hub2.revisions, str(hub2.revisions))
+        check("a checkpoint folder is named on stderr and not read",
+              "not read, checkpoint folders (no GGUF header): qwen3 o/b-nvfp4" in err.getvalue()
+              and not any(r[1] == "o/b-nvfp4" for r in hub2.revisions), err.getvalue())
+        check("the box is compared for the README's rows only", "hf-arch-box files=2 " in text and "o/a-GGUF" not in "".join(
+            l for l in text.splitlines() if l.startswith("hf-arch-box")), text)
+        got = raises(lambda: live(text=readme, catalog_text="not a catalog\n", hub_factory=hub), Refuse, "the header is")
+        check("an unreadable catalog is a refusal that names it", got[0] and "tools/catalog.tsv" in got[1], got[1])
 
         # the named exception in the whole flow: the real entry's sizes patched to the fake shard's (the same 125 bytes
         # short), restored in the finally
