@@ -20,7 +20,8 @@ use crate::fault::MetalFaultWord;
 use crate::library::Pipeline;
 
 use super::{
-    Kernels, Quant, WeightAlign, args_bytes, check_weights_align, check_window_len, pack, word,
+    Kernels, LoadNorm, Quant, WeightAlign, args_bytes, check_weights_align, check_window_len, pack,
+    word,
 };
 
 /// The columns of every row of the head: the hidden width (`Geometry::hidden`).
@@ -58,16 +59,13 @@ pub struct HeadParams<'w> {
     pub weights: Window<'w, u8, MetalDevice>,
     /// The input, `k` values, starting on a 16-byte boundary of its buffer.
     pub x: Window<'w, f32, MetalDevice>,
-    /// The output norm's gain, `k` values, starting on a 16-byte boundary of
-    /// its buffer.
-    pub gain: Window<'w, f32, MetalDevice>,
+    /// The output norm: its gain, or the scale of the join that applied it.
+    pub norm: LoadNorm<'w>,
     /// The logits, `rows` values: the first dispatch's output and the
     /// second's input.
     pub logits: WindowMut<'w, f32, MetalDevice>,
     /// The winning row, one `u32`.
     pub step_id: WindowMut<'w, u32, MetalDevice>,
-    /// The epsilon added to the mean of the squares.
-    pub eps: f32,
     /// The fault word a raise lands in.
     pub fault: &'w MetalFaultWord,
     /// The layer a raise is recorded in.
@@ -108,26 +106,28 @@ fn check(p: &HeadParams<'_>, rows_per_group: usize) -> Result<Shape, DeviceError
             p.rows
         )));
     }
-    if !p.eps.is_finite() {
-        return Err(refuse(format!("eps {} is not finite", p.eps)));
+    if let LoadNorm::Gain { eps, .. } = p.norm
+        && !eps.is_finite()
+    {
+        return Err(refuse(format!("eps {eps} is not finite")));
     }
     let nblocks = p.k / p.quant.values_per_block();
     let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.k)))?;
     check_window_len(WHAT, "x", p.x.len(), p.k)?;
-    check_window_len(WHAT, "gain", p.gain.len(), p.k)?;
+    p.norm.check(WHAT, p.k)?;
     check_window_len(WHAT, "logits", p.logits.len(), p.rows)?;
     check_window_len(WHAT, "step id", p.step_id.len(), 1)?;
     check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
     let start = p.weights.byte_range()?.start.get();
     check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
-    // The input and the gain are read as `float4`s.
-    for (name, start) in [
-        ("x", p.x.byte_range()?.start.get()),
-        ("gain", p.gain.byte_range()?.start.get()),
-    ] {
-        check_weights_align(WHAT, name, start, WeightAlign::Float4)?;
-    }
+    // The input is read as `float4`s.
+    check_weights_align(
+        WHAT,
+        "x",
+        p.x.byte_range()?.start.get(),
+        WeightAlign::Float4,
+    )?;
     if p.simdgroups != HEAD_SIMD_GROUPS {
         return Err(refuse(format!(
             "the SIMD-group count is {}, the kernel runs {HEAD_SIMD_GROUPS}",
@@ -186,15 +186,19 @@ impl Kernels {
     /// The logits pipeline of `p`'s type and its checked shape. A type with no
     /// head entry is refused by name: the entry is absent, not defaulted.
     fn head_checked(&self, p: &HeadParams<'_>) -> Result<(&Pipeline, Shape), DeviceError> {
-        let pipeline = match p.quant {
-            Quant::Q6K => &self.head_logits_q6k,
-            Quant::A4 => &self.head_logits_a4,
-            Quant::Q8_0 => &self.head_logits_q8_0,
-            Quant::Q5K => &self.head_logits_q5k,
-            Quant::Q4K => {
+        let pipeline = match (p.quant, p.norm.scaled()) {
+            (Quant::Q6K, false) => &self.head_logits_q6k,
+            (Quant::A4, false) => &self.head_logits_a4,
+            (Quant::Q8_0, false) => &self.head_logits_q8_0,
+            (Quant::Q5K, false) => &self.head_logits_q5k,
+            (Quant::Q6K, true) => &self.head_logits_q6k_scaled,
+            (Quant::A4, true) => &self.head_logits_a4_scaled,
+            (Quant::Q8_0, true) => &self.head_logits_q8_0_scaled,
+            (Quant::Q5K, true) => &self.head_logits_q5k_scaled,
+            (Quant::Q4K, _) => {
                 return Err(refuse("Q4_K has no head entry".to_string()));
             }
-            Quant::F32 => {
+            (Quant::F32, _) => {
                 return Err(refuse("F32 has no head entry".to_string()));
             }
         };
@@ -209,12 +213,12 @@ impl Kernels {
         p: &HeadParams<'_>,
         shape: &Shape,
     ) -> Result<(), DeviceError> {
-        let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.eps.to_bits()]);
+        let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.norm.eps().to_bits()]);
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.x)?)?;
-        slot.set(Binding::of(&p.gain)?)?;
+        slot.set(Binding::of(p.norm.window())?)?;
         slot.set(Binding::of_mut(&p.logits)?)?;
         slot.set(p.fault.binding())?;
         slot.set(Binding::bytes(pack(&args))?)?;

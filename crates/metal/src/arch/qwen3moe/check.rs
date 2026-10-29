@@ -1679,7 +1679,8 @@ impl Checked {
             }
         }
         // The rope tables, one a distinct base and factors; the conv's output
-        // and the sandwich's join buffer, where a layer has them.
+        // and the sandwich's join buffer, where a layer has them, and the
+        // sandwich's hand-on buffer, its input and one scale word.
         for _ in &g.ropes {
             b.scratch.add(f32s(g.rope_len));
         }
@@ -1687,6 +1688,9 @@ impl Checked {
             if held {
                 b.scratch.add(f32s(g.hidden));
             }
+        }
+        if g.has_join() {
+            b.scratch.add(f32s(g.hidden + 1));
         }
         for words in [
             g.hidden,
@@ -3131,11 +3135,11 @@ mod tests {
 
     /// `Checked::bytes` of an LFM3-1.7B file, class by class: thirteen conv
     /// rings of 114,688 B in the state, the eleven attention layers' caches,
-    /// two rope tables, a conv output and a join buffer among the arena's
-    /// buffers, the gate rows beside the pass's, and the embedding twice in the
-    /// weights (the tied head is its second buffer). Mutant: the head or the
-    /// ring count, a rope table, `conv_y`, `join` or the gate rows is left out
-    /// of `Checked::bytes` or of `RowsLens`.
+    /// two rope tables, a conv output, a join buffer and a hand-on buffer
+    /// among the arena's buffers, the gate rows beside the pass's, and the
+    /// embedding twice in the weights (the tied head is its second buffer).
+    /// Mutant: the head or the ring count, a rope table, `conv_y`, `join`,
+    /// `xn` or the gate rows is left out of `Checked::bytes` or of `RowsLens`.
     #[test]
     fn the_bytes_of_an_lfm3_file_pin_the_rings_the_tables_the_gate_rows_and_the_head() {
         use super::super::arena::RECORD_SLOTS;
@@ -3176,6 +3180,9 @@ mod tests {
         let mut scratch: Vec<u64> = vec![f32s(1); 2 * 24];
         scratch.extend([CTX * g.attn.rot; 2].map(f32s));
         scratch.extend([hidden; 2].map(f32s));
+        // PIN(2026-10-29): the hand-on buffer (`Arena::xn`), `hidden` values
+        // of the joined stream times the reader's gain and one scale word.
+        scratch.push(f32s(hidden + 1));
         scratch.extend(
             [
                 hidden,                                  // x

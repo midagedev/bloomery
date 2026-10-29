@@ -9,10 +9,10 @@
 //! modules, whose defect is a source edit of `crates/metal/src/kernels/*.rs`:
 //! the module is compiled into this gate's own binary, so each such defect is
 //! a one-off edit recorded in the round that proves it, not a mutant here.
-//! `matvec_refusals`, `delta_bounds`, `experts_bounds` and `fold_type` are
-//! wholly host-side; `seg_bounds`, `router_bounds`, `head_bounds` and
-//! `attn_bounds` also have a kernel-side contract, and the kernel mutants
-//! below pin that side. The gate's refusal loop turns red on a deleted launch
+//! `matvec_refusals`, `delta_bounds`, `experts_bounds`, `fold_type` and
+//! `handon_refusals` are wholly host-side; `seg_bounds`, `router_bounds`,
+//! `head_bounds` and `attn_bounds` also have a kernel-side contract, and the
+//! kernel mutants below pin that side. The gate's refusal loop turns red on a deleted launch
 //! check; a table that stayed green on one would be wrong.
 //!
 //! The tensor-op GEMMs' mutants ([`TENSOR_MUTANTS`]) edit their own program's
@@ -866,8 +866,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "pair_shared",
         why: "slot 8 reads the expert stack",
         edits: &[(
-            "pair_slot<QS>(shexp_gate, shexp_up, x,",
-            "pair_slot<QS>((device const typename QS::Block *)gate, (device const typename QS::Block *)up, x,",
+            "pair_slot<QS, SCALED>(shexp_gate, shexp_up, x,",
+            "pair_slot<QS, SCALED>((device const typename QS::Block *)gate, (device const typename QS::Block *)up, x,",
             1,
         )],
     },
@@ -1050,8 +1050,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_head",
         why: "the first stored logit of every SIMD group is doubled",
         edits: &[(
-            "faults, first_row,\n                                              (int)args.rows, tiisg);",
-            "faults, first_row,\n                                              (int)args.rows, tiisg);\n    if (tiisg == 0u && first_row < (int)args.rows) {\n        logits[first_row] *= 2.f;\n    }",
+            "gain, nullptr,\n                                                         faults, first_row, (int)args.rows, tiisg);",
+            "gain, nullptr,\n                                                         faults, first_row, (int)args.rows, tiisg);\n    if (tiisg == 0u && first_row < (int)args.rows) {\n        logits[first_row] *= 2.f;\n    }",
             1,
         )],
     },
@@ -1321,8 +1321,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "head_logit",
         why: "the first stored logit of every SIMD group is doubled",
         edits: &[(
-            "faults, first_row,\n                                              (int)args.rows, tiisg);",
-            "faults, first_row,\n                                              (int)args.rows, tiisg);\n    if (tiisg == 0u && first_row < (int)args.rows) {\n        logits[first_row] *= 2.f;\n    }",
+            "gain, nullptr,\n                                                         faults, first_row, (int)args.rows, tiisg);",
+            "gain, nullptr,\n                                                         faults, first_row, (int)args.rows, tiisg);\n    if (tiisg == 0u && first_row < (int)args.rows) {\n        logits[first_row] *= 2.f;\n    }",
             1,
         )],
     },
@@ -1396,8 +1396,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "head_bounds",
         why: "the mat-vec does not run, so the logits stay the sentinel",
         edits: &[(
-            "matvec_rows<Q, true, false, false, false>(weights, x, logits,",
-            "if (false) matvec_rows<Q, true, false, false, false>(weights, x, logits,",
+            "matvec_rows<Q, !SCALED, false, false, false, SCALED>(weights, x, logits,",
+            "if (false) matvec_rows<Q, !SCALED, false, false, false, SCALED>(weights, x, logits,",
             1,
         )],
     },
@@ -1669,6 +1669,62 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "norm_rows_raise(faults, args.norm.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = float4(NAN);",
             "norm_rows_raise(faults, args.norm.layer);\n        }\n        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n            *((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "handon_xg_no_gain",
+        clause: "handon_readers",
+        why: "the join hands on the new stream without the reader's gain",
+        edits: &[("= joined * norm_rows_load4(next_gain, f4);", "= joined;", 1)],
+    },
+    Mutant {
+        name: "handon_scale_ulp",
+        clause: "handon_readers",
+        why: "the hand-on scale is a few roundings off the reader's own, as a sum in another order is",
+        edits: &[(
+            "rms_scale(sum_squares, (uint)nb * Q::values_per_block(), next.eps);",
+            "rms_scale(sum_squares * 1.000001f, (uint)nb * Q::values_per_block(), next.eps);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "handon_seg_scale_ignored",
+        clause: "handon_readers",
+        why: "the scaled mat-vec rows skip the join's scale",
+        edits: &[(
+            "const float in_scale = SCALED ? gain[0] : 1.f;\n    // Each row's blocks",
+            "const float in_scale = 1.f;\n    // Each row's blocks",
+            1,
+        )],
+    },
+    Mutant {
+        name: "handon_pair_scale_ignored",
+        clause: "handon_readers",
+        why: "the scaled pair skips the join's scale",
+        edits: &[(
+            "const float in_scale = SCALED ? gain[0] : 1.f;\n    for (int ib",
+            "const float in_scale = 1.f;\n    for (int ib",
+            1,
+        )],
+    },
+    Mutant {
+        name: "handon_nan_scale_finite",
+        clause: "handon_nan",
+        why: "a next norm that cannot take the stream hands on its zero scale, a finite value",
+        edits: &[(
+            "xn[args.norm.cols] = NAN;",
+            "xn[args.norm.cols] = scale;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "handon_nan_xg_stays",
+        clause: "handon_nan",
+        why: "a join the norm cannot take leaves the hand-on values as they were",
+        edits: &[(
+            "if (xg != nullptr) {\n                *((device float4 *)(xg + f4 * 4u)) = float4(NAN);\n            }",
+            "",
             1,
         )],
     },

@@ -3,7 +3,7 @@
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::{Buffer, Device, Elems};
-use bloomery_metal::kernels::{BLOCK_VALUES, NormOnLoad, Quant, SegParams, Segment};
+use bloomery_metal::kernels::{BLOCK_VALUES, LoadNorm, Quant, SegParams, Segment};
 use gguf::quant::GgmlType;
 
 use super::clauses_synth;
@@ -256,12 +256,12 @@ fn refuse(
             weights: b.weights.window(Elems(0), Elems(a.weights_len))?,
             x: b.x.window(Elems(a.x_at), Elems(b.cols))?,
             y: b.y.window_mut(Elems(0), Elems(a.y_len))?,
-            norm: NormOnLoad {
+            norm: LoadNorm::Gain {
                 gain: b.gain.window(Elems(a.gain_at), Elems(b.cols))?,
                 eps: 1e-6,
-                fault: h.device.fault_word(),
-                layer: LAYER,
             },
+            fault: h.device.fault_word(),
+            layer: LAYER,
         },
     )
 }

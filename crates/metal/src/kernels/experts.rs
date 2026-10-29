@@ -17,7 +17,7 @@ use crate::fault::MetalFaultWord;
 use crate::geom::ExpertsGeom;
 use crate::library::{Library, Pipeline};
 
-use super::{Quant, args_bytes, check_window_len, pack, word};
+use super::{LoadNorm, Quant, args_bytes, check_window_len, pack, word};
 
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";
@@ -62,7 +62,8 @@ pub enum SharedPlan<'w> {
 /// shared expert's when the instance has one), each
 /// `silu(gate · x̂) * (up · x̂)` over `cols` inputs, `x̂ = x * gain / sqrt(mean(x^2) + eps)`. A norm that finds a value
 /// that is not finite, or a zero scale, raises the norm site of `layer` on
-/// `fault` and writes NaN to its rows.
+/// `fault` and writes NaN to its rows. A [`LoadNorm::Scaled`] launch reads
+/// `x · gain` and the scale its join wrote; the rows are the same bits.
 pub struct PairParams<'w> {
     /// The weight type. A layer's experts are one type.
     pub quant: Quant,
@@ -89,12 +90,11 @@ pub struct PairParams<'w> {
     pub shared_gate: Option<Window<'w, u8, MetalDevice>>,
     /// The shared expert's up, one expert, given with the gate.
     pub shared_up: Option<Window<'w, u8, MetalDevice>>,
-    /// The input, `cols` values, before the norm.
+    /// The input, `cols` values: before the norm, or `x · gain` for a scaled
+    /// launch.
     pub x: Window<'w, f32, MetalDevice>,
-    /// The norm's gain, `cols` values.
-    pub gain: Window<'w, f32, MetalDevice>,
-    /// The epsilon added to the mean of the squares.
-    pub eps: f32,
+    /// The norm: its gain, or the scale of the join that applied it.
+    pub norm: LoadNorm<'w>,
     /// The slot outputs. Slot `s` starts at `s * out_stride`.
     pub y: WindowMut<'w, f32, MetalDevice>,
     /// Floats from one slot's output to the next. Below the expert width the
@@ -308,13 +308,12 @@ fn check_pair(
         aligned(PAIR, "shared up", p.shared_quant, up)?;
     }
     check_window_len(PAIR, "x", p.x.len(), p.cols)?;
-    check_window_len(PAIR, "gain", p.gain.len(), p.cols)?;
+    p.norm.check(PAIR, p.cols)?;
     check_window_len(PAIR, "ids", p.ids.len(), g.routed_ids)?;
     check_window_len(PAIR, "y", p.y.len(), y_len)?;
     aligned(PAIR, "gate", p.quant, p.gate)?;
     aligned(PAIR, "up", p.quant, p.up)?;
     float4_aligned(PAIR, "x", p.x)?;
-    float4_aligned(PAIR, "gain", p.gain)?;
     Ok(PairShape {
         nblocks: word(PAIR, "the block count", nblocks)?,
         rows: word(PAIR, "the row count", g.k)?,
@@ -420,6 +419,9 @@ pub(crate) struct Pipelines {
     pair_a4: Pipeline,
     pair_q8_0: Pipeline,
     pair_q5k: Pipeline,
+    /// The pair over a scaled input, one per type: stacks and a shared
+    /// expert of that one type.
+    pair_scaled: Vec<(Quant, Pipeline)>,
     fold_q4: Pipeline,
     fold_q6: Pipeline,
     fold_a4: Pipeline,
@@ -453,6 +455,13 @@ impl Pipelines {
             pair_a4: library.pipeline_with_simdgroups("a4_pair_swiglu", simdgroups)?,
             pair_q8_0: library.pipeline_with_simdgroups("q8_0_pair_swiglu", simdgroups)?,
             pair_q5k: library.pipeline_with_simdgroups("q5k_pair_swiglu", simdgroups)?,
+            pair_scaled: [Quant::Q4K, Quant::Q6K, Quant::A4, Quant::Q8_0, Quant::Q5K]
+                .into_iter()
+                .map(|quant| {
+                    let name = format!("{}_pair_swiglu_scaled", quant.name());
+                    Ok((quant, library.pipeline_with_simdgroups(&name, simdgroups)?))
+                })
+                .collect::<Result<Vec<_>, DeviceError>>()?,
             fold_q4: library.pipeline_with_simdgroups("q4k_down_fold", simdgroups)?,
             fold_q6: library.pipeline_with_simdgroups("q6k_down_fold", simdgroups)?,
             fold_a4: library.pipeline_with_simdgroups("a4_down_fold", simdgroups)?,
@@ -464,8 +473,29 @@ impl Pipelines {
     }
 
     /// The pair's pipeline for stacks of `quant` and a shared expert of
-    /// `shared`, or a named refusal for a type outside the tables.
-    fn pair(&self, quant: Quant, shared: Quant) -> Result<&Pipeline, DeviceError> {
+    /// `shared` over a raw or a `scaled` input, or a named refusal for a type
+    /// outside the tables.
+    fn pair(&self, quant: Quant, shared: Quant, scaled: bool) -> Result<&Pipeline, DeviceError> {
+        if scaled {
+            if shared != quant {
+                return Err(super::range(
+                    PAIR,
+                    format!(
+                        "stacks of {} and a shared expert of {}: no scaled entry",
+                        quant.name(),
+                        shared.name()
+                    ),
+                ));
+            }
+            return self
+                .pair_scaled
+                .iter()
+                .find(|(q, _)| *q == quant)
+                .map(|(_, pipeline)| pipeline)
+                .ok_or_else(|| {
+                    super::range(PAIR, format!("{} has no scaled entry", quant.name()))
+                });
+        }
         if shared != quant {
             return Self::apart(&self.pair_apart, quant, shared, PAIR);
         }
@@ -546,9 +576,12 @@ impl super::Kernels {
             shape.n_experts,
             p.layer,
             shape.stride,
-            p.eps.to_bits(),
+            p.norm.eps().to_bits(),
         ]);
-        encoder.set_pipeline(self.experts.pair(p.quant, p.shared_quant)?);
+        encoder.set_pipeline(
+            self.experts
+                .pair(p.quant, p.shared_quant, p.norm.scaled())?,
+        );
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.gate)?)?;
         slot.set(Binding::of(&p.up)?)?;
@@ -557,7 +590,7 @@ impl super::Kernels {
         slot.set(Binding::of(p.shared_gate.as_ref().unwrap_or(&p.gate))?)?;
         slot.set(Binding::of(p.shared_up.as_ref().unwrap_or(&p.up))?)?;
         slot.set(Binding::of(&p.x)?)?;
-        slot.set(Binding::of(&p.gain)?)?;
+        slot.set(Binding::of(p.norm.window())?)?;
         slot.set(Binding::of(&p.ids)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(p.fault.binding())?;

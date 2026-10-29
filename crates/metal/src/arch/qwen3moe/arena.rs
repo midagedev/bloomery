@@ -20,6 +20,7 @@
 use core::ops::Range;
 use std::borrow::Cow;
 
+use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Elem, Elems};
 use chain::rope::{Direction, RopeSpec, RopeTable};
 use gguf::quant::GgmlType;
@@ -32,6 +33,7 @@ use super::check::{
     PostLayout, RopeLayout, Site, Values,
 };
 use super::count::{FfnKind, GroupBytes, GroupKind, Layer, Projection, Residual};
+use super::ops::Half;
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
@@ -163,6 +165,17 @@ pub(super) enum MixerBufs {
     ShortConv(ConvBufs),
 }
 
+impl MixerBufs {
+    /// The mixer's P1.
+    pub(super) fn p1(&self) -> &P1 {
+        match self {
+            Self::Delta(d) => &d.p1,
+            Self::Attention(a) => &a.p1,
+            Self::ShortConv(c) => &c.p1,
+        }
+    }
+}
+
 /// A layer's sandwich: the gain of the norm each half's output goes through
 /// before it joins the stream, `x += add[i] · gain[i] ⊙ rms_norm(out)`, the
 /// mixer's half first (the order of `SandwichPlan`'s `norms`). The epsilon and
@@ -266,6 +279,10 @@ pub(super) struct Arena {
     /// What a half's out projection writes before its join, `hidden` values;
     /// none for a file with no sandwich.
     pub(super) join: Option<MetalBuffer<f32>>,
+    /// What a join that hands on ([`Arena::hands_on`]) writes for the launch
+    /// after it: the new stream times that launch's norm gain, `hidden`
+    /// values, then the norm's scale; none for a file with no sandwich.
+    pub(super) xn: Option<MetalBuffer<f32>>,
     /// The rope tables, one for each distinct base and factors the attention
     /// layers have: `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`.
     pub(super) ropes: Vec<MetalBuffer<f32>>,
@@ -287,6 +304,68 @@ pub(super) struct Arena {
 /// The fault word's layer of model layer `l`.
 pub(super) fn layer_word(l: usize) -> u32 {
     u32::try_from(l).expect("a layer index fits u32")
+}
+
+/// A launch that norms the stream on load right after a sandwich join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reader {
+    /// Layer `l`'s P1, after layer `l − 1`'s FFN join.
+    P1(usize),
+    /// Layer `l`'s gate-up pair, after its mixer join.
+    Pair(usize),
+    /// The head's logits, after the last layer's FFN join.
+    Head,
+}
+
+impl Reader {
+    /// The reader after layer `l`'s join of `half`, in a model of `layers`
+    /// layers.
+    pub(super) fn after(layers: usize, l: usize, half: Half) -> Self {
+        match half {
+            Half::Mixer => Self::Pair(l),
+            Half::Ffn if l + 1 < layers => Self::P1(l + 1),
+            Half::Ffn => Self::Head,
+        }
+    }
+
+    /// The fault word's layer the reader's norm raises at.
+    pub(super) fn layer(self) -> u32 {
+        match self {
+            Self::P1(l) | Self::Pair(l) => layer_word(l),
+            Self::Head => LAYER_HEAD,
+        }
+    }
+}
+
+/// `reader`'s weight type and norm gain, when it is one launch of a type with
+/// a scaled entry: a P1 of one part, a pair whose shared expert (if any) is
+/// its stacks' type, the head; none of F32.
+pub(super) fn reader_norm<'a>(
+    layers: &'a [LayerBufs],
+    head: (Quant, &'a MetalBuffer<f32>),
+    reader: Reader,
+) -> Option<(Quant, &'a MetalBuffer<f32>)> {
+    let (quant, gain) = match reader {
+        Reader::P1(l) => {
+            let p1 = layers.get(l)?.mixer.p1();
+            let [part] = p1.parts.as_slice() else {
+                return None;
+            };
+            (part.quant, &p1.norm)
+        }
+        Reader::Pair(l) => {
+            let f = &layers.get(l)?.ffn;
+            if f.shared
+                .as_ref()
+                .is_some_and(|s| s.gate_up_quant != f.gate_up_quant)
+            {
+                return None;
+            }
+            (f.gate_up_quant, &f.norm)
+        }
+        Reader::Head => head,
+    };
+    (quant != Quant::F32).then_some((quant, gain))
 }
 
 fn refuse(detail: impl Into<String>) -> SessionError {
@@ -599,6 +678,10 @@ impl Arena {
             attn_ticket: zeroed(device, 1)?,
             conv_y: g.has_conv().then(|| zeroed(device, hidden)).transpose()?,
             join: g.has_join().then(|| zeroed(device, hidden)).transpose()?,
+            xn: g
+                .has_join()
+                .then(|| zeroed(device, hidden + 1))
+                .transpose()?,
             ropes,
             h: zeroed(device, geom.experts.slots * geom.experts.k)?,
             logits: zeroed(device, vocab)?,
@@ -647,6 +730,49 @@ impl Arena {
                 }
             })
             .collect()
+    }
+
+    /// Whether layer `l`'s joins hand their readers the normed input: a
+    /// sandwich layer whose two readers ([`Reader::after`]) each have a
+    /// scaled entry ([`reader_norm`]). The join writes the new stream times
+    /// the reader's gain and the reader's scale into [`Arena::xn`], and the
+    /// reader takes them in place of its norm on load. A layer's two joins
+    /// hand on together; the join and its reader both ask here.
+    pub(super) fn hands_on(&self, l: usize) -> bool {
+        let Some(layer) = self.layers.get(l) else {
+            return false;
+        };
+        let head = (self.head_quant, &self.head_norm);
+        layer.post.is_some()
+            && self.xn.is_some()
+            && [Half::Mixer, Half::Ffn].into_iter().all(|half| {
+                reader_norm(
+                    &self.layers,
+                    head,
+                    Reader::after(self.layers.len(), l, half),
+                )
+                .is_some()
+            })
+    }
+
+    /// The scale word's bytes `reader` reads besides its input: 4 when it
+    /// takes its join's, else none.
+    fn scale_word(&self, reader: Reader) -> u64 {
+        if self.reads_scaled(reader) { 4 } else { 0 }
+    }
+
+    /// Whether `reader` takes the input its join handed on.
+    pub(super) fn reads_scaled(&self, reader: Reader) -> bool {
+        match reader {
+            Reader::P1(0) => false,
+            Reader::P1(l) => self.hands_on(l - 1),
+            Reader::Pair(l) => self.hands_on(l),
+            Reader::Head => self
+                .layers
+                .len()
+                .checked_sub(1)
+                .is_some_and(|l| self.hands_on(l)),
+        }
     }
 
     /// The bytes the group `kind` of layer `layer` of the token at `pos`
@@ -710,10 +836,13 @@ impl Arena {
                 };
                 let out_end = p1.parts.iter().map(|p| p.out_end).max().unwrap_or(0);
                 Ok(GroupBytes {
+                    // The norm's gain with its layer, read here or by the join
+                    // that hands on to this P1.
                     weights: p1.parts.iter().map(|p| bytes_of(&p.weights)).sum::<u64>()
                         + bytes_of(&p1.norm),
-                    // The residual read, the projection's output written.
-                    acts: f32s(self.hidden) + f32s(out_end),
+                    // The residual read (or the join's normed input and its
+                    // scale), the projection's output written.
+                    acts: f32s(self.hidden) + f32s(out_end) + self.scale_word(Reader::P1(layer)),
                     state: 0,
                 })
             }
@@ -794,12 +923,19 @@ impl Arena {
                         "{kind:?}: layer {layer} adds its halves to the stream and runs no join"
                     )));
                 };
+                // A join that hands on writes its reader's input and scale; the
+                // reader's gain it reads is counted with the reader.
+                let handed = if self.hands_on(layer) {
+                    f32s(self.hidden + 1)
+                } else {
+                    0
+                };
                 Ok(GroupBytes {
                     // A gain of either half: `hidden` values.
                     weights: bytes_of(&post.gains[0]),
                     // The half's output and the residual read, the residual
                     // written.
-                    acts: 3 * f32s(self.hidden),
+                    acts: 3 * f32s(self.hidden) + handed,
                     state: 0,
                 })
             }
@@ -909,10 +1045,12 @@ impl Arena {
                                 .as_ref()
                                 .map_or(0, |s| bytes_of(&s.gate) + bytes_of(&s.up))
                             + norm_weight,
-                        // The residual normed as it is loaded, the ids read,
-                        // the experts' rows written.
+                        // The residual normed as it is loaded (or the join's
+                        // normed input and its scale), the ids read, the
+                        // experts' rows written.
                         f32s(self.hidden)
                             + norm_read
+                            + self.scale_word(Reader::Pair(layer))
                             + 4 * count_u64(ids.len(), "ids")
                             + bytes_of(&self.h),
                     ),
@@ -941,8 +1079,11 @@ impl Arena {
                 no_ids()?;
                 Ok(GroupBytes {
                     weights: bytes_of(&self.head_w) + bytes_of(&self.head_norm),
-                    // The residual read and the logits written.
-                    acts: f32s(self.hidden) + bytes_of(&self.logits),
+                    // The residual read (or the join's normed input and its
+                    // scale) and the logits written.
+                    acts: f32s(self.hidden)
+                        + bytes_of(&self.logits)
+                        + self.scale_word(Reader::Head),
                     state: 0,
                 })
             }

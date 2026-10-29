@@ -35,8 +35,10 @@ using namespace metal;
 #define HEAD_STAGE_MAX 32u
 
 // The first dispatch: the logits, the norm on the load. The rows of a
-// threadgroup are the mat-vec's own geometry.
-template <typename Q>
+// threadgroup are the mat-vec's own geometry. SCALED: the input is the last
+// join's x · gain and `gain` binds that join's scale word (matvec_rows'
+// SCALED), so the logits are the norm-on-load entry's bits.
+template <typename Q, bool SCALED = false>
 kernel void head_logits_kernel(device const typename Q::Block *weights [[buffer(0)]],
                                device const float *x [[buffer(1)]],
                                device const float *gain [[buffer(2)]],
@@ -48,10 +50,28 @@ kernel void head_logits_kernel(device const typename Q::Block *weights [[buffer(
                                ushort sg [[simdgroup_index_in_threadgroup]])
 {
     const int first_row = simd_first_row(tg, sg);
-    matvec_rows<Q, true, false, false, false>(weights, x, logits, (int)args.nblocks, args.eps,
-                                              args.layer, gain, nullptr, faults, first_row,
-                                              (int)args.rows, tiisg);
+    matvec_rows<Q, !SCALED, false, false, false, SCALED>(weights, x, logits, (int)args.nblocks,
+                                                         args.eps, args.layer, gain, nullptr,
+                                                         faults, first_row, (int)args.rows, tiisg);
 }
+
+// Each type's scaled logits entry.
+#define SCALED_HEAD_ENTRY(NAME, Q, BQ)                                                 \
+    template [[host_name(NAME)]]                                                      \
+    kernel void head_logits_kernel<Q, true>(device const BQ *weights [[buffer(0)]],    \
+                                            device const float *x [[buffer(1)]],       \
+                                            device const float *gain [[buffer(2)]],    \
+                                            device float *logits [[buffer(3)]],        \
+                                            device atomic_uint *faults [[buffer(4)]],  \
+                                            constant MatvecArgs &args [[buffer(5)]],   \
+                                            uint tg [[threadgroup_position_in_grid]],  \
+                                            ushort tiisg [[thread_index_in_simdgroup]], \
+                                            ushort sg [[simdgroup_index_in_threadgroup]]);
+
+SCALED_HEAD_ENTRY("q6k_head_logits_scaled", Q6K, block_q6_K)
+SCALED_HEAD_ENTRY("a4_head_logits_scaled", A4, block_mlx_a4)
+SCALED_HEAD_ENTRY("q8_0_head_logits_scaled", Q8_0, block_q8_0)
+SCALED_HEAD_ENTRY("q5k_head_logits_scaled", Q5K, block_q5_K)
 
 template [[host_name("q6k_head_logits")]]
 kernel void head_logits_kernel<Q6K>(device const block_q6_K *weights [[buffer(0)]],

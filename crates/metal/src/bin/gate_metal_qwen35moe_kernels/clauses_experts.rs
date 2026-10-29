@@ -10,7 +10,8 @@ use bloomery_metal::MetalBuffer;
 use bloomery_metal::geom::{ExpertsGeom, Geometry};
 use bloomery_metal::instance::REGISTERED;
 use bloomery_metal::kernels::{
-    APART_DOWN, APART_GATE_UP, FoldParams, PairParams, Quant, ROWS_PER_SIMD_GROUP, SharedPlan,
+    APART_DOWN, APART_GATE_UP, FoldParams, LoadNorm, PairParams, Quant, ROWS_PER_SIMD_GROUP,
+    SharedPlan,
 };
 use gguf::quant::GgmlType;
 
@@ -443,8 +444,10 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
                     })
                     .transpose()?,
                 x: x.window(Elems(ACT_PAD), Elems(launch.x.len()))?,
-                gain: gain.window(Elems(ACT_PAD), Elems(launch.norm.gain.len()))?,
-                eps: launch.norm.eps,
+                norm: LoadNorm::Gain {
+                    gain: gain.window(Elems(ACT_PAD), Elems(launch.norm.gain.len()))?,
+                    eps: launch.norm.eps,
+                },
                 y: y.window_mut(Elems(OUT_GUARD), Elems(y_len))?,
                 out_stride: e.k,
                 fault: device.fault_word(),
@@ -1314,8 +1317,10 @@ fn refuse_pair(
                 .then(|| b.bytes.window(Elems(0), Elems(a.gate_len)))
                 .transpose()?,
             x: b.values.window(Elems(a.x_at), Elems(a.x))?,
-            gain: b.values.window(Elems(a.gain_at), Elems(a.x))?,
-            eps: 1e-6,
+            norm: LoadNorm::Gain {
+                gain: b.values.window(Elems(a.gain_at), Elems(a.x))?,
+                eps: 1e-6,
+            },
             y: b.marker.window_mut(Elems(0), Elems(a.y_len))?,
             out_stride: a.stride,
             fault: h.device.fault_word(),

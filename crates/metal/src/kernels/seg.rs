@@ -11,9 +11,10 @@ use bloomery_device::{DeviceError, Window, WindowMut};
 
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
+use crate::fault::MetalFaultWord;
 
 use super::geometry::MAX_SEGMENTS;
-use super::matvec::{NormOnLoad, Quant};
+use super::matvec::{LoadNorm, Quant};
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
 /// One segment of a segmented mat-vec: the rows of one tensor, and where they
@@ -46,8 +47,12 @@ pub struct SegParams<'w> {
     pub x: Window<'w, f32, MetalDevice>,
     /// The output of every segment, one buffer.
     pub y: WindowMut<'w, f32, MetalDevice>,
-    /// The norm the load applies.
-    pub norm: NormOnLoad<'w>,
+    /// The norm the load applies, or the scale of the join that applied it.
+    pub norm: LoadNorm<'w>,
+    /// The fault word a norm's raise lands in.
+    pub fault: &'w MetalFaultWord,
+    /// The layer a raise is recorded in.
+    pub layer: u32,
 }
 
 /// One segment, as the kernel's argument block holds it.
@@ -151,7 +156,7 @@ fn check(
     }
     check_window_len(WHAT, "weights", p.weights.len(), weight_end)?;
     check_window_len(WHAT, "x", p.x.len(), cols)?;
-    check_window_len(WHAT, "gain", p.norm.gain.len(), cols)?;
+    p.norm.check(WHAT, cols)?;
     let out_end = p
         .segments
         .iter()
@@ -163,12 +168,12 @@ fn check(
     let start = p.weights.byte_range()?.start.get();
     super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
     // The input and the gain are read as `float4`s.
-    for (name, start) in [
-        ("x", p.x.byte_range()?.start.get()),
-        ("gain", p.norm.gain.byte_range()?.start.get()),
-    ] {
-        super::check_weights_align(WHAT, name, start, super::WeightAlign::Float4)?;
-    }
+    super::check_weights_align(
+        WHAT,
+        "x",
+        p.x.byte_range()?.start.get(),
+        super::WeightAlign::Float4,
+    )?;
 
     // The threadgroups: every segment's own, so a segment's rows are the rows
     // a launch of that segment alone would write.
@@ -224,13 +229,22 @@ impl Kernels {
         p: SegParams<'_>,
     ) -> Result<(), DeviceError> {
         let shape = check(&p, self.simdgroups, self.rows_per_simd_group)?;
-        let args = args_bytes(args_words(&shape, p.norm.layer, p.norm.eps));
-        let pipeline = match p.quant {
-            Quant::F32 => &self.f32_seg,
-            dense => self
-                .dense_family(dense)
-                .expect("a type but F32 has a mat-vec family")
-                .seg(),
+        let args = args_bytes(args_words(&shape, p.layer, p.norm.eps()));
+        let pipeline = match (p.quant, p.norm.scaled()) {
+            (Quant::F32, false) => &self.f32_seg,
+            (Quant::F32, true) => {
+                return Err(refuse("F32 weights have no scaled entry".to_string()));
+            }
+            (dense, scaled) => {
+                let family = self
+                    .dense_family(dense)
+                    .expect("a type but F32 has a mat-vec family");
+                if scaled {
+                    family.seg_scaled()
+                } else {
+                    family.seg()
+                }
+            }
         };
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
@@ -238,8 +252,8 @@ impl Kernels {
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
-        slot.set(Binding::of(&p.norm.gain)?)?;
-        slot.set(p.norm.fault.binding())?;
+        slot.set(Binding::of(p.norm.window())?)?;
+        slot.set(p.fault.binding())?;
         let threads = self.threads_per_group();
         slot.dispatch_groups(shape.groups, 1, threads)
     }

@@ -20,7 +20,9 @@
 //! mat-vec reads. Its kernel is `kernels/delta.metal`.
 //! The head ([`head`]) is two more: the logits mat-vec and the argmax over them, `kernels/head.metal`.
 //! The short conv ([`shortconv`]) of a gated-conv mixer is `kernels/shortconv.metal`; the
-//! sandwich residual is `kernels/norm.metal`'s `norm_add_rows`.
+//! sandwich residual is `kernels/norm.metal`'s `norm_add_rows`, and the one-row join that
+//! hands its next launch the normed input is each type's `<q>_norm_add_next`
+//! ([`Kernels::norm_add_next`]), read by the scaled seg, pair and head entries ([`LoadNorm`]).
 
 mod attention;
 use crate::attention_geom;
@@ -77,9 +79,9 @@ pub use geometry::{
 };
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
-pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
-pub use norm::NormAddRowsParams;
+pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
+pub use norm::{NormAddNextParams, NormAddRowsParams};
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
     RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, TABLE_THREADS,
@@ -96,28 +98,43 @@ pub use crate::geom::Geometry;
 use crate::library::{GemmPath, Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
-/// input as it loads it, the one that adds into its output, and the segmented
-/// entry.
+/// input as it loads it, the one that adds into its output, the segmented
+/// entry, its scaled form, and the sandwich join that hands that form its
+/// normed input in this type's lane order.
 struct MatvecPipelines {
     store: Pipeline,
     norm: Pipeline,
     residual: Pipeline,
     seg: Pipeline,
+    seg_scaled: Pipeline,
+    norm_add_next: Pipeline,
 }
 
 impl MatvecPipelines {
-    fn new(library: &Library, names: [&str; 4], simdgroups: u32) -> Result<Self, DeviceError> {
+    fn new(library: &Library, names: [&str; 6], simdgroups: u32) -> Result<Self, DeviceError> {
         Ok(Self {
             store: library.pipeline_with_simdgroups(names[0], simdgroups)?,
             norm: library.pipeline_with_simdgroups(names[1], simdgroups)?,
             residual: library.pipeline_with_simdgroups(names[2], simdgroups)?,
             seg: library.pipeline_with_simdgroups(names[3], simdgroups)?,
+            seg_scaled: library.pipeline_with_simdgroups(names[4], simdgroups)?,
+            norm_add_next: library.pipeline(names[5])?,
         })
     }
 
     /// The segmented entry of one type.
     pub(crate) fn seg(&self) -> &Pipeline {
         &self.seg
+    }
+
+    /// The segmented entry over a scaled input.
+    pub(crate) fn seg_scaled(&self) -> &Pipeline {
+        &self.seg_scaled
+    }
+
+    /// The sandwich join whose next launch is of this type.
+    pub(crate) fn norm_add_next(&self) -> &Pipeline {
+        &self.norm_add_next
     }
 }
 
@@ -176,6 +193,12 @@ pub struct Kernels {
     head_logits_a4: Pipeline,
     head_logits_q8_0: Pipeline,
     head_logits_q5k: Pipeline,
+    /// The logits dispatch over the last join's scaled input, of the same
+    /// types.
+    head_logits_q6k_scaled: Pipeline,
+    head_logits_a4_scaled: Pipeline,
+    head_logits_q8_0_scaled: Pipeline,
+    head_logits_q5k_scaled: Pipeline,
     /// The output head's argmax over the logits, the one entry of every type.
     head_pick: Pipeline,
     /// The launch geometry of the library's instance: the numbers every
@@ -302,6 +325,8 @@ impl Kernels {
                     "q4k_matvec_norm",
                     "q4k_matvec_resid",
                     "q4k_matvec_seg",
+                    "q4k_matvec_seg_scaled",
+                    "q4k_norm_add_next",
                 ],
                 count,
             )?,
@@ -312,6 +337,8 @@ impl Kernels {
                     "q6k_matvec_norm",
                     "q6k_matvec_resid",
                     "q6k_matvec_seg",
+                    "q6k_matvec_seg_scaled",
+                    "q6k_norm_add_next",
                 ],
                 count,
             )?,
@@ -322,6 +349,8 @@ impl Kernels {
                     "a4_matvec_norm",
                     "a4_matvec_resid",
                     "a4_matvec_seg",
+                    "a4_matvec_seg_scaled",
+                    "a4_norm_add_next",
                 ],
                 count,
             )?,
@@ -332,6 +361,8 @@ impl Kernels {
                     "q8_0_matvec_norm",
                     "q8_0_matvec_resid",
                     "q8_0_matvec_seg",
+                    "q8_0_matvec_seg_scaled",
+                    "q8_0_norm_add_next",
                 ],
                 count,
             )?,
@@ -342,6 +373,8 @@ impl Kernels {
                     "q5k_matvec_norm",
                     "q5k_matvec_resid",
                     "q5k_matvec_seg",
+                    "q5k_matvec_seg_scaled",
+                    "q5k_norm_add_next",
                 ],
                 count,
             )?,
@@ -373,6 +406,14 @@ impl Kernels {
             head_logits_a4: library.pipeline_with_simdgroups("a4_head_logits", count)?,
             head_logits_q8_0: library.pipeline_with_simdgroups("q8_0_head_logits", count)?,
             head_logits_q5k: library.pipeline_with_simdgroups("q5k_head_logits", count)?,
+            head_logits_q6k_scaled: library
+                .pipeline_with_simdgroups("q6k_head_logits_scaled", count)?,
+            head_logits_a4_scaled: library
+                .pipeline_with_simdgroups("a4_head_logits_scaled", count)?,
+            head_logits_q8_0_scaled: library
+                .pipeline_with_simdgroups("q8_0_head_logits_scaled", count)?,
+            head_logits_q5k_scaled: library
+                .pipeline_with_simdgroups("q5k_head_logits_scaled", count)?,
             // The argmax's SIMD-group count, not the mat-vec count this
             // function was given. The constant is the pipeline's function
             // constant.

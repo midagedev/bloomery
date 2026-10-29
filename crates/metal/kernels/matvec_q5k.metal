@@ -50,6 +50,8 @@ kernel void matvec_norm_kernel<Q5K>(device const block_q5_K * W [[buffer(0)]],
                                     ushort tiisg [[thread_index_in_simdgroup]],
                                     ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
+SCALED_SEG_ENTRIES("q5k", Q5K, block_q5_K)
+
 template [[host_name("q5k_matvec_seg")]]
 kernel void matvec_seg_kernel<Q5K>(device const block_q5_K * W [[buffer(0)]],
                                    device const float      * x [[buffer(1)]],

@@ -9,7 +9,11 @@
 //! its last threadgroup, so an attention mixer is one group at any depth. A
 //! layer whose residual is a sandwich has a join group `J` after the mixer's
 //! out and after the down: the out and the down store into the join buffer,
-//! and `J` norms that buffer into the stream ([`MetalOps::join`]). The FFN
+//! and `J` norms that buffer into the stream ([`MetalOps::join`]). A sandwich
+//! layer whose readers each have a scaled entry hands on ([`Arena::hands_on`]):
+//! its joins also write the next reader's input, the stream times that
+//! reader's gain and then the norm's scale, which the reader takes in place of
+//! its norm on load. The FFN
 //! norm has no group of its own: the router (R) and the gate-up pair (G) each
 //! norm the residual as they load it. The head's pick is the token's last
 //! group and closes no barrier; a token whose pick nobody reads encodes none
@@ -32,7 +36,8 @@ use chain::arch::qwen3moe::plan::{
 };
 
 use super::arena::{
-    Arena, ConvBufs, LANES, LayerBufs, MixerBufs, lane_of, layer_word, slot_before, slot_of,
+    Arena, ConvBufs, LANES, LayerBufs, MixerBufs, Reader, lane_of, layer_word, reader_norm,
+    slot_before, slot_of,
 };
 use super::rows::RowsArena;
 use super::session::SessionError;
@@ -42,9 +47,9 @@ use crate::encode::ComputeEncoder;
 use crate::kernels::router::RouterParams;
 use crate::kernels::{
     AttentionParams, AttnCache, AttnLayer, DeltaParams, EmbedParams, FoldParams, HEAD_SIMD_GROUPS,
-    HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormAddRowsParams, NormOnLoad,
-    NormRowsParams, PASS_ROWS, PairParams, SegParams, SharedPlan, ShortConvStepParams,
-    segments_for_window,
+    HeadNormParams, HeadParams, Kernels, LoadNorm, MatvecParams, Mode, NormAddNextParams,
+    NormAddRowsParams, NormRowsParams, PASS_ROWS, PairParams, SegParams, SharedPlan,
+    ShortConvStepParams, segments_for_window,
 };
 
 /// The half of a layer a sandwich joins: the mixer's, then the FFN's, the
@@ -96,17 +101,20 @@ fn part<'b, T: Elem>(
 /// The head's windows over `arena`, for the step record slot `slot`: the
 /// weights and the norm's gain whole, the logits whole, the slot's pick and
 /// fault word. `x` is the residual the head norms: the arena's own for a
-/// token, the last row of the rows arena for a pass.
+/// token (or the input the last join handed on, [`Arena::reads_scaled`]),
+/// the last row of the rows arena for a pass.
 fn head_params<'a>(
     arena: &'a mut Arena,
     x: Option<Window<'a, f32, MetalDevice>>,
     slot: usize,
 ) -> Result<HeadParams<'a>, SessionError> {
+    let scaled = x.is_none() && arena.reads_scaled(Reader::Head);
     let Arena {
         head_w,
         head_quant,
         head_norm,
         x: residual,
+        xn,
         logits,
         step_id,
         faults,
@@ -115,9 +123,22 @@ fn head_params<'a>(
         vocab,
         ..
     } = arena;
-    let x = match x {
-        Some(x) => x,
-        None => residual.window(Elems(0), Elems(*hidden))?,
+    let (x, norm) = match x {
+        Some(x) => (
+            x,
+            LoadNorm::Gain {
+                gain: all(head_norm)?,
+                eps: *eps,
+            },
+        ),
+        None if scaled => handed_on(xn.as_ref(), *hidden)?,
+        None => (
+            residual.window(Elems(0), Elems(*hidden))?,
+            LoadNorm::Gain {
+                gain: all(head_norm)?,
+                eps: *eps,
+            },
+        ),
     };
     Ok(HeadParams {
         quant: *head_quant,
@@ -126,13 +147,49 @@ fn head_params<'a>(
         simdgroups: HEAD_SIMD_GROUPS,
         weights: all(head_w)?,
         x,
-        gain: all(head_norm)?,
+        norm,
         logits: all_mut(logits)?,
         step_id: step_id.window_mut(Elems(slot), Elems(1))?,
-        eps: *eps,
         fault: &faults[slot],
         layer: LAYER_HEAD,
     })
+}
+
+/// The input a join handed on and its scale word: `hidden` values of the
+/// stream times the reader's gain, then the norm's scale.
+fn handed_on(
+    xn: Option<&MetalBuffer<f32>>,
+    hidden: usize,
+) -> Result<(Window<'_, f32, MetalDevice>, LoadNorm<'_>), SessionError> {
+    let xn = xn.ok_or_else(|| refuse("a scaled reader over an arena with no hand-on buffer"))?;
+    Ok((
+        xn.window(Elems(0), Elems(hidden))?,
+        LoadNorm::Scaled {
+            scale: xn.window(Elems(hidden), Elems(1))?,
+        },
+    ))
+}
+
+/// The norm a reader of the stream applies as it loads it: `gain` and the
+/// arena's epsilon over the residual, or the input its join handed on.
+fn reader_input<'b>(
+    scaled: bool,
+    x: &'b MetalBuffer<f32>,
+    xn: Option<&'b MetalBuffer<f32>>,
+    gain: &'b MetalBuffer<f32>,
+    eps: f32,
+    hidden: usize,
+) -> Result<(Window<'b, f32, MetalDevice>, LoadNorm<'b>), SessionError> {
+    if scaled {
+        return handed_on(xn, hidden);
+    }
+    Ok((
+        x.window(Elems(0), Elems(hidden))?,
+        LoadNorm::Gain {
+            gain: all(gain)?,
+            eps,
+        },
+    ))
 }
 
 /// Where a token's embed finds its id.
@@ -240,12 +297,14 @@ impl<'a, 'e> MetalOps<'a, 'e> {
         self.enc.memory_barrier();
     }
 
-    /// Layer `l`'s P1: the norm on load, one dispatch per weight type, one
-    /// group.
+    /// Layer `l`'s P1: the norm on load (or the input the join before it
+    /// handed on), one dispatch per weight type, one group.
     fn p1(&mut self, l: usize) -> Result<(), SessionError> {
         let slot = slot_of(self.pos);
+        let scaled = self.arena.reads_scaled(Reader::P1(l));
         let Arena {
             x,
+            xn,
             proj,
             layers,
             faults,
@@ -253,26 +312,20 @@ impl<'a, 'e> MetalOps<'a, 'e> {
             hidden,
             ..
         } = &mut *self.arena;
-        let p1 = match &layers[l].mixer {
-            MixerBufs::Delta(d) => &d.p1,
-            MixerBufs::Attention(a) => &a.p1,
-            MixerBufs::ShortConv(c) => &c.p1,
-        };
+        let p1 = layers[l].mixer.p1();
         for part in &p1.parts {
+            let (x, norm) = reader_input(scaled, x, xn.as_ref(), &p1.norm, *eps, *hidden)?;
             self.kernels.matvec_seg(
                 self.enc,
                 SegParams {
                     quant: part.quant,
                     segments: &part.segments,
                     weights: all(&part.weights)?,
-                    x: x.window(Elems(0), Elems(*hidden))?,
+                    x,
                     y: proj.window_mut(Elems(0), Elems(part.out_end))?,
-                    norm: NormOnLoad {
-                        gain: all(&p1.norm)?,
-                        eps: *eps,
-                        fault: &faults[slot],
-                        layer: layer_word(l),
-                    },
+                    norm,
+                    fault: &faults[slot],
+                    layer: layer_word(l),
                 },
             )?;
         }
@@ -509,9 +562,11 @@ impl MetalOps<'_, '_> {
     /// gate and up, the residual normed as it is loaded.
     pub(super) fn experts_pair(&mut self, l: usize) -> Result<(), SessionError> {
         let slot = slot_of(self.pos);
+        let scaled = self.arena.reads_scaled(Reader::Pair(l));
         let Arena {
             layers,
             x,
+            xn,
             h,
             faults,
             hidden,
@@ -525,6 +580,7 @@ impl MetalOps<'_, '_> {
             .ids
             .window(Elems(0), Elems(geom.experts.routed_ids))?
             .cast::<i32>()?;
+        let (x, norm) = reader_input(scaled, x, xn.as_ref(), &f.norm, *eps, *hidden)?;
         self.kernels.pair(
             self.enc,
             PairParams {
@@ -542,9 +598,8 @@ impl MetalOps<'_, '_> {
                     .map_or(f.gate_up_quant, |s| s.gate_up_quant),
                 shared_gate: f.shared.as_ref().map(|s| all(&s.gate)).transpose()?,
                 shared_up: f.shared.as_ref().map(|s| all(&s.up)).transpose()?,
-                x: x.window(Elems(0), Elems(*hidden))?,
-                gain: all(&f.norm)?,
-                eps: *eps,
+                x,
+                norm,
                 y: all_mut(h)?,
                 out_stride: geom.experts.k,
                 fault: &faults[slot],
@@ -747,41 +802,73 @@ impl MetalOps<'_, '_> {
 
     /// Layer `l`'s join group of `half` on a sandwich: the half's output in
     /// the join buffer normed by the half's gain and added into the stream at
-    /// the half's scale, `x += add · gain ⊙ rms_norm(out)`. A plain residual
-    /// has no join group (its out and down added into the stream) and nothing
-    /// is encoded.
+    /// the half's scale, `x += add · gain ⊙ rms_norm(out)`. A layer that
+    /// hands on ([`Arena::hands_on`]) also writes its reader's normed input
+    /// into the hand-on buffer. A plain residual has no join group (its out
+    /// and down added into the stream) and nothing is encoded.
     pub(super) fn join(&mut self, l: LayerCtx<'_>, half: Half) -> Result<(), SessionError> {
         let ResidualPlan::Sandwich(s) = &l.plan.residual else {
             return Ok(());
         };
         let slot = slot_of(self.pos);
+        let hands_on = self.arena.hands_on(l.layer);
         let Arena {
             layers,
             x,
+            xn,
             join,
             faults,
             hidden,
+            eps,
+            head_quant,
+            head_norm,
             ..
         } = &mut *self.arena;
         let out = join.as_ref().ok_or_else(|| no_join(l.layer))?;
-        self.kernels.norm_add_rows(
-            self.enc,
-            NormAddRowsParams {
-                norm: NormRowsParams {
-                    rows: 1,
-                    cols: *hidden,
-                    x: all(out)?,
-                    x_stride: *hidden,
-                    gain: all(post_gain(layers, l.layer, half)?)?,
-                    y: x.window_mut(Elems(0), Elems(*hidden))?,
-                    y_stride: *hidden,
-                    eps: s.eps,
-                    fault: &faults[slot],
-                    layer: layer_word(l.layer),
-                },
-                add: s.add[half.index()],
+        let joined = NormAddRowsParams {
+            norm: NormRowsParams {
+                rows: 1,
+                cols: *hidden,
+                x: all(out)?,
+                x_stride: *hidden,
+                gain: all(post_gain(layers, l.layer, half)?)?,
+                y: x.window_mut(Elems(0), Elems(*hidden))?,
+                y_stride: *hidden,
+                eps: s.eps,
+                fault: &faults[slot],
+                layer: layer_word(l.layer),
             },
-        )?;
+            add: s.add[half.index()],
+        };
+        if hands_on {
+            let reader = Reader::after(layers.len(), l.layer, half);
+            let (quant, gain) = reader_norm(layers, (*head_quant, &*head_norm), reader)
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "layer {}: a join hands on to {reader:?}, which has no scaled entry",
+                        l.layer
+                    ))
+                })?;
+            let xn = xn.as_mut().ok_or_else(|| {
+                refuse(format!(
+                    "layer {}: a join hands on over an arena with no hand-on buffer",
+                    l.layer
+                ))
+            })?;
+            self.kernels.norm_add_next(
+                self.enc,
+                NormAddNextParams {
+                    join: joined,
+                    quant,
+                    gain: all(gain)?,
+                    eps: *eps,
+                    layer: reader.layer(),
+                    out: all_mut(xn)?,
+                },
+            )?;
+        } else {
+            self.kernels.norm_add_rows(self.enc, joined)?;
+        }
         self.close();
         Ok(())
     }

@@ -48,7 +48,7 @@ use bloomery_metal::instance::{
     QWEN35MOE_GQA6, REGISTERED,
 };
 use bloomery_metal::kernels::{
-    Geometry, HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant,
+    Geometry, HeadNormParams, Kernels, LoadNorm, MatvecParams, Mode, NormOnLoad, Quant,
     SIMD_GROUPS_PER_GROUP, SegParams, Segment,
 };
 use bloomery_metal::library::{self, Library};
@@ -71,6 +71,8 @@ mod clauses_experts;
 mod clauses_f32;
 #[path = "clauses_gemm.rs"]
 mod clauses_gemm;
+#[path = "clauses_handon.rs"]
+mod clauses_handon;
 #[path = "clauses_head.rs"]
 mod clauses_head;
 #[path = "clauses_matvec.rs"]
@@ -365,14 +367,14 @@ impl Harness<'_> {
                 .map_err(why)?,
             x: x.window(Elems(ACT_PAD), Elems(launch.cols)).map_err(why)?,
             y: y.window_mut(Elems(OUT_GUARD), Elems(rows)).map_err(why)?,
-            norm: NormOnLoad {
+            norm: LoadNorm::Gain {
                 gain: gain
                     .window(Elems(ACT_PAD), Elems(launch.cols))
                     .map_err(why)?,
                 eps: launch.eps,
-                fault: device.fault_word(),
-                layer: launch.layer,
             },
+            fault: device.fault_word(),
+            layer: launch.layer,
         };
         self.encode(|encoder| self.kernels.matvec_seg(encoder, params))?;
         let mut back = vec![0f32; rows + 2 * OUT_GUARD];
@@ -1038,6 +1040,7 @@ fn clause_table<'a>(
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
             .chain(clauses_delta::table(ctx))
             .chain(clauses_shortconv::table(ctx))
+            .chain(clauses_handon::table(ctx))
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))
             .chain(clauses_apart::table(ctx))

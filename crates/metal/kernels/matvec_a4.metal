@@ -50,6 +50,8 @@ kernel void matvec_norm_kernel<A4>(device const block_mlx_a4 * W [[buffer(0)]],
                                    ushort tiisg [[thread_index_in_simdgroup]],
                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
+SCALED_SEG_ENTRIES("a4", A4, block_mlx_a4)
+
 template [[host_name("a4_matvec_seg")]]
 kernel void matvec_seg_kernel<A4>(device const block_mlx_a4 * W [[buffer(0)]],
                                   device const float      * x [[buffer(1)]],

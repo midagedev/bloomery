@@ -193,20 +193,22 @@ kernel void norm_rows(device const float *x [[buffer(0)]],
 // add · value, in place. The sums are norm_rows' in the same order (the same
 // loads, the same simd_sum, the groups' shares in group order, the same
 // `rms_scale`), so `value` is the bits norm_rows writes; the sandwich clause
-// holds the two equal.
-kernel void norm_add_rows(device const float *x [[buffer(0)]],
-                          device const float *gain [[buffer(1)]],
-                          device float *y [[buffer(2)]],
-                          constant NormAddArgs &args [[buffer(3)]],
-                          device atomic_uint *faults [[buffer(4)]],
-                          uint row [[threadgroup_position_in_grid]],
-                          uint tid [[thread_position_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]])
+// holds the two equal. One row, `xr` the sub-layer's output and `yr` the
+// stream's row. `xg`, when not null, also receives the stream's new row times
+// `next_gain`, each product rounded once: the input of the launch after the
+// join, which norm_add_next_kernel (matvec_q4k.metal) hands it normed.
+inline void norm_add_row(device const float *xr,
+                         device const float *gain,
+                         device float *yr,
+                         constant NormAddArgs &args,
+                         device atomic_uint *faults,
+                         device const float *next_gain,
+                         device float *xg,
+                         uint tid,
+                         uint lane,
+                         uint sg,
+                         threadgroup float *tg_sums)
 {
-    threadgroup float tg_sums[NORM_ROWS_SG];
-    device const float *xr = x + row * args.norm.x_stride;
-    device float *yr = y + row * args.norm.y_stride;
     const uint f4s = args.norm.cols / 4u;
 
     float sum_sq = 0.f;
@@ -231,6 +233,9 @@ kernel void norm_add_rows(device const float *x [[buffer(0)]],
         }
         for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
             *((device float4 *)(yr + f4 * 4u)) = float4(NAN);
+            if (xg != nullptr) {
+                *((device float4 *)(xg + f4 * 4u)) = float4(NAN);
+            }
         }
         return;
     }
@@ -238,9 +243,28 @@ kernel void norm_add_rows(device const float *x [[buffer(0)]],
     for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
         float4 value = norm_rows_value(norm_rows_load4(xr, f4), norm_rows_load4(gain, f4), scale);
         bad = bad || !all(isfinite(value));
-        *((device float4 *)(yr + f4 * 4u)) = norm_rows_load4(yr, f4) + args.add * value;
+        const float4 joined = norm_rows_load4(yr, f4) + args.add * value;
+        *((device float4 *)(yr + f4 * 4u)) = joined;
+        if (xg != nullptr) {
+            *((device float4 *)(xg + f4 * 4u)) = joined * norm_rows_load4(next_gain, f4);
+        }
     }
     if (bad) {
         norm_rows_raise(faults, args.norm.layer);
     }
+}
+
+kernel void norm_add_rows(device const float *x [[buffer(0)]],
+                          device const float *gain [[buffer(1)]],
+                          device float *y [[buffer(2)]],
+                          constant NormAddArgs &args [[buffer(3)]],
+                          device atomic_uint *faults [[buffer(4)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float tg_sums[NORM_ROWS_SG];
+    norm_add_row(x + row * args.norm.x_stride, gain, y + row * args.norm.y_stride, args, faults,
+                 nullptr, nullptr, tid, lane, sg, tg_sums);
 }

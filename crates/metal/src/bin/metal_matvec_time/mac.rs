@@ -94,7 +94,7 @@ use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::router::{self, RouterParams};
 use bloomery_metal::kernels::{
     EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_K, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams,
-    Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD, PairParams, Quant, ROUTED_IDS,
+    Kernels, LoadNorm, MatvecParams, Mode, PARTIALS_PER_HEAD, PairParams, Quant, ROUTED_IDS,
     ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP, SegParams, Segment, SharedPlan, VALUE_HEADS,
 };
 use bloomery_metal::library::{Library, SOURCE};
@@ -656,12 +656,12 @@ fn time_shape(
                                 weights: w,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
                                 y: out,
-                                norm: NormOnLoad {
+                                norm: LoadNorm::Gain {
                                     gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
                                     eps: 1e-6,
-                                    fault: device.fault_word(),
-                                    layer: LAYER_NONE,
                                 },
+                                fault: device.fault_word(),
+                                layer: LAYER_NONE,
                             },
                         )
                         .map_err(why)?;
@@ -710,8 +710,10 @@ fn time_shape(
                                 shared_gate: None,
                                 shared_up: None,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                eps: 1e-6,
+                                norm: LoadNorm::Gain {
+                                    gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                    eps: 1e-6,
+                                },
                                 y: out,
                                 out_stride: *rows,
                                 fault: device.fault_word(),
@@ -758,10 +760,12 @@ fn time_shape(
                         simdgroups: HEAD_SIMD_GROUPS,
                         weights: w,
                         x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
-                        gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                        norm: LoadNorm::Gain {
+                            gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                            eps: 1e-6,
+                        },
                         logits: out,
                         step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
-                        eps: 1e-6,
                         fault: device.fault_word(),
                         layer: LAYER_NONE,
                     };
@@ -1065,8 +1069,10 @@ fn time_pair(
                         shared_gate: Some(shg_w.window(Elems(sg), Elems(one_expert)).map_err(why)?),
                         shared_up: Some(shu_w.window(Elems(sg), Elems(one_expert)).map_err(why)?),
                         x: x.window(Elems(0), Elems(cols)).map_err(why)?,
-                        gain: gain.window(Elems(0), Elems(cols)).map_err(why)?,
-                        eps: 1e-6,
+                        norm: LoadNorm::Gain {
+                            gain: gain.window(Elems(0), Elems(cols)).map_err(why)?,
+                            eps: 1e-6,
+                        },
                         y: y.window_mut(Elems(n * out_values), Elems(out_values))
                             .map_err(why)?,
                         out_stride: EXPERT_K,
@@ -1412,10 +1418,12 @@ fn time_head(
                             .window(Elems((n % copies) * stride), Elems(bytes))
                             .map_err(why)?,
                         x: x.window(Elems(0), Elems(HEAD_K)).map_err(why)?,
-                        gain: gain.window(Elems(0), Elems(HEAD_K)).map_err(why)?,
+                        norm: LoadNorm::Gain {
+                            gain: gain.window(Elems(0), Elems(HEAD_K)).map_err(why)?,
+                            eps: 1e-6,
+                        },
                         logits: y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?,
                         step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
-                        eps: 1e-6,
                         fault: device.fault_word(),
                         layer: LAYER_NONE,
                     },

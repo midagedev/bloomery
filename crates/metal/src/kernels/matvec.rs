@@ -185,6 +185,72 @@ pub struct NormOnLoad<'w> {
     pub layer: u32,
 }
 
+/// Where a launch that norms its input finds the norm. `Gain`: the input is
+/// the raw `x`, and the launch sums its squares as it loads it and multiplies
+/// it by the gain (the norm on load). `Scaled`: the input is already `x · gain`,
+/// written by the sandwich join before the launch ([`Kernels::norm_add_next`]),
+/// and `scale` is the one word of the norm's scale that join computed in the
+/// launch's own lane order; the rows are the `Gain` launch's bits.
+#[derive(Clone, Copy)]
+pub enum LoadNorm<'w> {
+    Gain {
+        /// One value per input column, starting on a 16-byte boundary of its
+        /// buffer.
+        gain: Window<'w, f32, MetalDevice>,
+        /// The epsilon added to the mean of the squares.
+        eps: f32,
+    },
+    Scaled {
+        /// The scale word: a NaN scale (its join found the norm unusable) makes
+        /// every row NaN.
+        scale: Window<'w, f32, MetalDevice>,
+    },
+}
+
+impl<'w> LoadNorm<'w> {
+    /// Whether the launch takes the scaled entry.
+    #[must_use]
+    pub fn scaled(&self) -> bool {
+        matches!(self, Self::Scaled { .. })
+    }
+
+    /// The epsilon the argument block carries: 0 for a scaled launch, which
+    /// reads none.
+    #[must_use]
+    pub fn eps(&self) -> f32 {
+        match self {
+            Self::Gain { eps, .. } => *eps,
+            Self::Scaled { .. } => 0.0,
+        }
+    }
+
+    /// The window bound in the gain's slot: the gain, or the scale word.
+    #[must_use]
+    pub fn window(&self) -> &Window<'w, f32, MetalDevice> {
+        match self {
+            Self::Gain { gain, .. } => gain,
+            Self::Scaled { scale } => scale,
+        }
+    }
+
+    /// The norm's windows against an input of `cols` values: a gain of `cols`
+    /// values on a `float4` boundary, or one scale word.
+    pub(crate) fn check(&self, what: &'static str, cols: usize) -> Result<(), DeviceError> {
+        match self {
+            Self::Gain { gain, .. } => {
+                check_window_len(what, "gain", gain.len(), cols)?;
+                super::check_weights_align(
+                    what,
+                    "gain",
+                    gain.byte_range()?.start.get(),
+                    super::WeightAlign::Float4,
+                )
+            }
+            Self::Scaled { scale } => check_window_len(what, "scale", scale.len(), 1),
+        }
+    }
+}
+
 /// What a mat-vec does with its input and its output.
 pub enum Mode<'w> {
     /// `y = W . x`.

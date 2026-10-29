@@ -238,8 +238,10 @@ kernel void down_fold_kernel(device const typename Q::Block * down [[buffer(0)]]
 // The dots of one pair slot over quant Q: `gate` and `up` are the slot's
 // expert tensors, `nblocks` the blocks of one of their rows. The pair kernel
 // runs it for a routed slot over the stacks' quant and for the shared slot
-// over the shared expert's.
-template <typename Q>
+// over the shared expert's. SCALED: `x` is the join's x · gain and `gain`
+// points at that join's scale word (matvec_rows' SCALED): the load is the
+// plain one and the dots are scaled as the norm's, the same bits.
+template <typename Q, bool SCALED = false>
 inline void pair_slot(device const typename Q::Block * gate,
                       device const typename Q::Block * up,
                       device const float * x,
@@ -265,17 +267,25 @@ inline void pair_slot(device const typename Q::Block * gate,
         sumu[o] = 0.f;
     }
     float sum_sq = 0.f;
+    // The join's scale, read before the walk so its load is in flight under it.
+    const float in_scale = SCALED ? gain[0] : 1.f;
     for (int ib = Q::first_block(lane); ib < (int)nblocks; ib += Q::block_stride()) {
-        Q::template load<LOAD_NORM>(lane, x + (ulong)ib * Q::values_per_block(),
-                                    gain + (ulong)ib * Q::values_per_block(), 1.f, &sum_sq);
+        if (SCALED) {
+            Q::template load<LOAD_PLAIN>(lane, x + (ulong)ib * Q::values_per_block(), nullptr,
+                                         1.f, nullptr);
+        } else {
+            Q::template load<LOAD_NORM>(lane, x + (ulong)ib * Q::values_per_block(),
+                                        gain + (ulong)ib * Q::values_per_block(), 1.f, &sum_sq);
+        }
         for (short o = 0; o < PAIR_OUTS; ++o) {
             sumg[o] += Q::partial(grow[o][ib], lane);
             sumu[o] += Q::partial(urow[o][ib], lane);
         }
     }
-    const float sum_squares = simd_sum(sum_sq);
-    const float scale = rms_scale(sum_squares, nblocks * Q::values_per_block(), args.eps);
-    if (!rms_usable(sum_squares, scale)) {
+    const float sum_squares = SCALED ? 0.f : simd_sum(sum_sq);
+    const float scale =
+        SCALED ? in_scale : rms_scale(sum_squares, nblocks * Q::values_per_block(), args.eps);
+    if (!SCALED && !rms_usable(sum_squares, scale)) {
         if (tiisg == 0u) {
             pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
                            BLOOMERY_FAULT_SITE_NORM_QUANT);
@@ -294,7 +304,7 @@ inline void pair_slot(device const typename Q::Block * gate,
 // The pair over stacks of quant Q and a shared expert of quant QS. `nblocks`
 // in the arguments is the stacks' rows' blocks; the shared expert's rows hold
 // the same columns in QS's blocks, as many when QS is Q.
-template <typename Q, typename QS>
+template <typename Q, typename QS, bool SCALED = false>
 kernel void pair_swiglu_apart_kernel(device const typename Q::Block * gate [[buffer(0)]],
                                      device const typename Q::Block * up [[buffer(1)]],
                                      device const typename QS::Block * shexp_gate [[buffer(2)]],
@@ -327,11 +337,12 @@ kernel void pair_swiglu_apart_kernel(device const typename Q::Block * gate [[buf
     }
     if (slot == BLOOMERY_EXPERT_SHARED) {
         const uint shared_blocks = args.nblocks * (uint)Q::values_per_block() / (uint)QS::values_per_block();
-        pair_slot<QS>(shexp_gate, shexp_up, x, gain, y, faults, args, shared_blocks, slot, row0, tiisg);
+        pair_slot<QS, SCALED>(shexp_gate, shexp_up, x, gain, y, faults, args, shared_blocks, slot,
+                              row0, tiisg);
     } else {
         const ulong expert_blocks = (ulong)expert * (ulong)args.rows * (ulong)args.nblocks;
-        pair_slot<Q>(gate + expert_blocks, up + expert_blocks, x, gain, y, faults, args,
-                     args.nblocks, slot, row0, tiisg);
+        pair_slot<Q, SCALED>(gate + expert_blocks, up + expert_blocks, x, gain, y, faults, args,
+                             args.nblocks, slot, row0, tiisg);
     }
 }
 
@@ -463,6 +474,31 @@ APART_PAIR_ENTRY("q6k_pair_swiglu", Q6K, block_q6_K, Q6K, block_q6_K)
 APART_PAIR_ENTRY("a4_pair_swiglu", A4, block_mlx_a4, A4, block_mlx_a4)
 APART_PAIR_ENTRY("q8_0_pair_swiglu", Q8_0, block_q8_0, Q8_0, block_q8_0)
 APART_PAIR_ENTRY("q5k_pair_swiglu", Q5K, block_q5_K, Q5K, block_q5_K)
+
+// The scaled pair of each type, a shared expert in the stacks' type: the
+// input is the join's x · gain, `gain` binds the join's scale word.
+#define SCALED_PAIR_ENTRY(NAME, Q, BQ)                                                 \
+    template [[host_name(NAME)]]                                                       \
+    kernel void pair_swiglu_apart_kernel<Q, Q, true>(                                  \
+        device const BQ * gate [[buffer(0)]],                                          \
+        device const BQ * up [[buffer(1)]],                                            \
+        device const BQ * shexp_gate [[buffer(2)]],                                    \
+        device const BQ * shexp_up [[buffer(3)]],                                      \
+        device const float * x [[buffer(4)]],                                          \
+        device const float * gain [[buffer(5)]],                                       \
+        device const int * ids [[buffer(6)]],                                          \
+        device float * y [[buffer(7)]],                                                \
+        device atomic_uint * faults [[buffer(8)]],                                     \
+        constant PairArgs & args [[buffer(9)]],                                        \
+        uint3 tgpig [[threadgroup_position_in_grid]],                                  \
+        ushort tiisg [[thread_index_in_simdgroup]],                                    \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+SCALED_PAIR_ENTRY("q4k_pair_swiglu_scaled", Q4K, block_q4_K)
+SCALED_PAIR_ENTRY("q6k_pair_swiglu_scaled", Q6K, block_q6_K)
+SCALED_PAIR_ENTRY("a4_pair_swiglu_scaled", A4, block_mlx_a4)
+SCALED_PAIR_ENTRY("q8_0_pair_swiglu_scaled", Q8_0, block_q8_0)
+SCALED_PAIR_ENTRY("q5k_pair_swiglu_scaled", Q5K, block_q5_K)
 
 // The pairs of types a mixed file has: Q4_K and Q5_K gate and up stacks, Q5_K
 // and Q6_K down stacks, each beside a Q8_0 shared expert.

@@ -69,7 +69,13 @@ inline int simd_first_row(uint tg, ushort sg) {
 // are the same bits. ROW_RAISE: a norm-on-load row the scaled sum leaves
 // not finite raises the norm site and is NaN. The head's logits turn it off:
 // its argmax owns a non-finite logit and raises the logit site for it.
-template <typename Q, bool NORM, bool RESID, bool HEADNORM, bool ROW_RAISE = true>
+// SCALED: the input is already x · gain, written by the join before it
+// (norm_add_next_kernel), and `gain` points at the one word of the scale that
+// join computed in this quant's lane order; the load is the plain one and the
+// rows are scaled and raised as the norm's, so they are the norm-on-load
+// rows' bits.
+template <typename Q, bool NORM, bool RESID, bool HEADNORM, bool ROW_RAISE = true,
+          bool SCALED = false>
 inline void matvec_rows(device const typename Q::Block * W,
                         device const float      * x,
                         device float            * y,
@@ -83,11 +89,14 @@ inline void matvec_rows(device const typename Q::Block * W,
                         int rows,
                         ushort tiisg) {
     constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
+    static_assert(!(NORM && SCALED), "a scaled input is normed once, by its join");
 
     const int nb = nblocks;
     if (first_row >= rows) {
         return;
     }
+    // The join's scale, read before the walk so its load is in flight under it.
+    const float in_scale = SCALED ? gain[0] : 1.f;
     // Each row's blocks, the last row's for a row past the last.
     device const typename Q::Block * rp[NR0];
     for (short r = 0; r < NR0; ++r) {
@@ -141,7 +150,7 @@ inline void matvec_rows(device const typename Q::Block * W,
         }
     }
 
-    float scale = 1.f;
+    float scale = in_scale;
     if (NORM) {
         const float sum_squares = simd_sum(sum_sq);
         scale = rms_scale(sum_squares, (uint)nb * Q::values_per_block(), eps);
@@ -158,13 +167,14 @@ inline void matvec_rows(device const typename Q::Block * W,
 
     for (short row = 0; row < NR0 && first_row + row < rows; ++row) {
         float sum_all = simd_sum(sumf[row]);
-        if (NORM) {
+        if (NORM || SCALED) {
             sum_all *= scale;
         }
         if (tiisg == 0) {
             // A row the scaled sum leaves not finite (a gain or a weight that is
-            // not finite) raises the norm site and is NaN, not a plausible value.
-            if (NORM && ROW_RAISE && !isfinite(sum_all)) {
+            // not finite, or a scale its join found unusable) raises the norm
+            // site and is NaN, not a plausible value.
+            if ((NORM || SCALED) && ROW_RAISE && !isfinite(sum_all)) {
                 raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
                 y[first_row + row] = NAN;
             } else if (RESID) {
@@ -208,8 +218,9 @@ kernel void matvec_norm_kernel(device const typename Q::Block * W [[buffer(0)]],
 
 // The row segments of up to four tensors of one type and one width: the
 // threadgroup takes the segment whose first threadgroup it is, and the rows
-// are the ones a launch of that segment alone would write.
-template <typename Q>
+// are the ones a launch of that segment alone would write. SCALED: the input
+// is the join's x · gain and `gain` binds the join's scale word.
+template <typename Q, bool SCALED = false>
 kernel void matvec_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
                               device const float      * x [[buffer(1)]],
                               device float            * y [[buffer(2)]],
@@ -227,7 +238,7 @@ kernel void matvec_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
     }
     const uint local = tgpig.x - args.segs[s].first_group;
     const int first_row = simd_first_row(local, sgitg);
-    matvec_rows<Q, true, false, false>(
+    matvec_rows<Q, !SCALED, false, false, true, SCALED>(
         W + (ulong)args.segs[s].wblocks,
         x,
         y + args.segs[s].out,
@@ -283,7 +294,94 @@ kernel void matvec_headnorm_kernel(device const typename Q::Block * W [[buffer(0
                                       nullptr, scales, faults, first_row, (int)args.rows, tiisg);
 }
 
+// The next launch's norm, the second half of a sandwich join's work: the
+// join of one row (norm.metal's norm_add_row), which also writes the stream's
+// new row times the next launch's gain into `xn`, then the scale of that
+// launch's norm into `xn[cols]`. The scale's sum is the next launch's own:
+// SIMD group 0 walks the stream's row with quant Q's lane map and load, the
+// walk matvec_rows and the pair run, so the scale is the bits that launch
+// would compute, and its rows over `xn` (the SCALED entries) are its
+// norm-on-load rows' bits. A sum or scale the norm cannot take raises the norm
+// site in the next launch's layer, where that launch would raise it, and the
+// scale is NaN, so every row it scales is NaN.
+struct NextNormArgs {
+    float eps;      // the next launch's norm epsilon
+    uint layer;     // the layer the next launch's raise is recorded in
+};
+
+static_assert(sizeof(NextNormArgs) == 8, "NextNormArgs is 8 bytes: the host packs two words");
+
+template <typename Q>
+kernel void norm_add_next_kernel(device const float *x [[buffer(0)]],
+                                 device const float *gain [[buffer(1)]],
+                                 device float *y [[buffer(2)]],
+                                 constant NormAddArgs &args [[buffer(3)]],
+                                 device atomic_uint *faults [[buffer(4)]],
+                                 device const float *next_gain [[buffer(5)]],
+                                 device float *xn [[buffer(6)]],
+                                 constant NextNormArgs &next [[buffer(7)]],
+                                 uint tid [[thread_position_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float tg_sums[NORM_ROWS_SG];
+    norm_add_row(x, gain, y, args, faults, next_gain, xn, tid, lane, sg, tg_sums);
+    // The row the walk reads is every thread's store.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (sg != 0u) {
+        return;
+    }
+    typename Q::Lane walk = Q::lane_of((ushort)lane);
+    const int nb = (int)(args.norm.cols / (uint)Q::values_per_block());
+    float sum_sq = 0.f;
+    device const float * yp = y + Q::first_block(walk) * Q::values_per_block();
+    device const float * gp = next_gain + Q::first_block(walk) * Q::values_per_block();
+    for (int ib = Q::first_block(walk); ib < nb; ib += Q::block_stride()) {
+        Q::template load<LOAD_NORM>(walk, yp, gp, 1.f, &sum_sq);
+        yp += Q::block_stride() * Q::values_per_block();
+        gp += Q::block_stride() * Q::values_per_block();
+    }
+    const float sum_squares = simd_sum(sum_sq);
+    const float scale = rms_scale(sum_squares, (uint)nb * Q::values_per_block(), next.eps);
+    if (lane == 0u) {
+        if (rms_usable(sum_squares, scale)) {
+            xn[args.norm.cols] = scale;
+        } else {
+            raise(faults, next.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+            xn[args.norm.cols] = NAN;
+        }
+    }
+}
+
+// Each type's scaled segmented entry and the join that feeds it: the pair of
+// entries a quant's file instantiates beside its own.
+#define SCALED_SEG_ENTRIES(PREFIX, Q, BQ)                                              \
+    template [[host_name(PREFIX "_matvec_seg_scaled")]]                                \
+    kernel void matvec_seg_kernel<Q, true>(device const BQ * W [[buffer(0)]],          \
+                                           device const float * x [[buffer(1)]],       \
+                                           device float * y [[buffer(2)]],             \
+                                           constant SegArgs & args [[buffer(3)]],      \
+                                           device const float * gain [[buffer(4)]],    \
+                                           device atomic_uint * faults [[buffer(5)]],  \
+                                           uint3 tgpig [[threadgroup_position_in_grid]], \
+                                           ushort tiisg [[thread_index_in_simdgroup]], \
+                                           ushort sgitg [[simdgroup_index_in_threadgroup]]); \
+    template [[host_name(PREFIX "_norm_add_next")]]                                    \
+    kernel void norm_add_next_kernel<Q>(device const float * x [[buffer(0)]],          \
+                                        device const float * gain [[buffer(1)]],       \
+                                        device float * y [[buffer(2)]],                \
+                                        constant NormAddArgs & args [[buffer(3)]],     \
+                                        device atomic_uint * faults [[buffer(4)]],     \
+                                        device const float * next_gain [[buffer(5)]],  \
+                                        device float * xn [[buffer(6)]],               \
+                                        constant NextNormArgs & next [[buffer(7)]],    \
+                                        uint tid [[thread_position_in_threadgroup]],   \
+                                        uint lane [[thread_index_in_simdgroup]],       \
+                                        uint sg [[simdgroup_index_in_threadgroup]]);
+
 // The Q4_K entries, under the names the host launches.
+
+SCALED_SEG_ENTRIES("q4k", Q4K, block_q4_K)
 
 template [[host_name("q4k_matvec")]]
 kernel void matvec_kernel<Q4K, false>(device const block_q4_K * W [[buffer(0)]],

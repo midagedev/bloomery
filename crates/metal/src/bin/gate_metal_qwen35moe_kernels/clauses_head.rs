@@ -12,7 +12,9 @@ use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::geom::Geometry;
 use bloomery_metal::instance::REGISTERED;
-use bloomery_metal::kernels::{HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, Quant, ROWS_PER_GROUP};
+use bloomery_metal::kernels::{
+    HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, LoadNorm, Quant, ROWS_PER_GROUP,
+};
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
@@ -152,10 +154,12 @@ pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
                 simdgroups: HEAD_SIMD_GROUPS,
                 weights: weights_b.window(Elems(0), Elems(weights.len()))?,
                 x: x_b.window(Elems(0), Elems(x.len()))?,
-                gain: gain_b.window(Elems(0), Elems(gain.len()))?,
+                norm: LoadNorm::Gain {
+                    gain: gain_b.window(Elems(0), Elems(gain.len()))?,
+                    eps,
+                },
                 logits: logits_b.window_mut(Elems(0), Elems(rows))?,
                 step_id: step_b.window_mut(Elems(0), Elems(1))?,
-                eps,
                 fault,
                 layer: LAYER,
             },
@@ -531,10 +535,12 @@ pub fn head_repeat(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                         simdgroups: HEAD_SIMD_GROUPS,
                         weights: weights_b.window(Elems(0), Elems(weights.len()))?,
                         x: x_b.window(Elems(launch * K), Elems(K))?,
-                        gain: gain_b.window(Elems(0), Elems(K))?,
+                        norm: LoadNorm::Gain {
+                            gain: gain_b.window(Elems(0), Elems(K))?,
+                            eps,
+                        },
                         logits: logits_b.window_mut(Elems(launch * ROWS), Elems(ROWS))?,
                         step_id: step_b.window_mut(Elems(launch), Elems(1))?,
-                        eps,
                         fault,
                         layer: LAYER,
                     },
@@ -775,10 +781,12 @@ fn refuse(
             simdgroups: a.simdgroups,
             weights: bufs.weights.window(Elems(a.weights_at), Elems(a.weights))?,
             x: bufs.x.window(Elems(a.x_at), Elems(a.x))?,
-            gain: bufs.gain.window(Elems(a.gain_at), Elems(a.gain))?,
+            norm: LoadNorm::Gain {
+                gain: bufs.gain.window(Elems(a.gain_at), Elems(a.gain))?,
+                eps: a.eps,
+            },
             logits: bufs.logits.window_mut(Elems(0), Elems(a.logits))?,
             step_id: bufs.step_id.window_mut(Elems(0), Elems(a.step_id))?,
-            eps: a.eps,
             fault: h.device.fault_word(),
             layer: LAYER,
         },
