@@ -8,9 +8,12 @@
 #
 #   The cut     nvidia/Qwen3.8-27B-NVFP4 at 482ca0f3 (ModelOpt MIXED_PRECISION: NVFP4 feed-forward and head, FP8 attention and
 #               delta-rule projections), layers 0 to 3 (three delta-rule layers, one attention layer), the embedding, the head
-#               and the final norm, no vision tower and no `mtp.*` (tools/fixture-cuts/qwen38nv.json), in /models/fixtures/qwen38nv:
+#               and the final norm, no vision tower and no `mtp.*` (tools/fixture-cuts/qwen38nv.json), in /models/fixtures/qwen38nv.
+#               The card budget is above the cut's tensor data (4.31 GB) with room for the cache and scratch of the longest
+#               context a gate runs, so the folder plans whole on one card as the real model does on a 24 GB card:
 #                 cargo build --release -p bloomery-model-hf --bin fixture
-#                 target/release/fixture cut /models/Qwen3.8-27B-NVFP4 /models/fixtures/qwen38nv --spec tools/fixture-cuts/qwen38nv.json
+#                 target/release/fixture cut /models/Qwen3.8-27B-NVFP4 /models/fixtures/qwen38nv --spec tools/fixture-cuts/qwen38nv.json \
+#                   --card-budget 8G
 #                 target/release/fixture verify /models/fixtures/qwen38nv --source /models/Qwen3.8-27B-NVFP4
 #   MODEL       the twin: mainline's converter (convert_hf_to_gguf.py at the LCPP_PIN commit) over the cut folder, in a directory
 #               of its own under the cut's (the fixture's first-shard glob does not see it):
