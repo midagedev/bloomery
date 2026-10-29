@@ -2,8 +2,8 @@
 //! 256, each with a dense SwiGLU FFN of 17,408; the 15 `blk.64.*` next-token tensors unused) whole on one card, the
 //! Body35 chain a request runs: the prompt call, the decode step, the pass, the checkpoints and the resident slots,
 //! against llama.cpp mainline's forced-logits rows (`refset::arch::qwen35::dense`, `just dump-logits-qwen38d`). The
-//! file fits either card, so the gate holds the same clauses in both tiers. `gate_clef_hidden` holds the trunk's
-//! hidden-state band on the same geometry; this gate does not repeat it.
+//! file fits either card. `gate_clef_hidden` holds the trunk's hidden-state band on the same geometry; this gate does
+//! not repeat it.
 //!
 //! The clauses (a) to (f) are the shared dense-gate module's (`shared/dense_e2e.rs`, the same code for every dense
 //! Body35 file); this bin is the Qwen3.8-27B's row of it: the file, its sets, its header's geometry and the bands below.
@@ -13,7 +13,8 @@
 //! qwen38nv.sh`); the twin is the file mainline reads, as it reads no folder and ik reads no NVFP4. Two fixture-oracle
 //! clauses (module `nv`) hold that route: G3, ours on the twin against mainline's forced-logits rows, within bands that are
 //! multiples of the oracle's own CPU floor; G4, ours on the folder equal bit for bit to ours on the twin, which is the
-//! folder map's bytes held to the converter's. Clauses (a) to (f) are the real file's and the real tier's.
+//! folder map's bytes held to the converter's. Clauses (a) to (f) run on the real file in the real tier only (the
+//! family's rotation schedules them); the fixture tier holds no run of them on any file.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -91,7 +92,7 @@ mod gate {
     /// difference of their two moves, at most `min(2 · max_abs, √2 · l2)` of the move's vector
     /// (`dense-logits.py stable_margin`); the move taken is the oracle's own spread on that row (twin against CUDA,
     /// the same positions amplify for any two realizations) times 1.3, the factor the p90 band takes.
-    const STABLE_K: f64 = 1.3;
+    pub(super) const STABLE_K: f64 = 1.3;
     /// PIN(2026-10-19): the rows at or under their stability bound (the only rows that could flip), per set: 20 of 32
     /// and 17 of 32 at [`STABLE_K`] (28 of 64 at a factor of 1, the floor's report). A count that moves means the
     /// sets or the twin moved, not the engine.
@@ -130,13 +131,13 @@ mod gate {
 
 #[cfg(feature = "gpu")]
 mod nv {
-    use super::dense_e2e::{norms, rows_of};
+    use super::dense_e2e::{self, Bands, norms, rows_of, twin_of};
     use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, kld, quantile, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, quantile, verdict};
     use bloomery_levers::{CARD_BUDGET, CardBudget};
     use refset::arch::qwen35::dense::{NV_P64, NV_P4096, NV_PROFILE, NV_TWIN, NvForcedLogits};
     use std::collections::BTreeMap;
@@ -180,10 +181,11 @@ mod nv {
     const ACT_MEDIAN: f64 = 0.0109;
     const ACT_P90: f64 = 0.0121;
     const ACT_ROW: f64 = 0.0130;
-    /// The factor on a row's stability bound, as the real file's: two logits swap only if their margin is within the
-    /// difference of their two moves, at most `min(2 · max_abs, √2 · l2)` of the move's vector, the move taken being the
-    /// oracle's own spread on that row (CPU against CUDA) times this factor.
-    const STABLE_K: f64 = 1.3;
+    /// PIN(2026-10-29): the twin's rows at or under their stability bound (the real file's factor, [`super::gate::STABLE_K`]),
+    /// per set: 1 and 2 of 32, read from G3's own lines `ref_qwen38nv_logits_p64: ... 1 rows at or under their stability
+    /// bound` and `ref_qwen38nv_logits_p4096: ... 2 rows at or under their stability bound`. The count reads the sets and the
+    /// CPU floor alone, so a count that moves means the sets or the twin moved, not the engine.
+    const OTHER_ROWS: [usize; 2] = [1, 2];
 
     fn options() -> Open35 {
         Open35 {
@@ -331,22 +333,17 @@ mod nv {
         )
     }
 
-    /// G3: ours on the twin against mainline's CUDA rows of each set: each row's relative L2 within the largest-row band,
-    /// the median and the 90th percentile within theirs, and the argmax equal on every row whose reference top-2 margin
-    /// exceeds its stability bound; the rows at or under it are counted and printed.
+    /// G3: ours on the twin against mainline's CUDA rows of each set, by the per-row rule the real file's clause holds
+    /// (`dense_e2e::oracle`) within bands that the floor sets here: each row's relative L2 within the largest-row band, the
+    /// median and the 90th percentile within theirs, the argmax equal on every row whose reference top-2 margin exceeds its
+    /// stability bound, and the rows at or under it counted against [`OTHER_ROWS`].
     fn g3(side: &Side, sets: [(&str, usize); 2]) -> Result<bool, GateError> {
         println!("(G3) the twin through ours against mainline's forced logits rows");
         let mut opened = Vec::new();
         let mut floor_spread = (0.0f64, 0.0f64, 0.0f64);
         for (name, prompt) in sets {
             let set = NvForcedLogits::open(&data_dir().join(name))?;
-            let cpu = NvForcedLogits::open_cpu(&data_dir().join(format!("{name}.cpu")))?;
-            if cpu.prompt != set.prompt || cpu.forced != set.forced || set.prompt.len() != prompt {
-                return Err(format!(
-                    "{name}: its CPU floor is not the CPU run of the same prompt and forced ids"
-                )
-                .into());
-            }
+            let cpu = twin_of(name, prompt, &set)?;
             let floor: Vec<f64> = (0..set.rows())
                 .map(|i| {
                     let (l2, _, norm) = norms(cpu.row(i), set.row(i));
@@ -364,65 +361,22 @@ mod nv {
             );
             opened.push((name, prompt, set, cpu));
         }
-        let (band_median, band_p90, band_rel) = (
-            ACT_MEDIAN.hypot(MEDIAN_FACTOR * floor_spread.0),
-            ACT_P90.hypot(P90_FACTOR * floor_spread.1),
-            ACT_ROW.hypot(REL_FACTOR * floor_spread.2),
-        );
+        let bands = Bands {
+            rel: ACT_ROW.hypot(REL_FACTOR * floor_spread.2),
+            median: ACT_MEDIAN.hypot(MEDIAN_FACTOR * floor_spread.0),
+            p90: ACT_P90.hypot(P90_FACTOR * floor_spread.1),
+            stable_k: super::gate::STABLE_K,
+            other_rows: OTHER_ROWS,
+        };
         println!(
-            "  bands (the activation rule's term in quadrature with the floor's): median {band_median:.4} ({ACT_MEDIAN} with \
-             {MEDIAN_FACTOR} x the larger median), p90 {band_p90:.4} ({ACT_P90} with {P90_FACTOR} x the larger p90), row \
-             {band_rel:.4} ({ACT_ROW} with {REL_FACTOR} x the largest row)"
+            "  bands (the activation rule's term in quadrature with the floor's): median {:.4} ({ACT_MEDIAN} with \
+             {MEDIAN_FACTOR} x the larger median), p90 {:.4} ({ACT_P90} with {P90_FACTOR} x the larger p90), row \
+             {:.4} ({ACT_ROW} with {REL_FACTOR} x the largest row)",
+            bands.median, bands.p90, bands.rel
         );
         let mut ok = true;
-        for ((name, prompt, set, cpu), ours) in opened.iter().zip(&side.rows) {
-            let (mut rel, mut stable, mut flips_stable, mut under, mut flips_under) =
-                (Vec::new(), 0usize, 0usize, 0usize, 0usize);
-            let mut worst = (0.0f64, 0usize);
-            for (i, row) in ours.iter().enumerate() {
-                let reference = set.row(i);
-                if row.len() != reference.len() {
-                    return Err(format!(
-                        "{name} row {i}: {} logits, the set's {}",
-                        row.len(),
-                        reference.len()
-                    )
-                    .into());
-                }
-                let (l2, _, norm) = norms(row, reference);
-                rel.push(l2 / norm);
-                if l2 / norm > worst.0 || l2.is_infinite() {
-                    worst = (l2 / norm, i);
-                }
-                let (floor_l2, floor_max, _) = norms(cpu.row(i), reference);
-                let bound =
-                    STABLE_K * f64::min(2.0 * floor_max, std::f64::consts::SQRT_2 * floor_l2);
-                let (ours_top, _, _, _) = kld::top2(row);
-                let (ref_top, first, _, second) = kld::top2(reference);
-                if f64::from(first) - f64::from(second) > bound {
-                    stable += 1;
-                    flips_stable += usize::from(ours_top != ref_top);
-                } else {
-                    under += 1;
-                    flips_under += usize::from(ours_top != ref_top);
-                }
-            }
-            let (median, p90, _) = spread(&rel);
-            let pass = rel.iter().all(|&r| r <= band_rel)
-                && median <= band_median
-                && p90 <= band_p90
-                && flips_stable == 0;
-            println!(
-                "  {name}: {} rows after {prompt} ids; rel L2 median {median:.4} (band {band_median:.4}), p90 {p90:.4} (band {band_p90:.4}), \
-                 worst {:.4} at row {} (band {band_rel:.4}); argmax equal on {}/{stable} stable rows; {under} rows at or under their stability \
-                 bound, {flips_under} of them flipped {}",
-                ours.len(),
-                worst.0,
-                worst.1,
-                stable - flips_stable,
-                verdict(pass)
-            );
-            ok &= pass;
+        for (i, ((name, prompt, set, cpu), ours)) in opened.iter().zip(&side.rows).enumerate() {
+            ok &= dense_e2e::oracle(ours, bands, (*name, *prompt), (set, cpu), i)?;
         }
         Ok(ok)
     }
