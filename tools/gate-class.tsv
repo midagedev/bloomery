@@ -163,7 +163,7 @@ gate-gpu-qwen38-nodes-remote	family	qwen4exp	by-hand	node_link+placement_nodes
 gate-gpu-qwen38-residency	family	qwen4exp	residency	residency
 gate-gpu-qwen38-serve	family	qwen4exp	serve	seats_serve_engine+serve_http_api
 gate-gpu-qwen38-twocard	family	qwen4exp	tier	tier_legs+placement_sizing
-gate-gpu-qwen38d	family	qwen38d	e2e	attn_linear_gdn_kda+attn_gqa
+gate-gpu-qwen38d	family	qwen38d	e2e	attn_linear_gdn_kda+attn_gqa+checkpoint_folder+quant_mxfp4
 gate-gpu-qwen3moe-kernels	family	qwen3moe	kernel	attn_gqa+head_sample+moe_route+quant_q4k+quant_q6k+weights_load
 gate-gpu-qwen3moe-e2e	family	qwen3moe	e2e	graph_fault+moe_route+attn_gqa
 gate-gpu-qwen3moe-types	family	qwen3moe	place	placement_sizing+weights_load

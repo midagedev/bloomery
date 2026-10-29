@@ -925,16 +925,19 @@ mod tests {
         );
     }
 
-    /// A cut row is its rules file's family: the file parses, names the row's directory and its
-    /// canonical architecture string, and `fetch` of a cut family says `cut` instead of reading a
-    /// hub repo. (The registry's own test holds a rules file to each row and each row to a file.)
+    /// A cut row or profile cut is its rules file's family: the file parses, names the cut's
+    /// directory and its architecture string, and `fetch` of a cut family says `cut` instead of
+    /// reading a hub repo. (The registry's own test holds a rules file to each cut and each cut to
+    /// a file.)
     #[test]
     fn a_cut_row_is_its_rules_files_family_and_fetch_refuses_it() {
         let mut cuts = 0;
-        for row in registry::ROWS {
-            let Some(registry::Fixture::Cut(c)) = row.fixture else {
-                continue;
-            };
+        let rows = registry::ROWS.iter().filter_map(|row| match row.fixture {
+            Some(registry::Fixture::Cut(c)) => Some((c, row.canonical())),
+            _ => None,
+        });
+        let profiles = registry::PROFILE_CUTS.iter().map(|p| (p.cut, p.arch));
+        for (c, arch) in rows.chain(profiles) {
             cuts += 1;
             let path = format!(
                 "{}/../../tools/fixture-cuts/{}.json",
@@ -945,8 +948,7 @@ mod tests {
             let spec = cut::Spec::parse(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
             assert_eq!(spec.name, c.family, "{path}: the rules name another family");
             assert_eq!(
-                spec.arch,
-                row.canonical(),
+                spec.arch, arch,
                 "{path}: the rules name another architecture"
             );
             let args = ["fetch", c.family, "/nonexistent/out"].map(String::from);

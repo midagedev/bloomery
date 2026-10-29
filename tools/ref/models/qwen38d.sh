@@ -8,8 +8,9 @@
 #
 #   MODEL           lmstudio-community's Qwen3.8-27B Q4_K_M (rev 5a7da681, 16,810,714,336 bytes, sha256 e00082f7...:
 #                   tools/ref/dense-logits.py TARGETS holds the identity the writer checks before it opens the file).
-#                   BLOOMERY_REF_MODEL moves it. The file runs on either card in both tiers, so the fixture tier's
-#                   row is `self` (tools/ref/ref-paths.sh)
+#                   BLOOMERY_REF_MODEL moves it. The fixture tier's model is the NVFP4 cut folder tools/fixture-dirs.tsv
+#                   names for this profile (tools/fixture-cuts/qwen38nv.json), whose GGUF twin and oracle sets are the
+#                   qwen38nv profile's (tools/ref/models/qwen38nv.sh); this file is the real tier's
 #   LCPP            the mainline llama.cpp tree that is the numeric oracle: the qwen35 profile's, at LCPP_PIN
 #                   (src/models/qwen35.cpp, LLM_ARCH_QWEN35). dense_logits_ref (tools/ref/dense_logits_ref.cpp) links against its
 #                   build/bin libraries (tools/ref/build-dense-logits.sh), which tools/ref/emb2/oracle-tree.sh proves are

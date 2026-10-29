@@ -7,6 +7,13 @@
 //!
 //! The clauses (a) to (f) are the shared dense-gate module's (`shared/dense_e2e.rs`, the same code for every dense
 //! Body35 file); this bin is the Qwen3.8-27B's row of it: the file, its sets, its header's geometry and the bands below.
+//!
+//! The fixture tier's model is the NVFP4 cut of `nvidia/Qwen3.8-27B-NVFP4` (`tools/fixture-cuts/qwen38nv.json`: layers 0 to
+//! 3, a folder in its stored bits) and its GGUF twin, which mainline's converter makes of the cut (`tools/ref/models/
+//! qwen38nv.sh`); the twin is the file mainline reads, as it reads no folder and ik reads no NVFP4. Two fixture-oracle
+//! clauses (module `nv`) hold that route: G3, ours on the twin against mainline's forced-logits rows, within bands that are
+//! multiples of the oracle's own CPU floor; G4, ours on the folder equal bit for bit to ours on the twin, which is the
+//! folder map's bytes held to the converter's. Clauses (a) to (f) are the real file's and the real tier's.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -34,6 +41,7 @@ mod gate {
     use super::dense_e2e::{self, Bands, Row};
     use super::q35_clauses::Geometry35;
     use bloomery_gpu_gates::GateError;
+    use bloomery_gpu_gates::tier::Tier;
     use refset::arch::qwen35::dense::{MODEL, P64, P4096, Qwen38d};
 
     /// The real file's literals, beside the geometry its header gives (the move proof, `Geometry35::of`).
@@ -91,7 +99,361 @@ mod gate {
         },
     };
 
+    /// The real tier runs the real file's clauses and leaves the cut's to the fixture tier by name; the fixture tier runs
+    /// the cut's.
     pub fn run() -> Result<(), GateError> {
-        dense_e2e::run::<Qwen38d>(&ROW)
+        match Tier::from_env()? {
+            Tier::Real => {
+                dense_e2e::run::<Qwen38d>(&ROW)?;
+                super::nv::declare()
+            }
+            Tier::Fixture => super::nv::run(),
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+mod nv {
+    use super::dense_e2e::{norms, rows_of};
+    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
+    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_gates::tier::{self, Tag};
+    use bloomery_gpu_gates::{
+        GateError, checks_failed, data_dir, kld, quantile, ref_model_path, verdict,
+    };
+    use refset::arch::qwen35::dense::{NV_P64, NV_P4096, NV_PROFILE, NV_TWIN, NvForcedLogits};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    /// The gate's name: its first line and the `what` of its refusals.
+    const GATE: &str = "gate_qwen35_dense";
+    /// The fixture-oracle clauses this gate declares, in order.
+    const G3: &str = "g3_twin_against_mainline";
+    const G4: &str = "g4_folder_is_twin";
+    const DECLARED: usize = 2;
+
+    /// The cache both clauses load with: the sets' context (a 4,096-id prompt and 31 forced steps fit) at the real
+    /// file's gate ubatch, f16 K/V, the scalar flash (the model's group of 6 query heads runs the pairs' pass).
+    const CTX: usize = 4352;
+    const U_GATE: usize = 1024;
+
+    /// The bands of G3 are multiples of the oracle's own floor on the twin: mainline's CPU kernels against its CUDA
+    /// kernels on the same file, prompt and ids (`dense-logits.py floor`, the rows `<set>.cpu` beside each set), pooled over
+    /// both sets as the real file's bands are. The factors are the ones the real file's `PIN` bands take over its own floor
+    /// (0.20 over the largest row 0.1492, 0.066 over the larger median 0.0525, 0.09 over the larger p90 0.0685): 1.34 on the
+    /// largest relative L2, 1.25 on the median, 1.3 on the 90th percentile. A wiring fault (a dropped scale, a stale
+    /// activation block, a layer or id off by one) moves a row by order one, far past either.
+    const REL_FACTOR: f64 = 1.34;
+    const MEDIAN_FACTOR: f64 = 1.25;
+    const P90_FACTOR: f64 = 1.3;
+    /// The factor on a row's stability bound, as the real file's: two logits swap only if their margin is within the
+    /// difference of their two moves, at most `min(2 · max_abs, √2 · l2)` of the move's vector, the move taken being the
+    /// oracle's own spread on that row (CPU against CUDA) times this factor.
+    const STABLE_K: f64 = 1.3;
+
+    fn options() -> Open35 {
+        Open35 {
+            ctx: CTX,
+            mma: false,
+            ubatch: U_GATE,
+            kv: KvQ8::F16,
+            media: false,
+        }
+    }
+
+    /// The real tier leaves both clauses to the fixture tier, each a [`tier::FIXTURE_ONLY`] line the batch counts.
+    pub fn declare() -> Result<(), GateError> {
+        for clause in [G3, G4] {
+            tier::run_clause(clause, Tag::FixtureOracle)?;
+        }
+        tier::expect_fixture_oracle(GATE, DECLARED)?;
+        println!("{}", tier::tally_line());
+        Ok(())
+    }
+
+    /// The twin through ours, then the folder through ours, one model on the card at a time.
+    pub fn run() -> Result<(), GateError> {
+        bloomery_levers::at_main(&[])?;
+        let folder = ref_model_path()?;
+        println!("{GATE} (fixture tier): the cut {}", folder.display());
+        let first = refset::fixture::first_shard(NV_PROFILE)?;
+        if Path::new(&first).parent() != Some(folder.as_path()) {
+            return Err(format!(
+                "{GATE}: the model is {}, the fixture table's cut of {NV_PROFILE} is {first}'s folder",
+                folder.display()
+            )
+            .into());
+        }
+        println!("  {}", refset::fixture::line(Path::new(&first))?.trim_end());
+        let twin = Path::new(NV_TWIN);
+        if !twin.is_file() {
+            return Err(format!(
+                "{GATE}: the cut's GGUF twin {NV_TWIN} is not there (the command is in tools/ref/models/qwen38nv.sh)"
+            )
+            .into());
+        }
+        // `--only g3|g4` runs one clause (the FAIL-first mutants' loop); no flag runs both.
+        let only = std::env::args().skip_while(|a| a != "--only").nth(1);
+        if let Some(o) = &only
+            && !["g3", "g4"].contains(&o.as_str())
+        {
+            return Err(format!("--only {o}: a clause is one of g3, g4").into());
+        }
+        let want = |c: &str| only.as_deref().is_none_or(|o| o == c);
+        let sets = [(NV_P64, 64usize), (NV_P4096, 4096usize)];
+        let mut ok = true;
+        let mut twin_run: Option<Side> = None;
+        if want("g3") && tier::run_clause(G3, Tag::FixtureOracle)? {
+            let side = run_side(twin, load_twin)?;
+            ok &= g3(&side, sets)?;
+            twin_run = Some(side);
+        }
+        if want("g4") && tier::run_clause(G4, Tag::FixtureOracle)? {
+            let twin_side = match twin_run {
+                Some(side) => side,
+                None => run_side(twin, load_twin)?,
+            };
+            let folder_side = run_side(&folder, load_folder)?;
+            ok &= g4(&folder_side, &twin_side, sets)?;
+        }
+        if only.is_none() {
+            tier::expect_fixture_oracle(GATE, DECLARED)?;
+        }
+        println!("{}", tier::tally_line());
+        if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    /// One model's run of both sets: every row of each, and the weights the load holds.
+    struct Side {
+        rows: Vec<Vec<Vec<f32>>>,
+        weights: BTreeMap<String, usize>,
+    }
+
+    fn load_twin(path: &Path) -> Result<Qwen35moeModel, GateError> {
+        super::qwen35_open::open_options(path, options(), &|_| {}).map(|(m, _)| m)
+    }
+
+    fn load_folder(path: &Path) -> Result<Qwen35moeModel, GateError> {
+        // R4 provides: the whole-card open of a checkpoint folder, as `open_options` is of a GGUF file.
+        super::qwen35_open::open_dense_folder(path, options()).map(|(m, _)| m)
+    }
+
+    /// `path` loaded by `load` on the card and run over both sets' prompts and forced ids from a `reset`; the model is gone
+    /// when this returns.
+    fn run_side(
+        path: &Path,
+        load: fn(&Path) -> Result<Qwen35moeModel, GateError>,
+    ) -> Result<Side, GateError> {
+        let mut m = load(path)?;
+        m.set_mode(StepMode::Graph);
+        let mut rows = Vec::new();
+        for name in [NV_P64, NV_P4096] {
+            let set = NvForcedLogits::open(&data_dir().join(name))?;
+            rows.push(rows_of(&mut m, &set)?);
+        }
+        let w = m.weights();
+        let weights = w
+            .names()
+            .filter(|n| !n.starts_with("derived."))
+            .filter_map(|n| w.get(n).map(|d| (n.to_string(), d.resident_bytes())))
+            .collect();
+        Ok(Side { rows, weights })
+    }
+
+    /// The median, 90th percentile and largest of `v`.
+    fn spread(v: &[f64]) -> (f64, f64, f64) {
+        (
+            quantile(v, 0.5),
+            quantile(v, 0.9),
+            v.iter().copied().fold(0.0, f64::max),
+        )
+    }
+
+    /// G3: ours on the twin against mainline's CUDA rows of each set: each row's relative L2 within the largest-row band,
+    /// the median and the 90th percentile within theirs, and the argmax equal on every row whose reference top-2 margin
+    /// exceeds its stability bound; the rows at or under it are counted and printed.
+    fn g3(side: &Side, sets: [(&str, usize); 2]) -> Result<bool, GateError> {
+        println!("(G3) the twin through ours against mainline's forced logits rows");
+        let mut opened = Vec::new();
+        let mut floor_spread = (0.0f64, 0.0f64, 0.0f64);
+        for (name, prompt) in sets {
+            let set = NvForcedLogits::open(&data_dir().join(name))?;
+            let cpu = NvForcedLogits::open_cpu(&data_dir().join(format!("{name}.cpu")))?;
+            if cpu.prompt != set.prompt || cpu.forced != set.forced || set.prompt.len() != prompt {
+                return Err(format!(
+                    "{name}: its CPU floor is not the CPU run of the same prompt and forced ids"
+                )
+                .into());
+            }
+            let floor: Vec<f64> = (0..set.rows())
+                .map(|i| {
+                    let (l2, _, norm) = norms(cpu.row(i), set.row(i));
+                    l2 / norm
+                })
+                .collect();
+            let (median, p90, largest) = spread(&floor);
+            println!(
+                "  {name}: the oracle's floor (CPU against CUDA) rel L2 median {median:.4}, p90 {p90:.4}, largest {largest:.4}"
+            );
+            floor_spread = (
+                floor_spread.0.max(median),
+                floor_spread.1.max(p90),
+                floor_spread.2.max(largest),
+            );
+            opened.push((name, prompt, set, cpu));
+        }
+        let (band_median, band_p90, band_rel) = (
+            MEDIAN_FACTOR * floor_spread.0,
+            P90_FACTOR * floor_spread.1,
+            REL_FACTOR * floor_spread.2,
+        );
+        println!(
+            "  bands: median {band_median:.4} ({MEDIAN_FACTOR} x the larger median), p90 {band_p90:.4} ({P90_FACTOR} x the larger p90), row {band_rel:.4} ({REL_FACTOR} x the largest row)"
+        );
+        let mut ok = true;
+        for ((name, prompt, set, cpu), ours) in opened.iter().zip(&side.rows) {
+            let (mut rel, mut stable, mut flips_stable, mut under, mut flips_under) =
+                (Vec::new(), 0usize, 0usize, 0usize, 0usize);
+            let mut worst = (0.0f64, 0usize);
+            for (i, row) in ours.iter().enumerate() {
+                let reference = set.row(i);
+                if row.len() != reference.len() {
+                    return Err(format!(
+                        "{name} row {i}: {} logits, the set's {}",
+                        row.len(),
+                        reference.len()
+                    )
+                    .into());
+                }
+                let (l2, _, norm) = norms(row, reference);
+                rel.push(l2 / norm);
+                if l2 / norm > worst.0 || l2.is_infinite() {
+                    worst = (l2 / norm, i);
+                }
+                let (floor_l2, floor_max, _) = norms(cpu.row(i), reference);
+                let bound =
+                    STABLE_K * f64::min(2.0 * floor_max, std::f64::consts::SQRT_2 * floor_l2);
+                let (ours_top, _, _, _) = kld::top2(row);
+                let (ref_top, first, _, second) = kld::top2(reference);
+                if f64::from(first) - f64::from(second) > bound {
+                    stable += 1;
+                    flips_stable += usize::from(ours_top != ref_top);
+                } else {
+                    under += 1;
+                    flips_under += usize::from(ours_top != ref_top);
+                }
+            }
+            let (median, p90, _) = spread(&rel);
+            let pass = rel.iter().all(|&r| r <= band_rel)
+                && median <= band_median
+                && p90 <= band_p90
+                && flips_stable == 0;
+            println!(
+                "  {name}: {} rows after {prompt} ids; rel L2 median {median:.4} (band {band_median:.4}), p90 {p90:.4} (band {band_p90:.4}), \
+                 worst {:.4} at row {} (band {band_rel:.4}); argmax equal on {}/{stable} stable rows; {under} rows at or under their stability \
+                 bound, {flips_under} of them flipped {}",
+                ours.len(),
+                worst.0,
+                worst.1,
+                stable - flips_stable,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
+    /// Where two runs of the same rows differ, bit for bit. A NaN in either reads as a difference unless both bit patterns
+    /// are equal.
+    struct Diff {
+        rows: usize,
+        lanes: usize,
+        /// The first differing `(row, lane)`.
+        first: Option<(usize, usize)>,
+        /// The largest `|a - b|` and `‖a - b‖₂ / ‖b‖₂`.
+        max: f64,
+        rel: f64,
+    }
+
+    fn differ(a: &[Vec<f32>], b: &[Vec<f32>]) -> Diff {
+        let mut d = Diff {
+            rows: 0,
+            lanes: 0,
+            first: None,
+            max: 0.0,
+            rel: 0.0,
+        };
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            let before = d.lanes;
+            for (j, (&u, &v)) in x.iter().zip(y).enumerate() {
+                if u.to_bits() != v.to_bits() {
+                    d.lanes += 1;
+                    d.first.get_or_insert((i, j));
+                    let delta = f64::from(u) - f64::from(v);
+                    num += delta * delta;
+                    d.max = d.max.max(delta.abs());
+                }
+                den += f64::from(v).powi(2);
+            }
+            d.rows += usize::from(d.lanes > before);
+        }
+        d.rel = (num / den).sqrt();
+        d
+    }
+
+    /// G4: ours on the folder equal bit for bit to ours on the twin, every row of both sets. The weights each load holds are
+    /// printed beside it (names and resident bytes), the first place a difference in the map's bytes would show.
+    fn g4(folder: &Side, twin: &Side, sets: [(&str, usize); 2]) -> Result<bool, GateError> {
+        println!("(G4) the cut folder through ours equals the twin through ours, bit for bit");
+        let (a, b) = (&folder.weights, &twin.weights);
+        let only_folder: Vec<&String> = a.keys().filter(|k| !b.contains_key(*k)).collect();
+        let only_twin: Vec<&String> = b.keys().filter(|k| !a.contains_key(*k)).collect();
+        let bytes: Vec<String> = a
+            .iter()
+            .filter_map(|(k, &n)| {
+                b.get(k)
+                    .filter(|&&m| m != n)
+                    .map(|m| format!("{k} {n} vs {m}"))
+            })
+            .collect();
+        let same_weights = only_folder.is_empty() && only_twin.is_empty() && bytes.is_empty();
+        println!(
+            "  weights: folder {} tensors {} B, twin {} tensors {} B; {}",
+            a.len(),
+            a.values().sum::<usize>(),
+            b.len(),
+            b.values().sum::<usize>(),
+            if same_weights {
+                "the same names and bytes".to_string()
+            } else {
+                format!(
+                    "only in the folder {:?}, only in the twin {:?}, other bytes {:?}",
+                    &only_folder[..only_folder.len().min(8)],
+                    &only_twin[..only_twin.len().min(8)],
+                    &bytes[..bytes.len().min(8)]
+                )
+            }
+        );
+        let mut ok = true;
+        for (i, (name, prompt)) in sets.iter().enumerate() {
+            let d = differ(&folder.rows[i], &twin.rows[i]);
+            let pass = d.lanes == 0 && folder.rows[i].len() == twin.rows[i].len();
+            let at = d.first.map_or(String::new(), |(r, l)| {
+                let (f, t) = (folder.rows[i][r][l], twin.rows[i][r][l]);
+                format!("; first at row {r} lane {l}: folder {f} vs twin {t}")
+            });
+            println!(
+                "  {name}: {} rows after {prompt} ids; {} rows and {} lanes differ, largest |d| {:.3e}, rel L2 {:.3e}{at} {}",
+                folder.rows[i].len(),
+                d.rows,
+                d.lanes,
+                d.max,
+                d.rel,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
     }
 }

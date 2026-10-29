@@ -10,6 +10,8 @@
 #          A directory that holds model.safetensors.index.json is a checkpoint folder cut in its stored bits (`fixture cut`, its rules
 #          tools/fixture-cuts/<dir>.json), its first shard the `*-00001-of-*.safetensors` beside the index; any other holds GGUF shards
 #          (`fixture generate`).
+#          A row no registry row names (a gate profile, not an architecture string) is a profile's cut, listed in `PROFILE_CUTS`
+#          of crates/model/src/arch/registry.rs; only the gate clauses that name that cut read it.
 qwen4exp	qwen38
 deepseek41	v41
 glm5next	glm5next
@@ -18,7 +20,7 @@ nemotron_h_moe	nemotron-bolt
 qwen35moe	qwen35moe
 solar-open2	solar2
 deepseek2	self
-qwen38d	self
+qwen38d	qwen38nv
 lfm3	self
 qwen3moe	qwen3moe
 qwen35	self

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Write a dense profile's logits oracle sets (LOGITS_SETS of tools/ref/models/qwen38d.sh or nanbeige43.sh): for each `<set>:<P>`,
+# Write a dense profile's logits oracle sets (LOGITS_SETS of tools/ref/models/qwen38d.sh, qwen38nv.sh or nanbeige43.sh): for each `<set>:<P>`,
 # llama.cpp mainline's logits after the first P ids of PROSE_IDS and after each of the LOGITS_FORCED ids that follow them
 # (teacher forced on the corpus), by dense_logits_ref (tools/ref/dense_logits_ref.cpp) through tools/ref/dense-logits.py, into
-# $BLOOMERY_DATA/<set>/ — the sets the profile's refset family checks (logits-qwen38d: crates/refset/src/arch/qwen35/dense.rs;
+# $BLOOMERY_DATA/<set>/ — the sets the profile's refset family checks (logits-qwen38d, logits-qwen38nv: crates/refset/src/arch/qwen35/dense.rs;
 # logits-nanbeige43: crates/refset/src/arch/llama/dense.rs). The profile names its file's identity (LOGITS_TARGET, a key of
 # dense-logits.py's TARGETS), which also gives the architecture the harness checks the file against.
 #

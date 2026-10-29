@@ -4,14 +4,15 @@ invented accuracy band.
 
 A set is a node-dump `MANIFEST.tsv` (tools/bloomery/manifest.py here, crates/refset there) with the
 rows in `logits.0.f32` and the ids it was fed. A CUDA `--kind reference` run is the one writer of the
-refset families `logits-qwen38d` (crates/refset/src/arch/qwen35/dense.rs; `just dump-logits-qwen38d`) and
-`logits-nanbeige43` (crates/refset/src/arch/llama/dense.rs; `just dump-logits-nanbeige43`), each driven
-through tools/ref/dense-logits.sh: its `# model`, `# build` and `# arch` lines are what the family checks,
+refset families `logits-qwen38d`, `logits-qwen38nv` (crates/refset/src/arch/qwen35/dense.rs; `just dump-logits-qwen38d`,
+`just dump-logits-qwen38nv`) and `logits-nanbeige43` (crates/refset/src/arch/llama/dense.rs; `just dump-logits-nanbeige43`),
+each driven through tools/ref/dense-logits.sh: its `# model`, `# build` and `# arch` lines are what the family checks,
 and the `# arch` line is the target's own `arch`. HIP reference runs are lab diagnostics with full build
 hashes, not those families' sets.
 A `--kind native` run is a comparison capture and is no family's set. `compare --bitwise` checks native
 eager/graph equality only; `floor` prints the oracle's own spread (mainline CUDA against its CPU twin)
-and the top-2 margins the gates' bands are derived from. `--self-test` checks the
+and the top-2 margins the gates' bands are derived from; `identity` measures the size and sha256 a TARGETS entry takes for a
+file the tree makes (the NVFP4 twin's). `--self-test` checks the
 malformed/incomplete inputs and the comparison contracts without a GPU.
 """
 import argparse
@@ -58,6 +59,19 @@ TARGETS = {
         "file": "Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf",
         "arch": "llama",
     },
+    # The GGUF twin of the Qwen3.8-27B NVFP4 fixture cut (tools/ref/models/qwen38nv.sh holds the conversion): mainline's converter
+    # at the oracle pin turns the cut folder into NVFP4 feed-forward and head blocks (36 bytes per 64 values), Q8_0 attention and
+    # delta-rule projections and BF16 for the rest. Its bytes are made on the box, so size and sha256 stay None, a run refuses by
+    # name, until `dense-logits.py identity <file>` has measured them and they are written here.
+    "qwen38nv-twin": {
+        "vocab": 248320,
+        "size": None,
+        "sha256": None,
+        "repository": "nvidia/Qwen3.8-27B-NVFP4",
+        "revision": "482ca0f3832238542f8f5295dde86b5f22711d80",
+        "file": "qwen38nv-twin.gguf",
+        "arch": "qwen35",
+    },
     "qwen35-0.8b-candidate": {
         "vocab": 248320,
         "size": 590880672,
@@ -98,7 +112,19 @@ def file_signature(path):
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
+def unpinned(target):
+    return target.get("size", 0) is None or target.get("sha256", "") is None
+
+
+def target_identity(path):
+    """The `size` and `sha256` a TARGETS entry spells for the file at `path`: what pins a target whose bytes the tree makes."""
+    return {"size": Path(path).stat().st_size, "sha256": digest(path)}
+
+
 def immutable_model(path, target):
+    if unpinned(target):
+        raise ValueError("the target is unpinned: its file was never measured; run `dense-logits.py identity <file>` "
+                         "and write its size and sha256 into TARGETS; no engine was opened")
     before = file_signature(path)
     if before[2] != target["size"] or digest(path) != target["sha256"] or file_signature(path) != before:
         raise ValueError("model differs from the selected immutable target; no engine was opened")
@@ -651,6 +677,8 @@ def bundle(path):
     if m.header.get("format") != MANIFEST_FORMAT:
         raise ValueError(f"{path}: not a {MANIFEST_FORMAT} set (an older capture: dump it again)")
     target = TARGETS.get(m.header.get("target"))
+    if target is not None and unpinned(target):
+        raise ValueError(f"{path}: the target {m.header.get('target')} is unpinned (no size and sha256 in TARGETS)")
     if target is None or m.header.get("model_sha256") != target["sha256"]:
         raise ValueError(f"{path}: wrong immutable model identity")
     rows = m.rows("tensor")
@@ -819,6 +847,13 @@ def self_test():
         target = {"size": 8, "sha256": digest(model)}
         before = immutable_model(model, target)
         model_unchanged(model, before)
+        assert target_identity(model) == target and unpinned(TARGETS["qwen38nv-twin"]) and not unpinned(target)
+        for pinned_by_hand in ({"size": None, "sha256": "x"}, {"size": 8, "sha256": None}):
+            try:
+                immutable_model(model, pinned_by_hand)
+                raise AssertionError("opened a target with a missing identity half")
+            except ValueError as error:
+                assert "unpinned" in str(error), error
         model.write_bytes(b"replaced")
         # Same metadata must not hide a content change.
         before[:-1] = file_signature(model)
@@ -1124,7 +1159,8 @@ def self_test():
             assert "floor takes a reference CUDA set" in str(error), error
     del TARGETS["_selftest"], TARGETS["_selftest_llama"]
     print("dense-logits self-test: malformed ids, provenance, the set's family-shaped manifest, corpus slices, run and build refusals, "
-          "incomplete/truncated/NaN rows, HIP placement and reserve, reset repeats, eager/graph, the oracle floor and owned-session cleanup contracts passed")
+          "incomplete/truncated/NaN rows, HIP placement and reserve, reset repeats, eager/graph, the oracle floor, the unpinned-target refusal "
+          "and owned-session cleanup contracts passed")
     return 0
 
 
@@ -1166,6 +1202,8 @@ def main():
     c.add_argument("left", type=Path)
     c.add_argument("right", type=Path)
     c.add_argument("--bitwise", action="store_true")
+    i = sub.add_parser("identity", help="the size and sha256 a TARGETS entry takes for a file")
+    i.add_argument("file", type=Path)
     f = sub.add_parser("floor", help="the oracle's own spread: each reference CUDA set against the CPU twin beside it")
     f.add_argument("sets", type=Path, nargs="+", help="reference CUDA set directories; the twin of S is S.cpu")
     f.add_argument("--twin-suffix", default=".cpu")
@@ -1178,6 +1216,9 @@ def main():
             native_build(args)
         elif args.action == "run":
             run(args)
+        elif args.action == "identity":
+            found = target_identity(args.file)
+            print(f'        "size": {found["size"]},\n        "sha256": "{found["sha256"]}",')
         elif args.action == "floor":
             report = floor(args.sets, args.twin_suffix)
             print_floor(report)

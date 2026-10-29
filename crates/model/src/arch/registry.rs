@@ -100,6 +100,21 @@ pub struct CutRow {
     pub family: &'static str,
 }
 
+/// A checkpoint-folder fixture of a gate profile that no row names: the profile's gates keep the
+/// row's own fixture (or run on its real file) and only the clauses that name this cut read it. A
+/// row holds one [`Fixture`], so a second meaning of one architecture is a profile cut, never the
+/// row's. The directory is the profile's row in `tools/fixture-dirs.tsv`.
+#[derive(Clone, Copy)]
+pub struct ProfileCut {
+    /// The `BLOOMERY_MODEL` profile whose row in `tools/fixture-dirs.tsv` names the cut's directory.
+    /// No row of [`ROWS`] holds it as one of its strings.
+    pub profile: &'static str,
+    /// The canonical architecture string of the row whose reader reads the folder; the rules file
+    /// names the same one.
+    pub arch: &'static str,
+    pub cut: CutRow,
+}
+
 /// One group of architecture strings and what serves them. A string is in one row.
 pub struct ArchRow {
     /// The [`Arch`] the strings name; `None` for strings a reader takes that no `Arch` stands for.
@@ -333,6 +348,15 @@ pub static ROWS: &[ArchRow] = &[
     },
 ];
 
+/// Every profile's cut fixture, in table order.
+pub static PROFILE_CUTS: &[ProfileCut] = &[ProfileCut {
+    // The dense Qwen3.8 NVFP4 checkpoint: only the NVFP4 gate clauses read it, and `qwen35` keeps its
+    // `self` row for the K-quant gates.
+    profile: "qwen38d",
+    arch: "qwen35",
+    cut: CutRow { family: "qwen38nv" },
+}];
+
 /// The row whose strings include `arch`.
 pub fn row_of(arch: &str) -> Option<&'static ArchRow> {
     ROWS.iter().find(|row| row.names.contains(&arch))
@@ -357,12 +381,14 @@ pub fn fixtures() -> impl Iterator<Item = &'static FixtureRow> {
     })
 }
 
-/// Every cut-folder fixture row, in registry order.
+/// Every cut-folder fixture, in registry order: the rows' cuts, then [`PROFILE_CUTS`].
 pub fn cuts() -> impl Iterator<Item = &'static CutRow> {
-    ROWS.iter().filter_map(|row| match &row.fixture {
-        Some(Fixture::Cut(cut)) => Some(cut),
-        _ => None,
-    })
+    ROWS.iter()
+        .filter_map(|row| match &row.fixture {
+            Some(Fixture::Cut(cut)) => Some(cut),
+            _ => None,
+        })
+        .chain(PROFILE_CUTS.iter().map(|p| &p.cut))
 }
 
 /// The registry as `tools/arch-registry.tsv` holds it: a comment line, a header line, then one
@@ -521,8 +547,9 @@ mod tests {
     }
 
     /// A cut fixture's rules are `tools/fixture-cuts/<family>.json`, and a rules file there is a
-    /// cut row's: a row with no file, or a file no row names, cuts nothing. (The rules' own name
-    /// and architecture are held to the row by `fixture`'s tests, which parse them.)
+    /// cut row's or a profile cut's: a cut with no file, or a file no cut names, cuts nothing.
+    /// (The rules' own name and architecture are held to the cut by `fixture`'s tests, which
+    /// parse them.)
     #[test]
     fn a_cut_fixture_is_its_rules_file() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/fixture-cuts");
@@ -537,6 +564,41 @@ mod tests {
             files, rows,
             "tools/fixture-cuts holds a rules file per cut row and nothing else"
         );
+    }
+
+    /// A profile cut is for a profile no row names (a row's own fixture is its `fixture`), the
+    /// directory `tools/fixture-dirs.tsv` gives that profile, read by the reader of the row its
+    /// architecture names, and a family no row's fixture already is.
+    #[test]
+    fn a_profile_cut_is_its_profiles_directory() {
+        assert!(!PROFILE_CUTS.is_empty(), "no profile cut to hold");
+        for p in PROFILE_CUTS {
+            let (profile, family) = (p.profile, p.cut.family);
+            assert!(
+                row_of(profile).is_none(),
+                "{profile}: a row names it, so its fixture is the row's, not a profile cut"
+            );
+            assert_eq!(
+                refset::fixture::dir_of(profile),
+                Some(family),
+                "{profile}: tools/fixture-dirs.tsv gives the profile another directory than its cut"
+            );
+            let row = row_of(p.arch).unwrap_or_else(|| panic!("{family}: no row names {}", p.arch));
+            assert_eq!(
+                row.canonical(),
+                p.arch,
+                "{family}: not the row's canonical string"
+            );
+            assert!(
+                row.read.is_some(),
+                "{family}: a cut of a family with no reader"
+            );
+            assert!(
+                ROWS.iter()
+                    .all(|r| r.fixture.is_none_or(|fx| fx.family() != family)),
+                "{family}: a row's fixture is already this directory"
+            );
+        }
     }
 
     /// The draft rules are the old table's three keys, `llama` has a reader row and no draft rule,
