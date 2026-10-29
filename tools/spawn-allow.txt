@@ -60,3 +60,4 @@ crates/jinja/src/lib.rs 1 a test parses on a thread with a fixed stack size, fro
 crates/device/src/pages.rs 2 a test's writer and reader threads, spawned in one scope by the test harness, never pinned
 crates/metal/src/bin/gate_metal_device/mac.rs 1 the stream clause's two waiter threads, scoped in the gate main, never pinned (macOS has no affinity call)
 crates/model-hf/src/remote.rs 1 a set's header reads, up to eight at once in a thread scope (network waits, no compute), from the start by name's pick and the fixture bin's main thread, never pinned
+crates/metal/src/arch/qwen3moe/session.rs 1 the open's pipeline build, scoped beside the weight load on the open's own thread, never pinned (macOS has no affinity call)
