@@ -63,10 +63,10 @@ pub mod residency38;
 #[cfg(feature = "gpu")]
 pub mod rope_gate;
 pub mod rounding;
-#[cfg(feature = "deepseek41")]
-pub mod serve_client;
 #[cfg(all(feature = "deepseek41", feature = "hf"))]
 pub mod seat_bin;
+#[cfg(feature = "deepseek41")]
+pub mod serve_client;
 #[cfg(feature = "deepseek41")]
 pub mod side_seat;
 #[cfg(feature = "gpu")]
