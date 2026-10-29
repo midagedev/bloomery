@@ -14,8 +14,14 @@
 # 종료 코드: 게이트의 것 그대로. 124 = 상한에서 TERM으로 끝남, 137 = TERM을 무시해 --kill-after의 KILL로
 # 끝남, 75 = 30분 안에 카드 락이나 V4.1 적재 락을 못 잡음(카드 락 상한에는 배치 홀드를 기다린 시간이 든다), 또는 강제한 카드(3090·a6000)가 잡힌 타이밍 임대의
 # 타이밍 카드임(모두 경쟁이지 게이트 실패가 아니다), 70 = 카드를 강제했는데 임대를 테스트할 수 없음, 64 = 사용법, 2 = 바이너리 없음,
-# 69 = 게이트 락이나 V4.1 적재 락 파일을 열 수 없음(박스의 root 셸이 아님).
-# `--self-test`: 카드 고르기, 임대 거절, V4.1 적재 락을 임시 디렉터리의 락·임대 파일과 가짜 nvidia-smi로 시험한다(리눅스,
+# 69 = 게이트 락이나 V4.1 적재 락 파일을 열 수 없음(박스의 root 셸이 아님), 73 = 이 실행의 사설 링크를 만들 수 없음(아래 단락).
+# 사설 링크: 카고는 빌드마다 target/release/<이름>을 지우고 다시 하드링크한다. 그 파일을 매핑해 도는 게이트는 같은 이름을 빌드하는 다른
+# 항목의 링크 갈이에 이미지를 잃는다(cuda-oxide의 앵커 로더가 /proc/self/map_files의 경로를 다시 열고, 갈린 이미지는 오류다:
+# `cannot read the binary containing the CUDA artifact anchor`). 그래서 모든 락을 쥔 뒤 — 기다리는 게이트는 링크를 쥐지 않는다 — 바이너리와
+# 같은 디렉터리에 `.<이름>.run.<pid>` 하드링크를 만들어 그것을 돌리고(형제 바이너리는 current_exe().with_file_name으로 찾으니 디렉터리가
+# 같아야 한다), 어떤 끝에서도(EXIT 트랩) 지운다. 링크를 못 만들면 `ln`의 말을 붙여 73으로 끝난다 — 공유 경로로 조용히 돌아가지 않는다.
+# 죽은 실행이 남긴 링크(pid가 없는 것)는 같은 이름의 다음 실행이 지우고, 살아 있는 pid의 것은 건드리지 않는다.
+# `--self-test`: 카드 고르기, 임대 거절, V4.1 적재 락, 사설 링크를 임시 디렉터리의 락·임대 파일과 가짜 nvidia-smi로 시험한다(리눅스,
 # flock과 timeout이 필요하다 — 맥에는 없다). 시험만 쓰는 첫 인자 `--test-locks DIR`이 세 락과 배치 홀드 파일(batch.gpuhold), V4.1 적재 큐(v41-queue.d, v41-queue.seq)를 DIR 아래로 옮기고
 # V4.1 적재 락의 상한을 6초로, 카드 락의 상한을 4초로, 폴링을 1초로 줄인다. GATE_TEST_CAP=<초> (the self-test's helper waiters only): both bounds become that safety cap; GATE_TEST_PACE=<FIFO prefix> (the self-test's paced loaders only): each poll rests until the test grants the next one.
 # 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버), BLOOMERY_GATE_CARD(아래 카드 고르기),
@@ -92,6 +98,7 @@ GATE_LOCK=$LOCK_DIR/bloomery-gate.lock A6000_LOCK=$LOCK_DIR/bloomery-gate-a6000.
 V41_LOCK=$LOCK_DIR/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
 GPU_HOLD=$LOCK_DIR/bloomery-batch.gpuhold HOLD_STALE=300
 V41_QDIR=$LOCK_DIR/bloomery-v41-queue.d V41_SEQ=$LOCK_DIR/bloomery-v41-queue.seq PACE=''
+EXE_LINK=''
 
 # batch_hold_read: HOLD_STATE none | up | stale (its mtime is HOLD_STALE s old or more), HOLD_OWNER (`?` when the file names none or
 # is not readable), HOLD_AGE (seconds since its last refresh, `?` when its mtime cannot be read — then it is up: never free) and
@@ -330,11 +337,40 @@ ticket_drop() {
 
 # The paced loader's `exit` line is written while the process still holds its locks (they go with the process, after the trap), so the
 # test takes it as an end only once the pid is gone (ack). GATE_TEST_LINGER=<s> (the self-test's paced loaders only) widens that gap.
-# on_exit: the EXIT trap of a V4.1 loader. In the self-test a paced loader (PACE) ends with one more line on its ack FIFO.
+# on_exit: the EXIT trap of a run that holds something: a V4.1 loader's ticket, the run-private link of the binary (exe_link). In the
+# self-test a paced loader (PACE) ends with one more line on its ack FIFO.
 on_exit() {
   ticket_drop
+  [ -z "$EXE_LINK" ] || rm -f "$EXE_LINK"
+  EXE_LINK=
   [ -z "$PACE" ] || echo exit > "$PACE.ack"
   [ -z "$PACE" ] || [ -z "${GATE_TEST_LINGER:-}" ] || sleep "$GATE_TEST_LINGER"
+}
+
+# exe_link: after every lock is held, EXE becomes a hard link to the binary in its own directory, .<NAME>.run.<pid>. A build re-links
+# target/release/<NAME> (removes it and links it again), which a run that mapped the shared name would not survive: the CUDA anchor loader
+# re-opens its mapped image by path. The private name is one no build touches; the same directory keeps current_exe().with_file_name(..)
+# finding the sibling binaries. A link that cannot be made ends the run with 73, never a run from the shared path. First, the links of
+# this NAME whose pid is gone (a run killed outright leaves its link) are removed; a live pid's is left, and this run's own pid is no
+# live owner (its leftover is replaced by `ln -f`). The EXIT trap (on_exit) removes the link.
+exe_link() {
+  local dir=${EXE%/*} l p err
+  for l in "$dir"/."$NAME".run.*; do
+    [ -e "$l" ] || [ -L "$l" ] || continue
+    p=${l##*.run.}
+    case $p in '' | *[!0-9]*) continue ;; esac
+    [ "$p" != "$$" ] || continue
+    if kill -0 "$p" 2> /dev/null || [ -d "/proc/$p" ]; then continue; fi
+    rm -f "$l"
+    echo "gpu-gate.sh: $NAME: removed the stale private link $l (pid $p is gone)" >&2
+  done
+  l=$dir/.$NAME.run.$$
+  err=$(ln -f "$EXE" "$l" 2>&1) || {
+    echo "gpu-gate.sh: $NAME: cannot make its run-private link $l to $EXE (rc 73): $err — the gate does not run from the shared path" >&2
+    exit 73
+  }
+  EXE_LINK=$l EXE=$l
+  trap on_exit EXIT
 }
 
 # pace: what a poll rests with: POLL seconds of sleep. A paced loader (the self-test's, PACE=<FIFO prefix>) writes `polled` to
@@ -1386,6 +1422,70 @@ PY
   judge_all '--v41-queue runs under BLOOMERY_BOX_READONLY=1 and syncs nothing' "$rc" 0 'rsync calls: 0$' 'last ssh: bash tools/gpu-gate\.sh --v41-queue$'
   case_ 'BLOOMERY_V41_CLASS other than 1 to 4: 64, named' 64 "BLOOMERY_V41_CLASS is 1 .* got '5'" 3090 "$t/lease" BLOOMERY_V41_CLASS=5
   case_ '  … a name is no class either' 64 "BLOOMERY_V41_CLASS is 1 .* got 'two'" 3090 "$t/lease" BLOOMERY_V41_CLASS=two
+  fi
+  if gg_part 2; then
+  # The run-private link (EXE_LINK). A stub gate (gate_relink) says it is running and holds; the test then does what a concurrent build
+  # does to the shared name (removes target/release/gate_relink and links another file there); the stub then opens the path it was
+  # started as, which must still be its own image (marker gen1), as the CUDA anchor loader's re-open of its mapped image must.
+  rl=$t/tree/target/release
+  relink_stub() {
+    printf '%s\n' '#!/bin/sh' '# gen1' '[ -z "${STUB_READY:-}" ] || echo "$0" > "$STUB_READY"' '[ -z "${STUB_HOLD:-}" ] || read -r _ < "$STUB_HOLD"' \
+      'if grep -q "^# gen1\$" "$0"; then echo "image still $0"; else echo "image replaced: $0"; exit 3; fi' > "$rl/gate_relink"
+    chmod +x "$rl/gate_relink"
+  }
+  printf '%s\n' '#!/bin/sh' '# gen2' 'exit 0' > "$t/relink-gen2"
+  chmod +x "$t/relink-gen2"
+  relink_stub
+  mkfifo "$t/relink.hold"
+  exec 19<> "$t/relink.hold"
+  rm -f "$t/relink.ready"
+  GATE_BIN=gate_relink gate "$t/relink.out" any "$t/lease" STUB_READY="$t/relink.ready" STUB_HOLD="$t/relink.hold" &
+  rp=$!
+  # The stub's first line is the event; the wait goes on while the run lives (the failsafe bound ends a hung one).
+  while [ ! -s "$t/relink.ready" ] && kill -0 "$rp" 2> /dev/null; do sleep 0.1; done
+  if [ -s "$t/relink.ready" ]; then
+    rm -f "$rl/gate_relink"
+    ln "$t/relink-gen2" "$rl/gate_relink"
+    echo go >&19
+  fi
+  rc=0
+  wait "$rp" || rc=$?
+  exec 19>&-
+  cp "$t/relink.out" "$t/out"
+  judge_all 'a shared binary re-linked mid-run: the gate still runs from its own image' "$rc" 0 \
+    '^image still \./target/release/\.gate_relink\.run\.[0-9]+$' '!image replaced'
+  seen=$(cat "$t/relink.ready" 2> /dev/null)
+  { echo "ran as: $seen"; if [ -e "$t/tree/$seen" ]; then echo 'link: present'; else echo 'link: gone'; fi; echo "shared: $(grep -c '^# gen2$' "$rl/gate_relink")"; } > "$t/out"
+  judge_all '  … the private link is gone when the run ends, the shared name is left as the build made it' 0 0 \
+    '^ran as: \./target/release/\.gate_relink\.run\.[0-9]+$' '^link: gone$' '^shared: 1$'
+  # --executable: the link is made beside the executable, whatever directory that is.
+  relink_stub
+  gate_args=(./target/release/gate_relink)
+  rc=0
+  GATE_BIN=--executable gate "$t/out" any "$t/lease" || rc=$?
+  gate_args=()
+  judge_all '  … a run of --executable PATH takes the link beside the executable too' "$rc" 0 '^image still \./target/release/\.gate_relink\.run\.[0-9]+$'
+  # A killed run leaves its link: the next run of that name removes it once its pid is gone; a live pid's link and another name's stay.
+  dead=$(sh -c 'echo $$')
+  me=$$
+  : > "$rl/.gate_relink.run.$dead"
+  : > "$rl/.gate_relink.run.$me"
+  : > "$rl/.gate_other.run.$dead"
+  rc=0
+  GATE_BIN=gate_relink gate "$t/out" any "$t/lease" || rc=$?
+  ls -A "$rl" | sed 's/^/ls: /' >> "$t/out"
+  judge_all 'a private link whose pid is gone is removed by the next run of that name; a live pid'"'"'s and another name'"'"'s stay' "$rc" 0 \
+    "removed the stale private link \\./target/release/\\.gate_relink\\.run\\.$dead \\(pid $dead is gone\\)" \
+    "!^ls: \\.gate_relink\\.run\\.$dead\$" "^ls: \\.gate_relink\\.run\\.$me\$" "^ls: \\.gate_other\\.run\\.$dead\$"
+  rm -f "$rl/.gate_relink.run.$me" "$rl/.gate_other.run.$dead"
+  # A link that cannot be made is a named error and its own exit (73); the gate does not run from the shared path.
+  mkdir -p "$t/lnfail"
+  printf '%s\n' '#!/bin/sh' 'echo "ln: stub: Operation not permitted" >&2' 'exit 1' > "$t/lnfail/ln"
+  chmod +x "$t/lnfail/ln"
+  rc=0
+  GATE_BIN=gate_relink gate "$t/out" any "$t/lease" PATH="$t/lnfail:$PATH" || rc=$?
+  judge_all 'a private link that cannot be made: 73, named, the gate does not run from the shared path' "$rc" 73 \
+    'gate_relink: cannot make its run-private link \./target/release/\.gate_relink\.run\.[0-9]+ .*Operation not permitted' '!image still'
   fi
   if gg_part 3; then
   case_ 'BLOOMERY_V41_PRED_S not whole seconds: 64, named' 64 "BLOOMERY_V41_PRED_S is whole seconds .* got '2m'" 3090 "$t/lease" BLOOMERY_V41_PRED_S=2m
@@ -2458,6 +2558,7 @@ case $GOT in
   local) ON="this machine's card(s), the local gate lock" ;;
   *) ON="the $GOT" ;;
 esac
+exe_link
 echo "gpu-gate.sh: $NAME on $ON (asked $([ "$CARD" = local ] && echo "$ASK" || echo "$CARD"))$([ "$V41" = 0 ] || echo ', V4.1 load lock')$TIER_NOTE" >&2
 # The run's own wall, its locks' waits outside it, is the closing line: a recipe that runs several
 # binaries, or one binary several times, is read per run.
