@@ -63,17 +63,19 @@
 //!   text chat is a 200; every stdout line is an event of the one schema; a SIGTERM ends the server with exit 0 and a
 //!   `stopped` event whose cause is `signal`.
 //! - (s8) `--model <name> --dry-run --json` prints one JSON document and exits 0 without a start: one model entry whose
-//!   pick is the cached row, and `start`, the argument list a real start would run (`--hf <repo>:<variant>`, no
-//!   `--model`). The pick equals the `--plan --json` of that list in place, context, slots and paged bytes, and that
-//!   plan is the plan of the fixture file (the same need bytes and limit).
+//!   pick is the cached row, and `start`, the argument list a real start would run: `--model <name>:<variant>` and the
+//!   flags given, no `--hf` and no `--revision`, so the start replays the pick at the row's pinned commit. That start's
+//!   `--plan --json` prints the same `pick` (variant, source, revision) and a plan that equals the dry run's pick in place,
+//!   context, slots and paged bytes, and is the plan of the fixture file (the same need bytes and limit).
 //! - (s9) the loading window of (s7)'s start: from the `bound` event on, `GET /health` answers 503 `loading` (phase,
 //!   byte counts and the `error` object llama-server answers with) until the first 200; no 200 is answered before the
 //!   `ready` event is on stdout, and no 503 after it.
 //! - (s10) the exit table, on the refusals a start meets, each ending in an `error` event of the code's name and
 //!   status: an unknown name is 64; a `--model` value that is a path is 64 with a `next` that names `-m`; an embedding
-//!   file is 65 and names `--embd-model`; a card budget below the dense trunk is 80 with every smaller variant of the
-//!   model in `next`; a `BLOOMERY_*` value no lever takes is 78 and names it; a port another process holds is 83, found
-//!   before the load, with `--port 0` in `next`.
+//!   file is 65 and names `--embd-model`; a card budget below the dense trunk is 80, and its `next` offers only variants
+//!   smaller than the one asked, the next smaller one among them (the families' default models have none, so theirs
+//!   offers no variant); a `BLOOMERY_*` value no lever takes is 78 and names it; a port another process holds is 83,
+//!   found before the load, with `--port 0` in `next`.
 //!
 //! A clause's failure never ends the run: an error inside a clause (a server that exits before it listens,
 //! a kind the log is not read by) is that clause's FAIL line, and (s4) reads every log the run wrote.
@@ -544,6 +546,9 @@ struct NamedRow {
     repo: String,
     /// The variants of the model the catalog records fewer bytes for.
     smaller: Vec<String>,
+    /// The next smaller variant: the largest verified row of the smaller ones in an automatic format (2 to 4 bits).
+    /// For the two families this gate runs no smaller row is of another automatic format.
+    step: Option<String>,
 }
 
 impl NamedRow {
@@ -567,16 +572,22 @@ impl NamedRow {
             .hf
             .split_once(':')
             .ok_or_else(|| format!("{CATALOG}: {} names no quant", row.hf))?;
-        let smaller = of_model
+        let under: Vec<&&CatalogRow> = of_model
             .iter()
             .filter(|r| matches!((r.bytes, row.bytes), (Some(a), Some(b)) if a < b))
-            .map(|r| r.variant.clone())
             .collect();
+        let smaller = under.iter().map(|r| r.variant.clone()).collect();
+        let step = under
+            .iter()
+            .filter(|r| r.verified && matches!(r.format.as_str(), "gguf2" | "gguf3" | "gguf4"))
+            .max_by_key(|r| r.bytes)
+            .map(|r| r.variant.clone());
         Ok(NamedRow {
             variant: variant.to_owned(),
             repo: repo.to_owned(),
             model,
             smaller,
+            step,
         })
     }
 
@@ -695,6 +706,37 @@ fn one_json_line(what: &str, stdout: &str) -> Result<Value, GateError> {
         .map_err(|e| GateError::from(format!("{what}: {e}: {}", tail(line, 300))))
 }
 
+/// The plan line and the events of a `--plan --json` run's stdout: every line is a JSON object, exactly one names
+/// [`PLAN_SCHEMA`], and the others are events of the one schema.
+fn plan_and_events(what: &str, stdout: &str) -> Result<(Value, Vec<Value>), GateError> {
+    let mut plan = None;
+    let mut events = Vec::new();
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let v: Value = serde_json::from_str(line)
+            .map_err(|e| GateError::from(format!("{what}: {e}: {}", tail(line, 300))))?;
+        if v["schema"] == PLAN_SCHEMA {
+            if plan.replace(v).is_some() {
+                return Err(format!("{what}: stdout holds two plan lines").into());
+            }
+        } else if v["schema"] == EVENT_SCHEMA {
+            events.push(v);
+        } else {
+            return Err(format!(
+                "{what}: a stdout line names the schema {}, not {PLAN_SCHEMA} or {EVENT_SCHEMA}",
+                v["schema"]
+            )
+            .into());
+        }
+    }
+    let plan = plan.ok_or_else(|| {
+        GateError::from(format!(
+            "{what}: stdout holds no line of the schema {PLAN_SCHEMA}: {}",
+            tail(stdout, 300)
+        ))
+    })?;
+    Ok((plan, events))
+}
+
 /// Whether the `error` event `e` lists the argument list `argv` in its `next`.
 fn next_has(e: &Value, argv: &[&str]) -> bool {
     e["next"].as_array().is_some_and(|next| {
@@ -713,10 +755,15 @@ fn same(a: &Value, b: &Value, keys: &[&str]) -> bool {
 
 /// A GGUF file at `path` whose architecture is `arch`, with one tensor: what a start reads of a file to seat it.
 fn gguf_of_arch(path: &Path, arch: &str) -> Result<(), GateError> {
-    let kvs = [(
-        gguf::GENERAL_ARCHITECTURE.to_owned(),
-        gguf::Value::String(arch.to_owned()),
-    )];
+    let kvs = [
+        (
+            gguf::GENERAL_ARCHITECTURE.to_owned(),
+            gguf::Value::String(arch.to_owned()),
+        ),
+        // The fixture tier opens only files its generator wrote: this one carries the generator's key, and
+        // the server refuses it for what it is.
+        (tier::VERSION_KEY.to_owned(), gguf::Value::U32(1)),
+    ];
     let name = "token_embd.weight";
     let decl = TensorDecl {
         name: name.to_owned(),
@@ -1601,13 +1648,14 @@ impl Gate {
     }
 
     /// `args` with `--plan --json` run to its end: the plan the server printed, one JSON line that names
-    /// [`PLAN_SCHEMA`]. Its stderr is kept in `<dir>/<tag>/plan.err`.
+    /// [`PLAN_SCHEMA`], and the events before it (a start by name prints its `pick`; every other stdout line is
+    /// refused by name). Its stderr is kept in `<dir>/<tag>/plan.err`.
     fn plan_json(
         &self,
         tag: &str,
         args: &[String],
         cache: Option<&Path>,
-    ) -> Result<Value, GateError> {
+    ) -> Result<(Value, Vec<Value>), GateError> {
         let dir = self.dir.join(tag);
         std::fs::create_dir_all(&dir)?;
         let out = command(cache)?
@@ -1631,15 +1679,7 @@ impl Gate {
             )
             .into());
         }
-        let plan = one_json_line(&format!("{tag}: --plan --json"), &stdout)?;
-        if plan["schema"] != PLAN_SCHEMA {
-            return Err(format!(
-                "{tag}: the plan names the schema {}, not {PLAN_SCHEMA}",
-                plan["schema"]
-            )
-            .into());
-        }
-        Ok(plan)
+        plan_and_events(&format!("{tag}: --plan --json"), &stdout)
     }
 
     /// (s8): the dry run by name prints the pick, and the argument list of the start it would make, whose plan is the
@@ -1647,7 +1687,7 @@ impl Gate {
     fn dry_run(&self) -> Result<bool, GateError> {
         let named = self.named()?;
         let cache = Some(named.cache.0.as_path());
-        let file_plan = self.plan_json("s8_file", &self.file_args(), None)?;
+        let (file_plan, _) = self.plan_json("s8_file", &self.file_args(), None)?;
         let dir = self.dir.join("s8");
         std::fs::create_dir_all(&dir)?;
         let mut args = vec!["--model".to_owned(), named.row.model.clone()];
@@ -1692,17 +1732,31 @@ impl Gate {
                     .collect()
             })
             .unwrap_or_default();
+        // PIN(2026-10-29): the start replays the pick by name (`--model <name>:<variant>`), not by the repo it resolves to
+        // (`--hf`): the name carries the row's pinned commit, which a repo spelling would read at `main`.
+        let replay = [
+            "--model".to_owned(),
+            format!("{}:{}", named.row.model, named.row.variant),
+        ]
+        .into_iter()
+        .chain(Self::base_args())
+        .collect::<Vec<String>>();
         ok &= check(
-            "s8_start_is_the_hf_arguments_of_the_pick",
-            start
-                .windows(2)
-                .any(|w| w[0] == "--hf" && w[1] == named.row.hf())
-                && !start.iter().any(|a| a == "--model"),
+            "s8_start_replays_the_pick_by_name_at_its_pinned_commit",
+            start == replay,
         );
         if start.is_empty() {
             return Ok(false);
         }
-        let start_plan = self.plan_json("s8_start", &start, cache)?;
+        let (start_plan, replayed) = self.plan_json("s8_start", &start, cache)?;
+        ok &= check(
+            "s8_the_start_prints_the_pick_it_replays",
+            matches!(
+                (pick, event(&replayed, "pick")),
+                (Some(dry), Some(made))
+                    if same(dry, made, &["variant", "source", "revision", "place", "ctx", "slots", "paged"])
+            ),
+        );
         ok &= check(
             "s8_pick_equals_the_plan_of_its_start",
             pick.is_some_and(|p| same(p, &start_plan, &["place", "ctx", "slots", "paged"])),
@@ -1812,19 +1866,37 @@ impl Gate {
                     r.is(Code::NoFit),
                 );
                 println!(
-                    "s10: {} variants of {} are smaller than {}",
+                    "s10: {} variants of {} are smaller than {}; the next smaller is {:?}",
                     n.row.smaller.len(),
                     n.row.model,
-                    n.row.variant
+                    n.row.variant,
+                    n.row.step
                 );
+                // PIN(2026-10-29): `next` offers the next smaller variant (the design's exit table), not every smaller
+                // one; the check holds both sides, since the default rows of both families have nothing smaller and a
+                // check of "every smaller" would pass on an empty `next`.
                 ok &= check(
-                    "s10_no_fit_next_lists_every_smaller_variant",
+                    "s10_no_fit_next_offers_the_next_smaller_variant_and_no_other",
                     r.error().is_some_and(|e| {
-                        e["next"].is_array()
-                            && n.row
-                                .smaller
-                                .iter()
-                                .all(|v| next_has(e, &["--model", &format!("{}:{v}", n.row.model)]))
+                        let offered =
+                            e["next"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|list| {
+                                    let list = list.as_array()?;
+                                    match (list.first()?.as_str()?, list.get(1)?.as_str()?) {
+                                        ("--model", value) => Some(value.to_owned()),
+                                        _ => None,
+                                    }
+                                });
+                        let want: Vec<String> = n
+                            .row
+                            .step
+                            .iter()
+                            .map(|v| format!("{}:{v}", n.row.model))
+                            .collect();
+                        offered.collect::<Vec<String>>() == want
                     }),
                 );
             }

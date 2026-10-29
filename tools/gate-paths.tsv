@@ -54,6 +54,8 @@ crates/gpu-gates/src/{bind.rs,serve_client.rs}	derive gate-gpu-routed-legs	the V
 crates/gpu-gates/src/vision_seat.rs	derive weekly-gpu-ds41-serve gate-gpu-ds41-draft gate-gpu-ds41-dspark-loop gate-gpu-routed-legs gate-gpu-ds41-chat gate-gpu-glm5next-twocard weekly-gpu-glm5next-media-serve	the vision seat every serve seat shares: gate-ds41-bind's unit tests (the vision_seat:: run), and the servers that bind it (the V4.1 seat's images)
 crates/gpu-gates/src/image_plan.rs	derive gate-gpu-qwen35moe-verify	the plan's side of an image input (a sequence's rotation table a position): the qwen3 placement every Qwen3 bin includes, and the servers that bind its seat
 crates/gpu-gates/src/engine.rs	derive	AnyEngine, the V2-Lite and Qwen3 engine behind gate_e2e
+crates/gpu-gates/src/start.rs	derive gate-ds41-bind	the start's one report, exit mapping and early listener: the seats' plan printers note into it, a plan ends through plan_exit and a refusal through exit_serve; the module is behind the gpu feature, which gate-gpu-gates-lib does not build, so its unit tests run in gate-ds41-bind
+crates/gpu-gates/src/model_file/pick.rs	derive gate-gpu-gates-lib	the pick of a start by name: its children's plans and header reads run in every bloomery-serve a gate starts by name, and its own tests are the lib's
 crates/gpu-gates/src/tap_dump.rs	gate-gpu-gates-lib	the tap dump reader: forced_probe (no gate) and the lib's own unit tests are its only readers
 crates/gpu-gates/src/prompts.rs	derive	the prompt and greedy-file readers of the long, e2e, hybrid and qwen3moe e2e gates
 crates/gpu-gates/src/qwen3moe.rs	derive	the Qwen3 kernel gates' shared sets

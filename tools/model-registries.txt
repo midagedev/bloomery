@@ -28,3 +28,4 @@ crates/tokenizer/src/pretok.rs
 crates/tokenizer/src/vocab.rs
 crates/vision/src/arch/mod.rs
 crates/models/src/formats.rs
+crates/hf/src/catalog/rows.rs

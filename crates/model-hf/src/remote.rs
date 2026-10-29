@@ -256,6 +256,7 @@ pub fn sparse_set(
     dir: &Path,
     progress: &mut dyn FnMut(&Entry, &HeaderStat),
 ) -> Result<Vec<PathBuf>, RemoteError> {
+    fs::create_dir_all(dir).map_err(|e| io_err(dir, "create the header directory", e))?;
     files
         .iter()
         .map(|e| {

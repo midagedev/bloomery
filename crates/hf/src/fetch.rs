@@ -516,7 +516,7 @@ impl Client {
     /// token and errors as every other call, nothing cached and nothing
     /// checked against the listing's digest. A hub that
     /// ignores the range and answers the whole file is stopped by its
-    /// `Content-Length` (`--max-filesize`) instead of being read; a body of
+    /// `Content-Length` (`--max-filesize`, [`range_limit`]) instead of being read; a body of
     /// another length than `len` is [`HfError::Range`], so the caller clips
     /// `len` to the file's listed size first.
     pub fn fetch_range(
@@ -533,7 +533,7 @@ impl Client {
             return Ok(Vec::new());
         }
         let range = format!("{from}-{}", from + len - 1);
-        let max = len.to_string();
+        let max = range_limit(len).to_string();
         let body = self.curl(
             &what,
             &[
@@ -985,6 +985,14 @@ fn write_marker(path: &Path, digest: &str) -> Result<(), HfError> {
     fs::write(path, format!("{digest}\n")).map_err(|e| HfError::io(path, e))
 }
 
+/// The bytes `--max-filesize` allows a range read of `len` bytes: curl holds the redirect the hub
+/// answers first (its body counts) to the same limit, and a hub's redirect body is a few hundred
+/// bytes whatever the range, so a short range gets this much room beyond `len`.
+fn range_limit(len: u64) -> u64 {
+    const REDIRECT_BODY: u64 = 4096;
+    len.saturating_add(REDIRECT_BODY)
+}
+
 /// The digest of the whole file at `path` by `check`, lowercase hex.
 /// For a Git blob, `size` supplies the header's size, not a read limit.
 pub fn digest(path: &Path, check: Check, size: u64) -> Result<String, HfError> {
@@ -1354,6 +1362,15 @@ mod tests {
             .resolve_exact("a/b", &["m.bin"], &mut |_| {})
             .expect("resolve");
         assert_eq!(fs::read(&got[0]).expect("read"), older);
+    }
+
+    /// The hub answers a request with a redirect whose body is longer than a short range (310
+    /// bytes for the 202-byte `generation_config.json` of a checkpoint folder): the limit holds it.
+    #[test]
+    fn a_short_range_is_given_room_for_a_redirects_body() {
+        assert!(range_limit(202) >= 310);
+        assert!(range_limit(0) >= 310);
+        assert_eq!(range_limit(u64::MAX), u64::MAX);
     }
 
     #[test]

@@ -72,9 +72,11 @@
 //!
 //! Two checks run before anything is fetched or loaded, each a named refusal
 //! (`serve::preflight`): first of all, on a CPU that does not run the
-//! release's x86-64-v3 host code, `cpu_gate` prints what it lacks and exits
-//! 1; after `--version`, `--help` and the arguments' check below, a driver below R580 (CUDA 13), or
-//! one whose `libcuda.so.1` does not load, ends the start with what it reported.
+//! release's x86-64-v3 host code, `cpu_gate` prints what it lacks and ends as
+//! the class `no-device` (status 69, with its `error` event); after
+//! `--version`, `--help` and the arguments' check below, a driver below R580
+//! (CUDA 13), or one whose `libcuda.so.1` does not load, ends the start with
+//! what it reported.
 //!
 //! The arguments are checked as far as that needs no model, card or network before the driver is
 //! asked and before `--hf` fetches anything (`drive::early`): with `--model WORD`, `--help` or `-h`
@@ -1280,14 +1282,18 @@ models (the --model word is optional with a model file: the file's architecture 
     }
 
     /// `check` at every seat, for a start whose model file picks the seat ([`early`]): `Ok` when
-    /// one seat takes the arguments, else each refusal once, with the seats that give it.
+    /// one seat takes the arguments, else each refusal once, with the seats that give it. The
+    /// refusal is of the class the seats' refusals name when they name one (a lever's value is
+    /// refused as a lever at every seat), else of no class: the start's phase gives it one.
     fn any_seat(check: impl Fn(Word) -> Result<(), GateError>) -> Result<(), GateError> {
         let mut refused: Vec<(String, Vec<&str>)> = Vec::new();
+        let mut named: Vec<Code> = Vec::new();
         let words = Model::ALL.iter().map(|&m| Word::Seat(m));
         for word in words.chain([Word::Decide]) {
             let Err(e) = check(word) else {
                 return Ok(());
             };
+            named.extend(start::class_of(&e));
             let e = e.to_string();
             match refused.iter_mut().find(|(text, _)| *text == e) {
                 Some((_, seats)) => seats.push(word.word()),
@@ -1298,11 +1304,14 @@ models (the --model word is optional with a model file: the file's architecture 
             .iter()
             .map(|(e, seats)| format!("  --model {}: {e}", seats.join(", ")))
             .collect();
-        Err(format!(
+        let text = format!(
             "no seat takes these arguments, each refusing them as follows (--model names the seat):\n{}",
             lines.join("\n")
-        )
-        .into())
+        );
+        match named.first() {
+            Some(&code) if named.iter().all(|c| *c == code) => Err(Refusal::new(code, text).into()),
+            _ => Err(text.into()),
+        }
     }
 
     /// The process's exit for a seat's end, the decide seat's and the
@@ -1408,6 +1417,37 @@ models (the --model word is optional with a model file: the file's architecture 
         /// A `--model` value is a catalog model by name, alias or seat word (with its variant),
         /// or a seat word the catalog has no model for; an unknown name lists both sets, and an
         /// existing path is `-m`'s.
+        /// A start whose file picks the seat refuses as the class the seats' refusals name: a lever's
+        /// bad value is the class `lever` whichever seats read it, a seat whose refusal names no class
+        /// does not hide it, and refusals no seat classes stay unclassed.
+        #[test]
+        fn every_seat_refusing_in_one_class_ends_the_start_as_that_class() {
+            let lever =
+                || -> GateError { Refusal::new(Code::Lever, "BLOOMERY_X=\"b\" is refused").into() };
+            let err = any_seat(|_| Err(lever())).expect_err("every seat refuses");
+            assert_eq!(start::class_of(&err), Some(Code::Lever));
+            assert!(err.to_string().contains("BLOOMERY_X"), "{err}");
+            let mixed = |w: Word| match w {
+                Word::Decide => Err("a string refusal".into()),
+                Word::Seat(_) => Err(lever()),
+            };
+            let err = any_seat(mixed).expect_err("every seat refuses");
+            assert_eq!(start::class_of(&err), Some(Code::Lever));
+            let two = |w: Word| match w {
+                Word::Decide => Err(Refusal::new(Code::NoFit, "no fit").into()),
+                Word::Seat(_) => Err(lever()),
+            };
+            let err = any_seat(two).expect_err("every seat refuses");
+            assert_eq!(start::class_of(&err), None, "two classes name no one");
+            let plain = any_seat(|_| Err("--ctx-size \"abc\"".into())).expect_err("refused");
+            assert_eq!(start::class_of(&plain), None);
+            let one = |w: Word| match w {
+                Word::Seat(Model::Glm) => Ok(()),
+                _ => Err("not this seat".into()),
+            };
+            assert!(any_seat(one).is_ok());
+        }
+
         #[test]
         fn a_model_value_is_a_catalog_name_or_a_seat_word() {
             let seat = |word: &str| Some(Word::parse(word).expect("a seat word"));

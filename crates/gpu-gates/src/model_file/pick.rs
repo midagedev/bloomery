@@ -37,6 +37,9 @@ pub struct Ask<'a> {
     pub revision: Option<&'a str>,
 }
 
+/// The text `hf::fetch` gives a listing the hub answers 404.
+const NOT_THERE: &str = "no such repo or file";
+
 /// One repo at one revision, as the pick reads it.
 struct Repo {
     /// The listing; `None` where the hub could not be reached and the cache stands in.
@@ -77,6 +80,14 @@ impl Reader<'_> {
                             row.repo
                         );
                         None
+                    }
+                    // A repo or revision the hub does not have lists no file: its rows are not in the repo.
+                    Err(HfError::Curl { why, .. }) if why.contains(NOT_THERE) => {
+                        eprintln!(
+                            "bloomery-serve: pick: {} at {}: the hub has no such repo or revision",
+                            row.repo, key.1
+                        );
+                        Some(Vec::new())
                     }
                     Err(e) => return Err(e),
                 }
@@ -256,14 +267,20 @@ pub enum Why {
     NoFit,
 }
 
-/// The class of an outcome with no picked row: the one reason every rejection shares when they
-/// share one, else [`Why::NoFit`].
+/// The class of an outcome with no picked row: the one reason every rejection of a considered row
+/// shares when they share one, else [`Why::NoFit`]. A row the pick filtered by policy (an
+/// explicit-only format, an unverified row) was never a candidate, so it does not decide the class.
 #[must_use]
 pub fn why_none(outcome: &Outcome) -> Why {
     use catalog::Reason;
-    let all = |want: fn(&Reason) -> bool| {
-        !outcome.rejected.is_empty() && outcome.rejected.iter().all(|r| want(&r.why))
-    };
+    let considered: Vec<&Reason> = outcome
+        .rejected
+        .iter()
+        .map(|r| &r.why)
+        .filter(|why| !matches!(why, Reason::ExplicitOnly | Reason::Unverified))
+        .collect();
+    let all =
+        |want: fn(&Reason) -> bool| !considered.is_empty() && considered.iter().all(|r| want(r));
     if all(|why| matches!(why, Reason::NotInRepo)) {
         Why::NotInRepo
     } else if all(|why| matches!(why, Reason::OfflineUncached)) {
@@ -313,7 +330,8 @@ pub fn choose(ask: &Ask<'_>) -> Result<Outcome, GateError> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
@@ -438,6 +456,20 @@ mod tests {
             "a mixed set of reasons is a fit refusal"
         );
         assert_eq!(why_none(&rejected(vec![plan("no-fit")])), Why::NoFit);
+        assert_eq!(
+            why_none(&rejected(vec![
+                Reason::OfflineUncached,
+                Reason::ExplicitOnly,
+                Reason::Unverified
+            ])),
+            Why::Offline,
+            "a row the pick never took does not decide the class"
+        );
+        assert_eq!(
+            why_none(&rejected(vec![Reason::ExplicitOnly, Reason::Unverified])),
+            Why::NoFit,
+            "rows none of which was a candidate are no class"
+        );
     }
 
     /// A row whose whole set the cache holds is planned from the cache's first shard, with no

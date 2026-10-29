@@ -58,7 +58,9 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed};
     use serde_json::Value;
 
-    use crate::decide_gate::{check, compare, listening, post_raw, refused, spawn, untimed, utf8};
+    use crate::decide_gate::{
+        answered, check, compare, listening, post_raw, refused, spawn, untimed, utf8,
+    };
 
     const USAGE: &str = "usage: gate_lev_serve --model <lev gguf> --head <joint_head.safetensors> \\
                          --ref <dir> --dir <dir> [--hf <repo[:quant]>]";
@@ -331,7 +333,9 @@ mod gate {
             ],
         )?;
         check(&mut ok, "qwen35_with_no_head", pass);
-        let pass = refused(&a.dir, "help_lists_lev", &["--help"], &[HELP_LINE])?;
+        // PIN(2026-10-29): `--help` is an answer: status 0 and the models table on stdout. It was a refusal with the
+        // table on stderr and a non-zero status.
+        let pass = answered(&a.dir, "help_lists_lev", &["--help"], &[HELP_LINE])?;
         check(&mut ok, "help_lists_lev", pass);
 
         // The seat serving its row, one server for the clauses that follow.

@@ -123,7 +123,9 @@ pub fn noted_place() -> Option<String> {
 }
 
 #[cfg(any(feature = "deepseek41", feature = "clef"))]
-pub use agent::{Refusal, bind_early, exit_serve, plan_exit, plan_line, refusal_json, take_early};
+pub use agent::{
+    Refusal, bind_early, class_of, exit_serve, plan_exit, plan_line, refusal_json, take_early,
+};
 
 /// The agent-facing half, which the server crate's types and JSON need.
 #[cfg(any(feature = "deepseek41", feature = "clef"))]
@@ -261,6 +263,12 @@ mod agent {
             }
         }
         std::process::exit(0);
+    }
+
+    /// The class an error of the start path names: the first error of its chain that names one;
+    /// `None` for a chain no type names.
+    pub fn class_of(e: &GateError) -> Option<Code> {
+        classify(e.as_ref()).map(|(code, _, _)| code)
     }
 
     /// What an error says of its class: the code, the argument lists that fix it and the bytes

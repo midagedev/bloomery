@@ -32,11 +32,12 @@
 //! - `a_repeat_is_the_same_body`: the same request again is the same body
 //!   byte for byte, `timings` taken out (each request runs from a reset);
 //! - the face both constants of `bloomery-serve`'s drive print
-//!   ([`face_pins_the_constants`]): `--help` exits non-zero with the models
-//!   table on its stderr, one line a seat with its `--hf` example exactly as
-//!   the gate pins it, and a start that passes the help branch prints the
-//!   first-start note before it refuses (here `--model qwen3` with no model
-//!   file, refused before any load);
+//!   ([`face_pins_the_constants`]): `--help` exits 0 with the models table
+//!   on its stdout, one line a seat with its `--hf` example exactly as the
+//!   gate pins it, and a start that passes the help branch prints the
+//!   first-start note before it refuses (here `--model qwen3` offline
+//!   against an empty cache, refused as the class `network` before any
+//!   load);
 //! - the refusals, each a process that exits non-zero before it listens,
 //!   its stderr naming why: `qwen35_with_no_head` (`-m <gguf>`),
 //!   `decide_with_no_head` (`--model decide -m <gguf>`), `qwen3_with_head`
@@ -105,6 +106,8 @@ mod decide_gate;
 #[cfg(all(feature = "deepseek41", feature = "clef"))]
 mod gate {
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu_gates::serve_client::{self, Served, curl};
     use bloomery_gpu_gates::ubatch_pick;
@@ -115,9 +118,12 @@ mod gate {
     use decision::render::dumps;
     use safetensors::write;
     use serde_json::Value;
+    use serve::event::SCHEMA;
+    use serve::exit::Code;
 
     use crate::decide_gate::{
-        check, compare, listening, post_raw, probabilities, refused, spawn, untimed, utf8,
+        REFUSE_WITHIN, answered, check, compare, listening, post_raw, probabilities, refused,
+        spawn, untimed, utf8,
     };
 
     const USAGE: &str = "usage: gate_clef_serve --model <gguf> --head <joint_head.safetensors> \
@@ -259,24 +265,106 @@ mod gate {
     const FIRST_START: &str = "bloomery-serve: a first start on a new card can compile the \
                                GPU code for it (tens of seconds); later starts take seconds";
 
+    /// The server of `args` with `env` set (`BLOOMERY_REF_MODEL` removed), run to its end within [`REFUSE_WITHIN`]:
+    /// its status and what it printed on stdout and stderr. `None` when it is still running then; it is stopped.
+    fn run_to_end(
+        dir: &Path,
+        name: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<Option<(Option<i32>, String, String)>, GateError> {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d)?;
+        let mut cmd = Command::new(std::env::current_exe()?.with_file_name("bloomery-serve"));
+        cmd.env_remove("BLOOMERY_REF_MODEL")
+            .envs(env.iter().copied());
+        let mut s = Served::spawn_cmd(cmd, args, &d)?;
+        let t = Instant::now();
+        let status = loop {
+            if let Some(status) = s.child.try_wait()? {
+                break Some(status);
+            }
+            if t.elapsed() > REFUSE_WITHIN {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let Some(status) = status else {
+            println!(
+                "{name}: still running after {REFUSE_WITHIN:?}: {}",
+                s.stop()?
+            );
+            return Ok(None);
+        };
+        let out = std::fs::read_to_string(d.join("server.out"))?;
+        let err = std::fs::read_to_string(d.join("server.err"))?;
+        Ok(Some((status.code(), out, err)))
+    }
+
+    /// Whether the server of `args` under `env` ends within [`REFUSE_WITHIN`] with the status of `class`, an `error`
+    /// event of that class last on stdout (after at most the listener's `bound`) and every one of `want` on stderr.
+    fn refused_as(
+        dir: &Path,
+        name: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        class: Code,
+        want: &[&str],
+    ) -> Result<bool, GateError> {
+        let Some((code, out, err)) = run_to_end(dir, name, args, env)? else {
+            return Ok(false);
+        };
+        // The events: the listener's `bound` (a start by name binds it before the pick) and the `error` last.
+        let events: Vec<Value> = out
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let status = u64::from(class.status());
+        let one_event = out.lines().count() == events.len()
+            && events.split_last().is_some_and(|(error, before)| {
+                error["schema"] == SCHEMA
+                    && error["event"] == "error"
+                    && error["exit"].as_u64() == Some(status)
+                    && error["code"] == class.name()
+                    && before
+                        .iter()
+                        .all(|e| e["schema"] == SCHEMA && e["event"] == "bound")
+            });
+        let named = want.iter().all(|w| err.contains(w));
+        println!(
+            "{name}: exit {code:?}, the events end in a {class} one {one_event}, stderr names {want:?}: {named}"
+        );
+        let pass = code == Some(i32::from(class.status())) && one_event && named;
+        if !pass {
+            println!("{name} stdout:\n{out}\n{name} stderr:\n{err}");
+        }
+        Ok(pass)
+    }
+
     /// The face (module header): the two constant lines of the drive, read
-    /// from what the binary printed. `--help` exits non-zero with the usage
-    /// and the models table on stderr, every line exactly as
-    /// [`MODELS_LINES`] pins it; a start that passes the help branch — here
-    /// `--model qwen3` with no model file, which refuses before any load —
-    /// prints the first-start note first. Neither process opens a card or
-    /// reads a model.
+    /// from what the binary printed. `--help` exits 0 with the usage and the
+    /// models table on stdout, every line exactly as [`MODELS_LINES`] pins it
+    /// and the first line pointing an agent at `--recommend --json`; a start
+    /// that passes the help branch, here `--model qwen3` offline against an
+    /// empty cache (a start by name that finds no listing and no cached set,
+    /// the class `network`), prints the first-start note first. Neither
+    /// process loads a model; the second reads the cards' census.
+    ///
+    /// PIN(2026-10-29): the agent contract. `--help` exits 0 and prints on stdout (it exited non-zero
+    /// with the usage on stderr), and `--model qwen3` alone is a start by name, so the first-start clause
+    /// runs it offline against an empty cache, where it was the refusal "no model file".
     fn face_pins_the_constants(dir: &Path) -> Result<bool, GateError> {
-        let helps = refused(
-            dir,
-            "help_prints_the_models_table",
-            &["--help"],
-            &MODELS_LINES,
-        )?;
-        let starts = refused(
+        let mut want = MODELS_LINES.to_vec();
+        want.push("bloomery-serve --recommend --json");
+        let helps = answered(dir, "help_prints_the_models_table", &["--help"], &want)?;
+        let cache = dir.join("offline_cache");
+        std::fs::create_dir_all(&cache)?;
+        let starts = refused_as(
             dir,
             "every_start_notes_the_first_compile",
-            &["--model", "qwen3"],
+            &["--model", "qwen3", "--host", "127.0.0.1", "--port", "0"],
+            &[("HF_HUB_OFFLINE", "1"), ("BLOOMERY_CACHE", utf8(&cache)?)],
+            Code::Network,
             &[FIRST_START],
         )?;
         Ok(helps && starts)

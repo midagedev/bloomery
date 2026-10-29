@@ -45,8 +45,10 @@ faster), `ranked-below`.
     bloomery-serve --model NAME[:VARIANT] --dry-run --json
 
 Picks and plans, downloads nothing, exit 0. The same `machine` block, one `models` entry with every candidate, and
-`"start":[...]`, the exact arguments a real start would run. `NAME` is a catalog name (`qwen3.8-flash-next`), an alias
-or a seat word (`qwen38`), in any case.
+`"start":["--model","NAME:VARIANT",...]`, the arguments a real start would run: the same row at the same pinned
+revision, so the start replays the pick. `NAME` is a catalog name (`qwen3.8-flash-next`), an alias or a seat word
+(`qwen38`), in any case. When no variant holds, `pick` is `null` and there is no `start`; the `error` event follows
+the document and the exit is the refusal's code (the one a real start would end with).
 
 ## 3. Start
 
