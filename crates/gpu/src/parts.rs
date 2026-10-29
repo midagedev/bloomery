@@ -292,6 +292,16 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
             room,
         )
     }
+
+    fn load_whole(&self, stream: &CudaStream) -> Result<Weights, GpuError> {
+        load(
+            stream,
+            &self.source,
+            |_, _, _| Ok::<_, std::convert::Infallible>(Take::Whole),
+            |_| None,
+            false,
+        )
+    }
 }
 
 /// Parts, their read costs, the owned read bytes they may hold at once, the peak owned host bytes

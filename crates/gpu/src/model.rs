@@ -50,7 +50,7 @@ use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::watchdog;
-use crate::weights::Weights;
+use crate::weights::{HEAD_TENSOR, Weights, head_tensor};
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream};
@@ -654,6 +654,22 @@ impl<B: ChainBody> GpuModel<B> {
         head: bool,
         body: impl FnOnce(&Gpu, &mut Weights) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
+        GpuModel::load_blocks_from(gpu, file, CardBytes::File, ctx_max, layers, head, body)
+    }
+
+    /// [`GpuModel::load_blocks`] with the card's tensors read from `bytes`: the file's own, or a
+    /// part source's when `file` is a checkpoint folder's header ([`CardBytes::Parts`]). A folder
+    /// loads the whole model, every layer and the head: a part of its layers, and a head tied to
+    /// the token embedding (which its part load does not alias), are refused by name.
+    pub(crate) fn load_blocks_from(
+        gpu: Gpu,
+        file: &Split,
+        bytes: CardBytes<'_>,
+        ctx_max: usize,
+        layers: Range<usize>,
+        head: bool,
+        body: impl FnOnce(&Gpu, &mut Weights) -> Result<B, GpuError>,
+    ) -> Result<GpuModel<B>, GpuError> {
         let what = "GpuModel::load_blocks";
         if ctx_max == 0 {
             return Err(GpuError::shape(what, "ctx_max must be >= 1"));
@@ -666,7 +682,13 @@ impl<B: ChainBody> GpuModel<B> {
             ));
         }
         one_shard(file, what)?;
-        let mut weights = Weights::load(gpu.stream(), file, layers, true)?;
+        let mut weights = match bytes {
+            CardBytes::File => Weights::load(gpu.stream(), file, layers, true)?,
+            CardBytes::Parts(parts) => {
+                refuse_partial_folder(file, &layers, n_layers, head)?;
+                parts.load_whole(gpu.stream())?
+            }
+        };
         let body = body(&gpu, &mut weights)?;
         let head = if head {
             Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
@@ -2247,6 +2269,10 @@ pub trait PartsLoad: Send {
         room: u64,
     ) -> Result<Weights, GpuError>;
 
+    /// Every tensor the source makes on the card, each whole in its type's card format: the
+    /// load of a model that sits wholly on one card, with no plan ([`GpuModel::load_blocks_from`]).
+    fn load_whole(&self, stream: &CudaStream) -> Result<Weights, GpuError>;
+
     /// The host admission and exact read peak to pass to load.
     fn host_need(
         &self,
@@ -2781,6 +2807,37 @@ pub(crate) fn block_count(file: &Split, what: &'static str) -> Result<usize, Gpu
     usize::try_from(n).map_err(|_| GpuError::shape(what, format!("block_count {n}")))
 }
 
+/// Refused by name unless the load of the checkpoint folder whose header is `file` is whole: every
+/// layer of `0..n_layers` with the head, which the folder holds as a tensor of its own (a head tied
+/// to the token embedding is a file's: the part load does not alias it).
+fn refuse_partial_folder(
+    file: &Split,
+    layers: &Range<usize>,
+    n_layers: usize,
+    head: bool,
+) -> Result<(), GpuError> {
+    let what = "GpuModel::load_blocks";
+    if *layers != (0..n_layers) || !head {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a checkpoint folder loads the whole model: layers {layers:?} of 0..{n_layers} \
+                 with head {head} are a file's"
+            ),
+        ));
+    }
+    if head_tensor(file) != HEAD_TENSOR {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a checkpoint folder with no {HEAD_TENSOR}: a head tied to the token embedding \
+                 is a file's"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The reader of `file`'s one shard, for a caller that reads a single file;
 /// a split set of several shards is refused.
 pub(crate) fn one_shard<'a>(
@@ -2824,7 +2881,7 @@ impl<B: Instrumented> Engine for GpuModel<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_reserve_past;
+    use super::{refuse_partial_folder, refuse_reserve_past};
 
     /// Buffers at the plan's reserve pass; one byte past it is refused by name with both figures
     /// and what the buffers are. Mutant: the comparison read `>=`, or reversed.
@@ -2875,5 +2932,42 @@ mod tests {
         let plan = plan_with(&model, &held, 16, &NoKv, None).expect("the holder's plan");
         let run = super::one_card_run("t", &plan, 0, 3).expect("a holder is no expert tier");
         assert_eq!(run, (0..3, 16));
+    }
+
+    /// A folder's part load reads every layer and a head of its own: a part of the layers, no
+    /// head, and a head tied to the token embedding are each refused by name, and the whole model
+    /// with `output.weight` passes. Mutant: the tied-head comparison dropped, or the layer range
+    /// compared with `<`.
+    #[test]
+    fn a_folder_loads_every_layer_and_a_head_of_its_own() {
+        use gguf::Split;
+        use gguf::write::{Layout, TensorDecl};
+        let header = |names: &[&str]| {
+            let tensors = names
+                .iter()
+                .map(|name| TensorDecl {
+                    name: (*name).into(),
+                    dims: vec![32],
+                    type_id: gguf::GgmlType::F32.as_u32(),
+                    nbytes: 128,
+                })
+                .collect();
+            let layout = Layout::new(&[], tensors).expect("a layout");
+            Split::header_only(std::env::temp_dir().join("model-folder-toy.gguf"), &layout)
+                .expect("a header")
+        };
+        let own = header(&["token_embd.weight", "output.weight"]);
+        let tied = header(&["token_embd.weight"]);
+        refuse_partial_folder(&own, &(0..4), 4, true).expect("every layer and its own head");
+        for (file, layers, head, want) in [
+            (&own, 0..3, true, "layers 0..3 of 0..4"),
+            (&own, 0..4, false, "with head false"),
+            (&tied, 0..4, true, "a head tied to the token embedding"),
+        ] {
+            let e = refuse_partial_folder(file, &layers, 4, head)
+                .expect_err(want)
+                .to_string();
+            assert!(e.contains(want), "{e}");
+        }
     }
 }
