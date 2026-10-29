@@ -1610,8 +1610,9 @@ gate-gpu-clef-hidden:
 # derivation without blk.64, the prompt call and forced decode steps' logits rows against mainline's (`just dump-logits-qwen38d`)
 # within the bands the oracle's own CPU twin gives, graph = eager = pass, reset, the checkpoint cut with its re-fed tail, and two
 # resident slots in one pass against each alone. Fixture tier, the NVFP4 cut folder (tools/fixture-cuts/qwen38nv.json) and its
-# GGUF twin: ours on the twin against mainline's logits rows (`just dump-logits-qwen38nv`) within the bands the oracle's own CPU
-# floor gives, and ours on the folder equal bit for bit to ours on the twin. The gate lock; no lease.
+# GGUF twin: ours on the twin against mainline's logits rows (`just dump-logits-qwen38nv`) within the bands the activation rule's
+# derived term and the oracle's own CPU floor give, and ours on the folder equal bit for bit to ours on the twin. The gate lock;
+# no lease.
 gate-gpu-qwen38d:
     BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
 

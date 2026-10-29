@@ -154,15 +154,32 @@ mod nv {
     const CTX: usize = 4352;
     const U_GATE: usize = 1024;
 
-    /// The bands of G3 are multiples of the oracle's own floor on the twin: mainline's CPU kernels against its CUDA
-    /// kernels on the same file, prompt and ids (`dense-logits.py floor`, the rows `<set>.cpu` beside each set), pooled over
-    /// both sets as the real file's bands are. The factors are the ones the real file's `PIN` bands take over its own floor
-    /// (0.20 over the largest row 0.1492, 0.066 over the larger median 0.0525, 0.09 over the larger p90 0.0685): 1.34 on the
-    /// largest relative L2, 1.25 on the median, 1.3 on the 90th percentile. A wiring fault (a dropped scale, a stale
-    /// activation block, a layer or id off by one) moves a row by order one, far past either.
+    /// Each band of G3 composes two terms in quadrature, the rows' error model:
+    /// - the activation rule, which ours carries by design and the oracle's floor does not hold: ours' decode gemvs
+    ///   quantize an NVFP4 weight's activations to q8 per 128 (f32 d) and read a Q8_0 weight's in f32, where mainline's
+    ///   CUDA and CPU kernels alike quantize them to q8 per 32 (f16 d). Its size is `ACT_*` below.
+    /// - the f32 sum order, as the oracle's own floor on the twin measures it: mainline's CPU kernels against its CUDA
+    ///   kernels on the same file, prompt and ids (`dense-logits.py floor`, the rows `<set>.cpu` beside each set), pooled
+    ///   over both sets as the real file's bands are, times the factors the real file's `PIN` bands take over its own floor
+    ///   (0.20 over the largest row 0.1492, 0.066 over the larger median 0.0525, 0.09 over the larger p90 0.0685): 1.34 on
+    ///   the largest relative L2, 1.25 on the median, 1.3 on the 90th percentile.
+    ///
+    /// A wiring fault (a dropped scale, a stale activation block, a layer or id off by one) moves a row by order one, far
+    /// past both.
     const REL_FACTOR: f64 = 1.34;
     const MEDIAN_FACTOR: f64 = 1.25;
     const P90_FACTOR: f64 = 1.3;
+    /// PIN(2026-10-29): the activation rule's term in a decode row's relative L2 (median, 90th percentile, largest row).
+    /// Derived on mainline's own CPU activations of the p64 set's rows, each site's error vector being its weight times the
+    /// difference of the two rules on the same input: the head (NVFP4, 0.0047 median alone), the FFN's gate/up/down, the
+    /// mixers' output projections and their z and attention gates, carried to the logits through the final norm's Jacobian
+    /// and the head, 0.0049 / 0.0053 / 0.0058 together; and the mixers' q/k/v inputs (the delta nets' qkv, the attention
+    /// layer's q, k and v), taken isotropic and carried to the layer's output at gain one (the free-running composition
+    /// of the house's error model), 0.0096 / 0.0111 / 0.0120. In quadrature: 0.0109 / 0.0121 / 0.0130. Row 0, the
+    /// prompt call's, holds the head's term alone.
+    const ACT_MEDIAN: f64 = 0.0109;
+    const ACT_P90: f64 = 0.0121;
+    const ACT_ROW: f64 = 0.0130;
     /// The factor on a row's stability bound, as the real file's: two logits swap only if their margin is within the
     /// difference of their two moves, at most `min(2 · max_abs, √2 · l2)` of the move's vector, the move taken being the
     /// oracle's own spread on that row (CPU against CUDA) times this factor.
@@ -348,12 +365,14 @@ mod nv {
             opened.push((name, prompt, set, cpu));
         }
         let (band_median, band_p90, band_rel) = (
-            MEDIAN_FACTOR * floor_spread.0,
-            P90_FACTOR * floor_spread.1,
-            REL_FACTOR * floor_spread.2,
+            ACT_MEDIAN.hypot(MEDIAN_FACTOR * floor_spread.0),
+            ACT_P90.hypot(P90_FACTOR * floor_spread.1),
+            ACT_ROW.hypot(REL_FACTOR * floor_spread.2),
         );
         println!(
-            "  bands: median {band_median:.4} ({MEDIAN_FACTOR} x the larger median), p90 {band_p90:.4} ({P90_FACTOR} x the larger p90), row {band_rel:.4} ({REL_FACTOR} x the largest row)"
+            "  bands (the activation rule's term in quadrature with the floor's): median {band_median:.4} ({ACT_MEDIAN} with \
+             {MEDIAN_FACTOR} x the larger median), p90 {band_p90:.4} ({ACT_P90} with {P90_FACTOR} x the larger p90), row \
+             {band_rel:.4} ({ACT_ROW} with {REL_FACTOR} x the largest row)"
         );
         let mut ok = true;
         for ((name, prompt, set, cpu), ours) in opened.iter().zip(&side.rows) {
