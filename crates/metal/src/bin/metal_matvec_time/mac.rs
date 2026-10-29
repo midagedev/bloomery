@@ -62,6 +62,11 @@
 //! session's down), at eight routed experts and the shared one, on synthetic
 //! stacks. `--only pair` / `--only fold` select them.
 //!
+//! `--only lfm3` times LFM3-1.7B's decode launches instead (`lfm3.rs`): the
+//! session's own host calls over A4 synthetic weights, on a device opened at
+//! LFM3's instance, with the diagnostic rows and source cuts that split the
+//! gap to MLX's `qmv` into terms. It runs no other row.
+//!
 //! `--geometry rows=N,sg=M,router_sg=K` compiles the kernels' own source with
 //! other values of the geometry constants — the rows a SIMD group owns
 //! (2/4/8, a `#define` of the source), the SIMD groups in a mat-vec
@@ -104,6 +109,9 @@ mod oracle;
 #[path = "../shared/synthetic.rs"]
 mod synthetic;
 use synthetic::matrix;
+
+#[path = "lfm3.rs"]
+mod lfm3;
 
 /// The probe's working set, window, warm-up and trial counts.
 const WORKING_SET_BYTES: usize = 1 << 30;
@@ -199,6 +207,25 @@ enum Shape {
     },
     /// The head-normed residual mat-vec: a gated delta net's out projection.
     HeadNorm { rows: usize, cols: usize },
+    /// A dense FFN's gate-up pair at its one slot: the experts' launch over
+    /// one gate and one up of `rows` by `cols`, the weights holding the gate
+    /// and then the up. The launch refuses a `rows` that is not the device's
+    /// instance's expert width.
+    DensePair {
+        quant: Quant,
+        rows: usize,
+        cols: usize,
+    },
+    /// A dense FFN's folded down at its one slot: `rows` by `k`, added into
+    /// the output, the route weight 1.
+    DenseFold { quant: Quant, rows: usize, k: usize },
+    /// The output head: `rows` logits over `cols`, the norm on the load and
+    /// the argmax in the same dispatch.
+    Head {
+        quant: Quant,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl Shape {
@@ -208,13 +235,20 @@ impl Shape {
             Self::Matvec { .. } => "matvec",
             Self::Seg { .. } => "seg",
             Self::HeadNorm { .. } => "headnorm",
+            Self::DensePair { .. } => "pair",
+            Self::DenseFold { .. } => "fold",
+            Self::Head { .. } => "head",
         }
     }
 
     /// The weight type the dispatch reads.
     fn quant(&self) -> Quant {
         match self {
-            Self::Matvec { quant, .. } | Self::Seg { quant, .. } => *quant,
+            Self::Matvec { quant, .. }
+            | Self::Seg { quant, .. }
+            | Self::DensePair { quant, .. }
+            | Self::DenseFold { quant, .. }
+            | Self::Head { quant, .. } => *quant,
             Self::HeadNorm { .. } => Quant::Q4K,
         }
     }
@@ -222,15 +256,22 @@ impl Shape {
     /// The columns the dispatch reads.
     fn cols(&self) -> usize {
         match self {
-            Self::Matvec { cols, .. } | Self::Seg { cols, .. } => *cols,
+            Self::Matvec { cols, .. }
+            | Self::Seg { cols, .. }
+            | Self::DensePair { cols, .. }
+            | Self::Head { cols, .. } => *cols,
             Self::HeadNorm { cols, .. } => *cols,
+            Self::DenseFold { k, .. } => *k,
         }
     }
 
     /// The rows the dispatch writes.
     fn rows(&self) -> usize {
         match self {
-            Self::Matvec { rows, .. } => *rows,
+            Self::Matvec { rows, .. }
+            | Self::DensePair { rows, .. }
+            | Self::DenseFold { rows, .. }
+            | Self::Head { rows, .. } => *rows,
             Self::Seg { segments, .. } => segments.iter().sum(),
             Self::HeadNorm { rows, .. } => *rows,
         }
@@ -250,6 +291,9 @@ impl Shape {
                 segments,
             } => per(*quant, segments.iter().sum::<usize>() * cols),
             Self::HeadNorm { rows, cols } => per(Quant::Q4K, rows * cols),
+            Self::DensePair { quant, rows, cols } => 2 * per(*quant, rows * cols),
+            Self::DenseFold { quant, rows, k } => per(*quant, rows * k),
+            Self::Head { quant, rows, cols } => per(*quant, rows * cols),
         }
     }
 }
@@ -477,6 +521,14 @@ fn time_shape(
             all
         }
         Shape::HeadNorm { rows, cols } => matrix(Quant::Q4K, *rows, *cols, seed),
+        // The gate, then the up: two tensors of one expert's shape.
+        Shape::DensePair { rows, cols, .. } => {
+            let mut both = matrix(quant, *rows, *cols, seed);
+            both.extend_from_slice(&matrix(quant, *rows, *cols, seed ^ 1));
+            both
+        }
+        Shape::DenseFold { rows, k, .. } => matrix(quant, *rows, *k, seed),
+        Shape::Head { rows, cols, .. } => matrix(quant, *rows, *cols, seed),
     };
     let bytes = one.len();
     let (stride, copies, working_set) = spread(bytes);
@@ -521,6 +573,33 @@ fn time_shape(
     let mut y = device
         .zeroed::<f32>(stream, Elems(buffers * dispatches * rows))
         .map_err(why)?;
+    // The experts' and the head's launches: the instance's experts, the one
+    // expert id and route weight of a dense FFN, and one scratch set per
+    // committed buffer for the head's candidates and ticket, as for the
+    // router. A shape that launches neither holds the one element each.
+    let experts = &kernels.geom().experts;
+    let faults_read = matches!(
+        shape,
+        Shape::DensePair { .. } | Shape::DenseFold { .. } | Shape::Head { .. }
+    );
+    if faults_read {
+        device.fault_word().clear(stream).map_err(why)?;
+    }
+    let ids = device.upload(stream, &[0i32]).map_err(why)?;
+    let route = device.upload(stream, &[1.0f32]).map_err(why)?;
+    let head_groups = match shape {
+        Shape::Head { rows, .. } => rows.div_ceil(HEAD_SIMD_GROUPS * kernels.rows_per_simd_group()),
+        Shape::Matvec { .. }
+        | Shape::Seg { .. }
+        | Shape::HeadNorm { .. }
+        | Shape::DensePair { .. }
+        | Shape::DenseFold { .. } => 1,
+    };
+    let mut candidates = device
+        .zeroed::<u64>(stream, Elems(buffers * head_groups))
+        .map_err(why)?;
+    let mut ticket = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
+    let mut step_id = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
 
     let timing = time_dispatches(
         stream,
@@ -600,6 +679,89 @@ fn time_shape(
                         )
                         .map_err(why)?;
                 }
+                Shape::DensePair { quant, rows, cols } => {
+                    let half = bytes / 2;
+                    let base = (n % copies) * stride;
+                    kernels
+                        .pair(
+                            encoder,
+                            PairParams {
+                                quant: *quant,
+                                shared_quant: *quant,
+                                slots: experts.slots,
+                                k: *rows,
+                                cols: *cols,
+                                n_experts: 1,
+                                ids: ids
+                                    .window(Elems(0), Elems(experts.routed_ids))
+                                    .map_err(why)?,
+                                gate: weights.window(Elems(base), Elems(half)).map_err(why)?,
+                                up: weights
+                                    .window(Elems(base + half), Elems(half))
+                                    .map_err(why)?,
+                                shared_gate: None,
+                                shared_up: None,
+                                x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                eps: 1e-6,
+                                y: out,
+                                out_stride: *rows,
+                                fault: device.fault_word(),
+                                layer: LAYER_NONE,
+                            },
+                        )
+                        .map_err(why)?;
+                }
+                Shape::DenseFold { quant, rows, k } => {
+                    kernels
+                        .fold(
+                            encoder,
+                            FoldParams {
+                                quant: *quant,
+                                shared: SharedPlan::None,
+                                rows: *rows,
+                                slots: experts.slots,
+                                k: *k,
+                                n_experts: 1,
+                                ids: ids
+                                    .window(Elems(0), Elems(experts.routed_ids))
+                                    .map_err(why)?,
+                                down: w,
+                                h: x.window(Elems(0), Elems(*k)).map_err(why)?,
+                                w: route.window(Elems(0), Elems(experts.slots)).map_err(why)?,
+                                y: &out,
+                                fault: device.fault_word(),
+                                layer: LAYER_NONE,
+                            },
+                        )
+                        .map_err(why)?;
+                }
+                Shape::Head { quant, rows, cols } => {
+                    let b = n / dispatches;
+                    kernels
+                        .head(
+                            encoder,
+                            HeadParams {
+                                quant: *quant,
+                                rows: *rows,
+                                k: *cols,
+                                simdgroups: HEAD_SIMD_GROUPS,
+                                weights: w,
+                                x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                logits: out,
+                                candidates: candidates
+                                    .window_mut(Elems(b * head_groups), Elems(head_groups))
+                                    .map_err(why)?,
+                                ticket: ticket.window_mut(Elems(b), Elems(1)).map_err(why)?,
+                                step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
+                                eps: 1e-6,
+                                fault: device.fault_word(),
+                                layer: LAYER_NONE,
+                            },
+                        )
+                        .map_err(why)?;
+                }
             }
             Ok(())
         },
@@ -619,6 +781,11 @@ fn time_shape(
                 "dispatch {n} read the same weights and gave other bits than dispatch 0"
             ));
         }
+    }
+    if matches!(shape, Shape::Head { .. }) {
+        ticket_and_fault(device, stream, &ticket)?;
+    } else if faults_read {
+        ticket_and_fault_free(device, stream)?;
     }
     if check && matches!(shape, Shape::Matvec { resid: false, .. }) {
         let x64: Vec<f64> = x_values.iter().map(|&v| f64::from(v)).collect();
@@ -735,10 +902,15 @@ impl Geometry {
     }
 }
 
-/// The kernels of a geometry variant: the source with the two `#define`s of
-/// the geometry replaced, compiled by the runtime, one occurrence of each
-/// named so a header edit that moves one is an error, not a silent no-op.
-fn geometry_kernels(device: &MetalDevice, geometry: Geometry) -> Result<Kernels, String> {
+/// The kernels of a geometry variant: `source` (the device's instance's
+/// program text) with the two `#define`s of the geometry replaced, compiled by
+/// the runtime, one occurrence of each named so a header edit that moves one
+/// is an error, not a silent no-op.
+fn geometry_kernels(
+    device: &MetalDevice,
+    source: &str,
+    geometry: Geometry,
+) -> Result<Kernels, String> {
     let edits = [
         (
             format!(
@@ -755,7 +927,7 @@ fn geometry_kernels(device: &MetalDevice, geometry: Geometry) -> Result<Kernels,
             format!("#define BLOOMERY_ROUTER_SG {}", geometry.router_sg),
         ),
     ];
-    let mut text = SOURCE.to_string();
+    let mut text = source.to_string();
     for (find, with) in edits {
         let found = text.matches(find.as_str()).count();
         if found != 1 {
@@ -1400,7 +1572,10 @@ us_p90, gbps.
   --only KIND            a kernel (matvec, seg, headnorm, router, head), a
                          mat-vec type (q4k, q6k, a4), or a shape label.
                          Repeatable, and one value may be comma-separated.
-                         Unset times every shape.
+                         Unset times every shape. `lfm3` runs LFM3-1.7B's
+                         decode rows alone (lfm3.rs); a further value there
+                         narrows them to a kernel (pair, fold, head, seg,
+                         matvec) or a label part (`[plain]`, `[fma]`).
   --trials N             timed command buffers per arm (default 16)
   --chain N              also time N back-to-back dispatches: arm lone (one
                          dispatch), serial and concurrent (a memory barrier
@@ -1639,6 +1814,10 @@ pub fn main() -> ExitCode {
         }
     };
 
+    if lfm3::selected(&run.only) {
+        return lfm3::main(&run);
+    }
+
     let device = match MetalDevice::open(&HOST) {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
@@ -1659,7 +1838,7 @@ pub fn main() -> ExitCode {
             }
         }
     } else {
-        match geometry_kernels(&device, run.geometry) {
+        match geometry_kernels(&device, SOURCE, run.geometry) {
             Ok(kernels) => kernels,
             Err(e) => {
                 println!(
