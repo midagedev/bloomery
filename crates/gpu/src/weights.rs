@@ -11,17 +11,19 @@
 //! pin the uploads against independent host packings bit for bit.
 
 use crate::GpuError;
-use crate::mxfp4::{Nvfp4, Nvfp4Weight, Planes, repack};
+use crate::mxfp4::Nvfp4Weight;
 use crate::mxfp4_sel::Nvfp4Stack;
+use crate::planes::Format as PlaneFormat;
 use crate::q5::{pack_q5_0, pack_q5_1};
-use crate::q8f32::{E4m3Scales, E4m3Weight, e4m3_planes};
+use crate::q8f32::{E4m3Scales, E4m3Weight};
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
 use ::model::placement::host_lock::PageDrop;
+use ::model::placement::read_ahead::{self, Ranges};
 use ::model::placement::{
     CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span, tp,
 };
-use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, sys};
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 use runtime::words::stream_words;
@@ -1172,7 +1174,7 @@ const PLACED: &str = "Weights::load_placed";
 
 /// The file bytes a segment's upload may release once its bytes are staged:
 /// each entry the shard and the bytes within its mapping.
-type PendingRelease = Vec<(usize, Range<u64>)>;
+type PendingRelease = Ranges;
 
 /// Reads a part's `qs` words, its scales and its width, `None` for another format.
 type PartPlanes<S> =
@@ -1186,7 +1188,9 @@ fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
 /// [`Weights::load_rows`], releasing each uploaded segment's file pages
 /// through `release` when there is one, each as soon as its bytes are
 /// staged. One staging ring carries the whole load's copies and one
-/// synchronize ends them.
+/// synchronize ends them. The file pages of the segments after the one
+/// being staged are read ahead of it ([`read_ahead`]), so the drive works
+/// while the host copies instead of between copies.
 fn load_segments(
     stream: &CudaStream,
     split: &Split,
@@ -1207,6 +1211,8 @@ fn load_segments(
         .map(|seg| seg.resident_bytes)
         .sum::<u64>();
     let mut ring = UploadRing::new(stream, usize::try_from(budget).unwrap_or(usize::MAX))?;
+    // The load's steps, in the order it stages them: one a card segment.
+    let mut steps = Vec::new();
     for row in rows {
         let t = model.tensors.get(row.tensor).ok_or_else(|| {
             GpuError::shape(PLACED, format!("placement row names tensor {}", row.tensor))
@@ -1217,32 +1223,77 @@ fn load_segments(
             .iter()
             .filter(|s| s.device == Device::Card(card))
         {
-            let (dw, release_ranges) =
-                upload_segment(&mut ring, stream, split, model.experts, t, seg)?;
-            if by_name.insert(t.name.clone(), dw).is_some() {
-                return Err(placed_refusal(
-                    t,
-                    format!("has two segments on card {card}"),
-                ));
-            }
-            // The ring's copies read its pinned slots, never the file: once a
-            // segment's pieces are staged, its pages can go at once, which
-            // keeps the load's page-cache footprint to one segment rather
-            // than letting a card's whole upload evict the host set.
-            if let Some(release) = release.as_mut() {
-                for (shard, at) in release_ranges {
-                    release
-                        .release(shard, at)
-                        .map_err(|e| GpuError::plan(PLACED, e))?;
-                }
-            }
+            steps.push((t, seg));
         }
     }
-    ring.finish(stream)?;
+    let files: Vec<Ranges> = steps
+        .iter()
+        .map(|&(t, seg)| segment_ranges(split, model.experts, t, seg))
+        .collect::<Result<_, _>>()?;
+    let ((), _) = read_ahead::run(
+        split,
+        &files,
+        |e| GpuError::plan(PLACED, e),
+        |ahead| {
+            for (i, &(t, seg)) in steps.iter().enumerate() {
+                ahead.begin(i).map_err(|e| GpuError::plan(PLACED, e))?;
+                let (dw, release_ranges) =
+                    upload_segment(&mut ring, stream, split, model.experts, t, seg)?;
+                if by_name.insert(t.name.clone(), dw).is_some() {
+                    return Err(placed_refusal(
+                        t,
+                        format!("has two segments on card {card}"),
+                    ));
+                }
+                // The reads of this step end before its pages are released,
+                // so none puts a page back.
+                ahead.retire(i);
+                // The ring's copies read its pinned slots, never the file: once a
+                // segment's pieces are staged, its pages can go at once, which
+                // keeps the load's page-cache footprint to one segment rather
+                // than letting a card's whole upload evict the host set.
+                if let Some(release) = release.as_mut() {
+                    for (shard, at) in release_ranges {
+                        release
+                            .release(shard, at)
+                            .map_err(|e| GpuError::plan(PLACED, e))?;
+                    }
+                }
+            }
+            ring.finish(stream)?;
+            Ok(())
+        },
+    )?;
     Ok(Weights {
         by_name,
         tied: false,
     })
+}
+
+/// The file bytes of placement segment `seg` of tensor `t`, a stack of
+/// `experts` when it is one: the shard and the file offsets of each of its
+/// spans, the bytes the upload copies from and the load releases afterwards.
+fn segment_ranges(
+    split: &Split,
+    experts: u64,
+    t: &ModelTensor,
+    seg: &Segment,
+) -> Result<Ranges, GpuError> {
+    let file = SegmentFile::of(split, experts, t, seg)?;
+    Ok(span_ranges(
+        file.shard,
+        file.gguf.data_base() + file.info.offset,
+        &file.spans,
+    ))
+}
+
+/// `spans`' bytes as file offsets of shard `shard`, the tensor's first byte
+/// at `base`.
+fn span_ranges(shard: usize, base: u64, spans: &[Span]) -> Ranges {
+    spans
+        .iter()
+        .map(|span| (shard, base + span.bytes.start..base + span.bytes.end))
+        .collect()
 }
 
 /// Where placement segment `seg` of tensor `t`, a stack of `experts` when it
@@ -1368,11 +1419,7 @@ fn upload_segment(
     let release = if read_by_steps {
         PendingRelease::new()
     } else {
-        let base = g.data_base() + info.offset;
-        spans
-            .iter()
-            .map(|span| (s, base + span.bytes.start..base + span.bytes.end))
-            .collect()
+        span_ranges(s, g.data_base() + info.offset, &spans)
     };
     Ok((dw, release))
 }
@@ -1451,8 +1498,11 @@ fn upload_budget(t: &TensorInfo) -> usize {
 /// `ring`. The formats whose device bytes are the file bytes verbatim
 /// ([`CardFormat::KQuant`], [`CardFormat::F32`] — the host is little-endian,
 /// the module refuses to build otherwise) stage the slices themselves into a
-/// zeroed buffer, so no word is packed on the host; every other format packs
-/// its run on the host and stages the packed words. Refuses exactly where
+/// zeroed buffer, so no word is packed on the host; the formats that keep a
+/// file's scale bytes and code bytes in two planes (Q8_0, NVFP4, MXFP8,
+/// FP8_B128: [`crate::planes`]) split their rows straight into the ring's
+/// slots; every other format packs its run on the host and stages the packed
+/// words. Refuses exactly where
 /// [`CardFormat::resident_bytes`] has no size for the rows, and checks the
 /// upload's device bytes against that size; `what` names the caller in both
 /// errors. `scale` is an NVFP4 tensor's scales ([`tensor_scales`]; a stack's
@@ -1553,18 +1603,15 @@ fn upload_rows(
             }
         }
         CardFormat::Q8_0Planes => {
-            let blocks: Vec<Q8Block> = flat_of(src, take)?
-                .as_chunks::<34>()
-                .0
-                .iter()
-                .map(Q8Block::from_bytes)
-                .collect();
-            let (qs, d) = q8_0_planes(&blocks);
-            DevWeight::Q8_0 {
-                qs: upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
-                d: upload_packed(stream, ring, what, name, &d, rows, k / 32)?,
-                k,
-            }
+            let (qs, d) = upload_split(
+                stream,
+                ring,
+                (what, name),
+                (PlaneFormat::Q8_0, k / 32),
+                (src, take),
+                (rows, k / 4, k / 32),
+            )?;
+            DevWeight::Q8_0 { qs, d, k }
         }
         CardFormat::Nvfp4Planes => {
             let scale = scale.ok_or_else(|| {
@@ -1587,9 +1634,14 @@ fn upload_rows(
                     return Err(GpuError::shape(what, detail));
                 }
             };
-            let Planes { qs, e } = repack::<Nvfp4>(&flat_of(src, take)?, rows, k)?;
-            let qs = upload_packed(stream, ring, what, name, &qs, rows, k / 8)?;
-            let e = upload_packed(stream, ring, what, name, &e, rows, k / 64)?;
+            let (qs, e) = upload_split(
+                stream,
+                ring,
+                (what, name),
+                (PlaneFormat::Nvfp4, k / 64),
+                (src, take),
+                (rows, k / 8, k / 64),
+            )?;
             let scales = upload_packed(stream, ring, what, name, &scale, scale.len(), 1)?;
             if stack {
                 DevWeight::Nvfp4Stack { qs, e, scales, k }
@@ -1609,15 +1661,27 @@ fn upload_rows(
             } else {
                 E4m3Scales::Fp8B128
             };
-            let bytes = flat_of(src, take)?;
             let (qs, e) = if t.ty == GgmlType::BF16 {
-                crate::q8f32::bf16_mxfp8_planes(&bytes, rows, k)
+                let (qs, e) = crate::q8f32::bf16_mxfp8_planes(&flat_of(src, take)?, rows, k)
+                    .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
+                (
+                    upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
+                    upload_packed(stream, ring, what, name, &e, rows, k / 128)?,
+                )
             } else {
-                e4m3_planes(scales, &bytes, rows, k)
-            }
-            .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
-            let qs = upload_packed(stream, ring, what, name, &qs, rows, k / 4)?;
-            let e = upload_packed(stream, ring, what, name, &e, rows, k / 128)?;
+                let format = match scales {
+                    E4m3Scales::Mxfp8 => PlaneFormat::Mxfp8,
+                    E4m3Scales::Fp8B128 => PlaneFormat::Fp8B128,
+                };
+                upload_split(
+                    stream,
+                    ring,
+                    (what, name),
+                    (format, k / 128),
+                    (src, take),
+                    (rows, k / 4, k / 128),
+                )?
+            };
             match scales {
                 E4m3Scales::Mxfp8 => DevWeight::Mxfp8 { qs, e, k },
                 E4m3Scales::Fp8B128 => DevWeight::Fp8B128 { qs, e, k },
@@ -1729,6 +1793,41 @@ fn upload_packed<T: DeviceCopy>(
     };
     ring.copy_bytes(stream, &stage, &[bytes], bytes.len())?;
     Ok(t)
+}
+
+/// `rows` rows of `format`, `row_recs` records a row, from `src`'s first `take`
+/// bytes (the file's own rows), as two device tensors of the planes
+/// ([`crate::planes`]): the codes `rows` x `code_cols` and the scale bytes
+/// `rows` x `head_cols`, each zeroed first, each element the plane's bytes as a
+/// little-endian word of its own type. The split writes into the ring's slots,
+/// so no host vector of the planes exists.
+fn upload_split<C: DeviceCopy, H: DeviceCopy>(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    (what, name): (&'static str, &str),
+    (format, row_recs): (PlaneFormat, usize),
+    (src, take): (&[&[u8]], usize),
+    (rows, code_cols, head_cols): (usize, usize, usize),
+) -> Result<(DeviceTensor<C>, DeviceTensor<H>), GpuError> {
+    let codes = DeviceTensor::<C>::zeroed(stream, rows, code_cols)?;
+    let heads = DeviceTensor::<H>::zeroed(stream, rows, head_cols)?;
+    let stage = |dst: sys::CUdeviceptr, dst_bytes: usize| Stage {
+        what,
+        name,
+        dst,
+        dst_bytes,
+    };
+    ring.copy_split(
+        stream,
+        (
+            &stage(codes.buf().cu_deviceptr(), codes.buf().num_bytes()),
+            &stage(heads.buf().cu_deviceptr(), heads.buf().num_bytes()),
+        ),
+        (format, row_recs),
+        src,
+        take,
+    )?;
+    Ok((codes, heads))
 }
 
 /// The q8f32 two-plane layout of Q8_0 blocks: per block 8 code words (code j

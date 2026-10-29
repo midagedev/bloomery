@@ -48,7 +48,7 @@ pub fn page_bytes() -> Result<u64, PlacementError> {
 /// About how many chunks, a thread each, a walk cuts a set into: several
 /// times the reads one thread keeps in flight, so that the device, not one
 /// thread, bounds the walk.
-const WALK_CHUNKS: u64 = 16;
+pub(crate) const WALK_CHUNKS: u64 = 16;
 
 /// A file of a host set: a shard of the split, or the r8 sidecar, which
 /// messages name by its path.
@@ -981,20 +981,20 @@ pub(crate) fn drop_cached_pages(
 /// The line a populate prints once when the kernel has no
 /// `MADV_POPULATE_READ`.
 #[cfg(target_os = "linux")]
-const NO_POPULATE_READ: &str = "host populate: madvise(MADV_POPULATE_READ) is not in this kernel \
+pub(crate) const NO_POPULATE_READ: &str = "host populate: madvise(MADV_POPULATE_READ) is not in this kernel \
                                 (EINVAL; it came in Linux 5.14), so the load reads one byte a page \
                                 instead";
 
 /// The line a populate prints once when the platform has no
 /// `MADV_POPULATE_READ`.
 #[cfg(target_os = "macos")]
-const NO_POPULATE_READ: &str = "host populate: this platform has no madvise(MADV_POPULATE_READ), \
+pub(crate) const NO_POPULATE_READ: &str = "host populate: this platform has no madvise(MADV_POPULATE_READ), \
                                 so the load reads one byte a page instead";
 
 /// `madvise(MADV_POPULATE_READ)` over `span`, a live sub-slice of a set's
 /// mappings: a shard's read-only file mapping, or the sidecar's, which is its
 /// file's mapping or a resident anonymous copy.
-fn advise_populate(span: &[u8]) -> Result<(), os::OsError> {
+pub(crate) fn advise_populate(span: &[u8]) -> Result<(), os::OsError> {
     // SAFETY: `span` is a live slice (the caller's contract above), so its
     // pages are inside one live mapping.
     unsafe { os::advise_populate(span.as_ptr().cast_mut().cast(), span.len()) }
@@ -1006,7 +1006,7 @@ fn advise_populate(span: &[u8]) -> Result<(), os::OsError> {
 /// gets the same pages faulted by a read of one byte each `page` bytes
 /// instead. Any other refusal is the walk's, by name. The error stays typed
 /// through this seam: the fallback reads the variant and the errno.
-fn populate_span(
+pub(crate) fn populate_span(
     span: &[u8],
     page: u64,
     advise: impl Fn(&[u8]) -> Result<(), os::OsError>,

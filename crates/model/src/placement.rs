@@ -20,6 +20,7 @@
 pub use bloomery_placement::placement::*;
 pub use bloomery_placement::{accepts, kernels, slots};
 pub mod host_lock;
+pub mod read_ahead;
 pub mod workstation;
 
 /// A built plan against its invariants ([`Plan::violations`]): the plan

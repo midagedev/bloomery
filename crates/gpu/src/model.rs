@@ -498,7 +498,10 @@ pub struct LoadTimes {
     /// The architecture's derived weights.
     pub derive: Duration,
     /// The plan's host set: its r8 source, and the populate walk and the
-    /// lock when the load ran them.
+    /// lock when the load ran them. The walk runs on a helper beside the
+    /// context, the upload and the derived weights, so this is the wall the
+    /// load waited for it after them, not the walk's own (the populate's
+    /// record has that).
     pub host_set: Duration,
     /// The body over the weights: the residency glue when the load runs a
     /// machine, the caches, the ring shadows, the chain pieces, the host
@@ -2312,16 +2315,30 @@ pub trait PartsLoad: Send {
 /// The steps of a placed load before its body: the plan's card and context
 /// budget, the card, the host's memory against the plan's host need, the
 /// card's weights (`bytes`': the file's, or a part source's) with `derive`'s
-/// filings, and — after the uploads, so the
-/// card's file bytes have left the page cache first — the plan's host set
-/// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
-/// bytes) beside it and `known`'s runs known, neither read in nor locked nor
-/// counted ([`HostResidency::at_load_with`]). The pieces, and the host set.
-/// Every placed load passes
-/// here, so the refusals before any upload are made once: the need hook's
-/// (`BLOOMERY_NEED_HOOK`, first, before the load's own open of the card), a plan's card
-/// that is not one visible device ([`Gpu::open_card`]), and a
-/// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
+/// filings, and the plan's host set read in and locked as `host` asks, with
+/// `extra`'s runs (of `extra`'s bytes) beside it and `known`'s runs known,
+/// neither read in nor locked nor counted ([`HostResidency::at_load_with`]).
+/// The pieces, and the host set.
+///
+/// What waits for what. The refusals that need no read come first and alone —
+/// the need hook's (`BLOOMERY_NEED_HOOK`), a plan's card that is not one
+/// visible device ([`Gpu::resolve_card`]) and a host whose `MemAvailable` is
+/// under the plan's need ([`HostNeed`]) — and the host's reading is taken
+/// before anything starts reading, so the host set's pages do not move it.
+/// Then the host set's walk (its r8 source, the populate, the lock) starts on
+/// a helper, beside the card's context and module load, the weights' upload
+/// and `derive`: the drive and the driver's JIT do not share a resource, and
+/// the upload's reads of the card segments and the walk's reads of the host
+/// segments are different bytes of one drive. The upload releases a card
+/// segment's pages as it stages it (whole pages inside the segment only), so
+/// it never drops a page of the host set. The body needs the host set, so the
+/// helper is joined before it, and the time that join waits is the load's
+/// `host_set` phase. A failure of the card side ends the load only once the
+/// walk has ended too: the walk has no cancel. A plan whose host set also
+/// holds experts of card segments (`extra`, the residency machine's churn
+/// pool) reads them in and locks them where the upload releases the card
+/// segments' pages, so that load keeps the old order: the walk after the
+/// upload and derive.
 #[allow(
     clippy::too_many_arguments,
     reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, and the derive (rust-quality R8)"
@@ -2351,9 +2368,7 @@ fn placed_pre(
     // The hook answers before the load opens its card or reads a byte in: a
     // broker that refuses the load holds nothing of the load's.
     need_hook::consult().map_err(|e| GpuError::plan(what, e))?;
-    let t = Instant::now();
-    let gpu = Gpu::open_card(&spec.name, spec.device)?;
-    let context = t.elapsed();
+    let ordinal = Gpu::resolve_card(&spec.name, spec.device)?;
     let reading = workstation::host_available_read().map_err(|e| GpuError::plan(what, e))?;
     // A plan with an arena may find the host short of its need by less than
     // the arena's room above its floor: the tier is then built over what
@@ -2372,23 +2387,42 @@ fn placed_pre(
     let grant = need
         .grant(&reading, least)
         .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
-    let t = Instant::now();
-    let mut weights = match bytes {
-        CardBytes::File => {
-            Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?
-        }
-        CardBytes::Parts(parts) => {
-            parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?
-        }
+    let walk = || HostResidency::at_load_with(file, plan, |_| true, host, extra, known);
+    let card_side = || -> Result<(Gpu, Weights, [Duration; 3]), GpuError> {
+        let t = Instant::now();
+        let gpu = Gpu::with_device(ordinal)?;
+        let context = t.elapsed();
+        let t = Instant::now();
+        let mut weights = match bytes {
+            CardBytes::File => {
+                Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?
+            }
+            CardBytes::Parts(parts) => {
+                parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?
+            }
+        };
+        let upload = t.elapsed();
+        let t = Instant::now();
+        derive(gpu.stream(), file, layers.clone(), &mut weights)?;
+        Ok((gpu, weights, [context, upload, t.elapsed()]))
     };
-    let upload = t.elapsed();
-    let t = Instant::now();
-    derive(gpu.stream(), file, layers.clone(), &mut weights)?;
-    let derived = t.elapsed();
-    let t = Instant::now();
-    let residency =
-        HostResidency::at_load_with(file, plan, |_| true, host, extra, known)?.with_arena(grant);
-    let host_set = t.elapsed();
+    // `extra` is experts of card segments the host set also reads in and may
+    // lock: their pages lie inside the segments the upload releases, so a walk
+    // beside the upload would lock a page the release is dropping. With none,
+    // the host set and the card segments share no whole page.
+    let (card_side, host_side, host_set) = if extra.is_empty() {
+        let (card, host, waited) = beside(what, walk, card_side)?;
+        (card, Some(host), waited)
+    } else {
+        let card = card_side();
+        let t = Instant::now();
+        let host = card.is_ok().then(walk);
+        (card, host, t.elapsed())
+    };
+    let (gpu, weights, [context, upload, derived]) = card_side?;
+    let residency = host_side
+        .ok_or_else(|| GpuError::shape(what, "the host set's walk did not run"))??
+        .with_arena(grant);
     Ok((
         PlacedPre {
             gpu,
@@ -2408,6 +2442,35 @@ fn placed_pre(
         },
         residency,
     ))
+}
+
+/// Run `background` on a helper thread beside `foreground` on this one, and
+/// join the helper whichever way `foreground` went: both results, and how long
+/// the join waited after `foreground` returned. The helper floats off the
+/// caller's cpu mask (`threads::helper::float_caller`), as a binary pins its
+/// load thread to one cpu. A panic on the helper is the caller's; a helper that
+/// cannot start is `what`'s error and `foreground` does not run.
+fn beside<A, B: Send>(
+    what: &'static str,
+    background: impl FnOnce() -> Result<B, GpuError> + Send,
+    foreground: impl FnOnce() -> A,
+) -> Result<(A, Result<B, GpuError>, Duration), GpuError> {
+    std::thread::scope(|scope| {
+        let helper = std::thread::Builder::new()
+            .name("load-beside".to_owned())
+            .spawn_scoped(scope, move || {
+                threads::helper::float_caller().map_err(|e| GpuError::plan(what, e))?;
+                background()
+            })
+            .map_err(|e| GpuError::plan(what, format!("a load helper did not spawn: {e}")))?;
+        let done = foreground();
+        let t = Instant::now();
+        let background = match helper.join() {
+            Ok(background) => background,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        Ok((done, background, t.elapsed()))
+    })
 }
 
 /// Refused by name, as `what`'s, when the load's scratch, `made` device
@@ -2892,7 +2955,9 @@ impl<B: Instrumented> Engine for GpuModel<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{refuse_partial_folder, refuse_reserve_past};
+    use super::{beside, refuse_partial_folder, refuse_reserve_past};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     /// Buffers at the plan's reserve pass; one byte past it is refused by name with both figures
     /// and what the buffers are. Mutant: the comparison read `>=`, or reversed.
@@ -2980,5 +3045,37 @@ mod tests {
                 .to_string();
             assert!(e.contains(want), "{e}");
         }
+    }
+    /// The background of a load runs while its foreground does: the foreground waits for a
+    /// flag only the background sets, so a load that ran them one after the other would time
+    /// the wait out. Both results come back, the foreground's first. Mutant: `beside` runs
+    /// the foreground before it starts the helper.
+    #[test]
+    fn the_host_set_walk_runs_beside_the_card_side() {
+        let started = AtomicBool::new(false);
+        let (seen, background, waited) = beside(
+            "beside",
+            || {
+                started.store(true, Ordering::SeqCst);
+                Ok(7u32)
+            },
+            || {
+                let until = Instant::now() + Duration::from_secs(10);
+                while !started.load(Ordering::SeqCst) {
+                    if Instant::now() >= until {
+                        return false;
+                    }
+                    std::thread::yield_now();
+                }
+                true
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            seen,
+            "the background had not started while the foreground ran"
+        );
+        assert_eq!(background.unwrap_or_else(|e| panic!("{e}")), 7);
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
     }
 }
