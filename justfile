@@ -1613,7 +1613,7 @@ gate-gpu-clef-hidden:
 # GGUF twin: ours on the twin against mainline's logits rows (`just dump-logits-qwen38nv`) within the bands the oracle's own CPU
 # floor gives, and ours on the folder equal bit for bit to ours on the twin. The gate lock; no lease.
 gate-gpu-qwen38d:
-    BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
+    BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
 
 # The dense Nanbeige4.3-33B generation gate (llama, bartowski's Q4_K_M, either card, both tiers): the same clauses as
 # gate-gpu-qwen38d over the Body35 chain on a trunk of attention layers alone (52 layers of 56/8 heads of 128, NORM rope, no head

@@ -33,6 +33,22 @@ mod qwen35_open;
 mod q35_clauses;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/folder.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate opens a dense Qwen3.8 folder alone: the checked open is what it reads"
+)]
+mod folder;
+
+#[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/qwen3_folder.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate takes the model at a path, not the seat's open"
+)]
+mod qwen3_folder;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/dense_e2e.rs"]
 mod dense_e2e;
 
@@ -115,8 +131,10 @@ mod gate {
 #[cfg(feature = "gpu")]
 mod nv {
     use super::dense_e2e::{norms, rows_of};
+    use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, checks_failed, data_dir, kld, quantile, ref_model_path, verdict,
@@ -233,9 +251,14 @@ mod nv {
         super::qwen35_open::open_options(path, options(), &|_| {}).map(|(m, _)| m)
     }
 
+    /// The checkpoint folder at `path` on the card `open_options` would take, through the one folder open
+    /// (`serve_seats/qwen3_folder.rs`). The cut fits any card the twin fits, so no whole-fit probe runs first.
     fn load_folder(path: &Path) -> Result<Qwen35moeModel, GateError> {
-        // R4 provides: the whole-card open of a checkpoint folder, as `open_options` is of a GGUF file.
-        super::qwen35_open::open_dense_folder(path, options()).map(|(m, _)| m)
+        let model = super::qwen3_folder::model_at(path)?;
+        let census = bloomery_gpu_gates::gpu_census::census()?;
+        let card = Place::A.on(&census)?.card_specs()?[0];
+        let gpu = Gpu::open_card(card.name, card.device)?;
+        Ok(Qwen35moeModel::open(gpu, model, options())?)
     }
 
     /// `path` loaded by `load` on the card and run over both sets' prompts and forced ids from a `reset`; the model is gone
