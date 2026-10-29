@@ -1323,8 +1323,20 @@ mod gate {
         let f16_cache = cache_term(&f16_log, same_n)?;
         let q8_cache = cache_term(&same_log, same_n)?;
         let plane_drop = f16_cache.saturating_sub(q8_cache);
+        // PIN(2026-10-30): each plane is allocated whole granules, so at a context that is no
+        // power of two the drop is the granule-rounded planes' difference, not the raw
+        // ceiling: f16 two planes of 2b bytes, q8_0 two of codes b and two of scales b/16, b
+        // the K or V values of a layer (kv_heads x n x head_dim). The default context became
+        // a 1024-step (cd84d529f); at 226304 on Qwen3-30B the clause was red at 153 MiB under
+        // the ceiling, which this term equals.
+        let g = GRANULE.get();
+        let b = kv_heads * same_n * head_dim;
+        let granule_drop = layers
+            * (2 * (2 * b).next_multiple_of(g)
+                - 2 * b.next_multiple_of(g)
+                - 2 * (b / 16).next_multiple_of(g));
         let planes_held = match split.architecture() {
-            Some("qwen3moe") => plane_drop == ceiling,
+            Some("qwen3moe") => plane_drop == granule_drop,
             _ => plane_drop > 0 && plane_drop <= ceiling,
         };
         let f16_split = routed_split(&record::Log::of(&f16_log, record::BLOOMERY_SERVE_QWEN3))?;
