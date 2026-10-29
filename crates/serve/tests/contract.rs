@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-mod common;
+#[path = "common/process.rs"]
+mod process;
 
-use common::Reaped;
+use process::Reaped;
 
 const MOCK: &str = env!("CARGO_BIN_EXE_bloomery-serve");
 
