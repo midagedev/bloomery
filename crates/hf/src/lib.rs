@@ -263,6 +263,13 @@ impl Entry {
     }
 }
 
+/// Whether `rev` is a commit (a git sha-1, 40 hex digits): a revision whose files never change,
+/// where a branch or a tag may move.
+#[must_use]
+pub fn is_commit(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn hex_of(v: Option<&Value>, len: usize) -> Option<String> {
     let s = v?.as_str()?;
     (s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
@@ -1119,5 +1126,23 @@ mod tests {
             Some("https://huggingface.co/api/models/a/b/tree/main?recursive=true&cursor=xyz")
         );
         assert_eq!(next_link("HTTP/2 200\r\ncontent-type: x\r\n"), None);
+    }
+
+    /// A commit is 40 hex digits; a branch, a tag or a short sha may move or be ambiguous.
+    #[test]
+    fn only_a_full_sha_is_a_commit() {
+        assert!(is_commit("766911a6b7369840a91dbcd95f9f997acaab6cd6"));
+        assert!(is_commit("766911A6B7369840A91DBCD95F9F997ACAAB6CD6"));
+        for not in [
+            "main",
+            "refs/pr/1",
+            "766911a",
+            "",
+            "766911a6b7369840a91dbcd95f9f997acaab6cd",
+            "766911a6b7369840a91dbcd95f9f997acaab6cd66",
+            "g66911a6b7369840a91dbcd95f9f997acaab6cd6",
+        ] {
+            assert!(!is_commit(not), "{not:?}");
+        }
     }
 }

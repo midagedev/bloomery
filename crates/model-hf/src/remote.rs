@@ -8,12 +8,17 @@
 //! hand, then written at the front of a file extended to the listing's size. The file is
 //! held to the listing: a header whose tensors end past that size, or more than an alignment
 //! before it, is [`RemoteError::Size`]. [`sparse_set`] does that for each file of a listed
-//! set through the hf crate's client, the one HTTP path.
+//! set through the hf crate's client, the one HTTP path. The files of a set are read up to
+//! [`PARALLEL`] at a time, and a revision that is a commit leaves its sparse files in place for the
+//! next read: a header already there at the listed size, which opens as the listing says, is not
+//! read again.
 
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use gguf::{Gguf, LoadError};
 use hf::fetch::Client;
@@ -27,7 +32,8 @@ pub const FIRST_RANGE: u64 = 4 << 20;
 pub const MAX_HEADER: u64 = 256 << 20;
 
 /// Reads `len` bytes of a remote file from byte `from`, exactly.
-pub type ReadRange<'a> = dyn FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error>> + 'a;
+pub type ReadRange<'a> =
+    dyn FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + 'a;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -40,7 +46,7 @@ pub enum RemoteError {
         file: String,
         from: u64,
         len: u64,
-        source: Box<dyn Error>,
+        source: Box<dyn Error + Send + Sync>,
     },
     #[error("{file}: a range of {len} bytes at {from} came back as {got} bytes")]
     ShortRead {
@@ -245,9 +251,100 @@ fn check_size(dest: &Path, file: &str, size: u64) -> Result<(), RemoteError> {
     Ok(())
 }
 
+/// The most files of a set whose headers are read at once.
+pub const PARALLEL: usize = 8;
+
+/// `work(i)` for each `i` below `n`, up to [`PARALLEL`] at a time, and `done(i, &answer)` as each
+/// answer is complete, in the order of `i`. The answers in that order, or the first error in it:
+/// once one is in hand no new `work` starts, and the ones running end first.
+fn each<T: Send>(
+    n: usize,
+    work: &(dyn Fn(usize) -> Result<T, RemoteError> + Sync),
+    done: &mut dyn FnMut(usize, &T),
+) -> Result<Vec<T>, RemoteError> {
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<(usize, Result<T, RemoteError>)>();
+    let mut waiting: Vec<Option<Result<T, RemoteError>>> = (0..n).map(|_| None).collect();
+    let mut answers: Vec<T> = Vec::with_capacity(n);
+    let mut failed: Option<RemoteError> = None;
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL.min(n) {
+            let tx = tx.clone();
+            let (next, stop) = (&next, &stop);
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let answer = work(i);
+                    if answer.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if tx.send((i, answer)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for (i, answer) in rx {
+            waiting[i] = Some(answer);
+            while failed.is_none()
+                && let Some(answer) = waiting.get_mut(answers.len()).and_then(Option::take)
+            {
+                match answer {
+                    Ok(v) => {
+                        done(answers.len(), &v);
+                        answers.push(v);
+                    }
+                    Err(e) => failed = Some(e),
+                }
+            }
+        }
+    });
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(answers),
+    }
+}
+
+/// Whether `dest` is the sparse file an earlier read of a `size`-byte file left: a read writes the
+/// header, then extends the file to the listed size, so a file of that size is one whole read.
+fn left_whole(dest: &Path, size: u64) -> bool {
+    fs::metadata(dest).is_ok_and(|m| m.len() == size)
+}
+
+/// [`sparse_shard`], or the header an earlier read of the file left at `dest` when `reuse` is set
+/// and that header is still the listing's: its file is `size` bytes and its tensors end where
+/// the listing says. The answer then reads no range.
+fn sparse_shard_or_kept(
+    dest: &Path,
+    file: &str,
+    size: u64,
+    reuse: bool,
+    read: &mut ReadRange<'_>,
+) -> Result<HeaderStat, RemoteError> {
+    if reuse
+        && left_whole(dest, size)
+        && check_size(dest, file, size).is_ok()
+        && let Ok(g) = Gguf::open(dest)
+    {
+        return Ok(HeaderStat {
+            header: g.data_base().min(size),
+            reads: 0,
+        });
+    }
+    sparse_shard(dest, file, size, FIRST_RANGE, read)
+}
+
 /// Each of `files` (entries of `repo`'s listing at revision `rev`) as a sparse file named by
 /// its own file name under `dir`: the header read by range through `client`, the data region
-/// a hole. Calls `progress` after each file. The paths, in `files`' order.
+/// a hole. The files are read up to [`PARALLEL`] at a time. Where `rev` is a commit, a file an
+/// earlier read left whole in `dir` is kept ([`sparse_shard_or_kept`]); a branch or a tag may move,
+/// so it is read again. Calls `progress` after each file, in the order of `files`. The paths, in
+/// `files`' order.
 pub fn sparse_set(
     client: &Client,
     repo: &str,
@@ -257,19 +354,20 @@ pub fn sparse_set(
     progress: &mut dyn FnMut(&Entry, &HeaderStat),
 ) -> Result<Vec<PathBuf>, RemoteError> {
     fs::create_dir_all(dir).map_err(|e| io_err(dir, "create the header directory", e))?;
-    files
-        .iter()
-        .map(|e| {
-            let dest = dir.join(e.name());
-            let stat = sparse_shard(&dest, &e.path, e.size, FIRST_RANGE, &mut |from, len| {
+    let reuse = hf::is_commit(rev);
+    each(
+        files.len(),
+        &|i| {
+            let e = &files[i];
+            sparse_shard_or_kept(&dir.join(e.name()), &e.path, e.size, reuse, &mut |from, len| {
                 client
                     .fetch_range(repo, rev, &e.path, from, len)
                     .map_err(Into::into)
-            })?;
-            progress(e, &stat);
-            Ok(dest)
-        })
-        .collect()
+            })
+        },
+        &mut |i, stat| progress(&files[i], stat),
+    )?;
+    Ok(files.iter().map(|e| dir.join(e.name())).collect())
 }
 
 /// The directory under the cache `root` that holds the header-only copies of `repo` at `rev`: a
@@ -368,7 +466,9 @@ pub fn whole_file(
 /// A checkpoint folder's `files` (entries of `repo`'s listing at revision `rev`, its top-level
 /// files: [`hf::checkpoint_files`]) as a header-only copy in `dir`: each shard's header read by
 /// range into a sparse file of the listed size ([`sparse_safetensors`]), every other file whole.
-/// Calls `progress` after each file. `dir`, which a folder reader opens as the folder.
+/// The files are read up to [`PARALLEL`] at a time, and where `rev` is a commit a file an earlier
+/// read left whole in `dir` is kept. Calls `progress` after each file, in the order of `files`.
+/// `dir`, which a folder reader opens as the folder.
 pub fn sparse_checkpoint(
     client: &Client,
     repo: &str,
@@ -378,20 +478,28 @@ pub fn sparse_checkpoint(
     progress: &mut dyn FnMut(&Entry),
 ) -> Result<PathBuf, RemoteError> {
     fs::create_dir_all(dir).map_err(|e| io_err(dir, "create the header folder", e))?;
-    for e in files {
-        let dest = dir.join(e.name());
-        let mut read = |from: u64, len: u64| -> Result<Vec<u8>, Box<dyn Error>> {
-            client
-                .fetch_range(repo, rev, &e.path, from, len)
-                .map_err(Into::into)
-        };
-        if e.path.ends_with(".safetensors") {
-            sparse_safetensors(&dest, &e.path, e.size, &mut read)?;
-        } else {
-            whole_file(&dest, &e.path, e.size, &mut read)?;
-        }
-        progress(e);
-    }
+    let reuse = hf::is_commit(rev);
+    each(
+        files.len(),
+        &|i| {
+            let e = &files[i];
+            let dest = dir.join(e.name());
+            if reuse && left_whole(&dest, e.size) {
+                return Ok(());
+            }
+            let mut read = |from: u64, len: u64| -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+                client
+                    .fetch_range(repo, rev, &e.path, from, len)
+                    .map_err(Into::into)
+            };
+            if e.path.ends_with(".safetensors") {
+                sparse_safetensors(&dest, &e.path, e.size, &mut read).map(drop)
+            } else {
+                whole_file(&dest, &e.path, e.size, &mut read)
+            }
+        },
+        &mut |i, _| progress(&files[i]),
+    )?;
     Ok(dir.to_path_buf())
 }
 
@@ -469,7 +577,7 @@ mod tests {
     fn reader<'a>(
         file: &'a [u8],
         log: &'a RefCell<Vec<(u64, u64)>>,
-    ) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error>> + 'a {
+    ) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + 'a {
         move |from, len| {
             log.borrow_mut().push((from, len));
             let end = from.checked_add(len).filter(|&e| e <= file.len() as u64);
@@ -617,6 +725,87 @@ mod tests {
         let real = gguf::Gguf::open(d.join("m-00002-of-00002.gguf")).expect("shard");
         assert_eq!(real.mapping().len() as u64, files[1].len() as u64);
         assert!(real.data(info).expect("data").iter().all(|&b| b == 0));
+    }
+
+    /// A header an earlier read left whole at a commit is kept: the second read makes no request.
+    /// A branch may move, so it is read again; a file left short of the listed size is read again
+    /// too.
+    #[test]
+    fn a_header_left_whole_is_not_read_again() {
+        let d = scratch("kept");
+        let file = gguf_bytes(40, 3);
+        let size = file.len() as u64;
+        let dest = d.join("m.gguf");
+        let log = RefCell::new(Vec::new());
+        let read = |reuse: bool, size: u64, log: &RefCell<Vec<(u64, u64)>>| {
+            sparse_shard_or_kept(&dest, "m.gguf", size, reuse, &mut reader(&file, log))
+        };
+        let first = read(true, size, &log).expect("first read");
+        assert_eq!(first.reads, 1);
+        assert_eq!(log.borrow().len(), 1);
+        let again = read(true, size, &log).expect("kept");
+        assert_eq!((again.header, again.reads), (first.header, 0));
+        assert_eq!(log.borrow().len(), 1, "a kept header asks the hub nothing");
+        read(false, size, &log).expect("a branch is read again");
+        assert_eq!(log.borrow().len(), 2);
+        // A file that stopped short of the listed size is not a whole read.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&dest)
+            .and_then(|f| f.set_len(first.header))
+            .expect("cut");
+        read(true, size, &log).expect("a short file is read again");
+        assert_eq!(log.borrow().len(), 3);
+    }
+
+    /// Files are read in parallel, handed out in order, and the first failure in file order ends
+    /// the read: none starts after it, and the answers before it are still handed over.
+    #[test]
+    fn files_are_read_in_parallel_and_answered_in_order() {
+        use std::time::Duration;
+
+        let (running, widest) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let mut handed = Vec::new();
+        let got = each(
+            12,
+            &|i| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                widest.fetch_max(now, Ordering::SeqCst);
+                // The early files take longest: answers complete out of order.
+                std::thread::sleep(Duration::from_millis(60 - 4 * i as u64));
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(i * 10)
+            },
+            &mut |i, v: &usize| handed.push((i, *v)),
+        )
+        .expect("no failure");
+        assert_eq!(got, (0..12).map(|i| i * 10).collect::<Vec<_>>());
+        assert_eq!(handed, (0..12).map(|i| (i, i * 10)).collect::<Vec<_>>());
+        let widest = widest.load(Ordering::SeqCst);
+        assert!((2..=PARALLEL).contains(&widest), "widest {widest}");
+
+        let mut handed = Vec::new();
+        let failing = each(
+            6,
+            &|i| match i {
+                3 | 4 => Err(RemoteError::PastEnd {
+                    file: format!("f{i}"),
+                    size: 0,
+                }),
+                _ => Ok(i),
+            },
+            &mut |i, _: &usize| handed.push(i),
+        )
+        .expect_err("file 3 fails");
+        assert!(
+            matches!(&failing, RemoteError::PastEnd { file, .. } if file == "f3"),
+            "{failing:?}"
+        );
+        assert_eq!(handed, [0, 1, 2]);
+        assert_eq!(
+            each(0, &|_| Ok(0usize), &mut |_, _| {}).expect("empty"),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
@@ -817,7 +1006,7 @@ mod tests {
     }
 
     /// A reader over `bytes` that serves any range inside them.
-    fn slice_reader(bytes: &[u8]) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error>> + '_ {
+    fn slice_reader(bytes: &[u8]) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + '_ {
         move |from, len| {
             let (from, len) = (from as usize, len as usize);
             bytes

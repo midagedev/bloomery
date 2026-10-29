@@ -7,7 +7,10 @@
 //! is explicit-only, a row nobody has verified), and asks its caller for what only the machine can
 //! say: whether the repo holds the row and how much is left to download ([`Avail`]), and whether
 //! the seat's plan holds ([`Plan`]). The best-ranked row at the fastest placement tier wins: a plan
-//! the cards hold whole, then one that needs the host's memory, then one paged from NVMe.
+//! the cards hold whole, then one that needs the host's memory, then one paged from NVMe. Rows are
+//! asked in rank order, and a row that cannot beat the best plan in hand is not asked: after a
+//! plan the cards hold whole none can, after one that needs the host the rows too large for the
+//! cards alone cannot. Such a row costs no listing, no header and no plan.
 //!
 //! `tools/catalog.tsv` is [`print`]'s committed copy.
 
@@ -218,7 +221,7 @@ impl Model {
     }
 }
 
-/// Why a catalog target, or a pick over it, was refused.
+/// Why a catalog target was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("model {name:?} is not in the catalog; its models: {}", .names.join(", "))]
@@ -234,8 +237,6 @@ pub enum CatalogError {
     },
     #[error("{0:?}: a catalog target is NAME or NAME:VARIANT, each part non-empty")]
     Empty(String),
-    #[error("the probe answered {got} of the {asked} rows it was asked about")]
-    ProbeAnswers { asked: usize, got: usize },
 }
 
 /// Every model of the catalog.
@@ -300,11 +301,14 @@ impl fmt::Display for CatalogRef {
     }
 }
 
-/// What a pick reads of the machine: the card class that orders the formats and the room the
-/// download cache has.
+/// What a pick reads of the machine: the card class that orders the formats, the memory of its
+/// cards and the room the download cache has.
 #[derive(Clone, Copy, Debug)]
 pub struct Machine {
     pub class: CardClass,
+    /// The memory of every card together: a row whose files are larger than this cannot be held
+    /// by the cards alone ([`Tier::Cards`]).
+    pub card_bytes: u64,
     pub cache_free_bytes: u64,
 }
 
@@ -406,7 +410,8 @@ pub enum Reason {
     },
     /// The row holds, but only at this slower tier, while a lower-ranked row holds at a faster one.
     Slower(Tier),
-    /// A row of the same or a faster tier ranks above it.
+    /// A better-ranked row was picked, or ranks above it at the same or a faster tier. The row
+    /// below a pick is not asked about: it may or may not hold.
     RankedBelow,
 }
 
@@ -462,21 +467,18 @@ impl Outcome {
     }
 }
 
-/// What a probe answers for the rows it is given, one plan or refusal each, in their order.
-pub type Answers = Vec<Result<Plan, Refusal>>;
-
 /// The best-ranked row of `target`'s model that holds on `machine`, at the fastest tier that has
 /// one, and every other candidate with a reason. The candidates are the named variant alone, or
 /// every row of the model; a start that names no variant leaves out the explicit-only formats and
-/// the unverified rows. `avail` says what the listing and the cache hold of a row (asked of the
-/// rows that pass that filter), `probe` plans every surviving row at once, in rank order, and
-/// answers each in the same order.
+/// the unverified rows. The rows are asked in rank order: `avail` says what the listing and the
+/// cache hold of a row, `probe` plans it. A row that cannot beat the best plan in hand is not
+/// asked ([`ceiling`]) and is [`Reason::RankedBelow`].
 pub fn pick(
     target: &CatalogRef,
     machine: &Machine,
     avail: &mut dyn FnMut(&'static Row) -> Avail,
-    probe: &mut dyn FnMut(&[&'static Row]) -> Answers,
-) -> Result<Outcome, CatalogError> {
+    probe: &mut dyn FnMut(&'static Row) -> Result<Plan, Refusal>,
+) -> Outcome {
     let model = target.model;
     let named = target.variant.is_some();
     let mut order: Vec<&'static Row> = model
@@ -487,30 +489,33 @@ pub fn pick(
     order.sort_by_key(|row| (rank(machine.class, row), Reverse(row.bytes.unwrap_or(0))));
 
     let mut rejected: Vec<Rejected> = Vec::new();
-    let mut survivors: Vec<(&'static Row, u64)> = Vec::new();
-    for row in order {
-        match screen(row, named, machine, avail) {
-            Ok(download_bytes) => survivors.push((row, download_bytes)),
-            Err(why) => rejected.push(Rejected { row, why }),
-        }
-    }
-
-    let asked: Vec<&'static Row> = survivors.iter().map(|&(row, _)| row).collect();
-    let answers = if asked.is_empty() {
-        Vec::new()
-    } else {
-        probe(&asked)
-    };
-    if answers.len() != asked.len() {
-        return Err(CatalogError::ProbeAnswers {
-            asked: asked.len(),
-            got: answers.len(),
-        });
-    }
     let mut held: Vec<(&'static Row, u64, Plan)> = Vec::new();
-    for ((row, download_bytes), answer) in survivors.into_iter().zip(answers) {
-        match answer {
-            Ok(plan) => held.push((row, download_bytes, plan)),
+    let mut best: Option<Tier> = None;
+    for row in order {
+        if let Err(why) = policy(row, named) {
+            rejected.push(Rejected { row, why });
+            continue;
+        }
+        if best.is_some_and(|best| ceiling(row, machine) >= best) {
+            rejected.push(Rejected {
+                row,
+                why: Reason::RankedBelow,
+            });
+            continue;
+        }
+        let download_bytes = match screen(row, machine, avail) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                rejected.push(Rejected { row, why });
+                continue;
+            }
+        };
+        match probe(row) {
+            Ok(plan) => {
+                let tier = plan.tier();
+                best = Some(best.map_or(tier, |best| best.min(tier)));
+                held.push((row, download_bytes, plan));
+            }
             Err(refusal) => rejected.push(Rejected {
                 row,
                 why: Reason::Plan {
@@ -521,7 +526,8 @@ pub fn pick(
         }
     }
 
-    let best = held.iter().map(|(_, _, plan)| plan.tier()).min();
+    // `held` is in rank order: the first row at the fastest tier wins, the held rows above it are
+    // slower, and the ones below it rank below.
     let mut picked: Option<Picked> = None;
     for (row, download_bytes, plan) in held {
         let tier = plan.tier();
@@ -544,7 +550,18 @@ pub fn pick(
         }
     }
     rejected.sort_by_key(|r| model.rows.iter().position(|m| m.variant == r.row.variant));
-    Ok(Outcome { picked, rejected })
+    Outcome { picked, rejected }
+}
+
+/// The fastest tier `row` can reach on `machine` without asking anything: the cards unless its
+/// files are larger than all the cards' memory together, then the host's. A row of unknown size
+/// may reach the cards.
+fn ceiling(row: &Row, machine: &Machine) -> Tier {
+    if row.bytes.is_some_and(|bytes| bytes > machine.card_bytes) {
+        Tier::Host
+    } else {
+        Tier::Cards
+    }
 }
 
 /// The row's place in the class's order; a format the order does not hold ranks last.
@@ -555,21 +572,27 @@ fn rank(class: CardClass, row: &Row) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Whether a start may take `row` on its own: an explicit-only format and an unverified row only
+/// when the start names it.
+fn policy(row: &Row, named: bool) -> Result<(), Reason> {
+    if named {
+        return Ok(());
+    }
+    if !row.format.automatic() {
+        return Err(Reason::ExplicitOnly);
+    }
+    if !row.status.is_verified() {
+        return Err(Reason::Unverified);
+    }
+    Ok(())
+}
+
 /// The bytes still to fetch of a row that may be probed, or the reason it may not.
 fn screen(
     row: &'static Row,
-    named: bool,
     machine: &Machine,
     avail: &mut dyn FnMut(&'static Row) -> Avail,
 ) -> Result<u64, Reason> {
-    if !named {
-        if !row.format.automatic() {
-            return Err(Reason::ExplicitOnly);
-        }
-        if !row.status.is_verified() {
-            return Err(Reason::Unverified);
-        }
-    }
     match avail(row) {
         Avail::NotInRepo => Err(Reason::NotInRepo),
         Avail::OfflineUncached => Err(Reason::OfflineUncached),
@@ -847,6 +870,7 @@ mod tests {
         let target = CatalogRef::parse(target).unwrap_or_else(|e| panic!("{target}: {e}"));
         let machine = Machine {
             class,
+            card_bytes: ROOM,
             cache_free_bytes,
         };
         let mut probed: Vec<&'static str> = Vec::new();
@@ -859,20 +883,15 @@ mod tests {
                     .find(|(variant, _)| *variant == row.variant)
                     .map_or(Avail::Present { download_bytes: 0 }, |&(_, a)| a)
             },
-            &mut |rows| {
-                rows.iter()
-                    .map(|row| {
-                        probed.push(row.variant);
-                        answers
-                            .iter()
-                            .find(|(variant, _)| *variant == row.variant)
-                            .map(|(_, answer)| answer.clone())
-                            .unwrap_or_else(|| panic!("no probe answer for {}", row.variant))
-                    })
-                    .collect()
+            &mut |row| {
+                probed.push(row.variant);
+                answers
+                    .iter()
+                    .find(|(variant, _)| *variant == row.variant)
+                    .map(|(_, answer)| answer.clone())
+                    .unwrap_or_else(|| panic!("no probe answer for {}", row.variant))
             },
-        )
-        .expect("the probe answers every row");
+        );
         // Every candidate is picked or rejected, once, with its word.
         let candidates = target.variant.map_or(target.model.rows.len(), |_| 1);
         let mut seen: Vec<&str> = outcome.rejected.iter().map(|r| r.row.variant).collect();
@@ -936,8 +955,9 @@ mod tests {
         assert_eq!(o.least_need_bytes(), Some(102_300_000_000));
         assert_eq!(o.picked.as_ref().map(|p| p.plan.tier()), Some(Tier::Host));
 
-        // A row the cards hold whole beats a better-ranked one that needs the host.
-        let (o, _) = run(
+        // A row the cards hold whole beats a better-ranked one that needs the host, and ends the
+        // asking: the rows below it are not planned.
+        let (o, probed) = run(
             name,
             class,
             ROOM,
@@ -945,17 +965,45 @@ mod tests {
             &[
                 ("UD-Q4_K_XL", plan(Tier::Host)),
                 ("UD-Q3_K_XL", plan(Tier::Cards)),
-                ("fp4-local", no_fit(1)),
-                ("nvfp4", no_fit(1)),
             ],
         );
+        assert_eq!(probed, ["UD-Q4_K_XL", "UD-Q3_K_XL"]);
         assert_eq!(picked(&o), Some("UD-Q3_K_XL"));
         assert_eq!(
             rejected(&o),
             [
                 "UD-Q4_K_XL: host",
-                "nvfp4: plan:no-fit",
-                "fp4-local: plan:no-fit",
+                "nvfp4: ranked-below",
+                "fp4-local: ranked-below",
+                "Q8_0: explicit-only"
+            ]
+        );
+        // The best-ranked row the cards hold is the only one asked, and asks nothing of the repos
+        // of the rows below it.
+        let mut listed: Vec<&str> = Vec::new();
+        let target = CatalogRef::parse(name).expect("target");
+        let machine = Machine {
+            class,
+            card_bytes: ROOM,
+            cache_free_bytes: ROOM,
+        };
+        let o = pick(
+            &target,
+            &machine,
+            &mut |row| {
+                listed.push(row.variant);
+                Avail::Present { download_bytes: 0 }
+            },
+            &mut |_| plan(Tier::Cards),
+        );
+        assert_eq!(listed, ["UD-Q4_K_XL"]);
+        assert_eq!(picked(&o), Some("UD-Q4_K_XL"));
+        assert_eq!(
+            rejected(&o),
+            [
+                "UD-Q3_K_XL: ranked-below",
+                "nvfp4: ranked-below",
+                "fp4-local: ranked-below",
                 "Q8_0: explicit-only"
             ]
         );
@@ -1003,11 +1051,78 @@ mod tests {
         assert_eq!(o.least_need_bytes(), Some(18_556_686_752));
     }
 
+    /// A row is not asked once it cannot beat the best plan in hand: after a plan the host holds,
+    /// the rows whose files are larger than the cards' memory together (which cannot be held by the
+    /// cards alone); after a plan paged from NVMe, none (a row the host holds beats it).
+    #[test]
+    fn a_row_too_large_for_the_cards_is_not_asked_once_the_host_holds_one() {
+        let name = "qwen3.8-flash-next";
+        let target = CatalogRef::parse(name).expect("target");
+        let on = |card_bytes: u64, answers: &[(&str, Result<Plan, Refusal>)]| {
+            let machine = Machine {
+                class: CardClass::Ampere,
+                card_bytes,
+                cache_free_bytes: ROOM,
+            };
+            let mut asked: Vec<&str> = Vec::new();
+            let outcome = pick(
+                &target,
+                &machine,
+                &mut |_| Avail::Present { download_bytes: 0 },
+                &mut |row| {
+                    asked.push(row.variant);
+                    answers
+                        .iter()
+                        .find(|(variant, _)| *variant == row.variant)
+                        .map(|(_, answer)| answer.clone())
+                        .unwrap_or_else(|| panic!("no probe answer for {}", row.variant))
+                },
+            );
+            (outcome, asked)
+        };
+        // 48 GB of cards: every row is larger (the smallest, UD-Q3_K_XL, is 90 GB), so the first
+        // plan the host holds is the pick and nothing below it is asked.
+        let host = [("UD-Q4_K_XL", plan(Tier::Host))];
+        let (o, asked) = on(48_000_000_000, &host);
+        assert_eq!(asked, ["UD-Q4_K_XL"]);
+        assert_eq!(picked(&o), Some("UD-Q4_K_XL"));
+        assert_eq!(
+            rejected(&o),
+            [
+                "UD-Q3_K_XL: ranked-below",
+                "nvfp4: ranked-below",
+                "fp4-local: ranked-below",
+                "Q8_0: explicit-only"
+            ]
+        );
+        // 100 GB of cards: UD-Q3_K_XL (90 GB) may be held by them, so it is asked, and a plan the
+        // cards hold ends the asking.
+        let both = [
+            ("UD-Q4_K_XL", plan(Tier::Host)),
+            ("UD-Q3_K_XL", plan(Tier::Cards)),
+        ];
+        let (o, asked) = on(100_000_000_000, &both);
+        assert_eq!(asked, ["UD-Q4_K_XL", "UD-Q3_K_XL"]);
+        assert_eq!(picked(&o), Some("UD-Q3_K_XL"));
+        assert_eq!(rejected(&o)[0], "UD-Q4_K_XL: host");
+        // A plan paged from NVMe is beaten by any row the host holds: the rows are all asked, down
+        // to the first the host holds.
+        let paged = [
+            ("UD-Q4_K_XL", plan(Tier::Paged)),
+            ("UD-Q3_K_XL", plan(Tier::Host)),
+        ];
+        let (o, asked) = on(48_000_000_000, &paged);
+        assert_eq!(asked, ["UD-Q4_K_XL", "UD-Q3_K_XL"]);
+        assert_eq!(picked(&o), Some("UD-Q3_K_XL"));
+        assert_eq!(rejected(&o)[0], "UD-Q4_K_XL: paged");
+    }
+
     /// The card class orders the formats: an FP4 folder first where the build has native FP4
     /// products (a GB10, a discrete 12.0 card), after every GGUF where it has none.
     #[test]
     fn the_card_class_orders_the_formats() {
-        let both = [("Q4_K_M", plan(Tier::Cards)), ("nvfp4", plan(Tier::Cards))];
+        // Neither holds on the cards alone, so both are asked, in the class's order.
+        let both = [("Q4_K_M", plan(Tier::Host)), ("nvfp4", plan(Tier::Host))];
         for (class, first, probed) in [
             (CardClass::Gb10, "nvfp4", ["nvfp4", "Q4_K_M"]),
             (CardClass::Blackwell, "nvfp4", ["nvfp4", "Q4_K_M"]),
@@ -1099,23 +1214,6 @@ mod tests {
         );
         assert_eq!(probed, ["Q8_0"]);
         assert_eq!(picked(&o), Some("Q8_0"));
-    }
-
-    #[test]
-    fn a_probe_that_answers_the_wrong_number_of_rows_is_refused() {
-        let target = CatalogRef::parse("glm").expect("glm");
-        let machine = Machine {
-            class: CardClass::Ampere,
-            cache_free_bytes: ROOM,
-        };
-        let e = pick(
-            &target,
-            &machine,
-            &mut |_| Avail::Present { download_bytes: 0 },
-            &mut |_| Vec::new(),
-        )
-        .expect_err("no answers");
-        assert!(matches!(e, CatalogError::ProbeAnswers { asked: 1, got: 0 }));
     }
 
     /// A target is a model's name, alias or seat word and optionally one of its variants; an
