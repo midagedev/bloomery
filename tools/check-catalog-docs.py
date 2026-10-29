@@ -209,11 +209,17 @@ def exit_codes(text):
     body = re.search(r"codes!\s*\{(.*?)\n\}", text, re.S)
     if not body:
         raise Invalid(f"{EXIT_RS}: no `codes! {{ ... }}` table")
-    lit = r'"((?:[^"\\]|\\.)*)"'
+    lit = r'"((?:[^"\\]|\\[\s\S])*)"'
     rows = re.findall(rf"\b[A-Z]\w*\s*=\s*(\d+),\s*{lit},\s*{lit},\s*{lit};", body.group(1))
     if not rows:
         raise Invalid(f"{EXIT_RS}: the `codes!` table holds no row this tool reads")
-    return [(int(s), n, h, d) for s, n, h, d in rows]
+    return [(int(s), n, rust_str(h), rust_str(d)) for s, n, h, d in rows]
+
+
+def rust_str(body):
+    """The value of a Rust string literal's body as far as the table uses it: a backslash before a newline drops
+    the newline and the next line's leading whitespace, and an escaped quote or backslash is the character."""
+    return re.sub(r'\\(["\\])', r"\1", re.sub(r"\\\n\s*", "", body))
 
 
 def exit_problems(agents_text, exit_text):

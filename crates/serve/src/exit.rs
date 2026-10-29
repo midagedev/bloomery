@@ -61,10 +61,15 @@ macro_rules! codes {
 codes! {
     Ok = 0, "ok", "", "Success, an orderly stop, or a request that only prints.";
     Refused = 1, "refused", "read the message", "A refusal no other code names yet.";
-    Usage = 64, "usage", "run with --help; the message names the flag or value",
-        "A flag, a value, a name or a combination the server refuses.";
+    Usage = 64, "usage",
+        "run with --help; the message names the flag or value; for a model with no automatic row, \
+         `next` lists `--model NAME:VARIANT` for each row",
+        "A flag, a value, a name or a combination the server refuses; a model whose every row is \
+         unverified or explicit-only, started by its name alone.";
     Unsupported = 65, "unsupported", "run with --recommend --json for what this machine serves",
-        "A model or file no seat of the server serves.";
+        "A model or file no seat of the server serves, among them an `--embd-model` file of an \
+         architecture no side seat serves; a start by name whose every row the seat's plan refuses \
+         as unsupported.";
     NoModel = 66, "no-model",
         "name a model with --model, -m or --hf; the message lists what exists",
         "No model was named, or the one named is not there.";
