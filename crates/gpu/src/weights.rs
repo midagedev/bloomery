@@ -36,6 +36,10 @@ use std::ops::Range;
 pub use ::model::placement::HEAD_TENSOR;
 const EMBED_TENSOR: &str = "token_embd.weight";
 
+/// The card format a whole load gives a tensor, where a model's description picks one
+/// ([`ModelTensors::card_format`]); `None` keeps its type's own.
+pub(crate) type CardOf<'a> = &'a dyn Fn(&TensorInfo) -> Option<CardFormat>;
+
 fn file_format(t: &TensorInfo) -> Option<CardFormat> {
     ::model::placement::file_card_format(&t.name, t.ty, *t.dims.first()?)
 }
@@ -414,7 +418,7 @@ impl Weights {
         split: &Split,
         layers: Range<usize>,
         globals: bool,
-        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
+        card: CardOf<'_>,
     ) -> Result<Weights, GpuError> {
         let n_layers = split
             .arch_get_u64("block_count")
@@ -542,7 +546,7 @@ impl Weights {
         split: &Split,
         mut keep: impl FnMut(&str) -> bool,
         tied: bool,
-        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
+        card: CardOf<'_>,
     ) -> Result<Weights, GpuError> {
         stream.context().bind_to_thread()?;
         let mut by_name = BTreeMap::new();
