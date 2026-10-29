@@ -65,8 +65,8 @@ TARGETS = {
     # name, until `dense-logits.py identity <file>` has measured them and they are written here.
     "qwen38nv-twin": {
         "vocab": 248320,
-        "size": None,
-        "sha256": None,
+        "size": 4353225792,
+        "sha256": "58c869888d4d505cc7605213394c3148af75c468c3cfa08195deac3686c784c8",
         "repository": "nvidia/Qwen3.8-27B-NVFP4",
         "revision": "482ca0f3832238542f8f5295dde86b5f22711d80",
         "file": "qwen38nv-twin.gguf",
@@ -847,7 +847,7 @@ def self_test():
         target = {"size": 8, "sha256": digest(model)}
         before = immutable_model(model, target)
         model_unchanged(model, before)
-        assert target_identity(model) == target and unpinned(TARGETS["qwen38nv-twin"]) and not unpinned(target)
+        assert target_identity(model) == target and unpinned({"size": None, "sha256": None}) and not unpinned(target)
         for pinned_by_hand in ({"size": None, "sha256": "x"}, {"size": 8, "sha256": None}):
             try:
                 immutable_model(model, pinned_by_hand)
