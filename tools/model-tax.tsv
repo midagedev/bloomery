@@ -77,7 +77,7 @@ crates/gpu-gates/src/bin/generate.rs	deepseek	4	baseline T 4: case-table rows, t
 crates/gpu-gates/src/bin/generate.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/h2d_probe.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/probe_nvread.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/shared/dense_e2e.rs	qwen	16	PIN(2026-10-26) qwen: the dense e2e gate both Body35 dense families share opens the body through qwen35_open and names its model type Qwen35moeModel; a program-named body type and open path would remove them
+crates/gpu-gates/src/bin/shared/dense_e2e.rs	qwen	15	PIN(2026-10-26) qwen: the dense e2e gate both Body35 dense families share opens the body through qwen35_open and names its model type Qwen35moeModel; a program-named body type and open path would remove them
 crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
