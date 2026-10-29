@@ -145,7 +145,7 @@ mod agent {
     use serve::exit::{self, Code};
     use serve::{Listener, ServeError};
 
-    use super::{CtxNote, NeedNote, plan_json_asked, report};
+    use super::{CtxNote, NeedNote, Report, plan_json_asked, report};
     use crate::GateError;
     use crate::generate::{CtxDoesNotFit, FloorShort};
 
@@ -577,7 +577,9 @@ mod agent {
         fn the_early_listener_goes_to_the_seat_that_binds_its_address() {
             assert!(take_early("127.0.0.1", 1).expect("none bound").is_none());
             bind_early("127.0.0.1", 0).expect("bind");
-            let e = take_early("127.0.0.1", 9).expect_err("another port");
+            let Err(e) = take_early("127.0.0.1", 9) else {
+                panic!("another port is refused");
+            };
             assert!(e.to_string().contains("127.0.0.1:0"), "{e}");
             bind_early("127.0.0.1", 0).expect("bind");
             let l = take_early("127.0.0.1", 0).expect("same").expect("bound");
