@@ -24,7 +24,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 struct CtxNote {
     slot_ctx: u64,
     slots: u64,
-    total: u64,
     rule: &'static str,
     limit: u64,
 }
@@ -74,13 +73,12 @@ pub fn note_place(place: &str, why: &str) {
     report().place = Some((place.to_owned(), why.to_owned()));
 }
 
-/// The context a slot serves, the slots, their total, the rule that set it and the model's limit,
-/// as the `ctx` line prints them.
-pub fn note_ctx(slot_ctx: u64, slots: u64, total: u64, rule: &'static str, limit: u64) {
+/// The context a slot serves, the slots, the rule that set it and the model's limit, as the `ctx`
+/// line prints them.
+pub fn note_ctx(slot_ctx: u64, slots: u64, rule: &'static str, limit: u64) {
     report().ctx = Some(CtxNote {
         slot_ctx,
         slots,
-        total,
         rule,
         limit,
     });
@@ -208,7 +206,6 @@ mod agent {
         let CtxNote {
             slot_ctx,
             slots,
-            total: _,
             rule,
             limit,
         } = report
@@ -520,7 +517,6 @@ mod agent {
                 ctx: ctx.then_some(CtxNote {
                     slot_ctx: 8192,
                     slots: 2,
-                    total: 16384,
                     rule: "fitted",
                     limit: 32768,
                 }),

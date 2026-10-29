@@ -445,9 +445,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     /// `args` with every `--model V` pair taken out: the last pair's word and catalog model and
     /// the rest. `--model` with no value is refused by name.
-    fn take_model(
-        args: &[String],
-    ) -> Result<(Option<Word>, Option<CatalogRef>, Vec<String>), GateError> {
+    fn take_model(args: &[String]) -> Result<(Named, Vec<String>), GateError> {
         let mut named: Named = (None, None);
         let (selected, rest) = llama_launch::take_serve_args(args, &["--model"]);
         let mut it = selected.iter();
@@ -465,7 +463,7 @@ models (the --model word is optional with a model file: the file's architecture 
             })?;
             named = name_of(v)?;
         }
-        Ok((named.0, named.1, rest))
+        Ok((named, rest))
     }
 
     /// The model source parser receives model options without mistaking other values for flags.
@@ -680,7 +678,7 @@ models (the --model word is optional with a model file: the file's architecture 
         };
         let asked = |flag: &str| llama_launch::serve_option(&args, flag);
         start::set_plan_json(agent.json && asked("--plan"));
-        let (word, name, rest) = match take_model(&args) {
+        let ((word, name), rest) = match take_model(&args) {
             Ok(v) => v,
             Err(e) => return refuse(Code::Usage, e),
         };

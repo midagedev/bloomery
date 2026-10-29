@@ -230,7 +230,6 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
     crate::start::note_ctx(
         chosen.slot_ctx,
         chosen.slots as u64,
-        chosen.total,
         chosen.rule.word(),
         chosen.limit.positions,
     );

@@ -462,6 +462,9 @@ impl Outcome {
     }
 }
 
+/// What a probe answers for the rows it is given, one plan or refusal each, in their order.
+pub type Answers = Vec<Result<Plan, Refusal>>;
+
 /// The best-ranked row of `target`'s model that holds on `machine`, at the fastest tier that has
 /// one, and every other candidate with a reason. The candidates are the named variant alone, or
 /// every row of the model; a start that names no variant leaves out the explicit-only formats and
@@ -472,7 +475,7 @@ pub fn pick(
     target: &CatalogRef,
     machine: &Machine,
     avail: &mut dyn FnMut(&'static Row) -> Avail,
-    probe: &mut dyn FnMut(&[&'static Row]) -> Vec<Result<Plan, Refusal>>,
+    probe: &mut dyn FnMut(&[&'static Row]) -> Answers,
 ) -> Result<Outcome, CatalogError> {
     let model = target.model;
     let named = target.variant.is_some();
