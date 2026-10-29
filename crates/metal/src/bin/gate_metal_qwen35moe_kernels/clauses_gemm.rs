@@ -1252,19 +1252,8 @@ pub fn gemm_range(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// f32-row entry's bits, the faulted row's NaN among them. A path whose f16
 /// GEMMs do not read half rows gets its f32 rows back from the cast.
 pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
-    let same = |what: &str, want: &[f32], got: &[f32]| -> Result<(), String> {
-        match want
-            .iter()
-            .zip(got)
-            .position(|(w, g)| w.to_bits() != g.to_bits())
-        {
-            None => Ok(()),
-            Some(i) => Err(format!(
-                "{what}: element {i} is {:?} over the cast rows, {:?} over the f32 rows",
-                got[i], want[i]
-            )),
-        }
-    };
+    let same =
+        |what: &str, want: &[f32], got: &[f32]| super::clauses_rows::same_bits(what, got, want);
     h.clear_fault()?;
     let cases = a4_cases(h, mlx, sites)?;
     for case in &cases {

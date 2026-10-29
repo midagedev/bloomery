@@ -19,6 +19,8 @@ use bloomery_metal::kernels::{
 };
 use bloomery_metal::{MetalBuffer, MetalDevice};
 
+use super::clauses_experts::PairWeights;
+use super::clauses_rows::same_bits;
 use super::common::{self, BadArg, Edit, LAYER};
 use super::oracle;
 use super::synthetic;
@@ -212,13 +214,6 @@ fn seg(h: &Harness<'_>, quant: Quant, w: &[u8], input: Input<'_>) -> Result<Vec<
 
 /// The pair's weights: stacks of [`N_EXPERTS`] experts and, where the
 /// instance runs one, a shared expert, all of `quant`.
-struct PairWeights {
-    gate: Vec<u8>,
-    up: Vec<u8>,
-    shared_gate: Vec<u8>,
-    shared_up: Vec<u8>,
-}
-
 impl PairWeights {
     fn of(h: &Harness<'_>, quant: Quant, seed: u64) -> Self {
         let e = h.geom().experts;
@@ -337,22 +332,6 @@ fn head(
 fn gain(seed: u64) -> Vec<f32> {
     let mut rng = oracle::Rng::new(seed);
     (0..K).map(|_| 1.0 + 0.5 * rng.signed()).collect()
-}
-
-/// The first element two outputs differ at in their bits, named.
-fn same_bits(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
-    match got
-        .iter()
-        .zip(want)
-        .position(|(g, w)| g.to_bits() != w.to_bits())
-    {
-        None if got.len() == want.len() => Ok(()),
-        None => Err(format!("{what}: {} values, not {}", got.len(), want.len())),
-        Some(i) => Err(format!(
-            "{what}: element {i} is {:e}, not {:e}",
-            got[i], want[i]
-        )),
-    }
 }
 
 /// The join that hands on writes the stream's bits of `norm_add_rows` and,

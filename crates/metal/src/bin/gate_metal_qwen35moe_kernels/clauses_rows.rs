@@ -339,7 +339,7 @@ fn run_stepped(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
 }
 
 /// The first word of `got` that is not the bits of `want`, named.
-fn same_bits(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
+pub(super) fn same_bits(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
     if got.len() != want.len() {
         return Err(format!("{what}: {} words, not {}", got.len(), want.len()));
     }
