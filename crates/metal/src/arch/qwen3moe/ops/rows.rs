@@ -188,19 +188,28 @@ impl MetalOps<'_, '_> {
         )?;
         self.enc.memory_barrier();
         // The quantized projections' GEMMs read the normed rows cast once.
-        let x = self.kernels.gemm_x(
-            self.enc,
-            GemmXParams {
+        // A P1 of f32 projections only reads the f32 rows and casts nothing:
+        // a finite value past the half range is no fault there.
+        let x = if p1.parts.iter().any(|part| part.quant != Quant::F32) {
+            self.kernels.gemm_x(
+                self.enc,
+                GemmXParams {
+                    x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
+                    x_stride: *hidden,
+                    cols: *hidden,
+                    acts: m,
+                    operand: PASS_OPERAND,
+                    half: &mut rows.xh,
+                    fault: &faults[slot],
+                    layer: layer_word(l),
+                },
+            )?
+        } else {
+            crate::kernels::GemmX::F32 {
                 x: rows.xn.window(Elems(0), Elems(m * *hidden))?,
-                x_stride: *hidden,
-                cols: *hidden,
-                acts: m,
-                operand: PASS_OPERAND,
-                half: &mut rows.xh,
-                fault: &faults[slot],
-                layer: layer_word(l),
-            },
-        )?;
+                stride: *hidden,
+            }
+        };
         let stride = rows.proj_stride;
         let heads = geom.attn.query_heads;
         for part in &p1.parts {
