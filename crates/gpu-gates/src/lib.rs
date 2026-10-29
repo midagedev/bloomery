@@ -66,6 +66,8 @@ pub mod rounding;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;
 #[cfg(feature = "deepseek41")]
+pub mod seat_bin;
+#[cfg(feature = "deepseek41")]
 pub mod side_seat;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;

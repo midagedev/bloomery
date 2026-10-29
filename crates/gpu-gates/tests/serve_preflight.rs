@@ -264,12 +264,7 @@ fn refusal(
         .collect();
     let (dir, err, code) = startup_coded(name, bin, args, &env);
     if before_model {
-        let class = if unified(bin) {
-            Code::Usage
-        } else {
-            Code::Refused
-        };
-        assert_eq!(code, class, "{args:?} {alias:?}: {err}");
+        assert_eq!(code, Code::Usage, "{args:?} {alias:?}: {err}");
     }
     let message = if before_model {
         err.as_str()
@@ -314,12 +309,6 @@ fn error_event(out: &str, context: &str) -> (Value, usize) {
     (error.clone(), before.len())
 }
 
-/// Whether `bin` is the unified `bloomery-serve`, which speaks the exit table and the events. The stand-alone seat
-/// binaries (`bloomery-serve-ds41`, `bloomery-serve-qwen38`) still refuse with status 1 and a silent stdout.
-fn unified(bin: &str) -> bool {
-    bin == env!("CARGO_BIN_EXE_bloomery-serve")
-}
-
 /// `bin` with `args` and `env`, run in a fresh directory under an offline empty cache until it ends: the directory,
 /// the status and what it printed on stdout and stderr.
 fn run_start(
@@ -362,9 +351,10 @@ fn run_start(
 /// [`startup`], and the class the refusal ended in: the status the process left with, which its `error` event
 /// names with the code's own name.
 ///
-/// PIN(2026-10-29): a start of `bloomery-serve` that is refused ends with the status of its class (`serve::exit`)
-/// and an `error` event on stdout. It ended with status 1 and an empty stdout before the exit table and the
-/// events. A stand-alone seat binary keeps status 1 and the empty stdout (the class `refused`).
+/// PIN(2026-10-29): a start of `bloomery-serve`, `bloomery-serve-ds41` or `bloomery-serve-qwen38` that is refused ends
+/// with the status of its class (`serve::exit`) and an `error` event on stdout. It ended with status 1 and an empty
+/// stdout before the exit table and the events, and the two stand-alone seat binaries kept that until they took the
+/// contract (`bloomery_gpu_gates::seat_bin`); the branch on the binary is gone.
 fn startup_coded(
     name: &str,
     bin: &str,
@@ -373,11 +363,6 @@ fn startup_coded(
 ) -> (std::path::PathBuf, String, Code) {
     let (dir, status, out, err) = run_start(name, bin, args, env);
     let context = format!("{args:?} {env:?}: {err}");
-    if !unified(bin) {
-        assert_eq!(status.code(), Some(1), "{context}");
-        assert!(out.is_empty(), "{context}: {out}");
-        return (dir, err, Code::Refused);
-    }
     let (event, _) = error_event(&out, &context);
     let code = status
         .code()
@@ -914,8 +899,8 @@ fn clean_refusal(dir: &std::path::Path, err: &str, before_model: bool) {
         assert!(!err.contains("first start"), "{err}");
     }
     assert_eq!(std::fs::read_dir(dir.join("cache")).unwrap().count(), 0);
-    // Stdout holds the refusal's `error` event and nothing else (a stand-alone seat binary prints none): before
-    // the model nothing came earlier (the listener was not bound), and after it only the `bound` event did.
+    // Stdout holds the refusal's `error` event and nothing else: before the model nothing came earlier (the
+    // listener was not bound), and after it only the `bound` event did.
     let out = std::fs::read_to_string(dir.join("server.out")).unwrap();
     if !out.is_empty() {
         let (_, before) = error_event(&out, err);

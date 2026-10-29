@@ -2,41 +2,24 @@
 //! engine: [`ds41`]'s seat, whose module doc holds the contract (the flags,
 //! the records, the prompt cache and the exit codes). `bloomery-serve --model
 //! ds41` serves the same seat. llama-server's placement flags, their `LLAMA_ARG_*` variables and
-//! `--list-devices` are read as `bloomery-serve` reads them (`bloomery_gpu_gates::llama_launch`).
+//! `--list-devices` are read as `bloomery-serve` reads them (`bloomery_gpu_gates::llama_launch`), and
+//! its events and exit codes are `bloomery-serve`'s (`bloomery_gpu_gates::seat_bin`).
 
 #[cfg(feature = "deepseek41")]
 const NAME: &str = "bloomery-serve-ds41";
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
-    use bloomery_gpu_gates::llama_launch::{self, Launcher};
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if llama_launch::serve_option(&args, bloomery_gpu_gates::llama_place::LIST_DEVICES) {
-        match llama_launch::answer_list_devices(&args) {
-            Ok(true) => return std::process::ExitCode::SUCCESS,
-            Ok(false) => {}
-            Err(e) => return bloomery_gpu_gates::exit_with(NAME, Err(e)),
-        }
-    }
-    // llama-server's placement flags and variables, read once the seat's own flags are out.
-    let seat = || -> Result<&'static str, bloomery_gpu_gates::GateError> { Ok("ds41") };
-    let launcher = Launcher {
-        bin: NAME,
-        seat: &seat,
-        layers: &llama_launch::file_layers,
-        reads: llama_launch::SEAT,
-    };
-    let side = bloomery_gpu_gates::side_seat::Flags::take(&args);
-    match side.and_then(|(side, rest)| ds41::run(&launcher.placed(&rest)?, &side)) {
-        // EX_SOFTWARE: the engine, not the listener or the load, ended the run.
-        Ok(serve::ServeError::Engine(f)) => {
-            eprintln!("{NAME}: {f}");
-            std::process::ExitCode::from(70)
-        }
-        Ok(e) => bloomery_gpu_gates::exit_with(NAME, Err(e.into())),
-        Err(e) => bloomery_gpu_gates::exit_with(NAME, Err(e)),
-    }
+    // Before any x86-64-v3 code: `seat_bin::main` is not inlined, so `main` holds nothing but the
+    // two calls.
+    #[cfg(target_arch = "x86_64")]
+    serve::preflight::cpu_gate(NAME);
+    bloomery_gpu_gates::seat_bin::main(&bloomery_gpu_gates::seat_bin::Seat {
+        name: NAME,
+        word: "ds41",
+        check: |args, read_levers, from_repo| ds41::check(args, read_levers, from_repo).map(drop),
+        run: ds41::run,
+    })
 }
 
 #[cfg(feature = "deepseek41")]

@@ -124,7 +124,8 @@ pub fn noted_place() -> Option<String> {
 
 #[cfg(any(feature = "deepseek41", feature = "clef"))]
 pub use agent::{
-    Refusal, bind_early, class_of, exit_serve, plan_exit, plan_line, refusal_json, take_early,
+    Refusal, bind_early, class_of, driver_found, ended, exit_serve, plan_exit, plan_line,
+    refusal_json, take_early,
 };
 
 /// The agent-facing half, which the server crate's types and JSON need.
@@ -143,6 +144,7 @@ mod agent {
     use serde_json::{Value, json};
     use serve::event::{self, Event};
     use serve::exit::{self, Code};
+    use serve::preflight::Driver;
     use serve::{Listener, ServeError};
 
     use super::{CtxNote, NeedNote, Report, plan_json_asked, report};
@@ -391,6 +393,37 @@ mod agent {
             Code::Unsupported
         } else {
             Code::Refused
+        }
+    }
+
+    /// What the driver answers a start: its library's load as cuda-bindings loads it (`dyn_load`:
+    /// `libcuda.so.1`, then `libcuda.so`, and its `cuDriverGetVersion` refused as too old below the
+    /// CUDA major the build's toolkit is), read through that crate's own `cuda_driver_load_error`.
+    pub fn driver_found() -> Driver {
+        use cuda_core::sys;
+        match sys::cuda_driver_load_error() {
+            None => Driver::Loaded,
+            Some(sys::DynLoadError::RuntimeTooOld {
+                runtime_version, ..
+            }) => i32::try_from(*runtime_version).map_or_else(
+                |_| Driver::Missing(format!("a runtime version {runtime_version}")),
+                Driver::Version,
+            ),
+            Some(e) => Driver::Missing(e.to_string()),
+        }
+    }
+
+    /// The process's exit for a seat's end, the decide seat's and the generative seats' alike: the
+    /// engine ending the run is the class `engine`; any other end is a refusal no type names, the
+    /// class `refused` (an error that names its class keeps it).
+    pub fn ended(name: &str, r: Result<ServeError, GateError>) -> ExitCode {
+        match r {
+            Ok(ServeError::Engine(f)) => {
+                eprintln!("{name}: {f}");
+                exit::refused(Code::Engine, &f.to_string(), &[])
+            }
+            Ok(e) => exit_serve(name, Err(e.into()), Code::Refused, |_| Vec::new()),
+            Err(e) => exit_serve(name, Err(e), Code::Refused, |_| Vec::new()),
         }
     }
 

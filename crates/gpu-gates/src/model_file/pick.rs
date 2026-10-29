@@ -6,9 +6,10 @@
 //! row's header, in a child process of this binary that runs under the user's flags and
 //! environment and answers with one JSON line ([`hf::catalog::read_plan`]): a verified cached set
 //! is planned from its first shard, any other from a header-only copy of it under the cache's
-//! `headers` directory, which costs the header's bytes and not the download. The children run one
-//! after another: each reads the card's free bytes, and a sibling's context would be counted in
-//! them.
+//! `headers` directory, which costs the header's bytes and not the download. The rows are taken
+//! in rank order and a row that cannot beat the plan in hand is neither listed nor read
+//! ([`hf::catalog::pick`]). The children run one after another: each reads the card's free bytes,
+//! and a sibling's context would be counted in them.
 //!
 //! A listing the network refuses leaves the cache to stand in, as `--hf` does; any other failure
 //! of a listing ends the pick by name. A row whose header cannot be read or whose child gives no
@@ -254,7 +255,7 @@ fn run_plan(exe: &Path, header: &Path, flags: &[String]) -> Result<Plan, Refusal
 }
 
 /// Why a pick found no row, for the class of refusal it ends in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Why {
     /// No row of the model is in its repo.
     NotInRepo,
@@ -265,11 +266,20 @@ pub enum Why {
     /// The seat's plan refuses the rows that are there, or they are held only slower than
     /// nothing: the model does not fit as asked.
     NoFit,
+    /// The seat's plan refused every considered row for one reason that is a class of its own
+    /// (`unsupported`, `usage` or `lever`, as the plan's refusal names it): the start ends in that
+    /// class, not as a fit refusal.
+    PlanRefused(String),
+    /// Every row of the model is one a start by name never takes on its own (an explicit-only
+    /// format, a row nobody has verified), so none was asked about the machine: it fits or not,
+    /// nobody knows. A start that names a variant takes it.
+    NamedOnly,
 }
 
 /// The class of an outcome with no picked row: the one reason every rejection of a considered row
 /// shares when they share one, else [`Why::NoFit`]. A row the pick filtered by policy (an
-/// explicit-only format, an unverified row) was never a candidate, so it does not decide the class.
+/// explicit-only format, an unverified row) was never a candidate, so it does not decide the class;
+/// a model with no other row is [`Why::NamedOnly`], not a fit refusal.
 #[must_use]
 pub fn why_none(outcome: &Outcome) -> Why {
     use catalog::Reason;
@@ -279,6 +289,9 @@ pub fn why_none(outcome: &Outcome) -> Why {
         .map(|r| &r.why)
         .filter(|why| !matches!(why, Reason::ExplicitOnly | Reason::Unverified))
         .collect();
+    if considered.is_empty() && !outcome.rejected.is_empty() {
+        return Why::NamedOnly;
+    }
     let all =
         |want: fn(&Reason) -> bool| !considered.is_empty() && considered.iter().all(|r| want(r));
     if all(|why| matches!(why, Reason::NotInRepo)) {
@@ -287,9 +300,23 @@ pub fn why_none(outcome: &Outcome) -> Why {
         Why::Offline
     } else if all(|why| matches!(why, Reason::DiskShort)) {
         Why::DiskShort
+    } else if let Some(code) = shared_class(&considered) {
+        Why::PlanRefused(code)
     } else {
         Why::NoFit
     }
+}
+
+/// The plan refusal code every one of `whys` carries, when it is one of the classes a start can
+/// end in besides a fit refusal.
+fn shared_class(whys: &[&catalog::Reason]) -> Option<String> {
+    let mut codes = whys.iter().map(|why| match why {
+        catalog::Reason::Plan { code, .. } => Some(code.as_str()),
+        _ => None,
+    });
+    let first = codes.next()??;
+    (["unsupported", "usage", "lever"].contains(&first) && codes.all(|code| code == Some(first)))
+        .then(|| first.to_owned())
 }
 
 /// The pick of `ask`: the row that holds, and every other row with its reason
@@ -318,12 +345,10 @@ pub fn choose(ask: &Ask<'_>) -> Result<Outcome, GateError> {
             }
         }
     };
-    let mut probe = |rows: &[&'static Row]| -> Vec<Result<Plan, Refusal>> {
-        rows.iter()
-            .map(|&row| reader.borrow_mut().probe(row, &exe, ask.flags))
-            .collect()
+    let mut probe = |row: &'static Row| -> Result<Plan, Refusal> {
+        reader.borrow_mut().probe(row, &exe, ask.flags)
     };
-    let outcome = catalog::pick(ask.target, ask.machine, &mut avail, &mut probe)?;
+    let outcome = catalog::pick(ask.target, ask.machine, &mut avail, &mut probe);
     match reader.into_inner().failure {
         Some(e) => Err(e),
         None => Ok(outcome),
@@ -457,6 +482,21 @@ mod tests {
         );
         assert_eq!(why_none(&rejected(vec![plan("no-fit")])), Why::NoFit);
         assert_eq!(
+            why_none(&rejected(vec![plan("unsupported"), plan("unsupported")])),
+            Why::PlanRefused("unsupported".to_owned()),
+            "rows the seat refuses as unsupported end as that class"
+        );
+        assert_eq!(
+            why_none(&rejected(vec![plan("unsupported"), plan("no-fit")])),
+            Why::NoFit,
+            "a mixed set of refusals is a fit refusal"
+        );
+        assert_eq!(
+            why_none(&rejected(vec![plan("refused"), plan("refused")])),
+            Why::NoFit,
+            "an unnamed refusal is no class of its own"
+        );
+        assert_eq!(
             why_none(&rejected(vec![
                 Reason::OfflineUncached,
                 Reason::ExplicitOnly,
@@ -467,8 +507,8 @@ mod tests {
         );
         assert_eq!(
             why_none(&rejected(vec![Reason::ExplicitOnly, Reason::Unverified])),
-            Why::NoFit,
-            "rows none of which was a candidate are no class"
+            Why::NamedOnly,
+            "rows none of which was a candidate were not asked, so they did not fail to fit"
         );
     }
 

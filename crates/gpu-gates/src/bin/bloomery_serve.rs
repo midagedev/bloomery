@@ -185,7 +185,6 @@ mod drive {
     use bloomery_gpu_gates::{
         GateError, gpu_census, llama_launch, llama_place, model_file, ref_model_path,
     };
-    use cuda_core::sys;
     use gguf::Split;
     use hf::catalog::{self, CatalogError, CatalogRef, Outcome};
     use model::arch::{Arch, DEEPSEEK4};
@@ -193,9 +192,8 @@ mod drive {
     use serve::ServeError;
     use serve::decide::Ask;
     use serve::event::{self, Event};
-    use serve::exit::{self, Code};
+    use serve::exit::Code;
     use serve::listener::{Phase, Progress};
-    use serve::preflight::Driver;
 
     use crate::serve_seats::{
         decide, ds41, flint, glm, mimo2, minimaxm3, musespark, nemotron, qwen3, qwen38, raon1,
@@ -638,24 +636,6 @@ models (the --model word is optional with a model file: the file's architecture 
         Ok((from, rest))
     }
 
-    /// What the driver answers a start: its library's load as cuda-bindings
-    /// loads it (`dyn_load`: `libcuda.so.1`, then `libcuda.so`, and its
-    /// `cuDriverGetVersion` refused as too old below the CUDA major the
-    /// build's toolkit is), read through that crate's own
-    /// `cuda_driver_load_error`.
-    fn driver_found() -> Driver {
-        match sys::cuda_driver_load_error() {
-            None => Driver::Loaded,
-            Some(sys::DynLoadError::RuntimeTooOld {
-                runtime_version, ..
-            }) => i32::try_from(*runtime_version).map_or_else(
-                |_| Driver::Missing(format!("a runtime version {runtime_version}")),
-                Driver::Version,
-            ),
-            Some(e) => Driver::Missing(e.to_string()),
-        }
-    }
-
     #[inline(never)]
     pub fn run() -> ExitCode {
         event::enable();
@@ -729,7 +709,7 @@ models (the --model word is optional with a model file: the file's architecture 
             return refuse(Code::Usage, e);
         }
         // A driver that cannot run the CUDA 13 code ends the start before any download.
-        if let Err(e) = serve::preflight::driver(&driver_found()) {
+        if let Err(e) = serve::preflight::driver(&start::driver_found()) {
             return refuse(Code::NoDevice, e.into());
         }
         if llama_launch::serve_option(&args, llama_place::LIST_DEVICES) {
@@ -755,6 +735,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Ok(_) => None,
             Err(e) => return refuse(Code::Usage, e.into()),
         };
+        let asked_as = by_name.as_ref().map(|target| target.model.name);
         // The listener comes up before the pick and the fetch, so a port that is taken is found
         // first and a client sees the start at once; a run that ends before it serves binds none.
         let serves =
@@ -826,7 +807,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Err(e) => return refuse(Code::Usage, e),
             };
             start::note_seat(serve::decide::WORD);
-            return ended(decide::run(&rest, from, repo.as_deref()));
+            return start::ended(NAME, decide::run(&rest, from, repo.as_deref()));
         }
         let seat = match seat_of_file(word) {
             Ok(v) => v,
@@ -851,7 +832,20 @@ models (the --model word is optional with a model file: the file's architecture 
             Err(e) => return refuse(Code::Usage, e),
         };
         let (run, _) = entries(seat);
-        ended(run(&rest, &side))
+        start::ended(NAME, run(&served_as(rest, asked_as), &side))
+    }
+
+    /// The arguments of a start by name, serving the catalog name it asked by: `--alias NAME`
+    /// joins them, since the served name is the file's `general.name`, which a repo's maker may
+    /// have left as anything (NVIDIA's Nemotron file says `Hf`). An alias the start gave stays:
+    /// the flag, `-a` and `LLAMA_ARG_ALIAS` are all `--alias` once the launcher has read them.
+    fn served_as(mut rest: Vec<String>, name: Option<&str>) -> Vec<String> {
+        if let Some(name) = name
+            && !llama_launch::serve_option(&rest, "--alias")
+        {
+            rest.extend(["--alias".to_owned(), name.to_owned()]);
+        }
+        rest
     }
 
     /// Ends the start with `e`: its stderr lines, its `error` event and the status of its class
@@ -924,10 +918,12 @@ models (the --model word is optional with a model file: the file's architecture 
             })
         }
 
-        /// What the catalog's pick reads of it.
+        /// What the catalog's pick reads of it: the class, the cards' memory together and the
+        /// cache's room.
         fn for_pick(&self) -> catalog::Machine {
             catalog::Machine {
                 class: self.class,
+                card_bytes: self.census.iter().map(|d| d.total_bytes).sum(),
                 cache_free_bytes: self.cache_free,
             }
         }
@@ -1011,7 +1007,7 @@ models (the --model word is optional with a model file: the file's architecture 
     /// `--recommend`: the pick of every catalog model (or of the one `--model` names), under the
     /// user's flags, printed; the exit is 0 whether or not a model fits (each entry says).
     fn recommend(agent: &Agent, name: Option<CatalogRef>, flags: &[String]) -> ExitCode {
-        if let Err(e) = serve::preflight::driver(&driver_found()) {
+        if let Err(e) = serve::preflight::driver(&start::driver_found()) {
             return refuse(Code::NoDevice, e.into());
         }
         let machine = match Machine::read() {
@@ -1106,7 +1102,8 @@ models (the --model word is optional with a model file: the file's architecture 
     /// start named that does not fit, the next smaller one.
     fn no_pick(target: &CatalogRef, outcome: &Outcome, machine: &Machine) -> ExitCode {
         use model_file::pick::{Why, why_none};
-        let (code, what) = match why_none(outcome) {
+        let why = why_none(outcome);
+        let (code, what) = match why {
             Why::NotInRepo => (Code::NoModel, "no row of the model is in its repo"),
             Why::Offline => (
                 Code::Network,
@@ -1119,6 +1116,17 @@ models (the --model word is optional with a model file: the file's architecture 
             Why::NoFit => (
                 Code::NoFit,
                 "no row of the model fits this machine as asked",
+            ),
+            Why::PlanRefused(ref word) => (
+                Code::from_name(word).unwrap_or(Code::NoFit),
+                "the seat's plan refuses every row of the model, and the refusal is not a lack \
+                 of room",
+            ),
+            Why::NamedOnly => (
+                Code::Usage,
+                "no row of the model starts on its name alone: each is explicit-only or \
+                 unverified, so none was planned on this machine; start one by naming its \
+                 variant (--model NAME:VARIANT)",
             ),
         };
         let reasons: Vec<String> = outcome
@@ -1135,6 +1143,12 @@ models (the --model word is optional with a model file: the file's architecture 
             code,
             format!("{target}: {what}{need}; {}", reasons.join("; ")),
         );
+        if why == Why::NamedOnly {
+            for rejected in &outcome.rejected {
+                let named = format!("{}:{}", target.model.name, rejected.row.variant);
+                refusal = refusal.offering(&["--model", &named]);
+            }
+        }
         if code == Code::NoFit
             && let Some(variant) = target.variant
             && let Some(row) = target.model.row(variant)
@@ -1314,26 +1328,35 @@ models (the --model word is optional with a model file: the file's architecture 
         }
     }
 
-    /// The process's exit for a seat's end, the decide seat's and the
-    /// generative seats' alike.
-    fn ended(r: Result<ServeError, GateError>) -> ExitCode {
-        match r {
-            // EX_SOFTWARE: the engine, not the listener or the load, ended the run.
-            Ok(ServeError::Engine(f)) => {
-                eprintln!("{NAME}: {f}");
-                exit::refused(Code::Engine, &f.to_string(), &[])
-            }
-            Ok(e) => refuse(Code::Refused, e.into()),
-            Err(e) => refuse(Code::Refused, e),
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
 
         fn line(s: &str) -> Vec<String> {
             s.split_whitespace().map(str::to_owned).collect()
+        }
+
+        /// A start by name serves the catalog name it was asked by; an alias the start gave, as the
+        /// flag or through the variable the launcher has already read, and a start that named no
+        /// catalog model, are left as they are.
+        #[test]
+        fn a_start_by_name_serves_the_name_it_was_asked_by() {
+            let rest = line("--host 127.0.0.1 --port 0");
+            assert_eq!(
+                served_as(rest.clone(), Some("nemotron-3-nano-4b")),
+                line("--host 127.0.0.1 --port 0 --alias nemotron-3-nano-4b")
+            );
+            for given in ["--alias mine --port 0", "--port 0 --alias mine"] {
+                let given = line(given);
+                assert_eq!(served_as(given.clone(), Some("glm-5.3-flash")), given);
+            }
+            assert_eq!(served_as(rest.clone(), None), rest);
+            // A value that spells `--alias` is the value of another flag, not an alias.
+            let value = line("--api-key --alias");
+            assert_eq!(
+                served_as(value, Some("glm-5.3-flash")),
+                line("--api-key --alias --alias glm-5.3-flash")
+            );
         }
 
         #[test]
