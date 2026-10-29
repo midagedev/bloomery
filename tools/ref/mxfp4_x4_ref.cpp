@@ -12,9 +12,11 @@
 // (:2451-2454) — the Q5_0 template with ScaleHelperQ_0_1_MXFP4<12> and the unsigned code
 // table.
 //
-// The GGUF is argv[1]: build-qdot-ref.sh passes the V4-Flash first data shard, whose first
-// MXFP4 tensor is blk.0.ffn_down_exps.weight (k = 2048, 16 whole x4 groups, no tail). The
-// column is the first k = 2048 f32 of the attn_norm-0 dump — token 0.
+// The GGUF is argv[1]: build-qdot-ref.sh passes BLOOMERY_MXFP4_MODEL, by default the V4.1
+// DSpark draft's tl37 file, whose first MXFP4 tensor is blk.0.ffn_gate_exps.weight (k = 5120,
+// 40 whole x4 groups, no tail). The column is the first k = 5120 f32 of the attn_norm-0 dump
+// (two and a half tokens' worth of that 2048-per-token dump: the real value distribution, not
+// a token-aligned column).
 #include "ggml.h"
 #include "ggml-backend.h"
 

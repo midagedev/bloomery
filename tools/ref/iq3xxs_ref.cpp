@@ -12,10 +12,11 @@
 // iqk_quantize_row_q8_K, iqk_quantize.cpp:3941): 296-byte block_q8_K {d, sum, qs[256],
 // bsums[16]}, the layout the Rust side reads.
 //
-// The GGUF is argv[1]: build-qdot-ref.sh passes the V4-Flash first data shard, whose first
-// IQ3_XXS tensor is blk.0.ffn_gate_exps.weight (k = 4096). The column is the first k = 4096
-// f32 of the attn_norm-0 dump the other harnesses read (two tokens' worth of that
-// 2048-per-token dump: the real value distribution, not a token-aligned column).
+// The GGUF is argv[1]: build-qdot-ref.sh passes BLOOMERY_IQ3XXS_MODEL, by default the Qwen3.8
+// UD-Q3_K_XL second shard, whose first IQ3_XXS tensor is blk.0.ffn_gate_exps.weight (k = 2560).
+// The column is the first k = 2560 f32 of the attn_norm-0 dump the other harnesses read (one
+// and a quarter tokens' worth of that 2048-per-token dump: the real value distribution, not a
+// token-aligned column).
 #include "ggml.h"
 #include "ggml-backend.h"
 

@@ -21,11 +21,14 @@
 # reads the file named by BLOOMERY_Q5K_MODEL (default: the V4.1 first shard,
 # which holds blk.0.ffn_down_exps.weight — the reference model has no Q5_K
 # tensor), and also dumps ggml's to_float of that tensor's first rows
-# (q5k-v41-dequant.raw/.meta) for gate-qdot's dequant test. iq3xxs_ref and
-# mxfp4_x4_ref read the file named by BLOOMERY_V4_MODEL (default: the V4-Flash
-# first data shard, whose first IQ3_XXS and MXFP4 tensors are
-# blk.0.ffn_gate_exps.weight and blk.0.ffn_down_exps.weight; gate-qdot reads the
-# same variable with the same default). iq4nl_ref reads the file named by
+# (q5k-v41-dequant.raw/.meta) for gate-qdot's dequant test. iq3xxs_ref reads the
+# file named by BLOOMERY_IQ3XXS_MODEL (default: the Qwen3.8 UD-Q3_K_XL second
+# shard, whose first IQ3_XXS tensor is blk.0.ffn_gate_exps.weight, k = 2560) and
+# mxfp4_x4_ref the file named by BLOOMERY_MXFP4_MODEL (default: the V4.1 DSpark
+# draft's tl37 file, whose first MXFP4 tensor is blk.0.ffn_gate_exps.weight,
+# k = 5120); gate-qdot reads the same variables with the same defaults.
+# BLOOMERY_V4_MODEL, which named one file for both, is refused when set (exit 64).
+# iq4nl_ref reads the file named by
 # BLOOMERY_QWEN_Q4_MODEL (default: the Qwen3.8 UD-Q4_K_XL second shard, whose
 # first IQ4_NL tensor is per_layer_token_embd.weight) and iq4xs_ref the file
 # named by BLOOMERY_QWEN_Q3_MODEL (default: the Qwen3.8 UD-Q3_K_XL second shard,
@@ -65,6 +68,11 @@
 # visible; -mavx2 -mfma -mf16c is the ISA those kernels are written for (a
 # build without them does not compile).
 set -euo pipefail
+# The retired name is refused by name, with any value, before anything is built.
+if [ -n "${BLOOMERY_V4_MODEL+x}" ]; then
+  echo "build-qdot-ref: BLOOMERY_V4_MODEL is retired: name the IQ3_XXS file with BLOOMERY_IQ3XXS_MODEL and the MXFP4 file with BLOOMERY_MXFP4_MODEL" >&2
+  exit 64
+fi
 if [ "${1:-}" = --self-test ]; then
   set +e
   t=$(mktemp -d "${TMPDIR:-/tmp}/build-qdot-ref-test.XXXXXX") || exit 70
@@ -75,12 +83,13 @@ if [ "${1:-}" = --self-test ]; then
     echo "build-qdot-ref self-test FAIL $1: got '$2', want '$3'" >&2
     bad=$((bad + 1))
   }
-  # A g++ that writes an executable no-op at its -o path: the selection is what the run built, no ik.
+  # A g++ that writes an executable at its -o path, which records its arguments beside itself: the selection
+  # is what the run built and the files each dumper was handed, no ik.
   mkdir "$t/stub"
   cat > "$t/stub/g++" << 'EOF'
 #!/bin/sh
 while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done
-printf '#!/bin/sh\n' > "$out"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "$0.args"\n' > "$out"
 chmod +x "$out"
 EOF
   chmod +x "$t/stub/g++"
@@ -89,7 +98,7 @@ EOF
     rm -rf "${t:?}/bin" "${t:?}/data"
     PATH=$t/stub:$PATH BLOOMERY_V41_MODEL=x BLOOMERY_DATA=$t/data Q3K_OUT=$t/bin bash "${BASH_SOURCE[0]}" "$@" > "$t/out" 2>&1
     RC=$?
-    BUILT=$(find "$t/bin" -type f -exec basename {} \; 2> /dev/null | sort | tr '\n' ' ')
+    BUILT=$(find "$t/bin" -type f ! -name '*.args' -exec basename {} \; 2> /dev/null | sort | tr '\n' ' ')
   }
   run q4k_x4_ref
   check one-rc "$RC" 0
@@ -106,6 +115,21 @@ EOF
   run q4k_x4_ref bogus
   check late-bad-rc "$RC" 64
   check late-bad-built "$BUILT" ''
+  # A type's file is its own variable: swapped, the IQ3_XXS harness would read the MXFP4 file.
+  BLOOMERY_IQ3XXS_MODEL=/x/iq3.gguf BLOOMERY_MXFP4_MODEL=/x/mx.gguf run iq3xxs_ref mxfp4_x4_ref
+  check files-rc "$RC" 0
+  check files-built "$BUILT" 'iq3xxs_ref mxfp4_x4_ref '
+  check iq3xxs-file "$(cat "$t/bin/iq3xxs_ref.args" 2> /dev/null)" /x/iq3.gguf
+  check mxfp4-file "$(cat "$t/bin/mxfp4_x4_ref.args" 2> /dev/null)" /x/mx.gguf
+  # The retired one-file name is refused by name, whatever its value, before anything is built.
+  for v in x ''; do
+    export BLOOMERY_V4_MODEL=$v
+    run q4k_x4_ref
+    unset BLOOMERY_V4_MODEL
+    check "retired-rc '$v'" "$RC" 64
+    check "retired-built '$v'" "$BUILT" ''
+    check "retired-names '$v'" "$(grep -c 'BLOOMERY_IQ3XXS_MODEL.*BLOOMERY_MXFP4_MODEL' "$t/out")" 1
+  done
   echo "build-qdot-ref self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
   [ "$bad" = 0 ]
   exit
@@ -117,7 +141,8 @@ OUT=${Q3K_OUT:-$REF_BIN}
 # BLOOMERY_Q5K_MODEL names another.
 Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-${BLOOMERY_V41_MODEL:?BLOOMERY_V41_MODEL unset — run through tools/box.sh, which exports it from the deepseek41 profile}}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
-V4_MODEL=${BLOOMERY_V4_MODEL:-/models/DeepSeek-V4-Flash-0731-UD-Q3_K_M/DeepSeek-V4-Flash-0731-UD-Q3_K_M-00002-of-00004.gguf}
+IQ3XXS_MODEL=${BLOOMERY_IQ3XXS_MODEL:-/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
+MXFP4_MODEL=${BLOOMERY_MXFP4_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 QWEN_Q4_MODEL=${BLOOMERY_QWEN_Q4_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf}
 QWEN_Q3_MODEL=${BLOOMERY_QWEN_Q3_MODEL:-/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
 GLM_Q2_IQ2XS_MODEL=${GLM_Q2_IQ2XS_MODEL:-/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf}
@@ -156,7 +181,8 @@ for name in $DUMPERS; do
   want "$name" || continue
   case $name in
     q5k_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$Q5K_MODEL" ;;
-    iq3xxs_ref|mxfp4_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$V4_MODEL" ;;
+    iq3xxs_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$IQ3XXS_MODEL" ;;
+    mxfp4_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$MXFP4_MODEL" ;;
     iq4nl_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$QWEN_Q4_MODEL" ;;
     iq2xs_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$GLM_Q2_IQ2XS_MODEL" ;;
     q2k_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$GLM_Q2_Q2K_MODEL" ;;

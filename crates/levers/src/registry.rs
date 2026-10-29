@@ -1740,6 +1740,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          runner's own when unset.",
     ),
     path(
+        "BLOOMERY_IQ3XXS_MODEL",
+        Some("ref/build-qdot-ref.sh"),
+        "The file IQ3_XXS's qdot harness and gate read, the Qwen3.8 UD-Q3_K_XL second shard when unset.",
+    ),
+    path(
         "BLOOMERY_KLD_FILE",
         None,
         "A KLD base file the KLD gate judges instead of its set's \
@@ -1801,6 +1806,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Mac side, the tool profile a box command runs under (`tools/ref/models/`), which \
          `tools/box.sh` reads and does not export; on the box, the model crate's test \
          harnesses read it as a model file's path.",
+    ),
+    path(
+        "BLOOMERY_MXFP4_MODEL",
+        Some("ref/build-qdot-ref.sh"),
+        "The file MXFP4's qdot harness and gate read, the V4.1 DSpark draft's tl37 file when unset.",
     ),
     path(
         "BLOOMERY_NCU_BIN",
@@ -1927,7 +1937,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     path(
         "BLOOMERY_V4_MODEL",
         Some("ref/build-qdot-ref.sh"),
-        "The V4-Flash shard the MXFP4 qdot harnesses and gates read.",
+        "Was the one file IQ3_XXS's and MXFP4's qdot harnesses and gates read; the harness \
+         script and the gate refuse it when set, and `BLOOMERY_IQ3XXS_MODEL` and \
+         `BLOOMERY_MXFP4_MODEL` name a file each.",
     ),
     path(
         "BLOOMERY_VISION_SET",

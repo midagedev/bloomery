@@ -1293,10 +1293,11 @@ fn hw_q5k_dequant_matches_ggml() {
 }
 
 // ------------------------------------------- IQ3_XXS x Q8_K and MXFP4 x Q8_2_X4
-// The V4-Flash routed-expert formats. The reference model carries neither; the V4-Flash
-// file's first data shard holds blk.0.ffn_gate_exps.weight (IQ3_XXS, k = 4096) and
-// blk.0.ffn_down_exps.weight (MXFP4, k = 2048). Its tensors are found through the
-// header-only inventory and their rows read at `data_base + offset`, as the Q5_K case does.
+// The routed-expert formats of Qwen3.8-Flash-Next (IQ3_XXS) and V4.1 (MXFP4). The reference
+// model carries neither, so each type reads the first aligned tensor of a file of its own
+// ([`model_file`]): IQ3_XXS the UD-Q3_K_XL second shard's blk.0.ffn_gate_exps.weight (k = 2560),
+// MXFP4 the DSpark draft's blk.0.ffn_gate_exps.weight (k = 5120). A tensor is found through the
+// header-only inventory and its rows read at `data_base + offset`, as the Q5_K case does.
 // Gate A: the AVX2 kernel equals its mirror bit for bit on the tensor's first rows. Gate B:
 // on ik's own column the kernel is within 1 ULP of ik's kernel on all 64 dumped rows
 // (tools/ref/iq3xxs_ref.cpp, tools/ref/mxfp4_x4_ref.cpp). MXFP4 also carries gate 0, the
@@ -1304,19 +1305,32 @@ fn hw_q5k_dequant_matches_ggml() {
 // from the unsigned max (d > 0 always) where ours mirrors ggml's signed-extreme reference,
 // so the bytes differ while the products agree.
 
-/// The V4-Flash shard the two gates and their harnesses read; `BLOOMERY_V4_MODEL`
-/// overrides it (tools/ref/build-qdot-ref.sh reads the same variable, same default).
-fn v4_model() -> String {
-    std::env::var("BLOOMERY_V4_MODEL").unwrap_or_else(|_| {
-        "/models/DeepSeek-V4-Flash-0731-UD-Q3_K_M/DeepSeek-V4-Flash-0731-UD-Q3_K_M-00002-of-00004.gguf"
-            .into()
-    })
+/// The file `ty`'s gates and harness read: `BLOOMERY_IQ3XXS_MODEL` or `BLOOMERY_MXFP4_MODEL`
+/// overrides the default (tools/ref/build-qdot-ref.sh reads the same variables, same
+/// defaults). `BLOOMERY_V4_MODEL`, which named one file for both types, is refused when set.
+fn model_file(ty: GgmlType) -> String {
+    assert!(
+        std::env::var_os("BLOOMERY_V4_MODEL").is_none(),
+        "BLOOMERY_V4_MODEL is retired: name the IQ3_XXS file with BLOOMERY_IQ3XXS_MODEL and the \
+         MXFP4 file with BLOOMERY_MXFP4_MODEL"
+    );
+    match ty {
+        GgmlType::IQ3_XXS => std::env::var("BLOOMERY_IQ3XXS_MODEL").unwrap_or_else(|_| {
+            "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf"
+                .into()
+        }),
+        GgmlType::MXFP4 => std::env::var("BLOOMERY_MXFP4_MODEL").unwrap_or_else(|_| {
+            "/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf"
+                .into()
+        }),
+        _ => panic!("no file case for {ty:?}"),
+    }
 }
 
-/// The first `ty` tensor of the V4-Flash shard with an aligned k — the scan its
-/// harness does — with its first rows and the column `quantize_col` codes from
-/// the first k values of the attn_norm-0 dump (the column the harness codes).
-struct V4Case {
+/// The first `ty` tensor of [`model_file`] with an aligned k — the scan its harness
+/// does — with its first rows and the column `quantize_col` codes from the first k
+/// values of the attn_norm-0 dump (the column the harness codes).
+struct FileCase {
     ty: GgmlType,
     name: String,
     k: usize,
@@ -1325,15 +1339,15 @@ struct V4Case {
     acol: Vec<u8>,
 }
 
-impl V4Case {
-    fn load(ty: GgmlType, rows: usize) -> V4Case {
+impl FileCase {
+    fn load(ty: GgmlType, rows: usize) -> FileCase {
         use std::os::unix::fs::FileExt;
         let (gran, block): (usize, usize) = match ty {
             GgmlType::IQ3_XXS => (256, 98),
             GgmlType::MXFP4 => (32, 17),
-            _ => panic!("no V4 case for {ty:?}"),
+            _ => panic!("no file case for {ty:?}"),
         };
-        let path = v4_model();
+        let path = model_file(ty);
         let inv = gguf::inventory_of(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let t = inv
             .tensors
@@ -1356,7 +1370,7 @@ impl V4Case {
         let xs = oracle_f32("attn_norm-0", 2048 * 6)[..k].to_vec();
         let mut acol = vec![0u8; col_bytes(ty, k)];
         quantize_col(ty, &xs, &mut acol);
-        V4Case {
+        FileCase {
             ty,
             name: t.name.clone(),
             k,
@@ -1443,19 +1457,19 @@ impl V4Case {
     }
 }
 
-/// IQ3_XXS gate A: kernel vs mirror on the V4-Flash gate stack.
+/// IQ3_XXS gate A: kernel vs mirror on the first aligned IQ3_XXS tensor.
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+#[ignore = "hw: needs the box, the Qwen3.8 UD-Q3_K_XL shard and $BLOOMERY_DATA/ref"]
 fn hw_iq3xxs_kernel_matches_mirror() {
-    V4Case::load(GgmlType::IQ3_XXS, ROWS).gate_a();
+    FileCase::load(GgmlType::IQ3_XXS, ROWS).gate_a();
 }
 
 /// IQ3_XXS gate B: within 1 ULP of ik's `mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3XXS, 1>`.
 #[test]
-#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+#[ignore = "hw: needs the box, the Qwen3.8 UD-Q3_K_XL shard and $BLOOMERY_DATA/ref"]
 fn hw_iq3xxs_kernel_predicts_ik() {
-    V4Case::load(GgmlType::IQ3_XXS, 64).gate_b(
+    FileCase::load(GgmlType::IQ3_XXS, 64).gate_b(
         "iq3xxs-ik-dot.txt",
         "mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3XXS, 1>",
     );
@@ -1463,9 +1477,9 @@ fn hw_iq3xxs_kernel_predicts_ik() {
 
 /// MXFP4 gate 0: `quantize_col` codes the column byte for byte as ik's `quantize_row_q8_2_x4`.
 #[test]
-#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+#[ignore = "hw: needs the box, the DSpark draft file and $BLOOMERY_DATA/ref"]
 fn hw_mxfp4_encoder_matches_ik() {
-    let c = V4Case::load(GgmlType::MXFP4, 1);
+    let c = FileCase::load(GgmlType::MXFP4, 1);
     let (ik_acol, _) = c.ik_dump("mxfp4-x4-ik-dot.txt");
     for (i, (a, b)) in ik_acol.iter().zip(&c.acol).enumerate() {
         assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
@@ -1478,19 +1492,19 @@ fn hw_mxfp4_encoder_matches_ik() {
     );
 }
 
-/// MXFP4 gate A: kernel vs mirror on the V4-Flash down stack.
+/// MXFP4 gate A: kernel vs mirror on the first aligned MXFP4 tensor.
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+#[ignore = "hw: needs the box, the DSpark draft file and $BLOOMERY_DATA/ref"]
 fn hw_mxfp4_kernel_matches_mirror() {
-    V4Case::load(GgmlType::MXFP4, ROWS).gate_a();
+    FileCase::load(GgmlType::MXFP4, ROWS).gate_a();
 }
 
 /// MXFP4 gate B: within 1 ULP of ik's `mul_mat_qX_1_q8_2_T<MXFP4_Unpacker, 1>`.
 #[test]
-#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+#[ignore = "hw: needs the box, the DSpark draft file and $BLOOMERY_DATA/ref"]
 fn hw_mxfp4_kernel_predicts_ik() {
-    V4Case::load(GgmlType::MXFP4, 64).gate_b(
+    FileCase::load(GgmlType::MXFP4, 64).gate_b(
         "mxfp4-x4-ik-dot.txt",
         "mul_mat_qX_1_q8_2_T<MXFP4_Unpacker, 1>",
     );

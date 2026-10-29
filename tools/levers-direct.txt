@@ -78,7 +78,7 @@ crates/model/tests/prompts.rs	BLOOMERY_MODEL,BLOOMERY_DATA	stays: the model file
 crates/model/tests/qwen3moe_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens
 crates/model/tests/musespark_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens
 crates/model/tests/union.rs	BLOOMERY_MODEL	stays: the model file the harness opens
-crates/qdot/tests/qdot.rs	BLOOMERY_MODEL,BLOOMERY_DATA,BLOOMERY_Q5K_MODEL,BLOOMERY_V4_MODEL,BLOOMERY_QDOT_AVX512	stays: the model files and the data directory, and the Q4_K body the AVX-512 gate expects q4k_avx512 to pick
+crates/qdot/tests/qdot.rs	BLOOMERY_MODEL,BLOOMERY_DATA,BLOOMERY_Q5K_MODEL,BLOOMERY_IQ3XXS_MODEL,BLOOMERY_MXFP4_MODEL,BLOOMERY_V4_MODEL,BLOOMERY_QDOT_AVX512	stays: the model files and the data directory, and the Q4_K body the AVX-512 gate expects q4k_avx512 to pick
 crates/qdot/tests/quant_rows.rs	QUANT_ONLY	stays: the quant gate's row filter (`just gate-quant TYPE`, a ggml type name); it is no BLOOMERY_* lever
 crates/metal/build.rs	OUT_DIR,CARGO_MANIFEST_DIR	stays: cargo's build-script directories (the output directory the kernels' source is written to and the crate directory it is read from)
 crates/gpu/build.rs	CUDA_OXIDE_TARGET	stays: cargo-oxide's build target, which selects the native NVFP4 module at compile time
