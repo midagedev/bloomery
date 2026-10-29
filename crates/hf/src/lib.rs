@@ -8,10 +8,11 @@
 //! the files named exactly ([`exact`]), the MTP draft by its file name
 //! ([`mtp_draft`]), a model's image-projector sibling ([`mmproj_sibling`]),
 //! the cache paths ([`cache_root`],
-//! [`cache_path`]), where a model file comes from ([`source`]) and what a
-//! model card says ([`card`]). The network part, [`fetch`], is `curl`, the
-//! checks of what it wrote, and the cache standing in when the network
-//! refuses the listing.
+//! [`cache_path`]), where a model file comes from ([`source`]), the models
+//! bloomery starts by name and the rule that picks a file for a machine
+//! ([`catalog`]) and what a model card says ([`card`]). The network part,
+//! [`fetch`], is `curl`, the checks of what it wrote, and the cache standing
+//! in when the network refuses the listing.
 //!
 //! The picking follows llama.cpp's `common/download.cpp`: a split set
 //! (`-00001-of-0000N.gguf`) is one set by its prefix and count, and the
@@ -34,6 +35,7 @@
 //! runtime's shape); [`schema`] holds the keys and values a checkpoint reader accepts.
 
 pub mod card;
+pub mod catalog;
 pub mod csf;
 pub mod dspark;
 pub mod fetch;
