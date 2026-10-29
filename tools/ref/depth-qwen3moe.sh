@@ -517,6 +517,9 @@ set -uo pipefail
 # The drive the model file is on and its read counter (an ours row's drive column).
 # shellcheck source=tools/ref/drive-read.sh
 source "${BASH_SOURCE[0]%/*}/drive-read.sh" || exit 2
+# model_shards and the capped arms' page-cache eviction.
+# shellcheck source=tools/ref/evict.sh
+source "${BASH_SOURCE[0]%/*}/evict.sh" || exit 2
 # Probe tag. Qwen3.8's prompt plan reads the lane rate the load probes (`xstream_lane_gbs=` on the load's
 # `xstream=` line): the pick floor m* follows it, so a load on a contended box probes a low rate and
 # admits fewer experts (7.43 GB/s: m_min 3194, 4095 experts admitted; 20.56: m_min 1216, 5805) — a
@@ -1568,73 +1571,19 @@ arm_has_prefill() { [[ ,$1 == *,prefill=* ]]; }
 prefill_ref_refuse() {
   arm_refuse "$1" "prefill= sets generate_qwen3moe's --prefill, and $2 is a reference engine's arm, which takes no prefill path of ours"
 }
-# model_shards <file>: every shard of <file>'s split set, one a line (`<stem>-0000k-of-0000n.gguf`, k = 1..n,
-# whichever shard <file> names), or <file> alone when its name is no shard's.
-model_shards() {
-  local f=$1 n k
-  if [[ ${f##*/} =~ -([0-9]{5})-of-([0-9]{5})\.gguf$ ]]; then
-    n=${BASH_REMATCH[2]} f=${f%-"${BASH_REMATCH[1]}"-of-"${BASH_REMATCH[2]}".gguf}
-    for ((k = 1; k <= 10#$n; k++)); do printf '%s-%05d-of-%s.gguf\n' "$f" "$k" "$n"; done
-  else
-    echo "$f"
-  fi
-}
-# A capped arm's eviction (the header's Mem), over the shards in argv: each one's resident pages (mincore over a
-# mapping of the file that faults nothing), posix_fadvise(DONTNEED) over the whole file, its resident pages again;
-# prints `<shards> <pages> <resident before> <resident after>`. Linux only: it runs on the box, never under
-# --parse-arms. It advises these files alone: no other file, no drop_caches, no system setting.
-EVICT_PY='
-import ctypes, mmap, os, sys
-libc = ctypes.CDLL(None, use_errno=True)
-libc.mmap.restype = ctypes.c_void_p
-libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
-libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
-page = os.sysconf("SC_PAGE_SIZE")
-low = bytes(b & 1 for b in range(256))
-def resident(fd, size):
-    if size == 0:
-        return 0
-    addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
-    if addr is None or addr == ctypes.c_void_p(-1).value:
-        raise OSError(ctypes.get_errno(), "mmap")
-    try:
-        n = (size + page - 1) // page
-        vec = ctypes.create_string_buffer(n)
-        if libc.mincore(addr, size, vec) != 0:
-            raise OSError(ctypes.get_errno(), "mincore")
-        return n - vec.raw.translate(low).count(0)
-    finally:
-        libc.munmap(addr, size)
-pages = before = after = 0
-for path in sys.argv[1:]:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        size = os.fstat(fd).st_size
-        pages += (size + page - 1) // page
-        before += resident(fd, size)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        after += resident(fd, size)
-    finally:
-        os.close(fd)
-print(len(sys.argv) - 1, pages, before, after)
-'
-# evict_arm <i>: a capped arm's eviction before one of its processes: EVICT_PY over every shard of its model file
-# (its model=, else the profile's), the witness line, and 1 with FAIL_WHY when a page stays resident or the
-# advice did not run.
+# evict_arm <i>: a capped arm's eviction (the header's Mem) before one of its processes: evict_set (evict.sh) over every
+# shard of its model file (its model=, else the profile's), the witness line, and 1 with FAIL_WHY when a page stays
+# resident or the advice did not run.
 evict_arm() {
-  local f=${A_MODEL[$1]:-$MODEL} s out n pages before after
-  local -a shards=()
-  while IFS= read -r s; do shards+=("$s"); done < <(model_shards "$f")
-  if ! out=$(python3 -c "$EVICT_PY" "${shards[@]}" 2>&1); then
-    echo "    evict: $f shards=${#shards[@]} failed: $(tail -n 1 <<< "$out")"
-    FAIL_WHY="evict: the advice over $f's ${#shards[@]} shard(s) did not run: $(tail -n 1 <<< "$out")"
+  local f=${A_MODEL[$1]:-$MODEL}
+  if ! evict_set "$f"; then
+    echo "    evict: $f shards=$EVICT_SHARDS failed: $EVICT_ERR"
+    FAIL_WHY="evict: the advice over $f's $EVICT_SHARDS shard(s) did not run: $EVICT_ERR"
     return 1
   fi
-  read -r n pages before after <<< "$out"
-  echo "    evict: $f shards=$n pages=$pages resident before=$before after=$after (posix_fadvise DONTNEED, then mincore)"
-  [ "$after" != 0 ] || return 0
-  FAIL_WHY="evict: $after of the $pages pages of $f's $n shard(s) stay resident after posix_fadvise(DONTNEED) (a page another process holds mapped is not evicted): the capped row would read them warm"
+  echo "    evict: $f shards=$EVICT_SHARDS pages=$EVICT_PAGES resident before=$EVICT_BEFORE after=$EVICT_AFTER (posix_fadvise DONTNEED, then mincore)"
+  [ "$EVICT_AFTER" != 0 ] || return 0
+  FAIL_WHY="evict: $EVICT_AFTER of the $EVICT_PAGES pages of $f's $EVICT_SHARDS shard(s) stay resident after posix_fadvise(DONTNEED) (a page another process holds mapped is not evicted): the capped row would read them warm"
   return 1
 }
 # split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
