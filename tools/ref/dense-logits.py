@@ -112,19 +112,12 @@ def file_signature(path):
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
-def unpinned(target):
-    return target.get("size", 0) is None or target.get("sha256", "") is None
-
-
 def target_identity(path):
     """The `size` and `sha256` a TARGETS entry spells for the file at `path`: what pins a target whose bytes the tree makes."""
     return {"size": Path(path).stat().st_size, "sha256": digest(path)}
 
 
 def immutable_model(path, target):
-    if unpinned(target):
-        raise ValueError("the target is unpinned: its file was never measured; run `dense-logits.py identity <file>` "
-                         "and write its size and sha256 into TARGETS; no engine was opened")
     before = file_signature(path)
     if before[2] != target["size"] or digest(path) != target["sha256"] or file_signature(path) != before:
         raise ValueError("model differs from the selected immutable target; no engine was opened")
@@ -677,8 +670,6 @@ def bundle(path):
     if m.header.get("format") != MANIFEST_FORMAT:
         raise ValueError(f"{path}: not a {MANIFEST_FORMAT} set (an older capture: dump it again)")
     target = TARGETS.get(m.header.get("target"))
-    if target is not None and unpinned(target):
-        raise ValueError(f"{path}: the target {m.header.get('target')} is unpinned (no size and sha256 in TARGETS)")
     if target is None or m.header.get("model_sha256") != target["sha256"]:
         raise ValueError(f"{path}: wrong immutable model identity")
     rows = m.rows("tensor")
@@ -847,13 +838,7 @@ def self_test():
         target = {"size": 8, "sha256": digest(model)}
         before = immutable_model(model, target)
         model_unchanged(model, before)
-        assert target_identity(model) == target and unpinned({"size": None, "sha256": None}) and not unpinned(target)
-        for pinned_by_hand in ({"size": None, "sha256": "x"}, {"size": 8, "sha256": None}):
-            try:
-                immutable_model(model, pinned_by_hand)
-                raise AssertionError("opened a target with a missing identity half")
-            except ValueError as error:
-                assert "unpinned" in str(error), error
+        assert target_identity(model) == target
         model.write_bytes(b"replaced")
         # Same metadata must not hide a content change.
         before[:-1] = file_signature(model)
@@ -1159,7 +1144,7 @@ def self_test():
             assert "floor takes a reference CUDA set" in str(error), error
     del TARGETS["_selftest"], TARGETS["_selftest_llama"]
     print("dense-logits self-test: malformed ids, provenance, the set's family-shaped manifest, corpus slices, run and build refusals, "
-          "incomplete/truncated/NaN rows, HIP placement and reserve, reset repeats, eager/graph, the oracle floor, the unpinned-target refusal "
+          "incomplete/truncated/NaN rows, HIP placement and reserve, reset repeats, eager/graph, the oracle floor "
           "and owned-session cleanup contracts passed")
     return 0
 
