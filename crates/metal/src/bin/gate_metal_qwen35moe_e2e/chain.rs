@@ -4,7 +4,8 @@
 //! - `b_chain`: from one prompt, the greedy picks of chain steps to the
 //!   cache's last row equal the host-fed steps' picks, the last logits bit
 //!   for bit; every token ahead is kept, and the last call commits nothing
-//!   ahead.
+//!   ahead. Every host-fed call commits the token the call before encoded
+//!   while its own ran, so the picks held equal are the primed ones.
 //! - `c_resume`: a broken promise. Both arms run the prompt and `RESUME_AT`
 //!   greedy steps, then step an id that is not the pick, then run greedy to
 //!   the last row: arm A host-fed throughout, arm B in chain steps with the
@@ -84,6 +85,7 @@ pub fn moved(s: &Session, before: StepStats) -> StepStats {
         discarded: now.discarded - before.discarded,
         last_row: now.last_row - before.last_row,
         passes: now.passes - before.passes,
+        primed: now.primed - before.primed,
     }
 }
 
@@ -127,7 +129,16 @@ fn differs(what: &str, a: &Snapshot, b: &Snapshot) -> Option<String> {
 
 pub fn b_chain(s: &mut Session) -> Clause {
     let start = prompt(s)?;
+    let before_host = s.stats();
     let host = greedy(s, start, StepMode::HostFed)?;
+    let primed = moved(s, before_host).primed;
+    if primed != host.len() as u64 {
+        return Err(format!(
+            "{} host-fed calls committed {primed} tokens the call before encoded; every one is \
+             expected to",
+            host.len()
+        ));
+    }
     let host_logits = s.probe().map_err(says)?.read(Node::Logits).map_err(says)?;
 
     let start_b = prompt(s)?;

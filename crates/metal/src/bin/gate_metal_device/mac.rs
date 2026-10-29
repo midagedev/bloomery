@@ -29,6 +29,10 @@
 //!     writes 2 (the flag arrived during the spin). With a memory barrier
 //!     between them, the flag is stored only after the spin has written 1.
 //!     No overlap, and the clause skips: a barrier cannot be shown to matter.
+//! 12. **parked_goes_stale**: a token recording parked off the queue comes
+//!     back while the stream's boundary is the value its wait names; once a
+//!     signalled buffer has moved the boundary, or on another stream, it does
+//!     not.
 //!
 //! `--drop-barrier` is this gate's seam: the ordered arm encodes no memory
 //! barrier. Nothing else reads it. `--help` lists the arguments.
@@ -53,7 +57,7 @@ use bloomery_metal::device::{MetalDevice, require_macos};
 use bloomery_metal::encode::{Binding, MAX_BINDINGS, MAX_BYTES_BINDING};
 use bloomery_metal::instance::HOST;
 use bloomery_metal::library::{Library, Pipeline};
-use bloomery_metal::stream::{HostEvent, MetalStream};
+use bloomery_metal::stream::{HostEvent, MetalStream, Parked};
 
 /// How many times the long kernels read their flag: long enough that the host
 /// is back from a call before the kernel is over, and short of the GPU
@@ -413,6 +417,43 @@ fn event_values_rise(device: &MetalDevice) -> Clause {
     Ok(Verdict::Pass)
 }
 
+/// A token recording of `stream`, its encoder ended, parked.
+fn parked(stream: &MetalStream) -> Result<Parked, String> {
+    let mut recording = stream.begin().map_err(why)?;
+    recording.token_encoder().map_err(why)?.end();
+    stream.park(recording).map_err(why)
+}
+
+fn parked_goes_stale(device: &MetalDevice) -> Clause {
+    let stream = device.stream();
+    let fresh = parked(stream)?;
+    let back = stream
+        .unpark(fresh)
+        .ok_or("a parked recording came back stale with nothing committed since")?;
+    let signalled = stream.submit_signalled(back).map_err(why)?;
+    stream.settle(signalled).map_err(why)?;
+
+    let stale = parked(stream)?;
+    let mut between = stream.begin().map_err(why)?;
+    between.token_encoder().map_err(why)?.end();
+    let signalled = stream.submit_signalled(between).map_err(why)?;
+    stream.settle(signalled).map_err(why)?;
+    if stream.unpark(stale).is_some() {
+        return Err(
+            "a parked recording came back after a signalled buffer moved the boundary past its \
+             wait"
+                .to_string(),
+        );
+    }
+
+    let foreign = parked(stream)?;
+    let other = device.new_stream().map_err(why)?;
+    if other.unpark(foreign).is_some() {
+        return Err("another stream gave a parked recording back".to_string());
+    }
+    Ok(Verdict::Pass)
+}
+
 /// The inputs of the arithmetic kernel: products whose fused and rounded-apart
 /// results differ.
 const ARITH_A: [f32; 8] = [1.000_000_1, -3.5, 0.1, 16_777_217.0, 1e-20, 2.0, -0.3, 7.25];
@@ -715,6 +756,7 @@ pub fn main() -> ExitCode {
     report.clause("sync_bound_named", sync_bound_named(&harness));
     report.clause("sync_two_waiters", sync_two_waiters(&harness));
     report.clause("event_values_rise", event_values_rise(device));
+    report.clause("parked_goes_stale", parked_goes_stale(device));
     report.clause("arith_matches_host", arith_matches_host(device));
     report.clause("metallib_equals_source", metallib_equals_source(device));
     report.clause("census_driver", census_driver(device));

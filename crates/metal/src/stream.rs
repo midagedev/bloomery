@@ -146,6 +146,8 @@ pub struct Settled(());
 pub struct Recording<'s> {
     buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     stream: &'s MetalStream,
+    /// The boundary value the buffer's first command waits for, 0 for none.
+    waits_for: u64,
 }
 
 impl<'s> Recording<'s> {
@@ -179,7 +181,7 @@ impl<'s> Recording<'s> {
     /// [`Recording::token_encoder`], with the encoder kept beside the
     /// recording instead of borrowing it, so a caller holds the pair across
     /// calls and commits it when it chooses.
-    pub fn open_token_encoder(self) -> Result<TokenRecording<'s>, DeviceError> {
+    pub fn open_token_encoder(mut self) -> Result<TokenRecording<'s>, DeviceError> {
         self.wait_for_boundary();
         let encoder = ComputeEncoder::concurrent_detached(&self.buffer)?;
         Ok(TokenRecording {
@@ -190,8 +192,9 @@ impl<'s> Recording<'s> {
 
     /// The buffer's first command: wait for the boundary's last value, when
     /// a signalled buffer has set one.
-    fn wait_for_boundary(&self) {
+    fn wait_for_boundary(&mut self) {
         let last = self.stream.committed().boundary;
+        self.waits_for = last;
         if last > 0 {
             #[cfg(feature = "encode-trace")]
             crate::trace::wait_event(&self.buffer, "boundary", last);
@@ -246,6 +249,21 @@ impl Recording<'_> {
 /// The handle is [`Send`](CommandBufferHandle), so a lock may hold the stamps
 /// across threads; it is not `Sync`, and never leaves one.
 pub struct GpuStamps(CommandBufferHandle);
+
+/// A token's recording, encoded and held off the queue: made by
+/// [`MetalStream::park`], committed later through [`MetalStream::unpark`].
+/// Its buffer waits for the boundary value the stream held when it was
+/// encoded, so it may run only while that is still the stream's boundary: a
+/// signalled buffer committed in between makes it stale, and `unpark` gives
+/// nothing back. A parked recording dropped is never committed, so it never
+/// runs. It does not borrow the stream: a session holds it beside its own.
+pub struct Parked {
+    buffer: CommandBufferHandle,
+    /// The boundary event the buffer's wait names, held so that no other
+    /// stream's event takes its address while the recording is parked.
+    boundary: Retained<ProtocolObject<dyn MTLEvent>>,
+    waits_for: u64,
+}
 
 /// The GPU's own stamps of one recording's buffer, in seconds on the clock
 /// [`host_secs`] reads: Apple GPUs stamp the mach timebase the host shares.
@@ -552,6 +570,39 @@ impl MetalStream {
         Ok(Recording {
             buffer: self.command_buffer()?,
             stream: self,
+            waits_for: 0,
+        })
+    }
+
+    /// Hold a recording whose encoders have ended off the queue, to commit
+    /// it later ([`MetalStream::unpark`]). A recording made by another
+    /// stream is refused by name.
+    pub fn park(&self, recording: Recording<'_>) -> Result<Parked, DeviceError> {
+        if !core::ptr::eq(recording.stream, self) {
+            return Err(DeviceError::backend(
+                "command buffer",
+                "the recording was made by another stream".to_string(),
+            ));
+        }
+        Ok(Parked {
+            buffer: CommandBufferHandle(recording.buffer),
+            boundary: self.boundary.clone(),
+            waits_for: recording.waits_for,
+        })
+    }
+
+    /// A parked recording back, to submit: `None` when it is stale — the
+    /// stream's boundary has moved past the value its wait names, so another
+    /// token's work would run between them — or when another stream parked
+    /// it. A stale recording is dropped uncommitted.
+    #[must_use]
+    pub fn unpark(&self, parked: Parked) -> Option<Recording<'_>> {
+        let ours = Retained::as_ptr(&parked.boundary) == Retained::as_ptr(&self.boundary);
+        let fresh = ours && parked.waits_for == self.committed().boundary;
+        fresh.then(|| Recording {
+            buffer: parked.buffer.0,
+            stream: self,
+            waits_for: parked.waits_for,
         })
     }
 

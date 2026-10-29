@@ -3,7 +3,15 @@
 //!
 //! A host-fed step ([`StepMode::HostFed`]) writes the token id into the host
 //! id slot, encodes the token on one command buffer, commits it, waits for
-//! it, and reads the token's fault word, then the head's pick. A chain step
+//! it, and reads the token's fault word, then the head's pick. While it
+//! waits it encodes the next position's host-fed token and holds it off the
+//! queue ([`Parked`]): the id is the host's to pick from this token's logits,
+//! and the token reads it from the slot at run time, so the next host-fed
+//! step writes the slot and commits that buffer instead of encoding one.
+//! The encode is the same whenever it runs: a host-fed token's commands
+//! depend on its position and the stream's boundary alone. A parked token
+//! that another signalled buffer has passed on the stream, or whose position
+//! is not the step's, is dropped unrun. A chain step
 //! ([`StepMode::Chain`]) also commits the next token before it waits, its
 //! embed reading the pick on the device: the token runs ahead of the call
 //! that names it. The next call keeps it when its id is that pick; any other
@@ -109,7 +117,7 @@ use crate::kernels::{Kernels, PASS_ROWS, SNAPS};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
 use crate::stream::{
-    GpuInterval, GpuStamps, MetalStream, Settled, Signalled, TokenRecording, host_secs,
+    GpuInterval, GpuStamps, MetalStream, Parked, Settled, Signalled, TokenRecording, host_secs,
 };
 use objc2_metal::MTLDevice;
 
@@ -286,7 +294,9 @@ pub struct Stepped {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepMode {
     /// The id is written into the host id slot; the step commits its token
-    /// and waits for it, and nothing runs ahead.
+    /// and waits for it, and nothing runs ahead. The next position's
+    /// host-fed token is encoded during the wait and committed by the next
+    /// host-fed call, its id written first.
     HostFed,
     /// As host-fed, unless a token runs ahead with this id; either way the
     /// next token is committed before this one is waited, embedding this
@@ -322,6 +332,8 @@ pub struct StepStats {
     /// Steps at the cache's last row that would commit a token ahead, and
     /// commit none.
     pub last_row: u64,
+    /// Host-fed tokens committed from the encode the step before made.
+    pub primed: u64,
     /// Passes that ran to their settle.
     pub passes: u64,
 }
@@ -338,6 +350,25 @@ struct Ahead {
     /// Whether the token's encode carried the head: a chain's does, its pick
     /// the next promise; an ahead's does not, the call after names its id.
     head: bool,
+}
+
+/// The next host-fed token, encoded during a host-fed step's wait and held
+/// off the queue until the call that names its id.
+struct Primed {
+    parked: Parked,
+    count: EncodeCount,
+    pos: u32,
+    /// The encode's own seconds, when the step clock ran at the encode.
+    encode_s: Option<f64>,
+}
+
+/// The host's encode of a committed token, as the clock counts it.
+#[derive(Clone, Copy)]
+enum Encoded {
+    /// Encoded at the commit, from this host second on.
+    Since(f64),
+    /// Encoded and parked a step before, in this many seconds.
+    Took(f64),
 }
 
 /// One committed token the clock holds until its settle: its identity on the
@@ -376,7 +407,9 @@ struct Phases {
 pub struct StepPhase {
     /// The settled steps the averages hold.
     pub steps: u64,
-    /// The host's encode of a token, µs: the encoder's begin to the commit.
+    /// The host's encode of a token, µs: the encoder's begin to the commit,
+    /// or to the park for a token a host-fed step encoded during its wait,
+    /// which no step waits on.
     pub encode_us: f64,
     /// A token's GPU start against the host clock at its commit, µs.
     pub start_us: f64,
@@ -661,6 +694,8 @@ pub struct Session {
     poisoned: Option<Fault>,
     /// The token at `pos`, committed by the last step that ran one ahead.
     ahead: Option<Ahead>,
+    /// The next host-fed token, encoded and parked.
+    primed: Option<Primed>,
     stats: StepStats,
     /// The step clock, when a caller started one; `None` steps and times
     /// nothing.
@@ -693,7 +728,9 @@ pub enum MarkCopies {
     OnFirstMark,
 }
 
-/// How long each part of a session's open took, on the host's clock.
+/// How long each part of a session's open took, on the host's clock. The
+/// pipelines are built beside the other three, which run one after another:
+/// the open's wall is the longer of the two, not the sum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpenSplit {
     /// The plan read from the file and the weights copied into the arena.
@@ -706,6 +743,18 @@ pub struct OpenSplit {
     pub residency: Duration,
     /// The kernels' pipelines built, the prefill attention's among them.
     pub pipelines: Duration,
+}
+
+/// What [`Session::open_load`] made: the checked plan, the stream with its
+/// residency set committed, both arenas, and how long each part took.
+struct Loaded {
+    checked: check::Checked,
+    stream: MetalStream,
+    arena: Arena,
+    rows: RowsArena,
+    load: Duration,
+    rows_t: Duration,
+    residency_t: Duration,
 }
 
 /// What a pass returns of its head.
@@ -843,55 +892,35 @@ impl Session {
         every: u32,
         copies: MarkCopies,
     ) -> Result<Session, SessionError> {
-        let started = Instant::now();
-        let kernels = Kernels::from_library(library)?;
-        // Built here so a refused build fails the open, never a pass.
-        kernels.prepare_prefill()?;
-        let pipelines = started.elapsed();
-        let started = Instant::now();
-        // Every refusal the header and tensor table hold, in the order the
-        // checks meet them; the open stops at the first.
-        let checked = check::check(file.header(), ctx).checked_or_first()?;
-        // The arena is sized at the geometry the file was judged at and the
-        // launches at the library's: one instance, or the open is refused.
-        if checked.geom != *kernels.geom() {
-            return Err(refuse(format!(
-                "{}: the file is {}, the library is built for {}",
-                file.header()
-                    .shard_path(0)
-                    .map_or_else(|| "the model file".into(), |p| p.display().to_string()),
-                checked.instance,
-                library.instance()
-            )));
-        }
+        // The pipelines are built on a thread of their own while this one
+        // reads the plan and loads the weights: the two share the device and
+        // nothing else. A refused build is still the open's first refusal;
+        // the stream the load made, and the set it committed, go with it.
+        let (built, loaded) = std::thread::scope(|s| {
+            let pipelines = s.spawn(|| {
+                let started = Instant::now();
+                let kernels = Kernels::from_library(library)?;
+                // Built here so a refused build fails the open, never a pass.
+                kernels.prepare_prefill()?;
+                Ok::<_, SessionError>((kernels, started.elapsed()))
+            });
+            let loaded = Self::open_load(device, library, file, ctx, copies);
+            let built = pipelines
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
+            (built, loaded)
+        });
+        let (kernels, pipelines) = built?;
+        let Loaded {
+            checked,
+            stream,
+            arena,
+            rows,
+            load,
+            rows_t,
+            residency_t,
+        } = loaded?;
         let plans = checked.plans;
-        let mut stream = device.new_stream()?;
-        stream.enable_residency(device.metal())?;
-        let residency = stream
-            .residency()
-            .ok_or_else(|| refuse("the stream made no residency set"))?;
-        let staged = residency.stage();
-        let alloc = Alloc::new(device.metal(), &staged);
-        let weights = file.weights()?;
-        let arena = Arena::open(alloc, &weights, &checked.geom, &checked.layout)?;
-        let load = started.elapsed();
-        let started = Instant::now();
-        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max(&checked.geom).min(arena.ctx))?;
-        // A file with no delta layer has nothing a mark copies: a short conv
-        // ring is not copied inside a pass (the pass is refused by name).
-        let stores = arena
-            .layers
-            .iter()
-            .any(|l| matches!(l.mixer, MixerBufs::Delta(_)));
-        if copies == MarkCopies::AtOpen && stores {
-            rows.snaps = Some(SnapBufs::open(alloc, &arena)?);
-        }
-        let rows_t = started.elapsed();
-        // The open waits for the driver to wire the arenas, so the first
-        // token and the first pass find them resident.
-        let started = Instant::now();
-        staged.commit();
-        let residency_t = started.elapsed();
         let ctx_positions = u32::try_from(arena.ctx).map_err(|_| {
             refuse(format!(
                 "a cache of {} rows: more than a u32 position names",
@@ -921,6 +950,7 @@ impl Session {
             pos: 0,
             poisoned: None,
             ahead: None,
+            primed: None,
             stats: StepStats::default(),
             clock: None,
             checkpoints,
@@ -933,6 +963,71 @@ impl Session {
                 residency: residency_t,
                 pipelines,
             },
+        })
+    }
+
+    /// The load half of [`Session::open_model_as`], run beside the pipeline
+    /// build: the plan's checks, the stream and its residency set, the arena,
+    /// the rows arena (and the mark copies' when `copies` asks at open), and
+    /// the set's commit. The arena is sized at the geometry the file was
+    /// judged at and the launches at the library's: one instance, or the
+    /// open is refused before any buffer is made.
+    fn open_load(
+        device: &MetalDevice,
+        library: &Library,
+        file: &ModelFile,
+        ctx: usize,
+        copies: MarkCopies,
+    ) -> Result<Loaded, SessionError> {
+        let started = Instant::now();
+        // Every refusal the header and tensor table hold, in the order the
+        // checks meet them; the open stops at the first.
+        let checked = check::check(file.header(), ctx).checked_or_first()?;
+        if checked.geom != Geometry::of(library.instance()) {
+            return Err(refuse(format!(
+                "{}: the file is {}, the library is built for {}",
+                file.header()
+                    .shard_path(0)
+                    .map_or_else(|| "the model file".into(), |p| p.display().to_string()),
+                checked.instance,
+                library.instance()
+            )));
+        }
+        let mut stream = device.new_stream()?;
+        stream.enable_residency(device.metal())?;
+        let residency = stream
+            .residency()
+            .ok_or_else(|| refuse("the stream made no residency set"))?;
+        let staged = residency.stage();
+        let alloc = Alloc::new(device.handle(), &staged);
+        let weights = file.weights()?;
+        let arena = Arena::open(alloc, &weights, &checked.geom, &checked.layout)?;
+        let load = started.elapsed();
+        let started = Instant::now();
+        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max(&checked.geom).min(arena.ctx))?;
+        // A file with no delta layer has nothing a mark copies: a short conv
+        // ring is not copied inside a pass (the pass is refused by name).
+        let stores = arena
+            .layers
+            .iter()
+            .any(|l| matches!(l.mixer, MixerBufs::Delta(_)));
+        if copies == MarkCopies::AtOpen && stores {
+            rows.snaps = Some(SnapBufs::open(alloc, &arena)?);
+        }
+        let rows_t = started.elapsed();
+        // The open waits for the driver to wire the arenas, so the first
+        // token and the first pass find them resident.
+        let started = Instant::now();
+        staged.commit();
+        let residency_t = started.elapsed();
+        Ok(Loaded {
+            checked,
+            stream,
+            arena,
+            rows,
+            load,
+            rows_t,
+            residency_t,
         })
     }
 
@@ -1081,6 +1176,15 @@ impl Session {
             } else {
                 self.stats.last_row += 1;
             }
+        }
+        // A host-fed step encodes the next host-fed token while this one
+        // runs; its id is the host's pick of this token's logits.
+        if mode == StepMode::HostFed
+            && (next as usize) < self.arena.ctx
+            && let Err(e) = self.prime(next)
+        {
+            let _ = self.stream.settle(current);
+            return Err(e);
         }
         let value = current.value();
         let settled = match self.stream.settle(current) {
@@ -1383,30 +1487,85 @@ impl Session {
         if feed == Feed::Host {
             self.arena.id_in.pages().store(0, id, Ordering::Relaxed)?;
         }
+        // The parked token of this position, when it is still fresh: a
+        // host-fed token with a head is what the step before encoded.
+        let primed = self
+            .primed
+            .take()
+            .filter(|p| p.pos == pos && feed == Feed::Host && head)
+            .and_then(|p| {
+                let recording = self.stream.unpark(p.parked)?;
+                Some((recording, p.count, p.encode_s.map(Encoded::Took)))
+            });
         let clock = self.clock.as_ref();
-        let encode_from = clock.is_some().then(host_secs);
+        let (recording, count, encode_s) = match primed {
+            Some(primed) => {
+                self.stats.primed += 1;
+                primed
+            }
+            None => {
+                let encode_from = clock.is_some().then(host_secs);
+                let mut recording = self.stream.begin()?;
+                let mut enc = recording.token_encoder()?;
+                Walk::new(
+                    &mut MetalOps::new(&mut enc, &mut self.arena, &self.kernels, pos, feed, head),
+                    &self.plans,
+                    1,
+                )
+                .run(1)?;
+                let count = enc.count();
+                enc.end();
+                (recording, count, encode_from.map(Encoded::Since))
+            }
+        };
+        let stamps = clock.is_some().then(|| recording.stamps());
+        let signalled = self.stream.submit_signalled(recording)?;
+        if let (Some(clock), Some(stamps), Some(encoded)) = (clock, stamps, encode_s) {
+            let at = host_secs();
+            clock.committed(PendingToken {
+                value: signalled.value(),
+                stamps,
+                encode_s: match encoded {
+                    Encoded::Since(from) => at - from,
+                    Encoded::Took(s) => s,
+                },
+                submitted: at,
+            });
+        }
+        Ok((signalled, count))
+    }
+
+    /// Encode the host-fed token at `pos`, with its head, and park it for
+    /// the call that names its id ([`Session::commit`] takes it). Its embed
+    /// reads the host id slot, which that call writes before the commit; the
+    /// token this step waits for has read the slot by then.
+    fn prime(&mut self, pos: u32) -> Result<(), SessionError> {
+        let encode_from = self.clock.is_some().then(host_secs);
         let mut recording = self.stream.begin()?;
         let mut enc = recording.token_encoder()?;
         Walk::new(
-            &mut MetalOps::new(&mut enc, &mut self.arena, &self.kernels, pos, feed, head),
+            &mut MetalOps::new(
+                &mut enc,
+                &mut self.arena,
+                &self.kernels,
+                pos,
+                Feed::Host,
+                true,
+            ),
             &self.plans,
             1,
         )
         .run(1)?;
         let count = enc.count();
         enc.end();
-        let stamps = clock.is_some().then(|| recording.stamps());
-        let signalled = self.stream.submit_signalled(recording)?;
-        if let (Some(clock), Some(stamps), Some(from)) = (clock, stamps, encode_from) {
-            let at = host_secs();
-            clock.committed(PendingToken {
-                value: signalled.value(),
-                stamps,
-                encode_s: at - from,
-                submitted: at,
-            });
-        }
-        Ok((signalled, count))
+        let parked = self.stream.park(recording)?;
+        self.primed = Some(Primed {
+            parked,
+            count,
+            pos,
+            encode_s: encode_from.map(|from| host_secs() - from),
+        });
+        Ok(())
     }
 
     /// The token ahead waited out and dropped, its fault word cleared if it

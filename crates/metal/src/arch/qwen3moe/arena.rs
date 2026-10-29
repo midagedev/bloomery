@@ -3,7 +3,13 @@
 //!
 //! The weights are copied from the file into buffers of their own. A layer's
 //! P1 projection is one buffer per weight type, each the segments of one
-//! dispatch. The activations, the caches, the recurrent stores, the routers'
+//! dispatch. The load runs on [`LOAD_WORKERS`] threads at most, each taking
+//! the next of the embedding, the head and the layers in the file's order, so
+//! the drive serves several reads at once while the host repacks and copies
+//! what came in; every buffer holds what a one-thread load writes, and a
+//! refusal is the first in that order.
+//!
+//! The activations, the caches, the recurrent stores, the routers'
 //! and the attention's tickets, the host's id slot, the step record slots and
 //! the fault words are the session's. Every name, type and length comes from the
 //! layout [`super::check`] resolved from the file's header (the plan, the
@@ -18,6 +24,7 @@
 //! its position's parity and writes by the next position's.
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::borrow::Cow;
 
 use bloomery_device::fault::LAYER_HEAD;
@@ -42,6 +49,10 @@ use crate::kernels::{HeadMap, Quant, Segment, segments_for_window};
 use crate::residency::Alloc;
 
 const WHAT: &str = "qwen35moe arena";
+
+/// The most threads one open loads with: enough reads in flight to keep the
+/// drive at its streaming rate, each beside its own repack and copy.
+const LOAD_WORKERS: usize = 8;
 
 /// Lanes of the delta state: the token at `pos` reads lane [`lane_of`]`(pos)`
 /// and writes the next position's, so a token that ran and was not taken
@@ -542,6 +553,116 @@ impl<'a> Loader<'a> {
             post: layer.post.as_ref().map(|p| post(self, p)).transpose()?,
         })
     }
+
+    /// Job `j` of the load: 0 the embedding, 1 the head's weights, then
+    /// layer `j - 2`.
+    fn job(&self, g: &Layout, j: usize) -> Result<Loaded, SessionError> {
+        match j {
+            0 => self.site(&g.embed).map(Loaded::Site),
+            1 => self.site(&g.head).map(Loaded::Site),
+            j => {
+                let l = j - 2;
+                self.layer(&g.layers[l])
+                    .map(|b| Loaded::Layer(Box::new(b)))
+                    .map_err(|e| at_layer(l, e))
+            }
+        }
+    }
+
+    /// The embedding, the head's weights and every layer, loaded by up to
+    /// [`LOAD_WORKERS`] threads ([`in_order`]): the refusal returned is the
+    /// first a load in order meets, and each buffer holds the bytes its
+    /// tensor gives, whichever thread wrote it.
+    fn weights(&self, g: &Layout) -> Result<Loads, SessionError> {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(LOAD_WORKERS);
+        let mut loaded = in_order(g.layers.len() + 2, workers, |j| self.job(g, j))?.into_iter();
+        let mut site = || match loaded.next() {
+            Some(Loaded::Site(b)) => Ok(b),
+            _ => Err(refuse(
+                "the load's first two jobs are the embedding and the head",
+            )),
+        };
+        let (embed, head) = (site()?, site()?);
+        let layers = loaded
+            .map(|r| match r {
+                Loaded::Layer(b) => Ok(*b),
+                Loaded::Site(_) => Err(refuse("a layer job loaded a site")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Loads {
+            embed,
+            head,
+            layers,
+        })
+    }
+}
+
+/// The weights the load's jobs made: the embedding, the head's and each
+/// layer's, in layer order.
+struct Loads {
+    embed: MetalBuffer<u8>,
+    head: MetalBuffer<u8>,
+    layers: Vec<LayerBufs>,
+}
+
+/// Jobs `0..jobs` run by up to `workers` threads, each taking the next job in
+/// order; their results in job order, or the error of the earliest job that
+/// failed. A worker takes no job past the earliest failure, and every job
+/// before it was taken, so the error is the one a run in order on one thread
+/// returns.
+fn in_order<T: Send, E: Send>(
+    jobs: usize,
+    workers: usize,
+    job: impl Fn(usize) -> Result<T, E> + Sync,
+) -> Result<Vec<T>, E> {
+    let next = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(usize::MAX);
+    let work = || {
+        let mut done = Vec::new();
+        loop {
+            let j = next.fetch_add(1, Ordering::Relaxed);
+            if j >= jobs || j > failed.load(Ordering::Relaxed) {
+                return done;
+            }
+            let r = job(j);
+            if r.is_err() {
+                failed.fetch_min(j, Ordering::Relaxed);
+            }
+            done.push((j, r));
+        }
+    };
+    let mut slots: Vec<Option<Result<T, E>>> = std::iter::repeat_with(|| None).take(jobs).collect();
+    std::thread::scope(|s| {
+        let threads: Vec<_> = (1..workers.clamp(1, jobs.max(1)))
+            .map(|_| s.spawn(work))
+            .collect();
+        let mut runs = vec![work()];
+        for t in threads {
+            runs.push(t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+        }
+        for (j, r) in runs.into_iter().flatten() {
+            slots[j] = Some(r);
+        }
+    });
+    // Every job up to the earliest failure ran; the first `None` is past it.
+    let mut out = Vec::with_capacity(jobs);
+    for r in slots.into_iter().map_while(|r| r) {
+        out.push(r?);
+    }
+    assert_eq!(
+        out.len(),
+        jobs,
+        "in_order: a job past no failure did not run"
+    );
+    Ok(out)
+}
+
+/// What one job of the load made.
+enum Loaded {
+    Site(MetalBuffer<u8>),
+    Layer(Box<LayerBufs>),
 }
 
 /// A buffer of `n` elements, zeroed.
@@ -640,13 +761,12 @@ impl Arena {
             weights,
             geom,
         };
-        let embed = load.site(&g.embed)?;
-        let head_w = load.site(&g.head)?;
+        let Loads {
+            embed,
+            head: head_w,
+            layers,
+        } = load.weights(g)?;
         let head_norm = load.values(&g.head_norm)?;
-        let mut layers = Vec::with_capacity(g.layers.len());
-        for (l, layer) in g.layers.iter().enumerate() {
-            layers.push(load.layer(layer).map_err(|e| at_layer(l, e))?);
-        }
         let mut ropes = Vec::with_capacity(g.ropes.len());
         for r in &g.ropes {
             let mut table = device.buffer(Elems(g.rope_len))?;
@@ -1262,6 +1382,36 @@ fn ffn(load: &Loader<'_>, device: Alloc<'_>, f: &FfnLayout) -> Result<FfnBufs, S
         ids,
         weights,
     })
+}
+
+#[cfg(test)]
+mod in_order_tests {
+    use super::in_order;
+
+    /// The results come back in job order whatever thread ran each, and the
+    /// error is the earliest failing job's, however the threads interleave:
+    /// a later job that fails first does not win. Mutant: the error that
+    /// came first in time returned (job 9 here, with two workers or more).
+    #[test]
+    fn jobs_return_in_order_and_the_earliest_failure_wins() {
+        for workers in [1, 2, 3, 8] {
+            let got = in_order(20, workers, |j| Ok::<_, usize>(j * 3)).unwrap();
+            assert_eq!(got, (0..20).map(|j| j * 3).collect::<Vec<_>>(), "{workers}");
+            let err = in_order(20, workers, |j| {
+                if j == 9 || j == 4 {
+                    // The earlier failure finishes last.
+                    if j == 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                    }
+                    return Err(j);
+                }
+                Ok(j)
+            })
+            .unwrap_err();
+            assert_eq!(err, 4, "{workers} workers");
+        }
+        assert_eq!(in_order(0, 4, Ok::<_, ()>).unwrap(), Vec::<usize>::new());
+    }
 }
 
 #[cfg(test)]

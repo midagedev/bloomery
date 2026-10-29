@@ -18,16 +18,16 @@
 //! set, which `Session::residency` shows as bytes short of what the device
 //! holds (the `r_resident` clause). An [`Alloc`] stages its buffers
 //! ([`Staged`]) and they join the set only when the open that made them
-//! commits: an open that fails leaves the set as it was.
+//! commits: an open that fails leaves the set as it was. An [`Alloc`] is
+//! shared by the open's loading threads; the staging list is behind a lock,
+//! and the set takes the buffers in whatever order they were staged.
 
-use core::cell::RefCell;
 use core::time::Duration;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use objc2::Message;
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLAllocation, MTLBuffer, MTLCommandQueue, MTLDevice, MTLResidencySet,
@@ -122,14 +122,14 @@ impl Residency {
     pub(crate) fn stage(&self) -> Staged<'_> {
         Staged {
             residency: self,
-            buffers: RefCell::new(Vec::new()),
+            buffers: Mutex::new(Vec::new()),
         }
     }
 
     /// `buffers` made part of the set and the set requested resident. This
     /// returns once the driver has wired them, which is what an open waits
     /// for.
-    fn commit(&self, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
+    fn commit(&self, buffers: &[Handle<dyn MTLBuffer>]) {
         let set = self.set();
         mark("set", format_args!("commit {} allocations", buffers.len()));
         for buffer in buffers {
@@ -204,27 +204,32 @@ impl Drop for Residency {
 /// a list dropped uncommitted adds nothing.
 pub(crate) struct Staged<'a> {
     residency: &'a Residency,
-    buffers: RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    buffers: Mutex<Vec<Handle<dyn MTLBuffer>>>,
 }
 
 impl Staged<'_> {
     /// The staged buffers made part of the set, and the set requested
     /// resident.
     pub(crate) fn commit(self) {
-        self.residency.commit(&self.buffers.into_inner());
+        let buffers = self
+            .buffers
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.residency.commit(&buffers);
     }
 }
 
 /// Where a session allocates the buffers its kernels bind: the device, and
-/// the staging list of the stream's residency set each buffer joins.
+/// the staging list of the stream's residency set each buffer joins. It is
+/// `Send` and `Sync`: the open's loading threads share one.
 #[derive(Clone, Copy)]
 pub(crate) struct Alloc<'a> {
-    device: &'a ProtocolObject<dyn MTLDevice>,
+    device: &'a Handle<dyn MTLDevice>,
     staged: &'a Staged<'a>,
 }
 
 impl<'a> Alloc<'a> {
-    pub(crate) fn new(device: &'a ProtocolObject<dyn MTLDevice>, staged: &'a Staged<'a>) -> Self {
+    pub(crate) fn new(device: &'a Handle<dyn MTLDevice>, staged: &'a Staged<'a>) -> Self {
         Self { device, staged }
     }
 
@@ -232,10 +237,12 @@ impl<'a> Alloc<'a> {
     /// (resident once the open's [`Staged::commit`] runs).
     pub(crate) fn buffer<T: Elem>(&self, n: Elems) -> Result<MetalBuffer<T>, DeviceError> {
         let buffer = MetalBuffer::new(self.device, n)?;
+        // A poisoned list holds every buffer staged before the panic.
         self.staged
             .buffers
-            .borrow_mut()
-            .push(buffer.metal().retain());
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Handle(buffer.metal().retain()));
         Ok(buffer)
     }
 }
