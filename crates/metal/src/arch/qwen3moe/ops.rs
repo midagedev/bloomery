@@ -30,7 +30,9 @@ use chain::arch::qwen3moe::plan::{
     DeltaPlan, FfnPlan, FfnRoute, GqaPlan, ResidualPlan, ShortConvPlan,
 };
 
-use super::arena::{Arena, LANES, LayerBufs, MixerBufs, lane_of, layer_word, slot_before, slot_of};
+use super::arena::{
+    Arena, ConvBufs, LANES, LayerBufs, MixerBufs, lane_of, layer_word, slot_before, slot_of,
+};
 use super::rows::RowsArena;
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
@@ -283,28 +285,17 @@ macro_rules! attention_of {
     };
 }
 
-/// The layer's short conv buffers, or a named refusal for a layer of another
+/// Layer `l`'s short conv buffers, or the named refusal for a layer of another
 /// mixer.
-macro_rules! conv_of {
-    ($layers:expr, $l:expr) => {
-        match &mut $layers[$l].mixer {
-            MixerBufs::ShortConv(c) => c,
-            MixerBufs::Delta(_) => {
-                return Err(ChainError::shape(
-                    WHAT,
-                    format!("layer {}: a short conv op on a delta layer", $l),
-                )
-                .into());
-            }
-            MixerBufs::Attention(_) => {
-                return Err(ChainError::shape(
-                    WHAT,
-                    format!("layer {}: a short conv op on an attention layer", $l),
-                )
-                .into());
-            }
-        }
-    };
+fn conv_bufs(layers: &mut [LayerBufs], l: usize) -> Result<&mut ConvBufs, SessionError> {
+    match &mut layers[l].mixer {
+        MixerBufs::ShortConv(c) => Ok(c),
+        MixerBufs::Delta(_) | MixerBufs::Attention(_) => Err(ChainError::shape(
+            WHAT,
+            format!("layer {l}: a short conv op on a layer of another mixer"),
+        )
+        .into()),
+    }
 }
 
 /// Where the out projection of one half of layer `l` writes, and how: a plain
@@ -657,7 +648,7 @@ impl MetalOps<'_, '_> {
             hidden,
             ..
         } = &mut *self.arena;
-        let c = conv_of!(layers, l);
+        let c = conv_bufs(layers, l)?;
         let y = conv_y.as_mut().ok_or_else(|| no_conv_y(l))?;
         self.kernels.shortconv_step(
             self.enc,
@@ -692,7 +683,7 @@ impl MetalOps<'_, '_> {
             hidden,
             ..
         } = &mut *self.arena;
-        let c = conv_of!(layers, l.layer);
+        let c = conv_bufs(layers, l.layer)?;
         let y = conv_y.as_ref().ok_or_else(|| no_conv_y(l.layer))?;
         let (out, mode) = half_out(l, x, join, *hidden)?;
         self.kernels.matvec(

@@ -26,10 +26,10 @@ use chain::ChainError;
 use chain::arch::qwen3moe::ops::LayerCtx;
 use chain::arch::qwen3moe::plan::ResidualPlan;
 
-use super::super::arena::{Arena, ConvBufs, LayerBufs, MixerBufs, lane_of, layer_word, slot_of};
+use super::super::arena::{Arena, LayerBufs, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::rows::FfnRows;
 use super::super::session::SessionError;
-use super::{Half, MetalOps, WHAT, all, all_mut, post_gain, refuse, rope_of};
+use super::{Half, MetalOps, WHAT, all, all_mut, conv_bufs, post_gain, refuse, rope_of};
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::kernels::{
@@ -56,19 +56,6 @@ fn half_out<'b>(
     match &l.plan.residual {
         ResidualPlan::Plain => Ok((x.window_mut(Elems(0), Elems(len))?, GemmMode::Residual)),
         ResidualPlan::Sandwich(_) => Ok((xn.window_mut(Elems(0), Elems(len))?, GemmMode::Store)),
-    }
-}
-
-/// Layer `l`'s short conv buffers, or the named refusal for a layer of another
-/// mixer.
-fn conv_of_rows(layers: &mut [LayerBufs], l: usize) -> Result<&mut ConvBufs, SessionError> {
-    match &mut layers[l].mixer {
-        MixerBufs::ShortConv(c) => Ok(c),
-        MixerBufs::Delta(_) | MixerBufs::Attention(_) => Err(ChainError::shape(
-            WHAT,
-            format!("layer {l}: a short conv op on a layer of another mixer"),
-        )
-        .into()),
     }
 }
 
@@ -469,7 +456,7 @@ impl MetalOps<'_, '_> {
             hidden,
             ..
         } = &mut *self.arena;
-        let c = conv_of_rows(layers, l)?;
+        let c = conv_bufs(layers, l)?;
         let stride = rows.proj_stride;
         self.kernels.shortconv_rows(
             self.enc,
@@ -509,7 +496,7 @@ impl MetalOps<'_, '_> {
             hidden,
             ..
         } = &mut *self.arena;
-        let c = conv_of_rows(layers, l.layer)?;
+        let c = conv_bufs(layers, l.layer)?;
         let (y, mode) = half_out(l, &mut rows.x, &mut rows.xn, m * *hidden)?;
         self.kernels.gemm(
             self.enc,
