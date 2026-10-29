@@ -205,7 +205,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     // every layer; otherwise both are widened before joining. Every other one
     // (the convs, the injects, the parts of its joined beta/alpha stack) is
     // read as f32 values;
-    // Qwen3.5's body reads none in its words.
+    // Qwen3.5's body reads only its embedding in its words (a checkpoint folder's table as stored).
     const WORDS: fn(&crate::placement::ModelTensor) -> bool = |t| {
         let stem = block_stem(&t.name, usize::MAX).map_or(t.name.as_str(), |(_, stem)| stem);
         matches!(
@@ -250,7 +250,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
         (Variant::Qwen4Exp, false) => |t| {
             WORDS(t) && t.role != Role::Router && !t.name.ends_with(".ffn_gate_inp_shexp.weight")
         },
-        _ => |_| false,
+        _ => |t| t.name == "token_embd.weight",
     };
     Ok(model)
 }

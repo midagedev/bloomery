@@ -1546,7 +1546,9 @@ pub(super) mod tests {
 
     /// A dense qwen35 header reads with every layer's FFN dense at
     /// `feed_forward_length`, no expert key read, and its description gives
-    /// each layer `Ffn::Dense` and each FFN matrix the dense role.
+    /// each layer `Ffn::Dense` and each FFN matrix the dense role; of its tensors
+    /// only the embedding keeps BF16 words (the body's gather reads them), every
+    /// other one is widened. Mutant: no word reader on the dense variant.
     #[test]
     fn a_small_qwen35_header_reads_dense() {
         let hp =
@@ -1585,6 +1587,14 @@ pub(super) mod tests {
             .filter(|t| t.role == crate::placement::Role::DenseFfn)
             .count();
         assert_eq!(dense, 3 * KINDS.len());
+        let words: Vec<&str> = read
+            .tensors
+            .tensors
+            .iter()
+            .filter(|t| (read.tensors.bf16_words)(t))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(words, ["token_embd.weight"]);
     }
 
     /// The chat surface is the family's on every variant the reader reads
