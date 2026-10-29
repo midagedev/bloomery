@@ -31,7 +31,7 @@
 // for any of 2, 4 and 8, and a SIMD group loads the input once for all its
 // rows (the register reuse MLX's affine_qmv_fast is built on). The SIMD
 // groups in a threadgroup are the function constant of norm.metal: 2 for the
-// dense mat-vec, 8 for the output head.
+// mat-vecs, the output head's logits among them, 8 for the head's argmax.
 //
 // What differs from llama.cpp's loop:
 //   - the matrix is not padded: a SIMD group past the last row returns, and
@@ -67,8 +67,8 @@ inline int simd_first_row(uint tg, ushort sg) {
 // groups once at the end of the block, and the residual adds into the
 // output: the dot product is the same in all of them, so the rows they write
 // are the same bits. ROW_RAISE: a norm-on-load row the scaled sum leaves
-// not finite raises the norm site and is NaN. The head turns it off: its
-// argmax owns a non-finite logit and raises the logit site for it.
+// not finite raises the norm site and is NaN. The head's logits turn it off:
+// its argmax owns a non-finite logit and raises the logit site for it.
 template <typename Q, bool NORM, bool RESID, bool HEADNORM, bool ROW_RAISE = true>
 inline void matvec_rows(device const typename Q::Block * W,
                         device const float      * x,

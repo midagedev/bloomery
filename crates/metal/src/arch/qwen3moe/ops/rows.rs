@@ -20,7 +20,6 @@
 //! its faults land and its head writes its pick, is its last row's: the pass
 //! is the token at its last position as far as the record goes.
 
-use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, Elems, WindowMut};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::LayerCtx;
@@ -29,15 +28,17 @@ use chain::arch::qwen3moe::plan::ResidualPlan;
 use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::rows::FfnRows;
 use super::super::session::SessionError;
-use super::{Half, MetalOps, WHAT, all, all_mut, conv_bufs, post_gain, refuse, rope_of};
+use super::{
+    Half, MetalOps, WHAT, all, all_mut, conv_bufs, head_params, post_gain, refuse, rope_of,
+};
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::kernels::{
     AttentionPrefillParams, AttnCache, AttnLayer, CombineParams, DeltaRowStrides, DeltaRowsParams,
-    DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, HEAD_SIMD_GROUPS,
-    HeadNormRowsParams, HeadParams, NormAddRowsParams, NormRowsParams, Operand, Quant,
-    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams,
-    SwigluRowsParams, route_table_words, route_tiles,
+    DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams,
+    HeadNormRowsParams, NormAddRowsParams, NormRowsParams, Operand, Quant, RouteSelectParams,
+    RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams, SwigluRowsParams,
+    route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -1061,47 +1062,17 @@ impl MetalOps<'_, '_> {
         self.rows_join(cx, Half::Ffn, m)
     }
 
-    /// The head over the pass's last row.
+    /// The head over the pass's last row: the logits, a barrier that closes
+    /// their group, and the pick.
     pub(super) fn rows_head(&mut self, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
+        let hidden = self.arena.hidden;
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
-        let rows = &mut *ctx.arena;
-        let Arena {
-            head_w,
-            head_quant,
-            head_norm,
-            logits,
-            candidates,
-            head_ticket,
-            step_id,
-            faults,
-            eps,
-            hidden,
-            vocab,
-            ..
-        } = &mut *self.arena;
-        let last = rows.x.window(Elems((m - 1) * *hidden), Elems(*hidden))?;
-        self.kernels.head(
-            self.enc,
-            HeadParams {
-                quant: *head_quant,
-                rows: *vocab,
-                k: *hidden,
-                simdgroups: HEAD_SIMD_GROUPS,
-                weights: all(head_w)?,
-                x: last,
-                gain: all(head_norm)?,
-                logits: all_mut(logits)?,
-                candidates: all_mut(candidates)?,
-                ticket: all_mut(head_ticket)?,
-                step_id: step_id.window_mut(Elems(slot), Elems(1))?,
-                eps: *eps,
-                fault: &faults[slot],
-                layer: LAYER_HEAD,
-            },
-        )?;
+        let last = ctx.arena.x.window(Elems((m - 1) * hidden), Elems(hidden))?;
+        let p = head_params(&mut *self.arena, Some(last), slot)?;
+        self.kernels.head(self.enc, p)?;
         Ok(())
     }
 }

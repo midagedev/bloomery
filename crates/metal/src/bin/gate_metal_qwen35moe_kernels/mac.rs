@@ -138,6 +138,20 @@ const WEIGHT_PAD: usize = 66;
 /// The weights' pad for a type whose kernel loads `float4`: the next
 /// 16-byte boundary past the same odd-looking offset.
 const FLOAT4_WEIGHT_PAD: usize = 80;
+/// The weights' pad for a type whose kernels load 32-bit words: the next
+/// 4-byte boundary past the same odd-looking offset.
+const WORD_WEIGHT_PAD: usize = 68;
+
+/// The weights' pad a launch of `quant` takes: the least aligned offset past
+/// the guard its kernels accept, so a read wider than the type's word reads
+/// the poisoned pad or is refused.
+pub fn weight_pad(quant: Quant) -> usize {
+    match quant {
+        Quant::F32 => FLOAT4_WEIGHT_PAD,
+        Quant::A4 => WORD_WEIGHT_PAD,
+        Quant::Q4K | Quant::Q6K | Quant::Q8_0 | Quant::Q5K => WEIGHT_PAD,
+    }
+}
 const WEIGHT_TAIL: usize = 258;
 /// Values the activation and gain buffers hold before their windows.
 const VALUE_PAD: usize = 5;
@@ -259,7 +273,8 @@ impl Harness<'_> {
     pub fn matvec(&self, launch: &Launch<'_>) -> Result<Vec<f32>, String> {
         let (device, stream) = (self.device, self.stream);
         let sentinel = f32::from_bits(SENTINEL_BITS);
-        let weights = padded(0xFFu8, WEIGHT_PAD, launch.weights, WEIGHT_TAIL);
+        let pad = weight_pad(launch.quant);
+        let weights = padded(0xFFu8, pad, launch.weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
         let x = padded(sentinel, VALUE_PAD, launch.x, 1);
         let x = device.upload(stream, &x).map_err(why)?;
@@ -291,7 +306,7 @@ impl Harness<'_> {
             rows: launch.rows,
             cols: launch.cols,
             weights: weights
-                .window(Elems(WEIGHT_PAD), Elems(launch.weights.len()))
+                .window(Elems(pad), Elems(launch.weights.len()))
                 .map_err(why)?,
             x: x.window(Elems(VALUE_PAD), Elems(launch.cols))
                 .map_err(why)?,
@@ -330,11 +345,7 @@ impl Harness<'_> {
         }
         let weight_bytes = weights.len();
         let rows = out_offset;
-        let pad = if launch.quant == Quant::F32 {
-            FLOAT4_WEIGHT_PAD
-        } else {
-            WEIGHT_PAD
-        };
+        let pad = weight_pad(launch.quant);
         let weights = padded(0xFFu8, pad, &weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
         let x = padded(sentinel, VALUE_PAD, launch.x, 1);
@@ -376,7 +387,8 @@ impl Harness<'_> {
     pub fn headnorm(&self, launch: &HeadNormLaunch<'_>) -> Result<Vec<f32>, String> {
         let (device, stream) = (self.device, self.stream);
         let sentinel = f32::from_bits(SENTINEL_BITS);
-        let weights = padded(0xFFu8, WEIGHT_PAD, launch.weights, WEIGHT_TAIL);
+        let pad = weight_pad(launch.quant);
+        let weights = padded(0xFFu8, pad, launch.weights, WEIGHT_TAIL);
         let weights = device.upload(stream, &weights).map_err(why)?;
         let g = padded(sentinel, VALUE_PAD, launch.g, 1);
         let g = device.upload(stream, &g).map_err(why)?;
@@ -390,7 +402,7 @@ impl Harness<'_> {
             rows: launch.rows,
             cols: launch.cols,
             weights: weights
-                .window(Elems(WEIGHT_PAD), Elems(launch.weights.len()))
+                .window(Elems(pad), Elems(launch.weights.len()))
                 .map_err(why)?,
             g: g.window(Elems(VALUE_PAD), Elems(launch.cols))
                 .map_err(why)?,

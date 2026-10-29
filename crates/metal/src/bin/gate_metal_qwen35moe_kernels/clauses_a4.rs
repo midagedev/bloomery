@@ -578,12 +578,6 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
         if let Some(f) = h.fault()? {
             return Err(format!("{name} raised {f}"));
         }
-        if out.ticket != 0 {
-            return Err(format!(
-                "{name}: the ticket counter is {}, not 0",
-                out.ticket
-            ));
-        }
         let xhat = oracle::rms_norm(&x, &gain, eps);
         let reference = oracle::reference(Quant::A4, weights, rows, hidden, &xhat)?;
         let band = oracle::band(Quant::A4, hidden / Quant::A4.values_per_block(), Kind::Norm);

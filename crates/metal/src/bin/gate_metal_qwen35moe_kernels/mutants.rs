@@ -900,8 +900,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "one nibble of an A4 word pairs the lane value beside it",
         edits: &[(
-            "acc[1] += lane.yl[4 * m + 1] * (q[m] & 0x00F0);",
-            "acc[1] += lane.yl[4 * m + 2] * (q[m] & 0x00F0);",
+            "acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);",
+            "acc[1] += lane.yl[4 * m + 2] * (words[m] & 0x00F0);",
             1,
         )],
     },
@@ -910,8 +910,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "an A4 lane reads the group's code words a quarter early",
         edits: &[(
-            "device const uint16_t * q = (device const uint16_t *)blk.qs + 4 * lane.iq;",
-            "device const uint16_t * q = (device const uint16_t *)blk.qs + 2 * lane.iq;",
+            "device const uint32_t * q = blk.qs + 2 * lane.iq;",
+            "device const uint32_t * q = blk.qs + lane.iq;",
             1,
         )],
     },
@@ -920,8 +920,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "the A4 bias term is subtracted, not added",
         edits: &[(
-            "+ bias_of(blk) * lane.sumy;",
-            "- bias_of(blk) * lane.sumy;",
+            "+ as_type<float>(sb & 0xFFFF0000u) * lane.sumy;",
+            "- as_type<float>(sb & 0xFFFF0000u) * lane.sumy;",
             1,
         )],
     },
@@ -930,8 +930,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "the A4 code dot is scaled by the bias, not the scale",
         edits: &[(
-            "return scale_of(blk) * ((acc[0] + 1.f/16.f * acc[1]) +",
-            "return bias_of(blk) * ((acc[0] + 1.f/16.f * acc[1]) +",
+            "return as_type<float>(sb << 16) * ((acc[0] + 1.f/16.f * acc[1]) +",
+            "return as_type<float>(sb & 0xFFFF0000u) * ((acc[0] + 1.f/16.f * acc[1]) +",
             1,
         )],
     },
@@ -976,10 +976,10 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "a4_head_logit",
         clause: "a4_head",
-        why: "the stored logit is doubled",
+        why: "the first stored logit of every SIMD group is doubled",
         edits: &[(
-            "            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
-            "            logits[row] *= 2.f;\n            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
+            "faults, first_row,\n                                              (int)args.rows, tiisg);",
+            "faults, first_row,\n                                              (int)args.rows, tiisg);\n    if (tiisg == 0u && first_row < (int)args.rows) {\n        logits[first_row] *= 2.f;\n    }",
             1,
         )],
     },
@@ -1247,36 +1247,50 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "head_logit",
         clause: "head_logit",
-        why: "the stored logit is doubled",
+        why: "the first stored logit of every SIMD group is doubled",
         edits: &[(
-            "            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
-            "            logits[row] *= 2.f;\n            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
+            "faults, first_row,\n                                              (int)args.rows, tiisg);",
+            "faults, first_row,\n                                              (int)args.rows, tiisg);\n    if (tiisg == 0u && first_row < (int)args.rows) {\n        logits[first_row] *= 2.f;\n    }",
             1,
         )],
     },
     Mutant {
         name: "head_id",
         clause: "head_id",
-        why: "the threadgroup keeps the smaller logit",
+        why: "a thread of the pick keeps the smaller logit",
+        edits: &[("if (v > best_v) {", "if (v < best_v) {", 1)],
+    },
+    Mutant {
+        name: "head_tie_higher",
+        clause: "head_id",
+        why: "a thread of the pick keeps the later row of an equal logit, so a tie is not \
+              the lowest row's",
+        edits: &[("if (v > best_v) {", "if (v >= best_v) {", 1)],
+    },
+    Mutant {
+        name: "head_unroll_last",
+        clause: "head_id",
+        why: "the pick's unrolled run takes three of its four loads, so a winner in the \
+              fourth is lost",
         edits: &[(
-            "v > best_v || (v == best_v && (uint)row < best_i)",
-            "v < best_v || (v == best_v && (uint)row < best_i)",
+            "FOR_UNROLL (short u = 0; u < 4; ++u) {\n            head_take(",
+            "FOR_UNROLL (short u = 0; u < 3; ++u) {\n            head_take(",
             1,
         )],
     },
     Mutant {
-        name: "head_last_group",
+        name: "head_last_row",
         clause: "head_partial",
-        why: "the final reduction stops one candidate short, so the last threadgroup's winner is lost",
+        why: "the pick's tail loop stops one row short, so the last row's logit is never read",
         edits: &[(
-            "for (uint g = tid; g < groups; g += HEAD_THREADS) {",
-            "for (uint g = tid; g < groups - 1u; g += HEAD_THREADS) {",
+            "for (; row < args.rows; row += HEAD_THREADS) {",
+            "for (; row < args.rows - 1u; row += HEAD_THREADS) {",
             1,
         )],
     },
     Mutant {
-        name: "head_ticket",
-        clause: "head_ticket",
+        name: "head_id_plus_one",
+        clause: "head_repeat",
         why: "the step id is one past the selected row",
         edits: &[(
             "step_id[0] = ~uint(best_key)",
@@ -1292,6 +1306,17 @@ pub const MUTANTS: &[Mutant] = &[
             "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);",
             "",
             2,
+        )],
+    },
+    Mutant {
+        name: "head_nan_row",
+        clause: "head_nan",
+        why: "a non-finite logit raises nothing in the pick's scan, and the empty key's raise \
+              stays, which a finite winner never reaches",
+        edits: &[(
+            "if (!isfinite(v)) {\n        raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n    }",
+            "if (!isfinite(v)) {\n    }",
+            1,
         )],
     },
     Mutant {
@@ -1312,7 +1337,7 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "head_stage",
-        clause: "head_ticket",
+        clause: "head_repeat",
         why: "the threadgroup's key reduction skips the last SIMD group's share",
         edits: &[(
             "    ulong best = stage[0];\n    for (uint g = 1u; g < sg_count; ++g) {\n        best = max(best, stage[g]);\n    }",

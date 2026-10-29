@@ -493,11 +493,11 @@ struct Q6K {
 // map splits one group across four lanes — a SIMD group's 32 lanes cover
 // eight groups, 512 values, a pass (the stride). The lane's two consecutive
 // code words hold its sixteen values in address order (nibble j of a word is
-// value j of the word), so the uint16 mask trick reads each nibble of a word
-// pair into its own accumulator and the shift of a whole accumulator folds
-// once into an exact power of two. MLX's own `affine_qmv_fast` (quantized.h)
-// is the design reference for the bias fold; its four-rows-a-thread x reuse
-// is this engine's SIMD-group row loop instead.
+// value j of the word), so the uint16 mask trick, over the four halves of the
+// word pair, reads each nibble into its own accumulator and the shift of a
+// whole accumulator folds once into an exact power of two. MLX's own
+// `affine_qmv_fast` (quantized.h) is the design reference for the bias fold;
+// its four-rows-a-thread x reuse is this engine's SIMD-group row loop instead.
 struct A4 {
     typedef block_mlx_a4 Block;
 
@@ -587,20 +587,27 @@ struct A4 {
 
     // One group's contribution. The scale multiplies the code dot and the
     // bias the lane's input sum, as MLX's `qdot` folds its bias and Q4_K its
-    // dmin term.
+    // dmin term. The lane's two code words and the scale-and-bias pair (the
+    // two BF16s sit at byte 32, scale in the low half) are read as 32-bit
+    // words, the same bits as 16-bit reads in fewer, wider loads; a launch
+    // checks that the weights start on a 4-byte boundary.
     static inline float partial(device const Block & blk,
                                 const thread Lane & lane) {
-        device const uint16_t * q = (device const uint16_t *)blk.qs + 4 * lane.iq;
+        device const uint32_t * q = blk.qs + 2 * lane.iq;
+        const uint32_t sb = *(device const uint32_t *)&blk.scale;
+        const uint32_t w0 = q[0];
+        const uint32_t w1 = q[1];
+        const uint32_t words[4] = {w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16};
         float4 acc = {0.f, 0.f, 0.f, 0.f};
         FOR_UNROLL (short m = 0; m < 4; ++m) {
-            acc[0] += lane.yl[4 * m + 0] * (q[m] & 0x000F);
-            acc[1] += lane.yl[4 * m + 1] * (q[m] & 0x00F0);
-            acc[2] += lane.yl[4 * m + 2] * (q[m] & 0x0F00);
-            acc[3] += lane.yl[4 * m + 3] * (q[m] & 0xF000);
+            acc[0] += lane.yl[4 * m + 0] * (words[m] & 0x000F);
+            acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);
+            acc[2] += lane.yl[4 * m + 2] * (words[m] & 0x0F00);
+            acc[3] += lane.yl[4 * m + 3] * (words[m] & 0xF000);
         }
-        return scale_of(blk) * ((acc[0] + 1.f/16.f * acc[1]) +
-                                (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))
-             + bias_of(blk) * lane.sumy;
+        return as_type<float>(sb << 16) * ((acc[0] + 1.f/16.f * acc[1]) +
+                                           (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))
+             + as_type<float>(sb & 0xFFFF0000u) * lane.sumy;
     }
 
     // A 64-value group sits whole inside one 128-column value head, so the
@@ -629,8 +636,8 @@ struct A4 {
     // Value `j` of a group, the host reader's decode: `s·q + b`, the product
     // and the sum each rounded once (the fp-contract pragma holds the order),
     // the bits the embed's clause holds it to. The code word is read through
-    // 16-bit words: a group's 36 bytes stride every block to the same mod 4,
-    // so a wider read would ask an alignment no launcher checks.
+    // 16-bit words: the embed's and the GEMMs' launches check a 2-byte weights
+    // alignment, and a wider read would ask for 4.
     static inline float value(device const Block & blk, uint j) {
         device const uint16_t * w = (device const uint16_t *)blk.qs;
         const uint word = (uint)w[2 * (j / 8)] | ((uint)w[2 * (j / 8) + 1] << 16);

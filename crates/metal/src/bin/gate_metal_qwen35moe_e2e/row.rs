@@ -236,7 +236,9 @@ pub static QWEN38D: Row = Row {
 /// degenerates the model in the pin's own reference.
 ///
 /// The count is 24 layers of seven groups, P1, mixer, out, join, FFN pair,
-/// down, join, each one dispatch, and the embed and the head: 24 · 7 + 2.
+/// down, join, each one dispatch, and the embed's one group and the head's two
+/// (the logits, then the pick): 24 · 7 + 3.
+/// PIN(2026-10-29): 171, was 170: the head is two dispatches, a barrier between.
 pub static LFM3: Row = Row {
     name: "lfm3",
     arch: refset::arch::lfm3::ARCH,
@@ -251,8 +253,8 @@ pub static LFM3: Row = Row {
     logit_abs: LFM3_LOGIT_ABS,
     deep_logit_abs: Some(LFM3_DEEP_LOGIT_ABS),
     count: Some(Count {
-        groups: 170,
-        dispatches: 170,
+        groups: 171,
+        dispatches: 171,
     }),
     mutants: Mutants::Lfm3,
     skips: &[(

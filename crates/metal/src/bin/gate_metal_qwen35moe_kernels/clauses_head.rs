@@ -1,4 +1,5 @@
-//! The output head's clauses.
+//! The output head's clauses: the logits dispatch, then the pick, launched as
+//! one pair.
 //!
 //! PIN(2026-10-22): the logit band is `oracle::band(Quant::Q6K, nblocks, Kind::Norm)`.
 //! Its operation count is the one that function already derives for the norm on
@@ -11,9 +12,7 @@ use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::geom::Geometry;
 use bloomery_metal::instance::REGISTERED;
-use bloomery_metal::kernels::{
-    HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, Quant, ROWS_PER_SIMD_GROUP, head_groups,
-};
+use bloomery_metal::kernels::{HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, Quant, ROWS_PER_GROUP};
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
@@ -21,9 +20,6 @@ use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::{Fixture, OUTPUT_ROWS};
 use super::oracle::{self, Kind};
 use super::{Harness, SENTINEL_BITS};
-
-/// The rows one threadgroup owns.
-const ROWS_PER_GROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
 
 /// What the fixture's head is written for, held for every registered row: the
 /// 2048-wide tensors the clauses read.
@@ -36,10 +32,8 @@ const _: () = {
 };
 const _: () = assert!(HEAD_SIMD_GROUPS == 8);
 const _: () = assert!(HEAD_THREADS == 256);
-const _: () = assert!(ROWS_PER_GROUP == HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP);
-// The fixture's head is the full grid the shipped dispatch runs.
-const _: () = assert!(head_groups(OUTPUT_ROWS) == 7_760);
-const _: () = assert!(head_groups(OUTPUT_ROWS) * ROWS_PER_GROUP == OUTPUT_ROWS);
+// The fixture's head is whole threadgroups of the logits dispatch.
+const _: () = assert!(OUTPUT_ROWS / ROWS_PER_GROUP * ROWS_PER_GROUP == OUTPUT_ROWS);
 
 const OUTPUT: &str = "output.weight";
 const GAIN: &str = "output_norm.weight";
@@ -50,7 +44,6 @@ const Q6K_D: usize = 208;
 pub struct Out {
     pub logits: Vec<f32>,
     pub id: u32,
-    pub ticket: u32,
 }
 
 fn block_bytes() -> usize {
@@ -118,24 +111,6 @@ pub fn host_argmax(logits: &[f32]) -> Result<(f32, u32), String> {
     Ok((best_v, best_i))
 }
 
-fn group_key(logits: &[f32], base: usize, rows: usize) -> Result<u64, String> {
-    let mut best_v = f32::NEG_INFINITY;
-    let mut best_i = 0u32;
-    let end = (base + ROWS_PER_GROUP).min(rows);
-    let Some(span) = end.checked_sub(base) else {
-        return Ok(argmax_key(best_v, best_i));
-    };
-    for (row, &v) in logits.iter().enumerate().skip(base).take(span) {
-        let i = u32::try_from(row).map_err(|_| format!("row {row} does not fit the step id"))?;
-        let takes = v > best_v || (v == best_v && i < best_i);
-        if takes {
-            best_v = v;
-            best_i = i;
-        }
-    }
-    Ok(argmax_key(best_v, best_i))
-}
-
 /// One head launch's own inputs: what every caller of [`run`] hands it.
 pub struct HeadRun<'a> {
     pub quant: Quant,
@@ -147,8 +122,7 @@ pub struct HeadRun<'a> {
     pub eps: f32,
 }
 
-/// One head launch. Logits start as the sentinel, the ticket as 0, the step
-/// id as `u32::MAX`.
+/// One head launch. Logits start as the sentinel, the step id as `u32::MAX`.
 pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
     let HeadRun {
         quant,
@@ -160,15 +134,12 @@ pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
         eps,
     } = case;
     let (device, stream) = (h.device, h.stream);
-    let groups = head_groups(rows);
     let weights_b = device.upload(stream, weights).map_err(why)?;
     let x_b = device.upload(stream, x).map_err(why)?;
     let gain_b = device.upload(stream, gain).map_err(why)?;
     let mut logits_b = device
         .upload(stream, &vec![f32::from_bits(SENTINEL_BITS); rows])
         .map_err(why)?;
-    let mut candidates_b = device.upload(stream, &vec![0u64; groups]).map_err(why)?;
-    let mut ticket_b = device.upload(stream, &[0]).map_err(why)?;
     let mut step_b = device.upload(stream, &[u32::MAX]).map_err(why)?;
     let fault = device.fault_word();
     h.encode(|encoder| {
@@ -183,8 +154,6 @@ pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
                 x: x_b.window(Elems(0), Elems(x.len()))?,
                 gain: gain_b.window(Elems(0), Elems(gain.len()))?,
                 logits: logits_b.window_mut(Elems(0), Elems(rows))?,
-                candidates: candidates_b.window_mut(Elems(0), Elems(groups))?,
-                ticket: ticket_b.window_mut(Elems(0), Elems(1))?,
                 step_id: step_b.window_mut(Elems(0), Elems(1))?,
                 eps,
                 fault,
@@ -194,21 +163,13 @@ pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
     })?;
     let mut logits = vec![0f32; rows];
     let mut id = [0u32];
-    let mut ticket = [1u32];
     device
         .read(stream, logits_b.whole().map_err(why)?, &mut logits)
         .map_err(why)?;
     device
         .read(stream, step_b.whole().map_err(why)?, &mut id)
         .map_err(why)?;
-    device
-        .read(stream, ticket_b.whole().map_err(why)?, &mut ticket)
-        .map_err(why)?;
-    Ok(Out {
-        logits,
-        id: id[0],
-        ticket: ticket[0],
-    })
+    Ok(Out { logits, id: id[0] })
 }
 
 fn norm_band(k: usize) -> oracle::Band {
@@ -275,12 +236,6 @@ pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         if let Some(f) = h.fault()? {
             return Err(format!("{name} raised {f}"));
         }
-        if out.ticket != 0 {
-            return Err(format!(
-                "{name}: the ticket counter is {}, not 0",
-                out.ticket
-            ));
-        }
         let ratio = check_logits(name, &out.logits, weights, &x, &gain, hidden, eps)?;
         worst = worst.max(ratio);
         notes.push(format!("{name} {rows}x{hidden} {ratio:.3}"));
@@ -337,7 +292,8 @@ fn wide_row(hidden: usize, fixture: &Fixture, eps: f32) -> Result<(&[u8], f64, f
 }
 
 fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
-    const WINNER: usize = 100;
+    /// The fourth load of a thread's unrolled run in the pick's first pass.
+    const WINNER: usize = 3 * HEAD_THREADS + 100;
     let hidden = h.geom().hidden;
     let bytes = row_bytes(hidden);
     let (row, y, width) = wide_row(hidden, fixture, eps)?;
@@ -357,12 +313,6 @@ fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, S
             eps,
         },
     )?;
-    if out.ticket != 0 {
-        return Err(format!(
-            "head-id wide: the ticket counter is {}, not 0",
-            out.ticket
-        ));
-    }
     let gap = y;
     if gap <= width {
         println!("head-id: wide-margin gap {gap:.3e} is inside the band {width:.3e}");
@@ -379,10 +329,16 @@ fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, S
 }
 
 fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, String> {
-    const ROWS: usize = 32;
+    /// Past the pick's first unrolled run: four loads a thread, and a tail.
+    const ROWS: usize = 5 * HEAD_THREADS;
     const K: usize = 256;
+    /// The tied rows: two threads' first rows, and each thread's own later row,
+    /// so the tie is met inside a thread and between threads.
     const LOW: usize = 5;
     const HIGH: usize = 9;
+    const LOW_AGAIN: usize = LOW + HEAD_THREADS;
+    const HIGH_AGAIN: usize = HIGH + 2 * HEAD_THREADS;
+    const TIED: [usize; 4] = [LOW, HIGH, LOW_AGAIN, HIGH_AGAIN];
     let hidden = h.geom().hidden;
     let bytes = row_bytes(hidden);
     let block = block_bytes();
@@ -402,8 +358,9 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
         );
     };
     let mut weights = vec![0u8; ROWS * block];
-    weights[LOW * block..(LOW + 1) * block].copy_from_slice(&good);
-    weights[HIGH * block..(HIGH + 1) * block].copy_from_slice(&good);
+    for row in TIED {
+        weights[row * block..(row + 1) * block].copy_from_slice(&good);
+    }
     let x = dequant(&good, K)?;
     let gain = vec![1f32; K];
     let out = run(
@@ -418,17 +375,13 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
             eps,
         },
     )?;
-    if out.ticket != 0 {
-        return Err(format!(
-            "head-id tie: the ticket counter is {}, not 0",
-            out.ticket
-        ));
-    }
-    if out.logits[LOW].to_bits() != out.logits[HIGH].to_bits() {
-        return Err(format!(
-            "head-id tie: rows {LOW} and {HIGH} are {:e} and {:e}, not the same bits",
-            out.logits[LOW], out.logits[HIGH]
-        ));
+    for row in TIED {
+        if out.logits[row].to_bits() != out.logits[LOW].to_bits() {
+            return Err(format!(
+                "head-id tie: rows {LOW} and {row} are {:e} and {:e}, not the same bits",
+                out.logits[LOW], out.logits[row]
+            ));
+        }
     }
     let tied = out.logits[LOW];
     if !tied.is_finite() {
@@ -437,7 +390,7 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
         ));
     }
     for (i, &v) in out.logits.iter().enumerate() {
-        if i == LOW || i == HIGH {
+        if TIED.contains(&i) {
             continue;
         }
         let above = tied > v;
@@ -458,13 +411,14 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
 }
 
 /// The head over a row count no threadgroup divides, as a vocabulary of 248,144
-/// is: the grid has full groups and a partial last one, and the true argmax is
-/// planted in the partial group's last row. A grid that leaves that group out,
-/// or a reduction that does not read its candidate, loses the winner; the
-/// logits of the last two groups are held to the f64 oracle.
+/// is to a wider grid: the logits dispatch has full groups and a partial last
+/// one, and the true argmax is planted in the partial group's last row, which
+/// is also where the pick's loop ends. A grid that leaves that group out, or a
+/// pick that stops a row short, loses the winner; the logits of the last two
+/// groups are held to the f64 oracle.
 pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    /// The rows of the launch: 7,754 full groups and a last group of 16.
-    const ROWS: usize = 248_144;
+    /// The rows of the launch: full groups and a last group of three.
+    const ROWS: usize = 248_139;
     /// The first row of the last group.
     const LAST_BASE: usize = ROWS / ROWS_PER_GROUP * ROWS_PER_GROUP;
     /// The rows the last group owns.
@@ -499,12 +453,6 @@ pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     if let Some(f) = h.fault()? {
         return Err(format!("head-partial raised {f}"));
     }
-    if out.ticket != 0 {
-        return Err(format!(
-            "head-partial: the ticket counter is {}, not 0",
-            out.ticket
-        ));
-    }
     let from = ROWS - CHECKED;
     let ratio = check_logits(
         "head-partial last groups",
@@ -524,26 +472,24 @@ pub fn head_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     }
     Ok(Verdict::Noted(format!(
         "{ROWS} rows in {} groups, the last of {LAST_ROWS}: id {want}, last {CHECKED} rows {ratio:.3}",
-        head_groups(ROWS)
+        ROWS.div_ceil(ROWS_PER_GROUP)
     )))
 }
 
-pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+/// The head launched a thousand times back to back, a hundred a command
+/// buffer: every launch's logits are finite and its id is the host argmax of
+/// its own logits. A pick that mixes launches, or a launch that leaves a word
+/// of the one before, picks a row its logits do not.
+pub fn head_repeat(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     const LAUNCHES: usize = 1_000;
     const BATCH: usize = 100;
-    /// The threadgroups the ticket handshake runs, whatever the geometry.
+    /// The threadgroups of the logits dispatch, whatever the geometry.
     const GROUPS: usize = 2_304;
     const ROWS: usize = ROWS_PER_GROUP * GROUPS;
     const K: usize = 256;
     let hidden = h.geom().hidden;
     h.clear_fault()?;
     expect_head(h, fixture)?;
-    let groups = ROWS.div_ceil(ROWS_PER_GROUP);
-    if groups != GROUPS {
-        return Err(format!(
-            "{ROWS} rows are {groups} threadgroups, the clause runs {GROUPS}"
-        ));
-    }
     let eps = fixture.rms_eps()?;
     let full = fixture.rows(OUTPUT, GgmlType::Q6_K, hidden, ROWS)?;
     let block = block_bytes();
@@ -568,10 +514,6 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             &vec![f32::from_bits(SENTINEL_BITS); LAUNCHES * ROWS],
         )
         .map_err(why)?;
-    let mut candidates_b = device
-        .upload(stream, &vec![0u64; LAUNCHES * groups])
-        .map_err(why)?;
-    let mut ticket_b = device.upload(stream, &[0]).map_err(why)?;
     let mut step_b = device
         .upload(stream, &vec![u32::MAX; LAUNCHES])
         .map_err(why)?;
@@ -591,9 +533,6 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                         x: x_b.window(Elems(launch * K), Elems(K))?,
                         gain: gain_b.window(Elems(0), Elems(K))?,
                         logits: logits_b.window_mut(Elems(launch * ROWS), Elems(ROWS))?,
-                        candidates: candidates_b
-                            .window_mut(Elems(launch * groups), Elems(groups))?,
-                        ticket: ticket_b.window_mut(Elems(0), Elems(1))?,
                         step_id: step_b.window_mut(Elems(launch), Elems(1))?,
                         eps,
                         fault,
@@ -603,35 +542,17 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             }
             Ok(())
         })?;
-        let mut word = [1u32];
-        device
-            .read(
-                stream,
-                ticket_b.window(Elems(0), Elems(1)).map_err(why)?,
-                &mut word,
-            )
-            .map_err(why)?;
-        if word[0] != 0 {
-            return Err(format!(
-                "after {end} launches the ticket counter is {}, not 0",
-                word[0]
-            ));
-        }
     }
     let mut logits = vec![0f32; LAUNCHES * ROWS];
     let mut ids = vec![0u32; LAUNCHES];
-    let mut candidates = vec![0u64; LAUNCHES * groups];
     device
         .read(stream, logits_b.whole().map_err(why)?, &mut logits)
         .map_err(why)?;
     device
         .read(stream, step_b.whole().map_err(why)?, &mut ids)
         .map_err(why)?;
-    device
-        .read(stream, candidates_b.whole().map_err(why)?, &mut candidates)
-        .map_err(why)?;
     if let Some(f) = h.fault()? {
-        return Err(format!("head-ticket raised {f}"));
+        return Err(format!("head-repeat raised {f}"));
     }
     for launch in 0..LAUNCHES {
         let rows = &logits[launch * ROWS..(launch + 1) * ROWS];
@@ -645,18 +566,9 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                 ids[launch]
             ));
         }
-        let packed = &candidates[launch * groups..(launch + 1) * groups];
-        for (g, &got) in packed.iter().enumerate() {
-            let key = group_key(rows, g * ROWS_PER_GROUP, ROWS)?;
-            if got != key {
-                return Err(format!(
-                    "launch {launch} group {g} packed {got:#x}, the group's argmax is {key:#x}"
-                ));
-            }
-        }
     }
     Ok(Verdict::Noted(format!(
-        "{LAUNCHES} launches, ids and candidates match the logits, ticket is 0"
+        "{LAUNCHES} launches, every id the argmax of its own logits"
     )))
 }
 
@@ -729,12 +641,6 @@ pub fn head_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             out.id
         ));
     }
-    if out.ticket != 0 {
-        return Err(format!(
-            "head-nan: the ticket counter is {}, not 0",
-            out.ticket
-        ));
-    }
     Ok(Verdict::Noted(
         "logit site, the NaN stays stored, the id is the finite argmax".to_string(),
     ))
@@ -799,12 +705,6 @@ pub fn head_all_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err(format!("an all-NaN head stored id {}, a token id", out.id));
     }
     common::expect_fault(h, "an all-NaN head", FaultSite::Logit)?;
-    if out.ticket != 0 {
-        return Err(format!(
-            "head-all-nan: the ticket counter is {}, not 0",
-            out.ticket
-        ));
-    }
     Ok(Verdict::Noted(
         "logit site, every logit stays NaN, the id is not a token".to_string(),
     ))
@@ -819,12 +719,12 @@ struct Args {
     simdgroups: usize,
     eps: f32,
     weights: usize,
+    /// The byte the weights' window starts at in its buffer.
+    weights_at: usize,
     x: usize,
     gain: usize,
     logits: usize,
-    candidates: usize,
     step_id: usize,
-    ticket: usize,
 }
 
 impl Args {
@@ -835,12 +735,11 @@ impl Args {
             simdgroups: HEAD_SIMD_GROUPS,
             eps: 1e-5,
             weights: weights_len,
+            weights_at: 0,
             x: k,
             gain: k,
             logits: rows,
-            candidates: 1,
             step_id: 1,
-            ticket: 1,
         }
     }
 }
@@ -852,8 +751,6 @@ struct BoundBufs<'a> {
     x: &'a MetalBuffer<f32>,
     gain: &'a MetalBuffer<f32>,
     logits: &'a mut MetalBuffer<f32>,
-    candidates: &'a mut MetalBuffer<u64>,
-    ticket: &'a mut MetalBuffer<u32>,
     step_id: &'a mut MetalBuffer<u32>,
 }
 
@@ -870,12 +767,10 @@ fn refuse(
             rows: a.rows,
             k: a.k,
             simdgroups: a.simdgroups,
-            weights: bufs.weights.window(Elems(0), Elems(a.weights))?,
+            weights: bufs.weights.window(Elems(a.weights_at), Elems(a.weights))?,
             x: bufs.x.window(Elems(0), Elems(a.x))?,
             gain: bufs.gain.window(Elems(0), Elems(a.gain))?,
             logits: bufs.logits.window_mut(Elems(0), Elems(a.logits))?,
-            candidates: bufs.candidates.window_mut(Elems(0), Elems(a.candidates))?,
-            ticket: bufs.ticket.window_mut(Elems(0), Elems(a.ticket))?,
             step_id: bufs.step_id.window_mut(Elems(0), Elems(a.step_id))?,
             eps: a.eps,
             fault: h.device.fault_word(),
@@ -902,6 +797,11 @@ fn bad<'a>(
     )
 }
 
+/// The launches the host module must refuse, each by name, with nothing
+/// written.
+///
+/// PIN(2026-10-29): the head has no candidates or ticket window, so the four
+/// refusal cases of those windows are gone with them.
 pub fn head_bounds(h: &Harness<'_>) -> Clause {
     const K: usize = 256;
     const ROWS: usize = 16;
@@ -916,16 +816,12 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
     let mut logits = device
         .upload(stream, &[f32::from_bits(SENTINEL_BITS); ROWS + 4])
         .map_err(why)?;
-    let mut candidates = device.upload(stream, &[0u64; 4]).map_err(why)?;
-    let mut ticket = device.upload(stream, &[u32::MAX, u32::MAX]).map_err(why)?;
     let mut step_id = device.upload(stream, &[u32::MAX, u32::MAX]).map_err(why)?;
     let mut bufs = BoundBufs {
         weights: &weights,
         x: &x,
         gain: &gain,
         logits: &mut logits,
-        candidates: &mut candidates,
-        ticket: &mut ticket,
         step_id: &mut step_id,
     };
     let whole = Args::whole(K, ROWS, weights_len);
@@ -978,16 +874,6 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
             Box::new(|a| a.logits = whole.logits + 1),
         ),
         case(
-            "an empty candidates window",
-            "candidates",
-            Box::new(|a| a.candidates = 0),
-        ),
-        case(
-            "a long candidates window",
-            "candidates",
-            Box::new(|a| a.candidates = 2),
-        ),
-        case(
             "an empty step id window",
             "step id",
             Box::new(|a| a.step_id = 0),
@@ -998,12 +884,6 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
             Box::new(|a| a.step_id = 2),
         ),
         case(
-            "an empty ticket window",
-            "ticket",
-            Box::new(|a| a.ticket = 0),
-        ),
-        case("a long ticket window", "ticket", Box::new(|a| a.ticket = 2)),
-        case(
             "a short weights window",
             "weights",
             Box::new(|a| a.weights = whole.weights - 1),
@@ -1012,6 +892,11 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
             "a long weights window",
             "weights",
             Box::new(|a| a.weights = whole.weights + 1),
+        ),
+        case(
+            "weights at an odd byte offset",
+            "16-bit words",
+            Box::new(|a| a.weights_at = 1),
         ),
         case(
             "no SIMD groups",
@@ -1031,7 +916,6 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
     ];
     let unchanged = |h: &Harness<'_>, b: &BoundBufs<'_>| {
         common::still(h, b.logits, |v| v.to_bits() == SENTINEL_BITS)?;
-        common::still(h, b.ticket, |v| *v == u32::MAX)?;
         common::still(h, b.step_id, |v| *v == u32::MAX)
     };
     let count = common::refuse_launches(h, "head", &mut bufs, cases, unchanged)?;
@@ -1053,7 +937,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cla
         ("head_logit", Box::new(|| ctx.with(head_logit))),
         ("head_id", Box::new(|| ctx.with(head_id))),
         ("head_partial", Box::new(|| ctx.with(head_partial))),
-        ("head_ticket", Box::new(|| ctx.with(head_ticket))),
+        ("head_repeat", Box::new(|| ctx.with(head_repeat))),
         ("head_nan", Box::new(|| ctx.with(head_nan))),
         ("head_all_nan", Box::new(|| ctx.with(head_all_nan))),
         ("head_bounds", Box::new(|| head_bounds(ctx.harness))),

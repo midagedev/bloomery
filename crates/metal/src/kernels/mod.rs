@@ -18,7 +18,7 @@
 //! The routed gate-up pair and the folded down are one dispatch each.
 //! The gated delta step ([`delta`]) writes the numerator and the partials that
 //! mat-vec reads. Its kernel is `kernels/delta.metal`.
-//! The head ([`head`]) is one more pipeline: `kernels/head.metal`, the same ticket.
+//! The head ([`head`]) is two more: the logits mat-vec and the argmax over them, `kernels/head.metal`.
 //! The short conv ([`shortconv`]) of a gated-conv mixer is `kernels/shortconv.metal`; the
 //! sandwich residual is `kernels/norm.metal`'s `norm_add_rows`.
 
@@ -75,7 +75,7 @@ pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
 };
-pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, head_groups};
+pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormAddRowsParams;
@@ -169,12 +169,15 @@ pub struct Kernels {
     /// The gated delta step over rows, and the ring commit after it.
     delta_rows: delta::RowsPipelines,
     attention: attention::AttentionPipelines,
-    /// The output head: the Q6_K entry (A4's, Q8_0's and Q5_K's are
-    /// `head_a4`, `head_q8_0` and `head_q5k`; Q4_K has none).
-    head_q6k: Pipeline,
-    head_a4: Pipeline,
-    head_q8_0: Pipeline,
-    head_q5k: Pipeline,
+    /// The output head's logits dispatch: the Q6_K entry (A4's, Q8_0's and
+    /// Q5_K's are `head_logits_a4`, `head_logits_q8_0` and `head_logits_q5k`;
+    /// Q4_K has none).
+    head_logits_q6k: Pipeline,
+    head_logits_a4: Pipeline,
+    head_logits_q8_0: Pipeline,
+    head_logits_q5k: Pipeline,
+    /// The output head's argmax over the logits, the one entry of every type.
+    head_pick: Pipeline,
     /// The launch geometry of the library's instance: the numbers every
     /// launch sizes its grid and checks its windows by.
     geom: Geometry,
@@ -366,25 +369,15 @@ impl Kernels {
             delta: library.pipeline("gdn_step")?,
             delta_rows: delta::RowsPipelines::new(library)?,
             attention: attention::AttentionPipelines::new(library)?,
-            // The head's SIMD-group count, not the mat-vec count this function
-            // was given. The constant is the pipeline's function constant.
-            head_q6k: library.pipeline_with_simdgroups(
-                "q6k_head_argmax",
-                u32::try_from(head::HEAD_SIMD_GROUPS)
-                    .expect("the head's SIMD-group count fits u32"),
-            )?,
-            head_a4: library.pipeline_with_simdgroups(
-                "a4_head_argmax",
-                u32::try_from(head::HEAD_SIMD_GROUPS)
-                    .expect("the head's SIMD-group count fits u32"),
-            )?,
-            head_q8_0: library.pipeline_with_simdgroups(
-                "q8_0_head_argmax",
-                u32::try_from(head::HEAD_SIMD_GROUPS)
-                    .expect("the head's SIMD-group count fits u32"),
-            )?,
-            head_q5k: library.pipeline_with_simdgroups(
-                "q5k_head_argmax",
+            head_logits_q6k: library.pipeline_with_simdgroups("q6k_head_logits", count)?,
+            head_logits_a4: library.pipeline_with_simdgroups("a4_head_logits", count)?,
+            head_logits_q8_0: library.pipeline_with_simdgroups("q8_0_head_logits", count)?,
+            head_logits_q5k: library.pipeline_with_simdgroups("q5k_head_logits", count)?,
+            // The argmax's SIMD-group count, not the mat-vec count this
+            // function was given. The constant is the pipeline's function
+            // constant.
+            head_pick: library.pipeline_with_simdgroups(
+                "logits_argmax",
                 u32::try_from(head::HEAD_SIMD_GROUPS)
                     .expect("the head's SIMD-group count fits u32"),
             )?,
@@ -454,6 +447,8 @@ pub(crate) fn range(what: &'static str, detail: impl Into<String>) -> DeviceErro
 pub(crate) enum WeightAlign {
     /// The kernel loads `float4` from the window.
     Float4,
+    /// The kernel loads 32-bit words from the window.
+    Word,
     /// The kernel loads 16-bit words from the window.
     Half,
 }
@@ -475,6 +470,17 @@ pub(crate) fn check_weights_align(
                 what,
                 format!(
                     "the {name} window starts {start} bytes into its buffer and is not 16-byte aligned"
+                ),
+            ))
+        }
+        WeightAlign::Word => {
+            if start.is_multiple_of(4) {
+                return Ok(());
+            }
+            Err(range(
+                what,
+                format!(
+                    "the {name} weights start {start} bytes into their buffer: the kernels read 32-bit words"
                 ),
             ))
         }

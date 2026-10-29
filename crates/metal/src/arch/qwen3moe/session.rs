@@ -2390,8 +2390,9 @@ impl ChainOps for PassProfiler<'_> {
 /// The profiled step's groups: each group of [`MetalOps`] on its own command
 /// buffer, waited, its GPU interval read, one sample appended. The groups
 /// are the token's as the encoder counts them, so the walk's `experts` is two
-/// groups (the gate-up and the down), and on a sandwich every half's out and
-/// the down are each followed by a join group.
+/// groups (the gate-up and the down), the head is two (the logits and the
+/// pick), and on a sandwich every half's out and the down are each followed by
+/// a join group.
 struct Profiler<'s> {
     stream: &'s MetalStream,
     kernels: &'s Kernels,
@@ -2519,7 +2520,8 @@ impl ChainOps for Profiler<'_> {
     }
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
-        self.one(GroupKind::Head, None, |o| o.head(m))
+        self.one(GroupKind::Head, None, |o| o.head_logits(m))?;
+        self.one(GroupKind::HeadPick, None, |o| o.head_pick(m))
     }
 }
 

@@ -355,6 +355,7 @@ struct Refusals {
 /// it is given, one of them bad.
 #[derive(Clone, Copy)]
 struct Args {
+    quant: Quant,
     rows: usize,
     cols: usize,
     weights: usize,
@@ -368,6 +369,7 @@ struct Args {
 impl Args {
     const fn whole(rows: usize, cols: usize, bytes: usize) -> Self {
         Self {
+            quant: Quant::Q4K,
             rows,
             cols,
             weights: bytes,
@@ -397,7 +399,7 @@ fn refuse(
     h.kernels.matvec(
         encoder,
         MatvecParams {
-            quant: Quant::Q4K,
+            quant: a.quant,
             rows: a.rows,
             cols: a.cols,
             weights: b.weights.window(Elems(a.weights_at), Elems(a.weights))?,
@@ -459,6 +461,18 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
             "weights at an odd byte offset",
             "16-bit words",
             |a| a.weights_at = 1,
+            h,
+            whole,
+        ),
+        // A4's 36-byte groups total the Q4_K shape's bytes at these rows and
+        // columns, so the same window holds them.
+        bad(
+            "A4 weights two bytes into their buffer",
+            "32-bit words",
+            |a| {
+                a.quant = Quant::A4;
+                a.weights_at = 2;
+            },
             h,
             whole,
         ),

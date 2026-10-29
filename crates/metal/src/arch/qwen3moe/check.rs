@@ -43,7 +43,7 @@ use super::rows::RowsLens;
 use super::session::{PROJECTED, SITES, SessionError, WHAT, pass_rows_max};
 use crate::geom::Geometry;
 use crate::instance::{self, Instance};
-use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, head_groups, segments_for_keys, shared_entry};
+use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, segments_for_keys, shared_entry};
 
 /// The arena's name in a refusal.
 const ARENA: &str = "qwen35moe arena";
@@ -1698,14 +1698,12 @@ impl Checked {
             1,
             geom.experts.slots * geom.experts.k,
             g.vocab,
-            1,
             super::arena::RECORD_SLOTS,
             1,
             LANES,
         ] {
             b.scratch.add(f32s(words));
         }
-        b.scratch.add(count(head_groups(g.vocab)) * 8);
         // The fault word of each step record slot.
         for _ in 0..super::arena::RECORD_SLOTS {
             b.scratch.add(count(FAULT_WORDS) * 4);
@@ -2270,8 +2268,7 @@ mod tests {
             ]
             .map(f32s),
         );
-        scratch.push(count(head_groups(vocab)) * 8); // candidates
-        scratch.extend([1, RECORD_SLOTS, 1, LANES].map(f32s)); // head_ticket, step_id, id_in, lane
+        scratch.extend([RECORD_SLOTS, 1, LANES].map(f32s)); // step_id, id_in, lane
         scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
         assert_eq!(bytes.scratch, class(&scratch));
 
@@ -2368,8 +2365,7 @@ mod tests {
             ]
             .map(f32s),
         );
-        scratch.push(count(head_groups(vocab)) * 8); // candidates
-        scratch.extend([1, RECORD_SLOTS, 1, LANES].map(f32s)); // head_ticket, step_id, id_in, lane
+        scratch.extend([RECORD_SLOTS, 1, LANES].map(f32s)); // step_id, id_in, lane
         scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
         assert_eq!(bytes.scratch, class(&scratch));
 
@@ -3191,14 +3187,12 @@ mod tests {
                 1,                                       // attn_ticket
                 g.experts.slots * g.experts.k,           // h
                 vocab,                                   // logits
-                1,                                       // head_ticket
                 RECORD_SLOTS,                            // step_id
                 1,                                       // id_in
                 LANES,                                   // lane
             ]
             .map(f32s),
         );
-        scratch.push(count(head_groups(vocab)) * 8); // candidates
         scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
         assert_eq!(bytes.scratch, class(&scratch));
 

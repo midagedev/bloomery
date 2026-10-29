@@ -15,22 +15,21 @@
 //!   `Mode::Store`, which is what a sandwich session launches, and through the
 //!   experts' fold at its one slot, which is what a plain-residual dense
 //!   session launches;
-//! - the head: `a4_head_argmax` over 128000 rows of 2048.
+//! - the head: the logits dispatch, a barrier and `logits_argmax`, over 128000
+//!   rows of 2048.
 //!
 //! Beside those the probe times diagnostic rows, labelled in brackets, that
 //! split a row into terms. The head is also timed as a plain mat-vec of its
-//! shape (`[plain]`: no norm, no argmax) and as a one-segment norm-on-load
-//! mat-vec (`[norm]`: the norm, no argmax), so that the head's time is
-//! `[plain]` plus the norm's term (`[norm]` less `[plain]`) plus the
-//! argmax's term (the head less `[norm]`). Three source cuts of the head
-//! (`[nobar1]`, `[noscan]`, `[noticket]`) each remove one step of the head's
-//! per-threadgroup tail. A plain mat-vec of the gate's shape is timed beside
-//! its norm-on-load form and five cuts of the A4 row loop: `[fma]` (the dot
-//! accumulated with `fma`, the one float change), `[wide]` (the code words and
-//! the scale and bias read as 32-bit words: the same bits), `[vecx]` (the
-//! activations read as `float4`s: the same bits), `[lite]` (the dot reduced to
-//! a conversion and an add a word, the weight reads kept: what the loads alone
-//! cost) and `[all]` (`wide`, `vecx` and `fma` together).
+//! shape (`[plain]`: no norm, no pick), as a one-segment norm-on-load mat-vec
+//! (`[norm]`: the norm, no pick) and as the pick alone (`[pick]`:
+//! `logits_argmax` over the zero logits the output buffer holds), so that the
+//! head's time is `[plain]` plus the norm's term (`[norm]` less `[plain]`)
+//! plus the pick's term (the head less `[norm]`, which `[pick]` reads on its
+//! own). A plain mat-vec of the gate's shape is timed beside its norm-on-load
+//! form and three cuts of the A4 row loop: `[fma]` (the dot accumulated with
+//! `fma`, the one float change), `[vecx]` (the activations read as `float4`s:
+//! the same bits) and `[lite]` (the dot reduced to a conversion and an add a
+//! word, the weight reads kept: what the loads alone cost).
 //!
 //! A cut is a copy of the instance's program text with counted edits, the way
 //! the phase cuts of the other rows are: each find text must occur exactly
@@ -54,7 +53,8 @@ use bloomery_metal::kernels::{Kernels, Quant};
 use bloomery_metal::library::{Library, sources_for};
 
 use super::{
-    Run, Shape, WARMUPS, WINDOW_BYTES, WORKING_SET_BYTES, geometry_kernels, time_arms, time_shape,
+    HeadPart, Run, Shape, WARMUPS, WINDOW_BYTES, WORKING_SET_BYTES, geometry_kernels, time_arms,
+    time_shape,
 };
 
 /// LFM3-1.7B's residual width, dense FFN width and vocabulary.
@@ -80,78 +80,23 @@ struct Cut {
 
 /// The A4 block's accumulate lines, in the dot's own order.
 const ACC_FIND: &str = concat!(
-    "            acc[0] += lane.yl[4 * m + 0] * (q[m] & 0x000F);\n",
-    "            acc[1] += lane.yl[4 * m + 1] * (q[m] & 0x00F0);\n",
-    "            acc[2] += lane.yl[4 * m + 2] * (q[m] & 0x0F00);\n",
-    "            acc[3] += lane.yl[4 * m + 3] * (q[m] & 0xF000);\n",
-);
-
-/// The same four lines with `fma`: the contracted form of the products.
-const ACC_FMA: &str = concat!(
-    "            acc[0] = fma(lane.yl[4 * m + 0], float(q[m] & 0x000F), acc[0]);\n",
-    "            acc[1] = fma(lane.yl[4 * m + 1], float(q[m] & 0x00F0), acc[1]);\n",
-    "            acc[2] = fma(lane.yl[4 * m + 2], float(q[m] & 0x0F00), acc[2]);\n",
-    "            acc[3] = fma(lane.yl[4 * m + 3], float(q[m] & 0xF000), acc[3]);\n",
-);
-
-/// The dot reduced to one conversion and one add a code word: the weight and
-/// the scale and bias reads stay, and the per-value work goes.
-const ACC_LITE: &str = "            acc[0] += float(q[m]);\n";
-
-/// The A4 block's dot from its first read to its return.
-const PARTIAL_FIND: &str = concat!(
-    "        device const uint16_t * q = (device const uint16_t *)blk.qs + 4 * lane.iq;\n",
-    "        float4 acc = {0.f, 0.f, 0.f, 0.f};\n",
-    "        FOR_UNROLL (short m = 0; m < 4; ++m) {\n",
-    "            acc[0] += lane.yl[4 * m + 0] * (q[m] & 0x000F);\n",
-    "            acc[1] += lane.yl[4 * m + 1] * (q[m] & 0x00F0);\n",
-    "            acc[2] += lane.yl[4 * m + 2] * (q[m] & 0x0F00);\n",
-    "            acc[3] += lane.yl[4 * m + 3] * (q[m] & 0xF000);\n",
-    "        }\n",
-    "        return scale_of(blk) * ((acc[0] + 1.f/16.f * acc[1]) +\n",
-    "                                (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))\n",
-    "             + bias_of(blk) * lane.sumy;\n",
-);
-
-/// The same dot over two 32-bit code words and one 32-bit scale-and-bias
-/// word: a code word's halves are the 16-bit words the shipped dot reads, in
-/// the same order, so the bits are the shipped dot's.
-const PARTIAL_WIDE: &str = concat!(
-    "        device const uint32_t * q = blk.qs + 2 * lane.iq;\n",
-    "        const uint32_t sb = *(device const uint32_t *)&blk.scale;\n",
-    "        const uint32_t w0 = q[0];\n",
-    "        const uint32_t w1 = q[1];\n",
-    "        const uint32_t words[4] = {w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16};\n",
-    "        float4 acc = {0.f, 0.f, 0.f, 0.f};\n",
-    "        FOR_UNROLL (short m = 0; m < 4; ++m) {\n",
     "            acc[0] += lane.yl[4 * m + 0] * (words[m] & 0x000F);\n",
     "            acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);\n",
     "            acc[2] += lane.yl[4 * m + 2] * (words[m] & 0x0F00);\n",
     "            acc[3] += lane.yl[4 * m + 3] * (words[m] & 0xF000);\n",
-    "        }\n",
-    "        return as_type<float>(sb << 16) * ((acc[0] + 1.f/16.f * acc[1]) +\n",
-    "                                           (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))\n",
-    "             + as_type<float>(sb & 0xFFFF0000u) * lane.sumy;\n",
 );
 
-/// `PARTIAL_WIDE` with the products contracted.
-const PARTIAL_WIDE_FMA: &str = concat!(
-    "        device const uint32_t * q = blk.qs + 2 * lane.iq;\n",
-    "        const uint32_t sb = *(device const uint32_t *)&blk.scale;\n",
-    "        const uint32_t w0 = q[0];\n",
-    "        const uint32_t w1 = q[1];\n",
-    "        const uint32_t words[4] = {w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16};\n",
-    "        float4 acc = {0.f, 0.f, 0.f, 0.f};\n",
-    "        FOR_UNROLL (short m = 0; m < 4; ++m) {\n",
+/// The same four lines with `fma`: the contracted form of the products.
+const ACC_FMA: &str = concat!(
     "            acc[0] = fma(lane.yl[4 * m + 0], float(words[m] & 0x000F), acc[0]);\n",
     "            acc[1] = fma(lane.yl[4 * m + 1], float(words[m] & 0x00F0), acc[1]);\n",
     "            acc[2] = fma(lane.yl[4 * m + 2], float(words[m] & 0x0F00), acc[2]);\n",
     "            acc[3] = fma(lane.yl[4 * m + 3], float(words[m] & 0xF000), acc[3]);\n",
-    "        }\n",
-    "        return as_type<float>(sb << 16) * ((acc[0] + 1.f/16.f * acc[1]) +\n",
-    "                                           (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))\n",
-    "             + as_type<float>(sb & 0xFFFF0000u) * lane.sumy;\n",
 );
+
+/// The dot reduced to one conversion and one add a code word: the weight and
+/// the scale and bias reads stay, and the per-value work goes.
+const ACC_LITE: &str = "            acc[0] += float(words[m]);\n";
 
 /// The A4 block's activation reads: sixteen scalar floats a lane.
 const LOAD_FIND: &str = concat!(
@@ -180,10 +125,6 @@ static FMA: Cut = Cut {
     name: "fma",
     edits: &[(ACC_FIND, ACC_FMA)],
 };
-static WIDE: Cut = Cut {
-    name: "wide",
-    edits: &[(PARTIAL_FIND, PARTIAL_WIDE)],
-};
 static VECX: Cut = Cut {
     name: "vecx",
     edits: &[(LOAD_FIND, LOAD_VEC)],
@@ -191,64 +132,6 @@ static VECX: Cut = Cut {
 static LITE: Cut = Cut {
     name: "lite",
     edits: &[(ACC_FIND, ACC_LITE)],
-};
-static ALL: Cut = Cut {
-    name: "all",
-    edits: &[(PARTIAL_FIND, PARTIAL_WIDE_FMA), (LOAD_FIND, LOAD_VEC)],
-};
-
-/// The head's first device barrier: the SIMD group's lane 0 reads back only
-/// the rows its own SIMD group stored, so the cut leaves the threadgroup's
-/// other barrier to publish the logits to the reducing thread.
-static NOBAR1: Cut = Cut {
-    name: "nobar1",
-    edits: &[(
-        concat!(
-            "    // Every logit this group stored is visible.\n",
-            "    threadgroup_barrier(mem_flags::mem_device);\n",
-        ),
-        "",
-    )],
-};
-
-/// The head's serial scan of a threadgroup's logits: the thread's compare
-/// chain stays, the device reads go.
-static NOSCAN: Cut = Cut {
-    name: "noscan",
-    edits: &[(
-        concat!(
-            "            int row = base + r;\n",
-            "            if (row >= (int)args.rows) {\n",
-            "                break;\n",
-            "            }\n",
-            "            float v = logits[row];\n",
-        ),
-        concat!(
-            "            int row = base + r;\n",
-            "            if (row >= (int)args.rows) {\n",
-            "                break;\n",
-            "            }\n",
-            "            float v = (float)row;\n",
-        ),
-    )],
-};
-
-/// The head's ticket: no threadgroup counts itself, so none is last and the
-/// final reduction never runs.
-static NOTICKET: Cut = Cut {
-    name: "noticket",
-    edits: &[(
-        concat!(
-            "    ticket_is_last(ticket, groups, tid, last_flag);\n",
-            "    if (last_flag == 1u) {\n",
-            "        // The threads of the last threadgroup share the candidates by\n",
-        ),
-        concat!(
-            "    last_flag = 0u;\n",
-            "    if (last_flag == 1u) {\n",
-            "        // The threads of the last threadgroup share the candidates by\n",
-        ),
-    )],
 };
 
 /// The band a row's window arm is predicted to fall in, and the measured
@@ -292,10 +175,11 @@ fn expect(lo: f64, hi: f64, basis: &'static str) -> Option<Expect> {
 fn rows() -> Vec<Row> {
     let hidden = HIDDEN as usize;
     let ff = FF as usize;
-    let head = || Shape::Head {
+    let head = |part: HeadPart| Shape::Head {
         quant: Quant::A4,
         rows: VOCAB,
         cols: hidden,
+        part,
     };
     let loop_shape = || a4_matvec(ff, hidden);
     let mut rows = vec![
@@ -348,9 +232,13 @@ fn rows() -> Vec<Row> {
             cut: None,
         },
         Row {
-            label: format!("lfm3 head a4_head_argmax {VOCAB}x{hidden}"),
-            shape: head(),
-            expect: expect(62.0, 78.0, "profile head 70.8 GB/s"),
+            label: format!("lfm3 head a4_head_logits+logits_argmax {VOCAB}x{hidden}"),
+            shape: head(HeadPart::Pair),
+            expect: expect(
+                105.0,
+                123.0,
+                "derived: the round's predicted 1.2 to 1.4 ms over the head's 147.5 MB",
+            ),
             cut: None,
         },
         Row {
@@ -374,14 +262,12 @@ fn rows() -> Vec<Row> {
             cut: None,
         },
     ];
-    for cut in [&NOBAR1, &NOSCAN, &NOTICKET] {
-        rows.push(Row {
-            label: format!("lfm3 head a4_head_argmax {VOCAB}x{hidden} [{}]", cut.name),
-            shape: head(),
-            expect: None,
-            cut: Some(cut),
-        });
-    }
+    rows.push(Row {
+        label: format!("lfm3 head [pick] logits_argmax {VOCAB}"),
+        shape: head(HeadPart::Pick),
+        expect: None,
+        cut: None,
+    });
     rows.push(Row {
         label: format!("lfm3 loop matvec a4 {ff}x{hidden} store"),
         shape: loop_shape(),
@@ -402,7 +288,7 @@ fn rows() -> Vec<Row> {
         ),
         cut: None,
     });
-    for cut in [&FMA, &WIDE, &VECX, &LITE, &ALL] {
+    for cut in [&FMA, &VECX, &LITE] {
         rows.push(Row {
             label: format!("lfm3 loop matvec a4 {ff}x{hidden} store [{}]", cut.name),
             shape: loop_shape(),

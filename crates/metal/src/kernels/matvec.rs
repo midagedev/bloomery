@@ -111,12 +111,13 @@ impl Quant {
         }
     }
 
-    /// The alignment the segmented mat-vec's weight reads need: the 16-bit
-    /// words of the quantized blocks, or F32's `float4` loads.
+    /// The alignment the row loops' weight reads need: A4's 32-bit words, the
+    /// 16-bit words of the other quantized blocks, or F32's `float4` loads.
     pub(crate) const fn weight_align(self) -> super::WeightAlign {
         match self {
             Self::F32 => super::WeightAlign::Float4,
-            Self::Q4K | Self::Q6K | Self::A4 | Self::Q8_0 | Self::Q5K => super::WeightAlign::Half,
+            Self::A4 => super::WeightAlign::Word,
+            Self::Q4K | Self::Q6K | Self::Q8_0 | Self::Q5K => super::WeightAlign::Half,
         }
     }
 
@@ -131,7 +132,8 @@ impl Quant {
     }
 
     /// Whether the head launch has an entry for the type: the
-    /// `Kernels::head` pipeline match, which refuses the others by name.
+    /// `Kernels::head` logits pipeline match, which refuses the others by
+    /// name.
     #[must_use]
     pub const fn heads(self) -> bool {
         match self {
@@ -261,10 +263,10 @@ fn check(
     if let Mode::NormOnLoad(norm) = &p.mode {
         check_window_len(WHAT, "gain", norm.gain.len(), p.cols)?;
     }
-    // The kernels read the weights as 16-bit words, from the window's byte
-    // offset in its buffer.
+    // The kernels read the weights as words of the type's width, from the
+    // window's byte offset in its buffer.
     let start = p.weights.byte_range()?.start.get();
-    super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
+    super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
     Ok(Shape {
         nblocks: word(WHAT, "the block count", nblocks)?,
         rows: word(WHAT, "the row count", p.rows)?,

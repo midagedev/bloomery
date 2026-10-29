@@ -393,8 +393,7 @@ pub fn fold(h: &Harness<'_>, quant: Quant) -> Clause {
 }
 
 /// The head over the whole vocabulary: every logit against the norm-on-load
-/// oracle band, the step id the host argmax of the read-back logits, the
-/// ticket counter back at 0.
+/// oracle band, the step id the host argmax of the read-back logits.
 pub fn head(h: &Harness<'_>, quant: Quant) -> Clause {
     let hidden = h.geom().hidden;
     let weights = synthetic::matrix(quant, OUTPUT_ROWS, hidden, salt(quant) + 0x60);
@@ -415,9 +414,6 @@ pub fn head(h: &Harness<'_>, quant: Quant) -> Clause {
     )?;
     if let Some(f) = h.fault()? {
         return Err(format!("the head raised {f}"));
-    }
-    if out.ticket != 0 {
-        return Err(format!("the ticket counter is {}, not 0", out.ticket));
     }
     let xhat = oracle::rms_norm(&x, &gain, EPS);
     let reference = oracle::reference(quant, &weights, OUTPUT_ROWS, hidden, &xhat)?;

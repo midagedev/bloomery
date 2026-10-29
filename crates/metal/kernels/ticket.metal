@@ -1,11 +1,10 @@
-// The ticket: the one owner of the cross-threadgroup handoff. The router
-// calls the float pair. The head calls the u64 pair for a packed candidate,
-// and the same arrive, acquire and reset. The last threadgroup's reductions
-// of the argmax key live here too, beside the handoff they follow.
+// The ticket: the one owner of the cross-threadgroup handoff. The router and
+// the attention fold call the float pair, the arrive, the acquire and the
+// reset. The argmax key and the threadgroup's reduction of it live here too:
+// the router and the output head's argmax both pack and reduce keys.
 //
 // The contract is these functions, in this order:
 //   ticket_write      one producing lane stores one partial
-//   ticket_write_u64  one producing lane stores one packed candidate
 //   (the caller then barriers the threadgroup on device memory, so every
 //    partial that threadgroup wrote is visible to the thread that arrives)
 //   ticket_arrive     that one thread fences, then a relaxed fetch_add; the
@@ -13,7 +12,6 @@
 //                     is last when old + 1 equals the dispatch's group count
 //   ticket_acquire    the last threadgroup's readers fence before they load
 //   ticket_load       a reader loads its partials through coherent(device)
-//   ticket_load_u64   a reader loads its packed candidates the same way
 //   ticket_reset      that reader stores 0, relaxed
 //   ticket_is_last    the producing lanes have stored; one barrier publishes
 //                     them, thread 0 arrives, and a second barrier publishes
@@ -52,18 +50,6 @@ static float ticket_load(device coherent(device) float *partials, uint index)
 static void ticket_reset(device atomic_uint *ticket)
 {
     atomic_store_explicit(ticket, 0u, memory_order_relaxed);
-}
-
-// A packed candidate. The same contract as the float pair: a plain
-// coherent(device) store and load, no atomic.
-static void ticket_write_u64(device coherent(device) ulong *candidates, uint index, ulong value)
-{
-    candidates[index] = value;
-}
-
-static ulong ticket_load_u64(device coherent(device) ulong *candidates, uint index)
-{
-    return candidates[index];
 }
 
 // The last threadgroup of the dispatch. `groups` is the grid's threadgroup

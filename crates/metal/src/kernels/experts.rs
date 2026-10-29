@@ -189,10 +189,11 @@ fn weight_bytes(quant: Quant, rows: usize, nblocks: usize, experts: usize) -> Op
 fn aligned(
     what: &'static str,
     name: &str,
+    quant: Quant,
     window: Window<'_, u8, MetalDevice>,
 ) -> Result<(), DeviceError> {
     let start = window.byte_range()?.start.get();
-    super::check_weights_align(what, name, start, super::WeightAlign::Half)
+    super::check_weights_align(what, name, start, quant.weight_align())
 }
 
 fn hidden_overlaps_output(
@@ -292,15 +293,15 @@ fn check_pair(
     if let Some((gate, up)) = shared {
         check_window_len(PAIR, "shared gate", gate.len(), shared_bytes)?;
         check_window_len(PAIR, "shared up", up.len(), shared_bytes)?;
-        aligned(PAIR, "shared gate", gate)?;
-        aligned(PAIR, "shared up", up)?;
+        aligned(PAIR, "shared gate", p.shared_quant, gate)?;
+        aligned(PAIR, "shared up", p.shared_quant, up)?;
     }
     check_window_len(PAIR, "x", p.x.len(), p.cols)?;
     check_window_len(PAIR, "gain", p.gain.len(), p.cols)?;
     check_window_len(PAIR, "ids", p.ids.len(), g.routed_ids)?;
     check_window_len(PAIR, "y", p.y.len(), y_len)?;
-    aligned(PAIR, "gate", p.gate)?;
-    aligned(PAIR, "up", p.up)?;
+    aligned(PAIR, "gate", p.quant, p.gate)?;
+    aligned(PAIR, "up", p.quant, p.up)?;
     Ok(PairShape {
         nblocks: word(PAIR, "the block count", nblocks)?,
         rows: word(PAIR, "the row count", g.k)?,
@@ -376,13 +377,13 @@ fn check_fold<'w>(
         let shared_bytes = weight_bytes(quant, p.rows, g.k / quant.values_per_block(), 1)
             .ok_or_else(|| refuse_fold("one shared expert wraps".to_string()))?;
         check_window_len(FOLD, "shared down", shared.len(), shared_bytes)?;
-        aligned(FOLD, "shared down", shared)?;
+        aligned(FOLD, "shared down", quant, shared)?;
     }
     check_window_len(FOLD, "hidden", p.h.len(), hidden)?;
     check_window_len(FOLD, "route", p.w.len(), g.slots)?;
     check_window_len(FOLD, "ids", p.ids.len(), g.routed_ids)?;
     check_window_len(FOLD, "y", p.y.len(), p.rows)?;
-    aligned(FOLD, "down", p.down)?;
+    aligned(FOLD, "down", p.quant, p.down)?;
     let rows_per_group = simdgroups * rows_per_simd_group;
     // An instance with no shared slot binds the stack in its place, which the
     // kernel does not read.

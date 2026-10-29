@@ -22,7 +22,8 @@
 //! Five launches are timed: the plain mat-vec of one tensor, the segmented
 //! mat-vec of several tensors in one dispatch, the head-normed residual
 //! mat-vec, the router (`router35`, 257 rows of K 2048 f32, top-8) and the
-//! head (`q6k_head_argmax`, 248320 rows of K 2048 Q6_K). The f64 oracle's
+//! head (`q6k_head`, 248320 rows of K 2048 Q6_K: the logits dispatch, a
+//! barrier and the pick). The f64 oracle's
 //! check of the first dispatch against the band runs for the plain mat-vec
 //! only (`--no-check` skips it). The router and the head run on synthetic
 //! inputs of that shape; they open no model file.
@@ -145,10 +146,6 @@ fn head_bytes() -> usize {
 /// microsecond fields.
 const ROUTER_TAIL_US: (f64, f64) = (11.0, 123.0);
 
-/// The review's predicted tail span for one head dispatch, in the row's
-/// microsecond fields.
-const HEAD_TAIL_US: (f64, f64) = (62.0, 683.0);
-
 /// Whether this build's geometry is the one the predictions above were derived at: Qwen3.6's
 /// router (257 rows of K 2048, top-8) and head K 2048. A build of another host refuses at `main`.
 const PREDICTED_GEOMETRY: bool =
@@ -156,7 +153,7 @@ const PREDICTED_GEOMETRY: bool =
 
 const _: () =
     assert!(!PREDICTED_GEOMETRY || (ROUTER_BYTES == 2_105_344 && ROUTER_BYTES.is_multiple_of(256)));
-const _: () = assert!(HEAD_ROWS.is_multiple_of(HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP));
+const _: () = assert!(HEAD_ROWS.is_multiple_of(SIMD_GROUPS_PER_GROUP * ROWS_PER_SIMD_GROUP));
 
 /// How one kernel is launched into a timed command buffer.
 struct Arm {
@@ -219,13 +216,23 @@ enum Shape {
     /// A dense FFN's folded down at its one slot: `rows` by `k`, added into
     /// the output, the route weight 1.
     DenseFold { quant: Quant, rows: usize, k: usize },
-    /// The output head: `rows` logits over `cols`, the norm on the load and
-    /// the argmax in the same dispatch.
+    /// The output head: `rows` logits over `cols`, the norm on the load.
     Head {
         quant: Quant,
         rows: usize,
         cols: usize,
+        part: HeadPart,
     },
+}
+
+/// What of the output head a row launches.
+#[derive(Clone, Copy)]
+enum HeadPart {
+    /// The logits dispatch, the barrier and the pick.
+    Pair,
+    /// The pick alone, over the zero logits the output buffer holds: the
+    /// bytes it streams are the logits'.
+    Pick,
 }
 
 impl Shape {
@@ -293,7 +300,17 @@ impl Shape {
             Self::HeadNorm { rows, cols } => per(Quant::Q4K, rows * cols),
             Self::DensePair { quant, rows, cols } => 2 * per(*quant, rows * cols),
             Self::DenseFold { quant, rows, k } => per(*quant, rows * k),
-            Self::Head { quant, rows, cols } => per(*quant, rows * cols),
+            Self::Head {
+                quant,
+                rows,
+                cols,
+                part: HeadPart::Pair,
+            } => per(*quant, rows * cols),
+            Self::Head {
+                rows,
+                part: HeadPart::Pick,
+                ..
+            } => rows * core::mem::size_of::<f32>(),
         }
     }
 }
@@ -530,6 +547,9 @@ fn time_shape(
         Shape::DenseFold { rows, k, .. } => matrix(quant, *rows, *k, seed),
         Shape::Head { rows, cols, .. } => matrix(quant, *rows, *cols, seed),
     };
+    // The bytes the working set is spread by: the weights'. A row that
+    // launches the pick alone still holds the head's weights, so its buffers
+    // are the pair's.
     let bytes = one.len();
     let (stride, copies, working_set) = spread(bytes);
     let mut all = vec![0u8; copies * stride];
@@ -574,9 +594,9 @@ fn time_shape(
         .zeroed::<f32>(stream, Elems(buffers * dispatches * rows))
         .map_err(why)?;
     // The experts' and the head's launches: the instance's experts, the one
-    // expert id and route weight of a dense FFN, and one scratch set per
-    // committed buffer for the head's candidates and ticket, as for the
-    // router. A shape that launches neither holds the one element each.
+    // expert id and route weight of a dense FFN, and one pick word per
+    // committed buffer for the head. A shape that launches neither holds the
+    // one element each.
     let experts = &kernels.geom().experts;
     let faults_read = matches!(
         shape,
@@ -587,18 +607,6 @@ fn time_shape(
     }
     let ids = device.upload(stream, &[0i32]).map_err(why)?;
     let route = device.upload(stream, &[1.0f32]).map_err(why)?;
-    let head_groups = match shape {
-        Shape::Head { rows, .. } => rows.div_ceil(HEAD_SIMD_GROUPS * kernels.rows_per_simd_group()),
-        Shape::Matvec { .. }
-        | Shape::Seg { .. }
-        | Shape::HeadNorm { .. }
-        | Shape::DensePair { .. }
-        | Shape::DenseFold { .. } => 1,
-    };
-    let mut candidates = device
-        .zeroed::<u64>(stream, Elems(buffers * head_groups))
-        .map_err(why)?;
-    let mut ticket = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
     let mut step_id = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
 
     let timing = time_dispatches(
@@ -736,31 +744,32 @@ fn time_shape(
                         )
                         .map_err(why)?;
                 }
-                Shape::Head { quant, rows, cols } => {
+                Shape::Head {
+                    quant,
+                    rows,
+                    cols,
+                    part,
+                } => {
                     let b = n / dispatches;
-                    kernels
-                        .head(
-                            encoder,
-                            HeadParams {
-                                quant: *quant,
-                                rows: *rows,
-                                k: *cols,
-                                simdgroups: HEAD_SIMD_GROUPS,
-                                weights: w,
-                                x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                logits: out,
-                                candidates: candidates
-                                    .window_mut(Elems(b * head_groups), Elems(head_groups))
-                                    .map_err(why)?,
-                                ticket: ticket.window_mut(Elems(b), Elems(1)).map_err(why)?,
-                                step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
-                                eps: 1e-6,
-                                fault: device.fault_word(),
-                                layer: LAYER_NONE,
-                            },
-                        )
-                        .map_err(why)?;
+                    let params = HeadParams {
+                        quant: *quant,
+                        rows: *rows,
+                        k: *cols,
+                        simdgroups: HEAD_SIMD_GROUPS,
+                        weights: w,
+                        x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                        gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                        logits: out,
+                        step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
+                        eps: 1e-6,
+                        fault: device.fault_word(),
+                        layer: LAYER_NONE,
+                    };
+                    let launched = match part {
+                        HeadPart::Pair => kernels.head(encoder, params),
+                        HeadPart::Pick => kernels.head_pick(encoder, &params),
+                    };
+                    launched.map_err(why)?;
                 }
             }
             Ok(())
@@ -782,9 +791,7 @@ fn time_shape(
             ));
         }
     }
-    if matches!(shape, Shape::Head { .. }) {
-        ticket_and_fault(device, stream, &ticket)?;
-    } else if faults_read {
+    if faults_read {
         ticket_and_fault_free(device, stream)?;
     }
     if check && matches!(shape, Shape::Matvec { resid: false, .. }) {
@@ -1160,8 +1167,8 @@ fn time_fold(
     Ok(timing)
 }
 
-/// The pair and fold raise no fault and hold no ticket; the probe's own
-/// launches carry none.
+/// The pair, the fold and the head hold no ticket; the probe's own launches
+/// carry none, and the kernel raised nothing.
 fn ticket_and_fault_free(device: &MetalDevice, stream: &MetalStream) -> Result<(), String> {
     if let Some(fault) = device.fault_word().read(stream).map_err(why)? {
         return Err(format!("the kernel raised {fault}"));
@@ -1354,9 +1361,6 @@ fn time_head(
 ) -> Result<Timing, String> {
     let stream = device.stream();
     device.fault_word().clear(stream).map_err(why)?;
-    // The variant's rows a SIMD group move the threadgroup count: the
-    // candidates buffer follows the geometry the launch encodes against.
-    let head_groups = HEAD_ROWS.div_ceil(HEAD_SIMD_GROUPS * kernels.rows_per_simd_group());
     let one = matrix(Quant::Q6K, HEAD_ROWS, HEAD_K, 0x6EAD);
     let bytes = one.len();
     if bytes != head_bytes() {
@@ -1378,11 +1382,7 @@ fn time_head(
     let gain = device.upload(stream, &vec![1.0f32; HEAD_K]).map_err(why)?;
     let dispatches = dispatch_count(arm, bytes);
     let buffers = WARMUPS + trials;
-    // One scratch set per committed buffer, as for the router.
-    let mut candidates = device
-        .zeroed::<u64>(stream, Elems(buffers * head_groups))
-        .map_err(why)?;
-    let mut ticket = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
+    // One pick word per committed buffer.
     let mut step_id = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
     let rows = HEAD_ROWS;
     let mut y = device
@@ -1414,10 +1414,6 @@ fn time_head(
                         x: x.window(Elems(0), Elems(HEAD_K)).map_err(why)?,
                         gain: gain.window(Elems(0), Elems(HEAD_K)).map_err(why)?,
                         logits: y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?,
-                        candidates: candidates
-                            .window_mut(Elems(b * head_groups), Elems(head_groups))
-                            .map_err(why)?,
-                        ticket: ticket.window_mut(Elems(b), Elems(1)).map_err(why)?,
                         step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
                         eps: 1e-6,
                         fault: device.fault_word(),
@@ -1429,7 +1425,7 @@ fn time_head(
         },
     )?;
     same_outputs(device, stream, &y, rows)?;
-    ticket_and_fault(device, stream, &ticket)?;
+    ticket_and_fault_free(device, stream)?;
     Ok(timing)
 }
 
@@ -1890,7 +1886,7 @@ pub fn main() -> ExitCode {
     }
     let geom = run.geometry.label();
     let want_router = named(&run.only, "router", "router35");
-    let want_head = named(&run.only, "head", "q6k_head_argmax");
+    let want_head = named(&run.only, "head", "q6k_head");
     let probe_selected = selects(&run.only, "matvec", Quant::Q4K.name(), STREAM_LABEL);
 
     let mut failed = false;
@@ -2104,14 +2100,14 @@ pub fn main() -> ExitCode {
             }
         }
     }
-    let head_label = format!("q6k_head_argmax {HEAD_ROWS}x{HEAD_K} q6k{geom}");
+    let head_label = format!("q6k_head {HEAD_ROWS}x{HEAD_K} q6k{geom}");
     if want_head {
         let outcome = time_arms(
             &run,
             "head",
             &head_label,
             head_bytes(),
-            Some(HEAD_TAIL_US),
+            None,
             stream_gbps,
             |arm| time_head(&device, &kernels, arm, run.trials),
         );

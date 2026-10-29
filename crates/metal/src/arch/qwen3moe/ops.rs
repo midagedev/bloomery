@@ -3,17 +3,18 @@
 //! barrier.
 //!
 //! The DAG, one group per op past the embed: `E | P1 | mixer | out | R | G |
-//! W` for every layer, then `H`; a layer of a dense FFN has no `R`. P1 is one
-//! dispatch per weight type of the layer's projections in one group. The
-//! flash folds its segments' partials in its last threadgroup, so an attention
-//! mixer is one group at any depth. A layer whose residual is a sandwich has a
-//! join group `J` after the mixer's out and after the down: the out and the
-//! down store into the join buffer, and `J` norms that buffer into the stream
-//! ([`MetalOps::join`]). The FFN norm has no group of its own: the router (R)
-//! and the gate-up pair (G) each norm the residual as they load it. The head
-//! is the token's last group and closes no barrier; a token whose pick nobody
-//! reads encodes none of it. Every op only encodes: no wait, no allocation
-//! past the launches' own argument lists, no host round trip.
+//! W` for every layer, then `H | K`, the head's logits and its pick; a layer
+//! of a dense FFN has no `R`. P1 is one dispatch per weight type of the
+//! layer's projections in one group. The flash folds its segments' partials in
+//! its last threadgroup, so an attention mixer is one group at any depth. A
+//! layer whose residual is a sandwich has a join group `J` after the mixer's
+//! out and after the down: the out and the down store into the join buffer,
+//! and `J` norms that buffer into the stream ([`MetalOps::join`]). The FFN
+//! norm has no group of its own: the router (R) and the gate-up pair (G) each
+//! norm the residual as they load it. The head's pick is the token's last
+//! group and closes no barrier; a token whose pick nobody reads encodes none
+//! of the head. Every op only encodes: no wait, no allocation past the
+//! launches' own argument lists, no host round trip.
 //!
 //! The token at `pos` binds the step record slot of its position: the head
 //! writes its id there and every kernel raises that slot's fault word. A
@@ -90,6 +91,48 @@ fn part<'b, T: Elem>(
     r: &core::ops::Range<usize>,
 ) -> Result<Window<'b, T, MetalDevice>, DeviceError> {
     b.window(Elems(r.start), Elems(r.len()))
+}
+
+/// The head's windows over `arena`, for the step record slot `slot`: the
+/// weights and the norm's gain whole, the logits whole, the slot's pick and
+/// fault word. `x` is the residual the head norms: the arena's own for a
+/// token, the last row of the rows arena for a pass.
+fn head_params<'a>(
+    arena: &'a mut Arena,
+    x: Option<Window<'a, f32, MetalDevice>>,
+    slot: usize,
+) -> Result<HeadParams<'a>, SessionError> {
+    let Arena {
+        head_w,
+        head_quant,
+        head_norm,
+        x: residual,
+        logits,
+        step_id,
+        faults,
+        eps,
+        hidden,
+        vocab,
+        ..
+    } = arena;
+    let x = match x {
+        Some(x) => x,
+        None => residual.window(Elems(0), Elems(*hidden))?,
+    };
+    Ok(HeadParams {
+        quant: *head_quant,
+        rows: *vocab,
+        k: *hidden,
+        simdgroups: HEAD_SIMD_GROUPS,
+        weights: all(head_w)?,
+        x,
+        gain: all(head_norm)?,
+        logits: all_mut(logits)?,
+        step_id: step_id.window_mut(Elems(slot), Elems(1))?,
+        eps: *eps,
+        fault: &faults[slot],
+        layer: LAYER_HEAD,
+    })
 }
 
 /// Where a token's embed finds its id.
@@ -742,6 +785,38 @@ impl MetalOps<'_, '_> {
         self.close();
         Ok(())
     }
+
+    /// The head's logits group of a step: the norm on load and the output
+    /// projection, closed by a barrier so the pick reads what it wrote. The
+    /// pass's head is [`MetalOps::rows_head`], which encodes both whole.
+    pub(super) fn head_logits(&mut self, m: usize) -> Result<(), SessionError> {
+        self.head_step(m, Kernels::head_logits)?;
+        self.close();
+        Ok(())
+    }
+
+    /// The head's pick group of a step: the argmax over the logits. It is the
+    /// token's last group and closes no barrier.
+    pub(super) fn head_pick(&mut self, m: usize) -> Result<(), SessionError> {
+        self.head_step(m, Kernels::head_pick)
+    }
+
+    /// One of the head's launches over a step's windows. A pass is refused by
+    /// name: its head is [`MetalOps::rows_head`].
+    fn head_step(
+        &mut self,
+        m: usize,
+        launch: fn(&Kernels, &mut ComputeEncoder<'_>, &HeadParams<'_>) -> Result<(), DeviceError>,
+    ) -> Result<(), SessionError> {
+        if self.arm(m)? != Arm::Step {
+            return Err(refuse(format!(
+                "a head group of {m} rows; a pass encodes its head whole"
+            )));
+        }
+        let p = head_params(&mut *self.arena, None, slot_of(self.pos))?;
+        launch(self.kernels, self.enc, &p)?;
+        Ok(())
+    }
 }
 
 impl ChainOps for MetalOps<'_, '_> {
@@ -1000,49 +1075,15 @@ impl ChainOps for MetalOps<'_, '_> {
         let arm = self.arm(m)?;
         if !self.head {
             // The call said nobody reads this token's pick: the head's
-            // dispatch is the whole of what is skipped, and no later op
-            // depends on it — the head closes no barrier and writes nothing
-            // but its own outputs.
+            // dispatches are the whole of what is skipped, and no later op
+            // depends on them — the head closes no barrier past its own and
+            // writes nothing but its own outputs.
             return Ok(());
         }
         if arm == Arm::Rows {
             return self.rows_head(m);
         }
-        let slot = slot_of(self.pos);
-        let Arena {
-            head_w,
-            head_quant,
-            head_norm,
-            x,
-            logits,
-            candidates,
-            head_ticket,
-            step_id,
-            faults,
-            eps,
-            hidden,
-            vocab,
-            ..
-        } = &mut *self.arena;
-        self.kernels.head(
-            self.enc,
-            HeadParams {
-                quant: *head_quant,
-                rows: *vocab,
-                k: *hidden,
-                simdgroups: HEAD_SIMD_GROUPS,
-                weights: all(head_w)?,
-                x: x.window(Elems(0), Elems(*hidden))?,
-                gain: all(head_norm)?,
-                logits: all_mut(logits)?,
-                candidates: all_mut(candidates)?,
-                ticket: all_mut(head_ticket)?,
-                step_id: step_id.window_mut(Elems(slot), Elems(1))?,
-                eps: *eps,
-                fault: &faults[slot],
-                layer: LAYER_HEAD,
-            },
-        )?;
-        Ok(())
+        self.head_logits(m)?;
+        self.head_pick(m)
     }
 }

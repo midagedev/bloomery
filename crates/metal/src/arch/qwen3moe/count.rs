@@ -1,7 +1,7 @@
 //! The groups and the dispatches one qwen35moe token encodes.
 //!
 //! The caller passes the layers it has. An empty list is the embed and the
-//! head, not a hidden default trunk.
+//! head's two groups, not a hidden default trunk.
 //!
 //! The token encoder is the caller: the e2e gate holds what one token
 //! encodes to this count.
@@ -59,6 +59,10 @@ pub enum Residual {
 
 /// The groups of a layer's mixer: P1, the core, its out.
 const MIXER_GROUPS: u32 = 3;
+
+/// The groups of the embed and of the head: the embed's one, and the head's
+/// two, the logits and the pick.
+const ENDS_GROUPS: u32 = 3;
 
 /// The groups of a layer's FFN: the gate-up and the down, and the router's
 /// ahead of them when it has one.
@@ -154,14 +158,14 @@ pub enum LiveKeys {
     Past64,
 }
 
-/// Whether the router's ticket and the head's stay one dispatch.
+/// Whether the router's ticket stays one dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ticket {
-    /// The router and the head are one dispatch and one group each.
+    /// The router is one dispatch and one group.
     Folded,
-    /// Each layer's router, and the head, are two dispatches and two groups.
-    /// The count when a fence cannot fold those dispatches. Nothing encodes
-    /// this path; the tests keep the number.
+    /// Each layer's router is two dispatches and two groups. The count when a
+    /// fence cannot fold those dispatches. Nothing encodes this path; the
+    /// tests keep the number.
     Unfolded,
 }
 
@@ -177,16 +181,16 @@ pub struct TokenCount {
 
 /// The groups and the dispatches one token encodes for `layers`.
 ///
-/// The embed and the head are the 2. Each layer adds [`Layer::groups`]: P1,
-/// the mixer, its out, the router, the gate-up and the down, so six; a layer
-/// of a dense FFN has no router, so five; a sandwich adds a join after the
-/// mixer's out and one after the down, so seven. Those already include the
-/// flash — the attention's fold runs inside it, so past the segment rule's
-/// waterline the count is the same — and the FFN norm, which the router and
-/// the gate-up each apply as they load the residual (a dense layer's gate-up
-/// alone). A projection of more than one dispatch adds the rest. An unfolded
-/// ticket adds one group for each routed layer's router and one for the head.
-/// A count that does not fit `u32` panics by name.
+/// The embed is one group and the head two, the logits and the pick, so the
+/// ends are the 3. Each layer adds [`Layer::groups`]: P1, the mixer, its out,
+/// the router, the gate-up and the down, so six; a layer of a dense FFN has no
+/// router, so five; a sandwich adds a join after the mixer's out and one after
+/// the down, so seven. Those already include the flash — the attention's fold
+/// runs inside it, so past the segment rule's waterline the count is the
+/// same — and the FFN norm, which the router and the gate-up each apply as
+/// they load the residual (a dense layer's gate-up alone). A projection of
+/// more than one dispatch adds the rest. An unfolded ticket adds one group for
+/// each routed layer's router. A count that does not fit `u32` panics by name.
 pub fn token_count(layers: &[Layer], _live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut in_layers = 0u32;
     let mut routers = 0u32;
@@ -198,12 +202,11 @@ pub fn token_count(layers: &[Layer], _live: LiveKeys, ticket: Ticket) -> TokenCo
             routers = fit("router", routers.checked_add(1));
         }
     }
-    let mut groups = fit("group", 2u32.checked_add(in_layers));
+    let mut groups = fit("group", ENDS_GROUPS.checked_add(in_layers));
     let mut dispatches = fit("dispatch", groups.checked_add(n_split));
     if matches!(ticket, Ticket::Unfolded) {
-        let extra = fit("group", routers.checked_add(1));
-        groups = fit("group", groups.checked_add(extra));
-        dispatches = fit("dispatch", dispatches.checked_add(extra));
+        groups = fit("group", groups.checked_add(routers));
+        dispatches = fit("dispatch", dispatches.checked_add(routers));
     }
     TokenCount { groups, dispatches }
 }
@@ -256,8 +259,11 @@ pub enum GroupKind {
     /// The experts' down, the routed picks' and the shared expert's, folded
     /// into the residual.
     Down,
-    /// The head: the logits and the pick.
+    /// The head's logits: the norm on load and the output projection over
+    /// the vocabulary.
     Head,
+    /// The head's pick: the argmax over the logits.
+    HeadPick,
 }
 
 impl GroupKind {
@@ -280,12 +286,13 @@ impl GroupKind {
             GroupKind::GateUp => "gate_up",
             GroupKind::Down => "down",
             GroupKind::Head => "head",
+            GroupKind::HeadPick => "head_pick",
         }
     }
 }
 
 /// Every kind, in the token's walk order: the order a profile's lines print.
-pub const KINDS: [GroupKind; 15] = [
+pub const KINDS: [GroupKind; 16] = [
     GroupKind::Embed,
     GroupKind::AttnP1,
     GroupKind::AttnFlash,
@@ -301,6 +308,7 @@ pub const KINDS: [GroupKind; 15] = [
     GroupKind::GateUp,
     GroupKind::Down,
     GroupKind::Head,
+    GroupKind::HeadPick,
 ];
 
 /// The bytes one group of a token moves, by what moves them: the weights
@@ -325,6 +333,10 @@ impl GroupBytes {
     }
 }
 
+// PIN(2026-10-29): every folded count below is one group and one dispatch more
+// than before: the head is two dispatches, the logits then the pick, with a
+// barrier between them. The unfolded counts are the old ones: the head's
+// ticket handoff is gone, so only a router unfolds.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,8 +435,8 @@ mod tests {
         assert_eq!(
             token_count(&fixture(), LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 26,
-                dispatches: 28
+                groups: 27,
+                dispatches: 29
             }
         );
     }
@@ -432,7 +444,7 @@ mod tests {
     #[test]
     fn fixture_folded_past_64() {
         // The flash folds the merge, so past the waterline the count is the
-        // within-waterline one: 28/30 before the fold, one merge group and
+        // within-waterline one: 29/31 before the fold, one merge group and
         // dispatch an attention layer.
         assert_eq!(
             token_count(&fixture(), LiveKeys::Past64, Ticket::Folded),
@@ -441,8 +453,8 @@ mod tests {
         assert_eq!(
             token_count(&fixture(), LiveKeys::Past64, Ticket::Folded),
             TokenCount {
-                groups: 26,
-                dispatches: 28
+                groups: 27,
+                dispatches: 29
             }
         );
     }
@@ -463,21 +475,21 @@ mod tests {
         assert_eq!(
             token_count(&target(), LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 242,
-                dispatches: 262
+                groups: 243,
+                dispatches: 263
             }
         );
     }
 
     #[test]
     fn target_folded_past_64() {
-        // 252/272 before the fold: ten attention layers' merge group and
+        // 253/273 before the fold: ten attention layers' merge group and
         // dispatch each.
         assert_eq!(
             token_count(&target(), LiveKeys::Past64, Ticket::Folded),
             TokenCount {
-                groups: 242,
-                dispatches: 262
+                groups: 243,
+                dispatches: 263
             }
         );
     }
@@ -522,26 +534,26 @@ mod tests {
 
     #[test]
     fn q30_target_folded_within_64() {
-        // 2 + 6·48 groups, and the 24 raised layers' second P1 dispatch.
+        // 3 + 6·48 groups, and the 24 raised layers' second P1 dispatch.
         assert_eq!(
             token_count(&q30_target(), LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 290,
-                dispatches: 314
+                groups: 291,
+                dispatches: 315
             }
         );
     }
 
     /// A dense layer has no router group: five groups a layer, the folded
-    /// ticket's count one group fewer for each, and the unfolded one's extra
-    /// group is the head's alone.
+    /// ticket's count one group fewer for each, and with no router to unfold
+    /// the unfolded count is the folded one.
     #[test]
     fn a_dense_layer_has_no_router_group() {
         assert_eq!(
             token_count(&dense(&fixture()), LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 22,
-                dispatches: 24
+                groups: 23,
+                dispatches: 25
             }
         );
         assert_eq!(
@@ -551,13 +563,13 @@ mod tests {
                 dispatches: 25
             }
         );
-        // 2 + 5 · 64 groups for the 27B's layers.
+        // 3 + 5 · 64 groups for the 27B's layers.
         let layers = vec![routed_delta(Projection::ONE); 64];
         assert_eq!(
             token_count(&dense(&layers), LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 322,
-                dispatches: 322
+                groups: 323,
+                dispatches: 323
             }
         );
         // One routed layer among dense ones adds its router's group.
@@ -566,16 +578,16 @@ mod tests {
         assert_eq!(
             token_count(&mixed, LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 23,
-                dispatches: 25
+                groups: 24,
+                dispatches: 26
             }
         );
     }
 
     /// A sandwich's two joins are two groups and two dispatches a layer, on
     /// the delta, attention and short conv layers alike, and no layer's kind
-    /// changes the count of the rest: LFM3's 24 layers are 2 + 24 · 7 = 170
-    /// groups and 170 dispatches, 13 of them short conv and 11 attention.
+    /// changes the count of the rest: LFM3's 24 layers are 3 + 24 · 7 = 171
+    /// groups and 171 dispatches, 13 of them short conv and 11 attention.
     /// Mutant: `JOIN_GROUPS` is 1, or `Layer::groups` counts the router of a
     /// dense layer.
     #[test]
@@ -588,12 +600,11 @@ mod tests {
         assert_eq!((layers.len(), convs), (24, 13));
         for ticket in [Ticket::Folded, Ticket::Unfolded] {
             let got = token_count(&layers, LiveKeys::Within64, ticket);
-            let head = u32::from(matches!(ticket, Ticket::Unfolded));
             assert_eq!(
                 got,
                 TokenCount {
-                    groups: 170 + head,
-                    dispatches: 170 + head
+                    groups: 171,
+                    dispatches: 171
                 },
                 "{ticket:?}"
             );
@@ -622,8 +633,8 @@ mod tests {
         assert_eq!(
             token_count(&plain, LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 122,
-                dispatches: 122
+                groups: 123,
+                dispatches: 123
             }
         );
         // A short conv's P1 of two dispatches adds one dispatch, no group.
@@ -636,8 +647,8 @@ mod tests {
         assert_eq!(
             token_count(&split, LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 170,
-                dispatches: 171
+                groups: 171,
+                dispatches: 172
             }
         );
     }
@@ -656,8 +667,8 @@ mod tests {
         assert_eq!(
             token_count(&[], LiveKeys::Within64, Ticket::Folded),
             TokenCount {
-                groups: 2,
-                dispatches: 2
+                groups: 3,
+                dispatches: 3
             }
         );
     }

@@ -3,9 +3,9 @@
 //!
 //! The weights are copied from the file into buffers of their own. A layer's
 //! P1 projection is one buffer per weight type, each the segments of one
-//! dispatch. The activations, the caches, the recurrent stores, the router's
-//! and the head's tickets, the host's id slot, the step record slots and the
-//! fault words are the session's. Every name, type and length comes from the
+//! dispatch. The activations, the caches, the recurrent stores, the routers'
+//! and the attention's tickets, the host's id slot, the step record slots and
+//! the fault words are the session's. Every name, type and length comes from the
 //! layout [`super::check`] resolved from the file's header (the plan, the
 //! file's shapes and a launch's geometry): a shape or a type no launch runs was
 //! refused there, by name, before any buffer was allocated, so the loader
@@ -36,7 +36,7 @@ use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::geom::Geometry;
-use crate::kernels::{HeadMap, Quant, Segment, head_groups, segments_for_window};
+use crate::kernels::{HeadMap, Quant, Segment, segments_for_window};
 use crate::residency::Alloc;
 
 const WHAT: &str = "qwen35moe arena";
@@ -272,8 +272,6 @@ pub(super) struct Arena {
     /// The experts' activations, one row of `ExpertsGeom::k` per slot.
     pub(super) h: MetalBuffer<f32>,
     pub(super) logits: MetalBuffer<f32>,
-    pub(super) candidates: MetalBuffer<u64>,
-    pub(super) head_ticket: MetalBuffer<u32>,
     /// The head's pick, one per step record slot — or, for a token whose
     /// pick nobody reads, the id the host writes there for the token ahead
     /// to embed.
@@ -604,8 +602,6 @@ impl Arena {
             ropes,
             h: zeroed(device, geom.experts.slots * geom.experts.k)?,
             logits: zeroed(device, vocab)?,
-            candidates: zeroed(device, head_groups(vocab))?,
-            head_ticket: zeroed(device, 1)?,
             step_id: zeroed(device, RECORD_SLOTS)?,
             id_in: zeroed(device, 1)?,
             lane,
@@ -945,12 +941,17 @@ impl Arena {
                 no_ids()?;
                 Ok(GroupBytes {
                     weights: bytes_of(&self.head_w) + bytes_of(&self.head_norm),
-                    // The residual read, the logits, the candidates and the
-                    // pick written.
-                    acts: f32s(self.hidden)
-                        + bytes_of(&self.logits)
-                        + bytes_of(&self.candidates)
-                        + 4,
+                    // The residual read and the logits written.
+                    acts: f32s(self.hidden) + bytes_of(&self.logits),
+                    state: 0,
+                })
+            }
+            GroupKind::HeadPick => {
+                no_ids()?;
+                Ok(GroupBytes {
+                    weights: 0,
+                    // The logits read and the pick written.
+                    acts: bytes_of(&self.logits) + 4,
                     state: 0,
                 })
             }
@@ -978,7 +979,6 @@ impl Arena {
                 router.ticket.zero();
             }
         }
-        self.head_ticket.zero();
         self.attn_ticket.zero();
         self.step_id.zero();
         self.id_in.zero();

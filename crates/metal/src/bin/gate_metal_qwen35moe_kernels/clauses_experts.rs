@@ -20,7 +20,7 @@ use super::oracle;
 use super::oracle_experts;
 use super::synthetic;
 use super::{
-    Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_PAD, WEIGHT_TAIL, check_guards, padded,
+    Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_TAIL, check_guards, padded, weight_pad,
 };
 const N_EXPERTS: usize = 4;
 const PAIR_COLS: usize = 2048;
@@ -377,10 +377,20 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
     let e = h.geom().experts;
     let (device, stream) = (h.device, h.stream);
     let y_len = e.slots * e.k;
-    let gate = padded(0xFFu8, WEIGHT_PAD, launch.gate, WEIGHT_TAIL);
-    let up = padded(0xFFu8, WEIGHT_PAD, launch.up, WEIGHT_TAIL);
-    let shared_gate = padded(0xFFu8, WEIGHT_PAD, launch.shared_gate, WEIGHT_TAIL);
-    let shared_up = padded(0xFFu8, WEIGHT_PAD, launch.shared_up, WEIGHT_TAIL);
+    let gate = padded(0xFFu8, weight_pad(launch.quant), launch.gate, WEIGHT_TAIL);
+    let up = padded(0xFFu8, weight_pad(launch.quant), launch.up, WEIGHT_TAIL);
+    let shared_gate = padded(
+        0xFFu8,
+        weight_pad(launch.shared_quant),
+        launch.shared_gate,
+        WEIGHT_TAIL,
+    );
+    let shared_up = padded(
+        0xFFu8,
+        weight_pad(launch.shared_quant),
+        launch.shared_up,
+        WEIGHT_TAIL,
+    );
     let x = padded(f32::from_bits(SENTINEL_BITS), VALUE_PAD, launch.x, 1);
     let gain = padded(
         f32::from_bits(SENTINEL_BITS),
@@ -416,15 +426,25 @@ pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, Stri
                 cols: PAIR_COLS,
                 n_experts,
                 ids: ids.window(Elems(VALUE_PAD), Elems(launch.ids.len()))?,
-                gate: gate.window(Elems(WEIGHT_PAD), Elems(launch.gate.len()))?,
-                up: up.window(Elems(WEIGHT_PAD), Elems(launch.up.len()))?,
+                gate: gate.window(Elems(weight_pad(launch.quant)), Elems(launch.gate.len()))?,
+                up: up.window(Elems(weight_pad(launch.quant)), Elems(launch.up.len()))?,
                 shared_gate: e
                     .has_shared
-                    .then(|| shared_gate.window(Elems(WEIGHT_PAD), Elems(launch.shared_gate.len())))
+                    .then(|| {
+                        shared_gate.window(
+                            Elems(weight_pad(launch.shared_quant)),
+                            Elems(launch.shared_gate.len()),
+                        )
+                    })
                     .transpose()?,
                 shared_up: e
                     .has_shared
-                    .then(|| shared_up.window(Elems(WEIGHT_PAD), Elems(launch.shared_up.len())))
+                    .then(|| {
+                        shared_up.window(
+                            Elems(weight_pad(launch.shared_quant)),
+                            Elems(launch.shared_up.len()),
+                        )
+                    })
                     .transpose()?,
                 x: x.window(Elems(VALUE_PAD), Elems(launch.x.len()))?,
                 gain: gain.window(Elems(VALUE_PAD), Elems(launch.norm.gain.len()))?,
@@ -456,8 +476,13 @@ pub struct FoldIn<'a> {
 pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, String> {
     let e = h.geom().experts;
     let (device, stream) = (h.device, h.stream);
-    let down = padded(0xFFu8, WEIGHT_PAD, launch.down, WEIGHT_TAIL);
-    let shared = padded(0xFFu8, WEIGHT_PAD, launch.shared, WEIGHT_TAIL);
+    let down = padded(0xFFu8, weight_pad(launch.quant), launch.down, WEIGHT_TAIL);
+    let shared = padded(
+        0xFFu8,
+        weight_pad(launch.shared_quant),
+        launch.shared,
+        WEIGHT_TAIL,
+    );
     let hidden = padded(f32::from_bits(SENTINEL_BITS), VALUE_PAD, launch.h, 1);
     let route = padded(0.0, VALUE_PAD, launch.w, 1);
     let ids = padded(-1, VALUE_PAD, launch.ids, 1);
@@ -477,7 +502,10 @@ pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, Stri
     let n_experts = launch.n_experts;
     let rows = launch.y0.len();
     h.encode(|encoder| {
-        let shared = shared.window(Elems(WEIGHT_PAD), Elems(launch.shared.len()))?;
+        let shared = shared.window(
+            Elems(weight_pad(launch.shared_quant)),
+            Elems(launch.shared.len()),
+        )?;
         let out = y.window_mut(Elems(OUT_GUARD), Elems(rows))?;
         let plan = if launch.shared_quant == quant {
             shared_plan(&e, shared)
@@ -497,7 +525,7 @@ pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, Stri
                 k: e.k,
                 n_experts,
                 ids: ids.window(Elems(VALUE_PAD), Elems(launch.ids.len()))?,
-                down: down.window(Elems(WEIGHT_PAD), Elems(launch.down.len()))?,
+                down: down.window(Elems(weight_pad(launch.quant)), Elems(launch.down.len()))?,
                 h: hidden.window(Elems(VALUE_PAD), Elems(launch.h.len()))?,
                 w: route.window(Elems(VALUE_PAD), Elems(launch.w.len()))?,
                 y: &out,

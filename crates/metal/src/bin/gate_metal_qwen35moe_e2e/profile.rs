@@ -65,9 +65,9 @@ fn live_of(n_keys: usize) -> LiveKeys {
 /// The kinds one token's groups are tagged with, as the file's own layer plans
 /// derive them: a mixer's three groups (P1, core, out), a join after the mixer
 /// and another after the FFN where the layer's residual is a sandwich, the
-/// router where the FFN routes, then the gate-up and the down. The count
-/// model's own derivation is the walk's, so the two agree only while both are
-/// right.
+/// router where the FFN routes, then the gate-up and the down, and at the end
+/// the head's logits and its pick. The count model's own derivation is the
+/// walk's, so the two agree only while both are right.
 fn kinds_expected(plans: &[LayerPlan]) -> Vec<GroupKind> {
     let mut out = vec![GroupKind::Embed];
     for plan in plans {
@@ -102,6 +102,7 @@ fn kinds_expected(plans: &[LayerPlan]) -> Vec<GroupKind> {
         }
     }
     out.push(GroupKind::Head);
+    out.push(GroupKind::HeadPick);
     out
 }
 

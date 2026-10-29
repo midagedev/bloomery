@@ -88,7 +88,7 @@ fn check(
     check_window_len(WHAT, "partials", p.partials.len(), d.partials_stride)?;
     check_window_len(WHAT, "y", p.y.len(), p.rows)?;
     let start = p.weights.byte_range()?.start.get();
-    super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
+    super::check_weights_align(WHAT, "weights", start, p.quant.weight_align())?;
     Ok(Shape {
         nblocks: word(WHAT, "the block count", nblocks)?,
         rows: word(WHAT, "the row count", p.rows)?,
