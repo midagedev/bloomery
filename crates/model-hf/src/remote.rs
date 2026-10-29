@@ -32,8 +32,7 @@ pub const FIRST_RANGE: u64 = 4 << 20;
 pub const MAX_HEADER: u64 = 256 << 20;
 
 /// Reads `len` bytes of a remote file from byte `from`, exactly.
-pub type ReadRange<'a> =
-    dyn FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + 'a;
+pub type ReadRange<'a> = dyn FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + 'a;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -359,11 +358,17 @@ pub fn sparse_set(
         files.len(),
         &|i| {
             let e = &files[i];
-            sparse_shard_or_kept(&dir.join(e.name()), &e.path, e.size, reuse, &mut |from, len| {
-                client
-                    .fetch_range(repo, rev, &e.path, from, len)
-                    .map_err(Into::into)
-            })
+            sparse_shard_or_kept(
+                &dir.join(e.name()),
+                &e.path,
+                e.size,
+                reuse,
+                &mut |from, len| {
+                    client
+                        .fetch_range(repo, rev, &e.path, from, len)
+                        .map_err(Into::into)
+                },
+            )
         },
         &mut |i, stat| progress(&files[i], stat),
     )?;
@@ -1006,7 +1011,9 @@ mod tests {
     }
 
     /// A reader over `bytes` that serves any range inside them.
-    fn slice_reader(bytes: &[u8]) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + '_ {
+    fn slice_reader(
+        bytes: &[u8],
+    ) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> + '_ {
         move |from, len| {
             let (from, len) = (from as usize, len as usize);
             bytes
