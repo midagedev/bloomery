@@ -8,7 +8,7 @@
 //! family a file, so a set of one is refused by name where another is read.
 //! The dense Qwen3.8-27B is the same architecture with a file and a kind of set
 //! of its own: [`dense::LOGITS`], mainline's logits rows after a prompt and
-//! after each forced id.
+//! after each forced id; its NVFP4 build's GGUF twin has [`dense::NV_LOGITS`].
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -126,6 +126,7 @@ pub static FAMILIES: &[&Family] = &[
     &HIDDEN_FLASH_Q8,
     &HIDDEN_LEV,
     &dense::LOGITS,
+    &dense::NV_LOGITS,
     &clefvis::PREPROC,
     &clefvis::TAPS,
     &clefvis::HIDDEN,

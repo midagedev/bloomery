@@ -1,0 +1,38 @@
+{
+  "name": "qwen38nv",
+  "arch": "qwen35",
+  "source": "nvidia/Qwen3.8-27B-NVFP4",
+  "rev": "482ca0f3832238542f8f5295dde86b5f22711d80",
+  "expect": {"tensors": 2194, "data_bytes": 21921428072},
+  "layers": [0, 1, 2, 3],
+  "layer_prefix": "model.language_model.layers.",
+  "keep": [
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.norm.weight",
+    "lm_head.weight",
+    "lm_head.weight_scale",
+    "lm_head.weight_scale_2",
+    "lm_head.input_scale"
+  ],
+  "drop": ["model.visual.", "mtp."],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "vocab.json",
+    "merges.txt",
+    "hf_quant_config.json"
+  ],
+  "widths": {},
+  "planes": [],
+  "config": {
+    "layer_count": "text_config.num_hidden_layers",
+    "widths": {},
+    "per_layer": ["text_config.layer_types"],
+    "layer_names": [
+      "quantization_config.config_groups.group_0.targets",
+      "quantization_config.config_groups.group_1.targets"
+    ]
+  }
+}

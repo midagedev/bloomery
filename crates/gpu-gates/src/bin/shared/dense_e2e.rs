@@ -113,7 +113,7 @@ fn load(path: &Path, mma: bool) -> Result<(Qwen35moeModel, Split), GateError> {
 }
 
 /// `(‖a − b‖₂, max |a − b|, ‖b‖₂)` in f64; a NaN reads infinite.
-fn norms(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+pub fn norms(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
     let (mut num, mut den, mut max) = (0.0f64, 0.0f64, 0.0f64);
     for (&x, &y) in a.iter().zip(b) {
         let e = f64::from(x) - f64::from(y);
@@ -324,7 +324,7 @@ fn resident_clause(
 
 /// The prompt call and the forced steps of `set` on `m` from a `reset`: the logits row after the prompt, then after
 /// each forced id fed.
-fn rows_of<K: Kind>(
+pub fn rows_of<K: Kind>(
     m: &mut Qwen35moeModel,
     set: &ForcedLogits<K>,
 ) -> Result<Vec<Vec<f32>>, GateError> {

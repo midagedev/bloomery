@@ -1019,6 +1019,16 @@ build-dense-logits-ref:
 dump-logits-qwen38d *SETS:
     case " {{SETS}} " in *" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=qwen38d ./tools/box.sh 'bash tools/ref/dense-logits.sh {{SETS}}'
 
+# The qwen38nv logits oracle sets (tools/ref/dense-logits.sh, profile tools/ref/models/qwen38nv.sh): mainline's logits on the GGUF twin
+# of the Qwen3.8-27B NVFP4 fixture cut after the first 64 and 4,096 prose ids and after each of the 32 ids that follow them (teacher
+# forced), into $BLOOMERY_DATA/ref_qwen38nv_logits_p{64,4096}/ (refset family logits-qwen38nv). The same dense_logits_ref binary as
+# build-dense-logits-ref, and the twin's size and sha256 pinned in tools/ref/dense-logits.py TARGETS first. Each dump puts the whole
+# file on the card (the A6000 unless BLOOMERY_CARD says otherwise; its gate lock); no lease (a functional oracle). `--cpu-twin`
+# writes each set's CPU floor into <set>.cpu/ instead (no card, 16 threads), what the fixture gate's band is derived from
+# (`python3 tools/ref/dense-logits.py floor <set>`).
+dump-logits-qwen38nv *SETS:
+    case " {{SETS}} " in *" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=qwen38nv ./tools/box.sh 'bash tools/ref/dense-logits.sh {{SETS}}'
+
 # Nanbeige4.3-33B (nanbeige43: general.architecture llama, bartowski's Q4_K_M) logits oracle's binary: the same dense_logits_ref as
 # build-dense-logits-ref (one source, one mainline tree and pin; the device arch comes from the writer's target), built under this profile
 # (tools/ref/models/nanbeige43.sh) into target/release of the box's directory (tools/ref/build-dense-logits.sh).
@@ -1596,10 +1606,12 @@ gate-gpu-minicpm-text:
 gate-gpu-clef-hidden:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
 
-# The dense Qwen3.8-27B generation gate (qwen35, lmstudio's Q4_K_M, 16.5 GB, either card, both tiers): the load against the header
+# The dense Qwen3.8-27B generation gate (qwen35, either card). Real tier, lmstudio's Q4_K_M (16.5 GB): the load against the header
 # derivation without blk.64, the prompt call and forced decode steps' logits rows against mainline's (`just dump-logits-qwen38d`)
 # within the bands the oracle's own CPU twin gives, graph = eager = pass, reset, the checkpoint cut with its re-fed tail, and two
-# resident slots in one pass against each alone. The gate lock; no lease.
+# resident slots in one pass against each alone. Fixture tier, the NVFP4 cut folder (tools/fixture-cuts/qwen38nv.json) and its
+# GGUF twin: ours on the twin against mainline's logits rows (`just dump-logits-qwen38nv`) within the bands the oracle's own CPU
+# floor gives, and ours on the folder equal bit for bit to ours on the twin. The gate lock; no lease.
 gate-gpu-qwen38d:
     BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
 
