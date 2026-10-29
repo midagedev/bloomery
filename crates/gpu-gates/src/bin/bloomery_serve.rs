@@ -727,10 +727,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Err(e) => return refuse(Code::Usage, e),
         };
         flags.name = name;
-        let by_name = match hf::source::resolve(
-            &flags,
-            std::env::var("BLOOMERY_REF_MODEL").ok().as_deref(),
-        ) {
+        let by_name = match hf::source::resolve(&flags, model_file::ref_model().as_deref()) {
             Ok(Some(hf::source::Source::Named(target))) => Some(target),
             Ok(_) => None,
             Err(e) => return refuse(Code::Usage, e.into()),
@@ -906,8 +903,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 )
             })?;
             let (host_room, _) = model::placement::workstation::host_available_read()?;
-            let cache_root =
-                hf::cache_root(std::env::var_os("BLOOMERY_CACHE"), std::env::var_os("HOME"))?;
+            let cache_root = model_file::cache_root()?;
             let cache_free = catalog::cache_free_bytes(&cache_root)?;
             Ok(Machine {
                 census,

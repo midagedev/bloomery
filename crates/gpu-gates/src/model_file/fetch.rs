@@ -57,11 +57,23 @@ fn pinned(mut client: Client, repo: &str) -> Client {
     client
 }
 
-/// The cache client for `repo`: its root `$BLOOMERY_CACHE`, else
-/// `~/.cache/bloomery/hf`; offline under `$HF_HUB_OFFLINE`.
+/// The cache client for `repo` at [`cache_root`]; offline under `$HF_HUB_OFFLINE`.
 fn client(repo: &str) -> Result<Client, GateError> {
-    let root = hf::cache_root(std::env::var_os("BLOOMERY_CACHE"), std::env::var_os("HOME"))?;
-    Ok(pinned(Client::new(root)?, repo))
+    Ok(pinned(Client::new(cache_root()?)?, repo))
+}
+
+/// The hub cache's root: `$BLOOMERY_CACHE`, else `~/.cache/bloomery/hf`.
+pub fn cache_root() -> Result<PathBuf, GateError> {
+    Ok(hf::cache_root(
+        std::env::var_os("BLOOMERY_CACHE"),
+        std::env::var_os("HOME"),
+    )?)
+}
+
+/// `$BLOOMERY_REF_MODEL`, the model the gates' variable names, which a start's own flags must not
+/// name a second time ([`resolve`]).
+pub fn ref_model() -> Option<String> {
+    std::env::var("BLOOMERY_REF_MODEL").ok()
 }
 
 /// What a fetch has written of a set or checkpoint, as the start reports it on `/health`:
@@ -341,7 +353,7 @@ fn model_card(repo: &str) -> Result<Option<String>, GateError> {
 pub fn name(flags: &Flags) -> Result<(), GateError> {
     record::require(record::groups::fetch::FETCH, "model_file::name");
     record::require(record::groups::fetch::SET, "model_file::name");
-    let env = std::env::var("BLOOMERY_REF_MODEL").ok();
+    let env = ref_model();
     let sources = if cfg!(feature = "checkpoint") {
         Sources::GgufOrCheckpoint
     } else {

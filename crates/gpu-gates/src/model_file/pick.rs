@@ -323,7 +323,7 @@ fn shared_class(whys: &[&catalog::Reason]) -> Option<String> {
 /// ([`hf::catalog::pick`]). A listing that fails for a reason other than the network ends it
 /// by name.
 pub fn choose(ask: &Ask<'_>) -> Result<Outcome, GateError> {
-    let root = hf::cache_root(std::env::var_os("BLOOMERY_CACHE"), std::env::var_os("HOME"))?;
+    let root = super::cache_root()?;
     let client = Client::new(root.clone())?;
     let exe = std::env::current_exe().map_err(|e| format!("the server's own path: {e}"))?;
     let reader = RefCell::new(Reader {
