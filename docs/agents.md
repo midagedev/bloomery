@@ -38,7 +38,15 @@ none fits. A pick is:
 `rejected` lists every other variant with one `why` word: `explicit-only` (Q8_0, Q6_K and Q5_K_M start only when
 named), `unverified` (no gate runs the file; the row has `"verified":false`), `not-in-repo`, `offline-uncached`,
 `disk-short`, `plan:CODE` (the plan refused it), `host` or `paged` (it holds, but a lower-ranked variant holds
-faster), `ranked-below`.
+faster), `ranked-below` (a better-ranked variant was picked, and this one would not hold faster). A `ranked-below`
+variant may not have been planned: the pick does not read the file list or the header of a variant that cannot beat
+the one it holds. To see whether it fits, plan it by name: `bloomery-serve --model NAME:VARIANT --dry-run --json`.
+
+The first pick of a model reads each planned file's header from the hub (a few MB a file, fetched in parallel; a
+checkpoint folder also reads its tokenizer and index files, up to tens of MB) and keeps it in
+`$BLOOMERY_CACHE/headers`, so the same pick again reads none. Give the first `--recommend --json` on a
+machine with no cache a timeout of several minutes: on one workstation (an RTX A6000, 2026-10-29) it took 68 s, the
+second one 8 s, and `--model NAME --dry-run --json` for one model 8 s and then 2 s.
 
 ## 2. Check one start
 
@@ -60,7 +68,7 @@ Read stdout line by line. Every line has `"schema":"bloomery.event/1"`; refuse a
 |---|---|
 | `{"event":"pick",...}` | a start by name chose a file: the pick block above |
 | `{"event":"bound","url":"http://H:P","phase":"loading"}` | the port is bound and answers 503 `loading` |
-| `{"event":"ready","url":"http://H:P","model":...,"ctx":...,"slots":...,"place":...}` | requests are served: send them now |
+| `{"event":"ready","url":"http://H:P","model":...,"ctx":...,"slots":...,"place":...}` | requests are served: send them now; `model` is the name the server answers to, and `/v1/models` lists it |
 | `{"event":"error","exit":N,"code":"...","message":"...","hint":"...","next":[[...]]}` | before every non-zero exit |
 | `{"event":"stopped","cause":"...","exit":N}` | the server ended |
 
@@ -75,11 +83,17 @@ Until `ready`, every route answers 503, and `GET /health` says where the start i
 `phase` is `fetch` (the download, with `bytes_done` of `bytes_total`), `plan` or `load`. After `ready`, `/health` is
 200 `{"status":"ok",...}`.
 
+A start by name serves under the catalog name it was asked by (`nemotron-3-nano-4b`, not the name the file states;
+`--alias NAME` replaces it). A start with `-m PATH` or `--hf REPO` serves under the name its file states.
+
 A catalog name is a start by name. A `--model` value that is an existing path is refused with 64 and a `next` that
 names `-m`: a file you already have starts with `-m PATH` or `--hf REPO[:QUANT]`. The automatic pick never takes
 Q8_0, Q6_K or Q5_K_M or a row with `"verified":false`; name one to start it (`--model NAME:Q8_0`).
 
 Stop the server with SIGTERM to the pid you started, then wait for `stopped` and exit 0.
+
+`bloomery-serve-ds41` and `bloomery-serve-qwen38`, the binaries of one seat each, speak the same events and exit
+codes. A start by name is `bloomery-serve`'s alone.
 
 ## Exit codes
 
@@ -87,8 +101,8 @@ Stop the server with SIGTERM to the pid you started, then wait for `stopped` and
 |---|---|---|---|
 | 0 | `ok` | Success, an orderly stop, or a request that only prints. | - |
 | 1 | `refused` | A refusal no other code names yet. | read the message |
-| 64 | `usage` | A flag, a value, a name or a combination the server refuses. | run with --help; the message names the flag or value |
-| 65 | `unsupported` | A model or file no seat of the server serves. | run with --recommend --json for what this machine serves |
+| 64 | `usage` | A flag, a value, a name or a combination the server refuses; a model whose every row is unverified or explicit-only, started by its name alone. | run with --help; the message names the flag or value; for a model with no automatic row, `next` lists `--model NAME:VARIANT` for each row |
+| 65 | `unsupported` | A model or file no seat of the server serves, among them an `--embd-model` file of an architecture no side seat serves; a start by name whose every row the seat's plan refuses as unsupported. | run with --recommend --json for what this machine serves |
 | 66 | `no-model` | No model was named, or the one named is not there. | name a model with --model, -m or --hf; the message lists what exists |
 | 69 | `no-device` | The machine lacks what the server needs: a driver, a card or a CPU feature. | the message names the driver, device or CPU feature that is missing |
 | 70 | `engine` | The engine ended the run. | restart the server; the crash block names the failure |
