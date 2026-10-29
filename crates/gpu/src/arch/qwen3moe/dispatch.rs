@@ -418,11 +418,16 @@ pub(super) fn embed_into(
 ) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::embed_rows";
     let name = token_embd();
-    if let Some(DevWeight::Q8_0 { qs, d, .. }) = w.get(&name) {
+    let table = match w.get(&name) {
+        Some(DevWeight::Q8_0 { qs, d, .. }) => Some(EmbedRows::Q8_0 { qs, d }),
+        Some(DevWeight::Bf16 { w, .. }) => Some(EmbedRows::Bf16(w)),
+        _ => None,
+    };
+    if let Some(table) = table {
         return k.q35(WHAT)?.q38.enqueue_embed_rows(
             gpu.stream(),
             EmbedArgs {
-                table: EmbedRows::Q8_0 { qs, d },
+                table,
                 ids: io.ids,
                 pos0: io.pos0,
                 first: io.first,
@@ -454,7 +459,7 @@ pub(super) fn embed_into(
             return Err(GpuError::tensor(
                 WHAT,
                 &name,
-                "K-quant rows or Q8_0 planes; Q5_0 packed rows when the body admits them",
+                "K-quant rows, Q8_0 planes or BF16 words; Q5_0 packed rows when the body admits them",
             ));
         }
     };

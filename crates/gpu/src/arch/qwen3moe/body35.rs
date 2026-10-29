@@ -510,14 +510,15 @@ impl<'a> Copied35<'a> {
 }
 
 /// The types the embedding and the head read (`crate::site`): the embedding
-/// Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K, Q4_K, Q8_0 or
-/// NVFP4 (`Head`).
+/// Q3_K, Q4_K, Q5_K or Q6_K rows, Q8_0 planes or BF16 words (a checkpoint folder's table as
+/// stored); the head Q6_K, Q4_K, Q8_0 or NVFP4 (`Head`).
 const EMBED: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
     SiteTy::Q5K,
     SiteTy::Q6K,
     SiteTy::Q8_0,
+    SiteTy::Bf16,
 ];
 const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q4K, SiteTy::Q8_0, SiteTy::Nvfp4];
 
