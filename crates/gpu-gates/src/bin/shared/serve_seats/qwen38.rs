@@ -1469,11 +1469,12 @@ pub(crate) fn check(
         a.template_file.check()?;
         a.vision.check_before_model(from_repo)?;
         ubatch_rule(a.ubatch)?;
-        KvQ8::choose(
-            a.cache_type_k.as_deref(),
-            levers.and_then(|l| l.qwen3_kv_set()),
-            KvQ8::F16,
-        )?;
+        let kv_set = if let Some(levers) = levers {
+            levers.qwen3_kv_set()
+        } else {
+            None
+        };
+        KvQ8::choose(a.cache_type_k.as_deref(), kv_set, KvQ8::F16)?;
         if let Some(levers) = levers {
             check_draft_word(levers)?;
             let feed = Feed38::of(levers)?;
