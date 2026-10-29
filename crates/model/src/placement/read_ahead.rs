@@ -30,10 +30,10 @@ use super::host_lock::{NO_POPULATE_READ, WALK_CHUNKS, advise_populate, page_byte
 pub type Ranges = Vec<(usize, Range<u64>)>;
 
 /// The most bytes of steps read ahead of the step being copied, past the
-/// step's own: 1 GiB is 0.15 s of the drive at the 6.83 GB/s the host set's
-/// walk measures, enough that the drive never waits for the copy to finish a
-/// step, and little enough of the page cache that the pages read and not yet
-/// copied cost the host set nothing it would miss. One step past the window may
+/// step's own: a fraction of a second of an NVMe drive, enough that the drive
+/// never waits for the copy to finish a step, and little enough of the page
+/// cache that the pages read and not yet copied cost the host set nothing it
+/// would miss. One step past the window may
 /// be queued whole (a step larger than the window still reads ahead), so the
 /// bound is the window plus the largest step.
 pub const WINDOW_BYTES: u64 = 1 << 30;
