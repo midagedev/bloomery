@@ -2828,11 +2828,13 @@ mod gate {
             }),
         );
         check(&mut ok, CHURN_REQUEST, completed);
-        let (mut rereads, mut unresident) = (0u64, 0u64);
+        let (mut rereads, mut unresident, mut picked, mut landed) = (0u64, 0u64, 0u64, 0u64);
         let passes = log.all(&record::RESIDENCY_PASS)?;
         for pass in &passes {
             rereads = rereads.saturating_add(pass.u64("rereads")?);
             unresident = unresident.saturating_add(pass.opt_u64("unresident")?.unwrap_or(0));
+            picked = picked.saturating_add(pass.opt_u64("picked")?.unwrap_or(0));
+            landed = landed.saturating_add(pass.u64("landed")?);
         }
         let refused = text.contains(UNRESIDENT_REFUSED);
         println!(
@@ -2840,6 +2842,21 @@ mod gate {
              refused flip in the log: {refused}",
             passes.len()
         );
+        // The premise line names a missed setup apart from a victim the engine did not serve
+        // from the file; the verdict below is the same either way.
+        println!(
+            "churn-unhosted: premise: {picked} flips picked by the prompt call, {landed} landed; \
+             {} of their victims were outside the page cache",
+            rereads.saturating_add(unresident)
+        );
+        if picked == 0 {
+            println!("churn-unhosted: setup missed: the prompt call picked no flip");
+        } else if rereads.saturating_add(unresident) == 0 {
+            println!(
+                "churn-unhosted: setup missed: every picked victim was page-cache resident \
+                 (another process maps the model file, or the load's page drop did not hold)"
+            );
+        }
         check(
             &mut ok,
             CHURN_VICTIMS,

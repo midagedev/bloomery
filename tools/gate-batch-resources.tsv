@@ -40,7 +40,7 @@ gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
 gate-gpu-glm5next-serve	-	173015891968
 gate-gpu-glm5next-twocard	-	173015891968
-gate-gpu-qwen38-serve	-	127654154240
+gate-gpu-qwen38-serve	m	127654154240
 gate-gpu-qwen38-twocard	-	92054154240
 gate-gpu-qwen3moe-twocard	-	92054154240
 gate-gpu-qwen4exp-e2e	m	92054154240
