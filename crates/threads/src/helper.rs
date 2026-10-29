@@ -161,6 +161,15 @@ where
     }
 }
 
+/// Place the calling thread as a [`Placement::Float`] helper, for a thread a
+/// caller spawned itself, a scoped one, which [`spawn_helper`]'s `'static`
+/// body cannot be: a one-cpu mask inherited from its spawner is widened to
+/// every cpu, so the thread does not take turns with the spawner on its cpu.
+/// A mask that cannot be read or widened is a named error.
+pub fn float_caller() -> Result<(), HelperError> {
+    place(None).map(|_| ())
+}
+
 /// The calling thread's SMT sibling when it is pinned to one cpu. `None` for
 /// a floating caller or a core without SMT.
 #[must_use]

@@ -4,7 +4,7 @@
 
 use std::sync::mpsc;
 
-use threads::helper::{Placement, helpers, mask, sibling_of, spawn_helper};
+use threads::helper::{Placement, float_caller, helpers, mask, sibling_of, spawn_helper};
 
 /// Set the calling thread's mask to `cpus`.
 fn set_mask(cpus: &[usize]) {
@@ -88,4 +88,49 @@ fn a_helper_leaves_its_openers_one_cpu_mask() {
         }
         other => println!("SKIP the sibling case: cpu {c}'s sibling is {other:?}"),
     }
+}
+
+/// A scoped thread a caller spawned itself inherits its opener's one-cpu mask
+/// and [`float_caller`] widens it: the way a load's own helpers, which borrow the
+/// load's data and so cannot be [`spawn_helper`]'s `'static` bodies, stay off the
+/// opener's cpu. A test thread whose own mask holds one cpu cannot tell the
+/// float from the pin and skips by name.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the Linux fact it reads: a thread's own affinity mask"
+)]
+#[test]
+fn a_scoped_thread_floats_off_its_openers_one_cpu_mask() {
+    let wide = mask().expect("the test thread's mask");
+    if wide.len() < 2 {
+        println!(
+            "SKIP a_scoped_thread_floats_off_its_openers_one_cpu_mask: the test thread's mask is {wide:?}"
+        );
+        return;
+    }
+    let c = wide[0];
+    let (inherited, floated) = std::thread::spawn(move || {
+        set_mask(&[c]);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let inherited = mask().expect("the scoped thread's inherited mask");
+                    float_caller().expect("the scoped thread floats");
+                    (inherited, mask().expect("the scoped thread's mask"))
+                })
+                .join()
+                .expect("the scoped thread")
+        })
+    })
+    .join()
+    .expect("the opener");
+    assert_eq!(
+        inherited,
+        vec![c],
+        "the scoped thread inherits cpu {c} alone"
+    );
+    assert!(
+        floated.len() > 1,
+        "float_caller left the scoped thread on {floated:?}"
+    );
 }
