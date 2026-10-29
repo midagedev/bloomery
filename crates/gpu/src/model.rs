@@ -50,18 +50,18 @@ use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::watchdog;
-use crate::weights::{HEAD_TENSOR, Weights, head_tensor};
+use crate::weights::{CardOf, HEAD_TENSOR, Weights, head_tensor};
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream};
 use engram::direct::DIRECT_ALIGN;
-use gguf::{Split, TensorInfo};
+use gguf::Split;
 use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
 use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
-use model::placement::{ArenaFloor, CardFormat, ExpertList, Plan};
+use model::placement::{ArenaFloor, ExpertList, Plan};
 use model::r8file::R8Source;
 use std::ops::Range;
 use std::sync::Arc;
@@ -674,7 +674,7 @@ impl<B: ChainBody> GpuModel<B> {
     pub(crate) fn load_blocks_from(
         gpu: Gpu,
         file: &Split,
-        (bytes, card): (CardBytes<'_>, &dyn Fn(&TensorInfo) -> Option<CardFormat>),
+        (bytes, card): (CardBytes<'_>, CardOf<'_>),
         ctx_max: usize,
         layers: Range<usize>,
         head: bool,
@@ -2282,11 +2282,7 @@ pub trait PartsLoad: Send {
     /// Every tensor the source makes on the card, each whole in the card format `card` gives it
     /// and in its type's own where `card` gives none: the load of a model that sits wholly on
     /// one card, with no plan ([`GpuModel::load_blocks_from`]).
-    fn load_whole(
-        &self,
-        stream: &CudaStream,
-        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
-    ) -> Result<Weights, GpuError>;
+    fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError>;
 
     /// The host admission and exact read peak to pass to load.
     fn host_need(

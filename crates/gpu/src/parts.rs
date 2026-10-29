@@ -20,7 +20,7 @@ use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan
 
 use crate::GpuError;
 use crate::upload::UploadRing;
-use crate::weights::{TensorPart, Weights, part_format, stage_parts};
+use crate::weights::{CardOf, TensorPart, Weights, part_format, stage_parts};
 
 /// What the errors name.
 const WHAT: &str = "parts::load";
@@ -293,11 +293,7 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
         )
     }
 
-    fn load_whole(
-        &self,
-        stream: &CudaStream,
-        card: &dyn Fn(&TensorInfo) -> Option<CardFormat>,
-    ) -> Result<Weights, GpuError> {
+    fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError> {
         load(
             stream,
             &self.source,
