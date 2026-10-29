@@ -181,7 +181,10 @@
 //!   error within six deviations of the error model's router error
 //!   ([`flip::flip_cap`]), and — where no earlier flip lies on its path — only at
 //!   a gap within six deviations of the router's error over the logits'
-//!   spread ([`flip::margin_cap`]); its logits and stores printed. The forced arm
+//!   spread ([`flip::margin_cap`]); past an earlier flip the cap holds the
+//!   pair's error in the forced arm's router row instead, our rounding
+//!   without that flip's cascade ([`flip::Flip::allowed_past`]); its logits
+//!   and stores printed. The forced arm
 //!   takes the pass's routes (`Body38::plant_ubatch_routes`), so no flip
 //!   can happen: every id the pass's, its last argmax equal to ik's, the
 //!   last logits and every layer's live store and the PLE ring within the
@@ -230,7 +233,8 @@
 //!   an id past the experts, and reads no shared expert's word
 //!   ([`places_rule`]). (i) The batch set's five eager steps against the
 //!   host plan's eager steps of (p): each flip of the routing excused as
-//!   (g)'s free arm excuses one; off every flip's path each layer output
+//!   (g)'s free arm excuses one, a flip past an earlier one capped on its own
+//!   error (the leg runs no undone walk); off every flip's path each layer output
 //!   within [`card_band`] and each position's logits within the last
 //!   layer's band, its argmax the host plan's or a named tie; on a flip's
 //!   path printed. (ii) Its
@@ -2622,13 +2626,22 @@ mod gate {
     /// The flips of `ours` against `theirs` (each `[token][layer]`), each
     /// printed with `arm`: excused by the pair rule under [`flip::flip_cap`] and,
     /// where no earlier flip lies on its path, only at a gap within
-    /// [`flip::margin_cap`], both at the layer's `band`.
+    /// [`flip::margin_cap`], both at the layer's `band`. Past an earlier flip,
+    /// when `undone` is given (`ours`' run with `theirs`' routes taken), the
+    /// cap holds each pair's error in `undone`'s row ([`Flip::allowed_past`]);
+    /// without it, the pair's own error.
     fn judge_flips(
         arm: &str,
         ours: &[Vec<RouteTap>],
         theirs: &[Vec<RouteTap>],
+        undone: Option<&[Vec<RouteTap>]>,
         band: fn(usize) -> f64,
     ) -> FlipTally {
+        fn row(r: &[Vec<RouteTap>], t: usize, l: usize) -> &[f32] {
+            r.get(t)
+                .and_then(|ls| ls.get(l))
+                .map_or(&[][..], |x| &x.logits[..])
+        }
         let mut flips = Vec::new();
         for (t, (ours, theirs)) in ours.iter().zip(theirs).enumerate() {
             for (l, (o, p)) in ours.iter().zip(theirs).enumerate() {
@@ -2657,13 +2670,23 @@ mod gate {
                 .map(|p| p.2)
                 .fold(f64::NEG_INFINITY, f64::max);
             let at_wide = !prior && (widest > *bound || widest.is_nan());
-            refused += usize::from(!f.allowed(*cap));
+            let past = undone
+                .filter(|_| prior)
+                .map(|u| (row(u, f.token, f.layer), row(theirs, f.token, f.layer)));
+            let (allowed, line) = match past {
+                Some(rows) => (f.allowed_past(*cap, rows), f.line_past(arm, *cap, rows)),
+                None => (f.allowed(*cap), f.line(arm, *cap)),
+            };
+            refused += usize::from(!allowed);
             first += usize::from(!prior);
             wide += usize::from(at_wide);
             println!(
-                "{}; {}",
-                f.line(arm, *cap),
-                if prior {
+                "{line}; {}",
+                if past.is_some() {
+                    "past an earlier flip on its path: the cap holds the error with the flips \
+                     undone (margin rule not applied)"
+                        .to_owned()
+                } else if prior {
                     "past an earlier flip on its path (margin rule not applied)".to_owned()
                 } else {
                     format!(
@@ -2692,21 +2715,18 @@ mod gate {
 
     /// (g) on the batch set, the free arm: the ubatch walk ([`gemm_walk`],
     /// its own routing), then the pass (by passes from [`fresh`]), the walk
-    /// against the pass (`eager`, the eager steps' taps, bit for bit the
-    /// pass's routing) and ik — the last argmax equal to ik's; every route
-    /// tap the top ten of its own logits; each flip against the pass's
-    /// routing excused by the pair rule under [`flip::flip_cap`], and, where no
-    /// earlier flip lies on its path, only at a gap within [`flip::margin_cap`]; its
-    /// logits and stores printed. Around it: a read of the taps past the
-    /// walk's positions refused by name; the reset before the pass leaving no
-    /// split behind; a walk of more rows than the armed taps refused before
-    /// it moves anything. Returns the pass's run.
+    /// against the pass and ik — the last argmax equal to ik's; every route
+    /// tap the top ten of its own logits; its logits and stores printed (its
+    /// flips are judged after the forced arm, [`gemm_free_flips`]). Around
+    /// it: a read of the taps past the walk's positions refused by name; the
+    /// reset before the pass leaving no split behind; a walk of more rows
+    /// than the armed taps refused before it moves anything. Returns the
+    /// pass's run and the walk's route taps.
     fn gemm_free(
         m: &mut Qwen38Model,
         man: &RefManifest,
         toks: &[u32],
-        eager: &Run,
-    ) -> Result<(bool, Run), GateError> {
+    ) -> Result<(bool, Run, Vec<Vec<RouteTap>>), GateError> {
         let n = toks.len();
         let (free, routes) = gemm_walk(m, toks, None)?;
         let (ask, split) = {
@@ -2764,20 +2784,6 @@ mod gate {
             &inconsistent[..inconsistent.len().min(8)],
             verdict(taps_ok)
         );
-        let tally = judge_flips("gemm", &routes, &eager.routes, gemm_band);
-        let flips_ok = tally.ok();
-        ok &= flips_ok;
-        println!(
-            "gemm free: {} flip(s) against the pass's routing, {} allowed by the pair rule; {} \
-             first on their path, {} of them at a wide margin; the smallest pass margin that \
-             flipped {:.3e} {}",
-            tally.flips.len(),
-            tally.flips.len() - tally.refused,
-            tally.first,
-            tally.wide,
-            tally.smallest,
-            verdict(flips_ok)
-        );
         let (layers, ple) = live_rel(&free, pass, n)?;
         let shown: Vec<usize> = (0..layers.len())
             .filter(|l| l % 8 == 0 || l + 1 == n_layer())
@@ -2800,7 +2806,32 @@ mod gate {
             verdict(split_ok)
         );
         ok &= gemm_taps_first(m, toks, &free)?;
-        Ok((ok, pass_run))
+        Ok((ok, pass_run, routes))
+    }
+
+    /// (g) on the batch set, the free arm's flips (`free`, its route taps)
+    /// against the pass's routing (`eager`, the eager steps' taps, bit for
+    /// bit the pass's): each excused by the pair rule under
+    /// [`flip::flip_cap`]; where no earlier flip lies on its path, only at a
+    /// gap within [`flip::margin_cap`]; past one, the cap holding each pair's
+    /// error in the forced arm's router row (`forced`: the same walk on the
+    /// pass's routes, so our rounding without the earlier flip's cascade,
+    /// [`Flip::allowed_past`]).
+    fn gemm_free_flips(free: &[Vec<RouteTap>], forced: &[Vec<RouteTap>], eager: &Run) -> bool {
+        let tally = judge_flips("gemm", free, &eager.routes, Some(forced), gemm_band);
+        let ok = tally.ok();
+        println!(
+            "gemm free: {} flip(s) against the pass's routing, {} allowed by the pair rule; {} \
+             first on their path, {} of them at a wide margin; the smallest pass margin that \
+             flipped {:.3e} {}",
+            tally.flips.len(),
+            tally.flips.len() - tally.refused,
+            tally.first,
+            tally.wide,
+            tally.smallest,
+            verdict(ok)
+        );
+        ok
     }
 
     /// (g): with the route taps armed at fewer rows than the batch set's,
@@ -2859,12 +2890,13 @@ mod gate {
     /// every layer's live store and the PLE ring within [`gemm_band`] of the
     /// pass's, with no layer excused; the router's own logits against the
     /// pass's printed per layer (the input [`flip::margin_cap`] is derived from).
+    /// Returns its route taps, the free arm's flips undone ([`gemm_free_flips`]).
     fn gemm_forced(
         m: &mut Qwen38Model,
         man: &RefManifest,
         toks: &[u32],
         (eager, pass): (&Run, &Run),
-    ) -> Result<bool, GateError> {
+    ) -> Result<(bool, Vec<Vec<RouteTap>>), GateError> {
         let n = toks.len();
         let walk = gemm_walk(m, toks, Some(&eager.routes));
         gemm_taps_off(m)?;
@@ -2967,7 +2999,7 @@ mod gate {
              {wl}; peak error over three deviations, worst {peak:.3} (printed: [`margin_cap`]'s \
              premise, 1 or under where it holds)"
         );
-        Ok(ok)
+        Ok((ok, routes))
     }
 
     /// (g) `auto` on the batch set's five positions — below
@@ -3003,16 +3035,19 @@ mod gate {
     }
 
     /// (g) on the batch set: the free arm and the pass, `auto`, then the
-    /// forced arm, then (crx), the walk with ik's routes planted.
+    /// forced arm, the free arm's flips with the forced arm's rows as their
+    /// undone rows, then (crx), the walk with ik's routes planted.
     fn gemm_batch(
         m: &mut Qwen38Model,
         man: &RefManifest,
         toks: &[u32],
         eager: &Run,
     ) -> Result<bool, GateError> {
-        let (mut ok, pass) = gemm_free(m, man, toks, eager)?;
+        let (mut ok, pass, free) = gemm_free(m, man, toks)?;
         ok &= gemm_auto_call(m, toks, &pass)?;
-        ok &= gemm_forced(m, man, toks, (eager, &pass))?;
+        let (forced_ok, forced) = gemm_forced(m, man, toks, (eager, &pass))?;
+        ok &= forced_ok;
+        ok &= gemm_free_flips(&free, &forced, eager);
         ok &= forced_fx(m, toks)?;
         Ok(ok)
     }
@@ -3677,8 +3712,10 @@ mod gate {
     /// routes bit for bit the host run's (its router reads what the same
     /// launches wrote from the same inputs); each flip of
     /// the card run's routing against the host run's excused as (g)'s free
-    /// arm excuses one, at [`card_band`]; off every flip's path each layer
-    /// output within [`card_band`] of the host run's, and each position's
+    /// arm excuses one, at [`card_band`], save that a flip past an earlier one
+    /// is capped on its own error (the leg runs no undone walk); off every
+    /// flip's path each layer output within [`card_band`] of the host run's,
+    /// and each position's
     /// logits within the last layer's band with its argmax the host run's —
     /// or, named and counted, the host run's runner-up with the host run's
     /// margin between the two within twice the two runs' distance at those
@@ -3697,7 +3734,7 @@ mod gate {
              {first_same} {}",
             verdict(first_same)
         );
-        let tally = judge_flips("card", &card.routes, &host.routes, card_band);
+        let tally = judge_flips("card", &card.routes, &host.routes, None, card_band);
         let mut ok = first_same && tally.ok() && card.routes.len() == host.routes.len();
         println!(
             "card leg vs host: {} flip(s) of the card plan's routing against the host plan's, {} \

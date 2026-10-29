@@ -113,6 +113,64 @@ impl Flip {
             pairs.join(", "),
         )
     }
+
+    /// Each pair's error with our values read from `undone` (`|undone[a] − ik[a]| + |undone[b] −
+    /// ik[b]|`, in the pairs' order). An id past a row reads NaN.
+    fn errs_in(&self, undone: &[f32], ik: &[f32]) -> Vec<f64> {
+        let v = |x: &[f32], e: u32| x.get(e as usize).map_or(f64::NAN, |&y| f64::from(y));
+        self.pairs
+            .iter()
+            .map(|&(a, b, _, _)| (v(undone, a) - v(ik, a)).abs() + (v(undone, b) - v(ik, b)).abs())
+            .collect()
+    }
+
+    /// PIN(2026-10-29): the rule for a flip past an earlier flip on its path, derived. There our
+    /// values differ from ik's by our rounding, which [`Flip::allowed`]'s cap is derived for (a
+    /// chain that takes ik's experts), plus the earlier flip's cascade: the expert it exchanged
+    /// moves every later router input on its path by that expert's routed output less the one it
+    /// replaced, a term of the weights that no rounding model bounds. `undone` is our router's
+    /// row at this flip's (layer, token) from the same run with ik's routes taken at every layer,
+    /// so its distance from ik's is the rounding alone. A pair is allowed only when its gap lies
+    /// within our error and its error in `undone` within `cap`; past either the pick is wrong,
+    /// named by [`Flip::line_past`].
+    #[must_use]
+    pub fn allowed_past(&self, cap: f64, (undone, ik): (&[f32], &[f32])) -> bool {
+        !self.pairs.is_empty()
+            && self
+                .pairs
+                .iter()
+                .zip(self.errs_in(undone, ik))
+                .all(|(&(_, _, gap, err), held)| gap <= err && held <= cap)
+    }
+
+    /// The line of a flip past an earlier flip on its path: its pairs, each with its error in
+    /// `undone`, and its verdict under `cap` ([`Flip::allowed_past`]).
+    #[must_use]
+    pub fn line_past(&self, arm: &str, cap: f64, (undone, ik): (&[f32], &[f32])) -> String {
+        let held = self.errs_in(undone, ik);
+        let pairs: Vec<String> = self
+            .pairs
+            .iter()
+            .zip(&held)
+            .map(|((a, b, gap, err), h)| {
+                format!("{a}<-{b} gap {gap:.3e} err {err:.3e} undone {h:.3e}")
+            })
+            .collect();
+        let verdict = if self.allowed_past(cap, (undone, ik)) {
+            "allowed (counted)"
+        } else if held.iter().any(|&h| h > cap || h.is_nan()) {
+            "FAIL: our error with the earlier flips undone past the pinned frontier"
+        } else {
+            "FAIL: a pair's gap past our error"
+        };
+        format!(
+            "{arm} flip layer={} token={}: ik margin {:.3e}; {} (cap {cap:.2}): {verdict}",
+            self.layer,
+            self.token,
+            self.margin,
+            pairs.join(", "),
+        )
+    }
 }
 
 /// A head's argmax that differs from ik's, excused as a tie: ours is ik's
@@ -205,6 +263,51 @@ mod tests {
         assert!(!wrong.allowed(10.0), "gap 0.40 past err 0.02: {wrong:?}");
         assert!(wrong.line("free", 10.0).contains("gap past our error"));
         assert!(Flip::between((3, 1), (&[0], &ours), (&[0], &ik), 0.0).is_none());
+    }
+
+    /// Past an earlier flip the cap holds the pair's error in the undone row, not ours: a pair at
+    /// err 0.16 (a cascade the cap on our error refuses at 0.1) is allowed over an undone row at
+    /// 0.02 and refused over one at 0.61 (a router moved by order one); a pair whose gap passes
+    /// its error, and an undone row too short for an id, are refused whatever the cap. Mutant:
+    /// the cap read on our error, or the gap test dropped.
+    #[test]
+    fn a_flip_past_another_is_capped_with_it_undone() {
+        let ik = [0.50f32, 0.49, 0.10];
+        let ours = [0.40f32, 0.55, 0.10];
+        let f =
+            Flip::between((2, 0), (&[1], &ours), (&[0], &ik), margin(&ik, &[0])).expect("a flip");
+        let (_, _, gap, err) = f.pairs[0];
+        assert!(
+            (gap - 0.01).abs() < 1e-6 && (err - 0.16).abs() < 1e-6,
+            "{f:?}"
+        );
+        assert!(!f.allowed(0.1), "the cap on our error: {f:?}");
+        let rounding = [0.49f32, 0.50, 0.10];
+        assert!(f.allowed_past(0.1, (&rounding, &ik)));
+        assert!(
+            f.line_past("free", 0.1, (&rounding, &ik))
+                .contains("undone 2.000e-2")
+        );
+        let fault = [0.20f32, 0.80, 0.10];
+        assert!(!f.allowed_past(0.1, (&fault, &ik)));
+        assert!(
+            f.line_past("free", 0.1, (&fault, &ik))
+                .contains("undone past the pinned frontier")
+        );
+        let wrong = Flip::between((2, 0), (&[2], &ours), (&[0], &ik), 0.0).expect("a flip");
+        assert!(
+            !wrong.allowed_past(10.0, (&ik, &ik)),
+            "gap 0.40 past err 0.10: {wrong:?}"
+        );
+        assert!(
+            wrong
+                .line_past("free", 10.0, (&ik, &ik))
+                .contains("gap past our error")
+        );
+        assert!(
+            !f.allowed_past(10.0, (&rounding[..1], &ik)),
+            "id 1 past the row reads NaN"
+        );
     }
 
     /// The tie is judged against the head input's own distance, not a band
