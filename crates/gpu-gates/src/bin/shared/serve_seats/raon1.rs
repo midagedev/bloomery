@@ -685,7 +685,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     need::print(&plan, 0, 0, true)?;
     parallel_line(slots, slot_ctx, from, Pass::One);
     if a.plan_only {
-        std::process::exit(0);
+        bloomery_gpu_gates::start::plan_exit();
     }
     let props = EngineProps {
         model: Some(model_props(&split, &inputs.model)),

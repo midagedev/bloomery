@@ -2575,7 +2575,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         // The records the load would print first are out; nothing was
         // opened on a card.
         load.print_plan(&levers, vision.as_ref())?;
-        std::process::exit(0);
+        bloomery_gpu_gates::start::plan_exit();
     }
     // `/props`' placement: a placed load's plan, the one its open makes from the same plan and
     // levers; a whole-card load opens with no plan, so it reports none and says so.

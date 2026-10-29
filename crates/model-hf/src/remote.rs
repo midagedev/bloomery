@@ -271,6 +271,129 @@ pub fn sparse_set(
         .collect()
 }
 
+/// The directory under the cache `root` that holds the header-only copies of `repo` at `rev`: a
+/// start by name plans a candidate's file from its header, and a copy here costs the header's
+/// bytes instead of the download. A `/` in `rev` (a branch such as `refs/pr/1`) is one path part.
+pub fn headers_dir(root: &Path, repo: &str, rev: &str) -> PathBuf {
+    root.join("headers").join(repo).join(rev.replace('/', "_"))
+}
+
+/// `len` bytes of `file` from byte `from`, exactly: the reader's own error, or a body of another
+/// length, named with the file.
+fn read_exactly(
+    read: &mut ReadRange<'_>,
+    file: &str,
+    from: u64,
+    len: u64,
+) -> Result<Vec<u8>, RemoteError> {
+    let got = read(from, len).map_err(|source| RemoteError::Read {
+        file: file.to_owned(),
+        from,
+        len,
+        source,
+    })?;
+    let have = got.len() as u64;
+    if have != len {
+        return Err(RemoteError::ShortRead {
+            file: file.to_owned(),
+            from,
+            len,
+            got: have,
+        });
+    }
+    Ok(got)
+}
+
+/// `file`, a safetensors shard of `size` bytes, as a sparse file at `dest`: its header (the
+/// eight-byte little-endian length and the JSON it counts) at the front of a file extended to
+/// `size`, the tensor data a hole. The header is bound by [`MAX_HEADER`] and by the file.
+pub fn sparse_safetensors(
+    dest: &Path,
+    file: &str,
+    size: u64,
+    read: &mut ReadRange<'_>,
+) -> Result<HeaderStat, RemoteError> {
+    if size < 8 {
+        return Err(RemoteError::PastEnd {
+            file: file.to_owned(),
+            size,
+        });
+    }
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&read_exactly(read, file, 0, 8)?);
+    let json = u64::from_le_bytes(word);
+    if json > MAX_HEADER {
+        return Err(RemoteError::HeaderTooLong {
+            file: file.to_owned(),
+        });
+    }
+    let end = 8 + json;
+    if end > size {
+        return Err(RemoteError::PastEnd {
+            file: file.to_owned(),
+            size,
+        });
+    }
+    let header = read_exactly(read, file, 0, end)?;
+    fs::write(dest, &header).map_err(|e| io_err(dest, "write the header", e))?;
+    OpenOptions::new()
+        .write(true)
+        .open(dest)
+        .and_then(|f| f.set_len(size))
+        .map_err(|e| io_err(dest, "extend to the listed size", e))?;
+    Ok(HeaderStat {
+        header: end,
+        reads: 2,
+    })
+}
+
+/// `file` of `size` bytes, a small file of a checkpoint (its config, tokenizer or template),
+/// whole at `dest`.
+pub fn whole_file(
+    dest: &Path,
+    file: &str,
+    size: u64,
+    read: &mut ReadRange<'_>,
+) -> Result<(), RemoteError> {
+    if size > MAX_HEADER {
+        return Err(RemoteError::HeaderTooLong {
+            file: file.to_owned(),
+        });
+    }
+    let bytes = read_exactly(read, file, 0, size)?;
+    fs::write(dest, bytes).map_err(|e| io_err(dest, "write", e))
+}
+
+/// A checkpoint folder's `files` (entries of `repo`'s listing at revision `rev`, its top-level
+/// files: [`hf::checkpoint_files`]) as a header-only copy in `dir`: each shard's header read by
+/// range into a sparse file of the listed size ([`sparse_safetensors`]), every other file whole.
+/// Calls `progress` after each file. `dir`, which a folder reader opens as the folder.
+pub fn sparse_checkpoint(
+    client: &Client,
+    repo: &str,
+    rev: &str,
+    files: &[Entry],
+    dir: &Path,
+    progress: &mut dyn FnMut(&Entry),
+) -> Result<PathBuf, RemoteError> {
+    fs::create_dir_all(dir).map_err(|e| io_err(dir, "create the header folder", e))?;
+    for e in files {
+        let dest = dir.join(e.name());
+        let mut read = |from: u64, len: u64| -> Result<Vec<u8>, Box<dyn Error>> {
+            client
+                .fetch_range(repo, rev, &e.path, from, len)
+                .map_err(Into::into)
+        };
+        if e.path.ends_with(".safetensors") {
+            sparse_safetensors(&dest, &e.path, e.size, &mut read)?;
+        } else {
+            whole_file(&dest, &e.path, e.size, &mut read)?;
+        }
+        progress(e);
+    }
+    Ok(dir.to_path_buf())
+}
+
 /// A fixture written at `out` taken down: its directory, and its sidecar file at `sidecar` and
 /// the sidecar's directory when that holds nothing else (it is never the directory of a file
 /// the writer did not make).
@@ -682,5 +805,103 @@ mod tests {
             Err(RemoteError::ShortRead { len, got, .. }) => assert_eq!((len, got), (64, 63)),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A safetensors file: the eight-byte length, a JSON header and `data` bytes.
+    fn safetensors_bytes(json: &str, data: usize) -> Vec<u8> {
+        let mut out = (json.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(json.as_bytes());
+        out.extend(std::iter::repeat_n(0xAB, data));
+        out
+    }
+
+    /// A reader over `bytes` that serves any range inside them.
+    fn slice_reader(bytes: &[u8]) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error>> + '_ {
+        move |from, len| {
+            let (from, len) = (from as usize, len as usize);
+            bytes
+                .get(from..from + len)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "a range past the file".into())
+        }
+    }
+
+    /// A shard's copy has its header at the front and the listed size, so a reader that checks
+    /// tensor offsets against the file length is satisfied while the data costs no disk; a header
+    /// longer than the file, a length past the bound and a file under eight bytes are named.
+    #[test]
+    fn a_safetensors_shard_is_its_header_and_a_hole() {
+        let d = scratch("st-shard");
+        let json = r#"{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let file = safetensors_bytes(json, 8);
+        let dest = d.join("m.safetensors");
+        let stat = sparse_safetensors(
+            &dest,
+            "m.safetensors",
+            file.len() as u64,
+            &mut slice_reader(&file),
+        )
+        .expect("a shard");
+        assert_eq!(stat.header, 8 + json.len() as u64);
+        let copy = fs::read(&dest).expect("copy");
+        assert_eq!(copy.len(), file.len(), "the listed size");
+        assert_eq!(&copy[..8 + json.len()], &file[..8 + json.len()]);
+        assert!(
+            copy[8 + json.len()..].iter().all(|b| *b == 0),
+            "the data region is a hole"
+        );
+        // A length that runs past the file: the listing's size does not hold the header.
+        let cut = &file[..20];
+        match sparse_safetensors(&d.join("c"), "c", 20, &mut slice_reader(cut)) {
+            Err(RemoteError::PastEnd { size, .. }) => assert_eq!(size, 20),
+            other => panic!("{other:?}"),
+        }
+        let huge = (MAX_HEADER + 1).to_le_bytes();
+        match sparse_safetensors(&d.join("h"), "h", 64, &mut slice_reader(&huge)) {
+            Err(RemoteError::HeaderTooLong { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        match sparse_safetensors(&d.join("s"), "s", 4, &mut slice_reader(&[0; 4])) {
+            Err(RemoteError::PastEnd { size, .. }) => assert_eq!(size, 4),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A small file is written whole, a body of another length is named, and the header copies of
+    /// two revisions of a repo are two directories.
+    #[test]
+    fn a_config_is_whole_and_a_revision_has_its_own_header_directory() {
+        let d = scratch("st-whole");
+        let body = br#"{"model_type":"x"}"#;
+        whole_file(
+            &d.join("config.json"),
+            "config.json",
+            body.len() as u64,
+            &mut slice_reader(body),
+        )
+        .expect("whole");
+        assert_eq!(fs::read(d.join("config.json")).expect("read"), body);
+        match whole_file(
+            &d.join("short.json"),
+            "short.json",
+            body.len() as u64 + 3,
+            &mut slice_reader(body),
+        ) {
+            Err(RemoteError::Read { .. } | RemoteError::ShortRead { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        let root = Path::new("/cache");
+        assert_eq!(
+            headers_dir(root, "o/n", "abc123"),
+            Path::new("/cache/headers/o/n/abc123")
+        );
+        assert_eq!(
+            headers_dir(root, "o/n", "refs/pr/1"),
+            Path::new("/cache/headers/o/n/refs_pr_1")
+        );
+        assert_ne!(
+            headers_dir(root, "o/n", "main"),
+            headers_dir(root, "o/n", "abc123")
+        );
     }
 }

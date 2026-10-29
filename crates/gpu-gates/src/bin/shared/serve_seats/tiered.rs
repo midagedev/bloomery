@@ -640,7 +640,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     parallel_line(slots, slot_ctx, from, Pass::of(slots, S::ONE_PASS));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
-        std::process::exit(0);
+        bloomery_gpu_gates::start::plan_exit();
     }
     let props = EngineProps {
         model: Some(model_props(&split, &inputs.model)),

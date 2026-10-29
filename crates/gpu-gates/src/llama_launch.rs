@@ -46,6 +46,9 @@ pub(crate) fn serve_takes_value(flag: &str) -> bool {
             | llama_place::LIST_DEVICES
             | "--records-schema"
             | "--levers"
+            | "--recommend"
+            | "--dry-run"
+            | "--json"
     ) && !llama_place::CPU_MOE.contains(&llama_place::spelled(flag).as_str())
 }
 

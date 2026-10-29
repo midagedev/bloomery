@@ -162,6 +162,9 @@ pub struct Client {
     /// `HF_HUB_OFFLINE` ([`hub_offline`]): no listing is asked for; the
     /// cache's verified files stand in.
     pub offline: bool,
+    /// The revision of the repo a resolve lists and downloads: `main`, or a
+    /// commit hash, a tag or another branch a caller pins.
+    pub revision: String,
 }
 
 /// Why a resolve under `HF_HUB_OFFLINE` asked the hub for no listing.
@@ -278,6 +281,7 @@ impl Client {
             root,
             curl: "curl".into(),
             offline,
+            revision: "main".to_owned(),
         })
     }
 
@@ -346,7 +350,7 @@ impl Client {
         if self.offline {
             return Ok(Listed::Cache(HUB_OFFLINE_WHY.to_owned()));
         }
-        match self.listing(repo) {
+        match self.listing_at(repo, &self.revision) {
             Ok(entries) => Ok(Listed::Hub(entries)),
             Err(HfError::Network { why, .. } | HfError::Unavailable { why, .. }) => {
                 Ok(Listed::Cache(why))
@@ -563,7 +567,10 @@ impl Client {
         if let Some(dir) = part.parent() {
             fs::create_dir_all(dir).map_err(|e| HfError::io(dir, e))?;
         }
-        let url = format!("{}/{repo}/resolve/main/{}", self.base, entry.path);
+        let url = format!(
+            "{}/{repo}/resolve/{}/{}",
+            self.base, self.revision, entry.path
+        );
         let what = format!("download {url}");
         let mut cmd = Command::new(&self.curl);
         cmd.args(["--fail", "--location", "--silent", "--show-error"]);
@@ -1038,6 +1045,7 @@ mod tests {
             root: dir.join("cache"),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         };
         let entry = Entry {
             path: path.to_owned(),
@@ -1078,6 +1086,7 @@ mod tests {
             root: dir.join("cache"),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         }
     }
 
@@ -1316,6 +1325,35 @@ mod tests {
         fs::write(tree.join("0123abc"), json(11)).expect("rev listing");
         assert_eq!(c.listing("a/b").expect("main")[0].size, 10);
         assert_eq!(c.listing_at("a/b", "0123abc").expect("rev")[0].size, 11);
+    }
+
+    /// A client's revision is the one its listing and its download read: a pinned revision's file
+    /// is fetched, not `main`'s.
+    #[test]
+    fn a_clients_revision_names_the_listing_and_the_download() {
+        let d = scratch("client-rev");
+        let (mut c, _) = served(&d, "a/b", "m.bin", b"main bytes");
+        let older: &[u8] = b"older bytes";
+        let rev = d.join("hub/a/b/resolve/0123abc");
+        fs::create_dir_all(&rev).expect("rev dir");
+        fs::write(rev.join("m.bin"), older).expect("rev file");
+        let tree = d.join("hub/api/models/a/b/tree");
+        fs::create_dir_all(&tree).expect("tree dir");
+        let listing = |content: &[u8]| {
+            format!(
+                "[{{\"type\":\"file\",\"path\":\"m.bin\",\"size\":{},\"lfs\":{{\"oid\":\"{}\",\"size\":{}}}}}]",
+                content.len(),
+                hex(&sha2::Sha256::digest(content)),
+                content.len()
+            )
+        };
+        fs::write(tree.join("main"), listing(b"main bytes")).expect("main listing");
+        fs::write(tree.join("0123abc"), listing(older)).expect("rev listing");
+        c.revision = "0123abc".to_owned();
+        let got = c
+            .resolve_exact("a/b", &["m.bin"], &mut |_| {})
+            .expect("resolve");
+        assert_eq!(fs::read(&got[0]).expect("read"), older);
     }
 
     #[test]
@@ -1643,6 +1681,7 @@ mod tests {
             root: root.to_owned(),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         }
     }
 
@@ -1675,6 +1714,7 @@ mod tests {
             root: root.to_owned(),
             curl: "curl".into(),
             offline: false,
+            revision: "main".to_owned(),
         }
     }
 

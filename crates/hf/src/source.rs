@@ -1,7 +1,7 @@
 //! Where a server's model file comes from: a path (`-m PATH`, `--model-file
 //! PATH`, and whatever other spellings a binary gives the flag), a repo
 //! (`--hf <repo>[:<quant>]`), the gates' environment variable
-//! `BLOOMERY_REF_MODEL`, or a catalog model by name ([`CatalogRef`], which the
+//! `BLOOMERY_REF_MODEL`, or a catalog model by name ([`Source::Named`], which the
 //! pick turns into a repo). A model is named once: a flag given twice, a path
 //! beside `--hf`, and a flag beside the variable when the two name different
 //! files are each refused by name with both values. A path flag equal to the
@@ -67,45 +67,27 @@ pub enum Source {
     File(String),
     /// A repo to fetch.
     Hf(RepoRef),
+    /// A catalog model by name, no model flag beside it: the pick turns it into a repo
+    /// ([`Source::Hf`]). A caller that has no pick refuses it by name.
+    Named(CatalogRef),
 }
 
-/// What the flags and the variable name: a source, or a catalog model the pick turns into one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Selected {
-    /// A path or a repo.
-    Source(Source),
-    /// A catalog model by name, no model flag beside it.
-    Catalog(CatalogRef),
-}
-
-/// What `flags` and the variable's value `env` name; `None` when nothing names a model. A
-/// catalog name beside a path, a repo or the variable only chooses the seat and the other
-/// source stands; a catalog variant beside one of them is the model named twice.
-pub fn select(flags: &Flags, env: Option<&str>) -> Result<Option<Selected>, HfError> {
+/// The source `flags` and the variable's value `env` name; `None` when neither names one. An
+/// empty `env` counts as unset. A catalog name beside a path, a repo or the variable only chooses
+/// the seat and the other source stands; a catalog variant beside one of them is the model named
+/// twice. A catalog name alone is [`Source::Named`].
+pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<Source>, HfError> {
     let source = file_or_repo(flags, env)?;
     match (flags.name, source) {
-        (None, source) => Ok(source.map(Selected::Source)),
-        (Some(name), None) => Ok(Some(Selected::Catalog(name))),
+        (None, source) => Ok(source),
+        (Some(name), None) => Ok(Some(Source::Named(name))),
         (Some(name), Some(source)) => match name.variant {
-            None => Ok(Some(Selected::Source(source))),
+            None => Ok(Some(source)),
             Some(_) => Err(HfError::Source(format!(
                 "the model is named twice: --model {name} and {}",
                 other_source(flags, env)
             ))),
         },
-    }
-}
-
-/// The source `flags` and the variable's value `env` name; `None` when
-/// neither names one. An empty `env` counts as unset. A catalog name alone is
-/// not a source: [`select`] returns it for the pick, and this refuses it.
-pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<Source>, HfError> {
-    match select(flags, env)? {
-        None => Ok(None),
-        Some(Selected::Source(source)) => Ok(Some(source)),
-        Some(Selected::Catalog(name)) => Err(HfError::Source(format!(
-            "{name} names a catalog model, which the pick turns into a source, not `resolve`"
-        ))),
     }
 }
 
@@ -232,17 +214,15 @@ mod tests {
         };
         let file = |p: &str| Some(("-m".to_owned(), p.to_owned()));
 
-        // Alone, a name is the catalog's: `select` hands it to the pick, `resolve` refuses it.
+        // Alone, a name is the catalog's: `resolve` hands it to the pick as `Source::Named`.
         let alone = Flags {
             name: named("qwen3.8-flash-next:q8_0"),
             ..Flags::default()
         };
         assert_eq!(
-            select(&alone, None).expect("name"),
-            alone.name.map(Selected::Catalog)
+            resolve(&alone, None).expect("name"),
+            alone.name.map(Source::Named)
         );
-        let e = resolve(&alone, None).expect_err("not a source").to_string();
-        assert!(e.contains("qwen3.8-flash-next:Q8_0"), "{e}");
 
         // A bare name beside a path, a repo or the variable chooses the seat; the source stands.
         for (path, hf, env, source) in [
@@ -260,10 +240,7 @@ mod tests {
                 hf: hf.map(str::to_owned),
                 name: named("glm"),
             };
-            assert_eq!(
-                select(&flags, env).expect("seat only"),
-                Some(Selected::Source(source))
-            );
+            assert_eq!(resolve(&flags, env).expect("seat only"), Some(source));
         }
 
         // A variant beside one of them names the model twice, with both spellings.
@@ -277,7 +254,7 @@ mod tests {
                 hf: hf.map(str::to_owned),
                 name: named("glm:UD-Q4_K_XL"),
             };
-            let e = select(&flags, env).expect_err("twice").to_string();
+            let e = resolve(&flags, env).expect_err("twice").to_string();
             assert!(
                 e.contains("glm-5.3-flash:UD-Q4_K_XL") && e.contains(other),
                 "{e}"

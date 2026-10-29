@@ -3,7 +3,7 @@
 //! the repo) or a safetensors checkpoint folder (the repo's one model, served as stored).
 //!
 //! The catalog is data and one rule. [`pick`] ranks a model's rows for a card class
-//! ([`CardClass::order`]), leaves out what a start by name never takes on its own (a format that
+//! ([`order`] of the placement's [`CardClass`]), leaves out what a start by name never takes on its own (a format that
 //! is explicit-only, a row nobody has verified), and asks its caller for what only the machine can
 //! say: whether the repo holds the row and how much is left to download ([`Avail`]), and whether
 //! the seat's plan holds ([`Plan`]). The best-ranked row at the fastest placement tier wins: a plan
@@ -15,6 +15,11 @@ mod rows;
 
 use std::cmp::Reverse;
 use std::fmt;
+use std::path::Path;
+
+use bloomery_placement::placement::devices::CardClass;
+
+use crate::{Entry, HfError};
 
 /// The revision of a row whose repo's tables pin no commit.
 pub const FLOATING: &str = "main";
@@ -109,33 +114,20 @@ const GGUF_FIRST: &[Format] = &[
     Format::Nvfp4,
 ];
 
-/// The kind of card the stage runs on, which decides the order of the formats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CardClass {
-    /// Compute capability 8.x, and a 12.0 card in a build without native FP4 products.
-    Ampere,
-    /// A discrete compute capability 12.0 card in a build with native FP4 products.
-    Blackwell,
-    /// The integrated compute capability 12.1 part (GB10) in a build with native FP4 products.
-    Gb10,
+/// The automatic formats of `class`, best first; a row whose format is not here is never ranked.
+pub const fn order(class: CardClass) -> &'static [Format] {
+    match class {
+        CardClass::Ampere => GGUF_FIRST,
+        CardClass::Blackwell | CardClass::Gb10 => FP4_FIRST,
+    }
 }
 
-impl CardClass {
-    /// The spelling the JSON contract uses.
-    pub const fn name(self) -> &'static str {
-        match self {
-            CardClass::Ampere => "ampere",
-            CardClass::Blackwell => "blackwell",
-            CardClass::Gb10 => "gb10",
-        }
-    }
-
-    /// The automatic formats, best first; a row whose format is not here is never ranked.
-    pub const fn order(self) -> &'static [Format] {
-        match self {
-            CardClass::Ampere => GGUF_FIRST,
-            CardClass::Blackwell | CardClass::Gb10 => FP4_FIRST,
-        }
+/// The spelling the JSON contract uses for `class`.
+pub const fn class_name(class: CardClass) -> &'static str {
+    match class {
+        CardClass::Ampere => "ampere",
+        CardClass::Blackwell => "blackwell",
+        CardClass::Gb10 => "gb10",
     }
 }
 
@@ -554,8 +546,7 @@ pub fn pick(
 
 /// The row's place in the class's order; a format the order does not hold ranks last.
 fn rank(class: CardClass, row: &Row) -> usize {
-    class
-        .order()
+    order(class)
         .iter()
         .position(|format| *format == row.format)
         .unwrap_or(usize::MAX)
@@ -584,6 +575,179 @@ fn screen(
         }
         Avail::Present { download_bytes } => Ok(download_bytes),
     }
+}
+
+impl Fit {
+    /// The spelling the JSON contract uses.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Fit::Planned => "planned",
+            Fit::Estimate => "estimate",
+        }
+    }
+}
+
+/// The files of `row` in the repo's listing `entries`: the GGUF set its quant tag names, or the
+/// checkpoint its index holds. `None` when the listing lacks the set; a repo the listing makes
+/// ambiguous or incomplete is refused by name ([`HfError`]).
+pub fn row_files(row: &Row, entries: &[Entry]) -> Result<Option<Vec<Entry>>, HfError> {
+    match row.kind {
+        Kind::Gguf => {
+            let sets = crate::gguf_sets(row.repo, entries)?;
+            match crate::pick(row.repo, &sets, Some(row.variant)) {
+                Ok(set) => Ok(Some(set.files.clone())),
+                Err(HfError::NoGguf { .. } | HfError::NoMatch { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        Kind::Folder => Ok(crate::checkpoint_files(entries)),
+    }
+}
+
+/// Whether `cached` (the verified files of the repo's cache) holds `file`: a verified file with
+/// its path, size and digest.
+#[must_use]
+pub fn is_cached(file: &Entry, cached: &[Entry]) -> bool {
+    cached
+        .iter()
+        .any(|c| c.path == file.path && c.size == file.size && c.digest == file.digest)
+}
+
+/// What the repo's listing `entries` and the cache's verified files `cached` say of `row`'s files:
+/// the bytes of [`row_files`] the cache does not hold ([`is_cached`]), or [`Avail::NotInRepo`]
+/// when the listing lacks the set.
+pub fn availability(row: &Row, entries: &[Entry], cached: &[Entry]) -> Result<Avail, HfError> {
+    let Some(files) = row_files(row, entries)? else {
+        return Ok(Avail::NotInRepo);
+    };
+    let download_bytes = files
+        .iter()
+        .filter(|file| !is_cached(file, cached))
+        .map(|file| file.size)
+        .sum();
+    Ok(Avail::Present { download_bytes })
+}
+
+/// [`availability`] when no listing could be read: the verified `cached` files are all there is,
+/// so a row whose set they hold whole is present with nothing to fetch and every other row is
+/// [`Avail::OfflineUncached`].
+pub fn availability_offline(row: &Row, cached: &[Entry]) -> Avail {
+    match availability(row, cached, cached) {
+        Ok(avail @ Avail::Present { .. }) => avail,
+        Ok(Avail::NotInRepo | Avail::OfflineUncached) | Err(_) => Avail::OfflineUncached,
+    }
+}
+
+/// The bytes free to this process on the filesystem that holds the cache `root` (read at its
+/// nearest existing ancestor on a first start): the room a download may take.
+pub fn cache_free_bytes(root: &Path) -> Result<u64, HfError> {
+    let at = root.ancestors().find(|a| a.exists()).unwrap_or(root);
+    os::free_bytes(at).map_err(|e| match e {
+        os::OsError::Io(err) => HfError::Io {
+            path: at.display().to_string(),
+            err,
+        },
+        os::OsError::Unsupported { call } => HfError::Source(format!(
+            "{call}: this platform cannot read the cache's free bytes"
+        )),
+    })
+}
+
+/// The variant of `model` one step smaller than `row` on `class`: among the rows an automatic
+/// start may take (an automatic format, verified, a known size), the largest one under `row`'s
+/// bytes. `None` when `row`'s size is unknown or no row is smaller.
+pub fn next_smaller(model: &'static Model, class: CardClass, row: &Row) -> Option<&'static Row> {
+    let have = row.bytes?;
+    let rows: &'static [Row] = model.rows;
+    rows.iter()
+        .filter(|r| r.format.automatic() && r.status.is_verified())
+        .filter(|r| order(class).contains(&r.format))
+        .filter(|r| r.bytes.is_some_and(|bytes| bytes < have))
+        .max_by_key(|r| r.bytes)
+}
+
+/// The schema a `--plan --json` line names.
+pub const PLAN_SCHEMA: &str = "bloomery.plan/1";
+
+/// The seat's answer to a `--plan --json` run, read from its `text` (stdout: the plan's records
+/// may share it, so the last line that is a JSON object naming [`PLAN_SCHEMA`] is the answer):
+/// the plan, or its refusal. No such line, or one whose fields are not the contract's, is an
+/// error naming what was missing.
+pub fn read_plan(text: &str) -> Result<Result<Plan, Refusal>, String> {
+    let line = text
+        .lines()
+        .rev()
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["schema"] == PLAN_SCHEMA)
+        .ok_or_else(|| format!("no line of the output names the schema {PLAN_SCHEMA}"))?;
+    if let Some(refused) = line.get("refused") {
+        let code = refused["code"]
+            .as_str()
+            .ok_or("the refusal names no code")?
+            .to_owned();
+        return Ok(Err(Refusal {
+            code,
+            need_bytes: refused["need"].as_u64(),
+        }));
+    }
+    let number = |key: &str| {
+        line[key]
+            .as_u64()
+            .ok_or_else(|| format!("the plan's {key} is not a number"))
+    };
+    Ok(Ok(Plan {
+        place: line["place"]
+            .as_str()
+            .ok_or("the plan names no place")?
+            .to_owned(),
+        ctx: number("ctx")?,
+        slots: number("slots")?,
+        host_bytes: number("host_bytes")?,
+        paged_bytes: number("paged")?,
+        fit: Fit::Planned,
+    }))
+}
+
+/// The chosen row as the keys of the JSON contract's `pick` object.
+pub fn pick_fields(picked: &Picked) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    let values = [
+        ("variant", serde_json::json!(picked.row.variant)),
+        ("source", serde_json::json!(picked.row.hf())),
+        ("revision", serde_json::json!(picked.row.revision)),
+        ("download", serde_json::json!(picked.download_bytes)),
+        ("cached", serde_json::json!(picked.download_bytes == 0)),
+        ("place", serde_json::json!(picked.plan.place)),
+        ("ctx", serde_json::json!(picked.plan.ctx)),
+        ("slots", serde_json::json!(picked.plan.slots)),
+        ("paged", serde_json::json!(picked.plan.paged_bytes)),
+        ("fit", serde_json::json!(picked.plan.fit.name())),
+    ];
+    for (key, value) in values {
+        fields.insert(key.to_owned(), value);
+    }
+    fields
+}
+
+/// The chosen row as the JSON contract's `pick` object.
+pub fn pick_json(picked: &Picked) -> serde_json::Value {
+    serde_json::Value::Object(pick_fields(picked))
+}
+
+/// One model's entry of the JSON contract: its name and seat, the pick (`null` when nothing
+/// holds) and every other candidate with its one reason word.
+pub fn model_json(model: &Model, outcome: &Outcome) -> serde_json::Value {
+    serde_json::json!({
+        "name": model.name,
+        "seat": model.seat,
+        "pick": outcome.picked.as_ref().map(pick_json),
+        "rejected": outcome
+            .rejected
+            .iter()
+            .map(|r| serde_json::json!({"variant": r.row.variant, "why": r.why.to_string()}))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The catalog as `tools/catalog.tsv` holds it: a comment line, a header line, then one
@@ -1054,9 +1218,9 @@ mod tests {
     #[test]
     fn every_class_orders_exactly_the_automatic_formats() {
         for class in [CardClass::Ampere, CardClass::Blackwell, CardClass::Gb10] {
-            let order = class.order();
+            let formats = order(class);
             for format in Format::ALL {
-                let places = order.iter().filter(|f| **f == format).count();
+                let places = formats.iter().filter(|f| **f == format).count();
                 assert_eq!(
                     places,
                     usize::from(format.automatic()),
@@ -1152,5 +1316,174 @@ mod tests {
             }
         }
         assert!(backed >= 10, "only {backed} rows are held to the census");
+    }
+
+    /// A listing entry of `size` bytes whose digest is `digest`.
+    fn entry(path: &str, size: u64, digest: &str) -> Entry {
+        Entry {
+            path: path.to_owned(),
+            size,
+            check: crate::Check::Sha256,
+            digest: digest.to_owned(),
+        }
+    }
+
+    fn row_of(model: &str, variant: &str) -> &'static Row {
+        find(model)
+            .unwrap_or_else(|e| panic!("{model}: {e}"))
+            .row(variant)
+            .unwrap_or_else(|| panic!("{model} has no {variant}"))
+    }
+
+    /// A row's files are the listing's set it names, the bytes still to fetch are the files the
+    /// cache does not hold by path, size and digest, a listing without the set is `NotInRepo`,
+    /// and offline only a whole verified set is present.
+    #[test]
+    fn availability_reads_the_listing_and_the_cache() {
+        let row = row_of("qwen3", "Q4_K_M");
+        let listed = [
+            entry("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 100, "aa"),
+            entry("Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf", 200, "bb"),
+            entry("README.md", 5, "cc"),
+        ];
+        assert_eq!(
+            availability(row, &listed, &[]).expect("listed"),
+            Avail::Present {
+                download_bytes: 100
+            }
+        );
+        let cached = [entry("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 100, "aa")];
+        assert_eq!(
+            availability(row, &listed, &cached).expect("cached"),
+            Avail::Present { download_bytes: 0 }
+        );
+        let moved = [entry("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 100, "zz")];
+        assert_eq!(
+            availability(row, &listed, &moved).expect("a moved file"),
+            Avail::Present {
+                download_bytes: 100
+            },
+            "a cached file whose digest is not the listing's is fetched again"
+        );
+        assert_eq!(
+            availability(row, &listed[1..], &[]).expect("no such set"),
+            Avail::NotInRepo
+        );
+        assert_eq!(
+            availability_offline(row, &cached),
+            Avail::Present { download_bytes: 0 }
+        );
+        assert_eq!(availability_offline(row, &[]), Avail::OfflineUncached);
+
+        let folder = row_of("qwen3.8-flash-next", "nvfp4");
+        let checkpoint = [
+            entry("model.safetensors.index.json", 10, "i"),
+            entry("model-00001-of-00002.safetensors", 1000, "s1"),
+            entry("model-00002-of-00002.safetensors", 2000, "s2"),
+            entry("config.json", 3, "c"),
+            entry("sub/other.json", 4, "o"),
+        ];
+        assert_eq!(
+            availability(folder, &checkpoint, &checkpoint[..2]).expect("folder"),
+            Avail::Present {
+                download_bytes: 2003
+            }
+        );
+        assert_eq!(
+            availability(folder, &listed, &[]).expect("a repo with no index"),
+            Avail::NotInRepo
+        );
+    }
+
+    /// The next smaller variant is the largest verified automatic row under the row's bytes that
+    /// the class ranks; an explicit-only or unverified row is never one, and the smallest row has
+    /// none.
+    #[test]
+    fn the_next_smaller_variant_is_the_largest_one_under_the_row() {
+        let model = find("qwen3.8-flash-next").expect("model");
+        let q4 = model.row("UD-Q4_K_XL").expect("row");
+        let q3 = model.row("UD-Q3_K_XL").expect("row");
+        let nvfp4 = model.row("nvfp4").expect("row");
+        let local = model.row("fp4-local").expect("row");
+        let q8 = model.row("Q8_0").expect("row");
+        assert_eq!(next_smaller(model, CardClass::Ampere, nvfp4), Some(q4));
+        assert_eq!(next_smaller(model, CardClass::Ampere, q4), Some(local));
+        assert_eq!(next_smaller(model, CardClass::Ampere, local), Some(q3));
+        assert_eq!(next_smaller(model, CardClass::Ampere, q3), None);
+        assert_eq!(
+            next_smaller(model, CardClass::Ampere, q8),
+            Some(nvfp4),
+            "the explicit-only row's next smaller is the largest automatic row"
+        );
+    }
+
+    /// `--plan --json`'s answer is the last schema line of the output, whatever record lines
+    /// share it; a refusal carries its code and need; a line that is not the contract's is named.
+    #[test]
+    fn a_plan_line_is_read_from_the_output() {
+        let out = [
+            "plan a card=A6000 ctx_max=4096",
+            r#"{"schema":"bloomery.event/1","event":"error"}"#,
+            r#"{"schema":"bloomery.plan/1","seat":"glm","place":"a","place_why":"w","ctx":8192,"ctx_rule":"fitted","slots":2,"limit":16384,"host_bytes":5,"paged":3,"need":null}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            read_plan(&out).expect("a plan"),
+            Ok(Plan {
+                place: "a".to_owned(),
+                ctx: 8192,
+                slots: 2,
+                host_bytes: 5,
+                paged_bytes: 3,
+                fit: Fit::Planned,
+            })
+        );
+        let refused =
+            r#"{"schema":"bloomery.plan/1","refused":{"code":"no-fit","message":"m","need":77}}"#;
+        assert_eq!(
+            read_plan(refused).expect("a refusal"),
+            Err(Refusal {
+                code: "no-fit".to_owned(),
+                need_bytes: Some(77)
+            })
+        );
+        let e = read_plan("plan a\nnot json").expect_err("no schema line");
+        assert!(e.contains(PLAN_SCHEMA), "{e}");
+        let e = read_plan(r#"{"schema":"bloomery.plan/1","place":"a","ctx":1}"#)
+            .expect_err("a plan without its slots");
+        assert!(e.contains("slots"), "{e}");
+    }
+
+    /// The model's JSON entry names the pick with its fit and every rejection with its word.
+    #[test]
+    fn a_model_entry_names_the_pick_and_each_rejection() {
+        let model = find("qwen3.8-flash-next").expect("model");
+        let q4 = model.row("UD-Q4_K_XL").expect("row");
+        let q3 = model.row("UD-Q3_K_XL").expect("row");
+        let outcome = Outcome {
+            picked: Some(Picked {
+                row: q4,
+                plan: plan(Tier::Cards).expect("held"),
+                download_bytes: 0,
+            }),
+            rejected: vec![Rejected {
+                row: q3,
+                why: Reason::RankedBelow,
+            }],
+        };
+        let v = model_json(model, &outcome);
+        assert_eq!(v["name"], "qwen3.8-flash-next");
+        assert_eq!(v["seat"], "qwen38");
+        assert_eq!(v["pick"]["variant"], "UD-Q4_K_XL");
+        assert_eq!(v["pick"]["source"], q4.hf());
+        assert_eq!(v["pick"]["cached"], true);
+        assert_eq!(v["pick"]["fit"], "planned");
+        assert_eq!(v["rejected"][0]["variant"], "UD-Q3_K_XL");
+        assert_eq!(v["rejected"][0]["why"], "ranked-below");
+        let none = Outcome {
+            picked: None,
+            rejected: Vec::new(),
+        };
+        assert!(model_json(model, &none)["pick"].is_null());
     }
 }
