@@ -176,7 +176,9 @@ pub fn run<K: Kind>(row: &Row) -> Result<(), GateError> {
         if want("b") {
             println!("(b) forced logits rows against mainline's CUDA rows");
             for (i, (name, prompt)) in [(row.sets[0], 64), (row.sets[1], 4096)].iter().enumerate() {
-                ok &= oracle(&mut m, row, (*name, *prompt), &sets[i], i)?;
+                let twin = twin_of(name, *prompt, &sets[i])?;
+                let ours = rows_of(&mut m, &sets[i])?;
+                ok &= oracle(&ours, row.bands, (*name, *prompt), (&sets[i], &twin), i)?;
             }
         }
         if want("c") {
@@ -338,26 +340,35 @@ pub fn rows_of<K: Kind>(
     Ok(rows)
 }
 
-/// (b) on one set (`set_at` its place in the row's sets): the clause's bands, the stability rule and the pinned count
-/// of rows under it.
-fn oracle<K: Kind>(
-    m: &mut Qwen35moeModel,
-    row: &Row,
-    (name, prompt): (&str, usize),
+/// The CPU twin of `set` (`<name>.cpu`, mainline's CPU kernels on the same file): the oracle's own floor, refused by
+/// name unless it ran the prompt and forced ids `set` holds and `set` is the `prompt`-id set.
+pub fn twin_of<K: Kind>(
+    name: &str,
+    prompt: usize,
     set: &ForcedLogits<K>,
-    set_at: usize,
-) -> Result<bool, GateError> {
-    let b = row.bands;
-    let other = b.other_rows[set_at];
-    let twin_dir = data_dir().join(format!("{name}.cpu"));
-    let twin = ForcedLogits::<K>::open_cpu(&twin_dir)?;
+) -> Result<ForcedLogits<K>, GateError> {
+    let twin = ForcedLogits::<K>::open_cpu(&data_dir().join(format!("{name}.cpu")))?;
     if twin.prompt != set.prompt || twin.forced != set.forced || set.prompt.len() != prompt {
         return Err(format!(
             "{name}: its twin is not the CPU run of the same prompt and forced ids"
         )
         .into());
     }
-    let ours = rows_of(m, set)?;
+    Ok(twin)
+}
+
+/// (b) on one set (`set_at` its place in `b.other_rows`): `ours`, the logits rows `rows_of` gave after the set's prompt
+/// and forced ids, against `set`'s CUDA rows within `b`, the stability rule drawn from `twin`'s spread, and the pinned
+/// count of rows under it. The one owner of the per-row rule: `gate_qwen35_dense`'s fixture-oracle G3 calls it with
+/// bands of its own.
+pub fn oracle<K: Kind>(
+    ours: &[Vec<f32>],
+    b: Bands,
+    (name, prompt): (&str, usize),
+    (set, twin): (&ForcedLogits<K>, &ForcedLogits<K>),
+    set_at: usize,
+) -> Result<bool, GateError> {
+    let other = b.other_rows[set_at];
     let (mut rel, mut flips_stable, mut stable, mut under, mut flips_under) =
         (Vec::new(), 0usize, 0usize, 0usize, 0usize);
     let mut worst = (0.0f64, 0usize);
@@ -396,8 +407,8 @@ fn oracle<K: Kind>(
         && flips_stable == 0
         && under == other;
     println!(
-        "  {name}: {} rows after {prompt} ids; rel L2 median {median:.4} (band {}), p90 {p90:.4} (band {}), worst \
-         {:.4} at row {} (band {}); argmax equal on {}/{stable} stable rows; {under} rows at or under their stability \
+        "  {name}: {} rows after {prompt} ids; rel L2 median {median:.4} (band {:.4}), p90 {p90:.4} (band {:.4}), worst \
+         {:.4} at row {} (band {:.4}); argmax equal on {}/{stable} stable rows; {under} rows at or under their stability \
          bound (pinned {other}), {flips_under} of them flipped {}",
         ours.len(),
         b.median,
