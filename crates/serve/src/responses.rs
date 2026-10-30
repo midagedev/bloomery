@@ -132,7 +132,11 @@
 //!   `response.function_call_arguments.delta` (the call's whole arguments),
 //!   `response.output_item.done`;
 //! - `response.completed`, or `response.incomplete`, with the whole response
-//!   and the generation's `timings`.
+//!   and the generation's `timings`;
+//! - a generation that fails after the head, or tool-call markup that does
+//!   not parse, ends the stream with `response.failed`, the response `failed`
+//!   with the error's `code` and `message`, as OpenAI's stream ends a failed
+//!   response.
 //!
 //! Each item is done before the next one is added. Item events carry
 //! `output_index`, part and text events `item_id` and `content_index`. With
@@ -156,8 +160,10 @@
 //! namespace that is not a function; two function tools of one name; an item,
 //! a part or a role the conversion does not know; and a field of the wrong
 //! type. An error is the chat path's OpenAI error object, its `param` this
-//! request's own field (`input` for the chat path's `messages`); inside a stream that has started, a
-//! `data: {"error": …}` frame with no `event:` line, as llama-server sends it.
+//! request's own field (`input` for the chat path's `messages`); inside a
+//! stream that has started, `response.failed`, the response `failed` with the
+//! error's `code` and `message`, as OpenAI's Responses stream ends a failed
+//! response.
 //!
 //! # Where this differs from llama-server
 //!
@@ -187,6 +193,10 @@
 //!   llama-server writes it as an empty system message.
 //! - The non-stream answer's item ids are the stream's (one per output index),
 //!   not fresh ones.
+//! - A failure after the stream's head ends it with `response.failed`, as
+//!   OpenAI's Responses stream does; llama-server ends its `/v1/responses`
+//!   stream with a bare `data: {"error": …}` frame, which carries no `event:`
+//!   line a client that reads only events would see.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -199,7 +209,7 @@ use super::response_store::Refusal;
 use super::{
     ApiError, ChatPlan, Client, State, body, chat_input, chat_plan, check_effort, engine_error,
     finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found, progress,
-    run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
+    run_gen, run_whole, send_error, send_json, tool_markup_error, unix_now,
 };
 use crate::admit::Lease;
 use crate::dsml::{ChatParser, Message, ToolCall};
@@ -1277,6 +1287,15 @@ fn finished(ids: &Ids, o: &Outcome, output: Vec<Value>) -> Value {
     v
 }
 
+/// The response `failed` with the server error's `code` and `message`: a
+/// background response the store keeps, and the `response.failed` a stream
+/// ends with ([`Frames::fail`]) — the failure's text has this one owner.
+fn failed(ids: &Ids, e: &ApiError) -> Value {
+    let mut v = unfinished(ids, "failed");
+    v["error"] = json!({ "code": e.kind, "message": e.message });
+    v
+}
+
 /// The conversation a finished `response` ends: the request's input items,
 /// then its output items.
 fn with_output(mut conversation: Vec<Value>, response: &Value) -> Vec<Value> {
@@ -1420,9 +1439,7 @@ fn run_background(
             state.responses.finish(&ids.id, v, conversation);
         }
         Err(e) => {
-            let mut v = unfinished(ids, "failed");
-            v["error"] = json!({ "code": e.kind, "message": e.message });
-            state.responses.finish(&ids.id, v, Vec::new());
+            state.responses.finish(&ids.id, failed(ids, &e), Vec::new());
         }
     }
 }
@@ -1511,11 +1528,20 @@ impl Frames {
         }
         Ok(())
     }
+
+    /// `response.failed`, the failure that ends a stream after its head: the
+    /// opening pair when nothing was sent yet, then the response `failed`
+    /// with the error ([`failed`]).
+    fn fail(&mut self, s: &mut EventStream<'_>, ids: &Ids, e: &ApiError) -> io::Result<()> {
+        let mut events = self.opening(ids);
+        events.push(json!({ "type": "response.failed", "response": failed(ids, e) }));
+        self.send(s, events)
+    }
 }
 
 /// The stream. The head and the opening pair go out with the first event. An
-/// error before the head is the request's answer; after it, the chat path's
-/// error frame ([`finish_stream`]).
+/// error before the head is the request's answer ([`finish_stream`]); after
+/// it, `response.failed` ([`Frames::fail`]).
 fn stream(
     state: &State,
     req: &Request,
@@ -1537,7 +1563,7 @@ fn stream(
     let mut items = Items::new(ids);
     let tpt = p.timings_per_token;
     // Markup that does not parse stops the generation (the sink fails) and
-    // ends the stream with an error frame instead of a dropped connection.
+    // ends the stream with `response.failed` instead of a dropped connection.
     let mut markup = None;
     let r = {
         let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
@@ -1590,14 +1616,29 @@ fn stream(
         Some(e) => Err(tool_markup_error(&e)),
         None => r,
     };
-    finish_stream(req, stream, w_opt, r, |s, o| {
+    // After the head, every failure ends the stream as `response.failed`,
+    // OpenAI's terminal event for a failed response: the chat path's bare
+    // error frame has no `event:` line, so a client that reads only events
+    // reports a dropped stream instead of the error. Before the head the
+    // error is the request's own answer, and a client gone ends the answer
+    // as is ([`finish_stream`]).
+    let r = match (stream.is_some(), r) {
+        (true, Err(e)) => Ok(Ok(Ending::Failed(e))),
+        (true, Ok(Err(GenError::Client(e)))) => Ok(Err(GenError::Client(e))),
+        (true, Ok(Err(e))) => Ok(Ok(Ending::Failed(engine_error(&e)))),
+        (_, r) => r.map(|r| r.map(Ending::Done)),
+    };
+    finish_stream(req, stream, w_opt, r, |s, ending| {
+        let o = match ending {
+            Ending::Done(o) => o,
+            Ending::Failed(e) => return frames.fail(s, ids, e),
+        };
         let mut events = frames.opening(ids);
         match parser.try_finish_at(o.cut()) {
             Ok(d) => items.push(&d, &mut events),
             Err(e) => {
                 frames.send(s, events)?;
-                let e = tool_markup_error(&e);
-                return sse(s, &e.body());
+                return frames.fail(s, ids, &tool_markup_error(&e));
             }
         }
         let output = items.finish(&mut events);
@@ -1611,6 +1652,13 @@ fn stream(
         events.push(end);
         frames.send(s, events)
     })
+}
+
+/// How a stream that has sent its head ends: with the generation's outcome,
+/// or with the failure [`Frames::fail`] frames.
+enum Ending {
+    Done(Outcome),
+    Failed(ApiError),
 }
 
 #[cfg(test)]
@@ -2982,11 +3030,11 @@ mod tests {
 
     /// Errors are the chat path's OpenAI error object: a prompt past the
     /// context is the plain 400 even when a stream is asked for (nothing has
-    /// started); an engine failure after the stream started is one last
-    /// `data: {"error": …}` frame with no `event:` line, as llama-server ends
-    /// the stream, after the frames already sent.
+    /// started); an engine failure after the stream started ends the stream
+    /// with `response.failed`, the response `failed` with the error's `code`
+    /// and `message`, after the frames already sent.
     #[test]
-    fn errors_are_the_chat_paths_and_end_a_started_stream() {
+    fn errors_are_the_chat_paths_and_fail_a_started_stream() {
         let small = serve(Box::new(MockEngine::new(16)));
         let long = json!({"input": "a prompt past the context of sixteen ids", "stream": true});
         let (status, v) = post(small, "/v1/responses", &long);
@@ -2997,28 +3045,77 @@ mod tests {
         let failing = serve(Box::new(MockEngine::failing_at(4096, 2)));
         let body = json!({"input": "hi", "stream": true, "temperature": 0});
         let (status, text) = post_stream(failing, "/v1/responses", &body);
-        let (sent, last) = text
-            .trim_end()
-            .rsplit_once("\n\n")
-            .unwrap_or_else(|| panic!("frames before the error: {text}"));
-        let f = frames(status, sent);
+        let f = frames(status, &text);
         assert_eq!(f[0]["type"], "response.created", "{text}");
-        let error = last
-            .strip_prefix("data: ")
-            .unwrap_or_else(|| panic!("the error frame is one data line: {last:?}"));
-        let error: Value = serde_json::from_str(error).expect("the error frame is JSON");
-        let e = &error["error"];
-        assert_eq!(
-            (&e["code"], &e["type"]),
-            (&json!(500), &json!("server_error")),
-            "{error}"
-        );
+        let failed = f.last().expect("a last frame");
+        assert_eq!(failed["type"], "response.failed", "{text}");
+        assert_eq!(failed["response"]["id"], f[0]["response"]["id"], "{failed}");
+        assert_eq!(failed["response"]["status"], "failed", "{failed}");
+        let e = &failed["response"]["error"];
+        assert_eq!(e["code"], "server_error", "{failed}");
         assert!(
             e["message"]
                 .as_str()
                 .is_some_and(|m| m.contains("injected failure")),
-            "{error}"
+            "{failed}"
         );
-        assert_eq!(error.as_object().map(|o| o.len()), Some(1), "{error}");
+    }
+
+    /// Tool-call markup that does not parse inside a streamed answer ends it
+    /// with `response.failed` (the codex case: a client that reads only
+    /// `event:` frames sees the refusal, not a dropped stream), the response
+    /// carrying the chat path's own refusal text. The markup is refused as it
+    /// is read (after text already sent) and at the end of the generation (a
+    /// call left open).
+    #[test]
+    fn a_streamed_markup_refusal_fails_the_response() {
+        const BAD: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"not an object\"}\n</tool_call>";
+        const OPEN: &str = "<tool_call>\n{\"name\": \"get_weather\"";
+        let sent = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.failed",
+        ];
+        let cases = [format!("Hello{BAD}"), format!("Hello{OPEN}")];
+        let tool = json!({"type": "function", "function": {"name": "get_weather"}});
+        for script in cases {
+            let addr = scripted(&script);
+            let body = json!({
+                "input": "hi",
+                "stream": true,
+                "tools": [{"type": "function", "name": "get_weather"}],
+            });
+            let (status, stream) = post_stream(addr, "/v1/responses", &body);
+            let f = frames(status, &stream);
+            assert_eq!(kinds(&f), sent, "{script:?}: {stream}");
+            let text: String = of(&f, "response.output_text.delta")
+                .iter()
+                .map(|d| d["delta"].as_str().expect("a delta"))
+                .collect();
+            assert_eq!(text, "Hello", "{script:?}");
+            let failed = f.last().expect("a last frame");
+            assert_eq!(failed["response"]["id"], f[0]["response"]["id"], "{failed}");
+            assert_eq!(failed["response"]["status"], "failed", "{failed}");
+            let e = &failed["response"]["error"];
+            assert_eq!(e["code"], "server_error", "{failed}");
+            let message = e["message"].as_str().expect("a message");
+            assert!(message.starts_with("tool-call markup: "), "{failed}");
+
+            // The chat path's refusal of the same generation is the same text.
+            let chat = json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "tools": [tool],
+            });
+            let (status, stream) = post_stream(addr, "/v1/chat/completions", &chat);
+            assert_eq!(status, 200, "{stream}");
+            let last = stream.trim_end().rsplit("\n\n").next().expect("a frame");
+            let error: Value = serde_json::from_str(last.strip_prefix("data: ").expect("data"))
+                .expect("the chat path's error frame is JSON");
+            assert_eq!(error["error"]["message"], message, "{script:?}: {error}");
+        }
     }
 }
