@@ -34,6 +34,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The mistral-large4 metadata gate builds its header-only GGUF from the
+# checked-in header tables (tests/mistrallarge4_hdr.kv.json); the version is
+# the tree's pin.
+serde_json = "=1.0.151"
 # The open gate builds the hash constants and opens the tables the way the card engine does.
 bloomery-engram = { path = "../engram" }
 # The gates read the oracle sets through the reference-set reader, which checks each set's
