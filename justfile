@@ -2269,7 +2269,7 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # are planned, every named refusal, `/props` `modalities.video`. The decoder's own subprocess rules (src/video): an ffprobe past
 # its limit and an ffmpeg that does not end after its last frame are killed and named; a decode is taken only when ffmpeg ended well.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test mistral --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract -- --include-ignored --nocapture'
 
 # The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
 # naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule
