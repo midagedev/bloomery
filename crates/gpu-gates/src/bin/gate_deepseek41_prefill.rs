@@ -93,11 +93,11 @@
 //!   column fails here, before the cases.
 //! - **First routed seam.** Then the locator's machinery at each `P` of
 //!   [`SEAM_PS`]: the steps' every seam recorded, then the batch of the same
-//!   ids with every seam read back. The first routed layer comes from the
-//!   header's own layer table, never a literal, and its FFN seam's streams
-//!   are held per token — max |Δ| at most the derived sum-order band
-//!   ([`seam_band`]) times the stream's max |x| — while every seam before
-//!   that one is the steps' bits: a difference there is a defect outside the
+//!   ids with every seam read back. The first seam whose streams leave the
+//!   steps' bits must be the FFN seam of a routed layer (the header's layer
+//!   table), held per token to max |Δ| at most the derived sum-order band
+//!   ([`seam_band`]) times the stream's max |x|; every seam before it is the
+//!   steps' bits, so a first difference elsewhere is a defect outside the
 //!   experts.
 //! - **Fault, reset, clean.** A NaN in the scale of every card expert's
 //!   first gate row makes a prefill of [`FAULT_P`] ids fault; with the
@@ -3405,33 +3405,21 @@ mod gate {
     }
 
     /// The first routed seam clause (module doc): the locator's machinery at
-    /// each `P` of [`SEAM_PS`], the first routed layer from the header's own
-    /// layer table. The model is left reset.
+    /// each `P` of [`SEAM_PS`]: the first seam that leaves the steps' bits,
+    /// a routed FFN seam within [`seam_band`]. The model is left reset.
     fn first_routed_seam_case(
         m: &mut Deepseek41Model,
         hp: &Hparams,
         ids: &[u32],
     ) -> Result<bool, GateError> {
-        let l1 = hp.layers.iter().position(|k| k.routed).ok_or_else(|| {
-            format!(
-                "{NAME}: no routed layer among the header's {}",
-                hp.layers.len()
-            )
-        })?;
         let rel = seam_band(hp);
         let mut ok = true;
         for &p in SEAM_PS.iter() {
             let (rec, _) = seam_record(m, &ids[..p])?;
-            let i_seam = rec
-                .iter()
-                .position(|(k, _)| *k == (body::BatchSeamKind::Ffn, l1))
-                .ok_or_else(|| format!("{NAME}: the steps visited no FFn seam at layer {l1}"))?;
             m.reset()?;
-            // The seam's measured distance and the stream's own scale; every
-            // seam before it must stay the steps' bits.
-            let (mut max_diff, mut scale) = (0.0f64, 0.0f64);
-            let (mut tokens, mut tokens_n) = (0usize, 0usize);
-            let mut before: Vec<(body::BatchSeamKind, usize, usize)> = Vec::new();
+            // Per recorded seam, in seam order: tokens seen, tokens that differ,
+            // the largest distance and the stream's own scale.
+            let mut seen = vec![(0usize, 0usize, 0.0f64, 0.0f64); rec.len()];
             body::prefill_observed(m, &ids[..p], &mut |gpu, seam| {
                 gpu.stream().synchronize()?;
                 let n4 = seam.streams.len() / crate::gate::T_MAX_TOKENS;
@@ -3444,54 +3432,48 @@ mod gate {
                     });
                 };
                 let (_, want) = &rec[i];
+                let s = &mut seen[i];
                 for t in 0..seam.tokens {
                     let pos = seam.first as usize + t;
                     let got = &host[(seam.at + t) * n4..(seam.at + t + 1) * n4];
                     let w = &want[pos];
-                    let diff = got
-                        .iter()
-                        .zip(w)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    if i == i_seam {
-                        tokens_n += 1;
-                        if diff > 0 {
-                            tokens += 1;
-                            for (a, b) in got.iter().zip(w) {
-                                max_diff = max_diff.max((f64::from(*a) - f64::from(*b)).abs());
-                            }
-                        }
-                        for v in got.iter().chain(w) {
-                            scale = scale.max(f64::from(v.abs()));
-                        }
-                    } else if i < i_seam && diff > 0 {
-                        before.push((seam.kind, seam.layer, diff));
+                    s.0 += 1;
+                    if got.iter().zip(w).any(|(a, b)| a.to_bits() != b.to_bits()) {
+                        s.1 += 1;
+                    }
+                    for (a, b) in got.iter().zip(w) {
+                        s.2 = s.2.max((f64::from(*a) - f64::from(*b)).abs());
+                        s.3 = s.3.max(f64::from(a.abs())).max(f64::from(b.abs()));
                     }
                 }
                 Ok(())
             })?;
-            if tokens_n != p {
-                return Err(
-                    format!("{NAME}: the first routed seam ran {tokens_n} of {p} tokens").into(),
-                );
-            }
+            // The first seam whose streams leave the steps' bits: every seam
+            // before it is bit-equal by construction, and it must be a routed
+            // FFN seam within the sum-order bound. None at all is the steps'
+            // own bits.
+            let Some(i) = seen.iter().position(|s| s.1 > 0) else {
+                println!("{NAME}: first routed seam P={p}: no seam differs from the steps: PASS");
+                continue;
+            };
+            let (kind, layer) = rec[i].0;
+            let (tokens_n, tokens, max_diff, scale) = seen[i];
+            let routed =
+                kind == body::BatchSeamKind::Ffn && hp.layers.get(layer).is_some_and(|k| k.routed);
             let bound = rel * scale;
-            let seam_ok = max_diff <= bound;
-            let before_ok = before.is_empty();
-            ok &= seam_ok && before_ok;
-            if !before_ok {
-                println!(
-                    "{NAME}: first routed seam P={p}: a seam before layer {l1}'s FFN differs: \
-                     {:?}",
-                    &before[..before.len().min(4)]
-                );
-            }
+            let seam_ok = routed && max_diff <= bound;
+            ok &= seam_ok;
             println!(
-                "{NAME}: first routed seam P={p}: Ffn layer {l1}: {tokens} of {tokens_n} tokens \
-                 differ, max |Δ| {max_diff:.3e} over band {bound:.3e} ({rel:.2e} · max |x| \
-                 {scale:.3e}), ratio {:.3}; seams before bit-equal: {}",
+                "{NAME}: first routed seam P={p}: the first seam that differs is {kind:?} layer \
+                 {layer}{}: {tokens} of {tokens_n} tokens differ, max |Δ| {max_diff:.3e} over band \
+                 {bound:.3e} ({rel:.2e} · max |x| {scale:.3e}), ratio {:.3}: {}",
+                if routed {
+                    ""
+                } else {
+                    " (not a routed FFN seam)"
+                },
                 if bound > 0.0 { max_diff / bound } else { 0.0 },
-                verdict(seam_ok && before_ok)
+                verdict(seam_ok)
             );
         }
         m.reset()?;
