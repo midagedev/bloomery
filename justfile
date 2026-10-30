@@ -1536,6 +1536,16 @@ gate-llama-meta:
 gate-lfm3-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::lfm3 arch::classify --nocapture && bash tools/gate.sh --release -p bloomery-model --test lfm3_meta -- --ignored --nocapture'
 
+# mistral-large4 (Mistral Large 4 1T-A52B, unsloth UD-IQ1_S) header gate: the reader's refusals on synthetic headers (a missing key,
+# a wrong kv-head count, gating func, index head count, rope scaling, rope width or YaRN log multiplier, a shared first indexer, a KV
+# source above its layer, itself a reader or of another rope-ness, a q_lora, a missing, misshaped or unclaimed tensor — a vision
+# projector's or a DSpark stage's), the [rope | nope] row permutation, then what the reader resolves from the real shard-1 header,
+# checked in beside the test as the fetch's kv/tensor tables and built into a header-only GGUF in the test: the description layer by
+# layer (72 layers, 18 NoPE, 9 KV readers of layer 35, 44 full indexers), the coverage list naming each part no program runs, and
+# the context bound (2048, the indexer's own top-k). Headers only, seconds; the 233 GB file itself is not read.
+gate-mistrallarge4-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mistrallarge4 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_meta -- --nocapture'
+
 # Cache append safety contracts and model-less plane/ring writer refusals.
 gate-gpu-rope-writers:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'

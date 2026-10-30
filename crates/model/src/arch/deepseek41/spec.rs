@@ -188,11 +188,16 @@ fn layer_of(
                 orig_ctx: rope.n_ctx_orig,
                 beta_fast: rope.beta_fast,
                 beta_slow: rope.beta_slow,
+                // ik's `dsv4_rope_attn_factor` is the exact inverse of the
+                // magnitude `rope_yarn` itself applies, so the net is 1.
+                magnitude: 1.0,
             }),
             factors: false,
         }),
         q_head_norm: hp.q_head_norm,
+        ssmax: false,
         pe: 0,
+        cache: Source::Own(()),
         out_gate: OutGate::None,
         out: LatentOut::Grouped {
             groups: spec_u32("attention.output_group_count", hp.o_groups)?,
@@ -315,7 +320,9 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
                         factors: false,
                     }),
                     q_head_norm: false,
+                    ssmax: false,
                     pe: 0,
+                    cache: Source::Own(()),
                     out_gate: OutGate::None,
                     out: LatentOut::Grouped {
                         groups: spec_u32("attention.output_group_count", hp.o_groups)?,
