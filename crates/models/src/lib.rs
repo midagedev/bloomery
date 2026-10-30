@@ -917,6 +917,9 @@ pub enum ToolFormat {
     /// `<|eom|>` (more follow) or `<|eot|>` (the turn's end), `to=self` the reasoning span and
     /// `to=<tool>` a call in ATEM markup (`<atem:function_calls>`).
     MuseSpark,
+    /// Mistral's `[TOOL_CALLS]NAME[ARGS]{json}`, one markup per call with no
+    /// call id and nothing between calls (Mistral Large 4's template).
+    Mistral,
 }
 
 impl ToolFormat {
