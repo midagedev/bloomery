@@ -34,7 +34,8 @@ fn run() -> Result<(), GateError> {
     };
     let bytes = std::fs::read(section).map_err(|e| format!("read {section}: {e}"))?;
     let packed = pack(&bytes, "ptxas")?;
-    std::fs::write(out, packed).map_err(|e| format!("write {out}: {e}"))
+    std::fs::write(out, packed).map_err(|e| format!("write {out}: {e}"))?;
+    Ok(())
 }
 
 /// The section's bundles with each PTX payload replaced by ptxas's cubin of
@@ -159,8 +160,8 @@ fn elf_func_names(bytes: &[u8]) -> Option<Vec<String>> {
     if shoff == 0 || shentsize < 64 || shnum == 0 {
         return None;
     }
-    let header = |i: usize| shoff.checked_add(i.checked_mul(shentsize)?)?;
-    if header(shnum - 1)? + shentsize > bytes.len() {
+    let header = |i: usize| -> Option<usize> { shoff.checked_add(i.checked_mul(shentsize)?) };
+    if header(shnum - 1)?.checked_add(shentsize)? > bytes.len() {
         return None;
     }
     let mut names = Vec::new();
