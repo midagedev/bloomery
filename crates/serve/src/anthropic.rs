@@ -292,13 +292,18 @@ fn text_of<'a>(b: &'a Value, k: &str, what: &str) -> Result<&'a str, ApiError> {
 /// its text and image parts, its calls (`tool_calls`) and its thinking
 /// (`reasoning_content`), then one `tool` message per `tool_result`, as
 /// llama-server orders them. A message of blocks that leave nothing (an empty
-/// array) and an assistant message without content add nothing.
+/// array) and an assistant message without content add nothing. A `system`
+/// message among the messages becomes a `user` message in its place: chat
+/// templates take a system message only first, and keeping its place keeps the
+/// prompt cache's prefix when a later turn adds one.
 fn message(m: &Value, out: &mut Vec<Value>) -> Result<(), ApiError> {
     let Value::Object(m) = m else {
         return Err(invalid("each message must be an object"));
     };
-    let Some(role) = m.get("role").and_then(Value::as_str) else {
-        return Err(invalid("each message needs a string 'role'"));
+    let role = match m.get("role").and_then(Value::as_str) {
+        Some("system") => "user",
+        Some(role) => role,
+        None => return Err(invalid("each message needs a string 'role'")),
     };
     let blocks = match set(m, "content") {
         None if role == "assistant" => return Ok(()),

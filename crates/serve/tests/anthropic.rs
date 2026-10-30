@@ -13,9 +13,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use common::{Reply, call, get, post, start, start_with};
+use common::{Reply, call, get, post, start, start_templated, start_with};
 use serde_json::{Map, Value, json};
 use serve::{MockEngine, ScriptedEngine};
+
+const QWEN38: &str = include_str!("fixtures/qwen38-chat-template.jinja");
 
 /// The three-turn conversation the mock answers `abc`, with `extra` beside it.
 fn turns(extra: Value) -> Value {
@@ -384,6 +386,37 @@ fn hw_anthropic_request_conversion() {
             "{anthropic} renders as {openai}"
         );
     }
+}
+
+/// Claude Code's request shape: a `system` message among the messages (after the first user
+/// message) renders as a `user` message in its place, under a template that refuses a system
+/// message anywhere but first (Qwen3.8's), and the request answers 200.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_anthropic_system_message_among_messages() {
+    let addr = start_templated(Box::new(MockEngine::new(8192)), QWEN38);
+    let anthropic = json!({
+        "max_tokens": 1,
+        "temperature": 0,
+        "system": [{"type": "text", "text": "Be brief."}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "system", "content": [{"type": "text", "text": "Working directory: /w"}]},
+        ],
+    });
+    let r = post(addr, "/v1/messages", &anthropic);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let want = post(
+        addr,
+        "/apply-template",
+        &json!({"messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Working directory: /w"}]},
+        ]}),
+    );
+    assert_eq!(want.status, 200, "{}", want.body);
+    assert_eq!(last_prompt(addr), want.json()["prompt"]);
 }
 
 /// Ports `test_anthropic_messages_streaming`: the stream is exactly `message_start` (the message
