@@ -5,7 +5,8 @@
 //! the tanh GELU-gated unit (`geglu_tanh`, [`crate::gelu`]'s rule), the
 //! residual add and the two-branch gain mix (`mix_rows`), the elementwise
 //! product of two vectors (`mul_rows`), the in-place scalar `scale_rows`, the
-//! routed-expert weighted sum and argmax, and the head's
+//! per-head SSMax query scale (`ssmax_rows`), the routed-expert weighted sum
+//! and argmax, and the head's
 //! logit softcap (`softcap_rows`). One
 //! `#[cuda_module]` in its own file (docs/gpu-design.md decision 6); the
 //! arithmetic bodies are cores above the module so a later fused block kernel
@@ -638,6 +639,17 @@ pub(crate) unsafe fn weighted_expert_sum(
 #[inline(always)]
 pub(crate) fn argmax_take(v: f32, i: u32, best_v: f32, best_i: u32) -> bool {
     v > best_v || (v == best_v && i < best_i)
+}
+
+/// The position basis of SSMax: `ln(pos + 1)`, as the reference's graph forms
+/// it. The input row holds `ln(pos + 1) + 1` — the logarithm in f64 of the
+/// position (held as an f32) plus one, rounded once to f32 — and the graph
+/// subtracts the one in f32, which is exact. The reference's log scale of
+/// 1.0 multiplies the logarithm before the sum and changes no bit.
+#[inline(always)]
+pub fn ssmax_basis(pos: u32) -> f32 {
+    let at = f64::from(pos as f32) + 1.0;
+    (at.ln() + 1.0) as f32 - 1.0
 }
 
 // ---------------------------------------------------------------- kernels
@@ -1449,6 +1461,76 @@ mod elem_kernels {
         unsafe {
             let v = *y.get_unchecked_mut(i);
             *y.get_unchecked_mut(i) = mul_rn_f32(v, s);
+        }
+    }
+
+    /// SSMax over `m` tokens of `h` heads of `d` values, in place: `x[t][head][i]
+    /// *= f`, the factor `f = (basis·s[head]) + b[head]` of token `t`'s
+    /// [`ssmax_basis`] at `pos[t]`, the product and the sum each rounded on
+    /// their own as the graph's MUL and ADD nodes round them, then one rounded
+    /// multiply of the value by `f`. The tokens' rows are contiguous
+    /// (`[m][h·d]`); a row takes `ceil(h·d / 256)` blocks, and block `b`
+    /// serves token `b / ceil(h·d / 256)`: its first thread forms the basis
+    /// once and the block reads it past the barrier. A value or a weight that
+    /// is not finite makes the values it scales not finite, the rule's own
+    /// result (nothing is clamped, and no fault is raised).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= m * h * d, pos.len() >= m, s.len() >= h, b.len() >= h)
+    )]
+    pub fn ssmax_rows(
+        mut x: DisjointSlice<f32>,
+        pos: &[u32],
+        s: &[f32],
+        b: &[f32],
+        d: u32,
+        h: u32,
+        m: u32,
+    ) {
+        static mut BASIS: SharedArray<f32, 1> = SharedArray::UNINIT;
+
+        let row = h as usize * d as usize;
+        let per_row = row.div_ceil(256);
+        let blk = thread::blockIdx_x() as usize;
+        let t = blk / per_row;
+        // The guard reads only the block's index, so every thread of the
+        // block leaves before the barrier together.
+        if t >= m as usize {
+            return;
+        }
+        let tid = thread::threadIdx_x() as usize;
+        // SAFETY: BASIS is this block's own shared allocation; the raw form
+        // is the only way to reach it without a reference to a `static mut`.
+        // Thread 0 alone writes it, before the barrier.
+        let basis_at = unsafe { SharedArray::as_raw_mut_ptr(&raw mut BASIS) };
+        if tid == 0 {
+            // SAFETY: t < m <= pos.len() by the launch contract; slot 0 of the
+            // one-slot array.
+            unsafe {
+                *basis_at = ssmax_basis(*pos.get_unchecked(t));
+            }
+        }
+        thread::sync_threads();
+        let i = (blk - t * per_row) * 256 + tid;
+        if i >= row {
+            return;
+        }
+        // SAFETY: the slot was written by thread 0 before the barrier.
+        let basis = unsafe { *basis_at };
+        let head = i / d as usize;
+        // SAFETY: head < h <= s.len(), b.len() (i < h·d), and t·h·d + i <
+        // (t + 1)·h·d <= m·h·d <= x.len() by the launch contract; thread i of
+        // token t owns entry i of its row.
+        unsafe {
+            let f = add_rn_f32(
+                mul_rn_f32(basis, *s.get_unchecked(head)),
+                *b.get_unchecked(head),
+            );
+            let v = x.get_unchecked_mut(t * row + i);
+            *v = mul_rn_f32(*v, f);
         }
     }
 
@@ -2866,6 +2948,64 @@ impl ElemKernels {
             .module
             .prepare_scale_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.scale_rows(stream, &prep, y, n, s)?;
+        Ok(())
+    }
+
+    /// Enqueue SSMax over `m` tokens of `h` heads of `d` values of `x`, in
+    /// place (`ssmax_rows`): token `t`'s value `i` of head `head` is scaled by
+    /// `(ssmax_basis(pos[t])·s[head]) + b[head]`. `pos` holds `m` positions
+    /// and `s` and `b` the `h` heads' scale and bias, each a device buffer
+    /// of f32 (positions u32); the counts and the one `m·h·d` span fit a
+    /// launch's u32. Refused before the launch: an empty token, head or
+    /// width, short `x`, `pos`, `s` or `b`. Asynchronous, allocation-free,
+    /// capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
+    pub fn enqueue_ssmax_rows(
+        &self,
+        stream: &CudaStream,
+        x: &mut DeviceBuffer<f32>,
+        pos: &DeviceBuffer<u32>,
+        s: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        h: usize,
+        d: usize,
+        m: usize,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_ssmax_rows";
+        if m == 0 || h == 0 || d == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need m, h and d >= 1, got m={m} h={h} d={d}"),
+            ));
+        }
+        let row = launch_u32(what, "h*d", h.saturating_mul(d))?;
+        let span = launch_u32(what, "m*h*d", m.saturating_mul(row as usize))?;
+        if x.len() < span as usize || pos.len() < m || s.len() < h || b.len() < h {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "x.len() {} (need {span}), pos.len() {} (need {m}), s.len() {} and b.len() \
+                     {} (need {h})",
+                    x.len(),
+                    pos.len(),
+                    s.len(),
+                    b.len()
+                ),
+            ));
+        }
+        let per_row = (row as usize).div_ceil(256);
+        let grid = launch_u32(what, "grid", m * per_row)?;
+        let d = launch_u32(what, "d", d)?;
+        let h = launch_u32(what, "h", h)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_ssmax_rows(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module
+            .ssmax_rows(stream, &prep, x, pos, s, b, d, h, m)?;
         Ok(())
     }
 
