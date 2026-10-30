@@ -8,8 +8,10 @@ use crate::{ReasoningFormat, ToolFormat};
 
 /// The tool formats a template alone can name, each with the markup every call of it spells: the
 /// first row whose markers all appear in the template is the template's.
-const TOOLS: &[(ToolFormat, &[&str])] =
-    &[(ToolFormat::QwenXml, &[CALL_OPEN, FUNCTION_OPEN, PARAM_OPEN])];
+const TOOLS: &[(ToolFormat, &[&str])] = &[
+    (ToolFormat::QwenXml, &[CALL_OPEN, FUNCTION_OPEN, PARAM_OPEN]),
+    (ToolFormat::Mistral, &["[TOOL_CALLS]", "[ARGS]"]),
+];
 
 /// The reasoning formats a template alone can name: the one whose opening tag the template writes.
 const SPANS: &[ReasoningFormat] = &[ReasoningFormat::THINK];

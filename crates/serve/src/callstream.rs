@@ -4,7 +4,7 @@
 //! closes. The fragments concatenate to the call's `arguments`.
 //!
 //! A scan ([`crate::dsml`], [`crate::glmxml`], [`crate::hermes`],
-//! [`crate::qwenxml`]) reports the call it has opened and not closed as a
+//! [`crate::qwenxml`], [`crate::mistral`]) reports the call it has opened and not closed as a
 //! [`Progress`]: its name and the arguments text read so far, which is a
 //! prefix of the arguments the call will close with. The common owner here
 //! (`Streamer`, held by [`crate::dsml::ChatParser`]) turns each report into
