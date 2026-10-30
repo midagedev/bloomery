@@ -50,9 +50,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::callstream::{self, Progress, released};
+use crate::callstream::{self, Reading, held, read_value};
 use crate::constrain::{Fun, Part, Refusal, Style, call, value};
-use crate::dsml::{self, MarkupError, Scanned, ToolCall};
+use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
 // The format's markup is its description's (the models crate's `function_xml`, not this crate's `models` module),
@@ -367,18 +367,7 @@ impl QwenScan {
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
     pub fn push(&mut self, piece: &str) -> Result<Scanned, QwenXmlError> {
-        let mut out = self.push_stream(piece)?;
-        out.advances = None;
-        out.open = self.progress();
-        Ok(out)
-    }
-
-    fn progress(&self) -> Option<Progress> {
-        self.read.name.as_ref().map(|name| Progress {
-            index: self.calls,
-            name: name.clone(),
-            args: self.read.args.clone(),
-        })
+        Ok(self.push_stream(piece)?.whole(&self.read.call, self.calls))
     }
 
     /// [`QwenScan::push`] that reports the call text as `advances`, each
@@ -392,29 +381,18 @@ impl QwenScan {
                 let closed = self
                     .read
                     .advance(&self.buf, self.calls, &self.kinds, self.framing)?;
-                if let Some(name) = &self.read.name
-                    && (self.read.sent < self.read.args.len() || closed.is_some())
-                {
-                    advances.push((
-                        Progress {
-                            index: self.calls,
-                            name: name.clone(),
-                            args: self.read.args[self.read.sent..].to_owned(),
-                        },
-                        closed.is_some(),
-                    ));
-                    self.read.sent = self.read.args.len();
-                }
                 let Some((name, arguments, used)) = closed else {
+                    self.read.call.send(self.calls, advances);
                     return Ok(out);
                 };
-                out.calls.push(ToolCall {
+                let call = ToolCall {
                     index: self.calls,
                     name,
                     arguments,
-                });
+                };
+                std::mem::take(&mut self.read).call.close(&call, advances);
+                out.calls.push(call);
                 self.calls += 1;
-                self.read = CallRead::default();
                 self.buf.drain(..used);
                 self.inside = false;
                 self.after_call = true;
@@ -444,26 +422,6 @@ impl QwenScan {
                 return Ok(out);
             }
         }
-    }
-
-    /// [`QwenScan::finish`] for the parser's end ([`crate::dsml::ChatParser::try_finish_at`]):
-    /// a call the limit `cut` and the parser `kept` is the call read so far, and since
-    /// its arguments already went out as advances, its stream only closes.
-    pub(crate) fn finish_at(
-        &mut self,
-        cut: bool,
-        kept: Option<&Progress>,
-    ) -> Result<Scanned, MarkupError> {
-        let mut scanned = dsml::ended(self.finish(), QwenXmlError::unclosed, cut, kept)?;
-        if let Some(p) = kept.filter(|_| cut) {
-            let close = Progress {
-                index: p.index,
-                name: p.name.clone(),
-                args: String::new(),
-            };
-            scanned.advances = Some(vec![(close, true)]);
-        }
-        Ok(scanned)
     }
 
     /// Releases what is held at the end of the stream; a call still open is
@@ -556,12 +514,6 @@ fn json_value(raw: &str) -> Option<Cow<'_, str>> {
 /// The first characters of `s`, for an error.
 fn quote(s: &str) -> String {
     s.chars().take(QUOTE).collect()
-}
-
-/// Whether `rest` is a proper prefix of `tag` (the empty text included): the
-/// text so far can still grow into the tag, so nothing is decided yet.
-fn held(tag: &str, rest: &str) -> bool {
-    rest.len() < tag.len() && tag.starts_with(rest)
 }
 
 /// One call, the text after `<tool_call>`, at the start of `s`: its function
@@ -735,10 +687,8 @@ fn parse_call(
 #[derive(Clone, Debug, Default)]
 struct CallRead {
     at: usize,
-    name: Option<String>,
-    args: String,
+    call: Reading,
     value: Option<(String, usize, usize)>,
-    sent: usize,
 }
 
 impl CallRead {
@@ -749,7 +699,7 @@ impl CallRead {
         kinds: &ParamKinds,
         framing: Framing,
     ) -> Result<Option<(String, String, usize)>, QwenXmlError> {
-        if self.name.is_none() {
+        if self.call.name.is_none() {
             let rest = s.trim_start();
             let Some(body) = rest.strip_prefix(FUNCTION_OPEN) else {
                 return parse_call(s, index, kinds, framing, false);
@@ -761,39 +711,31 @@ impl CallRead {
             if name.is_empty() || name.contains(['<', '\n', '"']) || !kinds.names(name) {
                 return parse_call(s, index, kinds, framing, false);
             }
-            self.name = Some(name.to_owned());
-            self.args.push('{');
+            self.call.name = Some(name.to_owned());
+            self.call.args.push('{');
             self.at = s.len() - body.len() + end + 1;
         }
         loop {
             if let Some((key, start, searched)) = &mut self.value {
                 let close = framing.value_close();
-                let tail = &s[*searched..];
-                let end = tail.find(close).map(|n| *searched + n);
-                let text = kinds.kind(self.name.as_deref().unwrap_or_default(), key)
-                    == Some(&Kind::String);
+                let kind = kinds.kind(self.call.name.as_deref().unwrap_or_default(), key);
+                let text = kind == Some(&Kind::String);
+                let args = text.then_some(&mut self.call.args);
+                let Some(end) = read_value(s, searched, close, CALL_CLOSE, args) else {
+                    return Ok(None);
+                };
                 if text {
-                    let upto = end
-                        .unwrap_or_else(|| *searched + released(tail, &[close, CALL_CLOSE]).len());
-                    self.args
-                        .push_str(&callstream::string_body(&s[*searched..upto]));
-                    *searched = upto;
-                } else if end.is_none() {
-                    *searched = s.len() - partial_suffix(tail, close);
-                }
-                let Some(end) = end else { return Ok(None) };
-                if text {
-                    self.args.push('"');
+                    self.call.args.push('"');
                 } else {
-                    callstream::Args::key(&mut self.args, key);
+                    callstream::Args::key(&mut self.call.args, key);
                     let raw = &s[*start..end];
-                    match kinds.kind(self.name.as_deref().unwrap_or_default(), key) {
+                    match kind {
                         Some(Kind::Bool) => match boolean(raw) {
-                            Some(word) => self.args.push_str(word),
+                            Some(word) => self.call.args.push_str(word),
                             None => return parse_call(s, index, kinds, framing, false),
                         },
                         Some(Kind::Json(_)) => match json_value(raw) {
-                            Some(value) => self.args.push_str(&value),
+                            Some(value) => self.call.args.push_str(&value),
                             None => return parse_call(s, index, kinds, framing, false),
                         },
                         _ => return parse_call(s, index, kinds, framing, false),
@@ -812,11 +754,7 @@ impl CallRead {
                 {
                     return Ok(None);
                 }
-                let closed = parse_call(s, index, kinds, framing, false)?;
-                if let Some((_, args, _)) = &closed {
-                    self.args.clone_from(args);
-                }
-                return Ok(closed);
+                return parse_call(s, index, kinds, framing, false);
             };
             let Some(end) = p.find('>') else {
                 return Ok(None);
@@ -825,7 +763,7 @@ impl CallRead {
             if key.is_empty()
                 || key.contains(['<', '\n', '"'])
                 || kinds
-                    .kind(self.name.as_deref().unwrap_or_default(), key)
+                    .kind(self.call.name.as_deref().unwrap_or_default(), key)
                     .is_none()
             {
                 return parse_call(s, index, kinds, framing, false);
@@ -833,11 +771,11 @@ impl CallRead {
             let Some(v) = p[end + 1..].strip_prefix(framing.value_open()) else {
                 return parse_call(s, index, kinds, framing, false);
             };
-            let text =
-                kinds.kind(self.name.as_deref().unwrap_or_default(), key) == Some(&Kind::String);
+            let text = kinds.kind(self.call.name.as_deref().unwrap_or_default(), key)
+                == Some(&Kind::String);
             if text {
-                callstream::Args::key(&mut self.args, key);
-                self.args.push('"');
+                callstream::Args::key(&mut self.call.args, key);
+                self.call.args.push('"');
             }
             let start = s.len() - v.len();
             self.value = Some((key.to_owned(), start, start));

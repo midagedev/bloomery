@@ -16,6 +16,11 @@
 //! markup), are a [`MarkupError::Diverged`], never a call whose earlier
 //! fragments are quietly wrong.
 //!
+//! The scans of DSML, the key/value markup and Qwen3-Coder's markup read only
+//! the text each push adds: each holds its open call as a `Reading` and reports
+//! the arguments a push adds as an `Advance`, so a long value streams with
+//! work linear in its length.
+//!
 //! Each format reads its arguments in the form its closed call writes them: a
 //! text parameter's value is released as it arrives, JSON-escaped, up to the
 //! longest tail that could still become a tag that ends the value or the
@@ -45,6 +50,79 @@ pub enum CallPiece {
     Open { index: usize, name: String },
     /// The next fragment of the call's `arguments`.
     Args { index: usize, text: String },
+}
+
+/// One step of a call a scan reads by its own cursor, reporting only the text
+/// each push adds ([`crate::dsml::Scanned`]'s `advances`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Advance {
+    /// The open call's arguments read since its last step, and whether they
+    /// close it.
+    Args(Progress, bool),
+    /// The open call, some of it sent, ended other than as sent: given back
+    /// as content, or closed with arguments the sent text does not begin.
+    Diverged,
+}
+
+/// A call a scan reads by its own cursor, as read so far: its name once read,
+/// the arguments read, and how much of them went out as [`Advance`]s.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Reading {
+    pub(crate) name: Option<String>,
+    pub(crate) args: String,
+    sent: usize,
+}
+
+impl Reading {
+    /// The call `index` as read so far, once its name is read.
+    pub(crate) fn progress(&self, index: usize) -> Option<Progress> {
+        self.name.as_ref().map(|name| Progress {
+            index,
+            name: name.clone(),
+            args: self.args.clone(),
+        })
+    }
+
+    /// Sends the arguments read since the last step of the open call `index`.
+    pub(crate) fn send(&mut self, index: usize, out: &mut Vec<Advance>) {
+        if let Some(name) = &self.name
+            && self.sent < self.args.len()
+        {
+            out.push(Advance::Args(
+                Progress {
+                    index,
+                    name: name.clone(),
+                    args: self.args[self.sent..].to_owned(),
+                },
+                false,
+            ));
+            self.sent = self.args.len();
+        }
+    }
+
+    /// Ends the reading with the close of `call`: the arguments not yet sent,
+    /// or [`Advance::Diverged`] when `call`'s do not begin with those sent.
+    pub(crate) fn close(self, call: &ToolCall, out: &mut Vec<Advance>) {
+        out.push(match call.arguments.strip_prefix(&self.args[..self.sent]) {
+            Some(rest) => Advance::Args(
+                Progress {
+                    index: call.index,
+                    name: call.name.clone(),
+                    args: rest.to_owned(),
+                },
+                true,
+            ),
+            None => Advance::Diverged,
+        });
+    }
+
+    /// Ends the reading of a call given back as content:
+    /// [`Advance::Diverged`] once some of it was sent.
+    pub(crate) fn give_back(self, out: &mut Vec<Advance>) {
+        if self.sent > 0 {
+            out.push(Advance::Diverged);
+        }
+    }
 }
 
 /// A call announced and not closed: what has gone out of it.
@@ -113,8 +191,17 @@ impl Streamer {
         Ok(())
     }
 
-    /// An append-only scan's new arguments, with its close when complete.
-    pub(crate) fn advance(&mut self, p: &Progress, closed: bool) -> Result<(), MarkupError> {
+    /// A step of a scan that reads by its own cursor.
+    pub(crate) fn advance(&mut self, a: &Advance) -> Result<(), MarkupError> {
+        let (p, closed) = match a {
+            Advance::Args(p, closed) => (p, *closed),
+            Advance::Diverged => {
+                return match self.told.take() {
+                    Some(t) => Err(diverged(&t.name, t.index)),
+                    None => Ok(()),
+                };
+            }
+        };
         if let Some(t) = &self.told {
             if t.index != p.index || t.name != p.name {
                 return Err(diverged(&t.name, t.index));
@@ -175,9 +262,50 @@ pub(crate) fn string_body(s: &str) -> String {
 
 /// The text of a value that a tag ends, as far as it may be released: `v`
 /// without the tail that could still grow into any of `tags`.
-pub(crate) fn released<'a>(v: &'a str, tags: &[&str]) -> &'a str {
+fn released<'a>(v: &'a str, tags: &[&str]) -> &'a str {
     let keep = tags.iter().map(|t| partial_suffix(v, t)).max().unwrap_or(0);
     &v[..v.len() - keep]
+}
+
+/// Whether `rest` is a proper prefix of `tag` (the empty text included): the
+/// text so far can still grow into the tag, so nothing is decided yet.
+pub(crate) fn held(tag: &str, rest: &str) -> bool {
+    rest.len() < tag.len() && tag.starts_with(rest)
+}
+
+/// Where `tag` starts in `s` at or after `*searched`. While it has not come,
+/// `*searched` moves past the text that can no longer begin it, so the next
+/// search reads only what arrives.
+pub(crate) fn find_from(s: &str, searched: &mut usize, tag: &str) -> Option<usize> {
+    let from = *searched;
+    let found = s[from..].find(tag).map(|n| from + n);
+    if found.is_none() {
+        *searched = s.len() - partial_suffix(&s[from..], tag);
+    }
+    found
+}
+
+/// Where `close` starts in `s` for a value read from `*searched` on, once it
+/// has come. A text value (`text`, the arguments it is written into) gains
+/// the value's bytes up to `close`, or up to the tail that could still grow
+/// into `close` or `ends` (the tag that ends the call), JSON-escaped;
+/// `*searched` moves past them.
+pub(crate) fn read_value(
+    s: &str,
+    searched: &mut usize,
+    close: &str,
+    ends: &str,
+    text: Option<&mut String>,
+) -> Option<usize> {
+    let Some(args) = text else {
+        return find_from(s, searched, close);
+    };
+    let from = *searched;
+    let tail = &s[from..];
+    let end = tail.find(close).map(|n| from + n);
+    *searched = end.unwrap_or_else(|| from + released(tail, &[close, ends]).len());
+    args.push_str(&string_body(&s[from..*searched]));
+    end
 }
 
 /// A call's arguments object as a scan has read it: `{`, then a field per
@@ -204,15 +332,6 @@ impl Args {
     pub(crate) fn field(&mut self, key: &str, json: &str) {
         Self::key(&mut self.0, key);
         self.0.push_str(json);
-    }
-
-    /// The text parameter `key` with `released` of its value so far; the
-    /// string stays open.
-    pub(crate) fn text_so_far(mut self, key: &str, released: &str) -> String {
-        Self::key(&mut self.0, key);
-        self.0.push('"');
-        self.0.push_str(&string_body(released));
-        self.0
     }
 
     /// The fields so far; the object stays open.
@@ -344,17 +463,29 @@ mod tests {
         assert_eq!(released("abc</", &["</parameter>", "</call>"]), "abc");
         assert_eq!(released("abc<", &["</parameter>"]), "abc");
         assert_eq!(released("abc", &["</parameter>"]), "abc");
-        let mut a = Args::new();
-        a.field("n", "3");
-        assert_eq!(a.text_so_far("k", "v\n"), r#"{"n":3,"k":"v\n"#);
+        let (mut searched, mut text) = (0, String::new());
+        let s = "v\n\"</par";
+        let close = read_value(s, &mut searched, "</parameter>", "</call>", Some(&mut text));
+        assert_eq!((close, searched, text.as_str()), (None, 3, r#"v\n\""#));
+        let s = "v\n\"</parameter>";
+        let close = read_value(s, &mut searched, "</parameter>", "</call>", Some(&mut text));
+        assert_eq!((close, text.as_str()), (Some(3), r#"v\n\""#));
+        let mut searched = 0;
+        assert_eq!(find_from("1, 2</p", &mut searched, "</p>"), None);
+        assert_eq!(
+            searched, 4,
+            "only the tail that can begin the tag is searched again"
+        );
+        assert_eq!(find_from("1, 2</p>", &mut searched, "</p>"), Some(4));
     }
     #[test]
     fn advances_do_not_accumulate_argument_history() {
+        let step = |p, closed| Advance::Args(p, closed);
         let mut s = Streamer::default();
-        s.advance(&progress(0, "{"), false).unwrap();
+        s.advance(&step(progress(0, "{"), false)).unwrap();
         assert_eq!(s.take(), [open(0), args(0, "{")]);
         for fragment in ["", "\"text\":", "\"hello\""] {
-            s.advance(&progress(0, fragment), false).unwrap();
+            s.advance(&step(progress(0, fragment), false)).unwrap();
             assert_eq!(
                 s.told.as_ref().unwrap().sent,
                 "{",
@@ -373,15 +504,63 @@ mod tests {
             name: "g".to_owned(),
             ..progress(0, "")
         };
-        assert_eq!(s.advance(&renamed, false).unwrap_err(), diverged("f", 0));
         assert_eq!(
-            s.advance(&progress(1, ""), false).unwrap_err(),
+            s.advance(&step(renamed, false)).unwrap_err(),
             diverged("f", 0)
         );
-        s.advance(&progress(0, "}"), true).unwrap();
+        assert_eq!(
+            s.advance(&step(progress(1, ""), false)).unwrap_err(),
+            diverged("f", 0)
+        );
+        s.advance(&step(progress(0, "}"), true)).unwrap();
         assert!(s.told.is_none(), "closed calls release their state");
         assert_eq!(s.take(), [args(0, "}")]);
-        s.advance(&progress(1, "{}"), true).unwrap();
+        s.advance(&step(progress(1, "{}"), true)).unwrap();
         assert_eq!(s.take(), [open(1), args(1, "{}")]);
+        s.advance(&step(progress(2, "{"), false)).unwrap();
+        assert_eq!(s.advance(&Advance::Diverged).unwrap_err(), diverged("f", 2));
+        assert_eq!(s.advance(&Advance::Diverged), Ok(()), "nothing was sent");
+    }
+
+    /// A reading sends only what it read since its last step, and closes
+    /// with the rest of the call it closes with, or diverges from what it sent.
+    #[test]
+    fn a_reading_sends_its_new_arguments_and_closes_on_the_call() {
+        let mut out = Vec::new();
+        let mut r = Reading::default();
+        r.send(0, &mut out);
+        assert!(out.is_empty(), "nothing goes out before the name");
+        r.name = Some("f".to_owned());
+        r.args.push_str(r#"{"a":"x"#);
+        r.send(0, &mut out);
+        r.send(0, &mut out);
+        r.args.push('y');
+        r.close(&call(0, "f", r#"{"a":"xyz"}"#), &mut out);
+        assert_eq!(
+            out,
+            [
+                Advance::Args(progress(0, r#"{"a":"x"#), false),
+                Advance::Args(progress(0, r#"yz"}"#), true),
+            ],
+            "read and unsent text closes with the call's own"
+        );
+        let mut out = Vec::new();
+        let mut r = Reading {
+            name: Some("f".to_owned()),
+            args: r#"{"a":1"#.to_owned(),
+            ..Reading::default()
+        };
+        r.send(0, &mut out);
+        r.clone().close(&call(0, "f", r#"{"a":2}"#), &mut out);
+        r.give_back(&mut out);
+        Reading::default().give_back(&mut out);
+        assert_eq!(
+            out,
+            [
+                Advance::Args(progress(0, r#"{"a":1"#), false),
+                Advance::Diverged,
+                Advance::Diverged,
+            ]
+        );
     }
 }

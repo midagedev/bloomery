@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use serve::ScriptedEngine;
 use serve::callstream::CallPiece;
 use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, Tools};
-use serve::glmxml::{ArgTypes, KvSpelling};
+use serve::glmxml::{ArgTypes, KvError, KvSpelling};
 use serve::qwenxml::{Framing, ParamKinds};
 use serve::reasoning::ReasoningFormat;
 
@@ -373,6 +373,24 @@ fn hw_a_call_announced_and_ended_otherwise_is_a_named_error() {
     assert!(m.calls.is_empty() && m.content == bad, "{m:?}");
     assert_eq!(run_by_char(&bad, true).unwrap_err(), diverged);
 
+    // A parser that keeps a cut call answers with the call the limit cut, not
+    // with the one given back before it under the same index.
+    let p = param("p", "abc");
+    let recut = format!("{bad}{head}{}", &p[..p.find("abc").expect("value") + 2]);
+    let mut parser =
+        ChatParser::with_tools("", ReasoningFormat::None, Some(dsml.clone())).keeping_cut_call();
+    for c in char_by_char(&recut) {
+        parser.try_push(&c).expect("parses");
+    }
+    assert_eq!(
+        parser.try_finish_at(true).expect("cut").calls,
+        [ToolCall {
+            index: 0,
+            name: "write".to_owned(),
+            arguments: r#"{"p":"ab"#.to_owned()
+        }]
+    );
+
     // The generation ends inside the call (a token limit): content for the
     // parser that does not stream, the call the stream announced is cut.
     let cut = format!("{head}{}", &param("content", "abc")[..60]);
@@ -437,6 +455,88 @@ fn hw_a_call_closed_under_another_name_is_a_named_error() {
     }
 }
 
+/// A token limit that cuts a streamed call inside its long text answers with
+/// the call as read so far, and its pieces carry those arguments once: a scan
+/// that reads by its own cursor only closes the call it already sent.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_cut_call_streams_its_arguments_once() {
+    for case in cases() {
+        let label = case.label;
+        let cut = &case.call[..case.call.find("line 3").expect("the long text")];
+        let mut p =
+            ChatParser::with_tools("", ReasoningFormat::None, Some(case.tools)).streaming_calls();
+        let mut pieces = Vec::new();
+        for c in cut.chars() {
+            p.try_push(&c.to_string())
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            pieces.extend(p.take_pieces());
+        }
+        p.try_finish_at(true)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        pieces.extend(p.take_pieces());
+        let calls = closed(p.message());
+        assert!(
+            calls.len() == 1 && calls[0].1.contains("line 2"),
+            "{label}: the cut call stands: {calls:?}"
+        );
+        assert_eq!(
+            fold_pieces(&pieces),
+            calls,
+            "{label}: fragments == arguments"
+        );
+    }
+
+    // An argument the cut call completed wrong stays its error, in both spellings.
+    let glm = |k: &str, v: &str| format!("<arg_key>{k}</arg_key><arg_value>{v}</arg_value>");
+    let solar =
+        |k: &str, v: &str| format!("\n<|tool_arg:start|>{k}<|tool_arg:value|>{v}<|tool_arg:end|>");
+    let spellings = [
+        (
+            KvSpelling::Glm,
+            "<tool_call>write",
+            glm as fn(&str, &str) -> String,
+        ),
+        (
+            KvSpelling::Solar,
+            "<|tool_call:start|>write",
+            solar as fn(&str, &str) -> String,
+        ),
+    ];
+    for (spelling, open, arg) in spellings {
+        let wrong = [
+            (arg("mode", "oops"), "NotJson"),
+            (
+                format!("{}{}", arg("path", "/a"), arg("path", "/b")),
+                "DuplicateKey",
+            ),
+        ];
+        let open_value = arg("content", "abc");
+        let open_value = &open_value[..open_value.len() - 4];
+        for (args, want) in wrong {
+            let text = format!("{open}{args}{open_value}");
+            let tools = Tools::KvMarkup(spelling, ArgTypes::of_tools(Some(&tools())));
+            let mut p =
+                ChatParser::with_tools("", ReasoningFormat::None, Some(tools)).streaming_calls();
+            for c in text.chars() {
+                p.try_push(&c.to_string()).expect("no close yet");
+            }
+            let e = p.try_finish_at(true).expect_err("a wrong argument");
+            assert!(
+                matches!(
+                    (&e, want),
+                    (MarkupError::Kv(KvError::NotJson { .. }), "NotJson")
+                        | (
+                            MarkupError::Kv(KvError::DuplicateKey { .. }),
+                            "DuplicateKey"
+                        )
+                ),
+                "{spelling:?} {want}: {e}"
+            );
+        }
+    }
+}
+
 thread_local! {
     static ALLOCATED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
@@ -463,32 +563,57 @@ unsafe impl std::alloc::GlobalAlloc for CountAlloc {
 #[global_allocator]
 static COUNT_ALLOC: CountAlloc = CountAlloc;
 
-/// A file-sized string streams with allocation work bounded by its length,
-/// preserving escapes and delimiters under small, character-aligned chunks.
+/// A file-sized string streams with allocation work bounded by its length in
+/// every markup that releases a text value as it arrives, preserving escapes
+/// and delimiters under small, character-aligned chunks.
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_qwen_long_string_stream_is_linear() {
-    let content = "quoted \" \\ tab\t 서울 </parameter x>\n".repeat(3000);
-    for framing in [Framing::Lines, Framing::Compact] {
-        let (open, close) = match framing {
-            Framing::Lines => ("\n", "\n</parameter>\n"),
-            Framing::Compact => ("", "</parameter>"),
-        };
-        let mut p = ChatParser::with_tools(
-            "",
-            ReasoningFormat::None,
-            Some(Tools::QwenXml(
-                framing,
-                ParamKinds::of_tools(Some(&tools())),
-            )),
-        )
-        .streaming_calls();
-        let prefix = format!("<tool_call><function=write><parameter=content>{open}");
-        let suffix = format!("{close}</function></tool_call>");
+fn hw_long_string_stream_is_linear() {
+    let content = "quoted \" \\ tab\t 서울 </parameter x> </arg_value x> <|tool_arg:end x|> \
+                   </｜DSML｜ parameter x>\n"
+        .repeat(3000);
+    let kinds = || ParamKinds::of_tools(Some(&tools()));
+    let types = || ArgTypes::of_tools(Some(&tools()));
+    let cases = [
+        (
+            "qwen",
+            Tools::QwenXml(Framing::Lines, kinds()),
+            "<tool_call><function=write><parameter=content>\n",
+            "\n</parameter>\n</function></tool_call>",
+        ),
+        (
+            "qwen-compact",
+            Tools::QwenXml(Framing::Compact, kinds()),
+            "<tool_call><function=write><parameter=content>",
+            "</parameter></function></tool_call>",
+        ),
+        (
+            "glm",
+            Tools::KvMarkup(KvSpelling::Glm, types()),
+            "<tool_call>write<arg_key>content</arg_key><arg_value>",
+            "</arg_value></tool_call>",
+        ),
+        (
+            "solar",
+            Tools::KvMarkup(KvSpelling::Solar, types()),
+            "<|tool_call:start|>write\n<|tool_arg:start|>content<|tool_arg:value|>",
+            "<|tool_arg:end|>\n<|tool_call:end|>",
+        ),
+        (
+            "dsml",
+            Tools::Dsml(Spelling::Spaced),
+            "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write\">\n\
+             <｜DSML｜ parameter name=\"content\" string=\"true\">",
+            "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        ),
+    ];
+    for (label, tools, prefix, suffix) in cases {
+        let mut p =
+            ChatParser::with_tools("", ReasoningFormat::None, Some(tools)).streaming_calls();
         let mut arguments = String::new();
         let began = std::time::Instant::now();
         ALLOCATED.with(|n| n.set(Some(0)));
-        p.try_push(&prefix).expect("call opens");
+        p.try_push(prefix).expect("call opens");
         for line in content.split_inclusive('\n') {
             p.try_push(line).expect("string advances");
             for piece in p.take_pieces() {
@@ -497,7 +622,7 @@ fn hw_qwen_long_string_stream_is_linear() {
                 }
             }
         }
-        p.try_push(&suffix).expect("call closes");
+        p.try_push(suffix).expect("call closes");
         for piece in p.take_pieces() {
             if let CallPiece::Args { text, .. } = piece {
                 arguments.push_str(&text);
@@ -506,7 +631,7 @@ fn hw_qwen_long_string_stream_is_linear() {
         p.try_finish().expect("stream ends");
         let bytes = ALLOCATED.with(|n| n.replace(None).expect("counting"));
         eprintln!(
-            "long-string {framing:?}: bytes={} allocated={bytes} host_us={}",
+            "long-string {label}: bytes={} allocated={bytes} host_us={}",
             content.len(),
             began.elapsed().as_micros()
         );
@@ -517,7 +642,7 @@ fn hw_qwen_long_string_stream_is_linear() {
         );
         assert!(
             bytes < content.len() * 128,
-            "{framing:?}: {bytes} allocated for {} argument bytes",
+            "{label}: {bytes} allocated for {} argument bytes",
             content.len()
         );
     }

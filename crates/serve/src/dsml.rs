@@ -29,7 +29,8 @@
 //! The call a scan has opened and not closed is reported as it is read
 //! ([`Scanned::open`]): its name once the opening tag is whole, and the arguments
 //! read so far, a prefix of the arguments the call closes with
-//! ([`crate::callstream`]).
+//! ([`crate::callstream`]). The chat parser's scan reads only the text each push
+//! adds (`DsmlScan::push_stream`) and reports only the arguments it adds.
 //!
 //! Every decision depends on the text only, never on how it was cut into pieces,
 //! so a stream and a whole response parse to the same message. A parser that
@@ -39,7 +40,9 @@
 use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
-use crate::callstream::{self, Args, CallPiece, Progress, Streamer};
+use crate::callstream::{
+    self, Advance, Args, CallPiece, Progress, Reading, Streamer, find_from, held, read_value,
+};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
@@ -175,9 +178,19 @@ pub struct Scanned {
     /// ([`Progress`]).
     pub open: Option<Progress>,
     /// For a scan that streams by its own cursor, the call text it read this
-    /// step, in order: each piece's new arguments and whether it closed the
-    /// call. `None` for a scan whose `calls` and `open` are the whole state.
-    pub(crate) advances: Option<Vec<(Progress, bool)>>,
+    /// step, in order ([`Advance`]). `None` for a scan whose `calls` and
+    /// `open` are the whole state.
+    pub(crate) advances: Option<Vec<Advance>>,
+}
+
+impl Scanned {
+    /// A step of a scan that reads by its own cursor in the whole-state form:
+    /// the call `read` holds, as call `index`, is `open`, and no advances.
+    pub(crate) fn whole(mut self, read: &Reading, index: usize) -> Scanned {
+        self.advances = None;
+        self.open = read.progress(index);
+        self
+    }
 }
 
 /// Streaming DSML scanner over the text after the think span.
@@ -190,16 +203,13 @@ pub struct DsmlScan {
     /// Text not yet decided.
     buf: String,
     calls: usize,
+    /// The invoke open at the start of `buf`, as far as it is read.
+    read: InvokeRead,
 }
 
-enum Invoke {
-    /// A complete call and the bytes it took.
-    Call(String, String, usize),
-    /// Not enough text yet.
-    Wait,
-    /// Not DSML the template emits.
-    Malformed,
-}
+/// The attributes that end a parameter's opening tag: a text value, or JSON.
+const STRING_TRUE: &str = "\" string=\"true\">";
+const STRING_FALSE: &str = "\" string=\"false\">";
 
 impl DsmlScan {
     /// A scan for a block in `spelling`.
@@ -210,13 +220,23 @@ impl DsmlScan {
             block: None,
             buf: String::new(),
             calls: 0,
+            read: InvokeRead::default(),
         }
     }
 
     /// Feeds text.
     pub fn push(&mut self, piece: &str) -> Scanned {
+        self.push_stream(piece).whole(&self.read.call, self.calls)
+    }
+
+    /// [`DsmlScan::push`] that reads only the text `piece` adds and reports
+    /// the open call's new arguments as `advances` instead of its whole text.
+    pub(crate) fn push_stream(&mut self, piece: &str) -> Scanned {
         self.buf.push_str(piece);
-        let mut out = Scanned::default();
+        let mut out = Scanned {
+            advances: Some(Vec::new()),
+            ..Scanned::default()
+        };
         loop {
             let progressed = match self.block.take() {
                 None => self.text_step(&mut out),
@@ -272,29 +292,28 @@ impl DsmlScan {
             return true;
         }
         if rest.starts_with(tags.invoke_open) {
-            match parse_invoke(rest, tags) {
-                Invoke::Call(name, arguments, used) => {
-                    out.calls.push(ToolCall {
-                        index: self.calls,
-                        name,
-                        arguments,
-                    });
-                    self.calls += 1;
-                    self.buf.drain(..lead + used);
-                    self.block = Some(String::new());
-                    return true;
-                }
-                Invoke::Wait => {
-                    out.open = partial_invoke(rest, tags).map(|(name, args)| Progress {
-                        index: self.calls,
-                        name,
-                        args,
-                    });
-                    self.block = Some(raw);
-                    return false;
-                }
-                Invoke::Malformed => {}
+            let advances = out.advances.get_or_insert_default();
+            let Some(end) = find_from(rest, &mut self.read.closing, tags.invoke_close) else {
+                self.read.advance(rest, tags);
+                self.read.call.send(self.calls, advances);
+                self.block = Some(raw);
+                return false;
+            };
+            let read = std::mem::take(&mut self.read);
+            if let Some((name, arguments)) = parse_invoke(&rest[..end], tags) {
+                let call = ToolCall {
+                    index: self.calls,
+                    name,
+                    arguments,
+                };
+                read.call.close(&call, advances);
+                out.calls.push(call);
+                self.calls += 1;
+                self.buf.drain(..lead + end + tags.invoke_close.len());
+                self.block = Some(String::new());
+                return true;
             }
+            read.call.give_back(advances);
         } else if rest.is_empty()
             || tags.calls_close.starts_with(rest)
             || tags.invoke_open.starts_with(rest)
@@ -311,19 +330,15 @@ impl DsmlScan {
     }
 }
 
-/// Parses `<｜DSML｜invoke name="…">…</｜DSML｜invoke>` at the start of `s`, in
-/// `tags`' spelling.
-fn parse_invoke(s: &str, tags: &Tags) -> Invoke {
-    let Some(end) = s.find(tags.invoke_close) else {
-        return Invoke::Wait;
-    };
-    let body = &s[tags.invoke_open.len()..end];
-    let Some(name_end) = body.find("\">") else {
-        return Invoke::Malformed;
-    };
+/// Parses `s`, an `<｜DSML｜invoke name="…">…` up to its `</｜DSML｜invoke>`, in
+/// `tags`' spelling: the call's name and arguments, `None` when it is not DSML
+/// the template emits.
+fn parse_invoke(s: &str, tags: &Tags) -> Option<(String, String)> {
+    let body = &s[tags.invoke_open.len()..];
+    let name_end = body.find("\">")?;
     let name = &body[..name_end];
-    if name.is_empty() || name.contains(['"', '\n', '<']) {
-        return Invoke::Malformed;
+    if !is_name(name) {
+        return None;
     }
     let mut params: Vec<(String, String)> = Vec::new();
     let mut rest = &body[name_end + 2..];
@@ -332,24 +347,11 @@ fn parse_invoke(s: &str, tags: &Tags) -> Invoke {
         if rest.is_empty() {
             break;
         }
-        let Some(p) = rest.strip_prefix(tags.param_open) else {
-            return Invoke::Malformed;
-        };
-        let Some(key_end) = p.find('"') else {
-            return Invoke::Malformed;
-        };
+        let p = rest.strip_prefix(tags.param_open)?;
+        let key_end = p.find('"')?;
         let key = &p[..key_end];
-        let p = &p[key_end..];
-        let (is_string, p) = if let Some(v) = p.strip_prefix("\" string=\"true\">") {
-            (true, v)
-        } else if let Some(v) = p.strip_prefix("\" string=\"false\">") {
-            (false, v)
-        } else {
-            return Invoke::Malformed;
-        };
-        let Some(val_end) = p.find(tags.param_close) else {
-            return Invoke::Malformed;
-        };
+        let (is_string, p) = string_attr(&p[key_end..])?;
+        let val_end = p.find(tags.param_close)?;
         let value = json_value(&p[..val_end], is_string);
         match params.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value,
@@ -361,54 +363,135 @@ fn parse_invoke(s: &str, tags: &Tags) -> Invoke {
         .iter()
         .map(|(k, v)| format!("{}:{v}", callstream::string(k)))
         .collect();
-    Invoke::Call(
-        name.to_owned(),
-        format!("{{{}}}", fields.join(",")),
-        end + tags.invoke_close.len(),
-    )
+    Some((name.to_owned(), format!("{{{}}}", fields.join(","))))
 }
 
-/// The call at the start of `s`, an `<｜DSML｜ invoke name="…">` whose close has
-/// not come, as far as `s` reads it: its name once the opening tag is whole,
-/// and the arguments [`parse_invoke`] will close with, as a prefix — each
-/// complete parameter, and the text of a `string="true"` parameter whose end
-/// has not come, up to the tail that could still become a tag that ends it.
-/// `None` until the name is read.
-fn partial_invoke(s: &str, tags: &Tags) -> Option<(String, String)> {
-    let body = s.strip_prefix(tags.invoke_open)?;
-    let name_end = body.find("\">")?;
-    let name = &body[..name_end];
-    if name.is_empty() || name.contains(['"', '\n', '<']) {
-        return None;
+/// Whether `name` may name a call in an invoke's opening tag.
+fn is_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['"', '\n', '<'])
+}
+
+/// The text after a parameter's name, `p`, read as its opening tag's end:
+/// whether the value is text, and the text after the tag.
+fn string_attr(p: &str) -> Option<(bool, &str)> {
+    p.strip_prefix(STRING_TRUE)
+        .map(|v| (true, v))
+        .or_else(|| p.strip_prefix(STRING_FALSE).map(|v| (false, v)))
+}
+
+/// The invoke a scan has opened and not closed, read from where the last push
+/// stopped, the arguments [`parse_invoke`] will close with as a prefix: each
+/// complete parameter, and the text of a `string="true"` parameter as it
+/// arrives, up to the tail that could still become a tag that ends it.
+#[derive(Clone, Debug, Default)]
+struct InvokeRead {
+    call: Reading,
+    stage: InvokeStage,
+    /// Where the stage's text starts, in the invoke's text.
+    at: usize,
+    /// How far the tag that ends the stage has been searched for.
+    searched: usize,
+    /// How far the invoke's close has been searched for.
+    closing: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+enum InvokeStage {
+    /// The call's name, up to the opening tag's `">`.
+    #[default]
+    Name,
+    /// Between parameters.
+    Next,
+    /// A parameter's name and the rest of its opening tag.
+    Key,
+    /// The value of the parameter `key`, text or JSON.
+    Value { key: String, text: bool },
+    /// The text stopped being the template's markup: the close decides.
+    Stopped,
+}
+
+impl InvokeRead {
+    /// Reads `s`, the invoke's text so far (its close not in it), on from
+    /// where the last read stopped.
+    fn advance(&mut self, s: &str, tags: &Tags) {
+        loop {
+            let next = match &self.stage {
+                InvokeStage::Name => {
+                    let start = tags.invoke_open.len();
+                    self.searched = self.searched.max(start);
+                    let from = self.searched;
+                    match find_from(s, &mut self.searched, "\">") {
+                        Some(end) if is_name(&s[start..end]) => {
+                            self.call.name = Some(s[start..end].to_owned());
+                            self.call.args.push('{');
+                            self.at = end + 2;
+                            InvokeStage::Next
+                        }
+                        None if !s[from..self.searched].contains(['"', '\n', '<']) => return,
+                        _ => InvokeStage::Stopped,
+                    }
+                }
+                InvokeStage::Next => {
+                    let tail = &s[self.at..];
+                    let rest = tail.trim_start();
+                    self.at += tail.len() - rest.len();
+                    match rest.strip_prefix(tags.param_open) {
+                        Some(p) => {
+                            self.at = s.len() - p.len();
+                            self.searched = self.at;
+                            InvokeStage::Key
+                        }
+                        None if held(tags.param_open, rest) => return,
+                        None => InvokeStage::Stopped,
+                    }
+                }
+                InvokeStage::Key => {
+                    let Some(end) = find_from(s, &mut self.searched, "\"") else {
+                        return;
+                    };
+                    let attr = &s[end..];
+                    match string_attr(attr) {
+                        Some((text, v)) => {
+                            let key = s[self.at..end].to_owned();
+                            if text {
+                                Args::key(&mut self.call.args, &key);
+                                self.call.args.push('"');
+                            }
+                            self.at = s.len() - v.len();
+                            self.searched = self.at;
+                            InvokeStage::Value { key, text }
+                        }
+                        None if held(STRING_TRUE, attr) || held(STRING_FALSE, attr) => return,
+                        None => InvokeStage::Stopped,
+                    }
+                }
+                InvokeStage::Value { key, text } => {
+                    let args = text.then_some(&mut self.call.args);
+                    let Some(end) = read_value(
+                        s,
+                        &mut self.searched,
+                        tags.param_close,
+                        tags.invoke_close,
+                        args,
+                    ) else {
+                        return;
+                    };
+                    if *text {
+                        self.call.args.push('"');
+                    } else {
+                        Args::key(&mut self.call.args, key);
+                        self.call
+                            .args
+                            .push_str(&json_value(&s[self.at..end], false));
+                    }
+                    self.at = end + tags.param_close.len();
+                    InvokeStage::Next
+                }
+                InvokeStage::Stopped => return,
+            };
+            self.stage = next;
+        }
     }
-    let mut args = Args::new();
-    let mut rest = &body[name_end + 2..];
-    loop {
-        rest = rest.trim_start();
-        let Some(p) = rest.strip_prefix(tags.param_open) else {
-            break;
-        };
-        let Some(key_end) = p.find('"') else { break };
-        let key = &p[..key_end];
-        let p = &p[key_end..];
-        let (is_string, v) = if let Some(v) = p.strip_prefix("\" string=\"true\">") {
-            (true, v)
-        } else if let Some(v) = p.strip_prefix("\" string=\"false\">") {
-            (false, v)
-        } else {
-            break;
-        };
-        let Some(val_end) = v.find(tags.param_close) else {
-            if is_string {
-                let text = callstream::released(v, &[tags.param_close, tags.invoke_close]);
-                return Some((name.to_owned(), args.text_so_far(key, text)));
-            }
-            break;
-        };
-        args.field(key, &json_value(&v[..val_end], is_string));
-        rest = &v[val_end + tags.param_close.len()..];
-    }
-    Some((name.to_owned(), args.so_far()))
 }
 
 /// A parameter value as JSON text: `string="true"` is the raw text, `string="false"`
@@ -855,8 +938,8 @@ impl ChatParser {
         };
         let scanned = match &mut self.scan {
             None => None,
-            Some(Scan::Dsml(d)) => Some(d.push(&split.content)),
-            Some(Scan::Kv(k)) => Some(k.push(&split.content)?),
+            Some(Scan::Dsml(d)) => Some(d.push_stream(&split.content)),
+            Some(Scan::Kv(k)) => Some(k.push_stream(&split.content)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
             Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content)?),
             Some(Scan::Muse(m)) => Some(m.push(&split.content)),
@@ -886,19 +969,19 @@ impl ChatParser {
             .as_mut()
             .map(ThinkSplit::finish)
             .unwrap_or_default();
-        let kept = self.open.as_ref().filter(|_| self.keep_cut);
+        let kept = self.open.as_ref().filter(|_| self.keep_cut && cut);
+        // The call the limit cut, for a whole-state scan and for one that reads
+        // by its own cursor.
+        let (whole, sent) = (kept.map(cut_call), kept.map(cut_close));
         let scanned = match &mut self.scan {
             None => None,
             Some(Scan::Dsml(d)) => {
                 let released = d.finish();
-                Some(match kept.filter(|_| cut) {
-                    Some(p) => cut_call(p),
-                    None => released,
-                })
+                Some(sent.unwrap_or(released))
             }
-            Some(Scan::Kv(k)) => Some(ended(k.finish(), KvError::unclosed, cut, kept)?),
-            Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, kept)?),
-            Some(Scan::Qwen(q)) => Some(q.finish_at(cut, kept)?),
+            Some(Scan::Kv(k)) => Some(ended(k.finish(), KvError::unclosed, cut, sent)?),
+            Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, whole)?),
+            Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, sent)?),
             // The scan closes a message the stream ends inside as its call on its own.
             Some(Scan::Muse(m)) => Some(m.finish()),
         };
@@ -919,17 +1002,17 @@ impl ChatParser {
                 None => Ok(()),
             };
         };
-        for (p, closed) in advances {
+        for a in advances {
             if let Some(st) = &mut self.streamer {
-                st.advance(p, *closed)?;
+                st.advance(a)?;
             }
-            self.open = match self.open.take() {
-                _ if *closed => None,
-                Some(mut open) if open.index == p.index => {
+            self.open = match (a, self.open.take()) {
+                (Advance::Args(_, true) | Advance::Diverged, _) => None,
+                (Advance::Args(p, false), Some(mut open)) if open.index == p.index => {
                     open.args.push_str(&p.args);
                     Some(open)
                 }
-                _ => Some(p.clone()),
+                (Advance::Args(p, false), _) => Some(p.clone()),
             };
         }
         Ok(())
@@ -974,12 +1057,13 @@ impl ChatParser {
 /// A scan's end of text. `released` is its release; when the limit cut (`cut`) the generation
 /// inside a call it reads as the template's so far (`unclosed`: the text of that call, from the
 /// scan's own error), the answer holds what was read of that call instead of its error: the `kept`
-/// call (its name read) with the arguments so far, else the text it consumed as content.
-pub(crate) fn ended<E: Into<MarkupError>>(
+/// call (its name read, as [`cut_call`] or [`cut_close`] gives it), else the text it consumed as
+/// content.
+fn ended<E: Into<MarkupError>>(
     released: Result<Scanned, E>,
     unclosed: fn(&E) -> Option<String>,
     cut: bool,
-    kept: Option<&Progress>,
+    kept: Option<Scanned>,
 ) -> Result<Scanned, MarkupError> {
     let e = match released {
         Err(e) if cut => e,
@@ -988,13 +1072,10 @@ pub(crate) fn ended<E: Into<MarkupError>>(
     let Some(text) = unclosed(&e) else {
         return Err(e.into());
     };
-    Ok(match kept {
-        Some(p) => cut_call(p),
-        None => Scanned {
-            content: text,
-            ..Scanned::default()
-        },
-    })
+    Ok(kept.unwrap_or(Scanned {
+        content: text,
+        ..Scanned::default()
+    }))
 }
 
 /// The call a cut left open, as the arguments read so far spell it.
@@ -1006,6 +1087,19 @@ fn cut_call(p: &Progress) -> Scanned {
             arguments: p.args.clone(),
         }],
         ..Scanned::default()
+    }
+}
+
+/// [`cut_call`] for a scan that reads by its own cursor: it sent the arguments as it read them,
+/// so the stream only closes the call.
+fn cut_close(p: &Progress) -> Scanned {
+    let close = Progress {
+        args: String::new(),
+        ..p.clone()
+    };
+    Scanned {
+        advances: Some(vec![Advance::Args(close, true)]),
+        ..cut_call(p)
     }
 }
 

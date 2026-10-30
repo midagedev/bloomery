@@ -29,18 +29,20 @@
 //! types as JSON that is not JSON) and a call still open when the stream ends
 //! are a [`KvError`], never content and never dropped; the chat parser reads a
 //! generation the token limit cut inside a call as an answer, not as this error
-//! ([`crate::dsml::ChatParser::try_finish_at`]). The call a scan has
+//! ([`crate::dsml::ChatParser::try_finish_at`]), unless an argument it completed
+//! is already wrong (a key given twice, a value not JSON). The call a scan has
 //! opened and not closed is reported as it is read ([`Scanned::open`]): its
 //! name once a tag follows it, and the arguments so far, a prefix of the
 //! arguments the call closes with, the text of a `"string"` argument as it
-//! arrives. Every decision depends on the text only, never on how it was cut
-//! into pieces.
+//! arrives. The chat parser's scan reads only the text each push adds
+//! (`KvScan::push_stream`) and reports only the arguments it adds. Every
+//! decision depends on the text only, never on how it was cut into pieces.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::callstream::{Args, Progress, released};
+use crate::callstream::{Args, Reading, find_from, held, read_value};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, refuse, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
@@ -295,6 +297,8 @@ pub struct KvScan {
     /// Text not yet decided.
     buf: String,
     calls: usize,
+    /// The call open at the start of `buf`, as far as it is read.
+    read: CallRead,
 }
 
 impl KvScan {
@@ -308,32 +312,38 @@ impl KvScan {
             line_due: false,
             buf: String::new(),
             calls: 0,
+            read: CallRead::default(),
         }
     }
 
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
     pub fn push(&mut self, piece: &str) -> Result<Scanned, KvError> {
+        Ok(self.push_stream(piece)?.whole(&self.read.call, self.calls))
+    }
+
+    /// [`KvScan::push`] that reads only the text `piece` adds and reports the
+    /// open call's new arguments as `advances` instead of its whole text.
+    pub(crate) fn push_stream(&mut self, piece: &str) -> Result<Scanned, KvError> {
         let m = self.markers;
         self.buf.push_str(piece);
         let mut out = Scanned::default();
+        let advances = out.advances.insert(Vec::new());
         loop {
             if self.inside {
-                let Some(end) = self.buf.find(m.call_close) else {
-                    out.open =
-                        partial_call(m, &self.buf, &self.types).map(|(name, args)| Progress {
-                            index: self.calls,
-                            name,
-                            args,
-                        });
+                let Some(end) = find_from(&self.buf, &mut self.read.closing, m.call_close) else {
+                    self.read.advance(m, &self.buf, &self.types);
+                    self.read.call.send(self.calls, advances);
                     return Ok(out);
                 };
                 let (name, arguments) = parse_call(m, &self.buf[..end], self.calls, &self.types)?;
-                out.calls.push(ToolCall {
+                let call = ToolCall {
                     index: self.calls,
                     name,
                     arguments,
-                });
+                };
+                std::mem::take(&mut self.read).call.close(&call, advances);
+                out.calls.push(call);
                 self.calls += 1;
                 self.buf.drain(..end + m.call_close.len());
                 self.inside = false;
@@ -373,6 +383,12 @@ impl KvScan {
     pub fn finish(&mut self) -> Result<Scanned, KvError> {
         let rest = std::mem::take(&mut self.buf);
         if self.inside {
+            // Complete arguments keep their errors when the call is cut.
+            if let Err(e @ (KvError::NotJson { .. } | KvError::DuplicateKey { .. })) =
+                parse_call(self.markers, &rest, self.calls, &self.types)
+            {
+                return Err(e);
+            }
             return Err(KvError::Unterminated {
                 index: self.calls,
                 close: self.markers.call_close,
@@ -464,53 +480,148 @@ fn parse_call(
     Ok((name.to_owned(), format!("{{{}}}", fields.join(","))))
 }
 
-/// The call at the start of `body`, the text after a call's opening whose
-/// close has not come, as far as `body` reads it: its name once a tag follows
-/// it, and the arguments [`parse_call`] will close with, as a prefix — each
+/// The call a scan has opened and not closed, read from where the last push
+/// stopped, the arguments [`parse_call`] will close with as a prefix: each
 /// complete argument, and the text of an argument the schema types `"string"`
-/// whose end has not come, up to the tail that could still become a tag that
-/// ends it. A fault ends the reading where it stands: [`parse_call`] names it
-/// when the call closes.
-fn partial_call(m: &Markers, body: &str, types: &ArgTypes) -> Option<(String, String)> {
-    let name_end = body.find('<')?;
-    let name = body[..name_end].trim();
-    if name.is_empty() {
-        return None;
+/// as it arrives, up to the tail that could still become a tag that ends it.
+/// A fault stops the reading where it stands: [`parse_call`] names it when the
+/// call closes.
+#[derive(Clone, Debug, Default)]
+struct CallRead {
+    call: Reading,
+    stage: Stage,
+    /// Where the stage's text starts, in the text after the call's opening.
+    at: usize,
+    /// How far the tag that ends the stage has been searched for.
+    searched: usize,
+    /// How far the call's close has been searched for.
+    closing: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+enum Stage {
+    /// The function name, up to the first tag.
+    #[default]
+    Name,
+    /// Between arguments.
+    Next,
+    /// An argument's name.
+    Key,
+    /// The opening of the argument `key`'s value.
+    Open(String),
+    /// The value of the argument `key`.
+    Value(String),
+    /// The text stopped being the template's markup: the close decides.
+    Stopped,
+}
+
+impl CallRead {
+    /// Reads `s`, the call's text after its opening so far (its close not in
+    /// it), on from where the last read stopped.
+    fn advance(&mut self, m: &Markers, s: &str, types: &ArgTypes) {
+        loop {
+            let next = match &self.stage {
+                Stage::Name => {
+                    let Some(end) = find_from(s, &mut self.searched, "<") else {
+                        return;
+                    };
+                    let name = s[..end].trim();
+                    if name.is_empty() {
+                        Stage::Stopped
+                    } else {
+                        self.call.name = Some(name.to_owned());
+                        self.call.args.push('{');
+                        self.at = end;
+                        Stage::Next
+                    }
+                }
+                Stage::Next => {
+                    let tail = &s[self.at..];
+                    let rest = tail.trim_start();
+                    self.at += tail.len() - rest.len();
+                    match rest.strip_prefix(m.key_open) {
+                        Some(k) => {
+                            self.at = s.len() - k.len();
+                            self.searched = self.at;
+                            Stage::Key
+                        }
+                        None if held(m.key_open, rest) => return,
+                        None => Stage::Stopped,
+                    }
+                }
+                Stage::Key => {
+                    let from = self.searched;
+                    match find_from(s, &mut self.searched, m.key_close) {
+                        Some(end) if !s[self.at..end].contains('<') => {
+                            let key = s[self.at..end].to_owned();
+                            self.at = end + m.key_close.len();
+                            Stage::Open(key)
+                        }
+                        None if !s[from..self.searched].contains('<') => return,
+                        _ => Stage::Stopped,
+                    }
+                }
+                Stage::Open(key) => {
+                    let tail = &s[self.at..];
+                    // A value opened by the name's close starts right after it.
+                    let rest = if m.value_open.is_empty() {
+                        tail
+                    } else {
+                        tail.trim_start()
+                    };
+                    self.at += tail.len() - rest.len();
+                    match rest.strip_prefix(m.value_open) {
+                        Some(v) => {
+                            self.at = s.len() - v.len();
+                            self.searched = self.at;
+                            let name = self.call.name.as_deref().unwrap_or_default();
+                            if types.kind(name, key) == Some(&Kind::String) {
+                                Args::key(&mut self.call.args, key);
+                                self.call.args.push('"');
+                            }
+                            Stage::Value(key.clone())
+                        }
+                        None if held(m.value_open, rest) => return,
+                        None => Stage::Stopped,
+                    }
+                }
+                Stage::Value(key) => {
+                    let kind = types.kind(self.call.name.as_deref().unwrap_or_default(), key);
+                    let text = kind == Some(&Kind::String);
+                    let args = text.then_some(&mut self.call.args);
+                    let Some(end) =
+                        read_value(s, &mut self.searched, m.value_close, m.call_close, args)
+                    else {
+                        return;
+                    };
+                    let raw = &s[self.at..end];
+                    self.at = end + m.value_close.len();
+                    if text {
+                        self.call.args.push('"');
+                        Stage::Next
+                    } else {
+                        let value = match kind {
+                            Some(Kind::Json(_)) => serde_json::from_str::<Value>(raw).ok(),
+                            _ => Some(
+                                serde_json::from_str(raw)
+                                    .unwrap_or_else(|_| Value::String(raw.to_owned())),
+                            ),
+                        };
+                        match value {
+                            Some(value) => {
+                                Args::key(&mut self.call.args, key);
+                                self.call.args.push_str(&value.to_string());
+                                Stage::Next
+                            }
+                            None => Stage::Stopped,
+                        }
+                    }
+                }
+                Stage::Stopped => return,
+            };
+            self.stage = next;
+        }
     }
-    let mut args = Args::new();
-    let mut rest = &body[name_end..];
-    loop {
-        rest = rest.trim_start();
-        let Some(k) = rest.strip_prefix(m.key_open) else {
-            break;
-        };
-        let Some((key, after)) = m.split_key(k) else {
-            break;
-        };
-        let Some(v) = m.value_start(after) else {
-            break;
-        };
-        let kind = types.kind(name, key);
-        let Some(value_end) = v.find(m.value_close) else {
-            if kind == Some(&Kind::String) {
-                let text = released(v, &[m.value_close, m.call_close]);
-                return Some((name.to_owned(), args.text_so_far(key, text)));
-            }
-            break;
-        };
-        let raw = &v[..value_end];
-        let value = match kind {
-            Some(Kind::String) => Value::String(raw.to_owned()),
-            Some(Kind::Json(_)) => match serde_json::from_str(raw) {
-                Ok(v) => v,
-                Err(_) => break,
-            },
-            None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
-        };
-        args.field(key, &value.to_string());
-        rest = &v[value_end + m.value_close.len()..];
-    }
-    Some((name.to_owned(), args.so_far()))
 }
 
 /// The call `spelling` spells, as the parts structured output forces: the
