@@ -806,6 +806,13 @@ stage-gpu-load-v41-lock:
 measure-qdot-rate *ARGS:
     ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-qdot --bin qdot-rate && bash tools/ref/qdot-rate.sh {{ARGS}}'
 
+# The qdot MT streaming ceiling (lead-only): qdot-rate-mt inside the machine-wide CPU lease, with
+# the witness blocks around it. The shapes are the binary's SHAPES table, keyed by (qtype, k);
+# ARGS go to the binary (--granularity, --only TYPE[,TYPE...], --iq1s-generic for the IQ1_S
+# pre-hand-kernel arm).
+measure-qdot-rate-mt *ARGS:
+    ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-qdot --bin qdot-rate-mt && . tools/ref/ref-paths.sh && . tools/ref/lease.sh && lease_take && { witness pre; lease_bounded 3600 target/release/qdot-rate-mt {{ARGS}}; rc=$?; witness post; lease_release; exit $rc; }'
+
 # V4.1 호스트 expert 다리의 벤치(bench_v41_host) — 정확성 실행이다. 실제 V4.1 파일을 mmap해 층마다 엔진의 디스패치
 # (gate+up 묶음 하나, swiglu를 품은 down 하나)를 돌리고, 층 여덟의 expert마다 gate·up·swiglu·down 여섯 행을 같은 바이트의
 # f64 참조와 대조한다(밴드 1e-5). 층마다 샤드 지도와 작업 집합의 상주율도 찍는다. 모델은 Mac 쪽 BLOOMERY_MODEL이고

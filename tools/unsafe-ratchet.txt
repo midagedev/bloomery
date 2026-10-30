@@ -1034,7 +1034,10 @@ placement 0 0 0
 # PIN(2026-10-25): qdot 255 -> 261 blocks, 115 -> 120 fns, new code, not old code relaxed: the generic AVX2 dots of
 # IQ1_S, IQ1_M and IQ2_S (generic.rs: `signed_by_bits`, `iq1_codes_avx2` and the three types' `codes_avx2`, each an
 # unsafe fn with its body block), each with its SAFETY line.
-qdot 261 120 0
+# PIN(2026-10-31): qdot 261 -> 269 blocks, 120 -> 124 fns, new code, not old code relaxed: the IQ1_S x Q8_K port of
+# ik's AVX2 body (lib.rs: `iq1s_pack`, `iq1s_block_step`, `dot_iq1s_q8k_avx2`, `dot_iq1s_q8k_tile_avx2` and their
+# dispatch calls), each with its SAFETY line.
+qdot 269 124 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0

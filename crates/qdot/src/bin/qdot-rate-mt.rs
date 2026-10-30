@@ -3,6 +3,11 @@
 //! Measures sustained bandwidth across thread counts T in {1, 8, 16, 32} using
 //! scoped threads over a shared ~2.5 GB buffer, and under `--granularity`
 //! measures rows/call scaling at T=32 with barrier resynchronization.
+//!
+//! The shapes are the [`SHAPES`] table, keyed by (type, k); `--only TYPE[,TYPE…]` runs the
+//! named rows alone (a name no row takes is refused by name), and `--iq1s-generic` runs the
+//! IQ1_S row through the generic decoder (`generic::dot_avx2::<Iq1s>`), the path IQ1_S rows
+//! took before their hand kernel — the generic-vs-hand comparison arm.
 
 use std::sync::Barrier;
 use std::time::Instant;
@@ -32,45 +37,59 @@ struct Shape {
     site: &'static str,
 }
 
-fn shapes() -> [Shape; 5] {
-    [
-        Shape {
-            ty: GgmlType::Q3_K,
-            k: 2048,
-            row_bytes: (2048 / 256) * 110, // 880
-            rows: 27 * 102_400,            // 2.43 GB
-            site: "batch Q3_K + matmul_q Q3_K (k=2048, 880 B/row)",
-        },
-        Shape {
-            ty: GgmlType::Q4_K,
-            k: 2048,
-            row_bytes: (2048 / 256) * 144, // 1152
-            rows: 21 * 102_400,            // 2.48 GB
-            site: "matmul_q Q4_K (k=2048, 1152 B/row)",
-        },
-        Shape {
-            ty: GgmlType::Q6_K,
-            k: 2048,
-            row_bytes: (2048 / 256) * 210, // 1680
-            rows: 14 * 102_400,            // 2.41 GB
-            site: "matmul_q Q6_K (k=2048, 1680 B/row)",
-        },
-        Shape {
-            ty: GgmlType::Q5_0,
-            k: 1408,
-            row_bytes: (1408 / 32) * 22, // 968
-            rows: 25 * 102_400,          // 2.48 GB
-            site: "batch Q5_0 (k=1408, 968 B/row)",
-        },
-        Shape {
-            ty: GgmlType::Q5_1,
-            k: 10_944,
-            row_bytes: (10_944 / 32) * 24, // 8208
-            rows: 3 * 102_400,             // 2.52 GB
-            site: "matmul_q Q5_1 (k=10944, 8208 B/row)",
-        },
-    ]
-}
+/// The shapes table, keyed by (type, k): each row is a dispatch site's type and width, its
+/// block bytes as the row size, and the row count that holds the buffer near 2.5 GB.
+const SHAPES: [Shape; 7] = [
+    Shape {
+        ty: GgmlType::Q3_K,
+        k: 2048,
+        row_bytes: (2048 / 256) * 110, // 880
+        rows: 27 * 102_400,            // 2.43 GB
+        site: "batch Q3_K + matmul_q Q3_K (k=2048, 880 B/row)",
+    },
+    Shape {
+        ty: GgmlType::Q4_K,
+        k: 2048,
+        row_bytes: (2048 / 256) * 144, // 1152
+        rows: 21 * 102_400,            // 2.48 GB
+        site: "matmul_q Q4_K (k=2048, 1152 B/row)",
+    },
+    Shape {
+        ty: GgmlType::Q6_K,
+        k: 2048,
+        row_bytes: (2048 / 256) * 210, // 1680
+        rows: 14 * 102_400,            // 2.41 GB
+        site: "matmul_q Q6_K (k=2048, 1680 B/row)",
+    },
+    Shape {
+        ty: GgmlType::Q5_0,
+        k: 1408,
+        row_bytes: (1408 / 32) * 22, // 968
+        rows: 25 * 102_400,          // 2.48 GB
+        site: "batch Q5_0 (k=1408, 968 B/row)",
+    },
+    Shape {
+        ty: GgmlType::Q5_1,
+        k: 10_944,
+        row_bytes: (10_944 / 32) * 24, // 8208
+        rows: 3 * 102_400,             // 2.52 GB
+        site: "matmul_q Q5_1 (k=10944, 8208 B/row)",
+    },
+    Shape {
+        ty: GgmlType::IQ1_S,
+        k: 6144,
+        row_bytes: (6144 / 256) * 50, // 1200
+        rows: 20 * 102_400,           // 2.46 GB
+        site: "ML4 host experts IQ1_S (k=6144, 1200 B/row)",
+    },
+    Shape {
+        ty: GgmlType::IQ2_XXS,
+        k: 6144,
+        row_bytes: (6144 / 256) * 66, // 1584
+        rows: 15 * 102_400,           // 2.43 GB
+        site: "ML4 host experts IQ2_XXS (k=6144, 1584 B/row)",
+    },
+];
 
 /// xorshift64* filler: any bytes are valid quantized codes, and the
 /// fill touches every page to avoid faults in timed passes.
@@ -102,9 +121,48 @@ fn acol(ty: GgmlType, k: usize) -> Vec<u8> {
 
 // ---------------------------------------------------------------- mode 1
 
+/// The row dot a cell runs: `qdot::dot_row`, or — under `--iq1s-generic` — the generic IQ1_S
+/// decode, the path IQ1_S rows took before their hand kernel.
+type Dot = fn(GgmlType, &[u8], &[u8], usize) -> f32;
+
+/// The fused kernel the dispatch picks.
+fn dot_fused(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
+    qdot::dot_row(ty, w, a, k).unwrap()
+}
+
+/// The generic IQ1_S decode, the pre-hand-kernel path.
+fn dot_iq1s_generic(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
+    assert!(
+        ty == GgmlType::IQ1_S,
+        "the generic arm runs IQ1_S only, got {ty:?}"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(
+            std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma"),
+            "the generic arm needs the vector decode's AVX2+FMA"
+        );
+        // SAFETY: asserted just above; the shape sized `w` and `a` for k/256 blocks.
+        unsafe { qdot::generic::dot_avx2::<qdot::generic::Iq1s>(w, a, k / 256) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (w, a, k);
+        unimplemented!("the generic arm's vector decode is x86_64 only")
+    }
+}
+
 /// One MT-ceiling cell: `t_threads` scoped threads stream contiguous shares
 /// of the shared buffer. Returns (weight bytes moved, seconds, checksum).
-fn run_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, passes: u32) -> (f64, f64, f32) {
+fn run_mt(
+    sh: &Shape,
+    w: &[u8],
+    acol: &[u8],
+    t_threads: usize,
+    passes: u32,
+    dot: Dot,
+) -> (f64, f64, f32) {
     let share = sh.rows / t_threads;
     let row = sh.row_bytes;
     let ty = sh.ty;
@@ -120,7 +178,7 @@ fn run_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, passes: u32) -> (
                     let mut acc = 0.0f32;
                     for _ in 0..passes {
                         for r in 0..share {
-                            acc += qdot::dot_row(ty, &slice[r * row..], acol, k).unwrap();
+                            acc += dot(ty, &slice[r * row..], acol, k);
                         }
                     }
                     acc
@@ -140,10 +198,10 @@ fn run_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, passes: u32) -> (
 }
 
 /// One (shape, T) measurement: warm-up calibrates pass count, then timed passes report.
-fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize) {
-    let (_, warm, _) = run_mt(sh, w, acol, t_threads, 1);
+fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, dot: Dot) {
+    let (_, warm, _) = run_mt(sh, w, acol, t_threads, 1, dot);
     let passes = ((TARGET_SECS / warm).ceil() as u32).clamp(MIN_PASSES, MAX_PASSES);
-    let (bytes, dt, sum) = run_mt(sh, w, acol, t_threads, passes);
+    let (bytes, dt, sum) = run_mt(sh, w, acol, t_threads, passes, dot);
     println!(
         "{:?} k={:<5} T={:>2}: {:>8} rows x {:>4} B x {:>4} passes in {:>7.3} s = {:>6.1} GB/s (sum {sum:.3})",
         sh.ty,
@@ -166,6 +224,7 @@ fn run_gran(
     acol: &[u8],
     rows_per_call: usize,
     sweeps: usize,
+    dot: Dot,
 ) -> (f64, f64, f32) {
     let calls = sh.rows / rows_per_call; // remainder rows are unvisited
     let row = sh.row_bytes;
@@ -187,7 +246,7 @@ fn run_gran(
                         for call in 0..calls {
                             let base = (call * rows_per_call + c0) * row;
                             for r in 0..width {
-                                acc += qdot::dot_row(ty, &w[base + r * row..], acol, k).unwrap();
+                                acc += dot(ty, &w[base + r * row..], acol, k);
                             }
                             // Resync threads between calls.
                             call_sync.wait();
@@ -209,10 +268,10 @@ fn run_gran(
     })
 }
 
-fn cell_gran(sh: &Shape, w: &[u8], acol: &[u8], rows_per_call: usize) {
-    let (_, warm, _) = run_gran(sh, w, acol, rows_per_call, 1);
+fn cell_gran(sh: &Shape, w: &[u8], acol: &[u8], rows_per_call: usize, dot: Dot) {
+    let (_, warm, _) = run_gran(sh, w, acol, rows_per_call, 1, dot);
     let sweeps = ((TARGET_SECS / warm).ceil() as usize).clamp(MIN_SWEEPS, MAX_SWEEPS);
-    let (bytes, dt, sum) = run_gran(sh, w, acol, rows_per_call, sweeps);
+    let (bytes, dt, sum) = run_gran(sh, w, acol, rows_per_call, sweeps, dot);
     println!(
         "{:?} k={:<5} T=32 R={:>6} ({:>5.1} rows/thread/call): {:>3} calls x {:>4} B x {:>3} sweeps in {:>7.3} s = {:>6.1} GB/s (sum {sum:.3})",
         sh.ty,
@@ -227,8 +286,54 @@ fn cell_gran(sh: &Shape, w: &[u8], acol: &[u8], rows_per_call: usize) {
     );
 }
 
+/// The rows `--only` names (its comma-separated types), or every row when absent: a name no
+/// row takes is refused by name.
+fn selected(only: Option<&str>) -> Vec<&'static Shape> {
+    let names = only.map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
+    let rows = SHAPES
+        .iter()
+        .filter(|sh| {
+            names
+                .as_ref()
+                .is_none_or(|ns| ns.iter().any(|n| *n == format!("{:?}", sh.ty)))
+        })
+        .collect::<Vec<_>>();
+    if let Some(ns) = &names {
+        for n in ns {
+            if !rows.iter().any(|sh| format!("{:?}", sh.ty) == *n) {
+                let table = SHAPES
+                    .iter()
+                    .map(|sh| format!("{:?}", sh.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panic!("--only {n:?}: no table row of that type — the table holds {table}");
+            }
+        }
+    }
+    rows
+}
+
 fn main() {
-    let gran = std::env::args().any(|a| a == "--granularity");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let gran = args.iter().any(|a| a == "--granularity");
+    let generic = args.iter().any(|a| a == "--iq1s-generic");
+    let only = args
+        .iter()
+        .position(|a| a == "--only")
+        .and_then(|p| args.get(p + 1))
+        .map(String::as_str);
+    let mut shapes = selected(only);
+    if generic {
+        shapes = shapes
+            .into_iter()
+            .filter(|sh| sh.ty == GgmlType::IQ1_S)
+            .collect::<Vec<_>>();
+        assert!(
+            !shapes.is_empty(),
+            "--iq1s-generic needs the IQ1_S row (check --only)"
+        );
+    }
+    let dot: Dot = if generic { dot_iq1s_generic } else { dot_fused };
     if gran {
         println!(
             "qdot-rate-mt --granularity: T=32, std::sync::Barrier resync per R rows/call (characterizes the Barrier, NOT the pool — see the header caveat)"
@@ -238,7 +343,12 @@ fn main() {
             "qdot-rate-mt: MT streaming ceiling, zero orchestration (std::thread::scope, no pool, no pinning)"
         );
     }
-    for sh in shapes() {
+    if generic {
+        println!(
+            "qdot-rate-mt --iq1s-generic: IQ1_S through the generic decode (the pre-hand-kernel path)"
+        );
+    }
+    for sh in shapes {
         println!(
             "# {} — {} rows, {:.2} GB",
             sh.site,
@@ -249,11 +359,11 @@ fn main() {
         let a = acol(sh.ty, sh.k);
         if gran {
             for r in RS {
-                cell_gran(&sh, &w, &a, r);
+                cell_gran(sh, &w, &a, r, dot);
             }
         } else {
             for t in [1usize, 8, 16, 32] {
-                cell_mt(&sh, &w, &a, t);
+                cell_mt(sh, &w, &a, t, dot);
             }
         }
         drop(w); // free memory before the next shape allocates

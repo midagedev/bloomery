@@ -22,6 +22,7 @@ use qdot::dot_row_avx2;
 use qdot::{
     QdotError, col_bytes, dot_row, dot_row_scalar, quantize_col, quantize_col_scalar, supports,
 };
+use std::fmt::Write as _;
 
 fn model_path() -> String {
     std::env::var("BLOOMERY_MODEL")
@@ -2702,6 +2703,186 @@ fn iq2xxs_dot_is_within_its_f64_bound() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------- IQ1_S x Q8_K
+// The kernel is ik's `mul_mat_iq1_s_q8_K` and no harness dumps it, so the gates stand on the
+// crate's own oracles, as IQ2_XXS's do: kernel vs mirror (bit identity), ours vs the dequant
+// oracle (a band, below) and tile vs dot_row (bit identity).
+
+/// An IQ1_S block: f16 `d`, the 32 grid index bytes `idx(4s + l)` (sub-block `s`, group
+/// `l`), then the eight `qh` words `qh(s)`: bits `3l .. 3l + 3` group `l`'s high index bits,
+/// bits 12..15 the scale, bit 15 the delta's sign.
+fn iq1s_block(d: u16, idx: impl Fn(usize) -> u8, qh: impl Fn(usize) -> u16) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    for s in 0..8 {
+        b.extend((0..4).map(|l| idx(4 * s + l)));
+    }
+    for s in 0..8 {
+        b.extend_from_slice(&qh(s).to_le_bytes());
+    }
+    b
+}
+
+/// The band gate's hand-built block: sub-block `s` reads group `l` at index
+/// `((s + l) & 7) << 8 | idx(4s + l)`, scale `s`, and a negative delta on odd sub-blocks.
+fn iq1s_hand_block() -> Vec<u8> {
+    iq1s_block(
+        F16_ONE,
+        |i| ((i * 37 + 11) & 0xff) as u8,
+        |s| {
+            let high: u16 = (0..4).map(|l| (((s + l) & 7) as u16) << (3 * l)).sum();
+            ((s as u16 & 7) << 12) | high | if s % 2 == 1 { 0x8000 } else { 0 }
+        },
+    )
+}
+
+/// IQ1_S end blocks: every index byte and index bit with the top scale under either delta and
+/// either sign of `d`, the index bits alone (scale 0), the scale alone over zero indexes, a
+/// scrambled pattern, d = 0 and a subnormal d.
+const IQ1S_ENDS: [IqEnd; 8] = [
+    || iq1s_block(F16_ONE, |_| 0xFF, |_| 0x7FFF),
+    || iq1s_block(F16_ONE, |_| 0xFF, |_| 0xFFFF),
+    || iq1s_block(F16_NEG_ONE, |_| 0xFF, |_| 0xFFFF),
+    || iq1s_block(F16_ONE, |_| 0xFF, |_| 0x0FFF),
+    || iq1s_block(F16_ONE, |_| 0, |_| 0x8007),
+    || {
+        iq1s_block(
+            F16_ONE,
+            |i| (i * 41 + 7) as u8,
+            |s| 0xC3A5u16.rotate_left(3 * s as u32),
+        )
+    },
+    || iq1s_block(0, |_| 0xFF, |_| 0xFFFF),
+    || iq1s_block(F16_TINY, |i| i as u8, |_| 0x50F0),
+];
+
+/// IQ1_S's k contract: a non-multiple of 256 is `UnalignedK` by name, before any byte is
+/// read.
+#[test]
+fn iq1s_refuses_unaligned_k() {
+    let wrow = vec![0u8; 50 * 24];
+    let acol = vec![0u8; 296 * 24];
+    assert_eq!(
+        dot_row(GgmlType::IQ1_S, &wrow, &acol, 6144 + 128),
+        Err(QdotError::UnalignedK {
+            k: 6144 + 128,
+            gran: 256
+        })
+    );
+}
+
+/// IQ1_S kernel vs mirror on [`generated_gate_a`]'s rows (random bytes, finite scales) at
+/// 24, three and one blocks, and on the ends of [`IQ1S_ENDS`] (every grid index, index bit,
+/// scale and delta sign at its extreme, d = 0, a subnormal d) at one and 24 blocks against
+/// the ±3.0 and seeded columns — bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq1s_kernel_matches_mirror() {
+    generated_gate_a(GgmlType::IQ1_S, 50, 256, &[6144, 768, 256]);
+    for k in [256, 6144] {
+        let nb = k / 256;
+        let rows = legacy_end_rows(&IQ1S_ENDS, nb, |end| end());
+        let cols = legacy_tile_columns(GgmlType::IQ1_S, k, vec![]);
+        for (r, row) in rows.chunks(50 * nb).enumerate() {
+            for (j, col) in cols.iter().enumerate() {
+                let a = dot_row_avx2(GgmlType::IQ1_S, row, col, k).unwrap();
+                let b = dot_row_scalar(GgmlType::IQ1_S, row, col, k).unwrap();
+                assert!(
+                    a.to_bits() == b.to_bits(),
+                    "end row {r} (k = {k}) column {j}: kernel {a:e} (bits {:#x}) and mirror {b:e} \
+                     (bits {:#x}) must be bit-identical",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+        eprintln!(
+            "IQ1_S: {} end rows x {} columns bit-identical (k = {k})",
+            rows.len() / (50 * nb),
+            cols.len()
+        );
+    }
+}
+
+/// IQ1_S against the dequant oracle: `dequant_row`'s f32 weights (held to ggml's
+/// `dequantize_row_iq1_s` bit for bit in gguf) times the column's scaled codes, summed
+/// exactly in f64, at the hand-built block ([`iq1s_hand_block`]), the ends' one- and
+/// three-block rows and four random rows, through `dot_row` and `dot_row_scalar`.
+///
+/// The oracle's weights carry two f32 roundings a term (`d`, then the value). Ours sums one
+/// exact integer a block and lane — the codes `8·(2s + 1)·(grid + 1)` with the fold
+/// `(2s + 1)·(δ − 8)·Σ q` of each sub-block, both inside the i32 sum — in one fmadd against
+/// the rounded `d·dy`, then the closing hsum's three adds and the exact `0.125`. Those
+/// roundings act on sums bounded by `Σ (|w| + 0.125·|d|·(2s + 1)·25)·|dy·q|` over the values
+/// (the codes' offset `8·|grid + 1| ≤ 16` and the fold's `9`); the band is `gamma_(nb + 10)`
+/// of that sum, the IQ2_XXS test's rule ([`iq2xxs_dot_is_within_its_f64_bound`]) at IQ1_S's
+/// one fmadd a block and lane. A wrong grid byte, index bit, scale or delta sign moves a
+/// whole term, far past it.
+#[test]
+fn iq1s_dot_is_within_its_f64_bound() {
+    let mut rng = Lcg(0x2C_1F7E);
+    for k in [256usize, 768, 6144] {
+        let nb = k / 256;
+        let x: Vec<f32> = (0..k).map(|_| rng.unit() * 30.0).collect();
+        let mut acol = vec![0u8; col_bytes(GgmlType::IQ1_S, k)];
+        quantize_col(GgmlType::IQ1_S, &x, &mut acol);
+        let mut rows = vec![iq1s_hand_block().repeat(nb)];
+        rows.extend(
+            legacy_end_rows(&IQ1S_ENDS, nb, |end| end())
+                .chunks(50 * nb)
+                .map(<[u8]>::to_vec),
+        );
+        for _ in 0..4 {
+            rows.push(iq_random_block(&mut rng, 50, &[0]).repeat(nb));
+        }
+        let n_u = (nb + 10) as f64 * 2f64.powi(-24);
+        for (r, row) in rows.iter().enumerate() {
+            let mut w = vec![0.0f32; k];
+            dequant_row(GgmlType::IQ1_S, row, &mut w).unwrap();
+            let (mut exact, mut abs) = (0.0f64, 0.0f64);
+            for (b, wb) in w.as_chunks::<256>().0.iter().enumerate() {
+                let blk = &acol[296 * b..296 * (b + 1)];
+                let dy = f64::from(f32::from_le_bytes(blk[0..4].try_into().unwrap()));
+                let wblk = &row[50 * b..50 * (b + 1)];
+                let dw = f64::from(half_to_f32(u16::from_le_bytes([wblk[0], wblk[1]])));
+                for (n, (&wv, &q)) in wb.iter().zip(&blk[8..264]).enumerate() {
+                    // Sub-block n / 32's scale nibble: bits 12..15 of its qh word.
+                    let qh = u16::from_le_bytes([wblk[34 + 2 * (n / 32)], wblk[35 + 2 * (n / 32)]]);
+                    let sc = f64::from(2 * ((qh >> 12) & 7) + 1);
+                    let yq = dy * f64::from(q as i8);
+                    let term = f64::from(wv) * yq;
+                    exact += term;
+                    abs += (f64::from(wv).abs() + 0.125 * dw.abs() * sc * 25.0) * yq.abs();
+                }
+            }
+            let bound = n_u / (1.0 - n_u) * abs;
+            for (path, got) in [
+                ("dot_row", dot_row(GgmlType::IQ1_S, row, &acol, k)),
+                (
+                    "dot_row_scalar",
+                    dot_row_scalar(GgmlType::IQ1_S, row, &acol, k),
+                ),
+            ] {
+                let got = f64::from(got.unwrap());
+                assert!(
+                    (got - exact).abs() <= bound,
+                    "{path} k = {k} row {r}: got {got:e}, exact {exact:e}, bound {bound:e}"
+                );
+            }
+        }
+    }
+}
+
+/// IQ1_S tile clause: random rows (every grid index, index bit, scale and delta sign, `d` of
+/// either sign) and the ends of [`IQ1S_ENDS`] at k = 6144 (Mistral Large 4's host experts),
+/// 768 and 256 — tile = `dot_row` per column, bit for bit. No IQ1_S file is on the box, so
+/// there are no real rows.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq1s_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ1_S, 50, 256, &[6144, 768, 256], &IQ1S_ENDS);
 }
 
 // ------------------------------------------------------- Q8_0 x Q8_2_X4

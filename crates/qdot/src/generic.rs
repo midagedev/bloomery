@@ -27,10 +27,12 @@
 //! A type joins by an `impl HostDecode` and one [`Entry::of`] line in [`ENTRIES`]; its row
 //! (`gguf::QROWS`) already carries the block size, bytes and activation form, which the entry is
 //! checked against at build time. A type with a hand kernel is never listed: the hand arms of
-//! the dispatch are matched first. The listed types are IQ2_S, IQ1_S and IQ1_M, each with its
+//! the dispatch are matched first. The listed types are IQ2_S and IQ1_M, each with its
 //! vector decode; IQ1_S and IQ1_M put the group delta into the code (`8·grid ± 1`, float factor
 //! `d / 8`), so they have no min term and read no column sums. Q2_K, IQ4_XS and IQ4_NL are the
-//! decoders the tests hold to their hand kernels.
+//! decoders the tests hold to their hand kernels. IQ1_S's decoder
+//! ([`Iq1s`]) is unlisted — its hand kernel owns the dispatch — but stays with the tests that
+//! hold its decode, and the rate bin dots it as the pre-port arm.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -129,11 +131,7 @@ pub struct Entry {
 }
 
 /// The entries the dispatch falls to for a type with no hand kernel.
-pub static ENTRIES: &[Entry] = &[
-    Entry::of::<Iq2s>(),
-    Entry::of::<Iq1s>(),
-    Entry::of::<Iq1m>(),
-];
+pub static ENTRIES: &[Entry] = &[Entry::of::<Iq2s>(), Entry::of::<Iq1m>()];
 
 const _: () = {
     let mut i = 0;

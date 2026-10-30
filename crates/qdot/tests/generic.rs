@@ -22,10 +22,11 @@
 //! - every row of `gguf::QROWS` that names a quantized activation form has a kernel of that
 //!   form, and a row that names none has no kernel.
 //!
-//! IQ2_S, IQ1_S and IQ1_M are the listed types (`qdot::generic::ENTRIES`), with no hand kernel to
+//! IQ2_S and IQ1_M are the listed types (`qdot::generic::ENTRIES`), with no hand kernel to
 //! be equal to: the decode, vector, bound, refusal and entry clauses above hold them, a dispatch
 //! clause holds every entry point to the generic kernels, and `gate-quant` holds their dots to
-//! mainline's `vec_dot`.
+//! mainline's `vec_dot`. IQ1_S's decoder is held by the same decode, vector and bound clauses
+//! (its hand kernel owns the dispatch; `tests/qdot.rs` holds that kernel to its mirror).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -428,7 +429,6 @@ fn check_dispatch<D: HostDecode>(ks: &[usize]) {
 #[test]
 fn a_type_with_no_hand_kernel_reaches_its_generic_kernels() {
     check_dispatch::<Iq2s>(&Q8K_KS);
-    check_dispatch::<Iq1s>(&Q8K_KS);
     check_dispatch::<Iq1m>(&Q8K_KS);
 }
 
