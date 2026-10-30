@@ -987,9 +987,7 @@ pub fn header_budget(split: &Split) -> Result<Option<HeaderBudget>, GateError> {
                 )
             })?;
         if let model::fixture::CardBudget::Planned(planner) = spec.card_budget {
-            let family =
-                model::arch::registry::fixture_of(spec.arch).map_or(spec.arch, |row| row.family);
-            card_set_aside = planned(&planner, split, path, recorded, variant, family)?;
+            card_set_aside = planned(&planner, split, path, recorded, variant, spec.arch)?;
         }
     }
     Ok(Some(HeaderBudget {
@@ -1015,8 +1013,9 @@ fn on_fixture_card(_: &model::fixture::Budget, _: &Split) -> Result<u64, GateErr
 }
 
 /// A planned family's `recorded` budget of `split` (first shard `path`; `variant` its tag, if a
-/// variant of `family`) re-planned ([`model::fixture::check_budget`]), a stale one named with the
-/// step that fixes it, and what the fixture tier's card sets aside past the family's
+/// variant of the family whose model profile is `profile` — its fixture's architecture, the word
+/// `just fixture-requant` takes) re-planned ([`model::fixture::check_budget`]), a stale one named
+/// with the step that fixes it, and what the fixture tier's card sets aside past the family's
 /// ([`on_fixture_card`]).
 fn planned(
     planner: &model::fixture::Budget,
@@ -1024,7 +1023,7 @@ fn planned(
     path: &Path,
     recorded: u64,
     variant: Option<&str>,
-    family: &str,
+    profile: &str,
 ) -> Result<u64, GateError> {
     let check = if variant.is_some() {
         model::fixture::check_budget_variant
@@ -1032,7 +1031,7 @@ fn planned(
         model::fixture::check_budget
     };
     check(planner, split, recorded)
-        .map_err(|e| fixture_budget_error(path, recorded, e, variant, family))?;
+        .map_err(|e| fixture_budget_error(path, recorded, e, variant, profile))?;
     Ok(on_fixture_card(planner, split).map_err(|e| format!("{}: {e}", path.display()))?)
 }
 
@@ -1041,13 +1040,13 @@ fn fixture_budget_error(
     budget: u64,
     error: model::fixture::FixtureError,
     variant: Option<&str>,
-    family: &str,
+    profile: &str,
 ) -> String {
     match (&error, variant) {
         (model::fixture::FixtureError::BudgetMismatch(_), Some(tag)) => format!(
             "{}: variant {tag} records a stale budget {budget}: a variant's card budget is \
              planned on its own file; {error}; make the variant again: just fixture-requant \
-             {family} {tag}",
+             {profile} {tag}",
             path.display()
         ),
         (model::fixture::FixtureError::BudgetMismatch(_), None) => format!(
@@ -1868,6 +1867,14 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("regenerate"), "{error}");
+        // The recipe's word is the family's model profile, its fixture's architecture — not the
+        // family's directory: the qwen38 fixture family's is qwen4exp.
+        let mismatch = model::fixture::check_budget(&planner, &split, 3).unwrap_err();
+        let error = fixture_budget_error(&path, 3, mismatch, Some("q38dense"), "qwen4exp");
+        assert!(
+            error.contains("just fixture-requant qwen4exp q38dense"),
+            "{error}"
+        );
         drop(split);
         std::fs::remove_dir_all(dir).unwrap();
     }
