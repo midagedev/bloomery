@@ -199,8 +199,7 @@ use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::QueryNorm;
 use crate::gemm::{
-    GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
-    GemmWeight, MmaForm,
+    DownW, DownWin, GateUp, GemmAct, GemmAct32, GemmInput, GemmRoute, MmaForm, enqueue_gemm_batch,
 };
 use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, Streams, WideMixArgs};
 use crate::head::Head;
@@ -876,12 +875,6 @@ impl Down38 {
     }
 }
 
-/// A run's window of a card route's down rows ([`Down38::window`]).
-enum DownWin {
-    F32(Win<f32>),
-    Bf16(Win<u16>),
-}
-
 impl DownWin {
     fn rows(&self) -> DownRows<'_> {
         match self {
@@ -908,9 +901,9 @@ pub(super) fn down_weight<'a>(
     l: usize,
     ty: GgmlType,
     w: StackW<'a>,
-) -> Result<Gemm32Weight<'a>, GpuError> {
+) -> Result<DownW<'a>, GpuError> {
     match w.route(ty) {
-        Some(RouteW::Blocks32(w)) => Ok(w),
+        Some(RouteW::Blocks32(w)) => Ok(DownW::Blocks32(w)),
         Some(RouteW::Grouped(..)) | None => Err(GpuError::shape(
             what,
             format!("layer {l}: a down stack of {ty}, which no route GEMM reads"),
@@ -930,41 +923,25 @@ enum RouteX {
     Blocks32(Box<GemmAct32>),
 }
 
-/// A layer's gate and up as the route's GEMMs read them ([`StackW::route`]),
-/// each with the run's normed rows in the form it reads: the grouped GEMM's
-/// words over the q8_1 rows, or the 32-value GEMM's weights over the
-/// 32-value rows.
-#[derive(Clone, Copy)]
-enum GateUp<'a> {
-    Grouped(GemmWeight, [&'a DeviceTensor<u32>; 2], &'a GemmAct),
-    Blocks32([Gemm32Weight<'a>; 2], &'a GemmAct32),
-}
-
 /// One GEMM batch of a route pass over `map` — the batch's places, a
 /// host-mapped row of a landing batch ([`LandBatch`]) or the card's own map
 /// copy for the whole of a pass nothing batched — with the engine stream
 /// `stream` waiting `wait` first (the batch's landed event; `None` for a
-/// batch nothing lands in): the places into `sel`, the route table over the
-/// map, the gate and up GEMMs, the SwiGLU over `sel` (every place below
-/// `n_places` a column it writes; the 32-value GEMM's NVFP4 up folds it into
-/// its own launch, `Gemm32Kernels::enqueue_up_swiglu32`, and on a native FP4
-/// build the gate joins them, `Gemm32Kernels::enqueue_gate_up_sel32`) and the
-/// down GEMM into the run's `down_y` rows. Six launches, five with the fold,
-/// four where the gate joins them; only the batch's slots are touched, so a
-/// pass's batches write the rows the whole pass always wrote, the same
-/// values in the same order — the bits do not move.
+/// batch nothing lands in): the places into `sel`, `geo::N_USED + 1` columns
+/// a token, then the batch sequence itself
+/// ([`crate::gemm::enqueue_gemm_batch`]) over the same `map` and `sel`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the batch's context, wait, ids, map, weights, width, places bound, sink, run rows and buffers (rust-quality R8)"
 )]
-fn enqueue_gemm_batch(
+fn enqueue_places_batch(
     c: &Ctx38<'_>,
     stream: &CudaStream,
     wait: Option<&CudaEvent>,
     (walk_ids, ids): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
     map: &DeviceBuffer<u32>,
     gate_up: GateUp<'_>,
-    down: Gemm32Weight<'_>,
+    down: DownW<'_>,
     (n, n_places): (usize, usize),
     sink: FaultSink,
     down_y: &mut DownWin,
@@ -991,69 +968,20 @@ fn enqueue_gemm_batch(
         sink,
         sel,
     )?;
-    c.k.g32
-        .enqueue_route_remap(stream, ids, map, n * geo::N_USED, route, sink)?;
-    let input = GemmInput::Shared { top_k: geo::N_USED };
-    match gate_up {
-        GateUp::Grouped(ty, [gate, up], x) => {
-            for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
-                c.k.gemm.enqueue_gemm(
-                    stream,
-                    GemmArgs {
-                        ty,
-                        w,
-                        rows_per_expert: geo::FF,
-                        act: x,
-                        route,
-                        input,
-                        y,
-                    },
-                )?;
-            }
-            c.k.g32.enqueue_swiglu_quant32_sel(
-                stream,
-                g,
-                u,
-                sel,
-                n_places,
-                n * geo::N_USED,
-                act,
-                sink,
-            )?;
-        }
-        GateUp::Blocks32(w, x) => c.k.g32.enqueue_gate_up_sel32(
-            stream,
-            GateUp32Args {
-                w,
-                rows_per_expert: geo::FF,
-                x,
-                route,
-                input,
-                sel,
-                n_card: n_places,
-                g,
-                u,
-                act,
-            },
-            sink,
-        )?,
-    }
-    macro_rules! down_args {
-        ($y:expr) => {
-            Gemm32Args {
-                w: down,
-                rows_per_expert: geo::HIDDEN,
-                act,
-                route,
-                input: GemmInput::PerSlot,
-                y: $y,
-            }
-        };
-    }
-    match down_y {
-        DownWin::F32(y) => c.k.g32.enqueue_gemm32(stream, down_args!(y)),
-        DownWin::Bf16(y) => c.k.g32.enqueue_gemm32_bf16(stream, down_args!(y)),
-    }
+    enqueue_gemm_batch(
+        (c.k.gemm, c.k.g32),
+        stream,
+        ids,
+        map,
+        gate_up,
+        down,
+        (n, n_places),
+        (geo::N_USED, geo::FF, geo::HIDDEN),
+        sink,
+        down_y,
+        (g, u, act),
+        (sel, route),
+    )
 }
 
 impl CardRoute38 {
@@ -1225,7 +1153,7 @@ impl CardRoute38 {
     /// shared expert's last — never read), the q8_1 of the run's normed rows
     /// (`ffn_x`, `[m][HIDDEN]`; their 32-value form for a gate and up the
     /// 32-value GEMM reads), then the stack pass as one GEMM batch a
-    /// landing batch of the layer's pick (`land`, [`enqueue_gemm_batch`]):
+    /// landing batch of the layer's pick (`land`, [`enqueue_places_batch`]):
     /// the leading batch the slots no copy lands in, which wait nothing,
     /// then the admits' slots in slot order, each batch behind its own
     /// landed event — or, when the pick moved nothing, the whole stack at
@@ -1406,7 +1334,7 @@ impl CardRoute38 {
                 // layer's pick, the leading one (nothing lands in it) first,
                 // or the whole stack at once when the pick moved nothing.
                 if land.is_empty() {
-                    enqueue_gemm_batch(
+                    enqueue_places_batch(
                         c,
                         stream,
                         None,
@@ -1426,7 +1354,7 @@ impl CardRoute38 {
                     places(&map, &mut sel_w)?;
                     for b in land {
                         b.with_map(ctx, geo::EXPERTS, |bmap| {
-                            enqueue_gemm_batch(
+                            enqueue_places_batch(
                                 c,
                                 stream,
                                 b.event.as_deref(),
@@ -1452,7 +1380,7 @@ impl CardRoute38 {
                     places(union_map, &mut rr.union)?;
                     for b in &r.batches {
                         b.with_map(ctx, geo::EXPERTS, |bmap| {
-                            enqueue_gemm_batch(
+                            enqueue_places_batch(
                                 c,
                                 stream,
                                 b.event.as_deref(),

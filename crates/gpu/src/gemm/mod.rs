@@ -40,6 +40,11 @@
 //! the host, and `f32tile.rs` the wide F32 product. Its GEMMs read the same
 //! [`GemmRoute`] as the K-quant ones.
 //!
+//! `batch.rs` is the sequence over both families a remapped card route runs
+//! between the model's places launch and its card sum
+//! ([`enqueue_gemm_batch`]): the route table, the gate and up GEMMs, the
+//! SwiGLU of the card slots' places and the down GEMM.
+//!
 //! [`Gpu::enqueue_quantize_gemm`]: crate::Gpu::enqueue_quantize_gemm
 
 mod act;
@@ -63,8 +68,11 @@ mod remap;
 // After `gemm32`, for the same reason.
 mod kernels32;
 
+mod batch;
+
 pub use act::GemmAct;
 pub use act32::{GemmAct32, MmaForm};
+pub use batch::{DownW, DownWin, GateUp, enqueue_gemm_batch};
 pub use f32tile::LINE as F32_TILE_LINE;
 pub(crate) use f32tile::mxfp8_w8a8_reads;
 pub(crate) use f32tile::{
