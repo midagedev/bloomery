@@ -112,6 +112,7 @@ generate_ds41   ds41_hc_pre                              0           0
 generate_ds41   ds41_hc_pre_f32                          0           0
 generate_ds41   ds41_hc_pre_groups                       0           0
 generate_ds41   ds41_index_key                           0           0
+generate_ds41   ds41_index_key_input                           0           0
 generate_ds41   ds41_indexer_score                       0           0
 generate_ds41   ds41_indexer_topk                        0           0
 generate_ds41   ds41_kv_norm_rope_append                 0           0
@@ -601,6 +602,7 @@ generate_ds41	iq2_xxs_gate_up_sel	0	0
 generate_ds41	sigmoid_256_8_router	0	0
 generate_ds41	sigmoid_256_8_router_pick	0	0
 generate_ds41	softcap_rows	0	0
+generate_ds41	ssmax_rows	0	0
 generate_ds41	swiglu_rule_rows	0	0
 # PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
 # PIN(2026-10-21): raon_hc_route (Raon's mHC route, one block a token and layer) keeps its 4x3 and 4x4 route matrices in per-thread arrays the while loops index at run time: hz 48 B + e 64 B = 112 B of JIT local; the rest of its work is shared memory. ptxas spills nothing.
