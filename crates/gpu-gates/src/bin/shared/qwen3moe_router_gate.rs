@@ -73,6 +73,14 @@
 //! wrong shape or a `k` not a multiple of 64, a weight or an input not
 //! 16-byte aligned, a ubatch past `UBATCH` tokens).
 //!
+//! The router at Mistral Large 4's shape (`wide_section`): a synthetic 128 x
+//! 6144 f32 weight, the top 4 renormalized by HF's `(sum + 1e-20)`, through the
+//! fused launch at one, five and eight tokens and the ubatch pair at nine and
+//! thirty-three: the ids EXACT against the host rule on the launch's own logits,
+//! probabilities and weights within [`BAND`], the guard no bit of the divisor,
+//! the weights summing to one, the logits within the f64 dot's band, and the
+//! ubatch pair's bits the fused launch's.
+//!
 //! Refusals, each launch labelled with layer 13: a token with a non-finite
 //! logit raises `FaultSite::Router` with that layer, its probabilities and
 //! weights are NaN and its ids those it held before the launch, and every
@@ -1275,6 +1283,123 @@ fn picks_section(
     Ok(ok)
 }
 
+/// The router at 6144 inputs and four picks, the shape Mistral Large 4
+/// routes at (softmax over 128, top 4, the chosen probabilities divided by
+/// `sum + 1e-20`, routed scale 1): the module doc's wide clause.
+fn wide_section(gpu: &Gpu, rk: &RouterKernels) -> Result<bool, GateError> {
+    const K: usize = 6144;
+    const TOP: usize = 4;
+    const GUARD: f32 = 1e-20;
+    let stream = gpu.stream();
+    let sink = gpu.unlabelled_sink();
+    let w: Vec<f32> = activations(N_EXPERT * K, 1, 7001)
+        .iter()
+        .map(|&v| 0.02 * v)
+        .collect();
+    let wd = DeviceTensor::upload(stream, &w, N_EXPERT, K)?;
+    let d = dims(TOP)?;
+    let mut fused = RouterOut::with_tokens(stream, d, MAX_TOKENS)?;
+    let mut ub = RouterOut::for_ubatch(stream, d, 33)?;
+    let mut ok = true;
+    for (entry, t) in [
+        ("fused", 1usize),
+        ("fused", 5),
+        ("fused", 8),
+        ("ubatch", 9),
+        ("ubatch", 33),
+    ] {
+        let x = activations(K, t, 7100 + t as u32);
+        let xd = DeviceBuffer::from_host(stream, &x)?;
+        let got = if entry == "fused" {
+            rk.enqueue_fused(stream, &wd, &xd, t, sink, &mut fused)?;
+            stream.synchronize()?;
+            read_fused(stream, &fused, t)?
+        } else {
+            rk.enqueue_ubatch(stream, &wd, &xd, t, sink, &mut ub)?;
+            stream.synchronize()?;
+            read_fused(stream, &ub, t)?
+        };
+        // The routing against the host rule on the launch's own logits, the
+        // divisor in HF's form.
+        let (mut ids_exact, mut pe, mut we, mut guard_free, mut sums_one) =
+            (true, 0.0f32, 0.0f32, true, true);
+        for tok in 0..t {
+            let lg = &got.logits[tok * N_EXPERT..(tok + 1) * N_EXPERT];
+            let (probs, ids, chosen) = route_ref_within(lg, 1, N_EXPERT, TOP, 1.0)?;
+            let sum = chosen.iter().fold(0.0f64, |a, &v| a + f64::from(v)) as f32;
+            let denom = sum + GUARD;
+            guard_free &= denom.to_bits() == sum.to_bits();
+            let want: Vec<f32> = chosen.iter().map(|&v| v / denom).collect();
+            let want_ids: Vec<u32> = ids.into_iter().map(|i| i as u32).collect();
+            let r = &got.routed;
+            ids_exact &= r.ids[tok * TOP..(tok + 1) * TOP] == want_ids[..];
+            pe = pe.max(max_abs(
+                &r.probs[tok * N_EXPERT..(tok + 1) * N_EXPERT],
+                &probs,
+            ));
+            let wt = &r.weights[tok * TOP..(tok + 1) * TOP];
+            we = we.max(max_abs(wt, &want));
+            sums_one &= (wt.iter().map(|&v| f64::from(v)).sum::<f64>() - 1.0).abs() <= 1e-6;
+        }
+        // The logits against the f64 dot, the f32 lane sums' band.
+        let band_n = K / 32 + 5;
+        let mut in_band = true;
+        for tok in 0..t {
+            for e in 0..N_EXPERT {
+                let (mut dot, mut mag) = (0.0f64, 0.0f64);
+                for i in 0..K {
+                    let p = f64::from(w[e * K + i]) * f64::from(x[tok * K + i]);
+                    dot += p;
+                    mag += p.abs();
+                }
+                in_band &=
+                    (f64::from(got.logits[tok * N_EXPERT + e]) - dot).abs() <= gamma(band_n) * mag;
+            }
+        }
+        // The ubatch pair writes the bits the fused launch writes per column.
+        let mut same = true;
+        let ubatch_note = if entry == "ubatch" {
+            ""
+        } else {
+            "(fused: n/a) "
+        };
+        if entry == "ubatch" {
+            for c0 in (0..t).step_by(MAX_TOKENS) {
+                let m = (t - c0).min(MAX_TOKENS);
+                let xc = DeviceBuffer::from_host(stream, &x[c0 * K..(c0 + m) * K])?;
+                rk.enqueue_fused(stream, &wd, &xc, m, sink, &mut fused)?;
+                stream.synchronize()?;
+                let f = read_fused(stream, &fused, m)?;
+                let e = N_EXPERT;
+                same &= bits_equal(&f.logits, &got.logits[c0 * e..(c0 + m) * e])
+                    && bits_equal(&f.routed.probs, &got.routed.probs[c0 * e..(c0 + m) * e])
+                    && f.routed.ids == got.routed.ids[c0 * TOP..(c0 + m) * TOP]
+                    && bits_equal(
+                        &f.routed.weights,
+                        &got.routed.weights[c0 * TOP..(c0 + m) * TOP],
+                    );
+            }
+        }
+        let pass = ids_exact
+            && pe <= BAND
+            && we <= BAND
+            && guard_free
+            && sums_one
+            && in_band
+            && same
+            && gpu.take_fault()?.is_none();
+        println!(
+            "router wide entry={entry} t={t} k={K} experts={N_EXPERT} top={TOP}: ids=host {ids_exact} \
+             probs_err={pe:.3e} weights_err={we:.3e} (band {BAND:.0e}) divisor_is_sum_plus_1e-20 \
+             {guard_free} weights_sum_to_one={sums_one} logits_in_band={in_band} {ubatch_note}\
+             ubatch_eq_fused_bits={same} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+    }
+    Ok(ok)
+}
+
 pub fn run() -> Result<(), GateError> {
     let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-kernels")?;
     let hp = Hparams::read(&split)?;
@@ -1522,6 +1647,7 @@ pub fn run() -> Result<(), GateError> {
     ok &= norm_m_section(&gpu, &gguf, &k, hp.rms_eps)?;
     let (w0, k0) = router_weight_host(&gguf, 0)?;
     ok &= ubatch_section(&gpu, &k, &w0, k0)?;
+    ok &= wide_section(&gpu, &k)?;
     ok &= fault_section(&gpu, &gguf, &k, hp.rms_eps)?;
 
     println!("gate_qwen3moe_router: {}", verdict(ok));
