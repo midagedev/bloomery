@@ -2417,7 +2417,7 @@ impl FfnPiece {
     /// replaced places), after [`FfnPiece::enqueue_batch_replace`]; the
     /// streamed pass follows. Asynchronous, allocation-free.
     pub fn enqueue_batch_block_kept(
-        &self,
+        &mut self,
         gpu: &Gpu,
         bl: &BatchLayer<'_>,
         card: Option<CardStacks<'_>>,
@@ -2437,7 +2437,7 @@ impl FfnPiece {
     /// sum in slot order over every card slot, or for a `tiered` layer the
     /// held routing. Asynchronous, allocation-free.
     pub fn enqueue_batch_stream(
-        &self,
+        &mut self,
         gpu: &Gpu,
         bl: &BatchLayer<'_>,
         card: Option<CardStacks<'_>>,
