@@ -4,8 +4,7 @@ A survey (2026-10-30, the lead's Mac and the box, no model run). The question: w
 judged by the first request each agent sends. A large first request is a long first prompt pass on a slow machine, and
 a field the server or the chat template refuses ends the session before it starts.
 
-Every number is measured from a captured request body, or marked `[derived]` with its terms. Code citations are this
-repo at 109e6075d.
+Every number is measured from a captured request body, or marked `[derived]` with its terms.
 
 ## 0. Result
 
@@ -36,9 +35,10 @@ Read from the code, not yet run against a live server:
   families) answer 400 "System message must be at the beginning." Claude Code 2.1.312 did not send it. Fixed after
   0.3.11: such a message renders as a `user` message in its place (`crates/serve/src/anthropic.rs`, #995).
 - **Codex 0.153.4** speaks only `/v1/responses` (`wire_api = "chat"` is refused by the CLI). Its `developer` item
-  reaches the template as `system` (`crates/serve/src/api.rs:2965`). Its tools include one of `type: "namespace"`
-  (`multi_agent_v1`, sub-agent functions nested inside it). The server runs function tools only and refuses any other
-  type with 400 (`crates/serve/src/responses.rs:776`), so Codex fails on its first request. Open.
+  reaches the template as `system` (`crates/serve/src/api.rs`). Its tools include one of `type: "namespace"`
+  (`multi_agent_v1`, sub-agent functions nested inside it). bloomery 0.3.11 runs function tools only and refuses any
+  other type with 400, so Codex fails on its first request. Fixed after 0.3.11: the functions inside a namespace become
+  function tools, and a call to one answers with the `namespace` field Codex reads (`crates/serve/src/responses.rs`).
 - **OpenCode 1.19.3**, through its `openai` provider, speaks `/v1/responses`: a `system` item first, `input_text`
   parts, `store: false`, `prompt_cache_key`. The server reads or ignores each of these (`crates/serve/src/responses.rs`,
   module doc). Its title call names its own small model (`gpt-5.4-nano`); the server echoes a model name and serves its
@@ -48,7 +48,7 @@ Read from the code, not yet run against a live server:
 - **DeepSeek Harness (dsh) 0.2.0-rc.2** (npm `@deepseek-ai/dsh`, a web UI with `dsh web`, one task with `dsh headless`)
   speaks `/v1/chat/completions` through a `pi-ai` provider: a `developer` message first, then two `user` messages,
   `chat_template_kwargs` (`enable_thinking`, `reasoning_effort` from the profile), `max_completion_tokens`,
-  `stream_options`. The `developer` message reaches the template as `system` (`crates/serve/src/api.rs:2965`). It
+  `stream_options`. The `developer` message reaches the template as `system` (`crates/serve/src/api.rs`). It
   served the DeepSeek-V4.1-Flash 1017 clip of 2026-10-19 on this server.
 - **pi** speaks plain `/v1/chat/completions`: `system`, `user`, four tools (`read`, `bash`, `edit`, `write`),
   `stream_options`. Nothing in it is new to the server.
@@ -63,7 +63,7 @@ Every agent streams. None puts a `system` item after another message in its firs
   its web UI shows the work as it happens.
 - **A fast card set, a demo:** Claude Code (bloomery after 0.3.11) or OpenCode. Both carry many tools and long system
   prompts, which a fast prompt pass absorbs.
-- **Codex:** not until the server accepts its `namespace` tool.
+- **Codex:** bloomery after 0.3.11 (its `namespace` tool).
 - **Pin the agent's version for a demo or a script.** Agents change their request between patch releases. Claude
   Code changed the role of its environment block from 2.1.312 to 2.1.314, and that change alone broke a rehearsed
   session.
