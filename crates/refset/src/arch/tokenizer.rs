@@ -21,7 +21,10 @@
 //! Muse Spark Open's `gpt-4o` pre is this tree's `minimax-m2` regex under its
 //! own name, and its set is read by `/home/user/llama.cpp-muse`
 //! (mainline at PR 30616's merge, no patch; [`MUSESPARK_BUILD`], the same tree
-//! the musespark node dumps are read by). A family pins the tree its oracle is built from, the
+//! the musespark node dumps are read by). Mistral Large 4's `tekken-num3` pre is the Tekken regex with
+//! digit runs grouped by three from the right, and its set is read by `/home/user/llama.cpp-ml4`
+//! (mainline at PR 31376's merge, no patch; [`MISTRALLARGE4_BUILD`], the same tree the
+//! mistrallarge4 node dumps are read by). A family pins the tree its oracle is built from, the
 //! `# build` line its set states after `crates/tokenizer/tools/oracle.sh` has
 //! checked the tree (`tools/ref/emb2/oracle-tree.sh`): the upstream commit's
 //! first 9 digits, and for a tree with a local patch `+` and the 12 digits
@@ -79,6 +82,12 @@ pub(crate) const MINIMAXM3_BUILD: &str = "6ea215d17+1616f7f3d842";
 /// tree at ([`super::musespark::COMMIT`]).
 // PIN(2026-10-23): the commit, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
 pub const MUSESPARK_BUILD: &str = super::musespark::COMMIT;
+
+/// The tree `/home/user/llama.cpp-ml4`, whose `llama-tokenize` loads Mistral Large 4's file
+/// (the merge of PR 31376, no patch): the commit the mistrallarge4 node-dump family reads the
+/// same tree at ([`super::mistrallarge4::COMMIT`]).
+// PIN(2026-10-31): the commit, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
+pub const MISTRALLARGE4_BUILD: &str = super::mistrallarge4::COMMIT;
 
 /// V4.1's set (`deepseek-v3` pre-tokenizer), from the file the tree runs.
 pub static V41: Family = Family {
@@ -182,6 +191,20 @@ pub static MUSESPARK: Family = Family {
     consumers: &["gate-tokenizer"],
 };
 
+/// Mistral Large 4's set (`tekken-num3` pre-tokenizer, BOS `<s>` added by the file, so the set is dumped without it).
+pub static MISTRALLARGE4: Family = Family {
+    name: "tokenizer-mistrallarge4",
+    sets: &["ref-tokenizer-mistrallarge4"],
+    resolve: None,
+    recipe: "just dump-ref-tokenizer mistrallarge4",
+    identity: Identity::Vocabulary,
+    arch: None,
+    build: Some(Build::Is(MISTRALLARGE4_BUILD)),
+    runs: Some(mistrallarge4_model),
+    draft_runs: None,
+    consumers: &["gate-tokenizer"],
+};
+
 /// Nanbeige4.3-33B's set (`llama` SentencePiece, byte fallback, BOS `<|im_start|>`): the ids keep the BOS that
 /// `llama-tokenize` adds.
 pub static NANBEIGE43: Family = Family {
@@ -226,6 +249,10 @@ fn musespark_model() -> Result<String, RefError> {
     Ok(super::musespark::MODEL.to_string())
 }
 
+fn mistrallarge4_model() -> Result<String, RefError> {
+    Ok(super::mistrallarge4::MODEL.to_string())
+}
+
 fn nanbeige43_model() -> Result<String, RefError> {
     Ok(super::llama::dense::MODEL.to_string())
 }
@@ -239,6 +266,7 @@ pub static FAMILIES: &[&Family] = &[
     &NEMOTRON,
     &MINIMAXM3,
     &MUSESPARK,
+    &MISTRALLARGE4,
     &NANBEIGE43,
     &super::gemma_embedding::TOKENIZER,
 ];
@@ -246,9 +274,9 @@ pub static FAMILIES: &[&Family] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCH, FAMILIES, GLM5NEXT, MAINLINE_BUILD, MINIMAXM3, MINIMAXM3_BUILD, MUSESPARK,
-        MUSESPARK_BUILD, NANBEIGE43, NEMOTRON, NEMOTRON_BUILD, QWEN3MOE, QWEN38, TILDE_BUILD,
-        TOKREF_BUILD, V41,
+        ARCH, FAMILIES, GLM5NEXT, MAINLINE_BUILD, MINIMAXM3, MINIMAXM3_BUILD, MISTRALLARGE4,
+        MISTRALLARGE4_BUILD, MUSESPARK, MUSESPARK_BUILD, NANBEIGE43, NEMOTRON, NEMOTRON_BUILD,
+        QWEN3MOE, QWEN38, TILDE_BUILD, TOKREF_BUILD, V41,
     };
     use crate::RefError;
     use crate::emb2::LCPP_BUILD;
@@ -309,7 +337,7 @@ mod tests {
     /// without a patch are mainline's, whose commit the pin states as it is.
     #[test]
     fn the_vocabularies_are_rows_of_the_table() {
-        assert_eq!(crate::arch::families(ARCH).len(), 9);
+        assert_eq!(crate::arch::families(ARCH).len(), 10);
         for f in FAMILIES {
             assert!(std::ptr::eq(crate::arch::named(f.name).unwrap_or(&V41), *f));
             assert!(
@@ -331,6 +359,7 @@ mod tests {
             (&NEMOTRON, NEMOTRON_BUILD, false),
             (&MINIMAXM3, MINIMAXM3_BUILD, true),
             (&MUSESPARK, MUSESPARK_BUILD, false),
+            (&MISTRALLARGE4, MISTRALLARGE4_BUILD, false),
             (&NANBEIGE43, MAINLINE_BUILD, false),
             (&super::super::gemma_embedding::TOKENIZER, LCPP_BUILD, false),
         ] {
@@ -353,6 +382,7 @@ mod tests {
                 "ref-tokenizer-nemotron",
                 "ref-tokenizer-minimaxm3",
                 "ref-tokenizer-musespark",
+                "ref-tokenizer-mistrallarge4",
                 "ref-tokenizer-nanbeige43",
                 "ref-tokenizer-llama",
             ]

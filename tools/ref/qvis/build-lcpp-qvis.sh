@@ -17,6 +17,8 @@
 #   LCPP_BUILD_TARGETS  the targets, comma-separated (default llama,mtmd,llama-common)
 #   LCPP_BUILD_CUDA_ARCH  CMAKE_CUDA_ARCHITECTURES (default 86, the box's two cards; 121a on a DGX Spark's GB10)
 #   LCPP_BUILD_CUDA     the CUDA toolkit nvcc comes from (default /usr/local/cuda-13.3)
+#   LCPP_BUILD_CPU_ONLY 1 builds the CPU backend alone (GGML_CUDA=OFF, GGML_NATIVE=ON, no nvcc); 0, the default, the CUDA
+#                       build above; any other value is refused (rc 64). Mistral Large 4's oracle tree is the CPU-only one
 #
 # A clone of the box's local clone /home/user/llama.cpp (objects shared, `git clone --shared`) at the tree, the pin fetched from
 # GitHub and checked out detached. Every git and build step runs as the trees' owner `user` when the script runs as root (the
@@ -35,6 +37,7 @@ SRC=/home/user/llama.cpp
 MAINLINE=/home/user/llama.cpp-mainline
 CUDA=${LCPP_BUILD_CUDA:-/usr/local/cuda-13.3}
 CUDA_ARCH=${LCPP_BUILD_CUDA_ARCH:-86}
+CPU_ONLY=${LCPP_BUILD_CPU_ONLY:-0}
 IFS=, read -ra TARGETS <<< "${LCPP_BUILD_TARGETS:-llama,mtmd,llama-common}"
 NVCC=$CUDA/bin/nvcc
 USER_PATH=$CUDA/bin:/usr/bin:/bin
@@ -55,6 +58,10 @@ fail() {
   exit "${2:-2}"
 }
 [[ $PIN =~ ^[0-9a-f]{40}$ ]] || fail "LCPP_BUILD_PIN='$PIN' is not a full commit id (40 lower-case hex digits)" 64
+case $CPU_ONLY in
+  0 | 1) ;;
+  *) fail "LCPP_BUILD_CPU_ONLY='$CPU_ONLY' is not 0 or 1" 64 ;;
+esac
 # Every git and build step from /: the track directory holds a .git file naming the Mac's worktree, which git would find
 # from there, and the user `user` cannot enter /root.
 cd / || fail "cannot cd /"
@@ -77,10 +84,16 @@ echo "build-lcpp-qvis: HEAD $(ugit log -1 --format='%H %cI %s')"
 echo "build-lcpp-qvis: short $(ugit rev-parse --short=9 HEAD)"
 echo "build-lcpp-qvis: mainline's command-line options ($MAINLINE/build/CMakeCache.txt):"
 grep -E ':UNINITIALIZED=|^GGML_CUDA:BOOL=|^CMAKE_BUILD_TYPE:|^CMAKE_CUDA_COMPILER:' "$MAINLINE/build/CMakeCache.txt" | sed 's/^/    /'
-echo "build-lcpp-qvis: targets ${TARGETS[*]}, CUDA architecture $CUDA_ARCH, $NVCC"
+if [ "$CPU_ONLY" = 1 ]; then
+  BACKEND_FLAGS=(-DGGML_CUDA=OFF -DGGML_NATIVE=ON)
+  echo "build-lcpp-qvis: targets ${TARGETS[*]}, CPU backend only"
+else
+  BACKEND_FLAGS=(-DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH" "-DCMAKE_CUDA_COMPILER=$NVCC")
+  echo "build-lcpp-qvis: targets ${TARGETS[*]}, CUDA architecture $CUDA_ARCH, $NVCC"
+fi
 t0=$(date +%s)
-as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH" -DLLAMA_CURL=OFF \
-  -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$NVCC" || fail "cmake configure failed"
+as_user cmake -S "$TREE" -B "$TREE/build" "${BACKEND_FLAGS[@]}" -DLLAMA_CURL=OFF \
+  -DCMAKE_BUILD_TYPE=Release || fail "cmake configure failed"
 rc=0
 lease_bounded 1740 taskset -c 0-31 nice -n 19 "${AS_USER[@]}" \
   cmake --build "$TREE/build" --config Release -j 16 --target "${TARGETS[@]}" || rc=$?

@@ -1,0 +1,5 @@
+fn main() {
+    let total: u64 = (1..=1000).sum();
+    println!("{}", total); // 500500
+    let mean = total / 1000;
+}

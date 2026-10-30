@@ -41,6 +41,7 @@
 #   nemotron  Nemotron 3 Nano 4B                  llama.cpp-19cce691 (pixtral; --no-bos, below)        ref-tokenizer-nemotron
 #   minimaxm3 MiniMax-M3-UD-IQ4_XS's first shard  llama.cpp-solar2 (minimax-m2; --no-bos, below)       ref-tokenizer-minimaxm3
 #   musespark Muse-Spark-Open's first shard       llama.cpp-muse (gpt-4o; --no-bos, below)             ref-tokenizer-musespark
+#   mistrallarge4 Mistral Large 4's first shard   llama.cpp-ml4 (tekken-num3; --no-bos, below)         ref-tokenizer-mistrallarge4
 #   gemma4    EmbeddingGemma 2's Q8_0 file        mainline 6868a52cb (the gemma-embedding2 profile's  ref-tokenizer-gemma4
 #                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
 #   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
@@ -80,7 +81,7 @@
 # takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
 # mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|nanbeige43|gemma4|llama|all [--cases-only]
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|mistrallarge4|nanbeige43|gemma4|llama|all [--cases-only]
 # --cases-only writes the fixed cases without reading the corpus trees.
 set -euo pipefail
 
@@ -163,15 +164,15 @@ case $#:${2:-} in
 esac
 
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | nanbeige43 | gemma4 | llama) ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | mistrallarge4 | nanbeige43 | gemma4 | llama) ;;
   all)
-    for v in v41 qwen3moe glm5next qwen38 nemotron musespark nanbeige43; do
+    for v in v41 qwen3moe glm5next qwen38 nemotron musespark mistrallarge4 nanbeige43; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v" "${@:2}"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|nanbeige43|gemma4|llama|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|mistrallarge4|nanbeige43|gemma4|llama|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -286,6 +287,21 @@ profile() {
       SHARD=/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf
       SET=ref-tokenizer-musespark
       # Nemotron's flags, a mainline llama-tokenize too: the file sets add_bos_token, and the gate compares the text's own ids.
+      REF_FLAGS=(--no-bos --no-escape)
+      ;;
+    mistrallarge4)
+      # llama.cpp-ml4: mainline at PR 31376's merge (the mistrallarge4 node-dump tree, crates/refset/src/arch/mistrallarge4), no
+      # patch. Its `tekken-num3` pre is the Tekken regex with digit runs grouped by three from the right, and its UTF-8 decoder
+      # is the strict one the `gpt-4o` row of the Muse tree has (`Pre::strict_utf8`).
+      ORACLE_TREE=/home/user/llama.cpp-ml4
+      BUILD_PIN=78feec062d50ec9e8940244cac918ac4480b60cb BUILD_PATCH=
+      TREE_FLAGS=()
+      # The file lives on the root drive, not under /models.
+      SHARD=/home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf
+      SET=ref-tokenizer-mistrallarge4
+      # The chat template's special tokens, digit runs 1..10 and the other cases of this vocabulary after the shared ones.
+      EXTRA=$ROOT/crates/tokenizer/tests/cases-mistrallarge4.txt
+      # The file sets add_bos_token (BOS is <s>), and the gate compares the text's own ids, as Muse's does.
       REF_FLAGS=(--no-bos --no-escape)
       ;;
     nanbeige43)

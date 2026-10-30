@@ -3,7 +3,8 @@
 //! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer),
 //! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`), Qwen3.8-Flash-Next's
 //! (`qwen35`), Nemotron 3 Nano 4B's (`pixtral`), MiniMax-M3's (`minimax-m2`)
-//! and Nanbeige4.3-33B's (`llama`, SentencePiece with byte fallback).
+//! Muse Spark Open's (`gpt-4o`), Mistral Large 4's (`tekken-num3`, with cases of its own for its
+//! digit runs and special tokens) and Nanbeige4.3-33B's (`llama`, SentencePiece with byte fallback).
 //!
 //! The reference's sets are written once by `just dump-ref-tokenizer`
 //! (`crates/tokenizer/tools/oracle.sh`) and opened here through their refset
@@ -28,7 +29,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
-use refset::arch::tokenizer::{GLM5NEXT, MUSESPARK, NANBEIGE43, NEMOTRON, QWEN3MOE, QWEN38, V41};
+use refset::arch::tokenizer::{
+    GLM5NEXT, MISTRALLARGE4, MUSESPARK, NANBEIGE43, NEMOTRON, QWEN3MOE, QWEN38, V41,
+};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
@@ -51,6 +54,9 @@ struct Vocabulary {
     /// decode to the text up to them (empty for a vocabulary whose ids round
     /// trip).
     unspelled: &'static [&'static str],
+    /// The vocabulary's own cases file, after `cases.txt`, when its set holds
+    /// any (`oracle.sh` EXTRA).
+    extra: Option<&'static [u8]>,
 }
 
 /// V4.1's first shard: the family's file, `$BLOOMERY_V41_DIR` or the served
@@ -61,6 +67,7 @@ fn v41() -> Vocabulary {
         ambiguous: &[],
         unspelled: &[],
         eog: &[],
+        extra: None,
     }
 }
 
@@ -74,6 +81,7 @@ fn qwen3moe() -> Vocabulary {
         ambiguous: &["eot"],
         unspelled: &[],
         eog: &["<|im_end|>", "<|endoftext|>"],
+        extra: None,
     }
 }
 
@@ -85,6 +93,7 @@ fn glm5next() -> Vocabulary {
         unspelled: &[],
         // The header's eos, eot and eom: a generation ends on any of the three.
         eog: &["<|endoftext|>", "<|user|>", "<|observation|>"],
+        extra: None,
     }
 }
 
@@ -97,6 +106,7 @@ fn qwen38() -> Vocabulary {
         ambiguous: &["eot"],
         unspelled: &[],
         eog: &["<|im_end|>", "<|endoftext|>"],
+        extra: None,
     }
 }
 
@@ -109,6 +119,7 @@ fn nemotron() -> Vocabulary {
         ambiguous: &[],
         unspelled: &[],
         eog: &["</s>", "<|im_end|>"],
+        extra: None,
     }
 }
 
@@ -122,6 +133,20 @@ fn musespark() -> Vocabulary {
         ambiguous: &[],
         eog: &["<|eot|>"],
         unspelled: &[],
+        extra: None,
+    }
+}
+
+/// Mistral Large 4's first shard on the box (`tekken-num3`: the Tekken regex with digit runs
+/// cut in threes from the right). The header carries no `eot_token_id` key; generation ends on
+/// the eos. The cases after `cases.txt` are the vocabulary's own.
+fn mistrallarge4() -> Vocabulary {
+    Vocabulary {
+        family: &MISTRALLARGE4,
+        ambiguous: &[],
+        eog: &["</s>"],
+        unspelled: &[],
+        extra: Some(include_bytes!("cases-mistrallarge4.txt")),
     }
 }
 
@@ -135,15 +160,22 @@ fn nanbeige43() -> Vocabulary {
         ambiguous: &["eot"],
         eog: &["<|im_end|>", "<|endoftext|>"],
         unspelled: &[],
+        extra: None,
     }
 }
 
 /// The vocabulary's set opened through its family and held to `cases.txt`;
 /// a refusal names the recipe that re-takes it.
 fn open(f: &Family) -> TokenizerSet {
+    open_with(f, None)
+}
+
+/// [`open`] for a set that also holds the vocabulary's own cases, `extra` the
+/// file they come from.
+fn open_with(f: &Family, extra: Option<&[u8]>) -> TokenizerSet {
     let set = TokenizerSet::open(&f.path(f.sets[0]), f).unwrap_or_else(|e| refuse(f, &e));
-    // The hand-picked cases file the sets' case texts must come from.
-    set.check_cases(include_bytes!("cases.txt"), None)
+    // The hand-picked cases files the sets' case texts must come from.
+    set.check_cases(include_bytes!("cases.txt"), extra)
         .unwrap_or_else(|e| refuse(f, &e));
     set
 }
@@ -266,7 +298,7 @@ fn check(tok: &Tokenizer, v: &Vocabulary, name: &str, text: &Text, failures: &mu
 /// Every engram corpus text: ids equal the reference's, both parse modes.
 fn corpus_ids_equal_reference(v: &Vocabulary) {
     let tok = load(v.family);
-    let set = open(v.family);
+    let set = open_with(v.family, v.extra);
     let names: Vec<&str> = set.corpora().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
@@ -337,7 +369,7 @@ fn cases_equal_reference(v: &Vocabulary) {
     let tok = load(v.family);
     equality_is_well_defined(&tok, v);
 
-    let set = open(v.family);
+    let set = open_with(v.family, v.extra);
     let cases: Vec<&Text> = set.cases().collect();
     assert!(
         cases.len() >= 20,
@@ -514,4 +546,16 @@ fn hw_musespark_corpus_ids_equal_reference() {
 #[ignore = "needs the musespark vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_musespark_cases_equal_reference() {
     cases_equal_reference(&musespark());
+}
+
+#[test]
+#[ignore = "needs the mistrallarge4 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_mistrallarge4_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&mistrallarge4());
+}
+
+#[test]
+#[ignore = "needs the mistrallarge4 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_mistrallarge4_cases_equal_reference() {
+    cases_equal_reference(&mistrallarge4());
 }
