@@ -833,7 +833,8 @@ pub(crate) fn call(
             })
         })
         .collect::<Result<Vec<_>, Refusal>>()?;
-    Ok(vec![Part::Text(open.to_owned()), Part::Pick(alts)])
+    let lead = (!open.is_empty()).then(|| Part::Text(open.to_owned()));
+    Ok(lead.into_iter().chain([Part::Pick(alts)]).collect())
 }
 
 /// The name a function or an argument may have: text a chat format can write

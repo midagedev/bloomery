@@ -4798,6 +4798,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
             Tools::QwenXml(framing, ParamKinds::of_tools(b.get("tools")))
         }
         ToolFormat::MuseSpark => Tools::MuseSpark,
+        ToolFormat::Mistral => Tools::Mistral,
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
@@ -4806,8 +4807,8 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
                           (DSML, GLM's and Solar's key/value markup, Hermes' and Qwen's XML, \
-                          and Muse's recipient markup are parsed): send the request without \
-                          tools or with tool_choice \"none\""
+                          Muse's recipient markup and Mistral's [TOOL_CALLS] are parsed): send \
+                          the request without tools or with tool_choice \"none\""
                     .to_owned(),
             });
         }

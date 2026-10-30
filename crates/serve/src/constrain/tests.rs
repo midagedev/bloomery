@@ -19,6 +19,7 @@ use crate::genloop::{
 };
 use crate::glmxml::{ArgTypes, KvScan, KvSpelling};
 use crate::hermes::HermesScan;
+use crate::mistral::MistralScan;
 use crate::mock::SPECIALS;
 use crate::qwenxml::{CALL_CLOSE, CALL_OPEN, Framing, ParamKinds, QwenScan};
 use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkSplit, ThinkTags};
@@ -1171,6 +1172,10 @@ fn markup(format: ToolFormat) -> [String; 2] {
             " to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"unit\">celsius</atem:parameter>\n<atem:parameter name=\"days\">2</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
             " to=search<|message|><atem:function_calls>\n<atem:invoke name=\"search\">\n<atem:parameter name=\"query\">cats</atem:parameter>\n<atem:parameter name=\"deep\">false</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
         ],
+        ToolFormat::Mistral => [
+            "[TOOL_CALLS]get_weather[ARGS]{\"unit\": \"celsius\", \"days\": 2}",
+            "[TOOL_CALLS]search[ARGS]{\"query\": \"cats\", \"deep\": false}",
+        ],
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     texts.map(|t| match format {
@@ -1216,6 +1221,12 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().calls);
             out
         }
+        ToolFormat::Mistral => {
+            let mut s = MistralScan::default();
+            let mut out = s.push(text).expect("parses");
+            out.calls.extend(s.finish().expect("closes").calls);
+            out
+        }
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     assert!(
@@ -1253,6 +1264,7 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::MuseSpark,
+        ToolFormat::Mistral,
     ] {
         let [weather, search] = markup(format);
         let required = json!({"tools": tools, "tool_choice": "required"});
@@ -1316,6 +1328,7 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::MuseSpark,
+        ToolFormat::Mistral,
     ] {
         let c = build(
             &tok,
@@ -1897,6 +1910,7 @@ fn parser(format: ToolFormat, tools: &Value) -> ChatParser {
         }
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
         ToolFormat::MuseSpark => Tools::MuseSpark,
+        ToolFormat::Mistral => Tools::Mistral,
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     ChatParser::with_tools("", ReasoningFormat::None, Some(scan))
