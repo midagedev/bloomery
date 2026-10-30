@@ -1737,9 +1737,7 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use super::{
-        Acted, Action, ReqName, Shared, finish_line, intervals, note_due, progress_line, serve,
-    };
+    use super::{Acted, Action, ReqName, Shared, finish_line, progress_line, serve};
     use crate::api::{End, EngineFailure, relock};
     use crate::genloop::{Slot, StopKind, Timings, cause_word};
     use crate::sched::{Board, FifoPicker, Refusal, Reserve};
@@ -1814,17 +1812,25 @@ mod tests {
     /// next token, not a run of them.
     #[test]
     fn a_progress_stderr_line_every_interval_of_generation() {
-        let t = |ms: f64| Timings {
-            predicted_ms: ms,
-            ..Timings::default()
+        let sh = Shared::new(
+            Board::new(1, 4, Box::new(FifoPicker)),
+            mpsc::channel().0,
+            sampling::reference_factory(),
+        );
+        let name = ReqName {
+            id: 0,
+            route: "/completion".to_owned(),
+            choice: 0,
+            choices: 1,
         };
-        // What the tick does: a due line counts the intervals passed.
+        // One token through the generation's own tick: whether it printed a line.
         let tick = |noted: &mut usize, ms: f64| {
-            let due = note_due(*noted, &t(ms));
-            if due {
-                *noted = intervals(&t(ms));
-            }
-            due
+            let before = sh.notes().len();
+            super::tick_of(&sh, 0, &name, noted)(&Timings {
+                predicted_ms: ms,
+                ..Timings::default()
+            });
+            sh.notes().len() - before == 1
         };
         let mut noted = 0;
         assert!(!tick(&mut noted, 0.0));
