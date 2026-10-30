@@ -199,7 +199,8 @@ use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::QueryNorm;
 use crate::gemm::{
-    DownW, DownWin, GateUp, GemmAct, GemmAct32, GemmInput, GemmRoute, MmaForm, enqueue_gemm_batch,
+    DownW, DownWin, GateUp, Gemm32Weight, GemmAct, GemmAct32, GemmInput, GemmRoute, MmaForm,
+    enqueue_gemm_batch,
 };
 use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, Streams, WideMixArgs};
 use crate::head::Head;
@@ -901,9 +902,9 @@ pub(super) fn down_weight<'a>(
     l: usize,
     ty: GgmlType,
     w: StackW<'a>,
-) -> Result<DownW<'a>, GpuError> {
+) -> Result<Gemm32Weight<'a>, GpuError> {
     match w.route(ty) {
-        Some(RouteW::Blocks32(w)) => Ok(DownW::Blocks32(w)),
+        Some(RouteW::Blocks32(w)) => Ok(w),
         Some(RouteW::Grouped(..)) | None => Err(GpuError::shape(
             what,
             format!("layer {l}: a down stack of {ty}, which no route GEMM reads"),
@@ -941,7 +942,7 @@ fn enqueue_places_batch(
     (walk_ids, ids): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
     map: &DeviceBuffer<u32>,
     gate_up: GateUp<'_>,
-    down: DownW<'_>,
+    down: Gemm32Weight<'_>,
     (n, n_places): (usize, usize),
     sink: FaultSink,
     down_y: &mut DownWin,
@@ -969,12 +970,12 @@ fn enqueue_places_batch(
         sel,
     )?;
     enqueue_gemm_batch(
-        (c.k.gemm, c.k.g32),
+        (&c.k.gemm, &c.k.g32),
         stream,
         ids,
         map,
         gate_up,
-        down,
+        DownW::Blocks32(down),
         (n, n_places),
         (geo::N_USED, geo::FF, geo::HIDDEN),
         sink,
