@@ -498,8 +498,10 @@ pub enum IndexKeys {
     /// Projected from the layer input over the raw positions: the projection
     /// of the input, a LayerNorm with a gain and a bias on it (at `norm_eps`,
     /// `attention.layer_norm_epsilon`), the layer's own [`Latent::rope`]
-    /// turning its head's first `dims` values (none on a layer whose rope is
-    /// `None`), then the Hadamard rotation, the keys stored f16 — DeepSeek's
+    /// turning `dims` values of each head (the file's first `dims`, which the
+    /// reader moves to the head's tail, where V4.1's index keys turn theirs;
+    /// none on a layer whose rope is `None`), then the Hadamard rotation, the
+    /// keys stored f16 — DeepSeek's
     /// lightning index keys, one per position. The scoring query is the same
     /// form: the LayerNorm-normed input projected by the indexer's own
     /// `attn_q_b`.
