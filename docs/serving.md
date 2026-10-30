@@ -805,15 +805,17 @@ it is refused, and a request with an image is a 501.
 
 Inline PNG/JPEG input shares a fixed 64 MiB decoded-RGB budget across a chat
 request's new images and across every image of a batched embedding input. An
-image whose file the server has already prepared for its encoder is served from
-the prepared-image cache without a decode or a prepare and draws on none of that
-budget, so a conversation an agent client resends whole every turn keeps fitting
-however many screenshots its history holds (the file is still hashed each
-request; that is the key). The cache is one per server, beside its one encoder,
-and retains at most 512 MiB, the least recently used first out; a 1280×720
+image whose key is resident in the prepared-image cache skips decoding and
+preparation and draws on none of that budget; its file is still loaded and
+hashed (the hash is the key). Evicted images are decoded and prepared again and
+consume the decode budget like new ones. The cache is one per server, beside its
+encoder, and retains at most 512 MiB, the least recently used entries first out;
+how many images that is depends on the encoder and the image size (a 1280×720
 screenshot prepares to about 5.6 MB on V4.1 and about 11.3 MB on the Qwen3-VL
-and GLM encoders [derived], so the bound holds 90 or more such screenshots on
-every image seat. Image headers are checked before allocating decoder output,
+and GLM encoders [derived], about 90 and 45 such screenshots). `/metrics` counts
+its hits and misses (`prepared_image_hits_total`, `prepared_image_misses_total`)
+and its retained bytes and images on a server with an encoder. Image headers
+are checked before allocating decoder output,
 and all of a request's new images are decoded within the budget before model
 preparation starts; PNG temporary output must fit the remaining budget too. A
 request whose new images together pass the budget is a named 400, not a large

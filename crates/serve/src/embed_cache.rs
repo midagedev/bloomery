@@ -18,28 +18,45 @@ pub enum Value {
 }
 
 /// Retained values and entry metadata are charged; container slack and allocator overhead are not.
-pub struct Cache {
+/// `charge` prices one value; the server's prepared images share this order through their own.
+pub struct Cache<T = Value> {
     limit: usize,
     bytes: usize,
-    entries: VecDeque<([u8; 32], Value)>,
+    entries: VecDeque<([u8; 32], T)>,
+    charge: fn(&T) -> usize,
 }
 
 impl Cache {
     /// Zero disables caching without allocating an owner.
     #[must_use]
     pub fn shared(limit: usize) -> Option<Shared> {
-        (limit > 0).then(|| {
-            Arc::new(Mutex::new(Self {
-                limit,
-                bytes: 0,
-                entries: VecDeque::new(),
-            }))
-        })
+        (limit > 0).then(|| Arc::new(Mutex::new(Self::new(limit, Self::charge_value))))
+    }
+
+    fn charge_value(value: &Value) -> usize {
+        size_of::<([u8; 32], Value)>()
+            + match value {
+                Value::Vector(v) => v.capacity() * size_of::<f32>(),
+                Value::Image(v) => v.capacity() * size_of::<u16>(),
+            }
+    }
+}
+
+impl<T: Clone> Cache<T> {
+    /// A cache of at most `limit` charged bytes; zero retains nothing.
+    #[must_use]
+    pub fn new(limit: usize, charge: fn(&T) -> usize) -> Self {
+        Self {
+            limit,
+            bytes: 0,
+            entries: VecDeque::new(),
+            charge,
+        }
     }
 
     /// A hit becomes the most recently used entry. The search starts at that end, where a repeated
     /// request's entry sits.
-    pub fn get(&mut self, key: &[u8; 32]) -> Option<Value> {
+    pub fn get(&mut self, key: &[u8; 32]) -> Option<T> {
         let at = self.entries.iter().rposition(|(k, _)| k == key)?;
         let entry = self.entries.remove(at).expect("the entry was found");
         let value = entry.1.clone();
@@ -48,29 +65,44 @@ impl Cache {
     }
 
     /// Oversized results are not retained and do not evict useful entries.
-    pub fn insert(&mut self, key: [u8; 32], value: Value) {
-        let bytes = Self::charge(&value);
+    pub fn insert(&mut self, key: [u8; 32], value: T) {
+        let bytes = (self.charge)(&value);
         if bytes > self.limit {
             return;
         }
         if let Some(at) = self.entries.iter().position(|(k, _)| *k == key) {
             let (_, old) = self.entries.remove(at).expect("the entry was found");
-            self.bytes -= Self::charge(&old);
+            self.bytes -= (self.charge)(&old);
         }
         while self.bytes > self.limit - bytes {
             let (_, old) = self.entries.pop_front().expect("charged entries exist");
-            self.bytes -= Self::charge(&old);
+            self.bytes -= (self.charge)(&old);
         }
         self.bytes += bytes;
         self.entries.push_back((key, value));
     }
 
-    fn charge(value: &Value) -> usize {
-        size_of::<([u8; 32], Value)>()
-            + match value {
-                Value::Vector(v) => v.capacity() * size_of::<f32>(),
-                Value::Image(v) => v.capacity() * size_of::<u16>(),
-            }
+    /// The charged bytes retained now.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The bound the charged bytes stay within.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The entries retained now.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -159,7 +191,7 @@ mod tests {
     fn one_budget_evicts_the_least_recent_vector_or_image() {
         assert!(Cache::shared(0).is_none());
         let v = || Value::Vector(vec![1.0, -0.0]);
-        let bytes = Cache::charge(&v());
+        let bytes = Cache::charge_value(&v());
         let shared = Cache::shared(2 * bytes).unwrap();
         let mut cache = shared.lock().unwrap();
         cache.insert([1; 32], v());
@@ -184,7 +216,7 @@ mod tests {
     #[test]
     fn a_key_holds_one_entry_and_a_hit_is_found_wherever_it_sits() {
         let v = |x: f32| Value::Vector(vec![x]);
-        let shared = Cache::shared(8 * Cache::charge(&v(0.0))).unwrap();
+        let shared = Cache::shared(8 * Cache::charge_value(&v(0.0))).unwrap();
         let mut cache = shared.lock().unwrap();
         for k in 1..=4u8 {
             cache.insert([k; 32], v(f32::from(k)));

@@ -750,9 +750,9 @@ struct State {
     /// and refused by name otherwise. Read without the engine.
     media: Option<SharedMediaModel>,
     /// The images this server has already prepared for its model
-    /// ([`media::PreparedImages`]): a request's already-sent images are served
-    /// from it without a decode or a prepare, so a resent history draws on none
-    /// of the decode budget.
+    /// ([`media::PreparedImages`]): a request's already-sent images it still
+    /// holds are served without a decode or a prepare and draw on none of the
+    /// decode budget.
     images: media::PreparedImages,
     /// What decodes a clip: ffmpeg found at startup, a decoder a caller set
     /// ([`Server::with_video`]), or the reason there is none. A clip is taken
@@ -2912,8 +2912,39 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 s.park_budget.to_string(),
             ),
         ];
+        let held = state.images.stats();
+        let images: [(&str, &str, &str, String); 4] = [
+            (
+                "counter",
+                "prepared_image_hits_total",
+                "Request images served from the prepared-image cache, without a decode or a prepare",
+                held.hits.to_string(),
+            ),
+            (
+                "counter",
+                "prepared_image_misses_total",
+                "Request images the prepared-image cache did not hold: decoded and prepared",
+                held.misses.to_string(),
+            ),
+            (
+                "gauge",
+                "prepared_image_bytes",
+                "Bytes the prepared-image cache retains",
+                held.bytes.to_string(),
+            ),
+            (
+                "gauge",
+                "prepared_images",
+                "Images the prepared-image cache retains",
+                held.entries.to_string(),
+            ),
+        ];
+        let vision = state.media.is_some();
         let mut out = String::new();
-        for (kind, name, help, value) in rows.into_iter().chain(swap.into_iter().filter(|_| turns))
+        for (kind, name, help, value) in rows
+            .into_iter()
+            .chain(swap.into_iter().filter(|_| turns))
+            .chain(images.into_iter().filter(|_| vision))
         {
             out.push_str(&format!(
                 "# HELP llamacpp:{name} {help}\n# TYPE llamacpp:{name} {kind}\nllamacpp:{name} {value}\n"

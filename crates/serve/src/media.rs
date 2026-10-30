@@ -11,7 +11,7 @@
 //!
 //! The images a server has prepared it keeps ([`PreparedImages`]): a request that resends them —
 //! an agent client resends its whole history every turn — is served without decoding or preparing
-//! them again, and only the images the cache holds not share the decode budget.
+//! the ones the cache still holds, and only the others share the decode budget.
 //!
 //! An image arrives only inside a `data:` URL holding a base64 PNG or JPEG, in either OpenAI form
 //! of an `image_url` part. A clip arrives as an `input_video` part's base64 `data` and `format`, or
@@ -21,8 +21,9 @@
 //! [`MediaError`] variant that names what it refused; nothing is skipped, repaired or fetched.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -81,67 +82,63 @@ fn decode_images_with_limit<'a>(
 pub type SharedMediaModel = Arc<dyn MediaModel + Send + Sync>;
 
 /// The images a server has already prepared for its one media model, keyed by the image file's
-/// bytes: a request whose image the server has already served takes its [`Prepared`] from here
-/// without a decode or a prepare, so a conversation an agent client resends whole every turn
-/// neither runs the decode budget dry nor pays the prepare again. One server holds one of these
-/// beside its one model (a prepared image depends on the model); it retains at most
-/// [`PREPARED_IMAGE_BYTES`] of heap, the least recently used first out, and an entry the whole
-/// bound cannot hold is not retained.
+/// bytes: a request whose image the server still holds takes its [`Prepared`] from here without a
+/// decode or a prepare, and that image draws on none of the decode budget. One server holds one of
+/// these beside its one model (a prepared image depends on the model); it retains at most
+/// [`PREPARED_IMAGE_BYTES`] of heap in [`crate::embed_cache::Cache`]'s LRU order. An evicted image
+/// is decoded and prepared again and is charged to the decode budget like a new one.
 pub struct PreparedImages {
-    limit: usize,
-    held: Mutex<Lru>,
+    held: Mutex<crate::embed_cache::Cache<Arc<Prepared>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
-/// The retained entries and their charge, the least recently used at the front.
-struct Lru {
-    bytes: usize,
-    entries: VecDeque<(ImageKey, Arc<Prepared>)>,
+/// What `/metrics` reads of a [`PreparedImages`]: the lookups served and missed since the start,
+/// and the bytes and entries retained now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreparedStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub bytes: usize,
+    pub entries: usize,
 }
 
 impl PreparedImages {
-    /// A cache that retains at most `limit` bytes of prepared images; 0 retains nothing (a
-    /// request's own repeats still share one decode, which needs no retention).
+    /// Retain prepared images within the byte limit; zero retains nothing (a request's own repeats
+    /// still share one decode, which needs no retention).
     #[must_use]
     pub fn new(limit: usize) -> PreparedImages {
         PreparedImages {
-            limit,
-            held: Mutex::new(Lru {
-                bytes: 0,
-                entries: VecDeque::new(),
-            }),
+            held: Mutex::new(crate::embed_cache::Cache::new(limit, |p| prepared_bytes(p))),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
-    /// The model's prepared image of `key`, moved to the cache's most recent end.
     fn get(&self, key: &ImageKey) -> Option<Arc<Prepared>> {
-        let mut held = crate::api::relock(&self.held);
-        let at = held.entries.iter().rposition(|(k, _)| k == key)?;
-        let entry = held.entries.remove(at).expect("the entry was found");
-        let prepared = Arc::clone(&entry.1);
-        held.entries.push_back(entry);
-        Some(prepared)
+        let found = crate::api::relock(&self.held).get(&key.0);
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
     }
 
-    /// Retain `key`'s prepared image, evicting the least recently used entries the bound needs
-    /// out. An entry larger than the whole bound is not retained and evicts nothing.
     fn insert(&self, key: ImageKey, prepared: Arc<Prepared>) {
-        let bytes = prepared_bytes(&prepared);
-        let mut held = crate::api::relock(&self.held);
-        if bytes > self.limit {
-            return;
+        crate::api::relock(&self.held).insert(key.0, prepared);
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> PreparedStats {
+        let held = crate::api::relock(&self.held);
+        PreparedStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            bytes: held.bytes(),
+            entries: held.len(),
         }
-        if let Some(at) = held.entries.iter().position(|(k, _)| *k == key) {
-            let (_, old) = held.entries.remove(at).expect("the entry was found");
-            held.bytes -= prepared_bytes(&old);
-        }
-        while held.bytes + bytes > self.limit {
-            let Some((_, old)) = held.entries.pop_front() else {
-                break;
-            };
-            held.bytes -= prepared_bytes(&old);
-        }
-        held.bytes += bytes;
-        held.entries.push_back((key, prepared));
     }
 }
 
@@ -386,8 +383,8 @@ impl VideoCtx {
 }
 
 /// An image's cache key: the sha256 of its file bytes. It is known before the decode, so a server
-/// whose [`PreparedImages`] holds the key serves the image without the decode, the resize and the
-/// encoder.
+/// whose [`PreparedImages`] holds the key serves the image without decoding or repeating the
+/// model's image preprocessing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImageKey(pub [u8; 32]);
 
@@ -2078,18 +2075,21 @@ mod tests {
         assert!(images.get(&key(2)).is_none(), "the least recently used");
         let held = crate::api::relock(&images.held);
         assert!(
-            held.bytes <= images.limit,
+            held.bytes() <= held.limit(),
             "{} <= {}",
-            held.bytes,
-            images.limit
+            held.bytes(),
+            held.limit()
         );
-        assert_eq!(held.entries.len(), 2);
+        assert_eq!(held.len(), 2);
         drop(held);
         // An entry the whole bound cannot hold is not retained and evicts nothing.
         let huge = image(4 * one);
         images.insert(key(9), Arc::clone(&huge));
         assert!(images.get(&key(1)).is_some());
         assert!(images.get(&key(9)).is_none());
+        let stats = images.stats();
+        assert_eq!((stats.hits, stats.misses, stats.entries), (4, 2, 2));
+        assert_eq!(stats.bytes, 2 * one);
     }
 
     /// The expansion's refusals reach the client as `ExpandError` wrote them: the text is the
