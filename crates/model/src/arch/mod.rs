@@ -28,6 +28,7 @@ pub mod lfm3;
 pub mod llama;
 pub mod mimo2;
 pub mod minimaxm3;
+pub mod mistrallarge4;
 pub mod musespark;
 pub mod names;
 pub mod nemotron_h;
@@ -176,7 +177,7 @@ fn architecture_is(is: &str) -> PlacementError {
 
 /// An architecture a file's `general.architecture` names, when this crate has
 /// a reader or a program for it. Flint has a reader and no executable program;
-/// `muse-spark` has a reader and no program.
+/// `muse-spark` and `mistral-large4` have a reader and no program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -194,6 +195,11 @@ pub enum Arch {
     GemmaEmbedding2,
     Flint,
     MuseSpark,
+    /// Mistral Large 4: MLA with no query latent, SSMax, a lightning indexer
+    /// over keys from the layer input, KV sharing and NoPE layers the file's
+    /// arrays name, over softmax-routed experts with one shared. No
+    /// executable program is registered.
+    MistralLarge4,
 }
 
 impl Arch {
@@ -229,6 +235,7 @@ impl Arch {
             GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
             "flint" => Ok(Arch::Flint),
             "muse-spark" => Ok(Arch::MuseSpark),
+            "mistral-large4" => Ok(Arch::MistralLarge4),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -257,6 +264,7 @@ impl Arch {
             Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
             Arch::Flint => "flint",
             Arch::MuseSpark => "muse-spark",
+            Arch::MistralLarge4 => "mistral-large4",
         }
     }
 }
@@ -1270,6 +1278,7 @@ mod tests {
             Arch::GemmaEmbedding2,
             Arch::Flint,
             Arch::MuseSpark,
+            Arch::MistralLarge4,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }
