@@ -9,7 +9,7 @@ use super::oracle::Rng;
 
 /// One matrix of random blocks: random bytes, with the scales (and the
 /// mins, the biases) small and finite — an f16 pair in [0.0005, 0.004] for
-/// Q4_K, Q6_K and Q8_0, a BF16 pair for A4's groups, and an f16 pair in
+/// Q4_K, Q6_K and Q8_0, a BF16 pair for A4's and A8's groups, and an f16 pair in
 /// [0.0001, 0.0008] for Q5_K: under its 6-bit sub-scales and 5-bit codes the
 /// wider range's weights reach 0.004 · 63 · 31, and their pair outputs pass
 /// the half range a GEMM's f16 operand takes.
@@ -57,10 +57,16 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
             Quant::Q6K => b[208..210].copy_from_slice(&small_f16(&mut rng)),
             Quant::Q8_0 => b[0..2].copy_from_slice(&small_f16(&mut rng)),
             // A group: the scale and the bias at its end, both BF16, so the
-            // reader's finiteness check takes the matrix.
+            // reader's finiteness check takes the matrix. A8's codes span
+            // the byte, so its values reach 0.004 · 255 where A4's reach
+            // 0.004 · 15.
             Quant::A4 => {
                 b[32..34].copy_from_slice(&small_bf16(&mut rng));
                 b[34..36].copy_from_slice(&zero_bias);
+            }
+            Quant::A8 => {
+                b[64..66].copy_from_slice(&small_bf16(&mut rng));
+                b[66..68].copy_from_slice(&zero_bias);
             }
             Quant::F32 => unreachable!("F32 rows are built above"),
         }

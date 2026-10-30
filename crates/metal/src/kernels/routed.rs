@@ -114,6 +114,7 @@ pub(crate) struct RoutedPipelines {
     q4k: RoutedFamily,
     q6k: RoutedFamily,
     a4: RoutedFamily,
+    a8: RoutedFamily,
     q8_0: RoutedFamily,
     q5k: RoutedFamily,
     /// The pair tile of a shared expert of another type than the stacks, a
@@ -139,6 +140,7 @@ impl RoutedPipelines {
             q4k: RoutedFamily::new(gemm, "q4k")?,
             q6k: RoutedFamily::new(gemm, "q6k")?,
             a4: RoutedFamily::new(gemm, "a4")?,
+            a8: RoutedFamily::new(gemm, "a8")?,
             q8_0: RoutedFamily::new(gemm, "q8_0")?,
             q5k: RoutedFamily::new(gemm, "q5k")?,
             apart_pair: apart_tiles(library, &super::APART_GATE_UP, "pair")?,
@@ -171,6 +173,7 @@ impl RoutedPipelines {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
             Quant::A4 => &self.a4,
+            Quant::A8 => &self.a8,
             Quant::Q8_0 => &self.q8_0,
             Quant::Q5K => &self.q5k,
             Quant::F32 => return None,

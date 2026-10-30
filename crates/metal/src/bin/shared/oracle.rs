@@ -42,6 +42,16 @@
 //! lane's sum over its `ceil(nb / 8)` blocks, and the 31 adds of the SIMD
 //! group: `n = 9 + ceil(nb / 8) + 31`.
 //!
+//! **A8** (MLX's affine 8-bit, quant.metal's `A8`) factors a weight as A4's
+//! `s q + b`, so the bound is on A4's magnitudes (`M_c = |s| q + |b|`, the
+//! groups with both sign bits cleared, dequantized by the same reader). The
+//! longest path is A4's own count over its own tree: the product (1), the
+//! four-term chain of its accumulator (3), the three combine adds (A8's are
+//! plain adds, the codes unpacked to their values; no power-of-two product,
+//! and none is needed), the product by the scale (1) and the bias side's add
+//! (1), the lane's sum over its `ceil(nb / 8)` blocks, and the 31 adds of
+//! the SIMD group: `n = 9 + ceil(nb / 8) + 31`.
+//!
 //! **Q8_0** (quant.metal's `Q8_0`), one term `d * q * x`, `q` an integer: the
 //! product `q * x` (1), the eight-term chain of the block's code dot (7: its
 //! first add is to zero, exact), the product by `d` (1), the lane's sum over
@@ -73,7 +83,7 @@
 //! product at the end (1), and the scale itself: `s = rsqrt(S / K + eps)`, `S`
 //! the sum of squares in the kernel's own order (a square, two adds, the lane's
 //! chain of `8 ceil(nb / 4)` adds for Q4_K and Q5_K (one load), `4 ceil(nb /
-//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4, `2 ceil(nb / 8)` for Q8_0 or `ceil(nb / 8)` for F32, the 31
+//! 2)` for Q6_K, `4 ceil(nb / 8)` for A4 and A8, `2 ceil(nb / 8)` for Q8_0 or `ceil(nb / 8)` for F32, the 31
 //! adds of the SIMD group), then the division and the addition. `s` is off
 //! by at most `(1 - t)^(-1/2) - 1` for `t = G(nS + 2)` (the worse direction),
 //! and by the library `rsqrt`'s own error, taken as `RSQRT_ULP` units in the
@@ -194,6 +204,15 @@ const Q6K_STORE_BASE: usize = 9;
 /// product and the bias add, as this module's doc derives.
 const A4_STORE_BASE: usize = 9;
 
+/// The operations of an A8 store path before the lane's blocks and the SIMD
+/// group's sum: A4's own count over its own tree, as this module's doc
+/// derives (the one-byte codes unpack to their values, so the combine adds
+/// carry no power-of-two product).
+///
+/// PIN(2026-10-30): the model in this module's doc, and no measured error,
+/// sets the band.
+const A8_STORE_BASE: usize = 9;
+
 /// The operations of a Q8_0 store path before the lane's blocks and the SIMD
 /// group's sum: the product, the eight-term chain and the scale product, as
 /// this module's doc derives.
@@ -285,6 +304,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
         Quant::Q4K => (nblocks.div_ceil(4), Q4K_STORE_BASE),
         Quant::Q6K => (nblocks.div_ceil(2), Q6K_STORE_BASE),
         Quant::A4 => (nblocks.div_ceil(8), A4_STORE_BASE),
+        Quant::A8 => (nblocks.div_ceil(8), A8_STORE_BASE),
         Quant::Q8_0 => (nblocks.div_ceil(8), Q8_0_STORE_BASE),
         Quant::Q5K => (nblocks.div_ceil(4), Q5K_STORE_BASE),
         Quant::F32 => (nblocks.div_ceil(8), F32_STORE_BASE),
@@ -299,7 +319,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
             let chain = match quant {
                 Quant::Q4K | Quant::Q5K => 8 * lane_blocks,
                 Quant::Q6K => 4 * lane_blocks,
-                Quant::A4 => 4 * lane_blocks,
+                Quant::A4 | Quant::A8 => 4 * lane_blocks,
                 Quant::Q8_0 => 2 * lane_blocks,
                 Quant::F32 => lane_blocks,
             };
@@ -376,21 +396,22 @@ fn k_magnitude_blocks(quant: Quant, row: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `block`'s bytes with the scale's and the bias's sign bits cleared: the
+/// `row`'s bytes with the scale's and the bias's sign bits cleared: the
 /// reader's dequantization of them is `|s| q + |b|`, the magnitude of the two
-/// terms of an A4 weight. Each sign bit is the top bit of the pair's second
-/// byte (little-endian).
-fn a4_magnitude_blocks(row: &[u8]) -> Vec<u8> {
-    let bytes = Quant::A4.block_bytes();
+/// terms of an affine (A4, A8) weight. Each sign bit is the top bit of the
+/// pair's second byte (little-endian), at the group's end.
+fn affine_magnitude_blocks(quant: Quant, row: &[u8]) -> Vec<u8> {
+    let bytes = quant.block_bytes();
     assert!(
         row.len().is_multiple_of(bytes),
-        "an A4 row of {} bytes is not whole {bytes}-byte groups",
+        "a {} row of {} bytes is not whole {bytes}-byte groups",
+        quant.name(),
         row.len()
     );
     let mut out = row.to_vec();
     for group in out.chunks_exact_mut(bytes) {
-        group[33] &= 0x7F;
-        group[35] &= 0x7F;
+        group[bytes - 3] &= 0x7F;
+        group[bytes - 1] &= 0x7F;
     }
     out
 }
@@ -433,8 +454,8 @@ pub fn reference(
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
             }
-            Quant::A4 => {
-                dequant_row(ty, &a4_magnitude_blocks(row), &mut m)
+            Quant::A4 | Quant::A8 => {
+                dequant_row(ty, &affine_magnitude_blocks(quant, row), &mut m)
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
             }

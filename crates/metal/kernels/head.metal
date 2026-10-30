@@ -1,6 +1,6 @@
 // The output head, two dispatches. The first is a quantized mat-vec with the
 // norm on the load over the vocabulary's rows (`head_logits_kernel`), the
-// instantiations Q6_K, A4, Q8_0 and Q5_K under their host names; its row loop
+// instantiations Q6_K, A4, A8, Q8_0 and Q5_K under their host names; its row loop
 // is matvec_q4k.metal's and it stores every logit. The second
 // (`logits_argmax`) is one threadgroup over the stored logits: each thread
 // reduces its strided share to one packed key, the threadgroup reduces the
@@ -70,6 +70,7 @@ kernel void head_logits_kernel(device const typename Q::Block *weights [[buffer(
 
 SCALED_HEAD_ENTRY("q6k_head_logits_scaled", Q6K, block_q6_K)
 SCALED_HEAD_ENTRY("a4_head_logits_scaled", A4, block_mlx_a4)
+SCALED_HEAD_ENTRY("a8_head_logits_scaled", A8, block_mlx_a8)
 SCALED_HEAD_ENTRY("q8_0_head_logits_scaled", Q8_0, block_q8_0)
 SCALED_HEAD_ENTRY("q5k_head_logits_scaled", Q5K, block_q5_K)
 
@@ -86,6 +87,17 @@ kernel void head_logits_kernel<Q6K>(device const block_q6_K *weights [[buffer(0)
 
 template [[host_name("a4_head_logits")]]
 kernel void head_logits_kernel<A4>(device const block_mlx_a4 *weights [[buffer(0)]],
+                                   device const float *x [[buffer(1)]],
+                                   device const float *gain [[buffer(2)]],
+                                   device float *logits [[buffer(3)]],
+                                   device atomic_uint *faults [[buffer(4)]],
+                                   constant MatvecArgs &args [[buffer(5)]],
+                                   uint tg [[threadgroup_position_in_grid]],
+                                   ushort tiisg [[thread_index_in_simdgroup]],
+                                   ushort sg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("a8_head_logits")]]
+kernel void head_logits_kernel<A8>(device const block_mlx_a8 *weights [[buffer(0)]],
                                    device const float *x [[buffer(1)]],
                                    device const float *gain [[buffer(2)]],
                                    device float *logits [[buffer(3)]],

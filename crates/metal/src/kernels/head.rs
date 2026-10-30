@@ -44,8 +44,8 @@ const MAX_ROWS: usize = u32::MAX as usize - 4 * HEAD_THREADS;
 
 /// One head launch.
 pub struct HeadParams<'w> {
-    /// The weight type. Q6_K, A4, Q8_0 and Q5_K have a head entry; Q4_K and
-    /// F32 have none and are refused by name.
+    /// The weight type. Q6_K, A4, A8, Q8_0 and Q5_K have a head entry; Q4_K
+    /// and F32 have none and are refused by name.
     pub quant: Quant,
     /// The output rows: the file's vocabulary for the engine's head. A launch
     /// accepts any positive count up to the pick's 32-bit loop.
@@ -197,10 +197,12 @@ impl Kernels {
         let pipeline = match (p.quant, p.norm.scaled()) {
             (Quant::Q6K, false) => &self.head_logits_q6k,
             (Quant::A4, false) => &self.head_logits_a4,
+            (Quant::A8, false) => &self.head_logits_a8,
             (Quant::Q8_0, false) => &self.head_logits_q8_0,
             (Quant::Q5K, false) => &self.head_logits_q5k,
             (Quant::Q6K, true) => &self.head_logits_q6k_scaled,
             (Quant::A4, true) => &self.head_logits_a4_scaled,
+            (Quant::A8, true) => &self.head_logits_a8_scaled,
             (Quant::Q8_0, true) => &self.head_logits_q8_0_scaled,
             (Quant::Q5K, true) => &self.head_logits_q5k_scaled,
             (Quant::Q4K, _) => {

@@ -417,6 +417,7 @@ pub(crate) struct Pipelines {
     pair_q4: Pipeline,
     pair_q6: Pipeline,
     pair_a4: Pipeline,
+    pair_a8: Pipeline,
     pair_q8_0: Pipeline,
     pair_q5k: Pipeline,
     /// The pair over a scaled input, one per type: stacks and a shared
@@ -425,6 +426,7 @@ pub(crate) struct Pipelines {
     fold_q4: Pipeline,
     fold_q6: Pipeline,
     fold_a4: Pipeline,
+    fold_a8: Pipeline,
     fold_q8_0: Pipeline,
     fold_q5k: Pipeline,
     /// The entries of two types: a pair of [`APART_GATE_UP`] for the pair, of
@@ -453,18 +455,27 @@ impl Pipelines {
             pair_q4: library.pipeline_with_simdgroups("q4k_pair_swiglu", simdgroups)?,
             pair_q6: library.pipeline_with_simdgroups("q6k_pair_swiglu", simdgroups)?,
             pair_a4: library.pipeline_with_simdgroups("a4_pair_swiglu", simdgroups)?,
+            pair_a8: library.pipeline_with_simdgroups("a8_pair_swiglu", simdgroups)?,
             pair_q8_0: library.pipeline_with_simdgroups("q8_0_pair_swiglu", simdgroups)?,
             pair_q5k: library.pipeline_with_simdgroups("q5k_pair_swiglu", simdgroups)?,
-            pair_scaled: [Quant::Q4K, Quant::Q6K, Quant::A4, Quant::Q8_0, Quant::Q5K]
-                .into_iter()
-                .map(|quant| {
-                    let name = format!("{}_pair_swiglu_scaled", quant.name());
-                    Ok((quant, library.pipeline_with_simdgroups(&name, simdgroups)?))
-                })
-                .collect::<Result<Vec<_>, DeviceError>>()?,
+            pair_scaled: [
+                Quant::Q4K,
+                Quant::Q6K,
+                Quant::A4,
+                Quant::A8,
+                Quant::Q8_0,
+                Quant::Q5K,
+            ]
+            .into_iter()
+            .map(|quant| {
+                let name = format!("{}_pair_swiglu_scaled", quant.name());
+                Ok((quant, library.pipeline_with_simdgroups(&name, simdgroups)?))
+            })
+            .collect::<Result<Vec<_>, DeviceError>>()?,
             fold_q4: library.pipeline_with_simdgroups("q4k_down_fold", simdgroups)?,
             fold_q6: library.pipeline_with_simdgroups("q6k_down_fold", simdgroups)?,
             fold_a4: library.pipeline_with_simdgroups("a4_down_fold", simdgroups)?,
+            fold_a8: library.pipeline_with_simdgroups("a8_down_fold", simdgroups)?,
             fold_q8_0: library.pipeline_with_simdgroups("q8_0_down_fold", simdgroups)?,
             fold_q5k: library.pipeline_with_simdgroups("q5k_down_fold", simdgroups)?,
             pair_apart: apart("pair_swiglu", &APART_GATE_UP)?,
@@ -503,6 +514,7 @@ impl Pipelines {
             Quant::Q4K => Some(&self.pair_q4),
             Quant::Q6K => Some(&self.pair_q6),
             Quant::A4 => Some(&self.pair_a4),
+            Quant::A8 => Some(&self.pair_a8),
             Quant::Q8_0 => Some(&self.pair_q8_0),
             Quant::Q5K => Some(&self.pair_q5k),
             Quant::F32 => None,
@@ -518,6 +530,7 @@ impl Pipelines {
             Quant::Q4K => Some(&self.fold_q4),
             Quant::Q6K => Some(&self.fold_q6),
             Quant::A4 => Some(&self.fold_a4),
+            Quant::A8 => Some(&self.fold_a8),
             Quant::Q8_0 => Some(&self.fold_q8_0),
             Quant::Q5K => Some(&self.fold_q5k),
             Quant::F32 => None,

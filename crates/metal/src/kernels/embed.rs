@@ -14,8 +14,8 @@ const GROUP_THREADS: usize = 256;
 
 /// One embedding: `ids.len()` rows of a quantized table, dequantized to f32.
 pub struct EmbedParams<'w> {
-    /// The table's type. Q4_K and A4 have an embedding entry; Q6_K has none
-    /// and is refused by name.
+    /// The table's type. Q4_K, A4 and A8 have an embedding entry; Q6_K has
+    /// none and is refused by name.
     pub quant: Quant,
     /// The table's bytes: `vocab * cols / values_per_block()` blocks.
     pub table: Window<'w, u8, MetalDevice>,
@@ -87,6 +87,7 @@ impl Kernels {
         let pipeline = match p.quant {
             Quant::Q4K => &self.embed_q4k,
             Quant::A4 => &self.embed_a4,
+            Quant::A8 => &self.embed_a8,
             Quant::Q8_0 => &self.embed_q8_0,
             Quant::Q5K => &self.embed_q5k,
             // A quant with no embedding entry is refused by name: the entry

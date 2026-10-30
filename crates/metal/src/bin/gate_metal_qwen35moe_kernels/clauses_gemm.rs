@@ -13,8 +13,8 @@
 //!
 //! - every weight value carries its owner's dequant arithmetic in f32: four
 //!   roundings for Q4_K and Q5_K (`d·sc`, `·q`, `dmin·min`, the
-//!   subtraction), two for Q6_K (`d·sc`, `·(q−32)`), two for A4 (`s·q`,
-//!   `+b`) and one for Q8_0 (`q·d`);
+//!   subtraction), two for Q6_K (`d·sc`, `·(q−32)`), two for A4 and A8
+//!   (`s·q`, `+b`) and one for Q8_0 (`q·d`);
 //! - the f32 operand's product rounds once; the f16 operand's two casts
 //!   round once each into half (2^-11 relative) and their products are exact
 //!   in the f32 accumulator (two eleven-bit mantissas);
@@ -400,7 +400,7 @@ pub(super) fn gemm_band(
 ) -> (f64, usize) {
     let base = match quant {
         Quant::Q4K | Quant::Q5K => 4,
-        Quant::Q6K | Quant::A4 => 2,
+        Quant::Q6K | Quant::A4 | Quant::A8 => 2,
         Quant::Q8_0 => 1,
         Quant::F32 => panic!("F32 has no dense GEMM: its rows run as the router's f32 GEMM"),
     };
@@ -505,7 +505,7 @@ pub(super) struct Case<'a> {
 /// fixture's real tensors at the activation row counts that exercise the
 /// tile's edges — 9 and 33 leave activation rows past the last, 512 fills
 /// the tiles — and a weight-row tail no threadgroup divides.
-fn run_cases(h: &Harness<'_>, mode: GemmMode, cases: &[Case<'_>]) -> Clause {
+pub(super) fn run_cases(h: &Harness<'_>, mode: GemmMode, cases: &[Case<'_>]) -> Clause {
     let mut parts = Vec::new();
     for case in cases {
         let x = oracle::activations(case.acts * case.x_stride, case.seed, 1.0);
@@ -1252,11 +1252,17 @@ pub fn gemm_range(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// f32-row entry's bits, the faulted row's NaN among them. A path whose f16
 /// GEMMs do not read half rows gets its f32 rows back from the cast.
 pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
+    half_rows_over(h, &a4_cases(h, mlx, sites)?, a4_seg_group(mlx, sites)?)
+}
+
+/// [`gemm_half_rows`]'s body over given `cases` and one segmented `group`:
+/// the A8 clause runs it at the split's tensors quantized at 8 bits
+/// (`clauses_a8`).
+pub(super) fn half_rows_over(h: &Harness<'_>, cases: &[Case<'_>], group: SegGroup<'_>) -> Clause {
     let same =
         |what: &str, want: &[f32], got: &[f32]| super::clauses_rows::same_bits(what, got, want);
     h.clear_fault()?;
-    let cases = a4_cases(h, mlx, sites)?;
-    for case in &cases {
+    for case in cases {
         for (mode, x_stride) in [
             (GemmMode::Store, case.x_stride),
             (GemmMode::Residual, case.x_stride + 20),
@@ -1287,7 +1293,6 @@ pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
             )?;
         }
     }
-    let group = a4_seg_group(mlx, sites)?;
     let (acts, cols) = (33, SEG_COLS);
     let seg_rows: usize = group.segments.iter().map(|(r, _)| r).sum();
     let y_stride = seg_rows.div_ceil(4) * 4;
@@ -1308,9 +1313,13 @@ pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
         let want = launch_gemm_seg_as(h, &launch, Rows::F32)?;
         let got = launch_gemm_seg_as(h, &launch, Rows::Cast)?;
         common::expect_clean(h, "the segmented launch")?;
-        same(&format!("the segmented A4 group {mode:?}"), &want, &got)?;
+        same(
+            &format!("the segmented {:?} group {mode:?}", group.quant),
+            &want,
+            &got,
+        )?;
     }
-    let case = cases.first().ok_or("no A4 case at the row's sites")?;
+    let case = cases.first().ok_or("no case for the half-row launches")?;
     for (what, value, bad_row) in [
         ("an activation past the half range", 65_536.0f32, 7usize),
         ("a NaN activation", f32::NAN, 0),
@@ -1351,9 +1360,10 @@ pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
     }
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
-        "{} dense A4 cases at both epilogues and the segmented group, the cast rows' bits the \
+        "{} dense {:?} cases at both epilogues and the segmented group, the cast rows' bits the \
          f32 rows' ({}); the range fault and NaN rows through the cast",
         cases.len(),
+        case.quant,
         if h.kernels.gemm_takes_half() {
             "half rows"
         } else {

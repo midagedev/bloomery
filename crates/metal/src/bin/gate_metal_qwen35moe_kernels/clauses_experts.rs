@@ -119,6 +119,7 @@ fn tag(quant: Quant) -> u64 {
         Quant::Q4K => 0,
         Quant::Q6K => 1,
         Quant::A4 => 2,
+        Quant::A8 => 6,
         Quant::Q8_0 => 3,
         Quant::Q5K => 4,
         Quant::F32 => 5,
@@ -158,11 +159,34 @@ fn plane(
     Ok(fix.rows(name, ty, cols, rows)?.to_vec())
 }
 
+/// A stack of experts quantized at 8 bits ([`Fixture::expert_as_a8`]): the
+/// MLX split holds its experts at MLX_A4.
+fn stack_as_a8(
+    fix: &Fixture,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    from: usize,
+    count: usize,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for expert in from..from + count {
+        out.extend_from_slice(&fix.expert_as_a8(name, cols, rows, expert)?);
+    }
+    Ok(out)
+}
+
+/// A plane quantized at 8 bits ([`Fixture::rows_as_a8`]).
+fn plane_as_a8(fix: &Fixture, name: &str, cols: usize, rows: usize) -> Result<Vec<u8>, String> {
+    fix.rows_as_a8(name, cols, rows)
+}
+
 /// Q4 reads the gate and up experts. Q6 has no gate or up experts in the
 /// fixture, so each expert is one Q6_K down expert's blocks, read as 512 by
 /// 2048: the byte length is the same. A4 reads its own gate and up stacks,
-/// which an MLX-format fixture holds. The fixtures hold no Q8_0 or Q5_K
-/// experts: those are refused by name (their clauses build synthetic rows).
+/// which an MLX-format fixture holds; A8 reads the same stacks quantized at
+/// 8 bits. The fixtures hold no Q8_0 or Q5_K experts: those are refused by
+/// name (their clauses build synthetic rows).
 pub fn pair_weights_for(
     e: &ExpertsGeom,
     fix: &Fixture,
@@ -234,6 +258,32 @@ pub fn pair_weights_for(
             })?,
             shared_up: if_shared(e, || {
                 plane(fix, "blk.0.ffn_up_shexp.weight", ty, PAIR_COLS, e.k)
+            })?,
+        },
+        // The MLX split holds its experts at MLX_A4; the A8 weights are the
+        // same experts quantized at 8 bits.
+        Quant::A8 => PairWeights {
+            gate: stack_as_a8(
+                fix,
+                "blk.0.ffn_gate_exps.weight",
+                PAIR_COLS,
+                e.k,
+                0,
+                N_EXPERTS,
+            )?,
+            up: stack_as_a8(
+                fix,
+                "blk.0.ffn_up_exps.weight",
+                PAIR_COLS,
+                e.k,
+                0,
+                N_EXPERTS,
+            )?,
+            shared_gate: if_shared(e, || {
+                plane_as_a8(fix, "blk.0.ffn_gate_shexp.weight", PAIR_COLS, e.k)
+            })?,
+            shared_up: if_shared(e, || {
+                plane_as_a8(fix, "blk.0.ffn_up_shexp.weight", PAIR_COLS, e.k)
             })?,
         },
     };
@@ -317,7 +367,7 @@ pub fn fold_weights_for(
         Quant::Q8_0 | Quant::Q5K | Quant::F32 => {
             return Err(format!("the fixture has no {} experts", quant.name()));
         }
-        Quant::Q4K | Quant::A4 => [
+        Quant::Q4K | Quant::A4 | Quant::A8 => [
             "blk.0.ffn_down_exps.weight".to_owned(),
             "blk.0.ffn_down_shexp.weight".to_owned(),
         ],
@@ -326,12 +376,26 @@ pub fn fold_weights_for(
     let rb = row_bytes(quant, e.k);
     let mut down = Vec::with_capacity(N_EXPERTS * rows * rb);
     for expert in 0..N_EXPERTS {
-        let whole = fix.expert(&name, ty, e.k, FOLD_ROWS, expert)?;
+        // The MLX split holds its down experts at MLX_A4; the A8 weights are
+        // the same experts quantized at 8 bits.
+        let whole_a8;
+        let whole: &[u8] = if quant == Quant::A8 {
+            whole_a8 = fix.expert_as_a8(&name, e.k, FOLD_ROWS, expert)?;
+            &whole_a8
+        } else {
+            fix.expert(&name, ty, e.k, FOLD_ROWS, expert)?
+        };
         down.extend_from_slice(&whole[..rows * rb]);
     }
     let weights = FoldWeights {
         down,
-        shared: if_shared(e, || Ok(fix.rows(&shared, ty, e.k, rows)?.to_vec()))?,
+        shared: if_shared(e, || {
+            if quant == Quant::A8 {
+                fix.rows_as_a8(&shared, e.k, rows)
+            } else {
+                Ok(fix.rows(&shared, ty, e.k, rows)?.to_vec())
+            }
+        })?,
     };
     let one = weights.down.len() / N_EXPERTS;
     if weights.shared.len() != if e.has_shared { one } else { 0 } {
