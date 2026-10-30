@@ -50,15 +50,23 @@
 //!   where the two first differ, the `on` arm's top-1 margin is below
 //!   [`GREEDY_MARGIN`] (a near tie, the long gate's rule), and every `on`
 //!   call admitted at least one expert (mutant: the pick's admitted experts
-//!   left out of the streamed places).
+//!   left out of the streamed places). The arms' logits sit at the
+//!   prefill gate's band however streaming behaves — `off` runs the
+//!   grouped GEMM, `on` the tile path — so the near-tie rule is what
+//!   covers that distance too, and a streaming defect shows as a
+//!   difference at a clear position.
 //! - `s4` (a group of two streams what it runs off: a streamed pass that
-//!   admits nothing is the plain pass, bit for bit): [`S4_P`] prose ids,
+//!   admits nothing is the plain pass): [`S4_P`] prose ids,
 //!   two batches, one group of two, so the next batch's route is enqueued
 //!   ahead of this one's host serve while the batches share the block's
 //!   norm, routing and places. Call A streams and admits; the seat's reset
 //!   keeps its placement; call B, the same ids streaming, admits none; after
 //!   another reset call C, the same ids with streaming off, runs on the same
-//!   placement. B's argmax and logits equal C's. Premises, each named: A
+//!   placement. B keeps the tile path the streamed passes run (the steps'
+//!   bits) and C runs the default pass's grouped GEMM, so B's argmax and
+//!   logits sit within the prefill gate's band of C's
+//!   ([`LogitsBand`]: clear top-1, max and RMS |Δlogit| at its pins), not
+//!   on C's bits. Premises, each named: A
 //!   admitted an expert; B admitted none; the card sets after C are those
 //!   after B (mutant: the next batch's route enqueued between the pick and
 //!   the streamed pass, which then reads that batch's routing and places;
@@ -73,8 +81,13 @@
 //! free of device or pinned memory (a `DeviceBuffer`'s drop synchronizes the
 //! context) waits for it.
 //!
-//! `off` keeps a prompt call bit for bit the decode steps' (the prefill
-//! gate); this gate judges `on`, whose bits are the band's.
+//! A prompt call with streaming `off` runs the default pass's grouped GEMM,
+//! so it sits within the prefill gate's logits band of the decode steps',
+//! not on their bits; the streamed passes (`on`) keep the tile path, which
+//! is the steps' order. `s2` and `s1` compare streaming arms with each
+//! other, batch against batch on the tile path, so their equalities stay
+//! bit for bit; `s4` and `s3` compare `on` with `off` across the two
+//! orders, so they defer to the band's rule.
 //!
 //! Tiers: every equality and structure clause is self-consistency and runs on a fixture. What the
 //! real file's routing skew makes true — a call admits an expert, a later group admits, every
@@ -130,6 +143,9 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::logits_band::{
+        LOGITS_CLEAR_PIN, LOGITS_MAX_PIN, LOGITS_RMS_PIN, LogitsBand,
+    };
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
@@ -282,6 +298,9 @@ mod gate {
     struct Run {
         /// The call's last position, then each step's.
         out: Vec<Pos>,
+        /// The call's last logits row, as f32 bits — [`LogitsBand`]'s input,
+        /// which `s4` reads against the `off` call's.
+        row: Vec<u32>,
         picks: Vec<Pick>,
         end: Option<CallReport>,
     }
@@ -295,7 +314,14 @@ mod gate {
     /// The prompt call of `ids` from where the session stands, then `steps` greedy
     /// steps; the call's picks and end.
     fn call(s: &mut Session<Body>, ids: &[u32], steps: usize) -> Result<Run, GateError> {
-        let first = pos_of(s.prompt(ids, Want::Logits)?)?;
+        let answered = s.prompt(ids, Want::Logits)?;
+        let row = match &answered {
+            Out::Logits { row, .. } => row.iter().map(|f| f.to_bits()).collect(),
+            Out::Argmax(_) => {
+                return Err("a call asked for its logits returned the argmax alone".into());
+            }
+        };
+        let first = pos_of(answered)?;
         let (picks, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
         let mut out = Vec::with_capacity(steps + 1);
         out.push(first);
@@ -310,6 +336,7 @@ mod gate {
         }
         Ok(Run {
             out,
+            row,
             picks: picks
                 .iter()
                 .map(|(g, p)| (*g, p.layer, p.admitted, p.kept, p.bytes, p.counts))
@@ -482,12 +509,19 @@ mod gate {
             .filter(|(_, ok)| !ok)
             .map(|(what, _)| *what)
             .collect();
-        let same = b.out == c.out;
+        // The two calls run different f32 orders of the same exact integer
+        // block sums (B the streamed passes' tile path, C the default pass's
+        // grouped GEMM), so B sits within the prefill gate's band of C —
+        // clear top-1 at its pins — not on C's bits.
+        let mut band = LogitsBand::new();
+        band.add(&b.row, &c.row);
+        let same = band.ok();
         let ok = failed.is_empty() && same;
         println!(
             "s4: {S4_P} ids in a group of two; call A admitted {} experts over {} picks, B {}; \
-             B (streaming) argmax {} and logits {:016x} against C (off) {} {:016x}: same \
-             {same}{}: {}",
+             B (streaming, the tile path) argmax {} and logits {:016x} against C (off, the GEMM) \
+             {} {:016x}: band clear top-1 {} of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} \
+             (pin {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}) {same}{}: {}",
             a.admitted(),
             a.picks.len(),
             b.admitted(),
@@ -495,6 +529,10 @@ mod gate {
             b.out[0].fnv,
             c.out[0].argmax,
             c.out[0].fnv,
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
             if failed.is_empty() {
                 String::new()
             } else {
@@ -733,7 +771,9 @@ mod gate {
             pass &= watched("s1", || s1(s, &flags))?;
             crate::ds41_tier::sc("s3: on against off, a difference is a near tie")?;
             pass &= watched("s3", || on_off(s, "s3", S3_P, S3_WINDOWS))?;
-            crate::ds41_tier::sc("s4: a group that admits nothing is the plain pass, bit for bit")?;
+            crate::ds41_tier::sc(
+                "s4: a group that admits nothing is the plain pass, within the prefill gate's band",
+            )?;
             pass &= watched("s4", || s4(s))?;
             Ok((pass, probe))
         };

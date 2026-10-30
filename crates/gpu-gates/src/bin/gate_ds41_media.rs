@@ -77,7 +77,9 @@
 //! them; (ii)'s coverage needs the file's `exp_probs_b_vl` to pick differently from
 //! `exp_probs_b` somewhere, which the fixture's biases (0 and a uniform ±0.1) do.
 //!
-//! Text-only prompts are `gate-gpu-ds41-prefill`'s (bit for bit); the
+//! Text-only prompts are `gate-gpu-ds41-prefill`'s (within its logits
+//! band: the prompt batch runs the grouped GEMM, the steps the gemv, so a
+//! call sits at a pinned distance from the steps, not on their bits); the
 //! kernels are untouched (ptx-scan against the base). The FAIL-first
 //! mutants — the rows staged one position off, the media broadcast reading
 //! `token_embd`, every position picking with the text bias, the span's

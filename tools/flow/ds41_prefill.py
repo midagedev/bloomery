@@ -351,7 +351,14 @@ HEAD_ACTS = 7                  # the trace: 7 activities after the last join
 SHADOW_EXPERT_CHUNK = 8        # enqueue_batch_shadow_chunk: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose
 SHADOW_EXPERT_BLOCK = 5        # the expert arm's block: buckets, grouped gate-up, quantize_sel, grouped down, card_acc
 SHADOW_TILE_BLOCK = 7          # cardtile, enqueue_tiled_experts: buckets, grouped_tiles, gather, GT, quantize_ord, DT,
-                               # card_acc (entries_shadow 478.9 against the expert arm's 477.0 at P 512, 38 card lbs)
+                               # card_acc (entries_shadow 478.9 against the expert arm's 477.0 at P 512, 38 card lbs) —
+                               # the paths that still take it: host streaming's kept and streamed passes, the expert
+                               # tier's batch service (each over its own scratch); a leg layer runs enqueue_leg_block's
+                               # own pieces instead (body/prefill.rs shadow_entries: 4 a 64-token piece)
+SHADOW_GEMM_BLOCK = 7          # the default block's grouped GEMM (gpu/src/gemm/batch.rs enqueue_gemm_batch over
+                               # chain/ffn/batch.rs enqueue_block_experts CardPath::Gemm): quantize_q8_1, route_remap,
+                               # the gate gemm, the up gemm, swiglu_act_quant_sel, the down gemm, card_acc — the same
+                               # count the engine's counter holds (body/prefill.rs shadow_entries: 6 + card_acc)
 # T's GT (gate-up) kernel over one (card expert, 8-column tile) item: 2304 / 8 row tiles, blocks in rho-major order
 # (b = g + tile_cap x rho, chain/ffn/batch.rs ds41_expert_gate_up_tiles), so each row tile's sweep reads every item's
 # activation columns again
@@ -1036,8 +1043,9 @@ def shadow_lb(p, cfg, lb, rt):
     """Card time (ms), activities and events of a layer-batch's shadow (FfnPiece::enqueue_batch_shadow), under the
     union. Expert arm: the per-chunk kernels as traced and the grouped gate-up and down per card slot;
     slot arm: the same per-chunk kernels and each slot's expert bytes (derived, not traced). `tile` (T,
-    cardtile) prices the grouped pair as card_tile_us (the items' m mix and GT's L2 spill); `imma` prices
-    it as the IMMA grouped GEMM (gemm_q3k/gemm_q4k): imma_lb a layer-batch of 512 columns, in
+    cardtile) prices the grouped pair as card_tile_us (the items' m mix and GT's L2 spill) — the streamed
+    passes' path under host streaming; `imma` prices it as the IMMA grouped GEMM (gemm_q3k/gemm_q4k),
+    the default prompt block's arm since f812d30e1: imma_lb a layer-batch of 512 columns, in
     proportion below, at least the card experts' bytes once. `_clk` stretches the SM-bound parts (the per-chunk kernels, T's issue-bound
     items), not the per-slot grouped pair, which reads its weights from DRAM once a slot."""
     if not lb.full:
@@ -1077,7 +1085,8 @@ def shadow_lb(p, cfg, lb, rt):
                 grouped = card_tiles(rt, l, lb.T) * cfg["_tile_us"]
             else:
                 grouped = lb.T * cs_tok * p["shadow_slot"]
-            nb = SHADOW_TILE_BLOCK if cfg.get("tile") and not cfg.get("imma") else SHADOW_EXPERT_BLOCK
+            nb = (SHADOW_GEMM_BLOCK if cfg.get("imma") else
+                  SHADOW_TILE_BLOCK if cfg.get("tile") else SHADOW_EXPERT_BLOCK)
             t += (p["shadow_lb"] * clk + grouped) / 1000.0 + nb * g
             acts += nb
         else:
@@ -1835,11 +1844,13 @@ CONFIGS = {
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True),
     # the engine from candwire on: PG1 / PG2's flow with the candidate mask's launches (cand_acts) in every full chunk
-    # of its source and consumers; what --counts holds a counter log of today's tree to
-    "CW1": dict(commit="candwire", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True,
-                marks4=True, cand=True),
-    "CW2": dict(commit="candwire", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
-                wrap=True, marks4=True, cand=True),
+    # of its source and consumers; what --counts holds a counter log of today's tree to. From f812d30e1 the default
+    # block runs the grouped GEMM (imma; the tile flag stays for the streamed passes' pricing under host streaming),
+    # and the block's entry count is the same 7 a card layer-batch (SHADOW_GEMM_BLOCK = SHADOW_TILE_BLOCK)
+    "CW1": dict(commit="f812d30e1", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True, hot=False,
+                timed=True, marks4=True, cand=True),
+    "CW2": dict(commit="f812d30e1", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True, hot=False,
+                timed=True, G=2, wrap=True, marks4=True, cand=True),
     # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), frequency list 384, CED on, G 2
     # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
     # sitting (09-28#v41-release): main 53e2def, the same flow, lcg at the id prefix, no STEP_STATS (no card marks)

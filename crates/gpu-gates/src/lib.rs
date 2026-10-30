@@ -42,6 +42,7 @@ pub mod kv_planes;
 pub mod llama_launch;
 pub mod llama_place;
 pub mod logit_rows;
+pub mod logits_band;
 pub mod model_file;
 pub mod need;
 #[cfg(feature = "gpu")]
