@@ -975,12 +975,11 @@ fn enqueue_places_batch(
         ids,
         map,
         gate_up,
-        DownW::Blocks32(down),
+        DownW::Blocks32(down, act, down_y),
         (n, n_places),
         (geo::N_USED, geo::FF, geo::HIDDEN),
         sink,
-        down_y,
-        (g, u, act),
+        (g, u),
         (sel, route),
     )
 }

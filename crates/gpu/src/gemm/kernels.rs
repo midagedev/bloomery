@@ -1,9 +1,9 @@
 //! The one device module of the grouped GEMM, its route and its SwiGLU
 //! quantizer: every `#[kernel]` entry of the family, so one bundle load
 //! serves them all. Each GEMM entry is one expansion of `grouped.rs`'s
-//! block; the route and SwiGLU bodies are written out here, and the device
-//! helpers every body calls live with their owner (`grouped.rs`,
-//! `route.rs`).
+//! block; the route bodies are written out here, and the device helpers
+//! every body calls live with their owner (`grouped.rs`, `route.rs`,
+//! `swiglu.rs`, whose warp body both SwiGLU entries share).
 
 use super::grouped::{
     B_COL_W, B_STAGE_W, GEMM_BM, GEMM_NT, GEMM_THREADS, IQ1M_SB_BYTES, IQ1S_SB_BYTES,
@@ -17,6 +17,7 @@ use super::route::{
     GEMM_MAX_EXPERTS, NO_EXPERT, ROUTE_HIST, ROUTE_THREADS, ROUTE_WARPS, route_id, tile_parts,
     tile_word,
 };
+use super::swiglu::swiglu_quant_block;
 use super::{GEMM_BN, GEMM_MAX_SLOTS};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -37,8 +38,6 @@ mod gemm_kernels {
     use crate::cores::{q4k_scale_min, q6k_dequant};
     use crate::flash::half_bits_to_f32;
     use crate::iq::{iq1m_scale_bits, iq4_word};
-    use crate::kquant::act::apply;
-    use crate::q8_1_quant_vals;
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
     };
@@ -1051,42 +1050,92 @@ mod gemm_kernels {
         let col = blk / per_col;
         let b = blk - col * per_col;
         let lane = warp::lane_id() as usize;
-        let base = col * 256 * n_sb + 128 * b + 4 * lane;
-        // SAFETY: base + 3 < (col + 1)·256·n_sb <= n_cols·256·n_sb, inside g
-        // and u by the launch contract.
-        let (gv, uv) = unsafe {
-            (
-                [
-                    *g.get_unchecked(base),
-                    *g.get_unchecked(base + 1),
-                    *g.get_unchecked(base + 2),
-                    *g.get_unchecked(base + 3),
-                ],
-                [
-                    *u.get_unchecked(base),
-                    *u.get_unchecked(base + 1),
-                    *u.get_unchecked(base + 2),
-                    *u.get_unchecked(base + 3),
-                ],
+        // SAFETY: this warp's one `(col, b)` with its lane, inside the
+        // launch's columns and blocks as the helper's contract states.
+        let refused = unsafe {
+            swiglu_quant_block(
+                g, u, act, limit, col, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6,
+                &mut s8, &mut d8,
             )
         };
-        let v = if crate::fault::quad_finite(gv) & crate::fault::quad_finite(uv) {
-            [
-                apply(act, limit, gv[0], uv[0]),
-                apply(act, limit, gv[1], uv[1]),
-                apply(act, limit, gv[2], uv[2]),
-                apply(act, limit, gv[3], uv[3]),
-            ]
-        } else {
-            [f32::NAN; 4]
-        };
-        // SAFETY: col < n_cols and b < 2·n_sb by the lines above, the output
-        // bounds are the launch contract's, the block is one warp with one
-        // `(col, b)`, and `v` holds values 128·b + 4·lane .. +3 of column col.
+        if refused && lane == 0 {
+            fault.raise(FaultSite::QuantColumn);
+        }
+    }
+
+    /// [`gemm_swiglu_quant`] over the slots a remapped route left the card: a
+    /// column whose place `sel[col]` is `HOST` is the host's — nothing of it
+    /// is read, written or refused, so a stale column a reset left or a
+    /// non-finite `g`/`u` row of it raises nothing; one whose place is below
+    /// `n_card` is quantized as `gemm_swiglu_quant` quantizes it; one in
+    /// `[n_card, HOST)` is no expert either side serves and raises
+    /// [`FaultSite::ExpertId`] without a store.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            act <= 3,
+            g.len() >= n_cols * 256 * n_sb,
+            u.len() >= n_cols * 256 * n_sb,
+            sel.len() >= n_cols,
+            q3.len() >= n_cols * 64 * half_it,
+            q4.len() >= n_cols * 256 * quad_it,
+            q6.len() >= n_cols * 128 * half_it,
+            s8.len() >= n_cols * 8 * n_sb,
+            d8.len() >= n_cols * 2 * n_sb
+        )
+    )]
+    pub fn gemm_swiglu_quant_sel(
+        g: &[f32],
+        u: &[f32],
+        sel: &[u32],
+        n_card: u32,
+        act: u32,
+        limit: f32,
+        n_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let per_col = 2 * n_sb;
+        if blk >= n_cols as usize * per_col {
+            return; // warp-uniform: one warp per block
+        }
+        let col = blk / per_col;
+        // SAFETY: col < n_cols <= sel.len() by the launch contract; the
+        // column is warp-uniform, so the branch is too.
+        let place = unsafe { *sel.get_unchecked(col) };
+        if place == crate::hybrid::HOST {
+            return;
+        }
+        if place >= n_card {
+            if warp::lane_id() == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        let b = blk - col * per_col;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: this warp's one `(col, b)` with its lane, inside the
+        // launch's columns and blocks as the helper's contract states.
         let refused = unsafe {
-            q8_1_quant_vals(
-                v, col, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
-                &mut d8,
+            swiglu_quant_block(
+                g, u, act, limit, col, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6,
+                &mut s8, &mut d8,
             )
         };
         if refused && lane == 0 {

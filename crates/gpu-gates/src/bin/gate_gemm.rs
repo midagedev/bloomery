@@ -127,6 +127,11 @@
 //! SwiGLU (limits 7 and 0.5) bit for bit the CPU twin `qdot::swiglu_oai` then
 //! the same quantizer, a NaN up value refused as `QuantColumn`, and a NaN or
 //! negative limit and an `alpha` other than the references' refused by name.
+//! Case `swiglu_sel`: `GemmKernels::enqueue_swiglu_act_quant_sel` over a
+//! places row under the clamp 10 and the plain rule — the card columns the
+//! plain rule-taking launch's bits over other rows, the host columns a first
+//! plain launch's, untouched, a NaN in a host column raising nothing, a
+//! place in `[n_card, HOST)` `ExpertId` with nothing written.
 //!
 //! The squared-ReLU quantizer fold (`Gpu::enqueue_quantize_gemm_relu_sqr`,
 //! case `relu_sqr`) at K ∈ {768, 2048} for 1, 8, 64 and 4096 columns: its
@@ -2554,6 +2559,143 @@ mod gate {
         Ok(ok)
     }
 
+    /// The card-slots-only K-quant SwiGLU quantizer
+    /// (`GemmKernels::enqueue_swiglu_act_quant_sel`) over a remapped route's
+    /// places, under the clamp GLM's routed experts run (10) and the plain
+    /// rule: a first plain launch seeds every column's bytes, then the
+    /// `_sel` launch over other rows — the card columns the plain launch's
+    /// bits over those rows, the host columns the seed's, untouched — a NaN
+    /// in a host column raising nothing, a place in `[n_card, HOST)`
+    /// `ExpertId` with nothing written. The clause turns red on a mutant
+    /// that drops the `HOST` early return (a host column raising), takes the
+    /// stray bound above `n_card` (`place > n_card`: a stray column written,
+    /// no fault) or quantizes the host columns (the seed's bytes gone).
+    fn swiglu_sel_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("swiglu_sel") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let mut ok = true;
+        gpu.clear_fault()?;
+        let (k, n, n_card) = (768usize, 33usize, 20usize);
+        let place = |c: usize| {
+            if c.is_multiple_of(3) {
+                HOST
+            } else {
+                ((c * 7) % n_card) as u32
+            }
+        };
+        let sel: Vec<u32> = (0..n).map(place).collect();
+        let sel_d = DeviceBuffer::from_host(stream, &sel)?;
+        for (name, rule) in [
+            ("clamp10", Act::SwigluClamp { limit: 10.0 }),
+            ("silu_mul", Act::SiluMul),
+        ] {
+            let mut plain = GemmAct::new(stream, n, k)?;
+            let mut sela = GemmAct::new(stream, n, k)?;
+            // Twelve so silu(g) passes the clamp 10 on a share of the values.
+            let scaled = |seed: u32| -> Vec<f32> {
+                activations(k, n, seed)
+                    .into_iter()
+                    .map(|v| 12.0 * v)
+                    .collect()
+            };
+            let (g0, u0, g1, u1) = (
+                DeviceBuffer::from_host(stream, &scaled(9500))?,
+                DeviceBuffer::from_host(stream, &scaled(9501))?,
+                DeviceBuffer::from_host(stream, &scaled(9502))?,
+                DeviceBuffer::from_host(stream, &scaled(9503))?,
+            );
+            dev.gk
+                .enqueue_swiglu_act_quant(stream, &g0, &u0, rule, n, &mut sela, sink)?;
+            stream.synchronize()?;
+            let before = planes(&sela, stream)?;
+            dev.gk.enqueue_swiglu_act_quant_sel(
+                stream, &g1, &u1, rule, &sel_d, n_card, n, &mut sela, sink,
+            )?;
+            dev.gk
+                .enqueue_swiglu_act_quant(stream, &g1, &u1, rule, n, &mut plain, sink)?;
+            stream.synchronize()?;
+            let fault = gpu.take_fault()?;
+            let (got, want) = (planes(&sela, stream)?, planes(&plain, stream)?);
+            let (n_sb, half_it, quad_it) = (k / 256, (k / 256).div_ceil(2), (k / 256).div_ceil(4));
+            let eq = |a: &Planes, b: &Planes, c: usize| {
+                a.0[c * 64 * half_it..][..64 * half_it] == b.0[c * 64 * half_it..][..64 * half_it]
+                    && a.1[c * 256 * quad_it..][..256 * quad_it]
+                        == b.1[c * 256 * quad_it..][..256 * quad_it]
+                    && a.2[c * 128 * half_it..][..128 * half_it]
+                        == b.2[c * 128 * half_it..][..128 * half_it]
+                    && a.3[c * 8 * n_sb..][..8 * n_sb] == b.3[c * 8 * n_sb..][..8 * n_sb]
+                    && bits_equal(
+                        &a.4[c * 2 * n_sb..][..2 * n_sb],
+                        &b.4[c * 2 * n_sb..][..2 * n_sb],
+                    )
+            };
+            let mut card = 0usize;
+            let mut host_ok = true;
+            let mut card_ok = true;
+            for (c, &sel_c) in sel.iter().enumerate().take(n) {
+                if sel_c == HOST {
+                    host_ok &= eq(&got, &before, c);
+                } else {
+                    card += 1;
+                    card_ok &= eq(&got, &want, c);
+                }
+            }
+            let pass = card_ok && host_ok && fault.is_none();
+            println!(
+                "gemm case=swiglu_sel rule={name} K={k} cols={n} card_cols_eq_plain={card_ok} \
+                 ({card} of them) host_cols_untouched={host_ok} fault={} {}",
+                fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+            // A NaN in a host column is never read: no fault, the host
+            // column still the seed's.
+            let mut gn = scaled(9504);
+            let host_col = (0..n).find(|&c| sel[c] == HOST).unwrap_or(0);
+            gn[host_col * k + 5] = f32::NAN;
+            let gn = DeviceBuffer::from_host(stream, &gn)?;
+            dev.gk.enqueue_swiglu_act_quant_sel(
+                stream, &gn, &u1, rule, &sel_d, n_card, n, &mut sela, sink,
+            )?;
+            stream.synchronize()?;
+            let fault = gpu.take_fault()?;
+            let got = planes(&sela, stream)?;
+            let host_kept = eq(&got, &before, host_col);
+            let pass = fault.is_none() && host_kept;
+            println!(
+                "gemm case=swiglu_sel rule={name} fault=nan_host col={host_col} \
+                 host_col_untouched={host_kept} fault_raised={} {}",
+                fault.is_some(),
+                verdict(pass)
+            );
+            ok &= pass;
+            // A place in [n_card, HOST): `ExpertId`, its column unwritten.
+            let mut stray = sel.clone();
+            stray[host_col] = n_card as u32;
+            let stray_d = DeviceBuffer::from_host(stream, &stray)?;
+            dev.gk.enqueue_swiglu_act_quant_sel(
+                stream, &g1, &u1, rule, &stray_d, n_card, n, &mut sela, sink,
+            )?;
+            stream.synchronize()?;
+            let fault = gpu.take_fault()?;
+            let got = planes(&sela, stream)?;
+            let unwritten = eq(&got, &before, host_col);
+            let pass = fault == Some(Fault::at(LAYER_NONE, FaultSite::ExpertId)) && unwritten;
+            println!(
+                "gemm case=swiglu_sel rule={name} fault=stray_place col={host_col} \
+                 col_unwritten={unwritten} fault={} {}",
+                fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         if std::env::args().any(|a| a == "--bench-kernels") {
@@ -2702,6 +2844,7 @@ mod gate {
         ok &= swiglu_case(&dev)?;
         ok &= relu_sqr_case(&dev)?;
         ok &= swiglu_clamp_case(&dev)?;
+        ok &= swiglu_sel_case(&dev)?;
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
         ok &= site_mask(&dev)?;
