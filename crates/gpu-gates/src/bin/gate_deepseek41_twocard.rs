@@ -38,12 +38,20 @@
 //!   argmax and logits read; then from a reset with the draft started over,
 //!   the first [`CALL_PROMPT`] ids as one prompt call through the draft's
 //!   (one batch, the draft fed the call's feature rows) and [`PASSES`] DSpark
-//!   passes, each pass's kept tokens and its rows' logits read. Every token,
-//!   kept count and logits vector of the two-card run (and of the loopback)
-//!   bit for bit the reference's, the stage's step graph of the reference's
-//!   node count. Preconditions: every layer the tier holds experts of was
-//!   sent at least one routed slot over the two-card run (the tier's
-//!   per-layer hits), and by the prompt call alone, whose batch the tier
+//!   passes, each pass's kept tokens and the logits of the rows it kept read.
+//!   The stepped part, every token and logits vector of the decode steps, of
+//!   the two-card run (and of the loopback) is bit for bit the reference's,
+//!   the stage's step graph of the reference's node count. The call and the
+//!   passes after it are walked in order against the reference's
+//!   (`logits_band::walk`): the call's stage experts run the grouped GEMM and
+//!   its tier's the tile path, the reference's all on the GEMM, so their
+//!   logits sit within the logits band of the reference's, not on its bits.
+//!   The tokens agree until a position the reference was not clear about
+//!   (clear top-1 equality is the band's hard clause), after which the
+//!   contexts differ and the rest is not compared; the passes' kept counts
+//!   are equal over the passes the walk compared. Preconditions: every layer
+//!   the tier holds experts of was sent at least one routed slot over the
+//!   two-card run (the tier's per-layer hits), and by the prompt call alone, whose batch the tier
 //!   served (its batch services); the pair passes kept and rejected a
 //!   proposal each at least once (a property of the draft file's content, so the fixture
 //!   tier defers it: its random draft keeps none); or the run proves nothing and fails by
@@ -97,6 +105,7 @@ mod gate {
         Body, BodyMeta, DECODE_INPUT, Deepseek41Model, OpenCfg, PAIR_ROWS, PrefillMode,
     };
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::logits_band::{self, Positions};
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, ref_model_path};
     use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8};
     use gguf::Split;
@@ -366,11 +375,16 @@ mod gate {
         Ok(Opened { s, spec })
     }
 
-    /// Every token, kept count and logits vector a run read, in order.
+    /// Every token, kept count and logits vector a run read, in order: one token and one logits
+    /// row a position, the row the token was taken from. The decode steps' positions come first,
+    /// then the call's last position, then the rows each pass kept.
     #[derive(Default)]
     struct Run {
         tokens: Vec<u32>,
         logits: Vec<Vec<f32>>,
+        /// The leading positions the decode steps recorded; the call's and the passes' follow.
+        stepped: usize,
+        /// The rows each DSpark pass kept.
         kept: Vec<usize>,
         stage_nodes: Option<usize>,
         /// Pair passes that kept their proposal, and that rejected it.
@@ -378,6 +392,16 @@ mod gate {
         rejects: usize,
         /// What the prompt call alone sent the tier; `None` without one.
         call: Option<Sent>,
+    }
+
+    impl Run {
+        /// The call's last position and the rows the passes kept, with the tokens taken from them.
+        fn called(&self) -> Positions<'_> {
+            Positions {
+                tokens: &self.tokens[self.stepped..],
+                rows: &self.logits[self.stepped..],
+            }
+        }
     }
 
     /// What a span of a run sent the tier: its hits per layer from the
@@ -436,6 +460,7 @@ mod gate {
             run.tokens.push(tok);
             run.logits.push(s.model().logits()?);
         }
+        run.stepped = run.tokens.len();
         s.reset()?;
         spec.draft_mut().restart()?;
         let before = tier_counts(s.model())?;
@@ -448,68 +473,108 @@ mod gate {
             out.clear();
             let c = Advance::pass(spec, s, last, &mut out)?;
             run.kept.push(c.kept);
-            run.tokens.extend_from_slice(&out);
-            if c.rows == PAIR_ROWS {
-                let [a, b] = s.model().rows_logits::<PAIR_ROWS>()?;
-                run.logits.push(a);
-                run.logits.push(b);
+            // Row `r` of a pass holds the logits kept token `r` was taken from; the rows past
+            // `kept` follow a proposal the target rejected and are taken back.
+            let rows: Vec<Vec<f32>> = if c.rows == PAIR_ROWS {
                 if c.kept == PAIR_ROWS {
                     run.accepts += 1;
                 } else {
                     run.rejects += 1;
                 }
+                s.model().rows_logits::<PAIR_ROWS>()?.into()
             } else {
-                run.logits.push(s.model().logits()?);
+                vec![s.model().logits()?]
+            };
+            if out.len() != c.kept || c.kept > rows.len() {
+                return Err(format!(
+                    "a pass kept {} rows of its {} and gave {} tokens over {} logits rows",
+                    c.kept,
+                    c.rows,
+                    out.len(),
+                    rows.len()
+                )
+                .into());
             }
+            run.tokens.extend_from_slice(&out);
+            run.logits.extend(rows.into_iter().take(c.kept));
             last = *out.last().ok_or("a pass kept no token")?;
         }
         spec.draft_mut().check_fault()?;
         Ok(run)
     }
 
-    /// Whether `got`, run `what`, is `want` bit for bit; prints the first
-    /// difference.
+    /// Whether `got`, run `what`, is `want`: the stepped part bit for bit, the call and the passes
+    /// after it within the logits band of `want`'s ([`logits_band::walk`]), and the passes' kept
+    /// counts equal over the passes the walk compared. The call's stage experts run the grouped
+    /// GEMM and its tier's the tile path where the reference's all run the GEMM, so the same exact
+    /// integer block sums fold in more than one f32 order and the logits are near the reference's,
+    /// not on its bits. Prints each part's line.
     fn same(what: &str, want: &Run, got: &Run) -> bool {
-        if want.tokens != got.tokens || want.kept != got.kept {
-            let at = want
-                .tokens
-                .iter()
-                .zip(&got.tokens)
-                .position(|(a, b)| a != b);
+        let stepped = same_stepped(what, want, got);
+        let walk = logits_band::walk(
+            &format!("{what} (the call and its passes)"),
+            want.called(),
+            got.called(),
+        );
+        let kept = same_kept(what, want, got, walk.agreed);
+        stepped && walk.ok && kept
+    }
+
+    /// Whether `got`'s decode steps, run `what`, are `want`'s bit for bit; prints the first
+    /// difference.
+    fn same_stepped(what: &str, want: &Run, got: &Run) -> bool {
+        let n = want.stepped;
+        if got.stepped != n {
             println!(
-                "FAIL {what}: tokens apart at {at:?} ({} and {} tokens), kept {:?} against the \
-                 reference's {:?}",
-                got.tokens.len(),
-                want.tokens.len(),
-                got.kept,
-                want.kept
+                "FAIL {what} (the steps): {} positions, the reference ran {n}",
+                got.stepped
             );
             return false;
         }
-        if want.logits.len() != got.logits.len() {
-            println!(
-                "FAIL {what}: {} logits rows, the reference read {}",
-                got.logits.len(),
-                want.logits.len()
-            );
-            return false;
-        }
-        for (i, (w, g)) in want.logits.iter().zip(&got.logits).enumerate() {
-            let first = w
+        let (w_tok, w_row) = (&want.tokens[..n], &want.logits[..n]);
+        let (g_tok, g_row) = (&got.tokens[..n], &got.logits[..n]);
+        let steps = w_tok.iter().zip(w_row).zip(g_tok.iter().zip(g_row));
+        for (i, ((wt, wl), (gt, gl))) in steps.enumerate() {
+            let first = wl
                 .iter()
-                .zip(g)
+                .zip(gl)
                 .position(|(a, b)| a.to_bits() != b.to_bits());
-            if w.len() != g.len() || first.is_some() {
-                println!("FAIL {what}: logits row {i}: first logit apart {first:?}");
+            if wt != gt || wl.len() != gl.len() || first.is_some() {
+                println!(
+                    "FAIL {what} (the steps): position {i}: token {gt} (reference {wt}), first \
+                     logit apart {first:?}"
+                );
                 return false;
             }
         }
         println!(
-            "ok {what}: {} tokens, {} logits rows, {} passes' kept counts bit for bit the \
-             reference's",
-            got.tokens.len(),
-            got.logits.len(),
-            got.kept.len()
+            "ok {what} (the steps): {n} positions, tokens and logits bit for bit the reference's"
+        );
+        true
+    }
+
+    /// Whether `got`'s passes kept the rows `want`'s did, over the passes whose kept tokens all lie
+    /// among the first `agreed` positions of [`Run::called`] (the call's last position, then each
+    /// pass's kept rows): a pass past them ran on contexts the walk found apart. Prints the count.
+    fn same_kept(what: &str, want: &Run, got: &Run, agreed: usize) -> bool {
+        // The call's position is position 0; pass `k` ends at `end` positions.
+        let (mut want_end, mut got_end, mut compared) = (1, 1, 0);
+        for (k, (&w, &g)) in want.kept.iter().zip(&got.kept).enumerate() {
+            want_end += w;
+            got_end += g;
+            if want_end > agreed || got_end > agreed {
+                break;
+            }
+            if w != g {
+                println!("FAIL {what} (the passes): pass {k} kept {g} rows, the reference's {w}");
+                return false;
+            }
+            compared = k + 1;
+        }
+        println!(
+            "ok {what} (the passes): kept counts equal over {compared} of the reference's {} passes, \
+             the ones the walk compared",
+            want.kept.len()
         );
         true
     }
@@ -604,7 +669,8 @@ mod gate {
         let prompt = prose_ids("engram", PROMPT.max(CALL_PROMPT))?;
         if args.union {
             crate::ds41_tier::sc(
-                "--union: two cards (and the loopback) are the union reference, bit for bit",
+                "--union: two cards (and the loopback) are the union reference, the steps bit for \
+                 bit, the call and its passes within the logits band",
             )?;
         }
         if args.lost {

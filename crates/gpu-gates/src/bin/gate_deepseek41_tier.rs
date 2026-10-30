@@ -32,22 +32,31 @@
 //!   by name before anything is uploaded: as the load's check before the
 //!   uploads (`body::TIER_MAP_BEFORE_UPLOAD`), not the one after them.
 //! - `--batch` (B7): the prose prompt of [`BATCH_P`] positions fed as one
-//!   prompt batch (`body::prefill`), then [`BATCH_STEPS`] greedy steps, bit
-//!   for bit the same prompt fed one decode step per position on the tiered
-//!   load: the call's last position and every greedy step, argmax and
-//!   logits. No reference load.
+//!   prompt batch (`body::prefill`), then [`BATCH_STEPS`] greedy steps, walked
+//!   against the same prompt fed one decode step per position on the tiered
+//!   load (`logits_band::walk`): the call's last position and every greedy
+//!   step, in order. The call's stage experts run the grouped GEMM, its
+//!   tier's the tile path and the steps' the gemv, the same exact integer
+//!   block sums folded in more than one f32 order, so the logits sit within
+//!   the logits band of the steps', not on their bits. No reference load.
 //! - `--batch2` (B7, a group): [`BATCH_P2`] positions, two batches run as one
-//!   group of [`BATCH_GROUP`], then the greedy steps, bit for bit the
-//!   reference's prompt call of the same ids.
+//!   group of [`BATCH_GROUP`], then the greedy steps, walked against the
+//!   reference's prompt call of the same ids. The reference's experts all
+//!   sit on its one card, so all run the grouped GEMM; the tiered call's
+//!   tier experts run the tile path, so the logits sit within the logits
+//!   band of the reference's, not on its bits.
 //!
-//!   Both: precondition, the prompt call itself sent every tier layer at
-//!   least one routed slot (the tier's per-layer hits across the call), and
-//!   `--batch2`'s call ran as a group of two, or the clause proves nothing
-//!   and fails by name.
+//!   Both: the walk's tokens agree until a position the reference was not
+//!   clear about (clear top-1 equality is the band's hard clause), after
+//!   which the contexts differ and the rest is not compared. Precondition,
+//!   the prompt call itself sent every tier layer at least one routed slot
+//!   (the tier's per-layer hits across the call), and `--batch2`'s call ran
+//!   as a group of two, or the clause proves nothing and fails by name.
 //! - `--bfault` (B2): a fault raised on the tier card's word at the first
 //!   tier layer before a prompt call is the call's error, by its layer and
-//!   site, and poisons the model; a reset lifts it and the call is then the
-//!   same prompt fed one decode step per position. No reference load.
+//!   site, and poisons the model; a reset lifts it and the call is then,
+//!   walked as B7's is, within the logits band of the same prompt fed one
+//!   decode step per position. No reference load.
 //! - `--blost` (B3): the tier's stream held behind a host flag before a
 //!   prompt call: within the go deadline and its grace the call fails naming
 //!   the lost card, the host tier is poisoned as a lost card, the next call
@@ -67,12 +76,19 @@
 //!   again — the order `--place bp` opens a draft in (`app::Loaded::open`,
 //!   `open_draft`, `Loaded::ready`). Then the [`FEAT_P`] prose ids fed
 //!   one decode step each, each position's features read after its step
-//!   (`Body::read_features`); against them, a prompt call of the same ids
-//!   (`body::prefill_with`) handing over its last `window` positions' rows,
-//!   for the draft's `attention.sliding_window` and for every position: the
-//!   positions and every row bit for bit. Preconditions: the calls ran two
-//!   batches as one group of [`BATCH_GROUP`], the wide call handed rows over
-//!   from both batches, and it sent every tier layer a routed slot.
+//!   (`Body::read_features`), and a prompt call of the same ids
+//!   (`body::prefill_with`) handing over every position's rows. A second
+//!   call handing over its last `window` positions' rows, for the draft's
+//!   `attention.sliding_window`, holds the positions and every row bit for
+//!   bit the every-position call's: the same load, path and group of
+//!   batches, so the window moves no value. The every-position call's rows
+//!   against the steps': the largest |Δ| and the largest |Δ| relative to
+//!   the step row's largest |x| over every row are printed, the latter held
+//!   to [`FEATURE_REL_PIN`] — the call's experts and the steps' fold the
+//!   same exact integer block sums in other f32 orders, so a row sits near
+//!   the step's, not on its bits. Preconditions: the calls ran two batches
+//!   as one group of [`BATCH_GROUP`], the every-position call handed rows
+//!   over from both batches, and it sent every tier layer a routed slot.
 //!
 //! Every clause is self-consistency (the tiered load against the reference load or against the
 //! same file fed another way), so the fixture tier runs all of them; each names its tag once
@@ -117,6 +133,7 @@ mod gate {
         self, Body, BodyMeta, DECODE_INPUT, Deepseek41Model, FeatureRows, OpenCfg, PrefillMode,
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
+    use bloomery_gpu_gates::logits_band::{self, Positions};
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
@@ -151,9 +168,9 @@ mod gate {
     /// at depth (the `CASES` of P, 512 among them, and the three `SPLITS`;
     /// every layer's ring, state, shadow, rows, keys and logits) is
     /// `gate-gpu-ds41-prefill`'s Cases clause; this clause keeps what only the
-    /// tier loopback load shows, at this size: the batch call is the steps' on
-    /// the tiered load with every tier layer sent a slot, and `--batch2` keeps
-    /// the two-batch call against the reference.
+    /// tier loopback load shows, at this size: the batch call is within the
+    /// band of the steps' on the tiered load with every tier layer sent a slot,
+    /// and `--batch2` keeps the two-batch call against the reference.
     const BATCH_P: usize = 64;
     /// Positions of the prompt call `--batch2` feeds against the reference's:
     /// two batches, one group of two under the default group lever.
@@ -169,6 +186,13 @@ mod gate {
     /// after the tiered load made the batch buffers, every tier layer sent a
     /// slot, and a group of two batches both handing rows over.
     const FEAT_P: usize = 513;
+    /// The most the every-position call's features may sit from the steps': the RMS |Δ| over
+    /// the steps' RMS |x|, every value of every position. A tap that reads another position or
+    /// layer sits near or past 1; the two sum orders sit far under it.
+    // PIN(2026-10-31): the grouped GEMM's sum order; real 0.0789, fixture 0.0644 (against the step one
+    // position earlier: 0.944, 1.245), x2. Not derived: the taps sit past the layers that compound the
+    // first routed seam's sum-order distance.
+    const FEATURE_REL_PIN: f64 = 0.16;
     /// The batches a group holds that `--batch2`'s call must run as.
     const BATCH_GROUP: usize = 2;
     /// Greedy steps after a prompt call.
@@ -438,6 +462,14 @@ mod gate {
             self.tokens.push(token);
             self.logits.push(logits);
         }
+
+        /// The run's tokens, each with the logits row it was taken from.
+        fn positions(&self) -> Positions<'_> {
+            Positions {
+                tokens: &self.tokens,
+                rows: &self.logits,
+            }
+        }
     }
 
     /// The T1 run on `m`: the prompt one step a position, the greedy steps,
@@ -640,6 +672,16 @@ mod gate {
         true
     }
 
+    /// Whether `got`, a prompt call and the greedy steps after it, is within the logits band of
+    /// `want`'s: the two runs' positions walked in order ([`logits_band::walk`]), which prints its
+    /// line. A prompt call's stage experts run the grouped GEMM and a tier's the tile path, while
+    /// the steps' run the gemv and a reference load's call runs every expert on the GEMM, so the
+    /// same exact integer block sums fold in more than one f32 order and the logits are near the
+    /// other order's, not on its bits.
+    fn in_band(what: &str, want: &Run, got: &Run) -> bool {
+        logits_band::walk(what, want.positions(), got.positions()).ok
+    }
+
     fn open(
         file: Split,
         plan: &Plan<'_>,
@@ -688,10 +730,14 @@ mod gate {
                 args.two,
                 "T7: an expert on two devices is refused before any upload",
             ),
-            (args.batch, "B7: one batch is the steps"),
+            (
+                args.batch,
+                "B7: one batch is within the logits band of the steps",
+            ),
             (
                 args.batch2,
-                "B7 group: two batches as one group are the reference's call",
+                "B7 group: two batches as one group are within the logits band of the \
+                 reference's call",
             ),
             (
                 args.bfault,
@@ -707,7 +753,8 @@ mod gate {
             ),
             (
                 args.bfeat,
-                "B8: the feature tap through a tiered prompt call is the steps'",
+                "B8: the feature tap through a tiered prompt call hands over the call's own rows, \
+                 near the steps'",
             ),
         ] {
             if on {
@@ -821,7 +868,7 @@ mod gate {
                 &mut f,
                 &long[..FEAT_P],
                 &dhp.target_layers,
-                &[dhp.window, FEAT_P],
+                &[dhp.window],
                 &tier_layers,
             )?;
             drop(f);
@@ -898,7 +945,7 @@ mod gate {
         if args.batch {
             let want = steps_run(&mut m, &long[..BATCH_P])?;
             let (got, sent) = batch_run(&mut m, &long[..BATCH_P])?;
-            pass &= same(
+            pass &= in_band(
                 "B7 (one batch against the steps, then greedy steps)",
                 &want,
                 &got,
@@ -907,7 +954,7 @@ mod gate {
         }
         if let Some(want) = &want.batch2 {
             let (got, sent) = batch_run(&mut m, &long)?;
-            pass &= same(
+            pass &= in_band(
                 "B7 group (two batches against the reference's call, then greedy steps)",
                 want,
                 &got,
@@ -953,10 +1000,132 @@ mod gate {
         Ok(())
     }
 
+    /// One prompt call's hand-over: each handed row with its position, and what the call sent the
+    /// tier.
+    struct Handed {
+        rows: Vec<(usize, Vec<f32>)>,
+        sent: Option<Sent>,
+    }
+
+    /// `ids` fed as one prompt call from a reset on `m`, whose tap is attached, handing over the
+    /// features of its last `window` positions: clause `what`'s call. `None`, after printing why,
+    /// when the call fails or hands over rows of other positions than those.
+    fn hand_over(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        window: usize,
+        what: &str,
+    ) -> Result<Option<Handed>, GateError> {
+        let width = m.body(NAME)?.feature_width();
+        m.reset()?;
+        let before = tier_counts(m)?;
+        let mut rows: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut sink = |first: u32, chunk: &[f32]| -> Result<(), GpuError> {
+            for (r, row) in chunk.chunks_exact(width).enumerate() {
+                rows.push((first as usize + r, row.to_vec()));
+            }
+            Ok(())
+        };
+        let call = body::prefill_with(
+            m,
+            ids,
+            Some(FeatureRows {
+                window,
+                sink: &mut sink,
+            }),
+        );
+        if let Err(e) = call {
+            println!("FAIL {what}: the prompt call that hands features over failed: {e}");
+            return Ok(None);
+        }
+        let sent = sent_between(before, tier_counts(m)?);
+        let from = ids.len() - window.min(ids.len());
+        let positions: Vec<usize> = rows.iter().map(|(p, _)| *p).collect();
+        if positions.iter().copied().ne(from..ids.len()) {
+            println!(
+                "FAIL {what}: rows of positions {:?}..{:?} ({} rows), want {from}..{}",
+                positions.first(),
+                positions.last(),
+                positions.len(),
+                ids.len()
+            );
+            return Ok(None);
+        }
+        Ok(Some(Handed { rows, sent }))
+    }
+
+    /// The every-position call's feature `rows` against the steps' `want`, clause `what`: the
+    /// RMS |Δ| over the steps' RMS |x|, every value of every row, held to [`FEATURE_REL_PIN`];
+    /// printed beside the largest |Δ| and the row whose |Δ| sits furthest over its own largest
+    /// |x|. A NaN on either side is infinitely far.
+    fn features_near(what: &str, rows: &[(usize, Vec<f32>)], want: &[Vec<f32>]) -> bool {
+        let (mut abs, mut worst, mut at) = (0.0_f64, 0.0_f64, 0);
+        let (mut dd, mut xx, mut nd) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (p, row) in rows {
+            // The control: the same row against the step one position earlier, which a tap
+            // reading the wrong position would match instead.
+            if let Some(prev) = p.checked_sub(1).and_then(|q| want.get(q)) {
+                nd += row
+                    .iter()
+                    .zip(prev)
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>();
+            }
+            let step = &want[*p];
+            if row.len() != step.len() {
+                println!(
+                    "FAIL {what}: position {p}'s row holds {} values, the step's {}",
+                    row.len(),
+                    step.len()
+                );
+                return false;
+            }
+            let (mut d, mut x) = (0.0_f64, 0.0_f64);
+            for (&a, &b) in row.iter().zip(step) {
+                let diff = (f64::from(a) - f64::from(b)).abs();
+                let diff = if diff.is_nan() { f64::INFINITY } else { diff };
+                d = d.max(diff);
+                x = x.max(f64::from(b).abs());
+                dd += diff * diff;
+                xx += f64::from(b) * f64::from(b);
+            }
+            let r = if x > 0.0 {
+                d / x
+            } else if d > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            };
+            abs = abs.max(d);
+            if r > worst {
+                (worst, at) = (r, *p);
+            }
+        }
+        let rel = if xx > 0.0 {
+            (dd / xx).sqrt()
+        } else if dd > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+        let ok = rel <= FEATURE_REL_PIN;
+        let control = if xx > 0.0 { (nd / xx).sqrt() } else { 0.0 };
+        println!(
+            "{} {what} against the steps: {} positions' features, RMS |Δ| over the steps' RMS |x| \
+             {rel:.3e} (pin {FEATURE_REL_PIN}; against the step one position earlier \
+             {control:.3e}); max |Δ| {abs:.3e}, the furthest row position {at} at {worst:.3e} of \
+             its max |x|",
+            if ok { "ok" } else { "FAIL" },
+            rows.len()
+        );
+        ok
+    }
+
     /// B8 (module header): the tap attached to the fresh tiered load `m`,
     /// whose prompt batch's buffers the load made, then those buffers
     /// prepared again; `ids` fed one step each against a prompt call of them
-    /// for each of `windows`.
+    /// handing over every position's rows, and against a call for each of
+    /// `windows`, each narrower than `ids`.
     fn batch_feature_case(
         m: &mut Deepseek41Model,
         ids: &[u32],
@@ -987,72 +1156,54 @@ mod gate {
         }
         let mut ok = true;
         let batches = body::batch_count(ids.len());
-        for &window in windows {
-            let what = format!("B8 (window {window})");
-            m.reset()?;
-            let before = tier_counts(m)?;
-            let mut got: Vec<(usize, Vec<f32>)> = Vec::new();
-            let mut sink = |first: u32, rows: &[f32]| -> Result<(), GpuError> {
-                for (r, row) in rows.chunks_exact(width).enumerate() {
-                    got.push((first as usize + r, row.to_vec()));
-                }
-                Ok(())
-            };
-            let call = body::prefill_with(
-                m,
-                ids,
-                Some(FeatureRows {
-                    window,
-                    sink: &mut sink,
-                }),
-            );
-            if let Err(e) = call {
-                println!("FAIL {what}: the prompt call that hands features over failed: {e}");
-                ok = false;
-                continue;
-            }
-            let sent = sent_between(before, tier_counts(m)?);
-            let from = ids.len() - window.min(ids.len());
-            let positions: Vec<usize> = got.iter().map(|(p, _)| *p).collect();
-            if positions.iter().copied().ne(from..ids.len()) {
+        let every = "B8 (every position)";
+        let full = hand_over(m, ids, ids.len(), every)?;
+        if let Some(full) = &full {
+            ok &= features_near(every, &full.rows, &want);
+            ok &= sent_every(every, full.sent.as_ref(), tier_layers);
+            let first_batch = body::batches(0, ids.len()).first().map_or(0, |r| r.end);
+            let from = full.rows.first().map_or(ids.len(), |(p, _)| *p);
+            if from < first_batch {
+                println!("ok {every} precondition: the first batch handed its rows over too");
+            } else {
                 println!(
-                    "FAIL {what}: rows of positions {:?}..{:?} ({} rows), want {from}..{}",
-                    positions.first(),
-                    positions.last(),
-                    positions.len(),
-                    ids.len()
+                    "FAIL {every} precondition: no row from the first batch (ends at \
+                     {first_batch}); the group's first set's rows are not exercised"
                 );
                 ok = false;
-                continue;
             }
-            let apart = got.iter().find_map(|(p, row)| {
+        } else {
+            ok = false;
+        }
+        for &window in windows {
+            let what = format!("B8 (window {window})");
+            let Some(handed) = hand_over(m, ids, window, &what)? else {
+                ok = false;
+                continue;
+            };
+            let Some(full) = &full else {
+                continue;
+            };
+            let from = ids.len() - window.min(ids.len());
+            let apart = handed.rows.iter().find_map(|(p, row)| {
                 row.iter()
-                    .zip(&want[*p])
+                    .zip(&full.rows[*p].1)
                     .position(|(a, b)| a.to_bits() != b.to_bits())
                     .map(|v| (*p, v))
             });
             if let Some((p, v)) = apart {
-                println!("FAIL {what}: position {p}'s features apart from the step's at value {v}");
+                println!(
+                    "FAIL {what}: position {p}'s features apart from the every-position call's at \
+                     value {v}"
+                );
                 ok = false;
             } else {
                 println!(
-                    "ok {what}: {} positions' features, {from}..{}, bit for bit the steps'",
-                    got.len(),
+                    "ok {what}: {} positions' features, {from}..{}, bit for bit the every-position \
+                     call's",
+                    handed.rows.len(),
                     ids.len()
                 );
-            }
-            if window >= ids.len() {
-                ok &= sent_every(&what, sent.as_ref(), tier_layers);
-                let first_batch = body::batches(0, ids.len()).first().map_or(0, |r| r.end);
-                if from < first_batch {
-                    println!("ok {what} precondition: the first batch handed its rows over too");
-                } else {
-                    println!(
-                        "FAIL {what} precondition: no row from the first batch (ends at \
-                         {first_batch}); the group's first set's rows are not exercised"
-                    );
-                    ok = false;
-                }
             }
         }
         let group = m.body(NAME)?.prefill_group().map(|(g, _)| g);
@@ -1169,7 +1320,7 @@ mod gate {
             ok = false;
         }
         let (got, _) = batch_run(m, ids)?;
-        ok &= same(
+        ok &= in_band(
             "B2 (after the reset, the prompt call against the steps)",
             &want,
             &got,

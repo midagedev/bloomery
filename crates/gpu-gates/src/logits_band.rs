@@ -6,7 +6,10 @@
 //! at a pinned distance from the other order's, not on its bits. The band
 //! is `gate_deepseek41_prefill`'s rule (its module doc); the gates that
 //! compare a batched call with another order of the same call defer to it
-//! here rather than carrying a copy.
+//! here rather than carrying a copy. A comparison of two whole runs, the
+//! call's last position and the steps that follow it, is [`walk`]: the
+//! one walk over their positions in order that the tier and two-card gates
+//! share.
 
 use crate::prompts::MARGIN_FLOOR;
 
@@ -130,4 +133,205 @@ pub fn argmax(row: &[u32]) -> usize {
         }
     }
     best
+}
+
+/// One run's positions in order: the token each position took and the
+/// logits row it took it from, one of each a position.
+#[derive(Clone, Copy)]
+pub struct Positions<'a> {
+    pub tokens: &'a [u32],
+    pub rows: &'a [Vec<f32>],
+}
+
+/// What [`walk`] compared.
+pub struct Walk {
+    /// The band over the compared positions' rows.
+    pub band: LogitsBand,
+    /// The positions whose rows are in the band: each one whose earlier
+    /// tokens agree, through the first whose own token differs.
+    pub compared: usize,
+    /// The leading positions whose tokens agree: a span that ends inside
+    /// them ran on the same context in both runs.
+    pub agreed: usize,
+    /// Whether the band sits within its pins and neither run ends before
+    /// the other while their tokens agree.
+    pub ok: bool,
+}
+
+/// Walk `got` against the reference `want`, two runs of the same ids read
+/// in order, and print one `ok` or `FAIL` line.
+///
+/// A position's row joins the band while every earlier token agrees: both
+/// runs fed it the same context, so the rows differ by the reassociation
+/// alone. At the first position whose tokens differ the walk stops after
+/// folding that row in. It is red when the reference was clear there (a
+/// disagree, held to [`LOGITS_CLEAR_PIN`]); otherwise the two orders
+/// resolved a near-tie differently, the positions after it ran on other
+/// contexts, and the line says how many were left. Red by name: rows of
+/// unequal width, a run that ends before the other while every token
+/// agrees, runs with no position.
+///
+/// # Panics
+/// A run whose tokens and rows are not as many as each other.
+pub fn walk(what: &str, want: Positions<'_>, got: Positions<'_>) -> Walk {
+    for (name, run) in [("reference", want), ("compared run", got)] {
+        assert_eq!(
+            run.tokens.len(),
+            run.rows.len(),
+            "{what}: the {name} holds {} tokens and {} logits rows, one of each a position",
+            run.tokens.len(),
+            run.rows.len()
+        );
+    }
+    let shared = want.tokens.len().min(got.tokens.len());
+    let mut band = LogitsBand::new();
+    let (mut compared, mut agreed, mut apart_clear) = (0, shared, false);
+    let runs = want
+        .tokens
+        .iter()
+        .zip(want.rows)
+        .zip(got.tokens.iter().zip(got.rows));
+    for (i, ((wt, wr), (gt, gr))) in runs.enumerate() {
+        let (clear, disagree) = (band.clear, band.disagree);
+        band.add(&bits(gr), &bits(wr));
+        compared += 1;
+        if wt != gt {
+            apart_clear = band.clear > clear;
+            // A token apart at a clear position is a disagree whatever the
+            // rows' argmax reads.
+            if apart_clear && band.disagree == disagree {
+                band.disagree += 1;
+            }
+            agreed = i;
+            break;
+        }
+    }
+    let stopped = agreed < shared;
+    let ends = !stopped && want.tokens.len() != got.tokens.len();
+    let ok = shared > 0 && !ends && band.ok();
+    let mut red: Vec<String> = Vec::new();
+    if shared == 0 {
+        red.push("no position to compare".into());
+    }
+    if !band.aligned {
+        red.push("rows of unequal width".into());
+    }
+    if apart_clear {
+        red.push(format!(
+            "tokens apart at position {agreed}, where the reference is clear"
+        ));
+    }
+    if ends {
+        red.push(format!(
+            "a run ends at {shared} positions with every token agreeing, the other holds {}",
+            want.tokens.len().max(got.tokens.len())
+        ));
+    }
+    if band.disagree.saturating_sub(LOGITS_CLEAR_PIN) > 0 {
+        red.push("clear top-1 disagreements over the pin".into());
+    }
+    if band.max > LOGITS_MAX_PIN {
+        red.push("max |Δlogit| over the pin".into());
+    }
+    if band.rms().is_nan() || band.rms() > LOGITS_RMS_PIN {
+        red.push("rms |Δlogit| over the pin".into());
+    }
+    let left = if stopped && !apart_clear {
+        format!(
+            ", the tokens part at position {agreed} where the reference is not clear, so the {} \
+             after it, on other contexts, are not compared",
+            want.tokens.len() - agreed - 1
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "{} {what}: {compared} of the reference's {} positions compared{left}: band clear top-1 \
+         {} of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} (pin {LOGITS_MAX_PIN}), rms \
+         {:.3e} (pin {LOGITS_RMS_PIN}){}",
+        if ok { "ok" } else { "FAIL" },
+        want.tokens.len(),
+        band.disagree,
+        band.clear,
+        band.max,
+        band.rms(),
+        if red.is_empty() {
+            String::new()
+        } else {
+            format!("; red: {}", red.join("; "))
+        }
+    );
+    Walk {
+        band,
+        compared,
+        agreed,
+        ok,
+    }
+}
+
+/// An f32 row as the bits [`LogitsBand::add`] takes.
+fn bits(row: &[f32]) -> Vec<u32> {
+    row.iter().map(|v| v.to_bits()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A four-wide row whose top-1 is `top`: over a margin the band reads
+    /// as clear, or, unless `clear`, under it.
+    fn row(top: usize, clear: bool) -> Vec<f32> {
+        let mut r = vec![0.0; 4];
+        r[top] = if clear { 5.0 } else { MARGIN_FLOOR / 2.0 };
+        r
+    }
+
+    fn run<'a>(tokens: &'a [u32], rows: &'a [Vec<f32>]) -> Positions<'a> {
+        Positions { tokens, rows }
+    }
+
+    /// Two runs that agree compare every position; a pin overrun is red
+    /// whatever the tokens say.
+    #[test]
+    fn walk_compares_agreeing_runs_to_their_end_within_the_pins() {
+        let rows = [row(1, true), row(2, true)];
+        let w = walk("same", run(&[1, 2], &rows), run(&[1, 2], &rows));
+        assert!(w.ok && w.compared == 2 && w.agreed == 2 && w.band.clear == 2);
+        let mut far = rows.clone();
+        far[1][2] += 2.0 * LOGITS_MAX_PIN as f32;
+        assert!(!walk("far", run(&[1, 2], &rows), run(&[1, 2], &far)).ok);
+    }
+
+    /// A token apart where the reference is not clear ends the walk
+    /// without a red: the row at that position is in the band, the ones
+    /// after it are not.
+    #[test]
+    fn walk_stops_at_a_token_apart_where_the_reference_is_not_clear() {
+        let want = [row(1, true), row(2, false), row(3, true)];
+        let got = [row(1, true), row(0, false), row(0, true)];
+        let w = walk("near-tie", run(&[1, 2, 3], &want), run(&[1, 0, 0], &got));
+        assert!(w.ok && w.compared == 2 && w.agreed == 1);
+        assert_eq!((w.band.clear, w.band.disagree), (1, 0));
+    }
+
+    /// A token apart where the reference is clear is a disagree.
+    #[test]
+    fn walk_is_red_at_a_token_apart_where_the_reference_is_clear() {
+        let want = [row(1, true), row(2, true)];
+        let got = [row(1, true), row(0, true)];
+        let w = walk("clear", run(&[1, 2], &want), run(&[1, 0], &got));
+        assert!(!w.ok && w.compared == 2 && w.agreed == 1 && w.band.disagree == 1);
+    }
+
+    /// A run that ends first while the tokens agree, and rows of another
+    /// width, are red by name.
+    #[test]
+    fn walk_is_red_on_a_run_that_ends_first_and_on_unequal_widths() {
+        let rows = [row(1, true), row(2, true), row(3, true)];
+        let short = walk("short", run(&[1, 2, 3], &rows), run(&[1, 2], &rows[..2]));
+        assert!(!short.ok && short.compared == 2 && short.agreed == 2);
+        let narrow = [vec![5.0, 0.0, 0.0]];
+        let width = walk("width", run(&[1], &rows[..1]), run(&[1], &narrow));
+        assert!(!width.ok && !width.band.aligned);
+    }
 }

@@ -2665,12 +2665,12 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-se
 # 라우팅된 슬롯이 한 번 이상 갔다. --fault(T2): 층 카드 폴트가 스텝의 오류·독, 리셋 뒤 기준과 같다. --lost(T3): 층
 # 스트림을 호스트 플래그 뒤에 묶으면 데드라인 안에 카드 상실 이름, CardLost 독, 다음 스텝·리셋 거절. --two(T7): 두 장치에
 # 같은 전문가가 있는 계획은 업로드 전에 이름으로 거절. 프롬프트 배치(tierbatch, twoeng R4): --batch(B7) P = 64 배치 하나가
-# 같은 적재에서 스텝으로 먹인 것과 비트까지 같다; --batch2(B7 그룹) P = 1024 배치 둘을 한 그룹으로 돌린 것이 기준 적재의 배치
-# 호출과 비트까지 같고 그룹이 실제로 둘이었다; --bfault(B2) 층 카드 폴트를 올린 뒤의 프롬프트 호출이 같은 폴트로 끝나고 독,
-# 리셋 뒤 스텝과 같다; --blost(B3) 층 스트림을 묶은 채 프롬프트 호출이 데드라인 안에 카드 상실 이름과 CardLost 독으로 끝난다.
+# 같은 적재에서 스텝으로 먹인 것과 logits 밴드(logits_band::walk: clear top-1 같음, max·rms 핀) 안이다; --batch2(B7 그룹) P = 1024
+# 배치 둘을 한 그룹으로 돌린 것이 기준 적재의 배치 호출과 같은 밴드 안이고(층 전문가는 tile, 기준은 GEMM) 그룹이 실제로 둘이었다; --bfault(B2) 층 카드 폴트를 올린 뒤의 프롬프트 호출이 같은 폴트로 끝나고 독,
+# 리셋 뒤 스텝과 같은 밴드 안이다; --blost(B3) 층 스트림을 묶은 채 프롬프트 호출이 데드라인 안에 카드 상실 이름과 CardLost 독으로 끝난다.
 # --bfeat(B8) 따로 한 번 더 적재해, 적재가 배치 버퍼를 만든 뒤 드래프트 특징 탭을 붙이고 prepare_prefill을 다시 부른다(--place bp가
-# 드래프트를 여는 순서). P = 513을 스텝으로 먹여 위치마다 읽은 특징과, 같은 id의 프롬프트 호출이 넘긴 특징(드래프트 창, 전 위치)이
-# 위치·값 비트까지 같다; 전제: 배치 둘이 한 그룹, 넓은 호출은 두 배치 모두에서 행을 넘겼다. 드래프트 헤더는 프로필의 DSPARK_MODEL.
+# 드래프트를 여는 순서). 같은 id의 프롬프트 호출이 드래프트 창으로 넘긴 특징이 전 위치를
+# 넘긴 호출의 것과 위치·값 비트까지 같고, 전 위치 호출의 특징은 P = 513 스텝의 특징과 FEATURE_REL_PIN 안이다; 전제: 배치 둘이 한 그룹, 넓은 호출은 두 배치 모두에서 행을 넘겼다. 드래프트 헤더는 프로필의 DSPARK_MODEL.
 # B7 feeds 64 positions and B8 513 (two batches): the batch call's depth against the steps is gate-gpu-ds41-prefill's oracle, so
 # these keep only what the tier loopback load shows. The lost-card clauses --lost (T3), --blost (B3) and --bfirst (B3f) are not
 # in the landing run: weekly-gpu-ds41-lost runs them. The 3090's plan on either card (shared/gate_card.rs), gate lock.
@@ -2683,8 +2683,9 @@ gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfea
 # name only, adds the plan with the tier on the A6000 beside the stage (two Gpus on one card). The draft is on the 3090
 # in every load; the plans are made under a card budget so the A6000 holds both sets; the stage keeps each layer's id
 # prefix and the tier the next ids. --union: the prose prompt (32 ids) step by step, 48 greedy steps, then the prompt
-# through the draft and 16 DSpark passes, every token, kept count and logits row bit for bit the reference's, the stage
-# graph's node count too; precondition: every tier layer sent a routed slot, the passes kept and rejected a proposal.
+# through the draft and 16 DSpark passes: the stepped part's tokens and logits rows bit for bit the reference's, the call and
+# passes within the logits band (logits_band::walk; the tier's experts run tiles, the reference's the GEMM) and their kept
+# counts equal over the walked passes, the stage graph's node count the reference's; precondition: every tier layer sent a routed slot, the passes kept and rejected a proposal.
 # --lost: the tier's stream held behind a host flag, the step named as a lost card within the deadline, no token,
 # CardLost, the next step refused; not in the landing run: weekly-gpu-ds41-lost runs it. Two loads, one after the
 # other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a batch.
