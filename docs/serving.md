@@ -50,7 +50,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   input items. This is a serialized size bound; JSON value trees allocate additional memory. The oldest finished
   response goes first. A background request gets 503 with `Retry-After` while the running ones fill either bound;
   an oversized background result stays pollable as `failed` with a named error. All responses are lost when the
-  server stops.
+  server stops. A `namespace` tool (Codex's `multi_agent_v1`) flattens: each function inside it serves as a function
+  tool under its bare name, and its calls answer with the namespace as the `function_call` item's `namespace` field.
 - **Chat token counts**: `POST /chat/completions/input_tokens` (and its `/v1/` spelling) answers
   `{"input_tokens": N}` with the same chat request's prompt ids — the chat template's render, an image as its span;
   `max_tokens` is not needed.

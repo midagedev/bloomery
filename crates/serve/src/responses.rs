@@ -47,7 +47,16 @@
 //!   fields but `type` the function's and `strict` `true` when absent. A
 //!   `web_search` tool (`web_search_preview` and the like) is dropped, as
 //!   llama-server drops every tool that is not a function's: it runs on the
-//!   provider's side, and Codex sends one by default.
+//!   provider's side, and Codex sends one by default. A `namespace` tool
+//!   (Codex's `multi_agent_v1`) flattens: each `function` inside it converts
+//!   the same way, under its bare name (the namespace's own `description` is
+//!   not sent), and a call to one answers with that name and the namespace as
+//!   the call item's `namespace` field — the two fields name the tool, never a
+//!   joined name. No two function tools of one request may share a name (the
+//!   flattened name a call answers with would be ambiguous), a tool inside a
+//!   namespace that is not a function is refused by name, and a
+//!   `function_call` item's `namespace` field is read past: the prompt holds
+//!   the bare name the same tools list spells.
 //! - `max_output_tokens`: `max_tokens`.
 //! - `reasoning`: its `effort` (a string) as `reasoning_effort`, which the
 //!   template reads. Its `summary` asks OpenAI's models for a summary of their
@@ -94,7 +103,8 @@
 //! `reasoning` item (the think span as one `reasoning_text` content part,
 //! `summary` empty, `encrypted_content` empty), a `message` item (one
 //! `output_text` part), then one `function_call` item per parsed call
-//! (`call_id`, `name`, `arguments`), each present only when it has
+//! (`call_id`, `name`, `arguments`, and the `namespace` its function came
+//! from when a `namespace` tool flattened it), each present only when it has
 //! something. `usage` is the chat path's: `input_tokens` the whole
 //! prompt, `input_tokens_details.cached_tokens` what the prompt cache kept,
 //! `output_tokens` the generated ids, `total_tokens` their sum. `status` is
@@ -142,16 +152,20 @@
 //! `n` above 1; `text.format` other than `text`, `json_object` or `json_schema`;
 //! `input_file`, an
 //! `input_image` by `file_id`, and an assistant's `refusal` part; a tool that
-//! is neither a function nor a web search; an item, a part or a role the
-//! conversion does not know; and a field of the wrong type. An error is the
-//! chat path's OpenAI error object, its `param` this request's own field
-//! (`input` for the chat path's `messages`); inside a stream that has started, a
+//! is neither a function, a web search nor a namespace; a tool inside a
+//! namespace that is not a function; two function tools of one name; an item,
+//! a part or a role the conversion does not know; and a field of the wrong
+//! type. An error is the chat path's OpenAI error object, its `param` this
+//! request's own field (`input` for the chat path's `messages`); inside a stream that has started, a
 //! `data: {"error": …}` frame with no `event:` line, as llama-server sends it.
 //!
 //! # Where this differs from llama-server
 //!
 //! - An unserved field is refused by name (above) where llama-server ignores
 //!   it or reads the wrong type as empty.
+//! - A `namespace` tool is flattened into function tools and its calls answer
+//!   with a `namespace` field; llama-server drops every tool that is not a
+//!   function's, a namespace included.
 //! - `store`, `background` and `previous_response_id` are served (# The
 //!   store); llama-server keeps no responses and ignores them.
 //! - An assistant message with no `type` is read as a `message`, as OpenAI
@@ -174,6 +188,7 @@
 //! - The non-stream answer's item ids are the stream's (one per output index),
 //!   not fresh ones.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -209,7 +224,11 @@ pub(super) fn create(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io
         let r = request(state, &b)?;
         let plan = chat_plan(state, &r.chat, r.chat.get("reasoning_format"))
             .map_err(|e| named_in(&b, e))?;
-        Ok((Ids::new(state, &b, r.keep), r.conversation, plan))
+        Ok((
+            Ids::new(state, &b, r.keep, r.namespaces),
+            r.conversation,
+            plan,
+        ))
     });
     let (ids, conversation, plan) = match parsed {
         Ok(x) => x,
@@ -338,6 +357,16 @@ struct Converted {
     conversation: Vec<Value>,
     /// The OpenAI chat body the request converts to.
     chat: Map<String, Value>,
+    /// The namespace each function of a `namespace` tool flattened from, by
+    /// its bare name: the answer's calls carry it.
+    namespaces: HashMap<String, String>,
+}
+
+/// The chat body a request converts to, with the namespace each function of
+/// its `namespace` tools flattened from: the answer's calls carry it.
+struct Chat {
+    body: Map<String, Value>,
+    namespaces: HashMap<String, String>,
 }
 
 /// The request `b` read, or the first field it refuses, by name.
@@ -376,13 +405,15 @@ fn request(state: &State, b: &Map<String, Value>) -> Result<Converted, ApiError>
     Ok(Converted {
         keep,
         conversation: items,
-        chat,
+        chat: chat.body,
+        namespaces: chat.namespaces,
     })
 }
 
 /// The OpenAI chat body of a Responses request whose conversation is `items`,
-/// or the first field it refuses, by name.
-fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>, ApiError> {
+/// with the namespace each flattened function of its `namespace` tools came
+/// from, or the first field it refuses, by name.
+fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Chat, ApiError> {
     let mut messages = Vec::new();
     if let Some(v) = set(b, "instructions") {
         let Value::String(s) = v else {
@@ -403,10 +434,12 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     chat.insert("messages".into(), Value::Array(messages));
+    let mut namespaces = HashMap::new();
     if let Some(t) = set(b, "tools") {
         let tools = tools(t).map_err(|e| e.at("tools"))?;
-        if !tools.is_empty() {
-            chat.insert("tools".into(), Value::Array(tools));
+        namespaces = tools.namespaces;
+        if !tools.chat.is_empty() {
+            chat.insert("tools".into(), Value::Array(tools.chat));
         }
     }
     // Range-checked under the name the client sent; the chat half then reads
@@ -436,7 +469,10 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>
         }
         None => {}
     }
-    Ok(chat)
+    Ok(Chat {
+        body: chat,
+        namespaces,
+    })
 }
 
 /// The fields that ask for what this server does not serve, refused by name.
@@ -794,21 +830,60 @@ fn reasoning(it: &Map<String, Value>, out: &mut Vec<Value>) -> Result<(), ApiErr
     Ok(())
 }
 
-/// `tools` as the chat path's function tools; a web search is dropped.
-fn tools(v: &Value) -> Result<Vec<Value>, ApiError> {
+/// The function tools a request's `tools` convert to: the chat path's tools,
+/// every function name seen (no two function tools of one request may share
+/// one) and the namespace each function of a `namespace` tool flattened from.
+#[derive(Default)]
+struct ToolSet {
+    chat: Vec<Value>,
+    names: HashSet<String>,
+    namespaces: HashMap<String, String>,
+}
+
+impl ToolSet {
+    /// One function tool, of the request's top level or of the `namespace`
+    /// `ns` (flattened, so its bare name is remembered with its namespace), as
+    /// the chat path's. A name another function tool of the request already
+    /// holds is refused: a flattened namespace's functions answer calls under
+    /// their bare names, and a shared name could not tell which tool a call
+    /// named.
+    fn function(&mut self, t: &Map<String, Value>, ns: Option<&str>) -> Result<(), ApiError> {
+        let name = function_name(t)?;
+        if !self.names.insert(name.to_owned()) {
+            return Err(invalid(format!(
+                "{}function tool {name} appears more than once: function names must be unique \
+                 across the request's tools",
+                ns.map_or_else(String::new, |ns| format!("namespace {ns}: "))
+            )));
+        }
+        if let Some(ns) = ns {
+            self.namespaces.insert(name.to_owned(), ns.to_owned());
+        }
+        self.chat.push(function_tool(t)?);
+        Ok(())
+    }
+}
+
+/// `tools` as the chat path's function tools, a web search dropped, with the
+/// namespace each function of a `namespace` tool flattened from.
+fn tools(v: &Value) -> Result<ToolSet, ApiError> {
     let Value::Array(tools) = v else {
         return Err(invalid(format!(
             "tools must be an array, not {}",
             json_type(v)
         )));
     };
-    let mut out = Vec::with_capacity(tools.len());
+    let mut out = ToolSet {
+        chat: Vec::with_capacity(tools.len()),
+        ..ToolSet::default()
+    };
     for t in tools {
         let Value::Object(t) = t else {
             return Err(invalid("each tool must be an object"));
         };
         match t.get("type").and_then(Value::as_str) {
-            Some("function") => out.push(function_tool(t)?),
+            Some("function") => out.function(t, None)?,
+            Some("namespace") => namespace_tool(t, &mut out)?,
             Some(kind) if kind.starts_with("web_search") => {}
             Some(kind) => {
                 return Err(invalid(format!(
@@ -821,19 +896,57 @@ fn tools(v: &Value) -> Result<Vec<Value>, ApiError> {
     Ok(out)
 }
 
+/// A `namespace` tool: each `function` inside it flattens under its bare name,
+/// remembered with the namespace for the answer's calls. The namespace's own
+/// `description` is not sent; a namespace that holds no functions contributes
+/// none.
+fn namespace_tool(t: &Map<String, Value>, out: &mut ToolSet) -> Result<(), ApiError> {
+    let ns = match t.get("name") {
+        Some(Value::String(s)) if !s.is_empty() => s,
+        _ => {
+            return Err(invalid("a namespace tool needs a non-empty string 'name'"));
+        }
+    };
+    let inner = match set(t, "tools") {
+        Some(Value::Array(inner)) => inner.as_slice(),
+        Some(v) => {
+            return Err(invalid(format!(
+                "namespace {ns}: 'tools' must be an array, not {}",
+                json_type(v)
+            )));
+        }
+        None => &[],
+    };
+    for x in inner {
+        let Value::Object(x) = x else {
+            return Err(invalid(format!(
+                "namespace {ns}: each tool must be an object"
+            )));
+        };
+        match x.get("type").and_then(Value::as_str) {
+            Some("function") => out.function(x, Some(ns))?,
+            Some(kind) => {
+                return Err(invalid(format!(
+                    "namespace {ns}: a {kind} tool is not supported inside a namespace: this \
+                     server runs function tools only"
+                )));
+            }
+            None => {
+                return Err(invalid(format!(
+                    "namespace {ns}: each tool needs a string 'type'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One function tool as the chat path's: its fields but `type` the function's,
 /// `strict` `true` when absent, as llama-server converts it. Its `name` is a
 /// non-empty string, its `description` a string or absent, its `parameters` an
 /// object or absent.
 fn function_tool(t: &Map<String, Value>) -> Result<Value, ApiError> {
-    let name = match t.get("name") {
-        Some(Value::String(s)) if !s.is_empty() => s,
-        _ => {
-            return Err(invalid(
-                "each function tool needs a non-empty string 'name'",
-            ));
-        }
-    };
+    let name = function_name(t)?;
     if let Some(v) = set(t, "description").filter(|v| !v.is_string()) {
         return Err(invalid(format!(
             "tool {name}: 'description' must be a string, not {}",
@@ -854,6 +967,16 @@ fn function_tool(t: &Map<String, Value>) -> Result<Value, ApiError> {
     Ok(json!({ "type": "function", "function": function }))
 }
 
+/// A function tool's `name`: a non-empty string.
+fn function_name(t: &Map<String, Value>) -> Result<&str, ApiError> {
+    match t.get("name") {
+        Some(Value::String(s)) if !s.is_empty() => Ok(s),
+        _ => Err(invalid(
+            "each function tool needs a non-empty string 'name'",
+        )),
+    }
+}
+
 // ---------------------------------------------------------------- the answer
 
 /// The answer's names: the response's id, its creation time, the request's
@@ -865,10 +988,18 @@ struct Ids {
     created_at: u64,
     model: String,
     keep: Keep,
+    /// The namespace each function of a `namespace` tool flattened from, by
+    /// its bare name: its calls' item carries it.
+    namespaces: HashMap<String, String>,
 }
 
 impl Ids {
-    fn new(state: &State, b: &Map<String, Value>, keep: Keep) -> Self {
+    fn new(
+        state: &State,
+        b: &Map<String, Value>,
+        keep: Keep,
+        namespaces: HashMap<String, String>,
+    ) -> Self {
         Ids {
             id: format!("resp_{}", state.random_id()),
             created_at: unix_now(),
@@ -877,6 +1008,7 @@ impl Ids {
                 .and_then(Value::as_str)
                 .map_or_else(|| state.alias.clone(), str::to_owned),
             keep,
+            namespaces,
         }
     }
 
@@ -916,16 +1048,22 @@ fn message_item(id: &str, text: &str) -> Value {
     })
 }
 
-/// A call's item, `arguments` and `status` as the stream reports it.
+/// A call's item, `arguments` and `status` as the stream reports it. A call
+/// to a function a `namespace` tool flattened carries the namespace: the name
+/// stays the bare one the model called.
 fn call_item(ids: &Ids, c: &ToolCall, arguments: &str, status: &str) -> Value {
-    json!({
+    let mut item = json!({
         "id": ids.item("fc", c.index),
         "type": "function_call",
         "status": status,
         "call_id": ids.item("call", c.index),
         "name": c.name,
         "arguments": arguments,
-    })
+    });
+    if let Some(namespace) = ids.namespaces.get(&c.name) {
+        item["namespace"] = json!(namespace);
+    }
+    item
 }
 
 /// The open item's kind.
@@ -1941,6 +2079,94 @@ mod tests {
         assert!(prompt.ends_with(&turns), "{prompt}");
     }
 
+    /// A `namespace` tool (Codex's `multi_agent_v1`) flattens: each `function`
+    /// inside it converts as the chat path's function tool under its bare
+    /// name, the namespace's `description` not sent, and a call the model
+    /// makes to one answers as the `function_call` item's `namespace` field
+    /// with the bare name (a client routes the two fields apart, never a
+    /// joined name), streamed as the same item; the item comes back on the
+    /// next request as the assistant's call under the bare name, its
+    /// `namespace` field read past.
+    #[test]
+    fn a_namespace_tool_flattens_and_its_calls_answer_with_the_namespace() {
+        let addr = scripted(
+            "<tool_call>\n{\"name\": \"spawn_agent\", \"arguments\": {\"message\": \"hi\"}}\n</tool_call>",
+        );
+        let namespace = json!({
+            "type": "namespace", "name": "multi_agent_v1",
+            "description": "Tools for spawning and managing sub-agents.",
+            "tools": [
+                {"type": "function", "name": "spawn_agent", "strict": false,
+                 "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}},
+                {"type": "function", "name": "wait_agent",
+                 "parameters": {"type": "object"}},
+            ],
+        });
+        let tools = json!([namespace, {"type": "function", "name": "get_goal"}]);
+        let chat_tools = json!([
+            {"type": "function", "function": {
+                "name": "spawn_agent", "strict": false,
+                "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}}},
+            {"type": "function", "function": {
+                "name": "wait_agent", "parameters": {"type": "object"}, "strict": true}},
+            {"type": "function", "function": {"name": "get_goal", "strict": true}},
+        ]);
+        let v = answered(
+            addr,
+            "/v1/responses",
+            &json!({"input": "spawn one", "tools": tools}),
+        );
+        let n = nonce(&v["id"]);
+        let call_id = format!("call_0_{n}");
+        let call = json!({
+            "id": format!("fc_0_{n}"), "type": "function_call", "status": "completed",
+            "call_id": call_id, "name": "spawn_agent", "namespace": "multi_agent_v1",
+            "arguments": "{\"message\":\"hi\"}",
+        });
+        assert_eq!(v["output"], json!([call]), "{v}");
+        assert_eq!(
+            last_prompt(addr),
+            rendered(
+                addr,
+                &json!({
+                    "messages": [{"role": "user", "content": "spawn one"}],
+                    "tools": chat_tools,
+                })
+            )
+        );
+        let mut streamed = json!({"input": "spawn one", "tools": tools});
+        streamed["stream"] = json!(true);
+        let (status, text) = post_stream(addr, "/v1/responses", &streamed);
+        let f = frames(status, &text);
+        let added = &of(&f, "response.output_item.added")[0]["item"];
+        assert_eq!(added["name"], "spawn_agent", "{added}");
+        assert_eq!(added["namespace"], "multi_agent_v1", "{added}");
+        assert_eq!(added["status"], "in_progress", "{added}");
+        let done = &of(&f, "response.output_item.done")[0]["item"];
+        assert_eq!(done["namespace"], "multi_agent_v1", "{done}");
+        let next = json!({
+            "input": [
+                {"role": "user", "content": "spawn one"},
+                v["output"][0],
+                {"type": "function_call_output", "call_id": call_id, "output": "spawned"},
+            ],
+            "tools": tools,
+        });
+        answered(addr, "/v1/responses", &next);
+        let chat = json!({
+            "messages": [
+                {"role": "user", "content": [{"text": "spawn one", "type": "text"}]},
+                {"role": "assistant", "tool_calls": [{
+                    "function": {"arguments": "{\"message\":\"hi\"}", "name": "spawn_agent"},
+                    "id": call_id, "type": "function",
+                }]},
+                {"content": "spawned", "role": "tool", "tool_call_id": call_id},
+            ],
+            "tools": chat_tools,
+        });
+        assert_eq!(last_prompt(addr), rendered(addr, &chat));
+    }
+
     /// The think span the chat path splits off comes back as a `reasoning`
     /// item (one `reasoning_text` part, `summary` and `encrypted_content`
     /// empty) before the message; the next request carrying both items as they
@@ -2042,7 +2268,10 @@ mod tests {
     /// absent and kept when set; a web search (Codex sends one on every
     /// request) is dropped, as llama-server drops it, and a request of web
     /// searches alone renders no tools; every other type is refused by name,
-    /// where llama-server drops it.
+    /// where llama-server drops it. A `namespace` flattens (the test below it),
+    /// so what it refuses is its own: a tool inside it that is not a function,
+    /// a name another function tool of the request already holds (the
+    /// flattened name would be ambiguous), and a namespace without its name.
     #[test]
     fn tools_convert_drop_web_search_and_refuse_the_rest() {
         let addr = scripted("ok");
@@ -2068,7 +2297,6 @@ mod tests {
         assert_eq!(last_prompt(addr), "<user>\nhi<assistant>\n");
         for kind in [
             "custom",
-            "namespace",
             "tool_search",
             "file_search",
             "code_interpreter",
@@ -2085,6 +2313,31 @@ mod tests {
                 &format!("tool type {kind} is not supported"),
             );
         }
+        assert_refused(
+            addr,
+            "/v1/responses",
+            &json!({"input": "hi", "tools": [
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "tools": [{"type": "custom", "name": "x"}]},
+            ]}),
+            "namespace multi_agent_v1: a custom tool is not supported inside a namespace",
+        );
+        assert_refused(
+            addr,
+            "/v1/responses",
+            &json!({"input": "hi", "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "tools": [{"type": "function", "name": "spawn_agent"}]},
+            ]}),
+            "function tool spawn_agent appears more than once",
+        );
+        assert_refused(
+            addr,
+            "/v1/responses",
+            &json!({"input": "hi", "tools": [{"type": "namespace", "tools": []}]}),
+            "a namespace tool needs a non-empty string 'name'",
+        );
     }
 
     /// The request Codex sends is served: its bookkeeping (`store: false`,
