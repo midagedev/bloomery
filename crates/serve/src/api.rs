@@ -3600,9 +3600,6 @@ fn run_choices(
         });
     }
     let (events, rx) = mpsc::channel();
-    // The task id the request's choices share, what its stderr lines and
-    // `/slots` name them by.
-    let id = state.next_id();
     // A sampler its factory refuses ends the request here, before it takes a
     // slot, as any refused sampling field does.
     let subs = ps
@@ -3621,7 +3618,7 @@ fn run_choices(
                 events: Events::new(events.clone(), choice),
                 client: Arc::clone(&client),
                 name: ReqName {
-                    id,
+                    id: state.next_id(),
                     route: route.to_owned(),
                     choice,
                     choices: ps.len(),
@@ -10090,6 +10087,46 @@ mod tests {
             finish[1].contains(" /v1/messages: prompt "),
             "{}",
             finish[1]
+        );
+    }
+
+    /// The choices of one request are tasks of their own: each finish line
+    /// names its choice's index after a task id no other choice shares, the
+    /// id `/slots` and the live view tell one generation by.
+    #[test]
+    fn each_choice_has_its_own_task_id() {
+        let (addr, state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":3,"n":2}"#;
+        let (status, body) = super::testserve::roundtrip(addr, "POST", "/v1/completions", &[], ask);
+        assert_eq!(status, 200, "{body}");
+        let lines = state.shared.notes();
+        let mut tags: Vec<(String, String)> = lines
+            .iter()
+            .filter(|l| l.contains("; stop "))
+            .map(|l| {
+                let tag = l
+                    .strip_prefix("bloomery-serve: request ")
+                    .and_then(|r| r.split_whitespace().next())
+                    .unwrap_or_else(|| panic!("no request tag: {l}"));
+                let (id, choice) = tag
+                    .split_once('.')
+                    .unwrap_or_else(|| panic!("no choice index: {l}"));
+                (choice.to_owned(), id.to_owned())
+            })
+            .collect();
+        tags.sort();
+        assert_eq!(tags.len(), 2, "one line a choice: {lines:#?}");
+        assert_eq!(
+            (tags[0].0.as_str(), tags[1].0.as_str()),
+            ("0", "1"),
+            "{lines:#?}"
+        );
+        assert_ne!(
+            tags[0].1, tags[1].1,
+            "each choice its own task id: {lines:#?}"
         );
     }
 

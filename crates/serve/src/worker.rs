@@ -134,8 +134,8 @@ pub(crate) fn rate(n: u64, ms: f64) -> f64 {
 /// The seconds of generation between a request's stderr progress lines.
 const NOTE_S: f64 = 30.0;
 
-/// What the server's per-request stderr lines name a request by: the task
-/// id it shares with its choices (what `/slots` shows as `id_task`), the
+/// What the server's per-request stderr lines name a request by: its own
+/// task id (what `/slots` shows as `id_task`; each choice has its own), the
 /// path it was posted to, and its choice's index when the request asked for
 /// more than one choice.
 pub(crate) struct ReqName {
@@ -394,8 +394,8 @@ struct Active {
     events: Events,
     /// What the server's stderr lines name the request by.
     name: ReqName,
-    /// The progress lines its generation has printed; the next waits for
-    /// its count's worth of [`NOTE_S`] seconds of generation.
+    /// The whole [`NOTE_S`] intervals of generation its last progress line
+    /// counted; the next line waits for one more.
     noted: usize,
     /// The engine call the request needs next, taken from its generation
     /// by a pump that ran ahead of the call ([`Worker::hold_need`]).
@@ -580,7 +580,7 @@ fn tick_of<'a>(
 ) -> impl FnMut(&Timings) + 'a {
     move |t| {
         if note_due(*noted, t) {
-            *noted += 1;
+            *noted = intervals(t);
             sh.note(progress_line(name, t));
         }
         let mut b = relock(&sh.board);
@@ -595,13 +595,18 @@ fn tick_of<'a>(
 /// a generation that stalls skips to the next multiple rather than printing
 /// a run of lines when it resumes.
 fn note_due(noted: usize, t: &Timings) -> bool {
-    t.predicted_ms >= (noted as f64 + 1.0) * NOTE_S * 1e3
+    intervals(t) > noted
+}
+
+/// The whole [`NOTE_S`] intervals the generation has run.
+fn intervals(t: &Timings) -> usize {
+    (t.predicted_ms / (NOTE_S * 1e3)).floor() as usize
 }
 
 /// `n` ids over `ms` as a rate, one decimal; `-` over no time.
 fn ids_rate(n: usize, ms: f64) -> String {
     if ms > 0.0 {
-        format!("{:.1}", 1e3 / ms * n as f64)
+        format!("{:.1}", rate(n as u64, ms))
     } else {
         "-".to_owned()
     }
@@ -1732,7 +1737,9 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use super::{Acted, Action, ReqName, Shared, finish_line, note_due, progress_line, serve};
+    use super::{
+        Acted, Action, ReqName, Shared, finish_line, intervals, note_due, progress_line, serve,
+    };
     use crate::api::{End, EngineFailure, relock};
     use crate::genloop::{Slot, StopKind, Timings, cause_word};
     use crate::sched::{Board, FifoPicker, Refusal, Reserve};
@@ -1811,22 +1818,32 @@ mod tests {
             predicted_ms: ms,
             ..Timings::default()
         };
+        // What the tick does: a due line counts the intervals passed.
+        let tick = |noted: &mut usize, ms: f64| {
+            let due = note_due(*noted, &t(ms));
+            if due {
+                *noted = intervals(&t(ms));
+            }
+            due
+        };
         let mut noted = 0;
-        assert!(!note_due(noted, &t(0.0)));
-        assert!(!note_due(noted, &t(29_999.0)));
-        assert!(note_due(noted, &t(30_000.0)));
-        noted += 1;
-        assert!(!note_due(noted, &t(30_001.0)));
-        assert!(!note_due(noted, &t(59_999.0)));
-        assert!(note_due(noted, &t(60_000.0)));
-        noted += 1;
+        assert!(!tick(&mut noted, 0.0));
+        assert!(!tick(&mut noted, 29_999.0));
+        assert!(tick(&mut noted, 30_000.0));
+        assert!(!tick(&mut noted, 30_001.0));
+        assert!(!tick(&mut noted, 59_999.0));
+        assert!(tick(&mut noted, 60_000.0));
         // A stall past two intervals: one line, and the next waits for the
         // next multiple.
-        assert!(note_due(noted, &t(95_000.0)));
-        noted += 1;
-        assert!(!note_due(noted, &t(95_001.0)));
-        assert!(!note_due(noted, &t(119_999.0)));
-        assert!(note_due(noted, &t(120_000.0)));
+        assert!(tick(&mut noted, 95_000.0));
+        assert!(!tick(&mut noted, 95_001.0));
+        assert!(!tick(&mut noted, 119_999.0));
+        assert!(tick(&mut noted, 120_000.0));
+        // A stall from the start: one line at 95 s, none at the tokens after.
+        let mut noted = 0;
+        assert!(tick(&mut noted, 95_000.0));
+        assert!(!tick(&mut noted, 95_001.0));
+        assert!(!tick(&mut noted, 95_002.0));
     }
 
     /// The two lines' shapes: a fixed field order, the seconds to two
