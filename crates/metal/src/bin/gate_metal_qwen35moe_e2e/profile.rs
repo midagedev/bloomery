@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::count::{
-    GroupKind, KINDS, Layer, LiveKeys, Ticket, token_count,
+    GroupKind, KINDS, Layer, LiveKeys, Residual, Ticket, token_count,
 };
 use bloomery_metal::arch::qwen3moe::session::{Node, ProfileGroup, Session, StepMode};
 use bloomery_metal::device::MetalDevice;
@@ -65,14 +65,36 @@ fn live_of(n_keys: usize) -> LiveKeys {
 
 /// The kinds one token's groups are tagged with, as the file's own layer plans
 /// derive them: a mixer's three groups (P1, core, out), a join after the mixer
-/// and another after the FFN where the layer's residual is a sandwich, the
+/// and another after the FFN where the layer's residual is a sandwich, or a
+/// hand-on after each where the session's layer hands its plain residual on
+/// (`layers`, the session's own reading: the plans hold no reader types), the
 /// router where the FFN routes, then the gate-up and the down, and at the end
 /// the head's logits and its pick. The count model's own derivation is the
 /// walk's, so the two agree only while both are right.
-fn kinds_expected(plans: &[LayerPlan]) -> Vec<GroupKind> {
+fn kinds_expected(plans: &[LayerPlan], layers: &[Layer]) -> Result<Vec<GroupKind>, String> {
+    if plans.len() != layers.len() {
+        return Err(format!(
+            "{} plans against the session's {} layers",
+            plans.len(),
+            layers.len()
+        ));
+    }
     let mut out = vec![GroupKind::Embed];
-    for plan in plans {
-        let joins = matches!(plan.residual, ResidualPlan::Sandwich(_));
+    for (plan, layer) in plans.iter().zip(layers) {
+        let joins = match (&plan.residual, layer.residual()) {
+            (ResidualPlan::Sandwich(_), Residual::Sandwich) => Some(GroupKind::Join),
+            (ResidualPlan::Plain, Residual::PlainHandOn) => Some(GroupKind::HandOn),
+            (ResidualPlan::Plain, Residual::Plain) => None,
+            (plan, layer) => {
+                let plan = match plan {
+                    ResidualPlan::Plain => "plain",
+                    ResidualPlan::Sandwich(_) => "a sandwich",
+                };
+                return Err(format!(
+                    "the plan's residual is {plan}, the session's layer {layer:?}"
+                ));
+            }
+        };
         match &plan.mixer {
             MixerPlan::Gqa(_) => {
                 out.push(GroupKind::AttnP1);
@@ -90,21 +112,17 @@ fn kinds_expected(plans: &[LayerPlan]) -> Vec<GroupKind> {
                 out.push(GroupKind::ConvOut);
             }
         }
-        if joins {
-            out.push(GroupKind::Join);
-        }
+        out.extend(joins);
         if matches!(plan.ffn.route, FfnRoute::Router { .. }) {
             out.push(GroupKind::Router);
         }
         out.push(GroupKind::GateUp);
         out.push(GroupKind::Down);
-        if joins {
-            out.push(GroupKind::Join);
-        }
+        out.extend(joins);
     }
     out.push(GroupKind::Head);
     out.push(GroupKind::HeadPick);
-    out
+    Ok(out)
 }
 
 /// The samples' kinds against the plans' derivation: every kind's count
@@ -428,8 +446,8 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
     let file = ModelFile::open(path).map_err(|e| e.to_string())?;
     let split = file.header();
     let (plans, hidden) = plans_of(split)?;
-    let expected = kinds_expected(&plans);
     let mut s = Session::open(device, library, path, CTX).map_err(says)?;
+    let expected = kinds_expected(&plans, s.token_layers())?;
     // The ids both arms feed, `ids[k]` the token at position `k`: the walk
     // is deterministic, so a replay of a prefix leaves the same state.
     let mut ids = vec![seed()];

@@ -2564,13 +2564,16 @@ struct Profiler<'s> {
 }
 
 impl Profiler<'_> {
-    /// The join group of `half` on a sandwich layer; a plain residual has
-    /// none, and no group is sampled.
+    /// The join group of `half` on a sandwich layer, the hand-on group on a
+    /// plain residual that hands on; a plain residual that does not has
+    /// neither, and no group is sampled.
     fn join(&mut self, l: LayerCtx<'_>, half: Half) -> Result<(), SessionError> {
-        if !matches!(l.plan.residual, ResidualPlan::Sandwich(_)) {
-            return Ok(());
-        }
-        self.one(GroupKind::Join, Some(l.layer), |o| o.join(l, half))
+        let kind = match l.plan.residual {
+            ResidualPlan::Sandwich(_) => GroupKind::Join,
+            ResidualPlan::Plain if self.arena.hands_on(l.layer) => GroupKind::HandOn,
+            ResidualPlan::Plain => return Ok(()),
+        };
+        self.one(kind, Some(l.layer), |o| o.join(l, half))
     }
 
     fn one(
@@ -2645,8 +2648,9 @@ impl ChainOps for Profiler<'_> {
         self.one(GroupKind::DeltaCore, Some(l.layer), |o| o.delta_core(l, d))
     }
 
-    fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
-        self.one(GroupKind::DeltaOut, Some(l.layer), |o| o.delta_out(l, d))
+    fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::DeltaOut, Some(l.layer), |o| o.delta_project(l))?;
+        self.join(l, Half::Mixer)
     }
 
     fn conv_in(&mut self, l: LayerCtx<'_>, c: &ShortConvPlan) -> Result<(), SessionError> {

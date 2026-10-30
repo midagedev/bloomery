@@ -769,7 +769,8 @@ fn timed(
             *word = gguf::quant::f32_to_f16_bits(value(&mut cstate, 0.1));
         }
     }
-    let partials_host = vec![0f32; partials_len(segments_for_keys(CTX) as usize).expect("fits")];
+    let partials_host =
+        vec![0f32; partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("fits")];
     let out_host = vec![0f32; out_len().expect("the out length wraps")];
     let upload = |host: &[f32]| -> Result<MetalBuffer<f32>, String> {
         device.upload(stream, host).map_err(why)
@@ -906,7 +907,7 @@ fn clear_scratch(
     stream: &MetalStream,
     bufs: &mut Bufs,
 ) -> Result<(), String> {
-    let parts = partials_len(segments_for_keys(CTX) as usize).expect("the partials fit");
+    let parts = partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("the partials fit");
     bufs.partials = device.zeroed::<f32>(stream, Elems(parts)).map_err(why)?;
     bufs.out = device
         .zeroed::<f32>(stream, Elems(out_len().expect("the out length wraps")))
@@ -977,7 +978,7 @@ fn self_check(
     }
     let args = args_words(segments as u32, pos, keys);
     let out_n = out_len().expect("the out length wraps");
-    let parts_all = partials_len(segments_for_keys(CTX) as usize).expect("the partials fit");
+    let parts_all = partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("the partials fit");
     let parts_used = partials_len(segments).ok_or("the self-check partials do not fit")?;
     // The floats of one (head, segment) partial: the max, the weight sum and
     // the head's values.

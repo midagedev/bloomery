@@ -311,6 +311,33 @@ struct NextNormArgs {
 
 static_assert(sizeof(NextNormArgs) == 8, "NextNormArgs is 8 bytes: the host packs two words");
 
+// The next launch's scale over the stream's row ROW of COLS values, into
+// `xn[COLS]`: SIMD group 0's walk, in quant Q's lane order, the one sum both
+// hand-ons write. A macro, not a function, so each kernel's program is the
+// walk written in place. It reads `lane`, `next_gain`, `next`, `xn` and
+// `faults` from the kernel's own names.
+#define NEXT_NORM_SCALE(Q, ROW, COLS)                                                   \
+    typename Q::Lane walk = Q::lane_of((ushort)lane);                                   \
+    const int nb = (int)(COLS / (uint)Q::values_per_block());                           \
+    float sum_sq = 0.f;                                                                 \
+    device const float * yp = ROW + Q::first_block(walk) * Q::values_per_block();       \
+    device const float * gp = next_gain + Q::first_block(walk) * Q::values_per_block(); \
+    for (int ib = Q::first_block(walk); ib < nb; ib += Q::block_stride()) {             \
+        Q::template load<LOAD_NORM>(walk, yp, gp, 1.f, &sum_sq);                        \
+        yp += Q::block_stride() * Q::values_per_block();                                \
+        gp += Q::block_stride() * Q::values_per_block();                                \
+    }                                                                                   \
+    const float sum_squares = simd_sum(sum_sq);                                         \
+    const float scale = rms_scale(sum_squares, (uint)nb * Q::values_per_block(), next.eps); \
+    if (lane == 0u) {                                                                   \
+        if (rms_usable(sum_squares, scale)) {                                           \
+            xn[COLS] = scale;                                                           \
+        } else {                                                                        \
+            raise(faults, next.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);                  \
+            xn[COLS] = NAN;                                                             \
+        }                                                                               \
+    }
+
 template <typename Q>
 kernel void norm_add_next_kernel(device const float *x [[buffer(0)]],
                                  device const float *gain [[buffer(1)]],
@@ -331,30 +358,46 @@ kernel void norm_add_next_kernel(device const float *x [[buffer(0)]],
     if (sg != 0u) {
         return;
     }
-    typename Q::Lane walk = Q::lane_of((ushort)lane);
-    const int nb = (int)(args.norm.cols / (uint)Q::values_per_block());
-    float sum_sq = 0.f;
-    device const float * yp = y + Q::first_block(walk) * Q::values_per_block();
-    device const float * gp = next_gain + Q::first_block(walk) * Q::values_per_block();
-    for (int ib = Q::first_block(walk); ib < nb; ib += Q::block_stride()) {
-        Q::template load<LOAD_NORM>(walk, yp, gp, 1.f, &sum_sq);
-        yp += Q::block_stride() * Q::values_per_block();
-        gp += Q::block_stride() * Q::values_per_block();
-    }
-    const float sum_squares = simd_sum(sum_sq);
-    const float scale = rms_scale(sum_squares, (uint)nb * Q::values_per_block(), next.eps);
-    if (lane == 0u) {
-        if (rms_usable(sum_squares, scale)) {
-            xn[args.norm.cols] = scale;
-        } else {
-            raise(faults, next.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
-            xn[args.norm.cols] = NAN;
-        }
-    }
+    NEXT_NORM_SCALE(Q, y, args.norm.cols)
 }
 
-// Each type's scaled segmented entry and the join that feeds it: the pair of
-// entries a quant's file instantiates beside its own.
+// A plain residual's hand-on: the stream the out projection already added
+// into, read whole, times the next launch's gain into `xn`, each product
+// rounded once (the product the next launch's norm on load forms), and the
+// next launch's scale into `xn[cols]` (NEXT_NORM_SCALE). The stream is only
+// read, so the walk needs no barrier after the stores. A stream the norm
+// cannot take hands on a NaN scale and raises at the next launch's layer.
+struct NormNextArgs {
+    uint cols;          // the stream's values: whole blocks of Q
+    NextNormArgs next;
+};
+
+static_assert(sizeof(NormNextArgs) == 12, "NormNextArgs is 12 bytes: the host packs three words");
+
+template <typename Q>
+kernel void norm_next_kernel(device const float *x [[buffer(0)]],
+                             device const float *next_gain [[buffer(1)]],
+                             device float *xn [[buffer(2)]],
+                             constant NormNextArgs &args [[buffer(3)]],
+                             device atomic_uint *faults [[buffer(4)]],
+                             uint tid [[thread_position_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint f4s = args.cols / 4u;
+    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+        *((device float4 *)(xn + f4 * 4u)) = norm_rows_load4(x, f4) * norm_rows_load4(next_gain, f4);
+    }
+    if (sg != 0u) {
+        return;
+    }
+    constant NextNormArgs &next = args.next;
+    NEXT_NORM_SCALE(Q, x, args.cols)
+}
+
+// Each type's scaled segmented entry and the two hand-ons that feed it, the
+// sandwich join's and the plain residual's: the entries a quant's file
+// instantiates beside its own.
 #define SCALED_SEG_ENTRIES(PREFIX, Q, BQ)                                              \
     template [[host_name(PREFIX "_matvec_seg_scaled")]]                                \
     kernel void matvec_seg_kernel<Q, true>(device const BQ * W [[buffer(0)]],          \
@@ -377,7 +420,16 @@ kernel void norm_add_next_kernel(device const float *x [[buffer(0)]],
                                         constant NextNormArgs & next [[buffer(7)]],    \
                                         uint tid [[thread_position_in_threadgroup]],   \
                                         uint lane [[thread_index_in_simdgroup]],       \
-                                        uint sg [[simdgroup_index_in_threadgroup]]);
+                                        uint sg [[simdgroup_index_in_threadgroup]]);   \
+    template [[host_name(PREFIX "_norm_next")]]                                        \
+    kernel void norm_next_kernel<Q>(device const float * x [[buffer(0)]],              \
+                                    device const float * next_gain [[buffer(1)]],      \
+                                    device float * xn [[buffer(2)]],                   \
+                                    constant NormNextArgs & args [[buffer(3)]],        \
+                                    device atomic_uint * faults [[buffer(4)]],         \
+                                    uint tid [[thread_position_in_threadgroup]],       \
+                                    uint lane [[thread_index_in_simdgroup]],           \
+                                    uint sg [[simdgroup_index_in_threadgroup]]);
 
 // The Q4_K entries, under the names the host launches.
 

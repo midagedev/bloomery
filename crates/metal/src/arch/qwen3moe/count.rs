@@ -52,6 +52,10 @@ pub enum Residual {
     /// The half's out projection (the mixer's out, the FFN's down) adds into
     /// the stream: no group of its own.
     Plain,
+    /// The half's out projection adds into the stream, and a hand-on group
+    /// after it writes the next reader's normed input: two more groups a
+    /// layer.
+    PlainHandOn,
     /// The half's projection writes a buffer of its own and a norm-and-add
     /// group joins it to the stream: two more groups a layer.
     Sandwich,
@@ -71,6 +75,10 @@ const FFN_GROUPS: u32 = 2;
 /// The groups a sandwich adds: a join after the mixer's out and one after the
 /// FFN's down.
 const JOIN_GROUPS: u32 = 2;
+
+/// The groups a plain residual that hands on adds: a hand-on after the
+/// mixer's out and one after the FFN's down.
+const HANDON_GROUPS: u32 = 2;
 
 impl Layer {
     /// How the layer's FFN picks its slots.
@@ -104,7 +112,8 @@ impl Layer {
     }
 
     /// The groups the layer encodes: its mixer's three, its FFN's two and a
-    /// router's ahead of them, and a sandwich's two joins.
+    /// router's ahead of them, and a sandwich's two joins or a plain
+    /// residual's two hand-ons.
     #[must_use]
     pub const fn groups(&self) -> u32 {
         let router = match self.ffn() {
@@ -113,6 +122,7 @@ impl Layer {
         };
         let joins = match self.residual() {
             Residual::Plain => 0,
+            Residual::PlainHandOn => HANDON_GROUPS,
             Residual::Sandwich => JOIN_GROUPS,
         };
         MIXER_GROUPS + FFN_GROUPS + router + joins
@@ -185,7 +195,8 @@ pub struct TokenCount {
 /// ends are the 3. Each layer adds [`Layer::groups`]: P1, the mixer, its out,
 /// the router, the gate-up and the down, so six; a layer of a dense FFN has no
 /// router, so five; a sandwich adds a join after the mixer's out and one after
-/// the down, so seven. Those already include the flash — the attention's fold
+/// the down, and a plain residual that hands on a hand-on after each, so
+/// seven. Those already include the flash — the attention's fold
 /// runs inside it, so past the segment rule's waterline the count is the
 /// same — and the FFN norm, which the router and the gate-up each apply as
 /// they load the residual (a dense layer's gate-up alone). A projection of
@@ -224,7 +235,8 @@ fn fit(what: &str, n: Option<u32>) -> u32 {
 /// segment of keys also folds its partials; the gate-up group and the down
 /// group each carry the shared expert's part with the routed picks' — the
 /// pair and the fold run them together, so no kind of the shared expert
-/// stands alone. A sandwich's join is one kind for both halves.
+/// stands alone. A sandwich's join is one kind for both halves, and so is a
+/// plain residual's hand-on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GroupKind {
     /// The token's embedding row.
@@ -251,6 +263,9 @@ pub enum GroupKind {
     ConvOut,
     /// A sandwich's join: the half's output normed and added to the stream.
     Join,
+    /// A plain residual's hand-on: the stream times the next reader's gain,
+    /// and that reader's scale.
+    HandOn,
     /// The router: the routed logits, the picks and their weights. A dense
     /// FFN has none.
     Router,
@@ -282,6 +297,7 @@ impl GroupKind {
             GroupKind::ConvCore => "conv_core",
             GroupKind::ConvOut => "conv_out",
             GroupKind::Join => "join",
+            GroupKind::HandOn => "hand_on",
             GroupKind::Router => "router",
             GroupKind::GateUp => "gate_up",
             GroupKind::Down => "down",
@@ -292,7 +308,7 @@ impl GroupKind {
 }
 
 /// Every kind, in the token's walk order: the order a profile's lines print.
-pub const KINDS: [GroupKind; 16] = [
+pub const KINDS: [GroupKind; 17] = [
     GroupKind::Embed,
     GroupKind::AttnP1,
     GroupKind::AttnFlash,
@@ -304,6 +320,7 @@ pub const KINDS: [GroupKind; 16] = [
     GroupKind::ConvCore,
     GroupKind::ConvOut,
     GroupKind::Join,
+    GroupKind::HandOn,
     GroupKind::Router,
     GroupKind::GateUp,
     GroupKind::Down,
@@ -649,6 +666,33 @@ mod tests {
             TokenCount {
                 groups: 171,
                 dispatches: 172
+            }
+        );
+    }
+
+    /// Qwen3.8-27B's 64 layers over a dense FFN, the plain residual handing
+    /// on: seven groups a layer and the ends' three, 451 groups and 451
+    /// dispatches (the plain add's 323 is `a_dense_layer_has_no_router_group`'s).
+    /// Mutant: `HANDON_GROUPS` is 1, or `Layer::groups` counts a plain
+    /// residual that hands on as one that does not.
+    #[test]
+    fn a_plain_hand_on_adds_two_groups_a_layer() {
+        let layers: Vec<Layer> = dense(&vec![routed_delta(Projection::ONE); 64])
+            .into_iter()
+            .map(|l| match l {
+                Layer::Delta { qkv, ffn, .. } => Layer::Delta {
+                    qkv,
+                    ffn,
+                    residual: Residual::PlainHandOn,
+                },
+                other => other,
+            })
+            .collect();
+        assert_eq!(
+            token_count(&layers, LiveKeys::Within64, Ticket::Folded),
+            TokenCount {
+                groups: 451,
+                dispatches: 451
             }
         );
     }

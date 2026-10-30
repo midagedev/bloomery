@@ -9,11 +9,12 @@
 //! its last threadgroup, so an attention mixer is one group at any depth. A
 //! layer whose residual is a sandwich has a join group `J` after the mixer's
 //! out and after the down: the out and the down store into the join buffer,
-//! and `J` norms that buffer into the stream ([`MetalOps::join`]). A sandwich
-//! layer whose readers each have a scaled entry hands on ([`Arena::hands_on`]):
-//! its joins also write the next reader's input, the stream times that
-//! reader's gain and then the norm's scale, which the reader takes in place of
-//! its norm on load. The FFN
+//! and `J` norms that buffer into the stream ([`MetalOps::join`]). A layer
+//! whose readers each have a scaled entry hands on ([`Arena::hands_on`]): its
+//! joins, or on a plain residual a hand-on group `N` after the mixer's out
+//! and after the down ([`MetalOps::hand_on`]), write the next reader's input,
+//! the stream times that reader's gain and then the norm's scale, which the
+//! reader takes in place of its norm on load. The FFN
 //! norm has no group of its own: the router (R) and the gate-up pair (G) each
 //! norm the residual as they load it. The head's pick is the token's last
 //! group and closes no barrier; a token whose pick nobody reads encodes none
@@ -48,8 +49,8 @@ use crate::kernels::router::RouterParams;
 use crate::kernels::{
     AttentionParams, AttnCache, AttnLayer, DeltaParams, EmbedParams, FoldParams, HEAD_SIMD_GROUPS,
     HeadNormParams, HeadParams, Kernels, LoadNorm, MatvecParams, Mode, NormAddNextParams,
-    NormAddRowsParams, NormRowsParams, PASS_ROWS, PairParams, SegParams, SharedPlan,
-    ShortConvStepParams, segments_for_window,
+    NormAddRowsParams, NormNextParams, NormRowsParams, PASS_ROWS, PairParams, Quant, SegParams,
+    SharedPlan, ShortConvStepParams, segments_for_window,
 };
 
 /// The half of a layer a sandwich joins: the mixer's, then the FFN's, the
@@ -413,6 +414,43 @@ fn half_out<'b>(
 }
 
 /// The refusal of a sandwich layer over an arena with no join buffer.
+/// What layer `l`'s half `half` hands on to: the reader, its weight type and
+/// gain, and the hand-on buffer the writer fills.
+struct HandOnTo<'a> {
+    reader: Reader,
+    quant: Quant,
+    gain: &'a MetalBuffer<f32>,
+    xn: &'a mut MetalBuffer<f32>,
+}
+
+/// The reader after layer `l`'s half `half` and the hand-on buffer; a reader
+/// with no scaled entry or an arena with no hand-on buffer is refused by name.
+fn hand_on_to<'a>(
+    layers: &'a [LayerBufs],
+    head: (Quant, &'a MetalBuffer<f32>),
+    xn: &'a mut Option<MetalBuffer<f32>>,
+    l: usize,
+    half: Half,
+) -> Result<HandOnTo<'a>, SessionError> {
+    let reader = Reader::after(layers.len(), l, half);
+    let (quant, gain) = reader_norm(layers, head, reader).ok_or_else(|| {
+        refuse(format!(
+            "layer {l}: a half hands on to {reader:?}, which has no scaled entry"
+        ))
+    })?;
+    let xn = xn.as_mut().ok_or_else(|| {
+        refuse(format!(
+            "layer {l}: a half hands on over an arena with no hand-on buffer"
+        ))
+    })?;
+    Ok(HandOnTo {
+        reader,
+        quant,
+        gain,
+        xn,
+    })
+}
+
 fn no_join(l: usize) -> SessionError {
     refuse(format!(
         "layer {l}: a sandwich residual over an arena with no join buffer"
@@ -691,16 +729,86 @@ impl MetalOps<'_, '_> {
         Ok(())
     }
 
-    /// Layer `l`'s down group: a plain residual folds the experts' down
-    /// projections into the stream; a sandwich over a dense FFN stores its one
-    /// down projection into the join buffer for [`MetalOps::join`]. A
+    /// Layer `l`'s dense down group under a plain residual: its one slot's
+    /// down projection added into the stream by the residual mat-vec. A
+    /// dense slot's route weight is 1 and the mat-vec walks the fold's lane
+    /// order, so the stream takes the fold's bits with no per-block slot
+    /// address.
+    fn dense_down_add(&mut self, l: usize) -> Result<(), SessionError> {
+        let Arena {
+            layers,
+            h,
+            x,
+            hidden,
+            geom,
+            ..
+        } = &mut *self.arena;
+        let f = &layers[l].ffn;
+        self.kernels.matvec(
+            self.enc,
+            MatvecParams {
+                quant: f.down_quant,
+                rows: *hidden,
+                cols: geom.experts.k,
+                weights: all(&f.down)?,
+                x: h.window(Elems(0), Elems(geom.experts.k))?,
+                y: x.window_mut(Elems(0), Elems(*hidden))?,
+                mode: Mode::Residual,
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s down group: a plain residual folds the routed experts'
+    /// down projections into the stream, and adds a dense FFN's one
+    /// ([`MetalOps::dense_down_add`]); a sandwich over a dense FFN stores its
+    /// one down projection into the join buffer for [`MetalOps::join`]. A
     /// sandwich over a routed FFN is refused by name: the combine only adds.
     pub(super) fn experts_down(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
         match (&l.plan.ffn.route, &l.plan.residual) {
-            (_, ResidualPlan::Plain) => self.experts_fold(l.layer),
+            (FfnRoute::Dense, ResidualPlan::Plain) => self.dense_down_add(l.layer),
+            (FfnRoute::Router { .. }, ResidualPlan::Plain) => self.experts_fold(l.layer),
             (FfnRoute::Dense, ResidualPlan::Sandwich(_)) => self.dense_down_store(l.layer),
             (FfnRoute::Router { .. }, ResidualPlan::Sandwich(_)) => Err(routed_sandwich(l.layer)),
         }
+    }
+
+    /// Layer `l`'s delta out group: the head-norm projection of the gated
+    /// numerator, added into the stream. The projection has the residual
+    /// epilogue only: a sandwich over the delta rule is refused by name, at
+    /// the open and here.
+    pub(super) fn delta_project(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        l.plain_only("qwen3moe::MetalOps::delta_out")?;
+        let slot = slot_of(self.pos);
+        let Arena {
+            layers,
+            g,
+            delta_partials,
+            x,
+            faults,
+            eps,
+            hidden,
+            ..
+        } = &mut *self.arena;
+        let d = delta_of!(layers, l.layer);
+        self.kernels.headnorm_resid(
+            self.enc,
+            HeadNormParams {
+                quant: d.out_quant,
+                rows: *hidden,
+                cols: g.len().get(),
+                weights: all(&d.out)?,
+                g: all(g)?,
+                partials: all(delta_partials)?,
+                y: x.window_mut(Elems(0), Elems(*hidden))?,
+                eps: *eps,
+                fault: &faults[slot],
+                layer: layer_word(l.layer),
+            },
+        )?;
+        self.close();
+        Ok(())
     }
 
     /// Layer `l`'s attention out group: the output projection of the flash's
@@ -805,10 +913,12 @@ impl MetalOps<'_, '_> {
     /// the half's scale, `x += add · gain ⊙ rms_norm(out)`. A layer that
     /// hands on ([`Arena::hands_on`]) also writes its reader's normed input
     /// into the hand-on buffer. A plain residual has no join group (its out
-    /// and down added into the stream) and nothing is encoded.
+    /// and down added into the stream): one that hands on runs its hand-on
+    /// group instead ([`MetalOps::hand_on`]), and one that does not encodes
+    /// nothing.
     pub(super) fn join(&mut self, l: LayerCtx<'_>, half: Half) -> Result<(), SessionError> {
         let ResidualPlan::Sandwich(s) = &l.plan.residual else {
-            return Ok(());
+            return self.hand_on(l.layer, half);
         };
         let slot = slot_of(self.pos);
         let hands_on = self.arena.hands_on(l.layer);
@@ -841,34 +951,58 @@ impl MetalOps<'_, '_> {
             add: s.add[half.index()],
         };
         if hands_on {
-            let reader = Reader::after(layers.len(), l.layer, half);
-            let (quant, gain) = reader_norm(layers, (*head_quant, &*head_norm), reader)
-                .ok_or_else(|| {
-                    refuse(format!(
-                        "layer {}: a join hands on to {reader:?}, which has no scaled entry",
-                        l.layer
-                    ))
-                })?;
-            let xn = xn.as_mut().ok_or_else(|| {
-                refuse(format!(
-                    "layer {}: a join hands on over an arena with no hand-on buffer",
-                    l.layer
-                ))
-            })?;
+            let to = hand_on_to(layers, (*head_quant, &*head_norm), xn, l.layer, half)?;
             self.kernels.norm_add_next(
                 self.enc,
                 NormAddNextParams {
                     join: joined,
-                    quant,
-                    gain: all(gain)?,
+                    quant: to.quant,
+                    gain: all(to.gain)?,
                     eps: *eps,
-                    layer: reader.layer(),
-                    out: all_mut(xn)?,
+                    layer: to.reader.layer(),
+                    out: all_mut(to.xn)?,
                 },
             )?;
         } else {
             self.kernels.norm_add_rows(self.enc, joined)?;
         }
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s hand-on group of `half` on a plain residual that hands on
+    /// ([`Arena::hands_on`]): the stream the half's out projection added
+    /// into, times the next reader's gain, and that reader's scale, into the
+    /// hand-on buffer. A layer that does not hand on encodes nothing.
+    fn hand_on(&mut self, l: usize, half: Half) -> Result<(), SessionError> {
+        if !self.arena.hands_on(l) {
+            return Ok(());
+        }
+        let slot = slot_of(self.pos);
+        let Arena {
+            layers,
+            x,
+            xn,
+            faults,
+            hidden,
+            eps,
+            head_quant,
+            head_norm,
+            ..
+        } = &mut *self.arena;
+        let to = hand_on_to(layers, (*head_quant, &*head_norm), xn, l, half)?;
+        self.kernels.norm_next(
+            self.enc,
+            NormNextParams {
+                quant: to.quant,
+                x: x.window(Elems(0), Elems(*hidden))?,
+                gain: all(to.gain)?,
+                eps: *eps,
+                layer: to.reader.layer(),
+                out: all_mut(to.xn)?,
+                fault: &faults[slot],
+            },
+        )?;
         self.close();
         Ok(())
     }
@@ -1028,41 +1162,12 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
-        // The head-norm projection has the residual epilogue only: a sandwich
-        // over the delta rule is refused by name, at the open and here.
-        l.plain_only("qwen3moe::MetalOps::delta_out")?;
         if self.arm(l.m)? == Arm::Rows {
+            l.plain_only("qwen3moe::MetalOps::delta_out")?;
             return self.rows_delta_out(l.layer, l.m);
         }
-        let slot = slot_of(self.pos);
-        let Arena {
-            layers,
-            g,
-            delta_partials,
-            x,
-            faults,
-            eps,
-            hidden,
-            ..
-        } = &mut *self.arena;
-        let d = delta_of!(layers, l.layer);
-        self.kernels.headnorm_resid(
-            self.enc,
-            HeadNormParams {
-                quant: d.out_quant,
-                rows: *hidden,
-                cols: g.len().get(),
-                weights: all(&d.out)?,
-                g: all(g)?,
-                partials: all(delta_partials)?,
-                y: x.window_mut(Elems(0), Elems(*hidden))?,
-                eps: *eps,
-                fault: &faults[slot],
-                layer: layer_word(l.layer),
-            },
-        )?;
-        self.close();
-        Ok(())
+        self.delta_project(l)?;
+        self.join(l, Half::Mixer)
     }
 
     fn conv_in(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {

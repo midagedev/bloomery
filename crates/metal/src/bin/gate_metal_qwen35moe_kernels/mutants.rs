@@ -1821,14 +1821,20 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "handon_plain_no_gain",
+        clause: "handon_readers",
+        why: "the plain residual's hand-on writes the stream without the reader's gain",
+        edits: &[(
+            "= norm_rows_load4(x, f4) * norm_rows_load4(next_gain, f4);",
+            "= norm_rows_load4(x, f4);",
+            1,
+        )],
+    },
+    Mutant {
         name: "handon_nan_scale_finite",
         clause: "handon_nan",
         why: "a next norm that cannot take the stream hands on its zero scale, a finite value",
-        edits: &[(
-            "xn[args.norm.cols] = NAN;",
-            "xn[args.norm.cols] = scale;",
-            1,
-        )],
+        edits: &[("xn[COLS] = NAN;", "xn[COLS] = scale;", 1)],
     },
     Mutant {
         name: "handon_nan_xg_stays",

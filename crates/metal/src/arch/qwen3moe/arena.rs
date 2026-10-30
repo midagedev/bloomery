@@ -290,9 +290,9 @@ pub(super) struct Arena {
     /// What a half's out projection writes before its join, `hidden` values;
     /// none for a file with no sandwich.
     pub(super) join: Option<MetalBuffer<f32>>,
-    /// What a join that hands on ([`Arena::hands_on`]) writes for the launch
-    /// after it: the new stream times that launch's norm gain, `hidden`
-    /// values, then the norm's scale; none for a file with no sandwich.
+    /// What a layer that hands on ([`Arena::hands_on`]) writes for the
+    /// launch after each half: the new stream times that launch's norm gain,
+    /// `hidden` values, then the norm's scale.
     pub(super) xn: Option<MetalBuffer<f32>>,
     /// The rope tables, one for each distinct base and factors the attention
     /// layers have: `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`.
@@ -317,14 +317,15 @@ pub(super) fn layer_word(l: usize) -> u32 {
     u32::try_from(l).expect("a layer index fits u32")
 }
 
-/// A launch that norms the stream on load right after a sandwich join.
+/// A launch that norms the stream on load right after a half's join or
+/// hand-on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reader {
-    /// Layer `l`'s P1, after layer `l − 1`'s FFN join.
+    /// Layer `l`'s P1, after layer `l − 1`'s FFN half.
     P1(usize),
-    /// Layer `l`'s gate-up pair, after its mixer join.
+    /// Layer `l`'s gate-up pair, after its mixer half.
     Pair(usize),
-    /// The head's logits, after the last layer's FFN join.
+    /// The head's logits, after the last layer's FFN half.
     Head,
 }
 
@@ -798,10 +799,7 @@ impl Arena {
             attn_ticket: zeroed(device, 1)?,
             conv_y: g.has_conv().then(|| zeroed(device, hidden)).transpose()?,
             join: g.has_join().then(|| zeroed(device, hidden)).transpose()?,
-            xn: g
-                .has_join()
-                .then(|| zeroed(device, hidden + 1))
-                .transpose()?,
+            xn: Some(zeroed(device, hidden + 1)?),
             ropes,
             h: zeroed(device, geom.experts.slots * geom.experts.k)?,
             logits: zeroed(device, vocab)?,
@@ -820,7 +818,8 @@ impl Arena {
     pub(super) fn token_layers(&self) -> Vec<Layer> {
         self.layers
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
                 let ffn = if l.ffn.router.is_some() {
                     FfnKind::Routed
                 } else {
@@ -828,6 +827,8 @@ impl Arena {
                 };
                 let residual = if l.post.is_some() {
                     Residual::Sandwich
+                } else if self.hands_on(i) {
+                    Residual::PlainHandOn
                 } else {
                     Residual::Plain
                 };
@@ -852,19 +853,19 @@ impl Arena {
             .collect()
     }
 
-    /// Whether layer `l`'s joins hand their readers the normed input: a
-    /// sandwich layer whose two readers ([`Reader::after`]) each have a
-    /// scaled entry ([`reader_norm`]). The join writes the new stream times
-    /// the reader's gain and the reader's scale into [`Arena::xn`], and the
-    /// reader takes them in place of its norm on load. A layer's two joins
-    /// hand on together; the join and its reader both ask here.
+    /// Whether layer `l`'s halves hand their readers the normed input: a
+    /// layer whose two readers ([`Reader::after`]) each have a scaled entry
+    /// ([`reader_norm`]). A sandwich's join, or on a plain residual a hand-on
+    /// group after the half's out projection, writes the new stream times the
+    /// reader's gain and the reader's scale into [`Arena::xn`], and the reader
+    /// takes them in place of its norm on load. A layer's two halves hand on
+    /// together; the writer and its reader both ask here.
     pub(super) fn hands_on(&self, l: usize) -> bool {
-        let Some(layer) = self.layers.get(l) else {
+        if l >= self.layers.len() {
             return false;
-        };
+        }
         let head = (self.head_quant, &self.head_norm);
-        layer.post.is_some()
-            && self.xn.is_some()
+        self.xn.is_some()
             && [Half::Mixer, Half::Ffn].into_iter().all(|half| {
                 reader_norm(
                     &self.layers,
@@ -1059,6 +1060,21 @@ impl Arena {
                     state: 0,
                 })
             }
+            GroupKind::HandOn => {
+                no_ids()?;
+                if bufs()?.post.is_some() || !self.hands_on(layer) {
+                    return Err(refuse(format!(
+                        "{kind:?}: layer {layer} runs no plain hand-on"
+                    )));
+                }
+                Ok(GroupBytes {
+                    // The reader's gain it reads is counted with the reader.
+                    weights: 0,
+                    // The stream read, its reader's input and scale written.
+                    acts: f32s(self.hidden) + f32s(self.hidden + 1),
+                    state: 0,
+                })
+            }
             GroupKind::DeltaCore => {
                 no_ids()?;
                 let d = delta_of(bufs()?, layer, kind)?;
@@ -1180,6 +1196,13 @@ impl Arena {
                         // sandwich's down stores its projection, and no route
                         // weight scales it.
                         bytes_of(&self.h) + f32s(self.hidden),
+                    ),
+                    _ if f.router.is_none() => (
+                        picks * expert(&f.down)?,
+                        // The one slot's row read, the residual read and
+                        // written: a dense down adds its projection with no
+                        // route weight.
+                        bytes_of(&self.h) + 2 * f32s(self.hidden),
                     ),
                     _ => (
                         picks * expert(&f.down)?
