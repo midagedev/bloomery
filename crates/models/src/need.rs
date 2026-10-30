@@ -97,6 +97,14 @@ pub enum Need {
     StreamIndex { heads: u32, d: u32 },
     /// Index keys pooled by the indexer's own compressor.
     IndexKeyCompressor,
+    /// Index keys projected from the layer input over the raw positions.
+    IndexKeyFromInput,
+    /// A latent layer that reads a cache another layer wrote: it stores
+    /// nothing and attends the source's rows.
+    SharedLatentCache,
+    /// SSMax: the query scaled per head by `s·ln(pos + 1) + b`, the
+    /// attention's and its indexer's.
+    SsMax,
     /// A top-k over learned pools of the raw positions' keys.
     TokenPool { heads: u32, d: u32, pool: u32 },
     /// A LayerNorm with a gain and a bias on each index key.
@@ -325,6 +333,13 @@ impl fmt::Display for Need {
             Need::WholeStream => f.write_str("a compressed stream attended whole, without a top-k"),
             Need::StreamIndex { heads, d } => write!(f, "stream indexer: {heads} heads x {d}"),
             Need::IndexKeyCompressor => f.write_str("index keys from the indexer's own compressor"),
+            Need::IndexKeyFromInput => {
+                f.write_str("index keys projected from the layer input, one per position")
+            }
+            Need::SharedLatentCache => {
+                f.write_str("the latent cache another layer wrote, read in place of its own")
+            }
+            Need::SsMax => f.write_str("SSMax: the query scaled per head by s*ln(pos + 1) + b"),
             Need::TokenPool { heads, d, pool } => {
                 write!(f, "token-pool indexer: {heads} heads x {d}, pool {pool}")
             }
@@ -627,6 +642,12 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if a.pe > 0 {
                     at(Need::LatentPe { width: a.pe });
                 }
+                if a.ssmax {
+                    at(Need::SsMax);
+                }
+                if matches!(a.cache, Source::From(_)) {
+                    at(Need::SharedLatentCache);
+                }
                 if a.out_gate == OutGate::Proj {
                     at(Need::LatentOutGate);
                 }
@@ -836,8 +857,10 @@ fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
                 heads: *heads,
                 d: *d,
             });
-            if matches!(keys, Source::Own(IndexKeys::Compressor(_))) {
-                at(Need::IndexKeyCompressor);
+            match keys {
+                Source::Own(IndexKeys::Compressor(_)) => at(Need::IndexKeyCompressor),
+                Source::Own(IndexKeys::FromInput { .. }) => at(Need::IndexKeyFromInput),
+                Source::Own(IndexKeys::FromRows) | Source::From(_) => {}
             }
         }
         Selector::TokenPool {

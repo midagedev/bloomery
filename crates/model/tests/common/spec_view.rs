@@ -19,6 +19,12 @@ fn src<T>(s: &Source<T>, inner: impl Fn(&T) -> String) -> String {
 }
 
 fn rope(r: &Rope) -> String {
+    // The net magnitude joins only where it leaves 1, so every attached
+    // model's pins keep theirs.
+    let magnitude = match r.yarn {
+        Some(y) if y.magnitude != 1.0 => format!(" magnitude {}", y.magnitude),
+        _ => String::new(),
+    };
     let yarn = r.yarn.map_or("-".to_string(), |y| {
         format!(
             "{}/{}/{}/{}",
@@ -29,7 +35,7 @@ fn rope(r: &Rope) -> String {
     // theirs.
     let factors = if r.factors { " factors" } else { "" };
     format!(
-        "{:?} {} base {} yarn {yarn}{factors}",
+        "{:?} {} base {} yarn {yarn}{factors}{magnitude}",
         r.mode, r.dims, r.base
     )
 }
@@ -64,6 +70,7 @@ fn select(o: &mut String, select: Option<&Selector>) {
                 src(keys, |k| match k {
                     IndexKeys::FromRows => String::new(),
                     IndexKeys::Compressor(c) => format!("{{icmp {c:?}}}"),
+                    IndexKeys::FromInput { .. } => " {input}".to_string(),
                 }),
                 src(list, |()| String::new())
             );
@@ -126,6 +133,14 @@ pub fn layer_line(layer: &LayerSpec) -> String {
             );
             if a.pe > 0 || a.out_gate != OutGate::None {
                 let _ = write!(o, " pe {} gate {:?}", a.pe, a.out_gate);
+            }
+            // The SSMax flag and a shared cache join the line only where set,
+            // for the same reason: every attached model's pins keep their text.
+            if a.ssmax {
+                o.push_str(" ssmax");
+            }
+            if let models::Source::From(l) = a.cache {
+                let _ = write!(o, " cache<-{l}");
             }
             if let Some(Compress { ratio, rows }) = &a.compress {
                 let _ = write!(
