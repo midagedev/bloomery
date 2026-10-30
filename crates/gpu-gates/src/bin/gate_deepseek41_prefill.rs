@@ -378,26 +378,26 @@ mod gate {
     /// batched call's logits and the steps' run — a compared position whose
     /// steps' top1−top2 margin is at least `MARGIN_FLOOR` (the e2e clarity
     /// rule) where the two top-1s differ. Clear-position top-1 equality is
-    /// the band's hard clause; this pin holds at zero until the calibration
-    /// run re-pins it with a `PIN(YYYY-MM-DD):` line and its derivation
-    /// (both paths reassociate the same exact integer block sums; the band
-    /// is measured, not derived — the derived band is the first routed seam
-    /// clause's).
+    /// the band's hard clause: both paths reassociate the same exact integer
+    /// block sums, and the derived band is the first routed seam clause's.
     const LOGITS_CLEAR_PIN: usize = 0;
     /// The largest |Δlogit| the band admits between a batched call's logits
     /// and the steps' run, over every compared value. The last logits
     /// compound the first routed seam's distance through the remaining
     /// layers, past what the sum-order model derives (the first routed seam
     /// clause carries the derived band), so this pin carries the measured
-    /// distance: zero until the calibration run re-pins it with a
-    /// `PIN(YYYY-MM-DD):` line and its derivation.
-    const LOGITS_MAX_PIN: f64 = 0.0;
+    /// distance with twice its headroom; it catches a broken call, not a
+    /// value bug (the seam clause and the clear top-1 do).
+    // PIN(2026-10-30): the grouped GEMM's sum order; the largest of 16 cases a tier, real 7.852 (P=1), fixture
+    // 1.375, x2. Not derived: attention and requantization compound the first routed seam's sum-order distance.
+    const LOGITS_MAX_PIN: f64 = 16.0;
     /// The RMS |Δlogit| the band admits, over the same values. The last
     /// logits compound the first routed seam's distance through the
     /// remaining layers, past what the sum-order model derives, so this pin
-    /// carries the measured distance: zero until the calibration run re-pins
-    /// it with a `PIN(YYYY-MM-DD):` line and its derivation.
-    const LOGITS_RMS_PIN: f64 = 0.0;
+    /// carries the measured distance with twice its headroom.
+    // PIN(2026-10-30): the grouped GEMM's sum order; the largest of 16 cases a tier, real 1.245 (P=1), fixture
+    // 0.184, x2. Not derived, as the max pin.
+    const LOGITS_RMS_PIN: f64 = 2.5;
 
     /// One arm of the clear clause: the first `p` ids of
     /// `corpus-<corpus>.ids` as one prompt call, then `steps` greedy steps.
