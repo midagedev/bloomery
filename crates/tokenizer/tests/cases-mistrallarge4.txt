@@ -1,0 +1,69 @@
+# Mistral Large 4's own cases for the tokenizer oracle's mistrallarge4 row (oracle.sh EXTRA), after tests/cases.txt; printf %b
+# escapes, one a line. The vocabulary is gpt2 BPE with the `tekken-num3` pre: the Tekken regex whose digit rule is
+# `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`, so a digit run is cut in groups of three counted from its right end. First digit runs of
+# every length 1..10 alone, after a space, inside words and beside punctuation, other scripts' digits and number shapes. Then the
+# special tokens (`<unk> <s> </s> <pad>`, the chat template's `[INST]`, `[SYSTEM_PROMPT]`, `[THINK]`, `[MODEL_SETTINGS]`,
+# `[AVAILABLE_TOOLS]`, `[TOOL_CALLS]`, `[ARGS]`, `[TOOL_RESULTS]` and their closers, the image markers, the `<SPECIAL_n>` slots) next
+# to text and to each other, whole rendered turns and near misses, then cased words, contractions, Korean, emoji and whitespace.
+1
+12
+123
+1234
+12345
+123456
+1234567
+12345678
+123456789
+1234567890
+ 1234567890
+x1234567890y
+a 1234567 b
+0001234567
+-1234567 +1234567 (1234567) [1234567] 1234567.
+3.14159265358979 2.718281828
+1,234,567.89 USD
+123 456 789 0123
+12\n345\n6789
+٣٤٥٦٧ １２３４５６７ ²³⁴⁵ ①②③ 一二三四五
+2026-10-31T13:45:59.123456Z
+0x1F4A9 0b1010101010 1e-10 1_000_000
+<unk>
+<s>
+</s>
+<pad>
+<s>Hello</s>
+<s><s></s></s>
+[INST]
+[/INST]
+[INST]What is 2+2?[/INST]
+[INST][INST][/INST][/INST]
+[INST] [/INST]
+x[INST]y
+ [INST] 
+[[INST]]
+[inst] [Inst] [INST
+INST] [ INST ]
+[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT]
+<s>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST]What is 2+2?[/INST]4</s>
+<s>[INST]What is 2+2?[/INST]4</s>[INST]And 3+3?[/INST]
+[THINK]x[/THINK]y
+[THINK]\nLet me think. 17 * 24 = 408.\n[/THINK]\n\nThe answer is 408.
+[MODEL_SETTINGS]{"reasoning_effort": "high"}[/MODEL_SETTINGS]
+[AVAILABLE_TOOLS][{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}][/AVAILABLE_TOOLS]
+[TOOL_CALLS]get_weather[ARGS]{"city": "Seoul"}
+[TOOL_RESULTS]{"temp": 21}[/TOOL_RESULTS]
+[IMG][IMG_BREAK][IMG_END]
+[TOOL_CONTENT] [CALL_ID] [AUDIO] [BEGIN_AUDIO]
+[PREFIX]a[MIDDLE]b[SUFFIX]c
+<SPECIAL_20><SPECIAL_21>x
+<SPECIAL_999>
+HelloWorld ABCdef camelCaseWord SCREAMING_SNAKE_CASE ÀÉÎõü
+I'm don't we've they'll he'd it's
+fn main() {\n    let total: u64 = (1..=1000).sum();\n    println!("{}", total); // 500500\n}
+한국어 문장입니다. 숫자 12345도 있고 1234567원도 있습니다.
+😀 👍🏽 🇰🇷 👨‍👩‍👧‍👦 ❤️
+a\n\n\nb
+  x
+x  
+\t\ttab
+a \r\n b
