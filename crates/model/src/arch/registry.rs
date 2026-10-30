@@ -17,7 +17,8 @@ use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
     deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, lfm3, llama, mimo2,
-    minimaxm3, musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
+    minimaxm3, mistrallarge4, musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1,
+    solar2,
 };
 use crate::placement::PlacementError;
 
@@ -346,6 +347,15 @@ pub static ROWS: &[ArchRow] = &[
             draft: DraftSource::None,
         })),
     },
+    ArchRow {
+        arch: Some(Arch::MistralLarge4),
+        names: &["mistral-large4"],
+        read: Some(mistrallarge4::spec::read),
+        draft: None,
+        // No fixture of its own yet: the requantized mini of real layers is a
+        // later round's, and the meta gate reads the checked-in header tables.
+        fixture: None,
+    },
 ];
 
 /// Every profile's cut fixture, in table order.
@@ -440,6 +450,7 @@ mod tests {
             GEMMA_EMBEDDING => gemma_embedding::spec::read,
             GEMMA_EMBEDDING2 => gemma_embedding2::spec::read,
             "muse-spark" => musespark::spec::read,
+            "mistral-large4" => mistrallarge4::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }
@@ -485,6 +496,7 @@ mod tests {
             Arch::GemmaEmbedding2,
             Arch::Flint,
             Arch::MuseSpark,
+            Arch::MistralLarge4,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");

@@ -108,6 +108,10 @@ pub enum Arch {
     /// LFM3: gated short-conv layers and GQA layers (sliding or full) in one trunk, a dense
     /// SwiGLU block in every layer, sandwich norms, a tied head.
     Lfm3,
+    /// Mistral Large 4: MLA with no query latent, SSMax, a lightning indexer over keys from
+    /// the layer input, KV sharing and NoPE layers the file's arrays name, over softmax-routed
+    /// experts with one shared. No program runs it yet.
+    MistralLarge4,
 }
 
 impl Arch {
@@ -136,6 +140,7 @@ impl Arch {
             Arch::MuseSpark => "muse-spark",
             Arch::Llama => "llama",
             Arch::Lfm3 => "lfm3",
+            Arch::MistralLarge4 => "mistral-large4",
         }
     }
 }
@@ -324,7 +329,8 @@ impl Gqa {
 pub struct Latent {
     /// `attention.head_count`.
     pub heads: u32,
-    /// `attention.q_lora_rank`: the query latent's values.
+    /// `attention.q_lora_rank`: the query latent's values. 0: the query is the
+    /// hidden row's own projection, no query latent on the path.
     pub q_lora: u32,
     /// The cached row's values.
     pub latent: u32,
@@ -333,9 +339,18 @@ pub struct Latent {
     pub rope: Option<Rope>,
     /// A per-head RMS norm on the query, without a gain.
     pub q_head_norm: bool,
+    /// SSMax: every query value of head `h` is scaled by
+    /// `s_h·ln(pos + 1) + b_h` (`attn_ssmax`), the whole cached-width row after
+    /// its parts are joined, and the indexer's query by its own pair
+    /// (`indexer.ssmax`, one per index head) — the same op, one code path.
+    pub ssmax: bool,
     /// Key values beside the latent in the cached row, which no rope turns: shared by every head
     /// (`qk_rope_head_dim` of a model that rotates none). 0: the row is the latent alone.
     pub pe: u32,
+    /// Who writes the cached rows this layer reads ([`Source::From`]:
+    /// `attention.kv_source_map`, the layer stores nothing); the source's
+    /// rope-ness is the reader's to hold equal.
+    pub cache: Source<()>,
     /// The gate on the heads' outputs before the output projection; [`OutGate::Proj`] is a
     /// projection of the layer input of its own (`attn_gate`). [`OutGate::Packed`] and
     /// [`OutGate::ProjHead`] are not a latent layer's.
@@ -412,7 +427,9 @@ impl<T> Source<T> {
 /// How a latent layer picks the compressed rows it attends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Selector {
-    /// A top-k over index keys, one per compressed row.
+    /// A top-k over index keys, one per compressed row of the layer's stream,
+    /// or one per raw position where the layer compresses nothing
+    /// ([`Latent::compress`] `None`).
     StreamTopK {
         /// `attention.indexer.head_count`.
         heads: u32,
@@ -472,12 +489,24 @@ pub enum PoolRule {
 }
 
 /// Where a layer's index keys come from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IndexKeys {
     /// Projected from the pooled latent rows.
     FromRows,
     /// Pooled from the layer input by the indexer's own compressor.
     Compressor(Compressor),
+    /// Projected from the layer input over the raw positions: the projection
+    /// of the input, a LayerNorm with a gain and a bias on it (at `norm_eps`,
+    /// `attention.layer_norm_epsilon`), the layer's own [`Latent::rope`]
+    /// turning its head's first `dims` values (none on a layer whose rope is
+    /// `None`), then the Hadamard rotation, the keys stored f16 — DeepSeek's
+    /// lightning index keys, one per position. The scoring query is the same
+    /// form: the LayerNorm-normed input projected by the indexer's own
+    /// `attn_q_b`.
+    FromInput {
+        /// The LayerNorm's epsilon on the key.
+        norm_eps: f32,
+    },
 }
 
 /// A two-level candidate pool: the blocks another layer's index scores rank first.
@@ -580,6 +609,12 @@ pub struct Yarn {
     pub orig_ctx: u32,
     pub beta_fast: f32,
     pub beta_slow: f32,
+    /// The net factor on the rotated values — ggml's `mscale`, the product of
+    /// the `attn_factor` the caller passes and YaRN's own `1 + 0.1·ln factor`:
+    /// the reader states the value the whole recipe applies, so no consumer
+    /// works an `attn_factor` out again. A model that runs YaRN without
+    /// magnitude scaling states 1.
+    pub magnitude: f32,
 }
 
 /// A layer's feed-forward block.

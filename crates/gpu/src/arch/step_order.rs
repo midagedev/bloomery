@@ -343,8 +343,10 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         Arch::GemmaEmbedding => ("GemmaEmbedding", GEMMA_ENCODER),
         Arch::GemmaEmbedding2 => ("GemmaEmbedding2", GEMMA_ENCODER),
         Arch::MuseSpark => ("MuseSpark", MUSE_SPARK),
-        // Reader only: neutral decoding order, not a runnable step.
+        // Reader only, each of them: a neutral decoding order, not a
+        // runnable step.
         Arch::Flint => ("Flint", FaultSite::ALL),
+        Arch::MistralLarge4 => ("MistralLarge4", FaultSite::ALL),
     };
     StepOrder { arch: name, sites }
 }
@@ -356,7 +358,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`of`] gives it a table).
-    fn every_arch() -> [Arch; 15] {
+    fn every_arch() -> [Arch; 16] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -373,6 +375,7 @@ mod tests {
             Arch::GemmaEmbedding2,
             Arch::Flint,
             Arch::MuseSpark,
+            Arch::MistralLarge4,
         ];
         for a in all {
             match a {
@@ -390,7 +393,8 @@ mod tests {
                 | Arch::GemmaEmbedding
                 | Arch::GemmaEmbedding2
                 | Arch::Flint
-                | Arch::MuseSpark => {}
+                | Arch::MuseSpark
+                | Arch::MistralLarge4 => {}
             }
         }
         all
