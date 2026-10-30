@@ -16,6 +16,8 @@ in [`docs/bloomery/`](https://github.com/midagedev/rig-log/tree/main/docs/bloome
 | [`evaluating.md`](evaluating.md) | A checklist to run bloomery and compare it fairly; hardware reports |
 | [`agents.md`](agents.md) | Starting the server from an agent: the commands, the events to wait on, the exit codes |
 | [`claude-code.md`](claude-code.md) | Claude Code on a local model, on an NVIDIA card or a Mac, with measured first-turn times |
+| [`pi.md`](pi.md) | pi on a local model: the smallest first request of the surveyed agents, on an NVIDIA card or a Mac |
+| [`dsh.md`](dsh.md) | DeepSeek Harness (dsh) on DeepSeek-V4.1-Flash: the server, the profile patch, what to expect |
 | [`serving.md`](serving.md) | llama-server compatibility, the flags, the seats, concurrent requests, drafts, residency, limits |
 | [`models.md`](models.md) | The recommended files and what each model needs in GPU, RAM and disk |
 | [`performance.md`](performance.md) | The numbers' conditions, why it is fast, how it is verified, recorded sessions |

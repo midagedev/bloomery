@@ -2,8 +2,26 @@
 
 For a program or an agent that starts `bloomery-serve` and then calls its API. stdout is machine-readable: JSON,
 one object a line. stderr is text for people; do not parse it. On a Mac the server is `bloomery-serve-metal`, which
-has none of this yet: read [On a Mac](#on-a-mac) instead. To run Claude Code itself on the local model, read
-[`claude-code.md`](claude-code.md).
+has none of this yet: read [On a Mac](#on-a-mac) instead. To run a coding agent on the model you started, read
+[Which coding agent](#which-coding-agent).
+
+## Which coding agent
+
+The server this page starts can run one. The agents differ most in the size of their first request: 6,181 bytes for
+pi 0.86.1, 68,225 for Claude Code 2.1.314. On a slow machine that first prompt pass is the wait a user notices. The
+survey behind this table, each agent's request and how it was captured, is
+[`research/coding-agents.md`](research/coding-agents.md).
+
+| Machine or model | Agent | Why |
+|---|---|---|
+| A slow machine (a Mac) | [`pi`](pi.md) | the smallest first request of the survey: 2,261 ids in 5.3 s on an M1 Pro with Qwen3-Coder-30B-A3B, against Claude Code's 17,410 ids in 91.7 s (measured) |
+| DeepSeek-V4.1-Flash | [`dsh`](dsh.md) | DeepSeek's own harness; the second smallest first request (~6,600 ids [derived]); its web UI shows the work as it happens |
+| A fast card set, a demo | [Claude Code](claude-code.md) or OpenCode | many tools and long prompts (~19,300 and ~18,600 ids [derived]) that a fast prompt pass absorbs; Claude Code needs the release after 0.3.11 on a Qwen3.6 or Qwen3.8 model |
+| The Codex CLI | Codex, on the release after 0.3.11 | 0.3.11 refuses its `namespace` tool on the first request; ~10,800 ids [derived] |
+
+Pin the agent's version for a demo or a script: agents change their request between patch releases, and Claude Code's
+change from 2.1.312 to 2.1.314 alone broke a rehearsed session. The setup pages: [`pi.md`](pi.md),
+[`dsh.md`](dsh.md), [`claude-code.md`](claude-code.md).
 
 ## Rules
 
