@@ -24,7 +24,8 @@
 //! Qwen3-Coder's reference parser reads one, is `true` or `false` in either
 //! case ([`boolean`]), spelled in lower case; every other parameter (another
 //! `type`, a `type` list without `string`, or no `type` at all) is JSON,
-//! spelled in `arguments` as the model wrote it.
+//! spelled in `arguments` as the model wrote it, a control character inside
+//! one of its strings escaped ([`json_value`]).
 //!
 //! A call is emitted when its `</tool_call>` arrives; the parameters become a
 //! JSON object in the model's order, serialized compactly to a string. Text
@@ -44,6 +45,7 @@
 //! of a string parameter as it arrives. Every decision depends on the text
 //! only, never on how it was cut into pieces.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde_json::Value;
@@ -503,6 +505,54 @@ fn boolean(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// The text to write into `arguments` for a JSON-typed parameter: `raw` as the
+/// model wrote it when it parses, else the same text with every control
+/// character U+0000–U+001F inside a string literal escaped (`\n`, `\r`, `\t`
+/// for those, `\u00XX` for the rest; the raw byte is not JSON, its meaning
+/// still the character itself) when that parses, else none: no JSON, and a
+/// value for it would be a guess.
+fn json_value(raw: &str) -> Option<Cow<'_, str>> {
+    if serde_json::from_str::<Value>(raw).is_ok() {
+        return Some(Cow::Borrowed(raw));
+    }
+    let mut escaped = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut after_backslash = false;
+    for c in raw.chars() {
+        if !in_string {
+            in_string = c == '"';
+        } else if after_backslash {
+            after_backslash = false;
+        } else {
+            match c {
+                '\\' => after_backslash = true,
+                '"' => in_string = false,
+                '\n' => {
+                    escaped.push_str("\\n");
+                    continue;
+                }
+                '\r' => {
+                    escaped.push_str("\\r");
+                    continue;
+                }
+                '\t' => {
+                    escaped.push_str("\\t");
+                    continue;
+                }
+                c @ '\0'..='\u{1f}' => {
+                    escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        escaped.push(c);
+    }
+    serde_json::from_str::<Value>(&escaped)
+        .is_ok()
+        .then_some(Cow::Owned(escaped))
+}
+
 /// The first characters of `s`, for an error.
 fn quote(s: &str) -> String {
     s.chars().take(QUOTE).collect()
@@ -638,11 +688,11 @@ fn parse_call(
                         value: quote(raw),
                     })?
             }
-            Some(Kind::Json(ty)) => match serde_json::from_str::<Value>(raw) {
+            Some(Kind::Json(ty)) => match json_value(raw) {
                 // The value as the model wrote it, as llama-server writes a
                 // typed value back; a re-serialization would respell it.
-                Ok(_) => raw.to_owned(),
-                Err(_) => {
+                Some(value) => value.into_owned(),
+                None => {
                     return Err(QwenXmlError::NotJson {
                         index,
                         name: name.to_owned(),
@@ -742,9 +792,10 @@ impl CallRead {
                             Some(word) => self.args.push_str(word),
                             None => return parse_call(s, index, kinds, framing, false),
                         },
-                        Some(Kind::Json(_)) if serde_json::from_str::<Value>(raw).is_ok() => {
-                            self.args.push_str(raw)
-                        }
+                        Some(Kind::Json(_)) => match json_value(raw) {
+                            Some(value) => self.args.push_str(&value),
+                            None => return parse_call(s, index, kinds, framing, false),
+                        },
                         _ => return parse_call(s, index, kinds, framing, false),
                     }
                 }

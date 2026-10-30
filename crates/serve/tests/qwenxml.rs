@@ -67,6 +67,11 @@ const INDENT: &str = "</think><tool_call>\n<function=run_python>\n<parameter=cod
 const TEXT_THEN_CALL: &str = "</think>Let me inspect the directory.\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
 const THINK_THEN_CALL: &str = "I should inspect the directory.</think>Let me inspect it now.\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
 const TYPED: &str = "</think><tool_call>\n<function=save_note>\n<parameter=filter>\n{\"n\": [1, 2], \"q\": \"서울 ☃\"}\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=pinned>\ntrue\n</parameter>\n<parameter=text>\na<b & \"c\"\n</parameter>\n</function>\n</tool_call>";
+/// A JSON-typed value whose strings hold a raw newline and a raw tab (the
+/// spelling a model writing code reaches: strict JSON forbids the raw byte,
+/// its meaning still the character itself), with escapes of its own that stay
+/// as written.
+const RAW_CONTROL: &str = "</think><tool_call>\n<function=save_note>\n<parameter=tags>\n[\"a \\\"quoted\\\" line\nnext\", \"tab\tback\\\\slash\"]\n</parameter>\n</function>\n</tool_call>";
 const BOOLEANS: &str = "</think><tool_call>\n<function=save_note>\n<parameter=pinned>\nTrue\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=save_note>\n<parameter=pinned>\n FALSE \n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=save_note>\n<parameter=pinned>\nfalse\n</parameter>\n</function>\n</tool_call>";
 const LIST_AND_UNTYPED: &str = "</think><tool_call>\n<function=lookup>\n<parameter=q>\nhello, world\n</parameter>\n<parameter=n>\n42\n</parameter>\n</function>\n</tool_call>";
 const RESOLVED: &str = "</think><tool_call>\n<function=resolve>\n<parameter=path>\nsrc/a.rs\n</parameter>\n<parameter=mode>\nfast\n</parameter>\n<parameter=when>\n2026-10-06\n</parameter>\n<parameter=either>\n7\n</parameter>\n<parameter=both>\nx\n</parameter>\n<parameter=limit>\n7\n</parameter>\n</function>\n</tool_call>";
@@ -237,6 +242,21 @@ fn fixtures() -> Vec<(
                     0,
                     "save_note",
                     r#"{"filter":{"n": [1, 2], "q": "서울 ☃"},"tags":["a", "b"],"pinned":true,"text":"a<b & \"c\""}"#,
+                )],
+            ),
+        ),
+        (
+            "a JSON value whose strings hold raw control characters, escaped",
+            ON,
+            Deepseek,
+            RAW_CONTROL,
+            msg(
+                "",
+                "",
+                vec![call(
+                    0,
+                    "save_note",
+                    r#"{"tags":["a \"quoted\" line\nnext", "tab\tback\\slash"]}"#,
                 )],
             ),
         ),
