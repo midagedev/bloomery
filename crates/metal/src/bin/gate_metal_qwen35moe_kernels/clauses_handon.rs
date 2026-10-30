@@ -7,15 +7,17 @@
 //! launch's own lane order. A reader given that input ([`LoadNorm::Scaled`])
 //! stores the bits its norm-on-load launch stores over the new row: the
 //! segmented mat-vec, the gate-up pair and the head's logits, of every type
-//! with an entry.
+//! with an entry. A plain residual's hand-on
+//! ([`Kernels::norm_next`](bloomery_metal::kernels::Kernels::norm_next))
+//! writes the same input from the new stream as it stands, the join's bits.
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, Window};
 use bloomery_metal::encode::ComputeEncoder;
 use bloomery_metal::kernels::{
-    HEAD_SIMD_GROUPS, HeadParams, LoadNorm, NormAddNextParams, NormAddRowsParams, NormRowsParams,
-    PairParams, Quant, SegParams, Segment,
+    HEAD_SIMD_GROUPS, HeadParams, LoadNorm, NormAddNextParams, NormAddRowsParams, NormNextParams,
+    NormRowsParams, PairParams, Quant, SegParams, Segment,
 };
 use bloomery_metal::{MetalBuffer, MetalDevice};
 
@@ -121,6 +123,40 @@ fn join(
     }
     xn.truncate(K + 1);
     Ok((y, xn))
+}
+
+/// The plain residual's hand-on over `stream` for `next`: the hand-on buffer,
+/// `K` values and the scale, checked one word past it as [`join`] checks.
+fn plain(h: &Harness<'_>, stream: &[f32], next: &Next<'_>) -> Result<Vec<f32>, String> {
+    let (device, stream_q) = (h.device, h.stream);
+    let pad = f32::from_bits(SENTINEL_BITS);
+    let x_b = device.upload(stream_q, stream).map_err(why)?;
+    let gain_b = device.upload(stream_q, next.gain).map_err(why)?;
+    let mut xn_b = device.upload(stream_q, &vec![pad; K + 2]).map_err(why)?;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        h.kernels.norm_next(
+            encoder,
+            NormNextParams {
+                quant: next.quant,
+                x: x_b.window(Elems(0), Elems(K))?,
+                gain: gain_b.window(Elems(0), Elems(K))?,
+                eps: next.eps,
+                layer: LAYER,
+                out: xn_b.window_mut(Elems(0), Elems(K + 1))?,
+                fault: h.device.fault_word(),
+            },
+        )
+    })?;
+    let mut xn = vec![0f32; K + 2];
+    device
+        .read(stream_q, xn_b.whole().map_err(why)?, &mut xn)
+        .map_err(why)?;
+    if xn[K + 1].to_bits() != SENTINEL_BITS {
+        return Err("the plain hand-on wrote past the hand-on buffer's scale word".to_string());
+    }
+    xn.truncate(K + 1);
+    Ok(xn)
 }
 
 /// What a reader loads: the new stream with the norm on load, or the hand-on
@@ -339,11 +375,14 @@ fn gain(seed: u64) -> Vec<f32> {
 /// every reader given that input stores the bits of its norm-on-load launch
 /// over the new stream (the scale summed in the reader's own lane order):
 /// the segmented mat-vec and the pair of each type, the head of each type with
-/// an entry. Two joins: LFM3's add 1 at eps 1e-5, and a negative add.
-/// Mutants: `handon_xg_no_gain` (the hand-on value is the stream's, without
-/// the gain), `handon_scale_ulp` (the hand-on scale is one rounding off the
-/// reader's), `handon_seg_scale_ignored` (the scaled mat-vec rows skip the
-/// scale), `handon_pair_scale_ignored` (the scaled pair skips it).
+/// an entry. The plain residual's hand-on over the new stream writes the
+/// join's hand-on bits, values and scale. Two joins: LFM3's add 1 at eps 1e-5,
+/// and a negative add. Mutants: `handon_xg_no_gain` (the hand-on value is the
+/// stream's, without the gain), `handon_plain_no_gain` (the plain hand-on's
+/// is), `handon_scale_ulp` (the hand-on scale, both hand-ons' one walk, is
+/// one rounding off the reader's), `handon_seg_scale_ignored` (the scaled
+/// mat-vec rows skip the scale), `handon_pair_scale_ignored` (the scaled pair
+/// skips it).
 pub fn handon_readers(h: &Harness<'_>) -> Clause {
     let post_gain = gain(0x4A01);
     let next_gain = gain(0x4A02);
@@ -376,6 +415,9 @@ pub fn handon_readers(h: &Harness<'_>) -> Clause {
             same_bits(&format!("{name}: the stream"), &y_next, &y)?;
             let xg: Vec<f32> = y.iter().zip(&next_gain).map(|(v, g)| v * g).collect();
             same_bits(&format!("{name}: the hand-on values"), &xn[..K], &xg)?;
+            let xn_plain = plain(h, &y, &next)?;
+            common::expect_clean(h, &format!("{name}: the plain hand-on"))?;
+            same_bits(&format!("{name}: the plain hand-on"), &xn_plain, &xn)?;
             let scale = xn[K];
             if !(scale.is_finite() && scale > 0.0) {
                 return Err(format!("{name}: the hand-on scale is {scale:e}"));
@@ -419,7 +461,7 @@ pub fn handon_readers(h: &Harness<'_>) -> Clause {
         parts.push(format!("add {add}"));
     }
     Ok(Verdict::Noted(format!(
-        "the stream's bits, the values times the gain, and the scaled readers' bits (mat-vec and pair of five types, head of four) at {}",
+        "the stream's bits, the values times the gain, the plain hand-on's bits equal to the join's, and the scaled readers' bits (mat-vec and pair of five types, head of four) at {}",
         parts.join(", ")
     )))
 }
@@ -427,8 +469,10 @@ pub fn handon_readers(h: &Harness<'_>) -> Clause {
 /// A join the norm cannot take is NaN in the stream, the hand-on values and
 /// the scale; a stream the next norm cannot take (a value whose square
 /// overflows) keeps finite stream and hand-on values and hands on a NaN scale. Each raises
-/// the norm site, and the scaled reader's rows are NaN. Mutants:
-/// `handon_nan_scale_finite` (the unusable next norm hands on its zero scale),
+/// the norm site, and the scaled reader's rows are NaN; the plain hand-on over
+/// that stream hands on the same values and a NaN scale and raises. Mutants:
+/// `handon_nan_scale_finite` (the unusable next norm hands on its zero scale,
+/// in both hand-ons' one walk),
 /// `handon_nan_xg_stays` (a join the norm cannot take leaves the hand-on
 /// values as they were).
 pub fn handon_nan(h: &Harness<'_>) -> Clause {
@@ -517,6 +561,23 @@ pub fn handon_nan(h: &Harness<'_>) -> Clause {
             xn[K]
         ));
     }
+    let xn_plain = plain(h, &y, &next)?;
+    common::expect_fault(
+        h,
+        "a stream the plain hand-on's norm cannot take",
+        FaultSite::NormQuant,
+    )?;
+    same_bits(
+        "a stream the next norm cannot take: the plain hand-on values",
+        &xn_plain[..K],
+        &xn[..K],
+    )?;
+    if !xn_plain[K].is_nan() {
+        return Err(format!(
+            "a stream the plain hand-on's norm cannot take handed on the scale {:e}, not NaN",
+            xn_plain[K]
+        ));
+    }
     let rows = seg(h, quant, &w, Input::Scaled { xn: &xn })?;
     common::expect_fault(h, "a scaled mat-vec over a NaN scale", FaultSite::NormQuant)?;
     if !rows.iter().all(|v| v.is_nan()) {
@@ -585,9 +646,50 @@ fn refuse_next(
     h.kernels.norm_add_next(encoder, p)
 }
 
+/// One launch of the plain hand-on's refusal table: the well-formed one with
+/// at most one argument changed.
+#[derive(Clone, Copy)]
+struct PlainCase {
+    quant: Quant,
+    cols: usize,
+    gain_len: usize,
+    out_len: usize,
+    eps: f32,
+}
+
+const PLAIN_GOOD: PlainCase = PlainCase {
+    quant: Quant::A4,
+    cols: K,
+    gain_len: K,
+    out_len: K + 1,
+    eps: 1.0e-5,
+};
+
+/// The plain hand-on over `b`, as `c` gives it.
+fn refuse_plain(
+    h: &Harness<'_>,
+    b: &mut Refusals,
+    encoder: &mut ComputeEncoder<'_>,
+    c: PlainCase,
+) -> Result<(), DeviceError> {
+    let p = NormNextParams {
+        quant: c.quant,
+        x: b.x.window(Elems(0), Elems(c.cols))?,
+        gain: b.gain.window(Elems(0), Elems(c.gain_len))?,
+        eps: c.eps,
+        layer: LAYER,
+        out: b.xn.window_mut(Elems(0), Elems(c.out_len))?,
+        fault: h.device.fault_word(),
+    };
+    h.kernels.norm_next(encoder, p)
+}
+
 /// The join that hands on refuses by name, writing nothing: another type than
 /// one with an entry, more than one row, a hand-on window without its scale
-/// word, an epsilon that is not finite; the well-formed launch writes.
+/// word, an epsilon that is not finite; the well-formed launch writes. The
+/// plain residual's hand-on refuses the same way: another type, a stream that
+/// is not whole blocks of the type, a gain other than the stream's length, a
+/// hand-on window without its scale word, an epsilon that is not finite.
 pub fn handon_refusals(h: &Harness<'_>) -> Clause {
     let (device, stream) = (h.device, h.stream);
     let pad = f32::from_bits(SENTINEL_BITS);
@@ -635,8 +737,63 @@ pub fn handon_refusals(h: &Harness<'_>) -> Clause {
     common::accepted_writes(h, &mut b, good, |h, b| {
         common::moved(h, &b.xn, |v| v.to_bits() != SENTINEL_BITS)
     })?;
+
+    b.xn = device.upload(stream, &vec![pad; K + 1]).map_err(why)?;
+    let plain_case = |what, needle, c: PlainCase| -> BadArg<'_, Refusals> {
+        BadArg::new(what, needle, Box::new(move |b, e| refuse_plain(h, b, e, c)))
+    };
+    let plain_cases = vec![
+        plain_case(
+            "an F32 reader",
+            "f32",
+            PlainCase {
+                quant: Quant::F32,
+                ..PLAIN_GOOD
+            },
+        ),
+        plain_case(
+            "a stream that is not whole blocks",
+            "blocks",
+            PlainCase {
+                cols: K - 32,
+                ..PLAIN_GOOD
+            },
+        ),
+        plain_case(
+            "a gain shorter than the stream",
+            "gain",
+            PlainCase {
+                gain_len: K - 64,
+                ..PLAIN_GOOD
+            },
+        ),
+        plain_case(
+            "a hand-on window without its scale word",
+            "out",
+            PlainCase {
+                out_len: K,
+                ..PLAIN_GOOD
+            },
+        ),
+        plain_case(
+            "a next epsilon that is not finite",
+            "eps",
+            PlainCase {
+                eps: f32::NAN,
+                ..PLAIN_GOOD
+            },
+        ),
+    ];
+    let plain_unchanged =
+        |h: &Harness<'_>, b: &Refusals| common::still(h, &b.xn, |v| v.to_bits() == SENTINEL_BITS);
+    let plain_count =
+        common::refuse_launches(h, "norm next", &mut b, plain_cases, plain_unchanged)?;
+    let good: Edit<'_, Refusals> = Box::new(|b, e| refuse_plain(h, b, e, PLAIN_GOOD));
+    common::accepted_writes(h, &mut b, good, |h, b| {
+        common::moved(h, &b.xn, |v| v.to_bits() != SENTINEL_BITS)
+    })?;
     Ok(Verdict::Noted(format!(
-        "{count} refusals, each by name, nothing written"
+        "{count} refusals of the join and {plain_count} of the plain hand-on, each by name, nothing written"
     )))
 }
 

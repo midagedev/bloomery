@@ -19,6 +19,11 @@
 //! lane order over its weight type. The next launch takes them as
 //! [`LoadNorm::Scaled`](super::LoadNorm) and its rows are the bits of the
 //! norm on load.
+//!
+//! A plain residual hands on the same input with no join
+//! ([`Kernels::norm_next`], each type's `<q>_norm_next`): the stream, which
+//! the out projection already added into, times the next norm's gain, and the
+//! next norm's scale summed in the same walk.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -41,6 +46,7 @@ type Next<'a, 'w> = Option<(
 const WHAT: &str = "norm rows";
 const WHAT_ADD: &str = "norm add rows";
 const WHAT_NEXT: &str = "norm add next";
+const WHAT_PLAIN: &str = "norm next";
 
 /// The argument words both norm kernels take: cols, layer, eps and the two
 /// strides.
@@ -98,6 +104,26 @@ pub struct NormAddNextParams<'w> {
     /// `cols` values of the new row times `gain`, then the scale word, on a
     /// 16-byte boundary.
     pub out: WindowMut<'w, f32, MetalDevice>,
+}
+
+/// A plain residual's hand-on: the next launch's input from the stream as it
+/// stands, `cols` values (the stream's length).
+pub struct NormNextParams<'w> {
+    /// The next launch's weight type, whose lane order the scale is summed
+    /// in. F32 has no entry and is refused by name.
+    pub quant: Quant,
+    /// The stream, whole blocks of `quant`, on a 16-byte boundary.
+    pub x: Window<'w, f32, MetalDevice>,
+    /// The next norm's gain, the stream's length, on a 16-byte boundary.
+    pub gain: Window<'w, f32, MetalDevice>,
+    /// The next norm's epsilon.
+    pub eps: f32,
+    /// The layer the next norm's raise is recorded in.
+    pub layer: u32,
+    /// The stream times `gain`, then the scale word, on a 16-byte boundary.
+    pub out: WindowMut<'w, f32, MetalDevice>,
+    /// The fault word a raise lands in.
+    pub fault: &'w MetalFaultWord,
 }
 
 fn refuse(what: &'static str, detail: impl Into<String>) -> DeviceError {
@@ -181,6 +207,57 @@ impl Kernels {
             &p.join,
             Some((&p.gain, &p.out, &next)),
         )
+    }
+
+    /// Encode a plain residual's hand-on: one dispatch, one threadgroup of
+    /// the router's thread count. A type with no entry, a stream that is not
+    /// whole blocks of `quant`, a next epsilon that is not finite, a gain
+    /// other than the stream's length, an output other than `cols + 1` and a
+    /// window off a 16-byte boundary are refused by name, and nothing is
+    /// encoded.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn norm_next(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: NormNextParams<'_>,
+    ) -> Result<(), DeviceError> {
+        let Some(family) = self.dense_family(p.quant) else {
+            return Err(refuse(
+                WHAT_PLAIN,
+                format!("{} has no entry", p.quant.name()),
+            ));
+        };
+        let cols = p.x.len().0;
+        if cols == 0 || !cols.is_multiple_of(p.quant.values_per_block()) {
+            return Err(refuse(
+                WHAT_PLAIN,
+                format!("cols {cols} are not whole blocks of {}", p.quant.name()),
+            ));
+        }
+        if !p.eps.is_finite() {
+            return Err(refuse(
+                WHAT_PLAIN,
+                format!("the next eps {} is not finite", p.eps),
+            ));
+        }
+        check_window_len(WHAT_PLAIN, "gain", p.gain.len(), cols)?;
+        check_window_len(WHAT_PLAIN, "out", p.out.len(), cols + 1)?;
+        for (name, start) in [
+            ("x", p.x.byte_range()?.start.get()),
+            ("gain", p.gain.byte_range()?.start.get()),
+            ("out", p.out.byte_range()?.start.get()),
+        ] {
+            check_weights_align(WHAT_PLAIN, name, start, WeightAlign::Float4)?;
+        }
+        let args = args_bytes([word(WHAT_PLAIN, "cols", cols)?, p.eps.to_bits(), p.layer]);
+        encoder.set_pipeline(family.norm_next());
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of(&p.gain)?)?;
+        slot.set(Binding::of_mut(&p.out)?)?;
+        slot.set(Binding::bytes(args.as_flattened())?)?;
+        slot.set(p.fault.binding())?;
+        slot.dispatch_groups(1, 1, self.router_threads())
     }
 
     /// A join with its next launch's input windows and argument words.

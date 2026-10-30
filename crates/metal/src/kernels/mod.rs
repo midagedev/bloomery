@@ -22,7 +22,8 @@
 //! The short conv ([`shortconv`]) of a gated-conv mixer is `kernels/shortconv.metal`; the
 //! sandwich residual is `kernels/norm.metal`'s `norm_add_rows`, and the one-row join that
 //! hands its next launch the normed input is each type's `<q>_norm_add_next`
-//! ([`Kernels::norm_add_next`]), read by the scaled seg, pair and head entries ([`LoadNorm`]).
+//! ([`Kernels::norm_add_next`]), read by the scaled seg, pair and head entries ([`LoadNorm`]);
+//! a plain residual hands the same input on with `<q>_norm_next` ([`Kernels::norm_next`]).
 
 mod attention;
 use crate::attention_geom;
@@ -84,7 +85,7 @@ pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
-pub use norm::{NormAddNextParams, NormAddRowsParams};
+pub use norm::{NormAddNextParams, NormAddRowsParams, NormNextParams};
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
     RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, TABLE_THREADS,
@@ -102,8 +103,9 @@ use crate::library::{GemmPath, Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
 /// input as it loads it, the one that adds into its output, the segmented
-/// entry, its scaled form, and the sandwich join that hands that form its
-/// normed input in this type's lane order.
+/// entry, its scaled form, and the two hand-ons that give a scaled entry its
+/// normed input in this type's lane order, the sandwich join's and the plain
+/// residual's.
 struct MatvecPipelines {
     store: Pipeline,
     norm: Pipeline,
@@ -111,10 +113,11 @@ struct MatvecPipelines {
     seg: Pipeline,
     seg_scaled: Pipeline,
     norm_add_next: Pipeline,
+    norm_next: Pipeline,
 }
 
 impl MatvecPipelines {
-    fn new(library: &Library, names: [&str; 6], simdgroups: u32) -> Result<Self, DeviceError> {
+    fn new(library: &Library, names: [&str; 7], simdgroups: u32) -> Result<Self, DeviceError> {
         Ok(Self {
             store: library.pipeline_with_simdgroups(names[0], simdgroups)?,
             norm: library.pipeline_with_simdgroups(names[1], simdgroups)?,
@@ -122,6 +125,7 @@ impl MatvecPipelines {
             seg: library.pipeline_with_simdgroups(names[3], simdgroups)?,
             seg_scaled: library.pipeline_with_simdgroups(names[4], simdgroups)?,
             norm_add_next: library.pipeline(names[5])?,
+            norm_next: library.pipeline(names[6])?,
         })
     }
 
@@ -138,6 +142,11 @@ impl MatvecPipelines {
     /// The sandwich join whose next launch is of this type.
     pub(crate) fn norm_add_next(&self) -> &Pipeline {
         &self.norm_add_next
+    }
+
+    /// The plain residual's hand-on whose next launch is of this type.
+    pub(crate) fn norm_next(&self) -> &Pipeline {
+        &self.norm_next
     }
 }
 
@@ -333,6 +342,7 @@ impl Kernels {
                     "q4k_matvec_seg",
                     "q4k_matvec_seg_scaled",
                     "q4k_norm_add_next",
+                    "q4k_norm_next",
                 ],
                 count,
             )?,
@@ -345,6 +355,7 @@ impl Kernels {
                     "q6k_matvec_seg",
                     "q6k_matvec_seg_scaled",
                     "q6k_norm_add_next",
+                    "q6k_norm_next",
                 ],
                 count,
             )?,
@@ -357,6 +368,7 @@ impl Kernels {
                     "a4_matvec_seg",
                     "a4_matvec_seg_scaled",
                     "a4_norm_add_next",
+                    "a4_norm_next",
                 ],
                 count,
             )?,
@@ -369,6 +381,7 @@ impl Kernels {
                     "q8_0_matvec_seg",
                     "q8_0_matvec_seg_scaled",
                     "q8_0_norm_add_next",
+                    "q8_0_norm_next",
                 ],
                 count,
             )?,
@@ -381,6 +394,7 @@ impl Kernels {
                     "q5k_matvec_seg",
                     "q5k_matvec_seg_scaled",
                     "q5k_norm_add_next",
+                    "q5k_norm_next",
                 ],
                 count,
             )?,

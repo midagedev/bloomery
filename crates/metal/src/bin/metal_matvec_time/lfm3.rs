@@ -37,7 +37,10 @@
 //! geometry of `SWEEP` (rows a SIMD group and SIMD groups a threadgroup),
 //! the variants compiled in this process and timed right after the default, so
 //! a geometry is judged against the default in one clock state. A variant's
-//! rows carry the geometry in their label.
+//! rows carry the geometry in their label. `--only lfm3,overlap` adds an
+//! `overlap` arm to every row: the window's dispatches in one concurrent
+//! encoder with no barrier between them. `d27.rs` runs its rows through the
+//! same machinery ([`run_rows`]).
 //!
 //! A cut is a copy of the instance's program text with counted edits, the way
 //! the phase cuts of the other rows are: each find text must occur exactly
@@ -61,8 +64,8 @@ use bloomery_metal::kernels::{Kernels, Quant};
 use bloomery_metal::library::{Library, sources_for};
 
 use super::{
-    Geometry, HeadPart, Run, Shape, WARMUPS, WINDOW_BYTES, WORKING_SET_BYTES, geometry_kernels,
-    time_arms, time_shape,
+    Arm, Geometry, HEAT_BYTES, HeadPart, Run, Shape, WARMUPS, WINDOW_BYTES, WORKING_SET_BYTES,
+    geometry_kernels, print_fail, print_row, time_arms, time_shape,
 };
 
 /// LFM3-1.7B's residual width, dense FFN width and vocabulary.
@@ -78,12 +81,12 @@ const ATTN_SEGMENTS: [usize; 4] = [2048, 512, 512, 16];
 
 /// One counted text edit of a cut: the text to find, once, and its
 /// replacement.
-type Edit = (&'static str, &'static str);
+pub(super) type Edit = (&'static str, &'static str);
 
 /// A phase cut of the instance's program text.
-struct Cut {
-    name: &'static str,
-    edits: &'static [Edit],
+pub(super) struct Cut {
+    pub(super) name: &'static str,
+    pub(super) edits: &'static [Edit],
 }
 
 /// The A4 block's accumulate lines, in the dot's own order.
@@ -152,18 +155,18 @@ const SWEEP: [(usize, usize); 5] = [(2, 2), (4, 4), (4, 8), (8, 2), (8, 4)];
 
 /// The band a row's window arm is predicted to fall in, and the measured
 /// line it was derived from.
-struct Expect {
+pub(super) struct Expect {
     lo: f64,
     hi: f64,
     basis: &'static str,
 }
 
 /// One probe row.
-struct Row {
-    label: String,
-    shape: Shape,
-    expect: Option<Expect>,
-    cut: Option<&'static Cut>,
+pub(super) struct Row {
+    pub(super) label: String,
+    pub(super) shape: Shape,
+    pub(super) expect: Option<Expect>,
+    pub(super) cut: Option<&'static Cut>,
 }
 
 fn a4_matvec(rows: usize, cols: usize) -> Shape {
@@ -180,10 +183,11 @@ fn a4_seg(segments: &[usize]) -> Shape {
         quant: Quant::A4,
         cols: HIDDEN as usize,
         segments: segments.to_vec(),
+        scaled: false,
     }
 }
 
-fn expect(lo: f64, hi: f64, basis: &'static str) -> Option<Expect> {
+pub(super) fn expect(lo: f64, hi: f64, basis: &'static str) -> Option<Expect> {
     Some(Expect { lo, hi, basis })
 }
 
@@ -196,6 +200,7 @@ fn rows() -> Vec<Row> {
         rows: VOCAB,
         cols: hidden,
         part,
+        scaled: false,
     };
     let loop_shape = || a4_matvec(ff, hidden);
     let mut rows = vec![
@@ -223,6 +228,7 @@ fn rows() -> Vec<Row> {
                 quant: Quant::A4,
                 rows: ff,
                 cols: hidden,
+                scaled: false,
             },
             expect: expect(98.0, 115.0, "profile gate_up 105.3 GB/s"),
             cut: None,
@@ -327,6 +333,7 @@ fn rows() -> Vec<Row> {
             quant: Quant::A4,
             rows: ff,
             cols: hidden,
+            scaled: false,
         },
         expect: None,
         cut: Some(&SCALARX),
@@ -345,26 +352,37 @@ fn rows() -> Vec<Row> {
 
 /// The selection names the LFM3 rows.
 pub(super) fn selected(only: &[String]) -> bool {
+    names(only, "lfm3")
+}
+
+/// The selection names `token`.
+pub(super) fn names(only: &[String], token: &str) -> bool {
     only.iter()
         .flat_map(|spec| spec.split(','))
-        .any(|tok| tok.trim() == "lfm3")
+        .any(|tok| tok.trim() == token)
 }
 
 /// The selection also names the geometry sweep.
 fn swept(only: &[String]) -> bool {
-    only.iter()
-        .flat_map(|spec| spec.split(','))
-        .any(|tok| tok.trim() == "sweep")
+    names(only, "sweep")
+}
+
+/// The selection also names the overlap arm: the window's dispatches in one
+/// concurrent encoder with no barrier, the condition of MLX's own window
+/// (independent matmuls in one eval run concurrently).
+fn overlapped(only: &[String]) -> bool {
+    names(only, "overlap")
 }
 
 /// A row is timed when the selection names no further filter, or one of its
-/// further values is the row's kernel or a part of its label.
-fn wanted(only: &[String], kind: &str, label: &str) -> bool {
+/// further values is the row's kernel or a part of its label. `family` is the
+/// token that selected the rows.
+fn wanted(only: &[String], family: &str, kind: &str, label: &str) -> bool {
     let filters: Vec<&str> = only
         .iter()
         .flat_map(|spec| spec.split(','))
         .map(str::trim)
-        .filter(|tok| *tok != "lfm3" && *tok != "sweep")
+        .filter(|tok| ![family, "sweep", "overlap"].contains(tok))
         .collect();
     filters.is_empty()
         || filters
@@ -397,10 +415,17 @@ pub(super) fn main(run: &Run) -> ExitCode {
         attn: LFM3_ATTN.key.attn,
         delta: None,
     };
+    run_rows(run, key, "lfm3", rows())
+}
+
+/// Time `rows` on a device opened at `key`, the instance of the model the
+/// selection token `family` names, under the run's geometry and, when the
+/// selection names it, the sweep's.
+pub(super) fn run_rows(run: &Run, key: Key, family: &str, rows: Vec<Row>) -> ExitCode {
     let instance = match open_key(key) {
         Ok(instance) => instance,
         Err(e) => {
-            println!("metal_matvec_time: FAIL (LFM3's instance: {e})");
+            println!("metal_matvec_time: FAIL ({family}'s instance: {e})");
             return ExitCode::FAILURE;
         }
     };
@@ -442,7 +467,7 @@ pub(super) fn main(run: &Run) -> ExitCode {
         }
     };
     println!(
-        "info\tinstrument=development-loop\tdevice={}\tlib={}\tbackend={}\tinstance={instance}\ttrials={}\twarmups={WARMUPS}\twindow_bytes={WINDOW_BYTES}\tworking_set_bytes={WORKING_SET_BYTES}\tgeom=rows{},sg{},router_sg{}",
+        "info\tinstrument=development-loop\tdevice={}\tlib={}\tbackend={}\tinstance={instance}\ttrials={}\twarmups={WARMUPS}\theat_bytes={HEAT_BYTES}\twindow_bytes={WINDOW_BYTES}\tworking_set_bytes={WORKING_SET_BYTES}\tgeom=rows{},sg{},router_sg{}",
         info.name,
         device.library().path().name(),
         <MetalDevice as Device>::BACKEND,
@@ -476,8 +501,14 @@ pub(super) fn main(run: &Run) -> ExitCode {
             }
         }
     }
-    for row in rows() {
-        if !wanted(&run.only, row.shape.kind(), &row.label) {
+    let overlap = Arm {
+        name: "overlap",
+        dispatches: None,
+        concurrent: true,
+        barrier: false,
+    };
+    for row in rows {
+        if !wanted(&run.only, family, row.shape.kind(), &row.label) {
             continue;
         }
         // A cut compiles the instance's default geometry, so a geometry
@@ -532,6 +563,27 @@ pub(super) fn main(run: &Run) -> ExitCode {
             failed |= outcome.failed;
             if outcome.stuck {
                 return ExitCode::FAILURE;
+            }
+            if overlapped(&run.only) {
+                let shape = &row.shape;
+                match time_shape(&device, arm_kernels, shape, &overlap, run.trials, false) {
+                    Ok(t) => print_row(
+                        shape.kind(),
+                        &label,
+                        overlap.name,
+                        run.trials,
+                        &t,
+                        shape.bytes(),
+                        "",
+                    ),
+                    Err(e) => {
+                        print_fail(shape.kind(), &label, overlap.name, &e);
+                        failed = true;
+                        if e.contains("still running") {
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
             }
         }
     }

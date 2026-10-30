@@ -1679,8 +1679,8 @@ impl Checked {
             }
         }
         // The rope tables, one a distinct base and factors; the conv's output
-        // and the sandwich's join buffer, where a layer has them, and the
-        // sandwich's hand-on buffer, its input and one scale word.
+        // and the sandwich's join buffer, where a layer has them; and the
+        // hand-on buffer, the reader's input and one scale word.
         for _ in &g.ropes {
             b.scratch.add(f32s(g.rope_len));
         }
@@ -1689,9 +1689,7 @@ impl Checked {
                 b.scratch.add(f32s(g.hidden));
             }
         }
-        if g.has_join() {
-            b.scratch.add(f32s(g.hidden + 1));
-        }
+        b.scratch.add(f32s(g.hidden + 1));
         for words in [
             g.hidden,
             g.proj,
@@ -2274,6 +2272,10 @@ mod tests {
         );
         scratch.extend([RECORD_SLOTS, 1, LANES].map(f32s)); // step_id, id_in, lane
         scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
+        // PIN(2026-10-30): the hand-on buffer (`Arena::xn`), held by every
+        // file: `hidden` values of the stream times the reader's gain and one
+        // scale word.
+        scratch.push(f32s(hidden + 1));
         assert_eq!(bytes.scratch, class(&scratch));
 
         // The rows arena of a pass of `cap` rows: ids, residual, normed input,
@@ -2375,6 +2377,10 @@ mod tests {
         );
         scratch.extend([RECORD_SLOTS, 1, LANES].map(f32s)); // step_id, id_in, lane
         scratch.extend([f32s(FAULT_WORDS); RECORD_SLOTS]); // faults
+        // PIN(2026-10-30): the hand-on buffer (`Arena::xn`), held by every
+        // file: `hidden` values of the stream times the reader's gain and one
+        // scale word.
+        scratch.push(f32s(hidden + 1));
         assert_eq!(bytes.scratch, class(&scratch));
 
         let cap = pass_rows_max(&g).min(CTX);

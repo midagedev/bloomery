@@ -66,7 +66,8 @@
 //! `--only lfm3` times LFM3-1.7B's decode launches instead (`lfm3.rs`): the
 //! session's own host calls over A4 synthetic weights, on a device opened at
 //! LFM3's instance, with the diagnostic rows and source cuts that split the
-//! gap to MLX's `qmv` into terms. It runs no other row.
+//! gap to MLX's `qmv` into terms. It runs no other row. `--only d27` times
+//! Qwen3.8-27B's the same way (`d27.rs`), with each normed row's scaled twin.
 //!
 //! `--geometry rows=N,sg=M,router_sg=K` compiles the kernels' own source with
 //! other values of the geometry constants — the rows a SIMD group owns
@@ -114,10 +115,31 @@ use synthetic::matrix;
 #[path = "lfm3.rs"]
 mod lfm3;
 
+#[path = "d27.rs"]
+mod d27;
+
 /// The probe's working set, window, warm-up and trial counts.
 const WORKING_SET_BYTES: usize = 1 << 30;
 const WINDOW_BYTES: usize = 768 << 20;
 const WARMUPS: usize = 2;
+/// The heat a window arm of a shape row ([`time_shape`]: the model rows of
+/// `lfm3.rs` and `d27.rs` among them) commits ahead of its warm-ups: its own dispatches, enough to read `HEAT_BYTES` in
+/// `HEAT_BUFFERS` command buffers, so the GPU runs the timed buffers at the
+/// clock a sustained stream holds and not at the one it idled down to while
+/// the host built the arm's weights. A small shape's heat stops at
+/// `HEAT_MAX` dispatches.
+const HEAT_BYTES: usize = 96 << 30;
+const HEAT_BUFFERS: usize = 4;
+const HEAT_MAX: usize = 16_384;
+
+/// The heat dispatches of `arm` over a shape of `bytes`: none for a chain
+/// arm, whose short buffers are the point.
+fn heat_of(arm: &Arm, bytes: usize) -> usize {
+    if arm.dispatches.is_some() {
+        return 0;
+    }
+    HEAT_BYTES.div_ceil(bytes).min(HEAT_MAX)
+}
 /// How long the host waits for one timed command buffer. A buffer still
 /// running when this ends is a named failure, and later arms are not
 /// submitted behind it. The wait only gates the read of the GPU stamps; it
@@ -201,6 +223,9 @@ enum Shape {
         cols: usize,
         /// The rows of every segment.
         segments: Vec<usize>,
+        /// The input is already `x · gain` and the norm's scale is one word
+        /// (the scaled entry, what a hand-on feeds), else the norm on load.
+        scaled: bool,
     },
     /// The head-normed residual mat-vec: a gated delta net's out projection.
     HeadNorm { rows: usize, cols: usize },
@@ -212,6 +237,8 @@ enum Shape {
         quant: Quant,
         rows: usize,
         cols: usize,
+        /// The scaled entry, as the segmented mat-vec's.
+        scaled: bool,
     },
     /// A dense FFN's folded down at its one slot: `rows` by `k`, added into
     /// the output, the route weight 1.
@@ -222,6 +249,8 @@ enum Shape {
         rows: usize,
         cols: usize,
         part: HeadPart,
+        /// The scaled entry, as the segmented mat-vec's.
+        scaled: bool,
     },
 }
 
@@ -296,15 +325,19 @@ impl Shape {
                 quant,
                 cols,
                 segments,
+                ..
             } => per(*quant, segments.iter().sum::<usize>() * cols),
             Self::HeadNorm { rows, cols } => per(Quant::Q4K, rows * cols),
-            Self::DensePair { quant, rows, cols } => 2 * per(*quant, rows * cols),
+            Self::DensePair {
+                quant, rows, cols, ..
+            } => 2 * per(*quant, rows * cols),
             Self::DenseFold { quant, rows, k } => per(*quant, rows * k),
             Self::Head {
                 quant,
                 rows,
                 cols,
                 part: HeadPart::Pair,
+                ..
             } => per(*quant, rows * cols),
             Self::Head {
                 rows,
@@ -325,6 +358,7 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
                 quant: Quant::Q4K,
                 cols: 2048,
                 segments: vec![8192, 4096],
+                scaled: false,
             },
         ),
         (
@@ -333,6 +367,7 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
                 quant: Quant::Q4K,
                 cols: 2048,
                 segments: vec![8192, 4096, 512, 512],
+                scaled: false,
             },
         ),
         (
@@ -341,6 +376,7 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
                 quant: Quant::Q6K,
                 cols: 2048,
                 segments: vec![8192],
+                scaled: false,
             },
         ),
         (
@@ -412,6 +448,10 @@ struct TimedWork<'a> {
     /// Timed command buffers after the warm-up.
     trials: usize,
     arm: &'a Arm,
+    /// Dispatches of the heat ahead of the warm-ups: `encode` gets them as
+    /// indices `0..heat` and the buffers' dispatches after them, so every
+    /// index is one output written once.
+    heat: usize,
 }
 
 /// Encode every buffer, commit them back to back, and read each timed
@@ -429,6 +469,30 @@ fn time_dispatches(
         ));
     }
     let buffers = WARMUPS + work.trials;
+    let per_heat = work.heat.div_ceil(HEAT_BUFFERS);
+    for h in 0..HEAT_BUFFERS {
+        let first = h * per_heat;
+        let last = work.heat.min(first + per_heat);
+        if first >= last {
+            break;
+        }
+        let mut recording = stream.begin().map_err(why)?;
+        {
+            let mut encoder = if work.arm.concurrent {
+                recording.compute_encoder_concurrent().map_err(why)?
+            } else {
+                recording.compute_encoder().map_err(why)?
+            };
+            for n in first..last {
+                if work.arm.barrier && n > first {
+                    encoder.memory_barrier();
+                }
+                encode(&mut encoder, n)?;
+            }
+            encoder.end();
+        }
+        stream.submit(recording).map_err(why)?;
+    }
     let encode_start = Instant::now();
     let mut pending = Vec::with_capacity(buffers);
     for b in 0..buffers {
@@ -444,7 +508,7 @@ fn time_dispatches(
                 if work.arm.barrier && j > 0 {
                     encoder.memory_barrier();
                 }
-                encode(&mut encoder, b * work.dispatches + j)?;
+                encode(&mut encoder, work.heat + b * work.dispatches + j)?;
             }
             encoder.end();
         }
@@ -560,8 +624,22 @@ fn time_shape(
     drop(all);
     let x_values = oracle::activations(cols, 0x78, 1.0);
     let x = device.upload(stream, &x_values).map_err(why)?;
-    // The norm's gain, and the head norm's gated numerator and partial sums.
+    // The norm's gain, the scaled entries' scale word, and the head norm's
+    // gated numerator and partial sums.
     let gain = device.upload(stream, &vec![1.0f32; cols]).map_err(why)?;
+    let scale_word = device.upload(stream, &[1.0f32]).map_err(why)?;
+    let load_norm = |scaled: bool| -> Result<LoadNorm<'_>, String> {
+        Ok(if scaled {
+            LoadNorm::Scaled {
+                scale: scale_word.window(Elems(0), Elems(1)).map_err(why)?,
+            }
+        } else {
+            LoadNorm::Gain {
+                gain: gain.window(Elems(0), Elems(cols)).map_err(why)?,
+                eps: 1e-6,
+            }
+        })
+    };
     let g = device.upload(stream, &x_values).map_err(why)?;
     let partials = device
         .upload(stream, &vec![1.0f32; VALUE_HEADS * PARTIALS_PER_HEAD])
@@ -590,8 +668,11 @@ fn time_shape(
 
     let dispatches = dispatch_count(arm, bytes);
     let buffers = WARMUPS + trials;
+    // Every dispatch, the heat's first, writes an output of its own.
+    let heat = heat_of(arm, bytes);
+    let outputs = heat + buffers * dispatches;
     let mut y = device
-        .zeroed::<f32>(stream, Elems(buffers * dispatches * rows))
+        .zeroed::<f32>(stream, Elems(outputs * rows))
         .map_err(why)?;
     // The experts' and the head's launches: the instance's experts, the one
     // expert id and route weight of a dense FFN, and one pick word per
@@ -607,7 +688,9 @@ fn time_shape(
     }
     let ids = device.upload(stream, &[0i32]).map_err(why)?;
     let route = device.upload(stream, &[1.0f32]).map_err(why)?;
-    let mut step_id = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
+    let mut step_id = device
+        .zeroed::<u32>(stream, Elems(outputs.div_ceil(dispatches)))
+        .map_err(why)?;
 
     let timing = time_dispatches(
         stream,
@@ -618,6 +701,7 @@ fn time_shape(
             working_set_bytes: working_set,
             trials,
             arm,
+            heat,
         },
         |encoder, n| {
             let w = weights
@@ -646,7 +730,12 @@ fn time_shape(
                         )
                         .map_err(why)?;
                 }
-                Shape::Seg { quant, cols, .. } => {
+                Shape::Seg {
+                    quant,
+                    cols,
+                    scaled,
+                    ..
+                } => {
                     kernels
                         .matvec_seg(
                             encoder,
@@ -656,10 +745,7 @@ fn time_shape(
                                 weights: w,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
                                 y: out,
-                                norm: LoadNorm::Gain {
-                                    gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                    eps: 1e-6,
-                                },
+                                norm: load_norm(*scaled)?,
                                 fault: device.fault_word(),
                                 layer: LAYER_NONE,
                             },
@@ -687,7 +773,12 @@ fn time_shape(
                         )
                         .map_err(why)?;
                 }
-                Shape::DensePair { quant, rows, cols } => {
+                Shape::DensePair {
+                    quant,
+                    rows,
+                    cols,
+                    scaled,
+                } => {
                     let half = bytes / 2;
                     let base = (n % copies) * stride;
                     kernels
@@ -710,10 +801,7 @@ fn time_shape(
                                 shared_gate: None,
                                 shared_up: None,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                norm: LoadNorm::Gain {
-                                    gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
-                                    eps: 1e-6,
-                                },
+                                norm: load_norm(*scaled)?,
                                 y: out,
                                 out_stride: *rows,
                                 fault: device.fault_word(),
@@ -751,6 +839,7 @@ fn time_shape(
                     rows,
                     cols,
                     part,
+                    scaled,
                 } => {
                     let b = n / dispatches;
                     let params = HeadParams {
@@ -760,10 +849,7 @@ fn time_shape(
                         simdgroups: HEAD_SIMD_GROUPS,
                         weights: w,
                         x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
-                        norm: LoadNorm::Gain {
-                            gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
-                            eps: 1e-6,
-                        },
+                        norm: load_norm(*scaled)?,
                         logits: out,
                         step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
                         fault: device.fault_word(),
@@ -1046,6 +1132,7 @@ fn time_pair(
             working_set_bytes: working_set,
             trials,
             arm,
+            heat: 0,
         },
         |encoder, n| {
             let sg = (n % one_copies) * one_stride;
@@ -1137,6 +1224,7 @@ fn time_fold(
             working_set_bytes: working_set,
             trials,
             arm,
+            heat: 0,
         },
         |encoder, n| {
             let sh = (n % one_copies) * one_stride;
@@ -1309,6 +1397,7 @@ fn time_router(
             working_set_bytes: working_set,
             trials,
             arm,
+            heat: 0,
         },
         |encoder, n| {
             let b = n / dispatches;
@@ -1403,6 +1492,7 @@ fn time_head(
             working_set_bytes: working_set,
             trials,
             arm,
+            heat: 0,
         },
         |encoder, n| {
             let b = n / dispatches;
@@ -1581,7 +1671,9 @@ us_p90, gbps.
                          narrows them to a kernel (pair, fold, head, seg,
                          matvec) or a label part (`[plain]`, `[scalarx]`);
                          `sweep` times each row under the geometry variants
-                         of lfm3.rs too.
+                         of lfm3.rs too, `overlap` adds an arm of the window
+                         in a concurrent encoder with no barrier. `d27` runs
+                         Qwen3.8-27B's rows the same way (d27.rs).
   --trials N             timed command buffers per arm (default 16)
   --chain N              also time N back-to-back dispatches: arm lone (one
                          dispatch), serial and concurrent (a memory barrier
@@ -1822,6 +1914,9 @@ pub fn main() -> ExitCode {
 
     if lfm3::selected(&run.only) {
         return lfm3::main(&run);
+    }
+    if d27::selected(&run.only) {
+        return d27::main(&run);
     }
 
     let device = match MetalDevice::open(&HOST) {
