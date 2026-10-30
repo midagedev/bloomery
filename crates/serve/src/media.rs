@@ -9,6 +9,10 @@
 //! prefix inside a span, which is kept whole or fed whole. [`expand_prompt`] makes a chat's
 //! [`Prompt`]: its held sequence and one [`MediaFeed`] per image for the engine.
 //!
+//! The images a server has prepared it keeps ([`PreparedImages`]): a request that resends them —
+//! an agent client resends its whole history every turn — is served without decoding or preparing
+//! them again, and only the images the cache holds not share the decode budget.
+//!
 //! An image arrives only inside a `data:` URL holding a base64 PNG or JPEG, in either OpenAI form
 //! of an `image_url` part. A clip arrives as an `input_video` part's base64 `data` and `format`, or
 //! a `video_url` part's `data:video/*;base64,` URL ([`Part::Video`]); [`flatten`] probes and plans
@@ -17,8 +21,9 @@
 //! [`MediaError`] variant that names what it refused; nothing is skipped, repaired or fetched.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,11 +31,18 @@ use sha2::{Digest, Sha256};
 pub use vision::media::ExpandError;
 pub use vision::media::PartJoin;
 use vision::media::{Piece, expand_marked};
+use vision::{EncoderInput, Patches};
 pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
 
 use crate::video::{Clip, PlannedClip, VideoError, VideoSupport, plan_clip};
 
+/// The decoded RGB a request's new images may retain together: the keys its server's
+/// [`PreparedImages`] holds not, each distinct key charged once.
 const DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The heap bytes of prepared images one server retains ([`PreparedImages`]): what the cache
+/// costs at its worst, whatever a request sends.
+pub const PREPARED_IMAGE_BYTES: usize = 512 * 1024 * 1024;
 
 /// An inline image decoded under the request's shared RGB budget, before model preparation.
 pub(crate) struct DecodedImage {
@@ -67,6 +79,81 @@ fn decode_images_with_limit<'a>(
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
 /// it while the engine runs elsewhere.
 pub type SharedMediaModel = Arc<dyn MediaModel + Send + Sync>;
+
+/// The images a server has already prepared for its one media model, keyed by the image file's
+/// bytes: a request whose image the server has already served takes its [`Prepared`] from here
+/// without a decode or a prepare, so a conversation an agent client resends whole every turn
+/// neither runs the decode budget dry nor pays the prepare again. One server holds one of these
+/// beside its one model (a prepared image depends on the model); it retains at most
+/// [`PREPARED_IMAGE_BYTES`] of heap, the least recently used first out, and an entry the whole
+/// bound cannot hold is not retained.
+pub struct PreparedImages {
+    limit: usize,
+    held: Mutex<Lru>,
+}
+
+/// The retained entries and their charge, the least recently used at the front.
+struct Lru {
+    bytes: usize,
+    entries: VecDeque<(ImageKey, Arc<Prepared>)>,
+}
+
+impl PreparedImages {
+    /// A cache that retains at most `limit` bytes of prepared images; 0 retains nothing (a
+    /// request's own repeats still share one decode, which needs no retention).
+    #[must_use]
+    pub fn new(limit: usize) -> PreparedImages {
+        PreparedImages {
+            limit,
+            held: Mutex::new(Lru {
+                bytes: 0,
+                entries: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// The model's prepared image of `key`, moved to the cache's most recent end.
+    fn get(&self, key: &ImageKey) -> Option<Arc<Prepared>> {
+        let mut held = crate::api::relock(&self.held);
+        let at = held.entries.iter().rposition(|(k, _)| k == key)?;
+        let entry = held.entries.remove(at).expect("the entry was found");
+        let prepared = Arc::clone(&entry.1);
+        held.entries.push_back(entry);
+        Some(prepared)
+    }
+
+    /// Retain `key`'s prepared image, evicting the least recently used entries the bound needs
+    /// out. An entry larger than the whole bound is not retained and evicts nothing.
+    fn insert(&self, key: ImageKey, prepared: Arc<Prepared>) {
+        let bytes = prepared_bytes(&prepared);
+        let mut held = crate::api::relock(&self.held);
+        if bytes > self.limit {
+            return;
+        }
+        if let Some(at) = held.entries.iter().position(|(k, _)| *k == key) {
+            let (_, old) = held.entries.remove(at).expect("the entry was found");
+            held.bytes -= prepared_bytes(&old);
+        }
+        while held.bytes + bytes > self.limit {
+            let Some((_, old)) = held.entries.pop_front() else {
+                break;
+            };
+            held.bytes -= prepared_bytes(&old);
+        }
+        held.bytes += bytes;
+        held.entries.push_back((key, prepared));
+    }
+}
+
+/// The heap bytes one prepared image retains: its patch values and the metadata around them.
+fn prepared_bytes(prepared: &Prepared) -> usize {
+    let patches = |p: &Patches| size_of::<Patches>() + p.bf16.capacity() * size_of::<u16>();
+    size_of::<Prepared>()
+        + match &prepared.input {
+            EncoderInput::Grid(p) => patches(p),
+            EncoderInput::Tiles(g) => size_of_val(g) + g.tiles.iter().map(patches).sum::<usize>(),
+        }
+}
 
 /// A model that numbers its images, as MiniCPM-V's template does: the placeholder of image `i` is
 /// `<image_id>i</image_id><image><unk>`, and `<image><unk>` is what every placeholder carries.
@@ -298,8 +385,9 @@ impl VideoCtx {
     }
 }
 
-/// An image's cache key: the sha256 of its file bytes. It is known before the decode, so a request
-/// whose image is cached skips the decode, the resize and the encoder.
+/// An image's cache key: the sha256 of its file bytes. It is known before the decode, so a server
+/// whose [`PreparedImages`] holds the key serves the image without the decode, the resize and the
+/// encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImageKey(pub [u8; 32]);
 
@@ -952,23 +1040,37 @@ fn kind_name(is_image: bool) -> &'static str {
 /// prepared by group, each placeholder's token expanded to its span, and one feed per image and per
 /// group. The placeholders are counted, their kinds and numbers checked and the last position
 /// checked before anything is decoded, so a placeholder typed into the text, which pairs with no
-/// medium, costs no decode.
+/// medium, costs no decode. Every image is a new one here: a server that keeps its prepared images
+/// expands through [`expand_prompt_with`].
 pub fn expand_prompt(
     ids: &[u32],
     media: &[Medium],
     model: &dyn MediaModel,
+) -> Result<Prompt, MediaError> {
+    expand_prompt_with(ids, media, model, &PreparedImages::new(0))
+}
+
+/// [`expand_prompt`] beside the server's prepared images: an image whose key the cache holds is
+/// served from it without a decode or a prepare, and only the images the cache holds not share
+/// the decode budget — a key the request itself repeats counted once. The image loads still run
+/// (the key is the file bytes' hash), and every image is decoded before any is prepared.
+pub fn expand_prompt_with(
+    ids: &[u32],
+    media: &[Medium],
+    model: &dyn MediaModel,
+    images: &PreparedImages,
 ) -> Result<Prompt, MediaError> {
     let image_token = model.image_token().ok_or(MediaError::NoChatImageToken)?;
     let video_token = model.video_token();
     let is_mark = |t: u32| t == image_token || Some(t) == video_token;
     // Each placeholder the media want, in order: an image's index, or `None` for a group.
     let mut want: Vec<Option<usize>> = Vec::new();
-    let mut images = 0;
+    let mut image_count = 0;
     for m in media {
         match m {
             Medium::Image(_) => {
-                want.push(Some(images));
-                images += 1;
+                want.push(Some(image_count));
+                image_count += 1;
             }
             Medium::Video(clip) => {
                 video_token.ok_or(MediaError::NoChatVideoToken)?;
@@ -978,16 +1080,16 @@ pub fn expand_prompt(
     }
     let placeholders = ids.iter().filter(|&&t| is_mark(t)).count();
     if placeholders != want.len() {
-        let groups = want.len() - images;
+        let groups = want.len() - image_count;
         return Err(if groups == 0 {
             MediaError::Expand(ExpandError::PlaceholderCount {
                 placeholders,
-                images,
+                images: image_count,
             })
         } else {
             MediaError::MediaCount {
                 placeholders,
-                images,
+                images: image_count,
                 groups,
             }
         });
@@ -996,18 +1098,49 @@ pub fn expand_prompt(
         return Err(MediaError::ImageLast);
     }
     check_placeholders(ids, &want, image_token, model)?;
-    let images = decode_images(media.iter().filter_map(|m| match m {
-        Medium::Image(url) => Some(url.as_str()),
-        Medium::Video(_) => None,
-    }))?;
-    let mut images = images.into_iter();
+    // Load and key every image, take the keys the cache holds, and decode the rest under the
+    // budget, each distinct key once; nothing is prepared until every image is decoded.
+    let mut left_bytes = DECODED_IMAGE_BYTES;
+    let mut served: HashMap<ImageKey, Arc<Prepared>> = HashMap::new();
+    let mut fresh: Vec<(ImageKey, Rgb8)> = Vec::new();
+    let mut loaded: HashSet<ImageKey> = HashSet::new();
+    let mut keys = Vec::new();
+    for m in media {
+        let Medium::Image(url) = m else {
+            continue;
+        };
+        let file = load(url)?;
+        keys.push(file.key);
+        if served.contains_key(&file.key) || !loaded.insert(file.key) {
+            continue;
+        }
+        match images.get(&file.key) {
+            Some(prepared) => {
+                served.insert(file.key, prepared);
+            }
+            None => {
+                let image = Rgb8::from_bytes_with_limit(&file.bytes, left_bytes)
+                    .map_err(MediaError::Decode)?;
+                left_bytes -= image.data.len();
+                fresh.push((file.key, image));
+            }
+        }
+    }
+    for (key, image) in &fresh {
+        let prepared = Arc::new(model.prepare(image).map_err(MediaError::Prepare)?);
+        images.insert(*key, Arc::clone(&prepared));
+        served.insert(*key, prepared);
+    }
+    let mut keys = keys.into_iter();
     let mut ready: Vec<(ImageKey, Arc<Prepared>)> = Vec::with_capacity(want.len());
     for m in media {
         match m {
             Medium::Image(_) => {
-                let image = images.next().expect("one decoded image per image medium");
-                let prepared = model.prepare(&image.image).map_err(MediaError::Prepare)?;
-                ready.push((image.key, Arc::new(prepared)));
+                let key = keys.next().expect("one key per image medium, loaded above");
+                let prepared = served
+                    .get(&key)
+                    .expect("every image's key was resolved above");
+                ready.push((key, Arc::clone(prepared)));
             }
             Medium::Video(clip) => {
                 ready.extend(
@@ -1201,14 +1334,17 @@ fn short(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::sync::Arc;
 
     use serde_json::{Value, json};
     use vision::{GridPlan, Patches};
 
     use super::{
         ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Medium,
-        NumberedMedia, Part, PartJoin, Prepared, Rgb8, VideoCtx, VisionError, common_prefix,
-        encode_base64, expand_prompt, flatten, keep_whole_spans, load, parse_part, prepare,
+        NumberedMedia, PREPARED_IMAGE_BYTES, Part, PartJoin, Prepared, PreparedImages, Rgb8,
+        VideoCtx, VisionError, common_prefix, encode_base64, expand_prompt, expand_prompt_with,
+        flatten, keep_whole_spans, load, parse_part, prepare, prepared_bytes,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -1779,6 +1915,181 @@ mod tests {
             ),
             Err(MediaError::Decode(VisionError::Decode(_)))
         ));
+    }
+
+    /// A flat `width`×`height` RGB PNG of one shade, as a data URL: another shade is another
+    /// file, so each shade is its own image key. Its decode is `width * height * 3` bytes.
+    fn flat_png(width: u32, height: u32, shade: u8) -> String {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![shade; width as usize * height as usize * 3])
+                .unwrap();
+        }
+        data("image/png", &encode_base64(&bytes))
+    }
+
+    /// A model whose every prepare gives the same small span and counts its calls: the
+    /// prepared-image tests read how many images a request carried to a prepare.
+    struct Tally {
+        span_len: usize,
+        prepares: Cell<usize>,
+    }
+
+    impl MediaModel for Tally {
+        fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+            Cow::Borrowed("<img>")
+        }
+
+        fn image_marker(&self) -> &str {
+            "<img>"
+        }
+
+        fn image_token(&self) -> Option<u32> {
+            Some(7)
+        }
+
+        fn prepare(&self, _image: &Rgb8) -> Result<Prepared, VisionError> {
+            self.prepares.set(self.prepares.get() + 1);
+            Ok(Prepared::of_grid(
+                self.span_len,
+                super::grid(0, (self.span_len, 1)),
+            ))
+        }
+    }
+
+    /// The ids of a prompt of `n` images: text, then each placeholder followed by text.
+    fn shot_ids(n: usize) -> Vec<u32> {
+        let mut ids = vec![1];
+        ids.extend(std::iter::repeat_n([7, 1], n).flatten());
+        ids
+    }
+
+    /// An agent resends its whole conversation every turn, so a request carries every screenshot
+    /// the conversation already took. The images an earlier request of the conversation served
+    /// cost no decode and no prepare — only the new image draws on the decode budget — and a
+    /// history whose images together pass the budget is served. Twenty-one flat 1024×1024 PNGs
+    /// decode to 66,060,288 bytes together, inside the 67,108,864-byte budget; a twenty-second
+    /// crosses it [derived].
+    #[test]
+    fn a_history_of_prepared_images_costs_only_its_new_images() {
+        let history: Vec<String> = (0..21).map(|i| flat_png(1024, 1024, i)).collect();
+        let model = Tally {
+            span_len: 3,
+            prepares: Cell::new(0),
+        };
+        let images = PreparedImages::new(PREPARED_IMAGE_BYTES);
+        let old: Vec<&str> = history.iter().map(String::as_str).collect();
+        let first =
+            expand_prompt_with(&shot_ids(21), &Medium::images(&old), &model, &images).unwrap();
+        assert_eq!(model.prepares.get(), 21);
+        let mut resent = history;
+        resent.push(flat_png(1024, 1024, 99));
+        let urls: Vec<&str> = resent.iter().map(String::as_str).collect();
+        let second =
+            expand_prompt_with(&shot_ids(22), &Medium::images(&urls), &model, &images).unwrap();
+        assert_eq!(model.prepares.get(), 22, "only the new image is prepared");
+        assert_eq!(second.feeds.len(), 22);
+        for (was, now) in first.feeds.iter().zip(&second.feeds) {
+            assert!(Arc::ptr_eq(&was.prepared, &now.prepared));
+        }
+    }
+
+    /// The budget still bounds a request whose images are all new: nothing is prepared past the
+    /// decode, and the refusal names the decode budget.
+    #[test]
+    fn only_new_images_over_the_budget_are_refused_by_name() {
+        let urls: Vec<String> = (0..22).map(|i| flat_png(1024, 1024, i)).collect();
+        let model = Tally {
+            span_len: 3,
+            prepares: Cell::new(0),
+        };
+        let images = PreparedImages::new(PREPARED_IMAGE_BYTES);
+        let fresh: Vec<&str> = urls.iter().map(String::as_str).collect();
+        match err(expand_prompt_with(
+            &shot_ids(22),
+            &Medium::images(&fresh),
+            &model,
+            &images,
+        )) {
+            MediaError::Decode(VisionError::Limits { detail }) => assert!(
+                detail.ends_with("decoded-image bytes remaining"),
+                "{detail}"
+            ),
+            e => panic!("{e}"),
+        }
+        assert_eq!(model.prepares.get(), 0);
+    }
+
+    /// A request that sends the same image twice prepares it once and both placeholders hold the
+    /// same prepared image, with no retention of anything (a zero cache).
+    #[test]
+    fn repeats_within_one_request_share_one_prepare() {
+        let png = data("image/png", PNG_B64);
+        let model = Tally {
+            span_len: 2,
+            prepares: Cell::new(0),
+        };
+        let images = PreparedImages::new(0);
+        let urls = [png.as_str(), png.as_str()];
+        let p =
+            expand_prompt_with(&[1, 7, 2, 7, 3], &Medium::images(&urls), &model, &images).unwrap();
+        assert_eq!(model.prepares.get(), 1);
+        assert_eq!(p.held.ids, [1, 7, 7, 2, 7, 7, 3]);
+        assert!(Arc::ptr_eq(&p.feeds[0].prepared, &p.feeds[1].prepared));
+    }
+
+    /// The retained images stay inside their bound: the least recently used is the first out, a
+    /// hit moves its entry to the recent end, and an entry the whole bound cannot hold is not
+    /// retained and evicts nothing.
+    #[test]
+    fn prepared_images_are_bounded_least_recently_first() {
+        let image = |values: usize| {
+            Arc::new(Prepared::of_grid(
+                1,
+                Patches {
+                    plan: GridPlan {
+                        n_llm_h: 1,
+                        n_llm_w: 1,
+                        best_h: 1,
+                        best_w: 1,
+                    },
+                    n_vit_h: 1,
+                    n_vit_w: 1,
+                    patch_len: values,
+                    bf16: vec![0; values],
+                },
+            ))
+        };
+        let one = prepared_bytes(&image(4));
+        let images = PreparedImages::new(2 * one);
+        let key = |k: u8| ImageKey([k; 32]);
+        images.insert(key(1), Arc::clone(&image(4)));
+        images.insert(key(2), Arc::clone(&image(4)));
+        // A hit moves key 1 to the recent end, so key 2 is the one a third entry evicts.
+        assert!(images.get(&key(1)).is_some());
+        images.insert(key(3), Arc::clone(&image(4)));
+        assert!(images.get(&key(1)).is_some());
+        assert!(images.get(&key(3)).is_some());
+        assert!(images.get(&key(2)).is_none(), "the least recently used");
+        let held = crate::api::relock(&images.held);
+        assert!(
+            held.bytes <= images.limit,
+            "{} <= {}",
+            held.bytes,
+            images.limit
+        );
+        assert_eq!(held.entries.len(), 2);
+        drop(held);
+        // An entry the whole bound cannot hold is not retained and evicts nothing.
+        let huge = image(4 * one);
+        images.insert(key(9), Arc::clone(&huge));
+        assert!(images.get(&key(1)).is_some());
+        assert!(images.get(&key(9)).is_none());
     }
 
     /// The expansion's refusals reach the client as `ExpandError` wrote them: the text is the

@@ -463,6 +463,7 @@ impl Server {
             model_path: config.model_path,
             engine_props,
             media,
+            images: media::PreparedImages::new(media::PREPARED_IMAGE_BYTES),
             video,
             slot_save_path: config.slot_save_path,
             side: None,
@@ -748,6 +749,11 @@ struct State {
     /// image part is rendered as the model's placeholder only when it exists,
     /// and refused by name otherwise. Read without the engine.
     media: Option<SharedMediaModel>,
+    /// The images this server has already prepared for its model
+    /// ([`media::PreparedImages`]): a request's already-sent images are served
+    /// from it without a decode or a prepare, so a resent history draws on none
+    /// of the decode budget.
+    images: media::PreparedImages,
     /// What decodes a clip: ffmpeg found at startup, a decoder a caller set
     /// ([`Server::with_video`]), or the reason there is none. A clip is taken
     /// when this and the model's video rule are both there ([`State::takes_video`]).
@@ -3598,14 +3604,16 @@ fn media_error(e: &MediaError, field: &str) -> ApiError {
 }
 
 /// The prompt of a rendered chat: its ids, and on an engine that takes images
-/// each image expanded to its span with its feed ([`media::expand_prompt`]),
-/// which also refuses a placeholder no image part made.
+/// each image expanded to its span with its feed ([`media::expand_prompt_with`]
+/// over the server's prepared images), which also refuses a placeholder no
+/// image part made.
 fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
     let ids = rendered.ids(&*state.tok);
     let Some(model) = &state.media else {
         return Ok(Prompt::from(ids));
     };
-    media::expand_prompt(&ids, &rendered.media, &**model).map_err(|e| media_error(&e, "messages"))
+    media::expand_prompt_with(&ids, &rendered.media, &**model, &state.images)
+        .map_err(|e| media_error(&e, "messages"))
 }
 
 /// What the 400 for a prompt past the context adds to its two numbers: the

@@ -803,17 +803,27 @@ this server reads text only`). The Clef decide seat answers it with a 501 and ll
 supported - hint: if this is unexpected, you may need to provide the mmproj`). Lev takes no image: `--mmproj` beside
 it is refused, and a request with an image is a 501.
 
-Inline PNG/JPEG input shares a fixed 64 MiB decoded-RGB budget across a request's
-images, including batched embedding inputs. Image headers are checked before
-allocating decoder output, and all inline images are decoded within the budget
-before model preparation starts. PNG temporary output must fit the remaining
-budget too. An oversized image is a named 400, not a large allocation followed
-by a context refusal. Trusted offline image constructors are not subject to this
-serving policy.
+Inline PNG/JPEG input shares a fixed 64 MiB decoded-RGB budget across a chat
+request's new images and across every image of a batched embedding input. An
+image whose file the server has already prepared for its encoder is served from
+the prepared-image cache without a decode or a prepare and draws on none of that
+budget, so a conversation an agent client resends whole every turn keeps fitting
+however many screenshots its history holds (the file is still hashed each
+request; that is the key). The cache is one per server, beside its one encoder,
+and retains at most 512 MiB, the least recently used first out; a 1280×720
+screenshot prepares to about 5.6 MB on V4.1 and about 11.3 MB on the Qwen3-VL
+and GLM encoders [derived], so the bound holds 90 or more such screenshots on
+every image seat. Image headers are checked before allocating decoder output,
+and all of a request's new images are decoded within the budget before model
+preparation starts; PNG temporary output must fit the remaining budget too. A
+request whose new images together pass the budget is a named 400, not a large
+allocation followed by a context refusal. Trusted offline image constructors are
+not subject to this serving policy.
 
-The budget bounds retained RGB, not total process memory: compressed request
-data, decoder internals, temporary conversion buffers and model preparation are
-additional. Encoded-video planning and decoding keep their own limits.
+The budget bounds retained RGB and the cache prepared patches, not total process
+memory: compressed request data, decoder internals, temporary conversion buffers
+and model preparation are additional. Encoded-video planning and decoding keep
+their own limits.
 
 **Video input.** A model with a video rule reads a clip when `ffmpeg` and `ffprobe` (5.1 or newer) are on `PATH`; the
 server looks once at start, prints one `video:` line, and answers `/props` with `modalities.video` true. A clip is an

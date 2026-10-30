@@ -48,3 +48,7 @@ thiserror.workspace = true
 # The orderly stop's signal handlers: `sigaction`, a `write` a handler makes,
 # a `read` the reader thread blocks on. The workspace's pinned version.
 libc.workspace = true
+
+[dev-dependencies]
+# The media tests' flat megapixel PNGs: the same pinned encoder the vision crate's image tests use.
+png = "=0.18.1"
