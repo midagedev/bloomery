@@ -108,7 +108,7 @@ impl LogitsBand {
     /// Whether the measured band sits within the pins.
     pub fn ok(&self) -> bool {
         self.aligned
-            && self.disagree <= LOGITS_CLEAR_PIN
+            && self.disagree.saturating_sub(LOGITS_CLEAR_PIN) == 0
             && self.max <= LOGITS_MAX_PIN
             && self.rms() <= LOGITS_RMS_PIN
     }

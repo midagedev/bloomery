@@ -732,7 +732,11 @@ gguf 7 2 0
 # fused gate/up FP4 epilogue replaces 4 Q8-output blocks with 16 shared-code, FP4-plane, frame and arrival blocks;
 # fp4_sub's register-only conversion adds 1 block, and load_gpu, shared_max and arrive add 3 fns and 4 blocks
 # for the GPU-scope load, shared maximum and acquire/release arrival. Each has its SAFETY line.
-gpu 2877 396 10
+# PIN(2026-10-31): gpu 2877 -> 2880 blocks, 396 -> 397 fns, new code, not old code relaxed: the K-quant SwiGLU's
+# shared body (`gemm::swiglu::swiglu_quant_block`, an unsafe fn with its two blocks, the plain and card-slots entries'
+# one owner) and the card-slots entry's reads of its refusal word and a column's place (`gemm_swiglu_quant_sel`), each
+# with its SAFETY line.
+gpu 2880 397 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -763,7 +767,10 @@ gpu 2877 396 10
 # and its checked row launch retain their SAFETY invariants over main's ISTA entries.
 # PIN(2026-10-27): gpu-deepseek41 397 -> 396 blocks, moved code: the engram rows' arrival copies through the
 # gpu crate's StagedRows (glue.rs `RowsArrival::enqueue`).
-gpu-deepseek41 396 44 0
+# PIN(2026-10-31): gpu-deepseek41 396 -> 397 blocks, new code, not old code relaxed: the route phase's copy of the
+# layer's slot-map row into the batch (`b.gemm.map_row`), which the prompt block's grouped GEMM route reads, with its
+# SAFETY line.
+gpu-deepseek41 397 44 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0

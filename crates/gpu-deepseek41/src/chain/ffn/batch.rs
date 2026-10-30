@@ -2568,7 +2568,7 @@ impl FfnPiece {
                     enqueue_gemm_batch(
                         (&b.kernels.gemm, &b.kernels.g32),
                         gpu.stream(),
-                        &*ids,
+                        &ids,
                         &b.gemm.map_row,
                         GateUp::Grouped(gty, [s.gate, s.up], &b.gemm.act_x),
                         DownW::Grouped(
@@ -2576,7 +2576,7 @@ impl FfnPiece {
                             s.down,
                             Act::SwigluClamp { limit: c.limit },
                             &mut b.gemm.act_down,
-                            &mut *down,
+                            &mut down,
                         ),
                         (t, c.n_card),
                         (N_USED, ff, n),

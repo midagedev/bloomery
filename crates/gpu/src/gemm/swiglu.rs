@@ -204,13 +204,13 @@ impl GemmKernels {
                 ),
             ));
         }
-        if let Some((sel, _)) = sel {
-            if sel.len() < n_cols {
-                return Err(GpuError::shape(
-                    what,
-                    format!("sel.len() {} < n_cols {n_cols}", sel.len()),
-                ));
-            }
+        if let Some((sel, _)) = sel
+            && sel.len() < n_cols
+        {
+            return Err(GpuError::shape(
+                what,
+                format!("sel.len() {} < n_cols {n_cols}", sel.len()),
+            ));
         }
         let (act_code, limit) = rule.code(what)?;
         let n_sb = k / 256;
