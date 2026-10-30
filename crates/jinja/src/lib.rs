@@ -20,7 +20,7 @@
 //! `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.lstrip()`/
 //! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()` with Python's
 //! arguments, filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
-//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`/`replace` (Python string
+//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`/`replace`/`list` (Python string
 //! conversion, optional integer count, positional or keyword arguments), tests `defined`/`undefined`/`none`/`true`/
 //! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
 //! `raise_exception`/`range`, and Hugging Face's `{% generation %}` block (it renders its body,
@@ -2597,6 +2597,17 @@ fn filter(
         "lower" => V::J(Value::String(to_str(&v)?.to_lowercase())),
         "upper" => V::J(Value::String(to_str(&v)?.to_uppercase())),
         "capitalize" => V::J(Value::String(capitalize(&to_str(&v)?)?)),
+        // jinja2's `do_list`: `list(value)` — a sequence's copy, a string's characters, a
+        // mapping's keys, a range's items.
+        "list" => V::J(Value::Array(match elements(v) {
+            Ok(items) => items,
+            Err(V::Undef) => return err("|list of an undefined value is an error".to_owned()),
+            Err(other) => {
+                return err(format!(
+                    "|list needs a list, a mapping, a string or a range, not {other:?}"
+                ));
+            }
+        })),
         other => return err(format!("unsupported filter |{other}")),
     })
 }
@@ -4808,5 +4819,115 @@ mod tests {
     #[test]
     fn lfm3_template_renders_as_jinja2() {
         renders_as_jinja2(LFM3, LFM3_RENDERS, 13);
+    }
+
+    /// `| list` is jinja2's `do_list` (`list(value)`): a sequence's copy, a string's characters,
+    /// a mapping's keys, a range's items; anything else is a named error, as `list()` raising is.
+    #[test]
+    fn list_filter_follows_jinja2() {
+        let vars = json!({"a": [1, 2], "s": "héy", "m": {"b": 1, "a": 2}, "n": null, "x": 5});
+        for (src, want) in [
+            ("{{ a | list | tojson }}", "[1, 2]"),
+            ("{{ s | list | tojson }}", r#"["h", "é", "y"]"#),
+            ("{{ m | list | tojson }}", r#"["b", "a"]"#),
+            ("{{ range(3) | list | tojson }}", "[0, 1, 2]"),
+            ("{{ range(1, 7, 2) | list | tojson }}", "[1, 3, 5]"),
+            // A copy, not the source itself: it concatenates, the source stays whole.
+            ("{{ ([0] + (a | list)) | tojson }}", "[0, 1, 2]"),
+            ("{{ ([] + (a | list)) | length }}", "2"),
+            ("{{ a | length }}", "2"),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+        for (src, want) in [
+            (
+                "{{ x | list }}",
+                "|list needs a list, a mapping, a string or a range",
+            ),
+            (
+                "{{ n | list }}",
+                "|list needs a list, a mapping, a string or a range",
+            ),
+            ("{{ u | list }}", "|list of an undefined value"),
+        ] {
+            let e = render_err(src, vars.clone());
+            assert!(e.contains(want), "{src}: {e}");
+        }
+    }
+
+    const ML4: &str = include_str!("../tests/fixtures/mistral-large4-chat-template.jinja");
+
+    /// Mistral Large 4's chat template renders a tool round trip as the template writes it,
+    /// derived by reading the template: the BOS; the system message in `[SYSTEM_PROMPT]`; the
+    /// tools and the model settings (`reasoning_effort` defaults `high`) before the first user
+    /// turn; the user turn in `[INST]`; the assistant call as `[TOOL_CALLS]name[ARGS]` with the
+    /// arguments `tojson` writes (no call id, nothing between calls) and `eos_token` after the
+    /// assistant turn; the tool result in `[TOOL_RESULTS]`. The arguments object reaches the
+    /// template as the request gave it, its key order kept.
+    #[test]
+    fn ml4_template_renders_a_tool_round_trip() {
+        let vars = json!({
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "unit": {"type": "string"}},
+                "required": ["city"],
+            }}}],
+            "messages": [
+                {"role": "system", "content": "You are precise."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"type": "function", "function": {
+                        "name": "get_weather", "arguments": {"city": "Paris", "unit": "C"},
+                    }},
+                ]},
+                {"role": "tool", "content": "18"},
+            ],
+        });
+        assert_eq!(
+            render(ML4, vars),
+            "<s>[SYSTEM_PROMPT]You are precise.[/SYSTEM_PROMPT]\
+             [AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \
+             \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \
+             \"unit\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS]\
+             [MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS]\
+             [INST]Weather in Paris?[/INST]\
+             [TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"unit\": \"C\"}</s>\
+             [TOOL_RESULTS]18[/TOOL_RESULTS]"
+        );
+    }
+
+    /// The same template on an assistant turn with `reasoning_content` and chunked content: the
+    /// reasoning becomes a leading thinking chunk joined to a copy of the content's chunks
+    /// (`| list`, the template's other use), the chunks merge the text parts between them, and the
+    /// thinking chunk renders its span with `closed` defaulted.
+    #[test]
+    fn ml4_template_joins_reasoning_into_chunked_content() {
+        let vars = json!({
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+            "tools": [{"type": "function", "function": {"name": "get_time", "parameters": {
+                "type": "object", "properties": {},
+            }}}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant",
+                 "reasoning_content": "thinking hard",
+                 "content": [{"type": "text", "text": "part 1"}, {"type": "text", "text": "part 2"}],
+                 "tool_calls": [{"type": "function", "function": {
+                     "name": "get_time", "arguments": {},
+                 }}]},
+                {"role": "tool", "content": "done"},
+            ],
+        });
+        assert_eq!(
+            render(ML4, vars),
+            "<s>[AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \
+             \"parameters\": {\"type\": \"object\", \"properties\": {}}}}][/AVAILABLE_TOOLS]\
+             [MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS]\
+             [INST]hi[/INST][THINK]thinking hard[/THINK]part 1part 2\
+             [TOOL_CALLS]get_time[ARGS]{}</s>[TOOL_RESULTS]done[/TOOL_RESULTS]"
+        );
     }
 }

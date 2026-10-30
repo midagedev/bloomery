@@ -2,8 +2,8 @@
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
 //! [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`lfm2`), [`Pre::Tekken`] (`tekken`, `pixtral`),
-//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
-//! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
+//! [`Pre::TekkenNum3`] (`tekken-num3`), [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`),
+//! [`Pre::Gemma4`] (`gemma4`), [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
 //!
@@ -154,6 +154,11 @@
 //! [`Pre::MiniMaxM2Hf`] does (a non-ASCII capital is no lowercase letter there), with no
 //! contraction.
 //!
+//! `tekken-num3` is the same regex with the number run cut in words of three from its end
+//! (`\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`, raon's rule), so [`Pre::TekkenNum3`] runs the same
+//! matcher with that one [`DigitRule`] and no Hugging Face twin: Mistral publishes no
+//! `tokenizer.json` that spells it.
+//!
 //! ## raon
 //!
 //! One regex, which the reference runs as the hand-written
@@ -255,6 +260,38 @@ fn match_number(c: &[u8], i: usize, hi: usize, max: usize) -> usize {
     run(c, i, hi, is_number).min(max)
 }
 
+/// How a regex's number alternative cuts a run of numbers.
+#[derive(Clone, Copy)]
+enum DigitRule {
+    /// No number alternative: an earlier pass took the numbers.
+    None,
+    /// `\p{N}{1,n}`: at most `n` numbers, from the run's start.
+    Front(usize),
+    /// `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`: the run in words of three from
+    /// its end, the first one the shorter. The `\p{N}{1,2}` beside it in the
+    /// regex never runs: at the start of a run of `n` numbers some prefix of
+    /// one to three always leaves a multiple of three.
+    ThreesFromEnd,
+}
+
+impl DigitRule {
+    /// The alternative's match at `i`: its length, 0 for none.
+    fn at(self, c: &[u8], i: usize, hi: usize) -> usize {
+        match self {
+            DigitRule::None => 0,
+            DigitRule::Front(n) => match_number(c, i, hi, n),
+            DigitRule::ThreesFromEnd => {
+                let n = run(c, i, hi, is_number);
+                match n % 3 {
+                    0 if n == 0 => 0,
+                    0 => 3,
+                    first => first,
+                }
+            }
+        }
+    }
+}
+
 /// `[^\s\p{L}\p{N}]`: the "other" run's class of qwen2 and glm4.
 fn is_other(c: u8) -> bool {
     !is_space(c) && !is_letter(c) && !is_number(c)
@@ -318,18 +355,18 @@ fn match_prefixed_word(
     run(c, i, hi, word)
 }
 
-/// The alternatives every regex here ends with, at `i`: `\p{N}{1,digits}` (none when `digits` is
-/// 0), ` ?[other]+[tail]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`. A space is none of `other`, so backing
+/// The alternatives every regex here ends with, at `i`: the number rule `digits`,
+/// ` ?[other]+[tail]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`. A space is none of `other`, so backing
 /// the optional space off never helps.
 fn match_tail(
     c: &[u8],
     i: usize,
     hi: usize,
-    digits: usize,
+    digits: DigitRule,
     other: impl Fn(u8) -> bool,
     tail: impl Fn(u8) -> bool,
 ) -> usize {
-    let n = match_number(c, i, hi, digits);
+    let n = digits.at(c, i, hi);
     if n > 0 {
         return n;
     }
@@ -381,7 +418,7 @@ fn match_qwen(
 
     // `\p{N}` or `\p{N}{1,3}` (up to `digits` numbers), ` ?[^\s<word>\p{N}]+[\r\n]*` and
     // `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_tail(c, i, hi, digits, other, is_newline)
+    match_tail(c, i, hi, DigitRule::Front(digits), other, is_newline)
 }
 
 /// Regex 3 at `i`: the first of its six alternatives that matches.
@@ -408,7 +445,7 @@ fn match_word(c: &[u8], i: usize, hi: usize) -> usize {
     }
 
     // ` ?[\p{P}\p{S}]+[\r\n]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_tail(c, i, hi, 0, is_punct_or_symbol, is_newline)
+    match_tail(c, i, hi, DigitRule::None, is_punct_or_symbol, is_newline)
 }
 
 /// [`collapse_hf`], with a letter of Unicode 14.0 told by its category: `Lu` and `Lt` collapse to
@@ -510,23 +547,27 @@ impl CasedLetters for CasedHf {
     }
 }
 
-/// What the two case-split regexes differ in beside their letters.
+/// What the case-split regexes differ in beside their letters.
 #[derive(Clone, Copy)]
 struct CasedShape {
     /// Whether a word may end in a contraction (`minimax-m2` does).
     contraction: bool,
-    /// The longest run of numbers one word holds (`\p{N}` is 1, `\p{N}{1,3}` is 3).
-    digits: usize,
+    /// How the run of numbers one word opens is cut ([`DigitRule`]).
+    digits: DigitRule,
 }
 
 impl CasedShape {
     const MINIMAX_M2: Self = Self {
         contraction: true,
-        digits: 3,
+        digits: DigitRule::Front(3),
     };
     const TEKKEN: Self = Self {
         contraction: false,
-        digits: 1,
+        digits: DigitRule::Front(1),
+    };
+    const TEKKEN_NUM3: Self = Self {
+        contraction: false,
+        digits: DigitRule::ThreesFromEnd,
     };
 }
 
@@ -586,8 +627,8 @@ fn match_cased_words<K: CasedLetters>(
         }
     }
 
-    // `\p{N}{1,3}` (`\p{N}` for `tekken`), ` ?[^\s\p{L}\p{N}]+[\r\n/]*` and
-    // `\s*[\r\n]+|\s+(?!\S)|\s+`
+    // The number rule (`\p{N}` for `tekken`, `\p{N}{1,3}` for `minimax-m2`, the threes from the
+    // end for `tekken-num3`), ` ?[^\s\p{L}\p{N}]+[\r\n/]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
     match_tail(
         c,
         i,
@@ -695,6 +736,9 @@ pub(crate) enum Pre {
     /// `tekken`, `pixtral`: the reference's TEKKEN regex, run as a regex over the collapsed text,
     /// and a word that is itself a token is taken whole ([`Pre::ignore_merges`]).
     Tekken,
+    /// `tekken-num3`: [`Pre::Tekken`]'s regex with the number run cut in words of three from its
+    /// end, and a word that is itself a token is taken whole ([`Pre::ignore_merges`]).
+    TekkenNum3,
     /// `tekken` as a Hugging Face `tokenizer.json` spells and runs it: the letter categories apart,
     /// `\p{M}` in the word classes, Unicode 14.0's classes, and BPE skips a byte its vocabulary
     /// lacks; a word that is itself a token is still taken whole. Never named in a header; a
@@ -720,7 +764,7 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 15] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 16] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -729,6 +773,7 @@ impl Pre {
         ("glm4", Pre::Glm4),
         ("qwen35", Pre::Qwen35),
         ("tekken", Pre::Tekken),
+        ("tekken-num3", Pre::TekkenNum3),
         ("pixtral", Pre::Tekken),
         ("lfm2", Pre::Llama3),
         ("minimax-m2", Pre::MiniMaxM2),
@@ -762,11 +807,12 @@ impl Pre {
     }
 
     /// Whether a word that is itself a vocabulary token is taken whole,
-    /// before merges. Any pre can carry it; `lfm2` and `tekken` do, in either reading.
+    /// before merges. Any pre can carry it; `lfm2`, `tekken` and `tekken-num3` do, the first two
+    /// in either reading.
     pub(crate) fn ignore_merges(self) -> bool {
         matches!(
             self,
-            Pre::Llama3 | Pre::Llama3Hf | Pre::Tekken | Pre::TekkenHf
+            Pre::Llama3 | Pre::Llama3Hf | Pre::Tekken | Pre::TekkenHf | Pre::TekkenNum3
         )
     }
 
@@ -778,11 +824,14 @@ impl Pre {
 
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
     /// An overlong form is not a codepoint there; older readers accept it. The trees that read
-    /// `gpt-4o`, `raon`, `flint` and `tekken` (every tree that maps `pixtral` to it has the check)
-    /// reject it; the trees the other names' sets are read by (ik, the Solar-Open2 patch,
-    /// mainline before the check) accept it.
+    /// `gpt-4o`, `raon`, `flint`, `tekken` (every tree that maps `pixtral` to it has the check)
+    /// and `tekken-num3` (a name younger than the check) reject it; the trees the other names'
+    /// sets are read by (ik, the Solar-Open2 patch, mainline before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
-        matches!(self, Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken)
+        matches!(
+            self,
+            Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken | Pre::TekkenNum3
+        )
     }
 
     /// How this pre-tokenizer's words are spelled in the vocabulary.
@@ -800,6 +849,7 @@ impl Pre {
             | Pre::Llama3Hf
             | Pre::Tekken
             | Pre::TekkenHf
+            | Pre::TekkenNum3
             | Pre::MiniMaxM2
             | Pre::Gpt4o
             | Pre::Raon
@@ -837,6 +887,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         Pre::MiniMaxM2Hf => split_cased::<CasedHf>(cpts, s, CasedShape::MINIMAX_M2),
         Pre::Tekken => split_cased::<TekkenReference>(cpts, s, CasedShape::TEKKEN),
         Pre::TekkenHf => split_cased::<CasedHf>(cpts, s, CasedShape::TEKKEN),
+        Pre::TekkenNum3 => split_cased::<TekkenReference>(cpts, s, CasedShape::TEKKEN_NUM3),
         Pre::Gemma4 => {
             split_newlines(cpts, &mut s.b);
             &s.b
@@ -889,13 +940,8 @@ fn split_raon(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
             }
             pos = p;
         } else if number(pos) {
-            // `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`: the run cut in threes from its end.
-            p = pos;
-            while number(p) {
-                p += 1;
-            }
-            let first = (p - pos) % 3;
-            pos += if first > 0 { first } else { 3 };
+            // `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`.
+            pos += DigitRule::ThreesFromEnd.at(c, pos, end);
         } else if punct(p) {
             // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
             while punct(p) {
@@ -1776,6 +1822,111 @@ mod tests {
         for &(text, hf, reference) in cases {
             assert_eq!(words(Pre::TekkenHf, text), hf, "tekken hf {text:?}");
             assert_eq!(words(Pre::Tekken, text), reference, "tekken {text:?}");
+        }
+    }
+
+    /// `tekken-num3` is a row of its own that runs the `tekken` splitter with the number branch the
+    /// name spells, and takes a word that is itself a token whole with the strict UTF-8 reader of
+    /// the tree that reads it (the one tree that does: it is younger than the check).
+    ///
+    /// FAIL-first: a missing row, `Pre::ignore_merges` without it, or `Pre::strict_utf8` without
+    /// it fails it.
+    #[test]
+    fn tekken_num3_names() {
+        assert_eq!(
+            crate::named(&Pre::NAMES, "tekken-num3"),
+            Some(Pre::TekkenNum3)
+        );
+        assert!(crate::runs_pre_tokenizer("tekken-num3"));
+        assert!(Pre::TekkenNum3.ignore_merges());
+        assert!(Pre::TekkenNum3.strict_utf8());
+        assert_eq!(Pre::TekkenNum3.hf_reading(), None);
+    }
+
+    /// The `tekken-num3` regex is `tekken`'s with the number alternative
+    /// `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}` (llama.cpp's `llama-vocab.cpp`, the
+    /// `LLAMA_VOCAB_PRE_TYPE_TEKKEN_NUM3` case): a run of numbers is cut in words of three from
+    /// its end, the first one the shorter — `1|234|567` where `tekken` cuts every number and
+    /// glm4's `\p{N}{1,3}` cuts `123|456|7` from the start. Every other alternative splits as
+    /// `tekken`'s does (the words, the symbol runs, the whitespace).
+    ///
+    /// FAIL-first: with `CasedShape::TEKKEN`'s digit rule (one number a word) every digit row
+    /// fails; with glm4's (three from the start) the runs of 4, 5, 7 and 10 fail.
+    #[test]
+    fn tekken_num3_cases() {
+        /// One case: the text, and its words under num3, tekken and glm4.
+        type Case = (
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let cases: &[Case] = &[
+            //                              tekken-num3               tekken                    glm4
+            ("7", &["7"], &["7"], &["7"]),
+            ("12", &["12"], &["1", "2"], &["12"]),
+            ("123", &["123"], &["1", "2", "3"], &["123"]),
+            ("1234", &["1", "234"], &["1", "2", "3", "4"], &["123", "4"]),
+            (
+                "12345",
+                &["12", "345"],
+                &["1", "2", "3", "4", "5"],
+                &["123", "45"],
+            ),
+            (
+                "123456",
+                &["123", "456"],
+                &["1", "2", "3", "4", "5", "6"],
+                &["123", "456"],
+            ),
+            (
+                "1234567",
+                &["1", "234", "567"],
+                &["1", "2", "3", "4", "5", "6", "7"],
+                &["123", "456", "7"],
+            ),
+            // The number words are the same as raon's rule: `1|234|567`.
+            (
+                "call 5551234567 now",
+                &["call", " ", "5", "551", "234", "567", " now"],
+                &[
+                    "call", " ", "5", "5", "5", "1", "2", "3", "4", "5", "6", "7", " now",
+                ],
+                &["call", " ", "555", "123", "456", "7", " now"],
+            ),
+            // Mixed text: the words, the symbol runs and the whitespace cut as `tekken`'s do.
+            (
+                "abc1234def",
+                &["abc", "1", "234", "def"],
+                &["abc", "1", "2", "3", "4", "def"],
+                &["abc", "123", "4", "def"],
+            ),
+            (
+                " 12345",
+                &[" ", "12", "345"],
+                &[" ", "1", "2", "3", "4", "5"],
+                &[" ", "123", "45"],
+            ),
+            (
+                "Hello世界2026 Мир",
+                &["Hello世界", "2", "026", " Мир"],
+                &["Hello世界", "2", "0", "2", "6", " Мир"],
+                &["Hello世界", "202", "6", " Мир"],
+            ),
+            // Unicode numbers: `²` and `³` are `No`, `١` to `٤` `Nd`, all one run of numbers; the
+            // run of two is one word under num3 and glm4, two under tekken.
+            (
+                "x²³ ١٢٣٤",
+                &["x", "²³", " ", "١", "٢٣٤"],
+                &["x", "²", "³", " ", "١", "٢", "٣", "٤"],
+                &["x", "²³", " ", "١٢٣", "٤"],
+            ),
+            ("it'sa", &["it", "'sa"], &["it", "'sa"], &["it", "'s", "a"]),
+        ];
+        for &(text, num3, tekken, glm4) in cases {
+            assert_eq!(words(Pre::TekkenNum3, text), num3, "num3 {text:?}");
+            assert_eq!(words(Pre::Tekken, text), tekken, "tekken {text:?}");
+            assert_eq!(words(Pre::Glm4, text), glm4, "glm4 {text:?}");
         }
     }
 
