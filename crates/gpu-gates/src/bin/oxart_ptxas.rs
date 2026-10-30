@@ -28,9 +28,8 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), GateError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (section, out) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [section, out] => (section, out),
-        _ => return Err(USAGE.into()),
+    let [section, out] = args.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
+        return Err(USAGE.into());
     };
     let bytes = std::fs::read(section).map_err(|e| format!("read {section}: {e}"))?;
     let packed = pack(&bytes, "ptxas")?;
