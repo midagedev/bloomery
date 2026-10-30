@@ -2,7 +2,7 @@
 //! generation into `reasoning_content`, `content` and `tool_calls` under the
 //! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's and
 //! Solar-Open's in [`crate::glmxml`], Hermes' in [`crate::hermes`], Qwen3-Coder's in
-//! [`crate::qwenxml`]).
+//! [`crate::qwenxml`], Mistral's in [`crate::mistral`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
 //! `tool_calls` branch), in one of two spellings ([`Spelling`]):
@@ -46,6 +46,7 @@ use crate::callstream::{
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
+use crate::mistral::{self, MistralError, MistralScan};
 use crate::qwenxml::{self, Framing, ParamKinds, QwenScan, QwenXmlError};
 use crate::reasoning::{ReasoningFormat, Split, ThinkSplit, ThinkTags, partial_suffix};
 
@@ -559,6 +560,9 @@ pub enum ToolFormat {
     /// calls block ([`crate::museatem`]); the `to=self` span is the
     /// reasoning.
     MuseSpark,
+    /// Mistral's `[TOOL_CALLS]NAME[ARGS]{json}` (Mistral Large 4's markup),
+    /// one per call, no call id.
+    Mistral,
     /// None the server parses: a chat request that asks for tool calls is
     /// refused.
     Unparsed,
@@ -570,7 +574,8 @@ impl ToolFormat {
     /// openers (GLM's `<tool_call>`, `<arg_key>` and `<arg_value>`), Qwen3-Coder's
     /// when it spells `<tool_call>`, `<function=` and `<parameter=` (llama.cpp
     /// reads the three spellings), DSML's when it spells the DSML token (in the
-    /// spelling [`Spelling::of_template`] reads), else
+    /// spelling [`Spelling::of_template`] reads), Mistral's when it spells
+    /// `[TOOL_CALLS]` and `[ARGS]`, else
     /// nothing the source alone can name — a `<tool_call>` template may carry
     /// Hermes' JSON body, which only a rendered call tells apart
     /// ([`ToolFormat::of_chat_template`]). Qwen3-Coder's framing is read from
@@ -628,6 +633,8 @@ impl ToolFormat {
             framing().map_or(ToolFormat::Unparsed, ToolFormat::QwenXml)
         } else if source.contains(DSML) {
             ToolFormat::Dsml(Spelling::of_template(source))
+        } else if source.contains(mistral::CALL_OPEN) && source.contains(mistral::ARGS) {
+            ToolFormat::Mistral
         } else {
             ToolFormat::Unparsed
         }
@@ -716,6 +723,8 @@ pub enum Tools {
     /// Muse Spark's recipient protocol ([`crate::museatem`]): its values
     /// carry no schema (JSON when a value parses, else the raw text).
     MuseSpark,
+    /// Mistral's markup: the model writes the arguments as JSON itself.
+    Mistral,
 }
 
 #[derive(Clone, Debug)]
@@ -725,6 +734,7 @@ enum Scan {
     Hermes(HermesScan),
     Qwen(QwenScan),
     Muse(crate::museatem::MuseScan),
+    Mistral(MistralScan),
 }
 
 /// A generation whose tool-call markup does not parse: which scan refused,
@@ -737,6 +747,9 @@ pub enum MarkupError {
     /// The Hermes scan's refusal.
     #[error("{0}")]
     Hermes(#[from] HermesError),
+    /// The Mistral scan's refusal.
+    #[error("{0}")]
+    Mistral(#[from] MistralError),
     /// The Qwen3-Coder scan's refusal.
     #[error("{0}")]
     Qwen(#[from] QwenXmlError),
@@ -834,6 +847,7 @@ impl ChatParser {
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
                 Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
                 Tools::MuseSpark => Scan::Muse(crate::museatem::MuseScan::default()),
+                Tools::Mistral => Scan::Mistral(MistralScan::default()),
             }),
             streamer: None,
             open: None,
@@ -943,6 +957,7 @@ impl ChatParser {
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
             Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content)?),
             Some(Scan::Muse(m)) => Some(m.push(&split.content)),
+            Some(Scan::Mistral(m)) => Some(m.push(&split.content)?),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
@@ -981,6 +996,7 @@ impl ChatParser {
             }
             Some(Scan::Kv(k)) => Some(ended(k.finish(), KvError::unclosed, cut, sent)?),
             Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, whole)?),
+            Some(Scan::Mistral(m)) => Some(ended(m.finish(), MistralError::unclosed, cut, whole)?),
             Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, sent)?),
             // The scan closes a message the stream ends inside as its call on its own.
             Some(Scan::Muse(m)) => Some(m.finish()),
@@ -1113,6 +1129,7 @@ impl ToolFormat {
             ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs),
             ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
             ToolFormat::MuseSpark => crate::museatem::call_parts(funs),
+            ToolFormat::Mistral => mistral::call_parts(funs),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"
