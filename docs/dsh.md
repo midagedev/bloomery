@@ -66,7 +66,8 @@ same shape as pi's `models.json` ([`pi.md`](pi.md)). Three choices in it:
   the first page came 12 to 13 min after the server was up. The wait is the model's answer length, not the
   harness's prompt ([`research/coding-agents.md`](research/coding-agents.md) §1).
 - `input: [text, image]` — turns on dsh's `read_image`, which needs the server's `--mmproj` (§1).
-- `contextWindow: 262144` — the model's own context window, told to dsh instead of a guess.
+- `contextWindow` — replace `262144` with the `ready` event's `ctx` before running dsh. The server can fit a smaller
+  context to available memory. Keep `maxTokens` below that served window too.
 
 The model `id` can be any name the server answers to: bloomery serves its one model whatever name a request carries.
 `BLOOMERY_DSH_KEY` can be any value; the server does not check it.

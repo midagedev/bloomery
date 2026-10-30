@@ -14,24 +14,8 @@ npm install -g @earendil-works/pi-coding-agent
 
 ## 1. Start a server
 
-The same server as [`claude-code.md`](claude-code.md) §1. **NVIDIA (Linux, WSL2).** Pick a model and start it by
-name, as [`agents.md`](agents.md) describes:
-
-```sh
-bloomery-serve --recommend --json            # what this machine serves, the fastest variant of each
-bloomery-serve --model NAME --port 8080      # wait for the "ready" event on stdout
-```
-
-**Apple Silicon.** The server is `bloomery-serve-metal` ([`mac.md`](mac.md)). For coding on a 32 GB Mac, start
-Qwen3-Coder-30B-A3B's MLX folder:
-
-```sh
-bloomery-serve-metal --hf mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --ctx 49152 --port 8080
-```
-
-Wait until `GET /health` answers 200. The first start downloads the folder (17.2 GB), so give it minutes. `--ctx`
-unset is 32,768 positions; that already holds pi's first request (~1,700 ids [derived]) many times over, so it is
-enough to start with.
+Follow [Start a server](claude-code.md#1-start-a-server) for NVIDIA or Apple Silicon. Use its server URL and served
+context in the pi configuration below.
 
 ## 2. Point pi at it
 
