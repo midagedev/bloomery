@@ -79,6 +79,7 @@ use std::sync::Arc;
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegShape, LegStacks, QuantRun};
 use bloomery_gpu::fused::FusedKernels;
+use bloomery_gpu::gemm::GemmRoute;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
@@ -619,16 +620,21 @@ unsafe fn combine_post_at_n<const N: usize>(
 }
 
 /// A layer's routed stacks on the card: the experts its slot-map row puts
-/// there, slot `s` at rows `s · rows .. (s + 1) · rows` of each. Either the
-/// fused layer ([`accepts::DS41_LEG`]: gate and up q3_K, `ff` rows of `n_embd`
-/// per expert, and a q4_K down of `n_embd` rows of `ff`), which the chain's
-/// own launches read, or a layer of types the common card leg runs
+/// there, slot `s` at rows `s · rows .. (s + 1) · rows` of each, with each
+/// stack's file type beside it ([`CardStacks::gate_up_ty`],
+/// [`CardStacks::down_ty`]) — what a launcher that reads the stacks reads by
+/// instead of assuming the pair it was built for. Either the fused layer
+/// ([`accepts::DS41_LEG`]: gate and up q3_K, `ff` rows of `n_embd` per
+/// expert, and a q4_K down of `n_embd` rows of `ff`), which the chain's own
+/// launches read, or a layer of types the common card leg runs
 /// ([`accepts::ds41_pair`]), which [`CardStacks::legs`] hands to it.
 #[derive(Clone, Copy)]
 pub struct CardStacks<'a> {
     pub gate: &'a DeviceTensor<u32>,
     pub up: &'a DeviceTensor<u32>,
     pub down: &'a DeviceTensor<u32>,
+    gate_up_ty: GgmlType,
+    down_ty: GgmlType,
     /// The stacks as the common card leg reads them, for a layer on it;
     /// `None` for the fused layer.
     legs: Option<LegStacks<'a>>,
@@ -693,6 +699,8 @@ impl<'a> CardStacks<'a> {
             gate,
             up,
             down,
+            gate_up_ty: types[0],
+            down_ty: types[2],
             legs: (!fused).then_some(legs),
         }))
     }
@@ -705,12 +713,27 @@ impl<'a> CardStacks<'a> {
         up: &'a DeviceTensor<u32>,
         down: &'a DeviceTensor<u32>,
     ) -> CardStacks<'a> {
+        let [gate_up_ty, _, down_ty] = accepts::DS41_LEG;
         CardStacks {
             gate,
             up,
             down,
+            gate_up_ty,
+            down_ty,
             legs: None,
         }
+    }
+
+    /// The gate's and the up's type.
+    #[must_use]
+    pub fn gate_up_ty(&self) -> GgmlType {
+        self.gate_up_ty
+    }
+
+    /// The down's type.
+    #[must_use]
+    pub fn down_ty(&self) -> GgmlType {
+        self.down_ty
     }
 
     /// Whether the layer is the fused one the chain's own launches read
@@ -1106,6 +1129,14 @@ pub struct FfnPiece {
     /// The common card leg's launches, for the layers of types it runs
     /// ([`FfnPiece::prepare_leg`]).
     leg: Option<CardLeg>,
+    /// The grouped GEMM's route tables, one per distinct count of card
+    /// experts the map puts on a layer ([`FfnPiece::gemm_route_at`]), for the
+    /// default prompt block's card experts ([`batch::enqueue_block_experts`]).
+    /// Empty when no layer holds card experts: a block that needs a table is
+    /// refused by name then.
+    routes: Vec<GemmRoute>,
+    /// The expert counts [`FfnPiece::routes`]' tables hold, in their order.
+    counts: Vec<usize>,
     /// HC_PRE's reduction scratch, which its own launches consume.
     hc_scratch: HcPreScratch,
 }
@@ -1182,6 +1213,15 @@ impl FfnPiece {
         let rows = (0..rows)
             .map(|_| FfnRow::new(stream, n_embd, ff))
             .collect::<Result<Vec<_>, _>>()?;
+        // The GEMM's route table holds the experts of one stack, so one table
+        // a distinct card count; a block's fill passes its layer's count.
+        let mut counts: Vec<usize> = cfg.iter().map(|c| c.n_card).filter(|&n| n > 0).collect();
+        counts.sort_unstable();
+        counts.dedup();
+        let routes = counts
+            .iter()
+            .map(|&n| GemmRoute::new(stream, UNION_MAX_COLS * N_USED, n))
+            .collect::<Result<_, _>>()?;
         Ok(FfnPiece {
             fused: FusedKernels::load(ctx)?,
             router: RouterKernels::load(ctx)?,
@@ -1202,7 +1242,22 @@ impl FfnPiece {
             scale: ex.routed_scale,
             rows,
             leg: None,
+            routes,
+            counts,
             hc_scratch: HcPreScratch::new(stream, HC_STREAMS * n_embd)?,
+        })
+    }
+
+    /// The grouped GEMM's route table for a layer of `n_card` card experts,
+    /// its index into [`FfnPiece::routes`], refused by name when the piece
+    /// holds no table for the count.
+    fn gemm_route_at(&self, layer: usize, n_card: usize) -> Result<usize, GpuError> {
+        self.counts.iter().position(|&n| n == n_card).ok_or_else(|| GpuError::Shape {
+            what: ENQUEUE,
+            detail: format!(
+                "layer {layer}: a GEMM route table of {n_card} card experts; the piece holds {:?}",
+                self.counts
+            ),
         })
     }
 
@@ -1250,11 +1305,13 @@ impl FfnPiece {
             .map(|c| if c.n_card > 0 { 10 } else { 7 } + usize::from(c.sh_down_q8_1))
     }
 
-    /// Device bytes of the piece's own scratch, every row's.
+    /// Device bytes of the piece's own scratch, every row's and the GEMM
+    /// route tables'.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
         self.rows.iter().map(FfnRow::device_bytes).sum::<usize>()
             + hc_pre_scratch_bytes(&self.hc_scratch)
+            + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
     }
 
     /// Device bytes of one row's buffers.

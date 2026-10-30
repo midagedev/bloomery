@@ -10,9 +10,10 @@
 //!    router (`RouterKernels::enqueue_router_rows`, each token's scores and
 //!    selection the one-token launch's) into the batch's ids and weights, and
 //!    each slot's place in the card's routed stacks (`ds41_ffn_places`, the
-//!    handoff's rule, an id past the expert count raising its fault);
-//!    the layer's tensors are resolved once for the route and the shadow
-//!    ([`FfnPiece::resolve_batch`]);
+//!    handoff's rule, an id past the expert count raising its fault); on a
+//!    layer with card experts the layer's map row beside them into the
+//!    batch's GEMM copy; the layer's tensors are resolved once for the route
+//!    and the shadow ([`FfnPiece::resolve_batch`]);
 //! 2. the exchange ([`FfnBatch::enqueue_download`], [`FfnBatch::serve`],
 //!    [`FfnBatch::enqueue_upload`], through the host tier's batch port):
 //!    the block's activations and routing to the host, one union call over
@@ -20,13 +21,14 @@
 //!    sums back;
 //! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), enqueued before the
 //!    host computes: per chunk HC_PRE, the norm's q8_1 form again and the
-//!    shared expert; then over the whole block the card's routed experts by
-//!    tile items — an expert, a tile of its rows, up to eight of its slots —
-//!    each weight row read once for the tile's slots (the table
-//!    `q4k_sel::grouped_buckets` and its tiles, `ds41_card_gather`,
-//!    `ds41_expert_gate_up_tiles`, the q8_1 of the table's entries,
-//!    `q4k_gemv_tiles`: [`enqueue_tiled_experts`]), and their sum
-//!    (`ds41_ffn_card_acc`);
+//!    shared expert; then over the whole block the card's routed experts on
+//!    the grouped GEMM ([`bloomery_gpu::gemm::enqueue_gemm_batch`]: the route
+//!    table over the block's ids and the layer's map row, the gate and up
+//!    GEMMs, the SwiGLU of the card slots' places, the down GEMM into the
+//!    down rows by slot) and their sum (`ds41_ffn_card_acc`); the streamed
+//!    passes under host streaming keep the tile items
+//!    ([`enqueue_tiled_experts`]), an expert a tile of its rows at most eight
+//!    slots of its own;
 //! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the block:
 //!    the card sum, the host sum and the shared expert combined, then HC_POST
 //!    with the next fold where the layer folds.
@@ -43,17 +45,25 @@
 //! place for an id past the stack, a tile that names no run of its table —
 //! are [`FfnBatchKernels`]'s, which a gate loads alone and drives with it.
 //!
-//! Every token's values are the step's bit for bit: each launch writes, per
-//! token, what its one-token launch writes — the m-column kernels carry that
-//! contract, the routed dot reads its token's column through the step's
-//! `q3k_row_dot`, and the combine is [`combine_elem`] cut at its one seam
-//! ([`card_sum_elem`], then [`join_elem`]).
+//! Every token's route values are the step's bit for bit: each launch of
+//! the route writes, per token, what its one-token launch writes — the
+//! m-column kernels carry that contract — and the combine is
+//! [`combine_elem`] cut at its one seam ([`card_sum_elem`], then
+//! [`join_elem`]). The streamed passes' tile path stays the step's bits (its
+//! gate·up reads its token's column through the step's `q3k_row_dot`); the
+//! default block's card experts run the grouped GEMM, which folds each
+//! 128-value activation block one fma where the step keeps per-lane partials
+//! a warp tree reduces: their rows are a reassociated sum of the same exact
+//! integer block sums, a band the prefill gate pins, not the steps' bits.
 
 use std::mem::size_of;
 
 use bloomery_gpu::card_leg::LegRun;
 use bloomery_gpu::card_slots::CardSlotKernels;
 use bloomery_gpu::cores::q3k_row_dot;
+use bloomery_gpu::gemm::{
+    DownW, GateUp, Gemm32Kernels, GemmAct, GemmKernels, GemmWeight, enqueue_gemm_batch,
+};
 use bloomery_gpu::hybrid::{BatchKey, ServeTimes};
 use bloomery_gpu::kquant::TileScratch;
 use bloomery_gpu::kquant::tiles::{GatherPlanes, gather, gather_plane};
@@ -1006,6 +1016,16 @@ pub fn enqueue_leg_block(
     Ok(())
 }
 
+/// Which path a block's card experts run on
+/// ([`FfnPiece::enqueue_block_experts`]): the default pass's grouped GEMM,
+/// or the K-quant tile path, which the passes under host streaming keep (the
+/// kept and the streamed pass, over the block's own or its streamed places).
+#[derive(Clone, Copy)]
+enum CardPath {
+    Gemm,
+    Tiles,
+}
+
 /// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
 /// that drives the launches with inputs a batch's route cannot produce.
 pub struct FfnBatchKernels {
@@ -1013,6 +1033,10 @@ pub struct FfnBatchKernels {
     /// The places and the card sum, which the common card slots own
     /// ([`CardSlotKernels`]).
     slots: CardSlotKernels,
+    /// The grouped GEMM and the 32-value GEMM's route fill, for the default
+    /// block's card experts ([`enqueue_block_experts`]).
+    gemm: GemmKernels,
+    g32: Gemm32Kernels,
 }
 
 /// What [`FfnBatchKernels::enqueue_gate_up_tiles`] reads: both Q3_K stacks
@@ -1078,6 +1102,8 @@ impl FfnBatchKernels {
         Ok(FfnBatchKernels {
             module,
             slots: CardSlotKernels::load(ctx)?,
+            gemm: GemmKernels::load(ctx)?,
+            g32: Gemm32Kernels::load(ctx)?,
         })
     }
 
@@ -1427,12 +1453,15 @@ pub struct FfnBatch {
     act_sh: Vec<Q8Act>,
     sh_raw: DeviceBuffer<f32>,
     /// The block's card experts: per token the norm's q8_1 planes (q3 and
-    /// d8, as the chunk's scratch lays out a column), the tile path's scratch
-    /// ([`Q3TileScratch`]) and the down output by slot.
+    /// d8, as the chunk's scratch lays out a column) and the tile path's
+    /// scratch ([`Q3TileScratch`]) — both the streamed passes' — the default
+    /// block's GEMM scratch ([`GemmScratch`]) and the down output by slot,
+    /// which every path writes the same rows of.
     q3_all: DeviceBuffer<u64>,
     d8_all: DeviceBuffer<f32>,
     down_all: DeviceBuffer<f32>,
     tile: Q3TileScratch,
+    gemm: GemmScratch,
     /// With an expert tier, per token each slot's place in the tier's routed
     /// stacks, which the route writes and the tier computes by; and per
     /// batch of a group the shadow's copy of a tiered block's routing — the
@@ -1500,6 +1529,51 @@ impl Q3TileScratch {
     }
 }
 
+/// The default block's card experts on the grouped GEMM
+/// ([`enqueue_block_experts`]): the block's normed rows in the GEMM's q8_1
+/// form (a column a token — the route's norm quantized again, whose bytes
+/// the norm's fused launch defines equal to its own, bit for bit), the gate
+/// and up products (slot-major, `ff` a slot), the SwiGLU's q8_1 form (a
+/// column a slot) and the layer's map row as the block's route fill reads
+/// it — the slot map lives outside the batch, so the route, which holds it,
+/// copies the row (the row a pick moves is copied again by the route that
+/// runs under it).
+struct GemmScratch {
+    act_x: GemmAct,
+    g: DeviceBuffer<f32>,
+    u: DeviceBuffer<f32>,
+    act_down: GemmAct,
+    map_row: DeviceBuffer<u32>,
+}
+
+impl GemmScratch {
+    /// The scratch for blocks of up to `cap` tokens of `n_embd` through
+    /// experts of `ff` over `n_expert` experts, on `stream`'s card. Load-time
+    /// only; the shapes the GEMM family does not take are its named refusal.
+    fn new(
+        stream: &CudaStream,
+        (cap, n_embd, ff, n_expert): (usize, usize, usize, usize),
+    ) -> Result<GemmScratch, GpuError> {
+        let slots = cap * N_USED;
+        Ok(GemmScratch {
+            act_x: GemmAct::new(stream, cap, n_embd)?,
+            g: DeviceBuffer::zeroed(stream, slots * ff)?,
+            u: DeviceBuffer::zeroed(stream, slots * ff)?,
+            act_down: GemmAct::new(stream, slots, ff)?,
+            map_row: DeviceBuffer::zeroed(stream, n_expert)?,
+        })
+    }
+
+    /// Device bytes of the scratch.
+    fn bytes(&self) -> usize {
+        self.act_x.bytes()
+            + self.g.num_bytes()
+            + self.u.num_bytes()
+            + self.act_down.bytes()
+            + self.map_row.num_bytes()
+    }
+}
+
 impl FfnBatch {
     /// The buffers for groups of up to `sets` batches of up to `cap` tokens
     /// (at most [`UNION_MAX_COLS`], the host union's columns) of rows of
@@ -1559,6 +1633,7 @@ impl FfnBatch {
             d8_all: z(cap * 2 * n_sb)?,
             down_all: z(slot_cols * n_embd)?,
             tile: Q3TileScratch::new(stream, slot_cols, n_embd, ff)?,
+            gemm: GemmScratch::new(stream, (cap, n_embd, ff, N_EXPERT))?,
             tsel: if tier {
                 Some(DeviceBuffer::zeroed(stream, slot_cols)?)
             } else {
@@ -1680,6 +1755,7 @@ impl FfnBatch {
             + self.sel.num_bytes()
             + self.q3_all.num_bytes()
             + self.tile.device_bytes()
+            + self.gemm.bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.leg.as_ref().map_or(0, |(_, b)| b.bytes())
@@ -2017,7 +2093,9 @@ impl FfnPiece {
     /// The route of `bl`'s layer for the block `io` of a batch: per chunk the
     /// norm with its q8_1 form; then, over the block's tokens, the router
     /// ([`RouterKernels::enqueue_router_rows`], two launches) and each slot's
-    /// place from `slots`, the map's card copy (one launch). With `vl`, a
+    /// place from `slots`, the map's card copy (one launch); on a layer with
+    /// card experts, the layer's map row beside it into the batch's GEMM copy
+    /// (one copy, which the default block's route fill reads). With `vl`, a
     /// media call's — the layer's `exp_probs_b_vl` row, and per token of the
     /// batch whether it is a media position — the block's media tokens pick
     /// with that bias: the router's scores once over the block, then a pick
@@ -2116,6 +2194,21 @@ impl FfnPiece {
             n_expert: self.n_expert,
         };
         b.kernels.enqueue_places(stream, &places, fault, &mut sel)?;
+        if c.n_card > 0 {
+            // The default block's GEMM route fill reads the layer's map row
+            // from the batch's own copy: the shadow holds no slot map, and a
+            // row a pick moves is copied again by the route that runs under
+            // it.
+            let row = span(WHAT, slots.buf(), c.row_off, self.n_expert)?;
+            // SAFETY: the copy reads the slot map's card copy beside the
+            // places launch that read the same row before it on this stream
+            // (so it sees the row that launch saw), and writes the batch's
+            // row, which nothing but the blocks' route fills read, every one
+            // of them behind this route in stream order.
+            unsafe {
+                dtod(stream, &mut b.gemm.map_row, 0, &row, self.n_expert)?;
+            }
+        }
         Ok(picks)
     }
 
@@ -2207,10 +2300,11 @@ impl FfnPiece {
 
     /// The shadow work of `bl`'s layer for the block `io`, after the batch's
     /// route of it: each chunk's HC_PRE, norm and shared expert; then over the
-    /// block the card slots grouped by expert, the gate·up, its q8_1 form and
-    /// the down by tile items, each reading a weight row once for up to eight
-    /// slots, and — unless the layer is `tiered` — the card sum.
-    /// Asynchronous, allocation-free.
+    /// block the card's routed experts on the grouped GEMM ([`enqueue_block_experts`]:
+    /// the route table over the block's ids and the layer's map row, the gate
+    /// and up GEMMs, the SwiGLU of the card slots' places, the down GEMM) and
+    /// — unless the layer is `tiered` — the card sum. Asynchronous,
+    /// allocation-free.
     pub fn enqueue_batch_shadow(
         &mut self,
         gpu: &Gpu,
@@ -2257,11 +2351,11 @@ impl FfnPiece {
     }
 
     /// The second part of [`FfnPiece::enqueue_batch_shadow`]: the block's
-    /// card experts by tile items and the card sum, or for a `tiered` layer
-    /// the held routing ([`FfnPiece::enqueue_grouped_block`]). Asynchronous,
-    /// allocation-free.
+    /// card experts on the grouped GEMM and the card sum, or for a `tiered`
+    /// layer the held routing ([`FfnPiece::enqueue_grouped_block`]).
+    /// Asynchronous, allocation-free.
     pub fn enqueue_batch_block(
-        &self,
+        &mut self,
         gpu: &Gpu,
         bl: &BatchLayer<'_>,
         card: Option<CardStacks<'_>>,
@@ -2319,10 +2413,9 @@ impl FfnPiece {
     }
 
     /// Under host streaming, the block's card experts but those the call's
-    /// pick admitted, by tile items (the tile part of
-    /// [`FfnPiece::enqueue_batch_block`] over the replaced places), after
-    /// [`FfnPiece::enqueue_batch_replace`]; the streamed pass follows.
-    /// Asynchronous, allocation-free.
+    /// pick admitted, on the tile path the streamed passes keep (over the
+    /// replaced places), after [`FfnPiece::enqueue_batch_replace`]; the
+    /// streamed pass follows. Asynchronous, allocation-free.
     pub fn enqueue_batch_block_kept(
         &self,
         gpu: &Gpu,
@@ -2334,15 +2427,15 @@ impl FfnPiece {
         let layer = bl.layer;
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
-        self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], false)
+        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], CardPath::Tiles, false)
     }
 
     /// Under host streaming, the streamed pass of the block, once the engine
-    /// stream waits for the pick's copies: the admitted ids' experts by tile
-    /// items over the streamed places, those places merged into the block's
-    /// (`ds41_ffn_sel_merge`), then the card sum in slot order over every
-    /// card slot, or for a `tiered` layer the held routing. Asynchronous,
-    /// allocation-free.
+    /// stream waits for the pick's copies: the admitted ids' experts on the
+    /// tile path the streamed passes keep, over the streamed places, those
+    /// places merged into the block's (`ds41_ffn_sel_merge`), then the card
+    /// sum in slot order over every card slot, or for a `tiered` layer the
+    /// held routing. Asynchronous, allocation-free.
     pub fn enqueue_batch_stream(
         &self,
         gpu: &Gpu,
@@ -2355,7 +2448,7 @@ impl FfnPiece {
         let layer = bl.layer;
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
-        self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], true)?;
+        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], CardPath::Tiles, true)?;
         let slots_n = (u - at) * N_USED;
         {
             let FfnBatch {
@@ -2374,11 +2467,12 @@ impl FfnPiece {
     }
 
     /// The block's launches for tokens `at .. u` of the group's batch `set`,
-    /// after every chunk's part before them: with card experts, the tile path
-    /// over the block's card slots ([`enqueue_tiled_experts`]) into the
-    /// block's down outputs by slot; then the card sum of every token of the
-    /// block — or, for a `tiered` layer, whose card sum waits for the tier's
-    /// rows ([`FfnPiece::enqueue_batch_acc_tier`]), the copy of the block's
+    /// after every chunk's part before them: with card experts, the default
+    /// pass's GEMM over the block's card slots
+    /// ([`enqueue_block_experts`]) into the block's down outputs by slot;
+    /// then the card sum of every token of the block — or, for a `tiered`
+    /// layer, whose card sum waits for the tier's rows
+    /// ([`FfnPiece::enqueue_batch_acc_tier`]), the copy of the block's
     /// weights, card places and tier places into the batch's held routing,
     /// three copies.
     #[allow(
@@ -2386,7 +2480,7 @@ impl FfnPiece {
         reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
     )]
     fn enqueue_grouped_block(
-        &self,
+        &mut self,
         gpu: &Gpu,
         i: usize,
         card: Option<CardStacks<'_>>,
@@ -2395,28 +2489,38 @@ impl FfnPiece {
         [at, u]: [usize; 2],
         tiered: bool,
     ) -> Result<(), GpuError> {
-        self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], false)?;
+        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], CardPath::Gemm, false)?;
         self.enqueue_block_finish(gpu, i, b, [layer, set], [at, u], tiered)
     }
 
-    /// With card experts, the tile path over the block's card slots
-    /// ([`enqueue_tiled_experts`]) into the block's down outputs by slot:
-    /// over the block's places, or with `streamed` over its streamed places.
+    /// With card experts, the block's card slots into the block's down
+    /// outputs by slot, on `path`: a layer the common card leg runs goes
+    /// through it whatever the path; the default pass's GEMM quantizes the
+    /// block's normed rows ([`Gpu::enqueue_quantize_gemm`], the bytes the
+    /// route's fused norm leaves, bit for bit) and runs the common batch
+    /// sequence ([`enqueue_gemm_batch`]) — the route table over the block's
+    /// ids and the layer's map row the route copied, the gate and up GEMMs,
+    /// the SwiGLU of the card slots' places, the down GEMM — each stack's
+    /// type read from the stacks and refused by name where the grouped GEMM
+    /// decodes it not; the tile path ([`enqueue_tiled_experts`]) reads the
+    /// block's q8_1 planes over the block's places, or with `streamed` over
+    /// its streamed places.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the block's layer, stacks, buffers, tokens and places (rust-quality R8)"
+        reason = "the block's layer, stacks, buffers, tokens, path and places (rust-quality R8)"
     )]
-    fn enqueue_block_tiles(
-        &self,
+    fn enqueue_block_experts(
+        &mut self,
         gpu: &Gpu,
         i: usize,
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
         layer: usize,
         [at, u]: [usize; 2],
+        path: CardPath,
         streamed: bool,
     ) -> Result<(), GpuError> {
-        let n = self.n_embd;
+        let (n, ff) = (self.n_embd, self.ff);
         let c = &self.cfg[i];
         let slots_n = (u - at) * N_USED;
         if let Some(s) = card {
@@ -2449,19 +2553,55 @@ impl FfnPiece {
                 };
                 return enqueue_leg_block(gpu, leg, &t, &mut down);
             }
-            let t = TiledBlock {
-                stacks: s,
-                q3: &b.q3_all,
-                d8: &b.d8_all,
-                col0: at,
-                cols: u,
-                sel: &sel,
-                layer,
-                limit: c.limit,
-            };
-            enqueue_tiled_experts(gpu, &b.kernels, &t, &mut b.tile, &mut down)?;
+            match path {
+                CardPath::Gemm => {
+                    let t = u - at;
+                    let (gty, dty) = (
+                        GemmWeight::from_ggml(s.gate_up_ty())?,
+                        GemmWeight::from_ggml(s.down_ty())?,
+                    );
+                    let table = self.gemm_route_at(layer, c.n_card)?;
+                    let sink = gpu.layer_sink(layer)?;
+                    let x = span(WHAT, &b.x, at * n, t * n)?;
+                    gpu.enqueue_quantize_gemm(&x, t, &mut b.gemm.act_x, sink)?;
+                    let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
+                    enqueue_gemm_batch(
+                        (&b.kernels.gemm, &b.kernels.g32),
+                        gpu.stream(),
+                        &*ids,
+                        &b.gemm.map_row,
+                        GateUp::Grouped(gty, [s.gate, s.up], &b.gemm.act_x),
+                        DownW::Grouped(
+                            dty,
+                            s.down,
+                            Act::SwigluClamp { limit: c.limit },
+                            &mut b.gemm.act_down,
+                            &mut *down,
+                        ),
+                        (t, c.n_card),
+                        (N_USED, ff, n),
+                        sink,
+                        (&mut b.gemm.g, &mut b.gemm.u),
+                        (&*sel, &mut self.routes[table]),
+                    )
+                }
+                CardPath::Tiles => {
+                    let t = TiledBlock {
+                        stacks: s,
+                        q3: &b.q3_all,
+                        d8: &b.d8_all,
+                        col0: at,
+                        cols: u,
+                        sel: &sel,
+                        layer,
+                        limit: c.limit,
+                    };
+                    enqueue_tiled_experts(gpu, &b.kernels, &t, &mut b.tile, &mut down)
+                }
+            }
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// The block's card sum of every token, or for a `tiered` layer, whose
@@ -2503,9 +2643,9 @@ impl FfnPiece {
 
     /// Layer `layer`'s shadow work for the chunk `io`, after the batch's
     /// route: HC_PRE into the batch's results, the norm's q8_1 form again —
-    /// with card experts copied into the block's planes, which the block's
-    /// gather reads — and the shared expert into the batch's outputs. `lw`
-    /// are layer `i`'s tensors.
+    /// with card experts copied into the block's planes, which a streamed
+    /// block's tile path reads — and the shared expert into the batch's
+    /// outputs. `lw` are layer `i`'s tensors.
     #[allow(
         clippy::too_many_arguments,
         reason = "the shadow's inputs and the layer's resolved tensors (rust-quality R8)"
