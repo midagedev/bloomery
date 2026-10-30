@@ -2272,6 +2272,7 @@ mod tests {
     /// so what it refuses is its own: a tool inside it that is not a function,
     /// a name another function tool of the request already holds (the
     /// flattened name would be ambiguous), and a namespace without its name.
+    // PIN(2026-10-30): namespace flattening replaces its refusal case.
     #[test]
     fn tools_convert_drop_web_search_and_refuse_the_rest() {
         let addr = scripted("ok");
