@@ -91,6 +91,14 @@
 //!   short, a quantizer past its form's columns, rows past the projection's,
 //!   more groups than HC_PRE's scratch. A group that reads its neighbour's
 //!   column fails here, before the cases.
+//! - **First routed seam.** Then the locator's machinery at each `P` of
+//!   [`SEAM_PS`]: the steps' every seam recorded, then the batch of the same
+//!   ids with every seam read back. The first routed layer comes from the
+//!   header's own layer table, never a literal, and its FFN seam's streams
+//!   are held per token — max |Δ| at most the derived sum-order band
+//!   ([`seam_band`]) times the stream's max |x| — while every seam before
+//!   that one is the steps' bits: a difference there is a defect outside the
+//!   experts.
 //! - **Fault, reset, clean.** A NaN in the scale of every card expert's
 //!   first gate row makes a prefill of [`FAULT_P`] ids fault; with the
 //!   scales put back and the model reset, a prefill of the smallest case's
@@ -201,7 +209,9 @@
 //! batch of the same ids with every seam read back (`body::prefill_observed`),
 //! and one line per seam — engram, attention, MoE of each layer — with the
 //! tokens whose streams differ among those the batch ran and the largest
-//! difference, up to the first seams that differ.
+//! difference, up to the first seams that differ. The same machinery — the
+//! steps' record and the batch's read-back, one owner ([`seam_record`]) —
+//! also backs the first routed seam clause above.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -291,6 +301,7 @@ mod gate {
     use runtime::{Target, Want};
 
     use crate::{dspark, finite, split};
+    use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::tier;
 
     const NAME: &str = "gate_deepseek41_prefill";
@@ -326,6 +337,10 @@ mod gate {
     /// 100 + 700 the second call past it, and 700 + 400 stays (take-back and snapshot read the
     /// first). [`splits`] holds either list to the derived reach.
     const SPLITS_FIXTURE: [(usize, usize); 3] = [(700, 400), (300, 200), (100, 700)];
+    /// The prompt lengths of the first routed seam clause (module doc): the
+    /// shortest call, and a many-token one; the second is the longest the
+    /// clause reads.
+    const SEAM_PS: [usize; 2] = [1, 64];
     /// The wide-taps case: `P` and the features it keeps.
     const WIDE: (usize, usize) = (1100, 300);
     /// The rollback case's `P` and the refused cut inside it.
@@ -362,20 +377,26 @@ mod gate {
     /// Clear-position top-1 disagreements the cases' band admits between a
     /// batched call's logits and the steps' run — a compared position whose
     /// steps' top1−top2 margin is at least `MARGIN_FLOOR` (the e2e clarity
-    /// rule) where the two top-1s differ. The batch's tile path is the
-    /// steps' arithmetic column for column, so the value holds at zero until
-    /// the calibration run on the GEMM engine re-pins it with a
-    /// `PIN(YYYY-MM-DD):` line and its derivation (both paths reassociate
-    /// the same exact integer block sums; the band is measured, not derived).
+    /// rule) where the two top-1s differ. Clear-position top-1 equality is
+    /// the band's hard clause; this pin holds at zero until the calibration
+    /// run re-pins it with a `PIN(YYYY-MM-DD):` line and its derivation
+    /// (both paths reassociate the same exact integer block sums; the band
+    /// is measured, not derived — the derived band is the first routed seam
+    /// clause's).
     const LOGITS_CLEAR_PIN: usize = 0;
     /// The largest |Δlogit| the band admits between a batched call's logits
-    /// and the steps' run, over every compared value. Zero while the tile
-    /// path runs; the calibration run on the GEMM engine re-pins it with a
+    /// and the steps' run, over every compared value. The last logits
+    /// compound the first routed seam's distance through the remaining
+    /// layers, past what the sum-order model derives (the first routed seam
+    /// clause carries the derived band), so this pin carries the measured
+    /// distance: zero until the calibration run re-pins it with a
     /// `PIN(YYYY-MM-DD):` line and its derivation.
     const LOGITS_MAX_PIN: f64 = 0.0;
-    /// The RMS |Δlogit| the band admits, over the same values. Zero while
-    /// the tile path runs; the calibration run on the GEMM engine re-pins it
-    /// with a `PIN(YYYY-MM-DD):` line and its derivation.
+    /// The RMS |Δlogit| the band admits, over the same values. The last
+    /// logits compound the first routed seam's distance through the
+    /// remaining layers, past what the sum-order model derives, so this pin
+    /// carries the measured distance: zero until the calibration run re-pins
+    /// it with a `PIN(YYYY-MM-DD):` line and its derivation.
     const LOGITS_RMS_PIN: f64 = 0.0;
 
     /// One arm of the clear clause: the first `p` ids of
@@ -567,6 +588,12 @@ mod gate {
         pass &= raise_cases(m, &hp)?;
         crate::ds41_tier::sc("projections: the batch-wide launches are the chunk launches")?;
         pass &= proj_cases(m, &hp)?;
+        let seam_ids = corpus("prose", SEAM_PS[1])?;
+        crate::ds41_tier::sc(
+            "first routed seam: the batch's first routed FFN stream within the derived sum-order \
+             band, every seam before it the steps' bits",
+        )?;
+        pass &= first_routed_seam_case(m, &hp, &seam_ids)?;
         let splits: Vec<(usize, usize)> = if args.split {
             split_list.to_vec()
         } else {
@@ -3196,8 +3223,21 @@ mod gate {
     /// A seam of the observed step: the sub-layer kind and the layer.
     type SeamKey = (body::BatchSeamKind, usize);
 
-    /// `--seams` (module doc).
-    fn seams(m: &mut Deepseek41Model, ids: &[u32]) -> Result<(), GateError> {
+    /// The steps' every seam, in seam order: per (kind, layer) each
+    /// position's streams, and position 0's attention buffers per layer —
+    /// the record a seam comparison reads a batch back against (`--seams`
+    /// and the first routed seam clause, one owner). The model is left
+    /// reset.
+    fn seam_record(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+    ) -> Result<
+        (
+            Vec<(SeamKey, Vec<Vec<f32>>)>,
+            Vec<Vec<(&'static str, Vec<f32>)>>,
+        ),
+        GateError,
+    > {
         let p = ids.len();
         m.reset()?;
         let mut head = {
@@ -3237,6 +3277,14 @@ mod gate {
                 Ok(())
             })?;
         }
+        m.reset()?;
+        Ok((rec, taps0))
+    }
+
+    /// `--seams` (module doc): the record above, then the batch's seams read
+    /// back against it, one line a seam.
+    fn seams(m: &mut Deepseek41Model, ids: &[u32]) -> Result<(), GateError> {
+        let (rec, taps0) = seam_record(m, ids)?;
         m.reset()?;
         let mut off = 0usize;
         // A seam is looked up by its sub-layer and layer: a group shows its
@@ -3323,6 +3371,131 @@ mod gate {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// The first routed seam's band, relative to the stream's max |x| (module
+    /// doc): the two paths fold the same exact integer block sums of the
+    /// routed experts' dots and reassociate them in f32, so the seam's
+    /// distance is the two orders' rounding counts alone. A dot of `k` terms
+    /// — the gate·up's `k = n_embd`, the down's `k = ff` — has `k / 128`
+    /// block terms; the step's gemv folds one fma with its scale product a
+    /// super-block a lane (`k / 256` super-blocks, lane parity halves them)
+    /// and reduces the lanes in the 5-level warp tree, `2·⌈k/512⌉ + 5`
+    /// roundings; the GEMM folds a scale product and an fma a 128-value
+    /// block, `3·k/128` roundings. Each path's result sits within `γ(n)` of
+    /// the exact sum over its block terms' absolute sum, the two orders'
+    /// difference within the sum of the two `γ`s, and the block terms'
+    /// absolute sum sits `√(k/128)` over the dot's output — the random-walk
+    /// estimate over the block sums, the one bridge the model cannot derive
+    /// (a dot's cancellation is data). The clamped SwiGLU passes both its
+    /// sums' relative errors through (silu's slope at most 1.1, the
+    /// product's two factors), so the gate·up's term enters doubled; the
+    /// top-k weighted sum passes the per-slot bound (the weights the steps'
+    /// bits, their sum at most 1, the shared expert the same dots), and the
+    /// sub-layer's output joins the streams linearly — the clause scales by
+    /// the stream's own max |x|. Derived for the real file's `n_embd` 5120
+    /// and `ff` 2304: `2·(γ(25) + γ(120))·√40 + (γ(15) + γ(54))·√18` ≈
+    /// 1.3e-4.
+    fn seam_band(hp: &Hparams) -> f64 {
+        let dot = |k: usize| {
+            let blocks = (k / 128) as f64;
+            (gamma(2 * k.div_ceil(512) + 5) + gamma(3 * k / 128)) * blocks.sqrt()
+        };
+        2.0 * dot(hp.n_embd) + dot(hp.experts.ff)
+    }
+
+    /// The first routed seam clause (module doc): the locator's machinery at
+    /// each `P` of [`SEAM_PS`], the first routed layer from the header's own
+    /// layer table. The model is left reset.
+    fn first_routed_seam_case(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        ids: &[u32],
+    ) -> Result<bool, GateError> {
+        let l1 = hp.layers.iter().position(|k| k.routed).ok_or_else(|| {
+            format!(
+                "{NAME}: no routed layer among the header's {}",
+                hp.layers.len()
+            )
+        })?;
+        let rel = seam_band(hp);
+        let mut ok = true;
+        for &p in SEAM_PS.iter() {
+            let (rec, _) = seam_record(m, &ids[..p])?;
+            let i_seam = rec
+                .iter()
+                .position(|(k, _)| *k == (body::BatchSeamKind::Ffn, l1))
+                .ok_or_else(|| format!("{NAME}: the steps visited no FFn seam at layer {l1}"))?;
+            m.reset()?;
+            // The seam's measured distance and the stream's own scale; every
+            // seam before it must stay the steps' bits.
+            let (mut max_diff, mut scale) = (0.0f64, 0.0f64);
+            let (mut tokens, mut tokens_n) = (0usize, 0usize);
+            let mut before: Vec<(body::BatchSeamKind, usize, usize)> = Vec::new();
+            body::prefill_observed(m, &ids[..p], &mut |gpu, seam| {
+                gpu.stream().synchronize()?;
+                let n4 = seam.streams.len() / crate::gate::T_MAX_TOKENS;
+                let mut host = vec![0.0f32; seam.streams.len()];
+                seam.streams.copy_to_host(gpu.stream(), &mut host)?;
+                let Some(i) = rec.iter().position(|(k, _)| *k == (seam.kind, seam.layer)) else {
+                    return Err(GpuError::State {
+                        what: NAME,
+                        missing: "a recorded seam for every batch seam",
+                    });
+                };
+                let (_, want) = &rec[i];
+                for t in 0..seam.tokens {
+                    let pos = seam.first as usize + t;
+                    let got = &host[(seam.at + t) * n4..(seam.at + t + 1) * n4];
+                    let w = &want[pos];
+                    let diff = got
+                        .iter()
+                        .zip(w)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    if i == i_seam {
+                        tokens_n += 1;
+                        if diff > 0 {
+                            tokens += 1;
+                            for (a, b) in got.iter().zip(w) {
+                                max_diff = max_diff.max((f64::from(*a) - f64::from(*b)).abs());
+                            }
+                        }
+                        for v in got.iter().chain(w) {
+                            scale = scale.max(f64::from(v.abs()));
+                        }
+                    } else if i < i_seam && diff > 0 {
+                        before.push((seam.kind, seam.layer, diff));
+                    }
+                }
+                Ok(())
+            })?;
+            if tokens_n != p {
+                return Err(
+                    format!("{NAME}: the first routed seam ran {tokens_n} of {p} tokens").into(),
+                );
+            }
+            let bound = rel * scale;
+            let seam_ok = max_diff <= bound;
+            let before_ok = before.is_empty();
+            ok &= seam_ok && before_ok;
+            if !before_ok {
+                println!(
+                    "{NAME}: first routed seam P={p}: a seam before layer {l1}'s FFN differs: \
+                     {:?}",
+                    &before[..before.len().min(4)]
+                );
+            }
+            println!(
+                "{NAME}: first routed seam P={p}: Ffn layer {l1}: {tokens} of {tokens_n} tokens \
+                 differ, max |Δ| {max_diff:.3e} over band {bound:.3e} ({rel:.2e} · max |x| \
+                 {scale:.3e}), ratio {:.3}; seams before bit-equal: {}",
+                if bound > 0.0 { max_diff / bound } else { 0.0 },
+                verdict(seam_ok && before_ok)
+            );
+        }
+        m.reset()?;
+        Ok(ok)
     }
 
     /// The attention piece's buffers on the host, by name.
