@@ -93,7 +93,7 @@ use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::swap::Park;
 use crate::video::{self, VideoSupport};
-use crate::worker::{self, Acted, Action, Events, Msg, Shared, Submit};
+use crate::worker::{self, Acted, Action, Events, Msg, ReqName, Shared, Submit};
 
 use self::listener::Listener;
 
@@ -3536,6 +3536,7 @@ fn ctx_hint(prompt_tokens: usize, n_predict: i64, slots: usize) -> String {
 /// took.
 fn run_gen(
     state: &State,
+    route: &str,
     input: &Prompt,
     prompt: Value,
     p: &GenParams,
@@ -3544,6 +3545,7 @@ fn run_gen(
 ) -> Result<Result<(Outcome, usize), GenError>, ApiError> {
     let ran = run_choices(
         state,
+        route,
         input,
         prompt,
         std::slice::from_ref(p),
@@ -3566,6 +3568,7 @@ fn run_gen(
 /// end at their next event, the channel they send on closed.
 fn run_choices(
     state: &State,
+    route: &str,
     input: &Prompt,
     prompt: Value,
     ps: &[GenParams],
@@ -3597,6 +3600,9 @@ fn run_choices(
         });
     }
     let (events, rx) = mpsc::channel();
+    // The task id the request's choices share, what its stderr lines and
+    // `/slots` name them by.
+    let id = state.next_id();
     // A sampler its factory refuses ends the request here, before it takes a
     // slot, as any refused sampling field does.
     let subs = ps
@@ -3614,6 +3620,12 @@ fn run_choices(
                 sampler,
                 events: Events::new(events.clone(), choice),
                 client: Arc::clone(&client),
+                name: ReqName {
+                    id,
+                    route: route.to_owned(),
+                    choice,
+                    choices: ps.len(),
+                },
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
@@ -3783,12 +3795,13 @@ fn probe_client(w: &TcpStream) -> io::Result<()> {
 /// [`run_whole_choices`] of a request of one choice.
 fn run_whole(
     state: &State,
+    route: &str,
     input: &Prompt,
     prompt: Value,
     p: &GenParams,
     w: &TcpStream,
 ) -> io::Result<Result<(Outcome, usize), ApiError>> {
-    let ran = run_whole_choices(state, input, prompt, std::slice::from_ref(p), w)?;
+    let ran = run_whole_choices(state, route, input, prompt, std::slice::from_ref(p), w)?;
     Ok(ran.map(|mut all| all.swap_remove(0)))
 }
 
@@ -3799,6 +3812,7 @@ fn run_whole(
 /// inner one is the request's answer, an engine error a 500.
 fn run_whole_choices(
     state: &State,
+    route: &str,
     input: &Prompt,
     prompt: Value,
     ps: &[GenParams],
@@ -3806,6 +3820,7 @@ fn run_whole_choices(
 ) -> io::Result<Result<Vec<(Outcome, usize)>, ApiError>> {
     match run_choices(
         state,
+        route,
         input,
         prompt,
         ps,
@@ -4276,7 +4291,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         return_tokens,
     } = plan;
     if !p.stream {
-        return match run_whole(state, &input, prompt.clone(), &p, w)? {
+        return match run_whole(state, &req.path, &input, prompt.clone(), &p, w)? {
             Err(e) => send_error(w, req, &e),
             Ok((o, slot)) => send_json(
                 w,
@@ -4328,6 +4343,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         };
         run_gen(
             state,
+            &req.path,
             &input,
             prompt.clone(),
             &p,
@@ -4655,7 +4671,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     };
     let vocab = &*state.tok;
     if !p.stream {
-        let all = match run_whole_choices(state, &input, prompt, &ps, w)? {
+        let all = match run_whole_choices(state, &req.path, &input, prompt, &ps, w)? {
             Ok(all) => all,
             Err(e) => return send_error(w, req, &e),
         };
@@ -4742,7 +4758,15 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run_choices(state, &input, prompt, ps, Client::of(peer), &mut sink)
+        run_choices(
+            state,
+            &req.path,
+            &input,
+            prompt,
+            ps,
+            Client::of(peer),
+            &mut sink,
+        )
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -7693,7 +7717,7 @@ mod tests {
             use crate::api::Client;
             use crate::genloop::GenParams;
             use crate::media::Held;
-            use crate::worker::Submit;
+            use crate::worker::{ReqName, Submit};
             use std::sync::Mutex;
 
             let prefilled = Arc::new(AtomicUsize::new(0));
@@ -7750,6 +7774,12 @@ mod tests {
                         media: Vec::new(),
                         sampler: None,
                         events: crate::worker::Events::new(events, 0),
+                        name: ReqName {
+                            id: 0,
+                            route: "/completion".to_owned(),
+                            choice: 0,
+                            choices: 1,
+                        },
                         client,
                     },
                 )
@@ -10027,6 +10057,106 @@ mod tests {
             e.message,
             "video input needs ffmpeg and ffprobe on PATH (ffmpeg: not found); install ffmpeg, \
              or send the clip as decoded one-FPS image_url frames after a Video: text part"
+        );
+    }
+
+    /// One stderr line a finished request, whatever endpoint it came
+    /// through: the chat route and `/v1/messages` each print exactly one,
+    /// naming the endpoint's own path.
+    #[test]
+    fn one_stderr_line_a_finished_request() {
+        let (addr, state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let chat = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#;
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/v1/chat/completions", &[], chat);
+        assert_eq!(status, 200, "{body}");
+        let messages = r#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/v1/messages", &[], messages);
+        assert_eq!(status, 200, "{body}");
+        let lines = state.shared.notes();
+        let finish: Vec<&String> = lines.iter().filter(|l| l.contains("; stop ")).collect();
+        assert_eq!(finish.len(), 2, "one line a request: {lines:#?}");
+        assert!(
+            finish[0].starts_with("bloomery-serve: request ")
+                && finish[0].contains(" /v1/chat/completions: prompt "),
+            "{}",
+            finish[0]
+        );
+        assert!(
+            finish[1].contains(" /v1/messages: prompt "),
+            "{}",
+            finish[1]
+        );
+    }
+
+    /// The finish line's counts are the ones `/metrics` books for the
+    /// request: its prompt and generated ids equal the counters' move over
+    /// the request.
+    #[test]
+    fn the_stderr_line_counts_what_metrics_books() {
+        let (addr, state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let before = super::testserve::roundtrip(addr, "GET", "/metrics", &[], "").1;
+        let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":4}"#;
+        let (status, body) = super::testserve::roundtrip(addr, "POST", "/completion", &[], ask);
+        assert_eq!(status, 200, "{body}");
+        let after = super::testserve::roundtrip(addr, "GET", "/metrics", &[], "").1;
+        let counter = |text: &str, name: &str| -> u64 {
+            let row = format!("llamacpp:{name} ");
+            text.lines()
+                .find_map(|l| l.strip_prefix(row.as_str()))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {name} row in the metrics: {text}"))
+        };
+        let lines = state.shared.notes();
+        let finish: Vec<&String> = lines.iter().filter(|l| l.contains("; stop ")).collect();
+        assert_eq!(finish.len(), 1, "one line the request: {lines:#?}");
+        let line = finish[0];
+        let count = |word: &str| -> u64 {
+            line.split_whitespace()
+                .skip_while(|t| !t.starts_with(word))
+                .nth(1)
+                .and_then(|t| t.parse().ok())
+                .unwrap_or_else(|| panic!("no {word} count in the line: {line}"))
+        };
+        assert_eq!(
+            count("prompt"),
+            counter(&after, "prompt_tokens_total") - counter(&before, "prompt_tokens_total"),
+            "the line's prompt count is what /metrics added: {line}"
+        );
+        assert_eq!(
+            count("generated"),
+            counter(&after, "tokens_predicted_total") - counter(&before, "tokens_predicted_total"),
+            "the line's generated count is what /metrics added: {line}"
+        );
+    }
+
+    /// A request the token limit ends says `length`: the line's stop cause
+    /// is the generation's own.
+    #[test]
+    fn a_length_limited_request_says_length_in_its_stderr_line() {
+        let (addr, state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let chat = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#;
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/v1/chat/completions", &[], chat);
+        assert_eq!(status, 200, "{body}");
+        let lines = state.shared.notes();
+        let finish = lines
+            .iter()
+            .find(|l| l.contains("; stop "))
+            .expect("the finish line");
+        assert!(
+            finish.contains("stop length;"),
+            "the limit names itself: {finish}"
         );
     }
 }

@@ -34,6 +34,9 @@ events, so the steps differ:
 5. `--ctx` unset is the smaller of 32,768 and the model's own context. Raise it only when the user asks, or when the
    client is Claude Code ([`claude-code.md`](claude-code.md)).
 
+A long request is not a stuck one: the server prints one stderr line when each request ends and a `generating` line
+while a long one runs, so `serve.log` tells an agent it is still working.
+
 Do not pass `--place`, `--parallel` or `-ngl`: the Mac server refuses them with 64.
 
 ## 1. What this machine serves

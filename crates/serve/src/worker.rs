@@ -54,7 +54,8 @@ use crate::engine::{
     Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError,
 };
 use crate::genloop::{
-    Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
+    Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, cause_word,
+    ms_since,
 };
 use crate::live::{Ending, Finished, Ring};
 use crate::media::{Held, MediaFeed};
@@ -130,6 +131,20 @@ pub(crate) fn rate(n: u64, ms: f64) -> f64 {
     }
 }
 
+/// The seconds of generation between a request's stderr progress lines.
+const NOTE_S: f64 = 30.0;
+
+/// What the server's per-request stderr lines name a request by: the task
+/// id it shares with its choices (what `/slots` shows as `id_task`), the
+/// path it was posted to, and its choice's index when the request asked for
+/// more than one choice.
+pub(crate) struct ReqName {
+    pub id: u64,
+    pub route: String,
+    pub choice: usize,
+    pub choices: usize,
+}
+
 /// A request handed to the engine thread.
 pub(crate) struct Submit {
     pub p: GenParams,
@@ -144,6 +159,8 @@ pub(crate) struct Submit {
     pub sampler: Option<Sampler>,
     pub events: Events,
     pub client: Arc<crate::api::Client>,
+    /// What the server's stderr lines name the request by.
+    pub name: ReqName,
 }
 
 /// A request's side of its HTTP thread's channel. The choices of one request
@@ -218,6 +235,10 @@ pub(crate) struct Shared {
     /// panic): what the orderly stop waits for first ([`Shared::wait_stop`]).
     /// Past it the thread calls the engine no more and never drops it.
     loop_ended: Mutex<bool>,
+    /// The server's per-request lines, collected in the tests' place of
+    /// stderr.
+    #[cfg(test)]
+    stderr_lines: Mutex<Vec<String>>,
     /// Wakes [`Shared::wait_loop_end`].
     loop_ended_c: Condvar,
     /// The answers the connections are writing ([`crate::api::keep_alive`]
@@ -254,7 +275,24 @@ impl Shared {
             end,
             sampler,
             ids: AtomicU64::new(0),
+            #[cfg(test)]
+            stderr_lines: Mutex::new(Vec::new()),
         }
+    }
+
+    /// One of the server's per-request stderr lines. The tests collect it
+    /// instead: the engine thread's stderr is beyond a test's capture.
+    fn note(&self, line: String) {
+        #[cfg(test)]
+        relock(&self.stderr_lines).push(line);
+        #[cfg(not(test))]
+        eprintln!("{line}");
+    }
+
+    /// The per-request lines, in the order they were printed.
+    #[cfg(test)]
+    pub(crate) fn notes(&self) -> Vec<String> {
+        relock(&self.stderr_lines).clone()
     }
 
     /// Adopts `f` as the failure that ends the server unless one already
@@ -354,6 +392,11 @@ struct Active {
     slot: usize,
     job: Gen,
     events: Events,
+    /// What the server's stderr lines name the request by.
+    name: ReqName,
+    /// The progress lines its generation has printed; the next waits for
+    /// its count's worth of [`NOTE_S`] seconds of generation.
+    noted: usize,
     /// The engine call the request needs next, taken from its generation
     /// by a pump that ran ahead of the call ([`Worker::hold_need`]).
     need: Option<Need>,
@@ -524,14 +567,89 @@ fn sink_of(events: &Events) -> impl FnMut(Event<'_>) -> io::Result<()> + '_ {
     }
 }
 
-/// The tick a request's generation calls after every token: its slot's view.
-fn tick_of(sh: &Shared, slot: usize) -> impl FnMut(&Timings) + '_ {
+/// The tick a request's generation calls after every token: its slot's view,
+/// and a progress line on the server's stderr once its generation passed
+/// another [`NOTE_S`] seconds. The due check is the generation's own clock
+/// against the lines printed: no lock, no allocation and no formatting but
+/// the line's own.
+fn tick_of<'a>(
+    sh: &'a Shared,
+    slot: usize,
+    name: &'a ReqName,
+    noted: &'a mut usize,
+) -> impl FnMut(&Timings) + 'a {
     move |t| {
+        if note_due(*noted, t) {
+            *noted += 1;
+            sh.note(progress_line(name, t));
+        }
         let mut b = relock(&sh.board);
         let v = b.view_mut(slot);
         v.n_decoded = t.predicted_n;
         v.n_past = t.n_past;
     }
+}
+
+/// Whether the generation crossed its next progress line: one every
+/// [`NOTE_S`] seconds of generation, counted from the generation's start, so
+/// a generation that stalls skips to the next multiple rather than printing
+/// a run of lines when it resumes.
+fn note_due(noted: usize, t: &Timings) -> bool {
+    t.predicted_ms >= (noted as f64 + 1.0) * NOTE_S * 1e3
+}
+
+/// `n` ids over `ms` as a rate, one decimal; `-` over no time.
+fn ids_rate(n: usize, ms: f64) -> String {
+    if ms > 0.0 {
+        format!("{:.1}", 1e3 / ms * n as f64)
+    } else {
+        "-".to_owned()
+    }
+}
+
+/// One phase of a request as its stderr lines print it: `<n> ids[ (<reused>
+/// reused)] in <s> s, <rate> ids/s`, the seconds to two decimals.
+fn phase(n: usize, ms: f64, reused: Option<usize>) -> String {
+    let reuse = reused.map_or(String::new(), |c| format!(" ({c} reused)"));
+    format!(
+        "{n} ids{reuse} in {:.2} s, {} ids/s",
+        ms / 1e3,
+        ids_rate(n, ms)
+    )
+}
+
+/// The request's own part of its stderr lines: `<id> <path>`, the choice's
+/// index after the id for one choice of several.
+fn req_tag(name: &ReqName) -> String {
+    if name.choices > 1 {
+        format!("{}.{} {}", name.id, name.choice, name.route)
+    } else {
+        format!("{} {}", name.id, name.route)
+    }
+}
+
+/// The finish line, the one stderr line a request's end prints: its prompt
+/// and generated phases, its stop cause, and where its context stands.
+fn finish_line(name: &ReqName, t: &Timings, cause: &str) -> String {
+    format!(
+        "bloomery-serve: request {}: prompt {}; generated {}; stop {cause}; ctx {}/{}",
+        req_tag(name),
+        phase(t.prompt_n, t.prompt_ms, Some(t.cache_n)),
+        phase(t.predicted_n, t.predicted_ms, None),
+        t.n_past,
+        t.n_ctx
+    )
+}
+
+/// The progress line, while one request generates past an interval.
+fn progress_line(name: &ReqName, t: &Timings) -> String {
+    format!(
+        "bloomery-serve: request {}: generating, {}; ctx {}/{}",
+        req_tag(name),
+        phase(t.predicted_n, t.predicted_ms, None),
+        t.n_past,
+        t.n_ctx
+    )
 }
 
 impl Worker {
@@ -651,7 +769,7 @@ impl Worker {
             .iter()
             .chain(self.prompting.iter().map(|p| &p.a));
         for a in held {
-            self.book(a.job.timings(), Ending::Stopped);
+            self.book(&a.name, a.job.timings(), Ending::Stopped, None);
         }
         self.close();
     }
@@ -727,10 +845,11 @@ impl Worker {
             media,
             sampler,
             events,
+            name,
             client: _,
         } = sub;
         *relock(&self.sh.board).view_mut(slot) = SlotView {
-            id_task: self.sh.next_id(),
+            id_task: name.id,
             prompt,
             settings,
             n_predict: p.n_predict,
@@ -776,6 +895,8 @@ impl Worker {
             slot,
             job,
             events,
+            name,
+            noted: 0,
             need: None,
             left: 0,
             batch: 0,
@@ -881,7 +1002,7 @@ impl Worker {
                         return Err(self.die(&e));
                     }
                     // `/slots` shows the run's positions as its calls run.
-                    tick_of(&self.sh, a.slot)(a.job.timings());
+                    tick_of(&self.sh, a.slot, &a.name, &mut a.noted)(a.job.timings());
                     if !self.hold_need(k) {
                         continue;
                     }
@@ -1028,9 +1149,13 @@ impl Worker {
     }
 
     /// Books an ending request's counters, `/metrics`' totals, from its
-    /// timings `t`, and keeps it with how it ended for the live view;
-    /// touches no engine and no slot.
-    fn book(&self, t: &Timings, ending: Ending) {
+    /// timings `t`, prints its stderr finish line from the same numbers, and
+    /// keeps it with how it ended for the live view; touches no engine and
+    /// no slot. The line and the totals cannot disagree: both come from `t`
+    /// here, the one place a request's counts are booked.
+    fn book(&self, name: &ReqName, t: &Timings, ending: Ending, stop: Option<StopKind>) {
+        let failed = matches!(ending, Ending::EngineError | Ending::Error);
+        self.sh.note(finish_line(name, t, cause_word(stop, failed)));
         relock(&self.sh.done).push(Finished {
             at: SystemTime::now(),
             timings: t.clone(),
@@ -1066,7 +1191,8 @@ impl Worker {
             Err(GenError::Engine(_)) => Ending::EngineError,
             Err(_) => Ending::Error,
         };
-        self.book(t, ending);
+        let stop = r.as_ref().ok().map(|o| o.stop);
+        self.book(&a.name, t, ending, stop);
         // An engine failure leaves no state to save; any other end leaves the
         // slot holding what it fed.
         if self.turns.is_none() && !matches!(r, Err(GenError::Engine(_))) {
@@ -1322,9 +1448,10 @@ impl Worker {
             return Some(need);
         }
         let a = &mut self.active[i];
-        let pumped = a
-            .job
-            .pump(&mut sink_of(&a.events), &mut tick_of(&self.sh, a.slot));
+        let pumped = a.job.pump(
+            &mut sink_of(&a.events),
+            &mut tick_of(&self.sh, a.slot, &a.name, &mut a.noted),
+        );
         let ended = match pumped {
             Ok(Need::Done) => {
                 let mut a = self.active.remove(i);
@@ -1605,9 +1732,9 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use super::{Acted, Action, Shared, serve};
+    use super::{Acted, Action, ReqName, Shared, finish_line, note_due, progress_line, serve};
     use crate::api::{End, EngineFailure, relock};
-    use crate::genloop::Slot;
+    use crate::genloop::{Slot, StopKind, Timings, cause_word};
     use crate::sched::{Board, FifoPicker, Refusal, Reserve};
     use crate::{MockEngine, sampling};
 
@@ -1672,5 +1799,94 @@ mod tests {
             fatal.starts_with("the engine thread panicked: the stop's cause:"),
             "the panic names the broken order: {fatal:?}"
         );
+    }
+
+    /// One progress line every interval of generation, on the generation's
+    /// own clock: the due check a token costs is one comparison, and a
+    /// generation that stalls past several intervals prints one line at its
+    /// next token, not a run of them.
+    #[test]
+    fn a_progress_stderr_line_every_interval_of_generation() {
+        let t = |ms: f64| Timings {
+            predicted_ms: ms,
+            ..Timings::default()
+        };
+        let mut noted = 0;
+        assert!(!note_due(noted, &t(0.0)));
+        assert!(!note_due(noted, &t(29_999.0)));
+        assert!(note_due(noted, &t(30_000.0)));
+        noted += 1;
+        assert!(!note_due(noted, &t(30_001.0)));
+        assert!(!note_due(noted, &t(59_999.0)));
+        assert!(note_due(noted, &t(60_000.0)));
+        noted += 1;
+        // A stall past two intervals: one line, and the next waits for the
+        // next multiple.
+        assert!(note_due(noted, &t(95_000.0)));
+        noted += 1;
+        assert!(!note_due(noted, &t(95_001.0)));
+        assert!(!note_due(noted, &t(119_999.0)));
+        assert!(note_due(noted, &t(120_000.0)));
+    }
+
+    /// The two lines' shapes: a fixed field order, the seconds to two
+    /// decimals, the rates to one, `-` over no time, and the choice's index
+    /// only for one choice of several.
+    #[test]
+    fn the_two_stderr_lines() {
+        let of_two = ReqName {
+            id: 7,
+            route: "/completion".to_owned(),
+            choice: 1,
+            choices: 2,
+        };
+        let t = Timings {
+            prompt_n: 12,
+            prompt_ms: 850.0,
+            predicted_n: 40,
+            predicted_ms: 3_900.0,
+            n_ctx: 64,
+            n_past: 52,
+            cache_n: 3,
+            ..Timings::default()
+        };
+        assert_eq!(
+            progress_line(&of_two, &t),
+            "bloomery-serve: request 7.1 /completion: generating, 40 ids in 3.90 s, 10.3 ids/s; \
+             ctx 52/64"
+        );
+        assert_eq!(
+            finish_line(&of_two, &t, "length"),
+            "bloomery-serve: request 7.1 /completion: prompt 12 ids (3 reused) in 0.85 s, \
+             14.1 ids/s; generated 40 ids in 3.90 s, 10.3 ids/s; stop length; ctx 52/64"
+        );
+        let of_one = ReqName {
+            id: 8,
+            route: "/v1/messages".to_owned(),
+            choice: 0,
+            choices: 1,
+        };
+        let none = Timings {
+            n_ctx: 64,
+            ..Timings::default()
+        };
+        // A request that reached no token: the rates read `-`, the counts
+        // stay what it reached.
+        assert_eq!(
+            finish_line(&of_one, &none, "error"),
+            "bloomery-serve: request 8 /v1/messages: prompt 0 ids (0 reused) in 0.00 s, - ids/s; \
+             generated 0 ids in 0.00 s, - ids/s; stop error; ctx 0/64"
+        );
+    }
+
+    /// The stop cause words: the generation's own stop, and the two ways a
+    /// request ends without one.
+    #[test]
+    fn the_stderr_line_cause_words() {
+        assert_eq!(cause_word(Some(StopKind::Eos), false), "eos");
+        assert_eq!(cause_word(Some(StopKind::Word), false), "stop");
+        assert_eq!(cause_word(Some(StopKind::Limit), false), "length");
+        assert_eq!(cause_word(None, false), "cancel");
+        assert_eq!(cause_word(None, true), "error");
     }
 }
