@@ -87,8 +87,7 @@ impl GemmKernels {
             "GemmKernels::enqueue_swiglu_act_quant",
             stream,
             (g, u, rule),
-            None,
-            n_cols,
+            (n_cols, None),
             target,
             fault,
         )
@@ -133,8 +132,7 @@ impl GemmKernels {
             what,
             stream,
             (g, u, rule),
-            Some((sel, n_card)),
-            n_cols,
+            (n_cols, Some((sel, n_card))),
             target,
             fault,
         )
@@ -167,23 +165,21 @@ impl GemmKernels {
             "GemmKernels::enqueue_swiglu_act_quant_q8",
             stream,
             (g, u, rule),
-            None,
-            n_cols,
+            (n_cols, None),
             target,
             fault,
         )
     }
 
-    /// The launch the enqueues share, over `n_cols` of `target`'s columns:
-    /// `sel` `None` quantizes every column, `Some((sel, n_card))` only the
-    /// columns whose place is below `n_card`.
+    /// The launch the enqueues share, over the first `n_cols` of `target`'s
+    /// columns: `sel` `None` quantizes every one, `Some((sel, n_card))` only
+    /// those whose place is below `n_card`.
     fn launch(
         &self,
         what: &'static str,
         stream: &CudaStream,
         (g, u, rule): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, Act),
-        sel: Option<(&DeviceBuffer<u32>, u32)>,
-        n_cols: usize,
+        (n_cols, sel): (usize, Option<(&DeviceBuffer<u32>, u32)>),
         target: Target<'_>,
         fault: FaultSink,
     ) -> Result<(), GpuError> {

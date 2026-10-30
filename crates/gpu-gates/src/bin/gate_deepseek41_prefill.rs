@@ -2691,8 +2691,10 @@ mod gate {
             .map(|i| needs.iter().map(|n| n.written(i)).collect())
             .collect();
         let unclaimed = claimed(m, hp, at, &written)?;
-        let mut snap = Snap::default();
-        snap.logits = bits(&m.logits()?);
+        let mut snap = Snap {
+            logits: bits(&m.logits()?),
+            ..Snap::default()
+        };
         if at < ORACLE {
             m.step(&[ids[at]])?;
             snap.next = Some(bits(&m.logits()?));
@@ -3113,6 +3115,11 @@ mod gate {
     /// A seam of the observed step: the sub-layer kind and the layer.
     type SeamKey = (body::BatchSeamKind, usize);
 
+    /// Each seam's streams, by (kind, layer): one row a position.
+    type SeamStreams = Vec<(SeamKey, Vec<Vec<f32>>)>;
+    /// Position 0's attention buffers, by layer: each buffer's name and values.
+    type AttnBufs = Vec<Vec<(&'static str, Vec<f32>)>>;
+
     /// The steps' every seam, in seam order: per (kind, layer) each
     /// position's streams, and position 0's attention buffers per layer —
     /// the record a seam comparison reads a batch back against (`--seams`
@@ -3121,13 +3128,7 @@ mod gate {
     fn seam_record(
         m: &mut Deepseek41Model,
         ids: &[u32],
-    ) -> Result<
-        (
-            Vec<(SeamKey, Vec<Vec<f32>>)>,
-            Vec<Vec<(&'static str, Vec<f32>)>>,
-        ),
-        GateError,
-    > {
+    ) -> Result<(SeamStreams, AttnBufs), GateError> {
         let p = ids.len();
         m.reset()?;
         let mut head = {

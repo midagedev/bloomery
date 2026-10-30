@@ -44,7 +44,7 @@ pub const LOGITS_RMS_PIN: f64 = 2.5;
 pub struct LogitsBand {
     /// Whether every compared position was held by both sides at the
     /// same width.
-    aligned: bool,
+    pub aligned: bool,
     /// Positions whose reference top1−top2 margin is at least
     /// `MARGIN_FLOOR`.
     pub clear: usize,
