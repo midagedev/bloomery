@@ -169,7 +169,7 @@ mod tests {
     use models::{
         Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap,
         KdaGate, Latent, LatentOut, LatentUp, Moe, OutGate, PoolRule, Residual, Rope, RopeMode,
-        Router, Score, ShortConv,
+        Router, Score, ShortConv, Source,
     };
 
     fn moe() -> Ffn {
@@ -264,7 +264,9 @@ mod tests {
                 up: LatentUp::KeqV,
                 rope: Some(rope(RopeMode::NormTail, 64)),
                 q_head_norm: false,
+                ssmax: false,
                 pe: 0,
+                cache: Source::Own(()),
                 out_gate: OutGate::None,
                 out: LatentOut::Grouped {
                     groups: 8,
