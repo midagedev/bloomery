@@ -218,6 +218,7 @@ gate-q38-serve-rules	family	qwen4exp	serve	seats_serve_engine
 gate-qdot	common		host	quant_host_qdot
 gate-quant	common		host	quant_host_qdot
 gate-qwen3-plan	common		place	placement_sizing+tier_legs
+gate-mistrallarge4-meta	family	mistral-large4	meta	arch_registry
 gate-musespark-meta	family	muse-spark	meta	arch_registry+placement_sizing
 gate-qwen35moe-meta	family	qwen35moe	meta	arch_registry
 gate-qwen3moe-meta	family	qwen3moe	meta	arch_registry
