@@ -17,6 +17,8 @@
 //   a4_matvec / _norm / _resid / _seg /
 //   a4_matvec_headnorm_resid  the same over MLX's affine 4-bit groups,
 //                             instantiated in matvec_a4.metal
+//   a8_matvec / ...           the same five over MLX's affine 8-bit groups,
+//                             instantiated in matvec_a8.metal
 //   q8_0_matvec / ..., q5k_matvec / ...
 //                             the same five over Q8_0 and Q5_K,
 //                             instantiated in matvec_q8_0.metal and

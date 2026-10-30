@@ -1,7 +1,7 @@
 // The dense quantized GEMM: y[r][n] = sum_k W[n][k] * x[r][k] over R
 // activation rows, one dispatch. The entry points, under their host names:
 //
-//   gemm_{q4k,q6k,a4,q8_0,q5k}_{store,resid}[_seg]_{f16,f32,h16}
+//   gemm_{q4k,q6k,a4,a8,q8_0,q5k}_{store,resid}[_seg]_{f16,f32,h16}
 //   gemm_cast_rows
 //
 //   store    y = W . x
@@ -442,6 +442,14 @@ GEMM_SEG_ENTRY(a4_seg_store_f16, A4, half, false, gemm_seg_kernel)
 GEMM_SEG_ENTRY(a4_seg_store_f32, A4, float, false, gemm_seg_kernel)
 GEMM_SEG_ENTRY(a4_seg_resid_f16, A4, half, true, gemm_seg_kernel)
 GEMM_SEG_ENTRY(a4_seg_resid_f32, A4, float, true, gemm_seg_kernel)
+GEMM_ENTRY(a8_store_f16, A8, half, false, gemm_kernel)
+GEMM_ENTRY(a8_store_f32, A8, float, false, gemm_kernel)
+GEMM_ENTRY(a8_resid_f16, A8, half, true, gemm_kernel)
+GEMM_ENTRY(a8_resid_f32, A8, float, true, gemm_kernel)
+GEMM_SEG_ENTRY(a8_seg_store_f16, A8, half, false, gemm_seg_kernel)
+GEMM_SEG_ENTRY(a8_seg_store_f32, A8, float, false, gemm_seg_kernel)
+GEMM_SEG_ENTRY(a8_seg_resid_f16, A8, half, true, gemm_seg_kernel)
+GEMM_SEG_ENTRY(a8_seg_resid_f32, A8, float, true, gemm_seg_kernel)
 GEMM_ENTRY(q8_0_store_f16, Q8_0, half, false, gemm_kernel)
 GEMM_ENTRY(q8_0_store_f32, Q8_0, float, false, gemm_kernel)
 GEMM_ENTRY(q8_0_resid_f16, Q8_0, half, true, gemm_kernel)
@@ -480,6 +488,7 @@ GEMM_SEG_ENTRY(q5k_seg_resid_f32, Q5K, float, true, gemm_seg_kernel)
 GEMM_H16_ENTRIES(q4k, Q4K)
 GEMM_H16_ENTRIES(q6k, Q6K)
 GEMM_H16_ENTRIES(a4, A4)
+GEMM_H16_ENTRIES(a8, A8)
 GEMM_H16_ENTRIES(q8_0, Q8_0)
 GEMM_H16_ENTRIES(q5k, Q5K)
 

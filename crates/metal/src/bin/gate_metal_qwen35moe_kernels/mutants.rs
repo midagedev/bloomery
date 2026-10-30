@@ -1009,6 +1009,36 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "a8_bias_fold",
+        clause: "a8_matvec",
+        why: "the A8 bias fold drops the bias term",
+        edits: &[(
+            "return s * code_dot + b * lane.sumy;",
+            "return s * code_dot;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a8_byte_order",
+        clause: "a8_matvec",
+        why: "an A8 code word's bytes are read reversed, value 4m + j pairing byte 3 − j",
+        edits: &[(
+            "const float4 codes = float4(as_type<uchar4>(q[m]));",
+            "const float4 codes = float4(as_type<uchar4>(q[m])).wzyx;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a8_scale_bias",
+        clause: "a8_matvec",
+        why: "the A8 code dot is scaled by the bias, not the scale",
+        edits: &[(
+            "const float s = as_type<float>(sb << 16);",
+            "const float s = as_type<float>(sb & 0xFFFF0000u);",
+            1,
+        )],
+    },
+    Mutant {
         name: "a4_fold_slot",
         clause: "a4_fold",
         why: "the A4 fold maps every sixteen groups, not every eight, to a slot",
