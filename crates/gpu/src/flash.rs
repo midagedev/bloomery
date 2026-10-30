@@ -93,7 +93,7 @@ pub use gguf::quant::f32_to_f16_bits;
 /// append rounds a finite f32 past f16's range to infinity, which this names.
 #[inline(always)]
 #[must_use]
-pub(crate) fn f16_finite(h: u16) -> bool {
+pub fn f16_finite(h: u16) -> bool {
     h & 0x7c00 != 0x7c00
 }
 
