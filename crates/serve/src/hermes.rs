@@ -357,12 +357,13 @@ fn unit(s: &str) -> Option<Option<u16>> {
     }
 }
 
-/// The compact JSON of the object at the start of `s` (a `{` there), as far as
-/// `s` determines it: structure as it comes, a string as it is decoded, in the
-/// escapes `serde_json` writes, and a number or literal once a delimiter ends
-/// it. It ends at the object's close, or where the text stops being JSON.
-/// What it returns is the prefix of the text [`parse_call`] closes with.
-fn compact_prefix(s: &str) -> String {
+/// The compact JSON of the value at the start of `s`, as far as `s` determines
+/// it: structure as it comes, a string as it is decoded, in the escapes
+/// `serde_json` writes, and a number or literal once a delimiter ends it. It
+/// ends at the value's close, or where the text stops being JSON. What it
+/// returns is the prefix of the text [`parse_call`] closes with (Mistral's
+/// scan of the value after `[ARGS]` reads one too, [`crate::mistral`]).
+pub(crate) fn compact_prefix(s: &str) -> String {
     let mut out = String::new();
     let mut depth = 0usize;
     let mut at = 0;
