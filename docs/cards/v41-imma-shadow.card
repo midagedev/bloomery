@@ -1,0 +1,26 @@
+# T2: V4.1's prompt-batch card experts on the grouped IMMA GEMM (gemm::enqueue_gemm_batch) instead of the dp4a tile
+# pair (ds41_expert_gate_up_tiles + q4k_gemv_tiles). Measured (nsys 2026-10-29, A6000 300 W, plan a, prose P 4096):
+# card kernel 8963.94 ms, the tile pair 2559.56 ms (28.55 %), duty 0.811 -> 220 layer-batches, tile pair 11.63 ms/lb.
+# The GEMM's grouped term [derived]: byte floor 1.74 ms/lb (~70 touched residents x 16.77 MB / 674 GB/s) .. the flow
+# model's imma_lb rate form 5.45 [3.6..7.3] ms/lb. With the host union binding first after the change (model's IMMA
+# arm: binding layers host 87 / card 11), price_imma.py gives pp4096 393.2..404.6 against 370.6 -> +4.6..+7.6 %.
+# At P 512 or one slot the gain is ~0 (host-bound): judged at prose 4096 only.
+# Runner (lead; base generate_ds41 built at ffe7d04e8 in ~/repo/bloomery-cflt2base on the box):
+# BLOOMERY_REMOTE='~/repo/bloomery-cflt2r2' BLOOMERY_AB_ROUNDS=4
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/v41-imma-shadow.card'
+# just depth-gpu-ds41 prose:4096 bin:/root/repo/bloomery-cflt2base/target/release/generate_ds41:prose:4096
+# Wall [derived]: 2 arms x 4 rounds x (load ~90 s + 4096 ids at ~370 tok/s 11 s + steps) ~ 15..25 min.
+kind: ab
+question: does the grouped IMMA GEMM lift V4.1's prose pp4096 over the tile pair by the derived band?
+term: pp tok/s @ P = 4096 (prose corpus), generate_ds41 --place a, RTX A6000 + host; this tree against ffe7d04e8,
+  paired by round
+unit: %
+predict: +4.5..+7.6
+rounds: 4
+condition: one lease, the box quiet, the A6000; no FAIL, [cold] or [other-busy] row among the counted rounds; the
+  generated tokens equal between the arms within the prefill gate's band (clear top-1)
+decide-in: land T2 (PR) with the row in its description
+decide-below: nsys one window of the new arm: the grouped GEMM's ms/lb against 1.74..7.3 and the binding layers'
+  host/card split before any GEMM tuning
+decide-above: check the base arm's rate (~370 at the measured window) and the card witness before believing it;
+  re-derive the host union from the records
