@@ -10,6 +10,16 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The API**: `/v1/chat/completions`, `/completion`, streaming, tool calls, `reasoning_content`,
   `cache_prompt`, `/apply-template`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
   and llama-server tutorials apply as they are.
+- **One stderr line a request.** When a generation request ends — on `/completion`, `/v1/completions`,
+  `/v1/chat/completions`, `/v1/messages` or `/v1/responses` — the server prints one line on stderr:
+  `bloomery-serve: request <task id> <endpoint path>: prompt <N> ids (<C> reused) in <S> s, <R> ids/s; generated <G> ids in <S> s, <R> ids/s; stop <reason>; ctx <n_past>/<n_ctx>`.
+  The seconds carry two decimals, the rates one, and a rate over no time reads `-`. `<reason>` is the generation's own
+  cause: `eos`, `stop` (a stop string), `length`, `cancel` (the client went away) or `error`. While one request
+  generates past every 30 s, a shorter line prints on the same clock — `request <task id> <endpoint path>:
+  generating, <G> ids in <S> s, <R> ids/s; ctx <n_past>/<n_ctx>` — so a long generation is never silent. A request
+  of several choices (`n` above 1) prints one line a choice, its index after the task id. The counts are the numbers
+  `/metrics` books for the request; between the lines, a running request shows in `/slots` (`n_past`, `n_decoded`)
+  and `/metrics` (`predicted_tokens_seconds`).
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **The OpenAI text completion API**: `POST /v1/completions` runs the `/completion` path under OpenAI's shape —

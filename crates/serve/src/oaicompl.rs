@@ -79,7 +79,7 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
     let ps = choice_params(state, &p, n);
     let ids = Ids::new(state, &b);
     if !p.stream {
-        return match run_whole_choices(state, &input, prompt, &ps, w)? {
+        return match run_whole_choices(state, &req.path, &input, prompt, &ps, w)? {
             Err(e) => send_error(w, req, &e),
             Ok(all) => {
                 let choices = all
@@ -122,7 +122,15 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
             };
             sse(s, &v)
         };
-        run_choices(state, &input, prompt, &ps, Client::of(peer), &mut sink)
+        run_choices(
+            state,
+            &req.path,
+            &input,
+            prompt,
+            &ps,
+            Client::of(peer),
+            &mut sink,
+        )
     };
     finish_stream(req, stream, w_opt, r, |s, all| {
         // One frame a choice with its `finish_reason` (its text already

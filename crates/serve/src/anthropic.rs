@@ -577,7 +577,7 @@ fn whole(
         prompt,
         mut parser,
     } = plan;
-    let (o, _) = match run_whole(state, &prompt_ids, prompt, &p, w)? {
+    let (o, _) = match run_whole(state, &req.path, &prompt_ids, prompt, &p, w)? {
         Err(e) => return send_error(w, req, &e),
         Ok(done) => done,
     };
@@ -837,8 +837,16 @@ fn stream(
             })?;
             blocks.push(ids, &d).iter().try_for_each(|v| event(s, v))
         };
-        run_gen(state, &prompt_ids, prompt, &p, Client::of(peer), &mut sink)
-            .map(|r| r.map(|(o, _)| o))
+        run_gen(
+            state,
+            &req.path,
+            &prompt_ids,
+            prompt,
+            &p,
+            Client::of(peer),
+            &mut sink,
+        )
+        .map(|r| r.map(|(o, _)| o))
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),

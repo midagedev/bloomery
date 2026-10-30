@@ -60,7 +60,7 @@ pub(super) fn post(state: &State, req: &Request, w: &mut TcpStream) -> io::Resul
     let ChatPlan {
         p, input, prompt, ..
     } = plan;
-    let outcome = match run_whole(state, &input, prompt, &p, w)? {
+    let outcome = match run_whole(state, &req.path, &input, prompt, &p, w)? {
         Ok((o, _)) => o,
         Err(e) => return send_error(w, req, &e),
     };

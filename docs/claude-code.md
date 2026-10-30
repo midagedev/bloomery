@@ -70,6 +70,14 @@ only its new messages. A request that does not start with that prompt, such as a
 from position 0 again. A 1.7B model answers fast but gets small tasks wrong. Use a coding model of the size your
 memory holds.
 
+## When a turn takes long
+
+A long turn is usually a long generation, not a hang. The server says so itself: it prints one stderr line when a
+request ends, and a `generating` line every 30 s while one runs past that — `serve.log`, where the launcher's first
+script writes the server's output. Between the lines, `GET /slots` (`n_past`, `n_decoded`) and `GET /metrics`
+(`predicted_tokens_seconds`) show the request still running. The lines' fields are in
+[`serving.md`](serving.md).
+
 ## A launcher
 
 Two short scripts keep the shell's own settings untouched: one starts the server and waits for it, the other runs

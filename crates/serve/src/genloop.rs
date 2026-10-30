@@ -289,6 +289,21 @@ impl StopKind {
     }
 }
 
+/// The server's stderr finish line's cause word: the generation's own stop
+/// (`eos`, `stop` for a stop string, `length`), `cancel` for a request its
+/// client or the server's stop cut short, `error` for one that failed. The
+/// one mapping, beside [`StopKind::finish_reason`]; the endpoints never
+/// derive their own.
+pub(crate) fn cause_word(stop: Option<StopKind>, failed: bool) -> &'static str {
+    match stop {
+        Some(StopKind::Eos) => "eos",
+        Some(StopKind::Word) => "stop",
+        Some(StopKind::Limit) => "length",
+        None if failed => "error",
+        None => "cancel",
+    }
+}
+
 /// A finished generation.
 pub(crate) struct Outcome {
     pub content: String,

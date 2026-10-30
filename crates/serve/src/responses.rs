@@ -1143,11 +1143,12 @@ fn whole(
         prompt,
         parser,
     } = plan;
-    let response =
-        match run_whole(state, &input, prompt, &p, w)?.and_then(|(o, _)| answer(ids, &o, parser)) {
-            Err(e) => return send_error(w, req, &e),
-            Ok(v) => v,
-        };
+    let response = match run_whole(state, &req.path, &input, prompt, &p, w)?
+        .and_then(|(o, _)| answer(ids, &o, parser))
+    {
+        Err(e) => return send_error(w, req, &e),
+        Ok(v) => v,
+    };
     keep(state, ids, &response, conversation);
     send_json(w, req, 200, &response)
 }
@@ -1181,9 +1182,10 @@ fn background(
     }
     let id = ids.id.clone();
     let runner = Arc::clone(state);
+    let route = req.path.clone();
     let spawned = std::thread::Builder::new()
         .name("serve-background".to_owned())
-        .spawn(move || run_background(&runner, &ids, conversation, plan, job));
+        .spawn(move || run_background(&runner, &ids, route, conversation, plan, job));
     if let Err(e) = spawned {
         state.responses.delete(&id);
         let e = engine_error(&format!(
@@ -1199,6 +1201,7 @@ fn background(
 fn run_background(
     state: &State,
     ids: &Ids,
+    route: String,
     conversation: Vec<Value>,
     plan: ChatPlan,
     job: Arc<Client>,
@@ -1216,7 +1219,7 @@ fn run_background(
         }
         Ok(())
     };
-    let answered = match run_gen(state, &input, prompt, &p, job, &mut sink) {
+    let answered = match run_gen(state, &route, &input, prompt, &p, job, &mut sink) {
         // Cancelled or deleted: the store holds what the cancel left.
         Ok(Err(GenError::Client(_))) => return,
         Ok(Err(e)) => Err(engine_error(&e)),
@@ -1387,7 +1390,16 @@ fn stream(
             }
             frames.send(s, events)
         };
-        run_gen(state, &input, prompt, &p, Client::of(peer), &mut sink).map(|r| r.map(|(o, _)| o))
+        run_gen(
+            state,
+            &req.path,
+            &input,
+            prompt,
+            &p,
+            Client::of(peer),
+            &mut sink,
+        )
+        .map(|r| r.map(|(o, _)| o))
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
