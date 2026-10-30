@@ -1,10 +1,10 @@
-//! The kernels' gate's fixture file: the row's family's trunk (qwen35moe's or qwen3moe's) whose real tensors the clauses read.
+//! The kernels' gate's fixture file: the row's family's trunk (qwen35moe's or qwen3moe's) whose real tensors the clauses read. The A8 clauses read the same split's tensors quantized at 8 bits ([`Fixture::rows_as_a8`]).
 
 use std::path::{Path, PathBuf};
 
 use bloomery_metal::kernels::Quant;
 use gguf::Split;
-use gguf::quant::{GgmlType, dequant_row};
+use gguf::quant::{GgmlType, bf16_bits_to_f32, dequant_row, fp32_to_bf16_bits};
 
 /// The rows of the fixture's `output.weight`: Qwen3.6's vocabulary. The
 /// head's launch takes its row count from the file; this is the fixture's, for
@@ -147,6 +147,82 @@ impl Fixture {
         Ok(out)
     }
 
+    /// The bytes of rows `at..at + rows` of the 2-D tensor `name`, quantized
+    /// at 8 bits: the split's own rows of it, whatever type they are,
+    /// dequantized to f32 and encoded as MLX's affine 8-bit groups — the A8
+    /// clauses' weights, the same values the split holds.
+    pub fn rows_at_as_a8(
+        &self,
+        name: &str,
+        cols: usize,
+        at: usize,
+        rows: usize,
+    ) -> Result<Vec<u8>, String> {
+        let (shard, t) = self.tensor(name)?;
+        if t.dims.len() != 2 || t.dims[0] != cols as u64 || t.dims[1] < (at + rows) as u64 {
+            return Err(format!(
+                "{name} is {:?} {:?}, the gate reads {cols} columns and rows {at}..{}",
+                t.ty,
+                t.dims,
+                at + rows
+            ));
+        }
+        let own = matvec_of(name, t.ty)?;
+        let own_row = own.block_bytes() * (cols / own.values_per_block());
+        let all = self.data(shard, t, name)?;
+        let at = at * own_row;
+        if at + rows * own_row > all.len() {
+            return Err(format!(
+                "{name} needs {} bytes and the tensor holds {}",
+                at + rows * own_row,
+                all.len()
+            ));
+        }
+        let values = dequant_rows(name, t.ty, own_row, &all[at..], cols, rows)?;
+        Ok(quantize_a8(&values, cols))
+    }
+
+    /// The bytes of `rows` rows of the 2-D tensor `name`, quantized at 8
+    /// bits (see [`Fixture::rows_at_as_a8`]).
+    pub fn rows_as_a8(&self, name: &str, cols: usize, rows: usize) -> Result<Vec<u8>, String> {
+        self.rows_at_as_a8(name, cols, 0, rows)
+    }
+
+    /// One expert of the 3-D tensor `name`, quantized at 8 bits: expert
+    /// `expert` of `dims[2]`, `rows` by `cols` (see [`Fixture::rows_at_as_a8`]).
+    pub fn expert_as_a8(
+        &self,
+        name: &str,
+        cols: usize,
+        rows: usize,
+        expert: usize,
+    ) -> Result<Vec<u8>, String> {
+        let (shard, t) = self.tensor(name)?;
+        if t.dims.len() != 3
+            || t.dims[0] != cols as u64
+            || t.dims[1] != rows as u64
+            || expert as u64 >= t.dims[2]
+        {
+            return Err(format!(
+                "{name} is {:?} {:?}, the gate reads expert {expert} of {cols} columns by {rows} rows",
+                t.ty, t.dims
+            ));
+        }
+        let own = matvec_of(name, t.ty)?;
+        let own_row = own.block_bytes() * (cols / own.values_per_block());
+        let all = self.data(shard, t, name)?;
+        let at = expert * rows * own_row;
+        if at + rows * own_row > all.len() {
+            return Err(format!(
+                "{name} expert {expert} needs {} bytes and the tensor holds {}",
+                at + rows * own_row,
+                all.len()
+            ));
+        }
+        let values = dequant_rows(name, t.ty, own_row, &all[at..], cols, rows)?;
+        Ok(quantize_a8(&values, cols))
+    }
+
     /// The model's norm epsilon.
     pub fn rms_eps(&self) -> Result<f32, String> {
         self.split
@@ -190,4 +266,67 @@ impl Fixture {
 /// kernels' own.
 fn quant(ty: GgmlType) -> Result<Quant, String> {
     Quant::of_ggml(ty).ok_or_else(|| format!("{ty:?} is not a mat-vec type"))
+}
+
+/// The mat-vec type that reads `ty`, refusing by the tensor's name.
+fn matvec_of(name: &str, ty: GgmlType) -> Result<Quant, String> {
+    quant(ty).map_err(|e| format!("{name}: {e}"))
+}
+
+/// The f32 values of `rows` rows of `cols` columns whose bytes sit at `bytes`
+/// in the tensor's own type, a row's span `own_row`: the reader's decode of
+/// the split's rows.
+fn dequant_rows(
+    name: &str,
+    ty: GgmlType,
+    own_row: usize,
+    bytes: &[u8],
+    cols: usize,
+    rows: usize,
+) -> Result<Vec<f32>, String> {
+    let mut values = vec![0f32; rows * cols];
+    for (r, out) in values.chunks_mut(cols).enumerate() {
+        dequant_row(ty, &bytes[r * own_row..], out).map_err(|e| format!("{name}: {e}"))?;
+    }
+    Ok(values)
+}
+
+/// `values` (`rows` rows of `cols` columns, `cols` a multiple of 64)
+/// encoded as MLX's affine 8-bit groups: a group of 64 the range
+/// (max − min) over 255 spans, its scale and bias the range's ends as BF16,
+/// its codes the values on that grid. The fit is the fixture's own — the
+/// reader's decode of these bytes is what the oracle and the kernel read.
+fn quantize_a8(values: &[f32], cols: usize) -> Vec<u8> {
+    debug_assert!(values.len().is_multiple_of(cols) && cols.is_multiple_of(64));
+    let a8 = Quant::A8;
+    let block = a8.block_bytes();
+    let groups = a8.values_per_block();
+    let mut out = vec![0u8; values.len() / groups * block];
+    for (g, chunk) in values.chunks_exact(groups).enumerate() {
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for &v in chunk {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        let s_bits = fp32_to_bf16_bits((max - min) / 255.0);
+        let b_bits = fp32_to_bf16_bits(min);
+        let (s, b) = (bf16_bits_to_f32(s_bits), bf16_bits_to_f32(b_bits));
+        let mut words = [0u32; 16];
+        for (j, &v) in chunk.iter().enumerate() {
+            let code = if s > 0.0 {
+                (((v - b) / s).round() as i64).clamp(0, 255) as u32
+            } else {
+                0
+            };
+            words[j / 4] |= code << (8 * (j % 4) as u32);
+        }
+        let bytes = &mut out[g * block..];
+        for (w, word) in words.iter().enumerate() {
+            bytes[4 * w..4 * w + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes[64..66].copy_from_slice(&s_bits.to_le_bytes());
+        bytes[66..68].copy_from_slice(&b_bits.to_le_bytes());
+    }
+    out
 }

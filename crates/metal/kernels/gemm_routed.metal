@@ -1,7 +1,7 @@
 // The grouped GEMM of the routed experts, and the dense GEMM over f32 weight
 // rows. The entry points, under their host names:
 //
-//   gemm_routed_{q4k,q6k,a4,q8_0,q5k}_{pair,plain}_{f16,f32}
+//   gemm_routed_{q4k,q6k,a4,a8,q8_0,q5k}_{pair,plain}_{f16,f32}
 //   gemm_routed_{q4k,q5k}_apart_q8_0_pair_{f16,f32}
 //   gemm_routed_{q5k,q6k}_apart_q8_0_plain_{f16,f32}
 //   gemm_f32w_store_f32
@@ -390,6 +390,8 @@ ROUTED_APART_PAIR(q6k, Q6K, block_q6_K, Q6K, block_q6_K)
 ROUTED_APART_PLAIN(q6k, Q6K, block_q6_K, Q6K, block_q6_K)
 ROUTED_APART_PAIR(a4, A4, block_mlx_a4, A4, block_mlx_a4)
 ROUTED_APART_PLAIN(a4, A4, block_mlx_a4, A4, block_mlx_a4)
+ROUTED_APART_PAIR(a8, A8, block_mlx_a8, A8, block_mlx_a8)
+ROUTED_APART_PLAIN(a8, A8, block_mlx_a8, A8, block_mlx_a8)
 ROUTED_APART_PAIR(q8_0, Q8_0, block_q8_0, Q8_0, block_q8_0)
 ROUTED_APART_PLAIN(q8_0, Q8_0, block_q8_0, Q8_0, block_q8_0)
 ROUTED_APART_PAIR(q5k, Q5K, block_q5_K, Q5K, block_q5_K)
