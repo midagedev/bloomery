@@ -26,6 +26,7 @@ solar	solar	-	2026-10-20
 raon	raon	-	2026-10-21
 flint	flint	-	2026-10-23
 muse	muse	-	2026-10-23
+mistral	(?-i:mistrallarge|MistralLarge|mistral-large|Mistral-Large|MISTRAL_LARGE)	-	2026-10-31
 -	gates|vision	-	-
 llama	(?-i:\bLlama\b|\bllama\b(?![.-]| flags?\b| reads\b)|gate_llama_)	-	2026-10-26
 nanbeige43	nanbeige	-	2026-10-26
