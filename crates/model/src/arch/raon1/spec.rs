@@ -10,7 +10,7 @@
 use gguf::Split;
 use models::{
     Act, Arch, ChatSpec, Collapse, DeltaKind, DeltaRule, Ffn, HcKind, HcSpec, Latent, LatentOut,
-    LatentUp, LayerSpec, Mixer, ModelSpec, OutGate, ReasoningFormat, Residual, ToolFormat,
+    LatentUp, LayerSpec, Mixer, ModelSpec, OutGate, ReasoningFormat, Residual, Source, ToolFormat,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -62,7 +62,9 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                     },
                     rope: None,
                     q_head_norm: false,
+                    ssmax: false,
                     pe: spec_u32("rope.dimension_count", m.pe)?,
+                    cache: Source::Own(()),
                     out_gate: OutGate::Proj,
                     out: LatentOut::Plain,
                     window: None,

@@ -89,7 +89,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
         Arch::Flint => Some(Program::FlintBody),
         Arch::MuseSpark => Some(Program::MuseSparkBody),
-        Arch::Lfm3 => None,
+        Arch::Lfm3 | Arch::MistralLarge4 => None,
     }
 }
 
