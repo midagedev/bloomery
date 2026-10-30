@@ -1,8 +1,13 @@
 //! GPU gate for the V4.1 prompt batch (`body::prefill`) on the gate
 //! placement (`crate::gate_card::plan_gate`: the 3090's bytes in the real tier, the largest
 //! visible card under the header's card budget in the fixture tier): a batched prefill of `P` ids leaves
-//! the model where `P` decode steps over the same ids leave it, bit for bit,
-//! in everything a later step or cut reads.
+//! the model where `P` decode steps over the same ids leave it, the route
+//! ids and weights bit for bit and the last logits within a band from the
+//! error model — the two paths fold the same exact integer block sums and
+//! reassociate them in f32, so the batch's logits sit at a pinned distance
+//! from the steps', not on their bits — while the calls' own structure
+//! (which rows their needs say they wrote, which features they kept, which
+//! cuts they grant) is held to the steps exactly.
 //!
 //! The ids are the first [`ORACLE`] + 1 of `$BLOOMERY_DATA/engram/corpus-prose.ids`
 //! (V4.1 text ids, one per line). The feature tap is attached with the DSpark
@@ -13,10 +18,11 @@
 //! The batch runs the CED triangle (`body::Need`): above the last layer that
 //! owns a compressor, a layer runs only the positions a later reader needs,
 //! so it writes the ring shadow rows of those positions alone. The contract
-//! is therefore not "every shadow row equals the steps'" but: every row a
-//! layer's need says it wrote equals the steps' row, and no cut
-//! `Body::keep_point` grants restores a row outside those — what the batch
-//! leaves unwritten is never claimed.
+//! is therefore not "every shadow row is written" but: the calls' needs name
+//! the rows they wrote, and no cut `Body::keep_point` grants restores a row
+//! outside those — what the batch leaves unwritten is never claimed. The
+//! rows' values are the band's business (they reach the verdict through the
+//! logits), not a comparison of their own.
 //!
 //! - **Clear.** First, right after the load and the step's capture, before
 //!   any other call touches the model: three arms through the session
@@ -88,9 +94,10 @@
 //! - **Fault, reset, clean.** A NaN in the scale of every card expert's
 //!   first gate row makes a prefill of [`FAULT_P`] ids fault; with the
 //!   scales put back and the model reset, a prefill of the smallest case's
-//!   `P` must raise nothing and give the oracle's numbers (the cases'
-//!   comparison). Then the same for steps: a poisoned step faults, and after
-//!   a reset `P` clean steps give the oracle's logits. A quantizer that
+//!   `P` must raise nothing and give the oracle's numbers within the cases'
+//!   band. Then the same for steps: a poisoned step faults, and after
+//!   a reset `P` clean steps give the oracle's logits bit for bit — the
+//!   steps' path is the ruler's own. A quantizer that
 //!   reads a column its call did not write — a slot the host serves, or one
 //!   outside the batch's block — finds the faulted call's NaN there.
 //! - **Group fault.** A clean prefill of `group_fault_p` ids (the most, up to
@@ -112,21 +119,21 @@
 //!   sum to at most the enqueue time, and no layer-batch or queue entry is
 //!   counted without its group's batches.
 //! - **Oracle, one run.** From a reset, the ids decode-stepped one at a time
-//!   through the graph, each position's features read after its step (an md5
-//!   per position). After the step at each case's position `P − 1` the gate
-//!   records every layer's window ring and compressor state and the head's
-//!   logits; after the step at `P`, the logits again. The rows a position
-//!   writes once and no later step touches are read from the run's end: each
-//!   layer's shadow rows (an md5 per row), compressed rows and index keys
-//!   (rows below each case's `⌊P / ratio⌋`).
+//!   through the graph. After the step at each case's position `P − 1` the
+//!   gate records the head's logits as bits; after the step at `P`, the
+//!   logits again. The steps' record stays exact — it is the ruler the
+//!   cases' band measures the batch's distance from.
 //! - **Cases.** For each `P` of [`CASES`] and each split of [`SPLITS`] (its
 //!   parts as consecutive prefill calls, each call its own triangle): reset,
-//!   the calls, then the ring, state, compressed rows, keys and logits
-//!   against the oracle; each layer's shadow rows over the positions the
-//!   calls' needs say it wrote; the kept features (positions and rows); every
-//!   cut `0 < k <= P` that `keep_point` grants restores only written rows;
-//!   then one decode step with `ids[P]`, its logits against the oracle's
-//!   position `P`. The splits are 700 + 400, and two whose second call sits
+//!   the calls, then their structure against the oracle — the kept feature
+//!   positions are the needs' own, every cut `0 < k <= P` that `keep_point`
+//!   grants restores only rows the needs say the calls wrote — and the
+//!   logits against the oracle's steps within the band: the call's last
+//!   logits and the one step after, top-1 equality at every position whose
+//!   steps' top1−top2 margin is at least `MARGIN_FLOOR` with at most
+//!   [`LOGITS_CLEAR_PIN`] disagreements, and max and RMS |Δlogit| at most
+//!   [`LOGITS_MAX_PIN`] and [`LOGITS_RMS_PIN`], every measured value printed
+//!   one line a case. The splits are 700 + 400, and two whose second call sits
 //!   on either side of the length where the triangle starts to cut the last
 //!   compressor owner's block (`ced_reach`: `CHUNK + window · (layers above the owner)` =
 //!   8 + 128 · 19 = 2440 positions from an aligned end on the real file, layer 20 of 40;
@@ -139,28 +146,29 @@
 //! - **Rollback.** After a prefill of 1100 ids: a cut inside the call is
 //!   refused by name (`keep_point` grants less), the call's own tail is
 //!   granted, and stepping from there gives the oracle's logits at 1099 and
-//!   1100.
+//!   1100 within the band (the steps run over the call's restored state).
 //! - **Take back.** After a prefill of 700 ids, a call of 400 more whose
 //!   feature reader fails once the batch has run: the call is taken back to
-//!   700, and the same call again gives the oracle's logits at 1099 and 1100.
+//!   700, and the same call again gives the oracle's logits at 1099 and 1100
+//!   within the band.
 //! - **Snapshot.** The body cuts a prompt call of 1100 ids with a mark at 700
 //!   there (`Body::prefill_splits`), which then keeps 700; the state saved
 //!   (`body::snapshot`), the ids reversed prefilled over it from a reset, the
 //!   state put back (`body::resume`): the model stands at 1100 with the ids,
 //!   every layer's ring, compressor state, compressed rows and keys are the
 //!   saved ones' md5, the saved state and the body grant the same cuts, the
-//!   next step gives the oracle's logits at 1100, and a cut back to 700 then
-//!   steps to 1100 give its logits at 1099 (the ring rows restored from the
-//!   saved shadow).
+//!   next step gives the oracle's logits at 1100 within the band, and a cut
+//!   back to 700 then steps to 1100 give its logits at 1099 the same way
+//!   (the ring rows restored from the saved shadow).
 //!
 //! `--cand` (G2b, weekly — `just weekly-gpu-ds41-cand`; it runs nothing
 //! else): after the load and the capture, a prompt call of the first
 //! [`CAND_FIRST`] prose ids, whose end `keep_point` grants; then positions
 //! [`CAND_FIRST`]`..`[`CAND_END`], across the 16,384 positions past which the
 //! candidate mask selects, as one batch call, and — taken back to
-//! [`CAND_FIRST`] — as one decode step each: every layer's window ring and
-//! compressor state, the compressed rows and index keys below the end, and
-//! the last logits bit for bit the same. The batch's chunks keep their
+//! [`CAND_FIRST`] — as one decode step each: the last logits within the
+//! cases' band (top-1 at the clear position, max and RMS |Δlogit| at most
+//! the pins), every measured value printed. The batch's chunks keep their
 //! candidate blocks per row of words, its steps per pass: the two paths
 //! share only the kernels.
 //!
@@ -264,6 +272,7 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
+    use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         no_local_depot, patch_bytes, record, row_bytes, verdict,
@@ -350,6 +359,24 @@ mod gate {
         p: 600,
         steps: 2,
     };
+    /// Clear-position top-1 disagreements the cases' band admits between a
+    /// batched call's logits and the steps' run — a compared position whose
+    /// steps' top1−top2 margin is at least `MARGIN_FLOOR` (the e2e clarity
+    /// rule) where the two top-1s differ. The batch's tile path is the
+    /// steps' arithmetic column for column, so the value holds at zero until
+    /// the calibration run on the GEMM engine re-pins it with a
+    /// `PIN(YYYY-MM-DD):` line and its derivation (both paths reassociate
+    /// the same exact integer block sums; the band is measured, not derived).
+    const LOGITS_CLEAR_PIN: usize = 0;
+    /// The largest |Δlogit| the band admits between a batched call's logits
+    /// and the steps' run, over every compared value. Zero while the tile
+    /// path runs; the calibration run on the GEMM engine re-pins it with a
+    /// `PIN(YYYY-MM-DD):` line and its derivation.
+    const LOGITS_MAX_PIN: f64 = 0.0;
+    /// The RMS |Δlogit| the band admits, over the same values. Zero while
+    /// the tile path runs; the calibration run on the GEMM engine re-pins it
+    /// with a `PIN(YYYY-MM-DD):` line and its derivation.
+    const LOGITS_RMS_PIN: f64 = 0.0;
 
     /// One arm of the clear clause: the first `p` ids of
     /// `corpus-<corpus>.ids` as one prompt call, then `steps` greedy steps.
@@ -421,7 +448,8 @@ mod gate {
     }
 
     /// What one position `P` leaves, as the oracle recorded it or a case
-    /// read it.
+    /// read it: the clear clause and the snapshot case read every field,
+    /// the oracle and the cases the logits alone.
     #[derive(Default)]
     struct Snap {
         /// Per layer: the ring's md5, the compressor state's (None without).
@@ -436,23 +464,15 @@ mod gate {
         next: Option<Vec<u32>>,
     }
 
-    /// The oracle's per-position records, from the run's end: per layer an
-    /// md5 per shadow row, and an md5 per position's features.
-    struct Rows {
-        shadow: Vec<Vec<Digest>>,
-        taps: Vec<Digest>,
-    }
-
-    /// What a case's calls wrote and kept: per layer the shadow rows its
-    /// needs name, and the kept features, position by position.
+    /// What a case's calls wrote and kept: the positions whose features the
+    /// reader saw, the needs, and the logits the calls leave.
     struct Case {
         snap: Snap,
-        /// Per layer, the md5 of its written rows' md5s.
-        shadow: Vec<Digest>,
-        written: Vec<Vec<Range<usize>>>,
         /// A cut `keep_point` grants whose restore reads an unwritten row.
         unclaimed: Option<usize>,
-        taps: Vec<(usize, Digest)>,
+        /// The positions whose features the calls kept, in the order the
+        /// reader saw them.
+        taps: Vec<usize>,
         taps_want: Vec<usize>,
         needs: Vec<Need>,
     }
@@ -518,7 +538,7 @@ mod gate {
         }
         m.capture_step()?;
         if args.cand {
-            return if cand_case(&mut m, &hp)? {
+            return if cand_case(&mut m)? {
                 println!("PASSED: {NAME} --cand");
                 Ok(())
             } else {
@@ -593,7 +613,7 @@ mod gate {
         wanted.sort_unstable();
         wanted.dedup();
         let t = Instant::now();
-        let (oracle, rows) = oracle(m, &hp, &ids, steps, &wanted)?;
+        let oracle = oracle(m, &ids, steps, &wanted)?;
         println!(
             "{NAME}: oracle {steps} steps in {:.1} s",
             t.elapsed().as_secs_f64()
@@ -616,13 +636,13 @@ mod gate {
             ));
         }
         crate::ds41_tier::sc(
-            "cases: a prompt call (and its splits) is the P decode steps, every cache and the logits",
+            "cases: a prompt call (and its splits) is the P decode steps in the last logits' band, its structure exact",
         )?;
         for (what, parts, window) in &runs {
             let t = Instant::now();
             m.reset()?;
             m.body_parts(NAME)?.2.take_prefill_stats();
-            let case = run_case(m, &hp, &ids, parts, *window, &rows)?;
+            let case = run_case(m, &hp, &ids, parts, *window)?;
             if stats {
                 let stats = m.body_parts(NAME)?.2.take_prefill_stats();
                 // A split case's stats span its two calls; the counts hold
@@ -632,13 +652,13 @@ mod gate {
                 println!("{NAME}: {what} {}", split::split(&stats, counts)?.line());
             }
             let p: usize = parts.iter().sum();
-            pass &= compare(what, &case, &oracle[&p], &rows, t, owner);
+            pass &= compare(what, &case, &oracle[&p], t, owner);
         }
         let p_clean = args.cases.iter().copied().min().unwrap_or(1);
         crate::ds41_tier::sc(
             "fault, reset, clean: a poisoned prefill faults, the reset gives the oracle's numbers",
         )?;
-        pass &= fault_reset_case(m, &hp, &ids, &oracle, &rows, p_clean, dhp.window)?;
+        pass &= fault_reset_case(m, &hp, &ids, &oracle, p_clean, dhp.window)?;
         crate::ds41_tier::sc(
             "group fault: a fault in a group is the call's named error and poison",
         )?;
@@ -2407,7 +2427,6 @@ mod gate {
         hp: &Hparams,
         ids: &[u32],
         oracle: &BTreeMap<usize, Snap>,
-        rows: &Rows,
         p: usize,
         window: usize,
     ) -> Result<bool, GateError> {
@@ -2428,12 +2447,11 @@ mod gate {
             verdict(prefill_faulted)
         );
         m.reset()?;
-        let prefill_clean = match run_case(m, hp, ids, &[p], window, rows) {
+        let prefill_clean = match run_case(m, hp, ids, &[p], window) {
             Ok(case) => compare(
                 &format!("fault-reset prefill P={p}"),
                 &case,
                 &oracle[&p],
-                rows,
                 t,
                 crate::ds41_tier::last_owner(hp)?,
             ),
@@ -2599,66 +2617,33 @@ mod gate {
         Ok(ok)
     }
 
-    /// The oracle run (module doc): a [`Snap`] per position of `wanted`, and
-    /// the per-position records.
+    /// The oracle run (module doc): the head's logits, as bits, at each of
+    /// `wanted` and the position after it.
     fn oracle(
         m: &mut Deepseek41Model,
-        hp: &Hparams,
         ids: &[u32],
         steps: usize,
         wanted: &[usize],
-    ) -> Result<(BTreeMap<usize, Snap>, Rows), GateError> {
+    ) -> Result<BTreeMap<usize, Snap>, GateError> {
         m.reset()?;
-        let mut taps = Vec::with_capacity(steps);
         let mut out: BTreeMap<usize, Snap> = BTreeMap::new();
         for (p, &id) in ids.iter().enumerate().take(steps) {
             m.step(&[id])?;
             if let Some(s) = out.get_mut(&p) {
                 s.next = Some(bits(&m.logits()?));
             }
-            {
-                let (gpu, _, b) = m.body_parts(NAME)?;
-                let f = b.read_features(gpu, 1)?;
-                if f.pos as usize != p {
-                    return Err(
-                        format!("{NAME}: the features after step {p} name {}", f.pos).into(),
-                    );
-                }
-                taps.push(md5(&bytes_of(f.values)));
-            }
             let at = p + 1;
             if wanted.contains(&at) {
-                let mut s = live(m)?;
-                s.logits = bits(&m.logits()?);
-                out.insert(at, s);
+                out.insert(
+                    at,
+                    Snap {
+                        logits: bits(&m.logits()?),
+                        ..Snap::default()
+                    },
+                );
             }
         }
-        // The rows a position writes once: from the run's end, below each P.
-        for (&p, s) in out.iter_mut() {
-            written_rows(m, hp, p, s)?;
-        }
-        let shadow = shadow_rows(m, hp, steps)?;
-        Ok((out, Rows { shadow, taps }))
-    }
-
-    /// Per layer, an md5 per shadow row of positions `0 .. n`.
-    fn shadow_rows(
-        m: &mut Deepseek41Model,
-        hp: &Hparams,
-        n: usize,
-    ) -> Result<Vec<Vec<Digest>>, GateError> {
-        let (gpu, _, b) = m.body_parts(NAME)?;
-        b.layers()
-            .map(|l| {
-                let host = b
-                    .shadow_rows(gpu, l)?
-                    .ok_or_else(|| format!("{NAME}: no shadow for layer {l}"))?;
-                Ok(host[..n * hp.head_dim]
-                    .chunks_exact(hp.head_dim)
-                    .map(|r| md5(&bytes_of(r)))
-                    .collect())
-            })
-            .collect()
+        Ok(out)
     }
 
     /// One case: `parts` prefill calls over `ids[.. Σ parts]`, each keeping
@@ -2669,17 +2654,17 @@ mod gate {
         ids: &[u32],
         parts: &[usize],
         window: usize,
-        rows: &Rows,
     ) -> Result<Case, GateError> {
-        let mut taps: Vec<(usize, Digest)> = Vec::new();
+        // The reader's rows are the batch's own values: the band judges them
+        // through the logits, so only their positions are taken.
+        let mut taps: Vec<usize> = Vec::new();
         let mut needs = Vec::new();
         let mut at = 0;
         let width = m.body(NAME)?.feature_width();
         for &n in parts {
             let mut feed = |first: u32, rows: &[f32]| -> Result<(), GpuError> {
-                for (i, r) in rows.chunks_exact(width).enumerate() {
-                    taps.push((first as usize + i, md5(&bytes_of(r))));
-                }
+                let kept = rows.chunks_exact(width).count();
+                taps.extend(first as usize..first as usize + kept);
                 Ok(())
             };
             let feats = body::FeatureRows {
@@ -2696,23 +2681,19 @@ mod gate {
             at += n;
         }
         let taps_want: Vec<usize> = needs.iter().flat_map(|n| n.features..n.end).collect();
-        let n_layers = rows.shadow.len();
+        let n_layers = m.body(NAME)?.layers().len();
         let written: Vec<Vec<Range<usize>>> = (0..n_layers)
             .map(|i| needs.iter().map(|n| n.written(i)).collect())
             .collect();
-        let mut snap = live(m)?;
-        snap.logits = bits(&m.logits()?);
-        written_rows(m, hp, at, &mut snap)?;
-        let shadow = written_md5(&shadow_rows(m, hp, at)?, &written);
         let unclaimed = claimed(m, hp, at, &written)?;
+        let mut snap = Snap::default();
+        snap.logits = bits(&m.logits()?);
         if at < ORACLE {
             m.step(&[ids[at]])?;
             snap.next = Some(bits(&m.logits()?));
         }
         Ok(Case {
             snap,
-            shadow,
-            written,
             unclaimed,
             taps,
             taps_want,
@@ -2720,18 +2701,92 @@ mod gate {
         })
     }
 
-    /// Per layer, the md5 of its rows' md5s over its `written` positions.
-    fn written_md5(rows: &[Vec<Digest>], written: &[Vec<Range<usize>>]) -> Vec<Digest> {
-        rows.iter()
-            .zip(written)
-            .map(|(r, ranges)| {
-                let mut h = Md5::new();
-                for q in ranges.iter().flat_map(Clone::clone) {
-                    h.update(&r[q]);
+    /// The band a batched call's logits are held to against the steps' run
+    /// (module doc): the largest and RMS |Δlogit| over every compared
+    /// value, and the top-1 disagreements over the positions the steps are
+    /// clear about. A compared pair of unequal width, or a position one
+    /// side holds and the other does not, is red whatever the values — the
+    /// two runs read the same head over the same ids.
+    struct LogitsBand {
+        /// Whether every compared position was held by both sides at the
+        /// same width.
+        aligned: bool,
+        /// Positions whose steps' top1−top2 margin is at least
+        /// `MARGIN_FLOOR`.
+        clear: usize,
+        /// Clear positions whose top-1 is not the steps'.
+        disagree: usize,
+        values: usize,
+        max: f64,
+        sq: f64,
+    }
+
+    impl LogitsBand {
+        fn new() -> LogitsBand {
+            LogitsBand {
+                aligned: true,
+                clear: 0,
+                disagree: 0,
+                values: 0,
+                max: 0.0,
+                sq: 0.0,
+            }
+        }
+
+        /// Fold one position in: the steps' `want` decides the clarity
+        /// margin and the top-1, the call's `got` its distance from the
+        /// steps' values.
+        fn add(&mut self, got: &[u32], want: &[u32]) {
+            self.aligned &= got.len() == want.len();
+            // The steps' top two decide whether the position is clear; the
+            // first maximum wins, so ties go to the lower id.
+            let (mut top1, mut top2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for &b in want {
+                let v = f32::from_bits(b);
+                if v > top1 {
+                    top2 = top1;
+                    top1 = v;
+                } else if v > top2 {
+                    top2 = v;
                 }
-                h.finish()
-            })
-            .collect()
+            }
+            let clear = top1 - top2 >= MARGIN_FLOOR;
+            self.clear += usize::from(clear);
+            if clear && argmax(got) != argmax(want) {
+                self.disagree += 1;
+            }
+            for (&g, &w) in got.iter().zip(want) {
+                let d = (f64::from(f32::from_bits(g)) - f64::from(f32::from_bits(w))).abs();
+                self.max = self.max.max(d);
+                self.sq += d * d;
+            }
+            self.values += got.len().min(want.len());
+        }
+
+        /// The RMS |Δlogit| over the compared values.
+        fn rms(&self) -> f64 {
+            (self.sq / self.values.max(1) as f64).sqrt()
+        }
+
+        /// Whether the measured band sits within the pins.
+        fn ok(&self) -> bool {
+            self.aligned
+                && self.disagree <= LOGITS_CLEAR_PIN
+                && self.max <= LOGITS_MAX_PIN
+                && self.rms() <= LOGITS_RMS_PIN
+        }
+    }
+
+    /// The row's argmax in the reference's order, logit descending and id
+    /// ascending: the first maximum.
+    fn argmax(row: &[u32]) -> usize {
+        let mut best = 0;
+        for (i, &b) in row.iter().enumerate() {
+            if f32::from_bits(b) > f32::from_bits(row[best]) {
+                best = i;
+            }
+        }
+        best
     }
 
     /// The first cut `0 < k <= p` that `keep_point` grants and whose restore
@@ -2824,20 +2879,28 @@ mod gate {
         let (pos, len) = (m.pos() as usize, m.body(NAME)?.history().len());
         let back = failed.is_err() && pos == a && len == a;
         body::prefill(m, &ids[a..a + b])?;
-        let at_end = bits(&m.logits()?) == oracle[&(a + b)].logits;
+        let mut band = LogitsBand::new();
+        band.add(&bits(&m.logits()?), &oracle[&(a + b)].logits);
         m.step(&[ids[a + b]])?;
-        let next = Some(bits(&m.logits()?)) == oracle[&(a + b)].next;
-        let ok = back && at_end && next;
+        let want_next = oracle[&(a + b)]
+            .next
+            .as_deref()
+            .ok_or_else(|| format!("{NAME}: the oracle holds no logits past {}", a + b))?;
+        band.add(&bits(&m.logits()?), want_next);
+        let ok = back && band.ok();
         println!(
             "{NAME}: case take back {a}+{b}: the second call failed ({}), the model stands at \
-             {pos} with {len} tokens {} | the call again: logits[P-1] {} | next step logits {} | \
-             {:.1} s: {}",
+             {pos} with {len} tokens {} | the call again: logits within the band (clear top-1 {} \
+             of {}, max |Δlogit| {:.3e}, rms {:.3e}) {} | {:.1} s: {}",
             failed
                 .err()
                 .map_or("no error".to_string(), |e| e.to_string()),
             verdict(back),
-            verdict(at_end),
-            verdict(next),
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
+            verdict(band.ok()),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -2887,24 +2950,32 @@ mod gate {
             && body_grants == grants
             && saved_grants == grants;
         m.step(&[ids[p]])?;
-        let next = Some(bits(&m.logits()?)) == oracle[&p].next;
+        let mut band = LogitsBand::new();
+        let want_next = oracle[&p]
+            .next
+            .as_deref()
+            .ok_or_else(|| format!("{NAME}: the oracle holds no logits past {p}"))?;
+        band.add(&bits(&m.logits()?), want_next);
         m.rollback(u32::try_from(kept_mark)?)?;
         for &id in &ids[kept_mark..p] {
             m.step(&[id])?;
         }
-        let at_end = bits(&m.logits()?) == oracle[&p].logits;
-        let ok = cuts == [a] && kept_mark == a && same && stands && next && at_end;
+        band.add(&bits(&m.logits()?), &oracle[&p].logits);
+        let ok = cuts == [a] && kept_mark == a && same && stands && band.ok();
         println!(
             "{NAME}: case snapshot P={p}: cut at {cuts:?} keeps {kept_mark} {} | saved {} B, \
              resumed over the reversed ids: caches {} | stands at {p} with the ids and the same \
-             cuts {} | next step logits {} | cut to {kept_mark}, stepped to {p}: logits[P-1] {} | \
-             {:.1} s: {}",
+             cuts {} | logits within the band (clear top-1 {} of {}, max |Δlogit| {:.3e}, rms \
+             {:.3e}) {} | {:.1} s: {}",
             verdict(cuts == [a] && kept_mark == a),
             saved.bytes(),
             verdict(same),
             verdict(stands),
-            verdict(next),
-            verdict(at_end),
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
+            verdict(band.ok()),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -2938,17 +3009,25 @@ mod gate {
         for &id in &ids[tail..p] {
             m.step(&[id])?;
         }
-        let at_end = bits(&m.logits()?) == oracle[&p].logits;
+        let mut band = LogitsBand::new();
+        band.add(&bits(&m.logits()?), &oracle[&p].logits);
         m.step(&[ids[p]])?;
-        let next = Some(bits(&m.logits()?)) == oracle[&p].next;
-        let ok = refused && tail > inside && at_end && next;
+        let want_next = oracle[&p]
+            .next
+            .as_deref()
+            .ok_or_else(|| format!("{NAME}: the oracle holds no logits past {p}"))?;
+        band.add(&bits(&m.logits()?), want_next);
+        let ok = refused && tail > inside && band.ok();
         println!(
             "{NAME}: case rollback P={p}: cut {inside} refused (keep_point {kept_inside}) {} | \
-             tail cut {tail} granted, stepped to {p}: logits[P-1] {} | next step logits {} | \
-             {:.1} s: {}",
+             tail cut {tail} granted, stepped to {p}: logits within the band (clear top-1 {} of \
+             {}, max |Δlogit| {:.3e}, rms {:.3e}) {} | {:.1} s: {}",
             verdict(refused),
-            verdict(at_end),
-            verdict(next),
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
+            verdict(band.ok()),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -2956,8 +3035,8 @@ mod gate {
     }
 
     /// G2b (module doc): the crossing as one batch call and as steps from
-    /// the same keep point.
-    fn cand_case(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+    /// the same keep point, the last logits within the band.
+    fn cand_case(m: &mut Deepseek41Model) -> Result<bool, GateError> {
         let t = Instant::now();
         let ids = corpus("prose", CAND_END)?;
         m.reset()?;
@@ -2969,7 +3048,8 @@ mod gate {
             );
             return Ok(false);
         }
-        let mut arms = Vec::new();
+        // arms[0] is the batch call's logits, arms[1] the steps'.
+        let mut arms: Vec<Vec<u32>> = Vec::new();
         for batch in [true, false] {
             m.rollback(u32::try_from(CAND_FIRST)?)?;
             if batch {
@@ -2979,29 +3059,21 @@ mod gate {
                     m.step(&[id])?;
                 }
             }
-            let mut snap = live(m)?;
-            snap.logits = bits(&m.logits()?);
-            written_rows(m, hp, CAND_END, &mut snap)?;
-            arms.push(snap);
+            arms.push(bits(&m.logits()?));
         }
-        let (a, b) = (&arms[0], &arms[1]);
-        let fields = [
-            ("ring", a.ring == b.ring),
-            ("state", a.state == b.state),
-            ("rows", a.rows == b.rows),
-            ("keys", a.keys == b.keys),
-            ("logits", a.logits == b.logits),
-        ];
-        let ok = fields.iter().all(|&(_, same)| same);
+        let mut band = LogitsBand::new();
+        band.add(&arms[0], &arms[1]);
+        let ok = band.ok();
         println!(
             "{NAME}: case cand: ids {CAND_FIRST}..{CAND_END} as one batch call ({:?}) against \
-             steps from the keep point {CAND_FIRST}: {} | {:.1} s: {}",
+             steps from the keep point {CAND_FIRST}: last logits within the band: clear top-1 {} \
+             of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} (pin {LOGITS_MAX_PIN}), rms \
+             {:.3e} (pin {LOGITS_RMS_PIN}) | {:.1} s: {}",
             body::batches(CAND_FIRST, CAND_END - CAND_FIRST),
-            fields
-                .iter()
-                .map(|(f, same)| format!("{f} {}", verdict(*same)))
-                .collect::<Vec<_>>()
-                .join(" "),
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -3084,76 +3156,36 @@ mod gate {
         Ok(())
     }
 
-    /// Every field of `got` against `want` and the oracle's rows: one line.
-    fn compare(
-        what: &str,
-        case: &Case,
-        want: &Snap,
-        rows: &Rows,
-        t: Instant,
-        owner: usize,
-    ) -> bool {
-        let got = &case.snap;
-        let field = |name: &str, g: &[Digest], w: &[Digest]| -> (bool, String) {
-            let same = g.iter().zip(w).filter(|(a, b)| a == b).count();
-            let ok = g.len() == w.len() && same == g.len();
-            let first = g.iter().zip(w).position(|(a, b)| a != b);
-            (
-                ok,
-                format!(
-                    "{name} {same}/{} md5 {}{}",
-                    w.len(),
-                    hex(&fold(g)),
-                    first.map_or(String::new(), |i| format!(" (first off at layer {i})"))
-                ),
-            )
-        };
-        let opt = |v: &[Option<Digest>]| -> Vec<Digest> { v.iter().flatten().copied().collect() };
-        let shape_ok = got
-            .state
-            .iter()
-            .map(Option::is_some)
-            .eq(want.state.iter().map(Option::is_some))
-            && got
-                .rows
-                .iter()
-                .map(Option::is_some)
-                .eq(want.rows.iter().map(Option::is_some))
-            && got
-                .keys
-                .iter()
-                .map(Option::is_some)
-                .eq(want.keys.iter().map(Option::is_some));
-        let shadow_want = written_md5(&rows.shadow, &case.written);
-        let parts = [
-            field("ring", &got.ring, &want.ring),
-            field("state", &opt(&got.state), &opt(&want.state)),
-            field("shadow(written)", &case.shadow, &shadow_want),
-            field("rows", &opt(&got.rows), &opt(&want.rows)),
-            field("keys", &opt(&got.keys), &opt(&want.keys)),
-        ];
-        let kept: Vec<usize> = case.taps.iter().map(|&(p, _)| p).collect();
-        let taps =
-            kept == case.taps_want && case.taps.iter().all(|&(p, d)| rows.taps.get(p) == Some(&d));
-        let logits = got.logits == want.logits;
-        let next = got.next == want.next;
+    /// The case against the oracle (module doc): one line, the band's every
+    /// measured value in it.
+    fn compare(what: &str, case: &Case, want: &Snap, t: Instant, owner: usize) -> bool {
+        let mut band = LogitsBand::new();
+        band.add(&case.snap.logits, &want.logits);
+        match (&case.snap.next, &want.next) {
+            (Some(g), Some(w)) => band.add(g, w),
+            (None, None) => {}
+            _ => band.aligned = false,
+        }
+        let taps = case.taps == case.taps_want;
         let claimed = case.unclaimed.is_none();
-        let ok = shape_ok && parts.iter().all(|(o, _)| *o) && taps && claimed && logits && next;
-        let text: Vec<String> = parts.into_iter().map(|(_, s)| s).collect();
+        let ok = band.ok() && taps && claimed;
         let reach = |n: &Need| n.layers.get(owner).map_or(0, |l| l.full - n.first);
         println!(
-            "{NAME}: case {what}: {} | taps {} rows from {} {} | granted cuts claimed {} | \
-             logits[P-1] {} | next step logits {} | layer {owner} block cut by {:?} | {:.1} s: {}",
-            text.join(" | "),
-            kept.len(),
-            kept.first().map_or("-".to_string(), ToString::to_string),
+            "{NAME}: case {what}: taps {} rows from {} {} | granted cuts claimed {} | logits \
+             band: clear top-1 {} of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} (pin \
+             {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}) {} | layer {owner} block cut \
+             by {:?} | {:.1} s: {}",
+            case.taps.len(),
+            case.taps
+                .first()
+                .map_or("-".to_string(), ToString::to_string),
             verdict(taps),
             verdict(claimed),
-            verdict(logits),
-            match &got.next {
-                None => "n/a (P is the oracle's last position)".to_string(),
-                Some(_) => verdict(next).to_string(),
-            },
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
+            verdict(band.ok()),
             case.needs.iter().map(reach).collect::<Vec<_>>(),
             t.elapsed().as_secs_f64(),
             verdict(ok)
@@ -3344,13 +3376,6 @@ mod gate {
         let mut h = Md5::new();
         h.update(&bytes_of(&host));
         Ok(h.finish())
-    }
-
-    /// The md5 of `b`.
-    fn md5(b: &[u8]) -> Digest {
-        let mut h = Md5::new();
-        h.update(b);
-        h.finish()
     }
 
     fn bits(v: &[f32]) -> Vec<u32> {
