@@ -83,11 +83,15 @@ overrides the detected target; set it when invoking recipes from a machine witho
 card is compute capability 12.0 (the RTX 50 series) builds `sm_120a`, and other machines keep `sm_86`.
 
 The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
-and the features above, `checkpoint` among them. Its kernels are compiled for the GB10 when it is built (`oxart_jit
---cubin` in `tools/release/build.sh`), so a first start compiles nothing; their PTX stays in the binary for a driver
-that refuses the compiled code. It needs no toolchain: from 0.3.11 the release carries it, and
-`tools/release/install.sh` picks it on a GB10 and links `bloomery-serve` into `~/.local/bin`. `just release-build
-<version>` makes it on a GB10, run there with `BLOOMERY_BOX_LOCAL=1`.
+and the features above, `checkpoint` among them. The maintainers build it on their x86_64 box with the cross toolchain
+(`BLOOMERY_RELEASE_TARGET=aarch64 bash tools/release/build.sh <version> <commit>`, through `tools/box.sh`): the host
+code comes from the cross gcc for GB10's cores, and each bundle's PTX is compiled by the CUDA toolkit's
+`ptxas -arch=<the bundle's target>` on the build host (`oxart_ptxas`, no card there), the build printing the ptxas
+version, so a first start compiles nothing; their PTX stays in the binary as `.oxart.ptx` for a driver that refuses the
+compiled code. The build machine has no GB10: a contributor's Spark run checks the archive once before a release is
+tagged. Building it on a GB10 itself still works (`tools/release/build.sh` there with `BLOOMERY_BOX_LOCAL=1`, where
+`oxart_jit --cubin` links the cubins on the Spark's own card). It needs no toolchain to run: from 0.3.11 the release
+carries it, and `tools/release/install.sh` picks it on a GB10 and links `bloomery-serve` into `~/.local/bin`.
 
 ### 2.2 First placement and the models to try
 

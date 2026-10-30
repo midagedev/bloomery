@@ -22,11 +22,12 @@ There are three Linux archives; the installer picks the one for the machine.
   archive. It is built from the same tree as the others, and no maintainer machine has a 12.0 card, so the code path
   that card takes is checked by compiling it, and by the users who run it. A machine with a 12.0 card beside another
   capability takes the sm_86 archive, and so does a release that carries no sm_120a archive.
-- `linux-aarch64-cuda-sm121a`: a GB10 (DGX Spark and the other GB10 machines) on DGX OS 7 (Ubuntu 24.04, glibc 2.39). The archive
-  carries its GPU code compiled for sm_121a, which uses GB10's FP4 tensor cores and loads on compute capability 12.1
-  only, so a first start compiles nothing. A driver that refuses that code gets the PTX the archive keeps beside it,
-  compiled on the first start, and the server says so on one line. Another aarch64 GPU builds from source
-  (`docs/BUILD.md`).
+- `linux-aarch64-cuda-sm121a`: a GB10 (DGX Spark and the other GB10 machines) on DGX OS 7 (Ubuntu 24.04, glibc 2.39). The
+  archive is built on an x86_64 machine with the cross toolchain; its GPU code is compiled for sm_121a by the CUDA
+  toolkit's `ptxas` at build time (the build prints the ptxas version), which uses GB10's FP4 tensor cores and loads
+  on compute capability 12.1 only, so a first start compiles nothing. A driver that refuses that code gets the PTX the
+  archive keeps beside it as `.oxart.ptx`, compiled on the first start, and the server says so on one line. Another
+  aarch64 GPU builds from source (`docs/BUILD.md`).
 - For the x86-64 sm_86 archive, an NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
   card on first start. Run on an RTX A6000 and an RTX 3090 (driver 615.71, Ubuntu 24.04) and, for Clef-Flash, on an
   RTX 3060 under WSL2 (Windows driver 591.86), where the answers equal the A6000's byte for byte. Other cards and

@@ -13,11 +13,15 @@
 #     archive's build rebuilds the other's. A build machine with no cc 12.0 card cannot compile the PTX to cubins, so it
 #     stays PTX and the driver compiles it on the card's first start;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
-#     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself).
-#     The packed binary carries the driver's JIT of that PTX as cubins: oxart_jit --cubin links each `.oxart` bundle on
-#     the building GB10's card, the result becomes the `.oxart` section the loader reads, and the PTX stays beside it as
-#     `.oxart.ptx`, which bloomery-gpu loads for a bundle whose cubin the driver refuses. A first start then compiles
-#     nothing.
+#     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself)
+#     or cross on an x86_64 machine (BLOOMERY_RELEASE_TARGET=aarch64: the rust aarch64 target, the cross gcc for the
+#     host code and aarch64 binutils, the cargo --target, the triple's bin dir and its own target dir; every missing
+#     tool and the rust target are refused by name, rc 69, before anything is built, and any other value is rc 64).
+#     Either way the packed binary carries that PTX compiled as cubins, and the PTX stays beside it as `.oxart.ptx`,
+#     which bloomery-gpu loads for a bundle whose cubin the driver refuses, so a first start compiles nothing. On a
+#     GB10, oxart_jit --cubin links each `.oxart` bundle on the building machine's card; cross, oxart_ptxas hands each
+#     bundle's PTX to the toolkit's ptxas -arch=<the bundle's target> on the build host, no card and no gate lock, the
+#     ptxas version printed.
 #
 # The failures it blocks, each checked on the built binaries before anything is packed:
 #   - a binary for another machine than the platform's (its ELF header);
@@ -28,12 +32,14 @@
 #     function that runs behind a runtime CPU check;
 #   - a binary with no embedded PTX of the platform's arch, or PTX for another target.
 # A BLOOMERY_ARCH that is no arch of the machine's archives (tools/arch.sh) ends a build with 64 before anything is built;
-# `--check` reads the binaries and never the variable: the archive's arch is its argument, and an x86_64 binary checked
-# with none is held to sm_86.
+# `--check` reads the binaries and never that variable: the archive's arch is its argument, its machine is
+# BLOOMERY_RELEASE_TARGET's or the machine's own, and an x86_64 binary checked with none is held to sm_86.
 # Usage: tools/release/build.sh <version> <commit>
 #        tools/release/build.sh --check <dir> [<arch>]   (the binary checks alone, on <dir>/<bin>, for the archive of
-#                                                         <arch>, default the machine's sm_86 or sm_121a; builds and packs nothing)
-#        tools/release/build.sh --self-test     (the host-code scan on fixture listings and the platform table; check-recipes runs it)
+#                                                         <arch>, default the archive machine's sm_86 or sm_121a; builds and packs nothing)
+#        tools/release/build.sh --self-test     (the host-code scan on fixture listings, the platform table and the cross refusals;
+#                                                check-recipes runs it)
+# BLOOMERY_RELEASE_TARGET=aarch64 builds the aarch64 archive cross on an x86_64 machine; a build and a --check both read it.
 # The tarball and its .sha256 keep the names this script writes ($NAME.tar.gz…): install.sh resolves the release by
 # them and the Homebrew tap's formula pins them, so `gh release upload` must be given the files as named, not copies
 # under other names. The version the tarball carries is the serve crate's, so a release bumps that crate first.
@@ -139,6 +145,56 @@ set_platform() {
   esac
 }
 
+# set_target <uname -m> <BLOOMERY_RELEASE_TARGET>: MACHINE is the archive's machine and CROSS tells the cross build —
+# the building machine's own, or aarch64 when an x86_64 machine builds the GB10 archive. Any other value, and the cross
+# value on any other machine, is refused by name.
+set_target() {
+  MACHINE=$1 CROSS=
+  case ${2:-} in
+    '') ;;
+    aarch64)
+      if [ "$MACHINE" != x86_64 ]; then
+        echo "release: BLOOMERY_RELEASE_TARGET=aarch64 builds the aarch64 archive on an x86_64 machine; this machine is $MACHINE (unset it to build this machine's own)" >&2
+        return 64
+      fi
+      MACHINE=aarch64 CROSS=1 ;;
+    *)
+      echo "release: BLOOMERY_RELEASE_TARGET is 'aarch64' or unset, got '$2'" >&2
+      return 64 ;;
+  esac
+}
+
+# The cross build's own rows: its target dir (never the x86_64 archives', never a GB10's), the cargo triple, the cross
+# linker and the target binutils — the x86_64 objcopy cannot read an aarch64 binary. The cubin packer is a host tool
+# (oxart_ptxas, no device code), so nothing that runs is built for the wrong machine.
+cross_platform() {
+  TARGET_DIR=portable-aarch64 TRIPLE=aarch64-unknown-linux-gnu
+  LINKER=aarch64-linux-gnu-gcc OBJCOPY=aarch64-linux-gnu-objcopy
+}
+
+# The cross toolchain, refused by name before anything is built (rc 69): each tool names the package that provides it,
+# the rust target the command that installs it, ptxas the toolkit it comes with.
+cross_tools() {
+  command -v aarch64-linux-gnu-gcc > /dev/null || {
+    echo "release: aarch64-linux-gnu-gcc is not on PATH: apt install gcc-aarch64-linux-gnu (the cross linker)" >&2
+    return 69
+  }
+  command -v aarch64-linux-gnu-objcopy > /dev/null || {
+    echo "release: aarch64-linux-gnu-objcopy is not on PATH: apt install binutils-aarch64-linux-gnu (the x86_64 objcopy cannot read an aarch64 binary)" >&2
+    return 69
+  }
+  command -v ptxas > /dev/null || {
+    echo "release: ptxas is not on PATH: the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)" >&2
+    return 69
+  }
+  local sysroot
+  sysroot=$(rustc --print sysroot 2> /dev/null) || sysroot=
+  if [ -z "$sysroot" ] || [ ! -d "$sysroot/lib/rustlib/aarch64-unknown-linux-gnu" ]; then
+    echo "release: the aarch64-unknown-linux-gnu target is not installed for ${sysroot:-this rustc}: rustup target add aarch64-unknown-linux-gnu" >&2
+    return 69
+  fi
+}
+
 # The scan on listings in GNU objdump's form: address, bytes and instruction, tab-separated, and the bytes past the
 # seventh on a line of their own. Each instruction's bytes are its assembler's encoding. A case holds one refused
 # function at most, since awk lists them in no set order.
@@ -235,6 +291,63 @@ self_test() {
   expect_platform arm-sm120a aarch64 sm_120a 64 "release: no aarch64 archive for sm_120a; the aarch64 archive is sm_121a (BLOOMERY_ARCH unset on a GB10)"
   expect_platform riscv riscv64 '' 64 "release: no Linux release for riscv64; the platforms are x86_64 and aarch64"
 
+  # set_target: the archive's machine — the building machine's own, or aarch64 when an x86_64 machine builds the GB10
+  # archive cross; any other value, and the cross value on another machine, refused by name.
+  expect_target() { # expect_target <case> <uname -m> <variable> <want rc> <want output>
+    cases=$((cases + 1))
+    out=$( (set_target "$2" "$3" && echo "$MACHINE cross=$CROSS") 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$4" ] || [ "$out" != "$5" ]; then
+      echo "release self-test: target $1: rc $rc (want $4), output: $out" >&2
+      echo "  want: $5" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  expect_target native-x86 x86_64 '' 0 "x86_64 cross="
+  expect_target native-arm aarch64 '' 0 "aarch64 cross="
+  expect_target cross x86_64 aarch64 0 "aarch64 cross=1"
+  expect_target other-value x86_64 riscv64 64 "release: BLOOMERY_RELEASE_TARGET is 'aarch64' or unset, got 'riscv64'"
+  expect_target cross-on-arm aarch64 aarch64 64 "release: BLOOMERY_RELEASE_TARGET=aarch64 builds the aarch64 archive on an x86_64 machine; this machine is aarch64 (unset it to build this machine's own)"
+
+  # The cross platform line: the aarch64 row with the cross build's own target dir, triple, linker and binutils.
+  expect_cross() { # expect_cross <case> <uname -m> <variable> <want rc> <want output>
+    cases=$((cases + 1))
+    out=$( (set_target "$2" "$3" && set_platform "$MACHINE" '' && cross_platform &&
+      echo "$PLATFORM $RELEASE_ARCH $HOST_CPU $TARGET_DIR v3=$SCAN_V3 glibc=$GLIBC_FLOOR cubin=$CUBIN triple=$TRIPLE linker=$LINKER objcopy=$OBJCOPY") 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$4" ] || [ "$out" != "$5" ]; then
+      echo "release self-test: cross $1: rc $rc (want $4), output: $out" >&2
+      echo "  want: $5" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  expect_cross cross-line x86_64 aarch64 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable-aarch64 v3= glibc=2.39 cubin=1 triple=aarch64-unknown-linux-gnu linker=aarch64-linux-gnu-gcc objcopy=aarch64-linux-gnu-objcopy"
+
+  # cross_tools on a stub PATH: each missing piece refused by name (69), the rust target named with its command, all
+  # present a pass. The stubs are empty executables; the stub rustc names a sysroot the test fills last.
+  local t
+  t=$(mktemp -d "${TMPDIR:-/tmp}/release-tools.XXXXXX") || return 70
+  stub() { printf '#!/bin/sh\n' > "$t/$1" && chmod +x "$t/$1"; }
+  expect_tools() { # expect_tools <case> <want rc> <want output>
+    cases=$((cases + 1))
+    out=$(PATH="$t" cross_tools 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$2" ] || [ "$out" != "$3" ]; then
+      echo "release self-test: tools $1: rc $rc (want $2), output: $out" >&2
+      echo "  want: $3" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  expect_tools none 69 "release: aarch64-linux-gnu-gcc is not on PATH: apt install gcc-aarch64-linux-gnu (the cross linker)"
+  stub aarch64-linux-gnu-gcc
+  expect_tools no-objcopy 69 "release: aarch64-linux-gnu-objcopy is not on PATH: apt install binutils-aarch64-linux-gnu (the x86_64 objcopy cannot read an aarch64 binary)"
+  stub aarch64-linux-gnu-objcopy
+  expect_tools no-ptxas 69 "release: ptxas is not on PATH: the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)"
+  stub ptxas
+  printf '#!/bin/sh\necho %s\n' "$t/sysroot" > "$t/rustc"
+  chmod +x "$t/rustc"
+  expect_tools no-rust-target 69 "release: the aarch64-unknown-linux-gnu target is not installed for $t/sysroot: rustup target add aarch64-unknown-linux-gnu"
+  mkdir -p "$t/sysroot/lib/rustlib/aarch64-unknown-linux-gnu"
+  expect_tools present 0 ""
+  rm -rf "$t"
+
   if [ "$fails" = 0 ]; then
     echo "release: self-test ok ($cases cases)"
   else
@@ -247,16 +360,27 @@ if [ -n "$SELF_TEST" ]; then
   exit $?
 fi
 
-# The archive's arch: a build's is BLOOMERY_ARCH, as tools/arch.sh resolves it; a check's is its argument (empty: the
-# machine's own).
+# The archive's machine: the building machine's own, or the cross one BLOOMERY_RELEASE_TARGET names. The archive's
+# arch: a build's is BLOOMERY_ARCH, as tools/arch.sh resolves it, except that a cross build takes its row's own (the
+# building machine's selection names none of the aarch64 archive's arches, and tools/box.sh exports it into the box
+# command anyway); a check's is its argument (empty: the archive's own).
+set_target "$(uname -m)" "${BLOOMERY_RELEASE_TARGET:-}" || exit $?
 if [ -n "$CHECK_ONLY" ]; then
   ARCH=$CHECK_ARCH
-else
+elif [ -z "$CROSS" ]; then
   # shellcheck source=tools/arch.sh
   source "$ROOT/tools/arch.sh"
   bloomery_arch release/build.sh || exit $?
+else
+  ARCH=
 fi
-set_platform "$(uname -m)" "$ARCH" || exit $?
+set_platform "$MACHINE" "$ARCH" || exit $?
+OBJCOPY=objcopy
+if [ -n "$CROSS" ]; then
+  ARCH=$RELEASE_ARCH
+  cross_platform
+  [ -n "$CHECK_ONLY" ] || { cross_tools || exit $?; }
+fi
 ALLOWED_NEEDED="^(libc\\.so\\.6|libm\\.so\\.6|libgcc_s\\.so\\.1|$LOADER)\$"
 
 if [ -n "$CHECK_ONLY" ]; then
@@ -266,14 +390,26 @@ else
   DIST="$ROOT/target/release-dist"
   STAGE="$DIST/$NAME"
   export CARGO_TARGET_DIR="$ROOT/target/$TARGET_DIR"
-  BIN_DIR="$CARGO_TARGET_DIR/release"
+  target_args=()
+  if [ -n "$CROSS" ]; then
+    # The cubin packer is a host tool: no device code, so the host's plain cargo builds it into the cross dir's host
+    # half, before RUSTFLAGS names the target machine's CPU. The cross build's own binaries land under the triple.
+    env -u RUSTFLAGS cargo build -p bloomery-gpu-gates --release --bin oxart_ptxas
+    BIN_DIR="$CARGO_TARGET_DIR/$TRIPLE/release"
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$LINKER"
+    target_args=(--target "$TRIPLE")
+  else
+    BIN_DIR="$CARGO_TARGET_DIR/release"
+  fi
   # cargo-oxide appends RUSTFLAGS after the project's extra-rustflags, and rustc keeps the last -C target-cpu.
   export RUSTFLAGS="-C target-cpu=$HOST_CPU"
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
-  [ -z "$CUBIN" ] || bin_args+=(--bin oxart_jit)
+  # oxart_jit links the cubins on the building machine's card, so only the GB10's own build wants it; cross, ptxas on
+  # the host makes them and no oxart_jit is built.
+  if [ -n "$CUBIN" ] && [ -z "$CROSS" ]; then bin_args+=(--bin oxart_jit); fi
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
-  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}"
+  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}" ${target_args[@]+"${target_args[@]}"}
 fi
 
 fail=0
@@ -334,6 +470,12 @@ if [ -n "$CHECK_ONLY" ]; then
 fi
 
 for b in "${BINS[@]}"; do
+  if [ -n "$CROSS" ]; then
+    # The cross binary does not run on the build host; the Spark run before the tag stands in for it
+    # (docs/contrib/dgx-spark.md).
+    echo "release: $b --version not run: an aarch64 binary on x86_64 (the Spark run before the tag checks it)"
+    continue
+  fi
   v=$("$CARGO_TARGET_DIR/release/$b" --version)
   case "$v" in
     *"$COMMIT"*) ;;
@@ -348,13 +490,18 @@ done
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin"
-for b in "${BINS[@]}"; do cp "$CARGO_TARGET_DIR/release/$b" "$STAGE/bin/"; done
+for b in "${BINS[@]}"; do cp "$BIN_DIR/$b" "$STAGE/bin/"; done
 if [ -n "$CUBIN" ]; then
   for b in "${BINS[@]}"; do
     f="$STAGE/bin/$b"
-    objcopy --dump-section .oxart="$f.ptx.oxart" "$f"
-    bash tools/gpu-gate.sh --executable "$CARGO_TARGET_DIR/release/oxart_jit" --cubin "$f.ptx.oxart" "$f.cubin.oxart"
-    objcopy --rename-section .oxart=.oxart.ptx --add-section .oxart="$f.cubin.oxart" "$f"
+    "$OBJCOPY" --dump-section .oxart="$f.ptx.oxart" "$f"
+    if [ -n "$CROSS" ]; then
+      # ptxas compiles the bundles on the build host: no card, no gate lock.
+      "$CARGO_TARGET_DIR/release/oxart_ptxas" "$f.ptx.oxart" "$f.cubin.oxart"
+    else
+      bash tools/gpu-gate.sh --executable "$CARGO_TARGET_DIR/release/oxart_jit" --cubin "$f.ptx.oxart" "$f.cubin.oxart"
+    fi
+    "$OBJCOPY" --rename-section .oxart=.oxart.ptx --add-section .oxart="$f.cubin.oxart" "$f"
     rm "$f.ptx.oxart" "$f.cubin.oxart"
   done
   bash "$0" --check "$STAGE/bin"

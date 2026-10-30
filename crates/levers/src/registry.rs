@@ -2758,6 +2758,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          runners set it.",
     ),
     runner(
+        "BLOOMERY_RELEASE_TARGET",
+        Some("release/build.sh"),
+        "`tools/release/build.sh`: `aarch64` builds the GB10 archive cross on an x86_64 \
+         machine; unset builds the machine's own archive. Any other value is refused by \
+         name (64).",
+    ),
+    runner(
         "BLOOMERY_ROUTER_BOUND",
         Some("ref/router-trace.sh"),
         "Seconds `tools/ref/router-trace.sh` lets its harness run.",
