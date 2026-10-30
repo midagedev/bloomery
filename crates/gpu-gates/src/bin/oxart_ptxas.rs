@@ -154,8 +154,8 @@ fn elf_func_names(bytes: &[u8]) -> Option<Vec<String>> {
     let u32r = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
     let u64r = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
     let shoff = u64r(0x28)? as usize;
-    let shentsize = u16r(0x3e)? as usize;
-    let shnum = u16r(0x40)? as usize;
+    let shentsize = u16r(0x3a)? as usize;
+    let shnum = u16r(0x3c)? as usize;
     if shoff == 0 || shentsize < 64 || shnum == 0 {
         return None;
     }
@@ -345,9 +345,9 @@ mod tests {
         out.extend_from_slice(&strtab);
         let sh_off = out.len();
         out[0x28..0x30].copy_from_slice(&(sh_off as u64).to_le_bytes()); // e_shoff
-        out[0x38..0x3a].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
-        out[0x3e..0x40].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
-        out[0x40..0x42].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        out[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        out[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        out[0x3c..0x3e].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
         let shdr =
             |out: &mut Vec<u8>, ty: u32, offset: usize, size: usize, link: u32, entsize: u64| {
                 let base = out.len();
