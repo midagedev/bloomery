@@ -744,7 +744,11 @@ slot holds is refused by name, as `--parallel 1 --slot-ctx S` would be. `--paral
 variable or file entry) is refused by name, and under `BLOOMERY_ROUTE_TRACE` it serves one slot. The `parallel` line names the count it chose
 with `from=auto`. The default stays one slot; auto is never chosen for you.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
-name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
+name. A new request's prompt runs in one call between rounds, and the other streams wait for it. On Qwen3.8, unless the
+MTP draft serves the slots or `--mmproj` loads an image encoder, a prompt with more than 4,096 ids past its cached
+prefix runs instead as calls that end at the multiples of 4,096 positions, one a round between the other streams'
+rounds, so a stream waits for one such call at a time. The calls leave the bits and the cached prefixes of the one
+call.
 
 **Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card. On a 12-16 GB card
 the load sees that the file does not fit the card's free bytes, sends the routed experts to the CPU, and says so
@@ -955,7 +959,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 steps in turn. A new request's prompt runs whole while the other
-  streams wait. The decide seat serves one request at a time, and the nemotron, raon1, solar2 and musespark seats one
+  streams wait (on Qwen3.8 without the MTP draft on the slots or `--mmproj`, a call of 4,096 positions at a time, above). The decide seat serves one request at a time, and the nemotron, raon1, solar2 and musespark seats one
   slot each; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
@@ -1012,7 +1016,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   `span_ids` (the runs fed and their ids), `decisions`, `free_steps`, `next_calls`, `prefill_calls`, `next_after_calls`
   (the calls that fed a run and stepped it), `lead` (the ids the prompt's call carried) and `tail` (the ids taken after
   the last decision with no call). With `--parallel`, a run, and a prompt call with its lead, are calls the engine
-  thread makes one quantum of ids a round beside other busy slots, never inside a step.
+  thread makes on a seat's prompt quantum, one call a round beside other busy slots, never inside a step.
 - Refused by name: any other schema keyword (`oneOf`, `allOf`, `pattern`, `minLength`, `minItems`, `minimum`,
   `minProperties`, a list of types, ...), a `$ref` that points outside the schema or is met again inside the schema it
   points to (a recursive schema), a schema that writes out to more than 4,096 schemas, a schema or a request's tools

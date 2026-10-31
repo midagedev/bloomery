@@ -22,10 +22,9 @@
 //! `ids[n-1]` reach the engine as one [`Engine::prefill_next`], whose default
 //! is those two calls. An engine that names a prompt quantum `q`
 //! ([`Engine::prompt_quantum`]) may see that `prefill` arrive instead as calls
-//! ending at `k + j·q`, the grid
-//! starting again at each cut [`Engine::prefill_splits`] asks for, one a round
-//! between the other busy slots' decode rounds; the quantum's contract makes
-//! the request's bits those of the one call. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
+//! ending at the multiples of `q` inside it, one a round between the other
+//! busy slots' decode rounds; the quantum's contract makes the request's bits
+//! those of the one call. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
 //! `k`, `timings.prompt_n` is the `n − k` ids evaluated, and
 //! `tokens_evaluated` and `usage.prompt_tokens` count the whole prompt, `n`, as
 //! llama-server's do. A chat's image is a span of positions that each carry the
@@ -655,21 +654,25 @@ pub trait Engine: Send {
         self.prefill_marked(run, media, marks)?;
         self.next(last, logits_out)
     }
-    /// The call length `q` at which this engine's prompt work is bit-neutral
-    /// to cut: the calls `ids[a..a + k·q]` then `ids[a + k·q..b]` leave the
-    /// same bits as the one call `ids[a..b]` (every cell of the cache, every
-    /// other state, the next logits, and what a later request keeps of them)
-    /// for any `k`, from any position `a` the engine stands at. While another
-    /// slot is busy generating, the server runs a prompt call of more than one
-    /// quantum as such calls, one a round, a decode round of the busy slots
-    /// between them, so a long prompt does not stall the streams already
-    /// answering. The grid starts at each call the prompt call would run as
-    /// otherwise: its own start, and every cut [`Engine::prefill_splits`]
-    /// asks for, which still cuts. The cuts are then the same whatever the
-    /// load, and each one this contract covers. A seat that answers `Some(q)`
-    /// proves it with a gate of its own: the cut calls against the one call,
-    /// those bits and every id equal. `None` (the default): every prompt call
-    /// runs in one go.
+    /// The position grid `q` on which this engine's prompt work is
+    /// bit-neutral to cut: for a call `ids[a..b]` of more than `q` ids and a
+    /// multiple `c` of `q` inside it, the calls `ids[a..c]` then `ids[c..b]`
+    /// leave the same bits as the one call (every cell of the cache, every
+    /// other state, the next logits, and what a later request keeps of them).
+    /// The grid is the positions', not the call's: an engine that keeps
+    /// checkpoints on a grid of its own (`runtime::seqstate::marks`) names a
+    /// multiple of it, so a cut adds no checkpoint the one call would not
+    /// take. While another slot is busy generating, the server runs a prompt
+    /// call of more than one quantum as such calls, one a round, a decode
+    /// round of the busy slots between them, so a long prompt does not stall
+    /// the streams already answering. The calls the prompt call would run as
+    /// otherwise (cut where [`Engine::prefill_splits`] asks, which still
+    /// cuts) are each cut on the grid when they hold more than `q` ids; a
+    /// multiple inside an image span is not cut. The cuts are then the same
+    /// whatever the load, and each one this contract covers. A seat that
+    /// answers `Some(q)` proves it with a gate of its own: the cut calls
+    /// against the one call, those bits and every id equal. `None` (the
+    /// default): every prompt call runs in one go.
     fn prompt_quantum(&self) -> Option<NonZeroUsize> {
         None
     }

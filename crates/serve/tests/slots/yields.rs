@@ -3,9 +3,9 @@
 //! order: a long prompt that takes a slot while the other decodes runs as calls
 //! of a quantum, a decode round of the other slot between each two, and both
 //! requests give the ids each gives alone; a prompt alone, and every prompt
-//! on an engine that names no quantum, runs in one go as before; the cuts are
-//! counted from the call's start and again from each message mark, whatever
-//! the load; the slot holds after an interleaved prompt what an uninterrupted
+//! on an engine that names no quantum, runs in one go as before; the cuts fall
+//! on the positions' quantum grid and at each message mark, wherever the call
+//! starts and whatever the load; the slot holds after an interleaved prompt what an uninterrupted
 //! one leaves; a client gone between the calls ends its request, the slot
 //! freed and the other stream on; `/slots` shows the prompt's positions as its
 //! calls run; and `prompt_ms` is the prompt's own engine time. A constrained
@@ -435,14 +435,15 @@ fn hw_an_engine_without_a_quantum_runs_every_prompt_in_one_go() {
     assert_eq!(b.json()["tokens"], alone(B5, 6), "B");
 }
 
-/// The cuts of an interleaved prompt are counted from its call's start and
-/// again from each cut the engine asks for at a message, the same whether it
+/// The cuts of an interleaved prompt fall on the multiples of the quantum
+/// and at each cut the engine asks for at a message, the same whether it
 /// arrives at the decoding slot's first round or its eleventh; the call's
 /// note names the mark's cut alone, as the call run in one go does. A
-/// prompt whose cache kept a prefix counts from where its call starts.
+/// prompt whose cache kept a prefix off the grid cuts on the same grid, so
+/// its first call runs to the grid's next position.
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_the_cuts_follow_the_call_and_its_marks_whatever_the_load() {
+fn hw_the_cuts_fall_on_the_grid_and_the_marks_whatever_the_load() {
     assert_eq!(MockTokenizer.encode(MARKED).len(), 5 * Q + 1, "the fixture");
     for k in [2, 12] {
         let log = new_log();
@@ -452,8 +453,8 @@ fn hw_the_cuts_follow_the_call_and_its_marks_whatever_the_load() {
         let calls = calls(&log);
         assert_eq!(
             pieces(&calls, 1),
-            [4, 4, 1, 4, 4, 3],
-            "the cuts 4, 8, the mark 9, then 13, 17 (B at A's round {k}): {calls:?}"
+            [4, 4, 1, 3, 4, 4],
+            "the cuts 4, 8, the mark 9, then 12, 16 (B at A's round {k}): {calls:?}"
         );
         assert_eq!(
             splits(&calls),
@@ -467,7 +468,7 @@ fn hw_the_cuts_follow_the_call_and_its_marks_whatever_the_load() {
     }
     // The first request leaves "bcdefghij" on slot 0, A takes the empty slot
     // 1, and the marked prompt slot 0 again: its call starts at 9, past the
-    // mark, so the cuts are 13 and 17.
+    // mark, and the cuts are 12 and 16, the grid's.
     let head = "bcdefghij";
     for k in [2, 12] {
         let log = new_log();
@@ -483,8 +484,8 @@ fn hw_the_cuts_follow_the_call_and_its_marks_whatever_the_load() {
         let calls = calls(&log);
         assert_eq!(
             pieces(&calls, 0),
-            [4, 4, 3],
-            "the cuts 13, 17 (B at A's round {k}): {calls:?}"
+            [3, 4, 4],
+            "the cuts 12, 16 (B at A's round {k}): {calls:?}"
         );
     }
 }
@@ -785,9 +786,10 @@ fn b_rounds(calls: &[Call]) -> Vec<Vec<Call>> {
 }
 
 /// A constrained request that takes a slot while the other decodes runs each
-/// run of fixed ids as calls of a quantum, a decode round of the other slot
-/// between each two, the last of them stepping the run's last id; the answer's
-/// lead rides the prompt's calls, cut in quanta as the prompt is. On the jump
+/// run of fixed ids as calls cut on the quantum's grid, a decode round of the
+/// other slot between each two, the last of them stepping the run's last id;
+/// the answer's lead rides the prompt's calls, cut on the grid as the prompt
+/// is. On the jump
 /// arm it gives the step arm's ids in fewer calls, and nothing after the last
 /// pick: B makes the prompt's calls and one run's.
 #[test]
@@ -800,7 +802,11 @@ fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
         let (addr, log) = serve_jump(engine, jump);
         let a = post_bg(addr, completion(A, 60));
         assert!(latch.wait_entered(BOUND), "A never decoded");
-        let b = std::thread::spawn(move || post(addr, "/completion", &document()));
+        // A prompt of three ids: the run after the first pick starts off
+        // the quantum's grid, at position 9.
+        let mut body = document();
+        body["prompt"] = json!("abc");
+        let b = std::thread::spawn(move || post(addr, "/completion", &body));
         wait_deferred(addr, 1, BOUND);
         latch.release();
         let (a, b) = (a.join().expect("a"), b.join().expect("b"));
@@ -834,6 +840,30 @@ fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
     );
     assert!(run.len() > 6, "the run is more than six quanta: {jump:?}");
     assert!(lead.iter().chain(&run).all(|&n| n <= Q), "{jump:?}");
+    // Every call but a round's last ends on the quantum's grid: B's position
+    // after it, counted from its fresh slot, is a multiple of the quantum.
+    let mut at = 0;
+    let mut off_grid = Vec::new();
+    for round in &rounds {
+        let mut left = pieces_of(round).len();
+        for c in round {
+            match *c {
+                Call::Pre { n, .. } => {
+                    at += n;
+                    left -= 1;
+                    if left > 0 && !at.is_multiple_of(Q) {
+                        off_grid.push(at);
+                    }
+                }
+                Call::Next { .. } => at += 1,
+                Call::Split { .. } => {}
+            }
+        }
+    }
+    assert!(
+        off_grid.is_empty(),
+        "calls end off the quantum's grid at {off_grid:?}: {jump:?}"
+    );
     // Inside the prompt's calls and inside the run's; the run's first call
     // is the round the prompt's last call joins the running requests in.
     let mut at: Vec<Vec<usize>> = vec![Vec::new()];

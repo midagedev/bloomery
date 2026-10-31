@@ -2704,6 +2704,10 @@ mod gate {
     const CTX_CLOSE: u64 = 64;
     #[cfg(all(test, feature = "checkpoint"))]
     const UB_CLOSE: usize = 8;
+    /// The positions of [`hw_quantum_cuts`]'s load: a prompt past two inner
+    /// marks ([`CHECKPOINT_EVERY`]) and its steps.
+    #[cfg(all(test, feature = "checkpoint"))]
+    const CTX_QUANTUM: u64 = 2 * CHECKPOINT_EVERY as u64 + 64;
 
     /// The checkpoint folder at `$BLOOMERY_QWEN38_FOLDER` loaded with its MTP
     /// layer, two slots of `ctx` positions and ubatches of `ub` rows, its
@@ -3184,6 +3188,105 @@ mod gate {
     fn close_on(m: &mut Qwen38Model, on: bool) -> Result<(), GateError> {
         m.body_parts("(cl)")?.2.set_close(on);
         Ok(())
+    }
+
+    /// (qc) The serve seat's prompt quantum (`Q38::prompt_quantum`, the inner
+    /// checkpoint grid [`CHECKPOINT_EVERY`]): a prompt call cut at the grid's
+    /// positions against the one call ([`quantum_case`]), from a reset to 21
+    /// ids past the second mark, and after a prefix three ids short of the
+    /// first mark to five ids past the second, whose first and last calls
+    /// hold fewer ids than a ubatch walk's fewest ([`Prompt38::GEMM_FROM`]).
+    /// A call that short runs as passes off the grid, from a reset too, and
+    /// as ubatches where it starts or ends on it (`Body38::resolve_prompt`).
+    #[cfg(all(test, feature = "checkpoint"))]
+    #[test]
+    #[ignore = "needs one NVIDIA card and a Qwen3.8 checkpoint folder with MTP at $BLOOMERY_QWEN38_FOLDER"]
+    fn hw_quantum_cuts() -> Result<(), GateError> {
+        let e = CHECKPOINT_EVERY as usize;
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX_QUANTUM as usize)?;
+        let mut m = folder_load(CTX_QUANTUM, ub)?;
+        m.set_mode(bloomery_gpu::model::StepMode::Graph);
+        m.body_parts("(qc)")?.2.set_checkpoints(true);
+        let ids: Vec<u32> = (0..2 * e + 21)
+            .map(|i| 1 + (i * 7919 % 30_011) as u32)
+            .collect();
+        let b = m.body("(qc)")?;
+        let paths: Vec<(usize, bool)> = [
+            (0, Prompt38::Pass),
+            (1, Prompt38::Pass),
+            (e - 3, Prompt38::Gemm),
+            (e, Prompt38::Gemm),
+        ]
+        .into_iter()
+        .map(|(from, want)| {
+            (
+                from,
+                b.resolve_prompt(Prompt38::Auto, from as u32, 3) == want,
+            )
+        })
+        .collect();
+        let mut ok = paths.iter().all(|&(_, p)| p);
+        println!(
+            "(qc) 3 ids from 0 and 1 run as passes, from {} and {e} as ubatches: {paths:?} {}",
+            e - 3,
+            verdict(ok)
+        );
+        for (k, n) in [(0, 2 * e + 21), (e - 3, 2 * e + 5)] {
+            ok &= quantum_case(&mut m, &ids[..n], k)?;
+        }
+        m.body_parts("(qc)")?.2.set_checkpoints(false);
+        if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    /// One (qc) case, checkpoints on: after a reset and `ids[..k]` fed as a
+    /// call, the rest as the serve seat feeds a prompt's calls (each but the
+    /// last `GpuModel::prefill38_with`, the last the closing call
+    /// [`closed_run`], which the seat runs where its last id rides the ubatch
+    /// walk, `GpuModel::closes_by_ubatch`), once as one call and once cut at
+    /// every multiple of [`CHECKPOINT_EVERY`] inside it. The last call rides
+    /// the walk in both, and the cut calls give the one call's argmax, its
+    /// logits' bits, three steps' ids and bits and its checkpoints.
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn quantum_case(m: &mut Qwen38Model, ids: &[u32], k: usize) -> Result<bool, GateError> {
+        let e = CHECKPOINT_EVERY as usize;
+        let n = ids.len();
+        let mut run = |cuts: &[usize]| -> Result<(Closed, bool, Vec<u32>), GateError> {
+            m.reset()?;
+            let mut at = 0;
+            for &c in [k].iter().chain(cuts).filter(|&&c| c > 0) {
+                m.prefill38_with(&ids[at..c], Prompt38::Auto, None)?;
+                at = c;
+            }
+            let folds = m.closes_by_ubatch(n - at, Prompt38::Auto)?;
+            let closed = closed_run(m, &ids[at..], true)?;
+            Ok((closed, folds, m.body("(qc)")?.checkpoints().positions()))
+        };
+        let cuts: Vec<usize> = (k / e + 1..)
+            .map(|j| j * e)
+            .take_while(|&c| c < n - 1)
+            .collect();
+        let (one, one_folds, one_points) = run(&[])?;
+        let (cut, cut_folds, cut_points) = run(&cuts)?;
+        let calls: Vec<usize> = [k]
+            .iter()
+            .chain(&cuts)
+            .zip(cuts.iter().chain([&n]))
+            .map(|(a, b)| b - a)
+            .collect();
+        let ok = cut == one && one_folds && cut_folds && cut_points == one_points;
+        println!(
+            "(qc) {n} ids after {k}: the calls {calls:?} cut at {cuts:?} against the one call: \
+             argmax {} = {}, logits {}, steps' ids {:?} = {:?} and bits {}; the last call folds \
+             {cut_folds} (one call {one_folds}); points {cut_points:?} = {one_points:?} {}",
+            cut.0,
+            one.0,
+            cut.1 == one.1,
+            cut.2.iter().map(|s| s.0).collect::<Vec<_>>(),
+            one.2.iter().map(|s| s.0).collect::<Vec<_>>(),
+            cut.2 == one.2,
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// The target position and the draft's committed store count travel together in a state.
@@ -4684,7 +4787,7 @@ mod gate {
         m.body_parts("(fr)")?.2.set_split_walk(own)?;
         let next = next?;
         let b = m.body("(fr)")?;
-        let (ubatches, units) = match b.resolve_prompt(path, prompt.len()) {
+        let (ubatches, units) = match b.resolve_prompt(path, 0, prompt.len()) {
             Prompt38::Gemm => (b.ubatch_cut(prompt.len()).count(), b.ubatch_units()),
             _ => (0, 0),
         };

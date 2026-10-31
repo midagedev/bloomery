@@ -325,8 +325,8 @@ impl MockEngine {
         }
     }
 
-    /// The same mock naming `quantum` as the length its prompt calls are
-    /// bit-neutral to cut at ([`Engine::prompt_quantum`]), so the server may
+    /// The same mock naming `quantum` as the grid its prompt calls are
+    /// bit-neutral to cut on ([`Engine::prompt_quantum`]), so the server may
     /// run one of its prompts a call a round between the other busy slots'
     /// decode rounds. The mock's bits are the ids themselves, which any cut
     /// leaves unchanged: it lends the gates the cutting, not the neutrality —
@@ -334,7 +334,7 @@ impl MockEngine {
     ///
     /// # Panics
     ///
-    /// When `quantum` is 0: a quantum names a call length.
+    /// When `quantum` is 0: a quantum names a grid of positions.
     #[must_use]
     pub fn with_prompt_quantum(self, quantum: usize) -> Self {
         assert!(quantum > 0, "a prompt quantum of 0 ids");

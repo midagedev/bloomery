@@ -576,7 +576,11 @@ const fn kv_rows_bytes(positions: usize, kv: KvQ8) -> u64 {
 /// batch port, both leaving every position's state and logits bit for bit;
 /// or ubatches of up to the load's size through the same port at their
 /// width, the Q8_0 projections on q8 activations (`wide38`). `Auto` is the
-/// ubatches from [`Prompt38::GEMM_FROM`] positions on and the passes below.
+/// ubatches from [`Prompt38::GEMM_FROM`] positions on and the passes below
+/// ([`Prompt38::resolve`]); a load resolves it with
+/// [`Body38::resolve_prompt`], which also runs a shorter call as ubatches on
+/// an expert tier and where the call starts or ends on the inner checkpoint
+/// grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prompt38 {
     Step,
@@ -4626,14 +4630,24 @@ impl Body38 {
         }
     }
 
-    /// The path a prompt of `n` ids runs on this load: `path` resolved
-    /// ([`Prompt38::resolve`]), but `Auto` runs ubatches at every length on a
-    /// load with an expert tier, whose pass walk has no tier leg (`card38`'s
-    /// `MapCheck` refuses it by name).
+    /// The path a prompt call of `n` ids from position `from` runs on this
+    /// load: `path` resolved ([`Prompt38::resolve`]), but `Auto` runs
+    /// ubatches at every length on a load with an expert tier, whose pass walk
+    /// has no tier leg (`card38`'s `MapCheck` refuses it by name), and for a
+    /// call that starts or ends on the inner checkpoint grid past position 0
+    /// ([`CHECKPOINT_EVERY`]): such a call is a part of a longer call cut
+    /// there (a serve seat's prompt quantum) or a call that runs on from a
+    /// checkpoint kept there, and the one call from an earlier position runs
+    /// its positions there as ubatches cut at that mark, so the call runs as
+    /// they do whatever its length.
     #[must_use]
-    pub fn resolve_prompt(&self, path: Prompt38, n: usize) -> Prompt38 {
+    pub fn resolve_prompt(&self, path: Prompt38, from: u32, n: usize) -> Prompt38 {
+        let on_grid = |p: usize| p > 0 && p.is_multiple_of(CHECKPOINT_EVERY as usize);
         match path {
             Prompt38::Auto if self.tier.is_some() => Prompt38::Gemm,
+            Prompt38::Auto if on_grid(from as usize) || on_grid(from as usize + n) => {
+                Prompt38::Gemm
+            }
             p => p.resolve(n),
         }
     }
@@ -4861,7 +4875,7 @@ impl GpuModel<Body38> {
         const WHAT_C: &str = "qwen4exp closing call";
         let pos = self.pos();
         let body = self.body(WHAT_C)?;
-        if body.resolve_prompt(path, n) != Prompt38::Gemm {
+        if body.resolve_prompt(path, pos, n) != Prompt38::Gemm {
             return Ok(false);
         }
         if !body.marks {
@@ -5007,7 +5021,7 @@ impl GpuModel<Body38> {
                 ),
             ));
         }
-        let resolved = body.resolve_prompt(path, tokens.len());
+        let resolved = body.resolve_prompt(path, self.pos(), tokens.len());
         if resolved == Prompt38::Step && body.hybrid().swap().is_some() {
             return Err(GpuError::shape(
                 WHAT_P,

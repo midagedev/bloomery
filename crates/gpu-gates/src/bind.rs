@@ -51,6 +51,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1412,6 +1413,12 @@ pub trait Seat: 'static {
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
         prefill_then_step(self, ids, row)
     }
+    /// The position grid on which the seat's prompt calls are bit-neutral to
+    /// cut (`serve::Engine::prompt_quantum`), read once at the load. The
+    /// default is `None`: every prompt call runs in one go.
+    fn prompt_quantum(&self) -> Option<NonZeroUsize> {
+        None
+    }
     /// One pass from `last` (`serve::Engine::advance`): the kept tokens into
     /// `out`, and what the draft proposed and kept. Without a draft, one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
@@ -1660,6 +1667,8 @@ pub struct SeatEngine {
     snapshots_async: bool,
     /// [`Seat::media_model`], the opened seat's.
     media: Option<SharedMediaModel>,
+    /// [`Seat::prompt_quantum`], the opened seat's.
+    quantum: Option<NonZeroUsize>,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -1720,6 +1729,7 @@ impl SeatEngine {
                     bool,
                     bool,
                     Option<SharedMediaModel>,
+                    Option<NonZeroUsize>,
                     EngineProps,
                 ),
                 String,
@@ -1746,6 +1756,7 @@ impl SeatEngine {
                         g.snapshots_async(),
                         g.step_stats() && g.slots() >= 2,
                         g.media_model(),
+                        g.prompt_quantum(),
                         g.props(props),
                     )))
                     .is_err()
@@ -1911,9 +1922,9 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, slots, drafts, media, props, counts) = match loaded.recv() {
-            Ok(Ok((c, rows, n, d, ds, sa, counts, m, props))) => {
-                (c.min(defined), rows, n, [d, ds, sa], m, props, counts)
+        let (ctx_max, rows, slots, drafts, media, quantum, props, counts) = match loaded.recv() {
+            Ok(Ok((c, rows, n, d, ds, sa, counts, m, q, props))) => {
+                (c.min(defined), rows, n, [d, ds, sa], m, q, props, counts)
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
@@ -1939,6 +1950,7 @@ impl SeatEngine {
             drafts_sampled: drafts[1],
             snapshots_async: drafts[2],
             media,
+            quantum,
             card,
             props,
             cache_ram,
@@ -3308,6 +3320,11 @@ impl Engine for SeatEngine {
         }
         self.prefill_marked(run, media, marks)?;
         self.next(last, logits_out)
+    }
+
+    /// The seat's ([`Seat::prompt_quantum`]), read once at the load.
+    fn prompt_quantum(&self) -> Option<NonZeroUsize> {
+        self.quantum
     }
 
     /// One command on the engine thread ([`Seat::prefill_row`]).

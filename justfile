@@ -1798,11 +1798,13 @@ gate-gpu-qwen4exp-mtp-share:
 # a state adoption, reset, store walk, slot exchange or cut; the drafted greedy ids equal the plain ones. Then the serve seat's closing
 # call (hw_close_fold): a prompt's last call that runs its last id as its last row, cut anywhere or kept by a cache, gives the one
 # call's first token and its bits (and the later steps' unless that id completes a delta chunk, which the next step folds), its end
-# mark before that id. The whole model on one card, one test at a time: without BLOOMERY_QWEN38_FOLDER a batch
+# mark before that id. Then the serve seat's prompt quantum (hw_quantum_cuts): a prompt cut at the multiples of
+# CHECKPOINT_EVERY, its first and last calls shorter than a ubatch walk's fewest ids, gives the one call's first token, bits,
+# steps and checkpoints. The whole model on one card, one test at a time: without BLOOMERY_QWEN38_FOLDER a batch
 # defers it by name (needs-env).
 [group('v41-load')]
 gate-gpu-qwen4exp-mtp-input:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-mtp-input BLOOMERY_QWEN38_FOLDER && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_REF_MODEL="$BLOOMERY_QWEN38_FOLDER" bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_mtp -- --ignored hw_mtp_input_validity hw_close_fold --nocapture --test-threads 1'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-mtp-input BLOOMERY_QWEN38_FOLDER && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_REF_MODEL="$BLOOMERY_QWEN38_FOLDER" bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_mtp -- --ignored hw_mtp_input_validity hw_close_fold hw_quantum_cuts --nocapture --test-threads 1'
 
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
