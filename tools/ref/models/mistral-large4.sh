@@ -6,10 +6,11 @@
 # The name is the GGUF general.architecture value, so `grep mistral-large4` finds this profile, the reader
 # (crates/model/src/arch/mistrallarge4) and the oracle family (crates/refset/src/arch/mistrallarge4).
 #
-#   MODEL   shard 1 of the six-shard UD-IQ1_S split set (unsloth/Mistral-Large-4-1T-A52B-GGUF, 223 GB), which lives on
-#           the root drive, not under /models. BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored. The
-#           path is the family's identity (refset::arch::mistrallarge4::MODEL): a set names its file's full path,
-#           so the file is not moved or deleted before its sets are re-dumped.
+#   MODEL   shard 1 of the six-shard UD-IQ1_S split set (unsloth/Mistral-Large-4-1T-A52B-GGUF, 223 GB). The files live
+#           on the root drive and /models/Mistral-Large-4-1T-A52B-UD-IQ1_S is a symlink to their directory.
+#           BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored. The path is the family's identity
+#           (refset::arch::mistrallarge4::MODEL): a set names its file's full path, so the file is not moved or
+#           deleted before its sets are re-dumped.
 #   LCPP    mainline llama.cpp at PR 31376's merge, 78feec062d50ec9e8940244cac918ac4480b60cb
 #           (/home/user/llama.cpp-ml4, the CPU backend alone, built by `just build-ml4-lcpp`):
 #           src/models/mistral-large4.cpp is mainline's own graph, so the oracle (tools/ref/mistrallarge4-dump.sh)
@@ -30,4 +31,4 @@
 MODEL_NAME=mistral-large4
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-ml4}"
-MODEL=${BLOOMERY_REF_MODEL:-/home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf}

@@ -1398,7 +1398,9 @@ build-ref-mistrallarge4:
 # has the command); they are taken once and kept in tools/ref/data/mistrallarge4. Predicted wall 1-4 min
 # [derived: docs/cards/mistrallarge4-dump.card], under the CPU lease and its card
 # (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mistrallarge4-dump.card'); DUMP_DRY=1 in that variable prints the
-# dump and stops before the lease.
+# dump and stops before the lease. `BLOOMERY_TIER=fixture just dump-ref-mistrallarge4` dumps the same prompts on the
+# fixture (model::arch::mistrallarge4::fixture: five real layers at a mini width, `fixture generate`'s file) into
+# $BLOOMERY_DATA/fx_ref_mistrallarge4_{a,b}.
 dump-ref-mistrallarge4:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=300 BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump.sh'
 
@@ -1557,7 +1559,10 @@ gate-lfm3-meta:
 # projector's or a DSpark stage's), the [rope | nope] row permutation, then what the reader resolves from the real shard-1 header,
 # checked in beside the test as the fetch's kv/tensor tables and built into a header-only GGUF in the test: the description layer by
 # layer (72 layers, 18 NoPE, 9 KV readers of layer 35, 44 full indexers), the coverage list naming each part no program runs, and
-# the context bound (2048, the indexer's own top-k). Headers only, seconds; the 233 GB file itself is not read.
+# the context bound (2048, the indexer's own top-k); and the fixture clause: the plan of the fixture of the five real layers
+# [0, 1, 17, 35, 39] (model::arch::mistrallarge4::fixture) on that header, read back through the reader as the cut (the
+# arrays rope [T,T,T,F,F], indexer [T,T,F,T,T], cache map [0,1,2,3,3]) with a map, an array, a key and a type that differ
+# refused by name. Headers only, seconds; the 233 GB file itself is not read.
 gate-mistrallarge4-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mistrallarge4 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_meta -- --nocapture'
 

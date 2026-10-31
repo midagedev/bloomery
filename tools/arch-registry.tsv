@@ -19,4 +19,4 @@ gemma-embedding	GemmaEmbedding	yes	no	-
 gemma-embedding2	GemmaEmbedding2	yes	no	-
 flint	Flint	yes	no	-
 muse-spark	MuseSpark	yes	no	musespark
-mistral-large4	MistralLarge4	yes	no	-
+mistral-large4	MistralLarge4	yes	no	mistrallarge4
