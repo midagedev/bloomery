@@ -19,8 +19,8 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept. A request that reads its rows ([`Pick::reads_rows`]: it draws
-//! or asks for probabilities) and follows no program takes its passes through
+//! and kept. A request that reads its rows ([`Pick::reads_rows`]: it draws,
+//! asks for probabilities or follows a program) takes its passes through
 //! [`Engine::advance_sampled`] on an engine that drafts sampled requests
 //! ([`Engine::drafts_sampled`]), the pass lent the request's pick ([`Pick`])
 //! as its sampler: each kept id is the pick a step would make from that
@@ -42,8 +42,8 @@
 //! a step asks for a row, one where it is read and one where a token's text
 //! goes out.
 //!
-//! A request that follows a program ([`GenParams::constraint`]) takes one
-//! [`Engine::next`] a token: each token is the program's pick from the row
+//! A request that follows a program ([`GenParams::constraint`]) takes each
+//! token as the program's pick from its row, a step's or a pass's
 //! ([`crate::constrain::Walk`]) — a forced id as it stands, otherwise the
 //! largest logit among the ids the program allows there, or for a request that
 //! samples or penalizes its sampler's draw with every other id masked out —
@@ -53,7 +53,11 @@
 //! read only where the pick needs it: a token the program
 //! fixes (a forced id, the only child of a choice's node) asks the engine for
 //! none unless the request wants probabilities. A pick the program cannot make ends the request with a
-//! named error ([`GenError::Constrained`]).
+//! named error ([`GenError::Constrained`]). A pass draws one id a kept row, so
+//! the program moves through the kept ids alone and nothing is taken back. A
+//! program held while the model reasons steps until the model's own close
+//! hands it the answer: a pass could keep ids past the close that the
+//! program did not pick.
 //!
 //! That is the step arm. The jump arm (on by default, [`Slot::schema_jump`])
 //! feeds the ids the program fixes in the calls that read the decisions'
@@ -75,8 +79,9 @@
 //! prompt cache holds the answer up to its last decision. A request that
 //! asks for probabilities reads every row, and a penalized one counts the
 //! fixed ids in its history before each draw, so each takes the step arm.
-//! A run shorter than [`MIN_FILL`] ids is stepped: a call of one id is no
-//! cheaper than the step it replaces.
+//! A run shorter than [`MIN_FILL`] ids is taken as the step arm takes it: a
+//! call of one id is no cheaper than the step it replaces. On a drafting
+//! engine either arm's picks ride its passes where it would step.
 //!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
@@ -548,11 +553,16 @@ struct Pick {
     /// The row a sampled request's walk draws from, the ids its program does
     /// not allow masked ([`Draw::Sampled`]), kept for its capacity.
     masked: Vec<f32>,
-    /// The program's refusal of a pick, which the next [`Gen::pump`] returns
-    /// before it takes any token in hand: the generation ends there, every
-    /// id of the pass that drew the refused pick untaken, the ones it kept
-    /// before that pick too.
-    refused: Option<StepError>,
+    /// The rows answered since the pick was last lent to a pass
+    /// ([`Gen::lend_out`]): the place among the pass's rows a refusal names.
+    answered: usize,
+    /// The program's refusal of a pick, with its row's place among its
+    /// pass's (`answered` then). A step's, or a pass's at its first row, the
+    /// next [`Gen::pump`] returns before it takes the token; one at a later
+    /// row is returned once the pass's ids before it are taken
+    /// ([`Gen::advanced`]). The refused pick and every id after it go
+    /// untaken.
+    refused: Option<(usize, StepError)>,
 }
 
 impl Pick {
@@ -575,6 +585,7 @@ impl Pick {
         if let Some(c) = self.probs.as_mut() {
             c.pick(id, row);
         }
+        self.answered += 1;
         id
     }
 
@@ -612,7 +623,7 @@ impl Pick {
                 None => walk.choose(row),
             };
             return picked.unwrap_or_else(|e| {
-                self.refused = Some(e);
+                self.refused = Some((self.answered, e));
                 argmax(row)
             });
         }
@@ -639,10 +650,9 @@ impl Pick {
 /// passes when the engine drafts: one that reads no row greedily
 /// ([`Engine::advance`]), and one that reads its rows ([`Pick::reads_rows`])
 /// on an engine that drafts sampled requests ([`Engine::advance_sampled`]),
-/// each kept id its pick from its verified row. A request that follows a
-/// program steps.
-fn takes_passes(pick: &Pick, engine: &dyn Engine) -> bool {
-    pick.walk.is_none() && pick.held.is_none() && (!pick.reads_rows() || engine.drafts_sampled())
+/// each kept id its pick from its verified row.
+fn takes_passes(reads_rows: bool, engine: &dyn Engine) -> bool {
+    !reads_rows || engine.drafts_sampled()
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -2146,12 +2156,16 @@ pub(crate) struct Gen {
     stopping_word: String,
     truncated: bool,
     /// A pass's rows; 1 steps. A request passes when it reads no row, or
-    /// reads its rows ([`Pick::reads_rows`]) and follows no program on an
-    /// engine that drafts sampled requests.
+    /// reads its rows ([`Pick::reads_rows`]) on an engine that drafts sampled
+    /// requests.
     rows: usize,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
+    /// The program's refusal of a pass's row past its first, returned once
+    /// the ids before it, all `kept` holds, are taken; a stop among them
+    /// drops it.
+    refused_after: Option<StepError>,
     /// The copy of the history a sampled pass lends the engine
     /// ([`Slot::advance_sampled`]), kept for its capacity.
     lent_history: Vec<u32>,
@@ -2226,6 +2240,7 @@ impl Gen {
             held,
             biased_row: Vec::new(),
             masked: Vec::new(),
+            answered: 0,
             refused: None,
         };
         // A greedy request that changes no row reads the logits only for the
@@ -2234,7 +2249,7 @@ impl Gen {
         let reads = pick.reads_rows();
         let holds = pick.held.is_some();
         let logits = vec![0.0f32; if reads { slot.vocab.n_vocab() } else { 0 }];
-        let rows = if takes_passes(&pick, slot.engine.as_ref()) {
+        let rows = if takes_passes(reads, slot.engine.as_ref()) {
             slot.engine.advance_rows()
         } else {
             1
@@ -2271,6 +2286,7 @@ impl Gen {
             rows,
             kept: Vec::with_capacity(rows),
             taken: 0,
+            refused_after: None,
             lent_history: Vec::new(),
             tok: None,
             think: (p.reasoning_budget.is_some() || p.reasoning_loop || holds).then(|| {
@@ -2474,7 +2490,7 @@ impl Gen {
         }
         // A request that passes has its first token from the prompt's step:
         // the passes make at most the rest.
-        let passes = takes_passes(&self.pick, slot.engine.as_ref());
+        let passes = takes_passes(self.pick.reads_rows(), slot.engine.as_ref());
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
             Ok(n) if passes => Some(n.saturating_sub(1)),
             Err(_) if passes => None,
@@ -2701,7 +2717,7 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
         tick: &mut dyn FnMut(&Timings),
     ) -> Result<Need, GenError> {
-        if let Some(e) = self.pick.refused.take() {
+        if let Some((_, e)) = self.pick.refused.take() {
             return Err(e.into());
         }
         if let Some(span) = &self.span {
@@ -2811,6 +2827,9 @@ impl Gen {
                 self.tok = Some(t);
                 continue;
             }
+            if let Some(e) = self.refused_after.take() {
+                return Err(e.into());
+            }
             let (n, len) = (self.n, self.generated.len());
             // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
             if n + len > self.ctx_max {
@@ -2828,10 +2847,12 @@ impl Gen {
             }
             // A pass takes `rows` positions from there, and every token it
             // keeps spends the think budget: it starts only while the budget
-            // holds them all, so no kept token spends past the cap.
+            // holds them all, so no kept token spends past the cap. A held
+            // program's request steps until the program takes over.
             if self.rows > 1
                 && self.think_left() >= self.rows
                 && n + len + self.rows - 1 <= self.ctx_max
+                && self.pick.held.is_none()
             {
                 return Ok(if self.pick.reads_rows() {
                     Need::Sampled(tok)
@@ -3009,8 +3030,19 @@ impl Gen {
         self.tim.book(d);
         book_depths(&mut self.depths, d);
         self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
+        if let Some((at, e)) = self.pick.refused.take_if(|(at, _)| *at > 0) {
+            self.kept.truncate(at);
+            self.refused_after = Some(e);
+        }
         self.tok = Some(self.kept[0]);
         self.taken = 1;
+    }
+
+    /// The request's pick lent to a pass ([`Gen::lend`]), its count of rows
+    /// answered from zero.
+    fn lend_out(&mut self) {
+        self.pick.answered = 0;
+        self.lend();
     }
 
     /// The request's pick into [`Gen::lent`], where every draw of the pass's
@@ -3043,7 +3075,7 @@ impl Gen {
             .draw
             .take()
             .expect("a request's pass sampler is back between passes");
-        self.lend();
+        self.lend_out();
         let (d, draw) = slot.advance_sampled(
             last,
             &self.history,
@@ -3064,7 +3096,7 @@ impl Gen {
     /// until [`Gen::advanced`] takes the round's count.
     pub(crate) fn pass_row(&mut self, slot: usize, last: u32) -> SlotPass<'_> {
         let draw = if self.pick.reads_rows() {
-            self.lend();
+            self.lend_out();
             self.lending = true;
             Some(SlotDraw {
                 history: &self.history,

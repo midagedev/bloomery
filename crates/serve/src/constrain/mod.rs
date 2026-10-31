@@ -27,7 +27,10 @@
 //! allowed logit, so its answer is plain greedy decoding wherever greedy
 //! already obeys the program. A request that samples or penalizes draws with
 //! its own sampler from the row with every id the program does not allow
-//! masked out ([`Draw`]).
+//! masked out ([`Draw`]). On an engine that drafts, the same pick takes
+//! each kept id of a pass from its verified row; a pass stops after the
+//! first pick that is not its draft's, so the walk moves through kept ids
+//! alone.
 //!
 //! The jump arm feeds a run of ids the program fixes ([`Walk::forced_run`])
 //! as one prompt call instead of one step each, and reads the next decision

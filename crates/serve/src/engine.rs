@@ -315,8 +315,8 @@ pub trait Engine: Send {
     }
     /// The most positions one [`Engine::advance`] evaluates: 1 for an engine
     /// without a draft. Past 1 the engine drafts its greedy requests; a request
-    /// that needs the logits row (sampling, a banned id) takes
-    /// [`Engine::advance_sampled`] passes on an engine that
+    /// that needs the logits row (sampling, a banned id, probabilities, a
+    /// program) takes [`Engine::advance_sampled`] passes on an engine that
     /// [`Engine::drafts_sampled`], and plain [`Engine::next`] steps on any
     /// other, since a greedy pass keeps the target's argmax and reads no row.
     /// Under a draft, `next` with `Some(out)` writes the target's row of the
@@ -324,8 +324,9 @@ pub trait Engine: Send {
     fn advance_rows(&self) -> usize {
         1
     }
-    /// One drafted pass for a request that draws (it samples, or bans an id:
-    /// its sampler sets the banned logits to -inf first), by llama.cpp's
+    /// One drafted pass for a request that reads its rows (it samples, bans an
+    /// id, asks for probabilities or follows a program: `sampler` is its pick,
+    /// which reads the row as it needs), by llama.cpp's
     /// `common_sampler_sample_and_accept_n`. `last` and the ids the draft
     /// proposes after it are evaluated together. Then, row by row in position
     /// order, `sampler` takes an id from that row's logits, given `history`

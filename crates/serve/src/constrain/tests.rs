@@ -447,6 +447,160 @@ fn a_bias_reorders_the_allowed_ids_and_lets_in_none() {
     assert_eq!(o.stop, StopKind::Eos);
 }
 
+/// [`Rows`] drafting every request that reads its rows: a pass proposes
+/// [`DRAFTED`] ids after `last`, each the favoured id of its row but every
+/// third one, verifies them on the rows [`Rows`]'s steps would write there,
+/// keeps the rows through the first draw that is not the proposal's and
+/// takes the rest back.
+struct Drafts {
+    rows: Rows,
+    proposals: usize,
+    passes: Arc<Mutex<usize>>,
+}
+
+const DRAFTED: usize = 3;
+
+impl Engine for Drafts {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.rows.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.rows.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.rows.next(last, out)
+    }
+    fn advance_rows(&self) -> usize {
+        DRAFTED + 1
+    }
+    fn drafts_sampled(&self) -> bool {
+        true
+    }
+    fn advance_sampled(
+        &mut self,
+        last: u32,
+        mut history: Vec<u32>,
+        mut sampler: crate::engine::Sampler,
+        out: &mut Vec<u32>,
+    ) -> (
+        Result<crate::engine::Drafted, EngineError>,
+        Vec<u32>,
+        crate::engine::Sampler,
+    ) {
+        *self.passes.lock().expect("the passes") += 1;
+        let (k, n) = (self.rows.k, self.rows.tok.n_vocab());
+        let vocab = u32::try_from(n).expect("a vocabulary fits u32");
+        let mut rows = vec![0.0f32; (DRAFTED + 1) * n];
+        let mut draft = Vec::with_capacity(DRAFTED);
+        for (i, row) in rows.chunks_exact_mut(n).enumerate() {
+            let argmax = match self.rows.next(last, Some(row)) {
+                Ok(g) => g,
+                Err(e) => return (Err(e), history, sampler),
+            };
+            if i < DRAFTED {
+                self.proposals += 1;
+                draft.push(if self.proposals.is_multiple_of(3) {
+                    (argmax + 1) % vocab
+                } else {
+                    argmax
+                });
+            }
+        }
+        let from = history.len();
+        for (i, row) in rows.chunks_exact(n).enumerate() {
+            let id = sampler(row, &history);
+            history.push(id);
+            out.push(id);
+            if draft.get(i) != Some(&id) {
+                break;
+            }
+        }
+        history.truncate(from);
+        self.rows.k = k + out.len();
+        let d = crate::engine::Drafted {
+            proposed: DRAFTED,
+            accepted: out.len() - 1,
+        };
+        (Ok(d), history, sampler)
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.rows.reset()
+    }
+    fn ctx_max(&self) -> usize {
+        self.rows.ctx_max()
+    }
+    fn describe(&self) -> String {
+        "drafted rows".to_owned()
+    }
+}
+
+/// A program's request drafts on an engine that drafts the requests that
+/// read their rows, and takes the steps' ids, text and values on either arm:
+/// greedy where greedy obeys and where only the mask does, sampled, and
+/// asking for probabilities. Each kept id is the program's pick from its own
+/// verified row, so the walk moves through the kept ids alone.
+#[test]
+fn a_drafted_walk_takes_the_steps_ids() {
+    let tok = bytes_tok();
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&weather_schema())).expect("served");
+    let rows = |want: &[u32]| Rows {
+        tok: Arc::clone(&tok),
+        want: want.to_vec(),
+        k: 0,
+        read: Arc::new(Mutex::new(Vec::new())),
+    };
+    let generated = |engine: Box<dyn Engine>, jump: bool, p: &GenParams| {
+        let mut slot = Slot::new(engine).schema_jump(jump);
+        generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+        .expect("a generation")
+    };
+    let mut passed = 0;
+    for want in [ids(&tok, WEATHER), vec![BYTES + u32::from(b'Z'); 200]] {
+        for jump in [false, true] {
+            for (temperature, asks) in [(0.0, false), (0.8, false), (0.0, true)] {
+                let mut p = params(Some(c.clone()), ThinkEntry::Closed);
+                p.sampling.temperature = temperature;
+                p.sampling.seed = 9;
+                let probs = |p: &mut GenParams| {
+                    let ask = asks.then(|| Probs::new(2, tok.n_vocab()));
+                    p.logprobs.clone_from(&ask);
+                    ask
+                };
+                let what = format!("jump {jump}, T {temperature}, asks {asks}");
+                let stepped_ask = probs(&mut p);
+                let stepped = generated(Box::new(rows(&want)), jump, &p);
+                let drafted_ask = probs(&mut p);
+                let n = Arc::new(Mutex::new(0));
+                let drafts = Drafts {
+                    rows: rows(&want),
+                    proposals: 0,
+                    passes: Arc::clone(&n),
+                };
+                let drafted = generated(Box::new(drafts), jump, &p);
+                assert_eq!(drafted.tokens, stepped.tokens, "{what}");
+                assert_eq!(drafted.content, stepped.content, "{what}");
+                assert_eq!(
+                    drafted_ask.map(|a| a.whole(&*tok)),
+                    stepped_ask.map(|a| a.whole(&*tok)),
+                    "{what}"
+                );
+                serde_json::from_str::<Value>(&drafted.content)
+                    .unwrap_or_else(|e| panic!("{what}: {e}: {}", drafted.content));
+                passed += *n.lock().expect("the passes");
+            }
+        }
+    }
+    assert!(passed > 0, "no constrained request passed");
+}
+
 /// The subset past objects and scalars: an integer, an array of a `$ref`'s
 /// strings, an `anyOf` of a number and null, an array of integers.
 fn wide_schema() -> Value {

@@ -6,7 +6,8 @@
 //! (`logit_bias`) draws in those passes too, greedy or sampled, from rows
 //! whose banned ids are at -inf and whose biased ids carry their bias, and so
 //! does a request that asks for probabilities, its values read from the kept
-//! rows. The drafted mock is
+//! rows, or follows a JSON schema, its program's pick taken from each kept
+//! row. The drafted mock is
 //! [`DraftMock`]; its plain twin is the same mock
 //! [`DraftMock::without_sampled`]. Both servers sample with [`penalised`],
 //! whose draws read the history, so a pass that hands the sampler another
@@ -632,6 +633,69 @@ fn hw_an_asking_request_drafts() {
             .any(|c| matches!(c, MockCall::AdvanceSlots(2))),
         "the two slots passed in one call"
     );
+}
+
+/// A request that follows a program drafts: a JSON schema's document on
+/// `/completion`, greedy, sampled and asking for probabilities, takes the
+/// plain twin's ids and text, its passes picking each kept id from its
+/// verified row by the program (a fixed id read from no row, a pick masked to
+/// the ids the program allows there), the program moving through the kept
+/// ids alone.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_constrained_request_drafts() {
+    let (dlog, plog) = (log(), log());
+    let drafted = serve(drafting(4096), &dlog);
+    let plain = serve(drafting(4096).without_sampled(), &plog);
+    let schema = json!({"type": "object", "properties": {
+        "id": {"type": "integer", "enum": [7, 8]}, "ok": {"type": "boolean"},
+        "tag": {"type": "string", "maxLength": 5}}});
+    let rf = json!({"type": "json_schema", "json_schema": {"name": "r", "schema": schema}});
+    let greedy = json!({"prompt": BRANCHY, "n_predict": 120, "response_format": rf});
+    let mut drawn = sampled(BRANCHY, 120, 0.8, 6);
+    drawn["response_format"] = rf;
+    let mut asking = greedy.clone();
+    asking["n_probs"] = json!(2);
+    let mut passed = 0;
+    for body in [&greedy, &drawn, &asking] {
+        let (want, w) = ids_of(plain, body);
+        let (got, v) = ids_of(drafted, body);
+        assert_eq!(got, want, "{body}: {v}");
+        assert_eq!(v["content"], w["content"], "{body}");
+        assert_eq!(
+            v["completion_probabilities"], w["completion_probabilities"],
+            "{body}"
+        );
+        let doc: Value = serde_json::from_str(v["content"].as_str().expect("content"))
+            .unwrap_or_else(|e| panic!("{e}: {v}"));
+        assert!([7, 8].contains(&doc["id"].as_i64().expect("id")), "{doc}");
+        assert_eq!(draft_counts(&w), (0, 0), "{body}: the plain twin drafted");
+        passed += count(&drain(&dlog), MockCall::Sampled);
+    }
+    assert!(passed > 0, "no constrained request passed");
+    // A pass keeps the fixed `a`, then the program refuses its next row's
+    // pick (an infinite penalty leaves no allowed id finite): the two-token
+    // answer ends on `a` as the plain twin's does, the refusal past it unread;
+    // a longer one ends on the plain twin's refusal once `a` is taken.
+    let rf = json!({"type": "json_schema", "json_schema": {"name": "r", "schema": {"enum": ["ab", "ac"]}}});
+    let short = json!({"prompt": "\"abbcc", "n_predict": 2, "n_probs": 1, "temperature": 1, "top_k": 1,
+        "frequency_penalty": 3e38, "response_format": rf});
+    let (want, w) = ids_of(plain, &short);
+    let (got, v) = ids_of(drafted, &short);
+    assert_eq!((got, &v["content"]), (want, &w["content"]), "{v}");
+    assert!(
+        count(&drain(&dlog), MockCall::Sampled) > 0,
+        "the short request passed: {v}"
+    );
+    let mut long = short;
+    long["n_predict"] = json!(8);
+    let ended = |addr| {
+        let r = post(addr, "/completion", &long);
+        (r.status, r.json()["error"].clone())
+    };
+    let want = ended(plain);
+    assert_ne!(want.0, 200, "{want:?}");
+    assert_eq!(ended(drafted), want);
 }
 
 /// [`DraftMock`] whose sampled pass hands its history back with its last id
