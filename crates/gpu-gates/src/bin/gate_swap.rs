@@ -283,6 +283,13 @@
 //!   next pick of it is refused by name, the machine whole, and the end
 //!   lands it with the layers it returns itself, every layer back at its
 //!   start set, the passes after clean (its mutant: the refusal dropped).
+//! - s14 pick failure: with every host expert of layer 2 staging block
+//!   scales that are no UE4M3 scales (its last part, after its first two
+//!   staged), a kept call is refused by name at a pick after the failing
+//!   one, no later step running, and a kept call whose one pick is layer
+//!   2's is refused by name at its end; the machine is broken after both
+//!   (its mutants: the pick's refusal dropped; the kept end's refusal
+//!   dropped).
 //!
 //! Evicted (a host set populated and not locked, whose pages the page cache
 //! lets go): a victim not host-resident when the machine decides is read
@@ -310,8 +317,8 @@ mod gate {
     use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats, RING_SLOTS};
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
     use bloomery_gpu::host::swap::{
-        CallCfg, CallPick, CallReport, HostSite, Leak, LeakReason, MachineCfg, PassReport, Piece,
-        SlotState, SwapMachine, SwapSource, Transform, set_leak_sink,
+        CallCfg, CallPick, CallReport, HostSite, Leak, LeakReason, MachineCfg, Nvfp4From,
+        PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform, set_leak_sink,
     };
     use bloomery_gpu::host::xstream::land_batch_size;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
@@ -507,7 +514,9 @@ mod gate {
     /// `all_resident` or not, and a lane thread's prepare of one leaves
     /// it not resident (the page cache let it go again before the machine
     /// looked) — `slow` ones take `SLOW` to prepare, `fail_source` and
-    /// `panic_source` fail or panic when their bytes are read, every stack
+    /// `panic_source` fail or panic when their bytes are read, `bad_scale`
+    /// ones' last part is block scales that are no UE4M3 scales (the lane's
+    /// transform refuses it after the parts before it staged), every stack
     /// destination of layer `fail_dest` is an error, and each part a copy
     /// moves carries `inflate` more copy stream commands. `dropped_on` gets
     /// the name of the thread that drops the source.
@@ -519,6 +528,7 @@ mod gate {
         slow: Vec<(usize, u32)>,
         fail_source: Option<(usize, u32)>,
         panic_source: Option<(usize, u32)>,
+        bad_scale: Vec<(usize, u32)>,
         fail_dest: Option<usize>,
         inflate: usize,
         /// Every expert host-resident from the load (a churn pool the load's
@@ -848,6 +858,14 @@ mod gate {
             }
             if self.faults.panic_source == Some((layer, id)) {
                 panic!("Synth::source panics on layer {layer} expert {id} (gate_swap's panic arm)");
+            }
+            if part == PARTS - 1 && self.faults.bad_scale.contains(&(layer, id)) {
+                // 0x7F is E4M3's NaN, no UE4M3 scale.
+                static NAN_SCALES: [u8; PART_BYTES[PARTS - 1]] = [0x7F; PART_BYTES[PARTS - 1]];
+                return Ok(Piece {
+                    bytes: &NAN_SCALES,
+                    transform: Transform::Ue4m3Scales(Nvfp4From::Plane),
+                });
             }
             let at = (li(layer) * E + id as usize) * PARTS + part;
             Ok(Piece {
@@ -4476,6 +4494,69 @@ mod gate {
         Ok(ok)
     }
 
+    /// s14 pick failure: every host expert of layer 2 stages its last part
+    /// as block scales that are no UE4M3 scales ([`Faults::bad_scale`]), so
+    /// each job a pick of layer 2 issues fails in the lane's transform after
+    /// its first parts staged, and its copy lands all the same. A kept call
+    /// of the trace's steps is refused by name at a pick after the failing
+    /// one, no step after the failing pick's runs, and the machine is broken;
+    /// a kept call whose one pick is layer 2's is refused by name at its end,
+    /// no report, the machine broken (its mutants: the pick's refusal
+    /// dropped, so the call runs every step; the kept end's refusal dropped,
+    /// so the call ends kept).
+    fn s14(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        let faults = Faults {
+            bad_scale: layer2(N_L[0] as u32..E as u32),
+            ..Faults::default()
+        };
+        let staged = |said: &str, at: &str| {
+            said.contains(at)
+                && said.contains("staging failed for job")
+                && said.contains(&format!("(layer {} expert", LAYERS.start))
+                && said.contains("no UE4M3 scale")
+        };
+        let (p, many) = fresh_call(gpu, pm, trace, faults.clone(), CALL_STEPS, true)?;
+        let many_said = show(&many.err);
+        let broken_p = p.machine.as_ref().is_some_and(|m| m.broken().is_some());
+        let at_pick = staged(&many_said, "SwapMachine::call_pick")
+            && many.values.len() <= 1
+            && many.report.is_none()
+            && broken_p;
+
+        let faults = Faults {
+            all_resident: true,
+            ..faults
+        };
+        let mut e = plain(gpu, pm, faults, DELAY)?;
+        if let Some(err) = &e.err {
+            return Err(format!("gate_swap: s14's machine: {err}").into());
+        }
+        let stream = gpu.stream();
+        let m = e.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut e.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let counts = step_counts(&trace.passes[CALL_STEPS.start].0, 0);
+        let admitted = m
+            .call_pick(stream, &mut e.slots, LAYERS.start, &counts, usize::MAX)?
+            .admitted;
+        let ended = m.end_call(stream, &mut e.slots, true);
+        let end_said = said(&ended);
+        let broken_e = m.broken().is_some();
+        let at_end = admitted > 0 && staged(&end_said, "SwapMachine::end_call") && broken_e;
+        println!(
+            "s14 pick failure: layer {}'s host experts stage block scales that are no UE4M3 \
+             scales; a kept call of {} steps ran {} (stale, double, miss) {:?}, then \"{many_said}\" \
+             refused at a pick {at_pick}, broken {broken_p}; a kept call of one pick ({admitted} \
+             admitted) ended \"{end_said}\", broken {broken_e} {}",
+            LAYERS.start,
+            CALL_STEPS.len(),
+            many.values.len(),
+            errs(&many.values),
+            verdict(at_pick && at_end)
+        );
+        Ok(at_pick && at_end)
+    }
+
     /// A real [`HostTier`] over `stacks`, as `dropq_tier` builds one, its
     /// machine started over a source with `faults`: the engine's caller of
     /// the machine. The caller declares `stacks` first, so they drop after
@@ -5262,6 +5343,7 @@ mod gate {
         ok &= s11(&gpu, &pm, &trace)?;
         ok &= s12(&gpu, &pm, &trace)?;
         ok &= s13(&gpu, &pm, &trace)?;
+        ok &= s14(&gpu, &pm, &trace)?;
         ok &= s7_pick(&gpu, &trace)?;
         ok &= s7_boundary(&gpu, &pm, &trace, &a)?;
         ok &= s7_load(&gpu, &pm)?;
@@ -5288,7 +5370,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a call's end copies its way back under the same bound and waits for its last copy, its copies staging under the call's flush whatever the window says; a call's walk returns each layer after its last read, its copies behind that read, its words back to the call's start only once the engine stream has waited for them, with the end's picks and end state, and no pick or read of a layer after its return; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next, and a pick's landing batches each name their own admits and each land behind their own event; a pick's wait for the lane returns at the call's backlog bound and its `staged_us` reads the wall to the staging of its layer's last job; a call's end copies its way back under the same bound and waits for its last copy, its copies staging under the call's flush whatever the window says; a call's walk returns each layer after its last read, its copies behind that read, its words back to the call's start only once the engine stream has waited for them, with the end's picks and end state, and no pick or read of a layer after its return; a call whose pick's bytes failed to stage is refused at its next pick or its end; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end; one still not resident skips the pick through the tier, and goes to the host counted and followed at a boundary, the load, a reset and a call's end; the lane stages the jobs the window opened one at a time and those a flush or a landing opened on several threads at once, and a ring slot taken again waits for its last copy."
             );
             Ok(())
         } else {

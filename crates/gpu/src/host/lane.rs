@@ -431,7 +431,8 @@ pub(crate) struct Shared {
     /// late-flip ring.
     pub(super) stamps: JobStamps,
     stop: AtomicBool,
-    /// The first staging failure, which the next boundary or reset returns.
+    /// The first staging failure, which the next boundary, reset, call pick
+    /// or call end returns.
     failed: Mutex<Option<StagingFailure>>,
     /// Per lane thread, the jobs it took ([`LaneStats::taken`]).
     taken: [AtomicU64; LANE_THREADS],
@@ -686,7 +687,9 @@ impl Shared {
     /// failure — an error or a panic — is recorded for the next boundary,
     /// which waits for the ticket and refuses before its flip could go live,
     /// and the ticket is published anyway, so the copy stream never hangs on
-    /// it: the bytes it copies land in a slot no entry names.
+    /// it: the bytes it copies land in a slot no entry names, or in a prompt
+    /// call's picked slot, whose call the next pick or its end refuses before
+    /// it stands.
     fn run(&self, me: usize, jobs: &Mutex<mpsc::Receiver<Job>>) {
         loop {
             let taken = jobs.lock().unwrap_or_else(PoisonError::into_inner);

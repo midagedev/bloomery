@@ -167,7 +167,13 @@
 //! whose last pick no reader has waited for is refused by name. The call
 //! ends with every landing slot waited for and live, and either keeps its
 //! placement for the passes after it or returns each layer to the set it
-//! started with.
+//! started with. A pick's landed event follows its copies whether or not
+//! the lane staged their bytes (a failed job publishes its word all the
+//! same), so a slot whose parts never all staged may be read by the call's
+//! compute: the call's next pick refuses a staging failure by name, and its
+//! end waits on the host within the deadline until the lane has finished
+//! every job and refuses one too, so no call that read such a slot ends
+//! standing, kept or not.
 //!
 //! **Returns.** A call not kept may return a layer before its end, once the
 //! call has read the layer for the last time and its host service has run
@@ -1021,8 +1027,9 @@ fn micros(t0: Instant) -> u64 {
 
 /// A staging failure as the machine returns it, the source of a
 /// [`GpuError::Plan`]: the job, its layer and expert, the boundary that
-/// found it (`None` at a reset), and the lane thread's own error, which
-/// is the chain's next link.
+/// found it (`None` elsewhere: a reset, a call's pick or its end, which the
+/// error's `what` names), and the lane thread's own error, which is the
+/// chain's next link.
 #[derive(Debug)]
 pub struct StagingFailed {
     pub boundary: Option<u64>,
@@ -1034,13 +1041,13 @@ pub struct StagingFailed {
 
 impl std::fmt::Display for StagingFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let at = match self.boundary {
-            Some(b) => format!("boundary {b}"),
-            None => "a reset".to_string(),
-        };
+        let at = self
+            .boundary
+            .map(|b| format!(", found at boundary {b}"))
+            .unwrap_or_default();
         write!(
             f,
-            "staging failed for job {} (layer {} expert {}), found at {at}: {}",
+            "staging failed for job {} (layer {} expert {}){at}: {}",
             self.job, self.layer, self.id, self.error
         )
     }
@@ -3419,8 +3426,10 @@ impl SwapMachine {
     /// cannot serve from resident pages once its pages are read in again —
     /// [`GpuError::Unresident`], counted in the call's report, which a
     /// caller can do without ([`crate::host::HostTier::call_pick`]: the pick
-    /// admits nothing). Any error after the first job is sent breaks the
-    /// machine.
+    /// admits nothing). Refused by name, the machine broken: a staging
+    /// failure the lane recorded (an earlier pick's slot the call may have
+    /// read without its bytes). Any error after the first job is sent breaks
+    /// the machine.
     pub fn call_pick(
         &mut self,
         stream: &CudaStream,
@@ -3436,6 +3445,7 @@ impl SwapMachine {
             Some(c) => c.cfg.floor,
             None => return Err(GpuError::state(WHAT, "a prompt call open (begin_call)")),
         };
+        self.refuse_staging_failure(WHAT, None)?;
         let i = self.rule_layer(layer, WHAT)?;
         self.refuse_returned(i, layer, WHAT)?;
         if let Some((s, st)) = self.ledger.landing(layer) {
@@ -3679,8 +3689,11 @@ impl SwapMachine {
     /// the next boundary on ([`PassReport::faulting`]). The flips the call
     /// picked wait here for the boundary after it ([`PassReport::picked`]).
     /// Refused by name, the machine unchanged: no call open. Any error after
-    /// the first change breaks the machine, and so does a call kept whose
-    /// walk returned a layer.
+    /// the first change breaks the machine, and so do a call kept whose
+    /// walk returned a layer and a staging failure: a kept call waits on the
+    /// host within the deadline until the lane has finished every job issued
+    /// and refuses a failure before its placement stays, as a return does
+    /// before its slots go live.
     pub fn end_call(
         &mut self,
         stream: &CudaStream,
@@ -3726,6 +3739,8 @@ impl SwapMachine {
                     "a call kept whose walk returned layers to the call's start",
                 ));
             }
+            self.wait_staged_all(WHAT)?;
+            self.refuse_staging_failure(WHAT, None)?;
             for l in self.layers.clone() {
                 self.agree(l, slots, WHAT)?;
             }
