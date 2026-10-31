@@ -652,6 +652,88 @@ pub fn ssmax_basis(pos: u32) -> f32 {
     (at.ln() + 1.0) as f32 - 1.0
 }
 
+/// One thread's f64 partial of the mean of `x[base .. base + k]`: the sum of
+/// its strided values, each widened before the sum.
+///
+/// # Safety
+/// `base + k <= x.len()` and `tid < RMS_THREADS`.
+#[inline(always)]
+unsafe fn ln_mean(x: &[f32], base: usize, k: usize, tid: usize) -> f64 {
+    let mut acc = 0.0f64;
+    let mut i = tid;
+    while i < k {
+        // SAFETY: i < k, so base + i < base + k <= x.len() (this fn's
+        // contract).
+        acc += f64::from(unsafe { *x.get_unchecked(base + i) });
+        i += RMS_THREADS;
+    }
+    acc
+}
+
+/// One thread's f64 partial of the variance of `x[base .. base + k]` around
+/// `mean`: the sum of the f32-rounded squares of its strided f32 deviations.
+///
+/// # Safety
+/// `base + k <= x.len()` and `tid < RMS_THREADS`.
+#[inline(always)]
+unsafe fn ln_var(x: &[f32], base: usize, k: usize, tid: usize, mean: f32) -> f64 {
+    let mut acc = 0.0f64;
+    let mut i = tid;
+    while i < k {
+        // SAFETY: i < k, so base + i < base + k <= x.len() (this fn's
+        // contract).
+        let dev = unsafe { *x.get_unchecked(base + i) } - mean;
+        acc += f64::from(mul_rn_f32(dev, dev));
+        i += RMS_THREADS;
+    }
+    acc
+}
+
+/// The block's f64 sum of the warps' partials `v` (each lane's widened by the
+/// xor butterfly first): thread `tid` holds its warp's sum at lane 0, the
+/// first warp reduces the per-warp sums through the caller's shared `ws`
+/// ([`RMS_WARPS`] slots), and every thread reads the result — the value all
+/// threads need before the apply pass. The caller's barriers order the slots
+/// against both reads.
+///
+/// # Safety
+/// `tid < RMS_THREADS` and `ws` points to this block's own [`RMS_WARPS`]
+/// shared slots that no concurrent call shares; all threads of the block call
+/// it converged.
+#[inline(always)]
+unsafe fn ln_block_tree(v: f64, tid: usize, ws: *mut f64) -> f64 {
+    let mut acc = v;
+    acc += warp::shuffle_xor_f64(acc, 16);
+    acc += warp::shuffle_xor_f64(acc, 8);
+    acc += warp::shuffle_xor_f64(acc, 4);
+    acc += warp::shuffle_xor_f64(acc, 2);
+    acc += warp::shuffle_xor_f64(acc, 1);
+    // SAFETY: the caller's contract: the block's own slots, the whole block
+    // converged. Lane 0 of each warp writes its slot before the barrier, warp
+    // 0 alone reduces the slots, and the whole block reads slot 0 after the
+    // second barrier.
+    unsafe {
+        let (lane, wid) = (warp::lane_id() as usize, tid / 32);
+        if lane == 0 {
+            *ws.add(wid) = acc;
+        }
+        thread::sync_threads();
+        if wid == 0 {
+            let mut all = 0.0f64;
+            let mut w = 0usize;
+            while w < RMS_WARPS {
+                all += *ws.add(w);
+                w += 1;
+            }
+            if lane == 0 {
+                *ws.add(0) = all;
+            }
+        }
+        thread::sync_threads();
+        *ws.add(0)
+    }
+}
+
 // ---------------------------------------------------------------- kernels
 
 #[cuda_module]
@@ -1531,6 +1613,80 @@ mod elem_kernels {
             );
             let v = x.get_unchecked_mut(t * row + i);
             *v = mul_rn_f32(*v, f);
+        }
+    }
+
+    /// The LayerNorm at `eps` of each row of `k` values of `x`, the row then
+    /// scaled by the gain `gain` and shifted by the bias `bias`
+    /// (`ggml_add(ggml_mul(ggml_norm(x, eps), gain), bias)`, one block a
+    /// row): the mean and the variance each summed in f64 over the row's
+    /// plain values and its f32-rounded deviations ([`ln_mean`] and
+    /// [`ln_var`], the lightning index key's own order), the scale
+    /// `1/√(var + eps)`, then `(dev·scale)·gain + bias` a value with the
+    /// product and the sum each rounded on their own. A variance that is not
+    /// finite leaves the scale NaN (every value NaN) and raises
+    /// [`FaultSite::F32Product`] from lane 0.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= k * m, gain.len() >= k, bias.len() >= k, y.len() >= k * m)
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn ln_rows(
+        x: &[f32],
+        gain: &[f32],
+        bias: &[f32],
+        eps: f32,
+        k: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut WSUM: SharedArray<f64, RMS_WARPS> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform: no barrier is skipped
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let k = k as usize;
+        let base = t * k;
+        // SAFETY: WSUM is this block's own shared allocation.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        // SAFETY: base + k <= m·k <= x.len() (the launch contract) and
+        // tid < 256 = RMS_THREADS; `ws` is this block's own slots and the
+        // whole block reaches the call converged.
+        let mean = (unsafe { ln_block_tree(ln_mean(x, base, k, tid), tid, ws) } / k as f64) as f32;
+        // SAFETY: as for the mean: the same row, slots and converged block.
+        let var =
+            (unsafe { ln_block_tree(ln_var(x, base, k, tid, mean), tid, ws) } / k as f64) as f32;
+        let scale = if var.is_finite() {
+            1.0f32 / (var + eps).sqrt()
+        } else {
+            f32::NAN
+        };
+        if tid == 0 && !var.is_finite() {
+            fault.raise(FaultSite::F32Product);
+        }
+        let mut i = tid;
+        while i < k {
+            // SAFETY: i < k <= gain.len(), bias.len() by the launch contract,
+            // and base + i < (t + 1)·k <= m·k <= x.len(), y.len() (the same
+            // contract); thread i owns entry i of its row.
+            unsafe {
+                let dev = *x.get_unchecked(base + i) - mean;
+                let v = add_rn_f32(
+                    mul_rn_f32(mul_rn_f32(dev, scale), *gain.get_unchecked(i)),
+                    *bias.get_unchecked(i),
+                );
+                *y.get_unchecked_mut(base + i) = v;
+            }
+            i += RMS_THREADS;
         }
     }
 
@@ -3006,6 +3162,60 @@ impl ElemKernels {
             .prepare_ssmax_rows(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
             .ssmax_rows(stream, &prep, x, pos, s, b, d, h, m)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = gain·LayerNorm(x, eps) + bias` over `m` rows of `k`
+    /// values (`ln_rows`): the LayerNorm's mean and variance in f64, the row's
+    /// deviations in f32, each output's two products and sum rounded on their
+    /// own. `gain` and `bias` hold `k` values each. Refused before the launch:
+    /// an empty row or count, short `x`, `gain`, `bias` or `y`. Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
+    pub fn enqueue_ln_rows(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        gain: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        eps: f32,
+        k: usize,
+        m: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_ln_rows";
+        if k == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need k and m >= 1, got k={k} m={m}"),
+            ));
+        }
+        let span = launch_u32(what, "m*k", m.saturating_mul(k))?;
+        if x.len() < span as usize || gain.len() < k || bias.len() < k || y.len() < span as usize {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "x.len() {} and y.len() {} (need {span}), gain.len() {} and bias.len() {} \
+                     (need {k})",
+                    x.len(),
+                    y.len(),
+                    gain.len(),
+                    bias.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m)?;
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_ln_rows(LaunchConfig1D::new(grid, RMS_THREADS_U32, 0))?;
+        self.module
+            .ln_rows(stream, &prep, x, gain, bias, eps, k, m, fault, y)?;
         Ok(())
     }
 
