@@ -591,16 +591,20 @@ fn mistrallarge4_fixture_cut() {
             bad.push(format!("layer {f} cache {:?}", a.cache));
         }
     }
-    // The reader serves every position the fixture trained (64), past the
-    // indexer's own top-k 16 among them; past the trained one is named.
-    // PIN(2026-11-01): R4a's card tier lifted the top-k bound (above).
+    // The reader serves every position the fixture trained, past the
+    // indexer's own top-k 16 among them; past the trained one is named. The
+    // cut copies the source's context_length (key_rule's COPY), 1M.
+    // PIN(2026-11-01): R4a's card tier lifted the top-k bound (above); the
+    // trained context is the copied 1M, not the mini's 64.
     let ctx = model::arch::mistrallarge4::spec::serve_ctx;
-    if ctx(16, s) != Ok(64) || ctx(64, s) != Ok(64) || ctx(65, s).is_ok() {
+    let trained = 1_048_576;
+    if ctx(16, s) != Ok(trained) || ctx(trained, s) != Ok(trained) || ctx(trained + 1, s).is_ok() {
         bad.push(format!(
-            "serve_ctx(16) = {:?}, (64) = {:?}, (65) = {:?}",
+            "serve_ctx(16) = {:?}, ({trained}) = {:?}, ({}) = {:?}",
             ctx(16, s),
-            ctx(64, s),
-            ctx(65, s)
+            ctx(trained, s),
+            trained + 1,
+            ctx(trained + 1, s)
         ));
     }
 
