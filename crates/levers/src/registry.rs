@@ -1783,6 +1783,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          tests point it at their own.",
     ),
     path(
+        "BLOOMERY_LLAMA_BPE_GGUF",
+        None,
+        "The reference's vocabulary test file for that pre-tokenizer, its `.inp` and `.out` \
+         beside it, whose texts the tokenizer crate's vector gate encodes.",
+    ),
+    path(
         "BLOOMERY_LOCK_DIR",
         Some("ref/lease-probe.sh"),
         "The directory of the timing lease, the holds and the gate locks, `/root` when \
