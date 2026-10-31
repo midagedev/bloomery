@@ -2416,6 +2416,7 @@ impl Gemm32Kernels {
         let what = "Gemm32Kernels::enqueue_bf16_mma_norm_gate";
         let t = bf16_mma_launch(what, w, x, n, z)?;
         tail.check_rows(what, w.rows(), n, z.len())?;
+        tail.check_sigmoid(what)?;
         let form = held_form(what, act, MmaForm::Bf16, x, &t)?;
         let prep =
             self.module
@@ -2508,6 +2509,7 @@ impl Gemm32Kernels {
         } = a;
         let t = mxfp8_mma_launch(what, w, x, n, z)?;
         tail.check_rows(what, t.rows as usize, n, z.len())?;
+        tail.check_sigmoid(what)?;
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
         let y = tail.y.cu_deviceptr();
         let into = out.out_planes(stream, what, MmaForm::Mxfp8, (t.rows as usize, n))?;

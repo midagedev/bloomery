@@ -7661,7 +7661,9 @@ mod gate {
             }
             use crate::bench_arm::{N, burst, print_arm, replay};
             use bloomery_gpu::gemm::{MmaForm, Mxfp8NormGateArgs};
-            use bloomery_gpu::linear::norm_gate::{NormGateArgs, NormGateKernels, NormGateTail};
+            use bloomery_gpu::linear::norm_gate::{
+                GdnGate, NormGateArgs, NormGateKernels, NormGateTail,
+            };
             use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
             use gguf::quant::fp32_to_bf16_bits;
             let stream = gpu.stream();
@@ -7807,6 +7809,7 @@ mod gate {
                         let tail = NormGateTail {
                             o,
                             w: &gain,
+                            gate: GdnGate::Sigmoid,
                             eps: 1e-6,
                             fault: sink,
                             y,
@@ -7832,12 +7835,13 @@ mod gate {
                     let mut split = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
                     gpu.clear_fault()?;
                     product(stream, &mut z)?;
-                    norm.enqueue_norm_gate_sigmoid(
+                    norm.enqueue_norm_gate(
                         stream,
                         NormGateArgs {
                             o: &o,
                             z: &z,
                             w: &gain,
+                            gate: GdnGate::Sigmoid,
                             eps: 1e-6,
                             n_v: rows / 128,
                             m: n,
@@ -7983,12 +7987,13 @@ mod gate {
                                     enqueue(s, &mut z, &mut y, &mut out)
                                 } else {
                                     product(s, &mut z)?;
-                                    norm.enqueue_norm_gate_sigmoid(
+                                    norm.enqueue_norm_gate(
                                         s,
                                         NormGateArgs {
                                             o: &o,
                                             z: &z,
                                             w: &gain,
+                                            gate: GdnGate::Sigmoid,
                                             eps: 1e-6,
                                             n_v: rows / 128,
                                             m: n,
@@ -8073,11 +8078,35 @@ mod gate {
                 NormGateTail {
                     o: &o,
                     w: &gain,
+                    gate: GdnGate::Sigmoid,
                     eps: 1e-6,
                     fault: sink,
                     y: &mut y,
                 },
             ));
+            // The epilogue's norm gates by sigmoid alone: a whole head under
+            // a SiLU tail is refused by name, and the site runs that norm
+            // apart.
+            let head = DeviceTensor::upload(stream, &vec![0x3f80_3f80u32; 128 * 32], 128, 32)?;
+            let silu = says(
+                g32.enqueue_bf16_mma_norm_gate(
+                    stream,
+                    &head,
+                    &x,
+                    &act,
+                    1,
+                    &mut z,
+                    NormGateTail {
+                        o: &o,
+                        w: &gain,
+                        gate: GdnGate::Silu,
+                        eps: 1e-6,
+                        fault: sink,
+                        y: &mut y,
+                    },
+                ),
+                "gates by sigmoid",
+            );
             // The MXFP8 entry refuses as the product entry does: a partial
             // head, a misaligned value plane, other scales and a stale form;
             // and an output scratch of another K or without the MXFP8 form.
@@ -8118,6 +8147,7 @@ mod gate {
                             tail: NormGateTail {
                                 o: &o,
                                 w: &gain,
+                                gate: GdnGate::Sigmoid,
                                 eps: 1e-6,
                                 fault: sink,
                                 y: &mut y,
@@ -8166,6 +8196,7 @@ mod gate {
                             tail: NormGateTail {
                                 o: &o2,
                                 w: &gain,
+                                gate: GdnGate::Sigmoid,
                                 eps: 1e-6,
                                 fault: sink,
                                 y: &mut y2,
@@ -8190,15 +8221,15 @@ mod gate {
                 );
                 cols_ok &= cols_refused(MmaForm::Mxfp8)?;
             }
-            let overflow = matches!(norm.enqueue_norm_gate_sigmoid(stream, NormGateArgs {
-                o: &o, z: &z, w: &gain, eps: 1e-6, n_v: 2, m: usize::MAX,
+            let overflow = matches!(norm.enqueue_norm_gate(stream, NormGateArgs {
+                o: &o, z: &z, w: &gain, gate: GdnGate::Sigmoid, eps: 1e-6, n_v: 2, m: usize::MAX,
                 fault: sink, y: &mut y,
             }), Err(e) if e.to_string().contains("overflows"));
             println!(
-                "zgate native={native} partial_head_refused={partial_head} size_overflow_refused={overflow} {}",
-                verdict(partial_head && overflow)
+                "zgate native={native} partial_head_refused={partial_head} silu_refused={silu} size_overflow_refused={overflow} {}",
+                verdict(partial_head && silu && overflow)
             );
-            Ok(ok && partial_head && overflow && mx_refused && cols_ok)
+            Ok(ok && partial_head && silu && overflow && mx_refused && cols_ok)
         }
 
         /// Ragged dense MMA tiles, tails, repeatability and graph replay.

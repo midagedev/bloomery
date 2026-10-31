@@ -33,6 +33,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::mul_rn_f32;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
+pub use model::arch::models::GdnGate;
 use std::sync::Arc;
 
 const _: () = assert!(HEAD == 128 && BLOCK == 128);
@@ -228,11 +229,13 @@ mod norm_gate_kernels {
 
 /// [`NormGateKernels::enqueue_norm_gate`]'s arguments: `m` tokens of the
 /// delta step's `o` and the gate projection's `z` (`[m][n_v][HEAD]`), the
-/// layer's [`HEAD`] gains, and the output `y` of the same shape.
+/// layer's [`HEAD`] gains, the activation of `z` its model gates by, and the
+/// output `y` of the same shape.
 pub struct NormGateArgs<'a> {
     pub o: &'a DeviceBuffer<f32>,
     pub z: &'a DeviceBuffer<f32>,
     pub w: &'a DeviceBuffer<f32>,
+    pub gate: GdnGate,
     pub eps: f32,
     pub n_v: usize,
     pub m: usize,
@@ -240,16 +243,30 @@ pub struct NormGateArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// The norm and gate operands consumed by a product's final store.
+/// The norm and gate operands consumed by a product's final store, with the
+/// activation of `z` the model gates by.
 pub struct NormGateTail<'a> {
     pub o: &'a DeviceBuffer<f32>,
     pub w: &'a DeviceBuffer<f32>,
+    pub gate: GdnGate,
     pub eps: f32,
     pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
 impl NormGateTail<'_> {
+    /// Refused by name as `what`'s unless the tail gates by sigmoid: a
+    /// product epilogue's norm, whose entries carry that gate alone.
+    pub(crate) fn check_sigmoid(&self, what: &'static str) -> Result<(), GpuError> {
+        match self.gate {
+            GdnGate::Sigmoid => Ok(()),
+            GdnGate::Silu => Err(GpuError::shape(
+                what,
+                "the epilogue's norm gates by sigmoid; a SiLU gate runs the norm apart",
+            )),
+        }
+    }
+
     pub(crate) fn check_rows(
         &self,
         what: &'static str,
@@ -313,36 +330,21 @@ impl NormGateKernels {
         Ok(NormGateKernels { module })
     }
 
-    /// Enqueue the gated norm of `args.m · args.n_v` heads with the SiLU
-    /// gate: `⌈m·n_v / 4⌉` blocks of 128 threads. Asynchronous,
-    /// allocation-free, capturable.
+    /// Enqueue the gated norm of `args.m · args.n_v` heads with the gate
+    /// `args.gate` (`gdn_norm_gate` for SiLU, `gdn_norm_gate_sigmoid`):
+    /// `⌈m·n_v / 4⌉` blocks of 128 threads. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_norm_gate(
         &self,
         stream: &CudaStream,
         args: NormGateArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue::<GATE_SILU>(stream, args, "enqueue_norm_gate")
-    }
-
-    /// [`enqueue_norm_gate`](Self::enqueue_norm_gate) with the sigmoid gate.
-    pub fn enqueue_norm_gate_sigmoid(
-        &self,
-        stream: &CudaStream,
-        args: NormGateArgs<'_>,
-    ) -> Result<(), GpuError> {
-        self.enqueue::<GATE_SIGMOID>(stream, args, "enqueue_norm_gate_sigmoid")
-    }
-
-    fn enqueue<const ACT: u32>(
-        &self,
-        stream: &CudaStream,
-        args: NormGateArgs<'_>,
-        what: &'static str,
-    ) -> Result<(), GpuError> {
+        let what = "NormGateKernels::enqueue_norm_gate";
         let NormGateArgs {
             o,
             z,
             w,
+            gate,
             eps,
             n_v,
             m,
@@ -352,6 +354,7 @@ impl NormGateKernels {
         NormGateTail {
             o,
             w,
+            gate,
             eps,
             fault,
             y: &mut *y,
@@ -361,22 +364,25 @@ impl NormGateKernels {
         let n_v = launch_u32(what, "n_v", n_v)?;
         let m = launch_u32(what, "m", m)?;
         let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
-        if ACT == GATE_SILU {
-            let prep = self.module.prepare_gdn_norm_gate(cfg)?;
-            self.module
-                .gdn_norm_gate(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
-        } else {
-            let prep = self.module.prepare_gdn_norm_gate_sigmoid(cfg)?;
-            self.module
-                .gdn_norm_gate_sigmoid(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+        match gate {
+            GdnGate::Silu => {
+                let prep = self.module.prepare_gdn_norm_gate(cfg)?;
+                self.module
+                    .gdn_norm_gate(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+            }
+            GdnGate::Sigmoid => {
+                let prep = self.module.prepare_gdn_norm_gate_sigmoid(cfg)?;
+                self.module
+                    .gdn_norm_gate_sigmoid(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+            }
         }
         Ok(())
     }
 }
 
 /// The host rule of [`NormGateKernels::enqueue_norm_gate`] (`ACT`
-/// [`GATE_SILU`]) and [`NormGateKernels::enqueue_norm_gate_sigmoid`]
-/// ([`GATE_SIGMOID`]): the module doc's numeric contract, op for op, over `o.len() /
+/// [`GATE_SILU`] under [`GdnGate::Silu`], [`GATE_SIGMOID`] under
+/// [`GdnGate::Sigmoid`]): the module doc's numeric contract, op for op, over `o.len() /
 /// HEAD` heads.
 ///
 /// # Panics

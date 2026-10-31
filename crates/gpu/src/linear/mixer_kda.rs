@@ -34,7 +34,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 
 use crate::linear::conv::{KdaBetaScale, KdaConvArgs, KdaGateRule};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
-use crate::linear::norm_gate::NormGateArgs;
+use crate::linear::norm_gate::{GdnGate, NormGateArgs};
 use crate::linear::write_gate::WriteGateArgs;
 use crate::linear::{LinearKernels, LinearShape};
 use crate::{Gpu, GpuError};
@@ -332,12 +332,13 @@ pub fn enqueue(
             row: st.row,
         },
     )?;
-    k.norm_gate.enqueue_norm_gate_sigmoid(
+    k.norm_gate.enqueue_norm_gate(
         stream,
         NormGateArgs {
             o,
             z,
             w: v.gate_norm,
+            gate: GdnGate::Sigmoid,
             eps: d.rms_eps,
             n_v: d.shape.n_v,
             m,

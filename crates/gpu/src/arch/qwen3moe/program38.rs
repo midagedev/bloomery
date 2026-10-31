@@ -62,7 +62,9 @@
 
 use super::body::{ATTN_SCALE_256, KvQ8};
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
-use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site};
+use super::plan38::{
+    GDN, GDN_GATE, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site,
+};
 use super::router::gated;
 use super::scratch::{Append256, Io, cells_view};
 use super::scratch38::{Arena38, Store38, Taps38};
@@ -1292,12 +1294,13 @@ fn gdn_out(
         by,
         ..
     } = s;
-    c.k.linear.norm_gate.enqueue_norm_gate_sigmoid(
+    c.k.linear.norm_gate.enqueue_norm_gate(
         stream,
         NormGateArgs {
             o: &g.o,
             z: &g.z,
             w: f32_gain(w, &gp.ssm_norm)?,
+            gate: GDN_GATE,
             eps: c.eps,
             n_v: nv,
             m,

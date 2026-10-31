@@ -1650,10 +1650,11 @@ pub(crate) fn resident_gemm_bf16(
     wide_by_name(gpu, k, (w, src, rows), x, route, m, y.into())
 }
 
-/// A resident gate projection followed by the shared sigmoid norm, its
-/// output `tail.y` then quantized for the resident sites `readers` into
-/// `out` ([`resident_quantize`]). BF16 and native W8A8 MXFP8 tensor-core
-/// sites finish the norm in their product's store epilogue. The MXFP8
+/// A resident gate projection followed by the shared gated norm under the
+/// model's gate `tail.gate`, its output `tail.y` then quantized for the
+/// resident sites `readers` into `out` ([`resident_quantize`]). BF16 and
+/// native W8A8 MXFP8 tensor-core sites finish a sigmoid-gated norm in their
+/// product's store epilogue. The MXFP8
 /// epilogue also writes the output's MXFP8 form, so it runs only when that
 /// form is all the readers take from `out` ([`only_form`]).
 #[allow(
@@ -1674,13 +1675,14 @@ pub(crate) fn resident_gemm_norm_gate(
     ),
     (readers, (q128, out)): (&[&str], (Option<&mut GemmAct>, &mut GemmAct32)),
 ) -> Result<(), GpuError> {
-    use crate::linear::norm_gate::{NormGateArgs, NormGateTail};
+    use crate::linear::norm_gate::{GdnGate, NormGateArgs, NormGateTail};
     let what = "site::resident_gemm_norm_gate";
     let weight = w.resident(what, name)?;
     let rows = weight.rows();
     let NormGateTail {
         o,
         w: gain,
+        gate,
         eps,
         fault,
         y,
@@ -1688,23 +1690,26 @@ pub(crate) fn resident_gemm_norm_gate(
     let tail = NormGateTail {
         o,
         w: gain,
+        gate,
         eps,
         fault,
         y: &mut *y,
     };
+    // The product epilogues' norm gates by sigmoid alone.
+    let epilogue = gpu.q8f32().dense_mma && gate == GdnGate::Sigmoid;
     let mxfp8 = match weight {
         DevWeight::Mxfp8 { .. } => Some(w.e4m3(what, name)?),
         _ => None,
     };
     match (weight, mxfp8, x.q32, x.f32) {
         (DevWeight::Bf16 { w: packed, .. }, _, Some(act), Some(input))
-            if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, input, m) =>
+            if epilogue && act.holds(MmaForm::Bf16, input, m) =>
         {
             k.g32(what, "the BF16 prompt kernels")?
                 .enqueue_bf16_mma_norm_gate(gpu.stream(), packed, input, act, m, z, tail)?;
         }
         (_, Some(planes), Some(act), Some(input))
-            if gpu.q8f32().dense_mma
+            if epilogue
                 && only_form(gpu, w, readers, out) == Some(MmaForm::Mxfp8)
                 && crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) =>
         {
@@ -1726,12 +1731,13 @@ pub(crate) fn resident_gemm_norm_gate(
         _ => {
             tail.check_rows(what, rows, m, z.len())?;
             resident_gemm(gpu, k, (w, name), x, route, m, z)?;
-            norm.enqueue_norm_gate_sigmoid(
+            norm.enqueue_norm_gate(
                 gpu.stream(),
                 NormGateArgs {
                     o,
                     z,
                     w: gain,
+                    gate,
                     eps,
                     n_v: rows / crate::linear::HEAD,
                     m,
