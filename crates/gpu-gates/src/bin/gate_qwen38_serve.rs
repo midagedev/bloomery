@@ -14,7 +14,8 @@
 //! and a completion whose draft counts are malformed, or one without the
 //! other, fails the arm. Both
 //! conversations restore their cached prefixes on different slots after
-//! the resident slots are erased. A third two-slot lookup server, under the
+//! the resident slots are erased, with the ids each gave re-run from the
+//! cache in its own slot. A third two-slot lookup server, under the
 //! width chooser's cost mode, runs the code and the prose requests
 //! together: their slots take turns at the passes, their ids are the
 //! draft-off server's, and each slot's chooser ends its warm-up
@@ -1637,8 +1638,9 @@ mod gate {
     ///   rejoined there);
     /// - (b) A's first turn resent with the reasoning-stripped reply in place
     ///   of the reply, so the shared prefix ends at the first turn's end: it
-    ///   keeps the checkpoint there (the turn's prompt call's end, one short
-    ///   of the turn: its last id is fed by the first step), the draft on
+    ///   keeps the checkpoint there (the end mark of the turn's prompt call,
+    ///   one short of the turn: that call ran its last id as the ubatch
+    ///   walk's last row, `Q38::prefill_next`), the draft on
     ///   or off, and its ids are a fresh run's of the same ids (every prompt
     ///   call of at least nine ids is the ubatch walk, whose bits do not
     ///   depend on where a call is cut);
@@ -6039,8 +6041,10 @@ mod gate {
         Logprobs,
     }
 
-    /// Two resident slots, then both conversations restored from the prompt
-    /// cache in reverse order: the lookup follows the sequence, not its slot.
+    /// Two resident slots, each conversation re-run from the cache in its own
+    /// slot, then both restored from the prompt cache in reverse order after
+    /// the slots are erased: the lookup follows the sequence, not its slot,
+    /// and a moved restore gives the ids its own slot's re-run gave.
     /// The lookup server's ids are the draft-off server's, sampled requests
     /// included: the lookup takes no card bytes, so both load one plan, and
     /// a seeded draw from a verified row is the draw from that position's
@@ -6054,6 +6058,9 @@ mod gate {
         );
         let prose = "Write the numbers from one to two hundred in English words, separated by \
                      commas: one, two, three, four, five,";
+        // The first request after the erase that empties both slots: the prose
+        // conversation restored on the code's slot, then the code on the prose's.
+        const MOVED: usize = 5;
         let mut args = SERVER_ARGS.to_vec();
         args[11] = "2";
         let mut plain = Vec::<LookupCompletion>::new();
@@ -6079,6 +6086,8 @@ mod gate {
                 (prompt, N_PREDICT, Taken::Greedy),
                 (code.as_str(), 64, Taken::Greedy),
                 (prose, 64, Taken::Greedy),
+                (code.as_str(), 64, Taken::Greedy),
+                (prose, 64, Taken::Greedy),
                 (prose, 64, Taken::Greedy),
                 (code.as_str(), 64, Taken::Greedy),
                 (code.as_str(), 64, Taken::Logprobs),
@@ -6087,7 +6096,7 @@ mod gate {
             .into_iter()
             .enumerate()
             {
-                if i == 1 || i == 3 {
+                if i == 1 || i == MOVED {
                     for slot in 0..2 {
                         let (st, body) = curl(
                             &url(&format!("/slots/{slot}?action=erase")),
@@ -6133,7 +6142,7 @@ mod gate {
                     check(
                         &mut ok,
                         &format!("lookup_{draft}_{i}_draws_off_the_greedy_ids"),
-                        answer.tokens != answers[4].tokens,
+                        answer.tokens != answers[MOVED + 1].tokens,
                     );
                 }
                 if i == 0 {
@@ -6169,13 +6178,20 @@ mod gate {
                 }
                 answers.push(answer);
             }
-            for (fresh, restored) in [(1, 4), (2, 3)] {
+            // PIN(2026-11-01): a moved restore is held to its conversation re-run from the cache
+            // in its own slot, not to the fresh run: since `Engine::prefill_next` a fresh prompt
+            // of at least nine ids runs its last id as the ubatch walk's last row, while a cached
+            // re-run with that id alone left steps it, so fresh and cached ids are no bit pin;
+            // was `answers[fresh].tokens == answers[moved].tokens`.
+            for (fresh, stay, moved) in [(1, 3, MOVED + 1), (2, 4, MOVED)] {
                 check(
                     &mut ok,
                     &format!("lookup_{draft}_{fresh}_moves_slots_with_its_cache"),
-                    answers[fresh].slot != answers[restored].slot
-                        && answers[restored].cache_n > 0
-                        && answers[fresh].tokens == answers[restored].tokens,
+                    answers[stay].slot == answers[fresh].slot
+                        && answers[stay].cache_n > 0
+                        && answers[moved].slot != answers[stay].slot
+                        && answers[moved].cache_n == answers[stay].cache_n
+                        && answers[moved].tokens == answers[stay].tokens,
                 );
             }
             if draft == "lookup" {
