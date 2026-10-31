@@ -2,7 +2,7 @@
 //! selects, and the experts a token keeps.
 
 use crate::ChainError;
-use model::arch::models::shape::{self, MoeShape, RouterBody, RouterInst};
+use model::arch::models::shape::{self, MoeShape, RouterInst};
 
 /// A router's shape as its buffers and launches take it: the instance row a
 /// file's shape selected, and the experts a token keeps.
@@ -13,15 +13,15 @@ pub struct RouterDims {
 }
 
 impl RouterDims {
-    /// The dims of `shape`: its instance row, which must be one of the softmax
-    /// router bodies (`qwen3moe_router_*` or `gated`'s entries), and its
-    /// `top_k`. A shape no row serves, or a row another body owns, is
-    /// refused by name.
+    /// The dims of `shape`: its instance row, which must be one of the
+    /// warp-a-token softmax bodies (the common `softmax_router_*` entries
+    /// or the gated row built beside them), and its `top_k`. A shape no row
+    /// serves, or a row another body owns, is refused by name.
     pub fn of(shape: MoeShape) -> Result<RouterDims, ChainError> {
         const WHAT: &str = "router::RouterDims::of";
         let inst =
             shape::select_router(shape).map_err(|e| ChainError::shape(WHAT, e.to_string()))?;
-        if !matches!(inst.body, RouterBody::Qwen3moe | RouterBody::Qwen35moe) {
+        if !inst.body.is_warp_softmax() {
             return Err(ChainError::shape(
                 WHAT,
                 format!(

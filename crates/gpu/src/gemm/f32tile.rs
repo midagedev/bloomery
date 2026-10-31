@@ -22,7 +22,7 @@
 //! a column past the last as the last column; their sums are not stored.
 //! The output is column-major, `y[c · rows + r]` — the GEMM families'
 //! `y[s][n]`, not `f32_gemv`'s `y[r · m + c]`. The routers' prompt logits
-//! (`qwen3moe_router_logits` and the gated router's) run this body too.
+//! (`softmax_router_logits` and the gated router's) run this body too.
 //!
 //! The rows come from a [`TileRows`]: an F32 weight's values are copied into
 //! the stage as they are ([`F32Rows`], `cp.async`), and an E4M3 weight's

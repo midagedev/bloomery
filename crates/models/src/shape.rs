@@ -66,9 +66,9 @@ impl MoeShape {
 pub enum RouterBody {
     /// `gpu/src/router.rs` `router_topk`: one thread a token, serial sums.
     Topk,
-    /// `gpu/src/route_softmax.rs` `qwen3moe_router_*`: a warp a token,
+    /// `gpu/src/route_softmax.rs` `softmax_router_*`: a warp a token,
     /// four named logits a lane.
-    Qwen3moe,
+    Softmax,
     /// `gpu/src/arch/qwen3moe/router.rs` `qwen35moe_router_*`: a warp a token,
     /// the logits in shared memory, the shared expert's gate as the last row.
     Qwen35moe,
@@ -86,6 +86,17 @@ pub enum RouterBody {
     /// `gpu/src/route_body.rs` `sigmoid_floor_256_6_router*`: sigmoid,
     /// optional selection-only bias and a fixed `2^-14` selected-sum floor.
     SigmoidFloor,
+}
+
+impl RouterBody {
+    /// Whether the body routes a token in one warp of a softmax top-k
+    /// routing: `gpu/src/route_softmax.rs`'s own entries and the gated
+    /// shared-expert row built on them. The chain's router dims serve only
+    /// these bodies.
+    #[must_use]
+    pub const fn is_warp_softmax(self) -> bool {
+        matches!(self, RouterBody::Softmax | RouterBody::Qwen35moe)
+    }
 }
 
 /// One compiled router instance.
@@ -193,13 +204,13 @@ pub const ROUTERS: &[RouterInst] = &[
         at: "gpu/src/router.rs router_topk",
     },
     RouterInst {
-        body: RouterBody::Qwen3moe,
+        body: RouterBody::Softmax,
         rule: SOFTMAX_NORM,
         norm_arg: false,
         experts: 128,
         top_k_min: 1,
         top_k_max: LANE_PICKS,
-        at: "gpu/src/route_softmax.rs qwen3moe_router_*",
+        at: "gpu/src/route_softmax.rs softmax_router_*",
     },
     RouterInst {
         body: RouterBody::Qwen35moe,
