@@ -137,8 +137,10 @@ pub fn layer_seeds(
 /// stages of the layer: an NVFP4 stack's codes, block scales and tensor scale
 /// each one), the bytes a static load uploads for it, read back on `gpu`'s
 /// stream — the count checked and each differing part's first byte. A layer
-/// the machine runs whose source stages no part is refused by name, so no
-/// expert counts as checked with nothing compared.
+/// that holds card slots the machine runs, while its source stages no part
+/// of it, is refused by name, so no expert counts as checked with nothing
+/// compared; a map layer with no card slot (its ledger row empty: a dense
+/// layer, one the plan keeps whole on the host) holds nothing to compare.
 pub fn transform_check(
     gpu: &Gpu,
     machine: &SwapMachine,
@@ -151,7 +153,7 @@ pub fn transform_check(
     for (l, seed) in layers {
         let l = *l;
         let parts = source.part_bytes(l).len();
-        let Some(row) = machine.ledger().row(l) else {
+        let Some(row) = machine.ledger().row(l).filter(|row| !row.is_empty()) else {
             continue;
         };
         if parts == 0 {
