@@ -46,7 +46,7 @@
 //!    routed block: the router's logits (`f32_gemv` of `ffn_gate_inp`'s rows
 //!    — a file of fewer experts than the routing body's 128 lanes carries
 //!    the pads it never picks, `f32::MIN`, written once at load) and the
-//!    softmax top-k routing (`qwen3moe_router_route`: the kept weights
+//!    softmax top-k routing (`softmax_router_route`: the kept weights
 //!    renormalized, the chosen probabilities divided by their sum), the
 //!    i-quant gate·up and down of the picked experts
 //!    (`*_gate_up_sel`, `*_gemv_sel` at the file's own type), their weighted
