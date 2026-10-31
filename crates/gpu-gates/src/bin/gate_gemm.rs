@@ -2714,6 +2714,8 @@ mod gate {
             case_filter().as_deref(),
             Some(
                 "dense_mma"
+                    | "bf16_store"
+                    | "g32_slab"
                     | "mxfp8_w8a8"
                     | "nvfp4_native"
                     | "nvfp4_swiglu"
@@ -5447,6 +5449,125 @@ mod gate {
             Ok(ok && pass)
         }
 
+        /// The halfword a BF16 store check fills its output with first: a cell
+        /// still holding it past the product was not written.
+        const GUARD: u16 = 0xAAAA;
+
+        /// The grouped GEMM's BF16 store against its F32 store of the same
+        /// launch rounded to nearest even, the guard past the cells untouched:
+        /// a synthetic stack of each type a dense site reads over the dense
+        /// table at a ragged and a multi-tile column count, and a type no
+        /// dense site reads refused by name with the output untouched.
+        fn bf16_store_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("bf16_store") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let (rows, k) = (320usize, 2048usize);
+            let ms = [7usize, 300];
+            let max = ms[ms.len() - 1];
+            let mut act = GemmAct::new(stream, max, k)?;
+            let mut route = GemmRoute::new(stream, max, 1)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, max * rows)?;
+            let mut ok = true;
+            for (i, ty) in [
+                GemmWeight::Q3K,
+                GemmWeight::Q4K,
+                GemmWeight::Q5K,
+                GemmWeight::Q6K,
+                GemmWeight::Iq4Xs,
+                GemmWeight::Iq3Xxs,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let words = bytes_to_words(&synthetic(ty, rows * k / 256, 0xbf16 + i as u64));
+                let w = DeviceTensor::upload(stream, &words, rows, words.len() / rows)?;
+                let dense = ty != GemmWeight::Iq3Xxs;
+                for m in ms {
+                    let x = DeviceBuffer::from_host(stream, &activations(k, m, 9900 + m as u32))?;
+                    gpu.enqueue_quantize_gemm(&x, m, &mut act, sink)?;
+                    dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                    macro_rules! args {
+                        ($y:expr) => {
+                            GemmArgs {
+                                ty,
+                                w: &w,
+                                rows_per_expert: rows,
+                                act: &act,
+                                route: &route,
+                                input: GemmInput::PerSlot,
+                                y: $y,
+                            }
+                        };
+                    }
+                    let mut yb = DeviceBuffer::from_host(stream, &vec![GUARD; m * rows + 16])?;
+                    let got = dev.gk.enqueue_gemm_bf16(stream, args!(&mut yb));
+                    let yb = yb.to_host_vec(stream)?;
+                    let (cells, guard) = yb.split_at(m * rows);
+                    let pass = guard.iter().all(|&b| b == GUARD)
+                        && if dense {
+                            got.is_ok() && {
+                                dev.gk.enqueue_gemm(stream, args!(&mut y))?;
+                                let f = y.to_host_vec(stream)?;
+                                cells
+                                    .iter()
+                                    .zip(&f[..m * rows])
+                                    .all(|(&b, &v)| b == cuda_device::convert::f32_to_bf16_rne(v))
+                            }
+                        } else {
+                            cells.iter().all(|&b| b == GUARD)
+                                && matches!(
+                                    &got,
+                                    Err(GpuError::Shape { what, .. })
+                                        if *what == "GemmKernels::enqueue_gemm_bf16"
+                                )
+                        }
+                        && gpu.take_fault()?.is_none();
+                    println!(
+                        "gemm32 case=bf16_store ty={ty:?} m={m} rows={rows} K={k} dense_site={dense} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
+        /// The BF16 store of the product `f32` of `w` over `act` and the
+        /// table `route`: each cell `f32` rounded to nearest even
+        /// and the guard past the cells untouched.
+        fn bf16_product32(
+            dev: &Dev<'_>,
+            w: Gemm32Weight<'_>,
+            rows: usize,
+            (act, route): (&GemmAct32, &GemmRoute),
+            f32: &[f32],
+        ) -> Result<bool, GateError> {
+            let stream = dev.gpu.stream();
+            let mut yb = DeviceBuffer::from_host(stream, &vec![GUARD; f32.len() + 16])?;
+            dev.g32.enqueue_gemm32_bf16(
+                stream,
+                Gemm32Args {
+                    w,
+                    rows_per_expert: rows,
+                    act,
+                    route,
+                    input: GemmInput::PerSlot,
+                    y: &mut yb,
+                },
+            )?;
+            let yb = yb.to_host_vec(stream)?;
+            let (cells, guard) = yb.split_at(f32.len());
+            Ok(guard.iter().all(|&b| b == GUARD)
+                && cells
+                    .iter()
+                    .zip(f32)
+                    .all(|(&b, &v)| b == cuda_device::convert::f32_to_bf16_rne(v)))
+        }
+
         /// Both Q8_0-plane entries over the dense table on one stack of
         /// 4112 rows at K 2560 and K 2592 (11.2 and 11.3 MB of planes, past
         /// `GEMM32_RASTER_BYTES`): 16, 65 and 1100 columns, each against the
@@ -5536,9 +5657,11 @@ mod gate {
                         first,
                         ..
                     } = check(&w, false, SLAB_ROWS, &ha, &|_| Some(0), &|s| s, &got, m)?;
+                    let bf16 = bf16_product32(dev, weight, SLAB_ROWS, (&act, &route), &got)?;
                     let fault = gpu.take_fault()?;
                     let pass = act_ok
                         && dec
+                        && bf16
                         // PIN(2026-10-20): captured entry and grid replace the recomputed selector assertion.
                         && entry_ok
                         && unwritten == 0
@@ -5547,7 +5670,7 @@ mod gate {
                         && fault.is_none();
                     println!(
                         "gemm32 case=g32_slab K={k} m={m} rows={SLAB_ROWS} grid={grid} \
-                         entry={} entry_ok={entry_ok} act_eq_host={act_ok} decode_vs_ggml={dec} unwritten={unwritten} \
+                         entry={} entry_ok={entry_ok} act_eq_host={act_ok} decode_vs_ggml={dec} bf16_eq_f32_rne={bf16} unwritten={unwritten} \
                          checked={checked} worst_err_over_band={worst:.3} band_off={band_off} \
                          contract_bits_differ={bits_off} y_fnv={:016x} {}",
                         entry.name,
@@ -9378,43 +9501,21 @@ mod gate {
                         .iter()
                         .all(|v| v.to_bits() == SENT.to_bits());
                     // The BF16 product: each cell the F32 one rounded to nearest even, the
-                    // tail untouched; a scratch without the native form is refused by name.
-                    let bf16_eq = fused || {
-                        const GUARD: u16 = 0xAAAA;
-                        let mut yb =
-                            DeviceBuffer::from_host(stream, &vec![GUARD; slots * rows + 16])?;
-                        let got = dev.g32.enqueue_gemm32_bf16(
-                            stream,
-                            Gemm32Args {
-                                w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
-                                    qs: &wq,
-                                    e: &we,
-                                    scales: &ws,
-                                }),
-                                rows_per_expert: rows,
-                                act: &act,
-                                route: &route,
-                                input: GemmInput::PerSlot,
-                                y: &mut yb,
-                            },
-                        );
-                        if native {
-                            got?;
-                            let yb = yb.to_host_vec(stream)?;
-                            let (cells, guard) = yb.split_at(slots * rows);
-                            cells
-                                .iter()
-                                .zip(&eager)
-                                .all(|(&b, &v)| b == cuda_device::convert::f32_to_bf16_rne(v))
-                                && guard.iter().all(|&b| b == GUARD)
-                        } else {
-                            matches!(
-                                &got,
-                                Err(bloomery_gpu::GpuError::Shape { what, .. })
-                                    if *what == "Gemm32Kernels::enqueue_gemm32_bf16"
-                            )
-                        }
-                    };
+                    // tail untouched, on the native product and the Q8 one alike.
+                    // PIN(2026-11-01): the Q8 NVFP4 arm has a BF16 store; its product and tail
+                    // are checked where its refusal was.
+                    let bf16_eq = fused
+                        || bf16_product32(
+                            dev,
+                            Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
+                                qs: &wq,
+                                e: &we,
+                                scales: &ws,
+                            }),
+                            rows,
+                            (&act, &route),
+                            &eager[..slots * rows],
+                        )?;
                     let host_want = if host {
                         let (ha, _) = host_act(&x_host, k, slots);
                         let host_w: Vec<i8> = (0..rows * k)
@@ -9971,6 +10072,7 @@ mod gate {
             ok &= f32tile_case(&dev)?;
             ok &= dense_mma_case(&dev)?;
             ok &= norm_gate_case(gpu, false)?;
+            ok &= bf16_store_case(&dev)?;
             ok &= mxfp8_w8a8_case(&dev)?;
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());

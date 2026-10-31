@@ -1685,7 +1685,8 @@ macro_rules! gemm_block {
                         // thread's.
                         unsafe {
                             let slot = *$cols.get_unchecked(first + u / GEMM_BM) as usize;
-                            *$y.get_unchecked_mut(slot * rows_n + r) = f32::NAN;
+                            *$y.get_unchecked_mut(slot * rows_n + r) =
+                                $crate::gemm::f32tile::ProductCell::of(f32::NAN);
                         }
                     }
                     u += GEMM_THREADS;
@@ -1786,7 +1787,8 @@ macro_rules! gemm_block {
                         // lane of one block writes each (slot, row).
                         unsafe {
                             let slot = *$slot_sh.add(n) as usize;
-                            *$y.get_unchecked_mut(slot * $rows_n + r) = $acc[j0 + i];
+                            *$y.get_unchecked_mut(slot * $rows_n + r) =
+                                $crate::gemm::f32tile::ProductCell::of($acc[j0 + i]);
                         }
                     }
                     i += 1;
@@ -2099,14 +2101,14 @@ pub(super) fn q3k_scale_word(a0: u32, a1: u32, a2: u32, hh: usize, pp: usize) ->
 /// number of words per row), K = `act.k()`; `route` is the table its last
 /// fill left; `input` picks each slot's activation column; `y` holds
 /// `n_slots · rows_per_expert` f32, slot-major.
-pub struct GemmArgs<'a> {
+pub struct GemmArgs<'a, Y = f32> {
     pub ty: GemmWeight,
     pub w: &'a DeviceTensor<u32>,
     pub rows_per_expert: usize,
     pub act: &'a GemmAct,
     pub route: &'a GemmRoute,
     pub input: GemmInput,
-    pub y: &'a mut DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<Y>,
 }
 
 /// A GEMM launch's checked shape, as the entries take it.
@@ -2130,7 +2132,10 @@ impl GemmLaunch {
     /// aligned and under 2^30 words (its staging copies), whole tokens of
     /// `top_k`, and room in `act` and `y` for every slot; then every launch
     /// argument in `u32`.
-    fn check(what: &'static str, a: &GemmArgs<'_>) -> Result<GemmLaunch, GpuError> {
+    fn check<Y: cuda_core::DeviceCopy>(
+        what: &'static str,
+        a: &GemmArgs<'_, Y>,
+    ) -> Result<GemmLaunch, GpuError> {
         let GemmArgs {
             ty,
             w,
@@ -2237,6 +2242,34 @@ impl GemmLaunch {
     }
 }
 
+/// One grouped GEMM entry's launch over `a`'s operands and checked shape `g`.
+macro_rules! launch_gemm {
+    ($k:ident, $stream:ident, $cfg:ident, $g:ident, $a:ident, $prepare:ident, $entry:ident) => {{
+        let prep = $k.module.$prepare($cfg)?;
+        $k.module.$entry(
+            $stream,
+            &prep,
+            $a.w.buf(),
+            &$a.act.q6,
+            &$a.act.s8,
+            &$a.act.d8,
+            &$a.route.cols,
+            &$a.route.tiles,
+            &$a.route.n_tiles,
+            $g.n_experts,
+            $g.rows,
+            $g.n_sb,
+            $g.half_it,
+            $g.act_cols,
+            $g.n_slots,
+            $g.max_tiles,
+            $g.slot_div,
+            $g.row_tiles,
+            $a.y,
+        )?;
+    }};
+}
+
 impl GemmKernels {
     /// Enqueue `y[s][r] = Σ_k w[e(s)][r][k] · x[c(s)][k]` for every slot of
     /// the last fill of the route table ([`GemmArgs`] names each operand).
@@ -2245,54 +2278,106 @@ impl GemmKernels {
     /// word says so.
     pub fn enqueue_gemm(&self, stream: &CudaStream, a: GemmArgs<'_>) -> Result<(), GpuError> {
         let g = GemmLaunch::check("GemmKernels::enqueue_gemm", &a)?;
-        let GemmArgs {
-            ty,
-            w,
-            act,
-            route,
-            y,
-            ..
-        } = a;
         let cfg = LaunchConfig1D::new(g.grid, GEMM_THREADS_U32, 0);
-        macro_rules! launch {
-            ($prepare:ident, $entry:ident) => {{
-                let prep = self.module.$prepare(cfg)?;
-                self.module.$entry(
-                    stream,
-                    &prep,
-                    w.buf(),
-                    &act.q6,
-                    &act.s8,
-                    &act.d8,
-                    &route.cols,
-                    &route.tiles,
-                    &route.n_tiles,
-                    g.n_experts,
-                    g.rows,
-                    g.n_sb,
-                    g.half_it,
-                    g.act_cols,
-                    g.n_slots,
-                    g.max_tiles,
-                    g.slot_div,
-                    g.row_tiles,
-                    y,
-                )?;
-            }};
+        match a.ty {
+            GemmWeight::Q3K => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_q3k, gemm_q3k),
+            GemmWeight::Q4K => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_q4k, gemm_q4k),
+            GemmWeight::Q5K => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_q5k, gemm_q5k),
+            GemmWeight::Q6K => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_q6k, gemm_q6k),
+            GemmWeight::Iq2Xxs => {
+                launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq2xxs, gemm_iq2xxs);
+            }
+            GemmWeight::Iq2Xs => {
+                launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq2xs, gemm_iq2xs);
+            }
+            GemmWeight::Iq2S => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq2s, gemm_iq2s),
+            GemmWeight::Iq1S => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq1s, gemm_iq1s),
+            GemmWeight::Iq1M => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq1m, gemm_iq1m),
+            GemmWeight::Iq3Xxs => {
+                launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq3xxs, gemm_iq3xxs);
+            }
+            GemmWeight::Iq3S => launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq3s, gemm_iq3s),
+            GemmWeight::Iq4Xs => {
+                launch_gemm!(self, stream, cfg, g, a, prepare_gemm_iq4xs, gemm_iq4xs);
+            }
         }
-        match ty {
-            GemmWeight::Q3K => launch!(prepare_gemm_q3k, gemm_q3k),
-            GemmWeight::Q4K => launch!(prepare_gemm_q4k, gemm_q4k),
-            GemmWeight::Q5K => launch!(prepare_gemm_q5k, gemm_q5k),
-            GemmWeight::Q6K => launch!(prepare_gemm_q6k, gemm_q6k),
-            GemmWeight::Iq2Xxs => launch!(prepare_gemm_iq2xxs, gemm_iq2xxs),
-            GemmWeight::Iq2Xs => launch!(prepare_gemm_iq2xs, gemm_iq2xs),
-            GemmWeight::Iq2S => launch!(prepare_gemm_iq2s, gemm_iq2s),
-            GemmWeight::Iq1S => launch!(prepare_gemm_iq1s, gemm_iq1s),
-            GemmWeight::Iq1M => launch!(prepare_gemm_iq1m, gemm_iq1m),
-            GemmWeight::Iq3Xxs => launch!(prepare_gemm_iq3xxs, gemm_iq3xxs),
-            GemmWeight::Iq3S => launch!(prepare_gemm_iq3s, gemm_iq3s),
-            GemmWeight::Iq4Xs => launch!(prepare_gemm_iq4xs, gemm_iq4xs),
+        Ok(())
+    }
+
+    /// [`GemmKernels::enqueue_gemm`] storing each output as its BF16 bits,
+    /// the F32 output rounded to nearest even, for the types a dense site
+    /// reads (Q3_K, Q4_K, Q5_K, Q6_K and IQ4_XS: `site::gemm`'s); another
+    /// type is refused by name.
+    pub fn enqueue_gemm_bf16(
+        &self,
+        stream: &CudaStream,
+        a: GemmArgs<'_, u16>,
+    ) -> Result<(), GpuError> {
+        let what = "GemmKernels::enqueue_gemm_bf16";
+        let g = GemmLaunch::check(what, &a)?;
+        let cfg = LaunchConfig1D::new(g.grid, GEMM_THREADS_U32, 0);
+        match a.ty {
+            GemmWeight::Q3K => {
+                launch_gemm!(
+                    self,
+                    stream,
+                    cfg,
+                    g,
+                    a,
+                    prepare_gemm_q3k_bf16,
+                    gemm_q3k_bf16
+                );
+            }
+            GemmWeight::Q4K => {
+                launch_gemm!(
+                    self,
+                    stream,
+                    cfg,
+                    g,
+                    a,
+                    prepare_gemm_q4k_bf16,
+                    gemm_q4k_bf16
+                );
+            }
+            GemmWeight::Q5K => {
+                launch_gemm!(
+                    self,
+                    stream,
+                    cfg,
+                    g,
+                    a,
+                    prepare_gemm_q5k_bf16,
+                    gemm_q5k_bf16
+                );
+            }
+            GemmWeight::Q6K => {
+                launch_gemm!(
+                    self,
+                    stream,
+                    cfg,
+                    g,
+                    a,
+                    prepare_gemm_q6k_bf16,
+                    gemm_q6k_bf16
+                );
+            }
+            GemmWeight::Iq4Xs => {
+                launch_gemm!(
+                    self,
+                    stream,
+                    cfg,
+                    g,
+                    a,
+                    prepare_gemm_iq4xs_bf16,
+                    gemm_iq4xs_bf16
+                );
+            }
+            ty => {
+                return Err(GpuError::shape(
+                    what,
+                    format!("{ty:?} has no BF16 store; a dense site's K-quant does"),
+                ));
+            }
         }
         Ok(())
     }

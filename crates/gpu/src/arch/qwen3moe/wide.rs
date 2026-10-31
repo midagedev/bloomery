@@ -738,7 +738,7 @@ fn neox_128_in(
         sink,
         b.normed,
         t,
-        &[n.q_ty, n.k_ty, n.v_ty],
+        WideActs::wants_of(&[n.q_ty, n.k_ty, n.v_ty]),
     )?;
     let input = b.hid.input(b.normed);
     for (name, ty, rows, y) in [
@@ -834,8 +834,14 @@ fn neox_128_core(
         },
         n.flash,
     )?;
-    b.out
-        .quantize(gpu, &wide_kernels(k), sink, b.attn, t, &[n.o_ty])
+    b.out.quantize(
+        gpu,
+        &wide_kernels(k),
+        sink,
+        b.attn,
+        t,
+        WideActs::wants_of(&[n.o_ty]),
+    )
 }
 
 /// The head-128 half's output side at `t` rows over `b`'s views: the output
