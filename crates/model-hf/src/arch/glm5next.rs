@@ -1389,7 +1389,7 @@ mod tests {
                 ("layers.3.mlp.experts.0.down_proj.weight", Dtype::U32, false),
                 ("layers.1.self_attn.q_b_proj.weight", Dtype::U32, true),
                 ("layers.1.mlp.experts.0.down_proj.weight", Dtype::U32, true),
-                ("visual.blocks.0.attn.qkv.weight", Dtype::F16, false),
+                ("visual.blocks.0.attn.qkv.weight", Dtype::U16, false),
                 ("visual.blocks.0.attn.qkv.weight", Dtype::U32, false),
             ] {
                 let refused = format!("{prefix}{suffix}");

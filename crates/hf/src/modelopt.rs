@@ -30,9 +30,10 @@
 //! to 8 bits here.
 //!
 //! MLX's affine quantization stores a weight `<stem>.weight` as U32 words holding `bits`-bit codes
-//! along the last dim, with `<stem>.scales` and `<stem>.biases`, BF16 `[.., k/64]`, one pair a
-//! group of 64 values; a value is `scale · code + bias`. A routed stack is one tensor whose first
-//! dim is the experts. GGUF's MLX_A4 and MLX_A8 blocks ([`gguf::quant::dequant_row`]) hold one
+//! along the last dim, with `<stem>.scales` and `<stem>.biases`, BF16 or F16 `[.., k/64]` (one
+//! dtype for both of a weight), one pair a group of 64 values; a value is `scale · code + bias`. A
+//! routed stack is one tensor whose first dim is the experts. GGUF's MLX_A4 and MLX_A8 blocks (BF16
+//! pairs) and MLX_A4H and MLX_A8H blocks (F16 pairs) ([`gguf::quant::dequant_row`]) hold one
 //! group: its code words, then its scale, then its bias. The reader (`mlx_affine`) moves those
 //! bytes group by group and computes none of them.
 
@@ -132,8 +133,9 @@ pub struct Normal {
 /// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
 /// | NVFP4 compressed-tensors | as NVFP4, `.scale` the reciprocal of `weight_global_scale` | as NVFP4 |
 /// | F8_E4M3 with one scale a block (MXFP8's E8M0 a 32 values, an FP8 block format's), a row or the tensor | the card type the format is held in ([`Format::card_type`]): [`GgmlType::FP8_B128`] or [`GgmlType::MXFP8`], values as stored, each row block the scale of the checkpoint's block it lies in (`fp8`) | none |
-/// | MLX affine, 4 or 8 bits, groups of 64 | the card type the format is held in: [`GgmlType::MLX_A4`] or [`GgmlType::MLX_A8`], each group's words, scale and bias as stored, a stack one tensor `[k, rows, n_expert]` (`mlx_affine`) | none |
+/// | MLX affine, 4 or 8 bits, groups of 64 | the card type the format is held in: [`GgmlType::MLX_A4`] or [`GgmlType::MLX_A8`] for BF16 scales and biases, [`GgmlType::MLX_A4H`] or [`GgmlType::MLX_A8H`] for F16 ones, each group's words, scale and bias as stored, a stack one tensor `[k, rows, n_expert]` (`mlx_affine`) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
+/// | F16 | F32 only, each value widened exactly; Q8_0 and BF16 have no type for it | none |
 /// | BF16, F32, or F8_E4M3 held as FP8_B128 | [`Use::Q8_0`]: Q8_0, an FP8 weight decoded exactly and quantized again | none |
 /// | FP8 with one tensor scale (its companion) | as above | [`GgmlType::F8E4M3_ROWS`], bytes as stored |
 ///
@@ -151,7 +153,8 @@ pub fn type_of(format: Format, role: Use) -> Option<u32> {
             | Format::Fp8Block { .. }
             | Format::Fp8Channel
             | Format::Fp8Tensor
-            | Format::MlxAffine { .. },
+            | Format::MlxAffine { .. }
+            | Format::MlxAffineF16 { .. },
             Use::Matrix(_),
         ) => format.card_type().map(GgmlType::as_u32),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::Q8_0) | Use::Q8_0) => {
@@ -162,7 +165,9 @@ pub fn type_of(format: Format, role: Use) -> Option<u32> {
         {
             Some(GgmlType::Q8_0.as_u32())
         }
-        (Format::Bf16 | Format::F32, Use::Matrix(Plain::F32)) => Some(GgmlType::F32.as_u32()),
+        (Format::Bf16 | Format::F32 | Format::F16, Use::Matrix(Plain::F32)) => {
+            Some(GgmlType::F32.as_u32())
+        }
         (Format::Bf16, Use::Matrix(Plain::Bf16)) => Some(GgmlType::BF16.as_u32()),
         (Format::Fp8Tensor, Use::Rows) => Some(GgmlType::F8E4M3_ROWS.as_u32()),
         _ => None,
@@ -183,6 +188,12 @@ fn finite(name: &str, raw: &Raw<'_>) -> Result<(), Error> {
             .0
             .iter()
             .position(|b| u16::from_le_bytes(*b) & 0x7f80 == 0x7f80),
+        Dtype::F16 => raw
+            .bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .position(|b| u16::from_le_bytes(*b) & 0x7c00 == 0x7c00),
         _ => {
             return Err(safetensors::Error::Dtype {
                 name: name.into(),
@@ -251,7 +262,7 @@ pub fn normalize<'a>(
         .ok_or_else(|| refuse(format!("read as {role:?} has no GGUF type here")))?;
     match format {
         Format::Nvfp4 | Format::Nvfp4Ct | Format::Nvfp4Csf | Format::Nvfp4Csf32 => {}
-        Format::MlxAffine { .. } => {
+        Format::MlxAffine { .. } | Format::MlxAffineF16 { .. } => {
             let [source] = sources else {
                 return Err(refuse(format!(
                     "in a stack of {}: an MLX stack is one tensor",
@@ -453,7 +464,7 @@ fn plan_part<'a>(
                 ),
             ));
         }
-        if matches!(format, Format::MlxAffine { .. }) {
+        if format.mlx_affine().is_some() {
             mlx_planes(get, weight, placed)?;
             if at.start != 0 || matrix.get(dim) != Some(&at.end) {
                 return Err(refuse(
@@ -1511,9 +1522,9 @@ struct MlxPlanes<'a> {
     ty: GgmlType,
     /// The U32 words of codes, `[.., k * bits / 32]`.
     codes: Raw<'a>,
-    /// The BF16 scale of each group, `[.., k / group]`.
+    /// The scale of each group (BF16, or F16 as the format says), `[.., k / group]`.
     scales: Raw<'a>,
-    /// The BF16 bias of each group, `[.., k / group]`.
+    /// The bias of each group, of the scale's dtype, `[.., k / group]`.
     biases: Raw<'a>,
     /// The values a row holds.
     k: usize,
@@ -1531,8 +1542,8 @@ struct MlxPlanes<'a> {
 ///
 /// A format with no block type, a place that does not name a scales and a biases tensor, a
 /// weight that is not U32 with a leading dim and a packed row, a row that is not whole groups, and
-/// a scales or biases tensor that is not BF16 `[.., groups]` over the weight's leading dims, each
-/// by name.
+/// a scales or biases tensor that is not of the format's dtype (BF16, or F16 for
+/// [`Format::MlxAffineF16`]) `[.., groups]` over the weight's leading dims, each by name.
 fn mlx_planes<'a>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     weight: &str,
@@ -1544,7 +1555,8 @@ fn mlx_planes<'a>(
         format,
         what,
     };
-    let (Format::MlxAffine { bits, group }, Some(ty)) = (format, format.card_type()) else {
+    let (Some((bits, group, scale_dtype)), Some(ty)) = (format.mlx_affine(), format.card_type())
+    else {
         return Err(refuse(
             weight,
             "is not an MLX affine tensor with a block type here".into(),
@@ -1588,7 +1600,7 @@ fn mlx_planes<'a>(
     let mut grid = leading.to_vec();
     grid.push(k / group);
     let plane = |name: &String| {
-        let raw = stored(get, name, Dtype::Bf16, refuse)?;
+        let raw = stored(get, name, scale_dtype, refuse)?;
         if raw.shape != grid {
             return Err(refuse(
                 name,
@@ -1609,15 +1621,16 @@ fn mlx_planes<'a>(
     })
 }
 
-/// The MLX affine weight `source` in GGUF's MLX_A4 or MLX_A8 block: each group's code words, then
-/// its scale, then its bias, as stored. A weight of more than two dims (a routed stack) keeps its
+/// The MLX affine weight `source` in GGUF's MLX_A4, MLX_A8, MLX_A4H or MLX_A8H block (the one its
+/// format's card type names): each group's code words, then its scale, then its bias, as stored. A weight of more than two dims (a routed stack) keeps its
 /// leading dims as ggml's trailing ones, `[k, rows, n_expert]`. Every block written passes
 /// [`check_mlx_affine`], and a row whose block does not is refused by name.
 ///
 /// # Errors
 ///
 /// A refusal of `mlx_planes`, a byte count `usize` or the allocator cannot hold, and a group
-/// whose scale or bias is no finite BF16 or whose top code leaves f32's range, each by name.
+/// whose scale or bias is no finite BF16 or F16 (as its type stores them) or whose top code leaves
+/// f32's range, each by name.
 fn mlx_affine<'a>(
     get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     (weight, placed): (&str, &Placed),
@@ -1673,7 +1686,7 @@ fn mlx_affine<'a>(
 
 #[cfg(test)]
 mod tests {
-    use gguf::quant::{GgmlType, bf16_bits_to_f32, dequant_row, fp32_to_bf16_bits};
+    use gguf::quant::{GgmlType, bf16_bits_to_f32, dequant_row, fp32_to_bf16_bits, half_to_f32};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
 
@@ -3354,6 +3367,17 @@ mod tests {
     fn mlx(
         bits: usize,
         shape: &[usize],
+        planes: (&[u32], &[u16], &[u16]),
+    ) -> (Safetensors, Placed) {
+        mlx_stored("BF16", bits, shape, planes)
+    }
+
+    /// [`mlx`] with the scales and biases stored as `dtype` ("BF16" or "F16") and placed in the
+    /// format the plan gives that dtype.
+    fn mlx_stored(
+        dtype: &str,
+        bits: usize,
+        shape: &[usize],
         (words, scales, biases): (&[u32], &[u16], &[u16]),
     ) -> (Safetensors, Placed) {
         let (&packed, rows) = shape.split_last().unwrap();
@@ -3363,12 +3387,15 @@ mod tests {
         let words: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let st = Safetensors::parse(write(&[
             ("m.weight", "U32", shape, &words),
-            ("m.scales", "BF16", &grid, &le(scales)),
-            ("m.biases", "BF16", &grid, &le(biases)),
+            ("m.scales", dtype, &grid, &le(scales)),
+            ("m.biases", dtype, &grid, &le(biases)),
         ]))
         .unwrap();
         let place = Placed {
-            format: Format::MlxAffine { bits, group: 64 },
+            format: match dtype {
+                "F16" => Format::MlxAffineF16 { bits, group: 64 },
+                _ => Format::MlxAffine { bits, group: 64 },
+            },
             companions: vec!["m.scales".into(), "m.biases".into()],
         };
         (st, place)
@@ -3378,12 +3405,23 @@ mod tests {
     /// from any block: code `i` of a group is the `bits` bits at `bits · (i mod per)` of word
     /// `i / per`, `per` codes a word, and the value is `s · code + b` in f32.
     fn mlx_rule(bits: usize, words: &[u32], scales: &[u16], biases: &[u16]) -> Vec<f32> {
+        mlx_rule_with(bf16_bits_to_f32, bits, words, scales, biases)
+    }
+
+    /// [`mlx_rule`] with the scale and bias widened by `widen`.
+    fn mlx_rule_with(
+        widen: fn(u16) -> f32,
+        bits: usize,
+        words: &[u32],
+        scales: &[u16],
+        biases: &[u16],
+    ) -> Vec<f32> {
         let per = 32 / bits;
         words
             .chunks(64 / per)
             .zip(scales.iter().zip(biases))
             .flat_map(|(group, (&s, &b))| {
-                let (s, b) = (bf16_bits_to_f32(s), bf16_bits_to_f32(b));
+                let (s, b) = (widen(s), widen(b));
                 (0..64).map(move |i| {
                     let code = (group[i / per] >> (bits * (i % per))) & ((1 << bits) - 1);
                     s * code as f32 + b
@@ -3444,19 +3482,164 @@ mod tests {
         assert_eq!(alone.bytes, stack.bytes[..alone.bytes.len()]);
     }
 
+    /// An MLX tensor whose scales and biases are F16 repacks into the F16-pair block types
+    /// (MLX_A4H, MLX_A8H): each group's words as stored, then its F16 scale bits and its F16 bias
+    /// bits as stored, none rounded; the blocks decode to `s·q + b` with `s` and `b` widened from
+    /// F16 bits (the pinned words under hand-picked pairs: 0.25, 1, 2, 0.5 over -0.5, 0, -1, 0.25).
+    /// F16 companions of a weight placed as BF16 ones, and the other way round, are refused by
+    /// name, as is a group whose F16 scale is NaN.
+    ///
+    /// FAIL-first: placing an F16 weight as MLX_A4 and MLX_A8 (`Format::card_type`), or reading
+    /// the pair as BF16 bits in this rule, is red here.
+    #[test]
+    fn mlx_f16_tensors_repack_to_the_f16_block_types() {
+        let role = Use::Matrix(Plain::Q8_0);
+        let scales = [
+            0x3400u16, 0x3c00, 0x4000, 0x3800, 0x3400, 0x3c00, 0x4000, 0x3800,
+        ];
+        let biases = [
+            0xb800u16, 0x0000, 0xbc00, 0x3400, 0xb800, 0x0000, 0xbc00, 0x3400,
+        ];
+        let a4 = (&A4_WORDS[..], &scales[..], &biases[..]);
+        let a8 = (&A8_WORDS[..], &scales[..4], &biases[..4]);
+        let cases: [(usize, &[usize], GgmlType, _); 2] = [
+            (4, &[2, 2, 16], GgmlType::MLX_A4H, a4),
+            (8, &[2, 32], GgmlType::MLX_A8H, a8),
+        ];
+        for (bits, shape, ty, planes) in cases {
+            let (st, place) = mlx_stored("F16", bits, shape, planes);
+            let n = normalize(|n| st.raw(n), &[("m.weight", &place)], role).unwrap();
+            let block = ty.type_size().unwrap() as usize;
+            assert_eq!(n.type_id, ty.as_u32(), "{ty}");
+            assert_eq!(n.bytes.len(), planes.1.len() * block, "{ty}");
+            for (g, blk) in n.bytes.chunks_exact(block).enumerate() {
+                assert_eq!(
+                    blk[block - 4..block - 2],
+                    planes.1[g].to_le_bytes(),
+                    "{ty} {g}"
+                );
+                assert_eq!(blk[block - 2..], planes.2[g].to_le_bytes(), "{ty} {g}");
+            }
+            let want = mlx_rule_with(half_to_f32, bits, planes.0, planes.1, planes.2);
+            let mut got = vec![0.0f32; want.len()];
+            dequant_row(ty, &n.bytes, &mut got).unwrap();
+            for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(got.to_bits(), want.to_bits(), "{ty} value {i}");
+            }
+            // Stored as BF16 under an F16 place, and the other way round.
+            let (st, _) = mlx_stored("BF16", bits, shape, planes);
+            let e = normalize(|n| st.raw(n), &[("m.weight", &place)], role)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("m.scales") && e.contains("BF16"), "{e}");
+            let (st, place) = mlx_stored("F16", bits, shape, planes);
+            let bf16_place = Placed {
+                format: Format::MlxAffine { bits, group: 64 },
+                ..place
+            };
+            let e = normalize(|n| st.raw(n), &[("m.weight", &bf16_place)], role)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("m.scales") && e.contains("F16"), "{e}");
+        }
+        // A NaN F16 scale in row 0's first group, refused naming the row and the block.
+        let mut nan = scales;
+        nan[0] = 0x7e00;
+        let (st, place) = mlx_stored("F16", 4, &[2, 2, 16], (&A4_WORDS, &nan, &biases));
+        let e = normalize(|n| st.raw(n), &[("m.weight", &place)], role)
+            .unwrap_err()
+            .to_string();
+        for want in [
+            "m.weight: MLX-affine F16 4-bit group 64",
+            "row 0",
+            "mlx_a4h: block 0 holds scale bits 0x7e00, not finite",
+        ] {
+            assert!(e.contains(want), "{e}: missing {want}");
+        }
+    }
+
+    /// An F16 tensor (a norm gain) is read widened to f32, every value exact (1, -2, the smallest
+    /// subnormal 2^-24, F16's largest 65504, zeros of both signs), and no other read has a type
+    /// for it: Q8_0, BF16 and a row table are refused by name. A non-finite value is refused by
+    /// name too.
+    #[test]
+    fn f16_tensors_are_read_widened_to_f32_or_refused() {
+        let le = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let bits = [0x3c00u16, 0xc000, 0x0001, 0x7bff, 0x0000, 0x8000];
+        let st = Safetensors::parse(write(&[("g.weight", "F16", &[2, 3], &le(&bits))])).unwrap();
+        let place = Placed {
+            format: Format::F16,
+            companions: vec![],
+        };
+        let n = normalize(
+            |n| st.raw(n),
+            &[("g.weight", &place)],
+            Use::Matrix(Plain::F32),
+        )
+        .unwrap();
+        assert_eq!(n.type_id, GgmlType::F32.as_u32());
+        assert_eq!(n.dims, [3, 2]);
+        let got: Vec<f32> = n
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let want = [1.0f32, -2.0, 2.0f32.powi(-24), 65504.0, 0.0, -0.0];
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "value {i}");
+        }
+        for role in [
+            Use::Matrix(Plain::Q8_0),
+            Use::Matrix(Plain::Bf16),
+            Use::Q8_0,
+            Use::Rows,
+        ] {
+            assert_eq!(type_of(Format::F16, role), None, "{role:?}");
+            let e = normalize(|n| st.raw(n), &[("g.weight", &place)], role)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("g.weight: F16") && e.contains("has no GGUF type here"),
+                "{e}"
+            );
+        }
+        let st = Safetensors::parse(write(&[("g.weight", "F16", &[2], &le(&[0x3c00, 0x7c00]))]))
+            .unwrap();
+        let e = normalize(
+            |n| st.raw(n),
+            &[("g.weight", &place)],
+            Use::Matrix(Plain::F32),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Shape { name, what }
+                if name == "g.weight" && what.contains("non-finite value at 1")),
+            "{e:?}"
+        );
+    }
+
     /// The table writes an MLX affine tensor as its block type for a matrix role and gives a row
-    /// table, a width and a group the blocks do not have no type.
+    /// table, a width and a group the blocks do not have no type; the F16-pair format has its own
+    /// block types.
     #[test]
     fn mlx_affine_is_written_as_its_block_type() {
         let mlx = |bits, group| Format::MlxAffine { bits, group };
+        let half = |bits, group| Format::MlxAffineF16 { bits, group };
         for role in [Plain::Q8_0, Plain::F32, Plain::Bf16] {
             let role = Use::Matrix(role);
             assert_eq!(type_of(mlx(4, 64), role), Some(GgmlType::MLX_A4.as_u32()));
             assert_eq!(type_of(mlx(8, 64), role), Some(GgmlType::MLX_A8.as_u32()));
             assert_eq!(type_of(mlx(3, 64), role), None);
             assert_eq!(type_of(mlx(4, 32), role), None);
+            assert_eq!(type_of(half(4, 64), role), Some(GgmlType::MLX_A4H.as_u32()));
+            assert_eq!(type_of(half(8, 64), role), Some(GgmlType::MLX_A8H.as_u32()));
+            assert_eq!(type_of(half(3, 64), role), None);
+            assert_eq!(type_of(half(4, 32), role), None);
         }
         assert_eq!(type_of(mlx(4, 64), Use::Rows), None);
+        assert_eq!(type_of(half(4, 64), Use::Rows), None);
     }
 
     /// An MLX tensor the format does not hold is refused by name: a row that is not whole groups, a

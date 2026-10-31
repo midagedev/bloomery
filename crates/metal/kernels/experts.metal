@@ -7,12 +7,16 @@
 //   q6k_pair_swiglu   the same over block_q6_K
 //   a4_pair_swiglu    the same over block_mlx_a4
 //   a8_pair_swiglu    the same over block_mlx_a8
+//   a4h_pair_swiglu   the same over block_mlx_a4 with F16 scales and biases
+//   a8h_pair_swiglu   the same over block_mlx_a8 with F16 scales and biases
 //   q8_0_pair_swiglu  the same over block_q8_0
 //   q5k_pair_swiglu   the same over block_q5_K
 //   q4k_down_fold     y[r] += sum over slots of w_s * (down_s[r] · h_s)
 //   q6k_down_fold     the same over block_q6_K
 //   a4_down_fold      the same over block_mlx_a4
 //   a8_down_fold      the same over block_mlx_a8
+//   a4h_down_fold     the same over block_mlx_a4 with F16 scales and biases
+//   a8h_down_fold     the same over block_mlx_a8 with F16 scales and biases
 //   q8_0_down_fold    the same over block_q8_0
 //   q5k_down_fold     the same over block_q5_K
 //
@@ -46,8 +50,8 @@
 // seventy-two of MLX's 64-value groups, or a hundred and forty-four Q8_0
 // blocks — the quant's own count. A lane owns blocks by the dense stride
 // across that whole K', not slot by slot: Q4_K and Q5_K step four blocks (a
-// lane owns four or five), Q6_K steps two (a lane owns nine), A4, A8 and
-// Q8_0 step eight (nine and eighteen). The route weight of the block's slot
+// lane owns four or five), Q6_K steps two (a lane owns nine), A4, A8, A4H,
+// A8H and Q8_0 step eight (nine and eighteen). The route weight of the block's slot
 // scales the activation as it is loaded, and the residual add is the store.
 // There is no second dispatch.
 //
@@ -475,6 +479,8 @@ APART_PAIR_ENTRY("q4k_pair_swiglu", Q4K, block_q4_K, Q4K, block_q4_K)
 APART_PAIR_ENTRY("q6k_pair_swiglu", Q6K, block_q6_K, Q6K, block_q6_K)
 APART_PAIR_ENTRY("a4_pair_swiglu", A4, block_mlx_a4, A4, block_mlx_a4)
 APART_PAIR_ENTRY("a8_pair_swiglu", A8, block_mlx_a8, A8, block_mlx_a8)
+APART_PAIR_ENTRY("a4h_pair_swiglu", A4H, block_mlx_a4, A4H, block_mlx_a4)
+APART_PAIR_ENTRY("a8h_pair_swiglu", A8H, block_mlx_a8, A8H, block_mlx_a8)
 APART_PAIR_ENTRY("q8_0_pair_swiglu", Q8_0, block_q8_0, Q8_0, block_q8_0)
 APART_PAIR_ENTRY("q5k_pair_swiglu", Q5K, block_q5_K, Q5K, block_q5_K)
 
@@ -501,6 +507,8 @@ SCALED_PAIR_ENTRY("q4k_pair_swiglu_scaled", Q4K, block_q4_K)
 SCALED_PAIR_ENTRY("q6k_pair_swiglu_scaled", Q6K, block_q6_K)
 SCALED_PAIR_ENTRY("a4_pair_swiglu_scaled", A4, block_mlx_a4)
 SCALED_PAIR_ENTRY("a8_pair_swiglu_scaled", A8, block_mlx_a8)
+SCALED_PAIR_ENTRY("a4h_pair_swiglu_scaled", A4H, block_mlx_a4)
+SCALED_PAIR_ENTRY("a8h_pair_swiglu_scaled", A8H, block_mlx_a8)
 SCALED_PAIR_ENTRY("q8_0_pair_swiglu_scaled", Q8_0, block_q8_0)
 SCALED_PAIR_ENTRY("q5k_pair_swiglu_scaled", Q5K, block_q5_K)
 
@@ -562,6 +570,32 @@ kernel void down_fold_kernel<A8>(device const block_mlx_a8 * down [[buffer(0)]],
                                  uint3 tgpig [[threadgroup_position_in_grid]],
                                  ushort tiisg [[thread_index_in_simdgroup]],
                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("a4h_down_fold")]]
+kernel void down_fold_kernel<A4H>(device const block_mlx_a4 * down [[buffer(0)]],
+                                  device const block_mlx_a4 * shared [[buffer(1)]],
+                                  device const float * h [[buffer(2)]],
+                                  device const float * w [[buffer(3)]],
+                                  device const int * ids [[buffer(4)]],
+                                  device float * y [[buffer(5)]],
+                                  device atomic_uint * faults [[buffer(6)]],
+                                  constant FoldArgs & args [[buffer(7)]],
+                                  uint3 tgpig [[threadgroup_position_in_grid]],
+                                  ushort tiisg [[thread_index_in_simdgroup]],
+                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("a8h_down_fold")]]
+kernel void down_fold_kernel<A8H>(device const block_mlx_a8 * down [[buffer(0)]],
+                                  device const block_mlx_a8 * shared [[buffer(1)]],
+                                  device const float * h [[buffer(2)]],
+                                  device const float * w [[buffer(3)]],
+                                  device const int * ids [[buffer(4)]],
+                                  device float * y [[buffer(5)]],
+                                  device atomic_uint * faults [[buffer(6)]],
+                                  constant FoldArgs & args [[buffer(7)]],
+                                  uint3 tgpig [[threadgroup_position_in_grid]],
+                                  ushort tiisg [[thread_index_in_simdgroup]],
+                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
 template [[host_name("q8_0_down_fold")]]
 kernel void down_fold_kernel<Q8_0>(device const block_q8_0 * down [[buffer(0)]],

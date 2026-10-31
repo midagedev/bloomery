@@ -9,7 +9,8 @@ use super::oracle::Rng;
 
 /// One matrix of random blocks: random bytes, with the scales (and the
 /// mins, the biases) small and finite — an f16 pair in [0.0005, 0.004] for
-/// Q4_K, Q6_K and Q8_0, a BF16 pair for A4's and A8's groups, and an f16 pair in
+/// Q4_K, Q6_K and Q8_0, a BF16 pair for A4's and A8's groups (an f16 pair for
+/// A4H's and A8H's), and an f16 pair in
 /// [0.0001, 0.0008] for Q5_K: under its 6-bit sub-scales and 5-bit codes the
 /// wider range's weights reach 0.004 · 63 · 31, and their pair outputs pass
 /// the half range a GEMM's f16 operand takes.
@@ -44,6 +45,7 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
         gguf::quant::fp32_to_bf16_bits(0.0005 + 0.0035 * unit).to_le_bytes()
     };
     let zero_bias = gguf::quant::fp32_to_bf16_bits(0.0).to_le_bytes();
+    let zero_bias_f16 = gguf::quant::f32_to_f16_bits(0.0).to_le_bytes();
     for b in bytes.chunks_exact_mut(block) {
         match quant {
             Quant::Q4K => {
@@ -67,6 +69,15 @@ pub fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
             Quant::A8 => {
                 b[64..66].copy_from_slice(&small_bf16(&mut rng));
                 b[66..68].copy_from_slice(&zero_bias);
+            }
+            // The same groups with the pair as F16 bits.
+            Quant::A4H => {
+                b[32..34].copy_from_slice(&small_f16(&mut rng));
+                b[34..36].copy_from_slice(&zero_bias_f16);
+            }
+            Quant::A8H => {
+                b[64..66].copy_from_slice(&small_f16(&mut rng));
+                b[66..68].copy_from_slice(&zero_bias_f16);
             }
             Quant::F32 => unreachable!("F32 rows are built above"),
         }

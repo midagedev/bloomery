@@ -368,7 +368,9 @@ impl Source for Checkpoint {
         );
         let plain = matches!(
             format,
-            hf::quant_config::Format::Bf16 | hf::quant_config::Format::F32
+            hf::quant_config::Format::Bf16
+                | hf::quant_config::Format::F16
+                | hf::quant_config::Format::F32
         );
         // One BF16 matrix read whole is copied as stored (`modelopt::normalize`): no values widen.
         let widened = plain

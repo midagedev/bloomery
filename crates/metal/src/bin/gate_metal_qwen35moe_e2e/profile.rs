@@ -287,20 +287,20 @@ fn file_weights(
             .ok_or_else(|| format!("the file has no tensor {name}"))?;
         Ok(info.nbytes)
     };
-    // A value tensor the arena dequantizes at open: F32 as stored, MLX_A8 to
-    // one f32 an element. The profile counts that buffer, so the packed file
-    // length is the same number only for F32.
+    // A value tensor the arena dequantizes at open: F32 as stored, MLX_A8 or
+    // MLX_A8H to one f32 an element. The profile counts that buffer, so the
+    // packed file length is the same number only for F32.
     let values_held = |name: &str| -> Result<u64, String> {
         let (_, info) = split
             .find(name)
             .ok_or_else(|| format!("the file has no tensor {name}"))?;
         let elems = info.dims.iter().product::<u64>();
         match info.ty {
-            gguf::GgmlType::F32 | gguf::GgmlType::MLX_A8 => elems
+            gguf::GgmlType::F32 | gguf::GgmlType::MLX_A8 | gguf::GgmlType::MLX_A8H => elems
                 .checked_mul(4)
                 .ok_or_else(|| format!("{name}: its f32 bytes do not fit u64")),
             other => Err(format!(
-                "{name} is {other:?}; the profile holds F32 or MLX_A8"
+                "{name} is {other:?}; the profile holds F32, MLX_A8 or MLX_A8H"
             )),
         }
     };

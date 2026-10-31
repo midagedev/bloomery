@@ -1,13 +1,17 @@
-//! The A8 clauses: MLX's affine 8-bit decode (`quant.metal`'s `A8` owner)
-//! against the f64 oracle, over the same fixture split the A4 clauses read
-//! with its tensors quantized at 8 bits (`fixture.rs`'s requantizer — the
-//! split holds its typed sites at MLX_A4). A4's own shapes and fault inputs,
-//! every entry the owner instantiates: the five mat-vec modes, the pair, the
-//! fold, the head, the embedding, the dense and segmented GEMMs (both
-//! operands, the half-row entries among them) and the grouped GEMM. The
+//! The requantized affine clauses: MLX's affine decode owners the split holds
+//! no typed site of — A8 (`quant.metal`'s `A8`, one-byte codes under BF16
+//! scales and biases), A4H and A8H (the A4 and A8 rules over F16 scales and
+//! biases) — against the f64 oracle, over the same fixture split the A4
+//! clauses read with its tensors requantized as the type under test
+//! (`fixture.rs`'s requantizer — the split holds its typed sites at MLX_A4).
+//! One body for every type, the type a parameter: A4's own shapes and fault
+//! inputs, every entry the owner instantiates: the five mat-vec modes, the
+//! pair, the fold, the head, the embedding, the dense and segmented GEMMs
+//! (both operands, the half-row entries among them) and the grouped GEMM. The
 //! bands are A4's own derivation (`oracle.rs`: the same store-path count and
-//! norm chain, the same two-term magnitude), because the owner's evaluation
-//! tree is A4's over one-byte codes.
+//! norm chain, the same two-term magnitude), because each owner's evaluation
+//! tree is A4's, over one-byte codes for the 8-bit types and over a pair that
+//! widens exactly for the H types.
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
@@ -68,15 +72,15 @@ const SEG_GAIN: &str = "blk.1.attn_norm.weight";
 const HEAD_TAIL: usize = 1153;
 
 /// The store dot at the row's tensors and the head's tail rows.
-pub fn a8_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn matvec(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let mut parts = Vec::new();
     for (i, &(name, cols, rows)) in MATVEC.iter().enumerate() {
-        let weights = fix.rows_as_a8(name, cols, rows)?;
+        let weights = fix.rows_as(quant, name, cols, rows)?;
         let x = oracle::activations(cols, 0x2A34 + i as u64, 1.0);
         let worst = common::run_checked(
             h,
             &Launch {
-                quant: Quant::A8,
+                quant,
                 rows,
                 cols,
                 weights: &weights,
@@ -90,12 +94,18 @@ pub fn a8_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
     }
     let hidden = h.geom().hidden;
     let output_rows = fix.output_rows()?;
-    let head = fix.rows_at_as_a8("output.weight", hidden, output_rows - HEAD_TAIL, HEAD_TAIL)?;
+    let head = fix.rows_at_as(
+        quant,
+        "output.weight",
+        hidden,
+        output_rows - HEAD_TAIL,
+        HEAD_TAIL,
+    )?;
     let x = oracle::activations(hidden, 0x2A3A, 1.0);
     let worst = common::run_checked(
         h,
         &Launch {
-            quant: Quant::A8,
+            quant,
             rows: HEAD_TAIL,
             cols: hidden,
             weights: &head,
@@ -118,17 +128,17 @@ pub fn a8_matvec(h: &Harness<'_>, fix: &Fixture) -> Clause {
 
 /// Row counts no threadgroup divides: every row written, no word past the
 /// last.
-pub fn a8_row_tail(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn row_tail(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let counts = [1usize, 2, 3, 5, 6, 7, 4093, 4094, 4095];
     let (name, cols) = ("blk.0.attn_qkv.weight", 2048);
-    let all = fix.rows_as_a8(name, cols, 4095)?;
-    let row_bytes = cols / Quant::A8.values_per_block() * Quant::A8.block_bytes();
+    let all = fix.rows_as(quant, name, cols, 4095)?;
+    let row_bytes = cols / quant.values_per_block() * quant.block_bytes();
     let x = oracle::activations(cols, 0x2A60, 1.0);
     for rows in counts {
         common::run_checked(
             h,
             &Launch {
-                quant: Quant::A8,
+                quant,
                 rows,
                 cols,
                 weights: &all[..rows * row_bytes],
@@ -148,17 +158,17 @@ pub fn a8_row_tail(h: &Harness<'_>, fix: &Fixture) -> Clause {
 /// The norm on load and the residual epilogue, with the fault inputs the A4
 /// clause runs: a NaN input, an infinite one, a zero input with a zero
 /// epsilon, each raising the norm site and writing NaN rows.
-pub fn a8_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn norm(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let eps = fix.rms_eps()?;
     let mut parts = Vec::new();
     for (i, &(name, cols, rows, gain_name)) in NORM.iter().enumerate() {
         let gain = common::gain_for(fix, gain_name, cols, 0x2AA1 + i as u64)?;
-        let weights = fix.rows_as_a8(name, cols, rows)?;
+        let weights = fix.rows_as(quant, name, cols, rows)?;
         let x = oracle::activations(cols, 0x2A40 + i as u64, 3.7);
         let worst = common::run_checked(
             h,
             &Launch {
-                quant: Quant::A8,
+                quant,
                 rows,
                 cols,
                 weights: &weights,
@@ -176,13 +186,13 @@ pub fn a8_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     }
 
     let (name, cols, rows) = ("blk.0.ssm_out.weight", 4096, 2048);
-    let weights = fix.rows_as_a8(name, cols, rows)?;
+    let weights = fix.rows_as(quant, name, cols, rows)?;
     let gain = common::gain_for(fix, None, cols, 0x2AB0)?;
     // A zero input norms to zero with a positive epsilon: not a fault.
     common::run_checked(
         h,
         &Launch {
-            quant: Quant::A8,
+            quant,
             rows,
             cols,
             weights: &weights,
@@ -209,7 +219,7 @@ pub fn a8_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
         }
         h.clear_fault()?;
         let got = h.matvec(&Launch {
-            quant: Quant::A8,
+            quant,
             rows,
             cols,
             weights: &weights,
@@ -230,13 +240,13 @@ pub fn a8_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
 
     // The residual epilogue: the store's rows plus the output's own.
     for (i, &(name, cols, rows, _)) in NORM[..3].iter().enumerate() {
-        let weights = fix.rows_as_a8(name, cols, rows)?;
+        let weights = fix.rows_as(quant, name, cols, rows)?;
         let x = oracle::activations(cols, 0x2A50 + i as u64, 1.0);
         let resid = oracle::activations(rows, 0x2BE5 + i as u64, 2.0);
         let worst = common::run_checked(
             h,
             &Launch {
-                quant: Quant::A8,
+                quant,
                 rows,
                 cols,
                 weights: &weights,
@@ -253,7 +263,7 @@ pub fn a8_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
 
 /// Every segment of a segmented dispatch is the same bits as the same tensor
 /// run alone, in the A4 clause's layer shapes.
-pub fn a8_seg(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn seg(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let eps = fix.rms_eps()?;
     let cols = 2048;
     let gain = fix.f32s(SEG_GAIN, cols)?;
@@ -262,7 +272,7 @@ pub fn a8_seg(h: &Harness<'_>, fix: &Fixture) -> Clause {
         let x = oracle::activations(cols, 0x2E86 + i as u64, 1.0);
         let owned: Vec<Vec<u8>> = tensors
             .iter()
-            .map(|&(name, n)| fix.rows_as_a8(name, cols, n))
+            .map(|&(name, n)| fix.rows_as(quant, name, cols, n))
             .collect::<Result<Vec<_>, String>>()?;
         let segments: Vec<(usize, &[u8])> = tensors
             .iter()
@@ -271,7 +281,7 @@ pub fn a8_seg(h: &Harness<'_>, fix: &Fixture) -> Clause {
             .collect();
         let rows: usize = tensors.iter().map(|&(_, n)| n).sum();
         let got = h.seg(&SegLaunch {
-            quant: Quant::A8,
+            quant,
             cols,
             segments: segments.clone(),
             x: &x,
@@ -286,7 +296,7 @@ pub fn a8_seg(h: &Harness<'_>, fix: &Fixture) -> Clause {
         let mut at = 0usize;
         for (j, (n, bytes)) in segments.iter().enumerate() {
             let alone = h.matvec(&Launch {
-                quant: Quant::A8,
+                quant,
                 rows: *n,
                 cols,
                 weights: bytes,
@@ -316,11 +326,11 @@ pub fn a8_seg(h: &Harness<'_>, fix: &Fixture) -> Clause {
 /// The head-normed residual mat-vec: the gated numerator times the scale of
 /// the head each group sits in, against the f64 oracle, with the NaN partials
 /// and numerator the A4 clause runs.
-pub fn a8_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn headnorm(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let eps = fix.rms_eps()?;
     let delta = &h.geom().delta;
     let cols = delta.head_cols * delta.value_heads;
-    let weights = fix.rows_as_a8("blk.0.ssm_out.weight", cols, 2048)?;
+    let weights = fix.rows_as(quant, "blk.0.ssm_out.weight", cols, 2048)?;
     let g = oracle::activations(cols, 0x2E88, 1.0);
     let partials = head_partials(delta);
     let x = common::head_scaled(
@@ -331,11 +341,11 @@ pub fn a8_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
         PARTIALS_PER_HEAD,
         eps,
     );
-    let reference = oracle::reference(Quant::A8, &weights, 2048, cols, &x)?;
+    let reference = oracle::reference(quant, &weights, 2048, cols, &x)?;
     let resid = oracle::activations(2048, 0x2E89, 2.0);
     let launch = |g: &[f32], partials: &[f32]| {
         h.headnorm(&HeadNormLaunch {
-            quant: Quant::A8,
+            quant,
             rows: 2048,
             cols,
             weights: &weights,
@@ -356,7 +366,7 @@ pub fn a8_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
         cols_per_head: delta.head_cols,
         partials_per_head: PARTIALS_PER_HEAD,
     });
-    let band = oracle::band(Quant::A8, cols / Quant::A8.values_per_block(), kind);
+    let band = oracle::band(quant, cols / quant.values_per_block(), kind);
     let worst = oracle::check(&got, &reference, band, kind, Some(&resid))?;
 
     let mut bad_partials = partials.clone();
@@ -381,12 +391,12 @@ pub fn a8_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )))
 }
 
-/// The gate-up pair over the MLX stacks quantized at 8 bits: the oracle
+/// The gate-up pair over the MLX stacks requantized as `quant`: the oracle
 /// band, an id past the stack, and the norm's fault inputs.
-pub fn a8_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
-    let worst = check_pair_quant(h, fix, Quant::A8)?;
-    let weights = clauses_experts::pair_weights_for(&h.geom().experts, fix, Quant::A8)?;
-    clauses_experts::pair_faults(h, Quant::A8, &weights, &ffn_norm(fix)?)?;
+fn pair(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
+    let worst = check_pair_quant(h, fix, quant)?;
+    let weights = clauses_experts::pair_weights_for(&h.geom().experts, fix, quant)?;
+    clauses_experts::pair_faults(h, quant, &weights, &ffn_norm(fix)?)?;
     Ok(Verdict::Noted(format!(
         "worst error over its band: {worst}; ids -1 and the stack length raised expert_id, \
          NaN in that slot only; the norm's fault inputs raised norm_quant, NaN in all {} \
@@ -395,18 +405,18 @@ pub fn a8_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )))
 }
 
-/// The folded down over the MLX stacks quantized at 8 bits: the oracle band,
+/// The folded down over the MLX stacks requantized as `quant`: the oracle band,
 /// a row tail, and a bad id's NaN rows.
-pub fn a8_fold(h: &Harness<'_>, fix: &Fixture) -> Clause {
-    let worst = check_fold_quant(h, fix, Quant::A8, clauses_experts::FOLD_ROWS)?;
-    let tail = check_fold_quant(h, fix, Quant::A8, clauses_experts::FOLD_TAIL_ROWS)?;
+fn fold(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
+    let worst = check_fold_quant(h, fix, quant, clauses_experts::FOLD_ROWS)?;
+    let tail = check_fold_quant(h, fix, quant, clauses_experts::FOLD_TAIL_ROWS)?;
     let folded = clauses_experts::fold_weights_for(
         &h.geom().experts,
         fix,
-        Quant::A8,
+        quant,
         clauses_experts::FOLD_ROWS,
     )?;
-    fold_bad_id(h, &folded, Quant::A8)?;
+    fold_bad_id(h, &folded, quant)?;
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
         "worst error over its band: {worst}; tail {} rows: {tail}; a bad id writes NaN and \
@@ -415,10 +425,10 @@ pub fn a8_fold(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )))
 }
 
-/// The head over the MLX table quantized at 8 bits: the logits against the
+/// The head over the MLX table requantized as `quant`: the logits against the
 /// norm-on-load oracle band, the id against the host argmax of the read-back
 /// logits, head and tail rows.
-pub fn a8_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn head(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let eps = fix.rms_eps()?;
     let hidden = h.geom().hidden;
     let gain = fix.f32s("output_norm.weight", hidden)?;
@@ -430,12 +440,12 @@ pub fn a8_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let mut worst = 0.0f64;
     let mut notes = Vec::new();
     for (name, at, rows, seed) in samples {
-        let weights = fix.rows_at_as_a8("output.weight", hidden, at, rows)?;
+        let weights = fix.rows_at_as(quant, "output.weight", hidden, at, rows)?;
         let x = oracle::activations(hidden, seed, 0.5);
         let out = clauses_head::run(
             h,
             clauses_head::HeadRun {
-                quant: Quant::A8,
+                quant,
                 weights: &weights,
                 x: &x,
                 gain: &gain,
@@ -448,8 +458,8 @@ pub fn a8_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
             return Err(format!("{name} raised {f}"));
         }
         let xhat = oracle::rms_norm(&x, &gain, eps);
-        let reference = oracle::reference(Quant::A8, &weights, rows, hidden, &xhat)?;
-        let band = oracle::band(Quant::A8, hidden / Quant::A8.values_per_block(), Kind::Norm);
+        let reference = oracle::reference(quant, &weights, rows, hidden, &xhat)?;
+        let band = oracle::band(quant, hidden / quant.values_per_block(), Kind::Norm);
         let ratio = oracle::check(&out.logits, &reference, band, Kind::Norm, None)
             .map_err(|e| format!("{name}: {e}"))?;
         let (_, want) = clauses_head::host_argmax(&out.logits)?;
@@ -468,31 +478,29 @@ pub fn a8_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )))
 }
 
-/// The rows of the embedding table the A8 clause quantizes at 8 bits: enough
+/// The rows of the embedding table the clause requantizes: enough
 /// that the ids the clause embeds span the table's head and its end, without
 /// quantizing the whole vocabulary at once.
 const EMBED_ROWS: usize = 8192;
 
-/// The embedding clause over the MLX table quantized at 8 bits: the owner's
+/// The embedding clause over the MLX table requantized as `quant`: the owner's
 /// value decode bit-equal to the host reader, row by row, and the ids past
 /// the table's rows.
-pub fn a8_embed(h: &Harness<'_>, fix: &Fixture) -> Clause {
+fn embed(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
     let hidden = h.geom().hidden;
-    let table = fix.rows_as_a8("token_embd.weight", hidden, EMBED_ROWS)?;
+    let table = fix.rows_as(quant, "token_embd.weight", hidden, EMBED_ROWS)?;
     Ok(Verdict::Noted(clauses_embed::embed_table(
-        h,
-        Quant::A8,
-        &table,
-        EMBED_ROWS,
+        h, quant, &table, EMBED_ROWS,
     )?))
 }
 
 // ------------------------------------------------------------------- the GEMMs
 
-/// The dense GEMM's A8 weights, owned: the split's tensors quantized at 8
-/// bits, A4's own shapes — the three site tensors, the head's tail, the gate
+/// The dense GEMM's weights of `quant`, owned: the split's tensors requantized
+/// as it, A4's own shapes — the three site tensors, the head's tail, the gate
 /// projection's 16 rows (a quarter of a tile) and the segmented group's.
 struct Gemm {
+    quant: Quant,
     qkv: Vec<u8>,
     ssm_out: Vec<u8>,
     down: Vec<u8>,
@@ -504,18 +512,25 @@ struct Gemm {
 }
 
 impl Gemm {
-    fn of(h: &Harness<'_>, mlx: &Fixture) -> Result<Self, String> {
+    fn of(h: &Harness<'_>, mlx: &Fixture, quant: Quant) -> Result<Self, String> {
         let hidden = h.geom().hidden;
         let output_rows = mlx.output_rows()?;
         Ok(Self {
-            qkv: mlx.rows_as_a8("blk.0.attn_qkv.weight", 2048, 8192)?,
-            ssm_out: mlx.rows_as_a8("blk.0.ssm_out.weight", 4096, 2048)?,
-            down: mlx.rows_as_a8("blk.0.ffn_down_shexp.weight", 512, 2048)?,
-            tail: mlx.rows_at_as_a8("output.weight", hidden, output_rows - HEAD_TAIL, HEAD_TAIL)?,
-            gate: mlx.rows_at_as_a8("output.weight", hidden, 0, 16)?,
-            seg_qkv: mlx.rows_as_a8("blk.0.attn_qkv.weight", SEG_COLS, 8192)?,
-            seg_k: mlx.rows_as_a8("blk.1.attn_k.weight", SEG_COLS, 512)?,
-            seg_tail: mlx.rows_at_as_a8("blk.1.attn_q.weight", SEG_COLS, 100, 511)?,
+            quant,
+            qkv: mlx.rows_as(quant, "blk.0.attn_qkv.weight", 2048, 8192)?,
+            ssm_out: mlx.rows_as(quant, "blk.0.ssm_out.weight", 4096, 2048)?,
+            down: mlx.rows_as(quant, "blk.0.ffn_down_shexp.weight", 512, 2048)?,
+            tail: mlx.rows_at_as(
+                quant,
+                "output.weight",
+                hidden,
+                output_rows - HEAD_TAIL,
+                HEAD_TAIL,
+            )?,
+            gate: mlx.rows_at_as(quant, "output.weight", hidden, 0, 16)?,
+            seg_qkv: mlx.rows_as(quant, "blk.0.attn_qkv.weight", SEG_COLS, 8192)?,
+            seg_k: mlx.rows_as(quant, "blk.1.attn_k.weight", SEG_COLS, 512)?,
+            seg_tail: mlx.rows_at_as(quant, "blk.1.attn_q.weight", SEG_COLS, 100, 511)?,
         })
     }
 
@@ -524,6 +539,7 @@ impl Gemm {
     /// gate projection's 16 rows at two counts.
     fn cases<'a>(&'a self, h: &Harness<'_>) -> Vec<Case<'a>> {
         let hidden = h.geom().hidden;
+        let quant = self.quant;
         let case = |label: String,
                     weights: &'a [u8],
                     rows: usize,
@@ -534,7 +550,7 @@ impl Gemm {
                     seed: u64| Case {
             label,
             weights,
-            quant: Quant::A8,
+            quant,
             rows,
             cols,
             acts,
@@ -606,11 +622,11 @@ impl Gemm {
         ]
     }
 
-    /// The A8 group of a segmented dispatch: two whole tensors, then the
-    /// tail segment cut from the middle of a tensor.
+    /// The group of a segmented dispatch: two whole tensors, then the tail
+    /// segment cut from the middle of a tensor.
     fn seg_group(&self) -> SegGroup<'_> {
         SegGroup {
-            quant: Quant::A8,
+            quant: self.quant,
             segments: vec![
                 (8192, &self.seg_qkv[..]),
                 (512, &self.seg_k[..]),
@@ -623,39 +639,39 @@ impl Gemm {
 
 /// The store dot at the row's tensors: every case within the f64 oracle's
 /// band, both operand arms.
-pub fn gemm_a8_store(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    let w = Gemm::of(h, mlx)?;
+fn gemm_store(h: &Harness<'_>, mlx: &Fixture, quant: Quant) -> Clause {
+    let w = Gemm::of(h, mlx, quant)?;
     run_cases(h, GemmMode::Store, &w.cases(h))
 }
 
 /// The residual epilogue at the same cases.
-pub fn gemm_a8_resid(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    let w = Gemm::of(h, mlx)?;
+fn gemm_resid(h: &Harness<'_>, mlx: &Fixture, quant: Quant) -> Clause {
+    let w = Gemm::of(h, mlx, quant)?;
     run_cases(h, GemmMode::Residual, &w.cases(h))
 }
 
 /// Every segment of a segmented dispatch is the same bits as the same tensor
 /// run alone, both operand arms, both epilogues.
-pub fn gemm_a8_seg(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    let w = Gemm::of(h, mlx)?;
+fn gemm_seg(h: &Harness<'_>, mlx: &Fixture, quant: Quant) -> Clause {
+    let w = Gemm::of(h, mlx, quant)?;
     Ok(Verdict::Noted(format!(
         "every segment the same bits as its tensor alone: {}",
         seg_groups(h, &[w.seg_group()])?.join(", ")
     )))
 }
 
-/// The half-row GEMMs at the A8 cases: [`clauses_gemm::half_rows`].
-pub fn gemm_a8_half_rows(h: &Harness<'_>, mlx: &Fixture) -> Clause {
-    let w = Gemm::of(h, mlx)?;
+/// The half-row GEMMs at the requantized cases: [`clauses_gemm::half_rows`].
+fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, quant: Quant) -> Clause {
+    let w = Gemm::of(h, mlx, quant)?;
     clauses_gemm::half_rows_over(h, &w.cases(h), w.seg_group())
 }
 
-/// The grouped GEMM over synthetic A8 stacks: the pair and the down in both
+/// The grouped GEMM over synthetic stacks of `quant`: the pair and the down in both
 /// operands within the band, runs ending inside a SIMD group's blocks, the
 /// half range's fault, and a tile past the tile's slots
 /// ([`clauses_route::grouped_synthetic`], the Q8_0 and Q5_K clauses' body).
-pub fn grouped_a8(h: &Harness<'_>) -> Clause {
-    super::clauses_route::grouped_synthetic(h, Quant::A8, 0x2A80)
+fn grouped(h: &Harness<'_>, quant: Quant) -> Clause {
+    super::clauses_route::grouped_synthetic(h, quant, 0x2A80)
 }
 
 /// `clause` over the MLX split, or the reason it could not be opened: a
@@ -671,83 +687,154 @@ fn with<'a>(
     })
 }
 
-/// The A8 clauses of the whole row, in the token's order: the mat-vec
-/// family's, then the prompt pass's (the dense and segmented GEMMs, the
-/// half-row entries, the grouped GEMM).
+/// The names of one type's clauses.
+#[derive(Clone, Copy)]
+struct Names {
+    matvec: &'static str,
+    row_tail: &'static str,
+    norm: &'static str,
+    seg: &'static str,
+    headnorm: &'static str,
+    pair: &'static str,
+    fold: &'static str,
+    head: &'static str,
+    embed: &'static str,
+    gemm_store: &'static str,
+    gemm_resid: &'static str,
+    gemm_seg: &'static str,
+    gemm_half_rows: &'static str,
+    grouped: &'static str,
+    tensor_gemm: &'static str,
+    tensor_gemm_seg: &'static str,
+    tensor_grouped: &'static str,
+}
+
+/// The clause names of the type whose short name is `$p`.
+macro_rules! names {
+    ($p:literal) => {
+        Names {
+            matvec: concat!($p, "_matvec"),
+            row_tail: concat!($p, "_row_tail"),
+            norm: concat!($p, "_norm"),
+            seg: concat!($p, "_seg"),
+            headnorm: concat!($p, "_headnorm"),
+            pair: concat!($p, "_pair"),
+            fold: concat!($p, "_fold"),
+            head: concat!($p, "_head"),
+            embed: concat!($p, "_embed"),
+            gemm_store: concat!("gemm_", $p, "_store"),
+            gemm_resid: concat!("gemm_", $p, "_resid"),
+            gemm_seg: concat!("gemm_", $p, "_seg"),
+            gemm_half_rows: concat!("gemm_", $p, "_half_rows"),
+            grouped: concat!("grouped_", $p),
+            tensor_gemm: concat!("tensor_gemm_", $p),
+            tensor_gemm_seg: concat!("tensor_gemm_", $p, "_seg"),
+            tensor_grouped: concat!("tensor_grouped_", $p),
+        }
+    };
+}
+
+/// The types the split holds no typed site of ([`Fixture::requantizes`]),
+/// each with its clauses' names: every one runs the same bodies.
+const KINDS: [(Quant, Names); 3] = [
+    (Quant::A8, names!("a8")),
+    (Quant::A4H, names!("a4h")),
+    (Quant::A8H, names!("a8h")),
+];
+
+/// `clause` at `quant`, over the MLX split.
+fn run<'a>(
+    h: &'a Harness<'a>,
+    mlx: &'a Result<Fixture, String>,
+    quant: Quant,
+    clause: fn(&Harness<'_>, &Fixture, Quant) -> Clause,
+) -> ClauseRun<'a> {
+    with(h, mlx, move |h, fix| clause(h, fix, quant))
+}
+
+/// The requantized clauses of the whole row, in the token's order: the
+/// mat-vec family's, then the prompt pass's follow in [`gemm_table`].
 pub fn table<'a>(
     h: &'a Harness<'a>,
     mlx: &'a Result<Fixture, String>,
 ) -> Vec<(&'static str, ClauseRun<'a>)> {
-    vec![
-        ("a8_matvec", with(h, mlx, a8_matvec)),
-        ("a8_row_tail", with(h, mlx, a8_row_tail)),
-        ("a8_norm", with(h, mlx, a8_norm)),
-        ("a8_seg", with(h, mlx, a8_seg)),
-        ("a8_headnorm", with(h, mlx, a8_headnorm)),
-        ("a8_pair", with(h, mlx, a8_pair)),
-        ("a8_fold", with(h, mlx, a8_fold)),
-        ("a8_head", with(h, mlx, a8_head)),
-        ("a8_embed", with(h, mlx, a8_embed)),
-    ]
+    KINDS
+        .into_iter()
+        .flat_map(|(q, n)| {
+            [
+                (n.matvec, run(h, mlx, q, matvec)),
+                (n.row_tail, run(h, mlx, q, row_tail)),
+                (n.norm, run(h, mlx, q, norm)),
+                (n.seg, run(h, mlx, q, seg)),
+                (n.headnorm, run(h, mlx, q, headnorm)),
+                (n.pair, run(h, mlx, q, pair)),
+                (n.fold, run(h, mlx, q, fold)),
+                (n.head, run(h, mlx, q, head)),
+                (n.embed, run(h, mlx, q, embed)),
+            ]
+        })
+        .collect()
 }
 
-/// The A8 clauses of the prompt pass's GEMMs.
+/// The requantized clauses of the prompt pass's GEMMs: the dense and
+/// segmented GEMMs, the half-row entries, the grouped GEMM.
 pub fn gemm_table<'a>(
     h: &'a Harness<'a>,
     mlx: &'a Result<Fixture, String>,
 ) -> Vec<(&'static str, ClauseRun<'a>)> {
-    vec![
-        ("gemm_a8_store", with(h, mlx, gemm_a8_store)),
-        ("gemm_a8_resid", with(h, mlx, gemm_a8_resid)),
-        ("gemm_a8_seg", with(h, mlx, gemm_a8_seg)),
-        ("gemm_a8_half_rows", with(h, mlx, gemm_a8_half_rows)),
-        ("grouped_a8", Box::new(move || grouped_a8(h))),
-    ]
+    KINDS
+        .into_iter()
+        .flat_map(|(q, n)| {
+            [
+                (n.gemm_store, run(h, mlx, q, gemm_store)),
+                (n.gemm_resid, run(h, mlx, q, gemm_resid)),
+                (n.gemm_seg, run(h, mlx, q, gemm_seg)),
+                (n.gemm_half_rows, run(h, mlx, q, gemm_half_rows)),
+                (n.grouped, Box::new(move || grouped(h, q)) as ClauseRun<'a>),
+            ]
+        })
+        .collect()
 }
 
-/// The A8 clauses on the tensor-op kernels: the dense and segmented GEMMs
-/// and the grouped GEMM, on `tensor` (or why this device has none).
+/// The dense GEMM's tensor-op arms at the requantized cases.
+fn tensor_gemm(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
+    let w = Gemm::of(h, fix, quant)?;
+    dense_arms(h, &w.cases(h))
+}
+
+/// The requantized clauses on the tensor-op kernels: the dense and segmented
+/// GEMMs and the grouped GEMM, on `tensor` (or why this device has none).
 pub fn tensor_table<'a>(
     tensor: &'a Result<Harness<'a>, String>,
     mlx: &'a Result<Fixture, String>,
 ) -> Vec<(&'static str, ClauseRun<'a>)> {
-    let dense = |clause: fn(&Harness<'_>, &Fixture) -> Clause| {
-        Box::new(move || match (tensor, mlx) {
-            (Err(e), _) => Err(format!("the tensor-op GEMMs do not build here: {e}")),
-            (_, Err(e)) => Err(e.clone()),
-            (Ok(h), Ok(fix)) => {
-                h.clear_fault()?;
-                clause(h, fix)
-            }
-        }) as ClauseRun<'a>
-    };
-    vec![
-        (
-            "tensor_gemm_a8",
-            dense(|h, fix| {
-                let w = Gemm::of(h, fix)?;
-                dense_arms(h, &w.cases(h))
-            }),
-        ),
-        (
-            "tensor_gemm_a8_seg",
-            dense(|h, fix| {
-                let w = Gemm::of(h, fix)?;
-                Ok(Verdict::Noted(format!(
-                    "every segment the same bits as its tensor alone: {}",
-                    seg_groups(h, &[w.seg_group()])?.join(", ")
-                )))
-            }),
-        ),
-        (
-            "tensor_grouped_a8",
-            Box::new(move || match tensor {
-                Err(e) => Err(format!("the tensor-op GEMMs do not build here: {e}")),
-                Ok(h) => {
-                    h.clear_fault()?;
-                    grouped_a8(h)
-                }
-            }),
-        ),
-    ]
+    KINDS
+        .into_iter()
+        .flat_map(|(q, n)| {
+            let dense = move |clause: fn(&Harness<'_>, &Fixture, Quant) -> Clause| {
+                Box::new(move || match (tensor, mlx) {
+                    (Err(e), _) => Err(format!("the tensor-op GEMMs do not build here: {e}")),
+                    (_, Err(e)) => Err(e.clone()),
+                    (Ok(h), Ok(fix)) => {
+                        h.clear_fault()?;
+                        clause(h, fix, q)
+                    }
+                }) as ClauseRun<'a>
+            };
+            [
+                (n.tensor_gemm, dense(tensor_gemm)),
+                (n.tensor_gemm_seg, dense(gemm_seg)),
+                (
+                    n.tensor_grouped,
+                    Box::new(move || match tensor {
+                        Err(e) => Err(format!("the tensor-op GEMMs do not build here: {e}")),
+                        Ok(h) => {
+                            h.clear_fault()?;
+                            grouped(h, q)
+                        }
+                    }) as ClauseRun<'a>,
+                ),
+            ]
+        })
+        .collect()
 }

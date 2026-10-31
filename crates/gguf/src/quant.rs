@@ -72,10 +72,12 @@ use crate::qtype::HostAct;
 /// Q8_1=9 and Q8_K=15 are ggml's activation forms (ggml.h:399, :405): named so the table of
 /// ggml's types is whole, sized, and decoded by nothing here.
 ///
-/// F8E4M3_ROWS=2000, MXFP8=2001, NVFP4_ROWS=2002, FP8_B128=2003, MLX_A4=2004 and MLX_A8=2005 are
-/// bloomery's own value types, in its range of ids no
-/// ggml table holds (2000 up; 1000 up holds its re-layouts of ggml types): their rows are
-/// `qtype::OWN_ROWS`, beside ggml's.
+/// F8E4M3_ROWS=2000, MXFP8=2001, NVFP4_ROWS=2002, FP8_B128=2003, MLX_A4=2004, MLX_A8=2005,
+/// MLX_A4H=2006 and MLX_A8H=2007 are bloomery's own value types, in its range of ids no
+/// ggml table holds (2000 up, one the next after another; 1000 up holds its re-layouts of ggml
+/// types): their rows are `qtype::OWN_ROWS`, beside ggml's. MLX_A4H and MLX_A8H are MLX_A4's
+/// and MLX_A8's groups whose scale and bias are F16 bits, where MLX_A4's and MLX_A8's are BF16
+/// bits: two storages of one affine rule, two types, since a block's bytes do not say which.
 ///
 /// A named type is one this build can size ([`GgmlType::blck_size`],
 /// [`GgmlType::type_size`]): it has a row in [`crate::QROWS`], the one owner
@@ -131,6 +133,8 @@ pub enum GgmlType {
     FP8_B128,
     MLX_A4,
     MLX_A8,
+    MLX_A4H,
+    MLX_A8H,
     Unknown(u32),
 }
 
@@ -179,6 +183,8 @@ impl GgmlType {
             2003 => GgmlType::FP8_B128,
             2004 => GgmlType::MLX_A4,
             2005 => GgmlType::MLX_A8,
+            2006 => GgmlType::MLX_A4H,
+            2007 => GgmlType::MLX_A8H,
             other => GgmlType::Unknown(other),
         }
     }
@@ -226,6 +232,8 @@ impl GgmlType {
             GgmlType::FP8_B128 => 2003,
             GgmlType::MLX_A4 => 2004,
             GgmlType::MLX_A8 => 2005,
+            GgmlType::MLX_A4H => 2006,
+            GgmlType::MLX_A8H => 2007,
             GgmlType::Unknown(v) => v,
         }
     }
@@ -325,11 +333,12 @@ pub enum QuantError {
         bits: u32,
         why: &'static str,
     },
-    /// An MLX affine block's BF16 scale or bias that is not finite, or a scale
-    /// whose largest product with a code leaves f32's range at
-    /// ([`check_mlx_affine`]): no value is written for its group.
+    /// An MLX affine block's scale or bias (BF16 or F16 bits, as its type
+    /// stores them) that is not finite, or a scale whose largest product with
+    /// a code leaves f32's range at ([`check_mlx_affine`]): no value is
+    /// written for its group.
     #[error("dequant {ty}: block {block} holds {field} bits {bits:#06x}, {why}")]
-    UndefinedBf16 {
+    UndefinedAffinePair {
         ty: GgmlType,
         block: usize,
         field: &'static str,
@@ -411,8 +420,10 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q2_0 => dequant_q2_0(&src[..need], dst),
         GgmlType::MXFP8 => dequant_mxfp8(&src[..need], dst)?,
         GgmlType::FP8_B128 => dequant_fp8_b128(&src[..need], dst)?,
-        GgmlType::MLX_A4 => dequant_mlx_a4(&src[..need], dst)?,
-        GgmlType::MLX_A8 => dequant_mlx_a8(&src[..need], dst)?,
+        GgmlType::MLX_A4 => dequant_mlx_a4(ty, AffinePair::Bf16, &src[..need], dst)?,
+        GgmlType::MLX_A8 => dequant_mlx_a8(ty, AffinePair::Bf16, &src[..need], dst)?,
+        GgmlType::MLX_A4H => dequant_mlx_a4(ty, AffinePair::F16, &src[..need], dst)?,
+        GgmlType::MLX_A8H => dequant_mlx_a8(ty, AffinePair::F16, &src[..need], dst)?,
         GgmlType::Q4_0
         | GgmlType::Q4_1
         | GgmlType::I8
@@ -1403,29 +1414,54 @@ fn dequant_fp8_b128(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
 
 // ----------------------------------------------------------------- MLX affine
 
-/// Whether MLX's affine blocks `src` hold only values: each group's BF16 scale
+/// How an MLX affine type stores the scale and the bias that end each group:
+/// both as BF16 bits ([`GgmlType::MLX_A4`], [`GgmlType::MLX_A8`]) or both as
+/// F16 bits ([`GgmlType::MLX_A4H`], [`GgmlType::MLX_A8H`]). Either widens to
+/// f32 exactly, so one affine rule decodes all four.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AffinePair {
+    Bf16,
+    F16,
+}
+
+impl AffinePair {
+    /// The f32 of one stored scale or bias.
+    fn widen(self, bits: u16) -> f32 {
+        match self {
+            AffinePair::Bf16 => bf16_bits_to_f32(bits),
+            AffinePair::F16 => half_to_f32(bits),
+        }
+    }
+}
+
+/// Whether MLX's affine blocks `src` hold only values: each group's scale
 /// or bias that is not finite, or a scale whose largest product with a code
-/// leaves f32's range at, is [`QuantError::UndefinedBf16`] naming its block,
-/// and a partial last block [`QuantError::ShortSrc`]. [`GgmlType::MLX_A4`]
-/// blocks are whole 36-byte groups (8 little-endian U32 words of codes, then
-/// the scale and bias), [`GgmlType::MLX_A8`] 68-byte (16 words, then the
-/// pair); the largest product sits at the group's top code (15, 255), the
-/// value a finite bias and scale cannot overflow past — the sum is linear in
-/// the code, so an endpoint bounds it.
+/// leaves f32's range at, is [`QuantError::UndefinedAffinePair`] naming its
+/// block, and a partial last block [`QuantError::ShortSrc`].
+/// [`GgmlType::MLX_A4`] and [`GgmlType::MLX_A4H`] blocks are whole 36-byte
+/// groups (8 little-endian U32 words of codes, then the scale and bias),
+/// [`GgmlType::MLX_A8`] and [`GgmlType::MLX_A8H`] 68-byte (16 words, then the
+/// pair), the pair BF16 bits for the first of each and F16 bits for the `H`
+/// one; the largest product sits at the group's top code (15, 255), the value
+/// a finite bias and scale cannot overflow past — the sum is linear in the
+/// code, so an endpoint bounds it.
 ///
 /// # Errors
 ///
 /// The first such block, or the partial block.
 pub fn check_mlx_affine(ty: GgmlType, src: &[u8]) -> Result<(), QuantError> {
     match ty {
-        GgmlType::MLX_A4 => check_affine_blocks::<36, 15>(ty, src),
-        GgmlType::MLX_A8 => check_affine_blocks::<68, 255>(ty, src),
+        GgmlType::MLX_A4 => check_affine_blocks::<36, 15>(ty, AffinePair::Bf16, src),
+        GgmlType::MLX_A8 => check_affine_blocks::<68, 255>(ty, AffinePair::Bf16, src),
+        GgmlType::MLX_A4H => check_affine_blocks::<36, 15>(ty, AffinePair::F16, src),
+        GgmlType::MLX_A8H => check_affine_blocks::<68, 255>(ty, AffinePair::F16, src),
         other => Err(QuantError::Unsupported(other)),
     }
 }
 
 fn check_affine_blocks<const N: usize, const TOP: u32>(
     ty: GgmlType,
+    pair: AffinePair,
     src: &[u8],
 ) -> Result<(), QuantError> {
     let (blocks, tail) = src.as_chunks::<N>();
@@ -1441,21 +1477,21 @@ fn check_affine_blocks<const N: usize, const TOP: u32>(
         let scale = u16::from_le_bytes([blk[N - 4], blk[N - 3]]);
         let bias = u16::from_le_bytes([blk[N - 2], blk[N - 1]]);
         let refuse =
-            |field: &'static str, bits: u16, why: &'static str| QuantError::UndefinedBf16 {
+            |field: &'static str, bits: u16, why: &'static str| QuantError::UndefinedAffinePair {
                 ty,
                 block,
                 field,
                 bits,
                 why,
             };
-        if !bf16_bits_to_f32(scale).is_finite() {
+        if !pair.widen(scale).is_finite() {
             return Err(refuse("scale", scale, "not finite"));
         }
-        if !bf16_bits_to_f32(bias).is_finite() {
+        if !pair.widen(bias).is_finite() {
             return Err(refuse("bias", bias, "not finite"));
         }
-        let s = bf16_bits_to_f32(scale);
-        let b = bf16_bits_to_f32(bias);
+        let s = pair.widen(scale);
+        let b = pair.widen(bias);
         if !(s * TOP as f32 + b).is_finite() {
             return Err(refuse(
                 "scale",
@@ -1467,27 +1503,33 @@ fn check_affine_blocks<const N: usize, const TOP: u32>(
     Ok(())
 }
 
-/// MLX's affine 4-bit groups of 64 ([`GgmlType::MLX_A4`], 36 bytes: the
-/// group's 8 little-endian U32 words of codes, then its BF16 scale and BF16
-/// bias) decoded: value `i` is the 4 bits at bit `4·(i mod 8)` of word `i/8`
-/// (low nibble first) as `s·q + b` in f32, `s` and `b` the widened pair. The
-/// product of an 8-bit-significand scale and a 4-bit code is exact in f32, so
-/// the sum rounds once; MLX's own `dequantize` returns that value rounded
-/// once more to bf16 (measured, mlx 0.32.1: `mx.quantize` then
+/// MLX's affine 4-bit groups of 64 ([`GgmlType::MLX_A4`] and
+/// [`GgmlType::MLX_A4H`], 36 bytes: the group's 8 little-endian U32 words of
+/// codes, then its scale and bias as `pair` stores them) decoded: value `i`
+/// is the 4 bits at bit `4·(i mod 8)` of word `i/8` (low nibble first) as
+/// `s·q + b` in f32, `s` and `b` the widened pair. The product of a scale
+/// (an 8-bit significand in BF16, 11 in F16) and a 4-bit code is exact in
+/// f32, so the sum rounds once; MLX's own `dequantize` returns that value
+/// rounded once more to bf16 (measured, mlx 0.32.1: `mx.quantize` then
 /// `mx.dequantize`, every bit explained by the single rounding). This f32
 /// value is the oracle the Metal kernels gate compares against.
 /// [`check_mlx_affine`]'s refusals come before any value is written; `src`
 /// holds `dst`'s blocks exactly ([`dequant_row`]).
-fn dequant_mlx_a4(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
-    check_mlx_affine(GgmlType::MLX_A4, src)?;
+fn dequant_mlx_a4(
+    ty: GgmlType,
+    pair: AffinePair,
+    src: &[u8],
+    dst: &mut [f32],
+) -> Result<(), QuantError> {
+    check_mlx_affine(ty, src)?;
     for (blk, out) in src
         .as_chunks::<36>()
         .0
         .iter()
         .zip(dst.as_chunks_mut::<64>().0)
     {
-        let s = bf16_bits_to_f32(u16::from_le_bytes([blk[32], blk[33]]));
-        let b = bf16_bits_to_f32(u16::from_le_bytes([blk[34], blk[35]]));
+        let s = pair.widen(u16::from_le_bytes([blk[32], blk[33]]));
+        let b = pair.widen(u16::from_le_bytes([blk[34], blk[35]]));
         for (w, word) in blk[..32].as_chunks::<4>().0.iter().enumerate() {
             let word = u32::from_le_bytes(*word);
             for j in 0..8 {
@@ -1498,20 +1540,26 @@ fn dequant_mlx_a4(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
     Ok(())
 }
 
-/// MLX's affine 8-bit groups of 64 ([`GgmlType::MLX_A8`], 68 bytes: 16
-/// little-endian U32 words of one-byte codes, then the BF16 scale and bias)
-/// decoded: value `i` is byte `i` as `s·q + b` in f32, the same sum
-/// [`dequant_mlx_a4`] forms (an 8-bit code still exact in the product).
-fn dequant_mlx_a8(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
-    check_mlx_affine(GgmlType::MLX_A8, src)?;
+/// MLX's affine 8-bit groups of 64 ([`GgmlType::MLX_A8`] and
+/// [`GgmlType::MLX_A8H`], 68 bytes: 16 little-endian U32 words of one-byte
+/// codes, then the scale and bias as `pair` stores them) decoded: value `i`
+/// is byte `i` as `s·q + b` in f32, the same sum [`dequant_mlx_a4`] forms (an
+/// 8-bit code still exact in the product, 19 bits at most).
+fn dequant_mlx_a8(
+    ty: GgmlType,
+    pair: AffinePair,
+    src: &[u8],
+    dst: &mut [f32],
+) -> Result<(), QuantError> {
+    check_mlx_affine(ty, src)?;
     for (blk, out) in src
         .as_chunks::<68>()
         .0
         .iter()
         .zip(dst.as_chunks_mut::<64>().0)
     {
-        let s = bf16_bits_to_f32(u16::from_le_bytes([blk[64], blk[65]]));
-        let b = bf16_bits_to_f32(u16::from_le_bytes([blk[66], blk[67]]));
+        let s = pair.widen(u16::from_le_bytes([blk[64], blk[65]]));
+        let b = pair.widen(u16::from_le_bytes([blk[66], blk[67]]));
         for (w, word) in blk[..64].as_chunks::<4>().0.iter().enumerate() {
             let word = u32::from_le_bytes(*word);
             for j in 0..4 {
@@ -4063,7 +4111,7 @@ mod tests {
             let e = check_mlx_affine(ty, &block(ty, 0x7f7f, 0)).unwrap_err();
             assert_eq!(
                 e,
-                QuantError::UndefinedBf16 {
+                QuantError::UndefinedAffinePair {
                     ty,
                     block: 0,
                     field: "scale",
@@ -4088,5 +4136,112 @@ mod tests {
             activation_format(GgmlType::MLX_A8),
             Err(QuantError::NoActivationFormat(GgmlType::MLX_A8))
         );
+    }
+
+    /// One MLX affine group: `words` as the code words, then the scale and the bias bits.
+    fn affine_group(words: &[u32], scale: u16, bias: u16) -> Vec<u8> {
+        let mut b: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        b.extend_from_slice(&scale.to_le_bytes());
+        b.extend_from_slice(&bias.to_le_bytes());
+        b
+    }
+
+    /// The F16-pair types are named and sized as their BF16 twins and decode to the hand values
+    /// of `s·q + b` with `s` and `b` widened from F16 bits: 0x3400 is 0.25, 0xb800 is -0.5, 0x3c00
+    /// is 1, 0xc000 is -2, and 0x0001 is the smallest subnormal, 2^-24. The same bytes read as the
+    /// BF16 type are other values, so the two types are two meanings.
+    #[test]
+    fn mlx_f16_pair_blocks_decode_to_hand_values() {
+        for (ty, twin, name, size) in [
+            (GgmlType::MLX_A4H, GgmlType::MLX_A4, "mlx_a4h", 36),
+            (GgmlType::MLX_A8H, GgmlType::MLX_A8, "mlx_a8h", 68),
+        ] {
+            assert_eq!(ty.name(), Some(name));
+            assert_eq!(ty.blck_size(), Some(64));
+            assert_eq!(ty.type_size(), Some(size));
+            assert_eq!(ty.type_size(), twin.type_size());
+            assert!(ty.has_dequant());
+            assert_eq!(GgmlType::from_u32(ty.as_u32()), ty);
+        }
+        // 4-bit: word 0 holds codes 0..=7 low nibble first, word 1 codes 8..=15.
+        let mut words = [0u32; 8];
+        words[0] = 0x7654_3210;
+        words[1] = 0xfedc_ba98;
+        let src = affine_group(&words, 0x3400, 0xb800);
+        let mut got = [0.0f32; 64];
+        dequant_row(GgmlType::MLX_A4H, &src, &mut got).unwrap();
+        for (i, v) in got.iter().enumerate() {
+            let want = 0.25 * (if i < 16 { i as f32 } else { 0.0 }) - 0.5;
+            assert_eq!(v.to_bits(), want.to_bits(), "mlx_a4h value {i}");
+        }
+        let mut as_bf16 = [0.0f32; 64];
+        dequant_row(GgmlType::MLX_A4, &src, &mut as_bf16).unwrap();
+        assert_ne!(as_bf16[5].to_bits(), got[5].to_bits());
+        // The smallest subnormal scale times the top code, no bias.
+        let mut words = [0u32; 8];
+        words[7] = 0xf000_0000;
+        let src = affine_group(&words, 0x0001, 0x0000);
+        dequant_row(GgmlType::MLX_A4H, &src, &mut got).unwrap();
+        assert_eq!(got[63].to_bits(), (15.0f32 * 2.0f32.powi(-24)).to_bits());
+        assert_eq!(got[62].to_bits(), 0.0f32.to_bits());
+
+        // 8-bit: byte j of word w is value 4w + j.
+        let mut words = [0u32; 16];
+        words[0] = 0x0302_0100;
+        words[1] = 0xfffe_8001;
+        let src = affine_group(&words, 0x3c00, 0xc000);
+        let mut got = [0.0f32; 64];
+        dequant_row(GgmlType::MLX_A8H, &src, &mut got).unwrap();
+        let codes = [0u32, 1, 2, 3, 1, 128, 254, 255];
+        for (i, v) in got.iter().enumerate() {
+            let q = codes.get(i).copied().unwrap_or(0) as f32;
+            assert_eq!(v.to_bits(), (q - 2.0).to_bits(), "mlx_a8h value {i}");
+        }
+        let mut as_bf16 = [0.0f32; 64];
+        dequant_row(GgmlType::MLX_A8, &src, &mut as_bf16).unwrap();
+        assert_ne!(as_bf16[7].to_bits(), got[7].to_bits());
+        // F16's largest finite scale times the top code stays inside f32.
+        let src = affine_group(&words, 0x7bff, 0x0000);
+        dequant_row(GgmlType::MLX_A8H, &src, &mut got).unwrap();
+        assert_eq!(got[7].to_bits(), (65504.0f32 * 255.0).to_bits());
+    }
+
+    /// An F16-pair group whose scale or bias is not finite is refused by name before any value is
+    /// written (0x7c00 inf, 0xfc00 -inf, 0x7e00 NaN), a partial group is `ShortSrc`, and the types
+    /// have no activation format.
+    #[test]
+    fn mlx_f16_pair_blocks_refuse_undefined_pairs() {
+        for ty in [GgmlType::MLX_A4H, GgmlType::MLX_A8H] {
+            let codes = ty.type_size().unwrap() as usize / 4 - 1;
+            let words = vec![0x1111_1111u32; codes];
+            for (scale, bias, field, bits) in [
+                (0x7c00u16, 0u16, "scale", 0x7c00u16),
+                (0x3c00, 0xfc00, "bias", 0xfc00),
+                (0x7e00, 0, "scale", 0x7e00),
+            ] {
+                let src = affine_group(&words, scale, bias);
+                let mut dst = vec![1.0f32; 64];
+                let e = dequant_row(ty, &src, &mut dst).unwrap_err();
+                assert_eq!(
+                    e,
+                    QuantError::UndefinedAffinePair {
+                        ty,
+                        block: 0,
+                        field,
+                        bits,
+                        why: "not finite",
+                    },
+                    "{ty}"
+                );
+                assert!(dst.iter().all(|&v| v == 1.0), "{ty}: a value was written");
+            }
+            let ok = affine_group(&words, 0x3c00, 0x0000);
+            let e = dequant_row(ty, &ok[..ok.len() - 1], &mut vec![0.0; 64]).unwrap_err();
+            assert!(matches!(e, QuantError::ShortSrc { .. }), "{e}");
+            assert_eq!(
+                activation_format(ty),
+                Err(QuantError::NoActivationFormat(ty))
+            );
+        }
     }
 }

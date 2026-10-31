@@ -52,6 +52,12 @@
 //! (1), the lane's sum over its `ceil(nb / 8)` blocks, and the 31 adds of
 //! the SIMD group: `n = 9 + ceil(nb / 8) + 31`.
 //!
+//! **A4H** and **A8H** are those owners over F16 scales and biases: the pair
+//! widens exactly (an F16's significand is 11 bits, a product with a code of
+//! at most 8 bits still fits f32), so the evaluation tree, the magnitudes (the
+//! sign is the top bit of an F16 as it is of a BF16) and the count are A4's
+//! and A8's.
+//!
 //! **Q8_0** (quant.metal's `Q8_0`), one term `d * q * x`, `q` an integer: the
 //! product `q * x` (1), the eight-term chain of the block's code dot (7: its
 //! first add is to zero, exact), the product by `d` (1), the lane's sum over
@@ -303,8 +309,8 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
     let (lane_blocks, base) = match quant {
         Quant::Q4K => (nblocks.div_ceil(4), Q4K_STORE_BASE),
         Quant::Q6K => (nblocks.div_ceil(2), Q6K_STORE_BASE),
-        Quant::A4 => (nblocks.div_ceil(8), A4_STORE_BASE),
-        Quant::A8 => (nblocks.div_ceil(8), A8_STORE_BASE),
+        Quant::A4 | Quant::A4H => (nblocks.div_ceil(8), A4_STORE_BASE),
+        Quant::A8 | Quant::A8H => (nblocks.div_ceil(8), A8_STORE_BASE),
         Quant::Q8_0 => (nblocks.div_ceil(8), Q8_0_STORE_BASE),
         Quant::Q5K => (nblocks.div_ceil(4), Q5K_STORE_BASE),
         Quant::F32 => (nblocks.div_ceil(8), F32_STORE_BASE),
@@ -319,7 +325,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
             let chain = match quant {
                 Quant::Q4K | Quant::Q5K => 8 * lane_blocks,
                 Quant::Q6K => 4 * lane_blocks,
-                Quant::A4 | Quant::A8 => 4 * lane_blocks,
+                Quant::A4 | Quant::A8 | Quant::A4H | Quant::A8H => 4 * lane_blocks,
                 Quant::Q8_0 => 2 * lane_blocks,
                 Quant::F32 => lane_blocks,
             };
@@ -398,8 +404,8 @@ fn k_magnitude_blocks(quant: Quant, row: &[u8]) -> Vec<u8> {
 
 /// `row`'s bytes with the scale's and the bias's sign bits cleared: the
 /// reader's dequantization of them is `|s| q + |b|`, the magnitude of the two
-/// terms of an affine (A4, A8) weight. Each sign bit is the top bit of the
-/// pair's second byte (little-endian), at the group's end.
+/// terms of an affine (A4, A8, A4H, A8H) weight. Each sign bit is the top bit
+/// of the pair's second byte (little-endian), at the group's end.
 fn affine_magnitude_blocks(quant: Quant, row: &[u8]) -> Vec<u8> {
     let bytes = quant.block_bytes();
     assert!(
@@ -454,7 +460,7 @@ pub fn reference(
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
             }
-            Quant::A4 | Quant::A8 => {
+            Quant::A4 | Quant::A8 | Quant::A4H | Quant::A8H => {
                 dequant_row(ty, &affine_magnitude_blocks(quant, row), &mut m)
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()

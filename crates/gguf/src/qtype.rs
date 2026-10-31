@@ -189,6 +189,13 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
     // then the BF16 scale and bias.
     QRow { ty: T::MLX_A8, name: "mlx_a8", blck: 64, bytes: 68, dequant: true, host_act: H::None,
            card: Card::NONE },
+    // mlx_a4h and mlx_a8h: mlx_a4's and mlx_a8's blocks with the scale and the bias stored as F16
+    // bits, where a checkpoint holds `.scales` and `.biases` as F16 (`dequant_mlx_a4`,
+    // `dequant_mlx_a8`): the same sizes and codes, a pair `quant::half_to_f32` widens.
+    QRow { ty: T::MLX_A4H, name: "mlx_a4h", blck: 64, bytes: 36, dequant: true, host_act: H::None,
+           card: Card::NONE },
+    QRow { ty: T::MLX_A8H, name: "mlx_a8h", blck: 64, bytes: 68, dequant: true, host_act: H::None,
+           card: Card::NONE },
 ];
 
 /// The build refuses an own row whose type `from_u32` does not name, whose tag ggml's table
