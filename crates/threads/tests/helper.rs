@@ -4,7 +4,10 @@
 
 use std::sync::mpsc;
 
-use threads::helper::{Placement, float_caller, helpers, mask, sibling_of, spawn_helper};
+use threads::helper::{
+    Parts, PartsFrom, Placement, float_caller, helpers, mask, sibling_of, spawn_helper,
+    spawn_parted,
+};
 
 /// Set the calling thread's mask to `cpus`.
 fn set_mask(cpus: &[usize]) {
@@ -67,9 +70,9 @@ fn a_helper_leaves_its_openers_one_cpu_mask() {
         .find(|h| h.name == "helper-test-float")
         .expect("the helper is listed");
     assert_eq!(
-        (listed.asked, listed.pinned, listed.cpus),
-        (Placement::Float, None, seen.len()),
-        "the list names the helper's mask"
+        (listed.asked, listed.pinned, listed.cpus, listed.parts),
+        (Placement::Float, None, seen.len(), Parts::ALONE),
+        "the list names the helper's mask, and a plain helper reads alone"
     );
 
     let (seen, pinned) = helper_mask("helper-test-pair", pair.clone(), Placement::Float);
@@ -133,4 +136,68 @@ fn a_scoped_thread_floats_off_its_openers_one_cpu_mask() {
         floated.len() > 1,
         "float_caller left the scoped thread on {floated:?}"
     );
+}
+
+/// A helper that splits its reads over the worker pool's threads
+/// ([`Parts::pool`]) is listed with as many threads as the pool's plan on
+/// this machine has participants, and that count's source.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the Linux fact it reads: the process's cpu mask and topology"
+)]
+#[test]
+fn a_parted_helper_is_listed_with_the_pools_threads() {
+    let parts = Parts::pool();
+    let plan = threads::report().expect("the pool's plan");
+    assert_eq!(
+        parts,
+        Parts {
+            threads: plan.threads,
+            from: PartsFrom::Pool
+        }
+    );
+    let (handle, _) =
+        spawn_parted("helper-test-parts", Placement::Float, parts, || {}).expect("placed");
+    handle.join().expect("the helper");
+    let listed = helpers()
+        .into_iter()
+        .find(|h| h.name == "helper-test-parts")
+        .expect("the helper is listed");
+    assert_eq!(listed.parts, parts);
+}
+
+/// A failed pool plan is refused before a helper can choose a reader count.
+/// Each bad lever is read in a fresh process with no built pool.
+#[test]
+fn helper_parts_refuse_a_failed_pool_plan() {
+    if std::env::var_os("HELPER_POOL_REFUSAL").is_some() {
+        assert!(threads::built().is_none());
+        let _parts = Parts::pool();
+        return;
+    }
+    for (name, value) in [
+        (bloomery_levers::THREADS, "0"),
+        (bloomery_levers::THREADS, "not-a-count"),
+        (bloomery_levers::SPIN, "not-a-count"),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "helper_parts_refuse_a_failed_pool_plan",
+                "--nocapture",
+            ])
+            .env("HELPER_POOL_REFUSAL", "1")
+            .env_remove(bloomery_levers::THREADS)
+            .env_remove(bloomery_levers::SPIN)
+            .env(name, value)
+            .output()
+            .expect("the isolated pool-plan test starts");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}={value} was accepted");
+        assert!(
+            stderr.contains("helper parts: cannot read the worker pool plan:")
+                && stderr.contains(name),
+            "{name}={value}: {stderr}"
+        );
+    }
 }

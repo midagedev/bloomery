@@ -46,6 +46,7 @@ crates/gpu-gates/src/bin/gate_ds41_serve.rs	BLOOMERY_VISION_SET	gatestoml
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_HOST_LEASE	TL-7
 crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7
 # Not levers, and they stay.
+crates/threads/tests/helper.rs	HELPER_POOL_REFUSAL	stays: the helper pool-plan refusal test's handshake with the isolated child it runs
 crates/gpu-gates/src/bin/bloomery_serve.rs	SERVE_RECORD_ALIAS_SEAT	stays: the record alias test's handshake with the child it runs, cfg(test) only
 crates/gpu-gates/src/bin/soak_ds41_serve.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card list (the soak checks the card it was given)
 crates/gpu-gates/src/record.rs	CUDA_DEVICE_ORDER	stays: the driver's ordinal order, which the plan record prints beside the ordinals

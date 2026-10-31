@@ -673,7 +673,8 @@ struct PleHost {
 /// table in the split's own mapping ([`SplitTable`]), whose helper advises
 /// a fill's rows and copies them, so the step thread takes neither the
 /// advice nor a fault; a ubatch's rows (16 a position, at hashed places in
-/// the table) in [`PLE_WORKERS`] parts side by side. A prompt call's later
+/// the table) in parts side by side over the worker pool's threads
+/// ([`HelperOptions::spread`]). A prompt call's later
 /// ubatches are read one ahead while the ubatch before them computes
 /// ([`PleHost::prompt_start`]). A fill that waits for its rows at once and
 /// finds none read ahead (a verify's, a step's with no read ahead) reads
@@ -693,12 +694,6 @@ struct PleRead {
     /// The started fill's rows already copied ([`PleRead::read_now`]).
     read: bool,
 }
-
-/// Threads the PLE reader's helper reads a ubatch's rows over
-/// ([`HelperOptions::workers`]): a 4,096-position ubatch names 65,536 rows,
-/// up to one advice call and one page fault a row on each plane, and the
-/// read runs under the layer before the PLE site alone.
-const PLE_WORKERS: usize = 12;
 
 /// One ubatch of a prompt call as [`PleHost::prompt_start`] reads it ahead:
 /// its first position, its positions and its row ids.
@@ -752,12 +747,7 @@ impl PleRead {
         let rows = Prefetcher::over(
             table,
             &[max_rows; 2][..planes],
-            HelperOptions {
-                mode: FillMode::Touch,
-                cpu: caller_sibling(),
-                classify: false,
-                workers: PLE_WORKERS,
-            },
+            HelperOptions::spread(FillMode::Touch, caller_sibling(), false),
         )
         .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(PleRead {

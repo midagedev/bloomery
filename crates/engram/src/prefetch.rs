@@ -34,7 +34,7 @@
 //! SMT sibling of the owner's own pinned core, idle while the owner waits.
 //!
 //! A floating helper may split a large token over more threads
-//! ([`HelperOptions::workers`]): each takes one part of every site's rows and
+//! ([`HelperOptions::parts`]): each takes one part of every site's rows and
 //! advises, fills and copies them into its own part of the buffer, so the
 //! advice syscalls and the faults of a prompt's thousands of rows run side by
 //! side. A token too small to split, and every token of a pinned helper, is
@@ -46,6 +46,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::{Engram, EngramError, Faults, RowTable, RowTables, faults_thread};
+use threads::helper::Parts;
 
 /// How [`Prefetcher::with_options`] starts its helper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,34 +60,46 @@ pub struct HelperOptions {
     pub classify: bool,
     /// Threads a floating helper (`cpu` `None`) splits a token over, itself
     /// included, as many as give every part at least `PART_ROWS` rows of the
-    /// token's largest site; 1, or a `cpu` to pin to, reads every token on
-    /// the helper alone.
-    pub workers: usize,
+    /// token's largest site; one thread, or a `cpu` to pin to, reads every
+    /// token on the helper alone.
+    pub parts: Parts,
 }
 
 /// Rows of a token's largest site one part of a split read takes at least
-/// ([`HelperOptions::workers`]): a decode step's few rows stay on the helper,
+/// ([`HelperOptions::parts`]): a decode step's few rows stay on the helper,
 /// where a thread's start would cost more than its share of the read.
 const PART_ROWS: usize = 1024;
 
 impl HelperOptions {
-    /// A floating helper that classifies nothing.
+    /// A floating helper that classifies nothing and reads alone.
     #[must_use]
     pub fn of(mode: FillMode) -> HelperOptions {
         HelperOptions {
             mode,
             cpu: None,
             classify: false,
-            workers: 1,
+            parts: Parts::ALONE,
+        }
+    }
+
+    /// A helper on `cpu` (`None` floats) that classifies when `classify`
+    /// says and, floating, splits a large token over the worker pool's
+    /// threads on this machine ([`Parts::pool`]).
+    #[must_use]
+    pub fn spread(mode: FillMode, cpu: Option<usize>, classify: bool) -> HelperOptions {
+        HelperOptions {
+            mode,
+            cpu,
+            classify,
+            parts: Parts::pool(),
         }
     }
 
     /// The parts a token whose largest site asks `widest` rows is read in:
     /// one on a pinned helper, whose part threads would inherit its one cpu,
     /// and for a token too small to split.
-    fn parts(&self, widest: usize) -> usize {
-        let workers = if self.cpu.is_some() { 1 } else { self.workers };
-        workers.min(widest / PART_ROWS).max(1)
+    fn split(&self, widest: usize) -> usize {
+        self.parts.threads.min(widest / PART_ROWS).max(1)
     }
 }
 
@@ -126,7 +139,7 @@ struct Filled {
 /// What the read of the token [`Prefetcher::wait`] or [`Prefetcher::read_now`]
 /// just returned spent, and the faults the helper has taken since it started
 /// (a token `read_now` reads on the calling thread adds none). A token read in
-/// parts ([`HelperOptions::workers`]) takes each time from its slowest part,
+/// parts ([`HelperOptions::parts`]) takes each time from its slowest part,
 /// and counts every part's faults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HelperTimes {
@@ -221,9 +234,17 @@ impl Prefetcher {
                 "max_rows_per_site must have one entry per site",
             ));
         }
-        if options.workers == 0 {
+        if options.parts.threads == 0 {
             return Err(EngramError::Prefetch("a helper of no workers"));
         }
+        let options = HelperOptions {
+            parts: if options.cpu.is_some() {
+                Parts::ALONE
+            } else {
+                options.parts
+            },
+            ..options
+        };
         let row_bytes: Vec<usize> = (0..tables.count())
             .map(|i| table_of(tables.as_ref(), i).map(|t| t.row_bytes() as usize))
             .collect::<Result<_, _>>()?;
@@ -250,12 +271,13 @@ impl Prefetcher {
         let (job_tx, job_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Filled>();
         let helper_tables = Arc::clone(&tables);
-        let (handle, cpu) = threads::helper::spawn_helper(
+        let (handle, cpu) = threads::helper::spawn_parted(
             "engram-prefetch",
             options.cpu.map_or(
                 threads::helper::Placement::Float,
                 threads::helper::Placement::Pin,
             ),
+            options.parts,
             move || {
                 helper(helper_tables.as_ref(), options, &job_rx, &done_tx);
             },
@@ -306,7 +328,7 @@ impl Prefetcher {
     /// One token's rows for a caller that waits for them at once:
     /// [`Prefetcher::submit`] then [`Prefetcher::wait`], except that a token
     /// the helper would read alone (every token of a pinned helper, and one
-    /// too small to split, [`HelperOptions::workers`]) is advised, filled and
+    /// too small to split, [`HelperOptions::parts`]) is advised, filled and
     /// copied on the calling thread, so neither thread wakes the other. The
     /// refusals, [`Prefetcher::filled`] and [`Prefetcher::last`] are those
     /// two calls'.
@@ -316,7 +338,7 @@ impl Prefetcher {
     ) -> Result<(), EngramError> {
         let mut job = self.take_job(token_ids)?;
         let widest = job.ids.iter().map(Vec::len).max().unwrap_or(0);
-        if job.len == 0 || self.options.parts(widest) > 1 {
+        if job.len == 0 || self.options.split(widest) > 1 {
             self.send(job)?;
             return self.wait();
         }
@@ -483,7 +505,7 @@ impl Drop for Prefetcher {
 }
 
 /// Advise, fill and copy one token at a time until the job channel closes, a
-/// token of enough rows in parts ([`HelperOptions::workers`]).
+/// token of enough rows in parts ([`HelperOptions::parts`]).
 ///
 /// Errors travel back with the buffer rather than ending the helper: the owner
 /// is blocked in `wait` and has to be told, and the next token may well be
@@ -511,7 +533,7 @@ fn helper(
 }
 
 /// One token's read into its job's buffer on the calling thread, in the
-/// parts its options give it ([`HelperOptions::parts`], every part but the
+/// parts its options give it ([`HelperOptions::split`], every part but the
 /// first on a thread of its own): classified first when the options ask,
 /// then advised, filled and copied. Its times count no faults; the part
 /// threads' own come back beside them, then its first refusal.
@@ -542,7 +564,7 @@ fn read_job(
     }
 
     let widest = job.ids.iter().map(Vec::len).max().unwrap_or(0);
-    let parts = options.parts(widest);
+    let parts = options.split(widest);
     let read = match err {
         Some(e) => Read {
             err: Some(e),
@@ -742,7 +764,7 @@ fn table_of(tables: &dyn RowTables, i: usize) -> Result<&dyn RowTable, EngramErr
 
 #[cfg(test)]
 mod tests {
-    use super::{FillMode, HelperOptions, PART_ROWS, Prefetcher};
+    use super::{FillMode, HelperOptions, PART_ROWS, Parts, Prefetcher};
     use crate::rows::{PageAdvice, RunTable};
     use crate::{EngramError, RowTable};
     use std::path::Path;
@@ -833,19 +855,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("engram-parts-{}", std::process::id()));
         let (tables, bytes) = two_tables(&dir);
         let options = HelperOptions {
-            workers: 4,
+            parts: Parts::asked(4),
             ..HelperOptions::of(FillMode::Touch)
         };
         let max = 3 * PART_ROWS + 5;
         let tables = Arc::new(tables);
-        let none = HelperOptions {
-            workers: 0,
-            ..options
-        };
-        assert!(matches!(
-            Prefetcher::over(tables.clone(), &[max, max], none),
-            Err(EngramError::Prefetch("a helper of no workers"))
-        ));
+        for cpu in [None, Some(0)] {
+            let none = HelperOptions {
+                cpu,
+                parts: Parts::asked(0),
+                ..options
+            };
+            assert!(matches!(
+                Prefetcher::over(tables.clone(), &[max, max], none),
+                Err(EngramError::Prefetch("a helper of no workers"))
+            ));
+        }
         let mut pf = Prefetcher::over(tables, &[max, max], options).unwrap();
         for ids in &big_and_small() {
             pf.submit(ids.iter()).unwrap();
@@ -873,7 +898,7 @@ mod tests {
         let caller = std::thread::current().name().unwrap_or("").to_owned();
         let [big, small] = big_and_small();
         let floating = HelperOptions {
-            workers: 4,
+            parts: Parts::asked(4),
             ..HelperOptions::of(FillMode::Touch)
         };
         let pinned = HelperOptions {
@@ -886,6 +911,15 @@ mod tests {
             (pinned, &big, true),
         ] {
             let mut pf = Prefetcher::over(tables.clone(), &[max, max], options).unwrap();
+            assert_eq!(
+                pf.options.parts,
+                if options.cpu.is_some() {
+                    Parts::ALONE
+                } else {
+                    options.parts
+                },
+                "stored options name the threads used by the read"
+            );
             for t in tables.iter() {
                 t.copied_on.lock().unwrap().clear();
             }

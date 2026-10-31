@@ -1692,7 +1692,14 @@ impl OpenLog<Body> for Log<'_> {
             r.eprint();
         }
         for h in threads::helper::helpers() {
-            record::helper(&h.name, h.asked, h.pinned, h.cpus).eprint();
+            record::helper(
+                &h.name,
+                h.asked,
+                h.pinned,
+                h.cpus,
+                (h.parts.threads, h.parts.from),
+            )
+            .eprint();
         }
         Ok(())
     }

@@ -88,6 +88,66 @@ impl std::fmt::Display for Placement {
     }
 }
 
+/// The threads a helper splits one large read over, itself included, and
+/// where that count comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Parts {
+    pub threads: usize,
+    pub from: PartsFrom,
+}
+
+/// Where a helper's [`Parts`] count comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartsFrom {
+    /// The worker pool's participants on this machine ([`crate::report`]):
+    /// the cores the process's cpu mask leaves, or `BLOOMERY_THREADS`.
+    Pool,
+    /// The caller named the count.
+    Asked,
+}
+
+impl Parts {
+    /// One thread: the helper reads every job alone.
+    pub const ALONE: Parts = Parts::asked(1);
+
+    /// `threads` threads, as the caller names them.
+    #[must_use]
+    pub const fn asked(threads: usize) -> Parts {
+        Parts {
+            threads,
+            from: PartsFrom::Asked,
+        }
+    }
+
+    /// As many threads as the worker pool has participants on this machine
+    /// ([`crate::report`]): a read the step thread waits for runs over the
+    /// cpus its own pool would.
+    ///
+    /// # Panics
+    ///
+    /// Panics by name when the worker pool's plan cannot be read.
+    #[must_use]
+    pub fn pool() -> Parts {
+        let plan = match crate::report() {
+            Ok(plan) => plan,
+            Err(error) => panic!("helper parts: cannot read the worker pool plan: {error}"),
+        };
+        Parts {
+            threads: plan.threads,
+            from: PartsFrom::Pool,
+        }
+    }
+}
+
+impl std::fmt::Display for PartsFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PartsFrom::Pool => "pool",
+            PartsFrom::Asked => "asked",
+        })
+    }
+}
+
 /// A placed helper as [`helpers`] lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Helper {
@@ -98,6 +158,8 @@ pub struct Helper {
     pub pinned: Option<usize>,
     /// Cpus in its mask once placed.
     pub cpus: usize,
+    /// The threads it splits one read over ([`spawn_parted`]).
+    pub parts: Parts,
 }
 
 static HELPERS: Mutex<Vec<Helper>> = Mutex::new(Vec::new());
@@ -119,6 +181,20 @@ pub fn helpers() -> Vec<Helper> {
 pub fn spawn_helper<F>(
     name: &str,
     asked: Placement,
+    body: F,
+) -> Result<(JoinHandle<()>, Option<usize>), HelperError>
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_parted(name, asked, Parts::ALONE, body)
+}
+
+/// [`spawn_helper`] for a helper whose body splits one read over `parts`
+/// threads, listed with the helper.
+pub fn spawn_parted<F>(
+    name: &str,
+    asked: Placement,
+    parts: Parts,
     body: F,
 ) -> Result<(JoinHandle<()>, Option<usize>), HelperError>
 where
@@ -151,6 +227,7 @@ where
                     asked,
                     pinned,
                     cpus,
+                    parts,
                 });
             Ok((handle, pinned))
         }
