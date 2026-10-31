@@ -124,6 +124,12 @@
 //!     a written fixture whose layer holds another layer's experts is refused by name;
 //! 29. the NVFP4 rule: the window holds every (type, K) of the real file's NVFP4 census, filled at
 //!     σ through `gguf::dequant_row`; a K or a window no scale byte pair fits is refused by name;
+//! 40. the RMS band: ±10 % of `1/√K` for a quantized tensor and a uniform draw of many values, and
+//!     for a uniform draw of few values (a 16-head SSMax scale, a router's bias) five standard errors
+//!     of the RMS of its own size, so a few-value spread is not refused for sampling noise;
+//! 39. the IQ1_S rule: the Mistral Large 4 fixture's window holds every K of its IQ1_S routed stacks, filled at σ
+//!     through `gguf::dequant_row`, the scales and deltas read back from the written bytes; a K or a
+//!     window no scale fits is refused by name, and a block whose `d` is not the rule's is refused;
 //! 31. the IQ2_XXS rule: the window holds every K of the real file's IQ2_XXS census, filled at σ
 //!     through `gguf::dequant_row`, the signs and scales read back from the written bytes; a K or a
 //!     window no scale fits is refused by name, and a block whose `d` is not the rule's is refused;
@@ -187,6 +193,7 @@ use model::arch::deepseek41::place::PlanInputs as V41Inputs;
 use model::arch::glm5next::fixture as glm;
 use model::arch::glm5next::hparams::Kind as GlmKind;
 use model::arch::glm5next::place::{NextnInputs, PlanInputs as GlmInputs};
+use model::arch::mistrallarge4::fixture as ml4;
 use model::arch::nemotron_h::fixture as nemo;
 use model::arch::nemotron_h::hparams::{Hparams as NemoHparams, Kind as NemoKind};
 use model::arch::nemotron_h_moe::fixture as bolt;
@@ -1602,6 +1609,7 @@ impl Family for Toy {
             "ratios" => KeyRule::Ratios,
             "layer_list" => KeyRule::LayerIds,
             "per_layer" => KeyRule::PerLayer,
+            "layer_map" => KeyRule::PerLayerIds,
             "expert_feed_forward_length" => KeyRule::Ff,
             "table_rows" => KeyRule::Table,
             _ => return None,
@@ -1752,6 +1760,8 @@ fn toy_source(path: &Path) -> Split {
         ("toy.ratios".to_string(), arr(&[5, 6, 6, 7, 9])),
         ("toy.layer_list".to_string(), arr(&[3])),
         ("toy.per_layer".to_string(), arr(&[10, 11, 12, 13])),
+        // Layer 1's entry names layer 0, which a map of layers [1, 3] does not hold.
+        ("toy.layer_map".to_string(), arr(&[0, 0, 2, 3])),
         (
             "toy.expert_feed_forward_length".to_string(),
             Value::U32(512),
@@ -1854,6 +1864,7 @@ fn fixture_second_family() {
     assert_eq!(unsigned_items(kv("toy.ratios")), [5, 7, 9]);
     assert_eq!(unsigned_items(kv("toy.layer_list")), [1]);
     assert_eq!(unsigned_items(kv("toy.per_layer")), [10, 13]);
+    assert_eq!(unsigned_items(kv("toy.layer_map")), [0, 1]);
     assert_eq!(kv("toy.expert_feed_forward_length"), &Value::U32(256));
     assert_eq!(kv("toy.table_rows"), &Value::U32(TOY_ROWS as u32));
     assert_eq!(unsigned_items(kv(KEY_SOURCE_LAYERS)), [0, 3]);
@@ -1961,7 +1972,7 @@ fn fixture_second_family() {
     );
 
     let mut bad: Vec<String> = Vec::new();
-    let refusals: [(&str, FixtureSpec, bool, &str); 5] = [
+    let refusals: [(&str, FixtureSpec, bool, &str); 6] = [
         (
             "a constant and a spread for one leaf",
             FixtureSpec {
@@ -1989,6 +2000,16 @@ fn fixture_second_family() {
             },
             false,
             "lists layer 3, which the map does not hold",
+        ),
+        (
+            "a layer id naming a layer the map does not hold",
+            FixtureSpec {
+                layers: vec![1, 3],
+                ratios: vec![6, 7],
+                ..toy_spec()
+            },
+            false,
+            "holds 0 at layer 1, which the map does not hold",
         ),
         (
             "a draft for a family with none",
@@ -5780,4 +5801,120 @@ fn hw_fixture_qwen3moe_end_to_end() {
         Err(e) if e.to_string().contains(name) => println!("qwen3moe e2e: a flipped byte: {e}"),
         other => panic!("a flipped byte of {name}: {other:?}"),
     }
+}
+
+/// Contract 39: the Mistral Large 4 fixture's window holds every IQ1_S K of its routed stacks (1,024
+/// for the gate and up stacks and 256 for a down stack at the mini, 6,144 at the real file), a
+/// filled chunk of each dequantizes to an RMS within ±10 % of `1/√K` after every block passes
+/// `check_units` (the scale in the band, each value the grid byte at its scale and stored delta). A K and a window no scale reaches are
+/// refused by name; a block whose `d` is not the rule's is refused by name, and the unchanged block passes.
+#[test]
+fn fixture_ml4_iq1_s_rule_fills_at_sigma() {
+    let window = ml4::spec().window;
+    let mut bad = Vec::new();
+    for k in [256, 1024, 6144] {
+        let ty = GgmlType::IQ1_S;
+        let t = match rule_for("t", ty, k, window) {
+            Ok(rule) => one_chunk(ty, k, rule),
+            Err(e) => {
+                bad.push(format!("{ty} K = {k}: {e}"));
+                continue;
+            }
+        };
+        match filled_ratio(&t, window) {
+            Ok(r) if (0.9..=1.1).contains(&r) => {
+                println!(
+                    "ml4 window: {ty} K = {k}: {}; RMS / sigma = {r:.4}",
+                    t.rule.describe()
+                );
+            }
+            Ok(r) => bad.push(format!("{ty} K = {k}: RMS / sigma = {r:.4}")),
+            Err(e) => bad.push(format!("{ty} K = {k}: {e}")),
+        }
+    }
+    let above = Window::new(1.0 / 16.0, 1.0 / 8.0).unwrap();
+    for (what, k, w) in [
+        ("a K past every scale", 1u64 << 40, window),
+        ("a window above every scale", 4096, above),
+    ] {
+        match rule_for("t", GgmlType::IQ1_S, k, w) {
+            Err(FixtureError::NoScale { ty, k: got, .. }) if (ty, got) == (GgmlType::IQ1_S, k) => {}
+            other => bad.push(format!("{what}: {other:?}")),
+        }
+    }
+    let rule = rule_for("t", GgmlType::IQ1_S, 4096, window).unwrap();
+    let t = one_chunk(GgmlType::IQ1_S, 4096, rule);
+    let mut bytes = vec![0u8; 50 * 4];
+    t.fill_chunk(7, 0, &mut bytes[..]);
+    if let Err(e) = fixture::check_units(&t, &bytes, 0, window) {
+        bad.push(format!("the control block: {e}"));
+    }
+    bytes[0] ^= 1;
+    match fixture::check_units(&t, &bytes, 0, window) {
+        Err(e) if e.to_string().contains("the rule's") => {}
+        other => bad.push(format!("a d off the rule: {other:?}")),
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 40: the sample's RMS is held to ±10 % of `1/√K`, and for a uniform draw of few values to
+/// five standard errors of the RMS of that many draws when that is wider (the relative standard
+/// error of the RMS of `n` uniform draws is `½·√(4/5)/√n`). A 16-value spread at 1.243× σ, the case
+/// of the Mistral Large 4 fixture's `blk.0.attn_ssmax.bias` (the Muse Spark fixture's
+/// `blk.2.exp_probs_b.bias`, 16 values, is at 1.104×), passes; the same sample size far off, a
+/// many-value draw at 1.11× and a quantized tensor at 1.243× are refused. At 500 values and more the
+/// band is ±10 % as before, its bounds the literals `0.9` and `1.1`.
+#[test]
+fn fixture_rms_band_follows_the_sample_size() {
+    let uniform = PlannedTensor {
+        name: "blk.0.bias.weight".into(),
+        source: String::new(),
+        layer: Some(0),
+        dims: vec![16],
+        ty: GgmlType::F32,
+        nbytes: 64,
+        rule: Rule::Uniform {
+            ty: fixture::FloatTy::F32,
+            half_width: 0.5,
+        },
+    };
+    let sigma = uniform.sigma().unwrap();
+    let at = |t: &PlannedTensor, values: usize, ratio: f64| {
+        let rms = ratio * t.sigma().unwrap();
+        fixture::rms_within(
+            t,
+            &fixture::Sample {
+                blocks: values,
+                values,
+                sum_sq: rms * rms * values as f64,
+            },
+        )
+    };
+    assert!((sigma - 0.5 / 3.0f64.sqrt()).abs() < 1e-12);
+    assert_eq!((1.0 - 0.10f64, 1.0 + 0.10f64), (0.9, 1.1));
+    let mut bad = Vec::new();
+    for (what, values, ratio, accepted) in [
+        ("16 values at 1.243x", 16, 1.243, true),
+        ("16 values at 0.60x", 16, 0.60, true),
+        ("16 values at 1.60x", 16, 1.60, false),
+        ("16 values at 0.30x", 16, 0.30, false),
+        ("32 values at 1.20x", 32, 1.20, true),
+        ("4,096 values at 1.09x", 4096, 1.09, true),
+        ("4,096 values at 1.11x", 4096, 1.11, false),
+        ("4,096 values at 0.89x", 4096, 0.89, false),
+    ] {
+        match (at(&uniform, values, ratio), accepted) {
+            (Ok(()), true) | (Err(_), false) => {}
+            (got, _) => bad.push(format!("{what}: {got:?}, accepted {accepted}")),
+        }
+    }
+    let quantized = {
+        let ty = GgmlType::Q8_0;
+        let rule = rule_for("t", ty, 256, rule_window()).unwrap();
+        one_chunk(ty, 256, rule)
+    };
+    if at(&quantized, 256, 1.243).is_ok() {
+        bad.push("a quantized tensor at 1.243x: accepted".into());
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }

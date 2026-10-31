@@ -4,7 +4,7 @@
 use std::fmt;
 
 use gguf::GgmlType;
-use gguf::iq_tables::{IQ2XXS_GRID, KVALUES_IQ4NL};
+use gguf::iq_tables::{IQ1S_GRID, IQ2XXS_GRID, KVALUES_IQ4NL};
 use gguf::quant::{KVALUES_MXFP4, f32_to_f16_bits, half_to_f32, ue4m3_to_f32_half};
 
 use super::FixtureError;
@@ -135,6 +135,11 @@ pub enum Rule {
     /// `IQ2XXS_GRID`'s 256 entries (`g` its bytes) and seven uniform sign bits,
     /// the eighth sign the parity that makes the group's negatives even.
     Iq2Xxs { d: u16, band: Band },
+    /// `d·(2s + 1)·(g + δ)`: per 32-value sub-block the scale `s` (3 bits) has
+    /// `2s + 1` from `band` and the delta `δ` is ±1/8 by one sign bit; each
+    /// group of eight takes an 11-bit index uniform over `IQ1S_GRID`'s 2,048
+    /// entries (`g` its signed bytes, −1, 0 or 1).
+    Iq1S { d: u16, band: Band },
     /// Each of a block's four 16-value sub-blocks takes the UE4M3
     /// scale byte `s_lo` with probability `p_lo / 2^32`, else `s_lo + 1`; `c`
     /// uniform over the 16 codes. The block's dequant is `d·kvalues_fp4[c]`
@@ -226,6 +231,14 @@ impl Rule {
                 b.values.len(),
                 b.mean_sq()
             ),
+            Rule::Iq1S { d, band: b } => format!(
+                "d {:.4e}, 2s+1 in [{}, {}] ({} codes, E[(2s+1)^2] {:.2}), grid index and delta sign uniform",
+                half_to_f32(*d),
+                b.lo,
+                b.hi,
+                b.values.len(),
+                b.mean_sq()
+            ),
             Rule::Mxfp4 { e_lo, p_lo } => format!(
                 "E8M0 {e_lo} (d 2^{}) with p {:.4}, else {} (d 2^{})",
                 i32::from(*e_lo) - 128,
@@ -310,6 +323,28 @@ fn iq2xxs_code_sq() -> f64 {
         .map(|b| f64::from(b) * f64::from(b))
         .sum();
     sum / (IQ2XXS_GRID.len() * 8) as f64 / IQ2XXS_SCALE_DEN_SQ
+}
+/// IQ1_S (`block_iq1_s`: f16 `d`, 32 grid-index bytes, eight u16 `qh` of three
+/// high index bits a group, a 3-bit scale `s` and a delta sign a sub-block of 32
+/// values; value `d·(2s + 1)·(g + δ)` with `g` a signed byte of
+/// [`IQ1S_GRID`]'s entry and `δ = ±IQ1S_DELTA`): a band of the odd integers
+/// `2s + 1` is the scale distribution. The grid index (11 bits) is uniform over
+/// the 2,048 entries and the sign of `δ` is independent of it, so
+/// `E[w²] = d²·E[(2s+1)²]·(E[g²] + δ²)`; `E[g²]` is the mean of the squared grid
+/// bytes over every entry, read from the table.
+const IQ1S_DELTA_SQ: f64 = 0.125 * 0.125;
+/// IQ1_S's sub-block scale codes `2s + 1`, `s` in 0..=7.
+fn iq1s_scale_codes() -> Vec<i32> {
+    (0..8).map(|s| 2 * s + 1).collect()
+}
+/// `E[g²] + δ²`: the grid bytes' mean square and the delta's square.
+fn iq1s_code_sq() -> f64 {
+    let sum: f64 = IQ1S_GRID
+        .iter()
+        .flat_map(|g| g.to_le_bytes())
+        .map(|b| f64::from(b as i8) * f64::from(b as i8))
+        .sum();
+    sum / (IQ1S_GRID.len() * 8) as f64 + IQ1S_DELTA_SQ
 }
 /// NVFP4 (`block_nvfp4`: four UE4M3 sub-block scale bytes, 64 four-bit codes,
 /// value `S·d·kvalues_fp4[c]`; [`ue4m3_to_f32_half`] decodes `d`) carries a
@@ -428,6 +463,9 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64, window: Window) -> Result<Rule
         GgmlType::IQ2_XXS => widest_band(&iq2xxs_scale_codes(), iq2xxs_code_sq(), sigma, in_window)
             .map(|(band, d)| Rule::Iq2Xxs { d, band })
             .ok_or_else(|| no_scale("band of 4-bit scales")),
+        GgmlType::IQ1_S => widest_band(&iq1s_scale_codes(), iq1s_code_sq(), sigma, in_window)
+            .map(|(band, d)| Rule::Iq1S { d, band })
+            .ok_or_else(|| no_scale("band of 3-bit scales")),
         GgmlType::MXFP4 => mxfp4_rule(sigma).ok_or_else(|| no_scale("E8M0 exponent pair")),
         GgmlType::NVFP4 => {
             nvfp4_rule(sigma, window).ok_or_else(|| no_scale("UE4M3 scale byte pair"))
@@ -716,6 +754,18 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
                 let codes: [i32; 8] = draws(rng, band);
                 for (w, c) in blk[2..].as_chunks_mut::<8>().0.iter_mut().zip(codes) {
                     w[7] = (w[7] & 0x0f) | (((c - 1) / 2) as u8) << 4;
+                }
+            }
+        }
+        Rule::Iq1S { d, band } => {
+            for blk in units::<50>(out) {
+                blk[0..2].copy_from_slice(&d.to_le_bytes());
+                rng.fill(&mut blk[2..50]);
+                let codes: [i32; 8] = draws(rng, band);
+                // The scale `s` is bits 12..14 of a little-endian `qh`, so bits 4..6 of its high byte;
+                // the delta sign and the index bits stay random.
+                for (qh, c) in blk[34..50].as_chunks_mut::<2>().0.iter_mut().zip(codes) {
+                    qh[1] = (qh[1] & 0x8f) | (((c - 1) / 2) as u8) << 4;
                 }
             }
         }
