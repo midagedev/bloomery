@@ -1059,7 +1059,8 @@ impl PlanInputs {
     /// sum to [`SeqTerms::plan_kv`]. One slot is [`PlanInputs::plan_nextn`]
     /// itself; zero is refused by name. The trunk's NVMe tier split runs at the
     /// room less the NextN layer's routed experts, which are the host's beside
-    /// it; a room under them is refused by name.
+    /// it; a room under them is refused by name
+    /// ([`PlacementError::DraftHostRoom`]).
     pub fn plan_nextn_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -1114,11 +1115,12 @@ impl PlanInputs {
             // [`PlanInputs::plan_slots`] counts them.
             plan.cards[0].grow_kv(beside);
             let planned_at = plan.plan_at(&self.room);
-            let room = planned_at.checked_sub(draft_host).ok_or_else(|| {
-                PlacementError::HostRoom(format!(
-                    "the NextN layer's routed experts, {draft_host} B, pass the host room {planned_at} B"
-                ))
-            })?;
+            let room = planned_at
+                .checked_sub(draft_host)
+                .ok_or(PlacementError::DraftHostRoom {
+                    room: planned_at,
+                    draft: draft_host,
+                })?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             // A split plan's headroom is what the room it ran at left, a room
             // short of the draft's experts. An unsplit plan's headroom never
@@ -2552,9 +2554,10 @@ mod tests {
                     },
                 );
                 match routed(draft - 1).plan_nextn_slots(&m, CTX, &unset, &nextn, n) {
-                    Err(PlaceError::Placement(PlacementError::HostRoom(e))) => {
-                        assert!(e.contains(&draft.to_string()), "{e}");
-                    }
+                    Err(PlaceError::Placement(PlacementError::DraftHostRoom {
+                        room,
+                        draft: d,
+                    })) => assert_eq!((d, room), (draft, draft - 1), "the draft's own bytes"),
                     other => panic!(
                         "a room under the draft's experts: {:?}",
                         other.map(|p| p.plan.card_budget)

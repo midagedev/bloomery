@@ -1503,6 +1503,7 @@ fn refused_of(p: &PlacementError) -> Outcome {
         PlacementError::Unclassified { .. } => ("unclassified", None),
         PlacementError::Metadata { .. } | PlacementError::Tensor { .. } => ("metadata", None),
         PlacementError::HostRoom(_) => ("host-room", None),
+        PlacementError::DraftHostRoom { .. } => ("draft-host-room", None),
         PlacementError::NoCardFormat { .. } => ("no-card-format", None),
         // A census file whose dense trunk alone passes the visible card's
         // free reading (a BF16 set on the gate machine): the planner's own

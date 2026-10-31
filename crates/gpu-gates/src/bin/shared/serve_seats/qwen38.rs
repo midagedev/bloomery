@@ -321,9 +321,10 @@
 //! round of the busy slots' sampled and greedy requests one pass of their
 //! windows. Unset, the draft
 //! then yields to the context
-//! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
+//! (`bloomery_gpu_gates::generate::draft_yield`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot half the positions of the plan
-//! without it or fewer, a set `--ctx-size` included, one `draft yield` record naming
+//! without it or fewer, or holds no context at all, a set `--ctx-size` included (any
+//! other refusal of the plan with it stops the load by name), one `draft yield` record naming
 //! its card bytes and the positions a slot gets either way, and the plain
 //! plan's `ctx` line following; `BLOOMERY_DRAFT=mtp` set never yields. `BLOOMERY_DRAFT=off` is the plain
 //! path with the same record; `mtp` drafts wherever the draft loads. The
@@ -456,7 +457,9 @@ use bloomery_gpu_gates::bind::{
     bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
     prefill_then_step, put_back, seat_failure, slots_of,
 };
-use bloomery_gpu_gates::generate::{BreakEven, FloorShort, Lane, Place, lane_of};
+use bloomery_gpu_gates::generate::{
+    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, holds_no_ctx, lane_of,
+};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
@@ -1042,7 +1045,7 @@ fn check_draft_word(levers: &bloomery_levers::Levers) -> Result<(), GateError> {
 /// `load draft=off` record's); `lookup` the lookup draft in its place
 /// (`drafted::Lookups`), the MTP draft off with no why. This is the rule
 /// before the plan: the unset draft's yield to the context
-/// (`bloomery_levers::RungCost::of`, the module doc) is decided after the
+/// (`generate::draft_yield`, the module doc) is decided after the
 /// context choice, at the caller. `dspark` and any other word are refused by
 /// name.
 ///
@@ -1392,8 +1395,9 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
 /// count; unset, the most whose plan holds the context one slot's default takes where that is
 /// the target (the model's limit), with no total, so the default asks the target again over
 /// every slot. A default fitted under the target at one slot serves one, as does one whose
-/// floor the plans cannot hold, or a drafted one the plans refuse (the default's draft
-/// yield answers both, and a draft that cannot yield keeps the refusal), and so does a
+/// floor the plans cannot hold, or a drafted one that holds no context
+/// (`generate::holds_no_ctx`; the default's draft yield answers both, and a draft that
+/// cannot yield keeps the refusal), and so does a
 /// `--slot-ctx` one slot cannot hold, whose ask is refused by name as a set context.
 fn auto38(plans: &Plans<'_>, slot_ctx: Option<usize>) -> Result<(usize, Option<usize>), GateError> {
     let (ctx, least) = match slot_ctx {
@@ -1412,10 +1416,13 @@ fn auto38(plans: &Plans<'_>, slot_ctx: Option<usize>) -> Result<(usize, Option<u
                 );
                 return Ok((1, None));
             }
-            // A floor the machine cannot hold, or a drafted plan it refuses, is the one-slot
-            // default's to answer: its yield plans without the draft, and asks the refusal
-            // again where the draft cannot yield.
-            Err(e) if e.is::<FloorShort>() || plans.mtp.is_some() => {
+            // A floor the machine cannot hold, or a drafted plan that holds no context, is the
+            // one-slot default's to answer: its yield plans without the draft, and asks the
+            // refusal again where the draft cannot yield.
+            Err(e)
+                if e.is::<FloorShort>()
+                    || plans.mtp.is_some() && holds_no_ctx::<PlaceError>(&e) =>
+            {
                 eprintln!("parallel auto slots=1: the default does not hold at one slot ({e})");
                 return Ok((1, None));
             }
@@ -1436,20 +1443,17 @@ fn auto38(plans: &Plans<'_>, slot_ctx: Option<usize>) -> Result<(usize, Option<u
             .downcast_ref::<PlaceError>()
             .and_then(PlanRefusal::placement)
             .or_else(|| e.downcast_ref::<PlacementError>());
-        let (need, room) = match placement {
-            Some(PlacementError::HostRoomFloor { floor, room, .. }) => (*floor, *room),
-            Some(PlacementError::NvTierArenaUnder { arena, least }) => (least.bytes, *arena),
-            Some(PlacementError::NvTierArena { arena, room, floor }) => (*arena, *room - *floor),
-            _ => match e.downcast_ref::<HostShort>() {
-                Some(short) => (short.need.bytes(), short.available),
-                None => return q38place::probe(Err(e)),
-            },
-        };
-        Ok(Probe::Short(Short {
-            on: Side::Host,
-            need,
-            room,
-        }))
+        if let Some(short) = placement.and_then(PlacementError::host_floor_short) {
+            return Ok(Probe::Short(short));
+        }
+        match e.downcast_ref::<HostShort>() {
+            Some(short) => Ok(Probe::Short(Short {
+                on: Side::Host,
+                need: short.need.bytes(),
+                room: short.available,
+            })),
+            None => q38place::probe(Err(e)),
+        }
     })?
     .unwrap_or(1);
     Ok((n, slot_ctx.map(|s| s * n)))
@@ -2074,38 +2078,33 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         folder: folder.as_ref(),
         floor,
     };
-    // The unset draft's yield to the context (the module doc): the context
-    // comes first, so when the drafted load fitted its context, or holds not
-    // even the floor, the plain load decides; it holds twice as much or more,
-    // the draft goes off and one `draft yield` record names both. A set
-    // `--ctx-size` asks too; `BLOOMERY_DRAFT` never does.
+    // The unset draft's yield to the context (the module doc,
+    // `generate::draft_yield`): one `draft yield` record names both contexts.
+    // A set `--ctx-size` asks too; `BLOOMERY_DRAFT` never does.
     let asks_yield = mtp && draft_off.is_none() && levers.draft().is_none();
-    let (plans, mut rule, mtp, head, draft_off) = match ctx38(&drafted, a.ctx) {
-        Ok(r) if !matches!(r.rule, Rule::Fitted { .. }) => (drafted, r, mtp, head, draft_off),
-        r if !asks_yield => (drafted, r?, mtp, head, draft_off),
-        drafted_rule => {
-            let plain_plans = Plans {
-                mtp: None,
-                ..drafted
-            };
+    let plain_plans = Plans {
+        mtp: None,
+        ..drafted
+    };
+    let chosen_draft = draft_yield::<PlaceError, _, _>(
+        asks_yield,
+        ctx38(&drafted, a.ctx),
+        |r| matches!(r.rule, Rule::Fitted { .. }).then_some(r.ctx),
+        || {
             let plain = ctx38(&plain_plans, a.ctx)?;
-            let with = drafted_rule.as_ref().map_or(0, |r| r.ctx);
             let bytes = mtp_inputs
                 .as_ref()
                 .expect("a drafted choice held the draft")
                 .card_bytes_of(u64::try_from(plain.ctx)?, slots)?;
-            match bloomery_levers::RungCost::of(
-                bloomery_levers::Reserve::Draft,
-                u64::try_from(with)?,
-                u64::try_from(plain.ctx)?,
-                bytes,
-            ) {
-                Some(y) => {
-                    record::draft_yield(&y).eprint();
-                    (plain_plans, plain, false, None, Some(Draft38Off::Yield(y)))
-                }
-                None => (drafted, drafted_rule?, mtp, head, draft_off),
-            }
+            let ctx = plain.ctx;
+            Ok((plain, ctx, bytes))
+        },
+    )?;
+    let (plans, mut rule, mtp, head, draft_off) = match chosen_draft {
+        DraftYield::Keep(r) => (drafted, r, mtp, head, draft_off),
+        DraftYield::Yield(plain, y) => {
+            record::draft_yield(&y).eprint();
+            (plain_plans, plain, false, None, Some(Draft38Off::Yield(y)))
         }
     };
     let host = plans.host(rule.ctx, set)?;
@@ -4241,6 +4240,65 @@ mod tests {
             .collect::<Vec<_>>();
         let mtp = MtpInputs::from_parts(draft, &file).expect("the draft's inputs");
         let levers = model::placement::PlanLevers::default();
+        // Both discrete placements fit before reads; the plain folder load fits exactly,
+        // while the draft's checkpoint rows push its load past the same host boundary.
+        {
+            let (mut inputs, folder, _) = seat_plan_inputs();
+            inputs.spec.ctx_train = 4096;
+            let (plain_need, reads) = seat_plans(&inputs, place, &levers, None, Some(&folder))
+                .read(4096, |p| {
+                    assert_eq!(p.host.nvme_arena_bytes, 0);
+                    (
+                        HostNeed::of(p, 0).bytes(),
+                        folder.least_reads(p, super::CARD38).expect("part reads"),
+                    )
+                })
+                .expect("the plain placement")
+                .1;
+            let drafted_need = seat_plans(&inputs, place, &levers, Some(&mtp), None)
+                .read(4096, |p| {
+                    assert_eq!(p.host.nvme_arena_bytes, 0);
+                    HostNeed::of(p, 0).bytes()
+                })
+                .expect("the drafted placement")
+                .1;
+            assert!(drafted_need > plain_need);
+            assert!(reads > drafted_need - plain_need);
+            inputs.room = (plain_need + reads, HostRead::Given);
+            let plain = seat_plans(&inputs, place, &levers, None, Some(&folder));
+            super::ctx38(&plain, None).expect("the plain folder load fits exactly");
+            let drafted = seat_plans(&inputs, place, &levers, Some(&mtp), Some(&folder));
+            seat_plans(&inputs, place, &levers, Some(&mtp), None)
+                .holds(4096)
+                .expect("the drafted placement fits before reads");
+            let e = super::ctx38(&drafted, None)
+                .err()
+                .expect("the drafted folder load is short");
+            let short = e
+                .downcast_ref::<model::placement::workstation::HostShort>()
+                .expect("a discrete host shortage");
+            assert!(short.pool_short().is_none());
+            assert_eq!(
+                auto38(&drafted, None).expect("one slot lets the draft yield"),
+                (1, None)
+            );
+            let chosen = super::draft_yield::<super::PlaceError, _, _>(
+                true,
+                Err::<super::Ctx38, _>(e),
+                |_| panic!("the drafted load is short"),
+                || {
+                    let chosen = super::ctx38(&plain, None)?;
+                    let bytes = mtp.card_bytes_of(u64::try_from(chosen.ctx)?, plain.slots)?;
+                    let ctx = chosen.ctx;
+                    Ok((chosen, ctx, bytes))
+                },
+            )
+            .expect("the draft yields to the fitting plain folder load");
+            assert!(matches!(
+                chosen,
+                super::DraftYield::Yield(super::Ctx38 { ctx: 4096, .. }, _)
+            ));
+        }
         let (room, arena) = seat_plans(&inputs, place, &levers, Some(&mtp), None)
             .read(4096, |p| {
                 let floor = ArenaFloor::of(p).expect("the resident arena floor");
@@ -4384,21 +4442,23 @@ mod tests {
         assert!(slots > 1);
         assert_eq!(total, None);
 
-        let e = auto38(
-            &Plans {
-                ubatch: 0,
-                ..seat_plans(&inputs, place, &levers, Some(&mtp), None)
-            },
-            Some(4096),
-        )
-        .expect_err("a configuration error is no capacity limit");
-        assert!(
-            matches!(
-                e.downcast_ref::<super::PlaceError>(),
-                Some(super::PlaceError::Ubatch { .. })
-            ),
-            "{e}"
-        );
+        for slot_ctx in [Some(4096), None] {
+            let e = auto38(
+                &Plans {
+                    ubatch: 0,
+                    ..seat_plans(&inputs, place, &levers, Some(&mtp), None)
+                },
+                slot_ctx,
+            )
+            .expect_err("a configuration error is no capacity limit");
+            assert!(
+                matches!(
+                    e.downcast_ref::<super::PlaceError>(),
+                    Some(super::PlaceError::Ubatch { .. })
+                ),
+                "{e}"
+            );
+        }
         inputs.model.tensors[0].ty = gguf::GgmlType::Unknown(999);
         let e = auto38(
             &seat_plans(&inputs, place, &levers, Some(&mtp), None),

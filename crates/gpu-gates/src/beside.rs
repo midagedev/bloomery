@@ -10,6 +10,8 @@ use std::fmt::Display;
 
 use model::placement::{Card, Device, Machine, Reserve};
 
+use crate::GateError;
+
 /// What the plan's reserve for the image encoder's tower is called, as the plan's terms name it
 /// (beside `workstation`'s draft and tier-batch reserves).
 pub const IMAGE_ENCODER: &str = "image encoder";
@@ -92,16 +94,39 @@ pub fn note(card: &Card) -> String {
         .collect()
 }
 
-/// A plan's refusal, beside the reserves that were in it: with none the refusal as it is.
-pub fn refusal(beside: Beside, e: impl Display) -> String {
+/// A plan's refusal, beside the reserves that were in it: with none the refusal as it is, else
+/// named with them, the refusal its source so a caller still reads its type.
+pub fn refusal<E: Into<GateError>>(beside: Beside, e: E) -> GateError {
     let held: Vec<String> = beside
         .named()
         .map(|(name, bytes)| format!("the {name}'s {bytes} B as the stage card's {name} reserve"))
         .collect();
     if held.is_empty() {
-        return e.to_string();
+        return e.into();
     }
-    format!("the plan holds {}: {e}", held.join(" and "))
+    Box::new(Named {
+        text: format!("the plan holds {}", held.join(" and ")),
+        source: e.into(),
+    })
+}
+
+/// A refusal named with the reserves beside the plan ([`refusal`]).
+#[derive(Debug)]
+struct Named {
+    text: String,
+    source: GateError,
+}
+
+impl Display for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.text, self.source)
+    }
+}
+
+impl std::error::Error for Named {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
 }
 
 #[cfg(test)]
@@ -148,11 +173,25 @@ mod tests {
             note(&probe.cards[0]),
             "; the reserves term holds the image encoder's 1476000000 B"
         );
-        assert_eq!(refusal(Beside::default(), "no fit"), "no fit");
+        let no_fit = || std::io::Error::other("no fit");
+        let bare = refusal(Beside::default(), no_fit());
+        assert_eq!(bare.to_string(), "no fit");
+        assert!(bare.is::<std::io::Error>(), "the refusal as it is");
+        let named = refusal(image, no_fit());
         assert_eq!(
-            refusal(image, "no fit"),
+            named.to_string(),
             "the plan holds the image encoder's 1476000000 B as the stage card's image encoder \
              reserve: no fit"
+        );
+        assert_eq!(
+            std::error::Error::source(&*named)
+                .expect("the refusal")
+                .to_string(),
+            "no fit"
+        );
+        assert!(
+            std::error::Error::source(&*named).is_some_and(|e| e.is::<std::io::Error>()),
+            "the refusal stays the source"
         );
     }
 
@@ -186,8 +225,9 @@ mod tests {
                     image: None,
                     embedding: Some(7),
                 },
-                "no fit"
-            ),
+                std::io::Error::other("no fit")
+            )
+            .to_string(),
             "the plan holds the embedding model's 7 B as the stage card's embedding model \
              reserve: no fit"
         );
