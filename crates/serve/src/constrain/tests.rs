@@ -3585,6 +3585,12 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
         prop(json!({"$ref": 5})),
         json!({"type": "string"}),
         json!(5),
+        json!({"type": "object", "properties": {}, "required": [1],
+            "additionalProperties": false}),
+        json!({"type": "object", "properties": {}, "required": ["x"],
+            "additionalProperties": false}),
+        json!({"type": "object", "allOf": [{"properties": {"x": {"type": "string"}}}],
+            "required": [1]}),
     ];
     for parameters in &invalid {
         for format in [ToolFormat::Hermes, QWEN] {
@@ -3803,7 +3809,7 @@ fn a_schema_is_invalid_on_every_route_or_on_none() {
             usize::try_from(self.0 % u64::try_from(n).unwrap()).unwrap()
         }
     }
-    let pool: [(&str, [Value; 6]); 9] = [
+    let pool: [(&str, [Value; 6]); 10] = [
         (
             "type",
             [
@@ -3868,6 +3874,17 @@ fn a_schema_is_invalid_on_every_route_or_on_none() {
                 json!(["z"]),
                 json!("q"),
                 json!([5]),
+            ],
+        ),
+        (
+            "additionalProperties",
+            [
+                json!(false),
+                json!(true),
+                json!({"type": "string"}),
+                json!({"type": "str"}),
+                json!(null),
+                json!(5),
             ],
         ),
         (
