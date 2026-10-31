@@ -3,13 +3,13 @@
 
 use std::fmt::Write as _;
 
-use model::arch::coverage::{self, AVAILABLE, Available};
+use model::arch::coverage::{self, Available};
 use model::arch::models::ModelSpec;
 use model::placement::ModelTensors;
 
 use crate::spec_view::items;
 
-/// The check's FAIL-first specimen: with the row of [`AVAILABLE`] at `at`
+/// The check's FAIL-first specimen: with the row of [`coverage::rows`] at `at`
 /// removed, the check lists `want` (the need that row covered, on its layers)
 /// beside the items the whole table leaves; restored, it lists only those.
 pub fn fail_first(
@@ -21,12 +21,9 @@ pub fn fail_first(
     want: &str,
 ) {
     let whole = items(&coverage::check(spec, tensors));
-    let table: Vec<Available> = AVAILABLE.iter().copied().filter(|a| a.at != at).collect();
-    assert_eq!(
-        table.len() + 1,
-        AVAILABLE.len(),
-        "one row of AVAILABLE is at {at}"
-    );
+    let rows = coverage::rows(spec.arch);
+    let table: Vec<Available> = rows.iter().copied().filter(|a| a.at != at).collect();
+    assert_eq!(table.len() + 1, rows.len(), "one row is at {at}");
     let less = items(&coverage::check_with(spec, tensors, &table));
     let added: Vec<&String> = less.iter().filter(|l| !whole.contains(l)).collect();
     let _ = writeln!(out, "coverage without `{at}`: added {added:?}");

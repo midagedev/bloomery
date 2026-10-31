@@ -13,6 +13,7 @@
 
 use gguf::Split;
 
+use super::coverage::Available;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
@@ -127,6 +128,9 @@ pub struct ArchRow {
     /// Whether a set of this architecture can run its draft file ([`draft::draft_usable`]); `None`
     /// for an architecture with no rule.
     pub draft: Option<Rule>,
+    /// The coverage rows only this family's program runs, which [`super::coverage::rows`] adds to
+    /// the common table for a file of this row; `None` for a family the common table covers whole.
+    pub coverage: Option<&'static [Available]>,
     pub fixture: Option<Fixture>,
 }
 
@@ -144,6 +148,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["deepseek2"],
         read: None,
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -151,6 +156,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["deepseek41", DEEPSEEK4],
         read: Some(deepseek41::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "v41",
             repo: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
@@ -166,6 +172,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["qwen3moe"],
         read: Some(qwen3moe::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "qwen3moe",
             repo: "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
@@ -182,6 +189,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["qwen4exp"],
         read: Some(qwen35moe::spec::read),
         draft: Some(draft::qwen4exp_usable),
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "qwen38",
             repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
@@ -195,6 +203,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["qwen35moe"],
         read: Some(qwen35moe::spec::read),
         draft: Some(draft::qwen35moe_usable),
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "qwen35moe",
             repo: "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
@@ -210,6 +219,7 @@ pub static ROWS: &[ArchRow] = &[
         names: QWEN35_BODY,
         read: Some(qwen35moe::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -218,6 +228,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["llama"],
         read: Some(llama::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -226,6 +237,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["lfm3"],
         read: Some(lfm3::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -233,6 +245,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["glm5next", GLM5_NEXT_LLAMA_CPP],
         read: Some(glm5next::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "glm5next",
             repo: "unsloth/GLM-5.3-Flash-GGUF",
@@ -248,6 +261,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["mimo2"],
         read: Some(mimo2::spec::read),
         draft: Some(draft::mimo2_usable),
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -255,6 +269,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["minimax-m3"],
         read: Some(minimaxm3::spec::read),
         draft: None,
+        coverage: Some(minimaxm3::spec::AVAILABLE),
         fixture: Some(Fixture::Cut(CutRow {
             family: "minimaxm31",
         })),
@@ -264,6 +279,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["raon1"],
         read: Some(raon1::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -271,6 +287,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["solar-open2"],
         read: Some(solar2::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "solar2",
             repo: "llamaraspberryrabbit/Solar-Open2-250B-GGUF",
@@ -287,6 +304,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["nemotron_h"],
         read: Some(nemotron_h::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "nemotron",
             repo: "nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF",
@@ -301,6 +319,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["nemotron_h_moe"],
         read: Some(nemotron_h_moe::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "nemotron-bolt",
             repo: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
@@ -316,6 +335,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &[GEMMA_EMBEDDING],
         read: Some(gemma_embedding::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -323,6 +343,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &[GEMMA_EMBEDDING2],
         read: Some(gemma_embedding2::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -330,6 +351,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["flint"],
         read: Some(flint::spec::read),
         draft: None,
+        coverage: None,
         fixture: None,
     },
     ArchRow {
@@ -337,6 +359,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["muse-spark"],
         read: Some(musespark::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "musespark",
             repo: "unsloth/Muse-Spark-Open-816B-A42B-GGUF",
