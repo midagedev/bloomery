@@ -819,11 +819,12 @@ card bytes and the positions a slot gets either way, and the context line that f
 `BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 the MTP draft runs on any slot count, set or unset.
 The drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
 (the default, temperature 0.8 as in llama-server), on ones that ban an id (`ignore_eos`) or bias ids (`logit_bias`),
-and on ones that ask for probabilities (`n_probs`, `logprobs`), alone or beside other running requests: each kept id
-is the request's own pick from its verified row (its sampler's draw or the argmax, with each biased id's bias added
-and every banned id's logit at -inf), as llama.cpp's speculative decoding takes it, so a request of one seed takes the
-same ids alone and beside others. Its probabilities are read from the same verified rows, so they are the values its
-steps would report. Structured output steps one token at a time.
+on ones that ask for probabilities (`n_probs`, `logprobs`) and on structured output, alone or beside other running
+requests: each kept id is the request's own pick from its verified row (its sampler's draw or the argmax, with each
+biased id's bias added, every banned id's logit at -inf and, under a schema, every id it does not allow masked out),
+as llama.cpp's speculative decoding takes it, so a request of one seed takes the same ids alone and beside others.
+Its probabilities are read from the same verified rows, so they are the values its steps would report. A forced
+call's program waits for the model's own close of its think span stepping one token at a time.
 A request under DSpark decodes one token a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
