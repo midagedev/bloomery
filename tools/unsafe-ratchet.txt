@@ -1061,7 +1061,10 @@ placement 0 0 0
 # PIN(2026-10-31): qdot 261 -> 269 blocks, 120 -> 124 fns, new code, not old code relaxed: the IQ1_S x Q8_K port of
 # ik's AVX2 body (lib.rs: `iq1s_pack`, `iq1s_block_step`, `dot_iq1s_q8k_avx2`, `dot_iq1s_q8k_tile_avx2` and their
 # dispatch calls), each with its SAFETY line.
-qdot 269 124 0
+# PIN(2026-11-01): qdot 269 -> 271 blocks, 124 -> 126 fns, new code, not old code relaxed: the IQ2_XXS kernel's whole-block
+# pack splits into ik's three steps (`iq2xxs_new_block`, `iq2xxs_prepare`, `iq2xxs_multiply_add`, each
+# #[target_feature] with its SAFETY line) in place of `iq2xxs_pack`.
+qdot 271 126 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0
