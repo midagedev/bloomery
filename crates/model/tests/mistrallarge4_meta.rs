@@ -442,14 +442,18 @@ fn mistrallarge4_header() {
             bad.push(format!("{want}: not in the coverage list"));
         }
     }
-    // The context bound: the identity selection up to the indexer's top-k.
+    // The context bound: every position the file trained (1M here); past it
+    // is named. PIN(2026-11-01): the card tier of R4a lifted the fixture's
+    // bound from the indexer's top-k to the trained context (the selected
+    // walk serves past the top-k), so the header's own bound is the trained
+    // one alone.
     let ctx = model::arch::mistrallarge4::spec::serve_ctx;
-    if ctx(2048, s) != Ok(2048) {
-        bad.push(format!("serve_ctx(2048) = {:?}", ctx(2048, s)));
+    if ctx(1_048_576, s) != Ok(1_048_576) {
+        bad.push(format!("serve_ctx(1_048_576) = {:?}", ctx(1_048_576, s)));
     }
-    let refused = ctx(2049, s).expect_err("past the top-k");
-    if !refused.to_string().contains("index_topk") {
-        bad.push(format!("serve_ctx(2049): {refused}"));
+    let refused = ctx(1_048_577, s).expect_err("past the trained context");
+    if !refused.to_string().contains("trained at 1048576") {
+        bad.push(format!("serve_ctx(1_048_577): {refused}"));
     }
 
     println!(
@@ -587,13 +591,16 @@ fn mistrallarge4_fixture_cut() {
             bad.push(format!("layer {f} cache {:?}", a.cache));
         }
     }
-    // The reader serves a context up to the indexer's top-k, the mini's 16.
+    // The reader serves every position the fixture trained (64), past the
+    // indexer's own top-k 16 among them; past the trained one is named.
+    // PIN(2026-11-01): R4a's card tier lifted the top-k bound (above).
     let ctx = model::arch::mistrallarge4::spec::serve_ctx;
-    if ctx(16, s) != Ok(16) || ctx(17, s).is_ok() {
+    if ctx(16, s) != Ok(64) || ctx(64, s) != Ok(64) || ctx(65, s).is_ok() {
         bad.push(format!(
-            "serve_ctx(16) = {:?}, (17) = {:?}",
+            "serve_ctx(16) = {:?}, (64) = {:?}, (65) = {:?}",
             ctx(16, s),
-            ctx(17, s)
+            ctx(64, s),
+            ctx(65, s)
         ));
     }
 

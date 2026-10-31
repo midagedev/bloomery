@@ -700,13 +700,10 @@ impl Head {
     /// tokens then the fault's two words). `tail` must write both as
     /// `enqueue`'s gemv and argmax do; [`Head::token`] and
     /// [`Head::logits_to_host`] are unchanged.
-    /// Pure enqueues, so the same body is what a capture records.
-    pub(crate) fn enqueue_with_tail<F>(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        tail: F,
-    ) -> Result<(), GpuError>
+    /// Pure enqueues, so the same body is what a capture records. Public
+    /// because an architecture crate's chain writes its own tail (a logit
+    /// epilogue the shared one holds no launch of).
+    pub fn enqueue_with_tail<F>(&mut self, gpu: &Gpu, w: &Weights, tail: F) -> Result<(), GpuError>
     where
         F: FnOnce(
             &Q8Act,
@@ -752,6 +749,12 @@ impl Head {
     /// Public because an architecture crate's chain writes it too.
     pub fn input_mut(&mut self) -> &mut DeviceBuffer<f32> {
         &mut self.x
+    }
+
+    /// The chain's input row as it stands (the running residual of the
+    /// layers a chain has run), the read side of [`Head::input_mut`].
+    pub fn input(&self) -> &DeviceBuffer<f32> {
+        &self.x
     }
 
     /// The normed rows of the last run (the dump's `result_norm` tap; under
