@@ -339,6 +339,18 @@ impl SiteEntry {
         }
     }
 
+    /// The activation this site's wide prompt GEMM reads: what
+    /// [`SiteEntry::reads`] says, except NVFP4, whose GEMM reads the q8 blocks
+    /// of 32 ([`SiteAct::Q8x32`]) at any width of its 64-value blocks while its
+    /// gemv reads the q8_1 rows.
+    #[must_use]
+    pub const fn reads_wide(self) -> SiteAct {
+        match self {
+            SiteEntry::Nvfp4 => SiteAct::Q8x32,
+            _ => self.reads(),
+        }
+    }
+
     /// The activation this site's launch reads over rows of `k` values: what
     /// [`SiteEntry::reads`] says, except NVFP4 at a width that is no multiple
     /// of the q8_1 super-block's 256 values. Its gemv reads whole super-blocks;

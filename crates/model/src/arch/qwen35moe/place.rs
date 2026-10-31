@@ -63,7 +63,7 @@ use crate::placement::workstation::{
 use crate::placement::{
     self, Card, CardFormat, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
     ModelTensors, Node, PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation,
-    checked, joined,
+    checked, joined, kernels,
 };
 use gguf::digest::hex;
 
@@ -539,6 +539,50 @@ impl PlanInputs {
     /// [`coverage::check`] lists them. Empty for a file the program runs.
     pub fn unimplemented(&self) -> Vec<Unimplemented> {
         coverage::check(&self.spec, &self.model)
+    }
+
+    /// The file's layers and the card bytes a position of the ubatch walk
+    /// holds in the quantized forms its wide dense sites read: for each width
+    /// the walk's rows hold, the forms the layers' dense matrices of that row
+    /// width read ([`kernels::wide_act_bytes`]), the one rule the load
+    /// allocates them by. A machine counts them beside the walk's other rows
+    /// ([`machine_for_route`]).
+    #[must_use]
+    pub fn stack(&self) -> Stack {
+        let dense = |t: &&ModelTensor| {
+            t.layer.is_some_and(|l| l < self.model.layers)
+                && t.dims.len() == 2
+                && matches!(
+                    t.role,
+                    Role::Attention | Role::SharedExpert | Role::DenseFfn | Role::EngramDense
+                )
+        };
+        let mut widths: Vec<u64> = self
+            .model
+            .tensors
+            .iter()
+            .filter(dense)
+            .map(|t| t.dims[0])
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        let act_token_bytes = widths
+            .into_iter()
+            .map(|k| {
+                let tys = self
+                    .model
+                    .tensors
+                    .iter()
+                    .filter(dense)
+                    .filter(|t| t.dims[0] == k)
+                    .map(|t| t.ty);
+                kernels::wide_act_bytes(tys, 1, k)
+            })
+            .sum();
+        Stack {
+            layers: self.spec.layers.len(),
+            act_token_bytes,
+        }
     }
 
     /// The form a load of the file holds its card route's runs in, on a
@@ -1283,8 +1327,7 @@ pub const UBATCH_ARENA_TOKEN_BYTES: u64 = 477_408;
 
 /// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
 /// arena's, [`UBATCH_ARENA_TOKEN_BYTES`]; the walk's own
-/// buffers, 110,644.125 B — the 32-value activations of the model-width, the
-/// attention-width and the SwiGLU rows (3,200, 7,680 and 800 B), the wide
+/// buffers, 98,964.125 B — the wide
 /// mixes' scratch (98,356 B: the normed streams and the up's rows at 40,960 B
 /// each, their activations, the down's and inject's dots, the bottleneck and
 /// its Q8 activations, BF16 pairs and refusal, the weights), the indexer
@@ -1296,7 +1339,9 @@ pub const UBATCH_ARENA_TOKEN_BYTES: u64 = 477_408;
 // under their gate, so the arena holds no flash rows, 6,144 f32 a position.
 // PIN(2026-10-28): 617,337 (was 644,345): the arena holds no query rows (6,144 f32), no
 // separate β and α rows (96 f32) and no one-row indexer queries (512 f32) a position.
-pub const UBATCH_TOKEN_BYTES: u64 = UBATCH_ARENA_TOKEN_BYTES + 120_889;
+// PIN(2026-11-01): 109,209 (was 120,889): the activations' quantized forms are the file's
+// ([`Stack::act_token_bytes`]), counted beside this.
+pub const UBATCH_TOKEN_BYTES: u64 = UBATCH_ARENA_TOKEN_BYTES + 109_209;
 
 /// Card bytes a qwen4exp ubatch walk's selection holds for one run of its
 /// selecting rows: the walk takes as many rows a run as these bytes hold at
@@ -1314,6 +1359,37 @@ pub const SELECT_RUN_BYTES: u64 = 22_000_000;
 /// past the q·k·v rows of a walk of up to five positions, at most 133,124 B;
 /// 31,089,672 B, rounded up to 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
 pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
+
+/// The card bytes a position of a qwen4exp ubatch walk holds in the q8
+/// blocks of 32 of its model-width, attention-width and SwiGLU rows
+/// [derived: 2,560, 6,144 and 640 values at 1.25 B, 3,200, 7,680 and 800 B]:
+/// what a machine built from a layer count alone counts for the quantized
+/// forms its dense sites read ([`Stack`]), every row's q8 blocks of 32 and no
+/// q8_1 form.
+pub const Q8_BLOCKS32_TOKEN_BYTES: u64 = 3_200 + 7_680 + 800;
+
+/// The facts a machine counts a qwen4exp load's ubatch walk by: the file's
+/// layers and the card bytes a position of the walk holds in the quantized
+/// forms its wide dense sites read ([`PlanInputs::stack`] for a file,
+/// [`Stack::q8_blocks32`] for a synthetic spec).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stack {
+    pub layers: usize,
+    pub act_token_bytes: u64,
+}
+
+impl Stack {
+    /// `layers` layers of a stack whose dense sites read the q8 blocks of 32
+    /// of every row ([`Q8_BLOCKS32_TOKEN_BYTES`]): a synthetic spec's, which
+    /// has no file types for [`PlanInputs::stack`] to read.
+    #[must_use]
+    pub const fn q8_blocks32(layers: usize) -> Stack {
+        Stack {
+            layers,
+            act_token_bytes: Q8_BLOCKS32_TOKEN_BYTES,
+        }
+    }
+}
 
 /// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what
 /// its load's allocations may not pass.
@@ -1659,20 +1735,15 @@ pub const fn tier_route_scratch_bytes(cols: u64) -> u64 {
 /// plan's load ([`Experts::Host`]); a card one's
 /// ([`machine_for_experts`]) beside the ubatch walk's card route.
 #[must_use]
-pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
-    machine_for_experts(card, layers, ubatch, Experts::Host)
+pub fn machine(card: CardSpec, stack: Stack, ubatch: u64) -> Machine {
+    machine_for_experts(card, stack, ubatch, Experts::Host)
 }
 
 /// [`machine_for_route`] with the card route counted in [`RouteForm::Rows`],
 /// the larger form.
 #[must_use]
-pub fn machine_for_experts(
-    card: CardSpec,
-    layers: usize,
-    ubatch: u64,
-    experts: Experts,
-) -> Machine {
-    machine_for_route(card, layers, ubatch, experts, RouteForm::Rows)
+pub fn machine_for_experts(card: CardSpec, stack: Stack, ubatch: u64, experts: Experts) -> Machine {
+    machine_for_route(card, stack, ubatch, experts, RouteForm::Rows)
 }
 
 /// [`machine`] for a plan whose routed experts go where `experts` says: under
@@ -1688,7 +1759,7 @@ pub fn machine_for_experts(
 #[must_use]
 pub fn machine_for_route(
     card: CardSpec,
-    layers: usize,
+    stack: Stack,
     ubatch: u64,
     experts: Experts,
     form: RouteForm,
@@ -1697,7 +1768,8 @@ pub fn machine_for_route(
         Experts::Host => 0,
         Experts::Card => card_route_scratch_bytes(ubatch, form),
     };
-    let mut machine = workstation::placed_on(card, layers, card_scratch_bytes(ubatch) + route);
+    let scratch = card_scratch_bytes(ubatch) + ubatch * stack.act_token_bytes + route;
+    let mut machine = workstation::placed_on(card, stack.layers, scratch);
     if card.integrated {
         machine.cards[0].reserves.push((
             ACT_FORMS_RESERVE.to_string(),
@@ -1810,13 +1882,8 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
 /// the named reproduction of the maintainer's two cards; a load lays out
 /// [`machine_bp_on`] over the cards its placement resolved on the census.
 #[must_use]
-pub fn machine_bp(
-    layers: usize,
-    ubatch: u64,
-    draft: Option<u64>,
-    batch: TierBatchBytes,
-) -> Machine {
-    machine_bp_on((A6000, RTX_3090), layers, ubatch, draft, batch)
+pub fn machine_bp(stack: Stack, ubatch: u64, draft: Option<u64>, batch: TierBatchBytes) -> Machine {
+    machine_bp_on((A6000, RTX_3090), stack, ubatch, draft, batch)
 }
 
 /// [`machine_bp`] with `stage` the stage card and `tier` its expert tier
@@ -1824,12 +1891,12 @@ pub fn machine_bp(
 #[must_use]
 pub fn machine_bp_on(
     (stage, tier): (CardSpec, CardSpec),
-    layers: usize,
+    stack: Stack,
     ubatch: u64,
     draft: Option<u64>,
     batch: TierBatchBytes,
 ) -> Machine {
-    let mut m = machine_for_experts(stage, layers, ubatch, Experts::Card);
+    let mut m = machine_for_experts(stage, stack, ubatch, Experts::Card);
     m.cards[0].scratch_bytes += card_tier_join_bytes(ubatch);
     m.cards[0]
         .reserves
@@ -3037,7 +3104,11 @@ mod tests {
         assert!(header.is_header_only());
         let source = super::PlanInputs::describe_in(&header, (u64::MAX, HostRead::Given))
             .expect("the folder header describes");
-        let machine = super::machine(super::A6000, inputs.model.layers, 8);
+        let machine = super::machine(
+            super::A6000,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
+            8,
+        );
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
         };
@@ -4769,7 +4840,12 @@ mod tests {
                 let (got, want) = headroom(&drafted.plan);
                 assert_eq!(got, want, "{n} slots: the drafted plan on one card");
                 let reserve = mtp.card_bytes_of(CTX, n).expect("the draft's card bytes");
-                let bp = machine_bp(LAYERS, 4096, Some(reserve), batch);
+                let bp = machine_bp(
+                    crate::arch::qwen35moe::place::Stack::q8_blocks32(LAYERS),
+                    4096,
+                    Some(reserve),
+                    batch,
+                );
                 let drafted = tiered
                     .plan_mtp_with_slots(
                         &bp,
@@ -5212,7 +5288,12 @@ mod tests {
             let batch = tier_batch_of(2560, 10, 4096);
             for n in [1, 2, 4] {
                 let reserve = mtp.card_bytes_of(CTX, n).expect("the draft's card bytes");
-                let machine = machine_bp(LAYERS, 4096, Some(reserve), batch);
+                let machine = machine_bp(
+                    crate::arch::qwen35moe::place::Stack::q8_blocks32(LAYERS),
+                    4096,
+                    Some(reserve),
+                    batch,
+                );
                 let r = inputs.plan_mtp_with_slots(
                     &machine,
                     (CTX, UBATCH_PLANNED.min(CTX)),
@@ -5232,7 +5313,12 @@ mod tests {
                 .card_bytes_of(CTX, 2)
                 .expect("two sequences' card bytes");
             assert!(two > one, "{two} B for two sequences, {one} B for one");
-            let machine = machine_bp(LAYERS, 4096, Some(one), batch);
+            let machine = machine_bp(
+                crate::arch::qwen35moe::place::Stack::q8_blocks32(LAYERS),
+                4096,
+                Some(one),
+                batch,
+            );
             match inputs.plan_mtp_with_slots(
                 &machine,
                 (CTX, UBATCH_PLANNED.min(CTX)),
@@ -5502,7 +5588,14 @@ mod tests {
             inputs.model.tensors[last].ty = GgmlType::Q4_K;
             assert_eq!(inputs.route_form(true), RouteForm::Rows);
             let scratch = |experts: Experts, form: RouteForm| {
-                super::super::machine_for_route(RTX_3090, LAYERS, 4096, experts, form).cards[0]
+                super::super::machine_for_route(
+                    RTX_3090,
+                    crate::arch::qwen35moe::place::Stack::q8_blocks32(LAYERS),
+                    4096,
+                    experts,
+                    form,
+                )
+                .cards[0]
                     .scratch_bytes
             };
             assert_eq!(
@@ -5511,7 +5604,13 @@ mod tests {
             );
             assert_eq!(
                 scratch(Experts::Card, RouteForm::Rows),
-                super::super::machine_for_experts(RTX_3090, LAYERS, 4096, Experts::Card).cards[0]
+                super::super::machine_for_experts(
+                    RTX_3090,
+                    crate::arch::qwen35moe::place::Stack::q8_blocks32(LAYERS),
+                    4096,
+                    Experts::Card
+                )
+                .cards[0]
                     .scratch_bytes
             );
             assert_eq!(
@@ -5578,8 +5677,18 @@ mod tests {
         fn the_machine_of_plan_bp() {
             let batch = tier_batch_of(2560, 10, 4096);
             for draft in [None, Some(2_843_762_444u64)] {
-                let m = machine_bp(48, 4096, draft, batch);
-                let a = machine_for_experts(A6000, 48, 4096, Experts::Card);
+                let m = machine_bp(
+                    crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                    4096,
+                    draft,
+                    batch,
+                );
+                let a = machine_for_experts(
+                    A6000,
+                    crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                    4096,
+                    Experts::Card,
+                );
                 let [stage] = m.cards.as_slice() else {
                     panic!("{} stage cards", m.cards.len())
                 };
@@ -5646,11 +5755,26 @@ mod tests {
         #[test]
         fn the_draft_reserve_is_the_plans_own() {
             let batch = tier_batch_of(2560, 10, 4096);
-            let plain = machine_bp(48, 4096, None, batch);
-            let drafted = machine_bp(48, 4096, Some(100), batch);
+            let plain = machine_bp(
+                crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                4096,
+                None,
+                batch,
+            );
+            let drafted = machine_bp(
+                crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                4096,
+                Some(100),
+                batch,
+            );
             assert!(check_draft_reserve(&plain, None).is_ok());
             assert!(check_draft_reserve(&drafted, Some(100)).is_ok());
-            let mut twice = machine_bp(48, 4096, Some(100), batch);
+            let mut twice = machine_bp(
+                crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                4096,
+                Some(100),
+                batch,
+            );
             twice.cards[0].reserves.push((MTP_RESERVE.to_string(), 100));
             for (m, want, got) in [
                 (&plain, Some(100), vec![]),
@@ -5689,7 +5813,14 @@ mod tests {
             ..A6000
         };
         for ub in [512, 4096] {
-            let stage = machine_for_experts(unified, 48, ub, Experts::Card).cards[0].clone();
+            let stage = machine_for_experts(
+                unified,
+                crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                ub,
+                Experts::Card,
+            )
+            .cards[0]
+                .clone();
             assert_eq!(
                 stage.reserves,
                 vec![(ACT_FORMS_RESERVE.to_string(), ub * 14_772)]
@@ -5697,11 +5828,25 @@ mod tests {
             for at in [ub, ub / 2] {
                 assert_eq!(act_forms_bytes(&stage, at).expect("the form"), ub * 14_772);
             }
-            let discrete = machine_for_experts(A6000, 48, ub, Experts::Card).cards[0].clone();
+            let discrete = machine_for_experts(
+                A6000,
+                crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+                ub,
+                Experts::Card,
+            )
+            .cards[0]
+                .clone();
             assert!(discrete.reserves.is_empty(), "{:?}", discrete.reserves);
             assert_eq!(act_forms_bytes(&discrete, ub).expect("no form"), 0);
         }
-        let mut card = machine_for_experts(unified, 48, 512, Experts::Card).cards[0].clone();
+        let mut card = machine_for_experts(
+            unified,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(48),
+            512,
+            Experts::Card,
+        )
+        .cards[0]
+            .clone();
         for rows in [vec![512 * 14_772 - 1], vec![512 * 14_772; 2]] {
             card.reserves = rows
                 .iter()

@@ -171,7 +171,7 @@ use crate::model::{
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::rows::{Laid, RowFormat, RowKernels, RowRead};
-use crate::site::{BY_NAME_COLS, ByName};
+use crate::site::ByName;
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
@@ -1914,14 +1914,14 @@ impl Body38 {
         )?;
         let rp = PassRecord::new(stream)?;
         let pass_hsum = DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?;
-        // The ubatch walk projects a K-quant site by chunks of the by-name
-        // unit's columns on the main stream alone.
+        // The ubatch walk runs every dense site on its wide GEMM: its arena
+        // holds no by-name state.
         let wa = Arena38::wide(
             stream,
             router_dims,
             (ub, UBATCH_MOST, final_res(&plans)),
             ctx,
-            (by_state(BY_NAME_COLS.min(ub))?, by_none()?),
+            (by_none()?, by_none()?),
         )?;
         let wr = WideRecord::new(stream, ub)?;
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;

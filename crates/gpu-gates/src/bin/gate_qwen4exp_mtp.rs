@@ -2763,7 +2763,7 @@ mod gate {
         let device = census.first().ok_or("no visible card")?;
         let machine = machine_for_experts(
             model::placement::devices::spec_of_device(device),
-            inputs.spec.layers.len(),
+            inputs.stack(),
             ub as u64,
             Experts::Card,
         );
@@ -2863,7 +2863,7 @@ mod gate {
             3 * CHECKPOINT_EVERY as u64,
         );
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(ctx as usize)?;
-        let machine = machine(card()?, inputs.spec.layers.len(), ub as u64);
+        let machine = machine(card()?, inputs.stack(), ub as u64);
         let plan = inputs.plan_mtp_with_slots(
             &machine,
             (ctx, ub as u64),
@@ -4042,7 +4042,7 @@ mod gate {
         let p = CHECKPOINT_EVERY as usize;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX_LONG)?)?;
         let (file, draft) = (open_target()?, open_draft()?);
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(card()?, inputs.stack(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX_LONG)?;
         let plan = inputs.plan_mtp(
             &machine,
@@ -4138,7 +4138,7 @@ mod gate {
         ub: usize,
         prompt: &[u32],
     ) -> Result<(Qwen38Model, bool), GateError> {
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(card()?, inputs.stack(), u64::try_from(ub)?);
         let plain_plan = inputs.plan(&machine, (CTX, u64::try_from(ub)?), &plan_levers(0)?)?;
         let mut b = Body38::open_placed(open_target()?, &plain_plan, inputs, 0, cfg().host, ub)?;
         // Other ids over the same length: the state's rows differ from
@@ -4934,7 +4934,7 @@ mod gate {
         let n = prompt.len();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
         let (file, draft) = (open_target()?, open_draft()?);
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(card()?, inputs.stack(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX)?;
         let plan = inputs.plan_mtp(
             &machine,
@@ -5773,7 +5773,7 @@ mod gate {
         const ROUNDS: usize = 8;
         let ctx = u32::try_from(CTX)?;
         let (file, draft_file) = (open_target()?, open_draft()?);
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(card()?, inputs.stack(), u64::try_from(ub)?);
         let plan = inputs.plan_mtp_with_slots(
             &machine,
             (CTX, u64::try_from(ub)?),
@@ -7026,12 +7026,8 @@ mod gate {
     /// (unset: none), whose plans hold the draft's bytes out of the card's
     /// own: the counts are printed there, not pinned.
     fn draft_budget(inputs: &PlanInputs, mtp: &MtpInputs, ub: usize) -> Result<bool, GateError> {
-        let machine = machine_for_experts(
-            card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-            Experts::Card,
-        );
+        let machine =
+            machine_for_experts(card()?, inputs.stack(), u64::try_from(ub)?, Experts::Card);
         let alone = inputs.plan_with(
             &machine,
             (CTX, u64::try_from(ub)?),
@@ -7095,12 +7091,8 @@ mod gate {
         prompt: &[u32],
     ) -> Result<bool, GateError> {
         const N: usize = 32;
-        let machine = machine_for_experts(
-            card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-            Experts::Card,
-        );
+        let machine =
+            machine_for_experts(card()?, inputs.stack(), u64::try_from(ub)?, Experts::Card);
         let extra = mtp.card_bytes(CTX)?;
         // The room halves until the plan pages through an arena; a room the
         // tier's floor refuses ends the search, and the clause is red there.
@@ -7331,7 +7323,7 @@ mod gate {
         };
         let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
-        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine(card()?, inputs.stack(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX)?;
         let plan = inputs.plan_mtp(
             &machine,

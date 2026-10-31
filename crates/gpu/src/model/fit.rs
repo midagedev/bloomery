@@ -9,7 +9,7 @@
 //! ([`act_col_bytes`], [`act32_col_bytes`], [`route_bytes`]) are exposed here
 //! too, with the q8_1 column count delegated to placement's layout owner.
 
-use crate::gemm::{GEMM_BN, GEMM32_STEP};
+use crate::gemm::GEMM_BN;
 
 /// Card bytes a load leaves free past the arena it sizes by this rule: what
 /// the load and the first prompt still allocate after the arena — the
@@ -46,7 +46,8 @@ pub fn act_col_bytes(k: usize) -> usize {
 /// Bytes of one `GemmAct32` column of `k` values: per 64-value step sixteen
 /// code words, two scales and two sums.
 pub fn act32_col_bytes(k: usize) -> usize {
-    k.div_ceil(GEMM32_STEP) * (16 + 2 + 2) * 4
+    usize::try_from(model::placement::kernels::gemm_act32_bytes(1, k as u64))
+        .expect("the q8 blocks of 32's column bytes fit a usize")
 }
 
 /// Bytes of a `GemmRoute` table for `slots` slots over `experts` experts.

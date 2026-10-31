@@ -1460,7 +1460,7 @@ mod cli {
         experts: Experts,
         draft: Option<u64>,
     ) -> Result<Machine, GateError> {
-        let layers = inputs.spec.layers.len();
+        let layers = inputs.stack();
         let page = stage_page(place.card_specs()?[0])?;
         let mut machine = match place.card_specs()?.as_slice() {
             &[_, _] => {

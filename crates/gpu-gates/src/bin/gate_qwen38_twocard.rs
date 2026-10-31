@@ -152,7 +152,7 @@ mod gate {
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
     use model::arch::qwen35moe::place::{
-        Experts, PlaceError, PlanInputs, machine_bp_on, tier_batch,
+        Experts, PlaceError, PlanInputs, Stack, machine_bp_on, tier_batch,
     };
     use model::placement::host_lock::{HostFile, HostSet};
     use model::placement::workstation::{self, A6000, Pick, RTX_3090, TierBatchBytes};
@@ -264,7 +264,7 @@ mod gate {
     /// [`REAL_BUDGET_GIB`] and the union limit were found on, and refuses a
     /// pair without that room by name; the fixture tier plans `bp` as the
     /// devices report themselves (`--place bp`).
-    fn bp_machine(layers: usize, ub: u64, batch: TierBatchBytes) -> Result<Machine, GateError> {
+    fn bp_machine(layers: Stack, ub: u64, batch: TierBatchBytes) -> Result<Machine, GateError> {
         let census = bloomery_gpu::census()?;
         let specs = match tier::Tier::from_env()? {
             tier::Tier::Real => {
@@ -1014,7 +1014,7 @@ mod gate {
             )
             .into());
         }
-        let layers = inputs.spec.layers.len();
+        let layers = inputs.stack();
         let bp = bp_machine(layers, ub as u64, tier_batch(&inputs.spec, ub as u64))?;
         let Chosen { plan, tight, .. } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
@@ -1665,7 +1665,7 @@ mod gate {
         // refused here as every other gate refuses it.
         tier::plan_levers(&split, &levers, 0)?;
         let ub = ubatch_for(CTX)?;
-        let layers = inputs.spec.layers.len();
+        let layers = inputs.stack();
         let bp = bp_machine(layers, ub as u64, tier_batch(&inputs.spec, ub as u64))?;
         let Chosen {
             plan,

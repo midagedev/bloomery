@@ -23,7 +23,7 @@ use super::spec;
 pub use crate::arch::hybrid::{Experts, Holds, KvLayout, PlaceError, PlanInputs};
 use crate::placement::PlacementError;
 use crate::placement::kernels::{
-    card_planes_runs, card_relu2_runs, q8_act_bytes, q8_blocks32_bytes,
+    card_planes_runs, card_relu2_runs, gemm_act32_bytes, q8_act_bytes, q8_blocks32_bytes,
 };
 
 /// The rows the plan keeps a prompt pass's buffers for: the host union's columns, the most a
@@ -111,10 +111,9 @@ fn act_col_bytes(k: usize) -> usize {
     q8_act_bytes(1, k as u64) as usize
 }
 
-/// Bytes of one `GemmAct32` column of `k` values: per 64-value step sixteen code words, two
-/// scales and two sums.
+/// Bytes of one `GemmAct32` column of `k` values ([`gemm_act32_bytes`]).
 fn act32_col_bytes(k: usize) -> usize {
-    k.div_ceil(GEMM32_STEP) * (16 + 2 + 2) * 4
+    gemm_act32_bytes(1, k as u64) as usize
 }
 
 /// Bytes of one native FP4 column of `k` values (a multiple of 64) beside a `GemmAct32` column:

@@ -303,11 +303,15 @@ fn card_experts_with(
 
 /// The machine the Qwen3.8 gates plan a file on at [`BUDGET_CTX`]
 /// positions: `card` laid out by `machine_for_experts` with the ubatch such a
-/// load runs, the routed experts where [`place::Experts::Card`] says.
+/// load runs, the routed experts where [`place::Experts::Card`] says. The
+/// recorded fixture budgets were planned with the walk holding the q8 blocks
+/// of 32 of every row ([`place::Stack::q8_blocks32`]); counting the file's
+/// own forms ([`place::PlanInputs::stack`]) picks other card experts, so it
+/// waits for the fixture sets' next regeneration.
 fn budget_machine(card: CardSpec, inputs: &place::PlanInputs) -> Machine {
     place::machine_for_experts(
         card,
-        inputs.spec.layers.len(),
+        place::Stack::q8_blocks32(inputs.spec.layers.len()),
         place::UBATCH_PLANNED.min(BUDGET_CTX),
         place::Experts::Card,
     )

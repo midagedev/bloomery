@@ -270,8 +270,14 @@ fn hw_qwen4exp_mtp_plan() {
             (&p.rows, &p.cards, &host, p.nvme_bytes, &p.n_l, p.ctx_max)
         )
     };
+    // PIN(2026-11-01): the q8 blocks of 32 of every row, the rule these pins were recorded under
+    // (qwen4exp_meta.rs, beside CARD_SCRATCH).
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
+        let machine = place::machine(
+            card,
+            place::Stack::q8_blocks32(inputs.spec.layers.len()),
+            place::UBATCH_PLANNED,
+        );
         for ctx in [4096u64, 32_768] {
             let plain = inputs
                 .plan(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers)
@@ -338,7 +344,7 @@ fn hw_qwen4exp_mtp_plan() {
             for ctx in [4096u64, 4352, 32_768] {
                 let machine = place::machine_for_experts(
                     card,
-                    inputs.spec.layers.len(),
+                    place::Stack::q8_blocks32(inputs.spec.layers.len()),
                     place::UBATCH_PLANNED.min(ctx),
                     experts,
                 );
@@ -598,15 +604,16 @@ fn hw_qwen4exp_bp_mtp_plan() {
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let (ctx, u) = (4096u64, 4096u64);
     let n = inputs.spec.layers.len();
+    let stack = place::Stack::q8_blocks32(n);
     let levers = PlanLevers::default();
     let batch = tier_batch(&inputs.spec, u);
     let bytes = mtp
         .card_bytes(ctx)
         .unwrap_or_else(|e| panic!("card_bytes: {e}"));
-    let machine = machine_bp(n, u, Some(bytes), batch);
+    let machine = machine_bp(stack, u, Some(bytes), batch);
     // Plan (a)'s rule at the A6000's budget less the tier join's scratch
     // (`place::card_tier_join_bytes`), which plan (b′) adds to its scratch.
-    let mut a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    let mut a_machine = place::machine_for_experts(A6000, stack, u, Experts::Card);
     a_machine.cards[0].scratch_bytes += place::card_tier_join_bytes(u);
     let a = inputs
         .plan_mtp_with(
@@ -696,7 +703,7 @@ fn hw_qwen4exp_bp_mtp_plan() {
         }
     }
     for (label, reserve) in [("none", None), ("one byte more", Some(bytes + 1))] {
-        let wrong = machine_bp(n, u, reserve, batch);
+        let wrong = machine_bp(stack, u, reserve, batch);
         let got = inputs.plan_mtp_with(
             &wrong,
             (ctx, UBATCH_PLANNED.min(ctx)),

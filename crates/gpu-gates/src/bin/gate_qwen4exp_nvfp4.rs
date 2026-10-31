@@ -223,7 +223,7 @@ mod gate {
             )?;
             let machine = model::arch::qwen35moe::place::machine_for_experts(
                 card,
-                inputs.spec.layers.len(),
+                inputs.stack(),
                 ub as u64,
                 Experts::Card,
             );

@@ -2188,12 +2188,7 @@ fn run() -> Result<(), GateError> {
     let card = gate_card::init()?;
     let probe = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&probe, Some(ROOM))?;
-    let machine = machine_for_experts(
-        card,
-        inputs.spec.layers.len(),
-        ubatch_for(CTX)? as u64,
-        Experts::Card,
-    );
+    let machine = machine_for_experts(card, inputs.stack(), ubatch_for(CTX)? as u64, Experts::Card);
     let plan = inputs.plan_with(
         &machine,
         plan_shape()?,

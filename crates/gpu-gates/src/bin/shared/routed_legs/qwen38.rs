@@ -179,7 +179,7 @@ fn machine(
     seqs: Seqs,
 ) -> Result<Machine, Outcome> {
     let (ctx, ub) = terms;
-    let layers = inputs.spec.layers.len();
+    let layers = inputs.stack();
     let cards = place.card_specs().map_err(|e| outcome_of(e.as_ref()))?;
     let mut machine = match cards.as_slice() {
         &[stage] => machine_for_experts(stage, layers, ub, Experts::Card),

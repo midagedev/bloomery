@@ -204,7 +204,14 @@ pub(crate) fn by_name(
     let (_, xw, mut gw) = columns(gpu, (wide, k, rows), seed ^ 0x77, 1.0)?;
     let mut act = GemmAct32::new(stream, wide, k)?;
     let sink = gpu.unlabelled_sink();
-    site::resident_quantize(gpu, &kernels, (w, &[name]), (&xw, wide), &mut act, sink)?;
+    site::resident_quantize(
+        gpu,
+        &kernels,
+        (w, &[name]),
+        (&xw, wide),
+        (None, &mut act),
+        sink,
+    )?;
     let x_in = WideIn {
         q128: None,
         q32: Some(&act),

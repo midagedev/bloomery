@@ -3653,7 +3653,7 @@ mod gate {
     ) -> Result<model::placement::Machine, GateError> {
         let mut machine = machine_for_route(
             stage,
-            inputs.spec.layers.len(),
+            inputs.stack(),
             ub,
             experts,
             inputs.route_form(bloomery_gpu::NATIVE_FP4),

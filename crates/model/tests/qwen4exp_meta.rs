@@ -268,6 +268,9 @@ const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_590_819), ("3090", 590_740)]
 // PIN(2026-10-30): the ubatch arena's BF16 stream buffer, a halfword a value, 20,480 B fewer per
 // ubatch position [derived: 2,635,173,888 − 4,096 · 20,480 and 417,477,120 − 512 · 20,480; the
 // planner on this tree printed the 4,096 row].
+// PIN(2026-11-01): these plans count the walk's quantized forms as the q8 blocks of 32 of every row
+// (`place::Stack::q8_blocks32`), the rule every pin here was recorded under; the file's own forms
+// (`PlanInputs::stack`) wait for a re-pin from `just gate-qwen4exp-meta` on the box.
 const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_551_287_808), (512, 406_991_360)];
 
 // PIN(2026-09-29): the card scratch of a card-experts machine
@@ -452,7 +455,11 @@ fn hw_qwen4exp_plan() {
     );
     let levers = PlanLevers::default();
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, n_layer, place::UBATCH_PLANNED);
+        let machine = place::machine(
+            card,
+            place::Stack::q8_blocks32(n_layer),
+            place::UBATCH_PLANNED,
+        );
         for (ctx, kv) in KV_AT {
             let plan = match inputs.plan(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers) {
                 Ok(p) => p,
@@ -595,7 +602,11 @@ fn hw_qwen4exp_plan() {
             at_max && past,
         );
     }
-    let machine = place::machine(A6000, n_layer, place::UBATCH_PLANNED);
+    let machine = place::machine(
+        A6000,
+        place::Stack::q8_blocks32(n_layer),
+        place::UBATCH_PLANNED,
+    );
     // The plan's host set, from the headers: the PLE table's pages once, beside the routed
     // stacks', each run grown to whole pages and merged per shard.
     match inputs.plan(
@@ -1060,7 +1071,12 @@ fn hw_qwen4exp_card_plan() {
     let levers = PlanLevers::default();
     for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS {
         let card = if name == A6000.name { A6000 } else { RTX_3090 };
-        let machine = place::machine_for_experts(card, inputs.spec.layers.len(), u, Experts::Card);
+        let machine = place::machine_for_experts(
+            card,
+            place::Stack::q8_blocks32(inputs.spec.layers.len()),
+            u,
+            Experts::Card,
+        );
         let got = if with_draft {
             inputs
                 .plan_mtp_with(
@@ -1177,7 +1193,11 @@ fn hw_qwen4exp_card_plan() {
         );
     }
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
+        let machine = place::machine(
+            card,
+            place::Stack::q8_blocks32(inputs.spec.layers.len()),
+            place::UBATCH_PLANNED,
+        );
         // PIN(2026-10-15): the floor holds the stage rope table, 64 f32 a position, 256 B at
         // 4,096 positions (1,048,576 B), beside the cache.
         let stage = inputs.kv.stage_position_bytes(KV_AT[0].0);
@@ -1562,7 +1582,12 @@ fn hw_qwen4exp_q3_card_plan() {
     let levers = PlanLevers::default();
     for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS_Q3 {
         let card = if name == A6000.name { A6000 } else { RTX_3090 };
-        let machine = place::machine_for_experts(card, inputs.spec.layers.len(), u, Experts::Card);
+        let machine = place::machine_for_experts(
+            card,
+            place::Stack::q8_blocks32(inputs.spec.layers.len()),
+            u,
+            Experts::Card,
+        );
         let got = if with_draft {
             inputs
                 .plan_mtp_with(
@@ -1671,7 +1696,11 @@ fn hw_qwen4exp_q3_card_plan() {
         );
     }
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
+        let machine = place::machine(
+            card,
+            place::Stack::q8_blocks32(inputs.spec.layers.len()),
+            place::UBATCH_PLANNED,
+        );
         // PIN(2026-10-15): the floor holds the stage rope table, 64 f32 a position, 256 B at
         // 4,096 positions (1,048,576 B), beside the cache.
         let stage = inputs.kv.stage_position_bytes(KV_AT[0].0);
@@ -1829,12 +1858,13 @@ fn hw_qwen4exp_bp_plan() {
     inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
     let (ctx, u) = (4096u64, 4096u64);
     let n = inputs.spec.layers.len();
+    let stack = place::Stack::q8_blocks32(n);
     let levers = PlanLevers::default();
     let batch = tier_batch(&inputs.spec, u);
-    let machine = machine_bp(n, u, None, batch);
+    let machine = machine_bp(stack, u, None, batch);
     // Plan (a)'s rule at the A6000's budget less the tier join's scratch
     // (`place::card_tier_join_bytes`), which plan (b′) adds to its scratch.
-    let mut a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    let mut a_machine = place::machine_for_experts(A6000, stack, u, Experts::Card);
     a_machine.cards[0].scratch_bytes += place::card_tier_join_bytes(u);
     let a = inputs
         .plan_with(
@@ -1969,7 +1999,7 @@ fn hw_qwen4exp_bp_plan() {
         ),
         matches!(host, Err(PlaceError::TierHost { .. })),
     );
-    let drafted = machine_bp(n, u, Some(1), batch);
+    let drafted = machine_bp(stack, u, Some(1), batch);
     let reserve = inputs.plan_with(
         &drafted,
         (ctx, UBATCH_PLANNED.min(ctx)),

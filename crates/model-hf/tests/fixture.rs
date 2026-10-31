@@ -2741,7 +2741,7 @@ fn hw_fixture_q38_budget() {
     let at = |card: CardSpec, budget: Option<u64>| -> Vec<u64> {
         let machine = machine_for_experts(
             card,
-            layers,
+            model::arch::qwen35moe::place::Stack::q8_blocks32(layers),
             UBATCH_PLANNED.min(q38::BUDGET_CTX),
             Experts::Card,
         );

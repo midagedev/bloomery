@@ -340,7 +340,7 @@ mod gate {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
             crate::gate_card::card()?,
-            inputs.spec.layers.len(),
+            inputs.stack(),
             u64::try_from(ub)?,
             Experts::Card,
         );

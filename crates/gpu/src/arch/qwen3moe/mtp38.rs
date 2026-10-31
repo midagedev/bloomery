@@ -2996,7 +2996,7 @@ impl Mtp38 {
             &dense,
             (tw, &[&n.eh]),
             (&s.pack, cols),
-            &mut s.pack_q,
+            (None, &mut s.pack_q),
             sink,
         )?;
         k.gemm
@@ -3043,7 +3043,7 @@ impl Mtp38 {
             &dense,
             (tw, &[&n.k, &n.v]),
             (&s.mixed, m),
-            &mut s.mixed_q,
+            (None, &mut s.mixed_q),
             sink,
         )?;
         let x = WideIn {
