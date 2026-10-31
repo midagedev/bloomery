@@ -8,30 +8,36 @@
 //!
 //! # Where the row comes from
 //!
-//! A token's values read the logits row its id was taken from. A request that
-//! asks for probabilities therefore reads that row every token, and takes
-//! every token through a plain step:
+//! A token's values read the logits row its id was taken from: a step's row,
+//! or on an engine that drafts sampled requests the verified row of the
+//! token's position in a drafted pass.
 //!
 //! | path | without probabilities | asking |
 //! |---|---|---|
 //! | plain greedy | `next(last, None)`, no row | `next(last, Some(row))` |
 //! | plain sampled | `next(last, Some(row))`, the sampler's row | the same row, read once more |
-//! | drafted greedy | [`Engine::advance`] passes, no row | plain `next(last, Some(row))` steps |
-//! | drafted sampled | [`Engine::advance_sampled`] passes | plain `next(last, Some(row))` steps |
+//! | drafted greedy | [`Engine::advance`] passes, no row | [`Engine::advance_sampled`] passes, each kept row's argmax |
+//! | drafted sampled | [`Engine::advance_sampled`] passes | the same passes, each kept row read once more |
 //! | a row of [`Engine::step_slots`] | the row's own buffer when it samples | the row's own buffer, the request's alone |
+//! | a row of [`Engine::advance_slots`] | its pass's rows when it samples | its pass's rows, the request's alone |
 //!
-//! A request that asks never passes ([`crate::genloop`]'s `takes_passes`), so
-//! the drafted paths step: the row of every generated id is then one `next`
-//! wrote. Its ids are the ones it takes without asking, by the engine's
-//! contracts: `next` returns the same argmax whether it writes the row or not
-//! ([`Engine::next`]); a greedy pass keeps, row by row, the target's argmax,
-//! the first the one `next(last, None)` returns ([`Engine::advance`]), so the
-//! steps take the ids the passes kept; a sampled pass draws exactly one id a
-//! kept row from the sampler a plain run draws from, so a drafted and a plain
-//! run of one seed take the same ids ([`Engine::advance_sampled`]), beside
-//! another busy slot's pass too ([`Engine::advance_slots`]). The probabilities read
-//! the row and change nothing in it. The tests pin all four paths on the
-//! mocks, and that an asking run on the drafting mock makes no pass.
+//! An asking request's pass is lent the request's pick as its sampler
+//! ([`crate::genloop`]'s `Pick`): at each kept row, in position order, the
+//! pick reads the row ([`Collector::read`]), takes the id a step would take
+//! from it and holds that id's value ([`Collector::pick`]); the loop writes
+//! each value with the text its token released ([`Collector::take`]). A pass
+//! stops after the first id that is not its draft's, so it draws one id a
+//! kept row and every value held is a kept token's. Its ids are the ones it
+//! takes without asking, by the engine's contracts: `next` returns the same
+//! argmax whether it writes the row or not ([`Engine::next`]); a greedy pass
+//! keeps, row by row, the target's argmax ([`Engine::advance`]), the argmax
+//! an asking pass takes from the same verified rows; a sampled pass draws
+//! exactly one id a kept row from the sampler a plain run draws from, so a
+//! drafted and a plain run of one seed take the same ids
+//! ([`Engine::advance_sampled`]), beside another busy slot's pass too
+//! ([`Engine::advance_slots`]). The probabilities read the row and change
+//! nothing in it. The tests pin all the paths on the mocks, and that an
+//! asking run on the drafting mock passes as its quiet twin does.
 //!
 //! # What it costs
 //!
@@ -50,13 +56,12 @@
 //! - the second pass, Σ exp(l − max) in f64 over f32 exps: V libm `expf`
 //!   calls at 10–20 cycles, 1.5–3M cycles;
 //! - in all 2–3.5M host cycles on the engine thread, serial after the step
-//!   and under no other resource's shadow, so the token's wall grows by them,
-//!   and so does every slot's that steps in the same round; the JSON is built
-//!   on the request's own HTTP thread, beside the next step;
-//! - on an engine that drafts, the passes lost: the request decodes one token
-//!   a step where a pass keeps `1 + accepted`, so a draft whose passes keep k
-//!   tokens on average leaves that request 1/k of its drafted rate — the
-//!   largest of these terms on a drafting seat.
+//!   (after the pass, a kept row each) and under no other resource's shadow,
+//!   so the token's wall grows by them, and so does every slot's that steps
+//!   or passes in the same round; the JSON is built on the request's own HTTP
+//!   thread, beside the next step;
+//! - on an engine that drafts, the pass reads every kept row back, where a
+//!   greedy pass that does not ask reads none: 4·V bytes a kept token.
 //!
 //! A full sort of the vocabulary (V·log₂V ≈ 2.6M compares) is not needed: the
 //! sum needs no order and the top N come from the heap.
@@ -203,6 +208,15 @@ pub(crate) struct Log {
     text: String,
 }
 
+/// A picked id's value, held until its text is out: its log-probability
+/// and where its alternatives are in [`Collector`]'s held run.
+#[derive(Clone, Debug)]
+struct Picked {
+    id: u32,
+    logprob: f32,
+    top: std::ops::Range<usize>,
+}
+
 /// A generated token's value.
 #[derive(Clone, Copy, Debug)]
 struct Taken {
@@ -240,6 +254,9 @@ impl Ask {
             max: f32::NEG_INFINITY,
             ln_sum: 0.0,
             fault: None,
+            held: Vec::new(),
+            held_top: Vec::new(),
+            next: 0,
             taken: 0,
         }
     }
@@ -383,8 +400,11 @@ impl PartialEq for Rank {
 impl Eq for Rank {}
 
 /// The engine thread's side of an [`Ask`]: [`Collector::read`] reads the row
-/// a generated id is taken from, [`Collector::take`] writes the id's value
-/// with the text it released.
+/// a generated id is taken from, [`Collector::pick`] holds the value of the
+/// id taken from it, and [`Collector::take`] writes that value with the text
+/// the token released. A step holds one value at a time; a drafted pass one
+/// a kept row, each read from its own verified row before the next row is
+/// drawn from, and written as the loop takes the pass's tokens.
 pub(crate) struct Collector {
     log: Arc<Mutex<Log>>,
     top_n: usize,
@@ -395,6 +415,13 @@ pub(crate) struct Collector {
     ln_sum: f64,
     /// Why the row read has no distribution.
     fault: Option<RowError>,
+    /// The values picked and not yet written, oldest first, or why a row
+    /// had none.
+    held: Vec<Result<Picked, RowError>>,
+    /// The alternatives of the values held, back to back.
+    held_top: Vec<(u32, f32)>,
+    /// The first of `held` not yet written.
+    next: usize,
     /// The tokens written.
     taken: usize,
 }
@@ -434,37 +461,71 @@ impl Collector {
         self.ln_sum = sum.ln();
     }
 
-    /// Writes generated `id`'s value from the row last read (`row`, which
-    /// still holds `id`'s logit as the engine wrote it) with `text`, what the
-    /// token released into the answer; the row's fault, if it had one.
-    pub(crate) fn take(&mut self, id: u32, row: &[f32], text: &str) -> Result<(), RowError> {
-        if let Some(e) = self.fault.take() {
-            return Err(e);
-        }
-        let logit = usize::try_from(id)
-            .ok()
-            .and_then(|i| row.get(i))
-            .copied()
-            .ok_or(RowError::PastRow { id, len: row.len() })?;
+    /// Holds the value of `id`, the id taken from the row last read (`row`,
+    /// which still holds `id`'s logit as the engine wrote it), until its
+    /// token's text is out ([`Collector::take`]); or the row's fault.
+    pub(crate) fn pick(&mut self, id: u32, row: &[f32]) {
+        let value = match self.fault.take() {
+            Some(e) => Err(e),
+            None => usize::try_from(id)
+                .ok()
+                .and_then(|i| row.get(i))
+                .copied()
+                .ok_or(RowError::PastRow { id, len: row.len() }),
+        };
         let (max, ln_sum) = (self.max, self.ln_sum);
         let logprob = |l: f32| (f64::from(l - max) - ln_sum) as f32;
         let ranked = std::mem::take(&mut self.heap).into_sorted_vec();
+        let held = value.map(|logit| {
+            let from = self.held_top.len();
+            self.held_top
+                .extend(ranked.iter().map(|&Rank(l, alt)| (alt, logprob(l))));
+            Picked {
+                id,
+                logprob: logprob(logit),
+                top: from..self.held_top.len(),
+            }
+        });
+        self.held.push(held);
+        let mut scratch = ranked;
+        scratch.clear();
+        self.heap = BinaryHeap::from(scratch);
+    }
+
+    /// Writes the oldest value held, generated `id`'s, with `text`, what the
+    /// token released into the answer; its row's fault, if it had one. The
+    /// values a pass held past the last token the loop takes are never
+    /// written: the generation ended there.
+    ///
+    /// # Panics
+    ///
+    /// When no value is held, or the oldest is another id's: the loop takes
+    /// the ids it picked, in order.
+    pub(crate) fn take(&mut self, id: u32, text: &str) -> Result<(), RowError> {
+        let p = self
+            .held
+            .get(self.next)
+            .cloned()
+            .expect("a taken id was picked from a row")?;
+        assert_eq!(p.id, id, "the loop takes the ids it picked, in order");
         {
             let mut log = relock(&self.log);
-            log.top
-                .extend(ranked.iter().map(|&Rank(l, alt)| (alt, logprob(l))));
+            log.top.extend_from_slice(&self.held_top[p.top]);
             log.text.push_str(text);
             let t = Taken {
                 id,
-                logprob: logprob(logit),
+                logprob: p.logprob,
                 text_end: log.text.len(),
                 top_end: log.top.len(),
             };
             log.tokens.push(t);
         }
-        let mut scratch = ranked;
-        scratch.clear();
-        self.heap = BinaryHeap::from(scratch);
+        self.next += 1;
+        if self.next == self.held.len() {
+            self.held.clear();
+            self.held_top.clear();
+            self.next = 0;
+        }
         self.taken += 1;
         Ok(())
     }
@@ -646,7 +707,8 @@ mod tests {
         let ask = Ask::new(top, row.len());
         let mut c = ask.collector();
         c.read(row);
-        c.take(id, row, "x")?;
+        c.pick(id, row);
+        c.take(id, "x")?;
         Ok(ask.whole(&MockTokenizer).remove(0))
     }
 
@@ -1079,22 +1141,24 @@ mod tests {
         assert!(!text.contains("logprob"), "{text}");
     }
 
-    /// The `/completion` of `body` on a fresh server of `engine`: its ids.
-    fn ids(engine: Box<dyn Engine>, body: &Value) -> Vec<u64> {
+    /// The `/completion` of `body` on a fresh server of `engine`: its ids,
+    /// and its probabilities (`null` when it asked for none).
+    fn ids(engine: Box<dyn Engine>, body: &Value) -> (Vec<u64>, Value) {
         let mut b = body.clone();
         b["return_tokens"] = json!(true);
         let (status, v) = post(served(engine), "/completion", &b);
         assert_eq!(status, 200, "{v}");
-        arr(&v["tokens"])
+        let ids = arr(&v["tokens"])
             .iter()
             .map(|t| t.as_u64().expect("an id"))
-            .collect()
+            .collect();
+        (ids, v["completion_probabilities"].clone())
     }
 
     /// Asking changes no generated id: greedy and sampled (one seed), on the
-    /// plain mock and on the drafting one, whose asking run makes no pass —
-    /// the passes the same request makes without asking keep the ids the
-    /// asking run's steps take.
+    /// plain mock and on the drafting one, whose asking run passes as its
+    /// quiet one does, each kept id and its value taken from that id's own
+    /// verified row: its values are the plain mock's steps' too.
     #[test]
     fn asking_changes_no_generated_id() {
         let greedy = json!({"prompt": "abacadaeabacada", "n_predict": 24, "temperature": 0});
@@ -1103,25 +1167,24 @@ mod tests {
         for body in [&greedy, &sampled] {
             let mut asking = body.clone();
             asking["n_probs"] = json!(4);
-            let plain = ids(Box::new(MockEngine::new(4096)), body);
-            assert_eq!(
-                ids(Box::new(MockEngine::new(4096)), &asking),
-                plain,
-                "{body}"
-            );
+            let (plain, _) = ids(Box::new(MockEngine::new(4096)), body);
+            let (stepped, values) = ids(Box::new(MockEngine::new(4096)), &asking);
+            assert_eq!(stepped, plain, "{body}");
+            assert_eq!(arr(&values).len(), plain.len(), "{body}");
             let (quiet, loud) = (
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(Mutex::new(Vec::new())),
             );
-            let drafted = ids(
+            let (drafted, _) = ids(
                 Box::new(DraftMock::new(4096).logged(Arc::clone(&quiet))),
                 body,
             );
-            let asked = ids(
+            let (asked, passed) = ids(
                 Box::new(DraftMock::new(4096).logged(Arc::clone(&loud))),
                 &asking,
             );
             assert_eq!((&drafted, &asked), (&plain, &plain), "{body}");
+            assert_eq!(passed, values, "{body}");
             let passes = |log: &Mutex<Vec<MockCall>>| {
                 relock(log).iter().filter(|c| **c != MockCall::Next).count()
             };
@@ -1129,7 +1192,11 @@ mod tests {
                 passes(&quiet) > 0,
                 "{body}: the request passes without asking"
             );
-            assert_eq!(passes(&loud), 0, "{body}: an asking request steps");
+            assert_eq!(
+                passes(&loud),
+                passes(&quiet),
+                "{body}: an asking request passes as a quiet one does"
+            );
         }
     }
 

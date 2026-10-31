@@ -4,7 +4,9 @@
 //! steps where a pass would read what the loop has not settled: a think close
 //! it forces. A request that bans an id (`ignore_eos`) or biases ids
 //! (`logit_bias`) draws in those passes too, greedy or sampled, from rows
-//! whose banned ids are at -inf and whose biased ids carry their bias. The drafted mock is
+//! whose banned ids are at -inf and whose biased ids carry their bias, and so
+//! does a request that asks for probabilities, its values read from the kept
+//! rows. The drafted mock is
 //! [`DraftMock`]; its plain twin is the same mock
 //! [`DraftMock::without_sampled`]. Both servers sample with [`penalised`],
 //! whose draws read the history, so a pass that hands the sampler another
@@ -548,6 +550,88 @@ fn hw_beside_another_busy_slot_a_sampled_request_passes() {
     assert_eq!(alone, want, "{v}");
     assert!(draft_counts(&v).0 > 0, "alone it passes: {v}");
     assert!(count(&drain(&dlog), MockCall::Sampled) > 0);
+}
+
+/// A request that asks for probabilities drafts, greedy or sampled, alone
+/// and beside another busy slot: its ids and its values are the plain twin's
+/// steps', each kept id's value read from its own verified row, and every
+/// generated id has its entry.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_asking_request_drafts() {
+    let (dlog, plog) = (log(), log());
+    let drafted = serve(drafting(4096), &dlog);
+    let plain = serve(drafting(4096).without_sampled(), &plog);
+    let greedy = json!({"prompt": BRANCHY, "n_predict": 40, "temperature": 0, "n_probs": 3});
+    let mut drawn = sampled(BRANCHY, 40, 0.8, 5);
+    drawn["n_probs"] = json!(3);
+    for body in [&greedy, &drawn] {
+        let (want, w) = ids_of(plain, body);
+        let (got, v) = ids_of(drafted, body);
+        assert_eq!(got, want, "{body}: {v}");
+        assert_eq!(
+            v["completion_probabilities"], w["completion_probabilities"],
+            "{body}"
+        );
+        assert_eq!(
+            v["completion_probabilities"].as_array().map(Vec::len),
+            Some(got.len()),
+            "{body}: one entry a generated id"
+        );
+        assert!(
+            draft_counts(&v).1 > 0,
+            "{body}: the passes kept drafted ids: {v}"
+        );
+        assert_eq!(draft_counts(&w), (0, 0), "{body}: the plain twin drafted");
+        assert!(count(&drain(&dlog), MockCall::Sampled) > 0, "{body}");
+    }
+    let hold = Arc::new(Hold::default());
+    let held = drafting(4096)
+        .with_slots(2)
+        .logged(Arc::clone(&dlog))
+        .holding(Arc::clone(&hold));
+    let addr = start_sampling(Box::new(held), 2, penalised());
+    let long = json!({"prompt": "abcabcabc", "n_predict": 400, "temperature": 0,
+                      "cache_prompt": false});
+    let mut short = drawn.clone();
+    short["cache_prompt"] = json!(false);
+    short["return_tokens"] = json!(true);
+    let a = std::thread::spawn(move || post(addr, "/completion", &long));
+    assert!(
+        hold.reached(1, BOUND),
+        "the long prompt never reached the engine"
+    );
+    let b = {
+        let short = short.clone();
+        std::thread::spawn(move || post(addr, "/completion", &short))
+    };
+    wait_deferred(addr, 1.0);
+    hold.open();
+    let (ra, rb) = (a.join().expect("long"), b.join().expect("short"));
+    assert_eq!(
+        (ra.status, rb.status),
+        (200, 200),
+        "{} | {}",
+        ra.body,
+        rb.body
+    );
+    let vb = rb.json();
+    let (want, w) = ids_of(plain, &short);
+    assert_eq!(vb["tokens"], json!(want), "{vb}");
+    assert_eq!(
+        vb["completion_probabilities"],
+        w["completion_probabilities"]
+    );
+    assert!(
+        draft_counts(&vb).0 > 0,
+        "the asking request drafted beside the greedy one: {vb}"
+    );
+    assert!(
+        drain(&dlog)
+            .iter()
+            .any(|c| matches!(c, MockCall::AdvanceSlots(2))),
+        "the two slots passed in one call"
+    );
 }
 
 /// [`DraftMock`] whose sampled pass hands its history back with its last id

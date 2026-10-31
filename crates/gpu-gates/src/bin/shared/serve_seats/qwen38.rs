@@ -323,7 +323,8 @@
 //! plan's `ctx` line following; `BLOOMERY_DRAFT=mtp` set never yields. `BLOOMERY_DRAFT=off` is the plain
 //! path with the same record; `mtp` drafts wherever the draft loads. The
 //! CLI's `--logits` condition has no seat equivalent: a request that reads
-//! the logits row steps plainly. The route trace's condition is the seat's
+//! the logits row reads each kept row of its pass, the target's verified
+//! row. The route trace's condition is the seat's
 //! own (the paragraph on `BLOOMERY_ROUTE_TRACE` below).
 //!
 //! Drafting, the seat drives the session through the runtime's speculative
@@ -1038,7 +1039,8 @@ fn check_draft_word(levers: &bloomery_levers::Levers) -> Result<(), GateError> {
 /// name.
 ///
 /// The rule's run conditions as the seat meets them: no `--logits` (a
-/// request that reads the logits row steps plainly, the row the target's),
+/// request that reads the logits row reads its pass's kept rows, the
+/// target's),
 /// no route trace (`BLOOMERY_ROUTE_TRACE` records one-row steps; a set `mtp`
 /// beside it is [`refuse_feed`]'s), and the positions of one window a slot
 /// ([`window_positions`]). A set `mtp` meets that condition at the caller,

@@ -433,8 +433,9 @@ fn ids(logits: &[f32]) -> impl Iterator<Item = (u32, f32)> + '_ {
 
 /// The engine's greedy rule (`argmax_take`): a strictly greater value wins, an
 /// equal one wins at a lower id; the running best starts at `(0, -inf)`, so a
-/// NaN never wins and an all-`-inf` or all-NaN row answers id 0.
-fn argmax(xs: impl Iterator<Item = (u32, f32)>) -> (u32, f32) {
+/// NaN never wins and an all-`-inf` or all-NaN row answers id 0. The server's
+/// drafted picks take a greedy request's id by it.
+pub fn argmax(xs: impl Iterator<Item = (u32, f32)>) -> (u32, f32) {
     let (mut best_i, mut best_v) = (0u32, f32::NEG_INFINITY);
     for (i, v) in xs {
         if v > best_v || (v == best_v && i < best_i) {
