@@ -179,17 +179,6 @@ fn stack_as(
     Ok(out)
 }
 
-/// A plane requantized as `quant` ([`Fixture::rows_as`]).
-fn plane_as(
-    fix: &Fixture,
-    quant: Quant,
-    name: &str,
-    cols: usize,
-    rows: usize,
-) -> Result<Vec<u8>, String> {
-    fix.rows_as(quant, name, cols, rows)
-}
-
 /// Q4 reads the gate and up experts. Q6 has no gate or up experts in the
 /// fixture, so each expert is one Q6_K down expert's blocks, read as 512 by
 /// 2048: the byte length is the same. A4 reads its own gate and up stacks,
@@ -291,10 +280,10 @@ pub fn pair_weights_for(
                 N_EXPERTS,
             )?,
             shared_gate: if_shared(e, || {
-                plane_as(fix, quant, "blk.0.ffn_gate_shexp.weight", PAIR_COLS, e.k)
+                fix.rows_as(quant, "blk.0.ffn_gate_shexp.weight", PAIR_COLS, e.k)
             })?,
             shared_up: if_shared(e, || {
-                plane_as(fix, quant, "blk.0.ffn_up_shexp.weight", PAIR_COLS, e.k)
+                fix.rows_as(quant, "blk.0.ffn_up_shexp.weight", PAIR_COLS, e.k)
             })?,
         },
     };

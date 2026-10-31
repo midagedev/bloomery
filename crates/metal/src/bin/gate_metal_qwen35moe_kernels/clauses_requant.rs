@@ -17,6 +17,7 @@ use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
 use bloomery_metal::kernels::{GemmMode, PARTIALS_PER_HEAD, Quant};
 
+use super::clauses_a4::with;
 use super::clauses_embed;
 use super::clauses_experts::{self, check_fold_quant, check_pair_quant, ffn_norm, fold_bad_id};
 use super::clauses_gemm::{self, Case, SEG_COLS, SegGroup, dense_arms, run_cases, seg_groups};
@@ -672,19 +673,6 @@ fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, quant: Quant) -> Clause {
 /// ([`clauses_route::grouped_synthetic`], the Q8_0 and Q5_K clauses' body).
 fn grouped(h: &Harness<'_>, quant: Quant) -> Clause {
     super::clauses_route::grouped_synthetic(h, quant, 0x2A80)
-}
-
-/// `clause` over the MLX split, or the reason it could not be opened: a
-/// clause run without the split is red, not skipped.
-fn with<'a>(
-    h: &'a Harness<'a>,
-    mlx: &'a Result<Fixture, String>,
-    clause: impl Fn(&Harness<'_>, &Fixture) -> Clause + 'a,
-) -> super::ClauseRun<'a> {
-    Box::new(move || match mlx {
-        Ok(fix) => clause(h, fix),
-        Err(e) => Err(e.clone()),
-    })
 }
 
 /// The names of one type's clauses.

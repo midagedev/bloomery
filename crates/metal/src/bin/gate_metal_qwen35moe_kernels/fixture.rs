@@ -305,6 +305,9 @@ fn dequant_rows(
     let mut values = vec![0f32; rows * cols];
     for (r, out) in values.chunks_mut(cols).enumerate() {
         dequant_row(ty, &bytes[r * own_row..], out).map_err(|e| format!("{name}: {e}"))?;
+        if let Some(col) = out.iter().position(|v| !v.is_finite()) {
+            return Err(format!("{name}: row {r} column {col} is not finite"));
+        }
     }
     Ok(values)
 }

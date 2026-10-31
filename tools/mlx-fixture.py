@@ -1120,27 +1120,18 @@ def main(argv):
     if argv[0:1] == ["--self-test"]:
         self_test()
         return 0
-    if (argv[0:1] == ["make"] and len(argv) == 5 and argv[3] == "--config"):
+    if (argv[0:1] == ["make"] and len(argv) in (5, 6) and argv[3] == "--config"
+            and (len(argv) == 5 or argv[5] == "--f16")):
         fixture, out, config_path = argv[1], argv[2], argv[4]
         for p in (fixture, config_path):
             if not os.path.isfile(p):
                 print(f"mlx-fixture: {p}: no such file", file=sys.stderr)
                 return EXIT_MISSING
+        pair = "f16" if len(argv) == 6 else "bf16"
         quantizer = MlxQuantizer()
-        layers = make(fixture, out, config_path, quantizer)
-        print(f"made {out}: layers {[k for _, k in layers]}")
-        check(out, fixture, quantizer)
-        return 0
-    if (argv[0:1] == ["make"] and len(argv) == 6 and argv[3] == "--config"
-            and argv[5] == "--f16"):
-        fixture, out, config_path = argv[1], argv[2], argv[4]
-        for p in (fixture, config_path):
-            if not os.path.isfile(p):
-                print(f"mlx-fixture: {p}: no such file", file=sys.stderr)
-                return EXIT_MISSING
-        quantizer = MlxQuantizer()
-        layers = make(fixture, out, config_path, quantizer, pair="f16")
-        print(f"made {out} (f16 pairs): layers {[k for _, k in layers]}")
+        layers = make(fixture, out, config_path, quantizer, pair=pair)
+        label = " (f16 pairs)" if pair == "f16" else ""
+        print(f"made {out}{label}: layers {[k for _, k in layers]}")
         check(out, fixture, quantizer)
         return 0
     if len(argv) == 3 and argv[0] == "check":
