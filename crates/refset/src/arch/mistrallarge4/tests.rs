@@ -52,40 +52,17 @@ fn the_family_refuses_a_set_without_its_trailer() -> Result<(), RefError> {
 }
 
 /// The two prompt sets the dump recipe writes, in its order, each under the name the family's
-/// recipe prints.
+/// recipe prints, and their fixture twins; the shared fixture-family test (`arch::tests`) holds
+/// the rest of the mirror.
 #[test]
 fn the_family_holds_the_dump_recipes_two_sets() {
     assert_eq!(SETS, ["ref_mistrallarge4_a", "ref_mistrallarge4_b"]);
     assert_eq!(LCPP.sets, SETS);
-}
-
-/// The fixture family mirrors the real one as every fixture family does (`arch::tests`): the
-/// same architecture, build and consumers, the fixture twin of its identity, no per-file set
-/// name, and each set the real family's behind `fx_`.
-#[test]
-fn the_fixture_family_mirrors_the_real_one() {
-    let fx = &fixture::LCPP;
+    assert_eq!(LCPP.identity, Identity::Manifest);
     assert_eq!(
-        (fx.arch, fx.build, fx.consumers),
-        (LCPP.arch, LCPP.build, LCPP.consumers)
+        fixture::LCPP.sets,
+        ["fx_ref_mistrallarge4_a", "fx_ref_mistrallarge4_b"]
     );
-    assert_eq!(
-        (LCPP.identity, fx.identity),
-        (Identity::Manifest, Identity::FixtureManifest)
-    );
-    assert!(fx.resolve.is_none(), "one fixture file, no per-file suffix");
-    assert!(
-        fx.recipe
-            .starts_with("BLOOMERY_TIER=fixture just dump-ref-"),
-        "{}",
-        fx.recipe
-    );
-    let twins: Vec<String> = fx
-        .sets
-        .iter()
-        .map(|&s| s.strip_prefix("fx_").unwrap_or(s).to_string())
-        .collect();
-    assert_eq!(twins, SETS, "each fixture set is the real set behind fx_");
 }
 
 /// A complete set of the dumper's shape in a fresh directory: `model`, the family's build and
