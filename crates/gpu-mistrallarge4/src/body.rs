@@ -69,7 +69,6 @@
 
 use bloomery_gpu::Pitched;
 use bloomery_gpu::arch::hybrid::{Acts, DecodeInput, GqaCx};
-use bloomery_gpu::arch::qwen3moe::router::{RouterBufs, RouterDims, RouterKernels};
 use bloomery_gpu::flash::{FlashKernels, FlashMergeArgs, FlashSegArgs, segments_for};
 use bloomery_gpu::flash_gqa::FlashGqaKernels;
 use bloomery_gpu::fused::FusedKernels;
@@ -81,6 +80,7 @@ use bloomery_gpu::latent::{KvGatherSelArgs, LatentAppendArgs, LatentKernels, Row
 use bloomery_gpu::model::{ChainBody, GpuModel, Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::quant_sel::QuantSelKernels;
 use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
+use bloomery_gpu::route_softmax::{RouterBufs, RouterDims, RouterKernels};
 use bloomery_gpu::site::KGemvKernels;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, Window, dtod_2d};
