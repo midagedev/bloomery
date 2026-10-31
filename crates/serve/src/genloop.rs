@@ -19,25 +19,28 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept. A request that draws (it samples, or changes its rows: its
-//! `logit_bias` added and, under `ignore_eos`, the stop ids at -inf, then its
-//! sampler or the argmax, [`biased`]) takes its passes through
+//! and kept. A request that reads its rows ([`Pick::reads_rows`]: it draws
+//! or asks for probabilities) and follows no program takes its passes through
 //! [`Engine::advance_sampled`] on an engine that drafts sampled requests
-//! ([`Engine::drafts_sampled`]), its draw taking each kept id from the
-//! verified rows. Beside another busy slot its pass is a row of the round's
+//! ([`Engine::drafts_sampled`]), the pass lent the request's pick ([`Pick`])
+//! as its sampler: each kept id is the pick a step would make from that
+//! position's verified row, its value read from that row. A request that
+//! draws samples, or changes its rows: its `logit_bias` added and, under
+//! `ignore_eos`, the stop ids at -inf, then its sampler or the argmax
+//! ([`biased`]). Beside another busy slot its pass is a row of the round's
 //! [`Engine::advance_slots`] with its draw ([`Gen::pass_row`]), its ids the
 //! ones its pass alone draws. On another drafting engine such a request
 //! reads the logits row every token, which a pass does not give, so it
 //! takes one [`Engine::next`] a token and carries no draft counts.
 //!
 //! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
-//! row every token too, so it also takes one [`Engine::next`] a token, greedy
-//! or not: each row is read before the loop changes it, and each taken
-//! id's value goes to the request's log with the text it released
-//! ([`crate::api::logprobs`]). Its stream sends one event a token, the text possibly
-//! empty, and the end of generation's own; a request that asks for nothing
-//! meets one check of its fixed `None` where a step asks for a row, one where
-//! it is read and one where a token's text goes out.
+//! row of every token, a step's or a pass's: each row is read before the
+//! loop changes it, and each taken id's value goes to the request's log with
+//! the text it released ([`crate::api::logprobs`]). Its stream sends one
+//! event a token, the text possibly empty, and the end of generation's own;
+//! a request that asks for nothing meets one check of its fixed `None` where
+//! a step asks for a row, one where it is read and one where a token's text
+//! goes out.
 //!
 //! A request that follows a program ([`GenParams::constraint`]) takes one
 //! [`Engine::next`] a token: each token is the program's pick from the row
@@ -90,12 +93,13 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
 use crate::api::logprobs::{Ask, Collector, RowError};
+use crate::api::relock;
 use crate::constrain::{Constraint, Draw, StepError, Walk};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
@@ -445,7 +449,7 @@ fn prompt_tail(held: &Held, n: usize) -> Vec<u32> {
 /// What a request does to every row before its pick: `logit_bias`'s
 /// additions ([`GenParams::logit_bias`]), then -inf at each banned id (the
 /// stop ids under `ignore_eos`, as llama-server's `logit_bias_eog`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Bias {
     add: Vec<(u32, f32)>,
     banned: Vec<u32>,
@@ -507,19 +511,138 @@ fn biased(mut draw: Option<Sampler>, bias: Bias) -> Sampler {
     })
 }
 
+/// What takes each generated id from its logits row ([`Pick::answer`]): the
+/// request's draw (its sampler, or the argmax), its change to the rows, the
+/// program it follows and the probabilities it asks for. A step asks it once,
+/// for the row the step wrote ([`Gen::answer`]). A drafted pass is lent it as
+/// the pass's sampler ([`Gen::lend`]), which asks it once a kept row, in
+/// position order, for that position's verified row: the pass stops after the
+/// first id that is not its draft's, so every id it draws is kept. The pass
+/// takes the ids, and holds the values, the steps would take from those rows,
+/// and the program moves through the kept ids alone: nothing is taken back.
+#[derive(Default)]
+struct Pick {
+    sampler: Option<Sampler>,
+    /// The request's change to its rows: its `logit_bias`, and the stop ids
+    /// under `ignore_eos`.
+    bias: Bias,
+    /// Whether the request is greedy: one that changes its rows draws
+    /// through [`biased`] only where the change can move the engine's argmax
+    /// ([`Bias::moves`]).
+    greedy: bool,
+    /// What reads each row and holds the request's probabilities, `None` on
+    /// a request that asks for none.
+    probs: Option<Collector>,
+    /// The request's position in its program, `None` for free text and
+    /// while the program is held.
+    walk: Option<Walk>,
+    /// The program held while the model reasons in the span the prompt left
+    /// open ([`Constraint::follows_reasoning`]): it becomes the walk once the
+    /// model's own close is taken ([`Gen::spend`]). The request steps until
+    /// then: a pass could keep ids past the close that the program did not
+    /// pick.
+    held: Option<Walk>,
+    /// The biased copy of the row a program picks from, empty without a
+    /// `logit_bias`.
+    biased_row: Vec<f32>,
+    /// The row a sampled request's walk draws from, the ids its program does
+    /// not allow masked ([`Draw::Sampled`]), kept for its capacity.
+    masked: Vec<f32>,
+    /// The program's refusal of a pick, which the next [`Gen::pump`] returns
+    /// before it takes any token in hand: the generation ends there, every
+    /// id of the pass that drew the refused pick untaken, the ones it kept
+    /// before that pick too.
+    refused: Option<StepError>,
+}
+
+impl Pick {
+    /// Whether the request reads its rows: it draws (it samples or changes
+    /// its rows), asks for probabilities or follows a program.
+    fn reads_rows(&self) -> bool {
+        self.sampler.is_some() || self.probs.is_some() || self.walk.is_some() || self.held.is_some()
+    }
+
+    /// The id taken from `row` for the next generated token: `forced` when
+    /// the think budget forces its close, else [`Pick::choose`]'s; the row is
+    /// read for the probabilities first and the id's value held for its text.
+    /// `g` is the engine's argmax of the row where the engine gave it (a
+    /// step's), `None` for a pass's verified row.
+    fn answer(&mut self, row: &[f32], history: &[u32], forced: Option<u32>, g: Option<u32>) -> u32 {
+        if let Some(c) = self.probs.as_mut() {
+            c.read(row);
+        }
+        let id = forced.unwrap_or_else(|| self.choose(row, history, g));
+        if let Some(c) = self.probs.as_mut() {
+            c.pick(id, row);
+        }
+        id
+    }
+
+    /// The request's pick from `row`: its program's pick from the biased copy
+    /// (a sampled one drawing among the ids the program allows), else its
+    /// draw (a sampled one, or one that changes its rows: [`biased`] draws
+    /// from a copy) or the engine's argmax, which a greedy request whose
+    /// change cannot move it takes as `g` where the engine gave it. Past a
+    /// refusal the pick is the argmax, never taken.
+    fn choose(&mut self, row: &[f32], history: &[u32], g: Option<u32>) -> u32 {
+        // A pass's row comes without `g`: its stand-in takes the engine's
+        // rule, `-0` tied with `+0` by id and a NaN never, as `g` would.
+        let argmax = |row: &[f32]| {
+            g.unwrap_or_else(|| sampler::argmax((0..=u32::MAX).zip(row.iter().copied())).0)
+        };
+        if self.refused.is_some() {
+            return argmax(row);
+        }
+        if let Some(walk) = self.walk.as_mut() {
+            let row = if self.bias.add.is_empty() || walk.fixed_next() {
+                row
+            } else {
+                self.bias.apply(row, false, &mut self.biased_row);
+                &self.biased_row
+            };
+            let picked = match self.sampler.as_mut() {
+                Some(sampler) => walk.choose_by(
+                    row,
+                    &mut Draw::Sampled {
+                        sampler,
+                        history,
+                        masked: &mut self.masked,
+                    },
+                ),
+                None => walk.choose(row),
+            };
+            return picked.unwrap_or_else(|e| {
+                self.refused = Some(e);
+                argmax(row)
+            });
+        }
+        // A held program's request keeps its bias out of its sampler, as
+        // the walk applies it ([`Gen::new`]): its reasoning draws from the
+        // biased copy here.
+        let moves = g.is_none_or(|g| self.bias.moves(g));
+        let biased = self.held.is_some() && !self.bias.add.is_empty() && (!self.greedy || moves);
+        let row = if biased {
+            self.bias.apply(row, self.greedy, &mut self.biased_row);
+            &self.biased_row
+        } else {
+            row
+        };
+        match self.sampler.as_mut() {
+            Some(draw) if !self.greedy || moves => draw(row, history),
+            None if biased => sampling::argmax(row),
+            _ => argmax(row),
+        }
+    }
+}
+
 /// Whether a request takes its tokens after the first through the engine's
-/// passes when the engine drafts: one that asks for no probabilities
-/// (`asks`) and follows no program (`constrained`, whose every token is
-/// picked from its own row), greedy ([`Engine::advance`]) or drawing (it
-/// samples or changes its rows, [`biased`]) on an engine that drafts sampled
-/// requests ([`Engine::advance_sampled`]).
-fn takes_passes(
-    sampler: Option<&Sampler>,
-    asks: bool,
-    constrained: bool,
-    engine: &dyn Engine,
-) -> bool {
-    !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
+/// passes when the engine drafts: one that reads no row greedily
+/// ([`Engine::advance`]), and one that reads its rows ([`Pick::reads_rows`])
+/// on an engine that drafts sampled requests ([`Engine::advance_sampled`]),
+/// each kept id its pick from its verified row. A request that follows a
+/// program steps.
+fn takes_passes(pick: &Pick, engine: &dyn Engine) -> bool {
+    pick.walk.is_none() && pick.held.is_none() && (!pick.reads_rows() || engine.drafts_sampled())
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -1977,27 +2100,26 @@ impl Think {
 /// thread can step several slots' generations in one engine call. `ids` is
 /// non-empty and shorter than the context. [`Gen::timings`] are filled even
 /// when the sink failed midway (the caller's counters still see the work
-/// done). A greedy request that bans no id and asks for no probabilities
-/// never asks the engine for its logits, and takes its tokens after the
-/// first through the engine's passes. `tick` sees the timings after every
-/// generated token.
+/// done). A request that reads no row ([`Pick::reads_rows`]) never asks the
+/// engine for its logits; one that does takes them from its steps' rows or
+/// its passes' verified rows ([`takes_passes`]). `tick` sees the timings
+/// after every generated token.
 pub(crate) struct Gen {
     n: usize,
     ctx_max: usize,
-    sampler: Option<Sampler>,
+    /// What takes each generated id from its row, the request's own.
+    pick: Pick,
+    /// Where the pick is while a pass holds it, and an empty one between
+    /// passes ([`Gen::lend`]); and the sampler a pass is lent, whose every
+    /// draw asks the pick there.
+    lent: Arc<Mutex<Pick>>,
+    draw: Option<Sampler>,
+    /// Whether a pass of several slots holds the pick, from its row's making
+    /// ([`Gen::pass_row`]) to the round's count ([`Gen::advanced`]).
+    lending: bool,
     stops: Vec<u32>,
-    /// The request's change to its rows: its `logit_bias`, and the stop ids
-    /// under `ignore_eos`.
-    bias: Bias,
-    /// Whether the request is greedy: one that changes its rows draws
-    /// through [`biased`] only where the change can move the engine's argmax
-    /// ([`Bias::moves`]).
-    greedy: bool,
-    /// The engine's logits row, or empty on a greedy request.
+    /// The engine's logits row, or empty on a request that reads none.
     logits: Vec<f32>,
-    /// The biased copy of the row a program picks from, empty without a
-    /// `logit_bias`.
-    biased_row: Vec<f32>,
     tim: Timings,
     /// The draft's counts by depth ([`book_depths`]): their sums are the
     /// timings' `draft_n` and `draft_n_accepted`. Kept apart from the
@@ -2023,36 +2145,21 @@ pub(crate) struct Gen {
     stop: StopKind,
     stopping_word: String,
     truncated: bool,
-    /// A pass's rows; 1 steps. A request passes when it is greedy, or draws
-    /// (samples or changes its rows) on an engine that drafts sampled
-    /// requests.
+    /// A pass's rows; 1 steps. A request passes when it reads no row, or
+    /// reads its rows ([`Pick::reads_rows`]) and follows no program on an
+    /// engine that drafts sampled requests.
     rows: usize,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
     /// The copy of the history a sampled pass lends the engine
     /// ([`Slot::advance_sampled`]), kept for its capacity.
-    lent: Vec<u32>,
+    lent_history: Vec<u32>,
     /// The token the loop takes next; `None` once there is none.
     tok: Option<u32>,
     /// The think-span budget and loop guard, `None` on a request with neither
     /// (or whose prompt closed the span) and once the span closed.
     think: Option<Think>,
-    /// What reads each row and writes the request's probabilities, `None` on
-    /// a request that asks for none.
-    probs: Option<Collector>,
-    /// The request's position in its program, `None` for free text and
-    /// while the program is held.
-    walk: Option<Walk>,
-    /// The program held while the model reasons in the span the prompt left
-    /// open ([`Constraint::follows_reasoning`]): it becomes the walk once the
-    /// model's own close is taken ([`Gen::spend`]).
-    held: Option<Walk>,
-    /// The row a sampled request's walk draws from, the ids its program does
-    /// not allow masked ([`Draw::Sampled`]), kept for its capacity.
-    masked: Vec<f32>,
-    /// The program's refusal of a step, which the next [`Gen::pump`] returns.
-    refused: Option<StepError>,
     /// Whether the request takes the jump arm: it follows a program, asks for
     /// no probabilities, has no think budget and no penalty, and the server
     /// has the arm on.
@@ -2099,48 +2206,55 @@ impl Gen {
             },
         };
         let greedy = sampler.is_none();
-        // A program picks from its own biased copy of the row ([`Gen::answer`]).
+        // A program picks from its own biased copy of the row ([`Pick::choose`]).
         let sampler = if bias.is_empty() || p.constraint.is_some() {
             sampler
         } else {
             Some(biased(sampler, bias.clone()))
         };
-        let probs = p.logprobs.as_ref().map(Ask::collector);
         let open = p.think_entry == ThinkEntry::Open;
         let (walk, held) = match &p.constraint {
             Some(c) if open && c.follows_reasoning() => (None, Some(Walk::new(c, false))),
             c => (c.as_ref().map(|c| Walk::new(c, open)), None),
         };
+        let pick = Pick {
+            sampler,
+            bias,
+            greedy,
+            probs: p.logprobs.as_ref().map(Ask::collector),
+            walk,
+            held,
+            biased_row: Vec::new(),
+            masked: Vec::new(),
+            refused: None,
+        };
         // A greedy request that changes no row reads the logits only for the
         // probabilities it asked for, or to pick among the ids its program
         // allows.
-        let logits = vec![
-            0.0f32;
-            if sampler.is_some() || probs.is_some() || p.constraint.is_some() {
-                slot.vocab.n_vocab()
-            } else {
-                0
-            }
-        ];
-        let rows = if takes_passes(
-            sampler.as_ref(),
-            probs.is_some(),
-            p.constraint.is_some(),
-            slot.engine.as_ref(),
-        ) {
+        let reads = pick.reads_rows();
+        let holds = pick.held.is_some();
+        let logits = vec![0.0f32; if reads { slot.vocab.n_vocab() } else { 0 }];
+        let rows = if takes_passes(&pick, slot.engine.as_ref()) {
             slot.engine.advance_rows()
         } else {
             1
         };
+        let lent = Arc::new(Mutex::new(Pick::default()));
+        let draw: Sampler = {
+            let lent = Arc::clone(&lent);
+            Box::new(move |row: &[f32], history: &[u32]| {
+                relock(&lent).answer(row, history, None, None)
+            })
+        };
         Gen {
             n,
             ctx_max: slot.engine.ctx_max(),
-            sampler,
+            pick,
+            lent,
+            draw: Some(draw),
+            lending: false,
             stops,
-            bias,
-            greedy,
             logits,
-            biased_row: Vec::new(),
             tim: Timings::default(),
             depths: Vec::new(),
             t1: Instant::now(),
@@ -2157,26 +2271,19 @@ impl Gen {
             rows,
             kept: Vec::with_capacity(rows),
             taken: 0,
-            lent: Vec::new(),
+            lent_history: Vec::new(),
             tok: None,
-            think: (p.reasoning_budget.is_some() || p.reasoning_loop || held.is_some()).then(
-                || {
-                    Think::new(
-                        p.think_split.clone().unwrap_or_else(|| {
-                            ThinkSplit::for_entry_with(p.think_entry, p.think)
-                                .reading_specials(&*slot.vocab)
-                        }),
-                        p.reasoning_budget,
-                        slot.vocab.encode(p.think.close),
-                        p.reasoning_loop,
-                    )
-                },
-            ),
-            probs,
-            walk,
-            held,
-            masked: Vec::new(),
-            refused: None,
+            think: (p.reasoning_budget.is_some() || p.reasoning_loop || holds).then(|| {
+                Think::new(
+                    p.think_split.clone().unwrap_or_else(|| {
+                        ThinkSplit::for_entry_with(p.think_entry, p.think)
+                            .reading_specials(&*slot.vocab)
+                    }),
+                    p.reasoning_budget,
+                    slot.vocab.encode(p.think.close),
+                    p.reasoning_loop,
+                )
+            }),
             // A think budget's forced close would compete with a run for the
             // ids after it, and a penalized draw reads the ids a run feeds
             // after it, so a request with either steps.
@@ -2212,9 +2319,10 @@ impl Gen {
     /// Nor does a greedy request that changes no row while its program is
     /// held: its reasoning takes the engine's argmax.
     pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
-        let unread = self.walk.as_mut().is_some_and(Walk::fixed_next)
-            || (self.held.is_some() && self.greedy && self.bias.add.is_empty());
-        if unread && self.probs.is_none() {
+        let k = &mut self.pick;
+        let unread = k.walk.as_mut().is_some_and(Walk::fixed_next)
+            || (k.held.is_some() && k.greedy && k.bias.add.is_empty());
+        if unread && k.probs.is_none() {
             return None;
         }
         out(&mut self.logits)
@@ -2222,67 +2330,24 @@ impl Gen {
 
     /// The id the loop takes for an engine answer `g`: the next forced close id
     /// while one is queued (the engine's answer is discarded — the loop never
-    /// commits it, so nothing desyncs), else the request's draw from the row
-    /// (a sampled one, or one that changes its rows: [`biased`] draws from a
-    /// copy) or the engine's argmax `g`, which a greedy request keeps unless
-    /// its change can move it. A program picks from the biased copy. A
-    /// request that asks for probabilities reads the row as the engine wrote
-    /// it.
+    /// commits it, so nothing desyncs), else the request's pick from the row
+    /// ([`Pick::choose`]). A request that asks for probabilities reads the
+    /// row as the engine wrote it.
     fn answer(&mut self, g: u32) -> u32 {
-        if let Some(c) = self.probs.as_mut() {
-            c.read(&self.logits);
-        }
-        if let Some(id) = self.think.as_mut().and_then(Think::next_forced) {
-            return id;
-        }
-        if let Some(walk) = self.walk.as_mut() {
-            let row = if self.bias.add.is_empty() || walk.fixed_next() {
-                &self.logits
-            } else {
-                self.bias.apply(&self.logits, false, &mut self.biased_row);
-                &self.biased_row
-            };
-            let picked = match self.sampler.as_mut() {
-                Some(sampler) => walk.choose_by(
-                    row,
-                    &mut Draw::Sampled {
-                        sampler,
-                        history: &self.history,
-                        masked: &mut self.masked,
-                    },
-                ),
-                None => walk.choose(row),
-            };
+        let forced = self.think.as_mut().and_then(Think::next_forced);
+        let id = self
+            .pick
+            .answer(&self.logits, &self.history, forced, Some(g));
+        self.count_picks();
+        id
+    }
+
+    /// The program's pick counts into the jump arm's timings.
+    fn count_picks(&mut self) {
+        if let (Some(j), Some(walk)) = (self.tim.jump.as_mut(), self.pick.walk.as_ref()) {
             let picks = walk.picks();
-            if let Some(j) = self.tim.jump.as_mut() {
-                j.decisions = picks.decisions;
-                j.free_steps = picks.free;
-            }
-            return match picked {
-                Ok(id) => id,
-                Err(e) => {
-                    self.refused = Some(e);
-                    g
-                }
-            };
-        }
-        // A held program's request keeps its bias out of its sampler, as
-        // the walk applies it ([`Gen::new`]): its reasoning draws from the
-        // biased copy here.
-        let biased = self.held.is_some()
-            && !self.bias.add.is_empty()
-            && (!self.greedy || self.bias.moves(g));
-        let row = if biased {
-            self.bias
-                .apply(&self.logits, self.greedy, &mut self.biased_row);
-            &self.biased_row
-        } else {
-            &self.logits
-        };
-        match self.sampler.as_mut() {
-            Some(draw) if !self.greedy || self.bias.moves(g) => draw(row, &self.history),
-            None if biased => sampling::argmax(row),
-            _ => g,
+            j.decisions = picks.decisions;
+            j.free_steps = picks.free;
         }
     }
 
@@ -2333,7 +2398,7 @@ impl Gen {
             // The splitter sees even the stop scan's unsent prefix. At
             // handoff no unchosen text may remain there or in the decoder;
             // a matched stop discards the decoder tail instead of sending it.
-            if self.held.is_some()
+            if self.pick.held.is_some()
                 && (!s
                     .content
                     .trim_matches(crate::reasoning::is_space)
@@ -2348,7 +2413,8 @@ impl Gen {
             }
             if s.closed || !s.content.is_empty() {
                 self.think = None;
-                self.walk = self.walk.take().or_else(|| self.held.take());
+                let k = &mut self.pick;
+                k.walk = k.walk.take().or_else(|| k.held.take());
                 return Ok(false);
             }
             if s.opened {
@@ -2403,17 +2469,12 @@ impl Gen {
         // The history the draws read opens on the prompt's tail, the whole
         // prompt's last `repeat_last_n` ids — the cached part included, as
         // llama-server feeds `prompt.tokens` whole into the sampler.
-        if self.sampler.is_some() {
+        if self.pick.sampler.is_some() {
             self.history = prompt_tail(held, p.sampling.repeat_last_n);
         }
         // A request that passes has its first token from the prompt's step:
         // the passes make at most the rest.
-        let passes = takes_passes(
-            self.sampler.as_ref(),
-            self.probs.is_some(),
-            self.walk.is_some() || self.held.is_some(),
-            slot.engine.as_ref(),
-        );
+        let passes = takes_passes(&self.pick, slot.engine.as_ref());
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
             Ok(n) if passes => Some(n.saturating_sub(1)),
             Err(_) if passes => None,
@@ -2482,7 +2543,7 @@ impl Gen {
             .budget
             .saturating_sub(1)
             .min(self.ctx_max.saturating_sub(self.n));
-        let Some(walk) = self.walk.as_mut() else {
+        let Some(walk) = self.pick.walk.as_mut() else {
             return;
         };
         let mut ahead = walk.ahead();
@@ -2608,7 +2669,7 @@ impl Gen {
             cache_n: kept.cache_n,
             cache_ms: kept.cache_ms,
             n_prompt: n,
-            jump: (self.walk.is_some() || self.held.is_some()).then(|| Jump {
+            jump: (self.pick.walk.is_some() || self.pick.held.is_some()).then(|| Jump {
                 arm: self.jump,
                 lead: self.lead.len(),
                 ..Jump::default()
@@ -2640,7 +2701,7 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
         tick: &mut dyn FnMut(&Timings),
     ) -> Result<Need, GenError> {
-        if let Some(e) = self.refused.take() {
+        if let Some(e) = self.pick.refused.take() {
             return Err(e.into());
         }
         if let Some(span) = &self.span {
@@ -2653,18 +2714,18 @@ impl Gen {
             return Ok(Need::Fill);
         }
         while let Some(tok) = self.tok.take() {
-            if self.bias.banned.contains(&tok) {
+            if self.pick.bias.banned.contains(&tok) {
                 return Err(GenError::Banned(tok));
             }
             self.generated.push(tok);
-            if self.sampler.is_some() {
+            if self.pick.sampler.is_some() {
                 self.history.push(tok);
             }
             self.tim.predicted_n = self.generated.len();
             self.tim.predicted_ms = ms_since(self.t1);
             tick(&self.tim);
             if self.stops.contains(&tok) {
-                if self.held.is_some() {
+                if self.pick.held.is_some() {
                     return Err(GenError::Unclosed);
                 }
                 self.stop = StopKind::Eos;
@@ -2708,12 +2769,12 @@ impl Gen {
             // The token's text out. A request that asks for probabilities
             // sends an event a token, its value written first, the text
             // possibly empty; any other sends text alone, when there is some.
-            if let Some(c) = self.probs.as_mut() {
+            if let Some(c) = self.pick.probs.as_mut() {
                 let token = self.generated.len() - 1;
-                c.take(tok, &self.logits, &pushed.send)
+                c.take(tok, &pushed.send)
                     .map_err(|error| GenError::Logprobs { token, error })?;
             }
-            if self.probs.is_some() || !pushed.send.is_empty() {
+            if self.pick.probs.is_some() || !pushed.send.is_empty() {
                 let specials = self.sending(&pushed.send);
                 sink(Event::Text(&pushed.send, &specials, &self.tim))?;
             }
@@ -2772,7 +2833,7 @@ impl Gen {
                 && self.think_left() >= self.rows
                 && n + len + self.rows - 1 <= self.ctx_max
             {
-                return Ok(if self.sampler.is_some() {
+                return Ok(if self.pick.reads_rows() {
                     Need::Sampled(tok)
                 } else {
                     Need::Advance(tok)
@@ -2802,7 +2863,7 @@ impl Gen {
     /// the step arm picks it from a row, the tail names it. A fixed id the
     /// walk refuses is the request's error, as a pick's is.
     fn tail_id(&mut self) -> Result<Option<u32>, StepError> {
-        let (true, Some(end), Some(walk)) = (self.jump, self.end, self.walk.as_mut()) else {
+        let (true, Some(end), Some(walk)) = (self.jump, self.end, self.pick.walk.as_mut()) else {
             return Ok(None);
         };
         if !self.tail {
@@ -2840,7 +2901,7 @@ impl Gen {
         if !self.jump {
             return false;
         }
-        let Some(walk) = self.walk.as_mut() else {
+        let Some(walk) = self.pick.walk.as_mut() else {
             return false;
         };
         if !walk.fixed_next() {
@@ -2901,7 +2962,7 @@ impl Gen {
         let closing = span.close && end == span.feed.len();
         let ids = &span.feed[span.fed..end];
         let greedy = if closing {
-            let logits = if self.walk.as_mut().is_some_and(Walk::fixed_next) {
+            let logits = if self.pick.walk.as_mut().is_some_and(Walk::fixed_next) {
                 None
             } else {
                 out(&mut self.logits)
@@ -2939,8 +3000,12 @@ impl Gen {
     /// What a [`Need::Advance`] drafted; its tokens are in [`Gen::kept_mut`].
     /// The force is never armed here by [`Gen::pump`]'s pass gate: a pass
     /// starts only while the budget holds `rows` and keeps at most `rows`, so
-    /// its first kept token is always there for the taking.
+    /// its first kept token is always there for the taking. A pass of several
+    /// slots that held the pick ([`Gen::pass_row`]) gives it back here.
     pub(crate) fn advanced(&mut self, d: Drafted) {
+        if std::mem::take(&mut self.lending) {
+            self.take_back();
+        }
         self.tim.book(d);
         book_depths(&mut self.depths, d);
         self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
@@ -2948,44 +3013,62 @@ impl Gen {
         self.taken = 1;
     }
 
+    /// The request's pick into [`Gen::lent`], where every draw of the pass's
+    /// sampler ([`Gen::draw`]) asks it, one draw a kept row.
+    fn lend(&mut self) {
+        std::mem::swap(&mut self.pick, &mut relock(&self.lent));
+    }
+
+    /// The pick back from [`Gen::lent`] once its pass is over, with what the
+    /// pass's draws moved: the sampler's state, the program, the values held.
+    fn take_back(&mut self) {
+        self.lend();
+        self.count_picks();
+    }
+
     /// A [`Need::Sampled`] pass from `last` on the selected slot
-    /// ([`Slot::advance_sampled`]): the request's sampler goes to the engine
-    /// and comes back, so the next step or pass draws on from where this one
-    /// stopped, and the engine is lent the history a step's draw is given
-    /// ([`Gen::answer`]): the prompt's tail then the generated ids. Its
-    /// tokens are then in hand as an [`Engine::advance`] pass's, the loop
-    /// adding each to the generated ids as it takes it.
-    ///
-    /// # Panics
-    ///
-    /// When the request does not sample: [`Gen::pump`] asks for this pass
-    /// only of one that does.
+    /// ([`Slot::advance_sampled`]): the request's pick goes to the engine as
+    /// the pass's sampler and comes back ([`Gen::lend`]), so the next step or
+    /// pass picks on from where this one stopped, and the engine is lent the
+    /// history a step's draw is given ([`Gen::answer`]): the prompt's tail
+    /// then the generated ids. Its tokens are then in hand as an
+    /// [`Engine::advance`] pass's, the loop adding each to the generated ids
+    /// as it takes it.
     pub(crate) fn advance_sampled(
         &mut self,
         slot: &mut Slot,
         last: u32,
     ) -> Result<(), EngineError> {
-        let sampler = self
-            .sampler
+        let draw = self
+            .draw
             .take()
-            .expect("a sampled pass of a request that samples");
-        let (d, sampler) =
-            slot.advance_sampled(last, &self.history, &mut self.lent, sampler, &mut self.kept);
-        self.sampler = Some(sampler);
+            .expect("a request's pass sampler is back between passes");
+        self.lend();
+        let (d, draw) = slot.advance_sampled(
+            last,
+            &self.history,
+            &mut self.lent_history,
+            draw,
+            &mut self.kept,
+        );
+        self.take_back();
+        self.draw = Some(draw);
         self.advanced(d?);
         Ok(())
     }
 
     /// The row of a [`Need::Advance`] or a [`Need::Sampled`] pass from `last`
     /// in a round of several slots ([`Slot::advance_slots`]): the kept ids
-    /// its `out`, and on a request that samples its draw, the history and
-    /// the sampler [`Gen::advance_sampled`] hands its pass. Its count goes
-    /// to [`Gen::advanced`].
+    /// its `out`, and on a request that reads its rows its draw, the history
+    /// and the sampler [`Gen::advance_sampled`] hands its pass, the pick lent
+    /// until [`Gen::advanced`] takes the round's count.
     pub(crate) fn pass_row(&mut self, slot: usize, last: u32) -> SlotPass<'_> {
-        let draw = if self.sampler.is_some() {
+        let draw = if self.pick.reads_rows() {
+            self.lend();
+            self.lending = true;
             Some(SlotDraw {
                 history: &self.history,
-                sampler: &mut self.sampler,
+                sampler: &mut self.draw,
             })
         } else {
             None
@@ -3021,11 +3104,11 @@ impl Gen {
         }
         // `pump` takes the end-of-generation id without its text out: the one
         // generated id that can still lack its value here.
-        let valued = match self.probs.as_mut() {
+        let valued = match self.pick.probs.as_mut() {
             Some(c) => match self.generated.get(c.taken()) {
                 Some(&eog) => {
                     let token = c.taken();
-                    c.take(eog, &self.logits, &rest)
+                    c.take(eog, &rest)
                         .map_err(|error| GenError::Logprobs { token, error })?;
                     true
                 }
