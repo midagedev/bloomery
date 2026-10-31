@@ -99,7 +99,9 @@ curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/relea
 A 128 GB GB10 holds every routed expert of Qwen3.8-Flash-Next on the GPU. NVIDIA's FP4-Local and NVFP4 checkpoint
 folders serve as downloaded, with no conversion: `bloomery-serve -m <folder>`, or `--hf nvidia/Qwen3.8-Flash-Next-NVFP4`.
 In Docker, mount the folder and name it inside the container, for example
-`-v /path/to/models:/models ... ghcr.io/midagedev/bloomery -m /models/Qwen3.8-Flash-Next-FP4-Local`.
+`-v /path/to/models:/models ... ghcr.io/midagedev/bloomery -m /models/Qwen3.8-Flash-Next-FP4-Local`. The slots, the
+context each gets, the MTP draft and the memory each folder takes on a GB10 are in
+[`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md#23-qwen38-on-one-spark-slots-mtp-and-memory), section 2.3.
 
 ### Linux x86-64
 

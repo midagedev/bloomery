@@ -7,10 +7,11 @@ today, what was measured there, and which work is left and whose it is. The work
 
 Today a Spark builds the tree from source for `sm_121a`, the target whose NVFP4 and FP4-Local prompt products run on
 the FP4 tensor cores (section 2.1). It runs a model that fits its memory whole on the card, NVIDIA's Qwen3.8 NVFP4 and
-FP4-Local checkpoint folders as downloaded among them; section 2.3 gives the commands for FP4-Local on one Spark and
-its measured decode, prefill and first-token numbers. It runs the fixture-tier gates (the gates that run on small
-generated model files, section 4) in local mode, which runs a gate recipe on your own machine. What a Spark's memory
-and card change, and what was measured on them, is in sections 3, 5, 6 and 7.
+FP4-Local checkpoint folders as downloaded among them; section 2.3 gives the commands for both on one Spark, the slots,
+context, MTP draft and memory each start takes, and FP4-Local's measured decode, prefill and first-token numbers. It
+runs the fixture-tier gates (the gates that run on small generated model files, section 4) in local mode, which runs a
+gate recipe on your own machine. What a Spark's memory and card change, and what was measured on them, is in sections
+3, 5, 6 and 7.
 
 The large work left is models larger than the memory pool (P4, section 8) and one model across several linked Sparks
 (P5, section 9). For P5 the node planner, the link, remote expert tiers and a tensor-parallel GLM-5.3-Flash plan and
@@ -54,7 +55,8 @@ the RDMA end and the all-gather), the tier server (9.5, items 5 and 6), and the 
 
 A Spark installs the release's GB10 archive or builds from source (2.1), plans its one card against the unified pool,
 and serves any model that fits that pool whole on the card. 2.1 is the build, 2.2 the first placement and the models in
-the order to try them, and 2.3 the run path and the measured numbers for Qwen3.8 FP4-Local.
+the order to try them, and 2.3 the run path, the slots, the MTP draft, the memory and the measured numbers for Qwen3.8's
+two checkpoint folders.
 
 ### 2.1 Build
 
@@ -103,42 +105,80 @@ Models by size, in the order to try them (`docs/models.md:45-52` at `c21e3b81`):
 https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
 allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the first three.
 
-### 2.3 Qwen3.8 FP4-Local on one Spark
+### 2.3 Qwen3.8 on one Spark: slots, MTP and memory
 
 NVIDIA publishes Qwen3.8-Flash-Next in two checkpoint folders that a Spark serves as downloaded, with no conversion
 step: `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB on disk) and `nvidia/Qwen3.8-Flash-Next-FP4-Local` (102.3 GB at
 revision `b9ce18a6`; NVFP4 experts with compressed block scales, MXFP8 and FP8 dense weights,
 [#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (the GB10 archive or a build
-with the `checkpoint` feature, 2.1) holds every FP4-Local routed expert on the GB10, splits the NVFP4 folder's
-between the GB10 and the host where the card holds fewer, and reads the PLE table from the folder on the NVMe tier
-([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
-MXFP8 sites W8A8 (2.1). A checkpoint folder's KV cache is q8_0 unless `--cache-type-k f16` says otherwise
-(a GGUF file's stays f16 unless `--cache-type-k q8_0` asks): K and V take 17/16 B a value against f16's 2, and the
-attention store is 773,279,360 B against 967,921,280 B at 16,896 positions on FP4-Local (the index keys stay f16;
-the default context and slot count did not change there). `setup` names the format as `cache=`.
-The NVFP4 folder's gate, `gate-gpu-qwen4exp-nvfp4`, runs
-only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name.
-
-The first run needs the folder alone:
+with the `checkpoint` feature, 2.1) serves either, and the first run needs the folder alone:
 
 ```sh
 target/release/bloomery-serve -m <FP4-Local folder>
 ```
 
-With `BLOOMERY_MTP_DRAFT` unset, a folder target's MTP draft is the checkpoint's own MTP layer, loaded in its stored
-formats ([#682](https://github.com/midagedev/bloomery/pull/682); `draft_file`,
-`crates/refset/src/arch/qwen4exp/mtp.rs:33-38` at `c21e3b81`). An unset `BLOOMERY_DRAFT` drafts with it
-on any slot count unless the load prints a `load draft=off` or `draft yield` record. The draft goes off under
-`--place gate` or `--mmproj`, with stores shorter than one window, on a plan that pages experts, and when its card
-bytes would leave a slot half the context positions or fewer. `BLOOMERY_DRAFT=mtp` never
-yields to the context (`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:28-31,162-171,236-238,246-264` at
-`c21e3b81`). With no `--ctx-size`, each slot asks the trained 262,144 positions and, where the GB10's one memory pool cannot
-hold that plan, takes the largest context under it, a multiple of 1,024, whose plan holds, so `--parallel 2` and
-`--parallel 4` start without a context flag. Before its address the server prints one `setup` line with the draft and
-where it reads it (or, when a rule turned it off, why), the slots, the context each serves and whether it was the
-target or fitted, and the settings that change them.
+On the Spark of the table below, that start serves one request at a time at the trained 262,144 positions, with the
+MTP draft on. This section says what a start chooses and what changes it: the folder, the slot count and its context,
+the draft and the memory. The speed measured on FP4-Local closes it.
 
-The measurement below named a separate draft file instead: the shared Q8_0 draft that
+**The two folders.** On that 128 GB Spark the plan put all 24,576 routed experts of either folder on the GB10, in every
+row of the table. The FP4-Local folder needs that: the host does not read its compressed block scales, so its
+load holds every tensor on the GB10 and refuses a plan that puts one elsewhere. The NVFP4 folder's experts can also sit
+on the host, where a smaller card splits them ([`serving.md`](../serving.md#the-seats)). Both read the PLE table from
+the folder on the NVMe tier. FP4-Local takes 3.5 GB less of the pool at one slot (the table below) and decoded faster at
+0.3.10 ([`numbers.md`](../numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310)), so it is
+the folder to start with. On the `sm_121a` build the routed experts' prompt products run W4A4 and the MXFP8 sites W8A8
+(2.1). Either folder's KV cache is q8_0 unless `--cache-type-k f16` says otherwise (a GGUF file's stays f16 unless
+`--cache-type-k q8_0` asks; `crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:1751` at `0305ba7a`): K and V take
+17/16 B a value against f16's 2, and the attention store is 773,279,360 B against 967,921,280 B at 16,896 positions on
+FP4-Local (the index keys stay f16). `setup` names the format as `cache=`. The NVFP4 folder's gate,
+`gate-gpu-qwen4exp-nvfp4`, runs only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a
+smaller card defers it by name.
+
+**Slots and their context.** The server has one slot unless `--parallel N` asks for N. With no `--ctx-size`, each slot
+asks the trained 262,144 positions and, where the GB10's one memory pool cannot hold that plan, takes the largest
+context under it, a multiple of 1,024, whose plan holds, so each count in the table starts without a context flag.
+`--parallel auto` serves the most slots, up to 8, whose plan holds one request's context: `--slot-ctx S` when set, else
+the context one slot takes with no flags ([`serving.md`](../serving.md#the-seats), "Concurrent requests"). On FP4-Local
+`--parallel auto` alone serves 3 slots of 262,144 (107.0 GB). The table is `bloomery-serve --plan`, which prints a
+start's records and exits before it loads anything ([`serving.md`](../serving.md#flags-by-seat)), at main `0305ba7a` on
+one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB `MemAvailable` before each plan. The plan reads its
+room from `MemAvailable` (7.2), so a Spark with less free memory fits less: `--plan` with the same flags reads your own.
+Need is the `need` record's bytes, what the load takes of the pool: the GB10's share, the slots' checkpoints in pinned
+host memory and file pages. The prompt cache's budget (`--cache-ram`; by default 8 GiB, or half of what the plan leaves
+where that is less) comes on top of it.
+
+| Settings beside `-m <folder>` | FP4-Local: slots × context | FP4-Local: need | NVFP4: slots × context | NVFP4: need |
+|---|---|---:|---|---:|
+| none | 1 × 262,144 | 90.5 GB | 1 × 262,144 | 94.0 GB |
+| `--parallel 2` | 2 × 262,144 | 98.7 GB | 2 × 262,144 | 102.3 GB |
+| `--parallel 4` | 4 × 225,280 | 113.2 GB | 4 × 167,936 | 113.3 GB |
+| `--parallel auto --slot-ctx 131072` | 4 × 131,072 | 107.4 GB | 4 × 131,072 | 110.9 GB |
+| `--parallel auto --slot-ctx 65536` | 8 × 65,536 | 111.6 GB | 7 × 65,536 | 111.4 GB |
+| `--parallel auto --slot-ctx 32768` | 8 × 32,768 | 98.3 GB | 8 × 32,768 | 101.9 GB |
+| `BLOOMERY_DRAFT=off` | 1 × 262,144 | 88.5 GB | 1 × 262,144 | 90.9 GB |
+| `BLOOMERY_DRAFT=off --parallel 4` | 4 × 262,144 | 112.4 GB | 4 × 233,472 | 113.4 GB |
+
+Only automatically reduced contexts report `rule=fitted` with shortage details; `--slot-ctx` reports `rule=set`.
+The MTP draft stayed on in every row that did not set `BLOOMERY_DRAFT=off`, and no row printed a `draft yield`
+record. Read off the table [derived]: a slot of 262,144 positions takes 8.3 GB of the pool on either folder, 4.2 GB of
+it the slot's checkpoints; the draft takes 2.0 GB on FP4-Local and 3.1 GB on NVFP4 at one slot, and at four slots it
+costs each slot 36,864 positions on FP4-Local and 65,536 on NVFP4. What one, two and four requests at once decode on
+FP4-Local is the measurement at the end of this section. A smaller `-ub` frees card bytes for a context or a slot count
+the default does not fit, and runs long prompts slower ([`serving.md`](../serving.md#flags-by-seat)).
+
+**The MTP draft.** With `BLOOMERY_MTP_DRAFT` unset, a folder's MTP draft is the checkpoint's own MTP layer, loaded in
+its stored formats ([#682](https://github.com/midagedev/bloomery/pull/682); `draft_file`,
+`crates/refset/src/arch/qwen4exp/mtp.rs:33-38` at `0305ba7a`). An unset `BLOOMERY_DRAFT` drafts with it on any slot
+count, an image load (`--mmproj`) included, unless the load prints a `load draft=off` or `draft yield` record. The
+draft goes off under `--place gate`, with stores shorter than one window, on a plan that pages experts, on a folder
+without the MTP layer, and when its card bytes would leave a slot half the context positions of the plan without it or
+fewer. `BLOOMERY_DRAFT=mtp` keeps it on whatever the context, and `BLOOMERY_DRAFT=off` serves without it
+(`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:44-47,229-235,297,306-323` at `0305ba7a`). Before its address
+the server prints one `setup` line with the draft and where it reads it (or, when a rule turned it off, why), the
+slots, the context each serves and whether it was set, the target or fitted, and the settings that change them.
+
+**Speed on FP4-Local.** The measurement below named a separate draft file instead: the shared Q8_0 draft that
 `unsloth/Qwen3.8-Flash-Next-GGUF` publishes, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (revision `766911a6`), set
 by `BLOOMERY_MTP_DRAFT`. These are the servers the numbers below came from, one server per request count:
 

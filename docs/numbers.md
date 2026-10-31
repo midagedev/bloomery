@@ -86,6 +86,8 @@ defaults.
 Measured by [@juliankang4](https://github.com/juliankang4) on one DGX Spark at 0.3.10: `nvidia/Qwen3.8-Flash-Next-FP4-Local`
 and NVIDIA's NVFP4 folder as downloaded, the MTP draft from Unsloth's `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, 128
 tokens, greedy, `cache_prompt` off, median of three rounds. Decode is 1000 / TPOT; prefill is prompt tokens / TTFT.
+Two and four requests at once on the FP4-Local folder, and the slots and context each folder's plan holds, are in
+[`contrib/dgx-spark.md`](contrib/dgx-spark.md#23-qwen38-on-one-spark-slots-mtp-and-memory), section 2.3.
 
 | Prompt | Text | Decode, draft off | Decode, MTP on | First token, off / on | Prefill, draft off |
 |---|---|---|---|---|---|
