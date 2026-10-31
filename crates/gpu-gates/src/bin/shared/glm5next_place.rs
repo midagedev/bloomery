@@ -6,7 +6,7 @@
 //! them here.
 
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::beside::{self, Beside};
+use bloomery_gpu_gates::beside;
 use bloomery_gpu_gates::bind::place_word;
 use bloomery_gpu_gates::generate::{Place, TierRule, choose_ctx_of};
 use bloomery_gpu_gates::residency38::glm_machine;
@@ -116,10 +116,7 @@ pub fn plan_of<'a>(
     reason = "the serve seat names its refusals; the CLI and the routed legs read them bare"
 )]
 pub fn named(machine: &Machine, e: PlaceError) -> GateError {
-    match beside::reserve_in(machine) {
-        held if held == Beside::default() => GateError::from(e),
-        held => GateError::from(beside::refusal(held, e)),
-    }
+    beside::refusal(beside::reserve_in(machine), e)
 }
 
 /// The serve seat's context, every number a slot's own and every plan

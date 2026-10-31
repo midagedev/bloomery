@@ -52,6 +52,14 @@ pub enum PlacementError {
     /// ([`workstation::host_room`]'s reading): the file or value that failed.
     #[error("the host's room: {0}")]
     HostRoom(String),
+    /// The draft layer's routed experts, held on the host beside the trunk's,
+    /// pass the host room the plan was made at: the trunk has no room left to
+    /// split at.
+    #[error(
+        "the draft layer's routed experts, {draft} B, pass the host room {room} B: free host \
+         memory, or serve without the draft"
+    )]
+    DraftHostRoom { room: u64, draft: u64 },
     /// A host set, a walk or a page release met an r8 sidecar it cannot take
     /// beside its pair: the sidecar's own named refusal.
     #[error(transparent)]

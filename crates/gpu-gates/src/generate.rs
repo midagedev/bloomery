@@ -268,6 +268,93 @@ impl std::fmt::Display for FloorShort {
 
 impl std::error::Error for FloorShort {}
 
+/// Whether a seat's context search refused `e` because the machine holds no
+/// context it may take: a default short at its floor ([`FloorShort`]), a set
+/// context it cannot hold ([`CtxDoesNotFit`]), a load short of host room
+/// ([`placement::workstation::HostShort`], including a discrete host's
+/// folder read-ahead beside the draft's reserves), or a host room under a
+/// floor the draft raises and no smaller context lowers
+/// ([`placement::PlacementError::host_floor_short`]: the NVMe expert tier's
+/// floor and arena, and the draft's own host experts), read through the
+/// family's refusal `E`, anywhere in the source chain. Every other refusal is
+/// the plan's own error.
+#[must_use]
+pub fn holds_no_ctx<E>(e: &GateError) -> bool
+where
+    E: placement::ctx_ask::PlanRefusal + std::error::Error + 'static,
+{
+    use placement::ctx_ask::PlanRefusal;
+    std::iter::successors(Some(&**e as &dyn std::error::Error), |e| e.source()).any(|e| {
+        e.is::<FloorShort>()
+            || e.is::<CtxDoesNotFit>()
+            || e.is::<placement::workstation::HostShort>()
+            || e.downcast_ref::<E>()
+                .and_then(PlanRefusal::placement)
+                .or_else(|| e.downcast_ref::<placement::PlacementError>())
+                .and_then(placement::PlacementError::host_floor_short)
+                .is_some()
+    })
+}
+
+/// What an unset draft's yield to the context chose ([`draft_yield`]).
+#[derive(Debug)]
+pub enum DraftYield<D, P> {
+    /// The drafted plan serves.
+    Keep(D),
+    /// The draft goes off: the plain plan serves, and the cost names both
+    /// contexts.
+    Yield(P, bloomery_levers::RungCost),
+}
+
+/// The serve seats' one rule for an unset draft's yield to the context: the
+/// context comes first. Where the draft is unset (`asks`) and the drafted
+/// plan fitted its context under the target (`fitted` gives its positions)
+/// or holds no context it may take, a set one included ([`holds_no_ctx`],
+/// zero positions), `plain`
+/// plans without the draft and gives its plan, its positions and the draft's
+/// card bytes there; when the plain plan serves twice the positions or more
+/// ([`bloomery_levers::RungCost::of`]) the draft yields. Otherwise the drafted
+/// plan, or its refusal, stands: a refusal of any other kind is never read
+/// as a yield. A drafted plan that stands keeps its own context note
+/// ([`crate::start::note_ctx`]), which `plain` overwrote.
+///
+/// # Errors
+/// The drafted plan's refusal where the draft does not yield, and the plain
+/// plan's.
+pub fn draft_yield<E, D, P>(
+    asks: bool,
+    drafted: Result<D, GateError>,
+    fitted: impl FnOnce(&D) -> Option<usize>,
+    plain: impl FnOnce() -> Result<(P, usize, u64), GateError>,
+) -> Result<DraftYield<D, P>, GateError>
+where
+    E: placement::ctx_ask::PlanRefusal + std::error::Error + 'static,
+{
+    let with = match &drafted {
+        _ if !asks => None,
+        Ok(d) => fitted(d),
+        Err(e) if holds_no_ctx::<E>(e) => Some(0),
+        Err(_) => None,
+    };
+    let Some(with) = with else {
+        return drafted.map(DraftYield::Keep);
+    };
+    let noted = crate::start::noted_ctx();
+    let (plain, without, bytes) = plain()?;
+    match bloomery_levers::RungCost::of(
+        bloomery_levers::Reserve::Draft,
+        u64::try_from(with)?,
+        u64::try_from(without)?,
+        bytes,
+    ) {
+        Some(y) => Ok(DraftYield::Yield(plain, y)),
+        None => {
+            crate::start::restore_ctx(noted);
+            drafted.map(DraftYield::Keep)
+        }
+    }
+}
+
 /// A set context the machine cannot hold ([`placement::ctx_ask::AskError::DoesNotFit`]'s words),
 /// kept as its own type so a start can offer the largest context that does.
 #[derive(Debug)]
@@ -3018,30 +3105,35 @@ mod tests {
         );
     }
 
+    /// A family's plan refusal for the shared seat rules, carrying a placement
+    /// error or none, so the tests read no model's own error type.
+    #[derive(Debug)]
+    struct FamilyRefusal(Option<model::placement::PlacementError>);
+
+    impl std::fmt::Display for FamilyRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the family's plan refusal")
+        }
+    }
+
+    impl std::error::Error for FamilyRefusal {}
+
+    impl model::placement::ctx_ask::PlanRefusal for FamilyRefusal {
+        fn placement(&self) -> Option<&model::placement::PlacementError> {
+            self.0.as_ref()
+        }
+        fn violations(&self) -> Option<&[model::placement::Violation]> {
+            None
+        }
+    }
+
     /// A load's refusal of a plan that pages experts is short on the host wherever the seat's
     /// error carries it in its source chain (the gpu crate's plan refusal wraps it), so a
     /// context or slot search fits below it. Mutant: only the error itself read, so the wrapped
     /// refusal stays the seat's error.
     #[test]
     fn a_wrapped_unpaged_refusal_is_short_on_the_host() {
-        use model::placement::ctx_ask::{PlanRefusal, Short, Side, Unpaged};
-
-        #[derive(Debug)]
-        struct PlanError;
-        impl std::fmt::Display for PlanError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a refusal of another kind")
-            }
-        }
-        impl std::error::Error for PlanError {}
-        impl PlanRefusal for PlanError {
-            fn placement(&self) -> Option<&model::placement::PlacementError> {
-                None
-            }
-            fn violations(&self) -> Option<&[model::placement::Violation]> {
-                None
-            }
-        }
+        use model::placement::ctx_ask::{Short, Side, Unpaged};
 
         #[derive(Debug)]
         struct Wrapped(Unpaged);
@@ -3062,7 +3154,7 @@ mod tests {
         };
         let e: GateError = Box::new(Wrapped(refusal));
         assert_eq!(
-            super::short_in::<PlanError>(&e),
+            super::short_in::<FamilyRefusal>(&e),
             Some(Short {
                 on: Side::Host,
                 need: 10,
@@ -3070,7 +3162,154 @@ mod tests {
             })
         );
         let other: GateError = "a refusal of another kind".into();
-        assert_eq!(super::short_in::<PlanError>(&other), None);
+        assert_eq!(super::short_in::<FamilyRefusal>(&other), None);
+    }
+
+    /// An unset draft yields only where the plain plan serves twice the
+    /// positions or more and the drafted plan fitted its context or holds none
+    /// (a floor short, a set context short, a host room the NVMe tier's arena
+    /// does not fit, also under a named reserve); a refusal of any other kind
+    /// passes up with its name, and a set draft never yields.
+    /// Mutant: every drafted refusal read as no context (the draft goes off on
+    /// a read error).
+    #[test]
+    fn only_a_context_no_plan_holds_yields_the_draft() {
+        use model::placement::PlacementError;
+        use model::placement::ctx_ask::{Short, Side};
+
+        use super::{CtxDoesNotFit, DraftYield, FloorShort, draft_yield};
+
+        // A kept draft gives back the context note, which is process-wide.
+        let _note = crate::start::slot_note_tests();
+        let short = Short {
+            on: Side::Host,
+            need: 9,
+            room: 8,
+        };
+        let floor_short = || -> GateError {
+            Box::new(FloorShort {
+                floor: 4096,
+                short,
+                text: "short at the floor".into(),
+            })
+        };
+        let host_room_floor = || PlacementError::HostRoomFloor {
+            room: 8,
+            floor: 9,
+            base: 1,
+            layer: 1,
+            need: 9,
+            arena: None,
+        };
+        let host_floor = || -> GateError { Box::new(FamilyRefusal(Some(host_room_floor()))) };
+        let bare_host_floor = || -> GateError { Box::new(host_room_floor()) };
+        let arena_past = || -> GateError {
+            Box::new(FamilyRefusal(Some(PlacementError::NvTierArena {
+                arena: 9,
+                room: 16,
+                floor: 8,
+            })))
+        };
+        let arena_under = || -> GateError {
+            Box::new(FamilyRefusal(Some(PlacementError::NvTierArenaUnder {
+                arena: 1,
+                least: model::placement::ArenaFloor::new(8, 5, 0, 4).expect("a small arena floor"),
+            })))
+        };
+        let named_host_floor = || -> GateError {
+            crate::beside::refusal(
+                crate::beside::Beside {
+                    image: Some(1),
+                    embedding: None,
+                },
+                FamilyRefusal(Some(host_room_floor())),
+            )
+        };
+        let named_draft_host = || -> GateError {
+            crate::beside::refusal(
+                crate::beside::Beside {
+                    image: Some(1),
+                    embedding: None,
+                },
+                FamilyRefusal(Some(PlacementError::DraftHostRoom { room: 8, draft: 9 })),
+            )
+        };
+        let family_other = || -> GateError { Box::new(FamilyRefusal(None)) };
+        let host_short = || -> GateError {
+            use model::placement::workstation::{HostNeed, HostRead};
+            let need = HostNeed {
+                experts: 0,
+                tables: 0,
+                shadows: 0,
+                reserves: 9,
+                extra: 0,
+                read_ahead: 0,
+                arena: 0,
+                cards: 0,
+                os: 0,
+                card_budget: false,
+            };
+            let short = need
+                .check(&(8, HostRead::Given))
+                .expect_err("a discrete host shortage");
+            assert!(short.pool_short().is_none());
+            Box::new(short)
+        };
+        let set_short = || -> GateError {
+            Box::new(CtxDoesNotFit {
+                largest_total: None,
+                largest_slot: None,
+                short,
+                text: "the set context does not fit".into(),
+            })
+        };
+        let other = || -> GateError { "a read of the folder failed".into() };
+        let fitted = |&(c, fit): &(usize, bool)| fit.then_some(c);
+        let rule = |asks: bool, drafted: Result<(usize, bool), GateError>, without: usize| {
+            draft_yield::<FamilyRefusal, _, _>(asks, drafted, fitted, || Ok(("plain", without, 7)))
+                .map(|y| match y {
+                    DraftYield::Keep((c, _)) => format!("keep {c}"),
+                    DraftYield::Yield(p, y) => format!("{p} {}", y.with),
+                })
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(rule(true, Err(floor_short()), 16_384), Ok("plain 0".into()));
+        assert_eq!(rule(true, Err(host_short()), 16_384), Ok("plain 0".into()));
+        assert_eq!(rule(true, Err(host_floor()), 16_384), Ok("plain 0".into()));
+        assert_eq!(
+            rule(true, Err(bare_host_floor()), 16_384),
+            Ok("plain 0".into())
+        );
+        assert_eq!(rule(true, Err(arena_past()), 16_384), Ok("plain 0".into()));
+        assert_eq!(rule(true, Err(arena_under()), 16_384), Ok("plain 0".into()));
+        assert_eq!(
+            rule(true, Err(named_host_floor()), 16_384),
+            Ok("plain 0".into())
+        );
+        assert_eq!(
+            rule(true, Err(named_draft_host()), 16_384),
+            Ok("plain 0".into())
+        );
+        assert_eq!(
+            rule(true, Err(family_other()), 16_384),
+            Err("the family's plan refusal".into())
+        );
+        assert_eq!(rule(true, Err(set_short()), 4096), Ok("plain 0".into()));
+        assert_eq!(
+            rule(true, Err(other()), 16_384),
+            Err("a read of the folder failed".into())
+        );
+        assert_eq!(rule(true, Ok((4096, true)), 8192), Ok("plain 4096".into()));
+        assert_eq!(rule(true, Ok((4096, true)), 8191), Ok("keep 4096".into()));
+        assert_eq!(
+            rule(true, Ok((4096, false)), 16_384),
+            Ok("keep 4096".into())
+        );
+        assert_eq!(
+            rule(false, Err(floor_short()), 16_384),
+            Err("short at the floor".into())
+        );
+        assert_eq!(rule(false, Ok((4096, true)), 8192), Ok("keep 4096".into()));
     }
 }
 

@@ -200,6 +200,28 @@ impl PlacementError {
             _ => None,
         }
     }
+
+    /// This refusal as a host room under a floor the plan's slots and draft
+    /// raise and a smaller context does not lower: the NVMe expert tier's
+    /// floor ([`PlacementError::HostRoomFloor`]), a set arena past what the
+    /// room leaves over that floor ([`PlacementError::NvTierArena`]), an arena
+    /// under its least ([`PlacementError::NvTierArenaUnder`]), or the draft's
+    /// host experts past the room ([`PlacementError::DraftHostRoom`]). Every
+    /// other refusal is `None`.
+    pub fn host_floor_short(&self) -> Option<Short> {
+        let (need, room) = match self {
+            Self::HostRoomFloor { floor, room, .. } => (*floor, *room),
+            Self::NvTierArena { arena, room, floor } => (*arena, room.saturating_sub(*floor)),
+            Self::NvTierArenaUnder { arena, least } => (least.bytes, *arena),
+            Self::DraftHostRoom { room, draft } => (*draft, *room),
+            _ => return None,
+        };
+        Some(Short {
+            on: Side::Host,
+            need,
+            room,
+        })
+    }
 }
 
 impl HostShort {

@@ -197,9 +197,10 @@
 //! before the plan: `mtp` under `--place a` and `bp` on a file of one
 //! next-token layer; the plain path under `--place gate`, on a file of other than one,
 //! and with stores too short for one window, never a refusal. Unset, the
-//! draft then yields to the context, set or not (`bloomery_levers::RungCost::of`,
+//! draft then yields to the context, set or not (`bloomery_gpu_gates::generate::draft_yield`,
 //! the one rule): when the drafted load fitted its context, or holds not even
-//! the floor, and the plain load holds twice as much or more, the draft goes off, one `draft
+//! the floor, and the plain load holds twice as much or more, the draft goes off (any
+//! other refusal of the drafted load stops it by name), one `draft
 //! yield` record naming its card bytes and the positions a slot gets either
 //! way, the plain load's `ctx` line following. Set, refused by
 //! name: `mtp` with stores too short for one window (`--ctx` under 3: the
@@ -256,7 +257,9 @@ use bloomery_gpu_gates::bind::{
     SlotPassRow, SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
     model_props, note_line, parallel_line, placement_of, put_back, slots_given,
 };
-use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
+use bloomery_gpu_gates::generate::{
+    DraftYield, Lane, Place, draft_yield, lane_at, mode_name, with_cards,
+};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency::PlanRoom;
@@ -276,7 +279,7 @@ use bloomery_levers::{
     ChurnHosting, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
 };
 use gguf::Split;
-use model::arch::glm5next::place::{KdaLanes, NextnInputs, PROMPT_GROUP, PlanInputs};
+use model::arch::glm5next::place::{KdaLanes, NextnInputs, PROMPT_GROUP, PlaceError, PlanInputs};
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::slots::{SplitError, split_ctx};
@@ -951,15 +954,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The selected placement and slot count stay fixed.
     let drafted = plan_place(chosen.place, (a.ctx, slots));
     // The draft is unset, so it yields to the context, set or not: the
-    // context comes first.
+    // context comes first (`generate::draft_yield`).
     let asks_yield = draft_off.is_none() && levers.draft().is_none();
-    let (placed, draft_off, yield_record) = match drafted {
-        Ok(d) if !asks_yield || !d.line.starts_with("ctx rule=fitted ") => (d, draft_off, None),
-        // A draft the levers set keeps its own refusal: it never yields.
-        drafted if !asks_yield => (drafted?, draft_off, None),
-        drafted => {
-            // The draft costs context, or the drafted load holds not even
-            // the floor: the plain load's context decides.
+    let chosen_draft = draft_yield::<PlaceError, _, _>(
+        asks_yield,
+        drafted,
+        |d| d.line.starts_with("ctx rule=fitted ").then_some(d.ctx),
+        || {
             let plain = Placed::of(
                 chosen.place,
                 &inputs,
@@ -968,24 +969,17 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 (a.ctx, slots),
                 (&images, side.as_ref()),
             )?;
-            let with = drafted.as_ref().map_or(0, |d| d.ctx);
             let bytes = nextn
                 .as_ref()
                 .expect("a drafted load read the NextN layer")
                 .card_bytes(u64::try_from(plain.ctx)?, slots)?;
-            match bloomery_levers::RungCost::of(
-                bloomery_levers::Reserve::Draft,
-                u64::try_from(with)?,
-                u64::try_from(plain.ctx)?,
-                bytes,
-            ) {
-                Some(y) => {
-                    let said = record::draft_yield(&y);
-                    (plain, Some(y.to_string()), Some(said))
-                }
-                None => (drafted?, draft_off, None),
-            }
-        }
+            let ctx = plain.ctx;
+            Ok((plain, ctx, bytes))
+        },
+    )?;
+    let (placed, draft_off, yield_record) = match chosen_draft {
+        DraftYield::Keep(d) => (d, draft_off, None),
+        DraftYield::Yield(plain, y) => (plain, Some(y.to_string()), Some(record::draft_yield(&y))),
     };
     if let Some(said) = yield_record {
         said.eprint();

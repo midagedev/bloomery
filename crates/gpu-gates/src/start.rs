@@ -21,7 +21,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// The context a plan chose.
 #[derive(Clone, Debug)]
-struct CtxNote {
+pub(crate) struct CtxNote {
     slot_ctx: u64,
     slots: u64,
     rule: &'static str,
@@ -95,6 +95,17 @@ pub fn note_ctx(slot_ctx: u64, slots: u64, rule: &'static str, limit: u64) {
         rule,
         limit,
     });
+}
+
+/// The context [`note_ctx`] kept last, for a probe that notes its own and gives the note back
+/// ([`restore_ctx`]).
+pub(crate) fn noted_ctx() -> Option<CtxNote> {
+    report().ctx.clone()
+}
+
+/// Puts back the context note [`noted_ctx`] read.
+pub(crate) fn restore_ctx(note: Option<CtxNote>) {
+    report().ctx = note;
 }
 
 /// The plan's need: `bytes` of host, each card's bytes, the routed-expert bytes the host keeps
@@ -410,12 +421,10 @@ mod agent {
     /// program the seats do not run [`Code::Unsupported`], the rest the unnamed refusal.
     fn placement_code(e: &PlacementError) -> Code {
         if e.card_short().is_some()
+            || e.host_floor_short().is_some()
             || matches!(
                 e,
-                PlacementError::HostRoomFloor { .. }
-                    | PlacementError::NvTierArena { .. }
-                    | PlacementError::NvTierArenaUnder { .. }
-                    | PlacementError::TierBatchCard { .. }
+                PlacementError::TierBatchCard { .. }
                     | PlacementError::TierBatchHost { .. }
                     | PlacementError::ResidencyOverHost(_)
             )
@@ -709,6 +718,55 @@ mod agent {
             assert_eq!(v["refused"]["code"], "no-fit");
             assert_eq!(v["refused"]["need"], 7);
             assert!(refusal_json(Code::Usage, "m", None)["refused"]["need"].is_null());
+        }
+
+        /// A drafted plan that stands keeps its own context note, which the plain plan's probe
+        /// overwrote; a yield keeps the plain plan's.
+        #[test]
+        fn the_plan_line_names_the_context_the_draft_choice_serves() {
+            use crate::generate::{DraftYield, draft_yield};
+            use model::arch::hybrid::PlaceError;
+
+            let _note = super::super::slot_note_tests();
+            let chosen = |without: usize| {
+                super::super::note_ctx(4096, 1, "fitted", 16_384);
+                let chosen = draft_yield::<PlaceError, _, _>(
+                    true,
+                    Ok(4096_usize),
+                    |&c| Some(c),
+                    || {
+                        super::super::note_ctx(without as u64, 1, "fitted", 16_384);
+                        Ok((without, without, 7))
+                    },
+                )
+                .expect("a choice");
+                let kept = matches!(chosen, DraftYield::Keep(_));
+                (kept, report().ctx.as_ref().map(|c| c.slot_ctx))
+            };
+            assert_eq!(chosen(8191), (true, Some(4096)));
+            assert_eq!(chosen(8192), (false, Some(8192)));
+        }
+
+        /// A plan refusal named with the reserves beside the plan keeps its class and its cause:
+        /// the draft's host experts past the room are no fit, and the message the plan line and
+        /// the error event carry names the reserve and the refusal both.
+        #[test]
+        fn a_reserve_named_refusal_keeps_its_class_and_cause() {
+            let cause = PlacementError::DraftHostRoom { room: 8, draft: 9 };
+            let text = cause.to_string();
+            let e = crate::beside::refusal(
+                crate::beside::Beside {
+                    image: Some(7),
+                    embedding: None,
+                },
+                cause,
+            );
+            let (code, _, need) = classify(e.as_ref()).expect("a named refusal");
+            assert_eq!(code, Code::NoFit);
+            let line = refusal_json(code, &e.to_string(), need);
+            let message = line["refused"]["message"].as_str().expect("a message");
+            assert!(message.contains("image encoder's 7 B"), "{message}");
+            assert!(message.contains(&text), "{message}");
         }
 
         /// A seat that binds another address than the start bound is refused by name, and the
