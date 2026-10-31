@@ -333,11 +333,17 @@ impl Log {
 
 /// `id`'s piece as the vocabulary's streaming decoder renders it alone, and
 /// its bytes: those of that text when it is the piece exactly, `null` when
-/// the decoder held an incomplete tail or replaced an invalid sequence.
+/// the decoder held an incomplete tail or replaced an invalid sequence. The
+/// label keeps what the cleaner held for the text that follows; the
+/// replacement character a flush wrote for an incomplete sequence is not the
+/// token's text and stays out of the label.
 fn piece(vocab: &dyn Tokenizer, id: u32) -> (String, Value) {
     let mut d = vocab.decoder();
-    let text = d.push(id).unwrap_or_default();
-    let exact = d.flush().is_empty() && !text.contains(char::REPLACEMENT_CHARACTER);
+    let mut text = d.push(id).unwrap_or_default();
+    let tail = d.flush();
+    let complete = tail.strip_suffix(char::REPLACEMENT_CHARACTER);
+    let exact = complete.is_none() && !text.contains(char::REPLACEMENT_CHARACTER);
+    text.push_str(complete.unwrap_or(&tail));
     let bytes = if exact {
         json!(text.as_bytes())
     } else {
@@ -578,7 +584,7 @@ mod tests {
 
     use super::super::{Server, chat_plan, completion_plan, relock, testserve};
     use super::{Ask, MAX_TOP, RowError};
-    use crate::engine::{Engine, EngineError, SlotRow, Tokenizer};
+    use crate::engine::{Decoder, Engine, EngineError, SlotRow, Tokenizer};
     use crate::mock::{DraftMock, MockCall, MockEngine, MockTokenizer, ScriptedEngine};
     use crate::sched::SlotConfig;
 
@@ -1399,5 +1405,95 @@ mod tests {
             let quiet = json!({"prompt": "abcabc", "n_predict": 2});
             assert_eq!(post(addr, "/completion", &quiet).0, 200);
         }
+    }
+
+    /// A llama-bpe vocabulary of whole-word ids, decoded through the cleaner the llama-bpe
+    /// row cleans with: `piece`'s label is the alternative's whole piece.
+    const WORDS: [&str; 4] = ["<|end_of_text|>", "a", "hello", "word "];
+
+    struct WordTok;
+
+    impl Tokenizer for WordTok {
+        fn encode(&self, text: &str) -> Vec<u32> {
+            let at = WORDS
+                .iter()
+                .position(|w| *w == text)
+                .expect("a word of the table");
+            vec![u32::try_from(at).expect("four words")]
+        }
+
+        fn guard<'a>(&self, text: &'a str, _mark: &str) -> std::borrow::Cow<'a, str> {
+            std::borrow::Cow::Borrowed(text)
+        }
+
+        fn encode_marked(&self, text: &str, _mark: &str) -> Vec<u32> {
+            self.encode(text)
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter()
+                .map(|&i| WORDS[usize::try_from(i).unwrap()])
+                .collect()
+        }
+
+        fn decoder(&self) -> Box<dyn Decoder> {
+            Box::new(WordDecoder {
+                cleaner: tokenizer::SpaceCleaner::default(),
+            })
+        }
+
+        fn bos(&self) -> Option<u32> {
+            None
+        }
+
+        fn eos(&self) -> u32 {
+            0
+        }
+
+        fn add_bos(&self) -> bool {
+            false
+        }
+
+        fn n_vocab(&self) -> usize {
+            WORDS.len()
+        }
+    }
+
+    struct WordDecoder {
+        cleaner: tokenizer::SpaceCleaner,
+    }
+
+    impl Decoder for WordDecoder {
+        fn push(&mut self, id: u32) -> Option<String> {
+            let cleaned = self.cleaner.push(WORDS[usize::try_from(id).unwrap()]);
+            (!cleaned.is_empty()).then_some(cleaned)
+        }
+
+        fn flush(&mut self) -> String {
+            let mut rest = self.cleaner.push("");
+            rest.push_str(&self.cleaner.finish());
+            rest
+        }
+    }
+
+    /// An alternative's label is its whole piece — the text the cleaner held for the text
+    /// that follows included — and its `bytes` are the label's unless a replacement
+    /// character came in.
+    ///
+    /// FAIL-first: a `piece` that drops the cleaner's tail labels "a" as "" and "hello" as
+    /// "he", and gives every held tail null bytes.
+    #[test]
+    fn an_alternative_keeps_its_whole_piece_as_its_label() {
+        assert_eq!(super::piece(&WordTok, 1), ("a".to_string(), json!([97])));
+        assert_eq!(
+            super::piece(&WordTok, 2),
+            ("hello".to_string(), json!([104, 101, 108, 108, 111]))
+        );
+        // The cleaner holds the trailing space of "word " for the text that follows; the
+        // label keeps it and the bytes stand.
+        assert_eq!(
+            super::piece(&WordTok, 3),
+            ("word ".to_string(), json!([119, 111, 114, 100, 32]))
+        );
     }
 }

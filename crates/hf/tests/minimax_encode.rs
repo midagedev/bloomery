@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 /// A marked vocabulary of two tokens under each row's name opens: a row the tokenizer cannot run
 /// as `tokenizers` does is refused by name, so a row added to `PRE` without its reading ends here.
+/// The table writes `add_bos_token` false as the folder reader does for a tokenizer with no BOS
+/// template; the `llama-bpe` row's loader default is true and would demand a BOS id.
 #[test]
 fn every_pre_row_has_a_hugging_face_reading() {
     for (name, _, _) in hf::vocab::PRE {
@@ -28,6 +30,7 @@ fn every_pre_row_has_a_hugging_face_reading() {
                 "tokenizer.bloomery.eog_token_ids".into(),
                 Value::Array(vec![Value::U32(0)]),
             ),
+            ("tokenizer.ggml.add_bos_token".into(), Value::Bool(false)),
         ];
         let tok = tokenizer::Tokenizer::from_keys(&keys).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(tok.pre(), name);
