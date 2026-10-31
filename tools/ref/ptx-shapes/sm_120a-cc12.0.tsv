@@ -200,6 +200,9 @@ generate_ds41 gemm_q8_0p_slab 0 0
 generate_ds41 gemm_route 0 0
 generate_ds41 gemm_route_remap 0 0
 generate_ds41 gemm_swiglu_quant 0 0
+# PIN(2026-10-31): the V4.1 prompt batch's card-slots SwiGLU (gemm_swiglu_quant_sel) at the cc 8.6 scan's values
+# (tools/ref/ptx-shapes.tsv), not measured on cc 12.0, until a 5090 scan runs.
+generate_ds41 gemm_swiglu_quant_sel 0 0
 generate_ds41 glm5next_router 0 0
 generate_ds41 glm5next_router_pick 0 0
 generate_ds41 gqa_flash_merge 0 0
