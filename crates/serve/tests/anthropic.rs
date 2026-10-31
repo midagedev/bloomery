@@ -619,7 +619,7 @@ fn hw_anthropic_thinking_with_reasoning_model() {
 }
 
 /// Ports `test_anthropic_thinking`: `thinking` `enabled` with `budget_tokens` N caps the span as the
-/// OpenAI path's `reasoning_budget` N does (the same thinking and text, here `abcd` and `fghijkl`);
+/// OpenAI path's `reasoning_budget` N does (the same thinking and text, here `abcd` and `efghijkl`);
 /// `disabled`, `adaptive` and no `thinking` leave it unrestricted (the never-closing script all
 /// thinking). `thinking` does not turn the template's thinking on: without the template's own
 /// switch the prompt has closed the span, the budget is ignored and the whole script is text.
@@ -648,7 +648,7 @@ fn hw_anthropic_thinking() {
         capped,
         json!([
             {"type": "thinking", "thinking": "abcd", "signature": ""},
-            {"type": "text", "text": "fghijkl"},
+            {"type": "text", "text": "efghijkl"},
         ])
     );
     let o = post(
@@ -707,7 +707,8 @@ fn hw_anthropic_tool_use_basic() {
         "tools": [
             {"name": "get_weather", "description": "Get the weather",
              "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}}},
-            {"name": "get_time", "input_schema": {"type": "object"}},
+            {"name": "get_time",
+             "input_schema": {"type": "object", "properties": {"zone": {"type": "integer"}}}},
         ],
         "messages": [{"role": "user", "content": "Weather and time in Paris?"}],
     });
@@ -802,9 +803,10 @@ fn hw_anthropic_forced_tool_use() {
     let addr = start_with(Box::new(ScriptedEngine::new(4096, "")));
     let tools = json!([
         {"name": "get_weather", "input_schema": {"type": "object", "properties": {
-            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}}},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+            "required": ["unit"]}},
         {"name": "set_flag", "input_schema": {"type": "object", "properties": {
-            "on": {"type": "boolean"}}}},
+            "on": {"type": "boolean"}}, "required": ["on"]}},
     ]);
     for (choice, name, input) in [
         (

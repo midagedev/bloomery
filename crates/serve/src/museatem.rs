@@ -43,7 +43,9 @@
 //! the complete parameters read so far.
 
 use crate::callstream::Args;
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
+use crate::constrain::{
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, is_text, object_parameters, value,
+};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
@@ -348,29 +350,39 @@ fn json_value(raw: &str) -> String {
 
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`MuseScan`] — ` to=NAME<|message|>`, then the ATEM block with
-/// the template's own framing (a text value raw, any other as JSON).
-pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    call(funs, TO, str::to_owned, |f| {
+/// the template's own framing (a text value raw, any other as JSON), its
+/// parameters as the object rule writes them: the required ones, in the
+/// schema's order, then the optional ones, each of which may be left out.
+/// The call has no opener to watch for (the recipient slot names the
+/// answer's channels as well as a tool), so a watched one builds nothing.
+pub(crate) fn call_parts(funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refusal> {
+    if mode == CallMode::Watched {
+        return Ok(Call::unopened(Vec::new()));
+    }
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        let mut parts = vec![Part::Text(format!("{PARAM_OPEN}{key}\">", key = a.key))];
+        parts.extend(value(
+            &a.schema,
+            if is_text(&a.schema) {
+                Style::Raw
+            } else {
+                Style::JsonInMarkup
+            },
+            &a.path,
+        )?);
+        parts.push(Part::Text(format!("{PARAM_CLOSE}\n")));
+        Ok(parts)
+    };
+    let parts = call(funs, TO, str::to_owned, |f| {
         let mut parts = vec![Part::Text(format!(
             "{MESSAGE}{CALLS_OPEN}\n{INVOKE_OPEN}{name}\">\n",
             name = f.name
         ))];
-        for a in &f.args {
-            parts.push(Part::Text(format!("{PARAM_OPEN}{key}\">", key = a.key)));
-            parts.extend(value(
-                &a.schema,
-                if is_text(&a.schema) {
-                    Style::Raw
-                } else {
-                    Style::JsonInMarkup
-                },
-                &a.path,
-            )?);
-            parts.push(Part::Text(format!("{PARAM_CLOSE}\n")));
-        }
+        parts.extend(object_parameters(&f.args, &block)?);
         parts.push(Part::Text(format!("{INVOKE_CLOSE}\n{CALLS_CLOSE}")));
         Ok(parts)
-    })
+    })?;
+    Ok(Call::unopened(parts))
 }
 
 #[cfg(test)]

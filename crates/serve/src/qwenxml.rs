@@ -60,7 +60,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::callstream::{self, Reading, held, read_value};
-use crate::constrain::{Fun, Part, Refusal, Style, call, value};
+use crate::constrain::{
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, object_parameters, value,
+};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
 use crate::reasoning::{Marked, SpecialTags, partial_suffix};
@@ -907,30 +909,35 @@ impl CallRead {
 
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`QwenScan`]. `<function=NAME>` with a `<parameter=KEY>` block
-/// per parameter in the schema's order, each value written as the schema reads
-/// it (raw text for a string, JSON for the rest) and framed as `framing` says;
-/// the whitespace between the tags is a newline in both framings.
-pub(crate) fn call_parts(framing: Framing, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    call(
-        funs,
-        &format!("{CALL_OPEN}\n{FUNCTION_OPEN}"),
-        str::to_owned,
-        |f| {
-            let mut parts = vec![Part::Text(">\n".to_owned())];
-            for a in &f.args {
-                parts.push(Part::Text(format!(
-                    "{PARAM_OPEN}{}>{}",
-                    a.key,
-                    framing.value_open()
-                )));
-                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(match framing {
-                    Framing::Lines | Framing::Coder => PARAM_VALUE_CLOSE.to_owned(),
-                    Framing::Compact => format!("{PARAM_CLOSE}\n"),
-                }));
-            }
-            parts.push(Part::Text(format!("{FUNCTION_CLOSE}\n{CALL_CLOSE}")));
-            Ok(parts)
-        },
-    )
+/// per parameter as the object rule writes them — the required ones, in the
+/// schema's order, then the optional ones, each of which may be left out —
+/// each value written as the schema reads it (raw text for a string, JSON
+/// for the rest) and framed as `framing` says ([`Framing::Lines`] a line
+/// each, [`Framing::Compact`] none between the tags, as the compact
+/// template writes them). The opener is `<tool_call>`.
+pub(crate) fn call_parts(
+    framing: Framing,
+    funs: &[Fun<'_>],
+    mode: CallMode,
+) -> Result<Call, Refusal> {
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        let mut parts = vec![Part::Text(format!(
+            "{PARAM_OPEN}{}>{}",
+            a.key,
+            framing.value_open()
+        ))];
+        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        parts.push(Part::Text(match framing {
+            Framing::Lines | Framing::Coder => PARAM_VALUE_CLOSE.to_owned(),
+            Framing::Compact => PARAM_CLOSE.to_owned(),
+        }));
+        Ok(parts)
+    };
+    let body = call(funs, &format!("\n{FUNCTION_OPEN}"), str::to_owned, |f| {
+        let mut parts = vec![Part::Text(">\n".to_owned())];
+        parts.extend(object_parameters(&f.args, &block)?);
+        parts.push(Part::Text(format!("{FUNCTION_CLOSE}\n{CALL_CLOSE}")));
+        Ok(parts)
+    })?;
+    Ok(Call::opened(CALL_OPEN, mode, body))
 }

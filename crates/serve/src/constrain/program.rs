@@ -2,7 +2,8 @@
 //!
 //! A program is text first ([`Part`]): forced text, a choice among option
 //! texts, a free string, a JSON number, a fork among part lists, a JSON array
-//! or object of repeated items, and a rule of the program's grammar.
+//! or object of repeated items, a run of parts held once and repeated, and a
+//! rule of the program's grammar.
 //! [`compile`] turns it into ids ([`Program`]) with the serve [`Tokenizer`],
 //! each forced text and each option canonically on its own (a string's opening
 //! quote belongs to the text before it, its closing quote to the text after).
@@ -39,6 +40,14 @@
 //! id ([`sampling::argmax_in`]): the engine's argmax rule over the allowed set.
 //! The walk reads no row at an id every head fixes alike: a forced id, or the
 //! only child of a choice's node ([`Walk::fixed_next`]).
+//!
+//! A watched program ([`Opener`], a `tool_choice: auto` request) stands in
+//! free text before and between its runs: every id allowed, the pick plain
+//! greedy or the request's sampler over the whole row, and the ids taken
+//! watched for the chat format's call opener — the one special token the
+//! vocabulary holds for it, or its characters ending a piece of ordinary
+//! ones. Where the model writes it, the program a forced call compiles runs
+//! to the call's close and the walk returns to free text.
 
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
@@ -105,6 +114,10 @@ pub(crate) enum Part {
     /// After an item of a grammar's array or object: `close`, or `more` (the
     /// next item) and back to this part.
     Rep { close: Vec<Part>, more: Vec<Part> },
+    /// A run of parts the program holds once and stands wherever it is
+    /// repeated: the object rule's alternatives repeat a property's parts,
+    /// and a schema's build costs its size, not its alternatives' product.
+    Run(std::sync::Arc<[Part]>),
 }
 
 /// One option of a [`Part::Pick`].
@@ -243,7 +256,7 @@ impl<'a> Env<'a> {
     /// The ids of `text`, its bytes charged to the compile's budget.
     fn encode(&self, text: &str) -> Result<Vec<u32>, Refusal> {
         let Some(left) = self.bytes_left.get().checked_sub(text.len()) else {
-            return Err(refuse(format!(
+            return Err(outside(format!(
                 "the schema's fixed text is too long: its program tokenises more than \
                  {COMPILE_BYTES} bytes (an anyOf repeats the text on each side of it in every \
                  option)"
@@ -258,11 +271,17 @@ fn refuse(message: String) -> Refusal {
     Refusal::invalid(message)
 }
 
+/// The refusal of a schema that is valid but that this vocabulary or the
+/// compile's budget cannot write ([`Refusal::outside_subset`]).
+fn outside(message: String) -> Refusal {
+    Refusal::outside_subset(message)
+}
+
 /// Refuses `ids`, the tokens of `text`, when one is a stop id: the generation
 /// would end there with the program unspent.
 fn no_stop(ids: &[u32], text: &str, env: &Env<'_>) -> Result<(), Refusal> {
     match ids.iter().find(|id| env.vocab.stops().contains(id)) {
-        Some(id) => Err(refuse(format!(
+        Some(id) => Err(outside(format!(
             "the text {text:?} tokenises to the stop id {id}: a stop id cannot occur before the \
              program is spent"
         ))),
@@ -333,6 +352,10 @@ fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result<Program, R
                     close: Arc::new(compile_in(close, env, true)?),
                     more: Arc::new(compile_in(more, env, true)?),
                 });
+                reach = true;
+            }
+            Part::Run(parts) => {
+                steps.push(Step::Sub(Arc::new(compile_in(parts, env, reach)?)));
                 reach = true;
             }
             Part::Any(_) | Part::List { .. } => {
@@ -461,14 +484,14 @@ fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
     for (k, alt) in alts.iter().enumerate() {
         let ids = env.encode(&alt.text)?;
         if ids.is_empty() {
-            return Err(refuse(format!(
+            return Err(outside(format!(
                 "the option {:?} tokenises to no token",
                 alt.text
             )));
         }
         no_stop(&ids, &alt.text, env)?;
         let clash = |other: usize| {
-            refuse(format!(
+            outside(format!(
                 "the options {:?} and {:?} tokenise so that one is a prefix of the other \
                  (ids {:?} and {:?}): the choice between them would be ambiguous",
                 alts[other].text, alt.text, seqs[other], ids
@@ -543,7 +566,7 @@ fn free_step(
             };
             let first = tail.as_bytes()[0];
             if !first.is_ascii() {
-                return Err(refuse(format!(
+                return Err(outside(format!(
                     "a raw value ends at {tail:?}, whose first character is not ASCII"
                 )));
             }
@@ -553,7 +576,7 @@ fn free_step(
     if let Some(tail) = tail
         && !env.vocab.prefixes_of(tail)
     {
-        return Err(refuse(format!(
+        return Err(outside(format!(
             "no token of the vocabulary is a prefix of {tail:?}, so a free string before it \
              could never end"
         )));
@@ -646,6 +669,19 @@ impl Watch {
     }
 }
 
+/// The text that opens a call in a chat format's markup, and the program a
+/// walk follows from it: what a `tool_choice: auto` request's free text is
+/// watched for. `special` is the one id that writes `text` when the
+/// vocabulary holds it as a special token: the opener is then markup only
+/// where that id wrote it, as the format's own scan reads it, and ordinary
+/// ids spelling the same characters stay free text. Without one, the opener
+/// is watched for on the text of the ids taken, ending a piece of them.
+pub(crate) struct Opener {
+    pub text: &'static str,
+    pub special: Option<u32>,
+    pub prog: Arc<Program>,
+}
+
 /// A request's constraint, built once and shared by the walks that follow it.
 #[derive(Clone)]
 pub(crate) struct Constraint {
@@ -656,9 +692,13 @@ pub(crate) struct Constraint {
     /// leaves one open and the program does not follow the reasoning.
     close: Arc<[u32]>,
     /// The program starts where the model closes an open think span itself
-    /// (a forced tool call), not at once with the span force-closed (a JSON
-    /// document).
+    /// (a forced tool call, a watched one), not at once with the span
+    /// force-closed (a JSON document).
     follows_reasoning: bool,
+    /// The call opener whose writing starts the program where the model
+    /// chooses to open one (`tool_choice: auto`): `None` on a program that
+    /// starts at once.
+    waiting_for_call: Option<Arc<Opener>>,
     vocab: Arc<Vocab>,
     /// Where its walks write their decisions, `None` for a request that reads
     /// none.
@@ -685,6 +725,25 @@ impl Constraint {
             rules: rules.into(),
             close: close.into(),
             follows_reasoning: false,
+            waiting_for_call: None,
+            vocab,
+            watch: None,
+        }
+    }
+
+    /// A constraint that waits for the model to open a call itself
+    /// (`tool_choice: auto`): free text until the format's opener, the
+    /// program `opener` holds from there to the call's close, free text
+    /// again past it, each further opener starting the program again. The
+    /// model's own close of an open think span comes first, as a forced
+    /// call's does.
+    pub(crate) fn waiting_for(opener: Opener, close: Vec<u32>, vocab: Arc<Vocab>) -> Constraint {
+        Constraint {
+            prog: Arc::clone(&opener.prog),
+            rules: Vec::new().into(),
+            close: close.into(),
+            follows_reasoning: true,
+            waiting_for_call: Some(Arc::new(opener)),
             vocab,
             watch: None,
         }
@@ -698,10 +757,26 @@ impl Constraint {
     }
 
     /// Whether a prompt that left the think span open lets the model reason
-    /// to its own close before the program starts: a forced tool call does,
-    /// a JSON document closes the span first ([`Walk::new`]).
+    /// to its own close before the program starts: a forced tool call and a
+    /// watched one do, a JSON document closes the span first
+    /// ([`Walk::new`]).
     pub(crate) fn follows_reasoning(&self) -> bool {
         self.follows_reasoning
+    }
+
+    /// Whether the model's own call opener starts this constraint's program
+    /// (a `tool_choice: auto` request).
+    pub(crate) fn waits_for_call(&self) -> bool {
+        self.waiting_for_call.is_some()
+    }
+
+    /// Whether the reply is this program's alone from the think span's own
+    /// close, so a call opener inside the span is reasoning
+    /// ([`crate::dsml::ChatParser::following_reasoning`]): a forced call
+    /// holds the span open until then; a watched one leaves the parser's own
+    /// end rule in place, which a call opener may end (Qwen3-Coder's).
+    pub(crate) fn forced(&self) -> bool {
+        self.follows_reasoning && self.waiting_for_call.is_none()
     }
 
     /// This constraint with its walks writing their decisions to `watch`.
@@ -942,13 +1017,20 @@ pub(crate) fn aheads() -> usize {
 #[derive(Clone)]
 pub(crate) struct Walk {
     /// Every place the ids taken so far lead to: one, but where a fork's
-    /// options have begun alike.
+    /// options have begun alike. Empty while the walk waits in free text for
+    /// its call opener.
     heads: Vec<Head>,
     rules: Arc<[Arc<Program>]>,
     vocab: Arc<Vocab>,
     taken: usize,
     picks: Picks,
     watch: Option<Watch>,
+    /// The call opener this walk watches for in free text (`tool_choice:
+    /// auto`): `None` on a walk whose program starts without one.
+    waiting: Option<Arc<Opener>>,
+    /// The tail of the free text, as far as an opener could still complete
+    /// in it: at most the opener's length.
+    tail: Vec<u8>,
 }
 
 impl std::fmt::Debug for Walk {
@@ -962,27 +1044,46 @@ impl std::fmt::Debug for Walk {
 
 impl Walk {
     /// A walk at the start of `c`'s program; `close_think` forces the think
-    /// span's close first (a prompt that left the span open).
+    /// span's close first (a prompt that left the span open). A walk that
+    /// waits for a call starts in free text instead: its constraint follows
+    /// the reasoning, so no span is ever force-closed before it.
     pub(crate) fn new(c: &Constraint, close_think: bool) -> Walk {
         if let Some(w) = &c.watch {
             relock(&w.0).clear();
         }
+        let waiting = c.waiting_for_call.clone();
+        assert!(
+            waiting.is_none() || !close_think,
+            "a watched call waits for the model's own think close, not a forced one"
+        );
         Walk {
-            heads: vec![Head {
-                frames: vec![Frame::of(&c.prog)],
-                ctx: Ctx::Idle,
-                forced: if close_think {
-                    c.close.iter().rev().copied().collect()
-                } else {
-                    Vec::new()
-                },
-            }],
+            heads: match &waiting {
+                Some(_) => Vec::new(),
+                None => vec![Head {
+                    frames: vec![Frame::of(&c.prog)],
+                    ctx: Ctx::Idle,
+                    forced: if close_think {
+                        c.close.iter().rev().copied().collect()
+                    } else {
+                        Vec::new()
+                    },
+                }],
+            },
             rules: Arc::clone(&c.rules),
             vocab: Arc::clone(&c.vocab),
             taken: 0,
             picks: Picks::default(),
             watch: c.watch.clone(),
+            waiting,
+            tail: Vec::new(),
         }
+    }
+
+    /// Whether the walk stands in free text watched for its call opener
+    /// (`tool_choice: auto`, before the first call and between calls): every
+    /// id allowed, none forced.
+    pub(crate) fn waiting(&self) -> bool {
+        self.waiting.is_some() && self.heads.is_empty()
     }
 
     /// The ids picked from a row so far, by kind.
@@ -1004,6 +1105,7 @@ impl Walk {
     /// Moves every head to its next decision or forced id.
     /// A whole number the program ends with may also end the answer: a
     /// spent head joins it, so the stop is allowed beside its next digit.
+    /// A watched walk whose call closed returns to free text.
     fn settle(&mut self) {
         if !self.heads.iter().all(Head::settled) {
             let mut out = Vec::with_capacity(self.heads.len());
@@ -1024,6 +1126,11 @@ impl Walk {
                 ctx: Ctx::Done,
                 forced: Vec::new(),
             });
+        }
+        if self.waiting.is_some() && !self.heads.is_empty() && self.heads.iter().all(Head::done) {
+            // The call closed: free text again, watched for the next opener.
+            self.heads.clear();
+            self.tail.clear();
         }
     }
 
@@ -1414,8 +1521,11 @@ impl Walk {
     /// The next id: the fixed one, or `draw`'s pick from `row` among the ids
     /// the program allows here; the walk then stands past it. A stop id
     /// before the program is spent, or a drawn id the program does not allow,
-    /// is an error.
+    /// is an error. A waiting walk takes any id ([`Walk::draw_free`]).
     pub(crate) fn choose_by(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
+        if self.waiting() {
+            return self.draw_free(row, draw);
+        }
         self.settle();
         let id = match self.fixed_id() {
             Some(id) => id,
@@ -1445,6 +1555,101 @@ impl Walk {
         StepError::NoAllowed {
             taken: self.taken,
             why: why.to_owned(),
+        }
+    }
+
+    /// The pick of a waiting walk: any id of `row` — free text, a stop id
+    /// among them ends the answer as an unconstrained one's does. Where the
+    /// vocabulary holds the opener as one special token, its id opens the
+    /// program here; otherwise [`Walk::saw`] reads the text.
+    fn draw_free(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
+        let n = u32::try_from(row.len()).expect("a row of ids fits u32");
+        let id = draw
+            .pick(row, 0..n)
+            .ok_or_else(|| self.stuck("the row holds no id the free text may take"))?;
+        self.taken += 1;
+        if self
+            .waiting
+            .as_ref()
+            .expect("a waiting walk watches an opener")
+            .special
+            == Some(id)
+        {
+            let o = Arc::clone(
+                self.waiting
+                    .as_ref()
+                    .expect("a waiting walk watches an opener"),
+            );
+            self.open(&o);
+        }
+        Ok(id)
+    }
+
+    /// The text the id just taken decoded to, as the generation loop's
+    /// decoder released it, fed before the next pick: a waiting walk whose
+    /// opener no special token owns is watched for on it, ending a piece of
+    /// ordinary tokens. One id's own decode can be half a character, so the
+    /// stream's text is what an opener is read from, as the chat format's
+    /// own scan reads it.
+    pub(crate) fn saw(&mut self, text: &str) {
+        if !self.waiting() {
+            return;
+        }
+        let o = Arc::clone(
+            self.waiting
+                .as_ref()
+                .expect("a waiting walk watches an opener"),
+        );
+        if o.special.is_none() && self.wrote(text, &o) {
+            self.open(&o);
+        }
+    }
+
+    /// Whether `text`, just taken in free text, completes the opener `o`:
+    /// the free text ends with it. The tail keeps only what a later piece
+    /// could still finish an opener with.
+    fn wrote(&mut self, text: &str, o: &Opener) -> bool {
+        self.tail.extend_from_slice(text.as_bytes());
+        let hit = self.tail.ends_with(o.text.as_bytes());
+        if self.tail.len() > o.text.len() {
+            let drop = self.tail.len() - o.text.len();
+            self.tail.drain(..drop);
+        }
+        hit
+    }
+
+    /// The call's program, started at its opener's end.
+    fn open(&mut self, o: &Opener) {
+        self.heads = vec![Head {
+            frames: vec![Frame::of(&o.prog)],
+            ctx: Ctx::Idle,
+            forced: Vec::new(),
+        }];
+        self.tail.clear();
+    }
+
+    /// The content a held walk's think tracker released in the piece that
+    /// ended its wait — the text past the span's end, the first content of a
+    /// reply whose span the model did not open, or the call opener that ends
+    /// the span where the parser's own rule says so (Qwen3-Coder's) — with the
+    /// special tokens' texts in it, as byte offsets and lengths: a waiting
+    /// walk reads it for its opener and starts the program at one it
+    /// completes. Where the vocabulary holds the opener as one special token,
+    /// only that token ending the content is an opener — text spelling it is
+    /// content — and a piece that ran past the opener opens nothing, the
+    /// bytes after it already written. Any other walk reads none of it.
+    pub(crate) fn fed(&mut self, text: &str, specials: &[(usize, usize)]) {
+        let Some(o) = self.waiting.clone().filter(|_| self.heads.is_empty()) else {
+            return;
+        };
+        let opens = match o.special {
+            Some(_) => specials.last().is_some_and(|&(at, len)| {
+                at + len == text.len() && len == o.text.len() && text.get(at..) == Some(o.text)
+            }),
+            None => self.wrote(text, &o),
+        };
+        if opens {
+            self.open(&o);
         }
     }
 
@@ -1537,8 +1742,8 @@ mod tests {
             let key = letter.repeat(4096);
             let schema = json!({"type": "object", "properties": {
                 "first": {"type": "string"},
-                (key): {"type": "null"}
-            }});
+                (key.clone()): {"type": "null"}
+            }, "required": ["first", key]});
             let parts = super::super::schema::value(&schema, Style::Json, "schema").unwrap();
             let prog = compile(&parts, &env).unwrap();
             let Step::Forced(tail) = prog.steps.last().unwrap() else {

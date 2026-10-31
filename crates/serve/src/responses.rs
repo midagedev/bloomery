@@ -1701,6 +1701,27 @@ mod tests {
         testserve::spawn(engine, config).0
     }
 
+    /// [`serve`] with the jump arm off: a scripted engine's rows follow its
+    /// script only while every id is stepped, and a watched call's program
+    /// fixes ids the jump arm would feed as one call.
+    fn stepped(text: &str) -> SocketAddr {
+        let mut config = testserve::mock_config();
+        config.chat_template = TEMPLATE.to_owned();
+        let server = crate::Server::bind_with(
+            "127.0.0.1:0",
+            Box::new(ScriptedEngine::new(4096, text)),
+            config,
+            crate::SlotConfig {
+                schema_jump: false,
+                ..crate::SlotConfig::default()
+            },
+        )
+        .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let _ = server.start().expect("start");
+        addr
+    }
+
     /// A server whose every generation is `text`, then the end of generation.
     fn scripted(text: &str) -> SocketAddr {
         serve(Box::new(ScriptedEngine::new(4096, text)))
@@ -2076,7 +2097,7 @@ mod tests {
     /// `tool` message for it.
     #[test]
     fn function_call_round_trip_renders_as_llama_server_converts() {
-        let addr = scripted(CALL);
+        let addr = stepped(CALL);
         let parameters = json!({"type": "object", "properties": {"location": {"type": "string"}}});
         let tools = json!([{
             "type": "function", "name": "get_weather", "description": "the weather",
@@ -2149,7 +2170,7 @@ mod tests {
     /// `namespace` field read past.
     #[test]
     fn a_namespace_tool_flattens_and_its_calls_answer_with_the_namespace() {
-        let addr = scripted(
+        let addr = stepped(
             "<tool_call>\n{\"name\": \"spawn_agent\", \"arguments\": {\"message\": \"hi\"}}\n</tool_call>",
         );
         let namespace = json!({
@@ -2277,10 +2298,12 @@ mod tests {
     /// whole answer's to the same request but for the response's own hex.
     #[test]
     fn stream_items_close_in_order_and_match_the_whole_answer() {
-        let addr = scripted(&format!("<think>plan</think>answer{CALL}"));
+        let addr = stepped(&format!("<think>plan</think>answer{CALL}"));
         let body = json!({
             "input": "hi",
-            "tools": [{"type": "function", "name": "get_weather"}],
+            "tools": [{"type": "function", "name": "get_weather",
+                "parameters": {"type": "object", "properties": {
+                    "location": {"type": "string"}}}}],
         });
         let mut streamed = body.clone();
         streamed["stream"] = json!(true);
@@ -2545,13 +2568,15 @@ mod tests {
     /// drops it; an id the store does not hold is a 404 on each.
     #[test]
     fn a_stored_response_is_read_continued_and_deleted() {
-        let addr = scripted(CALL);
+        let addr = stepped(CALL);
         let first = answered(
             addr,
             "/v1/responses",
             &json!({
                 "instructions": "Be brief", "input": "Weather in Seoul?", "max_output_tokens": 256,
-                "tools": [{"type": "function", "name": "get_weather"}],
+                "tools": [{"type": "function", "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {
+                        "location": {"type": "string"}}}}],
             }),
         );
         let id = first["id"].as_str().expect("an id");
@@ -3053,82 +3078,56 @@ mod tests {
         );
     }
 
-    /// Tool-call markup that does not parse inside a streamed answer ends it
-    /// with `response.failed` (the codex case: a client that reads only
-    /// `event:` frames sees the refusal, not a dropped stream), the response
-    /// carrying the chat path's own refusal text. The markup is refused as it
-    /// is read (after text already sent) and at the end of the generation (a
-    /// call left open).
+    /// Tool-call markup a scripted model writes wrong inside a streamed
+    /// answer — arguments that are not an object, a call the script leaves
+    /// open — is held to the tool's schema once the call opens
+    /// (`tool_choice: auto`): the answer completes with the call the program
+    /// writes, where the markup's refusal used to end the response (the
+    /// codex case). A stop string the script is a prefix of no longer holds
+    /// the answer: the generation the watch writes is not the script.
     #[test]
-    fn a_streamed_markup_refusal_fails_the_response() {
+    fn a_streamed_call_the_watch_holds_completes() {
         const BAD: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"not an object\"}\n</tool_call>";
         const OPEN: &str = "<tool_call>\n{\"name\": \"get_weather\"";
-        let sent = [
-            "response.created",
-            "response.in_progress",
-            "response.output_item.added",
-            "response.content_part.added",
-            "response.output_text.delta",
-            "response.failed",
-        ];
-        let cases = [format!("Hello{BAD}"), format!("Hello{OPEN}")];
-        let tool = json!({"type": "function", "function": {"name": "get_weather"}});
-        for script in cases {
-            let addr = scripted(&script);
-            let body = json!({
+        for script in [format!("Hello{BAD}"), format!("Hello{OPEN}")] {
+            let addr = stepped(&script);
+            let mut body = json!({
                 "input": "hi",
                 "stream": true,
                 "tools": [{"type": "function", "name": "get_weather"}],
             });
             let (status, stream) = post_stream(addr, "/v1/responses", &body);
+            assert_eq!(status, 200, "{script:?}: {stream}");
             let f = frames(status, &stream);
-            assert_eq!(kinds(&f), sent, "{script:?}: {stream}");
+            let end = f.last().expect("a last frame");
+            assert_eq!(
+                end["response"]["status"], "completed",
+                "{script:?}: {stream}"
+            );
             let text: String = of(&f, "response.output_text.delta")
                 .iter()
                 .map(|d| d["delta"].as_str().expect("a delta"))
                 .collect();
-            assert_eq!(text, "Hello", "{script:?}");
-            let failed = f.last().expect("a last frame");
-            assert_eq!(failed["response"]["id"], f[0]["response"]["id"], "{failed}");
-            assert_eq!(failed["response"]["status"], "failed", "{failed}");
-            let e = &failed["response"]["error"];
-            assert_eq!(e["code"], "server_error", "{failed}");
-            let message = e["message"].as_str().expect("a message");
-            assert!(message.starts_with("tool-call markup: "), "{failed}");
+            assert!(text.starts_with("Hello"), "{script:?}: {text}");
+            let calls: Vec<&Value> = end["response"]["output"]
+                .as_array()
+                .expect("output")
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .collect();
+            assert_eq!(calls.len(), 1, "{script:?}: {stream}");
+            assert_eq!(calls[0]["name"], "get_weather", "{script:?}");
+            assert_eq!(calls[0]["arguments"], "{}", "{script:?}");
 
-            // The chat path's refusal of the same generation is the same text.
-            let chat = json!({
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true,
-                "tools": [tool],
-            });
-            let (status, stream) = post_stream(addr, "/v1/chat/completions", &chat);
-            assert_eq!(status, 200, "{stream}");
-            let last = stream.trim_end().rsplit("\n\n").next().expect("a frame");
-            let error: Value = serde_json::from_str(last.strip_prefix("data: ").expect("data"))
-                .expect("the chat path's error frame is JSON");
-            assert_eq!(error["error"]["message"], message, "{script:?}: {error}");
+            body["stop"] = json!(format!("{BAD}x"));
+            let (status, stream) = post_stream(addr, "/v1/responses", &body);
+            assert_eq!(status, 200, "{script:?}: {stream}");
+            let f = frames(status, &stream);
+            assert_eq!(
+                f.last().expect("a last frame")["response"]["status"],
+                "completed",
+                "{script:?}: {stream}"
+            );
         }
-
-        // A stop string the whole generation is a prefix of holds every token until the end, so the refused
-        // call is the first text the stream would send: the opening pair still comes before `response.failed`.
-        let addr = scripted(BAD);
-        let body = json!({
-            "input": "hi",
-            "stream": true,
-            "stop": format!("{BAD}x"),
-            "tools": [{"type": "function", "name": "get_weather"}],
-        });
-        let (status, stream) = post_stream(addr, "/v1/responses", &body);
-        let f = frames(status, &stream);
-        assert_eq!(
-            kinds(&f),
-            [
-                "response.created",
-                "response.in_progress",
-                "response.failed"
-            ],
-            "{stream}"
-        );
     }
 }
