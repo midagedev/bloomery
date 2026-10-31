@@ -710,7 +710,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// The geometry checks run before anything is uploaded: a cache of 0
     /// rows, a range outside the file, a file of several shards (a model of
     /// several shards loads by its placement plan, [`GpuModel::load_placed`]).
-    pub(crate) fn load_blocks(
+    /// Public because an architecture crate's whole-card body opens through
+    /// it, as the in-crate ones do.
+    pub fn load_blocks(
         gpu: Gpu,
         file: &Split,
         ctx_max: usize,
