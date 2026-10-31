@@ -151,6 +151,7 @@ use crate::checkpoint::{self, Checkpoints};
 use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkMode};
 use crate::folder::{Folder, Model};
 use crate::head::{Head, HeadLaunches, HeadNorm};
+use crate::host::costs::ExpertShape;
 use crate::host::nvtier::NvTier;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
@@ -1203,86 +1204,18 @@ pub struct DecodeInput38 {
     pos: u32,
 }
 
-/// The stream rule's costs of one Qwen3.8 expert — the architecture fact the
-/// expert stream reads beside the lane's priced rate: the host union's
-/// tile-path cost a column for an expert of the file's common layer kind and
-/// its weight-listing floor, and the card route's fixed and per-column cost
-/// of one streamed expert. The union's costs are the constrained fit of the
-/// Q4 prompt-union records (the per-layer `stat prompt lb` walls against
-/// their slots and listed experts, the pickrule round's fit: the records
-/// identify the per-column slope alone, the floor comes from the
-/// weight-listing anchor, one expert's bytes at the host's read bandwidth);
-/// the card route's are the q38seed card's decomposition
-/// (`docs/cards/q38seed-ab.card`), which the same records' shadow tail
-/// corroborates at the card's expert count. One row for every file of the
-/// family: the IQ file's union takes no tile path in this tree, so its own
-/// row waits on that path (the per-file override
-/// [`Body38::set_xstream_costs`]); no Q4-derived column cost is applied to
-/// it silently.
-pub const XSTREAM_COSTS: Costs = Costs {
-    host_us_per_col: 3.67,
-    host_us_fixed: 19.95,
-    card_us_fixed: 13.0,
-    card_us_per_col: 0.16,
+/// The Qwen3.8 routed expert the expert stream's card costs are priced from
+/// ([`crate::host::costs`]): its gate, up and down of the model's width by
+/// the expert's, the router's picks a column, and one unit's route reading a
+/// streamed expert's weights. The host union's costs are this host's,
+/// measured on the layer with the most host experts (ties: lowest layer), one calibration
+/// for the load ([`crate::host::HostTier::union_costs`]).
+const XSTREAM_SHAPE: ExpertShape = ExpertShape {
+    hidden: geo::HIDDEN,
+    ff: geo::FF,
+    top_k: geo::N_USED,
+    units: 1,
 };
-
-/// The card route's tail past a layer's last copy, in µs per card pick (a
-/// routed pick the card serves before the unit's pick: the unit's picks less
-/// the inherited host experts' columns) — the family cost the pick's walk
-/// balances against the union, for the Q4 kind. The tail is a level per unit
-/// width, not a constant, so the walk prices each unit with it
-/// ([`runtime::xsplit::unit_constants`]); the walk alone reads it, the ring's
-/// rule never does. The rate sits at or under the level the Q4 prompt-union
-/// records give at the largest prompts' unit.
-///
-/// Sensitivity [derived]: the walk's balance at 4096 columns has a knife edge
-/// in this rate. Its low end loses 6 % of the admits 2 % over the last flat
-/// value and half of them 4 % further; on the count wired here, before the
-/// pick, the edge sits 12 % above the row.
-pub const XSTREAM_TAIL_US_PER_CARD_COL: f64 = 0.125;
-
-/// The stream rule's costs for a file whose common routed kind no record has
-/// fitted — every kind but the Q4 one — until a record of that kind's host
-/// union exists (the per-file override [`Body38::set_xstream_costs`] takes a
-/// calibrated row then). The IQ kinds of the `UD-Q3_K_XL` file (IQ3_XXS, IQ4_XS) run a
-/// multi-column tile on the host union (`qdot::has_tile`), so this row's
-/// per-column cost does not describe their union; the record that closes it
-/// is a prompt-union record of that file at 512 and 4096 columns (the
-/// per-layer `stat prompt lb` walls against their slots and listed experts).
-/// No Q4-derived tail is wired beside it: a walk on this row balances
-/// without one.
-pub const XSTREAM_COSTS_UNFITTED: Costs = Costs {
-    host_us_per_col: 7.0,
-    host_us_fixed: 23.36,
-    card_us_fixed: 13.0,
-    card_us_per_col: 0.16,
-};
-
-/// The file's common routed kind: the gate·up type most of its layers carry —
-/// the kind whose host union the expert stream's costs row prices. Ties sit
-/// with the Q4 kind, the family's own.
-fn common_routed(stacks: &swap38::Qwen38Stacks) -> GgmlType {
-    let kinds = [
-        GgmlType::Q4_K,
-        GgmlType::Q5_K,
-        GgmlType::IQ3_XXS,
-        GgmlType::IQ4_XS,
-    ];
-    let count = |want: GgmlType| {
-        (0..)
-            .map_while(|l| stacks.pair(l))
-            .filter(|&(gate, _)| gate == want)
-            .count()
-    };
-    let mut best = (GgmlType::Q4_K, 0usize);
-    for ty in kinds {
-        let n = count(ty);
-        if n > best.1 {
-            best = (ty, n);
-        }
-    }
-    best.0
-}
 
 /// Everything Qwen3.8's chain owns. Field order is drop order: the host tier
 /// (its lock over the host set, its page windows) before the buffers.
@@ -1399,9 +1332,6 @@ pub struct Body38 {
     /// The NVMe expert tier's arena, when the plan paged routed experts
     /// ([`Body38::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
-    /// The file's common routed kind ([`common_routed`]): which expert
-    /// stream's costs row and card tail its walks take.
-    routed_gate: GgmlType,
     /// The recurrent stores on the host at chosen positions, and the PLE
     /// hash's history at each, ascending: the points a cut behind the fed
     /// positions restores. A prompt call takes them only while `marks` is on.
@@ -2069,6 +1999,10 @@ impl Body38 {
         // With a tier the batch port's tier legs are made here too, which the
         // plan reserves on the tier card and the host.
         hybrid.prepare_batch(gpu.context(), host_cols)?;
+        hybrid.defer_union_costs(
+            XSTREAM_SHAPE,
+            crate::host::swap_source::union_identity(plan.model, host.r8),
+        );
         if tiered {
             let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
             hybrid.check_tier_reserves(plan, &cards)?;
@@ -2162,7 +2096,6 @@ impl Body38 {
             mtp: None,
             residency_glue,
             nvme_tier,
-            routed_gate: common_routed(&stacks),
             ckpt,
             ple_points: Vec::new(),
             point_rows: Vec::new(),
@@ -2620,8 +2553,8 @@ impl Body38 {
     /// [`super::wide38`]'s module doc): off until set here, so one load can
     /// run every arm. `Split` starts the expert stream on `gpu` at its first
     /// setting ([`crate::host::HostTier::xstream_start`]: the ring sized from
-    /// the card's free bytes, the lane's probe, [`XSTREAM_COSTS`] for the
-    /// rule) and arms the walk's card route for its ring; the stream then
+    /// the card's free bytes, the lane's probe, the costs this device and
+    /// host price for [`XSTREAM_SHAPE`]) and arms the walk's card route for its ring; the stream then
     /// stays for the load's life, idle under `Admit` and `Off`. Refused by
     /// name: `Admit` or `Split` on a load that runs no residency machine,
     /// `Split` on a load that hangs an expert tier, on one whose card route
@@ -2659,16 +2592,9 @@ impl Body38 {
             ));
         }
         if mode == XMode::Split && self.hybrid.xstream().is_none() {
-            // The file's own row: the Q4 kind's recalibrated one, any other
-            // kind's the unfitted row until its record exists.
-            let costs = if self.routed_gate == GgmlType::Q4_K {
-                XSTREAM_COSTS
-            } else {
-                XSTREAM_COSTS_UNFITTED
-            };
             // The plan reserves no ring: it takes what the card's margin leaves past the keep-free
             // and the pages the slots' stores may still back.
-            let mut cfg = XCfg::new(costs, geo::EXPERTS, geo::N_USED, DEADLINE, None);
+            let mut cfg = XCfg::new(XSTREAM_SHAPE, geo::EXPERTS, DEADLINE, None);
             cfg.keep_free += self.store_growth() as u64;
             let half = self
                 .hybrid
@@ -2736,7 +2662,7 @@ impl Body38 {
         self.stream.set_return_at_end(on)
     }
 
-    /// The expert stream's rule costs in place of [`XSTREAM_COSTS`]
+    /// The expert stream's rule costs in place of the priced ones
     /// ([`PromptStream::set_costs`]). Refused by name before `split` started
     /// the stream and while a call streams.
     pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {
@@ -4241,6 +4167,11 @@ impl Body38 {
         }
         self.check_next(pos, n)?;
         self.settle(stream)?;
+        if n >= 2 && self.wide.split_walk() == SplitWalk::Rule {
+            let wide = &mut self.wide;
+            self.hybrid
+                .resolve_union_costs(stream, |hc| wide.set_host_costs(stream, hc))?;
+        }
         let unit = pos as usize..pos as usize + n;
         let spans = window_spans(self.media.iter().flat_map(MediaRows::positions), &unit);
         // A walk that serves no host leg (every layer's routed experts on the
@@ -4793,22 +4724,23 @@ impl GpuModel<Body38> {
     /// Open the prompt call's streaming ([`PromptStream::begin`]) with the
     /// body's own facts: the call's ids and end position, whether the path
     /// is the ubatch walk's, the pick's no-probe floor ([`STREAM_FLOOR`]),
-    /// the Q4 kind's card tail rate ([`XSTREAM_TAIL_US_PER_CARD_COL`]; none
-    /// on a kind no record has priced — the walk then balances without it)
-    /// and the map's layers. A pass runs at most [`PASS_ROWS`] rows, under
+    /// the card's tail rate a card pick (the stream's priced card column) and
+    /// the map's layers. A pass runs at most [`PASS_ROWS`] rows, under
     /// the floor, so no pass-fed call opens one.
     fn stream_begin(&mut self, path: Prompt38, n: usize, returns: bool) -> Result<(), GpuError> {
         const _: () = assert!(PASS_ROWS < STREAM_FLOOR as usize);
         const WHAT_B: &str = "qwen4exp prompt streaming";
         let end = self.pos() as usize + n;
         let (gpu, _, body) = self.body_parts(WHAT_B)?;
-        // The file's own tail rate: the Q4 kind's measured one, none on a
-        // kind no record has priced — the walk then balances without it.
-        let tail = if body.routed_gate == GgmlType::Q4_K {
-            XSTREAM_TAIL_US_PER_CARD_COL
-        } else {
-            0.0
-        };
+        // The card route's tail past a layer's last copy a card pick: a card
+        // column's cost as the stream prices it on this device, none before
+        // the stream started (no walk balances then).
+        // PIN(2026-11-01): detected tail kept; whole-path RTX 5090 @ 400 W, P=4096 K=128 C=1 draft off: pp +7.83%, TTFT p95 -7.22%.
+        let tail = body
+            .hybrid
+            .xstream()
+            .and_then(crate::host::xstream::XStream::priced)
+            .map_or(0.0, |(c, _)| c.card_us_per_col);
         body.stream.begin(
             &mut body.hybrid,
             gpu.stream(),

@@ -959,9 +959,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               stay for the decode after it. `split` admits, then streams the host experts the \
               rule (`runtime::xsplit`) sends to the card through a ring of card slots for the \
               ubatch alone (`host::xstream`): an expert streams when its columns cost the host \
-              union more than its copy and the card's columns, at the lane's rate its sources \
-              price (host memory, or the drive under the NVMe tier; the load's probe is printed, \
-              never priced), cut at the ring's half and where the layer's copies would pass the \
+              union more than its copy and the card's columns, at the measured rate of each \
+              source (host memory, or the drive under the NVMe tier), kept under the device/host \
+              workload key in the cost store (`BLOOMERY_COSTS`) so later loads of the key price alike. \
+              The load line prints both the current probe and the priced rate. The rule cuts \
+              at the ring's half and where the layer's copies would pass the \
               union it keeps; a ubatch narrower than the rule's least width streams nothing, so \
               decode and short prompts run as under `admit`. The host union leaves the streamed \
               experts out. The prompt's bits are then the band's, not the decode steps'. `off` \
@@ -1655,6 +1657,21 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         None,
         "The directory a server's `--hf <repo>[@<rev>][:<quant>]` fetches into, \
          `<dir>/<owner>/<name>[@<rev>]/<file>`; `~/.cache/bloomery/hf` when unset.",
+    ),
+    path(
+        "BLOOMERY_COSTS",
+        None,
+        "The directory of the cost store, where a load keeps what it timed for the expert \
+         stream and the split walk (the lane's rates, the host union's costs, the host's \
+         enqueue cost) under its device/host and workload key (effective host kernels, \
+         source layout and probe geometry), and where every later load of the \
+         key reads them (`crates/runtime/src/costs.rs`); `~/.cache/bloomery/costs` when unset. \
+         A key's first timing stands: delete its file (or the directory) and the next load \
+         times again, e.g. after a load timed under `taskset` or a busy host. A load whose \
+         stream or split rule needs costs the store cannot keep is refused by name. \
+         The split walk requests them at its first rule-driven multi-row ubatch; loads, \
+         decode, passes and split-walk `off` request no split-walk costs. \
+         The expert stream requests its costs when it starts.",
     ),
     path(
         "BLOOMERY_DATA",

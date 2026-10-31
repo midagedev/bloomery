@@ -884,6 +884,13 @@ impl<R: RouterEntry> Routed<R> {
         self.batch.as_ref().map_or(0, BatchBufs::bytes)
     }
 
+    /// A routed expert's gate, up and down widths: the model's and the
+    /// expert's, which the expert stream prices its card costs from.
+    #[must_use]
+    pub fn expert_widths(&self) -> (usize, usize) {
+        (self.d.embd, self.card.ff())
+    }
+
     /// The ring pass's GEMM buffers of the batch's card experts for a half of
     /// `half_slots` slots of the expert stream's ring
     /// ([`CardExperts::arm_ring`]), made when the stream starts. Nothing on a

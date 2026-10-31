@@ -40,10 +40,11 @@ use std::time::{Duration, Instant};
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
+use bloomery_gpu::host::costs::ExpertShape;
 use bloomery_gpu::host::prompt_stream::PromptStream;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::read_fault;
-use bloomery_gpu::host::xstream::{Costs, XCfg, XMode};
+use bloomery_gpu::host::xstream::{XCfg, XMode};
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::routed_block::RouterEntry;
@@ -178,11 +179,11 @@ pub struct StreamFacts {
 }
 
 /// What a family hands the walk's expert stream under `split` ([`BatchBufs::set_xstream`]), its own
-/// facts as data: the rule's costs of one of its routed experts and the bound on every host wait of
-/// the stream (its router's choice set and picks a column are the router entry's).
+/// facts as data: the bound on every host wait of the stream. The stream prices one routed expert on
+/// this device and host from its widths (the card route's), the router entry's picks a column and the
+/// walk's units, which each read a streamed expert's weights once.
 #[derive(Clone, Copy, Debug)]
 pub struct SplitFacts {
-    pub costs: Costs,
     pub deadline: Duration,
 }
 
@@ -266,7 +267,14 @@ impl BatchBufs {
                 )
             })?;
             let started = PromptStream::start_split(hybrid, gpu, || {
-                XCfg::new(split.costs, R::N_EXPERT, R::N_USED, split.deadline, None)
+                let (hidden, ff) = ffn.expert_widths();
+                let shape = ExpertShape {
+                    hidden,
+                    ff,
+                    top_k: R::N_USED,
+                    units: self.group,
+                };
+                XCfg::new(shape, R::N_EXPERT, split.deadline, None)
             })?;
             if let Some(half) = started {
                 ffn.arm_ring(gpu, half)?;

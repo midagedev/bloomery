@@ -420,6 +420,11 @@ pub trait SwapSource: Send + Sync {
     /// of that layer ever stages, so the machine takes no part in it.
     fn part_bytes(&self, layer: usize) -> &[usize];
 
+    /// The host layout of the whole source: layer tensor types and dimensions and any host
+    /// repacking, including layers held wholly on the host. Union and staging calibrations
+    /// use it: different host kernels or source transforms must have different tags.
+    fn union_tag(&self) -> Result<String, GpuError>;
+
     /// Part `part` of layer `layer`'s expert `id` as its source holds it:
     /// [`SwapSource::part_bytes`]`(layer)[part]` bytes once transformed.
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError>;

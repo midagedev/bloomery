@@ -101,6 +101,7 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::batch::BatchKey;
+    use bloomery_gpu::host::costs::{ExpertShape, UnionCosts};
     use bloomery_gpu::host::slots::HOST;
     use bloomery_gpu::host::swap::{Piece, SwapSource, Transform};
     use bloomery_gpu::host::xstream::{
@@ -109,7 +110,7 @@ mod gate {
     };
     use bloomery_gpu::{Gpu, GpuError, HostFlags};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
-    use cuda_core::{CudaStream, DeviceBuffer, sys};
+    use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
     use runtime::sched::{Item, Overlap, PortKind, order_in};
     use runtime::xsplit::{Constants, Split};
     use threads::helper::{Placement, spawn_helper};
@@ -191,6 +192,10 @@ mod gate {
     }
 
     impl SwapSource for Synth {
+        fn union_tag(&self) -> Result<String, GpuError> {
+            Ok(format!("synthetic-xstream parts={:?}", self.part_bytes(0)))
+        }
+
         fn part_bytes(&self, layer: usize) -> &[usize] {
             if layer < L { &PART_BYTES } else { &[] }
         }
@@ -230,11 +235,33 @@ mod gate {
         }
     }
 
+    /// The stream over `src` at [`cfg`]'s shape, its rule pinned at [`COSTS`]
+    /// ([`XStream::set_costs`]); [`XStream::new`]'s refusals as given.
+    fn open(
+        (ctx, stream): (&Arc<CudaContext>, &CudaStream),
+        src: &Arc<Synth>,
+        cfg: XCfg,
+    ) -> Result<XStream, GpuError> {
+        let mut x = XStream::new(ctx, stream, Arc::clone(src) as Arc<dyn SwapSource>, L, cfg)?;
+        x.set_costs(COSTS)?;
+        Ok(x)
+    }
+
     fn cfg(fill: usize, staging: usize) -> XCfg {
         XCfg {
-            costs: COSTS,
+            shape: ExpertShape {
+                hidden: 1,
+                ff: 1,
+                top_k: TOP_K,
+                units: 1,
+            },
+            union: Some(UnionCosts {
+                call_us: 0.0,
+                listing_us: COSTS.host_us_fixed,
+                per_col_us: COSTS.host_us_per_col,
+                split_us: 0.0,
+            }),
             experts: E,
-            top_k: TOP_K,
             max_half: HALF,
             keep_free: 0,
             room_cap: None,
@@ -404,13 +431,7 @@ mod gate {
         drop(capped);
 
         // probe
-        let mut x = XStream::new(
-            ctx,
-            stream,
-            Arc::clone(&src) as Arc<dyn SwapSource>,
-            L,
-            cfg(2, 4),
-        )?;
+        let mut x = open((ctx, stream), &src, cfg(2, 4))?;
         let probe_ok = x.half_slots() == HALF
             && x.staging_slots() == 4
             && x.probed_b_per_us() > 0.0
@@ -756,13 +777,7 @@ mod gate {
         drop(x);
 
         // backlog deadline
-        let mut slow = XStream::new(
-            ctx,
-            stream,
-            Arc::clone(&src) as Arc<dyn SwapSource>,
-            L,
-            cfg(1, 2),
-        )?;
+        let mut slow = open((ctx, stream), &src, cfg(1, 2))?;
         slow.begin_call();
         src.hold.store(true, Ordering::Release);
         let t0 = Instant::now();
@@ -787,13 +802,7 @@ mod gate {
         let mut tight = cfg(2, 4);
         tight.keep_free = u64::MAX;
         let room_ok = matches!(
-            XStream::new(
-                ctx,
-                stream,
-                Arc::clone(&src) as Arc<dyn SwapSource>,
-                L,
-                tight
-            ),
+            open((ctx, stream), &src, tight),
             Err(GpuError::Shape {
                 what: XSTREAM_ROOM,
                 ..
@@ -809,13 +818,7 @@ mod gate {
         let mut capped = cfg(2, 4);
         capped.room_cap = Some(0);
         let cap_ok = matches!(
-            XStream::new(
-                ctx,
-                stream,
-                Arc::clone(&src) as Arc<dyn SwapSource>,
-                L,
-                capped
-            ),
+            open((ctx, stream), &src, capped),
             Err(GpuError::Shape {
                 what: XSTREAM_ROOM,
                 ..
@@ -830,13 +833,7 @@ mod gate {
         // drop: layer 0's next stream takes the half whose read the engine
         // stream holds; past the staging slots, its fill threads wait for
         // the held copies to drain their slots when the drop stops them.
-        let mut held = XStream::new(
-            ctx,
-            stream,
-            Arc::clone(&src) as Arc<dyn SwapSource>,
-            L,
-            cfg(2, 4),
-        )?;
+        let mut held = open((ctx, stream), &src, cfg(2, 4))?;
         let slots = held.staging_slots();
         if slots != 4 {
             return Err(format!("drop: the stream has {slots} staging slots, want 4").into());

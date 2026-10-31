@@ -583,7 +583,7 @@ def cost_union(counts, W, c):
 
 
 def admits_walk(p, host, U, card_cols):
-    """xsplit.rs admit_walk at the engine's own constants (body38.rs XSTREAM_COSTS, the tail per card pick) and the
+    """xsplit.rs admit_walk at the A6000 row the engine carried (body38.rs XSTREAM_COSTS, the tail per card pick) and the
     machine's lane probe: (admits, backlog bound)."""
     Wp, cp, fp = p["walk_W_us"], p["walk_c_us"], p["walk_f_us"]
     b = p["expert_b_q4"]

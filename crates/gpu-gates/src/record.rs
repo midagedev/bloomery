@@ -3093,6 +3093,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     &[
         &CALL_STREAM,
         &CALL_STREAM_END,
+        &XSTREAM_END,
         &RESIDENCY_PASS,
         &RESIDENCY_RESET,
     ],

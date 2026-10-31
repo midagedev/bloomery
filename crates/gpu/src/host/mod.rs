@@ -103,6 +103,7 @@
 pub mod arena_leg;
 pub mod batch;
 pub mod census;
+pub mod costs;
 pub mod handoff;
 pub mod lane;
 pub mod leg;
@@ -986,6 +987,20 @@ pub struct HostTier<H> {
     /// ([`HostTier::xstream_start`]): its streamed experts leave the batch
     /// port's serve.
     xstream: Option<xstream::XStream>,
+    /// The host union's costs and the host's enqueue cost, once a caller asked for them
+    /// ([`HostTier::union_costs`]): one measurement, or one read of the cost store, a load.
+    union: Option<HostCosts>,
+    /// The model's shape and quant identity until its first consumer needs union prices.
+    deferred_union: Option<(costs::ExpertShape, String)>,
+}
+
+/// What [`HostTier::union_costs`] gives: the host union's costs, the host's cost of one
+/// enqueue [µs], and where they came from.
+#[derive(Clone, Debug)]
+pub struct HostCosts {
+    pub union: costs::UnionCosts,
+    pub enqueue_us: f64,
+    pub source: costs::Source,
 }
 
 impl<H> HostTier<H> {
@@ -1067,6 +1082,33 @@ impl<H> Drop for HostTier<H> {
     }
 }
 
+/// The most columns each host expert takes in [`HostTier::union_costs`]'s wide call.
+const UNION_COLS: usize = 16;
+
+/// The experts and the wide call's columns an expert of [`HostTier::union_costs`]'s probe over
+/// `host` experts, within a union of `cap` columns of `top_k` picks: every host expert and
+/// [`UNION_COLS`] where the union holds them, else the first `cap · top_k / 2` experts (each
+/// at least two picks) and the most even columns the union holds. Refused by name: fewer than
+/// two experts or two columns.
+fn union_probe(host: usize, cap: usize, top_k: usize) -> Result<(usize, usize), GpuError> {
+    const WHAT: &str = "host::union_costs";
+    let n = host.min(cap.saturating_mul(top_k) / 2);
+    if n < 2 {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("a probe of {n} experts, two wanted"),
+        ));
+    }
+    let cols = (cap.saturating_mul(top_k.min(n)) / n).min(UNION_COLS) & !1;
+    if cols < 2 {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("a probe of {cols} columns, two wanted"),
+        ));
+    }
+    Ok((n, cols))
+}
+
 impl<H: HostExperts> HostTier<H> {
     /// The tier over `boundary`: `experts` computes every expert `slots`
     /// sends to the host, and `layers` bounds the chain. Load-time only.
@@ -1096,6 +1138,8 @@ impl<H: HostExperts> HostTier<H> {
             call_open: OpenCall::Closed,
             swap_view: None,
             xstream: None,
+            union: None,
+            deferred_union: None,
         })
     }
 
@@ -1646,9 +1690,181 @@ impl<H: HostExperts> HostTier<H> {
         ))?;
         cfg.max_half = max_half;
         cfg.probe = host.iter().rev().take(probe).map(|&id| (l, id)).collect();
+        let hc = self
+            .union_costs(stream, cfg.shape, None)?
+            .ok_or(GpuError::state(
+                xstream::XSTREAM_NO_HOST,
+                "two host experts on a layer for the union's costs",
+            ))?;
+        cfg.union = Some(hc.union);
         let layers = self.slots.layers().end;
         let x = xstream::XStream::new(ctx, stream, source, layers, cfg)?;
         Ok(self.xstream.insert(x))
+    }
+
+    /// Register the model's shape and quant identity without touching the cost store.
+    /// Load-time only; the first consumer calls [`Self::resolve_union_costs`].
+    pub fn defer_union_costs(&mut self, shape: costs::ExpertShape, tag: String) {
+        self.deferred_union = Some((shape, tag));
+    }
+
+    /// Apply the deferred prices once. A calibration or consumer refusal keeps the request;
+    /// an explicit stream that already priced the union supplies the same cached values.
+    pub fn resolve_union_costs(
+        &mut self,
+        stream: &CudaStream,
+        apply: impl FnOnce(&HostCosts) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
+        let mut request = self.deferred_union.take();
+        let result = runtime::costs::resolve_union_costs(
+            &mut request,
+            |shape, tag| self.union_costs(stream, shape, Some(tag)),
+            apply,
+        );
+        self.deferred_union = request;
+        result
+    }
+
+    /// The host union's costs on this host and the host's cost of one enqueue
+    /// ([`costs::fit_union`], [`costs::enqueue_us`]): the union timed over every host expert
+    /// of the layer that holds the most (enough to fill the union's threads, so the fit reads
+    /// a busy union's cost an expert, the rate the rule prices), at `shape`'s widths, the
+    /// values kept in the cost store under the stream's device key, `shape` and the registered
+    /// quant identity (else the whole source's host layout), so a later load of the same key
+    /// reads the bits this one priced with ([`costs::Store`]). The first answer stands for the
+    /// tier's life. `None` with no layer of two host experts. Refused by name: the union's own
+    /// refusals and a fit that separates no cost.
+    pub fn union_costs(
+        &mut self,
+        stream: &CudaStream,
+        shape: costs::ExpertShape,
+        tag: Option<&str>,
+    ) -> Result<Option<HostCosts>, GpuError> {
+        if let Some(hc) = &self.union {
+            return Ok(Some(hc.clone()));
+        }
+        let n_expert = u32::try_from(self.slots.n_expert())
+            .map_err(|_| GpuError::shape("HostTier::union_costs", "experts past u32"))?;
+        let found = self
+            .slots
+            .layers()
+            .map(|l| {
+                let ids: Vec<u32> = (0..n_expert)
+                    .filter(|&id| self.slots.slot(l, id) == Some(Slot::Host))
+                    .collect();
+                (l, ids)
+            })
+            .max_by_key(|(l, ids)| (ids.len(), std::cmp::Reverse(*l)))
+            .filter(|(_, ids)| ids.len() >= 2);
+        let Some((l, ids)) = found else {
+            return Ok(None);
+        };
+        let cap = self.port_mut("HostTier::union_costs")?.cap();
+        let (n, cols) = union_probe(ids.len(), cap, shape.top_k)?;
+        let fallback = match tag {
+            Some(tag) => tag.to_owned(),
+            None => self
+                .swap
+                .as_ref()
+                .ok_or(GpuError::state(
+                    "HostTier::union_costs",
+                    "a union quant identity or source",
+                ))?
+                .source()
+                .union_tag()?,
+        };
+        let registered = self.deferred_union.as_ref().map(|(_, tag)| tag.as_str());
+        let key = runtime::costs::union_key(
+            &costs::device_key(stream.context())?,
+            threads::pool().threads(),
+            l,
+            ids.len(),
+            shape,
+            (n, cols),
+            (&fallback, registered),
+        );
+        let names = [
+            "call_us",
+            "listing_us",
+            "per_col_us",
+            "split_us",
+            "enqueue_us",
+        ];
+        let (v, source) = costs::Store::shared().get_or(&key, &names, || {
+            let u = self.time_union(l, &ids[..n], cols, shape)?;
+            Ok::<_, GpuError>(vec![
+                u.call_us,
+                u.listing_us,
+                u.per_col_us,
+                u.split_us,
+                costs::enqueue_us(stream)?,
+            ])
+        })?;
+        costs::check_range(&key, &names, &v, &["per_col_us"])?;
+        let hc = HostCosts {
+            union: costs::UnionCosts {
+                call_us: v[0],
+                listing_us: v[1],
+                per_col_us: v[2],
+                split_us: v[3],
+            },
+            enqueue_us: v[4],
+            source,
+        };
+        Ok(Some(self.union.insert(hc).clone()))
+    }
+
+    /// The host costs [`HostTier::union_costs`] gave, once it ran.
+    #[must_use]
+    pub fn host_costs(&self) -> Option<&HostCosts> {
+        self.union.as_ref()
+    }
+
+    /// The union's costs over `ids` of layer `l` at `cols` columns an expert in the wide call
+    /// ([`costs::fit_union`], [`union_probe`]): the least of three timings, after one untimed
+    /// call, of each of the fit's four unions.
+    fn time_union(
+        &mut self,
+        l: usize,
+        ids: &[u32],
+        cols: usize,
+        shape: costs::ExpertShape,
+    ) -> Result<costs::UnionCosts, GpuError> {
+        let n = ids.len();
+        let mut time = |experts: &[u32], cols_each: usize| -> Result<f64, GpuError> {
+            let k = shape.top_k.min(experts.len());
+            let pairs = experts.len() * cols_each;
+            let cols = pairs.div_ceil(k);
+            let w = 1.0 / k as f32;
+            let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+                .map(|j| {
+                    (j * k..((j + 1) * k).min(pairs))
+                        .map(|p| (experts[p % experts.len()], w))
+                        .collect()
+                })
+                .collect();
+            let lists: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+            let x = vec![0.0f32; shape.hidden * cols];
+            let mut out = vec![0.0f32; shape.hidden * cols];
+            let view = Tensor2View::new(&x, shape.hidden, cols)
+                .map_err(|e| GpuError::shape("HostTier::union_costs", e.to_string()))?;
+            self.experts.experts_union_into(l, view, &lists, &mut out)?;
+            let mut least = f64::INFINITY;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                self.experts.experts_union_into(l, view, &lists, &mut out)?;
+                least = least.min(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            Ok(least)
+        };
+        let times = costs::UnionTimes {
+            one: time(ids, 1)?,
+            half: time(&ids[..n / 2], 1)?,
+            wide: time(ids, cols)?,
+            halved: time(ids, cols / 2)?,
+        };
+        costs::fit_union(n, cols, times)
+            .map_err(|e| GpuError::protocol("host::union_costs", e.to_string()))
     }
 
     /// The expert stream, once started.
@@ -3288,10 +3504,42 @@ fn count_ids(
 mod tests {
     use super::{
         Drain, OpenCall, PassKind, SERVED_TIERS, await_within, count_ids, drain_of, pass_kept,
-        refuse_tier_count,
+        refuse_tier_count, union_probe,
     };
     use crate::GpuError;
     use std::time::Duration;
+
+    /// The union probe fits the union a load prepared: a Qwen3.8 load of a 64-column batch over
+    /// 256 host experts at top-10 probes every expert at 2 columns each (52 union columns, where
+    /// 16 each asked for 410 and the load failed), a 4,096-column one at 16 each, and a union
+    /// too small for two experts or two columns is refused by name (mutants: the cap left out,
+    /// an odd column count, the expert bound dropped).
+    #[test]
+    fn the_union_probe_fits_the_prepared_union() {
+        // The union columns a probe call of `n` experts at `each` columns lists, as the timing
+        // builds them: every pair over the router's picks a column.
+        let cols_of = |n: usize, each: usize, k: usize| (n * each).div_ceil(k.min(n));
+        for (host, cap, k, want) in [
+            (256, 64, 10, (256, 2)),
+            (256, 4096, 10, (256, 16)),
+            (512, 820, 10, (512, 16)),
+            (512, 819, 10, (512, 14)),
+            (400, 24, 8, (96, 2)),
+            (3, 64, 10, (3, 16)),
+        ] {
+            let (n, each) = union_probe(host, cap, k).unwrap();
+            assert_eq!((n, each), want, "{host} experts, cap {cap}, top-{k}");
+            assert!(each.is_multiple_of(2), "{each} columns");
+            assert!(
+                cols_of(n, each, k) <= cap && cols_of(n, 1, k) <= cap,
+                "{n} x {each} over cap {cap}"
+            );
+        }
+        for (host, cap, k) in [(256, 0, 10), (2, 1, 1), (256, 1, 10)] {
+            let e = union_probe(host, cap, k).unwrap_err().to_string();
+            assert!(e.contains("two wanted"), "{host} {cap} {k}: {e}");
+        }
+    }
 
     #[test]
     fn an_unsettled_release_keeps_the_service_error_kind_and_source() {

@@ -1,8 +1,8 @@
 //! A placed load's prompt calls on the common host streaming ([`PromptStream`], the `BLOOMERY_XSTREAM` lever), and
 //! the residency machine the stream reads its experts from ([`stacks`]): the body hands the common owners its own
 //! facts as data — its stacks' names, its counts ([`STREAM_FLOOR`]), its card map (a layer streams when the host
-//! serves a share of it and the card holds its stage stacks) and its expert shape's costs ([`XSTREAM_COSTS`] at the
-//! widths of its own experts) — and no stream code of its own.
+//! serves a share of it and the card holds its stage stacks) and its experts' shape, which the stream prices on this
+//! device and host — and no stream code of its own.
 //!
 //! A call opens on the machine inside the pass its boundary opened ([`super::prefill`]); each pass is one walk of one
 //! unit. At a hosted layer's shadow the pass picks ([`PromptStream::unit_pick`]): under `split` the host experts the
@@ -18,6 +18,7 @@
 
 use super::Body;
 use crate::card_slots::CardSlotKernels;
+use crate::host::costs::ExpertShape;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::swap::{CallPick, CallReport};
 use crate::host::swap_source::{DEADLINE, PlanStacks, hosted_stacks};
@@ -33,45 +34,9 @@ const WHAT: &str = "musespark::stream";
 
 /// The least count a pick admits on a load whose lane never probed: a call of fewer ids opens no streaming. The
 /// value V4.1's and Qwen3.8's walks admit from: an admit moves an expert for the rest of the call, so it pays only
-/// past the transient stream's own threshold (one expert's copy at the priced lane against [`XSTREAM_COSTS`]'s union
-/// columns, about eleven columns [derived]), and the floor sits above that.
+/// past the transient stream's own threshold (one expert's copy at the priced lane against the union's columns, about
+/// eleven columns on the A6000 the floor was set on [derived]), and the floor sits above that.
 pub const STREAM_FLOOR: u32 = 32;
-
-/// The latent and the expert width of the experts [`XSTREAM_COSTS`] is the row of: the real file's, 4,096 by 4,096 a
-/// part.
-const COSTS_LATENT: usize = 4096;
-const COSTS_FF: usize = 4096;
-
-/// The stream rule's costs for the file's IQ2_XXS experts (latent `COSTS_LATENT` by `COSTS_FF` a part, three
-/// parts): the host union's `t(m) = a + c·m` of `docs/research/muse-spark-attach.md` §5, "Prefill, P = 512", `a` the
-/// union's fixed part and `c` a column's cost with IQ2_XXS's unpack penalty [derived there]. The card's ring pass runs
-/// the streamed slots as the route GEMM over the ring's half ([`RingGemm`]), which reads an expert's blocks once a tile
-/// of up to 64 of its slots: the fixed part is the expert's bytes read once at the card's DRAM rate; a column, the
-/// expert's int8 MACs at a fifth of the card's dense int8 rate [derived from the expert's shape]. The row is not fitted
-/// to a record of this file's union or ring pass: the per-file override ([`Body::set_xstream_costs`]) takes a
-/// calibrated one. A load starts from the row of its own experts' widths (`xstream_costs`), not this one.
-pub const XSTREAM_COSTS: Costs = Costs {
-    host_us_per_col: 57.6,
-    host_us_fixed: 28.1,
-    card_us_fixed: 20.0,
-    card_us_per_col: 1.6,
-};
-
-/// [`XSTREAM_COSTS`] for experts of `latent` by `ff` a part. Every term of the row counts the expert's weights (the
-/// fixed ones the blocks the union and the ring pass read once, the per-column ones the MACs of a column) and the three
-/// parts share a type, so the ratio of a part's weights to the row's scales all four [derived; no union or ring pass
-/// has been fitted at another width]. The expert's bytes scale by the same ratio, so the rule's decisions in columns
-/// (its stream floor, the unit width that lights the ring) and its refusal of a union floor past one expert's copy and
-/// card cost hold at any widths as at the row's own, where the ratio is 1.
-fn xstream_costs(latent: usize, ff: usize) -> Costs {
-    let ratio = (latent as f64 * ff as f64) / (COSTS_LATENT as f64 * COSTS_FF as f64);
-    Costs {
-        host_us_per_col: XSTREAM_COSTS.host_us_per_col * ratio,
-        host_us_fixed: XSTREAM_COSTS.host_us_fixed * ratio,
-        card_us_fixed: XSTREAM_COSTS.card_us_fixed * ratio,
-        card_us_per_col: XSTREAM_COSTS.card_us_per_col * ratio,
-    }
-}
 
 /// The residency machine's stacks of a placed load of `n_layer` layers: every layer's gate, up and down by the common
 /// stack names, the types read from `plan`'s tensors, every layer routed (none holds no stack). Refused by name: a
@@ -195,7 +160,7 @@ impl XSide {
 }
 
 impl Body {
-    /// The stream rule's costs in place of [`XSTREAM_COSTS`] ([`PromptStream::set_costs`]). Refused by name: a load
+    /// The stream rule's costs in place of the priced ones ([`PromptStream::set_costs`]). Refused by name: a load
     /// with no host tier, before `split` started the stream, and while a call streams.
     pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {
         let p = self.placed.as_mut().ok_or(GpuError::state(
@@ -272,7 +237,7 @@ impl Body {
 impl XStreamBody for Body {
     /// What the next prompt calls move (`BLOOMERY_XSTREAM`): `off` until set here. `Split` starts the expert stream
     /// at its first setting ([`PromptStream::start_split`]: the ring sized from the card's free bytes past the
-    /// stream's keep-free, the lane's probe, [`xstream_costs`] for the rule) and arms the ring pass's buffers; the
+    /// stream's keep-free, the lane's probe, the costs this device and host price for the experts' shape) and arms the ring pass's buffers; the
     /// stream then stays for the load's life, idle under `admit` and `off`. The ring serves the stage card beside an
     /// expert tier card too: a tier layer's back sums the stage's and the streamed slots by the stream's union places
     /// before the tier's join. Refused by name: `admit` or `split` on a whole-card load or one with no residency
@@ -296,7 +261,18 @@ impl XStreamBody for Body {
         self.xs.stream.check_mode(&p.hybrid, (mode, false))?;
         if mode == XMode::Split
             && let Some(half) = PromptStream::start_split(&mut p.hybrid, gpu, || {
-                XCfg::new(xstream_costs(latent, ff), experts, top_k, DEADLINE, room)
+                // PIN(2026-11-01): `a_load_starts_from_the_row_of_its_experts_widths` went with the
+                // fitted row it scaled: loads now measure the host's costs and derive the card's from
+                // this shape (`runtime::costs::card_costs`, held by `the_card_costs_are_the_rows_at_a6000`),
+                // and `host::xstream`'s `the_tail_is_the_rules_whole_set_with_nothing_admitted` holds the
+                // union floor's refusal.
+                let shape = ExpertShape {
+                    hidden: latent,
+                    ff,
+                    top_k,
+                    units: 1,
+                };
+                XCfg::new(shape, experts, DEADLINE, room)
             })?
         {
             self.xs.arm(gpu, (rows, top_k, latent, ff), half)?;
@@ -311,72 +287,5 @@ impl XStreamBody for Body {
             Some(p) => self.xs.stream.word(&p.hybrid),
             None => self.xs.stream.mode().word().to_string(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::host::xstream::stream_tail;
-    use runtime::xsplit::{self, Constants, Split, SplitError};
-
-    /// The lane's priced rate for an expert held in host memory [B/µs].
-    const LANE_B_PER_US: f64 = 20_410.0;
-
-    /// The bytes of an expert of `latent` by `ff` a part: three IQ2_XXS stacks of 66 bytes a 256 values.
-    fn expert_b(latent: usize, ff: usize) -> u64 {
-        (3 * latent * ff * 66 / 256) as u64
-    }
-
-    /// The rule's constants at `costs` over `experts` routed experts of `latent` by `ff` a part, top-8, no burst share.
-    fn constants(costs: Costs, (latent, ff): (usize, usize), experts: usize) -> Constants {
-        Constants {
-            lane_b_per_us: LANE_B_PER_US,
-            host_us_per_col: costs.host_us_per_col,
-            host_us_fixed: costs.host_us_fixed,
-            card_us_fixed: costs.card_us_fixed,
-            card_us_per_col: costs.card_us_per_col,
-            union_burst_share: 0.0,
-            card_tail_us: 0.0,
-            expert_b: expert_b(latent, ff),
-            experts,
-            top_k: 8,
-        }
-    }
-
-    /// The ring's tail over a layer whose upper half of the experts sits on the host, 100 columns each: how many
-    /// the rule streams.
-    fn streamed(k: &Constants) -> Result<usize, SplitError> {
-        let counts = vec![100u32; k.experts];
-        let host: Vec<u32> = (k.experts as u32 / 2..k.experts as u32).collect();
-        let mut out = Split::default();
-        stream_tail(&counts, &host, k, &mut out)?;
-        Ok(out.stream.len())
-    }
-
-    /// At the row's own widths a load starts from the row; at the gate fixture's (latent 512 by 256, a 128th of the
-    /// weights) from the row scaled by the ratio, whose rule streams the layer's host experts from the same column
-    /// count the real file's does and does not refuse the union floor. The row on those experts without the ratio is
-    /// refused (mutant: `set_xstream` starting from [`XSTREAM_COSTS`]).
-    #[test]
-    fn a_load_starts_from_the_row_of_its_experts_widths() {
-        let (real, fixture) = ((COSTS_LATENT, COSTS_FF), (512, 256));
-        assert_eq!(xstream_costs(real.0, real.1), XSTREAM_COSTS);
-        let (kr, kf) = (
-            constants(xstream_costs(real.0, real.1), real, 256),
-            constants(xstream_costs(fixture.0, fixture.1), fixture, 16),
-        );
-        assert_eq!(streamed(&kr), Ok(128));
-        assert_eq!(streamed(&kf), Ok(8));
-        let (mr, mf) = (xsplit::m_star(&kr), xsplit::m_star(&kf));
-        assert!((mr - mf).abs() < 1e-9 * mr, "m* {mr} against {mf}");
-        let unscaled = constants(XSTREAM_COSTS, fixture, 16);
-        assert_eq!(
-            streamed(&unscaled),
-            Err(SplitError::Param {
-                name: "host_us_fixed",
-                range: "at most one expert's lane and card fixed cost",
-            })
-        );
     }
 }

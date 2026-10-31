@@ -835,6 +835,10 @@ mod gate {
     }
 
     impl SwapSource for Synth {
+        fn union_tag(&self) -> Result<String, GpuError> {
+            Ok(format!("synthetic-swap parts={:?}", self.part_bytes(0)))
+        }
+
         fn part_bytes(&self, _layer: usize) -> &[usize] {
             &PART_BYTES
         }

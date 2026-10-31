@@ -1,7 +1,8 @@
 //! MiniMax-M3.1's prompt calls through the common walk's host streaming (`BLOOMERY_XSTREAM`,
 //! [`bloomery_gpu_deepseek41::prompt_walk`]): the family hands the walk its facts as data — the
-//! floor a pick admits from, no card tail record, and under `split` the stream rule's costs of one
-//! routed expert — and runs no stream code of its own. The guards, the stream's start, the picks, the
+//! floor a pick admits from, no card tail record, and under `split` the stream's wait bound (the
+//! walk prices a routed expert on this device and host from its widths) — and runs no stream code
+//! of its own. The guards, the stream's start, the picks, the
 //! ring pass (route GEMMs over the ring's half, a batch a landing batch) and the join are the walk's.
 
 use bloomery_gpu::host::swap_source::DEADLINE;
@@ -12,22 +13,6 @@ use bloomery_gpu_deepseek41::router::sigmoid_128_4::RouterKernels;
 use model::arch::minimaxm3::place;
 
 use crate::body::Body;
-
-/// The stream rule's costs of one M3.1 routed expert (an NVFP4 gate, up and down of the model's
-/// width and the expert's rows), derived from the expert's shape and not fitted to a record: the
-/// host union a column, the expert's MACs at the host NVFP4 dot's rate (the middle of its band); its
-/// floor, the expert's bytes read once at the host's read bandwidth. The card's ring pass runs the
-/// streamed slots as route GEMMs over the ring's half, so a unit reads an expert's planes once a
-/// tile of up to 64 of its slots: the fixed part, the expert's bytes read once at the card's DRAM
-/// rate by each unit of the default prompt group (`BLOOMERY_PREFILL_GROUP`'s two units); a column,
-/// the expert's int8 MMAs at a fifth of the card's dense int8 rate. The record that replaces it is
-/// a prompt-union record of the file at 512 and 4096 columns and the ring pass's own card marks.
-pub const XSTREAM_COSTS: Costs = Costs {
-    host_us_per_col: 73.0,
-    host_us_fixed: 240.0,
-    card_us_fixed: 90.0,
-    card_us_per_col: 2.0,
-};
 
 /// The least count a pick admits from on a load whose lane never probed: the V4.1 walk's floor (its
 /// flow model's threshold), which no M3.1 record has priced for its own routing, held as a share of
@@ -42,10 +27,7 @@ const _: () = assert!(place::PROMPT_ROWS.is_multiple_of(128));
 const FACTS: StreamFacts = StreamFacts {
     floor: STREAM_FLOOR,
     tail_us_per_card_pick: 0.0,
-    split: Some(SplitFacts {
-        costs: XSTREAM_COSTS,
-        deadline: DEADLINE,
-    }),
+    split: Some(SplitFacts { deadline: DEADLINE }),
 };
 
 impl Body {
@@ -73,7 +55,7 @@ impl Body {
         self.units.stream().mode()
     }
 
-    /// The expert stream's rule costs in place of [`XSTREAM_COSTS`]
+    /// The expert stream's rule costs in place of the priced ones
     /// ([`bloomery_gpu::host::prompt_stream::PromptStream::set_costs`]), for a gate that drives the
     /// rule to stream. Refused by name before `split` started the stream and while a call streams.
     pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {

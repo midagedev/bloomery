@@ -3134,8 +3134,10 @@ impl Q38 {
 
     /// The call's `tier census` record ([`Q38::print_census`]); then the
     /// `call stream` records of the last prompt call — each of its picks,
-    /// then its end — and the `residency pass` records of the boundaries
-    /// since, on stderr, nothing of them without the residency.
+    /// then its end — its `xstream end` record when the expert stream ran it
+    /// (the layers and experts it streamed), and the `residency pass` records
+    /// of the boundaries since, on stderr, nothing of them without the
+    /// residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
         self.print_census()?;
         self.print_room()?;
@@ -3153,6 +3155,15 @@ impl Q38 {
         }
         if let Some(r) = end {
             record::call_report(&r).eprint();
+        }
+        let (_, xend) = self
+            .s
+            .model_mut()
+            .body_parts("bloomery-serve-qwen38")?
+            .2
+            .take_xstream_records();
+        if let Some(r) = xend {
+            record::xstream_end(&r).eprint();
         }
         for (kind, r) in self
             .s

@@ -13,7 +13,7 @@
 //! half of its ring for the layer's units, and the serve's union leaves the
 //! streamed experts out. The body hands the model's own facts in as data:
 //! the least count its pick admits with no probe ([`PromptStream::begin`]'s
-//! `floor`), the card tail rate its kind's records priced (`tail`), its
+//! `floor`), the stream's priced card column (`tail`), its
 //! layers, and — walk by walk — whether a layer holds card experts and the
 //! walk's last position.
 //!
@@ -62,9 +62,8 @@ pub struct PromptStream {
     /// The streaming call runs the expert stream too (`split`).
     split: bool,
     /// The card tail rate a split pick's walk prices its unit with [µs per
-    /// card pick], set when a streaming call opens: the family's measured
-    /// one on its fitted kind, none on a kind whose route no record has
-    /// priced.
+    /// card pick], set when a streaming call opens: the stream's priced card
+    /// column, 0 before the stream started.
     card_tail_us_per_pick: f64,
     /// The least count the pick admits on a load whose lane never probed,
     /// set when a streaming call opens: the body's own floor.
@@ -157,7 +156,7 @@ impl PromptStream {
 
     /// The expert stream on `gpu` at a family's first `Split`
     /// ([`HostTier::xstream_start`], its probe [`PROBE`] host experts, `cfg`
-    /// the stream's shape with its routed kind's costs row): the ring's slots
+    /// the model's expert shape): the ring's slots
     /// a half, which the family's card route arms its ring pass for; `None`
     /// when the stream runs already — it stays for the load's life, idle
     /// under `Admit` and `Off`. The stream's own refusals at its start (the
@@ -218,20 +217,36 @@ impl PromptStream {
     /// The load line's `xstream=` word: the mode, and under a started stream
     /// its ring's slots a half, its pinned staging slots (0: pageable), the
     /// lane's rate its probe measured and the rate the rule prices in GB/s,
-    /// and the least unit width that streams.
+    /// the least unit width that streams, the costs the rule prices its
+    /// first streaming layer at in µs (the host union's a column and its
+    /// floor, the card's fixed and a column) with where the lane's and the
+    /// union's values came from (`stored`, `measured`, or `set` by a gate).
     #[must_use]
     pub fn word<H: HostExperts>(&self, tier: &HostTier<H>) -> String {
         let mode = self.mode().word();
         match tier.xstream() {
-            Some(x) => format!(
-                "{mode} xstream_half={} xstream_staging={} xstream_lane_gbs={:.2} \
-                 xstream_priced_gbs={:.2} xstream_m_min={}",
-                x.half_slots(),
-                x.staging_slots(),
-                x.probed_b_per_us() / 1000.0,
-                x.lane_b_per_us() / 1000.0,
-                x.m_min().map_or("none".to_string(), |m| m.to_string())
-            ),
+            Some(x) => {
+                let costs = x.priced().map_or("none".to_string(), |(c, src)| {
+                    format!(
+                        "{:.3},{:.3},{:.3},{:.4} xstream_lane_source={src} \
+                         xstream_union_source={}",
+                        c.host_us_per_col,
+                        c.host_us_fixed,
+                        c.card_us_fixed,
+                        c.card_us_per_col,
+                        tier.host_costs().map_or("none", |h| h.source.word())
+                    )
+                });
+                format!(
+                    "{mode} xstream_half={} xstream_staging={} xstream_lane_gbs={:.2} \
+                     xstream_priced_gbs={:.2} xstream_m_min={} xstream_costs={costs}",
+                    x.half_slots(),
+                    x.staging_slots(),
+                    x.probed_b_per_us() / 1000.0,
+                    x.lane_b_per_us() / 1000.0,
+                    x.m_min().map_or("none".to_string(), |m| m.to_string())
+                )
+            }
             None => mode.to_string(),
         }
     }

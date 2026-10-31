@@ -1727,34 +1727,14 @@ impl Body35 {
     /// (`wide38`'s `STREAM_FLOOR`); a prompt call of fewer ids opens no call.
     pub const STREAM_FLOOR: u32 = STREAM_FLOOR;
 
-    /// The expert stream rule's costs for the file's routed kinds, in µs:
-    /// the host union's cost of one expert per column and its floor, and the
-    /// card route's fixed and per-column cost of one streamed expert. No
-    /// record has fitted this row: it is Qwen3.8's fitted Q4 row carried to
-    /// this family's expert shape (2048 by 512, Q4_K gate and up, a Q4_K or
-    /// Q6_K down) — the union's per-column cost by the row-lane instructions
-    /// a column takes (`model::ops`' `lane_units`, the arm a union of these
-    /// stacks takes) over the two layer kinds, its floor by an expert's bytes
-    /// at the same read rate, the card's per-column cost by the expert's
-    /// MACs, the card's fixed cost as that row's. The record that fits it is
-    /// a `stat prompt lb` record of a placed load of this family at 512 and
-    /// 4096 columns (the per-layer walls against their slots and listed
-    /// experts).
-    pub const XSTREAM_COSTS: Costs = Costs {
-        host_us_per_col: 2.0,
-        host_us_fixed: 12.4,
-        card_us_fixed: 13.0,
-        card_us_per_col: 0.10,
-    };
-
     /// What the next prompt calls move (`BLOOMERY_XSTREAM`,
     /// [`PromptStream`]): off until set here, so one load can run every
     /// arm. Under `Admit` a prompt call of the wide units' path moves each
     /// card layer's residency pool toward the experts its units route most
     /// ([`super::placed`]'s streaming walk); `Split` starts the expert stream
     /// on `gpu` at its first setting ([`Placed::start_xstream`]: the ring
-    /// sized from the card's free bytes, the lane's probe,
-    /// [`Body35::XSTREAM_COSTS`] for the rule) and arms the walk's pass rows
+    /// sized from the card's free bytes, the lane's probe, the costs this
+    /// device and host price for the rule) and arms the walk's pass rows
     /// for its ring, whose pass runs the streamed experts on the card beside
     /// its stacks; the stream then stays for the load's life, idle under
     /// `Admit` and `Off`. Refused by name: `Admit` or `Split` on a load that
@@ -1780,7 +1760,7 @@ impl Body35 {
             ));
         };
         if mode == XMode::Split {
-            p.start_xstream(gpu, Body35::XSTREAM_COSTS)?;
+            p.start_xstream(gpu)?;
         }
         self.stream.set_mode(mode);
         Ok(())
@@ -1803,7 +1783,7 @@ impl Body35 {
         self.stream.take_pick_records()
     }
 
-    /// The expert stream's rule costs in place of [`Body35::XSTREAM_COSTS`]
+    /// The expert stream's rule costs in place of the priced ones
     /// ([`PromptStream::set_costs`]). Refused by name on a load with no host
     /// tier, before `split` started the stream and while a call streams.
     pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {

@@ -125,7 +125,6 @@ mod gate {
     use bloomery_gpu_minimaxm3::prefill::{
         Batch, T_MAX, set_prefill_group, set_prompt_stats, take_prompt_stats,
     };
-    use bloomery_gpu_minimaxm3::stream::XSTREAM_COSTS;
     use cuda_core::DeviceBuffer;
     use refset::arch::minimaxm3::ARCH;
 
@@ -422,11 +421,13 @@ mod gate {
     /// The stream arm's prompt length: a group of two whole units, past the walk's gate at [`SPLIT_COSTS`].
     const STREAM_P: usize = 2 * T_MAX;
 
-    /// The stream arm's rule costs: the family's, with a host column of a tenth of a second, so the stream's floor sits
+    /// The stream arm's fixed rule input: a host column of a tenth of a second, so the stream's floor sits
     /// under one column and every host expert a unit routes streams until the ring's half or the balance cuts it.
     const SPLIT_COSTS: Costs = Costs {
         host_us_per_col: 1.0e5,
-        ..XSTREAM_COSTS
+        host_us_fixed: 240.0,
+        card_us_fixed: 90.0,
+        card_us_per_col: 2.0,
     };
 
     /// Under `BLOOMERY_XSTREAM=split` (the seat set it at the load), the rule's costs the stream arm runs at

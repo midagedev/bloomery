@@ -62,8 +62,8 @@ pub use body35::{
 };
 pub use body38::{
     ALLOWED, Body38, CHECKPOINT_EVERY, DecodeInput38, Folder38, LayerKind38, Model38, Prompt38,
-    Qwen38Model, RouteTap, Seq38, Store38Host, XSTREAM_COSTS, checkpoint_budget38,
-    checkpoint_bytes, checkpoint_price38, point_row_budget38, seq_positional_bytes, seq38_bytes,
+    Qwen38Model, RouteTap, Seq38, Store38Host, checkpoint_budget38, checkpoint_bytes,
+    checkpoint_price38, point_row_budget38, seq_positional_bytes, seq38_bytes,
 };
 pub use draft_taps::TapRowsSink;
 pub use mtp35::{Mtp35, MtpArena, addresses, mtp_chain, mtp_walk, prompt_with35};
@@ -74,7 +74,7 @@ pub use mtp38::{
 pub use placed::{Placed, WideRoute, WideRouteLayer};
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
 pub use tier38::NODE_FAMILY;
-pub use wide38::{SPLIT_COSTS, SplitWalk};
+pub use wide38::SplitWalk;
 
 /// Qwen3.6-35B-A3B on one card.
 pub type Qwen35moeModel = crate::GpuModel<Body35>;
