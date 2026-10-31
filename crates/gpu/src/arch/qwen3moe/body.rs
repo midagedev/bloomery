@@ -17,7 +17,7 @@ use super::plan::{
 use super::prefill::Prefill;
 use super::program::Tail;
 use super::proj::ProjKernels;
-use super::router::{RouterDims, RouterKernels, gated};
+use super::router::gated;
 use super::scratch::{
     Append128, Arena, Dims, FlashPass, Forms, KvPlanes, RopeRows, StepParams, cells_view,
 };
@@ -42,6 +42,7 @@ use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_norm::RopeNormKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
+use crate::route_softmax::{RouterDims, RouterKernels};
 use crate::site::{self, KGemvKernels};
 use crate::tensor::{Window, WindowMut};
 use crate::weights::{DevWeight, Weights};

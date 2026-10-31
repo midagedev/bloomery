@@ -323,12 +323,12 @@ mod gate {
     use super::q3place::{self, PlaceQ3};
     use super::taps;
     use app::Session;
-    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath, PrefillStep};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
+    use bloomery_gpu::route_softmax::MAX_TOKENS;
     use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};

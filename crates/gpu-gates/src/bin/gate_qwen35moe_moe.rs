@@ -140,11 +140,11 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::router::gated::{
         ROW, ROW_WIDE, RouterKernels, RouterOut, RouterWeight,
     };
-    use bloomery_gpu::arch::qwen3moe::router::{MAX_TOKENS, RouterDims};
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
     use bloomery_gpu::gemm::{GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::route_core::sigmoid;
+    use bloomery_gpu::route_softmax::{MAX_TOKENS, RouterDims};
     use bloomery_gpu::weights::{DevWeight, Weights, upload_file_tensor};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q4k_scales;

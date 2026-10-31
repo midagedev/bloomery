@@ -12,9 +12,9 @@
 //! ([`FfnPlan`]). The PLE layer ([`PlePlan`]) adds the n-gram embedding to
 //! the streams before its mix.
 
-use super::router::RouterDims;
 use crate::hc_gated::HcMatrix;
 use crate::linear::{self, KHeadMap, LinearShape};
+use crate::route_softmax::RouterDims;
 use crate::site::{self as dense, SiteTy};
 use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, flash_gqa, ple, q38, qsa};

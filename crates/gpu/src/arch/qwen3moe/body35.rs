@@ -125,6 +125,7 @@ use crate::model::{
     refuse_stage_rows_past,
 };
 use crate::rope_table::{RopeSpec, RopeTable};
+use crate::route_softmax::RouterDims;
 use crate::site::{self, Order, file_site};
 use crate::tensor::{WindowMut, host_filled};
 use crate::weights::Weights;
@@ -164,7 +165,7 @@ pub struct Open35 {
     /// The decode flash: the tensor-core pass when `true`.
     pub mma: bool,
     /// Tokens per ubatch of the prompt call, `1..=` the router's
-    /// [`ubatch`](super::router::RouterDims::ubatch) (at most [`UBATCH`]);
+    /// [`ubatch`](crate::route_softmax::RouterDims::ubatch) (at most [`UBATCH`]);
     /// the ubatch arena holds `max(ubatch, GEMV_COLS)` rows, at most `ctx`.
     /// A size outside that range, or an arena that does not fit the card's
     /// free bytes with [`FIT_RESERVE`] left, is refused by name at load.
@@ -997,7 +998,7 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
 /// (one shape, [`moe_fits`]) and the expert width, or no router and the
 /// dense width its dense layers share. A file with both kinds, or neither,
 /// is refused by name.
-fn ffn_dims(spec: &ModelSpec) -> Result<(Option<super::router::RouterDims>, usize), GpuError> {
+fn ffn_dims(spec: &ModelSpec) -> Result<(Option<RouterDims>, usize), GpuError> {
     let mut routed = spec.layers.iter().filter_map(|l| l.moe());
     let mut dense = spec.layers.iter().filter_map(|l| match l.ffn {
         Ffn::Dense { ff, .. } => Some(ff as usize),

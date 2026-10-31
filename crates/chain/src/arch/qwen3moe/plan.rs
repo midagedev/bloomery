@@ -25,9 +25,9 @@
 //! from its [`LayerSpec`] — the file's tensors, cross-checked with its
 //! interval key by the reader — never from the layer's number.
 
-use super::router::RouterDims;
 use crate::ChainError;
 use crate::linear::{self, LinearShape, Ring};
+use crate::router::RouterDims;
 pub use model::arch::coverage::{DownEntry, GateUpEntry};
 use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_shared, turns_as_neox};
 use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};

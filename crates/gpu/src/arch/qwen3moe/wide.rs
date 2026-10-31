@@ -45,7 +45,6 @@ use super::experts::CombineArgs;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaKind, GqaPlan, Pairs, SharedPlan, SiteTy};
 use super::program::{Program, Tail};
-use super::router::MAX_TOKENS;
 use super::scratch::{
     ApartForms, Append128, Append256, AppendNorm, Arena, Dims, Forms, GdnArena, KvPlanes,
     PrefillFlash, Route,
@@ -62,6 +61,7 @@ use crate::model::fit::{act_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
+use crate::route_softmax::MAX_TOKENS;
 use crate::site::{self, Gated, GatedIo, SiteWeight, WideActs, WideActsMut, WideIn, WideKernels};
 use crate::tensor::{DeviceTensor, WindowMut};
 use crate::weights::Weights;

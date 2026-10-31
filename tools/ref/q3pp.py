@@ -123,7 +123,7 @@ def flash_consts(tree):
         positions=src_const(tree, fp, r"^pub const POSITIONS: usize = ([\d_]+);", "POSITIONS"),
         head=src_const(tree, "crates/gpu/src/flash_gqa.rs", r"^pub const HEAD: usize = ([\d_]+);", "HEAD"),
         group=src_const(tree, "crates/gpu/src/flash_gqa.rs", r"^pub const GROUP: usize = ([\d_]+);", "GROUP"),
-        max_tokens=src_const(tree, "crates/gpu/src/arch/qwen3moe/router.rs",
+        max_tokens=src_const(tree, "crates/gpu/src/route_softmax.rs",
                              r"^pub const MAX_TOKENS: usize = ([\d_]+);", "MAX_TOKENS"),
         n_used=src_const(tree, "crates/gpu/src/arch/qwen3moe/router.rs",
                          r"^pub const N_USED: usize = ([\d_]+);", "N_USED"),
