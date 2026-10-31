@@ -350,14 +350,19 @@ const FREE: u32 = 0;
 const FILLING: u32 = 1;
 const FILLED: u32 = 2;
 
-/// The parts of an expert the arena holds: a slot's windows in the plan's
-/// stack-row order, and the count [`TierSlots::slot`]'s `part` names —
-/// mapped to the rows per layer at the attach ([`NvTier::note_parts`]).
+/// The most parts of an expert the arena holds, a gated expert's gate, up
+/// and down; a relu² expert holds two, its up and its down
+/// ([`LayerArena::rows`]). A slot's windows lie in the plan's stack-row
+/// order, and [`TierSlots::slot`]'s `part` names the leg's three, `[gate,
+/// up, down]` — mapped to the layer's rows at the attach
+/// ([`NvTier::note_parts`]), a relu² leg's gate to its up. A pick is that
+/// many units of a fill, one a part; a part the layer does not hold reads
+/// nothing.
 const PARTS: usize = 3;
 
 /// One run of a part's bytes: `len` bytes at file offset `at` of the split's
 /// shard `shard`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Run {
     shard: usize,
     at: u64,
@@ -511,8 +516,9 @@ fn open_shard(
 /// checkpoint folder keeps as two planes, its codes' run and its block
 /// scales' run (`scales`), each in its own shard; and the skew the codes'
 /// aligned read lands at in the part's window. A slot lends the codes, then
-/// the scales ([`PartRange::len`] bytes).
-#[derive(Clone, Copy)]
+/// the scales ([`PartRange::len`] bytes). The default holds no run, the
+/// part a layer of fewer rows than [`PARTS`] does not have.
+#[derive(Clone, Copy, Default)]
 struct PartRange {
     codes: Run,
     scales: Option<Run>,
@@ -1010,6 +1016,9 @@ struct LayerArena {
     /// serves. Every other id is the arena's.
     host: Range<u32>,
     n_expert: u32,
+    /// The plan's routed stack rows the layer pages, the first `rows` of
+    /// each array below: three for a gated expert, two for a relu² one.
+    rows: usize,
     /// Slot `k`'s part `p` window at `windows[p]` bytes into the slot.
     windows: [usize; PARTS],
     slot_bytes: usize,
@@ -1108,7 +1117,7 @@ impl LayerArena {
             && self.windows.iter().all(|&w| word(w))
             && (0..self.n_expert)
                 .filter(|id| !self.host.contains(id))
-                .all(|id| self.parts[id as usize].iter().all(|r| word(r.skew)))
+                .all(|id| self.parts_of(id).iter().all(|r| word(r.skew)))
     }
 
     /// Whether a lane's open read pins slot `s`: the expert it holds is read
@@ -1308,6 +1317,11 @@ impl LayerArena {
         })
     }
 
+    /// Expert `id`'s parts, by stack row.
+    fn parts_of(&self, id: u32) -> &[PartRange] {
+        &self.parts[id as usize][..self.rows]
+    }
+
     /// The fills' handle of shard `shard`. Every run the build resolved has
     /// one ([`NvTier::of_paged`]).
     fn file(&self, shard: usize) -> &Arc<DirectFile> {
@@ -1321,18 +1335,15 @@ impl LayerArena {
     /// page of byte `at`, for a refusal to name; `None` when no run does.
     fn owner_at(&self, shard: usize, at: u64, page: u64) -> Option<(usize, u32)> {
         (0..self.n_expert).find_map(|id| {
-            self.parts[id as usize]
-                .iter()
-                .enumerate()
-                .find_map(|(row, p)| {
-                    p.runs()
-                        .any(|r| {
-                            r.shard == shard
-                                && r.at / page * page <= at
-                                && at < (r.at + r.len as u64).div_ceil(page) * page
-                        })
-                        .then_some((row, id))
-                })
+            self.parts_of(id).iter().enumerate().find_map(|(row, p)| {
+                p.runs()
+                    .any(|r| {
+                        r.shard == shard
+                            && r.at / page * page <= at
+                            && at < (r.at + r.len as u64).div_ceil(page) * page
+                    })
+                    .then_some((row, id))
+            })
         })
     }
 }
@@ -2087,14 +2098,13 @@ impl NvTier {
     /// from its runs ([`stack_runs`]): a stack's one run of its file, its
     /// experts cut evenly, or the matrices a checkpoint folder locates, each
     /// in any shard. Refused by name: a layer whose host segment's ids are
-    /// not one run, whose routed stacks are not three rows the split holds,
-    /// a stack no file holds or whose experts do not cut its bytes evenly, a
-    /// run in a shard that is not its file's mapping
+    /// not one run, whose routed stacks are not two or three rows the split
+    /// holds, a stack no file holds or whose experts do not cut its bytes
+    /// evenly, a run in a shard that is not its file's mapping
     /// ([`gguf::Gguf::file_backed`]: a drop would zero a copy), and a budget
-    /// whose carve falls under the
-    /// arena's floor ([`ArenaFloor::of`] at the served column: a plan whose
-    /// arena was not the split dial's). A miss once no slot is free takes its
-    /// victim as `evict` says ([`pick_slot`]).
+    /// whose carve falls under the arena's floor ([`ArenaFloor::of`] at the
+    /// served column: a plan whose arena was not the split dial's). A miss
+    /// once no slot is free takes its victim as `evict` says ([`pick_slot`]).
     pub fn of_paged(
         plan: &Plan<'_>,
         split: &Arc<Split>,
@@ -2167,17 +2177,18 @@ impl NvTier {
             if rows.is_empty() {
                 continue;
             }
-            if rows.len() != PARTS {
+            if !(2..=PARTS).contains(&rows.len()) {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
-                        "layer {l} holds {} routed stack rows, not {PARTS}",
+                        "layer {l} holds {} routed stack rows, not a relu² expert's two or a \
+                         gated one's three",
                         rows.len()
                     ),
                 ));
             }
             let n = model.experts as usize;
-            let mut parts: Vec<Vec<PartRange>> = vec![Vec::new(); n];
+            let mut parts = vec![[PartRange::default(); PARTS]; n];
             let mut lens = [(0usize, 0usize); PARTS];
             for (p, name) in rows.iter().enumerate() {
                 let runs = stack_runs(split, name, n)?;
@@ -2191,38 +2202,32 @@ impl NvTier {
                 });
                 for (id, (codes, scales)) in runs.into_iter().enumerate() {
                     let (_, _, need) = aligned_span(codes.at, codes.len as u64);
-                    parts[id].push(PartRange {
+                    parts[id][p] = PartRange {
                         codes,
                         scales,
                         skew: need - codes.len,
-                    });
+                    };
                 }
             }
             let mut windows = [0usize; PARTS];
-            for p in 1..PARTS {
-                let (codes, scales) = lens[p - 1];
-                windows[p] = windows[p - 1] + window_bytes(codes, scales);
+            let mut slot_bytes = 0;
+            for (window, &(codes, scales)) in windows.iter_mut().zip(&lens[..rows.len()]) {
+                *window = slot_bytes;
+                slot_bytes += window_bytes(codes, scales);
             }
-            let (codes, scales) = lens[PARTS - 1];
-            let slot_bytes = windows[PARTS - 1] + window_bytes(codes, scales);
             slot_sizes.push(slot_bytes);
             arenas[l] = Some(LayerArena {
                 host: host_of[l].clone().unwrap_or(0..0),
                 n_expert: model.experts as u32,
+                rows: rows.len(),
                 windows,
                 slot_bytes,
                 base: 0,
                 dev: None,
                 part_of: OnceLock::new(),
                 files: Arc::new([]),
-                names: rows.clone().try_into().expect("three rows"),
-                parts: parts
-                    .into_iter()
-                    .map(|row| match row.try_into() {
-                        Ok(three) => three,
-                        Err(_) => panic!("the plan's three stack rows a row of parts"),
-                    })
-                    .collect(),
+                names: std::array::from_fn(|p| rows.get(p).cloned().unwrap_or_default()),
+                parts,
                 of_id: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 reading: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 mapped: (0..n).map(|_| AtomicU32::new(0)).collect(),
@@ -2439,33 +2444,45 @@ impl NvTier {
     }
 
     /// Resolve the host leg's part indices — the names of the layer's three
-    /// routed stacks as the leg built it, `[gate, up, down]` — to the plan's
-    /// stack rows the arena carved, refusing by name a stack the arena does
-    /// not hold or a name twice. Load-time only, once; until it runs every
-    /// pick of the layer refuses by name.
+    /// routed stacks as the leg built it, `[gate, up, down]`, a relu² leg's
+    /// gate slot holding its up again (`model::moe::HostLayer::stacks`) — to
+    /// the plan's stack rows the arena carved, refusing by name a stack the
+    /// arena does not hold, a name twice but that gate slot's, and a row no
+    /// part names. Load-time only, once; until it runs every pick of the
+    /// layer refuses by name.
     pub(crate) fn note_parts(&self, layer: usize, leg: &[&str; PARTS]) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::note_parts";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
             return Err(GpuError::state(WHAT, "the layer's arena"));
         };
+        let names = &arena.names[..arena.rows];
         let mut part_of = [usize::MAX; PARTS];
         for (p, name) in leg.iter().enumerate() {
-            let Some(at) = arena.names.iter().position(|n| n == name) else {
+            let Some(at) = names.iter().position(|n| n == name) else {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
-                        "layer {layer}'s stack {name} is not one of the plan's routed rows {:?}",
-                        arena.names
+                        "layer {layer}'s stack {name} is not one of the plan's routed rows {names:?}"
                     ),
                 ));
             };
-            if part_of.contains(&at) {
+            let up_as_gate = p == 1 && leg[0] == leg[1];
+            if part_of.contains(&at) && !up_as_gate {
                 return Err(GpuError::shape(
                     WHAT,
                     format!("layer {layer}'s stacks name the plan's row {name} twice"),
                 ));
             }
             part_of[p] = at;
+        }
+        if let Some(row) = (0..arena.rows).find(|row| !part_of.contains(row)) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer}'s stacks {leg:?} name none of the plan's row {}",
+                    names[row]
+                ),
+            ));
         }
         arena
             .part_of
@@ -2625,7 +2642,7 @@ impl NvTier {
                 format!("layer {layer} expert {id}: its pinned slot reads unfilled"),
             )
         })?;
-        let Some(row) = arena.names.iter().position(|n| n == stack) else {
+        let Some(row) = arena.names[..arena.rows].iter().position(|n| n == stack) else {
             return Ok(None);
         };
         let (at, len) = arena.span_of(slot, id, row);
@@ -2864,7 +2881,7 @@ impl NvTier {
         let mut out = Vec::with_capacity(PARTS);
         let mut runs_in: Vec<(usize, Range<u64>, Mark)> = Vec::with_capacity(marks.len());
         let (mut ranges, mut kept) = (Vec::new(), Vec::new());
-        for row in 0..PARTS {
+        for row in 0..arena.rows {
             for scales in [false, true] {
                 runs_in.clear();
                 runs_in.extend(arena.parts.iter().zip(marks).filter_map(|(p, &mark)| {
@@ -3116,7 +3133,7 @@ impl NvTier {
                     format!("layer {layer} expert {id}: unfilled after ensure"),
                 )
             })?;
-            for part in 0..PARTS {
+            for part in 0..arena.rows {
                 let (at, len) = arena.span_of(slot, id, part);
                 let mut lent = self.mem.slice(at, len);
                 for r in arena.parts[id as usize][part].runs() {
@@ -3465,10 +3482,11 @@ enum Prefetch<'a> {
 }
 
 /// One pick's reads as a reader thread needs them, all owned: each part's
-/// files, windows and aligned spans ([`read_of`]).
+/// files, windows and aligned spans ([`read_of`]); `None` past the layer's
+/// rows.
 struct PickRead {
     id: u32,
-    parts: [PartRead; PARTS],
+    parts: [Option<PartRead>; PARTS],
 }
 
 /// One part's reads: its codes' run (a part's one run) into the part's
@@ -3519,26 +3537,29 @@ impl RunRead {
 /// planes matrix's block scales into the window after its codes'.
 fn read_of(arena: &LayerArena, p: &Pick) -> PickRead {
     let slot_off = arena.slot_off(p.slot);
+    let parts = arena.parts_of(p.id);
     PickRead {
         id: p.id,
         parts: std::array::from_fn(|part| {
-            let r = arena.parts[p.id as usize][part];
+            let r = parts.get(part)?;
             let at = slot_off + arena.windows[part];
             let codes = RunRead::of(arena.file(r.codes.shard), at, r.codes);
             let scales = r
                 .scales
                 .map(|s| RunRead::of(arena.file(s.shard), at + window_bytes(r.codes.len, 0), s));
-            PartRead { codes, scales }
+            Some(PartRead { codes, scales })
         }),
     }
 }
 
-/// One part of a pick, read into that part's windows. The pick owns its
-/// slot (the books marked it Filling, and no claim takes a filling slot)
-/// and this writes only this part's windows of it. The three parts are
-/// disjoint, so they run together.
+/// One part of a pick, read into that part's windows; nothing for a part
+/// the layer does not hold. The pick owns its slot (the books marked it
+/// Filling, and no claim takes a filling slot) and this writes only this
+/// part's windows of it. The parts are disjoint, so they run together.
 fn read_part(mem: &ArenaMem, r: &PickRead, part: usize) -> Result<(), GpuError> {
-    read_part_of(mem, r.id, &r.parts[part])
+    r.parts[part]
+        .as_ref()
+        .map_or(Ok(()), |p| read_part_of(mem, r.id, p))
 }
 
 /// Part `part` of expert `id`: its codes' run, then a planes matrix's block
@@ -3587,10 +3608,10 @@ fn step_read(buf: &StepBuf, unit: usize) -> Result<(), GpuError> {
         };
         (read.id, read.parts[unit % PARTS].clone())
     };
-    read_part_of(&buf.mem, id, &part)
+    part.map_or(Ok(()), |part| read_part_of(&buf.mem, id, &part))
 }
 
-/// One pick's three parts, read one after another on this thread. The pool
+/// One pick's parts, read one after another on this thread. The pool
 /// and the reader call [`read_part`] instead, one unit a part. A slot an
 /// eviction handed over keeps its pages: the reads overwrite the bytes they
 /// place and no page is returned and faulted in again, and the bytes of a
@@ -3619,7 +3640,7 @@ fn count_fill(
 ) {
     let mut bytes = 0u64;
     for p in picks {
-        for r in arena.parts[p.id as usize].iter().flat_map(PartRange::runs) {
+        for r in arena.parts_of(p.id).iter().flat_map(PartRange::runs) {
             bytes += r.len as u64;
             if !arena.file(r.shard).is_direct() {
                 stats.buffered_reads.fetch_add(1, Ordering::Relaxed);
@@ -5764,6 +5785,89 @@ mod tests {
         assert_eq!(got, want, "a stack of one file run cuts it evenly");
     }
 
+    /// A relu² layer's arena holds two parts an expert, its up and its
+    /// down, in a slot of their two windows: the leg's `[gate, up, down]`
+    /// names its up in the gate slot again ([`NvTier::note_parts`]), so
+    /// parts 0 and 1 lend the up's bytes and part 2 the down's, every fill
+    /// reads the two runs alone, and a drop names the two rows. A gated
+    /// layer's three rows refuse that leg by name (its gate row unnamed).
+    /// FAIL-first: the arena's three parts an expert refused the leg ("names
+    /// the plan's row twice").
+    #[test]
+    fn a_relu2_layer_pages_its_up_and_its_down() {
+        use super::NvTier;
+        use engram::direct::DirectFile;
+        use model::moe::TierSlots;
+        use model::placement::workstation::ArenaGrant;
+        use std::sync::Arc;
+        const LEN: usize = 3000;
+        let scratch = Scratch::new("relu2");
+        let split = split_in(&scratch);
+        let path = scratch.0.join("rows");
+        let bytes: Vec<u8> = (0..2 * 4 * LEN).map(|i| (i % 253) as u8 + 1).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let files = shards_of([Arc::new(DirectFile::open_buffered(&path).unwrap())]);
+        let at = |row: usize, id: usize| (row * 4 + id) * LEN;
+        let layer = |rows: usize| {
+            let mut arena = arena_of(4, 0);
+            arena.rows = rows;
+            arena.names = ["up", "down", "gate"].map(String::from);
+            arena.windows = [0, window_bytes(LEN, 0), 2 * window_bytes(LEN, 0)];
+            arena.slot_bytes = rows * window_bytes(LEN, 0);
+            arena.parts = (0..4)
+                .map(|id| {
+                    std::array::from_fn(|row| {
+                        let (_, _, need) = aligned_span(at(row, id) as u64, LEN as u64);
+                        one_run(0, at(row, id) as u64, LEN, need - LEN)
+                    })
+                })
+                .collect();
+            arena.files = Arc::clone(&files);
+            arena
+        };
+        let carve = |arena: super::LayerArena| {
+            let slots = [arena.slot_bytes];
+            NvTier::carve(
+                vec![Some(arena)],
+                &slots,
+                2,
+                ArenaGrant::whole((2 * slots[0]) as u64),
+                0,
+                &split,
+                super::ArenaKind::Anon,
+            )
+            .expect("the tier's carve")
+        };
+        let gated = carve(layer(3));
+        let refused = gated
+            .note_parts(0, &["up", "up", "down"])
+            .expect_err("a gated layer's leg names its gate");
+        assert!(
+            refused
+                .to_string()
+                .contains("name none of the plan's row gate"),
+            "{refused}"
+        );
+        let tier = carve(layer(2));
+        tier.note_parts(0, &["up", "up", "down"])
+            .expect("a relu² leg's up in the gate slot again");
+        assert_eq!(tier.slot_set(), 2 * window_bytes(LEN, 0) as u64);
+        for id in [1u32, 3] {
+            tier.ensure(0, &[id]).expect("the fill");
+            let _pin = tier.pin(0, &[id]).expect("a filled id pins");
+            let row = |r: usize| Some(&bytes[at(r, id as usize)..at(r, id as usize) + LEN]);
+            for (part, want) in [(0, row(0)), (1, row(0)), (2, row(1))] {
+                assert_eq!(
+                    TierSlots::slot(&tier, 0, id, part),
+                    want,
+                    "expert {id} part {part}: the up twice, then the down"
+                );
+            }
+        }
+        assert_eq!(tier.stats().fill_bytes, 2 * 2 * LEN as u64);
+        assert_eq!(tier.drop_region(0).unwrap().len(), 2, "one drop a row");
+    }
+
     /// `devmap` over the tier's own carve ([`NvTier::carve`]): two paged
     /// layers, so the second's base is past 0, each stack row its own file
     /// and range, the leg's parts resolved to other rows (`[2, 0, 1]`), and
@@ -7344,6 +7448,7 @@ mod tests {
         super::LayerArena {
             host: 0..0,
             n_expert,
+            rows: PARTS,
             windows: [0; PARTS],
             slot_bytes: DIRECT_ALIGN,
             base: 0,

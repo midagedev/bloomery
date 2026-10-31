@@ -67,8 +67,8 @@ pub enum LegOff {
     ExpertTier,
     /// The page carries more than one column a row.
     Cols,
-    /// A covered layer's stacks are of a type no arena entry takes, or read
-    /// from the r8 sidecar.
+    /// A covered layer's stacks are of a type no arena entry takes, read
+    /// from the r8 sidecar, or of a form no gate·up rule runs (relu²).
     Types,
     /// A covered layer's part does not start on a 4-byte word in its slot,
     /// where the arena entries read it.
@@ -134,9 +134,10 @@ pub(super) struct LegLayer {
 
 impl LegLayer {
     /// The entries for `layer`'s `[gate, up, down]` stack types; `None` when
-    /// an arena entry is missing for one of them, or a stack is read in
+    /// an arena entry is missing for one of them, a stack is read in
     /// another row layout than its file's (the r8 sidecar's), whose bytes
-    /// the arena's slots then hold.
+    /// the arena's slots then hold, or the layer's form has no gate·up rule
+    /// ([`rule_of`]).
     fn of(host: &HostLayer, fault: FaultSink) -> Option<LegLayer> {
         if host.layouts().iter().any(|l| *l != RowLayout::Rows) {
             return None;
@@ -152,18 +153,23 @@ impl LegLayer {
             GgmlType::Q6_K => DownAtEntry::Q6k,
             _ => return None,
         };
-        let rule = match host.form() {
-            ExpertForm::GatedOai { alpha, limit } => Act::SwigluOai { alpha, limit },
-            ExpertForm::Gated { .. } | ExpertForm::Relu2 => Act::SwigluClamp {
-                limit: host.swiglu_limit(),
-            },
-        };
         Some(LegLayer {
             gate_up,
             down,
-            rule,
+            rule: rule_of(host.form())?,
             fault,
         })
+    }
+}
+
+/// The gate·up rule the card leg's kernels run for a layer of `form`: the
+/// gated forms'; `None` for relu², whose `relu(up·x)²` no gate·up kernel
+/// runs, so its layer keeps the host leg.
+fn rule_of(form: ExpertForm) -> Option<Act> {
+    match form {
+        ExpertForm::GatedOai { alpha, limit } => Some(Act::SwigluOai { alpha, limit }),
+        ExpertForm::Gated { limit } => Some(Act::SwigluClamp { limit }),
+        ExpertForm::Relu2 => None,
     }
 }
 
@@ -538,5 +544,34 @@ impl ArenaLeg {
         self.slots.enqueue_card_acc(stream, &c, acc)?;
         self.elem
             .enqueue_add(stream, &r.hsum, acc, self.hidden, &mut sums[row])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rule_of;
+    use crate::kquant::Act;
+    use model::ops::ExpertForm;
+
+    /// A gated layer runs its own rule on the card leg, and a relu² layer
+    /// none: the leg's gate·up kernels would read its up as a gate.
+    /// FAIL-first: a relu² layer took the clamped SwiGLU.
+    #[test]
+    fn a_relu2_layer_has_no_card_leg_rule() {
+        assert_eq!(
+            rule_of(ExpertForm::Gated { limit: 7.0 }),
+            Some(Act::SwigluClamp { limit: 7.0 })
+        );
+        assert_eq!(
+            rule_of(ExpertForm::GatedOai {
+                alpha: 1.702,
+                limit: 7.0
+            }),
+            Some(Act::SwigluOai {
+                alpha: 1.702,
+                limit: 7.0
+            })
+        );
+        assert_eq!(rule_of(ExpertForm::Relu2), None);
     }
 }

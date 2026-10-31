@@ -220,6 +220,16 @@
 //!   coldest count again. Under `tick` the transient's miss takes the first
 //!   id, the least recently used, and the tier counts nothing. A tier that
 //!   evicts by tick alone under `heat` takes the first id: red.
+//! - `relu2` (clause 16): a relu² layer's two parts an expert through the
+//!   tier, on the real file: the paged plan with every gate stack left out
+//!   pages each layer's up and down alone, the tier's build carves slots of
+//!   those two windows (the placement's slot set, [`ArenaFloor::of`]), and
+//!   the first paged layer's ups and downs served as relu² experts
+//!   (`HostLayer::build_relu2`, the leg's up in its gate slot again) give
+//!   through the attached tier the bits the file mapping gives, its fills
+//!   reading two parts an expert. FAIL-first: the tier refused a layer of
+//!   two routed stacks by name ("not 3"), and the relu² leg refused the
+//!   tier at every entry.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -2268,6 +2278,7 @@ fn run() -> Result<(), GateError> {
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
     pass &= evict_clause(path, &plan)?;
+    pass &= relu2_clause(path, &plan);
     let least = ArenaFloor::of(&plan)?;
     let grant_terms = GrantTerms::of(
         plan.host.nvme_arena_bytes,
@@ -3235,6 +3246,128 @@ fn evict_clause(path: &Path, plan: &model::placement::Plan<'_>) -> Result<bool, 
         pass &= ok;
     }
     Ok(pass)
+}
+
+/// `relu2` (clause 16): the up and the down of `plan`'s paged layers as a
+/// relu² layer's two parts through a tier of the floor's own arena (the
+/// module doc); a refusal on the way is the clause's red, by name.
+fn relu2_clause(path: &Path, plan: &model::placement::Plan<'_>) -> bool {
+    let run = || -> Result<bool, GateError> {
+        use bloomery_gpu::host::run::{HostRun, HostWidths};
+        use model::arch::names::routed_stacks;
+        use model::moe::{HostLayer, HostScratch, Relu2Spec};
+        use model::placement::Role;
+        use model::r8file::R8Source;
+        let model = plan.model;
+        let mut two = plan.clone();
+        two.rows.retain(|r| {
+            let t = &model.tensors[r.tensor];
+            t.role != Role::RoutedExperts || t.layer.is_none_or(|l| routed_stacks(l)[0] != t.name)
+        });
+        let least = ArenaFloor::of(&two)?;
+        two.host.nvme_arena_bytes = least.bytes;
+        let split = Arc::new(Split::open(path)?);
+        let tier = NvTier::of_paged(
+            &two,
+            &split,
+            true,
+            ArenaGrant::whole(least.bytes),
+            ArenaKind::Anon,
+            NvTierEvict::Tick,
+        )?
+        .map(Arc::new)
+        .ok_or("the two-part plan built no tier")?;
+        let layer = (0..model.layers)
+            .find(|&l| tier.covers(l))
+            .ok_or("the two-part plan pages no layer")?;
+        let [_, up, down] = routed_stacks(layer);
+        let dims = &model
+            .tensors
+            .iter()
+            .find(|t| t.name == up)
+            .ok_or_else(|| format!("no tensor {up}"))?
+            .dims;
+        let (embd, ff) = (dims[0] as usize, dims[1] as usize);
+        let list: Vec<(u32, f32)> = (0..model.experts as u32)
+            .filter(|&id| tier.serves(layer, id))
+            .take(model.experts_used as usize)
+            .zip(1..)
+            .map(|(id, i)| (id, 1.0 / i as f32))
+            .collect();
+        let spec = Relu2Spec {
+            up: &up,
+            down: &down,
+            n_expert: model.experts as usize,
+            embd,
+            ff,
+        };
+        let widths = HostWidths {
+            embd,
+            ff,
+            n_used: list.len(),
+        };
+        let build = || {
+            HostRun::build_at(Arc::clone(&split), [layer], false, widths, |src| {
+                HostLayer::build_relu2(src, &spec).map(|l| vec![l])
+            })
+        };
+        let mapped = build()?;
+        let mut tiered = build()?;
+        tiered.attach_tier(Some(Arc::clone(&tier)))?;
+        let x = model::Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd).map(|i| ((i % 13) as f32 - 6.0) / 8.0).collect(),
+        );
+        let mut scratch = HostScratch::new(embd, ff, list.len())?;
+        let mut sum = |run: &HostRun| -> Result<Vec<u32>, GateError> {
+            let mut out = vec![0.0f32; embd];
+            run.layer(layer)?.experts_into(
+                R8Source::rows(&split),
+                &x,
+                &list,
+                &mut out,
+                &mut scratch,
+            )?;
+            Ok(out.iter().map(|v| v.to_bits()).collect())
+        };
+        let (want, got) = (sum(&mapped)?, sum(&tiered)?);
+        let s = tier.stats();
+        let part_bytes = |name: &str| -> Result<u64, GateError> {
+            let t = model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .ok_or_else(|| format!("no tensor {name}"))?;
+            Ok(t.file_bytes / model.experts)
+        };
+        let two_parts = part_bytes(&up)? + part_bytes(&down)?;
+        let slots = tier.slot_set() == least.slot_set;
+        let bits = got == want;
+        let fills = s.fills == list.len() as u64 && s.fill_bytes == s.fills * two_parts;
+        println!(
+            "relu2: layer {layer}'s {up} and {down} paged as relu² experts: a slot set of {} B \
+             (the floor's {}: {}), experts {:?} through the tier the mapping's bits ({}), {} \
+             fills of {} B ({} B an expert's two parts: {})",
+            tier.slot_set(),
+            least.slot_set,
+            verdict(slots),
+            list.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            verdict(bits),
+            s.fills,
+            s.fill_bytes,
+            two_parts,
+            verdict(fills)
+        );
+        Ok(slots && bits && fills)
+    };
+    match run() {
+        Ok(pass) => pass,
+        Err(e) => {
+            println!("relu2: refused: {e}: FAIL");
+            false
+        }
+    }
 }
 
 /// `refuse` (clause 4): each refusal by name before any load. The room
