@@ -404,7 +404,7 @@ mod gate {
             ("add".into(), 3 * routed.len() + 2 * (layers - routed.len())),
             // every layer's ffn_norm and the head's final norm.
             ("rms_norm".into(), layers + 1),
-            ("qwen3moe_router_route".into(), routed.len()),
+            ("softmax_router_route".into(), routed.len()),
             ("iq1_s_gate_up_sel".into(), ty_count(case, "iq1_s")),
             ("iq1_s_gemv_sel".into(), ty_count(case, "iq1_s_down")),
             ("iq2_xxs_gate_up_sel".into(), ty_count(case, "iq2_xxs")),
