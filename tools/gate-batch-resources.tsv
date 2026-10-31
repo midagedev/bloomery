@@ -78,6 +78,7 @@ gate-gpu-glm5next-stagger	-	173015891968
 gate-gpu-serve-start-glm	-	8600000000
 gate-gpu-serve-start-ds41	-	15000000000
 gate-gpu-musespark-e2e	-	204000000000
+gate-gpu-mistrallarge4-e2e	-	1073741824
 gate-gpu-musespark-prefill	-	204000000000
 gate-gpu-musespark-load	-	204000000000
 gate-gpu-musespark-serve	-	203000000000

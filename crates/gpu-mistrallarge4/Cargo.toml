@@ -1,0 +1,24 @@
+[package]
+name = "bloomery-gpu-mistrallarge4"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+# The Mistral Large 4 program: host code only, no `#[cuda_module]` of its own. It composes the
+# kernels of `bloomery-gpu` (the norms, the LayerNorm, the rope, the fused key append, the 576-wide
+# latent flash, the q8_0 gemvs, the softmax router, the i-quant `_sel` experts, the head) and of
+# `bloomery-gpu-deepseek41` (the lightning indexer, the selected 512-wide walk); it is built with
+# `cargo oxide` because those crates are.
+[dependencies]
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41" }
+# Host only: the header read, the load-time row move and the context bound.
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-model = { path = "../model" }
+bloomery-models = { path = "../models" }
