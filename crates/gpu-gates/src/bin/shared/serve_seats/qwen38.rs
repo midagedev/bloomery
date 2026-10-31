@@ -3473,13 +3473,14 @@ impl Seat for Q38 {
         last: u32,
         history: &mut Vec<u32>,
         sampler: &mut serve::Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
         self.before_call();
         let sel = self.s.selected();
         let d = self
             .drafts
-            .pass_sampled(&mut self.s, sel, last, history, sampler, out)?;
+            .pass_sampled(&mut self.s, sel, last, history, sampler, best, out)?;
         self.read_ahead(out)?;
         self.print_passes()?;
         Ok(d)

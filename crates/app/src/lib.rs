@@ -34,6 +34,7 @@ pub mod dspark;
 pub mod mtp;
 pub mod warm;
 
+use bloomery_gpu::best;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::ResetReport;
@@ -372,6 +373,7 @@ impl<B: Open> Loaded<B> {
             slots_waiting: None,
             logits: Vec::new(),
             pass: Vec::new(),
+            best: BestRows::default(),
             round: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
@@ -381,12 +383,61 @@ impl<B: Open> Loaded<B> {
 
 /// The rows of a verify waiting for their commit, and whether a row read
 /// ([`RowLogits::row_logits`]) has fetched the pass's head into the
-/// session's copy.
+/// session's copy, and a best read ([`RowLogits::row_best`]) its rows' best.
 #[derive(Clone, Copy, Debug)]
 struct RowsInFlight {
     first: u32,
     m: usize,
     fetched: bool,
+    best_fetched: bool,
+}
+
+/// A pass's row read as its best logits ([`GpuModel::pass_best_into`]) and
+/// the row a pick reads in its place: the best logits at their ids, every
+/// other id at -inf. Each buffer is grown once and reused.
+#[derive(Default)]
+struct BestRows {
+    /// The pass's rows' words as the first best read of the pass fetched them.
+    stage: Vec<u32>,
+    /// The words of the row read last ([`best::ROW_WORDS`]).
+    words: Vec<u32>,
+    /// The row a pick reads.
+    row: Vec<f32>,
+    /// The ids `row` holds a logit at; every other id is -inf.
+    ids: Vec<u32>,
+}
+
+impl BestRows {
+    /// `words` as the row a pick reads, the last row's ids back at -inf first.
+    /// Refused by name for a row holding a NaN, as a whole row's read is, and
+    /// for an id past the vocabulary.
+    fn row(&mut self, n_vocab: usize, r: usize, pos: u32) -> Result<&[f32], SessionError> {
+        if let Some(i) = best::row_nan(&self.words) {
+            return Err(nan_row(r, i as usize, pos));
+        }
+        if self.row.len() != n_vocab {
+            self.row.clear();
+            self.row.resize(n_vocab, f32::NEG_INFINITY);
+            self.ids.clear();
+        }
+        for &id in &self.ids {
+            self.row[id as usize] = f32::NEG_INFINITY;
+        }
+        self.ids.clear();
+        for (id, v) in best::row_pairs(&self.words) {
+            let at = self.row.get_mut(id as usize).ok_or_else(|| {
+                SessionError::Refused(format!("row {r}'s best names id {id} past {n_vocab} ids"))
+            })?;
+            *at = v;
+            self.ids.push(id);
+        }
+        Ok(&self.row)
+    }
+}
+
+/// The refusal of row `r`, whose logit `i` is NaN after position `pos`.
+fn nan_row(r: usize, i: usize, pos: u32) -> SessionError {
+    SessionError::Refused(format!("row {r}'s logit {i} is NaN after position {pos}"))
 }
 
 /// One model on its card behind [`Target`] and [`Verify`].
@@ -410,6 +461,9 @@ pub struct Session<B: ChainBody> {
     /// The pass's head as a row read fetched it ([`GpuModel::pass_row_into`]),
     /// grown once and reused.
     pass: Vec<f32>,
+    /// The pass's rows as best reads take them ([`RowLogits::row_best`],
+    /// [`Session::slots_best`]).
+    best: BestRows,
     /// The requested rows' logits of the last round of several slots' steps
     /// ([`Session::step_slots_rounds`]), packed, grown to the widest round
     /// once and reused.
@@ -433,6 +487,7 @@ impl<B: ChainBody> Session<B> {
             slots_waiting: None,
             logits: Vec::new(),
             pass: Vec::new(),
+            best: BestRows::default(),
             round: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
@@ -443,10 +498,7 @@ impl<B: ChainBody> Session<B> {
     /// it holds a NaN, as a step's row is.
     fn read_row(&self, r: usize) -> Result<&[f32], SessionError> {
         if let Some(i) = self.logits.iter().position(|v| v.is_nan()) {
-            return Err(SessionError::Refused(format!(
-                "row {r}'s logit {i} is NaN after position {}",
-                self.model.pos()
-            )));
+            return Err(nan_row(r, i, self.model.pos()));
         }
         Ok(&self.logits)
     }
@@ -697,6 +749,20 @@ where
         self.read_row(r)
     }
 
+    /// Row `r` of the last pass of several slots read as its best logits
+    /// ([`GpuModel::slots_best_into`]): the row a sampled window whose pick
+    /// needs only a row's best draws from, its [`best::BEST`] best logits in
+    /// place and every other id at -inf. `fetched` as [`Session::slots_row`]
+    /// takes it, for the pass's best reads. Refused as `slots_row` refuses.
+    pub fn slots_best(&mut self, r: usize, fetched: bool) -> Result<&[f32], SessionError> {
+        let n_vocab = self.model.n_vocab()?;
+        self.best.words.resize(best::ROW_WORDS, 0);
+        self.model
+            .slots_best_into(r, &mut self.best.stage, fetched, &mut self.best.words)?;
+        let pos = self.model.pos();
+        self.best.row(n_vocab, r, pos)
+    }
+
     /// Keep each slot's first `kept[i]` rows of the pass waiting for its
     /// commit, in the pass's order ([`GpuModel::commit_slots`]). Refused by
     /// name with no pass waiting; a count the model refuses leaves the pass
@@ -939,6 +1005,7 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
             first,
             m: M,
             fetched: false,
+            best_fetched: false,
         });
         Ok(out)
     }
@@ -1002,6 +1069,29 @@ impl<B: Prompt + Keep + Rows + Rollback> RowLogits for Session<B> {
         }
         self.read_row(r)
     }
+
+    /// Row `r` of the verify waiting for its commit read as its best logits
+    /// ([`GpuModel::pass_best_into`]: the pass's rows' best read at the first
+    /// row asked), the row's [`best::BEST`] best logits in place and every
+    /// other id at -inf; a step's row 0 is read whole
+    /// ([`RowLogits::row_logits`]). Refused as `row_logits` refuses.
+    fn row_best(&mut self, r: usize) -> Result<&[f32], SessionError> {
+        let Some(f) = &mut self.rows else {
+            return self.row_logits(r);
+        };
+        let n_vocab = self.model.n_vocab()?;
+        self.best.words.resize(best::ROW_WORDS, 0);
+        self.model.pass_best_into(
+            f.m,
+            r,
+            &mut self.best.stage,
+            f.best_fetched,
+            &mut self.best.words,
+        )?;
+        f.best_fetched = true;
+        let pos = self.model.pos();
+        self.best.row(n_vocab, r, pos)
+    }
 }
 
 /// The capture of a verify pass of each width, `log` told of each.
@@ -1057,8 +1147,42 @@ impl<B: Prompt + Keep + Rows + Rollback> Session<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArmFailed, SessionError, clearable, round_passes, run_arms};
-    use bloomery_gpu::{Fault, FaultSite, GpuError};
+    use super::{ArmFailed, BestRows, SessionError, clearable, round_passes, run_arms};
+    use bloomery_gpu::{Fault, FaultSite, GpuError, best};
+
+    /// A best read's row holds its own list alone: the row read before it is
+    /// back at -inf, and a list naming an id past the vocabulary or a row
+    /// holding a NaN is refused by name.
+    #[test]
+    fn a_best_row_holds_its_own_list() {
+        let words = |pairs: &[(u32, f32)], nan: u32| {
+            let mut w = vec![u32::MAX; best::ROW_WORDS];
+            for (k, &(id, v)) in pairs.iter().enumerate() {
+                (w[k], w[best::BEST + k]) = (v.to_bits(), id);
+            }
+            w[2 * best::BEST] = nan;
+            w
+        };
+        let n = f32::NEG_INFINITY;
+        let mut b = BestRows {
+            words: words(&[(3, 2.0), (1, 1.0)], u32::MAX),
+            ..BestRows::default()
+        };
+        assert_eq!(b.row(5, 0, 7).unwrap(), [n, 1.0, n, 2.0, n]);
+        b.words = words(&[(0, 0.5)], u32::MAX);
+        assert_eq!(b.row(5, 1, 7).unwrap(), [0.5, n, n, n, n]);
+        for (w, why) in [
+            (words(&[(5, 1.0)], u32::MAX), "past 5 ids"),
+            (words(&[(0, 1.0)], 4), "is NaN"),
+        ] {
+            b.words = w;
+            let e = b.row(5, 2, 7).unwrap_err();
+            assert!(
+                matches!(&e, SessionError::Refused(m) if m.contains(why)),
+                "{e:?}"
+            );
+        }
+    }
 
     /// The slot each row a draft walks after a round came from, a list per
     /// entry of `entries` (a slot and its rows), with the round cut within

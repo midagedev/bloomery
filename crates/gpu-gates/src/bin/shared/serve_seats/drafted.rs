@@ -38,14 +38,15 @@
 use app::mtp::{MtpBody, MtpDraft, Parked, SlotWalks};
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::best;
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::model::{Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode, Wall};
 use runtime::{
-    Advance, Argmax, Committed, Draft, Lookup, Pick, Plain, RowLogits, Sample, Speculative, Target,
-    Verify, Want, WidthError, Widths, Window,
+    Advance, Argmax, Committed, Draft, Lookup, Pick, Plain, RowLogits, Sample, SampleBest,
+    Speculative, Target, Verify, Want, WidthError, Widths, Window,
 };
 use serve::{DraftProps, Drafted, EngineProps, Sampler};
 
@@ -62,8 +63,18 @@ pub(crate) type History<T> = fn(&T) -> Option<&[u32]>;
 pub(crate) enum Taking<'a> {
     /// The row's argmax.
     Argmax,
-    /// Drawn from the row's logits.
+    /// Drawn from the row's logits, read whole.
     Sample(&'a mut dyn FnMut(&[f32]) -> u32),
+    /// Drawn from the row read as its best logits, for a draw that reads only
+    /// those ([`reads_best`]).
+    SampleBest(&'a mut dyn FnMut(&[f32]) -> u32),
+}
+
+/// Whether a draw that reads at most `best` of a row's best logits
+/// (`serve::Engine::advance_sampled`'s `best`) takes each row as the card's
+/// best read of it ([`bloomery_gpu::best`]), which holds [`best::BEST`].
+pub(crate) fn reads_best(best: Option<usize>) -> bool {
+    best.is_some_and(|k| k <= best::BEST)
 }
 
 /// A slot's lookup window behind its width chooser, as [`Lookups`] drives
@@ -121,6 +132,9 @@ where
             Taking::Argmax => pass_in_turn(self, t, last, &mut Argmax, out),
             Taking::Sample(f) => {
                 pass_in_turn(self, t, last, &mut Sample(|row: &[f32]| f(row)), out)
+            }
+            Taking::SampleBest(f) => {
+                pass_in_turn(self, t, last, &mut SampleBest(|row: &[f32]| f(row)), out)
             }
         }?)
     }
@@ -920,8 +934,14 @@ where
     /// One sampled pass on `slot`, the session's selected one, from `last`
     /// (`serve::Engine::advance_sampled`): [`SlotDrafts::pass_taking`] with
     /// each row's id drawn by `sampler` from that row's logits, given
-    /// `history` and the ids this pass took before it. `history` comes back
-    /// as it was given.
+    /// `history` and the ids this pass took before it; each row read as its
+    /// best logits when the sampler reads at most `best` of them and the
+    /// card's best read holds that many ([`reads_best`]). `history` comes
+    /// back as it was given.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the sampled pass's operands, as `Seat::pass_sampled` names them"
+    )]
     pub(crate) fn pass_sampled(
         &mut self,
         s: &mut Session<B>,
@@ -929,6 +949,7 @@ where
         last: u32,
         history: &mut Vec<u32>,
         sampler: &mut Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
         let from = history.len();
@@ -937,9 +958,11 @@ where
             history.push(id);
             id
         };
-        let d = match &mut self.lookups {
-            Some(l) => l.pass(s, slot, last, Taking::Sample(&mut draw), out),
-            None => self.pass_taking(s, slot, last, &mut Sample(&mut draw), out),
+        let d = match (&mut self.lookups, reads_best(best)) {
+            (Some(l), true) => l.pass(s, slot, last, Taking::SampleBest(&mut draw), out),
+            (Some(l), false) => l.pass(s, slot, last, Taking::Sample(&mut draw), out),
+            (None, true) => self.pass_taking(s, slot, last, &mut SampleBest(&mut draw), out),
+            (None, false) => self.pass_taking(s, slot, last, &mut Sample(&mut draw), out),
         };
         history.truncate(from);
         d
@@ -1162,6 +1185,20 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Duration;
+
+    /// A draw takes the card's best read only when it reads no more of a
+    /// row's best than the read holds.
+    #[test]
+    fn a_draw_reads_best_up_to_the_cards_list() {
+        let b = best::BEST;
+        let cases = [
+            (Some(1), true),
+            (Some(b), true),
+            (Some(b + 1), false),
+            (None, false),
+        ];
+        assert_eq!(cases.map(|(k, _)| reads_best(k)), cases.map(|(_, r)| r));
+    }
 
     /// Each side keeps its kind and bytes, and is taken only under that draft.
     #[test]

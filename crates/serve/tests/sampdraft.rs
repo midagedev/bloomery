@@ -394,6 +394,53 @@ fn hw_a_banned_id_drafts() {
     );
 }
 
+/// A pass whose rows hold only the best logits its request reads
+/// ([`DraftMock::with_best_rows`], every other id at -inf, the read an engine
+/// that reads a row's best gives) takes the plain twin's ids under the
+/// server's chain: `top_k` alone, penalties that lower (the window's ids
+/// counted in), a penalty that can raise and a positive bias (both read the
+/// whole row), a penalized greedy request, and a bias and `ignore_eos` that
+/// lower ids (counted in).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_pass_of_best_rows_takes_the_plain_ids() {
+    let (dlog, plog) = (log(), log());
+    let chain = serve::sampling::sampler_factory;
+    let best = drafting(4096).with_best_rows().logged(Arc::clone(&dlog));
+    let drafted = start_sampling(Box::new(best), 1, chain());
+    let plain = drafting(4096).without_sampled().logged(Arc::clone(&plog));
+    let plain = start_sampling(Box::new(plain), 1, chain());
+    let id = |c: &str| serve::MockTokenizer.encode(c)[0].to_string();
+    // The mock's rows: the predicted id at 4, its other followers at 2, every
+    // other id at -8. A penalty over the last ids, a lift of `z` over the
+    // followers and a cut of `b` each move ids across the best `top_k`.
+    let cases = [
+        json!({"top_k": 3}),
+        json!({"top_k": 40, "top_p": 0.9}),
+        json!({"top_k": 3, "repeat_penalty": 3.0, "presence_penalty": 0.5, "repeat_last_n": 2}),
+        json!({"top_k": 3, "presence_penalty": -9.0, "repeat_last_n": 2}),
+        json!({"top_k": 3, "logit_bias": {id("z"): 11.0}}),
+        json!({"top_k": 3, "logit_bias": {id("b"): -7.0, id("c"): -7.0}, "ignore_eos": true}),
+        json!({"temperature": 0, "repeat_penalty": 3.0, "repeat_last_n": 2}),
+        json!({"temperature": 0, "logit_bias": {id("b"): -100, id("c"): -100}}),
+    ];
+    for extra in cases {
+        for seed in 1..=4u64 {
+            let mut body = sampled(BRANCHY, 40, 1.0, seed);
+            body.as_object_mut()
+                .expect("a body")
+                .extend(extra.as_object().expect("extra").clone());
+            let (want, w) = ids_of(plain, &body);
+            let (got, v) = ids_of(drafted, &body);
+            assert_eq!(got, want, "{body}: {v}");
+            assert!(draft_counts(&v).0 > 0, "{body}: the request drafted: {v}");
+            assert_eq!(draft_counts(&w), (0, 0), "{body}: the plain twin drafted");
+        }
+        assert!(count(&drain(&dlog), MockCall::Sampled) > 0, "{extra}");
+        drain(&plog);
+    }
+}
+
 /// A request with a `logit_bias` drafts, greedy and sampled, and takes the
 /// plain twin's ids: its passes draw from the verified rows with the bias
 /// added, as its steps do. -100 on `c` keeps every `c` out, +3 on `d` lifts
@@ -722,9 +769,10 @@ impl Engine for Alters {
         last: u32,
         history: Vec<u32>,
         sampler: Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
-        let (d, mut history, sampler) = self.0.advance_sampled(last, history, sampler, out);
+        let (d, mut history, sampler) = self.0.advance_sampled(last, history, sampler, best, out);
         if self.1 == 0
             && let Some(id) = history.last_mut()
         {
@@ -773,6 +821,7 @@ fn a_round_rejects_a_changed_history_and_restores_its_sampler() {
         draw: Some(serve::SlotDraw {
             history: &history,
             sampler: &mut sampler,
+            best: None,
         }),
     }];
     let e = engine
@@ -841,9 +890,10 @@ impl Engine for Keeps {
         last: u32,
         history: Vec<u32>,
         sampler: Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
-        self.0.advance_sampled(last, history, sampler, out)
+        self.0.advance_sampled(last, history, sampler, best, out)
     }
     fn drafts_sampled(&self) -> bool {
         self.0.drafts_sampled()

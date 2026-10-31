@@ -1212,6 +1212,9 @@ pub struct DraftMock {
     log: Option<Arc<Mutex<Vec<MockCall>>>>,
     /// Blocks every `prefill` until it opens, when [`DraftMock::holding`].
     hold: Option<Arc<Hold>>,
+    /// Whether a sampled pass hands its sampler rows cut to the best logits
+    /// it reads ([`DraftMock::with_best_rows`]).
+    best_rows: bool,
 }
 
 /// A hold on a mock's prompt calls: until it opens, every `prefill` blocks,
@@ -1292,6 +1295,7 @@ impl DraftMock {
             proposals: vec![0],
             log: None,
             hold: None,
+            best_rows: false,
         }
     }
 
@@ -1308,6 +1312,18 @@ impl DraftMock {
             inner: self.inner.with_slots(n),
             passes: vec![0; n],
             proposals: vec![0; n],
+            ..self
+        }
+    }
+
+    /// The same drafting mock handing each sampled pass's sampler the rows
+    /// cut to the `best` logits it reads ([`Engine::advance_sampled`]), every
+    /// other id at -inf, as an engine that reads a row's best does; and the
+    /// whole rows where it reads them whole.
+    #[must_use]
+    pub fn with_best_rows(self) -> Self {
+        DraftMock {
+            best_rows: true,
             ..self
         }
     }
@@ -1377,6 +1393,7 @@ impl DraftMock {
         last: u32,
         history: &mut Vec<u32>,
         sampler: &mut Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, EngineError> {
         if !self.sampled {
@@ -1405,6 +1422,11 @@ impl DraftMock {
             };
             draft.push(fed);
         }
+        if let (true, Some(k)) = (self.best_rows, best) {
+            for row in rows.chunks_exact_mut(n_vocab) {
+                keep_best(row, k);
+            }
+        }
         let n = history.len();
         for (i, row) in rows.chunks_exact(n_vocab).enumerate() {
             let id = sampler(row, history);
@@ -1420,6 +1442,22 @@ impl DraftMock {
             proposed: self.n_draft,
             accepted: out.len() - 1,
         })
+    }
+}
+
+/// `row` with its `k` best logits in place, the larger first and the lower id
+/// among equals (a NaN below every number), and every other id at -inf.
+fn keep_best(row: &mut [f32], k: usize) {
+    let key = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        key(row[b])
+            .partial_cmp(&key(row[a]))
+            .expect("no NaN is left")
+            .then(a.cmp(&b))
+    });
+    for &i in order.iter().skip(k) {
+        row[i] = f32::NEG_INFINITY;
     }
 }
 
@@ -1480,10 +1518,11 @@ impl Engine for DraftMock {
         last: u32,
         mut history: Vec<u32>,
         mut sampler: Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
         self.record(MockCall::Sampled);
-        let d = self.pass_sampled(last, &mut history, &mut sampler, out);
+        let d = self.pass_sampled(last, &mut history, &mut sampler, best, out);
         (d, history, sampler)
     }
 

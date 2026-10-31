@@ -339,16 +339,20 @@ pub trait Engine: Send {
     /// last taken id. `history` and `sampler` come back with the outcome. The
     /// sampler's draws are exactly one per appended id, as one
     /// [`Engine::next`] and one sample per token give them, so a drafted and
-    /// a plain run of one seed take the same ids. Called only when
+    /// a plain run of one seed take the same ids. `best` is the most of a
+    /// row's best logits `sampler` reads, `None` the whole row: an engine may
+    /// hand it each row with that many best logits in place and every other
+    /// id at -inf, which it draws the same id from. Called only when
     /// [`Engine::drafts_sampled`]; the default refuses by name.
     fn advance_sampled(
         &mut self,
         last: u32,
         history: Vec<u32>,
         sampler: Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
-        let _ = (last, &out);
+        let _ = (last, best, &out);
         (
             Err(EngineError(
                 "this engine does not draft a sampled request".to_string(),
@@ -749,13 +753,15 @@ pub struct SlotPass<'a> {
 }
 
 /// What a sampled row of [`Engine::advance_slots`] draws with: the ids its
-/// draws see (the prompt's tail then the generated ids so far), and the
+/// draws see (the prompt's tail then the generated ids so far), the
 /// request's sampler, which the engine takes for the call and puts back,
-/// its state moved one draw a kept id. The server refuses a row whose
-/// sampler did not come back.
+/// its state moved one draw a kept id, and the most of a row's best logits
+/// the sampler reads ([`Engine::advance_sampled`]'s `best`). The server
+/// refuses a row whose sampler did not come back.
 pub struct SlotDraw<'a> {
     pub history: &'a [u32],
     pub sampler: &'a mut Option<Sampler>,
+    pub best: Option<usize>,
 }
 
 impl fmt::Debug for SlotDraw<'_> {
@@ -763,6 +769,7 @@ impl fmt::Debug for SlotDraw<'_> {
         f.debug_struct("SlotDraw")
             .field("history", &self.history.len())
             .field("sampler", &self.sampler.is_some())
+            .field("best", &self.best)
             .finish()
     }
 }
@@ -785,7 +792,7 @@ pub(crate) fn advance_row<E: Engine + ?Sized>(
         ))
     })?;
     let (d, back, sampler) =
-        engine.advance_sampled(row.last, draw.history.to_vec(), sampler, row.out);
+        engine.advance_sampled(row.last, draw.history.to_vec(), sampler, draw.best, row.out);
     *draw.sampler = Some(sampler);
     let d = d?;
     if back != draw.history {
@@ -1299,6 +1306,27 @@ impl SamplingParams {
                 || self.frequency_penalty != 0.0
                 || self.presence_penalty != 0.0)
     }
+
+    /// The most of a row's best logits llama.cpp's chain reads: the `top_k`
+    /// best after the penalties (the best one at temperature 0), and one more
+    /// for each id the window can penalize, which can make room for the next.
+    /// `None`, the whole row, for `top_k <= 0` and for a penalty that can
+    /// raise a logit (a repeat penalty under 1, a negative frequency or
+    /// presence penalty).
+    pub(crate) fn best_read(&self) -> Option<usize> {
+        let k = if self.temperature <= 0.0 {
+            1
+        } else {
+            usize::try_from(self.top_k).ok().filter(|&k| k > 0)?
+        };
+        if !self.penalizes() {
+            return Some(k);
+        }
+        let lowers = self.repeat_penalty >= 1.0
+            && self.frequency_penalty >= 0.0
+            && self.presence_penalty >= 0.0;
+        lowers.then(|| k.saturating_add(self.repeat_last_n))
+    }
 }
 
 /// One request's sampler: `(logits, the history a draw sees) -> id` — the
@@ -1314,7 +1342,9 @@ pub struct SamplerRefused(pub String);
 
 /// Builds a sampler per request, or refuses its parameters. The real one comes
 /// from the sampler crate; the server ships [`crate::sampling::reference_factory`]
-/// so it runs without it.
+/// so it runs without it. A sampler follows llama.cpp's chain: it reads a
+/// row's best logits alone ([`SamplingParams::best_read`]), so a drafted pass
+/// may hand it rows holding only those ([`Engine::advance_sampled`]).
 pub type SamplerFactory =
     Arc<dyn Fn(&SamplingParams) -> Result<Sampler, SamplerRefused> + Send + Sync>;
 
