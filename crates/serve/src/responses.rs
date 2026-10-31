@@ -1501,14 +1501,13 @@ pub(super) fn stored(state: &State, req: &Request, w: &mut TcpStream) -> io::Res
 #[derive(Default)]
 struct Frames {
     sequence: u64,
-    opened: bool,
 }
 
 impl Frames {
     /// `response.created` and `response.in_progress` the first time, nothing
     /// after.
-    fn opening(&mut self, ids: &Ids) -> Vec<Value> {
-        if std::mem::replace(&mut self.opened, true) {
+    fn opening(&self, ids: &Ids) -> Vec<Value> {
+        if self.sequence != 0 {
             return Vec::new();
         }
         vec![
@@ -1623,15 +1622,15 @@ fn stream(
     // error is the request's own answer, and a client gone ends the answer
     // as is ([`finish_stream`]).
     let r = match (stream.is_some(), r) {
-        (true, Err(e)) => Ok(Ok(Ending::Failed(e))),
+        (true, Err(e)) => Ok(Ok(Err(e))),
         (true, Ok(Err(GenError::Client(e)))) => Ok(Err(GenError::Client(e))),
-        (true, Ok(Err(e))) => Ok(Ok(Ending::Failed(engine_error(&e)))),
-        (_, r) => r.map(|r| r.map(Ending::Done)),
+        (true, Ok(Err(e))) => Ok(Ok(Err(engine_error(&e)))),
+        (_, r) => r.map(|r| r.map(Ok)),
     };
     finish_stream(req, stream, w_opt, r, |s, ending| {
         let o = match ending {
-            Ending::Done(o) => o,
-            Ending::Failed(e) => return frames.fail(s, ids, e),
+            Ok(o) => o,
+            Err(e) => return frames.fail(s, ids, e),
         };
         let mut events = frames.opening(ids);
         match parser.try_finish_at(o.cut()) {
@@ -1652,13 +1651,6 @@ fn stream(
         events.push(end);
         frames.send(s, events)
     })
-}
-
-/// How a stream that has sent its head ends: with the generation's outcome,
-/// or with the failure [`Frames::fail`] frames.
-enum Ending {
-    Done(Outcome),
-    Failed(ApiError),
 }
 
 #[cfg(test)]
@@ -3117,5 +3109,26 @@ mod tests {
                 .expect("the chat path's error frame is JSON");
             assert_eq!(error["error"]["message"], message, "{script:?}: {error}");
         }
+
+        // A stop string the whole generation is a prefix of holds every token until the end, so the refused
+        // call is the first text the stream would send: the opening pair still comes before `response.failed`.
+        let addr = scripted(BAD);
+        let body = json!({
+            "input": "hi",
+            "stream": true,
+            "stop": format!("{BAD}x"),
+            "tools": [{"type": "function", "name": "get_weather"}],
+        });
+        let (status, stream) = post_stream(addr, "/v1/responses", &body);
+        let f = frames(status, &stream);
+        assert_eq!(
+            kinds(&f),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.failed"
+            ],
+            "{stream}"
+        );
     }
 }
