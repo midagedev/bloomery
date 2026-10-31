@@ -15236,7 +15236,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",
     )
     left = [n for n, _ in host_left_out(tree, lock_now)]
-    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-flint", "bloomery-gpu-gates", "bloomery-gpu-gemma-embedding2", "bloomery-gpu-gemma4a", "bloomery-gpu-glm5next", "bloomery-gpu-mimo2", "bloomery-gpu-minimaxm3", "bloomery-gpu-solar2", "bloomery-gpu-vision"], f"host nightly: left out {left}")
+    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-flint", "bloomery-gpu-gates", "bloomery-gpu-gemma-embedding2", "bloomery-gpu-gemma4a", "bloomery-gpu-glm5next", "bloomery-gpu-mimo2", "bloomery-gpu-minimaxm3", "bloomery-gpu-mistrallarge4", "bloomery-gpu-solar2", "bloomery-gpu-vision"], f"host nightly: left out {left}")
     expect(not nightly_problems(tree, lock_now), f"host nightly: {nightly_problems(tree, lock_now)}")
     ran = {u for u, _ in host_units(tree, lock_now)}
     expect(

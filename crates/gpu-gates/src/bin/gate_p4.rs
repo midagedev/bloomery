@@ -1094,6 +1094,113 @@ fn run() -> Result<(), GateError> {
 
     ok &= norm_geometry()?;
 
+    // =========================================================== ln_rows
+    // `y = gain·LayerNorm(x, eps) + bias` over m rows of k values, the
+    // biased LayerNorm of Mistral Large 4's indexer (its `q_norm` over the
+    // hidden row). No oracle row: synthetic rows at the family's two hidden
+    // widths (the fixture's 1,024 and the real file's 6,144), the mean and
+    // variance mirrored in f64 op for op (the lightning index key's own
+    // order), each output's two products and sum rounded on their own, and a
+    // bit-identical rerun. A row holding an inf leaves every value NaN and
+    // raises `F32Product`.
+    {
+        use bloomery_gpu::FaultSite;
+        let ln_ref = |x: &[f32], gain: &[f32], bias: &[f32], eps: f32| -> Vec<f32> {
+            let k = x.len();
+            let mean = (x.iter().map(|&v| f64::from(v)).sum::<f64>() / k as f64) as f32;
+            let var = ((0..k)
+                .map(|i| {
+                    let dev = x[i] - mean;
+                    f64::from(dev * dev)
+                })
+                .sum::<f64>()
+                / k as f64) as f32;
+            let scale = 1.0 / (var + eps).sqrt();
+            (0..k)
+                .map(|i| (((x[i] - mean) * scale) * gain[i]) + bias[i])
+                .collect()
+        };
+        for (label, k, m) in [
+            ("k1024", 1024usize, 1usize),
+            ("k6144", 6144, 1),
+            ("k1024_m3", 1024, 3),
+        ] {
+            let n = k * m;
+            let x = activations(n, 1, 9500 + k as u32 + m as u32);
+            let (gain, bias): (Vec<f32>, Vec<f32>) = (
+                (0..k).map(|i| 0.5 + ((i % 17) as f32) / 17.0).collect(),
+                (0..k).map(|i| -0.4 + ((i % 13) as f32) / 13.0).collect(),
+            );
+            let eps = 1e-6_f32;
+            let x_dev = DeviceBuffer::from_host(stream, &x)?;
+            let gain_dev = DeviceBuffer::from_host(stream, &gain)?;
+            let bias_dev = DeviceBuffer::from_host(stream, &bias)?;
+            let mut y_dev = DeviceBuffer::zeroed(stream, n)?;
+            elem.enqueue_ln_rows(
+                stream,
+                &x_dev,
+                &gain_dev,
+                &bias_dev,
+                eps,
+                k,
+                m,
+                gpu.unlabelled_sink(),
+                &mut y_dev,
+            )?;
+            stream.synchronize()?;
+            let y = y_dev.to_host_vec(stream)?;
+            elem.enqueue_ln_rows(
+                stream,
+                &x_dev,
+                &gain_dev,
+                &bias_dev,
+                eps,
+                k,
+                m,
+                gpu.unlabelled_sink(),
+                &mut y_dev,
+            )?;
+            stream.synchronize()?;
+            let rerun = bits_equal(&y, &y_dev.to_host_vec(stream)?);
+            let want: Vec<f32> = (0..m)
+                .flat_map(|t| ln_ref(&x[t * k..(t + 1) * k], &gain, &bias, eps))
+                .collect();
+            let band = (0..n).fold(0.0f32, |w, i| {
+                w.max((y[i] - want[i]).abs() / want[i].abs().max(1e-3))
+            });
+            // A row holding an inf: every value NaN, the fault F32Product.
+            let mut bad = x.clone();
+            bad[k / 2] = f32::INFINITY;
+            let bad_dev = DeviceBuffer::from_host(stream, &bad)?;
+            let mut bad_y = DeviceBuffer::zeroed(stream, k)?;
+            elem.enqueue_ln_rows(
+                stream,
+                &bad_dev,
+                &gain_dev,
+                &bias_dev,
+                eps,
+                k,
+                1,
+                gpu.unlabelled_sink(),
+                &mut bad_y,
+            )?;
+            stream.synchronize()?;
+            let refused = bad_y.to_host_vec(stream)?.iter().all(|v| v.is_nan())
+                && gpu
+                    .take_fault()?
+                    .is_some_and(|f| f.code == FaultSite::F32Product as u32);
+            let pass = band <= PLAIN_BAND * 64.0 && rerun && refused;
+            println!(
+                "ln_rows {label}: band {band:.3e} (band {:.0e})",
+                PLAIN_BAND * 64.0
+            );
+            ok &= pass;
+            if !pass {
+                println!("ln_rows {label} FAIL");
+            }
+        }
+    }
+
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
     }

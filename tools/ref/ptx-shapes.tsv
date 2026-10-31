@@ -393,9 +393,11 @@ generate_ds41   kq_gate_up_act_q5k_tiles                 0           0
 generate_ds41   kq_gate_up_act_q8_0                      0           0
 generate_ds41   kv_append                                0           0
 generate_ds41   kv_append_pos_buf                        0           0
+generate_ds41   kv_gather_sel                            0           0
 generate_ds41   kv_norm_rope_append                      0           0
 generate_ds41   latent_extra_rms_append                  0           0
 generate_ds41   latent_rms_append                        0           0
+generate_ds41   ln_rows                                  0           0
 generate_ds41   mamba2_conv_rows                         0           0
 generate_ds41   mamba2_norm_rows                         0           0
 generate_ds41   mamba2_ring_tail                         0           0
