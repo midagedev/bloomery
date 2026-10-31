@@ -67,7 +67,7 @@ use crate::q8_1_quant_vals;
 use crate::q8f32::{f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums};
 use crate::route_core::take;
 use crate::tensor::{DeviceTensor, Q8Act};
-use crate::{GpuError, launch_u32};
+use crate::{GpuError, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -381,53 +381,6 @@ unsafe fn publish_route(
     }
 }
 
-/// Lane 0's stores of one expert row's `m` column logits, token-major:
-/// `y[c · rows + r] = sums[c]`. One guarded store per column with a constant
-/// index: a loop over `c` would index `sums` at run time and put it in a
-/// local depot. `r` may carry a token offset (`t0 · rows + row`), which
-/// moves every store by whole rows.
-///
-/// # Safety
-///
-/// `1 <= m <= 8`, `(m − 1) · rows + r < y.len()`, and no other thread
-/// writes those slots.
-#[inline(always)]
-pub(crate) unsafe fn store_cols(
-    y: &mut DisjointSlice<f32>,
-    r: usize,
-    rows: usize,
-    m: usize,
-    sums: &[f32; 8],
-) {
-    let [s0, s1, s2, s3, s4, s5, s6, s7] = *sums;
-    // SAFETY: each store is guarded by c < m, so its slot c·rows + r is one
-    // this fn's contract puts inside y and gives to this thread alone.
-    unsafe {
-        *y.get_unchecked_mut(r) = s0;
-        if m > 1 {
-            *y.get_unchecked_mut(rows + r) = s1;
-        }
-        if m > 2 {
-            *y.get_unchecked_mut(2 * rows + r) = s2;
-        }
-        if m > 3 {
-            *y.get_unchecked_mut(3 * rows + r) = s3;
-        }
-        if m > 4 {
-            *y.get_unchecked_mut(4 * rows + r) = s4;
-        }
-        if m > 5 {
-            *y.get_unchecked_mut(5 * rows + r) = s5;
-        }
-        if m > 6 {
-            *y.get_unchecked_mut(6 * rows + r) = s6;
-        }
-        if m > 7 {
-            *y.get_unchecked_mut(7 * rows + r) = s7;
-        }
-    }
-}
-
 /// The norm-fused entries' body for token `t`, up to the routing, at `rows`
 /// router rows, one block per router row: `fused::norm_quant` on row `t` of
 /// `x` with the same cores in the same order, in every block — phase A its
@@ -594,7 +547,7 @@ pub(crate) unsafe fn norm_row_body<const PREFETCH: bool>(
         if lane == 0 {
             // SAFETY: t·rows + row < (t + 1)·rows <= logits.len() (this fn's
             // contract); lane 0 of the row's warp is the slot's only writer.
-            unsafe { store_cols(logits, t * rows + row, rows, 1, &sums) };
+            unsafe { store_cols(logits, t * rows + row, rows, 1, sums) };
         }
     }
 }
@@ -684,7 +637,7 @@ mod qwen3moe_router_kernels {
                 // SAFETY: row < WIDTH and 1 <= m <= 8, so the slots c·128 +
                 // row (c < m) lie inside logits (launch contract); lane 0 of
                 // the row's warp is their only writer.
-                unsafe { store_cols(&mut logits, row, WIDTH, m, &sums) };
+                unsafe { store_cols(&mut logits, row, WIDTH, m, sums) };
             }
         }
         // SAFETY: LAST and P are this block's own shared allocations of 1

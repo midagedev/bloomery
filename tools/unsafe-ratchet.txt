@@ -736,7 +736,7 @@ gguf 7 2 0
 # shared body (`gemm::swiglu::swiglu_quant_block`, an unsafe fn with its two blocks, the plain and card-slots entries'
 # one owner) and the card-slots entry's reads of its refusal word and a column's place (`gemm_swiglu_quant_sel`), each
 # with its SAFETY line.
-gpu 2880 397 10
+gpu 2879 396 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
