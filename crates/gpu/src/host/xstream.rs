@@ -27,7 +27,10 @@
 //! so a grouped GEMM reads the half as a stack of `half_slots` experts. The
 //! halves alternate per streamed layer: a layer's copies wait on the copy
 //! stream for the read event of the layer two streams back
-//! ([`XStream::read`]), the last reader of that half.
+//! ([`XStream::read`]), the last reader of that half, so a stream into a
+//! half whose last stream is still open (read by fewer units than its group)
+//! is refused by name: its copies would land under the card routes still to
+//! read it.
 //!
 //! **The maps.** Per half two rows of the router's experts, in mapped host
 //! memory the card reads in place: the ring row (a streamed expert's slot
@@ -1167,7 +1170,8 @@ impl XStream {
     /// them here; the layer's card route waits each batch before the GEMM
     /// batch over its slots. A layer that streams nothing issues nothing.
     /// Refused by name: a layer with no stage stack, a layer streaming twice
-    /// before its read, a staging failure, and the rule's own refusals.
+    /// before its read, a stream into a half another layer's open stream
+    /// still holds, a staging failure, and the rule's own refusals.
     #[allow(
         clippy::too_many_arguments,
         reason = "the unit, its width and counts, the host set, the pick, the stage row and the engine stream (rust-quality R8)"
@@ -1257,6 +1261,22 @@ impl XStream {
         };
         if take > 0 {
             let half = (self.issued % HALVES as u64) as usize;
+            if let Some(held) = self
+                .cur
+                .iter()
+                .position(|b| b.as_ref().is_some_and(|b| b.half == half))
+            {
+                let g = &self.groups[held];
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!(
+                        "layer {layer} streams into half {half}, which layer {held}'s stream \
+                         still holds (read by {} of its {} units)",
+                        g.reads,
+                        g.units.len()
+                    ),
+                ));
+            }
             self.write_rows(half, stage, n_card)?;
             self.write_land_rows(layer);
             let (bytes, backlog) = self.issue(layer, half)?;

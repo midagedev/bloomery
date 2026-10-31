@@ -36,6 +36,13 @@
 //!   is issued and the host waits [`HOST_WAIT`] before it lets the engine go: the
 //!   held copy reads the first stream's bytes, not the next one's (its
 //!   mutant: the copies do not wait for the half's read event).
+//! - held half: with layer 0's stream open and the engine stream held by a
+//!   host flag ahead of a copy of its half, layer 1 streams, is read, and
+//!   streams again, into the half layer 0's stream still holds: refused by
+//!   name, and the held copy reads layer 0's bytes; once layer 0 is read,
+//!   layer 1 streams into that half (its mutant: the refusal dropped, whose
+//!   copies wait on the half's last read event, an earlier stream's, and
+//!   land under the held copy).
 //! - serve set: a layer's exclusion set stands after its stream's read (the
 //!   batch order serves a unit's layer after its card route) for that
 //!   unit's serve alone — another unit of the layer (one the walk takes no
@@ -628,6 +635,54 @@ mod gate {
         );
         ok &= shared_ok;
 
+        // held half: layer 1's second stream takes the half layer 0's open
+        // stream holds.
+        flags.clear(0)?;
+        x.begin_call();
+        let ca4 = counts(UNIT_A);
+        let want_0 = want_set(&x, 0, &ca4)?;
+        let open_0 = unit(&mut x, stream, 0, &ca4)?.streamed;
+        let r0 = x
+            .ring_layer(0)
+            .ok_or("a ring view of a layer that streamed")?;
+        flags.enqueue_wait(stream, 0)?;
+        x.wait_layer(stream, 0)?;
+        snapshot(stream, &r0, r0.n, &snap)?;
+        let cb2 = counts(UNIT_B);
+        let _ = unit(&mut x, stream, 1, &cb2)?;
+        x.read(1, stream)?;
+        let refused_held = match unit(&mut x, stream, 1, &cb2) {
+            Err(e) => {
+                let s = e.to_string();
+                s.contains("layer 0's stream still holds") && s.contains("read by 0 of its 1")
+            }
+            // A stream the refusal let through is read, so the clause goes on
+            // to the held copy.
+            Ok(_) => {
+                x.read(1, stream)?;
+                false
+            }
+        };
+        std::thread::sleep(HOST_WAIT);
+        flags.raise(0)?;
+        let held_0 = snap.to_host_vec(stream)?;
+        x.read(0, stream)?;
+        let after_read = unit(&mut x, stream, 1, &cb2)?.streamed;
+        x.read(1, stream)?;
+        x.end_call()?;
+        let held_ok = open_0 == want_0.len()
+            && refused_held
+            && bytes_match(&src, 0, &want_0, &held_0)
+            && after_read > 0;
+        println!(
+            "held half: a stream into the half layer 0's open stream holds refused by name \
+             {refused_held}; the held copy reads layer 0's bytes {}; after layer 0's read layer 1 \
+             streams {after_read} into it {}",
+            bytes_match(&src, 0, &want_0, &held_0),
+            verdict(held_ok)
+        );
+        ok &= held_ok;
+
         // fronts: layer 0 of two units in the walk's declared order, the
         // lane held past the first unit's shadow.
         let new_event = || ctx.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
@@ -818,7 +873,8 @@ mod gate {
                 "gate_xstream: PASS — the stream is the rule's set cut at the half in rank order, \
                  its rows and exclusion set say so, the engine stream reads a batch's slots only \
                  once that batch's copies have landed (a batch a third of them), a half's next \
-                 stream waits for the half's read, an unread stream refuses the call's end, \
+                 stream waits for the half's read and a stream into a half an open stream \
+                 holds is refused by name, an unread stream refuses the call's end, \
                  units of a layer share its stream and close it at the last read, the \
                  walk's order marks a unit's front before its sibling's landing, a \
                  stuck lane is a named error within its deadline, a ring with no room is \
