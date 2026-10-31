@@ -46,9 +46,9 @@ pub const GEMM_TILE_COLS: usize = 64;
 pub const GEMM32_STEP: usize = 64;
 
 /// Card bytes of the q8 blocks of 32 of `cols` columns of `k` values (Q8_0 and Q5_0 sites' input,
-/// `GemmAct32`): per column `16 + 2 + 2` words a step of [`GEMM32_STEP`] values.
+/// `GemmAct32`, [`gemm_act32_bytes`](crate::placement::kernels::gemm_act32_bytes)).
 const fn act32_bytes(cols: usize, k: usize) -> usize {
-    4 * cols * 20 * k.div_ceil(GEMM32_STEP)
+    crate::placement::kernels::gemm_act32_bytes(cols as u64, k as u64) as usize
 }
 
 /// The most card bytes the forms a GEMM reads take at `k` values a column, `cols` columns: both,

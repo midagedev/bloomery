@@ -264,10 +264,11 @@ fn state38(ctx: u64, drafts: bool) -> u64 {
 /// key rings ([`state38`]'s term).
 const CHECKPOINT_38: u64 = 36 * 4_126_736 + 17 * 4 * 2560 * 4 + 12 * 11 * 128 * 2;
 
-/// The stage card of `qwen35moe::place::machine_for_experts(spec, 48, 4096,
-/// Experts::Card)`: every layer, the head and the token embedding, its
-/// scratch the m = 1 scratch, the ubatch walk's and its card route's at
-/// 4,096 positions (the box gate's `CARD_ROUTE_SCRATCH` row).
+/// The stage card of `qwen35moe::place::machine_for_experts(spec,
+/// Stack::q8_blocks32(48), 4096, Experts::Card)`: every layer, the head and
+/// the token embedding, its scratch the m = 1 scratch, the ubatch walk's and
+/// its card route's at 4,096 positions (the box gate's `CARD_ROUTE_SCRATCH`
+/// row).
 fn stage(spec: CardSpec) -> Card {
     Card {
         name: spec.name.to_string(),

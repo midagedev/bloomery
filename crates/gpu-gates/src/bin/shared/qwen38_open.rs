@@ -122,8 +122,7 @@ impl<'a> Open38<'a> {
         inputs.kv = inputs.kv.in_q8_if(self.kv == KvQ8::Q8);
         let ub = u64::try_from(self.ub)?;
         let form = inputs.route_form(bloomery_gpu::NATIVE_FP4);
-        let mut machine =
-            machine_for_route(self.card, inputs.spec.layers.len(), ub, self.experts, form);
+        let mut machine = machine_for_route(self.card, inputs.stack(), ub, self.experts, form);
         let drafts = false;
         inputs.reserve_room(
             &mut machine,

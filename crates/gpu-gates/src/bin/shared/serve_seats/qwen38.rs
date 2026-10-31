@@ -738,7 +738,7 @@ impl Place38 {
         (experts, levers, mtp, slots): (Experts, &PlanLevers, Option<&MtpInputs>, usize),
         read: impl Fn(&Plan<'_>) -> T,
     ) -> Result<(Machine, T), GateError> {
-        let layers = inputs.spec.layers.len();
+        let layers = inputs.stack();
         let form = inputs.route_form(bloomery_gpu::NATIVE_FP4);
         let mut machine = match self.kind {
             Kind38::A | Kind38::Gate => machine_for_route(self.spec()?, layers, ub, experts, form),

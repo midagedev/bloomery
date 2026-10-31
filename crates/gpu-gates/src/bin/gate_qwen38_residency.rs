@@ -250,7 +250,7 @@ mod gate {
     /// with why it did not.
     fn residency_machine(inputs: &PlanInputs, ub: usize) -> Result<Machine, GateError> {
         let card = tier::real_card(Place::A.on(&bloomery_gpu::census()?)?.card_specs()?[0]);
-        let layers = inputs.spec.layers.len();
+        let layers = inputs.stack();
         let at = |c: CardSpec| machine_for_experts(c, layers, ub as u64, Experts::Card);
         let why_not = |m: &Machine| -> Result<Option<String>, GateError> {
             let plan = match plan_of(inputs, m) {

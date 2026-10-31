@@ -10,7 +10,7 @@ use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx_of, short_in};
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use model::arch::qwen35moe::place::{
-    Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_bp_on, tier_batch,
+    Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, Stack, machine_bp_on, tier_batch,
 };
 use model::placement::ctx_ask::{Chosen, Probe};
 use model::placement::workstation::{DeviceInfo, TierBatchBytes};
@@ -56,7 +56,7 @@ pub(crate) struct Residents {
 /// refused by name.
 pub fn machine_bp38(
     place: Place,
-    layers: usize,
+    layers: Stack,
     ub: u64,
     draft: Option<u64>,
     batch: TierBatchBytes,
@@ -95,7 +95,7 @@ pub fn tier_experts(
     let slots = seqs.slots;
     let mut machine = machine_bp38(
         place,
-        inputs.spec.layers.len(),
+        inputs.stack(),
         ub,
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
         tier_batch(&inputs.spec, ub),

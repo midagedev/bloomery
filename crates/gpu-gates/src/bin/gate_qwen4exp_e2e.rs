@@ -4824,12 +4824,7 @@ mod gate {
         let file = open_split()?;
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let machine = machine_for_experts(
-            card()?,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-            experts,
-        );
+        let machine = machine_for_experts(card()?, inputs.stack(), u64::try_from(ub)?, experts);
         let ctx = CTX as u64;
         let shape = (ctx, u64::try_from(ub)?);
         let plan_levers = &cfg().plan_levers;

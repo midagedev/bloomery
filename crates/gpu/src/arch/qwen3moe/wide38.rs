@@ -12,13 +12,11 @@
 //!   (`quantize_gemm32`; the shared expert's down from `swiglu_quant32`);
 //! - the F32 matrices (β and α, the indexer's key and query) the wide F32
 //!   tile, bit for bit the decode path's gemv for each row and token;
-//! - a dense site of a type that reads q8_1 rows (a K-quant: the file's own
-//!   type of that site) has no wide GEMM here: it projects by name in chunks
-//!   of [`BY_NAME_COLS`] columns ([`project_chunks`]: the quantization, the
-//!   K-quant gemv and the token-major copy of each chunk), each column bit
-//!   for bit the step's one-column launch, and the weight is read once a
-//!   chunk. On a layer with such a site in its shared expert the three
-//!   projections run so, the SwiGLU once over every row;
+//! - a dense site of another type its wide GEMM over the same table
+//!   ([`site::resident_gemm`]): a K-quant the grouped GEMM over the rows' q8_1
+//!   blocks of 128, NVFP4 the 32-value GEMM, MXFP8 and BF16 the dense MMA
+//!   tile; the walk's rows hold the forms their sites read and no other
+//!   ([`site::DenseActs`]);
 //! - the router the ubatch instance of the 512-expert router, in runs of
 //!   [`ROUTE_ROWS`] tokens, bit for bit the fused launch for each token;
 //! - the routed experts the slot map puts on the card, on a layer with card
@@ -220,10 +218,7 @@ use crate::q38::{
     W_PITCH,
 };
 use crate::qsa::{self, KeyAppendArgs, PoolArgs, SelectArgs};
-use crate::site::{
-    self, BY_NAME_COLS, ByName, Form, Gated, GatedIo, Out, SiteWeight, SwigluRows, WideIn,
-    WideKernels,
-};
+use crate::site::{self, DenseActs, Gated, GatedIo, SiteWeight, SwigluRows, WideKernels};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
@@ -1534,13 +1529,13 @@ pub(super) struct Wide38 {
     /// second, on an arena of two rows or more, for the second unit of a
     /// split walk, at most half of them.
     dense: Vec<GemmRoute>,
-    /// q8 of the model-width rows (a mix's output, the PLE rows, the shared
-    /// expert's input), of the attention-width rows (the output projections'
-    /// input), and of the shared expert's SwiGLU, each with room for the
-    /// [`WideForms`] its sites read.
-    act_hid: GemmAct32,
-    act_attn: GemmAct32,
-    act_ff: GemmAct32,
+    /// The quantized forms of the model-width rows (a mix's output, the PLE
+    /// rows, the shared expert's input), of the attention-width rows (the
+    /// output projections' input), and of the shared expert's SwiGLU, each
+    /// those its sites read with room for the [`WideForms`] they copy.
+    act_hid: DenseActs,
+    act_attn: DenseActs,
+    act_ff: DenseActs,
     hc: HcWideScratch,
     /// Every token's `N_USED + 1` slots: the routed ids and weights the
     /// download reads, the shared expert's weight the gated sum reads.
@@ -1580,6 +1575,9 @@ pub(super) struct WideForms {
     hid: Vec<MmaForm>,
     attn: Vec<MmaForm>,
     ff: Vec<MmaForm>,
+    /// The quantized forms the sites of the model-width, attention-width and
+    /// SwiGLU rows read ([`site::resident_wants`]).
+    wants: [site::WideForms; 3],
     hc_bf16: bool,
 }
 
@@ -1611,22 +1609,10 @@ impl WideForms {
             hid: read(&hid, &[MmaForm::Bf16, MmaForm::Mxfp8]),
             attn: read(&attn, &[MmaForm::Mxfp8]),
             ff: read(&ff, &[MmaForm::Mxfp8]),
+            wants: [&hid, &attn, &ff].map(|sites| site::resident_wants(w, sites)),
             hc_bf16,
         })
     }
-}
-
-/// A [`GemmAct32`] of `cols` columns of `k` values with room for `forms`.
-fn act_with(
-    stream: &CudaStream,
-    (cols, k): (usize, usize),
-    forms: &[MmaForm],
-) -> Result<GemmAct32, GpuError> {
-    forms
-        .iter()
-        .try_fold(GemmAct32::new(stream, cols, k)?, |act, &f| {
-            act.with_form(stream, f)
-        })
 }
 
 impl Wide38 {
@@ -1664,9 +1650,9 @@ impl Wide38 {
         Ok(Wide38 {
             rows,
             dense,
-            act_hid: act_with(stream, (rows, geo::HIDDEN), &forms.hid)?,
-            act_attn: act_with(stream, (rows, geo::ATTN), &forms.attn)?,
-            act_ff: act_with(stream, (rows, geo::FF), &forms.ff)?,
+            act_hid: DenseActs::new(stream, forms.wants[0], (rows, geo::HIDDEN), &forms.hid)?,
+            act_attn: DenseActs::new(stream, forms.wants[1], (rows, geo::ATTN), &forms.attn)?,
+            act_ff: DenseActs::new(stream, forms.wants[2], (rows, geo::FF), &forms.ff)?,
             hc: HcWideScratch::new(stream, geometry, rows, forms.hc_bf16)?,
             ids: DeviceBuffer::zeroed(stream, rows * slots)?,
             weights: DeviceBuffer::zeroed(stream, rows * slots)?,
@@ -1801,16 +1787,22 @@ fn dense_kernels<'a>(c: &Ctx38<'a>) -> WideKernels<'a> {
 }
 
 /// The forms of the first `m` columns of the f32 rows `rows` that any of
-/// `names` reads into `act`: the q8 for Q8_0 planes, a [`MmaForm`] for a site
-/// on the dense MMA tile ([`site::resident_quantize`]).
+/// `names` reads into `act` ([`site::resident_quantize`]).
 fn quantize_for(
     c: &Ctx38<'_>,
     names: &[&str],
     rows: (&DeviceBuffer<f32>, usize),
-    act: &mut GemmAct32,
+    act: &mut DenseActs,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    site::resident_quantize(c.gpu, &dense_kernels(c), (c.w, names), rows, act, sink)
+    site::resident_quantize(
+        c.gpu,
+        &dense_kernels(c),
+        (c.w, names),
+        rows,
+        act.out(),
+        sink,
+    )
 }
 
 /// [`quantize_for`] unless `act` already holds the one form `names` read of
@@ -1820,76 +1812,29 @@ fn quantize_unheld(
     c: &Ctx38<'_>,
     names: &[&str],
     (rows, m): (&DeviceBuffer<f32>, usize),
-    act: &mut GemmAct32,
+    act: &mut DenseActs,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    if site::only_form(c.gpu, c.w, names, act).is_some_and(|f| act.holds(f, rows, m)) {
+    let q32 = &act.q32;
+    if site::only_form(c.gpu, c.w, names, q32).is_some_and(|f| q32.holds(f, rows, m)) {
         return Ok(());
     }
     quantize_for(c, names, (rows, m), act, sink)
 }
 
 /// `y = W · rows` for the dense weight `name` over the first `m` columns by
-/// its resident form, token-major, on the walk's one-expert table `dense`
-/// ([`site::resident_gemm`]): Q8_0 over `act`, the q8 of `rows`
-/// ([`quantize_for`]). A site that reads q8_1 rows (a K-quant) has no wide
-/// GEMM here: it runs by chunks of the by-name unit's columns
-/// ([`project_chunks`]).
+/// its resident form's wide GEMM, token-major, on the walk's one-expert table
+/// `dense` ([`site::resident_gemm`]), over the forms of `rows` in `act`
+/// ([`quantize_for`]).
 fn dense_gemm(
     c: &Ctx38<'_>,
-    bn: &mut ByName,
     name: &str,
-    (rows, act, m): (&DeviceBuffer<f32>, &GemmAct32, usize),
-    (dense, sink): (&GemmRoute, FaultSink),
+    (rows, act, m): (&DeviceBuffer<f32>, &DenseActs, usize),
+    dense: &GemmRoute,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    if reads_q8_1(c, name)? {
-        return project_chunks(c, bn, name, (rows, m), sink, y);
-    }
-    let x = wide_in(rows, act);
+    let x = act.input(rows);
     site::resident_gemm(c.gpu, &dense_kernels(c), (c.w, name), &x, dense, m, y)
-}
-
-/// Whether the dense weight `name` reads q8_1 rows (its resident type is a
-/// K-quant or NVFP4), the sites the ubatch walk projects by chunks.
-fn reads_q8_1(c: &Ctx38<'_>, name: &str) -> Result<bool, GpuError> {
-    Ok(site::resident_type(c.w, WHAT, name)?.reads() == Form::Q8x128)
-}
-
-/// `y = W · rows` for the dense weight `name` over the first `m` columns of
-/// the f32 rows `rows`, token-major, by chunks of [`BY_NAME_COLS`] columns:
-/// each chunk the by-name projection of its columns (the quantization, the
-/// K-quant gemv and the token-major copy), each column bit for bit the
-/// step's one-column launch. The weight is read once a chunk.
-fn project_chunks(
-    c: &Ctx38<'_>,
-    bn: &mut ByName,
-    name: &str,
-    (rows, m): (&DeviceBuffer<f32>, usize),
-    sink: FaultSink,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let weight = c.w.resident(WHAT, name)?;
-    let (n, k) = (weight.rows(), weight.k());
-    let f = size_of::<f32>();
-    let mut c0 = 0;
-    while c0 < m {
-        let cn = BY_NAME_COLS.min(m - c0);
-        let xs = Window::<f32>::of(rows, c0 * k * f, cn * k)?;
-        let mut ys = WindowMut::<f32>::of_mut(y, c0 * n * f, cn * n)?;
-        c.project(bn, name, &xs, cn, sink, Out::whole(&mut ys))?;
-        c0 += cn;
-    }
-    Ok(())
-}
-
-/// The f32 rows `rows` and their q8 `act`, the forms a dense site reads.
-fn wide_in<'a>(rows: &'a DeviceBuffer<f32>, act: &'a GemmAct32) -> WideIn<'a> {
-    WideIn {
-        q128: None,
-        q32: Some(act),
-        f32: Some(rows),
-    }
 }
 
 /// The wide mix of `site` over `m` columns of `res`, after `before`, into
@@ -2042,7 +1987,7 @@ impl WideParts<'_> {
                 m,
                 sink,
                 (&mut x.hc, u.wgt, &x.dense[u.route]),
-                (&mut s.mixed, readers, &mut x.act_hid),
+                (&mut s.mixed, readers, &mut x.act_hid.q32),
             )?;
         } else if let Some(pp) = &p.ple {
             if let Some(rows_in) = self.ple_rows.take() {
@@ -2055,9 +2000,8 @@ impl WideParts<'_> {
             quantize_for(c, &pp.input_sites(), e, &mut x.act_hid, sink)?;
             let dense = &x.dense[u.route];
             let act = (&*u.ple_e, &x.act_hid, m);
-            let table = (dense, sink);
-            dense_gemm(c, &mut s.by, &pp.key, act, table, &mut pl.key)?;
-            dense_gemm(c, &mut s.by, &pp.value, act, table, &mut pl.value)?;
+            dense_gemm(c, &pp.key, act, dense, &mut pl.key)?;
+            dense_gemm(c, &pp.value, act, dense, &mut pl.value)?;
             // The site reads the combined streams as F32 values and writes
             // the walk's BF16 streams.
             let xs = &*u.fin;
@@ -2104,7 +2048,7 @@ impl WideParts<'_> {
                 m,
                 sink,
                 (&mut x.hc, u.wgt, dense),
-                (&mut s.mixed, readers, &mut x.act_hid),
+                (&mut s.mixed, readers, &mut x.act_hid.q32),
             )?;
         } else {
             mix(
@@ -2115,7 +2059,7 @@ impl WideParts<'_> {
                 m,
                 sink,
                 (&mut x.hc, u.wgt, &x.dense[u.route]),
-                (&mut s.mixed, readers, &mut x.act_hid),
+                (&mut s.mixed, readers, &mut x.act_hid.q32),
             )?;
         }
         let store = self
@@ -2159,7 +2103,7 @@ impl WideParts<'_> {
             u.m,
             sink,
             (&mut x.hc, u.wgt, &x.dense[u.route]),
-            (&mut u.ffn_x, &p.ffn.shared_inputs(), &mut x.act_hid),
+            (&mut u.ffn_x, &p.ffn.shared_inputs(), &mut x.act_hid.q32),
         )
     }
 
@@ -2271,22 +2215,6 @@ impl WideParts<'_> {
         let (s, x) = (&mut *self.s, &mut *self.x);
         let f = &p.ffn;
         quantize_unheld(c, &f.shared_inputs(), (&*u.ffn_x, m), &mut x.act_hid, sink)?;
-        // A block with a site that reads q8_1 rows (a K-quant gate or up) has
-        // no wide GEMM: the three projections run by chunks, the SwiGLU once
-        // over every row (it is elementwise).
-        if reads_q8_1(c, &f.gate_sh)? || reads_q8_1(c, &f.up_sh)? || reads_q8_1(c, &f.down_sh)? {
-            let rows = (&*u.ffn_x, m);
-            project_chunks(c, &mut s.by, &f.gate_sh, rows, sink, &mut s.sh_g)?;
-            project_chunks(c, &mut s.by, &f.up_sh, rows, sink, &mut s.sh_u)?;
-            c.gpu.elem().enqueue_swiglu(
-                c.gpu.stream(),
-                &s.sh_g,
-                &s.sh_u,
-                geo::FF * m,
-                &mut s.sh_h,
-            )?;
-            return project_chunks(c, &mut s.by, &f.down_sh, (&s.sh_h, m), sink, &mut u.sh_y);
-        }
         let site = |name| -> Result<_, GpuError> {
             let ty = site::resident_type(c.w, "qwen38::wide shared", name)?;
             Ok((ty, SiteWeight::Resident(name)))
@@ -2302,14 +2230,15 @@ impl WideParts<'_> {
             rule: Act::SiluMul,
             input: GemmInput::PerSlot,
         };
-        // The SwiGLU writes the form the down's type reads: the q8 of its
-        // rows, or the f32 rows. Both are held here beside the arena's, not as
+        // The SwiGLU writes the form the down's type reads: a q8 form of its
+        // rows, or the f32 rows. They are held here beside the arena's, not as
         // one `WideActs`: `sh_h` is the gemv arm's row too.
+        let ff = &mut x.act_ff;
         let io = GatedIo {
-            x: &wide_in(&u.ffn_x, &x.act_hid),
+            x: &x.act_hid.input(&u.ffn_x),
             gate: &mut s.sh_g,
             up: &mut s.sh_u,
-            rows: SwigluRows::held(None, Some(&mut x.act_ff), Some(&mut s.sh_h)),
+            rows: SwigluRows::held(ff.q128.as_mut(), Some(&mut ff.q32), Some(&mut s.sh_h)),
             y: &mut u.sh_y,
         };
         site::gated(c.gpu, &dense_kernels(c), &block, (m, m), io, sink)
@@ -2516,26 +2445,22 @@ fn gdn(
     sink: FaultSink,
 ) -> Result<(), GpuError> {
     let (w, stream, m) = (c.w, c.gpu.stream(), u.m);
-    let nv = GDN.n_v;
     let Arena38 {
         mixed,
         gdn: g,
         attn,
-        by,
         ..
     } = s;
     quantize_unheld(c, &gp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
-    let (k, x_in) = (dense_kernels(c), wide_in(mixed, &x.act_hid));
-    let bf16 = if reads_q8_1(c, &gp.qkv)? {
-        false
-    } else {
+    let (k, x_in) = (dense_kernels(c), x.act_hid.input(mixed));
+    let bf16 = {
         let mut half = WindowMut::<u16>::of_mut(&mut g.x, 0, m * GDN.channels())?;
         site::resident_gemm_bf16(c.gpu, &k, (c.w, &gp.qkv), &x_in, dense, m, &mut half)?
     };
     if !bf16 {
-        dense_gemm(c, by, &gp.qkv, act, (dense, sink), &mut g.x)?;
+        dense_gemm(c, &gp.qkv, act, dense, &mut g.x)?;
     }
     // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
     // at load), β's rows first and α's next: one product, each row's β then
@@ -2599,56 +2524,28 @@ fn gdn(
         &mut work,
         keep,
     )?;
-    if reads_q8_1(c, &gp.z)? {
-        // A K-quant `z` has no tile epilogue to finish the norm in: the
-        // projection by chunks, the gated norm over its rows, then the forms
-        // the output projection reads.
-        project_chunks(c, by, &gp.z, (&*mixed, m), sink, &mut g.z)?;
-        lin.norm_gate.enqueue_norm_gate_sigmoid(
-            stream,
-            crate::linear::norm_gate::NormGateArgs {
+    site::resident_gemm_norm_gate(
+        c.gpu,
+        &k,
+        (w, &gp.z),
+        &x_in,
+        dense,
+        m,
+        (
+            &lin.norm_gate,
+            &mut g.z,
+            crate::linear::norm_gate::NormGateTail {
                 o: &g.o,
-                z: &g.z,
                 w: f32_gain(w, &gp.ssm_norm)?,
                 eps: c.eps,
-                n_v: nv,
-                m,
                 fault: sink,
                 y: &mut *attn,
             },
-        )?;
-        site::resident_quantize(
-            c.gpu,
-            &k,
-            (w, &[&gp.ssm_out]),
-            (&*attn, m),
-            &mut x.act_attn,
-            sink,
-        )?;
-    } else {
-        site::resident_gemm_norm_gate(
-            c.gpu,
-            &k,
-            (w, &gp.z),
-            &x_in,
-            dense,
-            m,
-            (
-                &lin.norm_gate,
-                &mut g.z,
-                crate::linear::norm_gate::NormGateTail {
-                    o: &g.o,
-                    w: f32_gain(w, &gp.ssm_norm)?,
-                    eps: c.eps,
-                    fault: sink,
-                    y: &mut *attn,
-                },
-            ),
-            (&[&gp.ssm_out], &mut x.act_attn),
-        )?;
-    }
+        ),
+        (&[&gp.ssm_out], x.act_attn.out()),
+    )?;
     let act = (&*attn, &x.act_attn, m);
-    dense_gemm(c, by, &gp.ssm_out, act, (dense, sink), &mut u.y)
+    dense_gemm(c, &gp.ssm_out, act, dense, &mut u.y)
 }
 
 /// A selecting attention layer's mixer over unit `u`'s rows and its store
@@ -2678,16 +2575,15 @@ fn qsa(
         mixed,
         qsa: q,
         attn,
-        by,
         ..
     } = s;
     quantize_unheld(c, &qp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
-    let table = (&x.dense[u.route], sink);
+    let table = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
-    dense_gemm(c, by, &qp.q, act, table, &mut q.qg)?;
-    dense_gemm(c, by, &qp.k, act, table, &mut q.k)?;
-    dense_gemm(c, by, &qp.v, act, table, &mut q.v)?;
-    dense_gemm(c, by, &qp.idx_k, act, table, &mut q.kr)?;
+    dense_gemm(c, &qp.q, act, table, &mut q.qg)?;
+    dense_gemm(c, &qp.k, act, table, &mut q.k)?;
+    dense_gemm(c, &qp.v, act, table, &mut q.v)?;
+    dense_gemm(c, &qp.idx_k, act, table, &mut q.kr)?;
     c.k.qsa.enqueue_pool(
         stream,
         PoolArgs {
@@ -2714,7 +2610,7 @@ fn qsa(
             ring: &mut *ring,
         },
     )?;
-    dense_gemm(c, by, &qp.idx_q, act, table, &mut q.qi)?;
+    dense_gemm(c, &qp.idx_q, act, table, &mut q.qi)?;
     // The append over the key heads alone: the flashes norm and turn the
     // query heads they read (`QueryNorm`).
     // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
@@ -2848,8 +2744,8 @@ fn qsa(
         r += n;
     }
     quantize_for(c, &[&qp.out], (attn, m), &mut x.act_attn, sink)?;
-    let table = (&x.dense[u.route], sink);
-    dense_gemm(c, by, &qp.out, (attn, &x.act_attn, m), table, &mut u.y)?;
+    let table = &x.dense[u.route];
+    dense_gemm(c, &qp.out, (attn, &x.act_attn, m), table, &mut u.y)?;
     Ok(split)
 }
 
@@ -3048,7 +2944,7 @@ impl<'a> Gemm38<'a> {
             m,
             fault,
             (hc, u.wgt, &dense[u.route]),
-            (&mut s.mixed, &[], act_hid),
+            (&mut s.mixed, &[], &mut act_hid.q32),
         )?;
         // Row m − 1 of `mixed` (1 <= m <= rows, the walk refused anything
         // else).

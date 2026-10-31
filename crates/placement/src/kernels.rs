@@ -180,6 +180,40 @@ const fn try_q8_blocks32_bytes(cols: u64, k: u64) -> Option<u64> {
     }
 }
 
+/// The card bytes of the q8 blocks of 32 values a wide GEMM reads (`GemmAct32`,
+/// [`SiteAct::Q8x32`] on the wide arm) for `cols` columns of `k` values: per
+/// 64-value step sixteen code words, two scales and two sums. Panics by name
+/// on a count past u64.
+#[must_use]
+pub const fn gemm_act32_bytes(cols: u64, k: u64) -> u64 {
+    match attention::wide32_bytes(cols, k) {
+        Some(bytes) => bytes,
+        None => panic!("gemm_act32_bytes: activation bytes overflow u64"),
+    }
+}
+
+/// The card bytes `cols` columns of `k` values hold in the quantized forms
+/// the wide dense sites of file types `tys` read ([`SiteEntry::reads_wide`]):
+/// the q8_1 blocks of 128 ([`q8_act_bytes`]) when one reads them, the q8
+/// blocks of 32 ([`gemm_act32_bytes`]) when one reads those or
+/// [`SiteAct::Q8Blocks32`] (whose GEMM reads the same blocks), nothing for a
+/// site of the f32 rows, which are the caller's. A type with no dense site
+/// reads no form. The one rule a load allocates its wide rows' forms by and
+/// a plan counts them by.
+#[must_use]
+pub fn wide_act_bytes(tys: impl IntoIterator<Item = GgmlType>, cols: u64, k: u64) -> u64 {
+    let forms = tys
+        .into_iter()
+        .filter_map(dense)
+        .fold(attention::Forms::default(), |forms, entry| {
+            forms.with(entry.reads_wide())
+        });
+    match forms.bytes(cols, k) {
+        Some(bytes) => bytes,
+        None => panic!("wide_act_bytes: activation bytes overflow u64"),
+    }
+}
+
 /// The down activation forms ([`DownAct`]) a card leg's buffers hold: the
 /// forms the downs of the layers a load runs on them read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -441,6 +475,26 @@ pub const fn card_k_unit(ty: GgmlType, role: Role) -> u64 {
 mod tests {
     use super::*;
     use crate::placement::CardFormat;
+
+    /// A wide input holds the forms its readers read and no other: a K-quant's
+    /// q8_1 blocks of 128, the q8 blocks of 32 of a Q8_0 or Q5_0 site and of an
+    /// NVFP4 site (its GEMM's, not its gemv's q8_1 rows), nothing for the
+    /// sites of the f32 rows (MXFP8, BF16, F32), each form once however many
+    /// readers share it.
+    #[test]
+    fn a_wide_input_holds_the_forms_its_readers_read() {
+        let (cols, k) = (3, 2560);
+        let (q128, q32) = (q8_act_bytes(cols, k), gemm_act32_bytes(cols, k));
+        assert_eq!(q32, cols * 2560 * 5 / 4);
+        let bytes = |tys: &[GgmlType]| wide_act_bytes(tys.iter().copied(), cols, k);
+        assert_eq!(bytes(&[GgmlType::MXFP8, GgmlType::BF16, GgmlType::F32]), 0);
+        assert_eq!(bytes(&[GgmlType::NVFP4]), q32);
+        assert_eq!(bytes(&[GgmlType::Q4_K, GgmlType::Q6_K]), q128);
+        assert_eq!(
+            bytes(&[GgmlType::Q4_K, GgmlType::Q8_0, GgmlType::Q5_0]),
+            q128 + q32
+        );
+    }
 
     /// Plane-padding transitions retain their byte counts, and both sizing
     /// contracts share the last representable column and aggregate boundary.

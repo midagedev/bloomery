@@ -125,10 +125,7 @@ pub fn reads_at(ty: SiteTy, k: usize) -> Form {
 /// form a [`gated`] block's SwiGLU writes follow this, so the arm's forms have one owner.
 #[must_use]
 pub fn reads_wide(ty: SiteTy) -> Form {
-    match ty {
-        SiteTy::Nvfp4 => Form::Q8x32,
-        _ => ty.reads(),
-    }
+    kernels::dense(ty.ggml()).map_or_else(|| ty.reads(), kernels::SiteEntry::reads_wide)
 }
 
 /// Where [`kgemv`] writes output `r` of column `c` of a site of `rows` rows.
@@ -1675,7 +1672,7 @@ pub(crate) fn resident_gemm_norm_gate(
         &mut DeviceBuffer<f32>,
         crate::linear::norm_gate::NormGateTail<'_>,
     ),
-    (readers, out): (&[&str], &mut GemmAct32),
+    (readers, (q128, out)): (&[&str], (Option<&mut GemmAct>, &mut GemmAct32)),
 ) -> Result<(), GpuError> {
     use crate::linear::norm_gate::{NormGateArgs, NormGateTail};
     let what = "site::resident_gemm_norm_gate";
@@ -1744,7 +1741,7 @@ pub(crate) fn resident_gemm_norm_gate(
             )?;
         }
     }
-    resident_quantize(gpu, k, (w, readers), (&*y, m), out, fault)
+    resident_quantize(gpu, k, (w, readers), (&*y, m), (q128, out), fault)
 }
 
 /// [`resident_gemm`] over rows `at .. at + n` of the resident weight `name`
@@ -1803,20 +1800,29 @@ pub(crate) fn reads_form(gpu: &Gpu, w: &Weights, names: &[&str], form: MmaForm) 
 }
 
 /// The forms of the first `m` columns of the f32 rows `x` that a site of one
-/// of the resident weights `names` reads into `q32`: the q8 blocks of 32
-/// ([`WideActs::wants`] of its type, [`of_resident`]), what [`resident_gemm`]
-/// reads for a Q8_0, Q5_0 or NVFP4 site; and each [`MmaForm`] that `q32` holds room
-/// for and a site reads ([`reads_form`], [`write_forms`]). A form no site
-/// reads is left marked as another rows', so no later site reads it.
+/// of the resident weights `names` reads ([`WideActs::wants`] of its type,
+/// [`of_resident`]): the q8_1 blocks of 128 into `q128` for a K-quant site,
+/// the q8 blocks of 32 into `q32` for a Q8_0, Q5_0 or NVFP4 site, what
+/// [`resident_gemm`] reads; and each [`MmaForm`] that `q32` holds room for and
+/// a site reads ([`reads_form`], [`write_forms`]). A form no site reads is
+/// left marked as another rows', so no later site reads it; q8_1 blocks a
+/// site reads that `q128` does not hold are refused by name.
 pub fn resident_quantize(
     gpu: &Gpu,
     k: &WideKernels<'_>,
     (w, names): (&Weights, &[&str]),
     (x, m): (&DeviceBuffer<f32>, usize),
-    q32: &mut GemmAct32,
+    (q128, q32): (Option<&mut GemmAct>, &mut GemmAct32),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    if reads_q32(w, names) {
+    if resident_wants(w, names).q128 {
+        let a = q128.ok_or(GpuError::state(
+            "site::resident_quantize",
+            "the rows' q8_1 blocks of 128 (a K-quant site reads them)",
+        ))?;
+        gpu.enqueue_quantize_gemm(x, m, a, sink)?;
+    }
+    if resident_wants(w, names).q32 {
         k.g32(
             "site::resident_quantize",
             "the 32-value kernels a site's q8 blocks of 32 are quantized by",
@@ -1830,8 +1836,8 @@ pub fn resident_quantize(
 
 /// The one [`MmaForm`] the sites of the resident weights `readers` take
 /// from `act`, when it is all they take: a reader copies it
-/// ([`reads_form`]), and none reads the q8 blocks of 32 or another form
-/// `act` holds room for. An epilogue that writes this form beside its f32
+/// ([`reads_form`]), and none reads a q8 form or another form `act` holds
+/// room for. An epilogue that writes this form beside its f32
 /// rows leaves the readers nothing to quantize.
 #[must_use]
 pub(crate) fn only_form(
@@ -1840,7 +1846,8 @@ pub(crate) fn only_form(
     readers: &[&str],
     act: &GemmAct32,
 ) -> Option<MmaForm> {
-    if reads_q32(w, readers) {
+    let wants = resident_wants(w, readers);
+    if wants.q128 || wants.q32 {
         return None;
     }
     let mut read = [MmaForm::Bf16, MmaForm::Mxfp8]
@@ -1850,14 +1857,66 @@ pub(crate) fn only_form(
     read.next().is_none().then_some(form)
 }
 
-/// Whether a site of one of the resident weights `names` reads the q8
-/// blocks of 32 ([`WideActs::wants`] of its resident type).
-fn reads_q32(w: &Weights, names: &[&str]) -> bool {
-    names.iter().any(|n| {
-        w.get(n)
-            .and_then(of_resident)
-            .is_some_and(|ty| WideActs::wants(ty).q32)
-    })
+/// The wide forms the sites of the resident weights `names` read
+/// ([`WideActs::wants`] of each resident type, [`of_resident`]).
+#[must_use]
+pub fn resident_wants(w: &Weights, names: &[&str]) -> WideForms {
+    names
+        .iter()
+        .filter_map(|n| w.get(n).and_then(of_resident))
+        .fold(WideForms::NONE, |acc, ty| acc.union(WideActs::wants(ty)))
+}
+
+/// The quantized forms of one wide input a body's resident dense sites read
+/// ([`resident_quantize`]): the q8_1 blocks of 128 when a K-quant site reads
+/// the rows, and the 32-value scratch, its q8 blocks of 32 held only when a
+/// Q8_0, Q5_0 or NVFP4 site reads them and room for each [`MmaForm`] a site
+/// copies ([`GemmAct32::with_form`]). The rule is the one a plan counts the
+/// rows by (`placement::kernels::wide_act_bytes`).
+pub struct DenseActs {
+    pub q128: Option<GemmAct>,
+    pub q32: GemmAct32,
+}
+
+impl DenseActs {
+    /// `cols` columns of `k` values in the quantized forms of `wants` (its
+    /// readers', [`resident_wants`]), with room for `forms`. Load-time only.
+    pub fn new(
+        stream: &cuda_core::CudaStream,
+        wants: WideForms,
+        (cols, k): (usize, usize),
+        forms: &[MmaForm],
+    ) -> Result<DenseActs, GpuError> {
+        let q32 = forms.iter().try_fold(
+            GemmAct32::with_planes(stream, cols, k, wants.q32)?,
+            |act, &f| act.with_form(stream, f),
+        )?;
+        Ok(DenseActs {
+            q128: wants
+                .q128
+                .then(|| GemmAct::new(stream, cols, k))
+                .transpose()?,
+            q32,
+        })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.q128.as_ref().map_or(0, GemmAct::bytes) + self.q32.bytes()
+    }
+
+    /// The forms beside the f32 rows `f32` a site picks from.
+    pub fn input<'a>(&'a self, f32: &'a DeviceBuffer<f32>) -> WideIn<'a> {
+        WideIn {
+            q128: self.q128.as_ref(),
+            q32: Some(&self.q32),
+            f32: Some(f32),
+        }
+    }
+
+    /// The quantized forms as [`resident_quantize`] writes them.
+    pub fn out(&mut self) -> (Option<&mut GemmAct>, &mut GemmAct32) {
+        (self.q128.as_mut(), &mut self.q32)
+    }
 }
 
 /// Each form `q32` holds room for of the first `m` columns of the f32 rows

@@ -270,7 +270,7 @@ mod gate {
         fn machine(&self, node: CardSpec) -> Result<Machine, GateError> {
             let own = bloomery_gpu::census()?;
             let stage = own.first().ok_or("this process sees no card")?;
-            let layers = self.inputs.spec.layers.len();
+            let layers = self.inputs.stack();
             let ub = self.ub as u64;
             Ok(machine_bp_on(
                 (spec_of_device(stage), node),
@@ -289,7 +289,7 @@ mod gate {
             let ub = self.ub as u64;
             q38place::machine_bp38(
                 Place::parse("0+1")?.on_host()?,
-                self.inputs.spec.layers.len(),
+                self.inputs.stack(),
                 ub,
                 None,
                 tier_batch(&self.inputs.spec, ub),

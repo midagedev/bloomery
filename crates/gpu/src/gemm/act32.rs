@@ -96,8 +96,9 @@ impl GemmAct32 {
         Self::with_planes(stream, cols, k, true)
     }
 
-    /// [`GemmAct32::new`]'s scratch, its Q8 planes empty unless `q8`.
-    fn with_planes(
+    /// [`GemmAct32::new`]'s scratch, its Q8 planes empty unless `q8` (a Q8
+    /// reader and a launch that stores them are then refused by name).
+    pub(crate) fn with_planes(
         stream: &CudaStream,
         cols: usize,
         k: usize,
