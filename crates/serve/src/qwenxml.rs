@@ -31,7 +31,13 @@
 //! JSON object in the model's order, serialized compactly to a string. Text
 //! before the first call, and after the calls once something other than the
 //! layout follows, is content; the whitespace a closed call's layout left is
-//! nothing, as the template writes its calls one newline apart. Markup that
+//! nothing, as the template writes its calls one newline apart. Under a
+//! template that teaches no think span ([`Framing::Coder`], Qwen3-Coder's
+//! own) the first call may also open bare, `<function=NAME>` with no
+//! `<tool_call>` before it — the omission the model now and then makes, as
+//! llama.cpp's `tool_call_first` reads it: the name must name one of the
+//! request's tools, the call still closes with `</tool_call>`, and a second
+//! call needs its own `<tool_call>`. Markup that
 //! does not parse — no function opener, no name, text where a tag belongs, a
 //! function or a parameter the request's tools do not name, one parameter
 //! twice, a value its schema types JSON that is not JSON, a boolean that is
@@ -57,7 +63,7 @@ use crate::callstream::{self, Reading, held, read_value};
 use crate::constrain::{Fun, Part, Refusal, Style, call, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
-use crate::reasoning::{Marked, SpecialTags, partial_suffix};
+use crate::reasoning::{Marked, SpecialTags, ThinkTags, partial_suffix};
 
 // The format's markup is its description's (the models crate's `function_xml`, not this crate's `models` module),
 // the strings the template table names a file's format by.
@@ -73,6 +79,11 @@ pub enum Framing {
     /// `<parameter=KEY>\nVALUE\n</parameter>`: the newline after the opener and
     /// the one before the closer (with the one after it) are the markup's own.
     Lines,
+    /// The lines framing of a template that renders no think span
+    /// (Qwen3-Coder's own): its model has no span to reason in, and its first
+    /// call may open bare, `<function=NAME>` with no `<tool_call>` before it
+    /// (llama.cpp's `tool_call_first`).
+    Coder,
     /// `<parameter=KEY>VALUE</parameter>`: the value is the bytes between the
     /// tags, whatever whitespace they hold.
     Compact,
@@ -82,7 +93,7 @@ impl Framing {
     /// What follows `<parameter=KEY>` before the value's first byte.
     const fn value_open(self) -> &'static str {
         match self {
-            Framing::Lines => "\n",
+            Framing::Lines | Framing::Coder => "\n",
             Framing::Compact => "",
         }
     }
@@ -90,7 +101,7 @@ impl Framing {
     /// The text that ends a value, and is consumed with it.
     const fn value_close(self) -> &'static str {
         match self {
-            Framing::Lines => PARAM_VALUE_CLOSE,
+            Framing::Lines | Framing::Coder => PARAM_VALUE_CLOSE,
             Framing::Compact => PARAM_CLOSE,
         }
     }
@@ -99,12 +110,14 @@ impl Framing {
     /// for `<parameter=key>` holding the string `value` in its last
     /// `<tool_call>` (the probe's call; a header's example sits before it),
     /// read with the scanner's own delimiters, so the framing found is one
-    /// the scanner closes. `None` when that call renders no such parameter,
-    /// or in a spelling that is neither.
+    /// the scanner closes; a lines framing whose render teaches no think span
+    /// (it writes no `<think>`) is [`Framing::Coder`], as llama.cpp reads the
+    /// span from the template's source. `None` when that call renders no such
+    /// parameter, or in a spelling that is neither.
     pub(crate) fn of_rendered(rendered: &str, key: &str, value: &str) -> Option<Framing> {
         let (_, call) = rendered.rsplit_once(CALL_OPEN)?;
         let (_, after) = call.split_once(&format!("{PARAM_OPEN}{key}>"))?;
-        [Framing::Lines, Framing::Compact]
+        match [Framing::Lines, Framing::Compact]
             .into_iter()
             .find(|framing| {
                 after.starts_with(&format!(
@@ -112,7 +125,10 @@ impl Framing {
                     framing.value_open(),
                     framing.value_close()
                 ))
-            })
+            })? {
+            Framing::Lines if !rendered.contains(ThinkTags::THINK.open) => Some(Framing::Coder),
+            framing => Some(framing),
+        }
     }
 }
 
@@ -239,6 +255,12 @@ impl ParamKinds {
         self.kinds.contains_key(name)
     }
 
+    /// Whether a tool's name starts with `part`: a name still arriving may
+    /// yet be one the tools hold.
+    fn may_name(&self, part: &str) -> bool {
+        self.kinds.keys().any(|name| name.starts_with(part))
+    }
+
     fn kind(&self, name: &str, key: &str) -> Option<&Kind> {
         self.kinds.get(name)?.get(key)
     }
@@ -340,8 +362,13 @@ fn kind_of(schema: &Value, root: &Value) -> Kind {
 pub struct QwenScan {
     kinds: ParamKinds,
     framing: Framing,
-    /// Inside a call (its `<tool_call>` consumed).
+    /// Inside a call (its opener, `<tool_call>` or a bare `<function=NAME>`
+    /// under [`Framing::Coder`], consumed or held as the call's own text).
     inside: bool,
+    /// The open call opened bare, `<function=NAME>` with no `<tool_call>`
+    /// before it: its text carries no `<tool_call>` the error or the answer
+    /// would show one the model never wrote.
+    bare: bool,
     /// A call closed: only the layout between calls may follow, and it is
     /// consumed, never content, as the template writes its calls one newline
     /// apart.
@@ -363,6 +390,7 @@ impl QwenScan {
             kinds,
             framing,
             inside: false,
+            bare: false,
             after_call: false,
             buf: Marked::default(),
             specials: SpecialTags::default(),
@@ -429,20 +457,44 @@ impl QwenScan {
                 if self.specials.at(&self.buf, ws, CALL_OPEN) {
                     self.buf.take_front(ws + CALL_OPEN.len());
                     self.inside = true;
+                    self.bare = false;
                     self.after_call = false;
                 } else {
                     // Text after the calls: it stays content, its leading
                     // whitespace with it.
                     self.after_call = false;
                 }
-            } else if let Some(at) = self.specials.find(&self.buf, CALL_OPEN) {
-                self.buf.take_text_into(at, &mut out.content);
-                self.buf.take_front(CALL_OPEN.len());
-                self.inside = true;
             } else {
-                let upto = self.buf.text.len() - partial_suffix(&self.buf.text, CALL_OPEN);
-                self.buf.take_text_into(upto, &mut out.content);
-                return Ok(out);
+                // Before the first call: `<tool_call>` opens one, and a
+                // template that teaches no think span ([`Framing::Coder`])
+                // also lets the call open bare, `<function=NAME>` naming a
+                // tool of the request — whichever the text holds first.
+                let bare_first = self.calls == 0 && matches!(self.framing, Framing::Coder);
+                let call = self.specials.find(&self.buf, CALL_OPEN);
+                let bare = bare_first
+                    .then(|| bare_open(&self.buf.text, &self.kinds))
+                    .flatten()
+                    .filter(|b| call.is_none_or(|a| *b < a));
+                if let Some(at) = bare {
+                    self.buf.take_text_into(at, &mut out.content);
+                    self.inside = true;
+                    self.bare = true;
+                } else if let Some(at) = call {
+                    self.buf.take_text_into(at, &mut out.content);
+                    self.buf.take_front(CALL_OPEN.len());
+                    self.inside = true;
+                    self.bare = false;
+                } else {
+                    let bare = if bare_first {
+                        bare_suffix(&self.buf.text, &self.kinds)
+                    } else {
+                        0
+                    };
+                    let hold = partial_suffix(&self.buf.text, CALL_OPEN).max(bare);
+                    let upto = self.buf.text.len() - hold;
+                    self.buf.take_text_into(upto, &mut out.content);
+                    return Ok(out);
+                }
             }
         }
     }
@@ -466,7 +518,13 @@ impl QwenScan {
         if self.inside {
             return Err(QwenXmlError::Unterminated {
                 index: self.calls,
-                text: format!("{CALL_OPEN}{rest}"),
+                // A call that opened bare carries no `<tool_call>` its text
+                // would show one the model never wrote.
+                text: if self.bare {
+                    rest
+                } else {
+                    format!("{CALL_OPEN}{rest}")
+                },
             });
         }
         if self.after_call && rest.trim().is_empty() {
@@ -477,6 +535,40 @@ impl QwenScan {
             ..Scanned::default()
         })
     }
+}
+
+/// Where a first call opens bare in `text`: `<function=NAME>` whole, its name
+/// one the request's tools hold — llama.cpp's trigger literals carry each
+/// tool's name, so an opener naming nothing the tools do is no trigger.
+/// `None` when no whole opener has come, the text left to hold
+/// ([`bare_suffix`]).
+fn bare_open(text: &str, kinds: &ParamKinds) -> Option<usize> {
+    let mut from = 0;
+    while let Some(n) = text[from..].find(FUNCTION_OPEN) {
+        let at = from + n;
+        let name = &text[at + FUNCTION_OPEN.len()..];
+        // The name is still arriving: the opener may yet name a tool.
+        let end = name.find('>')?;
+        if kinds.names(&name[..end]) {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// How many of `text`'s trailing bytes a bare first call may still need: a
+/// partial `<function=`, or one whose name is still arriving and may yet
+/// name a tool of the request.
+fn bare_suffix(text: &str, kinds: &ParamKinds) -> usize {
+    let mut hold = partial_suffix(text, FUNCTION_OPEN);
+    if let Some(at) = text.rfind(FUNCTION_OPEN) {
+        let name = &text[at + FUNCTION_OPEN.len()..];
+        if !name.contains('>') && kinds.may_name(name) {
+            hold = hold.max(text.len() - at);
+        }
+    }
+    hold
 }
 
 /// The JSON spelling of a boolean parameter's text: `true` or `false` in either case, as the Qwen3-Coder reference
@@ -838,7 +930,7 @@ pub(crate) fn call_parts(framing: Framing, funs: &[Fun<'_>]) -> Result<Vec<Part>
                 )));
                 parts.extend(value(&a.schema, Style::Raw, &a.path)?);
                 parts.push(Part::Text(match framing {
-                    Framing::Lines => PARAM_VALUE_CLOSE.to_owned(),
+                    Framing::Lines | Framing::Coder => PARAM_VALUE_CLOSE.to_owned(),
                     Framing::Compact => format!("{PARAM_CLOSE}\n"),
                 }));
             }

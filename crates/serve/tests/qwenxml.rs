@@ -87,6 +87,10 @@ const FORMAT_NONE: &str =
 const AFTER_CLOSED: &str = "<tool_call>\n<function=get_time>\n</function>\n</tool_call> after";
 const ANSWER: &str = "Hi.</think>Hello!";
 const NEAR_TAG: &str = "</think>a <tool_ca b <tool_call";
+/// A first call that opens bare, `<function=NAME>` with no `<tool_call>`
+/// before it: an omission Qwen3-Coder makes now and then.
+const BARE_CALL: &str =
+    "<function=run_python>\n<parameter=code>\nls -la\n</parameter>\n</function>\n</tool_call>";
 
 fn tools() -> Value {
     json!([
@@ -361,6 +365,13 @@ fn fixtures() -> Vec<(
             NEAR_TAG,
             msg("", "a <tool_ca b <tool_call", vec![]),
         ),
+        (
+            "a bare call is text under a template that teaches a think span",
+            CLOSED,
+            Deepseek,
+            BARE_CALL,
+            msg("", BARE_CALL, vec![]),
+        ),
     ]
 }
 
@@ -498,6 +509,81 @@ fn malformed() -> Vec<(&'static str, &'static str, QwenXmlError)> {
     ]
 }
 
+/// Qwen3-Coder's generation prompt after one user turn: its template teaches
+/// no think span, so the answer starts at once.
+const CODER_ON: &str = "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n";
+
+/// `(name, raw output, the message or the error)` under [`Framing::Coder`],
+/// after [`CODER_ON`]: a template that teaches no think span lets its model
+/// open its first call bare, `<function=NAME>` naming a tool of the request,
+/// the call still closed by `</tool_call>` (llama.cpp's `tool_call_first`).
+/// A name the tools do not hold is no call, and a second call needs its own
+/// `<tool_call>`.
+fn bare_fixtures() -> Vec<(&'static str, &'static str, Result<Message, MarkupError>)> {
+    vec![
+        (
+            "the first call opens bare, a string parameter framed as usual",
+            BARE_CALL,
+            Ok(msg(
+                "",
+                "",
+                vec![call(0, "run_python", r#"{"code":"ls -la"}"#)],
+            )),
+        ),
+        (
+            "a bare call with two parameters, typed as usual",
+            "<function=get_weather>\n<parameter=location>\nSeoul\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+            Ok(msg(
+                "",
+                "",
+                vec![call(0, "get_weather", r#"{"location":"Seoul","days":3}"#)],
+            )),
+        ),
+        (
+            "text, then the first call opens bare",
+            "Checking.\n<function=get_time>\n</function>\n</tool_call>",
+            Ok(msg("", "Checking.\n", vec![call(0, "get_time", "{}")])),
+        ),
+        (
+            "a bare call whose name the tools do not hold stays text",
+            "<function=get_date>\n</function>\n</tool_call>",
+            Ok(msg(
+                "",
+                "<function=get_date>\n</function>\n</tool_call>",
+                vec![],
+            )),
+        ),
+        (
+            "a second call that opens bare stays text",
+            "<tool_call>\n<function=get_time>\n</function>\n</tool_call>\n<function=get_time>\n</function>\n</tool_call>",
+            Ok(msg(
+                "",
+                "\n<function=get_time>\n</function>\n</tool_call>",
+                vec![call(0, "get_time", "{}")],
+            )),
+        ),
+        (
+            "a bare call is still not closed at the end",
+            "<function=get_time>\n</function>\n",
+            Err(MarkupError::Qwen(QwenXmlError::Unterminated {
+                index: 0,
+                text: "<function=get_time>\n</function>\n".to_owned(),
+            })),
+        ),
+        (
+            "a bare call's parameters are typed as usual",
+            "<function=get_weather>\n<parameter=days>\nthree\n</parameter>\n</function>\n</tool_call>",
+            Err(MarkupError::Qwen(QwenXmlError::NotJson {
+                index: 0,
+                name: "get_weather".to_owned(),
+                key: "days".to_owned(),
+                ty: "integer".to_owned(),
+                value: "three".to_owned(),
+            })),
+        ),
+    ]
+}
+
 /// Feeds `pieces` one by one; the deltas' sum, checked against the message.
 fn streamed(
     framing: Framing,
@@ -593,6 +679,23 @@ fn hw_qwen_parse_does_not_depend_on_chunking() {
     }
 }
 
+/// The first call a template that teaches no think span may open bare parses
+/// to its message, its errors named, and no answer depends on how the text
+/// was cut (the fixtures' own gate pattern).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_first_call_may_open_bare_under_qwen3coders_template() {
+    for (name, raw, want) in bare_fixtures() {
+        for pieces in common::every_chunking(raw, 1) {
+            assert_eq!(
+                streamed(Framing::Coder, CODER_ON, ReasoningFormat::Deepseek, &pieces),
+                want,
+                "{name}: {pieces:?}"
+            );
+        }
+    }
+}
+
 // ------------------------------------------------------- the compact framing
 
 /// The framing the server reads from the MiMo template's rendered call; any
@@ -627,15 +730,19 @@ fn weather_tools() -> Value {
 /// A template types its markup's framing from the call it renders, not from
 /// its name or from its source's spelling alone: MiMo's compact call is
 /// [`Framing::Compact`], the Qwen3.6, Qwen3.8 and Nemotron calls (a value on a
-/// line of its own) are [`Framing::Lines`], and so are two small templates
-/// that differ in nothing but how they write a value. The probe's own call
-/// decides, not a header's example before it. A template that spells the tags
-/// and renders no call is [`ToolFormat::Unparsed`]: no framing is guessed.
+/// line of its own, a think span the render shows) are [`Framing::Lines`],
+/// and so framed but with no think span — a template whose first call may
+/// open bare ([`Framing::Coder`]) — are Qwen3-Coder's own and two small
+/// templates that differ from it in nothing but how they write a value. The
+/// probe's own call decides, not a header's example before it. A template
+/// that spells the tags and renders no call is [`ToolFormat::Unparsed`]: no
+/// framing is guessed.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_framing_follows_the_rendered_call() {
     let compact = ToolFormat::QwenXml(Framing::Compact);
     let lines = ToolFormat::QwenXml(Framing::Lines);
+    let coder = ToolFormat::QwenXml(Framing::Coder);
     let t = ChatTemplate::parse(MIMO).expect("template parses");
     assert_eq!(ToolFormat::of_chat_template(&t), compact);
     assert_eq!(ToolFormat::of_template(MIMO), compact);
@@ -660,7 +767,7 @@ fn hw_framing_follows_the_rendered_call() {
         ToolFormat::of_template(
             &small("\n{{ v }}\n").replace("</parameter>", "</parameter>{{ '\\n' }}")
         ),
-        lines
+        coder
     );
     let example = "<tool_call><function=get_weather><parameter=location>\nSeoul\n</parameter>\n</function></tool_call>";
     assert_eq!(
@@ -1992,15 +2099,16 @@ fn hw_qwen3coder_template_renders_as_the_reference() {
 }
 
 /// What picks the parser for Qwen3-Coder: the template's own spelling, `<tool_call>`, `<function=` and `<parameter=`,
-/// and the framing read from the call its probe render writes, a value on a line of its own. The probe renders the
-/// template with a `tools` header, so a template the engine cannot render is [`ToolFormat::Unparsed`].
+/// and the framing read from the call its probe render writes, a value on a line of its own and no think span in the
+/// render — the template whose first call may open bare ([`Framing::Coder`]). The probe renders the template with a
+/// `tools` header, so a template the engine cannot render is [`ToolFormat::Unparsed`].
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_qwen3coder_template_is_read_as_qwen_markup() {
-    let lines = ToolFormat::QwenXml(Framing::Lines);
+    let coder = ToolFormat::QwenXml(Framing::Coder);
     let t = ChatTemplate::parse(CODER).expect("template parses");
-    assert_eq!(ToolFormat::of_chat_template(&t), lines);
-    assert_eq!(ToolFormat::of_template(CODER), lines);
+    assert_eq!(ToolFormat::of_chat_template(&t), coder);
+    assert_eq!(ToolFormat::of_template(CODER), coder);
 }
 
 /// A server on Qwen3-Coder's template answers a request with tools: a completion in the model's markup becomes
@@ -2079,5 +2187,48 @@ fn hw_a_server_on_qwen3coders_template_answers_a_call_and_its_result() {
     let c = &v["choices"][0];
     assert_eq!(c["finish_reason"], "stop", "{v}");
     assert_eq!(c["message"]["content"], "It is 21 degrees in Seoul.", "{v}");
+    assert!(c["message"]["tool_calls"].is_null(), "{v}");
+}
+
+/// A server on Qwen3-Coder's template answers a first call that opens bare,
+/// `<function=NAME>` with no `<tool_call>` before it, streamed and not; a bare opener whose name the request's tools do not hold
+/// stays text.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_server_on_qwen3coders_template_answers_a_bare_first_call() {
+    let script = "I will check.\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>";
+    let addr = start_templated(Box::new(ScriptedEngine::new(4096, script)), CODER);
+    let body = |stream: bool| {
+        json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "What's the weather in Seoul?"}],
+            "temperature": 0,
+            "tools": weather_tools(),
+            "stream": stream,
+        })
+    };
+    let want = json!({"name": "get_weather", "arguments": r#"{"city":"Seoul"}"#});
+    let r = post(addr, "/v1/chat/completions", &body(false));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls", "{v}");
+    assert_eq!(c["message"]["content"], "I will check.\n", "{v}");
+    assert_eq!(c["message"]["tool_calls"][0]["function"], want, "{v}");
+    let r = post(addr, "/v1/chat/completions", &body(true));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (finish, folded) = fold_stream(&r.body).expect("no error event");
+    assert_eq!(finish, "tool_calls");
+    assert_eq!(folded["content"], "I will check.\n");
+    assert_eq!(folded["calls"], json!([want]), "streamed == non-streamed");
+
+    let unknown = "<function=get_date>\n</function>\n</tool_call>";
+    let addr = start_templated(Box::new(ScriptedEngine::new(4096, unknown)), CODER);
+    let r = post(addr, "/v1/chat/completions", &body(false));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "stop", "{v}");
+    assert_eq!(c["message"]["content"], unknown, "{v}");
     assert!(c["message"]["tool_calls"].is_null(), "{v}");
 }

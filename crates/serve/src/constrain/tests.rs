@@ -939,7 +939,9 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"days\": 2}}\n</tool_call>",
             "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"cats\", \"deep\": false}}\n</tool_call>",
         ],
-        QWEN => [
+        // A Coder framing writes the lines markup: a forced call always opens
+        // `<tool_call>`, the bare first call is the model's own omission.
+        ToolFormat::QwenXml(Framing::Lines | Framing::Coder) => [
             "<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>",
             "<tool_call>\n<function=search>\n<parameter=query>\ncats\n</parameter>\n<parameter=deep>\nfalse\n</parameter>\n</function>\n</tool_call>",
         ],
