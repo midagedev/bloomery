@@ -319,7 +319,7 @@ unsafe fn publish_route_gated<const PER_LANE: usize>(
     }
 }
 
-/// The gated router's fused launch body, `qwen3moe_router_fused`'s at `n + 1
+/// The gated router's fused launch body, `softmax_router_fused`'s at `n + 1
 /// = 32 · PER_LANE + 1` rows: warp 0 of block `r` computes row `r`'s logit of
 /// each of the `m_cols` tokens with `f32_gemv`'s row body and stores it at
 /// `logits[c·(n + 1) + r]`, then [`publish_route_gated`]. `w` is an F32
@@ -783,7 +783,7 @@ pub mod gated {
         }
 
         /// The FFN norm and the router of one token in one launch
-        /// (`qwen3moe_router_norm`'s contract at [`ROWS`] rows): the q8_1 of
+        /// (`softmax_router_norm`'s contract at [`ROWS`] rows): the q8_1 of
         /// the normed row into `q3 … d8`, `norm_quant`'s bytes, and the
         /// router's outputs as `qwen35moe_router_fused` at one token. `k` a
         /// multiple of 128 up to [`NORM_K`] (host-checked).
@@ -1000,7 +1000,7 @@ pub mod gated {
         }
 
         /// The FFN norm and the router of `m_cols` tokens in one launch
-        /// (`qwen3moe_router_norm_m`'s contract at [`ROWS`] rows):
+        /// (`softmax_router_norm_m`'s contract at [`ROWS`] rows):
         /// `fused::norm_quant` then `qwen35moe_router_fused` at `m_cols`
         /// tokens, bit for bit — the q8_1 of the normed rows into `q3 … d8`
         /// (`m_cols` columns), the router's outputs as

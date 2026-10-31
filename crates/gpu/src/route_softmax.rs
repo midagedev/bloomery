@@ -5,19 +5,19 @@
 //! entries through [`RouterKernels`], over [`RouterBufs`] cut for its
 //! [`RouterDims`]; a model's own code holds none of it. [`RouterBufs`] and the
 //! norm-fused row body ([`norm_row_body`]) also serve the gated router that
-//! adds a shared expert's slot (`arch::qwen3moe::router::gated`).
+//! adds a shared expert's slot (the gated body's own module, `gpu/src/arch/`).
 //!
 //! Four entries share one warp-level routing body, [`route_warp`]:
-//! `qwen3moe_router_fused` — the router's logit gemv with the routing fused
-//! into it, one launch for up to [`MAX_TOKENS`] tokens; `qwen3moe_router_norm`,
+//! `softmax_router_fused` — the router's logit gemv with the routing fused
+//! into it, one launch for up to [`MAX_TOKENS`] tokens; `softmax_router_norm`,
 //! the decode chain's at one token — the same launch with `fused::norm_quant`
 //! run in every block first (its q8_1 bytes out, its normed row kept in shared
-//! memory for the gemv); `qwen3moe_router_norm_m`, the chain's at two to
+//! memory for the gemv); `softmax_router_norm_m`, the chain's at two to
 //! [`MAX_TOKENS`] tokens — the same fold over the tokens' rows one after
 //! another ([`norm_row_body`], the one-token entry's body); and
-//! `qwen3moe_router_route`, the routing alone over given logits, one warp per
+//! `softmax_router_route`, the routing alone over given logits, one warp per
 //! token. A ubatch's logits come from
-//! `qwen3moe_router_logits`: the fused entry's lane sums over a ubatch of up
+//! `softmax_router_logits`: the fused entry's lane sums over a ubatch of up
 //! to [`RouterDims::ubatch`] tokens as register tiles, the wide
 //! F32 product's body (`crate::gemm`'s `f32_tile_body`, which keeps every
 //! lane sum and the butterfly of the row walk) over the router's rows, so
@@ -100,7 +100,7 @@ const WIDTH: usize = 32 * PER_LANE;
 /// This body's instance row: its width, the softmax renormalized over the
 /// top k, `k` a launch argument of one to 32 (one pick a lane). A file's
 /// shape selects it through [`RouterDims::of`].
-pub const ROW: RouterInst = shape::router_row(RouterBody::Qwen3moe, 32 * PER_LANE as u32);
+pub const ROW: RouterInst = shape::router_row(RouterBody::Softmax, 32 * PER_LANE as u32);
 const _: () = assert!(shape::router_row_is(
     ROW,
     rules::SOFTMAX_NORM,
@@ -116,10 +116,10 @@ const _: () = assert!(FUSED_THREADS_U32 as usize == FUSED_THREADS);
 // block: the same threads, loads and tree as the norm's first RMS_THREADS.
 const _: () = assert!(FUSED_THREADS == RMS_THREADS && FUSED_WARPS == RMS_WARPS);
 
-/// The widest row the norm-fused entry normalizes into shared memory: the
-/// qwen3moe hidden width.
+/// The widest row the norm-fused entry normalizes into shared memory: an
+/// FFN residual's hidden width.
 pub const NORM_K: usize = 2048;
-// `qwen3moe_router_norm`'s launch contract spells the bound out.
+// `softmax_router_norm`'s launch contract spells the bound out.
 const _: () = assert!(NORM_K == 2048);
 // Block `t · (k / 128) + g` quantizes row `t`'s 128-value group `g`, so
 // every group of every token a launch routes needs a block.
@@ -553,7 +553,7 @@ pub(crate) unsafe fn norm_row_body<const PREFETCH: bool>(
 }
 
 #[cuda_module]
-mod qwen3moe_router_kernels {
+mod softmax_router_kernels {
     use super::*;
 
     /// The router of `m_cols` tokens: `w` the router weight ([`WIDTH`] rows
@@ -596,7 +596,7 @@ mod qwen3moe_router_kernels {
             done.len() >= 1
         )
     )]
-    pub fn qwen3moe_router_fused(
+    pub fn softmax_router_fused(
         w: &[f32],
         x: &[f32],
         k: u32,
@@ -667,7 +667,7 @@ mod qwen3moe_router_kernels {
     /// the router weight ([`WIDTH`] rows of `k` f32), `used` the experts a
     /// token keeps. Writes the q8_1 of
     /// the normed row into `q3 … d8` (the experts' input, one column) and the
-    /// router's outputs as `qwen3moe_router_fused` at one token.
+    /// router's outputs as `softmax_router_fused` at one token.
     ///
     /// Every block (256 threads) first runs `fused::norm_quant` on the row
     /// with the same cores in the same order, keeps the normed row in shared
@@ -705,7 +705,7 @@ mod qwen3moe_router_kernels {
             done.len() >= 1
         )
     )]
-    pub fn qwen3moe_router_norm(
+    pub fn softmax_router_norm(
         w: &[f32],
         x: &[f32],
         gain: &[f32],
@@ -762,7 +762,7 @@ mod qwen3moe_router_kernels {
                 fault,
             );
         }
-        // SAFETY: as in `qwen3moe_router_fused`, at one token: LAST and P
+        // SAFETY: as in `softmax_router_fused`, at one token: LAST and P
         // are this block's own and untouched until here, every thread arrives
         // converged, 1 <= used <= 32, the output lengths are the launch
         // contract's and `done[0]` is zero before the launch.
@@ -782,7 +782,7 @@ mod qwen3moe_router_kernels {
         }
     }
 
-    /// `qwen3moe_router_norm` with warp 0 of each block asking L2 for its router row
+    /// `softmax_router_norm` with warp 0 of each block asking L2 for its router row
     /// first ([`l2_prefetch`]): the entry an integrated device launches.
     #[allow(
         clippy::too_many_arguments,
@@ -812,7 +812,7 @@ mod qwen3moe_router_kernels {
             done.len() >= 1
         )
     )]
-    pub fn qwen3moe_router_norm_prefetch(
+    pub fn softmax_router_norm_prefetch(
         w: &[f32],
         x: &[f32],
         gain: &[f32],
@@ -869,7 +869,7 @@ mod qwen3moe_router_kernels {
                 fault,
             );
         }
-        // SAFETY: as in `qwen3moe_router_fused`, at one token: LAST and P
+        // SAFETY: as in `softmax_router_fused`, at one token: LAST and P
         // are this block's own and untouched until here, every thread arrives
         // converged, 1 <= used <= 32, the output lengths are the launch
         // contract's and `done[0]` is zero before the launch.
@@ -890,16 +890,16 @@ mod qwen3moe_router_kernels {
     }
 
     /// The FFN norm and the router of `m_cols` tokens in one launch:
-    /// `fused::norm_quant` then `qwen3moe_router_fused` at `m_cols` tokens,
+    /// `fused::norm_quant` then `softmax_router_fused` at `m_cols` tokens,
     /// bit for bit, each token's row as those two launches leave it. `x` the
     /// tokens' FFN input residuals (`m_cols` rows of `k`), `gain` the norm's
     /// gain, `w` the router weight ([`WIDTH`] rows of `k` f32), `used` the
     /// experts a token keeps. Writes the q8_1 of the normed rows into `q3 …
     /// d8` (`m_cols` columns) and the router's outputs as
-    /// `qwen3moe_router_fused` at `m_cols` tokens; `fault` takes the norm's
+    /// `softmax_router_fused` at `m_cols` tokens; `fault` takes the norm's
     /// raise and the router's.
     ///
-    /// Grid [`WIDTH`] blocks of 256: `qwen3moe_router_norm`'s body
+    /// Grid [`WIDTH`] blocks of 256: `softmax_router_norm`'s body
     /// ([`norm_row_body`]) for each token in turn — its row normed into
     /// shared memory, its groups quantized by blocks `t · (k / 128) ..`,
     /// warp 0 of block `r` its logit of row `r` — then the ticket and the
@@ -935,7 +935,7 @@ mod qwen3moe_router_kernels {
             done.len() >= 1
         )
     )]
-    pub fn qwen3moe_router_norm_m(
+    pub fn softmax_router_norm_m(
         w: &[f32],
         x: &[f32],
         gain: &[f32],
@@ -997,7 +997,7 @@ mod qwen3moe_router_kernels {
             }
             t += 1;
         }
-        // SAFETY: as in `qwen3moe_router_fused` at m_cols tokens: LAST is
+        // SAFETY: as in `softmax_router_fused` at m_cols tokens: LAST is
         // this block's own and untouched until here, and the routing's
         // scratch is NORMED's first P_LEN <= NORM_K entries (const assert),
         // which warp 0's last gemv has read before publish_route's first
@@ -1020,7 +1020,7 @@ mod qwen3moe_router_kernels {
         }
     }
 
-    /// `qwen3moe_router_norm_m` with warp 0 of each block asking L2 for its router row
+    /// `softmax_router_norm_m` with warp 0 of each block asking L2 for its router row
     /// first ([`l2_prefetch`]): the entry an integrated device launches.
     #[allow(
         clippy::too_many_arguments,
@@ -1052,7 +1052,7 @@ mod qwen3moe_router_kernels {
             done.len() >= 1
         )
     )]
-    pub fn qwen3moe_router_norm_m_prefetch(
+    pub fn softmax_router_norm_m_prefetch(
         w: &[f32],
         x: &[f32],
         gain: &[f32],
@@ -1114,7 +1114,7 @@ mod qwen3moe_router_kernels {
             }
             t += 1;
         }
-        // SAFETY: as in `qwen3moe_router_fused` at m_cols tokens: LAST is
+        // SAFETY: as in `softmax_router_fused` at m_cols tokens: LAST is
         // this block's own and untouched until here, and the routing's
         // scratch is NORMED's first P_LEN <= NORM_K entries (const assert),
         // which warp 0's last gemv has read before publish_route's first
@@ -1158,7 +1158,7 @@ mod qwen3moe_router_kernels {
             logits.len() >= 128 * n_tok
         )
     )]
-    pub fn qwen3moe_router_logits(
+    pub fn softmax_router_logits(
         w: &[f32],
         x: &[f32],
         k: u32,
@@ -1177,7 +1177,7 @@ mod qwen3moe_router_kernels {
     }
 
     /// The routing of `n_tok` tokens from their logits (`n_tok · 128`, as
-    /// `qwen3moe_router_logits` writes them): warp `w` of block `b` routes
+    /// `softmax_router_logits` writes them): warp `w` of block `b` routes
     /// token `8·b + w` with [`route_warp`] at `used` experts a token and
     /// writes its probabilities, ids and weights where the fused launch
     /// writes a token's; a token with a non-finite logit raises
@@ -1196,7 +1196,7 @@ mod qwen3moe_router_kernels {
             weights.len() >= used * n_tok
         )
     )]
-    pub fn qwen3moe_router_route(
+    pub fn softmax_router_route(
         logits: &[f32],
         n_tok: u32,
         used: u32,
@@ -1371,7 +1371,7 @@ impl RouterBufs {
 /// The loaded router module. Owns no stream: each enqueue takes the engine
 /// stream, so its launch orders with the rest of the step and capture.
 pub struct RouterKernels {
-    module: qwen3moe_router_kernels::LoadedModule,
+    module: softmax_router_kernels::LoadedModule,
     /// [`crate::row_prefetch`] of the context's device.
     row_prefetch: bool,
 }
@@ -1381,7 +1381,7 @@ impl RouterKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { crate::shared_module!(qwen3moe_router_kernels, ctx)? };
+        let module = unsafe { crate::shared_module!(softmax_router_kernels, ctx)? };
         Ok(RouterKernels {
             module,
             row_prefetch: crate::row_prefetch(ctx)?,
@@ -1404,7 +1404,7 @@ impl RouterKernels {
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "route_softmax::enqueue_fused";
-        let used = out.used_for(what, RouterBody::Qwen3moe, None)?;
+        let used = out.used_for(what, RouterBody::Softmax, None)?;
         let k = w.cols();
         if w.rows() != WIDTH || k == 0 || !k.is_multiple_of(32) {
             return Err(GpuError::shape(
@@ -1431,8 +1431,8 @@ impl RouterKernels {
         let grid = launch_u32(what, "grid", WIDTH)?;
         let prep = self
             .module
-            .prepare_qwen3moe_router_fused(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-        self.module.qwen3moe_router_fused(
+            .prepare_softmax_router_fused(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+        self.module.softmax_router_fused(
             stream,
             &prep,
             w.buf(),
@@ -1451,7 +1451,7 @@ impl RouterKernels {
     }
 
     /// Enqueue the router of a ubatch of `n` (1..=`out.tokens()`) tokens in
-    /// two launches, `qwen3moe_router_logits` then `qwen3moe_router_route`
+    /// two launches, `softmax_router_logits` then `softmax_router_route`
     /// ([`RouterKernels::enqueue_route`]):
     /// `w` the router weight as f32 ([`WIDTH`] rows of `k`, `k` a
     /// positive multiple of 64), `x` the tokens' `n` columns of `k` normed
@@ -1469,7 +1469,7 @@ impl RouterKernels {
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "route_softmax::enqueue_ubatch";
-        out.used_for(what, RouterBody::Qwen3moe, None)?;
+        out.used_for(what, RouterBody::Softmax, None)?;
         let k = w.cols();
         if w.rows() != WIDTH || n > out.tokens {
             return Err(GpuError::shape(
@@ -1491,14 +1491,14 @@ impl RouterKernels {
         let t = tile_launch(what, WIDTH, k, x, n, &out.logits)?;
         let prep = self
             .module
-            .prepare_qwen3moe_router_logits(LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0))?;
+            .prepare_softmax_router_logits(LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0))?;
         self.module
-            .qwen3moe_router_logits(stream, &prep, w.buf(), x, t.k, t.n, &mut out.logits)?;
+            .softmax_router_logits(stream, &prep, w.buf(), x, t.k, t.n, &mut out.logits)?;
         self.enqueue_route(stream, n, fault, out)
     }
 
     /// Enqueue the routing alone of the first `n` (1..=`out.tokens()`)
-    /// tokens' logits in `out.logits` (`qwen3moe_router_route`, warp `w` of
+    /// tokens' logits in `out.logits` (`softmax_router_route`, warp `w` of
     /// block `b` routing token `8·b + w`): each token's probabilities, ids
     /// and weights into `out` where the fused launch writes a token's, a
     /// token with a non-finite logit raising [`FaultSite::Router`] on
@@ -1512,7 +1512,7 @@ impl RouterKernels {
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "route_softmax::enqueue_route";
-        let used = out.used_for(what, RouterBody::Qwen3moe, None)?;
+        let used = out.used_for(what, RouterBody::Softmax, None)?;
         if !(1..=out.tokens).contains(&n) {
             return Err(GpuError::shape(
                 what,
@@ -1523,8 +1523,8 @@ impl RouterKernels {
         let grid = launch_u32(what, "grid", n.div_ceil(FUSED_WARPS))?;
         let prep = self
             .module
-            .prepare_qwen3moe_router_route(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-        self.module.qwen3moe_router_route(
+            .prepare_softmax_router_route(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+        self.module.softmax_router_route(
             stream,
             &prep,
             &out.logits,
@@ -1539,7 +1539,7 @@ impl RouterKernels {
     }
 
     /// Enqueue the FFN norm and the router of one token in one launch
-    /// (`qwen3moe_router_norm`): `x` the token's FFN input residual, `gain`
+    /// (`softmax_router_norm`): `x` the token's FFN input residual, `gain`
     /// the norm's gain (`w.cols()` values each), `eps` its epsilon; the q8_1
     /// of the normed row into `act` (one column of `w.cols()`) — the bytes
     /// `fused::norm_quant` writes — and the routing into `out`'s first token,
@@ -1562,7 +1562,7 @@ impl RouterKernels {
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "route_softmax::enqueue_norm_fused";
-        let used = out.used_for(what, RouterBody::Qwen3moe, None)?;
+        let used = out.used_for(what, RouterBody::Softmax, None)?;
         let k = w.cols();
         if w.rows() != WIDTH || k == 0 || !k.is_multiple_of(128) || k > NORM_K {
             return Err(GpuError::shape(
@@ -1592,12 +1592,12 @@ impl RouterKernels {
         if self.row_prefetch {
             let prep = self
                 .module
-                .prepare_qwen3moe_router_norm_prefetch(LaunchConfig1D::new(
+                .prepare_softmax_router_norm_prefetch(LaunchConfig1D::new(
                     grid,
                     FUSED_THREADS_U32,
                     0,
                 ))?;
-            self.module.qwen3moe_router_norm_prefetch(
+            self.module.softmax_router_norm_prefetch(
                 stream,
                 &prep,
                 w.buf(),
@@ -1624,8 +1624,8 @@ impl RouterKernels {
         } else {
             let prep = self
                 .module
-                .prepare_qwen3moe_router_norm(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-            self.module.qwen3moe_router_norm(
+                .prepare_softmax_router_norm(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+            self.module.softmax_router_norm(
                 stream,
                 &prep,
                 w.buf(),
@@ -1655,7 +1655,7 @@ impl RouterKernels {
 
     /// Enqueue the FFN norm and the router of `act.m()` tokens
     /// (1..=[`MAX_TOKENS`], at most `out.tokens()`) in one launch
-    /// (`qwen3moe_router_norm_m`): `x` the tokens' FFN input residuals
+    /// (`softmax_router_norm_m`): `x` the tokens' FFN input residuals
     /// (`act.m()` rows of `w.cols()`), `gain` the norm's gain, `eps` its
     /// epsilon; the q8_1 of the normed rows into `act` — the bytes
     /// `fused::norm_quant` writes — and the routing into `out`, as
@@ -1678,7 +1678,7 @@ impl RouterKernels {
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "route_softmax::enqueue_norm_fused_m";
-        let used = out.used_for(what, RouterBody::Qwen3moe, None)?;
+        let used = out.used_for(what, RouterBody::Softmax, None)?;
         let k = w.cols();
         if w.rows() != WIDTH || k == 0 || !k.is_multiple_of(128) || k > NORM_K {
             return Err(GpuError::shape(
@@ -1715,12 +1715,12 @@ impl RouterKernels {
         if self.row_prefetch {
             let prep = self
                 .module
-                .prepare_qwen3moe_router_norm_m_prefetch(LaunchConfig1D::new(
+                .prepare_softmax_router_norm_m_prefetch(LaunchConfig1D::new(
                     grid,
                     FUSED_THREADS_U32,
                     0,
                 ))?;
-            self.module.qwen3moe_router_norm_m_prefetch(
+            self.module.softmax_router_norm_m_prefetch(
                 stream,
                 &prep,
                 w.buf(),
@@ -1748,8 +1748,8 @@ impl RouterKernels {
         } else {
             let prep = self
                 .module
-                .prepare_qwen3moe_router_norm_m(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-            self.module.qwen3moe_router_norm_m(
+                .prepare_softmax_router_norm_m(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+            self.module.softmax_router_norm_m(
                 stream,
                 &prep,
                 w.buf(),

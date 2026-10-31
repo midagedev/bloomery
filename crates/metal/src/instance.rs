@@ -152,7 +152,7 @@ pub const QWEN3MOE_A3B: Instance = Instance {
     key: Key {
         hidden: 2048,
         ffn: FfnAxes::Routed(MoeAxes {
-            router: shape::router_row(RouterBody::Qwen3moe, 128),
+            router: shape::router_row(RouterBody::Softmax, 128),
             top_k: 8,
             expert_ff: 768,
         }),

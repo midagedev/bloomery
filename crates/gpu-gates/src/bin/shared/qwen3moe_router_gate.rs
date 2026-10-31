@@ -2,7 +2,7 @@
 //! over 128 experts, the top 8, and the weights renormalized
 //! (`norm_topk_prob`).
 //!
-//! The routing alone (`qwen3moe_router_route`, the engine's ubatch routing
+//! The routing alone (`softmax_router_route`, the engine's ubatch routing
 //! entry, at one token: its logits in) against the
 //! host rule (`route_ref_within` at 128/8 — the serial max fold, f32 `exp`,
 //! the f64 ascending sum, the f32 divide, ties to the smaller id — then the
@@ -23,7 +23,7 @@
 //! routing as a captured graph: one node, the replay bit-identical to the
 //! eager launch.
 //!
-//! The engine's launch (`qwen3moe_router_fused`: the logit gemv and the
+//! The engine's launch (`softmax_router_fused`: the logit gemv and the
 //! routing in one launch, the last block to finish routing every token) at
 //! m = 1, 5 and 8 tokens (`ffn_inp_normed-13` of the prefill set, then
 //! `-14`'s): logits, probabilities, ids and weights BIT-EQUAL to
@@ -31,9 +31,9 @@
 //! block ticket count back at zero. As a captured graph at m = 8: one node,
 //! two replays bit-identical to the eager launch, the count zero after each.
 //!
-//! The one-token launch with the FFN norm folded in (`qwen3moe_router_norm`,
+//! The one-token launch with the FFN norm folded in (`softmax_router_norm`,
 //! the chain's at m = 1) against the two launches it replaces —
-//! `fused::norm_quant` then `qwen3moe_router_fused` at one token — on every
+//! `fused::norm_quant` then `softmax_router_fused` at one token — on every
 //! token of `l_out-12` through layer 13's `ffn_norm` and router weight and of
 //! `l_out-46` through layer 47's: the q8_1 bytes (all five planes, the scales
 //! by bits), logits, probabilities, ids and weights BIT-EQUAL, the ticket
@@ -49,9 +49,9 @@
 //! captured graph: one node, two replays bit-identical to the eager launch,
 //! the count zero after each.
 //!
-//! The m-row launch with the FFN norm folded in (`qwen3moe_router_norm_m`,
+//! The m-row launch with the FFN norm folded in (`softmax_router_norm_m`,
 //! the chain's at two to eight tokens) at m = 2, 5 and 8 against
-//! `fused::norm_quant` then `qwen3moe_router_fused` at m, on the first m
+//! `fused::norm_quant` then `softmax_router_fused` at m, on the first m
 //! rows of `l_out-12` then `l_out-46` through layer 13's `ffn_norm` and
 //! router weight: the q8_1 bytes (all five planes of the m columns, the
 //! scales by bits), logits, probabilities, ids and weights BIT-EQUAL, the
@@ -683,7 +683,7 @@ fn norm_section(
     drop(graph);
     let pass = replays_ok && nodes == 1 && tickets_after.iter().all(|&t| t == 0);
     println!(
-        "graph op=qwen3moe_router_norm two_replays_bit_identical={replays_ok} \
+        "graph op=softmax_router_norm two_replays_bit_identical={replays_ok} \
              tickets_after={tickets_after:?} graph_nodes={nodes} {}",
         verdict(pass)
     );
@@ -1068,7 +1068,7 @@ fn fault_section(
             && bits_equal(&again.weights, &clean.weights);
         let pass = word == want && refused && ids_kept && clean_after;
         println!(
-            "fault op=qwen3moe_router_route logit[37]={name}: word \"{}\" (want \"{}\") probs_weights_nan={refused} \
+            "fault op=softmax_router_route logit[37]={name}: word \"{}\" (want \"{}\") probs_weights_nan={refused} \
                  ids_kept={ids_kept} clean_rerun_word_none_and_bits={clean_after} {}",
             word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
             want.map_or_else(String::new, |f| f.to_string()),
@@ -1112,7 +1112,7 @@ fn fault_section(
         && others
         && tickets == 0;
     println!(
-        "fault op=qwen3moe_router_fused m={m} token {bad_t} column finite={finite_in} logit[{HOT}]={hot_logit} \
+        "fault op=softmax_router_fused m={m} token {bad_t} column finite={finite_in} logit[{HOT}]={hot_logit} \
              (want inf): word {word:?} (want {want:?}, clean run {clean_word:?}) token refused={refused} \
              other tokens bit-identical={others} tickets={tickets} {}",
         verdict(pass)
@@ -1142,7 +1142,7 @@ fn fault_section(
     let (refused, others) = tokens_verdict(&got, &clean_u, ub_n, &[ub_n - 1]);
     let pass = clean_word.is_none() && word == want && refused && others;
     println!(
-        "fault op=qwen3moe_router_logits+route n={ub_n} token {} overflows: word {word:?} (want {want:?}, \
+        "fault op=softmax_router_logits+route n={ub_n} token {} overflows: word {word:?} (want {want:?}, \
              clean run {clean_word:?}) token refused={refused} other tokens bit-identical={others} {}",
         ub_n - 1,
         verdict(pass)
@@ -1166,7 +1166,7 @@ fn fault_section(
     let seen = r.map_or_else(|e| format!("Err: {e}"), |()| "Ok (accepted)".to_string());
     let pass = named && untouched;
     println!(
-        "refuse op=qwen3moe_router_fused m={ub_n} into ubatch buffers for {ub_n}: {seen} (want \
+        "refuse op=softmax_router_fused m={ub_n} into ubatch buffers for {ub_n}: {seen} (want \
              enqueue_fused's shape error) buffers_untouched={untouched} {}",
         verdict(pass)
     );
@@ -1185,7 +1185,7 @@ fn fault_section(
     let (refused, _) = tokens_verdict(&got, &clean_f, m, &all);
     let pass = word == want && refused;
     println!(
-        "fault op=qwen3moe_router_fused m={m} router weight [17][3]=NaN: word {word:?} (want {want:?}) \
+        "fault op=softmax_router_fused m={m} router weight [17][3]=NaN: word {word:?} (want {want:?}) \
              every token refused={refused} {}",
         verdict(pass)
     );
@@ -1208,7 +1208,7 @@ fn fault_section(
     let refused = token_refused(&got.routed, 0, &clean_n.routed);
     let pass = clean_word.is_none() && word == want && refused && q8_same;
     println!(
-        "fault op=qwen3moe_router_norm router weight [17][3]=NaN: word {word:?} (want {want:?}, clean run \
+        "fault op=softmax_router_norm router weight [17][3]=NaN: word {word:?} (want {want:?}, clean run \
              {clean_word:?}) token refused={refused} q8_1 bytes = clean run's {q8_same} {}",
         verdict(pass)
     );
@@ -1446,7 +1446,7 @@ pub fn run() -> Result<(), GateError> {
     let nodes = graph.node_count();
     let pass = identical && nodes == 1;
     println!(
-        "graph op=qwen3moe_router_route src=ffn_moe_logits-13 eager_vs_graph_bit_identical={identical} \
+        "graph op=softmax_router_route src=ffn_moe_logits-13 eager_vs_graph_bit_identical={identical} \
              graph_nodes={nodes} {}",
         verdict(pass)
     );
@@ -1511,7 +1511,7 @@ pub fn run() -> Result<(), GateError> {
     let nodes = graph.node_count();
     let pass = replays_ok && nodes == 1 && tickets_after.iter().all(|&t| t == 0);
     println!(
-        "graph op=qwen3moe_router_fused m={MAX_TOKENS} two_replays_bit_identical={replays_ok} \
+        "graph op=softmax_router_fused m={MAX_TOKENS} two_replays_bit_identical={replays_ok} \
              tickets_after={tickets_after:?} graph_nodes={nodes} {}",
         verdict(pass)
     );

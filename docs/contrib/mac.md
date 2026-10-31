@@ -320,7 +320,7 @@ for `Gpu::row_prefetch()` (`crates/gpu/src/lib.rs:2673`), chosen at launch; the 
 | 6 | `gqa_flash_merge` | `crates/gpu/src/flash_gqa.rs:3477` | merges the segments' partial softmax | f32 |
 | 7 | `q3k_quantize_q8_1` | `crates/gpu/src/lib.rs:912` | q8_1 quantization of the attention rows (the same kernel quantizes the SwiGLU rows at 11, and the head's input) | f32 → q8_1 |
 | 8 | `qwen3moe_o_resid_q4k` | `crates/gpu/src/arch/qwen3moe/proj.rs:355` | Q4_K output projection plus the residual add | Q4_K |
-| 9 | `qwen3moe_router_norm` | `crates/gpu/src/route_softmax.rs:755` | FFN RMSNorm and q8_1 (every block), the router logits, then the ticketed routing (`publish_route`); one launch at `m` = 1 | f32 router weights |
+| 9 | `softmax_router_norm` | `crates/gpu/src/route_softmax.rs:755` | FFN RMSNorm and q8_1 (every block), the router logits, then the ticketed routing (`publish_route`); one launch at `m` = 1 | f32 router weights |
 | 10 | `qwen3moe_gate_up_swiglu_q4k` | `crates/gpu/src/arch/qwen3moe/experts.rs:136` | gate and up of the chosen experts with SwiGLU | Q4_K (other types: `elem::swiglu` :1137 and the `_sel` family: Q5_K, Q8_0, IQ2_XS/IQ3_XXS/IQ3_S/IQ4_XS, MXFP4, NVFP4, `dispatch.rs:1093-1230`) |
 | 11 | (7 again) | | quantizes the SwiGLU rows | |
 | 12 | `q4k_gemv_sel` / `q6k_gemv_sel` | `crates/gpu/src/q4k_sel.rs:344`, `q6k_sel.rs:166` | down projection of the chosen experts | Q4_K / Q6_K (also Q5_K, Q5_0, Q5_1, Q8_0, IQ*, MXFP4, NVFP4) |

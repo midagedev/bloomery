@@ -322,7 +322,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::Qwen3moeBody, Program::Qwen35Body],
         at: "models/src/shape.rs ROUTERS, the Qwen3moe and Qwen35moe bodies",
-        runs: |n| routes(n, &[RouterBody::Qwen3moe, RouterBody::Qwen35moe]),
+        runs: |n| routes(n, &[RouterBody::Softmax, RouterBody::Qwen35moe]),
     },
     Available {
         programs: &[Program::Qwen35Body],

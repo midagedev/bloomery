@@ -3247,7 +3247,7 @@ nsys-gpu-qwen35moe *DEPTHS:
 # BLOOMERY_NSYS_N - 1 replays; the table is the prompt's window, its units and the head, per kernel, with the grouped
 # GEMM summed. The header of tools/ref/nsys-gpu.sh has the boundary. Expected at P = 4096 on main [derived,
 # https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/q3next-design-report.md; not numbers of record]: gemm_q4k + gemm_q6k about 62 % of the prompt,
-# qwen3moe_router_logits 0.36-0.54 ms a launch. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
+# softmax_router_logits 0.36-0.54 ms a launch. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe-prefill *PROMPTS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
 
