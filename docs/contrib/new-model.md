@@ -143,8 +143,12 @@ and GLM-5.3-Flash. V4.1's DSpark draft is the exception, made from a local copy 
 Compose, do not write kernels first: MiMo's body is attention, a dense block and a routed block over the shared kernels,
 and the step is a walk of `runtime::sched` over `runtime::layer` programs (`gpu-mimo2/src/lib.rs:1-20`). A new kernel
 is a separate round with its own `ptx-scan` proof (the table in `AGENTS.md`, "Derive first"). Add the family to
-`Program`/`program_of` and `AVAILABLE` rows (`coverage.rs:30-61,76`) so the coverage list shrinks to empty. Build with
-`cargo oxide`, never plain `cargo` (`docs/BUILD.md:55`). `just mac-check` type-checks it without a card.
+`Program`/`program_of` and give it coverage rows so the coverage list shrinks to empty: the rows only this family runs
+live in its own module (an `AVAILABLE` table such as `arch/minimaxm3/spec.rs`, named by the family's `coverage` entry
+in `registry::ROWS`, so only a file of that row is checked against them), and a shared kernel's row is reused by its
+`runs` predicate instead of adding the family's `Program` to the common table in `coverage.rs`, where `check-model-tax`
+counts each name. Build with `cargo oxide`, never plain `cargo` (`docs/BUILD.md:55`). `just mac-check` type-checks it
+without a card.
 
 ### 6. App session
 

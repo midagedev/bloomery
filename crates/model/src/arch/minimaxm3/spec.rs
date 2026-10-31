@@ -8,13 +8,15 @@
 //! template's generation prompt opens and the model closes.
 
 use gguf::Split;
+use models::shape::RouterBody;
 use models::{
-    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, ReasoningFormat, Residual,
-    Rope, RopeMode, Selector,
+    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Need, OutGate, ReasoningFormat,
+    Residual, Rope, RopeMode, Selector,
 };
 
 use super::hparams::{Attn, FfnKind, Hparams, SWIGLU_ALPHA, SWIGLU_LIMIT};
 use super::roles;
+use crate::arch::coverage::{self, Available, Program};
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::PlacementError;
 
@@ -30,6 +32,84 @@ const REASONING: Option<ReasoningFormat> = Some(ReasoningFormat::ThinkSpan {
     open: "<mm:think>",
     close: "</mm:think>",
 });
+
+/// What the minimax-m3 body runs that the common table ([`coverage::AVAILABLE`]) does not list
+/// for it: one row per kernel instance, citing the constant or function that owns it.
+pub const AVAILABLE: &[Available] = &[
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "gpu/src/flash_gqa.rs GROUP_16 (the sparse layers over the picked blocks, \
+             enqueue_pass_p16_blocks)",
+        runs: coverage::gqa_group_16,
+    },
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "gpu-deepseek41/src/shared_routed.rs (the ungated shared expert beside the swigluoai ones)",
+        runs: coverage::ungated_shared,
+    },
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "gpu/src/rope_neox.rs head_norm_neox_append_128_partial (HEAD, ROT_PARTIAL: 64 of 128 dims)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: true,
+                    head: 128,
+                    mode: RopeMode::Neox,
+                    dims: 64
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "gpu-minimaxm3/src/attn.rs MsaShape::check (HEADS, DIM, BLOCK, ROT; top_k up to \
+             MAX_TOP_K, 32, and local up to top_k: runtime::msa::Msa::new)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::BlockMax {
+                    heads: 4,
+                    d: 128,
+                    top_k,
+                    block: 128,
+                    local,
+                    rope: 64,
+                } if *top_k <= 32 && runtime::msa::Msa::new(*top_k, 128, *local).is_ok()
+            )
+        },
+    },
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at 128 experts with the top 4 \
+             (gpu-deepseek41 router sigmoid_128_4, gpu-minimaxm3/src/ffn.rs)",
+        runs: |n| {
+            matches!(n, Need::Router(s) if (s.experts, s.top_k) == (128, 4))
+                && coverage::routes(n, &[RouterBody::BiasedSigmoid])
+        },
+    },
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "gpu-deepseek41/src/shared_routed.rs dense (the leading blocks under Act::SwigluOai; \
+             the down reads h as q8_1 blocks of 32)",
+        runs: |n| matches!(n, Need::SwigluOai { ff } if ff.is_multiple_of(32)),
+    },
+    Available {
+        programs: &[Program::MiniMaxM3Body],
+        at: "gpu-deepseek41/src/shared_routed.rs rule_of (the routed and shared experts under \
+             Act::SwigluOai; host.rs HostLayer::build_oai)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    act: Act::SwigluOai { .. },
+                    ..
+                }
+            )
+        },
+    },
+];
 
 /// `split`'s description and roles, and the defaults the key read took.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
@@ -127,8 +207,8 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
 mod tests {
     use models::{Act, Ffn, Mixer, OutGate, Score, Selector};
 
-    use super::super::hparams::tests::{keys, tensors};
-    use super::{SWIGLU_ALPHA, SWIGLU_LIMIT};
+    use super::super::hparams::tests::{keys, real, tensors};
+    use super::{SWIGLU_ALPHA, SWIGLU_LIMIT, spec_of};
     use crate::arch::coverage;
     use crate::arch::synthetic::{V, header_shaped};
 
@@ -225,17 +305,125 @@ mod tests {
         }
     }
 
-    /// Only the features no program runs are listed: the swigluoai blocks, the block-max
-    /// indexer, the sigmoid router and the program itself — and the chat surface's template
-    /// tool-call parser. Each is a coverage item, so a load refuses the file by name rather than
-    /// running it wrong. The `minimax-m2` pre-tokenizer is run by the tokenizer crate and is no item.
+    /// The selector row is the kernels' geometry: 4 index heads x 128 over blocks of
+    /// 128 roped over 64, keeping 1 to 32 blocks with 1 to `top_k` of them local. Any other
+    /// geometry or count is an item.
+    #[test]
+    fn the_selector_row_is_the_kernels_geometry() {
+        use models::Need;
+
+        use super::AVAILABLE;
+        let need = |heads, d, top_k, block, local, rope| Need::BlockMax {
+            heads,
+            d,
+            top_k,
+            block,
+            local,
+            rope,
+        };
+        let runs = |n: &Need| AVAILABLE.iter().any(|a| (a.runs)(n));
+        for n in [need(4, 128, 16, 128, 1, 64), need(4, 128, 32, 128, 32, 64)] {
+            assert!(runs(&n), "{n} is the kernels'");
+        }
+        for n in [
+            need(2, 128, 16, 128, 1, 64),
+            need(4, 64, 16, 128, 1, 64),
+            need(4, 128, 33, 128, 1, 64),
+            need(4, 128, 0, 128, 0, 64),
+            need(4, 128, 16, 64, 1, 64),
+            need(4, 128, 16, 128, 0, 64),
+            need(4, 128, 16, 128, 17, 64),
+            need(4, 128, 16, 128, 1, 128),
+        ] {
+            assert!(!runs(&n), "{n} is no kernel's");
+        }
+    }
+
+    /// The rope, router and dense rows are the kernels' instances: the q/k-normed NeoX rope over
+    /// 64 of 128 values, the 128-expert top-4 router (not the body table's 128/top-6 row) and a
+    /// dense block whose width is whole q8_1 blocks of 32. Mutants: the rope's norm or mode
+    /// dropped, the router's `(128, 4)` check dropped, or the dense width held to 256 again.
+    #[test]
+    fn the_rows_are_the_kernels_instances() {
+        use models::shape::{MoeShape, rules};
+        use models::{Need, RopeMode};
+
+        use super::AVAILABLE;
+        let runs = |n: &Need| AVAILABLE.iter().any(|a| (a.runs)(n));
+        let rope = |qk_norm, mode| Need::QkRope {
+            qk_norm,
+            head: 128,
+            mode,
+            dims: 64,
+        };
+        let router = |experts, top_k| {
+            Need::Router(MoeShape {
+                rule: rules::BIASED_SIGMOID,
+                experts,
+                top_k,
+            })
+        };
+        let dense = |ff| Need::SwigluOai { ff };
+        for n in [
+            rope(true, RopeMode::Neox),
+            router(128, 4),
+            dense(128),
+            dense(12288),
+        ] {
+            assert!(runs(&n), "{n} is the kernels'");
+        }
+        for n in [
+            rope(false, RopeMode::Neox),
+            rope(true, RopeMode::None),
+            rope(true, RopeMode::NormTail),
+            router(128, 6),
+            dense(48),
+        ] {
+            assert!(!runs(&n), "{n} is no kernel's");
+        }
+    }
+
+    /// The released file's shape ([`real`]): every need its layers make is a row of the program's
+    /// (the head-128 group-16 flash, the q/k norm with the NeoX rope over 64 of 128 values, the
+    /// block-max indexer of 4 heads x 128 over blocks of 128, the 128-expert top-4 router, the
+    /// swigluoai dense block and experts, the ungated shared expert), so none is an item.
+    /// Mutant: one of those rows dropped, or the program taken off it.
+    #[test]
+    fn the_released_shape_is_covered() {
+        let (small, _) = read("mm3-released");
+        let spec = spec_of(&real(), small.spec.chat.clone()).expect("the released description");
+        let needs: Vec<String> = models::needs(&spec)
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert!(
+            needs
+                .iter()
+                .any(|n| n.starts_with("block-max indexer: 4 heads x 128"))
+        );
+        let items: Vec<String> = coverage::check(&spec, &small.tensors)
+            .into_iter()
+            .map(|u| u.feature)
+            .filter(|f| needs.contains(f))
+            .collect();
+        assert!(items.is_empty(), "{items:#?}");
+    }
+
+    /// What no kernel is built for stays listed: the small header's head-16 flash and rope, its
+    /// 2 x 16 indexer over blocks of 4, its 8-expert router and its dense block 48 wide, besides the
+    /// chat surface's template tool-call parser. Each is a coverage item, so a load refuses the file
+    /// by name rather than running it wrong. The `minimax-m2` pre-tokenizer is run by the tokenizer
+    /// crate and is no item.
     #[test]
     fn what_no_program_runs_is_listed() {
         let (_, items) = read("mm3-coverage");
         let listed = |needle: &str| items.iter().any(|f| f.contains(needle));
         for needle in [
-            "swigluoai",
+            "GQA flash, head 16, group 4",
+            "per-head QK norm plus rope: head 16",
             "block-max indexer: 2 heads x 16, blocks of 4 keep 3 (1 local)",
+            "router: sigmoid, 8 experts, top 2",
+            "dense swigluoai layer: ff 48",
         ] {
             assert!(listed(needle), "{needle:?} not listed: {items:#?}");
         }

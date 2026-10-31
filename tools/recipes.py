@@ -4830,8 +4830,9 @@ Hit = tuple[RootKey, str, int]  # (the root a file is compiled in, the file, the
 
 # ---- run-time dispatch by the opened file's architecture: the arch registry ----
 #
-# The registry's table holds one row per group of `general.architecture` strings, and a row holds function pointers: the
-# family's reader (`read: Some(qwen35moe::spec::read)`) and its draft rule. `registry::row_of(arch)` picks a row by the
+# The registry's table holds one row per group of `general.architecture` strings, and a row holds pointers: the family's
+# reader (`read: Some(qwen35moe::spec::read)`), its draft rule and its own coverage rows (`coverage: Some(..)`, the ones
+# `coverage::rows` adds for a file of the row). `registry::row_of(arch)` picks a row by the
 # architecture of the file a program opened, so the item graph below reaches every family's reader from every unit that
 # names the table (rule 6 of Reach). The edges from the table to a row's entries are therefore dispatch edges: a gate's
 # reach keeps the ones of a row only when the gate can open a file of that row (Reach.gate_archs: its profile, the names
@@ -4846,7 +4847,7 @@ ARCH_REGISTRY = ("crates/model/src/arch/registry.rs", "ROWS")  # (file, the tabl
 MODEL_SELECTORS = re.compile(r"BLOOMERY_REF_MODEL|BLOOMERY_V41_MODEL|(?:^|\s)(?:-m|--model|--hf)(?:\s|=)")
 _ROW_START = re.compile(r"\bArchRow\s*\{")
 _ROW_NAMES = re.compile(r"\bnames\s*:\s*(&\s*\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_]*)")
-_ROW_PICK = re.compile(r"\b(?:read|draft)\s*:\s*Some\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)")
+_ROW_PICK = re.compile(r"\b(?:read|draft|coverage)\s*:\s*Some\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)")
 _STR_LIT = re.compile(r'"([^"\\]*)"')
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ANY_ARCH = "*"  # a row whose strings the reach cannot read: every gate keeps it
@@ -4861,7 +4862,7 @@ def arch_norm(name: str) -> str:
 @dataclass
 class Dispatch:
     """The registry's table in one root: its node, each row's architecture strings (arch_norm), the node of each row's
-    entries (reader, draft rule) with the rows that name it, and the units that walk every row."""
+    entries (reader, draft rule, coverage rows) with the rows that name it, and the units that walk every row."""
 
     node: int
     rows: list[frozenset[str]]

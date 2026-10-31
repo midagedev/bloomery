@@ -1,11 +1,12 @@
 //! The coverage check: what of a file no program in this tree runs, every
 //! item listed at once ([`check`]). It joins the model's [`needs`] with a
-//! table of what exists ([`AVAILABLE`], one row per kernel instance or
-//! program step, each citing the constant or the function that owns it; the
-//! routers' and the GQA flashes' rows ask the shape table `models::shape`,
-//! which the router crates are held to), the card formats of the tensors'
-//! types ([`CardFormat`], the format owner), the program's per-tensor type
-//! pins, the pre-tokenizers the tokenizer runs
+//! table of what exists ([`rows`]: the common [`AVAILABLE`] and the rows a
+//! family's own code keeps, which its registry row names; one row per
+//! kernel instance or program step, each citing the constant or the
+//! function that owns it; the routers' and the GQA flashes' rows ask the
+//! shape table `models::shape`, which the router crates are held to), the
+//! card formats of the tensors' types ([`CardFormat`], the format owner),
+//! the program's per-tensor type pins, the pre-tokenizers the tokenizer runs
 //! (`tokenizer::runs_pre_tokenizer`, the tokenizer's own table) and the chat
 //! parsers.
 //!
@@ -26,7 +27,7 @@ pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
 use models::{
-    Collapse, DeltaKind, Extra, GdnGate, HcMix, KHeadMap, KdaGate, LatentUp, ModelSpec, Need,
+    Arch, Collapse, DeltaKind, Extra, GdnGate, HcMix, KHeadMap, KdaGate, LatentUp, ModelSpec, Need,
     RopeMode, needs,
 };
 
@@ -43,8 +44,9 @@ pub struct Available {
     pub runs: fn(&Need) -> bool,
 }
 
-/// Everything the programs run that a [`Need`] names. A need no row covers
-/// is an item of [`check`]; a row removed makes its needs items.
+/// Everything the programs run that a [`Need`] names, beside the rows a
+/// family's own code keeps ([`rows`]). A need no row covers is an item of
+/// [`check`]; a row removed makes its needs items.
 pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::FlintBody],
@@ -91,15 +93,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::FlintBody],
         at: "gpu-deepseek41/src/shared_routed.rs (ungated shared expert)",
-        runs: |n| {
-            matches!(
-                n,
-                Need::Shared {
-                    sigmoid_gate: false,
-                    ..
-                }
-            )
-        },
+        runs: ungated_shared,
     },
     Available {
         programs: &[Program::FlintBody],
@@ -138,15 +132,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::Deepseek41Chain],
         at: "gpu-deepseek41/src/chain/ffn.rs (the shared expert)",
-        runs: |n| {
-            matches!(
-                n,
-                Need::Shared {
-                    sigmoid_gate: false,
-                    ..
-                }
-            )
-        },
+        runs: ungated_shared,
     },
     Available {
         programs: &[Program::Deepseek41Chain],
@@ -241,19 +227,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::NemotronHMoeBody],
         at: "gpu/src/flash_gqa.rs GROUP_16 (two group-8 passes a key head)",
-        runs: |n| {
-            matches!(
-                n,
-                Need::Gqa {
-                    head,
-                    value,
-                    group,
-                    window: None,
-                    sinks: false,
-                    scaled: false,
-                } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 16)
-            )
-        },
+        runs: gqa_group_16,
     },
     Available {
         programs: &[Program::NemotronHMoeBody],
@@ -517,15 +491,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::Glm5nextBody, Program::Solar2Body],
         at: "gpu-glm5next/src/ffn.rs (the shared expert)",
-        runs: |n| {
-            matches!(
-                n,
-                Need::Shared {
-                    sigmoid_gate: false,
-                    ..
-                }
-            )
-        },
+        runs: ungated_shared,
     },
     Available {
         programs: &[Program::Glm5nextBody, Program::Mimo2Body],
@@ -1065,8 +1031,35 @@ pub fn turns_as_neox(mode: RopeMode, dims: u32) -> bool {
 /// Whether the router `n` names has an instance among `bodies`' rows: the
 /// row [`select_router`] picks, so a count or a pick the launchers refuse
 /// is an item here too.
-fn routes(n: &Need, bodies: &[RouterBody]) -> bool {
+pub(crate) fn routes(n: &Need, bodies: &[RouterBody]) -> bool {
     matches!(n, Need::Router(s) if select_router(*s).is_ok_and(|r| bodies.contains(&r.body)))
+}
+
+/// Whether `n` is a shared expert without a sigmoid gate (`gpu-deepseek41/src/shared_routed.rs`).
+pub(crate) fn ungated_shared(n: &Need) -> bool {
+    matches!(
+        n,
+        Need::Shared {
+            sigmoid_gate: false,
+            ..
+        }
+    )
+}
+
+/// Whether `n` is a flash of the group-16 row (`gpu/src/flash_gqa.rs` `GROUP_16`, two group-8
+/// passes a key head): the value head the key head's, no window, sinks or value scale.
+pub(crate) fn gqa_group_16(n: &Need) -> bool {
+    matches!(
+        n,
+        Need::Gqa {
+            head,
+            value,
+            group,
+            window: None,
+            sinks: false,
+            scaled: false,
+        } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 16)
+    )
 }
 
 /// A tensor family whose type a program pins, and the types it reads.
@@ -2094,10 +2087,22 @@ fn unrun_role(role: Role) -> &'static str {
 /// model-wide ones. Empty for a file a program runs whole.
 #[must_use]
 pub fn check(spec: &ModelSpec, model: &ModelTensors) -> Vec<Unimplemented> {
-    check_with(spec, model, AVAILABLE)
+    check_with(spec, model, &rows(spec.arch))
 }
 
-/// [`check`] against the table `available` instead of [`AVAILABLE`].
+/// The rows a file of `arch` is checked against: [`AVAILABLE`] and the rows its family's own code
+/// keeps, which its registry row names (`registry::ArchRow::coverage`).
+#[must_use]
+pub fn rows(arch: Arch) -> Vec<Available> {
+    let own = super::registry::row_of(arch.name()).and_then(|row| row.coverage);
+    AVAILABLE
+        .iter()
+        .chain(own.into_iter().flatten())
+        .copied()
+        .collect()
+}
+
+/// [`check`] against the table `available` instead of [`rows`].
 #[must_use]
 pub fn check_with(
     spec: &ModelSpec,
