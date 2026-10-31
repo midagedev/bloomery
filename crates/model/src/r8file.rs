@@ -21,7 +21,6 @@
 //! before the data, and [`verify`] compares every byte with the source, which
 //! the card upload reads anyway.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
@@ -1252,15 +1251,8 @@ fn check(path: &Path, g: &Gguf, now: &Inputs<&[u8]>) -> Result<(), R8Error> {
     );
     let heads = entries(path, g, KEY_HEADS, n, Value::as_str)?;
     let tails = entries(path, g, KEY_TAILS, n, Value::as_str)?;
-    let mut seen = HashSet::with_capacity(n);
     for ((i, t), s) in g.iter_tensors().enumerate().zip(&now.stacks) {
         let tensor = || t.name.clone();
-        if !seen.insert(t.name.as_str()) {
-            return Err(R8Error::DuplicateTensor {
-                path: path.to_path_buf(),
-                tensor: tensor(),
-            });
-        }
         if t.ty != GgmlType::Unknown(Q3K_R8_TYPE) {
             return Err(R8Error::TensorType {
                 path: path.to_path_buf(),

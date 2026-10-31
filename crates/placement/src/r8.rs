@@ -108,8 +108,6 @@ pub enum R8Error {
         recorded: String,
         found: String,
     },
-    #[error("{}: tensor {tensor} appears twice", .path.display())]
-    DuplicateTensor { path: PathBuf, tensor: String },
     #[error("{}: tensor {tensor} has type id {got}, a sidecar's are {}", .path.display(), Q3K_R8_TYPE)]
     TensorType {
         path: PathBuf,

@@ -457,11 +457,15 @@ fn every_identity_difference_is_refused_by_name() {
             change: |d| {
                 let (first, side) = copied(d);
                 // G1's name becomes G0's in the header: the writer refuses a
-                // repeated name, a foreign writer need not.
+                // repeated name, a foreign writer need not, and the GGUF
+                // reader refuses it at open.
                 flip(&side, find_bytes(&side, G1.as_bytes()) + 4, b'1' ^ b'0');
                 (first, side)
             },
-            want: |e| matches!(e, R8Error::DuplicateTensor { tensor, .. } if tensor == G0),
+            want: |e| {
+                matches!(e, R8Error::Open { source: LoadError::DuplicateTensor { name, .. }, .. }
+                    if name == G0)
+            },
         },
         Case {
             label: "identity pair absent",
