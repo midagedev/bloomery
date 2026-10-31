@@ -2101,7 +2101,8 @@ impl FfnPiece {
     /// with that bias: the router's scores once over the block, then a pick
     /// launch per run of tokens of one kind
     /// ([`RouterKernels::enqueue_router_rows_runs`]). Returns the router's
-    /// pick launches. Asynchronous, allocation-free without `vl`.
+    /// pick launches and, on a layer with card experts, the map row's copy.
+    /// Asynchronous, allocation-free without `vl`.
     pub fn enqueue_batch_route(
         &mut self,
         gpu: &Gpu,
@@ -2209,7 +2210,7 @@ impl FfnPiece {
                 dtod(stream, &mut b.gemm.map_row, 0, &row, self.n_expert)?;
             }
         }
-        Ok(picks)
+        Ok(picks + usize::from(c.n_card > 0))
     }
 
     /// The expert tier's places of the block `io`'s slots, after the batch's

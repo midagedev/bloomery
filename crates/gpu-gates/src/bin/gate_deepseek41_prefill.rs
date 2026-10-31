@@ -2660,8 +2660,9 @@ mod gate {
         parts: &[usize],
         window: usize,
     ) -> Result<Case, GateError> {
-        // The reader's rows are the batch's own values: the band judges them
-        // through the logits, so only their positions are taken.
+        // PIN(2026-10-30): the grouped GEMM's sum order moved the step-bit cache and feature-value
+        // comparisons, so those clauses are removed; only the tap's positions are taken here, and the
+        // logits do not read the tap's rows. gate-gpu-ds41-tier's B8 holds the rows to the steps'.
         let mut taps: Vec<usize> = Vec::new();
         let mut needs = Vec::new();
         let mut at = 0;

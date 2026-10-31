@@ -75,32 +75,26 @@ impl LogitsBand {
 
     /// Fold one position in: the reference's `want` decides the clarity
     /// margin and the top-1, the other order's `got` its distance from
-    /// the reference's values. Both rows are f32 bits.
+    /// the reference's values. Both rows are f32 bits; the top two are
+    /// [`crate::kld::top2`]'s, ties to the lower id.
     pub fn add(&mut self, got: &[u32], want: &[u32]) {
-        self.aligned &= got.len() == want.len();
-        // The reference's top two decide whether the position is clear;
-        // the first maximum wins, so ties go to the lower id.
-        let (mut top1, mut top2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for &b in want {
-            let v = f32::from_bits(b);
-            if v > top1 {
-                top2 = top1;
-                top1 = v;
-            } else if v > top2 {
-                top2 = v;
-            }
+        if got.len() != want.len() || got.len() < 2 {
+            self.aligned = false;
+            return;
         }
+        let got: Vec<f32> = got.iter().copied().map(f32::from_bits).collect();
+        let want: Vec<f32> = want.iter().copied().map(f32::from_bits).collect();
+        let (got_id, _, _, _) = crate::kld::top2(&got);
+        let (want_id, top1, _, top2) = crate::kld::top2(&want);
         let clear = top1 - top2 >= MARGIN_FLOOR;
         self.clear += usize::from(clear);
-        if clear && argmax(got) != argmax(want) {
-            self.disagree += 1;
-        }
-        for (&g, &w) in got.iter().zip(want) {
-            let d = (f64::from(f32::from_bits(g)) - f64::from(f32::from_bits(w))).abs();
+        self.disagree += usize::from(clear && got_id != want_id);
+        for (&g, &w) in got.iter().zip(&want) {
+            let d = (f64::from(g) - f64::from(w)).abs();
             self.max = self.max.max(d);
             self.sq += d * d;
         }
-        self.values += got.len().min(want.len());
+        self.values += got.len();
     }
 
     /// The RMS |Δlogit| over the compared values.
@@ -121,18 +115,6 @@ impl Default for LogitsBand {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The row's argmax in the reference's order, logit descending and id
-/// ascending: the first maximum. The row is f32 bits.
-pub fn argmax(row: &[u32]) -> usize {
-    let mut best = 0;
-    for (i, &b) in row.iter().enumerate() {
-        if f32::from_bits(b) > f32::from_bits(row[best]) {
-            best = i;
-        }
-    }
-    best
 }
 
 /// One run's positions in order: the token each position took and the

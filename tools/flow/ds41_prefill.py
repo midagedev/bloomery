@@ -214,6 +214,7 @@ IDX_ONLY = frozenset(x["l"] for x in _LAYERS if x["indexer"]) - SOURCES
 INDEXERS = SOURCES | IDX_ONLY
 ENGRAM = frozenset(x["l"] for x in _LAYERS if x["engram"])
 _RATIO = {x["l"]: x["ratio"] for x in _LAYERS}
+_CARD = {x["l"]: x["card_experts"] for x in _LAYERS}
 # The candidate mask (gpu-deepseek41 chain/attn.rs enqueue_select): the ratio-1 stream's compressor layer is its
 # source (20), the indexer layers that read that stream its consumers (24, 28, 32, 36).
 CAND_SOURCE = frozenset(l for l in SOURCES if _RATIO[l] == 1)
@@ -1031,6 +1032,9 @@ def route_lb(p, cfg, lb):
             tail = (T * p["router_tok"] + nfull * p["places"]) / 1000.0 + TAIL_PREBULK_ACTS * g
             acts += TAIL_PREBULK_ACTS
         ev += TAIL_EVENTS
+        if cfg.get("imma") and _CARD.get(l, 0) > 0:
+            tail += g                      # the map row's copy into the batch's GEMM copy
+            acts += 1
     terms["tail"] = tail
     clk = cfg.get("_clk", 1.0)
     if clk != 1.0:
@@ -3606,8 +3610,12 @@ def self_test():
         cfront, clbs = counts(P, "CW2")
         role = sum(2 * len(x["lb"].full) for x in evaluate(central(), dict(CONFIGS["PG2"], ced=True), P)["recs"]
                    if cand_acts(x["lb"].l))
+        # and the IMMA arm's map row copy, one a layer-batch with full chunks on a layer with card experts
+        role += sum(1 for x in evaluate(central(), dict(CONFIGS["CW2"]), P)["recs"]
+                    if x["lb"].full and _CARD.get(x["lb"].l, 0) > 0)
         moved = {k: (clbs[k][0] - lbs[k][0], clbs[k][1] - lbs[k][1]) for k in lbs}
-        check(f"CW2 at P {P} = PG2 + the mask's 2 a full chunk on layers 20, 24, 28, 32, 36 ({role} route entries)",
+        check(f"CW2 at P {P} = PG2 + the mask's 2 a full chunk on layers 20, 24, 28, 32, 36 and the map row's copy "
+              f"({role} route entries)",
               cfront == front and clbs.keys() == lbs.keys() and role > 0
               and sum(r for r, _ in moved.values()) == role and all(s == 0 for _, s in moved.values()),
               str(sum(r for r, _ in moved.values())))

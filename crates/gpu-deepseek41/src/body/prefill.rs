@@ -2627,7 +2627,7 @@ impl<'a> GroupCx<'a> {
         };
         // Each chunk's norm, the router's score launch over the block and
         // its picks — one, or on a media call one a run of one kind — the
-        // places.
+        // places, and on a layer with card experts the map row's copy.
         self.tally
             .route(i, m.set, (m.cuts.len() - full) as u64 + 2 + picks as u64)?;
         if tiered {
