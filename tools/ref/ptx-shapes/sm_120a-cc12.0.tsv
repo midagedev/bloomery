@@ -49,6 +49,8 @@ generate_ds41 argmax_rows_fault 0 0
 generate_ds41 argmax_rows_finite_fault 0 0
 generate_ds41 attn_out_gate_sigmoid 0 0
 generate_ds41 attn_out_gate_sigmoid_head 0 0
+generate_ds41 best_merge 0 0
+generate_ds41 best_part 0 0
 generate_ds41 bf16_cols 0 0
 generate_ds41 bf16_gemv 0 0
 generate_ds41 bf16_gemv_ids 0 0
