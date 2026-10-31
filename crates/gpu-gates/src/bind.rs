@@ -1190,6 +1190,7 @@ enum Cmd {
         last: u32,
         history: Vec<u32>,
         sampler: serve::Sampler,
+        best: Option<usize>,
         out: Vec<u32>,
     },
     Reset,
@@ -1276,11 +1277,13 @@ pub struct SlotPassRow {
 
 /// What a sampled row of a [`Cmd::PassSlots`] draws with, crossing to the
 /// engine thread and back with the row: the request's history, handed back
-/// as it was given, and its sampler, its state moved one draw a kept id
-/// ([`Seat::pass_sampled`]'s).
+/// as it was given, its sampler, its state moved one draw a kept id, and the
+/// most of a row's best logits the sampler reads (`serve::SlotDraw`'s
+/// `best`) ([`Seat::pass_sampled`]'s).
 pub struct RowDraw {
     pub history: Vec<u32>,
     pub sampler: serve::Sampler,
+    pub best: Option<usize>,
 }
 
 /// What a reply carries besides its result.
@@ -1425,16 +1428,18 @@ pub trait Seat: 'static {
     /// up to the first that is not the proposal's next; the taken ids into
     /// `out`, and what the draft proposed and kept. `history` comes back as
     /// it was given, the sampler with its state moved one draw a taken id.
-    /// Asked only of a seat that [`Seat::drafts_sampled`]; the default
-    /// refuses by name.
+    /// `best` is the most of a row's best logits the sampler reads
+    /// (`serve::Engine::advance_sampled`'s). Asked only of a seat that
+    /// [`Seat::drafts_sampled`]; the default refuses by name.
     fn pass_sampled(
         &mut self,
         last: u32,
         history: &mut Vec<u32>,
         sampler: &mut serve::Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
-        let _ = (last, history, sampler, out);
+        let _ = (last, history, sampler, best, out);
         Err("this seat does not draft a sampled request".into())
     }
     /// Whether the seat runs [`Seat::pass_sampled`]: it drafts and reads its
@@ -1789,12 +1794,19 @@ impl SeatEngine {
                             last,
                             mut history,
                             mut sampler,
+                            best,
                             mut out,
                         } => {
                             let at = g.pos();
                             out.clear();
-                            let r =
-                                pass_sampled(&mut g, last, &mut history, &mut sampler, &mut out);
+                            let r = pass_sampled(
+                                &mut g,
+                                last,
+                                &mut history,
+                                &mut sampler,
+                                best,
+                                &mut out,
+                            );
                             let (result, drafted) = match r {
                                 Ok(d) => (Ok(0), d),
                                 Err(e) => (
@@ -2195,6 +2207,7 @@ impl Link {
         last: u32,
         history: Vec<u32>,
         sampler: serve::Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, serve::Sampler) {
         let gone = |why: &str| EngineError(why.to_owned());
@@ -2202,6 +2215,7 @@ impl Link {
             last,
             history,
             sampler,
+            best,
             out: std::mem::take(out),
         };
         let sent = match self.tx.as_ref() {
@@ -2366,6 +2380,7 @@ impl Link {
                             r.slot
                         ))
                     })?,
+                    best: d.best,
                 }),
                 None => None,
             };
@@ -2447,6 +2462,7 @@ fn pass_sampled<S: Seat + ?Sized>(
     last: u32,
     history: &mut Vec<u32>,
     sampler: &mut serve::Sampler,
+    best: Option<usize>,
     out: &mut Vec<u32>,
 ) -> Result<Drafted, String> {
     let rows = g.pass_rows();
@@ -2459,7 +2475,7 @@ fn pass_sampled<S: Seat + ?Sized>(
     }
     let given = history.len();
     let d = g
-        .pass_sampled(last, history, sampler, out)
+        .pass_sampled(last, history, sampler, best, out)
         .map_err(|e| e.to_string())?;
     if out.is_empty() || out.len() > rows {
         return Err(format!("a pass of {rows} rows kept {} tokens", out.len()));
@@ -2714,7 +2730,14 @@ pub fn pass_rows_in_turn<S: Seat + ?Sized>(
             r.out.clear();
             match r.draw.as_mut() {
                 None => pass(g, r.last, &mut r.out),
-                Some(d) => pass_sampled(g, r.last, &mut d.history, &mut d.sampler, &mut r.out),
+                Some(d) => pass_sampled(
+                    g,
+                    r.last,
+                    &mut d.history,
+                    &mut d.sampler,
+                    d.best,
+                    &mut r.out,
+                ),
             }
             .map_err(|e| format!("pass at position {at}: {e}"))
         });
@@ -3314,9 +3337,10 @@ impl Engine for SeatEngine {
         last: u32,
         history: Vec<u32>,
         sampler: serve::Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, serve::Sampler) {
-        self.link.pass_sampled(last, history, sampler, out)
+        self.link.pass_sampled(last, history, sampler, best, out)
     }
 
     /// The seat's declaration ([`Seat::drafts_sampled`]), read once at the
@@ -3822,6 +3846,7 @@ mod tests {
                 draw: Some(serve::SlotDraw {
                     history: &history,
                     sampler: &mut sampler,
+                    best: None,
                 }),
             },
         ];
@@ -3894,7 +3919,11 @@ mod tests {
                 last: 3,
                 out,
                 drafted: serve::Drafted::default(),
-                draw: Some(serve::SlotDraw { history, sampler }),
+                draw: Some(serve::SlotDraw {
+                    history,
+                    sampler,
+                    best: None,
+                }),
             })
             .collect();
         let result = link.pass_slots(&mut rows);

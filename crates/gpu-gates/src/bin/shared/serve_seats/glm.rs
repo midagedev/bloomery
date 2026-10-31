@@ -1709,12 +1709,13 @@ impl Seat for Glm {
         last: u32,
         history: &mut Vec<u32>,
         sampler: &mut serve::Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
         let sel = self.s.selected();
         let d = self
             .drafted
-            .pass_sampled(&mut self.s, sel, last, history, sampler, out)?;
+            .pass_sampled(&mut self.s, sel, last, history, sampler, best, out)?;
         self.print_passes()?;
         Ok(d)
     }

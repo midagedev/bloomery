@@ -1663,6 +1663,7 @@ impl Slot {
         history: &[u32],
         lent: &mut Vec<u32>,
         sampler: Sampler,
+        best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Sampler) {
         let held = std::mem::take(&mut self.held);
@@ -1671,7 +1672,7 @@ impl Slot {
         lent.extend_from_slice(history);
         let (d, back, sampler) =
             self.engine
-                .advance_sampled(last, std::mem::take(lent), sampler, out);
+                .advance_sampled(last, std::mem::take(lent), sampler, best, out);
         let d = d.and_then(|d| {
             self.check_pass(out, d)?;
             if back != history {
@@ -2127,6 +2128,9 @@ pub(crate) struct Gen {
     /// Whether a pass of several slots holds the pick, from its row's making
     /// ([`Gen::pass_row`]) to the round's count ([`Gen::advanced`]).
     lending: bool,
+    /// The most of a row's best logits the pick reads in a pass
+    /// ([`Engine::advance_sampled`]'s `best`, [`best_read`]).
+    best: Option<usize>,
     stops: Vec<u32>,
     /// The engine's logits row, or empty on a request that reads none.
     logits: Vec<f32>,
@@ -2192,6 +2196,22 @@ pub(crate) struct Gen {
     tail: bool,
 }
 
+/// The most of a row's best logits a request of `p` picks its pass's ids
+/// from ([`Engine::advance_sampled`]'s `best`): its sampler's
+/// ([`SamplingParams::best_read`]) or a greedy request's argmax, plus each
+/// id its `bias` lowers, which can make room among the best for the next.
+/// `None`, the whole row, for a request that asks for probabilities or
+/// follows a program, and for a bias that raises an id, which can come from
+/// anywhere in the row.
+fn best_read(p: &GenParams, bias: &Bias, greedy: bool) -> Option<usize> {
+    let raises = bias.add.iter().any(|&(_, b)| b > 0.0);
+    if p.logprobs.is_some() || p.constraint.is_some() || raises {
+        return None;
+    }
+    let k = if greedy { 1 } else { p.sampling.best_read()? };
+    Some(k + bias.add.len() + bias.banned.len())
+}
+
 /// The sampler a request of `p` draws with, `None` for a greedy one, or the
 /// factory's refusal of its parameters. A penalized request at temperature 0
 /// takes the sampler's argmax after the penalties, as llama-server's chain
@@ -2220,6 +2240,7 @@ impl Gen {
             },
         };
         let greedy = sampler.is_none();
+        let best = best_read(p, &bias, greedy);
         // A program picks from its own biased copy of the row ([`Pick::choose`]).
         let sampler = if bias.is_empty() || p.constraint.is_some() {
             sampler
@@ -2268,6 +2289,7 @@ impl Gen {
             lent,
             draw: Some(draw),
             lending: false,
+            best,
             stops,
             logits,
             tim: Timings::default(),
@@ -3081,6 +3103,7 @@ impl Gen {
             &self.history,
             &mut self.lent_history,
             draw,
+            self.best,
             &mut self.kept,
         );
         self.take_back();
@@ -3101,6 +3124,7 @@ impl Gen {
             Some(SlotDraw {
                 history: &self.history,
                 sampler: &mut self.draw,
+                best: self.best,
             })
         } else {
             None
@@ -5258,9 +5282,11 @@ mod sampled_tests {
             last: u32,
             history: Vec<u32>,
             sampler: Sampler,
+            best: Option<usize>,
             out: &mut Vec<u32>,
         ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
-            self.inner.advance_sampled(last, history, sampler, out)
+            self.inner
+                .advance_sampled(last, history, sampler, best, out)
         }
         fn drafts_sampled(&self) -> bool {
             self.inner.drafts_sampled()

@@ -824,7 +824,12 @@ requests: each kept id is the request's own pick from its verified row (its samp
 biased id's bias added, every banned id's logit at -inf and, under a schema, every id it does not allow masked out),
 as llama.cpp's speculative decoding takes it, so a request of one seed takes the same ids alone and beside others.
 Its probabilities are read from the same verified rows, so they are the values its steps would report. A forced
-call's program waits for the model's own close of its think span stepping one token at a time.
+call's program waits for the model's own close of its think span stepping one token at a time. A pass reads each
+verified row back whole only when its request needs the whole row: one whose pick reads at most the row's 64 best
+logits (its sampler's `top_k` after penalties that only lower a logit, one more for each id the penalty window or a
+negative `logit_bias` or `ignore_eos` can lower, or the argmax of a greedy request) reads those 64 ids and logits a
+row from the card instead of the vocabulary's floats. Probabilities, a schema, `top_k` 0, and a penalty or a bias
+that can raise a logit read the whole row.
 A request under DSpark decodes one token a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts

@@ -285,6 +285,14 @@ pub trait RowLogits: Target {
     /// row 0, or row `r` of a verify waiting for its commit. Refused by name
     /// for a row the call did not run, and for a row holding a NaN.
     fn row_logits(&mut self, r: usize) -> Result<&[f32], Self::Error>;
+
+    /// Row `r` as a pick that reads only the row's best logits reads it: the
+    /// target may keep its best logits in place and every other at -inf, a
+    /// read of a few words in place of the row. Refused as
+    /// [`RowLogits::row_logits`] refuses. The default is the whole row.
+    fn row_best(&mut self, r: usize) -> Result<&[f32], Self::Error> {
+        self.row_logits(r)
+    }
 }
 
 /// Which id a pass takes at each row it ran, asked row by row in position
@@ -313,6 +321,16 @@ pub struct Sample<F>(pub F);
 impl<T: RowLogits, F: FnMut(&[f32]) -> u32> Pick<T> for Sample<F> {
     fn pick(&mut self, t: &mut T, r: usize, _argmax: u32) -> Result<u32, T::Error> {
         Ok((self.0)(t.row_logits(r)?))
+    }
+}
+
+/// [`Sample`] for a closure that reads only a row's best logits: each row
+/// read by [`RowLogits::row_best`].
+pub struct SampleBest<F>(pub F);
+
+impl<T: RowLogits, F: FnMut(&[f32]) -> u32> Pick<T> for SampleBest<F> {
+    fn pick(&mut self, t: &mut T, r: usize, _argmax: u32) -> Result<u32, T::Error> {
+        Ok((self.0)(t.row_best(r)?))
     }
 }
 

@@ -112,7 +112,15 @@ fn sample(
             &history[history.len().saturating_sub(p.repeat_last_n)..],
         );
     }
-    let by_logit_desc = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+    // The engine's order: the larger logit first, equal ones (`-0` and `+0`
+    // too) by id, so a row pruned to its best on the card draws the same.
+    let by_logit_desc = |a: &(u32, f32), b: &(u32, f32)| {
+        if a.1 == b.1 {
+            a.0.cmp(&b.0)
+        } else {
+            b.1.total_cmp(&a.1)
+        }
+    };
     if p.temperature <= 0.0 {
         return cand
             .iter()
@@ -210,6 +218,25 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference sampler ties `-0` and `+0` by id, as the engine and the
+    /// card's best read do: a row of `-0` before a `+0` draws the same id
+    /// whole as pruned to its best 64.
+    #[test]
+    fn the_reference_sampler_ties_zeros_by_id() {
+        let p = SamplingParams {
+            top_k: 1,
+            temperature: 1.0,
+            ..SamplingParams::default()
+        };
+        let mut row = vec![-1.0f32; 100];
+        row[..64].fill(-0.0);
+        row[64] = 0.0;
+        let mut pruned = row.clone();
+        pruned[64..].fill(f32::NEG_INFINITY);
+        let mut draw = reference_factory()(&p).unwrap_or_else(|e| panic!("refused: {e}"));
+        assert_eq!([draw(&row, &[]), draw(&pruned, &[])], [0, 0]);
+    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite

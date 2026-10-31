@@ -19,7 +19,7 @@ use bloomery_gpu_gates::record;
 use runtime::{Target, Widths, Window};
 use serve::Drafted;
 
-use super::drafted::SlotDrafts;
+use super::drafted::{SlotDrafts, reads_best};
 
 /// One round of several slots' steps, a seat's [`Seat::step_slots`]
 /// override, its one owner: the fallback loop ([`step_rows_in_turn`], which
@@ -273,6 +273,7 @@ where
                 r.last,
                 &mut d.history,
                 &mut d.sampler,
+                d.best,
                 &mut r.out,
             )?,
         };
@@ -345,11 +346,13 @@ where
             .iter_mut()
             .map(|d| {
                 d.as_mut().map(|d| {
-                    move |row: &[f32]| {
+                    let best = reads_best(d.best);
+                    let draw = move |row: &[f32]| {
                         let id = (d.sampler)(row, &d.history);
                         d.history.push(id);
                         id
-                    }
+                    };
+                    (draw, best)
                 })
             })
             .collect();
@@ -373,7 +376,10 @@ where
                     .draft_mut()
                     .draft_mut(),
                 out,
-                draw: draw.as_mut().map(|f| f as Draw<'_>),
+                draw: draw.as_mut().map(|(f, best)| Draw {
+                    take: f,
+                    best: *best,
+                }),
             });
         }
         app::mtp::pass_slots(s, &mut windows)

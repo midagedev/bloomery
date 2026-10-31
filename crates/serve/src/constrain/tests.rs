@@ -481,6 +481,7 @@ impl Engine for Drafts {
         last: u32,
         mut history: Vec<u32>,
         mut sampler: crate::engine::Sampler,
+        _best: Option<usize>,
         out: &mut Vec<u32>,
     ) -> (
         Result<crate::engine::Drafted, EngineError>,

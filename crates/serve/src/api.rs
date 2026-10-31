@@ -11129,10 +11129,12 @@ mod tests {
                 last: u32,
                 history: Vec<u32>,
                 sampler: Sampler,
+                best: Option<usize>,
                 out: &mut Vec<u32>,
             ) -> (Result<Drafted, super::EngineError>, Vec<u32>, Sampler) {
                 self.waits.card += CARD;
-                self.inner.advance_sampled(last, history, sampler, out)
+                self.inner
+                    .advance_sampled(last, history, sampler, best, out)
             }
             fn advance_rows(&self) -> usize {
                 self.inner.advance_rows()

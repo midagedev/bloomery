@@ -967,8 +967,13 @@ pub struct SlotWindow<'a, B: MtpBody> {
 }
 
 /// A drawing window's draw ([`SlotWindow::draw`]): the id it takes from a
-/// row's logits.
-pub type Draw<'a> = &'a mut dyn FnMut(&[f32]) -> u32;
+/// row's logits, and whether it reads only the row's best
+/// ([`Session::slots_best`]) in place of the whole row
+/// ([`Session::slots_row`]).
+pub struct Draw<'a> {
+    pub take: &'a mut dyn FnMut(&[f32]) -> u32,
+    pub best: bool,
+}
 
 /// One drafted round of several slots in passes of the target, each
 /// window's in turn as [`runtime::Speculative`]'s pass runs it for one
@@ -988,7 +993,8 @@ pub type Draw<'a> = &'a mut dyn FnMut(&[f32]) -> u32;
 ///   (`round_passes`), each pass run as one
 ///   ([`Session::verify_slots`]), each row bit for bit its step;
 /// - each window's ids taken row by row in position order — the argmax, or
-///   a drawing window's draw from that row's logits ([`Session::slots_row`])
+///   a drawing window's draw from that row's logits ([`Session::slots_row`],
+///   or [`Session::slots_best`] for a draw that reads only the row's best)
 ///   — up to the first that is not the proposal's next (runtime's
 ///   `Speculative::pass_picking`), those rows kept, recorded by its draft
 ///   from the position its rows ran from ([`MtpDraft::record`]) with the
@@ -1078,7 +1084,7 @@ where
         let (ws, rs) = (&mut windows[cut.clone()], &rows[cut.clone()]);
         let pass: Vec<(usize, &[u32])> = ws.iter().zip(rs).map(|(w, r)| (w.slot, &r[..])).collect();
         let argmax = t.verify_slots(&pass)?.ids;
-        let mut fetched = false;
+        let (mut fetched, mut best_fetched) = (false, false);
         let mut at = 0;
         for (((w, r), &p0), k) in ws
             .iter_mut()
@@ -1101,8 +1107,15 @@ where
                 Some(draw) => {
                     taken.clear();
                     for i in 0..r.len() {
-                        let id = draw(t.slots_row(at + i, fetched)?);
-                        fetched = true;
+                        let id = if draw.best {
+                            let row = t.slots_best(at + i, best_fetched)?;
+                            best_fetched = true;
+                            (draw.take)(row)
+                        } else {
+                            let row = t.slots_row(at + i, fetched)?;
+                            fetched = true;
+                            (draw.take)(row)
+                        };
                         taken.push(id);
                         if r.get(i + 1) != Some(&id) {
                             break;

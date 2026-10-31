@@ -51,7 +51,7 @@ pub mod xsplit;
 pub use lookup::Lookup;
 pub use speculative::{
     Argmax, Draft, Exhausted, Forced, NotAnId, NotBuilt, Pick, Picked, Picking, Program, RowLogits,
-    Sample, Speculative, TapNeed, TapSink, Tapped, TappedPrompt, Width, Widths, Window,
+    Sample, SampleBest, Speculative, TapNeed, TapSink, Tapped, TappedPrompt, Width, Widths, Window,
     accepted_rows, ids_from, program,
 };
 pub use stop::{NoTokens, Stop, StopReason};
