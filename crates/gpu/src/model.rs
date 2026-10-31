@@ -39,6 +39,7 @@ pub use slots::{SlotRange, SlotRowOrder, SlotRows, Slots, SlotsOut, slots_a_pass
 
 use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
+use crate::best::{self, Best};
 use crate::fault::Fault;
 use crate::graph::MappedHost;
 use crate::head::{Head, HeadNorm};
@@ -552,6 +553,9 @@ pub struct GpuModel<B: ChainBody> {
     /// The one head's logits as [`GpuModel::slots_logits_into`] fetched them
     /// to take each row's from; its capacity is grown once and reused.
     logits_stage: Vec<f32>,
+    /// The launches that read a pass's rows as their best logits, made by
+    /// the first such read ([`GpuModel::pass_best_into`]).
+    best: Option<Best>,
     /// The ranges of a pass of several slots' verify rows waiting for
     /// [`GpuModel::commit_slots`] ([`GpuModel::verify_slots`]).
     slots_waiting: Option<Vec<SlotRange>>,
@@ -624,6 +628,7 @@ impl<B: ChainBody> GpuModel<B> {
             one_pass: None,
             slot_rows: None,
             logits_stage: Vec::new(),
+            best: None,
             slots_waiting: None,
             body: Box::new(body),
             weights,
@@ -1447,14 +1452,6 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// The [`RowHeads::One`] head of `m` rows, once a pass made it.
-    fn pass_head(&self, m: usize, what: &'static str) -> Result<&Head, GpuError> {
-        self.pass_heads
-            .get(m.wrapping_sub(1))
-            .and_then(Option::as_ref)
-            .ok_or(GpuError::state(what, "no pass of these rows has run"))
-    }
-
     /// Row `r` of the pass `read` describes into `row` (`n_vocab` f32): the
     /// one read of a pass's row that [`GpuModel::pass_row_into`] and
     /// [`GpuModel::slots_logits_into`] take by their body's layout.
@@ -1482,13 +1479,7 @@ impl<B: ChainBody> GpuModel<B> {
                 .ok_or(GpuError::state(what, "no pass of these rows has run"))?
                 .logits_into_host(&self.gpu, row),
             RowHeads::One => {
-                if self.one_pass != Some(m) {
-                    return Err(GpuError::state(
-                        what,
-                        "the last call was not a pass of these rows",
-                    ));
-                }
-                let head = self.pass_head(m, what)?;
+                let head = one_head(&self.pass_heads, self.one_pass, m, what)?;
                 let n_vocab = head.n_vocab();
                 if row.len() != n_vocab {
                     return Err(GpuError::shape(
@@ -1515,6 +1506,62 @@ impl<B: ChainBody> GpuModel<B> {
                 Ok(())
             }
         }
+    }
+
+    /// Row `r` of the pass `read` describes read as its best logits into
+    /// `row` ([`best::ROW_WORDS`] words, [`crate::best`]'s row): the read a
+    /// pick that needs only a row's best takes, in place of
+    /// [`GpuModel::pass_row`]'s whole row. [`RowHeads::PerRow`] reads head `r`
+    /// alone; [`RowHeads::One`] reads every row of the pass's one head into
+    /// the stage unless this pass's rows are there already, and takes row
+    /// `r`'s words from it. Blocking read. Refused by name, as `what`, as
+    /// [`GpuModel::pass_row`] refuses, and for a `row` of another length.
+    fn pass_best(
+        &mut self,
+        what: &'static str,
+        read: &mut PassRead<'_, u32>,
+        r: usize,
+        row: &mut [u32],
+    ) -> Result<(), GpuError> {
+        let m = read.rows;
+        if r >= m || row.len() != best::ROW_WORDS {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "row {r} of a pass of {m} into {} words of {}",
+                    row.len(),
+                    best::ROW_WORDS
+                ),
+            ));
+        }
+        let n_vocab = self.n_vocab()?;
+        let launches = match &mut self.best {
+            Some(launches) => launches,
+            none => none.insert(Best::new(&self.gpu, n_vocab)?),
+        };
+        read.stage.resize(best::MAX_ROWS * best::ROW_WORDS, 0);
+        let at = match read.layout {
+            RowHeads::PerRow => {
+                let head = self
+                    .heads
+                    .get(r)
+                    .ok_or(GpuError::state(what, "no pass of these rows has run"))?;
+                launches.enqueue(&self.gpu, head.logits(), 1)?;
+                launches.read(&self.gpu, read.stage)?;
+                0
+            }
+            RowHeads::One => {
+                let head = one_head(&self.pass_heads, self.one_pass, m, what)?;
+                if !read.fetched {
+                    launches.enqueue(&self.gpu, head.logits(), m)?;
+                    launches.read(&self.gpu, read.stage)?;
+                    read.fetched = true;
+                }
+                r * best::ROW_WORDS
+            }
+        };
+        row.copy_from_slice(&read.stage[at..at + best::ROW_WORDS]);
+        Ok(())
     }
 
     /// The heads a pass of `m` rows laid as `layout` writes: for
@@ -2666,7 +2713,7 @@ impl<B: Rows> GpuModel<B> {
                 }
             }
             RowHeads::One => {
-                let head = self.pass_head(M, WHAT)?;
+                let head = one_head(&self.pass_heads, self.one_pass, M, WHAT)?;
                 let tokens = head.tokens(&self.gpu)?;
                 if tokens.len() != M {
                     return Err(GpuError::shape(
@@ -2753,17 +2800,61 @@ impl<B: Rows> GpuModel<B> {
         };
         self.pass_row("GpuModel::pass_row_into", &mut read, r, row)
     }
+
+    /// Row `r` of the last [`GpuModel::step_rows`] of `m` rows read as its
+    /// best logits into `row` ([`best::ROW_WORDS`] words): as
+    /// [`GpuModel::pass_row_into`], the pass's rows read once into `stage`
+    /// unless `fetched` says they are there ([`GpuModel::pass_best`]).
+    pub fn pass_best_into(
+        &mut self,
+        m: usize,
+        r: usize,
+        stage: &mut Vec<u32>,
+        fetched: bool,
+        row: &mut [u32],
+    ) -> Result<(), GpuError> {
+        let mut read = PassRead {
+            layout: B::HEADS,
+            rows: m,
+            stage,
+            fetched,
+        };
+        self.pass_best("GpuModel::pass_best_into", &mut read, r, row)
+    }
 }
 
-/// The read of one pass's rows ([`GpuModel::pass_row`]): the pass's `rows`,
-/// the `layout` its heads lay them in, and under [`RowHeads::One`] the host
-/// copy of its one head — `stage`, which the first row read fetches
-/// (`fetched` from then on) and the rows after it take theirs from.
-struct PassRead<'a> {
+/// The read of one pass's rows ([`GpuModel::pass_row`], and as their best
+/// logits [`GpuModel::pass_best`]): the pass's `rows`, the `layout` its heads
+/// lay them in, and under [`RowHeads::One`] the host copy of its one head
+/// (f32), or of its rows' best words (u32) — `stage`, which the first row
+/// read fetches (`fetched` from then on) and the rows after it take theirs
+/// from.
+struct PassRead<'a, T = f32> {
     layout: RowHeads,
     rows: usize,
-    stage: &'a mut Vec<f32>,
+    stage: &'a mut Vec<T>,
     fetched: bool,
+}
+
+/// The [`RowHeads::One`] head of the pass of `m` rows the last call ran:
+/// refused by name, as `what`, when the last call (`one_pass`) was another,
+/// or no pass of these rows has run.
+fn one_head<'a>(
+    pass_heads: &'a [Option<Head>],
+    one_pass: Option<usize>,
+    m: usize,
+    what: &'static str,
+) -> Result<&'a Head, GpuError> {
+    if one_pass != Some(m) {
+        return Err(GpuError::state(
+            what,
+            "the last call was not a pass of these rows",
+        ));
+    }
+    pass_heads
+        .get(m.wrapping_sub(1))
+        .and_then(Option::as_ref)
+        .ok_or(GpuError::state(what, "no pass of these rows has run"))
 }
 
 /// The heads a pass of `m` rows laid as `layout` writes: `heads[..m]`, or

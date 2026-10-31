@@ -10,7 +10,8 @@
 //! - [`selector_kernels::sel_topk_part`] — each block of 256 threads takes
 //!   [`TILE`] ids of every row (the tile in shared memory, the logits' own
 //!   layout `x[v · m + c]` read coalesced), and warp `c` finds row `c`'s 16
-//!   best of them by sixteen rounds of a warp tournament ([`warp_top16`]);
+//!   best of them by sixteen rounds of a warp tournament
+//!   ([`crate::best::warp_best`]);
 //! - [`selector_kernels::sel_topk_merge`] — one block a row merges its
 //!   parts' lists the same way (a warp's 512 entries to 16, the eight warps'
 //!   128 to 16): the row's candidates, ids into the lattice and their logits
@@ -44,7 +45,7 @@
 //! (the part launch), an id at or past a table's rows [`FaultSite::TokenId`]
 //! (the scoring launch; the score is NaN and no table word is read).
 
-use crate::elem::argmax_take;
+use crate::best::warp_best;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::{Gpu, GpuError, launch_u32};
@@ -106,70 +107,6 @@ const _: () = assert!(SCORE_LANE * 32 == RANK && SCORE_LANE == 8 && ROW_WORDS ==
 pub const LAUNCHES: usize = 4;
 
 // ------------------------------------------------------------------ cores
-
-/// The 16 best of the 32 lanes' `PER` entries each — `(v[j], id[j])` of lane
-/// `l` — by sixteen rounds of a tournament: every lane's best (the highest
-/// value, the lower id among equals, [`argmax_take`]), the xor butterfly
-/// merging them to every lane, lane 0 writing the round's pair to slot `t` of
-/// `out_v` and `out_i` and the owner retiring its entry. A retired entry is
-/// −∞, so a warp with fewer than 16 finite entries ends its list with −∞
-/// slots, which sort below any candidate. All 32 lanes call it together.
-///
-/// # Safety
-///
-/// `out_v` and `out_i` address [`TOP_K`] writable slots that no other thread
-/// writes during the call.
-#[inline(always)]
-#[allow(
-    clippy::needless_range_loop,
-    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-)]
-unsafe fn warp_top16<const PER: usize>(
-    mut v: [f32; PER],
-    id: [u32; PER],
-    out_v: *mut f32,
-    out_i: *mut u32,
-) {
-    let lane = warp::lane_id();
-    let mut t = 0usize;
-    while t < TOP_K {
-        let mut best_v = f32::NEG_INFINITY;
-        let mut best_i = u32::MAX;
-        for j in 0..PER {
-            thread::__unroll_config::<0>();
-            if argmax_take(v[j], id[j], best_v, best_i) {
-                best_v = v[j];
-                best_i = id[j];
-            }
-        }
-        let mut off = 16u32;
-        while off > 0 {
-            let (ov, oi) = (
-                warp::shuffle_xor_f32(best_v, off),
-                warp::shuffle_xor(best_i, off),
-            );
-            if argmax_take(ov, oi, best_v, best_i) {
-                best_v = ov;
-                best_i = oi;
-            }
-            off >>= 1;
-        }
-        if lane == 0 {
-            // SAFETY: t < TOP_K slots of each output, lane 0 alone writes.
-            unsafe {
-                *out_v.add(t) = best_v;
-                *out_i.add(t) = best_i;
-            }
-        }
-        for j in 0..PER {
-            thread::__unroll_config::<0>();
-            if id[j] == best_i {
-                v[j] = f32::NEG_INFINITY;
-            }
-        }
-        t += 1;
-    }
-}
 
 /// Value `q` (0..4) of a word of four Q8_0 codes.
 #[inline(always)]
@@ -271,7 +208,9 @@ mod selector_kernels {
         // SAFETY: at + TOP_K <= (m - 1) · n_parts · TOP_K <= cv.len(), ci.len()
         // by the launch contract; the slots of (row w, this part) are this
         // warp's alone.
-        unsafe { warp_top16::<TILE_LANE>(v, id, cv.as_mut_ptr().add(at), ci.as_mut_ptr().add(at)) };
+        unsafe {
+            warp_best::<TILE_LANE, TOP_K>(v, id, cv.as_mut_ptr().add(at), ci.as_mut_ptr().add(at))
+        };
     }
 
     /// Row `blockIdx.x + 1`'s merge: its `n_parts` lists of 16 into the 16
@@ -336,7 +275,7 @@ mod selector_kernels {
         }
         let w = tid / 32;
         // SAFETY: the warp's 16 slots of the lists are its own.
-        unsafe { warp_top16::<MERGE_LANE>(v, id, lv.add(w * TOP_K), li.add(w * TOP_K)) };
+        unsafe { warp_best::<MERGE_LANE, TOP_K>(v, id, lv.add(w * TOP_K), li.add(w * TOP_K)) };
         thread::sync_threads();
         if w != 0 {
             return;
@@ -357,7 +296,7 @@ mod selector_kernels {
         // lattice's ids are inside the launch contract's bounds and this
         // warp's alone.
         unsafe {
-            warp_top16::<LISTS_LANE>(
+            warp_best::<LISTS_LANE, TOP_K>(
                 v2,
                 id2,
                 unary.as_mut_ptr().add(rho * TOP_K),

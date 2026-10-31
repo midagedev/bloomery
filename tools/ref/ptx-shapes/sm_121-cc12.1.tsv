@@ -19,6 +19,8 @@ generate_ds41   attn_out_gate_sigmoid                    0           0
 # PIN(2026-10-29): LFM3's short conv and per-head output gate (short_conv, attn_out_gate_sigmoid_head) at the cc 8.6
 # scan's values (tools/ref/ptx-shapes.tsv), not measured on cc 12.1, until a GB10 scan runs.
 generate_ds41   attn_out_gate_sigmoid_head               0           0
+generate_ds41   best_merge                               0           0
+generate_ds41   best_part                                0           0
 generate_ds41   short_conv                               0           0
 generate_ds41   bf16_cols                                0           0
 generate_ds41   bf16_gemv                                0           0

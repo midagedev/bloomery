@@ -1036,6 +1036,31 @@ where
         self.pass_row(WHAT, &mut read, r, row)
     }
 
+    /// Row `r` of the last call read as its best logits into `row`
+    /// ([`crate::best::ROW_WORDS`] words), when it was a
+    /// [`GpuModel::step_slots`] or a [`GpuModel::verify_slots`]: the read a
+    /// sampled window whose pick needs only a row's best takes, in place of
+    /// [`GpuModel::slots_row_into`]'s. The pass's rows are read once into
+    /// `stage` unless `fetched` says they are there. Blocking read. Refused by
+    /// name as [`GpuModel::slots_row_into`] refuses.
+    pub fn slots_best_into(
+        &mut self,
+        r: usize,
+        stage: &mut Vec<u32>,
+        fetched: bool,
+        row: &mut [u32],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::slots_best_into";
+        let (rows, _) = self.slots_shape(WHAT)?;
+        let mut read = PassRead {
+            layout: B::HEADS,
+            rows,
+            stage,
+            fetched,
+        };
+        self.pass_best(WHAT, &mut read, r, row)
+    }
+
     /// The rows of the last call and the logits each holds, when that call
     /// was a pass of several slots; refused by name as `what` otherwise.
     fn slots_shape(&self, what: &'static str) -> Result<(usize, usize), GpuError> {
@@ -1260,7 +1285,8 @@ where
                 .map(|h| h.token(&self.gpu))
                 .collect::<Result<Vec<u32>, GpuError>>()?,
             RowHeads::One => {
-                let ids = self.pass_head(total, what)?.tokens(&self.gpu)?;
+                let ids = super::one_head(&self.pass_heads, self.one_pass, total, what)?
+                    .tokens(&self.gpu)?;
                 if ids.len() != total {
                     return Err(GpuError::shape(
                         what,

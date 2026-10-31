@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub mod arch;
 pub mod attention_h128;
 mod attention_h128_ring;
+pub mod best;
 pub mod cand;
 pub mod capsync;
 pub mod card_experts;

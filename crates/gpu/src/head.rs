@@ -764,6 +764,11 @@ impl Head {
         Ok(self.logits.to_host_vec(gpu.stream())?)
     }
 
+    /// The logits of the last run on the card (`n_vocab * m` f32, `[v*m + c]`).
+    pub(crate) fn logits(&self) -> &DeviceBuffer<f32> {
+        &self.logits
+    }
+
     /// [`Head::logits_to_host`] into `out`, which holds exactly `n_vocab * m`
     /// f32: a caller reading every token reuses one buffer. Blocking read.
     pub fn logits_into_host(&self, gpu: &Gpu, out: &mut [f32]) -> Result<(), GpuError> {
