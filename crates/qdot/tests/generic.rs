@@ -428,6 +428,8 @@ fn check_dispatch<D: HostDecode>(ks: &[usize]) {
 
 #[test]
 fn a_type_with_no_hand_kernel_reaches_its_generic_kernels() {
+    // PIN(2026-10-31): IQ1_S left this clause when its hand kernel took its dispatch; tests/qdot.rs holds that
+    // kernel to its mirror and its column tile to the one-column dot.
     check_dispatch::<Iq2s>(&Q8K_KS);
     check_dispatch::<Iq1m>(&Q8K_KS);
 }

@@ -320,7 +320,7 @@ fn main() {
     let only = args
         .iter()
         .position(|a| a == "--only")
-        .and_then(|p| args.get(p + 1))
+        .map(|p| args.get(p + 1).expect("--only needs TYPE[,TYPE...]"))
         .map(String::as_str);
     let mut shapes = selected(only);
     if generic {
