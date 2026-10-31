@@ -94,7 +94,10 @@
 //! [`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`] is the head-128
 //! launch over several sequences' f16 caches: token `t` appends into the
 //! planes of row `t` of a per-row table ([`RowPlanes`], the launch's
-//! grid-constant parameter). Its body, `norm_neox_append`, is the head-128
+//! grid-constant parameter).
+//! [`RopeNeoxKernels::enqueue_head_norm_neox_append_256_seqs`] is the
+//! head-256 one, its table per sequence (`crate::seq_rows`): a sequence's
+//! planes and its own rope table. Its body, `norm_neox_append`, is the head-128
 //! entry's written once over the cache format ([`KvSink`]); that entry keeps
 //! its own copy for the reason the q8 entry does.
 
@@ -102,8 +105,9 @@ use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{cache_f16_pair, f32_to_f16_bits};
-use crate::flash_gqa::{ROW_PLANES, RowPlanes, RowTable};
+use crate::flash_gqa::{KvSeq, ROW_PLANES, RowPlanes, RowTable, kv_seqs};
 use crate::launch_u32;
+use crate::seq_rows::SeqRows;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
 use cuda_device::{
@@ -1194,6 +1198,94 @@ mod rope_neox_kernels {
         };
     }
 
+    /// [`head_norm_neox_append_256`] over several sequences' f16 caches
+    /// (`crate::seq_rows`): token `t` of sequence `s` appends into that
+    /// sequence's planes (words 0 and 1, each `n_kv · ctx` rows of 256) and
+    /// turns by its rope table (word 2, `ctx` rows of [`ROT_256`]), its other
+    /// inputs that entry's rows. The tokens of one sequence hold distinct
+    /// positions and tokens of different sequences write different planes,
+    /// so no two blocks write one row.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qg.len() >= m * n_head * 512,
+            q.len() >= m * n_head * 256,
+            k.len() >= m * n_kv * 256,
+            v.len() >= m * n_kv * 256,
+            gq.len() >= 256,
+            gk.len() >= 256,
+            pos.len() >= m
+        )
+    )]
+    pub fn head_norm_neox_append_256_seqs(
+        gq: &[f32],
+        gk: &[f32],
+        pos: &[u32],
+        qg: &[f32],
+        v: &[f32],
+        eps: f32,
+        n_head: u32,
+        n_kv: u32,
+        ctx: u32,
+        m: u32,
+        fault: FaultSink,
+        q: DisjointSlice<f32>,
+        k: DisjointSlice<f32>,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        static mut WSUM4: SharedArray<f64, WARPS_256> = SharedArray::UNINIT;
+
+        let heads = (n_head + n_kv) as usize;
+        let b = thread::blockIdx_x() as usize;
+        if b >= m as usize * heads {
+            return; // block-uniform
+        }
+        let s = seqs.seq_of(b / heads);
+        let plane = n_kv as usize * ctx as usize * HEAD_256;
+        // SAFETY: s < the table's sequences (seq_of). The launcher put the
+        // sequence's f16 planes of n_kv·ctx·HEAD_256 values, which this
+        // launch alone writes, at words 0 and 1, and its rope table of
+        // ctx·ROT_256 f32 at word 2. Each block writes only its token's rows
+        // of its sequence's planes (the tokens of one sequence hold distinct
+        // positions, of two sequences different planes), so the slices'
+        // writes are disjoint. WSUM4 is this block's own shared allocation;
+        // the raw form reaches it without a reference. The launch contract is
+        // `norm_partial_append`'s at (HEAD_256, ROT_256) over the token's
+        // planes and table.
+        unsafe {
+            let (pk, pv) = (seqs.word(s, 0) as usize, seqs.word(s, 1) as usize);
+            let table = seqs.word(s, 2) as usize as *const f32;
+            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, { 2 * HEAD_256 }, _>(
+                gq,
+                gk,
+                core::slice::from_raw_parts(table, ctx as usize * ROT_256),
+                pos,
+                qg,
+                v,
+                eps,
+                n_head,
+                n_kv,
+                ctx,
+                m,
+                fault,
+                q,
+                k,
+                F16Sink {
+                    k: DisjointSlice::from_raw_parts(pk as *mut u16, plane),
+                    v: DisjointSlice::from_raw_parts(pv as *mut u16, plane),
+                },
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM4),
+            )
+        };
+    }
+
     /// The norm, whole NEOX turn and append over heads of [`HEAD_512`]
     /// values (`norm_partial_append` at `ROT = HEAD = 512`): the query heads
     /// read from plain query rows `qs` (`512` values a head) and written to
@@ -1977,6 +2069,24 @@ pub(crate) struct NeoxRowsArgs<'a> {
     pub(crate) fault: FaultSink,
 }
 
+/// [`RopeNeoxKernels::enqueue_head_norm_neox_append_256_seqs`]' arguments:
+/// those of [`PartialNeoxArgs`] without the rope table and the cache planes,
+/// which each sequence's [`KvSeq`] gives its tokens.
+pub(crate) struct PartialNeoxSeqsArgs<'a> {
+    pub(crate) qg: &'a DeviceBuffer<f32>,
+    pub(crate) q: &'a mut DeviceBuffer<f32>,
+    pub(crate) k: &'a mut DeviceBuffer<f32>,
+    pub(crate) v: &'a DeviceBuffer<f32>,
+    pub(crate) gq: &'a DeviceBuffer<f32>,
+    pub(crate) gk: &'a DeviceBuffer<f32>,
+    pub(crate) pos: &'a DeviceBuffer<u32>,
+    pub(crate) eps: f32,
+    pub(crate) n_head: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) ctx: usize,
+    pub(crate) fault: FaultSink,
+}
+
 /// The plane lengths of one side of a q8_0 cache of `n_kv` key heads over
 /// `ctx` rows of `head` values, in the two-plane layout the weights side
 /// owns (`weights::q8_0_planes` over `gguf::quant::Q8Block`): the codes
@@ -2072,7 +2182,7 @@ pub struct K192Args<'a> {
 /// The refusals and launch values the partial-turn launchers share, at heads
 /// of `head` values whose query source rows hold `q_span` values a head and
 /// a rope table of `rot` f32 a position: the shape `[n_head, n_kv, ctx, m]`
-/// (`n_kv`, `ctx` and `m` at least 1, `m <= ctx`; `n_head` 0 is the key heads
+/// (`n_kv`, `ctx` and `m` at least 1; `n_head` 0 is the key heads
 /// alone, [`PartialNeoxArgs`]), then the first buffer shorter than the
 /// launch reads, the inputs `[qg, q, k, v, gq, gk, table, pos]` (`inputs`,
 /// their lengths) before the sink's `planes` (name, length, need), each by
@@ -2085,11 +2195,11 @@ fn partial_launch(
     inputs: [usize; 8],
     planes: &[(&str, usize, usize)],
 ) -> Result<[u32; 5], GpuError> {
-    if n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
+    if n_kv == 0 || m == 0 || ctx == 0 {
         return Err(GpuError::shape(
             what,
             format!(
-                "need n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
+                "need n_kv, ctx and m >= 1, got n_head={n_head} \
                  n_kv={n_kv} ctx={ctx} m={m}"
             ),
         ));
@@ -2292,6 +2402,81 @@ impl RopeNeoxKernels {
             stream, &prep, gq, gk, table, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k,
             cache_k, cache_v,
         )?;
+        Ok(())
+    }
+
+    /// [`RopeNeoxKernels::enqueue_head_norm_neox_append_256`] over several
+    /// sequences' f16 caches (`crate::seq_rows`): each sequence's tokens
+    /// append into its own planes and turn by its own rope table
+    /// ([`KvSeq`]), their other inputs `args`' rows as that launch's, each
+    /// token's arithmetic and refusal that launch's. Refused by name: what
+    /// that launch refuses over the rows, and the sequences [`kv_seqs`]
+    /// refuses. Asynchronous and capturable; builds its sequence table on
+    /// the host.
+    ///
+    /// # Safety
+    ///
+    /// Within each sequence's rows, the corresponding positions in
+    /// `args.pos` below `args.ctx` are pairwise distinct. Different
+    /// sequences hold disjoint planes and may use the same positions.
+    pub(crate) unsafe fn enqueue_head_norm_neox_append_256_seqs(
+        &self,
+        stream: &CudaStream,
+        seqs: &[KvSeq<'_>],
+        args: PartialNeoxSeqsArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_head_norm_neox_append_256_seqs";
+        let PartialNeoxSeqsArgs {
+            qg,
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            fault,
+        } = args;
+        let table = kv_seqs(what, seqs, n_kv * ctx * HEAD_256, ctx * ROT_256)?;
+        let m = table.rows();
+        let [grid, n_head, n_kv, ctx, m] = partial_launch(
+            what,
+            (HEAD_256, 2 * HEAD_256, ROT_256),
+            [n_head, n_kv, ctx, m],
+            [
+                qg.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                gq.len(),
+                gk.len(),
+                // Each sequence's own rope table, which `kv_seqs` checked.
+                usize::MAX,
+                pos.len(),
+            ],
+            &[],
+        )?;
+        let prep = self
+            .module
+            .prepare_head_norm_neox_append_256_seqs(LaunchConfig1D::new(
+                grid,
+                THREADS_256_U32,
+                0,
+            ))?;
+        // SAFETY: the caller guarantees distinct cache-valid positions within
+        // each sequence. Each sequence's words are its own f16 planes and rope
+        // table of the lengths `kv_seqs` checked, the planes borrowed by
+        // `seqs` while this enqueue runs; a graph that captures the launch
+        // replays it over the same buffers, which the caller keeps alive and
+        // in place while the graph lives, as for any buffer it captured.
+        unsafe {
+            self.module.head_norm_neox_append_256_seqs(
+                stream, &prep, gq, gk, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k, table,
+            )?;
+        }
         Ok(())
     }
 
@@ -2926,5 +3111,232 @@ impl RopeNeoxKernels {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::partial_launch;
+
+    #[test]
+    fn combined_rows_are_not_bounded_by_one_cache_height() {
+        let what = "partial launch test";
+        for (head, q_span, rot) in [
+            (256, 512, 64),
+            (512, 512, 512),
+            (256, 256, 256),
+            (128, 128, 64),
+        ] {
+            for n_head in [0, 2] {
+                for m in [1, 2, 4] {
+                    let inputs = [
+                        m * n_head * q_span,
+                        m * n_head * head,
+                        m * head,
+                        m * head,
+                        head,
+                        head,
+                        rot,
+                        m,
+                    ];
+                    let planes = [("cache_k", head, head), ("cache_v", head, head)];
+                    let got = partial_launch(
+                        what,
+                        (head, q_span, rot),
+                        [n_head, 1, 1, m],
+                        inputs,
+                        &planes,
+                    )
+                    .expect("rows from separate sequences may exceed one cache's height");
+                    assert_eq!(
+                        got,
+                        [(m * (n_head + 1)) as u32, n_head as u32, 1, 1, m as u32]
+                    );
+                    for dims in [[n_head, 0, 1, m], [n_head, 1, 0, m], [n_head, 1, 1, 0]] {
+                        assert!(
+                            partial_launch(what, (head, q_span, rot), dims, inputs, &planes)
+                                .is_err()
+                        );
+                    }
+                    for i in 0..inputs.len() {
+                        if inputs[i] == 0 {
+                            continue;
+                        }
+                        let mut short = inputs;
+                        short[i] -= 1;
+                        assert!(
+                            partial_launch(
+                                what,
+                                (head, q_span, rot),
+                                [n_head, 1, 1, m],
+                                short,
+                                &planes
+                            )
+                            .is_err(),
+                            "short input {i}"
+                        );
+                    }
+                    for i in 0..planes.len() {
+                        let mut short = planes;
+                        short[i].1 -= 1;
+                        assert!(
+                            partial_launch(
+                                what,
+                                (head, q_span, rot),
+                                [n_head, 1, 1, m],
+                                inputs,
+                                &short
+                            )
+                            .is_err(),
+                            "short plane {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Gpu;
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_two_one_row_caches_match_solo_appends() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let kernels = RopeNeoxKernels::load(gpu.context()).expect("rope kernels");
+        let stream = gpu.stream();
+        let (n_head, n_kv, ctx) = (2, 1, 1);
+        let q_width = n_head * HEAD_256;
+        let kv_width = n_kv * HEAD_256;
+        let values = |n: usize, offset: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + offset) % 97) as f32 / 48.0 - 1.0)
+                .collect()
+        };
+        let qg_host = values(2 * 2 * q_width, 7);
+        let k_host = values(2 * kv_width, 19);
+        let v_host = values(2 * kv_width, 31);
+        let qg = DeviceBuffer::from_host(stream, &qg_host).expect("qg");
+        let mut q = DeviceBuffer::<f32>::zeroed(stream, 2 * q_width).expect("q");
+        let mut k = DeviceBuffer::from_host(stream, &k_host).expect("k");
+        let v = DeviceBuffer::from_host(stream, &v_host).expect("v");
+        let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; HEAD_256]).expect("gain");
+        let pos = DeviceBuffer::from_host(stream, &[0u32, 0]).expect("positions");
+        let mut caches: Vec<_> = (0..2)
+            .map(|slot| {
+                let angle = (slot + 1) as f32 * 0.25;
+                let rope: Vec<f32> = (0..ROT_256 / 2)
+                    .flat_map(|_| [angle.cos(), angle.sin()])
+                    .collect();
+                (
+                    DeviceBuffer::<u16>::zeroed(stream, kv_width).expect("cache k"),
+                    DeviceBuffer::<u16>::zeroed(stream, kv_width).expect("cache v"),
+                    DeviceBuffer::from_host(stream, &rope).expect("rope"),
+                )
+            })
+            .collect();
+        let seqs: Vec<_> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(slot, (k, v, rope))| KvSeq {
+                rows: slot..slot + 1,
+                k,
+                v,
+                rope,
+            })
+            .collect();
+        // SAFETY: each sequence has one valid position and disjoint cache planes.
+        unsafe {
+            kernels.enqueue_head_norm_neox_append_256_seqs(
+                stream,
+                &seqs,
+                PartialNeoxSeqsArgs {
+                    qg: &qg,
+                    q: &mut q,
+                    k: &mut k,
+                    v: &v,
+                    gq: &gain,
+                    gk: &gain,
+                    pos: &pos,
+                    eps: 1e-5,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    fault: gpu.unlabelled_sink(),
+                },
+            )
+        }
+        .expect("two rows fit two one-row caches");
+        drop(seqs);
+        stream.synchronize().expect("batch sync");
+        assert!(gpu.take_fault().expect("batch fault word").is_none());
+        let q_batch = q.to_host_vec(stream).expect("batched queries");
+        let k_batch = k.to_host_vec(stream).expect("batched keys");
+        let pos = DeviceBuffer::from_host(stream, &[0u32]).expect("solo position");
+        let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (slot, (ck, cv, rope)) in caches.iter().enumerate() {
+            let qg = DeviceBuffer::from_host(stream, &qg_host[slot * 2 * q_width..][..2 * q_width])
+                .expect("solo qg");
+            let mut q = DeviceBuffer::<f32>::zeroed(stream, q_width).expect("solo q");
+            let mut k = DeviceBuffer::from_host(stream, &k_host[slot * kv_width..][..kv_width])
+                .expect("solo k");
+            let v = DeviceBuffer::from_host(stream, &v_host[slot * kv_width..][..kv_width])
+                .expect("solo v");
+            let mut solo_k = DeviceBuffer::<u16>::zeroed(stream, kv_width).expect("solo cache k");
+            let mut solo_v = DeviceBuffer::<u16>::zeroed(stream, kv_width).expect("solo cache v");
+            // SAFETY: the solo launch has one valid position, so its writers are distinct.
+            unsafe {
+                kernels.enqueue_head_norm_neox_append_256(
+                    stream,
+                    PartialNeoxArgs {
+                        qg: &qg,
+                        q: &mut q,
+                        k: &mut k,
+                        v: &v,
+                        gq: &gain,
+                        gk: &gain,
+                        table: rope,
+                        pos: &pos,
+                        eps: 1e-5,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m: 1,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k: &mut solo_k,
+                        cache_v: &mut solo_v,
+                    },
+                )
+            }
+            .expect("one row fits its solo cache");
+            stream.synchronize().expect("solo sync");
+            assert!(gpu.take_fault().expect("solo fault word").is_none());
+            let q_solo = q.to_host_vec(stream).expect("solo queries");
+            let k_solo = k.to_host_vec(stream).expect("solo keys");
+            assert!(q_solo.iter().chain(&k_solo).all(|x| x.is_finite()));
+            assert_eq!(
+                bits(&q_batch[slot * q_width..][..q_width]),
+                bits(&q_solo),
+                "slot {slot} queries"
+            );
+            assert_eq!(
+                bits(&k_batch[slot * kv_width..][..kv_width]),
+                bits(&k_solo),
+                "slot {slot} keys"
+            );
+            assert_eq!(
+                ck.to_host_vec(stream).expect("batched cache k"),
+                solo_k.to_host_vec(stream).expect("solo cache k"),
+                "slot {slot} cache k"
+            );
+            assert_eq!(
+                cv.to_host_vec(stream).expect("batched cache v"),
+                solo_v.to_host_vec(stream).expect("solo cache v"),
+                "slot {slot} cache v"
+            );
+        }
     }
 }

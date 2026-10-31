@@ -584,7 +584,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Qwen38Body],
-        at: "gpu/src/qsa.rs (pool, score, top-k; q38.rs qsa_key_append)",
+        at: "gpu/src/qsa.rs (pool, key append, score, top-k)",
         runs: |n| {
             matches!(
                 n,

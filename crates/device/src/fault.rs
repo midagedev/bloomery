@@ -122,7 +122,7 @@ pub enum FaultSite {
     CacheValue = 16,
     /// A token-pool selector (`qsa`; GLM's `latent::index_pool` and `kpool`)
     /// met an indexer key that is not finite after its f16 rounding
-    /// (`q38::qsa_key_append`, the raw key), a pooled key or a head's score
+    /// (`qsa::qsa_key_append`, the raw key), a pooled key or a head's score
     /// that is not finite, a launch whose rows' positions or live counts are
     /// not consecutive (`qsa_key_append`, the pool pass), its top-k a refused
     /// live count, or its selected

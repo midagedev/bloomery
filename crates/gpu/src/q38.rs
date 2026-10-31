@@ -1,7 +1,7 @@
 //! Qwen3.8's own element kernels, the ones no other body launches: the Q8_0
-//! and BF16 embedding rows, the attention output under its sigmoid gate in f32, the
-//! selector's raw key append, and the shared expert's gated sum, alone or
-//! with the card's routed slots' sum.
+//! and BF16 embedding rows, the attention output under its sigmoid gate in f32,
+//! and the shared expert's gated sum, alone or with the card's routed slots'
+//! sum.
 //!
 //! - [`q38_kernels::embed_rows_q8_0`] — one thread per value: row `ids[t]`
 //!   of the Q8_0 table in the q8f32 planes (`crate::weights::q8_0_planes`),
@@ -16,12 +16,6 @@
 //!   σ(gate)`, the gate at `[q | gate]`'s head stride, `σ` the Qwen3.6 gated
 //!   quantizer's (`route_core::sigmoid`); the output projection reads the f32
 //!   product (its weights are Q8_0 with f32 activations).
-//! - [`q38_kernels::qsa_key_append`] — one thread per value: the indexer's
-//!   raw key, `DIM` values a row of the key projection (token-major `[m]
-//!   [DIM]`), rounded once to f16; the call's last `min(m, RING_ROWS)` rows
-//!   go into the raw key ring (`crate::qsa::RING_ROWS` rows of `DIM` f16,
-//!   position `p` in slot `p mod RING_ROWS`), after the call's pool pass
-//!   read the slots of the positions before it.
 //! - [`q38_kernels::q38_shared_add`] — one thread per value: `hsum + sh · w`,
 //!   the shared expert's output times its gate weight (the router's last slot)
 //!   rounded, then added to the host tier's routed sum and rounded — ggml's
@@ -70,13 +64,10 @@
 //! into `+0.0`.
 //!
 //! No silent failure: an embedding id past the table raises
-//! [`FaultSite::TokenId`] and writes a NaN row; a position at or past the
-//! cache's `ctx` rows raises [`FaultSite::CachePos`] and writes nothing; a card slot's
+//! [`FaultSite::TokenId`] and writes a NaN row; a card slot's
 //! place that is neither a card expert nor [`HOST`] raises
 //! [`FaultSite::ExpertId`] and writes its token's card sum NaN (the sum in
-//! `crate::card_slots` and the tier joins here); a raw key that is not finite
-//! after its f16 rounding, or a row whose position is not `pos[0]` plus its
-//! index, raises [`FaultSite::PoolSelect`]; an
+//! `crate::card_slots` and the tier joins here); an
 //! input or a result of the two f32 products, or of the combine with the card
 //! sum, that is not finite raises [`FaultSite::F32Product`] (a card slot's
 //! non-finite down or weight reaches it through the sum); a tier slot's place
@@ -87,7 +78,7 @@
 use crate::card_slots::{DownRows, card_acc_at};
 use crate::elem::EmbedRowsArgs;
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
+use crate::flash::half_bits_to_f32;
 use crate::hybrid::HOST;
 use crate::q8f32::{Bf16Words, RowValues};
 use crate::route_core::sigmoid;
@@ -105,17 +96,13 @@ use std::sync::Arc;
 /// Values of an attention head: the gate kernel's head, whose `[q | gate]`
 /// rows are twice as wide.
 pub const HEAD: usize = 256;
-/// Values of an indexer key.
-pub const DIM: usize = crate::qsa::DIM;
-/// Slots of the raw key ring: [`crate::qsa::RING_ROWS`].
-const RING_ROWS: usize = crate::qsa::RING_ROWS;
 /// Threads per block of every kernel here but [`q38_kernels::q38_tier_rank`].
 const THREADS: u32 = 256;
 /// Warps of [`q38_kernels::q38_tier_rank`]'s one block, whose launch contract
 /// spells its 1,024 threads as a literal.
 const RANK_WARPS: usize = 32;
 const _: () = assert!(RANK_WARPS * 32 == 1024);
-const _: () = assert!(HEAD == 256 && DIM == 128);
+const _: () = assert!(HEAD == 256);
 /// Routed slots a token: the card sum's slot count, which its launch
 /// contract spells as a literal.
 pub const SLOTS: usize = 10;
@@ -405,70 +392,6 @@ mod q38_kernels {
         // SAFETY: i < HEAD·n_head·m <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = out;
-        }
-    }
-
-    /// Row `c` of `m` indexer keys — value `r` at `kr[c·DIM + r]`, the key
-    /// projection's token-major output — rounded once to f16; a row of the
-    /// last [`RING_ROWS`] writes it into the ring's slot
-    /// `pos[c] mod RING_ROWS`, [`DIM`] values a row. A position at or past
-    /// `ctx` raises [`FaultSite::CachePos`] and writes nothing; a row whose
-    /// position is not `pos[0] + c` raises [`FaultSite::PoolSelect`] and
-    /// writes nothing, so no two rows share a slot; a value that is not
-    /// finite after its rounding raises [`FaultSite::PoolSelect`], whichever
-    /// row it is, and is written when its row is.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (kr.len() >= 128 * m, pos.len() >= m, ring.len() >= 1408)
-    )]
-    pub fn qsa_key_append(
-        kr: &[f32],
-        pos: &[u32],
-        m: u32,
-        ctx: u32,
-        fault: FaultSink,
-        mut ring: DisjointSlice<u16>,
-    ) {
-        let i = thread::index_1d().get();
-        if i >= DIM * m as usize {
-            return;
-        }
-        let (c, r) = (i / DIM, i % DIM);
-        // SAFETY: c = i / DIM < m <= pos.len() by the launch contract.
-        let p = unsafe { *pos.get_unchecked(c) };
-        // SAFETY: i < DIM·m makes m nonzero, and m <= pos.len().
-        let p0 = unsafe { *pos.get_unchecked(0) };
-        // SAFETY: i < DIM·m <= kr.len() by the launch contract.
-        let x = unsafe { *kr.get_unchecked(i) };
-        if p >= ctx {
-            if r == 0 {
-                fault.raise(FaultSite::CachePos);
-            }
-            return;
-        }
-        let bits = f32_to_f16_bits(x);
-        if !half_bits_to_f32(bits).is_finite() {
-            fault.raise(FaultSite::PoolSelect);
-        }
-        if p0.checked_add(c as u32) != Some(p) {
-            if r == 0 {
-                fault.raise(FaultSite::PoolSelect);
-            }
-            return;
-        }
-        if c + RING_ROWS < m as usize {
-            return;
-        }
-        // SAFETY: the slot is below RING_ROWS, so slot·DIM + r < RING_ROWS·DIM
-        // <= ring.len() by the launch contract; the rows written are
-        // consecutive (`pos[0] + c`, checked above) and at most RING_ROWS, so
-        // their slots are distinct and thread (c, r) is the value's only
-        // writer.
-        unsafe {
-            *ring.get_unchecked_mut(p as usize % RING_ROWS * DIM + r) = bits;
         }
     }
 
@@ -1175,18 +1098,6 @@ pub struct OutGateArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`Q38Kernels::enqueue_key_append`]'s arguments: the projection's `[m][DIM]`
-/// raw keys and the `m` rows' positions, the cache's `ctx` rows, and the
-/// layer's raw key ring (`[RING_ROWS][DIM]` f16).
-pub struct KeyAppendArgs<'a> {
-    pub kr: &'a DeviceBuffer<f32>,
-    pub pos: &'a DeviceBuffer<u32>,
-    pub m: usize,
-    pub ctx: usize,
-    pub fault: FaultSink,
-    pub ring: &'a mut DeviceBuffer<u16>,
-}
-
 /// A launch of `n` threads in blocks of [`THREADS`].
 fn grid(what: &'static str, n: usize) -> Result<LaunchConfig1D, GpuError> {
     let blocks = launch_u32(what, "grid", n.div_ceil(THREADS as usize))?;
@@ -1398,57 +1309,6 @@ impl Q38Kernels {
             launch_u32(what, "m", m)?,
             fault,
             y,
-        )?;
-        Ok(())
-    }
-
-    /// Enqueue the raw key append of `m` rows ([`KeyAppendArgs`], module
-    /// doc): `kr` the projection's `[m][DIM]` output, `pos` the rows'
-    /// positions (consecutive, `pos[0] + c`; any other row raises
-    /// `PoolSelect` on the device and writes nothing), `ring` the layer's
-    /// `[RING_ROWS][DIM]` f16 ring. One
-    /// launch, after the call's pool pass (`crate::qsa`), which reads the
-    /// ring's slots of the positions before the call. Asynchronous,
-    /// allocation-free, capturable.
-    pub fn enqueue_key_append(
-        &self,
-        stream: &CudaStream,
-        a: KeyAppendArgs<'_>,
-    ) -> Result<(), GpuError> {
-        let KeyAppendArgs {
-            kr,
-            pos,
-            m,
-            ctx,
-            fault,
-            ring,
-        } = a;
-        let what = "q38::enqueue_key_append";
-        if m == 0 || ctx == 0 {
-            return Err(GpuError::shape(
-                what,
-                format!("need m and ctx >= 1, got m={m} ctx={ctx}"),
-            ));
-        }
-        short(
-            what,
-            &[
-                ("kr", kr.len(), DIM * m),
-                ("pos", pos.len(), m),
-                ("ring", ring.len(), DIM * RING_ROWS),
-            ],
-        )?;
-        let cfg = grid(what, DIM * m)?;
-        let prep = self.module.prepare_qsa_key_append(cfg)?;
-        self.module.qsa_key_append(
-            stream,
-            &prep,
-            kr,
-            pos,
-            launch_u32(what, "m", m)?,
-            launch_u32(what, "ctx", ctx)?,
-            fault,
-            ring,
         )?;
         Ok(())
     }

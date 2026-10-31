@@ -9,6 +9,9 @@
 //! `gdn_conv_prep_bf16` is `gdn_conv_prep` over channels held as BF16 words
 //! (a ubatch walk's projection stores them so), each value widened as it is
 //! read: its outputs are the F32 entry's rule over the widened values.
+//! `gdn_conv_prep_seqs` is `gdn_conv_prep` over the rows of several
+//! sequences in one launch, each sequence's rows over its own ring
+//! (`crate::seq_rows`).
 //!
 //! Positions: token `t` is position `pos[t]`, the words the embedding launch
 //! writes, `pos[t] = pos[0] + t`. Its predecessor at distance `d` (1 to
@@ -73,12 +76,14 @@ use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
 use crate::q8f32::Bf16Words;
+use crate::seq_rows::{SEQ_WORDS, SeqRows};
 use crate::tensor::check_alignment;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
 use cuda_device::vector::F32x2;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
+use std::ops::Range;
 use std::sync::Arc;
 
 const _: () = assert!(HEAD == 128 && CONV_TAPS == 4 && BLOCK == 128 && RING_ROWS == 11);
@@ -606,10 +611,58 @@ unsafe fn conv_body<const DECAY: u32, const GATE: u32, const BETA: u32, X: ConvI
     decay: &mut DisjointSlice<f32>,
     ring: &mut DisjointSlice<f32>,
 ) {
+    let out = Outputs {
+        y: y.as_mut_ptr(),
+        beta: beta.as_mut_ptr(),
+        decay: decay.as_mut_ptr(),
+    };
+    let wi = thread::blockIdx_x() as usize * 4 + thread::threadIdx_x() as usize / 32;
+    // SAFETY: the contract's lengths and grid, forwarded.
+    unsafe {
+        conv_warp::<DECAY, GATE, BETA, X>(
+            wi,
+            x,
+            w,
+            (b_raw, decay_raw, dt_bias, ssm_a),
+            pos,
+            (lb, eps),
+            (n_k, n_v, ba_pitch, m),
+            fault,
+            out,
+            ring.as_mut_ptr(),
+        );
+    }
+}
+
+/// Warp `wi` of [`conv_body`]: unit `wi / H` and conv head `wi % H` over
+/// the call's `m` tokens, its outputs written through `out` and the ring
+/// `ring`; a warp past the call's `units(m)·H` writes nothing.
+///
+/// # Safety
+///
+/// [`conv_body`]'s contract, with `out` and `ring` addressing the values it
+/// names for `y`, `beta`, `decay` and `ring`, which this warp alone touches
+/// at its `(token, head)` outputs and head of the ring.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the kernel entry's arguments, forwarded flat"
+)]
+#[inline(always)]
+unsafe fn conv_warp<const DECAY: u32, const GATE: u32, const BETA: u32, X: ConvIn>(
+    wi: usize,
+    x: X,
+    w: &[f32],
+    (b_raw, decay_raw, dt_bias, ssm_a): (&[f32], &[f32], &[f32], &[f32]),
+    pos: &[u32],
+    (lb, eps): (f32, f32),
+    (n_k, n_v, ba_pitch, m): (u32, u32, u32, u32),
+    fault: FaultSink,
+    out: Outputs,
+    ring: *mut f32,
+) {
     let heads = (2 * n_k + n_v) as usize;
     let ch = heads * HEAD;
     let tid = thread::threadIdx_x() as usize;
-    let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
     let m = m as usize;
     if wi >= units(m) * heads {
         return; // warp-uniform
@@ -630,12 +683,6 @@ unsafe fn conv_body<const DECAY: u32, const GATE: u32, const BETA: u32, X: ConvI
         n_v: n_v as usize,
         ba_pitch: ba_pitch as usize,
     };
-    let out = Outputs {
-        y: y.as_mut_ptr(),
-        beta: beta.as_mut_ptr(),
-        decay: decay.as_mut_ptr(),
-    };
-    let ring = ring.as_mut_ptr();
     let (t0, t1) = if u == 0 {
         (0, m.min(CONV_ROWS))
     } else {
@@ -736,6 +783,99 @@ mod conv_kernels {
             conv_body::<DECAY_HEAD, KDA_GATE_SOFTPLUS, KDA_BETA_X1, _>(
                 x, w, b_raw, a_raw, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, ba_pitch, m, fault,
                 &mut y, &mut beta, &mut decay, &mut ring,
+            );
+        }
+    }
+
+    /// [`gdn_conv_prep`] over several sequences' rows (`crate::seq_rows`):
+    /// sequence `s` of `seqs` holds rows `lead .. lead + m_s` of every input
+    /// and output and its own ring at word 0, and its warps are the `per`
+    /// from `s·per` (`per = units(most)·H` for its longest sequence's
+    /// `most` rows), each [`gdn_conv_prep`]'s warp over the sequence's rows
+    /// alone; a warp past its sequence's units writes nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            x.len() >= rows * (2 * n_k + n_v) * 128,
+            w.len() >= 4 * (2 * n_k + n_v) * 128,
+            ba_pitch >= n_v,
+            b_raw.len() >= (rows - 1) * ba_pitch + n_v,
+            a_raw.len() >= (rows - 1) * ba_pitch + n_v,
+            dt_bias.len() >= n_v,
+            ssm_a.len() >= n_v,
+            pos.len() >= rows,
+            rows >= 1,
+            y.len() >= rows * (2 * n_k + n_v) * 128,
+            beta.len() >= rows * n_v,
+            decay.len() >= rows * n_v
+        )
+    )]
+    pub fn gdn_conv_prep_seqs(
+        x: &[f32],
+        w: &[f32],
+        b_raw: &[f32],
+        a_raw: &[f32],
+        dt_bias: &[f32],
+        ssm_a: &[f32],
+        pos: &[u32],
+        eps: f32,
+        n_k: u32,
+        n_v: u32,
+        ba_pitch: u32,
+        rows: u32,
+        per: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut beta: DisjointSlice<f32>,
+        mut decay: DisjointSlice<f32>,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        // rows only bounds the lengths in the launch contract.
+        let _ = rows;
+        let wi = thread::blockIdx_x() as usize * 4 + thread::threadIdx_x() as usize / 32;
+        let s = wi / per as usize;
+        if s >= seqs.len() {
+            return; // warp-uniform
+        }
+        // SAFETY: s < the table's sequences.
+        let ((lead, m), ring) = unsafe { (seqs.span(s), seqs.word(s, 0)) };
+        let ch = (2 * n_k + n_v) as usize * HEAD;
+        let (nv, pitch) = (n_v as usize, ba_pitch as usize);
+        // SAFETY: the sequence's rows lead .. lead + m lie inside the launch's
+        // `rows` (the table tiles them), so each window starts inside its
+        // input and holds the m rows the contract names, the outputs' too;
+        // the launcher put a ring of `RING_ROWS·C` f32 at word 0, the
+        // sequence's own; this warp is the one-sequence entry's warp
+        // `wi − s·per` over them.
+        unsafe {
+            let out = Outputs {
+                y: y.as_mut_ptr().add(lead * ch),
+                beta: beta.as_mut_ptr().add(lead * nv),
+                decay: decay.as_mut_ptr().add(lead * nv),
+            };
+            conv_warp::<DECAY_HEAD, KDA_GATE_SOFTPLUS, KDA_BETA_X1, _>(
+                wi - s * per as usize,
+                x.get_unchecked(lead * ch..),
+                w,
+                (
+                    b_raw.get_unchecked(lead * pitch..),
+                    a_raw.get_unchecked(lead * pitch..),
+                    dt_bias,
+                    ssm_a,
+                ),
+                pos.get_unchecked(lead..),
+                (0.0, eps),
+                (n_k, n_v, ba_pitch, m as u32),
+                fault,
+                out,
+                ring as usize as *mut f32,
             );
         }
     }
@@ -962,6 +1102,81 @@ pub struct ConvArgs<'a> {
     pub ring: &'a mut DeviceBuffer<f32>,
 }
 
+/// One sequence of [`ConvKernels::enqueue_conv_prep_seqs`]: its rows of the
+/// launch and its conv ring (`[RING_ROWS][C]`), read and written in place.
+pub(crate) struct ConvSeq<'a> {
+    pub(crate) rows: Range<usize>,
+    pub(crate) ring: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`ConvKernels::enqueue_conv_prep_seqs`]'s arguments: [`ConvArgs`]' over
+/// the rows of every sequence, the channels F32, each sequence's rows and
+/// ring in `seqs`.
+pub(crate) struct ConvSeqsArgs<'a, 's> {
+    pub(crate) x: &'a DeviceBuffer<f32>,
+    pub(crate) b_raw: &'a DeviceBuffer<f32>,
+    pub(crate) a_raw: &'a DeviceBuffer<f32>,
+    pub(crate) ba_pitch: usize,
+    pub(crate) w: &'a DeviceBuffer<f32>,
+    pub(crate) dt_bias: &'a DeviceBuffer<f32>,
+    pub(crate) ssm_a: &'a DeviceBuffer<f32>,
+    pub(crate) pos: &'a DeviceBuffer<u32>,
+    pub(crate) shape: LinearShape,
+    pub(crate) eps: f32,
+    pub(crate) fault: FaultSink,
+    pub(crate) y: &'a mut DeviceBuffer<f32>,
+    pub(crate) beta: &'a mut DeviceBuffer<f32>,
+    pub(crate) decay: &'a mut DeviceBuffer<f32>,
+    pub(crate) seqs: &'s [ConvSeq<'a>],
+}
+
+/// The refusals the conv's launches share over `m` rows of `shape` at
+/// `ba_pitch`: the shape's, no row, a pitch below `n_v`, and a buffer
+/// shorter than the rows read or written. `got` holds the lengths of `x`
+/// (in values), `b_raw`, `a_raw`, `w`, `dt_bias`, `ssm_a`, `pos`, `y`, `beta`
+/// and `decay`, in that order.
+fn check_rows(
+    what: &'static str,
+    (shape, m, ba_pitch): (LinearShape, usize, usize),
+    got: [usize; 10],
+) -> Result<(), GpuError> {
+    shape.check(what)?;
+    if m == 0 {
+        return Err(GpuError::shape(what, "need m >= 1, got m=0".to_owned()));
+    }
+    let ch = shape.channels();
+    let nv = shape.n_v;
+    if ba_pitch < nv {
+        return Err(GpuError::shape(
+            what,
+            format!("ba_pitch {ba_pitch} < n_v {nv}: a token's β and α rows overlap the next's"),
+        ));
+    }
+    let ba = (m - 1)
+        .checked_mul(ba_pitch)
+        .and_then(|v| v.checked_add(nv))
+        .ok_or_else(|| GpuError::shape(what, format!("m={m} rows of pitch {ba_pitch}")))?;
+    let need = [
+        ("x", m * ch),
+        ("b_raw", ba),
+        ("a_raw", ba),
+        ("w", CONV_TAPS * ch),
+        ("dt_bias", nv),
+        ("ssm_a", nv),
+        ("pos", m),
+        ("y", m * ch),
+        ("beta", m * nv),
+        ("decay", m * nv),
+    ];
+    match need.iter().zip(got).find(|&(&(_, need), got)| got < need) {
+        Some((&(name, need), got)) => Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct ConvKernels {
     module: conv_kernels::LoadedModule,
@@ -1006,24 +1221,6 @@ impl ConvKernels {
             decay,
             ring,
         } = args;
-        shape.check(what)?;
-        if m == 0 {
-            return Err(GpuError::shape(what, "need m >= 1, got m=0".to_owned()));
-        }
-        let ch = shape.channels();
-        let nv = shape.n_v;
-        if ba_pitch < nv {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "ba_pitch {ba_pitch} < n_v {nv}: a token's β and α rows overlap the next's"
-                ),
-            ));
-        }
-        let ba = (m - 1)
-            .checked_mul(ba_pitch)
-            .and_then(|v| v.checked_add(nv))
-            .ok_or_else(|| GpuError::shape(what, format!("m={m} rows of pitch {ba_pitch}")))?;
         let x_values = match x {
             ConvRows::F32(x) => x.len(),
             ConvRows::Bf16(x) => {
@@ -1031,25 +1228,29 @@ impl ConvKernels {
                 2 * x.len()
             }
         };
-        let lens = [
-            ("x", x_values, m * ch),
-            ("b_raw", b_raw.len(), ba),
-            ("a_raw", a_raw.len(), ba),
-            ("w", w.len(), CONV_TAPS * ch),
-            ("dt_bias", dt_bias.len(), nv),
-            ("ssm_a", ssm_a.len(), nv),
-            ("pos", pos.len(), m),
-            ("y", y.len(), m * ch),
-            ("beta", beta.len(), m * nv),
-            ("decay", decay.len(), m * nv),
-            ("ring", ring.len(), shape.ring_len()),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+        check_rows(
+            what,
+            (shape, m, ba_pitch),
+            [
+                x_values,
+                b_raw.len(),
+                a_raw.len(),
+                w.len(),
+                dt_bias.len(),
+                ssm_a.len(),
+                pos.len(),
+                y.len(),
+                beta.len(),
+                decay.len(),
+            ],
+        )?;
+        if ring.len() < shape.ring_len() {
             return Err(GpuError::shape(
                 what,
-                format!("{name}.len() {got} < {need}"),
+                format!("ring.len() {} < {}", ring.len(), shape.ring_len()),
             ));
         }
+        let nv = shape.n_v;
         let grid = launch_u32(what, "grid", (units(m) * shape.conv_heads()).div_ceil(4))?;
         let n_k = launch_u32(what, "n_k", shape.n_k)?;
         let n_v = launch_u32(what, "n_v", nv)?;
@@ -1099,6 +1300,108 @@ impl ConvKernels {
                 decay,
                 ring,
             )?,
+        }
+        Ok(())
+    }
+
+    /// Enqueue [`ConvKernels::enqueue_conv_prep`]'s F32 conv and prep of
+    /// every sequence of `args` in one launch (`crate::seq_rows`): each
+    /// sequence's rows over its own ring, bit for bit the launch of its rows
+    /// alone, `⌈units(most)·H·n / 4⌉` blocks for `n` sequences of at most
+    /// `most` rows. Refused by name: what that launch refuses over the
+    /// sequences' rows, a ring shorter than the shape's, and rows that do not
+    /// tile the launch from row 0 ([`SeqRows::new`]). Asynchronous and
+    /// capturable; builds its sequence table on the host.
+    pub(crate) fn enqueue_conv_prep_seqs(
+        &self,
+        stream: &CudaStream,
+        args: ConvSeqsArgs<'_, '_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_conv_prep_seqs";
+        let ConvSeqsArgs {
+            x,
+            b_raw,
+            a_raw,
+            ba_pitch,
+            w,
+            dt_bias,
+            ssm_a,
+            pos,
+            shape,
+            eps,
+            fault,
+            y,
+            beta,
+            decay,
+            seqs,
+        } = args;
+        let mut words = Vec::with_capacity(seqs.len());
+        for (s, q) in seqs.iter().enumerate() {
+            if q.ring.len() < shape.ring_len() {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "sequence {s}'s ring.len() {} < {}",
+                        q.ring.len(),
+                        shape.ring_len()
+                    ),
+                ));
+            }
+            let mut word = [0; SEQ_WORDS];
+            word[0] = q.ring.cu_deviceptr();
+            words.push((q.rows.clone(), word));
+        }
+        let table = SeqRows::new(what, &words)?;
+        let m = table.rows();
+        check_rows(
+            what,
+            (shape, m, ba_pitch),
+            [
+                x.len(),
+                b_raw.len(),
+                a_raw.len(),
+                w.len(),
+                dt_bias.len(),
+                ssm_a.len(),
+                pos.len(),
+                y.len(),
+                beta.len(),
+                decay.len(),
+            ],
+        )?;
+        let per = units(table.most()) * shape.conv_heads();
+        let grid = launch_u32(what, "grid", (per * table.len()).div_ceil(4))?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        let k = &self.module;
+        // SAFETY: each sequence's word 0 is its ring of the shape's
+        // `ring_len` f32s (checked above), borrowed mutably while this
+        // enqueue runs, so no other sequence's names it; a graph that
+        // captures the launch replays it over the same rings, which the
+        // caller keeps alive and in place while the graph lives, as for any
+        // buffer it captured.
+        unsafe {
+            k.gdn_conv_prep_seqs(
+                stream,
+                &k.prepare_gdn_conv_prep_seqs(cfg)?,
+                x,
+                w,
+                b_raw,
+                a_raw,
+                dt_bias,
+                ssm_a,
+                pos,
+                eps,
+                launch_u32(what, "n_k", shape.n_k)?,
+                launch_u32(what, "n_v", shape.n_v)?,
+                launch_u32(what, "ba_pitch", ba_pitch)?,
+                launch_u32(what, "rows", m)?,
+                launch_u32(what, "per", per)?,
+                fault,
+                y,
+                beta,
+                decay,
+                table,
+            )?;
         }
         Ok(())
     }

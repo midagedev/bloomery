@@ -6931,9 +6931,10 @@ impl Rollback for Body38 {
 
 /// A pass of several resident slots' rows (`GpuModel::step_slots`): every
 /// busy slot's rows walked as one verify of all of them (`Verify38` over
-/// [`Seqs38::Slots`]) — the row-wise launches once over every row, each
-/// slot's sequence-bound launches over its own rows and stores, each the
-/// launch that slot's rows would run alone — into one head of every row.
+/// [`Seqs38::Slots`]) — the row-wise launches once over every row, the
+/// sequence-bound launches over each slot's own rows and stores, most once
+/// over every slot (`crate::seq_rows`), each row's bits the launch that
+/// slot's rows would run alone — into one head of every row.
 /// Each slot is left as a verify of its rows leaves the live sequence:
 /// its stores past its rows and its verify waiting for its commit
 /// ([`Body38::keep_slot`]).
@@ -7242,7 +7243,7 @@ impl Body38 {
         let rows = key.iter().map(|&(_, m)| m).sum();
         let stand_in = key.first().is_some_and(|&(slot, _)| stands_in(slot));
         verify_launches(&self.plans, &self.card, self.tier.as_ref(), rows, self.head)
-            + key.len().saturating_sub(1) * seq_launches(&self.plans)
+            + key.len().saturating_sub(1) * seq_launches(&self.plans, self.kv_format())
             + key.iter().filter(|&&(slot, _)| slot != 0).count()
             - usize::from(stand_in)
     }

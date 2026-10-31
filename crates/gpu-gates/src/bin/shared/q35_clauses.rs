@@ -479,9 +479,8 @@ impl PassAdapter for Slots35 {
         Ok(Launches {
             n: self.nodes_slot,
             terms: format!(
-                "the embedding 1 + {} delta layers' conv and delta 2 + {} attention layers' rope-append and flash \
-                 segment pass and merge 3",
-                self.geom.n_delta, self.geom.n_attn
+                "the embedding 1 + {} attention layers' flash segment pass and merge 2",
+                self.geom.n_attn
             ),
         })
     }

@@ -21,7 +21,7 @@
 //! tie at the cut (`runtime::qsa::Tie::Higher`, ik's CPU `top_k`), and each
 //! row's list length written as its attention's visible count.
 //!
-//! Three launches:
+//! Four launches:
 //! - [`qsa_kernels::qsa_pool`] — the key of every pool some row completes
 //!   (`c % 4 == 0` completes pool `c/4 − 1`) from the raw indexer keys: the
 //!   four rows' mean, the RMS gain norm, the NEOX turn of the first [`ROT`]
@@ -34,6 +34,11 @@
 //!   RING_ROWS`), which a pool reaches at most `POOL − 1` rows back. The
 //!   launch's rows are consecutive positions (`n_keys[t] = n_keys[0] + t`);
 //!   it runs before the launch's key append writes the ring.
+//! - [`qsa_kernels::qsa_key_append`] — one thread per value: the raw key,
+//!   `DIM` values a row of the key projection (token-major `[m][DIM]`),
+//!   rounded once to f16; the call's last `min(m, RING_ROWS)` rows go into
+//!   the raw key ring, after the call's pool pass read the slots of the
+//!   positions before it.
 //! - [`qsa_kernels::qsa_score`] — per row: its [`HEADS`] indexer query heads
 //!   normed and turned at its position (every block of its group of
 //!   [`MAX_ROWS`] rows builds them; the group's first block writes them to
@@ -64,15 +69,25 @@
 //!   added `((h0 + h1) + h2) + h3`.
 //!
 //! No silent failure: a pooled value that is not finite after its f16
-//! rounding (a non-finite raw key, or one past f16's range) and a head dot
-//! that is not finite raise [`FaultSite::PoolSelect`]; the value is written
-//! as computed, never replaced by a plausible one, and the list is still a
-//! defined list of tokens below the row's count.
+//! rounding (a non-finite raw key, or one past f16's range), a raw key that
+//! is not finite after its rounding, a key row whose position is not `pos[0]`
+//! plus its index and a head dot that is not finite raise
+//! [`FaultSite::PoolSelect`], and a key row at or past the cache's `ctx` rows
+//! raises [`FaultSite::CachePos`] and writes nothing; every other value is
+//! written as computed, never replaced by a plausible one, and the list is
+//! still a defined list of tokens below the row's count.
+//!
+//! The pool, key append and score passes each have a `_seqs` entry over the
+//! rows of several sequences in one launch (`crate::seq_rows`), each
+//! sequence's rows over its own ring, pooled plane and rope table; the top-k
+//! pass reads only its rows' counts and scores, so one launch of it serves
+//! every sequence.
 
 use crate::elem::rms_scale_of_mean;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::rope_neox::neox_pair;
+use crate::seq_rows::{SEQ_WORDS, SeqRows};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32};
@@ -80,6 +95,7 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Indexer query heads (`attention.indexer.head_count`).
@@ -133,6 +149,8 @@ const _: () = assert!(WARPS == HEADS);
 const STAGE_PER: usize = POOL_TILE * ROW_QWORDS / THREADS as usize;
 const _: () = assert!(STAGE_PER * THREADS as usize == POOL_TILE * ROW_QWORDS);
 
+/// Threads of a key append block, one a value.
+const APPEND_THREADS: u32 = 256;
 /// Threads of a top-k block, and its warps.
 const TOPK_THREADS: u32 = 512;
 const TOPK_WARPS: usize = TOPK_THREADS as usize / 32;
@@ -510,6 +528,335 @@ pub unsafe fn refine(
     unsafe { fine_bins(fine, tid) }
 }
 
+/// [`pool_row`]'s inputs: the call's raw keys, the ring, the norm's gain,
+/// the rotation table and the rows' key counts.
+type PoolIn<'a> = (&'a [f32], &'a [u16], &'a [f32], &'a [f32], &'a [u32]);
+
+/// Row `t` of [`qsa_kernels::qsa_pool`]'s launch (that entry's doc), the
+/// warp's work: the pool its count completes, from the call's rows `kr`
+/// before it and the ring, written through `pooled`.
+///
+/// # Safety
+///
+/// `qsa_pool`'s launch contract over these inputs and the plane `pooled`
+/// addresses, `t` below its rows, and all 32 lanes of the warp here; no
+/// other warp of the launch writes the pool row `t` completes.
+#[inline(always)]
+unsafe fn pool_row(
+    t: usize,
+    (kr, ring, gain, table, n_keys): PoolIn<'_>,
+    eps: f32,
+    ctx: u32,
+    fault: FaultSink,
+    pooled: *mut u16,
+) {
+    // SAFETY: t < m <= n_keys.len() by the launch contract.
+    let c = unsafe { *n_keys.get_unchecked(t) };
+    // SAFETY: t < m makes m nonzero, and m <= n_keys.len().
+    let c0 = unsafe { *n_keys.get_unchecked(0) };
+    if c0.checked_add(t as u32) != Some(c) {
+        fault.raise(FaultSite::PoolSelect);
+        return; // warp-uniform
+    }
+    if c == 0 || c > ctx || !c.is_multiple_of(POOL as u32) {
+        return; // warp-uniform
+    }
+    for back in 1..POOL {
+        if back <= t {
+            // SAFETY: t − back < t < m <= n_keys.len().
+            let before = unsafe { *n_keys.get_unchecked(t - back) };
+            if c.checked_sub(back as u32) != Some(before) {
+                fault.raise(FaultSite::PoolSelect);
+                return; // warp-uniform
+            }
+        }
+    }
+    let j = (c / POOL as u32 - 1) as usize;
+    let lane = warp::lane_id() as usize;
+    let d = lane_dims(lane);
+    let mut x = [0.0f32; 4];
+    let mut g = [0.0f32; 4];
+    for i in 0..4 {
+        thread::__unroll_config::<0>();
+        // Row k of the pool lies POOL − 1 − k rows before row t: the
+        // call's row when it holds one, else the ring's slot.
+        let row = |k: usize| {
+            let back = POOL - 1 - k;
+            let bits = if back <= t {
+                // SAFETY: back <= t and t < m; d[i] < DIM, so
+                // (t - back) * DIM + d[i] < m * DIM <= kr.len().
+                let value = unsafe { *kr.get_unchecked((t - back) * DIM + d[i]) };
+                f32_to_f16_bits(value)
+            } else {
+                // SAFETY: the slot is below RING_ROWS and d[i] < DIM,
+                // so the index is below RING_ROWS * DIM <= ring.len().
+                unsafe { *ring.get_unchecked((POOL * j + k) % RING_ROWS * DIM + d[i]) }
+            };
+            half_bits_to_f32(bits)
+        };
+        x[i] = (((row(0) + row(1)) + row(2)) + row(3)) * 0.25;
+        // SAFETY: lane_dims gives d[i] < DIM <= gain.len().
+        g[i] = unsafe { *gain.get_unchecked(d[i]) };
+    }
+    let p = POOL * j;
+    // SAFETY: p < c <= ctx and 2·lane + 1 < ROT: inside row p of the
+    // table's ctx rows of ROT.
+    let (cs, sn) = unsafe {
+        (
+            *table.get_unchecked(p * ROT + 2 * lane),
+            *table.get_unchecked(p * ROT + 2 * lane + 1),
+        )
+    };
+    let y = norm_turn(x, g, cs, sn, eps);
+    let mut finite = true;
+    for i in 0..4 {
+        thread::__unroll_config::<0>();
+        let h = f32_to_f16_bits(y[i]);
+        finite &= half_bits_to_f32(h).is_finite();
+        // SAFETY: j < c/4 <= ctx/4 <= pools, so j·DIM + d[i] < pools·DIM,
+        // inside the plane `pooled` addresses; the rows of one launch hold
+        // distinct counts, so one lane writes each value.
+        unsafe { *pooled.add(j * DIM + d[i]) = h };
+    }
+    if !finite {
+        fault.raise(FaultSite::PoolSelect);
+    }
+}
+
+/// [`score_block`]'s inputs: the indexer queries, the norm's gain, the
+/// rotation table, the rows' key counts and the pooled keys.
+type ScoreIn<'a> = (&'a [f32], &'a [f32], &'a [f32], &'a [u32], &'a [u16]);
+
+/// Block `(group, tile)` of [`qsa_kernels::qsa_score`]'s launch of `m`
+/// rows (that entry's doc), its query heads written through `q_out` and its
+/// scores through `scores`, over the block's shared tiles `qs`, `ks`, `ws`.
+/// Every index into a tile is inside it, and every write is ordered before
+/// its reads by a block barrier.
+///
+/// # Safety
+///
+/// `qsa_score`'s launch contract over these inputs and the rows `q_out` and
+/// `scores` address, a block of [`THREADS`], and `qs`, `ks`, `ws` the
+/// block's own shared tiles of that entry's sizes.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn score_block(
+    (group, tile): (usize, usize),
+    (q, gain, table, n_keys, pooled): ScoreIn<'_>,
+    eps: f32,
+    (ctx, pools, kept, m): (u32, u32, u32, u32),
+    fault: FaultSink,
+    (q_out, scores): (*mut f32, *mut f32),
+    (qs, ks, ws): (*mut f32, *mut u32, *mut f32),
+) {
+    let r0 = group * MAX_ROWS;
+    if r0 >= m as usize {
+        return; // block-uniform: past the launch's groups
+    }
+    let tid = thread::threadIdx_x() as usize;
+    let w = tid / 32;
+    let lane = warp::lane_id() as usize;
+    let rows = (m as usize - r0).min(MAX_ROWS);
+    let p0 = tile * POOL_TILE;
+    // The largest complete pool count among the rows this tile serves;
+    // the same in every thread.
+    let mut live_max = 0usize;
+    let mut t = 0usize;
+    while t < rows {
+        // SAFETY: r0 + t < m <= n_keys.len() by the launch contract.
+        let c = unsafe { *n_keys.get_unchecked(r0 + t) };
+        if scored(c, ctx, kept) {
+            live_max = live_max.max(c as usize / POOL);
+        }
+        t += 1;
+    }
+    if p0 >= live_max && tile != 0 {
+        return; // block-uniform
+    }
+
+    // ---- the query heads: warp w builds head w of every row of the group.
+    let d = lane_dims(lane);
+    let mut g = [0.0f32; 4];
+    for i in 0..4 {
+        thread::__unroll_config::<0>();
+        // SAFETY: d[i] < DIM <= gain.len() by the launch contract.
+        g[i] = unsafe { *gain.get_unchecked(d[i]) };
+    }
+    let mut t = 0usize;
+    while t < rows {
+        // SAFETY: r0 + t < m <= n_keys.len().
+        let c = unsafe { *n_keys.get_unchecked(r0 + t) };
+        let base = (t * HEADS + w) * DIM;
+        let at = r0 * HEADS * DIM + base;
+        let y = if c >= 1 && c <= ctx {
+            let mut x = [0.0f32; 4];
+            for i in 0..4 {
+                thread::__unroll_config::<0>();
+                // SAFETY: at + d[i] < m·HEADS·DIM <= q.len().
+                x[i] = unsafe { *q.get_unchecked(at + d[i]) };
+            }
+            let p = c as usize - 1;
+            // SAFETY: p < ctx and 2·lane + 1 < ROT: inside the table.
+            let (cs, sn) = unsafe {
+                (
+                    *table.get_unchecked(p * ROT + 2 * lane),
+                    *table.get_unchecked(p * ROT + 2 * lane + 1),
+                )
+            };
+            norm_turn(x, g, cs, sn, eps)
+        } else {
+            [f32::NAN; 4]
+        };
+        for i in 0..4 {
+            thread::__unroll_config::<0>();
+            // SAFETY: base + d[i] < MAX_ROWS·HEADS·DIM; this lane's own.
+            unsafe { *qs.add(base + d[i]) = y[i] };
+            if tile == 0 {
+                // SAFETY: at + d[i] < m·HEADS·DIM, inside the rows
+                // `q_out` addresses; the group's tile-0 block alone
+                // writes it, each value by one lane.
+                unsafe { *q_out.add(at + d[i]) = y[i] };
+            }
+        }
+        t += 1;
+    }
+    if p0 >= live_max {
+        return; // block-uniform: a tile-0 block with no tile to score
+    }
+
+    // ---- the tile: pools p0 .. p0 + 32 below live_max, zeros past it.
+    for i in 0..STAGE_PER {
+        thread::__unroll_config::<0>();
+        let e = tid + THREADS as usize * i;
+        let key = e / ROW_QWORDS;
+        let word = e - key * ROW_QWORDS;
+        let kw = if p0 + key < live_max {
+            // SAFETY: p0 + key < live_max <= ctx/4 <= pools, so the row
+            // is inside pooled's pools·DIM u16 = pools·32 u64; the buffer
+            // starts 8-byte aligned (a device allocation).
+            unsafe { *(pooled.as_ptr() as *const u64).add((p0 + key) * ROW_QWORDS + word) }
+        } else {
+            0u64
+        };
+        // SAFETY: key < POOL_TILE and 2·word + 1 < K_STRIDE.
+        unsafe {
+            *ks.add(key * K_STRIDE + 2 * word) = kw as u32;
+            *ks.add(key * K_STRIDE + 2 * word + 1) = (kw >> 32) as u32;
+        }
+    }
+    thread::sync_threads();
+
+    let mut t = 0usize;
+    while t < rows {
+        // SAFETY: r0 + t < m <= n_keys.len().
+        let c = unsafe { *n_keys.get_unchecked(r0 + t) };
+        let nb = c as usize / POOL;
+        // Block-uniform: c is the row's.
+        if scored(c, ctx, kept) && p0 < nb {
+            let live = p0 + lane < nb;
+            let qh = (t * HEADS + w) * DIM;
+            let mut a = [0.0f32; ILP];
+            let mut wd = 0usize;
+            while wd < ROW_WORDS {
+                for p in 0..ILP {
+                    thread::__unroll_config::<0>();
+                    // SAFETY: lane < POOL_TILE and wd + p < ROW_WORDS:
+                    // inside KS; qh + 2(wd + p) + 1 < MAX_ROWS·HEADS·DIM.
+                    let (kw, q0, q1) = unsafe {
+                        (
+                            *ks.add(lane * K_STRIDE + wd + p),
+                            *qs.add(qh + 2 * (wd + p)),
+                            *qs.add(qh + 2 * (wd + p) + 1),
+                        )
+                    };
+                    a[p] = f32::mul_add(q0, half_bits_to_f32(kw as u16), a[p]);
+                    a[p] = f32::mul_add(q1, half_bits_to_f32((kw >> 16) as u16), a[p]);
+                }
+                wd += ILP;
+            }
+            let dot = (a[0] + a[1]) + (a[2] + a[3]);
+            if live && !dot.is_finite() {
+                fault.raise(FaultSite::PoolSelect);
+            }
+            // SAFETY: w < HEADS and lane < POOL_TILE: this lane's slot.
+            unsafe { *ws.add(w * POOL_TILE + lane) = relu(dot) };
+            thread::sync_threads();
+            if w == 0 && live {
+                // SAFETY: the four slots of lane `lane`, written
+                // before the barrier above.
+                let s = unsafe {
+                    ((*ws.add(lane) + *ws.add(POOL_TILE + lane)) + *ws.add(2 * POOL_TILE + lane))
+                        + *ws.add(3 * POOL_TILE + lane)
+                };
+                if !s.is_finite() {
+                    fault.raise(FaultSite::PoolSelect);
+                }
+                let pool = p0 + lane;
+                // SAFETY: pool < nb <= ctx/4 <= pools and r0 + t < m, so
+                // (r0 + t)·pools + pool < m·pools, inside the rows
+                // `scores` addresses; one lane writes each score.
+                unsafe { *scores.add((r0 + t) * pools as usize + pool) = s };
+            }
+            thread::sync_threads();
+        }
+        t += 1;
+    }
+}
+
+/// Value `i` of [`qsa_kernels::qsa_key_append`]'s launch of `m` rows (that
+/// entry's doc), the ring written through `ring`.
+///
+/// # Safety
+///
+/// `qsa_key_append`'s launch contract over `kr`, `pos` and the ring `ring`
+/// addresses, and `i < DIM·m`.
+#[inline(always)]
+unsafe fn key_append_value(
+    i: usize,
+    (kr, pos): (&[f32], &[u32]),
+    m: u32,
+    ctx: u32,
+    fault: FaultSink,
+    ring: *mut u16,
+) {
+    let (c, r) = (i / DIM, i % DIM);
+    // SAFETY: c = i / DIM < m <= pos.len() by the launch contract.
+    let p = unsafe { *pos.get_unchecked(c) };
+    // SAFETY: i < DIM·m makes m nonzero, and m <= pos.len().
+    let p0 = unsafe { *pos.get_unchecked(0) };
+    // SAFETY: i < DIM·m <= kr.len() by the launch contract.
+    let x = unsafe { *kr.get_unchecked(i) };
+    if p >= ctx {
+        if r == 0 {
+            fault.raise(FaultSite::CachePos);
+        }
+        return;
+    }
+    let bits = f32_to_f16_bits(x);
+    if !half_bits_to_f32(bits).is_finite() {
+        fault.raise(FaultSite::PoolSelect);
+    }
+    if p0.checked_add(c as u32) != Some(p) {
+        if r == 0 {
+            fault.raise(FaultSite::PoolSelect);
+        }
+        return;
+    }
+    if c + RING_ROWS < m as usize {
+        return;
+    }
+    // SAFETY: the slot is below RING_ROWS, so slot·DIM + r < RING_ROWS·DIM,
+    // inside the ring `ring` addresses; the rows written are consecutive
+    // (`pos[0] + c`, checked above) and at most RING_ROWS, so their slots are
+    // distinct and thread (c, r) is the value's only writer.
+    unsafe {
+        *ring.add(p as usize % RING_ROWS * DIM + r) = bits;
+    }
+}
+
 // ---------------------------------------------------------------- kernels
 
 #[cuda_module]
@@ -566,76 +913,154 @@ mod qsa_kernels {
         if t >= m as usize {
             return; // warp-uniform: the row is the warp's, and no barrier follows
         }
-        // SAFETY: t < m <= n_keys.len() by the launch contract.
-        let c = unsafe { *n_keys.get_unchecked(t) };
-        // SAFETY: t < m makes m nonzero, and m <= n_keys.len().
-        let c0 = unsafe { *n_keys.get_unchecked(0) };
-        if c0.checked_add(t as u32) != Some(c) {
-            fault.raise(FaultSite::PoolSelect);
-            return; // warp-uniform
+        // SAFETY: the launch contract's lengths, t < m, and the whole warp
+        // here; the pooled plane is this launch's own output.
+        unsafe {
+            pool_row(
+                t,
+                (kr, ring, gain, table, n_keys),
+                eps,
+                ctx,
+                fault,
+                pooled.as_mut_ptr(),
+            );
         }
-        if c == 0 || c > ctx || !c.is_multiple_of(POOL as u32) {
-            return; // warp-uniform
+    }
+
+    /// [`qsa_pool`] over several sequences' rows (`crate::seq_rows`): row `t`
+    /// of sequence `s` (rows `lead .. lead + m_s`) is that sequence's launch's
+    /// row `t − lead` over its rows of `kr` and `n_keys` and its own words,
+    /// the raw key ring, the pooled plane and the rope table, in that order.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys.len() >= rows,
+            kr.len() >= rows * 128,
+            gain.len() >= 128
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn qsa_pool_seqs(
+        kr: &[f32],
+        gain: &[f32],
+        n_keys: &[u32],
+        eps: f32,
+        ctx: u32,
+        rows: u32,
+        fault: FaultSink,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let t = thread::blockIdx_x() as usize * WARPS + tid / 32;
+        if t >= rows as usize {
+            return; // warp-uniform: the row is the warp's, and no barrier follows
         }
-        for back in 1..POOL {
-            if back <= t {
-                // SAFETY: t − back < t < m <= n_keys.len().
-                let before = unsafe { *n_keys.get_unchecked(t - back) };
-                if c.checked_sub(back as u32) != Some(before) {
-                    fault.raise(FaultSite::PoolSelect);
-                    return; // warp-uniform
-                }
-            }
+        let s = seqs.seq_of(t);
+        // SAFETY: s < the table's sequences (seq_of), whose rows tile the
+        // launch's: row t is its row t − lead, the windows from its first row
+        // hold its rows of kr and n_keys, and the launcher put its own ring
+        // (RING_ROWS·DIM f16), pooled plane (pools_for(ctx)·DIM f16,
+        // borrowed by this launch alone) and rope table (ctx·ROT f32) at its
+        // words, so the call is that sequence's launch's warp over them.
+        unsafe {
+            let (lead, _) = seqs.span(s);
+            let ring = seqs.word(s, 0) as usize as *const u16;
+            let table = seqs.word(s, 2) as usize as *const f32;
+            pool_row(
+                t - lead,
+                (
+                    kr.get_unchecked(lead * DIM..),
+                    core::slice::from_raw_parts(ring, RING_ROWS * DIM),
+                    gain,
+                    core::slice::from_raw_parts(table, ctx as usize * ROT),
+                    n_keys.get_unchecked(lead..),
+                ),
+                eps,
+                ctx,
+                fault,
+                seqs.word(s, 1) as usize as *mut u16,
+            );
         }
-        let j = (c / POOL as u32 - 1) as usize;
-        let lane = warp::lane_id() as usize;
-        let d = lane_dims(lane);
-        let mut x = [0.0f32; 4];
-        let mut g = [0.0f32; 4];
-        for i in 0..4 {
-            thread::__unroll_config::<0>();
-            // Row k of the pool lies POOL − 1 − k rows before row t: the
-            // call's row when it holds one, else the ring's slot.
-            let row = |k: usize| {
-                let back = POOL - 1 - k;
-                let bits = if back <= t {
-                    // SAFETY: back <= t and t < m; d[i] < DIM, so
-                    // (t - back) * DIM + d[i] < m * DIM <= kr.len().
-                    let value = unsafe { *kr.get_unchecked((t - back) * DIM + d[i]) };
-                    f32_to_f16_bits(value)
-                } else {
-                    // SAFETY: the slot is below RING_ROWS and d[i] < DIM,
-                    // so the index is below RING_ROWS * DIM <= ring.len().
-                    unsafe { *ring.get_unchecked((POOL * j + k) % RING_ROWS * DIM + d[i]) }
-                };
-                half_bits_to_f32(bits)
-            };
-            x[i] = (((row(0) + row(1)) + row(2)) + row(3)) * 0.25;
-            // SAFETY: lane_dims gives d[i] < DIM <= gain.len().
-            g[i] = unsafe { *gain.get_unchecked(d[i]) };
+    }
+
+    /// Row `c` of `m` indexer keys — value `r` at `kr[c·DIM + r]`, the key
+    /// projection's token-major output — rounded once to f16; a row of the
+    /// last [`RING_ROWS`] writes it into the ring's slot
+    /// `pos[c] mod RING_ROWS`, [`DIM`] values a row. A position at or past
+    /// `ctx` raises [`FaultSite::CachePos`] and writes nothing; a row whose
+    /// position is not `pos[0] + c` raises [`FaultSite::PoolSelect`] and
+    /// writes nothing, so no two rows share a slot; a value that is not
+    /// finite after its rounding raises [`FaultSite::PoolSelect`], whichever
+    /// row it is, and is written when its row is.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (kr.len() >= 128 * m, pos.len() >= m, ring.len() >= 1408)
+    )]
+    pub fn qsa_key_append(
+        kr: &[f32],
+        pos: &[u32],
+        m: u32,
+        ctx: u32,
+        fault: FaultSink,
+        mut ring: DisjointSlice<u16>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= DIM * m as usize {
+            return;
         }
-        let p = POOL * j;
-        // SAFETY: p < c <= ctx and 2·lane + 1 < ROT: inside row p of the
-        // table's ctx rows of ROT.
-        let (cs, sn) = unsafe {
-            (
-                *table.get_unchecked(p * ROT + 2 * lane),
-                *table.get_unchecked(p * ROT + 2 * lane + 1),
-            )
-        };
-        let y = norm_turn(x, g, cs, sn, eps);
-        let mut finite = true;
-        for i in 0..4 {
-            thread::__unroll_config::<0>();
-            let h = f32_to_f16_bits(y[i]);
-            finite &= half_bits_to_f32(h).is_finite();
-            // SAFETY: j < c/4 <= ctx/4 <= pools, so j·DIM + d[i] < pools·DIM
-            // <= pooled.len(); the rows of one launch hold distinct counts, so
-            // one lane writes each value.
-            unsafe { *pooled.get_unchecked_mut(j * DIM + d[i]) = h };
+        // SAFETY: the launch contract's lengths and i < DIM·m; the ring is
+        // this launch's own output.
+        unsafe { key_append_value(i, (kr, pos), m, ctx, fault, ring.as_mut_ptr()) };
+    }
+
+    /// [`qsa_key_append`] over several sequences' rows (`crate::seq_rows`):
+    /// value `i` of row `c` of sequence `s` (rows `lead .. lead + m_s`) is that
+    /// sequence's launch's value `i − lead·DIM` over its rows of `kr` and
+    /// `pos` and its own raw key ring (word 0).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (kr.len() >= 128 * rows, pos.len() >= rows)
+    )]
+    pub fn qsa_key_append_seqs(
+        kr: &[f32],
+        pos: &[u32],
+        rows: u32,
+        ctx: u32,
+        fault: FaultSink,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= DIM * rows as usize {
+            return;
         }
-        if !finite {
-            fault.raise(FaultSite::PoolSelect);
+        let s = seqs.seq_of(i / DIM);
+        // SAFETY: s < the table's sequences (seq_of), whose rows tile the
+        // launch's: row i / DIM is its row i / DIM − lead, the windows from
+        // its first row hold its m rows of kr and pos, and the launcher put
+        // its own ring (RING_ROWS·DIM f16, borrowed by this launch alone) at
+        // word 0, so the thread is that sequence's launch's over them.
+        unsafe {
+            let (lead, m) = seqs.span(s);
+            key_append_value(
+                i - lead * DIM,
+                (kr.get_unchecked(lead * DIM..), pos.get_unchecked(lead..)),
+                m as u32,
+                ctx,
+                fault,
+                seqs.word(s, 0) as usize as *mut u16,
+            );
         }
     }
 
@@ -670,10 +1095,6 @@ mod qsa_kernels {
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
-    #[allow(
-        clippy::needless_range_loop,
-        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-    )]
     pub fn qsa_score(
         q: &[f32],
         gain: &[f32],
@@ -695,171 +1116,116 @@ mod qsa_kernels {
 
         let tiles = (pools as usize).div_ceil(POOL_TILE);
         let b = thread::blockIdx_x() as usize;
-        let (group, tile) = (b / tiles, b % tiles);
-        let r0 = group * MAX_ROWS;
-        if r0 >= m as usize {
-            return; // block-uniform: past the launch's groups
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation; the raw form reaches it without a reference. The
+        // launch contract's lengths and outputs, and block b of its grid.
+        unsafe {
+            score_block(
+                (b / tiles, b % tiles),
+                (q, gain, table, n_keys, pooled),
+                eps,
+                (ctx, pools, kept, m),
+                fault,
+                (q_out.as_mut_ptr(), scores.as_mut_ptr()),
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QS),
+                    SharedArray::as_raw_mut_ptr(&raw mut KS),
+                    SharedArray::as_raw_mut_ptr(&raw mut WS),
+                ),
+            );
         }
-        let tid = thread::threadIdx_x() as usize;
-        let w = tid / 32;
-        let lane = warp::lane_id() as usize;
-        let rows = (m as usize - r0).min(MAX_ROWS);
-        let p0 = tile * POOL_TILE;
-        // The largest complete pool count among the rows this tile serves;
-        // the same in every thread.
-        let mut live_max = 0usize;
-        let mut t = 0usize;
-        while t < rows {
-            // SAFETY: r0 + t < m <= n_keys.len() by the launch contract.
-            let c = unsafe { *n_keys.get_unchecked(r0 + t) };
-            if scored(c, ctx, kept) {
-                live_max = live_max.max(c as usize / POOL);
-            }
-            t += 1;
-        }
-        if p0 >= live_max && tile != 0 {
+    }
+
+    /// [`qsa_score`] over several sequences' rows (`crate::seq_rows`): blocks
+    /// `s·per .. (s + 1)·per`, `per = groups·tiles`, are sequence `s`'s launch,
+    /// block `b − s·per` of it, over its rows `lead .. lead + m_s` of `q`,
+    /// `n_keys`, `q_out` and `scores` and its own pooled plane and rope
+    /// table (words 1 and 2);
+    /// `groups` is `⌈most / MAX_ROWS⌉` for the longest sequence's `most`
+    /// rows, and a block past its sequence's groups returns.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            pools >= 1,
+            n_keys.len() >= rows,
+            q.len() >= rows * 512,
+            gain.len() >= 128,
+            pools * 4 >= ctx,
+            q_out.len() >= rows * 512,
+            scores.len() >= rows * pools
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn qsa_score_seqs(
+        q: &[f32],
+        gain: &[f32],
+        n_keys: &[u32],
+        eps: f32,
+        ctx: u32,
+        pools: u32,
+        kept: u32,
+        rows: u32,
+        groups: u32,
+        fault: FaultSink,
+        mut q_out: DisjointSlice<f32>,
+        mut scores: DisjointSlice<f32>,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        static mut QS: SharedArray<f32, { MAX_ROWS * HEADS * DIM }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { POOL_TILE * K_STRIDE }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { HEADS * POOL_TILE }> = SharedArray::UNINIT;
+
+        // rows only bounds the lengths in the launch contract.
+        let _ = rows;
+        let tiles = (pools as usize).div_ceil(POOL_TILE);
+        let per = groups as usize * tiles;
+        let b = thread::blockIdx_x() as usize;
+        let s = b / per;
+        if s >= seqs.len() {
             return; // block-uniform
         }
-
-        // SAFETY: each `static mut` above is this block's own shared
-        // allocation; the raw form reaches it without a reference. Every
-        // index below is inside its array, and every write is ordered before
-        // its reads by a block barrier.
-        let (qs, ks, ws) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut QS),
-                SharedArray::as_raw_mut_ptr(&raw mut KS),
-                SharedArray::as_raw_mut_ptr(&raw mut WS),
-            )
-        };
-
-        // ---- the query heads: warp w builds head w of every row of the group.
-        let d = lane_dims(lane);
-        let mut g = [0.0f32; 4];
-        for i in 0..4 {
-            thread::__unroll_config::<0>();
-            // SAFETY: d[i] < DIM <= gain.len() by the launch contract.
-            g[i] = unsafe { *gain.get_unchecked(d[i]) };
-        }
-        let mut t = 0usize;
-        while t < rows {
-            // SAFETY: r0 + t < m <= n_keys.len().
-            let c = unsafe { *n_keys.get_unchecked(r0 + t) };
-            let base = (t * HEADS + w) * DIM;
-            let at = r0 * HEADS * DIM + base;
-            let y = if c >= 1 && c <= ctx {
-                let mut x = [0.0f32; 4];
-                for i in 0..4 {
-                    thread::__unroll_config::<0>();
-                    // SAFETY: at + d[i] < m·HEADS·DIM <= q.len().
-                    x[i] = unsafe { *q.get_unchecked(at + d[i]) };
-                }
-                let p = c as usize - 1;
-                // SAFETY: p < ctx and 2·lane + 1 < ROT: inside the table.
-                let (cs, sn) = unsafe {
-                    (
-                        *table.get_unchecked(p * ROT + 2 * lane),
-                        *table.get_unchecked(p * ROT + 2 * lane + 1),
-                    )
-                };
-                norm_turn(x, g, cs, sn, eps)
-            } else {
-                [f32::NAN; 4]
-            };
-            for i in 0..4 {
-                thread::__unroll_config::<0>();
-                // SAFETY: base + d[i] < MAX_ROWS·HEADS·DIM; this lane's own.
-                unsafe { *qs.add(base + d[i]) = y[i] };
-                if tile == 0 {
-                    // SAFETY: at + d[i] < m·HEADS·DIM <= q_out.len(); the
-                    // group's tile-0 block alone writes it, each value by one
-                    // lane.
-                    unsafe { *q_out.get_unchecked_mut(at + d[i]) = y[i] };
-                }
-            }
-            t += 1;
-        }
-        if p0 >= live_max {
-            return; // block-uniform: a tile-0 block with no tile to score
-        }
-
-        // ---- the tile: pools p0 .. p0 + 32 below live_max, zeros past it.
-        for i in 0..STAGE_PER {
-            thread::__unroll_config::<0>();
-            let e = tid + THREADS as usize * i;
-            let key = e / ROW_QWORDS;
-            let word = e - key * ROW_QWORDS;
-            let kw = if p0 + key < live_max {
-                // SAFETY: p0 + key < live_max <= ctx/4 <= pools, so the row
-                // is inside pooled's pools·DIM u16 = pools·32 u64; the buffer
-                // starts 8-byte aligned (a device allocation).
-                unsafe { *(pooled.as_ptr() as *const u64).add((p0 + key) * ROW_QWORDS + word) }
-            } else {
-                0u64
-            };
-            // SAFETY: key < POOL_TILE and 2·word + 1 < K_STRIDE.
-            unsafe {
-                *ks.add(key * K_STRIDE + 2 * word) = kw as u32;
-                *ks.add(key * K_STRIDE + 2 * word + 1) = (kw >> 32) as u32;
-            }
-        }
-        thread::sync_threads();
-
-        let mut t = 0usize;
-        while t < rows {
-            // SAFETY: r0 + t < m <= n_keys.len().
-            let c = unsafe { *n_keys.get_unchecked(r0 + t) };
-            let nb = c as usize / POOL;
-            // Block-uniform: c is the row's.
-            if scored(c, ctx, kept) && p0 < nb {
-                let live = p0 + lane < nb;
-                let qh = (t * HEADS + w) * DIM;
-                let mut a = [0.0f32; ILP];
-                let mut wd = 0usize;
-                while wd < ROW_WORDS {
-                    for p in 0..ILP {
-                        thread::__unroll_config::<0>();
-                        // SAFETY: lane < POOL_TILE and wd + p < ROW_WORDS:
-                        // inside KS; qh + 2(wd + p) + 1 < MAX_ROWS·HEADS·DIM.
-                        let (kw, q0, q1) = unsafe {
-                            (
-                                *ks.add(lane * K_STRIDE + wd + p),
-                                *qs.add(qh + 2 * (wd + p)),
-                                *qs.add(qh + 2 * (wd + p) + 1),
-                            )
-                        };
-                        a[p] = f32::mul_add(q0, half_bits_to_f32(kw as u16), a[p]);
-                        a[p] = f32::mul_add(q1, half_bits_to_f32((kw >> 16) as u16), a[p]);
-                    }
-                    wd += ILP;
-                }
-                let dot = (a[0] + a[1]) + (a[2] + a[3]);
-                if live && !dot.is_finite() {
-                    fault.raise(FaultSite::PoolSelect);
-                }
-                // SAFETY: w < HEADS and lane < POOL_TILE: this lane's slot.
-                unsafe { *ws.add(w * POOL_TILE + lane) = relu(dot) };
-                thread::sync_threads();
-                if w == 0 && live {
-                    // SAFETY: the four slots of lane `lane`, written
-                    // before the barrier above.
-                    let s = unsafe {
-                        ((*ws.add(lane) + *ws.add(POOL_TILE + lane))
-                            + *ws.add(2 * POOL_TILE + lane))
-                            + *ws.add(3 * POOL_TILE + lane)
-                    };
-                    if !s.is_finite() {
-                        fault.raise(FaultSite::PoolSelect);
-                    }
-                    let pool = p0 + lane;
-                    // SAFETY: pool < nb <= ctx/4 <= pools and r0 + t < m, so
-                    // (r0 + t)·pools + pool < m·pools <= scores.len(); one
-                    // lane writes each score.
-                    unsafe { *scores.get_unchecked_mut((r0 + t) * pools as usize + pool) = s };
-                }
-                thread::sync_threads();
-            }
-            t += 1;
+        let r = b - s * per;
+        let (q_at, p_at) = (HEADS * DIM, pools as usize);
+        // SAFETY: s < the table's sequences, whose rows tile the launch's:
+        // the windows from its first row hold its m rows of q, n_keys, q_out
+        // and scores, and the launcher put its own pooled plane
+        // (pools·DIM f16) and rope table (ctx·ROT f32) at words 1 and 2, so
+        // the block is that sequence's
+        // launch's block r over them (a group past its rows returns). Each
+        // `static mut` above is this block's own shared allocation; the raw
+        // form reaches it without a reference.
+        unsafe {
+            let (lead, m) = seqs.span(s);
+            let pooled = seqs.word(s, 1) as usize as *const u16;
+            let table = seqs.word(s, 2) as usize as *const f32;
+            score_block(
+                (r / tiles, r % tiles),
+                (
+                    q.get_unchecked(lead * q_at..),
+                    gain,
+                    core::slice::from_raw_parts(table, ctx as usize * ROT),
+                    n_keys.get_unchecked(lead..),
+                    core::slice::from_raw_parts(pooled, pools as usize * DIM),
+                ),
+                eps,
+                (ctx, pools, kept, m as u32),
+                fault,
+                (
+                    q_out.as_mut_ptr().add(lead * q_at),
+                    scores.as_mut_ptr().add(lead * p_at),
+                ),
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QS),
+                    SharedArray::as_raw_mut_ptr(&raw mut KS),
+                    SharedArray::as_raw_mut_ptr(&raw mut WS),
+                ),
+            );
         }
     }
 
@@ -1375,6 +1741,62 @@ pub struct PoolArgs<'a> {
     pub pooled: &'a mut DeviceBuffer<u16>,
 }
 
+/// One sequence of the indexer launches over several sequences' rows
+/// ([`QsaKernels::enqueue_pool_seqs`], [`QsaKernels::enqueue_select_seqs`],
+/// [`QsaKernels::enqueue_key_append_seqs`]): its rows of the launch, its raw
+/// key ring (`[RING_ROWS][DIM]` f16), its pooled plane
+/// (`[pools_for(ctx)][DIM]` f16) and its rope table (`ctx` rows of [`ROT`]).
+pub(crate) struct QsaSeq<'a> {
+    pub(crate) rows: Range<usize>,
+    pub(crate) ring: &'a mut DeviceBuffer<u16>,
+    pub(crate) pooled: &'a mut DeviceBuffer<u16>,
+    pub(crate) rope: &'a DeviceBuffer<f32>,
+}
+
+/// The table of `seqs` for a launch of `what` over a `ctx`-row cache, each
+/// sequence's words its ring, its pooled plane and its rope table; one
+/// shorter than [`QsaSeq`] names, or rows that do not tile the launch, are
+/// refused by name.
+pub(crate) fn qsa_seqs(
+    what: &'static str,
+    seqs: &[QsaSeq<'_>],
+    ctx: usize,
+) -> Result<SeqRows, GpuError> {
+    let pooled = pools_for(ctx) * DIM;
+    let mut words = Vec::with_capacity(seqs.len());
+    for (s, q) in seqs.iter().enumerate() {
+        let lens = [
+            ("ring", q.ring.len(), RING_ROWS * DIM),
+            ("pooled", q.pooled.len(), pooled),
+            ("rope", q.rope.len(), ctx * ROT),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("sequence {s}'s {name}.len() {got} < {need}"),
+            ));
+        }
+        let mut word = [0; SEQ_WORDS];
+        word[0] = q.ring.cu_deviceptr();
+        word[1] = q.pooled.cu_deviceptr();
+        word[2] = q.rope.cu_deviceptr();
+        words.push((q.rows.clone(), word));
+    }
+    SeqRows::new(what, &words)
+}
+
+/// [`QsaKernels::enqueue_key_append`]'s arguments: the projection's `[m][DIM]`
+/// raw keys and the `m` rows' positions, the cache's `ctx` rows, and the
+/// layer's raw key ring (`[RING_ROWS][DIM]` f16).
+pub struct KeyAppendArgs<'a> {
+    pub kr: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub m: usize,
+    pub ctx: usize,
+    pub fault: FaultSink,
+    pub ring: &'a mut DeviceBuffer<u16>,
+}
+
 /// [`QsaKernels::enqueue_select`]'s arguments: the rows' indexer query
 /// projections (`[m][HEADS][DIM]` f32, raw), the query norm's gain, the rope
 /// table, the live counts, the pooled plane [`QsaKernels::enqueue_pool`]
@@ -1394,6 +1816,32 @@ pub struct SelectArgs<'a> {
     pub scratch: &'a mut QsaScratch,
 }
 
+/// [`QsaKernels::enqueue_pool_seqs`]'s arguments: [`PoolArgs`] over every
+/// sequence's rows, each sequence's ring, pooled plane and rope table its
+/// [`QsaSeq`]'s.
+pub(crate) struct PoolSeqsArgs<'a> {
+    pub(crate) kr: &'a DeviceBuffer<f32>,
+    pub(crate) gain: &'a DeviceBuffer<f32>,
+    pub(crate) n_keys: &'a DeviceBuffer<u32>,
+    pub(crate) eps: f32,
+    pub(crate) ctx: usize,
+    pub(crate) fault: FaultSink,
+}
+
+/// [`QsaKernels::enqueue_select_seqs`]'s arguments: [`SelectArgs`] over
+/// every sequence's rows, each sequence's pooled plane and rope table its
+/// [`QsaSeq`]'s.
+pub(crate) struct SelectSeqsArgs<'a> {
+    pub(crate) q: &'a DeviceBuffer<f32>,
+    pub(crate) gain: &'a DeviceBuffer<f32>,
+    pub(crate) n_keys: &'a DeviceBuffer<u32>,
+    pub(crate) eps: f32,
+    pub(crate) ctx: usize,
+    pub(crate) kept: usize,
+    pub(crate) fault: FaultSink,
+    pub(crate) scratch: &'a mut QsaScratch,
+}
+
 /// [`QsaKernels::enqueue_topk_high`]'s arguments: the `m` rows' live counts,
 /// their scores (`[m][pools_for(ctx)]`, a scored row's first `count / 4`
 /// written by its score pass), the cache height, the pools kept, and where
@@ -1408,6 +1856,31 @@ pub struct TopkHighArgs<'a> {
     pub fault: FaultSink,
     pub list: &'a mut DeviceBuffer<u32>,
     pub vis: &'a mut DeviceBuffer<u32>,
+}
+
+/// The refusals the key appends share over `m` rows: no row, no cache, and
+/// keys or positions shorter than the rows.
+fn check_key_append(
+    what: &'static str,
+    (kr, pos): (&DeviceBuffer<f32>, &DeviceBuffer<u32>),
+    m: usize,
+    ctx: usize,
+) -> Result<(), GpuError> {
+    if m == 0 || ctx == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!("need m and ctx >= 1, got m={m} ctx={ctx}"),
+        ));
+    }
+    let lens = [("kr", kr.len(), DIM * m), ("pos", pos.len(), m)];
+    crate::short(what, &lens)
+}
+
+/// A key append's launch over `m` rows: one thread a value, in blocks of
+/// [`APPEND_THREADS`].
+fn append_grid(what: &'static str, m: usize) -> Result<LaunchConfig1D, GpuError> {
+    let blocks = launch_u32(what, "grid", (DIM * m).div_ceil(APPEND_THREADS as usize))?;
+    Ok(LaunchConfig1D::new(blocks, APPEND_THREADS, 0))
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -1471,6 +1944,142 @@ impl QsaKernels {
             a.fault,
             a.pooled,
         )?;
+        Ok(())
+    }
+
+    /// Enqueue [`QsaKernels::enqueue_pool`]'s pass over every sequence of
+    /// `seqs` in one launch (`crate::seq_rows`): `a`'s rows of every
+    /// sequence, each over its own ring, pooled plane and rope table, bit
+    /// for bit the
+    /// launch of its rows alone.
+    /// Refused by name: what that launch refuses over the rows, and the
+    /// sequences [`qsa_seqs`] refuses. One launch of `⌈rows/4⌉` blocks,
+    /// before the rows' key append. Asynchronous and capturable; builds its
+    /// sequence table on the host.
+    pub(crate) fn enqueue_pool_seqs(
+        &self,
+        stream: &CudaStream,
+        a: PoolSeqsArgs<'_>,
+        seqs: &[QsaSeq<'_>],
+    ) -> Result<(), GpuError> {
+        let what = "qsa::enqueue_pool_seqs";
+        let table = qsa_seqs(what, seqs, a.ctx)?;
+        let m = table.rows();
+        if a.ctx == 0 {
+            return Err(GpuError::shape(what, "need ctx >= 1, got ctx=0"));
+        }
+        let lens = [
+            ("kr", a.kr.len(), m * DIM),
+            ("gain", a.gain.len(), DIM),
+            ("n_keys", a.n_keys.len(), m),
+        ];
+        crate::short(what, &lens)?;
+        let grid = launch_u32(what, "grid", m.div_ceil(WARPS))?;
+        let prep = self
+            .module
+            .prepare_qsa_pool_seqs(LaunchConfig1D::new(grid, THREADS, 0))?;
+        // SAFETY: each sequence's words are its own ring, pooled plane and
+        // rope table of the lengths `qsa_seqs` checked, borrowed by `seqs`
+        // while this
+        // enqueue runs; a graph that captures the launch replays it over the
+        // same buffers, which the caller keeps alive and in place while the
+        // graph lives, as for any buffer it captured.
+        unsafe {
+            self.module.qsa_pool_seqs(
+                stream,
+                &prep,
+                a.kr,
+                a.gain,
+                a.n_keys,
+                a.eps,
+                launch_u32(what, "ctx", a.ctx)?,
+                launch_u32(what, "rows", m)?,
+                a.fault,
+                table,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue the raw key append of `m` rows ([`KeyAppendArgs`], module
+    /// doc): `kr` the projection's `[m][DIM]` output, `pos` the rows'
+    /// positions (consecutive, `pos[0] + c`; any other row raises
+    /// `PoolSelect` on the device and writes nothing), `ring` the layer's
+    /// `[RING_ROWS][DIM]` f16 ring. One launch, after the call's pool pass,
+    /// which reads the ring's slots of the positions before the call.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_key_append(
+        &self,
+        stream: &CudaStream,
+        a: KeyAppendArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let KeyAppendArgs {
+            kr,
+            pos,
+            m,
+            ctx,
+            fault,
+            ring,
+        } = a;
+        let what = "qsa::enqueue_key_append";
+        check_key_append(what, (kr, pos), m, ctx)?;
+        if ring.len() < DIM * RING_ROWS {
+            return Err(GpuError::shape(
+                what,
+                format!("ring.len() {} < {}", ring.len(), DIM * RING_ROWS),
+            ));
+        }
+        let prep = self.module.prepare_qsa_key_append(append_grid(what, m)?)?;
+        self.module.qsa_key_append(
+            stream,
+            &prep,
+            kr,
+            pos,
+            launch_u32(what, "m", m)?,
+            launch_u32(what, "ctx", ctx)?,
+            fault,
+            ring,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`QsaKernels::enqueue_key_append`] over every sequence of
+    /// `seqs` in one launch (`crate::seq_rows`): `kr`'s and `pos`' rows of
+    /// every sequence, each into its own ring, bit for bit the launch of its
+    /// rows alone. Refused by name: what that launch refuses over the rows,
+    /// and the sequences [`qsa_seqs`] refuses. One launch, after the rows'
+    /// pool pass. Asynchronous and capturable; builds its sequence table on the host.
+    pub(crate) fn enqueue_key_append_seqs(
+        &self,
+        stream: &CudaStream,
+        (kr, pos): (&DeviceBuffer<f32>, &DeviceBuffer<u32>),
+        (ctx, fault): (usize, FaultSink),
+        seqs: &[QsaSeq<'_>],
+    ) -> Result<(), GpuError> {
+        let what = "qsa::enqueue_key_append_seqs";
+        let table = qsa_seqs(what, seqs, ctx)?;
+        let m = table.rows();
+        check_key_append(what, (kr, pos), m, ctx)?;
+        let prep = self
+            .module
+            .prepare_qsa_key_append_seqs(append_grid(what, m)?)?;
+        // SAFETY: each sequence's word 0 is its own ring of the length
+        // `qsa_seqs` checked, borrowed by `seqs` while this enqueue runs; a
+        // graph that captures the launch replays it over the same rings,
+        // which the caller keeps alive and in place while the graph lives,
+        // as for any buffer it captured.
+        unsafe {
+            self.module.qsa_key_append_seqs(
+                stream,
+                &prep,
+                kr,
+                pos,
+                launch_u32(what, "rows", m)?,
+                launch_u32(what, "ctx", ctx)?,
+                fault,
+                table,
+            )?;
+        }
         Ok(())
     }
 
@@ -1563,6 +2172,94 @@ impl QsaKernels {
             kept,
             width,
             m,
+            &mut s.list,
+            &mut s.n_sel,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`QsaKernels::enqueue_select`]'s selection of every sequence
+    /// of `seqs`: the score pass of each sequence's rows over its own pooled
+    /// plane in one launch (`crate::seq_rows`), then the top-k pass over every
+    /// row, each row's list and length left in its row of `a.scratch`, bit
+    /// for bit the launches of its sequence alone. Refused by name: what
+    /// `enqueue_select` refuses over the sequences' rows, and the sequences
+    /// [`qsa_seqs`] refuses. Two launches. Asynchronous and capturable;
+    /// builds its sequence table on the host.
+    pub(crate) fn enqueue_select_seqs(
+        &self,
+        stream: &CudaStream,
+        a: SelectSeqsArgs<'_>,
+        seqs: &[QsaSeq<'_>],
+    ) -> Result<(), GpuError> {
+        let what = "qsa::enqueue_select_seqs";
+        let table = qsa_seqs(what, seqs, a.ctx)?;
+        let (s, m) = (a.scratch, table.rows());
+        let pools = pools_for(a.ctx);
+        if m > s.rows || a.kept == 0 || s.pools != pools || s.width != list_width(a.kept) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need 1..={} rows and the scratch's {} pools of lists {} wide; got m={m} \
+                     kept={} pools={pools}",
+                    s.rows, s.pools, s.width, a.kept
+                ),
+            ));
+        }
+        let lens = [
+            ("q", a.q.len(), m * HEADS * DIM),
+            ("gain", a.gain.len(), DIM),
+            ("n_keys", a.n_keys.len(), m),
+        ];
+        crate::short(what, &lens)?;
+        let ctx = launch_u32(what, "ctx", a.ctx)?;
+        let pools_u = launch_u32(what, "pools", pools)?;
+        let kept = launch_u32(what, "kept", a.kept)?;
+        let rows = launch_u32(what, "rows", m)?;
+        let groups = table.most().div_ceil(MAX_ROWS);
+        let grid = groups * pools.div_ceil(POOL_TILE) * table.len();
+        let prep = self.module.prepare_qsa_score_seqs(LaunchConfig1D::new(
+            launch_u32(what, "score grid", grid)?,
+            THREADS,
+            0,
+        ))?;
+        // SAFETY: each sequence's words 1 and 2 are its own pooled plane and
+        // rope table of the lengths `qsa_seqs` checked, borrowed by `seqs`
+        // while this enqueue runs; a graph that captures the launch replays it over the same
+        // planes, which the caller keeps alive and in place while the graph
+        // lives, as for any buffer it captured.
+        unsafe {
+            self.module.qsa_score_seqs(
+                stream,
+                &prep,
+                a.q,
+                a.gain,
+                a.n_keys,
+                a.eps,
+                ctx,
+                pools_u,
+                kept,
+                rows,
+                launch_u32(what, "groups", groups)?,
+                a.fault,
+                &mut s.q_out,
+                &mut s.scores,
+                table,
+            )?;
+        }
+        let prep = self
+            .module
+            .prepare_qsa_topk(LaunchConfig1D::new(rows, TOPK_THREADS, 0))?;
+        self.module.qsa_topk(
+            stream,
+            &prep,
+            a.n_keys,
+            &s.scores,
+            ctx,
+            pools_u,
+            kept,
+            launch_u32(what, "width", s.width)?,
+            rows,
             &mut s.list,
             &mut s.n_sel,
         )?;

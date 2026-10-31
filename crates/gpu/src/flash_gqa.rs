@@ -143,6 +143,9 @@
 //! `t` reads the planes of row `t` of a per-row table ([`RowPlanes`], the
 //! launch's grid-constant parameter) and is otherwise `seg_mma`'s row over
 //! them; the merge is [`flash_gqa_kernels::gqa_flash_merge`].
+//! [`FlashGqaKernels::enqueue_pass_256_p12_sel_seqs`] is the listed head-256
+//! pass's f16 segment pass over several sequences' caches, its table per
+//! sequence (`crate::seq_rows`), its merge the listed pass's.
 //!
 //! The `_k192` entries ([`FlashGqaKernels::enqueue_pass_k192`]) serve MiMo-V2's
 //! heads: scores over [`HEAD_K192`] key values, values of [`HEAD`], `packs`
@@ -202,6 +205,7 @@ use crate::flash::{
 use crate::flash_gqa_prefill::{OutGate, SigmoidGate, Ungated};
 use crate::launch_u32;
 use crate::rope_neox::q8_plane_lens;
+use crate::seq_rows::{SEQ_WORDS, SeqRows};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{
@@ -5085,6 +5089,96 @@ mod flash_gqa_kernels {
         };
     }
 
+    /// [`gqa_flash_seg_mma_256_p12_sel`] over several sequences' f16 caches
+    /// (`crate::seq_rows`): the blocks of row `t` read the planes of its
+    /// sequence (words 0 and 1, each `n_kv · ctx` rows of 256), every other
+    /// input that entry's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(384)]
+    #[launch_contract(
+        domain = 1,
+        block = (384, 1, 1),
+        requires = (
+            n_sel.len() >= m,
+            list.len() >= m * width,
+            segs >= 1,
+            q.len() >= m * n_kv * 12 * 256,
+            part_v.len() >= m * n_kv * 12 * segs * 256,
+            part_ms.len() >= m * n_kv * 12 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_mma_256_p12_sel_seqs(
+        q: &[f32],
+        list: &[u32],
+        n_sel: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        width: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        fault: FaultSink,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_12 * KEY_TILE }> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let rows = m as usize;
+        if b >= rows * n_kv as usize * segs as usize {
+            return; // block-uniform
+        }
+        let walk = Listed {
+            list,
+            width: width as usize,
+            fault,
+        };
+        // The block's row is b % m (`seg_block`).
+        let s = seqs.seq_of(b % rows);
+        let plane = n_kv as usize * ctx as usize * HEAD_256;
+        // SAFETY: s < the table's sequences (seq_of), and the launcher put
+        // the sequence's f16 planes of n_kv·ctx·HEAD_256 values, which this
+        // launch only reads, at words 0 and 1. Each `static mut` above is
+        // this block's own shared allocation, sized for HEAD_256 and PACK_12;
+        // the raw form reaches it without a reference. The launch contract is
+        // `seg_mma_ps`'s at HEAD_256 and one pack of PACK_12 heads per key
+        // head over the row's planes, with the list's.
+        unsafe {
+            let src = F16Kv {
+                k: std::slice::from_raw_parts(seqs.word(s, 0) as usize as *const u16, plane),
+                v: std::slice::from_raw_parts(seqs.word(s, 1) as usize as *const u16, plane),
+            };
+            seg_mma_ps::<_, _, HEAD_256, QW_256, PACK_12, PAD_12>(
+                walk,
+                q,
+                src,
+                n_sel,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                1,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QT),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
     /// [`gqa_flash_seg_mma_256_p12_sel`] over the Q8_0 cache (`seg_mma_ps`
     /// over [`Q8Kv`]): the listed keys' tiles hold the dequantized f16, as
     /// [`gqa_flash_seg_mma_256_q8`]'s do; the list, the counts, the faults and
@@ -6238,6 +6332,100 @@ pub struct GqaSelArgs<'a> {
     pub gate: Option<&'a DeviceBuffer<f32>>,
 }
 
+/// [`FlashGqaKernels::enqueue_pass_256_p12_sel_seqs`]' arguments: those of
+/// [`GqaSelArgs`] over every sequence's rows without the cache planes, which
+/// each sequence's [`KvSeq`] gives its rows.
+pub(crate) struct GqaSelSeqsArgs<'a> {
+    pub(crate) q: &'a DeviceBuffer<f32>,
+    pub(crate) list: &'a DeviceBuffer<u32>,
+    pub(crate) n_sel: &'a DeviceBuffer<u32>,
+    pub(crate) width: usize,
+    pub(crate) scale: f32,
+    pub(crate) n_kv: usize,
+    pub(crate) ctx: usize,
+    pub(crate) fault: FaultSink,
+    pub(crate) y: &'a mut DeviceBuffer<f32>,
+    pub(crate) part_v: &'a mut DeviceBuffer<f32>,
+    pub(crate) part_ms: &'a mut DeviceBuffer<f32>,
+    pub(crate) gate: Option<&'a DeviceBuffer<f32>>,
+}
+
+/// One sequence of a launch over several sequences' f16 caches
+/// (`crate::seq_rows`): its rows of the launch, its K and V planes
+/// (`[n_kv][ctx][head]` f16 each) and its rope table, the one its rows'
+/// append turns by.
+pub(crate) struct KvSeq<'a> {
+    pub(crate) rows: Range<usize>,
+    pub(crate) k: &'a mut DeviceBuffer<u16>,
+    pub(crate) v: &'a mut DeviceBuffer<u16>,
+    pub(crate) rope: &'a DeviceBuffer<f32>,
+}
+
+/// The table of `seqs` for a launch of `what`, each sequence's words its K
+/// plane, its V plane and its rope table; a plane shorter than `plane` f16, a
+/// rope table shorter than `rope` f32, or rows that do not tile the launch
+/// are refused by name.
+pub(crate) fn kv_seqs(
+    what: &'static str,
+    seqs: &[KvSeq<'_>],
+    plane: usize,
+    rope: usize,
+) -> Result<SeqRows, GpuError> {
+    let mut words = Vec::with_capacity(seqs.len());
+    for (s, q) in seqs.iter().enumerate() {
+        let lens = [
+            ("k", q.k.len(), plane),
+            ("v", q.v.len(), plane),
+            ("rope", q.rope.len(), rope),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("sequence {s}'s {name}.len() {got} < {need}"),
+            ));
+        }
+        let mut word = [0; SEQ_WORDS];
+        word[0] = q.k.cu_deviceptr();
+        word[1] = q.v.cu_deviceptr();
+        word[2] = q.rope.cu_deviceptr();
+        words.push((q.rows.clone(), word));
+    }
+    SeqRows::new(what, &words)
+}
+
+/// The listed pass's partials and gate against `m` rows of `n_head` heads
+/// over lists `width` wide: [`listed_partials_v_len_256`],
+/// [`listed_partials_ms_len`] and, under a gate, `m · n_head · 2 · 256`; a
+/// shorter buffer is refused by name.
+fn check_sel_partials(
+    what: &'static str,
+    (part_v, part_ms, gate): (
+        &DeviceBuffer<f32>,
+        &DeviceBuffer<f32>,
+        Option<&DeviceBuffer<f32>>,
+    ),
+    (m, n_head, width): (usize, usize, usize),
+) -> Result<(), GpuError> {
+    let lens = [
+        (
+            "part_v",
+            part_v.len(),
+            listed_partials_v_len_256(m, n_head, width),
+        ),
+        (
+            "part_ms",
+            part_ms.len(),
+            listed_partials_ms_len(m, n_head, width),
+        ),
+        (
+            "gate",
+            gate.map_or(usize::MAX, DeviceBuffer::len),
+            m * n_head * 2 * HEAD_256,
+        ),
+    ];
+    crate::short(what, &lens)
+}
+
 /// A layer's cache as a launch reads it: the f16 planes, or the q8_0
 /// cache's four ([`q8_plane_lens`]: per side the codes and the scales).
 #[derive(Clone, Copy)]
@@ -6484,7 +6672,30 @@ pub(crate) fn check_listed_256(
     a: &GqaListArgs<'_>,
     n_head: usize,
 ) -> Result<usize, GpuError> {
-    let (n_kv, ctx, m, width) = (a.n_kv, a.ctx, a.m, a.width);
+    let segs = check_listed_rows_256(
+        what,
+        (a.q, a.list, a.n_sel, a.y),
+        (a.n_kv, a.ctx, a.m, a.width),
+        n_head,
+    )?;
+    a.kv.check_lens(what, HEAD_256, a.n_kv, a.ctx)?;
+    Ok(segs)
+}
+
+/// [`check_listed_256`]'s checks but the cache planes', over the queries,
+/// lists, counts and output `(q, list, n_sel, y)` of `m` rows: the checks a
+/// launch over a per-row table ([`RowTable`]) shares.
+fn check_listed_rows_256(
+    what: &'static str,
+    (q, list, n_sel, y): (
+        &DeviceBuffer<f32>,
+        &DeviceBuffer<u32>,
+        &DeviceBuffer<u32>,
+        &DeviceBuffer<f32>,
+    ),
+    (n_kv, ctx, m, width): (usize, usize, usize, usize),
+    n_head: usize,
+) -> Result<usize, GpuError> {
     if n_kv == 0 || ctx == 0 || m == 0 || width == 0 {
         return Err(GpuError::shape(
             what,
@@ -6503,14 +6714,13 @@ pub(crate) fn check_listed_256(
             ),
         ));
     }
-    crate::short(what, &[("q", a.q.len(), m * n_head * HEAD_256)])?;
-    a.kv.check_lens(what, HEAD_256, n_kv, ctx)?;
     crate::short(
         what,
         &[
-            ("list", a.list.len(), m * width),
-            ("n_sel", a.n_sel.len(), m),
-            ("y", a.y.len(), m * n_head * HEAD_256),
+            ("q", q.len(), m * n_head * HEAD_256),
+            ("list", list.len(), m * width),
+            ("n_sel", n_sel.len(), m),
+            ("y", y.len(), m * n_head * HEAD_256),
         ],
     )?;
     Ok(listed_segments(width))
@@ -7182,32 +7392,8 @@ impl FlashGqaKernels {
             fault,
             y,
         } = attn;
-        let lens = [
-            (
-                "part_v",
-                part_v.len(),
-                listed_partials_v_len_256(m, n_head, width),
-            ),
-            (
-                "part_ms",
-                part_ms.len(),
-                listed_partials_ms_len(m, n_head, width),
-            ),
-            (
-                "gate",
-                gate.map_or(usize::MAX, DeviceBuffer::len),
-                m * n_head * 2 * HEAD_256,
-            ),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
+        check_sel_partials(what, (&*part_v, &*part_ms, gate), (m, n_head, width))?;
         let grid = launch_u32(what, "grid", m * n_kv * segs)?;
-        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
-        let heads = launch_u32(what, "n_head", n_head)?;
         let n_kv = launch_u32(what, "n_kv", n_kv)?;
         let ctx = launch_u32(what, "ctx", ctx)?;
         let width = launch_u32(what, "width", width)?;
@@ -7231,8 +7417,123 @@ impl FlashGqaKernels {
                 )?;
             }
         }
-        // The merge reads a row's count through the same rule at the list's
-        // width: its `ctx` argument is the width.
+        self.merge_256_sel(
+            stream,
+            what,
+            (part_v, part_ms, n_sel, gate),
+            (n_head, width, segs, m),
+            fault,
+            y,
+        )
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass_256_p12_sel`]'s f16 pass over several
+    /// sequences' caches (`crate::seq_rows`): each sequence's rows attend its
+    /// own planes ([`KvSeq`]; its rope table is not read), the rest of their
+    /// inputs `args`' rows as that launch's. The segment pass
+    /// `gqa_flash_seg_mma_256_p12_sel_seqs` and the merge over every row:
+    /// that launch's grid, partials and refusals, and the sequences
+    /// [`kv_seqs`] refuses. Each row's segments and its merge are cut from
+    /// its own list, so its bits are a launch of its sequence's over its own
+    /// planes. Two launches. Asynchronous and capturable; builds its
+    /// sequence table on the host.
+    pub(crate) fn enqueue_pass_256_p12_sel_seqs(
+        &self,
+        stream: &CudaStream,
+        seqs: &[KvSeq<'_>],
+        args: GqaSelSeqsArgs<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_256_p12_sel_seqs";
+        let GqaSelSeqsArgs {
+            q,
+            list,
+            n_sel,
+            width,
+            scale,
+            n_kv,
+            ctx,
+            fault,
+            y,
+            part_v,
+            part_ms,
+            gate,
+        } = args;
+        let table = kv_seqs(what, seqs, n_kv * ctx * HEAD_256, 0)?;
+        let m = table.rows();
+        let segs =
+            check_listed_rows_256(what, (q, list, n_sel, &*y), (n_kv, ctx, m, width), n_head)?;
+        check_sel_partials(what, (&*part_v, &*part_ms, gate), (m, n_head, width))?;
+        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
+        let (width, segs, m) = (
+            launch_u32(what, "width", width)?,
+            launch_u32(what, "segs", segs)?,
+            launch_u32(what, "m", m)?,
+        );
+        let cfg = LaunchConfig1D::new(grid, THREADS_P12_U32, 0);
+        let prep = self
+            .module
+            .prepare_gqa_flash_seg_mma_256_p12_sel_seqs(cfg)?;
+        // SAFETY: each sequence's words 0 and 1 are its own f16 planes of at
+        // least n_kv·ctx·HEAD_256 values (`kv_seqs` checked them), borrowed
+        // by `seqs` while this enqueue runs; a graph that captures the launch
+        // replays it over the same planes, which the caller keeps alive and
+        // in place while the graph lives, as for any buffer it captured.
+        unsafe {
+            self.module.gqa_flash_seg_mma_256_p12_sel_seqs(
+                stream,
+                &prep,
+                q,
+                list,
+                n_sel,
+                scale,
+                launch_u32(what, "n_kv", n_kv)?,
+                launch_u32(what, "ctx", ctx)?,
+                width,
+                segs,
+                launch_u32(what, "seg_keys", SEG_KEYS)?,
+                m,
+                fault,
+                &mut *part_v,
+                &mut *part_ms,
+                table,
+            )?;
+        }
+        self.merge_256_sel(
+            stream,
+            what,
+            (part_v, part_ms, n_sel, gate),
+            (n_head, width, segs, m),
+            fault,
+            y,
+        )
+    }
+
+    /// The listed pass's merge of `m` rows at the list's `width`
+    /// (`gqa_flash_merge_256`, or `gqa_flash_merge_256_gated` under `gate`):
+    /// the merge reads a row's count through the segment pass's rule at the
+    /// width, so its `ctx` argument is the width. One launch.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the merge's inputs, named where they are read"
+    )]
+    fn merge_256_sel(
+        &self,
+        stream: &CudaStream,
+        what: &'static str,
+        (part_v, part_ms, n_sel, gate): (
+            &DeviceBuffer<f32>,
+            &DeviceBuffer<f32>,
+            &DeviceBuffer<u32>,
+            Option<&DeviceBuffer<f32>>,
+        ),
+        (n_head, width, segs, m): (usize, u32, u32, u32),
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let merge_grid = launch_u32(what, "merge grid", m as usize * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
         let cfg = LaunchConfig1D::new(merge_grid, MERGE_THREADS_256, 0);
         match gate {
             None => {

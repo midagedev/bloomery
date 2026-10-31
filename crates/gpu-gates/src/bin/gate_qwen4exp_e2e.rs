@@ -494,15 +494,16 @@ mod gate {
     /// row count, so a delta layer adds none: 1139 + 2.
     const REAL_NODES_VERIFY: usize = 1141;
 
-    /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
-    /// of several slots' rows, derived before the pass was built: the
-    /// launches bound to one sequence — the embedding row, the PLE site's
-    /// conv on layer 1, each delta layer's conv and delta step, each
-    /// selecting layer's 8 (the indexer key's projection, its append and the
-    /// pool, the selection's two, the q/k norm, turn and append, the
-    /// selected flash's two) — and the copy of a parked slot's rows into its
-    /// own: 1 + 1 + 36·2 + 12·8 + 1.
-    const REAL_NODES_SLOT: usize = 171;
+    /// PIN(2026-11-01): the nodes one more busy slot adds to a captured pass
+    /// of several slots' rows: the launches bound to one sequence that run
+    /// once a sequence — the embedding row and the PLE site's conv on layer
+    /// 1 — and the copy of a parked slot's rows into its own: 1 + 1 + 1.
+    /// Each delta layer's conv and delta step and each selecting layer's 8
+    /// (the indexer key's projection, its append and the pool, the
+    /// selection's two, the q/k norm, turn and append, the selected flash's
+    /// two) run once over every slot's rows (171 before, 1 + 1 + 36·2 + 12·8
+    /// + 1).
+    const REAL_NODES_SLOT: usize = 3;
 
     /// PIN(2026-09-29): the layers the gate card's card plan puts routed
     /// experts on, derived before the leg was built: the 48 less the five
@@ -4780,13 +4781,9 @@ mod gate {
     impl PassAdapter for Slots38 {
         /// The header's slot nodes ([`Shape::nodes_slot`]).
         fn added_slot_launches(&self, _m: &Qwen38Model) -> Result<Launches, GateError> {
-            let (gdn, qsa) = (n_gdn(), n_qsa());
             Ok(Launches {
                 n: shape().nodes_slot(),
-                terms: format!(
-                    "the embedding 1 + the PLE conv 1 + {gdn} delta layers' 2 + {qsa} \
-                     selecting layers' 8 + the parked rows' copy 1"
-                ),
+                terms: "the embedding 1 + the PLE conv 1 + the parked rows' copy 1".to_owned(),
             })
         }
 

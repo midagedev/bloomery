@@ -584,12 +584,14 @@ mod gate {
     /// of the row's residual and three launches.
     const REAL_NODES_PASS: usize = 537;
 
-    /// PIN(2026-10-05): the launches one more busy slot adds to a captured
-    /// pass of several slots (`step_slots`), derived from the launches that
-    /// bind one sequence's stores or record: its embedding, each delta
-    /// layer's conv and delta step, each attention layer's rope with the
-    /// cache append and the flash's segment pass and merge: 1 + 30·2 + 10·3.
-    const REAL_NODES_SLOT: usize = 91;
+    /// PIN(2026-11-01): the launches one more busy slot adds to a captured
+    /// pass of several slots (`step_slots`) over f16 planes, derived from the
+    /// launches that bind one sequence's stores or record and run once a
+    /// sequence: its embedding and each attention layer's flash segment pass
+    /// and merge: 1 + 10·2. The delta layers' conv and delta step and the
+    /// attention layers' rope with the cache append run once over every
+    /// slot's rows (91 before, 1 + 30·2 + 10·3).
+    const REAL_NODES_SLOT: usize = 21;
 
     /// The train-gate file of the unjoined shared expert: unsloth's
     /// `UD-Q4_K_M`, every layer's shared expert q8_0 beside q4_K gate and up

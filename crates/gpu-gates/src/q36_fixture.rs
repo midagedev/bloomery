@@ -51,11 +51,10 @@ const UNJOINED_MIXER_LAUNCHES: usize = 10;
 /// routed down `_sel`, the shared gate and up, the SwiGLU, the shared down and the host-sum
 /// combine.
 const APART_FFN_LAUNCHES: usize = 11;
-/// Launches one busy slot adds to a captured pass of several slots on a delta layer (its conv and
-/// delta step) and on an attention layer (its rope with the cache append and the flash segment
-/// pass and merge).
-const SLOT_DELTA_LAUNCHES: usize = 2;
-const SLOT_ATTN_LAUNCHES: usize = 3;
+/// Launches one busy slot adds to a captured pass of several slots on an attention layer over f16
+/// planes (the flash segment pass and merge); its rope with the cache append, and a delta layer's
+/// conv and delta step, run once over every slot's rows and add none.
+const SLOT_ATTN_LAUNCHES: usize = 2;
 
 use model::arch::qwen35moe::hparams::Kind;
 
@@ -357,8 +356,9 @@ impl Shape {
         EMBED_LAUNCHES + layers
     }
 
-    /// The nodes one more busy slot adds to a captured pass of several slots' rows: the embedding
-    /// row and each layer's sequence-bound launches. Defined for joined layers only.
+    /// The nodes one more busy slot adds to a captured pass of several slots' rows over f16
+    /// planes: the embedding row and each attention layer's sequence-bound launches. Defined for
+    /// joined layers only.
     ///
     /// # Errors
     /// A layer that keeps its shared expert apart (the first one named): no slot count is pinned
@@ -375,9 +375,7 @@ impl Shape {
             )
             .into());
         }
-        Ok(EMBED_LAUNCHES
-            + self.n_delta() * SLOT_DELTA_LAUNCHES
-            + self.n_attn() * SLOT_ATTN_LAUNCHES)
+        Ok(EMBED_LAUNCHES + self.n_attn() * SLOT_ATTN_LAUNCHES)
     }
 }
 
@@ -493,8 +491,8 @@ mod tests {
         assert_eq!(real.nodes_decode(), 520);
         assert_eq!(real.nodes_pass(), 1 + 30 * 13 + 14 + 10 * 12 + 2 * 6);
         assert_eq!(real.nodes_pass(), 537);
-        assert_eq!(real.nodes_slot().expect("joined"), 1 + 30 * 2 + 10 * 3);
-        assert_eq!(real.nodes_slot().expect("joined"), 91);
+        assert_eq!(real.nodes_slot().expect("joined"), 1 + 10 * 2);
+        assert_eq!(real.nodes_slot().expect("joined"), 21);
         assert_eq!(real.apart(), vec![false; 40]);
 
         let ud = Shape::from_layers(ud()).expect("ud");
@@ -513,8 +511,8 @@ mod tests {
         assert_eq!(fix.nodes_decode(), 55);
         assert_eq!(fix.nodes_pass(), 1 + (13 + 14) + (12 + 14));
         assert_eq!(fix.nodes_pass(), 54);
-        assert_eq!(fix.nodes_slot().expect("joined"), 1 + 2 * 2 + 2 * 3);
-        assert_eq!(fix.nodes_slot().expect("joined"), 11);
+        assert_eq!(fix.nodes_slot().expect("joined"), 1 + 2 * 2);
+        assert_eq!(fix.nodes_slot().expect("joined"), 5);
 
         let var = Shape::from_layers(variant()).expect("variant");
         assert_eq!(var.nodes_decode(), 1 + 4 * 21 + 3);

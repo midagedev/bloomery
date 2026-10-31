@@ -60,7 +60,7 @@
 //! ([`HeadLaunches`]). A layer without a host leg
 //! ([`Card38::hostless`]) has no go and no wait.
 
-use super::body::ATTN_SCALE_256;
+use super::body::{ATTN_SCALE_256, KvQ8};
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site};
 use super::router::gated;
@@ -69,7 +69,7 @@ use super::scratch38::{Arena38, Store38, Taps38};
 use super::tier38::{STAGE_TIER, TierSide38};
 use crate::card_slots::CardSlotKernels;
 use crate::fault::{FaultSink, LAYER_HEAD};
-use crate::flash_gqa::{FlashGqaKernels, GqaListArgs, GqaSelArgs};
+use crate::flash_gqa::{FlashGqaKernels, GqaListArgs, GqaSelArgs, GqaSelSeqsArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::graph::{Forked, StagedRows};
@@ -83,13 +83,16 @@ use crate::host::{BatchLeg, StepLeg};
 use crate::linear::conv::{ConvArgs, ConvRows};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
+use crate::linear::seqs::{GdnSeq, GdnSeqsArgs};
 use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::MtpKernels;
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
-use crate::q38::{CardSharedAddArgs, EmbedIo, KeyAppendArgs, Q38Kernels, SharedAddArgs};
-use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
-use crate::rope_neox::RopeNeoxKernels;
+use crate::q38::{CardSharedAddArgs, EmbedIo, Q38Kernels, SharedAddArgs};
+use crate::qsa::{
+    KeyAppendArgs, PoolArgs, PoolSeqsArgs, QsaKernels, QsaSeq, SelectArgs, SelectSeqsArgs,
+};
+use crate::rope_neox::{PartialNeoxSeqsArgs, RopeNeoxKernels};
 use crate::site::{self, ByName, ByNameKernels, Out};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
@@ -407,8 +410,9 @@ pub(super) struct Parts38<'a> {
 /// The sequences a walk's unit binds: one over every row of the unit — the
 /// step's, a verify's, a pass's — its stores and input record handed to the
 /// launches whole; or several, each over its own rows of the unit (a pass of
-/// several slots), each sequence-bound launch run once a sequence over its
-/// rows' windows and its own stores.
+/// several slots), each sequence-bound launch run over each sequence's rows
+/// and its own stores: once over every sequence where a launch takes them
+/// all ([`seq_launches`] names the rest).
 pub(super) enum Seqs38<'a> {
     One {
         stores: &'a mut [Store38],
@@ -431,31 +435,30 @@ pub(super) struct SlotSeq38<'a> {
     pub(super) table: &'a DeviceBuffer<f32>,
 }
 
-/// The launches one more sequence's rows add to a pass: its embedding,
-/// the PLE site's conv, each delta layer's [`GDN_SEQ_LAUNCHES`] and each
-/// selecting layer's [`QSA_SEQ_LAUNCHES`] — every launch that binds a
-/// sequence's stores or its input record.
-pub(super) fn seq_launches(plans: &[Layer38]) -> usize {
+/// The launches one more sequence's rows add to a pass of several slots
+/// over a cache in the format `kv`: its embedding, the PLE site's conv, and
+/// on a q8_0 cache each selecting layer's [`QSA_Q8_SEQ_LAUNCHES`]. Every other
+/// launch that binds a sequence's stores runs once over every sequence's rows
+/// (`crate::seq_rows`): the delta layers' conv and step, the selecting
+/// layers' pool, key append and selection, and on an f16 cache their q/k
+/// norm, turn and append and the selected flash.
+pub(super) fn seq_launches(plans: &[Layer38], kv: KvQ8) -> usize {
     1 + plans
         .iter()
         .map(|p| {
-            let mixer = match p.mixer {
-                Mixer38::Gdn(_) => GDN_SEQ_LAUNCHES,
-                Mixer38::Qsa(_) => QSA_SEQ_LAUNCHES,
+            let per_seq = match (&p.mixer, kv) {
+                (Mixer38::Qsa(_), KvQ8::Q8) => QSA_Q8_SEQ_LAUNCHES,
+                _ => 0,
             };
-            mixer + usize::from(p.ple.is_some())
+            per_seq + usize::from(p.ple.is_some())
         })
         .sum::<usize>()
 }
 
-/// A delta layer's launches bound to a sequence: the conv over its ring and
-/// the delta step over its state, stamps and lane word.
-pub(super) const GDN_SEQ_LAUNCHES: usize = 2;
-/// A selecting layer's launches bound to a sequence: the indexer key's
-/// projection (its rows row-major, so a sequence's own), its append and the
-/// pool; the selection's two; the q/k norm, turn and append; the selected
-/// flash's two.
-pub(super) const QSA_SEQ_LAUNCHES: usize = 1 + 1 + 1 + 2 + 1 + 2;
+/// A selecting layer's launches bound to one sequence's q8_0 cache, which no
+/// launch over several sequences reads: the q/k norm, turn and append, and
+/// the selected flash's two.
+pub(super) const QSA_Q8_SEQ_LAUNCHES: usize = 1 + 2;
 
 /// Rows `r` of `parent`, `width` values a row, shared.
 fn rows_of<'b, T>(
@@ -1053,10 +1056,11 @@ struct GdnIo<'b> {
 
 /// A delta layer's mixer at `m` rows, layer `l` of each sequence of
 /// `seqs`, the attention site's mix in `s.mixed`, its output projection into
-/// `s.y`: the projections over every row, `z` on `branch` ([`gdn_in`]), each
-/// sequence's conv and delta step over its rows and its store, in row mode
-/// when `each` ([`gdn_seq`]), the join, then the gated norm and the output
-/// projection over every row ([`gdn_out`]).
+/// `s.y`: the projections over every row, `z` on `branch` ([`gdn_in`]), the
+/// conv and delta step over each sequence's rows and its store, in row mode
+/// when `each` ([`gdn_seq`]; several sequences' in one launch each,
+/// `linear::seqs`, a pass of several always in row mode), the join, then the
+/// gated norm and the output projection over every row ([`gdn_out`]).
 fn gdn(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
@@ -1067,7 +1071,6 @@ fn gdn(
     sink: FaultSink,
 ) -> Result<(), GpuError> {
     let fork = gdn_in(c, gp, branch, s, (m, sink))?;
-    let nv = GDN.n_v;
     {
         let Arena38 { gdn: g, pos, .. } = &mut *s;
         match seqs {
@@ -1091,27 +1094,46 @@ fn gdn(
                 )?;
             }
             Seqs38::Slots(seqs) => {
-                let ch = GDN.channels();
-                for q in seqs {
-                    let r = &q.rows;
-                    let lane = lane_of(&q.io)?;
-                    gdn_seq(
-                        c,
-                        gp,
-                        (rec_of(q.stores, l)?, lane),
-                        GdnIo {
-                            x: &*rows_of(&g.x, r, ch)?,
-                            ba: &*rows_of(&g.ba, r, BA_PITCH)?,
-                            pos: &*rows_of(pos, r, 1)?,
-                            conv: &mut *rows_mut(&mut g.conv, r, ch)?,
-                            beta: &mut *rows_mut(&mut g.beta, r, nv)?,
-                            decay: &mut *rows_mut(&mut g.decay, r, nv)?,
-                            o: &mut *rows_mut(&mut g.o, r, nv * linear::HEAD)?,
-                        },
-                        (r.len(), each),
-                        sink,
-                    )?;
+                if !each {
+                    return Err(GpuError::state(
+                        WHAT,
+                        "a pass of several sequences in row mode (each slot's rows a verify)",
+                    ));
                 }
+                let mut recs = Vec::with_capacity(seqs.len());
+                for q in seqs.iter_mut() {
+                    let (rec, stamp, record) = rec_of(q.stores, l)?;
+                    recs.push(GdnSeq {
+                        rows: q.rows.clone(),
+                        lane: lane_of(&q.io)?,
+                        rec,
+                        verify: Some((stamp, record)),
+                    });
+                }
+                let (b, a) = beta_alpha_rows(&g.ba, m)?;
+                let w = c.w;
+                linear::seqs::enqueue_gdn_seqs(
+                    &c.k.linear,
+                    c.gpu.stream(),
+                    GdnSeqsArgs {
+                        x: &g.x,
+                        b_raw: &b,
+                        a_raw: &a,
+                        ba_pitch: BA_PITCH,
+                        w: f32_gain(w, &gp.conv)?,
+                        dt_bias: f32_gain(w, &gp.dt_bias)?,
+                        ssm_a: f32_gain(w, &gp.ssm_a)?,
+                        pos,
+                        shape: GDN,
+                        eps: c.eps,
+                        fault: sink,
+                        conv: &mut g.conv,
+                        beta: &mut g.beta,
+                        decay: &mut g.decay,
+                        o: &mut g.o,
+                    },
+                    &mut recs,
+                )?;
             }
         }
     }
@@ -1293,30 +1315,33 @@ struct KeysIo<'b> {
     n_keys: &'b DeviceBuffer<u32>,
 }
 
-/// The rows a selecting layer's attention over one sequence reads and
-/// writes: the selection's queries, each row's live key count and
-/// position, the query projection's `[q | gate]` rows, the normed queries,
-/// the keys and values, and the flash's output under its gate.
+/// The rows a selecting layer's attention over its K/V planes reads and
+/// writes: the query projection's `[q | gate]` rows, the normed queries,
+/// the keys and values, each row's position, the selection's lists of
+/// `width` a row and lengths, and the flash's output under its gate.
 struct AttendIo<'b> {
-    qsel: &'b DeviceBuffer<f32>,
-    n_keys: &'b DeviceBuffer<u32>,
     qg: &'b DeviceBuffer<f32>,
     q: &'b mut DeviceBuffer<f32>,
     k: &'b mut DeviceBuffer<f32>,
     v: &'b DeviceBuffer<f32>,
     pos: &'b DeviceBuffer<u32>,
+    list: &'b DeviceBuffer<u32>,
+    width: usize,
+    n_sel: &'b DeviceBuffer<u32>,
     y: &'b mut DeviceBuffer<f32>,
 }
 
 /// A selecting attention layer's mixer at `m` rows, layer `l` of each
 /// sequence of `seqs`, the attention site's mix in `s.mixed`, its output
 /// projection into `s.y`: q, k and v over every row, q on `branch`
-/// ([`qsa_qkv`]); each sequence's indexer keys ([`qsa_keys`]) and attention
-/// ([`qsa_attend`]) over its rows and its store, the indexer queries over
-/// every row between ([`qsa_query`]: after one sequence's keys, before
-/// several sequences' keys) and the join before the first attention, each
-/// attention under its gate into `s.attn`; then the output projection over
-/// every row.
+/// ([`qsa_qkv`]); the indexer keys' projection over every row, the pools the
+/// rows complete and the keys' append to each sequence's ring ([`qsa_keys`]
+/// for one sequence, one launch each over several, `crate::seq_rows`); the
+/// indexer queries over every row ([`qsa_query`]) and the join; each row's
+/// selection over its sequence's pooled keys; then the q/k norm, turn and
+/// append and the selected flash over each sequence's K/V planes
+/// ([`kv_attend`]; over several f16 caches one launch each), under each
+/// head's gate into `s.attn`; then the output projection over every row.
 fn qsa(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
@@ -1356,70 +1381,193 @@ fn qsa(
                 attn,
                 ..
             } = &mut *s;
+            c.k.qsa.enqueue_select(
+                c.gpu.stream(),
+                SelectArgs {
+                    q: &qa.qi,
+                    gain: f32_gain(c.w, &qp.idx_q_norm)?,
+                    table: c.table,
+                    n_keys,
+                    pooled: &*pooled,
+                    eps: c.eps,
+                    ctx: c.ctx,
+                    kept: geo::KEPT,
+                    m,
+                    fault: sink,
+                    scratch: &mut qa.sel,
+                },
+            )?;
             let io = AttendIo {
-                qsel: &qa.qi,
-                n_keys,
                 qg: &qa.qg,
                 q: &mut qa.q,
                 k: &mut qa.k,
                 v: &qa.v,
                 pos,
+                list: &qa.sel.list,
+                width: qa.sel.width(),
+                n_sel: &qa.sel.n_sel,
                 y: attn,
             };
-            let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
             // SAFETY: the front embedding generates consecutive positions within this
             // sequence's window; this call selects only that sequence's cache planes.
-            unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink) }?;
+            unsafe { kv_attend(c, qp, kv, io, (&mut qa.part_v, &mut qa.part_ms), m, sink) }?;
         }
-        Seqs38::Slots(seqs) => {
-            qsa_query(c, qp, s, (m, sink))?;
-            fork.join()?;
-            let (h, d) = (geo::HIDDEN, geo::IDX_DIM);
-            let Arena38 {
-                mixed,
-                qsa: qa,
-                pos,
-                n_keys,
-                attn,
-                by,
-                ..
-            } = &mut *s;
-            for q in seqs {
-                let r = &q.rows;
-                // The slot's own rotation table: an image shifts one
-                // sequence's rows and no other's.
-                let c = &Ctx38 {
-                    table: q.table,
-                    ..*c
-                };
-                let (kv, ring, pooled) = qsa_of(q.stores, l)?;
-                let (pos, n_keys) = (rows_of(pos, r, 1)?, rows_of(n_keys, r, 1)?);
-                let keys = KeysIo {
-                    x: &*rows_of(mixed, r, h)?,
-                    kr: &mut *rows_mut(&mut qa.kr, r, d)?,
-                    pos: &pos,
-                    n_keys: &n_keys,
-                };
-                qsa_keys(c, qp, by, (ring, pooled), keys, (r.len(), sink))?;
-                let io = AttendIo {
-                    qsel: &*rows_of(&qa.qi, r, geo::IDX_HEADS * d)?,
-                    n_keys: &n_keys,
-                    qg: &*rows_of(&qa.qg, r, geo::Q_ROWS)?,
-                    q: &mut *rows_mut(&mut qa.q, r, geo::ATTN)?,
-                    k: &mut *rows_mut(&mut qa.k, r, geo::KV)?,
-                    v: &*rows_of(&qa.v, r, geo::KV)?,
-                    pos: &pos,
-                    y: &mut *rows_mut(attn, r, geo::ATTN)?,
-                };
-                let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
-                // SAFETY: the front embedding generates consecutive positions within this
-                // sequence's window; this call selects only that sequence's cache planes.
-                unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, r.len(), sink) }?;
-            }
-        }
+        Seqs38::Slots(seqs) => qsa_slots(c, qp, fork, seqs, s, (l, m), sink)?,
     }
     let Arena38 { attn, y, by, .. } = s;
     c.project(by, &qp.out, &*attn, m, sink, Out::whole(y))
+}
+
+/// [`qsa`]'s launches bound to the sequences of a pass of several, `fork`
+/// the branch [`qsa_qkv`] forked: the indexer keys' projection over every
+/// row, then over every sequence's rows in one launch each, each over its
+/// own store and rotation table (`crate::seq_rows`), the pools, the keys'
+/// append, the indexer queries' projection and the join, and the selection;
+/// then on f16 caches the q/k norm, turn and append and the selected flash in
+/// one launch each, on q8_0 caches [`kv_attend`] once a sequence over its
+/// rows' windows.
+fn qsa_slots(
+    c: &Ctx38<'_>,
+    qp: &QsaPlan,
+    fork: Forked<'_>,
+    seqs: &mut [SlotSeq38<'_>],
+    s: &mut Arena38,
+    (l, m): (usize, usize),
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    let (w, stream) = (c.w, c.gpu.stream());
+    let mut keys = Vec::with_capacity(seqs.len());
+    let mut planes = Vec::with_capacity(seqs.len());
+    for q in seqs.iter_mut() {
+        let (kv, ring, pooled) = qsa_of(q.stores, l)?;
+        keys.push(QsaSeq {
+            rows: q.rows.clone(),
+            ring,
+            pooled,
+            rope: q.table,
+        });
+        planes.push((q.rows.clone(), kv, q.table));
+    }
+    {
+        let Arena38 {
+            mixed,
+            qsa: qa,
+            pos,
+            n_keys,
+            by,
+            ..
+        } = &mut *s;
+        c.project(by, &qp.idx_k, mixed, m, sink, Out::whole(&mut qa.kr))?;
+        let k = &c.k.qsa;
+        k.enqueue_pool_seqs(
+            stream,
+            PoolSeqsArgs {
+                kr: &qa.kr,
+                gain: f32_gain(w, &qp.idx_k_norm)?,
+                n_keys,
+                eps: c.eps,
+                ctx: c.ctx,
+                fault: sink,
+            },
+            &keys,
+        )?;
+        k.enqueue_key_append_seqs(stream, (&qa.kr, pos), (c.ctx, sink), &keys)?;
+    }
+    qsa_query(c, qp, s, (m, sink))?;
+    fork.join()?;
+    let Arena38 {
+        qsa: qa,
+        pos,
+        n_keys,
+        attn,
+        ..
+    } = &mut *s;
+    c.k.qsa.enqueue_select_seqs(
+        stream,
+        SelectSeqsArgs {
+            q: &qa.qi,
+            gain: f32_gain(w, &qp.idx_q_norm)?,
+            n_keys,
+            eps: c.eps,
+            ctx: c.ctx,
+            kept: geo::KEPT,
+            fault: sink,
+            scratch: &mut qa.sel,
+        },
+        &keys,
+    )?;
+    drop(keys);
+    let (sel, width) = (&qa.sel, qa.sel.width());
+    if planes.iter().all(|(_, kv, _)| kv.seqs_serve()) {
+        let kv = planes
+            .iter_mut()
+            .map(|(rows, kv, rope)| kv.kv_seq(rows.clone(), rope))
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        // SAFETY: the front embedding generates consecutive positions within
+        // each sequence's window, and each sequence appends into its own
+        // planes.
+        unsafe {
+            c.k.neox.enqueue_head_norm_neox_append_256_seqs(
+                stream,
+                &kv,
+                PartialNeoxSeqsArgs {
+                    qg: &qa.qg,
+                    q: &mut qa.q,
+                    k: &mut qa.k,
+                    v: &qa.v,
+                    gq: f32_gain(w, &qp.q_norm)?,
+                    gk: f32_gain(w, &qp.k_norm)?,
+                    pos,
+                    eps: c.eps,
+                    n_head: geo::N_HEAD,
+                    n_kv: geo::N_KV,
+                    ctx: c.ctx,
+                    fault: sink,
+                },
+            )
+        }?;
+        return c.k.flash.enqueue_pass_256_p12_sel_seqs(
+            stream,
+            &kv,
+            GqaSelSeqsArgs {
+                q: &qa.q,
+                list: &sel.list,
+                n_sel: &sel.n_sel,
+                width,
+                scale: ATTN_SCALE_256,
+                n_kv: geo::N_KV,
+                ctx: c.ctx,
+                fault: sink,
+                y: attn,
+                part_v: &mut qa.part_v,
+                part_ms: &mut qa.part_ms,
+                gate: Some(&qa.qg),
+            },
+            geo::N_HEAD,
+        );
+    }
+    for (r, kv, rope) in &mut planes {
+        // The slot's own rotation table: an image shifts one sequence's rows
+        // and no other's.
+        let c = &Ctx38 { table: rope, ..*c };
+        let pos = rows_of(pos, r, 1)?;
+        let io = AttendIo {
+            qg: &*rows_of(&qa.qg, r, geo::Q_ROWS)?,
+            q: &mut *rows_mut(&mut qa.q, r, geo::ATTN)?,
+            k: &mut *rows_mut(&mut qa.k, r, geo::KV)?,
+            v: &*rows_of(&qa.v, r, geo::KV)?,
+            pos: &pos,
+            list: &*rows_of(&sel.list, r, width)?,
+            width,
+            n_sel: &*rows_of(&sel.n_sel, r, 1)?,
+            y: &mut *rows_mut(attn, r, geo::ATTN)?,
+        };
+        let parts = (&mut qa.part_v, &mut qa.part_ms);
+        // SAFETY: the front embedding generates consecutive positions within this
+        // sequence's window; this call selects only that sequence's cache planes.
+        unsafe { kv_attend(c, qp, kv, io, parts, r.len(), sink) }?;
+    }
+    Ok(())
 }
 
 /// A selecting layer's q (with each head's gate), k and v over every row
@@ -1484,7 +1632,7 @@ fn qsa_keys(
             pooled,
         },
     )?;
-    c.k.q38.enqueue_key_append(
+    c.k.qsa.enqueue_key_append(
         stream,
         KeyAppendArgs {
             kr: &*kr,
@@ -1511,57 +1659,37 @@ fn qsa_query(
     c.project(by, &qp.idx_q, mixed, m, sink, Out::whole(&mut qa.qi))
 }
 
-/// A selecting layer's attention over one sequence's `m` rows and its
-/// K/V planes: the selection of each row's pooled keys (into `sel` from its
-/// first row), the q/k norm and turn with the K/V append at the rows'
-/// positions, then the selected flash over the selection's lists (its
-/// partials from their first row) into `io.y` under each head's sigmoid
-/// gate from `io.qg`.
+/// A selecting layer's attention over one sequence's `m` rows and its K/V
+/// planes, past their selection: the q/k norm and turn with the K/V append
+/// at the rows' positions, then the selected flash over the selection's
+/// lists (its partials `part_v` and `part_ms` from their first row) into
+/// `io.y` under each head's sigmoid gate from `io.qg`.
 ///
 /// # Safety
 ///
 /// Among the first `m` positions in `io.pos`, those below `c.ctx` are
 /// pairwise distinct.
-unsafe fn qsa_attend(
+unsafe fn kv_attend(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
-    (kv, pooled): (&mut super::scratch::KvPlanes, &mut DeviceBuffer<u16>),
+    kv: &mut super::scratch::KvPlanes,
     io: AttendIo<'_>,
-    (sel, part_v, part_ms): (
-        &mut QsaScratch,
-        &mut DeviceBuffer<f32>,
-        &mut DeviceBuffer<f32>,
-    ),
+    (part_v, part_ms): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
     m: usize,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
     let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
     let AttendIo {
-        qsel,
-        n_keys,
         qg,
         q,
         k,
         v,
         pos,
+        list,
+        width,
+        n_sel,
         y,
     } = io;
-    c.k.qsa.enqueue_select(
-        stream,
-        SelectArgs {
-            q: qsel,
-            gain: f32_gain(w, &qp.idx_q_norm)?,
-            table: c.table,
-            n_keys,
-            pooled: &*pooled,
-            eps: c.eps,
-            ctx,
-            kept: geo::KEPT,
-            m,
-            fault: sink,
-            scratch: &mut *sel,
-        },
-    )?;
     // SAFETY: the enclosing helper requires distinct cache-valid positions.
     unsafe {
         kv.append_256(
@@ -1585,15 +1713,14 @@ unsafe fn qsa_attend(
             },
         )
     }?;
-    let width = sel.width();
     c.k.flash.enqueue_pass_256_p12_sel(
         stream,
         GqaSelArgs {
             attn: GqaListArgs {
                 q,
                 kv: kv.planes(),
-                list: &sel.list,
-                n_sel: &sel.n_sel,
+                list,
+                n_sel,
                 width,
                 scale: ATTN_SCALE_256,
                 n_kv: geo::N_KV,
