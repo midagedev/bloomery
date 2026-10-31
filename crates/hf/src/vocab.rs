@@ -339,6 +339,13 @@ const TOKENIZER_CONFIG: &Fields = &[
             "the multimodal processor's class; the text tokenizer is tokenizer_class",
         ),
     ),
+    (
+        "tool_parser_type",
+        Ignore(
+            Type::String,
+            "the serving framework's tool-call parser; serving parses tool calls by the model's family",
+        ),
+    ),
     ("audio_bos_token", Ignore(Type::String, MEDIA)),
     ("audio_eos_token", Ignore(Type::String, MEDIA)),
     ("audio_token", Ignore(Type::String, MEDIA)),
@@ -1271,6 +1278,7 @@ mod tests {
             ["tokenizer_config.json", "", "is_local", true, "yes"],
             ["tokenizer_config.json", "", "local_files_only", false, "yes"],
             ["tokenizer_config.json", "", "processor_class", "Qwen3VLProcessor", 1],
+            ["tokenizer_config.json", "", "tool_parser_type", "qwen3_coder", 1],
             ["tokenizer_config.json", "", "audio_bos_token", "<|audio_start|>", 1],
             ["tokenizer_config.json", "", "audio_eos_token", "<|audio_end|>", 1],
             ["tokenizer_config.json", "", "audio_token", "<|audio_pad|>", 1],
