@@ -2099,9 +2099,12 @@ fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiE
 /// any other `response_format`, `json_schema`, `tool_choice` or schema keyword
 /// is a 400 naming it. Such a request's `temperature` defaults to 0 (greedy); a
 /// positive one and the penalties draw with the sampler among the ids the
-/// program allows, and `ignore_eos` and `reasoning_budget` are 400s. The two
-/// routes whose answers render probabilities take their fields out of the body
-/// before this runs
+/// program allows, and `ignore_eos` and `reasoning_budget` are 400s. A
+/// `tool_choice` `"auto"` request with tools waits in free text for the model's
+/// own call opener ([`constrain::Constraint::waits_for_call`]) and is not such
+/// a request: it keeps the free-text default `temperature` and both fields. The
+/// two routes whose answers render probabilities take their fields out of the
+/// body before this runs
 /// ([`completion_plan_logprobs`], [`chat_plan_logprobs`]); every other route
 /// keeps the refusal.
 ///
@@ -2166,6 +2169,9 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         }
     })?;
     let d = SamplingParams::default();
+    // A constraint that waits for the model's call opener leaves the request
+    // free text until it comes: it keeps the free-text defaults and controls.
+    let starts_at_once = constraint.as_ref().is_some_and(|c| !c.waits_for_call());
     let seed = match get_i(o, "seed")? {
         Some(s) if s >= 0 => s as u64,
         _ => mix(state.next_id() ^ unix_now().rotate_left(17)) & u64::from(u32::MAX),
@@ -2193,7 +2199,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         usize::try_from(n).expect("a count in 0..=i32::MAX fits usize")
     });
     let sampling = SamplingParams {
-        temperature: get_f32(o, "temperature")?.unwrap_or(if constraint.is_some() {
+        temperature: get_f32(o, "temperature")?.unwrap_or(if starts_at_once {
             0.0
         } else {
             d.temperature
@@ -2226,7 +2232,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
     let ignore_eos = get_b(o, "ignore_eos")?.unwrap_or(false);
     let reasoning_budget = reasoning_budget(o)?;
     let logit_bias = logit_bias(o, state.info.n_vocab)?;
-    if constraint.is_some() {
+    if starts_at_once {
         program_ends_itself(ignore_eos, reasoning_budget)?;
     }
     let p = GenParams {
@@ -2316,10 +2322,11 @@ fn follows_reasoning(p: &GenParams) -> bool {
         .is_some_and(constrain::Constraint::forced)
 }
 
-/// What a structured-output request leaves out: `ignore_eos` would ban the id
-/// its program ends on, and a think budget would force a close that competes
-/// with the program for the span's end: a JSON document closes an open span
-/// itself, and a forced tool call starts at the model's own close.
+/// What a structured-output request that starts its program at once leaves
+/// out: `ignore_eos` would ban the id its program ends on, and a think budget
+/// would force a close that competes with the program for the span's end: a
+/// JSON document closes an open span itself, and a forced tool call starts at
+/// the model's own close.
 fn program_ends_itself(ignore_eos: bool, budget: Option<usize>) -> Result<(), ApiError> {
     let (field, why) = if ignore_eos {
         (

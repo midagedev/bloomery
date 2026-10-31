@@ -213,9 +213,20 @@ fn stop_tok() -> Arc<dyn Tokenizer> {
     Arc::new(Pieces(Arc::new(PieceTok(&[STOP_PIECE]))))
 }
 
-/// An engine whose row at its `k`-th step favours `want[k]` (the end of
-/// generation once `want` is spent) over a fixed pseudo-random floor. `read`
-/// holds, for each step, whether the caller asked for its row.
+/// The row at step `k` of an engine that favours `want[k]` (the end of
+/// generation once `want` is spent) over a fixed pseudo-random floor, and the
+/// id it favours, which is the row's argmax.
+fn row(tok: &dyn Tokenizer, want: &[u32], k: usize) -> (Vec<f32>, u32) {
+    let mut row: Vec<f32> = (0..tok.n_vocab())
+        .map(|i| ((i * 37 + k * 11) % 17) as f32 * 0.1)
+        .collect();
+    let id = want.get(k).copied().unwrap_or_else(|| tok.eos());
+    row[id as usize] = 10.0;
+    (row, id)
+}
+
+/// An engine whose row at its `k`-th step is [`row`]'s. `read` holds, for
+/// each step, whether the caller asked for its row.
 struct Rows {
     tok: Arc<dyn Tokenizer>,
     want: Vec<u32>,
@@ -232,20 +243,10 @@ impl Engine for Rows {
     }
     fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.read.lock().expect("the log").push(out.is_some());
-        let n = self.tok.n_vocab();
-        let mut row: Vec<f32> = (0..n)
-            .map(|i| ((i * 37 + self.k * 11) % 17) as f32 * 0.1)
-            .collect();
-        let favoured = self
-            .want
-            .get(self.k)
-            .copied()
-            .unwrap_or_else(|| self.tok.eos());
-        row[favoured as usize] = 10.0;
+        let (logits, best) = row(&*self.tok, &self.want, self.k);
         self.k += 1;
-        let best = sampling::argmax(&row);
         if let Some(out) = out {
-            out.copy_from_slice(&row);
+            out.copy_from_slice(&logits);
         }
         Ok(best)
     }
@@ -4623,17 +4624,6 @@ struct Passes {
 }
 
 impl Passes {
-    /// The row after position `pos`, and its argmax.
-    fn row(&self) -> (Vec<f32>, u32) {
-        let k = self.pos - self.start.expect("the prompt's last id was stepped");
-        let mut row: Vec<f32> = (0..self.tok.n_vocab())
-            .map(|i| ((i * 37 + k * 11) % 17) as f32 * 0.1)
-            .collect();
-        let id = self.want.get(k).copied().unwrap_or_else(|| self.tok.eos());
-        row[id as usize] = 10.0;
-        (row, id)
-    }
-
     fn ask(&self, a: Asked) {
         self.asked.lock().expect("the log").push(a);
     }
@@ -4649,18 +4639,19 @@ impl Engine for Passes {
     }
     fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.ask(Asked::Step(out.is_some()));
-        self.start.get_or_insert(self.pos);
-        let (row, id) = self.row();
+        let start = *self.start.get_or_insert(self.pos);
+        let (logits, id) = row(&*self.tok, &self.want, self.pos - start);
         self.pos += 1;
         if let Some(out) = out {
-            out.copy_from_slice(&row);
+            out.copy_from_slice(&logits);
         }
         Ok(id)
     }
     fn advance(&mut self, _last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
         self.ask(Asked::Pass);
+        let start = self.start.expect("the prompt's last id was stepped");
         for _ in 0..3 {
-            out.push(self.row().1);
+            out.push(row(&*self.tok, &self.want, self.pos - start).1);
             self.pos += 1;
         }
         Ok(Drafted {

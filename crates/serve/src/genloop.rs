@@ -2049,8 +2049,8 @@ pub(crate) struct Gen {
     greedy: bool,
     /// The engine's logits row, or empty on a greedy request.
     logits: Vec<f32>,
-    /// The biased copy of the row a program picks from, empty without a
-    /// `logit_bias`.
+    /// The biased copy of the row a program picks from, empty while the
+    /// request changes no row ([`Bias::is_empty`]).
     biased_row: Vec<f32>,
     tim: Timings,
     /// The draft's counts by depth ([`book_depths`]): their sums are the
@@ -2290,7 +2290,7 @@ impl Gen {
         let unread = self.walk.as_mut().is_some_and(Walk::fixed_next)
             || ((self.held.is_some() || self.walk.as_ref().is_some_and(Walk::waiting))
                 && self.greedy
-                && self.bias.add.is_empty());
+                && self.bias.is_empty());
         if unread && self.probs.is_none() {
             return None;
         }
@@ -2315,10 +2315,10 @@ impl Gen {
         if let Some(walk) = self.walk.as_mut() {
             // A watch's free text takes the engine's argmax unread, the
             // whole row's ([`Gen::logits_out`]).
-            if walk.waiting() && self.greedy && self.bias.add.is_empty() {
+            if walk.waiting() && self.greedy && self.bias.is_empty() {
                 return g;
             }
-            let row = if self.bias.add.is_empty() || walk.fixed_next() {
+            let row = if self.bias.is_empty() || walk.fixed_next() {
                 &self.logits
             } else {
                 self.bias.apply(&self.logits, false, &mut self.biased_row);
@@ -2351,9 +2351,8 @@ impl Gen {
         // A held program's request keeps its bias out of its sampler, as
         // the walk applies it ([`Gen::new`]): its reasoning draws from the
         // biased copy here.
-        let biased = self.held.is_some()
-            && !self.bias.add.is_empty()
-            && (!self.greedy || self.bias.moves(g));
+        let biased =
+            self.held.is_some() && !self.bias.is_empty() && (!self.greedy || self.bias.moves(g));
         let row = if biased {
             self.bias
                 .apply(&self.logits, self.greedy, &mut self.biased_row);

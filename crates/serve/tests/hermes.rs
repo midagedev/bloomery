@@ -597,6 +597,142 @@ fn hw_a_drafting_engine_that_cuts_no_pass_arms_no_auto_watch() {
     );
 }
 
+/// Before the model opens a call, an auto watch is free text: `ignore_eos` and
+/// `reasoning_budget` are served and act as on the same request with no watch
+/// ([`common::unwatched`]). `ignore_eos` puts the best other id where the
+/// script ends, in free text or inside a span the model opened, and the reply
+/// runs to its limit; the budget caps a span the model opened and one the
+/// prompt left open. A forced call starts its program at once and still
+/// refuses both by name.
+/// Mutant: the full-program check applies to a watch too, and the first two
+/// are 400s.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_auto_watch_keeps_ignore_eos_and_the_think_budget() {
+    let with_tools = |extra: Value| {
+        let mut b = qwen_chat(extra);
+        b["tools"] = tools();
+        b
+    };
+    let ask = |template: &str, script: &str, body: &Value| {
+        let engine = Box::new(ScriptedEngine::new(4096, script));
+        let r = post(
+            start_templated(engine, template),
+            "/v1/chat/completions",
+            body,
+        );
+        assert_eq!(r.status, 200, "{body}: {}", r.body);
+        r.json()
+    };
+    for (template, script, extra, tokens, finish) in [
+        (
+            TEMPLATE,
+            "Hi.",
+            json!({"ignore_eos": true, "max_tokens": 6}),
+            6,
+            "length",
+        ),
+        (
+            TEMPLATE,
+            "<think>abcd",
+            json!({"ignore_eos": true, "max_tokens": 12}),
+            12,
+            "length",
+        ),
+        (
+            TEMPLATE,
+            "<think>abcdefghijkl",
+            json!({"reasoning_budget": 4}),
+            15,
+            "stop",
+        ),
+        (
+            QWEN38,
+            "abcdefghijkl",
+            json!({"reasoning_budget": 4}),
+            14,
+            "stop",
+        ),
+    ] {
+        let at = extra.to_string();
+        let body = with_tools(extra);
+        let watched = ask(template, script, &body);
+        let plain = ask(template, script, &common::unwatched(body));
+        assert_eq!(
+            watched["choices"][0]["message"], plain["choices"][0]["message"],
+            "{at}: {watched}"
+        );
+        assert_eq!(watched["usage"]["completion_tokens"], json!(tokens), "{at}");
+        assert_eq!(watched["choices"][0]["finish_reason"], finish, "{at}");
+    }
+    for (extra, part) in [
+        (json!({"ignore_eos": true}), "ignore_eos is not supported"),
+        (
+            json!({"reasoning_budget": 4}),
+            "reasoning_budget is not supported",
+        ),
+    ] {
+        let mut b = with_tools(extra.clone());
+        b["tool_choice"] = json!("required");
+        let r = post(start("Hi."), "/v1/chat/completions", &b);
+        assert_eq!(r.status, 400, "{extra}: {}", r.body);
+        let m = r.json()["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        assert!(m.contains(part), "{extra}: {m}");
+    }
+}
+
+/// An auto watch keeps the free-text sampling default: a request with tools
+/// and no `temperature` reports 0.8, as it does on a drafting engine that
+/// arms no watch, while a forced call, which starts its program at once,
+/// defaults to 0 (greedy). A `temperature` given wins on every one.
+/// Mutant: every constraint defaults to 0, and the watched requests report 0.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_auto_watch_keeps_the_free_text_temperature() {
+    let watched = start("Hi.");
+    let unwatched = start_templated(
+        Box::new(ScriptedEngine::new(4096, "Hi.").drafting(4)),
+        TEMPLATE,
+    );
+    let temperature = |addr, extra: Value| {
+        let mut b = json!({"prompt": "Hi", "n_predict": 1, "tools": tools()});
+        b.as_object_mut()
+            .expect("a body")
+            .extend(extra.as_object().expect("extra").clone());
+        let r = post(addr, "/completion", &b);
+        assert_eq!(r.status, 200, "{extra}: {}", r.body);
+        r.json()["generation_settings"]["temperature"]
+            .as_f64()
+            .expect("a temperature")
+    };
+    let free = f64::from(0.8_f32);
+    for choice in [json!({}), json!({"tool_choice": "auto"})] {
+        assert_eq!(
+            temperature(watched, choice.clone()),
+            free,
+            "watched {choice}"
+        );
+        assert_eq!(
+            temperature(unwatched, choice.clone()),
+            free,
+            "unwatched {choice}"
+        );
+    }
+    assert_eq!(
+        temperature(watched, json!({"tool_choice": "required"})),
+        0.0
+    );
+    for addr in [watched, unwatched] {
+        assert_eq!(
+            temperature(addr, json!({"temperature": 0.5})),
+            f64::from(0.5_f32)
+        );
+    }
+}
+
 /// Under `tool_choice` auto (given or not) a tool whose schema is invalid is a
 /// 400 naming the field, as a forced choice answers it; a valid one the
 /// structured-output subset cannot compile is served, the reply the model's.
