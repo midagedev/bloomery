@@ -1789,7 +1789,7 @@ pub(super) struct WideParts<'a> {
 }
 
 /// [`WideParts::ple_rows`]: the walk's PLE rows landed in the arena's `e`
-/// (`Body38`'s `PleHost::land`, through the arena's planes).
+/// (`Body38`'s `PleHost::land`, through the arena's `raw` staging).
 pub(super) type PleRowsIn<'a> = dyn FnMut(&mut Ple38) -> Result<(), GpuError> + 'a;
 
 /// The kernels of the walk's dense sites ([`site::resident_gemm`]).

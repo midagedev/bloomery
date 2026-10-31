@@ -1,7 +1,7 @@
 //! The engine threads' waits, summed over the process: on the card's work
 //! (each finished wait inside a guarded engine call,
 //! [`crate::watchdog::wait_done`]) and on the rows of a PLE table read from
-//! NVMe for a call (`body38`'s `PleRead`). A server reads the totals around
+//! NVMe for a call (`rows::RowRead`). A server reads the totals around
 //! each decode round and books the difference by the round's width. Relaxed
 //! adds only: no lock and no allocation on the engine path.
 

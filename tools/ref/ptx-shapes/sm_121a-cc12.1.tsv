@@ -399,7 +399,11 @@ generate_ds41 nvfp4_gemv_sel32_cols 0 0
 generate_ds41 ple_conv 0 0
 generate_ds41 ple_conv_bf16 0 0
 generate_ds41 ple_gate 0 0
-generate_ds41 ple_rows_nvfp4 0 0
+# derived, not measured on this card: rows_nvfp4_planes (ple_rows_nvfp4 moved to rows.rs), rows_nvfp4, rows_iq4nl and rows_f8 hold no local array and no local depot; the first scan on this card confirms the rows or turns them red.
+generate_ds41 rows_nvfp4_planes 0 0
+generate_ds41 rows_nvfp4 0 0
+generate_ds41 rows_iq4nl 0 0
+generate_ds41 rows_f8 0 0
 generate_ds41 q2_k_rows 0 0
 generate_ds41 q38_card_shared_add 0 0
 generate_ds41 q38_card_sum_shared_add 0 0

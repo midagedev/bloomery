@@ -1272,7 +1272,7 @@ pub const UBATCH_PLANNED: u64 = 4096;
 /// token-major rows, 113,860 f32, 10,240 BF16, 12 u32 and 1,440 u8 — the embedding, the
 /// F32 and the BF16 stream buffers, the mix and sub-layer outputs, the attention rows, the delta
 /// layer's, the selecting layer's and the PLE site's intermediates (with the
-/// NVFP4 rows' code and scale planes, 9 bytes a 16 values), the shared
+/// table's rows as read, 9 bytes a 16 values), the shared
 /// expert's; no selected-flash queries, partials or output. The
 /// arena's own allocation is held to it
 /// (`crates/gpu/src/arch/qwen3moe/scratch38.rs`'s `Arena38::wide`).
