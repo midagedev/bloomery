@@ -6,7 +6,8 @@
 //! fixture's own tensors; the oracle is `crates/gguf`'s dequantization of the
 //! same blocks with an f64 dot, held to the band `oracle.rs` derives.
 //! `--list` prints the clause names in the order the gate runs them: the
-//! mat-vec clauses, then the A4 and A8 ones, then the token's kernels
+//! mat-vec clauses, then the A4 ones and the requantized A8, A4H and A8H
+//! ones, then the token's kernels
 //! (delta, router, experts, attention, head), then the prompt pass's, then
 //! the tensor-op GEMMs' (`clauses_tensor.rs`).
 //!
@@ -57,8 +58,6 @@ use gguf::Split;
 
 #[path = "clauses_a4.rs"]
 mod clauses_a4;
-#[path = "clauses_a8.rs"]
-mod clauses_a8;
 #[path = "clauses_apart.rs"]
 mod clauses_apart;
 #[path = "clauses_attention.rs"]
@@ -85,6 +84,8 @@ mod clauses_norm;
 mod clauses_q5k;
 #[path = "clauses_q8_0.rs"]
 mod clauses_q8_0;
+#[path = "clauses_requant.rs"]
+mod clauses_requant;
 #[path = "clauses_route.rs"]
 mod clauses_route;
 #[path = "clauses_router.rs"]
@@ -152,7 +153,7 @@ const WORD_WEIGHT_PAD: usize = 68;
 pub fn weight_pad(quant: Quant) -> usize {
     match quant {
         Quant::F32 => FLOAT4_WEIGHT_PAD,
-        Quant::A4 | Quant::A8 => WORD_WEIGHT_PAD,
+        Quant::A4 | Quant::A8 | Quant::A4H | Quant::A8H => WORD_WEIGHT_PAD,
         Quant::Q4K | Quant::Q6K | Quant::Q8_0 | Quant::Q5K => WEIGHT_PAD,
     }
 }
@@ -1034,7 +1035,7 @@ fn clause_table<'a>(
             .into_iter()
             .chain(instances())
             .chain(clauses_a4::table(ctx.harness, mlx))
-            .chain(clauses_a8::table(ctx.harness, mlx))
+            .chain(clauses_requant::table(ctx.harness, mlx))
             .chain(clauses_q8_0::table(ctx.harness))
             .chain(clauses_q5k::table(ctx.harness))
             .chain(std::iter::once((
@@ -1043,7 +1044,7 @@ fn clause_table<'a>(
             )))
             .chain(clauses_sites::table(ctx.harness))
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
-            .chain(clauses_a8::gemm_table(ctx.harness, mlx))
+            .chain(clauses_requant::gemm_table(ctx.harness, mlx))
             .chain(clauses_delta::table(ctx))
             .chain(clauses_shortconv::table(ctx))
             .chain(clauses_handon::table(ctx))
@@ -1055,7 +1056,7 @@ fn clause_table<'a>(
             .chain(clauses_rows::table(ctx))
             .chain(clauses_route::table(ctx, mlx))
             .chain(clauses_tensor::table(tensor, ctx.fixture, mlx))
-            .chain(clauses_a8::tensor_table(tensor, mlx))
+            .chain(clauses_requant::tensor_table(tensor, mlx))
             .collect(),
     }
 }

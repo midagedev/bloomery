@@ -1,5 +1,5 @@
-//! The launch of the Q4_K, Q6_K, A4, A8, Q8_0 and Q5_K mat-vecs, and the f32
-//! one's segmented form ([`Quant::F32`]).
+//! The launch of the Q4_K, Q6_K, A4, A8, A4H, A8H, Q8_0 and Q5_K mat-vecs, and
+//! the f32 one's segmented form ([`Quant::F32`]).
 
 use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
@@ -24,6 +24,12 @@ pub enum Quant {
     A4,
     /// MLX's affine 8-bit: 68-byte groups of 64 values (`MLX_A8`).
     A8,
+    /// MLX's affine 4-bit with F16 scales and biases: 36-byte groups of 64
+    /// values (`MLX_A4H`).
+    A4H,
+    /// MLX's affine 8-bit with F16 scales and biases: 68-byte groups of 64
+    /// values (`MLX_A8H`).
+    A8H,
     /// GGUF `Q8_0`: 34-byte blocks of 32 values.
     Q8_0,
     /// GGUF `Q5_K`: 176-byte blocks of 256 values.
@@ -55,11 +61,13 @@ impl Quant {
 
     /// Every type a session's arena opens: all the mat-vec families, in the
     /// order a layer's P1 dispatches them.
-    pub const ALL: [Quant; 7] = [
+    pub const ALL: [Quant; 9] = [
         Self::Q4K,
         Self::Q6K,
         Self::A4,
         Self::A8,
+        Self::A4H,
+        Self::A8H,
         Self::Q8_0,
         Self::Q5K,
         Self::F32,
@@ -81,6 +89,8 @@ impl Quant {
             Self::Q6K => gguf::quant::GgmlType::Q6_K,
             Self::A4 => gguf::quant::GgmlType::MLX_A4,
             Self::A8 => gguf::quant::GgmlType::MLX_A8,
+            Self::A4H => gguf::quant::GgmlType::MLX_A4H,
+            Self::A8H => gguf::quant::GgmlType::MLX_A8H,
             Self::Q8_0 => gguf::quant::GgmlType::Q8_0,
             Self::Q5K => gguf::quant::GgmlType::Q5_K,
             Self::F32 => gguf::quant::GgmlType::F32,
@@ -110,18 +120,25 @@ impl Quant {
     #[must_use]
     pub const fn dense(self) -> bool {
         match self {
-            Self::Q4K | Self::Q6K | Self::A4 | Self::A8 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q4K
+            | Self::Q6K
+            | Self::A4
+            | Self::A8
+            | Self::A4H
+            | Self::A8H
+            | Self::Q8_0
+            | Self::Q5K => true,
             Self::F32 => false,
         }
     }
 
-    /// The alignment the row loops' weight reads need: A4's and A8's 32-bit
+    /// The alignment the row loops' weight reads need: the affine types' 32-bit
     /// words, the 16-bit words of the other quantized blocks, or F32's
     /// `float4` loads.
     pub(crate) const fn weight_align(self) -> super::WeightAlign {
         match self {
             Self::F32 => super::WeightAlign::Float4,
-            Self::A4 | Self::A8 => super::WeightAlign::Word,
+            Self::A4 | Self::A8 | Self::A4H | Self::A8H => super::WeightAlign::Word,
             Self::Q4K | Self::Q6K | Self::Q8_0 | Self::Q5K => super::WeightAlign::Half,
         }
     }
@@ -131,7 +148,9 @@ impl Quant {
     #[must_use]
     pub const fn embeds(self) -> bool {
         match self {
-            Self::Q4K | Self::A4 | Self::A8 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q4K | Self::A4 | Self::A8 | Self::A4H | Self::A8H | Self::Q8_0 | Self::Q5K => {
+                true
+            }
             Self::Q6K | Self::F32 => false,
         }
     }
@@ -142,7 +161,9 @@ impl Quant {
     #[must_use]
     pub const fn heads(self) -> bool {
         match self {
-            Self::Q6K | Self::A4 | Self::A8 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q6K | Self::A4 | Self::A8 | Self::A4H | Self::A8H | Self::Q8_0 | Self::Q5K => {
+                true
+            }
             Self::Q4K | Self::F32 => false,
         }
     }
@@ -153,7 +174,9 @@ impl Quant {
     #[must_use]
     pub const fn headnorms(self) -> bool {
         match self {
-            Self::Q4K | Self::A4 | Self::A8 | Self::Q8_0 | Self::Q5K => true,
+            Self::Q4K | Self::A4 | Self::A8 | Self::A4H | Self::A8H | Self::Q8_0 | Self::Q5K => {
+                true
+            }
             Self::Q6K | Self::F32 => false,
         }
     }
@@ -166,6 +189,8 @@ impl Quant {
             Self::Q6K => "q6k",
             Self::A4 => "a4",
             Self::A8 => "a8",
+            Self::A4H => "a4h",
+            Self::A8H => "a8h",
             Self::Q8_0 => "q8_0",
             Self::Q5K => "q5k",
             Self::F32 => "f32",
@@ -374,6 +399,8 @@ impl Kernels {
             Quant::Q6K => Some(&self.q6k),
             Quant::A4 => Some(&self.a4),
             Quant::A8 => Some(&self.a8),
+            Quant::A4H => Some(&self.a4h),
+            Quant::A8H => Some(&self.a8h),
             Quant::Q8_0 => Some(&self.q8_0),
             Quant::Q5K => Some(&self.q5k),
             Quant::F32 => None,

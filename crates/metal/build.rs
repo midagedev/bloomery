@@ -184,8 +184,8 @@ fn main() {
     // The order is the dependency order: norm defines the argument block the
     // mat-vecs read, quant the block layouts and the decode owners every
     // quantized kernel reads (embed's too), matvec_q4k the row loop and the
-    // entry templates the Q6_K, A4, A8, Q8_0, Q5_K, F32, experts and head
-    // files instantiate.
+    // entry templates the Q6_K, A4, A8, A4H, A8H, Q8_0, Q5_K, F32, experts
+    // and head files instantiate.
     for name in [
         "fault",
         "copy",
@@ -198,6 +198,8 @@ fn main() {
         "matvec_q6k",
         "matvec_a4",
         "matvec_a8",
+        "matvec_a4h",
+        "matvec_a8h",
         "matvec_q8_0",
         "matvec_q5k",
         "matvec_f32",

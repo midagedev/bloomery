@@ -13,7 +13,7 @@
 //! one [`Format`]: each weight's stored tensors (dtype, shape and companion scales) are matched
 //! against the formats its module is declared.
 //!
-//! A BF16 or F32 tensor is placed as stored: configs quantize linears, and a tensor table cannot
+//! A BF16, F16 or F32 tensor is placed as stored: configs quantize linears, and a tensor table cannot
 //! tell a linear from a norm. A quantized weight whose module the config leaves unquantized, or
 //! whose tensors fit none of its module's formats, is refused by name, as is a companion (a scale,
 //! an input scale, a packed shape) no placed weight claims, and any other dtype. An unknown
@@ -85,13 +85,22 @@ pub enum Format {
     },
     /// MLX's affine quantization (`config.json`'s `quantization`, mlx-lm's
     /// convert): `bits` 4-bit codes an U32 word, one BF16 `.scales` value and
-    /// one BF16 `.biases` value a `group` values along the row.
+    /// one BF16 `.biases` value a `group` values along the row. What a config
+    /// declares, and what [`plan`] places a weight whose companions are BF16 as.
     MlxAffine {
+        bits: usize,
+        group: usize,
+    },
+    /// [`Format::MlxAffine`] whose `.scales` and `.biases` are F16: a config never
+    /// declares it, [`plan`] places a weight whose companions are F16 as it.
+    MlxAffineF16 {
         bits: usize,
         group: usize,
     },
     Bf16,
     F32,
+    /// F16 as stored, read widened to f32 (exact) where a role asks for F32.
+    F16,
 }
 
 impl fmt::Display for Format {
@@ -110,8 +119,12 @@ impl fmt::Display for Format {
             Format::MlxAffine { bits, group } => {
                 write!(f, "MLX-affine {bits}-bit group {group}")
             }
+            Format::MlxAffineF16 { bits, group } => {
+                write!(f, "MLX-affine F16 {bits}-bit group {group}")
+            }
             Format::Bf16 => f.write_str("BF16"),
             Format::F32 => f.write_str("F32"),
+            Format::F16 => f.write_str("F16"),
         }
     }
 }
@@ -155,8 +168,22 @@ impl Format {
             // block sizes' own group (64) has one.
             Format::MlxAffine { bits: 4, group: 64 } => Some(GgmlType::MLX_A4),
             Format::MlxAffine { bits: 8, group: 64 } => Some(GgmlType::MLX_A8),
+            Format::MlxAffineF16 { bits: 4, group: 64 } => Some(GgmlType::MLX_A4H),
+            Format::MlxAffineF16 { bits: 8, group: 64 } => Some(GgmlType::MLX_A8H),
             Format::Bf16 => Some(GgmlType::BF16),
             Format::F32 => Some(GgmlType::F32),
+            Format::F16 => Some(GgmlType::F16),
+            _ => None,
+        }
+    }
+
+    /// The bit width, the group and the dtype of the `.scales` and `.biases` of an MLX affine
+    /// format; `None` for another.
+    #[must_use]
+    pub fn mlx_affine(self) -> Option<(usize, usize, Dtype)> {
+        match self {
+            Format::MlxAffine { bits, group } => Some((bits, group, Dtype::Bf16)),
+            Format::MlxAffineF16 { bits, group } => Some((bits, group, Dtype::F16)),
             _ => None,
         }
     }
@@ -232,7 +259,7 @@ impl Format {
             | Format::Nvfp4Ct
             | Format::Mxfp4 => 2,
             Format::Int4Pack { .. } => 8,
-            Format::MlxAffine { bits, .. } => 32 / bits,
+            Format::MlxAffine { bits, .. } | Format::MlxAffineF16 { bits, .. } => 32 / bits,
             _ => 1,
         };
         if let Some(last) = s.last_mut() {
@@ -552,7 +579,7 @@ const MLX_BLOCK: &Fields = &[
 /// The affine format of one `quantization` entry (`what` names it in a
 /// refusal): a `bits` width and a `group_size`. Only the block sizes this
 /// reader places are formats — 4 and 8 bits at a group of 64, gguf's MLX_A4
-/// and MLX_A8 — and another value is refused by name, as is a width or group
+/// and MLX_A8, or MLX_A4H and MLX_A8H when the companions are F16 — and another value is refused by name, as is a width or group
 /// the blocks do not have.
 fn mlx_format(what: &str, entry: &Value) -> Result<Format, Error> {
     let refuse = |key: &str| {
@@ -913,7 +940,7 @@ pub fn plan<'a>(
         let (formats, owner) = config.declared(module, || class_of(module));
         let found = formats
             .iter()
-            .find_map(|&f| layout(f, name, module, owner, dtype, shape, &table).map(|c| (f, c)));
+            .find_map(|&f| layout(f, name, module, owner, dtype, shape, &table));
         match found {
             Some((format, companions)) => {
                 claimed.extend(companions.iter().cloned());
@@ -940,9 +967,15 @@ pub fn plan<'a>(
                     .map(|(n, (d, s))| format!("{n} {} {s:?}", d.name()))
                     .collect();
                 let want: Vec<String> = formats.iter().map(Format::to_string).collect();
+                let note = formats
+                    .iter()
+                    .any(|f| f.mlx_affine().is_some())
+                    .then(|| mlx_dtype_note(module, &table))
+                    .flatten()
+                    .unwrap_or_default();
                 out.refused.insert(
                     name.to_string(),
-                    format!("{} {shape:?} with {have:?} fits none of {want:?}, the config's formats for {module}", dtype.name()),
+                    format!("{} {shape:?} with {have:?} fits none of {want:?}, the config's formats for {module}{note}", dtype.name()),
                 );
             }
         }
@@ -980,13 +1013,16 @@ pub fn plan<'a>(
 fn plain(dtype: Dtype) -> Option<Format> {
     match dtype {
         Dtype::Bf16 => Some(Format::Bf16),
+        Dtype::F16 => Some(Format::F16),
         Dtype::F32 => Some(Format::F32),
         _ => None,
     }
 }
 
-/// The companions the weight `name` of `module` reads when stored as `format`, or `None` when
-/// its tensors do not fit. `owner` is the module a tensor scale may be shared from.
+/// The format a weight is placed in and the companions it reads when its tensors fit `format`
+/// (the placed format is `format` but for an MLX affine weight, whose companions' dtype picks
+/// [`Format::MlxAffine`] or [`Format::MlxAffineF16`]), or `None` when they do not. `owner` is the
+/// module a tensor scale may be shared from.
 fn layout(
     format: Format,
     name: &str,
@@ -995,7 +1031,7 @@ fn layout(
     dtype: Dtype,
     shape: &[usize],
     table: &BTreeMap<&str, (Dtype, &[usize])>,
-) -> Option<Vec<String>> {
+) -> Option<(Format, Vec<String>)> {
     // MLX's expert stacks are one 3-D U32 tensor (`switch_mlp`), so the affine
     // format matches any rank whose last dim is the packed row; every other
     // format's weights here are 2-D.
@@ -1167,14 +1203,14 @@ fn layout(
         }
         _ => return None,
     }
-    Some(out)
+    Some((format, out))
 }
 
-/// The companions an MLX affine weight reads: `.weight` U32 with its row's K
-/// packed `bits` to a word along the last dim, beside BF16 `.scales` and
-/// `.biases` of the same leading dims with K/`group` columns — one placed
-/// tensor whatever the rank (a `switch_mlp` stack's `[E, R, packed]` as much
-/// as a linear's `[R, packed]`).
+/// The format and companions an MLX affine weight reads: `.weight` U32 with its row's K
+/// packed `bits` to a word along the last dim, beside `.scales` and `.biases` of the same
+/// leading dims with K/`group` columns, both BF16 ([`Format::MlxAffine`]) or both F16
+/// ([`Format::MlxAffineF16`]) — one placed tensor whatever the rank (a `switch_mlp` stack's
+/// `[E, R, packed]` as much as a linear's `[R, packed]`). A pair of two dtypes fits neither.
 fn mlx_layout(
     bits: usize,
     group: usize,
@@ -1182,7 +1218,7 @@ fn mlx_layout(
     dtype: Dtype,
     shape: &[usize],
     table: &BTreeMap<&str, (Dtype, &[usize])>,
-) -> Option<Vec<String>> {
+) -> Option<(Format, Vec<String>)> {
     if dtype != Dtype::U32 || shape.len() < 2 {
         return None;
     }
@@ -1196,10 +1232,39 @@ fn mlx_layout(
         let n = format!("{module}.{suffix}");
         table
             .get(n.as_str())
-            .filter(|&&(d, s)| d == Dtype::Bf16 && s == grid)
-            .map(|_| n)
+            .filter(|&&(d, s)| matches!(d, Dtype::Bf16 | Dtype::F16) && s == grid)
+            .map(|&(d, _)| (n, d))
     };
-    Some(vec![find("scales")?, find("biases")?])
+    let (scales, scale_dtype) = find("scales")?;
+    let (biases, bias_dtype) = find("biases")?;
+    let format = match (scale_dtype, bias_dtype) {
+        (Dtype::Bf16, Dtype::Bf16) => Format::MlxAffine { bits, group },
+        (Dtype::F16, Dtype::F16) => Format::MlxAffineF16 { bits, group },
+        _ => return None,
+    };
+    Some((format, vec![scales, biases]))
+}
+
+/// What a refusal of an MLX affine weight adds when its `.scales` and `.biases` are of two
+/// dtypes, or of one the format does not read.
+fn mlx_dtype_note(module: &str, table: &BTreeMap<&str, (Dtype, &[usize])>) -> Option<String> {
+    let dtype = |suffix: &str| {
+        table
+            .get(format!("{module}.{suffix}").as_str())
+            .map(|&(d, _)| d)
+    };
+    match (dtype("scales")?, dtype("biases")?) {
+        (a, b) if a != b => Some(format!(
+            "; its scales are {} and its biases {}, and one weight's pair is of one dtype",
+            a.name(),
+            b.name()
+        )),
+        (a, _) if !matches!(a, Dtype::Bf16 | Dtype::F16) => Some(format!(
+            "; its scales and biases are {}, and only BF16 or F16 are read",
+            a.name()
+        )),
+        _ => None,
+    }
 }
 
 /// Whether a pattern of `patterns` starts or ends `module`, as transformers matches a module
@@ -2824,5 +2889,79 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    /// An MLX affine weight whose `.scales` and `.biases` are F16 is placed as
+    /// [`Format::MlxAffineF16`] (card type MLX_A4H or MLX_A8H) beside BF16 ones of the same
+    /// checkpoint placed as [`Format::MlxAffine`]; a weight whose pair is of two dtypes, or of one
+    /// the format does not read, is refused by name with the dtypes; an F16 tensor outside a
+    /// quantized weight is placed as [`Format::F16`].
+    #[test]
+    fn mlx_affine_places_f16_companions_as_their_own_format() {
+        let c = Config::parse(
+            &serde_json::json!({ "quantization": { "group_size": 64, "bits": 4 } }),
+            None,
+        )
+        .unwrap();
+        let entry =
+            |name: &str, dtype: Dtype, shape: &[usize]| (name.to_string(), dtype, shape.to_vec());
+        let linear = |layer: usize, scales: Dtype, biases: Dtype| {
+            let m = format!("m.layers.{layer}.q");
+            [
+                entry(&format!("{m}.weight"), Dtype::U32, &[256, 32]),
+                entry(&format!("{m}.scales"), scales, &[256, 4]),
+                entry(&format!("{m}.biases"), biases, &[256, 4]),
+            ]
+        };
+        let mut stored = vec![entry("m.layers.0.norm.weight", Dtype::F16, &[128])];
+        stored.extend(linear(0, Dtype::F16, Dtype::F16));
+        stored.extend(linear(1, Dtype::Bf16, Dtype::Bf16));
+        stored.extend(linear(2, Dtype::F16, Dtype::Bf16));
+        stored.extend(linear(3, Dtype::F32, Dtype::F32));
+        let p = plan(&c, tensors(&stored), |_| None);
+        let half = Format::MlxAffineF16 { bits: 4, group: 64 };
+        let placed = &p.placed["m.layers.0.q.weight"];
+        assert_eq!(placed.format, half);
+        assert_eq!(
+            placed.companions,
+            ["m.layers.0.q.scales", "m.layers.0.q.biases"]
+        );
+        assert_eq!(
+            p.placed["m.layers.1.q.weight"].format,
+            Format::MlxAffine { bits: 4, group: 64 }
+        );
+        assert_eq!(p.placed["m.layers.0.norm.weight"].format, Format::F16);
+        let two = &p.refused["m.layers.2.q.weight"];
+        assert!(
+            two.contains("fits none of")
+                && two.contains(
+                    "its scales are F16 and its biases BF16, and one weight's pair is of one dtype"
+                ),
+            "{two}"
+        );
+        let four = &p.refused["m.layers.3.q.weight"];
+        assert!(
+            four.contains("its scales and biases are F32, and only BF16 or F16 are read"),
+            "{four}"
+        );
+        assert_eq!(half.to_string(), "MLX-affine F16 4-bit group 64");
+        assert_eq!(Format::F16.to_string(), "F16");
+        assert_eq!(half.card_type(), Some(GgmlType::MLX_A4H));
+        assert_eq!(
+            Format::MlxAffineF16 { bits: 8, group: 64 }.card_type(),
+            Some(GgmlType::MLX_A8H)
+        );
+        assert_eq!(
+            Format::MlxAffineF16 { bits: 3, group: 64 }.card_type(),
+            None
+        );
+        assert_eq!(Format::F16.card_type(), Some(GgmlType::F16));
+        assert_eq!(half.logical(&[256, 32]), [256, 256]);
+        assert_eq!(half.mlx_affine(), Some((4, 64, Dtype::F16)));
+        assert_eq!(
+            Format::MlxAffine { bits: 8, group: 64 }.mlx_affine(),
+            Some((8, 64, Dtype::Bf16))
+        );
+        assert_eq!(Format::F16.mlx_affine(), None);
     }
 }

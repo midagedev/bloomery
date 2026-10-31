@@ -140,13 +140,25 @@ mod test_support {
     pub(crate) type Stored = (String, &'static str, Vec<usize>, Vec<u8>);
 
     /// An MLX linear `stem` of `bits`-bit codes over the leading dims `lead` and `k` values a row:
-    /// its weight (a counting pattern of words), its scales (0.5) and its biases (−0.25).
-    pub(crate) fn mlx_linear(stem: &str, bits: usize, lead: &[usize], k: usize) -> Vec<Stored> {
+    /// its weight (a counting pattern of words), its scales (0.5) and its biases (−0.25), the pair
+    /// in `pair`'s dtype.
+    pub(crate) fn mlx_linear_pair(
+        stem: &str,
+        bits: usize,
+        lead: &[usize],
+        k: usize,
+        pair: Dtype,
+    ) -> Vec<Stored> {
+        let (ty, scale, bias) = match pair {
+            Dtype::Bf16 => ("BF16", 0x3f00u16, 0xbe80),
+            Dtype::F16 => ("F16", 0x3800, 0xb400),
+            other => panic!("{other:?}: a pair this builder does not write"),
+        };
         let shape = |last: usize| [lead, &[last]].concat();
         let n = shape(k * bits / 32).iter().product::<usize>();
         let words = (0..n as u32).flat_map(|i| i.wrapping_mul(0x9e37_79b9).to_le_bytes());
         let groups = shape(k / 64).iter().product::<usize>();
-        let pair = |bf16: u16| (0..groups).flat_map(|_| bf16.to_le_bytes()).collect();
+        let pair = |bits16: u16| (0..groups).flat_map(|_| bits16.to_le_bytes()).collect();
         vec![
             (
                 format!("{stem}.weight"),
@@ -154,19 +166,14 @@ mod test_support {
                 shape(k * bits / 32),
                 words.collect(),
             ),
-            (
-                format!("{stem}.scales"),
-                "BF16",
-                shape(k / 64),
-                pair(0x3f00),
-            ),
-            (
-                format!("{stem}.biases"),
-                "BF16",
-                shape(k / 64),
-                pair(0xbe80),
-            ),
+            (format!("{stem}.scales"), ty, shape(k / 64), pair(scale)),
+            (format!("{stem}.biases"), ty, shape(k / 64), pair(bias)),
         ]
+    }
+
+    /// [`mlx_linear_pair`] with a BF16 pair, the real 4-bit folders' dtype.
+    pub(crate) fn mlx_linear(stem: &str, bits: usize, lead: &[usize], k: usize) -> Vec<Stored> {
+        mlx_linear_pair(stem, bits, lead, k, Dtype::Bf16)
     }
 
     /// A BF16 tensor of `shape` whose element `i` is `value(i)`.

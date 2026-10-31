@@ -1884,8 +1884,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Entries, Stored, bf16_tensor, entries, fixture, gguf_tensors, json, key_json, mlx_linear,
-        write_folder,
+        Entries, Stored, bf16_tensor, entries, fixture, gguf_tensors, json, key_json,
+        mlx_linear_pair, write_folder,
     };
 
     /// The next-token layers, the vision tower and the PLE hash constants are skipped with their
@@ -2971,19 +2971,23 @@ mod tests {
         assert!(missed.is_empty(), "accepted: {missed:?}");
     }
 
-    /// The MLX type and role a GGUF fixture tensor of type `ty` becomes: the 4-bit linears are
-    /// MLX_A4, read by Q8_0 roles but for the gated delta rule's alpha and beta, whose F32 role
-    /// the map keeps; the router and the shared-expert gate are the 8-bit MLX_A8, read by the
-    /// BF16 role the map gives a router; the BF16 vectors are F32.
-    fn mlx_type_of(name: &str, ty: GgmlType) -> (GgmlType, Use) {
+    /// The MLX type and role a GGUF fixture tensor of type `ty` becomes at the scale pair `pair`:
+    /// the 4-bit linears are MLX_A4 (MLX_A4H at an F16 pair), read by Q8_0 roles but for the gated
+    /// delta rule's alpha and beta, whose F32 role the map keeps; the router and the shared-expert
+    /// gate are the 8-bit MLX_A8 (MLX_A8H at an F16 pair), read by the BF16 role the map gives a
+    /// router; the BF16 vectors are F32.
+    fn mlx_type_of(name: &str, ty: GgmlType, pair: Dtype) -> (GgmlType, Use) {
+        let (a4, a8) = match pair {
+            Dtype::Bf16 => (GgmlType::MLX_A4, GgmlType::MLX_A8),
+            Dtype::F16 => (GgmlType::MLX_A4H, GgmlType::MLX_A8H),
+            other => panic!("{name}: a pair the fixture is not written at: {other:?}"),
+        };
         match ty {
             GgmlType::Q4_K if name.contains("ssm_alpha") || name.contains("ssm_beta") => {
-                (GgmlType::MLX_A4, Use::Matrix(Plain::F32))
+                (a4, Use::Matrix(Plain::F32))
             }
-            GgmlType::Q4_K | GgmlType::Q6_K => (GgmlType::MLX_A4, Use::Matrix(Plain::Q8_0)),
-            GgmlType::F32 if name.contains("ffn_gate_inp") => {
-                (GgmlType::MLX_A8, Use::Matrix(Plain::Bf16))
-            }
+            GgmlType::Q4_K | GgmlType::Q6_K => (a4, Use::Matrix(Plain::Q8_0)),
+            GgmlType::F32 if name.contains("ffn_gate_inp") => (a8, Use::Matrix(Plain::Bf16)),
             GgmlType::F32 => (GgmlType::F32, Use::Matrix(Plain::F32)),
             other => panic!("{name}: {other}"),
         }
@@ -3035,7 +3039,7 @@ mod tests {
             let folder::Make::Tensor(m) = &planned.make else {
                 panic!("{name}: a scale beside a type that reads none");
             };
-            let (mlx, role) = mlx_type_of(name, *ty);
+            let (mlx, role) = mlx_type_of(name, *ty, Dtype::Bf16);
             assert_eq!(planned.decl.dims, *dims, "{name}");
             assert_eq!(GgmlType::from_u32(planned.decl.type_id), mlx, "{name}");
             assert_eq!(m.role, role, "{name}");
@@ -3121,7 +3125,7 @@ mod tests {
             assert_eq!(got[name.as_str()].decl.dims, *dims, "{name}");
             assert_eq!(
                 GgmlType::from_u32(got[name.as_str()].decl.type_id),
-                mlx_type_of(name, *ty).0,
+                mlx_type_of(name, *ty, Dtype::Bf16).0,
                 "{name}"
             );
         }
@@ -3409,7 +3413,8 @@ mod tests {
     }
 
     /// A folder of two layers (gated delta rule, then attention) of a Qwen3.6 as small as the
-    /// groups allow, written in MLX's names, opens: its planned tensors and header keys read as
+    /// groups allow, written in MLX's names at both scale pairs the map reads (BF16's
+    /// MLX_A4/MLX_A8 and F16's MLX_A4H/MLX_A8H), opens: its planned tensors and header keys read as
     /// a qwen35moe file through the engine's own header reader (kinds, interval), every tensor of
     /// the source reads whole in the planned bytes, and the steps ran on the stored values
     /// (`A_log` as `-exp`; the conv taps as `[kernel, channels]`; the delta-rule matrices, taps and
@@ -3417,247 +3422,249 @@ mod tests {
     /// carry the one already).
     #[test]
     fn a_small_qwen36_folder_opens_as_a_qwen35moe_file() {
-        use model::arch::qwen35moe::hparams::{Hparams, Kind};
-        use model::part::{Source, Take};
-        use serde_json::json;
-
-        let p = "language_model.model";
-        let mut gates = serde_json::Map::new();
-        for l in 0..2 {
-            for gate in ["mlp.gate", "mlp.shared_expert_gate"] {
-                gates.insert(
-                    format!("{p}.layers.{l}.{gate}"),
-                    json!({"group_size": 64, "bits": 8}),
-                );
-            }
-        }
-        let mut quantization = json!({"group_size": 64, "bits": 4, "mode": "affine"});
-        quantization.as_object_mut().unwrap().extend(gates);
-        let config = json!({
-            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
-            "model_type": "qwen3_5_moe",
-            "eos_token_id": [2],
-            "image_token_id": 3,
-            "tie_word_embeddings": false,
-            "quantization": quantization,
-            "quantization_config": quantization,
-            "text_config": {
-                "model_type": "qwen3_5_moe_text", "attn_output_gate": true,
-                "num_hidden_layers": 2, "max_position_embeddings": 4096, "hidden_size": 64,
-                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
-                "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64,
-                "shared_expert_intermediate_size": 64, "linear_conv_kernel_dim": 4,
-                "linear_key_head_dim": 64, "linear_num_key_heads": 2,
-                "linear_num_value_heads": 6, "linear_value_head_dim": 64,
-                "layer_types": ["linear_attention", "full_attention"],
-                "full_attention_interval": 4, "rms_norm_eps": 1e-6, "vocab_size": 8,
-                "bos_token_id": 2, "eos_token_id": 2, "pad_token_id": null,
-                "partial_rotary_factor": 0.5, "hidden_act": "silu",
-                "rope_parameters": {"mrope_interleaved": true, "mrope_section": [4, 2, 2],
-                    "rope_theta": 1e6, "rope_type": "default", "partial_rotary_factor": 0.5},
-            },
-        });
-        let dir = crate::test_support::temp_dir("qwen36-open");
-        let mut t: Vec<Stored> = vec![];
-        for stem in [
-            format!("{p}.embed_tokens"),
-            "language_model.lm_head".to_string(),
+        // Both scale pairs the folder map reads: the BF16 pairs of the real
+        // 4-bit folders and their F16 forms.
+        for (pair, a4, a8, pair_bytes) in [
+            (
+                Dtype::Bf16,
+                GgmlType::MLX_A4,
+                GgmlType::MLX_A8,
+                [0x00u8, 0x3f, 0x80, 0xbe],
+            ),
+            (
+                Dtype::F16,
+                GgmlType::MLX_A4H,
+                GgmlType::MLX_A8H,
+                [0x00u8, 0x38, 0x00, 0xb4],
+            ),
         ] {
-            t.extend(mlx_linear(&stem, 4, &[8], 64));
-        }
-        t.push(bf16_tensor(&format!("{p}.norm.weight"), &[64], |_| 0x3fc0));
-        for l in 0..2 {
-            let m = format!("{p}.layers.{l}");
+            let lin = |stem: &str, bits: usize, lead: &[usize], k: usize| {
+                mlx_linear_pair(stem, bits, lead, k, pair)
+            };
+
+            use model::arch::qwen35moe::hparams::{Hparams, Kind};
+            use model::part::{Source, Take};
+            use serde_json::json;
+
+            let p = "language_model.model";
+            let mut gates = serde_json::Map::new();
+            for l in 0..2 {
+                for gate in ["mlp.gate", "mlp.shared_expert_gate"] {
+                    gates.insert(
+                        format!("{p}.layers.{l}.{gate}"),
+                        json!({"group_size": 64, "bits": 8}),
+                    );
+                }
+            }
+            let mut quantization = json!({"group_size": 64, "bits": 4, "mode": "affine"});
+            quantization.as_object_mut().unwrap().extend(gates);
+            let config = json!({
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "eos_token_id": [2],
+                "image_token_id": 3,
+                "tie_word_embeddings": false,
+                "quantization": quantization,
+                "quantization_config": quantization,
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text", "attn_output_gate": true,
+                    "num_hidden_layers": 2, "max_position_embeddings": 4096, "hidden_size": 64,
+                    "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
+                    "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64,
+                    "shared_expert_intermediate_size": 64, "linear_conv_kernel_dim": 4,
+                    "linear_key_head_dim": 64, "linear_num_key_heads": 2,
+                    "linear_num_value_heads": 6, "linear_value_head_dim": 64,
+                    "layer_types": ["linear_attention", "full_attention"],
+                    "full_attention_interval": 4, "rms_norm_eps": 1e-6, "vocab_size": 8,
+                    "bos_token_id": 2, "eos_token_id": 2, "pad_token_id": null,
+                    "partial_rotary_factor": 0.5, "hidden_act": "silu",
+                    "rope_parameters": {"mrope_interleaved": true, "mrope_section": [4, 2, 2],
+                        "rope_theta": 1e6, "rope_type": "default", "partial_rotary_factor": 0.5},
+                },
+            });
+            let dir = crate::test_support::temp_dir("qwen36-open");
+            let mut t: Vec<Stored> = vec![];
+            for stem in [
+                format!("{p}.embed_tokens"),
+                "language_model.lm_head".to_string(),
+            ] {
+                t.extend(lin(&stem, 4, &[8], 64));
+            }
+            t.push(bf16_tensor(&format!("{p}.norm.weight"), &[64], |_| 0x3fc0));
+            for l in 0..2 {
+                let m = format!("{p}.layers.{l}");
+                t.push(bf16_tensor(
+                    &format!("{m}.input_layernorm.weight"),
+                    &[64],
+                    |_| 0x3fc0,
+                ));
+                t.push(bf16_tensor(
+                    &format!("{m}.post_attention_layernorm.weight"),
+                    &[64],
+                    |_| 0x3f80,
+                ));
+                t.extend(lin(&format!("{m}.mlp.gate"), 8, &[4], 64));
+                t.extend(lin(&format!("{m}.mlp.shared_expert_gate"), 8, &[1], 64));
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    t.extend(lin(&format!("{m}.mlp.switch_mlp.{proj}"), 4, &[4, 64], 64));
+                    t.extend(lin(&format!("{m}.mlp.shared_expert.{proj}"), 4, &[64], 64));
+                }
+            }
+            let m = format!("{p}.layers.0.linear_attn");
+            for (stem, rows, k) in [
+                ("in_proj_qkv", 640, 64),
+                ("in_proj_z", 384, 64),
+                ("in_proj_a", 6, 64),
+                ("in_proj_b", 6, 64),
+                ("out_proj", 64, 384),
+            ] {
+                t.extend(lin(&format!("{m}.{stem}"), 4, &[rows], k));
+            }
             t.push(bf16_tensor(
-                &format!("{m}.input_layernorm.weight"),
-                &[64],
-                |_| 0x3fc0,
+                &format!("{m}.conv1d.weight"),
+                &[640, 4, 1],
+                |i| 0x3f80 + (i % 7) as u16,
             ));
+            t.push(bf16_tensor(&format!("{m}.A_log"), &[6], |i| {
+                [0, 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0][i]
+            }));
+            t.push(bf16_tensor(&format!("{m}.dt_bias"), &[6], |i| {
+                0x3f80 + i as u16
+            }));
+            t.push(bf16_tensor(&format!("{m}.norm.weight"), &[64], |_| 0x3f80));
+            let m = format!("{p}.layers.1.self_attn");
+            for (stem, rows, k) in [
+                ("q_proj", 128, 64),
+                ("k_proj", 32, 64),
+                ("v_proj", 32, 64),
+                ("o_proj", 64, 64),
+            ] {
+                t.extend(lin(&format!("{m}.{stem}"), 4, &[rows], k));
+            }
+            t.push(bf16_tensor(&format!("{m}.q_norm.weight"), &[32], |_| {
+                0x3e80
+            }));
+            t.push(bf16_tensor(&format!("{m}.k_norm.weight"), &[32], |_| {
+                0x3e80
+            }));
             t.push(bf16_tensor(
-                &format!("{m}.post_attention_layernorm.weight"),
-                &[64],
+                "vision_tower.patch_embed.proj.weight",
+                &[2, 3],
                 |_| 0x3f80,
             ));
-            t.extend(mlx_linear(&format!("{m}.mlp.gate"), 8, &[4], 64));
-            t.extend(mlx_linear(
-                &format!("{m}.mlp.shared_expert_gate"),
-                8,
-                &[1],
-                64,
-            ));
-            for proj in ["gate_proj", "up_proj", "down_proj"] {
-                t.extend(mlx_linear(
-                    &format!("{m}.mlp.switch_mlp.{proj}"),
-                    4,
-                    &[4, 64],
-                    64,
-                ));
-                t.extend(mlx_linear(
-                    &format!("{m}.mlp.shared_expert.{proj}"),
-                    4,
-                    &[64],
-                    64,
-                ));
+            write_folder(&dir, &t, &config, &tokenizer());
+            let opened = crate::folder::open(&dir).unwrap();
+            let hp = Hparams::read(&opened.header).unwrap();
+            assert_eq!(hp.kinds, [Kind::DeltaRule, Kind::Attention]);
+            assert_eq!(hp.interval, 2);
+            assert!(hp.exp.is_none());
+            let ty = |name: &str| opened.header.find(name).unwrap().1.ty;
+            assert_eq!(ty("blk.0.attn_qkv.weight"), a4);
+            assert_eq!(ty("blk.1.ffn_down_exps.weight"), a4);
+            assert_eq!(ty("blk.1.ffn_gate_inp.weight"), a8);
+            assert_eq!(ty("blk.0.ssm_a"), GgmlType::F32);
+            assert_eq!(ty("output_norm.weight"), GgmlType::F32);
+            assert!(
+                opened
+                    .header
+                    .find("vision_tower.patch_embed.proj.weight")
+                    .is_none()
+            );
+            let planned = opened
+                .source
+                .plan(|_, _, _| Ok::<_, String>(Take::Whole))
+                .unwrap();
+            assert_eq!(planned.len(), opened.header.iter_tensors().count());
+            let read = |name: &str| -> Vec<u8> {
+                let p = planned.iter().find(|p| p.info.name == name).unwrap();
+                let part = opened.source.read(p).unwrap();
+                assert_eq!(part.spans().concat().len() as u64, p.info.nbytes, "{name}");
+                part.spans().concat()
+            };
+            let f32s = |name: &str| -> Vec<f32> {
+                read(name)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect()
+            };
+            for p in &planned {
+                assert_eq!(read(&p.info.name).len() as u64, p.info.nbytes);
             }
-        }
-        let m = format!("{p}.layers.0.linear_attn");
-        for (stem, rows, k) in [
-            ("in_proj_qkv", 640, 64),
-            ("in_proj_z", 384, 64),
-            ("in_proj_a", 6, 64),
-            ("in_proj_b", 6, 64),
-            ("out_proj", 64, 384),
-        ] {
-            t.extend(mlx_linear(&format!("{m}.{stem}"), 4, &[rows], k));
-        }
-        t.push(bf16_tensor(
-            &format!("{m}.conv1d.weight"),
-            &[640, 4, 1],
-            |i| 0x3f80 + (i % 7) as u16,
-        ));
-        t.push(bf16_tensor(&format!("{m}.A_log"), &[6], |i| {
-            [0, 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0][i]
-        }));
-        t.push(bf16_tensor(&format!("{m}.dt_bias"), &[6], |i| {
-            0x3f80 + i as u16
-        }));
-        t.push(bf16_tensor(&format!("{m}.norm.weight"), &[64], |_| 0x3f80));
-        let m = format!("{p}.layers.1.self_attn");
-        for (stem, rows, k) in [
-            ("q_proj", 128, 64),
-            ("k_proj", 32, 64),
-            ("v_proj", 32, 64),
-            ("o_proj", 64, 64),
-        ] {
-            t.extend(mlx_linear(&format!("{m}.{stem}"), 4, &[rows], k));
-        }
-        t.push(bf16_tensor(&format!("{m}.q_norm.weight"), &[32], |_| {
-            0x3e80
-        }));
-        t.push(bf16_tensor(&format!("{m}.k_norm.weight"), &[32], |_| {
-            0x3e80
-        }));
-        t.push(bf16_tensor(
-            "vision_tower.patch_embed.proj.weight",
-            &[2, 3],
-            |_| 0x3f80,
-        ));
-        write_folder(&dir, &t, &config, &tokenizer());
-        let opened = crate::folder::open(&dir).unwrap();
-        let hp = Hparams::read(&opened.header).unwrap();
-        assert_eq!(hp.kinds, [Kind::DeltaRule, Kind::Attention]);
-        assert_eq!(hp.interval, 2);
-        assert!(hp.exp.is_none());
-        let ty = |name: &str| opened.header.find(name).unwrap().1.ty;
-        assert_eq!(ty("blk.0.attn_qkv.weight"), GgmlType::MLX_A4);
-        assert_eq!(ty("blk.1.ffn_down_exps.weight"), GgmlType::MLX_A4);
-        assert_eq!(ty("blk.1.ffn_gate_inp.weight"), GgmlType::MLX_A8);
-        assert_eq!(ty("blk.0.ssm_a"), GgmlType::F32);
-        assert_eq!(ty("output_norm.weight"), GgmlType::F32);
-        assert!(
-            opened
-                .header
-                .find("vision_tower.patch_embed.proj.weight")
-                .is_none()
-        );
-        let planned = opened
-            .source
-            .plan(|_, _, _| Ok::<_, String>(Take::Whole))
-            .unwrap();
-        assert_eq!(planned.len(), opened.header.iter_tensors().count());
-        let read = |name: &str| -> Vec<u8> {
-            let p = planned.iter().find(|p| p.info.name == name).unwrap();
-            let part = opened.source.read(p).unwrap();
-            assert_eq!(part.spans().concat().len() as u64, p.info.nbytes, "{name}");
-            part.spans().concat()
-        };
-        let f32s = |name: &str| -> Vec<f32> {
-            read(name)
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes(*b))
-                .collect()
-        };
-        for p in &planned {
-            assert_eq!(read(&p.info.name).len() as u64, p.info.nbytes);
-        }
-        // 6 V heads of 2 K heads: grouped head `h` goes to place `(h % 3) · 2 + h / 3`, so the
-        // places 0..6 hold the grouped heads 0, 3, 1, 4, 2, 5.
-        let held = [0, 3, 1, 4, 2, 5];
-        // `A_log` of 0..6 as `-exp`, and `dt_bias` of 1 + h/128 as stored, at those places.
-        let neg_exp = |x: f64| (-x.exp()) as f32;
-        assert_eq!(
-            f32s("blk.0.ssm_a"),
-            held.map(|h| neg_exp(h as f64)),
-            "A_log"
-        );
-        assert_eq!(
-            f32s("blk.0.ssm_dt.bias"),
-            held.map(|h| 1.0 + h as f32 / 128.0),
-            "dt_bias"
-        );
-        assert_eq!(f32s("blk.1.attn_q_norm.weight"), [0.25; 32]);
-        assert_eq!(f32s("blk.1.attn_k_norm.weight"), [0.25; 32]);
-        assert_eq!(f32s("blk.0.attn_norm.weight"), [1.5; 64]);
-        assert_eq!(f32s("blk.0.post_attention_norm.weight"), [1.0; 64]);
-        assert_eq!(f32s("output_norm.weight"), [1.5; 64]);
-        // The stored row a planned row holds, for V heads of `head` rows from row `from`.
-        let from_row = |row: usize, from: usize, head: usize| {
-            if row < from {
-                row
-            } else {
-                let at = row - from;
-                from + held[at / head] * head + at % head
+            // 6 V heads of 2 K heads: grouped head `h` goes to place `(h % 3) · 2 + h / 3`, so the
+            // places 0..6 hold the grouped heads 0, 3, 1, 4, 2, 5.
+            let held = [0, 3, 1, 4, 2, 5];
+            // `A_log` of 0..6 as `-exp`, and `dt_bias` of 1 + h/128 as stored, at those places.
+            let neg_exp = |x: f64| (-x.exp()) as f32;
+            assert_eq!(
+                f32s("blk.0.ssm_a"),
+                held.map(|h| neg_exp(h as f64)),
+                "A_log"
+            );
+            assert_eq!(
+                f32s("blk.0.ssm_dt.bias"),
+                held.map(|h| 1.0 + h as f32 / 128.0),
+                "dt_bias"
+            );
+            assert_eq!(f32s("blk.1.attn_q_norm.weight"), [0.25; 32]);
+            assert_eq!(f32s("blk.1.attn_k_norm.weight"), [0.25; 32]);
+            assert_eq!(f32s("blk.0.attn_norm.weight"), [1.5; 64]);
+            assert_eq!(f32s("blk.0.post_attention_norm.weight"), [1.0; 64]);
+            assert_eq!(f32s("output_norm.weight"), [1.5; 64]);
+            // The stored row a planned row holds, for V heads of `head` rows from row `from`.
+            let from_row = |row: usize, from: usize, head: usize| {
+                if row < from {
+                    row
+                } else {
+                    let at = row - from;
+                    from + held[at / head] * head + at % head
+                }
+            };
+            let taps = f32s("blk.0.ssm_conv1d.weight");
+            assert_eq!(taps.len(), 4 * 640);
+            for (row, tap) in (0..640).flat_map(|r| (0..4).map(move |t| (r, t))) {
+                let stored = 4 * from_row(row, 256, 64) + tap;
+                let want = f32::from_bits(u32::from(0x3f80 + (stored % 7) as u16) << 16);
+                assert_eq!(taps[4 * row + tap], want, "tap {tap} of channel {row}");
             }
-        };
-        let taps = f32s("blk.0.ssm_conv1d.weight");
-        assert_eq!(taps.len(), 4 * 640);
-        for (row, tap) in (0..640).flat_map(|r| (0..4).map(move |t| (r, t))) {
-            let stored = 4 * from_row(row, 256, 64) + tap;
-            let want = f32::from_bits(u32::from(0x3f80 + (stored % 7) as u16) << 16);
-            assert_eq!(taps[4 * row + tap], want, "tap {tap} of channel {row}");
-        }
-        // The matrices' rows are the stored rows moved whole: a row's first group is its stored
-        // words, then its scale and its bias (0.5, -0.25).
-        let words = |row: usize, words_a_row: usize, group: usize| -> Vec<u8> {
-            let at = (row * words_a_row + group * 8) as u32;
-            (at..at + 8)
-                .flat_map(|i| i.wrapping_mul(0x9e37_79b9).to_le_bytes())
-                .collect()
-        };
-        for (name, rows, from, head) in [
-            ("attn_qkv", 640, 256, 64),
-            ("attn_gate", 384, 0, 64),
-            ("ssm_alpha", 6, 0, 1),
-            ("ssm_beta", 6, 0, 1),
-        ] {
-            let m = read(&format!("blk.0.{name}.weight"));
-            assert_eq!(m.len(), rows * 36, "{name}");
-            for row in 0..rows {
-                let at = row * 36;
-                let stored = from_row(row, from, head);
-                assert_eq!(m[at..][..32], words(stored, 8, 0)[..], "{name} row {row}");
-                assert_eq!(
-                    m[at + 32..][..4],
-                    [0x00, 0x3f, 0x80, 0xbe],
-                    "{name} row {row}"
-                );
+            // The matrices' rows are the stored rows moved whole: a row's first group is its stored
+            // words, then its scale and its bias (0.5, -0.25).
+            let words = |row: usize, words_a_row: usize, group: usize| -> Vec<u8> {
+                let at = (row * words_a_row + group * 8) as u32;
+                (at..at + 8)
+                    .flat_map(|i| i.wrapping_mul(0x9e37_79b9).to_le_bytes())
+                    .collect()
+            };
+            for (name, rows, from, head) in [
+                ("attn_qkv", 640, 256, 64),
+                ("attn_gate", 384, 0, 64),
+                ("ssm_alpha", 6, 0, 1),
+                ("ssm_beta", 6, 0, 1),
+            ] {
+                let m = read(&format!("blk.0.{name}.weight"));
+                assert_eq!(m.len(), rows * 36, "{name}");
+                for row in 0..rows {
+                    let at = row * 36;
+                    let stored = from_row(row, from, head);
+                    assert_eq!(m[at..][..32], words(stored, 8, 0)[..], "{name} row {row}");
+                    assert_eq!(m[at + 32..][..4], pair_bytes, "{name} row {row}");
+                }
             }
-        }
-        // The out projection moves columns: each row's 6 groups of 64 are the V heads.
-        let out = read("blk.0.ssm_out.weight");
-        assert_eq!(out.len(), 64 * 6 * 36);
-        for row in [0, 1, 63] {
-            for (group, &stored) in held.iter().enumerate() {
-                let at = (row * 6 + group) * 36;
-                assert_eq!(
-                    out[at..][..32],
-                    words(row, 48, stored)[..],
-                    "out_proj row {row} group {group}"
-                );
+            // The out projection moves columns: each row's 6 groups of 64 are the V heads.
+            let out = read("blk.0.ssm_out.weight");
+            assert_eq!(out.len(), 64 * 6 * 36);
+            for row in [0, 1, 63] {
+                for (group, &stored) in held.iter().enumerate() {
+                    let at = (row * 6 + group) * 36;
+                    assert_eq!(
+                        out[at..][..32],
+                        words(row, 48, stored)[..],
+                        "out_proj row {row} group {group}"
+                    );
+                }
             }
+            std::fs::remove_dir_all(&dir).unwrap();
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

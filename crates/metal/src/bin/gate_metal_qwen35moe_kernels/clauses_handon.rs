@@ -33,7 +33,16 @@ const K: usize = 2048;
 
 /// The types a join hands on to: each has a scaled segmented mat-vec, a
 /// scaled pair and a `norm_add_next`; all but Q4_K a scaled head.
-const TYPES: [Quant; 5] = [Quant::Q4K, Quant::Q6K, Quant::A4, Quant::Q8_0, Quant::Q5K];
+const TYPES: [Quant; 8] = [
+    Quant::Q4K,
+    Quant::Q6K,
+    Quant::A4,
+    Quant::A8,
+    Quant::A4H,
+    Quant::A8H,
+    Quant::Q8_0,
+    Quant::Q5K,
+];
 
 /// The rows of the segmented mat-vec and of the head.
 const ROWS: usize = 96;

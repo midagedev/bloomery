@@ -540,6 +540,21 @@ def self_test() -> int:
         )
         rounded = round_bf16(np.array([1.0, 0.1], dtype=np.float32))
         check("bf16 keeps 1", float(rounded[0]) == 1.0)
+        # the F16 pairs: scale 1.0 (0x3C00) and 0.5 (0x3800), bias -0.25 (0xB400)
+        f16block = struct.pack("<8I", 0x2, 0, 0, 0, 0, 0, 0, 0) + struct.pack("<HH", 0x3C00, 0xB400)
+        f16_vals = dequant_a4_block(f16block, "f16")
+        check("a4h scale and bias", f16_vals[0] == 1.75 and f16_vals[1] == -0.25)
+        wide_h = dequant_a4(f16block, "f16")
+        check(
+            "a4h vector matches the block",
+            len(wide_h) == 64 and max(abs(a - b) for a, b in zip(wide_h, f16_vals)) == 0.0,
+        )
+        a8h = bytes(range(64)) + struct.pack("<HH", 0x3800, 0xB400)
+        a8h_vals = dequant_a8(a8h, "f16")
+        check(
+            "a8h byte codes and pair",
+            a8h_vals[0] == -0.25 and a8h_vals[1] == 0.25 and a8h_vals[63] == 31.25,
+        )
     except ImportError:
         pass
 
@@ -1348,12 +1363,25 @@ def bf16_bits_to_float(bits: int) -> float:
     return struct.unpack("<f", struct.pack("<I", (bits & 0xFFFF) << 16))[0]
 
 
-def dequant_a4_block(block: bytes) -> list[float]:
-    """One MLX_A4 group: value i is `s·q + b`, q the low-nibble-first code."""
+def f16_bits_to_float(bits: int) -> float:
+    return struct.unpack("<e", struct.pack("<H", bits & 0xFFFF))[0]
+
+
+def pair_bits_to_float(bits: int, pair: str) -> float:
+    """A scale or bias word widened to f64: bf16 bits (`MLX_A4`/`MLX_A8`) or f16
+    bits (`MLX_A4H`/`MLX_A8H`)."""
+    if pair == "f16":
+        return f16_bits_to_float(bits)
+    return bf16_bits_to_float(bits)
+
+
+def dequant_a4_block(block: bytes, pair: str = "bf16") -> list[float]:
+    """One MLX_A4 group (an MLX_A4H one at `pair="f16"`): value i is `s·q + b`, q the
+    low-nibble-first code."""
     if len(block) != 36:
         raise SystemExit(f"mlx-logits: an A4 group is 36 bytes, not {len(block)}")
-    scale = bf16_bits_to_float(struct.unpack_from("<H", block, 32)[0])
-    bias = bf16_bits_to_float(struct.unpack_from("<H", block, 34)[0])
+    scale = pair_bits_to_float(struct.unpack_from("<H", block, 32)[0], pair)
+    bias = pair_bits_to_float(struct.unpack_from("<H", block, 34)[0], pair)
     out = []
     for w in range(8):
         word = struct.unpack_from("<I", block, w * 4)[0]
@@ -1371,8 +1399,19 @@ def rmsnorm_list(values, gain, eps: float) -> list[float]:
     return [v * g * scale for v, g in zip(values, gain)]
 
 
-def dequant_a4(raw: bytes):
-    """Every MLX_A4 group in `raw`, the same values `dequant_a4_block` returns."""
+def pair_widen(bits, pair: str):
+    """A u16 array of scale or bias words widened to f64, bf16 or f16."""
+    import numpy as np
+
+    if pair == "f16":
+        return np.ascontiguousarray(bits, dtype=np.uint16).view("<f2").astype(np.float64)
+    u = (np.asarray(bits, dtype=np.uint32) << np.uint32(16)).astype("<u4")
+    return np.frombuffer(u.tobytes(), dtype="<f4").reshape(np.asarray(bits).shape).astype(np.float64)
+
+
+def dequant_a4(raw: bytes, pair: str = "bf16"):
+    """Every MLX_A4 group in `raw` (an MLX_A4H one at `pair="f16"`), the same values
+    `dequant_a4_block` returns."""
     import numpy as np
 
     if len(raw) % 36:
@@ -1386,13 +1425,12 @@ def dequant_a4(raw: bytes):
         word = words[:, j]
         for k in range(8):
             codes[:, j * 8 + k] = (word >> np.uint32(4 * k)) & np.uint32(0xF)
-    scale_f = (scale.astype(np.uint32) << np.uint32(16)).view(np.float32).astype(np.float64)
-    bias_f = (bias.astype(np.uint32) << np.uint32(16)).view(np.float32).astype(np.float64)
-    return (codes * scale_f[:, None] + bias_f[:, None]).reshape(-1)
+    return (codes * pair_widen(scale, pair)[:, None] + pair_widen(bias, pair)[:, None]).reshape(-1)
 
 
-def dequant_a8(raw: bytes):
-    """MLX_A8 groups of 64: byte i is the code, then the bf16 scale and bias."""
+def dequant_a8(raw: bytes, pair: str = "bf16"):
+    """MLX_A8 groups of 64 (MLX_A8H at `pair="f16"`): byte i is the code, then the scale
+    and bias words of the pair."""
     import numpy as np
 
     if len(raw) % 68:
@@ -1401,9 +1439,7 @@ def dequant_a8(raw: bytes):
     codes = blocks[:, :64].astype(np.float64)
     scale = np.ascontiguousarray(blocks[:, 64:66]).view(np.uint16).reshape(-1)
     bias = np.ascontiguousarray(blocks[:, 66:68]).view(np.uint16).reshape(-1)
-    scale_f = (scale.astype(np.uint32) << np.uint32(16)).view(np.float32).astype(np.float64)
-    bias_f = (bias.astype(np.uint32) << np.uint32(16)).view(np.float32).astype(np.float64)
-    return (codes * scale_f[:, None] + bias_f[:, None]).reshape(-1)
+    return (codes * pair_widen(scale, pair)[:, None] + pair_widen(bias, pair)[:, None]).reshape(-1)
 
 
 def round_bf16(values):
@@ -1434,7 +1470,7 @@ def gguf_tensors(path: str):
 
 
 def read_tensor(path: str, index, start: int, name: str):
-    """The tensor's type, dims, and f64 values. F32, BF16, MLX_A4 and MLX_A8."""
+    """The tensor's type, dims, and f64 values. F32, BF16 and the four MLX affine kinds."""
     import numpy as np
 
     if name not in index:
@@ -1448,9 +1484,9 @@ def read_tensor(path: str, index, start: int, name: str):
         nbytes = n * 4
     elif ty == 30:
         nbytes = n * 2
-    elif ty == 2004:
+    elif ty in (2004, 2006):
         nbytes = n // 64 * 36
-    elif ty == 2005:
+    elif ty in (2005, 2007):
         nbytes = n // 64 * 68
     else:
         raise SystemExit(f"mlx-logits: {name} has type id {ty}")
@@ -1464,10 +1500,10 @@ def read_tensor(path: str, index, start: int, name: str):
     elif ty == 30:
         bits = np.frombuffer(raw, dtype="<u2").astype(np.uint32)
         values = (bits << np.uint32(16)).view(np.float32).astype(np.float64).copy()
-    elif ty == 2004:
-        values = dequant_a4(raw)
+    elif ty in (2004, 2006):
+        values = dequant_a4(raw, "f16" if ty == 2006 else "bf16")
     else:
-        values = dequant_a8(raw)
+        values = dequant_a8(raw, "f16" if ty == 2007 else "bf16")
     return ty, [int(d) for d in dims], values
 
 
@@ -1548,7 +1584,8 @@ def f64_main(argv: list[str]) -> int:
         ("a", "blk.0.ssm_alpha.weight", "L00.a"),
         ("b", "blk.0.ssm_beta.weight", "L00.b"),
     )
-    names = {0: "F32", 30: "BF16", 2004: "MLX_A4", 2005: "MLX_A8"}
+    names = {0: "F32", 30: "BF16", 2004: "MLX_A4", 2005: "MLX_A8",
+             2006: "MLX_A4H", 2007: "MLX_A8H"}
     for kind, tensor, dump in jobs:
         ty, dims, values = read_tensor(split, index, start, tensor)
         ours = load_f32(ours_dir / f"{dump}.f32")
@@ -1596,9 +1633,9 @@ def read_span(path: str, start: int, offset: int, ty: int, begin: int, count: in
     """`count` values of a tensor, starting at value `begin`. The span is whole groups."""
     import numpy as np
 
-    if ty == 2004:
+    if ty in (2004, 2006):
         group, nbytes_g = 64, 36
-    elif ty == 2005:
+    elif ty in (2005, 2007):
         group, nbytes_g = 64, 68
     elif ty == 0:
         group, nbytes_g = 1, 4
@@ -1615,10 +1652,10 @@ def read_span(path: str, start: int, offset: int, ty: int, begin: int, count: in
         raw = handle.read(nbytes)
     if len(raw) != nbytes:
         raise SystemExit("mlx-logits: a tensor span is short")
-    if ty == 2004:
-        return dequant_a4(raw)
-    if ty == 2005:
-        return dequant_a8(raw)
+    if ty in (2004, 2006):
+        return dequant_a4(raw, "f16" if ty == 2006 else "bf16")
+    if ty in (2005, 2007):
+        return dequant_a8(raw, "f16" if ty == 2007 else "bf16")
     if ty == 0:
         return np.frombuffer(raw, dtype="<f4").astype(np.float64).copy()
     bits = np.frombuffer(raw, dtype="<u2").astype(np.uint32)

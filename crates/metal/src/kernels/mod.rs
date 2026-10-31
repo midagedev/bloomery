@@ -1,12 +1,13 @@
-//! The quantized kernels' host side: the pipelines of the Q4_K, Q6_K, A4 and
-//! A8 mat-vecs, the Q4_K, A4 and A8 embeddings, and the launch of each.
+//! The quantized kernels' host side: the pipelines of the Q4_K, Q6_K, A4, A8,
+//! A4H and A8H mat-vecs, the Q4_K, A4, A8, A4H and A8H embeddings, and the
+//! launch of each.
 //!
 //! A launch takes a parameter struct of windows and the shape they are for,
 //! checks every window's length against the shape before it encodes anything
 //! (a window that is not the shape's is a named [`bloomery_device::DeviceError`], never a
 //! partial read or write), and encodes one dispatch on the caller's encoder.
 //! The kernels themselves are
-//! `kernels/{norm,matvec_q4k,matvec_q6k,matvec_a4,matvec_a8,embed}.metal`.
+//! `kernels/{norm,matvec_q4k,matvec_q6k,matvec_a4,matvec_a8,matvec_a4h,matvec_a8h,embed}.metal`.
 //! Decode attention is `kernels/attention.metal`.
 //!
 //! Three mat-vecs live here, one concept each: the plain mat-vec of one
@@ -157,6 +158,8 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     a4: MatvecPipelines,
     a8: MatvecPipelines,
+    a4h: MatvecPipelines,
+    a8h: MatvecPipelines,
     q8_0: MatvecPipelines,
     q5k: MatvecPipelines,
     /// The f32 weights' one mat-vec entry, the segmented one
@@ -169,6 +172,8 @@ pub struct Kernels {
     q6k_gemm: gemm::GemmPipelines,
     a4_gemm: gemm::GemmPipelines,
     a8_gemm: gemm::GemmPipelines,
+    a4h_gemm: gemm::GemmPipelines,
+    a8h_gemm: gemm::GemmPipelines,
     q8_0_gemm: gemm::GemmPipelines,
     q5k_gemm: gemm::GemmPipelines,
     /// The cast of the half-row GEMMs' activations (`gemm.metal`'s
@@ -177,17 +182,21 @@ pub struct Kernels {
     /// The program the dense and the grouped GEMMs run: the library's
     /// [`Library::gemm_path`].
     gemm_path: GemmPath,
-    /// The gated delta net's out projection: the Q4_K entry (A4's, A8's,
-    /// Q8_0's and Q5_K's are `headnorm_a4`, `headnorm_a8`, `headnorm_q8_0`
-    /// and `headnorm_q5k`; Q6_K has none).
+    /// The gated delta net's out projection: the Q4_K entry (the others' are
+    /// `headnorm_a4`, `headnorm_a8`, `headnorm_a4h`, `headnorm_a8h`,
+    /// `headnorm_q8_0` and `headnorm_q5k`; Q6_K has none).
     headnorm: Pipeline,
     headnorm_a4: Pipeline,
     headnorm_a8: Pipeline,
+    headnorm_a4h: Pipeline,
+    headnorm_a8h: Pipeline,
     headnorm_q8_0: Pipeline,
     headnorm_q5k: Pipeline,
     embed_q4k: Pipeline,
     embed_a4: Pipeline,
     embed_a8: Pipeline,
+    embed_a4h: Pipeline,
+    embed_a8h: Pipeline,
     embed_q8_0: Pipeline,
     embed_q5k: Pipeline,
     router: Pipeline,
@@ -206,12 +215,15 @@ pub struct Kernels {
     /// The gated delta step over rows, and the ring commit after it.
     delta_rows: delta::RowsPipelines,
     attention: attention::AttentionPipelines,
-    /// The output head's logits dispatch: the Q6_K entry (A4's, A8's, Q8_0's
-    /// and Q5_K's are `head_logits_a4`, `head_logits_a8`,
-    /// `head_logits_q8_0` and `head_logits_q5k`; Q4_K has none).
+    /// The output head's logits dispatch: the Q6_K entry (the others' are
+    /// `head_logits_a4`, `head_logits_a8`, `head_logits_a4h`,
+    /// `head_logits_a8h`, `head_logits_q8_0` and `head_logits_q5k`; Q4_K has
+    /// none).
     head_logits_q6k: Pipeline,
     head_logits_a4: Pipeline,
     head_logits_a8: Pipeline,
+    head_logits_a4h: Pipeline,
+    head_logits_a8h: Pipeline,
     head_logits_q8_0: Pipeline,
     head_logits_q5k: Pipeline,
     /// The logits dispatch over the last join's scaled input, of the same
@@ -219,6 +231,8 @@ pub struct Kernels {
     head_logits_q6k_scaled: Pipeline,
     head_logits_a4_scaled: Pipeline,
     head_logits_a8_scaled: Pipeline,
+    head_logits_a4h_scaled: Pipeline,
+    head_logits_a8h_scaled: Pipeline,
     head_logits_q8_0_scaled: Pipeline,
     head_logits_q5k_scaled: Pipeline,
     /// The output head's argmax over the logits, the one entry of every type.
@@ -391,6 +405,30 @@ impl Kernels {
                 ],
                 count,
             )?,
+            a4h: MatvecPipelines::new(
+                library,
+                [
+                    "a4h_matvec",
+                    "a4h_matvec_norm",
+                    "a4h_matvec_resid",
+                    "a4h_matvec_seg",
+                    "a4h_matvec_seg_scaled",
+                    "a4h_norm_add_next",
+                ],
+                count,
+            )?,
+            a8h: MatvecPipelines::new(
+                library,
+                [
+                    "a8h_matvec",
+                    "a8h_matvec_norm",
+                    "a8h_matvec_resid",
+                    "a8h_matvec_seg",
+                    "a8h_matvec_seg_scaled",
+                    "a8h_norm_add_next",
+                ],
+                count,
+            )?,
             q8_0: MatvecPipelines::new(
                 library,
                 [
@@ -438,6 +476,16 @@ impl Kernels {
                 "gemm_a8",
                 library.gemm_path(),
             )?,
+            a4h_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_a4h",
+                library.gemm_path(),
+            )?,
+            a8h_gemm: gemm::GemmPipelines::new(
+                library.gemm_library(),
+                "gemm_a8h",
+                library.gemm_path(),
+            )?,
             q8_0_gemm: gemm::GemmPipelines::new(
                 library.gemm_library(),
                 "gemm_q8_0",
@@ -453,11 +501,15 @@ impl Kernels {
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             headnorm_a4: library.pipeline_with_simdgroups("a4_matvec_headnorm_resid", count)?,
             headnorm_a8: library.pipeline_with_simdgroups("a8_matvec_headnorm_resid", count)?,
+            headnorm_a4h: library.pipeline_with_simdgroups("a4h_matvec_headnorm_resid", count)?,
+            headnorm_a8h: library.pipeline_with_simdgroups("a8h_matvec_headnorm_resid", count)?,
             headnorm_q8_0: library.pipeline_with_simdgroups("q8_0_matvec_headnorm_resid", count)?,
             headnorm_q5k: library.pipeline_with_simdgroups("q5k_matvec_headnorm_resid", count)?,
             embed_q4k: library.pipeline("embed_q4k")?,
             embed_a4: library.pipeline("embed_a4")?,
             embed_a8: library.pipeline("embed_a8")?,
+            embed_a4h: library.pipeline("embed_a4h")?,
+            embed_a8h: library.pipeline("embed_a8h")?,
             embed_q8_0: library.pipeline("embed_q8_0")?,
             embed_q5k: library.pipeline("embed_q5k")?,
             router: library.pipeline("router35")?,
@@ -472,6 +524,8 @@ impl Kernels {
             head_logits_q6k: library.pipeline_with_simdgroups("q6k_head_logits", count)?,
             head_logits_a4: library.pipeline_with_simdgroups("a4_head_logits", count)?,
             head_logits_a8: library.pipeline_with_simdgroups("a8_head_logits", count)?,
+            head_logits_a4h: library.pipeline_with_simdgroups("a4h_head_logits", count)?,
+            head_logits_a8h: library.pipeline_with_simdgroups("a8h_head_logits", count)?,
             head_logits_q8_0: library.pipeline_with_simdgroups("q8_0_head_logits", count)?,
             head_logits_q5k: library.pipeline_with_simdgroups("q5k_head_logits", count)?,
             head_logits_q6k_scaled: library
@@ -480,6 +534,10 @@ impl Kernels {
                 .pipeline_with_simdgroups("a4_head_logits_scaled", count)?,
             head_logits_a8_scaled: library
                 .pipeline_with_simdgroups("a8_head_logits_scaled", count)?,
+            head_logits_a4h_scaled: library
+                .pipeline_with_simdgroups("a4h_head_logits_scaled", count)?,
+            head_logits_a8h_scaled: library
+                .pipeline_with_simdgroups("a8h_head_logits_scaled", count)?,
             head_logits_q8_0_scaled: library
                 .pipeline_with_simdgroups("q8_0_head_logits_scaled", count)?,
             head_logits_q5k_scaled: library

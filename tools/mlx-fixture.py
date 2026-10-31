@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mlx-fixture.py — the qwen35moe or qwen3moe GGUF fixture as an MLX-format checkpoint folder (bloomery #593 R3).
 
-    tools/mlx-fixture.py make <fixture.gguf> <out dir> --config <real config.json>
+    tools/mlx-fixture.py make <fixture.gguf> <out dir> --config <real config.json> [--f16]
     tools/mlx-fixture.py check <out dir> <fixture.gguf>
     tools/mlx-fixture.py --self-test
 
@@ -33,9 +33,10 @@ are copied when present), then runs `check`.
 
 `check` re-reads the folder's shard headers, decodes every quantized tensor with the affine rule
 bloomery's MLX_A4/MLX_A8 rows own (value i the 4 bits at bit 4·(i mod 8) of word i/8, low nibble
-first, or byte i; w = s·q + b in f32) and holds it to mx.dequantize bit for bit: MLX returns the
-f32 value rounded once to bf16 (measured, mlx 0.32.1), so every value must survive that rounding
-untouched. It also holds every value within the quantizer's own error of the GGUF fixture's
+first, or byte i; w = s·q + b in f32, the scale and bias widened from the pair the companions'
+own dtype names) and holds it to mx.dequantize bit for bit: MLX returns the f32 value rounded
+once to that pair's dtype (measured at bf16, mlx 0.32.1), so every value must survive that
+rounding untouched. It also holds every value within the quantizer's own error of the GGUF fixture's
 dequantized values: |err| ≤ |w|·2^-7 + |group scale|·1.25 (mx's affine fit is an optimizer
 whose group extremes can sit past the top code — measured worst 1.047·scale over this fixture,
 mlx 0.32.1 — and a near-constant group keeps only the bf16 grid; a scale can be negative, a
@@ -45,6 +46,9 @@ prints each file's sha256.
 `--self-test` runs the dequant ports against hand-computed blocks, the affine decode against the
 pinned mx.quantize vector of crates/gguf's MLX test, and make+check end to end over a tiny
 synthetic GGUF with a stub quantizer (exact integer grids, error 0) — no mlx and no fixture needed.
+
+`--f16` writes the scale and bias companions as F16 instead of BF16 (the quantizer's cast and
+every check follow the pair), the split the folder map reads as MLX_A4H/MLX_A8H.
 
 Exit: 0; 2 a file missing or unreadable; 64 usage; 65 a malformed input, a transform refusal or a
 failed check.
@@ -58,8 +62,8 @@ import struct
 import sys
 import tempfile
 
-USAGE = ("usage: tools/mlx-fixture.py make <fixture.gguf> <out dir> --config <real config.json> | "
-         "check <out dir> <fixture.gguf> | --self-test")
+USAGE = ("usage: tools/mlx-fixture.py make <fixture.gguf> <out dir> --config <real config.json> "
+         "[--f16] | check <out dir> <fixture.gguf> | --self-test")
 
 # The real folder's tokenizer files make copies of, beside its config.json; the first is required.
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
@@ -351,15 +355,35 @@ def bf16_bits_to_f32(bits):
     return np.frombuffer(u.tobytes(), dtype="<f4").reshape(np.asarray(bits).shape).copy()
 
 
-def decode_affine(q_u32, s_bits, b_bits, bits):
-    """The MLX_A4/MLX_A8 rule (crates/gguf dequant_mlx_a4/a8): value i of group g is
-    the code at bit (i % (32//bits))·bits of word g·(64//(32//bits)) + i//(32//bits),
-    `s·q + b` in f32 with the widened bf16 pair; `q_u32` is (…, words)."""
+# The two scale-and-bias pairs a folder stores: the safetensors dtype of the companions, and
+# `pair_bits_to_f32`'s and `to_pair_bits`' rule for one of them.
+PAIRS = {"bf16": "BF16", "f16": "F16"}
+
+
+def pair_bits_to_f32(bits, pair):
+    """A u16 array of scale or bias words widened to f32: bf16 bits shifted, f16 bits decoded."""
+    if pair == "f16":
+        return np.ascontiguousarray(bits, dtype=np.uint16).view("<f2").astype(np.float32)
+    return bf16_bits_to_f32(bits)
+
+
+def to_pair_bits(f, pair):
+    """f32 -> the pair's bits, round to nearest even (bf16 by hand, f16 by numpy's cast)."""
+    if pair == "f16":
+        return np.ascontiguousarray(f, dtype=np.float32).astype(np.float16).view(np.uint16)
+    return to_bf16_bits(f)
+
+
+def decode_affine(q_u32, s_bits, b_bits, bits, pair="bf16"):
+    """The MLX affine rule (crates/gguf dequant_mlx_a4/a8 and their F16 pairs): value i of
+    group g is the code at bit (i % (32//bits))·bits of word g·(64//(32//bits)) + i//(32//bits),
+    `s·q + b` in f32 with the widened pair (bf16 for MLX_A4/MLX_A8, f16 for MLX_A4H/MLX_A8H);
+    `q_u32` is (…, words)."""
     q = np.asarray(q_u32, dtype=np.uint64)
     lead = q.shape[:-1]
     q2 = q.reshape(-1, q.shape[-1])
-    s = bf16_bits_to_f32(s_bits).reshape(-1, s_bits.shape[-1])
-    b = bf16_bits_to_f32(b_bits).reshape(-1, b_bits.shape[-1])
+    s = pair_bits_to_f32(s_bits, pair).reshape(-1, s_bits.shape[-1])
+    b = pair_bits_to_f32(b_bits, pair).reshape(-1, b_bits.shape[-1])
     per = 32 // bits
     mask = (1 << bits) - 1
     groups = s.shape[1]
@@ -384,20 +408,24 @@ class MlxQuantizer:
             raise Refusal(EXIT_MISSING, f"mlx is not importable: {e}") from e
         self.mx = mx
 
-    def quantize(self, w, bits):
-        """w f32 -> (words u32, scale bits, bias bits) of one tensor, MLX's own dtypes."""
-        wq, s, b = self.mx.quantize(self.mx.array(w).astype(self.mx.bfloat16),
+    def quantize(self, w, bits, pair="bf16"):
+        """w f32 -> (words u32, scale bits, bias bits) of one tensor, MLX's own dtypes, the
+        quantizer's cast and so its companions in the pair's dtype."""
+        mx = self.mx
+        wide = mx.bfloat16 if pair == "bf16" else mx.float16
+        wq, s, b = self.mx.quantize(self.mx.array(w).astype(wide),
                                     group_size=GROUP, bits=bits, mode="affine")
         return (np.array(wq, copy=False),
                 np.array(s.view(self.mx.uint16), copy=False),
                 np.array(b.view(self.mx.uint16), copy=False))
 
-    def dequantize(self, q, s_bits, b_bits, bits):
-        """mx.dequantize widened to f32: the f32 value rounded once to bf16."""
+    def dequantize(self, q, s_bits, b_bits, bits, pair="bf16"):
+        """mx.dequantize widened to f32: the f32 value rounded once to the pair's dtype."""
         mx = self.mx
+        wide = mx.bfloat16 if pair == "bf16" else mx.float16
         qm = mx.array(np.ascontiguousarray(q, dtype=np.uint32))
-        sm = mx.array(np.ascontiguousarray(s_bits, dtype=np.uint16)).view(mx.bfloat16)
-        bm = mx.array(np.ascontiguousarray(b_bits, dtype=np.uint16)).view(mx.bfloat16)
+        sm = mx.array(np.ascontiguousarray(s_bits, dtype=np.uint16)).view(wide)
+        bm = mx.array(np.ascontiguousarray(b_bits, dtype=np.uint16)).view(wide)
         return np.array(mx.dequantize(qm, sm, bm, group_size=GROUP, bits=bits)
                         .astype(mx.float32), copy=False)
 
@@ -407,7 +435,7 @@ class StubQuantizer:
     bias 0, so decode is exact and the quantizer's error is 0 (the self-test's
     weights are integers)."""
 
-    def quantize(self, w, bits):
+    def quantize(self, w, bits, pair="bf16"):
         codes = w.astype(np.uint32).reshape(-1, w.shape[-1])
         top = (1 << bits) - 1
         if codes.max(initial=0) > top:
@@ -419,15 +447,16 @@ class StubQuantizer:
             words[:, i // per] |= codes[:, i].astype(np.uint64) << ((i % per) * bits)
         words = words.astype(np.uint32)
         groups = k // GROUP
-        s = np.full((codes.shape[0], groups), 0x3F80, dtype=np.uint16)  # bf16 1.0
+        one = 0x3F80 if pair == "bf16" else 0x3C00  # 1.0 in the pair's dtype
+        s = np.full((codes.shape[0], groups), one, dtype=np.uint16)
         b = np.zeros((codes.shape[0], groups), dtype=np.uint16)
         shape = w.shape[:-1]
         return (words.reshape(shape + (words.shape[1],)),
                 s.reshape(shape + (groups,)),
                 b.reshape(shape + (groups,)))
 
-    def dequantize(self, q, s_bits, b_bits, bits):
-        return decode_affine(q, s_bits, b_bits, bits)
+    def dequantize(self, q, s_bits, b_bits, bits, pair="bf16"):
+        return decode_affine(q, s_bits, b_bits, bits, pair)
 
 
 # ------------------------------------------------------------ safetensors files
@@ -514,7 +543,7 @@ def tensor_bytes(kind, bits, shape):
     return [n * 2]
 
 
-def make(fixture, out, config_path, quantizer, quiet=False):
+def make(fixture, out, config_path, quantizer, quiet=False, pair="bf16"):
     if os.path.exists(out):
         raise Refusal(EXIT_REFUSED, f"{out} already exists (remove it first)")
     tokenizer_dir = os.path.dirname(os.path.abspath(config_path))
@@ -558,13 +587,13 @@ def make(fixture, out, config_path, quantizer, quiet=False):
             if list(w.shape) != shape:
                 raise Refusal(EXIT_REFUSED, f"{name}: shape {w.shape}, planned {shape}")
             if kind == "quant":
-                q, s, b = quantizer.quantize(w, bits)
+                q, s, b = quantizer.quantize(w, bits, pair)
                 if q.dtype != np.uint32 or q.shape[-1] != shape[-1] * bits // 32:
                     raise Refusal(EXIT_REFUSED, f"{name}: quantized {q.shape}, not {shape} words")
                 stem = name[: -len(".weight")]
                 tensors[name] = ("U32", list(q.shape), q.astype("<u4").tobytes())
-                tensors[f"{stem}.scales"] = ("BF16", list(s.shape), s.astype("<u2").tobytes())
-                tensors[f"{stem}.biases"] = ("BF16", list(b.shape), b.astype("<u2").tobytes())
+                tensors[f"{stem}.scales"] = (PAIRS[pair], list(s.shape), s.astype("<u2").tobytes())
+                tensors[f"{stem}.biases"] = (PAIRS[pair], list(b.shape), b.astype("<u2").tobytes())
             else:
                 tensors[name] = ("BF16", shape, to_bf16_bits(w.reshape(-1)).astype("<u2").tobytes())
             del values, w
@@ -681,27 +710,34 @@ def check(out, fixture, quantizer, quiet=False):
                 stem = name[: -len(".weight")]
                 s_dty, s_shape, s_blob = shard.read(f"{stem}.scales")
                 b_dty, b_shape, b_blob = shard.read(f"{stem}.biases")
-                if s_dty != "BF16" or b_dty != "BF16":
-                    raise Refusal(EXIT_REFUSED, f"{name}: a companion is {s_dty}/{b_dty}, not BF16")
+                by_dtype = {v: k for k, v in PAIRS.items()}
+                if s_dty != b_dty or s_dty not in by_dtype:
+                    raise Refusal(EXIT_REFUSED,
+                                  f"{name}: a companion is {s_dty}/{b_dty}, not one pair "
+                                  f"({', '.join(PAIRS.values())})")
+                pair = by_dtype[s_dty]
                 s_bits = np.frombuffer(s_blob, dtype="<u2").reshape(s_shape)
                 b_bits = np.frombuffer(b_blob, dtype="<u2").reshape(b_shape)
-                mine = decode_affine(words, s_bits, b_bits, bits)
-                mxs = quantizer.dequantize(words, s_bits, b_bits, bits)
-                if not np.array_equal(to_bf16_bits(mine.reshape(-1)),
-                                      to_bf16_bits(mxs.reshape(-1))):
-                    bad = int((to_bf16_bits(mine.reshape(-1)) != to_bf16_bits(mxs.reshape(-1))).sum())
+                mine = decode_affine(words, s_bits, b_bits, bits, pair)
+                mxs = quantizer.dequantize(words, s_bits, b_bits, bits, pair)
+                if not np.array_equal(to_pair_bits(mine.reshape(-1), pair),
+                                      to_pair_bits(mxs.reshape(-1), pair)):
+                    bad = int((to_pair_bits(mine.reshape(-1), pair)
+                               != to_pair_bits(mxs.reshape(-1), pair)).sum())
                     raise Refusal(EXIT_REFUSED,
-                                  f"{name}: the f32 decode rounded once to bf16 differs from "
-                                  f"mx.dequantize at {bad} of {mine.size} values")
-                s = np.abs(np.repeat(bf16_bits_to_f32(s_bits), GROUP, axis=-1).reshape(-1))
+                                  f"{name}: the f32 decode rounded once to {PAIRS[pair]} differs "
+                                  f"from mx.dequantize at {bad} of {mine.size} values")
+                s = np.abs(np.repeat(pair_bits_to_f32(s_bits, pair), GROUP, axis=-1).reshape(-1))
                 err = np.abs(mxs.reshape(-1) - want.reshape(-1))
                 # mx's affine fit is an optimizer, not a min-max range: a group's
                 # extremes can sit past the top code by its choice (measured worst
                 # 1.047·scale over this fixture, mlx 0.32.1), and a group whose scale
-                # is far below its values' magnitude keeps only the bf16 grid (two
-                # ulps of |w|: the input cast and the reconstructed bias).
-                bound = (np.abs(want.reshape(-1)) * np.float32(2.0 ** -7)
-                         + s * np.float32(1.25))
+                # is far below its values' magnitude keeps only the pair's grid (two
+                # ulps of |w|: the input cast and the reconstructed bias — a measured
+                # 2^-7 term at bf16, the derived 2^-10 one at f16, whose ulp is 2^-11
+                # of |w|).
+                ulp = np.float32(2.0 ** -7 if pair == "bf16" else 2.0 ** -10)
+                bound = (np.abs(want.reshape(-1)) * ulp + s * np.float32(1.25))
                 if not np.all(err <= bound):
                     raise Refusal(EXIT_REFUSED,
                                   f"{name}: |err| past the quantizer's band (worst err/bound "
@@ -722,7 +758,7 @@ def check(out, fixture, quantizer, quiet=False):
         shard.close()
     gguf.close()
     print(f"check: {checked} tensors; every quantized value within the quantizer's band and "
-          "the f32 decode = mx.dequantize's bf16 bit for bit")
+          "the f32 decode = mx.dequantize's pair values bit for bit")
     for key in sorted(worst):
         err, ratio, n = worst[key]
         print(f"  {key}: {n} tensors, worst |err| {err:.6g}, worst err/scale {ratio:.4f}")
@@ -785,6 +821,23 @@ def self_test():
     for i, want in ((0, 0xbeb40000), (1, 0xc0070000), (3, 0xbfe10000)):
         expect(f"affine value {i}", int(got.reshape(-1)[i].view(np.uint32)) == want,
               f"{got.reshape(-1)[i]}")
+
+    # The F16 pair of the same rule: 1.0 is 0x3C00, a value between f16 grid points
+    # rounds to the nearer, and the widen is the identity on grid values.
+    expect("f16 one", int(to_pair_bits(np.array([1.0], dtype=np.float32), "f16")[0]) == 0x3C00)
+    near = np.array([1.0 + 2.0 ** -12], dtype=np.float32)
+    expect("f16 rounds to the grid",
+           int(to_pair_bits(near, "f16")[0]) == 0x3C00)
+    back = pair_bits_to_f32(np.array([[0x3C00]], dtype=np.uint16), "f16")
+    expect("f16 widens", float(back[0, 0]) == 1.0, f"{back[0, 0]}")
+    words16 = np.array([[0x00000002, 0, 0, 0, 0, 0, 0, 0]], dtype=np.uint32)
+    s16 = np.array([[0x3C00]], dtype=np.uint16)
+    b16 = np.array([[0xB400]], dtype=np.uint16)  # -0.25
+    got16 = decode_affine(words16, s16, b16, 4, "f16")
+    expect("affine f16 value 0", float(got16.reshape(-1)[0]) == 1.75,
+           f"{got16.reshape(-1)[0]}")
+    expect("affine f16 value 1", float(got16.reshape(-1)[1]) == -0.25,
+           f"{got16.reshape(-1)[1]}")
 
     # make + check over a tiny synthetic fixture with the stub quantizer: two layers
     # (linear, full), every transform exercised, integers only (error 0).
@@ -950,6 +1003,20 @@ def self_test():
         moved = grouped(np.arange(32, dtype=np.float32), [1, 32], "all", 0).reshape(-1)
         expect("grouped by hand", list(moved[:4]) == [0.0, 16.0, 1.0, 17.0], str(moved[:4]))
         check(out, fixture, StubQuantizer(), quiet=True)
+        # the same tiny fixture at F16 pairs: companions stored F16, the decode and
+        # the error band read the pair back, and the whole check passes the same way
+        out16 = os.path.join(tmp, "out16")
+        make(fixture, out16, config_path, StubQuantizer(), quiet=True, pair="f16")
+        with open(os.path.join(out16, "model.safetensors.index.json")) as fh:
+            wm16 = json.load(fh)["weight_map"]
+        stem16 = f"{P}layers.1.self_attn.q_proj"
+        rd16 = ShardReader(os.path.join(out16, wm16[f"{stem16}.weight"]))
+        s_dty, _s_shape, _s_blob = rd16.read(f"{stem16}.scales")
+        b_dty, _b_shape, _b_blob = rd16.read(f"{stem16}.biases")
+        expect("f16 companions", s_dty == "F16" and b_dty == "F16", f"{s_dty}/{b_dty}")
+        rd16.close()
+        check(out16, fixture, StubQuantizer(), quiet=True)
+        shutil.rmtree(out16)
         # an index that drops a tensor (here every one) is refused before any tensor is read
         index = os.path.join(out, "model.safetensors.index.json")
         with open(index) as fh:
@@ -1053,7 +1120,7 @@ def main(argv):
     if argv[0:1] == ["--self-test"]:
         self_test()
         return 0
-    if len(argv) >= 2 and argv[0] == "make" and len(argv) == 5 and argv[3] == "--config":
+    if (argv[0:1] == ["make"] and len(argv) == 5 and argv[3] == "--config"):
         fixture, out, config_path = argv[1], argv[2], argv[4]
         for p in (fixture, config_path):
             if not os.path.isfile(p):
@@ -1062,6 +1129,18 @@ def main(argv):
         quantizer = MlxQuantizer()
         layers = make(fixture, out, config_path, quantizer)
         print(f"made {out}: layers {[k for _, k in layers]}")
+        check(out, fixture, quantizer)
+        return 0
+    if (argv[0:1] == ["make"] and len(argv) == 6 and argv[3] == "--config"
+            and argv[5] == "--f16"):
+        fixture, out, config_path = argv[1], argv[2], argv[4]
+        for p in (fixture, config_path):
+            if not os.path.isfile(p):
+                print(f"mlx-fixture: {p}: no such file", file=sys.stderr)
+                return EXIT_MISSING
+        quantizer = MlxQuantizer()
+        layers = make(fixture, out, config_path, quantizer, pair="f16")
+        print(f"made {out} (f16 pairs): layers {[k for _, k in layers]}")
         check(out, fixture, quantizer)
         return 0
     if len(argv) == 3 and argv[0] == "check":

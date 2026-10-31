@@ -35,7 +35,9 @@
 // The same map was the dense mat-vec's, the pair's and the fold's since each
 // landed; this file is those copies folded into one. A4's map is ours, on
 // the same idiom (the nibble trick above), over MLX's group layout; A8's is
-// A4's over its one-byte codes.
+// A4's over its one-byte codes. A4 and A8 each have one decode rule over
+// the storage of a group's scale and bias (`AffineBf16`, `AffineF16`): A4 and
+// A8 are the rule over BF16 bits, A4H and A8H the same rule over F16 bits.
 //
 // This file comes after norm.metal and before every kernel file that reads
 // quantized weights; it defines what they use of it (QK_K, FOR_UNROLL and
@@ -68,24 +70,25 @@ struct block_q6_K {
 
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K is 210 bytes");
 
-// MLX's affine 4-bit group (crates/gguf's MLX_A4): 64 values, 36 bytes —
-// eight u32 words of codes, then a BF16 scale and a BF16 bias. Value 8w + j
-// is the 4 bits at bit 4j of word w, the low nibble first.
+// MLX's affine 4-bit group (crates/gguf's MLX_A4 and MLX_A4H): 64 values, 36
+// bytes — eight u32 words of codes, then a scale and a bias, BF16 bits in
+// MLX_A4 and F16 bits in MLX_A4H. Value 8w + j is the 4 bits at bit 4j of
+// word w, the low nibble first.
 struct block_mlx_a4 {
     uint32_t qs[8];
-    uint16_t scale;  // BF16 bits
-    uint16_t bias;   // BF16 bits
+    uint16_t scale;  // BF16 or F16 bits, as the type stores them
+    uint16_t bias;   // BF16 or F16 bits, as the type stores them
 };
 
 static_assert(sizeof(block_mlx_a4) == 36, "block_mlx_a4 is 36 bytes");
 
-// MLX's affine 8-bit group (crates/gguf's MLX_A8): 64 values, 68 bytes —
-// sixteen u32 words of one-byte codes, then a BF16 scale and a BF16 bias.
-// Value 4w + j is byte j of word w.
+// MLX's affine 8-bit group (crates/gguf's MLX_A8 and MLX_A8H): 64 values, 68
+// bytes — sixteen u32 words of one-byte codes, then a scale and a bias, BF16
+// bits in MLX_A8 and F16 bits in MLX_A8H. Value 4w + j is byte j of word w.
 struct block_mlx_a8 {
     uint32_t qs[16];
-    uint16_t scale;  // BF16 bits
-    uint16_t bias;   // BF16 bits
+    uint16_t scale;  // BF16 or F16 bits, as the type stores them
+    uint16_t bias;   // BF16 or F16 bits, as the type stores them
 };
 
 static_assert(sizeof(block_mlx_a8) == 68, "block_mlx_a8 is 68 bytes");
@@ -539,6 +542,39 @@ struct Q6K {
     }
 };
 
+// How an affine group stores its scale and bias, the one place the pair is
+// widened to f32: both BF16 bits (MLX_A4, MLX_A8) or both F16 bits (MLX_A4H,
+// MLX_A8H). Either widens exactly. `widen` takes one 16-bit field; the
+// `_of_word` forms take the 32-bit word the pair is read as (the scale in the
+// low half, the bias in the high half, little-endian).
+struct AffineBf16 {
+    static inline float widen(uint bits) {
+        return as_type<float>(bits << 16);
+    }
+
+    static inline float scale_of_word(uint32_t sb) {
+        return as_type<float>(sb << 16);
+    }
+
+    static inline float bias_of_word(uint32_t sb) {
+        return as_type<float>(sb & 0xFFFF0000u);
+    }
+};
+
+struct AffineF16 {
+    static inline float widen(uint bits) {
+        return float(as_type<half>((ushort)bits));
+    }
+
+    static inline float scale_of_word(uint32_t sb) {
+        return float(as_type<half2>(sb).x);
+    }
+
+    static inline float bias_of_word(uint32_t sb) {
+        return float(as_type<half2>(sb).y);
+    }
+};
+
 // MLX's affine 4-bit decode owner (block_mlx_a4, above): one 64-value group
 // is one block, so a block count a body reads is a group count and the lane
 // map splits one group across four lanes — a SIMD group's 32 lanes cover
@@ -549,7 +585,10 @@ struct Q6K {
 // whole accumulator folds once into an exact power of two. MLX's own
 // `affine_qmv_fast` (quantized.h) is the design reference for the bias fold;
 // its four-rows-a-thread x reuse is this engine's SIMD-group row loop instead.
-struct A4 {
+// The rule is a template over how the group's pair is stored (`Pair`): A4 is
+// it over BF16 bits and A4H over F16 bits.
+template <typename Pair>
+struct A4T {
     typedef block_mlx_a4 Block;
 
     // The lane's map and registers: ix picks the lane's groups (eight apart),
@@ -632,21 +671,21 @@ struct A4 {
         return isfinite(lane.sumy);
     }
 
-    // The group's BF16 pair, widened by the shift: exact.
+    // The group's pair, widened as `Pair` stores it: exact.
     static inline float scale_of(device const Block & blk) {
-        return as_type<float>((uint)blk.scale << 16);
+        return Pair::widen(blk.scale);
     }
 
     static inline float bias_of(device const Block & blk) {
-        return as_type<float>((uint)blk.bias << 16);
+        return Pair::widen(blk.bias);
     }
 
     // One group's contribution. The scale multiplies the code dot and the
     // bias the lane's input sum, as MLX's `qdot` folds its bias and Q4_K its
     // dmin term. The lane's two code words and the scale-and-bias pair (the
-    // two BF16s sit at byte 32, scale in the low half) are read as 32-bit
-    // words, the same bits as 16-bit reads in fewer, wider loads; a launch
-    // checks that the weights start on a 4-byte boundary.
+    // two 16-bit fields sit at byte 32, scale in the low half) are read as
+    // 32-bit words, the same bits as 16-bit reads in fewer, wider loads; a
+    // launch checks that the weights start on a 4-byte boundary.
     static inline float partial(device const Block & blk,
                                 const thread Lane & lane) {
         device const uint32_t * q = blk.qs + 2 * lane.iq;
@@ -661,9 +700,9 @@ struct A4 {
             acc[2] += lane.yl[4 * m + 2] * (words[m] & 0x0F00);
             acc[3] += lane.yl[4 * m + 3] * (words[m] & 0xF000);
         }
-        return as_type<float>(sb << 16) * ((acc[0] + 1.f/16.f * acc[1]) +
-                                           (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))
-             + as_type<float>(sb & 0xFFFF0000u) * lane.sumy;
+        return Pair::scale_of_word(sb) * ((acc[0] + 1.f/16.f * acc[1]) +
+                                          (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))
+             + Pair::bias_of_word(sb) * lane.sumy;
     }
 
     // A 64-value group sits whole inside one 128-column value head, so the
@@ -707,8 +746,9 @@ struct A4 {
     // instructions. A 16-bit code word holds four values; value t of it is
     // its nibble t masked in place, q·16^t (exact as a float), times the
     // scale over 16^t (exact: a power of two), plus the bias in one fma.
-    // The product q·s is exact (a 4-bit code by a BF16's 8-bit mantissa), so
-    // the fma's one rounding is `value`'s add and the f32 sum is `value`'s;
+    // The product q·s is exact (a 4-bit code by a BF16's 8-bit or an F16's
+    // 11-bit significand), so the fma's one rounding is `value`'s add and the
+    // f32 sum is `value`'s;
     // it is rounded once into the operand type.
     template <typename T>
     static inline void dequant16(device const Block & blk,
@@ -730,6 +770,9 @@ struct A4 {
     }
 };
 
+typedef A4T<AffineBf16> A4;
+typedef A4T<AffineF16> A4H;
+
 // MLX's affine 8-bit decode owner (block_mlx_a8, above): A4's lane map and
 // registers over the one-byte codes — a block is one 64-value group, the
 // lane's quarter of it four code words, its sixteen values the words' bytes
@@ -740,20 +783,22 @@ struct A4 {
 // as bytes, `scale * accum + sum * bias`). The registers, the load, the group
 // sums, the head scales and the fold counts are A4's own: the affine
 // layout's, not the code width's.
-struct A8 {
+template <typename Pair>
+struct A8T {
     typedef block_mlx_a8 Block;
-    typedef A4::Lane Lane;
+    typedef A4T<Pair> Base;
+    typedef typename Base::Lane Lane;
 
     static inline Lane lane_of(ushort tiisg) {
-        return A4::lane_of(tiisg);
+        return Base::lane_of(tiisg);
     }
 
     static inline int first_block(const thread Lane &lane) {
-        return A4::first_block(lane);
+        return Base::first_block(lane);
     }
 
     static inline int block_stride() {
-        return A4::block_stride();
+        return Base::block_stride();
     }
 
     static inline int values_per_block() {
@@ -762,7 +807,7 @@ struct A8 {
 
     // The lane's values' offset in a group: its quarter.
     static inline int input_offset(const thread Lane &lane) {
-        return A4::input_offset(lane);
+        return Base::input_offset(lane);
     }
 
     // The activations of one group, in the lane's registers: A4's load, the
@@ -775,28 +820,28 @@ struct A8 {
                             device const float * gain,
                             float scale,
                             thread float * sum_sq) {
-        A4::load<LOAD>(lane, block, gain, scale, sum_sq);
+        Base::template load<LOAD>(lane, block, gain, scale, sum_sq);
     }
 
     static inline bool sums_finite(const thread Lane &lane) {
-        return A4::sums_finite(lane);
+        return Base::sums_finite(lane);
     }
 
-    // The group's BF16 pair, widened by the shift: exact.
+    // The group's pair, widened as `Pair` stores it: exact.
     static inline float scale_of(device const Block & blk) {
-        return as_type<float>((uint)blk.scale << 16);
+        return Pair::widen(blk.scale);
     }
 
     static inline float bias_of(device const Block & blk) {
-        return as_type<float>((uint)blk.bias << 16);
+        return Pair::widen(blk.bias);
     }
 
     // One group's contribution. The scale multiplies the code dot and the
     // bias the lane's input sum, as A4's and MLX's `qdot` fold theirs. The
-    // lane's four code words and the scale-and-bias pair (the two BF16s sit
-    // at byte 64, scale in the low half) are read as 32-bit words, the codes
-    // unpacked as uchar4 vector casts into float4; a launch checks that the
-    // weights start on a 4-byte boundary.
+    // lane's four code words and the scale-and-bias pair (the two 16-bit
+    // fields sit at byte 64, scale in the low half) are read as 32-bit words,
+    // the codes unpacked as uchar4 vector casts into float4; a launch checks
+    // that the weights start on a 4-byte boundary.
     static inline float partial(device const Block & blk,
                                 const thread Lane & lane) {
         device const uint32_t * q = blk.qs + 4 * lane.iq;
@@ -810,8 +855,8 @@ struct A8 {
             acc[3] += lane.yl[4 * m + 3] * codes[3];
         }
         const float code_dot = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-        const float s = as_type<float>(sb << 16);
-        const float b = as_type<float>(sb & 0xFFFF0000u);
+        const float s = Pair::scale_of_word(sb);
+        const float b = Pair::bias_of_word(sb);
         return s * code_dot + b * lane.sumy;
     }
 
@@ -826,21 +871,21 @@ struct A8 {
     }
 
     static inline float2 head_scales(threadgroup const float * scales, int ib) {
-        return A4::head_scales(scales, ib);
+        return Base::head_scales(scales, ib);
     }
 
     static inline int fold_blocks() {
-        return A4::fold_blocks();
+        return Base::fold_blocks();
     }
 
     static inline int fold_slot(int ib) {
-        return A4::fold_slot(ib);
+        return Base::fold_slot(ib);
     }
 
     // Value `j` of a group, the host reader's decode: `s·q + b`, the product
-    // exact (an 8-bit code by a BF16's 8-bit significand) and the sum rounded
-    // once, the bits the embed's clause holds it to. The code is the group's
-    // byte `j`.
+    // exact (an 8-bit code by a BF16's 8-bit or an F16's 11-bit significand)
+    // and the sum rounded once, the bits the embed's clause holds it to. The
+    // code is the group's byte `j`.
     static inline float value(device const Block & blk, uint j) {
         device const uint8_t * q = (device const uint8_t *)blk.qs;
         return scale_of(blk) * float(q[j]) + bias_of(blk);
@@ -866,6 +911,9 @@ struct A8 {
         }
     }
 };
+
+typedef A8T<AffineBf16> A8;
+typedef A8T<AffineF16> A8H;
 
 // GGUF's Q8_0 decode owner (block_q8_0, above): a 32-value block of signed
 // bytes under one f16 scale, `y = q·d`. The lane map is llama.cpp's
