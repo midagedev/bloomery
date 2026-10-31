@@ -458,6 +458,8 @@ const TEXT_35: &Fields = &[
 /// `text_config.rope_parameters`: interleaved M-RoPE (`RopeMode::Imrope`), unscaled.
 const ROPE: &Fields = &[
     ("rope_type", Only(r#"["default"]"#)),
+    // The older spelling of `rope_type`, which some exported folders write beside it or alone.
+    ("type", Only(r#"["default"]"#)),
     ("mrope_interleaved", Need("[true]")),
     ("mrope_section", Read),
     ("rope_theta", Read),
@@ -2683,6 +2685,7 @@ mod tests {
             ["/text_config", "mtp_num_hidden_layers", 1, "x", "mtp_num_hidden_layers"],
             ["/text_config", "mtp_use_dedicated_embeddings", false, "x", "mtp_use_dedicated_embeddings"],
             ["/text_config/rope_parameters", "rope_type", "default", "yarn", "rope_type"],
+            ["/text_config/rope_parameters", "type", "default", "yarn", "type"],
             ["/text_config/rope_parameters", "mrope_interleaved", true, false, "mrope_interleaved"],
             ["/text_config/rope_parameters", "mrope_section", [11, 11, 10], [11, 11, 9], "mrope_section"],
             ["/text_config/rope_parameters", "rope_theta", 1e6, 1e300, "rope_theta"],
