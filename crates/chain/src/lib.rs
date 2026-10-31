@@ -26,6 +26,7 @@ pub mod linear;
 pub mod out_gate;
 pub mod residual;
 pub mod rope;
+pub mod router;
 pub mod shortconv;
 pub mod site;
 

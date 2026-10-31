@@ -445,7 +445,6 @@ mod cli {
     use app::{Session, SessionError};
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
     use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS_MAX};
-    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
     use bloomery_gpu::arch::qwen3moe::{
         Body, Body35, Body38, KvQ8, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
@@ -457,6 +456,7 @@ mod cli {
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
+    use bloomery_gpu::route_softmax::MAX_TOKENS;
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
 
     use bloomery_gpu_gates::generate::{

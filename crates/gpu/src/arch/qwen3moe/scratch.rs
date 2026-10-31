@@ -17,7 +17,6 @@
 use super::body::KvQ8;
 use super::image::MediaRows;
 use super::plan::Flash;
-use super::router::{MAX_TOKENS, RouterDims, RouterOut};
 use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::checkpoint::saved::{Plane, Spans};
@@ -29,6 +28,7 @@ use crate::flash_gqa::{
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, QueryNorm};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
+use crate::route_softmax::{MAX_TOKENS, RouterDims, RouterOut};
 use crate::site::WideForms;
 use chain::arch::qwen3moe::router::ubatch_at;
 

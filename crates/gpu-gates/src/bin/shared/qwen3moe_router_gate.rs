@@ -87,9 +87,9 @@
 //! is refused by name (`enqueue_fused`'s shape error, one launch routes at
 //! most eight) before any launch.
 
-use bloomery_gpu::arch::qwen3moe::router::{MAX_TOKENS, ROW, RouterDims, RouterKernels, RouterOut};
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
+use bloomery_gpu::route_softmax::{MAX_TOKENS, ROW, RouterDims, RouterKernels, RouterOut};
 use bloomery_gpu::{
     DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, Window,
 };
@@ -1159,7 +1159,7 @@ fn fault_section(
     let named = matches!(
         r,
         Err(GpuError::Shape {
-            what: "qwen3moe::router::enqueue_fused",
+            what: "route_softmax::enqueue_fused",
             ..
         })
     );
