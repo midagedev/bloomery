@@ -1,5 +1,5 @@
 # The Mistral Large 4 real file's CPU node dumps (UD-IQ1_S, 223 GB in six shards,
-# /home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S), `just dump-ref-mistrallarge4`: the two prompts (18 and 42 ids) from
+# /models/Mistral-Large-4-1T-A52B-UD-IQ1_S), `just dump-ref-mistrallarge4`: the two prompts (18 and 42 ids) from
 # ONE load, into ref_mistrallarge4_{a,b}. The phases run one after the other.
 # Predicted wall [derived], seconds:
 #   load      223 GB mmapped; the routed experts a run touches (4 of 128 a token and layer, so ~90 of 128 over 60 ids and 64

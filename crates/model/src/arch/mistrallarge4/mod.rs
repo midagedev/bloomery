@@ -14,7 +14,9 @@
 //! (`spec`), and the load-time row moves the indexer tensors need (`rows`,
 //! the family's one model-only fact). No program runs the architecture yet;
 //! the dialect's authority is llama.cpp's `src/models/mistral-large4.cpp`.
+//! The gate fixture's spec is `fixture`.
 
+pub mod fixture;
 pub mod hparams;
 pub mod names;
 pub mod roles;

@@ -305,6 +305,7 @@ mod tests {
             ("fx-ik-qwen35moe", 3),
             ("fx-ik-deepseek41", 4),
             ("fx-ref-nemotron-moe-logits", 1),
+            ("fx-lcpp-mistrallarge4", 2),
         ];
         let mut found: Vec<&str> = all()
             .filter(|f| f.name.starts_with("fx-") && !STANDALONE.contains(&f.name))
