@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use app::arch::{Batch, HybridCfg, SequenceSlots};
 use app::{Loaded, OpenArgs, OpenLog, Prompt, Session, SessionError};
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
@@ -40,7 +42,7 @@ use super::tiered::{self, Open, Tiered};
 pub trait Family: Sized + 'static {
     /// The body the seat serves: one chain on one card, fed in prompt
     /// batches.
-    type Body: Batch<Inputs = PlanInputs<Self::H>>;
+    type Body: Batch<Inputs = PlanInputs<Self::H>> + TierBody<Experts = HostRun>;
 
     /// The family's hyperparameters: what its plan inputs are read for.
     type H;
@@ -187,6 +189,7 @@ impl<F: Family> Log<F> {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(m, total, self.opened);
+        record::eprint_nvtier(m.body(F::NAME).ok().and_then(|b| b.hybrid().nvme_tier()));
     }
 }
 
@@ -258,7 +261,9 @@ impl<F: Family> Seat for Hybrid<F> {
     /// The prompt in batches (`app::Prompt for Body`), the argmax after the
     /// last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        Ok(<F::Body as Prompt>::prompt(self.s.model_mut(), ids)?)
+        let next = <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?;
+        record::eprint_nvtier(self.s.model().body(F::NAME)?.hybrid().nvme_tier());
+        Ok(next)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {

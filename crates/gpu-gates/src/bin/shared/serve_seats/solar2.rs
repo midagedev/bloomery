@@ -55,11 +55,10 @@
 //! trained context stops by name, and one the machine cannot hold stops with
 //! the largest it would hold. Unset, the slot asks the trained context, or the
 //! largest context under it whose plan holds where the card cannot hold the
-//! stores and resident bytes, or where the host cannot hold the routed
-//! experts the card then leaves it: the plan reads the host room
-//! (`BLOOMERY_HOST_ROOM` replaces the reading) and the body serves no NVMe
-//! expert tier (`PlaceError::NoNvmeTier`), so a shorter context, which keeps
-//! more experts on the card, is what that refusal asks for.
+//! stores and resident bytes. The plan reads the host room
+//! (`BLOOMERY_HOST_ROOM` replaces the reading) and pages the routed experts
+//! the room cannot hold on the NVMe expert tier, which the body's host run
+//! serves; a room under that tier's floor is refused by name.
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
 //! line (`placement::ctx_ask::Chosen::line`), the `residency lever` record
@@ -68,8 +67,10 @@
 //! (`rule=slots slots=1 slot_ctx=C total=C from=<word> pass=one`); then the
 //! `load` record (architecture, resident bytes, the
 //! slot's context, layers, the routed experts the plan keeps on the host and
-//! on the card, the step graph's nodes, the prompt group and the load's wall)
-//! and, once the port is bound, the `listening` record
+//! on the card, the step graph's nodes, the prompt group and the load's wall),
+//! the `nvtier` record (on a load whose plan paged routed experts: the arena's
+//! budget, the paged bytes and its counters, again after each prompt call) and,
+//! once the port is bound, the `listening` record
 //! (`record::BLOOMERY_SERVE_SOLAR2`). `--plan` ends the process after the
 //! `parallel` line, nothing loaded. An engine error ends the process with the
 //! crash block and exit code 70, as every seat's.

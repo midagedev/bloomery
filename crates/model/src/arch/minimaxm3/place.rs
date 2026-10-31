@@ -196,7 +196,9 @@ impl PlanInputs {
     /// The file as it is, for a gate that plans or describes it whatever the coverage list holds,
     /// and the host's room and the arena's given bytes. The prompt batch's buffers are the plan's
     /// reserve beside its terms ([`prompt_reserve_bytes`], and [`tier_places_bytes`] on a machine
-    /// that names a tier card); the step's come out of its scratch term.
+    /// that names a tier card); the step's come out of its scratch term. The body's host run is
+    /// the common one, so the plan pages the host experts the room cannot hold
+    /// ([`PlanInputs::with_nvme_tier`]).
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
@@ -206,7 +208,8 @@ impl PlanInputs {
         let tier = tier_places_bytes(PROMPT_ROWS, hp.experts.n_used);
         Ok(PlanInputs::new(ENGINE, hp, model, spec)?
             .with_prompt_reserve(reserve)
-            .with_tier_reserve(tier))
+            .with_tier_reserve(tier)
+            .with_nvme_tier())
     }
 }
 

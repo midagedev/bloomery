@@ -156,7 +156,8 @@ impl PlanInputs {
     }
 
     /// The file as it is, for a gate that plans or describes it whatever the coverage list holds,
-    /// and the host's room and the arena's given bytes.
+    /// and the host's room and the arena's given bytes. The body's host run is the common one, so
+    /// the plan pages the host experts the room cannot hold ([`PlanInputs::with_nvme_tier`]).
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
@@ -166,7 +167,8 @@ impl PlanInputs {
         let tier = tier_places_bytes(PROMPT_ROWS, hp.experts.n_used);
         Ok(PlanInputs::new(ENGINE, hp, model, spec)?
             .with_prompt_reserve(reserve)
-            .with_tier_reserve(tier))
+            .with_tier_reserve(tier)
+            .with_nvme_tier())
     }
 }
 
@@ -219,8 +221,13 @@ mod tests {
         ));
     }
 
+    /// A unified pool one byte under the card's bytes and the host need pages the routed experts
+    /// the room cannot hold on the NVMe tier, which the body's common host run serves.
+    /// FAIL-first: the plan was refused by name (`PlaceError::NoNvmeTier`).
     #[test]
-    fn unified_room_still_refuses_an_unserved_nvme_tier() {
+    fn a_unified_room_pages_what_it_cannot_hold() {
+        // PIN(2026-11-01): a unified room short of the routed experts is no longer refused
+        // (`PlaceError::NoNvmeTier`): the body's common host run serves the NVMe tier.
         use crate::placement::{Role, UnifiedPool};
         let mut inputs = described("so2-place-pool-room");
         for tensor in &mut inputs.model.tensors {
@@ -239,6 +246,7 @@ mod tests {
         let whole = inputs
             .plan(&machine, 64, &levers)
             .expect("the ample host fits");
+        let held = whole.host.expert_bytes;
         let pool = whole.cards[0].bytes()
             + inputs.prompt_reserve
             + workstation::HostNeed::of(&whole, 0).bytes()
@@ -246,10 +254,14 @@ mod tests {
         machine.host_mut().usable_bytes = pool;
         machine.host_mut().reserves.clear();
         *machine.unified_mut() = Some(UnifiedPool { bytes: pool });
-        match inputs.plan(&machine, 64, &levers) {
-            Err(PlaceError::NoNvmeTier { paged, .. }) => assert!(paged > 0),
-            other => panic!("the unserved tier must be refused by name: {other:?}"),
-        }
+        let plan = inputs
+            .plan(&machine, 64, &levers)
+            .unwrap_or_else(|e| panic!("the paged plan is refused: {e}"));
+        assert!(
+            plan.host.nvme_expert_bytes > 0,
+            "a room under the need pages none"
+        );
+        assert_eq!(plan.host.expert_bytes + plan.host.nvme_expert_bytes, held);
     }
 
     /// A machine that names an expert tier card is planned, the stage card keeping the tier's
