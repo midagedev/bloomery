@@ -925,9 +925,7 @@ fn post_processor<'a>(
     }
     if let Some(tokens) = template.get("special_tokens").filter(|v| !v.is_null()) {
         let tokens = tokens.as_object().ok_or_else(|| {
-            bad(format!(
-                "tokenizer.json.post_processor special_tokens is not an object"
-            ))
+            bad("tokenizer.json.post_processor special_tokens is not an object".into())
         })?;
         for (name, entry) in tokens {
             let id = by_name.get(name.as_str()).copied().ok_or_else(|| {
