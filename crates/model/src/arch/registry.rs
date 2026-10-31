@@ -24,7 +24,7 @@ use super::{
 use crate::placement::PlacementError;
 
 /// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
-pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 9] = [
+pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 10] = [
     deepseek41::fixture::spec,
     qwen3moe::fixture::spec,
     qwen35moe::fixture::spec,
@@ -34,6 +34,7 @@ pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 9] = [
     nemotron_h::fixture::spec,
     nemotron_h_moe::fixture::spec,
     musespark::fixture::spec,
+    mistrallarge4::fixture::spec,
 ];
 
 /// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
@@ -375,9 +376,13 @@ pub static ROWS: &[ArchRow] = &[
         names: &["mistral-large4"],
         read: Some(mistrallarge4::spec::read),
         draft: None,
-        // No fixture of its own yet: the requantized mini of real layers is a
-        // later round's, and the meta gate reads the checked-in header tables.
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "mistrallarge4",
+            repo: "unsloth/Mistral-Large-4-1T-A52B-GGUF",
+            quant: "UD-IQ1_S",
+            rev: None,
+            draft: DraftSource::None,
+        })),
     },
 ];
 
@@ -560,7 +565,8 @@ mod tests {
                 "solar-open2",
                 "nemotron_h",
                 "nemotron_h_moe",
-                "muse-spark"
+                "muse-spark",
+                "mistral-large4"
             ]
         );
         assert_eq!(archs_of(false), ["minimax-m3"]);

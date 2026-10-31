@@ -21,6 +21,7 @@
 use gguf::Split;
 
 use super::names;
+use crate::arch::classify::ROPE_FREQS;
 use crate::arch::{
     expert_counts, finite_positive, meta_arr, meta_bool, meta_str, meta_u64, metadata, n_vocab,
     one_expert_group, optional_f32, optional_usize, per_layer_bool, positive, tensors_agree,
@@ -374,11 +375,11 @@ impl Hparams {
                 0.0
             }
         };
-        if softcap < 0.0 {
+        if !softcap.is_finite() || softcap < 0.0 {
             return Err(metadata(
                 split,
                 "final_logit_softcapping",
-                format!("is {softcap}, not a nonnegative bound"),
+                format!("is {softcap}, not a finite nonnegative bound"),
             ));
         }
         let hp = Hparams {
@@ -437,10 +438,7 @@ impl Hparams {
                 vec![self.n_embd as u64, self.n_vocab as u64],
             ),
             (names::output_norm(), vec![self.n_embd as u64]),
-            (
-                "rope_freqs.weight".to_string(),
-                vec![self.rope_dims as u64 / 2],
-            ),
+            (ROPE_FREQS.to_string(), vec![self.rope_dims as u64 / 2]),
         ];
         for l in 0..self.n_layer {
             want.extend(
@@ -454,7 +452,7 @@ impl Hparams {
 
     /// The dims the keys give layer `l`, ggml order: the layer's own kind
     /// decides which stems it carries.
-    fn want(&self, l: usize) -> Vec<(&'static str, Vec<u64>)> {
+    pub(crate) fn want(&self, l: usize) -> Vec<(&'static str, Vec<u64>)> {
         let e = self.n_embd as u64;
         let h = self.n_head as u64;
         // The unrotated part of a head grows by the rope width a NoPE layer
