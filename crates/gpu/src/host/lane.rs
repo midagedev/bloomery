@@ -339,10 +339,11 @@ impl Ring {
         // and the thread holding the slot's job is its only host writer (job
         // n + RING_SLOTS writes the slot only once job n's copy has drained
         // it), so this is the span's one reference while it lives. The word's
-        // Release store follows these stores in program order, which x86
-        // (TSO) keeps in the coherent write-back pinned page, and the copy
-        // engine reads the page over PCIe with no SM cache between: the copy
-        // the word lets through reads these bytes.
+        // Release store follows these stores in program order and orders them
+        // before it in the coherent write-back pinned page (x86's TSO, an
+        // aarch64 release store alike), and the copy engine reads the page
+        // over the card's link with no SM cache between: the copy the word
+        // lets through reads these bytes.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.page.host_at(off), len) };
         piece.transform.apply(piece.bytes, dst)
     }
