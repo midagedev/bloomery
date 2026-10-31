@@ -1641,13 +1641,14 @@ def src_site_names(site, qtype):
     lo, hi = site.one_body("entry")
     entry = {}
     for pat, (a, b) in site.match_arms(lo, hi, r"\bmatch\s+self\b"):
-        p = re.fullmatch(r"\s*SiteTy::(\w+)\s*", site.m[pat[0]:pat[1]])
+        p = re.fullmatch(r"\s*SiteTy::\w+(?:\s*\|\s*SiteTy::\w+)*\s*", site.m[pat[0]:pat[1]])
         arm = site.m[a:b].strip()
         v = re.fullmatch(r"Some\(\s*SiteEntry::(\w+)\s*\)", arm)
         if not p or not (v or arm == "None"):
             raise site.err(a, f"an entry arm this tool cannot read: {arm!r}")
         if v:
-            entry[p.group(1)] = v.group(1)
+            for ty in re.findall(r"SiteTy::(\w+)", p.group(0)):
+                entry[ty] = v.group(1)
     dense = {}
     for row in re.finditer(r"\bQRow\s*\{\s*ty:\s*T::(\w+)\s*,", qtype.m):
         hi = qtype.close(qtype.m.index("{", row.start()))
