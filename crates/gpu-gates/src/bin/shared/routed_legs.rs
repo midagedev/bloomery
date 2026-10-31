@@ -1508,6 +1508,10 @@ fn refused_of(p: &PlacementError) -> Outcome {
         // free reading (a BF16 set on the gate machine): the planner's own
         // named refusal of the card, not a defect.
         PlacementError::CardFreeFloor(_) => ("card-free-floor", None),
+        // A census file whose routed stacks the card rule leaves on the host
+        // in a type or width no host kernel runs (a BF16 set): the planner's
+        // own named refusal of the file on this machine, not a defect.
+        PlacementError::NoHostKernel { .. } => ("no-host-kernel", None),
         _ => return Outcome::Red(p.to_string()),
     };
     Outcome::Refused(Refusal {
