@@ -123,7 +123,7 @@
 //!    launch whose counts are not consecutive (counts 4 and 13; counts 1, 9,
 //!    3 and 4, whose completing row is consecutive with the first), which
 //!    writes no pool of a row it reads; the raw key append
-//!    (`q38::qsa_key_append`) of positions 0 and 11 at ctx 12, which share
+//!    (`qsa::qsa_key_append`) of positions 0 and 11 at ctx 12, which share
 //!    ring slot 0, raises it too and writes row 0's key alone.
 //! 10. Selection (score and top-k): the query heads bit for bit the
 //!     transcription, each scored pool's score within its band of the f64
@@ -307,10 +307,9 @@ mod gate {
     };
     use bloomery_gpu::gated_quant::{GateLayout, GatedQuantKernels};
     use bloomery_gpu::gemm::GemmAct;
-    use bloomery_gpu::q38::{KeyAppendArgs, Q38Kernels};
     use bloomery_gpu::qsa::{
-        DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, POOL, PoolArgs, QsaKernels, QsaScratch,
-        RING_ROWS, ROT as IDX_ROT, SelectArgs, list_width, pools_for,
+        DIM as IDX_DIM, HEADS as IDX_HEADS, KeyAppendArgs, MAX_ROWS, POOL, PoolArgs, QsaKernels,
+        QsaScratch, RING_ROWS, ROT as IDX_ROT, SelectArgs, list_width, pools_for,
     };
     use bloomery_gpu::rope_neox::{
         PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, q8_plane_lens,
@@ -3519,7 +3518,6 @@ mod gate {
 
         // The key append of positions 0 and 11 at ctx 12: both map to ring
         // slot 0, so row 1, not position 0 + 1, writes nothing.
-        let q38 = Q38Kernels::load(gpu.context())?;
         let kr = DeviceBuffer::from_host(
             stream,
             &idx.raw[..2 * IDX_DIM]
@@ -3530,7 +3528,7 @@ mod gate {
         let pos = DeviceBuffer::from_host(stream, &[0u32, 11])?;
         let mut ring = DeviceBuffer::from_host(stream, &vec![NAN16; RING_ROWS * IDX_DIM])?;
         let before = gpu.fault()?;
-        q38.enqueue_key_append(
+        qk.enqueue_key_append(
             stream,
             KeyAppendArgs {
                 kr: &kr,

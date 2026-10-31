@@ -216,10 +216,10 @@ use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
 use crate::q38::{
-    CardSharedAddArgs, CardSumSharedAddArgs, CardTierAccArgs, EmbedIo, KeyAppendArgs, SLOTS,
-    SharedAddArgs, W_PITCH,
+    CardSharedAddArgs, CardSumSharedAddArgs, CardTierAccArgs, EmbedIo, SLOTS, SharedAddArgs,
+    W_PITCH,
 };
-use crate::qsa::{self, PoolArgs, SelectArgs};
+use crate::qsa::{self, KeyAppendArgs, PoolArgs, SelectArgs};
 use crate::site::{
     self, BY_NAME_COLS, ByName, Form, Gated, GatedIo, Out, SiteWeight, SwigluRows, WideIn,
     WideKernels,
@@ -2703,7 +2703,7 @@ fn qsa(
             pooled: &mut *pooled,
         },
     )?;
-    c.k.q38.enqueue_key_append(
+    c.k.qsa.enqueue_key_append(
         stream,
         KeyAppendArgs {
             kr: &q.kr,

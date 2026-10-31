@@ -2,14 +2,17 @@
 //! `GpuModel::step_slots`): every busy slot's rows in one walk over the
 //! pass arena. Each layer's row-wise launches — the norms, the projections,
 //! a delta layer's gated norm, an attention layer's gated quantizer, the
-//! router, the experts and the combine — run once over all `R` rows. The
-//! launches bound to one sequence run once per busy slot, over that slot's
-//! row window, its input record and its own stores: the embedding (its
-//! first position and its ids), a delta layer's conv over its conv ring and
-//! delta step over its state, and an attention layer's rope with
-//! the cache append and the flash's segment pass and merge over its K/V
-//! planes, the rope reading the slot's own rotation table (a media load's
-//! images shift one sequence's rows and no other's). Every slot's rows read
+//! router, the experts and the combine — run once over all `R` rows. A
+//! delta layer's conv over each slot's conv ring and delta step over its
+//! state run once over every slot's rows too, each slot's rows over its own
+//! store (`linear::seqs`). The other launches bound to one sequence run once
+//! per busy slot, over that slot's row window, its input record and its own
+//! stores: the embedding (its first position and its ids) and an attention
+//! layer's rope with the cache append and the flash's segment pass and merge
+//! over its K/V planes, the rope reading the slot's own rotation table (a
+//! media load's images shift one sequence's rows and no other's); a
+//! head-256 layer's rope and append on f16 planes run once over every
+//! slot's rows, each over its own planes and table. Every slot's rows read
 //! one lane word, `LANE`: each slot's recurrent stores are its own and hold
 //! one lane, so two slots never share
 //! a lane, and two ranges of one slot are refused before any body code runs
@@ -32,7 +35,7 @@
 //! ([`SlotRows::SETTLES_PARTIAL_KEEP`] stays false): keeping a part of them
 //! would need the state after a kept row, which no lane holds.
 
-use super::body::{ATTN_SCALE, ATTN_SCALE_256};
+use super::body::{ATTN_SCALE, ATTN_SCALE_256, KvQ8};
 use super::body35::{Body35, Slot35};
 use super::delta;
 use super::dispatch::{self, PassCtx};
@@ -48,13 +51,14 @@ use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::hybrid::Chain;
-use crate::linear::conv::{ConvArgs, ConvRows};
-use crate::linear::{self, delta::DeltaArgs, norm_gate::NormGateArgs};
+use crate::linear::seqs::{GdnSeq, GdnSeqsArgs};
+use crate::linear::{self, norm_gate::NormGateArgs};
 use crate::media::rope_table;
 use crate::model::lookup::f32_gain;
 use crate::model::slots::slot_twice;
 use crate::model::{MAX_PASS_ROWS, RowHeads, SlotRange, SlotRowOrder, SlotRows};
 use crate::q38::OutGateArgs;
+use crate::rope_neox::PartialNeoxSeqsArgs;
 use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
@@ -66,11 +70,10 @@ use std::ops::Range;
 /// What a pass of several slots' refusals name.
 const WHAT: &str = "qwen35moe slots";
 
-/// A delta layer's launches bound to one sequence: the conv over its ring
-/// and the delta step over its state.
-const DELTA_SEQ_LAUNCHES: usize = 2;
 /// An attention layer's launches bound to one sequence: the rope with the
-/// cache append, and the flash's segment pass and merge.
+/// cache append, and the flash's segment pass and merge. A head-256 layer's
+/// append on f16 planes runs once over every sequence's rows instead
+/// ([`seq_launches`]).
 const GQA_SEQ_LAUNCHES: usize = 3;
 
 impl SlotRows for Body35 {
@@ -255,7 +258,20 @@ impl Body35 {
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
         let rows = key.iter().map(|&(_, m)| m).sum();
-        self.pass_launches(rows) + key.len().saturating_sub(1) * seq_launches(&self.plans)
+        self.pass_launches(rows)
+            + key.len().saturating_sub(1) * seq_launches(&self.plans, self.kv_format())
+    }
+
+    /// The format the attention layers' planes hold: the load's one choice,
+    /// read back from the live planes (f16 on a load of none).
+    fn kv_format(&self) -> KvQ8 {
+        self.stores
+            .iter()
+            .find_map(|s| match s {
+                LayerStore::Kv(kv) => Some(kv.format()),
+                LayerStore::Rec(_) => None,
+            })
+            .unwrap_or_default()
     }
 
     /// Refused by name on a load that verifies drafted rows, whose delta
@@ -284,15 +300,21 @@ impl Body35 {
     }
 }
 
-/// The launches one more busy slot adds to a pass of `plans`: its
-/// embedding, each delta layer's [`DELTA_SEQ_LAUNCHES`] and each attention
-/// layer's [`GQA_SEQ_LAUNCHES`] — every launch that binds a sequence's
-/// stores or its input record.
-fn seq_launches(plans: &[LayerPlan]) -> usize {
+/// The launches one more busy slot adds to a pass of `plans` over planes of
+/// format `kv`: its embedding and each attention layer's
+/// [`GQA_SEQ_LAUNCHES`], less a head-256 layer's append on f16 planes —
+/// every launch that binds a sequence's stores or its input record and runs
+/// once a sequence. A delta layer's conv and step and a head-256 layer's
+/// append on f16 planes run once over every sequence's rows
+/// (`linear::seqs`, `KvPlanes::kv_seq`).
+fn seq_launches(plans: &[LayerPlan], kv: KvQ8) -> usize {
     1 + plans
         .iter()
-        .map(|p| match p.mixer {
-            MixerPlan::Delta(_) => DELTA_SEQ_LAUNCHES,
+        .map(|p| match &p.mixer {
+            MixerPlan::Delta(_) => 0,
+            MixerPlan::Gqa(n) if n.kind == GqaKind::Gated256 && kv == KvQ8::F16 => {
+                GQA_SEQ_LAUNCHES - 1
+            }
             MixerPlan::Gqa(_) => GQA_SEQ_LAUNCHES,
             MixerPlan::ShortConv(_) => {
                 panic!("qwen35moe::seq_launches: a short-conv layer, which `kinds35` refuses")
@@ -484,8 +506,9 @@ impl ChainOps for Slots35<'_, '_> {
         dispatch::attn_in(c, n, self.s, l.m)
     }
 
-    /// Each slot's q/k norm, rope and cache append and its flash over its
-    /// rows and its K/V planes, then the output gate over every row — in
+    /// Each slot's q/k norm, rope and cache append over its rows and its K/V
+    /// planes (one launch over every slot on f16 planes), its flash over
+    /// them, then the output gate over every row — in
     /// the output projection's quantizer for a K-quant, as f32 rows
     /// otherwise. A head-128 layer turned by NORM pairs runs [`norm_core`].
     fn attn_core(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
@@ -514,36 +537,71 @@ impl ChainOps for Slots35<'_, '_> {
             let q_out = q_out
                 .as_mut()
                 .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
+            let mut planes = Vec::with_capacity(seqs.len());
             for qs in seqs.iter_mut() {
-                let r = &qs.rows;
-                let kv = kv_of(&mut *qs.stores, c.layer)?;
-                let pos = rows(pos, r, 1)?;
-                let mut qo = rows_mut(q_out, r, d.attn_len())?;
-                // SAFETY: the layer program embeds consecutive positions before attention;
-                // saturation is outside the cache. Each call uses one sequence's row window
-                // and its own cache planes, not the combined positions of different slots.
+                planes.push((qs.rows.clone(), kv_of(&mut *qs.stores, c.layer)?, qs.table));
+            }
+            if planes.iter().all(|(_, kv, _)| kv.seqs_serve()) {
+                let kv = planes
+                    .iter_mut()
+                    .map(|(r, kv, table)| kv.kv_seq(r.clone(), table))
+                    .collect::<Result<Vec<_>, GpuError>>()?;
+                // SAFETY: the layer program embeds consecutive positions
+                // within each slot's rows; each sequence appends into its
+                // own planes, turned by its own table.
                 unsafe {
-                    kv.append_256(
-                        &k.neox,
+                    k.neox.enqueue_head_norm_neox_append_256_seqs(
                         stream,
-                        Append256 {
-                            qg: &*rows(q, r, d.q_rows)?,
-                            q: &mut qo,
-                            k: &mut *rows_mut(kr, r, d.kv_len())?,
-                            v: &*rows(v, r, d.kv_len())?,
+                        &kv,
+                        PartialNeoxSeqsArgs {
+                            qg: q,
+                            q: q_out,
+                            k: kr,
+                            v,
                             gq,
                             gk,
-                            table: qs.table,
-                            pos: &pos,
+                            pos,
                             eps: c.eps,
                             n_head: d.n_head,
                             n_kv: d.n_kv,
                             ctx: d.ctx,
-                            m: r.len(),
                             fault: c.sink,
                         },
                     )
                 }?;
+            } else {
+                for (r, kv, table) in &mut planes {
+                    let pos = rows(pos, r, 1)?;
+                    // SAFETY: the layer program embeds consecutive positions
+                    // before attention; saturation is outside the cache. Each
+                    // call uses one sequence's row window and its own cache
+                    // planes, not the combined positions of different slots.
+                    unsafe {
+                        kv.append_256(
+                            &k.neox,
+                            stream,
+                            Append256 {
+                                qg: &*rows(q, r, d.q_rows)?,
+                                q: &mut *rows_mut(q_out, r, d.attn_len())?,
+                                k: &mut *rows_mut(kr, r, d.kv_len())?,
+                                v: &*rows(v, r, d.kv_len())?,
+                                gq,
+                                gk,
+                                table,
+                                pos: &pos,
+                                eps: c.eps,
+                                n_head: d.n_head,
+                                n_kv: d.n_kv,
+                                ctx: d.ctx,
+                                m: r.len(),
+                                fault: c.sink,
+                            },
+                        )
+                    }?;
+                }
+            }
+            for (r, kv, _) in &mut planes {
+                let qo = rows(q_out, r, d.attn_len())?;
                 kv.flash_256(
                     &k.flash,
                     stream,
@@ -612,72 +670,53 @@ impl ChainOps for Slots35<'_, '_> {
         delta::delta_in(&layer_ctx(self.c, l)?, d, self.s, l.m)
     }
 
-    /// Each slot's conv and delta step over its rows, its conv ring and its
-    /// state at the slot's lane word, then the gated norm over every row.
+    /// Every slot's conv and delta step over its rows, its conv ring and its
+    /// state at the slot's lane word, one launch each over every slot
+    /// (`linear::seqs`), then the gated norm over every row.
     fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
         let (c, seqs, s, m) = (&layer_ctx(self.c, l)?, &mut *self.seqs, &mut *self.s, l.m);
         let (gpu, w) = (c.gpu, c.w);
         let lin = &c.k.q35(WHAT)?.linear;
         let stream = gpu.stream();
-        let (ch, nv) = (d.shape.channels(), d.shape.n_v);
-        let (wc, dt, sa) = (
-            f32_gain(w, &d.conv)?,
-            f32_gain(w, &d.dt_bias)?,
-            f32_gain(w, &d.ssm_a)?,
-        );
+        let nv = d.shape.n_v;
         let Arena { pos, attn, gdn, .. } = &mut *s;
         let g = gdn
             .as_mut()
             .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
+        let mut recs = Vec::with_capacity(seqs.len());
         for q in seqs.iter_mut() {
-            let r = &q.rows;
-            let lane =
-                q.io.lane
-                    .ok_or(GpuError::state(WHAT, "a slot's lane word"))?;
-            let mut conv = rows_mut(&mut g.conv, r, ch)?;
-            let mut beta = rows_mut(&mut g.beta, r, nv)?;
-            let mut decay = rows_mut(&mut g.decay, r, nv)?;
-            // The conv over the slot's ring, then the delta step over its
-            // state: each launch binds the slot's own store.
-            lin.conv.enqueue_conv_prep(
-                stream,
-                ConvArgs {
-                    x: ConvRows::F32(&*rows(&g.x, r, ch)?),
-                    b_raw: &*rows(&g.b, r, nv)?,
-                    a_raw: &*rows(&g.a, r, nv)?,
-                    ba_pitch: nv,
-                    w: wc,
-                    dt_bias: dt,
-                    ssm_a: sa,
-                    pos: &*rows(pos, r, 1)?,
-                    shape: d.shape,
-                    eps: c.eps,
-                    m: r.len(),
-                    fault: c.sink,
-                    y: &mut conv,
-                    beta: &mut beta,
-                    decay: &mut decay,
-                    ring: &mut rec_of(&mut *q.stores, c.layer)?.ring,
-                },
-            )?;
-            let st = rec_of(&mut *q.stores, c.layer)?;
-            lin.delta.enqueue_delta(
-                stream,
-                DeltaArgs {
-                    qkv: &conv,
-                    beta: &beta,
-                    decay: &decay,
-                    lane,
-                    lane_at: 0,
-                    lanes: st.lanes,
-                    shape: d.shape,
-                    m: r.len(),
-                    fault: c.sink,
-                    o: &mut *rows_mut(&mut g.o, r, nv * linear::HEAD)?,
-                    state: &mut st.state,
-                },
-            )?;
+            recs.push(GdnSeq {
+                rows: q.rows.clone(),
+                lane: q
+                    .io
+                    .lane
+                    .ok_or(GpuError::state(WHAT, "a slot's lane word"))?,
+                rec: rec_of(&mut *q.stores, c.layer)?,
+                verify: None,
+            });
         }
+        linear::seqs::enqueue_gdn_seqs(
+            lin,
+            stream,
+            GdnSeqsArgs {
+                x: &g.x,
+                b_raw: &g.b,
+                a_raw: &g.a,
+                ba_pitch: nv,
+                w: f32_gain(w, &d.conv)?,
+                dt_bias: f32_gain(w, &d.dt_bias)?,
+                ssm_a: f32_gain(w, &d.ssm_a)?,
+                pos,
+                shape: d.shape,
+                eps: c.eps,
+                fault: c.sink,
+                conv: &mut g.conv,
+                beta: &mut g.beta,
+                decay: &mut g.decay,
+                o: &mut g.o,
+            },
+            &mut recs,
+        )?;
         lin.norm_gate.enqueue_norm_gate(
             stream,
             NormGateArgs {

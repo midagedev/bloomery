@@ -736,7 +736,18 @@ gguf 7 2 0
 # shared body (`gemm::swiglu::swiglu_quant_block`, an unsafe fn with its two blocks, the plain and card-slots entries'
 # one owner) and the card-slots entry's reads of its refusal word and a column's place (`gemm_swiglu_quant_sel`), each
 # with its SAFETY line.
-gpu 2879 396 10
+# PIN(2026-11-01): gpu 2879 -> 2906 blocks, 396 -> 403 fns, new code and code moved, not old code relaxed: the
+# per-sequence row table of a pass of several slots (`seq_rows::SeqRows`, its unsafe accessors `span` and `word` and
+# their blocks) and the `_seqs` entries over it, each the one-sequence entry's body over a sequence's rows and its own
+# words: `gdn_conv_prep_seqs` over the conv's shared warp body `conv_warp` (an unsafe fn), `gdn_delta_seqs`,
+# `gdn_delta_recovery_seqs`, `qsa_pool_seqs`, `qsa_score_seqs` and `qsa_key_append_seqs` over the shared bodies
+# `pool_row`, `score_block` and `key_append_value` (unsafe fns), `head_norm_neox_append_256_seqs` and its unsafe
+# launcher, and `gqa_flash_seg_mma_256_p12_sel_seqs`; the QSA key append moved from q38.rs into qsa.rs (q38 48 -> 44
+# blocks, qsa its four); and the Qwen3.6 and Qwen3.8 slot passes' launch of that append over every slot's planes. Each
+# with its SAFETY line.
+# PIN(2026-11-01): gpu 2906 -> 2908 blocks, test code: the batched head-256 append regression
+# launches two disjoint one-row caches together and each alone, with one SAFETY line per call.
+gpu 2908 403 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

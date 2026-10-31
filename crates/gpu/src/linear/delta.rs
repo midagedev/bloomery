@@ -35,6 +35,10 @@
 //! lane receives the only full state store and its stamp; with one lane that
 //! is the committed lane itself. A discarded verify leaves its committed
 //! state intact. Both calls first fold the same prompt carry.
+//! [`DeltaKernels::enqueue_delta_seqs`] runs the step of several sequences in
+//! one launch, each over its own rows, lane word and state (`crate::seq_rows`):
+//! `gdn_delta_seqs` in place over one lane, `gdn_delta_recovery_seqs` a
+//! verify recorded into each sequence's record after its carry.
 //!
 //! `kda_delta_lanes` is `kda_delta` over stamped lanes by the same rule, with
 //! one more launch value, the row base `row`: the call's first token is row
@@ -136,6 +140,7 @@ use crate::GpuError;
 use crate::cores::global_addr;
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::launch_u32;
+use crate::seq_rows::{SEQ_WORDS, SeqRows};
 use crate::tensor::check_alignment;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::cvt_bf16x2_f32 as chunk_pair;
@@ -145,6 +150,7 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp,
 };
 use cuda_host::cuda_module;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Lanes that share one value column.
@@ -317,7 +323,7 @@ fn update_row(
     s
 }
 
-/// The loop of one block, for either decay granularity (`DECAY` is
+/// The loop of block `b`, for either decay granularity (`DECAY` is
 /// [`DECAY_HEAD`], `gdn_delta`, or [`DECAY_KEY`], `kda_delta`).
 ///
 /// # Safety
@@ -338,6 +344,7 @@ fn update_row(
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
 unsafe fn delta_body<const DECAY: u32>(
+    b: usize,
     qkv: &[f32],
     beta: &[f32],
     decay: &[f32],
@@ -355,7 +362,6 @@ unsafe fn delta_body<const DECAY: u32>(
     let tid = thread::threadIdx_x() as usize;
     let lane = tid % 32;
     let j = lane % LANES_PER_COLUMN;
-    let b = thread::blockIdx_x() as usize;
     let blocks_per_head = HEAD / COLUMNS_PER_BLOCK;
     let h = b / blocks_per_head;
     let (n_k, n_v, m) = (n_k as usize, n_v as usize, m as usize);
@@ -1010,7 +1016,93 @@ mod delta_kernels {
         // checks n_k divides n_v, the block width and the grid.
         unsafe {
             delta_body::<DECAY_HEAD>(
-                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, fault, o, state,
+                thread::blockIdx_x() as usize,
+                qkv,
+                beta,
+                decay,
+                lane,
+                lane_at,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                m,
+                fault,
+                o,
+                state,
+            );
+        }
+    }
+
+    /// [`gdn_delta`] over several sequences' rows (`crate::seq_rows`):
+    /// blocks `s·per .. (s + 1)·per`, `per = 8·n_v`, are sequence `s`'s
+    /// launch, block `b − s·per` of it, over its rows `lead .. lead + m_s` of
+    /// `qkv`, `beta`, `decay` and `o` and its own words: the lane word and
+    /// the state of `lanes` lanes, in that order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= rows * (2 * n_k + n_v) * 128,
+            beta.len() >= rows * n_v,
+            decay.len() >= rows * n_v,
+            lanes >= 1,
+            o.len() >= rows * n_v * 128
+        )
+    )]
+    pub fn gdn_delta_seqs(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        rows: u32,
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        // rows only bounds the lengths in the launch contract.
+        let _ = rows;
+        let per = n_v as usize * (HEAD / COLUMNS_PER_BLOCK);
+        let s = thread::blockIdx_x() as usize / per;
+        if s >= seqs.len() {
+            return; // block-uniform
+        }
+        let (ch, nv) = ((2 * n_k + n_v) as usize * HEAD, n_v as usize);
+        // SAFETY: s < the table's sequences. Its rows lead .. lead + m lie
+        // inside the launch's `rows` (the table tiles them), so each window
+        // holds the m rows `gdn_delta`'s contract names, `qkv` 16-byte
+        // aligned at a row (the launcher checked its base, and a row is a
+        // multiple of 4 f32). The launcher put the sequence's own lane word
+        // (one u32) and state (`lanes` lanes, 16-byte aligned, borrowed by
+        // this launch alone) at its words, so the body runs over them as the
+        // sequence's own launch's block b − s·per.
+        unsafe {
+            let (lead, m) = seqs.span(s);
+            let lane = seqs.word(s, 0) as usize as *const u32;
+            delta_body::<DECAY_HEAD>(
+                thread::blockIdx_x() as usize - s * per,
+                qkv.get_unchecked(lead * ch..),
+                beta.get_unchecked(lead * nv..),
+                decay.get_unchecked(lead * nv..),
+                core::slice::from_raw_parts(lane, 1),
+                0,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                m as u32,
+                fault,
+                o.as_mut_ptr().add(lead * nv * HEAD),
+                seqs.word(s, 1) as usize as *mut f32,
             );
         }
     }
@@ -1058,7 +1150,20 @@ mod delta_kernels {
         // values the body reads for DECAY_KEY.
         unsafe {
             delta_body::<DECAY_KEY>(
-                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, fault, o, state,
+                thread::blockIdx_x() as usize,
+                qkv,
+                beta,
+                decay,
+                lane,
+                lane_at,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                m,
+                fault,
+                o,
+                state,
             );
         }
     }
@@ -1306,6 +1411,108 @@ mod delta_kernels {
                 (carry, carried),
                 store_fault,
                 core::ptr::null_mut(),
+                state as usize as *mut f32,
+                stamp as usize as *mut u32,
+                record as usize as *mut f32,
+            );
+        }
+    }
+
+    /// [`gdn_delta_recovery`]'s verify (`each != 0`) of several sequences'
+    /// rows in one launch (`crate::seq_rows`): blocks `s·per .. (s + 1)·per`,
+    /// `per = 8·n_v`, are sequence `s`'s launch, block `b − s·per` of it,
+    /// over its rows `lead .. lead + m_s` of `qkv`, `beta`, `decay`, `pos`
+    /// and `o` and its own words: the lane word, the carry (0 for none),
+    /// the state, the stamps and the record, in that order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= rows * (2 * n_k + n_v) * 128,
+            beta.len() >= rows * n_v,
+            decay.len() >= rows * n_v,
+            lanes >= 1,
+            pos.len() >= rows,
+            o.len() >= rows * n_v * 128
+        )
+    )]
+    pub fn gdn_delta_recovery_seqs(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        rows: u32,
+        pos: &[u32],
+        carry_len: u32,
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        #[grid_constant] seqs: &SeqRows,
+    ) {
+        // rows only bounds the lengths in the launch contract.
+        let _ = rows;
+        let per = n_v as usize * (HEAD / COLUMNS_PER_BLOCK);
+        let b = thread::blockIdx_x() as usize;
+        let s = b / per;
+        if s >= seqs.len() {
+            return; // block-uniform
+        }
+        // SAFETY: s < the table's sequences, and its words are the five
+        // this entry names.
+        let ((lead, m), lane, carry, state, stamp, record) = unsafe {
+            (
+                seqs.span(s),
+                seqs.word(s, 0),
+                seqs.word(s, 1),
+                seqs.word(s, 2),
+                seqs.word(s, 3),
+                seqs.word(s, 4),
+            )
+        };
+        let carried = u32::from(carry != 0);
+        let carry = if carried != 0 {
+            // SAFETY: the launcher put a whole carry of the shape, 16-byte
+            // aligned, at a nonzero word; no launch writes it while this
+            // one reads.
+            unsafe { core::slice::from_raw_parts(carry as usize as *const f32, carry_len as usize) }
+        } else {
+            &[]
+        };
+        let (ch, nv) = ((2 * n_k + n_v) as usize * HEAD, n_v as usize);
+        // SAFETY: the sequence's rows lead .. lead + m lie inside the
+        // launch's `rows` (the table tiles them), so each window holds the m
+        // rows `gdn_delta_recovery`'s contract names, `qkv` 16-byte aligned
+        // at a row (the launcher checked its base, and a row is a multiple of
+        // 4 f32). The launcher put the sequence's own lane word
+        // (one u32), state (`lanes` lanes, 16-byte aligned), stamps (`lanes`
+        // words) and record (`m` rows, 16-byte aligned) at its words, each
+        // borrowed by this launch alone; so this block is that launch's
+        // block `b − s·per` over them.
+        unsafe {
+            delta_lanes_body::<DECAY_HEAD, true>(
+                qkv.get_unchecked(lead * ch..),
+                beta.get_unchecked(lead * nv..),
+                decay.get_unchecked(lead * nv..),
+                core::slice::from_raw_parts(lane as usize as *const u32, 1),
+                0,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                (m as u32, 1, 0),
+                b - s * per,
+                pos.get_unchecked(lead..),
+                (carry, carried),
+                fault,
+                o.as_mut_ptr().add(lead * nv * HEAD),
                 state as usize as *mut f32,
                 stamp as usize as *mut u32,
                 record as usize as *mut f32,
@@ -2116,6 +2323,40 @@ pub struct DeltaArgs<'a> {
     pub fault: FaultSink,
     pub o: &'a mut DeviceBuffer<f32>,
     pub state: &'a mut DeviceBuffer<f32>,
+}
+
+/// One sequence of [`DeltaKernels::enqueue_delta_seqs`]: its rows of the
+/// launch, its lane word (`lane[0]`), its state, and for a verify what it
+/// records into (`None`: the step in place).
+pub(crate) struct DeltaSeq<'a> {
+    pub(crate) rows: Range<usize>,
+    pub(crate) lane: &'a DeviceBuffer<u32>,
+    pub(crate) state: &'a mut DeviceBuffer<f32>,
+    pub(crate) verify: Option<DeltaRecord<'a>>,
+}
+
+/// A verifying sequence's own buffers: its carry (`None` on a store whose
+/// prompt does not run the chunked rule), its stamps and its record.
+pub(crate) struct DeltaRecord<'a> {
+    pub(crate) carry: Option<&'a DeviceBuffer<f32>>,
+    pub(crate) stamp: &'a mut DeviceBuffer<u32>,
+    pub(crate) record: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`DeltaKernels::enqueue_delta_seqs`]'s arguments: the rows of every
+/// sequence of `qkv`, `beta`, `decay`, `pos` and `o` as [`DeltaArgs`] and
+/// [`DeltaLanesArgs`] name them, the lanes every sequence's state holds, and
+/// each sequence's own in `seqs`.
+pub(crate) struct DeltaSeqsArgs<'a, 's> {
+    pub(crate) qkv: &'a DeviceBuffer<f32>,
+    pub(crate) beta: &'a DeviceBuffer<f32>,
+    pub(crate) decay: &'a DeviceBuffer<f32>,
+    pub(crate) pos: &'a DeviceBuffer<u32>,
+    pub(crate) lanes: usize,
+    pub(crate) shape: LinearShape,
+    pub(crate) fault: FaultSink,
+    pub(crate) o: &'a mut DeviceBuffer<f32>,
+    pub(crate) seqs: &'s [DeltaSeq<'a>],
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -3108,6 +3349,161 @@ impl DeltaKernels {
             launch_u32(WHAT, "carry_len", shape.carry_len())?,
             fault,
         )?;
+        Ok(())
+    }
+
+    /// Enqueue the delta step of every sequence of `args` in one launch
+    /// (`crate::seq_rows`), each sequence's rows over its own lane word and
+    /// state, bit for bit the launch of its rows alone, `8·n_v` blocks a
+    /// sequence: [`DeltaKernels::enqueue_delta_recovery`]'s verify (row mode)
+    /// when every sequence brings its record, each recorded into its own
+    /// after its carry; [`DeltaKernels::enqueue_delta`]'s step in place at
+    /// lane 0 of the lane word when none does. Refused by name: what that
+    /// launch refuses over each sequence's rows, sequences of both kinds, and
+    /// rows that do not tile the launch from row 0 ([`SeqRows::new`]).
+    /// Asynchronous and capturable; builds its sequence table on the host.
+    pub(crate) fn enqueue_delta_seqs(
+        &self,
+        stream: &CudaStream,
+        args: DeltaSeqsArgs<'_, '_>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_delta_seqs";
+        let DeltaSeqsArgs {
+            qkv,
+            beta,
+            decay,
+            pos,
+            lanes,
+            shape,
+            fault,
+            o,
+            seqs,
+        } = args;
+        shape.check(WHAT)?;
+        let nv = shape.n_v;
+        let overflow = || GpuError::shape(WHAT, "GDN launch size overflows usize");
+        let verify = seqs.first().is_some_and(|q| q.verify.is_some());
+        if seqs.iter().any(|q| q.verify.is_some() != verify) {
+            return Err(GpuError::shape(
+                WHAT,
+                "sequences that each verify, or each step in place",
+            ));
+        }
+        if !verify && lanes != 1 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("lanes={lanes}: a step in place takes one state lane, as `enqueue_delta`"),
+            ));
+        }
+        let state_len = lanes
+            .checked_mul(shape.state_len())
+            .filter(|_| lanes > 0)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{lanes} lanes: need 1 or more")))?;
+        let mut words = Vec::with_capacity(seqs.len());
+        for (s, q) in seqs.iter().enumerate() {
+            let record =
+                runtime::stores::delta_record_words(nv, HEAD, q.rows.len()).ok_or_else(overflow)?;
+            let lens = [
+                ("lane", q.lane.len(), 1),
+                ("state", q.state.len(), state_len),
+            ];
+            let carry = q.verify.as_ref().and_then(|v| v.carry);
+            let kept = q.verify.as_ref().map(|v| {
+                [
+                    ("stamp", v.stamp.len(), lanes),
+                    ("record", v.record.len(), record),
+                ]
+            });
+            if let Some((name, got, need)) = lens
+                .into_iter()
+                .chain(carry.map(|c| ("carry", c.len(), shape.carry_len())))
+                .chain(kept.into_iter().flatten())
+                .find(|(_, got, need)| got < need)
+            {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("sequence {s}'s {name}.len() {got} < {need}"),
+                ));
+            }
+            check_vector_bases(WHAT, qkv, q.state, carry)?;
+            let mut word = [0; SEQ_WORDS];
+            word[0] = q.lane.cu_deviceptr();
+            match &q.verify {
+                Some(v) => {
+                    check_alignment::<U32x4, _>(WHAT, "record", &*v.record)?;
+                    word[1] = carry.map_or(0, DeviceBuffer::cu_deviceptr);
+                    word[2] = q.state.cu_deviceptr();
+                    word[3] = v.stamp.cu_deviceptr();
+                    word[4] = v.record.cu_deviceptr();
+                }
+                None => word[1] = q.state.cu_deviceptr(),
+            }
+            words.push((q.rows.clone(), word));
+        }
+        let table = SeqRows::new(WHAT, &words)?;
+        let m = table.rows();
+        let heads = m.checked_mul(nv).ok_or_else(overflow)?;
+        let lens = [
+            ("qkv", qkv.len(), m * shape.channels()),
+            ("beta", beta.len(), heads),
+            ("decay", decay.len(), heads),
+            ("pos", pos.len(), m),
+            ("o", o.len(), heads * HEAD),
+        ];
+        crate::short(WHAT, &lens)?;
+        let per = nv * (HEAD / COLUMNS_PER_BLOCK);
+        let grid = launch_u32(WHAT, "grid", per * table.len())?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        let k = &self.module;
+        let (n_k, n_v, rows) = (
+            launch_u32(WHAT, "n_k", shape.n_k)?,
+            launch_u32(WHAT, "n_v", nv)?,
+            launch_u32(WHAT, "rows", m)?,
+        );
+        // SAFETY: each sequence's words are its own lane word, state and, for
+        // a verify, carry, stamps and record, of the lengths and alignment
+        // checked above; the state, stamps and record are borrowed mutably
+        // while this enqueue runs, so no other sequence's words name them,
+        // and a graph that captures the launch replays it over the same
+        // buffers, which the caller keeps alive and in place while the graph
+        // lives, as for any buffer it captured.
+        unsafe {
+            if verify {
+                k.gdn_delta_recovery_seqs(
+                    stream,
+                    &k.prepare_gdn_delta_recovery_seqs(cfg)?,
+                    qkv,
+                    beta,
+                    decay,
+                    launch_u32(WHAT, "lanes", lanes)?,
+                    n_k,
+                    n_v,
+                    grouped_arg(shape.map),
+                    rows,
+                    pos,
+                    launch_u32(WHAT, "carry_len", shape.carry_len())?,
+                    fault,
+                    o,
+                    table,
+                )?;
+            } else {
+                k.gdn_delta_seqs(
+                    stream,
+                    &k.prepare_gdn_delta_seqs(cfg)?,
+                    qkv,
+                    beta,
+                    decay,
+                    launch_u32(WHAT, "lanes", lanes)?,
+                    n_k,
+                    n_v,
+                    grouped_arg(shape.map),
+                    rows,
+                    fault,
+                    o,
+                    table,
+                )?;
+            }
+        }
         Ok(())
     }
 

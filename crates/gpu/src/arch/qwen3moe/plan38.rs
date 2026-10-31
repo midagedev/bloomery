@@ -75,7 +75,6 @@ const _: () = assert!(
         && geo::HEAD == flash_gqa::HEAD_256
         && geo::HEAD == q38::HEAD
         && geo::IDX_DIM == qsa::DIM
-        && geo::IDX_DIM == q38::DIM
         && geo::IDX_HEADS == qsa::HEADS
         && geo::POOL == qsa::POOL
         && geo::ROPE == qsa::ROT

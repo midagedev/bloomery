@@ -1333,13 +1333,9 @@ mod gate {
         /// The header's slot nodes ([`Shape::nodes_slot`]): the tier takes
         /// none of a slot's sequence-bound launches.
         fn added_slot_launches(&self, _m: &Qwen38Model) -> Result<Launches, GateError> {
-            let (gdn, qsa) = (self.shape.n_gdn(), self.shape.n_qsa());
             Ok(Launches {
                 n: self.shape.nodes_slot(),
-                terms: format!(
-                    "the embedding 1 + the PLE conv 1 + {gdn} delta layers' 2 + {qsa} selecting \
-                     layers' 8 + the parked rows' copy 1"
-                ),
+                terms: "the embedding 1 + the PLE conv 1 + the parked rows' copy 1".to_owned(),
             })
         }
 

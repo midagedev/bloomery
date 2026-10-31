@@ -5,7 +5,8 @@
 //! gate of a gated softmax-attention layer beside it ([`out_gate`]), and the
 //! write gate of a layer whose write and erase gates differ ([`write_gate`]).
 //! The gated short conv ([`shortconv`]) shares the conv ring's indexing
-//! ([`ring_input`]) and nothing else.
+//! ([`ring_input`]) and nothing else. [`seqs`] runs the conv and the delta
+//! step over several sequences' stores in one launch each.
 //! The projections around them (`W_qkv`, `w_β`, `w_α`, `W_gate`, `W_out`) are the tree's dense
 //! gemv/GEMM and are not here.
 //!
@@ -60,6 +61,7 @@ pub mod delta;
 pub mod mixer_kda;
 pub mod norm_gate;
 pub mod out_gate;
+pub(crate) mod seqs;
 pub mod shortconv;
 pub mod write_gate;
 

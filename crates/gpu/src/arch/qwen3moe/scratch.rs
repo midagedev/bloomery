@@ -22,8 +22,8 @@ use crate::GpuError;
 use crate::checkpoint::saved::{Plane, Spans};
 use crate::fault::FaultSink;
 use crate::flash_gqa::{
-    CachePlanes, FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable,
-    partials_ms_len, partials_v_len, partials_v_len_256,
+    CachePlanes, FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, KvSeq,
+    RowTable, partials_ms_len, partials_v_len, partials_v_len_256,
 };
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, QueryNorm};
 use crate::gemm::GEMM_MAX_SLOTS;
@@ -1324,6 +1324,26 @@ impl KvPlanes {
     /// pass. The scalar pass and a q8_0 cache have no per-row entry.
     pub(super) fn rows_serve(&self, mma: bool) -> bool {
         mma && matches!(self, KvPlanes::F16 { .. })
+    }
+
+    /// Whether the launches over several sequences' caches with a table per
+    /// sequence (`crate::flash_gqa::KvSeq`: the head-256 append and the
+    /// listed flash) serve these planes: the f16 cache's. A q8_0 cache has no
+    /// such entry.
+    pub(super) fn seqs_serve(&self) -> bool {
+        matches!(self, KvPlanes::F16 { .. })
+    }
+
+    /// These planes as the sequence of rows `rows` turned by `rope`
+    /// ([`KvSeq`]); a q8_0 cache's are refused by name
+    /// ([`KvPlanes::f16_mut`], [`KvPlanes::seqs_serve`]).
+    pub(super) fn kv_seq<'a>(
+        &'a mut self,
+        rows: Range<usize>,
+        rope: &'a DeviceBuffer<f32>,
+    ) -> Result<KvSeq<'a>, GpuError> {
+        let (k, v) = self.f16_mut("qwen3moe::KvPlanes::kv_seq")?;
+        Ok(KvSeq { rows, k, v, rope })
     }
 
     /// These planes as rows `rows` of a per-row table

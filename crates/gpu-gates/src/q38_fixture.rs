@@ -40,10 +40,6 @@ const HEAD_LAUNCHES: usize = 5;
 /// Nodes a verify's PLE rows' arrival adds at the PLE site: the wait on the host's flag (a batch
 /// memory operation) and the copy of the rows from the host's staging ([`Shape::arrivals`]).
 const ARRIVAL_NODES: usize = 2;
-/// Launches bound to one sequence on a selecting layer, and on a delta layer (its conv and delta
-/// step); a captured pass of several slots' rows repeats them for each busy slot.
-const SLOT_QSA_LAUNCHES: usize = 8;
-const SLOT_GDN_LAUNCHES: usize = 2;
 /// Launches the card leg adds on a card layer: the normed rows' q8_1, the gate·up, the card
 /// slots' q8_1, the down and the card sum.
 const CARD_LEG_LAUNCHES: usize = 5;
@@ -66,9 +62,9 @@ pub struct Shape {
     pub head: Head,
     /// The launches the dense sites' q8_1 projections add to a captured walk (a K-quant site
     /// quantizes its input rows first, and past one row a row-major type copies its result
-    /// token-major): at one row, at more than one, and a selecting layer's indexer key on one
-    /// busy slot's row. [`Shape::with_by_name`] states them, which the header's values alone do
-    /// not; zero on a file whose dense sites read the f32 rows or q8 blocks of 32.
+    /// token-major): at one row and at more than one. [`Shape::with_by_name`] states them, which
+    /// the header's values alone do not; zero on a file whose dense sites read the f32 rows or q8
+    /// blocks of 32.
     pub by_name: ByName,
 }
 
@@ -79,8 +75,6 @@ pub struct ByName {
     pub one: usize,
     /// A captured verify's at two to four rows, over every layer.
     pub rows: usize,
-    /// One busy slot's, over the selecting layers: the indexer key's projection at its one row.
-    pub slot: usize,
 }
 
 /// The extra launches of a file's head over a projection of f32 rows ([`Shape::head`]).
@@ -204,17 +198,14 @@ impl Shape {
         usize::from(self.ple_layer.is_some())
     }
 
-    /// The nodes one more busy slot adds to a captured pass of several slots' rows: the
-    /// embedding row, the PLE conv, each layer's sequence-bound launches and the parked rows'
-    /// copy.
+    /// The nodes one more busy slot adds to a captured pass of several slots' rows over an f16
+    /// cache: the embedding row, the PLE conv and the parked rows' copy. Every layer's other
+    /// launches bound to a sequence (a delta layer's conv and delta step, a selecting layer's
+    /// pool, key append, selection, q/k append and selected flash) and the indexer key's
+    /// projection run once over every slot's rows.
     #[must_use]
     pub fn nodes_slot(&self) -> usize {
-        EMBED_LAUNCHES
-            + usize::from(self.ple_layer.is_some())
-            + self.n_gdn() * SLOT_GDN_LAUNCHES
-            + self.n_qsa() * SLOT_QSA_LAUNCHES
-            + 1
-            + self.by_name.slot
+        EMBED_LAUNCHES + usize::from(self.ple_layer.is_some()) + 1
     }
 
     /// The captured step's nodes under a card plan that puts routed experts on `card_layers`
@@ -247,7 +238,7 @@ mod tests {
         assert_eq!(real.nodes_decode(), 1139);
         assert_eq!(real.memops(), 96);
         assert_eq!(real.nodes_verify(), 1141);
-        assert_eq!(real.nodes_slot(), 171);
+        assert_eq!(real.nodes_slot(), 3);
         assert_eq!(real.nodes_decode_card(48), 1379);
         assert_eq!(real.nodes_verify_card(48), 1381);
         assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
@@ -256,7 +247,7 @@ mod tests {
         assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 28 + 5 + 5);
         assert_eq!(fix.nodes_decode(), 111);
         assert_eq!(fix.nodes_verify(), 113);
-        assert_eq!(fix.nodes_slot(), 23);
+        assert_eq!(fix.nodes_slot(), 3);
         assert_eq!(fix.nodes_decode_card(4), 131);
         assert_eq!(fix.nodes_verify_card(4), 133);
         let kq = fix.clone().with_head(Head {
@@ -283,11 +274,10 @@ mod tests {
         let by = fix.with_by_name(ByName {
             one: 2 * 5 + 2 * 8,
             rows: 2 * 5 + 2 * 8 + 3 + 4,
-            slot: 2,
         });
         assert_eq!(by.nodes_decode(), 111 + 26);
         assert_eq!(by.nodes_verify(), 113 + 26 + 7);
-        assert_eq!(by.nodes_slot(), 23 + 2);
+        assert_eq!(by.nodes_slot(), 3);
         assert_eq!(by.nodes_decode_card(4), 131 + 26);
     }
 
@@ -301,7 +291,7 @@ mod tests {
         assert!(Shape::from_layers(4, vec![1, 3], Some(4), None).is_err());
         let bare = Shape::from_layers(4, vec![1, 3], None, None).expect("no site");
         assert_eq!(bare.nodes_decode(), 106);
-        assert_eq!(bare.nodes_slot(), 22);
+        assert_eq!(bare.nodes_slot(), 2);
         assert_eq!((bare.nodes_verify(), bare.arrivals()), (106, 0));
     }
 }

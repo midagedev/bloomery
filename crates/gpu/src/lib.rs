@@ -103,6 +103,7 @@ pub mod route_core;
 pub mod route_softmax;
 pub mod routed_block;
 pub mod router;
+pub(crate) mod seq_rows;
 pub mod site;
 pub(crate) mod tensor;
 pub mod token_major;

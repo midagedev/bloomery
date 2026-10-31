@@ -63,8 +63,7 @@ pub fn shape_of(spec: &ModelSpec, file: &Split) -> Result<Shape, GateError> {
 /// whose gemvs are row-major, copy the result token-major. The sites are the delta layer's
 /// q·k·v, z and output, the selecting layer's q, k, v, output and the indexer's key and query,
 /// every layer's shared expert and the PLE site's key and value; the joined β·α stack and the
-/// router read f32 rows. `slot` is the indexer key's one busy slot's launch on each selecting
-/// layer.
+/// router read f32 rows.
 #[must_use]
 fn dense_launches(shape: &Shape, file: &Split) -> ByName {
     use model::arch::qwen35moe::names as n;
@@ -105,9 +104,6 @@ fn dense_launches(shape: &Shape, file: &Split) -> ByName {
         for name in &names {
             by.one += extra(name, 1);
             by.rows += extra(name, 2);
-        }
-        if shape.qsa.contains(&l) {
-            by.slot += extra(&n::indexer_k_proj(l), 1);
         }
     }
     by

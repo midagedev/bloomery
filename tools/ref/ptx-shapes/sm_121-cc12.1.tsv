@@ -159,14 +159,17 @@ generate_ds41   gather_pairs                             0           0
 generate_ds41   gdn_carry_keep                           0           0
 generate_ds41   gdn_chunk_prepare                        0           0
 generate_ds41   gdn_conv_prep                            0           0
-# PIN(2026-10-31): gdn_conv_prep_bf16 48 B spill, 24 B JIT local (sm_121 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84): the BF16 conv's launch bound budgets registers for six 128-thread blocks a SM (launch_bounds(128, 6), 80 registers).
-generate_ds41   gdn_conv_prep_bf16                      48          24
+# PIN(2026-11-01): gdn_conv_prep_bf16 48 -> 0 B spill, 24 -> 0 B JIT local (sm_121 ptxas 13.3.73, cc 12.1 JIT on GB10, gate-ptx-spill --set arch sm_121): the conv's warp body is one function (conv_warp) the plain and per-sequence entries share, and the BF16 entry's registers now fit under its launch bound.
+generate_ds41   gdn_conv_prep_bf16                       0           0
+generate_ds41   gdn_conv_prep_seqs                       0           0
 generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
 generate_ds41   gdn_delta_recovery                       0           0
 # PIN(2026-10-27): gdn_delta_recovery_layers, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
 generate_ds41   gdn_delta_recovery_layers                0           0
+generate_ds41   gdn_delta_recovery_seqs                  0           0
 generate_ds41   gdn_delta_prepared                       0           0
+generate_ds41   gdn_delta_seqs                           0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
@@ -214,6 +217,7 @@ generate_ds41   gqa_flash_seg_mma                        0           0
 generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p12_sel            0           0
 generate_ds41   gqa_flash_seg_mma_256_p12_sel_q8         0           0
+generate_ds41   gqa_flash_seg_mma_256_p12_sel_seqs       0           0
 generate_ds41   gqa_flash_seg_mma_256_p4                 0           0
 generate_ds41   gqa_flash_seg_mma_256_p4_q8              0           0
 generate_ds41   gqa_flash_seg_mma_256_q8                 0           0
@@ -283,6 +287,7 @@ generate_ds41   head_norm_neox_append                    0           0
 generate_ds41   head_norm_neox_append_128_partial        0           0
 generate_ds41   head_norm_neox_append_256                0           0
 generate_ds41   head_norm_neox_append_256_q8             0           0
+generate_ds41   head_norm_neox_append_256_seqs           0           0
 generate_ds41   head_norm_neox_append_256_whole          0           0
 generate_ds41   head_norm_neox_append_512                0           0
 generate_ds41   head_norm_neox_append_q8                 0           0
@@ -414,8 +419,11 @@ generate_ds41   q8_1_quantize_gated                      0           0
 generate_ds41   q8_1_quantize_ord                        0           0
 generate_ds41   q8_1_quantize_sel                        0           0
 generate_ds41   qsa_key_append                           0           0
+generate_ds41   qsa_key_append_seqs                      0           0
 generate_ds41   qsa_pool                                 0           0
+generate_ds41   qsa_pool_seqs                            0           0
 generate_ds41   qsa_score                                0           0
+generate_ds41   qsa_score_seqs                           0           0
 generate_ds41   qsa_topk                                 0           0
 generate_ds41   qsa_topk_high                            0           0
 generate_ds41   quantize_gemm32                          0           0
