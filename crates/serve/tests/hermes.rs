@@ -385,6 +385,19 @@ fn tool_body(stream: bool) -> Value {
     })
 }
 
+/// [`tool_body`] over tools whose `tags` array schema the structured-output
+/// subset cannot compile: `tool_choice` auto leaves such a reply to the model
+/// (no watch), so the markup the script writes reaches the scan as it is.
+fn malformed_body(stream: bool) -> Value {
+    let mut b = tool_body(stream);
+    b["tools"]
+        .as_array_mut()
+        .expect("tools")
+        .push(json!({"type": "function", "function": {"name": "note",
+            "parameters": {"type": "object", "properties": {"tags": {"type": "array"}}}}}));
+    b
+}
+
 /// A streamed chat body folded back into `(finish_reason, message)`, call ids
 /// left out; `Err` with its message when the stream ended on an error event.
 fn fold_stream(body: &str) -> Result<(Value, Value), String> {
@@ -544,14 +557,14 @@ fn hw_hermes_malformed_call_is_an_api_error() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
+        let r = post(addr, "/v1/chat/completions", &malformed_body(false));
         assert_eq!(r.status, 500, "{}", r.body);
         let m = r.json()["error"]["message"]
             .as_str()
             .unwrap_or("")
             .to_owned();
         assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
+        let r = post(addr, "/v1/chat/completions", &malformed_body(true));
         let e = fold_stream(&r.body).expect_err("an error event");
         assert!(e.starts_with(want), "{e}");
     }
@@ -694,9 +707,10 @@ fn hw_a_model_that_opens_no_span_answers_in_content() {
 }
 
 /// The budget caps a model-opened span: the opening tag spends nothing, the
-/// next four ids are the reasoning, the close id is forced as the sixth taken
-/// token (the answer it displaces never appears), and the split consumes the
-/// tags — `</think>` shows in neither field.
+/// next four ids are the reasoning, and the close id is forced after them —
+/// the scripted model's script holds none of it, so the text resumes where
+/// the script stood — and the split consumes the tags: `</think>` shows in
+/// neither field.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_the_budget_caps_a_model_opened_span() {
@@ -714,13 +728,13 @@ fn hw_the_budget_caps_a_model_opened_span() {
         m["content"].as_str().unwrap_or(""),
     );
     assert_eq!(reasoning, "abcd", "{v}");
-    assert_eq!(content, "fghijkl", "{v}");
+    assert_eq!(content, "efghijkl", "{v}");
     assert!(
         !reasoning.contains("</think>") && !content.contains("</think>"),
         "{v}"
     );
-    // The script is 13 ids and the eos: 14 taken.
-    assert_eq!(v["usage"]["completion_tokens"], json!(14), "{v}");
+    // The script is 13 ids and the eos, beside the forced close: 15 taken.
+    assert_eq!(v["usage"]["completion_tokens"], json!(15), "{v}");
     assert_eq!(v["choices"][0]["finish_reason"], json!("stop"), "{v}");
 }
 
@@ -788,9 +802,11 @@ fn hw_a_forced_call_is_served_on_every_template() {
         {"type": "function", "function": {"name": "get_weather", "parameters": {
             "type": "object", "properties": {
                 "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
-                "days": {"type": "integer", "enum": [1, 2, 3]}}}}},
+                "days": {"type": "integer", "enum": [1, 2, 3]}},
+            "required": ["unit", "days"]}}},
         {"type": "function", "function": {"name": "set_flag", "parameters": {
-            "type": "object", "properties": {"on": {"type": "boolean"}}}}},
+            "type": "object", "properties": {"on": {"type": "boolean"}},
+            "required": ["on"]}}},
     ]);
     let weather = json!({"unit": "celsius", "days": 1});
     for (template, label) in [

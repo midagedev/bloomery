@@ -34,14 +34,13 @@ const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 /// The long text of `content`: twelve lines, each with quotes, a backslash, a
 /// tab, non-ASCII text and a near-tag of every markup (each shares a prefix
 /// with a tag that ends a value or a call, and is not one).
+/// A value the watch's program writes holds none of what its quoting refuses
+/// (a JSON string body takes no quote, backslash or control byte, and the
+/// chat formats' raw values no byte of their own closers): words, digits and
+/// unicode carry the streaming.
 fn content() -> String {
     (0..12)
-        .map(|i| {
-            format!(
-                "line {i}: \"quoted\" \\ back\ttab 서울 ☃ </arg_value x> </｜DSML｜ parameter x> \
-                 </parameter x> </tool_ca x>\n"
-            )
-        })
+        .map(|i| format!("line {i}: 서울 ☃ snowman über {i}; "))
         .collect()
 }
 
@@ -117,14 +116,15 @@ fn cases() -> Vec<Case> {
             tools: Tools::QwenXml(Framing::Lines, ParamKinds::of_tools(Some(&tools()))),
         },
         // The compact framing: the long text is the bytes between its tags,
-        // its newlines its own, the last one with it.
+        // the template's own spelling (no byte between one parameter and the
+        // next).
         Case {
             label: "qwen-compact",
             template: MIMO,
             lead: "",
             call: format!(
-                "<tool_call>\n<function=write>\n<parameter=path>/a.txt</parameter>\n\
-                 <parameter=mode>420</parameter>\n<parameter=content>{c}</parameter>\n\
+                "<tool_call>\n<function=write>\n<parameter=path>/a.txt</parameter>\
+                 <parameter=mode>420</parameter><parameter=content>{c}</parameter>\
                  </function>\n</tool_call>"
             ),
             tools: Tools::QwenXml(Framing::Compact, ParamKinds::of_tools(Some(&tools()))),

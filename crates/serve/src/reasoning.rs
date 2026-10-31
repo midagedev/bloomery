@@ -232,6 +232,9 @@ pub struct Split {
     pub opened: bool,
     /// `</think>` was consumed by this push.
     pub closed: bool,
+    /// The tag that ends the span too ended it ([`ThinkSplit::ending_at`]):
+    /// `content` then starts with that tag.
+    pub ended_at_opener: bool,
     pub content: String,
     /// The special tokens' texts in `content`: byte offset and length.
     pub specials: Vec<(usize, usize)>,
@@ -423,6 +426,7 @@ impl ThinkSplit {
             let reasoning = self.held.take_front(at).text;
             return Split {
                 reasoning,
+                ended_at_opener: true,
                 ..Split::content(std::mem::take(&mut self.held))
             };
         }

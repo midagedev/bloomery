@@ -33,7 +33,7 @@ const OFF: &str = "<｜User｜>hi<｜Assistant｜></think>";
 
 const ANSWER: &str = "The user greets me.</think>Hello!";
 const PLAIN: &str = "Hello! a</think>b";
-const ONE_CALL: &str = "Need the weather.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n<｜DSML｜parameter name=\"location\" string=\"true\">Seoul</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+const ONE_CALL: &str = "Need the weather.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Seoul</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
 const TWO_CALLS: &str = "Checking both.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Seoul</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_time\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
 const DSML_IN_REASONING: &str = "I could answer with </｜DSML｜tool_calls> or with\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls> but no.</think>Done.";
 const TRUNCATED: &str = "Still thinking about <｜DSML｜tool_calls>\n<｜DSML｜inv";
@@ -69,7 +69,7 @@ fn v4_fixtures() -> Vec<(
     Message,
 )> {
     use ReasoningFormat::{Deepseek, None};
-    let weather = || call(0, "get_weather", r#"{"days":3,"location":"Seoul"}"#);
+    let weather = || call(0, "get_weather", r#"{"location":"Seoul","days":3}"#);
     vec![
         (
             "thinking on, answer",

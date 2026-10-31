@@ -43,7 +43,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::callstream::{Args, Reading, find_from, held, read_value};
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, refuse, value};
+use crate::constrain::{
+    Arg, Fun, Part, Refusal, Style, call, is_text, object_parameters, refuse, value,
+};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
 use crate::reasoning::{Marked, SpecialTags, partial_suffix};
@@ -652,40 +654,55 @@ impl CallRead {
 }
 
 /// The call `spelling` spells, as the parts structured output forces: the
-/// inverse of [`KvScan`]. The name, then the key, value and closing markers
-/// per parameter in the schema's order, as the template writes them. The
-/// scanner reads a value as text only where the schema says `"type":
-/// "string"`, itself or through a `$ref`, so a text-valued parameter that
-/// does not say it is refused rather than written as something that could
-/// read back as JSON.
+/// inverse of [`KvScan`]. The name, then the parameters as the object rule
+/// writes them: the required ones, in the schema's order, then the optional
+/// ones, each of which may be left out. The scanner reads a value as text
+/// only where the schema says `"type": "string"`, itself or through a
+/// `$ref`, so a text-valued parameter that does not say it is refused
+/// rather than written as something that could read back as JSON.
 pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
     let m = spelling.markers();
+    parts(m, funs, m.call_open)
+}
+
+/// The opener a `tool_choice: auto` reply is watched for — the spelling's
+/// call opening — and the call as parts once the model writes it:
+/// [`call_parts`] less the opener, which the free text has already written.
+pub(crate) fn lazy_parts(
+    spelling: KvSpelling,
+    funs: &[Fun<'_>],
+) -> Result<(&'static str, Vec<Part>), Refusal> {
+    let m = spelling.markers();
+    Ok((m.call_open, parts(m, funs, "")?))
+}
+
+/// [`call_parts`] over `open`, the text the function's name follows.
+fn parts(m: &Markers, funs: &[Fun<'_>], open: &str) -> Result<Vec<Part>, Refusal> {
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        if is_text(&a.schema) && a.schema.get("type").and_then(Value::as_str) != Some("string") {
+            return Err(refuse(
+                &a.path,
+                format!(
+                    "{}'s tool markup reads a text value as text only under \"type\": \
+                     \"string\"; add it",
+                    m.family
+                ),
+            ));
+        }
+        let mut parts = vec![Part::Text(format!(
+            "{}{}{}{}",
+            m.key_open, a.key, m.key_close, m.value_open
+        ))];
+        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
+        Ok(parts)
+    };
     call(
         funs,
-        m.call_open,
+        open,
         |name| format!("{name}{}", m.line()),
         |f| {
-            let mut parts = Vec::new();
-            for a in &f.args {
-                if is_text(&a.schema)
-                    && a.schema.get("type").and_then(Value::as_str) != Some("string")
-                {
-                    return Err(refuse(
-                        &a.path,
-                        format!(
-                            "{}'s tool markup reads a text value as text only under \"type\": \
-                             \"string\"; add it",
-                            m.family
-                        ),
-                    ));
-                }
-                parts.push(Part::Text(format!(
-                    "{}{}{}{}",
-                    m.key_open, a.key, m.key_close, m.value_open
-                )));
-                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
-            }
+            let mut parts = object_parameters(&f.args, &block)?;
             parts.push(Part::Text(m.call_close.to_owned()));
             Ok(parts)
         },

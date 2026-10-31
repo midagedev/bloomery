@@ -2108,7 +2108,16 @@ impl Gen {
         let probs = p.logprobs.as_ref().map(Ask::collector);
         let open = p.think_entry == ThinkEntry::Open;
         let (walk, held) = match &p.constraint {
-            Some(c) if open && c.follows_reasoning() => (None, Some(Walk::new(c, false))),
+            // A forced call and a watched one both wait for the model's own
+            // close of a span the prompt left open; a watched call waits for
+            // a span the model may still open too, an opener inside its own
+            // span reasoning as the parser reads it.
+            Some(c)
+                if c.follows_reasoning()
+                    && (open || (p.think_entry == ThinkEntry::MayOpen && c.waits_for_call())) =>
+            {
+                (None, Some(Walk::new(c, false)))
+            }
             c => (c.as_ref().map(|c| Walk::new(c, open)), None),
         };
         // A greedy request that changes no row reads the logits only for the
@@ -2333,7 +2342,9 @@ impl Gen {
             // The splitter sees even the stop scan's unsent prefix. At
             // handoff no unchosen text may remain there or in the decoder;
             // a matched stop discards the decoder tail instead of sending it.
-            if self.held.is_some()
+            // A watched call's free text may follow the span's end (a call
+            // opener the parser's rule ends it at is itself that text).
+            if self.held.as_ref().is_some_and(|w| !w.waiting())
                 && (!s
                     .content
                     .trim_matches(crate::reasoning::is_space)
@@ -2349,6 +2360,11 @@ impl Gen {
             if s.closed || !s.content.is_empty() {
                 self.think = None;
                 self.walk = self.walk.take().or_else(|| self.held.take());
+                if let Some(w) = self.walk.as_mut() {
+                    // The text past the span's end was taken freely; a
+                    // waiting walk reads it for its opener.
+                    w.fed(&s.content, s.ended_at_opener);
+                }
                 return Ok(false);
             }
             if s.opened {
@@ -2664,13 +2680,21 @@ impl Gen {
             self.tim.predicted_ms = ms_since(self.t1);
             tick(&self.tim);
             if self.stops.contains(&tok) {
-                if self.held.is_some() {
+                // A forced call still held ends the span unnamed; a watched
+                // one ends its reasoning as an unconstrained reply's span
+                // does, the answer its own.
+                if self.held.as_ref().is_some_and(|w| !w.waiting()) {
                     return Err(GenError::Unclosed);
                 }
                 self.stop = StopKind::Eos;
                 break;
             }
             let piece = self.dec.push(tok);
+            // The stream's text, before the next pick: a walk watching for
+            // its format's call opener reads it here.
+            if let Some(w) = self.walk.as_mut() {
+                w.saw(piece.as_deref().unwrap_or(""));
+            }
             // Where a special id's text is in its piece: the piece ends with
             // it, after any bytes the decoder held.
             let special = piece

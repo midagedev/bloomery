@@ -1,10 +1,12 @@
 //! A request's fields as a program of text.
 //!
 //! The JSON-schema subset (draft 2020-12 keywords, annotations ignored):
-//! - `type: object` with `properties`: every property is written, in the
-//!   schema's order, so the output holds each `required` property whether or
-//!   not the schema lists it. `required` may only name properties;
-//!   `additionalProperties` is accepted (none are written).
+//! - `type: object` with `properties`: the properties `required` names are
+//!   each written, in the schema's order, then the others in order, each of
+//!   which may be left out — llama.cpp's object rule
+//!   (`json-schema-to-grammar.cpp` `_build_object_rule`). `required` may
+//!   only name properties; `additionalProperties` is accepted (none are
+//!   written).
 //! - `type: string`, with an optional `maxLength`: a free string.
 //! - `type: integer` and `type: number`: a free JSON number; `type: boolean`
 //!   and `type: null`.
@@ -40,7 +42,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use super::Refusal;
-use super::program::{self, Alt, Constraint, Env, Part, Style};
+use super::program::{self, Alt, Constraint, Env, Opener, Part, Style};
 use super::vocab::Vocab;
 use crate::dsml::{ToolFormat, parses_tools};
 use crate::engine::Tokenizer;
@@ -597,25 +599,29 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
             ));
         }
     };
-    if let Some(r) = o.get("required") {
-        let Some(names) = r.as_array() else {
-            return Err(refuse(
-                path,
-                format!("required must be an array, not {}", type_of(r)),
-            ));
-        };
-        for n in names {
-            let known = n
-                .as_str()
-                .is_some_and(|n| props.is_some_and(|p| p.contains_key(n)));
-            if !known {
+    let required: Vec<&str> = match o.get("required") {
+        None => Vec::new(),
+        Some(r) => {
+            let Some(names) = r.as_array() else {
                 return Err(refuse(
                     path,
-                    format!("required names {n}, which properties does not hold"),
+                    format!("required must be an array, not {}", type_of(r)),
                 ));
+            };
+            for n in names {
+                let known = n
+                    .as_str()
+                    .is_some_and(|n| props.is_some_and(|p| p.contains_key(n)));
+                if !known {
+                    return Err(refuse(
+                        path,
+                        format!("required names {n}, which properties does not hold"),
+                    ));
+                }
             }
+            names.iter().filter_map(Value::as_str).collect()
         }
-    }
+    };
     let args: Vec<Arg<'_>> = props
         .into_iter()
         .flatten()
@@ -623,29 +629,109 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
             key,
             schema: Cow::Borrowed(schema),
             path: format!("{path}.properties.{key}"),
+            required: required.contains(&key.as_str()),
         })
         .collect();
     object_of(&args, inner)
 }
 
 /// An object whose properties are `args`, as JSON with its strings in the
-/// style `inner`.
+/// style `inner`: the properties `required` names, in the schema's order,
+/// each written, then the others in order, each of which may be left out —
+/// a comma-led chain where any optional may be the first member written, as
+/// llama.cpp's object rule builds it.
 fn object_of(args: &[Arg<'_>], inner: Style) -> Result<Vec<Part>, Refusal> {
-    let mut parts = vec![Part::Text("{".to_owned())];
-    for (i, a) in args.iter().enumerate() {
-        let sep = if i == 0 { "" } else { ", " };
-        parts.push(Part::Text(format!("{sep}\"{}\": ", json_inner(a.key))));
+    /// One member: `sep`, the key, and the property's value.
+    fn member(a: &Arg<'_>, sep: &str, inner: Style) -> Result<Vec<Part>, Refusal> {
+        let mut parts = vec![Part::Text(format!("{sep}\"{}\": ", json_inner(a.key)))];
         parts.extend(value(&a.schema, inner, &a.path)?);
+        Ok(parts)
+    }
+    let optional: Vec<&Arg<'_>> = args.iter().filter(|a| !a.required).collect();
+    let mut parts = vec![Part::Text("{".to_owned())];
+    let mut written = false;
+    for a in args.iter().filter(|a| a.required) {
+        parts.extend(member(a, if written { ", " } else { "" }, inner)?);
+        written = true;
+    }
+    if !written && !optional.is_empty() {
+        // No property is required: any optional may be the object's first
+        // member, which carries no comma of its own, and none at all is the
+        // empty object.
+        parts.push(any_start(
+            &optional,
+            &|a| member(a, "", inner),
+            ", ",
+            Vec::new(),
+        )?);
+    } else {
+        for a in &optional {
+            parts.push(Part::Any(vec![Vec::new(), member(a, ", ", inner)?]));
+        }
     }
     parts.push(Part::Text("}".to_owned()));
     Ok(parts)
 }
 
-/// One argument of a tool: its name and schema, its `$ref`s written out.
+/// One tool's parameters in a chat format's markup: the `required` ones, in
+/// the schema's order, each written, then the optional ones in order, each
+/// of which may be left out — the object rule ([`object_of`]) where `block`
+/// spells one parameter, a run that carries its own framing so any two are
+/// neighbours apart. [`any_start`] takes over where no parameter is
+/// required and the format writes something of its own for a call that
+/// writes none (a DSML invoke's empty line).
+pub(crate) fn object_parameters(
+    args: &[Arg<'_>],
+    block: &impl Fn(&Arg<'_>) -> Result<Vec<Part>, Refusal>,
+) -> Result<Vec<Part>, Refusal> {
+    let mut parts = Vec::new();
+    for a in args.iter().filter(|a| a.required) {
+        parts.extend(block(a)?);
+    }
+    for a in args.iter().filter(|a| !a.required) {
+        parts.push(Part::Any(vec![Vec::new(), block(a)?]));
+    }
+    Ok(parts)
+}
+
+/// The optional `args` where any of them may be the first written: one
+/// alternative per property, each written bare and followed by a fork per
+/// later one — `sep` before it, a comma for a JSON member, nothing for a
+/// markup block — with `none` first, what is written where every optional
+/// is left out (the empty object; a DSML invoke's empty line). llama.cpp's
+/// object rule builds this shape for an object no property of which is
+/// required. Each property's bare parts are built once and shared
+/// ([`Part::Run`]): the alternatives repeat them, and a schema costs its
+/// size, not their product.
+pub(crate) fn any_start(
+    args: &[&Arg<'_>],
+    bare: &impl Fn(&Arg<'_>) -> Result<Vec<Part>, Refusal>,
+    sep: &str,
+    none: Vec<Part>,
+) -> Result<Part, Refusal> {
+    let members: Vec<Arc<[Part]>> = args
+        .iter()
+        .map(|a| bare(a).map(Arc::from))
+        .collect::<Result<_, Refusal>>()?;
+    let mut alts = vec![none];
+    for i in 0..members.len() {
+        let mut alt = vec![Part::Run(Arc::clone(&members[i]))];
+        for member in &members[i + 1..] {
+            let later = vec![Part::Text(sep.to_owned()), Part::Run(Arc::clone(member))];
+            alt.push(Part::Any(vec![Vec::new(), later]));
+        }
+        alts.push(alt);
+    }
+    Ok(Part::Any(alts))
+}
+
+/// One argument of a tool: its name and schema, its `$ref`s written out,
+/// and whether the tool's `required` names it.
 pub(crate) struct Arg<'a> {
     pub key: &'a str,
     pub schema: Cow<'a, Value>,
     pub path: String,
+    pub required: bool,
 }
 
 /// A tool the request names.
@@ -751,6 +837,13 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                     _ => Map::new(),
                 };
                 // `written_out` keeps every property, in order.
+                let required: Vec<&str> = p
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
                 p.get("properties")
                     .and_then(Value::as_object)
                     .into_iter()
@@ -762,6 +855,7 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                             key,
                             schema: Cow::Owned(schema),
                             path: format!("{here}.properties.{key}"),
+                            required: required.contains(&key.as_str()),
                         })
                     })
                     .collect::<Result<_, Refusal>>()?
@@ -881,6 +975,51 @@ fn response_schema(o: &Map<String, Value>) -> Result<Reply<'_>, Refusal> {
     }
 }
 
+/// The constraint of a `tool_choice: auto` request with tools to scan for:
+/// free text until the model opens a call — the format's own opener, then
+/// the program a forced call compiles from there — and free text again past
+/// the call's close, each further opener starting the program again.
+/// `Ok(None)` where no watch serves the request: a format no watch reads
+/// (Muse Spark's recipient slot names the answer's channels (`self`,
+/// `commentary`, `user`) as well as a tool, so no opener of its own can
+/// start a call's program), and tools whose parameters the schema subset
+/// cannot compile — `auto` constrains what it can serve and leaves the
+/// rest to the model, where a forced choice (`required`, a named function)
+/// refuses the request by name.
+fn watch(
+    o: &Map<String, Value>,
+    ask: &Ask<'_>,
+    env: &Env<'_>,
+) -> Result<Option<Constraint>, Refusal> {
+    let tools = o
+        .get("tools")
+        .expect("parses_tools held a non-empty tools array");
+    let Some((text, parts)) = funs(tools)
+        .ok()
+        .and_then(|funs| ask.format.lazy_parts(&funs).ok().flatten())
+    else {
+        return Ok(None);
+    };
+    let Ok(prog) = program::compile(&parts, env) else {
+        return Ok(None);
+    };
+    // The opener is watched for by the one special token the vocabulary
+    // holds for it, where it holds one, as the format's own scan reads it.
+    let special = match ask.tok.encode(text)[..] {
+        [id] if ask.tok.is_special(id) => Some(id),
+        _ => None,
+    };
+    Ok(Some(Constraint::waiting_for(
+        Opener {
+            text,
+            special,
+            prog: Arc::new(prog),
+        },
+        ask.tok.encode(&format!("{}\n\n", ask.think.close)),
+        Arc::clone(ask.vocab),
+    )))
+}
+
 /// The constraint a request's fields ask for, `None` for a request that
 /// asks for none. A tool call and a schema together are refused: a request
 /// has one program.
@@ -908,6 +1047,13 @@ pub(crate) fn request(
     } else {
         Style::Json
     };
+    // `tool_choice: auto` (or none given) with tools to scan for: the
+    // program starts where the model opens a call itself. A request without
+    // tools, a format no watch reads, and a JSON `response_format` (which
+    // keeps its own one program below) have none.
+    if forces.is_none() && matches!(reply, Reply::Text) && parses_tools(o) {
+        return watch(o, ask, &env);
+    }
     let call = forces.is_some();
     let (prog, rules) = match (reply, &forces) {
         (Reply::Text, None) => return Ok(None),

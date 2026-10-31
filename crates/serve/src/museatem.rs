@@ -43,7 +43,7 @@
 //! the complete parameters read so far.
 
 use crate::callstream::Args;
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
+use crate::constrain::{Arg, Fun, Part, Refusal, Style, call, is_text, object_parameters, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
@@ -348,26 +348,30 @@ fn json_value(raw: &str) -> String {
 
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`MuseScan`] — ` to=NAME<|message|>`, then the ATEM block with
-/// the template's own framing (a text value raw, any other as JSON).
+/// the template's own framing (a text value raw, any other as JSON), its
+/// parameters as the object rule writes them: the required ones, in the
+/// schema's order, then the optional ones, each of which may be left out.
 pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        let mut parts = vec![Part::Text(format!("{PARAM_OPEN}{key}\">", key = a.key))];
+        parts.extend(value(
+            &a.schema,
+            if is_text(&a.schema) {
+                Style::Raw
+            } else {
+                Style::JsonInMarkup
+            },
+            &a.path,
+        )?);
+        parts.push(Part::Text(format!("{PARAM_CLOSE}\n")));
+        Ok(parts)
+    };
     call(funs, TO, str::to_owned, |f| {
         let mut parts = vec![Part::Text(format!(
             "{MESSAGE}{CALLS_OPEN}\n{INVOKE_OPEN}{name}\">\n",
             name = f.name
         ))];
-        for a in &f.args {
-            parts.push(Part::Text(format!("{PARAM_OPEN}{key}\">", key = a.key)));
-            parts.extend(value(
-                &a.schema,
-                if is_text(&a.schema) {
-                    Style::Raw
-                } else {
-                    Style::JsonInMarkup
-                },
-                &a.path,
-            )?);
-            parts.push(Part::Text(format!("{PARAM_CLOSE}\n")));
-        }
+        parts.extend(object_parameters(&f.args, &block)?);
         parts.push(Part::Text(format!("{INVOKE_CLOSE}\n{CALLS_CLOSE}")));
         Ok(parts)
     })

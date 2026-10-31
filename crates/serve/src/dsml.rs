@@ -43,7 +43,9 @@ use serde_json::{Map, Value, json};
 use crate::callstream::{
     self, Advance, Args, CallPiece, Progress, Reading, Streamer, find_from, held, read_value,
 };
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
+use crate::constrain::{
+    Arg, Fun, Part, Refusal, Style, any_start, call, is_text, object_parameters, value,
+};
 use crate::engine::Tokenizer;
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
@@ -1160,6 +1162,25 @@ impl ToolFormat {
             }),
         }
     }
+
+    /// The opener a `tool_choice: auto` reply is watched for in this
+    /// format's markup, and the call as parts once the model writes it:
+    /// [`ToolFormat::call_parts`] less the opener, which the free text has
+    /// already written. `None` for a format no watch reads: Muse Spark's
+    /// recipient slot names the answer's channels as well as a tool, and
+    /// markup nothing parses has no opener to watch.
+    pub(crate) fn lazy_parts(
+        self,
+        funs: &[Fun<'_>],
+    ) -> Result<Option<(&'static str, Vec<Part>)>, Refusal> {
+        match self {
+            ToolFormat::Hermes => hermes::lazy_parts(funs).map(Some),
+            ToolFormat::QwenXml(framing) => qwenxml::lazy_parts(framing, funs).map(Some),
+            ToolFormat::KvMarkup(spelling) => glmxml::lazy_parts(spelling, funs).map(Some),
+            ToolFormat::Dsml(spelling) => lazy_parts(spelling, funs).map(Some),
+            ToolFormat::MuseSpark | ToolFormat::Unparsed => Ok(None),
+        }
+    }
 }
 
 /// The call this markup spells, as the parts structured output forces: the
@@ -1173,19 +1194,75 @@ pub(crate) fn call_parts(spelling: Spelling, funs: &[Fun<'_>]) -> Result<Vec<Par
         &format!("{}\n{}", t.calls_open, t.invoke_open),
         str::to_owned,
         |f| {
-            let mut parts = vec![Part::Text("\">\n".to_owned())];
-            for a in &f.args {
-                parts.push(Part::Text(format!(
-                    "{}{}\" string=\"{}\">",
-                    t.param_open,
-                    a.key,
-                    is_text(&a.schema)
-                )));
-                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(format!("{}\n", t.param_close)));
-            }
-            parts.push(Part::Text(format!("{}\n{}", t.invoke_close, t.calls_close)));
+            let mut parts = body(t, f)?;
+            parts.push(Part::Text(format!("\n{}", t.calls_close)));
             Ok(parts)
         },
     )
+}
+
+/// The opener a `tool_choice: auto` reply is watched for — the tool_calls
+/// block's opening tag, in the template's spelling — and the block as parts
+/// once the model writes it: [`call_parts`] less the opener, which the free
+/// text has already written. The block holds one invoke after another, each
+/// held to its schema, until the model closes it (the template writes a
+/// conversation's calls in one block).
+pub(crate) fn lazy_parts(
+    spelling: Spelling,
+    funs: &[Fun<'_>],
+) -> Result<(&'static str, Vec<Part>), Refusal> {
+    let t = spelling.tags();
+    let open = format!("\n{}", t.invoke_open);
+    // The block's end after an invoke: the model closes it or opens another
+    // invoke, which ends the same way.
+    let again = Part::Rep {
+        close: vec![Part::Text(format!("\n{}", t.calls_close))],
+        more: call(funs, &open, str::to_owned, |f| body(t, f))?,
+    };
+    let parts = call(funs, &open, str::to_owned, |f| {
+        let mut parts = body(t, f)?;
+        parts.push(again.clone());
+        Ok(parts)
+    })?;
+    Ok((t.calls_open, parts))
+}
+
+/// One invoke's own text, after its function's name: a `parameter` block per
+/// parameter as the object rule writes them — the required ones, in the
+/// schema's order, then the optional ones, each of which may be left out
+/// (`string="true"` around a text value, `string="false"` around any other)
+/// — the template's own empty line for a call that writes no parameter at
+/// all, and the invoke's close.
+fn body(t: &Tags, f: &Fun<'_>) -> Result<Vec<Part>, Refusal> {
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        let mut parts = vec![Part::Text(format!(
+            "{}{}\" string=\"{}\">",
+            t.param_open,
+            a.key,
+            is_text(&a.schema)
+        ))];
+        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        parts.push(Part::Text(format!("{}\n", t.param_close)));
+        Ok(parts)
+    };
+    let optional: Vec<&Arg<'_>> = f.args.iter().filter(|a| !a.required).collect();
+    let mut parts = vec![Part::Text("\">\n".to_owned())];
+    if !optional.is_empty() && !f.args.iter().any(|a| a.required) {
+        // No parameter is required: whichever are written come in order, and
+        // the template's own empty line where none is.
+        parts.push(any_start(
+            &optional,
+            &block,
+            "",
+            vec![Part::Text("\n".to_owned())],
+        )?);
+    } else {
+        parts.extend(object_parameters(&f.args, &block)?);
+        if f.args.is_empty() {
+            // The template's own empty line for a call of no parameters.
+            parts.push(Part::Text("\n".to_owned()));
+        }
+    }
+    parts.push(Part::Text(t.invoke_close.to_owned()));
+    Ok(parts)
 }

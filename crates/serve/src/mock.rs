@@ -1551,10 +1551,20 @@ impl Engine for DraftMock {
 /// output a parser gate scripts. Tokens are [`MockTokenizer`]'s, so the special
 /// strings are single ids and everything else goes byte by byte;
 /// [`ScriptedEngine::with_stops`] gives it a vocabulary with other stop ids.
+///
+/// The script is served as the ids the engine is fed, not as a count of its
+/// rows: a prefill that continues the script (a jump arm feeding the fixed
+/// ids of a program) advances it — its first id re-feeds the last one stepped
+/// — where the prompt, which spells none of it, leaves it alone.
 pub struct ScriptedEngine {
     script: Vec<u32>,
+    /// The script's ids consumed so far: the ids fed since the generation
+    /// began, the jump arm's calls among them.
     at: usize,
     pos: usize,
+    /// Whether a generation's first row has been asked for: prefills before
+    /// it are the prompt, ones after it a call the jump arm feeds.
+    started: bool,
     ctx_max: usize,
     tok: Arc<dyn Tokenizer>,
 }
@@ -1573,8 +1583,21 @@ impl ScriptedEngine {
             script,
             at: 0,
             pos: 0,
+            started: false,
             ctx_max,
             tok: Arc::new(MockTokenizer),
+        }
+    }
+
+    /// Consumes `ids` as the script's next ones, stopping at the first the
+    /// script does not hold: what the engine is fed is what its script has
+    /// written.
+    fn consume(&mut self, ids: &[u32]) {
+        for &id in ids {
+            if self.script.get(self.at) != Some(&id) {
+                break;
+            }
+            self.at += 1;
         }
     }
 
@@ -1663,10 +1686,15 @@ impl Engine for ScriptedEngine {
 
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
         self.pos += ids.len();
+        if self.started {
+            // A call's first id re-feeds the last one consumed.
+            let skip = usize::from(self.at > 0 && ids.first() == self.script.get(self.at - 1));
+            self.consume(&ids[skip..]);
+        }
         Ok(())
     }
 
-    fn next(&mut self, _last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+    fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         if self.pos >= self.ctx_max {
             return Err(EngineError(format!(
                 "scripted: position {} is past ctx_max {}",
@@ -1674,12 +1702,16 @@ impl Engine for ScriptedEngine {
             )));
         }
         self.pos += 1;
+        if self.started {
+            self.consume(std::slice::from_ref(&last));
+        } else {
+            self.started = true;
+        }
         let id = self
             .script
             .get(self.at)
             .copied()
             .unwrap_or_else(|| self.tok.eos());
-        self.at += 1;
         if let Some(l) = logits_out {
             l.fill(FLOOR);
             if let Some(slot) = usize::try_from(id).ok().and_then(|i| l.get_mut(i)) {
@@ -1692,6 +1724,7 @@ impl Engine for ScriptedEngine {
     fn reset(&mut self) -> Result<(), EngineError> {
         self.at = 0;
         self.pos = 0;
+        self.started = false;
         Ok(())
     }
 

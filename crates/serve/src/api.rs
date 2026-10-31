@@ -2300,12 +2300,14 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
     Ok(bias.into_iter().filter(|&(_, b)| b != 0.0).collect())
 }
 
-/// Whether `p`'s program is a forced tool call that starts after the model's
-/// own close of an open think span ([`constrain::Constraint::follows_reasoning`]).
+/// Whether the reply is one program's from the think span's own close (a
+/// forced call), so the parser's span ends only there and a call opener
+/// inside it is reasoning; a watched call (`tool_choice: auto`) keeps the
+/// parser's own end rule, which a call opener may end (Qwen3-Coder's).
 fn follows_reasoning(p: &GenParams) -> bool {
     p.constraint
         .as_ref()
-        .is_some_and(constrain::Constraint::follows_reasoning)
+        .is_some_and(constrain::Constraint::forced)
 }
 
 /// What a structured-output request leaves out: `ignore_eos` would ban the id
@@ -10436,13 +10438,17 @@ mod tests {
 
     /// The think budget runs on the seat's tags. A script that never closes
     /// its span, `reasoning_budget` 4: the first four ids are the reasoning
-    /// and `<|think:end|>` is forced in place of the next 13 (the mock spells
-    /// it a byte an id), so the content resumes after them. A script that
-    /// closes the span itself inside a budget it does not spend: the tracker
-    /// reads the seat's close, retires, and forces nothing.
+    /// and `<|think:end|>` is forced after them — the scripted engine's
+    /// script stands where it stood, its next ids the forced close holds none
+    /// of, so the content resumes there. A script that closes the span
+    /// itself inside a budget it does not spend: the tracker reads the seat's
+    /// close, retires, and forces nothing.
     #[test]
     fn a_seats_tags_close_and_retire_the_reasoning_budget() {
-        const SCRIPT: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+        // Digits first: no id of the script spells a byte of the forced
+        // close's own text, which the engine would otherwise take for the
+        // script's next one.
+        const SCRIPT: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
         let budgeted = |script: &str, budget: usize| {
             let addr = solar_template_server(
                 Box::new(crate::ScriptedEngine::new(4096, script)),
@@ -10457,12 +10463,8 @@ mod tests {
             )
         };
         let capped = budgeted(SCRIPT, 4);
-        assert_eq!(capped["reasoning_content"], "abcd", "{capped}");
-        assert_eq!(
-            capped["content"],
-            SCRIPT[4 + ThinkTags::SOLAR.close.len()..],
-            "{capped}"
-        );
+        assert_eq!(capped["reasoning_content"], "0123", "{capped}");
+        assert_eq!(capped["content"], SCRIPT[4..], "{capped}");
         let closed = format!("ab{}{}", ThinkTags::SOLAR.close, &SCRIPT[..24]);
         let natural = budgeted(&closed, 20);
         assert_eq!(natural["reasoning_content"], "ab", "{natural}");

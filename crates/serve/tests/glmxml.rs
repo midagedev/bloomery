@@ -499,6 +499,19 @@ fn tool_body(stream: bool) -> Value {
     })
 }
 
+/// [`tool_body`] over tools whose `tags` array schema the structured-output
+/// subset cannot compile: `tool_choice` auto leaves such a reply to the model
+/// (no watch), so the markup the script writes reaches the scan as it is.
+fn malformed_body(stream: bool) -> Value {
+    let mut b = tool_body(stream);
+    b["tools"]
+        .as_array_mut()
+        .expect("tools")
+        .push(json!({"type": "function", "function": {"name": "note",
+            "parameters": {"type": "object", "properties": {"tags": {"type": "array"}}}}}));
+    b
+}
+
 /// A streamed chat body folded back into `(finish_reason, message)`, call ids
 /// left out; `Err` with its message when the stream ended on an error event.
 fn fold_stream(body: &str) -> Result<(Value, Value), String> {
@@ -596,14 +609,14 @@ fn hw_glm_malformed_call_is_an_api_error() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
+        let r = post(addr, "/v1/chat/completions", &malformed_body(false));
         assert_eq!(r.status, 500, "{}", r.body);
         let m = r.json()["error"]["message"]
             .as_str()
             .unwrap_or("")
             .to_owned();
         assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
+        let r = post(addr, "/v1/chat/completions", &malformed_body(true));
         assert_eq!(r.status, 200, "{}", r.body);
         let e = fold_stream(&r.body).expect_err("an error event");
         assert!(e.starts_with(want), "{e}");

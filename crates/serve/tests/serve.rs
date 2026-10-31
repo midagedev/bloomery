@@ -586,7 +586,8 @@ fn hw_structured_output_is_served() {
     let addr = start(4096);
     let schema = json!({"type": "object", "properties": {
         "id": {"type": "integer", "enum": [7, 8]}, "ok": {"type": "boolean"},
-        "tag": {"type": "string", "maxLength": 5}}});
+        "tag": {"type": "string", "maxLength": 5}},
+        "required": ["id", "ok", "tag"]});
     let rf = json!({"type": "json_schema", "json_schema": {"name": "r", "schema": schema}});
     let valid = |text: &str| {
         let v: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
@@ -2910,7 +2911,9 @@ fn hw_tools_under_an_unparsed_markup_are_refused() {
 /// `logit_bias_eog`: a script that emits one of GLM's three stops gets the
 /// best other id instead (the scripted logits leave every other id tied at
 /// the floor, so greedy takes id 0), greedy and sampled alike, and the
-/// generation runs to `n_predict`.
+/// generation runs to `n_predict`. The scripted model holds its stop — none
+/// of it written is the script's own text — so greedy takes id 0 until the
+/// limit.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_ignore_eos_bans_every_stop_id() {
@@ -2945,11 +2948,7 @@ fn hw_ignore_eos_bans_every_stop_id() {
             );
             assert_eq!(r["stopped_limit"], true, "{at}");
             if temperature == 0.0 {
-                assert_eq!(
-                    tokens,
-                    [u64::from(a), 0, u64::from(b), u64::from(b)],
-                    "{at}"
-                );
+                assert_eq!(tokens, [u64::from(a), 0, 0, 0], "{at}");
             }
         }
     }
@@ -3431,9 +3430,10 @@ fn think_chat(extra: Value) -> Value {
 }
 
 /// A never-closing script with `reasoning_budget` 4: the script's first four
-/// tokens are the reasoning, the close id is forced as the fifth taken token
-/// (the engine answer it displaces never appears), and the split consumes the
-/// tag — `</think>` shows in neither field.
+/// tokens are the reasoning, the close id is forced after them — the
+/// scripted model's script holds none of it, so the content resumes where
+/// the script stood — and the split consumes the tag: `</think>` shows in
+/// neither field.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_reasoning_budget_caps_the_span() {
@@ -3450,20 +3450,18 @@ fn hw_reasoning_budget_caps_the_span() {
         m["content"].as_str().unwrap_or(""),
     );
     assert_eq!(reasoning, "abcd", "{r}");
-    // The script's `e` is the answer the arming step displaced; the content
-    // resumes at `f`.
-    assert_eq!(content, "fghijkl", "{r}");
+    assert_eq!(content, "efghijkl", "{r}");
     assert!(
         !reasoning.contains("</think>") && !content.contains("</think>"),
         "{r}"
     );
-    assert_eq!(r["usage"]["completion_tokens"], json!(13), "{r}");
+    assert_eq!(r["usage"]["completion_tokens"], json!(14), "{r}");
     assert_eq!(r["choices"][0]["finish_reason"], json!("stop"), "{r}");
 }
 
 /// `reasoning_budget` 0 closes the span before any model token: no reasoning,
-/// and the content starts at the script's second token — the first is the
-/// answer the force displaced at the prompt's step.
+/// and the content is the script whole — the forced close displaces none of
+/// it.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_reasoning_budget_zero_closes_at_once() {
@@ -3476,8 +3474,8 @@ fn hw_reasoning_budget_zero_closes_at_once() {
     .json();
     let m = &r["choices"][0]["message"];
     assert!(m.get("reasoning_content").is_none(), "{r}");
-    assert_eq!(m["content"], json!("bcdefghijkl"), "{r}");
-    assert_eq!(r["usage"]["completion_tokens"], json!(13), "{r}");
+    assert_eq!(m["content"], json!("abcdefghijkl"), "{r}");
+    assert_eq!(r["usage"]["completion_tokens"], json!(14), "{r}");
 }
 
 /// Absent, `null` and `-1` are the one unrestricted spelling: identical
@@ -3571,7 +3569,8 @@ fn hw_reasoning_budget_ignored_when_the_span_is_closed() {
 
 /// `/completion` carries the budget too, its prompt a string or an id array
 /// (the array decoded for the span check): the raw reply shows the forced
-/// close in place, the third taken token.
+/// close in place, the third taken token, and the script resumes whole — the
+/// close displaces none of it.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_reasoning_budget_on_a_completion_prompt() {
@@ -3590,11 +3589,11 @@ fn hw_reasoning_budget_on_a_completion_prompt() {
         )
         .json();
         let at = format!("prompt {prompt}: {r}");
-        assert_eq!(r["content"], json!("ab</think>defghijkl"), "{at}");
+        assert_eq!(r["content"], json!("ab</think>cdefghijkl"), "{at}");
         let tokens = ids(&r["tokens"]);
         assert_eq!(tokens[2], close[0], "{at}");
-        assert_eq!(tokens.len(), 13, "{at}");
-        assert_eq!(r["tokens_predicted"], json!(13), "{at}");
+        assert_eq!(tokens.len(), 14, "{at}");
+        assert_eq!(r["tokens_predicted"], json!(14), "{at}");
     }
 }
 
