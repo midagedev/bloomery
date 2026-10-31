@@ -121,6 +121,13 @@ const EOG_NAMES: &[&str] = &[
 ];
 const ALWAYS_RENDERED: &[&str] = &["<|channel|>", "<|message|>", "<|start|>", "<|constrain|>"];
 
+/// The `tokenizer.ggml.pre` names whose decoded text is cleaned as the reference's
+/// `clean_spaces` does: its BPE default, which the llama3 type keeps (llama-vocab.cpp sets it
+/// true for every BPE and the type's branch does not clear it) and most other types clear. This
+/// list holds the names whose cleaning is on; a name absent here decodes as this crate always
+/// has.
+const CLEAN_SPACES: &[&str] = &["llama-bpe"];
+
 /// A `tokenizer.ggml.model` this crate runs.
 #[derive(Clone, Copy)]
 pub(crate) enum Model {
@@ -185,6 +192,9 @@ pub(crate) struct Vocab {
     pub(crate) specials: Specials,
     pub(crate) add_bos: bool,
     pub(crate) add_eos: bool,
+    /// Whether decoded text has its spaces cleaned, the reference's `clean_spaces` for the
+    /// pre-tokenizer's name ([`CLEAN_SPACES`]).
+    pub(crate) clean_spaces: bool,
     pub(crate) eog: Vec<u32>,
     /// Roles the reference fills from the first matching token in hash-map
     /// order, where more than one candidate text is in this vocabulary — the
@@ -389,6 +399,7 @@ impl Vocab {
             attrs.push(types.as_ref().map_or(attr::NORMAL, |t| attr_of_type(t[i])));
         }
 
+        let mut clean_spaces = false;
         let (pre, encoding) = match model {
             Model::Gpt2 | Model::Gemma4 => {
                 let name = match model {
@@ -397,6 +408,7 @@ impl Vocab {
                 };
                 let pre = crate::named(&Pre::NAMES, name)
                     .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
+                clean_spaces = CLEAN_SPACES.contains(&name);
                 // Only the private stop key marks a Hugging Face tokenizer, whose pre-tokenizer
                 // runs as its tokenizer.json does.
                 let hf = explicit_stops.is_some();
@@ -520,6 +532,7 @@ impl Vocab {
             specials: sp,
             add_bos,
             add_eos,
+            clean_spaces,
             eog: Vec::new(),
             ambiguous_roles: Vec::new(),
             keys_read: std::mem::take(&mut m.read),

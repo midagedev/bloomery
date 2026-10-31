@@ -94,6 +94,7 @@ impl Tokenizer for Vocab {
         Box::new(VocabDecoder {
             tok: Arc::clone(&self.tok),
             pending: Vec::new(),
+            cleaner: self.tok.space_cleaner(),
         })
     }
 
@@ -136,11 +137,13 @@ impl Tokenizer for Vocab {
 
 /// `tokenizer::Decoder`'s rule over an owned vocabulary handle: pieces with
 /// special tokens rendered, an incomplete UTF-8 tail held, an invalid
-/// sequence replaced by U+FFFD. `tokenizer::Decoder` borrows its vocabulary,
+/// sequence replaced by U+FFFD, and spaces cleaned where the vocabulary cleans them
+/// (`tokenizer::Tokenizer::space_cleaner`). `tokenizer::Decoder` borrows its vocabulary,
 /// and the server's decoder must outlive the call that made it.
 struct VocabDecoder {
     tok: Arc<tokenizer::Tokenizer>,
     pending: Vec<u8>,
+    cleaner: Option<tokenizer::SpaceCleaner>,
 }
 
 impl Decoder for VocabDecoder {
@@ -171,12 +174,20 @@ impl Decoder for VocabDecoder {
                 }
             }
         }
+        if let Some(cleaner) = &mut self.cleaner {
+            let cleaned = cleaner.push(&out);
+            out = cleaned;
+        }
         (!out.is_empty()).then_some(out)
     }
 
     fn flush(&mut self) -> String {
-        let rest = String::from_utf8_lossy(&self.pending).into_owned();
+        let mut rest = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
+        if let Some(cleaner) = &mut self.cleaner {
+            rest = cleaner.push(&rest);
+            rest.push_str(&cleaner.finish());
+        }
         rest
     }
 }
