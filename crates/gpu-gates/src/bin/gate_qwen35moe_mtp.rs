@@ -4,10 +4,10 @@
 //!
 //! What is asserted, on the real unsloth `UD-Q4_K_M` file that carries the
 //! layer (`blk.40`: full attention and a routed MoE with the trunk's shapes,
-//! beside `nextn.{eh_proj, enorm, hnorm, shared_head_norm}`), pinned by its
-//! `general.name` and its size:
+//! beside `nextn.{eh_proj, enorm, hnorm, shared_head_norm}`), named by
+//! `BLOOMERY_MTP_MODEL` and pinned by its `general.name` and its size:
 //! - (q) refusals by name at open, before any upload: the plain Qwen3.6 file
-//!   (no `nextn` tensor, no next-token layer) fails with the in-file rule's
+//!   (`BLOOMERY_REF_MODEL`: no `nextn` tensor, no next-token layer) fails with the in-file rule's
 //!   reason, not a missing-tensor error from the loader, and a media load.
 //! - (d) the draft's resident card bytes are the figure derived from the
 //!   file's tensor table: the layer's own tensors (a bf16 one, the router and
@@ -28,7 +28,8 @@
 //!   it was, and the step they interrupted repeats to the same token. A
 //!   second resident sequence (`add_slots(2)`) is refused by name and the
 //!   load keeps its one slot.
-//! - (s) the draft's acceptance against the target: a 64-id prompt through the target,
+//! - (s) the draft's acceptance against the target: a 64-id prompt of the shared prose
+//!   corpus (`prose_ids`, Qwen3.8's ids: the same vocabulary) through the target,
 //!   one step at a time for its own next tokens and in one pass for its
 //!   final-norm rows; the draft is then fed each position in order — the
 //!   prompt's next id, the position and the target's row of it — so its K/V
@@ -68,22 +69,22 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, bits_equal, checks_failed, data_dir, verdict,
+        GateError, bits_equal, checks_failed, open_split, prose_ids, verdict,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::GgmlType;
+    use model::arch::Arch;
     use model::arch::models::Mixer;
     use model::arch::qwen35moe::mtp::{EH_PROJ, ENORM, HNORM, InFile, SHARED_HEAD_NORM, in_file};
     use model::arch::qwen35moe::spec;
-    use refset::arch::qwen35moe::{D1K, IK, MODEL};
     use runtime::stores::dense_kv_bytes;
 
     const WHAT: &str = "gate_qwen35moe_mtp";
 
-    /// The file the gate runs on: unsloth's `UD-Q4_K_M` with its next-token
-    /// layer. Pinned by `general.name` and by its size in bytes.
-    const DRAFT_FILE: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+    /// The lever naming the file the gate runs on: unsloth's `UD-Q4_K_M` with
+    /// its next-token layer. Pinned by `general.name` and by its size in bytes.
+    const DRAFT_LEVER: &str = "BLOOMERY_MTP_MODEL";
     const DRAFT_NAME: &str = "Qwen3.6-35B-A3B";
     const DRAFT_BYTES: u64 = 22_663_387_424;
 
@@ -119,22 +120,23 @@ mod gate {
     /// The pinned file: qwen35moe, `general.name` [`DRAFT_NAME`], one shard
     /// of [`DRAFT_BYTES`].
     fn pinned() -> Result<Split, GateError> {
-        let file = Split::open(DRAFT_FILE).map_err(|e| format!("open {DRAFT_FILE}: {e}"))?;
+        let path = std::env::var(DRAFT_LEVER).map_err(|_| {
+            format!("{DRAFT_LEVER} unset: it names the {DRAFT_NAME} file with its next-token layer")
+        })?;
+        let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         if file.architecture() != Some("qwen35moe") {
-            return Err(format!("{DRAFT_FILE} is {:?}, not qwen35moe", file.architecture()).into());
+            return Err(format!("{path} is {:?}, not qwen35moe", file.architecture()).into());
         }
         let name = file.value("general.name").and_then(|v| v.as_str());
         if name != Some(DRAFT_NAME) {
-            return Err(
-                format!("{DRAFT_FILE}: general.name is {name:?}, not {DRAFT_NAME:?}").into(),
-            );
+            return Err(format!("{path}: general.name is {name:?}, not {DRAFT_NAME:?}").into());
         }
         let shard = file.shard_path(0).ok_or("the file has no first shard")?;
         let bytes = std::fs::metadata(shard)
             .map_err(|e| format!("{}: {e}", shard.display()))?
             .len();
         if bytes != DRAFT_BYTES {
-            return Err(format!("{DRAFT_FILE} is {bytes} bytes, not {DRAFT_BYTES}").into());
+            return Err(format!("{path} is {bytes} bytes, not {DRAFT_BYTES}").into());
         }
         Ok(file)
     }
@@ -144,21 +146,9 @@ mod gate {
         open_at(o, file).err().map(|e| e.to_string())
     }
 
-    /// The prompt ids: the first 1,024-token set's prose.
-    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, before) = man.step()?;
-        before.get(..n).map(<[u32]>::to_vec).ok_or_else(|| {
-            GateError::from(format!(
-                "the prose set holds {} ids, {n} asked for",
-                before.len()
-            ))
-        })
-    }
-
     /// (q): the refusals at open, before the card is touched.
     fn refusals_at_open() -> Result<bool, GateError> {
-        let plain = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let plain = open_split(Arch::Qwen35moe, "gate-gpu-qwen35moe-mtp")?;
         let r = open_error(plain, opts(false));
         let text = r.as_deref().unwrap_or("opened");
         let none_ok = r
@@ -633,7 +623,7 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let mut ok = refusals_at_open()?;
         let file = pinned()?;
-        let ids = prose(PROMPT)?;
+        let ids = prose_ids("qwen4exp", PROMPT)?;
         let mut m = open_at(opts(false), file)?;
         println!(
             "load: resident_bytes={} ctx={CTX} ubatch={UBATCH} prompt={PROMPT}",
