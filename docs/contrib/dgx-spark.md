@@ -139,8 +139,8 @@ smaller card defers it by name.
 asks the trained 262,144 positions and, where the GB10's one memory pool cannot hold that plan, takes the largest
 context under it, a multiple of 1,024, whose plan holds, so each count in the table starts without a context flag.
 `--parallel auto` serves the most slots, up to 8, whose plan holds one request's context: `--slot-ctx S` when set, else
-the context one slot takes with no flags ([`serving.md`](../serving.md#the-seats), "Concurrent requests"). On FP4-Local
-`--parallel auto` alone serves 3 slots of 262,144 (107.0 GB). The table is `bloomery-serve --plan`, which prints a
+the context one slot takes with no flags ([`serving.md`](../serving.md#the-seats), "Concurrent requests"). On either
+folder `--parallel auto` alone serves 3 slots of 262,144 (107.0 GB on FP4-Local, 110.5 GB on NVFP4). The table is `bloomery-serve --plan`, which prints a
 start's records and exits before it loads anything ([`serving.md`](../serving.md#flags-by-seat)), at main `0305ba7a` on
 one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB `MemAvailable` before each plan. The plan reads its
 room from `MemAvailable` (7.2), so a Spark with less free memory fits less: `--plan` with the same flags reads your own.
