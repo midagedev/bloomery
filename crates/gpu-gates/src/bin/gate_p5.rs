@@ -178,6 +178,103 @@ fn run() -> Result<(), GateError> {
         "kv_append_pos_buf",
     ])?;
 
+    // ==================================================== kv_gather_sel
+    // The cache rows a selection list picks, into a contiguous scratch the
+    // dense flash runs over (Mistral Large 4's roped layers): rows bit-equal
+    // to the source's by index, in list order, at counts below the stride,
+    // nothing written where the count is zero, and a list entry past the
+    // cache raising `CachePos` and copying no row. `kv_gather_sel` lives in
+    // the latent module; this package owns it.
+    {
+        use bloomery_gpu::latent::{KvGatherSelArgs, LatentKernels};
+        let latent = LatentKernels::load(gpu.context())?;
+        let (stride, rows, width) = (16usize, 40usize, 576usize);
+        let src: Vec<u16> = (0..rows * width)
+            .map(|i| 0x3800 + (i % 512) as u16)
+            .collect();
+        let src_dev = DeviceTensor::upload(stream, &src, rows, width)?;
+        let mut all = true;
+        for (label, list, n) in [
+            (
+                "full",
+                (0..stride)
+                    .map(|i| ((i * 2) % rows) as u32)
+                    .collect::<Vec<u32>>(),
+                stride,
+            ),
+            (
+                "part",
+                (0..stride)
+                    .map(|i| ((i + 3) % rows) as u32)
+                    .collect::<Vec<u32>>(),
+                5,
+            ),
+            ("one", vec![7; stride], 1),
+            (
+                "none",
+                (0..stride).map(|i| (i + 1) as u32).collect::<Vec<u32>>(),
+                0,
+            ),
+        ] {
+            let list_dev = cuda_core::DeviceBuffer::from_host(stream, &list)?;
+            let n_dev = cuda_core::DeviceBuffer::from_host(stream, &[n as u32])?;
+            let mut dst = DeviceTensor::zeroed(stream, stride, width)?;
+            latent.enqueue_kv_gather_sel(
+                stream,
+                KvGatherSelArgs {
+                    list: &list_dev,
+                    n: &n_dev,
+                    stride,
+                    src: &src_dev,
+                    fault: gpu.unlabelled_sink(),
+                    dst: &mut dst,
+                },
+            )?;
+            stream.synchronize()?;
+            let got = dst.buf().to_host_vec(stream)?;
+            let want: Vec<u16> = (0..n)
+                .flat_map(|i| {
+                    let r = list[i] as usize;
+                    src[r * width..(r + 1) * width].to_vec()
+                })
+                .collect();
+            let mut same = got[..want.len()] == want[..];
+            // The scratch past the count keeps what it held (zeroed here).
+            same &= got[want.len()..].iter().all(|&v| v == 0);
+            println!("kv_gather_sel {label}: rows bit-equal {same}");
+            all &= same;
+        }
+        // A list entry past the cache: the fault `CachePos`, no row copied.
+        let bad: Vec<u32> = std::iter::once(rows as u32 + 1)
+            .chain((1..stride).map(|i| i as u32))
+            .collect();
+        let bad_dev = cuda_core::DeviceBuffer::from_host(stream, &bad)?;
+        let n_dev = cuda_core::DeviceBuffer::from_host(stream, &[1u32])?;
+        let mut dst = DeviceTensor::zeroed(stream, stride, width)?;
+        latent.enqueue_kv_gather_sel(
+            stream,
+            KvGatherSelArgs {
+                list: &bad_dev,
+                n: &n_dev,
+                stride,
+                src: &src_dev,
+                fault: gpu.unlabelled_sink(),
+                dst: &mut dst,
+            },
+        )?;
+        stream.synchronize()?;
+        let refused = gpu
+            .take_fault()?
+            .is_some_and(|f| f.code == FaultSite::CachePos as u32)
+            && dst.buf().to_host_vec(stream)?.iter().all(|&v| v == 0);
+        println!("kv_gather_sel past_rows: raised and copied nothing {refused}");
+        all &= refused;
+        ok &= all;
+        if !all {
+            println!("kv_gather_sel FAIL");
+        }
+    }
+
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
     }
