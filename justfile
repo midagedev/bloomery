@@ -32,7 +32,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -40,7 +40,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
@@ -459,6 +459,19 @@ gate-gpu-nemotron-h-moe-e2e:
 [group('solo-real')]
 gate-gpu-musespark-e2e:
     BLOOMERY_MODEL=muse-spark ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_musespark_e2e && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_musespark_e2e'
+
+# Mistral Large 4's end-to-end gate (gate_mistrallarge4_e2e's doc). Fixture tier: the whole one-token
+# decode chain of the fixture's five layers (dense lead, roped full indexer, roped shared indexer, NoPE owner,
+# NoPE reader of the owner's cache) against mainline's node dumps (BLOOMERY_TIER=fixture just
+# dump-ref-mistrallarge4 writes fx_ref_mistrallarge4_{a,b} first): the structure clause's entries by layer kind,
+# eager = replay, reset rewinds, the cache rows carry, a NaN router lane raises the fault word, the selection
+# rule at every position past the fixture's top-k 16, every compared node at every layer and position within the
+# bands, and the greedy 32 of both sets above the band. Real tier: R5's (the placed load of the real file); the
+# oracle clauses are tagged so only the own-contract ones run. Wall [derived: the 430 MB fixture loads in well
+# under a minute; ~900 eager steps of five layers, 10-15 min].
+[group('solo-real')]
+gate-gpu-mistrallarge4-e2e:
+    BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features mistrallarge4 --release --bin gate_mistrallarge4_e2e && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mistrallarge4_e2e'
 
 # Muse Spark Open's prompt batch gate (gate_musespark_prefill's doc): the batch against the one-token steps over prompt lengths
 # spanning the 2048 window, in the logits row, layer 0's output and the stores, then a step after the batch; passes of 7 rows

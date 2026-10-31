@@ -71,6 +71,8 @@ bloomery-gpu-flint = { path = "../gpu-flint", optional = true }
 # gate).
 bloomery-gpu-gemma-embedding2 = { path = "../gpu-gemma-embedding2", optional = true }
 bloomery-gpu-gemma4a = { path = "../gpu-gemma4a", optional = true }
+# The Mistral Large 4 program, reached only through the `mistrallarge4` feature (its end-to-end gate).
+bloomery-gpu-mistrallarge4 = { path = "../gpu-mistrallarge4", optional = true }
 cuda-core = { workspace = true, optional = true }
 # A gate binary's own `#[cuda_module]` (`gate_kquant`: entries no engine binary links) needs the
 # device and host halves of cuda-oxide as direct dependencies: the macros emit `::cuda_host` and
@@ -165,6 +167,7 @@ minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3", "bloomery-app/minimaxm3"]
 flint = ["gpu", "dep:bloomery-gpu-flint", "bloomery-app/flint"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
+mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4"]
 
 [[bin]]
 name = "gate_gemma4a"
@@ -501,6 +504,10 @@ required-features = ["gpu", "checkpoint"]
 [[bin]]
 name = "gate_musespark_e2e"
 required-features = ["gpu"]
+
+[[bin]]
+name = "gate_mistrallarge4_e2e"
+required-features = ["mistrallarge4"]
 
 [[bin]]
 name = "gate_musespark_prefill"

@@ -26,6 +26,12 @@
 //! ape[i][d]) · key_i[d]` over the four members `i`, from their f16 rows —
 //! the pooled key the scores read (`kpool`).
 //!
+//! A fifth serves a selected attention over a cache the dense flash reads
+//! whole: [`LatentKernels::enqueue_kv_gather_sel`] copies the rows a
+//! selection list picks into a contiguous f16 scratch, each token's count
+//! read on the device, so the flash runs unchanged over the picked rows
+//! (Mistral Large 4's roped layers).
+//!
 //! Numeric contract (the host rules [`latent_append_host`] and
 //! [`index_key_append_host`] are these lists, op for op). Latent, one block
 //! of [`BLOCK`] threads per token, thread `t` owning values `t + 128·i`:
@@ -568,6 +574,78 @@ mod latent_kernels {
             fault.raise(FaultSite::PoolSelect);
         }
     }
+
+    /// The cache rows a selection list picks, gathered into a contiguous
+    /// scratch the dense latent attention runs over (attention is order-free
+    /// over its keys): block `b` serves token `t = b / stride`'s list entry
+    /// `i = b % stride`, copying row `list[t·stride + i]` of `src`
+    /// (`[rows × width]` f16) to row `t·stride + i` of `dst` (`[tokens·stride
+    /// × width]` f16). Token `t`'s count `n[t]` (the launch's device word,
+    /// `min` of its visible rows and its list's width, the caller's own
+    /// image) bounds the copy: a block at or past its token's count leaves,
+    /// so the scratch's rows below each token's count are its list's rows in
+    /// list order and the rest keep what they held. A list entry at or past
+    /// `rows` raises [`FaultSite::CachePos`] from lane 0 and copies nothing
+    /// — no row a later kernel could mistake for a picked one.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            list.len() >= tokens * stride,
+            n.len() >= tokens,
+            src.len() >= rows * width,
+            dst.len() >= tokens * stride * width
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn kv_gather_sel(
+        list: &[u32],
+        n: &[u32],
+        stride: u32,
+        rows: u32,
+        width: u32,
+        tokens: u32,
+        fault: FaultSink,
+        src: &[u16],
+        mut dst: DisjointSlice<u16>,
+    ) {
+        let b = thread::blockIdx_x() as usize;
+        let t = b / stride as usize;
+        if t >= tokens as usize {
+            return;
+        }
+        // SAFETY: t < tokens <= n.len() by the launch contract; the guard
+        // reads only the block's index, so every thread of the block leaves
+        // together before any collective.
+        if b % stride as usize >= unsafe { *n.get_unchecked(t) } as usize {
+            return;
+        }
+        // SAFETY: b < tokens·stride <= list.len() (the launch contract).
+        let row = unsafe { *list.get_unchecked(b) } as usize;
+        if row >= rows as usize {
+            if thread::threadIdx_x() == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            return; // block-uniform
+        }
+        let (src_base, dst_base) = (row * width as usize, b * width as usize);
+        let mut i = thread::threadIdx_x() as usize;
+        while i < width as usize {
+            // SAFETY: i < width, so src_base + i < (row + 1)·width <=
+            // rows·width <= src.len() and dst_base + i < (b + 1)·width <=
+            // tokens·stride·width <= dst.len() (the launch contract); thread
+            // i owns value i of its block's row.
+            unsafe {
+                *dst.get_unchecked_mut(dst_base + i) = *src.get_unchecked(src_base + i);
+            }
+            i += 256;
+        }
+    }
 }
 
 /// Where one token's parts sit in the stacked projection output: `m` rows of
@@ -636,6 +714,19 @@ pub struct IndexPoolArgs<'a> {
     pub m: usize,
     pub fault: FaultSink,
     pub pooled: &'a mut DeviceTensor<u16>,
+}
+
+/// [`LatentKernels::enqueue_kv_gather_sel`]'s arguments: token `t`'s picked
+/// rows at `list[t·stride ..]`, its count at `n[t]` (at most `stride`), the
+/// cache `src` (`[rows × width]` f16) the list indexes, and the scratch
+/// (`[tokens·stride × width]` f16) the gathered rows land in, token-major.
+pub struct KvGatherSelArgs<'a> {
+    pub list: &'a DeviceBuffer<u32>,
+    pub n: &'a DeviceBuffer<u32>,
+    pub stride: usize,
+    pub src: &'a DeviceTensor<u16>,
+    pub fault: FaultSink,
+    pub dst: &'a mut DeviceTensor<u16>,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream,
@@ -954,6 +1045,78 @@ impl LatentKernels {
             launch_u32(what, "m", m)?,
             fault,
             pooled.buf_mut(),
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the gather of the picked cache rows (`kv_gather_sel`): token
+    /// `t`'s first `n[t]` list entries' rows of `src` into its rows of `dst`,
+    /// in list order, for `a.n.len()` tokens. The grid comes from the list's
+    /// width and the token count, not from the counts, so a captured graph
+    /// replays at any count. Refused before the launch: no token or width, a
+    /// scratch of another width or fewer than `tokens·stride` rows, and
+    /// short `list` or `n`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_kv_gather_sel(
+        &self,
+        stream: &CudaStream,
+        a: KvGatherSelArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_kv_gather_sel";
+        let KvGatherSelArgs {
+            list,
+            n,
+            stride,
+            src,
+            fault,
+            dst,
+        } = a;
+        let tokens = n.len();
+        let (rows, width) = (src.rows(), src.cols());
+        if tokens == 0 || stride == 0 || width == 0 || rows == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need tokens, stride, width and rows >= 1, got tokens={tokens} stride={stride} \
+                     width={width} rows={rows}"
+                ),
+            ));
+        }
+        if dst.cols() != width || dst.rows() < tokens * stride {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the scratch is {}x{}, want at least {} rows of {width}",
+                    dst.rows(),
+                    dst.cols(),
+                    tokens * stride
+                ),
+            ));
+        }
+        if list.len() < tokens * stride {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "list.len() {} for {tokens} tokens of {stride} entries",
+                    list.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", tokens * stride)?;
+        let prep = self
+            .module
+            .prepare_kv_gather_sel(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.kv_gather_sel(
+            stream,
+            &prep,
+            list,
+            n,
+            launch_u32(what, "stride", stride)?,
+            launch_u32(what, "rows", rows)?,
+            launch_u32(what, "width", width)?,
+            launch_u32(what, "tokens", tokens)?,
+            fault,
+            src.buf(),
+            dst.buf_mut(),
         )?;
         Ok(())
     }

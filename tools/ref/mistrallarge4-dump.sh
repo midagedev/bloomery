@@ -35,6 +35,9 @@
 #                                              layer il reads the first `top_k-<j>` with j >= il (16, 17 and 18
 #                                              read `top_k-18`)
 #   Qcur_ssmax                                  the absorbed query, rope part in place, times the SSMax scale
+#   fattn_mla                                   the flash's weighted latent sum before the value up-projection
+#                                              (the CPU build takes the flash path; the card gate's `att`
+#                                              tap)
 #   kv_cmpr, Kcur                               the latent and the cache key (the NoPE layers' rope part is
 #                                              zero-filled), on the layers that own a cache: 39..71 read 35's
 #   ffn_inp, ffn_shexp, ffn_out                 the attention residual, the shared expert and the FFN output
@@ -72,7 +75,7 @@ CB_PATCH=
 CB_ARCH=mistral-large4
 CB_TITLE="mistrallarge4-dump — mainline llama.cpp's intermediate tensors, raw f32, little-endian"
 CB_IDS=mistrallarge4
-TAPS=attn_norm+indexer_q_ssmax+indexer_k+indexer_weights+top_k+Qcur_ssmax+kv_cmpr+Kcur+ffn_inp+ffn_moe_logits+ffn_moe_probs+ffn_moe_topk+ffn_moe_weights+ffn_moe_weights_norm+ffn_moe_out+ffn_shexp+ffn_out+l_out+result_norm
+TAPS=attn_norm+indexer_q_ssmax+indexer_k+indexer_weights+top_k+Qcur_ssmax+kv_cmpr+Kcur+fattn_mla+ffn_inp+ffn_moe_logits+ffn_moe_probs+ffn_moe_topk+ffn_moe_weights+ffn_moe_weights_norm+ffn_moe_out+ffn_shexp+ffn_out+l_out+result_norm
 # name:ids:nodes:greedy — nodes joined by `+`.
 CB_PROMPTS=("a:a:$TAPS:32" "b:b:$TAPS:32")
 CB_FLAGS=()

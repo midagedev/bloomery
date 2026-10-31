@@ -203,25 +203,18 @@ fn yarn(keys: &YarnKeys) -> Yarn {
 }
 
 /// The most positions a load of the file `spec` describes serves today: its
-/// `ctx_train` within the indexer's own `top_k` — the selection the identity
-/// up to that many positions (every position kept), the selected flash a
-/// later round adds — so a context past it is refused by name
-/// ([`PastLimit`] names `index_topk`) and the load stops, never a cut.
+/// `ctx_train` — the selected attention (the gathered flash on a roped layer,
+/// the selected walk on a NoPE one) serves any depth the plan holds, past
+/// the indexer's own `top_k` included, so the trained context is the only
+/// bound and a context past it is refused by name and the load stops, never
+/// a cut.
 ///
 /// # Errors
 /// [`PastLimit`] when `ctx` is past [`CtxLimit::limit`].
 pub fn serve_ctx(ctx: u64, spec: &ModelSpec) -> Result<u64, PastLimit> {
-    let k = spec
-        .layers
-        .iter()
-        .find_map(|l| match l.latent().and_then(|a| a.select.as_ref()) {
-            Some(Selector::StreamTopK { k, .. }) => Some(u64::from(*k)),
-            _ => None,
-        })
-        .expect("every mistral-large4 layer selects by a top-k over its positions");
     let bounds = CtxLimit {
         trained: u64::from(spec.ctx_train),
-        kernel: Some((k, "index_topk")),
+        kernel: None,
         verified: None,
     };
     check_slot_ctx(ctx, &bounds)
@@ -814,18 +807,17 @@ mod tests {
         }
     }
 
-    /// A context within the indexer's own top-k serves, one past it is
-    /// refused naming `index_topk` and both counts, and the trained context
-    /// never binds above it. Mutant: the bound dropped (a cut, or none).
+    /// A context past the indexer's own top-k serves — the selected
+    /// attention's own depth — and one past the trained context is refused
+    /// naming it. Mutant: the trained bound dropped (a cut, or none).
     #[test]
-    fn a_context_past_the_indexers_own_top_k_is_named() {
+    fn a_context_past_the_top_k_serves_and_past_the_trained_one_is_named() {
         let read = load("ml4-ctx", &keys()).expect("the header reads");
-        assert_eq!(super::serve_ctx(TOP_K as u64, &read.spec), Ok(TOP_K as u64));
-        let err = super::serve_ctx(TOP_K as u64 + 1, &read.spec).expect_err("past the top-k");
+        assert_eq!(super::serve_ctx(TOP_K as u64 + 1, &read.spec), Ok(64));
+        assert_eq!(super::serve_ctx(64, &read.spec), Ok(64));
+        let err = super::serve_ctx(65, &read.spec).expect_err("past the trained context");
         assert!(
-            err.to_string().contains("index_topk")
-                && err.to_string().contains(&format!("limit of {TOP_K}"))
-                && err.to_string().contains("trained at 64"),
+            err.to_string().contains("trained at 64") && err.to_string().contains("limit of 64"),
             "{err}"
         );
     }
