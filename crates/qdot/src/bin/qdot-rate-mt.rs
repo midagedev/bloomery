@@ -17,7 +17,7 @@ use std::sync::{Barrier, Mutex};
 use std::time::Instant;
 
 use gguf::GgmlType;
-use threads::{chunk_bounds, pin_self, pinned_cpus};
+use threads::{chunk_bounds, pin, pinned_cpus};
 
 /// Timed-section target per cell.
 const TARGET_SECS: f64 = 3.0;
@@ -162,7 +162,7 @@ fn dot_iq1s_generic(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
 /// here would leave the start barrier short and the run wedged.
 fn pin_thread(pins: &[u32], t: usize, failed: &Mutex<Vec<String>>) {
     let cpu = pins[t];
-    if let Err(e) = pin_self(cpu) {
+    if let Err(e) = pin(cpu) {
         failed
             .lock()
             .unwrap_or_else(|e| e.into_inner())

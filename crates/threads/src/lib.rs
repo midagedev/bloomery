@@ -778,11 +778,13 @@ pub fn report() -> Result<PoolPlan, String> {
 
 // --------------------------------------------------------------------- pin
 
-/// Pin the calling thread to one logical cpu. Returns the kernel's refusal
-/// instead of panicking — a seccomp filter or a cpu outside the process's mask
-/// cannot be pinned, and the pool must keep running, floating. A platform
-/// with no per-thread mask refuses the pin by name.
-fn pin(cpu: u32) -> std::io::Result<()> {
+/// Pin the calling thread to one logical cpu — the pool's own pin call, a
+/// `sched_setaffinity` of that cpu alone, so a pinned caller outside the pool
+/// sits where a pool worker would. Returns the kernel's refusal instead of
+/// panicking — a seccomp filter or a cpu outside the process's mask cannot be
+/// pinned, and the pool must keep running, floating. A platform with no
+/// per-thread mask refuses the pin by name.
+pub fn pin(cpu: u32) -> std::io::Result<()> {
     os::pin(cpu).map_err(std::io::Error::from)
 }
 
@@ -809,14 +811,6 @@ pub fn pinned_cpus(t: usize) -> Result<Vec<u32>, String> {
         ));
     }
     Ok((0..t).map(|i| shape.cpu_for(i)).collect())
-}
-
-/// Pin the calling thread to one logical cpu — the pool's own pin call, a
-/// `sched_setaffinity` of that cpu alone, so a pinned caller sits where a pool
-/// worker would. Returns the kernel's refusal instead of panicking; a platform
-/// with no per-thread mask refuses by name.
-pub fn pin_self(cpu: u32) -> std::io::Result<()> {
-    pin(cpu)
 }
 
 #[cfg(test)]
