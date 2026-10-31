@@ -132,8 +132,13 @@
 //! the chat template have it), where both runs keep at least
 //! `Prompt38::GEMM_FROM` ids, so a later session that shares the system
 //! prompt keeps it; each run is the ubatch walk, whose bits do not depend on
-//! where a call is cut. Every prefix a request keeps less of than it shares is
-//! a `cache reuse` record with the rule.
+//! where a call is cut. While another slot is busy generating, a prompt call
+//! of more than `CHECKPOINT_EVERY` ids runs as calls cut at its multiples,
+//! one a round between the busy slots' rounds (`Q38::prompt_quantum`; not
+//! under the MTP draft on more than one slot nor with `--mmproj`): each cut
+//! is one of the call's own inner marks, so the cut prompt leaves the one
+//! call's checkpoints and bits. Every prefix a request keeps less of than it
+//! shares is a `cache reuse` record with the rule.
 //!
 //! Under `--parallel N` a request may take its prefix from another slot's
 //! sequence on the card when that keeps more than its own slot and every
@@ -368,7 +373,8 @@
 //! /residency/reset` moves it back to its seed on a free slot and prints a
 //! `residency reset` record (without the residency, the server's 501). The
 //! seat's prompt path is `auto` — passes below nine ids, ubatches from nine
-//! on, never one step an id — unless `BLOOMERY_PREFILL=steps` feeds one step
+//! on and for a call that starts or ends on the inner checkpoint grid
+//! (`Body38::resolve_prompt`), never one step an id — unless `BLOOMERY_PREFILL=steps` feeds one step
 //! an id (below), which the machine does not run beside: the unset word
 //! resolves `off`, and a set word other than `off` is refused by name before
 //! the load, where the body would refuse the first prompt.
@@ -425,6 +431,7 @@
 //! kinds and exits.
 
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -432,8 +439,8 @@ use std::time::{Duration, Instant};
 use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{
-    Body38, Folder38, KvQ8, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
-    checkpoint_price38, point_row_budget38, seq38_bytes,
+    Body38, CHECKPOINT_EVERY, Folder38, KvQ8, Model38, Prompt38, Seq38, TargetRows,
+    checkpoint_budget38, checkpoint_price38, point_row_budget38, seq38_bytes,
 };
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::checkpoint::saved::SaveLane;
@@ -857,7 +864,8 @@ fn check_mtp_ctx(ctx: usize, slots: usize) -> Result<(), GateError> {
 #[derive(Clone, Copy)]
 pub(crate) struct Feed38 {
     /// [`Prompt38::Step`] under `BLOOMERY_PREFILL=steps`, else
-    /// [`Prompt38::Auto`]: the ubatch walk, passes below nine ids.
+    /// [`Prompt38::Auto`]: the ubatch walk, passes below nine ids off the
+    /// inner checkpoint grid (`Body38::resolve_prompt`).
     pub(crate) prompt: Prompt38,
     /// `BLOOMERY_ROUTE_TRACE` is set.
     pub(crate) traced: bool,
@@ -3305,7 +3313,8 @@ impl Seat for Q38 {
     }
 
     /// The prompt through the ubatch walk `--prefill auto` takes: `gemm`
-    /// from nine positions on, `pass` below — never one step per id;
+    /// from nine positions on and on the inner checkpoint grid, `pass` below
+    /// (`Body38::resolve_prompt`) — never one step per id;
     /// under the draft the draft's own prompt call, its store walked over
     /// the prompt's units. Under `BLOOMERY_PREFILL=steps` one step per id
     /// ([`Q38::prefill_steps`]).
@@ -3399,6 +3408,25 @@ impl Seat for Q38 {
         self.read_ahead(&[next])?;
         self.print_passes()?;
         Ok(next)
+    }
+
+    /// The body's inner checkpoint grid ([`CHECKPOINT_EVERY`]): a cut on it
+    /// is one of the marks the one call takes (`runtime::seqstate::marks`)
+    /// and cuts its ubatches at, so the cut calls take the one call's
+    /// checkpoints, and a part that starts or ends on the grid runs as the
+    /// ubatch walk whatever its length (`Body38::resolve_prompt`), as the one
+    /// call's units there do; the walk leaves each position's bits a function
+    /// of its own inputs. None under the MTP draft on more than one slot,
+    /// where the busy slots' steps between the calls would clear the draft's
+    /// waiting row ([`Q38::drafts_slots`]), and with an image encoder
+    /// ([`Seat::media_model`]): a prompt whose image lies before its last
+    /// call would close that call by the fold, where the one call runs its
+    /// image and steps its last id (`SeatEngine::prefill_next`).
+    fn prompt_quantum(&self) -> Option<NonZeroUsize> {
+        if self.drafts_slots() || self.media_model().is_some() {
+            return None;
+        }
+        NonZeroUsize::new(CHECKPOINT_EVERY as usize)
     }
 
     /// One step; under the draft the rows it left waiting walked first

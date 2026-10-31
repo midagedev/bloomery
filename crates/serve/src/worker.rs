@@ -8,9 +8,9 @@
 //!
 //! On an engine that names a prompt quantum ([`Engine::prompt_quantum`]), a
 //! prompt that takes a slot while another slot is busy generating, and has
-//! more than one quantum left after what the cache kept, runs as calls of a
-//! quantum, one a round, each round's decode of the busy slots between them:
-//! a long prompt does not stall the streams already answering. Its request
+//! more than one quantum left after what the cache kept, runs as calls cut on
+//! the quantum's grid, one a round, each round's decode of the busy slots
+//! between them: a long prompt does not stall the streams already answering. Its request
 //! takes no decode round until its prompt ends. Without another busy slot, or
 //! on an engine that names none, a prompt runs in one go.
 //!
@@ -874,7 +874,7 @@ impl Worker {
     }
 
     /// A request that took `slot`: its prompt (`held`, with its images'
-    /// feeds), run now, or planned as calls of the engine's quantum that
+    /// feeds), run now, or planned as calls on the engine's quantum that
     /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]). A
     /// request whose client left is cancelled before anything runs, here or,
     /// when the slots take turns, in [`Worker::begin`] before the engine
@@ -1039,8 +1039,9 @@ impl Worker {
             };
             match need {
                 Need::Fill => {
-                    // A call of its own, like a prompt's: a quantum of ids
-                    // beside other busy slots. The request steps next round.
+                    // A call of its own, like a prompt's: cut on the
+                    // quantum's grid beside other busy slots. The request
+                    // steps next round.
                     let quantum = self.quantum.filter(|_| self.active.len() > 1);
                     let a = &mut self.active[k];
                     let called = self

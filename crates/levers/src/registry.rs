@@ -179,7 +179,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "V4.1: how a binary feeds a prompt, in batches (`body::prefill`) or one \
               decode step per id, the feed the batches are bit for bit equal to. The \
               `load` line prints `prefill=`. `bloomery-serve-qwen38`: `batch` is the \
-              seat's `auto` path (passes below nine ids, ubatches from nine), and `steps` \
+              seat's `auto` path (passes below nine ids, ubatches from nine and for a \
+              call that starts or ends on the 4,096-position checkpoint grid), and `steps` \
               one captured step per id (`prefill=step`); a prompt of nine ids or more \
               leaves other bits under the ubatch walk than under steps. Steps are \
               refused by name beside the MTP draft and a `BLOOMERY_RESIDENCY` word other \

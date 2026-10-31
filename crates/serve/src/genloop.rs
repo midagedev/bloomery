@@ -69,8 +69,8 @@
 //! row is the next decision's; a run the bounds cut (the request's budget,
 //! the cache's positions) is fed without its last id, which the loop then
 //! takes as the step arm does. The call is the engine thread's, run like a
-//! prompt's call (a quantum of ids a round beside other busy slots, the last
-//! quantum the `next_after`), never inside a step. Every id fed is an id of
+//! prompt's call (cut on the quantum's grid, a call a round beside other busy
+//! slots, the last call the `next_after`), never inside a step. Every id fed is an id of
 //! the answer, so nothing is taken back. After the last decision nothing is
 //! fed or stepped: the closing text and the stop are the tail, taken with no
 //! call, the stop the vocabulary's end of sequence ([`Gen::end`]; a request
@@ -1874,14 +1874,14 @@ pub(crate) struct Kept {
 /// A prompt the engine thread runs a call a round, between the other busy
 /// slots' decode rounds ([`Engine::prompt_quantum`], [`Gen::plan`]): its
 /// prompt call cut where the engine asks at its messages
-/// ([`Slot::marked_cuts`]), and each of those calls cut again every quantum
-/// from its own start. The cuts follow from the prompt and what the cache
-/// kept, whatever the load, and each is one the quantum makes bit-neutral, so
-/// the request's bits are those of the prompt run in one go.
+/// ([`Slot::marked_cuts`]), and each of those calls cut again on the
+/// quantum's grid ([`quantum_end`]). The cuts follow from the prompt and what
+/// the cache kept, whatever the load, and each is one the quantum makes
+/// bit-neutral, so the request's bits are those of the prompt run in one go.
 pub(crate) struct Prompt {
     ids: Vec<u32>,
-    /// The prompt's images, each riding the call that holds its span: a
-    /// quantum's cut inside a span moves to the span's end.
+    /// The prompt's images, each riding the call that holds its span: the
+    /// quantum does not cut inside a span.
     media: Vec<MediaFeed>,
     kept: Kept,
     /// The prompt call's message starts, each call handed those that fall in
@@ -1933,10 +1933,8 @@ fn call_parts(
 }
 
 /// The ends of the calls the prompt call `from..to` runs as: cut at `marks`
-/// (ascending, inside the range), and each of those calls every `q` ids from
-/// its own start. A cut inside an image span (`media`, the prompt's feeds)
-/// moves to the span's end, as a mark's end is one: a span never crosses
-/// calls, and the call after it runs on from the span's end.
+/// (ascending, inside the range), and each of those calls on the quantum's
+/// grid ([`quantum_end`], `media` the prompt's feeds).
 fn quantum_ends(
     from: usize,
     to: usize,
@@ -1944,31 +1942,38 @@ fn quantum_ends(
     media: &[MediaFeed],
     q: usize,
 ) -> Vec<usize> {
-    // The spans do not overlap, so the end a snap returns lies in none.
-    let snap = |u: usize| {
-        media
-            .iter()
-            .map(MediaFeed::span)
-            .find(|s| s.at < u && u < s.end())
-            .map_or(u, |s| s.end())
-    };
     let mut ends = Vec::new();
     let mut start = from;
     for &end in marks.iter().chain([&to]) {
-        let mut u = start + q;
-        while u < end {
-            u = snap(u);
-            if u >= end {
-                break;
-            }
-            ends.push(u);
-            start = u;
-            u = start + q;
+        while start < end {
+            start = quantum_end(start, end, media, q);
+            ends.push(start);
         }
-        ends.push(end);
-        start = end;
     }
     ends
+}
+
+/// The end of the next call of a run of positions `at..end` fed on the grid
+/// of a quantum `q` ([`Engine::prompt_quantum`]): the first multiple of `q`
+/// past `at` that lies before `end` and inside no image span of `media`, when
+/// more than `q` positions are left; `end` otherwise. The grid is the
+/// positions', so every cut falls on the same positions whatever the call
+/// started at, and a span never crosses calls.
+fn quantum_end(at: usize, end: usize, media: &[MediaFeed], q: usize) -> usize {
+    if end - at <= q {
+        return end;
+    }
+    let inside = |u: usize| {
+        media
+            .iter()
+            .map(MediaFeed::span)
+            .any(|s| s.at < u && u < s.end())
+    };
+    (at / q + 1..)
+        .map(|j| j * q)
+        .take_while(|&u| u < end)
+        .find(|&u| !inside(u))
+        .unwrap_or(end)
 }
 
 /// What a generation needs next ([`Gen::pump`]).
@@ -2603,7 +2608,7 @@ impl Gen {
 
     /// The prompt after its opening as calls the engine thread runs one a
     /// round ([`Gen::prompt_call`]), its prompt call cut where the engine asks
-    /// at its messages and each of those calls every `q` ids from its start
+    /// at its messages and each of those calls on the grid of `q`
     /// ([`Prompt`]). No call runs here; from here the timings carry the prompt
     /// so far. On the jump arm the calls carry the answer's lead
     /// ([`Gen::take_lead`]), as [`Gen::prompt_whole`]'s do.
@@ -2980,8 +2985,9 @@ impl Gen {
         true
     }
 
-    /// One call of the run being fed ([`Need::Fill`]): its ids, or a
-    /// `quantum` of them when other slots are busy, fed as one
+    /// One call of the run being fed ([`Need::Fill`]): its ids, or those up
+    /// to the next cut on the grid of `quantum` ([`quantum_end`], from the
+    /// slot's position) when other slots are busy, fed as one
     /// [`Engine::prefill`] that books them, or as the [`Engine::next_after`]
     /// that steps the run's last id when it is the span's last call and the
     /// span closes ([`Gen::plan_span`]); the request's `n_past` is the slot's
@@ -3000,7 +3006,8 @@ impl Gen {
     ) -> Result<(), EngineError> {
         let span = self.span.as_mut().expect("a run being fed");
         let end = quantum.map_or(span.feed.len(), |q| {
-            (span.fed + q.get()).min(span.feed.len())
+            let at = slot.held.len();
+            span.fed + quantum_end(at, at + span.feed.len() - span.fed, &[], q.get()) - at
         });
         let closing = span.close && end == span.feed.len();
         let ids = &span.feed[span.fed..end];
@@ -3191,7 +3198,7 @@ impl Gen {
     }
 
     /// The whole generation on `slot` alone, its calls one at a time; a run
-    /// of fixed ids is fed in calls of `quantum` ids, or whole.
+    /// of fixed ids is fed in calls cut on the quantum's grid, or whole.
     #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
@@ -3243,8 +3250,9 @@ pub(crate) fn generate(
     r
 }
 
-/// [`generate`] with a run of fixed ids fed in calls of `quantum` ids, as the
-/// worker feeds one beside other busy slots; the timings come with the result.
+/// [`generate`] with a run of fixed ids fed in calls cut on the quantum's
+/// grid ([`quantum_end`]), as the worker feeds one beside other busy slots;
+/// the timings come with the result.
 #[cfg(test)]
 pub(crate) fn generate_in_quanta(
     slot: &mut Slot,
@@ -4576,7 +4584,7 @@ mod media_tests {
 
     use vision::{GridPlan, Patches};
 
-    use super::{Gen, GenParams, Slot, sampler_of};
+    use super::{Gen, GenParams, Slot, quantum_ends, sampler_of};
     use crate::engine::{Engine, EngineError, SamplingParams, Tokenizer};
     use crate::media::{Held, ImageKey, MediaFeed, MediaSpan, Prepared, Prompt};
     use crate::mock::{IMAGE_ID, MediaCall, MediaTokenizer, MockEngine};
@@ -4710,6 +4718,24 @@ mod media_tests {
         );
         assert_eq!(from_b, fresh(&b), "the reply of b alone");
         assert_ne!(from_b, from_a, "the replies name their images");
+    }
+
+    /// The quantum's grid does not cut inside an image span
+    /// ([`quantum_ends`]): the multiples 4 and 8 inside the span over
+    /// positions 2 to 10 are passed over, so the span rides one call, and the
+    /// call ends on the next multiple, 12. A multiple at a span's start or
+    /// end is not inside it: the span over 4 to 11 rides the call from 4 to
+    /// 12.
+    #[test]
+    fn the_quantum_passes_over_the_multiples_inside_a_span() {
+        let p = prompt("ab", 9, 1, "cdefgh");
+        let to = p.held.ids.len() - 1;
+        assert_eq!((p.feeds[0].at, to), (2, 16), "the prompt's layout");
+        assert_eq!(quantum_ends(0, to, &[], &p.feeds, 4), [12, 16]);
+        let p = prompt("abcd", 8, 1, "efghij");
+        let to = p.held.ids.len() - 1;
+        assert_eq!((p.feeds[0].at, to), (4, 17), "the prompt's layout");
+        assert_eq!(quantum_ends(0, to, &[], &p.feeds, 4), [4, 12, 16, 17]);
     }
 
     /// The same image again keeps the span whole: the reuse passes its end,

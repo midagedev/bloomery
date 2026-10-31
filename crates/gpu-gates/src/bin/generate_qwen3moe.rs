@@ -1156,7 +1156,7 @@ mod cli {
         /// `pass:<sizes>`, or the ubatch cut `ubatch:<sizes>`; the kind is
         /// the path `auto` resolves to on this load (`Body38::resolve_prompt`).
         fn plan(m: &Qwen38Model, n: usize, path: Prompt38) -> Result<Units, GateError> {
-            let path = m.body("plan")?.resolve_prompt(path, n);
+            let path = m.body("plan")?.resolve_prompt(path, m.pos(), n);
             Ok(match path {
                 Prompt38::Gemm => {
                     let plan = PrefillPlan {
