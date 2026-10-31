@@ -63,6 +63,11 @@ weights, reduced to the one instantiation the `metal_gemm_time` probe launches a
 `steel/gemm/mma.h`, `steel/gemm/loader.h`); the file's header names what was taken out. It is compiled by the probe
 only and never enters the engine's kernels.
 
+`crates/metal/src/bin/metal_attention_time/mlx.rs` holds MLX's decode attention kernels `sdpa_vector`,
+`sdpa_vector_2pass_1` and `sdpa_vector_2pass_2`, ported to read the engine's cache rows, as the `metal_attention_time`
+probe's reference arm. They are taken from ml-explore/mlx v0.32.3 (`mlx/backend/metal/kernels/sdpa_vector.h`); the
+file's header names what differs. They are compiled by the probe only and never enter the engine's kernels.
+
 `crates/metal/kernels/gemm_tensor.metal` (the prompt pass's GEMMs on Metal 4's tensor ops) follows the design of MLX's
 NAX quantized matmul, v0.32.1 (`mlx/backend/metal/kernels/quantized_nax.h`, `steel/gemm/nax.h`): the weights
 dequantized into threadgroup memory a K step, the 64-by-64 tile over a 2-by-2 grid of SIMD groups, the `matmul2d`

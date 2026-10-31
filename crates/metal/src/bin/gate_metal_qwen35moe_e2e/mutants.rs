@@ -208,8 +208,8 @@ pub const KEPT: &[Mutant] = &[
         why: "the fold folds the first segment's values alone, so every live key \
               past one segment misses from the output",
         edits: &[(
-            "if (!refused) {\n        for (uint seg = 0u; seg < args.segments; ++seg) {",
-            "if (!refused) {\n        for (uint seg = 0u; seg < 1u; ++seg) {",
+            "            if (slot < args.segments) {",
+            "            if (slot < 1u) {",
             1,
         )],
     },
