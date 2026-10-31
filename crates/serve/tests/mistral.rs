@@ -242,7 +242,7 @@ fn streamed(prompt: &str, pieces: &[&str]) -> Result<Message, MarkupError> {
         total.calls.extend(d.calls);
     };
     for piece in pieces {
-        add(p.try_push(piece)?);
+        add(p.try_push(piece, &[])?);
     }
     add(p.try_finish()?);
     assert_eq!(&total, p.message(), "deltas sum to the message");
@@ -324,10 +324,13 @@ fn hw_open_calls_are_reported_as_they_are_read() {
     let mut p =
         ChatParser::with_tools(ON, ReasoningFormat::None, Some(Tools::Mistral)).streaming_calls();
     let mut pieces = Vec::new();
-    p.try_push("Let me check. [TOOL_CALLS]get_weather[ARGS]{\"city\": \"Par")
-        .unwrap();
+    p.try_push(
+        "Let me check. [TOOL_CALLS]get_weather[ARGS]{\"city\": \"Par",
+        &[],
+    )
+    .unwrap();
     pieces.extend(p.take_pieces());
-    p.try_push("is\", \"unit\": \"C\"}").unwrap();
+    p.try_push("is\", \"unit\": \"C\"}", &[]).unwrap();
     pieces.extend(p.take_pieces());
     let _ = p.try_finish().unwrap();
     pieces.extend(p.take_pieces());
