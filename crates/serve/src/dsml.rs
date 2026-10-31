@@ -665,9 +665,19 @@ fn probe_render(t: &ChatTemplate) -> Option<String> {
 
 /// How a template frames a parameter value, read from the call it renders
 /// ([`probe_render`]); `None` when it renders no call, or one in neither
-/// framing.
+/// framing. A lines framing whose template opens no think span (the span is
+/// read from the source, as llama.cpp reads it: the probe renders no
+/// generation prompt, where a template may open one) is
+/// [`Framing::Coder`].
 fn probe_framing(t: &ChatTemplate) -> Option<Framing> {
-    Framing::of_rendered(&probe_render(t)?, PROBE_KEY, PROBE_VALUE)
+    Some(
+        match Framing::of_rendered(&probe_render(t)?, PROBE_KEY, PROBE_VALUE)? {
+            Framing::Lines if ::models::ReasoningFormat::of_template(t.source()).is_none() => {
+                Framing::Coder
+            }
+            framing => framing,
+        },
+    )
 }
 
 /// Whether a rendered template spells the Hermes call markup: some

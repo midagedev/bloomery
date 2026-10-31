@@ -769,6 +769,15 @@ fn hw_framing_follows_the_rendered_call() {
         ),
         coder
     );
+    // A template that opens its think span only in the generation prompt
+    // teaches one, though the probe's render (no generation prompt) shows none.
+    assert_eq!(
+        ToolFormat::of_template(&format!(
+            "{}{{%- if add_generation_prompt -%}}<think>{{%- endif -%}}",
+            small("\n{{ v }}\n").replace("</parameter>", "</parameter>{{ '\\n' }}")
+        )),
+        lines
+    );
     let example = "<tool_call><function=get_weather><parameter=location>\nSeoul\n</parameter>\n</function></tool_call>";
     assert_eq!(
         ToolFormat::of_template(&format!("{example}{}", small("{{ v }}"))),

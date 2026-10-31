@@ -63,7 +63,7 @@ use crate::callstream::{self, Reading, held, read_value};
 use crate::constrain::{Fun, Part, Refusal, Style, call, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
-use crate::reasoning::{Marked, SpecialTags, ThinkTags, partial_suffix};
+use crate::reasoning::{Marked, SpecialTags, partial_suffix};
 
 // The format's markup is its description's (the models crate's `function_xml`, not this crate's `models` module),
 // the strings the template table names a file's format by.
@@ -110,14 +110,12 @@ impl Framing {
     /// for `<parameter=key>` holding the string `value` in its last
     /// `<tool_call>` (the probe's call; a header's example sits before it),
     /// read with the scanner's own delimiters, so the framing found is one
-    /// the scanner closes; a lines framing whose render teaches no think span
-    /// (it writes no `<think>`) is [`Framing::Coder`], as llama.cpp reads the
-    /// span from the template's source. `None` when that call renders no such
-    /// parameter, or in a spelling that is neither.
+    /// the scanner closes. `None` when that call renders no such parameter,
+    /// or in a spelling that is neither.
     pub(crate) fn of_rendered(rendered: &str, key: &str, value: &str) -> Option<Framing> {
         let (_, call) = rendered.rsplit_once(CALL_OPEN)?;
         let (_, after) = call.split_once(&format!("{PARAM_OPEN}{key}>"))?;
-        match [Framing::Lines, Framing::Compact]
+        [Framing::Lines, Framing::Compact]
             .into_iter()
             .find(|framing| {
                 after.starts_with(&format!(
@@ -125,10 +123,7 @@ impl Framing {
                     framing.value_open(),
                     framing.value_close()
                 ))
-            })? {
-            Framing::Lines if !rendered.contains(ThinkTags::THINK.open) => Some(Framing::Coder),
-            framing => Some(framing),
-        }
+            })
     }
 }
 

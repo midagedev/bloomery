@@ -1041,6 +1041,7 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         ToolFormat::Hermes,
         QWEN,
         QWEN_COMPACT,
+        ToolFormat::QwenXml(Framing::Coder),
         GLM,
         SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
