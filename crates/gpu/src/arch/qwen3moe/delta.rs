@@ -48,7 +48,7 @@ use crate::GpuError;
 use crate::linear;
 use crate::linear::conv::{ConvArgs, ConvRows};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
-use crate::linear::norm_gate::NormGateArgs;
+use crate::linear::norm_gate::{GdnGate, NormGateArgs};
 use crate::model::lookup::{f32_gain, kq_weight};
 
 /// The launches [`delta`] makes at `m` rows: eight, plus a Q6_K q·k·v
@@ -222,6 +222,7 @@ pub(super) fn delta_core(
             o: &g.o,
             z: &g.z,
             w: f32_gain(w, &d.ssm_norm)?,
+            gate: GdnGate::Silu,
             eps: c.eps,
             n_v: d.shape.n_v,
             m,

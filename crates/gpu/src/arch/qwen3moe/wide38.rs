@@ -183,7 +183,7 @@
 use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
 use super::image::MediaRows;
-use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
+use super::plan38::{GDN, GDN_GATE, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{BA_PITCH, Ctx38, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
@@ -2537,6 +2537,7 @@ fn gdn(
             crate::linear::norm_gate::NormGateTail {
                 o: &g.o,
                 w: f32_gain(w, &gp.ssm_norm)?,
+                gate: GDN_GATE,
                 eps: c.eps,
                 fault: sink,
                 y: &mut *attn,

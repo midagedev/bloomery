@@ -52,7 +52,10 @@ use crate::head::Head;
 use crate::host::StepLeg;
 use crate::hybrid::Chain;
 use crate::linear::seqs::{GdnSeq, GdnSeqsArgs};
-use crate::linear::{self, norm_gate::NormGateArgs};
+use crate::linear::{
+    self,
+    norm_gate::{GdnGate, NormGateArgs},
+};
 use crate::media::rope_table;
 use crate::model::lookup::f32_gain;
 use crate::model::slots::slot_twice;
@@ -723,6 +726,7 @@ impl ChainOps for Slots35<'_, '_> {
                 o: &g.o,
                 z: &g.z,
                 w: f32_gain(w, &d.ssm_norm)?,
+                gate: GdnGate::Silu,
                 eps: c.eps,
                 n_v: nv,
                 m,

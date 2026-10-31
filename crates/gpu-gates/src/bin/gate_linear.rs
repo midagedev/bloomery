@@ -148,7 +148,7 @@ mod gate {
         DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, NEVER, RecoveryStore, RecoveryTable,
         delta_host, kda_delta_host, prompt_work_len, recovery_record_len,
     };
-    use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
+    use bloomery_gpu::linear::norm_gate::{GdnGate, NormGateArgs, norm_gate_host};
     use bloomery_gpu::linear::out_gate::{OutGateArgs, out_gate_host};
     use bloomery_gpu::linear::{
         CARRY_ROWS, CHUNK_ROWS, CONV_TAPS, GATE_SIGMOID, GATE_SILU, HEAD, KHeadMap, LinearKernels,
@@ -716,17 +716,18 @@ mod gate {
                 o: &od,
                 z: &zd,
                 w: &wd,
+                gate: if act == GATE_SILU {
+                    GdnGate::Silu
+                } else {
+                    GdnGate::Sigmoid
+                },
                 eps,
                 n_v,
                 m,
                 fault,
                 y: &mut y,
             };
-            if act == GATE_SILU {
-                self.k.norm_gate.enqueue_norm_gate(s, args)?;
-            } else {
-                self.k.norm_gate.enqueue_norm_gate_sigmoid(s, args)?;
-            }
+            self.k.norm_gate.enqueue_norm_gate(s, args)?;
             s.synchronize()?;
             Ok(y.to_host_vec(s)?)
         }
@@ -1321,6 +1322,7 @@ mod gate {
                 o: &o.o,
                 z: &i.z,
                 w: &i.gain,
+                gate: GdnGate::Silu,
                 eps: EPS,
                 n_v: SHAPE.n_v,
                 m: 1,

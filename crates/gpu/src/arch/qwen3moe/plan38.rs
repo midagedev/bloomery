@@ -25,6 +25,10 @@ use model::arch::models::{
     NgramRule, OutGate, PoolRule, Residual, RouterNorm, Score, Selector,
 };
 
+/// The activation of `z` that gates a delta layer's normed output: the
+/// model's, which its plan refuses another delta rule than.
+pub(super) const GDN_GATE: GdnGate = GdnGate::Sigmoid;
+
 /// What the plan's refusals name.
 const WHAT: &str = "qwen4exp plan";
 
@@ -353,7 +357,7 @@ pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
                 let fits = d.kind
                     == DeltaKind::Gdn {
                         khead_map: SpecMap::Tiled,
-                        gate: GdnGate::Sigmoid,
+                        gate: GDN_GATE,
                     }
                     && (d.k_heads as usize, d.v_heads as usize) == (GDN.n_k, GDN.n_v)
                     && d.d as usize == linear::HEAD
