@@ -486,8 +486,9 @@ impl Tokenizer {
 
     /// Whether the vocabulary asks for a BOS / an EOS around encoded text:
     /// `tokenizer.ggml.add_bos_token` / `add_eos_token`, and a BOS always for
-    /// the `gemma4` pre-tokenizer, as the reference forces it. SentencePiece
-    /// defaults to adding a BOS unless the header disables it.
+    /// the `gemma4` pre-tokenizer, as the reference forces it. SentencePiece and the
+    /// `llama-bpe` pre-tokenizer default to adding a BOS unless the header disables it, as
+    /// the reference's SentencePiece and llama3 pre types do.
     pub fn add_bos(&self) -> bool {
         self.vocab.add_bos
     }
@@ -1710,6 +1711,72 @@ mod tests {
         }
     }
 
+    /// llama.cpp's three passes over one whole text (llama-vocab.cpp, `detokenize`'s
+    /// `clean_spaces`), as it writes them: the space before `?`, `!`, `.` and `,` dropped; an
+    /// apostrophe between two spaces keeping neither, its right space marked so a later
+    /// apostrophe does not read it as its left; the space before `'s`, `'m`, `'re` and `'ve`
+    /// dropped, where `'t`, `'d` and `'ll` keep theirs. The sweep's oracle, independent of
+    /// the cleaner it judges.
+    fn reference_clean(text: &str) -> String {
+        let t = text.as_bytes();
+        let first = {
+            let mut out = Vec::with_capacity(t.len());
+            if !t.is_empty() {
+                out.push(t[0]);
+                for i in 1..t.len() {
+                    if t[i - 1] == b' ' && matches!(t[i], b'?' | b'!' | b'.' | b',') {
+                        out.pop();
+                    }
+                    out.push(t[i]);
+                }
+            }
+            out
+        };
+        let second = {
+            let mut mark = first;
+            let mut out = Vec::with_capacity(mark.len());
+            if !mark.is_empty() {
+                out.push(mark[0]);
+                let mut i = 1;
+                while i < mark.len() {
+                    let x = mark[i];
+                    if x == b'\''
+                        && i + 1 < mark.len()
+                        && mark[i - 1] == b' '
+                        && mark[i + 1] == b' '
+                    {
+                        out.pop();
+                        mark[i + 1] = 0;
+                        out.push(x);
+                        i += 2;
+                        continue;
+                    }
+                    out.push(x);
+                    i += 1;
+                }
+            }
+            out
+        };
+        let t = &second;
+        let mut out = Vec::with_capacity(t.len());
+        if !t.is_empty() {
+            out.push(t[0]);
+            for i in 1..t.len() {
+                if t[i - 1] == b' '
+                    && t[i] == b'\''
+                    && i + 1 < t.len()
+                    && (matches!(t[i + 1], b's' | b'm')
+                        || i + 2 < t.len()
+                            && matches!((t[i + 1], t[i + 2]), (b'r', b'e') | (b'v', b'e')))
+                {
+                    out.pop();
+                }
+                out.push(t[i]);
+            }
+        }
+        String::from_utf8(out).expect("the passes drop ASCII bytes only")
+    }
+
     /// Cleaning a stream piece by piece gives the whole text's clean. [`SpaceCleaner`] is swept
     /// over every string of the passes' alphabet up to length 7 (`x`, space, `?`, `'`, `s`, and
     /// with `r` `e` for `'re`) at every two-piece cut, then over deterministic pseudo-random
@@ -1735,6 +1802,12 @@ mod tests {
             ("x  '  ", "x ' "),
             ("x  ' s", "x's"),
             ("한 , 글", "한, 글"),
+            ("I am a cat. I am a dog.", "I am a cat. I am a dog."),
+            ("I am a cat . I am a dog .", "I am a cat. I am a dog."),
+            ("<|start_header_id|>", "<|start_header_id|>"),
+            ("한 's", "한's"),
+            ("é 'm x", "é'm x"),
+            ("글 ' ?", "글 '?"),
         ];
         let streams = |text: &str, cuts: &[usize]| -> String {
             let mut cleaner = SpaceCleaner::default();
@@ -1794,7 +1867,7 @@ mod tests {
         }
         let mut failures = Vec::new();
         for text in &words {
-            let want = crate::decode::clean_str(text);
+            let want = reference_clean(text);
             for cut in 0..=text.len() {
                 if !text.is_char_boundary(cut) {
                     continue;
@@ -1842,12 +1915,67 @@ mod tests {
         }
     }
 
+    /// A push releases every byte no later piece can change: only a proper prefix of a
+    /// cleaning pattern (` `, ` '`, ` 'r`) is held for the piece that completes it, so a
+    /// text that ends in no pattern's prefix is out whole in its push and `finish` returns
+    /// nothing.
+    ///
+    /// FAIL-first: a cleaner that holds text behind a longer window releases none of these
+    /// rows whole, and holds a trailing space's text past its own push.
+    #[test]
+    fn a_push_releases_what_no_pattern_can_still_start() {
+        for text in [
+            "I am a cat. I am a dog.",
+            "<|start_header_id|>",
+            "Hello , world",
+            "a ' b",
+            "한 , 글",
+        ] {
+            let mut cleaner = SpaceCleaner::default();
+            let out = cleaner.push(text);
+            assert_eq!(&out, &reference_clean(text), "{text:?}");
+            assert_eq!(cleaner.finish(), "", "{text:?}");
+        }
+        // What a hold keeps is the pattern's own prefix, and the piece that completes the
+        // pattern takes it.
+        let mut cleaner = SpaceCleaner::default();
+        assert_eq!(cleaner.push("it '"), "it");
+        assert_eq!(cleaner.push("s here"), "'s here");
+        assert_eq!(cleaner.finish(), "");
+        let mut cleaner = SpaceCleaner::default();
+        assert_eq!(cleaner.push("x "), "x");
+        assert_eq!(cleaner.finish(), " ");
+    }
+
+    /// The `llama-bpe` row defaults an absent `tokenizer.ggml.add_bos_token` to true, as the
+    /// reference's llama3 pre type does, and the file's key still overrides it; `qwen2`, a
+    /// row of no such default, keeps adding nothing.
+    ///
+    /// FAIL-first: the false default omitted the BOS a llama-bpe gguf with no key adds.
+    #[test]
+    fn llama_bpe_defaults_to_adding_bos() {
+        let tok = from_header(&byte_header("llama-bpe")).unwrap();
+        assert!(tok.add_bos());
+        let Some(bos) = tok.specials().bos else {
+            panic!("no bos id");
+        };
+        assert_eq!(tok.encode("x", true, true).first(), Some(&bos));
+        let mut header = byte_header("llama-bpe");
+        header.push((
+            "tokenizer.ggml.add_bos_token".to_string(),
+            Value::Bool(false),
+        ));
+        assert!(!from_header(&header).unwrap().add_bos());
+        let raw = from_header(&byte_header("qwen2")).unwrap();
+        assert!(!raw.add_bos());
+        assert_eq!(raw.encode("x", true, true), raw.encode("x", false, false));
+    }
+
     /// llama.cpp's own tokenizer test data (`ggml-vocab-llama-bpe`): every text of the `.inp`
     /// file, split on its `__ggml_vocab_test__` separator, tokenizes to exactly the ids of its
     /// `.out` line, with no BOS added and no special token parsed (`add_special = false` in its
     /// test-tokenizer-0). The gguf names no `add_bos_token` key, so this loader defaults it
-    /// false where llama.cpp's pre type forces true; the vectors add no special token either
-    /// way.
+    /// true as llama.cpp's pre type does; the vectors add no special token either way.
     ///
     /// FAIL-first: a `llama-bpe` name off the pre-tokenizer table, or the vocabulary the gguf
     /// spells unrun, fails the load before the first row.

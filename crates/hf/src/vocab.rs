@@ -838,8 +838,8 @@ fn byte_level_posts() -> [Json; 2] {
 /// exported keys name (`bos`, the exported BOS id), and the template is what makes the header's
 /// `add_bos_token` true. The pair template encodes two texts, which serving never does: its
 /// pieces are read, their order and tokens free. Everything else — another processor, a
-/// template of another shape, a token that is not the BOS, a `special_tokens` entry that names
-/// another id — is refused by name.
+/// template of another shape, a token that is not the BOS, a template without the token's
+/// `special_tokens` entry, an entry that names another id — is refused by name.
 fn post_processor<'a>(
     post: Option<&'a Json>,
     bos: Option<u32>,
@@ -956,6 +956,16 @@ fn post_processor<'a>(
              token (id {bos:?})"
         )));
     }
+    // The entry is what ties the name the template writes to an id, so a template without it
+    // resolves the BOS through the vocabulary instead of the mapping the tokenizer runs by.
+    if !template["special_tokens"]
+        .as_object()
+        .is_some_and(|tokens| tokens.contains_key(token))
+    {
+        return Err(bad(format!(
+            "tokenizer.json.post_processor names {token:?} with no special_tokens entry for it"
+        )));
+    }
     Ok(Some(token))
 }
 
@@ -975,7 +985,8 @@ fn post_processor<'a>(
 /// not an id or a list of them, lies outside the vocabulary, or is a BOS, pad, unknown or
 /// separator id other than the one exported; a `post_processor` other than the ByteLevel
 /// spellings that move no id or the BOS template, or a template that names a token other than
-/// the exported BOS; an `add_bos_token` or `add_eos_token` that is not
+/// the exported BOS or carries no `special_tokens` entry for it; an `add_bos_token` or
+/// `add_eos_token` that is not
 /// boolean, and a `chat_template` that is not a string, each by name.
 pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
     let bad = |what: String| Error::Vocab(what);
@@ -2249,6 +2260,39 @@ mod tests {
         }
         assert!(get(&keys.keys, "tokenizer.chat_template").is_some());
         remove(&dir);
+    }
+
+    /// A template that names the BOS must carry its `special_tokens` entry for it: the
+    /// entry is what ties the name the template writes to an id, so a map that is absent,
+    /// null or empty is refused naming the token, not resolved through the vocabulary to an
+    /// inferred BOS with `add_bos_token` forced true.
+    ///
+    /// FAIL-first: an absent map read as no validation and exported the inferred BOS.
+    #[test]
+    fn a_template_without_its_bos_special_tokens_entry_is_refused() {
+        for (what, value) in [
+            ("removed", None),
+            ("null", Some(Json::Null)),
+            ("empty", Some(serde_json::json!({}))),
+        ] {
+            let dir = llama_repo(|f| match value {
+                Some(v) => {
+                    f["tokenizer.json"]["post_processor"]["processors"][1]["special_tokens"] = v
+                }
+                None => {
+                    f["tokenizer.json"]["post_processor"]["processors"][1]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("special_tokens");
+                }
+            });
+            let e = super::keys(&dir, &spec_of(&dir)).unwrap_err().to_string();
+            assert!(
+                e.contains("special_tokens") && e.contains("<|begin_of_text|>"),
+                "{what}: {e}"
+            );
+            remove(&dir);
+        }
     }
 
     /// A pipeline two rows spell is the row the folder's `model_type` names, else the first of

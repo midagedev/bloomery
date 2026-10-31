@@ -504,9 +504,11 @@ impl Vocab {
                 }
             }
         }
+        // SentencePiece and the reference's llama3 pre type default to adding a BOS
+        // (llama-vocab.cpp), the file's key overriding either.
         let add_bos = m
             .flag("tokenizer.ggml.add_bos_token")?
-            .unwrap_or(matches!(model, Model::Spm))
+            .unwrap_or(matches!(model, Model::Spm) || pre == "llama-bpe")
             || matches!(
                 encoding,
                 Encoding::Bpe {
