@@ -2327,13 +2327,6 @@ pub enum TierError {
         ids: usize,
         slots: usize,
     },
-    /// A relu² layer met the NVMe tier: the arena lends each expert's bytes
-    /// as `[gate, up, down]` parts and its paths lay them so, and a form
-    /// that reads two stacks has no gate part for the third.
-    #[error(
-        "layer {layer}'s NVMe tier serves gated experts only: a relu² layer holds no gate part"
-    )]
-    Relu2Tiered { layer: usize },
     /// A batch pin was refused: the tier's own error, naming what it
     /// pinned.
     #[error("layer {layer}: pinning a batch of experts: {source}")]
@@ -3097,7 +3090,6 @@ impl HostLayer {
                 got_ne1: scratch.ff,
             });
         }
-        self.refuse_relu2_tier()?;
         if self.tier.is_some()
             && let Some(union) = union
         {
@@ -3120,20 +3112,6 @@ impl HostLayer {
             None => None,
         };
         self.serve_column(lanes, split, x, experts, out, scratch)
-    }
-
-    /// A relu² layer's refusal of the NVMe tier, at every entry that could
-    /// reach one: the arena lends each expert's bytes as `[gate, up, down]`
-    /// parts and its paths lay them so, and a form that reads two stacks has
-    /// no gate part for the third ([`HostLayer::attach_tier`] cannot refuse —
-    /// the gpu side's run build calls it, and that side holds no form yet).
-    fn refuse_relu2_tier(&self) -> Result<(), ModelError> {
-        if let ExpertForm::Relu2 = self.form
-            && let Some(tier) = &self.tier
-        {
-            return Err(TierError::Relu2Tiered { layer: tier.layer }.into());
-        }
-        Ok(())
     }
 
     /// Today's one-column leg: `out` is the list-order sum, each expert read
@@ -3287,7 +3265,6 @@ impl HostLayer {
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
-        self.refuse_relu2_tier()?;
         let split = src.split();
         let x = x.into();
         check_union_call(
@@ -3357,7 +3334,6 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         let x = x.into();
-        self.refuse_relu2_tier()?;
         check_union_call(
             x,
             lists,
@@ -3756,8 +3732,11 @@ mod tests {
     /// than it says is refused with the stack's own error; a relu² layer that
     /// built reads its up again in the stacks' gate slot — the file's gate
     /// stack, which it holds here, is never read — and carries the relu²
-    /// form; and a relu² layer with the NVMe tier attached is refused by name
-    /// at every entry that could reach one.
+    /// form; and a relu² layer with the NVMe tier attached reads the ids
+    /// outside the host segment from the tier's slots, its up's part in the
+    /// gate slot again, at every entry: the bits the file mapping gives.
+    /// FAIL-first: each entry refused the tier by name ("gated experts
+    /// only").
     #[test]
     fn host_layer_build_relu2_refuses_by_name() {
         let (embd, ff, n_expert) = (256, 512, 4);
@@ -3805,29 +3784,54 @@ mod tests {
         layer.warm_spans(src, &[0], &mut spans).unwrap();
         assert_eq!(spans.len(), 2, "a relu² layer warms its up and its down");
 
-        // The NVMe tier: refused by name at the one-column, the union and the
-        // step-union entries, before any slot is asked for.
-        let tier = std::sync::Arc::new(MockTier::of(&split, &layer, false));
-        layer.attach_tier(4, 1..2, tier);
-        let (x, list) = (Tensor2::zeros(embd, 1), vec![(0u32, 1.0f32)]);
-        let mut out = vec![0.0f32; embd];
+        // The NVMe tier: every entry reads the ids outside the host segment
+        // from the slots and gives the file mapping's bits.
+        // PIN(2026-11-01): a relu² layer's NVMe tier is no longer refused ("gated experts
+        // only"): the arena lends each expert its up and its down.
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd).map(|i| ((i % 13) as f32 - 6.0) / 8.0).collect(),
+        );
+        let list = vec![(0u32, 0.75f32), (2, 0.25)];
         let mut host = HostScratch::new(embd, ff, n_expert).unwrap();
-        let e = layer
-            .experts_into(src, &x, &list, &mut out, &mut host)
-            .expect_err("a relu² layer refuses the tier")
-            .to_string();
-        assert!(e.contains("gated experts only"), "{e}");
         let mut us = UnionScratch::new_routed(embd, ff, 4, n_expert).unwrap();
-        let e = layer
-            .experts_union_into(src, &x, &[&list[..]], &mut out, &mut us)
-            .expect_err("a relu² layer refuses the tier at the union")
-            .to_string();
-        assert!(e.contains("gated experts only"), "{e}");
-        let e = layer
-            .experts_step_union_into(src, &x, &[&list[..]], &mut out, &mut us)
-            .expect_err("a relu² layer refuses the tier at the step union")
-            .to_string();
-        assert!(e.contains("gated experts only"), "{e}");
+        let entries =
+            |layer: &HostLayer, host: &mut HostScratch, us: &mut UnionScratch| -> [Vec<f32>; 3] {
+                let mut out = [vec![0.0f32; embd], vec![0.0f32; embd], vec![0.0f32; embd]];
+                layer
+                    .experts_into(src, &x, &list, &mut out[0], host)
+                    .expect("the one-column entry");
+                layer
+                    .experts_union_into(src, &x, &[&list[..]], &mut out[1], us)
+                    .expect("the union entry");
+                layer
+                    .experts_step_union_into(src, &x, &[&list[..]], &mut out[2], us)
+                    .expect("the step-union entry");
+                out
+            };
+        let want = entries(&layer, &mut host, &mut us);
+        let mut tier = MockTier::of(&split, &layer, true);
+        tier.slots = 2 * super::UNION_BATCH_IDS + 8;
+        let tier = std::sync::Arc::new(tier);
+        layer.attach_tier(4, 1..2, tier.clone());
+        let got = entries(&layer, &mut host, &mut us);
+        for (entry, (g, w)) in ["one-column", "union", "step union"]
+            .iter()
+            .zip(got.iter().zip(&want))
+        {
+            assert_eq!(
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{entry}: a tiered relu² layer reads the mapping's bits"
+            );
+        }
+        let asked = tier.asked.lock().unwrap();
+        assert!(
+            asked.iter().any(|&(l, id, _)| (l, id) == (4, 0))
+                && asked.iter().any(|&(l, id, _)| (l, id) == (4, 2)),
+            "the ids outside the host segment come from the tier: {asked:?}"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
