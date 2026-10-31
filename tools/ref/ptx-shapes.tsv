@@ -183,6 +183,9 @@ generate_ds41   gdn_delta_prepared                      48          16
 generate_ds41   gdn_delta_seqs                           0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
+# PIN(2026-11-01): gdn_norm_gate_q32 and _q128 are gdn_norm_gate_sigmoid's body with a quantizer's store, pinned at its values until a scan on this table's arch and capability.
+generate_ds41   gdn_norm_gate_q128                       0           0
+generate_ds41   gdn_norm_gate_q32                        0           0
 generate_ds41   geglu_tanh                               0           0
 generate_ds41   gemm_iq1m                                0           0
 generate_ds41   gemm_iq1s                                0           0

@@ -63,6 +63,13 @@ pub struct GemmAct32 {
     forms: [Option<ColsForm>; 2],
 }
 
+/// A [`GemmAct32`]'s Q8 planes borrowed for writing in its documented layout.
+pub(crate) struct GemmAct32PlanesMut<'a> {
+    pub(crate) q: &'a mut DeviceBuffer<u32>,
+    pub(crate) d: &'a mut DeviceBuffer<f32>,
+    pub(crate) s: &'a mut DeviceBuffer<i32>,
+}
+
 /// A form of a [`GemmAct32`]'s columns that a site on the dense MMA tile
 /// copies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,6 +443,32 @@ impl GemmAct32 {
             ));
         }
         self.input_launch(what, n_cols)
+    }
+
+    /// The Q8 planes `q`, `d`, `s`, writable, for a quantizer outside this
+    /// module that writes the layout above over the first `n_cols` columns
+    /// (`linear::norm_gate`'s q32 entry), recorded as its launch
+    /// ([`GemmAct32::fill`]); a scratch without Q8 planes, with fewer
+    /// columns, or holding the native FP4 form the writer leaves stale is
+    /// refused by name as `what`'s.
+    pub(crate) fn planes_mut(
+        &mut self,
+        what: &'static str,
+        n_cols: usize,
+    ) -> Result<GemmAct32PlanesMut<'_>, GpuError> {
+        if self.has_native_form() {
+            return Err(GpuError::state(
+                what,
+                "a Q8-only scratch; this writer does not update the native FP4 form",
+            ));
+        }
+        self.quant_launch(what, n_cols)?;
+        self.fill(n_cols);
+        Ok(GemmAct32PlanesMut {
+            q: &mut self.q,
+            d: &mut self.d,
+            s: &mut self.s,
+        })
     }
 
     /// The launch shape the quantizers take for `n_cols` columns: the grid
@@ -860,7 +893,7 @@ impl Gemm32Kernels {
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub(super) unsafe fn quant32_group(
+pub(crate) unsafe fn quant32_group(
     v: [f32; 4],
     col: usize,
     g: usize,
