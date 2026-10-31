@@ -1582,8 +1582,9 @@ gate-gpu-qwen35moe-leg:
 gate-gpu-qwen35moe-verify:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_verify'
 
-# Qwen3.6's own next-token layer (the unsloth UD-Q4_K_M file that carries `blk.40`, pinned by its general.name and size) as a
-# draft through Body35's layer path: the refusals by name at open (the plain file with no next-token layer; a media load),
+# Qwen3.6's own next-token layer (the unsloth UD-Q4_K_M file that carries `blk.40`, named by BLOOMERY_MTP_MODEL and pinned by
+# its general.name and size) as a draft through Body35's layer path: the refusals by name at open (the plain file,
+# BLOOMERY_REF_MODEL, with no next-token layer; a media load),
 # the draft's resident bytes against the plan's figure with the bf16 widening named, the target's token_embd and output
 # read in place at their addresses and copied nowhere, the input join at one stream against the host's rounding band and
 # its refused stream counts, the draft's token equal to the host argmax of its logits, the refusals on the live draft, and

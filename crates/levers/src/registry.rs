@@ -1817,6 +1817,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          harnesses read it as a model file's path.",
     ),
     path(
+        "BLOOMERY_MTP_MODEL",
+        None,
+        "The Qwen3.6 file that carries the model's next-token layer (unsloth's \
+         `UD-Q4_K_M`), which `gate_qwen35moe_mtp` opens and pins by its `general.name` and \
+         size; the gate refuses to run without it.",
+    ),
+    path(
         "BLOOMERY_MXFP4_MODEL",
         Some("ref/build-qdot-ref.sh"),
         "The file MXFP4's qdot harness and gate read, the V4.1 DSpark draft's tl37 file when unset.",

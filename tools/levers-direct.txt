@@ -31,6 +31,7 @@ crates/model/src/bin/bench_v41_host.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/metal/src/bin/generate_metal.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/arch/deepseek41/fixture.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/gate_dspark_read.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/gate_qwen35moe_mtp.rs	BLOOMERY_MTP_MODEL	gatestoml
 crates/gpu-gates/src/bin/shared/dspark_hf.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/gate_dspark_hc.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_MODEL	gatestoml

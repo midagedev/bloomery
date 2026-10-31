@@ -3,9 +3,10 @@
 //! of a verify of `m` rows with no re-feed and no copy, and a plain load is
 //! untouched.
 //!
-//! What is asserted, on the real Qwen3.6-35B-A3B file (`refset`'s `MODEL`,
+//! What is asserted, on the real Qwen3.6-35B-A3B file (`BLOOMERY_REF_MODEL`,
 //! the file the e2e gate's real tier opens), greedy, at the model's default
-//! step mode (graph) and eager:
+//! step mode (graph) and eager, on prompts of the shared prose corpus
+//! (`prose_ids`, Qwen3.8's ids: the same vocabulary):
 //! - (a) every accepted: for `m` in {4, 8} and each `accepted` in `1..=m`, a
 //!   40-id prompt, one verify of `m` forced rows (the plain run's next ids,
 //!   the token at the position first), `commit(accepted)`, then 16 plain
@@ -80,12 +81,11 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu::model::{MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
-    use gguf::Split;
+    use bloomery_gpu_gates::{GateError, checks_failed, open_split, prose_ids, verdict};
     use gguf::quant::dequant_row;
+    use model::arch::Arch;
     use model::arch::qwen35moe::place::PlanInputs;
     use model::placement::KvBytes;
-    use refset::arch::qwen35moe::{D1K, IK, MODEL};
     use runtime::stores::delta_lane_bytes;
     use runtime::{
         Advance, Lookup, RowLogits, Speculative, Tapped, TappedPrompt, Target, Verify, Want,
@@ -151,6 +151,7 @@ mod gate {
     const NODES_PASS: usize = 537;
 
     const WHAT: &str = "gate_qwen35moe_verify";
+    const RECIPE: &str = "gate-gpu-qwen35moe-verify";
 
     /// The chain of (a)'s second case: `(m, accepted)` stages.
     const CHAIN: [(usize, usize); 7] = [(4, 3), (8, 5), (8, 8), (2, 1), (8, 2), (3, 3), (8, 1)];
@@ -165,10 +166,7 @@ mod gate {
     }
 
     fn open_at(verifying: bool) -> Result<Seat, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        if file.architecture() != Some("qwen35moe") {
-            return Err(format!("{MODEL} is {:?}, not qwen35moe", file.architecture()).into());
-        }
+        let file = open_split(Arch::Qwen35moe, RECIPE)?;
         let o = Open35 {
             ctx: CTX,
             mma: true,
@@ -194,21 +192,9 @@ mod gate {
         Ok(s)
     }
 
-    /// The prompt ids: the first 1,024-token set's prose, `n` of them from
-    /// `from`.
+    /// The prompt ids: `n` ids of the shared prose corpus from `from`.
     fn prose(n: usize, from: usize) -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, before) = man.step()?;
-        before
-            .get(from..from + n)
-            .map(<[u32]>::to_vec)
-            .ok_or_else(|| {
-                GateError::from(format!(
-                    "the prose set holds {} ids, {} asked for",
-                    before.len(),
-                    from + n
-                ))
-            })
+        Ok(prose_ids("qwen4exp", from + n)?.split_off(from))
     }
 
     fn same_bits(a: &[f32], b: &[f32]) -> bool {
@@ -354,7 +340,7 @@ mod gate {
     /// The plan's layout bytes of the file at [`CTX`]: every layer's
     /// recurrent and positional bytes, with `lanes` lanes when asked.
     fn plan_bytes(lanes: Option<usize>) -> Result<usize, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_split(Arch::Qwen35moe, RECIPE)?;
         let inputs = PlanInputs::describe(&file)?;
         let inputs = match lanes {
             Some(l) => inputs.with_lanes(l)?,
@@ -788,7 +774,7 @@ mod gate {
     /// dequantizes (`gguf::quant::dequant_row`, the scalar reference), one
     /// `hidden` row each.
     fn embedding_rows(ids: &[u32]) -> Result<Vec<f32>, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = open_split(Arch::Qwen35moe, RECIPE)?;
         let (shard, t) = file
             .find("token_embd.weight")
             .ok_or_else(|| GateError::from("no token_embd.weight".to_string()))?;
