@@ -32,7 +32,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -40,7 +40,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
@@ -450,6 +450,19 @@ gate-gpu-nemotron-h-moe-e2e:
 [group('solo-real')]
 gate-gpu-musespark-e2e:
     BLOOMERY_MODEL=muse-spark ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_musespark_e2e && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_musespark_e2e'
+
+# Mistral Large 4's end-to-end gate (gate_mistrallarge4_e2e's doc). Fixture tier: the whole one-token
+# decode chain of the fixture's five layers (dense lead, roped full indexer, roped shared indexer, NoPE owner,
+# NoPE reader of the owner's cache) against mainline's node dumps (BLOOMERY_TIER=fixture just
+# dump-ref-mistrallarge4 writes fx_ref_mistrallarge4_{a,b} first): the structure clause's entries by layer kind,
+# eager = replay, reset rewinds, the cache rows carry, a NaN router lane raises the fault word, the selection
+# rule at every position past the fixture's top-k 16, every compared node at every layer and position within the
+# bands, and the greedy 32 of both sets above the band. Real tier: R5's (the placed load of the real file); the
+# oracle clauses are tagged so only the own-contract ones run. Wall [derived: the 430 MB fixture loads in well
+# under a minute; ~900 eager steps of five layers, 10-15 min].
+[group('solo-real')]
+gate-gpu-mistrallarge4-e2e:
+    BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features mistrallarge4 --release --bin gate_mistrallarge4_e2e && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mistrallarge4_e2e'
 
 # Muse Spark Open's prompt batch gate (gate_musespark_prefill's doc): the batch against the one-token steps over prompt lengths
 # spanning the 2048 window, in the logits row, layer 0's output and the stores, then a step after the batch; passes of 7 rows
@@ -1101,6 +1114,10 @@ dump-ref-mcvis *ARGS:
 build-emb2-lcpp:
     BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=6868a52cb337450658006ad2f9281c2eb63f1666 LCPP_BUILD_TREE=/home/user/llama.cpp-6868a52c LCPP_BUILD_DIR=/root/lcpp-emb2 LCPP_BUILD_TARGETS=llama,mtmd,llama-common,llama-server,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-emb2-lcpp: this recipe requires root on the box (/root/lcpp-emb2 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
 
+# Mistral Large 4 (mistral-large4), the oracle's tree: llama.cpp mainline at 78feec062 (the merge of PR 31376) in /home/user/llama.cpp-ml4, the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh) with the pin, tree, sentinel directory and targets by environment, the CPU backend alone (LCPP_BUILD_CPU_ONLY=1) and the tools the smoke and the tokenizer oracle run (llama-cli, llama-completion, llama-tokenize); detached, pid, log and rc under /root/lcpp-ml4. The node dumper links this tree's libraries (`just build-ref-mistrallarge4`).
+build-ml4-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=78feec062d50ec9e8940244cac918ac4480b60cb LCPP_BUILD_TREE=/home/user/llama.cpp-ml4 LCPP_BUILD_DIR=/root/lcpp-ml4 LCPP_BUILD_CPU_ONLY=1 LCPP_BUILD_TARGETS=llama,llama-common,llama-cli,llama-completion,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-ml4-lcpp: this recipe requires root on the box (/root/lcpp-ml4 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
 # EmbeddingGemma 2, the oracle's binary: dump_emb2 (tools/ref/emb2/dump_emb2.cpp) linked against that tree's libmtmd and libllama (tools/ref/clefvis/build-clefvis.sh, the gemma-embedding2 row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_emb2; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
 build-emb2-ref: (build-embedding-ref "gemma-embedding2")
 
@@ -1387,6 +1404,26 @@ build-ref-musespark:
 dump-ref-musespark:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=900 BLOOMERY_MODEL=muse-spark ./tools/box.sh 'bash tools/ref/musespark-dump.sh'
 
+# Mistral Large 4 oracle: mistrallarge4_dump (the shared tools/ref/cb_dump.cpp) linked against the existing mainline
+# build (llama.cpp 78feec062, PR 31376's merge, CPU, no patch, /home/user/llama.cpp-ml4, `just build-ml4-lcpp`, whose
+# tracked files must be clean), which this does not rebuild (tools/ref/mistrallarge4-dump-build.sh); the binary and its
+# build record land in $BLOOMERY_DATA/bin.
+build-ref-mistrallarge4:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump-build.sh'
+
+# The Mistral Large 4 oracle sets (refset family lcpp-mistrallarge4; tools/ref/mistrallarge4-dump.sh has the layout and
+# the taps): mainline on the CPU over the two prompts of tools/ref/data/mistrallarge4 (18 and 42 ids, the text beside the
+# ids) from one load of the 223 GB UD-IQ1_S file, into $BLOOMERY_DATA/ref_mistrallarge4_{a,b}: every per-layer tap, the
+# top-40 logprobs and 32 greedy tokens. The prompt ids are the ml4 tree's llama-tokenize on the file (the script's header
+# has the command); they are taken once and kept in tools/ref/data/mistrallarge4. Predicted wall 1-4 min
+# [derived: docs/cards/mistrallarge4-dump.card], under the CPU lease and its card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mistrallarge4-dump.card'); DUMP_DRY=1 in that variable prints the
+# dump and stops before the lease. `BLOOMERY_TIER=fixture just dump-ref-mistrallarge4` dumps the same prompts on the
+# fixture (model::arch::mistrallarge4::fixture: five real layers at a mini width, `fixture generate`'s file) into
+# $BLOOMERY_DATA/fx_ref_mistrallarge4_{a,b}.
+dump-ref-mistrallarge4:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=300 BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:
@@ -1535,6 +1572,19 @@ gate-llama-meta:
 # coverage list is printed and its new parts pinned, not empty. No fixture-tier conversion: the file is the fixture (`self`).
 gate-lfm3-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::lfm3 arch::classify --nocapture && bash tools/gate.sh --release -p bloomery-model --test lfm3_meta -- --ignored --nocapture'
+
+# mistral-large4 (Mistral Large 4 1T-A52B, unsloth UD-IQ1_S) header gate: the reader's refusals on synthetic headers (a missing key,
+# a wrong kv-head count, gating func, index head count, rope scaling, rope width or YaRN log multiplier, a shared first indexer, a KV
+# source above its layer, itself a reader or of another rope-ness, a q_lora, a missing, misshaped or unclaimed tensor — a vision
+# projector's or a DSpark stage's), the [rope | nope] row permutation, then what the reader resolves from the real shard-1 header,
+# checked in beside the test as the fetch's kv/tensor tables and built into a header-only GGUF in the test: the description layer by
+# layer (72 layers, 18 NoPE, 9 KV readers of layer 35, 44 full indexers), the coverage list naming each part no program runs, and
+# the context bound (2048, the indexer's own top-k); and the fixture clause: the plan of the fixture of the five real layers
+# [0, 1, 17, 35, 39] (model::arch::mistrallarge4::fixture) on that header, read back through the reader as the cut (the
+# arrays rope [T,T,T,F,F], indexer [T,T,F,T,T], cache map [0,1,2,3,3]) with a map, an array, a key and a type that differ
+# refused by name. Headers only, seconds; the 233 GB file itself is not read.
+gate-mistrallarge4-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mistrallarge4 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_meta -- --nocapture'
 
 # Cache append safety contracts and model-less plane/ring writer refusals.
 gate-gpu-rope-writers:
@@ -2218,9 +2268,9 @@ gate-engram:
 
 # The tokenizer gate: our ids equal `llama-tokenize`'s on every engram corpus text and every case of
 # crates/tokenizer/tests/cases.txt, in both parse modes, and the reference's ids decode back to the text, for
-# the seven vocabularies the engine runs: V4.1 (deepseek-v3), Qwen3-MoE (qwen2), GLM-5.3-Flash (glm4),
-# Qwen3.8-Flash-Next (qwen35), Nemotron 3 Nano 4B (pixtral), MiniMax-M3 (minimax-m2) and Muse-Spark-Open
-# (gpt-4o). It only reads the sets: each opens through its refset family
+# the eight vocabularies the engine runs: V4.1 (deepseek-v3), Qwen3-MoE (qwen2), GLM-5.3-Flash (glm4),
+# Qwen3.8-Flash-Next (qwen35), Nemotron 3 Nano 4B (pixtral), MiniMax-M3 (minimax-m2), Muse-Spark-Open
+# (gpt-4o) and Mistral Large 4 (tekken-num3, with its own digit-run and special-token cases). It only reads the sets: each opens through its refset family
 # (crates/refset/src/arch/tokenizer.rs), which refuses by name a set written from another reference tree (commit or patch), from
 # another vocabulary file or other cases, with a text that is not the one dumped, or never finished.
 # `just dump-ref-tokenizer` writes them. EmbeddingGemma v1's llama SentencePiece cases also compare with
@@ -2229,7 +2279,7 @@ gate-tokenizer:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
 # docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
-# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, minimaxm3, musespark, gemma4, llama or
+# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, minimaxm3, musespark, mistrallarge4, gemma4, llama or
 # all, every one but gemma4 and llama). No lease, no GPU. gemma4 (EmbeddingGemma 2) and llama (v1) use mainline 6868a52cb
 # (`just build-emb2-lcpp`), with their profile's EMBED_CASES after cases.txt. The EmbeddingGemma oracle sets read those ids.
 # Every vocabulary is held to the tree it is read by: before the dump the tree's commit, its patch and its build are checked against
@@ -2279,7 +2329,7 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # are planned, every named refusal, `/props` `modalities.video`. The decoder's own subprocess rules (src/video): an ffprobe past
 # its limit and an ffmpeg that does not end after its last frame are killed and named; a decode is taken only when ffmpeg ended well.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test mistral --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract -- --include-ignored --nocapture'
 
 # The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
 # naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule

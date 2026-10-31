@@ -1,15 +1,16 @@
 //! GPU kernel gate for package P4 (docs/gpu-design.md work package): the
 //! element-wise and reduction kernels of `bloomery_gpu::elem` — embedding row
-//! dequant, rms_norm, rope, swiglu, the logit softcap (`softcap_rows`),
-//! residual add, routed-expert weighted sum,
-//! argmax. Two layers per op (the package's gate rule):
+//! dequant, rms_norm, rope, swiglu, the logit softcap (`softcap_rows`), the
+//! per-head SSMax query scale (`ssmax_rows`), residual add, routed-expert
+//! weighted sum, argmax. Two layers per op (the package's gate rule):
 //! - **Asserted**: device output vs a host scalar reference computed in this
 //!   binary from the SAME input, f64 where a sum is involved, mirroring the
 //!   CPU engine's op order per op (cited at each reference fn). Band: exact
 //!   bits where the op is exact by construction (embed, add, argmax index);
 //!   1e-5 for rms_norm and weighted_sum (reduction tree vs f64 serial);
-//!   1e-6 for rope and swiglu (plain f32 ops; swiglu's device `expf` vs the
-//!   host's is the distance, printed). Plus a bit-identical rerun per shape.
+//!   1e-6 for rope, swiglu and ssmax (plain f32 ops; swiglu's device `expf` vs
+//!   the host's is the distance, printed; ssmax is also held to its graph's
+//!   float order bit for bit). Plus a bit-identical rerun per shape.
 //! - **Printed, never asserted**: `ik_rel` — the distance to ik CUDA's own
 //!   dumped output for the same real input (the block-layer bands are pinned
 //!   from these numbers by the lead, not chosen here). `swiglu` has no
@@ -490,6 +491,180 @@ fn run() -> Result<(), GateError> {
         ok &= refused;
     }
 
+    // ============================================================= ssmax
+    // `x[t][head][i] *= (basis(pos_t)·s[head]) + b[head]` in place, the
+    // per-head SSMax query scale of Mistral Large 4 (llama.cpp's graph:
+    // `build_ssmax` over the attention-temperature input): no oracle row, so
+    // synthetic rows at one and 37 tokens, 64 and 32 heads of 128 values, the
+    // positions at the table's ends and scattered. The asserted band is the
+    // plain-op band against an f64 host reference (the position's logarithm
+    // in f64, the whole expression in f64), and the kernel is also held to the
+    // reference graph's own float order on the host — the position basis
+    // `((ln(pos + 1) + 1) rounded to f32) − 1`, the product and the sum each
+    // rounded — bit for bit, with a rerun.
+    {
+        // The reference graph's order, from the position (llama.cpp's
+        // `llm_graph_input_attn_temp::set_input` with the log form, floor
+        // scale 1, scale 1, offset 0, then `ggml_scale_bias(…, 1, −1)`).
+        let basis_ref = |p: u32| -> f32 {
+            let at = f64::from(p as f32) + 1.0;
+            let attn_scale = (at.ln() * 1.0 + 1.0) as f32;
+            attn_scale * 1.0 + -1.0
+        };
+        const D: usize = 128;
+        let per_head = |h: usize, seed: u32| -> (Vec<f32>, Vec<f32>) {
+            let s = (0..h)
+                .map(|j| 0.1 + 0.2 * ((j * 37 + seed as usize) % 17) as f32 / 17.0)
+                .collect();
+            let b = (0..h)
+                .map(|j| 0.8 + 0.4 * ((j * 11 + seed as usize) % 13) as f32 / 13.0)
+                .collect();
+            (s, b)
+        };
+        let mut case = 0u32;
+        let cases: [(&str, usize, Vec<u32>); 5] = [
+            ("one_pos0", 1, vec![0]),
+            ("one_pos1500", 1, vec![1500]),
+            ("t37_from0", 37, (0..37).collect()),
+            ("t37_from2011", 37, (2011..2048).collect()),
+            (
+                "t37_scattered",
+                37,
+                (0..37).map(|i| (i * 55 + 3) % 2048).collect(),
+            ),
+        ];
+        for (label, t, pos) in &cases {
+            for h in [64usize, 32] {
+                case += 1;
+                let n = t * h * D;
+                let x = activations(n, 1, 9000 + case * 13);
+                let (s, b) = per_head(h, case);
+                let pos_dev = DeviceBuffer::from_host(stream, pos)?;
+                let s_dev = DeviceBuffer::from_host(stream, &s)?;
+                let b_dev = DeviceBuffer::from_host(stream, &b)?;
+                let mut y_dev = DeviceBuffer::from_host(stream, &x)?;
+                elem.enqueue_ssmax_rows(stream, &mut y_dev, &pos_dev, &s_dev, &b_dev, h, D, *t)?;
+                stream.synchronize()?;
+                let y = y_dev.to_host_vec(stream)?;
+                // In place: the rerun starts again from `x`.
+                y_dev = DeviceBuffer::from_host(stream, &x)?;
+                elem.enqueue_ssmax_rows(stream, &mut y_dev, &pos_dev, &s_dev, &b_dev, h, D, *t)?;
+                stream.synchronize()?;
+                let rerun = bits_equal(&y, &y_dev.to_host_vec(stream)?);
+
+                let mut y_f64 = Vec::with_capacity(n);
+                let mut y_graph = Vec::with_capacity(n);
+                for (tok, &p) in pos.iter().enumerate() {
+                    let lp = (f64::from(p) + 1.0).ln();
+                    let basis = basis_ref(p);
+                    for head in 0..h {
+                        let factor = f64::from(s[head]) * lp + f64::from(b[head]);
+                        let f32_factor = (basis * s[head]) + b[head];
+                        for i in 0..D {
+                            let v = x[(tok * h + head) * D + i];
+                            y_f64.push((f64::from(v) * factor) as f32);
+                            y_graph.push(v * f32_factor);
+                        }
+                    }
+                }
+                let rel = max_rel_err(&y, &y_f64)?;
+                let exact = bits_equal(&y, &y_graph);
+                let pass = rel <= PLAIN_BAND && exact && rerun;
+                println!(
+                    "shape op=ssmax case={label} t={t} h={h} d={D} max_rel_err={rel:.3e} \
+                     bit_exact_graph_order={exact} bit_identical_rerun={rerun} \
+                     ik_rel=n/a (no isolated oracle row) {}",
+                    verdict(pass)
+                );
+                if !pass {
+                    ok = false;
+                }
+            }
+        }
+
+        // The basis alone, over every position below 4096 and the ends of the
+        // f32's integer range: one head of one value, `x = 1`, `s = 1`, `b =
+        // 0`, so the product and the sum change no bit and the value is the
+        // basis. A position the f32 cannot hold rounds first, as the
+        // reference's input holds it.
+        let mut pos: Vec<u32> = (0..4096).collect();
+        pos.extend([1 << 20, (1 << 24) - 1, 1 << 24, (1 << 24) + 1, u32::MAX]);
+        let m = pos.len();
+        let pos_dev = DeviceBuffer::from_host(stream, &pos)?;
+        let one = DeviceBuffer::from_host(stream, &[1.0f32])?;
+        let zero = DeviceBuffer::from_host(stream, &[0.0f32])?;
+        let mut y_dev = DeviceBuffer::from_host(stream, &vec![1.0f32; m])?;
+        elem.enqueue_ssmax_rows(stream, &mut y_dev, &pos_dev, &one, &zero, 1, 1, m)?;
+        stream.synchronize()?;
+        let y = y_dev.to_host_vec(stream)?;
+        let want: Vec<f32> = pos.iter().map(|&p| basis_ref(p)).collect();
+        let bad = y
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        let pass = bad == 0;
+        println!(
+            "shape op=ssmax basis positions={m} (0..4096 and 2^20, 2^24±1, u32::MAX) h=1 d=1 \
+             bits_off_the_graph_order={bad} {}",
+            verdict(pass)
+        );
+        if !pass {
+            ok = false;
+        }
+
+        // Refusals by name: an empty token, head and width, a short `x`, a
+        // short `pos`, `s` and `b`.
+        let pos1 = DeviceBuffer::from_host(stream, &[0u32])?;
+        let s2 = DeviceBuffer::from_host(stream, &[0.5f32, 0.5])?;
+        let b2 = DeviceBuffer::from_host(stream, &[1.0f32, 1.0])?;
+        let mut x8 = DeviceBuffer::from_host(stream, &[1.0f32; 8])?;
+        let refusals: [(&str, bool); 7] = [
+            (
+                "m_zero",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 4, 0)
+                    .is_err(),
+            ),
+            (
+                "h_zero",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 0, 4, 1)
+                    .is_err(),
+            ),
+            (
+                "d_zero",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 0, 1)
+                    .is_err(),
+            ),
+            (
+                "x_short",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 5, 1)
+                    .is_err(),
+            ),
+            (
+                "pos_short",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 2, 2)
+                    .is_err(),
+            ),
+            (
+                "s_short",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &one, &b2, 2, 4, 1)
+                    .is_err(),
+            ),
+            (
+                "b_short",
+                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &zero, 2, 4, 1)
+                    .is_err(),
+            ),
+        ];
+        for (why, refused) in refusals {
+            println!(
+                "refusal op=ssmax {why} refused={refused} {}",
+                verdict(refused)
+            );
+            ok &= refused;
+        }
+    }
+
     // =============================================================== add
     // (out, a, b) with the operand pairs proven by element sums before use.
     {
@@ -918,6 +1093,113 @@ fn run() -> Result<(), GateError> {
     }
 
     ok &= norm_geometry()?;
+
+    // =========================================================== ln_rows
+    // `y = gain·LayerNorm(x, eps) + bias` over m rows of k values, the
+    // biased LayerNorm of Mistral Large 4's indexer (its `q_norm` over the
+    // hidden row). No oracle row: synthetic rows at the family's two hidden
+    // widths (the fixture's 1,024 and the real file's 6,144), the mean and
+    // variance mirrored in f64 op for op (the lightning index key's own
+    // order), each output's two products and sum rounded on their own, and a
+    // bit-identical rerun. A row holding an inf leaves every value NaN and
+    // raises `F32Product`.
+    {
+        use bloomery_gpu::FaultSite;
+        let ln_ref = |x: &[f32], gain: &[f32], bias: &[f32], eps: f32| -> Vec<f32> {
+            let k = x.len();
+            let mean = (x.iter().map(|&v| f64::from(v)).sum::<f64>() / k as f64) as f32;
+            let var = ((0..k)
+                .map(|i| {
+                    let dev = x[i] - mean;
+                    f64::from(dev * dev)
+                })
+                .sum::<f64>()
+                / k as f64) as f32;
+            let scale = 1.0 / (var + eps).sqrt();
+            (0..k)
+                .map(|i| (((x[i] - mean) * scale) * gain[i]) + bias[i])
+                .collect()
+        };
+        for (label, k, m) in [
+            ("k1024", 1024usize, 1usize),
+            ("k6144", 6144, 1),
+            ("k1024_m3", 1024, 3),
+        ] {
+            let n = k * m;
+            let x = activations(n, 1, 9500 + k as u32 + m as u32);
+            let (gain, bias): (Vec<f32>, Vec<f32>) = (
+                (0..k).map(|i| 0.5 + ((i % 17) as f32) / 17.0).collect(),
+                (0..k).map(|i| -0.4 + ((i % 13) as f32) / 13.0).collect(),
+            );
+            let eps = 1e-6_f32;
+            let x_dev = DeviceBuffer::from_host(stream, &x)?;
+            let gain_dev = DeviceBuffer::from_host(stream, &gain)?;
+            let bias_dev = DeviceBuffer::from_host(stream, &bias)?;
+            let mut y_dev = DeviceBuffer::zeroed(stream, n)?;
+            elem.enqueue_ln_rows(
+                stream,
+                &x_dev,
+                &gain_dev,
+                &bias_dev,
+                eps,
+                k,
+                m,
+                gpu.unlabelled_sink(),
+                &mut y_dev,
+            )?;
+            stream.synchronize()?;
+            let y = y_dev.to_host_vec(stream)?;
+            elem.enqueue_ln_rows(
+                stream,
+                &x_dev,
+                &gain_dev,
+                &bias_dev,
+                eps,
+                k,
+                m,
+                gpu.unlabelled_sink(),
+                &mut y_dev,
+            )?;
+            stream.synchronize()?;
+            let rerun = bits_equal(&y, &y_dev.to_host_vec(stream)?);
+            let want: Vec<f32> = (0..m)
+                .flat_map(|t| ln_ref(&x[t * k..(t + 1) * k], &gain, &bias, eps))
+                .collect();
+            let band = (0..n).fold(0.0f32, |w, i| {
+                w.max((y[i] - want[i]).abs() / want[i].abs().max(1e-3))
+            });
+            // A row holding an inf: every value NaN, the fault F32Product.
+            let mut bad = x.clone();
+            bad[k / 2] = f32::INFINITY;
+            let bad_dev = DeviceBuffer::from_host(stream, &bad)?;
+            let mut bad_y = DeviceBuffer::zeroed(stream, k)?;
+            elem.enqueue_ln_rows(
+                stream,
+                &bad_dev,
+                &gain_dev,
+                &bias_dev,
+                eps,
+                k,
+                1,
+                gpu.unlabelled_sink(),
+                &mut bad_y,
+            )?;
+            stream.synchronize()?;
+            let refused = bad_y.to_host_vec(stream)?.iter().all(|v| v.is_nan())
+                && gpu
+                    .take_fault()?
+                    .is_some_and(|f| f.code == FaultSite::F32Product as u32);
+            let pass = band <= PLAIN_BAND * 64.0 && rerun && refused;
+            println!(
+                "ln_rows {label}: band {band:.3e} (band {:.0e})",
+                PLAIN_BAND * 64.0
+            );
+            ok &= pass;
+            if !pass {
+                println!("ln_rows {label} FAIL");
+            }
+        }
+    }
 
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());

@@ -38,7 +38,7 @@ attn_linear_gdn_kda	recur	crates/gpu/src/linear/conv.rs crates/gpu/src/linear/de
 recur_mamba2	recur	crates/gpu/src/mamba2.rs crates/gpu/src/mamba2_ssd.rs crates/model/src/mamba2.rs crates/gpu/src/recur.rs
 recur_state	recur	crates/runtime/src/seqstate.rs crates/runtime/src/state.rs
 attn_ds41_csa_hca	attn	crates/gpu-deepseek41/src/attn.rs crates/gpu-deepseek41/src/compress.rs crates/gpu-deepseek41/src/indexer.rs crates/gpu-deepseek41/src/index_key.rs crates/gpu-deepseek41/src/hc.rs crates/gpu/src/hc_gated.rs
-moe_route	moe	crates/gpu/src/moe_fused.rs crates/gpu/src/router.rs crates/gpu/src/route_core.rs crates/gpu/src/route_body.rs crates/gpu/src/cand.rs crates/gpu/src/gemm/route.rs
+moe_route	moe	crates/gpu/src/moe_fused.rs crates/gpu/src/router.rs crates/gpu/src/route_core.rs crates/gpu/src/route_body.rs crates/gpu/src/route_softmax.rs crates/gpu/src/cand.rs crates/gpu/src/gemm/route.rs
 kv_pool_checkpoint	kv	crates/gpu/src/kpool.rs crates/gpu/src/checkpoint.rs crates/gpu/src/checkpoint/planes.rs crates/gpu/src/checkpoint/saved.rs crates/gpu/src/checkpoint/staging.rs crates/runtime/src/stores.rs crates/runtime/src/savemap.rs crates/model/src/kv.rs
 graph_fault	graph	crates/gpu/src/graph.rs crates/gpu/src/lane.rs crates/gpu/src/fault.rs crates/gpu/src/watchdog.rs crates/gpu/src/capsync.rs
 ple_embed	load	crates/gpu/src/ple.rs crates/embed/src/lib.rs

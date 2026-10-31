@@ -22,6 +22,7 @@ pub mod mimo2;
 pub mod minicpmv4_7;
 pub mod minimaxm3;
 pub mod minimaxm31;
+pub mod mistrallarge4;
 pub mod musespark;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
@@ -59,6 +60,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (nemotron_h_moe::ARCH, nemotron_h_moe::FAMILIES),
     (lfm3::ARCH, lfm3::FAMILIES),
     (musespark::ARCH, musespark::FAMILIES),
+    (mistrallarge4::ARCH, mistrallarge4::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
     (quant::ARCH, quant::FAMILIES),
@@ -303,6 +305,7 @@ mod tests {
             ("fx-ik-qwen35moe", 3),
             ("fx-ik-deepseek41", 4),
             ("fx-ref-nemotron-moe-logits", 1),
+            ("fx-lcpp-mistrallarge4", 2),
         ];
         let mut found: Vec<&str> = all()
             .filter(|f| f.name.starts_with("fx-") && !STANDALONE.contains(&f.name))

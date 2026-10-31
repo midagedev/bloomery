@@ -786,8 +786,9 @@ impl IndexerKernels {
     }
 
     /// [`Self::load`] from the three numbers it reads: `n_head` heads of
-    /// `head_dim` and `n_dims` roped values per head. For callers with no
-    /// model file (synthetic benches). Load-time only.
+    /// `head_dim` and `n_dims` roped values per head (`0`: a layer that ropes
+    /// none of them — the score and top-k passes run with no rotation).
+    /// For callers with no model file (synthetic benches). Load-time only.
     pub fn with_shape(
         ctx: &Arc<CudaContext>,
         n_head: usize,
@@ -804,12 +805,12 @@ impl IndexerKernels {
                 ),
             });
         }
-        if n_dims == 0 || !n_dims.is_multiple_of(PER_LANE) || n_dims > HEAD_DIM {
+        if !n_dims.is_multiple_of(PER_LANE) || n_dims > HEAD_DIM {
             return Err(GpuError::Shape {
                 what,
                 detail: format!(
-                    "the query's rope turns {n_dims} values: a positive multiple of {PER_LANE}, at \
-                     most {HEAD_DIM}"
+                    "the query's rope turns {n_dims} values: 0, or a positive multiple of \
+                     {PER_LANE}, at most {HEAD_DIM}"
                 ),
             });
         }

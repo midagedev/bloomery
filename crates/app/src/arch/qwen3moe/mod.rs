@@ -26,12 +26,12 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::Qwen3moeModel;
-use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::{
     Body, Body35, Body38, PrefillPath, Prompt38, Qwen35moeModel, Qwen38Model, TargetRows,
 };
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu::route_softmax::MAX_TOKENS;
 use runtime::seqstate::Kept;
 use runtime::{Speculative, TapSink, Tapped, TappedPrompt, Want};
 

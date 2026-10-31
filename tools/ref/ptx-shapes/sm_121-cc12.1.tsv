@@ -108,6 +108,9 @@ generate_ds41   ds41_hc_pre                              0           0
 generate_ds41   ds41_hc_pre_f32                          0           0
 generate_ds41   ds41_hc_pre_groups                       0           0
 generate_ds41   ds41_index_key                           0           0
+# PIN(2026-10-31): ssmax_rows and ds41_index_key_input (Mistral Large 4's SSMax and index key from the layer input) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 JIT local), not measured at cc 12.1 (sm_121 PTX) until a GB10 scan runs.
+# PIN(2026-11-01): ln_rows and kv_gather_sel (Mistral Large 4's index-head LayerNorm and the selected-row latent gather) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 JIT local), not measured at cc 12.1 (sm_121 PTX) until a GB10 scan runs.
+generate_ds41   ds41_index_key_input                           0           0
 generate_ds41   ds41_indexer_score                       0           0
 generate_ds41   ds41_indexer_topk                        0           0
 generate_ds41   ds41_kv_norm_rope_append                 0           0
@@ -323,9 +326,11 @@ generate_ds41   kq_gate_up_act_q5k_tiles               848         136
 generate_ds41   kq_gate_up_act_q8_0                      0           0
 generate_ds41   kv_append                                0           0
 generate_ds41   kv_append_pos_buf                        0           0
+generate_ds41   kv_gather_sel                            0           0
 generate_ds41   kv_norm_rope_append                      0           0
 generate_ds41   latent_extra_rms_append                  0           0
 generate_ds41   latent_rms_append                        0           0
+generate_ds41   ln_rows                                  0           0
 generate_ds41   mamba2_conv_rows                         0           0
 generate_ds41   mamba2_ssd                               0           0
 generate_ds41   mimo2_router                             0           0
@@ -572,6 +577,7 @@ generate_ds41   iq2_xxs_gate_up_sel                      0           0
 generate_ds41   sigmoid_256_8_router                     0           0
 generate_ds41   sigmoid_256_8_router_pick                0           0
 generate_ds41   softcap_rows                             0           0
+generate_ds41   ssmax_rows                             0           0
 generate_ds41   swiglu_rule_rows                         0           0
 generate_ds41   gemm_iq1m                                0           0
 generate_ds41   gemm_iq1s                                0           0

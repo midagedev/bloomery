@@ -44,6 +44,7 @@ pub mod hermes;
 mod http;
 pub mod live;
 pub mod media;
+pub mod mistral;
 pub mod mock;
 mod models;
 pub mod museatem;

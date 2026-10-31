@@ -110,7 +110,7 @@ use super::body::ATTN_SCALE_256;
 use super::body::KvQ8;
 use super::plan38::{HcSite, geo, router};
 use super::program38::{Ctx38, Kernels38, MMA};
-use super::router::{RouterDims, RouterOut, gated};
+use super::router::gated;
 use super::scratch::{
     Append256, IN_IDS, IN_POS0, Inbox, KvPlanes, cells_view, param_view, put_input,
 };
@@ -137,6 +137,7 @@ use crate::q8f32::{
 };
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::room::{Roomed, SharedPages};
+use crate::route_softmax::{RouterDims, RouterOut};
 use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};

@@ -123,6 +123,7 @@ gate-gpu-nemotron-e2e	family	nemotron_h	e2e	graph_fault+recur_mamba2
 gate-gpu-nemotron-h-moe-e2e	family	nemotron_h_moe	e2e	graph_fault+recur_mamba2+quant_mxfp4
 gate-gpu-nemotron-h-moe-serve	family	nemotron_h_moe	serve	seats_serve_engine
 gate-gpu-musespark-e2e	family	muse-spark	e2e	graph_fault+attn_gqa+moe_route+quant_iq+elem_kernels+tier_legs+placement_sizing
+gate-gpu-mistrallarge4-e2e	family	mistral-large4	e2e	graph_fault+attn_latent_mla+attn_ds41_csa_hca+moe_route+quant_iq+elem_kernels+tier_legs+placement_sizing
 gate-gpu-musespark-prefill	family	muse-spark	e2e	prompt_walks
 gate-gpu-musespark-load	family	muse-spark	load	weights_load+placement_sizing+tier_legs
 gate-gpu-musespark-serve	family	muse-spark	serve	seats_serve_engine
@@ -218,6 +219,7 @@ gate-q38-serve-rules	family	qwen4exp	serve	seats_serve_engine
 gate-qdot	common		host	quant_host_qdot
 gate-quant	common		host	quant_host_qdot
 gate-qwen3-plan	common		place	placement_sizing+tier_legs
+gate-mistrallarge4-meta	family	mistral-large4	meta	arch_registry
 gate-musespark-meta	family	muse-spark	meta	arch_registry+placement_sizing
 gate-qwen35moe-meta	family	qwen35moe	meta	arch_registry
 gate-qwen3moe-meta	family	qwen3moe	meta	arch_registry

@@ -66,7 +66,7 @@ impl MoeShape {
 pub enum RouterBody {
     /// `gpu/src/router.rs` `router_topk`: one thread a token, serial sums.
     Topk,
-    /// `gpu/src/arch/qwen3moe/router.rs` `qwen3moe_router_*`: a warp a token,
+    /// `gpu/src/route_softmax.rs` `qwen3moe_router_*`: a warp a token,
     /// four named logits a lane.
     Qwen3moe,
     /// `gpu/src/arch/qwen3moe/router.rs` `qwen35moe_router_*`: a warp a token,
@@ -199,7 +199,7 @@ pub const ROUTERS: &[RouterInst] = &[
         experts: 128,
         top_k_min: 1,
         top_k_max: LANE_PICKS,
-        at: "gpu/src/arch/qwen3moe/router.rs qwen3moe_router_*",
+        at: "gpu/src/route_softmax.rs qwen3moe_router_*",
     },
     RouterInst {
         body: RouterBody::Qwen35moe,

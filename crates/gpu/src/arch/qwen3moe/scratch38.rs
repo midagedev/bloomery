@@ -16,7 +16,6 @@
 use super::body::KvQ8;
 use super::body38::WHAT_SHARE;
 use super::plan38::{GDN, Layer38, geo};
-use super::router::{RouterDims, RouterOut};
 use super::scratch::{
     Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, RecStore, fresh_stamps, param_view, put_input,
 };
@@ -27,6 +26,7 @@ use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
 use crate::room::{Room, Roomed, Run, SharedPages};
+use crate::route_softmax::{RouterDims, RouterOut};
 use crate::site::ByName;
 use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};

@@ -5,7 +5,8 @@
 //! the tanh GELU-gated unit (`geglu_tanh`, [`crate::gelu`]'s rule), the
 //! residual add and the two-branch gain mix (`mix_rows`), the elementwise
 //! product of two vectors (`mul_rows`), the in-place scalar `scale_rows`, the
-//! routed-expert weighted sum and argmax, and the head's
+//! per-head SSMax query scale (`ssmax_rows`), the routed-expert weighted sum
+//! and argmax, and the head's
 //! logit softcap (`softcap_rows`). One
 //! `#[cuda_module]` in its own file (docs/gpu-design.md decision 6); the
 //! arithmetic bodies are cores above the module so a later fused block kernel
@@ -638,6 +639,99 @@ pub(crate) unsafe fn weighted_expert_sum(
 #[inline(always)]
 pub(crate) fn argmax_take(v: f32, i: u32, best_v: f32, best_i: u32) -> bool {
     v > best_v || (v == best_v && i < best_i)
+}
+
+/// The position basis of SSMax: `ln(pos + 1)`, as the reference's graph forms
+/// it. The input row holds `ln(pos + 1) + 1` — the logarithm in f64 of the
+/// position (held as an f32) plus one, rounded once to f32 — and the graph
+/// subtracts the one in f32, which is exact. The reference's log scale of
+/// 1.0 multiplies the logarithm before the sum and changes no bit.
+#[inline(always)]
+pub fn ssmax_basis(pos: u32) -> f32 {
+    let at = f64::from(pos as f32) + 1.0;
+    (at.ln() + 1.0) as f32 - 1.0
+}
+
+/// One thread's f64 partial of the mean of `x[base .. base + k]`: the sum of
+/// its strided values, each widened before the sum.
+///
+/// # Safety
+/// `base + k <= x.len()` and `tid < RMS_THREADS`.
+#[inline(always)]
+unsafe fn ln_mean(x: &[f32], base: usize, k: usize, tid: usize) -> f64 {
+    let mut acc = 0.0f64;
+    let mut i = tid;
+    while i < k {
+        // SAFETY: i < k, so base + i < base + k <= x.len() (this fn's
+        // contract).
+        acc += f64::from(unsafe { *x.get_unchecked(base + i) });
+        i += RMS_THREADS;
+    }
+    acc
+}
+
+/// One thread's f64 partial of the variance of `x[base .. base + k]` around
+/// `mean`: the sum of the f32-rounded squares of its strided f32 deviations.
+///
+/// # Safety
+/// `base + k <= x.len()` and `tid < RMS_THREADS`.
+#[inline(always)]
+unsafe fn ln_var(x: &[f32], base: usize, k: usize, tid: usize, mean: f32) -> f64 {
+    let mut acc = 0.0f64;
+    let mut i = tid;
+    while i < k {
+        // SAFETY: i < k, so base + i < base + k <= x.len() (this fn's
+        // contract).
+        let dev = unsafe { *x.get_unchecked(base + i) } - mean;
+        acc += f64::from(mul_rn_f32(dev, dev));
+        i += RMS_THREADS;
+    }
+    acc
+}
+
+/// The block's f64 sum of the warps' partials `v` (each lane's widened by the
+/// xor butterfly first): thread `tid` holds its warp's sum at lane 0, the
+/// first warp reduces the per-warp sums through the caller's shared `ws`
+/// ([`RMS_WARPS`] slots), and every thread reads the result — the value all
+/// threads need before the apply pass. The caller's barriers order the slots
+/// against both reads.
+///
+/// # Safety
+/// `tid < RMS_THREADS` and `ws` points to this block's own [`RMS_WARPS`]
+/// shared slots that no concurrent call shares; all threads of the block call
+/// it converged.
+#[inline(always)]
+unsafe fn ln_block_tree(v: f64, tid: usize, ws: *mut f64) -> f64 {
+    let mut acc = v;
+    acc += warp::shuffle_xor_f64(acc, 16);
+    acc += warp::shuffle_xor_f64(acc, 8);
+    acc += warp::shuffle_xor_f64(acc, 4);
+    acc += warp::shuffle_xor_f64(acc, 2);
+    acc += warp::shuffle_xor_f64(acc, 1);
+    // SAFETY: the caller's contract: the block's own slots, the whole block
+    // converged. Lane 0 of each warp writes its slot before the barrier, warp
+    // 0 alone reduces the slots, and the whole block reads slot 0 after the
+    // second barrier.
+    unsafe {
+        let (lane, wid) = (warp::lane_id() as usize, tid / 32);
+        if lane == 0 {
+            *ws.add(wid) = acc;
+        }
+        thread::sync_threads();
+        if wid == 0 {
+            let mut all = 0.0f64;
+            let mut w = 0usize;
+            while w < RMS_WARPS {
+                all += *ws.add(w);
+                w += 1;
+            }
+            if lane == 0 {
+                *ws.add(0) = all;
+            }
+        }
+        thread::sync_threads();
+        *ws.add(0)
+    }
 }
 
 // ---------------------------------------------------------------- kernels
@@ -1449,6 +1543,150 @@ mod elem_kernels {
         unsafe {
             let v = *y.get_unchecked_mut(i);
             *y.get_unchecked_mut(i) = mul_rn_f32(v, s);
+        }
+    }
+
+    /// SSMax over `m` tokens of `h` heads of `d` values, in place: `x[t][head][i]
+    /// *= f`, the factor `f = (basis·s[head]) + b[head]` of token `t`'s
+    /// [`ssmax_basis`] at `pos[t]`, the product and the sum each rounded on
+    /// their own as the graph's MUL and ADD nodes round them, then one rounded
+    /// multiply of the value by `f`. The tokens' rows are contiguous
+    /// (`[m][h·d]`); a row takes `ceil(h·d / 256)` blocks, and block `b`
+    /// serves token `b / ceil(h·d / 256)`: its first thread forms the basis
+    /// once and the block reads it past the barrier. A value or a weight that
+    /// is not finite makes the values it scales not finite, the rule's own
+    /// result (nothing is clamped, and no fault is raised).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= m * h * d, pos.len() >= m, s.len() >= h, b.len() >= h)
+    )]
+    pub fn ssmax_rows(
+        mut x: DisjointSlice<f32>,
+        pos: &[u32],
+        s: &[f32],
+        b: &[f32],
+        d: u32,
+        h: u32,
+        m: u32,
+    ) {
+        static mut BASIS: SharedArray<f32, 1> = SharedArray::UNINIT;
+
+        let row = h as usize * d as usize;
+        let per_row = row.div_ceil(256);
+        let blk = thread::blockIdx_x() as usize;
+        let t = blk / per_row;
+        // The guard reads only the block's index, so every thread of the
+        // block leaves before the barrier together.
+        if t >= m as usize {
+            return;
+        }
+        let tid = thread::threadIdx_x() as usize;
+        // SAFETY: BASIS is this block's own shared allocation; the raw form
+        // is the only way to reach it without a reference to a `static mut`.
+        // Thread 0 alone writes it, before the barrier.
+        let basis_at = unsafe { SharedArray::as_raw_mut_ptr(&raw mut BASIS) };
+        if tid == 0 {
+            // SAFETY: t < m <= pos.len() by the launch contract; slot 0 of the
+            // one-slot array.
+            unsafe {
+                *basis_at = ssmax_basis(*pos.get_unchecked(t));
+            }
+        }
+        thread::sync_threads();
+        let i = (blk - t * per_row) * 256 + tid;
+        if i >= row {
+            return;
+        }
+        // SAFETY: the slot was written by thread 0 before the barrier.
+        let basis = unsafe { *basis_at };
+        let head = i / d as usize;
+        // SAFETY: head < h <= s.len(), b.len() (i < h·d), and t·h·d + i <
+        // (t + 1)·h·d <= m·h·d <= x.len() by the launch contract; thread i of
+        // token t owns entry i of its row.
+        unsafe {
+            let f = add_rn_f32(
+                mul_rn_f32(basis, *s.get_unchecked(head)),
+                *b.get_unchecked(head),
+            );
+            let v = x.get_unchecked_mut(t * row + i);
+            *v = mul_rn_f32(*v, f);
+        }
+    }
+
+    /// The LayerNorm at `eps` of each row of `k` values of `x`, the row then
+    /// scaled by the gain `gain` and shifted by the bias `bias`
+    /// (`ggml_add(ggml_mul(ggml_norm(x, eps), gain), bias)`, one block a
+    /// row): the mean and the variance each summed in f64 over the row's
+    /// plain values and its f32-rounded deviations ([`ln_mean`] and
+    /// [`ln_var`], the lightning index key's own order), the scale
+    /// `1/√(var + eps)`, then `(dev·scale)·gain + bias` a value with the
+    /// product and the sum each rounded on their own. A variance that is not
+    /// finite leaves the scale NaN (every value NaN) and raises
+    /// [`FaultSite::F32Product`] from lane 0.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= k * m, gain.len() >= k, bias.len() >= k, y.len() >= k * m)
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn ln_rows(
+        x: &[f32],
+        gain: &[f32],
+        bias: &[f32],
+        eps: f32,
+        k: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut WSUM: SharedArray<f64, RMS_WARPS> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform: no barrier is skipped
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let k = k as usize;
+        let base = t * k;
+        // SAFETY: WSUM is this block's own shared allocation.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        // SAFETY: base + k <= m·k <= x.len() (the launch contract) and
+        // tid < 256 = RMS_THREADS; `ws` is this block's own slots and the
+        // whole block reaches the call converged.
+        let mean = (unsafe { ln_block_tree(ln_mean(x, base, k, tid), tid, ws) } / k as f64) as f32;
+        // SAFETY: as for the mean: the same row, slots and converged block.
+        let var =
+            (unsafe { ln_block_tree(ln_var(x, base, k, tid, mean), tid, ws) } / k as f64) as f32;
+        let scale = if var.is_finite() {
+            1.0f32 / (var + eps).sqrt()
+        } else {
+            f32::NAN
+        };
+        if tid == 0 && !var.is_finite() {
+            fault.raise(FaultSite::F32Product);
+        }
+        let mut i = tid;
+        while i < k {
+            // SAFETY: i < k <= gain.len(), bias.len() by the launch contract,
+            // and base + i < (t + 1)·k <= m·k <= x.len(), y.len() (the same
+            // contract); thread i owns entry i of its row.
+            unsafe {
+                let dev = *x.get_unchecked(base + i) - mean;
+                let v = add_rn_f32(
+                    mul_rn_f32(mul_rn_f32(dev, scale), *gain.get_unchecked(i)),
+                    *bias.get_unchecked(i),
+                );
+                *y.get_unchecked_mut(base + i) = v;
+            }
+            i += RMS_THREADS;
         }
     }
 
@@ -2866,6 +3104,118 @@ impl ElemKernels {
             .module
             .prepare_scale_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.scale_rows(stream, &prep, y, n, s)?;
+        Ok(())
+    }
+
+    /// Enqueue SSMax over `m` tokens of `h` heads of `d` values of `x`, in
+    /// place (`ssmax_rows`): token `t`'s value `i` of head `head` is scaled by
+    /// `(ssmax_basis(pos[t])·s[head]) + b[head]`. `pos` holds `m` positions
+    /// and `s` and `b` the `h` heads' scale and bias, each a device buffer
+    /// of f32 (positions u32); the counts and the one `m·h·d` span fit a
+    /// launch's u32. Refused before the launch: an empty token, head or
+    /// width, short `x`, `pos`, `s` or `b`. Asynchronous, allocation-free,
+    /// capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
+    pub fn enqueue_ssmax_rows(
+        &self,
+        stream: &CudaStream,
+        x: &mut DeviceBuffer<f32>,
+        pos: &DeviceBuffer<u32>,
+        s: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        h: usize,
+        d: usize,
+        m: usize,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_ssmax_rows";
+        if m == 0 || h == 0 || d == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need m, h and d >= 1, got m={m} h={h} d={d}"),
+            ));
+        }
+        let row = launch_u32(what, "h*d", h.saturating_mul(d))?;
+        let span = launch_u32(what, "m*h*d", m.saturating_mul(row as usize))?;
+        if x.len() < span as usize || pos.len() < m || s.len() < h || b.len() < h {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "x.len() {} (need {span}), pos.len() {} (need {m}), s.len() {} and b.len() \
+                     {} (need {h})",
+                    x.len(),
+                    pos.len(),
+                    s.len(),
+                    b.len()
+                ),
+            ));
+        }
+        let per_row = (row as usize).div_ceil(256);
+        let grid = launch_u32(what, "grid", m * per_row)?;
+        let d = launch_u32(what, "d", d)?;
+        let h = launch_u32(what, "h", h)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_ssmax_rows(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module
+            .ssmax_rows(stream, &prep, x, pos, s, b, d, h, m)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = gain·LayerNorm(x, eps) + bias` over `m` rows of `k`
+    /// values (`ln_rows`): the LayerNorm's mean and variance in f64, the row's
+    /// deviations in f32, each output's two products and sum rounded on their
+    /// own. `gain` and `bias` hold `k` values each. Refused before the launch:
+    /// an empty row or count, short `x`, `gain`, `bias` or `y`. Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
+    pub fn enqueue_ln_rows(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        gain: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        eps: f32,
+        k: usize,
+        m: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_ln_rows";
+        if k == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need k and m >= 1, got k={k} m={m}"),
+            ));
+        }
+        let span = launch_u32(what, "m*k", m.saturating_mul(k))?;
+        if x.len() < span as usize || gain.len() < k || bias.len() < k || y.len() < span as usize {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "x.len() {} and y.len() {} (need {span}), gain.len() {} and bias.len() {} \
+                     (need {k})",
+                    x.len(),
+                    y.len(),
+                    gain.len(),
+                    bias.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m)?;
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_ln_rows(LaunchConfig1D::new(grid, RMS_THREADS_U32, 0))?;
+        self.module
+            .ln_rows(stream, &prep, x, gain, bias, eps, k, m, fault, y)?;
         Ok(())
     }
 

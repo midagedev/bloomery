@@ -1,0 +1,20 @@
+# The Mistral Large 4 real file's CPU node dumps (UD-IQ1_S, 223 GB in six shards,
+# /models/Mistral-Large-4-1T-A52B-UD-IQ1_S), `just dump-ref-mistrallarge4`: the two prompts (18 and 42 ids) from
+# ONE load, into ref_mistrallarge4_{a,b}. The phases run one after the other.
+# Predicted wall [derived], seconds:
+#   load      223 GB mmapped; the routed experts a run touches (4 of 128 a token and layer, so ~90 of 128 over 60 ids and 64
+#             greedy tokens) and the 17 GB of dense part are paged in from the root drive at ~2-3 GB/s when the page cache holds
+#             none of it; nothing repacked on this AVX2 CPU (IQ1_S, IQ2_XXS, Q6_K, Q8_0): 20-100 s
+#   prefill   60 ids x 2 x ~52 G MACs a token (52B active: 4 of 128 experts, the dense MLA and indexer, the shared expert, the
+#             head) at the Muse dump's measured ~0.1 s an id for 42B active: 4-8 s
+#   greedy    64 tokens reading ~24 GB a token (6.7 GB of IQ1_S experts, 16.9 GB dense) over ~57-120 GB/s of host DRAM
+#             (Muse's 12 GB a token took 0.21 s): 13-26 s
+#   writes    a's and b's taps, ~0.3 GB and ~0.8 GB: 1-2 s
+#   total     1-4 min, bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when each prompt's manifest
+# carries its `# complete` trailer.
+kind: exclusive
+reason: mistrallarge4_dump runs mainline llama.cpp on 32 CPU threads over a 223 GB mmap; beside a timed run or a gate batch
+  it would take their cores and their page cache, so it holds the lease; why now: the real tier's oracle sets the Mistral
+  Large 4 body and placement rounds read
+minutes: 1..4

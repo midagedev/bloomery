@@ -241,6 +241,7 @@ dependencies = [
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
  "bloomery-gpu-minimaxm3",
+ "bloomery-gpu-mistrallarge4",
  "bloomery-gpu-solar2",
  "bloomery-gpu-vision",
  "bloomery-hf",
@@ -340,6 +341,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-gpu-mistrallarge4"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
+ "bloomery-levers",
+ "bloomery-model",
+ "bloomery-models",
+ "cuda-core",
+]
+
+[[package]]
 name = "bloomery-gpu-solar2"
 version = "0.1.0"
 dependencies = [
@@ -435,6 +449,7 @@ dependencies = [
  "bloomery-threads",
  "bloomery-tokenizer",
  "libc",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
