@@ -2,7 +2,7 @@
 //! sampled chunks byte for byte, each sampled block against its rule, and the
 //! dequantized RMS.
 
-use gguf::iq_tables::IQ2XXS_GRID;
+use gguf::iq_tables::{IQ1S_GRID, IQ2XXS_GRID};
 use gguf::quant::{KVALUES_MXFP4, half_to_f32, ue4m3_to_f32_half};
 use gguf::{Split, Value, dequant_row};
 
@@ -170,6 +170,7 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
         Rule::Iq2Xxs { d, band } => {
             scale_at(0, "d", *d).and_then(|d| iq2xxs_fault(blk, y, d, band))
         }
+        Rule::Iq1S { d, band } => scale_at(0, "d", *d).and_then(|d| iq1s_fault(blk, y, d, band)),
         Rule::Mxfp4 { e_lo, .. } => {
             if blk[0] != *e_lo && blk[0] != e_lo + 1 {
                 Err(format!(
@@ -238,6 +239,41 @@ fn iq2xxs_fault(blk: &[u8], y: &[f32], d: f32, band: &Band) -> Result<(), String
                 if v.abs() != db * f32::from(g) || v.is_sign_negative() != negative {
                     return Err(format!(
                         "sub-block {j} group {l} value {i} dequantizes {v}, not the grid byte {g} at scale {s} with its stored sign"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// IQ1_S: per 32-value sub-block the scale code `2s + 1` is in `band`, and each
+/// value `y` is `d·(2s + 1)` times the grid entry's byte plus the delta the sign
+/// bit gives (±1/8).
+fn iq1s_fault(blk: &[u8], y: &[f32], d: f32, band: &Band) -> Result<(), String> {
+    let qs = &blk[2..34];
+    for (j, (qh, vals)) in blk[34..50]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(y.as_chunks::<32>().0)
+        .enumerate()
+    {
+        let h = u16::from_le_bytes(*qh);
+        let s = i32::from((h >> 12) & 7);
+        if !band.holds(2 * s + 1) {
+            return Err(format!("sub-block {j} scale {s} is outside the band"));
+        }
+        let dl = d * (2 * s + 1) as f32;
+        let delta = if h & 0x8000 != 0 { -0.125 } else { 0.125 };
+        for (l, group) in vals.as_chunks::<8>().0.iter().enumerate() {
+            let index = usize::from(qs[4 * j + l]) | (usize::from((h >> (3 * l)) & 7) << 8);
+            let grid = IQ1S_GRID[index].to_le_bytes();
+            for (i, (&v, &g)) in group.iter().zip(&grid).enumerate() {
+                if v != dl * (f32::from(g as i8) + delta) {
+                    return Err(format!(
+                        "sub-block {j} group {l} value {i} dequantizes {v}, not the grid byte {} at scale {s} with delta {delta}",
+                        g as i8
                     ));
                 }
             }
@@ -348,7 +384,7 @@ pub fn sample_chunks(t: &PlannedTensor) -> Vec<usize> {
 
 /// `t`'s sampled chunks in `data` (its bytes in a file) equal the
 /// generator's under `seed` and pass [`check_units`] under `window`; the
-/// dequantized RMS of a random tensor is within ±10 % of `1/√K`.
+/// dequantized RMS of a random tensor is within [`rms_band`] of `1/√K`.
 pub fn check_tensor(
     t: &PlannedTensor,
     data: &[u8],
@@ -383,13 +419,42 @@ pub fn check_tensor(
     Ok(s)
 }
 
-/// The sample's RMS against `t`'s `1/√K`, ±10 %.
+/// The band of the sample's RMS about `t`'s `1/√K`.
+const RMS_BAND: f64 = 0.10;
+
+/// The standard errors of its own size that the RMS of a uniform draw may stray by: a correct
+/// draw is refused at 5 of them with a probability of about 5·10⁻⁶ at the fewest values [simulated:
+/// 4·10⁷ draws of 16 values refuse 5.1·10⁻⁶; the rate is lower at more values].
+const RMS_STANDARD_ERRORS: f64 = 5.0;
+
+/// The relative standard error of the RMS of `n` uniform draws, times `√n`. `x²` of a uniform in
+/// `±h` has mean `h²/3` and variance `4h⁴/45`, so the mean of `n` squares has relative variance
+/// `4/(5n)` and the root halves it: `½·√(4/5) = 1/√5`.
+const UNIFORM_RMS_SE: f64 = 0.447_213_595_499_957_9;
+
+/// The band of `t`'s RMS ratio for a sample of `values` values: [`RMS_BAND`], or for a uniform
+/// draw that few values make wider than that, [`RMS_STANDARD_ERRORS`] standard errors of it.
+fn rms_band(t: &PlannedTensor, values: usize) -> f64 {
+    match t.rule {
+        Rule::Uniform { .. } => {
+            RMS_BAND.max(RMS_STANDARD_ERRORS * UNIFORM_RMS_SE / (values.max(1) as f64).sqrt())
+        }
+        _ => RMS_BAND,
+    }
+}
+
+/// The sample's RMS against `t`'s `1/√K`, within [`rms_band`].
+// PIN(2026-10-31): a few-value uniform draw is held to 5 standard errors of its own RMS, `5/√(5n)` from the
+// uniform's moments, not ±10 %: ±10 % is 0.9 of them at 16 values and refuses 38 % of correct draws. ML4's
+// blk.0.attn_ssmax.bias (F32 [16], 1.243σ) and five more of its 18 draws, and the committed Muse Spark
+// fixture's blk.2.exp_probs_b.bias (F32 [16], 1.104σ), failed `verify` without it.
 pub fn rms_within(t: &PlannedTensor, s: &Sample) -> Result<(), FixtureError> {
     let Some(sigma) = t.sigma() else {
         return Ok(());
     };
     let ratio = s.rms() / sigma;
-    if (0.9..=1.1).contains(&ratio) {
+    let band = rms_band(t, s.values);
+    if (1.0 - band..=1.0 + band).contains(&ratio) {
         Ok(())
     } else {
         Err(FixtureError::Tensor {

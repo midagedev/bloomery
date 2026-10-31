@@ -694,7 +694,17 @@ mod tests {
             (
                 "final_logit_softcapping",
                 V::F32(-1.0),
-                "not a nonnegative bound",
+                "not a finite nonnegative bound",
+            ),
+            (
+                "final_logit_softcapping",
+                V::F32(f32::NAN),
+                "not a finite nonnegative bound",
+            ),
+            (
+                "final_logit_softcapping",
+                V::F32(f32::INFINITY),
+                "not a finite nonnegative bound",
             ),
         ] {
             let mut kv = keys();

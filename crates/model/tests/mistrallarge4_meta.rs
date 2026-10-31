@@ -17,6 +17,8 @@
 
 use gguf::write::{Layout, TensorDecl};
 use gguf::{GgmlType, Split, Value};
+use model::arch::mistrallarge4::fixture as ml4;
+use model::fixture::{FilePlan, FixtureSpec};
 use models::{
     Act, Ffn, IndexKeys, LatentUp, LogitEpilogue, Moe, OutGate, RouterNorm, Score, Selector, Source,
 };
@@ -422,10 +424,11 @@ fn mistrallarge4_header() {
     // the new ones among them — pinned here, emptied by the body's round.
     // What no common row runs: the two latent shapes (the absorbed
     // query with and without the rope part), SSMax, the shared cache and the
-    // keys from the layer input, beside the program, the pre-tokenizer and
-    // the tool parser. The unrotated-key row, the 32x128 stream indexer and
-    // the softmax router shapes are common rows' (the V4.1 indexer and the
-    // shape table), so they are no items here.
+    // keys from the layer input, beside the program and the tool parser.
+    // The pre-tokenizer `tekken-num3` is a known one, so no item. The
+    // unrotated-key row, the 32x128 stream indexer and the softmax router
+    // shapes are common rows' (the V4.1 indexer and the shape table), so they
+    // are no items here.
     for want in [
         "latent attention 512 x rope 64, absorbed qk 64 / v 128",
         "latent attention 512 x rope 0, absorbed qk 128 / v 128",
@@ -433,7 +436,6 @@ fn mistrallarge4_header() {
         "the latent cache another layer wrote, read in place of its own",
         "index keys projected from the layer input, one per position",
         "a layer program for mistral-large4",
-        "pre-tokenizer tekken-num3",
         "a tool-call parser for this template",
     ] {
         if !items.iter().any(|f| f == want) {
@@ -457,6 +459,296 @@ fn mistrallarge4_header() {
         KV_READERS.len(),
         (0..72).filter(|&l| full(l)).count(),
         items.len(),
+        bad.len()
+    );
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}
+
+/// The fixture's header as a `Split` holding no tensor's bytes: the plan's one shard laid out.
+fn fixture_header(plan: &FilePlan) -> Split {
+    let layouts = plan.layouts().expect("the plan lays out");
+    assert_eq!(layouts.len(), 1, "the fixture is one shard");
+    let path =
+        std::env::temp_dir().join(format!("bloomery-ml4-fixture-{}.gguf", std::process::id()));
+    Split::header_only(path, &layouts[0].1).expect("the fixture's header-only split opens")
+}
+
+/// The fixture clause: the plan of the fixture of the real header's five layers `[0, 1, 17, 35,
+/// 39]` (`model::arch::mistrallarge4::fixture`), laid out as a header-only file, reads through the
+/// engine's own reader as the cut. The three per-layer arrays are the source's at the map's layers
+/// (derived here from the pins above, not from the fixture's own table): `rope_pattern`
+/// `[T,T,T,F,F]`, `indexer.types` `[T,T,F,T,T]` and the cache map in fixture layers
+/// `[0,1,2,3,3]`; the mini's widths are its keys' and every tensor holds the real layer's type. A
+/// map whose layers are other kinds, an array left at the source's values, a mini key left at the
+/// source's and a retyped tensor are each refused by name.
+#[test]
+fn mistrallarge4_fixture_cut() {
+    let source = header();
+    let spec = ml4::spec();
+    let plan = model::fixture::plan(&spec, &source, None, &spec.options())
+        .unwrap_or_else(|e| panic!("plan: {e}"));
+    let fx = fixture_header(&plan.target);
+    let hp = model::arch::mistrallarge4::hparams::Hparams::read(&fx)
+        .unwrap_or_else(|e| panic!("the fixture's hparams: {e}"));
+    let read = model::arch::spec(&fx).unwrap_or_else(|e| panic!("the fixture's spec: {e}"));
+    let s = &read.spec;
+    let mut bad = Vec::new();
+
+    // The arrays, from the pins of the real header: a NoPE layer ropes not, a shared indexer is
+    // the pairs from 17, and a KV reader reads layer 35's cache.
+    let cut = ml4::LAYER_MAP;
+    let fixture_layer = |l: usize| cut.iter().position(|&m| m == l).expect("a map layer");
+    let want_rope: Vec<bool> = cut.iter().map(|l| !NOPE.contains(l)).collect();
+    let want_full: Vec<bool> = cut.iter().map(|&l| full(l)).collect();
+    let want_cache: Vec<usize> = cut
+        .iter()
+        .map(|&l| fixture_layer(if KV_READERS.contains(&l) { 35 } else { l }))
+        .collect();
+    if (&hp.rope_layer, &hp.indexer_full, &hp.kv_source) != (&want_rope, &want_full, &want_cache) {
+        bad.push(format!(
+            "arrays rope {:?} indexer {:?} cache {:?}, the cut's {want_rope:?} {want_full:?} {want_cache:?}",
+            hp.rope_layer, hp.indexer_full, hp.kv_source
+        ));
+    }
+    if (
+        want_rope.as_slice(),
+        want_full.as_slice(),
+        want_cache.as_slice(),
+    ) != (
+        [true, true, true, false, false].as_slice(),
+        [true, true, false, true, true].as_slice(),
+        [0, 1, 2, 3, 3].as_slice(),
+    ) {
+        bad.push(format!(
+            "the cut's arrays {want_rope:?} {want_full:?} {want_cache:?} are not the five kinds"
+        ));
+    }
+
+    // The mini's widths and the facts kept.
+    let got = (
+        hp.n_layer,
+        hp.n_embd,
+        hp.n_head,
+        hp.n_expert,
+        hp.expert_ff,
+        hp.dense_ff,
+        hp.indexer_top_k,
+    );
+    if got != (5, 1024, 16, 16, 256, 4096, 16) {
+        bad.push(format!("mini widths {got:?}"));
+    }
+    let kept = (
+        hp.kv_lora,
+        hp.key_length,
+        hp.head_k,
+        hp.head_v,
+        hp.rope_dims,
+        hp.indexer_heads,
+        hp.indexer_d,
+        hp.n_used,
+        hp.n_shared,
+        hp.n_vocab,
+    );
+    if kept != (512, 576, 128, 128, 64, 32, 128, 4, 1, 204_800) {
+        bad.push(format!("kept facts {kept:?}"));
+    }
+
+    // The layers the reader describes: every one selects a top-k of 16 over its positions, the
+    // shared indexer reads layer 1's keys and list, layer 4 reads layer 3's cache.
+    for (f, layer) in s.layers.iter().enumerate() {
+        let models::Mixer::Latent(a) = &layer.mixer else {
+            bad.push(format!("layer {f}: {:?}", layer.mixer));
+            continue;
+        };
+        match a.select.as_ref() {
+            Some(Selector::StreamTopK { k: 16, list, .. }) => {
+                let want_list = if want_full[f] {
+                    Source::Own(())
+                } else {
+                    Source::From(1)
+                };
+                if *list != want_list {
+                    bad.push(format!("layer {f} list {list:?}"));
+                }
+            }
+            other => bad.push(format!("layer {f} select {other:?}")),
+        }
+        let cache = if f == 4 {
+            Source::From(3)
+        } else {
+            Source::Own(())
+        };
+        if a.cache != cache {
+            bad.push(format!("layer {f} cache {:?}", a.cache));
+        }
+    }
+    // The reader serves a context up to the indexer's top-k, the mini's 16.
+    let ctx = model::arch::mistrallarge4::spec::serve_ctx;
+    if ctx(16, s) != Ok(16) || ctx(17, s).is_ok() {
+        bad.push(format!(
+            "serve_ctx(16) = {:?}, (17) = {:?}",
+            ctx(16, s),
+            ctx(17, s)
+        ));
+    }
+
+    // Every tensor at the real layer's type, the stems of each kind.
+    let t = &read.tensors;
+    if t.tensors.len() != 119 {
+        bad.push(format!(
+            "{} tensors, the five layers hold 119",
+            t.tensors.len()
+        ));
+    }
+    let tensor = |name: &str| {
+        t.tensors
+            .iter()
+            .find(|x| x.name == name)
+            .map(|x| (x.ty, x.dims.clone()))
+    };
+    for (name, want) in [
+        ("token_embd.weight", (GgmlType::Q6_K, vec![1024, 204_800])),
+        ("rope_freqs.weight", (GgmlType::F32, vec![32])),
+        ("blk.0.attn_k_b.weight", (GgmlType::Q8_0, vec![64, 512, 16])),
+        ("blk.0.ffn_down.weight", (GgmlType::Q8_0, vec![4096, 1024])),
+        (
+            "blk.1.ffn_down_exps.weight",
+            (GgmlType::IQ2_XXS, vec![256, 1024, 16]),
+        ),
+        (
+            "blk.2.ffn_gate_exps.weight",
+            (GgmlType::IQ1_S, vec![1024, 256, 16]),
+        ),
+        (
+            "blk.2.ffn_down_exps.weight",
+            (GgmlType::IQ2_XXS, vec![256, 1024, 16]),
+        ),
+        (
+            "blk.3.attn_k_b.weight",
+            (GgmlType::Q8_0, vec![128, 512, 16]),
+        ),
+        (
+            "blk.3.attn_kv_a_mqa.weight",
+            (GgmlType::Q8_0, vec![1024, 512]),
+        ),
+        (
+            "blk.3.ffn_down_exps.weight",
+            (GgmlType::IQ1_S, vec![256, 1024, 16]),
+        ),
+        (
+            "blk.4.indexer.attn_q_b.weight",
+            (GgmlType::Q6_K, vec![1024, 4096]),
+        ),
+    ] {
+        if tensor(name) != Some(want.clone()) {
+            bad.push(format!("{name} {:?}, wanted {want:?}", tensor(name)));
+        }
+    }
+    for name in [
+        "blk.4.attn_kv_a_mqa.weight",
+        "blk.4.attn_kv_a_norm.weight",
+        "blk.2.indexer.attn_q_b.weight",
+    ] {
+        if tensor(name).is_some() {
+            bad.push(format!("{name} is in the fixture"));
+        }
+    }
+    if let Err(e) = ml4::check_kinds(&spec, &fx, &source) {
+        bad.push(format!("check_kinds: {e}"));
+    }
+
+    // The refusals, each by name.
+    let mutant = |what: &str, want: &str, edit: &dyn Fn(&mut FilePlan)| {
+        let mut p = plan.target.clone();
+        edit(&mut p);
+        let split = fixture_header(&p);
+        match ml4::check_kinds(&spec, &split, &source) {
+            Err(e) if e.to_string().contains(want) => Ok(()),
+            Err(e) => Err(format!("{what}: refused as {e}, wanted {want:?}")),
+            Ok(_) => Err(format!("{what}: accepted")),
+        }
+    };
+    let set = |p: &mut FilePlan, key: &str, v: Value| {
+        p.kvs
+            .iter_mut()
+            .find(|(k, _)| k == &format!("mistral-large4.{key}"))
+            .unwrap_or_else(|| panic!("{key} is in the plan"))
+            .1 = v;
+    };
+    let bools = |v: &[bool]| Value::Array(v.iter().map(|&b| Value::Bool(b)).collect());
+    let results = [
+        mutant(
+            "an indexer array left at the source's",
+            "blk.2.indexer.q_norm.weight",
+            &|p| {
+                set(
+                    p,
+                    "attention.indexer.types",
+                    bools(&[true, true, true, true, true]),
+                );
+            },
+        ),
+        mutant(
+            "the cache map left at the source's ids",
+            "attention.kv_source_map",
+            &|p| {
+                let ids = [0u32, 1, 17, 35, 35];
+                set(
+                    p,
+                    "attention.kv_source_map",
+                    Value::Array(ids.iter().map(|&i| Value::U32(i)).collect()),
+                );
+            },
+        ),
+        mutant(
+            "the top-k left at the source's",
+            "attention.indexer.top_k",
+            &|p| {
+                set(p, "attention.indexer.top_k", Value::U32(2048));
+            },
+        ),
+        mutant(
+            "a tensor of another type",
+            "ffn_gate_exps.weight is",
+            &|p| {
+                let t = p
+                    .tensors
+                    .iter_mut()
+                    .find(|t| t.name == "blk.2.ffn_gate_exps.weight")
+                    .expect("the stack is in the plan");
+                t.ty = GgmlType::IQ2_XXS;
+                let (_, blck, tsz) = gguf::ggml_type_info(t.ty.as_u32()).expect("a type");
+                t.nbytes = gguf::tensor_bytes(blck, tsz, &t.dims).expect("bytes");
+            },
+        ),
+    ];
+    for r in results {
+        if let Err(why) = r {
+            bad.push(why);
+        }
+    }
+    // A map of other kinds: layer 2 is a full indexer, the kind keeps it shared.
+    let other = FixtureSpec {
+        layers: vec![0, 1, 2, 35, 39],
+        ..ml4::spec()
+    };
+    match model::fixture::plan(&other, &source, None, &other.options()) {
+        Err(e)
+            if e.to_string()
+                .contains("source layer 2 (fixture 2) has a full indexer") => {}
+        Err(e) => bad.push(format!("a map of other kinds: refused as {e}")),
+        Ok(_) => bad.push("a map of other kinds: planned".into()),
+    }
+
+    println!(
+        "mistral-large4 fixture layers=5 tensors={} shards={} pins_differ={}",
+        t.tensors.len(),
+        plan.target.shards.len(),
         bad.len()
     );
     assert!(

@@ -533,6 +533,30 @@ fn target_kvs(
                 }
                 other => other.clone(),
             },
+            KeyRule::PerLayerIds => match v {
+                Value::Array(a) if a.len() == n_layer => Value::Array(
+                    spec.layers
+                        .iter()
+                        .map(|&l| {
+                            let id = unsigned(k, &a[l])? as usize;
+                            let f = spec.layers.iter().position(|&m| m == id).ok_or_else(|| {
+                                meta(
+                                    k,
+                                    format!("holds {id} at layer {l}, which the map does not hold"),
+                                )
+                            })?;
+                            int_like(k, &a[l], f as u64)
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                Value::Array(a) => {
+                    return Err(meta(
+                        k,
+                        format!("has {} values for {n_layer} layers", a.len()),
+                    ));
+                }
+                _ => return Err(meta(k, "is not an array of one layer id per layer")),
+            },
             KeyRule::LayerIds => {
                 let a = items(k, v)?;
                 let tag = a.first().ok_or_else(|| meta(k, "is empty"))?;

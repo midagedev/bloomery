@@ -149,6 +149,10 @@ pub enum KeyRule {
     /// An array of exactly the source's layer count, taken at the map's
     /// layers; a scalar is copied.
     PerLayer,
+    /// An array of exactly the source's layer count, taken at the map's
+    /// layers, whose values are layer ids: each moved to its fixture layer,
+    /// and one naming a source layer the map does not hold is refused.
+    PerLayerIds,
     /// A per-layer array that may run past the source's layer count: the
     /// map's layers, whose values must be [`FixtureSpec::ratios`], then the
     /// entries past the source's layer count.
