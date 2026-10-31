@@ -1,7 +1,7 @@
 //! A PLE site: a per-layer n-gram embedding added to every hyper-connection
 //! stream (Qwen3.8-Flash-Next's layer 1). The host hashes each token's last
-//! n-grams into table rows (`engram::Hash::ple_rows_into`), decodes them
-//! (`gguf::quant::dequant_row`, IQ4_NL) into `e`, `ROW` values a token, and
+//! n-grams into table rows (`engram::Hash::ple_rows_into`), the rows are
+//! decoded on the card ([`crate::rows`]) into `e`, `ROW` values a token, and
 //! two Q8_0 gemvs make `key = ple_key·e` (`hc` rows of [`ROW`] a token) and
 //! `value = ple_value·e` ([`ROW`] a token). Two launches follow:
 //! - [`PleKernels::enqueue_gate`], one block per (token, stream): the
@@ -74,14 +74,12 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::hc_gated::{Slots, Streams};
 use crate::launch_u32;
 use crate::linear::{PASS_ROWS, butterfly_f32, butterfly_f64, silu};
-use crate::tensor::WindowMut;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, div_rn_f32, fma_rn_f32, mul_rn_f32, sqrt_rn_f32};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
-use gguf::quant::Nvfp4Rows;
 use std::sync::Arc;
 
 /// Values in one stream row: Qwen3.8's `n_embd`, and so the rows the PLE
@@ -439,57 +437,9 @@ unsafe fn conv_unit<O: Slots>(
     }
 }
 
-/// The values of FP4 code byte `q`, its low nibble then its high, under half
-/// scale `half`: `(half·v)·scale`, `v` the doubled E2M1 value through the
-/// shared nibble decode ([`crate::cores::table16_word`] over
-/// [`crate::mxfp4::E2M1`]).
-#[inline(always)]
-fn fp4_pair(q: u8, half: f32, scale: f32) -> [f32; 2] {
-    let (lo, hi) = crate::cores::table16_word(u32::from(q), crate::mxfp4::E2M1);
-    let v = |c: u32| mul_rn_f32(mul_rn_f32(half, f32::from(c as u8 as i8)), scale);
-    [v(lo), v(hi)]
-}
-
 #[cuda_module]
 mod ple_kernels {
     use super::*;
-
-    /// Group `g` of NVFP4 rows held as two planes in `planes` (the
-    /// `groups·8` code bytes, then the `groups` scale bytes) decoded into
-    /// `e[16g ..]` as `gguf::quant::Nvfp4Rows` decodes it: value `2i` the low
-    /// nibble of code byte `i` and `2i + 1` its high, each `(h·v)·scale`, `h`
-    /// half the UE4M3 scale byte and `v` the doubled E2M1 code, `h·v` exact
-    /// and its product with the tensor scale the one rounding. The host
-    /// refused the planes' undefined scales and values first
-    /// ([`PleKernels::enqueue_rows_nvfp4`]).
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (planes.len() >= 9 * groups, e.len() >= 16 * groups)
-    )]
-    pub fn ple_rows_nvfp4(planes: &[u8], groups: u32, scale: f32, mut e: DisjointSlice<f32>) {
-        let g = thread::index_1d().get();
-        if g >= groups as usize {
-            return;
-        }
-        // SAFETY: g < groups, so the scale byte 8·groups + g < 9·groups lies
-        // in planes by the launch contract.
-        let byte = unsafe { *planes.get_unchecked(8 * groups as usize + g) };
-        let half = crate::mxfp4::ue4m3_half(u32::from(byte));
-        for i in 0..8 {
-            ::cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: code byte 8g + i < 8·groups lies in planes and values
-            // 16g + 2i + 1 < 16·groups in e by the launch contract; thread g
-            // alone writes its group's 16 values.
-            unsafe {
-                let [lo, hi] = fp4_pair(*planes.get_unchecked(8 * g + i), half, scale);
-                *e.get_unchecked_mut(16 * g + 2 * i) = lo;
-                *e.get_unchecked_mut(16 * g + 2 * i + 1) = hi;
-            }
-        }
-    }
 
     /// Block `b` is stream `s = b % hc` of token `t = b / hc`: it
     /// normalizes key row `key[b·ROW ..]` and stream `x[b·ROW ..]` (gains
@@ -957,41 +907,6 @@ impl PleKernels {
                     .ple_conv_bf16(stream, &prep, ngv, gv, x, w, pos, hc, m, fault, out, a.ring)?;
             }
         }
-        Ok(())
-    }
-
-    /// Enqueue the decode of `groups` NVFP4 groups held as two planes in
-    /// `planes` ([`ple_kernels::ple_rows_nvfp4`]) into the first `16·groups`
-    /// values of `e`, at `rows`' tensor scale, after the planes' host copy
-    /// `host` passed `rows`' refusals ([`Nvfp4Rows::check_planes`]): an
-    /// undefined scale or a value outside f32's range is refused by name
-    /// before anything is enqueued. Asynchronous.
-    pub fn enqueue_rows_nvfp4(
-        &self,
-        stream: &CudaStream,
-        (rows, host): (&Nvfp4Rows, &[u8]),
-        planes: &mut DeviceBuffer<u8>,
-        groups: usize,
-        e: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        const WHAT: &str = "ple enqueue_rows_nvfp4";
-        let bytes = groups
-            .checked_mul(9)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("{groups} groups overflow")))?;
-        need(WHAT, "host planes", host.len(), bytes)?;
-        need(WHAT, "planes", planes.len(), bytes)?;
-        need(WHAT, "e", e.len(), 16 * groups)?;
-        let (codes, scales) = host[..bytes].split_at(8 * groups);
-        rows.check_planes(codes, scales, 16 * groups)
-            .map_err(|err| GpuError::shape(WHAT, err.to_string()))?;
-        let grid = launch_u32(WHAT, "grid", groups.div_ceil(BLOCK as usize))?;
-        let n = launch_u32(WHAT, "groups", groups)?;
-        WindowMut::<u8>::of_mut(planes, 0, bytes)?.copy_from_host(stream, &host[..bytes])?;
-        let prep = self
-            .module
-            .prepare_ple_rows_nvfp4(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module
-            .ple_rows_nvfp4(stream, &prep, planes, n, rows.scale(), e)?;
         Ok(())
     }
 

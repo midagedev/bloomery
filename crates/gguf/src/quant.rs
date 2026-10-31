@@ -1014,6 +1014,7 @@ fn ue4m3(byte: u8) -> Result<f32, &'static str> {
 pub struct E4m3Rows {
     /// Each byte's value times the scale, including non-finite results.
     table: [f32; 256],
+    scale: f32,
 }
 
 impl E4m3Rows {
@@ -1029,7 +1030,13 @@ impl E4m3Rows {
                 *v = twice * half * scale;
             }
         }
-        E4m3Rows { table }
+        E4m3Rows { table, scale }
+    }
+
+    /// The tensor scale every value is multiplied by.
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     /// Whether every byte in `src` has a finite value at the tensor's scale.
@@ -1113,19 +1120,35 @@ impl Nvfp4Rows {
     /// no UE4M3 scale or whose scaled value is not finite (its index the block,
     /// sub-block 0), before any value of the span is written.
     pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
-        let ty = GgmlType::NVFP4_ROWS;
-        let need = Self::group_count(dst.len())? * 9;
+        let groups = Self::row_groups(src, dst.len())?;
+        self.decode_groups(groups, dst)
+    }
+
+    /// [`Self::decode`]'s refusals of a span of `values` values alone, by
+    /// the same names, for a caller that decodes the rows elsewhere at
+    /// [`Self::scale`].
+    pub fn check(&self, src: &[u8], values: usize) -> Result<(), QuantError> {
+        self.refusal(Self::row_groups(src, values)?)
+    }
+
+    /// The `(scale byte, codes)` groups of a span of `values` values in
+    /// rows of 9-byte groups; a span of partial groups or a short source
+    /// refused.
+    fn row_groups(
+        src: &[u8],
+        values: usize,
+    ) -> Result<impl Iterator<Item = (u8, &[u8; 8])> + Clone, QuantError> {
+        let need = Self::group_count(values)? * 9;
         let src = src.get(..need).ok_or(QuantError::ShortSrc {
-            ty,
+            ty: GgmlType::NVFP4_ROWS,
             src: src.len(),
             need,
-            n: dst.len(),
+            n: values,
         })?;
-        let groups = src.as_chunks::<9>().0.iter().map(|g| {
+        Ok(src.as_chunks::<9>().0.iter().map(|g| {
             let [scale, codes @ ..] = g;
             (*scale, codes)
-        });
-        self.decode_groups(groups, dst)
+        }))
     }
 
     /// Separate code and block-scale planes decoded with the same rounding

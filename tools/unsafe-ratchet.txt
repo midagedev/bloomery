@@ -751,7 +751,12 @@ gguf 7 2 0
 # (best.rs: best_part and best_merge; the tiles' and lists' shared memory, the row reads past the launch contracts and
 # the lists' writes), each with its SAFETY line. Their tournament, warp_best, takes the list length as a parameter and
 # replaces the selector head's warp_top16 (dspark/selector.rs), so the fns stay at 403.
-gpu 2933 403 10
+# PIN(2026-11-01): gpu 2933 -> 2945 blocks, code moved in and new code, not old code relaxed: rows.rs, the row tables'
+# card decode, takes ple.rs's NVFP4 planes kernel (2 blocks there, 4 here: its scale read, then each code read and each
+# of its two value writes a block of its own) and adds the NVFP4 rows kernel (4 the same way), the IQ4_NL kernel (its
+# byte read and its two value writes) and the F8 kernel (its byte read and its value write), and the module load's
+# block, each with its SAFETY line.
+gpu 2945 403 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -1458,8 +1458,7 @@ pub static HELPER: Kind = Kind {
           pinned to (float when none: a refused pin or a core without a sibling floats), the \
           cpus in its mask once placed, the threads it splits one large read over (itself \
           included; 1 reads alone) and where that count comes from (pool: the worker pool's \
-          threads on this machine; unread: the pool's shape could not be read; asked: the caller \
-          named it).",
+          threads on this machine; asked: the caller named it).",
     parts: &[
         key("name", Word, ""),
         key("asked", Word, ""),

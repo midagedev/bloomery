@@ -38,11 +38,15 @@
 //!    is clean before and after.
 //! 8. `refuse`: the launchers refuse, by name, a conv of another tap count or
 //!    dilation, no stream, no token, a ring or key shorter than the call's.
-//! 9. `rows`: `ple_rows_nvfp4` over a 4,096-position ubatch of NVFP4 planes
-//!    (every UE4M3 scale byte, random codes), at a unit and at a small tensor
-//!    scale, is `gguf::quant::Nvfp4Rows::decode_planes` bit for bit; an
-//!    undefined scale byte and a value past f32's range are refused by name
-//!    before the launch, `e` as it was.
+//! 9. `rows`: the row decode (`bloomery_gpu::rows`) over a 4,096-position
+//!    ubatch of each layout (NVFP4 planes and NVFP4 rows over every UE4M3
+//!    scale byte, IQ4_NL blocks over random f16 scales, F8 rows over every
+//!    byte but E4M3's NaNs, through a staging that takes them in parts), at
+//!    a unit and at a small tensor scale and from a position past the
+//!    first, is the host decode (`RowFormat::decode`) bit for bit, the
+//!    values before that position untouched; planes past the staging, an
+//!    undefined scale byte, an E4M3 NaN past the first part and a value past
+//!    f32's range are refused by name before the launch, `e` as it was.
 //! 10. `shape`: every entry compiles with no local depot.
 
 #[cfg(feature = "gpu")]
@@ -57,11 +61,12 @@ mod gate {
         CLAMP_MIN, ConvOut, DILATION, GateOut, PleConvArgs, PleGateArgs, PleKernels, RING_ROWS,
         ROW, TAPS, conv_host, gate_host, ring_len,
     };
+    use bloomery_gpu::rows::{Laid, RowFormat, RowKernels};
     use bloomery_gpu::{Fault, FaultSink, FaultSite, Gpu};
     use bloomery_gpu_gates::rounding::bf16_round;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, no_local_depot, verdict};
     use cuda_core::DeviceBuffer;
-    use gguf::quant::{Nvfp4Rows, bf16_bits_to_f32};
+    use gguf::quant::{E4m3Rows, Nvfp4Rows, bf16_bits_to_f32};
 
     /// Streams: Qwen3.8's `hyper_connection.count`.
     const HC: usize = 4;
@@ -327,6 +332,7 @@ mod gate {
         }
         let gpu = Gpu::new()?;
         let k = PleKernels::load(gpu.context())?;
+        let rows = RowKernels::load(gpu.context())?;
         let cx = Cx { gpu: &gpu, k: &k };
         println!(
             "gate_ple: device {} — hc={HC} row={ROW} channels={CH} taps={TAPS} dilation={DILATION} \
@@ -355,14 +361,17 @@ mod gate {
             tally(pass);
         }
         tally(refuse(&cx)?);
-        for pass in rows_clauses(&cx)? {
+        for pass in rows_clauses(&cx, &rows)? {
             tally(pass);
         }
         tally(no_local_depot(&[
             "ple_gate",
             "ple_conv",
             "ple_conv_bf16",
-            "ple_rows_nvfp4",
+            "rows_nvfp4_planes",
+            "rows_nvfp4",
+            "rows_iq4nl",
+            "rows_f8",
         ])?);
         let pass = failed == 0;
         println!(
@@ -895,38 +904,89 @@ mod gate {
     // ---------------------------------------------------------- 9. rows
 
     /// Clause 9.
-    fn rows_clauses(cx: &Cx<'_>) -> Result<Vec<bool>, GateError> {
+    fn rows_clauses(cx: &Cx<'_>, k: &RowKernels) -> Result<Vec<bool>, GateError> {
         let s = cx.gpu.stream();
-        let groups = 4096 * ROW / 16;
+        let values = 4096 * ROW;
+        let groups = values / 16;
         let mut r = Lcg(0x0005_eed9);
-        let mut planes: Vec<u8> = (0..9 * groups).map(|_| (r.unit() * 256.0) as u8).collect();
+        let mut byte = || (r.unit() * 256.0) as u8;
+        let mut planes: Vec<u8> = (0..9 * groups).map(|_| byte()).collect();
         for (g, b) in planes[8 * groups..].iter_mut().enumerate() {
             *b = (g % 0x7F) as u8;
         }
-        let mut dev = DeviceBuffer::<u8>::zeroed(s, 9 * groups)?;
-        let mut e = DeviceBuffer::<f32>::zeroed(s, 16 * groups)?;
+        let packed: Vec<u8> = (0..groups)
+            .flat_map(|g| {
+                std::iter::once(planes[8 * groups + g])
+                    .chain(planes[8 * g..8 * g + 8].iter().copied())
+            })
+            .collect();
+        let iq4: Vec<u8> = (0..values / 32)
+            .flat_map(|b| {
+                let d = (b as u16).wrapping_mul(40_503);
+                let d = if d & 0x7C00 == 0x7C00 { d & 0x83FF } else { d };
+                d.to_le_bytes()
+                    .into_iter()
+                    .chain(planes[16 * b % (8 * groups)..][..16].iter().copied())
+            })
+            .collect();
+        let f8: Vec<u8> = (0..values)
+            .map(|i| match (i % 256) as u8 {
+                b if b & 0x7F == 0x7F => 0x38,
+                b => b,
+            })
+            .collect();
+        // Half the rows' bytes: the F8 rows go up in two parts.
+        let mut staging = DeviceBuffer::<u8>::zeroed(s, 9 * groups)?;
+        let at = 3 * ROW;
+        let mut e = DeviceBuffer::<f32>::zeroed(s, at + values)?;
         let mut out = Vec::new();
         for scale in [1.0f32, f32::from_bits(0x380B_6DB7)] {
-            let rows = Nvfp4Rows::new(scale);
-            let (codes, scales) = planes.split_at(8 * groups);
-            let mut want = vec![0.0f32; 16 * groups];
-            rows.decode_planes(codes, scales, &mut want)?;
-            cx.k.enqueue_rows_nvfp4(s, (&rows, &planes), &mut dev, groups, &mut e)?;
-            let got = e.to_host_vec(s)?;
-            let pass = bits_equal(&got, &want);
-            println!(
-                "rows scale={scale:e} groups={groups} bits={pass} {}",
-                verdict(pass)
-            );
-            out.push(pass);
+            let cases: [(&str, RowFormat, Laid, &[u8]); 4] = [
+                (
+                    "nvfp4 planes",
+                    RowFormat::Nvfp4(Box::new(Nvfp4Rows::new(scale))),
+                    Laid::Planes,
+                    planes.as_slice(),
+                ),
+                (
+                    "nvfp4 rows",
+                    RowFormat::Nvfp4(Box::new(Nvfp4Rows::new(scale))),
+                    Laid::Rows,
+                    packed.as_slice(),
+                ),
+                ("iq4_nl rows", RowFormat::Iq4Nl, Laid::Rows, iq4.as_slice()),
+                (
+                    "f8 rows",
+                    RowFormat::F8(Box::new(E4m3Rows::new(scale))),
+                    Laid::Rows,
+                    f8.as_slice(),
+                ),
+            ];
+            for (what, format, laid, raw) in cases {
+                let mut want = vec![-1.0f32; at + values];
+                format.decode(raw, laid, &mut want[at..])?;
+                e.copy_from_host(s, &vec![-1.0f32; at + values])?;
+                k.enqueue(s, (&format, laid, raw), &mut staging, &mut e, at)?;
+                let pass = bits_equal(&e.to_host_vec(s)?, &want);
+                println!(
+                    "rows {what} scale={scale:e} values={values} at={at} bits={pass} {}",
+                    verdict(pass)
+                );
+                out.push(pass);
+            }
         }
         let before = e.to_host_vec(s)?;
-        let mut refused = |planes: &[u8], scale: f32, why: &str| -> Result<bool, GateError> {
-            let rows = Nvfp4Rows::new(scale);
-            let e_msg =
-                cx.k.enqueue_rows_nvfp4(s, (&rows, planes), &mut dev, groups, &mut e)
-                    .err()
-                    .map(|e| e.to_string());
+        let mut short = DeviceBuffer::<u8>::zeroed(s, 9 * groups - 9)?;
+        let mut refused = |format: RowFormat,
+                           laid: Laid,
+                           raw: &[u8],
+                           staged: &mut DeviceBuffer<u8>,
+                           why: &str|
+         -> Result<bool, GateError> {
+            let e_msg = k
+                .enqueue(s, (&format, laid, raw), staged, &mut e, at)
+                .err()
+                .map(|e| e.to_string());
             let kept = bits_equal(&e.to_host_vec(s)?, &before);
             let pass = e_msg.as_deref().is_some_and(|m| m.contains(why)) && kept;
             println!(
@@ -935,12 +995,41 @@ mod gate {
             );
             Ok(pass)
         };
+        let fp4 = |scale| RowFormat::Nvfp4(Box::new(Nvfp4Rows::new(scale)));
+        let past = format!("{} B of planes into {} B staged", planes.len(), short.len());
+        out.push(refused(fp4(1.0), Laid::Planes, &planes, &mut short, &past)?);
         planes[8 * groups + 1234] = 0x7F;
-        out.push(refused(&planes, 1.0, "block 1234")?);
+        out.push(refused(
+            fp4(1.0),
+            Laid::Planes,
+            &planes,
+            &mut staging,
+            "block 1234",
+        )?);
         planes[8 * groups + 1234] = 0x38;
         planes[8 * 77..8 * 78].fill(0x77);
         planes[8 * groups + 77] = 0x7E;
-        out.push(refused(&planes, f32::MAX / 4.0, "leaves f32's range")?);
+        out.push(refused(
+            fp4(f32::MAX / 4.0),
+            Laid::Planes,
+            &planes,
+            &mut staging,
+            "leaves f32's range",
+        )?);
+        let mut bad = packed;
+        bad[9 * 4321] = 0xFF;
+        out.push(refused(
+            fp4(1.0),
+            Laid::Rows,
+            &bad,
+            &mut staging,
+            "block 4321",
+        )?);
+        // Past the first part's 9 * groups bytes: the refusal comes before any part goes up.
+        let mut nan = f8;
+        nan[6_000_000] = 0xFF;
+        let f8_rows = RowFormat::F8(Box::new(E4m3Rows::new(1.0)));
+        out.push(refused(f8_rows, Laid::Rows, &nan, &mut staging, "6000000")?);
         Ok(out)
     }
 

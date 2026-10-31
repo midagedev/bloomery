@@ -93,6 +93,7 @@ use crate::qsa::{
     KeyAppendArgs, PoolArgs, PoolSeqsArgs, QsaKernels, QsaSeq, SelectArgs, SelectSeqsArgs,
 };
 use crate::rope_neox::{PartialNeoxSeqsArgs, RopeNeoxKernels};
+use crate::rows::RowKernels;
 use crate::site::{self, ByName, ByNameKernels, Out};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
@@ -213,6 +214,8 @@ pub(super) struct Kernels38 {
     pub(super) slots: CardSlotKernels,
     pub(super) hc: HcGatedKernels,
     pub(super) ple: PleKernels,
+    /// The PLE table's row decode.
+    pub(super) rows: RowKernels,
     pub(super) qsa: QsaKernels,
     pub(super) neox: RopeNeoxKernels,
     pub(super) flash: FlashGqaKernels,
@@ -243,6 +246,7 @@ impl Kernels38 {
             slots: CardSlotKernels::load(ctx)?,
             hc: HcGatedKernels::load(ctx)?,
             ple: PleKernels::load(ctx)?,
+            rows: RowKernels::load(ctx)?,
             qsa: QsaKernels::load(ctx)?,
             neox: RopeNeoxKernels::load(ctx)?,
             flash: FlashGqaKernels::load(ctx)?,
