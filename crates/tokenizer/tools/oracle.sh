@@ -296,8 +296,8 @@ profile() {
       ORACLE_TREE=/home/user/llama.cpp-ml4
       BUILD_PIN=78feec062d50ec9e8940244cac918ac4480b60cb BUILD_PATCH=
       TREE_FLAGS=()
-      # The file lives on the root drive, not under /models.
-      SHARD=/home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf
+      # The files live on the root drive; /models/Mistral-Large-4-1T-A52B-UD-IQ1_S is a symlink to their directory.
+      SHARD=/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf
       SET=ref-tokenizer-mistrallarge4
       # The chat template's special tokens, digit runs 1..10 and the other cases of this vocabulary after the shared ones.
       EXTRA=$ROOT/crates/tokenizer/tests/cases-mistrallarge4.txt
