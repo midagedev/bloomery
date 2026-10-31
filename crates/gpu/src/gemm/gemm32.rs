@@ -1384,7 +1384,9 @@ macro_rules! gemm32_block {
                         unsafe {
                             let slot = *$slot_sh.add(n) as usize;
                             *$y.get_unchecked_mut(slot * $rows_n + r) =
-                                w32!(@scale $kind($($w),+), ws, $acc[j0 + i]);
+                                $crate::gemm::f32tile::ProductCell::of(
+                                    w32!(@scale $kind($($w),+), ws, $acc[j0 + i]),
+                                );
                         }
                     }
                 }
@@ -1422,7 +1424,10 @@ macro_rules! gemm32_block {
         // n_slots · rows <= y.len() (launch contract). No tile lists a
         // refused slot, so no other block writes it, and each (slot, row) is
         // one thread's.
-        unsafe { *$y.get_unchecked_mut($slot * $rows_n + $r) = f32::NAN };
+        unsafe {
+            *$y.get_unchecked_mut($slot * $rows_n + $r) =
+                $crate::gemm::f32tile::ProductCell::of(f32::NAN)
+        };
     }};
 }
 
@@ -1726,6 +1731,38 @@ impl Gemm32Launch {
     }
 }
 
+/// One 32-value GEMM entry's launch over the weight buffers `wbuf`, the
+/// activations, the route and the output, at the checked shape `g`.
+macro_rules! launch_gemm32 {
+    (
+        $k:ident, $stream:ident, $cfg:ident, $g:ident, ($act:ident, $route:ident, $y:expr),
+        $prepare:ident, $entry:ident, $($wbuf:expr),+
+    ) => {{
+        let prep = $k.module.$prepare($cfg)?;
+        $k.module.$entry(
+            $stream,
+            &prep,
+            $($wbuf,)+
+            &$act.q,
+            &$act.d,
+            &$act.s,
+            &$route.cols,
+            &$route.tiles,
+            &$route.n_tiles,
+            $g.n_experts,
+            $g.rows,
+            $g.kb,
+            $g.steps,
+            $g.act_cols,
+            $g.n_slots,
+            $g.max_tiles,
+            $g.slot_div,
+            $g.row_tiles,
+            $y,
+        )?;
+    }};
+}
+
 impl Gemm32Kernels {
     /// The slab entry's resident-block wave on this card, read at load.
     pub fn q8_0p_wave(&self) -> u32 {
@@ -1743,6 +1780,24 @@ impl Gemm32Kernels {
         grid >= self.q8_0p_wave() && u64::from(n_slots) > GEMM_BN as u64 * u64::from(n_experts)
     }
 
+    /// Whether a Q8_0-plane launch of `g` takes the slab entry
+    /// ([`Gemm32Kernels::q8_0p_slab`]), its code plane and, for the slab, its
+    /// scale plane checked 16-byte aligned as `what`'s.
+    fn q8_0p_entry(
+        &self,
+        what: &'static str,
+        (qs, d): (&DeviceTensor<u32>, &DeviceTensor<u16>),
+        g: &Gemm32Launch,
+    ) -> Result<bool, GpuError> {
+        use cuda_device::vector::U32x4;
+        crate::tensor::check_alignment::<U32x4, _>(what, "Q8_0 code plane", qs.buf())?;
+        let slab = self.q8_0p_slab(g.grid, g.n_slots, g.n_experts);
+        if slab {
+            crate::tensor::check_alignment::<U32x4, _>(what, "Q8_0 scale plane", d.buf())?;
+        }
+        Ok(slab)
+    }
+
     /// Enqueue `y[s][r] = Σ_k w[e(s)][r][k] · x[c(s)][k]` for every slot of
     /// the last fill of the route table, in the module doc's numeric
     /// contract ([`Gemm32Args`] names each operand). Asynchronous,
@@ -1756,44 +1811,13 @@ impl Gemm32Kernels {
         } = a;
         let cfg = LaunchConfig1D::new(g.grid, GEMM32_THREADS_U32, 0);
         macro_rules! launch {
-            ($prepare:ident, $entry:ident, $($wbuf:expr),+) => {{
-                let prep = self.module.$prepare(cfg)?;
-                self.module.$entry(
-                    stream,
-                    &prep,
-                    $($wbuf,)+
-                    &act.q,
-                    &act.d,
-                    &act.s,
-                    &route.cols,
-                    &route.tiles,
-                    &route.n_tiles,
-                    g.n_experts,
-                    g.rows,
-                    g.kb,
-                    g.steps,
-                    g.act_cols,
-                    g.n_slots,
-                    g.max_tiles,
-                    g.slot_div,
-                    g.row_tiles,
-                    y,
-                )?;
-            }};
+            ($prepare:ident, $entry:ident, $($wbuf:expr),+) => {
+                launch_gemm32!(self, stream, cfg, g, (act, route, y), $prepare, $entry, $($wbuf),+)
+            };
         }
         match w {
             Gemm32Weight::Q8_0Plane { qs, d } => {
-                crate::tensor::check_alignment::<cuda_device::vector::U32x4, _>(
-                    "Gemm32Kernels::enqueue_gemm32",
-                    "Q8_0 code plane",
-                    qs.buf(),
-                )?;
-                if self.q8_0p_slab(g.grid, g.n_slots, g.n_experts) {
-                    crate::tensor::check_alignment::<cuda_device::vector::U32x4, _>(
-                        "Gemm32Kernels::enqueue_gemm32",
-                        "Q8_0 scale plane",
-                        d.buf(),
-                    )?;
+                if self.q8_0p_entry("Gemm32Kernels::enqueue_gemm32", (qs, d), &g)? {
                     launch!(prepare_gemm_q8_0p_slab, gemm_q8_0p_slab, qs.buf(), d.buf());
                 } else {
                     launch!(prepare_gemm_q8_0p, gemm_q8_0p, qs.buf(), d.buf());
@@ -1841,13 +1865,10 @@ impl Gemm32Kernels {
 
     /// [`Gemm32Kernels::enqueue_gemm32`]'s products as BF16 bits, each value
     /// its F32 one rounded to nearest even (a value past the BF16 range an
-    /// infinity), from NVFP4 planes over the native FP4 activation form
-    /// alone: another stack or form is refused by name, nothing launched.
-    /// Asynchronous, allocation-free, capturable.
-    #[cfg_attr(
-        not(bloomery_nvfp4_mma),
-        allow(unused_variables, reason = "the native build's launch reads them")
-    )]
+    /// infinity): NVFP4 planes over the native FP4 activation form or over
+    /// the q8 blocks of 32, and Q8_0 planes, the stacks a dense site reads;
+    /// another stack is refused by name, nothing launched. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_gemm32_bf16(
         &self,
         stream: &CudaStream,
@@ -1855,32 +1876,64 @@ impl Gemm32Kernels {
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_gemm32_bf16";
         let g = Gemm32Launch::check(what, &a)?;
-        #[cfg(bloomery_nvfp4_mma)]
-        if let Gemm32Weight::Nvfp4Planes(w) = a.w
-            && a.act.native.is_some()
-        {
-            return self.native.product(
-                stream,
-                super::nvfp4mma::ProductArgs {
-                    w,
-                    act: a.act,
-                    route: a.route,
-                    rows: g.rows,
-                    slots: g.n_slots,
-                    max_tiles: g.max_tiles,
-                    slot_div: g.slot_div,
-                    y: super::ProductOut::Bf16(a.y),
-                },
-            );
+        let Gemm32Args {
+            w, act, route, y, ..
+        } = a;
+        let cfg = LaunchConfig1D::new(g.grid, GEMM32_THREADS_U32, 0);
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident, $($wbuf:expr),+) => {
+                launch_gemm32!(self, stream, cfg, g, (act, route, y), $prepare, $entry, $($wbuf),+)
+            };
         }
-        Err(GpuError::shape(
-            what,
-            format!(
-                "BF16 products of {} rows come from NVFP4 planes over the native FP4 activation \
-                 form",
-                g.rows
-            ),
-        ))
+        match w {
+            Gemm32Weight::Q8_0Plane { qs, d } => {
+                if self.q8_0p_entry(what, (qs, d), &g)? {
+                    launch!(
+                        prepare_gemm_q8_0p_slab_bf16,
+                        gemm_q8_0p_slab_bf16,
+                        qs.buf(),
+                        d.buf()
+                    );
+                } else {
+                    launch!(prepare_gemm_q8_0p_bf16, gemm_q8_0p_bf16, qs.buf(), d.buf());
+                }
+            }
+            Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales }) => {
+                #[cfg(bloomery_nvfp4_mma)]
+                if act.native.is_some() {
+                    return self.native.product(
+                        stream,
+                        super::nvfp4mma::ProductArgs {
+                            w: Nvfp4Stack { qs, e, scales },
+                            act,
+                            route,
+                            rows: g.rows,
+                            slots: g.n_slots,
+                            max_tiles: g.max_tiles,
+                            slot_div: g.slot_div,
+                            y: super::ProductOut::Bf16(y),
+                        },
+                    );
+                }
+                launch!(
+                    prepare_gemm_nvfp4p_bf16,
+                    gemm_nvfp4p_bf16,
+                    qs.buf(),
+                    e.buf(),
+                    scales.buf()
+                );
+            }
+            _ => {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "BF16 products of {} rows come from Q8_0 or NVFP4 planes",
+                        g.rows
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Enqueue `act = q8_1_32(silu(g) · u)` over the slots of the last fill

@@ -401,6 +401,58 @@ mod gemm_kernels {
         );
     }
 
+    /// [`gemm_q4k`] storing each output as its BF16 bits, the F32 output
+    /// rounded to nearest even (`ProductCell`), a refused slot's as a NaN:
+    /// the same walk, so each cell is the F32 entry's rounded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows * 36 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_q4k_bf16(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<u16>,
+    ) {
+        gemm_block!(
+            dec: q4k_dec,
+            wst: wst_q4k(wt),
+            walk: split,
+            sb_units: Q4K_SB_WORDS,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
     /// [`gemm_q4k`] for a Q5_K stack: rows of `44 · n_sb` words.
     #[allow(
         clippy::too_many_arguments,
@@ -440,6 +492,58 @@ mod gemm_kernels {
         slot_div: u32,
         row_tiles: u32,
         mut y: DisjointSlice<f32>,
+    ) {
+        gemm_block!(
+            dec: q5k_dec,
+            wst: wst_direct(),
+            walk: plain,
+            sb_units: Q5K_SB_WORDS,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_q5k`] storing each output as its BF16 bits, the F32 output
+    /// rounded to nearest even (`ProductCell`), a refused slot's as a NaN:
+    /// the same walk, so each cell is the F32 entry's rounded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows * 44 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_q5k_bf16(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<u16>,
     ) {
         gemm_block!(
             dec: q5k_dec,
@@ -503,6 +607,58 @@ mod gemm_kernels {
         );
     }
 
+    /// [`gemm_q6k`] storing each output as its BF16 bits, the F32 output
+    /// rounded to nearest even (`ProductCell`), a refused slot's as a NaN:
+    /// the same walk, so each cell is the F32 entry's rounded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows * 210 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_q6k_bf16(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<u16>,
+    ) {
+        gemm_block!(
+            dec: q6k_dec,
+            wst: wst_direct(),
+            walk: split,
+            sb_units: Q6K_SB_BYTES,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
     /// [`gemm_q6k`] for a Q3_K stack: `110 · n_sb` bytes a row.
     #[allow(
         clippy::too_many_arguments,
@@ -542,6 +698,58 @@ mod gemm_kernels {
         slot_div: u32,
         row_tiles: u32,
         mut y: DisjointSlice<f32>,
+    ) {
+        gemm_block!(
+            dec: q3k_dec,
+            wst: wst_direct(),
+            walk: plain,
+            sb_units: Q3K_SB_BYTES,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_q3k`] storing each output as its BF16 bits, the F32 output
+    /// rounded to nearest even (`ProductCell`), a refused slot's as a NaN:
+    /// the same walk, so each cell is the F32 entry's rounded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows * 110 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_q3k_bf16(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<u16>,
     ) {
         gemm_block!(
             dec: q3k_dec,
@@ -979,6 +1187,58 @@ mod gemm_kernels {
         slot_div: u32,
         row_tiles: u32,
         mut y: DisjointSlice<f32>,
+    ) {
+        gemm_block!(
+            dec: iq4xs_dec,
+            wst: wst_direct(),
+            walk: plain,
+            sb_units: IQ4XS_SB_WORDS,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_iq4xs`] storing each output as its BF16 bits, the F32 output
+    /// rounded to nearest even (`ProductCell`), a refused slot's as a NaN:
+    /// the same walk, so each cell is the F32 entry's rounded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows * 34 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_iq4xs_bf16(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<u16>,
     ) {
         gemm_block!(
             dec: iq4xs_dec,

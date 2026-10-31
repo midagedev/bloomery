@@ -210,6 +210,8 @@ generate_ds41 gemm_iq3s 24 16
 generate_ds41 gemm_iq3xxs 0 0
 generate_ds41 gemm_iq4nl 0 0
 generate_ds41 gemm_iq4xs 0 0
+# PIN(2026-11-01): each new gemm_*_bf16 entry is its F32 entry's body with the BF16 store, pinned at that entry's values until a scan on this table's arch and capability.
+generate_ds41 gemm_iq4xs_bf16 0 0
 generate_ds41 gemm_nvfp4_mma 0 0
 # PIN(2026-10-28): gemm_nvfp4_mma_bf16, a new entry: 0 spill and 0 JIT local bytes
 # (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill).
@@ -218,19 +220,28 @@ generate_ds41 gemm_nvfp4_mma_bf16 0 0
 # PIN(2026-10-24): staged NVFP4 weights: 64 spill bytes at sm_121a (ptxas 13.3.73),
 # 32 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
 generate_ds41 gemm_nvfp4p 64 32
+# PIN(2026-11-01): gemm_nvfp4p_bf16 at gemm_nvfp4p's values, its body with the BF16 store, until a scan on this table's arch and capability.
+generate_ds41 gemm_nvfp4p_bf16 64 32
 # PIN(2026-10-24): fused SwiGLU: 160 spill bytes at sm_121a (ptxas 13.3.73),
 # 64 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
 generate_ds41 gemm_nvfp4p_swiglu 160 64
 generate_ds41 gemm_q3k 0 0
+generate_ds41 gemm_q3k_bf16 0 0
 generate_ds41 gemm_q4k 0 0
+generate_ds41 gemm_q4k_bf16 0 0
 generate_ds41 gemm_q5_0p 0 0
 generate_ds41 gemm_q5_1 0 0
 generate_ds41 gemm_q5k 0 0
+generate_ds41 gemm_q5k_bf16 0 0
 # PIN(2026-10-23): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes over 212 and 48 are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121 with that walk compiled out holds 212 and 48.
 generate_ds41 gemm_q6k 532 64
+# PIN(2026-11-01): gemm_q6k_bf16 at gemm_q6k's values, its body with the BF16 store, until a scan on this table's arch and capability.
+generate_ds41 gemm_q6k_bf16 532 64
 generate_ds41 gemm_q8_0f 0 0
 generate_ds41 gemm_q8_0p 0 0
+generate_ds41 gemm_q8_0p_bf16 0 0
 generate_ds41 gemm_q8_0p_slab 0 0
+generate_ds41 gemm_q8_0p_slab_bf16 0 0
 generate_ds41 gemm_route 0 0
 generate_ds41 gemm_route_remap 0 0
 generate_ds41 gemm_swiglu_quant 0 0

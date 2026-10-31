@@ -1320,7 +1320,8 @@ impl WideActs {
         m: usize,
         tys: &[SiteTy],
     ) -> Result<(), GpuError> {
-        self.views_mut().quantize(gpu, k, sink, x, m, tys)
+        self.views_mut()
+            .quantize(gpu, k, sink, x, m, Self::wants_of(tys))
     }
 
     /// The forms as views.
@@ -1360,13 +1361,12 @@ pub(crate) struct WideActsMut<'a> {
 }
 
 impl WideActsMut<'_> {
-    /// The forms `x`'s first `m` columns are quantized into for sites of
-    /// types `tys`: each form one of them reads, and nothing else. A form a
-    /// site reads that the unit does not hold, or q8 blocks of 32 on a load
-    /// with no 32-value kernels, is refused by name.
+    /// Quantize `x`'s first `m` columns into exactly the forms `want` asks
+    /// for. A requested form the unit does not hold, or q8 blocks of 32 on
+    /// a load with no 32-value kernels, is refused by name.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the card, the kernels, the sink, the rows, their count and the site types (rust-quality R8)"
+        reason = "the card, the kernels, the sink, the rows, their count and the requested forms (rust-quality R8)"
     )]
     pub fn quantize(
         &mut self,
@@ -1375,10 +1375,9 @@ impl WideActsMut<'_> {
         sink: FaultSink,
         x: &DeviceBuffer<f32>,
         m: usize,
-        tys: &[SiteTy],
+        want: WideForms,
     ) -> Result<(), GpuError> {
         const WHAT_Q: &str = "site::WideActsMut::quantize";
-        let want = WideActs::wants_of(tys);
         if want.q128 {
             let a = self.q128.as_deref_mut().ok_or(GpuError::state(
                 WHAT_Q,
@@ -1436,11 +1435,12 @@ pub fn gemm(
     gemm_into(gpu, k, site, rows, x, table, m, y.into()).map(drop)
 }
 
-/// [`gemm`] into `y`'s cells. A BF16 `y` is stored by the dense MMA tile's
-/// BF16 store alone (an MXFP8 site's W8A8 product and a BF16 site's product
-/// over its held BF16 form), each cell the F32 product's rounded to nearest
-/// even: false, with nothing launched, for a site whose product has no BF16
-/// store. Always true for an F32 `y`.
+/// [`gemm`] into `y`'s cells. A BF16 `y` is stored by the product's BF16
+/// store, each cell the F32 product's rounded to nearest even: the K-quant
+/// grouped GEMM's, the 32-value GEMM's of Q8_0 and NVFP4 planes, and the
+/// dense MMA tile's (an MXFP8 site's W8A8 product and a BF16 site's product
+/// over its held BF16 form); false, with nothing launched, for a site whose
+/// product has no BF16 store. Always true for an F32 `y`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
@@ -1491,45 +1491,58 @@ fn gemm_into(
     src.check(WHAT, ty)?;
     let launched = match ty {
         SiteTy::Nvfp4 => {
-            let y = f32_cells!(y);
             dense()?;
             let DevWeight::Nvfp4 { qs, e, scales, .. } = w.resident(WHAT, name)? else {
                 return Err(GpuError::tensor(WHAT, name, "an NVFP4 weight"));
             };
-            k.g32(
+            let g32 = k.g32(
                 WHAT,
                 "the 32-value kernels an NVFP4 site runs on (this load holds none)",
-            )?
-            .enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales }),
-                    rows_per_expert: rows,
-                    act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
-                    route,
-                    input,
-                    y,
-                },
-            )
+            )?;
+            let w = Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales });
+            let act = x.q32.ok_or_else(|| missing("q8 blocks of 32"))?;
+            macro_rules! args {
+                ($y:expr) => {
+                    Gemm32Args {
+                        w,
+                        rows_per_expert: rows,
+                        act,
+                        route,
+                        input,
+                        y: $y,
+                    }
+                };
+            }
+            match y {
+                ProductOut::F32(y) => g32.enqueue_gemm32(stream, args!(y)),
+                ProductOut::Bf16(y) => g32.enqueue_gemm32_bf16(stream, args!(y)),
+            }
         }
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Iq4Xs => {
-            let y = f32_cells!(y);
-            k.gemm.enqueue_gemm(
-                stream,
-                GemmArgs {
-                    ty: gemm_weight(ty)
-                        .ok_or(GpuError::state(WHAT, "the selected site's GEMM type"))?,
-                    w: match src {
-                        SiteWeight::Words { w, .. } => w,
-                        _ => kq(w, WHAT, name)?,
-                    },
-                    rows_per_expert: rows,
-                    act: x.q128.ok_or_else(|| missing("q8_1 blocks of 128"))?,
-                    route,
-                    input,
-                    y,
-                },
-            )
+            let ty =
+                gemm_weight(ty).ok_or(GpuError::state(WHAT, "the selected site's GEMM type"))?;
+            let w = match src {
+                SiteWeight::Words { w, .. } => w,
+                _ => kq(w, WHAT, name)?,
+            };
+            let act = x.q128.ok_or_else(|| missing("q8_1 blocks of 128"))?;
+            macro_rules! args {
+                ($y:expr) => {
+                    GemmArgs {
+                        ty,
+                        w,
+                        rows_per_expert: rows,
+                        act,
+                        route,
+                        input,
+                        y: $y,
+                    }
+                };
+            }
+            match y {
+                ProductOut::F32(y) => k.gemm.enqueue_gemm(stream, args!(y)),
+                ProductOut::Bf16(y) => k.gemm.enqueue_gemm_bf16(stream, args!(y)),
+            }
         }
         SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 | SiteTy::Fp8B128 | SiteTy::Bf16 => {
             dense()?;
@@ -1544,17 +1557,25 @@ fn gemm_into(
             let f32_rows = || x.f32.ok_or_else(|| missing("f32 rows"));
             return with_planes(WHAT, (ty, weight, site), part, |p| {
                 match p {
-                    Planes::Q8_0(qs, d) => g32()?.enqueue_gemm32(
-                        stream,
-                        Gemm32Args {
-                            w: Gemm32Weight::Q8_0Plane { qs, d },
-                            rows_per_expert: rows,
-                            act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
-                            route,
-                            input,
-                            y: f32_cells!(y),
-                        },
-                    ),
+                    Planes::Q8_0(qs, d) => {
+                        let act = x.q32.ok_or_else(|| missing("q8 blocks of 32"))?;
+                        macro_rules! args {
+                            ($y:expr) => {
+                                Gemm32Args {
+                                    w: Gemm32Weight::Q8_0Plane { qs, d },
+                                    rows_per_expert: rows,
+                                    act,
+                                    route,
+                                    input,
+                                    y: $y,
+                                }
+                            };
+                        }
+                        match y {
+                            ProductOut::F32(y) => g32()?.enqueue_gemm32(stream, args!(y)),
+                            ProductOut::Bf16(y) => g32()?.enqueue_gemm32_bf16(stream, args!(y)),
+                        }
+                    }
                     Planes::F32(t) => {
                         g32()?.enqueue_f32_tile(stream, t, f32_rows()?, m, f32_cells!(y))
                     }
@@ -1821,20 +1842,11 @@ pub fn resident_quantize(
     (q128, q32): (Option<&mut GemmAct>, &mut GemmAct32),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    if resident_wants(w, names).q128 {
-        let a = q128.ok_or(GpuError::state(
-            "site::resident_quantize",
-            "the rows' q8_1 blocks of 128 (a K-quant site reads them)",
-        ))?;
-        gpu.enqueue_quantize_gemm(x, m, a, sink)?;
+    WideActsMut {
+        q128,
+        q32: Some(&mut *q32),
     }
-    if resident_wants(w, names).q32 {
-        k.g32(
-            "site::resident_quantize",
-            "the 32-value kernels a site's q8 blocks of 32 are quantized by",
-        )?
-        .enqueue_quantize_gemm32(gpu.stream(), x, m, q32, sink)?;
-    }
+    .quantize(gpu, k, sink, x, m, resident_wants(w, names))?;
     write_forms(k, gpu.stream(), (x, m), q32, |f| {
         reads_form(gpu, w, names, f)
     })

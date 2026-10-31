@@ -200,23 +200,33 @@ generate_ds41   gemm_iq3s                                8           8
 generate_ds41   gemm_iq3xxs                             16           8
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4xs               0  0
+# PIN(2026-11-01): each new gemm_*_bf16 entry is its F32 entry's body with the BF16 store, pinned at that entry's values until a scan on this table's arch and capability.
+generate_ds41   gemm_iq4xs_bf16                          0           0
 # PIN(2026-10-24): staged NVFP4 weights: 48 spill bytes and 24 stack-frame bytes from
 # sm_86 ptxas 13.3.73, read on GB10; jit_local uses the measured stack frame.
 # The cc8.6 JIT was not measured.
 generate_ds41   gemm_nvfp4p                             48          24
+# PIN(2026-11-01): gemm_nvfp4p_bf16 at gemm_nvfp4p's values, its body with the BF16 store, until a scan on this table's arch and capability.
+generate_ds41   gemm_nvfp4p_bf16                        48          24
 # PIN(2026-10-24): fused SwiGLU: 0 spill bytes and 0 stack-frame bytes from
 # sm_86 ptxas 13.3.73, read on GB10; jit_local uses the measured stack frame.
 # The cc8.6 JIT was not measured.
 generate_ds41   gemm_nvfp4p_swiglu                       0           0
 generate_ds41   gemm_q3k                                 0           0
+generate_ds41   gemm_q3k_bf16                            0           0
 generate_ds41   gemm_q4k                                 0           0
+generate_ds41   gemm_q4k_bf16                            0           0
 generate_ds41   gemm_q5_0p                               0           0
 generate_ds41   gemm_q5_1                                0           0
 generate_ds41   gemm_q5k                                 0           0
+generate_ds41   gemm_q5k_bf16                            0           0
 generate_ds41   gemm_q6k                                 0           0
+generate_ds41   gemm_q6k_bf16                            0           0
 generate_ds41   gemm_q8_0f                               0           0
 generate_ds41   gemm_q8_0p                               0           0
+generate_ds41   gemm_q8_0p_bf16                          0           0
 generate_ds41   gemm_q8_0p_slab                          0           0
+generate_ds41   gemm_q8_0p_slab_bf16                     0           0
 generate_ds41   gemm_route                               0           0
 generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
