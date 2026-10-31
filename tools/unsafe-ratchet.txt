@@ -771,7 +771,10 @@ gguf 7 2 0
 # in-place step of several sequences gdn_delta_lanes_seqs (linear/delta.rs) and gdn_delta_recovery_seqs now share the
 # unsafe fn lanes_seqs_block (the recovery entry's three blocks moved there), each entry one block calling it, each
 # with its SAFETY line.
-gpu 2959 405 10
+# PIN(2026-11-01): gpu 2959 -> 2973 blocks, 405 -> 408 fns, new code, not old code relaxed: Mistral Large 4's
+# card entries: ln_rows (elem.rs: its mean, variance and block-tree helpers, the shared basis and sums) and
+# kv_gather_sel (latent.rs: the count and list reads, the row copy), each with its SAFETY line.
+gpu 2973 408 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -805,7 +808,10 @@ gpu 2959 405 10
 # PIN(2026-10-31): gpu-deepseek41 396 -> 397 blocks, new code, not old code relaxed: the route phase's copy of the
 # layer's slot-map row into the batch (`b.gemm.map_row`), which the prompt block's grouped GEMM route reads, with its
 # SAFETY line.
-gpu-deepseek41 397 44 0
+# PIN(2026-11-01): gpu-deepseek41 397 -> 402 blocks, new code, not old code relaxed: index_key.rs's
+# input-projected index key append (Mistral Large 4's): the position read, the row, gain, bias and rope-table
+# loads, and the store, each with its SAFETY line.
+gpu-deepseek41 402 44 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0
@@ -920,6 +926,9 @@ gpu-mimo2 7 1 0
 # head kernels (the index heads and the attention heads, a unit's rows, so the positions are distinct), each with its SAFETY
 # line.
 gpu-minimaxm3 23 1 0
+# PIN(2026-11-01): gpu-mistrallarge4 seeded at 1 block, a new crate: body.rs's empty window view over a NoPE
+# layer's latent cache, which the selected walk reads no row through, with its SAFETY line.
+gpu-mistrallarge4 1 0 0
 gpu-solar2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
 # write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,
