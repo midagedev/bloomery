@@ -1407,12 +1407,7 @@ impl StepRows {
                 Prefetcher::with_options(
                     Arc::clone(&engram),
                     &vec![n_cols; sites],
-                    HelperOptions {
-                        mode: FillMode::Touch,
-                        cpu: caller_sibling(),
-                        classify: levers.stats,
-                        workers: 1,
-                    },
+                    HelperOptions::spread(FillMode::Touch, caller_sibling(), levers.stats),
                 )
             })
             .transpose()

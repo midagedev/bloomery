@@ -2782,6 +2782,16 @@ impl Q38 {
         if let Some(r) = record::nvtier_of(m.body(WHAT)?.nvme_tier().map(|t| &**t)) {
             r.eprint();
         }
+        for h in threads::helper::helpers() {
+            record::helper(
+                &h.name,
+                h.asked,
+                h.pinned,
+                h.cpus,
+                (h.parts.threads, h.parts.from),
+            )
+            .eprint();
+        }
         if let Some(why) = &a.draft_off {
             Record::new(&record::LOAD_DRAFT_OFF38)
                 .w("why", why)

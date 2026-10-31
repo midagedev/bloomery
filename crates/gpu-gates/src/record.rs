@@ -1455,13 +1455,18 @@ pub static HELPER: Kind = Kind {
     head: "helper",
     doc: "A helper thread the load spawned beside the step thread: its name, where it asked to \
           run (pin:<cpu>, sibling:<cpu> — the SMT sibling of that cpu — or float), the cpu it is \
-          pinned to (float when none: a refused pin or a core without a sibling floats) and the \
-          cpus in its mask once placed.",
+          pinned to (float when none: a refused pin or a core without a sibling floats), the \
+          cpus in its mask once placed, the threads it splits one large read over (itself \
+          included; 1 reads alone) and where that count comes from (pool: the worker pool's \
+          threads on this machine; unread: the pool's shape could not be read; asked: the caller \
+          named it).",
     parts: &[
         key("name", Word, ""),
         key("asked", Word, ""),
         key("pinned", Word, ""),
         key("cpus", U64, ""),
+        key("parts", U64, ""),
+        key("parts_from", Word, ""),
     ],
 };
 
@@ -3058,6 +3063,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     &[
         &LANE,
         &LOAD_PHASES,
+        &HELPER,
         &LOAD_DRAFT_OFF38,
         &MTP_HEAD38,
         &MTP_KEEP38,
@@ -4079,12 +4085,14 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
 }
 
 /// A helper thread's record: `name`, where it asked to run, the cpu it is
-/// pinned to, the cpus in its mask.
+/// pinned to, the cpus in its mask, and the threads it splits one read over
+/// with where that count comes from.
 pub fn helper(
     name: &str,
     asked: impl std::fmt::Display,
     pinned: Option<usize>,
     cpus: usize,
+    (parts, parts_from): (usize, impl std::fmt::Display),
 ) -> Record {
     Record::new(&HELPER)
         .w("name", name)
@@ -4094,6 +4102,8 @@ pub fn helper(
             pinned.map_or_else(|| "float".to_owned(), |c| c.to_string()),
         )
         .u("cpus", cpus)
+        .u("parts", parts)
+        .w("parts_from", parts_from)
 }
 
 /// A dropped residency machine's leak record.
