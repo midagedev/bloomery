@@ -22,6 +22,12 @@
 //! - Any other keyword (`oneOf`, `allOf`, `pattern`, `minLength`, `minItems`,
 //!   `minimum`, `format`, ...) is a refusal naming it and its path.
 //!
+//! A schema that contradicts itself or JSON Schema (a `type` that is no type,
+//! a `required` naming nothing, a `$ref` that points nowhere, ...) is
+//! refused apart from that, by [`valid`] and before any of this reads it: the
+//! compiler refuses what is outside the subset, [`Refusal::outside_subset`],
+//! and a node outside it never hides an invalid one.
+//!
 //! `response_format` `json_object` asks for any JSON object with at least one
 //! member, written in the same style ([`program::json_object`]).
 //!
@@ -48,6 +54,8 @@ use crate::dsml::{ToolFormat, parses_tools};
 use crate::engine::Tokenizer;
 use crate::http::MAX_BODY;
 use crate::reasoning::ThinkTags;
+
+mod valid;
 
 /// Keywords the subset reads, besides the annotations.
 const READ: [&str; 9] = [
@@ -109,21 +117,6 @@ pub(crate) fn outside(path: &str, message: impl std::fmt::Display) -> Refusal {
     }
 }
 
-/// The names JSON Schema gives a value's type.
-const TYPES: [&str; 7] = [
-    "object", "array", "string", "integer", "number", "boolean", "null",
-];
-
-/// Whether `v` is a list of type names, which JSON Schema takes for `type`
-/// and the compiler does not read.
-fn type_list(v: &Value) -> bool {
-    v.as_array().is_some_and(|a| {
-        !a.is_empty()
-            && a.iter()
-                .all(|t| t.as_str().is_some_and(|t| TYPES.contains(&t)))
-    })
-}
-
 fn type_of(v: &Value) -> &'static str {
     ::embed::request::json_type(v)
 }
@@ -144,28 +137,36 @@ enum Scalar {
 }
 
 impl Scalar {
-    fn of(v: &Value, path: &str) -> Result<Scalar, Refusal> {
+    /// The scalar `v` is, where the compiler can write it.
+    fn read(v: &Value) -> Option<Scalar> {
         match v {
-            Value::String(s) => Ok(Scalar::Str(s.clone())),
-            Value::Bool(b) => Ok(Scalar::Bool(*b)),
-            Value::Number(n) => match (n.as_i64(), n.as_u64()) {
-                (Some(i), _) => Ok(Scalar::Int(i128::from(i))),
-                (_, Some(u)) => Ok(Scalar::Int(i128::from(u))),
-                _ => Err(outside(
-                    path,
-                    format!(
-                        "the number {n} is not an integer: only strings, integers and booleans can be chosen or fixed"
-                    ),
-                )),
-            },
-            other => Err(outside(
+            Value::String(s) => Some(Scalar::Str(s.clone())),
+            Value::Bool(b) => Some(Scalar::Bool(*b)),
+            Value::Number(n) => n
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| n.as_u64().map(i128::from))
+                .map(Scalar::Int),
+            _ => None,
+        }
+    }
+
+    fn of(v: &Value, path: &str) -> Result<Scalar, Refusal> {
+        Scalar::read(v).ok_or_else(|| match v {
+            Value::Number(n) => outside(
+                path,
+                format!(
+                    "the number {n} is not an integer: only strings, integers and booleans can be chosen or fixed"
+                ),
+            ),
+            other => outside(
                 path,
                 format!(
                     "a {} cannot be chosen or fixed: only strings, integers and booleans can",
                     type_of(other)
                 ),
-            )),
-        }
+            ),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -221,20 +222,22 @@ fn only(o: &Map<String, Value>, kind: &str, allowed: &[&str], path: &str) -> Res
 /// `node` as the parts that write one value of it. `style` is how a string is
 /// written: quoted and escaped (JSON, in a reply of its own or inside a chat
 /// format's markup), or as the raw text a chat format's string argument holds.
+/// The schema is one [`valid`] passed: this refuses only what is outside the
+/// subset.
 pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> {
-    let Some(o) = node.as_object() else {
+    let o = match node {
+        Value::Object(o) => o,
         // `true` and `false` are schemas too, which the compiler does not read.
-        return Err(if node.is_boolean() {
-            outside(
+        Value::Bool(_) => {
+            return Err(outside(
                 path,
                 "a boolean schema is not supported by this server: write an object",
-            )
-        } else {
-            refuse(
-                path,
-                format!("a schema must be an object, not {}", type_of(node)),
-            )
-        });
+            ));
+        }
+        other => unreachable!(
+            "valid::schema passed {path}, a {} where a schema is an object or a boolean",
+            type_of(other)
+        ),
     };
     if let Some(k) = o
         .keys()
@@ -251,18 +254,13 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
     let ty = match o.get("type") {
         None => None,
         Some(Value::String(t)) => Some(t.as_str()),
-        Some(v) if type_list(v) => {
+        Some(v) if valid::type_list(v) => {
             return Err(outside(
                 path,
                 "a list of types is not supported by this server: write one type",
             ));
         }
-        Some(v) => {
-            return Err(refuse(
-                path,
-                format!("type must be a type name or a list of them, not {v}"),
-            ));
-        }
+        Some(v) => unreachable!("valid::schema passed {path}'s type {v}"),
     };
     if style == Style::Raw {
         raw_literals_hold_no_tag(o, path)?;
@@ -293,19 +291,9 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
         }
         Some("string") => {
             only(o, "type string", &["type", "maxLength"], path)?;
-            let max = match o.get("maxLength") {
-                None => None,
-                Some(v) => Some(
-                    v.as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                        .ok_or_else(|| {
-                            refuse(
-                                path,
-                                format!("maxLength must be a non-negative integer, not {v}"),
-                            )
-                        })?,
-                ),
-            };
+            let max = o.get("maxLength").map(|v| {
+                valid::max_length(v).expect("valid::schema passed a maxLength that is a length")
+            });
             Ok(match style {
                 Style::Json | Style::JsonInMarkup => vec![
                     Part::Text("\"".to_owned()),
@@ -345,13 +333,7 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
                 item: value(items, style.nested(), &format!("{path}.items"))?,
             }])
         }
-        Some(other) => Err(refuse(
-            path,
-            format!(
-                "type \"{other}\" is not a JSON Schema type ({})",
-                TYPES.join(", ")
-            ),
-        )),
+        Some(other) => unreachable!("valid::schema passed {path}'s type \"{other}\""),
         None => Err(outside(
             path,
             "a schema needs a type, an enum or a const to be served",
@@ -364,12 +346,10 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
 /// which would not say which.
 fn any_of(alts: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> {
     let here = format!("{path}.anyOf");
-    let Some(list) = alts.as_array().filter(|a| !a.is_empty()) else {
-        return Err(refuse(
-            &here,
-            format!("anyOf must be a non-empty array, not {alts}"),
-        ));
-    };
+    let list = alts
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .expect("valid::schema passed an anyOf that is a non-empty array");
     if style == Style::Raw && list.iter().any(is_text) {
         return Err(outside(
             &here,
@@ -426,9 +406,9 @@ fn inline_refs(
         return Ok(node.clone());
     };
     if let Some(r) = o.get("$ref") {
-        let Some(r) = r.as_str() else {
-            return Err(refuse(path, format!("$ref must be a string, not {r}")));
-        };
+        let r = r
+            .as_str()
+            .expect("valid::schema passed a $ref that is a string");
         if let Some(k) = o.keys().find(|k| {
             let k = k.as_str();
             k != "$ref" && !ANNOTATIONS.contains(&k) && !DEFS.contains(&k)
@@ -438,23 +418,10 @@ fn inline_refs(
                 format!("the keyword \"{k}\" beside $ref is not supported by this server"),
             ));
         }
-        let target = r
-            .strip_prefix('#')
-            .and_then(|p| root.pointer(p))
-            .ok_or_else(|| {
-                let message = format!(
-                    "$ref {r:?} does not point into this schema (\"#\" or a JSON pointer \
-                     after it)"
-                );
-                // A pointer that names nothing here is a dangling reference;
-                // an anchor or another document's URL is one the compiler
-                // does not resolve.
-                if r.starts_with("#/") {
-                    refuse(path, message)
-                } else {
-                    outside(path, message)
-                }
-            })?;
+        // A JSON pointer that names nothing here is a dangling reference,
+        // which `valid` refused; an anchor or another document's URL is one
+        // the compiler does not resolve.
+        let target = valid::target(root, r).ok_or_else(|| outside(path, valid::no_target(r)))?;
         if seen.iter().any(|s| s == r) {
             return Err(outside(
                 path,
@@ -542,17 +509,15 @@ fn raw_literals_hold_no_tag(o: &Map<String, Value>, path: &str) -> Result<(), Re
     Ok(())
 }
 
-/// A node's `type` against the kind of its values.
+/// A node's `type` against the kind of its values: `number` over integer
+/// values is the compiler's to refuse (`valid` held every other kind to its
+/// type).
 fn agree(ty: Option<&str>, kind: &str, path: &str) -> Result<(), Refusal> {
     match ty {
         Some("number") if kind == "integer" => Err(outside(
             path,
             "type \"number\" over integer values is not supported by this server: write \
              \"integer\"",
-        )),
-        Some(t) if t != kind => Err(refuse(
-            path,
-            format!("type \"{t}\" does not match its {kind} values"),
         )),
         _ => Ok(()),
     }
@@ -575,12 +540,10 @@ fn enumeration(
     path: &str,
 ) -> Result<Vec<Part>, Refusal> {
     let here = format!("{path}.enum");
-    let Some(items) = e.as_array().filter(|a| !a.is_empty()) else {
-        return Err(refuse(
-            &here,
-            format!("an enum must be a non-empty array, not {e}"),
-        ));
-    };
+    let items = e
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .expect("valid::schema passed an enum that is a non-empty array");
     let values: Vec<Scalar> = items
         .iter()
         .map(|v| Scalar::of(v, &here))
@@ -641,35 +604,19 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
     let props = match o.get("properties") {
         None | Some(Value::Null) => None,
         Some(Value::Object(p)) => Some(p),
-        Some(v) => {
-            return Err(refuse(
-                path,
-                format!("properties must be an object, not {}", type_of(v)),
-            ));
-        }
+        Some(v) => unreachable!("valid::schema passed {path}'s properties {v}"),
     };
     let required: Vec<&str> = match o.get("required") {
         None | Some(Value::Null) => Vec::new(),
-        Some(r) => {
-            let Some(names) = r.as_array() else {
-                return Err(refuse(
-                    path,
-                    format!("required must be an array, not {}", type_of(r)),
-                ));
-            };
-            for n in names {
-                let known = n
-                    .as_str()
-                    .is_some_and(|n| props.is_some_and(|p| p.contains_key(n)));
-                if !known {
-                    return Err(refuse(
-                        path,
-                        format!("required names {n}, which properties does not hold"),
-                    ));
-                }
-            }
-            names.iter().filter_map(Value::as_str).collect()
-        }
+        // `valid` held the names to strings the properties hold.
+        Some(Value::Array(names)) => names
+            .iter()
+            .map(|n| {
+                n.as_str()
+                    .expect("valid::schema passed a required name that is a string")
+            })
+            .collect(),
+        Some(v) => unreachable!("valid::schema passed {path}'s required {v}"),
     };
     let args: Vec<Arg<'_>> = props
         .into_iter()
@@ -875,26 +822,28 @@ fn plain_name(what: &str, name: &str, path: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// The tools of a request, with their arguments in the schema's order.
+/// The tools of a request, with their arguments in the schema's order. Every
+/// tool's schema is held valid ([`valid::tools`]) before the first is
+/// compiled, so an invalid one is refused whatever the tools before it are,
+/// and what this refuses is outside the subset.
 fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
-    let Some(list) = tools.as_array().filter(|t| !t.is_empty()) else {
-        return Err(refuse("tools", "tool_choice needs a non-empty tools array"));
-    };
     let mut out: Vec<Fun<'a>> = Vec::new();
     // One budget for every tool's written-out parameters.
     let mut bytes = MAX_BODY;
-    for (i, tool) in list.iter().enumerate() {
-        let path = format!("tools[{i}]");
-        let f = tool.get("function").unwrap_or(tool);
-        let name = f.get("name").and_then(Value::as_str).unwrap_or_default();
+    for valid::Tool {
+        name,
+        path,
+        here,
+        parameters,
+    } in valid::tools(tools)?
+    {
         plain_name("the tool name", name, &path)?;
         if out.iter().any(|g| g.name == name) {
             return Err(outside(&path, format!("the tool {name} is listed twice")));
         }
-        let here = format!("{path}.{name}.parameters");
-        let args = match f.get("parameters") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Object(p)) => {
+        let args = match parameters {
+            None => Vec::new(),
+            Some(p) => {
                 // A call's markup writes the arguments as one object's
                 // properties, which a root anyOf or $ref would not say.
                 if let Some(k) = ["anyOf", "$ref"].into_iter().find(|k| p.contains_key(*k)) {
@@ -907,12 +856,11 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                     ));
                 }
                 if let Some(t) = p.get("type").filter(|t| t.as_str() != Some("object")) {
-                    let message = format!("the parameters' type must be \"object\", not {t}");
-                    return Err(if type_list(t) {
-                        outside(&here, message)
-                    } else {
-                        refuse(&here, message)
-                    });
+                    assert!(
+                        valid::type_list(t),
+                        "valid::tools passed {here}'s type {t}, neither \"object\" nor a list of types"
+                    );
+                    return Err(outside(&here, valid::parameters_type(t)));
                 }
                 // The schema compiler reads the whole object, so a keyword the
                 // subset does not read is a refusal here and never ignored.
@@ -949,12 +897,6 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                         })
                     })
                     .collect::<Result<_, Refusal>>()?
-            }
-            Some(v) => {
-                return Err(refuse(
-                    &here,
-                    format!("parameters must be an object, not {}", type_of(v)),
-                ));
             }
         };
         out.push(Fun { name, args });
@@ -1076,7 +1018,9 @@ fn response_schema(o: &Map<String, Value>) -> Result<Reply<'_>, Refusal> {
 /// whose schemas are valid but outside the subset the compiler serves —
 /// `auto` constrains what it can serve and leaves the rest to the model. A
 /// tool whose schema is invalid is refused by name, as a forced choice
-/// refuses it ([`Refusal::outside_subset`] tells the two apart).
+/// refuses it ([`Refusal::outside_subset`] tells the two apart), however many
+/// tools or keywords outside the subset come before it: [`valid`] reads every
+/// tool before the first is compiled.
 fn watch(
     o: &Map<String, Value>,
     ask: &Ask<'_>,
@@ -1170,6 +1114,7 @@ pub(crate) fn request(
         }
         (Reply::Schema(s), None) => {
             let path = "response_format.json_schema.schema";
+            valid::schema(s, None, path)?;
             let mut bytes = MAX_BODY;
             let parts = value(&written_out(s, path, &mut bytes)?, style, path)?;
             let prog = program::compile(&parts, &env).map_err(|r| Refusal {

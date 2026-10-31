@@ -708,7 +708,7 @@ fn each_refusal_names_its_field() {
             true,
         ),
         (
-            node(json!({"$ref": "#/$defs/d", "type": "string"})),
+            node(json!({"$ref": "#/properties/p", "type": "string"})),
             ToolFormat::Hermes,
             "the keyword \"type\" beside $ref",
             true,
@@ -1484,7 +1484,7 @@ fn a_tool_parameter_schema_is_read_whole() {
             "tools[0].f.parameters: the keyword \"anyOf\"",
         ),
         (
-            json!({"type": "object", "properties": q, "$ref": "#/defs/p"}),
+            json!({"type": "object", "properties": q, "$ref": "#/properties/q"}),
             "tools[0].f.parameters: the keyword \"$ref\"",
         ),
         (
@@ -3516,11 +3516,6 @@ fn none_unwatched_and_json_replies_build_no_watch() {
     );
 }
 
-/// Under `tool_choice: auto` a tool whose schema is invalid (it contradicts
-/// itself or JSON Schema) is refused by name, the refusal a forced choice
-/// gives, and one that is valid but outside what the compiler serves (a
-/// keyword it does not read, a shape or text it cannot write) is served with
-/// no watch: the reply is the model's.
 /// A `required` or `properties` of null reads as absent (some tool-schema
 /// generators write null for an empty list or map): the call is watched,
 /// not refused. Mutant: null refused as a non-array or non-object.
@@ -3551,6 +3546,11 @@ fn a_null_required_or_properties_reads_as_absent() {
     }
 }
 
+/// Under `tool_choice: auto` a tool whose schema is invalid (it contradicts
+/// itself or JSON Schema) is refused by name, the refusal a forced choice
+/// gives, and one that is valid but outside what the compiler serves (a
+/// keyword it does not read, a shape or text it cannot write) is served with
+/// no watch: the reply is the model's.
 #[test]
 fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_unwatched() {
     let tok = bytes_tok();
@@ -3625,6 +3625,11 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
         (ToolFormat::Hermes, json!({"type": ["object", "null"]})),
         (ToolFormat::Hermes, json!({"anyOf": [{"type": "object"}]})),
         (
+            ToolFormat::Hermes,
+            json!({"type": "object", "allOf": [{"properties": {"x": {"type": "string"}}}],
+                "required": ["x"]}),
+        ),
+        (
             QWEN,
             prop(json!({"anyOf": [{"type": "integer"}, {"type": "string"}]})),
         ),
@@ -3642,6 +3647,328 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
     )
     .expect("served");
     assert!(served.is_some());
+}
+
+/// Whether a schema is invalid does not depend on what else the compiler
+/// would refuse: an invalid node is refused by name beside a keyword outside
+/// the subset on its own node, below an outside node (through `properties`,
+/// `items`, `anyOf` and a `$ref`'s target), and past an unresolved or boolean
+/// sibling, on every route that reads a schema: `tool_choice` auto, a forced
+/// call and `response_format`. Mutant: the compiler's own order decides, the
+/// outside refusal first (and under auto, the request served unwatched).
+#[test]
+fn an_invalid_node_is_refused_beside_an_outside_one() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = |format: ToolFormat| Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format,
+        think: ThinkTags::THINK,
+    };
+    let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
+    // The schema, and the path under it of the invalid node.
+    let cases = [
+        (
+            prop(json!({"type": "str", "pattern": "a+"})),
+            ".properties.p",
+        ),
+        (
+            prop(json!({"type": "string", "maxLength": -1, "pattern": "a+"})),
+            ".properties.p",
+        ),
+        (
+            prop(json!({"type": "string", "enum": ["a", 1]})),
+            ".properties.p",
+        ),
+        (
+            prop(json!({"type": "integer", "minimum": 0, "properties": {"q": {"type": "str"}}})),
+            ".properties.p.properties.q",
+        ),
+        (
+            prop(json!({"type": "array", "minItems": 1, "items": {"type": "str"}})),
+            ".properties.p.items",
+        ),
+        (
+            prop(json!({"anyOf": [{"type": "string", "pattern": "a"}, {"type": "str"}]})),
+            ".properties.p.anyOf[1]",
+        ),
+        (
+            json!({"type": "object", "properties": {
+                "a": {"type": "string", "pattern": "x"}, "b": {"$ref": "#/$defs/d"}},
+                "$defs": {"d": {"type": "str"}}}),
+            ".properties.b",
+        ),
+        (
+            json!({"type": "object", "properties": {
+                "a": {"$ref": "https://example.com/s.json"}, "b": {"$ref": "#/nope"}}}),
+            ".properties.b",
+        ),
+        (
+            json!({"type": "object", "properties": {"a": true, "b": {"type": "str"}}}),
+            ".properties.b",
+        ),
+        (
+            json!({"type": "object", "minProperties": 1, "required": ["q"]}),
+            "",
+        ),
+    ];
+    let refused = |e: Refusal, field: String, body: &Value| {
+        assert!(!e.outside_subset && !e.unsupported, "{body}: {e}");
+        assert_eq!(e.field.as_deref(), Some(field.as_str()), "{body}: {e}");
+    };
+    for (schema, at) in &cases {
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": schema}}]);
+        let here = format!("tools[0].f.parameters{at}");
+        for (format, choice) in [
+            (ToolFormat::Hermes, "auto"),
+            (QWEN, "auto"),
+            (ToolFormat::Hermes, "required"),
+        ] {
+            let body = json!({"tools": tools, "tool_choice": choice});
+            let e = request(body.as_object().unwrap(), &ask(format))
+                .expect_err(&format!("{format:?} {body}"));
+            refused(e, here.clone(), &body);
+        }
+        let body = schema_body(schema);
+        let e = build(&tok, ToolFormat::Hermes, &body).expect_err(&body.to_string());
+        refused(e, format!("response_format.json_schema.schema{at}"), &body);
+    }
+}
+
+/// Every tool's schema is validated before the first tool the compiler
+/// refuses as outside the subset decides: an earlier tool's outside keyword,
+/// root `anyOf`, list of types, name that is not plain or repeated name does
+/// not hide a later tool's invalid schema, under auto and under a forced
+/// choice. Mutant: `funs` returns at the first refusal.
+#[test]
+fn an_invalid_tool_is_refused_after_an_outside_one() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let tool = |name: &str, parameters: Value| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+    let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
+    let invalid = || prop(json!({"type": "str"}));
+    let firsts = [
+        tool("a", prop(json!({"type": "string", "pattern": "x"}))),
+        tool("a", json!({"anyOf": [{"type": "object"}]})),
+        tool("a", json!({"type": ["object", "null"]})),
+        tool("a<b", prop(json!({"type": "string"}))),
+        tool("b", prop(json!({"type": "string"}))),
+    ];
+    for first in &firsts {
+        let tools = json!([first, tool("b", invalid())]);
+        for (format, choice) in [
+            (ToolFormat::Hermes, "auto"),
+            (QWEN, "auto"),
+            (ToolFormat::Hermes, "required"),
+            (ToolFormat::Dsml(Spelling::Joined), "required"),
+        ] {
+            let body = json!({"tools": tools, "tool_choice": choice});
+            let e = request(
+                body.as_object().unwrap(),
+                &Ask {
+                    tok: &*tok,
+                    vocab: &vocab,
+                    format,
+                    think: ThinkTags::THINK,
+                },
+            )
+            .expect_err(&format!("{format:?} {body}"));
+            assert!(!e.outside_subset && !e.unsupported, "{body}: {e}");
+            assert_eq!(
+                e.field.as_deref(),
+                Some("tools[1].b.parameters.properties.p"),
+                "{body}: {e}"
+            );
+        }
+    }
+}
+
+/// A schema is invalid on every route or on none, and the compiler holds
+/// only what the validator passed: a sweep of node shapes (a keyword of the
+/// wrong type or of another kind than its partner, a missing partner), each
+/// as the schema and below a well-formed object, is read on every route
+/// (`response_format`, a forced call and a watched one, in each markup's
+/// style); the routes agree on whether it is invalid, and none stops the
+/// request thread. Mutant: a check the compiler dropped is not in the
+/// validator, or a route skips the validator.
+#[test]
+fn a_schema_is_invalid_on_every_route_or_on_none() {
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(n).unwrap()).unwrap()
+        }
+    }
+    let pool: [(&str, [Value; 6]); 9] = [
+        (
+            "type",
+            [
+                json!("object"),
+                json!("string"),
+                json!("number"),
+                json!("array"),
+                json!(["string", "null"]),
+                json!(5),
+            ],
+        ),
+        (
+            "enum",
+            [
+                json!([]),
+                json!(["a"]),
+                json!([1]),
+                json!(["a", 1]),
+                json!([1.5]),
+                json!("a"),
+            ],
+        ),
+        (
+            "const",
+            [
+                json!("a"),
+                json!(1),
+                json!(1.5),
+                json!(null),
+                json!([1]),
+                json!(true),
+            ],
+        ),
+        (
+            "anyOf",
+            [
+                json!([]),
+                json!([{"type": "string"}]),
+                json!([{"type": "integer"}, {"type": "null"}]),
+                json!([5]),
+                json!(5),
+                json!([{"type": "str"}]),
+            ],
+        ),
+        (
+            "properties",
+            [
+                json!(null),
+                json!({}),
+                json!({"q": {"type": "string"}}),
+                json!([]),
+                json!({"q": 5}),
+                json!({"q": true}),
+            ],
+        ),
+        (
+            "required",
+            [
+                json!(null),
+                json!([]),
+                json!(["q"]),
+                json!(["z"]),
+                json!("q"),
+                json!([5]),
+            ],
+        ),
+        (
+            "items",
+            [
+                json!({"type": "integer"}),
+                json!(5),
+                json!([{"type": "integer"}]),
+                json!(true),
+                json!({}),
+                json!(null),
+            ],
+        ),
+        (
+            "maxLength",
+            [
+                json!(0),
+                json!(-1),
+                json!("x"),
+                json!(1.5),
+                json!(9),
+                json!(null),
+            ],
+        ),
+        (
+            "$ref",
+            [
+                json!("#"),
+                json!("#/$defs/d"),
+                json!("#/nope"),
+                json!(5),
+                json!("#d"),
+                json!("#/properties/r"),
+            ],
+        ),
+    ];
+    let shape = |rng: &mut Rng| {
+        let mut o = Map::new();
+        for (key, values) in &pool {
+            if rng.below(3) == 0 {
+                o.insert((*key).to_owned(), values[rng.below(values.len())].clone());
+            }
+        }
+        o
+    };
+    let routes: [(ToolFormat, &str); 6] = [
+        (ToolFormat::Hermes, "required"),
+        (QWEN, "required"),
+        (GLM, "required"),
+        (ToolFormat::Dsml(Spelling::Joined), "required"),
+        (ToolFormat::Hermes, "auto"),
+        (QWEN, "auto"),
+    ];
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let read = |format: ToolFormat, body: &Value| {
+        let ask = Ask {
+            tok: &*tok,
+            vocab: &vocab,
+            format,
+            think: ThinkTags::THINK,
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            request(body.as_object().unwrap(), &ask)
+        }))
+        .unwrap_or_else(|_| panic!("the compiler stopped on {body}"))
+    };
+    let invalid = |r: &Result<Option<Constraint>, Refusal>| {
+        r.as_ref()
+            .is_err_and(|e| !e.outside_subset && !e.unsupported)
+    };
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let (mut refused, mut served) = (0, 0);
+    for _ in 0..1500 {
+        // Below a well-formed object, every route reads the node as a
+        // property: the routes must agree on it.
+        let wrapped = json!({"type": "object", "$defs": {"d": {"type": "string"}},
+            "properties": {"q": shape(&mut rng), "r": {"type": "integer"}}, "required": ["q"]});
+        let verdict = invalid(&read(ToolFormat::Hermes, &schema_body(&wrapped)));
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": wrapped}}]);
+        for (format, choice) in routes {
+            let body = json!({"tools": tools, "tool_choice": choice});
+            assert_eq!(invalid(&read(format, &body)), verdict, "{format:?} {body}");
+        }
+        if verdict {
+            refused += 1;
+        } else {
+            served += 1;
+        }
+        // As the schema itself, the compiler still stops on nothing.
+        let alone = Value::Object(shape(&mut rng));
+        let _ = read(ToolFormat::Hermes, &schema_body(&alone));
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": alone}}]);
+        for (format, choice) in routes {
+            let _ = read(format, &json!({"tools": tools, "tool_choice": choice}));
+        }
+    }
+    assert!(
+        refused > 100 && served > 100,
+        "the sweep covers both: {refused} refused, {served} not"
+    );
 }
 
 /// A watched call waits for the think span's own end: an opener inside the

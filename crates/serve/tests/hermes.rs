@@ -618,6 +618,51 @@ fn hw_an_invalid_tool_schema_is_a_400_under_auto_and_an_unservable_one_is_served
     );
 }
 
+/// An invalid tool schema is a 400 under `tool_choice` auto whatever else the
+/// request holds: beside a keyword the subset does not serve on its own node
+/// (a text completion's request), and in a tool after one the subset cannot
+/// compile. Mutant: the compiler's order decides, and the request is served
+/// unwatched with a 200.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_invalid_tool_schema_is_a_400_beside_an_unservable_one() {
+    let addr = start("Hi.");
+    let invalid = json!({"type": "object", "properties": {"p": {"type": "str", "pattern": "a+"}}});
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "Hi", "n_predict": 4, "temperature": 0, "tool_choice": "auto",
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": invalid}}]}),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    let e = &r.json()["error"];
+    assert_eq!(e["param"], "tools", "{}", r.body);
+    assert!(
+        e["message"].as_str().unwrap_or("").starts_with(
+            "tools[0].f.parameters.properties.p: type \"str\" is not a JSON Schema type"
+        ),
+        "{}",
+        r.body
+    );
+    // The tool the subset cannot compile first, then the invalid one.
+    let mut b = malformed_body(false);
+    b["tools"]
+        .as_array_mut()
+        .expect("tools")
+        .push(json!({"type": "function", "function": {"name": "bad",
+            "parameters": {"type": "object", "properties": {"n": {"type": "integr"}}}}}));
+    let r = post(addr, "/v1/chat/completions", &b);
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(
+        r.json()["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("tools[3].bad.parameters.properties.n: type \"integr\""),
+        "{}",
+        r.body
+    );
+}
+
 // ---------------------------------------------------------------- the span
 
 /// A chat body on the Qwen3 template with `extra` beside it.
