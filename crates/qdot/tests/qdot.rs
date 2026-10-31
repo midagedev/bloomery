@@ -22,7 +22,6 @@ use qdot::dot_row_avx2;
 use qdot::{
     QdotError, col_bytes, dot_row, dot_row_scalar, quantize_col, quantize_col_scalar, supports,
 };
-use std::fmt::Write as _;
 
 fn model_path() -> String {
     std::env::var("BLOOMERY_MODEL")
