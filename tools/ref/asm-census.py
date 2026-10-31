@@ -28,6 +28,7 @@ has none — the reason .cargo/config.toml turns sse4a off (tools/check-rustflag
 """
 
 import collections
+import functools
 import re
 import subprocess
 import sys
@@ -35,6 +36,41 @@ import sys
 FUNC = re.compile(r"^[0-9a-f]+ <(.*)>:$")
 JUMP = re.compile(r"(j\w+)\s+(?:0x)?([0-9a-f]+) <")
 SSE4A = {"extrq", "insertq", "movntss", "movntsd"}
+STACK_SLOT = re.compile(r"(-?0x[0-9a-f]+)?\(%rsp\)")
+SLOT_BYTES = 8  # a flag's stack slot: the bytes from its offset that the widest integer store of the flag writes
+# The instructions the tile derivation reads; the first pattern a mnemonic matches wins, and one no pattern matches is
+# refused by name. "" touches nothing; "F" only the condition flags; "D" only its last operand; "DF" its last operand
+# and the flags; "implicit" a register or memory its operands do not name, or more than its last operand: such an
+# instruction inside a counted loop or a flag loop refuses the loop, whatever it does.
+WRITE_CLASSES = tuple((re.compile(p), kind) for p, kind in (
+    (r"j\w+|nop\w*|data16|prefetch\w*|vzero(?:upper|all)|endbr(?:32|64)", ""),
+    (r"(?:cmp|test|bt)[bwlq]?|sahf|v?u?comis[sd]|vptest|vtestp[sd]", "F"),
+    (r"(?:mov|movabs|lea|not|bswap|movbe|shlx|shrx|sarx|rorx|pdep|pext)[bwlq]?|movz[bw][wlq]|movs[bw][wlq]|movslq"
+     r"|cmov[a-z]+|set[a-z]+", "D"),
+    (r"(?:add|sub|adc|sbb|and|or|xor|neg|inc|dec|sh[lr]|sa[lr]|ro[lr]|rc[lr]|sh[lr]d|bt[src]|bextr|bzhi|andn"
+     r"|popcnt|tzcnt|lzcnt|bs[fr]|blsr|blsi|blsmsk|adcx|adox)[bwlq]?", "DF"),
+    (r"imul[wlq]?", "imul"),  # "DF" with two or three operands, "implicit" with one
+    (r"(?:mul|div|idiv|xchg|xadd|cmpxchg|mulx|push|pop|call)[bwlq]?|lahf|cltq|cwtl|cbtw|cqto|cltd|cwtd", "implicit"),
+    (r"v(?:mov(?:aps|ups|apd|upd|dq[au]|ss|sd|d|q|[hl]p[sd]|hlps|lhps|[sd]dup|shdup|sldup|nt(?:dqa?|p[sd])|mskp[sd])"
+     r"|broadcast(?:s[sd]|[fi]128)|pbroadcast[bwdq]|cvt\w+|(?:insert|extract)(?:[fi]128|ps)|pinsr[bwdq]|pextr[bwdq]"
+     r"|perm(?:[dq]|p[sd]|ilp[sd]|2[fi]128)|fn?m(?:addsub|subadd|add|sub)(?:132|213|231)[ps][sd]"
+     r"|(?:add|sub|mul|div|min|max|sqrt|rcp|rsqrt|round|and|andn|or|xor|hadd|hsub|addsub|blendv?|shuf|unpck[hl]|dp)"
+     r"(?:p[sd]|s[sd])|cmp\w*[ps][sd]"
+     r"|p(?:adds?u?[bwdq]|subs?u?[bwdq]|madd\w+|mul\w+|andn?|x?or|(?:min|max)[su][bwdq]|avg[bw]|abs[bwd]|sign[bwd]"
+     r"|shuf(?:b|d|[hl]w)|unpck[hl](?:bw|wd|dq|qdq)|ack[su]s(?:wb|dw)|s(?:ll|rl|ra)v?[wdq]|s[lr]ldq|cmp(?:eq|gt)[bwdq]"
+     r"|mov[sz]x(?:bw|bd|bq|wd|wq|dq)|movmskb|alignr|blend(?:w|d|vb)|h(?:add|sub)s?[wd]|sadbw))", "D"),
+))
+# An integer register operand and the part of its 64-bit family it names (bits 64, 32, 16, 8, or "h" for 8..15).
+GPR_PARTS = tuple((re.compile(p), part) for p, part in (
+    (r"%r([abcd]x|si|di|bp|sp|\d+)", 64), (r"%e([abcd]x|si|di|bp|sp)", 32), (r"%r(\d+)d", 32),
+    (r"%([abcd]x|si|di|bp|sp)", 16), (r"%r(\d+)w", 16), (r"%([abcd])l", 8), (r"%(si|di|bp|sp)l", 8),
+    (r"%r(\d+)b", 8), (r"%([abcd])h", "h"),
+))
+OPERAND = re.compile(r"\$-?(?:0x)?[0-9a-f]+|%[xyz]mm\d+"  # an immediate, a vector register or a memory operand
+                     r"|(?:%[c-gs]s:)?(?:-?0x[0-9a-f]+)?\((?:%\w+)?(?:,%\w+(?:,[1248])?)?\)")
+VECTOR_BYTES = {"x": 16, "y": 32, "z": 64}
+SUFFIX_BYTES = {"b": 1, "w": 2, "l": 4, "q": 8}
+PART_BYTES = {64: 8, 32: 4, 16: 2, 8: 1, "h": 1}
 
 
 def listing(path):
@@ -201,63 +237,79 @@ def jump_table(rel_lines, section):
     return [a - o for o, a in sorted(ent)]
 
 
+def gpr_part(op):
+    """(64-bit family, part) of an integer register operand: `%eax` is (`rax`, 32), `%r9b` (`r9`, 8), `%dil`
+    (`rdi`, 8), `%ah` (`rax`, "h", bits 8..15); else None."""
+    for pat, part in GPR_PARTS:
+        m = pat.fullmatch(op.strip())
+        if m:
+            name = m.group(1)
+            return "r" + (name + "x" if name in ("a", "b", "c", "d") else name), part
+    return None
+
+
 def gpr(op):
-    """The 64-bit register a general-purpose operand names (`%eax`, `%rax` is `rax`; `%r9d`, `%r9` is `r9`;
-    `%al`..`%dl` the low byte of their family), else None."""
-    m = re.fullmatch(r"%[re]?(ax|bx|cx|dx|si|di|bp|sp)", op.strip())
-    if m:
-        return "r" + m.group(1)
-    m = re.fullmatch(r"%([abcd])l", op.strip())
-    if m:
-        return {"a": "rax", "b": "rbx", "c": "rcx", "d": "rdx"}[m.group(1)]
-    m = re.fullmatch(r"%r(\d+)[dwb]?", op.strip())
-    return f"r{m.group(1)}" if m else None
+    """The 64-bit register family an integer register operand names, else None."""
+    part = gpr_part(op)
+    return part[0] if part else None
 
 
 def operands(ins):
+    """Operands with the commas inside an address kept together."""
     parts = ins.split(None, 1)
-    return [o.strip() for o in parts[1].split("#")[0].split(",")] if len(parts) > 1 else []
+    return [o.strip() for o in re.split(r",(?![^()]*\))", parts[1].split("#")[0])] if len(parts) > 1 else []
 
 
-def write_reg(ins):
-    """The 64-bit register an instruction writes — its last operand, the destination in this listing's
-    order, whatever the operand count (`vpextrd $2, %xmm8, %eax` writes eax) — or None; a compare, test,
-    branch or push only reads, and a memory or immediate operand is no register."""
-    mn = mnemonic(ins)
-    if mn.startswith(("j", "cmp", "test")) or mn in ("push", "pushq", "bt", "btq"):
-        return None
-    ops = operands(ins)
-    return gpr(ops[-1]) if ops else None
+@functools.lru_cache(maxsize=None)
+def form(ins):
+    """(mnemonic, operands, kind) of one instruction, its kind from WRITE_CLASSES. An instruction or operand form
+    the classes do not list is a TileError naming it: what is not known to touch only its operands is never read
+    as touching nothing."""
+    ins = re.sub(r"^(?:(?:data16|cs|ds|lock|notrack)(?:\s+|$))+", "", ins.strip())
+    if not ins:
+        return "", (), ""
+    mn, ops = mnemonic(ins), tuple(operands(ins))
+    kind = next((k for pat, k in WRITE_CLASSES if pat.fullmatch(mn)), None)
+    if kind is None:
+        raise TileError(f"`{ins}`: {mn} is not an instruction the write classes list")
+    if kind == "imul":
+        kind = "DF" if len(ops) > 1 else "implicit"
+    if kind in ("", "implicit"):
+        return mn, ops, kind
+    for o in ops:
+        if not gpr_part(o) and not OPERAND.fullmatch(o):
+            raise TileError(f"`{ins}`: operand {o} is not a form the write classes read")
+    if kind in ("D", "DF") and not ops:
+        raise TileError(f"`{ins}`: no operand, not a form of {mn} the write classes read")
+    return mn, ops, kind
 
 
-def _clears(ins, op, reg):
-    """Whether `ins` writes the flag operand — the register family `reg`, or the stack slot `op` when the
-    flag is spilled — the constant 0."""
-    ops = operands(ins)
-    return len(ops) == 2 and (
-        (reg is not None and write_reg(ins) == reg and (
-            (mnemonic(ins).startswith("xor") and gpr(ops[0]) == reg)
-            or (mnemonic(ins).startswith("mov") and ops[0] in ("$0x0", "$0"))))
-        or (reg is None and mnemonic(ins).startswith("mov") and ops[1] == op and ops[0] in ("$0x0", "$0")))
-
-
-def _writes_flag(ins, op, reg):
-    """Whether `ins` writes the flag operand at all — a write of the register, or a store whose destination
-    is the slot (`mov %ecx, 0x20(%rsp)`)."""
-    ops = operands(ins)
-    return (reg is not None and write_reg(ins) == reg) or (
-        reg is None and mnemonic(ins).startswith("mov") and len(ops) == 2 and ops[1] == op)
-
-
-FLAGS_WRITER = ("cmp", "test", "add", "sub", "adc", "sbb", "and", "or", "xor", "neg", "inc", "dec",
-                "shl", "shr", "sar", "sal", "rol", "ror", "imul", "mul", "div", "bextr", "bzhi", "popcnt",
-                "tzcnt", "lzcnt", "bt")
-
-
-def _writes_flags(ins):
-    """Whether `ins` writes the integer condition flags (so a later branch reads it, not an earlier test);
-    the vector and move instructions do not."""
-    return mnemonic(ins).startswith(FLAGS_WRITER)
+def touches(ins, loc):
+    """Whether `ins` may read or write `loc`, a register family or a stack slot, told from its operands alone: an
+    "implicit" instruction or a memory bit instruction always (its bit index may reach another slot); a register
+    when an operand outside an address names any part of it; a slot when
+    %rsp is a register operand, an operand at %rsp may overlap the slot's SLOT_BYTES (its width the widest register
+    operand or integer suffix, unknown: overlapping), or a "D"/"DF" instruction stores through any other address."""
+    mn, ops, kind = form(ins)
+    if kind == "implicit" or (re.fullmatch(r"bt[rcs]?[wlq]?", mn) and any("(" in o for o in ops)):
+        return True
+    slot = STACK_SLOT.fullmatch(loc)
+    if not slot:
+        return any(gpr(o) == loc for o in ops)
+    sizes = [PART_BYTES[p[1]] for p in map(gpr_part, ops) if p]
+    sizes += [VECTOR_BYTES[o[1]] for o in ops if re.fullmatch(r"%[xyz]mm\d+", o)]
+    if not mn.startswith("v") and mn[-1] in SUFFIX_BYTES:
+        sizes.append(SUFFIX_BYTES[mn[-1]])
+    width, at = max(sizes, default=None), int(slot[1] or "0", 16)
+    for k, o in enumerate(ops):
+        m = STACK_SLOT.fullmatch(o)
+        if gpr(o) == "rsp" or "(%rsp" in o and not m:
+            return True
+        if m and (width is None or int(m[1] or "0", 16) < at + SLOT_BYTES and at < int(m[1] or "0", 16) + width):
+            return True
+        if not m and "(" in o and k == len(ops) - 1 and kind in ("D", "DF"):
+            return True
+    return False
 
 
 class Cfg:
@@ -384,7 +436,9 @@ class Cfg:
         return n
 
     def trips(self, header):
-        """The trip count of the loop at block `header`, from its latch and its zeroed start."""
+        """The trip count of the loop at block `header`. A latch `add $s, %r; ...; cmp $n, %r; jne header` counts
+        n / s trips when nothing else in the loop touches %r (`touches`) and the entry path zeroes it; a latch that
+        closes with `jmp` is a flag loop (`_flag_trips`). Every other shape is a named error."""
         blocks = self.loops[header]
         latches = [u for u in blocks if header in self.succ[u]]
         where = f"the loop at {self.body[self.blocks[header][0]][0]:#x}"
@@ -394,112 +448,109 @@ class Cfg:
         ins = [i for _, i in self.body[s:e]]
         if ins and mnemonic(ins[-1]) in ("jmp", "jmpq") and not re.match(r"jmpq?\s+\*", ins[-1]):
             return self._flag_trips(header, latches[0], where)
-        if len(ins) < 3 or not JUMP.match(ins[-1]) or mnemonic(ins[-1]) != "jne" or not mnemonic(ins[-2]).startswith("cmp"):
-            raise TileError(f"{where}: the latch does not end `cmp $n, %r; jne`")
+        m = JUMP.match(ins[-1]) if len(ins) >= 3 else None
+        if (not m or mnemonic(ins[-1]) != "jne" or int(m.group(2), 16) != self.body[self.blocks[header][0]][0]
+                or not mnemonic(ins[-2]).startswith("cmp")):
+            raise TileError(f"{where}: the latch does not end `cmp $n, %r; jne` to the loop's head")
         c_ops = operands(ins[-2])
         reg = gpr(c_ops[-1]) if len(c_ops) == 2 and c_ops[0].startswith("$") else None
-        adds = [operands(i) for i in ins[:-2] if mnemonic(i).startswith("add") and len(operands(i)) == 2 and gpr(operands(i)[1]) == reg]
-        if reg is None or not adds or not adds[-1][0].startswith("$"):
-            raise TileError(f"{where}: the latch has no `add $s, %r` of the compared register")
-        n, step = int(c_ops[0][1:], 16), int(adds[-1][0][1:], 16)
-        if step <= 0 or n % step:
-            raise TileError(f"{where}: compare {n:#x} is not a multiple of step {step:#x}")
-        if not self._starts_at_zero(header, reg):
+        adds = [k for k in range(s, e - 2) if re.fullmatch(r"add[bwlq]?", mnemonic(self.body[k][1]))
+                and (a_ops := operands(self.body[k][1]))[1:] == c_ops[1:] and a_ops[0].startswith("$")]
+        if reg is None or len(adds) != 1:
+            raise TileError(f"{where}: the latch has no single `add $s, %r` of the compared register")
+        n, step = int(c_ops[0][1:], 16), int(operands(self.body[adds[0]][1])[0][1:], 16)
+        if step <= 0 or n <= 0 or n % step:
+            raise TileError(f"{where}: compare {n:#x} is not a positive multiple of step {step:#x}")
+        other = next((k for b in blocks for k in range(*self.blocks[b]) if k not in (adds[0], e - 2)
+                      and touches(self.body[k][1], reg)), None)
+        if other is not None:
+            raise TileError(f"{where}: `{self.body[other][1]}` may touch the counter %{reg} besides the latch's add "
+                            "and compare")
+        if self._entry_value(header, reg) != 0:
             raise TileError(f"{where}: %{reg} is not shown to start at zero")
         return n // step
 
     def _flag_trips(self, header, latch, where):
-        """The trip count of a loop whose latch closes with `jmp` and the count left the latch for a flag
-        operand: a block of the loop ends `test $1, FLAG; je` to outside — FLAG a register or a stack slot,
-        wherever the compiler kept it — the flag written 1 on entry and cleared in the latch, its only write
-        inside the loop, so exactly one latch pass runs and the body takes 2 trips. The latch also writes the
-        induction register its last value (`movl $k, %r`, the register zeroed on entry and untouched inside
-        the loop besides the latch), and that count must agree: k + 1 = 2. Anything else is a named error."""
+        """The trip count of a loop whose latch closes with `jmp`: a block of the loop that dominates the latch ends
+        `test $1, FLAG; ...; je` to outside, FLAG a register or a stack slot, only "" or "D" instructions between the
+        test and the je. Nothing in the loop touches FLAG (`touches`) but that test and one clear in the latch
+        (`xorl` of the register's 32-bit name, `mov $0, SLOT`), and the entry path sets it to one: the first trip
+        passes the test, the latch clears the flag, and the second trip leaves at the test, 2 trips. Anything
+        else is a named error."""
         blocks = self.loops[header]
-        flag, freg = None, None
+        flag = shown = None
         for b in blocks:
             s, e = self.blocks[b]
-            body = [i for _, i in self.body[s:e]]
-            m = JUMP.match(body[-1]) if body else None
-            if not (m and mnemonic(body[-1]) == "je"):
+            m = JUMP.match(self.body[e - 1][1])
+            if not (m and mnemonic(self.body[e - 1][1]) == "je"):
                 continue
             t = self.bid.get(self.pos.get(int(m.group(2), 16), -1))
             if t is None or t in blocks:
                 continue
-            # the test may sit anywhere in the block, nothing that writes the flags between it and the je
-            for k in range(len(body) - 2, -1, -1):
-                if not mnemonic(body[k]).startswith("test"):
-                    if _writes_flags(body[k]):
+            for k in range(e - 2, s - 1, -1):
+                ins = self.body[k][1]
+                if not mnemonic(ins).startswith("test"):
+                    if form(ins)[2] not in ("", "D"):
                         break
                     continue
-                t_ops = operands(body[k])
-                if len(t_ops) == 2 and t_ops[0] == "$0x1" and (gpr(t_ops[1]) or "(%rsp)" in t_ops[1]):
-                    flag, freg = t_ops[1], gpr(t_ops[1])
+                t_ops = operands(ins)
+                part = gpr_part(t_ops[-1]) if t_ops else None
+                # bit 0 of a register's low part or of a stack slot's first byte; %ah..%dh hold bits 8..15
+                if len(t_ops) == 2 and t_ops[0] == "$0x1" and (
+                        part and part[1] != "h" or STACK_SLOT.fullmatch(t_ops[1])):
+                    flag, shown, test, test_block = part[0] if part else t_ops[1], t_ops[1], k, b
                 break
             if flag is not None:
                 break
         if flag is None:
             raise TileError(f"{where}: the latch closes with `jmp` and no block of the loop ends "
                             "`test $1, %r; je` to outside, the flag-tested shape")
+        if not self.dom(test_block, latch):
+            raise TileError(f"{where}: the flag test of {shown} does not dominate the latch")
         s, e = self.blocks[latch]
-        latch_ins = [i for _, i in self.body[s:e]]
-        if not any(_clears(i, flag, freg) for i in latch_ins):
-            raise TileError(f"{where}: the flag {flag} is not cleared in the latch")
-        inside = [i for b in blocks if b != latch for _, i in self.body[self.blocks[b][0]:self.blocks[b][1]]]
-        if any(_writes_flag(i, flag, freg) for i in inside):
-            raise TileError(f"{where}: the flag {flag} is written inside the loop besides the latch")
-        if self._entry_value_op(header, flag, freg) != 1:
-            raise TileError(f"{where}: the flag {flag} is not shown to start at one")
-        counted = [(int(operands(i)[0][1:], 16), write_reg(i)) for i in latch_ins
-                   if mnemonic(i).startswith("mov") and len(operands(i)) == 2
-                   and operands(i)[0].startswith("$") and int(operands(i)[0][1:], 16) > 0
-                   and self._entry_value(header, write_reg(i)) == 0]
-        if len(counted) != 1:
-            raise TileError(f"{where}: the latch writes {len(counted)} registers a positive immediate "
-                            "zeroed on entry, want the induction register's last value")
-        k, reg = counted[0]
-        if any(write_reg(i) == reg for i in inside):
-            raise TileError(f"{where}: the induction register %{reg} is written inside the loop "
-                            "besides the latch")
-        if k != 1:
-            raise TileError(f"{where}: the induction register's last value {k} disagrees with the "
-                            "flag's two trips")
-        return k + 1
+        hits = [k for b in blocks for k in range(*self.blocks[b]) if k != test and touches(self.body[k][1], flag)]
 
-    def _entry_value(self, header, reg):
-        """The constant the entry path into the loop at `header` last writes `reg` (a `xor %r, %r` is 0),
-        or None when no constant write is shown within 8 blocks outside."""
-        for ins in self._entry_ins(header):
-            ops = operands(ins)
-            if len(ops) == 2 and gpr(ops[1]) == reg and not mnemonic(ins).startswith(("cmp", "test", "v")):
-                if mnemonic(ins).startswith("xor") and gpr(ops[0]) == reg:
-                    return 0
-                if mnemonic(ins).startswith("mov") and ops[0].startswith("$"):
-                    return int(ops[0][1:], 16)
-                return None
-        return None
+        def clears(ins):
+            mn, ops, _ = form(ins)
+            if gpr_part(shown):
+                return mn == "xorl" and len(ops) == 2 and ops[0] == ops[1] and gpr_part(ops[0]) == (flag, 32)
+            return re.fullmatch(r"mov[bwlq]?", mn) and ops == ("$0x0", shown)
 
-    def _entry_value_op(self, header, op, reg):
-        """The constant the entry path into the loop at `header` last writes the flag operand — a register
-        (family `reg`) read through [`_entry_value`], a stack slot through the register or immediate its
-        last store took (one indirection: `movb $1, %cl; movl %ecx, 0x20(%rsp)`), or None."""
-        if reg is not None:
-            return self._entry_value(header, reg)
-        want = None
+        clear = [k for k in hits if s <= k < e and clears(self.body[k][1])]
+        if not clear:
+            raise TileError(f"{where}: the flag {shown} is not cleared in the latch")
+        other = next((k for k in hits if k != clear[0]), None)
+        if other is not None:
+            raise TileError(f"{where}: `{self.body[other][1]}` may touch the flag {shown} besides its test and the "
+                            "latch's clear")
+        if self._entry_value(header, flag, low=True) != 1:
+            raise TileError(f"{where}: the flag {shown} is not shown to start at one")
+        return 2
+
+    def _entry_value(self, header, loc, low=False):
+        """The constant the loop at `header` is entered with in `loc`, a register family or a stack slot, read from
+        the first instruction on the entry path that touches it (`touches`): `xorl %r32, %r32` is 0, `mov $k, loc`
+        is k (a register written whole, or with `low`, a flag's bit 0, its low byte or word too), and a slot
+        stored from a register (`mov %r, loc`) takes that register's constant the same way, once. Any other first
+        touch, or none, is None."""
+        want = loc
         for ins in self._entry_ins(header):
-            ops = operands(ins)
-            if want is not None:
-                if len(ops) == 2 and gpr(ops[1]) == want and not mnemonic(ins).startswith(("cmp", "test", "v")):
-                    if mnemonic(ins).startswith("xor") and gpr(ops[0]) == want:
-                        return 0
-                    if mnemonic(ins).startswith("mov") and ops[0].startswith("$"):
-                        return int(ops[0][1:], 16)
-                    return None
+            if not touches(ins, want):
                 continue
-            if mnemonic(ins).startswith("mov") and len(ops) == 2 and ops[1] == op:
-                if ops[0].startswith("$"):
-                    return int(ops[0][1:], 16)
-                want = gpr(ops[0])
+            mn, ops, _ = form(ins)
+            dst = gpr_part(ops[-1]) if len(ops) == 2 else None
+            whole = dst and dst[0] == want and (dst[1] in (32, 64) or low and dst[1] in (8, 16))
+            if mn == "xorl" and whole and ops[0] == ops[1] and dst[1] == 32:
+                return 0
+            if not re.fullmatch(r"mov[bwlq]?", mn) or len(ops) != 2:
+                return None
+            if ops[0].startswith("$") and (whole or ops[1] == want):
+                return int(ops[0][1:], 16)
+            src = gpr_part(ops[0])
+            if want == loc and STACK_SLOT.fullmatch(loc) and ops[1] == loc and src and src[1] != "h":
+                want = src[0]
+                continue
+            return None
         return None
 
     def _entry_ins(self, header):
@@ -513,9 +564,6 @@ class Cfg:
             s, e = self.blocks[outside[0]]
             yield from (ins for _, ins in reversed(self.body[s:e]))
             outside = self.pred[outside[0]]
-
-    def _starts_at_zero(self, header, reg):
-        return self._entry_value(header, reg) == 0
 
     def inner_loops(self, header):
         """The headers of the loops directly inside the loop at `header`."""
@@ -733,7 +781,8 @@ def tile_units_report(rows, red):
                f"tile-units: {red} of {len(rows)} rows missing, stale, refused or without a tile kernel: the table in ops.rs is not what the code derives")
     return "\n".join(out)
 
-def canned_tile(cs=(2, 3, 4, 5, 6), trip_cmp="cmpq\t$0x20, %rax", tail=True, inner_latch="counted"):
+def canned_tile(cs=(2, 3, 4, 5, 6), trip_cmp="cmpq\t$0x20, %rax", tail=True, inner_latch="counted",
+                inner="vaddps\t%ymm0, %ymm1, %ymm2", entry=(), latch_tail=()):
     """(listing lines, relocation lines) of `qdot::tile::<C>` functions shaped as qdot's: a jump-table dispatch on the
     kind to two arms. Arm 0, a 256-value type: a block loop of 5C + 6 instructions, a decode loop inside it. Arm 1, a
     32-value type: the x4 group loop (4C + 8) and a shorter tail loop. `inner_latch` picks arm 0's decode-loop latch:
@@ -741,7 +790,8 @@ def canned_tile(cs=(2, 3, 4, 5, 6), trip_cmp="cmpq\t$0x20, %rax", tail=True, inn
     "flag", the count carried in a flag register (`test $1, %r; je` in the body, the flag cleared and the induction
     register written its last value in a `jmp` latch) of two trips (5C + 39, fixed 78, per_col 10); "spill", the same
     with the flag in a stack slot (5C + 40, fixed 80, per_col 10). Arm 1 runs 4C + 8 for four blocks (fixed 4,
-    per_col 2) at every latch."""
+    per_col 2) at every latch. `inner` opens the decode loop; `entry` instructions run just before it;
+    `latch_tail` instructions follow the flag latch's induction write."""
     lst, rel = [], []
     for c in cs:
         prog = []  # (label or None, text); a jump names its target label
@@ -756,7 +806,8 @@ def canned_tile(cs=(2, 3, 4, 5, 6), trip_cmp="cmpq\t$0x20, %rax", tail=True, inn
         fill(5 * c + 5)
         if inner_latch == "counted":
             prog.append((None, "xorl\t%eax, %eax"))
-            prog.append(("A_inner", "vaddps\t%ymm0, %ymm1, %ymm2"))
+            prog += [(None, i) for i in entry]
+            prog.append(("A_inner", inner))
             fill(7)
             prog += [(None, "addq\t$0x4, %rax"), (None, trip_cmp), (None, "jne\tA_inner")]
             fill(3)
@@ -765,11 +816,14 @@ def canned_tile(cs=(2, 3, 4, 5, 6), trip_cmp="cmpq\t$0x20, %rax", tail=True, inn
             prog.append((None, "xorl\t%eax, %eax"))
             prog += [(None, "movl\t$0x1, %ecx")] if inner_latch == "spill" else [(None, "movl\t$0x1, %ebx")]
             prog += [(None, "movl\t%ecx, 0x20(%rsp)")] if inner_latch == "spill" else []
-            prog.append(("A_inner", "vaddps\t%ymm0, %ymm1, %ymm2"))
+            prog += [(None, i) for i in entry]
+            prog.append(("A_inner", inner))
             fill(7)
             prog += [(None, f"testb\t$0x1, {flag}"), (None, "je\tA_out")]
             prog += [(None, "movl\t$0x0, 0x20(%rsp)")] if inner_latch == "spill" else [(None, "xorl\t%ebx, %ebx")]
-            prog += [(None, "movl\t$0x1, %eax"), (None, "jmp\tA_inner")]
+            prog.append((None, "movl\t$0x1, %eax"))
+            prog += [(None, i) for i in latch_tail]
+            prog.append((None, "jmp\tA_inner"))
             prog.append(("A_out", "vaddps\t%ymm0, %ymm1, %ymm2"))
             fill(2)
         prog += [(None, "cmpq\t%rdx, %rsi"), (None, "jne\tA_outer"), (None, "jmp\tEXIT")]
@@ -902,8 +956,13 @@ def tile_units_self_test():
         return 1
     # a latch that carries its count in a flag — `test $1, %r; je` in the body, the flag cleared and the induction
     # register written its last value in a `jmp` latch — reads two trips, in a register and spilled to a slot alike
-    for what, latch, want in (("a flag register", "flag", (78, 10)), ("a spilled flag slot", "spill", (80, 10))):
+    for what, latch, want, slot in (
+        ("a flag register", "flag", (78, 10), "0x20(%rsp)"),
+        ("a spilled flag slot", "spill", (80, 10), "0x20(%rsp)"),
+        ("a red-zone flag slot", "spill", (80, 10), "-0x10(%rsp)"),
+    ):
         fl, fr = canned_tile(inner_latch=latch)
+        fl = [line.replace("0x20(%rsp)", slot) for line in fl]
         st = {r["ty"]: r for r in tile_units(fl, fr, CANNED_QDOT, CANNED_OPS.replace("(200, 10)", f"{want}"))[0]}["Q4_K"]
         got = (st["fixed"], st["per_col"], st["status"])
         if got != (*want, "ok"):
@@ -944,36 +1003,127 @@ def tile_units_self_test():
         print("asm-census self-test: tile-units reads GNU objdump's wide kernel differently")
         return 1
     # a shape the derivation does not read is a named error, never a guess
-    def edited(lines, was, is_):
-        return [l.replace(was, is_) for l in lines]
-
-    flag_lst = canned_tile(inner_latch="flag")[0]
-    for what, args in (
-        ("a wide type with no wide kernel in the listing", (lst, rel, wq, CANNED_OPS)),
-        ("a wide kernel named for another type", (lst + canned_wide("qdot::dot_q8_0_q8k_wide_avx2")[0], rel + wr, wq,
-                                                  CANNED_OPS)),
-        ("wide runs that are not whole groups", (lst + wl, rel + wr, wq.replace("WIDE_GROUP: usize = 8", "WIDE_GROUP: usize = 12"),
-                                                 CANNED_OPS)),
-        ("a wide kernel whose jump table is gone", (lst + wl, rel, wq, CANNED_OPS)),
-        ("a latch that is no counted loop", (canned_tile(trip_cmp="cmpq\t%rbx, %rax")[0], rel, CANNED_QDOT, CANNED_OPS)),
-        ("a 32-value type with no tail loop", (canned_tile(tail=False)[0], rel, CANNED_QDOT, CANNED_OPS)),
-        ("a flag latch that clears no flag", (edited(flag_lst, "xorl\t%ebx, %ebx", "nop"), rel, CANNED_QDOT, CANNED_OPS)),
-        ("a flag latch whose induction register counts past its flag",
-         (edited(flag_lst, "movl\t$0x1, %eax", "movl\t$0x2, %eax"), rel, CANNED_QDOT, CANNED_OPS)),
-        ("a flag latch with no exit test", (edited(flag_lst, "testb\t$0x1, %ebx", "nop"), rel, CANNED_QDOT, CANNED_OPS)),
-        ("a spilled flag that does not start at one",
-         (edited(canned_tile(inner_latch="spill")[0], "movl\t$0x1, %ecx", "movl\t$0x2, %ecx"), rel, CANNED_QDOT,
-          CANNED_OPS)),
-        ("a jump table of another size", (lst, rel, CANNED_QDOT.replace("Qb,\n", "Qb,\n    Qc,\n"), CANNED_OPS)),
-        ("a function with no jump table", (lst, [], CANNED_QDOT, CANNED_OPS)),
-    ):
+    for what, call, why in tile_refusals():
         try:
-            tile_units(*args)
+            call()
             print(f"asm-census self-test: tile-units read {what}")
             return 1
-        except TileError:
-            pass
+        except TileError as e:
+            if why not in str(e):
+                print(f"asm-census self-test: tile-units refused {what} for another reason: {e}")
+                return 1
     return 0
+
+
+def tile_refusals():
+    """[(what, call, the reason its TileError names)]: every shape the derivation refuses. A counted loop's counter
+    and a flag loop's flag are touched only by their own add, compare, test and clear, and an instruction that
+    touches either otherwise (any alias, an implicit write, a read) refuses the loop whatever it does."""
+    lst, rel = canned_tile()
+    wl, wr = canned_wide()
+    wq = CANNED_QDOT + CANNED_WIDE
+
+    def tile(**kw):
+        return lambda: tile_units(*canned_tile(**kw), CANNED_QDOT, CANNED_OPS)
+
+    def flagged(latch, slot="0x20(%rsp)", reg="%ebx", edit=("", ""), gap=None, **kw):
+        """canned_tile's flag latch with the flag in `reg` or spilled to `slot`, one instruction edited, `gap` between
+        the flag test and its je."""
+        fl, fr = canned_tile(inner_latch=latch, **kw)
+        fl = [l.replace("0x20(%rsp)", slot).replace("%ebx", reg).replace(*edit) for l in fl]
+        for k, l in enumerate(fl if gap else ()):
+            if "\ttestb\t$0x1, " in l:
+                fl[k - 1] = fl[k - 1].split("\t", 1)[0] + "\t" + l.split("\t", 1)[1]
+                fl[k] = l.split("\t", 1)[0] + "\t" + gap
+        ops = CANNED_OPS.replace("(200, 10)", "(80, 10)" if latch == "spill" else "(78, 10)")
+        return lambda: tile_units(fl, fr, CANNED_QDOT, ops)
+
+    def loop(header, *prog):
+        """Cfg.trips of the loop at `header` in a function of `prog`, an instruction every 4 bytes."""
+        cfg = Cfg([(4 * i, re.sub(r"@(\w+)", lambda m: f"{m[1]} <f+{m[1]}>", ins)) for i, ins in enumerate(prog)], [])
+        return lambda: cfg.trips(cfg.bid[cfg.pos[header]])
+
+    return [
+        ("a wide type with no wide kernel in the listing", lambda: tile_units(lst, rel, wq, CANNED_OPS),
+         "the listing holds none of"),
+        ("a wide kernel named for another type",
+         lambda: tile_units(lst + canned_wide("qdot::dot_q8_0_q8k_wide_avx2")[0], rel + wr, wq, CANNED_OPS),
+         "the listing holds none of"),
+        ("wide runs that are not whole groups",
+         lambda: tile_units(lst + wl, rel + wr, wq.replace("WIDE_GROUP: usize = 8", "WIDE_GROUP: usize = 12"), CANNED_OPS),
+         "are not whole groups"),
+        ("a wide kernel whose jump table is gone", lambda: tile_units(lst + wl, rel, wq, CANNED_OPS), "jump table"),
+        ("a jump table of another size",
+         lambda: tile_units(lst, rel, CANNED_QDOT.replace("Qb,\n", "Qb,\n    Qc,\n"), CANNED_OPS), "TileKind"),
+        ("a function with no jump table", lambda: tile_units(lst, [], CANNED_QDOT, CANNED_OPS), "jump table"),
+        ("a 32-value type with no tail loop", tile(tail=False), "outer loops"),
+        ("a latch that is no counted loop", tile(trip_cmp="cmpq\t%rbx, %rax"), "no single `add $s, %r`"),
+        ("a counted loop compared with zero", tile(trip_cmp="cmpq\t$0x0, %rax"), "is not a positive multiple"),
+        ("a counted latch whose jne leaves the loop",
+         loop(0x14, "xorl\t%eax, %eax", "jmp\t@0x14", "addq\t$0x4, %rax", "cmpq\t$0x20, %rax", "jne\t@0x1c",
+              "nop", "jmp\t@0x8", "retq"), "jne` to the loop's head"),
+        *((f"a counted loop whose head touches its counter with {ins}", tile(inner=ins), "may touch the counter")
+          for ins in ("incq\t%rax", "movb\t$0x0, %al", "testq\t%rax, %rax", "xchgq\t%rax, %rcx", "xchgl\t%eax, %eax",
+                      "xaddq\t%rax, %rcx", "xaddq\t%rax, %rax", "mulxq\t%rsi, %rax, %rcx", "mulxq\t%rsi, %rax, %rax",
+                      "cmpxchgq\t%rbx, %rcx", "lahf", "cltq", "mulq\t%rbx", "imulq\t%rbx", "pushq\t%rbx",
+                      "callq\t0x0 <f>")),
+        *((f"a counter set on entry after its zeroing by {ins}", tile(entry=(ins,)), "is not shown to start at zero")
+          for ins in ("movb\t$0x1, %al", "callq\t0x0 <f>")),
+        ("a flag latch that clears no flag", flagged("flag", edit=("xorl\t%ebx, %ebx", "nop")),
+         "is not cleared in the latch"),
+        ("a flag the latch clears only in %bh", flagged("flag", edit=("xorl\t%ebx, %ebx", "xorb\t%bh, %bh")),
+         "is not cleared in the latch"),
+        ("a flag latch with no exit test", flagged("flag", edit=("testb\t$0x1, %ebx", "nop")), "no block of the loop ends"),
+        # PIN(2026-11-01): Removed the induction-value refusal and its test because the flag's entry value, dominating test, and latch clear prove two trips without an induction register.
+        ("a flag tested in %bh", flagged("flag", edit=("testb\t$0x1, %ebx", "testb\t$0x1, %bh")),
+         "no block of the loop ends"),
+        *((f"a flag test whose je reads the flags {ins} writes", flagged("flag", gap=ins), "no block of the loop ends")
+          for ins in ("bsfl\t%ecx, %edx", "vptest\t%ymm0, %ymm1", "addq\t$0x1, %rcx")),
+        ("a flag test gap the write classes do not list", flagged("flag", gap="rdtsc"),
+         "rdtsc is not an instruction the write classes list"),
+        ("a flag test the latch does not pass",
+         loop(0x8, "movl\t$0x1, %ebx", "xorl\t%eax, %eax", "cmpq\t%rdx, %rsi", "jne\t@0x18", "testb\t$0x1, %bl",
+              "je\t@0x24", "xorl\t%ebx, %ebx", "movl\t$0x1, %eax", "jmp\t@0x8", "retq"), "does not dominate the latch"),
+        *((f"a {'spilled' if latch == 'spill' else 'register'} flag cleared then overwritten in the latch by {ins}",
+           flagged(latch, latch_tail=(ins,)),
+           "may touch the flag") for latch, ins in (
+               ("flag", "movl\t$0x1, %ebx"), ("flag", "movb\t$0x1, %bl"), ("flag", "incq\t%rbx"),
+               ("spill", "movl\t$0x1, 0x20(%rsp)"), ("spill", "movq\t$0x100000000, 0x1c(%rsp)"),
+               ("spill", "movl\t%ecx, 0x20(%rsp)"))),
+        *((f"a flag in {reg} that {ins} touches in the head", flagged("flag", reg=reg, inner=ins), "may touch the flag")
+          for reg, ins in (("%ebx", "xchgb\t%bl, %cl"), ("%edi", "movb\t$0x0, %dil"), ("%esi", "movb\t$0x0, %sil"),
+                           ("%ebp", "movb\t$0x0, %bpl"), ("%ebx", "movb\t$0x0, %bh"), ("%ebx", "movzbl\t%bl, %ecx"),
+                           ("%ebx", "cmpxchgq\t%rcx, %rdx"), ("%ebx", "callq\t0x0 <f>"))),
+        *((f"a spilled flag at {slot} that {ins} touches in the head", flagged("spill", slot, inner=ins),
+           "may touch the flag") for slot, ins in (
+               ("0x20(%rsp)", "movq\t$0x0, 0x1c(%rsp)"), ("-0x10(%rsp)", "movq\t$0x0, -0x14(%rsp)"),
+               ("-0x10(%rsp)", "movq\t$0x0, (%rsp,%rcx,4)"), ("0x20(%rsp)", "movl\t0x20(%rsp), %ecx"),
+               ("0x20(%rsp)", "movq\t%rax, (%rdi)"), ("0x20(%rsp)", "subq\t$0x8, %rsp"),
+               ("0x20(%rsp)", "callq\t0x0 <f>"), ("-0x8(%rsp)", "callq\t0x0 <f>"))),
+        *((f"a spilled flag touched by memory {mn} in its {where}",
+           flagged("spill", **kw), why)
+          for base in ("bt", "bts", "btr", "btc") for suffix in ("", "w", "l", "q")
+          for mn in (base + suffix,)
+          for ins in (f"{mn}\t%{'dx' if suffix == 'w' else 'edx' if suffix == 'l' else 'rdx'}, 0x10(%rsp)",)
+          for where, kw, why in (
+              ("head", dict(inner=ins, entry=("movl\t$0x80, %edx",)), "may touch the flag"),
+              ("entry", dict(entry=("movl\t$0x80, %edx", ins)), "is not shown to start at one"),
+              ("latch", dict(entry=("movl\t$0x80, %edx",), latch_tail=(ins,)), "may touch the flag"))),
+        ("a flag set only in %bh on entry", flagged("flag", edit=("movl\t$0x1, %ebx", "movb\t$0x1, %bh")),
+         "is not shown to start at one"),
+        ("a spilled flag that does not start at one", flagged("spill", edit=("movl\t$0x1, %ecx", "movl\t$0x2, %ecx")),
+         "is not shown to start at one"),
+        ("a spilled flag stored from %ch", flagged("spill", edit=("movl\t%ecx, 0x20(%rsp)", "movb\t%ch, 0x20(%rsp)")),
+         "is not shown to start at one"),
+        *((f"a spilled flag at {slot} touched on entry by {'; '.join(ins)}", flagged("spill", slot, entry=ins),
+           "is not shown to start at one") for slot, ins in (
+               ("0x20(%rsp)", ("movq\t$0x0, 0x1c(%rsp)",)), ("0x20(%rsp)", ("xchgl\t%ecx, %edx", "movl\t%ecx, 0x20(%rsp)")),
+               ("-0x8(%rsp)", ("callq\t0x0 <f>",)))),
+        ("an instruction the write classes do not list", tile(inner="cpuid"),
+         "cpuid is not an instruction the write classes list"),
+        ("an operand form the write classes do not read", tile(inner="vaddps\t%ymm0, %ymm1, %ymm2 {%k1}"),
+         "is not a form the write classes read"),
+    ]
 
 
 def self_test():
