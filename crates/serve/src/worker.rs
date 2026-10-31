@@ -591,7 +591,9 @@ fn call_alone(slot: &mut Slot, a: &mut Active, need: Need) -> Result<(), EngineE
         Need::Step(t) => slot.next(t, a.job.logits_out()).map(|g| a.job.stepped(g)),
         Need::Advance(t) => slot.advance(t, a.job.kept_mut()).map(|d| a.job.advanced(d)),
         Need::Sampled(t) => a.job.advance_sampled(slot, t),
-        Need::Fill => unreachable!("a round of fills alone makes no decode call"),
+        Need::Fill | Need::Back(_) => {
+            unreachable!("a round of the requests' own calls alone makes no decode call")
+        }
         Need::Done => unreachable!("a finished request left the running ones"),
     }
 }
@@ -1038,15 +1040,16 @@ impl Worker {
                 continue;
             };
             match need {
-                Need::Fill => {
+                Need::Fill | Need::Back(_) => {
                     // A call of its own, like a prompt's: a quantum of ids
-                    // beside other busy slots. The request steps next round.
+                    // beside other busy slots, or a pass taken back to a call
+                    // opener. The request steps next round.
                     let quantum = self.quantum.filter(|_| self.active.len() > 1);
                     let a = &mut self.active[k];
-                    let called = self
-                        .slot
-                        .select(a.slot)
-                        .and_then(|()| a.job.fill(&mut self.slot, quantum));
+                    let called = self.slot.select(a.slot).and_then(|()| match need {
+                        Need::Back(t) => a.job.back(&mut self.slot, t),
+                        _ => a.job.fill(&mut self.slot, quantum),
+                    });
                     if let Err(e) = called {
                         return Err(self.die(&e));
                     }
@@ -1117,7 +1120,7 @@ impl Worker {
                         pass_at.push(a.slot);
                         a.need = Some(Need::Sampled(last));
                     }
-                    Need::Fill => {}
+                    Need::Fill | Need::Back(_) => {}
                     Need::Done => unreachable!("a finished request left the running ones"),
                 }
             }
@@ -1577,8 +1580,13 @@ impl Worker {
         let Some(need) = self.take_need(i) else {
             return Ok(());
         };
-        if matches!(need, Need::Fill) {
-            return match self.active[i].job.fill(&mut self.slot, None) {
+        if let Need::Fill | Need::Back(_) = need {
+            let a = &mut self.active[i];
+            let called = match need {
+                Need::Back(t) => a.job.back(&mut self.slot, t),
+                _ => a.job.fill(&mut self.slot, None),
+            };
+            return match called {
                 Ok(()) => Ok(()),
                 Err(e) => Err(self.die(&e)),
             };
@@ -1595,7 +1603,9 @@ impl Worker {
                 .advance(t, a.job.kept_mut())
                 .map(|d| a.job.advanced(d)),
             Need::Sampled(t) => a.job.advance_sampled(&mut self.slot, t),
-            Need::Fill | Need::Done => unreachable!("a fill is run above, a finished request left"),
+            Need::Fill | Need::Back(_) | Need::Done => {
+                unreachable!("an own call is run above, a finished request left")
+            }
         };
         self.book_round(1, started, before);
         match called {

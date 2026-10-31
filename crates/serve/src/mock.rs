@@ -1475,6 +1475,12 @@ impl Engine for DraftMock {
         2.max(self.n_draft + 1)
     }
 
+    /// The inner mock keeps every position it holds, and a pass leaves it
+    /// holding every id the pass kept but the last.
+    fn cuts_into_passes(&self) -> bool {
+        true
+    }
+
     fn advance_sampled(
         &mut self,
         last: u32,
@@ -1554,8 +1560,9 @@ impl Engine for DraftMock {
 ///
 /// The script is served as the ids the engine is fed, not as a count of its
 /// rows: a prefill that continues the script (a jump arm feeding the fixed
-/// ids of a program) advances it — its first id re-feeds the last one stepped
-/// — where the prompt, which spells none of it, leaves it alone.
+/// ids of a program) advances it — its first id the one the last step
+/// answered, fed for the first time — where the prompt, which spells none of
+/// it, leaves it alone.
 pub struct ScriptedEngine {
     script: Vec<u32>,
     /// The script's ids consumed so far: the ids fed since the generation
@@ -1565,6 +1572,9 @@ pub struct ScriptedEngine {
     /// Whether a generation's first row has been asked for: prefills before
     /// it are the prompt, ones after it a call the jump arm feeds.
     started: bool,
+    /// The ids one pass keeps ([`ScriptedEngine::drafting`]); 1 without a
+    /// draft.
+    rows: usize,
     ctx_max: usize,
     tok: Arc<dyn Tokenizer>,
 }
@@ -1584,9 +1594,18 @@ impl ScriptedEngine {
             at: 0,
             pos: 0,
             started: false,
+            rows: 1,
             ctx_max,
             tok: Arc::new(MockTokenizer),
         }
+    }
+
+    /// The same engine drafting: a pass keeps the script's next `rows` ids,
+    /// its draft always right, up to the end of generation. It grants no
+    /// cut, so it does not cut into its passes.
+    #[must_use]
+    pub fn drafting(self, rows: usize) -> Self {
+        ScriptedEngine { rows, ..self }
     }
 
     /// Consumes `ids` as the script's next ones, stopping at the first the
@@ -1687,9 +1706,7 @@ impl Engine for ScriptedEngine {
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
         self.pos += ids.len();
         if self.started {
-            // A call's first id re-feeds the last one consumed.
-            let skip = usize::from(self.at > 0 && ids.first() == self.script.get(self.at - 1));
-            self.consume(&ids[skip..]);
+            self.consume(ids);
         }
         Ok(())
     }
@@ -1719,6 +1736,25 @@ impl Engine for ScriptedEngine {
             }
         }
         Ok(id)
+    }
+
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        let mut id = self.next(last, None)?;
+        out.push(id);
+        let mut kept = 0;
+        while kept + 1 < self.rows && id != self.tok.eos() {
+            id = self.next(id, None)?;
+            out.push(id);
+            kept += 1;
+        }
+        Ok(Drafted {
+            proposed: kept,
+            accepted: kept,
+        })
+    }
+
+    fn advance_rows(&self) -> usize {
+        self.rows
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {
@@ -1785,6 +1821,21 @@ mod tests {
         let mut d = m.decoder();
         let streamed: String = ids.iter().filter_map(|&id| d.push(id)).collect();
         assert_eq!(streamed, text);
+    }
+
+    /// A jump arm's call feeds the id the last step answered, then the run:
+    /// each is the script's next id, a repeat of the one before it too, so
+    /// the script "aab" ends at its end.
+    #[test]
+    fn a_scripted_call_consumes_a_repeated_id() {
+        let t = MockTokenizer;
+        let (a, b) = (t.encode("a")[0], t.encode("b")[0]);
+        let mut e = ScriptedEngine::from_ids(64, vec![a, a, b]);
+        let prompt = t.encode("hi");
+        e.prefill(&prompt[..prompt.len() - 1]).expect("fits");
+        assert_eq!(e.next(prompt[prompt.len() - 1], None).expect("fits"), a);
+        assert_eq!(e.next(a, None).expect("fits"), a);
+        assert_eq!(e.next_after(&[a, b], None).expect("fits"), t.eos());
     }
 
     #[test]

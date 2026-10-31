@@ -45,8 +45,19 @@
 //! largest logit among the ids the program allows there, or for a request that
 //! samples or penalizes its sampler's draw with every other id masked out —
 //! and once the program is spent the vocabulary's stop ids are the only ones
-//! left. The request's `logit_bias` is added before the mask, so it reorders
-//! allowed ids and lets in no other; a fixed id takes no bias. The row is
+//! left. A watch (a `tool_choice: auto` request's program) picks nothing
+//! while it waits in free text: unless it changes its rows, it takes the
+//! passes free text takes on an engine that cuts into its passes
+//! ([`Engine::cuts_into_passes`]), steps on any other, reads no row a greedy
+//! request does not, and each id taken is watched for the call opener. From
+//! the opener it steps row by row to the call's close; where a pass kept ids
+//! past the opener, they are dropped and the slot is cut back to the opener
+//! ([`Need::Back`], [`Slot::rewind`]), never reset, so no id after it is free
+//! text's. A sampled pass that
+//! ran past an opener drew those ids, so its draws past the opener are not a
+//! plain run's of the same seed. The request's `logit_bias` is added before
+//! the mask, so it reorders allowed ids and lets in no other; a fixed id
+//! takes no bias. The row is
 //! read only where the pick needs it: a token the program
 //! fixes (a forced id, the only child of a choice's node) asks the engine for
 //! none unless the request wants probabilities. A pick the program cannot make ends the request with a
@@ -509,17 +520,34 @@ fn biased(mut draw: Option<Sampler>, bias: Bias) -> Sampler {
 
 /// Whether a request takes its tokens after the first through the engine's
 /// passes when the engine drafts: one that asks for no probabilities
-/// (`asks`) and follows no program (`constrained`, whose every token is
-/// picked from its own row), greedy ([`Engine::advance`]) or drawing (it
-/// samples or changes its rows, [`biased`]) on an engine that drafts sampled
-/// requests ([`Engine::advance_sampled`]).
+/// (`asks`) and picks no token from a program's row (`picks_rows`: a program
+/// that starts at once, or a watch that changes its rows), greedy
+/// ([`Engine::advance`]) or drawing (it samples or changes its rows,
+/// [`biased`]) on an engine that drafts sampled requests
+/// ([`Engine::advance_sampled`]). A watch (`watches`) passes only on an engine
+/// that cuts into its passes ([`Engine::cuts_into_passes`]), since the opener
+/// a pass runs past is cut back to, and only while it waits in free text
+/// ([`Gen::pump`]); on any other engine it steps, reading no row while it
+/// waits unless it draws.
 fn takes_passes(
     sampler: Option<&Sampler>,
     asks: bool,
-    constrained: bool,
+    picks_rows: bool,
+    watches: bool,
     engine: &dyn Engine,
 ) -> bool {
-    !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
+    !asks
+        && !picks_rows
+        && (!watches || engine.cuts_into_passes())
+        && (sampler.is_none() || engine.drafts_sampled())
+}
+
+/// Whether `p`'s program is a watch: it waits in free text for a call
+/// opener ([`takes_passes`]).
+fn watches(p: &GenParams) -> bool {
+    p.constraint
+        .as_ref()
+        .is_some_and(Constraint::waits_for_call)
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -1455,6 +1483,27 @@ impl Slot {
         }));
     }
 
+    /// The selected slot taken back to its first `n` positions, a position
+    /// inside its last pass, by [`Engine::cut`]: asked only of an engine
+    /// that [`Engine::cuts_into_passes`]. One that grants less than `n` is the
+    /// named error, never a reset or ids fed again.
+    fn rewind(&mut self, n: usize) -> Result<(), EngineError> {
+        self.settle(self.cur)?;
+        let held = self.held.len();
+        let k = self.engine.keepable(n);
+        if k != n || n > held {
+            return Err(EngineError(format!(
+                "a take-back to {n} of the {held} positions the slot holds: the engine keeps {k} \
+                 of them, though it cuts into its passes"
+            )));
+        }
+        if n < held {
+            self.rows()?.cut(n)?;
+            self.held.truncate(n);
+        }
+        Ok(())
+    }
+
     /// `next` that books what it fed.
     pub(crate) fn next(
         &mut self,
@@ -1853,6 +1902,11 @@ pub(crate) enum Need {
     /// ([`Gen::fill`]): the engine thread runs it like a prompt's call, and
     /// the request's [`Need::Step`] follows. It is never part of a step.
     Fill,
+    /// A watch's call opener that a pass ran past ([`Gen::back`]): the slot
+    /// taken back to the opener's position and the opener stepped, as a
+    /// call of the request's own the engine thread runs like a fill. It is
+    /// never part of a step.
+    Back(u32),
     /// Nothing more: [`Gen::finish`] ends it.
     Done,
 }
@@ -2025,8 +2079,13 @@ pub(crate) struct Gen {
     truncated: bool,
     /// A pass's rows; 1 steps. A request passes when it is greedy, or draws
     /// (samples or changes its rows) on an engine that drafts sampled
-    /// requests.
+    /// requests, and picks no token from a program's row ([`takes_passes`]).
     rows: usize,
+    /// Whether the request picks its tokens from a program's rows from its
+    /// first: a program that starts at once, or a watch that changes its
+    /// rows (the walk applies the change, which a pass would not). A watch
+    /// that changes none waits in free text on the path free text takes.
+    picks_rows: bool,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
@@ -2131,10 +2190,15 @@ impl Gen {
                 0
             }
         ];
+        let picks_rows = p
+            .constraint
+            .as_ref()
+            .is_some_and(|c| !c.waits_for_call() || !bias.is_empty());
         let rows = if takes_passes(
             sampler.as_ref(),
             probs.is_some(),
-            p.constraint.is_some(),
+            picks_rows,
+            watches(p),
             slot.engine.as_ref(),
         ) {
             slot.engine.advance_rows()
@@ -2164,6 +2228,7 @@ impl Gen {
             stopping_word: String::new(),
             truncated: false,
             rows,
+            picks_rows,
             kept: Vec::with_capacity(rows),
             taken: 0,
             lent: Vec::new(),
@@ -2219,10 +2284,13 @@ impl Gen {
     /// The logits buffer a step writes, or `None` on a greedy request and on
     /// a step whose token the program fixes, unless probabilities were asked.
     /// Nor does a greedy request that changes no row while its program is
-    /// held: its reasoning takes the engine's argmax.
+    /// held, or while its watch waits in free text: its reasoning and its
+    /// free text take the engine's argmax.
     pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
         let unread = self.walk.as_mut().is_some_and(Walk::fixed_next)
-            || (self.held.is_some() && self.greedy && self.bias.add.is_empty());
+            || ((self.held.is_some() || self.walk.as_ref().is_some_and(Walk::waiting))
+                && self.greedy
+                && self.bias.add.is_empty());
         if unread && self.probs.is_none() {
             return None;
         }
@@ -2245,6 +2313,11 @@ impl Gen {
             return id;
         }
         if let Some(walk) = self.walk.as_mut() {
+            // A watch's free text takes the engine's argmax unread, the
+            // whole row's ([`Gen::logits_out`]).
+            if walk.waiting() && self.greedy && self.bias.add.is_empty() {
+                return g;
+            }
             let row = if self.bias.add.is_empty() || walk.fixed_next() {
                 &self.logits
             } else {
@@ -2293,6 +2366,15 @@ impl Gen {
             None if biased => sampling::argmax(row),
             _ => g,
         }
+    }
+
+    /// Whether the request's program is a watch standing in free text: its
+    /// walk, or the walk held while the model reasons.
+    fn watching(&mut self) -> bool {
+        self.walk
+            .as_mut()
+            .or(self.held.as_mut())
+            .is_some_and(Walk::in_free_text)
     }
 
     /// Whether a close id is queued to force: the budget spent with the span
@@ -2363,7 +2445,7 @@ impl Gen {
                 if let Some(w) = self.walk.as_mut() {
                     // The text past the span's end was taken freely; a
                     // waiting walk reads it for its opener.
-                    w.fed(&s.content, &s.specials);
+                    w.fed(&s.content, &s.specials)?;
                 }
                 return Ok(false);
             }
@@ -2427,7 +2509,8 @@ impl Gen {
         let passes = takes_passes(
             self.sampler.as_ref(),
             self.probs.is_some(),
-            self.walk.is_some() || self.held.is_some(),
+            self.picks_rows,
+            watches(p),
             slot.engine.as_ref(),
         );
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
@@ -2672,6 +2755,7 @@ impl Gen {
             if self.bias.banned.contains(&tok) {
                 return Err(GenError::Banned(tok));
             }
+            let watched = self.watching();
             self.generated.push(tok);
             if self.sampler.is_some() {
                 self.history.push(tok);
@@ -2690,10 +2774,20 @@ impl Gen {
                 break;
             }
             let piece = self.dec.push(tok);
-            // The stream's text, before the next pick: a walk watching for
-            // its format's call opener reads it here.
+            // The id and the stream's text, before the next pick: a walk
+            // watching for its format's call opener reads them here, whether
+            // a pick or a pass took the id. Bytes the decoder still holds
+            // once the opener is in are text after it that no piece showed
+            // the program.
             if let Some(w) = self.walk.as_mut() {
-                w.saw(piece.as_deref().unwrap_or(""));
+                w.saw(tok, piece.as_deref().unwrap_or(""))?;
+                if watched && !w.waiting() && !self.dec.flush().is_empty() {
+                    return Err(GenError::Constrained(StepError::NoAllowed {
+                        taken: self.generated.len(),
+                        why: "the call opener's id also wrote part of a character after it"
+                            .to_owned(),
+                    }));
+                }
             }
             // Where a special id's text is in its piece: the piece ends with
             // it, after any bytes the decoder held.
@@ -2770,6 +2864,14 @@ impl Gen {
             }
             // The last pass evaluated this token already.
             if let Some(&t) = self.kept.get(self.taken) {
+                // A call opener the pass ran past: the ids it kept after the
+                // opener are free text's, not the program's, so they are
+                // dropped and the opener is stepped again where the engine
+                // stands back at it ([`Need::Back`]).
+                if watched && !self.watching() {
+                    self.kept.truncate(self.taken);
+                    return Ok(Need::Back(tok));
+                }
                 self.taken += 1;
                 self.tok = Some(t);
                 continue;
@@ -2791,10 +2893,12 @@ impl Gen {
             }
             // A pass takes `rows` positions from there, and every token it
             // keeps spends the think budget: it starts only while the budget
-            // holds them all, so no kept token spends past the cap.
+            // holds them all, so no kept token spends past the cap. A watch
+            // passes only in free text; inside a call it steps.
             if self.rows > 1
                 && self.think_left() >= self.rows
                 && n + len + self.rows - 1 <= self.ctx_max
+                && self.walk.as_mut().is_none_or(Walk::in_free_text)
             {
                 return Ok(if self.sampler.is_some() {
                     Need::Sampled(tok)
@@ -2805,6 +2909,17 @@ impl Gen {
             return Ok(Need::Step(tok));
         }
         Ok(Need::Done)
+    }
+
+    /// The call of a [`Need::Back`]: the slot taken back to the position of
+    /// `opener`, the id a pass kept past it dropped ([`Slot::rewind`]), and
+    /// `opener` stepped with the row the program's first pick reads, as a
+    /// [`Need::Step`]'s answer.
+    pub(crate) fn back(&mut self, slot: &mut Slot, opener: u32) -> Result<(), EngineError> {
+        slot.rewind(self.n + self.generated.len() - 1)?;
+        let g = slot.next(opener, self.logits_out())?;
+        self.stepped(g);
+        Ok(())
     }
 
     /// The engine's answer `g` to a [`Need::Step`].
@@ -3106,6 +3221,7 @@ impl Gen {
                 }
                 Need::Sampled(t) => self.advance_sampled(slot, t)?,
                 Need::Fill => self.fill(slot, quantum)?,
+                Need::Back(t) => self.back(slot, t)?,
             }
         }
     }

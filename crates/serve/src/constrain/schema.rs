@@ -98,6 +98,11 @@ pub(crate) struct Ask<'a> {
     /// The tags of the model's think span: a prompt that left the span open
     /// has it closed with `think.close` before the program.
     pub think: ThinkTags,
+    /// Whether `tool_choice: auto` arms the call watch: the engine cuts into
+    /// its passes ([`crate::Engine::cuts_into_passes`]). Without it such a
+    /// request has no program and its calls are the parser's alone; a forced
+    /// call and a `response_format` compile theirs either way.
+    pub watches: bool,
 }
 
 /// The refusal of the request field at `path`, its message led by the path.
@@ -708,13 +713,31 @@ pub(crate) fn object_parameters(
 /// object rule builds this shape for an object no property of which is
 /// required. Each property's bare parts are built once and shared
 /// ([`Part::Run`]): the alternatives repeat them, and a schema costs its
-/// size, not their product.
+/// size, not their product. The alternatives' forks grow as the square of
+/// the properties, so more of them than [`MAX_SCHEMAS`] is outside the
+/// subset, refused before any is built.
 pub(crate) fn any_start(
     args: &[&Arg<'_>],
     bare: &impl Fn(&Arg<'_>) -> Result<Vec<Part>, Refusal>,
     sep: &str,
     none: Vec<Part>,
 ) -> Result<Part, Refusal> {
+    let n = args.len();
+    let forks = n.saturating_mul(n.saturating_add(1)) / 2;
+    if forks > MAX_SCHEMAS {
+        let at = args.first().map_or("", |a| {
+            a.path
+                .strip_suffix(&format!(".properties.{}", a.key))
+                .unwrap_or(&a.path)
+        });
+        return Err(outside(
+            at,
+            format!(
+                "{n} optional properties and none required: any may come first, which takes \
+                 {forks} alternatives, more than the {MAX_SCHEMAS} schemas a request may write"
+            ),
+        ));
+    }
     let members: Vec<Arc<[Part]>> = args
         .iter()
         .map(|a| bare(a).map(Arc::from))
@@ -1057,7 +1080,9 @@ fn watch(
     let Some(text) = call.opener else {
         return Ok(None);
     };
-    let prog = match program::compile(&call.parts, env) {
+    // The text after the opener in the piece that wrote it enters the
+    // program at any character of its first text ([`program::Walk::saw`]).
+    let prog = match program::compile_in(&call.parts, env, true) {
         Ok(prog) => prog,
         Err(r) => return unwatched(r),
     };
@@ -1106,11 +1131,18 @@ pub(crate) fn request(
         Style::Json
     };
     // `tool_choice: auto` (or none given) with tools to scan for: the
-    // program starts where the model opens a call itself. A request without
-    // tools, a format no watch reads, and a JSON `response_format` (which
-    // keeps its own one program below) have none.
+    // program starts where the model opens a call itself, on an engine that
+    // cuts into its passes. A request without tools, a format no watch reads,
+    // a drafting engine that keeps no cut into its passes, and a JSON
+    // `response_format` (which keeps its own one program below) have none.
     if forces.is_none() && matches!(reply, Reply::Text) && parses_tools(o) {
-        return watch(o, ask, &env);
+        // An invalid tool schema is refused whether a watch is armed or not.
+        return if ask.watches {
+            watch(o, ask, &env)
+        } else {
+            o.get("tools").map(valid::tools).transpose()?;
+            Ok(None)
+        };
     }
     let call = forces.is_some();
     let (prog, rules) = match (reply, &forces) {

@@ -974,7 +974,9 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   invalid (`required` names a property it does not hold, a type that is no JSON Schema type, a `$ref` that points
   nowhere) is a 400 as under a forced choice; a valid one outside the subset above (a list of types, `pattern`, an
   array with no `items`, …) leaves every call of that request unwatched, as before. Muse Spark's replies and
-  Qwen3-Coder's bare first call (`<function=NAME>` with no `<tool_call>`) are not watched.
+  Qwen3-Coder's bare first call (`<function=NAME>` with no `<tool_call>`) are not watched. With drafting on (MTP,
+  DSpark or lookup) the auto watch is off: the reply takes the draft's passes and its calls are the parser's alone. An
+  invalid tool schema is still a 400, and a forced call and a `response_format` stay constrained.
 - A prompt that leaves the think span open (thinking on) is read by what the program writes. A JSON `response_format`
   closes the span at once and writes the document after it. A `tool_choice` that forces a call lets the model reason
   freely, with the request's sampling and `logit_bias`, until it generates the span's close itself, and the call's

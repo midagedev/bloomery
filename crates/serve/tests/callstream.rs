@@ -33,14 +33,19 @@ const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 
 /// The long text of `content`: twelve lines, each with quotes, a backslash, a
 /// tab, non-ASCII text and a near-tag of every markup (each shares a prefix
-/// with a tag that ends a value or a call, and is not one).
-/// A value the watch's program writes holds none of what its quoting refuses
-/// (a JSON string body takes no quote, backslash or control byte, and the
-/// chat formats' raw values no byte of their own closers): words, digits and
-/// unicode carry the streaming.
+/// with a tag that ends a value or a call, and is not one). No watched call
+/// writes it — a JSON string the watch's program writes takes no quote,
+/// backslash or control byte, and a raw value no byte of its markup's closers
+/// — so the server gates send their tools unwatched ([`body`]) and the
+/// parser gates read it under every cut.
 fn content() -> String {
     (0..12)
-        .map(|i| format!("line {i}: 서울 ☃ snowman über {i}; "))
+        .map(|i| {
+            format!(
+                "line {i}: \"quoted\" \\ back\ttab 서울 ☃ </arg_value x> </｜DSML｜ parameter x> \
+                 </parameter x> </tool_ca x>\n"
+            )
+        })
         .collect()
 }
 
@@ -132,14 +137,17 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// The request the server gates send: its tools unwatched, so the script's
+/// call, whose [`content`] no watched program writes, reaches the scan as
+/// the model wrote it.
 fn body(stream: bool) -> Value {
-    json!({
+    common::unwatched(json!({
         "model": "m",
         "messages": [{"role": "user", "content": "write it"}],
         "temperature": 0,
         "tools": tools(),
         "stream": stream,
-    })
+    }))
 }
 
 /// The `tool_calls` deltas of a streamed chat body in order, and whether a

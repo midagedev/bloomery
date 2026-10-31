@@ -13,7 +13,7 @@ use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
 use crate::api::logprobs::Ask as Probs;
 use crate::callstream::CallPiece;
 use crate::dsml::{ChatParser, DsmlScan, MarkupError, Spelling, ToolFormat, Tools};
-use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
+use crate::engine::{Decoder, Drafted, Engine, EngineError, SamplingParams, Tokenizer};
 use crate::genloop::{
     Event, GenError, GenParams, Outcome, Slot, StopKind, Timings, generate, generate_in_quanta,
 };
@@ -335,6 +335,7 @@ fn build(
             vocab: &vocab,
             format,
             think: ThinkTags::THINK,
+            watches: true,
         },
     )
     .map(|c| c.expect("the body asks for a constraint"))
@@ -917,11 +918,14 @@ fn a_schema_is_refused_before_it_grows_past_its_budget() {
             .message
     };
     let over = "the schema passes 67108864 bytes once its $refs are written out";
+    // One property is required, so the optional ones follow it one by one
+    // and the written-out bytes, not the alternatives of an object any of
+    // whose properties may come first, are what each tool spends.
     let large = |refs: usize| {
         let props: Map<String, Value> = (0..refs)
             .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/large"})))
             .collect();
-        json!({"type": "object", "properties": props,
+        json!({"type": "object", "properties": props, "required": ["p0"],
             "$defs": {"large": {"const": "a".repeat(65 * 1024)}}})
     };
     let e = refused(large(1024));
@@ -3469,6 +3473,7 @@ fn none_unwatched_and_json_replies_build_no_watch() {
         vocab: &vocab,
         format,
         think: ThinkTags::THINK,
+        watches: true,
     };
     for (format, body) in [
         (
@@ -3539,6 +3544,7 @@ fn a_null_required_or_properties_reads_as_absent() {
                 vocab: &vocab,
                 format: ToolFormat::Hermes,
                 think: ThinkTags::THINK,
+                watches: true,
             },
         )
         .unwrap_or_else(|e| panic!("{parameters}: {e}"));
@@ -3561,6 +3567,7 @@ fn a_required_property_with_no_schema_is_outside_the_subset() {
         vocab: &vocab,
         format: ToolFormat::Hermes,
         think: ThinkTags::THINK,
+        watches: true,
     };
     for schema in [
         json!({"type": "object", "properties": {}, "required": ["x"],
@@ -3613,6 +3620,7 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
                 vocab: &vocab,
                 format,
                 think: ThinkTags::THINK,
+                watches: true,
             },
         )
     };
@@ -3717,6 +3725,7 @@ fn an_invalid_node_is_refused_beside_an_outside_one() {
         vocab: &vocab,
         format,
         think: ThinkTags::THINK,
+        watches: true,
     };
     let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
     // The schema, and the path under it of the invalid node.
@@ -3823,6 +3832,7 @@ fn an_invalid_tool_is_refused_after_an_outside_one() {
                     vocab: &vocab,
                     format,
                     think: ThinkTags::THINK,
+                    watches: true,
                 },
             )
             .expect_err(&format!("{format:?} {body}"));
@@ -3992,6 +4002,7 @@ fn a_schema_is_invalid_on_every_route_or_on_none() {
             vocab: &vocab,
             format,
             think: ThinkTags::THINK,
+            watches: true,
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             request(body.as_object().unwrap(), &ask)
@@ -4534,4 +4545,439 @@ fn a_dsml_invoke_with_no_parameter_written_keeps_its_empty_line() {
     assert_eq!(m.calls.len(), 1, "{}", o.content);
     assert_eq!(m.calls[0].arguments, "{}", "{}", o.content);
     assert_eq!(o.stop, StopKind::Eos);
+}
+
+/// `tool_choice: auto` arms its watch only on an engine that cuts into its
+/// passes: on one that does not, the request has no program, while a forced
+/// call and a `response_format` compile theirs as before.
+#[test]
+fn an_auto_watch_is_armed_only_on_an_engine_that_cuts_into_its_passes() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let tools = json!([{"type": "function", "function": {"name": "edit",
+        "parameters": {"type": "object", "properties": {"n": {"type": "integer"}}}}}]);
+    let plan = |body: Value, watches: bool| {
+        request(
+            body.as_object().expect("a body"),
+            &Ask {
+                tok: &*tok,
+                vocab: &vocab,
+                format: QWEN,
+                think: ThinkTags::THINK,
+                watches,
+            },
+        )
+        .expect("served")
+    };
+    let auto = json!({"tools": tools, "tool_choice": "auto"});
+    assert!(plan(auto.clone(), true).is_some_and(|c| c.waits_for_call()));
+    assert!(plan(auto, false).is_none());
+    let forced = json!({"tools": tools, "tool_choice": "required"});
+    assert!(plan(forced, false).is_some_and(|c| !c.waits_for_call()));
+    let format = json!({"tools": tools, "response_format": {"type": "json_object"}});
+    assert!(plan(format, false).is_some_and(|c| !c.waits_for_call()));
+    // An invalid schema is refused with no watch to arm too.
+    let invalid = json!({"tools": [{"type": "function", "function": {"name": "edit",
+        "parameters": {"type": "object", "required": [7]}}}], "tool_choice": "auto"});
+    let refused = request(
+        invalid.as_object().expect("a body"),
+        &Ask {
+            tok: &*tok,
+            vocab: &vocab,
+            format: QWEN,
+            think: ThinkTags::THINK,
+            watches: false,
+        },
+    )
+    .expect_err("an invalid schema is refused");
+    assert!(!refused.outside_subset, "{}", refused.message);
+}
+
+/// What a [`Passes`] engine was asked, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// A step, and whether its row was read.
+    Step(bool),
+    /// A drafted pass.
+    Pass,
+    /// A cut to this many positions.
+    Cut(usize),
+    /// A reset.
+    Reset,
+}
+
+/// A drafting engine whose row at each position after the prompt's last is
+/// [`Rows`]' row at that step: it favours `want`'s id there, the end of
+/// generation once `want` is spent. A pass keeps three ids, its draft always
+/// right, and a cut takes positions back, so the rows follow the positions
+/// fed whatever the calls were. One that does not `keep` grants no cut and
+/// says it does not cut into its passes.
+struct Passes {
+    tok: Arc<dyn Tokenizer>,
+    want: Vec<u32>,
+    keep: bool,
+    pos: usize,
+    /// The position of the prompt's last id, once stepped.
+    start: Option<usize>,
+    asked: Arc<Mutex<Vec<Asked>>>,
+}
+
+impl Passes {
+    /// The row after position `pos`, and its argmax.
+    fn row(&self) -> (Vec<f32>, u32) {
+        let k = self.pos - self.start.expect("the prompt's last id was stepped");
+        let mut row: Vec<f32> = (0..self.tok.n_vocab())
+            .map(|i| ((i * 37 + k * 11) % 17) as f32 * 0.1)
+            .collect();
+        let id = self.want.get(k).copied().unwrap_or_else(|| self.tok.eos());
+        row[id as usize] = 10.0;
+        (row, id)
+    }
+
+    fn ask(&self, a: Asked) {
+        self.asked.lock().expect("the log").push(a);
+    }
+}
+
+impl Engine for Passes {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::clone(&self.tok)
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.pos += ids.len();
+        Ok(())
+    }
+    fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.ask(Asked::Step(out.is_some()));
+        self.start.get_or_insert(self.pos);
+        let (row, id) = self.row();
+        self.pos += 1;
+        if let Some(out) = out {
+            out.copy_from_slice(&row);
+        }
+        Ok(id)
+    }
+    fn advance(&mut self, _last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.ask(Asked::Pass);
+        for _ in 0..3 {
+            out.push(self.row().1);
+            self.pos += 1;
+        }
+        Ok(Drafted {
+            proposed: 2,
+            accepted: 2,
+        })
+    }
+    fn advance_rows(&self) -> usize {
+        3
+    }
+    fn cuts_into_passes(&self) -> bool {
+        self.keep
+    }
+    fn keepable(&self, n: usize) -> usize {
+        if self.keep { n.min(self.pos) } else { 0 }
+    }
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.ask(Asked::Cut(n));
+        self.pos = n;
+        Ok(())
+    }
+    /// Asked of the reply once the prompt's last id was stepped; the reset a
+    /// fresh slot's request opens with is not the reply's.
+    fn reset(&mut self) -> Result<(), EngineError> {
+        if self.start.is_some() {
+            self.ask(Asked::Reset);
+        }
+        self.pos = 0;
+        Ok(())
+    }
+    fn ctx_max(&self) -> usize {
+        4096
+    }
+    fn describe(&self) -> String {
+        "passes".to_owned()
+    }
+}
+
+/// One greedy generation of `c` from "hi" on a [`Passes`] engine whose rows
+/// favour `want`, the jump arm `jump`, that grants a cut where `keep`, and
+/// what the engine was asked.
+fn run_passes(
+    tok: &Arc<dyn Tokenizer>,
+    c: Option<Constraint>,
+    want: &[u32],
+    jump: bool,
+    keep: bool,
+) -> (Outcome, Vec<Asked>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut slot = Slot::new(Box::new(Passes {
+        tok: Arc::clone(tok),
+        want: want.to_vec(),
+        keep,
+        pos: 0,
+        start: None,
+        asked: Arc::clone(&asked),
+    }))
+    .schema_jump(jump);
+    let o = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &params(c, ThinkEntry::Closed),
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    )
+    .expect("a generation");
+    let asked = asked.lock().expect("the log").clone();
+    (o, asked)
+}
+
+/// A waiting watch costs a request nothing: on a drafting engine a
+/// `tool_choice: auto` request with tools takes the passes free text takes
+/// and reads no row until the opener. There it steps, the engine taken back
+/// to the opener where a pass kept ids past it, and every id after the
+/// opener is the program's: the Python literal the rows favour never lands.
+/// Wherever the opener's last id falls in a pass, on either arm, the answer
+/// is the one the step arm gives over the same rows, and nothing is reset.
+#[test]
+fn a_waiting_watch_takes_the_passes_and_its_call_the_rows() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let prompt = tok.encode("hi").len();
+    for lead in ["a", "ab", "abc"] {
+        let mut want = ids(&tok, &format!("sure {lead}. "));
+        want.extend(ids(&tok, CALL_OPEN));
+        // The generated index of the opener's last id.
+        let opener = want.len() - 1;
+        want.extend(cycling(b"[{'a': 1}]", 40));
+        let stepped = run(
+            &tok,
+            Some(build(&tok, QWEN, &body).expect("served")),
+            ThinkEntry::Closed,
+            &want,
+        );
+        for jump in [false, true] {
+            let label = format!("lead={lead} jump={jump}");
+            let c = build(&tok, QWEN, &body).expect("served");
+            let (o, asked) = run_passes(&tok, Some(c), &want, jump, true);
+            assert!(!asked.contains(&Asked::Reset), "{label}: {asked:?}");
+            assert_eq!(o.content, stepped.content, "{label}");
+            assert_eq!(o.tokens, stepped.tokens, "{label}");
+            // The prompt's step, then passes that read no row up to the
+            // pass that keeps the opener: the first id from the prompt's
+            // step, three a pass.
+            let passes = opener.div_ceil(3);
+            assert_eq!(asked[0], Asked::Step(false), "{label}: {asked:?}");
+            assert!(
+                asked[1..=passes].iter().all(|a| *a == Asked::Pass),
+                "{label}: {asked:?}"
+            );
+            // An opener inside a pass takes the engine back to it; one that
+            // ends a pass stands where the engine does.
+            let next = asked.get(passes + 1).copied();
+            if opener.is_multiple_of(3) {
+                assert!(matches!(next, Some(Asked::Step(_))), "{label}: {asked:?}");
+            } else {
+                assert_eq!(
+                    next,
+                    Some(Asked::Cut(prompt + opener)),
+                    "{label}: {asked:?}"
+                );
+            }
+            let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+            m.try_push(&o.content, &o.specials)
+                .and_then(|_| m.try_finish())
+                .expect("the answer parses");
+            let m = m.message();
+            assert_eq!(m.calls.len(), 1, "{label}: {}", o.content);
+            assert!(
+                serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| v["edits"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(Value::is_i64))),
+                "{label}: {}",
+                o.content
+            );
+            assert!(o.content.starts_with(&format!("sure {lead}. ")), "{label}");
+        }
+    }
+}
+
+/// A request with no tools takes the drafting engine's passes as it did:
+/// the prompt's step reads no row, every id after it comes from a pass, and
+/// nothing is taken back.
+///
+/// Whether the engine cuts into its passes does not matter to it.
+#[test]
+fn a_request_with_no_tools_keeps_its_passes() {
+    let tok = bytes_tok();
+    let want = ids(&tok, "plain text, no call <tool_call> at all");
+    for keep in [true, false] {
+        let (o, asked) = run_passes(&tok, None, &want, true, keep);
+        assert_eq!(o.content, "plain text, no call <tool_call> at all");
+        assert_eq!(asked[0], Asked::Step(false), "keep={keep}: {asked:?}");
+        assert!(
+            asked[1..].iter().all(|a| *a == Asked::Pass),
+            "keep={keep}: {asked:?}"
+        );
+        assert_eq!(
+            asked.len(),
+            1 + want.len().div_ceil(3),
+            "keep={keep}: {asked:?}"
+        );
+    }
+}
+
+/// On a drafting engine that does not cut into its passes, a watch steps
+/// while it waits, reading no row, and the engine is never reset nor cut:
+/// a pass that ran past the opener would leave a reset and the whole context
+/// fed again as the only way back. The answer is the step arm's, on either
+/// arm.
+#[test]
+fn a_watch_on_an_engine_that_cuts_no_pass_steps_and_never_resets() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    for lead in ["ab", "abc", "a"] {
+        let mut want = ids(&tok, &format!("sure {lead}. "));
+        want.extend(ids(&tok, CALL_OPEN));
+        let opener = want.len() - 1;
+        want.extend(cycling(b"[{'a': 1}]", 40));
+        let stepped = run(
+            &tok,
+            Some(build(&tok, QWEN, &body).expect("served")),
+            ThinkEntry::Closed,
+            &want,
+        );
+        for jump in [false, true] {
+            let label = format!("lead={lead} jump={jump}");
+            let c = build(&tok, QWEN, &body).expect("served");
+            let (o, asked) = run_passes(&tok, Some(c), &want, jump, false);
+            assert_eq!(o.content, stepped.content, "{label}");
+            assert_eq!(o.tokens, stepped.tokens, "{label}");
+            assert!(
+                !asked
+                    .iter()
+                    .any(|a| matches!(a, Asked::Reset | Asked::Cut(_))),
+                "{label}: {asked:?}"
+            );
+            assert!(
+                asked.iter().all(|a| matches!(a, Asked::Step(_))),
+                "{label}: {asked:?}"
+            );
+            // The prompt's step and one a free-text id up to the opener's
+            // last, none reading its row.
+            assert!(
+                asked[..=opener].iter().all(|a| *a == Asked::Step(false)),
+                "{label}: {asked:?}"
+            );
+        }
+    }
+}
+
+/// The pieces a text opener splits into, the second carrying what follows
+/// it: the program's own newline, or a byte no call program starts with.
+const SPLIT_OPENER: [&str; 3] = ["<tool_call", ">\n", ">x"];
+
+/// A text opener split over decoded pieces opens the watch, and the text
+/// after it in the piece that ends it is the program's first: the call that
+/// follows is held to its schema. Text after the opener that the program
+/// does not start with is the named error, never free text inside a call.
+#[test]
+fn a_text_opener_split_over_pieces_opens_the_watch() {
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::new(PieceTok(&SPLIT_OPENER))));
+    let piece = |text: &str| PieceTok(&SPLIT_OPENER).piece(text);
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let mut want = ids(&tok, "sure. ");
+    want.extend([piece("<tool_call"), piece(">\n")]);
+    want.extend(cycling(b"[{'a': 1}]", 40));
+    let o = run(
+        &tok,
+        Some(build(&tok, QWEN, &body).expect("served")),
+        ThinkEntry::Closed,
+        &want,
+    );
+    let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+    m.try_push(&o.content, &o.specials)
+        .and_then(|_| m.try_finish())
+        .expect("the answer parses");
+    let m = m.message();
+    assert_eq!(m.calls.len(), 1, "{}", o.content);
+    assert!(
+        serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| v["edits"]
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_i64))),
+        "{}",
+        o.content
+    );
+    assert!(
+        o.content.starts_with("sure. <tool_call>\n"),
+        "{}",
+        o.content
+    );
+    let mut want = ids(&tok, "sure. ");
+    want.extend([piece("<tool_call"), piece(">x")]);
+    let p = params(
+        Some(build(&tok, QWEN, &body).expect("served")),
+        ThinkEntry::Closed,
+    );
+    let mut slot = Slot::new(Box::new(Rows {
+        tok: Arc::clone(&tok),
+        want,
+        k: 0,
+        read: Arc::new(Mutex::new(Vec::new())),
+    }))
+    .schema_jump(false);
+    let Err(e) = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    ) else {
+        panic!("text after the opener outside the program");
+    };
+    assert!(
+        matches!(&e, GenError::Constrained(super::StepError::NoAllowed { why, .. })
+            if why.contains("after the call opener")),
+        "{e}"
+    );
+}
+
+/// An object of many optional properties none of which is required is
+/// refused by name before its alternatives are built: any of them may come
+/// first, so the alternatives grow as the square of the properties.
+#[test]
+fn an_object_of_many_optional_properties_is_refused_before_it_is_built() {
+    let tok = bytes_tok();
+    for n in [91, 4000] {
+        let props: Map<String, Value> = (0..n)
+            .map(|i| (format!("p{i}"), json!({"type": "integer"})))
+            .collect();
+        let e = build(
+            &tok,
+            ToolFormat::Hermes,
+            &schema_body(&json!({"type": "object", "properties": props})),
+        )
+        .expect_err("over the schema budget");
+        assert!(
+            e.outside_subset
+                && e.message
+                    .contains(&format!("{n} optional properties and none required")),
+            "{n}: {e}"
+        );
+    }
 }

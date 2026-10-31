@@ -43,11 +43,13 @@
 //!
 //! A watched program ([`Opener`], a `tool_choice: auto` request) stands in
 //! free text before and between its runs: every id allowed, the pick plain
-//! greedy or the request's sampler over the whole row, and the ids taken
-//! watched for the chat format's call opener — the one special token the
-//! vocabulary holds for it, or its characters ending a piece of ordinary
-//! ones. Where the model writes it, the program a forced call compiles runs
-//! to the call's close and the walk returns to free text.
+//! greedy or the request's sampler over the whole row, and the ids taken,
+//! by a pick or by the engine's pass, watched for the chat format's call
+//! opener ([`Walk::saw`]) — the one special token the vocabulary holds for
+//! it, or its characters in the text of ordinary ones, across pieces, the
+//! text after it in the same piece the program's first. Where the model
+//! writes it, the program a forced call compiles runs to the call's close
+//! and the walk returns to free text.
 
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
@@ -308,8 +310,9 @@ pub(crate) fn compile(parts: &[Part], env: &Env<'_>) -> Result<Program, Refusal>
 }
 
 /// `parts` as a program; `reached` says whether an end token can reach its
-/// first step (an option of a fork, or what follows a string or a number).
-fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result<Program, Refusal> {
+/// first step (an option of a fork, what follows a string or a number, or a
+/// watched call's program, which the text after its opener enters).
+pub(super) fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result<Program, Refusal> {
     let parts = merged(parts);
     let mut steps = Vec::new();
     let mut reach = reached;
@@ -1559,63 +1562,84 @@ impl Walk {
     }
 
     /// The pick of a waiting walk: any id of `row` — free text, a stop id
-    /// among them ends the answer as an unconstrained one's does. Where the
-    /// vocabulary holds the opener as one special token, its id opens the
-    /// program here; otherwise [`Walk::saw`] reads the text.
+    /// among them ends the answer as an unconstrained one's does. The id is
+    /// watched for the opener once it is taken ([`Walk::saw`]), as an id a
+    /// pass kept is.
     fn draw_free(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
         let n = u32::try_from(row.len()).expect("a row of ids fits u32");
-        let id = draw
-            .pick(row, 0..n)
-            .ok_or_else(|| self.stuck("the row holds no id the free text may take"))?;
-        self.taken += 1;
-        if self
-            .waiting
-            .as_ref()
-            .expect("a waiting walk watches an opener")
-            .special
-            == Some(id)
-        {
-            let o = Arc::clone(
-                self.waiting
-                    .as_ref()
-                    .expect("a waiting walk watches an opener"),
-            );
-            self.open(&o);
-        }
-        Ok(id)
+        draw.pick(row, 0..n)
+            .ok_or_else(|| self.stuck("the row holds no id the free text may take"))
     }
 
-    /// The text the id just taken decoded to, as the generation loop's
-    /// decoder released it, fed before the next pick: a waiting walk whose
-    /// opener no special token owns is watched for on it, ending a piece of
-    /// ordinary tokens. One id's own decode can be half a character, so the
-    /// stream's text is what an opener is read from, as the chat format's
-    /// own scan reads it.
-    pub(crate) fn saw(&mut self, text: &str) {
+    /// Whether the walk stands in free text once its heads have moved on:
+    /// [`Walk::waiting`], a call whose last id was taken counted as closed.
+    pub(crate) fn in_free_text(&mut self) -> bool {
+        self.settle();
+        self.waiting()
+    }
+
+    /// The id just taken and the text the generation loop's decoder released
+    /// for it, fed before the next pick, whether the walk picked the id or a
+    /// pass kept it: a waiting walk counts it and watches it for its opener.
+    /// Where the vocabulary holds the opener as one special token, that id
+    /// opens the program. Otherwise the opener is read on the stream's text,
+    /// across pieces, as the chat format's own scan reads it (one id's own
+    /// decode can be half a character), and the text after it in the same
+    /// piece is the program's first ([`Walk::read`]).
+    pub(crate) fn saw(&mut self, id: u32, text: &str) -> Result<(), StepError> {
         if !self.waiting() {
-            return;
+            return Ok(());
         }
+        self.taken += 1;
         let o = Arc::clone(
             self.waiting
                 .as_ref()
                 .expect("a waiting walk watches an opener"),
         );
-        if o.special.is_none() && self.wrote(text, &o) {
-            self.open(&o);
+        match o.special {
+            Some(special) => {
+                if special == id {
+                    self.open(&o);
+                }
+                Ok(())
+            }
+            None => self.read(text, &o),
         }
     }
 
-    /// Whether `text`, just taken in free text, completes the opener `o`:
-    /// the free text ends with it. The tail keeps only what a later piece
-    /// could still finish an opener with.
-    fn wrote(&mut self, text: &str, o: &Opener) -> bool {
+    /// `text`, just taken in free text, read for the text opener `o`: where
+    /// the free text holds it, the program opens and takes the text after it
+    /// in the same piece, which the program must start with — any other is
+    /// the named error, never text the call's program did not pick. The tail
+    /// keeps only what a later piece could still finish an opener with.
+    fn read(&mut self, text: &str, o: &Opener) -> Result<(), StepError> {
         self.tail.extend_from_slice(text.as_bytes());
-        let hit = self.tail.ends_with(o.text.as_bytes());
-        if self.tail.len() > o.text.len() {
-            let drop = self.tail.len() - o.text.len();
+        let Some(at) = self
+            .tail
+            .windows(o.text.len())
+            .position(|w| w == o.text.as_bytes())
+        else {
+            let drop = self.tail.len().saturating_sub(o.text.len() - 1);
             self.tail.drain(..drop);
+            return Ok(());
+        };
+        let rest = String::from_utf8(self.tail.split_off(at + o.text.len()))
+            .expect("the bytes after an opener's whole characters are whole characters");
+        self.open(o);
+        if rest.is_empty() {
+            return Ok(());
         }
-        hit
+        let mut out = Vec::new();
+        for h in std::mem::take(&mut self.heads) {
+            self.eat(h, &rest, u32::MAX, &mut out);
+        }
+        if out.is_empty() {
+            return Err(self.stuck(&format!(
+                "the text {rest:?} after the call opener is not the call program's"
+            )));
+        }
+        self.heads = out;
+        Ok(())
     }
 
     /// The call's program, started at its opener's end.
@@ -1637,20 +1661,22 @@ impl Walk {
     /// completes. Where the vocabulary holds the opener as one special token,
     /// only that token ending the content is an opener — text spelling it is
     /// content — and a piece that ran past the opener opens nothing, the
-    /// bytes after it already written. Any other walk reads none of it.
-    pub(crate) fn fed(&mut self, text: &str, specials: &[(usize, usize)]) {
+    /// bytes after it already written. A text opener is read as
+    /// [`Walk::saw`] reads one, the text after it the program's. Any other
+    /// walk reads none of it.
+    pub(crate) fn fed(&mut self, text: &str, specials: &[(usize, usize)]) -> Result<(), StepError> {
         let Some(o) = self.waiting.clone().filter(|_| self.heads.is_empty()) else {
-            return;
+            return Ok(());
         };
-        let opens = match o.special {
-            Some(_) => specials.last().is_some_and(|&(at, len)| {
-                at + len == text.len() && len == o.text.len() && text.get(at..) == Some(o.text)
-            }),
-            None => self.wrote(text, &o),
-        };
-        if opens {
+        if o.special.is_none() {
+            return self.read(text, &o);
+        }
+        if specials.last().is_some_and(|&(at, len)| {
+            at + len == text.len() && len == o.text.len() && text.get(at..) == Some(o.text)
+        }) {
             self.open(&o);
         }
+        Ok(())
     }
 
     /// `draw`'s pick among the ids the heads allow, counted by kind; a lone

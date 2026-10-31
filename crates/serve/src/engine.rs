@@ -324,6 +324,18 @@ pub trait Engine: Send {
     fn advance_rows(&self) -> usize {
         1
     }
+    /// Whether a cut into the ids the last pass kept is always granted as
+    /// asked: right after [`Engine::advance`] or [`Engine::advance_sampled`],
+    /// [`Engine::keepable`] grants every `n` from the pass's `last` on to
+    /// where the engine stands, so [`Engine::cut`] takes it back with nothing
+    /// fed again. A request that watches for a tool call takes passes only on
+    /// such an engine: the call opener a pass ran past is cut back to. The
+    /// default holds for an engine whose pass keeps one id, which leaves no
+    /// position inside a pass; a drafting engine says true only where its
+    /// caches' rule grants every such cut.
+    fn cuts_into_passes(&self) -> bool {
+        self.advance_rows() <= 1
+    }
     /// One drafted pass for a request that draws (it samples, or bans an id:
     /// its sampler sets the banned logits to -inf first), by llama.cpp's
     /// `common_sampler_sample_and_accept_n`. `last` and the ids the draft

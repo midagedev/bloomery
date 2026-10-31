@@ -115,6 +115,9 @@ impl Engine for SwapEngine {
     fn advance_rows(&self) -> usize {
         self.inner.advance_rows()
     }
+    fn cuts_into_passes(&self) -> bool {
+        self.inner.cuts_into_passes()
+    }
     fn slots(&self) -> usize {
         self.slots
     }

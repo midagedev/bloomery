@@ -424,6 +424,7 @@ impl Server {
             return Err(ServeError::NoStops);
         }
         let engine_props = engine_object(&engine.props_engine());
+        let watches = engine.cuts_into_passes();
         let media = engine.media_model();
         let (video, video_line) = VideoSupport::detect();
         if media.as_ref().is_some_and(|m| m.video_rule().is_some()) {
@@ -454,6 +455,7 @@ impl Server {
             vocab,
             fatal_linger: config.fatal_linger,
             tool_format: ToolFormat::of_chat_template(&template),
+            watches,
             object_arguments: needs_object_arguments(&template),
             thinking_off,
             preparation: config.chat_preparation,
@@ -728,6 +730,9 @@ struct State {
     template: ChatTemplate,
     /// The tool-call markup the template teaches, read from its source once.
     tool_format: ToolFormat,
+    /// Whether `tool_choice: auto` arms the call watch: the engine cuts into
+    /// its passes ([`Engine::cuts_into_passes`]), read once.
+    watches: bool,
     /// Whether the template reads a tool call's `arguments` as an object
     /// ([`needs_object_arguments`]), decided once.
     object_arguments: bool,
@@ -2140,6 +2145,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             vocab: &state.vocab,
             format: state.tool_format,
             think: state.think,
+            watches: state.watches,
         },
     )
     .map_err(|r| {

@@ -385,19 +385,6 @@ fn tool_body(stream: bool) -> Value {
     })
 }
 
-/// [`tool_body`] over tools whose `tags` array schema the structured-output
-/// subset cannot compile: `tool_choice` auto leaves such a reply to the model
-/// (no watch), so the markup the script writes reaches the scan as it is.
-fn malformed_body(stream: bool) -> Value {
-    let mut b = tool_body(stream);
-    b["tools"]
-        .as_array_mut()
-        .expect("tools")
-        .push(json!({"type": "function", "function": {"name": "note",
-            "parameters": {"type": "object", "properties": {"tags": {"type": "array"}}}}}));
-    b
-}
-
 /// A streamed chat body folded back into `(finish_reason, message)`, call ids
 /// left out; `Err` with its message when the stream ended on an error event.
 fn fold_stream(body: &str) -> Result<(Value, Value), String> {
@@ -557,17 +544,57 @@ fn hw_hermes_malformed_call_is_an_api_error() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &malformed_body(false));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(false)),
+        );
         assert_eq!(r.status, 500, "{}", r.body);
         let m = r.json()["error"]["message"]
             .as_str()
             .unwrap_or("")
             .to_owned();
         assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &malformed_body(true));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(true)),
+        );
         let e = fold_stream(&r.body).expect_err("an error event");
         assert!(e.starts_with(want), "{e}");
     }
+}
+
+/// On a drafting engine that keeps no cut into its passes, `tool_choice` auto
+/// arms no watch: the reply takes the engine's passes, and its call is the
+/// model's as the parser reads it, a string where the schema says integer.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_drafting_engine_that_cuts_no_pass_arms_no_auto_watch() {
+    let script = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                  {\"location\": \"Seoul\", \"days\": \"3\"}}\n</tool_call>";
+    let addr = start_templated(
+        Box::new(ScriptedEngine::new(4096, script).drafting(4)),
+        TEMPLATE,
+    );
+    let r = post(addr, "/v1/chat/completions", &tool_body(false));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    assert!(
+        v["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+        "{}",
+        r.body
+    );
+    let call = &v["choices"][0]["message"]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "get_weather", "{}", r.body);
+    let args: Value =
+        serde_json::from_str(call["arguments"].as_str().expect("text")).expect("JSON");
+    assert_eq!(
+        args,
+        json!({"location": "Seoul", "days": "3"}),
+        "{}",
+        r.body
+    );
 }
 
 /// Under `tool_choice` auto (given or not) a tool whose schema is invalid is a
@@ -645,7 +672,7 @@ fn hw_an_invalid_tool_schema_is_a_400_beside_an_unservable_one() {
         r.body
     );
     // The tool the subset cannot compile first, then the invalid one.
-    let mut b = malformed_body(false);
+    let mut b = common::unwatched(tool_body(false));
     b["tools"]
         .as_array_mut()
         .expect("tools")
