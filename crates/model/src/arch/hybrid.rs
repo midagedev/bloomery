@@ -17,6 +17,7 @@ use crate::arch::stems::{Stem, opt, req, required};
 use crate::arch::{meta_usize, metadata, mul, optional_usize, positive, spec_u32};
 use crate::placement::accepts::{program_of, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::workstation::{self, HostRead};
 use crate::placement::{
     self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, Unimplemented,
     Violation, checked, joined,
@@ -443,9 +444,10 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
 /// card cannot hold, and a card too small for every routed expert, which
 /// would leave some on the host. [`PlanInputs::plan_with`] takes the other
 /// two places a plan may put the routed experts ([`Experts`]): the card's
-/// share with the rest on the host tier, or all on the host. The dense
-/// layers, the stores and the refusals above stay the card's under every
-/// arm.
+/// share with the rest on the host tier, or all on the host, where the host
+/// experts the room cannot hold go to the NVMe expert tier
+/// ([`placement::expert_nvme_tier`]). The dense layers, the stores and the
+/// refusals above stay the card's under every arm.
 #[derive(Clone, Debug)]
 pub struct PlanInputs {
     /// Every tensor with its role, and the model's layer count.
@@ -458,6 +460,14 @@ pub struct PlanInputs {
     /// card keeps them out of the expert budget ([`placement::plan_routed_reserving`]) and the
     /// body holds its pass to them. 0 for a family whose body sizes its pass apart from the plan.
     pub prompt_reserve: u64,
+    /// The host's available bytes when the inputs were read, with the reading that decided
+    /// ([`workstation::host_available_read`]): the routed experts the room cannot hold follow it
+    /// to the NVMe tier. A gate that plans an arm by a room of its own sets it, read
+    /// [`HostRead::Given`]. The effective room is [`Plan::plan_at`]'s.
+    pub room: (u64, HostRead),
+    /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
+    /// ([`workstation::nvtier_arena_given`]), `None` unset.
+    pub arena: Option<u64>,
 }
 
 /// Where a plan puts the routed experts.
@@ -520,6 +530,27 @@ impl PlanRefusal for PlaceError {
 }
 
 impl PlanInputs {
+    /// The inputs of a file whose roles `model`, description `spec`, stores `kv` and prompt
+    /// reserve a family read, with the host's room ([`workstation::host_available_read`]) and the
+    /// arena's given bytes beside them; a room that cannot be read is refused by name.
+    pub fn new(
+        model: ModelTensors,
+        spec: ModelSpec,
+        kv: KvLayout,
+        prompt_reserve: u64,
+    ) -> Result<PlanInputs, PlacementError> {
+        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
+        let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
+        Ok(PlanInputs {
+            model,
+            spec,
+            kv,
+            prompt_reserve,
+            room,
+            arena,
+        })
+    }
+
     /// `self`, or — for a file with a feature the engine does not run —
     /// [`PlacementError::Unimplemented`] with every one listed.
     pub fn runnable(self) -> Result<PlanInputs, PlacementError> {
@@ -553,7 +584,11 @@ impl PlanInputs {
 
     /// [`PlanInputs::plan`] with the routed experts where `experts` says:
     /// the context, tier, card-count and program refusals hold under every
-    /// arm. A file with no routed stacks plans the same under every arm.
+    /// arm. A file with no routed stacks plans the same under every arm. The
+    /// host experts are held to the room the inputs name
+    /// ([`PlanInputs::room`]): a room under the host need pages the rest to
+    /// the NVMe expert tier ([`placement::expert_nvme_tier`], which refuses a
+    /// room under the tier's floor by name).
     pub fn plan_with<'a>(
         &'a self,
         machine: &'a Machine,
@@ -577,7 +612,7 @@ impl PlanInputs {
         }
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
-        let plan = match experts {
+        let mut plan = match experts {
             Experts::Card | Experts::Placed => placement::plan_routed_reserving(
                 &self.model,
                 machine,
@@ -596,6 +631,8 @@ impl PlanInputs {
                 self.prompt_reserve,
             )?,
         };
+        let room = plan.plan_at(&self.room);
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         // Under `Card` the body uploads every expert stack, so the host leg
         // must hold none.
         if experts == Experts::Card && plan.host.experts != 0 {

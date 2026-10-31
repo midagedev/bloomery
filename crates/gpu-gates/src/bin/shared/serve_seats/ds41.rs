@@ -1707,9 +1707,7 @@ impl OpenLog<Body> for Log<'_> {
         }
         // The NVMe expert tier's arena as the load was granted it, beside
         // the one its plan reserved; a load with no tier prints nothing.
-        if let Some(r) = record::nvtier_of(b.nvme_tier().map(|t| &**t)) {
-            r.eprint();
-        }
+        record::eprint_nvtier(b.nvme_tier());
         for h in threads::helper::helpers() {
             record::helper(
                 &h.name,

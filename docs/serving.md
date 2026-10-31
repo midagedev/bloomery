@@ -697,7 +697,9 @@ Nemotron-3.5-Lightning 30B-A3B, one sequence: `--parallel` above 1, a placement 
 tier card, and a draft lever are refused by name. The prompt path is the body's batched one: a prompt of several ids
 runs in passes of many rows, one Mamba-2 pass a layer over the pass's rows. A Mamba-2 state cannot step back: a
 request keeps what the slot holds only when its prompt extends the whole held sequence, and any other prompt resets
-the slot and is read again. The seat runs no prompt cache; a snapshot or a resume is refused by name.
+the slot and is read again. The seat runs no prompt cache; a snapshot or a resume is refused by name. A Bolt or
+Lightning load the card cannot hold whole keeps the rest of its routed experts on the host, and a host need past the
+host's room pages the overflow on the NVMe tier, as "When the host cannot hold its experts either" below says.
 
 The decide seat answers SystemOne requests, one at a time. Clef-Flash also reads images (Image input, below); lev reads text states only. It serves two decision models: Clef-Flash (a joint schema head) and lev (`--hf ggml-org/lev-GGUF:Q4_K_M`, a label readout; its file's `qwen35.decision.type` picks it, and its request is rendered by the file's own `systemone` template):
 
@@ -772,9 +774,9 @@ by layer. A byte-budget limit alone, a dense model with no routed tensors, or an
 explicit all-host expert choice emits no such diagnosis. These records use the
 plan's stream: stderr in the server and stdout in the generation CLI.
 
-**When the host cannot hold its experts either.** A Qwen3.8, GLM-5.3 or V4.1 plan whose host need passes the
-host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. Who
-computes the arena's experts decides whether the tokens equal the all-RAM load's:
+**When the host cannot hold its experts either.** A Qwen3.8, GLM-5.3, V4.1 or Nemotron-H MoE plan whose host need
+passes the host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the
+file. Who computes the arena's experts decides whether the tokens equal the all-RAM load's:
 - On an anonymous arena (`BLOOMERY_NVTIER_MEM=anon`, the default on a card with its own memory) the host computes
   them, and the tokens equal the all-RAM load's.
 - On a pinned arena (`pinned`, the default on an integrated GPU such as DGX Spark's GB10) GLM-5.3's decode steps

@@ -320,9 +320,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               instead of from `/proc/meminfo` and the cgroup limits — an emulation of a \
               smaller host and an override. It reaches every reader of the host's available \
               bytes: the placed loads' host-need check, the residency rules' room and the \
-              Qwen3.8 plan's tiers, where the routed experts a room cannot hold are planned \
-              on the NVMe tier; a room under that tier's floor is refused with the room, the \
-              floor and the need. The MiMo plan reads it too and serves no NVMe expert tier, \
+              plans' tiers, where the routed experts a room cannot hold are planned on the \
+              NVMe tier; a room under that tier's floor is refused with the room, the floor \
+              and the need. The MiMo plan reads it too and serves no NVMe expert tier, \
               so it refuses a room that cannot hold its host experts, naming the room and \
               the need, and its default context is the card's deepest, the floor where the \
               room cannot hold that one. On a device that allocates from host memory it is \
