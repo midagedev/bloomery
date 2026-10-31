@@ -2,7 +2,8 @@
 
 The evidence table behind [`place-any-card.md`](place-any-card.md). Read-only: written from the tree at int039
 (`9c90b168d`) and round muse2card's uncommitted tree (`/Users/hckim/repo/bloomery-muse2card`, 2026-10-23 ~19:50 KST).
-Nothing here was run on a card. A number marked [derived] is arithmetic over the pins and constants cited beside it.
+Nothing here was run on a card. The NVMe tier rows include the current common host-run loaders.
+A number marked [derived] is arithmetic over the pins and constants cited beside it.
 
 Terms. The **stage** is device 0 of the plan's card list (every layer, the head, KV, then experts in its budget). A
 **tier** is a later card holding routed experts only (`Machine::all_cards` = stage cards ++ tiers,
@@ -25,7 +26,7 @@ term counts; it lives in the plan's 1 GiB `MARGIN` (`workstation.rs:112`).
 | layer cut (`plan_b`, `CUT`) | deepseek41 only, and only in `gate_load_v41` / `stage-gpu-load-v41` (`crates/gpu-gates/src/bin/gate_load_v41.rs:248`) | the rest never ask |
 | tensor parallel | glm5next (`crates/model/src/arch/glm5next/tp.rs`, `crates/gpu-glm5next/src/tp/`) | the rest never ask |
 | N nodes (Spark) | deepseek41, glm5next, qwen4exp (`nodes::loaded_routed`) | the rest never ask |
-| NVMe expert tier | deepseek41, glm5next, qwen4exp (`placement::expert_nvme_tier`) | every `place_hybrid` family by name (`PlaceError::NoNvmeTier`, `crates/model/src/arch/place_hybrid.rs:128,318`) |
+| NVMe expert tier | deepseek41, glm5next, qwen4exp, nemotron_h_moe; minimaxm3, musespark and solar2 through `place_hybrid::PlanInputs::with_nvme_tier` and the common host run | `place_hybrid` loaders that do not opt in, by name (`PlaceError::NoNvmeTier`) |
 | unified memory (one pool) | deepseek41, glm5next, qwen4exp | the rest never ask |
 
 Refusal causes, by class:
@@ -38,7 +39,7 @@ Refusal causes, by class:
 | missing runtime piece (plan and leg exist) | `serve_seats/qwen3.rs:1014-1019`: "the body runs no pass of several slots beside an expert tier card" | qwen3moe/qwen35moe seat |
 | missing chooser (bp served, unset never offers it) | `Place::choose_untiered` (`crates/gpu-gates/src/generate.rs:565`) | solar2 (`serve_seats/solar2.rs:42`), and every `Tiered` seat until muse2card's `TIER_RULE` hook lands |
 | missing reserve owner (bytes placed outside the plan or on the wrong card) | the scalar reserve; `TierDraft.on`; post-plan buffers; off-plan seats | deepseek41 (DSpark under `a`/`gate`), glm5next, solar2, qwen3.6 DSpark, musespark, mimo2, nemotron_h_moe, every vision/embedding seat |
-| missing NVMe/pool piece | `PlaceError::NoNvmeTier` | every `place_hybrid` family |
+| missing NVMe runtime binding | `PlaceError::NoNvmeTier` | `place_hybrid` loaders without `with_nvme_tier`; minimaxm3, musespark and solar2 opt in |
 
 The lead's list of tier-refusing models was minimaxm3, musespark, mimo2, raon1, nemotron_h, solar2. **solar2 does not
 refuse**: its description carries `with_tier_reserve` (`crates/model/src/arch/solar2/place.rs:190-194`), its test plans

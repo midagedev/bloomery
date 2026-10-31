@@ -410,7 +410,8 @@ impl PlanInputs {
 
 /// The plan inputs of a file read as `hp`, `model` and `spec`: the prompt pass's buffers
 /// ([`prompt_reserve_bytes`]) and the tier's places ([`tier_places_bytes`]) as the card's reserves,
-/// and the stores as the body keeps them ([`KV_ROWS`]).
+/// and the stores as the body keeps them ([`KV_ROWS`]). The body's host run is the common one, so
+/// the plan pages the host experts the room cannot hold ([`PlanInputs::with_nvme_tier`]).
 fn inputs_of(
     hp: Hparams,
     model: ModelTensors,
@@ -420,7 +421,8 @@ fn inputs_of(
     let tier = tier_places_bytes(&hp);
     let mut inputs = PlanInputs::new(ENGINE, hp, model, spec)?
         .with_prompt_reserve(reserve)
-        .with_tier_reserve(tier);
+        .with_tier_reserve(tier)
+        .with_nvme_tier();
     inputs.kv = inputs.kv.with_rows(KV_ROWS);
     Ok(inputs)
 }

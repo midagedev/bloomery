@@ -91,12 +91,11 @@
 //! every seat's): a set value past the file's trained context stops by name,
 //! and one the machine cannot hold stops with the largest it would hold. Unset,
 //! the slot asks the trained context, or the largest context under it whose
-//! plan holds where the card cannot hold the stores and resident bytes, or where
-//! the host cannot hold the routed experts the card then leaves it: the plan
-//! reads the host room (`BLOOMERY_HOST_ROOM` replaces the reading) and the
-//! body serves no NVMe expert tier (`PlaceError::NoNvmeTier`), so a shorter
-//! context, which keeps more experts on the card, is what that refusal asks
-//! for.
+//! plan holds where the card cannot hold the stores and resident bytes. The
+//! plan reads the host room (`BLOOMERY_HOST_ROOM` replaces the reading) and
+//! pages the routed experts the room cannot hold on the NVMe expert tier,
+//! which the body's host run serves; a room under that tier's floor is
+//! refused by name.
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
 //! line (`placement::ctx_ask::Chosen::line`), the `residency lever` record
@@ -105,8 +104,10 @@
 //! (`rule=slots slots=1 slot_ctx=C total=C from=<word> pass=one`); then the
 //! `load` record (architecture, resident bytes, the slot's context, the slots,
 //! layers, the routed experts the plan keeps on the host and on the card, the
-//! step graph's nodes, how a prompt is fed and the load's wall), the
-//! `xstream=` line and, once the port is bound, the `listening` record
+//! step graph's nodes, how a prompt is fed and the load's wall), the `nvtier`
+//! record (on a load whose plan paged routed experts: the arena's budget, the
+//! paged bytes and its counters, again after each prompt call), the `xstream=`
+//! line and, once the port is bound, the `listening` record
 //! (`record::BLOOMERY_SERVE_MUSESPARK`). `--plan` ends the process after the
 //! `parallel` line, nothing loaded. An engine error ends the process with the
 //! crash block and exit code 70, as every seat's.
@@ -135,6 +136,7 @@ use app::{Prompt, Session};
 use bloomery_gpu::arch::musespark::Body;
 use bloomery_gpu::checkpoint::planes::{seq_bytes, seq_lane};
 use bloomery_gpu::checkpoint::saved::SaveLane;
+use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_gates::GateError;
@@ -297,6 +299,12 @@ impl Muse {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(s.model(), total, opened);
+        record::eprint_nvtier(
+            s.model()
+                .body(NAME)?
+                .placed()
+                .and_then(|p| p.hybrid().nvme_tier()),
+        );
         Ok(Muse {
             s,
             ctx: a.ctx,
@@ -316,7 +324,15 @@ impl Seat for Muse {
 
     /// The prompt as passes (`app::Prompt for Body`), the argmax after the last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        Ok(<Body as Prompt>::prompt(self.s.model_mut(), ids)?)
+        let next = <Body as Prompt>::prompt(self.s.model_mut(), ids)?;
+        record::eprint_nvtier(
+            self.s
+                .model()
+                .body(NAME)?
+                .placed()
+                .and_then(|p| p.hybrid().nvme_tier()),
+        );
+        Ok(next)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
