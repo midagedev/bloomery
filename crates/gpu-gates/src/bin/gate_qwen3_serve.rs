@@ -536,10 +536,10 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
+    use bloomery_gpu::route_softmax::MAX_TOKENS;
     use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
         ctx_line, default_line_held, field as field_u64, fits as default_fits, step_above,

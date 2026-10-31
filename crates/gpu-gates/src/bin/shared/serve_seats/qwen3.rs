@@ -215,12 +215,12 @@ use app::dspark::CardDspark;
 use app::mtp::{MtpBody, MtpDraft};
 use q3place::Seqs;
 
-use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
 use bloomery_gpu::folder::Model;
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
+use bloomery_gpu::route_softmax::MAX_TOKENS;
 use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;

@@ -100,6 +100,7 @@ pub mod rope_norm;
 pub mod rope_table;
 pub mod route_body;
 pub mod route_core;
+pub mod route_softmax;
 pub mod routed_block;
 pub mod router;
 pub mod site;

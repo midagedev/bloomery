@@ -332,7 +332,6 @@ mod bench_arm;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::router::RouterDims;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::gemm::{
         GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmTile,
@@ -342,6 +341,7 @@ mod gate {
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
     use bloomery_gpu::kquant::{Act, act::SWIGLU_OAI_ALPHA};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
+    use bloomery_gpu::route_softmax::RouterDims;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
     use bloomery_gpu_gates::iq_rows::{ref_dequant, set_d};
