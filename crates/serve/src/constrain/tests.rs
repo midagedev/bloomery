@@ -657,7 +657,9 @@ fn a_walk_that_cannot_step_is_a_named_error() {
     assert!(e.to_string().contains("none of the option ids"), "{e}");
 }
 
-/// Every refusal is named, with the path of the keyword.
+/// Every refusal is named, with the path of the keyword, and says whether
+/// the request is invalid or valid but outside what the compiler serves
+/// (a watched call serves the second with no watch).
 #[test]
 fn each_refusal_names_its_field() {
     let tok = bytes_tok();
@@ -673,62 +675,73 @@ fn each_refusal_names_its_field() {
     }
     let deep = json!({"type": "object", "$defs": defs,
         "properties": {"x": {"$ref": "#/$defs/d129"}}});
-    let cases: Vec<(Value, ToolFormat, &str)> = vec![
+    let cases: Vec<(Value, ToolFormat, &str, bool)> = vec![
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f",
                 "parameters": deep}}]}),
             ToolFormat::Dsml(Spelling::Joined),
             "tools[0].f.parameters: the schema is too deeply nested once its $refs are written out",
+            true,
         ),
         (
             schema_body(&deep),
             ToolFormat::Hermes,
             "schema: the schema is too deeply nested once its $refs are written out",
+            true,
         ),
         (
             node(json!({"type": "string", "pattern": "a+"})),
             ToolFormat::Hermes,
             "schema.properties.p: the keyword \"pattern\"",
+            true,
         ),
         (
             node(json!({"$ref": "#/x"})),
             ToolFormat::Hermes,
             "$ref \"#/x\" does not point into this schema",
+            false,
         ),
         (
             schema_body(&json!({"type": "object", "properties": {"p": {"$ref": "#"}}})),
             ToolFormat::Hermes,
             "$ref \"#\" is met again inside the schema it points to",
+            true,
         ),
         (
             node(json!({"$ref": "#/$defs/d", "type": "string"})),
             ToolFormat::Hermes,
             "the keyword \"type\" beside $ref",
+            true,
         ),
         (
             node(json!({"oneOf": [{"type": "string"}]})),
             ToolFormat::Hermes,
             "the keyword \"oneOf\"",
+            true,
         ),
         (
             node(json!({"anyOf": []})),
             ToolFormat::Hermes,
             "anyOf must be a non-empty array",
+            false,
         ),
         (
             node(json!({"type": "integer", "minimum": 0})),
             ToolFormat::Hermes,
             "the keyword \"minimum\"",
+            true,
         ),
         (
             node(json!({"type": "array"})),
             ToolFormat::Hermes,
             "type array needs items",
+            true,
         ),
         (
             node(json!({"type": "array", "items": {"type": "string"}, "minItems": 1})),
             ToolFormat::Hermes,
             "the keyword \"minItems\"",
+            true,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
@@ -736,126 +749,150 @@ fn each_refusal_names_its_field() {
             {"type": "string"}]}}}}}]}),
             QWEN,
             "an anyOf with a text option",
+            true,
         ),
         (
             node(json!({"type": "number", "enum": [1.5]})),
             ToolFormat::Hermes,
             "not an integer",
+            true,
         ),
         (
             node(json!({"enum": [1, "a"]})),
             ToolFormat::Hermes,
             "mixed kinds",
+            true,
         ),
         (
             node(json!({"enum": ["a", "a"]})),
             ToolFormat::Hermes,
             "listed twice",
+            true,
         ),
         (
             node(json!({"enum": ["a", ""]})),
             ToolFormat::Hermes,
             "an empty string",
+            true,
         ),
         (
             node(json!({"enum": [1, 10]})),
             ToolFormat::Hermes,
             "one is a prefix of the other",
+            true,
         ),
         (
             node(json!({"enum": ["a", "ab"]})),
             ToolFormat::Hermes,
             "one is a prefix of the other",
+            true,
         ),
         (
             node(json!({"type": "string", "enum": [1]})),
             ToolFormat::Hermes,
             "does not match",
+            false,
         ),
         (
             node(json!({"type": "string", "maxLength": -1})),
             ToolFormat::Hermes,
             "maxLength must be",
+            false,
         ),
         (
             node(json!({"type": "boolean", "maxLength": 3})),
             ToolFormat::Hermes,
             "beside type boolean",
+            true,
         ),
         (
             node(json!({"description": "no type"})),
             ToolFormat::Hermes,
             "needs a type, an enum or a const",
+            true,
         ),
         (
             schema_body(&json!({"type": "object", "required": ["q"]})),
             ToolFormat::Hermes,
             "required names \"q\"",
+            false,
         ),
         (
             json!({"tool_choice": "required", "tools": tools,
                 "response_format": {"type": "json_object"}}),
             ToolFormat::Hermes,
             "has one program",
+            false,
         ),
         (
             json!({"response_format": {"type": "xml"}}),
             ToolFormat::Hermes,
             "response_format",
+            false,
         ),
         (
             json!({"response_format": {"type": "json_schema"}}),
             ToolFormat::Hermes,
             "json_schema.schema",
+            false,
         ),
         (
             json!({"json_schema": {"type": "object"}}),
             ToolFormat::Hermes,
             "json_schema is not supported",
+            false,
         ),
         (
             json!({"tool_choice": "required"}),
             ToolFormat::Hermes,
             "needs the request's tools",
+            false,
         ),
         (
             json!({"tool_choice": "sometimes", "tools": tools}),
             ToolFormat::Hermes,
             "\"sometimes\"",
+            false,
         ),
         (
             json!({"tool_choice": {"type": "function", "function": {"name": "g"}}, "tools": tools}),
             ToolFormat::Hermes,
             "the function g is not among",
+            false,
         ),
         (
             json!({"tool_choice": "required", "tools": tools,
                 "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "boolean"}}}}),
             ToolFormat::Hermes,
             "has one program",
+            false,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "a<b"}}]}),
             ToolFormat::Hermes,
             "not a plain name",
+            true,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
             {"type": "object", "properties": {"q": {"enum": ["a"]}}}}}]}),
             GLM,
             "under \"type\": \"string\"",
+            true,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
             {"type": "object", "properties": {"q": {"enum": ["a"]}}}}}]}),
             SOLAR,
             "Solar's tool markup reads a text value as text only under \"type\": \"string\"",
+            true,
         ),
     ];
-    for (body, format, needle) in cases {
+    for (body, format, needle, outside) in cases {
         let e = build(&tok, format, &body).expect_err(&body.to_string());
         assert!(e.message.contains(needle), "{body}: {e}");
         assert!(!e.unsupported, "{body}: {e}");
+        assert_eq!(e.outside_subset, outside, "{body}: {e}");
     }
     let e = build(
         &tok,
@@ -3479,6 +3516,134 @@ fn none_unwatched_and_json_replies_build_no_watch() {
     );
 }
 
+/// Under `tool_choice: auto` a tool whose schema is invalid (it contradicts
+/// itself or JSON Schema) is refused by name, the refusal a forced choice
+/// gives, and one that is valid but outside what the compiler serves (a
+/// keyword it does not read, a shape or text it cannot write) is served with
+/// no watch: the reply is the model's.
+/// A `required` or `properties` of null reads as absent (some tool-schema
+/// generators write null for an empty list or map): the call is watched,
+/// not refused. Mutant: null refused as a non-array or non-object.
+#[test]
+fn a_null_required_or_properties_reads_as_absent() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    for parameters in [
+        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": null}),
+        json!({"type": "object", "properties": null}),
+        json!({"type": "object", "properties": null, "required": null}),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": parameters}}]);
+        let watched = request(
+            json!({"tools": tools, "tool_choice": "auto"})
+                .as_object()
+                .unwrap(),
+            &Ask {
+                tok: &*tok,
+                vocab: &vocab,
+                format: ToolFormat::Hermes,
+                think: ThinkTags::THINK,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{parameters}: {e}"));
+        assert!(watched.is_some(), "{parameters}: no watch");
+    }
+}
+
+#[test]
+fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_unwatched() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let watch = |format: ToolFormat, parameters: &Value| {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": parameters}}]);
+        request(
+            json!({"tools": tools, "tool_choice": "auto"})
+                .as_object()
+                .unwrap(),
+            &Ask {
+                tok: &*tok,
+                vocab: &vocab,
+                format,
+                think: ThinkTags::THINK,
+            },
+        )
+    };
+    let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
+    let invalid = [
+        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["b"]}),
+        json!({"type": "object", "properties": []}),
+        json!({"type": "object", "required": "p"}),
+        prop(json!({"type": "str"})),
+        prop(json!({"type": 5})),
+        prop(json!({"type": "string", "maxLength": -1})),
+        prop(json!({"anyOf": []})),
+        prop(json!({"enum": []})),
+        prop(json!({"type": "string", "enum": [1]})),
+        prop(json!({"$ref": "#/$defs/missing"})),
+        prop(json!({"$ref": 5})),
+        json!({"type": "string"}),
+        json!(5),
+    ];
+    for parameters in &invalid {
+        for format in [ToolFormat::Hermes, QWEN] {
+            let e = watch(format, parameters).expect_err(&parameters.to_string());
+            assert!(!e.outside_subset && !e.unsupported, "{parameters}: {e}");
+            assert!(
+                e.field
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with("tools[0].f.parameters")),
+                "{parameters}: {e}"
+            );
+        }
+    }
+    let outside = [
+        (
+            ToolFormat::Hermes,
+            prop(json!({"type": ["string", "null"]})),
+        ),
+        (
+            ToolFormat::Hermes,
+            prop(json!({"type": "string", "pattern": "a+"})),
+        ),
+        (ToolFormat::Hermes, prop(json!({"type": "array"}))),
+        (ToolFormat::Hermes, prop(json!(true))),
+        (ToolFormat::Hermes, prop(json!({"description": "no type"}))),
+        (ToolFormat::Hermes, prop(json!({"enum": [1, "a"]}))),
+        (ToolFormat::Hermes, prop(json!({"enum": ["a", "a"]}))),
+        (ToolFormat::Hermes, prop(json!({"enum": ["a", "ab"]}))),
+        (
+            ToolFormat::Hermes,
+            prop(json!({"type": "number", "const": 1})),
+        ),
+        (
+            ToolFormat::Hermes,
+            prop(json!({"$ref": "https://example.com/s.json"})),
+        ),
+        (ToolFormat::Hermes, prop(json!({"$ref": "#"}))),
+        (ToolFormat::Hermes, json!({"type": ["object", "null"]})),
+        (ToolFormat::Hermes, json!({"anyOf": [{"type": "object"}]})),
+        (
+            QWEN,
+            prop(json!({"anyOf": [{"type": "integer"}, {"type": "string"}]})),
+        ),
+        (GLM, prop(json!({"enum": ["a"]}))),
+    ];
+    for (format, parameters) in &outside {
+        let served = watch(*format, parameters)
+            .unwrap_or_else(|e| panic!("{format:?} {parameters}: refused: {e}"));
+        assert!(served.is_none(), "{format:?} {parameters}: watched");
+    }
+    // What the compiler serves is watched, as before.
+    let served = watch(
+        ToolFormat::Hermes,
+        &prop(json!({"type": "array", "items": {"type": "integer"}})),
+    )
+    .expect("served");
+    assert!(served.is_some());
+}
+
 /// A watched call waits for the think span's own end: an opener inside the
 /// span is reasoning where the format's parser reads it so (Hermes'), and
 /// the program starts at the first opener past the close; where the parser's
@@ -3616,6 +3781,65 @@ fn a_watched_call_waits_for_the_think_spans_own_end() {
         ));
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A call opener the vocabulary holds as one special token starts the watched
+/// program where that token ends the free text, the first content of a reply
+/// whose span the model may still open included, with whitespace before it or
+/// none: the call that follows is held to its schema, not left as the model
+/// wrote it. A spelling of the opener in ordinary ids is not an opener.
+#[test]
+fn a_special_opener_at_the_first_content_starts_the_watched_program() {
+    let pieces = Arc::new(PieceTok(&TAG_PIECES));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": {
+        "type": "object",
+        "properties": {"edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]}}}]);
+    let c = build(
+        &tok,
+        ToolFormat::Hermes,
+        &json!({"tools": tools, "tool_choice": "auto"}),
+    )
+    .expect("served");
+    // The call the model writes names `edits` a string: only the program
+    // can make it the array of integers the schema asks for.
+    let written = "\n{\"name\": \"edit\", \"arguments\": {\"edits\": \"x\"}}\n";
+    let held = |opener: Vec<u32>, lead: &str| {
+        let mut want = ids(&tok, lead);
+        want.extend(opener);
+        want.extend(ids(&tok, written));
+        want.push(pieces.piece(CALL_CLOSE));
+        let o = run_read(&tok, &params(Some(c.clone()), ThinkEntry::MayOpen), &want).0;
+        let mut m = ChatParser::with_tags(
+            "",
+            ReasoningFormat::Deepseek,
+            Some(Tools::Hermes),
+            ThinkTags::THINK,
+        )
+        .reading_specials(&*tok);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .expect("the generation parses");
+        m.message().clone()
+    };
+    for lead in ["", "\n"] {
+        let m = held(vec![pieces.piece(CALL_OPEN)], lead);
+        assert_eq!(m.calls.len(), 1, "{lead:?}: {m:?}");
+        let args: Value = serde_json::from_str(&m.calls[0].arguments).expect("JSON arguments");
+        assert!(
+            args["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64)),
+            "{lead:?}: {args}"
+        );
+    }
+    // The opener's characters in ordinary ids start no program: the call is
+    // content and stays as written.
+    let plain: Vec<u32> = CALL_OPEN.bytes().map(|b| BYTES + u32::from(b)).collect();
+    let m = held(plain, "");
+    assert!(m.calls.is_empty(), "{m:?}");
+    assert!(m.content.contains("\"edits\": \"x\""), "{m:?}");
 }
 
 // ------------------------------------------------- the object rule

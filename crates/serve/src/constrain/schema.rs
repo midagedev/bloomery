@@ -100,6 +100,30 @@ pub(crate) fn refuse(path: &str, message: impl std::fmt::Display) -> Refusal {
     }
 }
 
+/// The refusal of a valid request the compiler does not serve
+/// ([`Refusal::outside_subset`]), the field's path leading its message.
+pub(crate) fn outside(path: &str, message: impl std::fmt::Display) -> Refusal {
+    Refusal {
+        outside_subset: true,
+        ..refuse(path, message)
+    }
+}
+
+/// The names JSON Schema gives a value's type.
+const TYPES: [&str; 7] = [
+    "object", "array", "string", "integer", "number", "boolean", "null",
+];
+
+/// Whether `v` is a list of type names, which JSON Schema takes for `type`
+/// and the compiler does not read.
+fn type_list(v: &Value) -> bool {
+    v.as_array().is_some_and(|a| {
+        !a.is_empty()
+            && a.iter()
+                .all(|t| t.as_str().is_some_and(|t| TYPES.contains(&t)))
+    })
+}
+
 fn type_of(v: &Value) -> &'static str {
     ::embed::request::json_type(v)
 }
@@ -127,14 +151,14 @@ impl Scalar {
             Value::Number(n) => match (n.as_i64(), n.as_u64()) {
                 (Some(i), _) => Ok(Scalar::Int(i128::from(i))),
                 (_, Some(u)) => Ok(Scalar::Int(i128::from(u))),
-                _ => Err(refuse(
+                _ => Err(outside(
                     path,
                     format!(
                         "the number {n} is not an integer: only strings, integers and booleans can be chosen or fixed"
                     ),
                 )),
             },
-            other => Err(refuse(
+            other => Err(outside(
                 path,
                 format!(
                     "a {} cannot be chosen or fixed: only strings, integers and booleans can",
@@ -186,7 +210,7 @@ fn only(o: &Map<String, Value>, kind: &str, allowed: &[&str], path: &str) -> Res
         .keys()
         .find(|k| !allowed.contains(&k.as_str()) && !ANNOTATIONS.contains(&k.as_str()))
     {
-        Some(k) => Err(refuse(
+        Some(k) => Err(outside(
             path,
             format!("the keyword \"{k}\" is not supported by this server beside {kind}"),
         )),
@@ -199,16 +223,24 @@ fn only(o: &Map<String, Value>, kind: &str, allowed: &[&str], path: &str) -> Res
 /// format's markup), or as the raw text a chat format's string argument holds.
 pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> {
     let Some(o) = node.as_object() else {
-        return Err(refuse(
-            path,
-            format!("a schema must be an object, not {}", type_of(node)),
-        ));
+        // `true` and `false` are schemas too, which the compiler does not read.
+        return Err(if node.is_boolean() {
+            outside(
+                path,
+                "a boolean schema is not supported by this server: write an object",
+            )
+        } else {
+            refuse(
+                path,
+                format!("a schema must be an object, not {}", type_of(node)),
+            )
+        });
     };
     if let Some(k) = o
         .keys()
         .find(|k| !READ.contains(&k.as_str()) && !ANNOTATIONS.contains(&k.as_str()))
     {
-        return Err(refuse(
+        return Err(outside(
             path,
             format!(
                 "the keyword \"{k}\" is not supported by this server (read: {}, and annotations)",
@@ -219,10 +251,16 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
     let ty = match o.get("type") {
         None => None,
         Some(Value::String(t)) => Some(t.as_str()),
+        Some(v) if type_list(v) => {
+            return Err(outside(
+                path,
+                "a list of types is not supported by this server: write one type",
+            ));
+        }
         Some(v) => {
             return Err(refuse(
                 path,
-                format!("type must be one string, not {}", type_of(v)),
+                format!("type must be a type name or a list of them, not {v}"),
             ));
         }
     };
@@ -302,7 +340,7 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
             only(o, "type array", &["type", "items"], path)?;
             let items = o
                 .get("items")
-                .ok_or_else(|| refuse(path, "type array needs items, the schema of each item"))?;
+                .ok_or_else(|| outside(path, "type array needs items, the schema of each item"))?;
             Ok(vec![Part::List {
                 item: value(items, style.nested(), &format!("{path}.items"))?,
             }])
@@ -310,11 +348,11 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
         Some(other) => Err(refuse(
             path,
             format!(
-                "type \"{other}\" is not supported by this server (supported: object, array, \
-                 string, integer, number, boolean, null)"
+                "type \"{other}\" is not a JSON Schema type ({})",
+                TYPES.join(", ")
             ),
         )),
-        None => Err(refuse(
+        None => Err(outside(
             path,
             "a schema needs a type, an enum or a const to be served",
         )),
@@ -333,7 +371,7 @@ fn any_of(alts: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> 
         ));
     };
     if style == Style::Raw && list.iter().any(is_text) {
-        return Err(refuse(
+        return Err(outside(
             &here,
             "an anyOf with a text option is not supported by this server in a chat format's \
              markup, which reads a value as text or as JSON by its schema",
@@ -366,7 +404,7 @@ fn inline_refs(
     bytes: &mut usize,
 ) -> Result<Value, Refusal> {
     *left = left.checked_sub(1).ok_or_else(|| {
-        refuse(
+        outside(
             path,
             format!(
                 "the schema holds more than {MAX_SCHEMAS} schemas once its $refs are written out"
@@ -375,7 +413,7 @@ fn inline_refs(
     })?;
     let charge = |bytes: &mut usize, n: usize| -> Result<(), Refusal> {
         *bytes = bytes.checked_sub(n).ok_or_else(|| {
-            refuse(
+            outside(
                 path,
                 format!("the schema passes {MAX_BODY} bytes once its $refs are written out"),
             )
@@ -395,7 +433,7 @@ fn inline_refs(
             let k = k.as_str();
             k != "$ref" && !ANNOTATIONS.contains(&k) && !DEFS.contains(&k)
         }) {
-            return Err(refuse(
+            return Err(outside(
                 path,
                 format!("the keyword \"{k}\" beside $ref is not supported by this server"),
             ));
@@ -404,16 +442,21 @@ fn inline_refs(
             .strip_prefix('#')
             .and_then(|p| root.pointer(p))
             .ok_or_else(|| {
-                refuse(
-                    path,
-                    format!(
-                        "$ref {r:?} does not point into this schema (\"#\" or a JSON pointer \
-                         after it)"
-                    ),
-                )
+                let message = format!(
+                    "$ref {r:?} does not point into this schema (\"#\" or a JSON pointer \
+                     after it)"
+                );
+                // A pointer that names nothing here is a dangling reference;
+                // an anchor or another document's URL is one the compiler
+                // does not resolve.
+                if r.starts_with("#/") {
+                    refuse(path, message)
+                } else {
+                    outside(path, message)
+                }
             })?;
         if seen.iter().any(|s| s == r) {
-            return Err(refuse(
+            return Err(outside(
                 path,
                 format!(
                     "$ref {r:?} is met again inside the schema it points to: a recursive \
@@ -472,7 +515,7 @@ fn written_out(schema: &Value, path: &str, bytes: &mut usize) -> Result<Value, R
     let mut left = MAX_SCHEMAS;
     let out = inline_refs(schema, schema, path, &mut Vec::new(), &mut left, bytes)?;
     serde_json::from_str(&out.to_string()).map_err(|e| {
-        refuse(
+        outside(
             path,
             format!("the schema is too deeply nested once its $refs are written out ({e})"),
         )
@@ -490,7 +533,7 @@ fn raw_literals_hold_no_tag(o: &Map<String, Value>, path: &str) -> Result<(), Re
             .flatten(),
     );
     if literals.filter_map(Value::as_str).any(|s| s.contains('<')) {
-        return Err(refuse(
+        return Err(outside(
             path,
             "raw string literals cannot contain '<': the chat format reads the value up to its \
              closing tag",
@@ -502,6 +545,11 @@ fn raw_literals_hold_no_tag(o: &Map<String, Value>, path: &str) -> Result<(), Re
 /// A node's `type` against the kind of its values.
 fn agree(ty: Option<&str>, kind: &str, path: &str) -> Result<(), Refusal> {
     match ty {
+        Some("number") if kind == "integer" => Err(outside(
+            path,
+            "type \"number\" over integer values is not supported by this server: write \
+             \"integer\"",
+        )),
         Some(t) if t != kind => Err(refuse(
             path,
             format!("type \"{t}\" does not match its {kind} values"),
@@ -539,7 +587,7 @@ fn enumeration(
         .collect::<Result<_, _>>()?;
     let kind = values[0].kind();
     if let Some(odd) = values.iter().find(|v| v.kind() != kind) {
-        return Err(refuse(
+        return Err(outside(
             &here,
             format!(
                 "an enum of mixed kinds ({kind} and {}) is not supported by this server",
@@ -550,13 +598,13 @@ fn enumeration(
     agree(ty, kind, path)?;
     for (i, v) in values.iter().enumerate() {
         if values[..i].contains(v) {
-            return Err(refuse(
+            return Err(outside(
                 &here,
                 format!("{:?} is listed twice", v.body(style)),
             ));
         }
         if v.body(style).is_empty() {
-            return Err(refuse(
+            return Err(outside(
                 &here,
                 "an empty string cannot be one of the options",
             ));
@@ -587,10 +635,11 @@ fn enumeration(
 }
 
 /// An object written as JSON: every property, in the schema's order, its
-/// strings in the style `inner`.
+/// strings in the style `inner`. A `properties` or `required` of null reads
+/// as absent, as some tool-schema generators write an empty one.
 fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>, Refusal> {
     let props = match o.get("properties") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(Value::Object(p)) => Some(p),
         Some(v) => {
             return Err(refuse(
@@ -600,7 +649,7 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
         }
     };
     let required: Vec<&str> = match o.get("required") {
-        None => Vec::new(),
+        None | Some(Value::Null) => Vec::new(),
         Some(r) => {
             let Some(names) = r.as_array() else {
                 return Err(refuse(
@@ -747,6 +796,45 @@ impl Fun<'_> {
     }
 }
 
+/// What a call's parts are for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallMode {
+    /// A forced choice: the program writes the call from its opener on.
+    Forced,
+    /// `tool_choice: auto`: the model wrote the opener itself and the
+    /// program follows from there.
+    Watched,
+}
+
+/// A tool call in a format's markup, the opener apart from the rest.
+pub(crate) struct Call {
+    /// The text that opens a call and tells it from the free text around it:
+    /// `None` where the markup has none to watch for.
+    pub opener: Option<&'static str>,
+    /// The call as parts, from the opener on when forced, after it when
+    /// watched.
+    pub parts: Vec<Part>,
+}
+
+impl Call {
+    /// A call `opener` opens, `body` its parts after it.
+    pub(crate) fn opened(opener: &'static str, mode: CallMode, body: Vec<Part>) -> Call {
+        let lead = (mode == CallMode::Forced).then(|| Part::Text(opener.to_owned()));
+        Call {
+            opener: Some(opener),
+            parts: lead.into_iter().chain(body).collect(),
+        }
+    }
+
+    /// A call whose markup has no opener to watch for.
+    pub(crate) fn unopened(parts: Vec<Part>) -> Call {
+        Call {
+            opener: None,
+            parts,
+        }
+    }
+}
+
 /// A call as parts: `open`, then the function's name, then what `body` writes
 /// after it. With several functions the name is a choice, each option followed
 /// by its own function's body; with one it is forced.
@@ -777,7 +865,7 @@ pub(crate) fn call(
 /// between its tags without escaping.
 fn plain_name(what: &str, name: &str, path: &str) -> Result<(), Refusal> {
     if name.is_empty() || name.contains(|c: char| c.is_control() || "\"\\<>".contains(c)) {
-        return Err(refuse(
+        return Err(outside(
             path,
             format!(
                 "{what} {name:?} is not a plain name (non-empty, none of \" \\ < > or a control character)"
@@ -801,7 +889,7 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
         let name = f.get("name").and_then(Value::as_str).unwrap_or_default();
         plain_name("the tool name", name, &path)?;
         if out.iter().any(|g| g.name == name) {
-            return Err(refuse(&path, format!("the tool {name} is listed twice")));
+            return Err(outside(&path, format!("the tool {name} is listed twice")));
         }
         let here = format!("{path}.{name}.parameters");
         let args = match f.get("parameters") {
@@ -810,7 +898,7 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                 // A call's markup writes the arguments as one object's
                 // properties, which a root anyOf or $ref would not say.
                 if let Some(k) = ["anyOf", "$ref"].into_iter().find(|k| p.contains_key(*k)) {
-                    return Err(refuse(
+                    return Err(outside(
                         &here,
                         format!(
                             "the keyword \"{k}\" is not supported by this server at the root of \
@@ -819,10 +907,12 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                     ));
                 }
                 if let Some(t) = p.get("type").filter(|t| t.as_str() != Some("object")) {
-                    return Err(refuse(
-                        &here,
-                        format!("the parameters' type must be \"object\", not {t}"),
-                    ));
+                    let message = format!("the parameters' type must be \"object\", not {t}");
+                    return Err(if type_list(t) {
+                        outside(&here, message)
+                    } else {
+                        refuse(&here, message)
+                    });
                 }
                 // The schema compiler reads the whole object, so a keyword the
                 // subset does not read is a refusal here and never ignored.
@@ -936,7 +1026,7 @@ fn tool_parts(
             ));
         }
     }
-    format.call_parts(&funs)
+    Ok(format.call_parts(&funs, CallMode::Forced)?.parts)
 }
 
 /// What `response_format` asks the reply to be.
@@ -982,10 +1072,11 @@ fn response_schema(o: &Map<String, Value>) -> Result<Reply<'_>, Refusal> {
 /// `Ok(None)` where no watch serves the request: a format no watch reads
 /// (Muse Spark's recipient slot names the answer's channels (`self`,
 /// `commentary`, `user`) as well as a tool, so no opener of its own can
-/// start a call's program), and tools whose parameters the schema subset
-/// cannot compile — `auto` constrains what it can serve and leaves the
-/// rest to the model, where a forced choice (`required`, a named function)
-/// refuses the request by name.
+/// start a call's program; markup nothing parses has none either), and tools
+/// whose schemas are valid but outside the subset the compiler serves —
+/// `auto` constrains what it can serve and leaves the rest to the model. A
+/// tool whose schema is invalid is refused by name, as a forced choice
+/// refuses it ([`Refusal::outside_subset`] tells the two apart).
 fn watch(
     o: &Map<String, Value>,
     ask: &Ask<'_>,
@@ -994,14 +1085,27 @@ fn watch(
     let tools = o
         .get("tools")
         .expect("parses_tools held a non-empty tools array");
-    let Some((text, parts)) = funs(tools)
-        .ok()
-        .and_then(|funs| ask.format.lazy_parts(&funs).ok().flatten())
-    else {
+    let unwatched = |r: Refusal| {
+        if r.outside_subset || r.unsupported {
+            Ok(None)
+        } else {
+            Err(r)
+        }
+    };
+    let funs = match funs(tools) {
+        Ok(funs) => funs,
+        Err(r) => return unwatched(r),
+    };
+    let call = match ask.format.call_parts(&funs, CallMode::Watched) {
+        Ok(call) => call,
+        Err(r) => return unwatched(r),
+    };
+    let Some(text) = call.opener else {
         return Ok(None);
     };
-    let Ok(prog) = program::compile(&parts, env) else {
-        return Ok(None);
+    let prog = match program::compile(&call.parts, env) {
+        Ok(prog) => prog,
+        Err(r) => return unwatched(r),
     };
     // The opener is watched for by the one special token the vocabulary
     // holds for it, where it holds one, as the format's own scan reads it.

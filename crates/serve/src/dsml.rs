@@ -44,7 +44,8 @@ use crate::callstream::{
     self, Advance, Args, CallPiece, Progress, Reading, Streamer, find_from, held, read_value,
 };
 use crate::constrain::{
-    Arg, Fun, Part, Refusal, Style, any_start, call, is_text, object_parameters, value,
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, any_start, call, is_text, object_parameters,
+    value,
 };
 use crate::engine::Tokenizer;
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
@@ -1144,41 +1145,27 @@ fn cut_close(p: &Progress) -> Scanned {
 }
 
 impl ToolFormat {
-    /// The forced call in this format's markup: the inverse of the format's
-    /// scan, or a 501 refusal for markup no scan here reads.
-    pub(crate) fn call_parts(self, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    /// The call in this format's markup: the inverse of the format's scan,
+    /// or a 501 refusal for markup no scan here reads. Forced, the parts
+    /// write the call from its opener on; watched, they follow the opener a
+    /// `tool_choice: auto` reply is watched for, which the call names apart
+    /// (`None` for Muse Spark, whose recipient slot names the answer's
+    /// channels as well as a tool).
+    pub(crate) fn call_parts(self, funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refusal> {
         match self {
-            ToolFormat::Hermes => hermes::call_parts(funs),
-            ToolFormat::QwenXml(framing) => qwenxml::call_parts(framing, funs),
-            ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs),
-            ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
-            ToolFormat::MuseSpark => crate::museatem::call_parts(funs),
+            ToolFormat::Hermes => hermes::call_parts(funs, mode),
+            ToolFormat::QwenXml(framing) => qwenxml::call_parts(framing, funs, mode),
+            ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs, mode),
+            ToolFormat::Dsml(spelling) => call_parts(spelling, funs, mode),
+            ToolFormat::MuseSpark => crate::museatem::call_parts(funs, mode),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"
                     .to_owned(),
                 unsupported: true,
+                outside_subset: false,
                 field: None,
             }),
-        }
-    }
-
-    /// The opener a `tool_choice: auto` reply is watched for in this
-    /// format's markup, and the call as parts once the model writes it:
-    /// [`ToolFormat::call_parts`] less the opener, which the free text has
-    /// already written. `None` for a format no watch reads: Muse Spark's
-    /// recipient slot names the answer's channels as well as a tool, and
-    /// markup nothing parses has no opener to watch.
-    pub(crate) fn lazy_parts(
-        self,
-        funs: &[Fun<'_>],
-    ) -> Result<Option<(&'static str, Vec<Part>)>, Refusal> {
-        match self {
-            ToolFormat::Hermes => hermes::lazy_parts(funs).map(Some),
-            ToolFormat::QwenXml(framing) => qwenxml::lazy_parts(framing, funs).map(Some),
-            ToolFormat::KvMarkup(spelling) => glmxml::lazy_parts(spelling, funs).map(Some),
-            ToolFormat::Dsml(spelling) => lazy_parts(spelling, funs).map(Some),
-            ToolFormat::MuseSpark | ToolFormat::Unparsed => Ok(None),
         }
     }
 }
@@ -1187,44 +1174,38 @@ impl ToolFormat {
 /// inverse of [`DsmlScan`]. One `invoke` block with a `parameter` block per
 /// parameter in the schema's order, `string="true"` around a text value (raw)
 /// and `string="false"` around any other (JSON), in the template's spelling.
-pub(crate) fn call_parts(spelling: Spelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    let t = spelling.tags();
-    call(
-        funs,
-        &format!("{}\n{}", t.calls_open, t.invoke_open),
-        str::to_owned,
-        |f| {
-            let mut parts = body(t, f)?;
-            parts.push(Part::Text(format!("\n{}", t.calls_close)));
-            Ok(parts)
-        },
-    )
-}
-
-/// The opener a `tool_choice: auto` reply is watched for — the tool_calls
-/// block's opening tag, in the template's spelling — and the block as parts
-/// once the model writes it: [`call_parts`] less the opener, which the free
-/// text has already written. The block holds one invoke after another, each
-/// held to its schema, until the model closes it (the template writes a
-/// conversation's calls in one block).
-pub(crate) fn lazy_parts(
+/// The opener is the tool_calls block's opening tag. Watched, the block holds
+/// one invoke after another, each held to its schema, until the model closes
+/// it (the template writes a conversation's calls in one block).
+pub(crate) fn call_parts(
     spelling: Spelling,
     funs: &[Fun<'_>],
-) -> Result<(&'static str, Vec<Part>), Refusal> {
+    mode: CallMode,
+) -> Result<Call, Refusal> {
     let t = spelling.tags();
     let open = format!("\n{}", t.invoke_open);
-    // The block's end after an invoke: the model closes it or opens another
-    // invoke, which ends the same way.
-    let again = Part::Rep {
-        close: vec![Part::Text(format!("\n{}", t.calls_close))],
-        more: call(funs, &open, str::to_owned, |f| body(t, f))?,
+    let close = format!("\n{}", t.calls_close);
+    let parts = match mode {
+        CallMode::Forced => call(funs, &open, str::to_owned, |f| {
+            let mut parts = body(t, f)?;
+            parts.push(Part::Text(close.clone()));
+            Ok(parts)
+        })?,
+        CallMode::Watched => {
+            // The block's end after an invoke: the model closes it or opens
+            // another invoke, which ends the same way.
+            let again = Part::Rep {
+                close: vec![Part::Text(close)],
+                more: call(funs, &open, str::to_owned, |f| body(t, f))?,
+            };
+            call(funs, &open, str::to_owned, |f| {
+                let mut parts = body(t, f)?;
+                parts.push(again.clone());
+                Ok(parts)
+            })?
+        }
     };
-    let parts = call(funs, &open, str::to_owned, |f| {
-        let mut parts = body(t, f)?;
-        parts.push(again.clone());
-        Ok(parts)
-    })?;
-    Ok((t.calls_open, parts))
+    Ok(Call::opened(t.calls_open, mode, parts))
 }
 
 /// One invoke's own text, after its function's name: a `parameter` block per

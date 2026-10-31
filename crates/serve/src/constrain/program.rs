@@ -256,7 +256,7 @@ impl<'a> Env<'a> {
     /// The ids of `text`, its bytes charged to the compile's budget.
     fn encode(&self, text: &str) -> Result<Vec<u32>, Refusal> {
         let Some(left) = self.bytes_left.get().checked_sub(text.len()) else {
-            return Err(refuse(format!(
+            return Err(outside(format!(
                 "the schema's fixed text is too long: its program tokenises more than \
                  {COMPILE_BYTES} bytes (an anyOf repeats the text on each side of it in every \
                  option)"
@@ -271,11 +271,17 @@ fn refuse(message: String) -> Refusal {
     Refusal::invalid(message)
 }
 
+/// The refusal of a schema that is valid but that this vocabulary or the
+/// compile's budget cannot write ([`Refusal::outside_subset`]).
+fn outside(message: String) -> Refusal {
+    Refusal::outside_subset(message)
+}
+
 /// Refuses `ids`, the tokens of `text`, when one is a stop id: the generation
 /// would end there with the program unspent.
 fn no_stop(ids: &[u32], text: &str, env: &Env<'_>) -> Result<(), Refusal> {
     match ids.iter().find(|id| env.vocab.stops().contains(id)) {
-        Some(id) => Err(refuse(format!(
+        Some(id) => Err(outside(format!(
             "the text {text:?} tokenises to the stop id {id}: a stop id cannot occur before the \
              program is spent"
         ))),
@@ -478,14 +484,14 @@ fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
     for (k, alt) in alts.iter().enumerate() {
         let ids = env.encode(&alt.text)?;
         if ids.is_empty() {
-            return Err(refuse(format!(
+            return Err(outside(format!(
                 "the option {:?} tokenises to no token",
                 alt.text
             )));
         }
         no_stop(&ids, &alt.text, env)?;
         let clash = |other: usize| {
-            refuse(format!(
+            outside(format!(
                 "the options {:?} and {:?} tokenise so that one is a prefix of the other \
                  (ids {:?} and {:?}): the choice between them would be ambiguous",
                 alts[other].text, alt.text, seqs[other], ids
@@ -560,7 +566,7 @@ fn free_step(
             };
             let first = tail.as_bytes()[0];
             if !first.is_ascii() {
-                return Err(refuse(format!(
+                return Err(outside(format!(
                     "a raw value ends at {tail:?}, whose first character is not ASCII"
                 )));
             }
@@ -570,7 +576,7 @@ fn free_step(
     if let Some(tail) = tail
         && !env.vocab.prefixes_of(tail)
     {
-        return Err(refuse(format!(
+        return Err(outside(format!(
             "no token of the vocabulary is a prefix of {tail:?}, so a free string before it \
              could never end"
         )));
@@ -1622,29 +1628,28 @@ impl Walk {
         self.tail.clear();
     }
 
-    /// The text that followed the think span's end in the piece that ended
-    /// it, taken while this walk was held: a waiting walk reads it for its
-    /// opener and starts the program at one it completes. A span the
-    /// parser's own rule ends at a call opener (Qwen3-Coder's) leaves the
-    /// opener in it; where the vocabulary holds the opener as one special
-    /// token, only that is an opener — text spelling it is content — and a
-    /// piece that ran past the opener opens nothing, the bytes after it
-    /// already written. Any other walk reads none of it.
-    pub(crate) fn fed(&mut self, text: &str, at_opener: bool) {
+    /// The content a held walk's think tracker released in the piece that
+    /// ended its wait — the text past the span's end, the first content of a
+    /// reply whose span the model did not open, or the call opener that ends
+    /// the span where the parser's own rule says so (Qwen3-Coder's) — with the
+    /// special tokens' texts in it, as byte offsets and lengths: a waiting
+    /// walk reads it for its opener and starts the program at one it
+    /// completes. Where the vocabulary holds the opener as one special token,
+    /// only that token ending the content is an opener — text spelling it is
+    /// content — and a piece that ran past the opener opens nothing, the
+    /// bytes after it already written. Any other walk reads none of it.
+    pub(crate) fn fed(&mut self, text: &str, specials: &[(usize, usize)]) {
         let Some(o) = self.waiting.clone().filter(|_| self.heads.is_empty()) else {
             return;
         };
-        match o.special {
-            Some(_) => {
-                if at_opener && text == o.text {
-                    self.open(&o);
-                }
-            }
-            None => {
-                if self.wrote(text, &o) {
-                    self.open(&o);
-                }
-            }
+        let opens = match o.special {
+            Some(_) => specials.last().is_some_and(|&(at, len)| {
+                at + len == text.len() && len == o.text.len() && text.get(at..) == Some(o.text)
+            }),
+            None => self.wrote(text, &o),
+        };
+        if opens {
+            self.open(&o);
         }
     }
 

@@ -44,7 +44,8 @@ use serde_json::Value;
 
 use crate::callstream::{Args, Reading, find_from, held, read_value};
 use crate::constrain::{
-    Arg, Fun, Part, Refusal, Style, call, is_text, object_parameters, refuse, value,
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, is_text, object_parameters, outside,
+    value,
 };
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
@@ -660,27 +661,15 @@ impl CallRead {
 /// only where the schema says `"type": "string"`, itself or through a
 /// `$ref`, so a text-valued parameter that does not say it is refused
 /// rather than written as something that could read back as JSON.
-pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    let m = spelling.markers();
-    parts(m, funs, m.call_open)
-}
-
-/// The opener a `tool_choice: auto` reply is watched for — the spelling's
-/// call opening — and the call as parts once the model writes it:
-/// [`call_parts`] less the opener, which the free text has already written.
-pub(crate) fn lazy_parts(
+pub(crate) fn call_parts(
     spelling: KvSpelling,
     funs: &[Fun<'_>],
-) -> Result<(&'static str, Vec<Part>), Refusal> {
+    mode: CallMode,
+) -> Result<Call, Refusal> {
     let m = spelling.markers();
-    Ok((m.call_open, parts(m, funs, "")?))
-}
-
-/// [`call_parts`] over `open`, the text the function's name follows.
-fn parts(m: &Markers, funs: &[Fun<'_>], open: &str) -> Result<Vec<Part>, Refusal> {
     let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
         if is_text(&a.schema) && a.schema.get("type").and_then(Value::as_str) != Some("string") {
-            return Err(refuse(
+            return Err(outside(
                 &a.path,
                 format!(
                     "{}'s tool markup reads a text value as text only under \"type\": \
@@ -697,14 +686,15 @@ fn parts(m: &Markers, funs: &[Fun<'_>], open: &str) -> Result<Vec<Part>, Refusal
         parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
         Ok(parts)
     };
-    call(
+    let body = call(
         funs,
-        open,
+        "",
         |name| format!("{name}{}", m.line()),
         |f| {
             let mut parts = object_parameters(&f.args, &block)?;
             parts.push(Part::Text(m.call_close.to_owned()));
             Ok(parts)
         },
-    )
+    )?;
+    Ok(Call::opened(m.call_open, mode, body))
 }

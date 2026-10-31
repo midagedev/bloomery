@@ -570,6 +570,54 @@ fn hw_hermes_malformed_call_is_an_api_error() {
     }
 }
 
+/// Under `tool_choice` auto (given or not) a tool whose schema is invalid is a
+/// 400 naming the field, as a forced choice answers it; a valid one the
+/// structured-output subset cannot compile is served, the reply the model's.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_invalid_tool_schema_is_a_400_under_auto_and_an_unservable_one_is_served() {
+    let addr = start("Hi.");
+    let with = |parameters: Value| {
+        let mut b = tool_body(false);
+        b["tools"] = json!([{"type": "function", "function": {"name": "note",
+            "parameters": parameters}}]);
+        b
+    };
+    for auto in [None, Some("auto")] {
+        let mut b = with(
+            json!({"type": "object", "properties": {"a": {"type": "string"}},
+            "required": ["b"]}),
+        );
+        if let Some(c) = auto {
+            b["tool_choice"] = json!(c);
+        }
+        let r = post(addr, "/v1/chat/completions", &b);
+        assert_eq!(r.status, 400, "{}", r.body);
+        let e = &r.json()["error"];
+        assert_eq!(e["param"], "tools", "{}", r.body);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("tools[0].note.parameters: required names \"b\""),
+            "{}",
+            r.body
+        );
+    }
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &with(json!({"type": "object", "properties": {"tags": {"type": "array"}}})),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json()["choices"][0]["message"]["content"],
+        "Hi.",
+        "{}",
+        r.body
+    );
+}
+
 // ---------------------------------------------------------------- the span
 
 /// A chat body on the Qwen3 template with `extra` beside it.
@@ -788,6 +836,24 @@ fn hw_a_prompt_ending_think_newline_opens_the_span() {
     let m = &v["choices"][0]["message"];
     assert_eq!(m["reasoning_content"], "The user greets me.", "{v}");
     assert_eq!(m["content"], "Hello!", "{v}");
+}
+
+/// A `/completion` prompt that ends in `<think>` leaves the model inside the
+/// span under a watched call too, with no budget or loop guard asked: the
+/// opener the model writes in its reasoning starts no program, the text stays
+/// as the model wrote it, and the program waits for an opener past the close.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_watched_completion_waits_for_the_span_its_prompt_opened() {
+    let script = "mull <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": 5}}\n</tool_call> more</think>done";
+    let addr = start(script);
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "q<think>\n", "tools": tools(), "temperature": 0, "n_predict": 200}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["content"], script, "{}", r.body);
 }
 
 /// A forced call on each template the server writes: `tool_choice` `required`

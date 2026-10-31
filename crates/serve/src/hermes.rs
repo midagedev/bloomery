@@ -31,7 +31,7 @@
 use serde_json::Value;
 
 use crate::callstream::{self, Progress};
-use crate::constrain::{Fun, Part, Refusal, call};
+use crate::constrain::{Call, CallMode, Fun, Part, Refusal, call};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
 use crate::reasoning::{Marked, SpecialTags, partial_suffix};
@@ -420,24 +420,13 @@ fn compact_prefix(s: &str) -> String {
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`HermesScan`]. `{"name": NAME, "arguments": {…}}` between the
 /// tags, the name a choice among `funs` when there are several, the arguments
-/// one JSON object of the function's parameters.
-pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    parts(funs, &format!("{CALL_OPEN}\n{{\"name\": \""))
-}
-
-/// The opener a `tool_choice: auto` reply is watched for — this markup's
-/// `<tool_call>` — and the call as parts once the model writes it:
-/// [`call_parts`] less the opener, which the free text has already written.
-pub(crate) fn lazy_parts(funs: &[Fun<'_>]) -> Result<(&'static str, Vec<Part>), Refusal> {
-    Ok((CALL_OPEN, parts(funs, "\n{\"name\": \"")?))
-}
-
-/// [`call_parts`] over `open`, the text the function's name follows.
-fn parts(funs: &[Fun<'_>], open: &str) -> Result<Vec<Part>, Refusal> {
-    call(funs, open, str::to_owned, |f| {
+/// one JSON object of the function's parameters. The opener is `<tool_call>`.
+pub(crate) fn call_parts(funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refusal> {
+    let body = call(funs, "\n{\"name\": \"", str::to_owned, |f| {
         let mut parts = vec![Part::Text("\", \"arguments\": ".to_owned())];
         parts.extend(f.object()?);
         parts.push(Part::Text(format!("}}\n{CALL_CLOSE}")));
         Ok(parts)
-    })
+    })?;
+    Ok(Call::opened(CALL_OPEN, mode, body))
 }

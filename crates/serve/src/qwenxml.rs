@@ -60,7 +60,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::callstream::{self, Reading, held, read_value};
-use crate::constrain::{Arg, Fun, Part, Refusal, Style, call, object_parameters, value};
+use crate::constrain::{
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, object_parameters, value,
+};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
 use crate::reasoning::{Marked, SpecialTags, partial_suffix};
@@ -912,26 +914,12 @@ impl CallRead {
 /// each value written as the schema reads it (raw text for a string, JSON
 /// for the rest) and framed as `framing` says ([`Framing::Lines`] a line
 /// each, [`Framing::Compact`] none between the tags, as the compact
-/// template writes them).
-pub(crate) fn call_parts(framing: Framing, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    parts(framing, funs, &format!("{CALL_OPEN}\n{FUNCTION_OPEN}"))
-}
-
-/// The opener a `tool_choice: auto` reply is watched for — this markup's
-/// `<tool_call>` — and the call as parts once the model writes it:
-/// [`call_parts`] less the opener, which the free text has already written.
-pub(crate) fn lazy_parts(
+/// template writes them). The opener is `<tool_call>`.
+pub(crate) fn call_parts(
     framing: Framing,
     funs: &[Fun<'_>],
-) -> Result<(&'static str, Vec<Part>), Refusal> {
-    Ok((
-        CALL_OPEN,
-        parts(framing, funs, &format!("\n{FUNCTION_OPEN}"))?,
-    ))
-}
-
-/// [`call_parts`] over `open`, the text the function's name follows.
-fn parts(framing: Framing, funs: &[Fun<'_>], open: &str) -> Result<Vec<Part>, Refusal> {
+    mode: CallMode,
+) -> Result<Call, Refusal> {
     let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
         let mut parts = vec![Part::Text(format!(
             "{PARAM_OPEN}{}>{}",
@@ -945,10 +933,11 @@ fn parts(framing: Framing, funs: &[Fun<'_>], open: &str) -> Result<Vec<Part>, Re
         }));
         Ok(parts)
     };
-    call(funs, open, str::to_owned, |f| {
+    let body = call(funs, &format!("\n{FUNCTION_OPEN}"), str::to_owned, |f| {
         let mut parts = vec![Part::Text(">\n".to_owned())];
         parts.extend(object_parameters(&f.args, &block)?);
         parts.push(Part::Text(format!("{FUNCTION_CLOSE}\n{CALL_CLOSE}")));
         Ok(parts)
-    })
+    })?;
+    Ok(Call::opened(CALL_OPEN, mode, body))
 }

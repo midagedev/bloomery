@@ -2363,7 +2363,7 @@ impl Gen {
                 if let Some(w) = self.walk.as_mut() {
                     // The text past the span's end was taken freely; a
                     // waiting walk reads it for its opener.
-                    w.fed(&s.content, s.ended_at_opener);
+                    w.fed(&s.content, &s.specials);
                 }
                 return Ok(false);
             }

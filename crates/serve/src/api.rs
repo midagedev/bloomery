@@ -4514,16 +4514,21 @@ struct CompletionPlan {
 }
 
 /// The completion path's steps on a completion body: the sampling fields,
-/// the prompt's ids ([`completion_prompt`]) and the think-span budget and
-/// loop guard, whose span check reads the prompt's text (a string prompt is
-/// its own, an id array's its decode) and whose span ends where the chat
-/// parser's does (a Qwen3-Coder call ends it too). Every route that runs a
-/// completion builds its generation here.
+/// the prompt's ids ([`completion_prompt`]) and the think-span steps: the
+/// budget, the loop guard and a call program (forced or watched), which
+/// starts where the span ends. The span check reads the prompt's text (a
+/// string prompt is its own, an id array's its decode) and the span ends
+/// where the chat parser's does (a Qwen3-Coder call ends it too). Every
+/// route that runs a completion builds its generation here.
 fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPlan, ApiError> {
     let mut p = gen_params(state, b)?;
     let ids = completion_prompt(state, b.get("prompt"))?;
     let call = follows_reasoning(&p);
-    if p.reasoning_budget.is_some() || p.reasoning_loop || call {
+    let after_span = p
+        .constraint
+        .as_ref()
+        .is_some_and(constrain::Constraint::follows_reasoning);
+    if p.reasoning_budget.is_some() || p.reasoning_loop || after_span {
         let text = match b.get("prompt") {
             Some(Value::String(s)) => s.clone(),
             _ => state.tok.decode(&ids),

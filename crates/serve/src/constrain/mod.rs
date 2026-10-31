@@ -20,14 +20,15 @@
 //!
 //! The tool-call text comes from the chat format's own module (`hermes`,
 //! `qwenxml`, `glmxml`, `dsml`): each has an inverse of its parser, a
-//! `call_parts` beside it, and none of this module knows a model. Each
-//! names its call opener beside that too (`lazy_parts`), which a
-//! `tool_choice: auto` request's free text is watched for: the generation
-//! is free until the model opens a call, the program a forced call compiles
-//! runs from the opener to the call's close, and free text follows again,
-//! each further opener starting the program again. Muse Spark's markup
-//! names no such opener (its recipient slot names the answer's channels as
-//! well as a tool), so its replies stay free under auto.
+//! `call_parts` beside it, and none of this module knows a model. It names
+//! the call opener apart from the rest, so one function serves a forced
+//! call (the program writes the opener too) and a `tool_choice: auto`
+//! request's free text, which is watched for the opener: the generation is
+//! free until the model opens a call, the program runs from the opener to
+//! the call's close, and free text follows again, each further opener
+//! starting the program again. Muse Spark's markup names no such opener (its
+//! recipient slot names the answer's channels as well as a tool), so its
+//! replies stay free under auto.
 //!
 //! The generation loop ([`crate::genloop`]) asks the walk for each token
 //! through the same logits-row path a banned id takes, and feeds the chosen
@@ -50,7 +51,8 @@ mod vocab;
 pub(crate) use program::Kid;
 pub(crate) use program::{Constraint, Decision, Draw, Part, StepError, Style, Walk, Watch};
 pub(crate) use schema::{
-    Arg, Ask, Fun, any_start, call, is_text, object_parameters, refuse, request, value,
+    Arg, Ask, Call, CallMode, Fun, any_start, call, is_text, object_parameters, outside, request,
+    value,
 };
 pub(crate) use vocab::Vocab;
 
@@ -63,6 +65,11 @@ pub(crate) struct Refusal {
     pub message: String,
     /// The markup is unsupported, not the request invalid.
     pub unsupported: bool,
+    /// The request is valid and names a keyword or shape the compiler does
+    /// not serve (a schema keyword outside the subset, text the vocabulary
+    /// cannot spell). A forced choice refuses it all the same; a watched
+    /// call serves it with no watch.
+    pub outside_subset: bool,
     /// The path of the request field refused (`response_format.json_schema.schema.items`),
     /// when the refusal is about one.
     pub field: Option<String>,
@@ -73,7 +80,16 @@ impl Refusal {
         Refusal {
             message,
             unsupported: false,
+            outside_subset: false,
             field: None,
+        }
+    }
+
+    /// A valid request the compiler does not serve ([`Refusal::outside_subset`]).
+    pub(crate) fn outside_subset(message: String) -> Refusal {
+        Refusal {
+            outside_subset: true,
+            ..Refusal::invalid(message)
         }
     }
 }
