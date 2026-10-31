@@ -413,7 +413,6 @@ fn half_out<'b>(
     }
 }
 
-/// The refusal of a sandwich layer over an arena with no join buffer.
 /// What layer `l`'s half `half` hands on to: the reader, its weight type and
 /// gain, and the hand-on buffer the writer fills.
 struct HandOnTo<'a> {
@@ -451,6 +450,7 @@ fn hand_on_to<'a>(
     })
 }
 
+/// The refusal of a sandwich layer over an arena with no join buffer.
 fn no_join(l: usize) -> SessionError {
     refuse(format!(
         "layer {l}: a sandwich residual over an arena with no join buffer"
@@ -697,22 +697,33 @@ impl MetalOps<'_, '_> {
         Ok(())
     }
 
-    /// Layer `l`'s down group of a dense FFN under a sandwich: its one slot's
-    /// down projection stored into the join buffer. The fold only adds into
-    /// its output, and the sandwich norms the projection before it joins the
-    /// stream, so the dense down is the plain mat-vec; a dense slot's route
-    /// weight is 1.
-    fn dense_down_store(&mut self, l: usize) -> Result<(), SessionError> {
+    /// Layer `l`'s down group: a plain residual folds the routed experts'
+    /// down projections into the stream. A dense FFN's one down projection
+    /// is the plain mat-vec, into the output [`half_out`] picks: added into
+    /// the stream by the residual mat-vec under a plain residual (a dense
+    /// slot's route weight is 1 and the mat-vec walks the fold's lane order,
+    /// so the stream takes the fold's bits), stored into the join buffer for
+    /// [`MetalOps::join`] under a sandwich. A sandwich over a routed FFN is
+    /// refused by name: the combine only adds.
+    pub(super) fn experts_down(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        match (&l.plan.ffn.route, &l.plan.residual) {
+            (FfnRoute::Router { .. }, ResidualPlan::Plain) => return self.experts_fold(l.layer),
+            (FfnRoute::Router { .. }, ResidualPlan::Sandwich(_)) => {
+                return Err(routed_sandwich(l.layer));
+            }
+            (FfnRoute::Dense, _) => {}
+        }
         let Arena {
             layers,
             h,
+            x,
             join,
             hidden,
             geom,
             ..
         } = &mut *self.arena;
-        let f = &layers[l].ffn;
-        let join = join.as_mut().ok_or_else(|| no_join(l))?;
+        let f = &layers[l.layer].ffn;
+        let (y, mode) = half_out(l, x, join, *hidden)?;
         self.kernels.matvec(
             self.enc,
             MatvecParams {
@@ -721,57 +732,12 @@ impl MetalOps<'_, '_> {
                 cols: geom.experts.k,
                 weights: all(&f.down)?,
                 x: h.window(Elems(0), Elems(geom.experts.k))?,
-                y: all_mut(join)?,
-                mode: Mode::Store,
+                y,
+                mode,
             },
         )?;
         self.close();
         Ok(())
-    }
-
-    /// Layer `l`'s dense down group under a plain residual: its one slot's
-    /// down projection added into the stream by the residual mat-vec. A
-    /// dense slot's route weight is 1 and the mat-vec walks the fold's lane
-    /// order, so the stream takes the fold's bits with no per-block slot
-    /// address.
-    fn dense_down_add(&mut self, l: usize) -> Result<(), SessionError> {
-        let Arena {
-            layers,
-            h,
-            x,
-            hidden,
-            geom,
-            ..
-        } = &mut *self.arena;
-        let f = &layers[l].ffn;
-        self.kernels.matvec(
-            self.enc,
-            MatvecParams {
-                quant: f.down_quant,
-                rows: *hidden,
-                cols: geom.experts.k,
-                weights: all(&f.down)?,
-                x: h.window(Elems(0), Elems(geom.experts.k))?,
-                y: x.window_mut(Elems(0), Elems(*hidden))?,
-                mode: Mode::Residual,
-            },
-        )?;
-        self.close();
-        Ok(())
-    }
-
-    /// Layer `l`'s down group: a plain residual folds the routed experts'
-    /// down projections into the stream, and adds a dense FFN's one
-    /// ([`MetalOps::dense_down_add`]); a sandwich over a dense FFN stores its
-    /// one down projection into the join buffer for [`MetalOps::join`]. A
-    /// sandwich over a routed FFN is refused by name: the combine only adds.
-    pub(super) fn experts_down(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
-        match (&l.plan.ffn.route, &l.plan.residual) {
-            (FfnRoute::Dense, ResidualPlan::Plain) => self.dense_down_add(l.layer),
-            (FfnRoute::Router { .. }, ResidualPlan::Plain) => self.experts_fold(l.layer),
-            (FfnRoute::Dense, ResidualPlan::Sandwich(_)) => self.dense_down_store(l.layer),
-            (FfnRoute::Router { .. }, ResidualPlan::Sandwich(_)) => Err(routed_sandwich(l.layer)),
-        }
     }
 
     /// Layer `l`'s delta out group: the head-norm projection of the gated
