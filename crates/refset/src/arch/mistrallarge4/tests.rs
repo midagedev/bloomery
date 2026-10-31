@@ -16,7 +16,7 @@ const ROW: Row = Row {
     other_files: &[
         "/models/Mistral-Large-4-1T-A52B-UD-IQ1_M/Mistral-Large-4-1T-A52B-UD-IQ1_M-00001-of-00007.gguf",
         "/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00002-of-00006.gguf",
-        "/home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf",
+        "/models/elsewhere/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf",
     ],
     other_builds: &[
         "78feec062",
