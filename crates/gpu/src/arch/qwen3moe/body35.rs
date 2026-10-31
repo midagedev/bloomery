@@ -109,6 +109,7 @@ use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
 use super::wide38::STREAM_FLOOR;
 use crate::checkpoint::{self, Checkpoints};
+use crate::draft::WalkMode;
 use crate::folder::{Model, Origin};
 use crate::head::Head;
 use crate::host::prompt_stream::PromptStream;
@@ -2935,7 +2936,7 @@ impl Body35 {
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        feed: (u32, usize),
+        (t, pos): (u32, usize),
         h: &DeviceBuffer<f32>,
     ) -> Result<u32, GpuError> {
         let Body35 {
@@ -2945,7 +2946,13 @@ impl Body35 {
             "qwen35moe mtp_draft",
             "the load carries no next-token layer (open it with GpuModel::open_mtp)",
         ))?;
-        mtp.enqueue(gpu, w, (&*k, &rope.table, *mma), feed, h)?;
+        mtp.enqueue(
+            gpu,
+            w,
+            (&*k, &rope.table, *mma),
+            (t, pos, WalkMode::Eager),
+            h,
+        )?;
         mtp.token(gpu)
     }
 }

@@ -54,7 +54,7 @@ use crate::watchdog;
 use crate::weights::{CardOf, HEAD_TENSOR, Weights, head_tensor};
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
-use cuda_core::{CudaContext, CudaStream};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use engram::direct::DIRECT_ALIGN;
 use gguf::Split;
 use model::arch::Arch;
@@ -1850,6 +1850,19 @@ impl<B: ChainBody> GpuModel<B> {
         _what: &'static str,
     ) -> Result<(&Gpu, &Weights, &mut B), GpuError> {
         Ok((&self.gpu, &self.weights, &mut *self.body))
+    }
+
+    /// [`GpuModel::body_parts`] beside the head's normed rows of the last
+    /// `step` or prompt call on the card ([`GpuModel::head_normed`]'s rows,
+    /// not read back), for a body's launch on the engine stream that reads
+    /// them where they sit. Refused as `head_normed` is.
+    pub(crate) fn body_parts_normed(
+        &mut self,
+        what: &'static str,
+    ) -> Result<(&Gpu, &Weights, &mut B, &DeviceBuffer<f32>), GpuError> {
+        self.refuse_one_pass(what)?;
+        let head = self.heads.first().ok_or(no_head(what))?;
+        Ok((&self.gpu, &self.weights, &mut *self.body, head.normed()))
     }
 
     /// The body, for an instrument that only reads it. Never fails, as
