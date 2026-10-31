@@ -82,16 +82,18 @@ pub const fn head_gate(inst: &Instance) -> bool {
     inst.key.attn.head_gate
 }
 
-/// The keys the split rule sizes its segments by: past [`ONE_PASS_KEYS`] a
-/// segment holds two tiles, `SEGMENT_KEYS / 2` keys (the count model and the
-/// e2e gate read it as their sessions' one segment of keys).
+/// The live keys the count model and the e2e gate take as one segment's
+/// worth: their sessions this deep run one segment (it is under
+/// [`ONE_PASS_KEYS`]).
 pub const SEGMENT_KEYS: usize = 64;
 
 /// The live-key ceiling one segment holds. At or under it the f16 launch is
 /// the one-pass flash, a threadgroup a query head over every key the layer
-/// attends, which writes no partial; past it the segment rule splits the
-/// keys and the flash's last threadgroup folds the partials.
-pub const ONE_PASS_KEYS: usize = 16384;
+/// attends, which writes no partial; past it the keys split into
+/// [`SEGMENT_CAP`] segments and the flash's last threadgroup folds the
+/// partials. Past it the split's threadgroups a key head outrun the one
+/// threadgroup a query head the one pass has.
+pub const ONE_PASS_KEYS: usize = 512;
 
 /// Threads in the flash threadgroup of `inst`: a SIMD group to each query
 /// head of a key head.
@@ -218,25 +220,6 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
             "1 to 8 (a SIMD group each in a flash of that many)",
         );
     }
-    // The fold: a thread to each head's share, every head at once, so the
-    // flash's threads are the query heads times the threads a head has, a
-    // SIMD width over the key heads.
-    if !SIMD_WIDTH.is_multiple_of(a.kv_heads) {
-        return refuse(
-            "key heads",
-            &a.kv_heads,
-            "a divisor of 32 (the fold's threads a head)",
-        );
-    }
-    // The fold's factors, two floats a segment a head and three a head, sit
-    // in one threadgroup's memory at the segment cap.
-    if a.query_heads * (2 * SEGMENT_CAP + 3) * 4 > SHARED_BYTES {
-        return refuse(
-            "query heads",
-            &a.query_heads,
-            "at most 62 (the fold's factors in 32 KB of threadgroup memory)",
-        );
-    }
     // The one-pass flash merges a thread a value, and holds the query, the
     // key's scratch, the key's and value's halves and every group's values in
     // one threadgroup's memory.
@@ -302,27 +285,24 @@ pub fn segments_for_window(n_keys: u32, window: Option<u32>) -> u32 {
 ///
 /// At or under [`ONE_PASS_KEYS`] the keys are one segment: the f16 flash is
 /// the one-pass launch, one dispatch that finishes in its epilogue. Past it
-/// the keys split two tiles a segment, capped so the partials the split
-/// writes and the fold reads stay a small share of the K/V bytes at depth
-/// (at today's waterline every split count is the cap). Zero keys are still
-/// one segment: the flash raises on that count.
+/// the keys split into [`SEGMENT_CAP`] segments at every depth. Zero keys are
+/// still one segment: the flash raises on that count.
 #[must_use]
 pub fn segments_for_keys(n_keys: u32) -> u32 {
-    let n = u64::from(n_keys);
-    let segments = if n <= ONE_PASS_KEYS as u64 {
+    if n_keys as usize <= ONE_PASS_KEYS {
         1
     } else {
-        n.div_ceil((SEGMENT_KEYS / 2) as u64)
-            .min(SEGMENT_CAP as u64)
-    };
-    u32::try_from(segments.max(1)).expect("a segment count fits u32")
+        SEGMENT_CAP as u32
+    }
 }
 
-/// The most segments a key count takes. The partials are
-/// `query_heads * SEGMENT_CAP * partial_elems` values, written by the flash
-/// and read by its fold; at the cap they are an eighth of the K/V bytes of
-/// the keys that reach it.
-pub const SEGMENT_CAP: usize = 64;
+/// The most segments a key count takes, and the count every split takes:
+/// fewer leave the split's threadgroups too few to keep the card's cores
+/// busy, more lengthen the fold, which reads every segment's partial of every
+/// head in the dispatch's last threadgroup. The partials are
+/// `query_heads * SEGMENT_CAP * partial_elems` values, a small share of the
+/// K/V bytes of the keys past [`ONE_PASS_KEYS`].
+pub const SEGMENT_CAP: usize = 16;
 
 /// `attn_span`'s rule (attention.metal): the keys a segment holds, rounded
 /// up to a tile, with the empty-count floor. This mirror exists so the
@@ -381,30 +361,25 @@ mod tests {
             assert_eq!(holds(&g), Ok(()), "{n_head} heads over {n_kv}");
             assert_eq!(g.attn.gqa, gqa, "{n_head}/{n_kv}: group");
             assert_eq!(g.attn.flash_threads, threads, "{n_head}/{n_kv}: threads");
-            assert_eq!(
-                g.attn.query_heads * g.attn.head,
-                g.attn.flash_threads * (g.attn.head * g.attn.kv_heads / SIMD_WIDTH),
-                "{n_head}/{n_kv}: the fold's threads hold every value"
-            );
         }
     }
 
     #[test]
-    fn the_flash_refuses_a_group_past_a_fragment_and_key_heads_off_the_width() {
+    fn the_flash_refuses_a_group_past_a_fragment_and_folds_any_key_heads() {
         let wide = Geometry::of(&shaped(20, 2));
         let refused = holds(&wide).expect_err("ten query heads a key head");
         assert_eq!(
             (refused.kernel, refused.axis),
             ("attention", "query heads a key head")
         );
-        let odd = Geometry::of(&shaped(24, 3));
-        let refused = holds(&odd).expect_err("three key heads");
-        assert_eq!((refused.kernel, refused.axis), ("attention", "key heads"));
-        // 128 heads over 16: a group the flash takes, but 128 heads' fold
-        // factors (128 × 131 floats) are past 32 KB.
-        let many = Geometry::of(&shaped(128, 16));
-        let refused = holds(&many).expect_err("128 query heads");
-        assert_eq!((refused.kernel, refused.axis), ("attention", "query heads"));
+        // The fold walks the heads a SIMD group at a time, so three key heads
+        // and 128 query heads are shapes it takes.
+        assert_eq!(holds(&Geometry::of(&shaped(24, 3))), Ok(()), "24 over 3");
+        assert_eq!(
+            holds(&Geometry::of(&shaped(128, 16))),
+            Ok(()),
+            "128 over 16"
+        );
     }
 
     #[test]
@@ -419,11 +394,6 @@ mod tests {
         assert_eq!((a.simd_groups, a.flash_threads, a.lane_dims), (4, 128, 4));
         assert!(a.windowed && a.head_gate && !a.gated);
         assert_eq!(a.qg_stride, a.head, "a head gate adds nothing to the query");
-        // The fold's threads hold every value of every head.
-        assert_eq!(
-            a.query_heads * a.head,
-            a.flash_threads * (a.head * a.kv_heads / SIMD_WIDTH)
-        );
         // A whole head turns: thread t of each of the two warps owns the
         // pair (t, t + 64).
         assert_eq!(a.rot, a.head);
@@ -448,10 +418,10 @@ mod tests {
             (300u32, Some(256u32), 1u32),
             (1025, Some(256), 1),
             (20_000, Some(256), 1),
-            (20_000, None, 64),
+            (20_000, None, 16),
             (100, Some(256), 1),
-            (20_000, Some(16_384), 1),
-            (20_000, Some(16_385), 64),
+            (20_000, Some(512), 1),
+            (20_000, Some(513), 16),
             (1025, Some(1), 1),
             (64, Some(64), 1),
         ] {
@@ -465,16 +435,15 @@ mod tests {
 
     #[test]
     fn one_segment_holds_the_waterline() {
-        for n in [1u32, 2, 63, 64, 65, 256, 1024, 4096, 16_383, 16_384] {
+        for n in [1u32, 2, 63, 64, 65, 256, 511, 512] {
             assert_eq!(segments_for_keys(n), 1, "{n} keys are one segment");
         }
     }
 
     #[test]
     fn the_rule_picks_the_counted_splits() {
-        // The counted splits past the waterline: two tiles a segment would
-        // pass the cap, so every count is the cap.
-        for (n, want) in [(16_385u32, 64u32), (32_768, 64), (262_144, 64)] {
+        // Every count past the waterline is the cap.
+        for (n, want) in [(513u32, 16u32), (4096, 16), (16_385, 16), (262_144, 16)] {
             assert_eq!(segments_for_keys(n), want, "{n} keys");
         }
     }

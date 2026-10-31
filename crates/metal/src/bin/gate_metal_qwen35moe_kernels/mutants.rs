@@ -160,19 +160,12 @@ pub const Q30_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_factors_tile_sized",
         clause: "attn_f16",
-        why: "the shared block is the K and V tiles' size, so 32 heads' factors at 64 segments run past it",
-        edits: &[
-            (
-                "    (ATTN_TILE_WORDS > ATTN_FACTOR_WORDS ? ATTN_TILE_WORDS : ATTN_FACTOR_WORDS)",
-                "    (ATTN_TILE_WORDS)",
-                1,
-            ),
-            (
-                "static_assert(ATTN_SHARED_WORDS * 4u >= BLOOMERY_ATTN_Q * BLOOMERY_ATTN_SEGMENT_CAP * 2u,",
-                "static_assert(true,",
-                1,
-            ),
-        ],
+        why: "the shared block holds a head row for every two SIMD groups, so two query heads' prepares pair through one row",
+        edits: &[(
+            "threadgroup float *row = scratch + sg * BLOOMERY_ATTN_HEAD;",
+            "threadgroup float *row = scratch + (sg / 2u) * BLOOMERY_ATTN_HEAD;",
+            1,
+        )],
     },
     Mutant {
         name: "attn_norm_pair_32",
@@ -369,10 +362,10 @@ pub const GQA_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "fold_dim_stride_16",
         clause: "attn_f16",
-        why: "the fold's thread owns the values 16 apart, whatever the key heads divide the SIMD width into",
+        why: "the fold's lane owns the values from lane * 4, whatever the head divides the SIMD width into",
         edits: &[(
-            "uint dim = d * ATTN_FOLD_SUBS + sub;",
-            "uint dim = d * 16u + sub;",
+            "uint fold_dim0 = lane * BLOOMERY_ATTN_LANE_DIMS;",
+            "uint fold_dim0 = lane * 4u;",
             1,
         )],
     },
@@ -2482,13 +2475,13 @@ pub const MUTANTS: &[Mutant] = &[
         why: "a key past the segment's end scores its zero row as 0 and weighs in",
         edits: &[
             (
-                "scores[t] = lo + t < hi ? score : -INFINITY;",
-                "scores[t] = score;",
+                "float scored = FULL || lo + t < hi ? score : -INFINITY;",
+                "float scored = score;",
                 1,
             ),
             (
-                "float weight = lo + t < hi ? exp(scores[t] - new_m) : 0.0f;",
-                "float weight = exp(scores[t] - new_m);",
+                "float weight = lo + lane < hi ? exp(mine - new_m) : 0.0f;",
+                "float weight = exp(mine - new_m);",
                 1,
             ),
         ],
@@ -2496,26 +2489,46 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_prefetch_stale",
         clause: "attn_f16",
-        why: "the next tile is never fetched, so every tile after the first is the first's rows again",
-        edits: &[("if (next < seg_hi) {", "if (false) {", 1)],
+        why: "every tile reads the cache's first tile's rows, so every tile after the first is the first's rows again",
+        edits: &[("uint key = lo + t0 + c;", "uint key = t0 + c;", 2)],
+    },
+    Mutant {
+        name: "attn_tile_score_lane",
+        clause: "attn_f16",
+        why: "lane t keeps the score of the tile's key t - 1, so every key weighs at its neighbour's score",
+        edits: &[(
+            "mine = lane == t ? scored : mine;",
+            "mine = lane == t + 1u ? scored : mine;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_tile_weight_shuffle",
+        clause: "attn_f16",
+        why: "every value of a run of rows in flight takes the run's first key's weight",
+        edits: &[(
+            "float w = simd_shuffle(weight, ushort(t0 + c));",
+            "float w = simd_shuffle(weight, ushort(t0));",
+            1,
+        )],
     },
     Mutant {
         name: "attn_fold_stage_l",
         clause: "attn_f16",
-        why: "the fold stages a segment's first value in place of its weight sum",
+        why: "the fold reads a segment's first value in place of its weight sum",
         edits: &[(
-            "factors[2u * p + 1u] = ticket_load(partials, base + 1u);",
-            "factors[2u * p + 1u] = ticket_load(partials, base + 2u);",
+            "lj = ticket_load(partials, base + 1u);",
+            "lj = ticket_load(partials, base + 2u);",
             1,
         )],
     },
     Mutant {
         name: "attn_fold_empty_unskipped",
         clause: "attn_f16",
-        why: "a segment holding no key keeps its staged maximum and weight sum as a kind and a factor, and rescales the accumulator to zero",
+        why: "a fold slot past the head's segments is not left empty: it folds the next head's first segment as one of its own",
         edits: &[(
-            "                mine[2u * seg] = 2.0f;\n                continue;",
-            "                continue;",
+            "if (slot < args.segments) {",
+            "if (slot < args.segments + 1u) {",
             1,
         )],
     },

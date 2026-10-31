@@ -294,6 +294,18 @@ impl Pipeline {
         self.max_threads_per_group
     }
 
+    /// The SIMD width this pipeline runs at.
+    #[must_use]
+    pub fn execution_width(&self) -> usize {
+        self.state.threadExecutionWidth()
+    }
+
+    /// The threadgroup memory the pipeline's function declares, in bytes.
+    #[must_use]
+    pub fn static_group_bytes(&self) -> usize {
+        self.state.staticThreadgroupMemoryLength()
+    }
+
     /// The entry's name and its function-constant values.
     #[cfg(feature = "pipeline-label")]
     #[must_use]
