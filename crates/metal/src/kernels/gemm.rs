@@ -735,6 +735,8 @@ impl Kernels {
             Quant::Q6K => &self.q6k_gemm,
             Quant::A4 => &self.a4_gemm,
             Quant::A8 => &self.a8_gemm,
+            Quant::A4H => &self.a4h_gemm,
+            Quant::A8H => &self.a8h_gemm,
             Quant::Q8_0 => &self.q8_0_gemm,
             Quant::Q5K => &self.q5k_gemm,
             // The f32 rows have no tile of this family: a pass runs each

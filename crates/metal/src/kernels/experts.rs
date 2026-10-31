@@ -418,6 +418,8 @@ pub(crate) struct Pipelines {
     pair_q6: Pipeline,
     pair_a4: Pipeline,
     pair_a8: Pipeline,
+    pair_a4h: Pipeline,
+    pair_a8h: Pipeline,
     pair_q8_0: Pipeline,
     pair_q5k: Pipeline,
     /// The pair over a scaled input, one per type: stacks and a shared
@@ -427,6 +429,8 @@ pub(crate) struct Pipelines {
     fold_q6: Pipeline,
     fold_a4: Pipeline,
     fold_a8: Pipeline,
+    fold_a4h: Pipeline,
+    fold_a8h: Pipeline,
     fold_q8_0: Pipeline,
     fold_q5k: Pipeline,
     /// The entries of two types: a pair of [`APART_GATE_UP`] for the pair, of
@@ -456,6 +460,8 @@ impl Pipelines {
             pair_q6: library.pipeline_with_simdgroups("q6k_pair_swiglu", simdgroups)?,
             pair_a4: library.pipeline_with_simdgroups("a4_pair_swiglu", simdgroups)?,
             pair_a8: library.pipeline_with_simdgroups("a8_pair_swiglu", simdgroups)?,
+            pair_a4h: library.pipeline_with_simdgroups("a4h_pair_swiglu", simdgroups)?,
+            pair_a8h: library.pipeline_with_simdgroups("a8h_pair_swiglu", simdgroups)?,
             pair_q8_0: library.pipeline_with_simdgroups("q8_0_pair_swiglu", simdgroups)?,
             pair_q5k: library.pipeline_with_simdgroups("q5k_pair_swiglu", simdgroups)?,
             pair_scaled: [
@@ -463,6 +469,8 @@ impl Pipelines {
                 Quant::Q6K,
                 Quant::A4,
                 Quant::A8,
+                Quant::A4H,
+                Quant::A8H,
                 Quant::Q8_0,
                 Quant::Q5K,
             ]
@@ -476,6 +484,8 @@ impl Pipelines {
             fold_q6: library.pipeline_with_simdgroups("q6k_down_fold", simdgroups)?,
             fold_a4: library.pipeline_with_simdgroups("a4_down_fold", simdgroups)?,
             fold_a8: library.pipeline_with_simdgroups("a8_down_fold", simdgroups)?,
+            fold_a4h: library.pipeline_with_simdgroups("a4h_down_fold", simdgroups)?,
+            fold_a8h: library.pipeline_with_simdgroups("a8h_down_fold", simdgroups)?,
             fold_q8_0: library.pipeline_with_simdgroups("q8_0_down_fold", simdgroups)?,
             fold_q5k: library.pipeline_with_simdgroups("q5k_down_fold", simdgroups)?,
             pair_apart: apart("pair_swiglu", &APART_GATE_UP)?,
@@ -515,6 +525,8 @@ impl Pipelines {
             Quant::Q6K => Some(&self.pair_q6),
             Quant::A4 => Some(&self.pair_a4),
             Quant::A8 => Some(&self.pair_a8),
+            Quant::A4H => Some(&self.pair_a4h),
+            Quant::A8H => Some(&self.pair_a8h),
             Quant::Q8_0 => Some(&self.pair_q8_0),
             Quant::Q5K => Some(&self.pair_q5k),
             Quant::F32 => None,
@@ -531,6 +543,8 @@ impl Pipelines {
             Quant::Q6K => Some(&self.fold_q6),
             Quant::A4 => Some(&self.fold_a4),
             Quant::A8 => Some(&self.fold_a8),
+            Quant::A4H => Some(&self.fold_a4h),
+            Quant::A8H => Some(&self.fold_a8h),
             Quant::Q8_0 => Some(&self.fold_q8_0),
             Quant::Q5K => Some(&self.fold_q5k),
             Quant::F32 => None,
@@ -642,5 +656,32 @@ impl super::Kernels {
         slot.set(p.fault.binding())?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.dispatch_groups(shape.groups_x, 1, self.threads_per_group())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shared expert beside stacks of an affine type reads that same type:
+    /// the F16-pair form of a width, the BF16 form of it and the other width
+    /// have no pair or fold entry with each other, and the open refuses the
+    /// combination by name.
+    #[test]
+    fn a_shared_expert_of_another_affine_kind_has_no_entry() {
+        let kinds = [Quant::A4, Quant::A8, Quant::A4H, Quant::A8H];
+        for stack in kinds {
+            for shared in kinds {
+                for gate_up in [true, false] {
+                    assert_eq!(
+                        shared_entry(stack, shared, gate_up),
+                        stack == shared,
+                        "{} stacks beside a {} shared expert, gate_up {gate_up}",
+                        stack.name(),
+                        shared.name()
+                    );
+                }
+            }
+        }
     }
 }

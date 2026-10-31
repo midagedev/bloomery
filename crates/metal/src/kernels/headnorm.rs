@@ -25,8 +25,8 @@ use super::{Kernels, args_bytes, check_window_len, pack, word};
 /// the gated numerator, the heads' partial sums, and the output the residual
 /// is added into.
 pub struct HeadNormParams<'w> {
-    /// The weight type. Q4_K, A4 and A8 have a head-normed entry; Q6_K has
-    /// none and is refused by name.
+    /// The weight type. Q4_K, A4, A8, A4H and A8H have a head-normed entry;
+    /// Q6_K has none and is refused by name.
     pub quant: Quant,
     /// The output rows: the model's hidden width.
     pub rows: usize,
@@ -121,6 +121,8 @@ impl Kernels {
             Quant::Q4K => &self.headnorm,
             Quant::A4 => &self.headnorm_a4,
             Quant::A8 => &self.headnorm_a8,
+            Quant::A4H => &self.headnorm_a4h,
+            Quant::A8H => &self.headnorm_a8h,
             Quant::Q8_0 => &self.headnorm_q8_0,
             Quant::Q5K => &self.headnorm_q5k,
             // A quant with no head-normed entry is refused by name: the mode

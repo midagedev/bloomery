@@ -993,8 +993,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "the A4 bias term is subtracted, not added",
         edits: &[(
-            "+ as_type<float>(sb & 0xFFFF0000u) * lane.sumy;",
-            "- as_type<float>(sb & 0xFFFF0000u) * lane.sumy;",
+            "+ Pair::bias_of_word(sb) * lane.sumy;",
+            "- Pair::bias_of_word(sb) * lane.sumy;",
             1,
         )],
     },
@@ -1003,8 +1003,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "the A4 code dot is scaled by the bias, not the scale",
         edits: &[(
-            "return as_type<float>(sb << 16) * ((acc[0] + 1.f/16.f * acc[1]) +",
-            "return as_type<float>(sb & 0xFFFF0000u) * ((acc[0] + 1.f/16.f * acc[1]) +",
+            "return Pair::scale_of_word(sb) * ((acc[0] + 1.f/16.f * acc[1]) +",
+            "return Pair::bias_of_word(sb) * ((acc[0] + 1.f/16.f * acc[1]) +",
             1,
         )],
     },
@@ -1033,8 +1033,38 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a8_matvec",
         why: "the A8 code dot is scaled by the bias, not the scale",
         edits: &[(
-            "const float s = as_type<float>(sb << 16);",
-            "const float s = as_type<float>(sb & 0xFFFF0000u);",
+            "const float s = Pair::scale_of_word(sb);",
+            "const float s = Pair::bias_of_word(sb);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "half_scale_as_bf16",
+        clause: "a8h_matvec",
+        why: "the F16-pair kinds read a group's scale as BF16 bits (the word's low half shifted into an f32), so every scale is another value",
+        edits: &[(
+            "return float(as_type<half2>(sb).x);",
+            "return as_type<float>(sb << 16);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "half_bias_as_scale",
+        clause: "a8h_matvec",
+        why: "the F16-pair kinds read a group's bias as its scale (the word's low half twice), so the bias fold adds s·Σx and the bias is lost",
+        edits: &[(
+            "return float(as_type<half2>(sb).y);",
+            "return float(as_type<half2>(sb).x);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "half_widen_as_bf16",
+        clause: "a4h_embed",
+        why: "the F16-pair kinds widen a 16-bit scale or bias field (the embedding's and the GEMMs' value decode) as BF16 bits",
+        edits: &[(
+            "return float(as_type<half>((ushort)bits));",
+            "return as_type<float>(bits << 16);",
             1,
         )],
     },

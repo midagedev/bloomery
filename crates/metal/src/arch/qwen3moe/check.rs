@@ -68,6 +68,9 @@ const ANY: &[SiteTy] = &[
     SiteTy::Fp8B128,
     SiteTy::Bf16,
     SiteTy::MlxA4,
+    SiteTy::MlxA8,
+    SiteTy::MlxA4h,
+    SiteTy::MlxA8h,
 ];
 
 /// [`ANY`] as the reader's six lists.
@@ -154,9 +157,9 @@ impl Table<'_> {
     }
 
     /// F32 tensor `name` of `len` values, or MLX's affine 8-bit tensor of the
-    /// same values, which the open dequantizes exactly: the router and the
-    /// shared-expert gate never run a kernel, so no 8-bit path exists on the
-    /// card.
+    /// same values — BF16- or F16-scaled (`MLX_A8`, `MLX_A8H`) — which the
+    /// open dequantizes exactly: the router and the shared-expert gate never
+    /// run a kernel, so no 8-bit path exists on the card.
     fn f32s_or_a8(&self, name: &str, len: usize) -> Result<Values, SessionError> {
         let (ty, dims) = self.info(name)?;
         let n: u64 = dims.iter().product();
@@ -166,9 +169,9 @@ impl Table<'_> {
             )));
         }
         match ty {
-            GgmlType::F32 | GgmlType::MLX_A8 => Ok(Values::new(name, len, ty)),
+            GgmlType::F32 | GgmlType::MLX_A8 | GgmlType::MLX_A8H => Ok(Values::new(name, len, ty)),
             other => Err(refuse(format!(
-                "{name} is {other:?}; the step reads F32 or MLX_A8"
+                "{name} is {other:?}; the step reads F32, MLX_A8 or MLX_A8H"
             ))),
         }
     }
@@ -2497,7 +2500,7 @@ mod tests {
         assert_eq!(
             got[0],
             "qwen35moe session: the plan: qwen35moe session: blk.0.attn_qkv.weight is q3_K in the \
-             file; this site launches Q4_K, Q6_K, MLX_A4, Q8_0, Q5_K, F32"
+             file; this site launches Q4_K, Q6_K, MLX_A4, MLX_A8, MLX_A4H, MLX_A8H, Q8_0, Q5_K, F32"
         );
     }
 
@@ -2607,6 +2610,75 @@ mod tests {
                 assert_eq!(layer.ffn.gate_up_quant.ggml(), gate_up);
                 assert_eq!(layer.ffn.down_quant.ggml(), down);
             }
+        }
+    }
+
+    /// Every MLX affine kind opens at each site its kernels read: the dense
+    /// sites a mat-vec reads ([`DENSE`], among them the embedding, the head
+    /// and the head-norm projection), the routed stacks and the shared
+    /// expert. The router, which the host dequantizes at open, takes the 8-bit
+    /// kinds and refuses the 4-bit one by name.
+    #[test]
+    fn mlx_affine_kinds_open_at_every_site_their_kernels_read() {
+        for kind in [
+            GgmlType::MLX_A4,
+            GgmlType::MLX_A8,
+            GgmlType::MLX_A4H,
+            GgmlType::MLX_A8H,
+        ] {
+            let quant = Quant::of_ggml(kind).expect("the kernels read the kind");
+            let mut t = retyped(Synthetic::new(), &DENSE, kind);
+            for l in 0..2 {
+                t = retyped(
+                    t,
+                    &[
+                        &format!("blk.{l}.ffn_gate_exps.weight"),
+                        &format!("blk.{l}.ffn_up_exps.weight"),
+                        &format!("blk.{l}.ffn_gate_shexp.weight"),
+                        &format!("blk.{l}.ffn_up_shexp.weight"),
+                    ],
+                    kind,
+                );
+                t = retyped(
+                    t,
+                    &[
+                        &format!("blk.{l}.ffn_down_exps.weight"),
+                        &format!("blk.{l}.ffn_down_shexp.weight"),
+                    ],
+                    kind,
+                );
+            }
+            let out = check(&t.split(), CTX);
+            assert!(out.items.is_empty(), "{kind:?}: {:?}", out.items);
+            let checked = out.checked.expect("a checked file");
+            let layout = checked.layout;
+            assert_eq!(layout.embed.quant, quant);
+            assert_eq!(layout.head.quant, quant);
+            for layer in &layout.layers {
+                assert_eq!(layer.ffn.gate_up_quant, quant, "{kind:?}");
+                assert_eq!(layer.ffn.down_quant, quant, "{kind:?}");
+                let out = match &layer.mixer {
+                    MixerLayout::Delta(d) => &d.out,
+                    MixerLayout::Attention(a) => &a.out,
+                    MixerLayout::ShortConv(_) => {
+                        panic!("{kind:?}: the synthetic file has no short-conv layer")
+                    }
+                };
+                assert_eq!(out.quant, quant, "{kind:?}");
+            }
+        }
+        // The router and the shared-expert gate are values the open
+        // dequantizes: the 8-bit kinds open, the 4-bit ones are refused.
+        for (router, opens) in [
+            (GgmlType::MLX_A8, true),
+            (GgmlType::MLX_A8H, true),
+            (GgmlType::MLX_A4, false),
+        ] {
+            let t = Synthetic::new()
+                .ty("blk.0.ffn_gate_inp.weight", router)
+                .ty("blk.1.ffn_gate_inp.weight", router);
+            let out = check(&t.split(), CTX);
+            assert_eq!(out.items.is_empty(), opens, "{router:?}: {:?}", out.items);
         }
     }
 
@@ -2879,7 +2951,7 @@ mod tests {
             got,
             [
                 "qwen35moe arena: token_embd.weight is Q6K; the embedding reads Q4_K, MLX_A4, \
-                 Q8_0 or Q5_K"
+                 MLX_A8, MLX_A4H, MLX_A8H, Q8_0 or Q5_K"
             ]
         );
         let got = texts(
@@ -2889,8 +2961,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                "qwen35moe arena: output.weight is Q4K; the head reads Q6_K, MLX_A4, Q8_0 or \
-                 Q5_K"
+                "qwen35moe arena: output.weight is Q4K; the head reads Q6_K, MLX_A4, MLX_A8, \
+                 MLX_A4H, MLX_A8H, Q8_0 or Q5_K"
             ]
         );
     }
@@ -2943,7 +3015,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                "qwen35moe arena: layer 1: blk.1.ffn_gate_inp.weight is Q4_K; the step reads F32 or MLX_A8"
+                "qwen35moe arena: layer 1: blk.1.ffn_gate_inp.weight is Q4_K; the step reads F32, \
+                 MLX_A8 or MLX_A8H"
             ]
         );
         // A norm in a type the step does not read.
@@ -3300,8 +3373,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                "qwen35moe arena: token_embd.weight is Q4K; the head reads Q6_K, MLX_A4, Q8_0 or \
-                 Q5_K"
+                "qwen35moe arena: token_embd.weight is Q4K; the head reads Q6_K, MLX_A4, MLX_A8, \
+                 MLX_A4H, MLX_A8H, Q8_0 or Q5_K"
             ]
         );
     }

@@ -33,12 +33,16 @@ pub enum SiteTy {
     Fp8B128,
     /// BF16 in its words, read on the f32 rows, narrow and wide.
     Bf16,
-    /// MLX's affine 4-bit groups (`MLX_A4`): a family no card launch reads,
-    /// a backend's mat-vec (Metal's). Outside the card kernel table, so
+    /// MLX's affine groups — 4-bit (`MLX_A4`) and 8-bit (`MLX_A8`), their F16
+    /// pairs (`MLX_A4H`, `MLX_A8H`): a family no card launch reads, a
+    /// backend's mat-vec (Metal's). Outside the card kernel table, so
     /// [`SiteTy::ALL`] does not hold it, no card list names it and its dense
     /// entry is none; a backend whose launch reads it names it in the list
     /// [`file_site`] takes.
     MlxA4,
+    MlxA8,
+    MlxA4h,
+    MlxA8h,
     /// IQ4_XS in its original blocks, over q8_1 columns, narrow and wide.
     Iq4Xs,
 }
@@ -104,7 +108,7 @@ impl SiteTy {
             SiteTy::Fp8B128 => Some(SiteEntry::Fp8B128),
             SiteTy::Bf16 => Some(SiteEntry::Bf16),
             SiteTy::Iq4Xs => Some(SiteEntry::Iq4xs),
-            SiteTy::MlxA4 => None,
+            SiteTy::MlxA4 | SiteTy::MlxA8 | SiteTy::MlxA4h | SiteTy::MlxA8h => None,
         }
     }
 
@@ -157,8 +161,12 @@ impl SiteTy {
 /// reads the table, so a card's `allowed` — which holds no family here —
 /// refuses the type by name exactly as it did before the row, and
 /// [`SiteTy::of_ggml`], the card table's map, names each of the types none.
-pub const BACKEND_SITES: &[(GgmlType, SiteTy, SiteAct)] =
-    &[(GgmlType::MLX_A4, SiteTy::MlxA4, SiteAct::F32)];
+pub const BACKEND_SITES: &[(GgmlType, SiteTy, SiteAct)] = &[
+    (GgmlType::MLX_A4, SiteTy::MlxA4, SiteAct::F32),
+    (GgmlType::MLX_A8, SiteTy::MlxA8, SiteAct::F32),
+    (GgmlType::MLX_A4H, SiteTy::MlxA4h, SiteAct::F32),
+    (GgmlType::MLX_A8H, SiteTy::MlxA8h, SiteAct::F32),
+];
 
 /// The family's file type, its ggml name in upper case (`Q4_K`, `NVFP4`).
 impl fmt::Display for SiteTy {
@@ -237,7 +245,7 @@ pub fn list(allowed: &[SiteTy]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKEND_SITES, SiteTy};
+    use super::{BACKEND_SITES, GgmlType, SiteTy, family_of};
 
     /// The kernel table's K-quant GEMM entries name exactly the four K-quant
     /// families: a table row that moves a type in or out of them moves
@@ -246,6 +254,28 @@ mod tests {
     fn the_kquant_sites_are_the_four_kquants() {
         let kq: Vec<SiteTy> = SiteTy::ALL.iter().copied().filter(|s| s.kquant()).collect();
         assert_eq!(kq, [SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K]);
+    }
+
+    /// Each new MLX row maps both ways: its file type reaches the family
+    /// through [`family_of`] (the map [`file_site`] reads), and the family's
+    /// file type is the type again. One test a row, so a row that moves or
+    /// loses its type is named.
+    #[test]
+    fn mlx_a8_is_its_row_both_ways() {
+        assert_eq!(family_of(GgmlType::MLX_A8), Some(SiteTy::MlxA8));
+        assert_eq!(SiteTy::MlxA8.ggml(), GgmlType::MLX_A8);
+    }
+
+    #[test]
+    fn mlx_a4h_is_its_row_both_ways() {
+        assert_eq!(family_of(GgmlType::MLX_A4H), Some(SiteTy::MlxA4h));
+        assert_eq!(SiteTy::MlxA4h.ggml(), GgmlType::MLX_A4H);
+    }
+
+    #[test]
+    fn mlx_a8h_is_its_row_both_ways() {
+        assert_eq!(family_of(GgmlType::MLX_A8H), Some(SiteTy::MlxA8h));
+        assert_eq!(SiteTy::MlxA8h.ggml(), GgmlType::MLX_A8H);
     }
 
     /// A family outside the card kernel table is its row alone: no card list

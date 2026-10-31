@@ -176,15 +176,19 @@ fn prefill_at_open(g: &Geometry) -> PrefillMode {
 /// The site types Metal's mat-vecs launch: the kernels' quant set
 /// ([`Quant::of_ggml`](crate::kernels::Quant::of_ggml) read over
 /// [`Quant::dense`](crate::kernels::Quant::dense), held equal to this list by
-/// `arena`'s test) as families — Q4_K, Q6_K, Q8_0, Q5_K and MLX_A4, the A4
-/// kernels' affine 4-bit groups. The F32 tensors a session reads as
-/// values (the norms, the conv, the dt bias, `ssm_a`) and the router's
-/// MLX_A8, which its loader dequantizes exactly at open, are no typed site; a
-/// type outside the list is refused by name at the site (`file_site`).
+/// `arena`'s test) as families — Q4_K, Q6_K, Q8_0, Q5_K and MLX's affine
+/// groups MLX_A4, MLX_A8, MLX_A4H and MLX_A8H (the last two their F16 pairs).
+/// The F32 tensors a session reads as values (the norms, the conv, the dt
+/// bias, `ssm_a`) and the router's MLX_A8 or MLX_A8H, which its loader
+/// dequantizes exactly at open, are no typed site; a type outside the list is
+/// refused by name at the site (`file_site`).
 pub(crate) const LAUNCHED: &[SiteTy] = &[
     SiteTy::Q4K,
     SiteTy::Q6K,
     SiteTy::MlxA4,
+    SiteTy::MlxA8,
+    SiteTy::MlxA4h,
+    SiteTy::MlxA8h,
     SiteTy::Q8_0,
     SiteTy::Q5K,
 ];
@@ -197,6 +201,9 @@ pub(crate) const PROJECTED: &[SiteTy] = &[
     SiteTy::Q4K,
     SiteTy::Q6K,
     SiteTy::MlxA4,
+    SiteTy::MlxA8,
+    SiteTy::MlxA4h,
+    SiteTy::MlxA8h,
     SiteTy::Q8_0,
     SiteTy::Q5K,
     SiteTy::F32,

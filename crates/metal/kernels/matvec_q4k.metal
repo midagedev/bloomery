@@ -19,6 +19,10 @@
 //                             instantiated in matvec_a4.metal
 //   a8_matvec / ...           the same five over MLX's affine 8-bit groups,
 //                             instantiated in matvec_a8.metal
+//   a4h_matvec / ..., a8h_matvec / ...
+//                             the same five over MLX's affine groups with
+//                             F16 scales and biases, instantiated in
+//                             matvec_a4h.metal and matvec_a8h.metal
 //   q8_0_matvec / ..., q5k_matvec / ...
 //                             the same five over Q8_0 and Q5_K,
 //                             instantiated in matvec_q8_0.metal and

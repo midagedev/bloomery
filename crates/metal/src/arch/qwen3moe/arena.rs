@@ -437,9 +437,10 @@ impl<'a> Loader<'a> {
     }
 
     /// The f32 values of `v`: an F32 tensor as it is, or MLX's affine 8-bit
-    /// tensor of the same values, dequantized exactly at open through the host
-    /// reader (`s·q + b` in f32, the pair's product exact). The reader's own
-    /// refusals (a non-finite scale or bias) name the tensor and its block.
+    /// tensor of the same values — BF16- or F16-scaled (`MLX_A8`, `MLX_A8H`)
+    /// — dequantized exactly at open through the host reader (`s·q + b` in
+    /// f32, the pair's product exact). The reader's own refusals (a
+    /// non-finite scale or bias) name the tensor and its block.
     fn values(&self, v: &Values) -> Result<MetalBuffer<f32>, SessionError> {
         let values = self.host_values(v)?;
         let mut buffer = self.device.buffer(Elems(v.len))?;
@@ -459,13 +460,13 @@ impl<'a> Loader<'a> {
                     *x = f32::from_le_bytes(*b);
                 }
             }
-            GgmlType::MLX_A8 => {
-                gguf::quant::dequant_row(GgmlType::MLX_A8, &bytes, &mut values)
+            GgmlType::MLX_A8 | GgmlType::MLX_A8H => {
+                gguf::quant::dequant_row(v.ty, &bytes, &mut values)
                     .map_err(|e| refuse(format!("{}: {e}", v.name)))?;
             }
             other => {
                 return Err(refuse(format!(
-                    "{} is {other:?}; the step reads F32 or MLX_A8",
+                    "{} is {other:?}; the step reads F32, MLX_A8 or MLX_A8H",
                     v.name
                 )));
             }

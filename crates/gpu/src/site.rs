@@ -168,8 +168,8 @@ pub fn of_resident(w: &DevWeight) -> Option<SiteTy> {
 
 /// How [`kgemv`] lays a site out: Q3_K, Q4_K and Q6_K row-major, Q5_K, IQ4_XS and NVFP4 token-major.
 /// `None` for a type [`kgemv`] does not run: Q8_0, F32, MXFP8, FP8_B128 and BF16 ([`gemv`]), Q5_0
-/// ([`blocks32_gemv`], whose row-major layout `y[r · m + c]` is that function's own), and MLX_A4,
-/// a backend's family no card launch reads.
+/// ([`blocks32_gemv`], whose row-major layout `y[r · m + c]` is that function's own), and the MLX
+/// affine kinds, a backend's families no card launch reads.
 #[must_use]
 pub fn kgemv_order(ty: SiteTy) -> Option<Order> {
     match ty {
@@ -181,7 +181,10 @@ pub fn kgemv_order(ty: SiteTy) -> Option<Order> {
         | SiteTy::Mxfp8
         | SiteTy::Fp8B128
         | SiteTy::Bf16
-        | SiteTy::MlxA4 => None,
+        | SiteTy::MlxA4
+        | SiteTy::MlxA8
+        | SiteTy::MlxA4h
+        | SiteTy::MlxA8h => None,
     }
 }
 
@@ -741,7 +744,7 @@ pub fn kgemv_on(
         )),
         // A backend's family, outside the card kernel table: no card path
         // reads a site of it.
-        SiteTy::MlxA4 => Err(GpuError::shape(
+        SiteTy::MlxA4 | SiteTy::MlxA8 | SiteTy::MlxA4h | SiteTy::MlxA8h => Err(GpuError::shape(
             WHAT,
             format!("{name} is {ty}: no card launch reads it"),
         )),
@@ -1606,7 +1609,7 @@ fn gemm_into(
         }
         // A backend's family, outside the card kernel table: no card path
         // reads a site of it.
-        SiteTy::MlxA4 => Err(GpuError::shape(
+        SiteTy::MlxA4 | SiteTy::MlxA8 | SiteTy::MlxA4h | SiteTy::MlxA8h => Err(GpuError::shape(
             WHAT,
             format!("{name} is {ty}: no card launch reads it"),
         )),

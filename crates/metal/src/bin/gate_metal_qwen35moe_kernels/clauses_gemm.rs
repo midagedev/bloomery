@@ -13,8 +13,8 @@
 //!
 //! - every weight value carries its owner's dequant arithmetic in f32: four
 //!   roundings for Q4_K and Q5_K (`d·sc`, `·q`, `dmin·min`, the
-//!   subtraction), two for Q6_K (`d·sc`, `·(q−32)`), two for A4 and A8
-//!   (`s·q`, `+b`) and one for Q8_0 (`q·d`);
+//!   subtraction), two for Q6_K (`d·sc`, `·(q−32)`), two for A4, A8, A4H and
+//!   A8H (`s·q`, `+b`) and one for Q8_0 (`q·d`);
 //! - the f32 operand's product rounds once; the f16 operand's two casts
 //!   round once each into half (2^-11 relative) and their products are exact
 //!   in the f32 accumulator (two eleven-bit mantissas);
@@ -400,7 +400,7 @@ pub(super) fn gemm_band(
 ) -> (f64, usize) {
     let base = match quant {
         Quant::Q4K | Quant::Q5K => 4,
-        Quant::Q6K | Quant::A4 | Quant::A8 => 2,
+        Quant::Q6K | Quant::A4 | Quant::A8 | Quant::A4H | Quant::A8H => 2,
         Quant::Q8_0 => 1,
         Quant::F32 => panic!("F32 has no dense GEMM: its rows run as the router's f32 GEMM"),
     };
@@ -1256,8 +1256,8 @@ pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
 }
 
 /// [`gemm_half_rows`]'s body over given `cases` and one segmented `group`:
-/// the A8 clause runs it at the split's tensors quantized at 8 bits
-/// (`clauses_a8`).
+/// the requantized clauses run it at the split's tensors requantized as their type
+/// (`clauses_requant`).
 pub(super) fn half_rows_over(h: &Harness<'_>, cases: &[Case<'_>], group: SegGroup<'_>) -> Clause {
     let same =
         |what: &str, want: &[f32], got: &[f32]| super::clauses_rows::same_bits(what, got, want);
