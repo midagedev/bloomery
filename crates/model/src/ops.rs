@@ -3992,7 +3992,7 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         GgmlType::Q4_K => Some((96, 97)),
         GgmlType::Q5_K => Some((156, 98)),
         GgmlType::Q6_K => Some((172, 118)),
-        GgmlType::IQ4_XS => Some((146, 95)),
+        GgmlType::IQ4_XS => Some((124, 134)),
         // The grid types decode a super-block's eight sub-blocks in a loop, so their fixed part is large.
         GgmlType::IQ2_XS => Some((624, 102)),
         // The IQ2_XXS wide kernel (`qdot::dot_row_cols_wide`): the block's pack, the signed and
@@ -4001,6 +4001,9 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         GgmlType::IQ2_XXS => Some((600, 75)),
         GgmlType::IQ3_XXS => Some((692, 106)),
         GgmlType::IQ3_S => Some((780, 96)),
+        // The IQ1_S tile packs a super-block's grid and sign lookups once (`qdot::iq1s_pack`),
+        // then each column runs its `iq1s_block_step` onto its own sum.
+        GgmlType::IQ1_S => Some((252, 94)),
         // Per 32-value block (`qdot::k_granularity`): a quarter of an x4 group's instructions.
         GgmlType::Q5_1 => Some((34, 17)),
         GgmlType::Q8_0 => Some((14, 16)),
@@ -7458,7 +7461,7 @@ mod tests {
     #[test]
     fn tile_units_has_a_row_for_exactly_the_types_qdot_tiles() {
         // The types of `qdot::tile_kind`.
-        const TILED: [GgmlType; 14] = [
+        const TILED: [GgmlType; 15] = [
             GgmlType::Q2_K,
             GgmlType::Q3_K,
             GgmlType::Q4_K,
@@ -7468,6 +7471,7 @@ mod tests {
             GgmlType::Q8_0,
             GgmlType::IQ2_XS,
             GgmlType::IQ2_XXS,
+            GgmlType::IQ1_S,
             GgmlType::IQ3_XXS,
             GgmlType::IQ3_S,
             GgmlType::IQ4_XS,
