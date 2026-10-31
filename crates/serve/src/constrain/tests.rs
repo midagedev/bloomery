@@ -3546,6 +3546,52 @@ fn a_null_required_or_properties_reads_as_absent() {
     }
 }
 
+/// A required property another keyword supplies (`additionalProperties`
+/// true or a schema) is valid JSON Schema the compiler cannot write: outside
+/// the subset, so `tool_choice: auto` serves it with no watch, and a forced
+/// call and a JSON `response_format` refuse it rather than write an object
+/// that leaves the property out. Mutant: the object rule compiles the
+/// declared properties alone.
+#[test]
+fn a_required_property_with_no_schema_is_outside_the_subset() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format: ToolFormat::Hermes,
+        think: ThinkTags::THINK,
+    };
+    for schema in [
+        json!({"type": "object", "properties": {}, "required": ["x"],
+            "additionalProperties": true}),
+        json!({"type": "object", "properties": {}, "required": ["x"],
+            "additionalProperties": {"type": "string"}}),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": schema}}]);
+        let auto = request(
+            json!({"tools": tools, "tool_choice": "auto"})
+                .as_object()
+                .unwrap(),
+            &ask,
+        )
+        .unwrap_or_else(|e| panic!("{schema}: auto refused: {e}"));
+        assert!(auto.is_none(), "{schema}: auto watched");
+        for body in [
+            json!({"tools": tools, "tool_choice": "required"}),
+            json!({"response_format": {"type": "json_schema",
+                "json_schema": {"name": "x", "schema": schema}}}),
+        ] {
+            let e = request(body.as_object().unwrap(), &ask).expect_err(&format!("{body}: served"));
+            assert!(
+                e.outside_subset && e.message.contains("\"x\""),
+                "{body}: {e}"
+            );
+        }
+    }
+}
+
 /// Under `tool_choice: auto` a tool whose schema is invalid (it contradicts
 /// itself or JSON Schema) is refused by name, the refusal a forced choice
 /// gives, and one that is valid but outside what the compiler serves (a

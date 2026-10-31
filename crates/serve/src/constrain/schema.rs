@@ -608,7 +608,7 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
     };
     let required: Vec<&str> = match o.get("required") {
         None | Some(Value::Null) => Vec::new(),
-        // `valid` held the names to strings the properties hold.
+        // `valid` held the names to strings.
         Some(Value::Array(names)) => names
             .iter()
             .map(|n| {
@@ -618,6 +618,16 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
             .collect(),
         Some(v) => unreachable!("valid::schema passed {path}'s required {v}"),
     };
+    // A required name another keyword supplies (`additionalProperties`,
+    // `allOf`, …) is valid, and has no schema here to write it by.
+    for name in &required {
+        if !props.is_some_and(|p| p.contains_key(*name)) {
+            return Err(outside(
+                path,
+                format!("required property {name:?} has no schema in properties"),
+            ));
+        }
+    }
     let args: Vec<Arg<'_>> = props
         .into_iter()
         .flatten()
