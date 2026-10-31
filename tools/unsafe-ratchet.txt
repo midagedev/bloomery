@@ -756,7 +756,11 @@ gguf 7 2 0
 # of its two value writes a block of its own) and adds the NVFP4 rows kernel (4 the same way), the IQ4_NL kernel (its
 # byte read and its two value writes) and the F8 kernel (its byte read and its value write), and the module load's
 # block, each with its SAFETY line.
-gpu 2945 403 10
+# PIN(2026-11-01): gpu 2945 -> 2951 blocks, 403 -> 404 fns, new kernel entries, not old code relaxed: the gated
+# norm's q8-form entries gdn_norm_gate_q32 and gdn_norm_gate_q128 (two blocks each: the head's values, the
+# quantizer's store) over the unsafe fn norm_gate_words, which calls the existing norm_gate_body (two blocks, one
+# per gate). Each with its SAFETY line.
+gpu 2951 404 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

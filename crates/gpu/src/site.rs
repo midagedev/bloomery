@@ -1675,7 +1675,9 @@ pub(crate) fn resident_gemm_bf16(
 /// model's gate `tail.gate`, its output `tail.y` then quantized for the
 /// resident sites `readers` into `out` ([`resident_quantize`]). BF16 and
 /// native W8A8 MXFP8 tensor-core sites finish a sigmoid-gated norm in their
-/// product's store epilogue. The MXFP8
+/// product's store epilogue; on another site a norm whose readers take one
+/// q8 form of its rows and no MMA form writes that form in its own launch
+/// (`NormGateKernels::enqueue_norm_gate_into`). The MXFP8
 /// epilogue also writes the output's MXFP8 form, so it runs only when that
 /// form is all the readers take from `out` ([`only_form`]).
 #[allow(
@@ -1696,7 +1698,7 @@ pub(crate) fn resident_gemm_norm_gate(
     ),
     (readers, (q128, out)): (&[&str], (Option<&mut GemmAct>, &mut GemmAct32)),
 ) -> Result<(), GpuError> {
-    use crate::linear::norm_gate::{GdnGate, NormGateArgs, NormGateTail};
+    use crate::linear::norm_gate::{GdnGate, NormGateArgs, NormGateTail, NormOut};
     let what = "site::resident_gemm_norm_gate";
     let weight = w.resident(what, name)?;
     let rows = weight.rows();
@@ -1752,20 +1754,37 @@ pub(crate) fn resident_gemm_norm_gate(
         _ => {
             tail.check_rows(what, rows, m, z.len())?;
             resident_gemm(gpu, k, (w, name), x, route, m, z)?;
-            norm.enqueue_norm_gate(
-                gpu.stream(),
-                NormGateArgs {
-                    o,
-                    z,
-                    w: gain,
-                    gate,
-                    eps,
-                    n_v: rows / crate::linear::HEAD,
-                    m,
-                    fault,
-                    y: tail.y,
-                },
-            )?;
+            let args = NormGateArgs {
+                o,
+                z,
+                w: gain,
+                gate,
+                eps,
+                n_v: rows / crate::linear::HEAD,
+                m,
+                fault,
+                y: tail.y,
+            };
+            // A norm whose readers take one q8 form of its rows, and no MMA
+            // or native FP4 form, writes that form itself.
+            let wants = resident_wants(w, readers);
+            let mma = [MmaForm::Bf16, MmaForm::Mxfp8]
+                .into_iter()
+                .any(|f| out.has(f) && reads_form(gpu, w, readers, f));
+            let stream = gpu.stream();
+            match (wants.q128, wants.q32, q128) {
+                (true, false, Some(a)) if !mma => {
+                    norm.enqueue_norm_gate_into(stream, args, NormOut::Q128(a))?;
+                }
+                (false, true, _) if !mma && !out.has_native_form() => {
+                    norm.enqueue_norm_gate_into(stream, args, NormOut::Q32(&mut *out))?;
+                }
+                (_, _, q128) => {
+                    norm.enqueue_norm_gate(stream, args)?;
+                    return resident_quantize(gpu, k, (w, readers), (&*y, m), (q128, out), fault);
+                }
+            }
+            return write_forms(k, stream, (&*y, m), out, |_| false);
         }
     }
     resident_quantize(gpu, k, (w, readers), (&*y, m), (q128, out), fault)

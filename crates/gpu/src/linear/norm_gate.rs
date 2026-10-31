@@ -49,7 +49,8 @@ fn act<const ACT: u32>(z: f32) -> f32 {
 }
 
 /// One warp's gated norm (module doc) with the gate `ACT`: head `wi` of
-/// the `[m][n_v]` order.
+/// the `[m][n_v]` order, written to `y`; returns the lane's four values
+/// (slot `i` holds value `lane + 32·i` of the head).
 ///
 /// # Safety
 ///
@@ -74,7 +75,7 @@ unsafe fn norm_gate_body<const ACT: u32>(
     eps: f32,
     fault: FaultSink,
     y: &mut DisjointSlice<f32>,
-) {
+) -> [f32; 4] {
     let base = wi * HEAD;
     let mut ov = [0.0f32; 4];
     let mut zv = [0.0f32; 4];
@@ -95,6 +96,7 @@ unsafe fn norm_gate_body<const ACT: u32>(
         // SAFETY: this lane owns these four values of the live head.
         unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = values[i] };
     }
+    values
 }
 
 /// The four values of one lane of a head, called by all 32 lanes together.
@@ -143,6 +145,62 @@ pub(crate) fn norm_gate_values<const ACT: u32>(
         fault.raise(FaultSite::LinearGate);
     }
     values
+}
+
+/// One warp's head `wi` of the gated norm (module doc) under the gate `act`
+/// ([`GATE_SILU`] or [`GATE_SIGMOID`]), written to `y` as
+/// [`norm_gate_body`] writes it, and returned in the quantizers' lane
+/// geometry: lane `ℓ` holds the head's values `4ℓ .. 4ℓ + 3`, gathered from
+/// the lanes that computed them (value `x` is lane `x mod 32`'s, its slot
+/// `x / 32`).
+///
+/// # Safety
+///
+/// [`norm_gate_body`]'s.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one warp's coordinates and the entry's arguments, forwarded flat"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+#[inline(always)]
+unsafe fn norm_gate_words(
+    wi: usize,
+    lane: usize,
+    (o, z, w): (&[f32], &[f32], &[f32]),
+    eps: f32,
+    act: u32,
+    fault: FaultSink,
+    y: &mut DisjointSlice<f32>,
+) -> [f32; 4] {
+    let values = if act == GATE_SILU {
+        // SAFETY: all 32 lanes call together; wi is live, lane < 32,
+        // o/z/w cover the head, and this warp alone writes its y head.
+        unsafe { norm_gate_body::<GATE_SILU>(wi, lane, o, z, w, eps, fault, y) }
+    } else {
+        // SAFETY: all 32 lanes call together; wi is live, lane < 32,
+        // o/z/w cover the head, and this warp alone writes its y head.
+        unsafe { norm_gate_body::<GATE_SIGMOID>(wi, lane, o, z, w, eps, fault, y) }
+    };
+    let slot = lane >> 3;
+    let mut words = [0.0f32; 4];
+    for j in 0usize..4 {
+        cuda_device::thread::__unroll_config::<0>();
+        let src = ((4 * lane + j) & 31) as u32;
+        let t0 = warp::shuffle_f32(values[0], src);
+        let t1 = warp::shuffle_f32(values[1], src);
+        let t2 = warp::shuffle_f32(values[2], src);
+        let t3 = warp::shuffle_f32(values[3], src);
+        words[j] = match slot {
+            0 => t0,
+            1 => t1,
+            2 => t2,
+            _ => t3,
+        };
+    }
+    words
 }
 
 #[cuda_module]
@@ -224,6 +282,156 @@ mod norm_gate_kernels {
         // SAFETY: wi < m·n_v by the guard, lane < 32; the contract's
         // lengths; head wi of y is this warp's.
         unsafe { norm_gate_body::<GATE_SIGMOID>(wi, tid % 32, o, z, w, eps, fault, &mut y) };
+    }
+
+    /// The gated norm of `m·n_v` heads under the gate `act` ([`GATE_SILU`]
+    /// or [`GATE_SIGMOID`]) into `y`, each token's row also written as the
+    /// next site's q8 blocks of 32 (a `GemmAct32` of K = `128·n_v`, column =
+    /// token): head `h` is group `h` of four blocks, the bytes, refusals and
+    /// fault `quantize_gemm32` gives the stored row.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            o.len() >= m * n_v * 128,
+            z.len() >= m * n_v * 128,
+            w.len() >= 128,
+            y.len() >= m * n_v * 128,
+            2 * steps >= 4 * n_v,
+            q.len() >= m * 16 * steps,
+            d.len() >= m * 2 * steps,
+            s.len() >= m * 2 * steps
+        )
+    )]
+    pub fn gdn_norm_gate_q32(
+        o: &[f32],
+        z: &[f32],
+        w: &[f32],
+        eps: f32,
+        act: u32,
+        n_v: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        steps: u32,
+        mut q: DisjointSlice<u32>,
+        mut d: DisjointSlice<f32>,
+        mut s: DisjointSlice<i32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
+        let n_v = n_v as usize;
+        if wi >= m as usize * n_v {
+            return; // warp-uniform
+        }
+        let lane = tid % 32;
+        // SAFETY: wi < m·n_v by the guard, lane < 32; the launch contract's
+        // lengths cover o, z, w and y; head wi of y is this warp's.
+        let v = unsafe { norm_gate_words(wi, lane, (o, z, w), eps, act, fault, &mut y) };
+        // SAFETY: the warp enters with one (token, head): the token is below
+        // m, the head below n_v = the groups of the row's 4·n_v blocks; the
+        // planes' bounds are the launch contract's.
+        let refused = unsafe {
+            crate::gemm::quant32_group(
+                v,
+                wi / n_v,
+                wi % n_v,
+                4 * n_v,
+                steps as usize,
+                lane,
+                &mut q,
+                &mut d,
+                &mut s,
+            )
+        };
+        if refused && lane & 7 == 0 {
+            fault.raise(FaultSite::QuantColumn);
+        }
+    }
+
+    /// [`gdn_norm_gate_q32`] writing each token's row as the next site's
+    /// q8_1 blocks of 128 instead (a `GemmAct` of K = `128·n_v`, `n_sb` its
+    /// super-blocks): head `h` is block `h`, the bytes, refusal and fault
+    /// `q3k_quantize_q8_1` gives the stored row.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            o.len() >= m * n_v * 128,
+            z.len() >= m * n_v * 128,
+            w.len() >= 128,
+            y.len() >= m * n_v * 128,
+            n_v == 2 * n_sb,
+            q3.len() >= m * 64 * half_it,
+            q4.len() >= m * 256 * quad_it,
+            q6.len() >= m * 128 * half_it,
+            s8.len() >= m * 8 * n_sb,
+            d8.len() >= m * 2 * n_sb
+        )
+    )]
+    pub fn gdn_norm_gate_q128(
+        o: &[f32],
+        z: &[f32],
+        w: &[f32],
+        eps: f32,
+        act: u32,
+        n_v: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
+        let n_v = n_v as usize;
+        if wi >= m as usize * n_v {
+            return; // warp-uniform
+        }
+        let lane = tid % 32;
+        // SAFETY: wi < m·n_v by the guard, lane < 32; the launch contract's
+        // lengths cover o, z, w and y; head wi of y is this warp's.
+        let v = unsafe { norm_gate_words(wi, lane, (o, z, w), eps, act, fault, &mut y) };
+        // SAFETY: the warp enters with one (token, head): the token is below
+        // m, the head below n_v = 2·n_sb blocks; the planes' bounds are the
+        // launch contract's, half_it and quad_it n_sb's halves and quarters.
+        let refused = unsafe {
+            crate::q8_1_quant_vals(
+                v,
+                wi / n_v,
+                wi % n_v,
+                n_sb as usize,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+            )
+        };
+        if refused && lane == 0 {
+            fault.raise(FaultSite::QuantColumn);
+        }
     }
 }
 
@@ -316,6 +524,14 @@ impl NormGateTail<'_> {
     }
 }
 
+/// The next site's quantized form a gated norm writes beside its rows
+/// ([`NormGateKernels::enqueue_norm_gate_into`]): the q8 blocks of 32 or the
+/// q8_1 blocks of 128 of each token's row, K = `128·n_v`.
+pub enum NormOut<'a> {
+    Q32(&'a mut crate::gemm::GemmAct32),
+    Q128(&'a mut crate::gemm::GemmAct),
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct NormGateKernels {
     module: norm_gate_kernels::LoadedModule,
@@ -374,6 +590,89 @@ impl NormGateKernels {
                 let prep = self.module.prepare_gdn_norm_gate_sigmoid(cfg)?;
                 self.module
                     .gdn_norm_gate_sigmoid(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`NormGateKernels::enqueue_norm_gate`] writing beside `args.y` the
+    /// next site's form `out` of each token's row in the same launch
+    /// (`gdn_norm_gate_q32` or `gdn_norm_gate_q128`), the bytes and faults
+    /// its quantizer gives the stored rows. A form of another K than
+    /// `128·n_v`, too few columns, a scratch without the Q8 planes, or one
+    /// holding the native FP4 form is refused by name before any write.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_norm_gate_into(
+        &self,
+        stream: &CudaStream,
+        args: NormGateArgs<'_>,
+        out: NormOut<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "NormGateKernels::enqueue_norm_gate_into";
+        let NormGateArgs {
+            o,
+            z,
+            w,
+            gate,
+            eps,
+            n_v,
+            m,
+            fault,
+            y,
+        } = args;
+        NormGateTail {
+            o,
+            w,
+            gate,
+            eps,
+            fault,
+            y: &mut *y,
+        }
+        .check(what, n_v, m, z.len())?;
+        let k = n_v * HEAD;
+        let grid = launch_u32(what, "grid", (m * n_v).div_ceil(4))?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        let act = match gate {
+            GdnGate::Silu => GATE_SILU,
+            GdnGate::Sigmoid => GATE_SIGMOID,
+        };
+        let (n_v32, m32) = (launch_u32(what, "n_v", n_v)?, launch_u32(what, "m", m)?);
+        match out {
+            NormOut::Q32(a) => {
+                if a.k() != k {
+                    return Err(GpuError::shape(
+                        what,
+                        format!("the q8 blocks of 32 hold rows of {} values, not {k}", a.k()),
+                    ));
+                }
+                let steps = launch_u32(what, "steps", a.steps())?;
+                let p = a.planes_mut(what, m)?;
+                let prep = self.module.prepare_gdn_norm_gate_q32(cfg)?;
+                self.module.gdn_norm_gate_q32(
+                    stream, &prep, o, z, w, eps, act, n_v32, m32, fault, y, steps, p.q, p.d, p.s,
+                )?;
+            }
+            NormOut::Q128(a) => {
+                if a.k() != k || a.cols() < m {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "the q8_1 blocks hold {} columns of {} values, not {m} of {k}",
+                            a.cols(),
+                            a.k()
+                        ),
+                    ));
+                }
+                let n_sb = k / 256;
+                let half_it = launch_u32(what, "half_it", n_sb.div_ceil(2))?;
+                let quad_it = launch_u32(what, "quad_it", n_sb.div_ceil(4))?;
+                let n_sb = launch_u32(what, "n_sb", n_sb)?;
+                let p = a.planes_mut();
+                let prep = self.module.prepare_gdn_norm_gate_q128(cfg)?;
+                self.module.gdn_norm_gate_q128(
+                    stream, &prep, o, z, w, eps, act, n_v32, m32, fault, y, n_sb, half_it, quad_it,
+                    p.q3, p.q4, p.q6, p.s8, p.d8,
+                )?;
             }
         }
         Ok(())

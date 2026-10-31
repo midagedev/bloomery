@@ -2716,6 +2716,7 @@ mod gate {
                 "dense_mma"
                     | "bf16_store"
                     | "g32_slab"
+                    | "norm_form"
                     | "mxfp8_w8a8"
                     | "nvfp4_native"
                     | "nvfp4_swiglu"
@@ -8871,6 +8872,145 @@ mod gate {
                 .collect()
         }
 
+        /// The gated norm writing the next site's q8 form in its own launch
+        /// against the norm and then the form's quantizer: the rows, the
+        /// q8 blocks of 32 and the q8_1 blocks of 128 bit-equal under both
+        /// gates, at one token, a ragged count and a ubatch, a head holding
+        /// a NaN refused alike with the fault raised on both sides, and a
+        /// scratch holding the native FP4 form refused untouched.
+        fn norm_form_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            use bloomery_gpu::linear::norm_gate::{
+                GdnGate, NormGateArgs, NormGateKernels, NormOut,
+            };
+            if !wanted("norm_form") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let norm = NormGateKernels::load(gpu.context())?;
+            let n_v = 32usize;
+            let k = 128 * n_v;
+            let mut ok = true;
+            for gate in [GdnGate::Silu, GdnGate::Sigmoid] {
+                for (m, nan) in [(1usize, false), (9, false), (512, false), (9, true)] {
+                    let mut o = activations(k, m, 4401 + m as u32);
+                    if nan {
+                        o[k + 3 * 128 + 5] = f32::NAN;
+                    }
+                    let o = DeviceBuffer::from_host(stream, &o)?;
+                    let z = DeviceBuffer::from_host(stream, &activations(k, m, 4501))?;
+                    let w = DeviceBuffer::from_host(stream, &activations(128, 1, 4601))?;
+                    macro_rules! args {
+                        ($y:expr) => {
+                            NormGateArgs {
+                                o: &o,
+                                z: &z,
+                                w: &w,
+                                gate,
+                                eps: 1e-6,
+                                n_v,
+                                m,
+                                fault: sink,
+                                y: $y,
+                            }
+                        };
+                    }
+                    let mut y_ref = DeviceBuffer::<f32>::zeroed(stream, m * k)?;
+                    let mut r32 = GemmAct32::new(stream, m, k)?;
+                    let mut r128 = GemmAct::new(stream, m, k)?;
+                    norm.enqueue_norm_gate(stream, args!(&mut y_ref))?;
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &y_ref, m, &mut r32, sink)?;
+                    gpu.enqueue_quantize_gemm(&y_ref, m, &mut r128, sink)?;
+                    let ref_fault = gpu.take_fault()?.is_some();
+                    let mut y32 = DeviceBuffer::<f32>::zeroed(stream, m * k)?;
+                    let mut a32 = GemmAct32::new(stream, m, k)?;
+                    norm.enqueue_norm_gate_into(stream, args!(&mut y32), NormOut::Q32(&mut a32))?;
+                    let fault32 = gpu.take_fault()?.is_some();
+                    let mut y128 = DeviceBuffer::<f32>::zeroed(stream, m * k)?;
+                    let mut a128 = GemmAct::new(stream, m, k)?;
+                    norm.enqueue_norm_gate_into(
+                        stream,
+                        args!(&mut y128),
+                        NormOut::Q128(&mut a128),
+                    )?;
+                    let fault128 = gpu.take_fault()?.is_some();
+                    let y = y_ref.to_host_vec(stream)?;
+                    let rows_eq = bits_equal(&y32.to_host_vec(stream)?, &y)
+                        && bits_equal(&y128.to_host_vec(stream)?, &y);
+                    let q32_eq = a32.filled() == m
+                        && a32.q().to_host_vec(stream)? == r32.q().to_host_vec(stream)?
+                        && bits_equal(&a32.d().to_host_vec(stream)?, &r32.d().to_host_vec(stream)?)
+                        && a32.s().to_host_vec(stream)? == r32.s().to_host_vec(stream)?;
+                    let q128_eq = a128.q3().to_host_vec(stream)?
+                        == r128.q3().to_host_vec(stream)?
+                        && a128.q4().to_host_vec(stream)? == r128.q4().to_host_vec(stream)?
+                        && a128.q6().to_host_vec(stream)? == r128.q6().to_host_vec(stream)?
+                        && a128.s8().to_host_vec(stream)? == r128.s8().to_host_vec(stream)?
+                        && bits_equal(
+                            &a128.d8().to_host_vec(stream)?,
+                            &r128.d8().to_host_vec(stream)?,
+                        );
+                    let fault_ok = ref_fault == nan && fault32 == nan && fault128 == nan;
+                    let pass = rows_eq && q32_eq && q128_eq && fault_ok;
+                    println!(
+                        "gemm32 case=norm_form gate={gate:?} m={m} n_v={n_v} nan={nan} rows_eq={rows_eq} \
+                         q32_eq_quantizer={q32_eq} q128_eq_quantizer={q128_eq} fault_ok={fault_ok} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            // A routed scratch holding the native FP4 form is refused by name
+            // before any write: the rows, the Q8 planes and the filled
+            // columns stay as they were.
+            let m = 9usize;
+            let mut native = GemmAct32::new_routed(stream, m, k)?;
+            if native.has_native_form() {
+                let x = DeviceBuffer::from_host(stream, &activations(k, m, 4701))?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &x, m, &mut native, sink)?;
+                let (q, d, s) = (
+                    native.q().to_host_vec(stream)?,
+                    native.d().to_host_vec(stream)?,
+                    native.s().to_host_vec(stream)?,
+                );
+                let o = DeviceBuffer::from_host(stream, &activations(k, m, 4401))?;
+                let z = DeviceBuffer::from_host(stream, &activations(k, m, 4501))?;
+                let w = DeviceBuffer::from_host(stream, &activations(128, 1, 4601))?;
+                let sentinel = vec![7.0f32; m * k];
+                let mut y = DeviceBuffer::from_host(stream, &sentinel)?;
+                let args = NormGateArgs {
+                    o: &o,
+                    z: &z,
+                    w: &w,
+                    gate: GdnGate::Sigmoid,
+                    eps: 1e-6,
+                    n_v,
+                    m,
+                    fault: sink,
+                    y: &mut y,
+                };
+                let refused = matches!(
+                    norm.enqueue_norm_gate_into(stream, args, NormOut::Q32(&mut native)),
+                    Err(e) if e.to_string().contains("does not update the native FP4 form")
+                );
+                let kept = bits_equal(&y.to_host_vec(stream)?, &sentinel)
+                    && native.filled() == m
+                    && native.q().to_host_vec(stream)? == q
+                    && bits_equal(&native.d().to_host_vec(stream)?, &d)
+                    && native.s().to_host_vec(stream)? == s;
+                let pass = refused && kept;
+                println!(
+                    "gemm32 case=norm_form native=true m={m} n_v={n_v} refused={refused} kept={kept} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
+        }
+
         /// The native W8A8 MXFP8 product over the activations' MXFP8 form:
         /// the form's values, block scales on both operands, tile tails,
         /// eager against graph, the cells the exact owner replays, and the
@@ -10072,6 +10212,7 @@ mod gate {
             ok &= f32tile_case(&dev)?;
             ok &= dense_mma_case(&dev)?;
             ok &= norm_gate_case(gpu, false)?;
+            ok &= norm_form_case(&dev)?;
             ok &= bf16_store_case(&dev)?;
             ok &= mxfp8_w8a8_case(&dev)?;
             ok &= refusals(&dev)?;

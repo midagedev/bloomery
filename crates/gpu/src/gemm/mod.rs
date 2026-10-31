@@ -71,6 +71,7 @@ mod kernels32;
 mod batch;
 
 pub use act::GemmAct;
+pub(crate) use act32::quant32_group;
 pub use act32::{GemmAct32, MmaForm};
 pub use batch::{DownW, DownWin, GateUp, enqueue_gemm_batch};
 pub use f32tile::LINE as F32_TILE_LINE;
