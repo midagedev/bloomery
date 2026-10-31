@@ -15,6 +15,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
 use model::part::{Part, Planned, Source, Take, read_ahead};
+use model::placement::ctx_ask::Unpaged;
 use model::placement::workstation::{HostRead, host_available_read};
 use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
 
@@ -562,12 +563,17 @@ impl OnCard {
     /// [`OnCard::of`] whose host reads the tensors `in_place` names where they are stored: a
     /// tensor the plan holds wholly on the host is skipped when `in_place` holds it, and refused
     /// by name otherwise; of a stack `in_place` holds that the plan splits between this card and
-    /// the host, the card takes its segment's experts ([`OnCard::take`]).
+    /// the host, the card takes its segment's experts ([`OnCard::take`]). A plan that pages
+    /// routed experts to the NVMe expert tier, which a part source does not serve, is refused as
+    /// short on the host ([`Unpaged`]).
     pub fn of_in_place(
         plan: &Plan<'_>,
         card: usize,
         in_place: &InPlace,
     ) -> Result<OnCard, GpuError> {
+        if let Some(paged) = Unpaged::of(plan) {
+            return Err(GpuError::plan(WHAT, paged));
+        }
         let model = plan.model;
         let rows = plan.rows.iter().map(|row| {
             model
@@ -779,6 +785,15 @@ mod tests {
     use super::*;
     use model::placement::Role;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A plan's KV terms of no bytes.
+    struct NoKv;
+
+    impl model::placement::KvBytes for NoKv {
+        fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+            0
+        }
+    }
 
     /// Parts are staged in plan order while later parts still read, a staged part's pages are
     /// released once, and a read's refusal stops the stage at that part. The last part's read
@@ -1427,16 +1442,10 @@ mod tests {
     fn a_placed_source_plans_a_cards_parts_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use model::placement::{KvBytes, ModelTensors, plan_with, workstation};
+        use model::placement::{ModelTensors, plan_with, workstation};
 
         use crate::model::PartsLoad;
 
-        struct NoKv;
-        impl KvBytes for NoKv {
-            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
-                0
-            }
-        }
         struct Counted(AtomicUsize);
         impl Source for Counted {
             type Error = std::io::Error;
@@ -1519,5 +1528,77 @@ mod tests {
         let other = plan_with(&larger, &machine, 4096, &NoKv, None).expect("a plan");
         load.host_bytes(&other, 0, 1 << 30).unwrap();
         assert_eq!(load.source.0.load(Ordering::Relaxed), 2);
+    }
+
+    /// A plan that pages routed experts to the NVMe expert tier is refused as short on the host,
+    /// so a context or slot search reads it as a plan to fit below: the paged bytes, the host
+    /// need with them on the host, and the room the plan was made at. A plan that pages none is
+    /// not. Mutants: the paged stack refused by name only (no `Unpaged` in the chain); the need
+    /// left without the paged experts, under the room.
+    #[test]
+    fn a_paged_plan_is_short_on_the_host() {
+        use model::placement::workstation::{self, HostNeed, HostRead};
+        use model::placement::{
+            ArenaFloor, ModelTensors, PlanLevers, expert_nvme_tier, plan_host_routed,
+        };
+
+        // Eight layers of 256 experts: a stack passes the NVMe arena's floor of its layer.
+        let (k, rows, experts, layers) = (640, 2560, 256, 8);
+        let stack = k * rows * experts / 32 * 34;
+        let model = ModelTensors {
+            tensors: (0..layers)
+                .map(|l| ModelTensor {
+                    name: format!("layer.{l}.routed.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty: GgmlType::Q8_0,
+                    dims: vec![k, rows, experts],
+                    file_bytes: stack,
+                    gathered_rows: None,
+                })
+                .collect(),
+            layers,
+            experts,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_on(workstation::A6000, layers);
+        let mut plan =
+            plan_host_routed(&model, &machine, 4096, &NoKv, &PlanLevers::default()).expect("plans");
+        let unpaged = |plan: &Plan<'_>| {
+            OnCard::of(plan, 0)
+                .err()
+                .and_then(|e| std::error::Error::source(&e).map(ToString::to_string))
+        };
+        assert_eq!(Unpaged::of(&plan), None);
+        assert_eq!(unpaged(&plan), None, "a plan that pages nothing");
+        let floor = ArenaFloor::of(&plan).expect("the arena's floor").bytes;
+        let room = HostNeed::of(&plan, 0).bytes() - 2 * stack + floor;
+        let room = plan.plan_at(&(room, HostRead::Given));
+        expert_nvme_tier(&mut plan, room, None).expect("the split");
+        let paged = plan.host.nvme_expert_bytes;
+        assert!(paged > 0, "the room pages experts");
+        let e = OnCard::of(&plan, 0).err().expect("a paged plan is refused");
+        let GpuError::Plan { source, .. } = &e else {
+            panic!("{e}");
+        };
+        let refusal = source
+            .downcast_ref::<Unpaged>()
+            .expect("refused as unpaged");
+        assert_eq!(refusal.paged, paged);
+        assert_eq!(refusal.room, room);
+        assert_eq!(
+            refusal.need,
+            HostNeed {
+                experts: plan.host.expert_bytes + paged,
+                arena: 0,
+                ..HostNeed::of(&plan, 0)
+            }
+            .bytes()
+        );
+        let short = refusal.short();
+        assert!(short.need > short.room, "{refusal}");
+        assert_eq!(unpaged(&plan), Some(refusal.to_string()));
     }
 }

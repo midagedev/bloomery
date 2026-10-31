@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 
-use super::workstation::HostShort;
+use super::workstation::{HostNeed, HostShort};
 use super::{PlacementError, Plan, Role, Violation, per_expert};
 
 /// The slots a load serves when `--parallel` is unset.
@@ -214,6 +214,68 @@ impl HostShort {
         })
     }
 }
+
+/// A plan that pages routed experts to the NVMe expert tier, refused by a load that serves no
+/// tier past the host (a part source's): the host would hold the paged experts too. A longer
+/// context or more slots leave the host more experts, so a smaller one is what it asks for
+/// ([`Unpaged::short`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unpaged {
+    /// The routed-expert bytes the plan pages (`HostTotals::nvme_expert_bytes`).
+    pub paged: u64,
+    /// The plan's host need with them on the host and no NVMe tier arena. Its reserves are the
+    /// paged plan's, the prompt run-ahead's page-cache window among them.
+    pub need: u64,
+    /// The host room the plan was made at.
+    pub room: u64,
+}
+
+impl Unpaged {
+    /// `plan`'s refusal by a load that serves no NVMe expert tier; `None` when it pages none.
+    #[must_use]
+    pub fn of(plan: &Plan<'_>) -> Option<Unpaged> {
+        let paged = plan.host.nvme_expert_bytes;
+        if paged == 0 {
+            return None;
+        }
+        let held = HostNeed::of(plan, 0);
+        let need = HostNeed {
+            experts: held.experts.saturating_add(paged),
+            arena: 0,
+            ..held
+        }
+        .bytes();
+        let room = plan.host.room.as_ref().map_or_else(
+            || HostNeed::machine_room(plan.machine.host()),
+            |(_, (room, _))| *room,
+        );
+        Some(Unpaged { paged, need, room })
+    }
+
+    /// This refusal as a short host.
+    #[must_use]
+    pub fn short(&self) -> Short {
+        Short {
+            on: Side::Host,
+            need: self.need,
+            room: self.room,
+        }
+    }
+}
+
+impl fmt::Display for Unpaged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the plan pages {} B of routed experts to the NVMe expert tier, which a load from a \
+             part source does not serve: the host would hold {} B with them, in a room of {} B; \
+             ask a shorter context or fewer slots, or free host memory",
+            self.paged, self.need, self.room
+        )
+    }
+}
+
+impl std::error::Error for Unpaged {}
 
 /// A family's plan refusal, read as a short memory ([`PlanRefusal::short`]):
 /// each family's error says which of its variants carry a placement error

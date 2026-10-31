@@ -293,8 +293,10 @@ impl std::error::Error for CtxDoesNotFit {}
 /// A seat's boxed plan refusal read as a short memory
 /// ([`placement::ctx_ask::PlanRefusal::short`]): the family's error `E` when
 /// the box holds one, else a bare placement error's card reading, else a host
-/// need's on a unified pool ([`placement::workstation::HostShort::pool_short`]);
-/// `None` when it is none of them, or not short.
+/// need's on a unified pool ([`placement::workstation::HostShort::pool_short`]),
+/// else a load's refusal of a plan that pages experts, anywhere in its source
+/// chain ([`placement::ctx_ask::Unpaged`]); `None` when it is none of them, or
+/// not short.
 #[must_use]
 pub fn short_in<E>(e: &GateError) -> Option<placement::ctx_ask::Short>
 where
@@ -308,6 +310,11 @@ where
             .or_else(|| {
                 e.downcast_ref::<placement::workstation::HostShort>()
                     .and_then(placement::workstation::HostShort::pool_short)
+            })
+            .or_else(|| {
+                std::iter::successors(Some(&**e as &dyn std::error::Error), |e| e.source())
+                    .find_map(|e| e.downcast_ref::<placement::ctx_ask::Unpaged>())
+                    .map(placement::ctx_ask::Unpaged::short)
             }),
     }
 }
@@ -3009,6 +3016,61 @@ mod tests {
             "--place bp: the plan reserves the expert tier's prompt-batch bytes, and none were \
              given"
         );
+    }
+
+    /// A load's refusal of a plan that pages experts is short on the host wherever the seat's
+    /// error carries it in its source chain (the gpu crate's plan refusal wraps it), so a
+    /// context or slot search fits below it. Mutant: only the error itself read, so the wrapped
+    /// refusal stays the seat's error.
+    #[test]
+    fn a_wrapped_unpaged_refusal_is_short_on_the_host() {
+        use model::placement::ctx_ask::{PlanRefusal, Short, Side, Unpaged};
+
+        #[derive(Debug)]
+        struct PlanError;
+        impl std::fmt::Display for PlanError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a refusal of another kind")
+            }
+        }
+        impl std::error::Error for PlanError {}
+        impl PlanRefusal for PlanError {
+            fn placement(&self) -> Option<&model::placement::PlacementError> {
+                None
+            }
+            fn violations(&self) -> Option<&[model::placement::Violation]> {
+                None
+            }
+        }
+
+        #[derive(Debug)]
+        struct Wrapped(Unpaged);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the load")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let refusal = Unpaged {
+            paged: 3,
+            need: 10,
+            room: 7,
+        };
+        let e: GateError = Box::new(Wrapped(refusal));
+        assert_eq!(
+            super::short_in::<PlanError>(&e),
+            Some(Short {
+                on: Side::Host,
+                need: 10,
+                room: 7
+            })
+        );
+        let other: GateError = "a refusal of another kind".into();
+        assert_eq!(super::short_in::<PlanError>(&other), None);
     }
 }
 
