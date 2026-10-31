@@ -258,11 +258,12 @@ pub const DENSE: &[Mutant] = &[
     Mutant {
         name: "dense_weight_half",
         clause: "m_logits",
-        why: "the dense FFN's fold weight is 0.5 where the route lays 1: every layer adds half \
-              its FFN output",
+        why: "the dense FFN's down, a residual mat-vec under a plain residual, adds half its \
+              sum: every layer adds half its FFN output (the edit halves every residual \
+              mat-vec's add, the attention's out projection's too)",
         edits: &[(
-            "float scale = w[Q::fold_slot(ib)];",
-            "float scale = 0.5f * w[Q::fold_slot(ib)];",
+            "y[first_row + row] += sum_all;",
+            "y[first_row + row] += 0.5f * sum_all;",
             1,
         )],
     },
