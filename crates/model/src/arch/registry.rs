@@ -376,6 +376,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["mistral-large4"],
         read: Some(mistrallarge4::spec::read),
         draft: None,
+        coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "mistrallarge4",
             repo: "unsloth/Mistral-Large-4-1T-A52B-GGUF",
