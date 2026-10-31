@@ -22,6 +22,9 @@
 //! Each destination has a persistent `.lock` file: an exclusive OS lock serializes the state
 //! check, hashing, download and publication across threads and processes. The verified marker
 //! is atomically replaced after the completed file, so an interrupted publication is rechecked.
+//! A listed file whose name ends in `.lock`, `.part` or `.verified`, in any case, is refused
+//! when its own fetch starts, files listed before it being fetched already: it would be another
+//! listed file's lock, part or marker. The cache's discovery skips such names.
 //!
 //! A resolve whose files are all on disk at their listed sizes reads the
 //! unmarked ones in parallel before the fetches, to mark the ones that match.
@@ -910,7 +913,7 @@ pub fn verified_entries(root: &Path, repo: &str) -> Result<Vec<Entry>, HfError> 
                 continue;
             }
             let marker = with_suffix(&path, ".verified");
-            if !marker.is_file() {
+            if sidecar_suffix(&path).is_some() || !marker.is_file() {
                 continue;
             }
             let _lock = lock_file(&path)?;
@@ -1003,17 +1006,26 @@ fn write_text(path: &Path, text: &str) -> Result<(), HfError> {
     rename(&part, path)
 }
 
+/// The suffix of a destination's lock, part or marker that `path` ends in, matched without case
+/// as a case-insensitive file system does: a listed file of such a name would be another listed
+/// file's sidecar.
+fn sidecar_suffix(path: &Path) -> Option<&'static str> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    [".lock", ".part", ".verified"].into_iter().find(|s| {
+        bytes.len() >= s.len() && bytes[bytes.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes())
+    })
+}
+
 /// A persistent lock file, never removed: replacing its inode could admit another writer. A cache
 /// this process cannot write and that has no lock file yet is read without one: this process
 /// cannot publish into it, and a writer publishes each file and its marker by rename.
 fn lock_file(dest: &Path) -> Result<Option<fs::File>, HfError> {
-    let bytes = dest.as_os_str().as_encoded_bytes();
-    if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".lock") {
+    if let Some(suffix) = sidecar_suffix(dest) {
         return Err(HfError::io(
             dest,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "the .lock suffix is reserved for cache locks",
+                format!("the {suffix} suffix is reserved for cache sidecars"),
             ),
         ));
     }
@@ -1265,9 +1277,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fetch_refuses_reserved_lock_destinations_before_touching_sidecars() {
+    fn fetch_refuses_reserved_sidecar_destinations_before_touching_sidecars() {
         let d = scratch("reserved-lock");
-        for suffix in [".lock", ".LOCK", ".Lock"] {
+        for suffix in [".lock", ".LOCK", ".Lock", ".part", ".Verified"] {
             let name = format!("weights/x.safetensors{suffix}");
             let (c, e) = served(&d, "a/b", &name, b"checkpoint bytes");
             let dest = cache_path(&c.root, "a/b", &name).unwrap();
@@ -1275,14 +1287,15 @@ pub(crate) mod tests {
             fs::write(&dest, b"").unwrap();
             let held = fs::File::open(&dest).unwrap();
             let (result, events) = run(&c, "a/b", &e);
-            let err = result.expect_err("a cache entry cannot replace a lock");
+            let err = result.expect_err("a cache entry cannot replace a sidecar");
             assert!(
                 matches!(&err, HfError::Io { err, .. }
                 if err.kind() == std::io::ErrorKind::InvalidInput),
                 "{err}"
             );
             assert!(
-                err.to_string().contains(".lock suffix is reserved"),
+                err.to_string()
+                    .contains(&format!("{} suffix is reserved", suffix.to_lowercase())),
                 "{err}"
             );
             assert!(events.is_empty(), "{events:?}");
@@ -1345,17 +1358,13 @@ pub(crate) mod tests {
         assert!(!lock.exists());
     }
 
-    /// A listed file named like another one's part sidecar or marker temporary keeps its bytes:
-    /// the cache's own records take names no listed file and no listed file's lock can have.
+    /// A listed file named like another one's part sidecar keeps its bytes: the cache's own records
+    /// take names no listed file and no listed file's lock can have.
     #[test]
     fn listed_files_named_like_another_files_records_keep_their_bytes() {
         let d = scratch("record-names");
-        let names = [
-            "x.bin.part.ranges",
-            "x.bin.part.ranges.part",
-            "x.bin.verified.part",
-            "x.bin",
-        ];
+        // PIN(2026-10-31): The two .part-ending cases are now rejected by the reserved-sidecar tests.
+        let names = ["x.bin.part.ranges", "x.bin"];
         let bodies: Vec<Vec<u8>> = names.iter().map(|n| n.repeat(3).into_bytes()).collect();
         let files: Vec<_> = names
             .iter()
@@ -1372,6 +1381,52 @@ pub(crate) mod tests {
                 Some(body),
                 "{}",
                 path.display()
+            );
+        }
+    }
+
+    /// A listed file named like another listed file's part or marker is refused when its fetch
+    /// starts, in either order, so no returned path holds another file's bytes or digest; the
+    /// cache's discovery skips such a name an earlier fetch left marked.
+    #[test]
+    fn listed_files_named_like_another_files_part_or_marker_are_refused() {
+        for suffix in [".part", ".verified", ".VERIFIED"] {
+            let other = format!("x.bin{suffix}");
+            for (i, names) in [[other.as_str(), "x.bin"], ["x.bin", other.as_str()]]
+                .into_iter()
+                .enumerate()
+            {
+                let d = scratch(&format!("sidecar-names-{}-{i}", &suffix[1..]));
+                let c = hub(
+                    &d,
+                    "a/b",
+                    &[
+                        (names[0], names[0].as_bytes()),
+                        (names[1], names[1].as_bytes()),
+                    ],
+                );
+                let err = c
+                    .resolve_exact("a/b", &names, &mut |_| {})
+                    .expect_err("a listed name cannot take another file's sidecar");
+                assert!(
+                    err.to_string()
+                        .contains(&format!("{} suffix is reserved", suffix.to_lowercase())),
+                    "{names:?}: {err}"
+                );
+            }
+            let d = scratch(&format!("sidecar-names-{}-cached", &suffix[1..]));
+            let (c, e) = served(&d, "a/b", "x.bin", b"x.bin");
+            let x = run(&c, "a/b", &e).0.expect("x.bin");
+            write_marker(&with_suffix(&x, suffix), &e.digest).unwrap();
+            write_marker(
+                &with_suffix(&with_suffix(&x, suffix), ".verified"),
+                &e.digest,
+            )
+            .unwrap();
+            let found = verified_entries(&c.root, "a/b").expect("discovery");
+            assert_eq!(
+                found.iter().map(|e| &e.path[..]).collect::<Vec<_>>(),
+                ["x.bin"]
             );
         }
     }
