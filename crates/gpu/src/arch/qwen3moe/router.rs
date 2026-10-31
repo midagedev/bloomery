@@ -12,7 +12,8 @@ use crate::q8f32::{
     Bf16Words, RowValues, f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums,
 };
 use crate::route_core::{sigmoid, take};
-use crate::route_softmax::{FUSED_WARPS, MAX_TOKENS, store_cols};
+use crate::route_softmax::{FUSED_WARPS, MAX_TOKENS};
+use crate::store_cols;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, thread, threadfence, warp};
 
@@ -373,7 +374,7 @@ unsafe fn gated_fused_body<const PER_LANE: usize, W: RowValues>(
             // SAFETY: row < rows and 1 <= m <= 8, so the slots c·rows + row
             // (c < m) lie inside logits (this fn's contract); lane 0 of the
             // row's warp is their only writer.
-            unsafe { store_cols(logits, row, rows, m, &sums) };
+            unsafe { store_cols(logits, row, rows, m, sums) };
         }
     }
     // SAFETY: this fn's contract is publish_route_gated's for m tokens.
