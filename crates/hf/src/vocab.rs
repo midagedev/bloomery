@@ -28,10 +28,15 @@
 //! vocabulary by the hash of its output), and the row `tokenizer.json` carries is the one
 //! written, whatever `pretokenize_regex` of `tokenizer_config.json` says (a regex no row spells is
 //! refused) and whatever `ByteLevel` trims of an encoding's offsets. A pipeline no row spells is
-//! refused by name, and a [`VocabSpec`] may name the row its model has. A row also says whether
+//! refused by name, a pipeline several rows spell is the row the folder's `model_type` names
+//! (`llama-bpe` and `lfm2` spell one pipeline), and a [`VocabSpec`] may name the row its model
+//! has. A row also says whether
 //! its BPE takes a word that is itself a token whole, and `model.ignore_merges` must say the
 //! same. For every row the stop id array also makes serving encode as `tokenizer.json` does: the
 //! regex folds a contraction's case by Unicode, and BPE skips a byte the vocabulary lacks.
+//! `post_processor` is read like the rows: absent, a ByteLevel that moves no id, or Llama 3's
+//! Sequence of one and a template that adds the BOS first — the token the exported BOS id names,
+//! and what makes the header's `add_bos_token` true.
 
 use std::collections::HashMap;
 use std::fs;
@@ -114,7 +119,7 @@ macro_rules! pre_tokenizer {
 /// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
 /// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
 /// regexes match every codepoint, so no gap exists and the two split alike.
-pub const PRE: [(&str, &str, bool); 5] = [
+pub const PRE: [(&str, &str, bool); 6] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
@@ -135,6 +140,15 @@ pub const PRE: [(&str, &str, bool); 5] = [
         pre_tokenizer!(llama3_regex, "Isolated", false, true),
         true,
     ),
+    // Llama 3's pipeline, the same one `lfm2` spells, under the name llama.cpp reads the
+    // vocabulary by: it maps both names to its llama3 type, with `ignore_merges`. A folder
+    // carrying this pipeline picks between the two rows by its `model_type`
+    // ([`MODEL_TYPE_PRE`]).
+    (
+        "llama-bpe",
+        pre_tokenizer!(llama3_regex, "Isolated", false, true),
+        true,
+    ),
     // Nemotron-3.5's pipeline, under the name its GGUF twin states; the tokenizer crate runs the
     // name, and `tekken`, as the Tekken regex.
     (
@@ -148,6 +162,11 @@ pub const PRE: [(&str, &str, bool); 5] = [
 fn pre_names() -> String {
     PRE.map(|(name, _, _)| name).join(", ")
 }
+
+/// The `config.json` `model_type`s that name the row a folder's pipeline gets when several rows
+/// spell it: Llama 3's folder carries the same pipeline LFM's does, and its model's name tells
+/// the two apart where the pipeline cannot.
+const MODEL_TYPE_PRE: [(&str, &str); 1] = [("llama", "llama-bpe")];
 
 /// Whether the row `name` of [`PRE`] has its BPE take a word that is itself a token whole.
 fn ignores_merges(name: &str) -> bool {
@@ -193,14 +212,27 @@ fn rows() -> impl Iterator<Item = (&'static str, Json, String)> {
 
 /// The row of [`PRE`] a `tokenizer.json` pre-tokenizer is: its name and the regex it splits by.
 /// A pipeline is a row when it spells the row's pretokenizers and options but for `ByteLevel`'s
-/// `trim_offsets` ([`ids_only`]).
-fn pre_row(pre: Option<&Json>) -> Result<(&'static str, String), Error> {
+/// `trim_offsets` ([`ids_only`]). A pipeline several rows spell is the row the folder's
+/// `model_type` names among them ([`MODEL_TYPE_PRE`]), else the first of them.
+fn pre_row(pre: Option<&Json>, model_type: Option<&str>) -> Result<(&'static str, String), Error> {
     let bad = |what: String| Error::Vocab(what);
     let pre = pre.ok_or_else(|| bad("tokenizer.json.pre_tokenizer is missing".into()))?;
     let own = ids_only(pre);
-    rows()
-        .find(|(_, row, _)| *row == own)
+    let spelled: Vec<(&'static str, String)> = rows()
+        .filter(|(_, row, _)| *row == own)
         .map(|(name, _, regex)| (name, regex))
+        .collect();
+    let named = model_type.and_then(|t| {
+        MODEL_TYPE_PRE
+            .iter()
+            .find(|&&(models, _)| models == t)
+            .map(|&(_, row)| row)
+    });
+    spelled
+        .iter()
+        .find(|(name, _)| Some(*name) == named)
+        .or_else(|| spelled.first())
+        .map(|&(name, ref regex)| (name, regex.clone()))
         .ok_or_else(|| {
             bad(format!(
                 "tokenizer.json.pre_tokenizer {pre} is unsupported; supported rows: {}",
@@ -220,19 +252,9 @@ const TOKENIZER: &Fields = &[
     ("normalizer", Only(r#"[null, {"type":"NFC"}]"#)),
     // The row it is, in `PRE`; the keys of `keys` take it from there.
     ("pre_tokenizer", Read),
-    // ByteLevel without trim_offsets moves no id, only offsets, and as a post-processor its
-    // `add_prefix_space` and `use_regex` act on no text (LFM3 spells it true, false, true); as a
-    // decoder its options move nothing.
-    (
-        "post_processor",
-        Only(concat!(
-            "[null, ",
-            byte_level!(false, false, false),
-            ", ",
-            byte_level!(true, false, true),
-            "]"
-        )),
-    ),
+    // Read by [`post_processor`]: a ByteLevel that moves no id, or a Sequence of one and the
+    // BOS template Llama 3's folder carries.
+    ("post_processor", Read),
     (
         "decoder",
         Need(concat!(
@@ -291,7 +313,9 @@ const TOKENIZER_CONFIG: &Fields = &[
     ("add_prefix_space", Only("[false]")),
     ("do_lower_case", Only("[false]")),
     ("split_special_tokens", Only("[false]")),
-    ("clean_up_tokenization_spaces", Only("[false]")),
+    // The reference's decoder cleans spaces by the pre-tokenizer's name (its `clean_spaces`),
+    // not this key; the value moves nothing here.
+    ("clean_up_tokenization_spaces", Only("[false, true]")),
     // Serving decodes invalid UTF-8 as U+FFFD.
     ("errors", Only(r#"["replace"]"#)),
     // The regex of the pre-tokenizer row, when present.
@@ -444,11 +468,12 @@ const SPECIAL: [(&str, &str); 5] = [
 ];
 
 /// What a model's map tells the tokenizer reader: the vocabulary size and the special ids its
-/// `config.json` names, and optionally the [`PRE`] row its model has.
+/// `config.json` names, its `model_type`, and optionally the [`PRE`] row its model has.
 #[derive(Debug)]
 pub struct VocabSpec {
     size: u32,
     ids: [Option<Vec<u32>>; 5],
+    model_type: Option<String>,
     pre: Option<&'static str>,
 }
 
@@ -456,7 +481,9 @@ pub struct VocabSpec {
 pub type Config = VocabSpec;
 
 impl VocabSpec {
-    /// Read only the vocabulary fields, refusing malformed counts and ids by name.
+    /// Read only the vocabulary fields, refusing malformed counts and ids by name. The
+    /// `model_type` names the row where several spell one pipeline ([`MODEL_TYPE_PRE`]); its
+    /// validation is the folder map's.
     pub fn parse(config: &Json) -> Result<Self, Error> {
         let bad = |s: &str| Error::Vocab(s.into());
         if !config.is_object() {
@@ -476,6 +503,10 @@ impl VocabSpec {
         let mut out = Self {
             size,
             ids: std::array::from_fn(|_| None),
+            model_type: config
+                .get("model_type")
+                .and_then(Json::as_str)
+                .map(str::to_string),
             pre: None,
         };
         for (i, (kind, _)) in SPECIAL.iter().enumerate() {
@@ -547,12 +578,13 @@ pub struct Keys {
 }
 
 /// A tokenizer's vocabulary as the GGUF keys spell it: every id's token and type, the merges in
-/// HF's rank order, and the added tokens by id (content, special).
+/// HF's rank order, the added tokens by id (content, special), and every token's name by id.
 struct Vocabulary<'a> {
     tokens: Vec<Value>,
     types: Vec<Value>,
     merges: Vec<Value>,
     added: HashMap<u32, (&'a str, bool)>,
+    by_name: HashMap<&'a str, u32>,
 }
 
 /// The vocabulary of `tokenizer.json` (`model` its `model`), its added tokens checked against
@@ -716,6 +748,7 @@ fn vocabulary<'a>(
         types,
         merges,
         added,
+        by_name,
     })
 }
 
@@ -789,6 +822,145 @@ fn special_ids(
     Ok((ids, stop))
 }
 
+/// The ByteLevel post-processors that move no id: the spellings a `tokenizer.json` carries,
+/// whose `add_prefix_space` and `use_regex` act on no text and whose `trim_offsets` is clear.
+fn byte_level_posts() -> [Json; 2] {
+    [
+        byte_level!(false, false, false),
+        byte_level!(true, false, true),
+    ]
+    .map(|spelled| serde_json::from_str(spelled).expect("a ByteLevel post-processor is JSON"))
+}
+
+/// `tokenizer.json.post_processor`: absent, a lone ByteLevel that moves no id, or the Sequence
+/// Llama 3's folder carries — a ByteLevel that moves no id, then a `TemplateProcessing` whose
+/// single template writes one special token before the text. That token must be the BOS the
+/// exported keys name (`bos`, the exported BOS id), and the template is what makes the header's
+/// `add_bos_token` true. The pair template encodes two texts, which serving never does: its
+/// pieces are read, their order and tokens free. Everything else — another processor, a
+/// template of another shape, a token that is not the BOS, a `special_tokens` entry that names
+/// another id — is refused by name.
+fn post_processor<'a>(
+    post: Option<&'a Json>,
+    bos: Option<u32>,
+    by_name: &HashMap<&str, u32>,
+) -> Result<Option<&'a str>, Error> {
+    let bad = |what: String| Error::Vocab(what);
+    let Some(post) = post.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let unsupported = || {
+        bad(format!(
+            "tokenizer.json.post_processor {post} is unsupported; it is absent, a ByteLevel \
+             that moves no id, or a Sequence of one and a template that adds the BOS first"
+        ))
+    };
+    if byte_level_posts().iter().any(|v| v == post) {
+        return Ok(None);
+    }
+    if post["type"] != "Sequence" || post.as_object().is_none_or(|o| o.len() != 2) {
+        return Err(unsupported());
+    }
+    if !post.get("processors").is_some_and(|v| v.is_array()) {
+        return Err(unsupported());
+    }
+    let processors = post["processors"].as_array().expect("an array");
+    if processors.len() != 2 || !byte_level_posts().iter().any(|v| v == &processors[0]) {
+        return Err(unsupported());
+    }
+    let template = &processors[1];
+    if template["type"] != "TemplateProcessing"
+        || !template.as_object().is_some_and(|o| {
+            o.keys()
+                .all(|k| matches!(k.as_str(), "type" | "single" | "pair" | "special_tokens"))
+        })
+    {
+        return Err(unsupported());
+    }
+    // A piece: `SpecialToken` or `Sequence`, a token's text (or `A`/`B` for the input), and the
+    // sequence it belongs to.
+    fn piece(p: &Json) -> Option<(&str, &str, i64)> {
+        let object = p.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        let (kind, body) = object.iter().next()?;
+        if kind != "SpecialToken" && kind != "Sequence" {
+            return None;
+        }
+        let body = body.as_object()?;
+        if body.len() != 2 {
+            return None;
+        }
+        Some((
+            kind,
+            body.get("id")?.as_str()?,
+            body.get("type_id")?.as_i64()?,
+        ))
+    }
+    let single = template["single"].as_array().ok_or_else(unsupported)?;
+    let bad_template = || {
+        bad(format!(
+            "tokenizer.json.post_processor {post} has no single template of one special token \
+             then the text"
+        ))
+    };
+    if single.len() != 2 {
+        return Err(bad_template());
+    }
+    let (kind, token, type_id) = piece(&single[0]).ok_or_else(bad_template)?;
+    if kind != "SpecialToken" || type_id != 0 {
+        return Err(bad_template());
+    }
+    let (kind, sequence, type_id) = piece(&single[1]).ok_or_else(bad_template)?;
+    if kind != "Sequence" || sequence != "A" || type_id != 0 {
+        return Err(bad_template());
+    }
+    if let Some(pair) = template.get("pair").filter(|v| !v.is_null())
+        && !pair
+            .as_array()
+            .is_some_and(|pieces| pieces.iter().all(|p| piece(p).is_some()))
+    {
+        return Err(unsupported());
+    }
+    if let Some(tokens) = template.get("special_tokens").filter(|v| !v.is_null()) {
+        let tokens = tokens.as_object().ok_or_else(|| {
+            bad(format!(
+                "tokenizer.json.post_processor special_tokens is not an object"
+            ))
+        })?;
+        for (name, entry) in tokens {
+            let id = by_name.get(name.as_str()).copied().ok_or_else(|| {
+                bad(format!(
+                    "tokenizer.json.post_processor special_tokens names {name:?}, no token of \
+                     this vocabulary"
+                ))
+            })?;
+            if entry["id"].as_str() != Some(name.as_str())
+                || entry["tokens"] != serde_json::json!([name])
+                || entry["ids"] != serde_json::json!([id])
+            {
+                return Err(bad(format!(
+                    "tokenizer.json.post_processor special_tokens {name:?} does not spell its \
+                     id {id}"
+                )));
+            }
+        }
+    }
+    let id = by_name.get(token).copied().ok_or_else(|| {
+        bad(format!(
+            "tokenizer.json.post_processor names {token:?}, no token of this vocabulary"
+        ))
+    })?;
+    if Some(id) != bos {
+        return Err(bad(format!(
+            "tokenizer.json.post_processor names {token:?} (id {id}), not the exported bos \
+             token (id {bos:?})"
+        )));
+    }
+    Ok(Some(token))
+}
+
 /// The `tokenizer.*` keys of the repo at `dir`.
 ///
 /// # Errors
@@ -803,7 +975,9 @@ fn special_ids(
 /// `config.json` does not give; a special token in `tokenizer_config.json` that is neither a
 /// string nor an added token's object, or that no added token spells; a special token id that is
 /// not an id or a list of them, lies outside the vocabulary, or is a BOS, pad, unknown or
-/// separator id other than the one exported; an `add_bos_token` or `add_eos_token` that is not
+/// separator id other than the one exported; a `post_processor` other than the ByteLevel
+/// spellings that move no id or the BOS template, or a template that names a token other than
+/// the exported BOS; an `add_bos_token` or `add_eos_token` that is not
 /// boolean, and a `chat_template` that is not a string, each by name.
 pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
     let bad = |what: String| Error::Vocab(what);
@@ -818,7 +992,7 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
     ] {
         schema::check(value, file, &[table]).map_err(bad)?;
     }
-    let (pre, regex) = pre_row(tok.get("pre_tokenizer"))?;
+    let (pre, regex) = pre_row(tok.get("pre_tokenizer"), spec.model_type.as_deref())?;
     if let Some(expected) = spec.pre.filter(|&expected| expected != pre) {
         return Err(bad(format!(
             "tokenizer.json.pre_tokenizer is the {pre:?} row, where this model's is {expected:?}"
@@ -856,6 +1030,7 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         types,
         merges,
         added,
+        by_name,
     } = vocabulary(model, &tok, &tc, spec)?;
     let mut out = vec![
         (
@@ -874,15 +1049,35 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         ));
     }
     let (ids, stop) = special_ids(&tc, &generation, spec, &added)?;
+    let bos = ids
+        .iter()
+        .find(|(k, _)| k == "tokenizer.ggml.bos_token_id")
+        .and_then(|(_, v)| match v {
+            Value::U32(id) => Some(*id),
+            _ => None,
+        });
+    // The BOS template the post-processor spells is the header's `add_bos_token`; without one
+    // the key the config writes stands.
+    let template = post_processor(tok.get("post_processor"), bos, &by_name)?;
     out.extend(ids);
     for kind in ["bos", "eos"] {
         let key = format!("add_{kind}_token");
-        let b = match tc.get(&key).filter(|v| !v.is_null()) {
+        let set = tc.get(&key).filter(|v| !v.is_null());
+        let mut b = match set {
             Some(v) => v
                 .as_bool()
                 .ok_or_else(|| bad(format!("{key} {v} is not boolean")))?,
             None => false,
         };
+        if kind == "bos" && template.is_some() {
+            if set == Some(&Json::Bool(false)) {
+                return Err(bad(format!(
+                    "{key} false disagrees with the post-processor, whose template adds the \
+                     bos first"
+                )));
+            }
+            b = true;
+        }
         out.push((format!("tokenizer.ggml.{key}"), Value::Bool(b)));
     }
     let template = match fs::read_to_string(dir.join("chat_template.jinja")) {
@@ -1268,7 +1463,7 @@ mod tests {
             ["tokenizer_config.json", "", "add_prefix_space", false, true],
             ["tokenizer_config.json", "", "do_lower_case", false, true],
             ["tokenizer_config.json", "", "split_special_tokens", false, true],
-            ["tokenizer_config.json", "", "clean_up_tokenization_spaces", false, true],
+            ["tokenizer_config.json", "", "clean_up_tokenization_spaces", true, 1],
             ["tokenizer_config.json", "", "errors", "replace", "ignore"],
             ["tokenizer_config.json", "", "pretokenize_regex", "$", "different"],
             ["tokenizer_config.json", "", "tokenizer_class", "PreTrainedTokenizerFast", "LlamaTokenizer"],
@@ -1590,7 +1785,7 @@ mod tests {
         let pipeline: Json = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(pipeline["normalizer"]["type"], "NFC");
         assert_eq!(
-            pre_row(Some(&pipeline["pre_tokenizer"])).unwrap().0,
+            pre_row(Some(&pipeline["pre_tokenizer"]), None).unwrap().0,
             "qwen2"
         );
     }
@@ -1679,11 +1874,22 @@ mod tests {
             let mut row: Json = serde_json::from_str(spelled).unwrap();
             let trim = row["pretokenizers"][1]["trim_offsets"].as_bool().unwrap();
             row["pretokenizers"][1]["trim_offsets"] = (!trim).into();
-            assert_eq!(pre_row(Some(&row)).unwrap().0, name);
+            // A row that differs only by `trim_offsets` is its row — the one a folder without a
+            // `model_type` naming it reads, and for `llama-bpe` the one `llama` names.
+            let found = pre_row(Some(&row), None).unwrap().0;
+            let spelled = PRE.iter().find(|r| r.0 == found).unwrap().1;
+            assert_eq!(
+                ids_only(&serde_json::from_str::<Json>(spelled).unwrap()),
+                ids_only(&row),
+                "{name}"
+            );
+            if name == "llama-bpe" {
+                assert_eq!(pre_row(Some(&row), Some("llama")).unwrap().0, name);
+            }
             for option in ["add_prefix_space", "use_regex"] {
                 let mut moved: Json = serde_json::from_str(spelled).unwrap();
                 moved["pretokenizers"][1][option] = true.into();
-                assert!(pre_row(Some(&moved)).is_err(), "{name} {option}");
+                assert!(pre_row(Some(&moved), None).is_err(), "{name} {option}");
             }
         }
     }
@@ -1750,8 +1956,10 @@ mod tests {
         remove(&dir);
     }
 
-    /// The rows are distinct pipelines under distinct names, each one `tokenizer.json`'s
-    /// `pre_tokenizer` accepts, and every one of the schema's allowed pre-tokenizer values is a row.
+    /// The rows are distinct names, each one a `tokenizer.json`'s `pre_tokenizer` accepts.
+    /// `llama-bpe` and `lfm2` spell one pipeline (llama.cpp reads both names as its llama3
+    /// type): the row a folder gets is the one its `model_type` names among them, else the
+    /// first, and the two share their `ignore_merges`, so the name alone moves nothing.
     #[test]
     fn the_pre_rows_are_distinct_and_accepted() {
         let names: std::collections::BTreeSet<_> = PRE.iter().map(|r| r.0).collect();
@@ -1761,12 +1969,30 @@ mod tests {
             .collect();
         assert_eq!(names.len(), PRE.len());
         for (i, a) in rows.iter().enumerate() {
-            assert!(
-                rows[..i].iter().all(|b| ids_only(a) != ids_only(b)),
-                "{}",
-                PRE[i].0
-            );
-            assert_eq!(pre_row(Some(a)).unwrap().0, PRE[i].0);
+            let (name, _) = pre_row(Some(a), None).unwrap();
+            let ignore = PRE.iter().find(|r| r.0 == name).unwrap().2;
+            assert_eq!(ignore, PRE[i].2, "{name} {}", PRE[i].0);
+            for (j, b) in rows[..i].iter().enumerate() {
+                if ids_only(a) == ids_only(b) {
+                    // One pipeline, two names: the first is what an unnamed folder reads, so
+                    // exactly one model type names the other.
+                    assert_eq!(pre_row(Some(b), None).unwrap().0, PRE[j].0);
+                    assert_eq!(
+                        MODEL_TYPE_PRE
+                            .iter()
+                            .filter(|&&(_, row)| row == PRE[i].0 || row == PRE[j].0)
+                            .count(),
+                        1,
+                        "{} {}",
+                        PRE[j].0,
+                        PRE[i].0
+                    );
+                    assert!(MODEL_TYPE_PRE.iter().any(|&(_, row)| row == PRE[i].0));
+                }
+            }
+        }
+        for &(models, row) in &MODEL_TYPE_PRE {
+            assert!(PRE.iter().any(|r| r.0 == row), "{models} {row}");
         }
     }
 
@@ -1961,6 +2187,209 @@ mod tests {
             assert!(e.contains("extra_special_tokens"), "{what}: {e}");
             remove(&dir);
         }
+    }
+
+    /// Llama-3.1-8B-Instruct's tokenizer files as the mlx folder ships them
+    /// (`llama-3.1-8b-tokenizer-files.json`: `tokenizer.json` but for the vocabulary and merges,
+    /// which the test sets, then `tokenizer_config.json` and `config.json` whole; the folder
+    /// ships no `generation_config.json`), after `edit`.
+    fn llama_repo(edit: impl FnOnce(&mut Json)) -> std::path::PathBuf {
+        let path = format!(
+            "{}/tests/fixtures/llama-3.1-8b-tokenizer-files.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut files: Json = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        files["tokenizer.json"]["model"]["vocab"] = serde_json::json!({"a":0,"b":1,"ab":2});
+        files["tokenizer.json"]["model"]["merges"] = serde_json::json!([["a", "b"]]);
+        edit(&mut files);
+        let texts: Vec<(&str, String)> = ["tokenizer.json", "tokenizer_config.json", "config.json"]
+            .into_iter()
+            .map(|name| (name, files[name].to_string()))
+            .collect();
+        repo(
+            &texts
+                .iter()
+                .map(|(n, t)| (*n, t.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Llama-3.1's real files open as the `llama-bpe` row — the pipeline `lfm2` spells, told
+    /// apart by the folder's `model_type` — with `ignore_merges` on, the BOS the
+    /// post-processor's template names (`<|begin_of_text|>`, id 128000) making
+    /// `add_bos_token` true though `tokenizer_config.json` writes no such key, the eos by name
+    /// (`<|eot_id|>`, id 128009), the stop ids the config's list gives, and all 256 added tokens
+    /// special. Mutants (each red at this line): the `llama-bpe` row or [`MODEL_TYPE_PRE`]
+    /// dropped (the folder reads `lfm2`), the template read as no BOS (`add_bos_token` false),
+    /// `clean_up_tokenization_spaces` back to `Only("[false]")`.
+    #[test]
+    fn the_real_llama_3_1_files_open_as_the_llama_bpe_row() {
+        let dir = llama_repo(|_| {});
+        let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+        let value = |key: &str| get(&keys.keys, &format!("tokenizer.ggml.{key}")).cloned();
+        assert_eq!(value("pre"), Some(Value::String("llama-bpe".into())));
+        assert_eq!(value("model"), Some(Value::String("gpt2".into())));
+        assert_eq!(value("bos_token_id"), Some(Value::U32(128_000)));
+        assert_eq!(value("eos_token_id"), Some(Value::U32(128_009)));
+        assert_eq!(value("add_bos_token"), Some(Value::Bool(true)));
+        assert_eq!(value("add_eos_token"), Some(Value::Bool(false)));
+        assert_eq!(value("normalizer"), None);
+        assert_eq!(keys.stop, [128_001, 128_008, 128_009]);
+        assert_eq!(keys.added, (128_000..=128_255).collect::<Vec<u32>>());
+        let Some(Value::Array(types)) = value("token_type") else {
+            panic!("no token_type");
+        };
+        assert_eq!(types.len(), 128_256);
+        for (id, ty) in [
+            (0, 1),
+            (127_999, 5),
+            (128_000, 3),
+            (128_009, 3),
+            (128_255, 3),
+        ] {
+            assert_eq!(types[id], Value::I32(ty), "id {id}");
+        }
+        assert!(get(&keys.keys, "tokenizer.chat_template").is_some());
+        remove(&dir);
+    }
+
+    /// A pipeline two rows spell is the row the folder's `model_type` names, else the first of
+    /// them: Llama-3.1's files read `lfm2` with the `model_type` gone or another model's, a
+    /// spec naming `lfm2` refuses the llama-typed folder by both names, and one naming
+    /// `llama-bpe` opens it.
+    #[test]
+    fn a_shared_pipeline_names_its_row_by_model_type() {
+        for model_type in [None, Some("lfm3"), Some("falcon3")] {
+            let dir = llama_repo(|f| match model_type {
+                Some(t) => f["config.json"]["model_type"] = serde_json::json!(t),
+                None => {
+                    f["config.json"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model_type");
+                }
+            });
+            let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+            assert_eq!(
+                get(&keys.keys, "tokenizer.ggml.pre"),
+                Some(&Value::String("lfm2".into())),
+                "{model_type:?}"
+            );
+            remove(&dir);
+        }
+        let dir = llama_repo(|_| {});
+        let e = super::keys(&dir, &spec_of(&dir).with_pre("lfm2").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("llama-bpe") && e.contains("lfm2") && e.contains("pre_tokenizer"),
+            "{e}"
+        );
+        super::keys(&dir, &spec_of(&dir).with_pre("llama-bpe").unwrap()).unwrap();
+        remove(&dir);
+    }
+
+    /// The post-processor's BOS template is read or refused by name: a single template of
+    /// another shape, a special token of another `type_id`, a template token that is not the
+    /// exported BOS or no token of the vocabulary, a pair of pieces another kind, a
+    /// `special_tokens` entry with another id or naming no token, a Sequence whose ByteLevel
+    /// moves ids, and an `add_bos_token` false beside the template. The pair template's own
+    /// order moves no single text, so its pieces are free.
+    #[test]
+    fn the_bos_template_is_read_or_refused_by_name() {
+        fn run(edit: impl Fn(&mut Json), needle: &str) {
+            let dir = llama_repo(edit);
+            let e = super::keys(&dir, &spec_of(&dir)).unwrap_err().to_string();
+            assert!(e.contains(needle), "{e}");
+            remove(&dir);
+        }
+        run(
+            |f| {
+                f["tokenizer.json"]["post_processor"]["processors"][1]["single"]
+                    .as_array_mut()
+                    .unwrap()
+                    .truncate(1);
+            },
+            "post_processor",
+        );
+        run(
+            |f| {
+                let single = f["tokenizer.json"]["post_processor"]["processors"][1]["single"]
+                    .as_array_mut()
+                    .unwrap();
+                single[0]["SpecialToken"]["type_id"] = serde_json::json!(1);
+            },
+            "post_processor",
+        );
+        run(
+            |f| {
+                f["tokenizer.json"]["post_processor"]["processors"][1]["single"][0]["SpecialToken"]
+                    ["id"] = serde_json::json!("<|eot_id|>");
+            },
+            "not the exported bos",
+        );
+        run(
+            |f| {
+                f["tokenizer.json"]["post_processor"]["processors"][1]["single"][0]["SpecialToken"]
+                    ["id"] = serde_json::json!("<|nowhere|>");
+            },
+            "no token of this vocabulary",
+        );
+        run(
+            |f| {
+                let pair = f["tokenizer.json"]["post_processor"]["processors"][1]["pair"]
+                    .as_array_mut()
+                    .unwrap();
+                pair[0] = serde_json::json!({"Other": {"id": "<|begin_of_text|>", "type_id": 0}});
+            },
+            "post_processor",
+        );
+        run(
+            |f| {
+                f["tokenizer.json"]["post_processor"]["processors"][1]["special_tokens"]["<|begin_of_text|>"]
+                    ["ids"] = serde_json::json!([1]);
+            },
+            "does not spell its id",
+        );
+        run(
+            |f| {
+                f["tokenizer.json"]["post_processor"]["processors"][1]["special_tokens"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("<|nowhere|>".into(), serde_json::json!({"id": "<|nowhere|>", "ids": [1], "tokens": ["<|nowhere|>"]}));
+            },
+            "no token of this vocabulary",
+        );
+        run(
+            |f| {
+                f["tokenizer.json"]["post_processor"]["processors"][0]["trim_offsets"] =
+                    serde_json::json!(true);
+            },
+            "post_processor",
+        );
+        run(
+            |f| {
+                let post = f["tokenizer.json"]["post_processor"].take();
+                let mut turned = post["processors"].as_array().unwrap().clone();
+                turned.reverse();
+                f["tokenizer.json"]["post_processor"]["processors"] = serde_json::json!(turned);
+            },
+            "post_processor",
+        );
+        run(
+            |f| {
+                f["tokenizer_config.json"]["add_bos_token"] = serde_json::json!(false);
+            },
+            "add_bos_token",
+        );
+        let dir = llama_repo(|f| {
+            f["tokenizer.json"]["post_processor"]["processors"][1]["pair"]
+                .as_array_mut()
+                .unwrap()
+                .reverse();
+        });
+        super::keys(&dir, &spec_of(&dir)).unwrap();
+        remove(&dir);
     }
 
     /// Feed a key's value to a digest: a tag, then the value's bytes, a string and an array

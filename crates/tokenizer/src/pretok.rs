@@ -1,7 +1,7 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
-//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`lfm2`), [`Pre::Tekken`] (`tekken`, `pixtral`),
+//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`), [`Pre::Tekken`] (`tekken`, `pixtral`),
 //! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
 //! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
@@ -91,7 +91,7 @@
 //!
 //! ## llama3
 //!
-//! The reference maps `lfm2` to its LLAMA3 type. That type's one regex is
+//! The reference maps `llama-bpe` and `lfm2` to its LLAMA3 type. That type's one regex is
 //! the one [`Pre::Glm4`] runs — qwen2's with `\p{N}{1,3}` in place of `\p{N}` —
 //! and it goes to the same hand-written splitter (`unicode_regex_split_custom_llama3`),
 //! so [`split`] uses [`split_custom`] with a run of three numbers, the `glm4`
@@ -684,7 +684,7 @@ pub(crate) enum Pre {
     /// classes are Unicode 14.0's, and BPE skips a byte its vocabulary lacks. Never named in a
     /// header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
     Qwen2Hf,
-    /// `lfm2`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
+    /// `llama-bpe`, `lfm2`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
     Llama3,
     /// `lfm2` as a Hugging Face `tokenizer.json` runs it: contractions fold case by Unicode,
@@ -720,7 +720,7 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 15] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 16] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -730,6 +730,7 @@ impl Pre {
         ("qwen35", Pre::Qwen35),
         ("tekken", Pre::Tekken),
         ("pixtral", Pre::Tekken),
+        ("llama-bpe", Pre::Llama3),
         ("lfm2", Pre::Llama3),
         ("minimax-m2", Pre::MiniMaxM2),
         ("gpt-4o", Pre::Gpt4o),
@@ -762,7 +763,8 @@ impl Pre {
     }
 
     /// Whether a word that is itself a vocabulary token is taken whole,
-    /// before merges. Any pre can carry it; `lfm2` and `tekken` do, in either reading.
+    /// before merges. Any pre can carry it; `llama-bpe`, `lfm2` and `tekken` do, in either
+    /// reading.
     pub(crate) fn ignore_merges(self) -> bool {
         matches!(
             self,
@@ -1178,6 +1180,15 @@ mod tests {
     fn lfm2_is_llama3() {
         assert_eq!(crate::named(&Pre::NAMES, "lfm2"), Some(Pre::Llama3));
         assert!(crate::runs_pre_tokenizer("lfm2"));
+    }
+
+    /// `llama-bpe` is `lfm2`'s splitter under its own name: llama.cpp maps both names to its
+    /// llama3 type, with `ignore_merges`. Llama 3's header spells it so. FAIL-first: a row that
+    /// names another splitter, or none, fails it.
+    #[test]
+    fn llama_bpe_is_llama3() {
+        assert_eq!(crate::named(&Pre::NAMES, "llama-bpe"), Some(Pre::Llama3));
+        assert!(crate::runs_pre_tokenizer("llama-bpe"));
     }
 
     /// `gpt-4o` is a row of its own (the UTF-8 reader of its tree is the strict one) that runs the

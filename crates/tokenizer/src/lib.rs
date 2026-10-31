@@ -33,7 +33,7 @@ use std::path::Path;
 
 use memchr::memmem::Finder;
 
-pub use decode::Decoder;
+pub use decode::{Decoder, SpaceCleaner};
 pub use unicode::byte_to_cpt_table;
 pub use vocab::{Specials, attr};
 
@@ -443,9 +443,24 @@ impl Tokenizer {
     }
 
     /// The text of `ids` with special tokens rendered; bytes that do not form
-    /// UTF-8 become U+FFFD.
+    /// UTF-8 become U+FFFD. A vocabulary that cleans spaces
+    /// ([`Tokenizer::space_cleaner`]) cleans the text as the reference's
+    /// `clean_spaces` does.
     pub fn decode(&self, ids: &[u32]) -> String {
-        String::from_utf8_lossy(&self.decode_bytes(ids, true)).into_owned()
+        let text = String::from_utf8_lossy(&self.decode_bytes(ids, true)).into_owned();
+        if self.vocab.clean_spaces {
+            decode::clean_str(&text)
+        } else {
+            text
+        }
+    }
+
+    /// A [`SpaceCleaner`] when this vocabulary's decoded text has its spaces cleaned (the
+    /// reference's `clean_spaces` for its pre-tokenizer's name), for a reader that streams
+    /// pieces one at a time; `None` when decode returns its text as is.
+    #[must_use]
+    pub fn space_cleaner(&self) -> Option<SpaceCleaner> {
+        self.vocab.clean_spaces.then(SpaceCleaner::default)
     }
 
     /// Vocabulary size.
@@ -550,7 +565,7 @@ mod tests {
     use gguf::Value;
     use gguf::write::{Layout, Writer};
 
-    use super::{Error, Tokenizer, attr, byte_to_cpt_table};
+    use super::{Decoder, Error, SpaceCleaner, Tokenizer, attr, byte_to_cpt_table};
 
     /// A gemma4 vocabulary of a few tokens: six CONTROL tokens, one
     /// USER_DEFINED token, the 256 `<0xXX>` byte tokens but `missing_byte`,
@@ -1623,6 +1638,265 @@ mod tests {
         assert_eq!(
             hf.encode_marked("]\u{1}~b]!p~[", "\u{1}", false, true),
             [93, 126, 98, 256]
+        );
+    }
+
+    /// A byte-alphabet vocabulary under `pre`: every byte is a token, so a text decodes to its
+    /// own bytes and encodes to one byte token a byte.
+    fn byte_header(pre: &str) -> Vec<(String, Value)> {
+        let tokens: Vec<Value> = byte_to_cpt_table()
+            .into_iter()
+            .map(|cp| Value::String(char::from_u32(cp).unwrap().to_string()))
+            .collect();
+        [
+            ("tokenizer.ggml.model", Value::String("gpt2".into())),
+            ("tokenizer.ggml.pre", Value::String(pre.into())),
+            ("tokenizer.ggml.tokens", Value::Array(tokens)),
+            ("tokenizer.ggml.merges", Value::Array(vec![])),
+        ]
+        .map(|(k, v)| (k.to_string(), v))
+        .to_vec()
+    }
+
+    /// The `llama-bpe` row cleans decoded spaces as the reference's `clean_spaces` does (its
+    /// BPE default, kept for the llama3 type): the space before `?`, `!`, `.` and `,` is
+    /// dropped — one of two, the one before the punctuation — an apostrophe between spaces
+    /// keeps neither, and the space before `'s`, `'m`, `'re` and `'ve` is dropped while `'t`,
+    /// `'d` and `'ll` keep theirs. A row that does not clean (`qwen35`) returns the text as is.
+    ///
+    /// FAIL-first: with the clean dropped every changed row fails; with one pass alone, the
+    /// rows the other passes change.
+    #[test]
+    fn the_llama_bpe_row_cleans_decoded_spaces() {
+        let cases: &[(&str, &str)] = &[
+            (" ?", "?"),
+            ("What ?", "What?"),
+            ("Hello , world", "Hello, world"),
+            ("a  ?", "a ?"),
+            ("Hello ,  world", "Hello,  world"),
+            ("a ' b", "a'b"),
+            ("it 's fine", "it's fine"),
+            ("I 'm here", "I'm here"),
+            ("they 're", "they're"),
+            ("we 've", "we've"),
+            ("don 't", "don 't"),
+            ("we 'll go", "we 'll go"),
+            ("you 'd", "you 'd"),
+            ("a 'x b", "a 'x b"),
+            ("x' y", "x' y"),
+            ("a ' b ' c", "a'b'c"),
+            (" ' s", "'s"),
+            (" '? t", " '? t"),
+            ("a '", "a '"),
+            ("xx ' ?", "xx '?"),
+            ("x  '  ", "x ' "),
+            ("x  ' s", "x's"),
+            ("한 , 글", "한, 글"),
+            ("no change", "no change"),
+            ("", ""),
+        ];
+        let cleaned = from_header(&byte_header("llama-bpe")).unwrap();
+        let raw = from_header(&byte_header("qwen35")).unwrap();
+        assert!(cleaned.space_cleaner().is_some());
+        assert!(raw.space_cleaner().is_none());
+        for &(text, want) in cases {
+            let ids = cleaned.encode(text, false, false);
+            assert_eq!(&cleaned.decode(&ids), want, "{text:?}");
+            assert_eq!(
+                &raw.decode(&raw.encode(text, false, false)),
+                text,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Cleaning a stream piece by piece gives the whole text's clean. [`SpaceCleaner`] is swept
+    /// over every string of the passes' alphabet up to length 7 (`x`, space, `?`, `'`, `s`, and
+    /// with `r` `e` for `'re`) at every two-piece cut, then over deterministic pseudo-random
+    /// longer strings of the whole alphabet at random cuts, beside the hand-derived cases and
+    /// [`Decoder`] fed one byte token at a time, whose pieces cut characters apart and the
+    /// decoder holds their halves before the cleaner sees text.
+    ///
+    /// FAIL-first: a hold that can re-fire a pattern the whole clean already fired (holding a
+    /// fragment that starts inside a cleaned pattern) fails the rows that clean twice, first of
+    /// all `a  ?` cut at 0.
+    #[test]
+    fn space_cleaning_streams_as_a_whole() {
+        let cases: &[(&str, &str)] = &[
+            (" ?", "?"),
+            ("Hello , world", "Hello, world"),
+            ("a  ?", "a ?"),
+            ("a ' b", "a'b"),
+            ("it 's fine", "it's fine"),
+            ("they 're", "they're"),
+            ("we 'll go", "we 'll go"),
+            ("a ' b ' c", "a'b'c"),
+            ("xx ' ?", "xx '?"),
+            ("x  '  ", "x ' "),
+            ("x  ' s", "x's"),
+            ("한 , 글", "한, 글"),
+        ];
+        let streams = |text: &str, cuts: &[usize]| -> String {
+            let mut cleaner = SpaceCleaner::default();
+            let mut out = String::new();
+            let mut at = 0;
+            for &cut in cuts {
+                let end = text.len().min(cut);
+                if text.is_char_boundary(end) && end >= at {
+                    out.push_str(&cleaner.push(&text[at..end]));
+                    at = end;
+                }
+            }
+            out.push_str(&cleaner.push(&text[at..]));
+            out.push_str(&cleaner.finish());
+            out
+        };
+        for &(text, want) in cases {
+            for cut in 0..=text.len() {
+                if text.is_char_boundary(cut) {
+                    assert_eq!(streams(text, &[cut]), want, "{text:?} cut at {cut}");
+                }
+            }
+        }
+        // Every short string of the passes' alphabet, every cut: one set with the contraction
+        // letter the third pass drops (`'s`), one with the pair it drops (`'re`).
+        let mut words = Vec::new();
+        fn walk(prefix: &[u8], alphabet: &[u8], left: usize, out: &mut Vec<String>) {
+            if !prefix.is_empty() {
+                out.push(String::from_utf8(prefix.to_vec()).unwrap());
+            }
+            if left == 0 {
+                return;
+            }
+            for &b in alphabet {
+                let mut next = prefix.to_vec();
+                next.push(b);
+                walk(&next, alphabet, left - 1, out);
+            }
+        }
+        for alphabet in [b"x ?'s".to_vec(), b"x ?'re".to_vec()] {
+            walk(&[], &alphabet, 7, &mut words);
+        }
+        // A deterministic pseudo-random tail of longer strings.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = 8 + (next() % 32) as usize;
+            let text: String = (0..len)
+                .map(|_| b"x ?'sremvtdl,.!"[next() as usize % 14] as char)
+                .collect();
+            words.push(text);
+        }
+        let mut failures = Vec::new();
+        for text in &words {
+            let want = crate::decode::clean_str(text);
+            for cut in 0..=text.len() {
+                if !text.is_char_boundary(cut) {
+                    continue;
+                }
+                let got = streams(text, &[cut]);
+                if got != want {
+                    failures.push(format!("{text:?} cut at {cut}: {got:?} != {want:?}"));
+                }
+            }
+            let second = text.len() / 3;
+            let third = 2 * text.len() / 3;
+            if text.is_char_boundary(second) && text.is_char_boundary(third) {
+                let got = streams(text, &[second, third]);
+                if got != want {
+                    failures.push(format!("{text:?}: {got:?} != {want:?}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {}:\n{}",
+            failures.len(),
+            words.len(),
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tok = from_header(&byte_header("llama-bpe")).unwrap();
+        for &(text, want) in cases {
+            let ids = tok.encode(text, false, false);
+            let mut decoder = Decoder::new(&tok, true);
+            let mut out = String::new();
+            for &id in &ids {
+                if let Some(s) = decoder.push(id) {
+                    out.push_str(s);
+                }
+            }
+            if let Some(rest) = decoder.finish() {
+                out.push_str(&rest);
+            }
+            assert_eq!(out, want, "{text:?}");
+        }
+    }
+
+    /// llama.cpp's own tokenizer test data (`ggml-vocab-llama-bpe`): every text of the `.inp`
+    /// file, split on its `__ggml_vocab_test__` separator, tokenizes to exactly the ids of its
+    /// `.out` line, with no BOS added and no special token parsed (`add_special = false` in its
+    /// test-tokenizer-0). The gguf names no `add_bos_token` key, so this loader defaults it
+    /// false where llama.cpp's pre type forces true; the vectors add no special token either
+    /// way.
+    ///
+    /// FAIL-first: a `llama-bpe` name off the pre-tokenizer table, or the vocabulary the gguf
+    /// spells unrun, fails the load before the first row.
+    #[test]
+    #[ignore = "needs llama.cpp's ggml-vocab-llama-bpe.gguf (its .inp and .out beside it) at $BLOOMERY_LLAMA_BPE_GGUF"]
+    fn hw_llama_bpe_encodes_as_llama_tokenizer() {
+        let path = std::path::PathBuf::from(std::env::var_os("BLOOMERY_LLAMA_BPE_GGUF").unwrap());
+        let tok = Tokenizer::from_gguf(&path).unwrap();
+        assert_eq!(tok.pre(), "llama-bpe");
+        let inp = std::fs::read(format!("{}.inp", path.display())).unwrap();
+        let out = std::fs::read_to_string(format!("{}.out", path.display())).unwrap();
+        const SEP: &[u8] = b"\n__ggml_vocab_test__\n";
+        let mut texts: Vec<&[u8]> = Vec::new();
+        let mut at = 0;
+        while let Some(found) = inp[at..]
+            .windows(SEP.len())
+            .position(|w| w == SEP)
+            .map(|p| at + p)
+        {
+            texts.push(&inp[at..found]);
+            at = found + SEP.len();
+        }
+        if at < inp.len() {
+            texts.push(&inp[at..]);
+        }
+        let outs: Vec<&str> = out.lines().collect();
+        assert_eq!(texts.len(), outs.len(), "a test a line");
+        let mut failures = Vec::new();
+        for (text, ids) in texts.iter().zip(&outs) {
+            let want: Vec<u32> = ids
+                .split_whitespace()
+                .map(|t| t.parse::<u32>().unwrap())
+                .collect();
+            let got = tok.encode(text, false, false);
+            if got != want {
+                failures.push(format!("{text:?}: {got:?} != {want:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {}:\n{}",
+            failures.len(),
+            texts.len(),
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }
