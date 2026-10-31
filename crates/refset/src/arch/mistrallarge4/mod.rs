@@ -20,7 +20,9 @@
 //! `ffn_moe_probs`, `ffn_moe_topk` (the experts chosen), `ffn_moe_weights` (their probabilities)
 //! and `ffn_moe_weights_norm` (the weights the experts are summed with), `ffn_moe_out`,
 //! `ffn_shexp` (the shared expert), `ffn_out` and `l_out`; and the head's `result_norm` and the
-//! softcapped logits at `result_output`.
+//! softcapped logits at `result_output`. The fixture tier's mirror is in [`fixture`].
+
+pub mod fixture;
 
 /// The tables beside the node dumps are every mainline-API family's
 /// ([`super::prompt_tables`]); the path stays the family's for its gate.
@@ -42,10 +44,11 @@ pub const ARCH: &str = "mistral-large4";
 pub const COMMIT: &str = "78feec062";
 
 /// The first shard of the UD-IQ1_S split set every mistrallarge4 set is dumped from and the
-/// tree runs: the identity each set's `# model` line states. The set lives on the root drive,
-/// not under `/models`. A set of the file moved elsewhere is stale by this line, not by its
-/// name.
-pub const MODEL: &str = "/home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf";
+/// tree runs: the identity each set's `# model` line states. The files live on the root drive and
+/// `/models/Mistral-Large-4-1T-A52B-UD-IQ1_S` is a symlink to their directory; this spelling is
+/// the identity. A set of the file named by another path is stale by this line, not by its name.
+pub const MODEL: &str =
+    "/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf";
 
 /// The build every mistrallarge4 set names: llama.cpp [`COMMIT`] and the first 12 hex digits of
 /// the md5 of the `libllama.so` built from it (`/home/user/llama.cpp-ml4`, the tree the
@@ -83,7 +86,6 @@ pub static LCPP: Family = Family {
     consumers: &[],
 };
 
-/// The architecture's families, in the order `refset-check` lists them. The fixture tier's
-/// family joins when the fixture file exists and its sets are dumped: a family in the table is
-/// checked in place by `gate-refset`, and one whose sets are absent is red there.
-pub static FAMILIES: &[&Family] = &[&LCPP];
+/// The architecture's families, in the order `refset-check` lists them: the real file's, then the
+/// fixture's ([`fixture::LCPP`], dumped by `BLOOMERY_TIER=fixture just dump-ref-mistrallarge4`).
+pub static FAMILIES: &[&Family] = &[&LCPP, &fixture::LCPP];
