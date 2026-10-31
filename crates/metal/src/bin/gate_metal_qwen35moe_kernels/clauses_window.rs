@@ -791,9 +791,9 @@ pub fn attn_window(h: &Harness<'_>) -> Clause {
         Case::decode(300, Some(64)),
         Case::decode(1025, Some(1)),
     ];
-    // The split's count of 1025 unwindowed keys: the segments past the
-    // window's keys are empty.
-    cases.push(Case::decode(1025, Some(256)).split(33));
+    // The split's count of 1025 unwindowed keys over a window of 100: the
+    // segments past the window's seven tiles are empty.
+    cases.push(Case::decode(1025, Some(100)).split(segments_for_window(1025, None) as usize));
     let mut q8 = Case::decode(1025, Some(256));
     q8.q8 = true;
     q8.label.push_str(" q8_0");

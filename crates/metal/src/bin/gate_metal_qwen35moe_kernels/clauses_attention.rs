@@ -28,19 +28,21 @@ pub(super) const CTX: usize = 80;
 /// The widest key-count scene's cache rows: the 4096-key scene plus rows
 /// past the live keys that stay unread.
 const DEEP_CTX: usize = 4112;
-/// The key counts the attention scenes run at by the rule, every one under the
-/// one-pass waterline (`ONE_PASS_KEYS`): one key, one round of the SIMD
-/// groups' chunks, then two, eight, sixteen, 64 and a part round.
-const SCENE_KEYS: [u32; 7] = [1, 64, 100, 512, 1024, 4096, 4112];
+/// The key counts the attention scenes run at by the rule. On the f16 cache's
+/// one-pass flash, up to its waterline (`ONE_PASS_KEYS`): one key, one round
+/// of the SIMD groups' chunks, then two and eight. Past it, the split at the
+/// cap: one key past the waterline, whose segments of three tiles leave the
+/// last five holding no key, then four and sixteen tiles a segment, and the
+/// deepest scene, whose last segment holds two of its seventeen tiles.
+const SCENE_KEYS: [u32; 8] = [1, 64, 100, 512, 513, 1024, 4096, 4112];
 const _: () = assert!(
-    SCENE_KEYS[6] as usize <= ONE_PASS_KEYS,
-    "the rule's scenes are the one-pass flash's"
+    SCENE_KEYS[3] as usize == ONE_PASS_KEYS && SCENE_KEYS[4] as usize == ONE_PASS_KEYS + 1,
+    "the rule's scenes hold the one-pass waterline from both sides"
 );
-/// The split flash, off the rule, at the segment counts its rule gives the
-/// same keys: a tile a segment, two tiles a segment, the ticket's fold at the
-/// cap, and the deepest scene, whose 64 segments of five tiles leave the last
-/// twelve holding no key.
-const SPLIT_SCENES: [(u32, usize); 5] = [(100, 7), (512, 16), (1024, 32), (4096, 64), (4112, 64)];
+/// The split flash, off the rule: a tile in each of the first four segments
+/// with the last twelve holding no key, a tile a segment with a part tile
+/// last, two tiles a segment at the cap, and three segments of uneven tiles.
+const SPLIT_SCENES: [(u32, usize); 4] = [(64, 16), (100, 7), (512, 16), (1024, 3)];
 /// An f16 cache word no packed value of the planted rows uses as its check.
 const F16_HOLE: u16 = 0x0BAD;
 /// A q8_0 code word planted where no row was written.

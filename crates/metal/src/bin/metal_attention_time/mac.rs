@@ -33,14 +33,15 @@
 //! takes twice that), `--keys a,b,c` (default 100,512,1024,4096), `--segs
 //! a,b,c` (segment counts timed at every key count, in place of the rule's),
 //! `--phase-arms lone|packed` (the phase arms' unit, default `lone`),
-//! `--no-phases` (skip the phase arms and the self-check), `--help`.
+//! `--no-phases` (skip the phase arms and the self-check), `--no-mlx` (skip
+//! MLX's kernels, `mlx.rs`), `--help`.
 
 use std::process::ExitCode;
 
 use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, Stream};
 use bloomery_metal::MetalStream;
-use bloomery_metal::attention_geom::FLASH_THREADS;
+use bloomery_metal::attention_geom::{FLASH_THREADS, ONE_PASS_THREADS};
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
@@ -53,11 +54,13 @@ use bloomery_metal::library::{Library, Pipeline, SOURCE};
 
 #[path = "../shared/gpu_time.rs"]
 mod gpu_time;
+#[path = "mlx.rs"]
+mod mlx;
 
 use gpu_time::{Timed, WARMUPS, time_arm};
 
 /// The cache rows the probe holds: the largest key count it times.
-const CTX: u32 = 4096;
+const CTX: u32 = 16384;
 
 /// The bytes one timed command buffer's dispatches read, so every buffer
 /// moves about the same total.
@@ -67,9 +70,11 @@ const PACKED_BYTES: usize = 64 << 20;
 /// raises nothing; the gate's own is 3.
 const LAYER: u32 = 3;
 
-/// The key count the self-check launches at: past one segment, so the flash
-/// writes partials and a fold follows, with every segment holding live keys.
+/// The key count the self-check launches at, and its segments: past one
+/// segment, so the flash writes partials and a fold follows, with every
+/// segment holding live keys.
 const CHECK_KEYS: u32 = 1024;
+const CHECK_SEGMENTS: usize = 16;
 
 /// The phase word's bits. The probe source reads them as the `PROBE_PHASE_*`
 /// macros [`phase_macros`] writes in front of it and the arm table builds its
@@ -86,13 +91,17 @@ const PH_NO_LOOP: u32 = 64;
 /// Set: the ticket handshake runs and the fold's body is skipped (the last
 /// threadgroup only resets the ticket).
 const PH_TICKET_ONLY: u32 = 128;
+/// Set: the segment's keys stream from the cache straight into each SIMD
+/// group's registers (the one-pass flash's walk over the segment) in place of
+/// the threadgroup tiles. Not a phase of the shipped flash: a candidate loop.
+const PH_DIRECT: u32 = 256;
 /// The shipped flash: the phases on, nothing skipped.
 const PH_FULL: u32 = PH_APPEND | PH_PREPARE;
 
 /// The phase arms, each a name and a phase word. The two bits that empty the
 /// partials (the tile loop, the epilogue) change what the fold reads, so the
 /// pairs that toggle them keep the fold off in both arms.
-const ARMS: [(&str, u32); 9] = [
+const ARMS: [(&str, u32); 11] = [
     ("full", PH_FULL),
     ("no_append", PH_FULL & !PH_APPEND),
     ("no_prepare", PH_FULL & !PH_PREPARE),
@@ -102,6 +111,8 @@ const ARMS: [(&str, u32); 9] = [
     ("no_epilogue", PH_FULL | PH_NO_EPILOGUE),
     ("no_fold_no_epilogue", PH_FULL | PH_NO_FOLD | PH_NO_EPILOGUE),
     ("ticket_only", PH_FULL | PH_TICKET_ONLY),
+    ("direct", PH_FULL | PH_DIRECT),
+    ("direct_no_fold", PH_FULL | PH_DIRECT | PH_NO_FOLD),
 ];
 
 /// The arms the split row reads, in the order [`phase_arms`] binds them.
@@ -124,7 +135,18 @@ const SKIP_BITS: u32 = PH_NO_FOLD | PH_NO_EPILOGUE | PH_NO_LOOP | PH_TICKET_ONLY
 /// adds [`PH_TICKET_ONLY`]. `no_<phase>`, joined by `_no_`, turns each named
 /// phase off from [`PH_FULL`]: the append and the prepare by clearing their
 /// bit, the loop, the fold and the epilogue by setting their skip bit.
+/// `direct`, alone or before `_no_<phase>`, adds [`PH_DIRECT`] to the word the
+/// rest names.
 fn word_named(name: &str) -> Result<u32, String> {
+    if let Some(rest) = name.strip_prefix("direct") {
+        let base = match rest {
+            "" => "full",
+            _ => rest
+                .strip_prefix('_')
+                .ok_or_else(|| format!("arm {name}: `direct` is followed by `_no_<phase>`"))?,
+        };
+        return word_named(base).map(|word| word | PH_DIRECT);
+    }
     match name {
         "full" => return Ok(PH_FULL),
         "ticket_only" => return Ok(PH_FULL | PH_TICKET_ONLY),
@@ -164,6 +186,7 @@ fn check_arms(arms: &[(&str, u32)]) -> Result<(), String> {
         PH_NO_EPILOGUE,
         PH_NO_LOOP,
         PH_TICKET_ONLY,
+        PH_DIRECT,
     ] {
         if !bit.is_power_of_two() || (seen & bit) != 0 {
             failures.push(format!("phase bit {bit} is not a bit of its own"));
@@ -215,16 +238,17 @@ fn phase_macros() -> String {
         ("NO_EPILOGUE", PH_NO_EPILOGUE),
         ("NO_LOOP", PH_NO_LOOP),
         ("TICKET_ONLY", PH_TICKET_ONLY),
+        ("DIRECT", PH_DIRECT),
     ]
     .iter()
     .map(|(name, bit)| format!("#define PROBE_PHASE_{name} {bit}u\n"))
     .collect()
 }
 
-/// The shipped source with the probe kernel after it, the way the kernel gate
-/// compiles its mutants.
+/// The shipped source with the probe kernel and MLX's kernels after it, the
+/// way the kernel gate compiles its mutants.
 fn probe_source() -> String {
-    format!("{SOURCE}\n{}{PROBE}", phase_macros())
+    format!("{SOURCE}\n{}{PROBE}\n{}", phase_macros(), mlx::SOURCE)
 }
 
 /// The probe kernel: the shipped flash's phases, gated at run time by one
@@ -242,6 +266,86 @@ struct AttnProbeArgs {
 };
 
 static_assert(sizeof(AttnProbeArgs) == 4, "AttnProbeArgs is 4 bytes: the probe packs one word");
+
+// The candidate walk: the segmented flash's grid, each SIMD group (a query
+// head) streaming the segment's keys from the cache into registers four at a
+// time with the one-pass flash's arithmetic, no threadgroup tiles and no
+// barrier. The f16 cache only.
+#define PROBE_CHUNK 4u
+static void probe_direct_walk(device ushort *cache_k,
+                              device ushort *cache_v,
+                              thread const AttnArgs &args,
+                              bool ok,
+                              uint kv,
+                              uint seg,
+                              uint span,
+                              uint max_live,
+                              uint lane,
+                              thread float qv[BLOOMERY_ATTN_LANE_DIMS],
+                              thread float *running_m,
+                              thread float *running_l,
+                              thread float acc[BLOOMERY_ATTN_LANE_DIMS]) {
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+        acc[d] = 0.0f;
+    }
+    if (ok) {
+        uint lo0 = seg * span;
+        uint seg_hi = min((seg + 1u) * span, max_live);
+        const device attn_lane_word *ck =
+            (const device attn_lane_word *)cache_k + kv * args.ctx * BLOOMERY_ATTN_LANES + lane;
+        const device attn_lane_word *cv =
+            (const device attn_lane_word *)cache_v + kv * args.ctx * BLOOMERY_ATTN_LANES + lane;
+        for (uint base = lo0; base < seg_hi; base += PROBE_CHUNK) {
+            attn_lane_word wk[PROBE_CHUNK];
+            attn_lane_word wv[PROBE_CHUNK];
+            for (uint c = 0u; c < PROBE_CHUNK; ++c) {
+                uint j = base + c;
+                attn_lane_word a = 0u;
+                attn_lane_word b = 0u;
+                if (j < seg_hi) {
+                    a = ck[j * BLOOMERY_ATTN_LANES];
+                    b = cv[j * BLOOMERY_ATTN_LANES];
+                }
+                wk[c] = a;
+                wv[c] = b;
+            }
+            float s[PROBE_CHUNK];
+            float chunk_max = -INFINITY;
+            for (uint c = 0u; c < PROBE_CHUNK; ++c) {
+                float kk[BLOOMERY_ATTN_LANE_DIMS];
+                attn_widen(wk[c], kk);
+                float dot = 0.0f;
+                for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+                    dot = fma(qv[d], kk[d], dot);
+                }
+                dot = simd_sum(dot);
+                float score = dot * args.scale;
+                s[c] = base + c < seg_hi ? score : -INFINITY;
+                chunk_max = max(chunk_max, s[c]);
+            }
+            float new_m = max(m, chunk_max);
+            float factor = m > -INFINITY ? exp(m - new_m) : 0.0f;
+            l *= factor;
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+                acc[d] *= factor;
+            }
+            m = new_m;
+            for (uint c = 0u; c < PROBE_CHUNK; ++c) {
+                float vv[BLOOMERY_ATTN_LANE_DIMS];
+                attn_widen(wv[c], vv);
+                float weight = base + c < seg_hi ? exp(s[c] - new_m) : 0.0f;
+                l += weight;
+                for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+                    acc[d] = fma(weight, vv[d], acc[d]);
+                }
+            }
+        }
+    }
+    *running_m = m;
+    *running_l = l;
+}
 
 // The shipped flash with its phases gated by the probe's word.
 template <typename Cache>
@@ -290,11 +394,11 @@ static void probe_flash(Cache cache,
         float running_m;
         float running_l;
         float acc[BLOOMERY_ATTN_LANE_DIMS];
-        // The tiles load over the scratch the prepare paired through, so
-        // every thread's scratch reads end here.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((phase & PROBE_PHASE_NO_LOOP) == 0u) {
-            attn_tile_loop(cache, args, ok, kv, seg, span, max_live, tid, lane, qv, &running_m,
+        if ((phase & PROBE_PHASE_NO_LOOP) == 0u && (phase & PROBE_PHASE_DIRECT) != 0u) {
+            probe_direct_walk(cache.k, cache.v, args, ok, kv, seg, span, max_live, lane, qv,
+                              &running_m, &running_l, acc);
+        } else if ((phase & PROBE_PHASE_NO_LOOP) == 0u) {
+            attn_tile_loop(cache, args, ok, kv, seg, span, max_live, lane, qv, &running_m,
                            &running_l, acc);
         } else {
             running_m = -INFINITY;
@@ -317,8 +421,7 @@ static void probe_flash(Cache cache,
                     ticket_reset(ticket);
                 }
             } else {
-                attn_fold(partials, ticket, args, q, out, faults, tid,
-                          (threadgroup float *)scratch);
+                attn_fold(partials, ticket, args, q, out, faults, tid);
             }
         }
     }
@@ -347,8 +450,6 @@ kernel void probe_flash_f16(device float const *q [[buffer(0)]],
     F16Cache cache;
     cache.k = cache_k;
     cache.v = cache_v;
-    cache.tile_k = (threadgroup attn_lane_word *)shared;
-    cache.tile_v = cache.tile_k + BLOOMERY_ATTN_TILE * BLOOMERY_ATTN_LANES;
     probe_flash(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults, ticket, tpg.x,
                 probe.phase, group.x, tid, (threadgroup float *)shared, last_flag);
 }
@@ -555,7 +656,9 @@ us_min, us_p90, kv_bytes, gbps.
   --phase-arms U  the phase arms' unit: `lone` (default), one dispatch to a command buffer like
                 the shipped `lone` arm, or `packed`, many dispatches to a buffer like the shipped
                 `packed` arm
-  --no-phases   skip the phase arms and the self-check they need"
+  --no-phases   skip the phase arms and the self-check they need
+  --no-mlx      skip MLX's kernels (sdpa_vector and its two passes) on the same cache
+  --variants    time the segmented flash of each source variant (VARIANTS) at every split scene"
     );
 }
 
@@ -585,6 +688,8 @@ struct Run {
     segs: Vec<usize>,
     phases: bool,
     phase_unit: PhaseUnit,
+    mlx: bool,
+    variants: bool,
 }
 
 fn parse(args: &[String]) -> Result<Run, String> {
@@ -592,6 +697,8 @@ fn parse(args: &[String]) -> Result<Run, String> {
     let mut keys = vec![100u32, 512, 1024, 4096];
     let mut segs: Vec<usize> = Vec::new();
     let mut phases = true;
+    let mut mlx = true;
+    let mut variants = false;
     let mut phase_unit = PhaseUnit::Lone;
     let mut i = 0;
     while i < args.len() {
@@ -599,6 +706,8 @@ fn parse(args: &[String]) -> Result<Run, String> {
         let next = || args.get(i + 1);
         match arg {
             "--no-phases" => phases = false,
+            "--no-mlx" => mlx = false,
+            "--variants" => variants = true,
             "--phase-arms" => {
                 let value = next().ok_or("--phase-arms takes lone or packed")?;
                 phase_unit = match value.as_str() {
@@ -668,6 +777,8 @@ fn parse(args: &[String]) -> Result<Run, String> {
         segs,
         phases,
         phase_unit,
+        mlx,
+        variants,
     })
 }
 
@@ -791,11 +902,18 @@ fn timed(
     device.fault_word().clear(stream).map_err(why)?;
 
     let mut failed = false;
+    let library = if run.phases || run.mlx {
+        let library = Library::from_source_text(device, &probe_source()).map_err(why)?;
+        pipeline_rows(&library);
+        Some(library)
+    } else {
+        None
+    };
     // The phase arms need the probe's pipeline, which exists only once its
     // self-check holds: a probe that is not the shipped flash prints no phase
     // row.
-    let probe = if run.phases {
-        match probe_pipeline(device, stream, kernels, &mut bufs) {
+    let probe = if let (true, Some(library)) = (run.phases, &library) {
+        match probe_pipeline(device, stream, kernels, &mut bufs, library) {
             Ok(pipeline) => Some(pipeline),
             Err(e) => {
                 println!("attn\tkernel=probe_flash_f16\tarm=self_check\tFAIL\t{e}");
@@ -806,6 +924,25 @@ fn timed(
     } else {
         None
     };
+    // MLX's kernels time only once their two paths agree on the self-check
+    // scene's output.
+    let mut mlx = match (run.mlx, &library) {
+        (true, Some(library)) => match mlx_setup(device, stream, &mut bufs, library) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                println!("attn\tkernel=mlx\tarm=self_check\tFAIL\t{e}");
+                failed = true;
+                None
+            }
+        },
+        _ => None,
+    };
+    let variants = if run.variants {
+        variant_pipelines(device)?
+    } else {
+        Vec::new()
+    };
+    let mut mlx_timed: Vec<u32> = Vec::new();
     let scenes: Vec<(u32, usize)> = run
         .keys
         .iter()
@@ -819,7 +956,14 @@ fn timed(
         .collect();
     for (keys, segments) in scenes {
         let pos = keys - 1;
-        let tgs = KV_HEADS * segments;
+        // One segment of the f16 cache is the one-pass flash, a threadgroup a
+        // query head; more are the segmented flash, a threadgroup a (key
+        // head, segment).
+        let (shipped, tgs, threads) = if segments == 1 {
+            ("attn_flash_one_f16", QUERY_HEADS, ONE_PASS_THREADS)
+        } else {
+            ("gqa256_flash_f16", KV_HEADS * segments, FLASH_THREADS)
+        };
         let args = args_words(segments as u32, pos, keys);
         let packed = packed_dispatches(keys);
         let (dispatches, trials) = match run.phase_unit {
@@ -827,7 +971,7 @@ fn timed(
             PhaseUnit::Packed => (packed, run.trials),
         };
         println!(
-            "scene\tkeys={keys}\tpos={pos}\tsegments={segments}\tthreadgroups={tgs}\tthreads={FLASH_THREADS}\tpacked_n={packed}\tphase_n={dispatches}"
+            "scene\tkeys={keys}\tpos={pos}\tsegments={segments}\tkernel={shipped}\tthreadgroups={tgs}\tthreads={threads}\tpacked_n={packed}\tphase_n={dispatches}"
         );
         // The production flash: many dispatches in one buffer, then one per
         // buffer. The phase arms divide by the one of their own unit.
@@ -840,20 +984,42 @@ fn timed(
                 kernels.attention_flash(encoder, p)
             }) {
                 Ok(t) => {
-                    print_row("gqa256_flash_f16", keys, name, arm_dispatches, &t);
+                    print_row(shipped, keys, name, arm_dispatches, &t);
                     if arm_dispatches == dispatches {
                         shipped_us = Some(t.us_median);
                     }
                 }
                 Err(e) => {
-                    println!("attn\tkernel=gqa256_flash_f16\tkeys={keys}\tarm={name}\tFAIL\t{e}");
+                    println!("attn\tkernel={shipped}\tkeys={keys}\tarm={name}\tFAIL\t{e}");
                     failed = true;
                 }
+            }
+        }
+        if let Some(m) = &mut mlx
+            && !mlx_timed.contains(&keys)
+        {
+            mlx_timed.push(keys);
+            failed |= mlx_arms(device, stream, &mut bufs, m, keys, packed, run.trials);
+        }
+        if segments > 1 {
+            for (name, pipeline) in &variants {
+                failed |= variant_arm(
+                    device, stream, &mut bufs, kernels, name, pipeline, keys, segments, &args,
+                    packed, run.trials,
+                );
             }
         }
         let Some(pipeline) = &probe else {
             continue;
         };
+        // The probe is the segmented flash: at one segment it would time a
+        // program the shipped launch does not run.
+        if segments == 1 {
+            println!(
+                "split\tkeys={keys}\tskipped=one segment is the one-pass flash, which the probe is not"
+            );
+            continue;
+        }
         let point = Point {
             keys,
             segments,
@@ -941,10 +1107,10 @@ fn probe_pipeline(
     stream: &MetalStream,
     kernels: &Kernels,
     bufs: &mut Bufs,
+    library: &Library,
 ) -> Result<Pipeline, String> {
     check_arms(&ARMS)?;
     println!("selfcheck\tclause=arm_table\tarms={}", ARMS.len());
-    let library = Library::from_source_text(device, &probe_source()).map_err(why)?;
     let pipeline = library.pipeline("probe_flash_f16").map_err(why)?;
     self_check(device, stream, kernels, bufs, &pipeline)?;
     Ok(pipeline)
@@ -970,12 +1136,7 @@ fn self_check(
 ) -> Result<(), String> {
     let keys = CHECK_KEYS;
     let pos = keys - 1;
-    let segments = segments_for_keys(keys) as usize;
-    if segments < 2 {
-        return Err(format!(
-            "the self-check scene of {keys} keys has {segments} segment; it needs a fold"
-        ));
-    }
+    let segments = CHECK_SEGMENTS;
     let args = args_words(segments as u32, pos, keys);
     let out_n = out_len().expect("the out length wraps");
     let parts_all = partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("the partials fit");
@@ -1023,6 +1184,33 @@ fn self_check(
     if differing != 0 {
         failures.push(format!(
             "full_equals_shipped: {differing} of {out_n} output values differ from the shipped flash's"
+        ));
+    }
+
+    // The candidate walk is not the shipped program: it is held to the
+    // shipped output within the rounding of its other rescale points.
+    clear_scratch(device, stream, bufs)?;
+    dispatch_once(stream, |encoder| {
+        encode_phase(
+            encoder,
+            pipeline,
+            bufs,
+            device.fault_word(),
+            &args,
+            PH_FULL | PH_DIRECT,
+            segments,
+        )
+    })?;
+    let direct = read_f32(device, stream, &bufs.out, out_n)?;
+    let big = shipped.iter().fold(0f32, |a, x| a.max(x.abs()));
+    let diff = shipped
+        .iter()
+        .zip(&direct)
+        .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+    println!("selfcheck\tclause=direct_close\tkeys={keys}\tmax_abs={big:e}\tmax_diff={diff:e}");
+    if diff > 1e-4 * big || direct.iter().any(|x| !x.is_finite()) {
+        failures.push(format!(
+            "direct_close: the direct walk's output is {diff:e} from the shipped flash's (max {big:e})"
         ));
     }
 
@@ -1156,6 +1344,347 @@ fn phase_arms(
             ticket_only - no_fold,
             full - ticket_only,
         );
+    }
+    if let (Some(full), Some(no_fold), Some(direct), Some(direct_no_fold)) = (
+        at("full"),
+        at("no_fold"),
+        at("direct"),
+        at("direct_no_fold"),
+    ) {
+        // The tile loop against the candidate walk on the same grid and fold.
+        println!(
+            "walk\tkeys={keys}\tsegments={segments}\ttiles_us={full:.3}\tdirect_us={direct:.3}\ttiles_no_fold_us={no_fold:.3}\tdirect_no_fold_us={direct_no_fold:.3}"
+        );
+    }
+    failed
+}
+
+/// Source edits timed against the shipped segmented flash: each is the shipped
+/// source with every occurrence of its finds replaced, compiled as a library of
+/// its own, its `gqa256_flash_f16` launched with the shipped bindings. A
+/// development-loop instrument: a variant is a question about one term.
+const VARIANTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "ahead2",
+        &[("#define ATTN_WALK_AHEAD 4u", "#define ATTN_WALK_AHEAD 2u")],
+    ),
+    (
+        "ahead8",
+        &[("#define ATTN_WALK_AHEAD 4u", "#define ATTN_WALK_AHEAD 8u")],
+    ),
+    (
+        "fastexp",
+        &[
+            (
+                "? exp(old_m - new_m) : 0.0f;",
+                "? fast::exp(old_m - new_m) : 0.0f;",
+            ),
+            (
+                "? exp(mine - new_m) : 0.0f;",
+                "? fast::exp(mine - new_m) : 0.0f;",
+            ),
+        ],
+    ),
+    (
+        "unguarded",
+        &[
+            (
+                "words[c] = FULL || key < hi ? cache.key_word(row0 + key, lane) : Cache::zero();",
+                "words[c] = cache.key_word(row0 + key, lane);",
+            ),
+            (
+                "words[c] = FULL || key < hi ? cache.value_word(row0 + key, lane) : Cache::zero();",
+                "words[c] = cache.value_word(row0 + key, lane);",
+            ),
+        ],
+    ),
+    (
+        "noprep",
+        &[(
+            "attn_prepare_q(args, q, q_gain, rope, ok, kv, sg, lane, scratch, qv);",
+            "for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) { qv[d] = q[(kv * BLOOMERY_ATTN_GQA + sg) * BLOOMERY_ATTN_QG + lane * BLOOMERY_ATTN_LANE_DIMS + d]; }",
+        )],
+    ),
+    (
+        "nofold",
+        &[(
+            "if (args.segments > 1u) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
+            "if (false) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
+        )],
+    ),
+];
+
+/// Each variant's `gqa256_flash_f16` pipeline, with its resource row.
+fn variant_pipelines(device: &MetalDevice) -> Result<Vec<(&'static str, Pipeline)>, String> {
+    let mut out = Vec::new();
+    for &(name, edits) in VARIANTS {
+        let mut text = probe_source();
+        for &(find, replace) in edits {
+            if !text.contains(find) {
+                return Err(format!("variant {name}: the source has no {find:?}"));
+            }
+            text = text.replace(find, replace);
+        }
+        let library = Library::from_source_text(device, &text).map_err(why)?;
+        let pipeline = library.pipeline("gqa256_flash_f16").map_err(why)?;
+        println!(
+            "pipe\tname=var_{name}\tmax_threads={}\texec_width={}\tstatic_tg_bytes={}",
+            pipeline.max_threads_per_group(),
+            pipeline.execution_width(),
+            pipeline.static_group_bytes()
+        );
+        out.push((name, pipeline));
+    }
+    Ok(out)
+}
+
+/// One variant at one split scene: its output against the shipped flash's
+/// (the largest difference), then its packed time.
+#[allow(clippy::too_many_arguments)]
+fn variant_arm(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    bufs: &mut Bufs,
+    kernels: &Kernels,
+    name: &str,
+    pipeline: &Pipeline,
+    keys: u32,
+    segments: usize,
+    args: &[[u8; 4]; 7],
+    packed: usize,
+    trials: usize,
+) -> bool {
+    let pos = keys - 1;
+    let out_n = out_len().expect("the out length wraps");
+    let fault = device.fault_word();
+    let compared = (|| -> Result<f32, String> {
+        clear_scratch(device, stream, bufs)?;
+        dispatch_once(stream, |encoder| {
+            let p = params(bufs, segments, pos, keys, fault)?;
+            kernels.attention_flash(encoder, p)
+        })?;
+        let shipped = read_f32(device, stream, &bufs.out, out_n)?;
+        clear_scratch(device, stream, bufs)?;
+        dispatch_once(stream, |encoder| {
+            encode_phase(encoder, pipeline, bufs, fault, args, 0, segments)
+        })?;
+        let got = read_f32(device, stream, &bufs.out, out_n)?;
+        Ok(shipped
+            .iter()
+            .zip(&got)
+            .fold(0f32, |a, (x, y)| a.max((x - y).abs())))
+    })();
+    let timed = time_arm(device, stream, packed, trials, |encoder, _| {
+        encode_phase(encoder, pipeline, bufs, fault, args, 0, segments)
+    });
+    match (compared, timed) {
+        (Ok(diff), Ok(t)) => {
+            println!(
+                "variant\tname={name}\tkeys={keys}\tsegments={segments}\tmax_diff_vs_shipped={diff:e}"
+            );
+            print_row(&format!("var_{name}"), keys, "packed", packed, &t);
+            false
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            println!("attn\tkernel=var_{name}\tkeys={keys}\tarm=packed\tFAIL\t{e}");
+            true
+        }
+    }
+}
+
+/// Every flash pipeline's resource figures, as Metal reports them: the most
+/// threads a group may hold (below 1024 when registers bind), the SIMD width
+/// and the static threadgroup memory.
+fn pipeline_rows(library: &Library) {
+    for name in [
+        "attn_flash_one_f16",
+        "gqa256_flash_f16",
+        "probe_flash_f16",
+        "mlx_vec_f16",
+        "mlx_2p1_f16",
+        "mlx_2p2_f16",
+    ]
+    .into_iter()
+    .chain(mlx::ARMS)
+    {
+        match library.pipeline(name) {
+            Ok(p) => println!(
+                "pipe\tname={name}\tmax_threads={}\texec_width={}\tstatic_tg_bytes={}",
+                p.max_threads_per_group(),
+                p.execution_width(),
+                p.static_group_bytes()
+            ),
+            Err(e) => println!("pipe\tname={name}\tFAIL\t{}", why(e)),
+        }
+    }
+}
+
+/// MLX's pipelines and partials, once its two paths agree.
+struct Mlx {
+    pipes: mlx::MlxPipes,
+    bufs: mlx::MlxBufs,
+}
+
+/// The MLX launch over the planted query and cache at `keys`.
+fn mlx_launch(bufs: &mut Bufs, keys: u32) -> mlx::MlxLaunch<'_> {
+    mlx::MlxLaunch {
+        q: &bufs.q,
+        qg: qg_len().expect("the query length wraps"),
+        cache_k: &mut bufs.cache_k,
+        cache_v: &mut bufs.cache_v,
+        cache_n: f16_len(CTX as usize).expect("the cache length wraps"),
+        keys,
+        ctx: CTX,
+        scale: SCALE,
+        head: 256,
+    }
+}
+
+/// Builds MLX's pipelines and holds the port to one clause: at the
+/// self-check's key count its single-pass kernel and its two passes write
+/// the same output within the half partials' rounding, finite and not all
+/// zero. A port that reads the wrong rows fails it.
+fn mlx_setup(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    bufs: &mut Bufs,
+    library: &Library,
+) -> Result<Mlx, String> {
+    let pipes = mlx::MlxPipes {
+        vec: library.pipeline("mlx_vec_f16").map_err(why)?,
+        pass1: library.pipeline("mlx_2p1_f16").map_err(why)?,
+        pass2: library.pipeline("mlx_2p2_f16").map_err(why)?,
+        arms: mlx::ARMS
+            .iter()
+            .map(|&name| Ok((name, library.pipeline(name).map_err(why)?)))
+            .collect::<Result<_, String>>()?,
+    };
+    let mut m = mlx::MlxBufs::new(device, stream, 256)?;
+    let keys = CHECK_KEYS;
+    let blocks = mlx::blocks_g13s(keys, QUERY_HEADS / KV_HEADS);
+    let out_n = QUERY_HEADS * 256;
+    dispatch_once(stream, |encoder| {
+        mlx::encode_vec(encoder, &pipes, &mut mlx_launch(bufs, keys), &mut m)
+    })?;
+    let single = read_f32(device, stream, &m.out, out_n)?;
+    m.out = device.zeroed::<f32>(stream, Elems(out_n)).map_err(why)?;
+    dispatch_once(stream, |encoder| {
+        let mut l = mlx_launch(bufs, keys);
+        mlx::encode_pass1(encoder, &pipes.pass1, &mut l, &mut m, blocks)?;
+        encoder.memory_barrier();
+        mlx::encode_pass2(encoder, &pipes, &l, &mut m, blocks)
+    })?;
+    let two = read_f32(device, stream, &m.out, out_n)?;
+    let finite = single.iter().chain(&two).all(|x| x.is_finite());
+    let big = single.iter().fold(0f32, |a, x| a.max(x.abs()));
+    let diff = single
+        .iter()
+        .zip(&two)
+        .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+    println!(
+        "selfcheck\tclause=mlx_paths_agree\tkeys={keys}\tblocks={blocks}\tvalues={out_n}\tfinite={finite}\tmax_abs={big:e}\tmax_diff={diff:e}"
+    );
+    if !finite || big == 0.0 || diff > 5e-3 * big {
+        return Err(format!(
+            "mlx_paths_agree: finite {finite}, max |out| {big:e}, max diff {diff:e} (bound 5e-3 of max)"
+        ));
+    }
+    // Every arm's pass 1, folded by pass 2, writes the single pass's output.
+    for (name, arm) in &pipes.arms {
+        m.out = device.zeroed::<f32>(stream, Elems(out_n)).map_err(why)?;
+        dispatch_once(stream, |encoder| {
+            let mut l = mlx_launch(bufs, keys);
+            mlx::encode_pass1(encoder, arm, &mut l, &mut m, blocks)?;
+            encoder.memory_barrier();
+            mlx::encode_pass2(encoder, &pipes, &l, &mut m, blocks)
+        })?;
+        let got = read_f32(device, stream, &m.out, out_n)?;
+        let finite = got.iter().all(|x| x.is_finite());
+        let diff = single
+            .iter()
+            .zip(&got)
+            .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+        println!(
+            "selfcheck\tclause=mlx_arm_agrees\tarm={name}\tkeys={keys}\tfinite={finite}\tmax_diff={diff:e}"
+        );
+        if !finite || diff > 5e-3 * big {
+            return Err(format!(
+                "mlx_arm_agrees {name}: finite {finite}, max diff {diff:e} (bound 5e-3 of {big:e})"
+            ));
+        }
+    }
+    Ok(Mlx { pipes, bufs: m })
+}
+
+/// MLX's arms at one key count, in the shipped `packed` unit: the
+/// single-pass kernel, pass 1 alone, pass 2 alone and both passes, at MLX's
+/// block count for this GPU and at the engine's segment cap. Whether any
+/// arm failed.
+fn mlx_arms(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    bufs: &mut Bufs,
+    m: &mut Mlx,
+    keys: u32,
+    packed: usize,
+    trials: usize,
+) -> bool {
+    let mut failed = false;
+    let rule = mlx::blocks_g13s(keys, QUERY_HEADS / KV_HEADS);
+    let mut block_counts = vec![rule];
+    if rule != bloomery_metal::kernels::SEGMENT_CAP {
+        block_counts.push(bloomery_metal::kernels::SEGMENT_CAP);
+    }
+    let mut report = |name: &str, r: Result<Timed, String>| match r {
+        Ok(t) => print_row(name, keys, "packed", packed, &t),
+        Err(e) => {
+            println!("attn\tkernel={name}\tkeys={keys}\tarm=packed\tFAIL\t{e}");
+            failed = true;
+        }
+    };
+    let Mlx { pipes, bufs: mb } = m;
+    report(
+        "mlx_vec",
+        time_arm(device, stream, packed, trials, |encoder, _| {
+            mlx::encode_vec(encoder, pipes, &mut mlx_launch(bufs, keys), mb)
+        }),
+    );
+    for blocks in block_counts {
+        report(
+            &format!("mlx_2p_b{blocks}"),
+            time_arm(device, stream, packed, trials, |encoder, _| {
+                let mut l = mlx_launch(bufs, keys);
+                mlx::encode_pass1(encoder, &pipes.pass1, &mut l, mb, blocks)?;
+                encoder.memory_barrier();
+                mlx::encode_pass2(encoder, pipes, &l, mb, blocks)
+            }),
+        );
+        report(
+            &format!("mlx_2p1_b{blocks}"),
+            time_arm(device, stream, packed, trials, |encoder, _| {
+                mlx::encode_pass1(
+                    encoder,
+                    &pipes.pass1,
+                    &mut mlx_launch(bufs, keys),
+                    mb,
+                    blocks,
+                )
+            }),
+        );
+        report(
+            &format!("mlx_2p2_b{blocks}"),
+            time_arm(device, stream, packed, trials, |encoder, _| {
+                mlx::encode_pass2(encoder, pipes, &mlx_launch(bufs, keys), mb, blocks)
+            }),
+        );
+        for (name, arm) in &pipes.arms {
+            report(
+                &format!("{name}_b{blocks}"),
+                time_arm(device, stream, packed, trials, |encoder, _| {
+                    mlx::encode_pass1(encoder, arm, &mut mlx_launch(bufs, keys), mb, blocks)
+                }),
+            );
+        }
     }
     failed
 }
