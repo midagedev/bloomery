@@ -1630,6 +1630,14 @@ impl ScriptedEngine {
             ..self
         }
     }
+
+    /// The same engine over `tok`'s vocabulary: the script holds its ids, and
+    /// its EOS ends a spent script.
+    #[must_use]
+    pub fn with_tokenizer(mut self, tok: Arc<dyn Tokenizer>) -> Self {
+        self.tok = tok;
+        self
+    }
 }
 
 /// [`MockTokenizer`] with its own stop ids. Its vocabulary reaches past the

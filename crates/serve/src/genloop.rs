@@ -420,6 +420,11 @@ pub(crate) enum GenError {
          call"
     )]
     Unclosed,
+    /// A special token the streaming decoder did not release whole (a space a
+    /// cleaning vocabulary holds), so the loop cannot place its span in the
+    /// text. The request ends; the server keeps serving the others.
+    #[error("special token {0} was not released whole by the streaming decoder")]
+    SpecialPiece(u32),
 }
 
 pub(crate) fn ms_since(t: Instant) -> f64 {
@@ -2776,18 +2781,20 @@ impl Gen {
             }
             let piece = self.dec.push(tok);
             // Where a special id's text is in its piece: the piece ends with
-            // it, after any bytes the decoder held.
-            let special = piece
-                .as_deref()
-                .filter(|_| self.vocab.is_special(tok))
-                .map(|p| {
-                    let len = self.vocab.decode(&[tok]).len();
-                    let at = p
-                        .len()
-                        .checked_sub(len)
-                        .expect("a special token's decoded text must fit its decoder piece");
-                    (at, len)
-                });
+            // it, after any bytes the decoder held. A piece that does not
+            // carry the text whole (a space a cleaning decoder holds) cannot
+            // place it, and the request ends by name rather than lose the span.
+            let special = if self.vocab.is_special(tok) {
+                let text = self.vocab.decode(&[tok]);
+                let at = piece
+                    .as_deref()
+                    .and_then(|p| p.strip_suffix(text.as_str()))
+                    .map(str::len)
+                    .ok_or(GenError::SpecialPiece(tok))?;
+                Some((at, text.len()))
+            } else {
+                None
+            };
             if let Some((at, len)) = special {
                 self.specials.push((self.scan.text().len() + at, len));
             }
@@ -5241,10 +5248,8 @@ mod think_tests {
 mod sampled_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{Bias, GenParams, Slot, Timings, biased, generate};
-    use crate::engine::{
-        Decoder, Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer,
-    };
+    use super::{Bias, GenError, GenParams, Outcome, Slot, Timings, biased, generate};
+    use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockTokenizer};
     use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
@@ -5390,187 +5395,63 @@ mod sampled_tests {
         assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(7)]);
     }
 
-    /// A llama-bpe vocabulary: the two specials below, then one id a byte, decoded by the
-    /// rule the server's own vocabulary decoder follows for a cleaning row (an incomplete
-    /// UTF-8 tail held, the text through `tokenizer::SpaceCleaner`); `vocab`'s decoder is
-    /// private, so the gate spells the same rule beside its vocabulary.
-    const LLAMA_SPECIALS: [&str; 2] = ["<|end_of_text|>", "<|start_header_id|>"];
+    /// A llama-bpe vocabulary as the server loads one (`tokenizer::Tokenizer::from_keys`
+    /// through [`crate::vocab::Vocab`], whose decoder and special mapping the loop reads):
+    /// the four CONTROL tokens below, then the byte-level alphabet minus the `'` the
+    /// apostrophe special already spells, a vocabulary holding a text once. `foo ` and `'`
+    /// are the spellings whose pieces the space cleaner does not release whole: `foo `
+    /// releases `foo` and holds its space, and `'` after a held space is held whole
+    /// (` ' ` starts with ` '`), where `<|start_header_id|>` no pattern starts.
+    fn llama_bpe_vocab() -> Arc<dyn Tokenizer> {
+        use gguf::Value;
 
-    fn llama_piece(id: u32) -> Vec<u8> {
-        match usize::try_from(id).ok().and_then(|i| LLAMA_SPECIALS.get(i)) {
-            Some(s) => s.as_bytes().to_vec(),
-            None => id
-                .checked_sub(LLAMA_SPECIALS.len() as u32)
-                .and_then(|b| u8::try_from(b).ok())
-                .map(|b| vec![b])
-                .unwrap_or_default(),
-        }
-    }
-
-    struct LlamaBpeTok;
-
-    impl Tokenizer for LlamaBpeTok {
-        fn encode(&self, text: &str) -> Vec<u32> {
-            let bytes = text.as_bytes();
-            let mut out = Vec::with_capacity(bytes.len());
-            let mut i = 0;
-            while i < bytes.len() {
-                let special = LLAMA_SPECIALS
+        const SPECIALS: [&str; 4] = ["<|end_of_text|>", "<|start_header_id|>", "foo ", "'"];
+        let bytes = tokenizer::byte_to_cpt_table().map(|c| char::from_u32(c).unwrap());
+        let tokens: Vec<Value> = SPECIALS
+            .iter()
+            .map(|s| Value::String((*s).to_owned()))
+            .chain(
+                bytes
                     .iter()
-                    .enumerate()
-                    .filter(|(_, s)| bytes[i..].starts_with(s.as_bytes()))
-                    .max_by_key(|(_, s)| s.len());
-                match special {
-                    Some((id, s)) => {
-                        out.push(u32::try_from(id).expect("two specials"));
-                        i += s.len();
-                    }
-                    None => {
-                        out.push(LLAMA_SPECIALS.len() as u32 + u32::from(bytes[i]));
-                        i += 1;
-                    }
-                }
-            }
-            out
-        }
-
-        fn guard<'a>(&self, text: &'a str, _mark: &str) -> std::borrow::Cow<'a, str> {
-            std::borrow::Cow::Borrowed(text)
-        }
-
-        fn encode_marked(&self, text: &str, _mark: &str) -> Vec<u32> {
-            self.encode(text)
-        }
-
-        fn decode(&self, ids: &[u32]) -> String {
-            let bytes: Vec<u8> = ids.iter().flat_map(|&id| llama_piece(id)).collect();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
-
-        fn decoder(&self) -> Box<dyn Decoder> {
-            Box::new(LlamaBpeDecoder {
-                pending: Vec::new(),
-                cleaner: tokenizer::SpaceCleaner::default(),
-            })
-        }
-
-        fn bos(&self) -> Option<u32> {
-            None
-        }
-
-        fn eos(&self) -> u32 {
-            0
-        }
-
-        fn add_bos(&self) -> bool {
-            false
-        }
-
-        fn n_vocab(&self) -> usize {
-            LLAMA_SPECIALS.len() + 256
-        }
-
-        fn is_special(&self, id: u32) -> bool {
-            usize::try_from(id).is_ok_and(|i| i < LLAMA_SPECIALS.len())
-        }
+                    .filter(|c| !SPECIALS.contains(&c.to_string().as_str()))
+                    .map(|c| Value::String(c.to_string())),
+            )
+            .collect();
+        let types: Vec<Value> = std::iter::repeat_n(Value::I32(3), SPECIALS.len())
+            .chain(std::iter::repeat_n(
+                Value::I32(1),
+                tokens.len() - SPECIALS.len(),
+            ))
+            .collect();
+        let vocab = tokenizer::Tokenizer::from_keys(&[
+            ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+            (
+                "tokenizer.ggml.pre".into(),
+                Value::String("llama-bpe".into()),
+            ),
+            ("tokenizer.ggml.tokens".into(), Value::Array(tokens)),
+            ("tokenizer.ggml.token_type".into(), Value::Array(types)),
+            ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+            ("tokenizer.ggml.eos_token_id".into(), Value::U32(0)),
+            ("tokenizer.ggml.add_bos_token".into(), Value::Bool(false)),
+        ])
+        .unwrap();
+        Arc::new(crate::vocab::Vocab::new(vocab).unwrap())
     }
 
-    struct LlamaBpeDecoder {
-        pending: Vec<u8>,
-        cleaner: tokenizer::SpaceCleaner,
-    }
-
-    impl Decoder for LlamaBpeDecoder {
-        fn push(&mut self, id: u32) -> Option<String> {
-            self.pending.extend_from_slice(&llama_piece(id));
-            let mut out = String::new();
-            loop {
-                match std::str::from_utf8(&self.pending) {
-                    Ok(s) => {
-                        out.push_str(s);
-                        self.pending.clear();
-                        break;
-                    }
-                    Err(e) => {
-                        let valid = e.valid_up_to();
-                        out.push_str(
-                            std::str::from_utf8(&self.pending[..valid]).unwrap_or_default(),
-                        );
-                        match e.error_len() {
-                            None => {
-                                self.pending.drain(..valid);
-                                break;
-                            }
-                            Some(bad) => {
-                                out.push(char::REPLACEMENT_CHARACTER);
-                                self.pending.drain(..valid + bad);
-                            }
-                        }
-                    }
-                }
-            }
-            let cleaned = self.cleaner.push(&out);
-            (!cleaned.is_empty()).then_some(cleaned)
-        }
-
-        fn flush(&mut self) -> String {
-            let mut rest = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            rest = self.cleaner.push(&rest);
-            rest.push_str(&self.cleaner.finish());
-            rest
-        }
-    }
-
-    /// An engine whose generation is the ids it was given, then the eos, over the llama-bpe
-    /// vocabulary; its rows are never read.
-    struct SpecialEngine {
-        tok: Arc<dyn Tokenizer>,
-        ids: Vec<u32>,
-        at: usize,
-    }
-
-    impl Engine for SpecialEngine {
-        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
-            Arc::clone(&self.tok)
-        }
-        fn prefill(&mut self, _ids: &[u32]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn next(&mut self, _last: u32, _row: Option<&mut [f32]>) -> Result<u32, EngineError> {
-            let id = self.ids.get(self.at).copied().unwrap_or(0);
-            self.at += 1;
-            Ok(id)
-        }
-        fn reset(&mut self) -> Result<(), EngineError> {
-            self.at = 0;
-            Ok(())
-        }
-        fn ctx_max(&self) -> usize {
-            4096
-        }
-        fn describe(&self) -> String {
-            "a llama-bpe special".into()
-        }
-    }
-
-    /// A llama-bpe special id pushed from an empty decoder keeps its whole text in its piece,
-    /// so the loop's special mapping finds the text at the piece's end instead of panicking
-    /// on `checked_sub`: `<|start_header_id|>` is 19 bytes none of the cleaner's patterns
-    /// starts.
-    ///
-    /// FAIL-first: a cleaner that releases only part of a piece panics the loop here, the
-    /// mapping expecting the special's whole decoded text at the piece's end.
-    #[test]
-    fn a_llama_bpe_special_pushed_from_an_empty_decoder_does_not_panic() {
-        let tok: Arc<dyn Tokenizer> = Arc::new(LlamaBpeTok);
-        let mut slot = Slot::new(Box::new(SpecialEngine {
-            tok: Arc::clone(&tok),
-            ids: vec![1],
-            at: 0,
-        }));
+    /// One generation over [`llama_bpe_vocab`]: the prompt `prompt`, then the scripted ids
+    /// `script`, its streamed text and special spans collected beside the outcome.
+    fn llama_bpe_run(
+        vocab: &Arc<dyn Tokenizer>,
+        script: Vec<u32>,
+        prompt: &str,
+        n_predict: i64,
+    ) -> (Result<Outcome, GenError>, String, Vec<(usize, usize)>) {
+        let mut slot = Slot::new(Box::new(
+            crate::mock::ScriptedEngine::from_ids(4096, script).with_tokenizer(Arc::clone(vocab)),
+        ));
         let p = GenParams {
-            n_predict: 1,
+            n_predict,
             sampling: SamplingParams {
                 temperature: 0.0,
                 ..SamplingParams::default()
@@ -5594,10 +5475,10 @@ mod sampled_tests {
         let mut text = String::new();
         let mut specials = Vec::new();
         let mut tim = Timings::default();
-        let outcome = generate(
+        let r = generate(
             &mut slot,
             &sampling::reference_factory(),
-            &[LLAMA_SPECIALS.len() as u32 + u32::from(b'x')],
+            &vocab.encode(prompt),
             &p,
             &mut |ev| {
                 if let super::Event::Text(t, s, _) = ev {
@@ -5608,10 +5489,54 @@ mod sampled_tests {
             },
             &mut |_| {},
             &mut tim,
-        )
-        .expect("a generation");
+        );
+        (r, text, specials)
+    }
+
+    /// A llama-bpe special id pushed from an empty decoder keeps its whole text in its
+    /// piece, so the loop's special mapping finds the text at the piece's end:
+    /// `<|start_header_id|>` is 19 bytes none of the cleaner's patterns starts.
+    #[test]
+    fn a_llama_bpe_special_pushed_from_an_empty_decoder_does_not_panic() {
+        let vocab = llama_bpe_vocab();
+        let (r, text, specials) = llama_bpe_run(&vocab, vec![1], "x", 1);
+        let outcome = r.expect("a generation");
         assert_eq!(text, "<|start_header_id|>");
         assert_eq!(outcome.specials, [(0, 19)]);
         assert_eq!(specials, [(0, 19)]);
+    }
+
+    /// A special whose piece the cleaner cuts short ends the request by name:
+    /// `foo ` streams `foo` while its whole decoded text keeps the space, so no
+    /// place in the piece holds the text.
+    ///
+    /// FAIL-first: the span mapping expected the special's whole decoded text
+    /// at its piece's end and panicked on `foo `.
+    #[test]
+    fn a_special_the_cleaner_cuts_short_ends_the_request() {
+        let vocab = llama_bpe_vocab();
+        let (r, ..) = llama_bpe_run(&vocab, vec![2], "x", 1);
+        assert!(
+            matches!(&r, Err(GenError::SpecialPiece(2))),
+            "foo: {:?}",
+            r.err()
+        );
+    }
+
+    /// A special the cleaner holds whole, so no piece carries it at all, ends the
+    /// request by name too: a lone `'` after a space makes ` ' `, whose prefix
+    /// ` '` the cleaner holds for the piece that completes it, which never comes.
+    ///
+    /// FAIL-first: without its piece the special's span was lost silently.
+    #[test]
+    fn a_special_the_cleaner_holds_whole_ends_the_request() {
+        let vocab = llama_bpe_vocab();
+        let space = *vocab.encode(" ").first().expect("the space is a token");
+        let (r, ..) = llama_bpe_run(&vocab, vec![space, 3], "x", 2);
+        assert!(
+            matches!(&r, Err(GenError::SpecialPiece(3))),
+            "apostrophe: {:?}",
+            r.err()
+        );
     }
 }

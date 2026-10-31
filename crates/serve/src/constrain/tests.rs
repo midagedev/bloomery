@@ -83,16 +83,36 @@ struct PieceDecoder {
 impl Decoder for PieceDecoder {
     fn push(&mut self, id: u32) -> Option<String> {
         self.held.extend(self.tok.bytes_of(id));
-        let upto = match std::str::from_utf8(&self.held) {
-            Ok(_) => self.held.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if upto == 0 {
-            return None;
+        // The production rule (`crate::vocab`'s decoder): a hard invalid
+        // sequence becomes U+FFFD and the text after it streams, an
+        // incomplete tail is held. A special after an invalid byte keeps its
+        // whole text in its piece, so the loop can place its span.
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.held) {
+                Ok(text) => {
+                    out.push_str(text);
+                    self.held.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // The first `valid` bytes were just checked.
+                    out.push_str(std::str::from_utf8(&self.held[..valid]).unwrap_or_default());
+                    match e.error_len() {
+                        None => {
+                            self.held.drain(..valid);
+                            break;
+                        }
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.held.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
         }
-        let text = String::from_utf8_lossy(&self.held[..upto]).into_owned();
-        self.held.drain(..upto);
-        Some(text)
+        (!out.is_empty()).then_some(out)
     }
     fn flush(&mut self) -> String {
         String::from_utf8_lossy(&std::mem::take(&mut self.held)).into_owned()

@@ -162,34 +162,58 @@ impl SpaceCleaner {
     /// what a later piece could still change, and hands what it released to the next pass.
     /// `None` is the end of the stream: nothing is held.
     fn feed(&mut self, text: Option<&[u8]>) -> String {
-        let mut bytes = text.unwrap_or_default().to_vec();
-        for (pending, patterns) in self.pending.iter_mut().zip(PATTERNS) {
-            pending.extend_from_slice(&bytes);
-            let mut out = Vec::with_capacity(pending.len());
-            let mut at = 0;
-            while at < pending.len() {
-                let rest = &pending[at..];
-                match patterns.iter().find(|&&(from, _)| rest.starts_with(from)) {
-                    Some(&(from, to)) => {
-                        out.extend_from_slice(to);
-                        at += from.len();
-                    }
-                    None if text.is_some()
-                        && patterns.iter().any(|(from, _)| from.starts_with(rest)) =>
-                    {
-                        break;
-                    }
-                    None => {
-                        out.push(pending[at]);
-                        at += 1;
-                    }
-                }
-            }
-            pending.drain(..at);
-            bytes = out;
+        if let Some(t) = text {
+            self.pending[0].extend_from_slice(t);
         }
-        String::from_utf8(bytes).expect("only ASCII pattern prefixes are held")
+        let last = PATTERNS.len() - 1;
+        for i in 0..last {
+            let (head, tail) = self.pending.split_at_mut(i + 1);
+            let released = clean_pass(&mut head[i], PATTERNS[i], text.is_some());
+            tail[0].extend_from_slice(&head[i][..released]);
+            let kept = head[i].len() - released;
+            head[i].copy_within(released.., 0);
+            head[i].truncate(kept);
+        }
+        let released = clean_pass(&mut self.pending[last], PATTERNS[last], text.is_some());
+        let out = self.pending[last].drain(..released).collect();
+        String::from_utf8(out).expect("only ASCII pattern prefixes are held")
     }
+}
+
+/// One pass over `pending` in place: each match's replacement written over it, the
+/// released bytes compacted to the front, the held tail behind them. Returns how many
+/// bytes the pass released; `pending` keeps the rest. A replacement is never longer
+/// than its pattern, so the write stays behind the read. `stream` is false only at the
+/// end of the stream, where nothing is held.
+fn clean_pass(pending: &mut Vec<u8>, patterns: &[(&[u8], &[u8])], stream: bool) -> usize {
+    let (mut read, mut write) = (0, 0);
+    while read < pending.len() {
+        match patterns
+            .iter()
+            .find(|&&(from, _)| pending[read..].starts_with(from))
+        {
+            Some(&(from, to)) => {
+                pending[write..write + to.len()].copy_from_slice(to);
+                write += to.len();
+                read += from.len();
+            }
+            None => {
+                if stream
+                    && patterns
+                        .iter()
+                        .any(|(from, _)| from.starts_with(&pending[read..]))
+                {
+                    break;
+                }
+                pending[write] = pending[read];
+                write += 1;
+                read += 1;
+            }
+        }
+    }
+    pending.copy_within(read.., write);
+    pending.truncate(write + pending.len() - read);
+    write
 }
 
 /// A streaming decoder: feed ids one at a time and take back the text that is
