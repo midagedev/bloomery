@@ -1523,51 +1523,8 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     );
 }
 
-/// [`RESIDENCY`] unset beside the NVMe tier over NVFP4 planes
-/// ([`residency_beside_paged_planes`]): the serving word turns `off` with why
-/// `nvme_planes` on a plan that pages while a routed stack loads in planes,
-/// and the pair rule passes that `off` on; the serving word on any other plan,
-/// a set word and every other why pass through untouched.
-#[test]
-fn residency_beside_paged_planes_turns_the_unset_word_off() {
-    let unset = ResidencyPick {
-        word: RESIDENCY_SERVING,
-        why: ResidencyWhy::Place,
-    };
-    let paged = residency_beside_paged_planes(unset, true);
-    assert_eq!((paged.word, paged.why), ("off", ResidencyWhy::NvmePlanes));
-    assert_eq!(paged.why.name(), "nvme_planes");
-    assert!(
-        paged
-            .why
-            .detail()
-            .expect("the nvme-planes why details")
-            .contains("NVFP4"),
-        "the detail names the planes"
-    );
-    let big = 1 << 40;
-    let pair = residency_at_plan(
-        UnhostedPool::NotCarried,
-        paged,
-        [42u64, 43],
-        30,
-        |_| Ok::<u64, ()>(0),
-        big,
-        big,
-    )
-    .expect("no pool error");
-    assert_eq!(pair, paged, "the pair rule passes the off on");
-    assert_eq!(residency_beside_paged_planes(unset, false), unset);
-    let set = ResidencyPick {
-        word: RESIDENCY_SERVING,
-        why: ResidencyWhy::Set,
-    };
-    assert_eq!(residency_beside_paged_planes(set, true), set);
-    for why in [ResidencyWhy::FixedPlace, ResidencyWhy::NoHostExperts] {
-        let off = ResidencyPick { word: "off", why };
-        assert_eq!(residency_beside_paged_planes(off, true), off);
-    }
-}
+// PIN(2026-11-01): residency_beside_paged_planes_turns_the_unset_word_off left with its rule: the
+// NVMe arena fills a stack's NVFP4 planes, so a paged plan keeps the serving residency word.
 
 /// `BLOOMERY_DRAFT` unset on a qwen4exp file in `generate_qwen3moe`: the MTP
 /// draft under `--place a` with its file there and room for the last

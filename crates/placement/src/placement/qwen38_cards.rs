@@ -23,7 +23,7 @@ use super::workstation::{
 use super::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
     ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, UnifiedPool,
-    nvme_arena_of, plan_routed_reserving,
+    arena_part_bytes, arena_window_bytes, nvme_arena_of, plan_routed_reserving,
 };
 use crate::accepts::{Program, routed_rule};
 use crate::slots::{SeqTerms, Stores};
@@ -1572,6 +1572,45 @@ fn a_room_under_the_floor_is_refused_by_name() {
         at.arena, least.bytes,
         "the floor's room plans the least arena"
     );
+}
+
+/// The arena's floor counts a routed stack of NVFP4 rows at the windows a
+/// fill of a checkpoint folder's two planes a matrix takes: its codes'
+/// window and its block scales' ([`arena_part_bytes`]: the codes 8 of a
+/// group's 9 bytes, the scales the ninth), as the arena carves it. Every
+/// other type stays one window a part. FAIL-first: a planes stack counted at
+/// one window over its bytes leaves the floor two or three pages a part
+/// under the carve, and the carve at the floor's room under the floor's
+/// slots.
+#[test]
+fn the_floor_counts_an_nvfp4_rows_stack_at_its_two_planes_windows() {
+    let mut fp4 = model(false);
+    for t in &mut fp4.tensors {
+        if t.role == Role::RoutedExperts {
+            t.ty = GgmlType::NVFP4_ROWS;
+            t.file_bytes = t.dims.iter().product::<u64>() / 16 * 9;
+        }
+    }
+    let gate = machine_a(RTX_3090);
+    let twin = plan_with(&fp4, &gate, 4096, 1, 27 << 30, false).expect("the unsplit plan");
+    let want: u64 = fp4
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts && t.layer.is_some())
+        .map(|t| {
+            let blocks = t.file_bytes / fp4.experts / 9;
+            arena_part_bytes(8 * blocks, blocks)
+        })
+        .sum();
+    let least = ArenaFloor::of(&twin).expect("the arena's floor");
+    assert_eq!(least.slot_set, want);
+    let one: u64 = fp4
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts && t.layer.is_some())
+        .map(|t| arena_window_bytes(t.file_bytes / fp4.experts))
+        .sum();
+    assert!(least.slot_set > one, "two windows a part over one");
 }
 
 /// The arena's floor on the gate plan: the larger of ten ids a call (the
