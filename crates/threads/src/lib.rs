@@ -786,6 +786,39 @@ fn pin(cpu: u32) -> std::io::Result<()> {
     os::pin(cpu).map_err(std::io::Error::from)
 }
 
+/// The cpus a caller that wants one thread a physical core pins its first `t`
+/// threads to: the shape the pool would build now ([`plan_pool`]'s), each
+/// thread's cpu the pool's own placement rule (`Shape::cpu_for`, the
+/// CCD-spread primaries, one a core). Refused by name — a pinned measurement
+/// must not run on a guess — when sysfs listed no topology the process's mask
+/// shares cpus with (the mask's cpus are not known to be one a core) or the
+/// host has fewer physical cores than `t`.
+pub fn pinned_cpus(t: usize) -> Result<Vec<u32>, String> {
+    let shape = shape_now(None).map_err(|e| format!("sched_getaffinity: {e}"))?;
+    if !shape.topology_read || shape.cut.as_ref().is_some_and(|cut| cut.from_mask) {
+        return Err(
+            "sysfs lists no cpu topology the process's mask shares cpus with: the mask's \
+             cpus are not known to be one a physical core"
+                .to_string(),
+        );
+    }
+    if t > shape.physical {
+        return Err(format!(
+            "{t} threads over {} physical cores: a pin needs one cpu a core",
+            shape.physical
+        ));
+    }
+    Ok((0..t).map(|i| shape.cpu_for(i)).collect())
+}
+
+/// Pin the calling thread to one logical cpu — the pool's own pin call, a
+/// `sched_setaffinity` of that cpu alone, so a pinned caller sits where a pool
+/// worker would. Returns the kernel's refusal instead of panicking; a platform
+/// with no per-thread mask refuses by name.
+pub fn pin_self(cpu: u32) -> std::io::Result<()> {
+    pin(cpu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Pool;

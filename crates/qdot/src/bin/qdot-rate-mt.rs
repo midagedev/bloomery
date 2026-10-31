@@ -8,12 +8,16 @@
 //! named rows alone (a name no row takes is refused by name), and `--iq1s-generic` runs the
 //! IQ1_S row through the generic decoder (`generic::dot_avx2::<Iq1s>`), the path IQ1_S rows
 //! took before their hand kernel — the generic-vs-hand comparison arm.
+//!
+//! `--pin` runs thread `i` of T pinned to physical-core primary `i` — the pool's own
+//! placement (`threads::pinned_cpus`), one cpu a core — refused by name when the host has
+//! fewer physical cores than the run's largest T or a thread's pin fails.
 
-use std::sync::Barrier;
+use std::sync::{Barrier, Mutex};
 use std::time::Instant;
 
 use gguf::GgmlType;
-use threads::chunk_bounds;
+use threads::{chunk_bounds, pin_self, pinned_cpus};
 
 /// Timed-section target per cell.
 const TARGET_SECS: f64 = 3.0;
@@ -153,14 +157,35 @@ fn dot_iq1s_generic(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
     }
 }
 
+/// Thread `t`'s `--pin` step: pin to `pins[t]`, recording a refusal in `failed`
+/// for the caller to refuse by name once the scope ends — a thread that panicked
+/// here would leave the start barrier short and the run wedged.
+fn pin_thread(pins: &[u32], t: usize, failed: &Mutex<Vec<String>>) {
+    let cpu = pins[t];
+    if let Err(e) = pin_self(cpu) {
+        failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("thread {t} to cpu {cpu}: {e}"));
+    }
+}
+
+/// Refuse a `--pin` run whose threads recorded pin refusals, by name.
+fn refuse_pin_failures(failed: Mutex<Vec<String>>) {
+    let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    assert!(failed.is_empty(), "--pin refused: {}", failed.join("; "));
+}
+
 /// One MT-ceiling cell: `t_threads` scoped threads stream contiguous shares
-/// of the shared buffer. Returns (weight bytes moved, seconds, checksum).
+/// of the shared buffer, each pinning itself to `pin[t]` first under `--pin`.
+/// Returns (weight bytes moved, seconds, checksum).
 fn run_mt(
     sh: &Shape,
     w: &[u8],
     acol: &[u8],
     t_threads: usize,
     passes: u32,
+    pin: Option<&[u32]>,
     dot: Dot,
 ) -> (f64, f64, f32) {
     let share = sh.rows / t_threads;
@@ -168,12 +193,17 @@ fn run_mt(
     let ty = sh.ty;
     let k = sh.k;
     let start = Barrier::new(t_threads + 1);
-    std::thread::scope(|s| {
+    let failed = Mutex::new(Vec::new());
+    let out = std::thread::scope(|s| {
         let handles: Vec<_> = (0..t_threads)
             .map(|t| {
                 let slice = &w[t * share * row..(t + 1) * share * row];
                 let start = &start;
+                let failed = &failed;
                 s.spawn(move || {
+                    if let Some(pins) = pin {
+                        pin_thread(pins, t, failed);
+                    }
                     start.wait();
                     let mut acc = 0.0f32;
                     for _ in 0..passes {
@@ -194,14 +224,16 @@ fn run_mt(
             dt,
             sums.iter().sum(),
         )
-    })
+    });
+    refuse_pin_failures(failed);
+    out
 }
 
 /// One (shape, T) measurement: warm-up calibrates pass count, then timed passes report.
-fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, dot: Dot) {
-    let (_, warm, _) = run_mt(sh, w, acol, t_threads, 1, dot);
+fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, pin: Option<&[u32]>, dot: Dot) {
+    let (_, warm, _) = run_mt(sh, w, acol, t_threads, 1, pin, dot);
     let passes = ((TARGET_SECS / warm).ceil() as u32).clamp(MIN_PASSES, MAX_PASSES);
-    let (bytes, dt, sum) = run_mt(sh, w, acol, t_threads, passes, dot);
+    let (bytes, dt, sum) = run_mt(sh, w, acol, t_threads, passes, pin, dot);
     println!(
         "{:?} k={:<5} T={:>2}: {:>8} rows x {:>4} B x {:>4} passes in {:>7.3} s = {:>6.1} GB/s (sum {sum:.3})",
         sh.ty,
@@ -217,13 +249,15 @@ fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, dot: Dot) {
 
 // ---------------------------------------------------------------- mode 2
 
-/// One granularity cell: 32 threads step through the buffer in calls of `rows_per_call` rows.
+/// One granularity cell: 32 threads step through the buffer in calls of `rows_per_call`
+/// rows, each pinning itself to `pin[t]` first under `--pin`.
 fn run_gran(
     sh: &Shape,
     w: &[u8],
     acol: &[u8],
     rows_per_call: usize,
     sweeps: usize,
+    pin: Option<&[u32]>,
     dot: Dot,
 ) -> (f64, f64, f32) {
     let calls = sh.rows / rows_per_call; // remainder rows are unvisited
@@ -232,12 +266,17 @@ fn run_gran(
     let k = sh.k;
     let call_sync = Barrier::new(T_GRAN);
     let start = Barrier::new(T_GRAN + 1);
-    std::thread::scope(|s| {
+    let failed = Mutex::new(Vec::new());
+    let out = std::thread::scope(|s| {
         let handles: Vec<_> = (0..T_GRAN)
             .map(|t| {
                 let call_sync = &call_sync;
                 let start = &start;
+                let failed = &failed;
                 s.spawn(move || {
+                    if let Some(pins) = pin {
+                        pin_thread(pins, t, failed);
+                    }
                     start.wait();
                     let (c0, c1) = chunk_bounds(rows_per_call, T_GRAN, t);
                     let width = c1 - c0;
@@ -265,13 +304,22 @@ fn run_gran(
             dt,
             sums.iter().sum(),
         )
-    })
+    });
+    refuse_pin_failures(failed);
+    out
 }
 
-fn cell_gran(sh: &Shape, w: &[u8], acol: &[u8], rows_per_call: usize, dot: Dot) {
-    let (_, warm, _) = run_gran(sh, w, acol, rows_per_call, 1, dot);
+fn cell_gran(
+    sh: &Shape,
+    w: &[u8],
+    acol: &[u8],
+    rows_per_call: usize,
+    pin: Option<&[u32]>,
+    dot: Dot,
+) {
+    let (_, warm, _) = run_gran(sh, w, acol, rows_per_call, 1, pin, dot);
     let sweeps = ((TARGET_SECS / warm).ceil() as usize).clamp(MIN_SWEEPS, MAX_SWEEPS);
-    let (bytes, dt, sum) = run_gran(sh, w, acol, rows_per_call, sweeps, dot);
+    let (bytes, dt, sum) = run_gran(sh, w, acol, rows_per_call, sweeps, pin, dot);
     println!(
         "{:?} k={:<5} T=32 R={:>6} ({:>5.1} rows/thread/call): {:>3} calls x {:>4} B x {:>3} sweeps in {:>7.3} s = {:>6.1} GB/s (sum {sum:.3})",
         sh.ty,
@@ -317,11 +365,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let gran = args.iter().any(|a| a == "--granularity");
     let generic = args.iter().any(|a| a == "--iq1s-generic");
+    let pin = args.iter().any(|a| a == "--pin");
     let only = args
         .iter()
         .position(|a| a == "--only")
         .map(|p| args.get(p + 1).expect("--only needs TYPE[,TYPE...]"))
         .map(String::as_str);
+    // T_GRAN is the largest T either mode runs, so the list covers every cell;
+    // thread i of a smaller T runs the first i cpus.
+    let pins = pin.then(|| pinned_cpus(T_GRAN).unwrap_or_else(|e| panic!("--pin refused: {e}")));
+    let pin_note = match &pins {
+        Some(cpus) => format!(
+            "--pin: thread i of T on cpu i, one a physical core (the pool's primaries), cpus {cpus:?}"
+        ),
+        None => "no pinning".to_string(),
+    };
     let mut shapes = selected(only);
     if generic {
         shapes = shapes
@@ -336,11 +394,11 @@ fn main() {
     let dot: Dot = if generic { dot_iq1s_generic } else { dot_fused };
     if gran {
         println!(
-            "qdot-rate-mt --granularity: T=32, std::sync::Barrier resync per R rows/call (characterizes the Barrier, NOT the pool — see the header caveat)"
+            "qdot-rate-mt --granularity: T=32, std::sync::Barrier resync per R rows/call (characterizes the Barrier, NOT the pool — see the header caveat); {pin_note}"
         );
     } else {
         println!(
-            "qdot-rate-mt: MT streaming ceiling, zero orchestration (std::thread::scope, no pool, no pinning)"
+            "qdot-rate-mt: MT streaming ceiling, zero orchestration (std::thread::scope, no pool, {pin_note})"
         );
     }
     if generic {
@@ -359,11 +417,11 @@ fn main() {
         let a = acol(sh.ty, sh.k);
         if gran {
             for r in RS {
-                cell_gran(sh, &w, &a, r, dot);
+                cell_gran(sh, &w, &a, r, pins.as_deref(), dot);
             }
         } else {
             for t in [1usize, 8, 16, 32] {
-                cell_mt(sh, &w, &a, t, dot);
+                cell_mt(sh, &w, &a, t, pins.as_deref(), dot);
             }
         }
         drop(w); // free memory before the next shape allocates

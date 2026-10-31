@@ -7279,11 +7279,13 @@ unsafe fn dot_iq3xxs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     }
 }
 
-/// One column's block step of the IQ2_XXS, IQ3_XXS, IQ3_S and IQ4_XS kernels (their steps
+/// One column's block step of the IQ3_XXS, IQ3_S and IQ4_XS kernels (their steps
 /// are the same past the weight decode): the bsums fold's fmadd, the eight
 /// sub-blocks' `madd(scale, maddubs(values, q8))` summed in ik's order, then
 /// the codes' fmadd, onto `accd`. `values` are the block's 32-code vectors
-/// (unsigned, offset), `scales` each sub-block's scale on every i16 lane.
+/// (unsigned, offset), `scales` each sub-block's scale on every i16 lane. The
+/// IQ2_XXS kernels keep these steps in their own half-block body
+/// ([`iq2xxs_multiply_add`], [`iq2xxs_wide_group`]).
 ///
 /// # Safety
 /// AVX2+FMA must be available (taken from the caller, being
@@ -8240,19 +8242,23 @@ const IQ2XXS_MIN: i8 = 43;
 
 /// AVX2+FMA+F16C row dot: IQ2_XXS weights against a Q8_K column.
 ///
-/// ik's form (`mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ2XXS, nrc_y>`, iqk_gemm_iquants.cpp:788
+/// ik's form (`mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ2XXS, nrc_y>`, iqk_gemm_iquants.cpp:786
 /// and :148, the body its AVX2 build runs at every column count, :1011): a sub-block's 32
 /// grid values take their signs on the weight side through `sign_epi8`, then +43
-/// ([`iq2xxs_pack`]); the offset comes back out through the column's 16-value sums,
+/// ([`iq2xxs_prepare`]); the offset comes back out through the column's 16-value sums,
 /// `(-43·d)·dy · Σ s·bsum`, one fmadd per block ahead of the codes' fmadd, with
-/// `d = 0.125·f16` ([`q8k_block_step`], the IQ3_XXS, IQ3_S and IQ4_XS kernels' steps).
+/// `d = 0.125·f16` — `q8k_block_step`'s float steps in its order (the IQ3_XXS, IQ3_S and
+/// IQ4_XS kernels' step, kept inline here because the weight side is consumed half a block
+/// at a time: [`iq2xxs_new_block`], [`iq2xxs_prepare`], [`iq2xxs_multiply_add`], ik's
+/// `new_block`/`prepare`/`multiply_add`, iqk_gemm_iquants.cpp:179, :214,
+/// iqk_common.h:388 — no whole-block pack lives across the block).
 /// i16: a maddubs pair peaks at 2·86·128 = 22016 on any column bytes, so saturation is
 /// unreachable. i32: a lane sums 8 sub-blocks × 31 × 4 × 86 × 128 < 2^24, so its f32
 /// conversion is exact.
 ///
 /// TWIN of [`iq2xxs_wide_group`], the body of its wide tile ([`dot_iq2xxs_q8k_wide_avx2`])
 /// and of its column tile ([`dot_iq2xxs_q8k_tile_avx2`], the wide tile's one group): each
-/// column there runs [`q8k_block_step`]'s float steps, so any edit to them is made in both.
+/// column there runs these float steps, so any edit to them is made in both.
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
@@ -8263,21 +8269,36 @@ unsafe fn dot_iq2xxs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     unsafe {
         let mut accd = _mm256_setzero_ps();
         for i in 0..nb {
-            let p = iq2xxs_pack(wrow.as_ptr().add(IQ2XXS_BLOCK * i));
+            let blk = wrow.as_ptr().add(IQ2XXS_BLOCK * i);
             let col = acol.as_ptr().add(Q8K_STRIDE * i);
-            accd = q8k_block_step(&p.values, &p.scales, p.mins, p.d, p.dmin, col, accd);
+            let head = iq2xxs_new_block(blk);
+            // q8k_block_step's float steps in its order: the fold's fmadd ahead of the
+            // codes'.
+            let dy = (col as *const f32).read_unaligned();
+            let bsums = _mm256_loadu_si256(col.add(264) as *const __m256i);
+            accd = _mm256_fmadd_ps(
+                _mm256_set1_ps(head.dmin * dy),
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(head.mins, bsums)),
+                accd,
+            );
+            let mut sumi = _mm256_setzero_si256();
+            for j in 0..2 {
+                let half = iq2xxs_prepare(blk, &head, j);
+                sumi = iq2xxs_multiply_add(&half, j, col, 0, sumi);
+            }
+            accd = _mm256_fmadd_ps(_mm256_set1_ps(head.d * dy), _mm256_cvtepi32_ps(sumi), accd);
         }
         hsum_float_8(accd)
     }
 }
 
 /// The IQ2_XXS tile: one row's blocks against up to [`TILE_COLS`] Q8_K columns, the wide
-/// tile's one group ([`dot_iq2xxs_q8k_wide_avx2`]): per block the weight side once into
-/// the block's pack ([`iq2xxs_pack`]), then [`iq2xxs_wide_group`] over the `C` columns —
-/// per sub-block the pack's values and scale against each column's codes into that
-/// column's sum, and per column [`q8k_block_step`]'s two fmadds. Each column keeps its own
-/// `accd` and ends in `hsum_float_8`, so every value is [`dot_iq2xxs_q8k_avx2`]'s bit for
-/// bit (the wide tile's argument).
+/// tile's one group ([`dot_iq2xxs_q8k_wide_avx2`]): per block the block head once
+/// ([`iq2xxs_new_block`]), then [`iq2xxs_wide_group`] over the `C` columns — per
+/// half-block the weight side prepared once ([`iq2xxs_prepare`]) and consumed by every
+/// column into its sum, and per column the one-column kernel's two fmadds. Each column
+/// keeps its own `accd` and ends in `hsum_float_8`, so every value is
+/// [`dot_iq2xxs_q8k_avx2`]'s bit for bit (the wide tile's argument).
 ///
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ2_XXS blocks and each
@@ -8296,8 +8317,9 @@ unsafe fn dot_iq2xxs_q8k_tile_avx2<const C: usize>(
         let mut accd = [_mm256_setzero_ps(); C];
 
         for i in 0..nb {
-            let pack = iq2xxs_pack(wrow.as_ptr().add(IQ2XXS_BLOCK * i));
-            iq2xxs_wide_group::<C>(&pack, acols, Q8K_STRIDE * i, &mut accd);
+            let blk = wrow.as_ptr().add(IQ2XXS_BLOCK * i);
+            let head = iq2xxs_new_block(blk);
+            iq2xxs_wide_group::<C>(blk, &head, acols, Q8K_STRIDE * i, &mut accd);
         }
 
         // Reduction order is load-bearing: the one-column kernel's, per column.
@@ -8310,11 +8332,13 @@ unsafe fn dot_iq2xxs_q8k_tile_avx2<const C: usize>(
 }
 
 /// The IQ2_XXS wide tile: one row's blocks against up to [`WIDE_COLS`] Q8_K
-/// columns. Per block the weight side once ([`iq2xxs_pack`]), then the columns in
-/// groups of up to [`WIDE_GROUP`] ([`iq2xxs_wide_group`]): per sub-block the pack's
-/// values and scale, and per column one `maddubs` against its codes and one `madd`
-/// into the column's sum; then per column the fold's fmadd and the codes' fmadd,
-/// [`q8k_block_step`]'s float steps in its order. The integer sums are exact, so
+/// columns. Per block the head once ([`iq2xxs_new_block`]) — the one side every
+/// group shares — then the columns in groups of up to [`WIDE_GROUP`]
+/// ([`iq2xxs_wide_group`]): each group prepares its half-blocks itself and consumes
+/// them per column, so at more than one group the weight side's grid gathers run
+/// per group, the half-block shape's cost for a whole-block pack that would not
+/// stay register-resident. Then per column the fold's fmadd and the codes' fmadd,
+/// the one-column kernel's float steps in its order. The integer sums are exact, so
 /// their order is free, and the closing `hsum_float_8` is the one-column kernel's,
 /// so every column's value is [`dot_iq2xxs_q8k_avx2`]'s bit for bit.
 ///
@@ -8341,7 +8365,8 @@ unsafe fn dot_iq2xxs_q8k_wide_avx2(wrow: &[u8], acols: &[*const u8], nb: usize, 
         let mut accd = [_mm256_setzero_ps(); WIDE_COLS];
 
         for i in 0..nb {
-            let pack = iq2xxs_pack(wrow.as_ptr().add(IQ2XXS_BLOCK * i));
+            let blk = wrow.as_ptr().add(IQ2XXS_BLOCK * i);
+            let head = iq2xxs_new_block(blk);
 
             let at = Q8K_STRIDE * i;
             let mut g0 = 0;
@@ -8349,14 +8374,14 @@ unsafe fn dot_iq2xxs_q8k_wide_avx2(wrow: &[u8], acols: &[*const u8], nb: usize, 
                 let g = (c - g0).min(WIDE_GROUP);
                 let (cols, acc) = (&acols[g0..g0 + g], &mut accd[g0..g0 + g]);
                 match g {
-                    1 => iq2xxs_wide_group::<1>(&pack, cols, at, acc),
-                    2 => iq2xxs_wide_group::<2>(&pack, cols, at, acc),
-                    3 => iq2xxs_wide_group::<3>(&pack, cols, at, acc),
-                    4 => iq2xxs_wide_group::<4>(&pack, cols, at, acc),
-                    5 => iq2xxs_wide_group::<5>(&pack, cols, at, acc),
-                    6 => iq2xxs_wide_group::<6>(&pack, cols, at, acc),
-                    7 => iq2xxs_wide_group::<7>(&pack, cols, at, acc),
-                    _ => iq2xxs_wide_group::<WIDE_GROUP>(&pack, cols, at, acc),
+                    1 => iq2xxs_wide_group::<1>(blk, &head, cols, at, acc),
+                    2 => iq2xxs_wide_group::<2>(blk, &head, cols, at, acc),
+                    3 => iq2xxs_wide_group::<3>(blk, &head, cols, at, acc),
+                    4 => iq2xxs_wide_group::<4>(blk, &head, cols, at, acc),
+                    5 => iq2xxs_wide_group::<5>(blk, &head, cols, at, acc),
+                    6 => iq2xxs_wide_group::<6>(blk, &head, cols, at, acc),
+                    7 => iq2xxs_wide_group::<7>(blk, &head, cols, at, acc),
+                    _ => iq2xxs_wide_group::<WIDE_GROUP>(blk, &head, cols, at, acc),
                 }
                 g0 += g;
             }
@@ -8369,35 +8394,34 @@ unsafe fn dot_iq2xxs_q8k_wide_avx2(wrow: &[u8], acols: &[*const u8], nb: usize, 
     }
 }
 
-/// An IQ2_XXS block's weight side in ik's form, built once for every column of a call
-/// ([`iq2xxs_pack`]).
+/// An IQ2_XXS block's per-block side, shared by every column and group of a call
+/// ([`iq2xxs_new_block`]): the two vectors and the two factors the whole block's
+/// sub-blocks read.
 #[cfg(target_arch = "x86_64")]
-struct Iq2xxsPack {
-    /// Sub-block `b`'s 32 grid magnitudes with their signs and the offset
-    /// [`IQ2XXS_MIN`], maddubs' unsigned side (`make4_signed`).
-    values: [__m256i; 8],
-    /// Sub-block `b`'s odd scale `2s + 1` on every i16 lane (`set_scales_8`).
-    scales: [__m256i; 8],
+struct Iq2xxsHead {
     /// The bsums fold's weights: scale `b` on the two 16-value sums of sub-block `b`
     /// (`Scales8KBase::shuffle`).
     mins: __m256i,
+    /// The eight odd scales `2s + 1` on the i16 lanes (`load_scales`), the source of
+    /// every half's scale vectors (`set_scales_8`).
+    all_scales: __m256i,
     /// `0.125·f16` (`load_scales`).
     d: f32,
     /// The fold's factor `-43·d` (`new_block`).
     dmin: f32,
 }
 
-/// ik's `DequantizerIQ2XXS` (iqk_gemm_iquants.cpp:148) on one block: `load_scales` reads
-/// the eight scale nibbles as one vector (here the high word of each sub-block's eight
-/// bytes, gathered by a shuffle and a qword permute), `make4_signed` signs each
-/// sub-block's grid words through [`keven_signs_word`] and adds [`IQ2XXS_MIN`].
+/// ik's `DequantizerIQ2XXS::new_block` (iqk_gemm_iquants.cpp:179) on one block:
+/// `load_scales` reads the eight scale nibbles as one vector (here the high word of
+/// each sub-block's eight bytes, gathered by a shuffle and a qword permute) and the
+/// fold's `mins` from it.
 ///
 /// # Safety
 /// AVX2 and F16C must be available (taken from the caller, being `#[inline(always)]`);
 /// `blk` must point at a whole IQ2_XXS block.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn iq2xxs_pack(blk: *const u8) -> Iq2xxsPack {
+unsafe fn iq2xxs_new_block(blk: *const u8) -> Iq2xxsHead {
     // SAFETY: AVX2 and F16C present per contract; every read is inside the block.
     unsafe {
         let d = 0.125f32 * f16c_to_f32((blk as *const u16).read_unaligned());
@@ -8429,13 +8453,43 @@ unsafe fn iq2xxs_pack(blk: *const u8) -> Iq2xxsPack {
                 _mm_set_epi32(0x0706_0706, 0x0504_0504, 0x0302_0302, 0x0100_0100),
             ),
         );
-        let all_scales = _mm256_set_m128i(sc16, sc16);
-        let min_value = _mm256_set1_epi8(IQ2XXS_MIN);
+        Iq2xxsHead {
+            mins,
+            all_scales: _mm256_set_m128i(sc16, sc16),
+            d,
+            dmin: -d * f32::from(IQ2XXS_MIN),
+        }
+    }
+}
 
-        let mut values = [_mm256_setzero_si256(); 8];
-        let mut scales = [_mm256_setzero_si256(); 8];
-        for b in 0..8 {
-            let qs = blk.add(2 + 8 * b);
+/// One half-block of an IQ2_XXS block's weight side (ik's `prepare` with
+/// `set_scales_8`, iqk_gemm_iquants.cpp:214 and :18): half `j`'s four sub-blocks,
+/// consumed as built so no whole-block pack lives across the block.
+#[cfg(target_arch = "x86_64")]
+struct Iq2xxsHalf {
+    /// Sub-block `4j + k`'s 32 grid magnitudes with their signs and the offset
+    /// [`IQ2XXS_MIN`], maddubs' unsigned side (`make4_signed`).
+    values: [__m256i; 4],
+    /// Sub-block `4j + k`'s odd scale `2s + 1` on every i16 lane (`set_scales_8`).
+    scales: [__m256i; 4],
+}
+
+/// ik's `DequantizerIQ2XXS::prepare` (iqk_gemm_iquants.cpp:214, the `make4_signed` it
+/// calls at :205) on half `j` of one block: `make4_signed` signs each sub-block's grid
+/// words through [`keven_signs_word`] and adds [`IQ2XXS_MIN`], and `set_scales_8` picks
+/// the half's four scale vectors from the head's `all_scales`.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
+/// `blk` must point at a whole IQ2_XXS block and `j` be 0 or 1.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2xxs_prepare(blk: *const u8, head: &Iq2xxsHead, j: usize) -> Iq2xxsHalf {
+    // SAFETY: AVX2 present per contract; every read is inside the block.
+    unsafe {
+        let min_value = _mm256_set1_epi8(IQ2XXS_MIN);
+        let values = std::array::from_fn(|k| {
+            let qs = blk.add(2 + 8 * (4 * j + k));
             let aux = (qs.add(4) as *const u32).read_unaligned();
             // Each of the four grid index bytes indexes the 256-entry grid.
             let q2 = _mm256_set_epi64x(
@@ -8444,38 +8498,69 @@ unsafe fn iq2xxs_pack(blk: *const u8) -> Iq2xxsPack {
                 IQ2XXS_GRID[usize::from(*qs.add(1))] as i64,
                 IQ2XXS_GRID[usize::from(*qs.add(0))] as i64,
             );
-            values[b] = _mm256_add_epi8(_mm256_sign_epi8(q2, keven_signs_word(aux)), min_value);
-            // set_scales_8: sub-block b's scale on every i16 lane.
-            scales[b] = _mm256_shuffle_epi8(
-                all_scales,
-                _mm256_set1_epi16(((2 * b) | ((2 * b + 1) << 8)) as i16),
-            );
-        }
-        Iq2xxsPack {
-            values,
-            scales,
-            mins,
-            d,
-            dmin: -d * f32::from(IQ2XXS_MIN),
+            _mm256_add_epi8(_mm256_sign_epi8(q2, keven_signs_word(aux)), min_value)
+        });
+        let scales = std::array::from_fn(|k| {
+            // set_scales_8: sub-block 4j + k's scale on every i16 lane.
+            let b = 8 * j + 2 * k;
+            _mm256_shuffle_epi8(
+                head.all_scales,
+                _mm256_set1_epi16((b | ((b + 1) << 8)) as i16),
+            )
+        });
+        Iq2xxsHalf { values, scales }
+    }
+}
+
+/// One column's consume of [`iq2xxs_prepare`]'s half (ik's `multiply_add`,
+/// iqk_common.h:388): the half's four sub-blocks' 32 codes each at `at + 8 + 32·b`
+/// through `maddubs` against the sub-block's values and `madd` by its scale, summed
+/// in [`q8k_block_step`]'s integer tree. The integer lanes are exact sums, so the
+/// order is free and this is it.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
+/// `col` must hold a Q8_K block at byte `at`, and `j` be 0 or 1.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2xxs_multiply_add(
+    half: &Iq2xxsHalf,
+    j: usize,
+    col: *const u8,
+    at: usize,
+    sumi: __m256i,
+) -> __m256i {
+    // SAFETY: AVX2 present per contract; the column holds a Q8_K block at `at`.
+    unsafe {
+        let p: [__m256i; 4] = std::array::from_fn(|k| {
+            let q8 = _mm256_loadu_si256(col.add(at + 8 + 32 * (4 * j + k)) as *const __m256i);
+            _mm256_madd_epi16(half.scales[k], _mm256_maddubs_epi16(half.values[k], q8))
+        });
+        if j == 0 {
+            _mm256_add_epi32(_mm256_add_epi32(p[0], p[2]), _mm256_add_epi32(p[1], p[3]))
+        } else {
+            let sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p[0], p[2]));
+            _mm256_add_epi32(sumi, _mm256_add_epi32(p[1], p[3]))
         }
     }
 }
 
-/// One group of [`dot_iq2xxs_q8k_wide_avx2`]'s columns against block `pack`: per
-/// sub-block, in order, each column's 32 codes at `at + 8 + 32·b` through `maddubs`
-/// against the sub-block's values and `madd` by its scale into the column's sum; then
-/// per column [`q8k_block_step`]'s float steps — the fold's fmadd of
-/// `madd(mins, bsums)` (the bsums at `at + 264`) against `dmin·dy`, then the codes'
-/// fmadd against `d·dy` (`dy` the f32 at `at`) — onto its accumulator.
+/// One group of [`dot_iq2xxs_q8k_wide_avx2`]'s columns against the block at `blk` with
+/// its head: per column the fold's fmadd of `madd(mins, bsums)` (the bsums at
+/// `at + 264`) against `dmin·dy`, then per half `j` the weight side prepared once
+/// ([`iq2xxs_prepare`]) and consumed by every column ([`iq2xxs_multiply_add`]) into
+/// that column's sum, then per column the codes' fmadd against `d·dy` (`dy` the f32
+/// at `at`) — the one-column kernel's float steps in its order.
 ///
 /// # Safety
 /// AVX2+FMA must be available (taken from the caller, being `#[inline(always)]`);
-/// `cols` must hold `G` columns, each with a Q8_K block at byte `at`, and `acc`
-/// `G` accumulators.
+/// `blk` must point at a whole IQ2_XXS block, `cols` hold `G` columns, each with a
+/// Q8_K block at byte `at`, and `acc` `G` accumulators.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn iq2xxs_wide_group<const G: usize>(
-    pack: &Iq2xxsPack,
+    blk: *const u8,
+    head: &Iq2xxsHead,
     cols: &[*const u8],
     at: usize,
     acc: &mut [__m256],
@@ -8489,21 +8574,24 @@ unsafe fn iq2xxs_wide_group<const G: usize>(
     // SAFETY: AVX2+FMA present per contract; every column holds a Q8_K block at `at`.
     unsafe {
         let mut sumi = [_mm256_setzero_si256(); G];
-        for (b, (&values, &sc)) in pack.values.iter().zip(&pack.scales).enumerate() {
+        for (col, a) in cols.iter().zip(acc.iter_mut()) {
+            let dy = (col.add(at) as *const f32).read_unaligned();
+            let bsums = _mm256_loadu_si256(col.add(at + 264) as *const __m256i);
+            *a = _mm256_fmadd_ps(
+                _mm256_set1_ps(head.dmin * dy),
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(head.mins, bsums)),
+                *a,
+            );
+        }
+        for j in 0..2 {
+            let half = iq2xxs_prepare(blk, head, j);
             for (col, s) in cols.iter().zip(sumi.iter_mut()) {
-                let q8 = _mm256_loadu_si256(col.add(at + 8 + 32 * b) as *const __m256i);
-                *s = _mm256_add_epi32(*s, _mm256_madd_epi16(sc, _mm256_maddubs_epi16(values, q8)));
+                *s = iq2xxs_multiply_add(&half, j, *col, at, *s);
             }
         }
         for ((col, s), a) in cols.iter().zip(&sumi).zip(acc.iter_mut()) {
             let dy = (col.add(at) as *const f32).read_unaligned();
-            let bsums = _mm256_loadu_si256(col.add(at + 264) as *const __m256i);
-            let folded = _mm256_fmadd_ps(
-                _mm256_set1_ps(pack.dmin * dy),
-                _mm256_cvtepi32_ps(_mm256_madd_epi16(pack.mins, bsums)),
-                *a,
-            );
-            *a = _mm256_fmadd_ps(_mm256_set1_ps(pack.d * dy), _mm256_cvtepi32_ps(*s), folded);
+            *a = _mm256_fmadd_ps(_mm256_set1_ps(head.d * dy), _mm256_cvtepi32_ps(*s), *a);
         }
     }
 }
