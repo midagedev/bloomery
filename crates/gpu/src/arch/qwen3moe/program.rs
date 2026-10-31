@@ -218,6 +218,14 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
         }
     }
 
+    fn attn_append(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        match store_of(self.stores, l.layer)? {
+            StoreMut::Kv(kv) => dispatch::attn_append(&lc, g, kv, self.s, l.m),
+            StoreMut::Rec(_) => Err(dispatch::two_kinds(l.layer)),
+        }
+    }
+
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
         l.plain_only("qwen3moe::Program::attn_out")?;
         let lc = layer_ctx(self.c, l)?;

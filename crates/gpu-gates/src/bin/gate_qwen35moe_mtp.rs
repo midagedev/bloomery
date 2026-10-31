@@ -37,6 +37,16 @@
 //!   Under 30 % is a wiring error (the join order, a wrong `h`, a wrong
 //!   gain), and the clause is red. The draft's own K/V rows weigh little
 //!   at this prompt length: a draft attending to one row stays above it.
+//! - (w) the store walk and the step row, after (s): the draft's K/V rows
+//!   below (s)'s last position are overwritten by steps of other ids and
+//!   rows, which moves that position's logits; store walks
+//!   (`WalkMode::Store`, two rows a walk) of (s)'s feed over those positions
+//!   leave the draft's last logits bit for bit (no head runs), and the eager
+//!   step at the last position after them is (s)'s last step bit for bit
+//!   (the store holds the eager walk's keys and values). After two plain
+//!   target steps, a chain at position 1 that reads the target head's row on
+//!   the card (`MtpArena::Step`) gives the token and logits, bit for bit, of
+//!   the same step over that row read back to the host.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -50,11 +60,16 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel, addresses};
+    use bloomery_gpu::arch::qwen3moe::{
+        KvQ8, Mtp35, MtpArena, Open35, PrefillPath, Qwen35moeModel, addresses, mtp_chain, mtp_walk,
+    };
+    use bloomery_gpu::draft::{DraftHead, Feed, Hidden, WalkBounds, WalkMode};
     use bloomery_gpu::mtp::{MtpInputArgs, MtpKernels};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::rounding::{U, gamma};
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{
+        GateError, RefManifest, bits_equal, checks_failed, data_dir, verdict,
+    };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -374,9 +389,8 @@ mod gate {
         drafted: Vec<u32>,
         /// Steps whose token is the host argmax of the card's logits.
         argmax_ok: usize,
-        /// The last step's largest logit and its index, which the head's gain
-        /// moves where it moves no token.
-        peak: (f32, usize),
+        /// Every logit of the last eager step, the store restoration's reference.
+        logits: Vec<f32>,
     }
 
     /// The target's own next token after each prompt id (a plain step per
@@ -397,20 +411,19 @@ mod gate {
     fn draft_run(m: &mut Qwen35moeModel, ids: &[u32], rows: &[f32]) -> Result<Run, GateError> {
         let stream = m.gpu().stream_handle();
         let mut h = DeviceBuffer::<f32>::zeroed(&stream, HIDDEN)?;
-        let (mut drafted, mut argmax_ok, mut peak) = (Vec::new(), 0, (0.0, 0));
+        let (mut drafted, mut argmax_ok, mut logits) = (Vec::new(), 0, Vec::new());
         for i in 0..ids.len() - 1 {
             h.copy_from_host(&stream, &rows[i * HIDDEN..(i + 1) * HIDDEN])?;
             let token = m.mtp_draft(ids[i + 1], i, &h)?;
-            let logits = draft_logits(m)?;
+            logits = draft_logits(m)?;
             let at = super::e2e::argmax(&logits) as usize;
             argmax_ok += usize::from(at == token as usize);
-            peak = (logits[at], at);
             drafted.push(token);
         }
         Ok(Run {
             drafted,
             argmax_ok,
-            peak,
+            logits,
         })
     }
 
@@ -455,12 +468,102 @@ mod gate {
             100.0 * FLOOR,
             verdict(wired)
         );
+        let at = super::e2e::argmax(&run.logits) as usize;
         println!(
             "(s) the last draft step's largest logit {:.6} at token {}",
-            run.peak.0, run.peak.1
+            run.logits[at], at
         );
         let r_ok = refusals(m, ids, &rows, run.drafted[steps - 1])?;
-        Ok(h_ok && r_ok && wired)
+        let w_ok = store_clause(m, ids, &rows, &run)?;
+        Ok(h_ok && r_ok && wired && w_ok)
+    }
+
+    /// The draft's step `t` at position `pos` over the host row `row`, and its
+    /// logits.
+    fn host_step(
+        m: &mut Qwen35moeModel,
+        (t, pos): (u32, usize),
+        row: &[f32],
+    ) -> Result<(u32, Vec<f32>), GateError> {
+        let stream = m.gpu().stream_handle();
+        let mut h = DeviceBuffer::<f32>::zeroed(&stream, HIDDEN)?;
+        h.copy_from_host(&stream, row)?;
+        let token = m.mtp_draft(t, pos, &h)?;
+        Ok((token, draft_logits(m)?))
+    }
+
+    /// (w) on (s)'s run.
+    fn store_clause(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        rows: &[f32],
+        run: &Run,
+    ) -> Result<bool, GateError> {
+        let last = run.drafted.len() - 1;
+        let row = |i: usize| &rows[i * HIDDEN..(i + 1) * HIDDEN];
+        let peak_bits = |l: &[f32]| {
+            let at = super::e2e::argmax(l) as usize;
+            (at, l[at].to_bits())
+        };
+        let fed = peak_bits(&run.logits);
+        for i in 0..last {
+            host_step(m, (ids[i + 2], i), row(i + 1))?;
+        }
+        let (_, moved) = host_step(m, (ids[last + 1], last), row(last))?;
+        let sensitive = !bits_equal(&moved, &run.logits);
+        let before = draft_logits(m)?;
+        for pos0 in (0..last).step_by(<Mtp35 as WalkBounds>::STORE_ROWS) {
+            let end = (pos0 + <Mtp35 as WalkBounds>::STORE_ROWS).min(last);
+            let feed = Feed {
+                tokens: &ids[pos0 + 1..end + 1],
+                pos0: u32::try_from(pos0)?,
+                hidden: Hidden::Host(&rows[pos0 * HIDDEN..end * HIDDEN]),
+                media: None,
+            };
+            mtp_walk(m, feed, DraftHead::Full, WalkMode::Store)?;
+        }
+        let kept = bits_equal(&draft_logits(m)?, &before);
+        let (token, logits) = host_step(m, (ids[last + 1], last), row(last))?;
+        let same = token == run.drafted[last] && bits_equal(&logits, &run.logits);
+        println!(
+            "(w) other rows below position {last} move its logits: peak {:?} against \
+             (s)'s {fed:?} {}",
+            peak_bits(&moved),
+            verdict(sensitive)
+        );
+        println!(
+            "(w) store walks over positions 0..{last} leave the draft's logits bit for bit {}",
+            verdict(kept)
+        );
+        println!(
+            "(w) the step at position {last} after them: token {token} (s): {}, logits \
+             bit for bit {}",
+            run.drafted[last],
+            verdict(same)
+        );
+        m.reset()?;
+        m.step(&ids[..1])?;
+        m.step(&ids[1..2])?;
+        let normed = m.head_normed()?;
+        let (want, want_logits) = host_step(m, (ids[2], 1), &normed)?;
+        let mut out = [0u32; 1];
+        let feed = Feed {
+            tokens: &ids[2..3],
+            pos0: 1,
+            hidden: Hidden::Target {
+                walk: MtpArena::Step,
+                first: 0,
+            },
+            media: None,
+        };
+        mtp_chain(m, feed, 0, DraftHead::Full, WalkMode::Eager, &mut out, None)?;
+        let on_card = out[0] == want && bits_equal(&draft_logits(m)?, &want_logits);
+        println!(
+            "(w) the step row on the card: token {} (read back: {want}), logits bit for bit {}",
+            out[0],
+            verdict(on_card)
+        );
+        Ok(sensitive && kept && same && on_card)
     }
 
     /// (r): the refusals on the live draft, then the last step again.

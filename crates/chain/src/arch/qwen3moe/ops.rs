@@ -88,6 +88,13 @@ pub trait ChainOps {
     /// the kind has one).
     fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), Self::Error>;
 
+    /// What [`attn_core`](ChainOps::attn_core) runs first and nothing after it: the q/k norm and
+    /// rope with the cache append, the store walk's last op ([`super::walk::store`]). A backend
+    /// with no such launch keeps the default body, which refuses by name.
+    fn attn_append(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), Self::Error> {
+        Err(unrun::<Self>("qwen3moe::ChainOps::attn_append", l.layer).into())
+    }
+
     /// The attention half's output side: the output projection and the join of its output into
     /// the FFN's input rows by `l.plan.residual` (the plain add, or the sandwich's mixer
     /// norm and scale).

@@ -28,8 +28,8 @@ impl MtpBody for Body35 {
     const STORE_ROWS: usize = 2;
 
     type Arena = MtpArena;
-    /// A plain step's post-norm row is the head's last position, read back
-    /// before the next step overwrites it.
+    /// A plain step's post-norm row is the head's last position, copied on
+    /// the card before the next step overwrites it.
     const STEP_ARENA: MtpArena = MtpArena::Step;
     /// A verify leaves its rows in the pass arena.
     const VERIFY_ARENA: MtpArena = MtpArena::Pass;

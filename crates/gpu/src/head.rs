@@ -751,11 +751,16 @@ impl Head {
     /// [`HeadNorm::Mixed`] the input, `result_embd`). Blocking read;
     /// gate/debug use.
     pub fn normed_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
-        let rows = match &self.fin {
+        Ok(self.normed().to_host_vec(gpu.stream())?)
+    }
+
+    /// [`Head::normed_to_host`]'s rows on the card, for a launch on the
+    /// engine stream that reads them where they sit.
+    pub(crate) fn normed(&self) -> &DeviceBuffer<f32> {
+        match &self.fin {
             Final::Rms { normed } => normed,
             Final::Mixed => &self.x,
-        };
-        Ok(rows.to_host_vec(gpu.stream())?)
+        }
     }
 
     /// The logits of the last run (`n_vocab * m` f32, `[v*m + c]`). Blocking

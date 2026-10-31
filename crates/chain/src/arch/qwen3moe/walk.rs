@@ -7,8 +7,8 @@
 //! ([`Walk::run`]): each layer is the walk's front, the head its end, and a port that exchanges
 //! nothing. A caller that lays a copy between a layer's mixer and its FFN half gives it to
 //! [`Walk::run_between`]; a caller that runs one layer, or one FFN half, from rows it laid in runs
-//! [`layer`] or [`ffn`]; a walk with a host leg runs each layer's [`front`] and then its FFN half
-//! around the leg.
+//! [`layer`] or [`ffn`], and one that fills a layer's store alone runs [`store`]; a walk with a
+//! host leg runs each layer's [`front`] and then its FFN half around the leg.
 //!
 //! What this order does not cover, so no backend reads it as covering it: a walk with a host leg
 //! splits its FFN half around the leg (the CUDA placed load's router, card experts and combine
@@ -161,6 +161,28 @@ pub fn layer<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error>
     ffn(ops, cx)
 }
 
+/// What a store walk runs of layer `cx` from the residual rows its caller laid in: the attention's
+/// input side and its cache append, and nothing after (no flash, no output side, no FFN half, no
+/// head), since a later row reads a row's keys and values alone. A mixer whose store is a state
+/// the whole mixer writes (the delta rule, the short conv) is refused by name before any op.
+pub fn store<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
+    match &cx.plan.mixer {
+        MixerPlan::Gqa(g) => {
+            ops.attn_in(cx, g)?;
+            ops.attn_append(cx, g)
+        }
+        MixerPlan::Delta(_) | MixerPlan::ShortConv(_) => Err(ChainError::shape(
+            "qwen3moe::walk::store",
+            format!(
+                "layer {}: a store walk of a mixer whose store the whole mixer writes; an \
+                 attention layer's is its keys and values alone",
+                cx.layer
+            ),
+        )
+        .into()),
+    }
+}
+
 /// The mixer the plan names: its input side, its middle and its output side, which joins the
 /// mixer's output into the stream.
 fn mixer<O: ChainOps>(ops: &mut O, cx: LayerCtx<'_>) -> Result<(), O::Error> {
@@ -197,7 +219,7 @@ mod tests {
         DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, HeadGate, LayerPlan, MixerPlan,
         ResidualPlan, SandwichPlan, ShortConvPlan, SiteTy,
     };
-    use super::{ChainOps, LayerCtx, NoLeg, Steps, Walk, ffn, front, layer};
+    use super::{ChainOps, LayerCtx, NoLeg, Steps, Walk, ffn, front, layer, store};
     use crate::ChainError;
     use crate::linear::{KHeadMap, LinearShape, Ring};
     use runtime::sched::{self, Overlap, PortKind};
@@ -243,6 +265,9 @@ mod tests {
         }
         fn attn_core(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
             self.put("attn_core")
+        }
+        fn attn_append(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
+            self.put("attn_append")
         }
         fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), ChainError> {
             self.put(&format!("attn_out{}", join(l, MIXER)))
@@ -542,6 +567,37 @@ mod tests {
             ]
         );
         assert!(!at(0).last && at(1).last);
+    }
+
+    /// A store walk of an attention layer is its input side and its append, nothing after; a
+    /// delta or short-conv layer is refused by name before any op, and a backend with no append
+    /// launch refuses the op by name after the input side.
+    #[test]
+    fn a_store_walk_ends_at_the_append() {
+        let plans = [gqa_layer(), delta_layer(), conv_layer(ResidualPlan::Plain)];
+        let at = |l| LayerCtx::of(&plans, l, 2).unwrap_or_else(|e| panic!("{e}"));
+        let mut ops = Rec::default();
+        store(&mut ops, at(0)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ops.log, ["attn_in", "attn_append"]);
+        for l in [1, 2] {
+            let err = store(&mut ops, at(l)).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.starts_with(&format!(
+                    "qwen3moe::walk::store: layer {l}: a store walk of a mixer"
+                ))),
+                "{err:?}"
+            );
+        }
+        assert_eq!(ops.log, ["attn_in", "attn_append"]);
+        let mut bare = Bare::default();
+        let err = store(&mut bare, at(0)).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e
+                .starts_with("qwen3moe::ChainOps::attn_append: layer 0: the backend ")
+                && e.ends_with("Bare implements no such op")),
+            "{err:?}"
+        );
+        assert_eq!(bare.log, ["attn_in"]);
     }
 
     /// A layer the chain does not hold, a chain of no layer, a unit of no row or wider than the

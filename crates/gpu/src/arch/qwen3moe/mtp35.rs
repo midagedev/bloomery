@@ -32,11 +32,16 @@
 //! never copied: the draft records their addresses at open and refuses a step
 //! by name when either has moved.
 //!
-//! A walk is eager. A captured walk is refused by name. A store walk runs
-//! this same step and does not read the head back: the layer has no
-//! store-only launch. `held` counts the positions the draft's store holds;
-//! a walk from position 0 replaces that count. The body's reset does not
-//! reach it.
+//! A walk is eager. A captured walk is refused by name. A store walk
+//! ([`WalkMode::Store`]) runs the step through the layer's cache append
+//! alone (`walk::store`): the join, `eh_proj`, the attention's input side and
+//! its append, no flash, FFN half or head. A later row reads a row's keys and
+//! values and nothing else of it, and the launches up to the append are the
+//! eager step's, so the store holds an eager walk's bits. A step walk
+//! ([`MtpArena::Step`]) reads the target head's normed row on the card,
+//! copied into the draft's own row on the engine stream: no readback.
+//! `held` counts the positions the draft's store holds; a walk from position
+//! 0 replaces that count. The body's reset does not reach it.
 
 use super::PrefillPath;
 use super::body::{Kernels, KvQ8};
@@ -126,7 +131,7 @@ pub struct Mtp35 {
 /// Where a walk reads the target's final hidden rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MtpArena {
-    /// The head's last position, one row, read back from the host.
+    /// The head's last position, one row, read on the card.
     Step,
     /// The pass arena.
     Pass,
@@ -328,14 +333,18 @@ impl Mtp35 {
     /// the target's hidden row `h` (`hidden` f32 on the card, the row of the
     /// position before `t`): the join, `eh_proj`, the layer at `pos` over the
     /// draft's K/V rows `0..=pos`, and the head, whose token and logits the
-    /// caller reads back. Eager; the target's `target` weights, kernels and
-    /// rope table are the ones its own layers launch with.
+    /// caller reads back. In [`WalkMode::Store`] the layer runs through its
+    /// cache append alone (`walk::store`) and the head does not run: the
+    /// draft's K/V row `pos` is the eager step's, and the last token and
+    /// logits stay those of the step before. Eager; the target's `target`
+    /// weights, kernels and rope table are the ones its own layers launch
+    /// with.
     pub(super) fn enqueue(
         &mut self,
         gpu: &Gpu,
         target: &Weights,
         (k, table, mma): (&Kernels, &DeviceBuffer<f32>, bool),
-        (t, pos): (u32, usize),
+        (t, pos, mode): (u32, usize, WalkMode),
         h: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         super::refuse_past_vocab(WHAT, &[t], self.vocab)?;
@@ -431,6 +440,9 @@ impl Mtp35 {
             m: 1,
             tail: Tail::Into(self.head.input_mut()),
         };
+        if mode == WalkMode::Store {
+            return walk::store(&mut layer, cx);
+        }
         walk::layer(&mut layer, cx)?;
         self.head.enqueue_over(gpu, &self.w, target)
     }
@@ -448,7 +460,7 @@ impl Mtp35 {
         gpu: &Gpu,
         target: &Weights,
         kernels: (&Kernels, &DeviceBuffer<f32>, bool),
-        feed: (u32, usize),
+        feed: (u32, usize, WalkMode),
     ) -> Result<(), GpuError> {
         // The pointer is taken before `enqueue` borrows `self`, so the two
         // borrows of the row do not alias in the checker.
@@ -497,8 +509,9 @@ fn norm_row(
 }
 
 /// One eager walk of the file's next-token layer, no readback. A captured
-/// walk is refused by name. A store walk runs the same step. A poisoned
-/// model is refused; a fault the walk raises is [`GpuModel::note_fault`]'s.
+/// walk is refused by name. A store walk runs each step through the layer's
+/// cache append alone. A poisoned model is refused; a fault the walk raises
+/// is [`GpuModel::note_fault`]'s.
 pub fn mtp_walk(
     m: &mut super::Qwen35moeModel,
     feed: Feed<'_, MtpArena>,
@@ -604,7 +617,7 @@ fn walk_rows(
             format!("{} hidden values for {n} rows of {width}", v.len()),
         ));
     }
-    let step_host = match hidden {
+    let (gpu, w, body, step_row) = match hidden {
         Hidden::Target {
             walk: MtpArena::Step,
             first,
@@ -616,7 +629,7 @@ fn walk_rows(
                      from its row 0",
                 ));
             }
-            let row = m.head_normed()?;
+            let (gpu, w, body, row) = m.body_parts_normed(WHAT)?;
             if row.len() != width {
                 return Err(GpuError::shape(
                     WHAT,
@@ -626,11 +639,13 @@ fn walk_rows(
                     ),
                 ));
             }
-            Some(row)
+            (gpu, w, body, Some(row))
         }
-        _ => None,
+        _ => {
+            let (gpu, w, body) = m.body_parts(WHAT)?;
+            (gpu, w, body, None)
+        }
     };
-    let (gpu, w, body) = m.body_parts(WHAT)?;
     let Body35Fields {
         eps,
         u,
@@ -671,10 +686,9 @@ fn walk_rows(
                 walk: MtpArena::Step,
                 ..
             } => {
-                let row = step_host
-                    .as_ref()
+                let row = step_row
                     .ok_or_else(|| GpuError::state(WHAT, "the head's normed row of the step"))?;
-                mtp.h_row.copy_from_host(gpu.stream(), row)?;
+                mtp.h_row.copy_from_device_async(row, gpu.stream())?;
             }
             Hidden::Target {
                 walk: MtpArena::Pass,
@@ -685,7 +699,7 @@ fn walk_rows(
                 first,
             } => norm_row(mtp, gpu, w, u, eps, first + i)?,
         }
-        mtp.enqueue_held(gpu, w, (k, table, mma), (t, pos))?;
+        mtp.enqueue_held(gpu, w, (k, table, mma), (t, pos, mode))?;
     }
     let n_u = u32::try_from(n)
         .map_err(|_| GpuError::shape(WHAT, format!("a walk of {n} rows passes u32")))?;

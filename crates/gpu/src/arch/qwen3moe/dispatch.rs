@@ -585,10 +585,11 @@ pub(super) fn shared_dense(
 }
 
 /// The attention half's middle at `m` rows, after [`attn_in`]: the head
-/// norm and the rope by the rows' positions with the cache append, the flash
-/// over the rows' live key counts, and the output projection's input — the
-/// attention rows' q8_1 for a K-quant one ([`attn_in`]'s doc); past
-/// [`GEMV_COLS`] rows the wide arm's ([`wide::attn_core`]).
+/// norm and the rope by the rows' positions with the cache append
+/// ([`attn_append`]), the flash over the rows' live key counts, and the
+/// output projection's input — the attention rows' q8_1 for a K-quant one
+/// ([`attn_in`]'s doc); past [`GEMV_COLS`] rows the wide arm's
+/// ([`wide::attn_core`]).
 pub(super) fn attn_core(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -599,10 +600,58 @@ pub(super) fn attn_core(
     if m > GEMV_COLS {
         return wide::attn_core(c, n, kv, s, m);
     }
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    let stream = gpu.stream();
+    attn_append(c, n, kv, s, m)?;
+    let gpu = c.gpu;
     let d = s.dims;
     let i = s.col(m)?;
+    match n.kind {
+        GqaKind::Neox128 => {
+            kv.flash_128(
+                &c.k.flash,
+                gpu.stream(),
+                FlashPass {
+                    q: &s.q,
+                    n_keys: &s.n_keys,
+                    scale: ATTN_SCALE,
+                    n_kv: d.n_kv,
+                    ctx: d.ctx,
+                    m,
+                    part_v: &mut s.part_v,
+                    part_ms: &mut s.part_ms,
+                    fault: c.sink,
+                    y: &mut s.attn,
+                },
+                c.mma,
+            )?;
+            if n.o_ty.kquant() {
+                gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
+            }
+            Ok(())
+        }
+        GqaKind::Gated256 => gated_256(c, n, kv, s, m),
+        // The head-128 NORM turn: `attn_append` refused every other kind.
+        GqaKind::Head128 { .. } | GqaKind::HeadGate128 => norm_128(c, n, kv, s, m),
+    }
+}
+
+/// The attention's q/k norm and rope by the rows' positions with the cache
+/// append at `m` rows, the arena's `q`, `k` and `v` rows into `kv` at the
+/// rows' positions: what [`attn_core`] runs first, and all a store walk
+/// runs after [`attn_in`] (`walk::store`). The launch is the plan's kind's
+/// (the head-128 NEOX turn with the head norm, the head-256 partial turn
+/// with the queries read out of the `[q | gate]` rows into `q_out`, the
+/// head-128 NORM turn), the same at every `m`; any other kind is refused by
+/// name before it.
+pub(super) fn attn_append(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::attn_append";
+    let (stream, w, k) = (c.gpu.stream(), c.w, c.k);
+    let d = s.dims;
     match n.kind {
         GqaKind::Neox128 => {
             // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
@@ -626,50 +675,70 @@ pub(super) fn attn_core(
                         fault: c.sink,
                     },
                 )
-            }?;
-            kv.flash_128(
-                &k.flash,
-                stream,
-                FlashPass {
-                    q: &s.q,
-                    n_keys: &s.n_keys,
-                    scale: ATTN_SCALE,
-                    n_kv: d.n_kv,
-                    ctx: d.ctx,
-                    m,
-                    part_v: &mut s.part_v,
-                    part_ms: &mut s.part_ms,
-                    fault: c.sink,
-                    y: &mut s.attn,
-                },
-                c.mma,
-            )?;
-            if n.o_ty.kquant() {
-                gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
             }
         }
-        GqaKind::Gated256 => gated_256(c, n, kv, s, m)?,
+        GqaKind::Gated256 => {
+            let q_out = s
+                .q_out
+                .as_mut()
+                .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
+            // SAFETY: the layer program embeds consecutive positions before attention;
+            // saturation is outside the cache. Each call uses one sequence's row window
+            // and its own cache planes, not the combined positions of different slots.
+            unsafe {
+                kv.append_256(
+                    &k.neox,
+                    stream,
+                    Append256 {
+                        qg: &s.q,
+                        q: q_out,
+                        k: &mut s.k,
+                        v: &s.v,
+                        gq: f32_gain(w, &n.attn_q_norm)?,
+                        gk: f32_gain(w, &n.attn_k_norm)?,
+                        table: c.table,
+                        pos: &s.pos,
+                        eps: c.eps,
+                        n_head: d.n_head,
+                        n_kv: d.n_kv,
+                        ctx: d.ctx,
+                        m,
+                        fault: c.sink,
+                    },
+                )
+            }
+        }
         GqaKind::Head128 {
             pairs: Pairs::Norm,
             head_norm: false,
-        } => norm_128(c, n, kv, s, m)?,
-        GqaKind::Head128 { pairs, head_norm } => {
-            return Err(GpuError::shape(
-                "qwen3moe::attention",
-                format!(
-                    "a head-128 attention of {pairs:?} pairs with head norm {head_norm}, which no \
-                     launch here serves"
-                ),
-            ));
-        }
-        GqaKind::HeadGate128 => {
-            return Err(GpuError::shape(
-                "qwen3moe::attention",
-                "a head-128 attention with an output gate of its own, which no launch here serves",
-            ));
-        }
+        } => kv.append_norm(
+            &k.q35(WHAT)?.norm,
+            stream,
+            AppendNorm {
+                q: &mut s.q,
+                k: &mut s.k,
+                v: &s.v,
+                table: c.table,
+                pos: &s.pos,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                m,
+                fault: c.sink,
+            },
+        ),
+        GqaKind::Head128 { pairs, head_norm } => Err(GpuError::shape(
+            "qwen3moe::attention",
+            format!(
+                "a head-128 attention of {pairs:?} pairs with head norm {head_norm}, which no \
+                 launch here serves"
+            ),
+        )),
+        GqaKind::HeadGate128 => Err(GpuError::shape(
+            "qwen3moe::attention",
+            "a head-128 attention with an output gate of its own, which no launch here serves",
+        )),
     }
-    Ok(())
 }
 
 /// The attention half's input side at `m` rows: the attention norm with its
@@ -847,9 +916,8 @@ pub(super) fn out_resid(
 }
 
 /// The attention's head-128 middle with a NORM rope and no head norm
-/// ([`GqaKind::Head128`]): the turn of all 128 values of each query and key
-/// head by neighbouring pairs, with the cache append; the flash over the
-/// rows' live key counts at the layer's layout (`n.flash`); and, for a
+/// ([`GqaKind::Head128`]) after its append ([`attn_append`]): the flash over
+/// the rows' live key counts at the layer's layout (`n.flash`); and, for a
 /// K-quant `attn_output`, the flash rows' q8_1.
 fn norm_128(
     c: &Ctx<'_>,
@@ -858,27 +926,10 @@ fn norm_128(
     s: &mut Arena,
     m: usize,
 ) -> Result<(), GpuError> {
-    const WHAT: &str = "qwen3moe::norm_128";
     let (gpu, k) = (c.gpu, c.k);
     let stream = gpu.stream();
     let d = s.dims;
     let i = s.col(m)?;
-    kv.append_norm(
-        &k.q35(WHAT)?.norm,
-        stream,
-        AppendNorm {
-            q: &mut s.q,
-            k: &mut s.k,
-            v: &s.v,
-            table: c.table,
-            pos: &s.pos,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            fault: c.sink,
-        },
-    )?;
     kv.flash_head128(
         &k.flash,
         stream,
@@ -903,13 +954,13 @@ fn norm_128(
     Ok(())
 }
 
-/// The attention's head-256 middle ([`GqaKind::Gated256`]): the q/k norm
-/// and the turn of the first 64 values with the cache append, the queries
-/// read out of the `[q | gate]` rows into their own buffer; the flash over
-/// the rows' live key counts; the output projection's input — for a K-quant
-/// `attn_output` quantized with each value multiplied by the sigmoid of its
-/// gate, for any other type those products as f32 rows into the arena's
-/// gated rows. The queries stay in `q_out`.
+/// The attention's head-256 middle ([`GqaKind::Gated256`]) after its append
+/// ([`attn_append`], which read the queries out of the `[q | gate]` rows into
+/// `q_out`): the flash over the rows' live key counts; the output
+/// projection's input — for a K-quant `attn_output` quantized with each
+/// value multiplied by the sigmoid of its gate, for any other type those
+/// products as f32 rows into the arena's gated rows. The queries stay in
+/// `q_out`.
 fn gated_256(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -918,40 +969,15 @@ fn gated_256(
     m: usize,
 ) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::gated_256";
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let (gpu, k) = (c.gpu, c.k);
     let q35 = k.q35(WHAT)?;
     let stream = gpu.stream();
     let d = s.dims;
     let i = s.col(m)?;
     let q_out = s
         .q_out
-        .as_mut()
+        .as_ref()
         .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
-    // SAFETY: the layer program embeds consecutive positions before attention;
-    // saturation is outside the cache. Each call uses one sequence's row window
-    // and its own cache planes, not the combined positions of different slots.
-    unsafe {
-        kv.append_256(
-            &k.neox,
-            stream,
-            Append256 {
-                qg: &s.q,
-                q: q_out,
-                k: &mut s.k,
-                v: &s.v,
-                gq: f32_gain(w, &n.attn_q_norm)?,
-                gk: f32_gain(w, &n.attn_k_norm)?,
-                table: c.table,
-                pos: &s.pos,
-                eps: c.eps,
-                n_head: d.n_head,
-                n_kv: d.n_kv,
-                ctx: d.ctx,
-                m,
-                fault: c.sink,
-            },
-        )
-    }?;
     kv.flash_256(
         &k.flash,
         stream,
