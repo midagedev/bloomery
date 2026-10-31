@@ -10,6 +10,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The API**: `/v1/chat/completions`, `/completion`, streaming, tool calls, `reasoning_content`,
   `cache_prompt`, `/apply-template`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
   and llama-server tutorials apply as they are.
+- **Compressed request bodies**: a body sent with `Content-Encoding: gzip` (or `x-gzip`) or `deflate` (a zlib
+  stream) is read as the bytes it decodes to. The 64 MiB body limit holds for the bytes sent and again for the decoded
+  body. A body that does not decode, or carries bytes past its stream, is a 400 `invalid_request_error`. Any other
+  coding (`br`, `zstd`), or a list of two or more, is a 415 whose `Accept-Encoding` header names `gzip, deflate`, sent
+  before the body when the client waits for `100 Continue`. A request with no body is read as sent.
 - **Model lookup**: `GET /v1/models/{model}` (and `/models/{model}`) answers the one `/v1/models` entry of that name.
   URL names are percent-decoded once with literal `+` preserved; invalid encoding is a 400 `invalid_request_error`.
   JSON names in `/api/show` are matched literally.

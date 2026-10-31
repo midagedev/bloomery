@@ -22,7 +22,7 @@ workspace = true
 bloomery-decision = { path = "../decision" }
 bloomery-embed = { path = "../embed" }
 # The HTTP layer is std::net on purpose: one slot, one engine mutex, and SSE needs a flush per
-# event. JSON is its only third-party need.
+# event. JSON and the gzip and deflate request bodies are its only third-party needs.
 bloomery-gguf = { path = "../gguf" }
 # The chat-template engine: `ChatTemplate` and `TemplateError` are the jinja crate's, re-exported here.
 bloomery-jinja = { path = "../jinja" }
@@ -38,6 +38,9 @@ bloomery-threads = { path = "../threads" }
 # crate's; an image's cache key is the sha256 of its file bytes.
 bloomery-vision = { path = "../vision" }
 sha2.workspace = true
+# A request body sent with `Content-Encoding: gzip` or `deflate`: the decoder the vision crate's PNG reader
+# already links.
+flate2 = "1.1.10"
 # `preserve_order`: an object keeps the key order it was parsed or built in, as a Python dict
 # does, so a chat template's `tojson` and `.items()` see a request's objects as jinja2 does.
 # `arbitrary_precision`: tool arguments keep JSON numbers outside the f64 range.

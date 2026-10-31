@@ -1478,14 +1478,23 @@ pub(crate) fn keep_alive(
         })() {
             Ok(Some(read)) => read,
             Ok(None) => return,
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                let body = error_body(400, "invalid_request_error", &e.to_string());
+            Err(e) => {
+                let (status, headers) = match e.kind() {
+                    io::ErrorKind::InvalidData => (400, Vec::new()),
+                    // A body's content coding the server does not read.
+                    io::ErrorKind::Unsupported => (
+                        415,
+                        vec![("Accept-Encoding", http::BODY_CODINGS.to_owned())],
+                    ),
+                    _ => return,
+                };
+                let body = error_body(status, "invalid_request_error", &e.to_string());
                 let sent = http::respond(
                     &mut w,
                     &closing(),
-                    400,
+                    status,
                     JSON,
-                    &[],
+                    &headers,
                     body.to_string().as_bytes(),
                 );
                 if sent.is_ok() {
@@ -1493,7 +1502,6 @@ pub(crate) fn keep_alive(
                 }
                 return;
             }
-            Err(_) => return,
         };
         let answered = {
             let _answering = answers.answering();
@@ -7736,6 +7744,168 @@ mod tests {
                     assert!(raw.ends_with("0\r\n\r\n"), "the stream finishes: {raw}");
                 }
             }
+        }
+    }
+
+    /// A body sent gzip or deflate is answered as the bytes it decodes to. A body that does not
+    /// decode, carries bytes past its stream or decodes past the body limit is a 400; another
+    /// coding, or two, is a 415 whose `Accept-Encoding` names the ones the server reads, sent
+    /// before the body is asked for. A request with no body reads as sent.
+    #[test]
+    fn compressed_request_bodies_are_read_decoded() {
+        use crate::http::{MAX_BODY, read_test_response as response};
+        use flate2::Compression;
+        use flate2::write::{GzEncoder, ZlibEncoder};
+        use std::io::{BufReader, Write};
+        use std::net::TcpStream;
+
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let send = |head: &str, body: &[u8]| {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            let (status, head, body) = response(&mut BufReader::new(stream));
+            (
+                status,
+                head,
+                String::from_utf8(body).expect("a UTF-8 answer"),
+            )
+        };
+        let post = |coding: &str, body: &[u8]| {
+            let head = format!(
+                "POST /tokenize HTTP/1.1\r\nConnection: close\r\nContent-Encoding: {coding}\r\n\
+                 Content-Length: {}\r\n\r\n",
+                body.len()
+            );
+            send(&head, body)
+        };
+        let gzip = |b: &[u8]| {
+            let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let deflate = |b: &[u8]| {
+            let mut e = ZlibEncoder::new(Vec::new(), Compression::fast());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+
+        let json = br#"{"content":"hello"}"#;
+        let (status, _, plain) = post("identity", json);
+        assert_eq!(status, 200, "{plain}");
+        for (coding, body) in [
+            ("gzip", gzip(json)),
+            ("X-GZIP", gzip(json)),
+            ("deflate", deflate(json)),
+            ("gzip,, identity", gzip(json)),
+            (
+                "gzip",
+                [gzip(br#"{"content":"#), gzip(br#""hello"}"#)].concat(),
+            ),
+        ] {
+            let (status, _, answer) = post(coding, &body);
+            assert_eq!((status, answer.as_str()), (200, plain.as_str()), "{coding}");
+        }
+        let body = gzip(json);
+        let chunked = [
+            format!("{:x}\r\n", body.len()).as_bytes(),
+            &body,
+            b"\r\n0\r\n\r\n",
+        ]
+        .concat();
+        let (status, _, answer) = send(
+            "POST /tokenize HTTP/1.1\r\nConnection: close\r\nContent-Encoding: gzip\r\n\
+             Transfer-Encoding: chunked\r\n\r\n",
+            &chunked,
+        );
+        assert_eq!((status, answer.as_str()), (200, plain.as_str()), "chunked");
+
+        let stream = deflate(json);
+        let mebibyte = gzip(&vec![0; 1 << 20]);
+        let mut past_deflate = deflate(&vec![0; MAX_BODY + (1 << 20)]);
+        *past_deflate.last_mut().expect("a checksum") ^= 1;
+        let past = |name: &str| {
+            format!(
+                "body too large: the {name} body decodes past the limit of {MAX_BODY} bytes ({} MiB)",
+                MAX_BODY >> 20
+            )
+        };
+        for (coding, body, says) in [
+            (
+                "gzip",
+                json.to_vec(),
+                "the body does not decode as gzip: ".to_owned(),
+            ),
+            (
+                "deflate",
+                stream[..stream.len() - 1].to_vec(),
+                "the body does not decode as deflate: ".to_owned(),
+            ),
+            (
+                "deflate",
+                [&stream[..], b"{}"].concat(),
+                "2 bytes follow the body's deflate stream".to_owned(),
+            ),
+            // A body that decodes to the limit itself is read: the JSON reader refuses its zeros.
+            (
+                "gzip",
+                mebibyte.repeat(MAX_BODY >> 20),
+                "invalid JSON body: ".to_owned(),
+            ),
+            // Decoding stops past the limit, before the bytes that do not decode (a gzip member
+            // that is not one, a deflate checksum that is wrong).
+            (
+                "gzip",
+                [mebibyte.repeat((MAX_BODY >> 20) + 1), b"invalid".to_vec()].concat(),
+                past("gzip"),
+            ),
+            ("deflate", past_deflate, past("deflate")),
+        ] {
+            let (status, _, answer) = post(coding, &body);
+            let v: Value = serde_json::from_str(&answer).expect("an error object");
+            let message = v["error"]["message"].as_str().expect("a message");
+            assert_eq!(status, 400, "{coding}: {answer}");
+            assert!(message.starts_with(&says), "{coding}: {message}");
+        }
+
+        for coding in ["br", "deflate, gzip"] {
+            let (status, head, answer) = send(
+                &format!(
+                    "POST /tokenize HTTP/1.1\r\nContent-Encoding: {coding}\r\n\
+                     Expect: 100-continue\r\nContent-Length: 20\r\n\r\n"
+                ),
+                b"",
+            );
+            assert_eq!(status, 415, "refused before 100 Continue: {head}");
+            assert!(
+                head.contains("\r\nAccept-Encoding: gzip, deflate\r\n"),
+                "{head}"
+            );
+            let v: Value = serde_json::from_str(&answer).expect("an error object");
+            assert_eq!(
+                v["error"]["message"],
+                format!(
+                    "unsupported content-encoding {coding:?}: the server reads a body in one coding, \
+                     gzip, deflate or identity"
+                )
+            );
+        }
+
+        for length in ["", "Content-Length: 0\r\n"] {
+            let (status, _, answer) = send(
+                &format!(
+                    "GET /v1/models HTTP/1.1\r\nConnection: close\r\nContent-Encoding: br\r\n\
+                     {length}\r\n"
+                ),
+                b"",
+            );
+            assert_eq!(status, 200, "{length:?}: {answer}");
         }
     }
 

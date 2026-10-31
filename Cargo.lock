@@ -547,6 +547,7 @@ dependencies = [
  "bloomery-threads",
  "bloomery-tokenizer",
  "bloomery-vision",
+ "flate2",
  "libc",
  "png",
  "serde",

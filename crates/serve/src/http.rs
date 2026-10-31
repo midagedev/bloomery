@@ -1,5 +1,6 @@
 //! A minimal HTTP/1.1 server over `std::net`: one thread per connection,
-//! keep-alive, `Content-Length` and chunked request bodies, `Expect: 100-continue`,
+//! keep-alive, `Content-Length` and chunked request bodies, gzip and deflate
+//! request bodies (`Content-Encoding`), `Expect: 100-continue`,
 //! fixed-length responses, and streamed responses that are flushed per event
 //! (chunked on HTTP/1.1, raw until close on HTTP/1.0).
 
@@ -7,12 +8,17 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 
+use flate2::bufread::{MultiGzDecoder, ZlibDecoder};
+
 use crate::admit::Lease;
 use crate::api::relock;
 
 const MAX_LINE: usize = 16 * 1024;
 const MAX_HEADERS: usize = 100;
 pub(crate) const MAX_BODY: usize = 64 * 1024 * 1024;
+/// The content codings a request body is read in besides `identity`, as `Accept-Encoding` lists
+/// them on the refusal of another.
+pub(crate) const BODY_CODINGS: &str = "gzip, deflate";
 
 /// One parsed request.
 pub(crate) struct Request {
@@ -248,6 +254,12 @@ pub(crate) fn read_body(
     {
         return Err(too_large(len));
     }
+    // A content coding describes a body; a request that frames none reads as sent.
+    let coding = if chunked || length.is_some_and(|len| len > 0) {
+        content_coding(req)?
+    } else {
+        None
+    };
     if req
         .header("expect")
         .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
@@ -262,7 +274,84 @@ pub(crate) fn read_body(
         read_framed(r, &mut body)?;
         req.body = body;
     }
+    if let Some(coding) = coding {
+        req.body = decode(coding, &req.body)?;
+    }
     Ok(())
+}
+
+/// A content coding a request body is read in.
+#[derive(Clone, Copy)]
+enum Coding {
+    /// `gzip` (or `x-gzip`): one or more gzip members.
+    Gzip,
+    /// `deflate`: a zlib stream.
+    Deflate,
+}
+
+/// The coding `Content-Encoding` names over all its lines; `identity` and empty list elements are
+/// none. Another coding, or a list of codings applied one after another, is refused as
+/// `Unsupported` (a 415 that names [`BODY_CODINGS`]) before the body is read: one decode bounds a
+/// request's work by the body limit.
+fn content_coding(req: &Request) -> io::Result<Option<Coding>> {
+    let named: Vec<&str> = req
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|c| c.trim_matches([' ', '\t']))
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
+        .collect();
+    match named[..] {
+        [] => Ok(None),
+        [c] if c.eq_ignore_ascii_case("gzip") || c.eq_ignore_ascii_case("x-gzip") => {
+            Ok(Some(Coding::Gzip))
+        }
+        [c] if c.eq_ignore_ascii_case("deflate") => Ok(Some(Coding::Deflate)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "unsupported content-encoding {:?}: the server reads a body in one coding, {BODY_CODINGS} or identity",
+                named.join(", ")
+            ),
+        )),
+    }
+}
+
+/// `body` decoded from `coding`. A body that does not decode, decodes past `MAX_BODY` or carries
+/// bytes past its stream is refused by name; decoding stops one byte past the limit.
+fn decode(coding: Coding, body: &[u8]) -> io::Result<Vec<u8>> {
+    let limit = MAX_BODY as u64 + 1;
+    let mut rest = body;
+    let mut decoded = Vec::new();
+    let (name, read) = match coding {
+        Coding::Gzip => (
+            "gzip",
+            MultiGzDecoder::new(&mut rest)
+                .take(limit)
+                .read_to_end(&mut decoded),
+        ),
+        Coding::Deflate => (
+            "deflate",
+            ZlibDecoder::new(&mut rest)
+                .take(limit)
+                .read_to_end(&mut decoded),
+        ),
+    };
+    read.map_err(|e| bad(&format!("the body does not decode as {name}: {e}")))?;
+    if decoded.len() > MAX_BODY {
+        return Err(bad(&format!(
+            "body too large: the {name} body decodes past the limit of {MAX_BODY} bytes ({} MiB)",
+            MAX_BODY >> 20
+        )));
+    }
+    if !rest.is_empty() {
+        return Err(bad(&format!(
+            "{} bytes follow the body's {name} stream",
+            rest.len()
+        )));
+    }
+    Ok(decoded)
 }
 
 /// The body length a request declares: `None` without `Content-Length`. A value that is not
@@ -350,6 +439,7 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
