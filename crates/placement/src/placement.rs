@@ -70,8 +70,8 @@ pub use pool::{PoolNeed, plan_in_pool};
 pub use refusal::{CardFreeFloor, PlacementError, Violation};
 pub use room::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, RowTableSource, STEP_PORT_COLUMNS,
-    UNION_BATCH_IDS, WholeLoad, WholeNeed, arena_slots, arena_window_bytes, expert_nvme_tier,
-    host_room_given, nvme_arena_of, row_room, row_table_tier, whole_need,
+    UNION_BATCH_IDS, WholeLoad, WholeNeed, arena_part_bytes, arena_slots, arena_window_bytes,
+    expert_nvme_tier, host_room_given, nvme_arena_of, row_room, row_table_tier, whole_need,
 };
 pub use rule::{
     ExpertPart, HostOnly, LegPair, RoutedFormat, RoutedRule, per_expert, routed_row, routed_row_on,

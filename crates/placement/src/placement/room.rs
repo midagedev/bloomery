@@ -3,7 +3,7 @@ use std::fmt;
 use gguf::GgmlType;
 
 use super::Role;
-use super::machine::{Card, Device, ExpertList, Format, Heap, ModelTensors};
+use super::machine::{Card, Device, ExpertList, Format, Heap, ModelTensor, ModelTensors};
 use super::refusal::PlacementError;
 use super::rule::{card_buffers, per_expert, row_bytes, rows_of};
 use super::table::{Plan, Row, Segment};
@@ -470,6 +470,38 @@ pub fn arena_window_bytes(len: u64) -> u64 {
     (len + 2 * ARENA_ALIGN).div_ceil(ARENA_ALIGN) * ARENA_ALIGN
 }
 
+/// The bytes one expert's part takes in an arena slot: a window
+/// ([`arena_window_bytes`]) for each run its fill reads, `codes` bytes and,
+/// for a matrix kept as two planes, `scales` bytes of block scales (0 for a
+/// part of one run), whose read lands in a window of its own before the fill
+/// moves it to follow the codes. The one shape of a part's place in a slot,
+/// which the arena carves and its floor counts.
+#[must_use]
+pub fn arena_part_bytes(codes: u64, scales: u64) -> u64 {
+    let scales = if scales == 0 {
+        0
+    } else {
+        arena_window_bytes(scales)
+    };
+    arena_window_bytes(codes) + scales
+}
+
+/// The runs one expert of routed stack `t`, `per` bytes, is filled from,
+/// `(codes, scales)`: NVFP4 rows ([`GgmlType::NVFP4_ROWS`]), which a
+/// checkpoint folder keeps as two planes a matrix, its codes (8 of a group's
+/// 9 bytes) and its block scales (the ninth); one run of `per` bytes, `(per,
+/// 0)`, for every other type. NVFP4 rows a file keeps in one run are counted
+/// at the two planes' windows, the larger.
+fn stored_planes(t: &ModelTensor, per: u64) -> (u64, u64) {
+    match (t.ty, t.ty.type_size()) {
+        (GgmlType::NVFP4_ROWS, Some(group)) => {
+            let scales = per / group;
+            (per - scales, scales)
+        }
+        _ => (per, 0),
+    }
+}
+
 /// The NVMe tier arena's floor: the slots a paged layer needs so that one
 /// call reads every distinct id it names from its own slot while the lane's
 /// pins and claim beside it take others — the call's `k × columns` ids and
@@ -490,7 +522,7 @@ pub struct ArenaFloor {
     /// run), else none.
     pub lane_slots: u64,
     /// One slot of every layer the host leg serves routed experts of, each
-    /// part in its window ([`arena_window_bytes`]).
+    /// part in its windows ([`arena_part_bytes`]).
     pub slot_set: u64,
     /// The slots a prompt union run in batches holds at once: two batches
     /// ([`UNION_BATCH_IDS`]) and the lane's slots ([`ARENA_LANE_SLOTS`],
@@ -558,8 +590,9 @@ impl ArenaFloor {
                 continue;
             }
             let (_, per) = per_expert(t, model.experts_of(t))?;
+            let (codes, scales) = stored_planes(t, per);
             slot_set = slot_set
-                .checked_add(arena_window_bytes(per))
+                .checked_add(arena_part_bytes(codes, scales))
                 .ok_or_else(|| PlacementError::tensor(t, "the arena's slot set passes u64"))?;
         }
         let lane_slots = if plan.n_l.iter().any(|&n| n > 0) {

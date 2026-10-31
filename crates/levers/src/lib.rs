@@ -1624,10 +1624,6 @@ pub enum ResidencyWhy {
     /// raised from `from` to `to`, the first count whose churn pool fits the
     /// host ([`Room::MovedForPool`]).
     PoolShrunk { from: usize, to: usize },
-    /// Unset, on a plan that pages NVFP4 rows routed stacks to the NVMe tier:
-    /// the machine's source stages such an expert from its two plane runs,
-    /// which the tier's arena does not serve ([`residency_beside_paged_planes`]).
-    NvmePlanes,
     /// Unset, on a load that hosts its pool: no count the card slots hold
     /// has a churn pool that fits the host ([`PoolUnhostable`]).
     PoolUnhostable(PoolUnhostable),
@@ -1650,7 +1646,6 @@ impl ResidencyWhy {
             ResidencyWhy::NoRoom { .. } => "no_room",
             ResidencyWhy::Unhosted(_) => "pool_unhosted",
             ResidencyWhy::PoolShrunk { .. } => "pool_shrunk",
-            ResidencyWhy::NvmePlanes => "nvme_planes",
             ResidencyWhy::PoolUnhostable(_) => "pool_unhostable",
         }
     }
@@ -1678,11 +1673,6 @@ impl ResidencyWhy {
             ResidencyWhy::PoolShrunk { from, to } => Some(format!(
                 "unset: p{from}→p{to} (host: the churn pool did not fit, raised)"
             )),
-            ResidencyWhy::NvmePlanes => Some(
-                "unset: the plan pages NVFP4 rows routed stacks to the NVMe tier, whose arena does \
-                 not serve the machine an NVFP4 rows expert's two plane runs"
-                    .to_string(),
-            ),
             ResidencyWhy::PoolUnhostable(pool) => Some(pool.to_string()),
             ResidencyWhy::Set
             | ResidencyWhy::Place
@@ -2118,29 +2108,6 @@ pub fn residency_at_plan<E>(
             },
         },
     )
-}
-
-/// [`RESIDENCY`] unset on a plan that pages routed experts to the NVMe tier
-/// while a routed stack of its model is NVFP4 rows a checkpoint folder keeps
-/// as two plane runs a matrix (`pages_planes`): `off` with why
-/// [`ResidencyWhy::NvmePlanes`] where `pick` runs the machine
-/// (`ResidencyWhy::Place` under a `mid-p<P>-s<S>` word), for the machine's
-/// source stages such an expert from its two plane runs and the tier's arena
-/// holds an expert's file run whole, and a default the user did not set never
-/// refuses the load. Before [`residency_at_plan`], which passes the `off` on.
-/// A set word and every other why pass through untouched: the load refuses a
-/// set machine word beside that tier by name.
-#[must_use]
-pub fn residency_beside_paged_planes(pick: ResidencyPick, pages_planes: bool) -> ResidencyPick {
-    let runs = pick.why == ResidencyWhy::Place
-        && matches!(residency_word(pick.word), Some(ResidencyWord::Mid { .. }));
-    if runs && pages_planes {
-        return ResidencyPick {
-            word: "off",
-            why: ResidencyWhy::NvmePlanes,
-        };
-    }
-    pick
 }
 
 /// The slots a layer the Qwen3.8 unset word frees for flips in flight.

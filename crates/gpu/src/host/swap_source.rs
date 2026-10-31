@@ -23,7 +23,8 @@
 //!
 //! **The arena.** On a paged plan ([`NvTier`]) an id the arena holds filled
 //! is read from its slot, part by part, the bytes the arena's fill wrote —
-//! the file's — while the lane's open read pins it ([`NvTier::open_read`]);
+//! the file's, a planes matrix's codes then its block scales — while the
+//! lane's open read pins it ([`NvTier::open_read`]);
 //! a part the sidecar holds still reads the sidecar, whose bytes are not the
 //! arena's, and an id unfilled when the lane opens it reads the file's
 //! mapping. An id the card then holds gives its slot back when its flip
@@ -824,13 +825,6 @@ impl FileSwap {
     /// drops would take from under the host ([`NvTier::refuse_held_pages`]).
     pub fn attach_tier(&self, tier: &Arc<NvTier>) -> Result<(), GpuError> {
         const WHAT: &str = "FileSwap::attach_tier";
-        if self.located() {
-            return Err(GpuError::shape(
-                WHAT,
-                "an NVMe tier over NVFP4 rows a checkpoint folder locates: the arena holds an \
-                 expert's file run whole, a planes expert stages from its matrices' two runs",
-            ));
-        }
         if !tier.drops_reach(self.pair.split()) {
             return Err(GpuError::shape(
                 WHAT,
@@ -855,16 +849,6 @@ impl FileSwap {
     #[must_use]
     pub fn unpacks(&self) -> bool {
         self.convert.is_some()
-    }
-
-    /// Whether a layer stages a plane from the matrices a checkpoint folder
-    /// locates ([`Nvfp4From::Plane`]), not from one run of the file.
-    fn located(&self) -> bool {
-        self.layers.iter().flatten().any(|p| {
-            p.of.iter().any(|&(stack, plane)| {
-                plane != Plane::Whole && p.tensors[stack].ty != GgmlType::NVFP4
-            })
-        })
     }
 
     /// Part `part` of layer `layer`'s expert `id` as a static load uploads it
@@ -967,6 +951,55 @@ impl FileSwap {
         })
     }
 
+    /// Stack `t`'s bytes of layer `layer`'s expert `id` in the arena's slot,
+    /// when the arena serves the id and the lane's open read found it filled
+    /// ([`NvTier::staged_slot`]); `None` when the mapping serves it.
+    fn slot_of(&self, layer: usize, id: u32, t: &ModelTensor) -> Result<Option<&[u8]>, GpuError> {
+        match self.tier_serving(layer, id) {
+            Some(tier) => tier.staged_slot(layer, id, &t.name),
+            None => Ok(None),
+        }
+    }
+
+    /// Matrix `id` of the stack `t` a checkpoint folder locates, its codes
+    /// and its block scales: the arena's slot when it holds the id filled
+    /// under the lane's open read (the codes, then the scales the fill moved
+    /// after them), else where the folder keeps them
+    /// ([`gguf::Split::matrix`]). A slot of another length is refused by
+    /// name as `what`'s.
+    fn matrix(
+        &self,
+        what: &'static str,
+        layer: usize,
+        id: u32,
+        t: &ModelTensor,
+    ) -> Result<(&[u8], &[u8]), GpuError> {
+        let m = self
+            .pair
+            .source()
+            .split()
+            .matrix(&t.name, id as usize)
+            .map_err(|e| GpuError::plan(what, e))?;
+        let Some(slot) = self.slot_of(layer, id, t)? else {
+            return Ok((m.codes, m.block_scales));
+        };
+        slot.split_at_checked(m.codes.len())
+            .filter(|(_, scales)| scales.len() == m.block_scales.len())
+            .ok_or_else(|| {
+                GpuError::shape(
+                    what,
+                    format!(
+                        "layer {layer} expert {id}: its slot holds {} bytes of {}, the matrix is \
+                         {} + {}",
+                        slot.len(),
+                        t.name,
+                        m.codes.len(),
+                        m.block_scales.len()
+                    ),
+                )
+            })
+    }
+
     fn layer(&self, layer: usize, what: &'static str) -> Result<&LayerParts, GpuError> {
         layer
             .checked_sub(self.first)
@@ -1012,8 +1045,7 @@ impl FileSwap {
         // file's. The sidecar's bytes are not the arena's, so its parts read
         // the sidecar as they always did.
         if side.is_none()
-            && let Some(tier) = self.tier_serving(layer, id)
-            && let Some(bytes) = tier.staged_slot(layer, id, &t.name)?
+            && let Some(bytes) = self.slot_of(layer, id, t)?
         {
             if bytes.len() != per {
                 return Err(GpuError::shape(
@@ -1054,8 +1086,9 @@ impl SwapSource for FileSwap {
             .map_or(&[], |p| p.parts.as_slice())
     }
 
-    /// A plane of NVFP4 rows reads the folder's matrix where it keeps it
-    /// (`gguf::Split::matrix`) — its codes or its block scales — a plane of
+    /// A plane of NVFP4 rows reads the folder's matrix ([`FileSwap::matrix`]:
+    /// the arena's slot, or where the folder keeps it) — its codes or its
+    /// block scales — a plane of
     /// GGUF's NVFP4 blocks the expert's run of them ([`FileSwap::run`]), and a
     /// tensor scale the one the header or the stack's `.scale` holds, each
     /// with the transform that makes it the card plane's bytes ([`Plane`]); a
@@ -1085,16 +1118,11 @@ impl SwapSource for FileSwap {
                 }
             }
             Plane::Codes | Plane::BlockScales => {
-                let m = self
-                    .pair
-                    .source()
-                    .split()
-                    .matrix(&t.name, id as usize)
-                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                let (codes, block_scales) = self.matrix(WHAT, layer, id, t)?;
                 let from = Nvfp4From::Plane;
                 match plane {
-                    Plane::Codes => (Some(m.codes), Transform::Nvfp4Codes(from)),
-                    _ => (Some(m.block_scales), Transform::Ue4m3Scales(from)),
+                    Plane::Codes => (Some(codes), Transform::Nvfp4Codes(from)),
+                    _ => (Some(block_scales), Transform::Ue4m3Scales(from)),
                 }
             }
         };

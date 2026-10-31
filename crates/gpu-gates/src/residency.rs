@@ -7,18 +7,14 @@
 //! plan are these five: the card experts a layer, the experts the plan leaves
 //! on the host, the churn pool's bytes at a pinned count, the host headroom and
 //! what the host's room leaves past the plan's host need (the reading less the
-//! drift margin, [`PlanRoom::mem_left`]). The pair rule also reads whether the
-//! plan pages NVFP4 planes ([`PlanRoom::pages_planes`]).
+//! drift margin, [`PlanRoom::mem_left`]).
 
 use crate::GateError;
 use crate::record::ClimbRead;
-use bloomery_levers::{
-    ResidencyPick, UnhostedPool, residency_at_plan, residency_beside_paged_planes,
-};
-use gguf::GgmlType;
+use bloomery_levers::{ResidencyPick, UnhostedPool, residency_at_plan};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, HostRead, host_available_read};
-use model::placement::{PlacementError, Plan, Role};
+use model::placement::{PlacementError, Plan};
 
 /// `plan`'s room for the churn pool of card `card`'s experts, with `beside`
 /// bytes the load hosts outside the plan (a draft layer's experts; 0 for a
@@ -91,24 +87,6 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
     pub fn pool_bytes(&self, pinned: usize) -> Result<u64, PlacementError> {
         ChurnPool::of(self.plan, self.card, pinned).map(|pool| pool.bytes)
     }
-
-    /// The plan pages routed experts to the NVMe tier
-    /// ([`HostTotals::nvme_expert_bytes`](model::placement::HostTotals::nvme_expert_bytes),
-    /// the load's tier then built) while a routed stack of its model is NVFP4
-    /// rows, which a checkpoint folder keeps as two plane runs a matrix and
-    /// the card loads in NVFP4 planes: the pair the machine's source refuses
-    /// beside the tier. GGUF's NVFP4 blocks stage from the expert's one run,
-    /// which the arena holds.
-    #[must_use]
-    pub fn pages_planes(&self) -> bool {
-        self.plan.host.nvme_expert_bytes > 0
-            && self
-                .plan
-                .model
-                .tensors
-                .iter()
-                .any(|t| t.role == Role::RoutedExperts && t.ty == GgmlType::NVFP4_ROWS)
-    }
 }
 
 /// `BLOOMERY_RESIDENCY` against `plan` on the pair rule
@@ -116,9 +94,7 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
 /// the plan has not yet seen, which the plan's card slots, host experts, host
 /// headroom and the host's room then keep, move or turn `off` with why, on every body (an
 /// unset word never asks for its pool unhosted; `carry` is the loading body's
-/// `ChainBody::UNHOSTED_POOL`, a value, so this module reaches no body), and
-/// which a plan that pages NVFP4 planes turns `off` first
-/// ([`residency_beside_paged_planes`], [`PlanRoom::pages_planes`]). The
+/// `ChainBody::UNHOSTED_POOL`, a value, so this module reaches no body). The
 /// churn pool's bytes are card `card`'s.
 pub fn at_plan(
     carry: UnhostedPool,
@@ -127,7 +103,6 @@ pub fn at_plan(
     pick: ResidencyPick,
 ) -> Result<ResidencyPick, GateError> {
     let room = PlanRoom::new(plan, card, 0);
-    let pick = residency_beside_paged_planes(pick, room.pages_planes());
     Ok(residency_at_plan(
         carry,
         pick,
