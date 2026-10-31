@@ -615,12 +615,17 @@ mod tests {
 
     /// The fixture layout's plan inputs, read as the three plan gates do.
     fn fixture_inputs(tag: &str) -> super::super::place::PlanInputs {
+        geo_inputs(&FIXTURE, tag)
+    }
+
+    /// `geo`'s plan inputs, read as the three plan gates do.
+    fn geo_inputs(geo: &Geo, tag: &str) -> super::super::place::PlanInputs {
         let path = header_typed(
             tag,
             "nemotron_h_moe",
-            &FIXTURE.keys(),
+            &geo.keys(),
             &[("tokenizer.ggml.pre", V::Str("pixtral"))],
-            &FIXTURE.tensors(),
+            &geo.tensors(),
         );
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let _ = std::fs::remove_file(&path);
@@ -660,6 +665,62 @@ mod tests {
             "{} experts with the reserve, {} without",
             kept.cards[0].experts,
             unreserved.cards[0].experts
+        );
+    }
+
+    /// A host room under the host need pages the host experts it cannot hold on the NVMe expert
+    /// tier ([`crate::placement::expert_nvme_tier`]): a layer's up and down stacks alike, the host
+    /// keeping the rest; a room past the need pages none. FAIL-first: the hybrid plan read no room
+    /// and kept every host expert in RAM.
+    #[test]
+    fn a_room_under_the_host_need_pages_experts_on_the_nvme_tier() {
+        use crate::placement::workstation::{self, HostNeed, HostRead};
+        use crate::placement::{Device, PlanLevers};
+        const PAGED: Geo = Geo {
+            kinds: &['m', 'e', 'a', 'e', 'e', 'e', 'e', 'e'],
+            shapes: &[(496, 256); 6],
+            ..FIXTURE
+        };
+        let mut inputs = geo_inputs(&PAGED, "nhm-paged");
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let levers = PlanLevers::default();
+        inputs.room = (u64::MAX, HostRead::Given);
+        let whole = inputs
+            .plan_with(&machine, 4, &levers, Experts::Host)
+            .unwrap_or_else(|e| panic!("the host arm is refused: {e}"));
+        assert_eq!(
+            whole.host.nvme_expert_bytes, 0,
+            "a room past the need pages none"
+        );
+        let held = whole.host.expert_bytes;
+        let layer = held / 6;
+        inputs.room = (HostNeed::of(&whole, 0).bytes() - layer, HostRead::Given);
+        let plan = inputs
+            .plan_with(&machine, 4, &levers, Experts::Host)
+            .unwrap_or_else(|e| panic!("a room a layer short is refused: {e}"));
+        assert!(
+            plan.host.nvme_expert_bytes > 0,
+            "a room a layer short pages none"
+        );
+        assert_eq!(plan.host.expert_bytes + plan.host.nvme_expert_bytes, held);
+        let paged: Vec<&str> = plan
+            .rows
+            .iter()
+            .filter(|r| r.segments.iter().any(|s| s.device == Device::Nvme))
+            .map(|r| inputs.model.tensors[r.tensor].name.as_str())
+            .collect();
+        assert!(
+            !paged.is_empty()
+                && paged.iter().all(|n| {
+                    let up = n.ends_with(names::FFN_UP_EXPS);
+                    let twin = if up {
+                        n.replace(names::FFN_UP_EXPS, names::FFN_DOWN_EXPS)
+                    } else {
+                        n.replace(names::FFN_DOWN_EXPS, names::FFN_UP_EXPS)
+                    };
+                    (up || n.ends_with(names::FFN_DOWN_EXPS)) && paged.contains(&twin.as_str())
+                }),
+            "{paged:?}"
         );
     }
 

@@ -28,12 +28,7 @@ pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
 pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
     let hp = Hparams::read(split)?;
     let read = spec::read(split)?;
-    Ok(PlanInputs {
-        model: read.tensors,
-        spec: read.spec,
-        kv: kv_layout(&hp),
-        prompt_reserve: 0,
-    })
+    PlanInputs::new(read.tensors, read.spec, kv_layout(&hp), 0)
 }
 
 /// The store each layer of `hp` holds: a Mamba-2 layer its scan, an attention

@@ -2795,9 +2795,7 @@ impl Q38 {
         // `generate_qwen3moe` prints, at load — the arena's budget, the
         // paged bytes and the counters (all zero this early). A load that
         // attached no tier prints nothing, as the CLI's honest absence.
-        if let Some(r) = record::nvtier_of(m.body(WHAT)?.nvme_tier().map(|t| &**t)) {
-            r.eprint();
-        }
+        record::eprint_nvtier(m.body(WHAT)?.nvme_tier());
         for h in threads::helper::helpers() {
             record::helper(
                 &h.name,
@@ -3166,9 +3164,7 @@ impl Q38 {
             )
             .eprint();
         self.census = Some(now);
-        if let Some(r) = record::nvtier_of(b.nvme_tier().map(|t| &**t)) {
-            r.eprint();
-        }
+        record::eprint_nvtier(b.nvme_tier());
         Ok(())
     }
 }

@@ -51,7 +51,8 @@ fast card set — see [Which coding agent](docs/agents.md#which-coding-agent).
   RAM, and the engine moves the experts it calls most onto the card while it runs. bloomery serves Muse Spark Open
   816B-A42B (225.6 GB of weights) and MiniMax-M3.1-Flash (250.1 GB, or 143.9 GB as Unsloth's 2-bit GGUF) on two cards
   with 72 GB between them. When the RAM
-  cannot hold the host's share either, Qwen3.8, GLM-5.3-Flash and DeepSeek-V4.1-Flash page the rest from NVMe.
+  cannot hold the host's share either, Qwen3.8, GLM-5.3-Flash, DeepSeek-V4.1-Flash and the Nemotron-3.5 MoE models
+  page the rest from NVMe.
 - **Checkpoint folders as downloaded.** MiniMax-M3.1-Flash loads from its vendor's NVFP4 safetensors folder, and
   Qwen3.8 from its NVFP4 or FP4-Local folder, with no conversion and no requant. Everything else loads from GGUF.
 - **Apple Silicon.** A Metal backend serves Qwen3.6-35B-A3B and Qwen3-30B-A3B on a Mac GPU. The verified path is

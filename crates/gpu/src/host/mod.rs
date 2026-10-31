@@ -1017,6 +1017,13 @@ impl<H> HostTier<H> {
 }
 
 impl HostTier<run::HostRun> {
+    /// The NVMe expert tier's arena the host run reads, on a load whose plan
+    /// paged routed experts ([`run::HostRun::tier`]); `None` otherwise.
+    #[must_use]
+    pub fn nvme_tier(&self) -> Option<&Arc<nvtier::NvTier>> {
+        self.experts.tier()
+    }
+
     /// Attach the step port's card leg over the NVMe tier's arena
     /// ([`arena_leg::ArenaLeg`]) on `gpu`, the stage card the chain runs on:
     /// on a load whose host run has an arena the card addresses, whose page

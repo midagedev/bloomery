@@ -84,10 +84,12 @@
 //! slot's), the `parallel` line (`rule=slots slots=1 slot_ctx=C total=C
 //! from=<word> pass=one`); then the `load` record (architecture, resident
 //! bytes, the slot's context, slots, layers, the step graph's nodes and the
-//! load's wall) and, once the port is bound, the `listening` record
-//! (`record::BLOOMERY_SERVE_NEMOTRON`). `--plan` ends the process after the
-//! `parallel` line, nothing loaded. An engine error ends the process with the
-//! crash block and exit code 70, as every seat's.
+//! load's wall), on a placed load whose plan paged routed experts the
+//! `nvtier` record (the arena's budget, the paged bytes and its counters),
+//! at load and again after each prompt call, and, once the port is bound,
+//! the `listening` record (`record::BLOOMERY_SERVE_NEMOTRON`). `--plan` ends
+//! the process after the `parallel` line, nothing loaded. An engine error ends
+//! the process with the crash block and exit code 70, as every seat's.
 //!
 //! The levers this seat acts on ([`ACTS_ON`]) are parsed once, at `main`
 //! (`bloomery_levers::at_main`), which refuses by name a lever set outside
@@ -100,7 +102,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bloomery_gpu::folder::Model;
-use bloomery_gpu::host::served::prompt_pass;
+use bloomery_gpu::host::served::{TierBody, prompt_pass};
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
 use bloomery_gpu_gates::beside::{self, Beside};
@@ -278,13 +280,22 @@ fn prefill_nano(m: &mut NemotronHModel, ids: &[u32]) -> Result<u32, GpuError> {
 /// ([`prompt_pass`]: a placed load's passes run through the tier's batch
 /// port; a whole-card load has no tier and the call adds nothing).
 fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError> {
-    prompt_pass(m, |m| {
+    let next = prompt_pass(m, |m| {
         if ids.len() > 1 {
             m.prefill(ids)
         } else {
             m.step(ids)
         }
-    })
+    })?;
+    print_nvtier(m)?;
+    Ok(next)
+}
+
+/// The load's cumulative `nvtier` record on stderr, on a placed load whose
+/// plan paged routed experts; nothing on any other load.
+fn print_nvtier(m: &NemotronHMoeModel) -> Result<(), GpuError> {
+    record::eprint_nvtier(m.body(NAME)?.placed().and_then(|p| p.hybrid().nvme_tier()));
+    Ok(())
 }
 
 /// The split a whole-card load opens: a checkpoint folder has no whole-card open, its card
@@ -555,7 +566,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             SeatEngine::spawn(
                 move || {
                     let ctx = open.ctx;
-                    Nemotron::open(open, |file| seat.open(file, ctx), prefill_bolt)
+                    let n = Nemotron::open(open, |file| seat.open(file, ctx), prefill_bolt)?;
+                    print_nvtier(&n.m)?;
+                    Ok(n)
                 },
                 slot_ctx,
                 vocab,

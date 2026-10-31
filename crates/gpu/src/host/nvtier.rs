@@ -109,12 +109,15 @@ use std::time::{Duration, Instant};
 
 use bloomery_levers::NvTierEvict;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
-use gguf::{Split, StackLayout};
+use gguf::Split;
 use model::moe::{Claim, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin, TierSlots};
-use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
+use model::placement::host_lock::{HostFile, HostSet, PageDrop, expert_runs, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::workstation::ArenaGrant;
-use model::placement::{ARENA_ALIGN, ArenaFloor, Device, Plan, Role, arena_part_bytes};
+use model::placement::{
+    ARENA_ALIGN, ArenaFloor, Device, ModelTensor, Plan, Role, arena_part_bytes,
+};
+use model::r8file::R8Source;
 
 use super::arena_leg::LegOff;
 use crate::GpuError;
@@ -369,99 +372,61 @@ struct Run {
     len: usize,
 }
 
-/// Each of the `n` experts' runs of routed stack `name` in `split`, `(codes,
-/// scales)`: a stack a checkpoint folder locates ([`gguf::Place::Stack`])
-/// reads each matrix where the folder keeps it, its codes and, kept as two
-/// planes, its block scales, each in its own shard; every other stack is one
-/// run of its file ([`gguf::Split::run`]) its experts cut evenly. Refused by
-/// name: a stack the split does not hold, an expert count other than `n`,
-/// bytes the experts do not cut evenly, and a stack no file holds (a made
-/// one).
-fn stack_runs(split: &Split, name: &str, n: usize) -> Result<Vec<(Run, Option<Run>)>, GpuError> {
+/// Each of the `n` experts' runs of routed stack `t` in `split`, `(codes, scales)`, where the
+/// host reads them ([`expert_runs`]): a stack a checkpoint folder locates
+/// ([`gguf::Place::Stack`]) reads each matrix where the folder keeps it, its codes and, kept as
+/// two planes, its block scales, each in its own shard; every other stack is one run of its file
+/// its experts cut evenly. Refused by name besides the runs' own refusals (a stack the split does
+/// not hold, an expert count other than `n`, bytes the experts do not cut evenly): a stack no
+/// file holds (a made one) and a located stack of another matrix count.
+fn stack_runs(split: &Split, t: &ModelTensor, n: u32) -> Result<Vec<(Run, Option<Run>)>, GpuError> {
     const WHAT: &str = "NvTier::of_paged";
-    let (_, info) = split
-        .find(name)
-        .ok_or(GpuError::shape(WHAT, format!("{name}: not in the split")))?;
-    let Some(&stack) = info.dims.last() else {
-        return Err(GpuError::shape(
-            WHAT,
-            format!("{name}: no expert count in its dims"),
-        ));
-    };
-    if stack as usize != n {
-        return Err(GpuError::shape(
-            WHAT,
-            format!("{name}: {stack} experts, the model has {n}"),
-        ));
-    }
-    let bytes = |b: u64| {
-        usize::try_from(b)
-            .map_err(|_| GpuError::shape(WHAT, format!("{name}: one expert's bytes pass usize")))
-    };
-    if let Some(gguf::Place::Stack {
-        codes_in,
-        codes_at,
-        scales_in,
-        scales_at,
-        codes_per,
-        scales_per,
-        layout,
-        ..
-    }) = split.place(name)
-    {
-        if codes_at.len() != n {
+    let name = &t.name;
+    match split.place(name) {
+        Some(gguf::Place::Made) => {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "{name}: {} matrices, the model has {n} experts",
+                    "{name}: no file holds it, and the NVMe arena reads a stack where a file keeps it"
+                ),
+            ));
+        }
+        Some(gguf::Place::Stack { codes_at, .. }) if codes_at.len() != n as usize => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{name}: {} matrices, the layer has {n} experts",
                     codes_at.len()
                 ),
             ));
         }
-        let (codes_per, scales_per) = (bytes(*codes_per)?, bytes(*scales_per)?);
-        let planes = *layout == StackLayout::Planes;
-        return Ok((0..n)
-            .map(|e| {
-                let codes = Run {
-                    shard: codes_in[e],
-                    at: codes_at[e],
-                    len: codes_per,
-                };
-                let scales = planes.then(|| Run {
-                    shard: scales_in[e],
-                    at: scales_at[e],
-                    len: scales_per,
-                });
-                (codes, scales)
-            })
-            .collect());
+        _ => {}
     }
-    let per = bytes(info.nbytes / stack)?;
-    if per * n != info.nbytes as usize {
-        return Err(GpuError::shape(
+    let run = |(file, at): (HostFile, Range<u64>)| match file {
+        HostFile::Shard(shard) => Ok(Run {
+            shard,
+            at: at.start,
+            len: usize::try_from(at.end - at.start).map_err(|_| {
+                GpuError::shape(WHAT, format!("{name}: one expert's bytes pass usize"))
+            })?,
+        }),
+        HostFile::Sidecar(_) => Err(GpuError::shape(
             WHAT,
-            format!("{name}: its experts do not cut its bytes evenly"),
-        ));
-    }
-    let (shard, run) = split.run(name).map_err(|e| {
-        GpuError::shape(
-            WHAT,
-            format!("{e}: the NVMe arena reads a stack where a file keeps it"),
-        )
-    })?;
-    Ok((0..n as u64)
-        .map(|e| {
-            let at = run.start + e * per as u64;
-            (
-                Run {
-                    shard,
-                    at,
-                    len: per,
-                },
-                None,
-            )
+            format!("{name}: an expert run in a sidecar"),
+        )),
+    };
+    (0..n)
+        .map(|id| {
+            let [codes, scales] = expert_runs(R8Source::rows(split), t, u64::from(n), id, false)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+            let scales = if scales.1.is_empty() {
+                None
+            } else {
+                Some(run(scales)?)
+            };
+            Ok((run(codes)?, scales))
         })
-        .collect())
+        .collect()
 }
 
 /// Open the fills' handle of shard `shard` into `files` (by shard) unless it
@@ -2120,7 +2085,7 @@ impl NvTier {
         let model = plan.model;
         // Per layer: its routed stack rows' tensor names in row order, and
         // its host segment's id run.
-        let mut rows_of: Vec<Vec<String>> = (0..model.layers).map(|_| Vec::new()).collect();
+        let mut rows_of: Vec<Vec<&ModelTensor>> = (0..model.layers).map(|_| Vec::new()).collect();
         let mut host_of: Vec<Option<Range<u32>>> = (0..model.layers).map(|_| None).collect();
         for r in &plan.rows {
             let t = &model.tensors[r.tensor];
@@ -2131,7 +2096,7 @@ impl NvTier {
             if !r.segments.iter().any(|s| s.device == Device::Nvme) {
                 continue;
             }
-            rows_of[l].push(t.name.clone());
+            rows_of[l].push(t);
             if let Some(s) = r.segments.iter().find(|s| s.device == Device::Host) {
                 let ids = s.experts.as_ref().ok_or(GpuError::shape(
                     WHAT,
@@ -2187,14 +2152,18 @@ impl NvTier {
                     ),
                 ));
             }
-            let n = model.experts as usize;
+            // The layer's own expert count: a family's layers may hold different counts.
+            let n_expert = u32::try_from(model.layer_experts(l)).map_err(|_| {
+                GpuError::shape(WHAT, format!("layer {l}: its expert count passes u32"))
+            })?;
+            let n = n_expert as usize;
             let mut parts = vec![[PartRange::default(); PARTS]; n];
             let mut lens = [(0usize, 0usize); PARTS];
-            for (p, name) in rows.iter().enumerate() {
-                let runs = stack_runs(split, name, n)?;
+            for (p, t) in rows.iter().enumerate() {
+                let runs = stack_runs(split, t, n_expert)?;
                 for &(codes, scales) in &runs {
                     for r in std::iter::once(codes).chain(scales) {
-                        open_shard(split, &mut files, r.shard, direct, name)?;
+                        open_shard(split, &mut files, r.shard, direct, &t.name)?;
                     }
                 }
                 lens[p] = runs.first().map_or((0, 0), |&(codes, scales)| {
@@ -2218,7 +2187,7 @@ impl NvTier {
             slot_sizes.push(slot_bytes);
             arenas[l] = Some(LayerArena {
                 host: host_of[l].clone().unwrap_or(0..0),
-                n_expert: model.experts as u32,
+                n_expert,
                 rows: rows.len(),
                 windows,
                 slot_bytes,
@@ -2226,7 +2195,9 @@ impl NvTier {
                 dev: None,
                 part_of: OnceLock::new(),
                 files: Arc::new([]),
-                names: std::array::from_fn(|p| rows.get(p).cloned().unwrap_or_default()),
+                names: std::array::from_fn(|p| {
+                    rows.get(p).map(|t| t.name.clone()).unwrap_or_default()
+                }),
                 parts,
                 of_id: (0..n).map(|_| AtomicU32::new(0)).collect(),
                 reading: (0..n).map(|_| AtomicU32::new(0)).collect(),
@@ -5716,7 +5687,8 @@ mod tests {
         use model::placement::workstation::ArenaGrant;
         let scratch = Scratch::new("located");
         let split = located_split(&scratch);
-        let runs = super::stack_runs(&split, "s.weight", 3).expect("the folder's runs");
+        let runs = super::stack_runs(&split, &routed(&split, "s.weight", None), 3)
+            .expect("the folder's runs");
         let mut files = Vec::new();
         for r in runs
             .iter()
@@ -5777,12 +5749,123 @@ mod tests {
         let want: Vec<_> = (0..4)
             .map(|e| (shard, run.start + 4 * e, 4, false))
             .collect();
-        let got: Vec<_> = super::stack_runs(&one, "x", 4)
+        // The file's 16 bytes as four experts of one row each.
+        let got: Vec<_> = super::stack_runs(&one, &routed(&one, "x", Some(vec![1, 4])), 4)
             .unwrap()
             .iter()
             .map(|(c, s)| (c.shard, c.at, c.len, s.is_some()))
             .collect();
         assert_eq!(got, want, "a stack of one file run cuts it evenly");
+    }
+
+    /// Routed stack `name` of `split` as a plan's tensor of layer 0, of `dims` (its header's when
+    /// `None`).
+    fn routed(
+        split: &gguf::Split,
+        name: &str,
+        dims: Option<Vec<u64>>,
+    ) -> model::placement::ModelTensor {
+        let (shard, info) = split.find(name).expect("the stack");
+        model::placement::ModelTensor {
+            name: name.into(),
+            shard,
+            layer: Some(0),
+            role: model::placement::Role::RoutedExperts,
+            ty: info.ty,
+            dims: dims.unwrap_or_else(|| info.dims.clone()),
+            file_bytes: info.nbytes,
+            gathered_rows: None,
+        }
+    }
+
+    /// A family whose layers hold different expert counts pages each layer at its own: a layer
+    /// of two experts among five of four, planned into a room a layer short of their host need
+    /// (over the tier's floor of three layers), carves every layer's arena over its own count.
+    /// FAIL-first: the arena took the model's count for every layer and refused the smaller
+    /// layer's stacks ("2 experts, the model has 4").
+    #[test]
+    fn each_paged_layer_takes_its_own_expert_count() {
+        use super::{ArenaKind, NvTier};
+        use gguf::write::{Layout, TensorDecl, Writer};
+        use model::placement::workstation::{self, ArenaGrant, HostNeed, HostRead};
+        use model::placement::{
+            KvBytes, ModelTensors, PlanLevers, expert_nvme_tier, plan_host_routed,
+        };
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        // Q8_0 stacks of 32-wide rows, 64 rows an expert (2,176 B), an up and a down a layer.
+        const ROWS: u64 = 64;
+        let per = ROWS * 34;
+        let counts = [4u64, 2, 4, 4, 4, 4];
+        let scratch = Scratch::new("layer-experts");
+        let path = scratch.0.join("model.gguf");
+        let stacks: Vec<(usize, String, u64)> = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(l, &n)| ["up", "down"].map(|r| (l, format!("layer.{l}.{r}.weight"), n)))
+            .collect();
+        let decls = stacks
+            .iter()
+            .map(|(_, name, n)| TensorDecl {
+                name: name.clone(),
+                dims: vec![32, ROWS, *n],
+                type_id: 8,
+                nbytes: per * n,
+            })
+            .collect();
+        let mut writer = Writer::new(
+            std::fs::File::create(&path).unwrap(),
+            Layout::new(&[], decls).unwrap(),
+        )
+        .unwrap();
+        for (_, name, n) in &stacks {
+            writer.tensor(name, &vec![1u8; (per * n) as usize]).unwrap();
+        }
+        writer.finish().unwrap();
+        let split = std::sync::Arc::new(gguf::Split::open(&path).unwrap());
+        let model = ModelTensors {
+            tensors: stacks
+                .iter()
+                .map(|(l, name, _)| model::placement::ModelTensor {
+                    layer: Some(*l),
+                    ..routed(&split, name, None)
+                })
+                .collect(),
+            layers: counts.len(),
+            experts: counts[0],
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_on(workstation::A6000, counts.len());
+        let mut plan =
+            plan_host_routed(&model, &machine, 4096, &NoKv, &PlanLevers::default()).expect("plans");
+        // A room one layer short of the host need pages experts of every layer.
+        let room = HostNeed::of(&plan, 0).bytes() - 2 * per * counts[0];
+        let room = plan.plan_at(&(room, HostRead::Given));
+        expert_nvme_tier(&mut plan, room, None).expect("the split");
+        assert!(plan.host.nvme_expert_bytes > 0, "the room pages experts");
+        let tier = NvTier::of_paged(
+            &plan,
+            &split,
+            false,
+            ArenaGrant::whole(64 << 20),
+            ArenaKind::Anon,
+            bloomery_levers::NvTierEvict::Tick,
+        )
+        .expect("the tier of two expert counts")
+        .expect("a tier");
+        for (l, &n) in counts.iter().enumerate() {
+            let arena = tier.arena_of(l, "the test").expect("every layer pages");
+            assert_eq!(
+                u64::from(arena.n_expert),
+                n,
+                "layer {l}'s arena over its own count"
+            );
+        }
     }
 
     /// A relu² layer's arena holds two parts an expert, its up and its

@@ -9,8 +9,8 @@
 //! leg's relu² form: [`crate::placement::accepts::latent_leg_runs`]), and the routed experts where
 //! [`Experts`] says. [`PlanInputs::plan`]
 //! is the whole card's. A plan under [`Experts::Placed`] or [`Experts::Host`]
-//! may put experts on the host; the load still refuses that until the body has
-//! a host tier.
+//! puts experts on the host, and the host experts the room cannot hold on the
+//! NVMe expert tier.
 //!
 //! A sequence's stores are an attention layer's K and V planes and a Mamba-2
 //! layer's scan state and conv ring; a latent MoE layer holds nothing
@@ -368,12 +368,8 @@ pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
 pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
     let hp = Hparams::read(split)?;
     let read = spec::read(split)?;
-    Ok(PlanInputs {
-        model: read.tensors,
-        spec: read.spec,
-        kv: kv_layout(&hp),
-        prompt_reserve: pass_reserve_bytes(&hp, forms_of(split, &hp)),
-    })
+    let reserve = pass_reserve_bytes(&hp, forms_of(split, &hp));
+    PlanInputs::new(read.tensors, read.spec, kv_layout(&hp), reserve)
 }
 
 /// The store each layer of `hp` holds: a Mamba-2 layer its scan, an attention

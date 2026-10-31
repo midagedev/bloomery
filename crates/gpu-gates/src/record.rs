@@ -3822,6 +3822,15 @@ pub fn lane(card: &str, rate: &bloomery_gpu::lane::LaneRate) -> Record {
         .w("pinned", rate.pinned)
 }
 
+/// The `nvtier` record ([`nvtier_of`]) of a server's load on stderr; nothing for a load that
+/// attached no tier.
+#[cfg(feature = "gpu")]
+pub fn eprint_nvtier(tier: Option<&std::sync::Arc<bloomery_gpu::host::nvtier::NvTier>>) {
+    if let Some(r) = nvtier_of(tier.map(|t| &**t)) {
+        r.eprint();
+    }
+}
+
 /// The `nvtier` record of a load's arena: its budget (the granted bytes), the
 /// arena the plan reserved beside it, the paged bytes it serves and the
 /// counters since the load. A load that attached no tier has
