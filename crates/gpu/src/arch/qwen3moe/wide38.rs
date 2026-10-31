@@ -58,7 +58,7 @@
 //! Units. The walk cuts its rows into units ([`unit_rows`]): one unit of
 //! every row, or — the split walk ([`SplitWalk`], `BLOOMERY_SPLIT_WALK`) —
 //! two of `⌈m/2⌉` and `⌊m/2⌋` rows where the width rule
-//! (`runtime::splitwalk::pays` at [`SPLIT_COSTS`]) says the second unit's
+//! (`runtime::splitwalk::pays` at the load's [`Wide38::set_host_costs`]) says the second unit's
 //! front under the first unit's host service pays for its union call; a load
 //! with an expert tier or an NVMe-paged plan walks one unit, and a split
 //! asked of it is refused by name. A part reads and writes a unit's rows
@@ -226,6 +226,8 @@ use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, BatchOrder, LayerProgram, Overlap, PortKind};
 use runtime::splitwalk::{self, LoadKind, SplitCosts};
 
+use crate::host::HostCosts;
+
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
 
@@ -240,30 +242,26 @@ pub enum SplitWalk {
     /// One unit of every row: the walk the lever's `off` keeps.
     Off,
     /// Two units of `⌈m/2⌉` and `⌊m/2⌋` rows where the width rule pays
-    /// (`runtime::splitwalk::pays` at [`SPLIT_COSTS`]), one unit otherwise.
+    /// (`runtime::splitwalk::pays` at the load's costs), one unit otherwise.
     Rule,
     /// Two units at every walk of two rows or more, whatever the rule says:
     /// a gate's arm.
     Every,
 }
 
-/// The width rule's costs on a card of [`SPLIT_COSTS_SMS`] streaming
-/// multiprocessors: the card's time a row of one layer's front on the
-/// A6000, and the high edge of the band the prompt-union records fit for one
-/// more union call a layer, its cost per listed expert and the second
-/// front's enqueue — the edge where a split pays least, so the rule splits
-/// only a walk that pays at every fit in the band. A card of another count
-/// scales the card's time by its multiprocessors ([`Wide38::new`]; its clock
-/// is not read).
-pub const SPLIT_COSTS: SplitCosts = SplitCosts {
-    card_row_us: 7.07,
-    call_us: 2600.0,
-    listing_us: 5.7,
-    enqueue_us: 920.0,
-};
+/// The work one row of one layer's front takes the card, in dense int8 MMA
+/// operations at the front kernels' shares of the peak: A6000's 7.07 a row
+/// [µs] at its 309.7 TOPS [derived]. The width rule prices the card's time a
+/// row at the detected card's rate (`host::costs::card_rates`); GB10's prompt pass reads
+/// it back within 5 % (9.68 a row [µs] measured at 48 SMs and 2,411 MHz
+/// against 9.24 priced).
+const FRONT_OPS_PER_ROW: f64 = 7.07 * 309.66e6;
 
-/// The streaming multiprocessors [`SPLIT_COSTS`]' card time is the time of.
-const SPLIT_COSTS_SMS: f64 = 84.0;
+/// The launches one layer's front enqueues a unit: the prompt pass's
+/// launches a layer and walk less the routed route's (about 148 of 156 on
+/// GB10's 4,095-row pass [derived]), each one host enqueue the split's
+/// second front adds.
+const FRONT_ENQUEUES: f64 = 148.0;
 
 /// The rows of a selecting layer's unit of `m` rows from position `pos0`
 /// that select nothing — every key below their count, the prefill flash's
@@ -406,21 +404,22 @@ fn refuse_split(load: LoadKind, w: SplitWalk) -> Result<(), GpuError> {
 }
 
 /// The widths of a walk of `m` rows cut under `w` on a load of kind `load`
-/// whose rule costs are `costs`, `host` the most host-resident routed
+/// whose rule costs are `costs` (`None`: the load priced none, so the rule
+/// cuts nothing), `host` the most host-resident routed
 /// experts a layer holds ([`WideParts::widths`]): `⌈m/2⌉` and `⌊m/2⌋` when
 /// the cut splits, else `m`. A split on a load the rule does not price is
 /// refused by name ([`refuse_split`]).
 fn unit_widths(
     m: usize,
     w: SplitWalk,
-    (load, costs): (LoadKind, &SplitCosts),
+    (load, costs): (LoadKind, Option<&SplitCosts>),
     host: usize,
 ) -> Result<Vec<usize>, GpuError> {
     let two = m >= 2
-        && match w {
-            SplitWalk::Off => false,
-            SplitWalk::Every => true,
-            SplitWalk::Rule => {
+        && match (w, costs) {
+            (SplitWalk::Off, _) | (SplitWalk::Rule, None) => false,
+            (SplitWalk::Every, _) => true,
+            (SplitWalk::Rule, Some(costs)) => {
                 host > 0
                     && splitwalk::pays(m, costs, host, geo::N_USED)
                         .map_err(|e| GpuError::shape(WHAT, format!("{m} rows: {e}")))?
@@ -1557,9 +1556,10 @@ pub(super) struct Wide38 {
     /// its routed experts on, which the rule prices only when resident.
     split_walk: SplitWalk,
     load: LoadKind,
-    /// The width rule's costs on this card ([`SPLIT_COSTS`] at its
-    /// multiprocessors).
-    split_costs: SplitCosts,
+    /// The width rule's costs once its first use gave the host's and read
+    /// this card's rate ([`Wide38::set_host_costs`]): until then the rule
+    /// cuts no walk.
+    split_costs: Option<SplitCosts>,
 }
 
 /// The [`MmaForm`]s the walk's model-width, attention-width and SwiGLU rows
@@ -1641,7 +1641,6 @@ impl Wide38 {
         if rows >= 2 {
             dense.push(GemmRoute::new(stream, rows / 2, 1)?);
         }
-        let sms = f64::from(stream.context().multiprocessor_count()?);
         let (split_walk, load) = if tiered {
             (SplitWalk::Off, LoadKind::Tier)
         } else {
@@ -1663,11 +1662,27 @@ impl Wide38 {
             units: Vec::new(),
             split_walk,
             load,
-            split_costs: SplitCosts {
-                card_row_us: SPLIT_COSTS.card_row_us * SPLIT_COSTS_SMS / sms,
-                ..SPLIT_COSTS
-            },
+            split_costs: None,
         })
+    }
+
+    /// The width rule's host costs on this host ([`HostCosts`]): one more
+    /// union call a layer, what a split adds an expert both calls list (the
+    /// union timed over a call's columns and over the halves of them), and
+    /// the second front's enqueues at the host's cost of one.
+    pub(super) fn set_host_costs(
+        &mut self,
+        stream: &CudaStream,
+        hc: &HostCosts,
+    ) -> Result<(), GpuError> {
+        let rates = crate::host::costs::card_rates(stream.context())?;
+        self.split_costs = Some(SplitCosts {
+            card_row_us: FRONT_OPS_PER_ROW / rates.int8_ops_per_us,
+            call_us: hc.union.call_us,
+            listing_us: hc.union.split_us,
+            enqueue_us: FRONT_ENQUEUES * hc.enqueue_us,
+        });
+        Ok(())
     }
 
     /// The units the last walk ran; 0 before a walk.
@@ -2960,8 +2975,8 @@ impl<'a> WideParts<'a> {
     /// The widths of the walk's units ([`SplitWalk`]): `⌈m/2⌉` and `⌊m/2⌋`
     /// rows when the cut splits a walk of two rows or more — every such walk
     /// under [`SplitWalk::Every`], one the width rule pays for under
-    /// [`SplitWalk::Rule`] (`runtime::splitwalk::pays` at the card's
-    /// [`SPLIT_COSTS`], over the most host-resident routed experts a layer
+    /// [`SplitWalk::Rule`] (`runtime::splitwalk::pays` at the load's costs,
+    /// over the most host-resident routed experts a layer
     /// holds; a load with none has no union to hide a front under) — else
     /// one unit of all `m`. A split on a load the rule does not price is
     /// refused by name (the setter refused it already).
@@ -2971,7 +2986,7 @@ impl<'a> WideParts<'a> {
             .map(|l| geo::EXPERTS.saturating_sub(self.card.n_card(l)))
             .max()
             .unwrap_or(0);
-        unit_widths(self.m, x.split_walk, (x.load, &x.split_costs), host)
+        unit_widths(self.m, x.split_walk, (x.load, x.split_costs.as_ref()), host)
     }
 }
 
@@ -3210,8 +3225,19 @@ pub(super) fn route_taps_host(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoadKind, SPLIT_COSTS, Span, SplitWalk, UnitSpans, geo, refuse_split, unit_dense,
-        unit_kept, unit_rows, unit_widths,
+        LoadKind, Span, SplitCosts, SplitWalk, UnitSpans, geo, refuse_split, unit_dense, unit_kept,
+        unit_rows, unit_widths,
+    };
+
+    /// The width rule's costs the A6000 records fitted: a row of one layer's
+    /// front, and the high edge of the prompt-union band for one more union
+    /// call a layer, its cost per listed expert and the second front's
+    /// enqueue.
+    const A6000_SPLIT: SplitCosts = SplitCosts {
+        card_row_us: 7.07,
+        call_us: 2600.0,
+        listing_us: 5.7,
+        enqueue_us: 920.0,
     };
 
     /// Each of a unit's windows with the words a row of the buffer it cuts:
@@ -3377,13 +3403,13 @@ mod tests {
                 // The rule splits 4,096 rows over 512 host experts, every
                 // walk splits 8.
                 let m = if w == SplitWalk::Rule { 4096 } else { 8 };
-                let cut = unit_widths(m, w, (load, &SPLIT_COSTS), 512)
+                let cut = unit_widths(m, w, (load, Some(&A6000_SPLIT)), 512)
                     .expect_err("the cut refuses it too");
                 assert!(cut.to_string().contains(want), "{load:?} {w:?}: {cut}");
             }
             refuse_split(load, SplitWalk::Off).expect("one unit on every load");
             assert_eq!(
-                unit_widths(8, SplitWalk::Off, (load, &SPLIT_COSTS), 512).expect("one unit"),
+                unit_widths(8, SplitWalk::Off, (load, Some(&A6000_SPLIT)), 512).expect("one unit"),
                 [8]
             );
         }
@@ -3398,7 +3424,7 @@ mod tests {
     /// 512-row walk does not.
     #[test]
     fn a_walk_splits_in_halves_where_its_cut_says() {
-        let at = |m, w, host| unit_widths(m, w, (LoadKind::Resident, &SPLIT_COSTS), host);
+        let at = |m, w, host| unit_widths(m, w, (LoadKind::Resident, Some(&A6000_SPLIT)), host);
         assert_eq!(at(4096, SplitWalk::Off, 512).unwrap(), [4096]);
         assert_eq!(at(1, SplitWalk::Every, 512).unwrap(), [1]);
         assert_eq!(at(7, SplitWalk::Every, 512).unwrap(), [4, 3]);
@@ -3406,6 +3432,22 @@ mod tests {
         assert_eq!(at(4096, SplitWalk::Rule, 512).unwrap(), [2048, 2048]);
         assert_eq!(at(512, SplitWalk::Rule, 512).unwrap(), [512]);
         assert_eq!(at(4096, SplitWalk::Rule, 0).unwrap(), [4096]);
+        let unpriced = unit_widths(4096, SplitWalk::Rule, (LoadKind::Resident, None), 512);
+        assert_eq!(unpriced.unwrap(), [4096]);
+    }
+
+    /// The front's row at GB10's attributes (48 SMs at 2,411 MHz) prices
+    /// within 15 % of the 9.68 a row and layer [µs] its 4,095-row prompt pass
+    /// measured (dense, attention, GDN, hyper-connection and router kernels),
+    /// where the multiprocessor count alone gave 12.4 [derived] (mutant: the
+    /// clock left out of the rate).
+    #[test]
+    fn the_front_row_is_priced_at_the_cards_rate() {
+        let gb10 =
+            runtime::costs::CardRates::from_attributes(48, 2_411_000, (12, 1), (4_266_000, 256))
+                .expect("GB10's attributes");
+        let row = super::FRONT_OPS_PER_ROW / gb10.int8_ops_per_us;
+        assert!(((row - 9.68) / 9.68).abs() <= 0.15, "{row} µs a row");
     }
 
     /// A unit's window gives back the context handle it takes when it drops.

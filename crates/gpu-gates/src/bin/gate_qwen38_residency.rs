@@ -170,7 +170,7 @@ mod gate {
 
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk, XSTREAM_COSTS};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
@@ -207,14 +207,16 @@ mod gate {
     /// Greedy steps after the streaming clause's prompt.
     const STREAM_STEPS: usize = 32;
     /// The `split` clause's prompt: one ubatch past the stream's least
-    /// width at the family's costs and at the gate's.
+    /// width at the load's prices and at the gate's fixed rule input.
     const SPLIT_PROMPT: usize = 2048;
-    /// The `split` clause's rule costs: the family's, with a host column a
+    /// The `split` clause's fixed rule input: a host column a
     /// thousand microseconds, so the stream's floor sits under one column and
     /// the balance cuts only the last few experts of a layer.
     const SPLIT_COSTS: Costs = Costs {
         host_us_per_col: 1000.0,
-        ..XSTREAM_COSTS
+        host_us_fixed: 19.95,
+        card_us_fixed: 13.0,
+        card_us_per_col: 0.16,
     };
     /// The `units` clause's prompt: the `stream` clause's, one ubatch the
     /// split walk cuts into two units of half its rows.

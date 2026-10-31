@@ -26,6 +26,7 @@
 //! that pin it must agree on.
 
 pub mod combine;
+pub mod costs;
 pub mod dspark;
 pub mod hc_gated;
 pub mod layer;

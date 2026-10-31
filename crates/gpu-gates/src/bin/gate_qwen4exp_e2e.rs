@@ -4406,6 +4406,10 @@ mod gate {
     }
 
     impl SwapSource for NoParts {
+        fn union_tag(&self) -> Result<String, GpuError> {
+            Err(Self::refused("NoParts::union_tag"))
+        }
+
         fn part_bytes(&self, _layer: usize) -> &[usize] {
             &[]
         }

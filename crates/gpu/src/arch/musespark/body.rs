@@ -94,8 +94,8 @@ mod tier;
 pub use placed::Placed;
 use placed::{PlacedOpen, StepWalk, plan_map};
 use prefill::{PASS_ROWS_MAX, PassSizes, Prompt, choose_pass_rows, placed_rows};
+pub use stream::STREAM_FLOOR;
 use stream::XSide;
-pub use stream::{STREAM_FLOOR, XSTREAM_COSTS};
 
 const WHAT: &str = "musespark::Body::load";
 const STEP: &str = "musespark::Body::enqueue_chain";

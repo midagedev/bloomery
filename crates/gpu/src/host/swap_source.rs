@@ -690,8 +690,24 @@ pub struct FileSwap {
     experts: u64,
     first: usize,
     layers: Vec<Option<LayerParts>>,
+    /// The host layout of every routed tensor, including layers with no stage stack.
+    union_tag: String,
     /// The model's convert step, when its staged bytes are not its slots'.
     convert: Option<Arc<dyn Convert>>,
+}
+
+/// The whole model's host expert layout, including wholly host-resident layers. Every routed
+/// tensor's type is included: a gate/down pair alone does not identify a separate up stack.
+#[must_use]
+pub fn union_identity(model: &ModelTensors, r8: bool) -> String {
+    runtime::costs::union_source_tag(
+        model
+            .tensors
+            .iter()
+            .filter(|t| t.role == model::placement::Role::RoutedExperts)
+            .map(|t| (t.layer, t.ty.as_u32(), t.dims.as_slice())),
+        r8,
+    )
 }
 
 // SAFETY: the stack addresses are plain device pointers into allocations the
@@ -739,6 +755,7 @@ impl FileSwap {
             ));
         }
         let pair = R8Pair::at_load(file, r8).map_err(|e| GpuError::plan(WHAT, e))?;
+        let union_tag = union_identity(plan.model, pair.r8().sidecar().is_some());
         let experts = plan.model.experts;
         let mut out = Vec::with_capacity(layers.len());
         for l in layers.clone() {
@@ -812,6 +829,7 @@ impl FileSwap {
             experts,
             first: layers.start,
             layers: out,
+            union_tag,
             convert,
         })
     }
@@ -1078,6 +1096,10 @@ impl FileSwap {
 }
 
 impl SwapSource for FileSwap {
+    fn union_tag(&self) -> Result<String, GpuError> {
+        Ok(self.union_tag.clone())
+    }
+
     fn part_bytes(&self, layer: usize) -> &[usize] {
         layer
             .checked_sub(self.first)

@@ -4251,13 +4251,15 @@ mod gate {
     const _: () = assert!(E_P1 + E_STEPS1 + E_P2 + E_STEPS2 < CTX);
     const _: () = assert!(E_P2 >= WIDE_FROM && E_P2 <= PLACED_UBATCH);
 
-    /// The `split` clause's rule costs: the family's, with a host column a
+    /// The `split` clause's fixed rule input: a host column a
     /// thousand microseconds, so the stream's floor sits under one column and
     /// each card layer streams the host experts its units route, up to a
     /// half of the ring and the balance's cut.
     const SPLIT_COSTS: Costs = Costs {
         host_us_per_col: 1000.0,
-        ..Body35::XSTREAM_COSTS
+        host_us_fixed: 12.4,
+        card_us_fixed: 13.0,
+        card_us_per_col: 0.10,
     };
 
     /// What one run of (e)'s history saw: every call's greedy id and logits

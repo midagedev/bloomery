@@ -3613,6 +3613,18 @@ pub fn lane_prefetch() -> bool {
     LANE_PREFETCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The effective kernel choices a host-union calibration must identify. Read after the
+/// binary sets its levers; the calibration's batched union uses flat participant lanes.
+#[must_use]
+pub fn host_kernels() -> runtime::costs::HostKernels {
+    runtime::costs::HostKernels {
+        q4k_avx512: qdot::q4k_avx512(),
+        lane_prefetch: lane_prefetch(),
+        steal: steal_enabled(),
+        defer_quant: defer_quant(),
+    }
+}
+
 /// A deferred slot's claim state.
 const SLOT_TODO: u8 = 0;
 const SLOT_CLAIMED: u8 = 1;

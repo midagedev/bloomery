@@ -2170,7 +2170,7 @@ fn raw_device_name(dev: cuda_core::sys::CUdevice) -> Result<String, GpuError> {
 }
 
 /// Device `dev`'s UUID, asked of the driver without a context.
-fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> {
+pub(crate) fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> {
     let mut uuid = cuda_core::sys::CUuuid { bytes: [0; 16] };
     // SAFETY: `uuid` is a live, writable CUuuid for the call.
     let rc = unsafe { cuda_core::sys::cuDeviceGetUuid_v2(&mut uuid, dev) };
@@ -2180,7 +2180,7 @@ fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> 
 
 /// Device `dev`'s integer attribute `attribute`, asked of the driver without
 /// a context; `what` names the call in an error.
-fn raw_device_attribute(
+pub(crate) fn raw_device_attribute(
     dev: cuda_core::sys::CUdevice,
     attribute: cuda_core::sys::CUdevice_attribute,
     what: &'static str,

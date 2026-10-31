@@ -96,6 +96,7 @@ use crate::card_leg::{
     CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteBlock, RouteIo, RouteW, leg_bytes_for,
 };
 use crate::gemm::{Gemm32Kernels, GemmRoute, GemmTile};
+use crate::host::costs::ExpertShape;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::leg_tier::{self, Hang, LegOpen, TierSide};
 use crate::host::prompt_stream::PromptStream;
@@ -105,7 +106,7 @@ use crate::host::swap::PassReport;
 use crate::host::swap_source::DEADLINE;
 use crate::host::swap_source::{FileSwap, ResidencyGlue};
 use crate::host::tier::TierOpen;
-use crate::host::xstream::{self, Costs, LAND_BATCHES, LandBatch, RingLayer, XCfg};
+use crate::host::xstream::{self, LAND_BATCHES, LandBatch, RingLayer, XCfg};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{
     Boundary, BoundaryShape, Chain, HOST, HandoffLayout, HandoffTarget, HostResidency, Hybrid,
@@ -958,8 +959,9 @@ impl Placed {
     }
 
     /// Start the expert stream for `split` ([`HostTier::xstream_start`]: the
-    /// ring sized from the card's free bytes, the lane's probe, `costs` for
-    /// the rule over the router's experts and routed slots) and arm the pass
+    /// ring sized from the card's free bytes, the lane's probe, the costs
+    /// this device and host price for the routed expert's shape over the
+    /// router's experts and routed slots) and arm the pass
     /// rows for its ring ([`PlacedRows::arm_ring`]); a started stream and
     /// armed rows are left as they are. Refused by name: a pass arena of the
     /// gemv arm alone (the ring pass is the wide arm's), a load that runs no
@@ -967,7 +969,7 @@ impl Placed {
     /// them. Load-time only.
     ///
     /// [`HostTier::xstream_start`]: crate::host::HostTier::xstream_start
-    pub(super) fn start_xstream(&mut self, gpu: &Gpu, costs: Costs) -> Result<(), GpuError> {
+    pub(super) fn start_xstream(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let shape = self.side.shape;
         if let Some(l) = self.side.ffn.iter().position(|f| f.common().is_some()) {
             return Err(GpuError::shape(
@@ -990,7 +992,13 @@ impl Placed {
         }
         if self.hybrid.xstream().is_none() {
             // The plan reserves no ring: it takes what the card's margin leaves past the keep-free.
-            let cfg = XCfg::new(costs, shape.n_expert, shape.used, DEADLINE, None);
+            let expert = ExpertShape {
+                hidden: shape.hidden,
+                ff: shape.ff,
+                top_k: shape.used,
+                units: 1,
+            };
+            let cfg = XCfg::new(expert, shape.n_expert, DEADLINE, None);
             self.hybrid
                 .xstream_start(gpu.context(), gpu.stream(), cfg, xstream::PROBE)?;
         }
