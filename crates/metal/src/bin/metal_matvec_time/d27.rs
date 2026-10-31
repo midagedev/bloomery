@@ -16,8 +16,8 @@
 //! - the dense FFN's gate-up: the experts' pair over one gate and one up of
 //!   17408 by 5120 (`pair`);
 //! - the dense FFN's down: 17408 columns by 5120 rows through the experts' fold
-//!   at its one slot, what a plain-residual dense session launches, and
-//!   through `matvec` with `Mode::Residual`, the same sums with no per-block
+//!   at its one slot for comparison, and through `matvec` with
+//!   `Mode::Residual`, the session's launch: the same sums with no per-block
 //!   slot address;
 //! - the head: the logits dispatch, a barrier and `logits_argmax`, over 248320
 //!   rows of 5120.
