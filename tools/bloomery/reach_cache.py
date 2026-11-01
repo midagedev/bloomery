@@ -55,7 +55,13 @@ def _paths():
 
     def resolve(path):
         parent, name = os.path.split(path)
-        if name in ("", ".", "..") or os.path.islink(path):
+        if name in ("", ".", ".."):
+            return os.path.realpath(path)
+        try:
+            linked = stat.S_ISLNK(os.lstat(path).st_mode)
+        except OSError:
+            linked = False
+        if linked:
             return os.path.realpath(path)
         if parent not in parents:
             parents[parent] = os.path.realpath(parent)

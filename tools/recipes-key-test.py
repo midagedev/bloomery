@@ -786,7 +786,14 @@ with patch.object(reach_cache, "_bytes", retarget):
         assert "source parent changed" in str(error), error
     else:
         raise AssertionError("parent retargeted during a snapshot was accepted")
-print("symlink referents, missing probes, parent retarget and mid-snapshot retarget checked")
+for rel in ("bad\0.rs", "bad\ud800.rs"):
+    try:
+        reach_cache._observed(tree, {("f", rel): False})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid path accepted as a missing probe: " + repr(rel))
+print("symlink referents, probes, retargets and invalid paths checked")
 '''
         ws.run(sys.executable, "-c", driver)
 
