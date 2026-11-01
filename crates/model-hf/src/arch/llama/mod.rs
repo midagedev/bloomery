@@ -319,16 +319,7 @@ impl FolderMap for Checkpoint {
         _planned: &[(&str, &[u64])],
         _folder: &safetensors::Folder,
     ) -> Result<Vec<(String, Value)>, Error> {
-        let mut keys = vec![(
-            gguf::GENERAL_ARCHITECTURE.to_string(),
-            Value::String(ARCHITECTURE.into()),
-        )];
-        keys.extend(
-            self.keys
-                .iter()
-                .map(|(k, v)| (format!("{ARCHITECTURE}.{k}"), v.clone())),
-        );
-        Ok(keys)
+        Ok(trunk::header(ARCHITECTURE, &self.keys))
     }
 
     fn vocab(&self) -> &VocabSpec {
@@ -1012,23 +1003,18 @@ mod tests {
                 .flat_map(|i| i.wrapping_mul(0x9e37_79b9).to_le_bytes())
                 .collect()
         };
-        let stored = |name: &str, heads: usize, row: usize| -> Vec<u8> {
-            // The file's row `row` of a projection of `heads` heads of 16 values, as stored:
-            // head `h`, value `v` is the stored row `h * 16 + v`; the file's `2i` is the stored
-            // `i` and `2i + 1` the stored `8 + i` of the head.
+        let stored = |row: usize| -> Vec<u8> {
+            // The file's row `row` of a projection of heads of 16 values, as stored: head `h`,
+            // value `v` is the stored row `h * 16 + v`; the file's `2i` is the stored `i` and
+            // `2i + 1` the stored `8 + i` of the head.
             let (head, at) = (row / 16, row % 16);
             let source = head * 16 + if at % 2 == 0 { at / 2 } else { 8 + at / 2 };
-            let _ = (name, heads);
             words(source)
         };
         let q = read("blk.0.attn_q.weight");
         assert_eq!(q.len(), 64 * 36);
         for row in [0, 1, 2, 15, 16, 17, 33, 63] {
-            assert_eq!(
-                q[row * 36..][..32],
-                stored("q", 4, row)[..],
-                "attn_q row {row}"
-            );
+            assert_eq!(q[row * 36..][..32], stored(row)[..], "attn_q row {row}");
             assert_eq!(
                 q[row * 36 + 32..][..4],
                 [0x00, 0x3f, 0x80, 0xbe],
@@ -1038,11 +1024,7 @@ mod tests {
         let k = read("blk.0.attn_k.weight");
         assert_eq!(k.len(), 32 * 36);
         for row in [0, 1, 2, 3, 15, 16, 17, 31] {
-            assert_eq!(
-                k[row * 36..][..32],
-                stored("k", 2, row)[..],
-                "attn_k row {row}"
-            );
+            assert_eq!(k[row * 36..][..32], stored(row)[..], "attn_k row {row}");
         }
         // The value projection and the output are as stored.
         for (name, rows) in [

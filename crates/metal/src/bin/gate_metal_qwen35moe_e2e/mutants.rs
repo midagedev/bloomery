@@ -27,7 +27,8 @@
 //! are [`DENSE`], edits of the pair and fold kernels at the dense FFN's one
 //! slot, and of the dense prompt's SwiGLU; LFM3's are [`LFM3`], edits of the
 //! windowed flash's first key and of the short conv's step ring, which only its
-//! deep pin (`m_logits_deep`) reads. The edits compile into the
+//! deep pin (`m_logits_deep`) reads; Llama's is [`LLAMA`], an edit of the NORM-pairs
+//! prologue that `m_logits` reads. The edits compile into the
 //! row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
@@ -44,6 +45,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
         Mutants::Routed => (MUTANTS, TENSOR_MUTANTS),
         Mutants::Dense => (DENSE, &[]),
         Mutants::Lfm3 => (LFM3, &[]),
+        Mutants::Llama => (LLAMA, &[]),
         Mutants::None => (&[], &[]),
     };
     program::all(main, tensor)
@@ -53,7 +55,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
 pub fn kept_of(set: Mutants) -> &'static [Mutant] {
     match set {
         Mutants::Routed => KEPT,
-        Mutants::Dense | Mutants::Lfm3 | Mutants::None => &[],
+        Mutants::Dense | Mutants::Lfm3 | Mutants::Llama | Mutants::None => &[],
     }
 }
 
@@ -286,6 +288,22 @@ pub const DENSE: &[Mutant] = &[
         )],
     },
 ];
+
+/// Llama's defect `m_logits` must catch: an edit of the NORM-pairs prologue, the branch of
+/// `attn_norm_rope` only the dense Llama instance compiles (the other rows' flashes norm each head
+/// and turn NEOX halves). Position 0 reads none of it (the rope angle is 0), so the pin's steps 1
+/// to 3 are the reach.
+pub const LLAMA: &[Mutant] = &[Mutant {
+    name: "rope_pair_reversed",
+    clause: "m_logits",
+    why: "a neighbour pair turns the other way: the sine of the rope's angle is reversed on the \
+          queries and the keys alike, so a key's angle to the query past position 0 flips",
+    edits: &[(
+        "float s = rope_row[i + 1u];",
+        "float s = -rope_row[i + 1u];",
+        1,
+    )],
+}];
 
 /// LFM3's defects the deep pin must catch, edits of the windowed flash and the short conv's
 /// step kernel. The first steps cannot: a window of 255 or 257 keys cuts nothing before

@@ -18,9 +18,7 @@
   "drop": [],
   "copy": [
     "tokenizer.json",
-    "tokenizer_config.json",
-    "generation_config.json",
-    "chat_template.jinja"
+    "tokenizer_config.json"
   ],
   "widths": {},
   "planes": [],

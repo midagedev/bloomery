@@ -27,6 +27,9 @@ pub enum Mutants {
     /// LFM3's: the windowed flash and the short conv's step ring, which only the
     /// row's deep pin reads (`m_logits_deep`).
     Lfm3,
+    /// Llama's: the prologue of the no-head-norm, NORM-pairs attention, which only the dense
+    /// Llama instance compiles.
+    Llama,
     /// None: the row runs the kernels of another row's tables.
     None,
 }
@@ -154,16 +157,21 @@ const LFM3_DEEP_LOGIT_CAP: f64 = 0.02;
 
 const _: () = assert!(LFM3_DEEP_LOGIT_ABS <= LFM3_DEEP_LOGIT_CAP);
 
-/// The band of `m_logits` on the Llama row: max |session − pin| on a logit of the 4-layer cut of
-/// Llama-3.1-8B-Instruct's folder, where the pin is mlx-lm's `llama` in f32 over the exact
-/// dequant of the folder's 4-bit weights. Derived, not measured: the Qwen band's error model, Δ =
-/// 2.8e-4 of a dot's rms a projection whose input is rounded once into half, over the rounded
-/// inputs of the cut's path (the shared input of q, k and v, the output projection's, the shared
-/// input of gate and up, the down's: four a layer, then the head's, 17 for four layers), added in
-/// quadrature: √17 · 2.8e-4 = 1.15e-3 of a logit's scale. It is held at 0.06, LFM3's band at 97
-/// roundings and a logit scale of 21, until the first pin's largest logit `L` gives the band
-/// 1.15e-3 · L (rounded up); the pin's half top-2 gap caps it, as `LFM3_LOGIT_CAP` caps LFM3's.
-const LLAMA_LOGIT_ABS: f64 = 0.06;
+/// PIN(2026-11-01): max |session − pin| on a logit of the 4-layer cut of Llama-3.1-8B-Instruct's
+/// folder at each pinned step (`pins/llama.txt`); the pin is mlx-lm's `llama` in f32 over the
+/// exact dequant of the folder's 4-bit weights. The Qwen band's error model, Δ = 2.8e-4 of a dot's
+/// rms a projection whose input is rounded once into half, over the rounded inputs of the cut's
+/// path (the shared input of q, k and v, the output projection's, the shared input of gate and up,
+/// the down's: four a layer, then the head's, 17 for four layers), added in quadrature: √17 ·
+/// 2.8e-4 = 1.15e-3 of a logit's scale. The pin's largest logit is 11.44 (step 1), so the band is
+/// 1.15e-3 · 11.44 = 0.0132, rounded up. Measured: the worst step is 3.89e-3 (step 2), and the
+/// mutant `rope_pair_reversed` is 8.13 away at step 2.
+const LLAMA_LOGIT_ABS: f64 = 0.014;
+
+/// Half the smallest top-2 gap of the pin's four rows, 0.1917 at step 3, rounded down.
+const LLAMA_LOGIT_CAP: f64 = 0.19;
+
+const _: () = assert!(LLAMA_LOGIT_ABS <= LLAMA_LOGIT_CAP);
 
 /// Qwen3.6-35B-A3B's fixture: the gated delta net beside the attention layers.
 pub static QWEN35MOE: Row = Row {
@@ -306,7 +314,7 @@ pub static LLAMA: Row = Row {
         groups: 31,
         dispatches: 31,
     }),
-    mutants: Mutants::None,
+    mutants: Mutants::Llama,
     skips: &[
         (
             "q_state",
