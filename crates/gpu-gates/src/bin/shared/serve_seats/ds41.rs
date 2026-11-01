@@ -6,7 +6,7 @@
 //!
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
-//!                         [--parallel N] [--slot-ctx S] [--queue-depth Q] [--slot-save-path DIR]
+//!                         [--parallel N|auto] [--slot-ctx S] [--queue-depth Q] [--slot-save-path DIR]
 //!                         [--chat-template-file PATH]
 //!                         [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                         [--image-max-tokens N] [--plan]
@@ -100,7 +100,11 @@
 //! reads, page-classifying syscalls) — a server run under it is never a
 //! timing reading.
 //! `--parallel 1` is exactly the one-sequence server, and `--parallel 0` is
-//! refused by name. A slot's share under the pair pass's rows is refused by
+//! refused by name. `--parallel auto` counts the slots once the placement, the
+//! draft and the encoder are chosen at one slot (`bind::AutoSlots::count`): the
+//! most, up to `ctx_ask::AUTO_MOST`, whose plan holds one request's context
+//! (`--slot-ctx`, or the default's where that is the model's limit); under the
+//! DSpark draft or a route trace it serves one. A slot's share under the pair pass's rows is refused by
 //! name before the load ([`slot_ctx`]). The plan counts every sequence —
 //! each one's caches on the card and ring shadows on the host
 //! (`PlanInputs::plan_with_slots`) — so slots the machine cannot hold are
@@ -222,9 +226,9 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, SlotsFrom,
-    TemplateFile, Vocab, arm_screen, bind_server, call_token, model_props, parallel_line,
-    placement_of,
+    AutoSlots, CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep,
+    SlotsFrom, TemplateFile, Vocab, arm_screen, bind_server, call_token, model_props,
+    parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name};
 use bloomery_gpu_gates::need;
@@ -236,9 +240,9 @@ use bloomery_gpu_gates::{GateError, ref_model_path, residency};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::deepseek41::hparams::Model as Hp41Model;
-use model::arch::deepseek41::place::PlanInputs;
+use model::arch::deepseek41::place::{PlaceError, PlanInputs};
 use model::arch::dspark::DraftHparams;
-use model::placement::ctx_ask::DEFAULT_SLOTS;
+use model::placement::ctx_ask::{DEFAULT_SLOTS, Probe};
 use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
@@ -269,7 +273,7 @@ use crate::{dspark, place};
 
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
-                     [--cache-ram MIB] [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan] \
+                     [--cache-ram MIB] [--parallel N|auto] [--slot-ctx S] [--queue-depth Q] [--plan] \
                      [--slot-save-path DIR] [--chat-template-file PATH] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
@@ -309,6 +313,9 @@ pub(crate) struct Args {
     /// `--parallel`: the resident sequences the seat serves; `None` takes
     /// [`slot_count`]'s default.
     parallel: Option<usize>,
+    /// `--parallel auto`: the seat counts the slots from its plan ([`AutoSlots::count`]);
+    /// `parallel` is unset beside it and `ctx` is `--slot-ctx`.
+    auto: Option<AutoSlots>,
     queue_depth: Option<usize>,
     /// `--slot-save-path`: the directory the slot actions answer from;
     /// `None` refuses every one, as llama-server does.
@@ -339,6 +346,7 @@ fn parse_args(args: &[String]) -> Result<(Args, Option<Place>), GateError> {
         alias: None,
         cache_ram: None,
         parallel: None,
+        auto: None,
         queue_depth: None,
         slot_save_path: None,
         template_file: TemplateFile::default(),
@@ -383,7 +391,7 @@ fn parse_args(args: &[String]) -> Result<(Args, Option<Place>), GateError> {
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    (a.ctx, a.parallel) = slots.given(a.ctx)?;
+    (a.ctx, a.parallel, a.auto) = slots.asked(a.ctx)?;
     if park_ram {
         return Err(
             "--park-ram holds the states of slots that take the model in turns; this seat's \
@@ -422,7 +430,8 @@ pub(crate) fn check(
                     levers,
                     (draft == Draft::Off).then_some("BLOOMERY_DRAFT is unset"),
                 )?;
-                let (slots, _) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
+                let traced = levers.route_trace().is_some();
+                let (slots, _) = slot_count((a.parallel, a.auto.is_some()), draft, traced)?;
                 slot_ctx(a.ctx, slots)?;
                 let at = ResidencyAt {
                     serving_place: place != Some(Place::Gate),
@@ -460,9 +469,10 @@ fn mib_bytes(flag: &str, v: &str) -> Result<u64, GateError> {
 /// draft, whose window is one sequence's on its own card
 /// ([`served::draft_slots`], which refuses several under it by name), and one
 /// under a route trace (`traced`), which records one sequence's steps; under a
-/// route trace, [`route_trace`] refuses several.
+/// route trace, [`route_trace`] refuses several. Under `--parallel auto` (`auto`) it is the
+/// one slot the count starts from ([`SlotsFrom::Auto`]), where neither names one.
 fn slot_count(
-    parallel: Option<usize>,
+    (parallel, auto): (Option<usize>, bool),
     draft: Draft,
     traced: bool,
 ) -> Result<(NonZeroUsize, SlotsFrom), GateError> {
@@ -471,6 +481,7 @@ fn slot_count(
         None => match parallel {
             Some(n) => (n, SlotsFrom::Flag),
             None if traced => (1, SlotsFrom::RouteTrace),
+            None if auto => (1, SlotsFrom::Auto),
             None => (DEFAULT_SLOTS, SlotsFrom::Default),
         },
     };
@@ -597,18 +608,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
     let draft = Draft::from_levers(&levers)?;
     let width = WidthMode::of(levers.mtp_width())?;
-    let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
-    // The rounds of several slots, decided once (the open takes it through
-    // `SeatArgs`) by what the body runs ([`Pass::of_body`]): one pass of the
-    // busy rows with no draft; a drafted round needs a body that verifies
-    // several slots' windows together, which this one does not (it keeps a
-    // pass's rows whole), so the fallback loop ([`V41::one_pass`]).
-    let window = match draft {
-        Draft::Off => None,
-        Draft::Lookup => Some(LOOKUP_ROWS),
-        Draft::Dspark => Some(PAIR_ROWS),
-    };
-    let pass = Pass::of_body::<Body>(slots.get(), true, window);
+    let (slots, from) = slot_count(
+        (a.parallel, a.auto.is_some()),
+        draft,
+        levers.route_trace().is_some(),
+    )?;
     // The draft's file is read before the target's load, which takes a minute.
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -670,21 +674,19 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
     // The context the load takes with the encoder's reserve `vision` and the side model's
-    // (`place::ctx_choice`): asked once for a projector's cost, once for the load.
-    let ctx_of = |vision: Option<u64>| {
+    // (`place::ctx_choice`) at the `asked` context and slots: asked once for a projector's cost,
+    // once for `--parallel auto`'s one-slot ask, once for the load.
+    let held = |vision: Option<u64>| Beside {
+        image: vision,
+        embedding,
+    };
+    let ctx_of = |vision: Option<u64>, asked: (Option<usize>, NonZeroUsize)| {
         place::ctx_choice(
             &split,
             &inputs,
             a.place,
-            (
-                reserve,
-                tier_batch,
-                Beside {
-                    image: vision,
-                    embedding,
-                },
-            ),
-            (a.ctx, slots),
+            (reserve, tier_batch, held(vision)),
+            asked,
             &cfg.place,
         )
     };
@@ -703,7 +705,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &a.vision,
         |v| {
             let vision = v.and_then(|v| v.seat.reserve);
-            let ctx = ctx_of(None)?.slot_ctx;
+            let ctx = ctx_of(None, (a.ctx, slots))?.slot_ctx;
             let cost_with = |vision: Option<u64>| -> Result<_, GateError> {
                 let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
                 beside::reserve_on(
@@ -718,7 +720,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 Ok(vision_seat::Cost::of(&plan, ctx))
             };
             match cost_with(vision) {
-                Err(_) if vision.is_some() && ctx_of(vision).is_ok() => cost_with(None),
+                Err(_) if vision.is_some() && ctx_of(vision, (a.ctx, slots)).is_ok() => {
+                    cost_with(None)
+                }
                 r => r,
             }
         },
@@ -730,14 +734,49 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     #[cfg(not(feature = "vision"))]
     let seated: Option<&vision_seat::Opened> = None;
     let vision_reserve = seated.and_then(|v| v.seat.reserve);
-    let chosen = ctx_of(vision_reserve)?;
+    // `--parallel auto`'s count ([`AutoSlots::count`]) over the plan of the placement, the draft
+    // and the encoder chosen at one slot.
+    let (slots, asked) = match a.auto.filter(|_| from == SlotsFrom::Auto) {
+        None => (slots, a.ctx),
+        Some(auto) => {
+            let (n, total) = auto.count::<PlaceError, _>(
+                false,
+                |set| {
+                    let one = ctx_of(vision_reserve, (set, NonZeroUsize::MIN))?;
+                    Ok((usize::try_from(one.slot_ctx)?, one.rule, ()))
+                },
+                |(), n, ctx| {
+                    let n =
+                        NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
+                    let at = (u64::try_from(ctx)?, n);
+                    let seat = (reserve, tier_batch, held(vision_reserve));
+                    let probe = place::probe(&inputs, a.place, seat, at, &cfg.place)?;
+                    Ok(matches!(probe, Probe::Holds(())))
+                },
+            )?;
+            let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
+            (n, total)
+        }
+    };
+    // The rounds of several slots, decided once (the open takes it through
+    // `SeatArgs`) by what the body runs ([`Pass::of_body`]): one pass of the
+    // busy rows with no draft; a drafted round needs a body that verifies
+    // several slots' windows together, which this one does not (it keeps a
+    // pass's rows whole), so the fallback loop ([`V41::one_pass`]).
+    let window = match draft {
+        Draft::Off => None,
+        Draft::Lookup => Some(LOOKUP_ROWS),
+        Draft::Dspark => Some(PAIR_ROWS),
+    };
+    let pass = Pass::of_body::<Body>(slots.get(), true, window);
+    let chosen = ctx_of(vision_reserve, (asked, slots))?;
     let ctx = usize::try_from(chosen.slot_ctx)?;
     // The encoder stays on. When its reserve lowers the context, the `ctx`
     // line names both ([`bloomery_levers::RungCost`]). The same context adds
     // nothing.
     let mut ctx_line = chosen.line();
     if let Some(bytes) = vision_reserve {
-        let plain = ctx_of(None)?;
+        let plain = ctx_of(None, (asked, slots))?;
         let image = bloomery_levers::Reserve::ImageEncoder;
         if let Some(note) =
             bloomery_levers::RungCost::of(image, chosen.slot_ctx, plain.slot_ctx, bytes)

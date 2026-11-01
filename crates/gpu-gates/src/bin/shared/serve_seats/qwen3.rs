@@ -6,7 +6,7 @@
 //!
 //!     bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--place W]
-//!                    [--cache-type-k f16|q8_0] [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan]
+//!                    [--cache-type-k f16|q8_0] [--parallel N|auto] [--slot-ctx S] [--queue-depth Q] [--plan]
 //!                    [-ub N | --ubatch-size N]
 //!                    [--chat-template-file PATH] [--mmproj FILE | --no-mmproj]
 //!                    [--image-min-tokens N] [--image-max-tokens N]
@@ -102,7 +102,11 @@
 //! rings, its held count and its checkpoints). `--parallel` naming no
 //! count, the seat serves one slot beside a set `--ctx` (the flag is one
 //! request's context, `bind::slots_of`; one line on stderr says so) and one
-//! slot by default; a count the flags set is never lowered.
+//! slot by default; a count the flags set is never lowered. `--parallel auto`
+//! counts the slots from the load chosen at one slot ([`auto_slots`]): the most,
+//! up to `ctx_ask::AUTO_MOST`, whose load (whole or placed, as a set count's)
+//! holds one request's context; the file's own MTP draft and the DSpark draft
+//! serve one.
 //! Under more slots than one the context
 //! is split across them
 //! as llama-server splits it with `-np N` and no `-kvu`: the `--ctx` the
@@ -227,8 +231,9 @@ use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
-    self, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, TemplateFile, Vocab,
-    arm_screen, bind_server, call_token, note_line, parallel_line, placement_of, slots_given,
+    self, AutoSlots, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, SlotsFrom,
+    TemplateFile, Vocab, arm_screen, bind_server, call_token, note_line, parallel_line,
+    placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::qwen_seat::Family;
@@ -240,10 +245,12 @@ use bloomery_levers::{Draft38At, Draft38Off, Levers, draft38_unset};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Mixer, RopeMode};
+use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::hparams::Hparams;
 use model::arch::qwen35moe::mtp::{InFile, in_file};
+use model::arch::qwen35moe::place as q35;
 use model::placement::PlanLevers;
-use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS};
+use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, Probe};
 use runtime::Target as _;
 use runtime::prompt::CallEnd;
 use runtime::seqstate::Why;
@@ -264,7 +271,7 @@ const NAME: &str = "bloomery-serve-qwen3";
 
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--place W] [--cache-type-k f16|q8_0] \
-                     [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan] \
+                     [--parallel N|auto] [--slot-ctx S] [--queue-depth Q] [--plan] \
                      [-ub N | --ubatch-size N] [--chat-template-file PATH] \
                      [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] \
@@ -330,6 +337,9 @@ pub(crate) struct Args {
     /// either file's load; `None` takes one slot beside a set `--ctx`, else
     /// `ctx_ask::DEFAULT_SLOTS` (one).
     parallel: Option<usize>,
+    /// `--parallel auto`: the seat counts the slots from its loads ([`AutoSlots::count`]);
+    /// `parallel` is unset beside it and `ctx` is `--slot-ctx`.
+    auto: Option<AutoSlots>,
     queue_depth: Option<usize>,
     /// `-ub` / `--ubatch-size`: the prompt ubatch of a file with no routed expert, taken exactly or
     /// refused by name; unset, the load takes the largest size the card holds
@@ -359,6 +369,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         // `ctx_ask::DEFAULT_SLOTS` (one). A count the flags set is never
         // lowered.
         parallel: None,
+        auto: None,
         queue_depth: None,
         ubatch: None,
         vision: vision_seat::Flags::default(),
@@ -428,7 +439,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    (a.ctx, a.parallel) = slots.given(a.ctx)?;
+    (a.ctx, a.parallel, a.auto) = slots.asked(a.ctx)?;
     if let Some(total) = a.ctx {
         slot_ctx(total, a.parallel.unwrap_or(1))?;
     }
@@ -1851,6 +1862,51 @@ fn ctx_and_load(
     Ok(chosen)
 }
 
+/// `--parallel auto`'s count ([`AutoSlots::count`]) over the load the seat asks at one slot
+/// ([`ctx_and_load`]), and the `--ctx` total it asks: a count holds where the load a set count
+/// makes holds ([`q3place::serve_probe`], whole or placed), the served draft runs on it
+/// ([`serves_on`]) and a qwen35 family load's checkpoints fit ([`q3place::checkpoints_fit`]). The file's own MTP layer
+/// drafts one sequence, so a load that may draft it serves one slot: the `mtp` word, and the
+/// unset one where the one slot's verdict prices the draft's lanes ([`verdict_lanes`]).
+fn auto_slots(
+    auto: AutoSlots,
+    (split, arch, word): (&Split, Family, Word),
+    o: q3place::ServeOpts<'_>,
+    lanes: usize,
+) -> Result<(usize, Option<usize>), GateError> {
+    let mtp = match word {
+        Word::Mtp => true,
+        Word::Off => lanes > 1,
+        Word::Lookup | Word::Dspark => false,
+    };
+    if mtp {
+        return Ok(auto.one("the in-file MTP draft serves one sequence"));
+    }
+    let census = q3place::census()?;
+    let one = |set| {
+        let one = ctx_and_load(split, (set, 1), o, lanes)?;
+        Ok((usize::try_from(one.slot_ctx)?, one.rule, ()))
+    };
+    let holds = |(): &(), n: usize, ctx: usize| -> Result<bool, GateError> {
+        let at = (u64::try_from(ctx)?, n);
+        let Probe::Holds(load) = q3place::serve_probe((split, &census), at, o, lanes)? else {
+            return Ok(false);
+        };
+        let placed = load.placed_body();
+        Ok(serves_on(served_draft(word), placed)
+            && match arch {
+                Family::Qwen3moe => true,
+                Family::Qwen35moe | Family::Qwen35 => {
+                    q3place::checkpoints_fit(seqs35(split, &load, n)?, ctx, placed).is_ok()
+                }
+            })
+    };
+    match arch {
+        Family::Qwen3moe => auto.count::<q3::PlaceError, _>(false, one, holds),
+        Family::Qwen35moe | Family::Qwen35 => auto.count::<q35::PlaceError, _>(false, one, holds),
+    }
+}
+
 /// The least context a resident slot loads at, one rule for both loads and
 /// both files: [`MAX_TOKENS`] rows. A whole-card load captures its widest
 /// pass (`capture_prefill`, `capture_rows`, [`MAX_TOKENS`] rows), whose
@@ -2301,6 +2357,12 @@ fn served_draft(word: Word) -> Draft {
     }
 }
 
+/// Whether the served draft runs on a load whose body is `placed`: the lookup and DSpark drafts
+/// verify on a whole-card load only, so a placed one is refused by name before it loads.
+fn serves_on(served: Draft, placed: bool) -> bool {
+    served == Draft::Off || !placed
+}
+
 /// Why `BLOOMERY_DRAFT=lookup` is refused on a qwen3moe file: the lookup
 /// draft needs a load whose session verifies several rows, and the qwen3moe
 /// body runs no pass of several rows.
@@ -2376,7 +2438,8 @@ pub(crate) fn check(
                 )?;
                 served::draft_slots(a.parallel, served_draft(word), true)?;
                 if word == Word::Mtp {
-                    let (slots, _) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
+                    let auto = a.auto.is_some();
+                    let (slots, _) = slots_given(a.parallel, a.ctx, auto, DEFAULT_SLOTS)?;
                     check_mtp_inputs(slots, a.vision.mmproj()?.is_some())?;
                 }
             }
@@ -2471,7 +2534,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The slot count before the context it sizes: a set `--ctx` with no
     // `--parallel` is one request's context — one slot at the whole of it
     // (`bind::slots_of`).
-    let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
+    let (slots, from) = slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?;
     // The DSpark draft's window is one sequence's: several slots are refused by name.
     // `mtp` decides no count here.
     let (slots, from) = served::draft_slots(a.parallel, served, true)?.unwrap_or((slots, from));
@@ -2519,16 +2582,16 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // one choice: the ask first, the plan around it ([`ctx_and_load`]). A
     // count is never lowered: the default is one slot.
     let plan_levers = PlanLevers::from_levers(&levers)?;
-    let asked = ctx_and_load(
-        split,
-        (a.ctx, slots),
-        serve_opts(
-            (a.place, &plan_levers),
-            (kv, a.ubatch),
-            (vision.as_ref(), embedding),
-        ),
-        lanes,
-    )?;
+    let opts = serve_opts(
+        (a.place, &plan_levers),
+        (kv, a.ubatch),
+        (vision.as_ref(), embedding),
+    );
+    let (slots, ctx) = match a.auto.filter(|_| from == SlotsFrom::Auto) {
+        None => (slots, a.ctx),
+        Some(auto) => auto_slots(auto, (split, arch, word), opts, lanes)?,
+    };
+    let asked = ctx_and_load(split, (ctx, slots), opts, lanes)?;
     let (_, image) = vision_seat::images_of(vision.as_ref());
     eprintln!(
         "{}{}",
@@ -2548,7 +2611,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // slot at a time ([`Body3::serves_one_pass`]: the placed body refuses a
     // pass of several slots beside one).
     let tiered = load.tiered(&plan_levers)?;
-    if served != Draft::Off && placed {
+    if !serves_on(served, placed) {
         let why = match a.place {
             Some(p) => (
                 format!("--place {}", p.name()),

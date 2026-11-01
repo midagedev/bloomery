@@ -2,7 +2,9 @@
 //! the engine thread and the bind, for a model whose file one architecture names and whose routed
 //! experts the plan keeps on the card and on the host. A seat gives its family's facts — the
 //! architectures it accepts, its plan inputs, its own flags, its `--parallel` rule, its residency
-//! machine, its think tags and its load (on the engine thread, with its records).
+//! machine, its think tags and its load (on the engine thread, with its records). A seat of
+//! resident slots takes `--parallel auto`, counted over the plan once the placement is chosen
+//! at one slot (`bind::AutoSlots::count`).
 //!
 //! [`mimo2`](super::mimo2), [`minimaxm3`](super::minimaxm3) and [`musespark`](super::musespark) run here.
 //! [`solar2`](super::solar2) keeps the hybrid seat's run. A seat
@@ -42,7 +44,7 @@ use bloomery_levers::{
 };
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::place_hybrid::PlanInputs;
+use model::arch::place_hybrid::{PlaceError, PlanInputs};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
@@ -188,8 +190,8 @@ pub trait Tiered: Seat + Sized + 'static {
     const FAMILY: &'static str;
     const SERVES: &'static str;
 
-    /// `--parallel N` resident slots, which the plan counts: false where the body holds one
-    /// sequence and `--parallel` above 1 is refused by name.
+    /// `--parallel N` resident slots, which the plan counts, and `--parallel auto`: false where
+    /// the body holds one sequence and `--parallel` above 1 or `auto` is refused by name.
     const RESIDENT: bool;
 
     /// Whether a round of several slots is one pass of the body ([`Pass::of`]). The default is
@@ -201,8 +203,8 @@ pub trait Tiered: Seat + Sized + 'static {
     /// Whether the body serves its expert tier card beside several resident slots. The default
     /// does; a body whose pass of several slots runs their rows as the columns of one row, which
     /// the tier's handoff does not write, overrides false: with several slots an unset `--place`
-    /// does not offer the tier card, and a set placement with one is refused by name before the
-    /// plan.
+    /// does not offer the tier card, a set placement with one is refused by name before the
+    /// plan, and `--parallel auto` on a placement with one serves one slot.
     const TIER_SLOTS: bool = true;
 
     /// The pool support of the body this seat loads.
@@ -308,11 +310,11 @@ pub trait Tiered: Seat + Sized + 'static {
     /// The seat's `listening` record, which the run fills once the port is bound.
     fn listening() -> Record;
 
-    /// The residency the seat opens with. The method prints the `residency lever` record, and
-    /// the plan-side detail beside it when the plan moved or refused the word. `None` where the
-    /// body keeps the experts the plan placed, which records nothing. The default is the common
-    /// machine ([`residency_pick`]): set as given, else the serving word on every placement but
-    /// `gate`, for a body that hosts its churn pool and feeds no step prompt.
+    /// The residency the seat opens with, resolved without reporting: [`run`] prints the
+    /// selected load's `residency lever` record and plan-side detail after slot selection.
+    /// `None` where the body keeps the experts the plan placed, which records nothing. The default
+    /// is the common machine ([`residency_pick`]): set as given, else the serving word on every
+    /// placement but `gate`, for a body that hosts its churn pool and feeds no step prompt.
     fn residency(
         levers: &Levers,
         _flags: &Self::Flags,
@@ -369,11 +371,11 @@ pub fn check_residency_feed(
     Ok(())
 }
 
-/// `BLOOMERY_RESIDENCY` for a tiered seat, printed as the `residency lever` record: set, as
-/// given; unset, the serving word on a serving placement (`place` other than `gate`), which
-/// the plan keeps, moves or turns `off`. `prefill_steps` is the seat's step feed, which the
-/// rule counts and which refuses a set word other than `off`. `carry` is the loading body's
-/// `ChainBody::UNHOSTED_POOL`.
+/// `BLOOMERY_RESIDENCY` for a tiered seat, resolved without reporting: [`run`] prints only
+/// the selected load's pick. Set, as given; unset, the serving word on a serving placement
+/// (`place` other than `gate`), which the plan keeps, moves or turns `off`. `prefill_steps` is the
+/// seat's step feed, which the rule counts and which refuses a set word other than `off`.
+/// `carry` is the loading body's `ChainBody::UNHOSTED_POOL`.
 pub fn residency_pick(
     levers: &Levers,
     place: Place,
@@ -381,7 +383,6 @@ pub fn residency_pick(
     prefill_steps: bool,
     carry: UnhostedPool,
 ) -> Result<ResidencyPick, GateError> {
-    record::require(record::groups::tiered::LEVER, "tiered::residency_pick");
     let pick = levers.residency_at(ResidencyAt {
         serving_place: place != Place::Gate,
         check_finite: false,
@@ -389,12 +390,7 @@ pub fn residency_pick(
         prefill_steps,
     });
     check_residency_feed(levers, prefill_steps, carry)?;
-    let pick = residency::at_plan(carry, plan, 0, pick)?;
-    record::residency_lever(pick).eprint();
-    if let Some(d) = pick.why.detail() {
-        eprintln!("{d}");
-    }
-    Ok(pick)
+    residency::at_plan(carry, plan, 0, pick)
 }
 
 /// After the plan's record: a set word's room check, the hosted churn pool's `residency host`
@@ -492,7 +488,7 @@ fn ringed<P>(
 }
 
 /// The plan a streaming seat loads, whether it keeps the ring, and the residency pick it opens
-/// with, `pick` of the plan (the seat's `Tiered::residency`, asked once: it prints its record):
+/// with, `pick` of the plan (the seat's `Tiered::residency`, asked once without reporting):
 /// the staged plan of `attempt` ([`ringed`]), or the `plain` plan where the attempt keeps none.
 /// A pick that streams nothing (`off`, or none) ends the stream rule at `off`: the load runs the
 /// plain plan, which holds no staging, so the card keeps the ring's bytes for experts and context
@@ -528,6 +524,26 @@ fn picked<P, K>(
     } else {
         (plain, false, k)
     })
+}
+
+/// Selects the load's plan for both the slot probe and the final context choice. Staging
+/// carries whether the plain plan hosts experts and the plans with and without the ring.
+fn streamed<P, K>(
+    set: bool,
+    plain: P,
+    staging: Option<(
+        bool,
+        impl FnOnce() -> Result<P, GateError>,
+        impl FnOnce() -> Result<P, GateError>,
+    )>,
+    pick: impl Fn(&P) -> Result<Option<K>, GateError>,
+    off: impl Fn(&K) -> bool,
+) -> Result<(P, bool, Option<K>), GateError> {
+    let attempt = match staging {
+        Some((hosts, with_ring, without)) => ringed(set, hosts, with_ring, without),
+        None => Ok(None),
+    };
+    picked(attempt, set, plain, pick, off)
 }
 
 /// The common flags of `args` and the seat's own; `--parallel` above one is refused by name on a
@@ -604,8 +620,9 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
     // reads `--parallel` as the one slot it holds, with no note about a count it cannot offer.
+    // Under `--parallel auto` the placement is chosen at one slot, and the count below.
     let (slots, from) = if S::RESIDENT {
-        slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?
+        slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?
     } else {
         slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?
     };
@@ -670,37 +687,85 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         workstation::reserve_stream_staging(&mut staged, r.stream_slot);
         staged
     });
+    let set = levers.xstream().is_some();
+    // `--parallel auto`'s count ([`AutoSlots::count`]) over the plans the load runs: the plain
+    // plan and the staged plans chosen by the same stream and residency rules as the load. A body
+    // that serves its tier card beside one sequence serves one slot there.
+    let (slots, ctx) = match a.auto {
+        None => (slots, a.ctx),
+        Some(auto) if !S::TIER_SLOTS && !place.tier_cards().is_empty() => auto.one(&format!(
+            "the {} body serves its expert tier card beside one sequence",
+            S::FAMILY
+        )),
+        Some(auto) => auto.count::<PlaceError, _>(
+            false,
+            |set| {
+                let one = (&machine, &plan_levers, NonZeroUsize::MIN, place);
+                let chosen = plan_at(&split, (set, 1), &inputs, one)?;
+                Ok((usize::try_from(chosen.slot_ctx)?, chosen.rule, ()))
+            },
+            |(), n, ctx| {
+                let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
+                let ctx = u64::try_from(ctx)?;
+                let plain = inputs.plan_with_slots(&machine, ctx, &plan_levers, n)?;
+                let Some((r, staged)) = ring_inputs.as_ref().zip(staged.as_ref()) else {
+                    return Ok(true);
+                };
+                let staging = Some((
+                    workstation::plan_streams(&plain),
+                    || Ok(r.plan_with_slots(staged, ctx, &plan_levers, n)?),
+                    || Ok(inputs.plan_with_slots(staged, ctx, &plan_levers, n)?),
+                ));
+                streamed(
+                    set,
+                    plain,
+                    staging,
+                    |p| S::residency(&levers, &flags, place, p),
+                    |pick| pick.word == "off",
+                )
+                .map(|_| true)
+            },
+        )?,
+    };
+    let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
     // The context, then the plan of every slot around it (`choose_ctx`, every seat's): a tier
     // card, a second card, a context the card cannot hold, a host room that cannot hold the host
     // experts and a budget that binds are refused here by name, before any load; the load plans
     // the same.
-    let asking = (a.ctx, slots);
+    let asking = (ctx, slots);
     let plain = plan_at(&split, asking, &inputs, (&machine, &plan_levers, n, place))?;
     // Where the seat streams, the ring's plan on the staged machine beside it, and the pick is
     // fitted to the plan the load runs. An unset `BLOOMERY_XSTREAM` keeps no ring where the plan
     // without it holds every expert on the card (the rule then ends at `off`: nothing to stream).
     // Where the plan cannot hold the ring, the rule sizes it from what the card leaves free at the
     // load ([`PlanInputs::streaming`]), so that plan keeps the staging on the host.
-    let set = levers.xstream().is_some();
-    let attempt = match (&ring_inputs, &staged) {
-        (Some(r), Some(staged)) => {
+    let staging = ring_inputs
+        .as_ref()
+        .zip(staged.as_ref())
+        .map(|(r, staged)| {
             let on = (staged, &plan_levers, n, place);
-            ringed(
-                set,
+            let split = &split;
+            let inputs = &inputs;
+            (
                 workstation::plan_streams(&plain.plan),
-                || plan_at(&split, asking, r, on),
-                || plan_at(&split, asking, &inputs, on),
+                move || plan_at(split, asking, r, on),
+                move || plan_at(split, asking, inputs, on),
             )
-        }
-        _ => Ok(None),
-    };
-    let (asked, ring, pick) = picked(
-        attempt,
+        });
+    let (asked, ring, pick) = streamed(
         set,
         plain,
+        staging,
         |p| S::residency(&levers, &flags, place, &p.plan),
         |pick| pick.word == "off",
     )?;
+    if let Some(pick) = pick {
+        record::require(record::groups::tiered::LEVER, "tiered::run");
+        record::residency_lever(pick).eprint();
+        if let Some(detail) = pick.why.detail() {
+            eprintln!("{detail}");
+        }
+    }
     eprintln!("{}", asked.line());
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
@@ -784,6 +849,178 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
 #[cfg(test)]
 mod tests {
     use bloomery_gpu_gates::GateError;
+
+    /// The fixed-context count holds the staging of an unset stream as the final load does.
+    /// The plain eight-slot plan fits, both staged seven-slot plans refuse, and six fits only
+    /// without the ring. A set stream needs its ring; an off residency needs no staging.
+    #[test]
+    fn auto_slots_hold_default_stream_staging() {
+        use bloomery_gpu_gates::bind::AutoSlots;
+        use model::arch::place_hybrid::PlaceError;
+        use model::placement::PlacementError;
+        use model::placement::ctx_ask::Rule;
+
+        let plan = |n: usize, ctx: usize, reserve: usize| -> Result<usize, GateError> {
+            let need = n * ctx + reserve;
+            if need > 8192 {
+                return Err(PlacementError::DraftHostRoom {
+                    room: 8192,
+                    draft: u64::try_from(need)?,
+                }
+                .into());
+            }
+            Ok(n)
+        };
+        let select = |set, off, staging: bool, n, ctx| {
+            super::streamed(
+                set,
+                plan(n, ctx, 0)?,
+                staging.then_some((true, || plan(n, ctx, 2560), || plan(n, ctx, 2048))),
+                |_| Ok(Some(off)),
+                |off| *off,
+            )
+        };
+        assert!(plan(8, 1024, 0).is_ok(), "the plain maximum fits");
+        assert!(plan(7, 1024, 2560).is_err(), "staging and ring exceed room");
+        assert!(plan(7, 1024, 2048).is_err(), "staging alone exceeds room");
+        assert_eq!(
+            select(false, false, true, 6, 1024).unwrap(),
+            (6, false, Some(false)),
+            "the smaller staged plan fits without its ring"
+        );
+        for (set, off, staging, expected) in [
+            (false, false, true, 6),
+            (true, false, true, 5),
+            (false, true, true, 8),
+            (false, false, false, 8),
+        ] {
+            let chosen = AutoSlots {
+                slot_ctx: Some(1024),
+            }
+            .count::<PlaceError, _>(
+                false,
+                |_| Ok((1024, Rule::Set, ())),
+                |(), n, ctx| select(set, off, staging, n, ctx).map(|_| true),
+            )
+            .unwrap();
+            assert_eq!(
+                chosen,
+                (expected, Some(expected * 1024)),
+                "the count follows the selected load: set={set} off={off} staging={staging}"
+            );
+            select(set, off, staging, chosen.0, 1024).expect("the final load fits");
+        }
+    }
+
+    /// Auto's one-slot probe resolves to a churn pool, but the selected larger load resolves
+    /// to off. Only the selected residency reaches the record reader.
+    #[test]
+    fn auto_slots_report_only_the_selected_residency() {
+        use std::cell::RefCell;
+
+        use bloomery_gpu_gates::bind::AutoSlots;
+        use bloomery_gpu_gates::record::{self, Log};
+        use bloomery_levers::{Levers, UnhostedPool};
+        use model::arch::place_hybrid::PlaceError;
+        use model::placement::ctx_ask::Rule;
+        use model::placement::{Host, HostTotals, Machine, ModelTensors, Node, Plan};
+
+        thread_local! {
+            static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        record::tee(|line| LINES.with_borrow_mut(|lines| lines.push(line.to_owned())));
+        let levers = Levers::from_env().unwrap();
+        assert!(levers.residency().is_none(), "the test asks the unset rule");
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 1,
+            experts: 4,
+            experts_used: 1,
+            bf16_words: |_| false,
+        };
+        let machine = Machine {
+            cards: Vec::new(),
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: 1 << 30,
+                    reserves: Vec::new(),
+                },
+                unified: None,
+            }],
+        };
+        // Only the residency's occupancy and host-room inputs matter; no tensor is loaded.
+        let plan = Plan {
+            model: &model,
+            machine: &machine,
+            ctx_max: 1024,
+            rows: Vec::new(),
+            cards: Vec::new(),
+            host: HostTotals {
+                expert_bytes: 0,
+                experts: 1,
+                nvme_expert_bytes: 0,
+                nvme_arena_bytes: 0,
+                arena_columns: 1,
+                table_bytes: 0,
+                shadow_bytes: 0,
+                reserve_bytes: 0,
+                row_reserve_bytes: 0,
+                pool_card_bytes: 0,
+                headroom_bytes: 1 << 30,
+                room: None,
+            },
+            nvme_bytes: 0,
+            n_l: vec![2],
+            tier_n_l: Vec::new(),
+            card_budget: model::placement::card_budget::CardBudget::default(),
+            budget_from_pool: false,
+        };
+        let select = |n| {
+            let mut plan = plan.clone();
+            plan.n_l[0] = if n == 1 { 2 } else { 1 };
+            super::streamed(
+                false,
+                plan.clone(),
+                Some((true, || Ok(plan.clone()), || Ok(plan.clone()))),
+                |p| {
+                    super::residency_pick(
+                        &levers,
+                        super::Place::A,
+                        p,
+                        false,
+                        UnhostedPool::NotCarried,
+                    )
+                    .map(Some)
+                },
+                |pick| pick.word == "off",
+            )
+        };
+        assert_eq!(select(1).unwrap().2.unwrap().word, "mid-p0-s1");
+        let chosen = AutoSlots {
+            slot_ctx: Some(1024),
+        }
+        .count::<PlaceError, _>(
+            false,
+            |_| Ok((1024, Rule::Set, ())),
+            |(), n, _| select(n).map(|_| true),
+        )
+        .unwrap();
+        assert_eq!(chosen, (8, Some(8192)));
+        let (_, ring, pick) = select(chosen.0).unwrap();
+        assert!(!ring, "off loads without the stream ring");
+        record::residency_lever(pick.unwrap()).eprint();
+        let lines = LINES.with_borrow(|lines| lines.join("\n"));
+        let records = Log::of(&lines, &[&record::RESIDENCY_LEVER])
+            .all(&record::RESIDENCY_LEVER)
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "only the selected load is reported: {lines}"
+        );
+        assert_eq!(records[0].word("residency").unwrap(), "off");
+    }
 
     /// A streaming seat's refused staged plans under an unset lever load the plain plan where its
     /// residency pick is `off` (a plain plan of no card expert streams nothing), with that one
