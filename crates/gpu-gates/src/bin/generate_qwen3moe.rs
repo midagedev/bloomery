@@ -1387,14 +1387,13 @@ mod cli {
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let ctx_max = u64::try_from(ctx)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
-        let drafts = mtp;
-        if !drafts {
+        if !mtp {
             let machine = machine38(
                 (place, levers, path),
                 &inputs,
-                (ctx_max, ub, slots, drafts),
+                (ctx_max, ub, slots),
                 experts,
-                None,
+                (None, None),
             )?;
             let plan =
                 inputs.plan_with_slots(&machine, (ctx_max, ub), &plan_levers, experts, slots)?;
@@ -1409,9 +1408,9 @@ mod cli {
         let machine = machine38(
             (place, levers, path),
             &inputs,
-            (ctx_max, ub, 1, drafts),
+            (ctx_max, ub, 1),
             experts,
-            reserve,
+            (reserve, Some(&mtp)),
         )?;
         let plan = inputs.plan_mtp_with(&machine, (ctx_max, ub), &plan_levers, &mtp, experts)?;
         Ok(plan.plan.host.nvme_arena_bytes)
@@ -1477,19 +1476,20 @@ mod cli {
     /// The machine a plan of `inputs` at `ctx` positions per resident slot
     /// and ubatches of `ub` under `experts` runs on, over `place`'s cards; a
     /// one-card machine counts its card route in the form this build holds
-    /// the file's in (`PlanInputs::route_form`). Every slot's room buffers and, under `drafts`, its draft's planes
-    /// reserve their page rounding before planning. `draft` is the MTP draft's card
-    /// bytes when the draft runs beside the target, which plan (b′) reserves on
-    /// its stage card (`q38place::machine_bp38`) and the one-card plans count in
-    /// `plan_mtp_with` instead. A load whose prompt calls stream (`levers` under the seat's rule,
-    /// [`plans_ring`], with no residency `off` before the plan at `path`, [`residency38_off`])
-    /// reserves the lane's staging on the host (`workstation::reserve_stream_staging`).
+    /// the file's in (`PlanInputs::route_form`). Every slot's room buffers and, under `mtp`, its
+    /// draft's planes reserve their page rounding before planning. `mtp` is the MTP draft when it runs
+    /// beside the target, and `draft` its card bytes, which plan (b′) reserves on its stage card
+    /// (`q38place::machine_bp38`) and the one-card plans count in `plan_mtp_with` instead. A load
+    /// whose prompt calls stream (`levers` under the seat's rule, [`plans_ring`], with no
+    /// residency `off` before the plan at `path`, [`residency38_off`]) reserves the lane's staging
+    /// on the host (`workstation::reserve_stream_staging`) where its plan has host experts to
+    /// stream (`workstation::plan_streams`, of the plan the caller makes, [`plan38`]).
     fn machine38(
         (place, levers, path): (Place, &Levers, Prompt38),
         inputs: &PlanInputs,
-        (ctx, ub, slots, drafts): (u64, u64, usize, bool),
+        (ctx, ub, slots): (u64, u64, usize),
         experts: Experts,
-        draft: Option<u64>,
+        (draft, mtp): (Option<u64>, Option<&MtpInputs>),
     ) -> Result<Machine, GateError> {
         let layers = inputs.stack();
         let page = stage_page(place.card_specs()?[0])?;
@@ -1514,15 +1514,42 @@ mod cli {
                 .into());
             }
         };
+        let drafts = mtp.is_some();
         inputs.reserve_room(&mut machine, (ctx, u64::try_from(slots)?, drafts), page)?;
         if plans_ring(
             levers.xstream(),
             stage38(place),
             residency38_off(levers.residency(), residency_at38(place, levers, path)),
         ) {
-            workstation::reserve_stream_staging(&mut machine, inputs.stream_slot(experts)?);
+            let mut staged = machine.clone();
+            workstation::reserve_stream_staging(&mut staged, inputs.stream_slot(experts)?);
+            let plan_levers = PlanLevers::from_levers(levers)?;
+            let on = (&plan_levers, experts, mtp, slots);
+            if workstation::plan_streams(&plan38(inputs, &staged, (ctx, ub), on)?) {
+                return Ok(staged);
+            }
         }
         Ok(machine)
+    }
+
+    /// The plan of `inputs` on `machine` at `ctx` positions and ubatches of `ub` under `levers`
+    /// and `experts`: with the MTP draft beside the target where `mtp` is given
+    /// (`plan_mtp_with`), else for `slots` resident sequences (`plan_with_slots`), as each
+    /// caller of [`machine38`] plans it.
+    fn plan38<'a>(
+        inputs: &'a PlanInputs,
+        machine: &'a Machine,
+        (ctx, ub): (u64, u64),
+        (levers, experts, mtp, slots): (&PlanLevers, Experts, Option<&'a MtpInputs>, usize),
+    ) -> Result<Plan<'a>, GateError> {
+        Ok(match mtp {
+            None => inputs.plan_with_slots(machine, (ctx, ub), levers, experts, slots)?,
+            Some(mi) => {
+                inputs
+                    .plan_mtp_with(machine, (ctx, ub), levers, mi, experts)?
+                    .plan
+            }
+        })
     }
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
@@ -2949,13 +2976,12 @@ mod cli {
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
-        let drafts = false;
         let machine = machine38(
             (place, levers, path),
             &inputs,
-            (u64::try_from(ctx)?, u64::try_from(ub)?, slots, drafts),
+            (u64::try_from(ctx)?, u64::try_from(ub)?, slots),
             experts,
-            None,
+            (None, None),
         )?;
         // One slot is `plan_with` itself.
         let plan = inputs.plan_with_slots(
@@ -3067,13 +3093,12 @@ mod cli {
         } else {
             None
         };
-        let drafts = true;
         let machine = machine38(
             (place, levers, path),
             &inputs,
-            (ctx_max, u64::try_from(ub)?, 1, drafts),
+            (ctx_max, u64::try_from(ub)?, 1),
             experts,
-            reserve,
+            (reserve, Some(&mtp)),
         )?;
         let plan = inputs.plan_mtp_with(
             &machine,

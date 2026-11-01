@@ -469,7 +469,9 @@ pub const STAGING_SLOTS: usize = 64;
 /// in place of any set before: a plan made on it counts them pinned in its
 /// host need and the NVMe expert tier's split leaves them room. A `slot` of 0,
 /// a load that streams nothing, sets none. The caller asks before the plan
-/// whether the load streams (the common `BLOOMERY_XSTREAM` rule).
+/// whether the load streams (the common `BLOOMERY_XSTREAM` rule), and plans
+/// on the machine without it where that plan streams nothing
+/// ([`plan_streams`]).
 pub fn reserve_stream_staging(machine: &mut Machine, slot: u64) {
     if slot == 0 {
         machine
@@ -483,6 +485,16 @@ pub fn reserve_stream_staging(machine: &mut Machine, slot: u64) {
             slot.saturating_mul(STAGING_SLOTS as u64),
         );
     }
+}
+
+/// Whether a load of `plan` has host experts its prompt calls could stream:
+/// the plan leaves a routed expert on no card (in host memory or on the NVMe
+/// tier). A plan that holds every routed expert on its cards streams nothing
+/// (the stream rule ends at `off`), so its load pins no lane staging and its
+/// machine sets none aside ([`reserve_stream_staging`]).
+#[must_use]
+pub fn plan_streams(plan: &Plan<'_>) -> bool {
+    plan.host.experts > 0
 }
 
 /// The expert tier's prompt-batch service in bytes ([`tier_batch_bytes`]):
