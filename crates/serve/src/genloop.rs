@@ -55,9 +55,22 @@
 //! none unless the request wants probabilities. A pick the program cannot make ends the request with a
 //! named error ([`GenError::Constrained`]). A pass draws one id a kept row, so
 //! the program moves through the kept ids alone and nothing is taken back. A
-//! program held while the model reasons steps until the model's own close
-//! hands it the answer: a pass could keep ids past the close that the
-//! program did not pick.
+//! forced call's program held while the model reasons steps until the
+//! model's own close hands it the answer: a pass could keep ids past the
+//! close that the program did not pick.
+//!
+//! A watch (a `tool_choice: auto` request's program) waits in free text for
+//! the model's own call opener. Its pick reads the free text it takes itself
+//! ([`FreeText`]): the think span's close while its program is held, then the
+//! opener. So it passes where any request that reads its rows passes, its
+//! reasoning and its free text included: within one pass the ids up to the
+//! opener's are free picks, and every id after it is the program's pick from
+//! its verified row. A free pick is the unwatched request's (its draw, or the
+//! argmax), and a greedy watch that changes no row reads no row on a step
+//! until its call opens. Where the opener's id also wrote text past the
+//! opener that the program does not start with, the refusal is returned once
+//! that id is taken, after its stop words: a stop word that matches the
+//! opener ends the request as a stop word does.
 //!
 //! That is the step arm. The jump arm (on by default, [`Slot::schema_jump`])
 //! feeds the ids the program fixes in the calls that read the decisions'
@@ -547,13 +560,17 @@ struct Pick {
     /// while the program is held.
     walk: Option<Walk>,
     /// The program held while the model reasons in the span the prompt left
-    /// open ([`Constraint::follows_reasoning`]): it becomes the walk once the
-    /// model's own close is taken ([`Gen::spend`]). The request steps until
-    /// then: a pass could keep ids past the close that the program did not
-    /// pick.
+    /// open ([`Constraint::follows_reasoning`]), or one the model may open
+    /// under a watch: it becomes the walk once the model's own close is
+    /// taken, a forced call's by [`Gen::spend`], a watch's by its pick
+    /// ([`Pick::read`]). A forced call's request steps until then: a pass
+    /// could keep ids past the close that the program did not pick.
     held: Option<Walk>,
-    /// The biased copy of the row a program picks from, empty without a
-    /// `logit_bias`.
+    /// What a watch's pick reads of the free text it takes, `None` on a
+    /// request whose program does not wait for a call ([`FreeText`]).
+    free: Option<FreeText>,
+    /// The changed copy of the row a program or a watch's free text picks
+    /// from, empty while the request changes no row.
     biased_row: Vec<f32>,
     /// The row a sampled request's walk draws from, the ids its program does
     /// not allow masked ([`Draw::Sampled`]), kept for its capacity.
@@ -566,8 +583,27 @@ struct Pick {
     /// next [`Gen::pump`] returns before it takes the token; one at a later
     /// row is returned once the pass's ids before it are taken
     /// ([`Gen::advanced`]). The refused pick and every id after it go
-    /// untaken.
+    /// untaken. A watch's refusal of the text a free id wrote ([`Pick::read`])
+    /// names the row after that id's: the id is taken, its stop words read,
+    /// and the refusal follows it ([`Gen::answer`] holds a step's).
     refused: Option<(usize, StepError)>,
+}
+
+/// What a watch's pick reads of the ids it takes as free text, each as it
+/// takes it, inside a pass as on a step: their text, as the generation loop's
+/// own decoder releases it, for the call opener ([`Walk::saw`]), and while
+/// the program is held, the think span's split, for the model's own close
+/// ([`Walk::fed`]). The loop reads a pass's ids only once the pass is over,
+/// so the pick reads them itself: the row after the opener's is the
+/// program's. The ids inside a call are the program's and are not read: the
+/// decoder holds nothing once the opener is in (else that id is refused), so
+/// it stands where the loop's does again when the call closes.
+struct FreeText {
+    dec: Box<dyn Decoder>,
+    vocab: Arc<dyn Tokenizer>,
+    /// The think span's split while the program is held, `None` once the
+    /// model's own close handed the program over.
+    split: Option<ThinkSplit>,
 }
 
 impl Pick {
@@ -586,12 +622,60 @@ impl Pick {
         if let Some(c) = self.probs.as_mut() {
             c.read(row);
         }
+        let free = self.free.is_some() && self.refused.is_none() && self.in_free_text();
         let id = forced.unwrap_or_else(|| self.choose(row, history, g));
         if let Some(c) = self.probs.as_mut() {
             c.pick(id, row);
         }
         self.answered += 1;
+        if free && let Err(e) = self.read(id) {
+            self.refused = Some((self.answered, e));
+        }
         id
+    }
+
+    /// Whether the next id is free text: the program held, or a walk that
+    /// waits for its call opener.
+    fn in_free_text(&mut self) -> bool {
+        self.held.is_some() || self.walk.as_mut().is_some_and(Walk::in_free_text)
+    }
+
+    /// A watch's free id `id`, just taken, read ([`FreeText`]): while the
+    /// program is held, its text into the think span's split, and where the
+    /// split ends the span, the program handed over and the text past the
+    /// close fed to it; else its text watched for the opener. Once the
+    /// opener is in, bytes the decoder still holds are text after it that
+    /// no piece showed the program: the named error.
+    fn read(&mut self, id: u32) -> Result<(), StepError> {
+        let f = self.free.as_mut().expect("a watch reads its free text");
+        let piece = f.dec.push(id);
+        let text = piece.as_deref().unwrap_or("");
+        let walk = match f.split.as_mut() {
+            Some(split) => {
+                // A special id its piece cannot place ends the request by
+                // name where the loop takes it ([`special_at`]), before any
+                // id after it.
+                let special = special_at(&*f.vocab, id, piece.as_deref()).ok().flatten();
+                let s = split.push(text, special.as_slice());
+                if !s.closed && s.content.is_empty() {
+                    return Ok(());
+                }
+                f.split = None;
+                self.walk = self.walk.take().or_else(|| self.held.take());
+                let walk = self.walk.as_mut().expect("a held program to hand over");
+                walk.fed(&s.content, &s.specials)?;
+                walk
+            }
+            None => {
+                let walk = self.walk.as_mut().expect("a watch's walk");
+                walk.saw(id, text)?;
+                walk
+            }
+        };
+        if walk.waiting() || f.dec.flush().is_empty() {
+            return Ok(());
+        }
+        Err(walk.stuck("the call opener's id also wrote part of a character after it"))
     }
 
     /// The request's pick from `row`: its program's pick from the biased copy
@@ -609,7 +693,9 @@ impl Pick {
         if self.refused.is_some() {
             return argmax(row);
         }
-        if let Some(walk) = self.walk.as_mut() {
+        if let Some(walk) = self.walk.as_mut()
+            && !walk.in_free_text()
+        {
             let row = if self.bias.add.is_empty() || walk.fixed_next() {
                 row
             } else {
@@ -632,11 +718,13 @@ impl Pick {
                 argmax(row)
             });
         }
-        // A held program's request keeps its bias out of its sampler, as
-        // the walk applies it ([`Gen::new`]): its reasoning draws from the
-        // biased copy here.
+        // Free text is one path: an unwatched request's, a held program's
+        // reasoning and a waiting watch's. A program's request keeps its bias
+        // out of its sampler, as the walk applies it ([`Gen::new`]), so its
+        // free text draws from the copy made here by [`biased`]'s rule.
         let moves = g.is_none_or(|g| self.bias.moves(g));
-        let biased = self.held.is_some() && !self.bias.add.is_empty() && (!self.greedy || moves);
+        let program = self.walk.is_some() || self.held.is_some();
+        let biased = program && !self.bias.is_empty() && (!self.greedy || moves);
         let row = if biased {
             self.bias.apply(row, self.greedy, &mut self.biased_row);
             &self.biased_row
@@ -649,6 +737,27 @@ impl Pick {
             _ => argmax(row),
         }
     }
+}
+
+/// Where special id `id`'s text is in `piece`, the text the streaming decoder
+/// released for it: the piece ends with it, after any bytes the decoder held;
+/// `None` for an id that is not special. A piece that does not carry the text
+/// whole (a space a cleaning decoder holds) cannot place it, and the request
+/// ends by name rather than lose the span.
+fn special_at(
+    vocab: &dyn Tokenizer,
+    id: u32,
+    piece: Option<&str>,
+) -> Result<Option<(usize, usize)>, GenError> {
+    if !vocab.is_special(id) {
+        return Ok(None);
+    }
+    let text = vocab.decode(&[id]);
+    let at = piece
+        .and_then(|p| p.strip_suffix(text.as_str()))
+        .map(str::len)
+        .ok_or(GenError::SpecialPiece(id))?;
+    Ok(Some((at, text.len())))
 }
 
 /// Whether a request takes its tokens after the first through the engine's
@@ -2176,9 +2285,9 @@ pub(crate) struct Gen {
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
-    /// The program's refusal of a pass's row past its first, returned once
-    /// the ids before it, all `kept` holds, are taken; a stop among them
-    /// drops it.
+    /// The program's refusal of a pass's row past its first, or a watch's
+    /// refusal of the text an id it took wrote, returned once the ids before
+    /// it, all `kept` holds, are taken; a stop among them drops it.
     refused_after: Option<StepError>,
     /// The copy of the history a sampled pass lends the engine
     /// ([`Slot::advance_sampled`]), kept for its capacity.
@@ -2259,9 +2368,34 @@ impl Gen {
         };
         let open = p.think_entry == ThinkEntry::Open;
         let (walk, held) = match &p.constraint {
-            Some(c) if open && c.follows_reasoning() => (None, Some(Walk::new(c, false))),
+            // A forced call and a watched one both wait for the model's own
+            // close of a span the prompt left open; a watched call waits for
+            // a span the model may still open too, an opener inside its own
+            // span reasoning as the parser reads it.
+            Some(c)
+                if c.follows_reasoning()
+                    && (open || (p.think_entry == ThinkEntry::MayOpen && c.waits_for_call())) =>
+            {
+                (None, Some(Walk::new(c, false)))
+            }
             c => (c.as_ref().map(|c| Walk::new(c, open)), None),
         };
+        // The span's split the loop's think tracker reads, and a watch's pick
+        // while its program is held: both end the span at one id.
+        let split = || {
+            p.think_split.clone().unwrap_or_else(|| {
+                ThinkSplit::for_entry_with(p.think_entry, p.think).reading_specials(&*slot.vocab)
+            })
+        };
+        let free = p
+            .constraint
+            .as_ref()
+            .filter(|c| c.waits_for_call())
+            .map(|_| FreeText {
+                dec: slot.vocab.decoder(),
+                vocab: Arc::clone(&slot.vocab),
+                split: held.is_some().then(split),
+            });
         let pick = Pick {
             sampler,
             bias,
@@ -2269,6 +2403,7 @@ impl Gen {
             probs: p.logprobs.as_ref().map(Ask::collector),
             walk,
             held,
+            free,
             biased_row: Vec::new(),
             masked: Vec::new(),
             answered: 0,
@@ -2323,10 +2458,7 @@ impl Gen {
             tok: None,
             think: (p.reasoning_budget.is_some() || p.reasoning_loop || holds).then(|| {
                 Think::new(
-                    p.think_split.clone().unwrap_or_else(|| {
-                        ThinkSplit::for_entry_with(p.think_entry, p.think)
-                            .reading_specials(&*slot.vocab)
-                    }),
+                    split(),
                     p.reasoning_budget,
                     slot.vocab.encode(p.think.close),
                     p.reasoning_loop,
@@ -2365,11 +2497,12 @@ impl Gen {
     /// The logits buffer a step writes, or `None` on a greedy request and on
     /// a step whose token the program fixes, unless probabilities were asked.
     /// Nor does a greedy request that changes no row while its program is
-    /// held: its reasoning takes the engine's argmax.
+    /// held, or while its watch waits in free text: its reasoning and its
+    /// free text take the engine's argmax.
     pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
         let k = &mut self.pick;
         let unread = k.walk.as_mut().is_some_and(Walk::fixed_next)
-            || (k.held.is_some() && k.greedy && k.bias.add.is_empty());
+            || (k.in_free_text() && k.greedy && k.bias.is_empty());
         if unread && k.probs.is_none() {
             return None;
         }
@@ -2380,13 +2513,18 @@ impl Gen {
     /// while one is queued (the engine's answer is discarded — the loop never
     /// commits it, so nothing desyncs), else the request's pick from the row
     /// ([`Pick::choose`]). A request that asks for probabilities reads the
-    /// row as the engine wrote it.
+    /// row as the engine wrote it. A watch's refusal of the text the id
+    /// wrote is returned once the id is taken ([`Gen::pump`]).
     fn answer(&mut self, g: u32) -> u32 {
         let forced = self.think.as_mut().and_then(Think::next_forced);
         let id = self
             .pick
             .answer(&self.logits, &self.history, forced, Some(g));
         self.count_picks();
+        let answered = self.pick.answered;
+        if let Some((_, e)) = self.pick.refused.take_if(|(at, _)| *at == answered) {
+            self.refused_after = Some(e);
+        }
         id
     }
 
@@ -2773,28 +2911,17 @@ impl Gen {
             self.tim.predicted_ms = ms_since(self.t1);
             tick(&self.tim);
             if self.stops.contains(&tok) {
-                if self.pick.held.is_some() {
+                // A forced call still held ends the span unnamed; a watched
+                // one ends its reasoning as an unconstrained reply's span
+                // does, the answer its own.
+                if self.pick.held.as_ref().is_some_and(|w| !w.waiting()) {
                     return Err(GenError::Unclosed);
                 }
                 self.stop = StopKind::Eos;
                 break;
             }
             let piece = self.dec.push(tok);
-            // Where a special id's text is in its piece: the piece ends with
-            // it, after any bytes the decoder held. A piece that does not
-            // carry the text whole (a space a cleaning decoder holds) cannot
-            // place it, and the request ends by name rather than lose the span.
-            let special = if self.vocab.is_special(tok) {
-                let text = self.vocab.decode(&[tok]);
-                let at = piece
-                    .as_deref()
-                    .and_then(|p| p.strip_suffix(text.as_str()))
-                    .map(str::len)
-                    .ok_or(GenError::SpecialPiece(tok))?;
-                Some((at, text.len()))
-            } else {
-                None
-            };
+            let special = special_at(&*self.vocab, tok, piece.as_deref())?;
             if let Some((at, len)) = special {
                 self.specials.push((self.scan.text().len() + at, len));
             }
@@ -2881,12 +3008,13 @@ impl Gen {
             }
             // A pass takes `rows` positions from there, and every token it
             // keeps spends the think budget: it starts only while the budget
-            // holds them all, so no kept token spends past the cap. A held
-            // program's request steps until the program takes over.
+            // holds them all, so no kept token spends past the cap. A forced
+            // call's held program steps until it takes over; a watch's pick
+            // reads the span's close inside a pass.
             if self.rows > 1
                 && self.think_left() >= self.rows
                 && n + len + self.rows - 1 <= self.ctx_max
-                && self.pick.held.is_none()
+                && self.pick.held.as_ref().is_none_or(Walk::waiting)
             {
                 return Ok(if self.pick.reads_rows() {
                     Need::Sampled(tok)

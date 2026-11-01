@@ -43,7 +43,10 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::callstream::{Args, Reading, find_from, held, read_value};
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, refuse, value};
+use crate::constrain::{
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, is_text, object_parameters, outside,
+    value,
+};
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
 use crate::reasoning::{Marked, SpecialTags, partial_suffix};
@@ -652,42 +655,46 @@ impl CallRead {
 }
 
 /// The call `spelling` spells, as the parts structured output forces: the
-/// inverse of [`KvScan`]. The name, then the key, value and closing markers
-/// per parameter in the schema's order, as the template writes them. The
-/// scanner reads a value as text only where the schema says `"type":
-/// "string"`, itself or through a `$ref`, so a text-valued parameter that
-/// does not say it is refused rather than written as something that could
-/// read back as JSON.
-pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+/// inverse of [`KvScan`]. The name, then the parameters as the object rule
+/// writes them: the required ones, in the schema's order, then the optional
+/// ones, each of which may be left out. The scanner reads a value as text
+/// only where the schema says `"type": "string"`, itself or through a
+/// `$ref`, so a text-valued parameter that does not say it is refused
+/// rather than written as something that could read back as JSON.
+pub(crate) fn call_parts(
+    spelling: KvSpelling,
+    funs: &[Fun<'_>],
+    mode: CallMode,
+) -> Result<Call, Refusal> {
     let m = spelling.markers();
-    call(
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        if is_text(&a.schema) && a.schema.get("type").and_then(Value::as_str) != Some("string") {
+            return Err(outside(
+                &a.path,
+                format!(
+                    "{}'s tool markup reads a text value as text only under \"type\": \
+                     \"string\"; add it",
+                    m.family
+                ),
+            ));
+        }
+        let mut parts = vec![Part::Text(format!(
+            "{}{}{}{}",
+            m.key_open, a.key, m.key_close, m.value_open
+        ))];
+        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
+        Ok(parts)
+    };
+    let body = call(
         funs,
-        m.call_open,
+        "",
         |name| format!("{name}{}", m.line()),
         |f| {
-            let mut parts = Vec::new();
-            for a in &f.args {
-                if is_text(&a.schema)
-                    && a.schema.get("type").and_then(Value::as_str) != Some("string")
-                {
-                    return Err(refuse(
-                        &a.path,
-                        format!(
-                            "{}'s tool markup reads a text value as text only under \"type\": \
-                             \"string\"; add it",
-                            m.family
-                        ),
-                    ));
-                }
-                parts.push(Part::Text(format!(
-                    "{}{}{}{}",
-                    m.key_open, a.key, m.key_close, m.value_open
-                )));
-                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
-            }
+            let mut parts = object_parameters(&f.args, &block)?;
             parts.push(Part::Text(m.call_close.to_owned()));
             Ok(parts)
         },
-    )
+    )?;
+    Ok(Call::opened(m.call_open, mode, body))
 }

@@ -300,3 +300,15 @@ pub fn every_chunking(raw: &str, tag_stride: usize) -> Vec<Vec<&str>> {
     }
     out
 }
+
+/// `body` with one more tool, whose `tags` array schema the structured-output
+/// subset cannot compile: `tool_choice` auto then leaves the reply to the
+/// model (no watch), so the markup a script writes reaches the scan as it is.
+pub fn unwatched(mut body: Value) -> Value {
+    body["tools"]
+        .as_array_mut()
+        .expect("tools")
+        .push(json!({"type": "function", "function": {"name": "note",
+            "parameters": {"type": "object", "properties": {"tags": {"type": "array"}}}}}));
+    body
+}

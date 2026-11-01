@@ -4,11 +4,12 @@
 //!
 //! - [`schema`]: the request's fields (`response_format` `json_schema` or
 //!   `json_object`, `tool_choice` `required` or named) to a program as text.
-//!   The JSON-schema subset is an object (every property written, in the
-//!   schema's order), arrays with `items`, `anyOf`, `$ref` into the schema,
-//!   string, integer and boolean enums, `const`, booleans, null, integers,
-//!   numbers and free strings with an optional `maxLength`; anything else is a
-//!   400 naming the keyword.
+//!   The JSON-schema subset is an object (the properties `required` names
+//!   written in the schema's order, then the others in order, each of which
+//!   may be left out — llama.cpp's object rule), arrays with `items`,
+//!   `anyOf`, `$ref` into the schema, string, integer and boolean enums,
+//!   `const`, booleans, null, integers, numbers and free strings with an
+//!   optional `maxLength`; anything else is a 400 naming the keyword.
 //! - [`program`]: the program as ids, built with the serve `Tokenizer`, and
 //!   the [`Walk`] over it that picks every token. A forced text is one id
 //!   after another, a choice is a trie, a free string or number takes any
@@ -19,7 +20,15 @@
 //!
 //! The tool-call text comes from the chat format's own module (`hermes`,
 //! `qwenxml`, `glmxml`, `dsml`): each has an inverse of its parser, a
-//! `call_parts` beside it, and none of this module knows a model.
+//! `call_parts` beside it, and none of this module knows a model. It names
+//! the call opener apart from the rest, so one function serves a forced
+//! call (the program writes the opener too) and a `tool_choice: auto`
+//! request's free text, which is watched for the opener: the generation is
+//! free until the model opens a call, the program runs from the opener to
+//! the call's close, and free text follows again, each further opener
+//! starting the program again. Muse Spark's markup names no such opener (its
+//! recipient slot names the answer's channels as well as a tool), so its
+//! replies stay free under auto.
 //!
 //! The generation loop ([`crate::genloop`]) asks the walk for each token
 //! through the same logits-row path a banned id takes, and feeds the chosen
@@ -44,7 +53,10 @@ mod vocab;
 #[cfg(test)]
 pub(crate) use program::Kid;
 pub(crate) use program::{Constraint, Decision, Draw, Part, StepError, Style, Walk, Watch};
-pub(crate) use schema::{Ask, Fun, call, is_text, refuse, request, value};
+pub(crate) use schema::{
+    Arg, Ask, Call, CallMode, Fun, any_start, call, is_text, object_parameters, outside, request,
+    value,
+};
 pub(crate) use vocab::Vocab;
 
 /// A request the constrained path will not take, named. The route answers it
@@ -56,6 +68,11 @@ pub(crate) struct Refusal {
     pub message: String,
     /// The markup is unsupported, not the request invalid.
     pub unsupported: bool,
+    /// The request is valid and names a keyword or shape the compiler does
+    /// not serve (a schema keyword outside the subset, text the vocabulary
+    /// cannot spell). A forced choice refuses it all the same; a watched
+    /// call serves it with no watch.
+    pub outside_subset: bool,
     /// The path of the request field refused (`response_format.json_schema.schema.items`),
     /// when the refusal is about one.
     pub field: Option<String>,
@@ -66,7 +83,16 @@ impl Refusal {
         Refusal {
             message,
             unsupported: false,
+            outside_subset: false,
             field: None,
+        }
+    }
+
+    /// A valid request the compiler does not serve ([`Refusal::outside_subset`]).
+    pub(crate) fn outside_subset(message: String) -> Refusal {
+        Refusal {
+            outside_subset: true,
+            ..Refusal::invalid(message)
         }
     }
 }

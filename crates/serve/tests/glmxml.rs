@@ -596,14 +596,22 @@ fn hw_glm_malformed_call_is_an_api_error() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(false)),
+        );
         assert_eq!(r.status, 500, "{}", r.body);
         let m = r.json()["error"]["message"]
             .as_str()
             .unwrap_or("")
             .to_owned();
         assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(true)),
+        );
         assert_eq!(r.status, 200, "{}", r.body);
         let e = fold_stream(&r.body).expect_err("an error event");
         assert!(e.starts_with(want), "{e}");

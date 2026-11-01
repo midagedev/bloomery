@@ -1590,10 +1590,24 @@ impl Engine for DraftMock {
 /// output a parser gate scripts. Tokens are [`MockTokenizer`]'s, so the special
 /// strings are single ids and everything else goes byte by byte;
 /// [`ScriptedEngine::with_stops`] gives it a vocabulary with other stop ids.
+///
+/// The script is served as the ids the engine is fed, not as a count of its
+/// rows: a prefill that continues the script (a jump arm feeding the fixed
+/// ids of a program) advances it — its first id the one the last step
+/// answered, fed for the first time — where the prompt, which spells none of
+/// it, leaves it alone.
 pub struct ScriptedEngine {
     script: Vec<u32>,
+    /// The script's ids consumed so far: the ids fed since the generation
+    /// began, the jump arm's calls among them.
     at: usize,
     pos: usize,
+    /// Whether a generation's first row has been asked for: prefills before
+    /// it are the prompt, ones after it a call the jump arm feeds.
+    started: bool,
+    /// The ids one pass keeps ([`ScriptedEngine::drafting`]); 1 without a
+    /// draft.
+    rows: usize,
     ctx_max: usize,
     tok: Arc<dyn Tokenizer>,
 }
@@ -1612,8 +1626,32 @@ impl ScriptedEngine {
             script,
             at: 0,
             pos: 0,
+            started: false,
+            rows: 1,
             ctx_max,
             tok: Arc::new(MockTokenizer),
+        }
+    }
+
+    /// The same engine drafting: a pass proposes the script's next ids, so a
+    /// greedy pass keeps the next `rows` up to the end of generation, and a
+    /// pass whose rows a request's pick reads keeps the picks, stopping
+    /// after the first that is not the script's ([`Engine::advance_sampled`]).
+    /// It grants no cut.
+    #[must_use]
+    pub fn drafting(self, rows: usize) -> Self {
+        ScriptedEngine { rows, ..self }
+    }
+
+    /// Consumes `ids` as the script's next ones, stopping at the first the
+    /// script does not hold: what the engine is fed is what its script has
+    /// written.
+    fn consume(&mut self, ids: &[u32]) {
+        for &id in ids {
+            if self.script.get(self.at) != Some(&id) {
+                break;
+            }
+            self.at += 1;
         }
     }
 
@@ -1710,10 +1748,13 @@ impl Engine for ScriptedEngine {
 
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
         self.pos += ids.len();
+        if self.started {
+            self.consume(ids);
+        }
         Ok(())
     }
 
-    fn next(&mut self, _last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+    fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         if self.pos >= self.ctx_max {
             return Err(EngineError(format!(
                 "scripted: position {} is past ctx_max {}",
@@ -1721,12 +1762,16 @@ impl Engine for ScriptedEngine {
             )));
         }
         self.pos += 1;
+        if self.started {
+            self.consume(std::slice::from_ref(&last));
+        } else {
+            self.started = true;
+        }
         let id = self
             .script
             .get(self.at)
             .copied()
             .unwrap_or_else(|| self.tok.eos());
-        self.at += 1;
         if let Some(l) = logits_out {
             l.fill(FLOOR);
             if let Some(slot) = usize::try_from(id).ok().and_then(|i| l.get_mut(i)) {
@@ -1736,9 +1781,66 @@ impl Engine for ScriptedEngine {
         Ok(id)
     }
 
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        let mut id = self.next(last, None)?;
+        out.push(id);
+        let mut kept = 0;
+        while kept + 1 < self.rows && id != self.tok.eos() {
+            id = self.next(id, None)?;
+            out.push(id);
+            kept += 1;
+        }
+        Ok(Drafted {
+            proposed: kept,
+            accepted: kept,
+        })
+    }
+
+    fn advance_rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Each verified row is the row [`Engine::next`] writes, the script's next
+    /// id its draft: the pick from it is fed as the next row's last, so a pick
+    /// the script does not hold leaves the script where it stood.
+    fn advance_sampled(
+        &mut self,
+        last: u32,
+        history: Vec<u32>,
+        mut sampler: Sampler,
+        _best: Option<usize>,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
+        let mut seen = history.clone();
+        let mut row = vec![FLOOR; self.tok.n_vocab()];
+        let mut fed = last;
+        let pass = loop {
+            let draft = match self.next(fed, Some(&mut row)) {
+                Ok(id) => id,
+                Err(e) => break Err(e),
+            };
+            let id = sampler(&row, &seen);
+            seen.push(id);
+            out.push(id);
+            if id != draft || out.len() == self.rows || id == self.tok.eos() {
+                break Ok(Drafted {
+                    proposed: self.rows - 1,
+                    accepted: out.len() - 1,
+                });
+            }
+            fed = id;
+        };
+        (pass, history, sampler)
+    }
+
+    fn drafts_sampled(&self) -> bool {
+        self.rows > 1
+    }
+
     fn reset(&mut self) -> Result<(), EngineError> {
         self.at = 0;
         self.pos = 0;
+        self.started = false;
         Ok(())
     }
 
@@ -1799,6 +1901,21 @@ mod tests {
         let mut d = m.decoder();
         let streamed: String = ids.iter().filter_map(|&id| d.push(id)).collect();
         assert_eq!(streamed, text);
+    }
+
+    /// A jump arm's call feeds the id the last step answered, then the run:
+    /// each is the script's next id, a repeat of the one before it too, so
+    /// the script "aab" ends at its end.
+    #[test]
+    fn a_scripted_call_consumes_a_repeated_id() {
+        let t = MockTokenizer;
+        let (a, b) = (t.encode("a")[0], t.encode("b")[0]);
+        let mut e = ScriptedEngine::from_ids(64, vec![a, a, b]);
+        let prompt = t.encode("hi");
+        e.prefill(&prompt[..prompt.len() - 1]).expect("fits");
+        assert_eq!(e.next(prompt[prompt.len() - 1], None).expect("fits"), a);
+        assert_eq!(e.next(a, None).expect("fits"), a);
+        assert_eq!(e.next_after(&[a, b], None).expect("fits"), t.eos());
     }
 
     #[test]
