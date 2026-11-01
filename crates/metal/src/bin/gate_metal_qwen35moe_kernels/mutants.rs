@@ -666,6 +666,7 @@ pub const GDN48_KEPT: &[&str] = &[
     "delta_roll_keep",
     "delta_lane_in_place",
     "delta_ring_slot",
+    "delta_ring_overflow",
     "delta_partial_scale",
     "delta_nan_zero",
     "rows_ring_slot",
@@ -1300,6 +1301,16 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "uint slot = pos % BLOOMERY_DELTA_RING_ROWS;",
             "uint slot = (pos + 1u) % BLOOMERY_DELTA_RING_ROWS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_ring_overflow",
+        clause: "delta_ring",
+        why: "adding the ring length before subtracting the tap distance wraps at large positions",
+        edits: &[(
+            "uint s = (pos0 - back) % BLOOMERY_DELTA_RING_ROWS;",
+            "uint s = (pos0 + BLOOMERY_DELTA_RING_ROWS - back) % BLOOMERY_DELTA_RING_ROWS;",
             1,
         )],
     },

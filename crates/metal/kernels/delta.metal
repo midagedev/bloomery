@@ -165,7 +165,7 @@ inline float tap_x(uint c, uint pos0, uint r, uint d, uint ch, uint x_stride,
     if (pos0 < back) {
         return 0.0f;
     }
-    uint s = (pos0 + BLOOMERY_DELTA_RING_ROWS - back) % BLOOMERY_DELTA_RING_ROWS;
+    uint s = (pos0 - back) % BLOOMERY_DELTA_RING_ROWS;
     return ring[s * ch + c];
 }
 
