@@ -565,8 +565,24 @@ pub fn delta_ring(h: &Harness<'_>, params: Params<'_>) -> Clause {
     if common::bits_eq(&at_two.g, &at_two_zero.g) {
         return Err("position 2 ignored the distance-2 ring slot".to_string());
     }
+    let ring_rows = u32::try_from(delta.ring_rows).expect("the ring length fits the position word");
+    let last_safe = u32::MAX - ring_rows;
+    for pos in [last_safe, last_safe + 1, u32::MAX] {
+        let equivalent = pos % ring_rows + ring_rows;
+        let high = ring_launch(h, &owned, &owned.ring, pos, true)?;
+        let low = ring_launch(h, &owned, &owned.ring, equivalent, true)?;
+        if !common::bits_eq(&high.g, &low.g)
+            || !common::bits_eq(&high.partials, &low.partials)
+            || !common::bits_eq(&high.state, &low.state)
+            || !common::bits_eq(&high.ring, &low.ring)
+        {
+            return Err(format!(
+                "position {pos} differs from ring-equivalent position {equivalent}"
+            ));
+        }
+    }
     Ok(Verdict::Noted(
-        "position 0 reads no ring slot, positions 1 and 2 read the live slot, and one slot is written"
+        "position 0 reads no ring slot, positions 1 and 2 read the live slot, one slot is written, and positions through u32::MAX match their ring-equivalent positions"
             .to_string(),
     ))
 }
