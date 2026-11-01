@@ -14,7 +14,7 @@ use bloomery_gpu_glm5next::checkpoint_price;
 use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PlaceError, PlanInputs,
 };
-use model::placement::ctx_ask::Probe;
+use model::placement::ctx_ask::{Chosen, Probe, probe_of};
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan, PlanLevers};
 
@@ -125,8 +125,8 @@ pub fn named(machine: &Machine, e: PlaceError) -> GateError {
 /// to `ORACLE_POSITIONS`; a set share past it stops by name, and one the
 /// machine cannot hold stops with the largest it would hold; unset, a slot
 /// asks the target and halves while the plan is short. Each probe plans the
-/// machine laid at its context (`machine_at`). The context a slot gets and
-/// the choice's `ctx` line.
+/// machine laid at its context (`machine_at`, [`probe`]). The choice, whose
+/// `ctx` line the caller prints.
 ///
 /// # Errors
 /// As `generate::choose_ctx_of`.
@@ -140,23 +140,29 @@ pub fn serve_ctx(
     levers: &PlanLevers,
     nextn: Option<&NextnInputs>,
     asked: (Option<usize>, usize),
-) -> Result<(usize, String), GateError> {
-    let slots = asked.1;
-    let plan_at = |c: u64| -> Result<Probe<()>, GateError> {
-        let machine = machine_at(c)?;
-        match plan_of(inputs, &machine, c, levers, nextn, slots) {
-            Ok(_) => Ok(Probe::Holds(())),
-            Err(e) => match model::placement::ctx_ask::PlanRefusal::short(&e) {
-                Some(short) => Ok(Probe::Short(short)),
-                None => Err(named(&machine, e)),
-            },
-        }
-    };
-    let chosen = choose_ctx_of(
+) -> Result<Chosen<()>, GateError> {
+    choose_ctx_of(
         u64::try_from(inputs.hp.n_ctx_train)?,
         asked,
         (None, Some((ORACLE_POSITIONS, "ORACLE_POSITIONS"))),
-        plan_at,
-    )?;
-    Ok((usize::try_from(chosen.slot_ctx)?, chosen.line()))
+        |c| probe(inputs, &machine_at(c)?, (c, asked.1), levers, nextn),
+    )
+}
+
+/// The plan of `slots` sequences of `ctx` positions on `machine` ([`plan_of`]), as the
+/// context choice and `--parallel auto`'s count read it: a refusal short of a memory is
+/// [`Probe::Short`], any other the seat's, named by the machine's reserves ([`named`]).
+#[allow(
+    dead_code,
+    reason = "the serve seat and the routed legs choose with it; the CLI takes its own --ctx"
+)]
+pub fn probe(
+    inputs: &PlanInputs,
+    machine: &Machine,
+    (ctx, slots): (u64, usize),
+    levers: &PlanLevers,
+    nextn: Option<&NextnInputs>,
+) -> Result<Probe<()>, GateError> {
+    probe_of(plan_of(inputs, machine, ctx, levers, nextn, slots).map(|_| ()))
+        .map_err(|e| named(machine, e))
 }

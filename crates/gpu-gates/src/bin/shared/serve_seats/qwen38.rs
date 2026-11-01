@@ -456,12 +456,12 @@ use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
-    SlotAsk, SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
+    SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
     bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
     prefill_then_step, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{
-    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, holds_no_ctx, lane_of,
+    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of,
 };
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::step_census;
@@ -485,7 +485,7 @@ use model::arch::qwen35moe::place::{
     widen_card_route,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx_ask::{AUTO_MOST, DEFAULT_SLOTS, Rule, card_experts_floor, most_slots};
+use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule, card_experts_floor};
 use model::placement::workstation::{
     self, CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
 };
@@ -1418,73 +1418,25 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
 }
 
 /// `--parallel auto`'s count over `plans`, the one-slot plans the load chose its placement
-/// and draft by ([`most_slots`] up to [`AUTO_MOST`]), and the `--ctx-size` total it asks: at
-/// `--slot-ctx` (`slot_ctx`) the most slots whose plan holds it, the total that times the
-/// count; unset, the most whose plan holds the context one slot's default takes where that is
-/// the target (the model's limit), with no total, so the default asks the target again over
-/// every slot. A default fitted under the target at one slot serves one, as does one whose
-/// floor the plans cannot hold, or a drafted one that holds no context
-/// (`generate::holds_no_ctx`; the default's draft yield answers both, and a draft that
-/// cannot yield keeps the refusal), and so does a
-/// `--slot-ctx` one slot cannot hold, whose ask is refused by name as a set context.
+/// and draft by, and the `--ctx-size` total it asks (the common count, [`AutoSlots::count`],
+/// up to `ctx_ask::AUTO_MOST`): the one-slot ask is the seat's context choice ([`ctx38`]), and where
+/// its default leaves the unset residency its experts ([`Plans::floor`]) every count's plan
+/// leaves them too ([`Plans::holds_leaving`]). The draft yields to the context, so a drafted
+/// default that holds no context serves one slot.
 fn auto38(plans: &Plans<'_>, slot_ctx: Option<usize>) -> Result<(usize, Option<usize>), GateError> {
-    let (ctx, least) = match slot_ctx {
-        Some(s) => (s, None),
-        None => match ctx38(plans, None) {
-            Ok(Ctx38 {
-                ctx,
-                rule: Rule::Target,
-                unmet,
-                ..
-            }) => (ctx, plans.floor.filter(|_| unmet.is_none())),
-            Ok(chosen) => {
-                eprintln!(
-                    "parallel auto slots=1: the default context is fitted below the model limit (ctx={ctx})",
-                    ctx = chosen.ctx
-                );
-                return Ok((1, None));
-            }
-            // A floor the machine cannot hold, or a drafted plan that holds no context, is the
-            // one-slot default's to answer: its yield plans without the draft, and asks the
-            // refusal again where the draft cannot yield.
-            Err(e)
-                if e.is::<FloorShort>()
-                    || plans.mtp.is_some() && holds_no_ctx::<PlaceError>(&e) =>
-            {
-                eprintln!("parallel auto slots=1: the default does not hold at one slot ({e})");
-                return Ok((1, None));
-            }
-            Err(e) => return Err(e),
+    AutoSlots { slot_ctx }.count::<PlaceError, _>(
+        plans.mtp.is_some(),
+        |set| {
+            let c = ctx38(plans, set)?;
+            let floored = c.rule == Rule::Target && c.unmet.is_none();
+            Ok((c.ctx, c.rule, plans.floor.filter(|_| floored)))
         },
-    };
-    let n = most_slots(AUTO_MOST, |n| {
-        use model::placement::PlacementError;
-        use model::placement::ctx_ask::{PlanRefusal, Probe, Short, Side};
-        use model::placement::workstation::HostShort;
-
-        let e = match (Plans { slots: n, ..*plans }).holds_leaving(ctx, least) {
-            Ok(()) => return Ok(Probe::Holds(())),
-            Err(e) => e,
-        };
-        // A slot count also raises host and arena floors that shrinking the context cannot fix.
-        let placement = e
-            .downcast_ref::<PlaceError>()
-            .and_then(PlanRefusal::placement)
-            .or_else(|| e.downcast_ref::<PlacementError>());
-        if let Some(short) = placement.and_then(PlacementError::host_floor_short) {
-            return Ok(Probe::Short(short));
-        }
-        match e.downcast_ref::<HostShort>() {
-            Some(short) => Ok(Probe::Short(Short {
-                on: Side::Host,
-                need: short.need.bytes(),
-                room: short.available,
-            })),
-            None => q38place::probe(Err(e)),
-        }
-    })?
-    .unwrap_or(1);
-    Ok((n, slot_ctx.map(|s| s * n)))
+        |&least, n, ctx| {
+            (Plans { slots: n, ..*plans })
+                .holds_leaving(ctx, least)
+                .map(|()| true)
+        },
+    )
 }
 
 pub(crate) struct Args {
@@ -1510,7 +1462,7 @@ pub(crate) struct Args {
     /// (one).
     parallel: Option<usize>,
     /// `--parallel auto`: the seat counts the slots from its plans
-    /// ([`auto38`]); `parallel` and `ctx` are unset beside it.
+    /// ([`auto38`]); `parallel` is unset beside it and `ctx` is `--slot-ctx`.
     auto: Option<AutoSlots>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; set is refused by name (resident slots park
@@ -1594,10 +1546,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    match slots.ask(a.ctx)? {
-        SlotAsk::Given { ctx, parallel } => (a.ctx, a.parallel) = (ctx, parallel),
-        SlotAsk::Auto(auto) => a.auto = Some(auto),
-    }
+    (a.ctx, a.parallel, a.auto) = slots.asked(a.ctx)?;
     if a.ctx == Some(0) {
         return Err("--ctx-size 0: the stores hold no position".into());
     }
@@ -1658,9 +1607,6 @@ pub(crate) fn check(
                 let (slots, _) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
                 if let Some(ctx) = a.ctx {
                     check_mtp_ctx(ctx / slots, slots)?;
-                }
-                if let Some(ctx) = a.auto.and_then(|auto| auto.slot_ctx) {
-                    check_mtp_ctx(ctx, 1)?;
                 }
             }
             WidthMode::of(levers.mtp_width())?;
@@ -1809,9 +1755,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The route trace records one sequence's steps, so its default is one, and so is its
     // `--parallel auto`. Until auto's count is chosen ([`auto38`], once the placement and the
     // draft are), the seat runs its one-slot ask: one slot at `--slot-ctx`, or the default.
-    if let Some(ctx) = a.auto.and_then(|auto| auto.slot_ctx) {
-        a.ctx = Some(ctx);
-    }
     let (slots, from) = match slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)? {
         _ if a.auto.is_some() && feed.traced => (1, SlotsFrom::RouteTrace),
         _ if a.auto.is_some() => (1, SlotsFrom::Auto),

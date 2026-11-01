@@ -2773,7 +2773,7 @@ pub mod groups {
         /// A tiered seat's run: the plan it loads and its need (`tiered::run`).
         pub const RUN: &[&Kind] = &[&PLAN, &NEED];
 
-        /// The residency lever's record (`tiered::residency_pick`).
+        /// The selected load's residency lever record (`tiered::run`).
         pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
     }
 
@@ -4627,7 +4627,7 @@ mod tests {
                 ],
             ),
             (
-                "mimo2 seat: residency_pick, residency_set, bind::spawn",
+                "mimo2 seat: tiered::run, residency_set, bind::spawn",
                 BLOOMERY_SERVE_MIMO2,
                 &[
                     side_seat::SEAT,
@@ -4639,7 +4639,7 @@ mod tests {
                 ],
             ),
             (
-                "solar2 seat: residency_pick, residency_set, hybrid::open_session, bind::spawn",
+                "solar2 seat: tiered::run, residency_set, hybrid::open_session, bind::spawn",
                 BLOOMERY_SERVE_SOLAR2,
                 &[
                     side_seat::SEAT,
@@ -4653,7 +4653,7 @@ mod tests {
                 ],
             ),
             (
-                "hybrid seat: residency_pick, settle_pick, hybrid::open_session, bind::spawn",
+                "hybrid seat: tiered::run, settle_pick, hybrid::open_session, bind::spawn",
                 BLOOMERY_SERVE_HYBRID,
                 &[
                     side_seat::SEAT,
@@ -4669,7 +4669,7 @@ mod tests {
                 ],
             ),
             (
-                "minimaxm3 seat: residency_pick, residency_set, MiniMax::open, bind::spawn",
+                "minimaxm3 seat: tiered::run, residency_set, MiniMax::open, bind::spawn",
                 BLOOMERY_SERVE_MINIMAXM3,
                 &[
                     side_seat::SEAT,
@@ -4683,7 +4683,7 @@ mod tests {
                 ],
             ),
             (
-                "musespark seat: Side::seat, residency_pick, settle_pick, Muse::open, bind::spawn",
+                "musespark seat: Side::seat, tiered::run, settle_pick, Muse::open, bind::spawn",
                 BLOOMERY_SERVE_MUSESPARK,
                 &[
                     side_seat::SEAT,

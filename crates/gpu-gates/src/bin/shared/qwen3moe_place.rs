@@ -1512,34 +1512,52 @@ pub fn serve_choice_lanes(
     };
     let plan_at = |c: u64| -> Result<Probe<ServeLoad>, GateError> {
         probes += 1;
-        let total = usize::try_from(c)?.saturating_mul(slots);
-        let load = match serve_load((split, &census), (total, slots), o, lanes) {
-            Ok(load) => load,
-            Err(e) => {
-                // The load asked at a ladder size: it fits, or is short of the card.
-                let fits = |u: usize| {
-                    let at = ServeOpts {
-                        ubatch: Some(u),
-                        ..o
-                    };
-                    match serve_load((split, &census), (total, slots), at, lanes) {
-                        Ok(_) => Ok(true),
-                        Err(e) => short_or(e).map(|_| false),
-                    }
-                };
-                return short_or(e).and_then(|p| named_size(p, asked, (c, slots), fits));
+        // The load asked at a ladder size: it fits, or is short of the card.
+        let fits = |u: usize| {
+            let at = ServeOpts {
+                ubatch: Some(u),
+                ..o
+            };
+            let total = usize::try_from(c)?.saturating_mul(slots);
+            match serve_load((split, &census), (total, slots), at, lanes) {
+                Ok(_) => Ok(true),
+                Err(e) => short_or(e).map(|_| false),
             }
         };
-        if let ServeLoad::Placed { q, total, .. } = &load
-            && let Err(e) = q.plan(*total, o.levers)
-        {
-            return short_or(e);
-        }
-        Ok(Probe::Holds(load))
+        let probe = serve_probe((split, &census), (c, slots), o, lanes)?;
+        named_size(probe, asked, (c, slots), fits)
     };
     let chosen = choose_ctx(split, (set, slots), (None, None), plan_at)?;
     let censuses = census_reads() - before;
     Ok((chosen, Reads { censuses, probes }))
+}
+
+/// The load [`serve_load`] makes for `slots` slots of `c` positions each, a placed one planned
+/// there too, as the context choice and `--parallel auto`'s count read it: a load or plan short of
+/// a memory is [`Probe::Short`] ([`short_or`]), any other refusal the error. A user's ubatch is
+/// only ever asked of a load with no routed expert, which loads whole and has no plan, so a short
+/// plan is never one of hers ([`named_size`]).
+#[allow(
+    dead_code,
+    reason = "the serve seat and the routed legs read it; the CLI and the e2e gates include the planner without it"
+)]
+pub fn serve_probe(
+    (split, census): (&Split, &[DeviceInfo]),
+    (c, slots): (u64, usize),
+    o: ServeOpts<'_>,
+    lanes: usize,
+) -> Result<Probe<ServeLoad>, GateError> {
+    let total = usize::try_from(c)?.saturating_mul(slots);
+    let load = match serve_load((split, census), (total, slots), o, lanes) {
+        Ok(load) => load,
+        Err(e) => return short_or(e),
+    };
+    if let ServeLoad::Placed { q, total, .. } = &load
+        && let Err(e) = q.plan(*total, o.levers)
+    {
+        return short_or(e);
+    }
+    Ok(Probe::Holds(load))
 }
 
 /// A short probe of a load whose ubatch the user named (`ask`), at the least context the choice tries
