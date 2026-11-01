@@ -12,6 +12,7 @@ use bloomery_gpu_glm5next::{Body, GlmArena, Nextn, PrefillMode};
 
 use super::WHAT;
 use crate::mtp::{DraftHead, Feed, MtpBody, UnitSink, WalkMode};
+use runtime::prompt::CallEnd;
 
 impl MtpBody for Body {
     /// A proposal of one id: the NextN layer predicts one position ahead.
@@ -67,9 +68,10 @@ impl MtpBody for Body {
         m: &mut GpuModel<Body>,
         ids: &[u32],
         path: PrefillMode,
+        end: CallEnd,
         sink: Option<&mut UnitSink<'_, Body>>,
-    ) -> Result<u32, GpuError> {
-        bloomery_gpu_glm5next::prompt_with(m, ids, path, sink)
+    ) -> Result<Option<u32>, GpuError> {
+        bloomery_gpu_glm5next::prompt_with(m, ids, path, end, sink)
     }
 
     /// [`bloomery_gpu_glm5next::prompt_media_with`]: the body's media call with the sink, its

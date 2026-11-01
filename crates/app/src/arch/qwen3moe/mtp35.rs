@@ -13,6 +13,7 @@ use bloomery_gpu::arch::qwen3moe::{
 
 use super::path35;
 use crate::mtp::{DraftHead, Feed, MtpBody, UnitSink, WalkMode};
+use runtime::prompt::CallEnd;
 
 /// The path value the window stores. [`MtpBody::prompt_with`] does not read
 /// it: a Qwen3.6 prompt's schedule is [`path35`] of that call's length.
@@ -92,9 +93,10 @@ impl MtpBody for Body35 {
         m: &mut Qwen35moeModel,
         ids: &[u32],
         _path: Prompt35,
+        end: CallEnd,
         sink: Option<&mut UnitSink<'_, Body35>>,
-    ) -> Result<u32, GpuError> {
-        prompt_with35(m, ids, path35(ids.len()), sink)
+    ) -> Result<Option<u32>, GpuError> {
+        prompt_with35(m, ids, path35(ids.len()), end, sink)
     }
 
     fn walk(

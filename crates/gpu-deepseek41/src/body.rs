@@ -124,8 +124,8 @@ pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
     BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, MediaKind,
     PrefillMode, PrefillStats, PromptCounts, RouteTap, Span41, T_MAX, batch_count, batches,
-    prefill, prefill_media, prefill_media_observed, prefill_observed, prefill_with, prepare_media,
-    prepare_prefill,
+    prefill, prefill_media, prefill_media_observed, prefill_observed, prefill_unread, prefill_with,
+    prepare_media, prepare_prefill,
 };
 use seq::RowSeqs;
 pub use seq::{KeepLimit, Seq};

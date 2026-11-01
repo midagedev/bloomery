@@ -16,6 +16,7 @@ use bloomery_gpu_deepseek41::body::{
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, Plan};
+use runtime::prompt::CallEnd;
 use runtime::{Tapped, TappedPrompt, Target};
 
 use crate::{Keep, Open, Prompt, Session, SessionError};
@@ -131,6 +132,20 @@ impl Prompt for Body {
                 m.step(ids)
             }
         }
+    }
+
+    /// [`Prompt::prompt`], an unread call of batches with no head
+    /// ([`body::prefill_unread`]); the steps run their heads whatever the end.
+    fn prompt_call(
+        m: &mut GpuModel<Body>,
+        ids: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
+        let batched = m.body(WHAT)?.prefill_mode() == PrefillMode::Batch;
+        if end == CallEnd::Unread && batched && !m.body(WHAT)?.hybrid().route_traced() {
+            return prompt_pass(m, |m| body::prefill_unread(m, ids)).map(|()| None);
+        }
+        Self::prompt(m, ids).map(Some)
     }
 }
 

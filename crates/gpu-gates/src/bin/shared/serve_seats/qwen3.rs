@@ -227,7 +227,7 @@ use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
     self, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, TemplateFile, Vocab,
-    arm_screen, bind_server, note_line, parallel_line, placement_of, slots_given,
+    arm_screen, bind_server, call_token, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::qwen_seat::Family;
@@ -244,6 +244,7 @@ use model::arch::qwen35moe::mtp::{InFile, in_file};
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS};
 use runtime::Target as _;
+use runtime::prompt::CallEnd;
 use runtime::seqstate::Why;
 use runtime::width::Mode as WidthMode;
 #[cfg(feature = "vision")]
@@ -1219,8 +1220,19 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.prompt_call(ids, CallEnd::Argmax)
+    }
+
+    /// The body's prompt call ending as `end` asks
+    /// ([`app::Prompt::prompt_call`]: a Qwen3.5/3.6 call runs no head when
+    /// unread), through the draft as [`Q3::prefill`] runs it: the DSpark
+    /// draft's own call runs its head whatever the end.
+    fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
         self.draft.prefill(&mut self.s, ids, |s| {
-            <B as Body3>::prompt(s.model_mut(), ids)
+            call_token(
+                end,
+                <B as app::Prompt>::prompt_call(s.model_mut(), ids, end)?,
+            )
         })
     }
 
@@ -1588,8 +1600,16 @@ impl Seat for Q35Mtp {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.prompt_call(ids, CallEnd::Argmax)
+    }
+
+    /// The draft's prompt call ([`SlotDrafts::prompt_call`]), the target's
+    /// head run only when `end` reads it. A delta layer takes no checkpoint
+    /// inside a unit, so the seat folds no last id
+    /// ([`Seat::prefill_next`]'s default).
+    fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
         let sel = self.s.selected();
-        self.drafted.prefill(&mut self.s, sel, ids)
+        self.drafted.prompt_call(&mut self.s, sel, ids, end)
     }
 
     /// Answer positions take no checkpoints. The prompt calls keep theirs.

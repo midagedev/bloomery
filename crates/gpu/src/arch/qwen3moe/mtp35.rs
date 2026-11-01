@@ -63,6 +63,7 @@ use chain::arch::qwen3moe::walk;
 use cuda_core::DeviceBuffer;
 use model::arch::models::MtpDraft;
 use model::arch::qwen3moe::names::token_embd;
+use runtime::prompt::CallEnd;
 
 const WHAT: &str = "qwen35moe Mtp35";
 
@@ -754,21 +755,23 @@ fn split_body(body: &mut super::body35::Body35) -> Result<Body35Fields<'_>, GpuE
 pub type Prompt35Sink<'a> =
     dyn FnMut(&mut super::Qwen35moeModel, MtpArena, u32, usize) -> Result<(), GpuError> + 'a;
 
-/// The prompt call on `path`, one residency pass, and `sink` after each unit
-/// with the ubatch arena the unit's rows sit in.
+/// The prompt call on `path` ending as `end` asks
+/// ([`super::Qwen35moeModel::prefill_call`]), one residency pass, and `sink`
+/// after each unit with the ubatch arena the unit's rows sit in.
 pub fn prompt_with35(
     m: &mut super::Qwen35moeModel,
     ids: &[u32],
     path: PrefillPath,
+    end: CallEnd,
     sink: Option<&mut Prompt35Sink<'_>>,
-) -> Result<u32, GpuError> {
+) -> Result<Option<u32>, GpuError> {
     crate::host::served::prompt_pass(m, |m| match sink {
-        None => m.prefill_hooked(ids, path, None),
+        None => m.prefill_hooked(ids, path, None, end),
         Some(sink) => {
             let mut hook = |model: &mut super::Qwen35moeModel, first: u32, rows: usize| {
                 sink(model, MtpArena::Ubatch, first, rows)
             };
-            m.prefill_hooked(ids, path, Some(&mut hook))
+            m.prefill_hooked(ids, path, Some(&mut hook), end)
         }
     })
 }

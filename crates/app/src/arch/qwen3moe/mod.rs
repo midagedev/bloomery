@@ -32,6 +32,7 @@ use bloomery_gpu::arch::qwen3moe::{
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu::route_softmax::MAX_TOKENS;
+use runtime::prompt::CallEnd;
 use runtime::seqstate::Kept;
 use runtime::{Speculative, TapSink, Tapped, TappedPrompt, Want};
 
@@ -59,6 +60,17 @@ impl Prompt for Body38 {
     /// prompt's length — the argmax after the last id.
     fn prompt(m: &mut Qwen38Model, ids: &[u32]) -> Result<u32, GpuError> {
         m.prompt38(ids, Prompt38::Auto)
+    }
+
+    /// [`Prompt::prompt`] ending as `end` asks
+    /// ([`Qwen38Model::prompt38_call`]): no head for an unread call, and a
+    /// closing call's last id folded into its last ubatch.
+    fn prompt_call(
+        m: &mut Qwen38Model,
+        ids: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
+        m.prompt38_call(ids, Prompt38::Auto, end, None)
     }
 }
 
@@ -142,6 +154,17 @@ impl Prompt for Body35 {
     /// its boundary before the first unit, none inside.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GpuError> {
         prompt_pass(m, |m| m.prefill_with(ids, path35(ids.len())))
+    }
+
+    /// [`Prompt::prompt`] by the body's `prefill_call`: no head at all for an
+    /// unread call. A closing call is refused by name
+    /// there: a delta layer takes no checkpoint inside a unit.
+    fn prompt_call(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
+        prompt_pass(m, |m| m.prefill_call(ids, path35(ids.len()), end))
     }
 }
 

@@ -286,6 +286,7 @@ use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
+use runtime::prompt::CallEnd;
 use runtime::seqstate::{Price, Why};
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
@@ -1607,13 +1608,20 @@ impl Seat for Glm {
         )
     }
 
-    /// The body's feed ([`bloomery_gpu_glm5next::feed`]): the batched prompt
-    /// call or one step a position, as `--prefill` says, each call taking the
-    /// checkpoints its marks name; under the draft the draft's own prompt
-    /// call, its store walked over the prompt's units.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.prompt_call(ids, CallEnd::Argmax)
+    }
+
+    /// The body's prompt call ([`bloomery_gpu_glm5next::prompt_with`]): the
+    /// batched call, its head only when `end` reads it, or one step a
+    /// position, as `--prefill` says, each call taking the checkpoints its
+    /// marks name; under the draft the draft's own prompt call, its store
+    /// walked over the prompt's units ([`SlotDrafts::prompt_call`]). A KDA
+    /// layer takes no checkpoint inside a batch, so the seat folds no last
+    /// id ([`Seat::prefill_next`]'s default).
+    fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
         let sel = self.s.selected();
-        let next = self.drafted.prefill(&mut self.s, sel, ids)?;
+        let next = self.drafted.prompt_call(&mut self.s, sel, ids, end)?;
         self.print_passes()?;
         Ok(next)
     }

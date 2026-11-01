@@ -43,6 +43,7 @@ use bloomery_gpu::model::{ChainBody, Rollback, Rows, SlotRows, Slots, SlotsOut, 
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
+use runtime::prompt::CallEnd;
 use runtime::seqstate::Kept;
 use runtime::swaprule::{KeptRows, SwapRule};
 use runtime::{Draft, Out, RowLogits, Speculative, Target, Verify, Want, Width, Widths, Window};
@@ -198,6 +199,20 @@ pub trait Prompt: ChainBody {
     /// with; the argmax after the last. A call that fails stands the model
     /// where the body's own rule leaves it, and is not run again here.
     fn prompt(m: &mut GpuModel<Self>, ids: &[u32]) -> Result<u32, GpuError>;
+
+    /// [`Prompt::prompt`] ending as `end` asks ([`CallEnd`]): the argmax
+    /// after the last when the call runs the head, `None` when it runs none.
+    /// A seat asks [`CallEnd::Close`] only of a body that folds the last id. The
+    /// default is [`Prompt::prompt`], its head run whatever the end; a body
+    /// whose prompt call can run without its head overrides it.
+    fn prompt_call(
+        m: &mut GpuModel<Self>,
+        ids: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
+        let _ = end;
+        Self::prompt(m, ids).map(Some)
+    }
 }
 
 /// Which cuts a body's caches keep. gpumodel's [`Rollback`] takes positions
@@ -1057,6 +1072,17 @@ impl<'a> RoundLogits<'a> {
         self.offsets
             .iter()
             .map(|offset| offset.map(|i| &self.all[i * self.n_vocab..(i + 1) * self.n_vocab]))
+    }
+}
+
+impl<B: Prompt> Session<B> {
+    /// The body's prompt call of `ids` ending as `end` asks
+    /// ([`Prompt::prompt_call`]), under the session's idle check: the argmax
+    /// after the last when it runs the head.
+    pub fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<Option<u32>, SessionError> {
+        self.idle("prompt")?;
+        let _busy = self.model.prompt_busy();
+        Ok(B::prompt_call(&mut self.model, ids, end)?)
     }
 }
 

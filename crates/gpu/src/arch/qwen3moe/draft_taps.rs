@@ -23,6 +23,7 @@ use super::body35::Body35;
 use super::prefill::PrefillPath;
 use crate::model::GpuModel;
 use crate::{GpuError, launch_u32};
+use runtime::prompt::CallEnd;
 
 const WHAT: &str = "qwen35moe::draft_taps";
 
@@ -120,6 +121,7 @@ impl GpuModel<Body35> {
             let rows = m.draft_tap_rows(skip, rows - skip)?;
             sink(from, &rows)
         };
-        self.prefill_hooked(tokens, path, Some(&mut unit))
+        let next = self.prefill_hooked(tokens, path, Some(&mut unit), CallEnd::Argmax)?;
+        next.ok_or(GpuError::state(WHAT_P, "a token read after the last unit"))
     }
 }

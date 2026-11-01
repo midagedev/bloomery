@@ -158,6 +158,7 @@ mod gate {
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::layer::{FfnKind, MixerKind};
+    use runtime::prompt::CallEnd;
     use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Draft, PassSink, Target, Verify, Want, accepted_rows};
 
@@ -849,7 +850,7 @@ mod gate {
             Ok(())
         };
         let sink: &mut GlmPromptSink<'_> = &mut units;
-        prompt_with(m, prompt, path, Some(sink))?;
+        prompt_with(m, prompt, path, CallEnd::Argmax, Some(sink))?;
         Ok((got, streams))
     }
 

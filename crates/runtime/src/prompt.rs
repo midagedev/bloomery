@@ -1,10 +1,10 @@
 //! The prompt walk's common owner: what every engine that feeds a prompt as
 //! batches decides the same way, once — the feed's two modes
-//! ([`PrefillMode`]), how a call is cut into batches ([`batches`],
-//! [`call_batches`]) and chunks ([`chunks`]), how a call's batches are
-//! walked together ([`group_sets`], [`groups`], [`check_group`],
-//! [`refuse_dense_after_routed`]) and the call's end ([`end_of`],
-//! [`call_end`]).
+//! ([`PrefillMode`]), what a call's last row is for ([`CallEnd`]), how a
+//! call is cut into batches ([`batches`], [`call_batches`]), units
+//! ([`call_units`], [`fold_units`]) and chunks ([`chunks`]), how a call's batches are walked together ([`group_sets`], [`groups`],
+//! [`check_group`], [`refuse_dense_after_routed`]) and the call's end
+//! ([`end_of`], [`call_end`]).
 //!
 //! Host only, and no device error type: a refusal comes back as a
 //! [`Refusal`], whose detail the engine crate puts in its own error beside
@@ -39,6 +39,31 @@ impl PrefillMode {
             PrefillMode::Batch => "batch",
             PrefillMode::Steps => "steps",
         }
+    }
+}
+
+/// What a prompt call's last row is for: the one plan every seat's prompt
+/// call reads, whatever the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallEnd {
+    /// A part of a prompt before its last call: nothing reads a token after
+    /// it, so the call runs no head and reads no argmax back. Its fault word
+    /// is still read at its end.
+    Unread,
+    /// The argmax after the last id: the head over the call's last row.
+    Argmax,
+    /// A prompt's last call whose last id is the one a server steps after
+    /// it: that id is the call's last row and its head gives the argmax, and
+    /// the call's checkpoints are those of the call less that id, so a later request keeps of it what it keeps
+    /// of that call and a step.
+    Close,
+}
+
+impl CallEnd {
+    /// Whether the call runs the head over its last row.
+    #[must_use]
+    pub fn head(self) -> bool {
+        self != CallEnd::Unread
     }
 }
 
@@ -95,6 +120,53 @@ pub fn call_batches(from: u32, to: u32, marks: &[u32], t_max: usize) -> Vec<Rang
         at = mark;
     }
     out
+}
+
+/// The units of a prompt call of `n` ids from position `from` on a path of
+/// units of at most `width` rows: each run up to the next of the call's
+/// checkpoint marks past `from` (`marks`, ascending, the call's end the last
+/// of them; none on a load that takes none), else up to the call's end, cut
+/// as [`chunks`] cuts it. A unit's rows, and whether a checkpoint is taken
+/// after it.
+#[must_use]
+pub fn call_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Vec<(usize, bool)> {
+    let (from, end) = (from as usize, from as usize + n);
+    let mut stops: Vec<(usize, bool)> = marks
+        .iter()
+        .map(|&p| (p as usize, true))
+        .filter(|&(p, _)| p > from)
+        .collect();
+    if stops.last().is_none_or(|&(p, _)| p < end) {
+        stops.push((end, false));
+    }
+    let (mut units, mut at) = (Vec::new(), from);
+    for (stop, marked) in stops {
+        let k = (stop - at).div_ceil(width);
+        units.extend(
+            chunks(stop - at, width)
+                .enumerate()
+                .map(|(i, (_, m))| (m, marked && i + 1 == k)),
+        );
+        at = stop;
+    }
+    units
+}
+
+/// The units of a closing call ([`CallEnd::Close`]) of `n` ids from `from`
+/// whose marks (as [`call_units`] takes them) end at its last id's position,
+/// that id folded into the call's last unit: [`call_units`] without that end
+/// mark, when the last unit then holds a row before the id. `None`
+/// otherwise: the mark cuts the call there as any mark does, and the id is a
+/// unit of its own. A body runs the fold only where it can take the end mark
+/// inside the unit.
+#[must_use]
+pub fn fold_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Option<Vec<(usize, bool)>> {
+    let (&end, inner) = marks.split_last()?;
+    if end as usize + 1 != from as usize + n {
+        return None;
+    }
+    let units = call_units(from, n, width, inner);
+    units.last().is_some_and(|&(m, _)| m >= 2).then_some(units)
 }
 
 /// The chunks of a batch of `t` tokens: runs of `chunk` from its first, the
@@ -259,6 +331,53 @@ mod tests {
         );
         assert_eq!(call_batches(5, 6, &[6], 512), vec![5..6]);
         assert_eq!(call_batches(5, 9, &[], 512), Vec::<Range<u32>>::new());
+    }
+
+    /// A prompt call's units: its runs cut at the checkpoint marks past its
+    /// start, each as the unit cut, the unit before each mark marked; with
+    /// no marks one run of the whole call. A closing call folds its last id
+    /// into its last unit only when that unit holds a row before it.
+    #[test]
+    fn a_call_cuts_its_units_at_its_marks() {
+        let (t, f) = (true, false);
+        for (from, n, width, marks, want) in [
+            (
+                0,
+                8192,
+                4096,
+                &[4096, 8192][..],
+                &[(4096, t), (4096, t)][..],
+            ),
+            (0, 8192, 4096, &[], &[(4096, f), (4096, f)]),
+            (100, 5000, 4096, &[100, 4096, 5100], &[(3996, t), (1004, t)]),
+            (
+                0,
+                9000,
+                4096,
+                &[4096, 8192, 9000],
+                &[(4096, t), (4096, t), (808, t)],
+            ),
+            (4090, 10, 8, &[4090, 4096, 4100], &[(6, t), (4, t)]),
+            (0, 10, 8, &[10], &[(8, f), (2, t)]),
+        ] {
+            assert_eq!(
+                call_units(from, n, width, marks),
+                want,
+                "{n} ids from {from}, {width} wide, marks {marks:?}"
+            );
+        }
+        assert_eq!(
+            fold_units(0, 10, 8, &[9]),
+            Some(vec![(8, f), (2, f)]),
+            "the end mark before the last id folds into the last unit"
+        );
+        assert_eq!(fold_units(0, 9, 8, &[8]), None, "a last id alone");
+        assert_eq!(fold_units(0, 10, 8, &[10]), None, "a mark past the last id");
+        assert_eq!(
+            fold_units(0, 10, 4, &[4, 9]),
+            Some(vec![(4, t), (4, f), (2, f)])
+        );
+        assert!(!CallEnd::Unread.head() && CallEnd::Argmax.head() && CallEnd::Close.head());
     }
 
     /// Chunks of a batch: runs of the chunk size, the last one shorter.

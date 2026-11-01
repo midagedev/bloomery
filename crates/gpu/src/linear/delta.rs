@@ -120,7 +120,7 @@
 //! carry ([`LinearShape::carry_len`]); a call that keeps its last chunk
 //! (`keep`) leaves it so when the call's last row completes it, so a point
 //! one row short of the call's end is the lane and the carry less that row
-//! (`Body38::set_close`). The carry is [`CARRY_HEAD`] words (the rows'
+//! (`runtime::prompt::CallEnd::Close`). The carry is [`CARRY_HEAD`] words (the rows'
 //! count and the position after them), then up to [`CARRY_ROWS`] rows of
 //! the conv's key and value heads, then their β and decays. A call from
 //! that position takes the carried rows first. The prompt form runs them

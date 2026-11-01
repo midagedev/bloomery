@@ -183,6 +183,7 @@ use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::part::StoredRows;
 use model::placement::{Device, Plan};
+use runtime::prompt::{CallEnd, call_units, chunks, fold_units};
 use runtime::seqstate::{Kept, Price, Take};
 use runtime::swaprule::KeptRows;
 use std::ops::Range;
@@ -1412,7 +1413,8 @@ pub struct Body38 {
     /// to the point reads ([`Body38::draft_rejoins`]).
     point_rows: Vec<(u32, Vec<f32>)>,
     marks: bool,
-    /// Whether a prompt call closes its prompt ([`Body38::set_close`]).
+    /// Whether the prompt call being fed closes its prompt
+    /// ([`CallEnd::Close`], [`GpuModel::prompt38_call`]).
     close: bool,
     /// Whether the ubatch walk being planned is a closing call's last, whose
     /// delta layers keep their last chunk out of the state
@@ -3027,19 +3029,6 @@ impl Body38 {
         self.marks
     }
 
-    /// Whether a prompt call closes its prompt: its last id is the one a
-    /// server would step after the call, run as the call's last row, whose
-    /// head gives the argmax after it, and the call's checkpoints are those of
-    /// the call less its last id: the end mark stands before the last id
-    /// ([`GpuModel::feed38`]). A call of passes or steps leaves the bits of
-    /// the call less its last id and that id's step; a call by ubatches
-    /// leaves the ubatch walk's last row, as one call of the whole prompt
-    /// does. Off at load; the serve seat turns it on around a prompt's last
-    /// call.
-    pub fn set_close(&mut self, on: bool) {
-        self.close = on;
-    }
-
     /// The PLE rows of `token` at `pos`, the input the next step is to take,
     /// read ahead on the NVMe tier's helper while the caller hands the step's
     /// answer on. The history and every device buffer stay as they are: the
@@ -4427,7 +4416,7 @@ impl Body38 {
     /// The ubatches a prompt of `n` positions runs as ([`Prompt38::Gemm`]):
     /// their sizes in order, each the load's size but the last.
     pub fn ubatch_cut(&self, n: usize) -> impl Iterator<Item = usize> + use<> {
-        ubatch_cut(n, self.wide.rows)
+        chunks(n, self.wide.rows).map(|(_, m)| m)
     }
 
     /// Every walk's map check reads `map` instead of the tier's own until a
@@ -4541,57 +4530,6 @@ impl Body38 {
     }
 }
 
-/// The ubatch sizes of a prompt of `n` positions in ubatches of at most
-/// `rows`: [`Body38::ubatch_cut`], and the cut [`GpuModel::prompt38`] runs.
-fn ubatch_cut(n: usize, rows: usize) -> impl Iterator<Item = usize> {
-    (0..n.div_ceil(rows)).map(move |i| rows.min(n - i * rows))
-}
-
-/// The units of a prompt call of `n` ids from position `from` on a path of
-/// units of at most `width` rows: each run up to the next of the call's
-/// checkpoint marks past `from` (`marks`, ascending, the call's end the last
-/// of them; none on a load that takes none), else up to the call's end, cut
-/// as [`ubatch_cut`] cuts it. A unit's rows, and whether a checkpoint is
-/// taken after it. The one cut of a call: its walks run it
-/// ([`GpuModel::feed38`]) and its PLE rows are read ahead by it
-/// ([`PleHost::prompt_start`]).
-fn call_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Vec<(usize, bool)> {
-    let (from, end) = (from as usize, from as usize + n);
-    let mut stops: Vec<(usize, bool)> = marks
-        .iter()
-        .map(|&p| (p as usize, true))
-        .filter(|&(p, _)| p > from)
-        .collect();
-    if stops.last().is_none_or(|&(p, _)| p < end) {
-        stops.push((end, false));
-    }
-    let (mut units, mut at) = (Vec::new(), from);
-    for (stop, marked) in stops {
-        let k = (stop - at).div_ceil(width);
-        units.extend(
-            ubatch_cut(stop - at, width)
-                .enumerate()
-                .map(|(i, m)| (m, marked && i + 1 == k)),
-        );
-        at = stop;
-    }
-    units
-}
-
-/// The units of a closing call of `n` ids from `from` whose marks (as
-/// [`call_units`] takes them) end at its last id's position, that id folded
-/// into the call's last ubatch: [`call_units`] without that end mark, when
-/// the last ubatch then holds a row before the id. `None` otherwise: the
-/// mark cuts the call there as any mark does.
-fn fold_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Option<Vec<(usize, bool)>> {
-    let (&end, inner) = marks.split_last()?;
-    if end as usize + 1 != from as usize + n {
-        return None;
-    }
-    let units = call_units(from, n, width, inner);
-    units.last().is_some_and(|&(m, _)| m >= 2).then_some(units)
-}
-
 impl GpuModel<Body38> {
     /// Arm (or disarm) the per-layer taps: after each layer the step copies
     /// its streams into the layer's tap, which [`Body38::taps`] reads back,
@@ -4629,7 +4567,7 @@ impl GpuModel<Body38> {
         Ok(body.wide_timing.as_mut().and_then(PromptTiming::take))
     }
 
-    /// Whether a closing call ([`Body38::set_close`]) of `n` ids on `path`
+    /// Whether a closing call ([`CallEnd::Close`]) of `n` ids on `path`
     /// from where the model stands runs its last id in the ubatch walk: the
     /// call is ubatches, and its last ubatch holds a row before that id
     /// ([`fold_units`]) or the call takes no checkpoint. Otherwise the end
@@ -4699,17 +4637,27 @@ impl GpuModel<Body38> {
         path: Prompt38,
         sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
-        self.prompt38_read(tokens, path, sink, true)
+        self.prompt38_read(tokens, path, sink, CallEnd::Argmax)
     }
 
-    /// Feed prompt positions and hidden-row taps without producing a token.
-    pub fn prefill38_with(
+    /// [`GpuModel::prompt38_with`] ending as `end` asks ([`CallEnd`]): no
+    /// head and no token for [`CallEnd::Unread`]; for [`CallEnd::Close`] the
+    /// call's last id is the one a server would step after it, run as the
+    /// call's last row, whose head gives the argmax after it, and the call's
+    /// checkpoints are those of the call less its last id: the end mark
+    /// stands before the last id ([`GpuModel::feed38`]). A closing call of
+    /// passes or steps leaves the bits of the call less its last id and that
+    /// id's step; one by ubatches leaves the ubatch walk's last row, as one
+    /// call of the whole prompt does.
+    pub fn prompt38_call(
         &mut self,
         tokens: &[u32],
         path: Prompt38,
+        end: CallEnd,
         sink: Option<&mut Prompt38Sink<'_>>,
-    ) -> Result<(), GpuError> {
-        self.prompt38_read(tokens, path, sink, false).map(|_| ())
+    ) -> Result<Option<u32>, GpuError> {
+        let next = self.prompt38_read(tokens, path, sink, end)?;
+        Ok(end.head().then_some(next))
     }
 
     fn prompt38_read(
@@ -4717,7 +4665,7 @@ impl GpuModel<Body38> {
         tokens: &[u32],
         path: Prompt38,
         sink: Option<&mut Prompt38Sink<'_>>,
-        head: bool,
+        end: CallEnd,
     ) -> Result<u32, GpuError> {
         let resolved = self.prompt38_checked(tokens, path)?;
         // The steps feed is no pass of its own: each id is a step with its
@@ -4726,7 +4674,11 @@ impl GpuModel<Body38> {
         if one_pass {
             self.pass_boundary()?;
         }
-        let fed = self.prompt38_fed(tokens, resolved, sink, head);
+        self.body_parts("qwen4exp prompt")?.2.close = end == CallEnd::Close;
+        let fed = self.prompt38_fed(tokens, resolved, sink, end.head());
+        if let Ok((_, _, body)) = self.body_parts("qwen4exp prompt") {
+            body.close = false;
+        }
         let kept = match one_pass {
             true => self.keep_rows(KeptRows::prefix(0), PassKind::Prompt),
             false => Ok(()),
@@ -4974,7 +4926,7 @@ impl GpuModel<Body38> {
     /// store. Each unit reads the rows those readers name and no other
     /// ([`Body38::walk_gemm`]'s `read`).
     ///
-    /// A closing call ([`Body38::set_close`]) by ubatches whose marks end
+    /// A closing call ([`CallEnd::Close`]) by ubatches whose marks end
     /// before its last id runs that id as the last row of its last ubatch
     /// (the fold) when the ubatch holds a row before it ([`fold_units`]): the
     /// ubatch keeps its last delta chunk out of the lanes
@@ -7522,7 +7474,7 @@ mod tests {
             PleHost::new(Arc::clone(&header), Some(&stored), 16, 8, Device::Nvme).unwrap();
         // A call with a checkpoint mark inside it (position 4) reads every
         // unit after its first ahead, across the mark.
-        let units = super::call_units(0, tokens.len(), 2, &[4, 6]);
+        let units = runtime::prompt::call_units(0, tokens.len(), 2, &[4, 6]);
         got.prompt_start(0, &tokens, units.iter().map(|&(m, _)| m), &[])
             .unwrap();
         let mut at = 0;
@@ -7600,39 +7552,5 @@ mod tests {
             .expect("refused");
         assert!(e.to_string().contains("source plane has 79 rows"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A prompt call's units: its runs cut at the checkpoint marks past its
-    /// start, each as the ubatch cut, the unit before each mark marked; with
-    /// no marks one run of the whole call.
-    #[test]
-    fn a_call_cuts_its_units_at_its_marks() {
-        let (t, f) = (true, false);
-        for (from, n, width, marks, want) in [
-            (
-                0,
-                8192,
-                4096,
-                &[4096, 8192][..],
-                &[(4096, t), (4096, t)][..],
-            ),
-            (0, 8192, 4096, &[], &[(4096, f), (4096, f)]),
-            (100, 5000, 4096, &[100, 4096, 5100], &[(3996, t), (1004, t)]),
-            (
-                0,
-                9000,
-                4096,
-                &[4096, 8192, 9000],
-                &[(4096, t), (4096, t), (808, t)],
-            ),
-            (4090, 10, 8, &[4090, 4096, 4100], &[(6, t), (4, t)]),
-            (0, 10, 8, &[10], &[(8, f), (2, t)]),
-        ] {
-            assert_eq!(
-                super::call_units(from, n, width, marks),
-                want,
-                "{n} ids from {from}, {width} wide, marks {marks:?}"
-            );
-        }
     }
 }

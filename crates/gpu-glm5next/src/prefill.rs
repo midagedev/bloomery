@@ -137,7 +137,7 @@ use model::placement::kernels::DownForms;
 use runtime::layer::{FfnKind, MixerKind};
 pub use runtime::prompt::PrefillMode;
 use runtime::prompt::{
-    GROUP_LEVER, call_end, check_group, chunks, end_of, group_sets, groups,
+    CallEnd, GROUP_LEVER, call_end, check_group, chunks, end_of, group_sets, groups,
     refuse_dense_after_routed,
 };
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -1076,29 +1076,39 @@ fn feed_as(
 ) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     let mode = m.body(WHAT)?.prompt.mode;
-    call_by(m, ids, mode, pass, sink)
+    headed(call_by(m, ids, mode, pass, CallEnd::Argmax, sink))
+}
+
+/// The token of a call that ran its head, which every such call returns.
+fn headed(next: Result<Option<u32>, GpuError>) -> Result<u32, GpuError> {
+    next?.ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the head of the batch that holds the call's last position",
+    })
 }
 
 /// A checked call of `ids` by `mode`, `sink` called after each unit it runs: the batch walk in
-/// one residency pass opened as `pass` says, or the steps (refused by name while a residency
-/// machine runs). The one owner of what a prompt call is by mode, for [`prompt_with`] and
-/// [`feed`].
+/// one residency pass opened as `pass` says, its head over the last row when `end` runs it
+/// ([`CallEnd::head`]), or the steps (refused by name while a residency machine runs), each with its head. The
+/// one owner of what a prompt call is by mode, for [`prompt_with`] and [`feed`].
 fn call_by(
     m: &mut Glm5nextModel,
     ids: &[u32],
     mode: PrefillMode,
     pass: Pass,
+    end: CallEnd,
     sink: Option<&mut GlmPromptSink<'_>>,
-) -> Result<u32, GpuError> {
+) -> Result<Option<u32>, GpuError> {
+    let head = end.head();
     match (mode, sink) {
-        (PrefillMode::Batch, sink) => pass.run(m, |m| prefill_units(m, ids, sink, None)),
+        (PrefillMode::Batch, sink) => pass.run(m, |m| prefill_units(m, ids, sink, None, head)),
         (PrefillMode::Steps, None) => {
             super::refuse_steps_under_residency(m)?;
-            prompt(m, ids)
+            prompt(m, ids).map(Some)
         }
         (PrefillMode::Steps, Some(sink)) => {
             super::refuse_steps_under_residency(m)?;
-            steps_with(m, ids, sink)
+            steps_with(m, ids, sink).map(Some)
         }
     }
 }
@@ -1126,20 +1136,32 @@ impl Pass {
     }
 }
 
-/// Feed `ids` from where `m` stands by `mode` and return the argmax after
-/// the last, `sink` called after each unit the call runs ([`GlmPromptSink`]):
+/// Feed `ids` from where `m` stands by `mode` ending as `end` asks
+/// ([`CallEnd`]: the argmax after the last, `None` for an unread call, whose
+/// batch walk runs no head), `sink` called after each unit the call runs
+/// ([`GlmPromptSink`]):
 /// each batch of [`prefill`] ([`GlmArena::Prefill`]), or each step
 /// ([`GlmArena::Step`]), one a position. Refused by name before anything runs
-/// as [`feed`] refuses. `None` is [`feed`]'s call by `mode`. A sink's error
-/// ends the call with it, its positions taken back as a failed call's are.
+/// as [`feed`] refuses, and a closing call ([`CallEnd::Close`]) too: a KDA
+/// layer takes no checkpoint inside a batch, before the call's last id.
+/// `None` is [`feed`]'s call by `mode`. A sink's error ends the call with
+/// it, its positions taken back as a failed call's are.
 pub fn prompt_with(
     m: &mut Glm5nextModel,
     ids: &[u32],
     mode: PrefillMode,
+    end: CallEnd,
     sink: Option<&mut GlmPromptSink<'_>>,
-) -> Result<u32, GpuError> {
+) -> Result<Option<u32>, GpuError> {
     check_call(m, ids)?;
-    call_by(m, ids, mode, Pass::Own, sink)
+    if end == CallEnd::Close {
+        return Err(shape(
+            "a closing call: a KDA layer takes no checkpoint inside a batch, before the call's \
+             last id"
+                .to_string(),
+        ));
+    }
+    call_by(m, ids, mode, Pass::Own, end, sink)
 }
 
 /// [`prompt`]'s steps one position each, `sink` called after each with the
@@ -1317,7 +1339,7 @@ pub(crate) fn dense_forms(cfg: &[super::LayerCfg]) -> DenseForms {
 /// holds one token's streams, and a batch runs many). The batch's buffers
 /// are made by the first call when [`set_prefill`] has not made them.
 pub fn prefill(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
-    prefill_units(m, ids, None, None)
+    headed(prefill_units(m, ids, None, None, true))
 }
 
 /// Set the id every position of a media span carries (`<|image|>`), or `None` for a load that
@@ -1405,7 +1427,7 @@ fn media_as(
     }
     let rows = CallRows::new(m.pos(), n_embd, spans.iter().map(|s| (&s.at, s.rows)))
         .map_err(|r| shape(r.to_string()))?;
-    pass.run(m, |m| prefill_units(m, ids, sink, Some(&rows)))
+    headed(pass.run(m, |m| prefill_units(m, ids, sink, Some(&rows), true)))
 }
 
 impl MediaBody for Body {
@@ -1443,7 +1465,8 @@ fn prefill_units(
     ids: &[u32],
     sink: Option<&mut GlmPromptSink<'_>>,
     media: Option<&CallRows<'_>>,
-) -> Result<u32, GpuError> {
+    head: bool,
+) -> Result<Option<u32>, GpuError> {
     let to = check_call(m, ids)?;
     let from = m.pos();
     {
@@ -1482,7 +1505,7 @@ fn prefill_units(
         }
         body.prompt.in_call = true;
     }
-    let r = call_groups(m, ids, from, to, sink, media);
+    let r = call_groups(m, ids, from, to, sink, media, head);
     if let Ok(body) = m.body_parts(WHAT).map(|(_, _, b)| b) {
         body.prompt.in_call = false;
         let (from, to) = (from as usize, to as usize);
@@ -1505,7 +1528,9 @@ fn prefill_units(
 /// group its inner marks' takes opened, its walk ([`Body::enqueue_group`]),
 /// the takes sealed once its fault word is read, the sink per unit, and the
 /// checkpoint at its end when that is a mark. A group that fails abandons
-/// its open takes and takes the call back.
+/// its open takes and takes the call back. The last group runs the head
+/// when `head` asks for it: the argmax after the call; else it reads the
+/// fault word alone and the call returns `None`.
 fn call_groups(
     m: &mut Glm5nextModel,
     ids: &[u32],
@@ -1513,7 +1538,8 @@ fn call_groups(
     to: u32,
     mut sink: Option<&mut GlmPromptSink<'_>>,
     media: Option<&CallRows<'_>>,
-) -> Result<u32, GpuError> {
+    head: bool,
+) -> Result<Option<u32>, GpuError> {
     let marks = m.body(WHAT)?.ckpt.marks(from, to);
     let batches = call_batches(from, to, &marks);
     let group = m.body(WHAT)?.prompt.group;
@@ -1534,8 +1560,9 @@ fn call_groups(
             Ok(t) => t,
             Err(e) => return Err(take_back(m, from, e)),
         };
-        let ran = m.run_rows(seg.len(), WHAT, |gpu, w, body, head, pos| {
-            body.enqueue_group(gpu, w, head, seg, pos, runs, last, &mut takes, media)
+        let headed = last && head;
+        let ran = m.run_rows(seg.len(), WHAT, |gpu, w, body, out, pos| {
+            body.enqueue_group(gpu, w, out, seg, pos, runs, headed, &mut takes, media)
         });
         let sealed = match ran {
             Ok(t) => seal_takes(m, &mut takes).map(|()| t),
@@ -1570,10 +1597,13 @@ fn call_groups(
             body.timed_checkpoint(gpu, end)?;
         }
     }
-    argmax.ok_or(GpuError::State {
-        what: WHAT,
-        missing: "the head of the batch that holds the call's last position",
-    })
+    if head && argmax.is_none() {
+        return Err(GpuError::State {
+            what: WHAT,
+            missing: "the head of the batch that holds the call's last position",
+        });
+    }
+    Ok(argmax)
 }
 
 /// The open takes of a group of `runs`: one a unit whose end is one of the
@@ -1949,13 +1979,14 @@ impl Body {
     /// Enqueue one group of `ids` from position `pos`, its batches `runs`
     /// (consecutive, from `pos`): each unit's rows and positions on the card,
     /// one walk `(units, T, Batch)` over every layer, and the head after the
-    /// last unit when `last` — the pass [`bloomery_gpu::GpuModel::run_rows`]
-    /// runs, returning whether the head was enqueued. Inside the walk each
+    /// last unit when `last` (the call's last group, its head asked for) —
+    /// the pass [`bloomery_gpu::GpuModel::run_rows`] runs, returning whether
+    /// the head was enqueued. Inside the walk each
     /// KDA layer's stores are copied into the open take of the mark its unit
     /// ends on (`takes`, one a unit) right after that unit's front. An inner
-    /// group waits for its launches and reads the fault word once, so a
-    /// fault ends the call before the mark after it; the last group's word
-    /// rides the head's readback. A position a span of `media` holds takes
+    /// group (and a headless last one) waits for its launches and reads the
+    /// fault word once, so a fault ends the call before the mark after it;
+    /// a headed last group's word rides the head's readback. A position a span of `media` holds takes
     /// the span's row as its embedding row, by the position it is written at.
     #[allow(
         clippy::too_many_arguments,

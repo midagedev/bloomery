@@ -68,6 +68,7 @@ use bloomery_levers::Levers;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, Machine, ModelTensors, Plan, Role};
+use runtime::prompt::CallEnd;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Flight,
@@ -1385,9 +1386,17 @@ pub trait Seat: 'static {
     /// one step per id), the draft fed as the call hands its rows over; the
     /// argmax after the last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError>;
-    /// Prompt positions whose output is unused. A batched seat can omit its head.
-    fn prefill_only(&mut self, ids: &[u32]) -> Result<(), GateError> {
-        self.prefill(ids).map(|_| ())
+    /// The body's prompt call of `ids` from `pos` ending as `end` asks
+    /// ([`CallEnd`]): the server's one prompt call plan, which
+    /// [`Seat::prefill_next`] and the parts before it (`Cmd::Prefill`) read.
+    /// The argmax after the last when the call runs the head; an
+    /// [`CallEnd::Unread`] call's value is unread. [`CallEnd::Close`] is asked
+    /// only by a seat's own [`Seat::prefill_next`] whose body folds the last
+    /// id. The default is [`Seat::prefill`], its head run whatever the end: a seat
+    /// whose body runs a prompt call with no head overrides it.
+    fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
+        let _ = end;
+        self.prefill(ids)
     }
     /// [`Seat::prefill`] where the slice carries images
     /// ([`Engine::prefill_media`]'s contract): each feed's `at` is its span's
@@ -1433,10 +1442,10 @@ pub trait Seat: 'static {
     /// A prompt's last call `ids` (at least one) from the slot's position and
     /// the step of its last id (`serve::Engine::prefill_next`): the argmax after the last
     /// and, into `row`, that position's logits. The prompt call takes its
-    /// checkpoints as [`Seat::prefill_only`] of all but the last id does. The
-    /// default is that call and [`Seat::step`] (or [`Seat::step_row`]) of the
-    /// last; a seat whose prompt call runs the last id as its last row
-    /// overrides it.
+    /// checkpoints as the unread call of all but the last id does. The
+    /// default is that unread call and [`Seat::step`] (or [`Seat::step_row`])
+    /// of the last; a seat whose body folds the last id into its call
+    /// overrides it with one closing call ([`CallEnd::Close`]).
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
         prefill_then_step(self, ids, row)
     }
@@ -2550,8 +2559,8 @@ fn serve_cmd<S: Seat>(
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
             check_feed(g, ids.len()).map_err(refuse).and_then(|()| {
-                g.prefill_only(&ids)
-                    .map(|()| 0)
+                g.prompt_call(&ids, CallEnd::Unread)
+                    .map(|_| 0)
                     .map_err(|e| refuse(e.to_string()))
             })
         }
@@ -2644,7 +2653,20 @@ fn next_row<S: Seat>(
     next_lent_row(g, last, row)
 }
 
-/// [`Seat::prefill_row`]'s default: [`Seat::prefill_only`] of all but the last of
+/// The token a prompt call ending as `end` gives the server: the argmax it
+/// read, 0 for an unread call (whose value nothing reads), refused by name
+/// when a call that runs the head read none.
+pub fn call_token(end: CallEnd, next: Option<u32>) -> Result<u32, GateError> {
+    match (next, end.head()) {
+        (Some(t), _) => Ok(t),
+        (None, false) => Ok(0),
+        (None, true) => {
+            Err(format!("a {end:?} prompt call read no token after its last id").into())
+        }
+    }
+}
+
+/// [`Seat::prefill_row`]'s default: the unread call ([`CallEnd::Unread`]) of all but the last of
 /// `ids` (none for one id) and [`Seat::step`], or [`Seat::step_row`] into
 /// `row`, of the last.
 pub fn prefill_then_step<S: Seat + ?Sized>(
@@ -2656,7 +2678,7 @@ pub fn prefill_then_step<S: Seat + ?Sized>(
         return Err("a prefill and its step of no ids".into());
     };
     if !run.is_empty() {
-        g.prefill_only(run)?;
+        g.prompt_call(run, CallEnd::Unread)?;
     }
     match row {
         Some(row) => g.step_row(last, row),
@@ -4484,6 +4506,101 @@ mod tests {
             e.to_string().starts_with("--slot-save-path needs a value"),
             "{e}"
         );
+    }
+
+    /// The server's prompt call plan through the seat's defaults: a part
+    /// before the last is the unread call, and the last call is the unread
+    /// call less its last id, then that id's step; a call that runs its head
+    /// and reads no token is refused by name.
+    mod prompt_plan {
+        use std::sync::Arc;
+
+        use runtime::prompt::CallEnd;
+
+        use super::super::{Cmd, Seat, call_token, serve_cmd};
+        use crate::GateError;
+
+        /// A seat that records each prompt call's ids and end and each step,
+        /// its logits row filled with the position it stands at.
+        struct Ends {
+            pos: usize,
+            took: Vec<(Vec<u32>, CallEnd)>,
+            steps: Vec<u32>,
+        }
+
+        impl Seat for Ends {
+            fn pos(&self) -> usize {
+                self.pos
+            }
+            fn ctx_max(&self) -> usize {
+                1 << 10
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+                self.prompt_call(ids, CallEnd::Argmax)
+            }
+            fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
+                self.took.push((ids.to_vec(), end));
+                self.pos += ids.len();
+                Ok(5)
+            }
+            fn step(&mut self, last: u32) -> Result<u32, GateError> {
+                self.steps.push(last);
+                self.pos += 1;
+                Ok(6)
+            }
+            fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
+                row.fill(self.pos as f32);
+                Ok(())
+            }
+            fn reset(&mut self) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn rollback(&mut self, _: u32) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn keep(&self, _: usize) -> (usize, Option<String>) {
+                (0, None)
+            }
+            fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
+                Vec::new()
+            }
+            fn snapshot(&mut self) -> Result<Arc<dyn serve::Saved>, GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn resume(&mut self, _: &dyn serve::Saved) -> Result<(), GateError> {
+                Err("this seat serves prompt calls alone".into())
+            }
+            fn note(_: &serve::CacheNote) {}
+        }
+
+        #[test]
+        fn a_prompt_call_reads_the_plan() {
+            let mut g = Ends {
+                pos: 0,
+                took: Vec::new(),
+                steps: Vec::new(),
+            };
+            let (r, _) = serve_cmd(&mut g, Cmd::Prefill(vec![1, 2]), 4);
+            assert_eq!(r.expect("the part"), 0);
+            assert_eq!(
+                g.took,
+                vec![(vec![1, 2], CallEnd::Unread)],
+                "a part runs no head"
+            );
+            let cmd = Cmd::PrefillNext {
+                ids: vec![3, 4, 7],
+                logits: Some(vec![0.0; 4]),
+            };
+            let (r, row) = serve_cmd(&mut g, cmd, 4);
+            let (arg, row) = (r.expect("the last call"), row.expect("the lent row"));
+            assert_eq!((arg, row[0]), (6, 5.0), "the step's answer and row");
+            assert_eq!(g.took[1], (vec![3, 4], CallEnd::Unread));
+            assert_eq!(g.steps, vec![7], "the last id stepped");
+            assert_eq!(call_token(CallEnd::Unread, None).expect("unread"), 0);
+            assert_eq!(call_token(CallEnd::Close, Some(9)).expect("read"), 9);
+            let e = call_token(CallEnd::Argmax, None).expect_err("a headed call with no token");
+            assert!(e.to_string().contains("read no token"), "{e}");
+        }
     }
 
     mod media {

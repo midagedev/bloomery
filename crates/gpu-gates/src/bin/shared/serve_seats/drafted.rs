@@ -42,7 +42,9 @@ use bloomery_gpu::best;
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots};
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::bind::call_token;
 use bloomery_gpu_gates::record::{self, Record};
+use runtime::prompt::CallEnd;
 use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode, Wall};
 use runtime::{
     Advance, Argmax, Committed, Draft, Lookup, Pick, Plain, RowLogits, Sample, SampleBest,
@@ -737,76 +739,43 @@ where
         }
     }
 
-    /// The prompt on `slot`, the session's selected one: the chooser's
+    /// The prompt call on `slot`, the session's selected one, ending as `end`
+    /// asks ([`CallEnd`]): the chooser's
     /// passes over the request that just left the slot closed out first —
     /// an `mtp width` record under the cost mode, none under `fixed` —
     /// then under the draft the draft's own prompt call, its store walked
-    /// over the prompt's units, then its join record; without it, or while
-    /// it is off, the session's prompt call.
-    pub(crate) fn prefill(
+    /// over the prompt's units whatever the end, then its join record;
+    /// without it, or while it is off, the session's prompt call
+    /// ([`Session::prompt_call`]). A closing
+    /// call (`serve::Engine::prefill_next` through a seat whose body folds
+    /// its last id) anchors the draft's window at the prompt's end
+    /// ([`Advance::begin`]) as the step after a call less that id anchors it
+    /// ([`Draft::stepped`]). The argmax after the last when the call runs
+    /// the head; an unread call's value is unread.
+    pub(crate) fn prompt_call(
         &mut self,
         s: &mut Session<B>,
         slot: usize,
         ids: &[u32],
+        end: CallEnd,
     ) -> Result<u32, GateError> {
         self.prefill_by(
             s,
             slot,
             ids,
-            |s| Ok(s.prompt(ids, Want::Argmax)?.argmax()),
-            |spec, s| Ok(Advance::prompt(spec, s, ids)?),
-        )
-    }
-
-    /// [`SlotDrafts::prefill`] of a prompt's last call whose last id the
-    /// call runs as its last row (`serve::Engine::prefill_next` through a
-    /// seat whose body runs it so), under the draft the window anchored at
-    /// the prompt's end ([`Advance::begin`]) as the step after a call less
-    /// that id anchors it ([`Draft::stepped`]).
-    pub(crate) fn prompt_close(
-        &mut self,
-        s: &mut Session<B>,
-        slot: usize,
-        ids: &[u32],
-    ) -> Result<u32, GateError> {
-        self.prefill_by(
-            s,
-            slot,
-            ids,
-            |s| Ok(s.prompt(ids, Want::Argmax)?.argmax()),
+            |s| call_token(end, s.prompt_call(ids, end)?),
             |spec, s| {
-                let next = Advance::prompt(spec, s, ids)?;
-                Advance::begin(spec, s, ids, next)?;
+                let next = spec.draft_mut().prompt_by(|d| d.prompt_call(s, ids, end))?;
+                let next = call_token(end, next)?;
+                if end == CallEnd::Close {
+                    Advance::begin(spec, s, ids, next)?;
+                }
                 Ok(next)
             },
         )
     }
 
-    /// The same prompt and draft-store walk without the target's head.
-    pub(crate) fn prefill_only(
-        &mut self,
-        s: &mut Session<B>,
-        slot: usize,
-        ids: &[u32],
-        path: B::Path,
-    ) -> Result<(), GateError> {
-        self.prefill_by(
-            s,
-            slot,
-            ids,
-            |s| {
-                s.prefill(ids, path)?;
-                Ok(0)
-            },
-            |spec, s| {
-                spec.draft_mut().prompt_by(|d| d.prefill(s, ids))?;
-                Ok(0)
-            },
-        )
-        .map(|_| ())
-    }
-
-    /// [`SlotDrafts::prefill`] of a prompt that holds an image: `spans` are the
+    /// [`SlotDrafts::prompt_call`] of a prompt that holds an image: `spans` are the
     /// body's spans of the image's rows, spliced in place of their positions'
     /// embeddings. Under the draft the draft's own media prompt call
     /// ([`MtpDraft::prompt_media`]: its store walked over the call's units, a

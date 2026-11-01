@@ -135,7 +135,7 @@ use crate::router::N_EXPERT;
 use crate::span::{span, span_mut};
 use bloomery_gpu::Fault;
 use bloomery_gpu::fault::read_cards;
-use runtime::prompt::{GROUP_LEVER, group_sets, groups};
+use runtime::prompt::{CallEnd, GROUP_LEVER, group_sets, groups};
 
 /// Positions one batch runs at most: the host union's columns.
 pub const T_MAX: usize = UNION_MAX_COLS;
@@ -272,7 +272,29 @@ pub fn prepare_media(m: &mut Deepseek41Model) -> Result<(), GpuError> {
 /// greedy token after the last of them; the model stands `ids.len()`
 /// positions on. See the module comment.
 pub fn prefill(m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
-    feed(m, ids, None, &mut |_, _| Ok(()), None)
+    headed(feed(
+        m,
+        ids,
+        None,
+        &mut |_, _| Ok(()),
+        None,
+        CallEnd::Argmax,
+    ))
+}
+
+/// [`prefill`] with no head: the last group reads its fault word as every
+/// group does and runs no head over the last row, for a prompt part whose
+/// token nothing reads.
+pub fn prefill_unread(m: &mut Deepseek41Model, ids: &[u32]) -> Result<(), GpuError> {
+    feed(m, ids, None, &mut |_, _| Ok(()), None, CallEnd::Unread).map(|_| ())
+}
+
+/// The token of a call that ran its head, which every such call returns.
+fn headed(token: Result<Option<u32>, GpuError>) -> Result<u32, GpuError> {
+    token?.ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the head of the group that holds the prompt's last position",
+    })
 }
 
 /// How many batches a call of `n` positions runs: `⌈n / T_MAX⌉`.
@@ -582,7 +604,7 @@ pub fn prefill_observed(
     ids: &[u32],
     observe: &mut BatchObserver<'_>,
 ) -> Result<u32, GpuError> {
-    feed(m, ids, None, observe, None)
+    headed(feed(m, ids, None, observe, None, CallEnd::Argmax))
 }
 
 /// Feed `ids` with `media` from the model's position on: the batched call of
@@ -629,7 +651,14 @@ fn feed_media(
     let call = m
         .body_parts(WHAT)
         .and_then(|(_, _, body)| body.check_media(first, ids, media))?;
-    feed(m, ids, features, observe, Some(&call))
+    headed(feed(
+        m,
+        ids,
+        features,
+        observe,
+        Some(&call),
+        CallEnd::Argmax,
+    ))
 }
 
 impl MediaBody for Body {
@@ -681,16 +710,28 @@ pub fn prefill_with(
     ids: &[u32],
     features: Option<FeatureRows<'_>>,
 ) -> Result<u32, GpuError> {
-    feed(m, ids, features, &mut |_, _| Ok(()), None)
+    headed(feed(
+        m,
+        ids,
+        features,
+        &mut |_, _| Ok(()),
+        None,
+        CallEnd::Argmax,
+    ))
 }
 
+/// The prompt call: the groups of `ids`' batches, the last group running the
+/// head over the last row when `end` runs it ([`CallEnd::head`]: the token
+/// after the call; `None` without the head).
 fn feed(
     m: &mut Deepseek41Model,
     ids: &[u32],
     features: Option<FeatureRows<'_>>,
     observe: &mut BatchObserver<'_>,
     media: Option<&CallMedia<'_>>,
-) -> Result<u32, GpuError> {
+    end: CallEnd,
+) -> Result<Option<u32>, GpuError> {
+    let head = end.head();
     if ids.is_empty() {
         return Err(GpuError::Shape {
             what: WHAT,
@@ -724,6 +765,7 @@ fn feed(
         let (Some(b), Some(e)) = (rs.first().map(|r| r.start), rs.last().map(|r| r.end)) else {
             continue;
         };
+        let headed = head && e == end;
         let ran = m
             .run_rows(e - b, WHAT, |gpu, w, body, head, _| {
                 body.enqueue_group(
@@ -734,7 +776,7 @@ fn feed(
                         ids: &ids[b - first..e - first],
                         runs: rs,
                         batch: g.start,
-                        last: e == end,
+                        last: headed,
                         media,
                     },
                     observe,
@@ -759,10 +801,13 @@ fn feed(
             }
         }
     }
-    let done = token.ok_or(GpuError::State {
-        what: WHAT,
-        missing: "the head of the group that holds the prompt's last position",
-    });
+    let done = match (head, token) {
+        (true, None) => Err(GpuError::State {
+            what: WHAT,
+            missing: "the head of the group that holds the prompt's last position",
+        }),
+        (_, token) => Ok(token),
+    };
     let ended = m
         .body_parts(WHAT)
         .and_then(|(gpu, _, body)| body.stream_end(gpu, done.is_ok()));
@@ -1116,8 +1161,8 @@ impl Batch {
 }
 
 /// One group of a prompt: its ids, its batches' positions, the index of its
-/// first batch in the call, whether it holds the prompt's last position (the
-/// head's), and the call's media — `None` on a text call.
+/// first batch in the call, whether it holds the prompt's last position and
+/// runs the head over it, and the call's media — `None` on a text call.
 struct GroupRun<'a> {
     ids: &'a [u32],
     runs: &'a [Range<usize>],

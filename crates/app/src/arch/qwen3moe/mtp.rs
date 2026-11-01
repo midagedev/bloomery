@@ -11,6 +11,7 @@ use bloomery_gpu::model::Rows;
 
 use super::WHAT;
 use crate::mtp::{DraftHead, Feed, MtpBody, SlotChain, UnitSink, WalkMode};
+use runtime::prompt::CallEnd;
 
 impl MtpBody for Body38 {
     /// A proposal fills the widest verify the GDN lanes hold.
@@ -64,22 +65,16 @@ impl MtpBody for Body38 {
         body.retain_prompt_row(gpu, walk, first, pos)
     }
 
+    /// [`Qwen38Model::prompt38_call`]: the body folds a closing call's last
+    /// id into its last ubatch where that ubatch holds a row before it.
     fn prompt_with(
         m: &mut Qwen38Model,
         ids: &[u32],
         path: Prompt38,
+        end: CallEnd,
         sink: Option<&mut UnitSink<'_, Body38>>,
-    ) -> Result<u32, GpuError> {
-        m.prompt38_with(ids, path, sink)
-    }
-
-    fn prefill_with(
-        m: &mut Qwen38Model,
-        ids: &[u32],
-        path: Prompt38,
-        sink: Option<&mut UnitSink<'_, Body38>>,
-    ) -> Result<(), GpuError> {
-        m.prefill38_with(ids, path, sink)
+    ) -> Result<Option<u32>, GpuError> {
+        m.prompt38_call(ids, path, end, sink)
     }
 
     fn media_frame(
