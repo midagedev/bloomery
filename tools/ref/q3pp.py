@@ -7,6 +7,8 @@
       block, and the counters that prove it was that launch; written to <plan out> as key=value lines
   q3pp.py summary <csv> <plan> <run log>
       the proof against the profiled run, then the step's cycles and each unit's demand beside them
+  q3pp.py --self-test
+      source-tree and header-only GGUF plan regressions, no GPU or model weights
   q3pp.py metrics
       the --metrics list the summary reads, comma-joined: this file owns the names
   q3pp.py source <source csv> [--limit R]
@@ -33,9 +35,10 @@ gone is a named refusal, not a guess:
     the gqa_flash_seg kernels), never this one.
   - in the prompt: PrefillPlan::new(P, Auto, U) (arch/qwen3moe/prefill.rs): ubatches of U, a tail of
     at most MAX_TOKENS as one pass (decode flash again), a longer tail as one more ubatch. U is
-    BLOOMERY_QWEN3_UBATCH, else UBATCH = 4096 (arch/qwen3moe/ubatch.rs).
+    BLOOMERY_QWEN3_UBATCH, else the placement's UBATCH_PLANNED; the file's expert_used_count
+    also bounds U by GEMM_MAX_SLOTS / expert_used_count.
   - per ubatch: one launch per layer, layers in order (ubatch.rs `Ubatch::enqueue` -> `attention` ->
-    `flash.enqueue`, the only call).
+    wide::neox_128_rows -> KvPlanes::prefill_head128, one head-128 flash).
   so skip = K x n_layer + layer, count 1.
 The launch: grid blocks_for(t, n_kv) = ceil(t / POSITIONS) x n_kv, block (POSITIONS / 2) x 32.
 Neither depends on the ubatch's first position, so the proof is the tensor pipe's count: a warp runs
@@ -109,9 +112,15 @@ def src_const(tree, rel, pattern, what):
     return int(m.group(1).replace("_", "")) if m.groups() else m.group(0)
 
 
-def src_count(tree, rel, pattern, want, what):
+def src_count(tree, rel, pattern, want, what, scope=None):
     path = os.path.join(tree, rel)
-    n = len(re.findall(pattern, open(path).read()))
+    text = open(path).read()
+    if scope is not None:
+        region = re.search(scope, text, re.S)
+        if region is None:
+            refuse(f"[derive] {path} no longer states {what}'s scope: re-read it")
+        text = region.group(0)
+    n = len(re.findall(pattern, text))
     if n != want:
         refuse(f"[derive] {path} holds {n} {what} (/{pattern}/), the derivation counts {want}: re-read it")
 
@@ -125,13 +134,18 @@ def flash_consts(tree):
         group=src_const(tree, "crates/gpu/src/flash_gqa.rs", r"^pub const GROUP: usize = ([\d_]+);", "GROUP"),
         max_tokens=src_const(tree, "crates/gpu/src/route_softmax.rs",
                              r"^pub const MAX_TOKENS: usize = ([\d_]+);", "MAX_TOKENS"),
-        n_used=src_const(tree, "crates/gpu/src/arch/qwen3moe/router.rs",
-                         r"^pub const N_USED: usize = ([\d_]+);", "N_USED"),
         gemm_max_slots=src_const(tree, "crates/gpu/src/gemm/mod.rs",
                                  r"^pub const GEMM_MAX_SLOTS: usize = ([\d_]+);", "GEMM_MAX_SLOTS"),
-        ubatch_max=src_const(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs",
-                             r"^pub const UBATCH: usize = ([\d_]+);", "UBATCH"),
+        ubatch_planned=src_const(tree, "crates/model/src/arch/qwen35moe/place.rs",
+                                 r"^pub const UBATCH_PLANNED: u64 = ([\d_]+);", "UBATCH_PLANNED"),
     )
+    src_const(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs",
+              r"^pub use chain::arch::qwen3moe::router::UBATCH;", "the chain's UBATCH")
+    src_const(tree, "crates/chain/src/arch/qwen3moe/router.rs",
+              r"^pub const UBATCH: usize = model::arch::qwen35moe::place::UBATCH_PLANNED as usize;",
+              "UBATCH = UBATCH_PLANNED")
+    src_const(tree, "crates/chain/src/arch/qwen3moe/router.rs",
+              r"UBATCH\.min\(max_slots / slots\)", "the ubatch cap at the router's slots")
     # The shapes the grid, the block, the tile walk and the order are written in.
     src_const(tree, fp, r"^const WARPS: usize = POSITIONS / 2;", "WARPS = POSITIONS / 2")
     src_const(tree, fp, r"^const THREADS: usize = WARPS \* 32;", "THREADS = WARPS * 32")
@@ -142,13 +156,13 @@ def flash_consts(tree):
     src_const(tree, "crates/gpu/src/elem.rs",
               r"\*n_keys\.get_unchecked_mut\(i\) = position_word\(p \+ 1\);",
               "a row's live key count, its position + 1 (written by the embedding gather)")
-    src_count(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs", r"\bflash\.enqueue\(", 1,
-              "prefill-flash enqueues a layer")
-    # The two mma loops: QK_STEPS x KEY_NT/2 pairs, PV_STEPS x DIM_PAIRS pairs, two mma each.
-    src_count(tree, fp, r"wmma::mma_m16n8k16_f32_f16\(", 4, "mma call sites (two per loop)")
-    if c["ubatch_max"] * c["n_used"] > c["gemm_max_slots"]:
-        refuse(f"[derive] UBATCH {c['ubatch_max']} x N_USED {c['n_used']} exceeds GEMM_MAX_SLOTS "
-               f"{c['gemm_max_slots']}: the derivation must be re-read")
+    src_count(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs", r"wide::neox_128_rows\(", 1,
+              "head-128 attention calls a layer")
+    src_count(tree, "crates/gpu/src/arch/qwen3moe/wide.rs", r"kv\.prefill_head128\(", 1,
+              "head-128 prefill calls")
+    # Only the head-128 walk belongs to this entry; the file also holds head-256 walks.
+    src_count(tree, fp, r"wmma::mma_m16n8k16_f32_f16\(", 4, "mma call sites (two per loop)",
+              scope=r"macro_rules! prefill_128_walk \{.*?\n\}")
     c["warps"] = c["positions"] // 2
     c["threads"] = c["warps"] * 32
     c["hmma_per_tile"] = (c["head"] // 16) * (c["key_tile"] // 8) + (c["key_tile"] // 16) * (c["head"] // 8)
@@ -266,10 +280,15 @@ def cmd_plan(argv):
         refuse(f"[derive] the form knows the launch order and the proof of gqa_prefill_flash only, got "
                f"'{kernel}': another kernel needs its own entry in tools/ref/q3pp.py (its launches before "
                f"the prompt, per layer, its grid and the counter that proves the position)", 64)
-    c = flash_consts(tree)
     arch = "qwen3moe"
     meta = gguf_meta(gguf, [f"{arch}.block_count", f"{arch}.attention.head_count",
-                            f"{arch}.attention.head_count_kv", f"{arch}.attention.key_length"])
+                            f"{arch}.attention.head_count_kv", f"{arch}.attention.key_length",
+                            f"{arch}.expert_used_count"])
+    c = flash_consts(tree)
+    n_used = meta[f"{arch}.expert_used_count"]
+    if type(n_used) is not int or not 1 <= n_used <= c["gemm_max_slots"]:
+        refuse(f"[derive] {arch}.expert_used_count must be in 1..={c['gemm_max_slots']}, got {n_used}")
+    ubatch_max = min(c["ubatch_planned"], c["gemm_max_slots"] // n_used)
     n_layer = meta[f"{arch}.block_count"]
     n_head = meta[f"{arch}.attention.head_count"]
     n_kv = meta[f"{arch}.attention.head_count_kv"]
@@ -277,9 +296,10 @@ def cmd_plan(argv):
         refuse(f"[derive] the file's key_length is {meta[f'{arch}.attention.key_length']}, the kernel's HEAD {c['head']}")
     if n_head != n_kv * c["group"]:
         refuse(f"[derive] {n_head} query heads over {n_kv} key heads, the kernel groups {c['group']}")
-    U = int(opt(argv, "--ubatch", c["ubatch_max"]))
-    if not 1 <= U <= c["ubatch_max"]:
-        refuse(f"[derive] a ubatch of {U} tokens (the binary takes 1..={c['ubatch_max']})", 64)
+    U = int(opt(argv, "--ubatch", c["ubatch_planned"]))
+    if not 1 <= U <= ubatch_max:
+        refuse(f"[derive] a ubatch of {U} tokens at {n_used} experts per token "
+               f"(the binary takes 1..={ubatch_max}); set --ubatch within that limit", 64)
     ctx = int(opt(argv, "--ctx", 0)) or None
     if not 0 <= layer < n_layer:
         refuse(f"[derive] layer {layer} of {n_layer}", 64)
@@ -311,7 +331,8 @@ def cmd_plan(argv):
             f.write(f"{key}={v}\n")
     print(f"[derive] source {tree}: KEY_TILE {c['key_tile']}, POSITIONS {c['positions']} (warps {c['warps']}, "
           f"threads {c['threads']}), HEAD {c['head']}, GROUP {c['group']}, MAX_TOKENS {c['max_tokens']}, "
-          f"UBATCH {c['ubatch_max']} (x N_USED {c['n_used']} <= GEMM_MAX_SLOTS {c['gemm_max_slots']})")
+          f"UBATCH_PLANNED {c['ubatch_planned']}, file expert_used_count {n_used}, "
+          f"ubatch limit {ubatch_max} (GEMM_MAX_SLOTS {c['gemm_max_slots']})")
     print(f"[derive] file: {n_layer} layers, {n_head} query heads over {n_kv} key heads of {c['head']}")
     print(f"[derive] P = {P}, ubatch {U}: plan={plan_str(steps)}; the profiled unit is ubatch {k} of {len(ubs)} "
           f"(t = {t} rows at positions {p0}..{p0 + t - 1})")
@@ -637,7 +658,82 @@ def fmt_bytes(v):
     return f"{v:.0f} B"
 
 
+def self_test():
+    """Exercise plan derivation against this source tree with header-only GGUF inputs."""
+    import contextlib
+    import io
+    import pathlib
+    import tempfile
+    import unittest
+
+    tree = pathlib.Path(__file__).resolve().parents[2]
+
+    class PlanTests(unittest.TestCase):
+        def plan(self, used=8, tokens=4096, extra=(), missing=False):
+            with tempfile.TemporaryDirectory() as tmp:
+                model = pathlib.Path(tmp) / "model.gguf"
+                plan = pathlib.Path(tmp) / "plan"
+                meta = {
+                    "qwen3moe.block_count": 48,
+                    "qwen3moe.attention.head_count": 32,
+                    "qwen3moe.attention.head_count_kv": 4,
+                    "qwen3moe.attention.key_length": 128,
+                }
+                if not missing:
+                    meta["qwen3moe.expert_used_count"] = used
+                with model.open("wb") as f:
+                    f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(meta)))
+                    for key, value in meta.items():
+                        encoded = key.encode()
+                        f.write(struct.pack("<Q", len(encoded)) + encoded)
+                        f.write(struct.pack("<II", 4, value))
+                args = [str(model), str(tree), str(tokens), "2", "gqa_prefill_flash", str(plan), *extra]
+                errors = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+                        cmd_plan(args)
+                except SystemExit:
+                    self.last_error = errors.getvalue()
+                    self.assertFalse(plan.exists())
+                    raise
+                return read_plan(plan)
+
+        def test_current_tree_plan(self):
+            p = self.plan()
+            self.assertEqual((p["ubatch"], p["skip"], p["t"], p["p0"]), ("4096", "2", "4096", "0"))
+            self.assertEqual((p["grid"], p["block"]), ("2048,1,1", "128,1,1"))
+
+        def test_tail_and_explicit_unit(self):
+            p = self.plan(tokens=4105)
+            self.assertEqual((p["skip"], p["t"], p["p0"]), ("50", "9", "4096"))
+            p = self.plan(tokens=4105, extra=("--unit", "0"))
+            self.assertEqual((p["skip"], p["t"], p["p0"]), ("2", "4096", "0"))
+            p = self.plan(tokens=4104)
+            self.assertEqual(p["plan_line"], "ubatch:4096 pass:8")
+
+        def test_model_dependent_slot_limit(self):
+            p = self.plan(used=16, extra=("--ubatch", "2560"))
+            self.assertEqual((p["ubatch"], p["t"], p["p0"]), ("2560", "1536", "2560"))
+            for extra in [(), ("--ubatch", "2561"), ("--ubatch", "0")]:
+                with self.subTest(extra=extra), self.assertRaises(SystemExit) as caught:
+                    self.plan(used=16, extra=extra)
+                self.assertEqual(caught.exception.code, 64)
+                self.assertIn("1..=2560", self.last_error)
+
+        def test_missing_or_invalid_expert_count(self):
+            for kwargs in [dict(missing=True), dict(used=0), dict(used=40961)]:
+                with self.subTest(kwargs=kwargs), self.assertRaises(SystemExit) as caught:
+                    self.plan(**kwargs)
+                self.assertEqual(caught.exception.code, 3)
+                self.assertIn("expert_used_count", self.last_error)
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(PlanTests))
+    return 0 if result.wasSuccessful() else 1
+
+
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        raise SystemExit(self_test())
     if len(sys.argv) < 2 or sys.argv[1] not in ("plan", "summary", "metrics", "source"):
         print(__doc__)
         raise SystemExit(64)
