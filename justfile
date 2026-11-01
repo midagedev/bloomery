@@ -2237,8 +2237,10 @@ gate-engram:
 # another vocabulary file or other cases, with a text that is not the one dumped, or never finished.
 # `just dump-ref-tokenizer` writes them. EmbeddingGemma v1's llama SentencePiece cases also compare with
 # BOS/EOS, in both parse modes, against the pinned mainline set and its extra cases.
+# The Llama-3 BPE vector test reads llama.cpp mainline 6868a52cb's models/ggml-vocab-llama-bpe.gguf with its .inp and
+# .out, copied into $BLOOMERY_DATA/vocab-llama-bpe/.
 gate-tokenizer:
-    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=/home/user/llama.cpp-6868a52c/models/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
 # docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
 # (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, minimaxm3, musespark, gemma4, llama or
@@ -3991,6 +3993,6 @@ gate-raon1-meta:
 # krafton-ai llama.cpp tree whose pre-tokenizer `raon` and NFC normalizer exist there only), and the header's two end tokens end
 # generation. The vocabulary only: seconds.
 gate-raon1-tokenizer:
-    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=/home/user/llama.cpp-6868a52c/models/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
+    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
 
 # --- end raon-model ---
