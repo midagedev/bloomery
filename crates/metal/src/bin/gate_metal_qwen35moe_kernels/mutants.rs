@@ -115,6 +115,8 @@ pub const Q30_KEPT: &[&str] = &[
     "prefill_score_scale",
     "prefill_overflow_no_raise",
     "prefill_nan_plausible",
+    "prefill_block_last_row",
+    "prefill_bad_row_spreads",
     "route_table_duplicate",
     "route_table_tile_cut",
     "routed_expert_base",
@@ -343,10 +345,19 @@ pub const ATTN_KEPT: &[&str] = &[
     "prefill_score_scale",
     "prefill_overflow_no_raise",
     "prefill_nan_plausible",
+    "prefill_block_last_row",
+    "prefill_bad_row_spreads",
 ];
 
 /// The defects only a group size under eight or four key heads show: each
 /// edit is the same program at Qwen3.6's eight query heads over two key heads.
+///
+/// PIN(2026-11-02): `prefill_pad_rows_stored` is retired. A prefill fragment has
+/// no padded row: its rows are consecutive (position, query head) pairs, and a
+/// row past the chunk repeats the last row and stores that row's own value, so
+/// no store of it is a defect a clause can see. The row mapping's three
+/// defects (`prefill_row_position_by_8`, `prefill_row_head_by_8`,
+/// `prefill_sg_first_row`) replace it.
 pub const GQA_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_gqa_read_as_8",
@@ -379,12 +390,32 @@ pub const GQA_MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
-        name: "prefill_pad_rows_stored",
+        name: "prefill_row_position_by_8",
         clause: "attn_prefill",
-        why: "the fragment's padded rows store their outputs over the next key head's heads",
+        why: "a key head's row n sits at chunk row n / 8, the padded layout's, not n / group",
         edits: &[(
-            "if (!writes || fm >= BLOOMERY_ATTN_GQA) {",
-            "if (!writes) {",
+            "#define PF_ROW_OF(n) ((n) / BLOOMERY_ATTN_GQA)",
+            "#define PF_ROW_OF(n) ((n) / 8u)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_row_head_by_8",
+        clause: "attn_prefill",
+        why: "a key head's row n is query head n % 8, the padded layout's, not n % group",
+        edits: &[(
+            "#define PF_HEAD_OF(n) ((n) % BLOOMERY_ATTN_GQA)",
+            "#define PF_HEAD_OF(n) ((n) % 8u)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_sg_first_row",
+        clause: "attn_prefill",
+        why: "every row of a SIMD group takes the causal limit of the group's first row's position",
+        edits: &[(
+            "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, row);",
+            "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, PF_ROW_OF(sg_n0));",
             1,
         )],
     },
@@ -489,6 +520,16 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         edits: &[(
             "uint first_tile = attn_window_lo(first, first.keys) / BLOOMERY_ATTN_PF_KEYS;",
             "uint first_tile = attn_window_lo(first, first.keys) / BLOOMERY_ATTN_PF_KEYS + 1u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "window_prefill_sg_first_row",
+        clause: "attn_window_prefill",
+        why: "every row of a SIMD group takes the first row's position and window",
+        edits: &[(
+            "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, row);",
+            "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, PF_ROW_OF(sg_n0));",
             1,
         )],
     },
@@ -642,6 +683,16 @@ pub const PROLOGUE_MUTANTS: &[Mutant] = &[
         edits: &[(
             "float2 n = *(threadgroup float2 const *)(scratch + i);",
             "float2 n = float2(scratch[i], scratch[i + BLOOMERY_ATTN_ROT / 2u]);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prologue_prefill_sg_first_row",
+        clause: "attn_prologue",
+        why: "every row of a SIMD group takes the first row's position",
+        edits: &[(
+            "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, row);",
+            "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, PF_ROW_OF(sg_n0));",
             1,
         )],
     },
@@ -1832,8 +1883,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_prefill",
         why: "the prefill never rescales its accumulators when a tile raises the running max",
         edits: &[(
-            "if (t > 0u && simd_any(factor != 1.0f)) {",
-            "if (false) {",
+            "            acc[c].thread_elements()[0] *= factor;\n            acc[c].thread_elements()[1] *= factor;\n",
+            "",
             1,
         )],
     },
@@ -1860,6 +1911,26 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "out[at] = NAN;\n                continue;",
             "out[at] = 0.0f;\n                continue;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_block_last_row",
+        clause: "attn_prefill",
+        why: "a threadgroup reads key tiles only up to its first row's position, not its last row's",
+        edits: &[(
+            "uint last = PF_ROW_OF(min(n0 + PF_BLOCK_ROWS, total) - 1u);",
+            "uint last = PF_ROW_OF(n0);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_bad_row_spreads",
+        clause: "attn_prefill_nan",
+        why: "a query that is not finite makes NaN every row of its SIMD group, not its own row",
+        edits: &[(
+            "bool unusable = !ok || ((bad_rows >> fm) & 1u) != 0u;",
+            "bool unusable = !ok || bad_rows != 0u;",
             1,
         )],
     },

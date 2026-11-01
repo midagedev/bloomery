@@ -26,6 +26,8 @@
 //! - `f16`, `f32`: the crate's simdgroup GEMM, launched through
 //!   `Kernels::gemm`, on every device (the GEMM path the device's own rule
 //!   picks is printed in the header, not timed by these arms).
+//! - `h16`: the same GEMM over half activation rows (`GemmX::F16`), the form the batched prefill's
+//!   projections run after the cast, which is done once before the timed region.
 //! - `tensor16`, `tensor32`: the tensor-op GEMM (`gemm_tensor.metal`, Metal
 //!   4's `matmul2d`), launched through `Kernels::gemm` on kernels whose GEMMs
 //!   come from that program, on any device that builds it.
@@ -200,6 +202,9 @@ struct Method {
 enum Arm {
     /// The crate's simdgroup GEMM, through `Kernels::gemm`.
     Engine(Operand),
+    /// The crate's simdgroup GEMM over half activation rows (`GemmX::F16`), the arm the batched prefill
+    /// runs: the cast is done once before the timed region.
+    Half,
     /// The tensor-op GEMM, through `Kernels::gemm`; the op's relaxed
     /// precision on when the flag is.
     Tensor(Operand, bool),
@@ -267,6 +272,7 @@ impl Arm {
     fn name(self) -> String {
         match self {
             Self::Engine(o) => operand_name(o).to_string(),
+            Self::Half => "h16".to_string(),
             Self::Tensor(o, relaxed) => format!(
                 "tensor{}{}",
                 &operand_name(o)[1..],
@@ -293,6 +299,7 @@ impl Arm {
         match name {
             "f16" => return Ok(Self::Engine(Operand::F16)),
             "f32" => return Ok(Self::Engine(Operand::F32)),
+            "h16" => return Ok(Self::Half),
             "tensor16" => return Ok(Self::Tensor(Operand::F16, false)),
             "tensor32" => return Ok(Self::Tensor(Operand::F32, false)),
             "tensor16_relaxed" => return Ok(Self::Tensor(Operand::F16, true)),
@@ -313,7 +320,7 @@ impl Arm {
             .map(|v| v.name.to_string())
             .collect();
         Err(format!(
-            "no arm named {name}: f16, f32, tensor16, tensor32, tensor16_relaxed, tensor32_relaxed, mlx16, mlx32, or <variant>_f16 / _f32 of {}",
+            "no arm named {name}: f16, f32, h16, tensor16, tensor32, tensor16_relaxed, tensor32_relaxed, mlx16, mlx32, or <variant>_f16 / _f32 of {}",
             known.join(", ")
         ))
     }
@@ -567,8 +574,12 @@ fn run() -> Result<(), String> {
     } else {
         shapes
     };
-    for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
+    for quant in [Quant::Q4K, Quant::Q6K, Quant::A4, Quant::A4H] {
         if !quants.is_empty() && !quants.iter().any(|q| q == quant.name()) {
+            continue;
+        }
+        // MLX's F16-scale 4-bit (Llama's file) is timed only when `--quant a4h` names it.
+        if quants.is_empty() && quant == Quant::A4H {
             continue;
         }
         for &arm in &arms {
@@ -640,6 +651,7 @@ fn pipelines(device: &MetalDevice, libs: &mut Libs, arms: &[Arm]) -> Result<(), 
         for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
             let (library, name): (&Library, String) = match arm {
                 Arm::Engine(o) => (device.library(), engine_kernel(quant, o)),
+                Arm::Half => (device.library(), engine_kernel(quant, Operand::F16)),
                 Arm::Tensor(o, relaxed) => {
                     (&libs.tensor(device, relaxed)?.0, engine_kernel(quant, o))
                 }
@@ -831,6 +843,17 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
         Some(b) => Some(ctx.device.upload(ctx.stream, b).map_err(why)?),
         None => None,
     };
+    // The half arm's activation rows: the f16 values the cast kernel writes, uploaded once.
+    let x_h16 = match arm {
+        Arm::Half => {
+            let halves: Vec<u16> = x_values
+                .iter()
+                .map(|&v| gguf::quant::f32_to_f16_bits(v))
+                .collect();
+            Some(ctx.device.upload(ctx.stream, &halves).map_err(why)?)
+        }
+        _ => None,
+    };
     let mut y = match ctx.device.zeroed::<f32>(ctx.stream, Elems(r * n)) {
         Ok(y) => y,
         Err(e) => return skip(format!("the output of {r}x{n} f32: {e}")),
@@ -865,6 +888,33 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
                             y_stride: n,
                             mode: GemmMode::Store,
                             operand,
+                            fault,
+                            layer: LAYER_NONE,
+                        },
+                    )
+                    .map_err(|e| format!("the dispatch did not encode: {e}"))
+            })?
+        }
+        Arm::Half => {
+            let x_h16 = x_h16.as_ref().expect("the half arm's activation rows");
+            time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
+                ctx.kernels
+                    .gemm(
+                        encoder,
+                        GemmParams {
+                            quant,
+                            rows: n,
+                            cols: k,
+                            acts: r,
+                            weights: pool.window(copy, 0)?,
+                            x: GemmX::F16 {
+                                x: x_h16.window(Elems(0), Elems(r * k)).map_err(why)?,
+                                stride: k,
+                            },
+                            y: y.window_mut(Elems(0), Elems(r * n)).map_err(why)?,
+                            y_stride: n,
+                            mode: GemmMode::Store,
+                            operand: Operand::F16,
                             fault,
                             layer: LAYER_NONE,
                         },
@@ -991,6 +1041,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     // once per weight-tile threadgroup, the output once.
     let (tile, elem) = match arm {
         Arm::Mlx(operand) => (MLX_TILE, mlx::elem_bytes(operand)),
+        Arm::Half => (GEMM_ROWS, 2),
         Arm::Variant(v, _) => (v.rows, 4),
         Arm::Source(s, _) => (s.rows, 4),
         _ => (GEMM_ROWS, 4),

@@ -994,11 +994,12 @@ pub fn attn_rows_v0(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 const PREFILL_CTX: usize = 352;
 
 /// The prefill cases: the first position and the rows. A first position of 0
-/// starts on an empty cache; 37 reads thirty-seven planted rows. One row is a
-/// block of one; 7 rows are a block short of its eight positions; 8 rows fill
-/// one; 9 rows end a block after one position; 64, 257 and 300 rows cover the
-/// diagonal tile at every offset of the block, 257 the first position past a
-/// 256-row cut.
+/// starts on an empty cache; 37 reads thirty-seven planted rows. A threadgroup
+/// takes 32 consecutive (position, query head) rows of a key head, so 1, 7, 8
+/// and 9 rows end the chunk at different offsets of the last block; a
+/// position's heads straddle two SIMD groups when the group size does not
+/// divide eight. 64, 257 and 300 rows cover the diagonal tile at every offset
+/// of the block, 257 the first position past a 256-row cut.
 const PREFILL_CASES: [(usize, usize); 14] = [
     (0, 1),
     (0, 7),
@@ -1286,6 +1287,28 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         .map_err(|e| format!("a non-finite gate: {e}"))?;
     }
 
+    // A query that is not finite: that row is NaN and raises nothing; the rows
+    // beside it in its SIMD group (the position's other heads, the next
+    // position's) are in band, as the decode flash's.
+    let (qr, qh, qd) = (20usize, 2usize, 5usize);
+    let mut inp = attn_inputs(attn, case.rows)?;
+    inp.q[qr * q_n + qh * attn.qg_stride + qd] = f32::NAN;
+    let (pre, v0) = prefill_pair(h, &tables, &case, &inp)?;
+    if pre.fault.is_some() {
+        return Err(format!(
+            "a non-finite query: the prefill's fault word is {:?}, none is expected",
+            pre.fault
+        ));
+    }
+    let at = qr * out_n + qh * attn.head;
+    if pre.out[at..at + attn.head].iter().any(|v| !v.is_nan()) {
+        return Err("a non-finite query left its row finite".to_string());
+    }
+    prefill_bands(attn, &tables, &case, &inp, (&pre, &v0), |r, head| {
+        (r, head) != (qr, qh)
+    })
+    .map_err(|e| format!("a non-finite query: {e}"))?;
+
     // A query past f16's range (a gain of 1e5): the product site, every row NaN.
     let big = Tables {
         eps: tables.eps,
@@ -1306,7 +1329,7 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err("a query past f16's range left a finite value".to_string());
     }
     Ok(Verdict::Noted(
-        "a key row that is not finite makes NaN the rows of its key head from its position on and leaves the rows before its tile in band; a gate that is not finite (of a query that has one) raises the product site and is NaN in both; a query past f16's range raises the product site and every row is NaN"
+        "a key row that is not finite makes NaN the rows of its key head from its position on and leaves the rows before its tile in band; a gate that is not finite (of a query that has one) raises the product site and is NaN in both; a query that is not finite makes NaN its own row and no other; a query past f16's range raises the product site and every row is NaN"
             .to_string(),
     ))
 }

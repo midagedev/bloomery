@@ -57,7 +57,7 @@ pub use super::attention_geom::{
     HEAD_DIM, KV_HEADS, ONE_PASS_KEYS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP,
     SEGMENT_KEYS, TILE, segments_for_keys,
 };
-use super::attention_geom::{ONE_PASS_THREADS, PREFILL_POSITIONS, PREFILL_THREADS, SIMD_WIDTH};
+use super::attention_geom::{ONE_PASS_THREADS, PREFILL_BLOCK_ROWS, PREFILL_THREADS, SIMD_WIDTH};
 
 /// The f16 cache or the q8_0 planes a launch reads and appends.
 pub enum AttnCache<'w> {
@@ -984,11 +984,12 @@ pub struct AttentionPrefillParams<'w> {
     pub fault: &'w MetalFaultWord,
 }
 
+/// The launch's words and the number of threadgroups a key head's rows take.
 fn checked_prefill(
     g: &AttnGeom,
     p: &AttentionPrefillParams<'_>,
     layer: &AttnLayer<'_>,
-) -> Result<LaunchArgs, DeviceError> {
+) -> Result<(LaunchArgs, usize), DeviceError> {
     let view = ChunkView {
         what: PREFILL_WHAT,
         head_dim: p.head_dim,
@@ -1012,8 +1013,15 @@ fn checked_prefill(
     };
     check_chunk(g, &view)?;
     let window = check_layer(PREFILL_WHAT, g, layer, p.rows)?;
+    // The kernel numbers a key head's rows position by position, in words.
+    let numbered = p
+        .rows
+        .checked_mul(g.gqa)
+        .ok_or_else(|| refuse_in(PREFILL_WHAT, "the rows' numbering wraps".to_string()))?;
+    word(PREFILL_WHAT, "rows times the group size", numbered)?;
     // The append dispatch's span rule takes one segment: the prefill has no split.
-    view.words(g, 1, p.layer, p.eps, window)
+    let args = view.words(g, 1, p.layer, p.eps, window)?;
+    Ok((args, numbered.div_ceil(PREFILL_BLOCK_ROWS)))
 }
 
 impl Kernels {
@@ -1117,13 +1125,13 @@ impl Kernels {
     /// Encode the prefill attention over a chunk of rows: the append of every
     /// row's key and value (the rows launch's own), a memory barrier, and the
     /// simdgroup-matrix flash, one threadgroup a key head and
-    /// [`PREFILL_POSITIONS`] positions. A shape the kernels do not take, or a
-    /// window that is not that shape, is refused by name and nothing is
-    /// encoded. The rows are within a band of the decode launch's, not its
-    /// bits. `layer` names the keys the layer attends and its per-head gate,
-    /// one row of the query heads' values a row of the chunk. The flash starts
-    /// at the tile of the first window of each block of positions, so the
-    /// tiles before every window of the block are never read.
+    /// [`PREFILL_BLOCK_ROWS`] of its (position, query head) rows. A shape the
+    /// kernels do not take, or a window that is not that shape, is refused by
+    /// name and nothing is encoded. The rows are within a band of the decode
+    /// launch's, not its bits. `layer` names the keys the layer attends and its
+    /// per-head gate, one row of the query heads' values a row of the chunk.
+    /// The flash starts at the tile of the first window of each block of rows,
+    /// so the tiles before every window of the block are never read.
     #[must_use = "a refused launch encoded nothing"]
     pub fn attention_prefill_layer(
         &self,
@@ -1132,7 +1140,7 @@ impl Kernels {
         layer: AttnLayer<'_>,
     ) -> Result<(), DeviceError> {
         let g = &self.geom.attn;
-        let args = checked_prefill(g, &p, &layer)?;
+        let (args, blocks) = checked_prefill(g, &p, &layer)?;
         let flash = self.attention.prefill()?;
         let AttnCache::F16 {
             k: cache_k,
@@ -1169,7 +1177,6 @@ impl Kernels {
         if let Some(gate) = &layer.head_gate {
             encoder.set_binding(8, Binding::of(gate)?)?;
         }
-        let blocks = p.rows.div_ceil(PREFILL_POSITIONS);
         encoder.dispatch_groups(blocks, g.kv_heads, PREFILL_THREADS)
     }
 }
