@@ -135,6 +135,9 @@ impl Body {
                 ffn::front(gpu, w, &mut p, hybrid, l)?;
                 ffn::shadow(gpu, w, &mut p, hybrid.boundary(), l)?;
                 ffn::back(gpu, &mut p, hybrid, l)?;
+                if p.card.has(l) && p.card.tier_k(l) == 0 {
+                    ffn::card_sum(gpu, &mut p, l)?;
+                }
                 let hostless = p.card.hostless(l);
                 if !hostless {
                     hybrid.row_enqueued(l, 0)?;

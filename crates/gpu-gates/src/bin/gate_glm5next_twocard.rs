@@ -633,28 +633,27 @@ mod gate {
         // fully cards the tier's layers, the stage keeps every tiered layer
         // hybrid, so the raw counts differ by two nodes a tiered layer
         // (measured: 178 against 170 at four tiered layers).
+        // PIN(2026-11-01): and one node a tiered layer more on the stage: the
+        // union's card layer joins its card sum with the shared expert in one
+        // launch (`card_sum_join`), the stage's tier layer keeps the tier's
+        // sum and its add in the back.
         let experts = plan.model.experts;
         let omitted = |n_l: &[u64]| 2 * n_l.iter().filter(|&&n| n == experts).count();
-        if got.stage_nodes + omitted(&plan.n_l) == want.stage_nodes + omitted(&uplan.n_l) {
-            println!(
-                "ok structure: stage graph of {} nodes beside the reference's {} (go/wait \
-                 omissions added back: the stage's {}, the reference's {})",
-                got.stage_nodes,
-                want.stage_nodes,
-                omitted(&plan.n_l),
-                omitted(&uplan.n_l)
-            );
-        } else {
-            println!(
-                "FAIL structure: stage graph of {} nodes beside the reference's {} (go/wait \
-                 omissions added back: the stage's {}, the reference's {})",
-                got.stage_nodes,
-                want.stage_nodes,
-                omitted(&plan.n_l),
-                omitted(&uplan.n_l)
-            );
-            pass = false;
-        }
+        let stage = got.stage_nodes + omitted(&plan.n_l);
+        let union = want.stage_nodes + omitted(&uplan.n_l) + tier_layers.len();
+        let structure = stage == union;
+        println!(
+            "{} structure: stage graph of {} nodes beside the reference's {} (go/wait omissions \
+             added back: the stage's {}, the reference's {}; the stage's tier layers' separate \
+             sum and add: {})",
+            if structure { "ok" } else { "FAIL" },
+            got.stage_nodes,
+            want.stage_nodes,
+            omitted(&plan.n_l),
+            omitted(&uplan.n_l),
+            tier_layers.len()
+        );
+        pass &= structure;
         // A pass that keeps its draft is the file's NextN layer: a fixture's is random, whose
         // proposals the target refuses, so only the real tier requires one kept.
         let accepts = tier::premise(

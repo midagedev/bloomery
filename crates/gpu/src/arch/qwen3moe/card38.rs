@@ -18,7 +18,7 @@
 //! with card experts and the same back. On a layer without a host leg
 //! ([`Card38::hostless`]) the step, the verify, the pass and the ubatch
 //! walk retain the down rows, and their sum and the combine are one launch
-//! (`q38_card_sum_shared_add`). A layer without card experts
+//! (`card_sum_join`). A layer without card experts
 //! launches none of them and keeps `q38_shared_add`. The slot places each
 //! launch reads are the ones the walk's handoff or places launch wrote
 //! beside the ids from the slot map's card copy, and the host tier skips
@@ -57,10 +57,10 @@ use super::program38::Ctx38;
 use super::scratch38::PASS_ROWS;
 use super::swap38::Qwen38Stacks;
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteW, StackW};
-use crate::card_slots::{CardAcc, DownRows};
+use crate::card_slots::{CardAcc, CardJoin, DownRows, SharedJoin};
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
-use crate::q38::{CardSumSharedAddArgs, CardTierSharedAddArgs, SLOTS, W_PITCH};
+use crate::q38::{CardTierSharedAddArgs, SLOTS, W_PITCH};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
@@ -688,20 +688,22 @@ impl Card38 {
         let (Some(cl), Some(r)) = (self.layer(l), self.run.as_ref()) else {
             return Err(no_card(l));
         };
-        c.k.q38.enqueue_card_sum_shared_add(
-            c.gpu.stream(),
-            CardSumSharedAddArgs {
-                down: DownRows::F32(&r.down),
-                w: weights,
-                sel,
+        let a = CardJoin {
+            down: DownRows::F32(&r.down),
+            w: weights,
+            sel,
+            n: geo::HIDDEN,
+            m,
+            n_card: cl.n_card,
+            n_used: SLOTS,
+            w_pitch: W_PITCH,
+            shared: SharedJoin {
                 sh,
-                n: geo::HIDDEN,
-                m,
-                n_card: cl.n_card,
-                fault: c.gpu.layer_sink(l)?,
-                y,
+                gate: Some(SLOTS),
             },
-        )
+            fault: c.gpu.layer_sink(l)?,
+        };
+        c.k.slots.enqueue_card_join(c.gpu.stream(), &a, y)
     }
 
     /// Enqueue the join of tier layer `l` over the unit's `m` columns, after

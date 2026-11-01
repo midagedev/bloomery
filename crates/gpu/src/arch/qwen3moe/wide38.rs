@@ -37,7 +37,7 @@
 //!   serves the rest of the slots, and the back adds the card sum on a
 //!   layer with card experts (`q38_card_shared_add`); on a layer without a
 //!   host leg the shared expert runs first and each run's card sum is the
-//!   block's output with its gated rows added (`q38_card_sum_shared_add`),
+//!   block's output with its gated rows added (`card_sum_join`),
 //!   no acc, no host sum and nothing left for the back; when every layer
 //!   runs so over NVFP4 downs in the native FP4 form, the down rows are
 //!   BF16 (`Down38`);
@@ -192,7 +192,7 @@ use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
 use crate::card_leg::{RouteW, StackW};
-use crate::card_slots::{CardAcc, DownRows};
+use crate::card_slots::{CardAcc, CardJoin, DownRows, SharedJoin};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::QueryNorm;
@@ -213,10 +213,7 @@ use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
-use crate::q38::{
-    CardSharedAddArgs, CardSumSharedAddArgs, CardTierAccArgs, EmbedIo, SLOTS, SharedAddArgs,
-    W_PITCH,
-};
+use crate::q38::{CardSharedAddArgs, CardTierAccArgs, EmbedIo, SLOTS, SharedAddArgs, W_PITCH};
 use crate::qsa::{self, KeyAppendArgs, PoolArgs, SelectArgs};
 use crate::site::{self, DenseActs, Gated, GatedIo, SiteWeight, SwigluRows, WideKernels};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
@@ -830,7 +827,7 @@ pub(super) enum CardSum<'b> {
     Acc(&'b mut DeviceBuffer<f32>),
     /// A layer the load runs without a host leg ([`Card38::hostless`]): each
     /// run's sum combined with the shared expert's output `sh` into the
-    /// block's output `y` in the same launch (`q38_card_sum_shared_add`),
+    /// block's output `y` in the same launch (`card_sum_join`),
     /// where the back would add the zeros of the host's empty list.
     Block {
         sh: &'b DeviceBuffer<f32>,
@@ -1424,20 +1421,22 @@ impl CardRoute38 {
                                 cells_view(y, c0 * geo::HIDDEN, n * geo::HIDDEN),
                             )
                         };
-                        c.k.q38.enqueue_card_sum_shared_add(
-                            stream,
-                            CardSumSharedAddArgs {
-                                down: down_w.rows(),
-                                w: &w_w,
-                                sel: sum_places.0,
+                        let a = CardJoin {
+                            down: down_w.rows(),
+                            w: &w_w,
+                            sel: sum_places.0,
+                            n: geo::HIDDEN,
+                            m: n,
+                            n_card: sum_places.1,
+                            n_used: SLOTS,
+                            w_pitch: W_PITCH,
+                            shared: SharedJoin {
                                 sh: &sh_w,
-                                n: geo::HIDDEN,
-                                m: n,
-                                n_card: sum_places.1,
-                                fault: sink,
-                                y: &mut y_w,
+                                gate: Some(SLOTS),
                             },
-                        )?;
+                            fault: sink,
+                        };
+                        c.k.slots.enqueue_card_join(stream, &a, &mut y_w)?;
                     }
                 }
                 c0 += n;

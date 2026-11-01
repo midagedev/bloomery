@@ -19,6 +19,8 @@
 # 595.84): the mix reads the normed streams as BF16 words, not F32 values.
 # PIN(2026-10-31): 252 -> 56 spill bytes, 64 -> 24 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84):
 # the up-mix's passes split the warp's columns, so a mix step holds fewer stream values live.
+generate_ds41 card_sum_join 0 0
+generate_ds41 card_sum_join_bf16 0 0
 generate_ds41 hc_gated_up_mma_mix_4 56 24
 # PIN(2026-10-25): the HC up/mix entries that also write mixed's BF16 or MXFP8 form, spill and GB10 JIT local
 # measured with ptxas 13.3.73, driver 595.84, sm_121a.
@@ -420,9 +422,7 @@ generate_ds41 rows_iq4nl 0 0
 generate_ds41 rows_f8 0 0
 generate_ds41 q2_k_rows 0 0
 generate_ds41 q38_card_shared_add 0 0
-generate_ds41 q38_card_sum_shared_add 0 0
 # PIN(2026-10-28): the BF16 rows' entry's first GB10 scan (sm_121a ptxas 13.3.73, cc 12.1 JIT, driver 595.84).
-generate_ds41 q38_card_sum_shared_add_bf16 0 0
 generate_ds41 q38_card_tier_acc 0 0
 generate_ds41 q38_card_tier_shared_add 0 0
 generate_ds41 q38_shared_add 0 0

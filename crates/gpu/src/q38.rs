@@ -24,13 +24,6 @@
 //! - [`q38_kernels::q38_card_shared_add`] — `q38_shared_add` with the card
 //!   sum: `(hsum + acc) + sh · w`, the host's sum, then the card's, then the
 //!   shared expert's rounded product, each step rounded.
-//! - [`q38_kernels::q38_card_sum_shared_add`] — a layer without a host leg:
-//!   the card sum of `crate::card_slots`' `ds41_ffn_card_acc_10` over the
-//!   card slots' down rows and `q38_card_shared_add`'s combine of it with the
-//!   zeros an empty host list sums to, in one launch — the two launches'
-//!   bits, without writing the sum or reading a host sum;
-//!   `q38_card_sum_shared_add_bf16` reads BF16 down rows, each widened
-//!   exactly to F32.
 //! - [`q38_kernels::q38_card_tier_shared_add`] — the join of a layer an
 //!   expert tier holds experts of, after the wait: the sum of
 //!   `crate::card_slots`' `ds41_ffn_card_acc_10` over
@@ -75,7 +68,7 @@
 //! hold, raises [`FaultSite::ExpertId`] as a card slot's does. Every value is
 //! written as computed.
 
-use crate::card_slots::{DownRows, card_acc_at};
+use crate::card_slots::join_value;
 use crate::elem::EmbedRowsArgs;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
@@ -193,54 +186,6 @@ fn position_word(v: usize) -> u32 {
         u32::MAX
     } else {
         v as u32
-    }
-}
-
-/// One value of a block output with card experts: `(h + a) + s · w`, the
-/// host's routed sum `h`, then the card's `a`, then the shared expert's
-/// output `s` times its gate weight `w`, the product and each sum rounded —
-/// this order is the gate. A non-finite input or result raises
-/// [`FaultSite::F32Product`].
-#[inline(always)]
-fn combine(h: f32, a: f32, s: f32, w: f32, fault: FaultSink) -> f32 {
-    let out = add_rn_f32(add_rn_f32(h, a), mul_rn_f32(s, w));
-    if !(h.is_finite() & a.is_finite() & s.is_finite() & w.is_finite() & out.is_finite()) {
-        fault.raise(FaultSite::F32Product);
-    }
-    out
-}
-
-/// The two card sum entries' value `i` (the thread's), one thread a value.
-///
-/// # Safety
-/// `down` holds `10·n·m` cells, `w` `11·m`, `sel` `10·m`, `sh` and `y`
-/// `n·m`.
-#[inline(always)]
-unsafe fn card_sum_shared_add_at(
-    i: usize,
-    down: impl RowValues,
-    (w, sel, sh): (&[f32], &[u32], &[f32]),
-    (n, m, n_card): (u32, u32, u32),
-    fault: FaultSink,
-    y: &mut DisjointSlice<f32>,
-) {
-    let (n, m) = (n as usize, m as usize);
-    if i >= n * m {
-        return;
-    }
-    // SAFETY: i < n·m, and this fn's contract gives every length the
-    // helper's contract asks for at SLOTS slots and a pitch of W_PITCH.
-    let a = unsafe { card_acc_at::<SLOTS>(down, w, sel, n, n_card, W_PITCH, fault, i) };
-    // SAFETY: i < n·m <= sh.len() by this fn's contract.
-    let s = unsafe { *sh.get_unchecked(i) };
-    // SAFETY: i / n < m puts 11(i / n) + 10 below 11m <= w.len() by this
-    // fn's contract.
-    let wt = unsafe { *w.get_unchecked(i / n * W_PITCH + SLOTS) };
-    let out = combine(0.0, a, s, wt, fault);
-    // SAFETY: i < n·m <= y.len() by this fn's contract; thread i is
-    // y[i]'s only writer.
-    unsafe {
-        *y.get_unchecked_mut(i) = out;
     }
 }
 
@@ -501,89 +446,11 @@ mod q38_kernels {
                 *w.get_unchecked(t * slots as usize + slot as usize),
             )
         };
-        let out = combine(h, a, s, wt, fault);
+        let out = join_value(h, a, s, wt, fault);
         // SAFETY: i < n·m <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = out;
         }
-    }
-
-    /// The block output of a layer run without a host leg over `m` tokens of
-    /// `n` values, one thread a value: `ds41_ffn_card_acc_10`'s sum of the
-    /// card slots' down rows (`crate::card_slots::card_acc_at` at [`SLOTS`]
-    /// slots and the router's pitch of [`W_PITCH`]), then the combine
-    /// ([`combine`], [`q38_card_shared_add`]'s) with the zeros an empty host
-    /// list sums to, `(0 + acc) + sh · w[11t + 10]` — the two launches'
-    /// bits, `0 + acc` turning a `-0.0` sum into `+0.0` as their zeros do. A
-    /// place in `[n_card, HOST)` raises [`FaultSite::ExpertId`] and its
-    /// token's values are NaN; a non-finite input or result of the combine
-    /// raises [`FaultSite::F32Product`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            down.len() >= 10 * n * m,
-            w.len() >= 11 * m,
-            sel.len() >= 10 * m,
-            sh.len() >= n * m,
-            y.len() >= n * m
-        )
-    )]
-    pub fn q38_card_sum_shared_add(
-        down: &[f32],
-        w: &[f32],
-        sel: &[u32],
-        sh: &[f32],
-        n: u32,
-        m: u32,
-        n_card: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let i = thread::index_1d().get();
-        // SAFETY: the launch contract's lengths, read as the body's.
-        unsafe { card_sum_shared_add_at(i, down, (w, sel, sh), (n, m, n_card), fault, &mut y) }
-    }
-
-    /// [`q38_card_sum_shared_add`] over BF16 down rows (each cell widened
-    /// exactly to F32): the same sum, combine and faults.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            down.len() >= 10 * n * m,
-            w.len() >= 11 * m,
-            sel.len() >= 10 * m,
-            sh.len() >= n * m,
-            y.len() >= n * m
-        )
-    )]
-    pub fn q38_card_sum_shared_add_bf16(
-        down: &[u16],
-        w: &[f32],
-        sel: &[u32],
-        sh: &[f32],
-        n: u32,
-        m: u32,
-        n_card: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let i = thread::index_1d().get();
-        // SAFETY: the launch contract's lengths, read as the body's.
-        unsafe { card_sum_shared_add_at(i, down, (w, sel, sh), (n, m, n_card), fault, &mut y) }
     }
 
     /// The join of a tier layer over `m` tokens of `n` values, one thread a
@@ -679,7 +546,7 @@ mod q38_kernels {
                 *w.get_unchecked(t * W_PITCH + SLOTS),
             )
         };
-        let out = combine(h, a, s, wt, fault);
+        let out = join_value(h, a, s, wt, fault);
         // SAFETY: i < n·m <= y.len() by the launch contract; thread i is
         // y[i]'s only writer.
         unsafe {
@@ -1007,23 +874,6 @@ pub struct CardSharedAddArgs<'a> {
     pub slots: usize,
     pub n: usize,
     pub m: usize,
-    pub fault: FaultSink,
-    pub y: &'a mut DeviceBuffer<f32>,
-}
-
-/// [`Q38Kernels::enqueue_card_sum_shared_add`]'s arguments: `m` tokens'
-/// [`SLOTS`] slots — the card's down outputs, slot-major (`n` values a
-/// slot), the router's weights ([`W_PITCH`] a token, the shared expert's gate
-/// last) and the places (below `n_card`, else [`HOST`]) — the shared
-/// expert's outputs (`[m][n]`), the sink and the output.
-pub struct CardSumSharedAddArgs<'a> {
-    pub down: DownRows<'a>,
-    pub w: &'a DeviceBuffer<f32>,
-    pub sel: &'a DeviceBuffer<u32>,
-    pub sh: &'a DeviceBuffer<f32>,
-    pub n: usize,
-    pub m: usize,
-    pub n_card: usize,
     pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
 }
@@ -1403,68 +1253,6 @@ impl Q38Kernels {
             a.fault,
             a.y,
         )?;
-        Ok(())
-    }
-
-    /// Enqueue the block output of a layer run without a host leg
-    /// ([`CardSumSharedAddArgs`], module doc): the card slots' sum in slot
-    /// order, then the combine with the zeros of an empty host list and the
-    /// shared expert's gated output, the bits of
-    /// `CardSlotKernels::enqueue_card_acc` then
-    /// [`Q38Kernels::enqueue_card_shared_add`] over zeros. `down`
-    /// `SLOTS·n·m` values, `w` `W_PITCH·m`, `sel` `SLOTS·m`, `sh` and `y`
-    /// `n·m`. No value or token, more than one launch's grid holds, and a
-    /// buffer short of them are refused by name, nothing launched. One
-    /// launch. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_card_sum_shared_add(
-        &self,
-        stream: &CudaStream,
-        a: CardSumSharedAddArgs<'_>,
-    ) -> Result<(), GpuError> {
-        let what = "q38::enqueue_card_sum_shared_add";
-        let nm =
-            a.n.checked_mul(a.m).filter(|&nm| nm != 0).ok_or_else(|| {
-                GpuError::shape(what, format!("{} values of {} tokens", a.n, a.m))
-            })?;
-        // The grid bounds n·m, so the lengths below cannot wrap.
-        let cfg = grid(what, nm)?;
-        short(
-            what,
-            &[
-                ("down", a.down.cells(), SLOTS * nm),
-                ("w", a.w.len(), W_PITCH * a.m),
-                ("sel", a.sel.len(), SLOTS * a.m),
-                ("sh", a.sh.len(), nm),
-                ("y", a.y.len(), nm),
-            ],
-        )?;
-        let (n, m, n_card) = (
-            launch_u32(what, "n", a.n)?,
-            launch_u32(what, "m", a.m)?,
-            launch_u32(what, "n_card", a.n_card)?,
-        );
-        macro_rules! launch {
-            ($prepare:ident, $entry:ident, $down:expr) => {{
-                let prep = self.module.$prepare(cfg)?;
-                self.module.$entry(
-                    stream, &prep, $down, a.w, a.sel, a.sh, n, m, n_card, a.fault, a.y,
-                )?;
-            }};
-        }
-        match a.down {
-            DownRows::F32(down) => {
-                launch!(
-                    prepare_q38_card_sum_shared_add,
-                    q38_card_sum_shared_add,
-                    down
-                );
-            }
-            DownRows::Bf16(down) => launch!(
-                prepare_q38_card_sum_shared_add_bf16,
-                q38_card_sum_shared_add_bf16,
-                down
-            ),
-        }
         Ok(())
     }
 

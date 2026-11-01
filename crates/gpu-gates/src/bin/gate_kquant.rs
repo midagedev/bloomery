@@ -90,15 +90,18 @@
 //!     the card that is not `HOST` raises `ExpertId` in the quantizer (its
 //!     column not read) and in the card sum (its token NaN), a `HOST` place
 //!     in neither, each launch alone over NaN host columns; the launchers
-//!     refuse weights at a pitch of ten, the quantizer a card of no expert,
-//!     columns past the scratch and a slot past the weights. A layer
-//!     without a host leg's one launch (`q38_card_sum_shared_add`) over the
+//!     refuse a slot past the weights, and the quantizer a card of no expert
+//!     and columns past the scratch. A layer
+//!     without a host leg's one launch (the common `card_sum_join`) over the
 //!     same down rows, the host slots NaN, is `runtime::combine::combine`
 //!     over a zero host sum and the sum and combine launches over zeros, bit
 //!     for bit, a card sum of `-0.0` (every product rounding to it) and a
 //!     `-0.0` shared row giving `+0.0`; a stray place raises `ExpertId` and
-//!     the NaN sum's `F32Product`, its token NaN; its launcher refuses no
-//!     token and an output a value short.
+//!     the NaN sum's `F32Product`, its token NaN; ungated from the card sum
+//!     itself it is the sum launch then `acc + sh`, bit for bit, the `-0.0`
+//!     sum kept; its launcher refuses a shared gate among the routed slots
+//!     or past the pitch. No token, short weights and a short output are covered
+//!     by `card_slots::tests::hw_the_card_sum_launchers_refuse_invalid_shapes`.
 //! 11. q8_0_sel32: the Q8_0 down `_sel` of 32-value blocks
 //!     (`bloomery_gpu::q8_0_sel32`, the file's `block_q8_0` bytes resident as
 //!     one word stream) over clause 7's seven experts and ten slots, at the
@@ -2124,7 +2127,7 @@ mod gate {
     /// and weights, and every launch's output.
     pub(crate) struct Leg38 {
         pub(crate) q38: Q38Kernels,
-        slots: CardSlotKernels,
+        pub(crate) slots: CardSlotKernels,
         gate: Stack,
         up: Stack,
         down: Stack51,
@@ -2494,19 +2497,8 @@ mod gate {
         let stream = c.gpu.stream();
         let sink = c.gpu.unlabelled_sink();
         let slots = SEL38.len();
-        let w10 = DeviceBuffer::from_host(stream, &[0.5f32; M38 * SLOTS])?;
-        let a = CardAcc {
-            down: &leg.y_down,
-            w: &w10,
-            sel: &leg.sel,
-            n: N38,
-            m: M38,
-            n_card: E38,
-            n_used: SLOTS,
-            w_pitch: W_PITCH,
-            fault: sink,
-        };
-        let r_pitch10 = leg.slots.enqueue_card_acc(stream, &a, &mut leg.acc);
+        // PIN(2026-11-02): short weights are covered by
+        // card_slots::tests::hw_the_card_sum_launchers_refuse_invalid_shapes.
         let mut r_quant = Vec::with_capacity(2);
         for (cols, n_card) in [(0..slots, 0), (1..slots + 1, E38)] {
             let q = QuantSel {
@@ -2528,12 +2520,7 @@ mod gate {
         // Qwen3.8's own launcher: the common sum serves a card of no expert as
         // zeros (V4.1's layers with no card experts), and card_slots.rs's hw
         // test holds that; Qwen3.8 keeps `q38_shared_add` for such a layer.
-        let cases: [(&str, &str, Result<(), GpuError>); 3] = [
-            (
-                "ds41_ffn_card_acc_10",
-                "weights_at_a_pitch_of_10",
-                r_pitch10,
-            ),
+        let cases: [(&str, &str, Result<(), GpuError>); 2] = [
             (
                 "enqueue_quantize_q8_sel",
                 "a_card_of_no_expert",
