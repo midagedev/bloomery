@@ -92,6 +92,13 @@ pub struct AttnGeom {
     /// The layer's output gate is one value a query head, from a projection
     /// of its own that the launch binds.
     pub head_gate: bool,
+    /// Every query and key head is RMS-normed by the file's gains before its
+    /// rope: a layer with no q/k norm applies none, and its launches hold no
+    /// gain windows.
+    pub qk_norm: bool,
+    /// The rope pairs the neighbours `2i, 2i + 1` (GGUF's NORM pairing), not
+    /// the NEOX halves `i, i + rot / 2`.
+    pub norm_pairs: bool,
 }
 
 /// The numbers of the gated delta step for one instance: its own axes, or the
@@ -236,6 +243,8 @@ impl Geometry {
                 gated: key.attn.q_gate,
                 windowed: attention_geom::windowed(inst),
                 head_gate: attention_geom::head_gate(inst),
+                qk_norm: attention_geom::qk_norm(inst),
+                norm_pairs: attention_geom::norm_pairs(inst),
             },
             delta: DeltaGeom {
                 value_heads,

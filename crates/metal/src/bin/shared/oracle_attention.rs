@@ -220,6 +220,32 @@ pub fn norm_rope(x: &[f32], gain: &[f32], eps: f32, table_row: &[f32]) -> Result
     Ok(y)
 }
 
+/// Rope of one head with no head norm, in the kernel's f32 order: the raw
+/// values turned as neighbours, pair `i` the values `2i, 2i + 1` (GGUF's NORM
+/// pairing) by the table row's pair `i`, the values past the turned width
+/// passed through. No sum of squares and no gain: a head of the no-norm
+/// prologue is exact in its inputs' width.
+pub fn rope_norm_pairs(x: &[f32], table_row: &[f32]) -> Result<Vec<f32>, String> {
+    let head = x.len();
+    let rot = table_row.len();
+    check_head(head)?;
+    if rot == 0 || !rot.is_multiple_of(2) || rot > head {
+        return Err(format!(
+            "a rope row holds {rot} values, which do not turn pairs of a head of {head}"
+        ));
+    }
+    let mut y = x.to_vec();
+    for i in 0..rot / 2 {
+        let n0 = x[2 * i];
+        let n1 = x[2 * i + 1];
+        let c = table_row[2 * i];
+        let s = table_row[2 * i + 1];
+        y[2 * i] = n0.mul_add(c, -(n1 * s));
+        y[2 * i + 1] = n0.mul_add(s, n1 * c);
+    }
+    Ok(y)
+}
+
 /// One head as f16 bits, `gguf::quant::f32_to_f16_bits` per value.
 #[must_use]
 pub fn pack_f16(row: &[f32]) -> Vec<u16> {

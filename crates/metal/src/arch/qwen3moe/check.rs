@@ -299,8 +299,11 @@ pub(super) struct DeltaLayout {
 pub(super) struct AttnLayout {
     pub(super) p1: P1Layout,
     pub(super) out: Site,
-    pub(super) q_norm: Values,
-    pub(super) k_norm: Values,
+    /// The query and key head norms' gains, on a kind whose flash norms each
+    /// head ([`GqaKind::head_norm`]); a kind with none reads neither tensor
+    /// and holds no gains.
+    pub(super) q_norm: Option<Values>,
+    pub(super) k_norm: Option<Values>,
     /// The elements of one cache plane.
     pub(super) cache: usize,
     /// The output gate of one value a query head is the P1's fourth segment,
@@ -1165,6 +1168,17 @@ fn attention_checks(
     ctx: usize,
     rope: Option<usize>,
 ) -> Option<AttnLayout> {
+    // The flash is compiled at the kind's head norm and pairing: the plan's names are read
+    // only for a kind whose flash norms each head, and a combination with no entry is the
+    // instance's own refusal (a shape no kernel takes).
+    let norm = if g.kind.head_norm() {
+        Some((
+            at.ok(t.f32s(&g.attn_q_norm, t.geom.attn.head)),
+            at.ok(t.f32s(&g.attn_k_norm, t.geom.attn.head)),
+        ))
+    } else {
+        None
+    };
     let a = &t.geom.attn;
     let q_rows = at.ok(a
         .qg_len()
@@ -1190,13 +1204,15 @@ fn attention_checks(
     let cache = at.ok(a
         .f16_len(ctx)
         .ok_or_else(|| refuse("the cache does not fit")));
-    let q_norm = at.ok(t.f32s(&g.attn_q_norm, a.head));
-    let k_norm = at.ok(t.f32s(&g.attn_k_norm, a.head));
+    let (q_norm, k_norm) = match norm {
+        Some((q, k)) => (Some(q?), Some(k?)),
+        None => (None, None),
+    };
     Some(AttnLayout {
         p1: p1?,
         out: out?,
-        q_norm: q_norm?,
-        k_norm: k_norm?,
+        q_norm,
+        k_norm,
         cache: cache?,
         gate: g.gate.is_some(),
         window: g.window,
@@ -1630,7 +1646,7 @@ impl Checked {
                 MixerLayout::Attention(a) => {
                     p1_weights(&mut b.weights, &a.p1);
                     b.weights.add(a.out.bytes());
-                    for v in [&a.q_norm, &a.k_norm] {
+                    for v in [&a.q_norm, &a.k_norm].into_iter().flatten() {
                         b.weights.add(f32s(v.len));
                     }
                     b.kv.add(count(a.cache) * 2);
@@ -2053,6 +2069,104 @@ mod tests {
             t
         }
 
+        /// The table of a dense Llama file (`llama`) at the axes the kernel
+        /// gate's `LLAMA_ATTN` row compiles: 32 heads over 8 of 128 values,
+        /// no q/k norm, the rope pairing neighbours over the whole head with
+        /// the file's frequency factors, an untied head unless `tied`, and a
+        /// dense SwiGLU FFN. The chat template is the plainest the reader
+        /// takes.
+        fn llama(tied: bool) -> Synthetic {
+            const VOCAB: u64 = 128_256;
+            const HEADS: u64 = 32;
+            const KV: u64 = 8;
+            const HEAD: u64 = 128;
+            const HIDDEN: u64 = 2048;
+            const FF: u64 = 512;
+            let u = |k: &str, v: u32| (format!("llama.{k}"), Value::U32(v));
+            let mut kvs = vec![
+                (
+                    gguf::GENERAL_ARCHITECTURE.to_owned(),
+                    Value::String("llama".to_owned()),
+                ),
+                (
+                    "tokenizer.ggml.model".to_owned(),
+                    Value::String("llama".to_owned()),
+                ),
+                (
+                    "tokenizer.ggml.pre".to_owned(),
+                    Value::String("default".to_owned()),
+                ),
+                (
+                    "tokenizer.chat_template".to_owned(),
+                    Value::String("{{ messages }}".to_owned()),
+                ),
+                u("block_count", 2),
+                u("context_length", 8192),
+                u(
+                    "embedding_length",
+                    u32::try_from(HIDDEN).expect("the width fits u32"),
+                ),
+                u(
+                    "feed_forward_length",
+                    u32::try_from(FF).expect("the width fits u32"),
+                ),
+                u(
+                    "vocab_size",
+                    u32::try_from(VOCAB).expect("the vocabulary fits u32"),
+                ),
+                u(
+                    "attention.head_count",
+                    u32::try_from(HEADS).expect("the heads fit u32"),
+                ),
+                u(
+                    "attention.head_count_kv",
+                    u32::try_from(KV).expect("the heads fit u32"),
+                ),
+                u(
+                    "attention.key_length",
+                    u32::try_from(HEAD).expect("the width fits u32"),
+                ),
+                u(
+                    "attention.value_length",
+                    u32::try_from(HEAD).expect("the width fits u32"),
+                ),
+                u("rope.dimension_count", u32::try_from(HEAD).expect("fits")),
+                ("llama.rope.freq_base".to_owned(), Value::F32(500_000.0)),
+                (
+                    "llama.attention.layer_norm_rms_epsilon".to_owned(),
+                    Value::F32(1e-5),
+                ),
+            ];
+            kvs.reserve(1);
+            let mut t = Synthetic {
+                kvs,
+                tensors: Vec::new(),
+                attn_layer: 1,
+            };
+            let q = GgmlType::Q4_K;
+            let query = HEADS * HEAD;
+            let key = KV * HEAD;
+            t.add("token_embd.weight", &[HIDDEN, VOCAB], GgmlType::Q5_K);
+            if !tied {
+                t.add("output.weight", &[HIDDEN, VOCAB], GgmlType::Q5_K);
+            }
+            t.add("output_norm.weight", &[HIDDEN], GgmlType::F32);
+            t.add("rope_freqs.weight", &[HEAD / 2], GgmlType::F32);
+            for l in 0..2 {
+                let b = |stem: &str| format!("blk.{l}.{stem}");
+                t.add(&b("attn_norm.weight"), &[HIDDEN], GgmlType::F32);
+                t.add(&b("attn_q.weight"), &[HIDDEN, query], q);
+                t.add(&b("attn_k.weight"), &[HIDDEN, key], q);
+                t.add(&b("attn_v.weight"), &[HIDDEN, key], q);
+                t.add(&b("attn_output.weight"), &[query, HIDDEN], q);
+                t.add(&b("ffn_norm.weight"), &[HIDDEN], GgmlType::F32);
+                t.add(&b("ffn_gate.weight"), &[HIDDEN, FF], q);
+                t.add(&b("ffn_up.weight"), &[HIDDEN, FF], q);
+                t.add(&b("ffn_down.weight"), &[FF, HIDDEN], q);
+            }
+            t
+        }
+
         fn add(&mut self, name: &str, dims: &[u64], ty: GgmlType) {
             self.tensors.push((name.to_owned(), dims.to_vec(), ty));
         }
@@ -2202,6 +2316,70 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A dense Llama file opens at an instance made at open with the no-norm,
+    /// neighbour-paired attention axes: its attention layers hold no q/k norm
+    /// gains, the head is its own matrix, and a tied one (no `output.weight`)
+    /// reads the token embedding as the head.
+    #[test]
+    fn a_dense_llama_opens_with_no_head_norms() {
+        for tied in [false, true] {
+            let t = Synthetic::llama(tied);
+            let out = check(&t.split(), CTX);
+            assert!(out.items.is_empty(), "tied {tied}: {:?}", out.items);
+            let checked = out.checked.expect("a checked file");
+            assert_eq!(checked.instance.name, instance::UNREGISTERED);
+            assert_eq!(checked.instance.key.attn, instance::LLAMA_ATTN.key.attn);
+            assert!(!checked.geom.attn.qk_norm && checked.geom.attn.norm_pairs);
+            let head_name = if tied {
+                "token_embd.weight"
+            } else {
+                "output.weight"
+            };
+            assert_eq!(checked.layout.head.name, head_name, "tied {tied}");
+            for layer in &checked.layout.layers {
+                let MixerLayout::Attention(a) = &layer.mixer else {
+                    panic!("tied {tied}: a layer mixes with another");
+                };
+                assert!(
+                    a.q_norm.is_none() && a.k_norm.is_none(),
+                    "tied {tied}: a layer holds head norm gains"
+                );
+            }
+            let bytes = checked.bytes().expect("the bytes");
+            assert_eq!(
+                bytes.weights.requested,
+                t.weight_bytes(),
+                "tied {tied}: the weights"
+            );
+        }
+    }
+
+    /// The same file with each layer's q and k norms is a head norm over the
+    /// neighbour pairs, a combination no kernel takes: refused by name at the
+    /// instance, before any arena rule.
+    #[test]
+    fn a_llama_with_head_norms_is_refused_by_name_at_the_instance() {
+        let mut t = Synthetic::llama(false);
+        for l in 0..2 {
+            let b = |stem: &str| format!("blk.{l}.{stem}");
+            t.add(&b("attn_q_norm.weight"), &[128], GgmlType::F32);
+            t.add(&b("attn_k_norm.weight"), &[128], GgmlType::F32);
+        }
+        let got = texts(&t.split(), CTX);
+        // The instance's refusal is first; the chain's own kind refusal follows.
+        assert!(
+            got.first().is_some_and(|text| text.contains(
+                "no kernel takes it: attention: head norm and rope pairs is \
+                     head norm yes, NORM pairs yes"
+            )),
+            "{got:?}"
+        );
+        assert!(
+            got.len() == 2 && got[1].contains("the kernels take heads of 128"),
+            "the plan's kind refusal follows: {got:?}"
+        );
     }
 
     /// One class of buffers from the byte size of each: how many, the bytes

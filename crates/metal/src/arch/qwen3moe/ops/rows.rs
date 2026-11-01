@@ -29,7 +29,7 @@ use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::rows::FfnRows;
 use super::super::session::SessionError;
 use super::{
-    Half, MetalOps, WHAT, all, all_mut, conv_bufs, head_params, post_gain, refuse, rope_of,
+    Half, MetalOps, WHAT, all, all_mut, conv_bufs, gains, head_params, post_gain, refuse, rope_of,
 };
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
@@ -383,8 +383,8 @@ impl MetalOps<'_, '_> {
                 k_stride: stride,
                 v: rows.proj.window(Elems(v_at), Elems(v_len))?,
                 v_stride: stride,
-                q_gain: all(&a.q_norm)?,
-                k_gain: all(&a.k_norm)?,
+                q_gain: gains(&a.q_norm)?,
+                k_gain: gains(&a.k_norm)?,
                 rope: all(rope)?,
                 cache: AttnCache::F16 {
                     k: all_mut(&mut a.k_cache)?,

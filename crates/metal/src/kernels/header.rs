@@ -88,6 +88,8 @@ pub fn geometry_defines(g: &Geometry) -> String {
          #define BLOOMERY_ATTN_LANE_DIMS {alanedims}\n\
          #define BLOOMERY_ATTN_GATED {agated}\n\
          #define BLOOMERY_ATTN_HEAD_GATE {aheadgate}\n\
+         #define BLOOMERY_ATTN_QK_NORM {aqknorm}\n\
+         #define BLOOMERY_ATTN_PAIRS_NORM {apairsnorm}\n\
          #define BLOOMERY_ATTN_WINDOW {awindow}\n\
          #define BLOOMERY_ATTN_SEGMENT_CAP {asegcap}\n\
          #define BLOOMERY_ATTN_ONE_SG {aonesg}\n\
@@ -131,6 +133,8 @@ pub fn geometry_defines(g: &Geometry) -> String {
         alanedims = g.attn.lane_dims,
         agated = u32::from(g.attn.gated),
         aheadgate = u32::from(g.attn.head_gate),
+        aqknorm = u32::from(g.attn.qk_norm),
+        apairsnorm = u32::from(g.attn.norm_pairs),
         awindow = u32::from(g.attn.windowed),
         asegcap = attention_geom::SEGMENT_CAP,
         aonesg = attention_geom::ONE_PASS_SG,
@@ -237,6 +241,8 @@ mod tests {
             ("BLOOMERY_ATTN_LANE_DIMS", g.attn.lane_dims),
             ("BLOOMERY_ATTN_GATED", usize::from(g.attn.gated)),
             ("BLOOMERY_ATTN_HEAD_GATE", usize::from(g.attn.head_gate)),
+            ("BLOOMERY_ATTN_QK_NORM", usize::from(g.attn.qk_norm)),
+            ("BLOOMERY_ATTN_PAIRS_NORM", usize::from(g.attn.norm_pairs)),
             ("BLOOMERY_ATTN_WINDOW", usize::from(g.attn.windowed)),
             ("BLOOMERY_ATTN_SEGMENT_CAP", attention_geom::SEGMENT_CAP),
             ("BLOOMERY_ATTN_ONE_SG", attention_geom::ONE_PASS_SG),

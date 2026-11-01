@@ -3,7 +3,7 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::geom::{Geometry, KernelRefused};
 use models::shape::{self, AttnShape, GqaInst, MoeShape, RouterBody, RouterInst, ShapeRefused};
-use models::{DeltaKind, Ffn, GdnGate, Mixer, ModelSpec, OutGate};
+use models::{DeltaKind, Ffn, GdnGate, Mixer, ModelSpec, OutGate, RopeMode};
 
 /// One instance: the axes its kernels are compiled at, under a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +75,12 @@ pub struct AttnAxes {
     /// The output gate is one value a query head from a projection of its own
     /// (`OutGate::ProjHead`): exclusive with `q_gate`.
     pub head_gate: bool,
+    /// Every query and key head is RMS-normed by the file's gains before its
+    /// rope (`BLOOMERY_ATTN_QK_NORM`): a layer with no q/k norm applies none.
+    pub qk_norm: bool,
+    /// The rope pairs the neighbours `2i, 2i + 1` (GGUF's NORM pairing,
+    /// `BLOOMERY_ATTN_PAIRS_NORM`), not the NEOX halves `i, i + rot / 2`.
+    pub norm_pairs: bool,
 }
 
 /// A gated delta layer's axes.
@@ -137,6 +143,8 @@ pub const QWEN35MOE_A3B: Instance = Instance {
             rot: 64,
             q_gate: true,
             head_gate: false,
+            qk_norm: true,
+            norm_pairs: false,
         },
         delta: Some(QWEN35_GDN),
     },
@@ -166,6 +174,8 @@ pub const QWEN3MOE_A3B: Instance = Instance {
             rot: 128,
             q_gate: false,
             head_gate: false,
+            qk_norm: true,
+            norm_pairs: false,
         },
         delta: None,
     },
@@ -203,6 +213,8 @@ pub const QWEN35MOE_GQA6: Instance = Instance {
             rot: 64,
             q_gate: true,
             head_gate: false,
+            qk_norm: true,
+            norm_pairs: false,
         },
         ..QWEN35MOE_A3B.key
     },
@@ -225,6 +237,8 @@ pub const QWEN35MOE_GQA4: Instance = Instance {
             rot: 64,
             q_gate: true,
             head_gate: false,
+            qk_norm: true,
+            norm_pairs: false,
         },
         ..QWEN35MOE_A3B.key
     },
@@ -259,10 +273,39 @@ pub const LFM3_ATTN: Instance = Instance {
             rot: 128,
             q_gate: false,
             head_gate: true,
+            qk_norm: true,
+            norm_pairs: false,
         },
         ..QWEN35MOE_A3B.key
     },
     host_feature: Some("host-lfm3-attn"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention layers of a dense Llama: 32 heads over
+/// 8 key heads of 128 values turned whole (four query heads a key head), no
+/// q/k head norm and the rope pairing neighbours (GGUF's NORM), over the same
+/// flash row a windowed layer takes (a Llama layer's launch names no window).
+/// The kernel gate's row of the prologue's two axes; every other axis is the
+/// one its clauses have a fixture for. A file of Llama-3.1-8B selects this
+/// row's flash ([`Key::of`]); its dense FFN has no row, so it opens an
+/// instance made at open.
+pub const LLAMA_ATTN: Instance = Instance {
+    name: "llama_attn",
+    key: Key {
+        attn: AttnAxes {
+            row: LFM3_ATTN.key.attn.row,
+            n_head: 32,
+            n_kv: 8,
+            rot: 128,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: true,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-llama-attn"),
     opens: false,
 };
 
@@ -277,6 +320,7 @@ pub const REGISTERED: &[Instance] = &[
     QWEN35MOE_GQA6,
     QWEN35MOE_GQA4,
     LFM3_ATTN,
+    LLAMA_ATTN,
 ];
 
 /// The name of an instance made at open for a shape no row registers. No
@@ -290,13 +334,15 @@ pub const UNREGISTERED: &str = "unregistered";
 /// `host-qwen3moe-a3b`, the 48-value-head delta net's under
 /// `host-qwen35moe-gdn48`, the six-query-head group's under
 /// `host-qwen35moe-gqa6`, the four-query-head group's under `host-qwen35moe-gqa4`,
-/// the windowed, per-head gated head-128 attention's under `host-lfm3-attn`.
+/// the windowed, per-head gated head-128 attention's under `host-lfm3-attn`,
+/// the norm-free neighbour-paired head-128 attention's under `host-llama-attn`.
 #[cfg(not(any(
     feature = "host-qwen3moe-a3b",
     feature = "host-qwen35moe-gdn48",
     feature = "host-qwen35moe-gqa6",
     feature = "host-qwen35moe-gqa4",
-    feature = "host-lfm3-attn"
+    feature = "host-lfm3-attn",
+    feature = "host-llama-attn"
 )))]
 pub const HOST: Instance = QWEN35MOE_A3B;
 
@@ -311,6 +357,10 @@ pub const HOST: Instance = QWEN35MOE_GQA4;
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-lfm3-attn")]
 pub const HOST: Instance = LFM3_ATTN;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-llama-attn")]
+pub const HOST: Instance = LLAMA_ATTN;
 
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-qwen3moe-a3b")]
@@ -412,7 +462,7 @@ impl fmt::Display for Key {
         let a = &self.attn;
         write!(
             f,
-            "; attention {}/{} heads of {} (value {}), rope {}{}; ",
+            "; attention {}/{} heads of {} (value {}), rope {}{}{}{}; ",
             a.n_head,
             a.n_kv,
             a.row.head,
@@ -425,6 +475,8 @@ impl fmt::Display for Key {
             } else {
                 ""
             },
+            if a.qk_norm { "" } else { ", no head norm" },
+            if a.norm_pairs { ", NORM pairs" } else { "" },
         )?;
         match &self.delta {
             Some(d) => write!(
@@ -551,6 +603,10 @@ impl Key {
                         rot: g.rope.dims,
                         q_gate: g.out_gate == OutGate::Packed,
                         head_gate: g.out_gate == OutGate::ProjHead,
+                        qk_norm: g.qk_norm,
+                        // GGUF's NORM pairing; IMROPE turns as NEOX does at a
+                        // text-only position, which is every position here.
+                        norm_pairs: matches!(g.rope.mode, RopeMode::NormTail),
                     };
                     agree(&mut attn, axes, layer, "attention")?;
                 }
@@ -691,19 +747,41 @@ mod tests {
 
     /// An attention layer of `out_gate`.
     fn gqa_gated(heads: u32, kv_heads: u32, head_dim: u32, rot: u32, out_gate: OutGate) -> Mixer {
+        gqa_axes(
+            heads,
+            kv_heads,
+            head_dim,
+            rot,
+            out_gate,
+            RopeMode::Neox,
+            true,
+        )
+    }
+
+    /// An attention layer of `out_gate`, rope mode and head norm: the axes a
+    /// description states that [`Key::of`] reads.
+    fn gqa_axes(
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        rot: u32,
+        out_gate: OutGate,
+        mode: RopeMode,
+        qk_norm: bool,
+    ) -> Mixer {
         Mixer::Gqa(Gqa {
             heads,
             kv_heads,
             head_dim,
             value_dim: head_dim,
             rope: Rope {
-                mode: RopeMode::Neox,
+                mode,
                 dims: rot,
                 base: 10_000_000.0,
                 yarn: None,
                 factors: false,
             },
-            qk_norm: true,
+            qk_norm,
             o_norm: false,
             out_gate,
             select: None,
@@ -1282,13 +1360,57 @@ mod tests {
             } else {
                 OutGate::None
             };
+            // The pairing of a head norm's axes: NEOX for the normed rows,
+            // and the pairing the row states where it norms none.
+            let mode = if a.norm_pairs {
+                RopeMode::NormTail
+            } else {
+                RopeMode::Neox
+            };
             let layers = vec![(
-                gqa_gated(a.n_head, a.n_kv, a.row.head, a.rot, gate),
+                gqa_axes(a.n_head, a.n_kv, a.row.head, a.rot, gate, mode, a.qk_norm),
                 dense_ffn(512),
             )];
             let got = key(inst.key.hidden, &layers).expect("a registered row's own shape");
             assert_eq!(got.attn, a, "{}", inst.name);
         }
+    }
+
+    /// A dense Llama's layers select the head-128 group-4 flash row with the
+    /// no-norm, neighbour-paired axes ([`LLAMA_ATTN`]'s attention), and the
+    /// file's key opens an instance made at open at them: no row registers a
+    /// dense FFN. Mutant: `Key::of` reading the q/k norm or the rope mode of
+    /// no layer.
+    #[test]
+    fn llama_layers_select_the_norm_free_neighbour_paired_row() {
+        let llama = |mode: RopeMode, qk_norm: bool| {
+            let layers: Vec<(Mixer, Ffn)> = (0..2)
+                .map(|_| {
+                    (
+                        gqa_axes(32, 8, 128, 128, OutGate::None, mode, qk_norm),
+                        dense_ffn(14_336),
+                    )
+                })
+                .collect();
+            key(4096, &layers).expect("the description reads")
+        };
+        let k = llama(RopeMode::NormTail, false);
+        assert_eq!(k.attn, LLAMA_ATTN.key.attn);
+        assert!(!k.attn.qk_norm && k.attn.norm_pairs);
+        assert!(of_key(k).is_err(), "no row registers a dense FFN");
+        let opened = open_key(k).expect("every kernel takes Llama's geometry");
+        assert_eq!(opened.name, UNREGISTERED);
+        assert_eq!(opened.key.attn, LLAMA_ATTN.key.attn);
+        // The axes leave the display only where they leave the default, and
+        // the refusal names them.
+        let text = Refused::NoInstance { key: k }.to_string();
+        assert!(
+            text.contains(
+                "a dense FFN of ff 14336; attention 32/8 heads of 128 (value 128), \
+                           rope 128, no head norm, NORM pairs; no delta layer"
+            ),
+            "{text}"
+        );
     }
 
     /// A flash no registered row serves is refused by name at its layer, with

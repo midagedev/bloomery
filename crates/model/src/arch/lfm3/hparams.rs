@@ -5,7 +5,7 @@
 //! loader requires is required here. The rope turns the whole of `rope.dimension_count` values
 //! of a head; the file's `rope_freqs.weight` holds one factor for each pair of them.
 
-use gguf::{GgmlType, Split};
+use gguf::Split;
 
 use super::names::{
     ATTN_GATE, ATTN_K, ATTN_K_NORM, ATTN_NORM, ATTN_OUTPUT, ATTN_Q, ATTN_Q_NORM, ATTN_V, CONV_IN,
@@ -13,6 +13,7 @@ use super::names::{
     ROPE_FREQS,
 };
 use super::roles;
+use crate::arch::classify::rope_factors;
 use crate::arch::{
     check_kv, dims_agree, finite_positive, metadata, mul, n_vocab, per_layer_bool, per_layer_count,
     plain_rope, positive,
@@ -263,33 +264,6 @@ fn factors_from_le(bytes: &[u8], pairs: usize) -> Result<Vec<f32>, String> {
         .iter()
         .map(|b| f32::from_le_bytes(*b))
         .collect())
-}
-
-/// Whether the file carries the rope's factors: `rope_freqs.weight`, one f32 for each of the
-/// `rope_dims / 2` pairs, or none. A table of another length or type is refused by name.
-fn rope_factors(split: &Split, rope_dims: usize) -> Result<bool, PlacementError> {
-    let Some((_, t)) = split.find(ROPE_FREQS) else {
-        return Ok(false);
-    };
-    let pairs = [(rope_dims / 2) as u64];
-    if t.dims != pairs {
-        return Err(PlacementError::Tensor {
-            name: ROPE_FREQS.to_string(),
-            detail: format!(
-                "has dims {:?}; the rope turns {rope_dims} values of a head, {} pairs, one factor \
-                 each ({pairs:?})",
-                t.dims,
-                rope_dims / 2
-            ),
-        });
-    }
-    if t.ty != GgmlType::F32 {
-        return Err(PlacementError::Tensor {
-            name: ROPE_FREQS.to_string(),
-            detail: format!("is {}; the rope's factors are f32", t.ty),
-        });
-    }
-    Ok(true)
 }
 
 #[cfg(test)]

@@ -154,6 +154,17 @@ const LFM3_DEEP_LOGIT_CAP: f64 = 0.02;
 
 const _: () = assert!(LFM3_DEEP_LOGIT_ABS <= LFM3_DEEP_LOGIT_CAP);
 
+/// The band of `m_logits` on the Llama row: max |session − pin| on a logit of the 4-layer cut of
+/// Llama-3.1-8B-Instruct's folder, where the pin is mlx-lm's `llama` in f32 over the exact
+/// dequant of the folder's 4-bit weights. Derived, not measured: the Qwen band's error model, Δ =
+/// 2.8e-4 of a dot's rms a projection whose input is rounded once into half, over the rounded
+/// inputs of the cut's path (the shared input of q, k and v, the output projection's, the shared
+/// input of gate and up, the down's: four a layer, then the head's, 17 for four layers), added in
+/// quadrature: √17 · 2.8e-4 = 1.15e-3 of a logit's scale. It is held at 0.06, LFM3's band at 97
+/// roundings and a logit scale of 21, until the first pin's largest logit `L` gives the band
+/// 1.15e-3 · L (rounded up); the pin's half top-2 gap caps it, as `LFM3_LOGIT_CAP` caps LFM3's.
+const LLAMA_LOGIT_ABS: f64 = 0.06;
+
 /// Qwen3.6-35B-A3B's fixture: the gated delta net beside the attention layers.
 pub static QWEN35MOE: Row = Row {
     name: "qwen35moe",
@@ -264,8 +275,67 @@ pub static LFM3: Row = Row {
     )],
 };
 
+/// Llama-3.1-8B-Instruct's checkpoint folder cut to its first four layers (the folder's own
+/// bits, `tools/mlx-fixture-cuts`): grouped-query attention of 32 heads over 8 key heads of 128
+/// values with no head norm, the rope's `llama3` frequency factors, a plain residual and a dense
+/// SwiGLU in every layer, and a head of its own. No `prepare` map reads the family, so the folder
+/// is the model. Its vocabulary is not Qwen's and no d1k set exists, so the prompts are
+/// generated; the generation starts at the BOS id, which is the model's own start.
+///
+/// The count is four layers of seven groups, P1 (q, k and v are one type, so one dispatch),
+/// the flash, the out projection (adding into the stream), a hand-on, the FFN's gate-up (a dense
+/// layer has no router), its down (adding into the stream) and a hand-on, and the embed's one
+/// group and the head's two: 4 · 7 + 3 = 31, each one dispatch. The plain residual hands on
+/// because every reader of a layer's two halves (the next layer's P1 of one weight type, the
+/// gate-up, the head) is a launch of a type other than F32 (`Arena::hands_on`). A cut of another
+/// layer count encodes 7 · layers + 3.
+pub static LLAMA: Row = Row {
+    name: "llama",
+    arch: refset::arch::llama::ARCH,
+    model: Model::Folder,
+    prompt: Prompt::Generated {
+        first: 128_000,
+        lo: 256,
+        hi: 100_000,
+    },
+    seed: 128_000,
+    recurrent: false,
+    logit_abs: LLAMA_LOGIT_ABS,
+    deep_logit_abs: None,
+    count: Some(Count {
+        groups: 31,
+        dispatches: 31,
+    }),
+    mutants: Mutants::None,
+    skips: &[
+        (
+            "q_state",
+            "the clause compares a delta layer's state and conv ring and the file has no delta \
+             layer; q_chunk holds the pass's key and value rows",
+        ),
+        (
+            "q_mark",
+            "a pass's marks copy its delta stores and the file has none",
+        ),
+        (
+            "q_mark_cut",
+            "a cut back to a mark restores a delta store and the file has none",
+        ),
+        (
+            "p_profile",
+            "not on a dense FFN: the clause walks each layer's router picks and the experts' \
+             stack slices of the file's own tensors",
+        ),
+        (
+            "m_mlx_folder",
+            "the folder is every clause's model and there is no prepared split to tell it \
+             against; `m_logits` holds the folder's own logits to the pin",
+        ),
+    ],
+};
+
 /// Every row, the default first.
-pub static ROWS: [&Row; 4] = [&QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3];
+pub static ROWS: [&Row; 5] = [&QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA];
 
 /// The row `--row` names.
 pub fn find(name: &str) -> Option<&'static Row> {

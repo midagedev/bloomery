@@ -45,8 +45,8 @@ use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{
-    self, Instance, LFM3_ATTN, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4,
-    QWEN35MOE_GQA6, REGISTERED,
+    self, Instance, LFM3_ATTN, LLAMA_ATTN, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48,
+    QWEN35MOE_GQA4, QWEN35MOE_GQA6, REGISTERED,
 };
 use bloomery_metal::kernels::{
     Geometry, HeadNormParams, Kernels, LoadNorm, MatvecParams, Mode, NormOnLoad, Quant,
@@ -540,6 +540,15 @@ enum Table {
         kept: &'static [&'static str],
         own: &'static [mutants::Mutant],
     },
+    /// The clauses of the attention kernels an instance's head-norm and
+    /// pairing axes shape: the instance's flash applies no head norm and
+    /// turns neighbour pairs, so the gain launches of the other clause files
+    /// refuse it by name. The mutants of those clauses in both tables
+    /// (`kept`) and the instance's own (`own`).
+    Prologue {
+        kept: &'static [&'static str],
+        own: &'static [mutants::Mutant],
+    },
 }
 
 /// A registered instance's row of the gate: the architecture whose fixture
@@ -595,6 +604,14 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         table: Table::Window {
             kept: mutants::WINDOW_KEPT,
             own: mutants::WINDOW_MUTANTS,
+        },
+    },
+    InstanceRow {
+        instance: &LLAMA_ATTN,
+        fixture: "qwen35moe",
+        table: Table::Prologue {
+            kept: mutants::PROLOGUE_KEPT,
+            own: mutants::PROLOGUE_MUTANTS,
         },
     },
 ];
@@ -1021,6 +1038,9 @@ fn clause_table<'a>(
             .chain(clauses_window::refusals(ctx))
             .collect(),
         Table::Window { .. } => instances().chain(clauses_window::table(ctx)).collect(),
+        Table::Prologue { .. } => instances()
+            .chain(clauses_window::prologue_table(ctx))
+            .collect(),
         Table::Shaped { .. } => instances()
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))

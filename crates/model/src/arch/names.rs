@@ -26,6 +26,13 @@ pub fn output() -> String {
     "output.weight".to_string()
 }
 
+/// `rope_freqs.weight`: the rope's per-pair frequency factors, one f32 for each pair of the values
+/// the rope turns, read only by a family whose rope divides by them.
+#[must_use]
+pub fn rope_freqs() -> String {
+    crate::arch::classify::ROPE_FREQS.to_string()
+}
+
 // ------------------------------------------------ the per-layer names families share
 //
 // Every family that carries one of these tensors spells it alike (llama.cpp's `tn()` table), so

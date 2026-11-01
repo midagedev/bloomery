@@ -2943,6 +2943,47 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The llama spec: the Metal-only MLX fixture cut of the 8B folder, which has no registry row.
+    fn llama_spec() -> Spec {
+        Spec::parse(include_str!(
+            "../../../tools/mlx-fixture-cuts/llama-mlx.json"
+        ))
+        .unwrap()
+    }
+
+    /// The tensors of the 8B MLX folder from its one committed shard header
+    /// (`model.safetensors`), each tensor's first byte where the file holds it.
+    fn real_8b_source() -> Vec<Src> {
+        let raw =
+            gunzipped("checkpoint-headers/llama-3.1-8b-instruct-mlx-4bit-model.header.json.gz");
+        let header: Value = serde_json::from_slice(&raw).unwrap();
+        let base = 8 + to_u64(raw.len());
+        let mut out = Vec::new();
+        for (name, e) in header.as_object().unwrap() {
+            if name == "__metadata__" {
+                continue;
+            }
+            let (from, to) = (
+                e["data_offsets"][0].as_u64().unwrap(),
+                e["data_offsets"][1].as_u64().unwrap(),
+            );
+            out.push(Src {
+                name: name.clone(),
+                dtype: Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
+                shape: e["shape"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| usize::try_from(d.as_u64().unwrap()).unwrap())
+                    .collect(),
+                shard: "model.safetensors".to_string(),
+                start: base + from,
+                len: to - from,
+            });
+        }
+        out
+    }
+
     /// The tensors of the 27B MLX folder from its three committed shard headers, each tensor's first
     /// byte where its shard file holds it (the length word, the header, then its data offset): the
     /// source [`plan`] reads, with no tensor bytes behind it.
@@ -3135,5 +3176,122 @@ pub(crate) mod tests {
                 "layer {i}: layer_types and the interval disagree"
             );
         }
+    }
+
+    /// The llama spec over the real 8B folder's one shard header (743 tensors,
+    /// 4,517,404,672 bytes) plans the four-layer fixture: every layer of the
+    /// trunk alike (23 tensors: four attention projections of three planes
+    /// each, three of the FFN, two norm gains), with the embedding, the untied
+    /// head and the final norm; every tensor whole in its stored bits, one
+    /// shard, no layer split. From the header: 99 tensors and 1,081,810,944
+    /// bytes (the seven unlayered tensors 591,011,840; each kept layer
+    /// 122,699,776), and the 644 tensors of layers 4 to 31 dropped.
+    #[test]
+    fn the_llama_spec_plans_the_four_layer_fixture_from_the_real_8b_header() {
+        let spec = llama_spec();
+        let src = real_8b_source();
+        Source {
+            dir: PathBuf::new(),
+            tensors: src.clone(),
+        }
+        .check_identity(&spec)
+        .unwrap();
+        let p = plan(&spec, &src, DEFAULT_SHARD_BYTES).unwrap();
+        assert_eq!(p.tensors.len(), 99);
+        assert_eq!(
+            p.tensors.iter().map(|t| t.view.len()).sum::<u64>(),
+            1_081_810_944
+        );
+        assert_eq!(p.shards, 1);
+        assert_eq!(p.dropped_tensors, 28 * 23);
+        assert_eq!(p.dropped_bytes, 4_517_404_672 - 1_081_810_944);
+        let in_layer = |t: &Planned, l: usize| t.name.starts_with(&format!("model.layers.{l}."));
+        let layer_bytes = |l: usize| {
+            p.tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.view.len())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| !t.name.contains(".layers."))
+                .map(|t| t.view.len())
+                .sum::<u64>(),
+            591_011_840
+        );
+        assert_eq!(
+            (0..4).map(layer_bytes).collect::<Vec<_>>(),
+            [122_699_776; 4]
+        );
+        for l in 0..4 {
+            let names: Vec<&str> = p
+                .tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.name.as_str())
+                .collect();
+            assert_eq!(names.len(), 23, "layer {l}");
+            for part in [
+                "self_attn.q_proj.",
+                "self_attn.k_proj.",
+                "self_attn.v_proj.",
+                "self_attn.o_proj.",
+                "mlp.gate_proj.",
+                "mlp.up_proj.",
+                "mlp.down_proj.",
+                "input_layernorm.",
+                "post_attention_layernorm.",
+            ] {
+                assert!(
+                    names.iter().any(|n| n.contains(part)),
+                    "layer {l}: no {part}"
+                );
+            }
+        }
+        let by_name: HashMap<&str, &Planned> =
+            p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        let source_of: HashMap<&str, &Src> = src.iter().map(|t| (t.name.as_str(), t)).collect();
+        for t in &p.tensors {
+            let s = source_of[t.src_name.as_str()];
+            assert_eq!(t.view, View::whole(s.start, s.len), "{}", t.name);
+            assert_eq!((&t.shape, t.dtype), (&s.shape, s.dtype), "{}", t.name);
+        }
+        // Every quantized matrix keeps its two F16 planes beside its U32
+        // codes: seven a layer and the two unlayered ones.
+        let mut matrices = 0;
+        for t in p.tensors.iter().filter(|t| t.dtype == Dtype::U32) {
+            let stem = t.name.strip_suffix(".weight").expect("a code plane");
+            let groups = [t.shape[0], t.shape[1] / 8];
+            for plane in ["scales", "biases"] {
+                let c = by_name
+                    .get(format!("{stem}.{plane}").as_str())
+                    .unwrap_or_else(|| panic!("{stem}: no {plane} beside its codes"));
+                assert_eq!(
+                    (c.dtype, c.shape.as_slice()),
+                    (Dtype::F16, groups.as_slice()),
+                    "{stem}.{plane}"
+                );
+            }
+            matrices += 1;
+        }
+        assert_eq!(matrices, 4 * 7 + 2);
+    }
+
+    /// The llama spec over the real 8B `config.json` edits the one field that
+    /// names the layers and nothing else: `num_hidden_layers` 4.
+    #[test]
+    fn the_llama_spec_edits_the_real_8b_config_to_four_layers() {
+        let spec = llama_spec();
+        let real = String::from_utf8(gunzipped(
+            "quant-configs/mlx-community__Llama-3.1-8B-Instruct-4bit__config.json.gz",
+        ))
+        .unwrap();
+        let before: Value = serde_json::from_str(&real).unwrap();
+        let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
+        let mut want = before;
+        want["num_hidden_layers"] = json!(4);
+        assert_eq!(edited, want);
     }
 }

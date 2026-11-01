@@ -8,6 +8,7 @@ use crate::folder::{self, FolderMap};
 
 pub mod glm5next;
 pub mod lfm3;
+pub mod llama;
 pub mod minimaxm3;
 pub mod nemotron_h;
 pub mod qwen35moe;
@@ -45,6 +46,11 @@ pub const MAPS: &[MapRow] = &[
         model_types: <lfm3::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<lfm3::Checkpoint>,
         architecture: folder::architecture_as::<lfm3::Checkpoint>,
+    },
+    MapRow {
+        model_types: <llama::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<llama::Checkpoint>,
+        architecture: folder::architecture_as::<llama::Checkpoint>,
     },
     MapRow {
         model_types: <nemotron_h::Checkpoint as FolderMap>::MODEL_TYPES,

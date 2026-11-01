@@ -82,6 +82,20 @@ pub const fn head_gate(inst: &Instance) -> bool {
     inst.key.attn.head_gate
 }
 
+/// Whether the flash of `inst` norms each query and key head by the file's
+/// gains before its rope.
+#[must_use]
+pub const fn qk_norm(inst: &Instance) -> bool {
+    inst.key.attn.qk_norm
+}
+
+/// Whether the rope of `inst` pairs the neighbours `2i, 2i + 1` (GGUF's NORM
+/// pairing), not the NEOX halves.
+#[must_use]
+pub const fn norm_pairs(inst: &Instance) -> bool {
+    inst.key.attn.norm_pairs
+}
+
 /// The live keys the count model and the e2e gate take as one segment's
 /// worth: their sessions this deep run one segment (it is under
 /// [`ONE_PASS_KEYS`]).
@@ -230,9 +244,28 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
             "at most the one-pass flash's threads, its values in 32 KB",
         );
     }
+    // The prologue's two axes name the entries the kernels are: the head
+    // norm's sum-of-squares walks the NEOX pair tree, so a head norm with
+    // NORM pairs is no entry, and a norm-free prologue is compiled for the
+    // neighbour pairs alone.
+    if (a.qk_norm && a.norm_pairs) || (!a.qk_norm && !a.norm_pairs) {
+        return refuse(
+            "head norm and rope pairs",
+            &format_args!(
+                "head norm {}, NORM pairs {}",
+                yes_no(a.qk_norm),
+                yes_no(a.norm_pairs)
+            ),
+            "a head norm with NEOX pairs, or none with NORM pairs",
+        );
+    }
     // The norm's pair tree (rope_neox's `owned_pair`): the turning pairs
-    // inside warp 0 or every value turning.
-    if !a.rot.is_multiple_of(2) || a.rot > a.head || (a.rot / 2 > SIMD_WIDTH && a.rot != a.head) {
+    // inside warp 0 or every value turning. The neighbour pairs turn within
+    // one lane, so they take no tree.
+    if !a.rot.is_multiple_of(2)
+        || a.rot > a.head
+        || (!a.norm_pairs && a.rot / 2 > SIMD_WIDTH && a.rot != a.head)
+    {
         return refuse(
             "rope dims",
             &a.rot,
@@ -397,6 +430,37 @@ mod tests {
         // A whole head turns: thread t of each of the two warps owns the
         // pair (t, t + 64).
         assert_eq!(a.rot, a.head);
+    }
+
+    #[test]
+    fn the_prologues_two_axes_name_the_entries_and_the_mixes_are_refused() {
+        // Qwen3.6's attention at the llama axes: the no-norm, neighbour-paired
+        // prologue, which holds.
+        let mut llama = crate::instance::LLAMA_ATTN;
+        llama.key.hidden = 2048;
+        let g = Geometry::of(&llama);
+        assert_eq!(holds(&g), Ok(()));
+        assert!(g.attn.qk_norm == llama.key.attn.qk_norm && !g.attn.qk_norm);
+        assert!(g.attn.norm_pairs);
+        // A head norm over the neighbour pairs: the norm's sum-of-squares
+        // walks the NEOX pair tree, so the mix is no entry.
+        let mut mixed = llama;
+        mixed.key.attn.qk_norm = true;
+        let refused = holds(&Geometry::of(&mixed)).expect_err("a head norm with NORM pairs");
+        assert_eq!(
+            (refused.kernel, refused.axis),
+            ("attention", "head norm and rope pairs")
+        );
+        assert!(refused.value.starts_with("head norm yes, NORM pairs yes"));
+        // No head norm over the NEOX pairs: no entry either.
+        let mut mixed = llama;
+        mixed.key.attn.norm_pairs = false;
+        let refused = holds(&Geometry::of(&mixed)).expect_err("no head norm with NEOX pairs");
+        assert_eq!(
+            (refused.kernel, refused.axis),
+            ("attention", "head norm and rope pairs")
+        );
+        assert!(refused.value.starts_with("head norm no, NORM pairs no"));
     }
 
     #[test]

@@ -224,18 +224,32 @@ pub(super) fn sized(shape: &[usize]) -> bool {
             .is_some()
 }
 
-/// The program's attention tensor of the checkpoint tensor `rest` (the name past `layers.N.`) of
-/// layer `l`, with the role it is read in: the four projections and the per-head norms.
-pub(super) fn attention(l: usize, rest: &str) -> Option<(String, Plain)> {
+/// The program's attention projection of the checkpoint tensor `rest` (the name past `layers.N.`)
+/// of layer `l`, with the role it is read in: the query, key, value and output.
+pub(super) fn projections(l: usize, rest: &str) -> Option<(String, Plain)> {
     Some(match rest {
         "self_attn.q_proj.weight" => (common::attn_q(l), Plain::Q8_0),
         "self_attn.k_proj.weight" => (common::attn_k(l), Plain::Q8_0),
         "self_attn.v_proj.weight" => (common::attn_v(l), Plain::Q8_0),
         "self_attn.o_proj.weight" => (common::attn_output(l), Plain::Q8_0),
+        _ => return None,
+    })
+}
+
+/// The program's per-head norm of the checkpoint tensor `rest` of layer `l`: the query's and the
+/// key's.
+pub(super) fn head_norms(l: usize, rest: &str) -> Option<(String, Plain)> {
+    Some(match rest {
         "self_attn.q_norm.weight" => (common::attn_q_norm(l), Plain::F32),
         "self_attn.k_norm.weight" => (common::attn_k_norm(l), Plain::F32),
         _ => return None,
     })
+}
+
+/// The program's attention tensor of the checkpoint tensor `rest` of layer `l`, with the role it
+/// is read in: the four projections ([`projections`]) and the per-head norms ([`head_norms`]).
+pub(super) fn attention(l: usize, rest: &str) -> Option<(String, Plain)> {
+    projections(l, rest).or_else(|| head_norms(l, rest))
 }
 
 /// The program's norm of the checkpoint tensor `rest` of layer `l`: the one before attention and
@@ -343,6 +357,15 @@ mod tests {
                 Some((want.0.to_string(), want.1)),
                 "{rest}"
             );
+        }
+        // A model with no head norms reads the projections alone.
+        for rest in ["self_attn.q_proj.weight", "self_attn.o_proj.weight"] {
+            assert_eq!(projections(3, rest), attention(3, rest), "{rest}");
+            assert_eq!(head_norms(3, rest), None, "{rest}");
+        }
+        for rest in ["self_attn.q_norm.weight", "self_attn.k_norm.weight"] {
+            assert_eq!(head_norms(3, rest), attention(3, rest), "{rest}");
+            assert_eq!(projections(3, rest), None, "{rest}");
         }
         assert_eq!(
             block_norms(3, "input_layernorm.weight", ffn),

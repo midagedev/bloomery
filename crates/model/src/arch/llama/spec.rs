@@ -1,8 +1,9 @@
 //! The llama reader's [`ModelSpec`]: the file's [`Hparams`] and tensor roles
 //! as the typed model description. Every layer is a GQA layer on the pairwise
-//! rope with a SwiGLU feed-forward block of `feed_forward_length`, on a plain
-//! residual; the per-head q/k norm is what a layer's tensors say, and nothing
-//! gates or selects the attention.
+//! rope (dividing by the file's frequency factors when it carries them) with a
+//! SwiGLU feed-forward block of `feed_forward_length`, on a plain residual; the
+//! per-head q/k norm is what a layer's tensors say, and nothing gates or selects
+//! the attention.
 
 use std::collections::HashSet;
 
@@ -49,7 +50,7 @@ pub(crate) fn spec_of(
         dims: spec_u32("rope.dimension_count", hp.rope.dims)?,
         base: hp.rope.base,
         yarn: None,
-        factors: false,
+        factors: hp.rope.factors,
     };
     let heads = spec_u32("attention.head_count", hp.n_head)?;
     let kv_heads = spec_u32("attention.head_count_kv", hp.n_head_kv)?;
@@ -213,7 +214,7 @@ mod tests {
             assert_eq!(g.group(), 2);
             assert_eq!(g.rope.mode, RopeMode::NormTail);
             assert_eq!((g.rope.dims, g.rope.base), (D as u32, 500_000.0));
-            assert!(g.rope.yarn.is_none());
+            assert!(g.rope.yarn.is_none() && !g.rope.factors);
             assert!(!g.qk_norm);
             assert_eq!(g.out_gate, OutGate::None);
             assert!(g.select.is_none() && g.window.is_none() && !g.sinks);
@@ -340,6 +341,40 @@ mod tests {
         );
     }
 
+    /// The rope's factors are the file's own tensor, one value a pair, read once by the load
+    /// (`Unread`, on no layer): a file with the table has a rope on every layer that divides by
+    /// it and the description needs the factors, and a file without it has neither.
+    #[test]
+    fn the_factors_are_the_files_table() {
+        let mut t = tensors();
+        t.push(("rope_freqs.weight".to_string(), vec![D / 2]));
+        let read = load("factors", &keys(), &global(), &t).expect("a file with a factor table");
+        for layer in &read.spec.layers {
+            let Mixer::Gqa(g) = &layer.mixer else {
+                panic!("a layer mixes with {:?}", layer.mixer);
+            };
+            assert!(g.rope.factors);
+        }
+        assert!(
+            models::needs(&read.spec)
+                .iter()
+                .any(|(n, _)| matches!(n, models::Need::RopeFactors))
+        );
+        let table = read
+            .tensors
+            .tensors
+            .iter()
+            .find(|t| t.name == "rope_freqs.weight")
+            .expect("the table is classified");
+        assert_eq!((table.role, table.layer), (Role::Unread, None));
+        let bare = load("no-factors", &keys(), &global(), &tensors()).expect("a file with none");
+        assert!(
+            !models::needs(&bare.spec)
+                .iter()
+                .any(|(n, _)| matches!(n, models::Need::RopeFactors))
+        );
+    }
+
     /// Each file this chain does not run is refused by the name of what is
     /// wrong with it.
     #[test]
@@ -361,10 +396,6 @@ mod tests {
         };
         let cases = [
             (
-                without("output.weight"),
-                "tensor output.weight: is not in the file; the description has no tied head",
-            ),
-            (
                 without("blk.2.ffn_down.weight"),
                 "tensor blk.2.ffn_down.weight: is not in the file (1 tensor(s) a dense llama trunk needs are missing",
             ),
@@ -373,8 +404,8 @@ mod tests {
                 "1 tensors have no role: blk.0.attn_q.bias",
             ),
             (
-                plus("rope_freqs.weight", vec![D / 2]),
-                "1 tensors have no role: rope_freqs.weight",
+                plus("rope_freqs.weight", vec![D]),
+                "tensor rope_freqs.weight: has dims [8]; the rope turns 8 values of a head, 4 pairs",
             ),
             (
                 plus("blk.1.ffn_gate_inp.weight", vec![E, 8]),
@@ -401,6 +432,26 @@ mod tests {
             })
             .collect();
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A file with no `output.weight` reads: its head is tied to the token
+    /// embedding (Llama-3.2's folders, `tie_word_embeddings`), which the
+    /// readers of [`Role::Head`] resolve, and no tensor of the table claims
+    /// the head's name.
+    #[test]
+    fn a_tied_head_is_the_embedding_and_reads() {
+        let mut t = tensors();
+        t.retain(|(n, _)| n != "output.weight");
+        let read = load("tied", &keys(), &global(), &t).expect("a tied head reads");
+        assert_eq!(read.spec.layers.len(), LAYERS);
+        assert!(
+            !read
+                .tensors
+                .tensors
+                .iter()
+                .any(|x| x.name == "output.weight"),
+            "the tied head claims no tensor of its own"
+        );
     }
 
     /// The coverage list of a llama file names no pre-tokenizer (a SentencePiece

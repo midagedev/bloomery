@@ -10,6 +10,7 @@
 
 use gguf::Split;
 
+use crate::arch::classify::rope_factors;
 use crate::arch::{finite_positive, metadata, n_vocab, optional_usize, plain_rope, positive};
 use crate::placement::PlacementError;
 
@@ -59,8 +60,8 @@ pub enum RopeMode {
 }
 
 /// The rope ik's graph applies to every layer's Q and K: `ggml_rope_ext` with
-/// no frequency factors, no YaRN (the file carries no scaling keys this chain
-/// accepts) and a frequency scale of 1.
+/// the file's frequency factors when it carries them, no YaRN (the file carries
+/// no scaling keys this chain accepts) and a frequency scale of 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rope {
     pub mode: RopeMode,
@@ -69,6 +70,9 @@ pub struct Rope {
     /// The rotated width: `rope.dimension_count`; ik's builder asserts it is
     /// the whole head (`build_llama`'s `n_embd_head == n_rot`).
     pub dims: usize,
+    /// Whether the file carries `rope_freqs.weight`: one factor for each pair of
+    /// the rotated values, which divides the pair's frequency.
+    pub factors: bool,
 }
 
 impl Hparams {
@@ -212,6 +216,7 @@ impl Rope {
             mode: RopeMode::Norm,
             base,
             dims,
+            factors: rope_factors(split, dims)?,
         })
     }
 }
@@ -285,6 +290,7 @@ mod tests {
                     mode: RopeMode::Norm,
                     base: 120_000_000.0,
                     dims: 128,
+                    factors: false,
                 },
                 rms_eps: 1e-5,
                 n_vocab: 166_912,

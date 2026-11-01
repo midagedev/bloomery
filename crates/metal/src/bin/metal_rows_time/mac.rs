@@ -48,6 +48,16 @@ const N_K: usize = 16;
 /// The layer word a raise is recorded in.
 const LAYER: u32 = 3;
 
+/// The gains a launch binds: the head's ones where the flash norms each
+/// head, none where it applies no head norm (the buffer then goes unread).
+fn gains_of(
+    norm: bool,
+    ones: &MetalBuffer<f32>,
+) -> Result<Option<bloomery_device::Window<'_, f32, MetalDevice>>, DeviceError> {
+    norm.then(|| ones.window(Elems(0), Elems(HEAD_DIM)))
+        .transpose()
+}
+
 fn help() {
     println!(
         "\
@@ -431,8 +441,8 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
                         k_stride: kv_n,
                         v: v.window(Elems(from * kv_n), Elems(rows * kv_n))?,
                         v_stride: kv_n,
-                        q_gain: ones.window(Elems(0), Elems(HEAD_DIM))?,
-                        k_gain: ones.window(Elems(0), Elems(HEAD_DIM))?,
+                        q_gain: gains_of(kernels.geom().attn.qk_norm, &ones)?,
+                        k_gain: gains_of(kernels.geom().attn.qk_norm, &ones)?,
                         rope: rope.window(Elems(0), Elems(p * ROT))?,
                         cache: AttnCache::F16 {
                             k: cache_k.window_mut(Elems(0), Elems(cache_n))?,
@@ -467,8 +477,8 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
                         k_stride: kv_n,
                         v: v.window(Elems(0), Elems(p * kv_n))?,
                         v_stride: kv_n,
-                        q_gain: ones.window(Elems(0), Elems(HEAD_DIM))?,
-                        k_gain: ones.window(Elems(0), Elems(HEAD_DIM))?,
+                        q_gain: gains_of(kernels.geom().attn.qk_norm, &ones)?,
+                        k_gain: gains_of(kernels.geom().attn.qk_norm, &ones)?,
                         rope: rope.window(Elems(0), Elems(p * ROT))?,
                         cache: AttnCache::F16 {
                             k: cache_k.window_mut(Elems(0), Elems(cache_n))?,
@@ -508,8 +518,8 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
                         k_stride: kv_n,
                         v: v.window(Elems(0), Elems(p * kv_n))?,
                         v_stride: kv_n,
-                        q_gain: ones.window(Elems(0), Elems(HEAD_DIM))?,
-                        k_gain: ones.window(Elems(0), Elems(HEAD_DIM))?,
+                        q_gain: gains_of(kernels.geom().attn.qk_norm, &ones)?,
+                        k_gain: gains_of(kernels.geom().attn.qk_norm, &ones)?,
                         rope: rope.window(Elems(0), Elems(p * ROT))?,
                         cache: AttnCache::F16 {
                             k: cache_k.window_mut(Elems(0), Elems(cache_n))?,
