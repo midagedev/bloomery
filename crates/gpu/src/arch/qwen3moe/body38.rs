@@ -1619,7 +1619,7 @@ impl Body38 {
         if slots == 0 {
             return Err(GpuError::shape(WHAT, "a load of 0 resident sequence slots"));
         }
-        let (file, origin) = file.into().into_origin(residency)?;
+        let (file, origin) = file.into().into_origin(residency, plan)?;
         // A draft in the folder's own MTP layer reads its tensors through the folder's parts.
         let draft_parts = match origin.bytes() {
             CardBytes::Parts(parts) => mtp

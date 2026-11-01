@@ -200,7 +200,7 @@ These seats serve a file or a checkpoint folder on disk (`-m PATH`):
 |---|---|---|
 | `minimaxm3` | MiniMax-M3.1-Flash | the vendor's NVFP4 safetensors folder as downloaded (MiniMax-M3: unverified) |
 | `musespark` | Muse Spark Open 816B-A42B | `Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf` |
-| `qwen38` | Qwen3.8-Flash-Next, checkpoint folders | NVIDIA's NVFP4 folder, its routed experts split between the card and the host, or the FP4-Local folder on a card that holds every routed expert (a DGX Spark's GB10), no conversion; also `--hf nvidia/Qwen3.8-Flash-Next-NVFP4` |
+| `qwen38` | Qwen3.8-Flash-Next, checkpoint folders | NVIDIA's NVFP4 or FP4-Local folder, its routed experts split between the card and the host, no conversion; also `--hf nvidia/Qwen3.8-Flash-Next-NVFP4` |
 | `nemotron` | Nemotron 3 Nano 4B, Nemotron 3.5 Bolt 74B-A9B, Nemotron-3.5-Lightning 30B-A3B | the GGUF |
 | `solar2` | Solar-Open2-250B, two cards | the GGUF, with `--place bp` |
 | `raon1` | Raon-1-mini-preview | `raon-1-mini-preview-Q4_K_M.gguf`, its DFlash2 draft file beside it |

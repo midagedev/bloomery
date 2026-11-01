@@ -177,6 +177,16 @@ impl Format {
         }
     }
 
+    /// The format a weight reads as once its block scales are decoded ([`crate::csf`]): plain
+    /// NVFP4 for NVFP4 whose block scales are stored compressed, the format itself for any other.
+    #[must_use]
+    pub fn decoded(self) -> Format {
+        match crate::csf::Encoding::of(self) {
+            Some(_) => Format::Nvfp4,
+            None => self,
+        }
+    }
+
     /// The bit width, the group and the dtype of the `.scales` and `.biases` of an MLX affine
     /// format; `None` for another.
     #[must_use]

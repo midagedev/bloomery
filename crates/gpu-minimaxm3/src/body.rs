@@ -447,7 +447,7 @@ impl Body {
         residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<MiniMaxM3Model, GpuError> {
-        let (file, origin) = file.into().into_origin(residency)?;
+        let (file, origin) = file.into().into_origin(residency, plan)?;
         let tiers = TierOpen::of_machine(plan.machine)?;
         refuse_tier_count(WHAT, tiers.len())?;
         let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;

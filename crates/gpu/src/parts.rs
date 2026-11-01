@@ -357,6 +357,12 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
             false,
         )
     }
+
+    fn make_in_place(&self) -> Result<(), GpuError> {
+        self.source
+            .make_in_place()
+            .map_err(|e| refused(e.to_string()))
+    }
 }
 
 /// Parts, their read costs, the owned read bytes they may hold at once, the peak owned host bytes
@@ -548,6 +554,20 @@ impl InPlace {
     #[must_use]
     pub fn holds(&self, name: &str) -> bool {
         self.0.contains_key(name)
+    }
+
+    /// Whether `plan` holds a tensor the header holds in place on the host or the NVMe tier,
+    /// which read it where the header says.
+    #[must_use]
+    pub fn read_off_cards(&self, plan: &Plan<'_>) -> bool {
+        plan.rows.iter().any(|row| {
+            row.segments.iter().any(off_cards)
+                && plan
+                    .model
+                    .tensors
+                    .get(row.tensor)
+                    .is_some_and(|t| self.holds(&t.name))
+        })
     }
 
     /// The matrices of the stack `name` the header holds in place; `None` for a tensor it holds
@@ -1599,9 +1619,10 @@ mod tests {
     /// so a context or slot search reads it as a plan to fit below: the paged bytes, the host
     /// need with them on the host, and the room the plan was made at. A plan that pages none is
     /// not, nor one whose paged stacks a located header holds in place, which the tier's arena
-    /// fills from where the folder stores them. Mutants: the paged stack refused by name only
-    /// (no `Unpaged` in the chain); the need left without the paged experts, under the room;
-    /// every paged plan refused, the in-place one too.
+    /// fills from where the folder stores them, and where the host reads those in place
+    /// ([`InPlace::read_off_cards`]), which a plan of every stack on the card does not. Mutants:
+    /// the paged stack refused by name only (no `Unpaged` in the chain); the need left without the
+    /// paged experts, under the room; every paged plan refused, the in-place one too.
     #[test]
     fn a_paged_plan_is_short_on_the_host() {
         use model::placement::workstation::{self, HostNeed, HostRead};
@@ -1678,6 +1699,13 @@ mod tests {
             OnCard::of_in_place(&plan, 0, &in_place).is_ok(),
             "a plan that pages stacks held in place"
         );
+        assert!(
+            in_place.read_off_cards(&plan),
+            "the host reads them in place"
+        );
+        assert!(!InPlace::default().read_off_cards(&plan));
+        let card = model::placement::plan_with(&model, &machine, 4096, &NoKv, None).unwrap();
+        assert!(!in_place.read_off_cards(&card), "every stack on the card");
     }
 
     /// A folder's plan that pages experts holds its load's need: the plan reserves the least its

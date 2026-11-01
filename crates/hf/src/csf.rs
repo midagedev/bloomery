@@ -48,6 +48,19 @@ pub(crate) enum Encoding {
     Csf32,
 }
 
+impl Encoding {
+    /// The encoding of the block scales of NVFP4 stored as `format`; `None` for a format that
+    /// stores them plain.
+    pub(crate) fn of(format: crate::quant_config::Format) -> Option<Encoding> {
+        use crate::quant_config::Format;
+        match format {
+            Format::Nvfp4Csf => Some(Encoding::Csf),
+            Format::Nvfp4Csf32 => Some(Encoding::Csf32),
+            _ => None,
+        }
+    }
+}
+
 /// The logical scale `scale` (`<stem>.weight_scale`) of a weight of `rows` by `cols` scale
 /// groups, its parts looked up by name through `get` and decoded by `encoding`: `rows · cols`
 /// bytes, row-major.

@@ -122,9 +122,8 @@ MTP draft on. This section says what a start chooses and what changes it: the fo
 the draft and the memory. The speed measured on FP4-Local closes it.
 
 **The two folders.** On that 128 GB Spark the plan put all 24,576 routed experts of either folder on the GB10, in every
-row of the table. The FP4-Local folder needs that: the host does not read its compressed block scales, so its
-load holds every tensor on the GB10 and refuses a plan that puts one elsewhere. The NVFP4 folder's experts can also sit
-on the host, where a smaller card splits them ([`serving.md`](../serving.md#the-seats)). Both read the PLE table from
+row of the table. On a smaller card either folder's experts also sit on the host, which takes the share the card does
+not hold ([`serving.md`](../serving.md#the-seats)). Both read the PLE table from
 the folder on the NVMe tier. FP4-Local takes 3.5 GB less of the pool at one slot (the table below) and decoded faster at
 0.3.10 ([`numbers.md`](../numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310)), so it is
 the folder to start with. On the `sm_121a` build the routed experts' prompt products run W4A4 and the MXFP8 sites W8A8

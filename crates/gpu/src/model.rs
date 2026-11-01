@@ -2567,6 +2567,10 @@ pub trait PartsLoad: Send {
     /// one card, with no plan ([`GpuModel::load_blocks_from`]).
     fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError>;
 
+    /// Write what the host reads where the source's located header holds it but the source keeps
+    /// in another form (`model::part::Source::make_in_place`), before a host reader takes it.
+    fn make_in_place(&self) -> Result<(), GpuError>;
+
     /// The host admission and exact read peak to pass to load: the reads planned within the room
     /// the need's other terms leave them, `extra` out ([`HostNeed::read_room`]), in place of the
     /// least reads the plan reserved (`workstation::PART_READS`).
