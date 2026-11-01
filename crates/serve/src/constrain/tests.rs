@@ -4562,7 +4562,7 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
     for (i, k) in keys.iter().enumerate() {
         let (v, text) = value(k);
         members.push(match format {
-            ToolFormat::Hermes => format!(
+            ToolFormat::Hermes | ToolFormat::Mistral => format!(
                 "{}\"{k}\": {}",
                 if i == 0 { "" } else { ", " },
                 if text {
@@ -4600,6 +4600,7 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
             " to=get_weather<|message|><atem:function_calls>\n\
              <atem:invoke name=\"get_weather\">\n{members}</atem:invoke>\n</atem:function_calls>"
         ),
+        ToolFormat::Mistral => format!("[TOOL_CALLS]get_weather[ARGS]{{{members}}}"),
         ToolFormat::Unparsed => unreachable!("a parsed format"),
     };
     match format {
@@ -4634,6 +4635,7 @@ fn optional_parameters_may_be_left_out_in_schema_order() {
         SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
+        ToolFormat::Mistral,
     ] {
         for keys in subsets {
             let body = json!({"tools": tools, "tool_choice": "auto"});
@@ -4704,7 +4706,14 @@ fn an_object_with_no_required_property_may_be_empty() {
     let tok = bytes_tok();
     let tools = json!([{"type": "function", "function": {"name": "get_time", "parameters": {
         "type": "object", "properties": {"zone": {"type": "integer"}}}}}]);
-    for format in [ToolFormat::Hermes, QWEN, QWEN_COMPACT, GLM, SOLAR] {
+    for format in [
+        ToolFormat::Hermes,
+        QWEN,
+        QWEN_COMPACT,
+        GLM,
+        SOLAR,
+        ToolFormat::Mistral,
+    ] {
         for keys in [&[] as &[&str], &["zone"]] {
             let body = json!({"tools": tools, "tool_choice": "auto"});
             let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
@@ -4718,6 +4727,7 @@ fn an_object_with_no_required_property_may_be_empty() {
                     }
                     GLM => "<tool_call>get_time</tool_call>",
                     SOLAR => "<|tool_call:start|>get_time\n<|tool_call:end|>",
+                    ToolFormat::Mistral => "[TOOL_CALLS]get_time[ARGS]{}",
                     ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
                     }
@@ -4743,6 +4753,7 @@ fn an_object_with_no_required_property_may_be_empty() {
                         "<|tool_call:start|>get_time\n<|tool_arg:start|>zone\
                         <|tool_arg:value|>1<|tool_arg:end|>\n<|tool_call:end|>"
                     }
+                    ToolFormat::Mistral => "[TOOL_CALLS]get_time[ARGS]{\"zone\": 1}",
                     ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
                     }
