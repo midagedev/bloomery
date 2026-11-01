@@ -4,6 +4,7 @@
 //! program's walks (`bloomery_gpu_glm5next::nextn_walk`, `nextn_chain`)
 //! held against ik's MTP draft set (refset family `mtp-glm5next`) and the
 //! drafted windows (`app::mtp::MtpDraft<Body>`) against the plain run.
+//! `--slots` runs only the two resident sequences' prompt and drafted rounds.
 //!
 //! What is asserted:
 //! - (m) the set's MTP input: its warmup graph's `enorm` reads `inp_embd`
@@ -1726,22 +1727,29 @@ mod gate {
         Ok(nextn_store(s.model_mut(), n)?)
     }
 
-    /// The selected slot's window from its reset, as the server feeds it and
-    /// the e2e gate's (sd) starts: every id of `ids` but the last through
-    /// the draft's prompt call, then the last one drafted step; its id.
-    fn z_start(
+    /// The selected slot's prompt from its reset, retaining its waiting row
+    /// when another sequence can overwrite the prompt arena; the last id.
+    fn z_prompt(
         s: &mut Session<Body>,
         d: &mut MtpDraft<Body>,
         ids: &[u32],
-    ) -> Result<Vec<u32>, GateError> {
+    ) -> Result<u32, GateError> {
         s.reset()?;
         d.restart();
         let (&last, head) = ids.split_last().ok_or("an empty prompt")?;
         Draft::prompt(d, s, head)?;
+        if s.slots() > 1 {
+            d.retain_prompt(s)?;
+        }
+        Ok(last)
+    }
+
+    /// The first plain step after a slot's prompt, its draft caught up first.
+    fn z_step(s: &mut Session<Body>, d: &mut MtpDraft<Body>, last: u32) -> Result<u32, GateError> {
         d.before_step(s, last)?;
         let next = Target::step(s, last, Want::Argmax)?.argmax();
         Draft::stepped(d, s, last, next)?;
-        Ok(vec![next])
+        Ok(next)
     }
 
     /// Window `ids` alone on the selected slot, [`Z_ROUNDS`] drafted rounds
@@ -1750,7 +1758,8 @@ mod gate {
     /// the rule's kept rows, the commit.
     fn z_alone(s: &mut Session<Body>, ids: &[u32]) -> Result<ZRun, GateError> {
         let mut d = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
-        let mut out = z_start(s, &mut d, ids)?;
+        let last = z_prompt(s, &mut d, ids)?;
+        let mut out = vec![z_step(s, &mut d, last)?];
         let mut rounds = Vec::with_capacity(Z_ROUNDS);
         for _ in 0..Z_ROUNDS {
             let last = *out.last().ok_or("a window with no id")?;
@@ -1789,8 +1798,12 @@ mod gate {
         inputs: &PlanInputs,
         nextn: &NextnInputs,
         levers: &bloomery_levers::Levers,
-        windows: [&[u32]; 2],
     ) -> Result<bool, GateError> {
+        let prefill = glm5next_tier::d1k_prefill()?;
+        if prefill.len() < 340 {
+            return Err(format!("{D1K}: {} prefill ids, (z) reads 340", prefill.len()).into());
+        }
+        let windows = [&prefill[..33], &prefill[300..340]];
         let file = glm5next_tier::open()?;
         let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
         reserve_checkpoints(
@@ -1830,9 +1843,16 @@ mod gate {
             MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?,
         ];
         let mut outs = [Vec::new(), Vec::new()];
-        for (slot, ((d, out), ids)) in drafts.iter_mut().zip(&mut outs).zip(windows).enumerate() {
+        let mut last = [0u32; Z_SLOTS];
+        for (slot, (d, ids)) in drafts.iter_mut().zip(windows).enumerate() {
             s.select_slot(slot)?;
-            *out = z_start(&mut s, d, ids)?;
+            last[slot] = z_prompt(&mut s, d, ids)?;
+        }
+        // Both prompts have overwritten the shared arena before either
+        // sequence's first step consumes its retained hidden row.
+        for (slot, (d, out)) in drafts.iter_mut().zip(&mut outs).enumerate() {
+            s.select_slot(slot)?;
+            out.push(z_step(&mut s, d, last[slot])?);
         }
         let mut rounds = [Vec::new(), Vec::new()];
         for _ in 0..Z_ROUNDS {
@@ -1948,6 +1968,13 @@ mod gate {
         let file = open()?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
+        if std::env::args().any(|arg| arg == "--slots") {
+            return if slots_pass(&inputs, &nextn, &levers)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
         // The fixture's band is counted over the layer's own tensors, so it is read from the file
         // the loads open.
         let fx_band = if Tier::from_env()? == Tier::Fixture {
@@ -2160,13 +2187,8 @@ mod gate {
         // (z) on a load of its own: this one's plan counts one sequence, and
         // the card holds one load.
         drop(m);
-        let prefill = glm5next_tier::d1k_prefill()?;
-        if prefill.len() < 340 {
-            return Err(format!("{D1K}: {} prefill ids, (z) reads 340", prefill.len()).into());
-        }
-        let windows = [&prefill[..33], &prefill[300..340]];
         tier::sc("(z) two windows' drafted rounds as one pass of both slots")?;
-        ok &= slots_pass(&inputs, &nextn, &levers, windows).unwrap_or_else(|e| {
+        ok &= slots_pass(&inputs, &nextn, &levers).unwrap_or_else(|e| {
             println!("(z) a call failed: {e} {}", verdict(false));
             false
         });
