@@ -18,9 +18,10 @@ in [`docs/bloomery/`](https://github.com/midagedev/rig-log/tree/main/docs/bloome
 | [`claude-code.md`](claude-code.md) | Claude Code on a local model, on an NVIDIA card or a Mac, with measured first-turn times |
 | [`pi.md`](pi.md) | pi on a local model: the smallest first request of the surveyed agents, on an NVIDIA card or a Mac |
 | [`dsh.md`](dsh.md) | DeepSeek Harness (dsh) on DeepSeek-V4.1-Flash: the server, the profile patch, what to expect |
-| [`serving.md`](serving.md) | llama-server compatibility, the flags, the seats, concurrent requests, drafts, residency, limits |
+| [`serving.md`](serving.md) | The serving guide: start, slots and context, drafts, placement, settings, API keys, every route, limits |
 | [`models.md`](models.md) | The recommended files and what each model needs in GPU, RAM and disk |
 | [`performance.md`](performance.md) | The numbers' conditions, why it is fast, how it is verified, recorded sessions |
+| [`dgx-spark.md`](dgx-spark.md) | DGX Spark (GB10): install, Qwen3.8's checkpoint folders, slots, context and memory, speed |
 | [`mac.md`](mac.md) | Apple Silicon: install, the Metal backend's build, the files that open, the server, its limits |
 | [`BUILD.md`](BUILD.md) | Building from source: the toolchain, the pinned cuda-oxide and its one carried patch, one command block per model |
 | [`HARDWARE.md`](HARDWARE.md) | What each part of the machine costs in a DeepSeek-V4.1 decode step, and the RAM floor |

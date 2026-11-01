@@ -571,7 +571,7 @@ timing runner exists. The tables and bullets below are the plan of 2026-10-21.
 - `tools/recipes.py`: `pure-crates` (:5876) and its `_NOT_ON_MAC` list (:5512-5525) — its `#[target_feature(` pattern must take
   a feature name (`neon`, `dotprod`, `i8mm`) as fine on aarch64, and the name list needs `O_DIRECT`; `HOST_DEVICE_LINKED` (:5905) holds one
   crate (`bloomery-app`) and concerns the Linux host nightly (`tools/nightly/run.sh`), not the Mac; the `gate-*` recipes all start `./tools/box.sh`
-  (`justfile:1609`, `:1655`), so a Mac recipe needs its own `mac-` prefix, or a `BLOOMERY_LOCAL` mode as `dgx-spark.md` section 4 has for local gates.
+  (`justfile:1609`, `:1655`), so a Mac recipe needs its own `mac-` prefix, or a local mode like `BLOOMERY_BOX_LOCAL=1`, which `dgx-spark.md` section 4 uses for local gates.
 - Crate classes: a new crate (`bloomery-device`, the platform crate, a Metal crate) needs rows in `tools/gate-class.tsv`, `tools/families.tsv`,
   `tools/owners.tsv` and `just check-recipes` passing `[unverified: not run]`.
 

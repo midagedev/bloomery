@@ -13,9 +13,10 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
    line in the log names the cards and how the experts are split. Wait until `GET /health` answers 200.
 4. **Pick the cards with `CUDA_VISIBLE_DEVICES`.** With `--place` unset the load takes the largest visible card and
    adds the host for the experts that do not fit it; on GLM-5.3 and Qwen3.8 it also adds the next card as an expert
-   tier when the plan finds that pays. When the host RAM cannot hold the experts either (Qwen3.8, GLM-5.3, V4.1), the
+   tier when the plan finds that pays. When the host RAM cannot hold the experts either, the
    plan pages them from NVMe through a RAM arena: the `nvtier` record names it, and a paged load is slower than an
-   all-RAM one. Its limits are in [Serving](serving.md#the-seats).
+   all-RAM one. Which models page and what a paged load changes are in
+   [Serving](serving.md#54-when-the-host-cannot-hold-the-experts-either).
 5. **Warm up first.** Send one request and discard its numbers. Adaptive residency then moves the experts the model
    calls most onto the card, so the first requests run slower than later ones. `BLOOMERY_RESIDENCY=off` gives
    repeatable tokens at some speed. On a paged plan the unset residency is already off. The Qwen3.8 and GLM-5.3 prompt
