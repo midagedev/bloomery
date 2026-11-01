@@ -3073,6 +3073,16 @@ mod gate {
             prompt.len() % UB_CLOSE,
         )?;
         spec.draft_mut().retain_prompt(&mut s)?;
+        let refused_owned_arenas = {
+            let pos = s.pos();
+            let (gpu, _, body) = s.model_mut().body_parts("(cl)")?;
+            [TargetRows::Step, TargetRows::Pass]
+                .into_iter()
+                .all(|walk| match body.retain_prompt_row(gpu, walk, 0, pos) {
+                    Err(e) => e.to_string().contains("a shared prompt arena"),
+                    Ok(()) => false,
+                })
+        };
         let anchor = spec.draft().park();
         s.model_mut().select_slot(1)?;
         s.reset()?;
@@ -3097,10 +3107,11 @@ mod gate {
             &runtime::Stop::new(8, CTX_CLOSE as u32)?,
             &mut Kept::default(),
         )?;
-        let preserved = row_equal && active && after_switch.tokens == drafted.tokens;
+        let preserved =
+            row_equal && active && refused_owned_arenas && after_switch.tokens == drafted.tokens;
         println!(
             "(cl) close then another slot's prompt: retained_row_bits={row_equal} draft_active={active} \
-             greedy_equal={} {}",
+             refused_owned_arenas={refused_owned_arenas} greedy_equal={} {}",
             after_switch.tokens == drafted.tokens,
             verdict(preserved),
         );

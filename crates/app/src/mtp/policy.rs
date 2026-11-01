@@ -880,6 +880,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(copied, 1);
+            assert!(rig.p.last_unit.is_none());
             rig.p
                 .retain_prompt(pos, |_, _, _| -> Result<(), String> {
                     panic!("the step arena already belongs to the sequence")
