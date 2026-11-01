@@ -334,9 +334,13 @@ fn print_attn(arm: &str, p: usize, t: &Timed) {
     );
 }
 
+/// The shipped rescale loop's text, which the three rescale arms replace.
+const RESCALE_FIND: &str = "        #pragma clang loop unroll(full)\n    for (uint c = 0u; c < PF_DCHUNKS; ++c) {\n            acc[c].thread_elements()[0] *= factor;\n            acc[c].thread_elements()[1] *= factor;\n        }\n";
+
 /// The prefill kernel's phase arms: the shipped source with one phase of the
-/// tile loop left out by a text edit, so the difference from the full launch is
-/// that phase's time (with the overlap the other phases hide it under).
+/// tile loop left out or rewritten by a text edit, so the difference from the
+/// full launch is that phase's time (with the overlap the other phases hide it
+/// under).
 const ATTN_PHASES: &[(&str, &str, &str)] = &[
     (
         "append_only",
@@ -348,10 +352,18 @@ const ATTN_PHASES: &[(&str, &str, &str)] = &[
         "            if (key < block_keys) {\n                ulong at",
         "            if (key < 0u) {\n                ulong at",
     ),
+    ("no_rescale", RESCALE_FIND, ""),
+    // The rescale as it was: a diagonal fragment product behind the vote.
     (
-        "no_rescale",
-        "        if (t > 0u && simd_any(factor != 1.0f)) {",
-        "        if (false) {",
+        "diag_rescale",
+        RESCALE_FIND,
+        "        if (t > 0u && simd_any(factor != 1.0f)) {\n            simdgroup_float8x8 diag;\n            diag.thread_elements()[0] = fn == fm ? factor : 0.0f;\n            diag.thread_elements()[1] = fn + 1u == fm ? factor : 0.0f;\n            #pragma clang loop unroll(full)\n    for (uint c = 0u; c < PF_DCHUNKS; ++c) {\n                simdgroup_float8x8 scaled;\n                simdgroup_multiply(scaled, diag, acc[c]);\n                acc[c] = scaled;\n            }\n        }\n",
+    ),
+    // The elementwise rescale behind the vote.
+    (
+        "cond_ew",
+        RESCALE_FIND,
+        "        if (t > 0u && simd_any(factor != 1.0f)) {\n            #pragma clang loop unroll(full)\n    for (uint c = 0u; c < PF_DCHUNKS; ++c) {\n                acc[c].thread_elements()[0] *= factor;\n                acc[c].thread_elements()[1] *= factor;\n            }\n        }\n",
     ),
     (
         "no_exp",
@@ -400,10 +412,14 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
         let cache_n = f16_len(p).ok_or("cache")?;
         let up = |v: &[f32]| device.upload(stream, v).map_err(why);
         let mut q = planted(&mut s, p * q_n, 0.5);
-        for r in 0..p {
-            for head in 0..QUERY_HEADS {
-                for d in 0..HEAD_DIM {
-                    q[r * q_n + head * 2 * HEAD_DIM + HEAD_DIM + d] = (d % 9) as f32 * 0.5 - 2.0;
+        // The gate halves of a gated query (the host's packed `[q | gate]` heads); a host with no gate has none.
+        if q_n == QUERY_HEADS * 2 * HEAD_DIM {
+            for r in 0..p {
+                for head in 0..QUERY_HEADS {
+                    for d in 0..HEAD_DIM {
+                        q[r * q_n + head * 2 * HEAD_DIM + HEAD_DIM + d] =
+                            (d % 9) as f32 * 0.5 - 2.0;
+                    }
                 }
             }
         }
@@ -417,6 +433,19 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
         let mut out = up(&vec![0f32; p * out_n])?;
         device.fault_word().clear(stream).map_err(why)?;
         let step = if run.chunk == 0 { p } else { run.chunk.min(p) };
+        // FNV-1a over the output's f32 bit words: two builds of the kernel agree bit for bit when the sums do.
+        let sum = |arm: &str, out: &MetalBuffer<f32>| -> Result<(), String> {
+            let mut host = vec![0f32; p * out_n];
+            device
+                .read(stream, out.whole().map_err(why)?, &mut host)
+                .map_err(why)?;
+            let fnv = host.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+                (h ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3)
+            });
+            let nan = host.iter().filter(|v| v.is_nan()).count();
+            println!("attn_sum\tarm={arm}\tp={p}\tfnv={fnv:016x}\tnan={nan}");
+            Ok(())
+        };
         let timed = time_arm(device, stream, 1, run.trials, |encoder, _| {
             let mut from = 0usize;
             while from < p {
@@ -458,6 +487,7 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
             Ok(())
         })?;
         print_attn("prefill", p, &timed);
+        sum("prefill", &out)?;
         for (arm, variant) in &variants {
             let timed = time_arm(device, stream, 1, run.trials, |encoder, _| {
                 variant.attention_prefill(
@@ -491,6 +521,7 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
                 )
             })?;
             print_attn(arm, p, &timed);
+            sum(arm, &out)?;
         }
         if run.v0 && p <= 1024 {
             let segments = 5usize;

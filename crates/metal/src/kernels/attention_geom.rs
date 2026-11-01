@@ -173,9 +173,10 @@ const _: () = assert!(
     "no score scale is written for the host's head"
 );
 
-/// Positions one prefill threadgroup holds: a SIMD group each, whose rows
-/// are the group's query heads of one key head at that position.
-pub const PREFILL_POSITIONS: usize = 4;
+/// SIMD groups of one prefill threadgroup. Each holds the eight rows of one
+/// fragment: (position, query head) pairs of one key head, numbered position by
+/// position across the chunk.
+pub const PREFILL_SIMD_GROUPS: usize = 4;
 
 /// Keys one prefill tile holds: two 8-key fragments.
 pub const PREFILL_KEYS: usize = 16;
@@ -185,11 +186,13 @@ pub const PREFILL_KEYS: usize = 16;
 pub const PREFILL_PAD: usize = 8;
 
 /// Threads in the prefill threadgroup.
-pub const PREFILL_THREADS: usize = PREFILL_POSITIONS * SIMD_WIDTH;
+pub const PREFILL_THREADS: usize = PREFILL_SIMD_GROUPS * SIMD_WIDTH;
 
-/// Rows of a prefill fragment: the query heads of a key head, padded with
-/// zero queries when the key head has fewer.
+/// Rows of a prefill fragment.
 pub const PREFILL_ROWS: usize = 8;
+
+/// Rows of one key head a prefill threadgroup takes.
+pub const PREFILL_BLOCK_ROWS: usize = PREFILL_SIMD_GROUPS * PREFILL_ROWS;
 
 /// The threadgroup memory one threadgroup may hold, in bytes.
 const SHARED_BYTES: usize = 32 * 1024;
@@ -223,7 +226,7 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
         return refuse("query heads", &a.query_heads, "a multiple of the key heads");
     }
     // One SIMD group a query head, so a flash of the key head's group of
-    // SIMD groups; the prefill's fragments hold at most eight of them.
+    // SIMD groups, one to eight of them.
     if HEADS_PER_SG * a.simd_groups != a.gqa
         || a.flash_threads != SIMD_WIDTH * a.simd_groups
         || !(1..=PREFILL_ROWS).contains(&a.gqa)
@@ -299,7 +302,7 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
 }
 
 const _: () = {
-    assert!(PREFILL_POSITIONS * SIMD_WIDTH == 128);
+    assert!(PREFILL_SIMD_GROUPS * SIMD_WIDTH == 128);
     assert!(PREFILL_KEYS == 16);
     // A prefill tile's row stride keeps the head's 8-value alignment.
     assert!(PREFILL_PAD.is_multiple_of(8));
