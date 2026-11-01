@@ -540,9 +540,8 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        LookupCompletion, PrefixRestore, curl, draft_counts, ids_of, json_of, metric, parse_ids,
-        prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
-        stepped_completion, tokenized,
+        LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
+        server_log, shared_system_prompt, slot_action, slot_erased, stepped_completion, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -1600,12 +1599,6 @@ mod gate {
             .ok_or("/apply-template: no prompt")?
             .to_owned();
         tokenized(url, &text)
-    }
-
-    /// `/tokenize` of `text`.
-    fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, GateError> {
-        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": text })), false)?;
-        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
     }
 
     /// The slot emptied (`POST /slots/0?action=erase`): its rows are reset and
