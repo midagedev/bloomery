@@ -50,10 +50,10 @@ use super::scratch::{
     PrefillFlash, Route,
 };
 use super::taps35::Ffn35Run;
+use crate::card_leg::RouteIo;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::gemm::{GEMM_MAX_SLOTS, Gemm32Kernels, GemmInput, GemmRoute};
-pub(super) use crate::host::xstream::{RingStacks, with_ring_windows};
 use crate::hybrid::HOST;
 use crate::kquant::Act;
 use crate::linear::{self, LinearShape};
@@ -63,11 +63,11 @@ use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
 use crate::route_softmax::MAX_TOKENS;
 use crate::site::{self, Gated, GatedIo, SiteWeight, WideActs, WideActsMut, WideIn, WideKernels};
-use crate::tensor::{DeviceTensor, WindowMut};
+use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use chain::arch::qwen3moe::walk;
-use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
+use cuda_core::{CudaStream, DeviceBuffer};
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
 /// (`ne[1] <= 8`), and the rows of a captured pass. Past it, the wide arm.
@@ -1125,7 +1125,7 @@ fn ffn_joined(
         }
         FfnRoute::Dense => (&*dense, GemmInput::PerSlot),
     };
-    slots_gemm(c, (n, None), &d, table, &hid, rows, m)?;
+    slots_gemm(c, n, &d, table, &hid, rows, m)?;
     k.experts.enqueue_combine_tokens(
         stream,
         CombineArgs {
@@ -1287,7 +1287,7 @@ pub(super) fn ffn_card(
     if let Some(table) = table {
         remap.enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
         let list = (&*table, GemmInput::Shared { top_k: slots });
-        slots_gemm(c, (n, None), &d, list, &hid, rows, m)?;
+        slots_gemm(c, n, &d, list, &hid, rows, m)?;
     }
     let Some(sh) = n.apart() else {
         return Ok(());
@@ -1417,67 +1417,39 @@ pub(super) fn ffn_combine(
     )
 }
 
-/// The ring's part of the apart arm of [`experts`] over `m` rows, after
-/// [`ffn_card`] and before [`ffn_combine`]: one GEMM batch of a layer's
-/// stream — the routed table over the ring's half from the batch's map
-/// (`map`: the stream's row, a streamed expert's slot in the half, [`HOST`]
-/// for every other expert and for the shared expert's id, the routed count),
-/// then the engine stream waiting the batch's landed event (`wait`), then
-/// the routed slots the table lists through the half's stacks into the rows
-/// [`ffn_card`]'s slots write. The SwiGLU runs every slot's column, so a
-/// slot of the card's stacks gets its form again from its unchanged rows:
-/// the same bits. Only K-quant stacks route; another type is refused by
-/// name before the batch's GEMMs ([`site::gated`]).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the layer's context, plan, arena and width, the batch's map, table and wait, and the half's stacks (rust-quality R8)"
-)]
-pub(super) fn ffn_ring(
-    c: &Ctx<'_>,
-    n: &FfnPlan,
-    s: &mut Arena,
-    m: usize,
-    map: &DeviceBuffer<u32>,
-    table: &mut GemmRoute,
-    wait: Option<&CudaEvent>,
-    ring: &RingStacks<'_>,
-) -> Result<(), GpuError> {
-    const WHAT_R: &str = "qwen3moe::wide::ffn_ring";
-    let stream = c.gpu.stream();
-    let d = s.dims;
-    let slots = d.slots();
-    let Arena {
-        normed,
-        route,
-        h,
-        down,
-        wide,
-        ..
-    } = s;
+/// The arena's rows of a unit of `m` rows past [`GEMV_COLS`] as a routed
+/// block over its slots reads and writes them (`crate::card_leg::RouteBlock`): the
+/// normed rows' forms, which the card route quantized for the layer's gate
+/// and up, the gate rows (the arena's `h`), the up rows, the SwiGLU's forms
+/// and the slots' down rows. The expert stream's ring pass reads a half of
+/// host experts through them ([`super::placed`]'s, `crate::card_leg::with_ring`)
+/// beside the card route's slots, a slot the ring's table lists in no tile
+/// keeping its rows.
+pub(super) fn route_io(s: &mut Arena) -> Result<RouteIo<'_>, GpuError> {
+    let Arena { h, down, wide, .. } = s;
     let Wide {
         act_hid, act_h, up, ..
-    } = wide_of(wide, WHAT_R)?;
-    c.k.q35(WHAT_R)?
-        .g32
-        .enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
-    if let Some(e) = wait {
-        stream.wait(e)?;
-    }
-    let hid = act_hid.input(normed);
-    let list = (&*table, GemmInput::Shared { top_k: slots });
-    slots_gemm(c, (n, Some(ring)), &d, list, &hid, (act_h, h, up, down), m)
+    } = wide_of(wide, WHAT)?;
+    Ok(RouteIo {
+        x128: act_hid.q128.as_ref(),
+        x32: act_hid.q32.as_ref(),
+        g: h,
+        u: up,
+        h128: act_h.q128.as_mut(),
+        h32: act_h.q32.as_mut(),
+        y: down,
+    })
 }
 
 /// The slots' half of the FFN at `m` rows: the gated block over `table`
 /// (each slot's column of `hid` as its input picks it) — gate and up, their
 /// SwiGLU into the form the down's type reads, and the down over the same
 /// table, slot by slot, into `down` — the `m · d.slots()` slots' SwiGLU
-/// forms, gate (`h`), up and down rows. The stacks are the plan's `n`, or
-/// with `ring` a half of the expert stream's ring at the plan's types. A
-/// slot the table lists in no tile keeps its rows.
+/// forms, gate (`h`), up and down rows, the stacks the plan's `n`. A slot
+/// the table lists in no tile keeps its rows.
 fn slots_gemm(
     c: &Ctx<'_>,
-    (n, ring): (&FfnPlan, Option<&RingStacks<'_>>),
+    n: &FfnPlan,
     d: &Dims,
     (table, input): (&GemmRoute, GemmInput),
     hid: &WideIn<'_>,
@@ -1492,9 +1464,9 @@ fn slots_gemm(
     let slots = Gated {
         w: c.w,
         route: table,
-        gate: slot_site((n.gate_ty, &n.gate), ring.map(|r| r.gate)),
-        up: slot_site((n.up_ty, &n.up), ring.map(|r| r.up)),
-        down: slot_site((n.down_ty, &n.down), ring.map(|r| r.down)),
+        gate: (n.gate_ty, SiteWeight::Resident(&n.gate)),
+        up: (n.up_ty, SiteWeight::Resident(&n.up)),
+        down: (n.down_ty, SiteWeight::Resident(&n.down)),
         ff: d.ff,
         hidden: d.hidden,
         rule: Act::SiluMul,
@@ -1515,19 +1487,6 @@ fn slots_gemm(
         io,
         c.sink,
     )
-}
-
-/// Site `name` of type `ty` as [`slots_gemm`]'s block reads its weight: the
-/// resident stack, or with `window` the ring's words of the same type.
-fn slot_site<'a>(
-    (ty, name): (SiteTy, &'a str),
-    window: Option<&'a DeviceTensor<u32>>,
-) -> (SiteTy, SiteWeight<'a>) {
-    let src = match window {
-        Some(w) => SiteWeight::Words { name, w },
-        None => SiteWeight::Resident(name),
-    };
-    (ty, src)
 }
 
 impl GpuModel<Body35> {

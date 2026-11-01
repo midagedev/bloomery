@@ -612,16 +612,13 @@ impl PlanInputs {
     }
 
     /// One slot of the expert stream a load of the file under `experts` runs: the widest layer's
-    /// routed expert ([`place_hybrid::stream_slot_bytes`]); 0 where the load streams nothing:
-    /// under [`Experts::Host`], whose plan holds no card expert, so its residency is `off` and no
-    /// stream starts, and where a routed stack reaches the card route as NVFP4 planes, which the
-    /// ring pass does not read. A load that streams reserves the lane's staging of it before its
-    /// plan (`workstation::reserve_stream_staging`).
+    /// routed expert ([`place_hybrid::stream_slot_bytes`]), its stacks in the file's blocks or in
+    /// NVFP4's planes alike (the ring holds a half in the card stacks' forms and every ring pass
+    /// reads either); 0 under [`Experts::Host`], whose plan holds no card expert, so its residency
+    /// is `off` and no stream starts. A load that streams reserves the lane's staging of it before
+    /// its plan (`workstation::reserve_stream_staging`).
     pub fn stream_slot(&self, experts: Experts) -> Result<u64, PlacementError> {
-        let planes = self.model.tensors.iter().any(|t| {
-            t.role == Role::RoutedExperts && card_routed(t.ty) == Some(CardFormat::Nvfp4Planes)
-        });
-        if experts == Experts::Host || planes {
+        if experts == Experts::Host {
             return Ok(0);
         }
         place_hybrid::stream_slot_bytes(&self.model, routed_stacks, self.model.experts)
@@ -3218,11 +3215,7 @@ mod tests {
                 .into_iter()
                 .map(|(n, d)| {
                     if n.contains(".ffn_") && n.ends_with("_exps.weight") {
-                        let ty = if nvfp4 && n.starts_with("blk.2.") {
-                            Ty::Nvfp4
-                        } else {
-                            Ty::Q8_0
-                        };
+                        let ty = if nvfp4 { Ty::Nvfp4 } else { Ty::Q8_0 };
                         (n, vec![64, 1, 8], ty)
                     } else if n.ends_with(".attn_q.weight") {
                         (n, vec![64, 128], Ty::F32)
@@ -3242,12 +3235,11 @@ mod tests {
         let (card, host) = (super::Experts::Card, super::Experts::Host);
         let words = described("q4x-stream-slot", false);
         assert_eq!(words.stream_slot(card).unwrap(), 3 * 68);
-        assert_eq!(
-            described("q4x-stream-planes", true)
-                .stream_slot(card)
-                .unwrap(),
-            0
-        );
+        // PIN(2026-11-01): NVFP4 planes stream as the file's blocks do (every ring pass reads the
+        // half in the card stacks' forms); a planes file's slot was 0, its load reserving none.
+        let planes = described("q4x-stream-planes", true);
+        assert_eq!(planes.stream_slot(card).unwrap(), 3 * 36);
+        assert_eq!(planes.stream_slot(host).unwrap(), 0);
         let machine = super::machine(
             super::A6000,
             crate::arch::qwen35moe::place::Stack::q8_blocks32(words.model.layers),

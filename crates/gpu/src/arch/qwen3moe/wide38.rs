@@ -188,9 +188,8 @@ use super::router::gated;
 use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
 use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res, no_carry};
 use super::tier38::TierSide38;
-use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
-use crate::card_leg::{RouteW, StackW};
+use crate::card_leg::{RouteBlock, RouteW, StackW, with_ring};
 use crate::card_slots::{CardAcc, CardJoin, DownRows, SharedJoin};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
@@ -884,6 +883,43 @@ struct RingRoute38 {
     union: DeviceBuffer<u32>,
 }
 
+/// The ring pass's gate and up GEMMs and down weight over the half `blk` of
+/// the expert stream's ring (`crate::card_leg::with_ring`, in the card
+/// stacks' forms): `gate_up`'s GEMMs over the run's same rows, the half's
+/// gate and up in place of the card's, and the half's down as the 32-value
+/// GEMM reads it. A half whose forms are not the card's, or whose down no
+/// 32-value GEMM reads, is refused by name on layer `l`.
+fn ring_weights<'a>(
+    l: usize,
+    gate_up: GateUp<'a>,
+    blk: &RouteBlock<'a>,
+) -> Result<(GateUp<'a>, Gemm32Weight<'a>), GpuError> {
+    let gate_up = match (gate_up, blk.gate, blk.up) {
+        (GateUp::Grouped(_, _, x), RouteW::Grouped(ty, g), RouteW::Grouped(_, u)) => {
+            GateUp::Grouped(ty, [g, u], x)
+        }
+        (GateUp::Blocks32(_, x), RouteW::Blocks32(g), RouteW::Blocks32(u)) => {
+            GateUp::Blocks32([g, u], x)
+        }
+        _ => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: the expert stream's half in a gate and up form the card route's \
+                     rows do not read"
+                ),
+            ));
+        }
+    };
+    match blk.down {
+        RouteW::Blocks32(down) => Ok((gate_up, down)),
+        RouteW::Grouped(..) => Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: the expert stream's half with a down no 32-value GEMM reads"),
+        )),
+    }
+}
+
 /// Layer `l`'s down stack `w` of type `ty` as the route's down GEMM reads it
 /// over the SwiGLU's 32-value rows ([`StackW::route`]); a stack no 32-value
 /// GEMM reads is refused by name as `what`'s.
@@ -1157,12 +1193,14 @@ impl CardRoute38 {
     /// each run then runs the ring pass before the card sum, one GEMM batch
     /// a landing batch of the stream's copies — each behind its own event,
     /// the route table and the gate and up GEMMs over the batch's map row,
-    /// the SwiGLU of the batch's streamed slots and the down GEMM — and the
-    /// card sum reads the union places at the stack's experts plus the
-    /// streamed ones, so the stack's and the ring's slots sum in slot order
-    /// in one launch. Refused by name: a layer without card experts, a
-    /// stream on a tier layer, on a layer of NVFP4 stacks (the ring holds
-    /// the file's blocks) and on a route the load did not arm
+    /// the SwiGLU of the batch's streamed slots and the down GEMM, over the
+    /// half as the common ring view reads it in the card stacks' forms
+    /// (`crate::card_leg::with_ring`: the file's blocks, or NVFP4's planes,
+    /// through the same GEMMs as the stack pass, the native FP4 gate·up fold
+    /// among them) — and the card sum reads the union places at the stack's
+    /// experts plus the streamed ones, so the stack's and the ring's slots
+    /// sum in slot order in one launch. Refused by name: a layer without card
+    /// experts, a stream on a tier layer and on a route the load did not arm
     /// ([`CardRoute38::arm_ring`]), a gate and up or a down no route GEMM
     /// reads ([`StackW::route`]), and a gate and up the 32-value GEMM reads
     /// on a route made with no 32-value rows. Asynchronous, allocation-free,
@@ -1236,21 +1274,13 @@ impl CardRoute38 {
                 ));
             }
         };
-        let ring_cols = match (st.gate, st.up, st.down) {
-            (StackW::Words(gate), StackW::Words(up), StackW::Words(down)) => {
-                Some([gate.cols(), up.cols(), down.cols()])
-            }
-            _ => None,
-        };
-        if ring.is_some() && (tiered || self.ring.is_none() || ring_cols.is_none()) {
+        if ring.is_some() && (tiered || self.ring.is_none()) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "layer {l}: a stream of the expert stream's ring on a {}",
                     if tiered {
                         "tier layer (the ring serves a load with no expert tier)"
-                    } else if ring_cols.is_none() {
-                        "layer of NVFP4 stacks (the ring holds the file's blocks)"
                     } else {
                         "card route the load did not arm for it"
                     }
@@ -1258,7 +1288,7 @@ impl CardRoute38 {
             ));
         }
         let ctx = gpu.context();
-        let mut run = |windows: Option<(&DeviceBuffer<u32>, &RingStacks<'_>)>| {
+        let mut run = |half: Option<(&DeviceBuffer<u32>, &RouteBlock<'_>)>| {
             let mut c0 = 0;
             while c0 < m {
                 let n = self.run.min(m - c0);
@@ -1361,9 +1391,10 @@ impl CardRoute38 {
                 // The card sum's places and experts: the stack's, or with a
                 // stream the union row's over the stack's and the ring's.
                 let mut sum_places = (&*sel_w, n_card);
-                if let (Some(r), Some((union_map, w)), Some(rr), GateUp::Grouped(ty, _, x)) =
-                    (ring, windows, self.ring.as_mut(), gate_up)
+                if let (Some(r), Some((union_map, blk)), Some(rr)) =
+                    (ring, half, self.ring.as_mut())
                 {
+                    let (ring_gate_up, ring_down) = ring_weights(l, gate_up, blk)?;
                     places(union_map, &mut rr.union)?;
                     for b in &r.batches {
                         b.with_map(ctx, geo::EXPERTS, |bmap| {
@@ -1373,8 +1404,8 @@ impl CardRoute38 {
                                 b.event.as_deref(),
                                 (&ids_w, &self.ids),
                                 bmap,
-                                GateUp::Grouped(ty, [w.gate, w.up], x),
-                                down_weight(WHAT, l, st.down_ty, StackW::Words(w.down))?,
+                                ring_gate_up,
+                                ring_down,
                                 (n, r.n),
                                 sink,
                                 &mut down_w,
@@ -1439,14 +1470,14 @@ impl CardRoute38 {
             }
             Ok(())
         };
-        match (ring, ring_cols) {
-            (Some(r), Some(cols)) => {
-                let rows = [geo::FF, geo::FF, geo::HIDDEN];
-                with_ring_windows(r, ctx, geo::EXPERTS, rows, cols, |union_map, w| {
-                    run(Some((union_map, w)))
+        match ring {
+            Some(r) => {
+                let leg = card.leg_stacks(c.w, l)?;
+                with_ring(&leg, n_card, r, ctx, (geo::FF, geo::HIDDEN), |blk| {
+                    r.with_union(ctx, geo::EXPERTS, |union_map| run(Some((union_map, blk))))
                 })
             }
-            _ => run(None),
+            None => run(None),
         }
     }
 

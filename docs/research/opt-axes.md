@@ -279,7 +279,7 @@ Status words are the inventory's. "Owned" names who queues it. An enabler that m
 
 | Item | Axis | Price |
 |---|---|---|
-| `wide.rs` `ffn_ring` reruns SwiGLU over all slots, up to 3 extra passes a layer | E, D | A `_sel` form would do it once. Common, before their timed A/B. No derived milliseconds in the note |
+| The ring pass's `RouteBlock` (`ring_gemm.rs`, Qwen3.5's placed `ring_pass`) reruns SwiGLU over all slots, up to 3 extra passes a layer | E, D | A `_sel` form would do it once. Common, before their timed A/B. No derived milliseconds in the note |
 | MiMo `_8_cols` handoff, 47 launches a two-row pass | G | 47 × 0.852 µs = 40 µs `[derived, A6000 c_node]`. Under the ruler on a prompt |
 | A column router, 47 further launches | G | Same 40 µs |
 | Flash K192 variant folds 3 per-slot launches | G, D | Three × c_node. Under the ruler |

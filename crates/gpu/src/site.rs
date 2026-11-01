@@ -1097,12 +1097,10 @@ pub fn scatter(
 }
 
 /// Where a site reads its weight: the resident tensor of a name
-/// (`Weights`), rows of it, or the K-quant or IQ4_XS words a caller holds — a
-/// window of experts laid out as the resident stack of the site's type, kept
-/// outside `Weights`. Each carries the site's name, which a refusal names.
-/// Words under a type with no grouped GEMM, and rows of a site whose
-/// launch reads neither the f32 rows nor q8 blocks of 32, are refused by
-/// name ([`gemm`], [`gated`], [`resident_gemm_rows`]).
+/// (`Weights`), or rows of it. Each carries the site's name, which a refusal
+/// names. Rows of a site whose launch reads neither the f32 rows nor q8
+/// blocks of 32 are refused by name ([`gemm`], [`gated`],
+/// [`resident_gemm_rows`]).
 #[derive(Clone, Copy)]
 pub enum SiteWeight<'a> {
     /// The resident weight of this name.
@@ -1110,11 +1108,6 @@ pub enum SiteWeight<'a> {
     /// Rows `at .. at + n` of the resident weight `name`: one part of a
     /// weight joined at load (`Weights::join_rows`).
     Part { name: &'a str, at: usize, n: usize },
-    /// The words of site `name`, `w`.
-    Words {
-        name: &'a str,
-        w: &'a DeviceTensor<u32>,
-    },
 }
 
 impl<'a> SiteWeight<'a> {
@@ -1122,23 +1115,14 @@ impl<'a> SiteWeight<'a> {
     #[must_use]
     pub fn name(self) -> &'a str {
         match self {
-            SiteWeight::Resident(name)
-            | SiteWeight::Part { name, .. }
-            | SiteWeight::Words { name, .. } => name,
+            SiteWeight::Resident(name) | SiteWeight::Part { name, .. } => name,
         }
     }
 
-    /// Words under a type with no grouped GEMM, and rows of a type whose
-    /// launch reads neither the f32 rows nor q8 blocks of 32, refused by
-    /// name as `what`.
+    /// Rows of a type whose launch reads neither the f32 rows nor q8 blocks
+    /// of 32, refused by name as `what`.
     fn check(self, what: &'static str, ty: SiteTy) -> Result<(), GpuError> {
         match self {
-            SiteWeight::Words { name, .. } if gemm_weight(ty).is_none() => Err(GpuError::shape(
-                what,
-                format!(
-                    "{name} is {ty} on words a caller holds; its grouped GEMM reads no such words"
-                ),
-            )),
             SiteWeight::Part { name, .. } if !BY_NAME.contains(&ty) => Err(GpuError::shape(
                 what,
                 format!(
@@ -1151,15 +1135,11 @@ impl<'a> SiteWeight<'a> {
     }
 
     /// The resident weight's name and the rows of it a site reads, all of
-    /// them at `None`; words a caller holds are refused by name as `what`.
-    fn rows(self, what: &'static str) -> Result<(&'a str, Part), GpuError> {
+    /// them at `None`.
+    fn rows(self) -> (&'a str, Part) {
         match self {
-            SiteWeight::Resident(name) => Ok((name, None)),
-            SiteWeight::Part { name, at, n } => Ok((name, Some((at, n)))),
-            SiteWeight::Words { name, .. } => Err(GpuError::shape(
-                what,
-                format!("{name} is on words a caller holds; this site reads a resident weight"),
-            )),
+            SiteWeight::Resident(name) => (name, None),
+            SiteWeight::Part { name, at, n } => (name, Some((at, n))),
         }
     }
 }
@@ -1551,10 +1531,7 @@ fn gemm_into(
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Iq4Xs => {
             let ty =
                 gemm_weight(ty).ok_or(GpuError::state(WHAT, "the selected site's GEMM type"))?;
-            let w = match src {
-                SiteWeight::Words { w, .. } => w,
-                _ => kq(w, WHAT, name)?,
-            };
+            let w = kq(w, WHAT, name)?;
             let act = x.q128.ok_or_else(|| missing("q8_1 blocks of 128"))?;
             macro_rules! args {
                 ($y:expr) => {
@@ -1588,7 +1565,7 @@ fn gemm_into(
         }
         SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 | SiteTy::Fp8B128 | SiteTy::Bf16 => {
             dense()?;
-            let (site, part) = src.rows(WHAT)?;
+            let (site, part) = src.rows();
             let weight = w.resident(WHAT, site)?;
             let g32 = || {
                 k.g32(

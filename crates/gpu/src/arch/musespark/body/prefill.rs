@@ -60,7 +60,7 @@ use super::stream::{RingPass, XSide};
 use super::tier::{TierSum, enqueue_tier_sum};
 use super::{Body, Kernels, Layer, RouteOut, Shape, Taps, enqueue_head, stack};
 use crate::arch::hybrid::{Site, WideCx, norm_rows, project_wide, wide_acts_at};
-use crate::card_leg::{RouteBlock, StackW};
+use crate::card_leg::{LegStacks, with_ring};
 use crate::card_slots::ColPlaces;
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
@@ -70,7 +70,7 @@ use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::run::HostRun;
 use crate::host::served::prompt_pass;
-use crate::host::xstream::{LandBatch, RingStacks, with_ring_windows};
+use crate::host::xstream::LandBatch;
 use crate::iq_sel::IqGateUp;
 use crate::kquant::{Act as GateAct, SelDown};
 use crate::model::GpuModel;
@@ -79,7 +79,7 @@ use crate::rope_table::Direction;
 use crate::site::{WideActs, WideKernels};
 use crate::tensor::{Pitched, dtod_2d};
 use crate::weights::Weights;
-use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
+use crate::{Gpu, GpuError, Q8Act, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::arch::musespark::hparams::Hparams;
@@ -1019,27 +1019,23 @@ impl PassWalk<'_> {
                 gemm: rg,
             }) => {
                 let ctx = gpu.context();
-                let cols = [
-                    stack(w, &stacks.gate)?.cols(),
-                    stack(w, &stacks.up)?.cols(),
-                    stack(w, &stacks.down)?.cols(),
-                ];
-                let rows = [sh.ff, sh.ff, sh.latent];
+                let card = LegStacks::of(w, [&stacks.gate, &stacks.up, &stacks.down])?;
                 let kernels = (Some(cx.gemm), &cx.k.g32);
                 rg.enqueue_rows(gpu, &cx.k.g32, &b.lat2, m, fault)?;
-                with_ring_windows(&r, ctx, sh.n_expert, rows, cols, |union_map, half| {
+                r.with_union(ctx, sh.n_expert, |union_map| {
                     acc_k.enqueue_places_cols(
                         stream,
                         &ring_places(&b.ids, union_map, sh, m),
                         fault,
                         union,
-                    )?;
-                    let blk = ring_block(half, sh)?;
+                    )
+                })?;
+                with_ring(&card, a.n_card, &r, ctx, (sh.ff, sh.latent), |blk| {
                     for batch in &r.batches {
                         rg.enqueue_batch(
                             gpu,
                             kernels,
-                            &blk,
+                            blk,
                             batch,
                             (&b.ids, slots, sh.top_k, sh.n_expert),
                             (&mut b.down, GateAct::SiluMul),
@@ -1328,27 +1324,6 @@ enum Sum {
     Moe,
     /// The card's slots' sum plus the host's.
     Lat,
-}
-
-/// The half's stacks `half` as the route GEMM of the file's IQ2_XXS reads them (the kernel table's
-/// GEMM entry, `kernels::gemm`): the gate and up of `sh.ff` rows an expert, the down of
-/// `sh.latent`. Refused by name: a type the table names no route GEMM for.
-fn ring_block<'a>(half: &RingStacks<'a>, sh: Shape) -> Result<RouteBlock<'a>, GpuError> {
-    let route = |t: &'a DeviceTensor<u32>| {
-        StackW::Words(t)
-            .route(GgmlType::IQ2_XXS)
-            .ok_or(GpuError::state(
-                WHAT,
-                "a route GEMM entry for the IQ2_XXS stacks (`kernels::gemm`)",
-            ))
-    };
-    Ok(RouteBlock {
-        gate: route(half.gate)?,
-        up: route(half.up)?,
-        down: route(half.down)?,
-        ff: sh.ff,
-        hidden: sh.latent,
-    })
 }
 
 /// A placed load's pass `(1, m, Batch)` through the host tier's batch port
