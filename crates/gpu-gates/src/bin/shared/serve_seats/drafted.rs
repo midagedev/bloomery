@@ -238,16 +238,23 @@ pub(crate) struct Lookups<T> {
 
 impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
     /// The lookup of `slots` resident slots on `s`, each behind a width
-    /// chooser of `mode`, the verify pass captured now (`log` told of it)
-    /// with slot 0's window and shared by every slot's. Load-time; refused by
-    /// name for no slot and a rule the chooser cannot run by.
+    /// chooser of `mode`. Each slot the session serves now opens its window
+    /// through [`Session::with_draft`] with that slot selected, which
+    /// captures the verify pass on that slot (`log` told of it), as
+    /// [`SlotDrafts::open`] does; a slot the seat adds after captures on its
+    /// first verify. Slot 0 is selected after. Load-time; refused by name for
+    /// no slot and a rule the chooser cannot run by.
     pub(crate) fn open(
         s: &mut Session<B>,
         slots: usize,
         mode: WidthMode,
         log: &mut impl RowsLog,
         history: Option<History<Session<B>>>,
-    ) -> Result<Self, GateError> {
+    ) -> Result<Self, GateError>
+    where
+        B: Slots,
+        B::Seq: 'static,
+    {
         record::require(record::groups::drafted::WIDTH, "drafted::Lookups::open");
         if slots == 0 {
             return Err("the lookup draft of no slot".into());
@@ -261,10 +268,15 @@ impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
             )
         };
         let mut windows: Vec<Box<dyn LookupWindow<Session<B>>>> = Vec::with_capacity(slots);
-        windows.push(Box::new(s.with_draft::<_, LOOKUP_ROWS>(choosing()?, log)?));
-        for _ in 1..slots {
-            windows.push(Box::new(Speculative::<_, LOOKUP_ROWS>::new(choosing()?)));
+        for slot in 0..slots {
+            if slot < s.slots() {
+                s.select_slot(slot)?;
+                windows.push(Box::new(s.with_draft::<_, LOOKUP_ROWS>(choosing()?, log)?));
+            } else {
+                windows.push(Box::new(Speculative::<_, LOOKUP_ROWS>::new(choosing()?)));
+            }
         }
+        s.select_slot(0)?;
         Ok(Lookups {
             windows,
             history,
@@ -586,15 +598,19 @@ where
     }
 
     /// The lookup draft on each of `slots` resident slots ([`Lookups::open`]:
-    /// its verify pass captured now, `log` told of it, behind the width
-    /// chooser of `mode`) in place of the MTP draft: no slot's draft is ever
-    /// off, and a cut or a state put back needs no rejoin. Load-time.
+    /// each slot's verify pass captured now, `log` told of each, behind the
+    /// width chooser of `mode`) in place of the MTP draft: no slot's draft is
+    /// ever off, and a cut or a state put back needs no rejoin. Load-time.
     pub(crate) fn lookup(
         s: &mut Session<B>,
         slots: usize,
         mode: WidthMode,
         log: &mut impl RowsLog,
-    ) -> Result<Self, GateError> {
+    ) -> Result<Self, GateError>
+    where
+        B: Slots,
+        B::Seq: 'static,
+    {
         Ok(SlotDrafts {
             specs: Vec::new(),
             batch: runtime::width::Batch::default(),
@@ -605,20 +621,26 @@ where
 
     /// One draft a resident slot, `slots` of them, each opened by the seat's
     /// `open` (the draft's prompt path and step mode are the seat's) and set
-    /// behind the width chooser of `mode` (`runtime::width`): slot
-    /// 0's driven through [`Session::with_draft`], which captures every
-    /// width's verify pass on the model (`log` told of each), each further
-    /// slot's opened beside it, the model's captures shared by every slot's
-    /// draft. Every slot starts as a fresh draft: nothing waits, nothing
-    /// skipped. Load-time, once the session serves its slots; refused by name
-    /// for no slot and a rule the chooser cannot run by.
+    /// behind the width chooser of `mode` (`runtime::width`), each driven
+    /// through [`Session::with_draft`] with its slot selected, which captures
+    /// every width's verify pass on that slot (`log` told of each), and its
+    /// draft's walks captured on it ([`GpuModel::capture_seq`]): each slot
+    /// keeps its own captures, so no slot's first verify of a width or first
+    /// proposal pays one. Slot 0 is selected after. Every slot starts as a
+    /// fresh draft: nothing waits, nothing skipped. Load-time, once the
+    /// session serves its slots; refused by name for no slot and a rule the
+    /// chooser cannot run by.
     pub(crate) fn open(
         s: &mut Session<B>,
         slots: usize,
         mode: WidthMode,
         log: &mut impl RowsLog,
         mut open: impl FnMut(&GpuModel<B>) -> Result<MtpDraft<B>, SessionError>,
-    ) -> Result<Self, GateError> {
+    ) -> Result<Self, GateError>
+    where
+        B: Slots,
+        B::Seq: 'static,
+    {
         record::require(record::groups::drafted::PROMPT, "drafted::SlotDrafts::open");
         record::require(record::groups::drafted::WIDTH, "drafted::SlotDrafts::open");
         if slots == 0 {
@@ -627,12 +649,14 @@ where
         let choose = |d: MtpDraft<B>| -> Result<Choosing<MtpDraft<B>>, SessionError> {
             Ok(d.choosing(mode)?)
         };
-        let first = choose(open(s.model())?)?;
         let mut specs = Vec::with_capacity(slots);
-        specs.push(Some(s.with_draft(first, log)?));
-        for _ in 1..slots {
-            specs.push(Some(Speculative::new(choose(open(s.model())?)?)));
+        for slot in 0..slots {
+            s.select_slot(slot)?;
+            let draft = choose(open(s.model())?)?;
+            specs.push(Some(s.with_draft(draft, log)?));
+            s.model_mut().capture_seq()?;
         }
+        s.select_slot(0)?;
         Ok(SlotDrafts {
             specs,
             batch: runtime::width::Batch::default(),

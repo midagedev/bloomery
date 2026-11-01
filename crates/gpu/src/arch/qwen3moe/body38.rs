@@ -5883,6 +5883,15 @@ impl ChainBody for Body38 {
         }
     }
 
+    /// The live sequence's draft walks ([`Mtp38::capture_walks`]); none on a
+    /// load without the draft.
+    fn capture_seq(&mut self, gpu: &Gpu, w: &Weights) -> Result<usize, GpuError> {
+        if self.mtp.is_none() {
+            return Ok(0);
+        }
+        self.mtp_with(gpu, w, Mtp38::capture_walks)
+    }
+
     /// The step's walk ([`Step38`]). An eager walk serves its host legs as
     /// it enqueues them: its PLE rows are delivered first, so they arrive
     /// before it.

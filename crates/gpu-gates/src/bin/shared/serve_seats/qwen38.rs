@@ -1699,6 +1699,17 @@ fn reseated(at: vision_seat::Opened, place: Place) -> Result<vision_seat::Opened
     Ok(vision_seat::Opened { seat, ..at })
 }
 
+/// The rows a slot's window verifies in one pass: the MTP draft's verify
+/// rows, the lookup's [`LOOKUP_ROWS`], or `None` for a load that drafts
+/// nothing (a plain step's one row).
+fn window_rows(mtp: bool, lookup: bool) -> Option<usize> {
+    match (mtp, lookup) {
+        (true, _) => Some(<Body38 as MtpBody>::VERIFY_ROWS),
+        (false, true) => Some(LOOKUP_ROWS),
+        (false, false) => None,
+    }
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
@@ -2229,12 +2240,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // `SeatArgs`) by what the body runs: one pass of the busy rows, a slot
     // at a time beside an expert tier card ([`Place38::tiered`]), the
     // draft's windows of its verify rows.
-    let window = match (mtp, lookup) {
-        (true, _) => Some(<Body38 as MtpBody>::VERIFY_ROWS),
-        (false, true) => Some(LOOKUP_ROWS),
-        (false, false) => None,
-    };
-    let pass = Pass::of_body::<Body38>(slots, !a.place.tiered(), window);
+    let pass = Pass::of_body::<Body38>(slots, !a.place.tiered(), window_rows(mtp, lookup));
     // The slots the seat serves ([`Session::add_slots`]): the flag's, or
     // one — one drafted pass a slot a round, nothing parked.
     parallel_line(slots, rule.ctx, from, pass);
@@ -2900,7 +2906,7 @@ impl Q38 {
         }
         // The resident sequences, parked after the captures: the live slot's
         // step and verify chains stay with it, each parked slot capturing on
-        // its first use.
+        // its first use, or below with the rounds.
         s.add_slots(a.slots)?;
         if let Some(t) = a.trace {
             s.model_mut()
@@ -2933,6 +2939,20 @@ impl Q38 {
         // pass of the busy rows where the body runs one, the drafted rounds
         // on a drafted load and the plain rounds on a plain one.
         let pass_of_slots = a.pass.together(a.slots);
+        // Two slots' rounds captured now, so no decode pays a capture: the
+        // drafted rounds of up to a window's rows a slot, the plain ones of a
+        // row, and each slot's step and draft walks a round of one busy slot
+        // replays, a window cut to a slot's context (a lookup window that
+        // does not fit steps instead). The rounds grow as (rows + 1)^slots,
+        // so more slots keep capturing a pass on its first use.
+        if pass_of_slots && a.slots <= 2 {
+            let rows = window_rows(a.mtp, a.lookup).unwrap_or(1).min(a.ctx);
+            let (passes, own) = s.capture_rounds(a.slots, rows)?;
+            eprintln!(
+                "capture rounds slots={} rows={rows} passes={passes} slot_graphs={own}",
+                a.slots
+            );
+        }
         if a.pass == Pass::Turns {
             eprintln!(
                 "bloomery-serve-qwen38: --place {}: the rounds of several slots run a slot at a \

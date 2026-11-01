@@ -1786,6 +1786,42 @@ impl Mtp38 {
             .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))
     }
 
+    /// Capture every walk a window's chain replays on this sequence that is
+    /// not captured yet: a refresh of 1 to [`MTP_GRAPH_ROWS`] rows and the
+    /// own walk, into the opened head; how many it captured. Nothing is
+    /// launched. Load-time; refused by name with the taps armed, as a
+    /// captured walk is.
+    pub(super) fn capture_walks(&mut self, c: &MtpCtx<'_>) -> Result<usize, GpuError> {
+        if self.arena_ref()?.taps.is_some() {
+            return Err(GpuError::state(WHAT, "the taps off for a captured walk"));
+        }
+        let head = if self.head.rows.is_some() {
+            DraftHead::Rows
+        } else {
+            DraftHead::Full
+        };
+        let refresh = (1..=MTP_GRAPH_ROWS).map(|m| MtpKey {
+            m,
+            own: false,
+            head,
+        });
+        let own = MtpKey {
+            m: 1,
+            own: true,
+            head,
+        };
+        let mut captured = 0;
+        for key in refresh.chain([own]) {
+            if self.graphs.iter().any(|(k, _)| *k == key) {
+                continue;
+            }
+            let graph = Graph::capture(c.gpu.stream(), |_| self.walk(c, key))?;
+            self.graphs.push((key, graph));
+            captured += 1;
+        }
+        Ok(captured)
+    }
+
     /// The captured walks' node counts, by rows, feed and head.
     #[must_use]
     pub fn graph_nodes(&self) -> Vec<(usize, bool, DraftHead, usize)> {

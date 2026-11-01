@@ -572,6 +572,25 @@ where
         Ok(())
     }
 
+    /// Capture, on every resident slot, the one-token step and the body's
+    /// own graphs of the slot's sequence ([`GpuModel::capture_seq`]) that
+    /// are not captured yet, so no slot's first lone step or draft walk pays
+    /// a capture; how many graphs it captured. Slot 0 is selected after.
+    /// Load-time; graph mode only, as [`GpuModel::capture_step`] is.
+    pub fn capture_each_slot(&mut self) -> Result<usize, GpuError> {
+        let mut captured = 0;
+        for slot in 0..self.slots() {
+            self.select_slot(slot)?;
+            if self.graphs.get(1).is_none() {
+                self.capture_step()?;
+                captured += 1;
+            }
+            captured += self.capture_seq()?;
+        }
+        self.select_slot(0)?;
+        Ok(captured)
+    }
+
     /// `f` over several resident slots at once, the homes made canonical
     /// first — slot 0 selected, so every slot's state sits in its home — as
     /// a pass of several slots binds them ([`SlotRows::enqueue_slots`]):

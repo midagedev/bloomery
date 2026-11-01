@@ -382,9 +382,9 @@ where
     }
 
     /// The lookup draft on each of `slots` resident slots of `s`
-    /// ([`Lookups::open`]), each behind a width chooser of `mode`, the verify
-    /// pass captured now (`log` told of it); `history` the body's token
-    /// history, where it keeps one.
+    /// ([`Lookups::open`]), each behind a width chooser of `mode`, each served
+    /// slot's verify pass captured now (`log` told of each); `history` the
+    /// body's token history, where it keeps one.
     pub fn lookup(
         s: &mut Session<B>,
         slots: usize,
