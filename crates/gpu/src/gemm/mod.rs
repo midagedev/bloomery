@@ -26,7 +26,9 @@
 //!
 //! One file per owner: `grouped.rs` the GEMM (its decode, staging and block
 //! walk, and [`GemmKernels::enqueue_gemm`]), `route.rs` the route table,
-//! `swiglu.rs` the SwiGLU quantizer's launcher, `act.rs` the activation
+//! `swiglu.rs` the SwiGLU quantizer's launcher, `swiglu32.rs` the SwiGLU
+//! epilogue an up GEMM of either family writes the down's q8 blocks of 32
+//! through, `act.rs` the activation
 //! scratch and its quantizer launch, and `kernels.rs` the one device module
 //! every entry is declared in — one `#[cuda_module]`, so one bundle load for
 //! the whole family.
@@ -52,6 +54,8 @@ mod act;
 mod grouped;
 mod route;
 mod swiglu;
+#[macro_use]
+mod swiglu32;
 
 // After `grouped`: the entries expand its macros, which are in scope only
 // after that module's declaration.
@@ -89,6 +93,7 @@ pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;
 pub use kernels32::Gemm32Kernels;
 pub use route::{GemmRoute, GemmTile};
+pub use swiglu32::SwigluSlots;
 
 /// Slots one route and one GEMM take: a 4096-token ubatch at ten slots a
 /// token (ten routed experts, or nine and the shared one).

@@ -32,9 +32,11 @@
 //!   nibbles to the E2M1 table's int8 values and their sub-block scales to
 //!   f32 as it reads them ([`nv_frags`]), the store applying the tile's
 //!   expert's scale. No Q8_0 twin is derived beside them.
-//!   `gemm_nvfp4p_swiglu` is its walk as the up GEMM of a SwiGLU pair: the
-//!   store takes `silu(g) · u` of each output and the gate GEMM's row and
-//!   quantizes a slab's rows into the down GEMM's activations instead
+//!   `gemm_nvfp4p_swiglu` is its walk as the up GEMM of a SwiGLU pair, as
+//!   `gemm_q8_0p_swiglu_all` and its slab twin are the Q8_0 planes': the
+//!   store is the SwiGLU epilogue (`swiglu32.rs`), which takes
+//!   `silu(g) · u` of each output and the gate GEMM's row and quantizes a
+//!   slab's rows into the down GEMM's activations instead
 //!   ([`Gemm32Kernels::enqueue_up_swiglu32`]).
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
@@ -92,7 +94,7 @@ use super::act32::GemmAct32;
 use super::grouped::{GEMM_BM, GEMM_THREADS};
 use super::kernels32::Gemm32Kernels;
 use super::route::gemm_max_tiles;
-use super::{GEMM_BN, GEMM32_STEP, GemmInput, GemmRoute};
+use super::{GEMM_BN, GEMM32_STEP, GemmInput, GemmRoute, SwigluSlots};
 use crate::fault::FaultSink;
 use crate::iq::iq4_word;
 use crate::mxfp4_sel::Nvfp4Stack;
@@ -128,14 +130,8 @@ pub(super) const NV_STAGE_W: usize = NV_CODE_W + GEMM_BM;
 /// NVFP4 weight stages: a step's weights are copied two steps ahead.
 pub(super) const NV_STAGES: usize = 3;
 const _: () = assert!(NV_STAGES * NV_STAGE_W <= 2 * W32_STAGE_W);
-/// f32 words between two columns of a round the SwiGLU store stages in WT
-/// (`gemm_nvfp4p_swiglu`): the slab's rows and four of pad, so the eight
-/// columns one store phase writes land in distinct banks and each lane's
-/// four rows of a block are one aligned 16-byte read.
-pub(super) const SW_PITCH: usize = GEMM_BM + 4;
-/// n-tiles of one such round.
-pub(super) const SW_NT: usize = 4;
-const _: () = assert!(SW_NT * 8 * SW_PITCH <= 2 * W32_STAGE_W);
+// The SwiGLU epilogue stages its rounds in WT (`swiglu32.rs`).
+const _: () = assert!(super::swiglu32::SW_STAGE <= 2 * W32_STAGE_W);
 /// [`GEMM_THREADS`] as the block width a launch takes.
 pub(super) const GEMM32_THREADS_U32: u32 = GEMM_THREADS as u32;
 /// Tiles one group of the Q8_0 planes' block raster takes ([`raster32`]):
@@ -1253,114 +1249,14 @@ macro_rules! gemm32_block {
     }};
     (
         @store $mode:ident, $nx:expr, $acc:ident, $kind:ident($($w:ident),+),
-        [swiglu($gate:ident, $sel:ident, $n_card:ident, $ob:ident, $osteps:ident, $oq:ident,
-            $od:ident, $os:ident, $fault:ident)], (
+        [swiglu($($sw:tt)+)], (
             $t:ident, $active:ident, $nt_live:ident, $len:ident, $row0:ident, $g:ident,
             $rows_n:ident, $slot_sh:ident, $xs:ident, $wt:ident, $rt:ident
         )
     ) => {{
         let ws = w32!(@expert_scale $kind($($w),+), $xs);
-        let lane = warp::lane_id() as usize;
-        let wid = thread::threadIdx_x() as usize / 32;
-        let (ob, osteps) = ($ob as usize, $osteps as usize);
-        // The gate rows of this thread's cells, all read before the first is
-        // used, so their loads overlap.
-        let mut gv = [0.0f32; 4 * GEMM_NT];
-        if $active {
-            gemm_nts!($mode, $nx, false, $nt_live, |nt, j0| {
-                for i in 0..4usize {
-                    ::cuda_device::thread::__unroll_config::<0>();
-                    let n = 8 * nt + 2 * $t + (i & 1);
-                    if n < $len {
-                        let r = $row0 + $g + 8 * (i / 2);
-                        // SAFETY: n < GEMM_BN bounds the shared read.
-                        let slot = unsafe { *$slot_sh.add(n) } as usize;
-                        // SAFETY: the slot is below n_slots and r below rows,
-                        // so the read is inside gate (launch contract).
-                        gv[j0 + i] = unsafe { *$gate.get_unchecked(slot * $rows_n + r) };
-                    }
-                }
-            });
-        }
-        // Every warp is done with the walk, so its weight stages hold a round
-        // of n-tiles' SwiGLU values: round column `c` at word `c · SW_PITCH`,
-        // the slab's rows in order.
-        thread::sync_threads();
-        let hs = $wt.cast::<f32>();
-        gemm_nts!($mode, $nx, false, $nt_live, |nt, j0| {
-            let (k, last) = sw_round!($mode, nt, $nt_live);
-            if $active {
-                for i in 0..4usize {
-                    ::cuda_device::thread::__unroll_config::<0>();
-                    let c = 2 * $t + (i & 1);
-                    if 8 * nt + c < $len {
-                        let h = silu_mul(gv[j0 + i], w32!(@scale $kind($($w),+), ws, $acc[j0 + i]));
-                        // SAFETY: round column 8k + c < 8 · SW_NT and slab row
-                        // 16 · wid + g + 8(i / 2) < GEMM_BM put the word inside
-                        // WT (the round's words fit); one lane writes it.
-                        unsafe {
-                            *hs.add((8 * k + c) * SW_PITCH + 16 * wid + $g + 8 * (i / 2)) = h;
-                        }
-                    }
-                }
-            }
-            if last {
-                thread::sync_threads();
-                // Warp `wid` quantizes the round's columns `wid + 8m`, each as
-                // `swiglu_quant32_sel`'s warp does its (column, group): the
-                // group is the slab's four blocks.
-                let mut m = 0usize;
-                while m <= k {
-                    let c = wid + 8 * m;
-                    let n = 8 * (nt - k) + c;
-                    if n < $len {
-                        // SAFETY: n < GEMM_BN bounds the shared read.
-                        let slot = unsafe { *$slot_sh.add(n) } as usize;
-                        // SAFETY: the slot is below n_slots <= sel.len()
-                        // (launch contract).
-                        let place = unsafe { *$sel.get_unchecked(slot) };
-                        if place < $n_card {
-                            // A lane past the column's blocks holds the last
-                            // block's values (`quant32_group`'s rule); every
-                            // block of the group lies in this slab.
-                            let b = (4 * $rt + (lane >> 3)).min(ob - 1);
-                            // SAFETY: block b's 32 rows are slab rows below
-                            // GEMM_BM of round column c < 8 · SW_NT, written
-                            // above and published by the barrier; the word is
-                            // 16-byte aligned (SW_PITCH and 4(lane % 8) are
-                            // multiples of four).
-                            let w = unsafe {
-                                *hs.add(c * SW_PITCH + 32 * b - GEMM_BM * $rt + 4 * (lane & 7))
-                                    .cast::<U32x4>()
-                            }
-                            .0;
-                            let v = [
-                                f32::from_bits(w[0]),
-                                f32::from_bits(w[1]),
-                                f32::from_bits(w[2]),
-                                f32::from_bits(w[3]),
-                            ];
-                            // SAFETY: the warp enters with one (slot, rt), the
-                            // slot below n_slots and rt below ceil(ob / 4); the
-                            // planes hold every slot's column (launch
-                            // contract).
-                            let refused = unsafe {
-                                quant32_group(
-                                    v, slot, $rt, ob, osteps, lane, &mut $oq, &mut $od, &mut $os,
-                                )
-                            };
-                            if refused && lane & 7 == 0 {
-                                $fault.raise(FaultSite::QuantColumn);
-                            }
-                        }
-                    }
-                    m += 1;
-                }
-                // Every warp is done with the round before the next one's
-                // stores.
-                thread::sync_threads();
-            }
-        });
+        swiglu32!(@store $mode, $nx, $acc, |v| w32!(@scale $kind($($w),+), ws, v), [$($sw)+],
+            ($t, $active, $nt_live, $len, $row0, $g, $rows_n, $slot_sh, $wt, $rt));
     }};
     (
         @store $mode:ident, $nx:expr, $acc:ident, $kind:ident($($w:ident),+), $y:ident, (
@@ -1393,31 +1289,9 @@ macro_rules! gemm32_block {
             });
         }
     }};
-    (
-        @refused [swiglu($gate:ident, $sel:ident, $n_card:ident, $ob:ident, $osteps:ident,
-            $oq:ident, $od:ident, $os:ident, $fault:ident)], $slot:expr, $r:expr, $rows_n:expr
-    ) => {{
-        let (slot, r, osteps): (usize, usize, usize) = ($slot, $r, $osteps as usize);
+    (@refused [swiglu($($sw:tt)+)], $slot:expr, $r:expr, $rows_n:expr) => {{
         let _ = $rows_n;
-        if r % GEMM_BM < 32 {
-            // SAFETY: slot < n_slots <= sel.len() by the launch contract.
-            let place = unsafe { *$sel.get_unchecked(slot) };
-            if place < $n_card {
-                // SAFETY: one whole warp handles this (slot, slab); rows are a
-                // multiple of 32, so its first warp is live even in the last slab.
-                // slot < n_slots, r / GEMM_BM < ceil(ob / 4), and the launch
-                // contract bounds all three planes. Each block has one writer.
-                let refused = unsafe {
-                    quant32_group(
-                        [f32::NAN; 4], slot, r / GEMM_BM, $ob as usize,
-                        osteps, r % 32, &mut $oq, &mut $od, &mut $os,
-                    )
-                };
-                if refused && r % 32 == 0 {
-                    $fault.raise(FaultSite::QuantColumn);
-                }
-            }
-        }
+        swiglu32!(@refused [$($sw)+], $slot, $r);
     }};
     (@refused $y:ident, $slot:expr, $r:expr, $rows_n:expr) => {{
         // SAFETY: slot < n_slots and r < rows put the output below
@@ -1429,19 +1303,6 @@ macro_rules! gemm32_block {
                 $crate::gemm::f32tile::ProductCell::of(f32::NAN)
         };
     }};
-}
-
-/// The SwiGLU store's place of n-tile `nt` in its round of [`SW_NT`]
-/// (`gemm32_block`'s `swiglu` output), and whether the round ends there: a
-/// `fast` walk stores every live n-tile in rounds, an `exact` one its one
-/// n-tile as a round.
-macro_rules! sw_round {
-    (fast, $nt:expr, $nt_live:expr) => {
-        ($nt % SW_NT, $nt % SW_NT == SW_NT - 1 || $nt + 1 == $nt_live)
-    };
-    (exact, $nt:expr, $nt_live:expr) => {
-        (0usize, true)
-    };
 }
 
 /// The weights of a 32-value GEMM: a stack of `n_experts · rows_per_expert`
@@ -1936,43 +1797,37 @@ impl Gemm32Kernels {
         Ok(())
     }
 
-    /// Enqueue `act = q8_1_32(silu(g) · u)` over the slots of the last fill
-    /// of `up.route`, `u` the up GEMM `up` (its `y` the up rows' scratch,
+    /// Enqueue `act = q8_1_32(silu(g) · u)` over `slots` of the last fill of
+    /// `up.route`, `u` the up GEMM `up` (its `y` the up rows' scratch,
     /// `rows_per_expert` the activations' K): the bytes and faults of
     /// [`Gemm32Kernels::enqueue_gemm32`] into `up.y`, then
-    /// [`Gemm32Kernels::enqueue_swiglu_quant32_sel`] over the route's slots
-    /// with `g`, `sel` and `n_card`. NVFP4 planes on the 32-value walk run
-    /// as one launch (`gemm_nvfp4p_swiglu`) that never writes `up.y` and
-    /// never reads `u` back; every other stack runs the two. Asynchronous,
-    /// allocation-free, capturable; `act`'s filled count is the route's slot
-    /// count.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "host launcher: the up GEMM, the gate rows, the places, the card count, the output and the sink (rust-quality R8)"
-    )]
+    /// [`Gemm32Kernels::enqueue_swiglu_quant32`] ([`SwigluSlots::All`]) or
+    /// [`Gemm32Kernels::enqueue_swiglu_quant32_sel`] ([`SwigluSlots::Card`])
+    /// over the route's slots. A stack and slot set with an entry of the
+    /// SwiGLU epilogue (`swiglu32.rs`) runs as one launch that never writes
+    /// `up.y` and never reads `u` back: NVFP4 planes on the 32-value walk
+    /// over card slots (`gemm_nvfp4p_swiglu`) and Q8_0 planes over all
+    /// (`gemm_q8_0p_swiglu_all`, or its slab walk where
+    /// [`Gemm32Kernels::q8_0p_slab`] takes it); every other runs the two, as
+    /// does an `act` in the native FP4 form. Asynchronous, allocation-free,
+    /// capturable; `act`'s filled count is the route's slot count.
     pub fn enqueue_up_swiglu32(
         &self,
         stream: &CudaStream,
         up: Gemm32Args<'_>,
         g: &DeviceBuffer<f32>,
-        sel: &DeviceBuffer<u32>,
-        n_card: usize,
+        slots: SwigluSlots<'_>,
         act: &mut GemmAct32,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_up_swiglu32";
         let l = Gemm32Launch::check(what, &up)?;
         let n_slots = l.n_slots as usize;
-        if act.k() != up.rows_per_expert {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "the SwiGLU's activations hold K = {}, the up rows are {}",
-                    act.k(),
-                    up.rows_per_expert
-                ),
-            ));
-        }
+        let (oblocks, osteps) = act.swiglu_launch(what, n_slots, up.rows_per_expert, g)?;
+        #[cfg(bloomery_nvfp4_mma)]
+        let (x_native, act_native) = (up.act.native.is_some(), act.native.is_some());
+        #[cfg(not(bloomery_nvfp4_mma))]
+        let (x_native, act_native) = (false, false);
         let Gemm32Args {
             w,
             rows_per_expert,
@@ -1981,12 +1836,56 @@ impl Gemm32Kernels {
             input,
             y: u,
         } = up;
-        #[cfg(bloomery_nvfp4_mma)]
-        let native = x.native.is_some() || act.native.is_some();
-        #[cfg(not(bloomery_nvfp4_mma))]
-        let native = false;
-        let planes = match w {
-            Gemm32Weight::Nvfp4Planes(planes) if !native => planes,
+        let cfg = LaunchConfig1D::new(l.grid, GEMM32_THREADS_U32, 0);
+        // The epilogue entry's launch: the up GEMM's operands, the gate rows,
+        // the card places where the entry reads them, the output planes and
+        // the sink.
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident, ($($wbuf:expr),+), ($($places:expr),*)) => {{
+                let prep = self.module.$prepare(cfg)?;
+                self.module.$entry(
+                    stream, &prep, $($wbuf,)+ &x.q, &x.d, &x.s, &route.cols, &route.tiles,
+                    &route.n_tiles, l.n_experts, l.rows, l.kb, l.steps, l.act_cols, l.n_slots,
+                    l.max_tiles, l.slot_div, l.row_tiles, g, $($places,)* oblocks, osteps,
+                    &mut act.q, &mut act.d, &mut act.s, fault,
+                )?;
+            }};
+        }
+        match (w, slots) {
+            (Gemm32Weight::Nvfp4Planes(planes), SwigluSlots::Card { sel, n_card })
+                if !x_native && !act_native =>
+            {
+                if sel.len() < n_slots {
+                    return Err(GpuError::shape(
+                        what,
+                        format!("sel.len() {} < {n_slots} slots", sel.len()),
+                    ));
+                }
+                let n_card = launch_u32(what, "n_card", n_card)?;
+                launch!(
+                    prepare_gemm_nvfp4p_swiglu,
+                    gemm_nvfp4p_swiglu,
+                    (planes.qs.buf(), planes.e.buf(), planes.scales.buf()),
+                    (sel, n_card)
+                );
+            }
+            (Gemm32Weight::Q8_0Plane { qs, d }, SwigluSlots::All) if !act_native => {
+                if self.q8_0p_entry(what, (qs, d), &l)? {
+                    launch!(
+                        prepare_gemm_q8_0p_slab_swiglu_all,
+                        gemm_q8_0p_slab_swiglu_all,
+                        (qs.buf(), d.buf()),
+                        ()
+                    );
+                } else {
+                    launch!(
+                        prepare_gemm_q8_0p_swiglu_all,
+                        gemm_q8_0p_swiglu_all,
+                        (qs.buf(), d.buf()),
+                        ()
+                    );
+                }
+            }
             _ => {
                 self.enqueue_gemm32(
                     stream,
@@ -1999,58 +1898,15 @@ impl Gemm32Kernels {
                         y: &mut *u,
                     },
                 )?;
-                return self
-                    .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_card, n_slots, act, fault);
+                return match slots {
+                    SwigluSlots::All => {
+                        self.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)
+                    }
+                    SwigluSlots::Card { sel, n_card } => self
+                        .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_card, n_slots, act, fault),
+                };
             }
-        };
-        let (_, _, oblocks, _, osteps) = act.quant_launch(what, n_slots)?;
-        if g.len() < n_slots * rows_per_expert || sel.len() < n_slots {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "g.len() {} and sel.len() {} need {n_slots} slots of {rows_per_expert} rows",
-                    g.len(),
-                    sel.len()
-                ),
-            ));
         }
-        let n_card = launch_u32(what, "n_card", n_card)?;
-        let prep = self.module.prepare_gemm_nvfp4p_swiglu(LaunchConfig1D::new(
-            l.grid,
-            GEMM32_THREADS_U32,
-            0,
-        ))?;
-        self.module.gemm_nvfp4p_swiglu(
-            stream,
-            &prep,
-            planes.qs.buf(),
-            planes.e.buf(),
-            planes.scales.buf(),
-            &x.q,
-            &x.d,
-            &x.s,
-            &route.cols,
-            &route.tiles,
-            &route.n_tiles,
-            l.n_experts,
-            l.rows,
-            l.kb,
-            l.steps,
-            l.act_cols,
-            l.n_slots,
-            l.max_tiles,
-            l.slot_div,
-            l.row_tiles,
-            g,
-            sel,
-            n_card,
-            oblocks,
-            osteps,
-            &mut act.q,
-            &mut act.d,
-            &mut act.s,
-            fault,
-        )?;
         act.fill(n_slots);
         Ok(())
     }
@@ -2132,8 +1988,7 @@ impl Gemm32Kernels {
                 y: u,
             },
             g,
-            sel,
-            n_card,
+            SwigluSlots::Card { sel, n_card },
             act,
             fault,
         )

@@ -29,6 +29,7 @@ generate_ds41   attn_out_gate_sigmoid                    0           0
 generate_ds41   attn_out_gate_sigmoid_head               0           0
 generate_ds41   best_merge                               0           0
 generate_ds41   best_part                                0           0
+# PIN(2026-11-02): card_sum_join and card_sum_join_bf16 are unmeasured on this arch/capability; retain strict 0/0 pins from the sm_121a GB10 scan until this pair is scanned.
 generate_ds41   card_sum_join                            0           0
 generate_ds41   card_sum_join_bf16                       0           0
 generate_ds41   short_conv                               0           0
@@ -222,6 +223,8 @@ generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q3k_bf16                            0           0
 generate_ds41   gemm_q4k                                 0           0
 generate_ds41   gemm_q4k_bf16                            0           0
+# PIN(2026-11-02): gemm_q4k_swiglu: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_q4k_swiglu                          0           0
 generate_ds41   gemm_q5_0p                               0           0
 generate_ds41   gemm_q5_0p_bf16                          0           0
 generate_ds41   gemm_q5_1                                0           0
@@ -236,6 +239,10 @@ generate_ds41   gemm_q8_0p                               0           0
 generate_ds41   gemm_q8_0p_bf16                          0           0
 generate_ds41   gemm_q8_0p_slab                          0           0
 generate_ds41   gemm_q8_0p_slab_bf16                     0           0
+# PIN(2026-11-02): gemm_q8_0p_slab_swiglu_all: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_q8_0p_slab_swiglu_all               0           0
+# PIN(2026-11-02): gemm_q8_0p_swiglu_all: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_q8_0p_swiglu_all                    0           0
 generate_ds41   gemm_route                               0           0
 generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0

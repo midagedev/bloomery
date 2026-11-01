@@ -6,10 +6,11 @@
 # cfg: bloomery_nvfp4_mma
 
 # binary entry spill jit_local
-# PIN(2026-10-31): the first cc 12.0 scan of these entries (ptxas 13.3.73 sm_120a, RTX 5090 driver 595.99.02): ptxas spills
-# or the driver JIT keeps local memory for each row of this block.
+# PIN(2026-11-02): card_sum_join and card_sum_join_bf16 are unmeasured on this arch/capability; retain strict 0/0 pins from the sm_121a GB10 scan until this pair is scanned.
 generate_ds41 card_sum_join 0 0
 generate_ds41 card_sum_join_bf16 0 0
+# PIN(2026-10-31): the first cc 12.0 scan of these entries (ptxas 13.3.73 sm_120a, RTX 5090 driver 595.99.02): ptxas spills
+# or the driver JIT keeps local memory for each row of this block.
 generate_ds41 raon_hc_route 0 112
 generate_ds41 bf16_mma_norm_gate 644 168
 generate_ds41 cand_select 8 8
@@ -29,6 +30,8 @@ generate_ds41 gemm_nvfp4p_swiglu 160 56
 generate_ds41 gemm_q4k 0 8
 # PIN(2026-11-01): gemm_q4k_bf16 at gemm_q4k's values, its body with the BF16 store, until a scan on this table's arch and capability.
 generate_ds41 gemm_q4k_bf16 0 8
+# PIN(2026-11-02): gemm_q4k_swiglu: unmeasured on this arch/capability; provisional 0/8 -> 208/64 from the sm_121a GB10 scan (ptxas 13.3.73, driver 595.84), until this pair is scanned.
+generate_ds41 gemm_q4k_swiglu 208 64
 generate_ds41 gemm_q6k 532 64
 # PIN(2026-11-01): gemm_q6k_bf16 at gemm_q6k's values, its body with the BF16 store, until a scan on this table's arch and capability.
 generate_ds41 gemm_q6k_bf16 532 64
@@ -222,6 +225,10 @@ generate_ds41 gemm_q8_0p 0 0
 generate_ds41 gemm_q8_0p_bf16 0 0
 generate_ds41 gemm_q8_0p_slab 0 0
 generate_ds41 gemm_q8_0p_slab_bf16 0 0
+# PIN(2026-11-02): gemm_q8_0p_slab_swiglu_all: unmeasured on this arch/capability; provisional 0/0 -> 8/8 from the sm_121a GB10 scan (ptxas 13.3.73, driver 595.84), until this pair is scanned.
+generate_ds41 gemm_q8_0p_slab_swiglu_all 8 8
+# PIN(2026-11-02): gemm_q8_0p_swiglu_all: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41 gemm_q8_0p_swiglu_all 0 0
 generate_ds41 gemm_route 0 0
 generate_ds41 gemm_route_remap 0 0
 generate_ds41 gemm_swiglu_quant 0 0

@@ -8,7 +8,7 @@
 
 use super::{
     GateUp32Args, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput,
-    GemmKernels, GemmRoute, GemmWeight,
+    GemmKernels, GemmRoute, GemmWeight, SwigluSlots,
 };
 use crate::GpuError;
 use crate::fault::FaultSink;
@@ -47,7 +47,7 @@ pub enum DownW<'a> {
 }
 
 /// A run's window of a card route's down rows: F32, or the BF16 bits a
-/// native FP4 down product stores.
+/// 32-value down product stores (`enqueue_gemm32_bf16`).
 pub enum DownWin {
     F32(WindowMut<'static, f32>),
     Bf16(WindowMut<'static, u16>),
@@ -58,12 +58,13 @@ pub enum DownWin {
 /// route table from `ids` over `map`, the gate and up GEMMs of `gate_up`
 /// (each slot reading its token's input column, `top_k` slots a token), the
 /// SwiGLU over `sel` (every place below `n_card` a column it writes) in the
-/// form `down` carries — a 32-value down the 32-value quantizer's rows (its
-/// NVFP4 gate·up folds it into its own launch,
+/// form `down` carries — a 32-value down the 32-value quantizer's rows, which
+/// the up GEMM's SwiGLU epilogue writes where its type has one
+/// (`GemmKernels::enqueue_up_swiglu32`,
 /// `Gemm32Kernels::enqueue_gate_up_sel32`), a grouped down the K-quant
 /// quantizer's under the case's rule — and the down GEMM of `down` into the
 /// rows its case holds: `ff` rows a gate and up expert, `hidden` a down
-/// expert. Five launches, four with the fold; only the batch's slots are
+/// expert. Five launches, four with the epilogue; only the batch's slots are
 /// touched, so a pass's batches write the rows the whole pass always wrote,
 /// the same values in the same order — the bits do not move.
 #[allow(
@@ -94,28 +95,40 @@ pub fn enqueue_gemm_batch(
     }
     g32.enqueue_route_remap(stream, ids, map, n * top_k, route, sink)?;
     let input = GemmInput::Shared { top_k };
-    if let GateUp::Grouped(ty, [gate, up], x) = gate_up {
-        for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
-            gemm.enqueue_gemm(
-                stream,
-                GemmArgs {
-                    ty,
-                    w,
-                    rows_per_expert: ff,
-                    act: x,
-                    route,
-                    input,
-                    y,
-                },
-            )?;
-        }
+    if let GateUp::Grouped(ty, [gate, _], x) = gate_up {
+        gemm.enqueue_gemm(
+            stream,
+            GemmArgs {
+                ty,
+                w: gate,
+                rows_per_expert: ff,
+                act: x,
+                route,
+                input,
+                y: &mut *g,
+            },
+        )?;
     }
     match down {
         DownW::Blocks32(w, act, y) => {
             match gate_up {
-                GateUp::Grouped(..) => {
-                    g32.enqueue_swiglu_quant32_sel(stream, g, u, sel, n_card, n * top_k, act, sink)?
-                }
+                GateUp::Grouped(ty, [_, up], x) => gemm.enqueue_up_swiglu32(
+                    g32,
+                    stream,
+                    GemmArgs {
+                        ty,
+                        w: up,
+                        rows_per_expert: ff,
+                        act: x,
+                        route,
+                        input,
+                        y: u,
+                    },
+                    g,
+                    SwigluSlots::Card { sel, n_card },
+                    act,
+                    sink,
+                )?,
                 GateUp::Blocks32(w, x) => g32.enqueue_gate_up_sel32(
                     stream,
                     GateUp32Args {
@@ -151,20 +164,32 @@ pub fn enqueue_gemm_batch(
             }
         }
         DownW::Grouped(ty, w, rule, act, y) => {
-            match gate_up {
-                GateUp::Grouped(..) => gemm.enqueue_swiglu_act_quant_sel(
-                    stream,
-                    g,
-                    u,
-                    rule,
-                    sel,
-                    n_card,
-                    n * top_k,
-                    act,
-                    sink,
-                )?,
-                GateUp::Blocks32(..) => unreachable!("refused before the batch's first launch"),
-            }
+            let GateUp::Grouped(up_ty, [_, up], x) = gate_up else {
+                unreachable!("refused before the batch's first launch")
+            };
+            gemm.enqueue_gemm(
+                stream,
+                GemmArgs {
+                    ty: up_ty,
+                    w: up,
+                    rows_per_expert: ff,
+                    act: x,
+                    route,
+                    input,
+                    y: &mut *u,
+                },
+            )?;
+            gemm.enqueue_swiglu_act_quant_sel(
+                stream,
+                g,
+                u,
+                rule,
+                sel,
+                n_card,
+                n * top_k,
+                act,
+                sink,
+            )?;
             gemm.enqueue_gemm(
                 stream,
                 GemmArgs {

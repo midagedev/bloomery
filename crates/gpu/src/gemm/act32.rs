@@ -445,6 +445,36 @@ impl GemmAct32 {
         self.input_launch(what, n_cols)
     }
 
+    /// The SwiGLU epilogue's output checks for `n_slots` slots of `rows` up
+    /// rows (`enqueue_up_swiglu32` of either GEMM family): this scratch's K
+    /// is `rows`, it stores the Q8 planes of `n_slots` columns and `g` holds
+    /// every slot's rows. Returns the quantizer's blocks and steps a column.
+    pub(super) fn swiglu_launch(
+        &self,
+        what: &'static str,
+        n_slots: usize,
+        rows: usize,
+        g: &DeviceBuffer<f32>,
+    ) -> Result<(u32, u32), GpuError> {
+        if self.k() != rows {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the SwiGLU's activations hold K = {}, the up rows are {rows}",
+                    self.k()
+                ),
+            ));
+        }
+        let (_, _, blocks, _, steps) = self.quant_launch(what, n_slots)?;
+        if g.len() < n_slots * rows {
+            return Err(GpuError::shape(
+                what,
+                format!("g.len() {} needs {n_slots} slots of {rows} rows", g.len()),
+            ));
+        }
+        Ok((blocks, steps))
+    }
+
     /// The Q8 planes `q`, `d`, `s`, writable, for a quantizer outside this
     /// module that writes the layout above over the first `n_cols` columns
     /// (`linear::norm_gate`'s q32 entry), recorded as its launch
