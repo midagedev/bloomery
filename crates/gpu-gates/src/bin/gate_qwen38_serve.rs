@@ -542,8 +542,9 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
-        server_log, shared_system_prompt, slot_action, slot_erased, stepped_completion, tokenized,
+        LookupCompletion, PrefixRestore, agree, curl, ids_of, json_of, metric, parse_ids,
+        prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
+        stepped_completion, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -827,16 +828,6 @@ mod gate {
             .find_map(|l| l.strip_prefix("tokens "))
             .ok_or_else(|| format!("{}: no `tokens` line", log.display()))?;
         parse_ids(line)
-    }
-
-    /// `ids` agree with `reference`, a run that did not stop at the
-    /// end-of-generation id: all of them, or, when `stop` is `eos`, a prefix
-    /// ending there.
-    fn agree(ids: &[u32], stop: &str, reference: &[u32]) -> bool {
-        match stop {
-            "eos" => !ids.is_empty() && reference.starts_with(ids),
-            _ => ids == reference,
-        }
     }
 
     /// The arms, one a process (the module header): `plain`, the main
