@@ -769,7 +769,9 @@ impl AttnBufs {
             out: device
                 .upload(stream, &vec![0f32; case.rows * out_n])
                 .map_err(why)?,
-            ticket: device.upload(stream, &vec![0u32; case.rows]).map_err(why)?,
+            ticket: device
+                .upload(stream, &vec![0u32; case.rows * attn.kv_heads])
+                .map_err(why)?,
             cache: upload_cache(device, stream, &planted)?,
         })
     }
@@ -782,7 +784,7 @@ impl AttnBufs {
         device
             .read(stream, self.out.whole().map_err(why)?, &mut out)
             .map_err(why)?;
-        let mut ticket = vec![1u32; case.rows];
+        let mut ticket = vec![1u32; case.rows * attn.kv_heads];
         device
             .read(stream, self.ticket.whole().map_err(why)?, &mut ticket)
             .map_err(why)?;
@@ -841,7 +843,9 @@ fn attn_rows_run(
                 out: b.out.window_mut(Elems(0), Elems(case.rows * out_n))?,
                 out_stride: out_n,
                 fault: h.device.fault_word(),
-                ticket: b.ticket.window_mut(Elems(0), Elems(case.rows))?,
+                ticket: b
+                    .ticket
+                    .window_mut(Elems(0), Elems(case.rows * attn.kv_heads))?,
             },
         )
     })?;
@@ -891,7 +895,9 @@ fn attn_stepped_run(
                         .window_mut(Elems(r * partial_n), Elems(partial_n))?,
                     out: b.out.window_mut(Elems(r * out_n), Elems(out_n))?,
                     fault: h.device.fault_word(),
-                    ticket: b.ticket.window_mut(Elems(r), Elems(1))?,
+                    ticket: b
+                        .ticket
+                        .window_mut(Elems(r * attn.kv_heads), Elems(attn.kv_heads))?,
                 },
             )?;
         }
@@ -1803,7 +1809,7 @@ impl AttnOver {
             q_len: REF_ROWS * q_n,
             out_len: REF_ROWS * out_n,
             partials_len: REF_ROWS * partial_n,
-            ticket_len: REF_ROWS,
+            ticket_len: REF_ROWS * attn.kv_heads,
             q8: false,
             prefill: false,
         })
@@ -1945,7 +1951,9 @@ fn attn_refusals(h: &Harness<'_>, tables: &Tables) -> Result<usize, String> {
         out: device
             .upload(stream, &vec![1f32; REF_ROWS * out_n])
             .map_err(why)?,
-        ticket: device.upload(stream, &[0u32; REF_ROWS]).map_err(why)?,
+        ticket: device
+            .upload(stream, &vec![0u32; REF_ROWS * attn.kv_heads])
+            .map_err(why)?,
         cache: upload_cache(device, stream, &plant_f16_for(attn, &scene)?)?,
         q8_codes: [0, 1]
             .map(|_| device.upload(stream, &q8_codes))
@@ -1988,7 +1996,7 @@ fn attn_refusals(h: &Harness<'_>, tables: &Tables) -> Result<usize, String> {
             },
         ),
         case(
-            "a ticket window short of one word a row",
+            "a ticket window short of one word a key head a row",
             "ticket window",
             |o| {
                 o.ticket_len -= 1;

@@ -10,10 +10,11 @@
 //!
 //! Past one segment, one threadgroup is one key head and one segment, one
 //! query head a SIMD group, the keys streamed from the cache into registers.
-//! Each writes partials, and the dispatch's last threadgroup — the ticket's —
-//! folds them, applies the gate and writes the output in the same launch.
-//! The ticket is one word the caller holds zeroed; the fold resets it, so the
-//! next launch finds it zero. There is no merge dispatch.
+//! Each writes partials, and the last threadgroup of each key head — its
+//! ticket word's — folds that key head's partials, applies the gate and writes
+//! its query heads' output in the same launch, the key heads at once. The
+//! ticket is one word a key head the caller holds zeroed; each fold resets its
+//! word, so the next launch finds them zero. There is no merge dispatch.
 //!
 //! [`Kernels::attention_rows`] is the same attention over a chunk of rows,
 //! each row a causal query at its own position: the append of the chunk's
@@ -148,8 +149,9 @@ pub struct AttentionParams<'w> {
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// The fault word.
     pub fault: &'w MetalFaultWord,
-    /// The fold's ticket, one word. Held zeroed; the fold resets it, so the
-    /// next launch finds it zero. Bound only past one segment.
+    /// The folds' tickets, one word a key head (`AttnGeom::kv_heads`). Held
+    /// zeroed; each key head's fold resets its word, so the next launch finds
+    /// them zero. Bound only past one segment.
     pub ticket: WindowMut<'w, u32, MetalDevice>,
 }
 
@@ -419,7 +421,7 @@ fn checked(
             p.segments
         )));
     }
-    check_window_len("attention", "ticket", p.ticket.len(), 1)?;
+    check_window_len("attention", "ticket", p.ticket.len(), g.kv_heads)?;
     let ticket = p
         .ticket
         .byte_range()
@@ -660,8 +662,9 @@ pub struct AttentionRowsParams<'w> {
     pub out_stride: usize,
     /// The fault word.
     pub fault: &'w MetalFaultWord,
-    /// The folds' tickets, one word a row. Held zeroed; each row's fold
-    /// resets its word, so the next launch finds them zero.
+    /// The folds' tickets, one word a key head a row (`AttnGeom::kv_heads`
+    /// words a row, row-major). Held zeroed; each fold resets its word, so the
+    /// next launch finds them zero.
     pub ticket: WindowMut<'w, u32, MetalDevice>,
 }
 
@@ -864,7 +867,14 @@ fn checked_rows(
         partials_row,
         partials_row,
     )?;
-    check_strided(ROWS_WHAT, "ticket", p.ticket.len(), p.rows, 1, 1)?;
+    check_strided(
+        ROWS_WHAT,
+        "ticket",
+        p.ticket.len(),
+        p.rows,
+        g.kv_heads,
+        g.kv_heads,
+    )?;
     let ticket = p
         .ticket
         .byte_range()

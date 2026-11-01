@@ -33,6 +33,9 @@
 //!     back while the stream's boundary is the value its wait names; once a
 //!     signalled buffer has moved the boundary, or on another stream, it does
 //!     not.
+//! 13. **wide_heads_compile**: the source of an instance made at open for 64
+//!     query heads over 8 key heads of 128 values (more query heads than the
+//!     flash's residency hold covers) compiles, and its flash pipelines build.
 //!
 //! `--drop-barrier` is this gate's seam: the ordered arm encodes no memory
 //! barrier. Nothing else reads it. `--help` lists the arguments.
@@ -55,9 +58,10 @@ use bloomery_metal::buffer::{MetalBuffer, MetalShared};
 use bloomery_metal::census::MetalCensus;
 use bloomery_metal::device::{MetalDevice, require_macos};
 use bloomery_metal::encode::{Binding, MAX_BINDINGS, MAX_BYTES_BINDING};
-use bloomery_metal::instance::HOST;
-use bloomery_metal::library::{Library, Pipeline};
+use bloomery_metal::instance::{HOST, QWEN3MOE_A3B, open_key};
+use bloomery_metal::library::{Library, Pipeline, sources_for};
 use bloomery_metal::stream::{HostEvent, MetalStream, Parked};
+use models::shape::gqa_row;
 
 /// How many times the long kernels read their flag: long enough that the host
 /// is back from a call before the kernel is over, and short of the GPU
@@ -667,6 +671,24 @@ fn concurrent_barrier(device: &MetalDevice, drop_barrier: bool) -> Clause {
     }
 }
 
+fn wide_heads_compile(device: &MetalDevice) -> Clause {
+    let mut key = QWEN3MOE_A3B.key;
+    key.attn.row = gqa_row(128, 8).ok_or("the shape table has no head-128 row of group 8")?;
+    key.attn.n_head = 64;
+    key.attn.n_kv = 8;
+    let inst = open_key(key).map_err(|e| e.to_string())?;
+    let (source, _) = sources_for(inst).map_err(why)?;
+    let library = Library::from_source_text(device, &source).map_err(why)?;
+    for entry in [
+        "gqa256_flash_f16",
+        "gqa256_flash_q8",
+        "gqa256_flash_f16_rows",
+    ] {
+        library.pipeline(entry).map_err(why)?;
+    }
+    Ok(Verdict::Pass)
+}
+
 fn macos_floor() -> Clause {
     for (major, minor, patch) in [(26, 1, 9), (15, 0, 0), (0, 0, 0)] {
         match require_macos(major, minor, patch) {
@@ -761,6 +783,7 @@ pub fn main() -> ExitCode {
     report.clause("metallib_equals_source", metallib_equals_source(device));
     report.clause("census_driver", census_driver(device));
     report.clause("macos_floor", macos_floor());
+    report.clause("wide_heads_compile", wide_heads_compile(device));
     report.clause(
         "concurrent_barrier",
         concurrent_barrier(device, drop_barrier),

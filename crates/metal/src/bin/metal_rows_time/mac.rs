@@ -486,7 +486,9 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
             let segments = 5usize;
             let partials_n = partials_len(segments).ok_or("partials")? * p;
             let mut partials = up(&vec![0f32; partials_n])?;
-            let mut ticket = device.upload(stream, &vec![0u32; p]).map_err(why)?;
+            let mut ticket = device
+                .upload(stream, &vec![0u32; p * KV_HEADS])
+                .map_err(why)?;
             let timed = time_arm(device, stream, 1, run.trials, |encoder, _| {
                 kernels.attention_rows(
                     encoder,
@@ -517,7 +519,7 @@ fn attn_arms(run: &Run, device: &MetalDevice, kernels: &Kernels) -> Result<(), S
                         out: out.window_mut(Elems(0), Elems(p * out_n))?,
                         out_stride: out_n,
                         fault: device.fault_word(),
-                        ticket: ticket.window_mut(Elems(0), Elems(p))?,
+                        ticket: ticket.window_mut(Elems(0), Elems(p * KV_HEADS))?,
                     },
                 )
             })?;

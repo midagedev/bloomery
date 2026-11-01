@@ -558,7 +558,7 @@ impl MetalOps<'_, '_> {
             partials: attn_partials.window_mut(Elems(0), Elems(parts))?,
             out: all_mut(attn)?,
             fault: &faults[slot],
-            ticket: attn_ticket.window_mut(Elems(0), Elems(1))?,
+            ticket: all_mut(attn_ticket)?,
         };
         Ok((params, layer))
     }

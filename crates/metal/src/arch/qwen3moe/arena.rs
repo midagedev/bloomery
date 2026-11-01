@@ -281,8 +281,9 @@ pub(super) struct Arena {
     /// The attention output after its gate, and its segment partials.
     pub(super) attn: MetalBuffer<f32>,
     pub(super) attn_partials: MetalBuffer<f32>,
-    /// The attention fold's ticket, one word: the flash's last threadgroup
-    /// resets it, so every launch finds it zero.
+    /// The attention folds' tickets, one word a key head: the last
+    /// threadgroup of each key head resets its word, so every launch finds
+    /// them zero.
     pub(super) attn_ticket: MetalBuffer<u32>,
     /// A short conv's output, `hidden` values; none for a file with no short
     /// conv layer.
@@ -797,7 +798,7 @@ impl Arena {
             delta_partials: zeroed(device, geom.delta.partials_stride)?,
             attn: zeroed(device, g.attn_out)?,
             attn_partials: zeroed(device, g.attn_partials)?,
-            attn_ticket: zeroed(device, 1)?,
+            attn_ticket: zeroed(device, geom.attn.kv_heads)?,
             conv_y: g.has_conv().then(|| zeroed(device, hidden)).transpose()?,
             join: g.has_join().then(|| zeroed(device, hidden)).transpose()?,
             xn: Some(zeroed(device, hidden + 1)?),
