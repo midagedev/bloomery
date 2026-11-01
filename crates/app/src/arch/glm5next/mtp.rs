@@ -11,7 +11,7 @@ use bloomery_gpu::model::Rows;
 use bloomery_gpu_glm5next::{Body, GlmArena, Nextn, PrefillMode};
 
 use super::WHAT;
-use crate::mtp::{DraftHead, Feed, MtpBody, SlotChain, UnitSink, WalkMode, chains_at_once};
+use crate::mtp::{DraftHead, Feed, MtpBody, UnitSink, WalkMode};
 use runtime::prompt::CallEnd;
 
 impl MtpBody for Body {
@@ -95,29 +95,6 @@ impl MtpBody for Body {
         bloomery_gpu_glm5next::nextn_walk(m, DraftFeed::Rows(feed), head, mode)
     }
 
-    /// One store walk of every slot's rows at once
-    /// ([`GpuModel::draft_store_slots`]).
-    fn store_slots(
-        m: &mut GpuModel<Body>,
-        walks: &[(usize, Feed<'_, GlmArena>)],
-        head: DraftHead,
-    ) -> Result<(), GpuError> {
-        m.draft_store_slots(walks, head)
-    }
-
-    /// Every slot's chain at once ([`chains_at_once`]: one walk over every
-    /// slot's refresh, each slot's store and head its own); `p` asked of any
-    /// chain is refused by name before the round runs.
-    fn chain_slots(
-        m: &mut GpuModel<Body>,
-        chains: &mut [SlotChain<'_, GlmArena>],
-        head: DraftHead,
-        mode: WalkMode,
-    ) -> Result<Vec<usize>, GpuError> {
-        refuse_probabilities(chains.iter().any(|c| c.p.is_some()))?;
-        chains_at_once(m, chains, head, mode)
-    }
-
     /// The NextN head reads back its ids alone: `p` is refused by name.
     fn chain(
         m: &mut GpuModel<Body>,
@@ -128,20 +105,14 @@ impl MtpBody for Body {
         out: &mut [u32],
         p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError> {
-        refuse_probabilities(p.is_some())?;
+        if p.is_some() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: "a chain's probabilities: the NextN head reads back its ids alone".into(),
+            });
+        }
         bloomery_gpu_glm5next::nextn_chain(m, DraftFeed::Rows(refresh), own, head, mode, out)
     }
-}
-
-/// Refused by name when `asked`: the NextN head reads back its ids alone.
-fn refuse_probabilities(asked: bool) -> Result<(), GpuError> {
-    if asked {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: "a chain's probabilities: the NextN head reads back its ids alone".into(),
-        });
-    }
-    Ok(())
 }
 
 // The adapter's widths fit together: a verify of two rows, the pass's

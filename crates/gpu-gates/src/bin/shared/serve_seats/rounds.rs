@@ -15,6 +15,7 @@
 
 use app::mtp::{MtpBody, SlotWalks};
 use app::{Draw, Keep, Prompt};
+use bloomery_gpu::draft::SlotDraft;
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, slots_a_pass};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{
@@ -193,7 +194,7 @@ pub(crate) fn step_rows_drafted<B, const M: usize>(
     drafts: &mut SlotDrafts<B, M>,
 ) -> Result<usize, GateError>
 where
-    B: MtpBody + SlotRows,
+    B: MtpBody + SlotRows + SlotDraft<<B as MtpBody>::Arena>,
     B::Seq: 'static,
     Window<M>: Widths,
 {
@@ -320,7 +321,7 @@ pub(crate) fn pass_rows_one_pass<B, const M: usize>(
     allowed: std::ops::RangeInclusive<usize>,
 ) -> Result<usize, GateError>
 where
-    B: MtpBody + SlotRows,
+    B: MtpBody + SlotRows + SlotDraft<<B as MtpBody>::Arena>,
     B::Seq: 'static,
     Window<M>: Widths,
 {

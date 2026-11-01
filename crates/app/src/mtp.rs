@@ -136,7 +136,9 @@ pub type UnitSink<'a, B> =
 /// in the session's verify ([`Rows`], [`Rollback`]). [`MtpBody::walk`] and
 /// [`MtpBody::chain`] are refused by name on a load without the layer and on
 /// a poisoned model; [`MtpBody::head`], [`MtpBody::held`] and
-/// [`MtpBody::hidden_width`] answer the load's defaults.
+/// [`MtpBody::hidden_width`] answer the load's defaults. A pass of several
+/// slots' windows ([`pass_slots`], [`SlotWalks`]) runs on a body whose draft
+/// also walks several resident sequences' rows at once ([`SlotDraft`]).
 ///
 /// A partial accept is the body's own: the window calls
 /// [`runtime::Verify::commit`] with the rows kept and nothing else, and the
@@ -309,32 +311,6 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         mode: WalkMode,
     ) -> Result<(), GpuError>;
 
-    /// One store walk ([`WalkMode::Store`]) of several resident sequences'
-    /// rows: each `(slot, feed)` the rows of that slot's draft, as
-    /// [`MtpBody::walk`] walks them with the slot selected, every slot named
-    /// once and at most [`MtpBody::STORE_ROWS`] rows in all. Each slot's
-    /// draft store comes out as its own walk leaves it, and the selected
-    /// slot stays selected. The default walks the slots in turn; a body
-    /// whose draft walks several sequences' rows at once ([`SlotDraft`])
-    /// overrides it with [`GpuModel::draft_store_slots`].
-    fn store_slots(
-        m: &mut GpuModel<Self>,
-        walks: &[(usize, Feed<'_, Self::Arena>)],
-        head: DraftHead,
-    ) -> Result<(), GpuError>
-    where
-        Self: Slots,
-        Self::Seq: 'static,
-    {
-        let home = m.selected();
-        let walked = walks.iter().try_for_each(|&(slot, feed)| {
-            m.select_slot(slot)?;
-            Self::walk(m, feed, head, WalkMode::Store)
-        });
-        let back = m.select_slot(home);
-        walked.and(back)
-    }
-
     /// One window's chain, one readback, never in [`WalkMode::Store`]:
     /// `refresh` walked (the rows the target kept with their hidden rows, its
     /// last row the target's own next token), then `own` walks, each reading the walk before it on the card;
@@ -354,73 +330,6 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         out: &mut [u32],
         p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError>;
-
-    /// Several resident sequences' window chains in one call, every slot
-    /// named once: each [`SlotChain`] the chain [`MtpBody::chain`] runs with
-    /// its slot selected, its proposal written to the front of its `out` and,
-    /// when it holds `p`, each id's probability to the front of `p`, bit for
-    /// bit what that chain alone writes. Returns each chain's proposal
-    /// length, in order. The default runs the chains in turn and leaves the
-    /// selected slot selected; a body whose draft walks several sequences'
-    /// rows at once ([`SlotDraft`]) overrides it with [`chains_at_once`] and
-    /// may leave another slot selected.
-    fn chain_slots(
-        m: &mut GpuModel<Self>,
-        chains: &mut [SlotChain<'_, Self::Arena>],
-        head: DraftHead,
-        mode: WalkMode,
-    ) -> Result<Vec<usize>, GpuError>
-    where
-        Self: Slots,
-        Self::Seq: 'static,
-    {
-        let home = m.selected();
-        let mut lens = Vec::with_capacity(chains.len());
-        let ran = chains.iter_mut().try_for_each(|c| {
-            m.select_slot(c.slot)?;
-            let n = Self::chain(m, c.refresh, c.own, head, mode, c.out, c.p.as_deref_mut())?;
-            lens.push(n);
-            Ok(())
-        });
-        let back = m.select_slot(home);
-        ran.and(back).map(|()| lens)
-    }
-}
-
-/// One slot's window chain of a round of several slots' chains
-/// ([`MtpBody::chain_slots`]): the slot, the refresh its draft recorded (its
-/// last row the token at the slot's position), the own walks after it, the
-/// room of its proposal and, when its draft reads them, of each id's
-/// probability.
-pub struct SlotChain<'a, A> {
-    pub slot: usize,
-    pub refresh: Feed<'a, A>,
-    pub own: usize,
-    pub out: &'a mut [u32],
-    pub p: Option<&'a mut [f32]>,
-}
-
-/// [`MtpBody::chain_slots`] of a body whose draft walks several sequences'
-/// chains at once ([`SlotDraft`]): one round call
-/// ([`GpuModel::draft_chain_slots`]), each proposal written to its chain's
-/// room ([`write_proposal`]).
-pub fn chains_at_once<B>(
-    m: &mut GpuModel<B>,
-    chains: &mut [SlotChain<'_, <B as MtpBody>::Arena>],
-    head: DraftHead,
-    mode: WalkMode,
-) -> Result<Vec<usize>, GpuError>
-where
-    B: MtpBody + SlotDraft<<B as MtpBody>::Arena>,
-    B::Seq: 'static,
-{
-    let feeds: Vec<_> = chains.iter().map(|c| (c.slot, c.refresh, c.own)).collect();
-    let drafts = m.draft_chain_slots(&feeds, head, mode)?;
-    chains
-        .iter_mut()
-        .zip(&drafts)
-        .map(|(c, d)| write_proposal(d, c.out, c.p.as_deref_mut()))
-        .collect()
 }
 
 /// A chain's readback `d` written to the front of `out` and, when asked, its
@@ -688,8 +597,9 @@ impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
 /// The waiting step and verify rows of several slots' drafts, gathered
 /// before a round's target call ([`MtpDraft::gather`]) and walked together
 /// ([`SlotWalks::run`]): one store walk of every slot's rows
-/// ([`MtpBody::store_slots`]) in place of one walk a slot. Rows gathered and
-/// never run are lost to their drafts, whose next call then skips.
+/// ([`GpuModel::draft_store_slots`]) in place of one walk a slot. Rows
+/// gathered and never run are lost to their drafts, whose next call then
+/// skips.
 #[must_use = "the gathered rows wait for SlotWalks::run"]
 pub struct SlotWalks<B: MtpBody> {
     head: Option<DraftHead>,
@@ -705,7 +615,7 @@ impl<B: MtpBody> Default for SlotWalks<B> {
     }
 }
 
-impl<B: MtpBody + Slots> SlotWalks<B>
+impl<B: MtpBody + SlotDraft<<B as MtpBody>::Arena>> SlotWalks<B>
 where
     B::Seq: 'static,
 {
@@ -728,12 +638,12 @@ where
         let mut rows = 0;
         for (i, (_, f)) in feeds.iter().enumerate() {
             if rows + f.tokens.len() > B::STORE_ROWS {
-                B::store_slots(t.model_mut(), &feeds[start..i], head)?;
+                t.model_mut().draft_store_slots(&feeds[start..i], head)?;
                 (start, rows) = (i, 0);
             }
             rows += f.tokens.len();
         }
-        Ok(B::store_slots(t.model_mut(), &feeds[start..], head)?)
+        Ok(t.model_mut().draft_store_slots(&feeds[start..], head)?)
     }
 }
 
@@ -1053,9 +963,8 @@ pub struct SlotWindow<'a, B: MtpBody> {
 ///   every window's before any pass: a pass may write the arena whose rows a
 ///   draft walks. The chains whose refresh reads the step's or the verify's
 ///   arena, which a select keeps, run together once every window's chain is
-///   decided ([`MtpBody::chain_slots`]: one walk a depth over every slot's
-///   rows, on a body that runs them so); any other chain runs at once, before
-///   the next select;
+///   decided ([`GpuModel::draft_chain_slots`]: one walk a depth over every
+///   slot's rows); any other chain runs at once, before the next select;
 /// - the windows' rows — the token at its slot's position, then the
 ///   proposal — verified together by the session's one owner of a round of
 ///   any draft's windows ([`Session::verify_rounds`]: passes cut between
@@ -1084,7 +993,7 @@ pub fn pass_slots<B>(
     windows: &mut [SlotWindow<'_, B>],
 ) -> Result<(Vec<runtime::Committed>, usize), SessionError>
 where
-    B: MtpBody + SlotRows,
+    B: MtpBody + SlotRows + SlotDraft<<B as MtpBody>::Arena>,
     B::Seq: 'static,
 {
     let mut rows: Vec<Vec<u32>> = Vec::with_capacity(windows.len());
@@ -1175,11 +1084,14 @@ where
 
 /// The chains of a pass's windows that [`pass_slots`] held for one call,
 /// `batch` each window's index and the chain its policy decided, run
-/// together ([`MtpBody::chain_slots`]), each proposal into its window's
-/// `rows` after the token at its slot's position, kept by its draft as its
-/// own chain keeps it. A lone chain, or chains of two heads or two walk
-/// modes, run in turn on their own slots. Returns each chain's proposal
-/// length, in `batch`'s order.
+/// together ([`GpuModel::draft_chain_slots`]), each proposal into its
+/// window's `rows` after the token at its slot's position ([`write_proposal`])
+/// and, when its draft keeps windows, each id's probability into the draft's
+/// own `p`, kept by its draft as its own chain keeps it. A lone chain, or
+/// chains of two heads or two walk modes, run in turn on their own slots.
+/// Probabilities asked of a draft whose readback holds none
+/// ([`MtpBody::PROBS`]) are refused by name before the round runs. Returns
+/// each chain's proposal length, in `batch`'s order.
 fn slot_chains<B>(
     t: &mut Session<B>,
     windows: &mut [SlotWindow<'_, B>],
@@ -1187,7 +1099,7 @@ fn slot_chains<B>(
     batch: &[(usize, policy::Chain<B::Arena>)],
 ) -> Result<Vec<usize>, SessionError>
 where
-    B: MtpBody + Slots,
+    B: MtpBody + SlotDraft<<B as MtpBody>::Arena>,
     B::Seq: 'static,
 {
     let Some(&(first, ref c0)) = batch.first() else {
@@ -1210,24 +1122,29 @@ where
         }
         return Ok(lens);
     }
-    let lens = {
-        let mut next = batch.iter().peekable();
-        let mut chains = Vec::with_capacity(batch.len());
-        for (i, (w, ids)) in windows.iter_mut().zip(rows.iter_mut()).enumerate() {
-            let Some((_, c)) = next.next_if(|(j, _)| *j == i) else {
-                continue;
-            };
-            let read_p = w.draft.windows.is_some();
-            chains.push(SlotChain {
-                slot: w.slot,
-                refresh: c.refresh.feed(),
-                own: c.own,
-                out: &mut ids[1..],
-                p: read_p.then_some(&mut w.draft.p[..]),
-            });
-        }
-        B::chain_slots(t.model_mut(), &mut chains, head, mode)?
-    };
+    if !B::PROBS
+        && batch
+            .iter()
+            .any(|(i, _)| windows[*i].draft.windows.is_some())
+    {
+        return Err(SessionError::Refused(format!(
+            "{WHAT}: a chain's probabilities: this draft's readback holds its ids alone"
+        )));
+    }
+    let feeds: Vec<_> = batch
+        .iter()
+        .map(|(i, c)| (windows[*i].slot, c.refresh.feed(), c.own))
+        .collect();
+    let drafts = t.model_mut().draft_chain_slots(&feeds, head, mode)?;
+    let lens = batch
+        .iter()
+        .zip(&drafts)
+        .map(|((i, _), d)| {
+            let w = &mut windows[*i];
+            let p = w.draft.windows.is_some().then_some(&mut w.draft.p[..]);
+            write_proposal(d, &mut rows[*i][1..], p)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for ((i, _), &n) in batch.iter().zip(&lens) {
         windows[*i].draft.proposed(&rows[*i][1..1 + n]);
     }
