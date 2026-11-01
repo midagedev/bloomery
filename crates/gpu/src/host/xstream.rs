@@ -481,6 +481,31 @@ pub const PARTS: usize = 3;
 /// tensor scale (`super::swap::Transform`).
 pub const MAX_PARTS: usize = 3 * PARTS;
 
+/// A source layout the expert stream's ring cannot hold.
+pub const XSTREAM_FORM: &str = "XStream ring form";
+
+/// Validate a layer's part sizes and the ring's uniform matrix layout separately.
+fn check_parts(layer: usize, parts: &[usize], previous: usize) -> Result<(), GpuError> {
+    let count = !(parts.len() == PARTS || parts.len() == MAX_PARTS)
+        || (previous != 0 && previous != parts.len());
+    let invalid = parts.iter().any(|&b| b == 0 || b % 4 != 0);
+    if count || invalid {
+        return Err(GpuError::shape(
+            if count && !invalid {
+                XSTREAM_FORM
+            } else {
+                "XStream::new"
+            },
+            format!(
+                "layer {layer}: expert parts of {parts:?} bytes; the stream holds {PARTS} or \
+                 {MAX_PARTS} an expert, the same count every layer, each a nonzero \
+                 multiple of 4"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The card bytes a ring leaves free when it sizes itself: half the margin
 /// the placement's expert rule leaves (`placement::workstation::MARGIN`),
 /// for what a load allocates past the plan after the ring.
@@ -888,18 +913,7 @@ impl XStream {
             if parts.is_empty() {
                 continue;
             }
-            let count = !(parts.len() == PARTS || parts.len() == MAX_PARTS)
-                || (!widest.is_empty() && widest.len() != parts.len());
-            if count || parts.iter().any(|&b| b == 0 || b % 4 != 0) {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "layer {l}: expert parts of {parts:?} bytes; the stream holds {PARTS} or \
-                         {MAX_PARTS} an expert, the same count every layer, each a nonzero \
-                         multiple of 4"
-                    ),
-                ));
-            }
+            check_parts(l, parts, widest.len())?;
             if widest.is_empty() {
                 widest = vec![0; parts.len()];
             }
@@ -2012,6 +2026,48 @@ fn start_lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unsupported uniform layouts have a named refusal the unset rule can admit; invalid
+    /// sizes remain errors. Both words and NVFP4 planes keep their supported layouts.
+    #[test]
+    fn a_layout_refusal_is_distinct_from_invalid_parts() {
+        for count in [PARTS, MAX_PARTS] {
+            let parts = vec![4; count];
+            check_parts(0, &parts, 0).expect("the first supported layout");
+            check_parts(1, &parts, count).expect("the same layout on another layer");
+        }
+        for (count, previous) in [(5, 0), (7, 0), (PARTS, MAX_PARTS), (MAX_PARTS, PARTS)] {
+            let e = check_parts(2, &vec![4; count], previous)
+                .expect_err("mixed matrix forms need a different ring layout");
+            assert!(
+                matches!(
+                    e,
+                    GpuError::Shape {
+                        what: XSTREAM_FORM,
+                        ..
+                    }
+                ),
+                "{e}"
+            );
+        }
+        for count in [PARTS, 7, MAX_PARTS] {
+            for bad in [0, 6] {
+                let mut parts = vec![4; count];
+                parts[0] = bad;
+                let e = check_parts(2, &parts, 0).expect_err("a part must hold whole words");
+                assert!(
+                    matches!(
+                        e,
+                        GpuError::Shape {
+                            what: "XStream::new",
+                            ..
+                        }
+                    ),
+                    "invalid bytes must propagate even for a mixed layout: {e}"
+                );
+            }
+        }
+    }
 
     struct ReusedSource {
         bytes: MappedHost,
