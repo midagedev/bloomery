@@ -791,11 +791,12 @@ where
             self.print_off(s, slot);
             return plain(s);
         }
+        let retain = self.specs.len() > 1;
         match self.spec_mut(slot)? {
             Some(spec) => {
                 print_widths(spec);
                 let next = drafted(spec, s)?;
-                if s.slots() > 1 {
+                if retain {
                     spec.draft_mut().draft_mut().retain_prompt(s)?;
                 }
                 print_join(spec);
