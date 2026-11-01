@@ -270,6 +270,16 @@ impl SlotRange {
     }
 }
 
+/// Whether every keep of a pass of `ranges` keeps all its rows: each slot
+/// holds one row, and a commit keeps row 0 always ([`GpuModel::commit_slots`]).
+/// A body runs such a pass's sequence state in place, with nothing recorded
+/// for a partial keep, whichever of `step_slots` and `verify_slots` runs it;
+/// the row counts alone decide, so one capture of the slots and counts
+/// serves both.
+pub(crate) fn kept_whole(ranges: &[SlotRange]) -> bool {
+    ranges.iter().all(|r| r.rows.len() == 1)
+}
+
 /// A slot named twice in one pass.
 pub(crate) fn slot_twice(what: &'static str, slot: usize) -> GpuError {
     GpuError::shape(what, format!("slot {slot} twice in one pass"))

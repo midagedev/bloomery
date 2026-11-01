@@ -1078,9 +1078,9 @@ struct GdnIo<'b> {
 /// `seqs`, the attention site's mix in `s.mixed`, its output projection into
 /// `s.y`: the projections over every row, `z` on `branch` ([`gdn_in`]), the
 /// conv and delta step over each sequence's rows and its store, in row mode
-/// when `each` ([`gdn_seq`]; several sequences' in one launch each,
-/// `linear::seqs`, a pass of several always in row mode), the join, then the
-/// gated norm and the output projection over every row ([`gdn_out`]).
+/// when `each`, else in place ([`gdn_seq`]; several sequences' in one launch
+/// each, `linear::seqs`), the join, then the gated norm and the output
+/// projection over every row ([`gdn_out`]).
 fn gdn(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
@@ -1114,12 +1114,6 @@ fn gdn(
                 )?;
             }
             Seqs38::Slots(seqs) => {
-                if !each {
-                    return Err(GpuError::state(
-                        WHAT,
-                        "a pass of several sequences in row mode (each slot's rows a verify)",
-                    ));
-                }
                 let mut recs = Vec::with_capacity(seqs.len());
                 for q in seqs.iter_mut() {
                     let (rec, stamp, record) = rec_of(q.stores, l)?;
@@ -1127,7 +1121,7 @@ fn gdn(
                         rows: q.rows.clone(),
                         lane: lane_of(&q.io)?,
                         rec,
-                        verify: Some((stamp, record)),
+                        stamped: Some((stamp, each.then_some(record))),
                     });
                 }
                 let (b, a) = beta_alpha_rows(&g.ba, m)?;
@@ -1862,11 +1856,14 @@ pub(super) struct RowsCopy<'a> {
 
 impl<'a> Verify38<'a> {
     /// Walk every layer at the unit's `m` columns through `leg`, then the
-    /// head. A head of other rows than the walk's, or a walk not in row
-    /// mode, is refused by name before any launch.
+    /// head. A head of other rows than the walk's, or a verify of one
+    /// sequence not in row mode, is refused by name before any launch: a
+    /// pass of several slots runs in place when its commit keeps every row
+    /// (`Body38::walk_slots`).
     pub(super) fn walk(mut self, leg: &mut StepLeg<'a, HostRun>) -> Result<(), GpuError> {
         let m = self.p.m;
-        if self.head.m() != m || !self.p.each {
+        let one = matches!(self.p.seqs, Seqs38::One { .. });
+        if self.head.m() != m || (one && !self.p.each) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(

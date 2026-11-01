@@ -169,6 +169,8 @@ generate_ds41   gdn_conv_prep_bf16                       0           0
 generate_ds41   gdn_conv_prep_seqs                       0           0
 generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
+# PIN(2026-11-02): gdn_delta_lanes_seqs, a new entry, at gdn_delta_lanes' 0 spill and 0 JIT local bytes [derived: the same body], not measured at this arch until a scan runs; measured 0 and 0 at sm_121a (gate-ptx-spill).
+generate_ds41   gdn_delta_lanes_seqs                     0           0
 generate_ds41   gdn_delta_recovery                       0           0
 # PIN(2026-10-27): gdn_delta_recovery_layers, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
 generate_ds41   gdn_delta_recovery_layers                0           0

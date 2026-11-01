@@ -166,7 +166,7 @@ use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
-use crate::model::slots::slot_twice;
+use crate::model::slots::{kept_whole, slot_twice};
 use crate::model::{
     CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRowOrder,
     SlotRows, Slots,
@@ -1144,22 +1144,26 @@ pub struct RouteTap {
     pub ids: Vec<u32>,
 }
 
-/// A verify that waits for its commit: its first position, its tokens, and
-/// the PLE history as it stood before them.
+/// A verify that waits for its commit: its first position, its tokens, the
+/// PLE history as it stood before them, and its row mode (`each`): its
+/// delta updates recorded for the commit's replay, or run in place by a pass
+/// whose commit keeps every row ([`kept_whole`]).
 struct Pending38 {
     pos0: u32,
     tokens: Vec<u32>,
     hist: History,
+    each: bool,
 }
 
 /// A call planned and not yet launched: its first position, its rows, the
-/// PLE history past them, and a verify's tokens. [`Body38::launch`] takes
-/// it; a call that fails first leaves it to be planned over.
+/// PLE history past them, and a verify's tokens and row mode.
+/// [`Body38::launch`] takes it; a call that fails first leaves it to be
+/// planned over.
 struct Staged38 {
     pos: u32,
     rows: u32,
     hist: History,
-    verify: Option<Vec<u32>>,
+    verify: Option<(Vec<u32>, bool)>,
 }
 
 /// Where a gate plants a call's failure ([`Body38::plant_before_launch`],
@@ -3857,7 +3861,7 @@ impl Body38 {
         pos: u32,
         rows: usize,
         hist: History,
-        verify: Option<Vec<u32>>,
+        verify: Option<(Vec<u32>, bool)>,
     ) -> Result<(), GpuError> {
         for s in &mut self.stores {
             s.fit(pos as usize + rows)?;
@@ -3906,11 +3910,12 @@ impl Body38 {
         let before = std::mem::replace(&mut self.ple.hist, s.hist);
         self.held = s.pos + s.rows;
         self.wrote.set(self.last_walk, s.pos, s.rows, read);
-        if let Some(tokens) = s.verify {
+        if let Some((tokens, each)) = s.verify {
             self.pending = Some(Pending38 {
                 pos0: s.pos,
                 tokens,
                 hist: before,
+                each,
             });
         }
         Ok(())
@@ -6228,7 +6233,7 @@ impl Body38 {
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
         self.ple_arrival.clear(0)?;
-        self.stage(pos, n, hist, Some(tokens.to_vec()))?;
+        self.stage(pos, n, hist, Some((tokens.to_vec(), true)))?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.launch(pos, n, n)?;
         self.ple_due = Some((pos, n));
@@ -6314,8 +6319,10 @@ impl Body38 {
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
     /// and take the rest back: replay the accepted recovery records into
-    /// the one state lane, where the lane word stays, the PLE history over
-    /// the kept rows, and the MTP
+    /// the one state lane, where the lane word stays (a verify run in place
+    /// holds one row, which every keep keeps, and has no records), the PLE
+    /// history over the kept
+    /// rows, and the MTP
     /// draft's records — the arenas' held rows and the store's held
     /// positions — cut to `pos`, the rejected rows no longer any walk's to
     /// read. With no verify
@@ -6346,14 +6353,15 @@ impl Body38 {
             return Ok(());
         };
         let kept = (pos - p.pos0) as usize;
-        let stream = gpu.stream();
-        self.k.linear.delta.enqueue_delta_recovery_layers(
-            stream,
-            (self.lane.word(), 0),
-            kept,
-            &self.recovery,
-            gpu.unlabelled_sink(),
-        )?;
+        if p.each {
+            self.k.linear.delta.enqueue_delta_recovery_layers(
+                gpu.stream(),
+                (self.lane.word(), 0),
+                kept,
+                &self.recovery,
+                gpu.unlabelled_sink(),
+            )?;
+        }
         // One lane: the replay's lane, the last kept row's
         // (`linear::delta::kept_lane`), is the one it read, so the word stays.
         const _: () = assert!(LANES == 1);
@@ -6585,7 +6593,10 @@ impl Rollback for Body38 {
 /// slot's rows would run alone — into one head of every row.
 /// Each slot is left as a verify of its rows leaves the live sequence:
 /// its stores past its rows and its verify waiting for its commit
-/// ([`Body38::keep_slot`]).
+/// ([`Body38::keep_slot`]). A pass whose every slot holds one row writes
+/// each slot's delta states in place, as its step does ([`kept_whole`]):
+/// every keep takes that row, so its commit replays nothing. A pass with a
+/// slot of several rows records each row (`program38`'s `Parts38::each`).
 impl Body38 {
     /// Plan the pass of `rows` (the busy slots' ranges in pass order, slot
     /// 0 first when it is busy) over `ids` (every row's token), `parked`
@@ -6640,8 +6651,9 @@ impl Body38 {
             b.check_slot(r, r.ids(WHAT_SLOTS, ids)?)
         })?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
+        let each = !kept_whole(rows);
         for_slots(self, parked, rows, |b, r| {
-            b.launch_slot(stream, r, r.ids(WHAT_SLOTS, ids)?)
+            b.launch_slot(stream, r, r.ids(WHAT_SLOTS, ids)?, each)
         })?;
         self.slot_in
             .as_mut()
@@ -6675,13 +6687,14 @@ impl Body38 {
 
     /// The live sequence's call as slot `r.slot` of a pass: its waiting cut
     /// settled, the PLE rows of `tokens` read and copied into rows `r.rows`
-    /// of the pass arena, and the call launched as a verify of its rows,
-    /// waiting for its commit.
+    /// of the pass arena, and the call launched as a verify of its rows in
+    /// the pass's row mode `each`, waiting for its commit.
     fn launch_slot(
         &mut self,
         stream: &CudaStream,
         r: &SlotRange,
         tokens: &[u32],
+        each: bool,
     ) -> Result<(), GpuError> {
         let m = tokens.len();
         self.settle(stream)?;
@@ -6689,7 +6702,7 @@ impl Body38 {
         self.last_walk = TargetRows::Pass;
         let a = &mut self.a.ple;
         self.ple.land(stream, &self.k.rows, a, r.rows.start, m)?;
-        self.stage(r.pos0, m, hist, Some(tokens.to_vec()))?;
+        self.stage(r.pos0, m, hist, Some((tokens.to_vec(), each)))?;
         self.launch(r.pos0, m, m)
     }
 
@@ -6854,7 +6867,7 @@ impl Body38 {
                 slots,
                 card,
                 tier: tier.as_mut(),
-                each: true,
+                each: !kept_whole(rows),
             },
             head,
             copies,

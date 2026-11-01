@@ -190,6 +190,7 @@ generate_ds41 gdn_conv_prep_bf16 0 0
 generate_ds41 gdn_conv_prep_seqs 0 0
 generate_ds41 gdn_delta 0 0
 generate_ds41 gdn_delta_lanes 0 0
+generate_ds41 gdn_delta_lanes_seqs 0 0
 generate_ds41 gdn_delta_recovery 0 0
 generate_ds41 gdn_delta_recovery_layers 0 0
 generate_ds41 gdn_delta_recovery_seqs 0 0
