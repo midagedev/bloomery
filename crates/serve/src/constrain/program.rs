@@ -819,6 +819,8 @@ impl Draw<'_> {
                 history,
                 masked,
             } => {
+                #[cfg(test)]
+                MASKS.with(|n| n.set(n.get() + 1));
                 masked.clear();
                 masked.resize(row.len(), f32::NEG_INFINITY);
                 let mut any = false;
@@ -1014,6 +1016,17 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn aheads() -> usize {
     AHEADS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static MASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The masked copies of a row [`Draw::Sampled`] has built on this thread.
+#[cfg(test)]
+pub(crate) fn masks() -> usize {
+    MASKS.with(std::cell::Cell::get)
 }
 
 /// One request's position in its program.
@@ -1524,10 +1537,11 @@ impl Walk {
     /// The next id: the fixed one, or `draw`'s pick from `row` among the ids
     /// the program allows here; the walk then stands past it. A stop id
     /// before the program is spent, or a drawn id the program does not allow,
-    /// is an error. A waiting walk takes any id ([`Walk::draw_free`]).
+    /// is an error, and so is a pick of a waiting walk: its free text is the
+    /// request's own draw, which the walk only watches ([`Walk::saw`]).
     pub(crate) fn choose_by(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
         if self.waiting() {
-            return self.draw_free(row, draw);
+            return Err(self.stuck("a waiting walk picks nothing: free text is the request's own"));
         }
         self.settle();
         let id = match self.fixed_id() {
@@ -1559,16 +1573,6 @@ impl Walk {
             taken: self.taken,
             why: why.to_owned(),
         }
-    }
-
-    /// The pick of a waiting walk: any id of `row` — free text, a stop id
-    /// among them ends the answer as an unconstrained one's does. The id is
-    /// watched for the opener once it is taken ([`Walk::saw`]), as an id a
-    /// pass kept is.
-    fn draw_free(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
-        let n = u32::try_from(row.len()).expect("a row of ids fits u32");
-        draw.pick(row, 0..n)
-            .ok_or_else(|| self.stuck("the row holds no id the free text may take"))
     }
 
     /// Whether the walk stands in free text once its heads have moved on:

@@ -2299,12 +2299,12 @@ impl Gen {
 
     /// The id the loop takes for an engine answer `g`: the next forced close id
     /// while one is queued (the engine's answer is discarded — the loop never
-    /// commits it, so nothing desyncs), else the request's draw from the row
-    /// (a sampled one, or one that changes its rows: [`biased`] draws from a
-    /// copy) or the engine's argmax `g`, which a greedy request keeps unless
-    /// its change can move it. A program picks from the biased copy. A
-    /// request that asks for probabilities reads the row as the engine wrote
-    /// it.
+    /// commits it, so nothing desyncs), else a program's pick from the row
+    /// (from a changed copy where the request changes its rows), else the
+    /// request's free-text draw: a sampled one from the row, or one that
+    /// changes its rows from a copy ([`biased`]), or the engine's argmax `g`,
+    /// which a greedy request keeps unless its change can move it. A request
+    /// that asks for probabilities reads the row as the engine wrote it.
     fn answer(&mut self, g: u32) -> u32 {
         if let Some(c) = self.probs.as_mut() {
             c.read(&self.logits);
@@ -2312,12 +2312,9 @@ impl Gen {
         if let Some(id) = self.think.as_mut().and_then(Think::next_forced) {
             return id;
         }
-        if let Some(walk) = self.walk.as_mut() {
-            // A watch's free text takes the engine's argmax unread, the
-            // whole row's ([`Gen::logits_out`]).
-            if walk.waiting() && self.greedy && self.bias.is_empty() {
-                return g;
-            }
+        if let Some(walk) = self.walk.as_mut()
+            && !walk.in_free_text()
+        {
             let row = if self.bias.is_empty() || walk.fixed_next() {
                 &self.logits
             } else {
@@ -2348,11 +2345,12 @@ impl Gen {
                 }
             };
         }
-        // A held program's request keeps its bias out of its sampler, as
-        // the walk applies it ([`Gen::new`]): its reasoning draws from the
-        // biased copy here.
-        let biased =
-            self.held.is_some() && !self.bias.is_empty() && (!self.greedy || self.bias.moves(g));
+        // Free text is one path: an unwatched request's, a held program's
+        // reasoning and a waiting watch's. A program's request keeps its bias
+        // out of its sampler, as the walk applies it ([`Gen::new`]), so the
+        // copy is made here with the greedy rule [`biased`] applies.
+        let program = self.walk.is_some() || self.held.is_some();
+        let biased = program && !self.bias.is_empty() && (!self.greedy || self.bias.moves(g));
         let row = if biased {
             self.bias
                 .apply(&self.logits, self.greedy, &mut self.biased_row);

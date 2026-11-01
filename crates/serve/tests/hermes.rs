@@ -749,7 +749,7 @@ fn hw_an_invalid_tool_schema_is_a_400_under_auto_and_an_unservable_one_is_served
     for auto in [None, Some("auto")] {
         let mut b = with(
             json!({"type": "object", "properties": {"a": {"type": "string"}},
-            "required": ["b"]}),
+            "required": ["b"], "additionalProperties": false}),
         );
         if let Some(c) = auto {
             b["tool_choice"] = json!(c);
@@ -767,18 +767,21 @@ fn hw_an_invalid_tool_schema_is_a_400_under_auto_and_an_unservable_one_is_served
             r.body
         );
     }
-    let r = post(
-        addr,
-        "/v1/chat/completions",
-        &with(json!({"type": "object", "properties": {"tags": {"type": "array"}}})),
-    );
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(
-        r.json()["choices"][0]["message"]["content"],
-        "Hi.",
-        "{}",
-        r.body
-    );
+    // A required name no keyword supplies is valid while `additionalProperties`
+    // is absent (JSON Schema's default allows any property): served unwatched.
+    for parameters in [
+        json!({"type": "object", "properties": {"tags": {"type": "array"}}}),
+        json!({"type": "object", "required": ["x"]}),
+    ] {
+        let r = post(addr, "/v1/chat/completions", &with(parameters.clone()));
+        assert_eq!(r.status, 200, "{parameters}: {}", r.body);
+        assert_eq!(
+            r.json()["choices"][0]["message"]["content"],
+            "Hi.",
+            "{parameters}: {}",
+            r.body
+        );
+    }
 }
 
 /// An invalid tool schema is a 400 under `tool_choice` auto whatever else the

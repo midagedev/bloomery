@@ -3078,6 +3078,86 @@ mod tests {
         );
     }
 
+    /// Tool-call markup that does not parse inside a streamed answer ends it
+    /// with `response.failed` (the codex case: a client that reads only
+    /// `event:` frames sees the refusal, not a dropped stream), the response
+    /// carrying the chat path's own refusal text, where no watch holds the
+    /// call: the tool's schema is outside what the watch compiles, so the
+    /// reply is the model's. The markup is refused as it is read (after text
+    /// already sent) and at the end of the generation (a call left open).
+    #[test]
+    fn a_streamed_markup_refusal_fails_the_response_of_an_unwatched_tool() {
+        const BAD: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"not an object\"}\n</tool_call>";
+        const OPEN: &str = "<tool_call>\n{\"name\": \"get_weather\"";
+        let parameters = json!({"type": "object", "properties": {"tags": {"type": "array"}}});
+        let sent = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.failed",
+        ];
+        let cases = [format!("Hello{BAD}"), format!("Hello{OPEN}")];
+        let tool = json!({"type": "function", "function": {"name": "get_weather",
+            "parameters": parameters}});
+        let tools = json!([{"type": "function", "name": "get_weather",
+            "parameters": parameters}]);
+        for script in cases {
+            let addr = scripted(&script);
+            let body = json!({"input": "hi", "stream": true, "tools": tools});
+            let (status, stream) = post_stream(addr, "/v1/responses", &body);
+            let f = frames(status, &stream);
+            assert_eq!(kinds(&f), sent, "{script:?}: {stream}");
+            let text: String = of(&f, "response.output_text.delta")
+                .iter()
+                .map(|d| d["delta"].as_str().expect("a delta"))
+                .collect();
+            assert_eq!(text, "Hello", "{script:?}");
+            let failed = f.last().expect("a last frame");
+            assert_eq!(failed["response"]["id"], f[0]["response"]["id"], "{failed}");
+            assert_eq!(failed["response"]["status"], "failed", "{failed}");
+            let e = &failed["response"]["error"];
+            assert_eq!(e["code"], "server_error", "{failed}");
+            let message = e["message"].as_str().expect("a message");
+            assert!(message.starts_with("tool-call markup: "), "{failed}");
+
+            // The chat path's refusal of the same generation is the same text.
+            let chat = json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "tools": [tool],
+            });
+            let (status, stream) = post_stream(addr, "/v1/chat/completions", &chat);
+            assert_eq!(status, 200, "{stream}");
+            let last = stream.trim_end().rsplit("\n\n").next().expect("a frame");
+            let error: Value = serde_json::from_str(last.strip_prefix("data: ").expect("data"))
+                .expect("the chat path's error frame is JSON");
+            assert_eq!(error["error"]["message"], message, "{script:?}: {error}");
+        }
+
+        // A stop string the whole generation is a prefix of holds every token until the end, so the refused
+        // call is the first text the stream would send: the opening pair still comes before `response.failed`.
+        let addr = scripted(BAD);
+        let body = json!({
+            "input": "hi",
+            "stream": true,
+            "stop": format!("{BAD}x"),
+            "tools": tools,
+        });
+        let (status, stream) = post_stream(addr, "/v1/responses", &body);
+        let f = frames(status, &stream);
+        assert_eq!(
+            kinds(&f),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.failed"
+            ],
+            "{stream}"
+        );
+    }
+
     /// Tool-call markup a scripted model writes wrong inside a streamed
     /// answer — arguments that are not an object, a call the script leaves
     /// open — is held to the tool's schema once the call opens
@@ -3085,6 +3165,9 @@ mod tests {
     /// writes, where the markup's refusal used to end the response (the
     /// codex case). A stop string the script is a prefix of no longer holds
     /// the answer: the generation the watch writes is not the script.
+    // PIN(2026-11-01): a_streamed_markup_refusal_fails_the_response asserted failure for a watched
+    // tool; the watch repairs those calls, so this case asserts completion and the refusal is
+    // asserted above for a tool no watch holds.
     #[test]
     fn a_streamed_call_the_watch_holds_completes() {
         const BAD: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"not an object\"}\n</tool_call>";

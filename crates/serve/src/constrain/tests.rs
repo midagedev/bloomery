@@ -814,7 +814,8 @@ fn each_refusal_names_its_field() {
             true,
         ),
         (
-            schema_body(&json!({"type": "object", "required": ["q"]})),
+            schema_body(&json!({"type": "object", "required": ["q"],
+                "additionalProperties": false})),
             ToolFormat::Hermes,
             "required names \"q\"",
             false,
@@ -1472,6 +1473,26 @@ fn a_walk_takes_no_stop_id_before_the_program_is_spent() {
     assert_eq!(w.choose(&row), Ok(tok.eos()));
 }
 
+/// A waiting walk has no pick: its free text is the request's own draw, which
+/// the walk only watches. Asked for one, it is the named error, not a pick
+/// from a row. Mutant: the walk draws free text itself.
+#[test]
+fn a_waiting_walk_refuses_a_pick() {
+    let tok = bytes_tok();
+    let body = json!({"tools": forecast_tools(), "tool_choice": "auto"});
+    let c = build(&tok, QWEN, &body).expect("served");
+    let mut w = Walk::new(&c, false);
+    assert!(w.waiting());
+    let mut row = vec![0.0; tok.n_vocab()];
+    row[(BYTES + u32::from(b'x')) as usize] = 1.0;
+    let e = w.choose(&row).expect_err("a waiting walk picks nothing");
+    assert!(
+        e.to_string().contains("a waiting walk picks nothing"),
+        "{e}"
+    );
+    assert!(w.waiting(), "the refusal leaves the walk waiting");
+}
+
 /// A tool's parameters are read by the one schema compiler: a keyword it does
 /// not read, or a `required` naming nothing, is refused by name, never
 /// dropped.
@@ -1493,11 +1514,12 @@ fn a_tool_parameter_schema_is_read_whole() {
             "tools[0].f.parameters: the keyword \"$ref\"",
         ),
         (
-            json!({"type": "object", "properties": q, "required": ["nope"]}),
+            json!({"type": "object", "properties": q, "required": ["nope"],
+                "additionalProperties": false}),
             "required names \"nope\"",
         ),
         (
-            json!({"type": "object", "required": ["q"]}),
+            json!({"type": "object", "required": ["q"], "additionalProperties": false}),
             "required names \"q\"",
         ),
         (
@@ -3554,11 +3576,12 @@ fn a_null_required_or_properties_reads_as_absent() {
 }
 
 /// A required property another keyword supplies (`additionalProperties`
-/// true or a schema) is valid JSON Schema the compiler cannot write: outside
-/// the subset, so `tool_choice: auto` serves it with no watch, and a forced
-/// call and a JSON `response_format` refuse it rather than write an object
-/// that leaves the property out. Mutant: the object rule compiles the
-/// declared properties alone.
+/// true, a schema, or none at all: JSON Schema allows any property then) is
+/// valid JSON Schema the compiler cannot write: outside the subset, so
+/// `tool_choice: auto` serves it with no watch, and a forced call and a JSON
+/// `response_format` refuse it rather than write an object that leaves the
+/// property out. Mutant: the object rule compiles the declared properties
+/// alone, or the validator reads an absent `additionalProperties` as `false`.
 #[test]
 fn a_required_property_with_no_schema_is_outside_the_subset() {
     let tok = bytes_tok();
@@ -3575,6 +3598,9 @@ fn a_required_property_with_no_schema_is_outside_the_subset() {
             "additionalProperties": true}),
         json!({"type": "object", "properties": {}, "required": ["x"],
             "additionalProperties": {"type": "string"}}),
+        json!({"type": "object", "required": ["x"]}),
+        json!({"type": "object", "properties": {"y": {"type": "string"}},
+            "required": ["x", "y"]}),
     ] {
         let tools = json!([{"type": "function", "function": {"name": "f",
             "parameters": schema}}]);
@@ -3596,6 +3622,41 @@ fn a_required_property_with_no_schema_is_outside_the_subset() {
                 e.outside_subset && e.message.contains("\"x\""),
                 "{body}: {e}"
             );
+        }
+    }
+}
+
+/// `additionalProperties: false` supplies no property, so a required name the
+/// node's `properties` lacks contradicts the schema: it is invalid, not
+/// outside the subset, on every route (`tool_choice: auto` too). Mutant: the
+/// validator counts `false` as a keyword that supplies.
+#[test]
+fn a_required_name_no_keyword_supplies_is_invalid() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format: ToolFormat::Hermes,
+        think: ThinkTags::THINK,
+        watches: true,
+    };
+    for schema in [
+        json!({"type": "object", "required": ["x"], "additionalProperties": false}),
+        json!({"type": "object", "properties": {"y": {"type": "string"}},
+            "required": ["x", "y"], "additionalProperties": false}),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": schema}}]);
+        for body in [
+            json!({"tools": tools, "tool_choice": "auto"}),
+            json!({"tools": tools, "tool_choice": "required"}),
+            json!({"response_format": {"type": "json_schema",
+                "json_schema": {"name": "x", "schema": schema}}}),
+        ] {
+            let e = request(body.as_object().unwrap(), &ask).expect_err(&format!("{body}: served"));
+            assert!(!e.outside_subset && !e.unsupported, "{body}: {e}");
+            assert!(e.message.contains("required names \"x\""), "{body}: {e}");
         }
     }
 }
@@ -3627,7 +3688,8 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
     };
     let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
     let invalid = [
-        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["b"]}),
+        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["b"],
+            "additionalProperties": false}),
         json!({"type": "object", "properties": []}),
         json!({"type": "object", "required": "p"}),
         prop(json!({"type": "str"})),
@@ -3771,7 +3833,8 @@ fn an_invalid_node_is_refused_beside_an_outside_one() {
             ".properties.b",
         ),
         (
-            json!({"type": "object", "minProperties": 1, "required": ["q"]}),
+            json!({"type": "object", "minProperties": 1, "required": ["q"],
+                "additionalProperties": false}),
             "",
         ),
     ];
@@ -4524,7 +4587,7 @@ fn an_object_with_no_required_property_may_be_empty() {
 
 /// A DSML invoke whose parameters are all optional writes the template's own
 /// empty line where the model leaves every one of them out, as it does for a
-/// call of no parameters.
+/// call of no parameters. Mutant: the empty alternative writes no newline.
 #[test]
 fn a_dsml_invoke_with_no_parameter_written_keeps_its_empty_line() {
     let tok = bytes_tok();
@@ -4538,6 +4601,7 @@ fn a_dsml_invoke_with_no_parameter_written_keeps_its_empty_line() {
     let mut want = ids(&tok, "sure. ");
     want.extend(ids(&tok, call));
     let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+    assert!(o.content.contains(call), "{}", o.content);
     let mut m = parser(format, &tools);
     m.try_push(&o.content, &o.specials)
         .and_then(|_| m.try_finish())
@@ -4871,6 +4935,146 @@ fn a_watch_on_an_engine_that_cuts_no_pass_steps_and_never_resets() {
             );
         }
     }
+}
+
+/// An engine whose every row is `row`.
+struct Flat {
+    tok: Arc<dyn Tokenizer>,
+    row: Vec<f32>,
+}
+
+impl Engine for Flat {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::clone(&self.tok)
+    }
+    fn prefill(&mut self, _ids: &[u32]) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        if let Some(out) = out {
+            out.copy_from_slice(&self.row);
+        }
+        Ok(sampling::argmax(&self.row))
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn ctx_max(&self) -> usize {
+        4096
+    }
+    fn describe(&self) -> String {
+        "flat".to_owned()
+    }
+}
+
+/// A greedy request that changes its rows (`ignore_eos`, a `logit_bias` on the
+/// engine's pick) ties `-0.0` and `+0.0` by id, as the engine's argmax does,
+/// whether or not a watch waits in its free text: the ids are the unwatched
+/// request's. The row puts the end of generation first, then `-0.0` at the
+/// lower id and `+0.0` at the higher over a floor below zero. Mutant: the
+/// waiting watch's copy of the row keeps the zero signs, so the higher id wins
+/// the `total_cmp` tie.
+#[test]
+fn a_waiting_watch_ties_signed_zeros_as_an_unwatched_request_does() {
+    let tok = bytes_tok();
+    let (low, high) = (BYTES + u32::from(b'x'), BYTES + u32::from(b'y'));
+    let mut row = vec![-1.0; tok.n_vocab()];
+    row[tok.eos() as usize] = 1.0;
+    row[low as usize] = -0.0;
+    row[high as usize] = 0.0;
+    let body = json!({"tools": forecast_tools(), "tool_choice": "auto"});
+    let ask = |constraint: Option<Constraint>, ignore_eos: bool, bias: Vec<(u32, f32)>| {
+        let mut p = params(constraint, ThinkEntry::Closed);
+        p.n_predict = 3;
+        p.ignore_eos = ignore_eos;
+        p.logit_bias = bias;
+        let mut slot = Slot::new(Box::new(Flat {
+            tok: Arc::clone(&tok),
+            row: row.clone(),
+        }))
+        .schema_jump(false);
+        generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+        .expect("a generation")
+    };
+    for (ignore_eos, bias) in [(true, Vec::new()), (false, vec![(tok.eos(), -5.0)])] {
+        let plain = ask(None, ignore_eos, bias.clone());
+        assert_eq!(plain.tokens, [low; 3], "ignore_eos={ignore_eos}");
+        let c = build(&tok, QWEN, &body).expect("served");
+        let watched = ask(Some(c), ignore_eos, bias);
+        assert_eq!(watched.tokens, plain.tokens, "ignore_eos={ignore_eos}");
+    }
+}
+
+/// A sampled step in a watch's free text is the unwatched request's step: the
+/// sampler draws from the engine's row (a copy only where the request
+/// changes its rows), and the program's mask of the row is built for no id
+/// while the watch waits. With the engine's rows and the sampler's seed the
+/// same, a watched request that never opens a call returns the ids an
+/// unwatched one does, whether it samples, bans the end of generation or
+/// biases an id; a call that does open is drawn through the mask.
+/// Mutant: a waiting walk draws through [`Draw::Sampled`] as a program does.
+#[test]
+fn a_waiting_watch_draws_free_text_as_an_unwatched_request_does() {
+    let tok = bytes_tok();
+    let body = json!({"tools": forecast_tools(), "tool_choice": "auto"});
+    let plain_ids = |p: &GenParams, seed: u64| scripted_in(&tok, p, seed, Vec::new(), false, 4096);
+    let mut distinct = std::collections::HashSet::new();
+    for (temperature, ignore_eos, bias) in [
+        (0.8, false, Vec::new()),
+        (0.8, true, Vec::new()),
+        (0.8, false, vec![(BYTES + u32::from(b'e'), 3.0)]),
+        (0.0, true, Vec::new()),
+        (0.0, false, vec![(tok.eos(), -9.0)]),
+    ] {
+        for seed in [1, 2, 3] {
+            let label =
+                format!("t={temperature} ignore_eos={ignore_eos} bias={bias:?} seed={seed}");
+            let mut p = params(None, ThinkEntry::Closed);
+            p.n_predict = 60;
+            p.sampling.temperature = temperature;
+            p.sampling.seed = seed;
+            p.ignore_eos = ignore_eos;
+            p.logit_bias = bias.clone();
+            let plain = plain_ids(&p, seed);
+            p.constraint = Some(build(&tok, QWEN, &body).expect("served"));
+            let before = program::masks();
+            let watched = plain_ids(&p, seed);
+            assert_eq!(program::masks(), before, "{label}: a mask while waiting");
+            assert_eq!(watched.out.tokens, plain.out.tokens, "{label}");
+            assert_eq!(watched.out.content, plain.out.content, "{label}");
+            distinct.insert((temperature.to_bits(), plain.out.tokens));
+        }
+    }
+    assert!(
+        distinct.len() > 5,
+        "the seeds draw apart: {}",
+        distinct.len()
+    );
+    // A call that opens is drawn through the mask.
+    let mut want = ids(&tok, "sure. ");
+    want.extend(ids(&tok, CALL_OPEN));
+    let peaks: Peaks = (0..want.len())
+        .map(|i| (want[..i].to_vec(), vec![(want[i], 50.0)]))
+        .collect();
+    let mut p = params(
+        Some(build(&tok, QWEN, &body).expect("served")),
+        ThinkEntry::Closed,
+    );
+    p.n_predict = 60;
+    p.sampling.temperature = 0.8;
+    p.sampling.seed = 1;
+    let before = program::masks();
+    let r = scripted_in(&tok, &p, 1, peaks, false, 4096);
+    assert!(r.out.content.starts_with("sure. "), "{}", r.out.content);
+    assert!(program::masks() > before, "the call's picks are masked");
 }
 
 /// The pieces a text opener splits into, the second carrying what follows

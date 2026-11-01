@@ -16,8 +16,8 @@
 //!   generators write an empty one);
 //! - `required` holds strings, and on a `type: object` node names only
 //!   properties the node holds, unless a keyword beside it may supply
-//!   properties too ([`SUPPLIES_PROPERTIES`], `additionalProperties` other
-//!   than `false`; the compiler serves no such node);
+//!   properties too (`additionalProperties` absent or other than `false`, or
+//!   another of [`SUPPLIES_PROPERTIES`]; the compiler serves no such node);
 //! - a `const` or `enum` value the compiler can write (a string, an integer
 //!   or a boolean) is of the kind `type` names;
 //! - `$ref` is a string, and one that starts `#/` points at something.
@@ -295,12 +295,13 @@ fn node<'a>(
                 format!("required must be an array, not {}", type_of(r)),
             ));
         };
-        // `additionalProperties: false` supplies none; any other value of a
-        // supplying keyword may.
-        let supplied = SUPPLIES_PROPERTIES.iter().any(|k| {
-            o.get(*k)
-                .is_some_and(|v| *k != "additionalProperties" || *v != Value::Bool(false))
-        });
+        // An absent `additionalProperties` allows any property; `false`
+        // supplies none, and any other value of a supplying keyword may.
+        let supplied = o.get("additionalProperties").is_none()
+            || SUPPLIES_PROPERTIES.iter().any(|k| {
+                o.get(*k)
+                    .is_some_and(|v| *k != "additionalProperties" || *v != Value::Bool(false))
+            });
         for n in names {
             let Some(name) = n.as_str() else {
                 return Err(refuse(
