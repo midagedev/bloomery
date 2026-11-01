@@ -5420,8 +5420,9 @@ mod gate {
     /// card bytes the draft's among them, its `draft` naming the file
     /// [`draft_file`] picks), the greedy pass's ids against this server's
     /// steps and its draft counts, `continued`, the sampled requests and,
-    /// after them, the `cache` clause's drafted half — none of the plain
-    /// arm's other clauses: each runs there on the plain main server.
+    /// after them, the `cache` clause's drafted half, then the independent
+    /// steps used to check the greedy pass — none of the plain arm's other
+    /// clauses: each runs there on the plain main server.
     /// `generated` (`generate_qwen3moe`'s ids) is printed, not compared: that
     /// run places more target experts on the card.
     fn drafted_main(
@@ -5453,22 +5454,6 @@ mod gate {
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
         ok &= props_engine(&url, &argv, served.child.id(), levers, &err_log, true)?;
-        let (reference, steps_draft_n) = stepped_completion(&url, ids, N_PREDICT)?;
-        println!("steps on the drafted server: tokens {reference:?} draft_n={steps_draft_n}");
-        println!("generate_qwen3moe {generated:?} (another placement, not compared)");
-        check(
-            &mut ok,
-            "drafted_reference_steps_draft_nothing",
-            steps_draft_n == 0,
-        );
-        if reference.len() != N_PREDICT {
-            return Err(format!(
-                "--prompt {prompt:?}: the drafted server's steps gave {} ids, not {N_PREDICT}: \
-                 `continued` extends the prompt by all of them",
-                reference.len()
-            )
-            .into());
-        }
         let completion = json!({
             "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
             "cache_prompt": false,
@@ -5481,18 +5466,15 @@ mod gate {
             "completion tokens {first:?} stop_type={stop} content={}",
             c1["content"]
         );
-        // The drafted server's own clause: the greedy ids are its steps'
-        // (a draft changes which passes run, never a token), and the pass
-        // carried its counts.
-        // PIN(2026-10-30): same-load steps replace the plain-load oracle: the draft's card
-        // reserve moves target experts to the host, whose sums round another way; was
-        // `generate_qwen3moe`'s ids.
+        if first.len() != N_PREDICT {
+            return Err(format!(
+                "--prompt {prompt:?}: the drafted server gave {} ids, not {N_PREDICT}: \
+                 `continued` extends the prompt by all of them",
+                first.len()
+            )
+            .into());
+        }
         let d = &c1["timings"];
-        check(
-            &mut ok,
-            "drafted_ids_are_its_steps",
-            agree(&first, &stop, &reference),
-        );
         // The accepted count is the file's: the fixture's draft proposes,
         // and its random-weight target accepts none of it.
         if tier::run_clause("drafted_timings_carry_the_draft_counts", Tag::FileBound)? {
@@ -5503,7 +5485,7 @@ mod gate {
                     && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
             );
         }
-        ok &= continued(&url, &err_log, ids, &reference)?;
+        ok &= continued(&url, &err_log, ids, &first)?;
         let sampled = json!({
             "prompt": prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
             "seed": SAMPLED_SEED, "return_tokens": true,
@@ -5516,6 +5498,24 @@ mod gate {
         let (st1, body1) = curl(&url("/completion"), Some(&top1), false)?;
         ok &= sampled_served((st, &body), (st1, &body1), &first)?;
         ok &= cache(&url, &err_log, true, "drafted")?;
+        // The one-token requests leave prefix snapshots in the prompt cache;
+        // run them after the clauses that exercise the windows' own state.
+        let (reference, steps_draft_n) = stepped_completion(&url, ids, N_PREDICT)?;
+        println!("steps on the drafted server: tokens {reference:?} draft_n={steps_draft_n}");
+        println!("generate_qwen3moe {generated:?} (another placement, not compared)");
+        check(
+            &mut ok,
+            "drafted_reference_steps_draft_nothing",
+            steps_draft_n == 0,
+        );
+        // PIN(2026-10-30): same-load steps replace the plain-load oracle: the draft's card
+        // reserve moves target experts to the host, whose sums round another way; was
+        // `generate_qwen3moe`'s ids.
+        check(
+            &mut ok,
+            "drafted_ids_are_its_steps",
+            agree(&first, &stop, &reference),
+        );
         println!("server stopped: {}", served.stop()?);
         ok &= slot_file(dir, levers, ids)?;
         Ok(ok)
