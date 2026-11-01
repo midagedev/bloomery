@@ -1434,7 +1434,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        LookupCompletion, completion, curl, draft_counts, held_ms, ids_of, slot_erased,
+        LookupCompletion, agree, completion, curl, draft_counts, held_ms, ids_of, slot_erased,
         stepped_completion, together,
     };
     use serde_json::json;
@@ -1678,5 +1678,19 @@ mod tests {
             }
         }
         assert!(slot_erased(&json!({"id_slot": 0, "n_erased": 0}), 1, 4096).is_err());
+    }
+
+    /// A run that stopped at the end-of-generation id agrees with a reference
+    /// it is a non-empty prefix of; any other stop needs every id. Mutants: the
+    /// prefix allowed under every stop, an empty `eos` run accepted, or `eos`
+    /// held to the whole reference.
+    #[test]
+    fn agree_takes_a_prefix_only_at_eos() {
+        let reference = [5, 6, 7];
+        assert!(agree(&[5, 6, 7], "limit", &reference));
+        assert!(!agree(&[5, 6], "limit", &reference));
+        assert!(agree(&[5, 6], "eos", &reference));
+        assert!(!agree(&[], "eos", &reference));
+        assert!(!agree(&[5, 7], "eos", &reference));
     }
 }

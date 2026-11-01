@@ -312,7 +312,8 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        self, Served, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log, slot_action,
+        self, Served, agree, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
+        slot_action,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -2500,16 +2501,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// `ids` agree with `reference`, a run that did not stop at the
-    /// end-of-generation id: all of them, or, when `stop` is `eos`, a prefix
-    /// ending there.
-    fn agree(ids: &[u32], stop: &str, reference: &[u32]) -> bool {
-        match stop {
-            "eos" => !ids.is_empty() && reference.starts_with(ids),
-            _ => ids == reference,
-        }
-    }
-
     /// A greedy `/completion` of `prompt` ([`DRAFT_PREDICT`] ids, stopping at
     /// the end-of-generation id): its ids, `cache_n` when it and `prompt_n`
     /// add up to the prompt, and its timings.
@@ -3129,12 +3120,11 @@ mod gate {
         std::fs::write(a.dir.join(COMPLETION_IDS), serde_json::to_string(&first)?)?;
         let (probe, _, _) = drafted_run(&url, "probe", &probe_prompt(&url)?, false)?;
         std::fs::write(a.dir.join(PROBE_IDS), serde_json::to_string(&probe)?)?;
-        let matches = match stop.as_str() {
-            // The server stopped at the end-of-generation id, which it returns.
-            "eos" => !first.is_empty() && reference.starts_with(&first),
-            _ => first == reference,
-        };
-        check(&mut ok, "completion_ids_are_generate_ds41", matches);
+        check(
+            &mut ok,
+            "completion_ids_are_generate_ds41",
+            agree(&first, &stop, &reference),
+        );
 
         let s1 = sampled(&url, &a.prompt, SAMPLED_SEED, 40)?;
         std::fs::write(a.dir.join(SAMPLED_IDS), serde_json::to_string(&s1)?)?;
